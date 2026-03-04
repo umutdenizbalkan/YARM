@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod capabilities;
+pub mod driver_proto;
 pub mod ipc;
 pub mod linux_compat;
 pub mod lock;

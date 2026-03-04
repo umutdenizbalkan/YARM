@@ -23,6 +23,10 @@ impl Timer {
     pub fn should_preempt(&self) -> bool {
         self.current.0 != 0 && self.current.0 % self.quantum_ticks == 0
     }
+
+    pub fn current_ticks(&self) -> u64 {
+        self.current.0
+    }
 }
 
 #[cfg(test)]

@@ -27,4 +27,7 @@ pub struct ThreadControlBlock {
     pub brk_base: Option<usize>,
     pub brk_end: Option<usize>,
     pub restart_token: Option<u64>,
+    pub restart_budget: u8,
+    pub restart_backoff_ticks: u64,
+    pub restart_available_at_tick: u64,
 }

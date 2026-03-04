@@ -74,6 +74,8 @@ struct DriverRecord {
     tid: u64,
     irq_cap: Option<CapId>,
     dma_cap: Option<CapId>,
+    dma_iova_base: Option<usize>,
+    dma_iova_len: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -380,6 +382,8 @@ impl KernelState {
                 tid,
                 irq_cap: None,
                 dma_cap: None,
+                dma_iova_base: None,
+                dma_iova_len: None,
             });
             Ok(())
         } else {
@@ -484,6 +488,64 @@ impl KernelState {
         Ok(())
     }
 
+    pub fn configure_driver_dma_window(
+        &mut self,
+        tid: u64,
+        iova_base: usize,
+        iova_len: usize,
+    ) -> Result<(), KernelError> {
+        if !iova_base.is_multiple_of(super::vm::PAGE_SIZE)
+            || !iova_len.is_multiple_of(super::vm::PAGE_SIZE)
+            || iova_len == 0
+        {
+            return Err(KernelError::Vm(VmError::Misaligned));
+        }
+
+        let record = self
+            .driver_records
+            .iter_mut()
+            .flatten()
+            .find(|record| record.tid == tid)
+            .ok_or(KernelError::TaskMissing)?;
+        record.dma_iova_base = Some(iova_base);
+        record.dma_iova_len = Some(iova_len);
+        Ok(())
+    }
+
+    pub fn validate_driver_dma_iova(
+        &self,
+        tid: u64,
+        iova_base: usize,
+        iova_len: usize,
+    ) -> Result<(), KernelError> {
+        if !iova_base.is_multiple_of(super::vm::PAGE_SIZE)
+            || !iova_len.is_multiple_of(super::vm::PAGE_SIZE)
+            || iova_len == 0
+        {
+            return Err(KernelError::Vm(VmError::Misaligned));
+        }
+        let record = self
+            .driver_records
+            .iter()
+            .flatten()
+            .find(|record| record.tid == tid)
+            .ok_or(KernelError::TaskMissing)?;
+
+        match (record.dma_iova_base, record.dma_iova_len) {
+            (Some(base), Some(len)) => {
+                let end = iova_base
+                    .checked_add(iova_len)
+                    .ok_or(KernelError::WrongObject)?;
+                let window_end = base.checked_add(len).ok_or(KernelError::WrongObject)?;
+                if iova_base < base || end > window_end {
+                    return Err(KernelError::WrongObject);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn report_task_exit_to_supervisor(
         &mut self,
         tid: u64,
@@ -509,6 +571,18 @@ impl KernelState {
         Ok(())
     }
 
+    pub fn set_task_restart_policy(
+        &mut self,
+        tid: u64,
+        budget: u8,
+        backoff_ticks: u64,
+    ) -> Result<(), KernelError> {
+        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        tcb.restart_budget = budget;
+        tcb.restart_backoff_ticks = backoff_ticks;
+        Ok(())
+    }
+
     pub fn exit_task(&mut self, tid: u64, code: u64) -> Result<u64, KernelError> {
         let token = self.next_restart_token;
         self.next_restart_token = self.next_restart_token.wrapping_add(1).max(1);
@@ -527,10 +601,20 @@ impl KernelState {
     }
 
     pub fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelError> {
+        let now = self.timer.current_ticks();
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         if tcb.restart_token != Some(token) {
             return Err(KernelError::WrongObject);
         }
+        if tcb.restart_budget == 0 {
+            return Err(KernelError::WouldBlock);
+        }
+        if now < tcb.restart_available_at_tick {
+            return Err(KernelError::WouldBlock);
+        }
+
+        tcb.restart_budget = tcb.restart_budget.saturating_sub(1);
+        tcb.restart_available_at_tick = now.saturating_add(tcb.restart_backoff_ticks);
         tcb.restart_token = None;
         tcb.status = TaskStatus::Runnable;
         self.scheduler
@@ -774,6 +858,9 @@ impl KernelState {
                 brk_base: None,
                 brk_end: None,
                 restart_token: None,
+                restart_budget: 3,
+                restart_backoff_ticks: 10,
+                restart_available_at_tick: 0,
             });
             Ok(())
         } else {
