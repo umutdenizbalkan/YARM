@@ -33,6 +33,7 @@ pub enum CapObject {
     Kernel,
     Endpoint { index: usize, generation: u64 },
     AddressSpace { asid: u16 },
+    IovaSpace { id: u64 },
     MemoryObject { id: u64 },
     DmaRegion { id: u64, offset: usize, len: usize },
     Notification { index: usize, generation: u64 },

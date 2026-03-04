@@ -52,6 +52,14 @@ pub enum FaultPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartTelemetry {
+    pub budget_remaining: u8,
+    pub backoff_ticks: u64,
+    pub available_at_tick: u64,
+    pub token_outstanding: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TaskMemByte {
     tid: u64,
     addr: usize,
@@ -76,6 +84,7 @@ struct DriverRecord {
     dma_cap: Option<CapId>,
     dma_iova_base: Option<usize>,
     dma_iova_len: Option<usize>,
+    iova_space_cap: Option<CapId>,
 }
 
 #[derive(Debug)]
@@ -97,6 +106,7 @@ pub struct KernelState {
     task_mem: [Option<TaskMemByte>; MAX_TASK_MEM_ENTRIES],
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
     next_memory_object_id: u64,
+    next_iova_space_id: u64,
     next_anon_phys: usize,
     tlb_shootdown_count: u64,
     last_fault: Option<FaultInfo>,
@@ -161,6 +171,7 @@ impl Bootstrap {
             task_mem: [None; MAX_TASK_MEM_ENTRIES],
             memory_objects: [None; MAX_MEMORY_OBJECTS],
             next_memory_object_id: 1,
+            next_iova_space_id: 1,
             next_anon_phys: 0x1000_0000,
             tlb_shootdown_count: 0,
             last_fault: None,
@@ -384,6 +395,7 @@ impl KernelState {
                 dma_cap: None,
                 dma_iova_base: None,
                 dma_iova_len: None,
+                iova_space_cap: None,
             });
             Ok(())
         } else {
@@ -421,6 +433,42 @@ impl KernelState {
                 &[CapRights::Signal],
             ))
             .map_err(|_| KernelError::CapabilityFull)
+    }
+
+    pub fn create_iova_space_cap(&mut self) -> Result<CapId, KernelError> {
+        let id = self.next_iova_space_id;
+        self.next_iova_space_id = self.next_iova_space_id.wrapping_add(1).max(1);
+        self.cspace
+            .mint(Capability::new(
+                "iova_space",
+                CapObject::IovaSpace { id },
+                &[CapRights::Map],
+            ))
+            .map_err(|_| KernelError::CapabilityFull)
+    }
+
+    pub fn grant_driver_iova_space(
+        &mut self,
+        tid: u64,
+        iova_cap: CapId,
+    ) -> Result<(), KernelError> {
+        let capability = self
+            .cspace
+            .get(iova_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        match capability.object {
+            CapObject::IovaSpace { .. } => {}
+            _ => return Err(KernelError::WrongObject),
+        }
+
+        let record = self
+            .driver_records
+            .iter_mut()
+            .flatten()
+            .find(|record| record.tid == tid)
+            .ok_or(KernelError::TaskMissing)?;
+        record.iova_space_cap = Some(iova_cap);
+        Ok(())
     }
 
     pub fn mint_dma_region_cap(
@@ -531,6 +579,10 @@ impl KernelState {
             .find(|record| record.tid == tid)
             .ok_or(KernelError::TaskMissing)?;
 
+        if record.iova_space_cap.is_none() {
+            return Err(KernelError::WrongObject);
+        }
+
         match (record.dma_iova_base, record.dma_iova_len) {
             (Some(base), Some(len)) => {
                 let end = iova_base
@@ -581,6 +633,21 @@ impl KernelState {
         tcb.restart_budget = budget;
         tcb.restart_backoff_ticks = backoff_ticks;
         Ok(())
+    }
+
+    pub fn task_restart_telemetry(&self, tid: u64) -> Result<RestartTelemetry, KernelError> {
+        let tcb = self
+            .tcbs
+            .iter()
+            .flatten()
+            .find(|tcb| tcb.tid == tid)
+            .ok_or(KernelError::TaskMissing)?;
+        Ok(RestartTelemetry {
+            budget_remaining: tcb.restart_budget,
+            backoff_ticks: tcb.restart_backoff_ticks,
+            available_at_tick: tcb.restart_available_at_tick,
+            token_outstanding: tcb.restart_token.is_some(),
+        })
     }
 
     pub fn exit_task(&mut self, tid: u64, code: u64) -> Result<u64, KernelError> {
@@ -1015,6 +1082,7 @@ impl KernelState {
             }
             CapObject::Kernel
             | CapObject::AddressSpace { .. }
+            | CapObject::IovaSpace { .. }
             | CapObject::MemoryObject { .. }
             | CapObject::DmaRegion { .. }
             | CapObject::Notification { .. }
@@ -2426,5 +2494,61 @@ mod tests {
         }
         assert_eq!(irq_msgs, 5);
         assert_eq!(state.online_cpu_count(), 2);
+    }
+
+    #[test]
+    fn restart_telemetry_reports_budget_and_backoff() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(11).expect("task");
+        state.set_task_restart_policy(11, 2, 5).expect("policy");
+
+        let token = state.exit_task(11, 1).expect("exit");
+        let t0 = state.task_restart_telemetry(11).expect("telemetry");
+        assert_eq!(t0.budget_remaining, 2);
+        assert!(t0.token_outstanding);
+
+        assert!(state.restart_task(11, token).is_ok());
+        let t1 = state.task_restart_telemetry(11).expect("telemetry");
+        assert_eq!(t1.budget_remaining, 1);
+        assert!(!t1.token_outstanding);
+        assert!(t1.available_at_tick >= 5);
+    }
+
+    #[test]
+    fn iova_window_validation_requires_iova_space_and_range() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(12).expect("task");
+        state.register_driver(12).expect("driver");
+
+        let iova_cap = state.create_iova_space_cap().expect("iova");
+        state
+            .grant_driver_iova_space(12, iova_cap)
+            .expect("grant iova");
+        state
+            .configure_driver_dma_window(
+                12,
+                crate::kernel::vm::PAGE_SIZE * 4,
+                crate::kernel::vm::PAGE_SIZE,
+            )
+            .expect("window");
+
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    12,
+                    crate::kernel::vm::PAGE_SIZE * 4,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_ok()
+        );
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    12,
+                    crate::kernel::vm::PAGE_SIZE * 3,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 }
