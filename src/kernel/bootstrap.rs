@@ -17,6 +17,7 @@ const MAX_TASK_MEM_ENTRIES: usize = 2048;
 const MAX_MEMORY_OBJECTS: usize = 128;
 const MAX_NOTIFICATIONS: usize = 16;
 const MAX_IRQ_LINES: usize = 64;
+const MAX_DRIVERS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelError {
@@ -68,6 +69,13 @@ struct NotificationObject {
     endpoint_idx: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DriverRecord {
+    tid: u64,
+    irq_cap: Option<CapId>,
+    dma_cap: Option<CapId>,
+}
+
 #[derive(Debug)]
 pub struct KernelState {
     pub kernel_aspace: AddressSpace,
@@ -95,6 +103,8 @@ pub struct KernelState {
     linux_proc_mgr_reply_recv: Option<CapId>,
     linux_vfs_request_send: Option<CapId>,
     linux_vfs_reply_recv: Option<CapId>,
+    supervisor_endpoint: Option<usize>,
+    driver_records: [Option<DriverRecord>; MAX_DRIVERS],
     fault_policy: FaultPolicy,
 }
 
@@ -156,6 +166,8 @@ impl Bootstrap {
             linux_proc_mgr_reply_recv: None,
             linux_vfs_request_send: None,
             linux_vfs_reply_recv: None,
+            supervisor_endpoint: None,
+            driver_records: [const { None }; MAX_DRIVERS],
             fault_policy: FaultPolicy::KillTask,
         };
 
@@ -335,6 +347,144 @@ impl KernelState {
             .linux_vfs_reply_recv
             .ok_or(KernelError::InvalidCapability)?;
         self.ipc_recv(recv_cap)
+    }
+
+    pub fn set_supervisor_endpoint(&mut self, recv_cap: CapId) -> Result<(), KernelError> {
+        let capability = self
+            .cspace
+            .get(recv_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        if !capability.has_right(CapRights::Receive) {
+            return Err(KernelError::MissingRight);
+        }
+        let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+        self.supervisor_endpoint = Some(endpoint_idx);
+        Ok(())
+    }
+
+    pub fn register_driver(&mut self, tid: u64) -> Result<(), KernelError> {
+        let _ = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        if self
+            .driver_records
+            .iter()
+            .flatten()
+            .any(|record| record.tid == tid)
+        {
+            return Ok(());
+        }
+
+        if let Some(slot) = self.driver_records.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(DriverRecord {
+                tid,
+                irq_cap: None,
+                dma_cap: None,
+            });
+            Ok(())
+        } else {
+            Err(KernelError::TaskTableFull)
+        }
+    }
+
+    pub fn grant_driver_irq(&mut self, tid: u64, irq_cap: CapId) -> Result<(), KernelError> {
+        let capability = self
+            .cspace
+            .get(irq_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        match capability.object {
+            CapObject::Irq { .. } => {}
+            _ => return Err(KernelError::WrongObject),
+        }
+        if !capability.has_right(CapRights::Signal) {
+            return Err(KernelError::MissingRight);
+        }
+        let record = self
+            .driver_records
+            .iter_mut()
+            .flatten()
+            .find(|record| record.tid == tid)
+            .ok_or(KernelError::TaskMissing)?;
+        record.irq_cap = Some(irq_cap);
+        Ok(())
+    }
+
+    pub fn mint_irq_cap(&mut self, line: u16) -> Result<CapId, KernelError> {
+        self.cspace
+            .mint(Capability::new(
+                "irq",
+                CapObject::Irq { line },
+                &[CapRights::Signal],
+            ))
+            .map_err(|_| KernelError::CapabilityFull)
+    }
+
+    pub fn mint_dma_region_cap(&mut self, mem_cap: CapId) -> Result<CapId, KernelError> {
+        let capability = self
+            .cspace
+            .get(mem_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        let id = match capability.object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id } => id,
+            _ => return Err(KernelError::WrongObject),
+        };
+        if !capability.has_right(CapRights::Map)
+            || !capability.has_right(CapRights::Read)
+            || !capability.has_right(CapRights::Write)
+        {
+            return Err(KernelError::MissingRight);
+        }
+
+        self.cspace
+            .mint(Capability::new(
+                "dma_region",
+                CapObject::DmaRegion { id },
+                &[CapRights::Map, CapRights::Read, CapRights::Write],
+            ))
+            .map_err(|_| KernelError::CapabilityFull)
+    }
+
+    pub fn grant_driver_dma(&mut self, tid: u64, dma_cap: CapId) -> Result<(), KernelError> {
+        let capability = self
+            .cspace
+            .get(dma_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        match capability.object {
+            CapObject::DmaRegion { .. } => {}
+            _ => return Err(KernelError::WrongObject),
+        }
+
+        let record = self
+            .driver_records
+            .iter_mut()
+            .flatten()
+            .find(|record| record.tid == tid)
+            .ok_or(KernelError::TaskMissing)?;
+        record.dma_cap = Some(dma_cap);
+        Ok(())
+    }
+
+    pub fn report_task_exit_to_supervisor(
+        &mut self,
+        tid: u64,
+        code: u64,
+    ) -> Result<(), KernelError> {
+        let Some(endpoint_idx) = self.supervisor_endpoint else {
+            return Ok(());
+        };
+        let mut payload = [0u8; 16];
+        payload[..8].copy_from_slice(&tid.to_le_bytes());
+        payload[8..16].copy_from_slice(&code.to_le_bytes());
+        let msg = Message::with_header(0, 0xEE, 0, None, &payload)
+            .map_err(|_| KernelError::WrongObject)?;
+        let endpoint = self
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?;
+        endpoint
+            .send(msg)
+            .map_err(|_| KernelError::EndpointQueueFull)?;
+        let _ = self.wake_waiter_for_endpoint(endpoint_idx);
+        Ok(())
     }
 
     pub fn bind_task_asid(&mut self, tid: u64, asid: Asid) -> Result<(), KernelError> {
@@ -720,6 +870,7 @@ impl KernelState {
             CapObject::Kernel
             | CapObject::AddressSpace { .. }
             | CapObject::MemoryObject { .. }
+            | CapObject::DmaRegion { .. }
             | CapObject::Notification { .. }
             | CapObject::Irq { .. } => Err(KernelError::WrongObject),
         }
@@ -1062,7 +1213,7 @@ impl KernelState {
             .mint(Capability::new(
                 "memobj_rw",
                 CapObject::MemoryObject { id },
-                &[CapRights::Read, CapRights::Write],
+                &[CapRights::Read, CapRights::Write, CapRights::Map],
             ))
             .map_err(|_| KernelError::CapabilityFull)?;
 
@@ -1105,7 +1256,7 @@ impl KernelState {
             .get(mem_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let id = match capability.object {
-            CapObject::MemoryObject { id } => id,
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id } => id,
             _ => return Err(KernelError::WrongObject),
         };
 
@@ -2010,5 +2161,41 @@ mod tests {
             .bind_irq_notification(1, recv_cap)
             .expect_err("must fail");
         assert_eq!(err, KernelError::MissingRight);
+    }
+
+    #[test]
+    fn driver_registration_and_capability_grants_work() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(3).expect("task");
+        state.register_driver(3).expect("driver");
+
+        let irq_cap = state.mint_irq_cap(9).expect("irq");
+        state.grant_driver_irq(3, irq_cap).expect("grant irq");
+
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let dma_cap = state.mint_dma_region_cap(mem_cap).expect("dma");
+        state.grant_driver_dma(3, dma_cap).expect("grant dma");
+    }
+
+    #[test]
+    fn supervisor_receives_task_exit_report() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_e, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .set_supervisor_endpoint(recv_cap)
+            .expect("supervisor ep");
+        state
+            .report_task_exit_to_supervisor(7, 99)
+            .expect("report exit");
+
+        let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(msg.opcode, 0xEE);
+        assert_eq!(msg.as_slice().len(), 16);
+        assert_eq!(
+            state
+                .ipc_send(send_cap, Message::new(0, b"ok").expect("m"))
+                .is_ok(),
+            true
+        );
     }
 }

@@ -4,7 +4,9 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
-pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 11;
+pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 12;
+pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = 1;
+pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = 1;
 
 pub const LINUX_NR_BRK: usize = 214;
 pub const LINUX_NR_MUNMAP: usize = 215;
@@ -17,15 +19,17 @@ pub const LINUX_NR_OPENAT: usize = 56;
 pub const LINUX_NR_CLOSE: usize = 57;
 pub const LINUX_NR_READ: usize = 63;
 pub const LINUX_NR_WRITE: usize = 64;
+pub const LINUX_NR_IOCTL: usize = 29;
 
-const PROC_OP_GETPID: u16 = 1;
-const PROC_OP_EXIT: u16 = 2;
-const PROC_OP_GETPPID: u16 = 3;
+pub const PROC_OP_GETPID: u16 = 1;
+pub const PROC_OP_EXIT: u16 = 2;
+pub const PROC_OP_GETPPID: u16 = 3;
 
-const VFS_OP_OPENAT: u16 = 10;
-const VFS_OP_CLOSE: u16 = 11;
-const VFS_OP_READ: u16 = 12;
-const VFS_OP_WRITE: u16 = 13;
+pub const VFS_OP_OPENAT: u16 = 10;
+pub const VFS_OP_CLOSE: u16 = 11;
+pub const VFS_OP_READ: u16 = 12;
+pub const VFS_OP_WRITE: u16 = 13;
+pub const VFS_OP_IOCTL: u16 = 14;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -92,6 +96,7 @@ pub enum LinuxCompatSyscall {
     Close = LINUX_NR_CLOSE,
     Read = LINUX_NR_READ,
     Write = LINUX_NR_WRITE,
+    Ioctl = LINUX_NR_IOCTL,
     Brk = LINUX_NR_BRK,
     Munmap = LINUX_NR_MUNMAP,
     Mmap = LINUX_NR_MMAP,
@@ -107,6 +112,7 @@ impl LinuxCompatSyscall {
         LINUX_NR_CLOSE,
         LINUX_NR_READ,
         LINUX_NR_WRITE,
+        LINUX_NR_IOCTL,
         LINUX_NR_BRK,
         LINUX_NR_MUNMAP,
         LINUX_NR_MMAP,
@@ -126,6 +132,7 @@ impl LinuxCompatSyscall {
             LINUX_NR_CLOSE => Ok(Self::Close),
             LINUX_NR_READ => Ok(Self::Read),
             LINUX_NR_WRITE => Ok(Self::Write),
+            LINUX_NR_IOCTL => Ok(Self::Ioctl),
             LINUX_NR_BRK => Ok(Self::Brk),
             LINUX_NR_MUNMAP => Ok(Self::Munmap),
             LINUX_NR_MMAP => Ok(Self::Mmap),
@@ -375,6 +382,22 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
         }
+        LinuxCompatSyscall::Ioctl => {
+            let payload = pack_vfs4(
+                frame.args[LINUX_ARG0],
+                frame.args[LINUX_ARG1],
+                frame.args[LINUX_ARG2],
+                frame.args[LINUX_ARG3],
+            );
+            kernel
+                .send_linux_vfs_request(VFS_OP_IOCTL, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
         LinuxCompatSyscall::Mmap => {
             let aspace_cap = CapId(frame.args[LINUX_ARG0] as u64);
             let addr = frame.args[LINUX_ARG1];
@@ -429,7 +452,9 @@ mod tests {
     #[test]
     fn linux_compat_abi_contract_is_frozen() {
         assert_eq!(LINUX_COMPAT_ABI_VERSION, 1);
-        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 11);
+        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 12);
+        assert_eq!(LINUX_PROC_SERVER_ABI_VERSION, 1);
+        assert_eq!(LINUX_VFS_SERVER_ABI_VERSION, 1);
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_EXIT),
             Ok(LinuxCompatSyscall::Exit)
@@ -457,6 +482,10 @@ mod tests {
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_WRITE),
             Ok(LinuxCompatSyscall::Write)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_IOCTL),
+            Ok(LinuxCompatSyscall::Ioctl)
         );
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_BRK),
@@ -617,7 +646,7 @@ mod tests {
             .register_linux_vfs_manager(req_send, rep_recv)
             .expect("register vfs");
 
-        for value in [42u64, 0u64, 128u64, 64u64] {
+        for value in [42u64, 0u64, 128u64, 64u64, 0u64] {
             state
                 .ipc_send(
                     rep_send,
@@ -652,5 +681,11 @@ mod tests {
         assert_eq!(write.ret0, 64);
         let write_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(write_req.opcode, VFS_OP_WRITE);
+
+        let mut ioctl = TrapFrame::new(LINUX_NR_IOCTL, [42, 0x1234, 0x5555, 0x6666, 0, 0]);
+        dispatch(&mut state, &mut ioctl);
+        assert_eq!(ioctl.error, 0);
+        let ioctl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(ioctl_req.opcode, VFS_OP_IOCTL);
     }
 }
