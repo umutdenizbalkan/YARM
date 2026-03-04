@@ -184,6 +184,45 @@ impl LinuxCompatSyscall {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcV2Args {
+    pub arg0: u64,
+    pub arg1: u64,
+}
+
+impl ProcV2Args {
+    pub const fn new(arg0: u64, arg1: u64) -> Self {
+        Self { arg0, arg1 }
+    }
+
+    pub const fn encode(self) -> [u8; 16] {
+        let mut payload = [0u8; 16];
+        let a0 = self.arg0.to_le_bytes();
+        let a1 = self.arg1.to_le_bytes();
+        let mut i = 0;
+        while i < 8 {
+            payload[i] = a0[i];
+            payload[8 + i] = a1[i];
+            i += 1;
+        }
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, LinuxErrno> {
+        if payload.len() < 16 {
+            return Err(LinuxErrno::Inval);
+        }
+        let mut a0 = [0u8; 8];
+        let mut a1 = [0u8; 8];
+        a0.copy_from_slice(&payload[..8]);
+        a1.copy_from_slice(&payload[8..16]);
+        Ok(Self {
+            arg0: u64::from_le_bytes(a0),
+            arg1: u64::from_le_bytes(a1),
+        })
+    }
+}
+
 fn round_up_page(value: usize) -> usize {
     if value.is_multiple_of(PAGE_SIZE) {
         value
@@ -614,6 +653,14 @@ mod tests {
     use crate::kernel::ipc::Message;
 
     #[test]
+    fn proc_v2_args_codec_roundtrip() {
+        let args = ProcV2Args::new(10, 20);
+        let encoded = args.encode();
+        let decoded = ProcV2Args::decode(&encoded).expect("decode");
+        assert_eq!(decoded, args);
+    }
+
+    #[test]
     fn linux_compat_errno_mapping_stable() {
         assert_eq!(LinuxErrno::Inval.code(), EINVAL);
         assert_eq!(LinuxErrno::Perm.code(), EPERM);
@@ -990,6 +1037,8 @@ mod tests {
         let req = state.ipc_recv(req_recv).expect("recv").expect("msg");
         assert_eq!(req.opcode, PROC_OP_WAITPID_V2);
         assert_eq!(req.as_slice().len(), 16);
+        let args = ProcV2Args::decode(req.as_slice()).expect("decode");
+        assert_eq!(args, ProcV2Args::new(42, 0x10));
 
         state
             .ipc_send(

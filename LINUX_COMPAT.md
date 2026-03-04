@@ -90,3 +90,7 @@ In addition to single-u64 process-manager requests, the kernel now provides a du
 - `PROC_OP_WAITPID_V2`
 
 The payload shape is a fixed 16-byte little-endian tuple (`arg0`, `arg1`) and is covered by round-trip unit tests.
+
+The process-manager v2 path also defines a typed `ProcV2Args` 16-byte codec (`arg0`, `arg1`) to freeze payload semantics before adding broader spawn/wait APIs.
+
+A minimal `vfs_lite` service implementation now exists in-kernel module space as a user-space server model scaffold (`src/kernel/vfs_lite.rs`) and is exercised by `src/bin/vfs_lite.rs`.

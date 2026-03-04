@@ -13,6 +13,7 @@ pub mod task;
 pub mod timer;
 pub mod trap;
 pub mod trapframe;
+pub mod vfs_lite;
 pub mod vm;
 
 pub use bootstrap::{Bootstrap, KernelState};

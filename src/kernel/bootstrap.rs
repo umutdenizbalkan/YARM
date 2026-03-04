@@ -132,6 +132,9 @@ pub struct KernelState {
     app_restart_policy: RestartPolicy,
     driver_restart_policy: RestartPolicy,
     system_restart_policy: RestartPolicy,
+    app_escalation_threshold: u32,
+    driver_escalation_threshold: u32,
+    system_escalation_threshold: u32,
 }
 
 pub struct Bootstrap;
@@ -209,6 +212,9 @@ impl Bootstrap {
                 budget: 8,
                 backoff_ticks: 5,
             },
+            app_escalation_threshold: RESTART_ESCALATION_THRESHOLD,
+            driver_escalation_threshold: RESTART_ESCALATION_THRESHOLD * 2,
+            system_escalation_threshold: RESTART_ESCALATION_THRESHOLD * 3,
         };
 
         state.register_task(0)?;
@@ -768,6 +774,11 @@ impl KernelState {
 
     pub fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelError> {
         let now = self.timer.current_ticks();
+        let (app_threshold, driver_threshold, system_threshold) = (
+            self.app_escalation_threshold,
+            self.driver_escalation_threshold,
+            self.system_escalation_threshold,
+        );
 
         let mut should_notify = None;
         let err = {
@@ -788,10 +799,12 @@ impl KernelState {
 
             if denied {
                 tcb.restart_denied_count = tcb.restart_denied_count.saturating_add(1);
-                if tcb
-                    .restart_denied_count
-                    .is_multiple_of(RESTART_ESCALATION_THRESHOLD)
-                {
+                let threshold = match tcb.class {
+                    TaskClass::App => app_threshold,
+                    TaskClass::Driver => driver_threshold,
+                    TaskClass::SystemServer => system_threshold,
+                };
+                if tcb.restart_denied_count.is_multiple_of(threshold) {
                     tcb.restart_escalation_count = tcb.restart_escalation_count.saturating_add(1);
                     should_notify = Some(tcb.restart_denied_count);
                 }
@@ -1041,6 +1054,15 @@ impl KernelState {
             .current_tid()
             .ok_or(KernelError::TaskMissing)?;
         self.read_user_memory(tid, user_ptr, len)
+    }
+
+    pub fn set_class_escalation_threshold(&mut self, class: TaskClass, threshold: u32) {
+        let bounded = threshold.max(1);
+        match class {
+            TaskClass::App => self.app_escalation_threshold = bounded,
+            TaskClass::Driver => self.driver_escalation_threshold = bounded,
+            TaskClass::SystemServer => self.system_escalation_threshold = bounded,
+        }
     }
 
     fn restart_policy_for_class(&self, class: TaskClass) -> RestartPolicy {
@@ -2752,6 +2774,62 @@ mod tests {
                 .validate_driver_dma_iova(
                     22,
                     crate::kernel::vm::PAGE_SIZE * 8,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn escalation_threshold_is_class_specific() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_e, _send, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        state.set_supervisor_endpoint(recv_cap).expect("supervisor");
+        state.set_class_escalation_threshold(TaskClass::Driver, 2);
+
+        state
+            .register_task_with_class(30, TaskClass::Driver)
+            .expect("task");
+        let _ = state.exit_task(30, 1).expect("exit");
+        let _ = state.restart_task(30, 0xBAD);
+        let _ = state.restart_task(30, 0xBAD);
+
+        let t = state.task_restart_telemetry(30).expect("telemetry");
+        assert_eq!(t.denied_count, 2);
+        assert_eq!(t.escalation_count, 1);
+    }
+
+    #[test]
+    fn detach_iova_space_revokes_dma_window_validation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(31).expect("task");
+        state.register_driver(31).expect("driver");
+
+        let iova = state.create_iova_space_cap().expect("iova");
+        state.grant_driver_iova_space(31, iova).expect("grant");
+        state
+            .configure_driver_dma_window(
+                31,
+                crate::kernel::vm::PAGE_SIZE * 2,
+                crate::kernel::vm::PAGE_SIZE,
+            )
+            .expect("window");
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    31,
+                    crate::kernel::vm::PAGE_SIZE * 2,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_ok()
+        );
+
+        state.detach_driver_iova_space(31).expect("detach");
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    31,
+                    crate::kernel::vm::PAGE_SIZE * 2,
                     crate::kernel::vm::PAGE_SIZE
                 )
                 .is_err()
