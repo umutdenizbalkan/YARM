@@ -17,38 +17,61 @@ struct FdEntry {
     inode: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsRequest {
+    OpenAt {
+        _dirfd: u64,
+        path_ptr: u64,
+        _flags: u64,
+        _mode: u64,
+    },
+    Close {
+        fd: u64,
+    },
+    Read {
+        fd: u64,
+        _buf_ptr: u64,
+        len: u64,
+    },
+    Write {
+        fd: u64,
+        _buf_ptr: u64,
+        len: u64,
+    },
+    Statx {
+        _dirfd: u64,
+        path_ptr: u64,
+        _flags: u64,
+        _mask_or_buf: u64,
+    },
+}
+
+pub trait VfsBackend {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError>;
+    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError>;
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError>;
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError>;
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError>;
+}
+
 #[derive(Debug)]
-pub struct VfsLiteService {
+pub struct InMemoryBackend {
     next_fd: u64,
     fds: [Option<FdEntry>; MAX_FDS],
 }
 
-impl Default for VfsLiteService {
+impl Default for InMemoryBackend {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl VfsLiteService {
+impl InMemoryBackend {
     pub const fn new() -> Self {
         Self {
             next_fd: 3,
             fds: [None; MAX_FDS],
         }
-    }
-
-    fn read_u64(payload: &[u8], idx: usize) -> Result<u64, VfsLiteError> {
-        let start = idx.checked_mul(8).ok_or(VfsLiteError::Malformed)?;
-        let end = start.checked_add(8).ok_or(VfsLiteError::Malformed)?;
-        let bytes = payload.get(start..end).ok_or(VfsLiteError::Malformed)?;
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(bytes);
-        Ok(u64::from_le_bytes(arr))
-    }
-
-    fn u64_reply(opcode: u16, value: u64) -> Result<Message, VfsLiteError> {
-        Message::with_header(0, opcode, 0, None, &value.to_le_bytes())
-            .map_err(|_| VfsLiteError::Malformed)
     }
 
     fn alloc_fd(&mut self, inode: u64) -> Result<u64, VfsLiteError> {
@@ -78,41 +101,122 @@ impl VfsLiteService {
             Err(VfsLiteError::BadFd)
         }
     }
+}
 
-    pub fn handle_request(&mut self, request: Message) -> Result<Message, VfsLiteError> {
+impl VfsBackend for InMemoryBackend {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        self.alloc_fd(path_ptr)
+    }
+
+    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+        self.close_fd(fd)?;
+        Ok(0)
+    }
+
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        if !self.has_fd(fd) {
+            return Err(VfsLiteError::BadFd);
+        }
+        Ok(len)
+    }
+
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        if !self.has_fd(fd) {
+            return Err(VfsLiteError::BadFd);
+        }
+        Ok(len)
+    }
+
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        Ok(path_ptr)
+    }
+}
+
+#[derive(Debug)]
+pub struct VfsLiteService<B: VfsBackend = InMemoryBackend> {
+    backend: B,
+}
+
+impl Default for VfsLiteService<InMemoryBackend> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VfsLiteService<InMemoryBackend> {
+    pub const fn new() -> Self {
+        Self {
+            backend: InMemoryBackend::new(),
+        }
+    }
+}
+
+impl<B: VfsBackend> VfsLiteService<B> {
+    pub const fn with_backend(backend: B) -> Self {
+        Self { backend }
+    }
+
+    fn read_u64(payload: &[u8], idx: usize) -> Result<u64, VfsLiteError> {
+        let start = idx.checked_mul(8).ok_or(VfsLiteError::Malformed)?;
+        let end = start.checked_add(8).ok_or(VfsLiteError::Malformed)?;
+        let bytes = payload.get(start..end).ok_or(VfsLiteError::Malformed)?;
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(bytes);
+        Ok(u64::from_le_bytes(arr))
+    }
+
+    fn u64_reply(opcode: u16, value: u64) -> Result<Message, VfsLiteError> {
+        Message::with_header(0, opcode, 0, None, &value.to_le_bytes())
+            .map_err(|_| VfsLiteError::Malformed)
+    }
+
+    pub fn parse_request(request: Message) -> Result<VfsRequest, VfsLiteError> {
         let payload = request.as_slice();
         match request.opcode {
-            VFS_OP_OPENAT => {
-                let path_ptr = Self::read_u64(payload, 1)?;
-                let fd = self.alloc_fd(path_ptr)?;
-                Self::u64_reply(VFS_OP_OPENAT, fd)
-            }
-            VFS_OP_CLOSE => {
-                let fd = Self::read_u64(payload, 0)?;
-                self.close_fd(fd)?;
-                Self::u64_reply(VFS_OP_CLOSE, 0)
-            }
-            VFS_OP_READ => {
-                let fd = Self::read_u64(payload, 0)?;
-                let len = Self::read_u64(payload, 2)?;
-                if !self.has_fd(fd) {
-                    return Err(VfsLiteError::BadFd);
-                }
-                Self::u64_reply(VFS_OP_READ, len)
-            }
-            VFS_OP_WRITE => {
-                let fd = Self::read_u64(payload, 0)?;
-                let len = Self::read_u64(payload, 2)?;
-                if !self.has_fd(fd) {
-                    return Err(VfsLiteError::BadFd);
-                }
-                Self::u64_reply(VFS_OP_WRITE, len)
-            }
-            VFS_OP_STATX => {
-                let path_ptr = Self::read_u64(payload, 1)?;
-                Self::u64_reply(VFS_OP_STATX, path_ptr)
-            }
+            VFS_OP_OPENAT => Ok(VfsRequest::OpenAt {
+                _dirfd: Self::read_u64(payload, 0)?,
+                path_ptr: Self::read_u64(payload, 1)?,
+                _flags: Self::read_u64(payload, 2)?,
+                _mode: Self::read_u64(payload, 3)?,
+            }),
+            VFS_OP_CLOSE => Ok(VfsRequest::Close {
+                fd: Self::read_u64(payload, 0)?,
+            }),
+            VFS_OP_READ => Ok(VfsRequest::Read {
+                fd: Self::read_u64(payload, 0)?,
+                _buf_ptr: Self::read_u64(payload, 1)?,
+                len: Self::read_u64(payload, 2)?,
+            }),
+            VFS_OP_WRITE => Ok(VfsRequest::Write {
+                fd: Self::read_u64(payload, 0)?,
+                _buf_ptr: Self::read_u64(payload, 1)?,
+                len: Self::read_u64(payload, 2)?,
+            }),
+            VFS_OP_STATX => Ok(VfsRequest::Statx {
+                _dirfd: Self::read_u64(payload, 0)?,
+                path_ptr: Self::read_u64(payload, 1)?,
+                _flags: Self::read_u64(payload, 2)?,
+                _mask_or_buf: Self::read_u64(payload, 3)?,
+            }),
             _ => Err(VfsLiteError::Unsupported),
+        }
+    }
+
+    pub fn handle_request(&mut self, request: Message) -> Result<Message, VfsLiteError> {
+        match Self::parse_request(request)? {
+            VfsRequest::OpenAt { path_ptr, .. } => {
+                Self::u64_reply(VFS_OP_OPENAT, self.backend.openat(path_ptr)?)
+            }
+            VfsRequest::Close { fd } => Self::u64_reply(VFS_OP_CLOSE, self.backend.close(fd)?),
+            VfsRequest::Read { fd, len, .. } => {
+                Self::u64_reply(VFS_OP_READ, self.backend.read(fd, len)?)
+            }
+            VfsRequest::Write { fd, len, .. } => {
+                Self::u64_reply(VFS_OP_WRITE, self.backend.write(fd, len)?)
+            }
+            VfsRequest::Statx { path_ptr, .. } => {
+                Self::u64_reply(VFS_OP_STATX, self.backend.statx(path_ptr)?)
+            }
         }
     }
 }
@@ -129,6 +233,22 @@ mod tests {
         out[16..24].copy_from_slice(&a2.to_le_bytes());
         out[24..32].copy_from_slice(&a3.to_le_bytes());
         out
+    }
+
+    #[test]
+    fn parser_extracts_openat_fields() {
+        let open_req = Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1000, 0x10, 0))
+            .expect("open");
+        let parsed = VfsLiteService::<InMemoryBackend>::parse_request(open_req).expect("parse");
+        assert_eq!(
+            parsed,
+            VfsRequest::OpenAt {
+                _dirfd: 0,
+                path_ptr: 0x1000,
+                _flags: 0x10,
+                _mode: 0,
+            }
+        );
     }
 
     #[test]

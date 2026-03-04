@@ -94,3 +94,5 @@ The payload shape is a fixed 16-byte little-endian tuple (`arg0`, `arg1`) and is
 The process-manager v2 path also defines a typed `ProcV2Args` 16-byte codec (`arg0`, `arg1`) to freeze payload semantics before adding broader spawn/wait APIs.
 
 A minimal `vfs_lite` service implementation now exists in-kernel module space as a user-space server model scaffold (`src/kernel/vfs_lite.rs`) and is exercised by `src/bin/vfs_lite.rs`.
+
+The compatibility test suite now includes an end-to-end personality shim flow (`getpid` + `openat` + `exit`) to verify process-manager and VFS routing in one sequence.

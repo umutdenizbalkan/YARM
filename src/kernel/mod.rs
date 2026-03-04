@@ -5,6 +5,7 @@ pub mod driver_proto;
 pub mod ipc;
 pub mod linux_compat;
 pub mod lock;
+pub mod process_manager;
 pub mod runtime;
 pub mod scheduler;
 pub mod smp;

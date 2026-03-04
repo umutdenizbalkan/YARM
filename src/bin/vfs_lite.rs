@@ -2,11 +2,11 @@ use yarm::kernel::bootstrap::Bootstrap;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::linux_compat::{LINUX_NR_OPENAT, dispatch};
 use yarm::kernel::trapframe::TrapFrame;
-use yarm::kernel::vfs_lite::VfsLiteService;
+use yarm::kernel::vfs_lite::{InMemoryBackend, VfsLiteService};
 
 fn main() {
     let mut kernel = Bootstrap::init().expect("init");
-    let mut vfs = VfsLiteService::new();
+    let mut vfs = VfsLiteService::with_backend(InMemoryBackend::new());
 
     let (_req_ep, req_send, _req_recv) = kernel.create_endpoint(8).expect("req ep");
     let (_rep_ep, rep_send, rep_recv) = kernel.create_endpoint(8).expect("rep ep");

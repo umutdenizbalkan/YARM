@@ -1053,4 +1053,58 @@ mod tests {
             .expect("msg");
         assert_eq!(reply.opcode, PROC_OP_WAITPID_V2);
     }
+
+    #[test]
+    fn linux_personality_shim_end_to_end_open_getpid_and_exit() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_proc_req_ep, proc_req_send, proc_req_recv) =
+            state.create_endpoint(8).expect("proc req");
+        let (_proc_rep_ep, proc_rep_send, proc_rep_recv) =
+            state.create_endpoint(8).expect("proc rep");
+        state
+            .register_linux_process_manager(proc_req_send, proc_rep_recv)
+            .expect("register proc");
+
+        let (_vfs_req_ep, vfs_req_send, vfs_req_recv) = state.create_endpoint(8).expect("vfs req");
+        let (_vfs_rep_ep, vfs_rep_send, vfs_rep_recv) = state.create_endpoint(8).expect("vfs rep");
+        state
+            .register_linux_vfs_manager(vfs_req_send, vfs_rep_recv)
+            .expect("register vfs");
+
+        state
+            .ipc_send(
+                proc_rep_send,
+                Message::with_header(0, PROC_OP_GETPID, 0, None, &42u64.to_le_bytes())
+                    .expect("rep"),
+            )
+            .expect("seed pid");
+        state
+            .ipc_send(
+                vfs_rep_send,
+                Message::with_header(0, VFS_OP_OPENAT, 0, None, &3u64.to_le_bytes()).expect("rep"),
+            )
+            .expect("seed open");
+
+        let mut getpid = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut getpid);
+        assert_eq!(getpid.error, 0);
+        assert_eq!(getpid.ret0, 42);
+
+        let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x2000, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut openat);
+        assert_eq!(openat.error, 0);
+        assert_eq!(openat.ret0, 3);
+
+        let mut exit = TrapFrame::new(LINUX_NR_EXIT, [5, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut exit);
+        assert_eq!(exit.error, 0);
+
+        let proc_getpid = state.ipc_recv(proc_req_recv).expect("recv").expect("msg");
+        assert_eq!(proc_getpid.opcode, PROC_OP_GETPID);
+        let proc_exit = state.ipc_recv(proc_req_recv).expect("recv").expect("msg");
+        assert_eq!(proc_exit.opcode, PROC_OP_EXIT);
+
+        let vfs_open = state.ipc_recv(vfs_req_recv).expect("recv").expect("msg");
+        assert_eq!(vfs_open.opcode, VFS_OP_OPENAT);
+    }
 }

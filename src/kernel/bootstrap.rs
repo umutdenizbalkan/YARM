@@ -53,6 +53,14 @@ pub enum FaultPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassPolicySnapshot {
+    pub class: TaskClass,
+    pub restart_budget: u8,
+    pub restart_backoff_ticks: u64,
+    pub escalation_threshold: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestartTelemetry {
     pub budget_remaining: u8,
     pub backoff_ticks: u64,
@@ -666,9 +674,16 @@ impl KernelState {
             .flatten()
             .find(|record| record.tid == tid)
             .ok_or(KernelError::TaskMissing)?;
-        record.irq_cap = None;
-        record.dma_cap = None;
-        record.iova_space_cap = None;
+
+        if let Some(cap) = record.irq_cap.take() {
+            let _ = self.cspace.revoke(cap);
+        }
+        if let Some(cap) = record.dma_cap.take() {
+            let _ = self.cspace.revoke(cap);
+        }
+        if let Some(cap) = record.iova_space_cap.take() {
+            let _ = self.cspace.revoke(cap);
+        }
         record.dma_iova_base = None;
         record.dma_iova_len = None;
         Ok(())
@@ -1070,6 +1085,21 @@ impl KernelState {
             TaskClass::App => self.app_restart_policy,
             TaskClass::Driver => self.driver_restart_policy,
             TaskClass::SystemServer => self.system_restart_policy,
+        }
+    }
+
+    pub fn class_policy_snapshot(&self, class: TaskClass) -> ClassPolicySnapshot {
+        let policy = self.restart_policy_for_class(class);
+        let escalation_threshold = match class {
+            TaskClass::App => self.app_escalation_threshold,
+            TaskClass::Driver => self.driver_escalation_threshold,
+            TaskClass::SystemServer => self.system_escalation_threshold,
+        };
+        ClassPolicySnapshot {
+            class,
+            restart_budget: policy.budget,
+            restart_backoff_ticks: policy.backoff_ticks,
+            escalation_threshold,
         }
     }
 
@@ -2834,6 +2864,43 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn class_policy_snapshot_reports_driver_settings() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_class_restart_policy(TaskClass::Driver, 6, 40);
+        state.set_class_escalation_threshold(TaskClass::Driver, 4);
+
+        let snap = state.class_policy_snapshot(TaskClass::Driver);
+        assert_eq!(snap.class, TaskClass::Driver);
+        assert_eq!(snap.restart_budget, 6);
+        assert_eq!(snap.restart_backoff_ticks, 40);
+        assert_eq!(snap.escalation_threshold, 4);
+    }
+
+    #[test]
+    fn revoke_driver_runtime_caps_revokes_from_cspace() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(32).expect("task");
+        state.register_driver(32).expect("driver");
+
+        let irq = state.mint_irq_cap(4).expect("irq");
+        state.grant_driver_irq(32, irq).expect("grant irq");
+
+        let (_id, mem) = state.alloc_anonymous_memory_object().expect("mem");
+        let dma = state
+            .mint_dma_region_cap(mem, 0, crate::kernel::vm::PAGE_SIZE)
+            .expect("dma");
+        state.grant_driver_dma(32, dma).expect("grant dma");
+
+        let iova = state.create_iova_space_cap().expect("iova");
+        state.grant_driver_iova_space(32, iova).expect("grant iova");
+
+        state.revoke_driver_runtime_caps(32).expect("revoke");
+        assert!(state.cspace.get(irq).is_none());
+        assert!(state.cspace.get(dma).is_none());
+        assert!(state.cspace.get(iova).is_none());
     }
 
     #[test]
