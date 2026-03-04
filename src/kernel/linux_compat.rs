@@ -4,6 +4,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
+pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 7;
 
 pub const LINUX_NR_BRK: usize = 214;
 pub const LINUX_NR_MUNMAP: usize = 215;
@@ -11,9 +12,11 @@ pub const LINUX_NR_MMAP: usize = 222;
 pub const LINUX_NR_MPROTECT: usize = 226;
 pub const LINUX_NR_GETPID: usize = 172;
 pub const LINUX_NR_EXIT: usize = 93;
+pub const LINUX_NR_GETPPID: usize = 173;
 
 const PROC_OP_GETPID: u16 = 1;
 const PROC_OP_EXIT: u16 = 2;
+const PROC_OP_GETPPID: u16 = 3;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -75,6 +78,7 @@ impl From<KernelError> for LinuxErrno {
 pub enum LinuxCompatSyscall {
     Exit = LINUX_NR_EXIT,
     Getpid = LINUX_NR_GETPID,
+    Getppid = LINUX_NR_GETPPID,
     Brk = LINUX_NR_BRK,
     Munmap = LINUX_NR_MUNMAP,
     Mmap = LINUX_NR_MMAP,
@@ -82,9 +86,10 @@ pub enum LinuxCompatSyscall {
 }
 
 impl LinuxCompatSyscall {
-    const DISPATCH_TABLE: [usize; 6] = [
+    const DISPATCH_TABLE: [usize; LINUX_COMPAT_SYSCALL_COUNT] = [
         LINUX_NR_EXIT,
         LINUX_NR_GETPID,
+        LINUX_NR_GETPPID,
         LINUX_NR_BRK,
         LINUX_NR_MUNMAP,
         LINUX_NR_MMAP,
@@ -99,6 +104,7 @@ impl LinuxCompatSyscall {
         match raw {
             LINUX_NR_EXIT => Ok(Self::Exit),
             LINUX_NR_GETPID => Ok(Self::Getpid),
+            LINUX_NR_GETPPID => Ok(Self::Getppid),
             LINUX_NR_BRK => Ok(Self::Brk),
             LINUX_NR_MUNMAP => Ok(Self::Munmap),
             LINUX_NR_MMAP => Ok(Self::Mmap),
@@ -265,6 +271,22 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
             bytes.copy_from_slice(&reply.as_slice()[..8]);
             Ok(u64::from_le_bytes(bytes) as usize)
         }
+        LinuxCompatSyscall::Getppid => {
+            let tid = kernel.scheduler.current_tid().ok_or(LinuxErrno::NoSys)?;
+            kernel
+                .send_linux_process_manager_request(PROC_OP_GETPPID, tid)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_process_manager_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            if reply.len < 8 {
+                return Err(LinuxErrno::Inval);
+            }
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&reply.as_slice()[..8]);
+            Ok(u64::from_le_bytes(bytes) as usize)
+        }
         LinuxCompatSyscall::Mmap => {
             let aspace_cap = CapId(frame.args[LINUX_ARG0] as u64);
             let addr = frame.args[LINUX_ARG1];
@@ -314,6 +336,40 @@ mod tests {
         assert_eq!(LinuxErrno::Perm.code(), EPERM);
         assert_eq!(LinuxErrno::NoMem.code(), ENOMEM);
         assert_eq!(LinuxErrno::NoSys.code(), ENOSYS);
+    }
+
+    #[test]
+    fn linux_compat_abi_contract_is_frozen() {
+        assert_eq!(LINUX_COMPAT_ABI_VERSION, 1);
+        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 7);
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_EXIT),
+            Ok(LinuxCompatSyscall::Exit)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_GETPID),
+            Ok(LinuxCompatSyscall::Getpid)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_GETPPID),
+            Ok(LinuxCompatSyscall::Getppid)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_BRK),
+            Ok(LinuxCompatSyscall::Brk)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_MUNMAP),
+            Ok(LinuxCompatSyscall::Munmap)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_MMAP),
+            Ok(LinuxCompatSyscall::Mmap)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_MPROTECT),
+            Ok(LinuxCompatSyscall::Mprotect)
+        );
     }
 
     #[test]
@@ -398,6 +454,7 @@ mod tests {
             .expect("register proc mgr");
 
         let pid: u64 = 1234;
+        let ppid: u64 = 77;
         state
             .ipc_send(
                 rep_send,
@@ -405,6 +462,13 @@ mod tests {
                     .expect("reply"),
             )
             .expect("seed reply");
+        state
+            .ipc_send(
+                rep_send,
+                Message::with_header(0, PROC_OP_GETPPID, 0, None, &ppid.to_le_bytes())
+                    .expect("reply"),
+            )
+            .expect("seed ppid reply");
 
         let mut getpid_frame = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &mut getpid_frame);
@@ -416,6 +480,17 @@ mod tests {
             .expect("req recv")
             .expect("req msg");
         assert_eq!(req_msg.opcode, PROC_OP_GETPID);
+
+        let mut getppid_frame = TrapFrame::new(LINUX_NR_GETPPID, [0, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut getppid_frame);
+        assert_eq!(getppid_frame.error, 0);
+        assert_eq!(getppid_frame.ret0, ppid as usize);
+
+        let getppid_req = state
+            .ipc_recv(req_recv)
+            .expect("req recv")
+            .expect("getppid req");
+        assert_eq!(getppid_req.opcode, PROC_OP_GETPPID);
 
         let mut exit_frame = TrapFrame::new(LINUX_NR_EXIT, [7, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &mut exit_frame);

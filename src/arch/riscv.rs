@@ -1,4 +1,5 @@
 use crate::kernel::bootstrap::{KernelState, TrapHandleError};
+use crate::kernel::scheduler::CpuId;
 use crate::kernel::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
 
@@ -20,7 +21,7 @@ pub fn decode_trap(scause: usize, stval: usize) -> TrapEvent {
     if is_interrupt {
         return match code {
             IRQ_SUPERVISOR_TIMER => TrapEvent::new(Trap::TimerInterrupt),
-            IRQ_SUPERVISOR_EXTERNAL => TrapEvent::new(Trap::ExternalInterrupt),
+            IRQ_SUPERVISOR_EXTERNAL => TrapEvent::with_irq(Trap::ExternalInterrupt, stval as u16),
             _ => TrapEvent::new(Trap::ExternalInterrupt),
         };
     }
@@ -55,6 +56,18 @@ pub fn handle_trap_from_scause(
     kernel.handle_trap_event(event, frame)
 }
 
+pub fn handle_trap_entry(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    scause: usize,
+    stval: usize,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    let _ = kernel.set_current_cpu(cpu);
+    let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
+    handle_trap_from_scause(kernel, scause, stval, frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +83,13 @@ mod tests {
     fn decode_timer_irq_to_timer_interrupt() {
         let event = decode_trap(INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER, 0);
         assert_eq!(event.trap, Trap::TimerInterrupt);
+    }
+
+    #[test]
+    fn decode_external_irq_carries_irq_line() {
+        let event = decode_trap(INTERRUPT_BIT | IRQ_SUPERVISOR_EXTERNAL, 11);
+        assert_eq!(event.trap, Trap::ExternalInterrupt);
+        assert_eq!(event.irq, Some(11));
     }
 
     #[test]
@@ -97,5 +117,31 @@ mod tests {
         handle_trap_from_scause(&mut state, INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER, 0, None)
             .expect("timer trap");
         assert_eq!(state.scheduler.current_tid(), Some(1));
+    }
+
+    #[test]
+    fn trap_entry_sets_cpu_and_processes_cpu_work() {
+        use crate::kernel::bootstrap::Bootstrap;
+        use crate::kernel::smp::WorkItem;
+
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        state
+            .submit_cross_cpu_work(WorkItem::TlbShootdown {
+                target_cpu: CpuId(1),
+                asid: 1,
+            })
+            .expect("submit");
+
+        handle_trap_entry(
+            &mut state,
+            CpuId(1),
+            INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER,
+            0,
+            None,
+        )
+        .expect("handle");
+        assert_eq!(state.scheduler.current_cpu(), CpuId(1));
+        assert_eq!(state.tlb_shootdown_count(), 1);
     }
 }

@@ -9,6 +9,8 @@ pub enum CapRights {
     Send,
     Receive,
     Schedule,
+    Signal,
+    Wait,
 }
 
 impl CapRights {
@@ -20,6 +22,8 @@ impl CapRights {
             Self::Send => 1 << 3,
             Self::Receive => 1 << 4,
             Self::Schedule => 1 << 5,
+            Self::Signal => 1 << 6,
+            Self::Wait => 1 << 7,
         }
     }
 }
@@ -30,6 +34,8 @@ pub enum CapObject {
     Endpoint { index: usize, generation: u64 },
     AddressSpace { asid: u16 },
     MemoryObject { id: u64 },
+    Notification { index: usize, generation: u64 },
+    Irq { line: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

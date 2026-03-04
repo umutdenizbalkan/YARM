@@ -15,6 +15,8 @@ const MAX_ENDPOINTS: usize = 16;
 const MAX_TASKS: usize = 64;
 const MAX_TASK_MEM_ENTRIES: usize = 2048;
 const MAX_MEMORY_OBJECTS: usize = 128;
+const MAX_NOTIFICATIONS: usize = 16;
+const MAX_IRQ_LINES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelError {
@@ -61,6 +63,11 @@ struct MemoryObject {
     phys: PhysAddr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NotificationObject {
+    endpoint_idx: usize,
+}
+
 #[derive(Debug)]
 pub struct KernelState {
     pub kernel_aspace: AddressSpace,
@@ -73,6 +80,9 @@ pub struct KernelState {
     endpoint_waiters: [Option<u64>; MAX_ENDPOINTS],
     endpoint_sender_waiters: [Option<(u64, Message)>; MAX_ENDPOINTS],
     endpoint_generations: [u64; MAX_ENDPOINTS],
+    notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
+    notification_generations: [u64; MAX_NOTIFICATIONS],
+    irq_routes: [Option<usize>; MAX_IRQ_LINES],
     tcbs: [Option<ThreadControlBlock>; MAX_TASKS],
     task_mem: [Option<TaskMemByte>; MAX_TASK_MEM_ENTRIES],
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
@@ -129,6 +139,9 @@ impl Bootstrap {
             endpoint_waiters: [None; MAX_ENDPOINTS],
             endpoint_sender_waiters: [None; MAX_ENDPOINTS],
             endpoint_generations: [0; MAX_ENDPOINTS],
+            notifications: [const { None }; MAX_NOTIFICATIONS],
+            notification_generations: [0; MAX_NOTIFICATIONS],
+            irq_routes: [None; MAX_IRQ_LINES],
             tcbs: [None; MAX_TASKS],
             task_mem: [None; MAX_TASK_MEM_ENTRIES],
             memory_objects: [None; MAX_MEMORY_OBJECTS],
@@ -651,9 +664,11 @@ impl KernelState {
                 }
                 Ok(index)
             }
-            CapObject::Kernel | CapObject::AddressSpace { .. } | CapObject::MemoryObject { .. } => {
-                Err(KernelError::WrongObject)
-            }
+            CapObject::Kernel
+            | CapObject::AddressSpace { .. }
+            | CapObject::MemoryObject { .. }
+            | CapObject::Notification { .. }
+            | CapObject::Irq { .. } => Err(KernelError::WrongObject),
         }
     }
 
@@ -728,6 +743,111 @@ impl KernelState {
             .map_err(|_| KernelError::CapabilityFull)?;
 
         Ok((endpoint_idx, send_cap, recv_cap))
+    }
+
+    pub fn create_notification(
+        &mut self,
+        max_depth: usize,
+    ) -> Result<(usize, CapId, CapId), KernelError> {
+        let (endpoint_idx, notif_send_cap, recv_cap) =
+            self.create_endpoint_with_mode(max_depth, EndpointMode::Buffered)?;
+
+        let mut slot_index = None;
+        for (idx, slot) in self.notifications.iter().enumerate() {
+            if slot.is_none() {
+                slot_index = Some(idx);
+                break;
+            }
+        }
+
+        let notification_idx = slot_index.ok_or(KernelError::EndpointFull)?;
+        let mut next_generation = self.notification_generations[notification_idx].wrapping_add(1);
+        if next_generation == 0 {
+            next_generation = 1;
+        }
+        self.notification_generations[notification_idx] = next_generation;
+        self.notifications[notification_idx] = Some(NotificationObject { endpoint_idx });
+
+        let notification_cap = self
+            .cspace
+            .mint(Capability::new(
+                "notification",
+                CapObject::Notification {
+                    index: notification_idx,
+                    generation: self.notification_generations[notification_idx],
+                },
+                &[CapRights::Signal],
+            ))
+            .map_err(|_| KernelError::CapabilityFull)?;
+
+        // Keep and return endpoint send cap for software-side injection/testing paths.
+        let _ = notif_send_cap;
+        Ok((notification_idx, notification_cap, recv_cap))
+    }
+
+    fn resolve_notification_index(&self, object: CapObject) -> Result<usize, KernelError> {
+        match object {
+            CapObject::Notification { index, generation } => {
+                if index >= MAX_NOTIFICATIONS || self.notifications[index].is_none() {
+                    return Err(KernelError::WrongObject);
+                }
+                if self.notification_generations[index] != generation {
+                    return Err(KernelError::StaleCapability);
+                }
+                Ok(index)
+            }
+            _ => Err(KernelError::WrongObject),
+        }
+    }
+
+    pub fn bind_irq_notification(
+        &mut self,
+        irq_line: u16,
+        notification_cap: CapId,
+    ) -> Result<(), KernelError> {
+        let capability = self
+            .cspace
+            .get(notification_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        if !capability.has_right(CapRights::Signal) {
+            return Err(KernelError::MissingRight);
+        }
+
+        let notif_idx = self.resolve_notification_index(capability.object)?;
+        let irq_idx = irq_line as usize;
+        if irq_idx >= MAX_IRQ_LINES {
+            return Err(KernelError::WrongObject);
+        }
+        self.irq_routes[irq_idx] = Some(notif_idx);
+        Ok(())
+    }
+
+    fn signal_notification(
+        &mut self,
+        notification_idx: usize,
+        irq_line: u16,
+    ) -> Result<(), KernelError> {
+        let notif = self.notifications[notification_idx].ok_or(KernelError::WrongObject)?;
+        let payload = irq_line.to_le_bytes();
+        let msg = Message::with_header(0, irq_line, 0, None, &payload)
+            .map_err(|_| KernelError::WrongObject)?;
+        if let Some(endpoint) = self.endpoints[notif.endpoint_idx].as_mut() {
+            endpoint
+                .send(msg)
+                .map_err(|_| KernelError::EndpointQueueFull)?;
+            let _ = self.wake_waiter_for_endpoint(notif.endpoint_idx);
+            Ok(())
+        } else {
+            Err(KernelError::WrongObject)
+        }
+    }
+
+    pub fn route_external_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {
+        let irq_idx = irq_line as usize;
+        let Some(notification_idx) = self.irq_routes.get(irq_idx).copied().flatten() else {
+            return Ok(());
+        };
+        self.signal_notification(notification_idx, irq_line)
     }
 
     pub fn ipc_send(&mut self, send_cap: CapId, msg: Message) -> Result<(), KernelError> {
@@ -1064,6 +1184,14 @@ impl KernelState {
                 .fault_current_task()
                 .map_err(SyscallError::from)
                 .map_err(TrapHandleError::Syscall),
+            Trap::ExternalInterrupt => {
+                if let Some(irq) = event.irq {
+                    self.route_external_irq(irq)
+                        .map_err(SyscallError::from)
+                        .map_err(TrapHandleError::Syscall)?;
+                }
+                self.handle_trap(Trap::ExternalInterrupt, frame)
+            }
             other => self.handle_trap(other, frame),
         }
     }
@@ -1804,5 +1932,30 @@ mod tests {
         assert_eq!(recv_frame.error, SyscallError::PageFault.code());
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
         assert_eq!(state.scheduler.current_tid(), Some(1));
+    }
+
+    #[test]
+    fn notification_irq_route_delivers_message_to_bound_endpoint() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_notif_idx, notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
+        state.bind_irq_notification(11, notif_cap).expect("bind");
+
+        state
+            .handle_trap_event(TrapEvent::with_irq(Trap::ExternalInterrupt, 11), None)
+            .expect("handle irq");
+
+        let msg = state.ipc_recv(notif_recv_cap).expect("recv").expect("msg");
+        assert_eq!(msg.opcode, 11);
+        assert_eq!(msg.as_slice()[0], 11);
+    }
+
+    #[test]
+    fn create_notification_rejects_non_signal_cap_for_irq_binding() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(2).expect("ep");
+        let err = state
+            .bind_irq_notification(1, recv_cap)
+            .expect_err("must fail");
+        assert_eq!(err, KernelError::MissingRight);
     }
 }

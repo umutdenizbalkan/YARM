@@ -17,6 +17,7 @@ This file documents the initial architecture split work for step 5b.
   - converts timer/external IRQ causes -> timer/external trap classes
   - converts load/store page faults -> `Trap::PageFault` with `FaultInfo`
 - `KernelState::handle_trap_event` to consume normalized trap events from arch decoders.
+- `arch::riscv::handle_trap_entry` to set current CPU, drain per-CPU deferred work, then route normalized trap events.
 
 ## Next
 

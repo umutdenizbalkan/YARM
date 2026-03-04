@@ -5,9 +5,11 @@ This document defines the Linux-compatibility bridge layer used to ease userland
 ## Scope (implemented)
 
 - ABI version: `1`
+- Dispatcher table size frozen at `7` entries
 - Linux syscall numbers supported by dispatcher table:
   - `exit` = 93
   - `getpid` = 172
+  - `getppid` = 173
   - `brk` = 214
   - `munmap` = 215
   - `mmap` = 222
@@ -40,7 +42,7 @@ A minimal `brk` region manager is implemented:
 
 ## Process-manager vertical path
 
-Linux-facing `getpid` / `exit` requests are now mapped onto IPC server requests:
+Linux-facing `getpid` / `getppid` / `exit` requests are now mapped onto IPC server requests:
 
 - kernel sends request messages to a registered process-manager request endpoint
 - kernel receives replies from a registered process-manager reply endpoint
