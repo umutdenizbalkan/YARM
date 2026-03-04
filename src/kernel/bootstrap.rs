@@ -1,7 +1,7 @@
 use super::capabilities::{CapId, CapObject, CapRights, Capability, CapabilitySpace};
 use super::ipc::{Endpoint, EndpointMode, Message};
 use super::scheduler::{CpuId, SmpScheduler};
-use super::smp::{CrossCpuWorkQueue, WorkItem};
+use super::smp::{CrossCpuWorkQueue, MAX_CROSS_CPU_WORK, WorkItem};
 use super::syscall::{SyscallError, dispatch as dispatch_syscall};
 use super::task::{TaskStatus, ThreadControlBlock, WaitReason};
 use super::timer::Timer;
@@ -78,6 +78,7 @@ pub struct KernelState {
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
     next_memory_object_id: u64,
     next_anon_phys: usize,
+    tlb_shootdown_count: u64,
     last_fault: Option<FaultInfo>,
     fault_handler_endpoint: Option<usize>,
     fault_policy: FaultPolicy,
@@ -131,6 +132,7 @@ impl Bootstrap {
             memory_objects: [None; MAX_MEMORY_OBJECTS],
             next_memory_object_id: 1,
             next_anon_phys: 0x1000_0000,
+            tlb_shootdown_count: 0,
             last_fault: None,
             fault_handler_endpoint: None,
             fault_policy: FaultPolicy::KillTask,
@@ -255,6 +257,64 @@ impl KernelState {
 
     pub fn drain_cross_cpu_work(&self) -> Option<WorkItem> {
         self.cross_cpu_work.take()
+    }
+
+    pub fn tlb_shootdown_count(&self) -> u64 {
+        self.tlb_shootdown_count
+    }
+
+    fn apply_cross_cpu_work(&mut self, item: WorkItem) -> Result<(), KernelError> {
+        match item {
+            WorkItem::Reschedule { target_cpu } => {
+                if self.scheduler.current_cpu() == target_cpu {
+                    self.yield_current()?;
+                }
+                Ok(())
+            }
+            WorkItem::TlbShootdown { .. } => {
+                self.tlb_shootdown_count = self.tlb_shootdown_count.wrapping_add(1);
+                Ok(())
+            }
+            WorkItem::WakeTask { target_cpu, tid } => {
+                let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Runnable;
+                self.enqueue_on_cpu(target_cpu, tid)
+            }
+        }
+    }
+
+    pub fn process_cross_cpu_work_for_cpu(&mut self, cpu: CpuId) -> Result<usize, KernelError> {
+        let mut deferred = [None; MAX_CROSS_CPU_WORK];
+        let mut deferred_len = 0usize;
+        let mut processed = 0usize;
+
+        while let Some(item) = self.cross_cpu_work.take() {
+            let target_cpu = match item {
+                WorkItem::Reschedule { target_cpu }
+                | WorkItem::TlbShootdown { target_cpu, .. }
+                | WorkItem::WakeTask { target_cpu, .. } => target_cpu,
+            };
+
+            if target_cpu == cpu {
+                self.apply_cross_cpu_work(item)?;
+                processed += 1;
+            } else if deferred_len < MAX_CROSS_CPU_WORK {
+                deferred[deferred_len] = Some(item);
+                deferred_len += 1;
+            }
+        }
+
+        let mut idx = 0;
+        while idx < deferred_len {
+            if let Some(item) = deferred[idx] {
+                self.cross_cpu_work
+                    .submit(item)
+                    .map_err(|_| KernelError::TaskTableFull)?;
+            }
+            idx += 1;
+        }
+
+        Ok(processed)
     }
 
     pub fn write_user_memory(
@@ -1000,6 +1060,42 @@ mod tests {
             })
         );
         assert_eq!(state.drain_cross_cpu_work(), None);
+    }
+
+    #[test]
+    fn process_cross_cpu_work_applies_matching_cpu_items_only() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+
+        state
+            .submit_cross_cpu_work(WorkItem::WakeTask {
+                target_cpu: CpuId(1),
+                tid: 2,
+            })
+            .expect("submit wake");
+        state
+            .submit_cross_cpu_work(WorkItem::TlbShootdown {
+                target_cpu: CpuId(0),
+                asid: 1,
+            })
+            .expect("submit tlb");
+
+        let done = state
+            .process_cross_cpu_work_for_cpu(CpuId(0))
+            .expect("process cpu0");
+        assert_eq!(done, 1);
+        assert_eq!(state.tlb_shootdown_count(), 1);
+
+        // WakeTask for cpu1 should still be queued.
+        let remaining = state.drain_cross_cpu_work();
+        assert_eq!(
+            remaining,
+            Some(WorkItem::WakeTask {
+                target_cpu: CpuId(1),
+                tid: 2
+            })
+        );
     }
 
     #[test]

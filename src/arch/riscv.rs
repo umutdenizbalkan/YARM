@@ -1,4 +1,6 @@
+use crate::kernel::bootstrap::{KernelState, TrapHandleError};
 use crate::kernel::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
+use crate::kernel::trapframe::TrapFrame;
 
 const INTERRUPT_BIT: usize = 1usize << (usize::BITS as usize - 1);
 
@@ -43,6 +45,16 @@ pub fn decode_trap(scause: usize, stval: usize) -> TrapEvent {
     }
 }
 
+pub fn handle_trap_from_scause(
+    kernel: &mut KernelState,
+    scause: usize,
+    stval: usize,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    let event = decode_trap(scause, stval);
+    kernel.handle_trap_event(event, frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +83,19 @@ mod tests {
                 access: FaultAccess::Write,
             })
         );
+    }
+
+    #[test]
+    fn handle_timer_trap_from_scause_routes_to_kernel() {
+        use crate::kernel::bootstrap::Bootstrap;
+
+        let mut state = Bootstrap::init().expect("init");
+        state.timer = crate::kernel::timer::Timer::new(1);
+        state.register_task(1).expect("task1");
+        state.scheduler.enqueue(1).expect("enqueue");
+
+        handle_trap_from_scause(&mut state, INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER, 0, None)
+            .expect("timer trap");
+        assert_eq!(state.scheduler.current_tid(), Some(1));
     }
 }
