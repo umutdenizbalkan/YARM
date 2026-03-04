@@ -4,7 +4,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
-pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 15;
+pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 20;
 pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = 1;
 pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = 1;
 
@@ -23,6 +23,11 @@ pub const LINUX_NR_IOCTL: usize = 29;
 pub const LINUX_NR_DUP: usize = 23;
 pub const LINUX_NR_FCNTL: usize = 25;
 pub const LINUX_NR_POLL: usize = 73;
+pub const LINUX_NR_EPOLL_CREATE1: usize = 20;
+pub const LINUX_NR_EPOLL_CTL: usize = 21;
+pub const LINUX_NR_EPOLL_PWAIT: usize = 22;
+pub const LINUX_NR_SENDFILE: usize = 71;
+pub const LINUX_NR_STATX: usize = 291;
 
 pub const PROC_OP_GETPID: u16 = 1;
 pub const PROC_OP_EXIT: u16 = 2;
@@ -36,6 +41,11 @@ pub const VFS_OP_IOCTL: u16 = 14;
 pub const VFS_OP_DUP: u16 = 15;
 pub const VFS_OP_FCNTL: u16 = 16;
 pub const VFS_OP_POLL: u16 = 17;
+pub const VFS_OP_EPOLL_CREATE1: u16 = 18;
+pub const VFS_OP_EPOLL_CTL: u16 = 19;
+pub const VFS_OP_EPOLL_PWAIT: u16 = 20;
+pub const VFS_OP_SENDFILE: u16 = 21;
+pub const VFS_OP_STATX: u16 = 22;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -106,6 +116,11 @@ pub enum LinuxCompatSyscall {
     Dup = LINUX_NR_DUP,
     Fcntl = LINUX_NR_FCNTL,
     Poll = LINUX_NR_POLL,
+    EpollCreate1 = LINUX_NR_EPOLL_CREATE1,
+    EpollCtl = LINUX_NR_EPOLL_CTL,
+    EpollPwait = LINUX_NR_EPOLL_PWAIT,
+    Sendfile = LINUX_NR_SENDFILE,
+    Statx = LINUX_NR_STATX,
     Brk = LINUX_NR_BRK,
     Munmap = LINUX_NR_MUNMAP,
     Mmap = LINUX_NR_MMAP,
@@ -125,6 +140,11 @@ impl LinuxCompatSyscall {
         LINUX_NR_DUP,
         LINUX_NR_FCNTL,
         LINUX_NR_POLL,
+        LINUX_NR_EPOLL_CREATE1,
+        LINUX_NR_EPOLL_CTL,
+        LINUX_NR_EPOLL_PWAIT,
+        LINUX_NR_SENDFILE,
+        LINUX_NR_STATX,
         LINUX_NR_BRK,
         LINUX_NR_MUNMAP,
         LINUX_NR_MMAP,
@@ -148,6 +168,11 @@ impl LinuxCompatSyscall {
             LINUX_NR_DUP => Ok(Self::Dup),
             LINUX_NR_FCNTL => Ok(Self::Fcntl),
             LINUX_NR_POLL => Ok(Self::Poll),
+            LINUX_NR_EPOLL_CREATE1 => Ok(Self::EpollCreate1),
+            LINUX_NR_EPOLL_CTL => Ok(Self::EpollCtl),
+            LINUX_NR_EPOLL_PWAIT => Ok(Self::EpollPwait),
+            LINUX_NR_SENDFILE => Ok(Self::Sendfile),
+            LINUX_NR_STATX => Ok(Self::Statx),
             LINUX_NR_BRK => Ok(Self::Brk),
             LINUX_NR_MUNMAP => Ok(Self::Munmap),
             LINUX_NR_MMAP => Ok(Self::Mmap),
@@ -478,6 +503,81 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
         }
+        LinuxCompatSyscall::EpollCreate1 => {
+            let payload = pack_vfs4(frame.args[LINUX_ARG0], 0, 0, 0);
+            kernel
+                .send_linux_vfs_request(VFS_OP_EPOLL_CREATE1, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
+        LinuxCompatSyscall::EpollCtl => {
+            let payload = pack_vfs4(
+                frame.args[LINUX_ARG0],
+                frame.args[LINUX_ARG1],
+                frame.args[LINUX_ARG2],
+                frame.args[LINUX_ARG3],
+            );
+            kernel
+                .send_linux_vfs_request(VFS_OP_EPOLL_CTL, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
+        LinuxCompatSyscall::EpollPwait => {
+            let payload = pack_vfs4(
+                frame.args[LINUX_ARG0],
+                frame.args[LINUX_ARG1],
+                frame.args[LINUX_ARG2],
+                frame.args[LINUX_ARG3],
+            );
+            kernel
+                .send_linux_vfs_request(VFS_OP_EPOLL_PWAIT, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
+        LinuxCompatSyscall::Sendfile => {
+            let payload = pack_vfs4(
+                frame.args[LINUX_ARG0],
+                frame.args[LINUX_ARG1],
+                frame.args[LINUX_ARG2],
+                frame.args[LINUX_ARG3],
+            );
+            kernel
+                .send_linux_vfs_request(VFS_OP_SENDFILE, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
+        LinuxCompatSyscall::Statx => {
+            let payload = pack_vfs4(
+                frame.args[LINUX_ARG0],
+                frame.args[LINUX_ARG1],
+                frame.args[LINUX_ARG2],
+                frame.args[LINUX_ARG3],
+            );
+            kernel
+                .send_linux_vfs_request(VFS_OP_STATX, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
         LinuxCompatSyscall::Brk => {
             let requested = frame.args[LINUX_ARG0];
             let aspace_cap = CapId(frame.args[LINUX_ARG1] as u64);
@@ -510,7 +610,7 @@ mod tests {
     #[test]
     fn linux_compat_abi_contract_is_frozen() {
         assert_eq!(LINUX_COMPAT_ABI_VERSION, 1);
-        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 15);
+        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 20);
         assert_eq!(LINUX_PROC_SERVER_ABI_VERSION, 1);
         assert_eq!(LINUX_VFS_SERVER_ABI_VERSION, 1);
         assert_eq!(
@@ -556,6 +656,26 @@ mod tests {
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_POLL),
             Ok(LinuxCompatSyscall::Poll)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_EPOLL_CREATE1),
+            Ok(LinuxCompatSyscall::EpollCreate1)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_EPOLL_CTL),
+            Ok(LinuxCompatSyscall::EpollCtl)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_EPOLL_PWAIT),
+            Ok(LinuxCompatSyscall::EpollPwait)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_SENDFILE),
+            Ok(LinuxCompatSyscall::Sendfile)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_STATX),
+            Ok(LinuxCompatSyscall::Statx)
         );
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_BRK),
@@ -710,13 +830,15 @@ mod tests {
     #[test]
     fn linux_dispatch_vfs_syscalls_route_to_vfs_ipc() {
         let mut state = Bootstrap::init().expect("init");
-        let (_req_ep, req_send, req_recv) = state.create_endpoint(8).expect("vfs req ep");
-        let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(8).expect("vfs rep ep");
+        let (_req_ep, req_send, req_recv) = state.create_endpoint(16).expect("vfs req ep");
+        let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(16).expect("vfs rep ep");
         state
             .register_linux_vfs_manager(req_send, rep_recv)
             .expect("register vfs");
 
-        for value in [42u64, 0u64, 128u64, 64u64, 0u64, 43u64, 0u64, 1u64] {
+        for value in [
+            42u64, 0u64, 128u64, 64u64, 0u64, 43u64, 0u64, 1u64, 7u64, 0u64, 1u64, 99u64, 0u64,
+        ] {
             state
                 .ipc_send(
                     rep_send,
@@ -777,5 +899,37 @@ mod tests {
         assert_eq!(poll.ret0, 1);
         let poll_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(poll_req.opcode, VFS_OP_POLL);
+        let mut epoll_create = TrapFrame::new(LINUX_NR_EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut epoll_create);
+        assert_eq!(epoll_create.error, 0);
+        assert_eq!(epoll_create.ret0, 7);
+        let epc_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(epc_req.opcode, VFS_OP_EPOLL_CREATE1);
+
+        let mut epoll_ctl = TrapFrame::new(LINUX_NR_EPOLL_CTL, [7, 1, 42, 0xA000, 0, 0]);
+        dispatch(&mut state, &mut epoll_ctl);
+        assert_eq!(epoll_ctl.error, 0);
+        let epctl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(epctl_req.opcode, VFS_OP_EPOLL_CTL);
+
+        let mut epoll_wait = TrapFrame::new(LINUX_NR_EPOLL_PWAIT, [7, 0xB000, 4, 10, 0, 0]);
+        dispatch(&mut state, &mut epoll_wait);
+        assert_eq!(epoll_wait.error, 0);
+        assert_eq!(epoll_wait.ret0, 1);
+        let epwait_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(epwait_req.opcode, VFS_OP_EPOLL_PWAIT);
+
+        let mut sendfile = TrapFrame::new(LINUX_NR_SENDFILE, [1, 2, 0xC000, 99, 0, 0]);
+        dispatch(&mut state, &mut sendfile);
+        assert_eq!(sendfile.error, 0);
+        assert_eq!(sendfile.ret0, 99);
+        let sendfile_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(sendfile_req.opcode, VFS_OP_SENDFILE);
+
+        let mut statx = TrapFrame::new(LINUX_NR_STATX, [3, 0xD000, 0, 0xE000, 0, 0]);
+        dispatch(&mut state, &mut statx);
+        assert_eq!(statx.error, 0);
+        let statx_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(statx_req.opcode, VFS_OP_STATX);
     }
 }

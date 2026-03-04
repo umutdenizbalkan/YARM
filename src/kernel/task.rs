@@ -30,4 +30,6 @@ pub struct ThreadControlBlock {
     pub restart_budget: u8,
     pub restart_backoff_ticks: u64,
     pub restart_available_at_tick: u64,
+    pub restart_denied_count: u32,
+    pub last_exit_code: Option<u64>,
 }

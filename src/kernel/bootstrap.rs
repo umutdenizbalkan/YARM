@@ -57,6 +57,8 @@ pub struct RestartTelemetry {
     pub backoff_ticks: u64,
     pub available_at_tick: u64,
     pub token_outstanding: bool,
+    pub denied_count: u32,
+    pub last_exit_code: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,6 +649,8 @@ impl KernelState {
             backoff_ticks: tcb.restart_backoff_ticks,
             available_at_tick: tcb.restart_available_at_tick,
             token_outstanding: tcb.restart_token.is_some(),
+            denied_count: tcb.restart_denied_count,
+            last_exit_code: tcb.last_exit_code,
         })
     }
 
@@ -657,6 +661,7 @@ impl KernelState {
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Exited(code);
         tcb.restart_token = Some(token);
+        tcb.last_exit_code = Some(code);
         self.report_task_exit_to_supervisor(tid, code)?;
 
         if self.scheduler.current_tid() == Some(tid) {
@@ -671,12 +676,15 @@ impl KernelState {
         let now = self.timer.current_ticks();
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         if tcb.restart_token != Some(token) {
+            tcb.restart_denied_count = tcb.restart_denied_count.saturating_add(1);
             return Err(KernelError::WrongObject);
         }
         if tcb.restart_budget == 0 {
+            tcb.restart_denied_count = tcb.restart_denied_count.saturating_add(1);
             return Err(KernelError::WouldBlock);
         }
         if now < tcb.restart_available_at_tick {
+            tcb.restart_denied_count = tcb.restart_denied_count.saturating_add(1);
             return Err(KernelError::WouldBlock);
         }
 
@@ -928,6 +936,8 @@ impl KernelState {
                 restart_budget: 3,
                 restart_backoff_ticks: 10,
                 restart_available_at_tick: 0,
+                restart_denied_count: 0,
+                last_exit_code: None,
             });
             Ok(())
         } else {
@@ -2550,5 +2560,54 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn long_run_multi_core_simulation_is_deterministic() {
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        let (_nidx, ncap, nrecv) = state.create_notification(64).expect("notif");
+        state.bind_irq_notification(7, ncap).expect("bind");
+
+        for i in 1..=20u64 {
+            state.register_task(i).expect("task");
+            state
+                .enqueue_on_cpu(CpuId((i % 2) as usize), i)
+                .expect("enqueue");
+        }
+
+        let mut seed = 0x1234_5678u64;
+        for _ in 0..500 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            match seed % 3 {
+                0 => state
+                    .submit_cross_cpu_work(WorkItem::Reschedule {
+                        target_cpu: CpuId((seed as usize) % 2),
+                    })
+                    .expect("work"),
+                1 => {
+                    if state
+                        .handle_trap_event(TrapEvent::with_irq(Trap::ExternalInterrupt, 7), None)
+                        .is_err()
+                    {
+                        let _ = state.ipc_recv(nrecv);
+                    }
+                }
+                _ => {
+                    let cpu = CpuId((seed as usize) % 2);
+                    state.process_cross_cpu_work_for_cpu(cpu).expect("process");
+                }
+            }
+        }
+
+        let mut seen = 0usize;
+        while state.ipc_recv(nrecv).expect("recv").is_some() {
+            seen += 1;
+            if seen > 2048 {
+                break;
+            }
+        }
+        assert!(seen > 0);
+        assert_eq!(state.online_cpu_count(), 2);
     }
 }
