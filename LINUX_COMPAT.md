@@ -6,6 +6,8 @@ This document defines the Linux-compatibility bridge layer used to ease userland
 
 - ABI version: `1`
 - Linux syscall numbers supported by dispatcher table:
+  - `exit` = 93
+  - `getpid` = 172
   - `brk` = 214
   - `munmap` = 215
   - `mmap` = 222
@@ -35,6 +37,15 @@ A minimal `brk` region manager is implemented:
 ## Linux-compat dispatcher
 
 `linux_compat::dispatch(kernel, frame)` is separate from kernel-native syscall ABI and routes Linux syscall numbers through the compatibility table.
+
+## Process-manager vertical path
+
+Linux-facing `getpid` / `exit` requests are now mapped onto IPC server requests:
+
+- kernel sends request messages to a registered process-manager request endpoint
+- kernel receives replies from a registered process-manager reply endpoint
+
+This is the initial vertical user-space server path over IPC.
 
 ## Design note
 

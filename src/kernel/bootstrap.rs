@@ -81,6 +81,8 @@ pub struct KernelState {
     tlb_shootdown_count: u64,
     last_fault: Option<FaultInfo>,
     fault_handler_endpoint: Option<usize>,
+    linux_proc_mgr_request_send: Option<CapId>,
+    linux_proc_mgr_reply_recv: Option<CapId>,
     fault_policy: FaultPolicy,
 }
 
@@ -135,6 +137,8 @@ impl Bootstrap {
             tlb_shootdown_count: 0,
             last_fault: None,
             fault_handler_endpoint: None,
+            linux_proc_mgr_request_send: None,
+            linux_proc_mgr_reply_recv: None,
             fault_policy: FaultPolicy::KillTask,
         };
 
@@ -216,6 +220,55 @@ impl KernelState {
             .flatten()
             .find(|tcb| tcb.tid == tid)
             .and_then(|tcb| tcb.asid)
+    }
+
+    pub fn register_linux_process_manager(
+        &mut self,
+        request_send_cap: CapId,
+        reply_recv_cap: CapId,
+    ) -> Result<(), KernelError> {
+        if !self.cspace.has_right(request_send_cap, CapRights::Send) {
+            return Err(KernelError::MissingRight);
+        }
+        if !self.cspace.has_right(reply_recv_cap, CapRights::Receive) {
+            return Err(KernelError::MissingRight);
+        }
+        let req_obj = self
+            .cspace
+            .get(request_send_cap)
+            .ok_or(KernelError::InvalidCapability)?
+            .object;
+        let rep_obj = self
+            .cspace
+            .get(reply_recv_cap)
+            .ok_or(KernelError::InvalidCapability)?
+            .object;
+        let _ = self.resolve_endpoint_index(req_obj)?;
+        let _ = self.resolve_endpoint_index(rep_obj)?;
+
+        self.linux_proc_mgr_request_send = Some(request_send_cap);
+        self.linux_proc_mgr_reply_recv = Some(reply_recv_cap);
+        Ok(())
+    }
+
+    pub fn send_linux_process_manager_request(
+        &mut self,
+        opcode: u16,
+        arg0: u64,
+    ) -> Result<(), KernelError> {
+        let send_cap = self
+            .linux_proc_mgr_request_send
+            .ok_or(KernelError::InvalidCapability)?;
+        let msg = Message::with_header(0, opcode, 0, None, &arg0.to_le_bytes())
+            .map_err(|_| KernelError::WrongObject)?;
+        self.ipc_send(send_cap, msg)
+    }
+
+    pub fn recv_linux_process_manager_reply(&mut self) -> Result<Option<Message>, KernelError> {
+        let recv_cap = self
+            .linux_proc_mgr_reply_recv
+            .ok_or(KernelError::InvalidCapability)?;
+        self.ipc_recv(recv_cap)
     }
 
     pub fn bind_task_asid(&mut self, tid: u64, asid: Asid) -> Result<(), KernelError> {

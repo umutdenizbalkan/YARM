@@ -9,6 +9,11 @@ pub const LINUX_NR_BRK: usize = 214;
 pub const LINUX_NR_MUNMAP: usize = 215;
 pub const LINUX_NR_MMAP: usize = 222;
 pub const LINUX_NR_MPROTECT: usize = 226;
+pub const LINUX_NR_GETPID: usize = 172;
+pub const LINUX_NR_EXIT: usize = 93;
+
+const PROC_OP_GETPID: u16 = 1;
+const PROC_OP_EXIT: u16 = 2;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -68,6 +73,8 @@ impl From<KernelError> for LinuxErrno {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum LinuxCompatSyscall {
+    Exit = LINUX_NR_EXIT,
+    Getpid = LINUX_NR_GETPID,
     Brk = LINUX_NR_BRK,
     Munmap = LINUX_NR_MUNMAP,
     Mmap = LINUX_NR_MMAP,
@@ -75,7 +82,9 @@ pub enum LinuxCompatSyscall {
 }
 
 impl LinuxCompatSyscall {
-    const DISPATCH_TABLE: [usize; 4] = [
+    const DISPATCH_TABLE: [usize; 6] = [
+        LINUX_NR_EXIT,
+        LINUX_NR_GETPID,
         LINUX_NR_BRK,
         LINUX_NR_MUNMAP,
         LINUX_NR_MMAP,
@@ -88,6 +97,8 @@ impl LinuxCompatSyscall {
         }
 
         match raw {
+            LINUX_NR_EXIT => Ok(Self::Exit),
+            LINUX_NR_GETPID => Ok(Self::Getpid),
             LINUX_NR_BRK => Ok(Self::Brk),
             LINUX_NR_MUNMAP => Ok(Self::Munmap),
             LINUX_NR_MMAP => Ok(Self::Mmap),
@@ -231,6 +242,29 @@ impl KernelState {
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
     let result: Result<usize, LinuxErrno> = (|| match LinuxCompatSyscall::decode(frame.syscall_num)?
     {
+        LinuxCompatSyscall::Exit => {
+            let code = frame.args[LINUX_ARG0] as u64;
+            kernel
+                .send_linux_process_manager_request(PROC_OP_EXIT, code)
+                .map_err(LinuxErrno::from)?;
+            Ok(0)
+        }
+        LinuxCompatSyscall::Getpid => {
+            let tid = kernel.scheduler.current_tid().ok_or(LinuxErrno::NoSys)?;
+            kernel
+                .send_linux_process_manager_request(PROC_OP_GETPID, tid)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_process_manager_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            if reply.len < 8 {
+                return Err(LinuxErrno::Inval);
+            }
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&reply.as_slice()[..8]);
+            Ok(u64::from_le_bytes(bytes) as usize)
+        }
         LinuxCompatSyscall::Mmap => {
             let aspace_cap = CapId(frame.args[LINUX_ARG0] as u64);
             let addr = frame.args[LINUX_ARG1];
@@ -272,6 +306,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
 mod tests {
     use super::*;
     use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::ipc::Message;
 
     #[test]
     fn linux_compat_errno_mapping_stable() {
@@ -351,5 +386,46 @@ mod tests {
         );
         dispatch(&mut state, &mut munmap_frame);
         assert_eq!(munmap_frame.error, 0);
+    }
+
+    #[test]
+    fn linux_dispatch_getpid_and_exit_route_to_process_manager_ipc() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("req ep");
+        let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("rep ep");
+        state
+            .register_linux_process_manager(req_send, rep_recv)
+            .expect("register proc mgr");
+
+        let pid: u64 = 1234;
+        state
+            .ipc_send(
+                rep_send,
+                Message::with_header(0, PROC_OP_GETPID, 0, None, &pid.to_le_bytes())
+                    .expect("reply"),
+            )
+            .expect("seed reply");
+
+        let mut getpid_frame = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut getpid_frame);
+        assert_eq!(getpid_frame.error, 0);
+        assert_eq!(getpid_frame.ret0, pid as usize);
+
+        let req_msg = state
+            .ipc_recv(req_recv)
+            .expect("req recv")
+            .expect("req msg");
+        assert_eq!(req_msg.opcode, PROC_OP_GETPID);
+
+        let mut exit_frame = TrapFrame::new(LINUX_NR_EXIT, [7, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut exit_frame);
+        assert_eq!(exit_frame.error, 0);
+
+        let exit_req = state
+            .ipc_recv(req_recv)
+            .expect("req recv")
+            .expect("exit req");
+        assert_eq!(exit_req.opcode, PROC_OP_EXIT);
+        assert_eq!(exit_req.as_slice()[0], 7);
     }
 }
