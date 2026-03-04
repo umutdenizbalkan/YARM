@@ -3,7 +3,7 @@ use super::ipc::{Endpoint, EndpointMode, Message};
 use super::scheduler::{CpuId, SmpScheduler};
 use super::smp::{CrossCpuWorkQueue, MAX_CROSS_CPU_WORK, WorkItem};
 use super::syscall::{SyscallError, dispatch as dispatch_syscall};
-use super::task::{TaskStatus, ThreadControlBlock, WaitReason};
+use super::task::{TaskClass, TaskStatus, ThreadControlBlock, WaitReason};
 use super::timer::Timer;
 use super::trap::{FaultInfo, Trap, TrapAction, TrapEvent, route_trap};
 use super::trapframe::TrapFrame;
@@ -82,6 +82,12 @@ struct NotificationObject {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestartPolicy {
+    budget: u8,
+    backoff_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DriverRecord {
     tid: u64,
     irq_cap: Option<CapId>,
@@ -123,6 +129,9 @@ pub struct KernelState {
     driver_records: [Option<DriverRecord>; MAX_DRIVERS],
     next_restart_token: u64,
     fault_policy: FaultPolicy,
+    app_restart_policy: RestartPolicy,
+    driver_restart_policy: RestartPolicy,
+    system_restart_policy: RestartPolicy,
 }
 
 pub struct Bootstrap;
@@ -188,6 +197,18 @@ impl Bootstrap {
             driver_records: [const { None }; MAX_DRIVERS],
             next_restart_token: 1,
             fault_policy: FaultPolicy::KillTask,
+            app_restart_policy: RestartPolicy {
+                budget: 3,
+                backoff_ticks: 10,
+            },
+            driver_restart_policy: RestartPolicy {
+                budget: 5,
+                backoff_ticks: 20,
+            },
+            system_restart_policy: RestartPolicy {
+                budget: 8,
+                backoff_ticks: 5,
+            },
         };
 
         state.register_task(0)?;
@@ -308,6 +329,23 @@ impl KernelState {
             .linux_proc_mgr_request_send
             .ok_or(KernelError::InvalidCapability)?;
         let msg = Message::with_header(0, opcode, 0, None, &arg0.to_le_bytes())
+            .map_err(|_| KernelError::WrongObject)?;
+        self.ipc_send(send_cap, msg)
+    }
+
+    pub fn send_linux_process_manager_request2(
+        &mut self,
+        opcode: u16,
+        arg0: u64,
+        arg1: u64,
+    ) -> Result<(), KernelError> {
+        let send_cap = self
+            .linux_proc_mgr_request_send
+            .ok_or(KernelError::InvalidCapability)?;
+        let mut payload = [0u8; 16];
+        payload[..8].copy_from_slice(&arg0.to_le_bytes());
+        payload[8..16].copy_from_slice(&arg1.to_le_bytes());
+        let msg = Message::with_header(0, opcode, 0, None, &payload)
             .map_err(|_| KernelError::WrongObject)?;
         self.ipc_send(send_cap, msg)
     }
@@ -602,6 +640,34 @@ impl KernelState {
         }
     }
 
+    pub fn detach_driver_iova_space(&mut self, tid: u64) -> Result<(), KernelError> {
+        let record = self
+            .driver_records
+            .iter_mut()
+            .flatten()
+            .find(|record| record.tid == tid)
+            .ok_or(KernelError::TaskMissing)?;
+        record.iova_space_cap = None;
+        record.dma_iova_base = None;
+        record.dma_iova_len = None;
+        Ok(())
+    }
+
+    pub fn revoke_driver_runtime_caps(&mut self, tid: u64) -> Result<(), KernelError> {
+        let record = self
+            .driver_records
+            .iter_mut()
+            .flatten()
+            .find(|record| record.tid == tid)
+            .ok_or(KernelError::TaskMissing)?;
+        record.irq_cap = None;
+        record.dma_cap = None;
+        record.iova_space_cap = None;
+        record.dma_iova_base = None;
+        record.dma_iova_len = None;
+        Ok(())
+    }
+
     pub fn report_task_exit_to_supervisor(
         &mut self,
         tid: u64,
@@ -741,6 +807,8 @@ impl KernelState {
             return Err(err);
         }
 
+        let _ = self.revoke_driver_runtime_caps(tid);
+
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.restart_budget = tcb.restart_budget.saturating_sub(1);
         tcb.restart_available_at_tick = now.saturating_add(tcb.restart_backoff_ticks);
@@ -755,6 +823,7 @@ impl KernelState {
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Dead;
         tcb.restart_token = None;
+        let _ = self.revoke_driver_runtime_caps(tid);
         Ok(())
     }
 
@@ -974,21 +1043,47 @@ impl KernelState {
         self.read_user_memory(tid, user_ptr, len)
     }
 
-    pub fn register_task(&mut self, tid: u64) -> Result<(), KernelError> {
+    fn restart_policy_for_class(&self, class: TaskClass) -> RestartPolicy {
+        match class {
+            TaskClass::App => self.app_restart_policy,
+            TaskClass::Driver => self.driver_restart_policy,
+            TaskClass::SystemServer => self.system_restart_policy,
+        }
+    }
+
+    pub fn set_class_restart_policy(&mut self, class: TaskClass, budget: u8, backoff_ticks: u64) {
+        let policy = RestartPolicy {
+            budget,
+            backoff_ticks,
+        };
+        match class {
+            TaskClass::App => self.app_restart_policy = policy,
+            TaskClass::Driver => self.driver_restart_policy = policy,
+            TaskClass::SystemServer => self.system_restart_policy = policy,
+        }
+    }
+
+    pub fn register_task_with_class(
+        &mut self,
+        tid: u64,
+        class: TaskClass,
+    ) -> Result<(), KernelError> {
         if self.task_status(tid).is_some() {
             return Ok(());
         }
+        let policy = self.restart_policy_for_class(class);
         if let Some(slot) = self.tcbs.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(ThreadControlBlock {
                 tid,
+                class,
                 status: TaskStatus::Runnable,
                 asid: None,
                 fault_policy_override: None,
                 brk_base: None,
                 brk_end: None,
                 restart_token: None,
-                restart_budget: 3,
-                restart_backoff_ticks: 10,
+                restart_budget: policy.budget,
+                restart_backoff_ticks: policy.backoff_ticks,
                 restart_available_at_tick: 0,
                 restart_denied_count: 0,
                 restart_escalation_count: 0,
@@ -998,6 +1093,10 @@ impl KernelState {
         } else {
             Err(KernelError::TaskTableFull)
         }
+    }
+
+    pub fn register_task(&mut self, tid: u64) -> Result<(), KernelError> {
+        self.register_task_with_class(tid, TaskClass::App)
     }
 
     fn dispatch_next_task(&mut self) -> Result<Option<u64>, KernelError> {
@@ -2601,6 +2700,62 @@ mod tests {
 
         let denial_report = state.ipc_recv(recv_cap).expect("recv").expect("msg");
         assert_eq!(denial_report.opcode, 0xEF);
+    }
+
+    #[test]
+    fn class_restart_policy_applies_on_registration() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_class_restart_policy(TaskClass::Driver, 9, 33);
+        state
+            .register_task_with_class(21, TaskClass::Driver)
+            .expect("register");
+
+        let t = state.task_restart_telemetry(21).expect("telemetry");
+        assert_eq!(t.budget_remaining, 9);
+        assert_eq!(t.backoff_ticks, 33);
+    }
+
+    #[test]
+    fn driver_restart_revokes_runtime_caps() {
+        let mut state = Bootstrap::init().expect("init");
+        state
+            .register_task_with_class(22, TaskClass::Driver)
+            .expect("task");
+        state.register_driver(22).expect("driver");
+
+        let irq_cap = state.mint_irq_cap(3).expect("irq");
+        state.grant_driver_irq(22, irq_cap).expect("grant irq");
+
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+            .expect("dma");
+        state.grant_driver_dma(22, dma_cap).expect("grant dma");
+
+        let iova_cap = state.create_iova_space_cap().expect("iova");
+        state
+            .grant_driver_iova_space(22, iova_cap)
+            .expect("grant iova");
+        state
+            .configure_driver_dma_window(
+                22,
+                crate::kernel::vm::PAGE_SIZE * 8,
+                crate::kernel::vm::PAGE_SIZE,
+            )
+            .expect("window");
+
+        let token = state.exit_task(22, 1).expect("exit");
+        state.restart_task(22, token).expect("restart");
+
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    22,
+                    crate::kernel::vm::PAGE_SIZE * 8,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 
     #[test]

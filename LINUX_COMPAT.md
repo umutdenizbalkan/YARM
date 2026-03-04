@@ -81,3 +81,12 @@ For higher-churn VFS calls we now freeze helper packers so request payload layou
 - `pack_statx(dirfd, path_ptr, flags, mask)`
 
 Each helper encodes four little-endian u64 words (`[arg0,arg1,arg2,arg3]`) into a 32-byte IPC payload.
+
+## Process-manager protocol v2 slice
+
+In addition to single-u64 process-manager requests, the kernel now provides a dual-u64 request path (`send_linux_process_manager_request2`) and frozen v2 opcodes for future spawn/wait routing:
+
+- `PROC_OP_SPAWN_V2`
+- `PROC_OP_WAITPID_V2`
+
+The payload shape is a fixed 16-byte little-endian tuple (`arg0`, `arg1`) and is covered by round-trip unit tests.

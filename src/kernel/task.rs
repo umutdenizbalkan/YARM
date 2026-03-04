@@ -9,6 +9,13 @@ pub enum WaitReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskClass {
+    App,
+    Driver,
+    SystemServer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
     Runnable,
     Running,
@@ -21,6 +28,7 @@ pub enum TaskStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThreadControlBlock {
     pub tid: u64,
+    pub class: TaskClass,
     pub status: TaskStatus,
     pub asid: Option<Asid>,
     pub fault_policy_override: Option<FaultPolicy>,

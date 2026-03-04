@@ -32,6 +32,8 @@ pub const LINUX_NR_STATX: usize = 291;
 pub const PROC_OP_GETPID: u16 = 1;
 pub const PROC_OP_EXIT: u16 = 2;
 pub const PROC_OP_GETPPID: u16 = 3;
+pub const PROC_OP_SPAWN_V2: u16 = 4;
+pub const PROC_OP_WAITPID_V2: u16 = 5;
 
 pub const VFS_OP_OPENAT: u16 = 10;
 pub const VFS_OP_CLOSE: u16 = 11;
@@ -945,6 +947,8 @@ mod tests {
         assert_eq!(epoll_ctl.error, 0);
         let epctl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(epctl_req.opcode, VFS_OP_EPOLL_CTL);
+        assert_eq!(epctl_req.as_slice().len(), 32);
+        assert_eq!(&epctl_req.as_slice()[..8], &(7u64).to_le_bytes());
 
         let mut epoll_wait = TrapFrame::new(LINUX_NR_EPOLL_PWAIT, [7, 0xB000, 4, 10, 0, 0]);
         dispatch(&mut state, &mut epoll_wait);
@@ -959,11 +963,45 @@ mod tests {
         assert_eq!(sendfile.ret0, 99);
         let sendfile_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(sendfile_req.opcode, VFS_OP_SENDFILE);
+        assert_eq!(sendfile_req.as_slice().len(), 32);
+        assert_eq!(&sendfile_req.as_slice()[24..32], &(99u64).to_le_bytes());
 
         let mut statx = TrapFrame::new(LINUX_NR_STATX, [3, 0xD000, 0, 0xE000, 0, 0]);
         dispatch(&mut state, &mut statx);
         assert_eq!(statx.error, 0);
         let statx_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(statx_req.opcode, VFS_OP_STATX);
+        assert_eq!(statx_req.as_slice().len(), 32);
+        assert_eq!(&statx_req.as_slice()[8..16], &(0xD000u64).to_le_bytes());
+    }
+
+    #[test]
+    fn process_manager_v2_dual_arg_payload_roundtrip() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("req ep");
+        let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("rep ep");
+        state
+            .register_linux_process_manager(req_send, rep_recv)
+            .expect("register proc mgr");
+
+        state
+            .send_linux_process_manager_request2(PROC_OP_WAITPID_V2, 42, 0x10)
+            .expect("send");
+        let req = state.ipc_recv(req_recv).expect("recv").expect("msg");
+        assert_eq!(req.opcode, PROC_OP_WAITPID_V2);
+        assert_eq!(req.as_slice().len(), 16);
+
+        state
+            .ipc_send(
+                rep_send,
+                Message::with_header(0, PROC_OP_WAITPID_V2, 0, None, &7u64.to_le_bytes())
+                    .expect("reply"),
+            )
+            .expect("seed");
+        let reply = state
+            .recv_linux_process_manager_reply()
+            .expect("recv")
+            .expect("msg");
+        assert_eq!(reply.opcode, PROC_OP_WAITPID_V2);
     }
 }
