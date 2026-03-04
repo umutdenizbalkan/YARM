@@ -4,7 +4,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
-pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 7;
+pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 11;
 
 pub const LINUX_NR_BRK: usize = 214;
 pub const LINUX_NR_MUNMAP: usize = 215;
@@ -13,10 +13,19 @@ pub const LINUX_NR_MPROTECT: usize = 226;
 pub const LINUX_NR_GETPID: usize = 172;
 pub const LINUX_NR_EXIT: usize = 93;
 pub const LINUX_NR_GETPPID: usize = 173;
+pub const LINUX_NR_OPENAT: usize = 56;
+pub const LINUX_NR_CLOSE: usize = 57;
+pub const LINUX_NR_READ: usize = 63;
+pub const LINUX_NR_WRITE: usize = 64;
 
 const PROC_OP_GETPID: u16 = 1;
 const PROC_OP_EXIT: u16 = 2;
 const PROC_OP_GETPPID: u16 = 3;
+
+const VFS_OP_OPENAT: u16 = 10;
+const VFS_OP_CLOSE: u16 = 11;
+const VFS_OP_READ: u16 = 12;
+const VFS_OP_WRITE: u16 = 13;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -79,6 +88,10 @@ pub enum LinuxCompatSyscall {
     Exit = LINUX_NR_EXIT,
     Getpid = LINUX_NR_GETPID,
     Getppid = LINUX_NR_GETPPID,
+    Openat = LINUX_NR_OPENAT,
+    Close = LINUX_NR_CLOSE,
+    Read = LINUX_NR_READ,
+    Write = LINUX_NR_WRITE,
     Brk = LINUX_NR_BRK,
     Munmap = LINUX_NR_MUNMAP,
     Mmap = LINUX_NR_MMAP,
@@ -90,6 +103,10 @@ impl LinuxCompatSyscall {
         LINUX_NR_EXIT,
         LINUX_NR_GETPID,
         LINUX_NR_GETPPID,
+        LINUX_NR_OPENAT,
+        LINUX_NR_CLOSE,
+        LINUX_NR_READ,
+        LINUX_NR_WRITE,
         LINUX_NR_BRK,
         LINUX_NR_MUNMAP,
         LINUX_NR_MMAP,
@@ -105,6 +122,10 @@ impl LinuxCompatSyscall {
             LINUX_NR_EXIT => Ok(Self::Exit),
             LINUX_NR_GETPID => Ok(Self::Getpid),
             LINUX_NR_GETPPID => Ok(Self::Getppid),
+            LINUX_NR_OPENAT => Ok(Self::Openat),
+            LINUX_NR_CLOSE => Ok(Self::Close),
+            LINUX_NR_READ => Ok(Self::Read),
+            LINUX_NR_WRITE => Ok(Self::Write),
             LINUX_NR_BRK => Ok(Self::Brk),
             LINUX_NR_MUNMAP => Ok(Self::Munmap),
             LINUX_NR_MMAP => Ok(Self::Mmap),
@@ -133,6 +154,24 @@ fn prot_to_page_flags(prot: usize) -> Result<PageFlags, LinuxErrno> {
         execute: (prot & PROT_EXEC) != 0,
         user: true,
     })
+}
+
+fn decode_u64_reply(reply: &[u8]) -> Result<usize, LinuxErrno> {
+    if reply.len() < 8 {
+        return Err(LinuxErrno::Inval);
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&reply[..8]);
+    Ok(u64::from_le_bytes(bytes) as usize)
+}
+
+fn pack_vfs4(a0: usize, a1: usize, a2: usize, a3: usize) -> [u8; 32] {
+    let mut payload = [0u8; 32];
+    payload[0..8].copy_from_slice(&(a0 as u64).to_le_bytes());
+    payload[8..16].copy_from_slice(&(a1 as u64).to_le_bytes());
+    payload[16..24].copy_from_slice(&(a2 as u64).to_le_bytes());
+    payload[24..32].copy_from_slice(&(a3 as u64).to_le_bytes());
+    payload
 }
 
 impl KernelState {
@@ -264,12 +303,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 .recv_linux_process_manager_reply()
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
-            if reply.len < 8 {
-                return Err(LinuxErrno::Inval);
-            }
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&reply.as_slice()[..8]);
-            Ok(u64::from_le_bytes(bytes) as usize)
+            decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::Getppid => {
             let tid = kernel.scheduler.current_tid().ok_or(LinuxErrno::NoSys)?;
@@ -280,12 +314,66 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 .recv_linux_process_manager_reply()
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
-            if reply.len < 8 {
-                return Err(LinuxErrno::Inval);
-            }
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&reply.as_slice()[..8]);
-            Ok(u64::from_le_bytes(bytes) as usize)
+            decode_u64_reply(reply.as_slice())
+        }
+        LinuxCompatSyscall::Openat => {
+            let payload = pack_vfs4(
+                frame.args[LINUX_ARG0],
+                frame.args[LINUX_ARG1],
+                frame.args[LINUX_ARG2],
+                frame.args[LINUX_ARG3],
+            );
+            kernel
+                .send_linux_vfs_request(VFS_OP_OPENAT, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
+        LinuxCompatSyscall::Close => {
+            let payload = pack_vfs4(frame.args[LINUX_ARG0], 0, 0, 0);
+            kernel
+                .send_linux_vfs_request(VFS_OP_CLOSE, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
+        LinuxCompatSyscall::Read => {
+            let payload = pack_vfs4(
+                frame.args[LINUX_ARG0],
+                frame.args[LINUX_ARG1],
+                frame.args[LINUX_ARG2],
+                0,
+            );
+            kernel
+                .send_linux_vfs_request(VFS_OP_READ, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
+        LinuxCompatSyscall::Write => {
+            let payload = pack_vfs4(
+                frame.args[LINUX_ARG0],
+                frame.args[LINUX_ARG1],
+                frame.args[LINUX_ARG2],
+                0,
+            );
+            kernel
+                .send_linux_vfs_request(VFS_OP_WRITE, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::Mmap => {
             let aspace_cap = CapId(frame.args[LINUX_ARG0] as u64);
@@ -341,7 +429,7 @@ mod tests {
     #[test]
     fn linux_compat_abi_contract_is_frozen() {
         assert_eq!(LINUX_COMPAT_ABI_VERSION, 1);
-        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 7);
+        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 11);
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_EXIT),
             Ok(LinuxCompatSyscall::Exit)
@@ -353,6 +441,22 @@ mod tests {
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_GETPPID),
             Ok(LinuxCompatSyscall::Getppid)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_OPENAT),
+            Ok(LinuxCompatSyscall::Openat)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_CLOSE),
+            Ok(LinuxCompatSyscall::Close)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_READ),
+            Ok(LinuxCompatSyscall::Read)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_WRITE),
+            Ok(LinuxCompatSyscall::Write)
         );
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_BRK),
@@ -502,5 +606,51 @@ mod tests {
             .expect("exit req");
         assert_eq!(exit_req.opcode, PROC_OP_EXIT);
         assert_eq!(exit_req.as_slice()[0], 7);
+    }
+
+    #[test]
+    fn linux_dispatch_vfs_syscalls_route_to_vfs_ipc() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_req_ep, req_send, req_recv) = state.create_endpoint(8).expect("vfs req ep");
+        let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(8).expect("vfs rep ep");
+        state
+            .register_linux_vfs_manager(req_send, rep_recv)
+            .expect("register vfs");
+
+        for value in [42u64, 0u64, 128u64, 64u64] {
+            state
+                .ipc_send(
+                    rep_send,
+                    Message::with_header(0, 0, 0, None, &value.to_le_bytes()).expect("reply"),
+                )
+                .expect("seed reply");
+        }
+
+        let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [3, 0x2000, 0x10, 0, 0, 0]);
+        dispatch(&mut state, &mut openat);
+        assert_eq!(openat.error, 0);
+        assert_eq!(openat.ret0, 42);
+        let open_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(open_req.opcode, VFS_OP_OPENAT);
+
+        let mut close = TrapFrame::new(LINUX_NR_CLOSE, [42, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut close);
+        assert_eq!(close.error, 0);
+        let close_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(close_req.opcode, VFS_OP_CLOSE);
+
+        let mut read = TrapFrame::new(LINUX_NR_READ, [42, 0x3000, 128, 0, 0, 0]);
+        dispatch(&mut state, &mut read);
+        assert_eq!(read.error, 0);
+        assert_eq!(read.ret0, 128);
+        let read_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(read_req.opcode, VFS_OP_READ);
+
+        let mut write = TrapFrame::new(LINUX_NR_WRITE, [42, 0x4000, 64, 0, 0, 0]);
+        dispatch(&mut state, &mut write);
+        assert_eq!(write.error, 0);
+        assert_eq!(write.ret0, 64);
+        let write_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(write_req.opcode, VFS_OP_WRITE);
     }
 }

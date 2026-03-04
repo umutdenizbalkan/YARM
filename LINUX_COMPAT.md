@@ -5,11 +5,15 @@ This document defines the Linux-compatibility bridge layer used to ease userland
 ## Scope (implemented)
 
 - ABI version: `1`
-- Dispatcher table size frozen at `7` entries
+- Dispatcher table size frozen at `11` entries
 - Linux syscall numbers supported by dispatcher table:
   - `exit` = 93
   - `getpid` = 172
   - `getppid` = 173
+  - `openat` = 56
+  - `close` = 57
+  - `read` = 63
+  - `write` = 64
   - `brk` = 214
   - `munmap` = 215
   - `mmap` = 222
@@ -48,6 +52,10 @@ Linux-facing `getpid` / `getppid` / `exit` requests are now mapped onto IPC serv
 - kernel receives replies from a registered process-manager reply endpoint
 
 This is the initial vertical user-space server path over IPC.
+
+## VFS-lite vertical path
+
+Linux-facing `openat` / `close` / `read` / `write` requests are mapped onto VFS-manager IPC requests via a dedicated registration path (`register_linux_vfs_manager`).
 
 ## Design note
 
