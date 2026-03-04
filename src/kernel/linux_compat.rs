@@ -1107,4 +1107,70 @@ mod tests {
         let vfs_open = state.ipc_recv(vfs_req_recv).expect("recv").expect("msg");
         assert_eq!(vfs_open.opcode, VFS_OP_OPENAT);
     }
+
+    #[test]
+    fn linux_personality_deterministic_sequence_is_stable() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_proc_req_ep, proc_req_send, proc_req_recv) =
+            state.create_endpoint(16).expect("proc req");
+        let (_proc_rep_ep, proc_rep_send, proc_rep_recv) =
+            state.create_endpoint(16).expect("proc rep");
+        state
+            .register_linux_process_manager(proc_req_send, proc_rep_recv)
+            .expect("register proc");
+
+        let (_vfs_req_ep, vfs_req_send, vfs_req_recv) = state.create_endpoint(16).expect("vfs req");
+        let (_vfs_rep_ep, vfs_rep_send, vfs_rep_recv) = state.create_endpoint(16).expect("vfs rep");
+        state
+            .register_linux_vfs_manager(vfs_req_send, vfs_rep_recv)
+            .expect("register vfs");
+
+        for pid in [101u64, 102, 103] {
+            state
+                .ipc_send(
+                    proc_rep_send,
+                    Message::with_header(0, PROC_OP_GETPID, 0, None, &pid.to_le_bytes())
+                        .expect("pid"),
+                )
+                .expect("seed pid");
+        }
+        for fd in [3u64, 4, 5] {
+            state
+                .ipc_send(
+                    vfs_rep_send,
+                    Message::with_header(0, VFS_OP_OPENAT, 0, None, &fd.to_le_bytes()).expect("fd"),
+                )
+                .expect("seed fd");
+        }
+
+        let sequence = [
+            LINUX_NR_GETPID,
+            LINUX_NR_OPENAT,
+            LINUX_NR_GETPID,
+            LINUX_NR_OPENAT,
+            LINUX_NR_GETPID,
+            LINUX_NR_OPENAT,
+        ];
+        let mut observed = [0usize; 6];
+        for (i, nr) in sequence.iter().enumerate() {
+            let mut frame = TrapFrame::new(*nr, [0, 0x2000 + i * 8, 0, 0, 0, 0]);
+            dispatch(&mut state, &mut frame);
+            assert_eq!(frame.error, 0);
+            observed[i] = frame.ret0;
+        }
+
+        assert_eq!(observed, [101, 3, 102, 4, 103, 5]);
+        let mut proc_count = 0;
+        for _ in 0..3 {
+            assert!(state.ipc_recv(proc_req_recv).expect("recv").is_some());
+            proc_count += 1;
+        }
+        let mut vfs_count = 0;
+        for _ in 0..3 {
+            assert!(state.ipc_recv(vfs_req_recv).expect("recv").is_some());
+            vfs_count += 1;
+        }
+        assert_eq!(proc_count, 3);
+        assert_eq!(vfs_count, 3);
+    }
 }

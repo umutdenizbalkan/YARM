@@ -96,3 +96,4 @@ The process-manager v2 path also defines a typed `ProcV2Args` 16-byte codec (`ar
 A minimal `vfs_lite` service implementation now exists in-kernel module space as a user-space server model scaffold (`src/kernel/vfs_lite.rs`) and is exercised by `src/bin/vfs_lite.rs`.
 
 The compatibility test suite now includes an end-to-end personality shim flow (`getpid` + `openat` + `exit`) to verify process-manager and VFS routing in one sequence.
+The compatibility test suite also includes a deterministic mixed syscall sequence (`getpid`/`openat`) to ensure stable cross-server routing behavior over repeated dispatch cycles.

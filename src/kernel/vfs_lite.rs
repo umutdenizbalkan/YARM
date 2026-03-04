@@ -103,6 +103,61 @@ impl InMemoryBackend {
     }
 }
 
+#[derive(Debug)]
+pub struct MountRouter<A: VfsBackend, B: VfsBackend> {
+    split_at: u64,
+    low: A,
+    high: B,
+}
+
+impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
+    pub const fn new(split_at: u64, low: A, high: B) -> Self {
+        Self {
+            split_at,
+            low,
+            high,
+        }
+    }
+
+    fn route_by_path(&mut self, path_ptr: u64) -> &mut dyn VfsBackend {
+        if path_ptr < self.split_at {
+            &mut self.low
+        } else {
+            &mut self.high
+        }
+    }
+
+    fn route_by_fd(&mut self, fd: u64) -> &mut dyn VfsBackend {
+        if fd < self.split_at {
+            &mut self.low
+        } else {
+            &mut self.high
+        }
+    }
+}
+
+impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        self.route_by_path(path_ptr).openat(path_ptr)
+    }
+
+    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+        self.route_by_fd(fd).close(fd)
+    }
+
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        self.route_by_fd(fd).read(fd, len)
+    }
+
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        self.route_by_fd(fd).write(fd, len)
+    }
+
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        self.route_by_path(path_ptr).statx(path_ptr)
+    }
+}
+
 impl VfsBackend for InMemoryBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
         self.alloc_fd(path_ptr)
@@ -271,6 +326,22 @@ mod tests {
             Message::with_header(0, VFS_OP_CLOSE, 0, None, &pack(fd, 0, 0, 0)).expect("close");
         let close_rep = svc.handle_request(close_req).expect("close rep");
         assert_eq!(close_rep.opcode, VFS_OP_CLOSE);
+    }
+
+    #[test]
+    fn mount_router_routes_by_path_split() {
+        let router = MountRouter::new(0x8000, InMemoryBackend::new(), InMemoryBackend::new());
+        let mut svc = VfsLiteService::with_backend(router);
+
+        let open_low =
+            Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1000, 0, 0)).expect("open");
+        let low_rep = svc.handle_request(open_low).expect("rep");
+        assert_eq!(low_rep.opcode, VFS_OP_OPENAT);
+
+        let open_high =
+            Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x9000, 0, 0)).expect("open");
+        let high_rep = svc.handle_request(open_high).expect("rep");
+        assert_eq!(high_rep.opcode, VFS_OP_OPENAT);
     }
 
     #[test]

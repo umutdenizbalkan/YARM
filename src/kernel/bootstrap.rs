@@ -2904,6 +2904,23 @@ mod tests {
     }
 
     #[test]
+    fn stale_driver_caps_are_rejected_after_revocation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(33).expect("task");
+        state.register_driver(33).expect("driver");
+
+        let irq = state.mint_irq_cap(8).expect("irq");
+        state.grant_driver_irq(33, irq).expect("grant irq");
+        state.revoke_driver_runtime_caps(33).expect("revoke");
+
+        assert!(state.cspace.get(irq).is_none());
+        assert_eq!(
+            state.grant_driver_irq(33, irq),
+            Err(KernelError::InvalidCapability)
+        );
+    }
+
+    #[test]
     fn iova_window_validation_requires_iova_space_and_range() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(12).expect("task");
