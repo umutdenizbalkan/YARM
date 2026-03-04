@@ -5,6 +5,7 @@ use crate::kernel::bootstrap::FaultPolicy;
 pub enum WaitReason {
     EndpointReceive(usize),
     EndpointSend(usize),
+    Poll,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,8 @@ pub enum TaskStatus {
     Running,
     Blocked(WaitReason),
     Faulted,
+    Exited(u64),
+    Dead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,4 +26,5 @@ pub struct ThreadControlBlock {
     pub fault_policy_override: Option<FaultPolicy>,
     pub brk_base: Option<usize>,
     pub brk_end: Option<usize>,
+    pub restart_token: Option<u64>,
 }

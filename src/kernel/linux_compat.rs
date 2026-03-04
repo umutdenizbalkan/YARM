@@ -4,7 +4,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
-pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 12;
+pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 15;
 pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = 1;
 pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = 1;
 
@@ -20,6 +20,9 @@ pub const LINUX_NR_CLOSE: usize = 57;
 pub const LINUX_NR_READ: usize = 63;
 pub const LINUX_NR_WRITE: usize = 64;
 pub const LINUX_NR_IOCTL: usize = 29;
+pub const LINUX_NR_DUP: usize = 23;
+pub const LINUX_NR_FCNTL: usize = 25;
+pub const LINUX_NR_POLL: usize = 73;
 
 pub const PROC_OP_GETPID: u16 = 1;
 pub const PROC_OP_EXIT: u16 = 2;
@@ -30,6 +33,9 @@ pub const VFS_OP_CLOSE: u16 = 11;
 pub const VFS_OP_READ: u16 = 12;
 pub const VFS_OP_WRITE: u16 = 13;
 pub const VFS_OP_IOCTL: u16 = 14;
+pub const VFS_OP_DUP: u16 = 15;
+pub const VFS_OP_FCNTL: u16 = 16;
+pub const VFS_OP_POLL: u16 = 17;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -97,6 +103,9 @@ pub enum LinuxCompatSyscall {
     Read = LINUX_NR_READ,
     Write = LINUX_NR_WRITE,
     Ioctl = LINUX_NR_IOCTL,
+    Dup = LINUX_NR_DUP,
+    Fcntl = LINUX_NR_FCNTL,
+    Poll = LINUX_NR_POLL,
     Brk = LINUX_NR_BRK,
     Munmap = LINUX_NR_MUNMAP,
     Mmap = LINUX_NR_MMAP,
@@ -113,6 +122,9 @@ impl LinuxCompatSyscall {
         LINUX_NR_READ,
         LINUX_NR_WRITE,
         LINUX_NR_IOCTL,
+        LINUX_NR_DUP,
+        LINUX_NR_FCNTL,
+        LINUX_NR_POLL,
         LINUX_NR_BRK,
         LINUX_NR_MUNMAP,
         LINUX_NR_MMAP,
@@ -133,6 +145,9 @@ impl LinuxCompatSyscall {
             LINUX_NR_READ => Ok(Self::Read),
             LINUX_NR_WRITE => Ok(Self::Write),
             LINUX_NR_IOCTL => Ok(Self::Ioctl),
+            LINUX_NR_DUP => Ok(Self::Dup),
+            LINUX_NR_FCNTL => Ok(Self::Fcntl),
+            LINUX_NR_POLL => Ok(Self::Poll),
             LINUX_NR_BRK => Ok(Self::Brk),
             LINUX_NR_MUNMAP => Ok(Self::Munmap),
             LINUX_NR_MMAP => Ok(Self::Mmap),
@@ -420,6 +435,49 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
             kernel.linux_mprotect_region(aspace_cap, addr, len, prot)?;
             Ok(0)
         }
+        LinuxCompatSyscall::Dup => {
+            let payload = pack_vfs4(frame.args[LINUX_ARG0], 0, 0, 0);
+            kernel
+                .send_linux_vfs_request(VFS_OP_DUP, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
+        LinuxCompatSyscall::Fcntl => {
+            let payload = pack_vfs4(
+                frame.args[LINUX_ARG0],
+                frame.args[LINUX_ARG1],
+                frame.args[LINUX_ARG2],
+                0,
+            );
+            kernel
+                .send_linux_vfs_request(VFS_OP_FCNTL, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
+        LinuxCompatSyscall::Poll => {
+            let payload = pack_vfs4(
+                frame.args[LINUX_ARG0],
+                frame.args[LINUX_ARG1],
+                frame.args[LINUX_ARG2],
+                0,
+            );
+            kernel
+                .send_linux_vfs_request(VFS_OP_POLL, &payload)
+                .map_err(LinuxErrno::from)?;
+            let reply = kernel
+                .recv_linux_vfs_reply()
+                .map_err(LinuxErrno::from)?
+                .ok_or(LinuxErrno::NoSys)?;
+            decode_u64_reply(reply.as_slice())
+        }
         LinuxCompatSyscall::Brk => {
             let requested = frame.args[LINUX_ARG0];
             let aspace_cap = CapId(frame.args[LINUX_ARG1] as u64);
@@ -452,7 +510,7 @@ mod tests {
     #[test]
     fn linux_compat_abi_contract_is_frozen() {
         assert_eq!(LINUX_COMPAT_ABI_VERSION, 1);
-        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 12);
+        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 15);
         assert_eq!(LINUX_PROC_SERVER_ABI_VERSION, 1);
         assert_eq!(LINUX_VFS_SERVER_ABI_VERSION, 1);
         assert_eq!(
@@ -486,6 +544,18 @@ mod tests {
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_IOCTL),
             Ok(LinuxCompatSyscall::Ioctl)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_DUP),
+            Ok(LinuxCompatSyscall::Dup)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_FCNTL),
+            Ok(LinuxCompatSyscall::Fcntl)
+        );
+        assert_eq!(
+            LinuxCompatSyscall::decode(LINUX_NR_POLL),
+            Ok(LinuxCompatSyscall::Poll)
         );
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_BRK),
@@ -646,7 +716,7 @@ mod tests {
             .register_linux_vfs_manager(req_send, rep_recv)
             .expect("register vfs");
 
-        for value in [42u64, 0u64, 128u64, 64u64, 0u64] {
+        for value in [42u64, 0u64, 128u64, 64u64, 0u64, 43u64, 0u64, 1u64] {
             state
                 .ipc_send(
                     rep_send,
@@ -687,5 +757,25 @@ mod tests {
         assert_eq!(ioctl.error, 0);
         let ioctl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(ioctl_req.opcode, VFS_OP_IOCTL);
+
+        let mut dup = TrapFrame::new(LINUX_NR_DUP, [42, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut dup);
+        assert_eq!(dup.error, 0);
+        assert_eq!(dup.ret0, 43);
+        let dup_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(dup_req.opcode, VFS_OP_DUP);
+
+        let mut fcntl = TrapFrame::new(LINUX_NR_FCNTL, [42, 3, 0xF0, 0, 0, 0]);
+        dispatch(&mut state, &mut fcntl);
+        assert_eq!(fcntl.error, 0);
+        let fcntl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(fcntl_req.opcode, VFS_OP_FCNTL);
+
+        let mut poll = TrapFrame::new(LINUX_NR_POLL, [0x9000, 2, 10, 0, 0, 0]);
+        dispatch(&mut state, &mut poll);
+        assert_eq!(poll.error, 0);
+        assert_eq!(poll.ret0, 1);
+        let poll_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+        assert_eq!(poll_req.opcode, VFS_OP_POLL);
     }
 }

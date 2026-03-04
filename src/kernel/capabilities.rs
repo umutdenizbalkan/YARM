@@ -34,7 +34,7 @@ pub enum CapObject {
     Endpoint { index: usize, generation: u64 },
     AddressSpace { asid: u16 },
     MemoryObject { id: u64 },
-    DmaRegion { id: u64 },
+    DmaRegion { id: u64, offset: usize, len: usize },
     Notification { index: usize, generation: u64 },
     Irq { line: u16 },
 }

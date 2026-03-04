@@ -105,6 +105,7 @@ pub struct KernelState {
     linux_vfs_reply_recv: Option<CapId>,
     supervisor_endpoint: Option<usize>,
     driver_records: [Option<DriverRecord>; MAX_DRIVERS],
+    next_restart_token: u64,
     fault_policy: FaultPolicy,
 }
 
@@ -168,6 +169,7 @@ impl Bootstrap {
             linux_vfs_reply_recv: None,
             supervisor_endpoint: None,
             driver_records: [const { None }; MAX_DRIVERS],
+            next_restart_token: 1,
             fault_policy: FaultPolicy::KillTask,
         };
 
@@ -417,13 +419,18 @@ impl KernelState {
             .map_err(|_| KernelError::CapabilityFull)
     }
 
-    pub fn mint_dma_region_cap(&mut self, mem_cap: CapId) -> Result<CapId, KernelError> {
+    pub fn mint_dma_region_cap(
+        &mut self,
+        mem_cap: CapId,
+        offset: usize,
+        len: usize,
+    ) -> Result<CapId, KernelError> {
         let capability = self
             .cspace
             .get(mem_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let id = match capability.object {
-            CapObject::MemoryObject { id } | CapObject::DmaRegion { id } => id,
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
             _ => return Err(KernelError::WrongObject),
         };
         if !capability.has_right(CapRights::Map)
@@ -433,10 +440,24 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
 
+        if !offset.is_multiple_of(crate::kernel::vm::PAGE_SIZE)
+            || !len.is_multiple_of(crate::kernel::vm::PAGE_SIZE)
+            || len == 0
+        {
+            return Err(KernelError::Vm(VmError::Misaligned));
+        }
+        if offset
+            .checked_add(len)
+            .ok_or(KernelError::Vm(VmError::Misaligned))?
+            > crate::kernel::vm::PAGE_SIZE
+        {
+            return Err(KernelError::WrongObject);
+        }
+
         self.cspace
             .mint(Capability::new(
                 "dma_region",
-                CapObject::DmaRegion { id },
+                CapObject::DmaRegion { id, offset, len },
                 &[CapRights::Map, CapRights::Read, CapRights::Write],
             ))
             .map_err(|_| KernelError::CapabilityFull)
@@ -448,7 +469,8 @@ impl KernelState {
             .get(dma_cap)
             .ok_or(KernelError::InvalidCapability)?;
         match capability.object {
-            CapObject::DmaRegion { .. } => {}
+            CapObject::DmaRegion { len, .. } if len > 0 => {}
+            CapObject::DmaRegion { .. } => return Err(KernelError::WrongObject),
             _ => return Err(KernelError::WrongObject),
         }
 
@@ -484,6 +506,42 @@ impl KernelState {
             .send(msg)
             .map_err(|_| KernelError::EndpointQueueFull)?;
         let _ = self.wake_waiter_for_endpoint(endpoint_idx);
+        Ok(())
+    }
+
+    pub fn exit_task(&mut self, tid: u64, code: u64) -> Result<u64, KernelError> {
+        let token = self.next_restart_token;
+        self.next_restart_token = self.next_restart_token.wrapping_add(1).max(1);
+
+        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        tcb.status = TaskStatus::Exited(code);
+        tcb.restart_token = Some(token);
+        self.report_task_exit_to_supervisor(tid, code)?;
+
+        if self.scheduler.current_tid() == Some(tid) {
+            let _ = self.scheduler.block_current();
+            let _ = self.dispatch_next_task()?;
+        }
+
+        Ok(token)
+    }
+
+    pub fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelError> {
+        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        if tcb.restart_token != Some(token) {
+            return Err(KernelError::WrongObject);
+        }
+        tcb.restart_token = None;
+        tcb.status = TaskStatus::Runnable;
+        self.scheduler
+            .enqueue(tid)
+            .map_err(|_| KernelError::SchedulerFull)
+    }
+
+    pub fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError> {
+        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        tcb.status = TaskStatus::Dead;
+        tcb.restart_token = None;
         Ok(())
     }
 
@@ -669,7 +727,7 @@ impl KernelState {
             .user_spaces
             .get(asid)
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let page_base = va & !(super::vm::PAGE_SIZE - 1);
+        let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1);
         let mapping = aspace
             .resolve(VirtAddr(page_base))
             .ok_or(KernelError::UserMemoryFault)?;
@@ -715,6 +773,7 @@ impl KernelState {
                 fault_policy_override: None,
                 brk_base: None,
                 brk_end: None,
+                restart_token: None,
             });
             Ok(())
         } else {
@@ -1195,7 +1254,7 @@ impl KernelState {
     }
 
     pub fn create_memory_object(&mut self, phys: PhysAddr) -> Result<(u64, CapId), KernelError> {
-        if !phys.0.is_multiple_of(super::vm::PAGE_SIZE) {
+        if !phys.0.is_multiple_of(crate::kernel::vm::PAGE_SIZE) {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
         let id = self.next_memory_object_id;
@@ -1222,7 +1281,9 @@ impl KernelState {
 
     pub fn alloc_anonymous_memory_object(&mut self) -> Result<(u64, CapId), KernelError> {
         let phys = PhysAddr(self.next_anon_phys);
-        self.next_anon_phys = self.next_anon_phys.wrapping_add(super::vm::PAGE_SIZE);
+        self.next_anon_phys = self
+            .next_anon_phys
+            .wrapping_add(crate::kernel::vm::PAGE_SIZE);
         self.create_memory_object(phys)
     }
 
@@ -1256,7 +1317,7 @@ impl KernelState {
             .get(mem_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let id = match capability.object {
-            CapObject::MemoryObject { id } | CapObject::DmaRegion { id } => id,
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
             _ => return Err(KernelError::WrongObject),
         };
 
@@ -2173,7 +2234,9 @@ mod tests {
         state.grant_driver_irq(3, irq_cap).expect("grant irq");
 
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-        let dma_cap = state.mint_dma_region_cap(mem_cap).expect("dma");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+            .expect("dma");
         state.grant_driver_dma(3, dma_cap).expect("grant dma");
     }
 
@@ -2197,5 +2260,84 @@ mod tests {
                 .is_ok(),
             true
         );
+    }
+
+    #[test]
+    fn exited_task_can_restart_with_token_and_then_be_marked_dead() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(9).expect("task");
+        let token = state.exit_task(9, 12).expect("exit");
+        assert_eq!(state.task_status(9), Some(TaskStatus::Exited(12)));
+
+        assert!(state.restart_task(9, token).is_ok());
+        assert_eq!(state.task_status(9), Some(TaskStatus::Runnable));
+
+        state.mark_task_dead(9).expect("dead");
+        assert_eq!(state.task_status(9), Some(TaskStatus::Dead));
+    }
+
+    #[test]
+    fn dma_region_cap_enforces_window_constraints() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+                .is_ok()
+        );
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
+                .is_err()
+        );
+        assert!(state.mint_dma_region_cap(mem_cap, 0, 0).is_err());
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deterministic_mixed_stress_sequence_is_stable() {
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        let (_nidx, ncap, nrecv) = state.create_notification(8).expect("notif");
+        state.bind_irq_notification(5, ncap).expect("bind irq");
+
+        for i in 1..=10u64 {
+            state.register_task(i).expect("task");
+            state
+                .enqueue_on_cpu(CpuId((i % 2) as usize), i)
+                .expect("enqueue");
+        }
+
+        for _ in 0..8 {
+            state
+                .submit_cross_cpu_work(WorkItem::Reschedule {
+                    target_cpu: CpuId(1),
+                })
+                .expect("work");
+        }
+        state
+            .process_cross_cpu_work_for_cpu(CpuId(1))
+            .expect("process");
+
+        for _ in 0..5 {
+            state
+                .handle_trap_event(TrapEvent::with_irq(Trap::ExternalInterrupt, 5), None)
+                .expect("irq");
+        }
+
+        let mut irq_msgs = 0usize;
+        while state.ipc_recv(nrecv).expect("recv").is_some() {
+            irq_msgs += 1;
+            if irq_msgs > 16 {
+                break;
+            }
+        }
+        assert_eq!(irq_msgs, 5);
+        assert_eq!(state.online_cpu_count(), 2);
     }
 }

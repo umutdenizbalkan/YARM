@@ -7,7 +7,7 @@ This document defines the Linux-compatibility bridge layer used to ease userland
 - ABI version: `1`
 - Process-server IPC ABI version: `1`
 - VFS-server IPC ABI version: `1`
-- Dispatcher table size frozen at `12` entries
+- Dispatcher table size frozen at `15` entries
 - Linux syscall numbers supported by dispatcher table:
   - `exit` = 93
   - `getpid` = 172
@@ -17,6 +17,9 @@ This document defines the Linux-compatibility bridge layer used to ease userland
   - `read` = 63
   - `write` = 64
   - `ioctl` = 29
+  - `dup` = 23
+  - `fcntl` = 25
+  - `poll` = 73
   - `brk` = 214
   - `munmap` = 215
   - `mmap` = 222
@@ -58,7 +61,7 @@ This is the initial vertical user-space server path over IPC.
 
 ## VFS-lite vertical path
 
-Linux-facing `openat` / `close` / `read` / `write` / `ioctl` requests are mapped onto VFS-manager IPC requests via a dedicated registration path (`register_linux_vfs_manager`).
+Linux-facing `openat` / `close` / `read` / `write` / `ioctl` / `dup` / `fcntl` / `poll` requests are mapped onto VFS-manager IPC requests via a dedicated registration path (`register_linux_vfs_manager`).
 
 ## Design note
 
