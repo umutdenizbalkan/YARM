@@ -221,6 +221,18 @@ fn pack_vfs4(a0: usize, a1: usize, a2: usize, a3: usize) -> [u8; 32] {
     payload
 }
 
+fn pack_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> [u8; 32] {
+    pack_vfs4(epfd, op, fd, event_ptr)
+}
+
+fn pack_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) -> [u8; 32] {
+    pack_vfs4(out_fd, in_fd, offset_ptr, count)
+}
+
+fn pack_statx(dirfd: usize, path_ptr: usize, flags: usize, mask: usize) -> [u8; 32] {
+    pack_vfs4(dirfd, path_ptr, flags, mask)
+}
+
 impl KernelState {
     pub fn linux_mmap_region(
         &mut self,
@@ -515,7 +527,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
             decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::EpollCtl => {
-            let payload = pack_vfs4(
+            let payload = pack_epoll_ctl(
                 frame.args[LINUX_ARG0],
                 frame.args[LINUX_ARG1],
                 frame.args[LINUX_ARG2],
@@ -547,7 +559,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
             decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::Sendfile => {
-            let payload = pack_vfs4(
+            let payload = pack_sendfile(
                 frame.args[LINUX_ARG0],
                 frame.args[LINUX_ARG1],
                 frame.args[LINUX_ARG2],
@@ -563,7 +575,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
             decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::Statx => {
-            let payload = pack_vfs4(
+            let payload = pack_statx(
                 frame.args[LINUX_ARG0],
                 frame.args[LINUX_ARG1],
                 frame.args[LINUX_ARG2],
@@ -605,6 +617,28 @@ mod tests {
         assert_eq!(LinuxErrno::Perm.code(), EPERM);
         assert_eq!(LinuxErrno::NoMem.code(), ENOMEM);
         assert_eq!(LinuxErrno::NoSys.code(), ENOSYS);
+    }
+
+    #[test]
+    fn linux_vfs_payload_helpers_are_stable() {
+        let epoll = pack_epoll_ctl(4, 2, 9, 0xABC0);
+        let sendfile = pack_sendfile(3, 8, 0x1000, 4096);
+        let statx = pack_statx(5, 0x2000, 0x4, 0x7FF);
+
+        let decode = |payload: [u8; 32]| {
+            let mut out = [0usize; 4];
+            for (i, slot) in out.iter_mut().enumerate() {
+                let mut bytes = [0u8; 8];
+                let start = i * 8;
+                bytes.copy_from_slice(&payload[start..start + 8]);
+                *slot = u64::from_le_bytes(bytes) as usize;
+            }
+            out
+        };
+
+        assert_eq!(decode(epoll), [4, 2, 9, 0xABC0]);
+        assert_eq!(decode(sendfile), [3, 8, 0x1000, 4096]);
+        assert_eq!(decode(statx), [5, 0x2000, 0x4, 0x7FF]);
     }
 
     #[test]

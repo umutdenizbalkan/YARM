@@ -71,3 +71,13 @@ Linux-facing `openat` / `close` / `read` / `write` / `ioctl` / `dup` / `fcntl` /
 ## Design note
 
 Compatibility is implemented as a translation layer over microkernel mechanisms (capabilities + VM objects), not by making the kernel internals Linux-specific.
+
+## Payload schema stability
+
+For higher-churn VFS calls we now freeze helper packers so request payload layout is explicit and testable:
+
+- `pack_epoll_ctl(epfd, op, fd, event_ptr)`
+- `pack_sendfile(out_fd, in_fd, offset_ptr, count)`
+- `pack_statx(dirfd, path_ptr, flags, mask)`
+
+Each helper encodes four little-endian u64 words (`[arg0,arg1,arg2,arg3]`) into a 32-byte IPC payload.

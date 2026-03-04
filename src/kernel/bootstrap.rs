@@ -18,6 +18,7 @@ const MAX_MEMORY_OBJECTS: usize = 128;
 const MAX_NOTIFICATIONS: usize = 16;
 const MAX_IRQ_LINES: usize = 64;
 const MAX_DRIVERS: usize = 32;
+const RESTART_ESCALATION_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelError {
@@ -58,6 +59,7 @@ pub struct RestartTelemetry {
     pub available_at_tick: u64,
     pub token_outstanding: bool,
     pub denied_count: u32,
+    pub escalation_count: u32,
     pub last_exit_code: Option<u64>,
 }
 
@@ -625,6 +627,31 @@ impl KernelState {
         Ok(())
     }
 
+    fn report_restart_denial_to_supervisor(
+        &mut self,
+        tid: u64,
+        denied_count: u32,
+    ) -> Result<(), KernelError> {
+        let Some(endpoint_idx) = self.supervisor_endpoint else {
+            return Ok(());
+        };
+        let mut payload = [0u8; 16];
+        payload[..8].copy_from_slice(&tid.to_le_bytes());
+        payload[8..12].copy_from_slice(&denied_count.to_le_bytes());
+        let msg = Message::with_header(0, 0xEF, 0, None, &payload)
+            .map_err(|_| KernelError::WrongObject)?;
+        let endpoint = self
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?;
+        endpoint
+            .send(msg)
+            .map_err(|_| KernelError::EndpointQueueFull)?;
+        let _ = self.wake_waiter_for_endpoint(endpoint_idx);
+        Ok(())
+    }
+
     pub fn set_task_restart_policy(
         &mut self,
         tid: u64,
@@ -650,6 +677,7 @@ impl KernelState {
             available_at_tick: tcb.restart_available_at_tick,
             token_outstanding: tcb.restart_token.is_some(),
             denied_count: tcb.restart_denied_count,
+            escalation_count: tcb.restart_escalation_count,
             last_exit_code: tcb.last_exit_code,
         })
     }
@@ -674,20 +702,46 @@ impl KernelState {
 
     pub fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelError> {
         let now = self.timer.current_ticks();
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        if tcb.restart_token != Some(token) {
-            tcb.restart_denied_count = tcb.restart_denied_count.saturating_add(1);
-            return Err(KernelError::WrongObject);
-        }
-        if tcb.restart_budget == 0 {
-            tcb.restart_denied_count = tcb.restart_denied_count.saturating_add(1);
-            return Err(KernelError::WouldBlock);
-        }
-        if now < tcb.restart_available_at_tick {
-            tcb.restart_denied_count = tcb.restart_denied_count.saturating_add(1);
-            return Err(KernelError::WouldBlock);
+
+        let mut should_notify = None;
+        let err = {
+            let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+            let mut denied = false;
+            let err = if tcb.restart_token != Some(token) {
+                denied = true;
+                Some(KernelError::WrongObject)
+            } else if tcb.restart_budget == 0 {
+                denied = true;
+                Some(KernelError::WouldBlock)
+            } else if now < tcb.restart_available_at_tick {
+                denied = true;
+                Some(KernelError::WouldBlock)
+            } else {
+                None
+            };
+
+            if denied {
+                tcb.restart_denied_count = tcb.restart_denied_count.saturating_add(1);
+                if tcb
+                    .restart_denied_count
+                    .is_multiple_of(RESTART_ESCALATION_THRESHOLD)
+                {
+                    tcb.restart_escalation_count = tcb.restart_escalation_count.saturating_add(1);
+                    should_notify = Some(tcb.restart_denied_count);
+                }
+            }
+            err
+        };
+
+        if let Some(count) = should_notify {
+            self.report_restart_denial_to_supervisor(tid, count)?;
         }
 
+        if let Some(err) = err {
+            return Err(err);
+        }
+
+        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.restart_budget = tcb.restart_budget.saturating_sub(1);
         tcb.restart_available_at_tick = now.saturating_add(tcb.restart_backoff_ticks);
         tcb.restart_token = None;
@@ -937,6 +991,7 @@ impl KernelState {
                 restart_backoff_ticks: 10,
                 restart_available_at_tick: 0,
                 restart_denied_count: 0,
+                restart_escalation_count: 0,
                 last_exit_code: None,
             });
             Ok(())
@@ -2522,6 +2577,30 @@ mod tests {
         assert_eq!(t1.budget_remaining, 1);
         assert!(!t1.token_outstanding);
         assert!(t1.available_at_tick >= 5);
+    }
+
+    #[test]
+    fn restart_denial_escalates_to_supervisor_every_threshold() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_e, _send, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state.set_supervisor_endpoint(recv_cap).expect("supervisor");
+
+        state.register_task(13).expect("task");
+        let _token = state.exit_task(13, 77).expect("exit");
+
+        for _ in 0..3 {
+            let _ = state.restart_task(13, 0xDEAD);
+        }
+
+        let telemetry = state.task_restart_telemetry(13).expect("telemetry");
+        assert_eq!(telemetry.denied_count, 3);
+        assert_eq!(telemetry.escalation_count, 1);
+
+        let exit_report = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(exit_report.opcode, 0xEE);
+
+        let denial_report = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(denial_report.opcode, 0xEF);
     }
 
     #[test]
