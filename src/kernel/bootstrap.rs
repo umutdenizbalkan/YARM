@@ -61,6 +61,23 @@ pub struct ClassPolicySnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceServerDelegation {
+    pub server_tid: u64,
+    pub irq_line: u16,
+    pub mem_cap: CapId,
+    pub dma_offset: usize,
+    pub dma_len: usize,
+    pub iova_cap: CapId,
+    pub iova_base: usize,
+    pub iova_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcFastpathResult {
+    pub switched_to_waiter: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestartTelemetry {
     pub budget_remaining: u8,
     pub backoff_ticks: u64,
@@ -590,6 +607,24 @@ impl KernelState {
             .ok_or(KernelError::TaskMissing)?;
         record.dma_cap = Some(dma_cap);
         Ok(())
+    }
+
+    pub fn delegate_device_server_caps(
+        &mut self,
+        plan: DeviceServerDelegation,
+    ) -> Result<(CapId, CapId), KernelError> {
+        self.register_driver(plan.server_tid)?;
+
+        let irq_cap = self.mint_irq_cap(plan.irq_line)?;
+        self.grant_driver_irq(plan.server_tid, irq_cap)?;
+
+        let dma_cap = self.mint_dma_region_cap(plan.mem_cap, plan.dma_offset, plan.dma_len)?;
+        self.grant_driver_dma(plan.server_tid, dma_cap)?;
+
+        self.grant_driver_iova_space(plan.server_tid, plan.iova_cap)?;
+        self.configure_driver_dma_window(plan.server_tid, plan.iova_base, plan.iova_len)?;
+
+        Ok((irq_cap, dma_cap))
     }
 
     pub fn configure_driver_dma_window(
@@ -1524,6 +1559,33 @@ impl KernelState {
         Ok(())
     }
 
+    pub fn ipc_send_fastpath(
+        &mut self,
+        send_cap: CapId,
+        msg: Message,
+    ) -> Result<IpcFastpathResult, KernelError> {
+        let capability = self
+            .cspace
+            .get(send_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        if !capability.has_right(CapRights::Send) {
+            return Err(KernelError::MissingRight);
+        }
+
+        let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+        let had_waiter = self.endpoint_waiters[endpoint_idx].is_some();
+
+        self.ipc_send(send_cap, msg)?;
+
+        if had_waiter {
+            let _ = self.dispatch_next_task()?;
+        }
+
+        Ok(IpcFastpathResult {
+            switched_to_waiter: had_waiter,
+        })
+    }
+
     pub fn ipc_send_with_cap_transfer(
         &mut self,
         send_cap: CapId,
@@ -2089,14 +2151,12 @@ mod tests {
 
     #[test]
     fn syscall_trap_dispatches_ipc_send_recv() {
-        use super::super::syscall::Syscall;
-
         let mut state = Bootstrap::init().expect("init");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
 
         let send_payload = usize::from_le_bytes([b'h', b'i', 0, 0, 0, 0, 0, 0]);
         let mut send_frame = TrapFrame::new(
-            Syscall::IpcSend as usize,
+            crate::kernel::syscall::Syscall::IpcSend as usize,
             [send_cap.0 as usize, 42, 2, send_payload, 0, 0],
         );
 
@@ -2106,7 +2166,7 @@ mod tests {
         assert_eq!(send_frame.error, 0);
 
         let mut recv_frame = TrapFrame::new(
-            Syscall::IpcRecv as usize,
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
         state
@@ -2252,8 +2312,6 @@ mod tests {
 
     #[test]
     fn syscall_send_can_copy_from_user_memory_when_task_has_asid() {
-        use super::super::syscall::Syscall;
-
         let mut state = Bootstrap::init().expect("init");
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind");
@@ -2276,7 +2334,7 @@ mod tests {
 
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let mut send_frame = TrapFrame::new(
-            Syscall::IpcSend as usize,
+            crate::kernel::syscall::Syscall::IpcSend as usize,
             [send_cap.0 as usize, 0, 2, 0, 0, 0],
         );
         state
@@ -2289,8 +2347,6 @@ mod tests {
 
     #[test]
     fn syscall_recv_can_copy_to_user_memory_when_task_has_asid() {
-        use super::super::syscall::Syscall;
-
         let mut state = Bootstrap::init().expect("init");
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind");
@@ -2317,7 +2373,7 @@ mod tests {
             .expect("send");
 
         let mut recv_frame = TrapFrame::new(
-            Syscall::IpcRecv as usize,
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 16, 2, 0, 0, 0],
         );
         state
@@ -2331,7 +2387,7 @@ mod tests {
 
     #[test]
     fn syscall_recv_reports_page_fault_on_unwritable_user_buffer() {
-        use super::super::syscall::{Syscall, SyscallError};
+        use super::super::syscall::SyscallError;
 
         let mut state = Bootstrap::init().expect("init");
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
@@ -2354,7 +2410,7 @@ mod tests {
             .expect("send");
 
         let mut recv_frame = TrapFrame::new(
-            Syscall::IpcRecv as usize,
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 2, 0, 0, 0],
         );
         state
@@ -2373,7 +2429,7 @@ mod tests {
 
     #[test]
     fn page_fault_syscall_faults_current_task_and_schedules_next() {
-        use super::super::syscall::{Syscall, SyscallError};
+        use super::super::syscall::SyscallError;
 
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
@@ -2398,7 +2454,7 @@ mod tests {
             .expect("send");
 
         let mut recv_frame = TrapFrame::new(
-            Syscall::IpcRecv as usize,
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 2, 0, 0, 0],
         );
         state
@@ -2424,7 +2480,7 @@ mod tests {
 
     #[test]
     fn page_fault_emits_report_to_fault_handler_endpoint() {
-        use super::super::syscall::{Syscall, SyscallError};
+        use super::super::syscall::SyscallError;
 
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
@@ -2453,7 +2509,7 @@ mod tests {
             .expect("send");
 
         let mut recv_frame = TrapFrame::new(
-            Syscall::IpcRecv as usize,
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 2, 0, 0, 0],
         );
         state
@@ -2480,7 +2536,7 @@ mod tests {
 
     #[test]
     fn page_fault_with_notify_and_continue_keeps_current_task_running() {
-        use super::super::syscall::{Syscall, SyscallError};
+        use super::super::syscall::SyscallError;
 
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
@@ -2510,7 +2566,7 @@ mod tests {
             .expect("send");
 
         let mut recv_frame = TrapFrame::new(
-            Syscall::IpcRecv as usize,
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 2, 0, 0, 0],
         );
         state
@@ -2530,7 +2586,7 @@ mod tests {
 
     #[test]
     fn task_fault_policy_override_beats_global_policy() {
-        use super::super::syscall::{Syscall, SyscallError};
+        use super::super::syscall::SyscallError;
 
         let mut state = Bootstrap::init().expect("init");
         state.set_fault_policy(FaultPolicy::NotifyAndContinue);
@@ -2559,7 +2615,7 @@ mod tests {
             .expect("send");
 
         let mut recv_frame = TrapFrame::new(
-            Syscall::IpcRecv as usize,
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 2, 0, 0, 0],
         );
         state
@@ -2594,6 +2650,63 @@ mod tests {
             .bind_irq_notification(1, recv_cap)
             .expect_err("must fail");
         assert_eq!(err, KernelError::MissingRight);
+    }
+
+    #[test]
+    fn delegate_device_server_caps_configures_driver_record() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(34).expect("task");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let iova_cap = state.create_iova_space_cap().expect("iova");
+
+        let plan = DeviceServerDelegation {
+            server_tid: 34,
+            irq_line: 10,
+            mem_cap,
+            dma_offset: 0,
+            dma_len: crate::kernel::vm::PAGE_SIZE,
+            iova_cap,
+            iova_base: crate::kernel::vm::PAGE_SIZE * 8,
+            iova_len: crate::kernel::vm::PAGE_SIZE,
+        };
+
+        let (irq_cap, dma_cap) = state.delegate_device_server_caps(plan).expect("delegate");
+        assert!(state.cspace.get(irq_cap).is_some());
+        assert!(state.cspace.get(dma_cap).is_some());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    34,
+                    crate::kernel::vm::PAGE_SIZE * 8,
+                    crate::kernel::vm::PAGE_SIZE,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn ipc_send_fastpath_detects_waiter() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(35).expect("sender");
+        state.register_task(36).expect("receiver");
+
+        let (_eid, send_cap, recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+
+        state.scheduler.enqueue(36).expect("enqueue receiver");
+        let mut recv_tf = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 8, 0x7000, 0, 0, 0],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut recv_tf))
+            .expect("recv trap");
+
+        state.scheduler.enqueue(35).expect("enqueue sender");
+        let msg = Message::new(35, b"x").expect("msg");
+        let result = state.ipc_send_fastpath(send_cap, msg).expect("fastpath");
+        assert!(result.switched_to_waiter);
     }
 
     #[test]

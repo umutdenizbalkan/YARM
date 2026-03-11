@@ -15,11 +15,24 @@ This contract locks the kernel to mechanisms and pushes policies to user space.
 - process-management policies
 - filesystems and VFS policy
 - networking stack
-- device-driver logic and protocol policy
+- device logic and protocol policy
 - POSIX personality/syscall policy translation
 
-## Driver model
+## Server model (uniform vocabulary)
 
-Drivers are user-space tasks registered with system servers.
-Kernel responsibilities are limited to capability validation and message routing
-(IRQ notifications, DMA-capability based mappings, IPC transport).
+All user-space components are **servers**:
+
+```
+/srv/
+  init.srv
+  procman.srv
+  vfs.srv
+  ext4.srv
+  tcp.srv
+  usb.srv
+  posix.srv
+```
+
+Kernel responsibilities are limited to capability validation and IPC transport.
+There is no privileged driver class in the kernel object model.
+Hardware access is modeled as capabilities held by normal servers.
