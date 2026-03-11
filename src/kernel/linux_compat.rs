@@ -4,6 +4,9 @@ use super::ipc::Message;
 use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
+// Linux syscall numbers in this module follow the LP64 numbering used by
+// RISC-V/AArch64 style ABIs in this prototype compatibility personality.
+
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
 pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 20;
 pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = 1;
@@ -342,19 +345,16 @@ impl ProcV2Args {
     }
 }
 
-fn round_up_page(value: usize) -> usize {
+fn round_up_page(value: usize) -> Result<usize, LinuxErrno> {
     if value.is_multiple_of(PAGE_SIZE) {
-        value
+        Ok(value)
     } else {
-        (value + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+        let rounded = value.checked_add(PAGE_SIZE - 1).ok_or(LinuxErrno::Inval)?;
+        Ok(rounded & !(PAGE_SIZE - 1))
     }
 }
 
 fn prot_to_page_flags(prot: usize) -> Result<PageFlags, LinuxErrno> {
-    if prot == 0 {
-        return Err(LinuxErrno::Inval);
-    }
-
     Ok(PageFlags {
         read: (prot & PROT_READ) != 0,
         write: (prot & PROT_WRITE) != 0,
@@ -369,7 +369,8 @@ fn decode_u64_reply(reply: &[u8]) -> Result<usize, LinuxErrno> {
     }
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&reply[..8]);
-    Ok(u64::from_le_bytes(bytes) as usize)
+    // Keep conversion checked so narrower pointer-width targets do not silently truncate.
+    usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| LinuxErrno::Inval)
 }
 
 fn pack_vfs4(a0: usize, a1: usize, a2: usize, a3: usize) -> [u8; 32] {
@@ -407,7 +408,7 @@ impl KernelState {
 
         let flags = prot_to_page_flags(prot)?;
         let end = addr
-            .checked_add(round_up_page(len))
+            .checked_add(round_up_page(len)?)
             .ok_or(LinuxErrno::Inval)?;
         let mut va = addr;
         while va < end {
@@ -431,7 +432,7 @@ impl KernelState {
             return Err(LinuxErrno::Inval);
         }
         let end = addr
-            .checked_add(round_up_page(len))
+            .checked_add(round_up_page(len)?)
             .ok_or(LinuxErrno::Inval)?;
         let mut va = addr;
         while va < end {
@@ -454,7 +455,7 @@ impl KernelState {
         }
         let flags = prot_to_page_flags(prot)?;
         let end = addr
-            .checked_add(round_up_page(len))
+            .checked_add(round_up_page(len)?)
             .ok_or(LinuxErrno::Inval)?;
         let mut va = addr;
         while va < end {
@@ -483,8 +484,8 @@ impl KernelState {
             return Err(LinuxErrno::Inval);
         }
 
-        let current_rounded = round_up_page(current_end);
-        let requested_rounded = round_up_page(requested_end);
+        let current_rounded = round_up_page(current_end)?;
+        let requested_rounded = round_up_page(requested_end)?;
 
         if requested_rounded > current_rounded {
             let map_start = current_rounded;
@@ -504,6 +505,8 @@ impl KernelState {
 }
 
 pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame: &mut TrapFrame) {
+    // VM-related personality syscalls pass capability IDs in arguments by design
+    // (e.g. mmap arg0/aspace-cap and brk arg1/aspace-cap) for capability routing.
     let result: Result<usize, LinuxErrno> = (|| match LinuxCompatSyscall::decode(frame.syscall_num)?
     {
         LinuxCompatSyscall::Exit => {
@@ -895,6 +898,24 @@ mod tests {
             LinuxCompatSyscall::decode(LINUX_NR_MPROTECT),
             Ok(LinuxCompatSyscall::Mprotect)
         );
+        assert_eq!(LinuxCompatSyscall::decode(0xFFFF), Err(LinuxErrno::NoSys));
+    }
+
+    #[test]
+    fn prot_none_maps_to_guard_page_flags() {
+        let flags = prot_to_page_flags(0).expect("prot none");
+        assert!(!flags.read);
+        assert!(!flags.write);
+        assert!(!flags.execute);
+        assert!(flags.user);
+    }
+
+    #[test]
+    fn round_up_page_handles_boundaries_and_overflow() {
+        assert_eq!(round_up_page(0), Ok(0));
+        assert_eq!(round_up_page(PAGE_SIZE), Ok(PAGE_SIZE));
+        assert_eq!(round_up_page(PAGE_SIZE + 1), Ok(PAGE_SIZE * 2));
+        assert_eq!(round_up_page(usize::MAX), Err(LinuxErrno::Inval));
     }
 
     #[test]
@@ -939,6 +960,11 @@ mod tests {
             )
             .expect("brk shrink");
         assert_eq!(shrunk, LINUX_BRK_DEFAULT_BASE + PAGE_SIZE);
+
+        let query = state
+            .linux_brk(0, aspace_cap, 0, PROT_READ | PROT_WRITE)
+            .expect("brk query");
+        assert_eq!(query, shrunk);
     }
 
     #[test]
