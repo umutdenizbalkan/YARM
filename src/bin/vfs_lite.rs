@@ -3,7 +3,7 @@ extern crate std;
 
 use yarm::kernel::bootstrap::Bootstrap;
 use yarm::kernel::ipc::Message;
-use yarm::kernel::linux_compat::{LINUX_NR_OPENAT, dispatch};
+use yarm::kernel::linux_compat::{LINUX_NR_OPENAT, LinuxServiceBindings, dispatch};
 use yarm::kernel::trapframe::TrapFrame;
 use yarm::kernel::vfs_lite::{InMemoryBackend, VfsLiteService};
 
@@ -15,8 +15,9 @@ fn main() {
 
     let (_req_ep, req_send, _req_recv) = kernel.create_endpoint(8).expect("req ep");
     let (_rep_ep, rep_send, rep_recv) = kernel.create_endpoint(8).expect("rep ep");
-    kernel
-        .register_linux_vfs_manager(req_send, rep_recv)
+    let mut bindings = LinuxServiceBindings::default();
+    bindings
+        .register_vfs_manager(&kernel, req_send, rep_recv)
         .expect("register vfs manager");
 
     let mut payload = [0u8; 32];
@@ -33,6 +34,6 @@ fn main() {
     kernel.ipc_send(rep_send, reply).expect("seed reply");
 
     let mut frame = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x1000, 0, 0, 0, 0]);
-    dispatch(&mut kernel, &mut frame);
+    dispatch(&mut kernel, &bindings, &mut frame);
     println!("vfs-lite demo: fd={}", frame.ret0);
 }

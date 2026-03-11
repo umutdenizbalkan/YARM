@@ -1,5 +1,6 @@
 use super::bootstrap::{KernelError, KernelState};
 use super::capabilities::CapId;
+use super::ipc::Message;
 use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
@@ -63,6 +64,124 @@ const LINUX_ARG0: usize = 0;
 const LINUX_ARG1: usize = 1;
 const LINUX_ARG2: usize = 2;
 const LINUX_ARG3: usize = 3;
+
+/// Userspace-owned bindings for Linux personality servers.
+///
+/// Kept out of `KernelState` so the kernel remains service-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinuxServiceBindings {
+    proc_mgr_request_send: Option<CapId>,
+    proc_mgr_reply_recv: Option<CapId>,
+    vfs_request_send: Option<CapId>,
+    vfs_reply_recv: Option<CapId>,
+}
+
+impl LinuxServiceBindings {
+    pub fn register_process_manager(
+        &mut self,
+        kernel: &KernelState,
+        request_send_cap: CapId,
+        reply_recv_cap: CapId,
+    ) -> Result<(), KernelError> {
+        if !kernel
+            .cspace
+            .has_right(request_send_cap, super::capabilities::CapRights::Send)
+        {
+            return Err(KernelError::MissingRight);
+        }
+        if !kernel
+            .cspace
+            .has_right(reply_recv_cap, super::capabilities::CapRights::Receive)
+        {
+            return Err(KernelError::MissingRight);
+        }
+        self.proc_mgr_request_send = Some(request_send_cap);
+        self.proc_mgr_reply_recv = Some(reply_recv_cap);
+        Ok(())
+    }
+
+    pub fn register_vfs_manager(
+        &mut self,
+        kernel: &KernelState,
+        request_send_cap: CapId,
+        reply_recv_cap: CapId,
+    ) -> Result<(), KernelError> {
+        if !kernel
+            .cspace
+            .has_right(request_send_cap, super::capabilities::CapRights::Send)
+        {
+            return Err(KernelError::MissingRight);
+        }
+        if !kernel
+            .cspace
+            .has_right(reply_recv_cap, super::capabilities::CapRights::Receive)
+        {
+            return Err(KernelError::MissingRight);
+        }
+        self.vfs_request_send = Some(request_send_cap);
+        self.vfs_reply_recv = Some(reply_recv_cap);
+        Ok(())
+    }
+
+    fn send_proc_request(
+        &self,
+        kernel: &mut KernelState,
+        opcode: u16,
+        arg0: u64,
+    ) -> Result<(), KernelError> {
+        let send_cap = self
+            .proc_mgr_request_send
+            .ok_or(KernelError::InvalidCapability)?;
+        let msg = Message::with_header(0, opcode, 0, None, &arg0.to_le_bytes())
+            .map_err(|_| KernelError::WrongObject)?;
+        kernel.ipc_send(send_cap, msg)
+    }
+
+    #[allow(dead_code)]
+    fn send_proc_request2(
+        &self,
+        kernel: &mut KernelState,
+        opcode: u16,
+        arg0: u64,
+        arg1: u64,
+    ) -> Result<(), KernelError> {
+        let send_cap = self
+            .proc_mgr_request_send
+            .ok_or(KernelError::InvalidCapability)?;
+        let mut payload = [0u8; 16];
+        payload[..8].copy_from_slice(&arg0.to_le_bytes());
+        payload[8..16].copy_from_slice(&arg1.to_le_bytes());
+        let msg = Message::with_header(0, opcode, 0, None, &payload)
+            .map_err(|_| KernelError::WrongObject)?;
+        kernel.ipc_send(send_cap, msg)
+    }
+
+    fn recv_proc_reply(&self, kernel: &mut KernelState) -> Result<Option<Message>, KernelError> {
+        let recv_cap = self
+            .proc_mgr_reply_recv
+            .ok_or(KernelError::InvalidCapability)?;
+        kernel.ipc_recv(recv_cap)
+    }
+
+    fn send_vfs_request(
+        &self,
+        kernel: &mut KernelState,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<(), KernelError> {
+        let send_cap = self
+            .vfs_request_send
+            .ok_or(KernelError::InvalidCapability)?;
+        let msg = Message::with_header(0, opcode, 0, None, payload)
+            .map_err(|_| KernelError::WrongObject)?;
+        kernel.ipc_send(send_cap, msg)
+    }
+
+    fn recv_vfs_reply(&self, kernel: &mut KernelState) -> Result<Option<Message>, KernelError> {
+        let recv_cap = self.vfs_reply_recv.ok_or(KernelError::InvalidCapability)?;
+        kernel.ipc_recv(recv_cap)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinuxErrno {
@@ -384,34 +503,34 @@ impl KernelState {
     }
 }
 
-pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
+pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame: &mut TrapFrame) {
     let result: Result<usize, LinuxErrno> = (|| match LinuxCompatSyscall::decode(frame.syscall_num)?
     {
         LinuxCompatSyscall::Exit => {
             let code = frame.args[LINUX_ARG0] as u64;
-            kernel
-                .send_linux_process_manager_request(PROC_OP_EXIT, code)
+            bindings
+                .send_proc_request(kernel, PROC_OP_EXIT, code)
                 .map_err(LinuxErrno::from)?;
             Ok(0)
         }
         LinuxCompatSyscall::Getpid => {
             let tid = kernel.scheduler.current_tid().ok_or(LinuxErrno::NoSys)?;
-            kernel
-                .send_linux_process_manager_request(PROC_OP_GETPID, tid)
+            bindings
+                .send_proc_request(kernel, PROC_OP_GETPID, tid)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_process_manager_reply()
+            let reply = bindings
+                .recv_proc_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::Getppid => {
             let tid = kernel.scheduler.current_tid().ok_or(LinuxErrno::NoSys)?;
-            kernel
-                .send_linux_process_manager_request(PROC_OP_GETPPID, tid)
+            bindings
+                .send_proc_request(kernel, PROC_OP_GETPPID, tid)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_process_manager_reply()
+            let reply = bindings
+                .recv_proc_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -423,22 +542,22 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 frame.args[LINUX_ARG2],
                 frame.args[LINUX_ARG3],
             );
-            kernel
-                .send_linux_vfs_request(VFS_OP_OPENAT, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_OPENAT, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::Close => {
             let payload = pack_vfs4(frame.args[LINUX_ARG0], 0, 0, 0);
-            kernel
-                .send_linux_vfs_request(VFS_OP_CLOSE, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_CLOSE, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -450,11 +569,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 frame.args[LINUX_ARG2],
                 0,
             );
-            kernel
-                .send_linux_vfs_request(VFS_OP_READ, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_READ, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -466,11 +585,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 frame.args[LINUX_ARG2],
                 0,
             );
-            kernel
-                .send_linux_vfs_request(VFS_OP_WRITE, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_WRITE, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -482,11 +601,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 frame.args[LINUX_ARG2],
                 frame.args[LINUX_ARG3],
             );
-            kernel
-                .send_linux_vfs_request(VFS_OP_IOCTL, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_IOCTL, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -515,11 +634,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
         }
         LinuxCompatSyscall::Dup => {
             let payload = pack_vfs4(frame.args[LINUX_ARG0], 0, 0, 0);
-            kernel
-                .send_linux_vfs_request(VFS_OP_DUP, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_DUP, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -531,11 +650,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 frame.args[LINUX_ARG2],
                 0,
             );
-            kernel
-                .send_linux_vfs_request(VFS_OP_FCNTL, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_FCNTL, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -547,22 +666,22 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 frame.args[LINUX_ARG2],
                 0,
             );
-            kernel
-                .send_linux_vfs_request(VFS_OP_POLL, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_POLL, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::EpollCreate1 => {
             let payload = pack_vfs4(frame.args[LINUX_ARG0], 0, 0, 0);
-            kernel
-                .send_linux_vfs_request(VFS_OP_EPOLL_CREATE1, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_EPOLL_CREATE1, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -574,11 +693,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 frame.args[LINUX_ARG2],
                 frame.args[LINUX_ARG3],
             );
-            kernel
-                .send_linux_vfs_request(VFS_OP_EPOLL_CTL, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_EPOLL_CTL, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -590,11 +709,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 frame.args[LINUX_ARG2],
                 frame.args[LINUX_ARG3],
             );
-            kernel
-                .send_linux_vfs_request(VFS_OP_EPOLL_PWAIT, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_EPOLL_PWAIT, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -606,11 +725,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 frame.args[LINUX_ARG2],
                 frame.args[LINUX_ARG3],
             );
-            kernel
-                .send_linux_vfs_request(VFS_OP_SENDFILE, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_SENDFILE, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -622,11 +741,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) {
                 frame.args[LINUX_ARG2],
                 frame.args[LINUX_ARG3],
             );
-            kernel
-                .send_linux_vfs_request(VFS_OP_STATX, &payload)
+            bindings
+                .send_vfs_request(kernel, VFS_OP_STATX, &payload)
                 .map_err(LinuxErrno::from)?;
-            let reply = kernel
-                .recv_linux_vfs_reply()
+            let reply = bindings
+                .recv_vfs_reply(kernel)
                 .map_err(LinuxErrno::from)?
                 .ok_or(LinuxErrno::NoSys)?;
             decode_u64_reply(reply.as_slice())
@@ -825,6 +944,7 @@ mod tests {
     #[test]
     fn linux_dispatch_table_drives_mmap_and_munmap() {
         let mut state = Bootstrap::init().expect("init");
+        let bindings = LinuxServiceBindings::default();
         let (_asid, aspace_cap) = state.create_user_address_space().expect("aspace");
 
         let mut mmap_frame = TrapFrame::new(
@@ -838,7 +958,7 @@ mod tests {
                 0,
             ],
         );
-        dispatch(&mut state, &mut mmap_frame);
+        dispatch(&mut state, &bindings, &mut mmap_frame);
         assert_eq!(mmap_frame.error, 0);
         assert_eq!(mmap_frame.ret0, 0x8000);
 
@@ -846,17 +966,18 @@ mod tests {
             LINUX_NR_MUNMAP,
             [aspace_cap.0 as usize, 0x8000, PAGE_SIZE * 2, 0, 0, 0],
         );
-        dispatch(&mut state, &mut munmap_frame);
+        dispatch(&mut state, &bindings, &mut munmap_frame);
         assert_eq!(munmap_frame.error, 0);
     }
 
     #[test]
     fn linux_dispatch_getpid_and_exit_route_to_process_manager_ipc() {
         let mut state = Bootstrap::init().expect("init");
+        let mut bindings = LinuxServiceBindings::default();
         let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("req ep");
         let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("rep ep");
-        state
-            .register_linux_process_manager(req_send, rep_recv)
+        bindings
+            .register_process_manager(&state, req_send, rep_recv)
             .expect("register proc mgr");
 
         let pid: u64 = 1234;
@@ -877,7 +998,7 @@ mod tests {
             .expect("seed ppid reply");
 
         let mut getpid_frame = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
-        dispatch(&mut state, &mut getpid_frame);
+        dispatch(&mut state, &bindings, &mut getpid_frame);
         assert_eq!(getpid_frame.error, 0);
         assert_eq!(getpid_frame.ret0, pid as usize);
 
@@ -888,7 +1009,7 @@ mod tests {
         assert_eq!(req_msg.opcode, PROC_OP_GETPID);
 
         let mut getppid_frame = TrapFrame::new(LINUX_NR_GETPPID, [0, 0, 0, 0, 0, 0]);
-        dispatch(&mut state, &mut getppid_frame);
+        dispatch(&mut state, &bindings, &mut getppid_frame);
         assert_eq!(getppid_frame.error, 0);
         assert_eq!(getppid_frame.ret0, ppid as usize);
 
@@ -899,7 +1020,7 @@ mod tests {
         assert_eq!(getppid_req.opcode, PROC_OP_GETPPID);
 
         let mut exit_frame = TrapFrame::new(LINUX_NR_EXIT, [7, 0, 0, 0, 0, 0]);
-        dispatch(&mut state, &mut exit_frame);
+        dispatch(&mut state, &bindings, &mut exit_frame);
         assert_eq!(exit_frame.error, 0);
 
         let exit_req = state
@@ -913,10 +1034,11 @@ mod tests {
     #[test]
     fn linux_dispatch_vfs_syscalls_route_to_vfs_ipc() {
         let mut state = Bootstrap::init().expect("init");
+        let mut bindings = LinuxServiceBindings::default();
         let (_req_ep, req_send, req_recv) = state.create_endpoint(16).expect("vfs req ep");
         let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(16).expect("vfs rep ep");
-        state
-            .register_linux_vfs_manager(req_send, rep_recv)
+        bindings
+            .register_vfs_manager(&state, req_send, rep_recv)
             .expect("register vfs");
 
         for value in [
@@ -931,66 +1053,66 @@ mod tests {
         }
 
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [3, 0x2000, 0x10, 0, 0, 0]);
-        dispatch(&mut state, &mut openat);
+        dispatch(&mut state, &bindings, &mut openat);
         assert_eq!(openat.error, 0);
         assert_eq!(openat.ret0, 42);
         let open_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(open_req.opcode, VFS_OP_OPENAT);
 
         let mut close = TrapFrame::new(LINUX_NR_CLOSE, [42, 0, 0, 0, 0, 0]);
-        dispatch(&mut state, &mut close);
+        dispatch(&mut state, &bindings, &mut close);
         assert_eq!(close.error, 0);
         let close_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(close_req.opcode, VFS_OP_CLOSE);
 
         let mut read = TrapFrame::new(LINUX_NR_READ, [42, 0x3000, 128, 0, 0, 0]);
-        dispatch(&mut state, &mut read);
+        dispatch(&mut state, &bindings, &mut read);
         assert_eq!(read.error, 0);
         assert_eq!(read.ret0, 128);
         let read_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(read_req.opcode, VFS_OP_READ);
 
         let mut write = TrapFrame::new(LINUX_NR_WRITE, [42, 0x4000, 64, 0, 0, 0]);
-        dispatch(&mut state, &mut write);
+        dispatch(&mut state, &bindings, &mut write);
         assert_eq!(write.error, 0);
         assert_eq!(write.ret0, 64);
         let write_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(write_req.opcode, VFS_OP_WRITE);
 
         let mut ioctl = TrapFrame::new(LINUX_NR_IOCTL, [42, 0x1234, 0x5555, 0x6666, 0, 0]);
-        dispatch(&mut state, &mut ioctl);
+        dispatch(&mut state, &bindings, &mut ioctl);
         assert_eq!(ioctl.error, 0);
         let ioctl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(ioctl_req.opcode, VFS_OP_IOCTL);
 
         let mut dup = TrapFrame::new(LINUX_NR_DUP, [42, 0, 0, 0, 0, 0]);
-        dispatch(&mut state, &mut dup);
+        dispatch(&mut state, &bindings, &mut dup);
         assert_eq!(dup.error, 0);
         assert_eq!(dup.ret0, 43);
         let dup_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(dup_req.opcode, VFS_OP_DUP);
 
         let mut fcntl = TrapFrame::new(LINUX_NR_FCNTL, [42, 3, 0xF0, 0, 0, 0]);
-        dispatch(&mut state, &mut fcntl);
+        dispatch(&mut state, &bindings, &mut fcntl);
         assert_eq!(fcntl.error, 0);
         let fcntl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(fcntl_req.opcode, VFS_OP_FCNTL);
 
         let mut poll = TrapFrame::new(LINUX_NR_POLL, [0x9000, 2, 10, 0, 0, 0]);
-        dispatch(&mut state, &mut poll);
+        dispatch(&mut state, &bindings, &mut poll);
         assert_eq!(poll.error, 0);
         assert_eq!(poll.ret0, 1);
         let poll_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(poll_req.opcode, VFS_OP_POLL);
         let mut epoll_create = TrapFrame::new(LINUX_NR_EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
-        dispatch(&mut state, &mut epoll_create);
+        dispatch(&mut state, &bindings, &mut epoll_create);
         assert_eq!(epoll_create.error, 0);
         assert_eq!(epoll_create.ret0, 7);
         let epc_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(epc_req.opcode, VFS_OP_EPOLL_CREATE1);
 
         let mut epoll_ctl = TrapFrame::new(LINUX_NR_EPOLL_CTL, [7, 1, 42, 0xA000, 0, 0]);
-        dispatch(&mut state, &mut epoll_ctl);
+        dispatch(&mut state, &bindings, &mut epoll_ctl);
         assert_eq!(epoll_ctl.error, 0);
         let epctl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(epctl_req.opcode, VFS_OP_EPOLL_CTL);
@@ -998,14 +1120,14 @@ mod tests {
         assert_eq!(&epctl_req.as_slice()[..8], &(7u64).to_le_bytes());
 
         let mut epoll_wait = TrapFrame::new(LINUX_NR_EPOLL_PWAIT, [7, 0xB000, 4, 10, 0, 0]);
-        dispatch(&mut state, &mut epoll_wait);
+        dispatch(&mut state, &bindings, &mut epoll_wait);
         assert_eq!(epoll_wait.error, 0);
         assert_eq!(epoll_wait.ret0, 1);
         let epwait_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(epwait_req.opcode, VFS_OP_EPOLL_PWAIT);
 
         let mut sendfile = TrapFrame::new(LINUX_NR_SENDFILE, [1, 2, 0xC000, 99, 0, 0]);
-        dispatch(&mut state, &mut sendfile);
+        dispatch(&mut state, &bindings, &mut sendfile);
         assert_eq!(sendfile.error, 0);
         assert_eq!(sendfile.ret0, 99);
         let sendfile_req = state.ipc_recv(req_recv).expect("req").expect("msg");
@@ -1014,7 +1136,7 @@ mod tests {
         assert_eq!(&sendfile_req.as_slice()[24..32], &(99u64).to_le_bytes());
 
         let mut statx = TrapFrame::new(LINUX_NR_STATX, [3, 0xD000, 0, 0xE000, 0, 0]);
-        dispatch(&mut state, &mut statx);
+        dispatch(&mut state, &bindings, &mut statx);
         assert_eq!(statx.error, 0);
         let statx_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(statx_req.opcode, VFS_OP_STATX);
@@ -1025,14 +1147,15 @@ mod tests {
     #[test]
     fn process_manager_v2_dual_arg_payload_roundtrip() {
         let mut state = Bootstrap::init().expect("init");
+        let mut bindings = LinuxServiceBindings::default();
         let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("req ep");
         let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("rep ep");
-        state
-            .register_linux_process_manager(req_send, rep_recv)
+        bindings
+            .register_process_manager(&state, req_send, rep_recv)
             .expect("register proc mgr");
 
-        state
-            .send_linux_process_manager_request2(PROC_OP_WAITPID_V2, 42, 0x10)
+        bindings
+            .send_proc_request2(&mut state, PROC_OP_WAITPID_V2, 42, 0x10)
             .expect("send");
         let req = state.ipc_recv(req_recv).expect("recv").expect("msg");
         assert_eq!(req.opcode, PROC_OP_WAITPID_V2);
@@ -1047,8 +1170,8 @@ mod tests {
                     .expect("reply"),
             )
             .expect("seed");
-        let reply = state
-            .recv_linux_process_manager_reply()
+        let reply = bindings
+            .recv_proc_reply(&mut state)
             .expect("recv")
             .expect("msg");
         assert_eq!(reply.opcode, PROC_OP_WAITPID_V2);
@@ -1057,18 +1180,19 @@ mod tests {
     #[test]
     fn linux_personality_shim_end_to_end_open_getpid_and_exit() {
         let mut state = Bootstrap::init().expect("init");
+        let mut bindings = LinuxServiceBindings::default();
         let (_proc_req_ep, proc_req_send, proc_req_recv) =
             state.create_endpoint(8).expect("proc req");
         let (_proc_rep_ep, proc_rep_send, proc_rep_recv) =
             state.create_endpoint(8).expect("proc rep");
-        state
-            .register_linux_process_manager(proc_req_send, proc_rep_recv)
+        bindings
+            .register_process_manager(&state, proc_req_send, proc_rep_recv)
             .expect("register proc");
 
         let (_vfs_req_ep, vfs_req_send, vfs_req_recv) = state.create_endpoint(8).expect("vfs req");
         let (_vfs_rep_ep, vfs_rep_send, vfs_rep_recv) = state.create_endpoint(8).expect("vfs rep");
-        state
-            .register_linux_vfs_manager(vfs_req_send, vfs_rep_recv)
+        bindings
+            .register_vfs_manager(&state, vfs_req_send, vfs_rep_recv)
             .expect("register vfs");
 
         state
@@ -1086,17 +1210,17 @@ mod tests {
             .expect("seed open");
 
         let mut getpid = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
-        dispatch(&mut state, &mut getpid);
+        dispatch(&mut state, &bindings, &mut getpid);
         assert_eq!(getpid.error, 0);
         assert_eq!(getpid.ret0, 42);
 
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x2000, 0, 0, 0, 0]);
-        dispatch(&mut state, &mut openat);
+        dispatch(&mut state, &bindings, &mut openat);
         assert_eq!(openat.error, 0);
         assert_eq!(openat.ret0, 3);
 
         let mut exit = TrapFrame::new(LINUX_NR_EXIT, [5, 0, 0, 0, 0, 0]);
-        dispatch(&mut state, &mut exit);
+        dispatch(&mut state, &bindings, &mut exit);
         assert_eq!(exit.error, 0);
 
         let proc_getpid = state.ipc_recv(proc_req_recv).expect("recv").expect("msg");
@@ -1111,18 +1235,19 @@ mod tests {
     #[test]
     fn linux_personality_deterministic_sequence_is_stable() {
         let mut state = Bootstrap::init().expect("init");
+        let mut bindings = LinuxServiceBindings::default();
         let (_proc_req_ep, proc_req_send, proc_req_recv) =
             state.create_endpoint(16).expect("proc req");
         let (_proc_rep_ep, proc_rep_send, proc_rep_recv) =
             state.create_endpoint(16).expect("proc rep");
-        state
-            .register_linux_process_manager(proc_req_send, proc_rep_recv)
+        bindings
+            .register_process_manager(&state, proc_req_send, proc_rep_recv)
             .expect("register proc");
 
         let (_vfs_req_ep, vfs_req_send, vfs_req_recv) = state.create_endpoint(16).expect("vfs req");
         let (_vfs_rep_ep, vfs_rep_send, vfs_rep_recv) = state.create_endpoint(16).expect("vfs rep");
-        state
-            .register_linux_vfs_manager(vfs_req_send, vfs_rep_recv)
+        bindings
+            .register_vfs_manager(&state, vfs_req_send, vfs_rep_recv)
             .expect("register vfs");
 
         for pid in [101u64, 102, 103] {
@@ -1154,7 +1279,7 @@ mod tests {
         let mut observed = [0usize; 6];
         for (i, nr) in sequence.iter().enumerate() {
             let mut frame = TrapFrame::new(*nr, [0, 0x2000 + i * 8, 0, 0, 0, 0]);
-            dispatch(&mut state, &mut frame);
+            dispatch(&mut state, &bindings, &mut frame);
             assert_eq!(frame.error, 0);
             observed[i] = frame.ret0;
         }
