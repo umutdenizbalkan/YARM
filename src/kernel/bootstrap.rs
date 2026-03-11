@@ -142,7 +142,7 @@ pub struct KernelState {
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
     next_memory_object_id: u64,
     next_iova_space_id: u64,
-    next_anon_phys: usize,
+    next_anon_phys: u64,
     tlb_shootdown_count: u64,
     last_fault: Option<FaultInfo>,
     fault_handler_endpoint: Option<usize>,
@@ -1074,7 +1074,7 @@ impl KernelState {
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
         let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1);
         let mapping = aspace
-            .resolve(VirtAddr(page_base))
+            .resolve(VirtAddr(page_base as u64))
             .ok_or(KernelError::UserMemoryFault)?;
         if !mapping.flags.user || !mapping.flags.read || (need_write && !mapping.flags.write) {
             return Err(KernelError::UserMemoryFault);
@@ -1688,7 +1688,7 @@ impl KernelState {
     }
 
     pub fn create_memory_object(&mut self, phys: PhysAddr) -> Result<(u64, CapId), KernelError> {
-        if !phys.0.is_multiple_of(crate::kernel::vm::PAGE_SIZE) {
+        if !phys.0.is_multiple_of(crate::kernel::vm::PAGE_SIZE as u64) {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
         let id = self.next_memory_object_id;
@@ -1717,7 +1717,7 @@ impl KernelState {
         let phys = PhysAddr(self.next_anon_phys);
         self.next_anon_phys = self
             .next_anon_phys
-            .wrapping_add(crate::kernel::vm::PAGE_SIZE);
+            .wrapping_add(crate::kernel::vm::PAGE_SIZE as u64);
         self.create_memory_object(phys)
     }
 

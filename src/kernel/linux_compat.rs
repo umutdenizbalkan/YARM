@@ -295,7 +295,7 @@ impl KernelState {
             let (_, mem_cap) = self
                 .alloc_anonymous_memory_object()
                 .map_err(LinuxErrno::from)?;
-            self.map_user_page_with_caps(aspace_map_cap, mem_cap, VirtAddr(va), flags)
+            self.map_user_page_with_caps(aspace_map_cap, mem_cap, VirtAddr(va as u64), flags)
                 .map_err(LinuxErrno::from)?;
             va += PAGE_SIZE;
         }
@@ -316,7 +316,7 @@ impl KernelState {
             .ok_or(LinuxErrno::Inval)?;
         let mut va = addr;
         while va < end {
-            self.unmap_user_page(aspace_map_cap, VirtAddr(va))
+            self.unmap_user_page(aspace_map_cap, VirtAddr(va as u64))
                 .map_err(LinuxErrno::from)?;
             va += PAGE_SIZE;
         }
@@ -339,7 +339,7 @@ impl KernelState {
             .ok_or(LinuxErrno::Inval)?;
         let mut va = addr;
         while va < end {
-            self.protect_user_page(aspace_map_cap, VirtAddr(va), flags)
+            self.protect_user_page(aspace_map_cap, VirtAddr(va as u64), flags)
                 .map_err(LinuxErrno::from)?;
             va += PAGE_SIZE;
         }
