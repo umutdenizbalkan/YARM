@@ -3,6 +3,7 @@ use super::capabilities::CapId;
 use super::ipc::Message;
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
+use super::vm::VirtAddr;
 
 pub const SYSCALL_ABI_VERSION: u16 = 1;
 pub const SYSCALL_YIELD_NR: usize = 0;
@@ -129,7 +130,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             Ok(payload) => payload,
             Err(KernelError::UserMemoryFault) => {
                 kernel.record_fault(FaultInfo {
-                    addr: user_ptr,
+                    addr: VirtAddr(user_ptr as u64),
                     access: FaultAccess::Read,
                 });
                 frame.set_err(SyscallError::PageFault.code());
@@ -173,7 +174,7 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                     Ok(()) => frame.set_ok(sender, msg.len as usize),
                     Err(KernelError::UserMemoryFault) => {
                         kernel.record_fault(FaultInfo {
-                            addr: user_ptr,
+                            addr: VirtAddr(user_ptr as u64),
                             access: FaultAccess::Write,
                         });
                         frame.set_err(SyscallError::PageFault.code());

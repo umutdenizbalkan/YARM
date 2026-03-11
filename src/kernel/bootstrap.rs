@@ -8,7 +8,7 @@ use super::task::{
     TickInstant, WaitReason,
 };
 use super::timer::Timer;
-use super::trap::{FaultInfo, Trap, TrapAction, TrapEvent, route_trap};
+use super::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
 use super::trapframe::TrapFrame;
 use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
@@ -1224,11 +1224,12 @@ impl KernelState {
 
         let mut payload = [0u8; 17];
         payload[..8].copy_from_slice(&faulted_tid.to_le_bytes());
-        let addr_bytes = (fault.addr as u64).to_le_bytes();
+        let addr_bytes = fault.addr.0.to_le_bytes();
         payload[8..16].copy_from_slice(&addr_bytes);
         payload[16] = match fault.access {
-            super::trap::FaultAccess::Read => 0,
-            super::trap::FaultAccess::Write => 1,
+            FaultAccess::Read => 0,
+            FaultAccess::Write => 1,
+            FaultAccess::Execute => 2,
         };
 
         let msg = match Message::new(0, &payload) {
@@ -1855,8 +1856,8 @@ impl KernelState {
         trap: Trap,
         frame: Option<&mut TrapFrame>,
     ) -> Result<(), TrapHandleError> {
-        match route_trap(trap) {
-            TrapAction::DispatchSyscall => {
+        match trap {
+            Trap::Syscall => {
                 self.clear_last_fault();
                 let trapframe = frame.ok_or(TrapHandleError::MissingTrapFrame)?;
                 dispatch_syscall(self, trapframe).map_err(TrapHandleError::Syscall)?;
@@ -1867,7 +1868,7 @@ impl KernelState {
                 }
                 Ok(())
             }
-            TrapAction::TickScheduler => {
+            Trap::TimerInterrupt => {
                 let (_, should_preempt) = self.timer.tick_and_check();
                 if should_preempt {
                     self.yield_current()
@@ -1876,7 +1877,7 @@ impl KernelState {
                 }
                 Ok(())
             }
-            TrapAction::HandlePageFault | TrapAction::HandleDeviceInterrupt => Ok(()),
+            Trap::PageFault | Trap::ExternalInterrupt => Ok(()),
         }
     }
 
@@ -2031,13 +2032,10 @@ mod tests {
 
         state
             .handle_trap_event(
-                TrapEvent::with_fault(
-                    Trap::PageFault,
-                    FaultInfo {
-                        addr: 0x1200,
-                        access: super::super::trap::FaultAccess::Read,
-                    },
-                ),
+                TrapEvent::page_fault(FaultInfo {
+                    addr: VirtAddr(0x1200),
+                    access: super::super::trap::FaultAccess::Read,
+                }),
                 None,
             )
             .expect("page fault event handled");
@@ -2047,7 +2045,7 @@ mod tests {
         assert_eq!(
             state.last_fault(),
             Some(FaultInfo {
-                addr: 0x1200,
+                addr: VirtAddr(0x1200),
                 access: super::super::trap::FaultAccess::Read,
             })
         );
@@ -2433,7 +2431,7 @@ mod tests {
         assert_eq!(
             state.last_fault(),
             Some(super::super::trap::FaultInfo {
-                addr: 8,
+                addr: VirtAddr(8),
                 access: super::super::trap::FaultAccess::Write,
             })
         );
@@ -2646,7 +2644,7 @@ mod tests {
         state.bind_irq_notification(11, notif_cap).expect("bind");
 
         state
-            .handle_trap_event(TrapEvent::with_irq(Trap::ExternalInterrupt, 11), None)
+            .handle_trap_event(TrapEvent::external_interrupt(11), None)
             .expect("handle irq");
 
         let msg = state.ipc_recv(notif_recv_cap).expect("recv").expect("msg");
@@ -2823,7 +2821,7 @@ mod tests {
 
         for _ in 0..5 {
             state
-                .handle_trap_event(TrapEvent::with_irq(Trap::ExternalInterrupt, 5), None)
+                .handle_trap_event(TrapEvent::external_interrupt(5), None)
                 .expect("irq");
         }
 
@@ -3109,7 +3107,7 @@ mod tests {
                     .expect("work"),
                 1 => {
                     if state
-                        .handle_trap_event(TrapEvent::with_irq(Trap::ExternalInterrupt, 7), None)
+                        .handle_trap_event(TrapEvent::external_interrupt(7), None)
                         .is_err()
                     {
                         let _ = state.ipc_recv(nrecv);

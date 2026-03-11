@@ -1,7 +1,8 @@
 use crate::kernel::bootstrap::{KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
-use crate::kernel::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
+use crate::kernel::trap::{FaultAccess, FaultInfo, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
+use crate::kernel::vm::VirtAddr;
 
 const INTERRUPT_BIT: usize = 1usize << (usize::BITS as usize - 1);
 
@@ -20,29 +21,23 @@ pub fn decode_trap(scause: usize, stval: usize) -> TrapEvent {
 
     if is_interrupt {
         return match code {
-            IRQ_SUPERVISOR_TIMER => TrapEvent::new(Trap::TimerInterrupt),
-            IRQ_SUPERVISOR_EXTERNAL => TrapEvent::with_irq(Trap::ExternalInterrupt, stval as u16),
-            _ => TrapEvent::new(Trap::ExternalInterrupt),
+            IRQ_SUPERVISOR_TIMER => TrapEvent::timer_interrupt(),
+            IRQ_SUPERVISOR_EXTERNAL => TrapEvent::external_interrupt(stval as u16),
+            _ => TrapEvent::external_interrupt(0),
         };
     }
 
     match code {
-        EXC_USER_ECALL => TrapEvent::new(Trap::Syscall),
-        EXC_LOAD_PAGE_FAULT => TrapEvent::with_fault(
-            Trap::PageFault,
-            FaultInfo {
-                addr: stval,
-                access: FaultAccess::Read,
-            },
-        ),
-        EXC_STORE_PAGE_FAULT => TrapEvent::with_fault(
-            Trap::PageFault,
-            FaultInfo {
-                addr: stval,
-                access: FaultAccess::Write,
-            },
-        ),
-        _ => TrapEvent::new(Trap::ExternalInterrupt),
+        EXC_USER_ECALL => TrapEvent::syscall(),
+        EXC_LOAD_PAGE_FAULT => TrapEvent::page_fault(FaultInfo {
+            addr: VirtAddr(stval as u64),
+            access: FaultAccess::Read,
+        }),
+        EXC_STORE_PAGE_FAULT => TrapEvent::page_fault(FaultInfo {
+            addr: VirtAddr(stval as u64),
+            access: FaultAccess::Write,
+        }),
+        _ => TrapEvent::external_interrupt(0),
     }
 }
 
@@ -71,6 +66,7 @@ pub fn handle_trap_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::trap::Trap;
 
     #[test]
     fn decode_user_ecall_to_syscall() {
@@ -99,7 +95,7 @@ mod tests {
         assert_eq!(
             event.fault,
             Some(FaultInfo {
-                addr: 0xDEAD_BEEF,
+                addr: VirtAddr(0xDEAD_BEEF),
                 access: FaultAccess::Write,
             })
         );
