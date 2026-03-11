@@ -1,8 +1,13 @@
+#![no_std]
+extern crate std;
+
 use yarm::kernel::bootstrap::Bootstrap;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::syscall::Syscall;
 use yarm::kernel::trap::Trap;
 use yarm::kernel::trapframe::TrapFrame;
+
+use std::println;
 
 fn main() {
     let mut kernel = Bootstrap::init().expect("bootstrap failed");
