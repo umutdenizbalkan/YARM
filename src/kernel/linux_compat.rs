@@ -1324,4 +1324,32 @@ mod tests {
         assert_eq!(proc_count, 3);
         assert_eq!(vfs_count, 3);
     }
+
+    #[test]
+    fn linux_dispatch_table_is_frozen_contract() {
+        let expected = [
+            LINUX_NR_EXIT,
+            LINUX_NR_GETPID,
+            LINUX_NR_GETPPID,
+            LINUX_NR_OPENAT,
+            LINUX_NR_CLOSE,
+            LINUX_NR_READ,
+            LINUX_NR_WRITE,
+            LINUX_NR_IOCTL,
+            LINUX_NR_DUP,
+            LINUX_NR_FCNTL,
+            LINUX_NR_POLL,
+            LINUX_NR_EPOLL_CREATE1,
+            LINUX_NR_EPOLL_CTL,
+            LINUX_NR_EPOLL_PWAIT,
+            LINUX_NR_SENDFILE,
+            LINUX_NR_STATX,
+            LINUX_NR_BRK,
+            LINUX_NR_MUNMAP,
+            LINUX_NR_MMAP,
+            LINUX_NR_MPROTECT,
+        ];
+        assert_eq!(LinuxCompatSyscall::DISPATCH_TABLE, expected);
+        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, expected.len());
+    }
 }

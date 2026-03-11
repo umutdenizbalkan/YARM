@@ -66,7 +66,7 @@ pub struct ClassPolicySnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceServerDelegation {
-    pub server_tid: u64,
+    pub server_tid: ThreadId,
     pub irq_line: u16,
     pub mem_cap: CapId,
     pub dma_offset: usize,
@@ -94,7 +94,7 @@ pub struct RestartTelemetry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TaskMemByte {
-    tid: u64,
+    tid: ThreadId,
     addr: usize,
     value: u8,
 }
@@ -118,7 +118,7 @@ struct RestartPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DriverRecord {
-    tid: u64,
+    tid: ThreadId,
     irq_cap: Option<CapId>,
     dma_cap: Option<CapId>,
     dma_iova_base: Option<usize>,
@@ -135,8 +135,8 @@ pub struct KernelState {
     pub user_spaces: AddressSpaceManager,
     cross_cpu_work: CrossCpuWorkQueue,
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
-    endpoint_waiters: [Option<u64>; MAX_ENDPOINTS],
-    endpoint_sender_waiters: [Option<(u64, Message)>; MAX_ENDPOINTS],
+    endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
+    endpoint_sender_waiters: [Option<(ThreadId, Message)>; MAX_ENDPOINTS],
     endpoint_generations: [u64; MAX_ENDPOINTS],
     notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
     notification_generations: [u64; MAX_NOTIFICATIONS],
@@ -245,16 +245,16 @@ impl Bootstrap {
 }
 
 impl KernelState {
-    fn switch_to_runnable_tid(&mut self, tid: u64) -> Result<bool, KernelError> {
+    fn switch_to_runnable_tid(&mut self, tid: ThreadId) -> Result<bool, KernelError> {
         let mut spins = 0usize;
         while spins < MAX_TASKS {
-            if self.scheduler.current_tid() == Some(tid) {
+            if self.scheduler.current_tid() == Some(tid.0) {
                 return Ok(true);
             }
             self.yield_current()?;
             spins += 1;
         }
-        Ok(self.scheduler.current_tid() == Some(tid))
+        Ok(self.scheduler.current_tid() == Some(tid.0))
     }
 
     fn tcb_mut(&mut self, tid: u64) -> Option<&mut ThreadControlBlock> {
@@ -349,14 +349,14 @@ impl KernelState {
             .driver_records
             .iter()
             .flatten()
-            .any(|record| record.tid == tid)
+            .any(|record| record.tid == ThreadId(tid))
         {
             return Ok(());
         }
 
         if let Some(slot) = self.driver_records.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(DriverRecord {
-                tid,
+                tid: ThreadId(tid),
                 irq_cap: None,
                 dma_cap: None,
                 dma_iova_base: None,
@@ -385,7 +385,7 @@ impl KernelState {
             .driver_records
             .iter_mut()
             .flatten()
-            .find(|record| record.tid == tid)
+            .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
         record.irq_cap = Some(irq_cap);
         Ok(())
@@ -431,7 +431,7 @@ impl KernelState {
             .driver_records
             .iter_mut()
             .flatten()
-            .find(|record| record.tid == tid)
+            .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
         record.iova_space_cap = Some(iova_cap);
         Ok(())
@@ -496,7 +496,7 @@ impl KernelState {
             .driver_records
             .iter_mut()
             .flatten()
-            .find(|record| record.tid == tid)
+            .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
         record.dma_cap = Some(dma_cap);
         Ok(())
@@ -506,16 +506,16 @@ impl KernelState {
         &mut self,
         plan: DeviceServerDelegation,
     ) -> Result<(CapId, CapId), KernelError> {
-        self.register_driver(plan.server_tid)?;
+        self.register_driver(plan.server_tid.0)?;
 
         let irq_cap = self.mint_irq_cap(plan.irq_line)?;
-        self.grant_driver_irq(plan.server_tid, irq_cap)?;
+        self.grant_driver_irq(plan.server_tid.0, irq_cap)?;
 
         let dma_cap = self.mint_dma_region_cap(plan.mem_cap, plan.dma_offset, plan.dma_len)?;
-        self.grant_driver_dma(plan.server_tid, dma_cap)?;
+        self.grant_driver_dma(plan.server_tid.0, dma_cap)?;
 
-        self.grant_driver_iova_space(plan.server_tid, plan.iova_cap)?;
-        self.configure_driver_dma_window(plan.server_tid, plan.iova_base, plan.iova_len)?;
+        self.grant_driver_iova_space(plan.server_tid.0, plan.iova_cap)?;
+        self.configure_driver_dma_window(plan.server_tid.0, plan.iova_base, plan.iova_len)?;
 
         Ok((irq_cap, dma_cap))
     }
@@ -537,7 +537,7 @@ impl KernelState {
             .driver_records
             .iter_mut()
             .flatten()
-            .find(|record| record.tid == tid)
+            .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
         record.dma_iova_base = Some(iova_base);
         record.dma_iova_len = Some(iova_len);
@@ -560,7 +560,7 @@ impl KernelState {
             .driver_records
             .iter()
             .flatten()
-            .find(|record| record.tid == tid)
+            .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
 
         if record.iova_space_cap.is_none() {
@@ -587,7 +587,7 @@ impl KernelState {
             .driver_records
             .iter_mut()
             .flatten()
-            .find(|record| record.tid == tid)
+            .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
         record.iova_space_cap = None;
         record.dma_iova_base = None;
@@ -600,7 +600,7 @@ impl KernelState {
             .driver_records
             .iter_mut()
             .flatten()
-            .find(|record| record.tid == tid)
+            .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
 
         if let Some(cap) = record.irq_cap.take() {
@@ -716,7 +716,7 @@ impl KernelState {
     }
 
     pub fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelError> {
-        let now = self.timer.current_ticks().0;
+        let now_tick = TickInstant(self.timer.current_ticks().0);
         let (app_threshold, driver_threshold, system_threshold) = (
             self.app_escalation_threshold,
             self.driver_escalation_threshold,
@@ -733,7 +733,7 @@ impl KernelState {
             } else if tcb.restart.budget == 0 {
                 denied = true;
                 Some(KernelError::WouldBlock)
-            } else if now < tcb.restart.available_at.0 {
+            } else if now_tick < tcb.restart.available_at {
                 denied = true;
                 Some(KernelError::WouldBlock)
             } else {
@@ -767,7 +767,7 @@ impl KernelState {
 
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.restart.budget = tcb.restart.budget.saturating_sub(1);
-        tcb.restart.available_at = TickInstant(now.saturating_add(tcb.restart.backoff.0));
+        tcb.restart.available_at = TickInstant(now_tick.0.saturating_add(tcb.restart.backoff.0));
         tcb.restart.token = None;
         tcb.status = TaskStatus::Runnable;
         self.scheduler
@@ -901,7 +901,7 @@ impl KernelState {
             for slot in &mut self.task_mem {
                 if slot
                     .as_ref()
-                    .is_some_and(|entry| entry.tid == tid && entry.addr == va)
+                    .is_some_and(|entry| entry.tid == ThreadId(tid) && entry.addr == va)
                 {
                     slot.as_mut().expect("checked").value = data[i];
                     found = true;
@@ -916,7 +916,7 @@ impl KernelState {
                     .find(|slot| slot.is_none())
                     .ok_or(KernelError::TaskTableFull)?;
                 *slot = Some(TaskMemByte {
-                    tid,
+                    tid: ThreadId(tid),
                     addr: va,
                     value: data[i],
                 });
@@ -946,7 +946,7 @@ impl KernelState {
                 .task_mem
                 .iter()
                 .flatten()
-                .find(|entry| entry.tid == tid && entry.addr == va)
+                .find(|entry| entry.tid == ThreadId(tid) && entry.addr == va)
                 .map(|entry| entry.value)
                 .ok_or(KernelError::UserMemoryFault)?;
             out[i] = value;
@@ -1176,7 +1176,7 @@ impl KernelState {
             .ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
-        self.endpoint_waiters[endpoint_idx] = Some(blocked_tid);
+        self.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
         let _ = self.dispatch_next_task()?;
         Ok(())
     }
@@ -1197,27 +1197,27 @@ impl KernelState {
             .ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
-        self.endpoint_sender_waiters[endpoint_idx] = Some((blocked_tid, msg));
+        self.endpoint_sender_waiters[endpoint_idx] = Some((ThreadId(blocked_tid), msg));
         let _ = self.dispatch_next_task()?;
         Ok(())
     }
 
     fn wake_waiter_for_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
         if let Some(waiter_tid) = self.endpoint_waiters[endpoint_idx].take() {
-            let tcb = self.tcb_mut(waiter_tid).ok_or(KernelError::TaskMissing)?;
+            let tcb = self.tcb_mut(waiter_tid.0).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Runnable;
             self.scheduler
-                .enqueue(waiter_tid)
+                .enqueue(waiter_tid.0)
                 .map_err(|_| KernelError::SchedulerFull)?;
         }
         Ok(())
     }
 
-    fn wake_sender_waiter(&mut self, sender_tid: u64) -> Result<(), KernelError> {
-        let tcb = self.tcb_mut(sender_tid).ok_or(KernelError::TaskMissing)?;
+    fn wake_sender_waiter(&mut self, sender_tid: ThreadId) -> Result<(), KernelError> {
+        let tcb = self.tcb_mut(sender_tid.0).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Runnable;
         self.scheduler
-            .enqueue(sender_tid)
+            .enqueue(sender_tid.0)
             .map_err(|_| KernelError::SchedulerFull)
     }
 
@@ -2564,7 +2564,7 @@ mod tests {
         let iova_cap = state.create_iova_space_cap().expect("iova");
 
         let plan = DeviceServerDelegation {
-            server_tid: 34,
+            server_tid: ThreadId(34),
             irq_line: 10,
             mem_cap,
             dma_offset: 0,
@@ -3023,5 +3023,48 @@ mod tests {
         }
         assert!(seen > 0);
         assert_eq!(state.online_cpu_count(), 2);
+    }
+
+    #[test]
+    fn yield_current_rotates_to_next_runnable_task() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(40).expect("task");
+        state.scheduler.enqueue(40).expect("enqueue");
+
+        assert_eq!(state.scheduler.current_tid(), Some(0));
+        state.yield_current().expect("yield");
+
+        assert_eq!(state.scheduler.current_tid(), Some(40));
+        assert_eq!(state.task_status(40), Some(TaskStatus::Running));
+        assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
+    }
+
+    #[test]
+    fn restart_task_honors_backoff_window() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(41).expect("task");
+        state.set_task_restart_policy(41, 2, 10).expect("policy");
+
+        let first = state.exit_task(41, 1).expect("exit1");
+        state.restart_task(41, first).expect("restart1");
+
+        let second = state.exit_task(41, 2).expect("exit2");
+        assert_eq!(state.restart_task(41, second), Err(KernelError::WouldBlock));
+    }
+
+    #[test]
+    fn trap_event_page_fault_records_fault_then_faults_current_task() {
+        let mut state = Bootstrap::init().expect("init");
+        let fault = FaultInfo {
+            addr: VirtAddr(0x4000),
+            access: FaultAccess::Execute,
+        };
+
+        state
+            .handle_trap_event(TrapEvent::page_fault(fault), None)
+            .expect("handle page fault");
+
+        assert_eq!(state.last_fault(), Some(fault));
+        assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
     }
 }
