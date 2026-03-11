@@ -1097,8 +1097,9 @@ impl KernelState {
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Runnable;
         }
-        let _ = self.scheduler.on_preempt();
-        if let Some(tid) = self.scheduler.current_tid() {
+
+        let next_tid = self.scheduler.on_preempt();
+        if let Some(tid) = next_tid {
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Running;
         }
