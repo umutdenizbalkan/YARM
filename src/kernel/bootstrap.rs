@@ -827,7 +827,7 @@ impl KernelState {
     }
 
     pub fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelError> {
-        let now = self.timer.current_ticks();
+        let now = self.timer.current_ticks().0;
         let (app_threshold, driver_threshold, system_threshold) = (
             self.app_escalation_threshold,
             self.driver_escalation_threshold,
@@ -1868,8 +1868,8 @@ impl KernelState {
                 Ok(())
             }
             TrapAction::TickScheduler => {
-                self.timer.tick();
-                if self.timer.should_preempt() {
+                let (_, should_preempt) = self.timer.tick_and_check();
+                if should_preempt {
                     self.yield_current()
                         .map_err(SyscallError::from)
                         .map_err(TrapHandleError::Syscall)?;
