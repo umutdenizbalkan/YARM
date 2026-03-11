@@ -3,13 +3,17 @@ use super::ipc::{Endpoint, EndpointMode, Message};
 use super::scheduler::{CpuId, SmpScheduler};
 use super::smp::{CrossCpuWorkQueue, MAX_CROSS_CPU_WORK, WorkItem};
 use super::syscall::{SyscallError, dispatch as dispatch_syscall};
-use super::task::{TaskClass, TaskStatus, ThreadControlBlock, WaitReason};
+use super::task::{
+    RestartState, RestartToken, TaskClass, TaskStatus, ThreadControlBlock, TickDuration,
+    TickInstant, WaitReason,
+};
 use super::timer::Timer;
 use super::trap::{FaultInfo, Trap, TrapAction, TrapEvent, route_trap};
 use super::trapframe::TrapFrame;
 use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
 };
+use crate::kernel::ipc::ThreadId;
 
 const MAX_ENDPOINTS: usize = 16;
 const MAX_TASKS: usize = 64;
@@ -250,14 +254,14 @@ impl Bootstrap {
 
 impl KernelState {
     fn tcb_mut(&mut self, tid: u64) -> Option<&mut ThreadControlBlock> {
-        self.tcbs.iter_mut().flatten().find(|tcb| tcb.tid == tid)
+        self.tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid)
     }
 
     pub fn task_status(&self, tid: u64) -> Option<TaskStatus> {
         self.tcbs
             .iter()
             .flatten()
-            .find(|tcb| tcb.tid == tid)
+            .find(|tcb| tcb.tid.0 == tid)
             .map(|tcb| tcb.status)
     }
 
@@ -309,7 +313,7 @@ impl KernelState {
         self.tcbs
             .iter()
             .flatten()
-            .find(|tcb| tcb.tid == tid)
+            .find(|tcb| tcb.tid.0 == tid)
             .and_then(|tcb| tcb.fault_policy_override)
             .unwrap_or(self.fault_policy)
     }
@@ -318,7 +322,7 @@ impl KernelState {
         self.tcbs
             .iter()
             .flatten()
-            .find(|tcb| tcb.tid == tid)
+            .find(|tcb| tcb.tid.0 == tid)
             .and_then(|tcb| tcb.asid)
     }
 
@@ -781,8 +785,8 @@ impl KernelState {
         backoff_ticks: u64,
     ) -> Result<(), KernelError> {
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.restart_budget = budget;
-        tcb.restart_backoff_ticks = backoff_ticks;
+        tcb.restart.budget = budget;
+        tcb.restart.backoff = TickDuration(backoff_ticks);
         Ok(())
     }
 
@@ -791,15 +795,15 @@ impl KernelState {
             .tcbs
             .iter()
             .flatten()
-            .find(|tcb| tcb.tid == tid)
+            .find(|tcb| tcb.tid.0 == tid)
             .ok_or(KernelError::TaskMissing)?;
         Ok(RestartTelemetry {
-            budget_remaining: tcb.restart_budget,
-            backoff_ticks: tcb.restart_backoff_ticks,
-            available_at_tick: tcb.restart_available_at_tick,
-            token_outstanding: tcb.restart_token.is_some(),
-            denied_count: tcb.restart_denied_count,
-            escalation_count: tcb.restart_escalation_count,
+            budget_remaining: tcb.restart.budget,
+            backoff_ticks: tcb.restart.backoff.0,
+            available_at_tick: tcb.restart.available_at.0,
+            token_outstanding: tcb.restart.token.is_some(),
+            denied_count: tcb.restart.denied_count,
+            escalation_count: tcb.restart.escalation_count,
             last_exit_code: tcb.last_exit_code,
         })
     }
@@ -809,8 +813,8 @@ impl KernelState {
         self.next_restart_token = self.next_restart_token.wrapping_add(1).max(1);
 
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Exited(code);
-        tcb.restart_token = Some(token);
+        tcb.status = TaskStatus::Exited;
+        tcb.restart.token = Some(RestartToken(token));
         tcb.last_exit_code = Some(code);
         self.report_task_exit_to_supervisor(tid, code)?;
 
@@ -834,13 +838,13 @@ impl KernelState {
         let err = {
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             let mut denied = false;
-            let err = if tcb.restart_token != Some(token) {
+            let err = if tcb.restart.token != Some(RestartToken(token)) {
                 denied = true;
                 Some(KernelError::WrongObject)
-            } else if tcb.restart_budget == 0 {
+            } else if tcb.restart.budget == 0 {
                 denied = true;
                 Some(KernelError::WouldBlock)
-            } else if now < tcb.restart_available_at_tick {
+            } else if now < tcb.restart.available_at.0 {
                 denied = true;
                 Some(KernelError::WouldBlock)
             } else {
@@ -848,15 +852,15 @@ impl KernelState {
             };
 
             if denied {
-                tcb.restart_denied_count = tcb.restart_denied_count.saturating_add(1);
+                tcb.restart.denied_count = tcb.restart.denied_count.saturating_add(1);
                 let threshold = match tcb.class {
                     TaskClass::App => app_threshold,
                     TaskClass::Driver => driver_threshold,
                     TaskClass::SystemServer => system_threshold,
                 };
-                if tcb.restart_denied_count.is_multiple_of(threshold) {
-                    tcb.restart_escalation_count = tcb.restart_escalation_count.saturating_add(1);
-                    should_notify = Some(tcb.restart_denied_count);
+                if tcb.restart.denied_count.is_multiple_of(threshold) {
+                    tcb.restart.escalation_count = tcb.restart.escalation_count.saturating_add(1);
+                    should_notify = Some(tcb.restart.denied_count);
                 }
             }
             err
@@ -873,9 +877,9 @@ impl KernelState {
         let _ = self.revoke_driver_runtime_caps(tid);
 
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.restart_budget = tcb.restart_budget.saturating_sub(1);
-        tcb.restart_available_at_tick = now.saturating_add(tcb.restart_backoff_ticks);
-        tcb.restart_token = None;
+        tcb.restart.budget = tcb.restart.budget.saturating_sub(1);
+        tcb.restart.available_at = TickInstant(now.saturating_add(tcb.restart.backoff.0));
+        tcb.restart.token = None;
         tcb.status = TaskStatus::Runnable;
         self.scheduler
             .enqueue(tid)
@@ -885,7 +889,7 @@ impl KernelState {
     pub fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError> {
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Dead;
-        tcb.restart_token = None;
+        tcb.restart.token = None;
         let _ = self.revoke_driver_runtime_caps(tid);
         Ok(())
     }
@@ -1161,19 +1165,21 @@ impl KernelState {
         let policy = self.restart_policy_for_class(class);
         if let Some(slot) = self.tcbs.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(ThreadControlBlock {
-                tid,
+                tid: ThreadId(tid),
                 class,
                 status: TaskStatus::Runnable,
                 asid: None,
                 fault_policy_override: None,
                 brk_base: None,
                 brk_end: None,
-                restart_token: None,
-                restart_budget: policy.budget,
-                restart_backoff_ticks: policy.backoff_ticks,
-                restart_available_at_tick: 0,
-                restart_denied_count: 0,
-                restart_escalation_count: 0,
+                restart: RestartState {
+                    token: None,
+                    budget: policy.budget,
+                    backoff: TickDuration(policy.backoff_ticks),
+                    available_at: TickInstant(0),
+                    denied_count: 0,
+                    escalation_count: 0,
+                },
                 last_exit_code: None,
             });
             Ok(())
@@ -1266,13 +1272,17 @@ impl KernelState {
         Ok(())
     }
 
-    fn block_current_on_receive(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
+    fn block_current_on_receive(
+        &mut self,
+        endpoint_idx: usize,
+        recv_cap: CapId,
+    ) -> Result<(), KernelError> {
         let blocked_tid = self
             .scheduler
             .block_current()
             .ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(endpoint_idx));
+        tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
         self.endpoint_waiters[endpoint_idx] = Some(blocked_tid);
         let _ = self.dispatch_next_task()?;
         Ok(())
@@ -1281,6 +1291,7 @@ impl KernelState {
     fn block_current_on_send(
         &mut self,
         endpoint_idx: usize,
+        send_cap: CapId,
         msg: Message,
     ) -> Result<(), KernelError> {
         if self.endpoint_sender_waiters[endpoint_idx].is_some() {
@@ -1292,7 +1303,7 @@ impl KernelState {
             .block_current()
             .ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(endpoint_idx));
+        tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
         self.endpoint_sender_waiters[endpoint_idx] = Some((blocked_tid, msg));
         let _ = self.dispatch_next_task()?;
         Ok(())
@@ -1541,7 +1552,7 @@ impl KernelState {
         if endpoint_mode == EndpointMode::Synchronous
             && self.endpoint_waiters[endpoint_idx].is_none()
         {
-            self.block_current_on_send(endpoint_idx, msg)?;
+            self.block_current_on_send(endpoint_idx, send_cap, msg)?;
             return Err(KernelError::WouldBlock);
         }
 
@@ -1642,7 +1653,7 @@ impl KernelState {
             return Ok(Some(pending_msg));
         }
 
-        self.block_current_on_receive(endpoint_idx)?;
+        self.block_current_on_receive(endpoint_idx, recv_cap)?;
         Ok(None)
     }
 
@@ -1725,8 +1736,8 @@ impl KernelState {
         self.tcbs
             .iter()
             .flatten()
-            .find(|tcb| tcb.tid == tid)
-            .and_then(|tcb| Some((tcb.brk_base?, tcb.brk_end?)))
+            .find(|tcb| tcb.tid.0 == tid)
+            .and_then(|tcb| Some((tcb.brk_base?.0 as usize, tcb.brk_end?.0 as usize)))
     }
 
     pub fn set_task_brk_bounds(
@@ -1736,8 +1747,8 @@ impl KernelState {
         end: usize,
     ) -> Result<(), KernelError> {
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.brk_base = Some(base);
-        tcb.brk_end = Some(end);
+        tcb.brk_base = Some(VirtAddr(base as u64));
+        tcb.brk_end = Some(VirtAddr(end as u64));
         Ok(())
     }
 
@@ -2054,7 +2065,7 @@ mod tests {
         assert!(first_try.is_none());
         assert_eq!(
             state.task_status(0),
-            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(0)))
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap)))
         );
         assert_eq!(state.scheduler.current_tid(), Some(1));
 
@@ -2079,7 +2090,7 @@ mod tests {
         assert_eq!(send_result, Err(KernelError::WouldBlock));
         assert_eq!(
             state.task_status(0),
-            Some(TaskStatus::Blocked(WaitReason::EndpointSend(0)))
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
         );
         assert_eq!(state.scheduler.current_tid(), Some(1));
 
@@ -2753,7 +2764,7 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(9).expect("task");
         let token = state.exit_task(9, 12).expect("exit");
-        assert_eq!(state.task_status(9), Some(TaskStatus::Exited(12)));
+        assert_eq!(state.task_status(9), Some(TaskStatus::Exited));
 
         assert!(state.restart_task(9, token).is_ok());
         assert_eq!(state.task_status(9), Some(TaskStatus::Runnable));
