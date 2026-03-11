@@ -1350,7 +1350,8 @@ impl KernelState {
             next_generation = 1;
         }
         self.endpoint_generations[endpoint_idx] = next_generation;
-        self.endpoints[endpoint_idx] = Some(Endpoint::new_with_mode(max_depth, mode));
+        self.endpoints[endpoint_idx] =
+            Some(Endpoint::new_with_mode(max_depth, mode).map_err(|_| KernelError::WrongObject)?);
 
         let send_cap = self
             .cspace
@@ -1927,7 +1928,7 @@ mod tests {
             .expect("recv should pass")
             .expect("message expected");
 
-        assert_eq!(received.sender_tid, 7);
+        assert_eq!(received.sender_tid.0, 7);
         assert_eq!(received.as_slice(), b"ping");
     }
 
@@ -2082,7 +2083,7 @@ mod tests {
             msg.flags & Message::FLAG_CAP_TRANSFER,
             Message::FLAG_CAP_TRANSFER
         );
-        assert_eq!(msg.transferred_cap, Some(mem_cap.0));
+        assert_eq!(msg.transferred_cap().map(|cap| cap.0), Some(mem_cap.0));
         assert_eq!(msg.as_slice(), b"mt");
     }
 
@@ -2467,7 +2468,7 @@ mod tests {
             .ipc_recv(handler_recv)
             .expect("handler recv")
             .expect("fault report");
-        assert_eq!(report.sender_tid, 0);
+        assert_eq!(report.sender_tid.0, 0);
         assert_eq!(report.as_slice()[16], 1);
     }
 
@@ -2524,7 +2525,7 @@ mod tests {
             .ipc_recv(handler_recv)
             .expect("handler recv")
             .expect("fault report");
-        assert_eq!(report.sender_tid, 0);
+        assert_eq!(report.sender_tid.0, 0);
     }
 
     #[test]

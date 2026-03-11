@@ -164,7 +164,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
                             return Err(SyscallError::InvalidArgs);
                         }
                         match kernel.copy_to_current_user(user_ptr, msg.as_slice()) {
-                            Ok(()) => frame.set_ok(msg.sender_tid as usize, msg.len as usize),
+                            Ok(()) => frame.set_ok(msg.sender_tid.0 as usize, msg.len as usize),
                             Err(KernelError::UserMemoryFault) => {
                                 kernel.record_fault(FaultInfo {
                                     addr: user_ptr,
@@ -177,7 +177,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
                         };
                         frame.ret1 = 0;
                     } else {
-                        frame.set_ok(msg.sender_tid as usize, msg.len as usize);
+                        frame.set_ok(msg.sender_tid.0 as usize, msg.len as usize);
                         frame.ret1 = pack_payload(msg.as_slice());
                     }
                 }

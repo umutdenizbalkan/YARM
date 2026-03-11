@@ -118,7 +118,7 @@ mod tests {
                 .expect("msg");
         let reply = handle_request(&mut state, grant_msg).expect("handle");
         assert_eq!(reply.opcode, DRIVER_OP_GRANT_IRQ);
-        assert!(reply.transferred_cap.is_some());
+        assert!(reply.transferred_cap().is_some());
     }
 
     #[test]

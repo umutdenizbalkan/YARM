@@ -1,18 +1,35 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ThreadId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TransferCapId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcError {
+    PayloadTooLarge,
+    MissingCapTransferFlag,
+    InconsistentCapTransferFlag,
+    InvalidEndpointDepth,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message {
-    pub sender_tid: u64,
+    pub sender_tid: ThreadId,
     pub opcode: u16,
     pub flags: u16,
-    pub transferred_cap: Option<u64>,
+    transferred_cap: u64,
     pub len: u8,
     pub payload: [u8; Self::MAX_PAYLOAD],
 }
 
+const _: () = assert!(Message::MAX_PAYLOAD <= (u8::MAX as usize));
+
 impl Message {
     pub const MAX_PAYLOAD: usize = 56;
     pub const FLAG_CAP_TRANSFER: u16 = 1 << 0;
+    const NO_TRANSFER_CAP: u64 = u64::MAX;
 
-    pub fn new(sender_tid: u64, bytes: &[u8]) -> Result<Self, ()> {
+    pub fn new(sender_tid: u64, bytes: &[u8]) -> Result<Self, IpcError> {
         Self::with_header(sender_tid, 0, 0, None, bytes)
     }
 
@@ -22,30 +39,40 @@ impl Message {
         flags: u16,
         transferred_cap: Option<u64>,
         bytes: &[u8],
-    ) -> Result<Self, ()> {
+    ) -> Result<Self, IpcError> {
         if bytes.len() > Self::MAX_PAYLOAD {
-            return Err(());
+            return Err(IpcError::PayloadTooLarge);
         }
 
-        if transferred_cap.is_some() && (flags & Self::FLAG_CAP_TRANSFER) == 0 {
-            return Err(());
+        let has_cap = transferred_cap.is_some();
+        let flag_set = (flags & Self::FLAG_CAP_TRANSFER) != 0;
+
+        if has_cap && !flag_set {
+            return Err(IpcError::MissingCapTransferFlag);
+        }
+        if !has_cap && flag_set {
+            return Err(IpcError::InconsistentCapTransferFlag);
         }
 
         let mut payload = [0u8; Self::MAX_PAYLOAD];
-        let mut i = 0;
-        while i < bytes.len() {
-            payload[i] = bytes[i];
-            i += 1;
-        }
+        payload[..bytes.len()].copy_from_slice(bytes);
 
         Ok(Self {
-            sender_tid,
+            sender_tid: ThreadId(sender_tid),
             opcode,
             flags,
-            transferred_cap,
+            transferred_cap: transferred_cap.unwrap_or(Self::NO_TRANSFER_CAP),
             len: bytes.len() as u8,
             payload,
         })
+    }
+
+    pub const fn transferred_cap(&self) -> Option<TransferCapId> {
+        if self.transferred_cap == Self::NO_TRANSFER_CAP {
+            None
+        } else {
+            Some(TransferCapId(self.transferred_cap))
+        }
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -56,6 +83,8 @@ impl Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointMode {
     Buffered,
+    /// Scheduling-level rendezvous behavior is enforced by `KernelState::ipc_send/ipc_recv`.
+    /// The endpoint itself remains a bounded queue primitive.
     Synchronous,
 }
 
@@ -71,24 +100,22 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    pub fn new(max_depth: usize) -> Self {
+    pub fn new(max_depth: usize) -> Result<Self, IpcError> {
         Self::new_with_mode(max_depth, EndpointMode::Buffered)
     }
 
-    pub fn new_with_mode(max_depth: usize, mode: EndpointMode) -> Self {
-        let bounded = if max_depth > MAX_ENDPOINT_DEPTH {
-            MAX_ENDPOINT_DEPTH
-        } else {
-            max_depth
-        };
+    pub fn new_with_mode(max_depth: usize, mode: EndpointMode) -> Result<Self, IpcError> {
+        if max_depth == 0 || max_depth > MAX_ENDPOINT_DEPTH {
+            return Err(IpcError::InvalidEndpointDepth);
+        }
 
-        Self {
-            queue: [None; MAX_ENDPOINT_DEPTH],
+        Ok(Self {
+            queue: [const { None }; MAX_ENDPOINT_DEPTH],
             head: 0,
             len: 0,
-            max_depth: if bounded == 0 { 1 } else { bounded },
+            max_depth,
             mode,
-        }
+        })
     }
 
     pub fn mode(&self) -> EndpointMode {
@@ -100,7 +127,7 @@ impl Endpoint {
             return Err(msg);
         }
 
-        let tail = (self.head + self.len) % MAX_ENDPOINT_DEPTH;
+        let tail = (self.head + self.len) & (MAX_ENDPOINT_DEPTH - 1);
         self.queue[tail] = Some(msg);
         self.len += 1;
         Ok(())
@@ -112,7 +139,7 @@ impl Endpoint {
         }
 
         let idx = self.head;
-        self.head = (self.head + 1) % MAX_ENDPOINT_DEPTH;
+        self.head = (self.head + 1) & (MAX_ENDPOINT_DEPTH - 1);
         self.len -= 1;
         self.queue[idx].take()
     }
@@ -128,13 +155,13 @@ mod tests {
 
     #[test]
     fn endpoint_enforces_queue_limit() {
-        let mut ep = Endpoint::new(1);
+        let mut ep = Endpoint::new(1).expect("endpoint");
         let first = Message::new(1, b"hello").expect("valid message");
         let second = Message::new(2, b"world").expect("valid message");
 
         assert!(ep.send(first).is_ok());
         assert!(ep.send(second).is_err());
-        assert_eq!(ep.recv().expect("first msg").sender_tid, 1);
+        assert_eq!(ep.recv().expect("first msg").sender_tid, ThreadId(1));
         assert!(ep.send(second).is_ok());
     }
 
@@ -148,12 +175,35 @@ mod tests {
             msg.flags & Message::FLAG_CAP_TRANSFER,
             Message::FLAG_CAP_TRANSFER
         );
-        assert_eq!(msg.transferred_cap, Some(77));
+        assert_eq!(msg.transferred_cap(), Some(TransferCapId(77)));
         assert_eq!(msg.as_slice(), b"xy");
     }
 
     #[test]
     fn message_transfer_requires_flag() {
-        assert!(Message::with_header(1, 0, 0, Some(3), b"x").is_err());
+        assert_eq!(
+            Message::with_header(1, 0, 0, Some(3), b"x"),
+            Err(IpcError::MissingCapTransferFlag)
+        );
+    }
+
+    #[test]
+    fn message_transfer_flag_requires_cap() {
+        assert_eq!(
+            Message::with_header(1, 0, Message::FLAG_CAP_TRANSFER, None, b"x"),
+            Err(IpcError::InconsistentCapTransferFlag)
+        );
+    }
+
+    #[test]
+    fn endpoint_rejects_invalid_depths() {
+        assert!(matches!(
+            Endpoint::new(0),
+            Err(IpcError::InvalidEndpointDepth)
+        ));
+        assert!(matches!(
+            Endpoint::new(MAX_ENDPOINT_DEPTH + 1),
+            Err(IpcError::InvalidEndpointDepth)
+        ));
     }
 }
