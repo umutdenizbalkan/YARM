@@ -123,13 +123,14 @@ mod tests {
     fn trap_entry_sets_cpu_and_processes_cpu_work() {
         use crate::kernel::bootstrap::Bootstrap;
         use crate::kernel::smp::WorkItem;
+        use crate::kernel::vm::Asid;
 
         let mut state = Bootstrap::init().expect("init");
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
         state
             .submit_cross_cpu_work(WorkItem::TlbShootdown {
                 target_cpu: CpuId(1),
-                asid: 1,
+                asid: Asid(1),
             })
             .expect("submit");
 

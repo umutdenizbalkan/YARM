@@ -35,6 +35,7 @@ impl SharedKernel {
 mod tests {
     use super::*;
     use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::ipc::ThreadId;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::smp::WorkItem;
 
@@ -67,7 +68,7 @@ mod tests {
             state
                 .submit_cross_cpu_work(WorkItem::WakeTask {
                     target_cpu: CpuId(1),
-                    tid: 0,
+                    tid: ThreadId(0),
                 })
                 .expect("submit");
         });

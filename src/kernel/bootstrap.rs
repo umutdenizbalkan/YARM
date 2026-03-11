@@ -948,9 +948,9 @@ impl KernelState {
                 Ok(())
             }
             WorkItem::WakeTask { target_cpu, tid } => {
-                let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+                let tcb = self.tcb_mut(tid.0).ok_or(KernelError::TaskMissing)?;
                 tcb.status = TaskStatus::Runnable;
-                self.enqueue_on_cpu(target_cpu, tid)
+                self.enqueue_on_cpu(target_cpu, tid.0)
             }
         }
     }
@@ -1899,6 +1899,7 @@ impl KernelState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::ipc::ThreadId;
 
     #[test]
     fn bootstrap_sets_minimal_kernel_state() {
@@ -1951,13 +1952,13 @@ mod tests {
         state
             .submit_cross_cpu_work(WorkItem::WakeTask {
                 target_cpu: CpuId(1),
-                tid: 2,
+                tid: ThreadId(2),
             })
             .expect("submit wake");
         state
             .submit_cross_cpu_work(WorkItem::TlbShootdown {
                 target_cpu: CpuId(0),
-                asid: 1,
+                asid: Asid(1),
             })
             .expect("submit tlb");
 
@@ -1973,7 +1974,7 @@ mod tests {
             remaining,
             Some(WorkItem::WakeTask {
                 target_cpu: CpuId(1),
-                tid: 2
+                tid: ThreadId(2)
             })
         );
     }
