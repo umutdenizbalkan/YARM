@@ -245,6 +245,18 @@ impl Bootstrap {
 }
 
 impl KernelState {
+    fn switch_to_runnable_tid(&mut self, tid: u64) -> Result<bool, KernelError> {
+        let mut spins = 0usize;
+        while spins < MAX_TASKS {
+            if self.scheduler.current_tid() == Some(tid) {
+                return Ok(true);
+            }
+            self.yield_current()?;
+            spins += 1;
+        }
+        Ok(self.scheduler.current_tid() == Some(tid))
+    }
+
     fn tcb_mut(&mut self, tid: u64) -> Option<&mut ThreadControlBlock> {
         self.tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid)
     }
@@ -391,7 +403,7 @@ impl KernelState {
 
     pub fn create_iova_space_cap(&mut self) -> Result<CapId, KernelError> {
         let id = self.next_iova_space_id;
-        self.next_iova_space_id = self.next_iova_space_id.wrapping_add(1).max(1);
+        self.next_iova_space_id = self.next_iova_space_id.checked_add(1).unwrap_or(1);
         self.cspace
             .mint(Capability::new(
                 "iova_space",
@@ -687,7 +699,7 @@ impl KernelState {
 
     pub fn exit_task(&mut self, tid: u64, code: u64) -> Result<u64, KernelError> {
         let token = self.next_restart_token;
-        self.next_restart_token = self.next_restart_token.wrapping_add(1).max(1);
+        self.next_restart_token = self.next_restart_token.checked_add(1).unwrap_or(1);
 
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Exited;
@@ -764,9 +776,11 @@ impl KernelState {
     }
 
     pub fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError> {
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Dead;
-        tcb.restart.token = None;
+        {
+            let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Dead;
+            tcb.restart.token = None;
+        }
         let _ = self.revoke_driver_runtime_caps(tid);
         Ok(())
     }
@@ -1462,16 +1476,18 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-        let had_waiter = self.endpoint_waiters[endpoint_idx].is_some();
+        let waiter_tid = self.endpoint_waiters[endpoint_idx];
 
         self.ipc_send(send_cap, msg)?;
 
-        if had_waiter {
-            let _ = self.dispatch_next_task()?;
-        }
+        let switched = if waiter_tid.is_some() {
+            self.switch_to_runnable_tid(waiter_tid.expect("checked is_some"))?
+        } else {
+            false
+        };
 
         Ok(IpcFastpathResult {
-            switched_to_waiter: had_waiter,
+            switched_to_waiter: switched,
         })
     }
 
