@@ -127,12 +127,7 @@ struct DriverRecord {
 }
 
 #[derive(Debug)]
-pub struct KernelState {
-    pub kernel_aspace: AddressSpace,
-    pub scheduler: SmpScheduler,
-    pub cspace: CapabilitySpace,
-    pub timer: Timer,
-    pub user_spaces: AddressSpaceManager,
+struct IpcSubsystem {
     cross_cpu_work: CrossCpuWorkQueue,
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
     endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
@@ -141,25 +136,55 @@ pub struct KernelState {
     notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
     notification_generations: [u64; MAX_NOTIFICATIONS],
     irq_routes: [Option<usize>; MAX_IRQ_LINES],
-    tcbs: [Option<ThreadControlBlock>; MAX_TASKS],
+}
+
+#[derive(Debug)]
+struct MemorySubsystem {
     task_mem: [Option<TaskMemByte>; MAX_TASK_MEM_ENTRIES],
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
     next_memory_object_id: u64,
-    next_iova_space_id: u64,
     next_anon_phys: u64,
-    tlb_shootdown_count: u64,
+}
+
+#[derive(Debug)]
+struct DriverSubsystem {
+    driver_records: [Option<DriverRecord>; MAX_DRIVERS],
+    next_iova_space_id: u64,
+}
+
+#[derive(Debug)]
+struct FaultSubsystem {
     last_fault: Option<FaultInfo>,
     fault_handler_endpoint: Option<usize>,
     supervisor_endpoint: Option<usize>,
-    driver_records: [Option<DriverRecord>; MAX_DRIVERS],
-    next_restart_token: u64,
     fault_policy: FaultPolicy,
+}
+
+#[derive(Debug)]
+struct RestartSubsystem {
+    next_restart_token: u64,
     app_restart_policy: RestartPolicy,
     driver_restart_policy: RestartPolicy,
     system_restart_policy: RestartPolicy,
     app_escalation_threshold: u32,
     driver_escalation_threshold: u32,
     system_escalation_threshold: u32,
+}
+
+#[derive(Debug)]
+pub struct KernelState {
+    pub kernel_aspace: AddressSpace,
+    pub scheduler: SmpScheduler,
+    pub cspace: CapabilitySpace,
+    pub timer: Timer,
+    pub user_spaces: AddressSpaceManager,
+    ipc: IpcSubsystem,
+    tcbs: [Option<ThreadControlBlock>; MAX_TASKS],
+    memory: MemorySubsystem,
+    drivers: DriverSubsystem,
+    tlb_shootdown_count: u64,
+    faults: FaultSubsystem,
+    restart: RestartSubsystem,
 }
 
 pub struct Bootstrap;
@@ -200,42 +225,52 @@ impl Bootstrap {
             cspace,
             timer: Timer::new(10),
             user_spaces: AddressSpaceManager::default(),
-            cross_cpu_work: CrossCpuWorkQueue::default(),
-            endpoints: [const { None }; MAX_ENDPOINTS],
-            endpoint_waiters: [None; MAX_ENDPOINTS],
-            endpoint_sender_waiters: [None; MAX_ENDPOINTS],
-            endpoint_generations: [0; MAX_ENDPOINTS],
-            notifications: [const { None }; MAX_NOTIFICATIONS],
-            notification_generations: [0; MAX_NOTIFICATIONS],
-            irq_routes: [None; MAX_IRQ_LINES],
+            ipc: IpcSubsystem {
+                cross_cpu_work: CrossCpuWorkQueue::default(),
+                endpoints: [const { None }; MAX_ENDPOINTS],
+                endpoint_waiters: [None; MAX_ENDPOINTS],
+                endpoint_sender_waiters: [None; MAX_ENDPOINTS],
+                endpoint_generations: [0; MAX_ENDPOINTS],
+                notifications: [const { None }; MAX_NOTIFICATIONS],
+                notification_generations: [0; MAX_NOTIFICATIONS],
+                irq_routes: [None; MAX_IRQ_LINES],
+            },
             tcbs: [None; MAX_TASKS],
-            task_mem: [None; MAX_TASK_MEM_ENTRIES],
-            memory_objects: [None; MAX_MEMORY_OBJECTS],
-            next_memory_object_id: 1,
-            next_iova_space_id: 1,
-            next_anon_phys: 0x1000_0000,
+            memory: MemorySubsystem {
+                task_mem: [None; MAX_TASK_MEM_ENTRIES],
+                memory_objects: [None; MAX_MEMORY_OBJECTS],
+                next_memory_object_id: 1,
+                next_anon_phys: 0x1000_0000,
+            },
+            drivers: DriverSubsystem {
+                driver_records: [const { None }; MAX_DRIVERS],
+                next_iova_space_id: 1,
+            },
             tlb_shootdown_count: 0,
-            last_fault: None,
-            fault_handler_endpoint: None,
-            supervisor_endpoint: None,
-            driver_records: [const { None }; MAX_DRIVERS],
-            next_restart_token: 1,
-            fault_policy: FaultPolicy::KillTask,
-            app_restart_policy: RestartPolicy {
-                budget: 3,
-                backoff_ticks: 10,
+            faults: FaultSubsystem {
+                last_fault: None,
+                fault_handler_endpoint: None,
+                supervisor_endpoint: None,
+                fault_policy: FaultPolicy::KillTask,
             },
-            driver_restart_policy: RestartPolicy {
-                budget: 5,
-                backoff_ticks: 20,
+            restart: RestartSubsystem {
+                next_restart_token: 1,
+                app_restart_policy: RestartPolicy {
+                    budget: 3,
+                    backoff_ticks: 10,
+                },
+                driver_restart_policy: RestartPolicy {
+                    budget: 5,
+                    backoff_ticks: 20,
+                },
+                system_restart_policy: RestartPolicy {
+                    budget: 8,
+                    backoff_ticks: 5,
+                },
+                app_escalation_threshold: RESTART_ESCALATION_THRESHOLD,
+                driver_escalation_threshold: RESTART_ESCALATION_THRESHOLD * 2,
+                system_escalation_threshold: RESTART_ESCALATION_THRESHOLD * 3,
             },
-            system_restart_policy: RestartPolicy {
-                budget: 8,
-                backoff_ticks: 5,
-            },
-            app_escalation_threshold: RESTART_ESCALATION_THRESHOLD,
-            driver_escalation_threshold: RESTART_ESCALATION_THRESHOLD * 2,
-            system_escalation_threshold: RESTART_ESCALATION_THRESHOLD * 3,
         };
 
         state.register_task(0)?;
@@ -270,15 +305,15 @@ impl KernelState {
     }
 
     pub fn last_fault(&self) -> Option<FaultInfo> {
-        self.last_fault
+        self.faults.last_fault
     }
 
     pub fn clear_last_fault(&mut self) {
-        self.last_fault = None;
+        self.faults.last_fault = None;
     }
 
     pub fn record_fault(&mut self, fault: FaultInfo) {
-        self.last_fault = Some(fault);
+        self.faults.last_fault = Some(fault);
     }
 
     pub fn set_fault_handler(&mut self, recv_cap: CapId) -> Result<(), KernelError> {
@@ -291,16 +326,16 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-        self.fault_handler_endpoint = Some(endpoint_idx);
+        self.faults.fault_handler_endpoint = Some(endpoint_idx);
         Ok(())
     }
 
     pub fn set_fault_policy(&mut self, policy: FaultPolicy) {
-        self.fault_policy = policy;
+        self.faults.fault_policy = policy;
     }
 
     pub fn fault_policy(&self) -> FaultPolicy {
-        self.fault_policy
+        self.faults.fault_policy
     }
 
     pub fn set_task_fault_policy(
@@ -319,7 +354,7 @@ impl KernelState {
             .flatten()
             .find(|tcb| tcb.tid.0 == tid)
             .and_then(|tcb| tcb.fault_policy_override)
-            .unwrap_or(self.fault_policy)
+            .unwrap_or(self.faults.fault_policy)
     }
 
     pub fn task_asid(&self, tid: u64) -> Option<Asid> {
@@ -339,13 +374,14 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-        self.supervisor_endpoint = Some(endpoint_idx);
+        self.faults.supervisor_endpoint = Some(endpoint_idx);
         Ok(())
     }
 
     pub fn register_driver(&mut self, tid: u64) -> Result<(), KernelError> {
         let _ = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         if self
+            .drivers
             .driver_records
             .iter()
             .flatten()
@@ -354,7 +390,12 @@ impl KernelState {
             return Ok(());
         }
 
-        if let Some(slot) = self.driver_records.iter_mut().find(|slot| slot.is_none()) {
+        if let Some(slot) = self
+            .drivers
+            .driver_records
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        {
             *slot = Some(DriverRecord {
                 tid: ThreadId(tid),
                 irq_cap: None,
@@ -382,6 +423,7 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
         let record = self
+            .drivers
             .driver_records
             .iter_mut()
             .flatten()
@@ -402,8 +444,9 @@ impl KernelState {
     }
 
     pub fn create_iova_space_cap(&mut self) -> Result<CapId, KernelError> {
-        let id = self.next_iova_space_id;
-        self.next_iova_space_id = self.next_iova_space_id.checked_add(1).unwrap_or(1);
+        let id = self.drivers.next_iova_space_id;
+        self.drivers.next_iova_space_id =
+            self.drivers.next_iova_space_id.checked_add(1).unwrap_or(1);
         self.cspace
             .mint(Capability::new(
                 "iova_space",
@@ -428,6 +471,7 @@ impl KernelState {
         }
 
         let record = self
+            .drivers
             .driver_records
             .iter_mut()
             .flatten()
@@ -493,6 +537,7 @@ impl KernelState {
         }
 
         let record = self
+            .drivers
             .driver_records
             .iter_mut()
             .flatten()
@@ -534,6 +579,7 @@ impl KernelState {
         }
 
         let record = self
+            .drivers
             .driver_records
             .iter_mut()
             .flatten()
@@ -557,6 +603,7 @@ impl KernelState {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
         let record = self
+            .drivers
             .driver_records
             .iter()
             .flatten()
@@ -584,6 +631,7 @@ impl KernelState {
 
     pub fn detach_driver_iova_space(&mut self, tid: u64) -> Result<(), KernelError> {
         let record = self
+            .drivers
             .driver_records
             .iter_mut()
             .flatten()
@@ -597,6 +645,7 @@ impl KernelState {
 
     pub fn revoke_driver_runtime_caps(&mut self, tid: u64) -> Result<(), KernelError> {
         let record = self
+            .drivers
             .driver_records
             .iter_mut()
             .flatten()
@@ -622,7 +671,7 @@ impl KernelState {
         tid: u64,
         code: u64,
     ) -> Result<(), KernelError> {
-        let Some(endpoint_idx) = self.supervisor_endpoint else {
+        let Some(endpoint_idx) = self.faults.supervisor_endpoint else {
             return Ok(());
         };
         let mut payload = [0u8; 16];
@@ -631,6 +680,7 @@ impl KernelState {
         let msg = Message::with_header(0, 0xEE, 0, None, &payload)
             .map_err(|_| KernelError::WrongObject)?;
         let endpoint = self
+            .ipc
             .endpoints
             .get_mut(endpoint_idx)
             .and_then(Option::as_mut)
@@ -647,7 +697,7 @@ impl KernelState {
         tid: u64,
         denied_count: u32,
     ) -> Result<(), KernelError> {
-        let Some(endpoint_idx) = self.supervisor_endpoint else {
+        let Some(endpoint_idx) = self.faults.supervisor_endpoint else {
             return Ok(());
         };
         let mut payload = [0u8; 16];
@@ -656,6 +706,7 @@ impl KernelState {
         let msg = Message::with_header(0, 0xEF, 0, None, &payload)
             .map_err(|_| KernelError::WrongObject)?;
         let endpoint = self
+            .ipc
             .endpoints
             .get_mut(endpoint_idx)
             .and_then(Option::as_mut)
@@ -698,8 +749,9 @@ impl KernelState {
     }
 
     pub fn exit_task(&mut self, tid: u64, code: u64) -> Result<u64, KernelError> {
-        let token = self.next_restart_token;
-        self.next_restart_token = self.next_restart_token.checked_add(1).unwrap_or(1);
+        let token = self.restart.next_restart_token;
+        self.restart.next_restart_token =
+            self.restart.next_restart_token.checked_add(1).unwrap_or(1);
 
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Exited;
@@ -718,9 +770,9 @@ impl KernelState {
     pub fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelError> {
         let now_tick = TickInstant(self.timer.current_ticks().0);
         let (app_threshold, driver_threshold, system_threshold) = (
-            self.app_escalation_threshold,
-            self.driver_escalation_threshold,
-            self.system_escalation_threshold,
+            self.restart.app_escalation_threshold,
+            self.restart.driver_escalation_threshold,
+            self.restart.system_escalation_threshold,
         );
 
         let mut should_notify = None;
@@ -817,13 +869,14 @@ impl KernelState {
     }
 
     pub fn submit_cross_cpu_work(&self, item: WorkItem) -> Result<(), KernelError> {
-        self.cross_cpu_work
+        self.ipc
+            .cross_cpu_work
             .submit(item)
             .map_err(|_| KernelError::TaskTableFull)
     }
 
     pub fn drain_cross_cpu_work(&self) -> Option<WorkItem> {
-        self.cross_cpu_work.take()
+        self.ipc.cross_cpu_work.take()
     }
 
     pub fn tlb_shootdown_count(&self) -> u64 {
@@ -855,7 +908,7 @@ impl KernelState {
         let mut deferred_len = 0usize;
         let mut processed = 0usize;
 
-        while let Some(item) = self.cross_cpu_work.take() {
+        while let Some(item) = self.ipc.cross_cpu_work.take() {
             let target_cpu = match item {
                 WorkItem::Reschedule { target_cpu }
                 | WorkItem::TlbShootdown { target_cpu, .. }
@@ -874,7 +927,8 @@ impl KernelState {
         let mut idx = 0;
         while idx < deferred_len {
             if let Some(item) = deferred[idx] {
-                self.cross_cpu_work
+                self.ipc
+                    .cross_cpu_work
                     .submit(item)
                     .map_err(|_| KernelError::TaskTableFull)?;
             }
@@ -898,7 +952,7 @@ impl KernelState {
             self.validate_user_access_for_tid(tid, va, true)?;
 
             let mut found = false;
-            for slot in &mut self.task_mem {
+            for slot in &mut self.memory.task_mem {
                 if slot
                     .as_ref()
                     .is_some_and(|entry| entry.tid == ThreadId(tid) && entry.addr == va)
@@ -911,6 +965,7 @@ impl KernelState {
 
             if !found {
                 let slot = self
+                    .memory
                     .task_mem
                     .iter_mut()
                     .find(|slot| slot.is_none())
@@ -943,6 +998,7 @@ impl KernelState {
             let va = ptr + i;
             self.validate_user_access_for_tid(tid, va, false)?;
             let value = self
+                .memory
                 .task_mem
                 .iter()
                 .flatten()
@@ -1004,26 +1060,26 @@ impl KernelState {
     pub fn set_class_escalation_threshold(&mut self, class: TaskClass, threshold: u32) {
         let bounded = threshold.max(1);
         match class {
-            TaskClass::App => self.app_escalation_threshold = bounded,
-            TaskClass::Driver => self.driver_escalation_threshold = bounded,
-            TaskClass::SystemServer => self.system_escalation_threshold = bounded,
+            TaskClass::App => self.restart.app_escalation_threshold = bounded,
+            TaskClass::Driver => self.restart.driver_escalation_threshold = bounded,
+            TaskClass::SystemServer => self.restart.system_escalation_threshold = bounded,
         }
     }
 
     fn restart_policy_for_class(&self, class: TaskClass) -> RestartPolicy {
         match class {
-            TaskClass::App => self.app_restart_policy,
-            TaskClass::Driver => self.driver_restart_policy,
-            TaskClass::SystemServer => self.system_restart_policy,
+            TaskClass::App => self.restart.app_restart_policy,
+            TaskClass::Driver => self.restart.driver_restart_policy,
+            TaskClass::SystemServer => self.restart.system_restart_policy,
         }
     }
 
     pub fn class_policy_snapshot(&self, class: TaskClass) -> ClassPolicySnapshot {
         let policy = self.restart_policy_for_class(class);
         let escalation_threshold = match class {
-            TaskClass::App => self.app_escalation_threshold,
-            TaskClass::Driver => self.driver_escalation_threshold,
-            TaskClass::SystemServer => self.system_escalation_threshold,
+            TaskClass::App => self.restart.app_escalation_threshold,
+            TaskClass::Driver => self.restart.driver_escalation_threshold,
+            TaskClass::SystemServer => self.restart.system_escalation_threshold,
         };
         ClassPolicySnapshot {
             class,
@@ -1039,9 +1095,9 @@ impl KernelState {
             backoff_ticks,
         };
         match class {
-            TaskClass::App => self.app_restart_policy = policy,
-            TaskClass::Driver => self.driver_restart_policy = policy,
-            TaskClass::SystemServer => self.system_restart_policy = policy,
+            TaskClass::App => self.restart.app_restart_policy = policy,
+            TaskClass::Driver => self.restart.driver_restart_policy = policy,
+            TaskClass::SystemServer => self.restart.system_restart_policy = policy,
         }
     }
 
@@ -1107,10 +1163,10 @@ impl KernelState {
     }
 
     fn emit_fault_report(&mut self, faulted_tid: u64) {
-        let Some(endpoint_idx) = self.fault_handler_endpoint else {
+        let Some(endpoint_idx) = self.faults.fault_handler_endpoint else {
             return;
         };
-        let Some(fault) = self.last_fault else {
+        let Some(fault) = self.faults.last_fault else {
             return;
         };
 
@@ -1130,6 +1186,7 @@ impl KernelState {
         };
 
         let sent = if let Some(endpoint) = self
+            .ipc
             .endpoints
             .get_mut(endpoint_idx)
             .and_then(Option::as_mut)
@@ -1176,7 +1233,7 @@ impl KernelState {
             .ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
-        self.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
+        self.ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
         let _ = self.dispatch_next_task()?;
         Ok(())
     }
@@ -1187,7 +1244,7 @@ impl KernelState {
         send_cap: CapId,
         msg: Message,
     ) -> Result<(), KernelError> {
-        if self.endpoint_sender_waiters[endpoint_idx].is_some() {
+        if self.ipc.endpoint_sender_waiters[endpoint_idx].is_some() {
             return Err(KernelError::EndpointQueueFull);
         }
 
@@ -1197,13 +1254,13 @@ impl KernelState {
             .ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
-        self.endpoint_sender_waiters[endpoint_idx] = Some((ThreadId(blocked_tid), msg));
+        self.ipc.endpoint_sender_waiters[endpoint_idx] = Some((ThreadId(blocked_tid), msg));
         let _ = self.dispatch_next_task()?;
         Ok(())
     }
 
     fn wake_waiter_for_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
-        if let Some(waiter_tid) = self.endpoint_waiters[endpoint_idx].take() {
+        if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx].take() {
             let tcb = self.tcb_mut(waiter_tid.0).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Runnable;
             self.scheduler
@@ -1227,10 +1284,10 @@ impl KernelState {
                 if index >= MAX_ENDPOINTS {
                     return Err(KernelError::WrongObject);
                 }
-                if self.endpoints[index].is_none() {
+                if self.ipc.endpoints[index].is_none() {
                     return Err(KernelError::WrongObject);
                 }
-                if self.endpoint_generations[index] != generation {
+                if self.ipc.endpoint_generations[index] != generation {
                     return Err(KernelError::StaleCapability);
                 }
                 Ok(index)
@@ -1246,20 +1303,20 @@ impl KernelState {
     }
 
     pub fn destroy_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
-        if endpoint_idx >= MAX_ENDPOINTS || self.endpoints[endpoint_idx].is_none() {
+        if endpoint_idx >= MAX_ENDPOINTS || self.ipc.endpoints[endpoint_idx].is_none() {
             return Err(KernelError::WrongObject);
         }
-        self.endpoints[endpoint_idx] = None;
-        if self.fault_handler_endpoint == Some(endpoint_idx) {
-            self.fault_handler_endpoint = None;
+        self.ipc.endpoints[endpoint_idx] = None;
+        if self.faults.fault_handler_endpoint == Some(endpoint_idx) {
+            self.faults.fault_handler_endpoint = None;
         }
-        self.endpoint_waiters[endpoint_idx] = None;
-        self.endpoint_sender_waiters[endpoint_idx] = None;
-        let mut next_generation = self.endpoint_generations[endpoint_idx].wrapping_add(1);
+        self.ipc.endpoint_waiters[endpoint_idx] = None;
+        self.ipc.endpoint_sender_waiters[endpoint_idx] = None;
+        let mut next_generation = self.ipc.endpoint_generations[endpoint_idx].wrapping_add(1);
         if next_generation == 0 {
             next_generation = 1;
         }
-        self.endpoint_generations[endpoint_idx] = next_generation;
+        self.ipc.endpoint_generations[endpoint_idx] = next_generation;
         Ok(())
     }
 
@@ -1276,7 +1333,7 @@ impl KernelState {
         mode: EndpointMode,
     ) -> Result<(usize, CapId, CapId), KernelError> {
         let mut slot_index = None;
-        for (idx, slot) in self.endpoints.iter().enumerate() {
+        for (idx, slot) in self.ipc.endpoints.iter().enumerate() {
             if slot.is_none() {
                 slot_index = Some(idx);
                 break;
@@ -1284,12 +1341,12 @@ impl KernelState {
         }
 
         let endpoint_idx = slot_index.ok_or(KernelError::EndpointFull)?;
-        let mut next_generation = self.endpoint_generations[endpoint_idx].wrapping_add(1);
+        let mut next_generation = self.ipc.endpoint_generations[endpoint_idx].wrapping_add(1);
         if next_generation == 0 {
             next_generation = 1;
         }
-        self.endpoint_generations[endpoint_idx] = next_generation;
-        self.endpoints[endpoint_idx] =
+        self.ipc.endpoint_generations[endpoint_idx] = next_generation;
+        self.ipc.endpoints[endpoint_idx] =
             Some(Endpoint::new_with_mode(max_depth, mode).map_err(|_| KernelError::WrongObject)?);
 
         let send_cap = self
@@ -1298,7 +1355,7 @@ impl KernelState {
                 "endpoint_send",
                 CapObject::Endpoint {
                     index: endpoint_idx,
-                    generation: self.endpoint_generations[endpoint_idx],
+                    generation: self.ipc.endpoint_generations[endpoint_idx],
                 },
                 &[CapRights::Send],
             ))
@@ -1310,7 +1367,7 @@ impl KernelState {
                 "endpoint_receive",
                 CapObject::Endpoint {
                     index: endpoint_idx,
-                    generation: self.endpoint_generations[endpoint_idx],
+                    generation: self.ipc.endpoint_generations[endpoint_idx],
                 },
                 &[CapRights::Receive],
             ))
@@ -1327,7 +1384,7 @@ impl KernelState {
             self.create_endpoint_with_mode(max_depth, EndpointMode::Buffered)?;
 
         let mut slot_index = None;
-        for (idx, slot) in self.notifications.iter().enumerate() {
+        for (idx, slot) in self.ipc.notifications.iter().enumerate() {
             if slot.is_none() {
                 slot_index = Some(idx);
                 break;
@@ -1335,12 +1392,13 @@ impl KernelState {
         }
 
         let notification_idx = slot_index.ok_or(KernelError::EndpointFull)?;
-        let mut next_generation = self.notification_generations[notification_idx].wrapping_add(1);
+        let mut next_generation =
+            self.ipc.notification_generations[notification_idx].wrapping_add(1);
         if next_generation == 0 {
             next_generation = 1;
         }
-        self.notification_generations[notification_idx] = next_generation;
-        self.notifications[notification_idx] = Some(NotificationObject { endpoint_idx });
+        self.ipc.notification_generations[notification_idx] = next_generation;
+        self.ipc.notifications[notification_idx] = Some(NotificationObject { endpoint_idx });
 
         let notification_cap = self
             .cspace
@@ -1348,7 +1406,7 @@ impl KernelState {
                 "notification",
                 CapObject::Notification {
                     index: notification_idx,
-                    generation: self.notification_generations[notification_idx],
+                    generation: self.ipc.notification_generations[notification_idx],
                 },
                 &[CapRights::Signal],
             ))
@@ -1362,10 +1420,10 @@ impl KernelState {
     fn resolve_notification_index(&self, object: CapObject) -> Result<usize, KernelError> {
         match object {
             CapObject::Notification { index, generation } => {
-                if index >= MAX_NOTIFICATIONS || self.notifications[index].is_none() {
+                if index >= MAX_NOTIFICATIONS || self.ipc.notifications[index].is_none() {
                     return Err(KernelError::WrongObject);
                 }
-                if self.notification_generations[index] != generation {
+                if self.ipc.notification_generations[index] != generation {
                     return Err(KernelError::StaleCapability);
                 }
                 Ok(index)
@@ -1392,7 +1450,7 @@ impl KernelState {
         if irq_idx >= MAX_IRQ_LINES {
             return Err(KernelError::WrongObject);
         }
-        self.irq_routes[irq_idx] = Some(notif_idx);
+        self.ipc.irq_routes[irq_idx] = Some(notif_idx);
         Ok(())
     }
 
@@ -1401,11 +1459,11 @@ impl KernelState {
         notification_idx: usize,
         irq_line: u16,
     ) -> Result<(), KernelError> {
-        let notif = self.notifications[notification_idx].ok_or(KernelError::WrongObject)?;
+        let notif = self.ipc.notifications[notification_idx].ok_or(KernelError::WrongObject)?;
         let payload = irq_line.to_le_bytes();
         let msg = Message::with_header(0, irq_line, 0, None, &payload)
             .map_err(|_| KernelError::WrongObject)?;
-        if let Some(endpoint) = self.endpoints[notif.endpoint_idx].as_mut() {
+        if let Some(endpoint) = self.ipc.endpoints[notif.endpoint_idx].as_mut() {
             endpoint
                 .send(msg)
                 .map_err(|_| KernelError::EndpointQueueFull)?;
@@ -1418,7 +1476,7 @@ impl KernelState {
 
     pub fn route_external_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {
         let irq_idx = irq_line as usize;
-        let Some(notification_idx) = self.irq_routes.get(irq_idx).copied().flatten() else {
+        let Some(notification_idx) = self.ipc.irq_routes.get(irq_idx).copied().flatten() else {
             return Ok(());
         };
         self.signal_notification(notification_idx, irq_line)
@@ -1436,6 +1494,7 @@ impl KernelState {
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
 
         let endpoint_mode = self
+            .ipc
             .endpoints
             .get(endpoint_idx)
             .and_then(Option::as_ref)
@@ -1443,13 +1502,14 @@ impl KernelState {
             .mode();
 
         if endpoint_mode == EndpointMode::Synchronous
-            && self.endpoint_waiters[endpoint_idx].is_none()
+            && self.ipc.endpoint_waiters[endpoint_idx].is_none()
         {
             self.block_current_on_send(endpoint_idx, send_cap, msg)?;
             return Err(KernelError::WouldBlock);
         }
 
         let endpoint = self
+            .ipc
             .endpoints
             .get_mut(endpoint_idx)
             .and_then(Option::as_mut)
@@ -1477,7 +1537,7 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-        let waiter_tid = self.endpoint_waiters[endpoint_idx];
+        let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx];
 
         self.ipc_send(send_cap, msg)?;
 
@@ -1495,7 +1555,7 @@ impl KernelState {
     pub fn ipc_send_with_cap_transfer(
         &mut self,
         send_cap: CapId,
-        sender_tid: u64,
+        sender_tid: ThreadId,
         opcode: u16,
         transfer_cap: CapId,
         payload: &[u8],
@@ -1504,7 +1564,7 @@ impl KernelState {
             return Err(KernelError::InvalidCapability);
         }
         let msg = Message::with_header(
-            sender_tid,
+            sender_tid.0,
             opcode,
             Message::FLAG_CAP_TRANSFER,
             Some(transfer_cap.0),
@@ -1526,6 +1586,7 @@ impl KernelState {
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
 
         let endpoint = self
+            .ipc
             .endpoints
             .get_mut(endpoint_idx)
             .and_then(Option::as_mut)
@@ -1533,7 +1594,7 @@ impl KernelState {
 
         if let Some(msg) = endpoint.recv() {
             if let Some((sender_tid, pending_msg)) =
-                self.endpoint_sender_waiters[endpoint_idx].take()
+                self.ipc.endpoint_sender_waiters[endpoint_idx].take()
             {
                 endpoint
                     .send(pending_msg)
@@ -1543,7 +1604,9 @@ impl KernelState {
             return Ok(Some(msg));
         }
 
-        if let Some((sender_tid, pending_msg)) = self.endpoint_sender_waiters[endpoint_idx].take() {
+        if let Some((sender_tid, pending_msg)) =
+            self.ipc.endpoint_sender_waiters[endpoint_idx].take()
+        {
             self.wake_sender_waiter(sender_tid)?;
             return Ok(Some(pending_msg));
         }
@@ -1597,10 +1660,11 @@ impl KernelState {
         if !phys.0.is_multiple_of(crate::kernel::vm::PAGE_SIZE as u64) {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
-        let id = self.next_memory_object_id;
-        self.next_memory_object_id = self.next_memory_object_id.wrapping_add(1);
+        let id = self.memory.next_memory_object_id;
+        self.memory.next_memory_object_id = self.memory.next_memory_object_id.wrapping_add(1);
 
         let slot = self
+            .memory
             .memory_objects
             .iter_mut()
             .find(|entry| entry.is_none())
@@ -1620,8 +1684,9 @@ impl KernelState {
     }
 
     pub fn alloc_anonymous_memory_object(&mut self) -> Result<(u64, CapId), KernelError> {
-        let phys = PhysAddr(self.next_anon_phys);
-        self.next_anon_phys = self
+        let phys = PhysAddr(self.memory.next_anon_phys);
+        self.memory.next_anon_phys = self
+            .memory
             .next_anon_phys
             .wrapping_add(crate::kernel::vm::PAGE_SIZE as u64);
         self.create_memory_object(phys)
@@ -1668,7 +1733,8 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
 
-        self.memory_objects
+        self.memory
+            .memory_objects
             .iter()
             .flatten()
             .find(|entry| entry.id == id)
@@ -2040,7 +2106,7 @@ mod tests {
         let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
 
         state
-            .ipc_send_with_cap_transfer(send_cap, 0, 0x55, mem_cap, b"mt")
+            .ipc_send_with_cap_transfer(send_cap, ThreadId(0), 0x55, mem_cap, b"mt")
             .expect("send transfer");
         let msg = state.ipc_recv(recv_cap).expect("recv").expect("message");
 
@@ -3066,5 +3132,27 @@ mod tests {
 
         assert_eq!(state.last_fault(), Some(fault));
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
+    }
+
+    #[test]
+    fn cross_cpu_work_for_other_cpu_is_deferred_not_dropped() {
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+
+        state
+            .submit_cross_cpu_work(WorkItem::Reschedule {
+                target_cpu: CpuId(1),
+            })
+            .expect("submit");
+
+        let processed_cpu0 = state
+            .process_cross_cpu_work_for_cpu(CpuId(0))
+            .expect("process cpu0");
+        assert_eq!(processed_cpu0, 0);
+
+        let processed_cpu1 = state
+            .process_cross_cpu_work_for_cpu(CpuId(1))
+            .expect("process cpu1");
+        assert_eq!(processed_cpu1, 1);
     }
 }
