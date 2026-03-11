@@ -2794,7 +2794,7 @@ mod tests {
         for i in 1..=10u64 {
             state.register_task(i).expect("task");
             state
-                .enqueue_on_cpu(CpuId((i % 2) as usize), i)
+                .enqueue_on_cpu(CpuId((i % 2) as u8), i)
                 .expect("enqueue");
         }
 
@@ -3082,7 +3082,7 @@ mod tests {
         for i in 1..=20u64 {
             state.register_task(i).expect("task");
             state
-                .enqueue_on_cpu(CpuId((i % 2) as usize), i)
+                .enqueue_on_cpu(CpuId((i % 2) as u8), i)
                 .expect("enqueue");
         }
 
@@ -3092,7 +3092,7 @@ mod tests {
             match seed % 3 {
                 0 => state
                     .submit_cross_cpu_work(WorkItem::Reschedule {
-                        target_cpu: CpuId((seed as usize) % 2),
+                        target_cpu: CpuId((seed as u8) % 2),
                     })
                     .expect("work"),
                 1 => {
@@ -3104,7 +3104,7 @@ mod tests {
                     }
                 }
                 _ => {
-                    let cpu = CpuId((seed as usize) % 2);
+                    let cpu = CpuId((seed as u8) % 2);
                     state.process_cross_cpu_work_for_cpu(cpu).expect("process");
                 }
             }

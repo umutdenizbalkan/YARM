@@ -2,7 +2,16 @@ pub const MAX_RUN_QUEUE: usize = 128;
 pub const MAX_CPUS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CpuId(pub usize);
+pub struct CpuId(pub u8);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerError {
+    InvalidCpu,
+    CpuOffline,
+    QueueFull,
+    AlreadyQueued,
+    CurrentOccupied,
+}
 
 #[derive(Debug)]
 pub struct RoundRobinScheduler {
@@ -15,7 +24,7 @@ pub struct RoundRobinScheduler {
 impl Default for RoundRobinScheduler {
     fn default() -> Self {
         Self {
-            run_queue: [None; MAX_RUN_QUEUE],
+            run_queue: [const { None }; MAX_RUN_QUEUE],
             head: 0,
             len: 0,
             current: None,
@@ -24,12 +33,30 @@ impl Default for RoundRobinScheduler {
 }
 
 impl RoundRobinScheduler {
+    fn contains_tid(&self, tid: u64) -> bool {
+        if self.current == Some(tid) {
+            return true;
+        }
+        let mut i = 0;
+        while i < self.len {
+            let idx = (self.head + i) & (MAX_RUN_QUEUE - 1);
+            if self.run_queue[idx] == Some(tid) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     pub fn enqueue(&mut self, tid: u64) -> Result<(), u64> {
+        if self.contains_tid(tid) {
+            return Ok(());
+        }
         if self.len >= MAX_RUN_QUEUE {
             return Err(tid);
         }
 
-        let tail = (self.head + self.len) % MAX_RUN_QUEUE;
+        let tail = (self.head + self.len) & (MAX_RUN_QUEUE - 1);
         self.run_queue[tail] = Some(tid);
         self.len += 1;
         Ok(())
@@ -41,19 +68,25 @@ impl RoundRobinScheduler {
         }
 
         let idx = self.head;
-        self.head = (self.head + 1) % MAX_RUN_QUEUE;
+        self.head = (self.head + 1) & (MAX_RUN_QUEUE - 1);
         self.len -= 1;
         self.run_queue[idx].take()
     }
 
     pub fn dispatch_next(&mut self) -> Option<u64> {
+        if self.current.is_some() {
+            return self.current;
+        }
         self.current = self.dequeue();
         self.current
     }
 
     pub fn on_preempt(&mut self) -> Option<u64> {
         if let Some(running_tid) = self.current.take() {
-            let _ = self.enqueue(running_tid);
+            if self.enqueue(running_tid).is_err() {
+                self.current = Some(running_tid);
+                return self.current;
+            }
         }
         self.dispatch_next()
     }
@@ -66,6 +99,7 @@ impl RoundRobinScheduler {
         self.current
     }
 
+    /// Returns runnable queued tasks only (does not include currently running task).
     pub fn runnable_count(&self) -> usize {
         self.len
     }
@@ -91,11 +125,12 @@ impl Default for SmpScheduler {
 }
 
 impl SmpScheduler {
-    fn check_cpu(cpu: CpuId) -> Result<usize, ()> {
-        if cpu.0 >= MAX_CPUS {
-            return Err(());
+    fn check_cpu(cpu: CpuId) -> Option<usize> {
+        let idx = cpu.0 as usize;
+        if idx >= MAX_CPUS {
+            return None;
         }
-        Ok(cpu.0)
+        Some(idx)
     }
 
     pub fn current_cpu(&self) -> CpuId {
@@ -103,7 +138,9 @@ impl SmpScheduler {
     }
 
     pub fn set_current_cpu(&mut self, cpu: CpuId) -> Result<(), ()> {
-        let idx = Self::check_cpu(cpu)?;
+        let Some(idx) = Self::check_cpu(cpu) else {
+            return Err(());
+        };
         if !self.online[idx] {
             return Err(());
         }
@@ -112,14 +149,15 @@ impl SmpScheduler {
     }
 
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), ()> {
-        let idx = Self::check_cpu(cpu)?;
+        let Some(idx) = Self::check_cpu(cpu) else {
+            return Err(());
+        };
         self.online[idx] = true;
         Ok(())
     }
 
     pub fn cpu_is_online(&self, cpu: CpuId) -> bool {
         Self::check_cpu(cpu)
-            .ok()
             .map(|idx| self.online[idx])
             .unwrap_or(false)
     }
@@ -129,7 +167,9 @@ impl SmpScheduler {
     }
 
     pub fn enqueue_on(&mut self, cpu: CpuId, tid: u64) -> Result<(), u64> {
-        let idx = Self::check_cpu(cpu).map_err(|_| tid)?;
+        let Some(idx) = Self::check_cpu(cpu) else {
+            return Err(tid);
+        };
         if !self.online[idx] {
             return Err(tid);
         }
@@ -137,7 +177,7 @@ impl SmpScheduler {
     }
 
     pub fn dispatch_next_on(&mut self, cpu: CpuId) -> Option<u64> {
-        let idx = Self::check_cpu(cpu).ok()?;
+        let idx = Self::check_cpu(cpu)?;
         if !self.online[idx] {
             return None;
         }
@@ -145,7 +185,7 @@ impl SmpScheduler {
     }
 
     pub fn on_preempt_on(&mut self, cpu: CpuId) -> Option<u64> {
-        let idx = Self::check_cpu(cpu).ok()?;
+        let idx = Self::check_cpu(cpu)?;
         if !self.online[idx] {
             return None;
         }
@@ -153,7 +193,7 @@ impl SmpScheduler {
     }
 
     pub fn block_current_on(&mut self, cpu: CpuId) -> Option<u64> {
-        let idx = Self::check_cpu(cpu).ok()?;
+        let idx = Self::check_cpu(cpu)?;
         if !self.online[idx] {
             return None;
         }
@@ -161,7 +201,7 @@ impl SmpScheduler {
     }
 
     pub fn current_tid_on(&self, cpu: CpuId) -> Option<u64> {
-        let idx = Self::check_cpu(cpu).ok()?;
+        let idx = Self::check_cpu(cpu)?;
         if !self.online[idx] {
             return None;
         }
@@ -169,9 +209,8 @@ impl SmpScheduler {
     }
 
     pub fn runnable_count_on(&self, cpu: CpuId) -> usize {
-        let idx = match Self::check_cpu(cpu) {
-            Ok(idx) => idx,
-            Err(_) => return 0,
+        let Some(idx) = Self::check_cpu(cpu) else {
+            return 0;
         };
         if !self.online[idx] {
             return 0;
@@ -221,6 +260,40 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_duplicate_enqueue_is_ignored() {
+        let mut sched = RoundRobinScheduler::default();
+        assert!(sched.enqueue(7).is_ok());
+        assert!(sched.enqueue(7).is_ok());
+        assert_eq!(sched.runnable_count(), 1);
+    }
+
+    #[test]
+    fn scheduler_dispatch_next_does_not_overwrite_current() {
+        let mut sched = RoundRobinScheduler::default();
+        assert!(sched.enqueue(1).is_ok());
+        assert!(sched.enqueue(2).is_ok());
+        assert_eq!(sched.dispatch_next(), Some(1));
+        assert_eq!(sched.dispatch_next(), Some(1));
+    }
+
+    #[test]
+    fn scheduler_wraparound_and_overflow_path() {
+        let mut sched = RoundRobinScheduler::default();
+        for tid in 0..MAX_RUN_QUEUE as u64 {
+            assert!(sched.enqueue(tid).is_ok());
+        }
+        assert_eq!(sched.enqueue(999), Err(999));
+
+        for _ in 0..(MAX_RUN_QUEUE / 2) {
+            let _ = sched.dispatch_next();
+            let _ = sched.block_current();
+        }
+        for tid in 1000..1000 + (MAX_RUN_QUEUE / 2) as u64 {
+            assert!(sched.enqueue(tid).is_ok());
+        }
+    }
+
+    #[test]
     fn smp_scheduler_tracks_per_cpu_queues() {
         let mut sched = SmpScheduler::default();
         assert_eq!(sched.online_cpu_count(), 1);
@@ -234,5 +307,11 @@ mod tests {
         assert_eq!(sched.dispatch_next_on(CpuId(1)), Some(20));
         assert_eq!(sched.current_tid_on(CpuId(0)), Some(10));
         assert_eq!(sched.current_tid_on(CpuId(1)), Some(20));
+    }
+
+    #[test]
+    fn smp_enqueue_on_offline_cpu_returns_error() {
+        let mut sched = SmpScheduler::default();
+        assert_eq!(sched.enqueue_on(CpuId(2), 55), Err(55));
     }
 }
