@@ -16,3 +16,130 @@ pub trait Hal {
     fn program_timer_deadline(&mut self, cpu: CpuId, ticks_from_now: u64);
     fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::trap::{FaultAccess, FaultInfo};
+    use crate::kernel::vm::VirtAddr;
+
+    #[derive(Debug, Clone, Copy)]
+    struct RiscvTrapContext {
+        scause: usize,
+        stval: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct MockRiscvHal {
+        last_asid: Option<Asid>,
+        last_irq: Option<(CpuId, u16)>,
+        last_timer: Option<(CpuId, u64)>,
+    }
+
+    impl Hal for MockRiscvHal {
+        type TrapContext = RiscvTrapContext;
+
+        fn switch_address_space(&mut self, asid: Asid) {
+            self.last_asid = Some(asid);
+        }
+
+        fn acknowledge_interrupt(&mut self, cpu: CpuId, irq_line: u16) {
+            self.last_irq = Some((cpu, irq_line));
+        }
+
+        fn program_timer_deadline(&mut self, cpu: CpuId, ticks_from_now: u64) {
+            self.last_timer = Some((cpu, ticks_from_now));
+        }
+
+        fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent {
+            if context.scause == 8 {
+                TrapEvent::syscall()
+            } else {
+                TrapEvent::page_fault(FaultInfo {
+                    addr: VirtAddr(context.stval as u64),
+                    access: FaultAccess::Write,
+                })
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct X86TrapContext {
+        vector: u8,
+        fault_addr: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct MockX86Hal {
+        last_asid: Option<Asid>,
+        last_irq: Option<(CpuId, u16)>,
+        last_timer: Option<(CpuId, u64)>,
+    }
+
+    impl Hal for MockX86Hal {
+        type TrapContext = X86TrapContext;
+
+        fn switch_address_space(&mut self, asid: Asid) {
+            self.last_asid = Some(asid);
+        }
+
+        fn acknowledge_interrupt(&mut self, cpu: CpuId, irq_line: u16) {
+            self.last_irq = Some((cpu, irq_line));
+        }
+
+        fn program_timer_deadline(&mut self, cpu: CpuId, ticks_from_now: u64) {
+            self.last_timer = Some((cpu, ticks_from_now));
+        }
+
+        fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent {
+            if context.vector == 0x80 {
+                TrapEvent::syscall()
+            } else {
+                TrapEvent::page_fault(FaultInfo {
+                    addr: VirtAddr(context.fault_addr as u64),
+                    access: FaultAccess::Read,
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn hal_contract_is_isa_agnostic_for_riscv_like_impl() {
+        let mut hal = MockRiscvHal::default();
+        hal.switch_address_space(Asid(3));
+        hal.acknowledge_interrupt(CpuId(0), 9);
+        hal.program_timer_deadline(CpuId(0), 100);
+
+        let trap = hal.decode_trap_event(&RiscvTrapContext {
+            scause: 8,
+            stval: 0,
+        });
+        assert_eq!(trap, TrapEvent::syscall());
+        assert_eq!(hal.last_asid, Some(Asid(3)));
+        assert_eq!(hal.last_irq, Some((CpuId(0), 9)));
+        assert_eq!(hal.last_timer, Some((CpuId(0), 100)));
+    }
+
+    #[test]
+    fn hal_contract_is_isa_agnostic_for_x86_like_impl() {
+        let mut hal = MockX86Hal::default();
+        hal.switch_address_space(Asid(7));
+        hal.acknowledge_interrupt(CpuId(1), 33);
+        hal.program_timer_deadline(CpuId(1), 250);
+
+        let trap = hal.decode_trap_event(&X86TrapContext {
+            vector: 14,
+            fault_addr: 0xDEAD_0000,
+        });
+        assert_eq!(
+            trap,
+            TrapEvent::page_fault(FaultInfo {
+                addr: VirtAddr(0xDEAD_0000),
+                access: FaultAccess::Read,
+            })
+        );
+        assert_eq!(hal.last_asid, Some(Asid(7)));
+        assert_eq!(hal.last_irq, Some((CpuId(1), 33)));
+        assert_eq!(hal.last_timer, Some((CpuId(1), 250)));
+    }
+}

@@ -12,6 +12,83 @@ pub enum IpcError {
     InvalidEndpointDepth,
 }
 
+pub const IPC_REGISTER_WORDS: usize = 2;
+pub const IPC_REGISTER_BYTES: usize = IPC_REGISTER_WORDS * core::mem::size_of::<usize>();
+
+pub fn unpack_register_payload(
+    words: [usize; IPC_REGISTER_WORDS],
+    len: usize,
+) -> Option<[u8; IPC_REGISTER_BYTES]> {
+    if len > IPC_REGISTER_BYTES {
+        return None;
+    }
+
+    let mut out = [0u8; IPC_REGISTER_BYTES];
+    let mut i = 0;
+    while i < IPC_REGISTER_WORDS {
+        let bytes = words[i].to_le_bytes();
+        let start = i * core::mem::size_of::<usize>();
+        let end = start + core::mem::size_of::<usize>();
+        out[start..end].copy_from_slice(&bytes);
+        i += 1;
+    }
+    Some(out)
+}
+
+pub fn pack_register_payload(payload: &[u8]) -> [usize; IPC_REGISTER_WORDS] {
+    let mut words = [0usize; IPC_REGISTER_WORDS];
+    let mut i = 0;
+    while i < IPC_REGISTER_WORDS {
+        let start = i * core::mem::size_of::<usize>();
+        let end = start + core::mem::size_of::<usize>();
+        let mut lane = [0u8; core::mem::size_of::<usize>()];
+        if start < payload.len() {
+            let copy_end = core::cmp::min(end, payload.len());
+            lane[..copy_end - start].copy_from_slice(&payload[start..copy_end]);
+        }
+        words[i] = usize::from_le_bytes(lane);
+        i += 1;
+    }
+    words
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedMemoryRegion {
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl SharedMemoryRegion {
+    pub const ENCODED_LEN: usize = 16;
+
+    pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        let off = self.offset.to_le_bytes();
+        let len = self.len.to_le_bytes();
+        let mut i = 0;
+        while i < 8 {
+            out[i] = off[i];
+            out[8 + i] = len[i];
+            i += 1;
+        }
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() < Self::ENCODED_LEN {
+            return None;
+        }
+        let mut off = [0u8; 8];
+        let mut len = [0u8; 8];
+        off.copy_from_slice(&payload[..8]);
+        len.copy_from_slice(&payload[8..Self::ENCODED_LEN]);
+        Some(Self {
+            offset: u64::from_le_bytes(off),
+            len: u64::from_le_bytes(len),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message {
     pub sender_tid: ThreadId,
@@ -193,6 +270,24 @@ mod tests {
             Message::with_header(1, 0, Message::FLAG_CAP_TRANSFER, None, b"x"),
             Err(IpcError::InconsistentCapTransferFlag)
         );
+    }
+
+    #[test]
+    fn register_payload_roundtrip() {
+        let source = [0xAAu8; IPC_REGISTER_BYTES];
+        let words = pack_register_payload(&source);
+        let decoded = unpack_register_payload(words, IPC_REGISTER_BYTES).expect("decode");
+        assert_eq!(decoded, source);
+    }
+
+    #[test]
+    fn shared_memory_region_codec_roundtrip() {
+        let region = SharedMemoryRegion {
+            offset: 0x1000,
+            len: 8192,
+        };
+        let encoded = region.encode();
+        assert_eq!(SharedMemoryRegion::decode(&encoded), Some(region));
     }
 
     #[test]
