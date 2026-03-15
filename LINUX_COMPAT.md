@@ -107,3 +107,13 @@ The compatibility-gate suite now includes golden fixture vectors and truncated-p
 ## Standalone server boundary
 
 Linux compatibility is now treated as a standalone personality server boundary. Core process-manager and VFS servers depend only on protocol modules (`proc_proto`, `vfs_proto`) and can be shipped without Linux personality support. The Linux compatibility layer consumes those protocols over IPC rather than owning their contracts.
+
+
+## Build/profile boundary
+
+Linux compatibility is optional and built behind Cargo feature `linux-compat`.
+
+- Core microkernel + protocol servers only: `cargo test`
+- Linux personality enabled: `cargo test --features linux-compat`
+
+This keeps `procman`/`vfs` deliverables independent from Linux personality policy code.

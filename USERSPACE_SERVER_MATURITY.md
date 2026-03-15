@@ -17,6 +17,7 @@ This plan tracks the transition from mechanism-complete kernel internals to prod
 2. **Policy gate**
    - Delegation chain is explicit (`init.srv` -> service).
    - Service role policy is enforced for hardware delegation.
+   - Delegation graph remains mechanism-auditable (allowed role edges are explicit and test-covered).
 
 3. **Determinism gate**
    - Deterministic simulation scripts cover mixed subsystem interaction:

@@ -31,3 +31,10 @@ Any intentional ABI/contract change must:
 - Update this document and the corresponding module docs.
 - Add/adjust tests that assert the new contract.
 - Include migration notes if userspace-visible behavior changes.
+
+
+## Compatibility gates in CI semantics
+
+- Mechanism/core profile must pass: `cargo test`
+- Linux personality profile must pass: `cargo test --features linux-compat`
+- Typed codec golden vectors and truncation-rejection tests are required gates for wire-compatibility changes.

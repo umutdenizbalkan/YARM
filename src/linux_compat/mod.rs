@@ -16,6 +16,8 @@ use crate::kernel::vfs_proto::{
 };
 use crate::kernel::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
+pub mod sim;
+
 // Linux syscall numbers in this module follow the LP64 numbering used by
 // RISC-V/AArch64 style ABIs in this prototype compatibility personality.
 

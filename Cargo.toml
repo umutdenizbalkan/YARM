@@ -3,4 +3,13 @@ name = "yarm"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+linux-compat = []
+
 [dependencies]
+
+[[bin]]
+name = "linux_compat_server"
+path = "src/bin/linux_compat_server.rs"
+required-features = ["linux-compat"]
