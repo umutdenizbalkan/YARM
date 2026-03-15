@@ -74,13 +74,13 @@ Compatibility is implemented as a translation layer over microkernel mechanisms 
 
 ## Payload schema stability
 
-For higher-churn VFS calls we now freeze helper packers so request payload layout is explicit and testable:
+For higher-churn VFS calls we now freeze helper packers and a typed codec so request payload layout is explicit and testable:
 
 - `pack_epoll_ctl(epfd, op, fd, event_ptr)`
 - `pack_sendfile(out_fd, in_fd, offset_ptr, count)`
 - `pack_statx(dirfd, path_ptr, flags, mask)`
 
-Each helper encodes four little-endian u64 words (`[arg0,arg1,arg2,arg3]`) into a 32-byte IPC payload.
+Each helper now routes through `VfsV1Args` (version `VFS_CODEC_V1_VERSION`) which encodes four little-endian u64 words (`[arg0,arg1,arg2,arg3]`) into a 32-byte IPC payload.
 
 ## Process-manager protocol v2 slice
 
@@ -91,9 +91,29 @@ In addition to single-u64 process-manager requests, the kernel now provides a du
 
 The payload shape is a fixed 16-byte little-endian tuple (`arg0`, `arg1`) and is covered by round-trip unit tests.
 
-The process-manager v2 path also defines a typed `ProcV2Args` 16-byte codec (`arg0`, `arg1`) to freeze payload semantics before adding broader spawn/wait APIs.
+The process-manager v2 path also defines a typed `ProcV2Args` 16-byte codec (`arg0`, `arg1`) with explicit codec version constant (`PROC_CODEC_V2_VERSION`) to freeze payload semantics before adding broader spawn/wait APIs.
 
 A minimal `vfs_lite` service implementation now exists in-kernel module space as a user-space server model scaffold (`src/kernel/vfs_lite.rs`) and is exercised by `src/bin/vfs_lite.rs`.
 
 The compatibility test suite now includes an end-to-end personality shim flow (`getpid` + `openat` + `exit`) to verify process-manager and VFS routing in one sequence.
 The compatibility test suite also includes a deterministic mixed syscall sequence (`getpid`/`openat`) to ensure stable cross-server routing behavior over repeated dispatch cycles.
+
+The compatibility suite further validates deterministic mixed server flow with IRQ notification routing (`getpid` + IRQ notification + `openat`) so server IPC and notification delivery remain stable under interleaving.
+
+
+The compatibility-gate suite now includes golden fixture vectors and truncated-payload rejection checks for `ProcV2Args` and `VfsV1Args`, so any wire-format drift fails tests immediately.
+
+
+## Standalone server boundary
+
+Linux compatibility is now treated as a standalone personality server boundary. Core process-manager and VFS servers depend only on protocol modules (`proc_proto`, `vfs_proto`) and can be shipped without Linux personality support. The Linux compatibility layer consumes those protocols over IPC rather than owning their contracts.
+
+
+## Build/profile boundary
+
+Linux compatibility is optional and built behind Cargo feature `linux-compat`.
+
+- Core microkernel + protocol servers only: `cargo test`
+- Linux personality enabled: `cargo test --features linux-compat`
+
+This keeps `procman`/`vfs` deliverables independent from Linux personality policy code.

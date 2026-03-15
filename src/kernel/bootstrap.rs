@@ -65,6 +65,21 @@ pub struct ClassPolicySnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRole {
+    Init,
+    ProcessManager,
+    Vfs,
+    Driver,
+    Supervisor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServicePolicyEntry {
+    tid: ThreadId,
+    role: ServiceRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceServerDelegation {
     pub server_tid: ThreadId,
     pub irq_line: u16,
@@ -77,8 +92,43 @@ pub struct DeviceServerDelegation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverDelegationBundle {
+    pub irq_cap: CapId,
+    pub dma_cap: CapId,
+    pub iova_cap: CapId,
+}
+
+const ALLOWED_SERVICE_DELEGATION_EDGES: &[(ServiceRole, ServiceRole)] = &[
+    (ServiceRole::Init, ServiceRole::ProcessManager),
+    (ServiceRole::Init, ServiceRole::Vfs),
+    (ServiceRole::Init, ServiceRole::Driver),
+    (ServiceRole::Init, ServiceRole::Supervisor),
+    (ServiceRole::Supervisor, ServiceRole::Driver),
+    (ServiceRole::Supervisor, ServiceRole::Vfs),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverBundlePlan {
+    pub server_tid: ThreadId,
+    pub irq_line: u16,
+    pub mem_cap: CapId,
+    pub iova_cap: CapId,
+    pub iova_base: usize,
+    pub iova_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpcFastpathResult {
     pub switched_to_waiter: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IpcPathTelemetry {
+    pub fastpath_attempts: u64,
+    pub fastpath_switches: u64,
+    pub queued_sends: u64,
+    pub blocked_sends: u64,
+    pub rendezvous_handoffs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,11 +181,12 @@ struct IpcSubsystem {
     cross_cpu_work: CrossCpuWorkQueue,
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
     endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
-    endpoint_sender_waiters: [Option<(ThreadId, Message)>; MAX_ENDPOINTS],
+    endpoint_sender_waiters: [Option<(ThreadId, Message, bool)>; MAX_ENDPOINTS],
     endpoint_generations: [u64; MAX_ENDPOINTS],
     notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
     notification_generations: [u64; MAX_NOTIFICATIONS],
     irq_routes: [Option<usize>; MAX_IRQ_LINES],
+    telemetry: IpcPathTelemetry,
 }
 
 #[derive(Debug)]
@@ -150,6 +201,7 @@ struct MemorySubsystem {
 struct DriverSubsystem {
     driver_records: [Option<DriverRecord>; MAX_DRIVERS],
     next_iova_space_id: u64,
+    service_policy: [Option<ServicePolicyEntry>; MAX_TASKS],
 }
 
 #[derive(Debug)]
@@ -234,6 +286,7 @@ impl Bootstrap {
                 notifications: [const { None }; MAX_NOTIFICATIONS],
                 notification_generations: [0; MAX_NOTIFICATIONS],
                 irq_routes: [None; MAX_IRQ_LINES],
+                telemetry: IpcPathTelemetry::default(),
             },
             tcbs: [None; MAX_TASKS],
             memory: MemorySubsystem {
@@ -245,6 +298,7 @@ impl Bootstrap {
             drivers: DriverSubsystem {
                 driver_records: [const { None }; MAX_DRIVERS],
                 next_iova_space_id: 1,
+                service_policy: [const { None }; MAX_TASKS],
             },
             tlb_shootdown_count: 0,
             faults: FaultSubsystem {
@@ -563,6 +617,112 @@ impl KernelState {
         self.configure_driver_dma_window(plan.server_tid.0, plan.iova_base, plan.iova_len)?;
 
         Ok((irq_cap, dma_cap))
+    }
+
+    pub fn delegate_driver_bundle(
+        &mut self,
+        plan: DriverBundlePlan,
+    ) -> Result<DriverDelegationBundle, KernelError> {
+        let (irq_cap, dma_cap) = self.delegate_device_server_caps(DeviceServerDelegation {
+            server_tid: plan.server_tid,
+            irq_line: plan.irq_line,
+            mem_cap: plan.mem_cap,
+            dma_offset: 0,
+            dma_len: super::vm::PAGE_SIZE,
+            iova_cap: plan.iova_cap,
+            iova_base: plan.iova_base,
+            iova_len: plan.iova_len,
+        })?;
+        Ok(DriverDelegationBundle {
+            irq_cap,
+            dma_cap,
+            iova_cap: plan.iova_cap,
+        })
+    }
+
+    pub fn ipc_path_telemetry(&self) -> IpcPathTelemetry {
+        self.ipc.telemetry
+    }
+    pub fn register_service_role(
+        &mut self,
+        tid: u64,
+        role: ServiceRole,
+    ) -> Result<(), KernelError> {
+        if self.tcb_mut(tid).is_none() {
+            return Err(KernelError::TaskMissing);
+        }
+        let tid = ThreadId(tid);
+        if let Some(entry) = self
+            .drivers
+            .service_policy
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.tid == tid)
+        {
+            entry.role = role;
+            return Ok(());
+        }
+        let slot = self
+            .drivers
+            .service_policy
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(KernelError::TaskTableFull)?;
+        *slot = Some(ServicePolicyEntry { tid, role });
+        Ok(())
+    }
+
+    fn service_role(&self, tid: ThreadId) -> Option<ServiceRole> {
+        self.drivers
+            .service_policy
+            .iter()
+            .flatten()
+            .find(|entry| entry.tid == tid)
+            .map(|entry| entry.role)
+    }
+
+    pub const fn allowed_service_delegation_edges() -> &'static [(ServiceRole, ServiceRole)] {
+        ALLOWED_SERVICE_DELEGATION_EDGES
+    }
+
+    fn can_delegate_service(
+        &self,
+        delegator_role: ServiceRole,
+        receiver_role: ServiceRole,
+    ) -> bool {
+        Self::allowed_service_delegation_edges()
+            .iter()
+            .any(|edge| *edge == (delegator_role, receiver_role))
+    }
+
+    pub fn validate_service_delegation(
+        &self,
+        delegator_tid: u64,
+        receiver_tid: u64,
+    ) -> Result<(), KernelError> {
+        let Some(delegator_role) = self.service_role(ThreadId(delegator_tid)) else {
+            return Err(KernelError::MissingRight);
+        };
+        let Some(receiver_role) = self.service_role(ThreadId(receiver_tid)) else {
+            return Err(KernelError::WrongObject);
+        };
+        if self.can_delegate_service(delegator_role, receiver_role) {
+            Ok(())
+        } else {
+            Err(KernelError::MissingRight)
+        }
+    }
+
+    pub fn delegate_driver_bundle_checked(
+        &mut self,
+        delegator_tid: u64,
+        plan: DriverBundlePlan,
+    ) -> Result<DriverDelegationBundle, KernelError> {
+        self.validate_service_delegation(delegator_tid, plan.server_tid.0)?;
+        if self.service_role(plan.server_tid) != Some(ServiceRole::Driver) {
+            return Err(KernelError::WrongObject);
+        }
+        self.delegate_driver_bundle(plan)
     }
 
     pub fn configure_driver_dma_window(
@@ -1254,7 +1414,7 @@ impl KernelState {
             .ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
-        self.ipc.endpoint_sender_waiters[endpoint_idx] = Some((ThreadId(blocked_tid), msg));
+        self.ipc.endpoint_sender_waiters[endpoint_idx] = Some((ThreadId(blocked_tid), msg, true));
         let _ = self.dispatch_next_task()?;
         Ok(())
     }
@@ -1501,10 +1661,26 @@ impl KernelState {
             .ok_or(KernelError::WrongObject)?
             .mode();
 
-        if endpoint_mode == EndpointMode::Synchronous
-            && self.ipc.endpoint_waiters[endpoint_idx].is_none()
-        {
+        if endpoint_mode == EndpointMode::Synchronous {
+            if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+                if self.ipc.endpoint_sender_waiters[endpoint_idx].is_some() {
+                    return Err(KernelError::EndpointQueueFull);
+                }
+                let sender_tid = ThreadId(
+                    self.scheduler
+                        .current_tid()
+                        .ok_or(KernelError::TaskMissing)?,
+                );
+                self.ipc.endpoint_sender_waiters[endpoint_idx] = Some((sender_tid, msg, false));
+                self.ipc.telemetry.rendezvous_handoffs =
+                    self.ipc.telemetry.rendezvous_handoffs.saturating_add(1);
+                self.wake_waiter_for_endpoint(endpoint_idx)?;
+                let _ = self.switch_to_runnable_tid(waiter_tid)?;
+                return Ok(());
+            }
+
             self.block_current_on_send(endpoint_idx, send_cap, msg)?;
+            self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
             return Err(KernelError::WouldBlock);
         }
 
@@ -1519,6 +1695,7 @@ impl KernelState {
             .send(msg)
             .map_err(|_| KernelError::EndpointQueueFull)?;
 
+        self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
     }
@@ -1537,6 +1714,8 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+        self.ipc.telemetry.fastpath_attempts =
+            self.ipc.telemetry.fastpath_attempts.saturating_add(1);
         let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx];
 
         self.ipc_send(send_cap, msg)?;
@@ -1546,6 +1725,11 @@ impl KernelState {
         } else {
             false
         };
+
+        if switched {
+            self.ipc.telemetry.fastpath_switches =
+                self.ipc.telemetry.fastpath_switches.saturating_add(1);
+        }
 
         Ok(IpcFastpathResult {
             switched_to_waiter: switched,
@@ -1593,21 +1777,25 @@ impl KernelState {
             .ok_or(KernelError::WrongObject)?;
 
         if let Some(msg) = endpoint.recv() {
-            if let Some((sender_tid, pending_msg)) =
+            if let Some((sender_tid, pending_msg, sender_blocked)) =
                 self.ipc.endpoint_sender_waiters[endpoint_idx].take()
             {
                 endpoint
                     .send(pending_msg)
                     .map_err(|_| KernelError::EndpointQueueFull)?;
-                self.wake_sender_waiter(sender_tid)?;
+                if sender_blocked {
+                    self.wake_sender_waiter(sender_tid)?;
+                }
             }
             return Ok(Some(msg));
         }
 
-        if let Some((sender_tid, pending_msg)) =
+        if let Some((sender_tid, pending_msg, sender_blocked)) =
             self.ipc.endpoint_sender_waiters[endpoint_idx].take()
         {
-            self.wake_sender_waiter(sender_tid)?;
+            if sender_blocked {
+                self.wake_sender_waiter(sender_tid)?;
+            }
             return Ok(Some(pending_msg));
         }
 
@@ -2144,7 +2332,8 @@ mod tests {
             .expect("syscall recv");
         assert_eq!(recv_frame.error, 0);
         assert_eq!(recv_frame.ret0 as u64, 0);
-        assert_eq!(recv_frame.ret1 & 0xFF, b'h' as usize);
+        assert_eq!(recv_frame.ret1, 2);
+        assert_eq!(recv_frame.args[3] & 0xFF, b'h' as usize);
     }
 
     #[test]
@@ -2313,6 +2502,37 @@ mod tests {
 
         let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
         assert_eq!(received.as_slice(), b"hi");
+    }
+
+    #[test]
+    fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        let mut send_frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut send_frame))
+            .expect("send syscall");
+
+        let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert!(msg.transferred_cap().is_some());
+        let region =
+            crate::kernel::ipc::SharedMemoryRegion::decode(msg.as_slice()).expect("region");
+        assert_eq!(region.offset, 0x2000);
+        assert_eq!(region.len as usize, Message::MAX_PAYLOAD + 16);
     }
 
     #[test]
@@ -2651,6 +2871,199 @@ mod tests {
                     crate::kernel::vm::PAGE_SIZE,
                 )
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn ipc_fastpath_telemetry_distinguishes_switch_and_queue_paths() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(60).expect("sender");
+        state.register_task(61).expect("receiver");
+
+        let (_eid, send_cap, recv_cap) = state
+            .create_endpoint_with_mode(2, EndpointMode::Synchronous)
+            .expect("endpoint");
+
+        state.scheduler.enqueue(61).expect("enqueue receiver");
+        let mut recv_tf = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 8, 0x9000, 0, 0, 0],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut recv_tf))
+            .expect("recv trap");
+
+        state.scheduler.enqueue(60).expect("enqueue sender");
+        let msg = Message::new(60, b"fp").expect("msg");
+        let fast = state.ipc_send_fastpath(send_cap, msg).expect("fastpath");
+        assert!(fast.switched_to_waiter);
+
+        let (_beid, bsend_cap, _brecv_cap) = state.create_endpoint(2).expect("buffered");
+        let queued = Message::new(60, b"q").expect("queued");
+        state.ipc_send(bsend_cap, queued).expect("queue send");
+
+        let t = state.ipc_path_telemetry();
+        assert_eq!(t.fastpath_attempts, 1);
+        assert_eq!(t.fastpath_switches, 1);
+        assert_eq!(t.queued_sends, 1);
+        assert_eq!(t.blocked_sends, 0);
+        assert_eq!(t.rendezvous_handoffs, 1);
+    }
+
+    #[test]
+    fn synchronous_endpoint_blocked_send_updates_telemetry() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(62).expect("sender");
+
+        let (_eid, send_cap, _recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+
+        let msg = Message::new(62, b"blk").expect("msg");
+        assert_eq!(state.ipc_send(send_cap, msg), Err(KernelError::WouldBlock));
+
+        let t = state.ipc_path_telemetry();
+        assert_eq!(t.blocked_sends, 1);
+        assert_eq!(t.queued_sends, 0);
+    }
+
+    #[test]
+    fn delegate_driver_bundle_uses_standard_window_and_revokes_caps() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(59).expect("task");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let iova_cap = state.create_iova_space_cap().expect("iova");
+
+        let bundle = state
+            .delegate_driver_bundle(DriverBundlePlan {
+                server_tid: ThreadId(59),
+                irq_line: 12,
+                mem_cap,
+                iova_cap,
+                iova_base: crate::kernel::vm::PAGE_SIZE * 2,
+                iova_len: crate::kernel::vm::PAGE_SIZE,
+            })
+            .expect("bundle");
+
+        assert!(state.cspace.get(bundle.irq_cap).is_some());
+        assert!(state.cspace.get(bundle.dma_cap).is_some());
+        assert!(state.cspace.get(bundle.iova_cap).is_some());
+
+        state.revoke_driver_runtime_caps(59).expect("revoke");
+        assert!(state.cspace.get(bundle.irq_cap).is_none());
+        assert!(state.cspace.get(bundle.dma_cap).is_none());
+        assert!(state.cspace.get(bundle.iova_cap).is_none());
+    }
+
+    #[test]
+    fn delegation_policy_requires_init_and_driver_roles() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(70).expect("init-task");
+        state.register_task(71).expect("driver-task");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let iova_cap = state.create_iova_space_cap().expect("iova");
+
+        state
+            .register_service_role(70, ServiceRole::Init)
+            .expect("role");
+        state
+            .register_service_role(71, ServiceRole::Driver)
+            .expect("role");
+
+        let ok = state.delegate_driver_bundle_checked(
+            70,
+            DriverBundlePlan {
+                server_tid: ThreadId(71),
+                irq_line: 3,
+                mem_cap,
+                iova_cap,
+                iova_base: crate::kernel::vm::PAGE_SIZE,
+                iova_len: crate::kernel::vm::PAGE_SIZE,
+            },
+        );
+        assert!(ok.is_ok());
+
+        let bad = state.delegate_driver_bundle_checked(
+            71,
+            DriverBundlePlan {
+                server_tid: ThreadId(71),
+                irq_line: 4,
+                mem_cap,
+                iova_cap,
+                iova_base: crate::kernel::vm::PAGE_SIZE * 2,
+                iova_len: crate::kernel::vm::PAGE_SIZE,
+            },
+        );
+        assert_eq!(bad, Err(KernelError::MissingRight));
+    }
+
+    #[test]
+    fn rendezvous_delivery_is_single_copy_and_no_sender_stuck() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(80).expect("sender");
+        state.register_task(81).expect("receiver");
+
+        let (_eid, send_cap, recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+
+        state.scheduler.enqueue(81).expect("enqueue receiver");
+        let mut recv_tf = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 8, 0x1100, 0, 0, 0],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut recv_tf))
+            .expect("recv trap");
+
+        state.scheduler.enqueue(80).expect("enqueue sender");
+        state
+            .ipc_send(send_cap, Message::new(80, b"rv").expect("msg"))
+            .expect("send");
+
+        let delivered = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(delivered.as_slice(), b"rv");
+        assert!(state.ipc_recv(recv_cap).expect("recv2").is_none());
+        assert_eq!(state.task_status(80), Some(TaskStatus::Runnable));
+
+        let t = state.ipc_path_telemetry();
+        assert!(t.rendezvous_handoffs >= 1);
+        assert!(t.fastpath_attempts >= t.fastpath_switches);
+    }
+
+    #[test]
+    fn service_delegation_edges_table_is_auditable_and_frozen() {
+        let edges = KernelState::allowed_service_delegation_edges();
+        assert!(edges.contains(&(ServiceRole::Init, ServiceRole::Driver)));
+        assert!(edges.contains(&(ServiceRole::Supervisor, ServiceRole::Vfs)));
+        assert!(!edges.contains(&(ServiceRole::Driver, ServiceRole::ProcessManager)));
+        assert_eq!(edges.len(), 6);
+    }
+
+    #[test]
+    fn service_delegation_graph_allows_only_expected_edges() {
+        let mut state = Bootstrap::init().expect("init");
+        for tid in 90..=93 {
+            state.register_task(tid).expect("task");
+        }
+        state
+            .register_service_role(90, ServiceRole::Init)
+            .expect("role init");
+        state
+            .register_service_role(91, ServiceRole::Supervisor)
+            .expect("role sup");
+        state
+            .register_service_role(92, ServiceRole::Driver)
+            .expect("role drv");
+        state
+            .register_service_role(93, ServiceRole::ProcessManager)
+            .expect("role proc");
+
+        assert!(state.validate_service_delegation(90, 93).is_ok());
+        assert!(state.validate_service_delegation(91, 92).is_ok());
+        assert_eq!(
+            state.validate_service_delegation(92, 93),
+            Err(KernelError::MissingRight)
         );
     }
 
