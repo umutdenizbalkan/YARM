@@ -2205,7 +2205,8 @@ mod tests {
             .expect("syscall recv");
         assert_eq!(recv_frame.error, 0);
         assert_eq!(recv_frame.ret0 as u64, 0);
-        assert_eq!(recv_frame.ret1 & 0xFF, b'h' as usize);
+        assert_eq!(recv_frame.ret1, 2);
+        assert_eq!(recv_frame.args[3] & 0xFF, b'h' as usize);
     }
 
     #[test]
@@ -2374,6 +2375,37 @@ mod tests {
 
         let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
         assert_eq!(received.as_slice(), b"hi");
+    }
+
+    #[test]
+    fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        let mut send_frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut send_frame))
+            .expect("send syscall");
+
+        let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert!(msg.transferred_cap().is_some());
+        let region =
+            crate::kernel::ipc::SharedMemoryRegion::decode(msg.as_slice()).expect("region");
+        assert_eq!(region.offset, 0x2000);
+        assert_eq!(region.len as usize, Message::MAX_PAYLOAD + 16);
     }
 
     #[test]

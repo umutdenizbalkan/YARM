@@ -13,6 +13,43 @@ pub enum IpcError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedMemoryRegion {
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl SharedMemoryRegion {
+    pub const ENCODED_LEN: usize = 16;
+
+    pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        let off = self.offset.to_le_bytes();
+        let len = self.len.to_le_bytes();
+        let mut i = 0;
+        while i < 8 {
+            out[i] = off[i];
+            out[8 + i] = len[i];
+            i += 1;
+        }
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() < Self::ENCODED_LEN {
+            return None;
+        }
+        let mut off = [0u8; 8];
+        let mut len = [0u8; 8];
+        off.copy_from_slice(&payload[..8]);
+        len.copy_from_slice(&payload[8..Self::ENCODED_LEN]);
+        Some(Self {
+            offset: u64::from_le_bytes(off),
+            len: u64::from_le_bytes(len),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message {
     pub sender_tid: ThreadId,
     pub opcode: u16,
@@ -193,6 +230,16 @@ mod tests {
             Message::with_header(1, 0, Message::FLAG_CAP_TRANSFER, None, b"x"),
             Err(IpcError::InconsistentCapTransferFlag)
         );
+    }
+
+    #[test]
+    fn shared_memory_region_codec_roundtrip() {
+        let region = SharedMemoryRegion {
+            offset: 0x1000,
+            len: 8192,
+        };
+        let encoded = region.encode();
+        assert_eq!(SharedMemoryRegion::decode(&encoded), Some(region));
     }
 
     #[test]
