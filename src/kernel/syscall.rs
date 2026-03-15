@@ -6,6 +6,7 @@ use super::ipc::{
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
 use super::vm::VirtAddr;
+use crate::arch::syscall_abi;
 
 pub const SYSCALL_ABI_VERSION: u16 = 2;
 pub const SYSCALL_YIELD_NR: usize = 0;
@@ -18,7 +19,7 @@ pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
 pub const SYSCALL_ARG_INLINE_PAYLOAD0: usize = 3;
 pub const SYSCALL_ARG_INLINE_PAYLOAD1: usize = 4;
-pub const SYSCALL_ARG_TRANSFER_CAP: usize = 5;
+pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;
 pub const SYSCALL_RET_STATUS: usize = 0;
 pub const SYSCALL_RET_AUX: usize = 1;
 pub const SYSCALL_RET_TRANSFER_CAP: usize = 2;
@@ -49,6 +50,7 @@ impl Syscall {
 }
 
 const _: [(); SYSCALL_COUNT] = [(); Syscall::VARIANT_COUNT];
+const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]

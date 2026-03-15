@@ -13,6 +13,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
 };
+use crate::arch::platform_layout;
 use crate::kernel::ipc::ThreadId;
 
 const MAX_ENDPOINTS: usize = 16;
@@ -20,7 +21,7 @@ const MAX_TASKS: usize = 64;
 const MAX_TASK_MEM_ENTRIES: usize = 2048;
 const MAX_MEMORY_OBJECTS: usize = 128;
 const MAX_NOTIFICATIONS: usize = 16;
-const MAX_IRQ_LINES: usize = 64;
+const MAX_IRQ_LINES: usize = platform_layout::MAX_IRQ_LINES;
 const MAX_DRIVERS: usize = 32;
 const RESTART_ESCALATION_THRESHOLD: u32 = 3;
 
@@ -261,9 +262,9 @@ impl Bootstrap {
         let mut kernel_aspace = AddressSpace::new_kernel();
         kernel_aspace
             .map_page(
-                VirtAddr(0xFFFF_0000),
+                VirtAddr(platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE),
                 Mapping {
-                    phys: PhysAddr(0x0),
+                    phys: PhysAddr(platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE),
                     flags: PageFlags::KERNEL_RW,
                 },
             )
@@ -308,7 +309,7 @@ impl Bootstrap {
                 task_mem: [None; MAX_TASK_MEM_ENTRIES],
                 memory_objects: [None; MAX_MEMORY_OBJECTS],
                 next_memory_object_id: 1,
-                next_anon_phys: 0x1000_0000,
+                next_anon_phys: platform_layout::NEXT_ANON_PHYS_BASE,
             },
             drivers: DriverSubsystem {
                 driver_records: [const { None }; MAX_DRIVERS],

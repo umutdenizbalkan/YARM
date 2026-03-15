@@ -1,3 +1,5 @@
+use crate::arch::syscall_abi;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ThreadId(pub u64);
 
@@ -12,7 +14,7 @@ pub enum IpcError {
     InvalidEndpointDepth,
 }
 
-pub const IPC_REGISTER_WORDS: usize = 2;
+pub const IPC_REGISTER_WORDS: usize = syscall_abi::IPC_REGISTER_WORDS;
 pub const IPC_REGISTER_BYTES: usize = IPC_REGISTER_WORDS * core::mem::size_of::<usize>();
 
 pub fn unpack_register_payload(

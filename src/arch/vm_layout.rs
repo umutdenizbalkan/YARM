@@ -1,9 +1,3 @@
-// Architecture-selected VM layout constants.
-// Current baseline remains 32-bit split semantics for prototype bring-up.
+// Selected ISA VM layout re-exports used by kernel mechanism code.
 
-pub const PAGE_SIZE: usize = 4096;
-pub const KERNEL_SPACE_BASE: u64 = 0x8000_0000;
-pub const ASID_BITS: u8 = 16;
-
-pub const MAX_MAPPINGS: usize = 128;
-pub const MAX_ADDRESS_SPACES: usize = 16;
+pub use super::selected_isa::vm_layout::*;

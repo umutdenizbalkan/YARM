@@ -44,3 +44,18 @@ This file documents the initial architecture split work for step 5b.
 ## VM layout boundary
 
 - VM layout constants (page size, kernel split base, ASID width, static VM capacities) are now sourced from `src/arch/vm_layout.rs` and consumed by `kernel::vm` to keep architecture assumptions out of mechanism logic.
+
+
+## Per-ISA layout module rule (implemented)
+
+Architecture/address-space constants are now selected through per-ISA modules instead of scattered `#[cfg]` constants:
+
+- `src/arch/riscv64/{vm_layout,platform_layout,syscall_abi}.rs`
+- `src/arch/x86_64/{vm_layout,platform_layout,syscall_abi}.rs`
+- `src/arch/aarch64/{vm_layout,platform_layout,syscall_abi}.rs`
+- `src/arch/mod.rs` selects one ISA module and re-exports selected views via:
+  - `src/arch/vm_layout.rs`
+  - `src/arch/platform_layout.rs`
+  - `src/arch/syscall_abi.rs`
+
+Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layout,platform_layout,syscall_abi}`), which keeps mechanism code architecture-agnostic.

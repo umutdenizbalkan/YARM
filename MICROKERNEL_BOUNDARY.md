@@ -42,3 +42,8 @@ Hardware access is modeled as capabilities held by normal servers.
 
 - Core-only systems: follow `CORE_PROFILE.md` (no Linux personality feature required).
 - Linux personality systems: enable feature `linux-compat` and include the linux compatibility server profile.
+
+
+## Per-ISA arch layout boundary
+
+- Arch/address-space constants and syscall shape constants are selected via `crate::arch::{vm_layout, platform_layout, syscall_abi}` and should not be newly introduced directly under `src/kernel/`.

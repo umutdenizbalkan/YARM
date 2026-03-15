@@ -1,3 +1,5 @@
+use crate::arch::syscall_abi;
+
 /// Register-width syscall/trap argument frame.
 ///
 /// `usize` is intentionally used here because these fields mirror machine
@@ -6,7 +8,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrapFrame {
     pub syscall_num: usize,
-    pub args: [usize; 6],
+    pub args: [usize; syscall_abi::TRAPFRAME_ARG_REGS],
     pub ret0: usize,
     pub ret1: usize,
     pub ret2: usize,
@@ -14,7 +16,7 @@ pub struct TrapFrame {
 }
 
 impl TrapFrame {
-    pub const fn new(syscall_num: usize, args: [usize; 6]) -> Self {
+    pub const fn new(syscall_num: usize, args: [usize; syscall_abi::TRAPFRAME_ARG_REGS]) -> Self {
         Self {
             syscall_num,
             args,
