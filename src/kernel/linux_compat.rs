@@ -11,6 +11,8 @@ pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
 pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 20;
 pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = 1;
 pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = 1;
+pub const PROC_CODEC_V2_VERSION: u16 = 2;
+pub const VFS_CODEC_V1_VERSION: u16 = 1;
 
 pub const LINUX_NR_BRK: usize = 214;
 pub const LINUX_NR_MUNMAP: usize = 215;
@@ -313,12 +315,15 @@ pub struct ProcV2Args {
 }
 
 impl ProcV2Args {
+    pub const VERSION: u16 = PROC_CODEC_V2_VERSION;
+    pub const ENCODED_LEN: usize = 16;
+
     pub const fn new(arg0: u64, arg1: u64) -> Self {
         Self { arg0, arg1 }
     }
 
-    pub const fn encode(self) -> [u8; 16] {
-        let mut payload = [0u8; 16];
+    pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut payload = [0u8; Self::ENCODED_LEN];
         let a0 = self.arg0.to_le_bytes();
         let a1 = self.arg1.to_le_bytes();
         let mut i = 0;
@@ -331,17 +336,72 @@ impl ProcV2Args {
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, LinuxErrno> {
-        if payload.len() < 16 {
+        if payload.len() < Self::ENCODED_LEN {
             return Err(LinuxErrno::Inval);
         }
         let mut a0 = [0u8; 8];
         let mut a1 = [0u8; 8];
         a0.copy_from_slice(&payload[..8]);
-        a1.copy_from_slice(&payload[8..16]);
+        a1.copy_from_slice(&payload[8..Self::ENCODED_LEN]);
         Ok(Self {
             arg0: u64::from_le_bytes(a0),
             arg1: u64::from_le_bytes(a1),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VfsV1Args {
+    pub arg0: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub arg3: u64,
+}
+
+impl VfsV1Args {
+    pub const VERSION: u16 = VFS_CODEC_V1_VERSION;
+    pub const ENCODED_LEN: usize = 32;
+
+    pub const fn new(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> Self {
+        Self {
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+        }
+    }
+
+    pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut payload = [0u8; Self::ENCODED_LEN];
+        let values = [self.arg0, self.arg1, self.arg2, self.arg3];
+        let mut idx = 0;
+        while idx < values.len() {
+            let bytes = values[idx].to_le_bytes();
+            let mut offset = 0;
+            while offset < 8 {
+                payload[idx * 8 + offset] = bytes[offset];
+                offset += 1;
+            }
+            idx += 1;
+        }
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, LinuxErrno> {
+        if payload.len() < Self::ENCODED_LEN {
+            return Err(LinuxErrno::Inval);
+        }
+        let mut values = [0u64; 4];
+        let mut idx = 0;
+        while idx < values.len() {
+            let start = idx * 8;
+            let end = start + 8;
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&payload[start..end]);
+            values[idx] = u64::from_le_bytes(bytes);
+            idx += 1;
+        }
+        Ok(Self::new(values[0], values[1], values[2], values[3]))
     }
 }
 
@@ -374,12 +434,7 @@ fn decode_u64_reply(reply: &[u8]) -> Result<usize, LinuxErrno> {
 }
 
 fn pack_vfs4(a0: usize, a1: usize, a2: usize, a3: usize) -> [u8; 32] {
-    let mut payload = [0u8; 32];
-    payload[0..8].copy_from_slice(&(a0 as u64).to_le_bytes());
-    payload[8..16].copy_from_slice(&(a1 as u64).to_le_bytes());
-    payload[16..24].copy_from_slice(&(a2 as u64).to_le_bytes());
-    payload[24..32].copy_from_slice(&(a3 as u64).to_le_bytes());
-    payload
+    VfsV1Args::new(a0 as u64, a1 as u64, a2 as u64, a3 as u64).encode()
 }
 
 fn pack_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> [u8; 32] {
@@ -783,6 +838,14 @@ mod tests {
     }
 
     #[test]
+    fn vfs_v1_args_codec_roundtrip() {
+        let args = VfsV1Args::new(1, 2, 3, 4);
+        let encoded = args.encode();
+        let decoded = VfsV1Args::decode(&encoded).expect("decode");
+        assert_eq!(decoded, args);
+    }
+
+    #[test]
     fn linux_compat_errno_mapping_stable() {
         assert_eq!(LinuxErrno::Inval.code(), EINVAL);
         assert_eq!(LinuxErrno::Perm.code(), EPERM);
@@ -797,14 +860,13 @@ mod tests {
         let statx = pack_statx(5, 0x2000, 0x4, 0x7FF);
 
         let decode = |payload: [u8; 32]| {
-            let mut out = [0usize; 4];
-            for (i, slot) in out.iter_mut().enumerate() {
-                let mut bytes = [0u8; 8];
-                let start = i * 8;
-                bytes.copy_from_slice(&payload[start..start + 8]);
-                *slot = u64::from_le_bytes(bytes) as usize;
-            }
-            out
+            let args = VfsV1Args::decode(&payload).expect("decode");
+            [
+                args.arg0 as usize,
+                args.arg1 as usize,
+                args.arg2 as usize,
+                args.arg3 as usize,
+            ]
         };
 
         assert_eq!(decode(epoll), [4, 2, 9, 0xABC0]);
@@ -818,6 +880,10 @@ mod tests {
         assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 20);
         assert_eq!(LINUX_PROC_SERVER_ABI_VERSION, 1);
         assert_eq!(LINUX_VFS_SERVER_ABI_VERSION, 1);
+        assert_eq!(PROC_CODEC_V2_VERSION, 2);
+        assert_eq!(ProcV2Args::VERSION, PROC_CODEC_V2_VERSION);
+        assert_eq!(VFS_CODEC_V1_VERSION, 1);
+        assert_eq!(VfsV1Args::VERSION, VFS_CODEC_V1_VERSION);
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_EXIT),
             Ok(LinuxCompatSyscall::Exit)
@@ -1323,6 +1389,63 @@ mod tests {
         }
         assert_eq!(proc_count, 3);
         assert_eq!(vfs_count, 3);
+    }
+
+    #[test]
+    fn linux_personality_mixed_flow_with_notification_route_is_deterministic() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut bindings = LinuxServiceBindings::default();
+
+        let (_proc_req_ep, proc_req_send, proc_req_recv) =
+            state.create_endpoint(16).expect("proc req");
+        let (_proc_rep_ep, proc_rep_send, proc_rep_recv) =
+            state.create_endpoint(16).expect("proc rep");
+        bindings
+            .register_process_manager(&state, proc_req_send, proc_rep_recv)
+            .expect("register proc");
+
+        let (_vfs_req_ep, vfs_req_send, vfs_req_recv) = state.create_endpoint(16).expect("vfs req");
+        let (_vfs_rep_ep, vfs_rep_send, vfs_rep_recv) = state.create_endpoint(16).expect("vfs rep");
+        bindings
+            .register_vfs_manager(&state, vfs_req_send, vfs_rep_recv)
+            .expect("register vfs");
+
+        let (_notif, notif_cap, notif_recv) = state.create_notification(8).expect("notif");
+        state.bind_irq_notification(9, notif_cap).expect("bind");
+
+        state
+            .ipc_send(
+                proc_rep_send,
+                Message::with_header(0, PROC_OP_GETPID, 0, None, &700u64.to_le_bytes())
+                    .expect("pid"),
+            )
+            .expect("seed pid");
+        state
+            .ipc_send(
+                vfs_rep_send,
+                Message::with_header(0, VFS_OP_OPENAT, 0, None, &11u64.to_le_bytes()).expect("fd"),
+            )
+            .expect("seed fd");
+
+        let mut getpid = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &bindings, &mut getpid);
+        assert_eq!(getpid.ret0, 700);
+
+        state
+            .handle_trap_event(crate::kernel::trap::TrapEvent::external_interrupt(9), None)
+            .expect("irq");
+
+        let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x1234, 0, 0, 0, 0]);
+        dispatch(&mut state, &bindings, &mut openat);
+        assert_eq!(openat.ret0, 11);
+
+        let proc_req = state.ipc_recv(proc_req_recv).expect("recv").expect("msg");
+        let vfs_req = state.ipc_recv(vfs_req_recv).expect("recv").expect("msg");
+        let notif = state.ipc_recv(notif_recv).expect("recv").expect("msg");
+
+        assert_eq!(proc_req.opcode, PROC_OP_GETPID);
+        assert_eq!(vfs_req.opcode, VFS_OP_OPENAT);
+        assert_eq!(notif.opcode, 9);
     }
 
     #[test]
