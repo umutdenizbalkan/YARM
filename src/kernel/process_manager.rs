@@ -192,27 +192,36 @@ impl ProcessManagerLite {
             .unwrap_or(pid.saturating_sub(1))
     }
 
-    fn wait_result(&self, target_pid: u64) -> WaitPidV2Result {
-        if let Some(record) = self
+    fn wait_result(&mut self, target_pid: u64) -> WaitPidV2Result {
+        if let Some((idx, record)) = self
             .table
             .iter()
-            .flatten()
-            .find(|record| record.pid == target_pid)
+            .enumerate()
+            .find_map(|(idx, slot)| slot.map(|record| (idx, record)))
+            .filter(|(_, record)| record.pid == target_pid)
         {
-            WaitPidV2Result {
+            let result = WaitPidV2Result {
                 waited_pid: target_pid,
                 exit_code: if record.exited {
                     record.exit_code
                 } else {
                     u64::MAX
                 },
+            };
+            if record.exited {
+                self.table[idx] = None;
             }
+            result
         } else {
             WaitPidV2Result {
                 waited_pid: target_pid,
                 exit_code: u64::MAX,
             }
         }
+    }
+
+    pub fn live_process_count(&self) -> usize {
+        self.table.iter().flatten().count()
     }
 
     pub fn handle_request(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
@@ -350,6 +359,33 @@ mod tests {
             ProcessManagerLite::parse_request(msg),
             Err(ProcessManagerError::InvalidTransport)
         );
+    }
+
+    #[test]
+    fn waitpid_reaps_exited_child() {
+        let mut pm = ProcessManagerLite::new();
+        let spawn = Message::with_header(
+            0,
+            PROC_OP_SPAWN_V2,
+            0,
+            None,
+            &ProcV2Args::new(1, 2).encode(),
+        )
+        .expect("spawn");
+        let spawn_reply = pm.handle_request(spawn).expect("spawn reply");
+        let spawned = SpawnV2Result::decode(spawn_reply.as_slice()).expect("decode");
+        pm.mark_exit(spawned.pid, 4).expect("exit");
+
+        let wait = Message::with_header(
+            0,
+            PROC_OP_WAITPID_V2,
+            0,
+            None,
+            &ProcV2Args::new(1, spawned.pid).encode(),
+        )
+        .expect("wait");
+        let _ = pm.handle_request(wait).expect("wait reply");
+        assert_eq!(pm.live_process_count(), 0);
     }
 
     #[test]

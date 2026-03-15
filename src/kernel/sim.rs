@@ -23,6 +23,73 @@ pub struct SimSummary {
     pub vfs_requests: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scenario {
+    pub name: &'static str,
+    pub steps: &'static [SimStep],
+    pub expected_getpid: usize,
+    pub expected_openat: usize,
+    pub expected_irq: Option<u16>,
+    pub expected_proc_requests: usize,
+    pub expected_vfs_requests: usize,
+}
+
+pub fn scenario_catalog() -> &'static [Scenario] {
+    const MIXED: [SimStep; 5] = [
+        SimStep::SeedGetPid(500),
+        SimStep::SeedOpenAt(3),
+        SimStep::SysGetPid,
+        SimStep::ExternalIrq(9),
+        SimStep::SysOpenAt(0x1000),
+    ];
+    const PROC_HEAVY: [SimStep; 4] = [
+        SimStep::SeedGetPid(100),
+        SimStep::SeedGetPid(101),
+        SimStep::SysGetPid,
+        SimStep::SysGetPid,
+    ];
+    const VFS_HEAVY: [SimStep; 4] = [
+        SimStep::SeedOpenAt(11),
+        SimStep::SeedOpenAt(12),
+        SimStep::SysOpenAt(0x2000),
+        SimStep::SysOpenAt(0x3000),
+    ];
+    const SCENARIOS: [Scenario; 3] = [
+        Scenario {
+            name: "mixed_irq_proc_vfs",
+            steps: &MIXED,
+            expected_getpid: 500,
+            expected_openat: 3,
+            expected_irq: Some(9),
+            expected_proc_requests: 1,
+            expected_vfs_requests: 1,
+        },
+        Scenario {
+            name: "proc_heavy",
+            steps: &PROC_HEAVY,
+            expected_getpid: 101,
+            expected_openat: 0,
+            expected_irq: None,
+            expected_proc_requests: 2,
+            expected_vfs_requests: 0,
+        },
+        Scenario {
+            name: "vfs_heavy",
+            steps: &VFS_HEAVY,
+            expected_getpid: 0,
+            expected_openat: 12,
+            expected_irq: None,
+            expected_proc_requests: 0,
+            expected_vfs_requests: 2,
+        },
+    ];
+    &SCENARIOS
+}
+
+pub fn run_scenario(scenario: &Scenario) -> Result<SimSummary, KernelError> {
+    run_deterministic_script(scenario.steps)
+}
+
 pub fn run_deterministic_script(steps: &[SimStep]) -> Result<SimSummary, KernelError> {
     let mut state = Bootstrap::init()?;
     let mut bindings = LinuxServiceBindings::default();
@@ -93,19 +160,48 @@ mod tests {
 
     #[test]
     fn deterministic_simulation_replays_mixed_subsystems() {
-        let summary = run_deterministic_script(&[
-            SimStep::SeedGetPid(500),
-            SimStep::SeedOpenAt(3),
-            SimStep::SysGetPid,
-            SimStep::ExternalIrq(9),
-            SimStep::SysOpenAt(0x1000),
-        ])
-        .expect("sim");
+        let scenario = scenario_catalog()
+            .iter()
+            .find(|scenario| scenario.name == "mixed_irq_proc_vfs")
+            .expect("scenario");
+        let summary = run_scenario(scenario).expect("sim");
 
-        assert_eq!(summary.last_getpid, 500);
-        assert_eq!(summary.last_openat, 3);
-        assert_eq!(summary.last_irq_opcode, Some(9));
-        assert_eq!(summary.proc_requests, 1);
-        assert_eq!(summary.vfs_requests, 1);
+        assert_eq!(summary.last_getpid, scenario.expected_getpid);
+        assert_eq!(summary.last_openat, scenario.expected_openat);
+        assert_eq!(summary.last_irq_opcode, scenario.expected_irq);
+        assert_eq!(summary.proc_requests, scenario.expected_proc_requests);
+        assert_eq!(summary.vfs_requests, scenario.expected_vfs_requests);
+    }
+
+    #[test]
+    fn scenario_catalog_replays_all_with_expected_results() {
+        for scenario in scenario_catalog() {
+            let summary = run_scenario(scenario).expect("sim");
+            assert_eq!(
+                summary.last_getpid, scenario.expected_getpid,
+                "{}",
+                scenario.name
+            );
+            assert_eq!(
+                summary.last_openat, scenario.expected_openat,
+                "{}",
+                scenario.name
+            );
+            assert_eq!(
+                summary.last_irq_opcode, scenario.expected_irq,
+                "{}",
+                scenario.name
+            );
+            assert_eq!(
+                summary.proc_requests, scenario.expected_proc_requests,
+                "{}",
+                scenario.name
+            );
+            assert_eq!(
+                summary.vfs_requests, scenario.expected_vfs_requests,
+                "{}",
+                scenario.name
+            );
+        }
     }
 }

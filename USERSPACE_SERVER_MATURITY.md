@@ -28,6 +28,10 @@ This plan tracks the transition from mechanism-complete kernel internals to prod
    - Restart/revoke behavior is test-covered for driver-facing runtime caps.
    - Process-manager wait/reap permissions are test-covered.
 
+5. **Scenario harness gate**
+   - Reusable deterministic scenario catalog is present.
+   - All catalog scenarios must replay to fixed expected summaries (proc/vfs/irq + request counts).
+
 ## Constraints
 
 - Keep kernel code `#![no_std]` and avoid `std` usage in mechanism paths.

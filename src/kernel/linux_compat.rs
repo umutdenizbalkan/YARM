@@ -864,6 +864,39 @@ mod tests {
     }
 
     #[test]
+    fn codec_fixture_vectors_are_frozen() {
+        let fixtures_proc = [
+            (ProcV2Args::new(0, 0), [0u8; 16]),
+            (ProcV2Args::new(1, 2), {
+                let mut b = [0u8; 16];
+                b[..8].copy_from_slice(&1u64.to_le_bytes());
+                b[8..16].copy_from_slice(&2u64.to_le_bytes());
+                b
+            }),
+        ];
+        for (args, expected) in fixtures_proc {
+            assert_eq!(args.encode(), expected);
+            assert_eq!(ProcV2Args::decode(&expected).expect("decode"), args);
+        }
+
+        let fixtures_vfs = [
+            VfsV1Args::new(0, 0, 0, 0),
+            VfsV1Args::new(9, 8, 7, 6),
+            VfsV1Args::new(u64::MAX, 1, 2, 3),
+        ];
+        for args in fixtures_vfs {
+            let encoded = args.encode();
+            assert_eq!(VfsV1Args::decode(&encoded).expect("decode"), args);
+        }
+    }
+
+    #[test]
+    fn codec_rejects_truncated_payloads() {
+        assert_eq!(ProcV2Args::decode(&[0u8; 15]), Err(LinuxErrno::Inval));
+        assert_eq!(VfsV1Args::decode(&[0u8; 31]), Err(LinuxErrno::Inval));
+    }
+
+    #[test]
     fn linux_compat_errno_mapping_stable() {
         assert_eq!(LinuxErrno::Inval.code(), EINVAL);
         assert_eq!(LinuxErrno::Perm.code(), EPERM);

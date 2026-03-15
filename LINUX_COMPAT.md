@@ -99,3 +99,6 @@ The compatibility test suite now includes an end-to-end personality shim flow (`
 The compatibility test suite also includes a deterministic mixed syscall sequence (`getpid`/`openat`) to ensure stable cross-server routing behavior over repeated dispatch cycles.
 
 The compatibility suite further validates deterministic mixed server flow with IRQ notification routing (`getpid` + IRQ notification + `openat`) so server IPC and notification delivery remain stable under interleaving.
+
+
+The compatibility-gate suite now includes golden fixture vectors and truncated-payload rejection checks for `ProcV2Args` and `VfsV1Args`, so any wire-format drift fails tests immediately.

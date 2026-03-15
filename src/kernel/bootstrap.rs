@@ -672,14 +672,46 @@ impl KernelState {
             .map(|entry| entry.role)
     }
 
+    fn can_delegate_service(
+        &self,
+        delegator_role: ServiceRole,
+        receiver_role: ServiceRole,
+    ) -> bool {
+        matches!(
+            (delegator_role, receiver_role),
+            (ServiceRole::Init, ServiceRole::ProcessManager)
+                | (ServiceRole::Init, ServiceRole::Vfs)
+                | (ServiceRole::Init, ServiceRole::Driver)
+                | (ServiceRole::Init, ServiceRole::Supervisor)
+                | (ServiceRole::Supervisor, ServiceRole::Driver)
+                | (ServiceRole::Supervisor, ServiceRole::Vfs)
+        )
+    }
+
+    pub fn validate_service_delegation(
+        &self,
+        delegator_tid: u64,
+        receiver_tid: u64,
+    ) -> Result<(), KernelError> {
+        let Some(delegator_role) = self.service_role(ThreadId(delegator_tid)) else {
+            return Err(KernelError::MissingRight);
+        };
+        let Some(receiver_role) = self.service_role(ThreadId(receiver_tid)) else {
+            return Err(KernelError::WrongObject);
+        };
+        if self.can_delegate_service(delegator_role, receiver_role) {
+            Ok(())
+        } else {
+            Err(KernelError::MissingRight)
+        }
+    }
+
     pub fn delegate_driver_bundle_checked(
         &mut self,
         delegator_tid: u64,
         plan: DriverBundlePlan,
     ) -> Result<DriverDelegationBundle, KernelError> {
-        if self.service_role(ThreadId(delegator_tid)) != Some(ServiceRole::Init) {
-            return Err(KernelError::MissingRight);
-        }
+        self.validate_service_delegation(delegator_tid, plan.server_tid.0)?;
         if self.service_role(plan.server_tid) != Some(ServiceRole::Driver) {
             return Err(KernelError::WrongObject);
         }
@@ -2956,6 +2988,67 @@ mod tests {
             },
         );
         assert_eq!(bad, Err(KernelError::MissingRight));
+    }
+
+    #[test]
+    fn rendezvous_delivery_is_single_copy_and_no_sender_stuck() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(80).expect("sender");
+        state.register_task(81).expect("receiver");
+
+        let (_eid, send_cap, recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+
+        state.scheduler.enqueue(81).expect("enqueue receiver");
+        let mut recv_tf = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 8, 0x1100, 0, 0, 0],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut recv_tf))
+            .expect("recv trap");
+
+        state.scheduler.enqueue(80).expect("enqueue sender");
+        state
+            .ipc_send(send_cap, Message::new(80, b"rv").expect("msg"))
+            .expect("send");
+
+        let delivered = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(delivered.as_slice(), b"rv");
+        assert!(state.ipc_recv(recv_cap).expect("recv2").is_none());
+        assert_eq!(state.task_status(80), Some(TaskStatus::Runnable));
+
+        let t = state.ipc_path_telemetry();
+        assert!(t.rendezvous_handoffs >= 1);
+        assert!(t.fastpath_attempts >= t.fastpath_switches);
+    }
+
+    #[test]
+    fn service_delegation_graph_allows_only_expected_edges() {
+        let mut state = Bootstrap::init().expect("init");
+        for tid in 90..=93 {
+            state.register_task(tid).expect("task");
+        }
+        state
+            .register_service_role(90, ServiceRole::Init)
+            .expect("role init");
+        state
+            .register_service_role(91, ServiceRole::Supervisor)
+            .expect("role sup");
+        state
+            .register_service_role(92, ServiceRole::Driver)
+            .expect("role drv");
+        state
+            .register_service_role(93, ServiceRole::ProcessManager)
+            .expect("role proc");
+
+        assert!(state.validate_service_delegation(90, 93).is_ok());
+        assert!(state.validate_service_delegation(91, 92).is_ok());
+        assert_eq!(
+            state.validate_service_delegation(92, 93),
+            Err(KernelError::MissingRight)
+        );
     }
 
     #[test]
