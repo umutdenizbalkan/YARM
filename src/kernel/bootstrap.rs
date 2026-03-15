@@ -65,6 +65,21 @@ pub struct ClassPolicySnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserImageSpec {
+    pub tid: u64,
+    pub entry: usize,
+    pub asid: Option<Asid>,
+    pub class: TaskClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnedUserTask {
+    pub tid: u64,
+    pub entry: usize,
+    pub asid: Option<Asid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceRole {
     Init,
     ProcessManager,
@@ -1299,6 +1314,22 @@ impl KernelState {
         self.register_task_with_class(tid, TaskClass::App)
     }
 
+    pub fn spawn_user_task_from_image(
+        &mut self,
+        spec: UserImageSpec,
+    ) -> Result<SpawnedUserTask, KernelError> {
+        self.register_task_with_class(spec.tid, spec.class)?;
+        if let Some(tcb) = self.tcb_mut(spec.tid) {
+            tcb.asid = spec.asid;
+            tcb.status = TaskStatus::Runnable;
+        }
+        Ok(SpawnedUserTask {
+            tid: spec.tid,
+            entry: spec.entry,
+            asid: spec.asid,
+        })
+    }
+
     fn dispatch_next_task(&mut self) -> Result<Option<u64>, KernelError> {
         let next = self.scheduler.dispatch_next();
         if let Some(tid) = next {
@@ -2068,6 +2099,25 @@ mod tests {
         assert_eq!(state.online_cpu_count(), 1);
         assert_eq!(state.scheduler.current_tid().expect("boot task"), 0);
         assert_eq!(state.task_status(0), Some(TaskStatus::Running));
+    }
+
+    #[test]
+    fn spawn_user_task_from_image_registers_asid_and_class() {
+        let mut state = Bootstrap::init().expect("init");
+        let spawned = state
+            .spawn_user_task_from_image(UserImageSpec {
+                tid: 55,
+                entry: 0x8000,
+                asid: Some(Asid(9)),
+                class: TaskClass::SystemServer,
+            })
+            .expect("spawn");
+        assert_eq!(spawned.tid, 55);
+        assert_eq!(spawned.entry, 0x8000);
+        assert_eq!(spawned.asid, Some(Asid(9)));
+        let tcb = state.tcb_mut(55).expect("tcb");
+        assert_eq!(tcb.class, TaskClass::SystemServer);
+        assert_eq!(tcb.asid, Some(Asid(9)));
     }
 
     #[test]

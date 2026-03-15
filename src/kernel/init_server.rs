@@ -8,6 +8,42 @@ pub enum InitBootPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupCap {
+    EndpointFactory,
+    MemoryObjectFactory,
+    IrqControl,
+    Clock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupCapSet {
+    pub endpoint_factory: bool,
+    pub memory_object_factory: bool,
+    pub irq_control: bool,
+    pub clock: bool,
+}
+
+impl StartupCapSet {
+    pub const fn core_required_minimum() -> Self {
+        Self {
+            endpoint_factory: true,
+            memory_object_factory: true,
+            irq_control: false,
+            clock: false,
+        }
+    }
+
+    pub const fn contains(self, cap: StartupCap) -> bool {
+        match cap {
+            StartupCap::EndpointFactory => self.endpoint_factory,
+            StartupCap::MemoryObjectFactory => self.memory_object_factory,
+            StartupCap::IrqControl => self.irq_control,
+            StartupCap::Clock => self.clock,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoreServiceGraph {
     pub init_tid: u64,
     pub process_manager_tid: u64,
@@ -26,6 +62,7 @@ pub struct CoreServiceHandles {
 pub struct InitServerLite {
     phase: InitBootPhase,
     handles: CoreServiceHandles,
+    startup_caps: StartupCapSet,
 }
 
 impl Default for InitServerLite {
@@ -43,6 +80,7 @@ impl InitServerLite {
                 vfs_tid: None,
                 supervisor_tid: None,
             },
+            startup_caps: StartupCapSet::core_required_minimum(),
         }
     }
 
@@ -54,11 +92,31 @@ impl InitServerLite {
         self.handles
     }
 
+    pub const fn startup_caps(&self) -> StartupCapSet {
+        self.startup_caps
+    }
+
+    pub fn set_startup_caps(&mut self, caps: StartupCapSet) {
+        self.startup_caps = caps;
+    }
+
+    pub fn validate_startup_caps(&self) -> Result<(), KernelError> {
+        let min = StartupCapSet::core_required_minimum();
+        if min.endpoint_factory && !self.startup_caps.endpoint_factory {
+            return Err(KernelError::MissingRight);
+        }
+        if min.memory_object_factory && !self.startup_caps.memory_object_factory {
+            return Err(KernelError::MissingRight);
+        }
+        Ok(())
+    }
+
     pub fn register_core_graph(
         &mut self,
         kernel: &mut KernelState,
         graph: CoreServiceGraph,
     ) -> Result<(), KernelError> {
+        self.validate_startup_caps()?;
         kernel.register_task(graph.init_tid)?;
         kernel.register_task(graph.process_manager_tid)?;
         kernel.register_task(graph.vfs_tid)?;
@@ -110,6 +168,28 @@ impl InitServerLite {
 mod tests {
     use super::*;
     use crate::kernel::bootstrap::Bootstrap;
+
+    #[test]
+    fn init_server_requires_minimum_startup_caps() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitServerLite::new();
+        init.set_startup_caps(StartupCapSet {
+            endpoint_factory: false,
+            memory_object_factory: true,
+            irq_control: false,
+            clock: false,
+        });
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        assert_eq!(
+            init.register_core_graph(&mut state, graph),
+            Err(KernelError::MissingRight)
+        );
+    }
 
     #[test]
     fn init_server_registers_core_graph_and_enters_running() {

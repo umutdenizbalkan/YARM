@@ -189,6 +189,117 @@ impl VfsBackend for InMemoryBackend {
     }
 }
 
+pub const DEV_CONSOLE_PATH_PTR: u64 = 0x434F_4E53_4F4C_4500;
+pub const INITRAMFS_BUSYBOX_PATH_PTR: u64 = 0x494E_4954_4255_5359;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadOnlyInitramfsBackend {
+    opened_fd: Option<u64>,
+    file_len: u64,
+}
+
+impl Default for ReadOnlyInitramfsBackend {
+    fn default() -> Self {
+        Self::new(4096)
+    }
+}
+
+impl ReadOnlyInitramfsBackend {
+    pub const fn new(file_len: u64) -> Self {
+        Self {
+            opened_fd: None,
+            file_len,
+        }
+    }
+}
+
+impl VfsBackend for ReadOnlyInitramfsBackend {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        if path_ptr != INITRAMFS_BUSYBOX_PATH_PTR {
+            return Err(VfsLiteError::BadFd);
+        }
+        self.opened_fd = Some(10);
+        Ok(10)
+    }
+
+    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+        if self.opened_fd == Some(fd) {
+            self.opened_fd = None;
+            Ok(0)
+        } else {
+            Err(VfsLiteError::BadFd)
+        }
+    }
+
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        if self.opened_fd != Some(fd) {
+            return Err(VfsLiteError::BadFd);
+        }
+        Ok(core::cmp::min(len, self.file_len))
+    }
+
+    fn write(&mut self, fd: u64, _len: u64) -> Result<u64, VfsLiteError> {
+        if self.opened_fd != Some(fd) {
+            return Err(VfsLiteError::BadFd);
+        }
+        Err(VfsLiteError::Unsupported)
+    }
+
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        if path_ptr == INITRAMFS_BUSYBOX_PATH_PTR {
+            Ok(self.file_len)
+        } else {
+            Err(VfsLiteError::BadFd)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConsoleBackend {
+    open_console_fd: Option<u64>,
+}
+
+impl VfsBackend for ConsoleBackend {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        if path_ptr != DEV_CONSOLE_PATH_PTR {
+            return Err(VfsLiteError::BadFd);
+        }
+        self.open_console_fd = Some(3);
+        Ok(3)
+    }
+
+    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+        if self.open_console_fd == Some(fd) {
+            self.open_console_fd = None;
+            Ok(0)
+        } else {
+            Err(VfsLiteError::BadFd)
+        }
+    }
+
+    fn read(&mut self, fd: u64, _len: u64) -> Result<u64, VfsLiteError> {
+        if self.open_console_fd != Some(fd) {
+            return Err(VfsLiteError::BadFd);
+        }
+        Ok(0)
+    }
+
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        if self.open_console_fd != Some(fd) {
+            return Err(VfsLiteError::BadFd);
+        }
+        Ok(len)
+    }
+
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        if path_ptr == DEV_CONSOLE_PATH_PTR {
+            Ok(0)
+        } else {
+            Err(VfsLiteError::BadFd)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct VfsLiteService<B: VfsBackend = InMemoryBackend> {
     backend: B,
@@ -274,6 +385,54 @@ mod tests {
 
     fn pack(a0: u64, a1: u64, a2: u64, a3: u64) -> [u8; 32] {
         VfsV1Args::new(a0, a1, a2, a3).encode()
+    }
+
+    #[test]
+    fn initramfs_backend_is_read_only_and_resolves_busybox() {
+        let mut svc = VfsLiteService::with_backend(ReadOnlyInitramfsBackend::new(2048));
+        let open = Message::with_header(
+            0,
+            VFS_OP_OPENAT,
+            0,
+            None,
+            &pack(0, INITRAMFS_BUSYBOX_PATH_PTR, 0, 0),
+        )
+        .expect("open");
+        let open_rep = svc.handle_request(open).expect("open rep");
+        let mut fd_bytes = [0u8; 8];
+        fd_bytes.copy_from_slice(open_rep.as_slice());
+        let fd = u64::from_le_bytes(fd_bytes);
+
+        let read =
+            Message::with_header(0, VFS_OP_READ, 0, None, &pack(fd, 0, 512, 0)).expect("read");
+        let read_rep = svc.handle_request(read).expect("read rep");
+        assert_eq!(read_rep.opcode, VFS_OP_READ);
+
+        let write =
+            Message::with_header(0, VFS_OP_WRITE, 0, None, &pack(fd, 0, 1, 0)).expect("write");
+        assert_eq!(svc.handle_request(write), Err(VfsLiteError::Unsupported));
+    }
+
+    #[test]
+    fn console_backend_exposes_dev_console_write() {
+        let mut svc = VfsLiteService::with_backend(ConsoleBackend::default());
+        let open = Message::with_header(
+            0,
+            VFS_OP_OPENAT,
+            0,
+            None,
+            &pack(0, DEV_CONSOLE_PATH_PTR, 0, 0),
+        )
+        .expect("open");
+        let open_rep = svc.handle_request(open).expect("open rep");
+        let mut fd_bytes = [0u8; 8];
+        fd_bytes.copy_from_slice(open_rep.as_slice());
+        let fd = u64::from_le_bytes(fd_bytes);
+
+        let write =
+            Message::with_header(0, VFS_OP_WRITE, 0, None, &pack(fd, 0, 32, 0)).expect("write");
+        let write_rep = svc.handle_request(write).expect("write rep");
+        assert_eq!(write_rep.opcode, VFS_OP_WRITE);
     }
 
     #[test]

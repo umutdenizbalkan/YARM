@@ -50,6 +50,28 @@ impl SpawnV2Result {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElfImageInfo {
+    pub entry: u64,
+    pub image_id: u64,
+}
+
+impl ElfImageInfo {
+    pub fn parse(image_id: u64, image: &[u8]) -> Result<Self, ProcessManagerError> {
+        if image.len() < 32 {
+            return Err(ProcessManagerError::Malformed);
+        }
+        if &image[..4] != b"ELF" {
+            return Err(ProcessManagerError::Malformed);
+        }
+        let mut entry = [0u8; 8];
+        entry.copy_from_slice(&image[24..32]);
+        Ok(Self {
+            entry: u64::from_le_bytes(entry),
+            image_id,
+        })
+    }
+}
+
 pub struct WaitPidV2Result {
     pub waited_pid: u64,
     pub exit_code: u64,
@@ -294,6 +316,16 @@ impl ProcessService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elf_image_info_parser_accepts_minimal_elf64_header() {
+        let mut image = [0u8; 64];
+        image[..4].copy_from_slice(b"ELF");
+        image[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
+        let info = ElfImageInfo::parse(7, &image).expect("elf");
+        assert_eq!(info.image_id, 7);
+        assert_eq!(info.entry, 0x401000);
+    }
 
     #[test]
     fn process_manager_parses_v2_payloads() {
