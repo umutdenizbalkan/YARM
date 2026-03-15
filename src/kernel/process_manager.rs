@@ -11,6 +11,7 @@ pub enum ProcessManagerError {
     Unsupported,
     TableFull,
     UnknownProcess,
+    InvalidTransport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +115,10 @@ impl ProcessManagerLite {
     }
 
     pub fn parse_request(msg: Message) -> Result<ProcessRequest, ProcessManagerError> {
+        if msg.transferred_cap().is_some() || (msg.flags & Message::FLAG_CAP_TRANSFER) != 0 {
+            return Err(ProcessManagerError::InvalidTransport);
+        }
+
         match msg.opcode {
             PROC_OP_GETPID => Ok(ProcessRequest::GetPid {
                 tid: Self::read_u64(msg.as_slice())?,
@@ -233,6 +238,45 @@ impl ProcessManagerLite {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct ProcessService {
+    manager: ProcessManagerLite,
+    handled: usize,
+}
+
+impl ProcessService {
+    pub const fn new() -> Self {
+        Self {
+            manager: ProcessManagerLite::new(),
+            handled: 0,
+        }
+    }
+
+    pub const fn handled_count(&self) -> usize {
+        self.handled
+    }
+
+    pub fn mark_exit(&mut self, pid: u64, code: u64) -> Result<(), ProcessManagerError> {
+        self.manager.mark_exit(pid, code)
+    }
+
+    pub fn handle(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
+        let reply = self.manager.handle_request(request)?;
+        self.handled = self.handled.saturating_add(1);
+        Ok(reply)
+    }
+
+    pub fn handle_batch(
+        &mut self,
+        requests: impl IntoIterator<Item = Message>,
+    ) -> Result<usize, ProcessManagerError> {
+        for request in requests {
+            self.handle(request)?;
+        }
+        Ok(self.handled)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +329,40 @@ mod tests {
         let waited = WaitPidV2Result::decode(wait_reply.as_slice()).expect("decode");
         assert_eq!(waited.waited_pid, spawned.pid);
         assert_eq!(waited.exit_code, 17);
+    }
+
+    #[test]
+    fn process_manager_rejects_cap_transport() {
+        let msg = Message::with_header(
+            0,
+            PROC_OP_GETPID,
+            Message::FLAG_CAP_TRANSFER,
+            Some(9),
+            &7u64.to_le_bytes(),
+        )
+        .expect("msg");
+        assert_eq!(
+            ProcessManagerLite::parse_request(msg),
+            Err(ProcessManagerError::InvalidTransport)
+        );
+    }
+
+    #[test]
+    fn process_service_tracks_batch_handled() {
+        let mut service = ProcessService::new();
+        let spawn = Message::with_header(
+            0,
+            PROC_OP_SPAWN_V2,
+            0,
+            None,
+            &ProcV2Args::new(1, 2).encode(),
+        )
+        .expect("spawn");
+        let getpid =
+            Message::with_header(0, PROC_OP_GETPID, 0, None, &42u64.to_le_bytes()).expect("getpid");
+
+        let handled = service.handle_batch([spawn, getpid]).expect("batch");
+        assert_eq!(handled, 2);
+        assert_eq!(service.handled_count(), 2);
     }
 }
