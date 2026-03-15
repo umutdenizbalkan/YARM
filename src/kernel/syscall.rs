@@ -1,10 +1,11 @@
 use super::bootstrap::{KernelError, KernelState};
 use super::capabilities::{CapId, CapObject};
-use super::ipc::{Message, SharedMemoryRegion};
+use super::ipc::{
+    IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
+};
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
 use super::vm::VirtAddr;
-use crate::arch::ipc::{IPC_REGISTER_BYTES, pack_register_payload, unpack_register_payload};
 
 pub const SYSCALL_ABI_VERSION: u16 = 2;
 pub const SYSCALL_YIELD_NR: usize = 0;
@@ -295,13 +296,14 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::ipc::IPC_REGISTER_WORDS;
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
         assert_eq!(SYSCALL_ABI_VERSION, 2);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
-        assert_eq!(crate::arch::ipc::IPC_REGISTER_WORDS, 2);
+        assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
     #[test]
