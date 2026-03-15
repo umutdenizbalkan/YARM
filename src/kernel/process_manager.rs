@@ -216,13 +216,12 @@ impl ProcessManagerLite {
         Ok(())
     }
 
-    fn lookup_parent(&self, pid: u64) -> u64 {
+    fn lookup_parent(&self, pid: u64) -> Option<u64> {
         self.table
             .iter()
             .flatten()
             .find(|record| record.pid == pid)
             .map(|record| record.parent_pid)
-            .unwrap_or(pid.saturating_sub(1))
     }
 
     fn wait_result(&mut self, target_pid: u64) -> WaitPidV2Result {
@@ -260,9 +259,10 @@ impl ProcessManagerLite {
     pub fn handle_request(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
         match Self::parse_request(request)? {
             ProcessRequest::GetPid { tid } => Self::u64_reply(PROC_OP_GETPID, tid),
-            ProcessRequest::GetPpid { tid } => {
-                Self::u64_reply(PROC_OP_GETPPID, self.lookup_parent(tid))
-            }
+            ProcessRequest::GetPpid { tid } => Self::u64_reply(
+                PROC_OP_GETPPID,
+                self.lookup_parent(tid).unwrap_or(tid.saturating_sub(1)),
+            ),
             ProcessRequest::Exit { .. } => Self::u64_reply(PROC_OP_EXIT, 0),
             ProcessRequest::SpawnV2(req) => {
                 let _ = req.image_id;
@@ -272,10 +272,13 @@ impl ProcessManagerLite {
                     .map_err(|_| ProcessManagerError::Malformed)
             }
             ProcessRequest::WaitPidV2(req) => {
-                if req.caller_tid != req.target_tid
-                    && self.lookup_parent(req.target_tid) != req.caller_tid
-                {
-                    return Err(ProcessManagerError::PermissionDenied);
+                if req.caller_tid != req.target_tid {
+                    let Some(parent) = self.lookup_parent(req.target_tid) else {
+                        return Err(ProcessManagerError::PermissionDenied);
+                    };
+                    if parent != req.caller_tid {
+                        return Err(ProcessManagerError::PermissionDenied);
+                    }
                 }
                 let result = self.wait_result(req.target_tid);
                 Message::with_header(0, PROC_OP_WAITPID_V2, 0, None, &result.encode())
@@ -466,6 +469,23 @@ mod tests {
             0,
             None,
             &ProcV2Args::new(99, spawned.pid).encode(),
+        )
+        .expect("wait");
+        assert_eq!(
+            pm.handle_request(wait),
+            Err(ProcessManagerError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn waitpid_rejects_unknown_target() {
+        let mut pm = ProcessManagerLite::new();
+        let wait = Message::with_header(
+            0,
+            PROC_OP_WAITPID_V2,
+            0,
+            None,
+            &ProcV2Args::new(1, 4242).encode(),
         )
         .expect("wait");
         assert_eq!(

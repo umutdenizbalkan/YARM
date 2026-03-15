@@ -63,6 +63,62 @@ pub struct CoreServiceHandles {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreServiceKind {
+    ProcessManager,
+    Vfs,
+    Supervisor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceRestartPolicy {
+    pub max_restarts: u8,
+    pub backoff_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreServicePolicyTable {
+    pub process_manager: ServiceRestartPolicy,
+    pub vfs: ServiceRestartPolicy,
+    pub supervisor: ServiceRestartPolicy,
+}
+
+impl CoreServicePolicyTable {
+    pub const fn baseline() -> Self {
+        Self {
+            process_manager: ServiceRestartPolicy {
+                max_restarts: 3,
+                backoff_ticks: 10,
+            },
+            vfs: ServiceRestartPolicy {
+                max_restarts: 3,
+                backoff_ticks: 10,
+            },
+            supervisor: ServiceRestartPolicy {
+                max_restarts: 8,
+                backoff_ticks: 5,
+            },
+        }
+    }
+
+    pub const fn policy_for(self, service: CoreServiceKind) -> ServiceRestartPolicy {
+        match service {
+            CoreServiceKind::ProcessManager => self.process_manager,
+            CoreServiceKind::Vfs => self.vfs,
+            CoreServiceKind::Supervisor => self.supervisor,
+        }
+    }
+
+    pub const fn is_sane(self) -> bool {
+        self.process_manager.max_restarts > 0
+            && self.vfs.max_restarts > 0
+            && self.supervisor.max_restarts > 0
+            && self.process_manager.backoff_ticks > 0
+            && self.vfs.backoff_ticks > 0
+            && self.supervisor.backoff_ticks > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoreServiceImagePlan {
     pub process_manager_entry: usize,
     pub vfs_entry: usize,
@@ -88,6 +144,9 @@ pub struct InitServerLite {
     handles: CoreServiceHandles,
     startup_caps: StartupCapSet,
     fault_handoff: Option<InitFaultHandoff>,
+    restart_policies: CoreServicePolicyTable,
+    launch_order: [Option<CoreServiceKind>; 3],
+    launch_count: usize,
 }
 
 impl Default for InitServerLite {
@@ -107,6 +166,9 @@ impl InitServerLite {
             },
             startup_caps: StartupCapSet::core_required_minimum(),
             fault_handoff: None,
+            restart_policies: CoreServicePolicyTable::baseline(),
+            launch_order: [None; 3],
+            launch_count: 0,
         }
     }
 
@@ -124,6 +186,25 @@ impl InitServerLite {
 
     pub const fn fault_handoff(&self) -> Option<InitFaultHandoff> {
         self.fault_handoff
+    }
+
+    pub const fn restart_policies(&self) -> CoreServicePolicyTable {
+        self.restart_policies
+    }
+
+    pub fn set_restart_policies(
+        &mut self,
+        policies: CoreServicePolicyTable,
+    ) -> Result<(), KernelError> {
+        if !policies.is_sane() {
+            return Err(KernelError::InvalidCapability);
+        }
+        self.restart_policies = policies;
+        Ok(())
+    }
+
+    pub const fn launch_order(&self) -> [Option<CoreServiceKind>; 3] {
+        self.launch_order
     }
 
     pub fn set_startup_caps(&mut self, caps: StartupCapSet) {
@@ -173,6 +254,11 @@ impl InitServerLite {
             return Err(KernelError::WrongObject);
         }
         self.phase = InitBootPhase::LaunchingCore;
+        if !self.restart_policies.is_sane() {
+            return Err(KernelError::InvalidCapability);
+        }
+        self.launch_order = [None; 3];
+        self.launch_count = 0;
 
         let proc_tid = self
             .handles
@@ -184,18 +270,24 @@ impl InitServerLite {
             .supervisor_tid
             .ok_or(KernelError::WrongObject)?;
 
+        self.launch_order[self.launch_count] = Some(CoreServiceKind::ProcessManager);
+        self.launch_count += 1;
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid: proc_tid,
             entry: plan.process_manager_entry,
             asid: Some(Asid(11)),
             class: TaskClass::SystemServer,
         })?;
+        self.launch_order[self.launch_count] = Some(CoreServiceKind::Vfs);
+        self.launch_count += 1;
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid: vfs_tid,
             entry: plan.vfs_entry,
             asid: Some(Asid(12)),
             class: TaskClass::SystemServer,
         })?;
+        self.launch_order[self.launch_count] = Some(CoreServiceKind::Supervisor);
+        self.launch_count += 1;
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid: supervisor_tid,
             entry: plan.supervisor_entry,
@@ -323,6 +415,38 @@ mod tests {
     }
 
     #[test]
+    fn launch_order_is_deterministic() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitServerLite::new();
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut state, graph)
+            .expect("register");
+        let _ = init
+            .launch_core_services(
+                &mut state,
+                CoreServiceImagePlan {
+                    process_manager_entry: 0x8000,
+                    vfs_entry: 0x9000,
+                    supervisor_entry: 0xA000,
+                },
+            )
+            .expect("launch");
+        assert_eq!(
+            init.launch_order(),
+            [
+                Some(CoreServiceKind::ProcessManager),
+                Some(CoreServiceKind::Vfs),
+                Some(CoreServiceKind::Supervisor),
+            ]
+        );
+    }
+
+    #[test]
     fn begin_running_requires_fault_handoff() {
         let mut state = Bootstrap::init().expect("init");
         let mut init = InitServerLite::new();
@@ -344,6 +468,29 @@ mod tests {
         )
         .expect("launch");
         assert_eq!(init.begin_running(), Err(KernelError::WrongObject));
+    }
+
+    #[test]
+    fn rejects_invalid_restart_policies() {
+        let mut init = InitServerLite::new();
+        let bad = CoreServicePolicyTable {
+            process_manager: ServiceRestartPolicy {
+                max_restarts: 0,
+                backoff_ticks: 1,
+            },
+            vfs: ServiceRestartPolicy {
+                max_restarts: 1,
+                backoff_ticks: 1,
+            },
+            supervisor: ServiceRestartPolicy {
+                max_restarts: 1,
+                backoff_ticks: 1,
+            },
+        };
+        assert_eq!(
+            init.set_restart_policies(bad),
+            Err(KernelError::InvalidCapability)
+        );
     }
 
     #[test]

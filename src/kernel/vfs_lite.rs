@@ -11,6 +11,7 @@ pub enum VfsLiteError {
     NoFd,
     BadFd,
     Unsupported,
+    PermissionDenied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,9 +324,34 @@ impl VfsBackend for ConsoleBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountNamespacePolicy {
+    pub allow_console: bool,
+    pub allow_initramfs: bool,
+}
+
+impl MountNamespacePolicy {
+    pub const fn baseline() -> Self {
+        Self {
+            allow_console: true,
+            allow_initramfs: true,
+        }
+    }
+
+    pub const fn allows_path(self, path_ptr: u64) -> bool {
+        match resolve_boot_path(path_ptr) {
+            Some(BootPath::DevConsole) => self.allow_console,
+            Some(BootPath::Busybox) => self.allow_initramfs,
+            None => true,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct VfsLiteService<B: VfsBackend = InMemoryBackend> {
     backend: B,
+    policy: MountNamespacePolicy,
+    op_sequence: u64,
 }
 
 impl Default for VfsLiteService<InMemoryBackend> {
@@ -338,13 +364,27 @@ impl VfsLiteService<InMemoryBackend> {
     pub const fn new() -> Self {
         Self {
             backend: InMemoryBackend::new(),
+            policy: MountNamespacePolicy::baseline(),
+            op_sequence: 0,
         }
     }
 }
 
 impl<B: VfsBackend> VfsLiteService<B> {
     pub const fn with_backend(backend: B) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            policy: MountNamespacePolicy::baseline(),
+            op_sequence: 0,
+        }
+    }
+
+    pub fn set_policy(&mut self, policy: MountNamespacePolicy) {
+        self.policy = policy;
+    }
+
+    pub const fn op_sequence(&self) -> u64 {
+        self.op_sequence
     }
 
     fn u64_reply(opcode: u16, value: u64) -> Result<Message, VfsLiteError> {
@@ -383,8 +423,12 @@ impl<B: VfsBackend> VfsLiteService<B> {
     }
 
     pub fn handle_request(&mut self, request: Message) -> Result<Message, VfsLiteError> {
-        match Self::parse_request(request)? {
+        let parsed = Self::parse_request(request)?;
+        let reply = match parsed {
             VfsRequest::OpenAt { path_ptr, .. } => {
+                if !self.policy.allows_path(path_ptr) {
+                    return Err(VfsLiteError::PermissionDenied);
+                }
                 Self::u64_reply(VFS_OP_OPENAT, self.backend.openat(path_ptr)?)
             }
             VfsRequest::Close { fd } => Self::u64_reply(VFS_OP_CLOSE, self.backend.close(fd)?),
@@ -395,9 +439,14 @@ impl<B: VfsBackend> VfsLiteService<B> {
                 Self::u64_reply(VFS_OP_WRITE, self.backend.write(fd, len)?)
             }
             VfsRequest::Statx { path_ptr, .. } => {
+                if !self.policy.allows_path(path_ptr) {
+                    return Err(VfsLiteError::PermissionDenied);
+                }
                 Self::u64_reply(VFS_OP_STATX, self.backend.statx(path_ptr)?)
             }
-        }
+        }?;
+        self.op_sequence = self.op_sequence.saturating_add(1);
+        Ok(reply)
     }
 }
 
@@ -507,6 +556,36 @@ mod tests {
             Message::with_header(0, VFS_OP_CLOSE, 0, None, &pack(fd, 0, 0, 0)).expect("close");
         let close_rep = svc.handle_request(close_req).expect("close rep");
         assert_eq!(close_rep.opcode, VFS_OP_CLOSE);
+    }
+
+    #[test]
+    fn mount_policy_can_deny_console_path() {
+        let mut svc = VfsLiteService::with_backend(ConsoleBackend::default());
+        svc.set_policy(MountNamespacePolicy {
+            allow_console: false,
+            allow_initramfs: true,
+        });
+        let open = Message::with_header(
+            0,
+            VFS_OP_OPENAT,
+            0,
+            None,
+            &pack(0, DEV_CONSOLE_PATH_PTR, 0, 0),
+        )
+        .expect("open");
+        assert_eq!(
+            svc.handle_request(open),
+            Err(VfsLiteError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn op_sequence_increments_per_successful_request() {
+        let mut svc = VfsLiteService::new();
+        let open =
+            Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1000, 0, 0)).expect("open");
+        let _ = svc.handle_request(open).expect("open rep");
+        assert_eq!(svc.op_sequence(), 1);
     }
 
     #[test]
