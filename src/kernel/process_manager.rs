@@ -177,6 +177,17 @@ impl ProcessManagerLite {
             .map_err(|_| ProcessManagerError::Malformed)
     }
 
+    pub fn spawn_from_elf_image(
+        &mut self,
+        parent_tid: u64,
+        image_id: u64,
+        image: &[u8],
+    ) -> Result<(u64, ElfImageInfo), ProcessManagerError> {
+        let info = ElfImageInfo::parse(image_id, image)?;
+        let pid = self.alloc_process(parent_tid)?;
+        Ok((pid, info))
+    }
+
     fn alloc_process(&mut self, parent_pid: u64) -> Result<u64, ProcessManagerError> {
         let pid = self.next_pid;
         self.next_pid = self.next_pid.saturating_add(1);
@@ -325,6 +336,21 @@ mod tests {
         let info = ElfImageInfo::parse(7, &image).expect("elf");
         assert_eq!(info.image_id, 7);
         assert_eq!(info.entry, 0x401000);
+    }
+
+    #[test]
+    fn spawn_from_elf_image_allocates_pid_and_returns_entry() {
+        let mut pm = ProcessManagerLite::new();
+        let mut image = [0u8; 64];
+        image[..4].copy_from_slice(b"ELF");
+        image[24..32].copy_from_slice(&0x402000u64.to_le_bytes());
+
+        let (pid, info) = pm
+            .spawn_from_elf_image(1, 9, &image)
+            .expect("spawn from image");
+        assert!(pid >= 1000);
+        assert_eq!(info.image_id, 9);
+        assert_eq!(info.entry, 0x402000);
     }
 
     #[test]

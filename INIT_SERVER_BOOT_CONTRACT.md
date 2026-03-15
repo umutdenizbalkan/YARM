@@ -26,9 +26,11 @@ These IDs are registered by `InitServerLite::register_core_graph` and assigned s
 
 1. `Uninitialized`
 2. `CoreServicesRegistered`
-3. `Running`
+3. `LaunchingCore`
+4. `Running`
+5. `Failed`
 
-`begin_running()` is valid only after successful graph registration.
+`begin_running()` is valid only after successful core launch (`LaunchingCore`).
 
 ## Required checks before running
 
@@ -46,4 +48,5 @@ These IDs are registered by `InitServerLite::register_core_graph` and assigned s
 ## Notes
 
 - This is a mechanism-level scaffold in `src/kernel/init_server.rs` and `src/bin/init_server.rs`.
-- Future revisions will add explicit launch ordering, capability intake maps, and restart/fault policy handoff.
+- Launch ordering now routes through `launch_core_services` with explicit core image plan and failure transition support (`mark_failed`).
+- Future revisions will add restart/fault policy handoff integration.

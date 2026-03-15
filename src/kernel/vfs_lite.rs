@@ -193,6 +193,29 @@ pub const DEV_CONSOLE_PATH_PTR: u64 = 0x434F_4E53_4F4C_4500;
 pub const INITRAMFS_BUSYBOX_PATH_PTR: u64 = 0x494E_4954_4255_5359;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootPath {
+    DevConsole,
+    Busybox,
+}
+
+pub const fn boot_path_ptr(path: BootPath) -> u64 {
+    match path {
+        BootPath::DevConsole => DEV_CONSOLE_PATH_PTR,
+        BootPath::Busybox => INITRAMFS_BUSYBOX_PATH_PTR,
+    }
+}
+
+pub const fn resolve_boot_path(path_ptr: u64) -> Option<BootPath> {
+    if path_ptr == DEV_CONSOLE_PATH_PTR {
+        Some(BootPath::DevConsole)
+    } else if path_ptr == INITRAMFS_BUSYBOX_PATH_PTR {
+        Some(BootPath::Busybox)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadOnlyInitramfsBackend {
     opened_fd: Option<u64>,
     file_len: u64,
@@ -215,7 +238,7 @@ impl ReadOnlyInitramfsBackend {
 
 impl VfsBackend for ReadOnlyInitramfsBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
-        if path_ptr != INITRAMFS_BUSYBOX_PATH_PTR {
+        if resolve_boot_path(path_ptr) != Some(BootPath::Busybox) {
             return Err(VfsLiteError::BadFd);
         }
         self.opened_fd = Some(10);
@@ -246,7 +269,7 @@ impl VfsBackend for ReadOnlyInitramfsBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
-        if path_ptr == INITRAMFS_BUSYBOX_PATH_PTR {
+        if resolve_boot_path(path_ptr) == Some(BootPath::Busybox) {
             Ok(self.file_len)
         } else {
             Err(VfsLiteError::BadFd)
@@ -261,7 +284,7 @@ pub struct ConsoleBackend {
 
 impl VfsBackend for ConsoleBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
-        if path_ptr != DEV_CONSOLE_PATH_PTR {
+        if resolve_boot_path(path_ptr) != Some(BootPath::DevConsole) {
             return Err(VfsLiteError::BadFd);
         }
         self.open_console_fd = Some(3);
@@ -292,7 +315,7 @@ impl VfsBackend for ConsoleBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
-        if path_ptr == DEV_CONSOLE_PATH_PTR {
+        if resolve_boot_path(path_ptr) == Some(BootPath::DevConsole) {
             Ok(0)
         } else {
             Err(VfsLiteError::BadFd)
@@ -385,6 +408,19 @@ mod tests {
 
     fn pack(a0: u64, a1: u64, a2: u64, a3: u64) -> [u8; 32] {
         VfsV1Args::new(a0, a1, a2, a3).encode()
+    }
+
+    #[test]
+    fn boot_path_resolution_is_stable() {
+        assert_eq!(
+            resolve_boot_path(boot_path_ptr(BootPath::DevConsole)),
+            Some(BootPath::DevConsole)
+        );
+        assert_eq!(
+            resolve_boot_path(boot_path_ptr(BootPath::Busybox)),
+            Some(BootPath::Busybox)
+        );
+        assert_eq!(resolve_boot_path(0xDEAD), None);
     }
 
     #[test]

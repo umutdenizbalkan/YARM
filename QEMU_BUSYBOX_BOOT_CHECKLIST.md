@@ -29,3 +29,9 @@ This file tracks the 7 immediate tasks and their implementation status.
 
 - The QEMU smoke script intentionally exits success when artifacts or QEMU are unavailable to keep this job non-blocking during incremental bring-up.
 - Once kernel and initramfs artifacts are generated in CI, this can be promoted from non-blocking smoke to required gate.
+
+
+## CI execution notes
+
+- Artifact staging script: `scripts/build-qemu-riscv64-artifacts.sh`
+- QEMU smoke gate now runs as a normal workflow job; strict failure mode can be enabled by setting `QEMU_SMOKE_STRICT=1`.

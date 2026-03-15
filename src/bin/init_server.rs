@@ -2,7 +2,7 @@
 extern crate std;
 
 use yarm::kernel::bootstrap::Bootstrap;
-use yarm::kernel::init_server::{CoreServiceGraph, InitServerLite};
+use yarm::kernel::init_server::{CoreServiceGraph, CoreServiceImagePlan, InitServerLite};
 
 use std::println;
 
@@ -20,6 +20,16 @@ fn main() {
         .expect("register graph");
     init.validate_core_delegation_paths(&kernel, graph.init_tid)
         .expect("delegation paths");
+    let _ = init
+        .launch_core_services(
+            &mut kernel,
+            CoreServiceImagePlan {
+                process_manager_entry: 0x8000,
+                vfs_entry: 0x9000,
+                supervisor_entry: 0xA000,
+            },
+        )
+        .expect("launch");
     init.begin_running().expect("running");
 
     println!(

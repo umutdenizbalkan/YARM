@@ -14,7 +14,7 @@ This file documents the initial architecture split work for step 5b.
 
 ## Implemented
 
-- `src/arch/mod.rs` with `hal` + `riscv` modules.
+- `src/arch/mod.rs` with `hal` + `riscv` + `vm_layout` modules.
 - `src/arch/hal.rs` trait boundary for minimal machine adaptation.
 - `src/arch/riscv.rs` trap decoder:
   - maps RISC-V `scause`/`stval` into normalized kernel `TrapEvent`
@@ -39,3 +39,8 @@ This file documents the initial architecture split work for step 5b.
 - Route per-CPU timer + IPI interrupts into cross-CPU work handling.
 - Add architecture-specific context switch/trapframe save/restore.
 - Extend conformance coverage to ARM trap-context shape using the same HAL contract.
+
+
+## VM layout boundary
+
+- VM layout constants (page size, kernel split base, ASID width, static VM capacities) are now sourced from `src/arch/vm_layout.rs` and consumed by `kernel::vm` to keep architecture assumptions out of mechanism logic.

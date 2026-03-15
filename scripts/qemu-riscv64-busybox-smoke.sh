@@ -4,6 +4,7 @@ set -euo pipefail
 KERNEL_IMAGE=${KERNEL_IMAGE:-build/yarm-riscv64.bin}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build/initramfs-busybox.cpio}
 TIMEOUT_SECS=${TIMEOUT_SECS:-20}
+QEMU_SMOKE_STRICT=${QEMU_SMOKE_STRICT:-0}
 
 if [[ ! -f "$KERNEL_IMAGE" ]]; then
   echo "[warn] kernel image missing: $KERNEL_IMAGE"
@@ -40,4 +41,7 @@ if grep -E "BusyBox|/ #|/ # " "$LOGFILE" >/dev/null 2>&1; then
 fi
 
 echo "[warn] busybox prompt not detected (status=$QEMU_STATUS)"
+if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
+  exit 1
+fi
 exit 0

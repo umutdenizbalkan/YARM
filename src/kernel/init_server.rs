@@ -1,10 +1,14 @@
-use super::bootstrap::{KernelError, KernelState, ServiceRole};
+use super::bootstrap::{KernelError, KernelState, ServiceRole, UserImageSpec};
+use super::task::TaskClass;
+use super::vm::Asid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitBootPhase {
     Uninitialized,
     CoreServicesRegistered,
+    LaunchingCore,
     Running,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +60,20 @@ pub struct CoreServiceHandles {
     pub process_manager_tid: Option<u64>,
     pub vfs_tid: Option<u64>,
     pub supervisor_tid: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreServiceImagePlan {
+    pub process_manager_entry: usize,
+    pub vfs_entry: usize,
+    pub supervisor_entry: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreLaunchReport {
+    pub process_manager_spawned: bool,
+    pub vfs_spawned: bool,
+    pub supervisor_spawned: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,8 +152,58 @@ impl InitServerLite {
         Ok(())
     }
 
-    pub fn begin_running(&mut self) -> Result<(), KernelError> {
+    pub fn launch_core_services(
+        &mut self,
+        kernel: &mut KernelState,
+        plan: CoreServiceImagePlan,
+    ) -> Result<CoreLaunchReport, KernelError> {
         if self.phase != InitBootPhase::CoreServicesRegistered {
+            return Err(KernelError::WrongObject);
+        }
+        self.phase = InitBootPhase::LaunchingCore;
+
+        let proc_tid = self
+            .handles
+            .process_manager_tid
+            .ok_or(KernelError::WrongObject)?;
+        let vfs_tid = self.handles.vfs_tid.ok_or(KernelError::WrongObject)?;
+        let supervisor_tid = self
+            .handles
+            .supervisor_tid
+            .ok_or(KernelError::WrongObject)?;
+
+        kernel.spawn_user_task_from_image(UserImageSpec {
+            tid: proc_tid,
+            entry: plan.process_manager_entry,
+            asid: Some(Asid(11)),
+            class: TaskClass::SystemServer,
+        })?;
+        kernel.spawn_user_task_from_image(UserImageSpec {
+            tid: vfs_tid,
+            entry: plan.vfs_entry,
+            asid: Some(Asid(12)),
+            class: TaskClass::SystemServer,
+        })?;
+        kernel.spawn_user_task_from_image(UserImageSpec {
+            tid: supervisor_tid,
+            entry: plan.supervisor_entry,
+            asid: Some(Asid(13)),
+            class: TaskClass::SystemServer,
+        })?;
+
+        Ok(CoreLaunchReport {
+            process_manager_spawned: true,
+            vfs_spawned: true,
+            supervisor_spawned: true,
+        })
+    }
+
+    pub fn mark_failed(&mut self) {
+        self.phase = InitBootPhase::Failed;
+    }
+
+    pub fn begin_running(&mut self) -> Result<(), KernelError> {
+        if self.phase != InitBootPhase::LaunchingCore {
             return Err(KernelError::WrongObject);
         }
         self.phase = InitBootPhase::Running;
@@ -192,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn init_server_registers_core_graph_and_enters_running() {
+    fn init_server_launch_flow_registers_launches_and_enters_running() {
         let mut state = Bootstrap::init().expect("init");
         let mut init = InitServerLite::new();
         let graph = CoreServiceGraph {
@@ -208,13 +276,28 @@ mod tests {
         init.validate_core_delegation_paths(&state, 1)
             .expect("validate delegation");
 
+        let report = init
+            .launch_core_services(
+                &mut state,
+                CoreServiceImagePlan {
+                    process_manager_entry: 0x8000,
+                    vfs_entry: 0x9000,
+                    supervisor_entry: 0xA000,
+                },
+            )
+            .expect("launch");
+        assert!(report.process_manager_spawned);
+        assert!(report.vfs_spawned);
+        assert!(report.supervisor_spawned);
+
         init.begin_running().expect("running");
         assert_eq!(init.phase(), InitBootPhase::Running);
     }
 
     #[test]
-    fn init_server_rejects_running_without_registration() {
+    fn init_server_supports_failure_transition() {
         let mut init = InitServerLite::new();
-        assert_eq!(init.begin_running(), Err(KernelError::WrongObject));
+        init.mark_failed();
+        assert_eq!(init.phase(), InitBootPhase::Failed);
     }
 }

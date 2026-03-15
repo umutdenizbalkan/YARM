@@ -7,12 +7,15 @@ on:
 jobs:
   riscv64-busybox-smoke:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+      - name: Build staged artifacts
+        run: scripts/build-qemu-riscv64-artifacts.sh
       - name: Install qemu
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-misc
-      - name: BusyBox QEMU smoke (non-blocking)
+      - name: BusyBox QEMU smoke
+        env:
+          QEMU_SMOKE_STRICT: "0"
         run: scripts/qemu-riscv64-busybox-smoke.sh

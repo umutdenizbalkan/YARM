@@ -1,6 +1,102 @@
 use super::bootstrap::{Bootstrap, KernelError};
 use super::ipc::Message;
 
+use super::init_server::{CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitServerLite};
+use super::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
+use super::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
+use super::vfs_lite::{INITRAMFS_BUSYBOX_PATH_PTR, ReadOnlyInitramfsBackend, VfsLiteService};
+use super::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitBootSummary {
+    pub init_phase: InitBootPhase,
+    pub proc_wait_exit: u64,
+    pub vfs_open_opcode: u16,
+    pub vfs_read_opcode: u16,
+}
+
+pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
+    let mut kernel = Bootstrap::init()?;
+    let mut init = InitServerLite::new();
+    let graph = CoreServiceGraph {
+        init_tid: 1,
+        process_manager_tid: 2,
+        vfs_tid: 3,
+        supervisor_tid: 4,
+    };
+    init.register_core_graph(&mut kernel, graph)?;
+    init.validate_core_delegation_paths(&kernel, graph.init_tid)?;
+    let _ = init.launch_core_services(
+        &mut kernel,
+        CoreServiceImagePlan {
+            process_manager_entry: 0x8000,
+            vfs_entry: 0x9000,
+            supervisor_entry: 0xA000,
+        },
+    )?;
+    init.begin_running()?;
+
+    let mut proc = ProcessService::new();
+    let spawn = Message::with_header(
+        0,
+        PROC_OP_SPAWN_V2,
+        0,
+        None,
+        &ProcV2Args::new(1, 99).encode(),
+    )
+    .map_err(|_| KernelError::WrongObject)?;
+    let spawn_rep = proc.handle(spawn).map_err(|_| KernelError::WrongObject)?;
+    let child =
+        SpawnV2Result::decode(spawn_rep.as_slice()).map_err(|_| KernelError::WrongObject)?;
+    proc.mark_exit(child.pid, 5)
+        .map_err(|_| KernelError::WrongObject)?;
+    let wait = Message::with_header(
+        0,
+        PROC_OP_WAITPID_V2,
+        0,
+        None,
+        &ProcV2Args::new(1, child.pid).encode(),
+    )
+    .map_err(|_| KernelError::WrongObject)?;
+    let wait_rep = proc.handle(wait).map_err(|_| KernelError::WrongObject)?;
+    let waited =
+        WaitPidV2Result::decode(wait_rep.as_slice()).map_err(|_| KernelError::WrongObject)?;
+
+    let mut vfs = VfsLiteService::with_backend(ReadOnlyInitramfsBackend::new(4096));
+    let open = Message::with_header(
+        0,
+        VFS_OP_OPENAT,
+        0,
+        None,
+        &VfsV1Args::new(0, INITRAMFS_BUSYBOX_PATH_PTR, 0, 0).encode(),
+    )
+    .map_err(|_| KernelError::WrongObject)?;
+    let open_rep = vfs
+        .handle_request(open)
+        .map_err(|_| KernelError::WrongObject)?;
+    let mut fd_bytes = [0u8; 8];
+    fd_bytes.copy_from_slice(open_rep.as_slice());
+    let fd = u64::from_le_bytes(fd_bytes);
+    let read = Message::with_header(
+        0,
+        VFS_OP_READ,
+        0,
+        None,
+        &VfsV1Args::new(fd, 0, 64, 0).encode(),
+    )
+    .map_err(|_| KernelError::WrongObject)?;
+    let read_rep = vfs
+        .handle_request(read)
+        .map_err(|_| KernelError::WrongObject)?;
+
+    Ok(InitBootSummary {
+        init_phase: init.phase(),
+        proc_wait_exit: waited.exit_code,
+        vfs_open_opcode: open_rep.opcode,
+        vfs_read_opcode: read_rep.opcode,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimStep {
     SeedOpcode(u16),
@@ -106,7 +202,25 @@ pub fn run_deterministic_script(steps: &[SimStep]) -> Result<SimSummary, KernelE
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+
+    #[test]
+    fn deterministic_init_core_bootstrap_replays_proc_and_vfs_path() {
+        let handle = std::thread::Builder::new()
+            .name("init-core-boot-sim".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let summary = run_init_core_bootstrap_scenario().expect("boot sim");
+                assert_eq!(summary.init_phase, InitBootPhase::Running);
+                assert_eq!(summary.proc_wait_exit, 5);
+                assert_eq!(summary.vfs_open_opcode, VFS_OP_OPENAT);
+                assert_eq!(summary.vfs_read_opcode, VFS_OP_READ);
+            })
+            .expect("spawn thread");
+        handle.join().expect("join");
+    }
 
     #[test]
     fn deterministic_core_simulation_replays_ipc_and_irq() {
