@@ -4,6 +4,7 @@ use super::vfs_proto::{
 };
 
 const MAX_FDS: usize = 16;
+const MAX_RAMFS_INODES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsLiteError {
@@ -190,19 +191,150 @@ impl VfsBackend for InMemoryBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RamFsInode {
+    path_ptr: u64,
+    file_len: u64,
+}
+
+#[derive(Debug)]
+pub struct RamFsBackend {
+    next_fd: u64,
+    fds: [Option<FdEntry>; MAX_FDS],
+    inodes: [Option<RamFsInode>; MAX_RAMFS_INODES],
+}
+
+impl Default for RamFsBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RamFsBackend {
+    pub const fn new() -> Self {
+        Self {
+            next_fd: 100,
+            fds: [None; MAX_FDS],
+            inodes: [None; MAX_RAMFS_INODES],
+        }
+    }
+
+    fn alloc_fd(&mut self, inode: u64) -> Result<u64, VfsLiteError> {
+        let fd = self.next_fd;
+        self.next_fd = self.next_fd.saturating_add(1);
+        if let Some(slot) = self.fds.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(FdEntry { fd, inode });
+            Ok(fd)
+        } else {
+            Err(VfsLiteError::NoFd)
+        }
+    }
+
+    fn open_inode(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        if let Some(inode) = self
+            .inodes
+            .iter()
+            .flatten()
+            .find(|inode| inode.path_ptr == path_ptr)
+            .map(|inode| inode.path_ptr)
+        {
+            return self.alloc_fd(inode);
+        }
+        if let Some(slot) = self.inodes.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(RamFsInode {
+                path_ptr,
+                file_len: 0,
+            });
+            return self.alloc_fd(path_ptr);
+        }
+        Err(VfsLiteError::NoFd)
+    }
+
+    fn close_fd(&mut self, fd: u64) -> Result<(), VfsLiteError> {
+        if let Some(slot) = self
+            .fds
+            .iter_mut()
+            .find(|slot| slot.map(|entry| entry.fd == fd).unwrap_or(false))
+        {
+            *slot = None;
+            Ok(())
+        } else {
+            Err(VfsLiteError::BadFd)
+        }
+    }
+
+    fn inode_for_fd(&self, fd: u64) -> Option<u64> {
+        self.fds
+            .iter()
+            .flatten()
+            .find(|entry| entry.fd == fd)
+            .map(|entry| entry.inode)
+    }
+
+    fn inode_index_for_path(&self, path_ptr: u64) -> Option<usize> {
+        self.inodes.iter().position(|slot| {
+            slot.map(|inode| inode.path_ptr == path_ptr)
+                .unwrap_or(false)
+        })
+    }
+}
+
+impl VfsBackend for RamFsBackend {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        self.open_inode(path_ptr)
+    }
+
+    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+        self.close_fd(fd)?;
+        Ok(0)
+    }
+
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        let inode = self.inode_for_fd(fd).ok_or(VfsLiteError::BadFd)?;
+        let idx = self
+            .inode_index_for_path(inode)
+            .ok_or(VfsLiteError::BadFd)?;
+        let file_len = self.inodes[idx].ok_or(VfsLiteError::BadFd)?.file_len;
+        Ok(core::cmp::min(len, file_len))
+    }
+
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        let inode = self.inode_for_fd(fd).ok_or(VfsLiteError::BadFd)?;
+        let idx = self
+            .inode_index_for_path(inode)
+            .ok_or(VfsLiteError::BadFd)?;
+        let Some(mut inode_slot) = self.inodes[idx] else {
+            return Err(VfsLiteError::BadFd);
+        };
+        inode_slot.file_len = inode_slot.file_len.saturating_add(len);
+        self.inodes[idx] = Some(inode_slot);
+        Ok(len)
+    }
+
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        let idx = self
+            .inode_index_for_path(path_ptr)
+            .ok_or(VfsLiteError::BadFd)?;
+        Ok(self.inodes[idx].ok_or(VfsLiteError::BadFd)?.file_len)
+    }
+}
+
 pub const DEV_CONSOLE_PATH_PTR: u64 = 0x434F_4E53_4F4C_4500;
 pub const INITRAMFS_BUSYBOX_PATH_PTR: u64 = 0x494E_4954_4255_5359;
+pub const DEV_NULL_PATH_PTR: u64 = 0x4445_564E_554C_4C00;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootPath {
     DevConsole,
     Busybox,
+    DevNull,
 }
 
 pub const fn boot_path_ptr(path: BootPath) -> u64 {
     match path {
         BootPath::DevConsole => DEV_CONSOLE_PATH_PTR,
         BootPath::Busybox => INITRAMFS_BUSYBOX_PATH_PTR,
+        BootPath::DevNull => DEV_NULL_PATH_PTR,
     }
 }
 
@@ -211,6 +343,8 @@ pub const fn resolve_boot_path(path_ptr: u64) -> Option<BootPath> {
         Some(BootPath::DevConsole)
     } else if path_ptr == INITRAMFS_BUSYBOX_PATH_PTR {
         Some(BootPath::Busybox)
+    } else if path_ptr == DEV_NULL_PATH_PTR {
+        Some(BootPath::DevNull)
     } else {
         None
     }
@@ -324,6 +458,151 @@ impl VfsBackend for ConsoleBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DevFsBackend {
+    open_console_fd: Option<u64>,
+    open_null_fd: Option<u64>,
+}
+
+impl VfsBackend for DevFsBackend {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        match resolve_boot_path(path_ptr) {
+            Some(BootPath::DevConsole) => {
+                self.open_console_fd = Some(3);
+                Ok(3)
+            }
+            Some(BootPath::DevNull) => {
+                self.open_null_fd = Some(4);
+                Ok(4)
+            }
+            _ => Err(VfsLiteError::BadFd),
+        }
+    }
+
+    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+        if self.open_console_fd == Some(fd) {
+            self.open_console_fd = None;
+            return Ok(0);
+        }
+        if self.open_null_fd == Some(fd) {
+            self.open_null_fd = None;
+            return Ok(0);
+        }
+        Err(VfsLiteError::BadFd)
+    }
+
+    fn read(&mut self, fd: u64, _len: u64) -> Result<u64, VfsLiteError> {
+        if self.open_console_fd == Some(fd) || self.open_null_fd == Some(fd) {
+            return Ok(0);
+        }
+        Err(VfsLiteError::BadFd)
+    }
+
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        if self.open_console_fd == Some(fd) || self.open_null_fd == Some(fd) {
+            return Ok(len);
+        }
+        Err(VfsLiteError::BadFd)
+    }
+
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        match resolve_boot_path(path_ptr) {
+            Some(BootPath::DevConsole) | Some(BootPath::DevNull) => Ok(0),
+            _ => Err(VfsLiteError::BadFd),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RamFsService {
+    inner: VfsLiteService<RamFsBackend>,
+    handled: usize,
+}
+
+impl Default for RamFsService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RamFsService {
+    pub const fn new() -> Self {
+        Self {
+            inner: VfsLiteService::with_backend(RamFsBackend::new()),
+            handled: 0,
+        }
+    }
+
+    pub const fn handled_count(&self) -> usize {
+        self.handled
+    }
+
+    pub fn handle(&mut self, request: Message) -> Result<Message, VfsLiteError> {
+        let reply = self.inner.handle_request(request)?;
+        self.handled = self.handled.saturating_add(1);
+        Ok(reply)
+    }
+}
+
+#[derive(Debug)]
+pub struct InitramfsService {
+    inner: VfsLiteService<ReadOnlyInitramfsBackend>,
+    handled: usize,
+}
+
+impl InitramfsService {
+    pub const fn new(file_len: u64) -> Self {
+        Self {
+            inner: VfsLiteService::with_backend(ReadOnlyInitramfsBackend::new(file_len)),
+            handled: 0,
+        }
+    }
+
+    pub const fn handled_count(&self) -> usize {
+        self.handled
+    }
+
+    pub fn handle(&mut self, request: Message) -> Result<Message, VfsLiteError> {
+        let reply = self.inner.handle_request(request)?;
+        self.handled = self.handled.saturating_add(1);
+        Ok(reply)
+    }
+}
+
+#[derive(Debug)]
+pub struct DevFsService {
+    inner: VfsLiteService<DevFsBackend>,
+    handled: usize,
+}
+
+impl Default for DevFsService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DevFsService {
+    pub const fn new() -> Self {
+        Self {
+            inner: VfsLiteService::with_backend(DevFsBackend {
+                open_console_fd: None,
+                open_null_fd: None,
+            }),
+            handled: 0,
+        }
+    }
+
+    pub const fn handled_count(&self) -> usize {
+        self.handled
+    }
+
+    pub fn handle(&mut self, request: Message) -> Result<Message, VfsLiteError> {
+        let reply = self.inner.handle_request(request)?;
+        self.handled = self.handled.saturating_add(1);
+        Ok(reply)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MountNamespacePolicy {
     pub allow_console: bool,
@@ -341,6 +620,7 @@ impl MountNamespacePolicy {
     pub const fn allows_path(self, path_ptr: u64) -> bool {
         match resolve_boot_path(path_ptr) {
             Some(BootPath::DevConsole) => self.allow_console,
+            Some(BootPath::DevNull) => self.allow_console,
             Some(BootPath::Busybox) => self.allow_initramfs,
             None => true,
         }
@@ -453,7 +733,9 @@ impl<B: VfsBackend> VfsLiteService<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
+    use crate::kernel::vfs_proto::{
+        VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
+    };
 
     fn pack(a0: u64, a1: u64, a2: u64, a3: u64) -> [u8; 32] {
         VfsV1Args::new(a0, a1, a2, a3).encode()
@@ -469,7 +751,91 @@ mod tests {
             resolve_boot_path(boot_path_ptr(BootPath::Busybox)),
             Some(BootPath::Busybox)
         );
+        assert_eq!(
+            resolve_boot_path(boot_path_ptr(BootPath::DevNull)),
+            Some(BootPath::DevNull)
+        );
         assert_eq!(resolve_boot_path(0xDEAD), None);
+    }
+
+    #[test]
+    fn ramfs_service_supports_write_then_stat() {
+        let mut svc = RamFsService::new();
+        let open =
+            Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1010, 0, 0)).expect("open");
+        let open_rep = svc.handle(open).expect("open rep");
+        let mut fd_bytes = [0u8; 8];
+        fd_bytes.copy_from_slice(open_rep.as_slice());
+        let fd = u64::from_le_bytes(fd_bytes);
+
+        let write =
+            Message::with_header(0, VFS_OP_WRITE, 0, None, &pack(fd, 0, 128, 0)).expect("write");
+        let _ = svc.handle(write).expect("write rep");
+
+        let stat =
+            Message::with_header(0, VFS_OP_STATX, 0, None, &pack(0, 0x1010, 0, 0)).expect("stat");
+        let stat_rep = svc.handle(stat).expect("stat rep");
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(stat_rep.as_slice());
+        assert_eq!(u64::from_le_bytes(len_bytes), 128);
+        assert_eq!(svc.handled_count(), 3);
+    }
+
+    #[test]
+    fn initramfs_service_is_read_only() {
+        let mut svc = InitramfsService::new(4096);
+        let open = Message::with_header(
+            0,
+            VFS_OP_OPENAT,
+            0,
+            None,
+            &pack(0, INITRAMFS_BUSYBOX_PATH_PTR, 0, 0),
+        )
+        .expect("open");
+        let open_rep = svc.handle(open).expect("open rep");
+        let mut fd_bytes = [0u8; 8];
+        fd_bytes.copy_from_slice(open_rep.as_slice());
+        let fd = u64::from_le_bytes(fd_bytes);
+
+        let write =
+            Message::with_header(0, VFS_OP_WRITE, 0, None, &pack(fd, 0, 1, 0)).expect("write");
+        assert_eq!(svc.handle(write), Err(VfsLiteError::Unsupported));
+    }
+
+    #[test]
+    fn devfs_service_supports_console_and_null() {
+        let mut svc = DevFsService::new();
+        let open_console = Message::with_header(
+            0,
+            VFS_OP_OPENAT,
+            0,
+            None,
+            &pack(0, DEV_CONSOLE_PATH_PTR, 0, 0),
+        )
+        .expect("open console");
+        let open_null =
+            Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, DEV_NULL_PATH_PTR, 0, 0))
+                .expect("open null");
+
+        let console_rep = svc.handle(open_console).expect("console rep");
+        let null_rep = svc.handle(open_null).expect("null rep");
+
+        let mut fd_bytes = [0u8; 8];
+        fd_bytes.copy_from_slice(console_rep.as_slice());
+        let console_fd = u64::from_le_bytes(fd_bytes);
+
+        fd_bytes.copy_from_slice(null_rep.as_slice());
+        let null_fd = u64::from_le_bytes(fd_bytes);
+
+        let write_console =
+            Message::with_header(0, VFS_OP_WRITE, 0, None, &pack(console_fd, 0, 7, 0))
+                .expect("write console");
+        let write_null = Message::with_header(0, VFS_OP_WRITE, 0, None, &pack(null_fd, 0, 11, 0))
+            .expect("write null");
+
+        let _ = svc.handle(write_console).expect("write console rep");
+        let _ = svc.handle(write_null).expect("write null rep");
+        assert_eq!(svc.handled_count(), 4);
     }
 
     #[test]

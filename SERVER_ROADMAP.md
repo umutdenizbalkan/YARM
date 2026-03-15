@@ -56,6 +56,12 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - mount gate: namespace + mount route tests
 - lifecycle gate: mount/unmount + failure/recovery tests
 
+### Current implementation status
+
+- ✅ `ramfs.srv` scaffold implemented (`RamFsBackend` + `RamFsService` + demo bin).
+- ✅ `initramfs.srv` scaffold implemented (`ReadOnlyInitramfsBackend` wrapped by `InitramfsService` + demo bin).
+- ✅ `devfs.srv` scaffold implemented (`DevFsBackend` + `DevFsService` + demo bin for `/dev/console` and `/dev/null`).
+
 ## Phase 2 — Device Driver Servers
 
 ### Target servers
