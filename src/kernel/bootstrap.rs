@@ -77,8 +77,33 @@ pub struct DeviceServerDelegation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverDelegationBundle {
+    pub irq_cap: CapId,
+    pub dma_cap: CapId,
+    pub iova_cap: CapId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverBundlePlan {
+    pub server_tid: ThreadId,
+    pub irq_line: u16,
+    pub mem_cap: CapId,
+    pub iova_cap: CapId,
+    pub iova_base: usize,
+    pub iova_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpcFastpathResult {
     pub switched_to_waiter: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IpcPathTelemetry {
+    pub fastpath_attempts: u64,
+    pub fastpath_switches: u64,
+    pub queued_sends: u64,
+    pub blocked_sends: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +161,7 @@ struct IpcSubsystem {
     notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
     notification_generations: [u64; MAX_NOTIFICATIONS],
     irq_routes: [Option<usize>; MAX_IRQ_LINES],
+    telemetry: IpcPathTelemetry,
 }
 
 #[derive(Debug)]
@@ -234,6 +260,7 @@ impl Bootstrap {
                 notifications: [const { None }; MAX_NOTIFICATIONS],
                 notification_generations: [0; MAX_NOTIFICATIONS],
                 irq_routes: [None; MAX_IRQ_LINES],
+                telemetry: IpcPathTelemetry::default(),
             },
             tcbs: [None; MAX_TASKS],
             memory: MemorySubsystem {
@@ -563,6 +590,31 @@ impl KernelState {
         self.configure_driver_dma_window(plan.server_tid.0, plan.iova_base, plan.iova_len)?;
 
         Ok((irq_cap, dma_cap))
+    }
+
+    pub fn delegate_driver_bundle(
+        &mut self,
+        plan: DriverBundlePlan,
+    ) -> Result<DriverDelegationBundle, KernelError> {
+        let (irq_cap, dma_cap) = self.delegate_device_server_caps(DeviceServerDelegation {
+            server_tid: plan.server_tid,
+            irq_line: plan.irq_line,
+            mem_cap: plan.mem_cap,
+            dma_offset: 0,
+            dma_len: super::vm::PAGE_SIZE,
+            iova_cap: plan.iova_cap,
+            iova_base: plan.iova_base,
+            iova_len: plan.iova_len,
+        })?;
+        Ok(DriverDelegationBundle {
+            irq_cap,
+            dma_cap,
+            iova_cap: plan.iova_cap,
+        })
+    }
+
+    pub fn ipc_path_telemetry(&self) -> IpcPathTelemetry {
+        self.ipc.telemetry
     }
 
     pub fn configure_driver_dma_window(
@@ -1505,6 +1557,7 @@ impl KernelState {
             && self.ipc.endpoint_waiters[endpoint_idx].is_none()
         {
             self.block_current_on_send(endpoint_idx, send_cap, msg)?;
+            self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
             return Err(KernelError::WouldBlock);
         }
 
@@ -1519,6 +1572,7 @@ impl KernelState {
             .send(msg)
             .map_err(|_| KernelError::EndpointQueueFull)?;
 
+        self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
     }
@@ -1537,6 +1591,8 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+        self.ipc.telemetry.fastpath_attempts =
+            self.ipc.telemetry.fastpath_attempts.saturating_add(1);
         let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx];
 
         self.ipc_send(send_cap, msg)?;
@@ -1546,6 +1602,11 @@ impl KernelState {
         } else {
             false
         };
+
+        if switched {
+            self.ipc.telemetry.fastpath_switches =
+                self.ipc.telemetry.fastpath_switches.saturating_add(1);
+        }
 
         Ok(IpcFastpathResult {
             switched_to_waiter: switched,
@@ -2144,7 +2205,8 @@ mod tests {
             .expect("syscall recv");
         assert_eq!(recv_frame.error, 0);
         assert_eq!(recv_frame.ret0 as u64, 0);
-        assert_eq!(recv_frame.ret1 & 0xFF, b'h' as usize);
+        assert_eq!(recv_frame.ret1, 2);
+        assert_eq!(recv_frame.args[3] & 0xFF, b'h' as usize);
     }
 
     #[test]
@@ -2313,6 +2375,37 @@ mod tests {
 
         let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
         assert_eq!(received.as_slice(), b"hi");
+    }
+
+    #[test]
+    fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        let mut send_frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut send_frame))
+            .expect("send syscall");
+
+        let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert!(msg.transferred_cap().is_some());
+        let region =
+            crate::kernel::ipc::SharedMemoryRegion::decode(msg.as_slice()).expect("region");
+        assert_eq!(region.offset, 0x2000);
+        assert_eq!(region.len as usize, Message::MAX_PAYLOAD + 16);
     }
 
     #[test]
@@ -2652,6 +2745,86 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn ipc_fastpath_telemetry_distinguishes_switch_and_queue_paths() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(60).expect("sender");
+        state.register_task(61).expect("receiver");
+
+        let (_eid, send_cap, recv_cap) = state
+            .create_endpoint_with_mode(2, EndpointMode::Synchronous)
+            .expect("endpoint");
+
+        state.scheduler.enqueue(61).expect("enqueue receiver");
+        let mut recv_tf = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 8, 0x9000, 0, 0, 0],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut recv_tf))
+            .expect("recv trap");
+
+        state.scheduler.enqueue(60).expect("enqueue sender");
+        let msg = Message::new(60, b"fp").expect("msg");
+        let fast = state.ipc_send_fastpath(send_cap, msg).expect("fastpath");
+        assert!(fast.switched_to_waiter);
+
+        let (_beid, bsend_cap, _brecv_cap) = state.create_endpoint(2).expect("buffered");
+        let queued = Message::new(60, b"q").expect("queued");
+        state.ipc_send(bsend_cap, queued).expect("queue send");
+
+        let t = state.ipc_path_telemetry();
+        assert_eq!(t.fastpath_attempts, 1);
+        assert_eq!(t.fastpath_switches, 1);
+        assert_eq!(t.queued_sends, 2);
+        assert_eq!(t.blocked_sends, 0);
+    }
+
+    #[test]
+    fn synchronous_endpoint_blocked_send_updates_telemetry() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(62).expect("sender");
+
+        let (_eid, send_cap, _recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+
+        let msg = Message::new(62, b"blk").expect("msg");
+        assert_eq!(state.ipc_send(send_cap, msg), Err(KernelError::WouldBlock));
+
+        let t = state.ipc_path_telemetry();
+        assert_eq!(t.blocked_sends, 1);
+        assert_eq!(t.queued_sends, 0);
+    }
+
+    #[test]
+    fn delegate_driver_bundle_uses_standard_window_and_revokes_caps() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(59).expect("task");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let iova_cap = state.create_iova_space_cap().expect("iova");
+
+        let bundle = state
+            .delegate_driver_bundle(DriverBundlePlan {
+                server_tid: ThreadId(59),
+                irq_line: 12,
+                mem_cap,
+                iova_cap,
+                iova_base: crate::kernel::vm::PAGE_SIZE * 2,
+                iova_len: crate::kernel::vm::PAGE_SIZE,
+            })
+            .expect("bundle");
+
+        assert!(state.cspace.get(bundle.irq_cap).is_some());
+        assert!(state.cspace.get(bundle.dma_cap).is_some());
+        assert!(state.cspace.get(bundle.iova_cap).is_some());
+
+        state.revoke_driver_runtime_caps(59).expect("revoke");
+        assert!(state.cspace.get(bundle.irq_cap).is_none());
+        assert!(state.cspace.get(bundle.dma_cap).is_none());
+        assert!(state.cspace.get(bundle.iova_cap).is_none());
     }
 
     #[test]
