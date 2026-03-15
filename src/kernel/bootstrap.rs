@@ -2061,6 +2061,15 @@ impl KernelState {
         }
     }
 
+    pub fn handle_selected_arch_trap_entry(
+        &mut self,
+        cpu: CpuId,
+        context: crate::arch::trap_entry::ArchTrapContext,
+        frame: Option<&mut TrapFrame>,
+    ) -> Result<(), TrapHandleError> {
+        crate::arch::trap_entry::handle_trap_entry(self, cpu, context, frame)
+    }
+
     pub fn handle_trap_event(
         &mut self,
         event: TrapEvent,
@@ -2092,6 +2101,40 @@ impl KernelState {
 mod tests {
     use super::*;
     use crate::kernel::ipc::ThreadId;
+
+    #[test]
+    fn selected_arch_trap_entry_routes_timer() {
+        let mut state = Bootstrap::init().expect("init");
+        #[cfg(target_arch = "x86_64")]
+        let ctx = crate::arch::trap_entry::ArchTrapContext {
+            vector: 0x20,
+            error_code: 0,
+            fault_addr: 0,
+        };
+        #[cfg(target_arch = "aarch64")]
+        let ctx = crate::arch::trap_entry::ArchTrapContext {
+            esr_el1: 0,
+            far_el1: 0,
+            irq_line: None,
+            is_timer_irq: true,
+        };
+        #[cfg(any(
+            target_arch = "riscv64",
+            not(any(
+                target_arch = "riscv64",
+                target_arch = "x86_64",
+                target_arch = "aarch64"
+            ))
+        ))]
+        let ctx = crate::arch::trap_entry::ArchTrapContext {
+            scause: 1usize << (usize::BITS as usize - 1) | 5,
+            stval: 0,
+        };
+
+        state
+            .handle_selected_arch_trap_entry(CpuId(0), ctx, None)
+            .expect("trap");
+    }
 
     #[test]
     fn bootstrap_sets_minimal_kernel_state() {

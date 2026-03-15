@@ -73,3 +73,8 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
   - `src/arch/x86_64/trap.rs`
   - `src/arch/aarch64/trap.rs`
 - Added selected-ISA trap dispatch facade `src/arch/trap_entry.rs` so kernel integration can call one arch-selected entrypoint shape.
+
+
+## Runtime entry wiring
+
+- `KernelState::handle_selected_arch_trap_entry(...)` now forwards trap handling through `crate::arch::trap_entry::handle_trap_entry(...)`, so runtime integration can use the selected-ISA facade from kernel state.

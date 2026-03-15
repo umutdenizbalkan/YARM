@@ -10,13 +10,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build staged artifacts
-        run: scripts/build-qemu-riscv64-artifacts.sh
-      - name: Install qemu
+      - name: Install build + qemu tools
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-misc cpio busybox-static
-      - name: BusyBox QEMU smoke
+      - name: Build staged artifacts (non-strict)
+        run: scripts/build-qemu-riscv64-artifacts.sh
+      - name: BusyBox QEMU smoke (non-strict)
         env:
           QEMU_SMOKE_STRICT: "0"
+        run: scripts/qemu-riscv64-busybox-smoke.sh
+
+  riscv64-busybox-smoke-strict:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build + qemu tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc cpio busybox-static
+      - name: Build staged artifacts (strict)
+        env:
+          ARTIFACTS_STRICT: "1"
+        run: scripts/build-qemu-riscv64-artifacts.sh
+      - name: BusyBox QEMU smoke (strict)
+        env:
+          QEMU_SMOKE_STRICT: "1"
         run: scripts/qemu-riscv64-busybox-smoke.sh

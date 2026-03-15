@@ -41,3 +41,8 @@ This file tracks the 7 immediate tasks and their implementation status.
 
 - `scripts/build-qemu-riscv64-artifacts.sh` now performs concrete staging steps: target cross-build attempt, busybox-based initramfs assembly, and optional ELF->binary conversion if objcopy is available.
 - `scripts/qemu-riscv64-busybox-smoke.sh` now runs a concrete parameterized QEMU command (`machine/cpu/mem/smp/bios/cmdline`) and checks boot shell markers with strict-mode support.
+
+
+## Golden path runbook
+
+- See `BOOT_QEMU_RUNBOOK.md` for exact local command sequence and required success markers.
