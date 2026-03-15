@@ -1,18 +1,20 @@
-use super::bootstrap::{KernelError, KernelState};
-use super::capabilities::CapId;
-use super::ipc::Message;
+use crate::kernel::bootstrap::{KernelError, KernelState};
+use crate::kernel::capabilities::CapId;
+use crate::kernel::ipc::Message;
 #[cfg(test)]
-use super::proc_proto::{PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2, ProcV2Args};
-use super::proc_proto::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_SERVER_ABI_VERSION};
-use super::trapframe::TrapFrame;
+use crate::kernel::proc_proto::{PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2, ProcV2Args};
+use crate::kernel::proc_proto::{
+    PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_SERVER_ABI_VERSION,
+};
+use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
-use super::vfs_proto::VFS_CODEC_V1_VERSION;
-use super::vfs_proto::{
+use crate::kernel::vfs_proto::VFS_CODEC_V1_VERSION;
+use crate::kernel::vfs_proto::{
     VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT,
     VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE,
     VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
 };
-use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
+use crate::kernel::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
 // Linux syscall numbers in this module follow the LP64 numbering used by
 // RISC-V/AArch64 style ABIs in this prototype compatibility personality.
@@ -76,16 +78,16 @@ impl LinuxServiceBindings {
         request_send_cap: CapId,
         reply_recv_cap: CapId,
     ) -> Result<(), KernelError> {
-        if !kernel
-            .cspace
-            .has_right(request_send_cap, super::capabilities::CapRights::Send)
-        {
+        if !kernel.cspace.has_right(
+            request_send_cap,
+            crate::kernel::capabilities::CapRights::Send,
+        ) {
             return Err(KernelError::MissingRight);
         }
-        if !kernel
-            .cspace
-            .has_right(reply_recv_cap, super::capabilities::CapRights::Receive)
-        {
+        if !kernel.cspace.has_right(
+            reply_recv_cap,
+            crate::kernel::capabilities::CapRights::Receive,
+        ) {
             return Err(KernelError::MissingRight);
         }
         self.proc_mgr_request_send = Some(request_send_cap);
@@ -99,16 +101,16 @@ impl LinuxServiceBindings {
         request_send_cap: CapId,
         reply_recv_cap: CapId,
     ) -> Result<(), KernelError> {
-        if !kernel
-            .cspace
-            .has_right(request_send_cap, super::capabilities::CapRights::Send)
-        {
+        if !kernel.cspace.has_right(
+            request_send_cap,
+            crate::kernel::capabilities::CapRights::Send,
+        ) {
             return Err(KernelError::MissingRight);
         }
-        if !kernel
-            .cspace
-            .has_right(reply_recv_cap, super::capabilities::CapRights::Receive)
-        {
+        if !kernel.cspace.has_right(
+            reply_recv_cap,
+            crate::kernel::capabilities::CapRights::Receive,
+        ) {
             return Err(KernelError::MissingRight);
         }
         self.vfs_request_send = Some(request_send_cap);

@@ -3,7 +3,6 @@ pub mod capabilities;
 pub mod driver_manager;
 pub mod driver_proto;
 pub mod ipc;
-pub mod linux_compat;
 pub mod lock;
 pub mod proc_proto;
 pub mod process_manager;

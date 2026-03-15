@@ -5,7 +5,7 @@ This file marks the current in-kernel mechanism contracts as intentionally stabl
 ## Frozen contracts
 
 1. **Linux-compat syscall dispatch table order and membership**
-   - Source of truth: `LinuxCompatSyscall::DISPATCH_TABLE` in `src/kernel/linux_compat.rs`.
+   - Source of truth: `LinuxCompatSyscall::DISPATCH_TABLE` in `src/linux_compat/mod.rs`.
    - Guarded by test: `linux_dispatch_table_is_frozen_contract`.
 
 2. **Trap routing surface**

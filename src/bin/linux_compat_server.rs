@@ -3,9 +3,9 @@ extern crate std;
 
 use yarm::kernel::bootstrap::Bootstrap;
 use yarm::kernel::ipc::Message;
-use yarm::kernel::linux_compat::{LINUX_NR_GETPID, LinuxServiceBindings, dispatch};
 use yarm::kernel::proc_proto::PROC_OP_GETPID;
 use yarm::kernel::trapframe::TrapFrame;
+use yarm::linux_compat::{LINUX_NR_GETPID, LinuxServiceBindings, dispatch};
 
 use std::println;
 
