@@ -1,0 +1,22 @@
+name: compatibility-gates
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  core-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: core profile tests
+        run: cargo test -q
+
+  linux-compat-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: linux-compat profile tests
+        run: cargo test -q --features linux-compat

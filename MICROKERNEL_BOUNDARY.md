@@ -36,3 +36,9 @@ All user-space components are **servers**:
 Kernel responsibilities are limited to capability validation and IPC transport.
 There is no privileged driver class in the kernel object model.
 Hardware access is modeled as capabilities held by normal servers.
+
+
+## Release profiles
+
+- Core-only systems: follow `CORE_PROFILE.md` (no Linux personality feature required).
+- Linux personality systems: enable feature `linux-compat` and include the linux compatibility server profile.

@@ -37,4 +37,5 @@ Any intentional ABI/contract change must:
 
 - Mechanism/core profile must pass: `cargo test`
 - Linux personality profile must pass: `cargo test --features linux-compat`
+- CI workflow source: `.github/workflows/compat-gates.yml`
 - Typed codec golden vectors and truncation-rejection tests are required gates for wire-compatibility changes.

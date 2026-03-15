@@ -98,6 +98,15 @@ pub struct DriverDelegationBundle {
     pub iova_cap: CapId,
 }
 
+const ALLOWED_SERVICE_DELEGATION_EDGES: &[(ServiceRole, ServiceRole)] = &[
+    (ServiceRole::Init, ServiceRole::ProcessManager),
+    (ServiceRole::Init, ServiceRole::Vfs),
+    (ServiceRole::Init, ServiceRole::Driver),
+    (ServiceRole::Init, ServiceRole::Supervisor),
+    (ServiceRole::Supervisor, ServiceRole::Driver),
+    (ServiceRole::Supervisor, ServiceRole::Vfs),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverBundlePlan {
     pub server_tid: ThreadId,
@@ -672,20 +681,18 @@ impl KernelState {
             .map(|entry| entry.role)
     }
 
+    pub const fn allowed_service_delegation_edges() -> &'static [(ServiceRole, ServiceRole)] {
+        ALLOWED_SERVICE_DELEGATION_EDGES
+    }
+
     fn can_delegate_service(
         &self,
         delegator_role: ServiceRole,
         receiver_role: ServiceRole,
     ) -> bool {
-        matches!(
-            (delegator_role, receiver_role),
-            (ServiceRole::Init, ServiceRole::ProcessManager)
-                | (ServiceRole::Init, ServiceRole::Vfs)
-                | (ServiceRole::Init, ServiceRole::Driver)
-                | (ServiceRole::Init, ServiceRole::Supervisor)
-                | (ServiceRole::Supervisor, ServiceRole::Driver)
-                | (ServiceRole::Supervisor, ServiceRole::Vfs)
-        )
+        Self::allowed_service_delegation_edges()
+            .iter()
+            .any(|edge| *edge == (delegator_role, receiver_role))
     }
 
     pub fn validate_service_delegation(
@@ -3022,6 +3029,15 @@ mod tests {
         let t = state.ipc_path_telemetry();
         assert!(t.rendezvous_handoffs >= 1);
         assert!(t.fastpath_attempts >= t.fastpath_switches);
+    }
+
+    #[test]
+    fn service_delegation_edges_table_is_auditable_and_frozen() {
+        let edges = KernelState::allowed_service_delegation_edges();
+        assert!(edges.contains(&(ServiceRole::Init, ServiceRole::Driver)));
+        assert!(edges.contains(&(ServiceRole::Supervisor, ServiceRole::Vfs)));
+        assert!(!edges.contains(&(ServiceRole::Driver, ServiceRole::ProcessManager)));
+        assert_eq!(edges.len(), 6);
     }
 
     #[test]
