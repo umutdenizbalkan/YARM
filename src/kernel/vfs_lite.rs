@@ -319,6 +319,143 @@ impl VfsBackend for RamFsBackend {
     }
 }
 
+#[derive(Debug)]
+pub struct Ext4Backend {
+    next_fd: u64,
+    fds: [Option<FdEntry>; MAX_FDS],
+    inodes: [Option<RamFsInode>; MAX_RAMFS_INODES],
+    max_file_len: u64,
+    journal_seq: u64,
+}
+
+impl Default for Ext4Backend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Ext4Backend {
+    pub const fn new() -> Self {
+        Self {
+            next_fd: 200,
+            fds: [None; MAX_FDS],
+            inodes: [None; MAX_RAMFS_INODES],
+            max_file_len: 16 * 1024 * 1024,
+            journal_seq: 0,
+        }
+    }
+
+    pub const fn journal_seq(&self) -> u64 {
+        self.journal_seq
+    }
+
+    fn alloc_fd(&mut self, inode: u64) -> Result<u64, VfsLiteError> {
+        let fd = self.next_fd;
+        self.next_fd = self.next_fd.saturating_add(1);
+        if let Some(slot) = self.fds.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(FdEntry { fd, inode });
+            Ok(fd)
+        } else {
+            Err(VfsLiteError::NoFd)
+        }
+    }
+
+    fn open_inode(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        if let Some(inode) = self
+            .inodes
+            .iter()
+            .flatten()
+            .find(|inode| inode.path_ptr == path_ptr)
+            .map(|inode| inode.path_ptr)
+        {
+            return self.alloc_fd(inode);
+        }
+        if let Some(slot) = self.inodes.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(RamFsInode {
+                path_ptr,
+                file_len: 0,
+            });
+            return self.alloc_fd(path_ptr);
+        }
+        Err(VfsLiteError::NoFd)
+    }
+
+    fn close_fd(&mut self, fd: u64) -> Result<(), VfsLiteError> {
+        if let Some(slot) = self
+            .fds
+            .iter_mut()
+            .find(|slot| slot.map(|entry| entry.fd == fd).unwrap_or(false))
+        {
+            *slot = None;
+            Ok(())
+        } else {
+            Err(VfsLiteError::BadFd)
+        }
+    }
+
+    fn inode_for_fd(&self, fd: u64) -> Option<u64> {
+        self.fds
+            .iter()
+            .flatten()
+            .find(|entry| entry.fd == fd)
+            .map(|entry| entry.inode)
+    }
+
+    fn inode_index_for_path(&self, path_ptr: u64) -> Option<usize> {
+        self.inodes.iter().position(|slot| {
+            slot.map(|inode| inode.path_ptr == path_ptr)
+                .unwrap_or(false)
+        })
+    }
+}
+
+impl VfsBackend for Ext4Backend {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        self.open_inode(path_ptr)
+    }
+
+    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+        self.close_fd(fd)?;
+        Ok(0)
+    }
+
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        let inode = self.inode_for_fd(fd).ok_or(VfsLiteError::BadFd)?;
+        let idx = self
+            .inode_index_for_path(inode)
+            .ok_or(VfsLiteError::BadFd)?;
+        let file_len = self.inodes[idx].ok_or(VfsLiteError::BadFd)?.file_len;
+        Ok(core::cmp::min(len, file_len))
+    }
+
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+        let inode = self.inode_for_fd(fd).ok_or(VfsLiteError::BadFd)?;
+        let idx = self
+            .inode_index_for_path(inode)
+            .ok_or(VfsLiteError::BadFd)?;
+        let Some(mut inode_slot) = self.inodes[idx] else {
+            return Err(VfsLiteError::BadFd);
+        };
+        let Some(new_len) = inode_slot.file_len.checked_add(len) else {
+            return Err(VfsLiteError::Unsupported);
+        };
+        if new_len > self.max_file_len {
+            return Err(VfsLiteError::Unsupported);
+        }
+        inode_slot.file_len = new_len;
+        self.inodes[idx] = Some(inode_slot);
+        self.journal_seq = self.journal_seq.saturating_add(1);
+        Ok(len)
+    }
+
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+        let idx = self
+            .inode_index_for_path(path_ptr)
+            .ok_or(VfsLiteError::BadFd)?;
+        Ok(self.inodes[idx].ok_or(VfsLiteError::BadFd)?.file_len)
+    }
+}
+
 pub const DEV_CONSOLE_PATH_PTR: u64 = 0x434F_4E53_4F4C_4500;
 pub const INITRAMFS_BUSYBOX_PATH_PTR: u64 = 0x494E_4954_4255_5359;
 pub const DEV_NULL_PATH_PTR: u64 = 0x4445_564E_554C_4C00;
@@ -554,6 +691,37 @@ impl InitramfsService {
     pub const fn new(file_len: u64) -> Self {
         Self {
             inner: VfsLiteService::with_backend(ReadOnlyInitramfsBackend::new(file_len)),
+            handled: 0,
+        }
+    }
+
+    pub const fn handled_count(&self) -> usize {
+        self.handled
+    }
+
+    pub fn handle(&mut self, request: Message) -> Result<Message, VfsLiteError> {
+        let reply = self.inner.handle_request(request)?;
+        self.handled = self.handled.saturating_add(1);
+        Ok(reply)
+    }
+}
+
+#[derive(Debug)]
+pub struct Ext4Service {
+    inner: VfsLiteService<Ext4Backend>,
+    handled: usize,
+}
+
+impl Default for Ext4Service {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Ext4Service {
+    pub const fn new() -> Self {
+        Self {
+            inner: VfsLiteService::with_backend(Ext4Backend::new()),
             handled: 0,
         }
     }
@@ -836,6 +1004,39 @@ mod tests {
         let _ = svc.handle(write_console).expect("write console rep");
         let _ = svc.handle(write_null).expect("write null rep");
         assert_eq!(svc.handled_count(), 4);
+    }
+
+    #[test]
+    fn ext4_service_supports_write_stat_and_journal() {
+        let mut svc = Ext4Service::new();
+        let open =
+            Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x2020, 0, 0)).expect("open");
+        let open_rep = svc.handle(open).expect("open rep");
+        let mut fd_bytes = [0u8; 8];
+        fd_bytes.copy_from_slice(open_rep.as_slice());
+        let fd = u64::from_le_bytes(fd_bytes);
+
+        let write =
+            Message::with_header(0, VFS_OP_WRITE, 0, None, &pack(fd, 0, 4096, 0)).expect("write");
+        let _ = svc.handle(write).expect("write rep");
+
+        let stat =
+            Message::with_header(0, VFS_OP_STATX, 0, None, &pack(0, 0x2020, 0, 0)).expect("stat");
+        let stat_rep = svc.handle(stat).expect("stat rep");
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(stat_rep.as_slice());
+        assert_eq!(u64::from_le_bytes(len_bytes), 4096);
+        assert_eq!(svc.handled_count(), 3);
+    }
+
+    #[test]
+    fn ext4_backend_rejects_oversized_write() {
+        let mut backend = Ext4Backend::new();
+        let fd = backend.openat(0x3030).expect("open");
+        assert_eq!(
+            backend.write(fd, (16 * 1024 * 1024) + 1),
+            Err(VfsLiteError::Unsupported)
+        );
     }
 
     #[test]
