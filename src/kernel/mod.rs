@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod capabilities;
 pub mod driver_manager;
 pub mod driver_proto;
+pub mod init_server;
 pub mod ipc;
 pub mod lock;
 pub mod proc_proto;

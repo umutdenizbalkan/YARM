@@ -59,3 +59,9 @@ This checklist focuses on turning the current in-memory kernel model into a port
 3. Freeze and document typed process/VFS server codecs with versioned structs.
 4. Add minimal HAL trait conformance docs/tests for RISC-V and one additional ISA target.
 5. Expand deterministic end-to-end server flow tests (procman + VFS + notification routing).
+
+
+## init.srv scaffold status
+
+- Initial boot-contract scaffold added: `INIT_SERVER_BOOT_CONTRACT.md`
+- Initial implementation added: `src/kernel/init_server.rs` + demo `src/bin/init_server.rs`
