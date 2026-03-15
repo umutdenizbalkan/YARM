@@ -1,7 +1,9 @@
 use super::bootstrap::{Bootstrap, KernelError};
 use super::ipc::Message;
 
-use super::init_server::{CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitServerLite};
+use super::init_server::{
+    CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitFaultHandoff, InitServerLite,
+};
 use super::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
 use super::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use super::vfs_lite::{INITRAMFS_BUSYBOX_PATH_PTR, ReadOnlyInitramfsBackend, VfsLiteService};
@@ -34,6 +36,10 @@ pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError
             supervisor_entry: 0xA000,
         },
     )?;
+    init.install_fault_handoff(InitFaultHandoff {
+        supervisor_tid: graph.supervisor_tid,
+        restart_window_ticks: 100,
+    })?;
     init.begin_running()?;
 
     let mut proc = ProcessService::new();

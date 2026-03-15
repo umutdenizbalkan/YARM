@@ -2,7 +2,9 @@
 extern crate std;
 
 use yarm::kernel::bootstrap::Bootstrap;
-use yarm::kernel::init_server::{CoreServiceGraph, CoreServiceImagePlan, InitServerLite};
+use yarm::kernel::init_server::{
+    CoreServiceGraph, CoreServiceImagePlan, InitFaultHandoff, InitServerLite,
+};
 
 use std::println;
 
@@ -30,6 +32,11 @@ fn main() {
             },
         )
         .expect("launch");
+    init.install_fault_handoff(InitFaultHandoff {
+        supervisor_tid: graph.supervisor_tid,
+        restart_window_ticks: 100,
+    })
+    .expect("handoff");
     init.begin_running().expect("running");
 
     println!(

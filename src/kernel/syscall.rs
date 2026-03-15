@@ -51,6 +51,8 @@ impl Syscall {
 
 const _: [(); SYSCALL_COUNT] = [(); Syscall::VARIANT_COUNT];
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
+const _: () = assert!(syscall_abi::TRAPFRAME_ARG_REGS > SYSCALL_ARG_TRANSFER_CAP);
+const _: () = assert!(syscall_abi::TRAPFRAME_ARG_REGS > SYSCALL_ARG_INLINE_PAYLOAD1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]

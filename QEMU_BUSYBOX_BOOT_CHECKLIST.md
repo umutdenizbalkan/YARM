@@ -22,8 +22,8 @@ This file tracks the 7 immediate tasks and their implementation status.
 - [x] 6. Add QEMU boot script for one ISA.
   - Added `scripts/qemu-riscv64-busybox-smoke.sh`.
 
-- [x] 7. Add non-blocking CI smoke for "BusyBox appears on serial".
-  - Added `.github/workflows/busybox-qemu-smoke.yml` (`continue-on-error: true`) invoking the script.
+- [x] 7. Add CI smoke for "BusyBox appears on serial" with strict-mode toggle.
+  - Added `.github/workflows/busybox-qemu-smoke.yml` invoking the script; strict failure is controlled by `QEMU_SMOKE_STRICT`.
 
 ## Notes
 

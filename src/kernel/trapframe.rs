@@ -15,6 +15,8 @@ pub struct TrapFrame {
     pub error: usize,
 }
 
+const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
+
 impl TrapFrame {
     pub const fn new(syscall_num: usize, args: [usize; syscall_abi::TRAPFRAME_ARG_REGS]) -> Self {
         Self {

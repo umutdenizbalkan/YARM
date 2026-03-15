@@ -42,3 +42,9 @@
 - `7`: `WouldBlock`
 - `8`: `PageFault`
 - `255`: `Internal`
+
+
+## Per-ISA shape source of truth
+
+- Trap/syscall argument lane count and IPC inline register-lane width are sourced from `crate::arch::syscall_abi` (`TRAPFRAME_ARG_REGS`, `IPC_REGISTER_WORDS`).
+- `src/kernel/syscall.rs` and `src/kernel/trapframe.rs` include compile-time assertions to keep ABI lane mapping synchronized with the selected ISA profile.

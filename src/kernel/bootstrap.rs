@@ -275,7 +275,7 @@ impl Bootstrap {
 
         let mut scheduler = SmpScheduler::default();
         scheduler
-            .enqueue_on(CpuId(0), 0)
+            .enqueue_on(CpuId(platform_layout::BOOTSTRAP_CPU_ID), 0)
             .map_err(|_| KernelError::SchedulerFull)?;
 
         let mut cspace = CapabilitySpace::default();
@@ -291,7 +291,7 @@ impl Bootstrap {
             kernel_aspace,
             scheduler,
             cspace,
-            timer: Timer::new(10),
+            timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: AddressSpaceManager::default(),
             ipc: IpcSubsystem {
                 cross_cpu_work: CrossCpuWorkQueue::default(),

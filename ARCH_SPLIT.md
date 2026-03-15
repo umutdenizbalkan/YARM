@@ -23,7 +23,7 @@ This file documents the initial architecture split work for step 5b.
   - converts load/store page faults -> `Trap::PageFault` with `FaultInfo`
 - `KernelState::handle_trap_event` to consume normalized trap events from arch decoders.
 - `arch::riscv::handle_trap_entry` to set current CPU, drain per-CPU deferred work, then route normalized trap events.
-- HAL conformance unit coverage now includes two ISA-shaped mocks (RISC-V-like + x86-like) validating that kernel-facing expectations remain identical across architectures.
+- HAL conformance unit coverage now includes three ISA-shaped mocks (RISC-V-like + x86-like + AArch64-like) validating that kernel-facing expectations remain identical across architectures.
 
 ## HAL conformance checklist (RISC-V + x86 baseline)
 
@@ -38,7 +38,7 @@ This file documents the initial architecture split work for step 5b.
 - Connect real arch trap entry stubs to call `decode_trap`.
 - Route per-CPU timer + IPI interrupts into cross-CPU work handling.
 - Add architecture-specific context switch/trapframe save/restore.
-- Extend conformance coverage to ARM trap-context shape using the same HAL contract.
+- [x] Extend conformance coverage to ARM trap-context shape using the same HAL contract.
 
 
 ## VM layout boundary
@@ -59,3 +59,8 @@ Architecture/address-space constants are now selected through per-ISA modules in
   - `src/arch/syscall_abi.rs`
 
 Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layout,platform_layout,syscall_abi}`), which keeps mechanism code architecture-agnostic.
+
+
+## Boundary enforcement in CI
+
+- `scripts/check-kernel-arch-boundary.sh` rejects direct architecture-shape constants in `src/kernel/*` for selected migrated fields (CPU/IRQ sizing, trap arg width, IPC register lanes, bootstrap VA/PA seed constants).

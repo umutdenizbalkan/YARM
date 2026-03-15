@@ -77,10 +77,17 @@ pub struct CoreLaunchReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitFaultHandoff {
+    pub supervisor_tid: u64,
+    pub restart_window_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitServerLite {
     phase: InitBootPhase,
     handles: CoreServiceHandles,
     startup_caps: StartupCapSet,
+    fault_handoff: Option<InitFaultHandoff>,
 }
 
 impl Default for InitServerLite {
@@ -99,6 +106,7 @@ impl InitServerLite {
                 supervisor_tid: None,
             },
             startup_caps: StartupCapSet::core_required_minimum(),
+            fault_handoff: None,
         }
     }
 
@@ -112,6 +120,10 @@ impl InitServerLite {
 
     pub const fn startup_caps(&self) -> StartupCapSet {
         self.startup_caps
+    }
+
+    pub const fn fault_handoff(&self) -> Option<InitFaultHandoff> {
+        self.fault_handoff
     }
 
     pub fn set_startup_caps(&mut self, caps: StartupCapSet) {
@@ -198,12 +210,23 @@ impl InitServerLite {
         })
     }
 
+    pub fn install_fault_handoff(&mut self, handoff: InitFaultHandoff) -> Result<(), KernelError> {
+        if self.phase != InitBootPhase::LaunchingCore {
+            return Err(KernelError::WrongObject);
+        }
+        if self.handles.supervisor_tid != Some(handoff.supervisor_tid) {
+            return Err(KernelError::WrongObject);
+        }
+        self.fault_handoff = Some(handoff);
+        Ok(())
+    }
+
     pub fn mark_failed(&mut self) {
         self.phase = InitBootPhase::Failed;
     }
 
     pub fn begin_running(&mut self) -> Result<(), KernelError> {
-        if self.phase != InitBootPhase::LaunchingCore {
+        if self.phase != InitBootPhase::LaunchingCore || self.fault_handoff.is_none() {
             return Err(KernelError::WrongObject);
         }
         self.phase = InitBootPhase::Running;
@@ -290,8 +313,37 @@ mod tests {
         assert!(report.vfs_spawned);
         assert!(report.supervisor_spawned);
 
+        init.install_fault_handoff(InitFaultHandoff {
+            supervisor_tid: 4,
+            restart_window_ticks: 50,
+        })
+        .expect("handoff");
         init.begin_running().expect("running");
         assert_eq!(init.phase(), InitBootPhase::Running);
+    }
+
+    #[test]
+    fn begin_running_requires_fault_handoff() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitServerLite::new();
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut state, graph)
+            .expect("register");
+        init.launch_core_services(
+            &mut state,
+            CoreServiceImagePlan {
+                process_manager_entry: 0x8000,
+                vfs_entry: 0x9000,
+                supervisor_entry: 0xA000,
+            },
+        )
+        .expect("launch");
+        assert_eq!(init.begin_running(), Err(KernelError::WrongObject));
     }
 
     #[test]

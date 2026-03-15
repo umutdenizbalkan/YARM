@@ -103,6 +103,46 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct Aarch64TrapContext {
+        esr: u32,
+        far: u64,
+    }
+
+    #[derive(Debug, Default)]
+    struct MockAarch64Hal {
+        last_asid: Option<Asid>,
+        last_irq: Option<(CpuId, u16)>,
+        last_timer: Option<(CpuId, u64)>,
+    }
+
+    impl Hal for MockAarch64Hal {
+        type TrapContext = Aarch64TrapContext;
+
+        fn switch_address_space(&mut self, asid: Asid) {
+            self.last_asid = Some(asid);
+        }
+
+        fn acknowledge_interrupt(&mut self, cpu: CpuId, irq_line: u16) {
+            self.last_irq = Some((cpu, irq_line));
+        }
+
+        fn program_timer_deadline(&mut self, cpu: CpuId, ticks_from_now: u64) {
+            self.last_timer = Some((cpu, ticks_from_now));
+        }
+
+        fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent {
+            if context.esr == 0x15 {
+                TrapEvent::syscall()
+            } else {
+                TrapEvent::page_fault(FaultInfo {
+                    addr: VirtAddr(context.far),
+                    access: FaultAccess::Read,
+                })
+            }
+        }
+    }
+
     #[test]
     fn hal_contract_is_isa_agnostic_for_riscv_like_impl() {
         let mut hal = MockRiscvHal::default();
@@ -141,5 +181,28 @@ mod tests {
         assert_eq!(hal.last_asid, Some(Asid(7)));
         assert_eq!(hal.last_irq, Some((CpuId(1), 33)));
         assert_eq!(hal.last_timer, Some((CpuId(1), 250)));
+    }
+
+    #[test]
+    fn hal_contract_is_isa_agnostic_for_aarch64_like_impl() {
+        let mut hal = MockAarch64Hal::default();
+        hal.switch_address_space(Asid(9));
+        hal.acknowledge_interrupt(CpuId(2), 41);
+        hal.program_timer_deadline(CpuId(2), 500);
+
+        let trap = hal.decode_trap_event(&Aarch64TrapContext {
+            esr: 0x24,
+            far: 0xABCD_1000,
+        });
+        assert_eq!(
+            trap,
+            TrapEvent::page_fault(FaultInfo {
+                addr: VirtAddr(0xABCD_1000),
+                access: FaultAccess::Read,
+            })
+        );
+        assert_eq!(hal.last_asid, Some(Asid(9)));
+        assert_eq!(hal.last_irq, Some((CpuId(2), 41)));
+        assert_eq!(hal.last_timer, Some((CpuId(2), 500)));
     }
 }

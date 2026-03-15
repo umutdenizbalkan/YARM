@@ -30,11 +30,12 @@ These IDs are registered by `InitServerLite::register_core_graph` and assigned s
 4. `Running`
 5. `Failed`
 
-`begin_running()` is valid only after successful core launch (`LaunchingCore`).
+`begin_running()` is valid only after successful core launch (`LaunchingCore`) and explicit fault-policy handoff installation.
 
 ## Required checks before running
 
 - Tasks for all core services are registered.
+- Fault/restart handoff is installed and bound to `supervisor_tid`.
 - Service roles are assigned:
   - `Init`
   - `ProcessManager`
@@ -49,4 +50,4 @@ These IDs are registered by `InitServerLite::register_core_graph` and assigned s
 
 - This is a mechanism-level scaffold in `src/kernel/init_server.rs` and `src/bin/init_server.rs`.
 - Launch ordering now routes through `launch_core_services` with explicit core image plan and failure transition support (`mark_failed`).
-- Future revisions will add restart/fault policy handoff integration.
+- Restart/fault policy handoff is now represented by `InitFaultHandoff` and must be installed before `Running`.
