@@ -5,6 +5,7 @@ pub mod driver_proto;
 pub mod ipc;
 pub mod linux_compat;
 pub mod lock;
+pub mod proc_proto;
 pub mod process_manager;
 pub mod runtime;
 pub mod scheduler;
@@ -16,6 +17,7 @@ pub mod timer;
 pub mod trap;
 pub mod trapframe;
 pub mod vfs_lite;
+pub mod vfs_proto;
 pub mod vm;
 
 pub use bootstrap::{Bootstrap, KernelState};

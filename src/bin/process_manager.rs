@@ -2,7 +2,7 @@
 extern crate std;
 
 use yarm::kernel::ipc::Message;
-use yarm::kernel::linux_compat::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
+use yarm::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
 use yarm::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 
 use std::println;

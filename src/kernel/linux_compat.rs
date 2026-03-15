@@ -1,7 +1,17 @@
 use super::bootstrap::{KernelError, KernelState};
 use super::capabilities::CapId;
 use super::ipc::Message;
+#[cfg(test)]
+use super::proc_proto::{PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2, ProcV2Args};
+use super::proc_proto::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_SERVER_ABI_VERSION};
 use super::trapframe::TrapFrame;
+#[cfg(test)]
+use super::vfs_proto::VFS_CODEC_V1_VERSION;
+use super::vfs_proto::{
+    VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT,
+    VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE,
+    VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
+};
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
 // Linux syscall numbers in this module follow the LP64 numbering used by
@@ -9,10 +19,8 @@ use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
 pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 20;
-pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = 1;
-pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = 1;
-pub const PROC_CODEC_V2_VERSION: u16 = 2;
-pub const VFS_CODEC_V1_VERSION: u16 = 1;
+pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = PROC_SERVER_ABI_VERSION;
+pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = VFS_SERVER_ABI_VERSION;
 
 pub const LINUX_NR_BRK: usize = 214;
 pub const LINUX_NR_MUNMAP: usize = 215;
@@ -34,26 +42,6 @@ pub const LINUX_NR_EPOLL_CTL: usize = 21;
 pub const LINUX_NR_EPOLL_PWAIT: usize = 22;
 pub const LINUX_NR_SENDFILE: usize = 71;
 pub const LINUX_NR_STATX: usize = 291;
-
-pub const PROC_OP_GETPID: u16 = 1;
-pub const PROC_OP_EXIT: u16 = 2;
-pub const PROC_OP_GETPPID: u16 = 3;
-pub const PROC_OP_SPAWN_V2: u16 = 4;
-pub const PROC_OP_WAITPID_V2: u16 = 5;
-
-pub const VFS_OP_OPENAT: u16 = 10;
-pub const VFS_OP_CLOSE: u16 = 11;
-pub const VFS_OP_READ: u16 = 12;
-pub const VFS_OP_WRITE: u16 = 13;
-pub const VFS_OP_IOCTL: u16 = 14;
-pub const VFS_OP_DUP: u16 = 15;
-pub const VFS_OP_FCNTL: u16 = 16;
-pub const VFS_OP_POLL: u16 = 17;
-pub const VFS_OP_EPOLL_CREATE1: u16 = 18;
-pub const VFS_OP_EPOLL_CTL: u16 = 19;
-pub const VFS_OP_EPOLL_PWAIT: u16 = 20;
-pub const VFS_OP_SENDFILE: u16 = 21;
-pub const VFS_OP_STATX: u16 = 22;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -305,103 +293,6 @@ impl LinuxCompatSyscall {
             LINUX_NR_MPROTECT => Ok(Self::Mprotect),
             _ => Err(LinuxErrno::NoSys),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcV2Args {
-    pub arg0: u64,
-    pub arg1: u64,
-}
-
-impl ProcV2Args {
-    pub const VERSION: u16 = PROC_CODEC_V2_VERSION;
-    pub const ENCODED_LEN: usize = 16;
-
-    pub const fn new(arg0: u64, arg1: u64) -> Self {
-        Self { arg0, arg1 }
-    }
-
-    pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
-        let mut payload = [0u8; Self::ENCODED_LEN];
-        let a0 = self.arg0.to_le_bytes();
-        let a1 = self.arg1.to_le_bytes();
-        let mut i = 0;
-        while i < 8 {
-            payload[i] = a0[i];
-            payload[8 + i] = a1[i];
-            i += 1;
-        }
-        payload
-    }
-
-    pub fn decode(payload: &[u8]) -> Result<Self, LinuxErrno> {
-        if payload.len() < Self::ENCODED_LEN {
-            return Err(LinuxErrno::Inval);
-        }
-        let mut a0 = [0u8; 8];
-        let mut a1 = [0u8; 8];
-        a0.copy_from_slice(&payload[..8]);
-        a1.copy_from_slice(&payload[8..Self::ENCODED_LEN]);
-        Ok(Self {
-            arg0: u64::from_le_bytes(a0),
-            arg1: u64::from_le_bytes(a1),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VfsV1Args {
-    pub arg0: u64,
-    pub arg1: u64,
-    pub arg2: u64,
-    pub arg3: u64,
-}
-
-impl VfsV1Args {
-    pub const VERSION: u16 = VFS_CODEC_V1_VERSION;
-    pub const ENCODED_LEN: usize = 32;
-
-    pub const fn new(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> Self {
-        Self {
-            arg0,
-            arg1,
-            arg2,
-            arg3,
-        }
-    }
-
-    pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
-        let mut payload = [0u8; Self::ENCODED_LEN];
-        let values = [self.arg0, self.arg1, self.arg2, self.arg3];
-        let mut idx = 0;
-        while idx < values.len() {
-            let bytes = values[idx].to_le_bytes();
-            let mut offset = 0;
-            while offset < 8 {
-                payload[idx * 8 + offset] = bytes[offset];
-                offset += 1;
-            }
-            idx += 1;
-        }
-        payload
-    }
-
-    pub fn decode(payload: &[u8]) -> Result<Self, LinuxErrno> {
-        if payload.len() < Self::ENCODED_LEN {
-            return Err(LinuxErrno::Inval);
-        }
-        let mut values = [0u64; 4];
-        let mut idx = 0;
-        while idx < values.len() {
-            let start = idx * 8;
-            let end = start + 8;
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&payload[start..end]);
-            values[idx] = u64::from_le_bytes(bytes);
-            idx += 1;
-        }
-        Ok(Self::new(values[0], values[1], values[2], values[3]))
     }
 }
 
@@ -892,8 +783,8 @@ mod tests {
 
     #[test]
     fn codec_rejects_truncated_payloads() {
-        assert_eq!(ProcV2Args::decode(&[0u8; 15]), Err(LinuxErrno::Inval));
-        assert_eq!(VfsV1Args::decode(&[0u8; 31]), Err(LinuxErrno::Inval));
+        assert!(ProcV2Args::decode(&[0u8; 15]).is_err());
+        assert!(VfsV1Args::decode(&[0u8; 31]).is_err());
     }
 
     #[test]

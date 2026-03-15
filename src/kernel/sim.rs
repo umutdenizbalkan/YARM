@@ -1,9 +1,9 @@
 use super::bootstrap::{Bootstrap, KernelError};
 use super::ipc::Message;
-use super::linux_compat::{
-    LINUX_NR_GETPID, LINUX_NR_OPENAT, LinuxServiceBindings, PROC_OP_GETPID, VFS_OP_OPENAT, dispatch,
-};
+use super::linux_compat::{LINUX_NR_GETPID, LINUX_NR_OPENAT, LinuxServiceBindings, dispatch};
+use super::proc_proto::PROC_OP_GETPID;
 use super::trapframe::TrapFrame;
+use super::vfs_proto::VFS_OP_OPENAT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimStep {

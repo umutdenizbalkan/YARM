@@ -1,5 +1,5 @@
 use super::ipc::Message;
-use super::linux_compat::{
+use super::vfs_proto::{
     VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
 };
 
@@ -270,7 +270,7 @@ impl<B: VfsBackend> VfsLiteService<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::linux_compat::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
+    use crate::kernel::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
 
     fn pack(a0: u64, a1: u64, a2: u64, a3: u64) -> [u8; 32] {
         VfsV1Args::new(a0, a1, a2, a3).encode()

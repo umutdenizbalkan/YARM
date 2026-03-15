@@ -102,3 +102,8 @@ The compatibility suite further validates deterministic mixed server flow with I
 
 
 The compatibility-gate suite now includes golden fixture vectors and truncated-payload rejection checks for `ProcV2Args` and `VfsV1Args`, so any wire-format drift fails tests immediately.
+
+
+## Standalone server boundary
+
+Linux compatibility is now treated as a standalone personality server boundary. Core process-manager and VFS servers depend only on protocol modules (`proc_proto`, `vfs_proto`) and can be shipped without Linux personality support. The Linux compatibility layer consumes those protocols over IPC rather than owning their contracts.

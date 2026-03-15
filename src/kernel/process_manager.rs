@@ -1,5 +1,5 @@
 use super::ipc::Message;
-use super::linux_compat::{
+use super::proc_proto::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args,
 };
 
