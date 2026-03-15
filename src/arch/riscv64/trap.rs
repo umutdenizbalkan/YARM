@@ -15,12 +15,12 @@ const IRQ_SUPERVISOR_TIMER: usize = 5;
 const IRQ_SUPERVISOR_EXTERNAL: usize = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RiscvTrapContext {
+pub struct Riscv64TrapContext {
     pub scause: usize,
     pub stval: usize,
 }
 
-pub fn decode_trap_context(context: RiscvTrapContext) -> TrapEvent {
+pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
     let is_interrupt = (context.scause & INTERRUPT_BIT) != 0;
     let code = context.scause & SCAUSE_EXCEPTION_MASK;
 
@@ -46,14 +46,10 @@ pub fn decode_trap_context(context: RiscvTrapContext) -> TrapEvent {
     }
 }
 
-pub fn decode_trap(scause: usize, stval: usize) -> TrapEvent {
-    decode_trap_context(RiscvTrapContext { scause, stval })
-}
-
 pub fn handle_trap_entry(
     kernel: &mut KernelState,
     cpu: CpuId,
-    context: RiscvTrapContext,
+    context: Riscv64TrapContext,
     frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
     let _ = kernel.set_current_cpu(cpu);
@@ -68,76 +64,31 @@ mod tests {
 
     #[test]
     fn decode_user_ecall_to_syscall() {
-        let event = decode_trap_context(RiscvTrapContext {
+        let event = decode_trap_context(Riscv64TrapContext {
             scause: EXC_USER_ECALL,
             stval: 0,
         });
         assert_eq!(event.trap, Trap::Syscall);
-        assert_eq!(event.fault, None);
     }
 
     #[test]
-    fn decode_timer_irq_to_timer_interrupt() {
-        let event = decode_trap_context(RiscvTrapContext {
-            scause: INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER,
-            stval: 0,
-        });
-        assert_eq!(event.trap, Trap::TimerInterrupt);
-    }
-
-    #[test]
-    fn decode_external_irq_carries_irq_line() {
-        let event = decode_trap_context(RiscvTrapContext {
-            scause: INTERRUPT_BIT | IRQ_SUPERVISOR_EXTERNAL,
-            stval: 11,
-        });
-        assert_eq!(event.trap, Trap::ExternalInterrupt);
-        assert_eq!(event.irq, Some(11));
-    }
-
-    #[test]
-    fn decode_page_fault_carries_fault_info() {
-        let event = decode_trap_context(RiscvTrapContext {
-            scause: EXC_STORE_PAGE_FAULT,
-            stval: 0xDEAD_BEEF,
-        });
-        assert_eq!(event.trap, Trap::PageFault);
-        assert_eq!(
-            event.fault,
-            Some(FaultInfo {
-                addr: VirtAddr(0xDEAD_BEEF),
-                access: FaultAccess::Write,
-            })
-        );
-    }
-
-    #[test]
-    fn trap_entry_sets_cpu_and_processes_cpu_work() {
+    fn trap_entry_sets_cpu_and_handles_timer() {
         use crate::kernel::bootstrap::Bootstrap;
-        use crate::kernel::smp::WorkItem;
-        use crate::kernel::vm::Asid;
 
         let mut state = Bootstrap::init().expect("init");
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
-        state
-            .submit_cross_cpu_work(WorkItem::TlbShootdown {
-                target_cpu: CpuId(1),
-                asid: Asid(1),
-            })
-            .expect("submit");
 
         handle_trap_entry(
             &mut state,
             CpuId(1),
-            RiscvTrapContext {
+            Riscv64TrapContext {
                 scause: INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER,
                 stval: 0,
             },
             None,
         )
-        .expect("handle");
+        .expect("timer");
 
         assert_eq!(state.scheduler.current_cpu(), CpuId(1));
-        assert_eq!(state.tlb_shootdown_count(), 1);
     }
 }

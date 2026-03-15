@@ -9,12 +9,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Build staged artifacts
         run: scripts/build-qemu-riscv64-artifacts.sh
       - name: Install qemu
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-misc
+          sudo apt-get install -y qemu-system-misc cpio busybox-static
       - name: BusyBox QEMU smoke
         env:
           QEMU_SMOKE_STRICT: "0"

@@ -23,3 +23,5 @@ pub use self::riscv64 as selected_isa;
 pub mod platform_layout;
 pub mod syscall_abi;
 pub mod vm_layout;
+
+pub mod trap_entry;

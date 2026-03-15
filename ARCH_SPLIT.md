@@ -64,3 +64,12 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
 ## Boundary enforcement in CI
 
 - `scripts/check-kernel-arch-boundary.sh` rejects direct architecture-shape constants in `src/kernel/*` for selected migrated fields (CPU/IRQ sizing, trap arg width, IPC register lanes, bootstrap VA/PA seed constants).
+
+
+## Trap-entry plumbing status
+
+- Added trap decode + trap entry handlers for all three ISA bring-up paths:
+  - `src/arch/riscv64/trap.rs`
+  - `src/arch/x86_64/trap.rs`
+  - `src/arch/aarch64/trap.rs`
+- Added selected-ISA trap dispatch facade `src/arch/trap_entry.rs` so kernel integration can call one arch-selected entrypoint shape.
