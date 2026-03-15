@@ -8,6 +8,7 @@ pub mod lock;
 pub mod process_manager;
 pub mod runtime;
 pub mod scheduler;
+pub mod sim;
 pub mod smp;
 pub mod syscall;
 pub mod task;

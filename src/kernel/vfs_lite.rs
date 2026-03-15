@@ -1,5 +1,7 @@
 use super::ipc::Message;
-use super::linux_compat::{VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX, VFS_OP_WRITE};
+use super::linux_compat::{
+    VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
+};
 
 const MAX_FDS: usize = 16;
 
@@ -211,47 +213,36 @@ impl<B: VfsBackend> VfsLiteService<B> {
         Self { backend }
     }
 
-    fn read_u64(payload: &[u8], idx: usize) -> Result<u64, VfsLiteError> {
-        let start = idx.checked_mul(8).ok_or(VfsLiteError::Malformed)?;
-        let end = start.checked_add(8).ok_or(VfsLiteError::Malformed)?;
-        let bytes = payload.get(start..end).ok_or(VfsLiteError::Malformed)?;
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(bytes);
-        Ok(u64::from_le_bytes(arr))
-    }
-
     fn u64_reply(opcode: u16, value: u64) -> Result<Message, VfsLiteError> {
         Message::with_header(0, opcode, 0, None, &value.to_le_bytes())
             .map_err(|_| VfsLiteError::Malformed)
     }
 
     pub fn parse_request(request: Message) -> Result<VfsRequest, VfsLiteError> {
-        let payload = request.as_slice();
+        let args = VfsV1Args::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
         match request.opcode {
             VFS_OP_OPENAT => Ok(VfsRequest::OpenAt {
-                _dirfd: Self::read_u64(payload, 0)?,
-                path_ptr: Self::read_u64(payload, 1)?,
-                _flags: Self::read_u64(payload, 2)?,
-                _mode: Self::read_u64(payload, 3)?,
+                _dirfd: args.arg0,
+                path_ptr: args.arg1,
+                _flags: args.arg2,
+                _mode: args.arg3,
             }),
-            VFS_OP_CLOSE => Ok(VfsRequest::Close {
-                fd: Self::read_u64(payload, 0)?,
-            }),
+            VFS_OP_CLOSE => Ok(VfsRequest::Close { fd: args.arg0 }),
             VFS_OP_READ => Ok(VfsRequest::Read {
-                fd: Self::read_u64(payload, 0)?,
-                _buf_ptr: Self::read_u64(payload, 1)?,
-                len: Self::read_u64(payload, 2)?,
+                fd: args.arg0,
+                _buf_ptr: args.arg1,
+                len: args.arg2,
             }),
             VFS_OP_WRITE => Ok(VfsRequest::Write {
-                fd: Self::read_u64(payload, 0)?,
-                _buf_ptr: Self::read_u64(payload, 1)?,
-                len: Self::read_u64(payload, 2)?,
+                fd: args.arg0,
+                _buf_ptr: args.arg1,
+                len: args.arg2,
             }),
             VFS_OP_STATX => Ok(VfsRequest::Statx {
-                _dirfd: Self::read_u64(payload, 0)?,
-                path_ptr: Self::read_u64(payload, 1)?,
-                _flags: Self::read_u64(payload, 2)?,
-                _mask_or_buf: Self::read_u64(payload, 3)?,
+                _dirfd: args.arg0,
+                path_ptr: args.arg1,
+                _flags: args.arg2,
+                _mask_or_buf: args.arg3,
             }),
             _ => Err(VfsLiteError::Unsupported),
         }
@@ -279,15 +270,10 @@ impl<B: VfsBackend> VfsLiteService<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::linux_compat::{VFS_OP_OPENAT, VFS_OP_READ};
+    use crate::kernel::linux_compat::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
 
     fn pack(a0: u64, a1: u64, a2: u64, a3: u64) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        out[0..8].copy_from_slice(&a0.to_le_bytes());
-        out[8..16].copy_from_slice(&a1.to_le_bytes());
-        out[16..24].copy_from_slice(&a2.to_le_bytes());
-        out[24..32].copy_from_slice(&a3.to_le_bytes());
-        out
+        VfsV1Args::new(a0, a1, a2, a3).encode()
     }
 
     #[test]
