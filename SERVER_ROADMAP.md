@@ -164,6 +164,8 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ## Readiness criteria
 
+- Readiness evidence mapping is maintained in `PHASE_READINESS_MATRIX.md` and enforced by `scripts/check-roadmap-readiness.sh`.
+
 Phase N is considered complete only when:
 
 - implementation exists,

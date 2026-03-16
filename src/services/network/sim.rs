@@ -56,4 +56,29 @@ mod tests {
         assert_eq!(socket.stats().opens, 1);
         assert_eq!(socket.stats().closes, 1);
     }
+
+    #[test]
+    fn repeated_route_loss_recovery_sequence_is_stable() {
+        let mut netmgr = NetmgrService::new();
+        let mut tcpip = TcpIpService::new();
+        let mut dhcp = DhcpService::new();
+
+        netmgr.mark_link(true);
+        dhcp.grant_lease(false);
+
+        for _ in 0..3 {
+            netmgr.mark_link(false);
+            tcpip.route_packet(false);
+            dhcp.grant_lease(true);
+            netmgr.mark_link(true);
+            tcpip.route_packet(true);
+        }
+
+        assert_eq!(netmgr.stats().links_up, 4);
+        assert_eq!(netmgr.stats().links_down, 3);
+        assert_eq!(dhcp.stats().leases_granted, 1);
+        assert_eq!(dhcp.stats().lease_renewals, 3);
+        assert_eq!(tcpip.stats().routed_packets, 3);
+        assert_eq!(tcpip.stats().dropped_packets, 3);
+    }
 }

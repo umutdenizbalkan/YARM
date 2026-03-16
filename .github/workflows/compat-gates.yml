@@ -92,6 +92,18 @@ jobs:
           cargo run -q --bin display_srv | tee /tmp/display_srv.log
           rg -n "\[ui\] boot-to-shell marker" /tmp/display_srv.log
 
+
+  phase3-4-strict-runtime-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: phase3 recovery + ui marker combined gate
+        run: |
+          cargo test -q services::network::sim::tests::link_flap_dhcp_rebind_and_socket_recovery_is_deterministic
+          cargo run -q --bin display_srv | tee /tmp/display_srv_combined.log
+          rg -n "\[ui\] boot-to-shell marker" /tmp/display_srv_combined.log
+
   mount-failure-matrix-sim-gate:
     runs-on: ubuntu-latest
     steps:

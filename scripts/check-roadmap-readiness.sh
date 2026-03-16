@@ -8,7 +8,7 @@ if ! rg -n "## Architecture follow-up status \(frozen\)" SERVER_ROADMAP.md >/dev
   bad=1
 fi
 
-for f in PHASE2_DRIVER_CONTRACT.md PHASE3_NETWORK_CONTRACT.md PHASE4_UI_CONTRACT.md; do
+for f in PHASE2_DRIVER_CONTRACT.md PHASE3_NETWORK_CONTRACT.md PHASE4_UI_CONTRACT.md PHASE_READINESS_MATRIX.md; do
   if [[ ! -f "$f" ]]; then
     echo "[fail] missing required phase contract: $f"
     bad=1
@@ -32,6 +32,32 @@ if rg -n "## Architecture follow-up addenda" SERVER_ROADMAP.md >/dev/null; then
   # addenda lines should be dated bullets like: - YYYY-MM-DD: ...
   if ! rg -n "^- [0-9]{4}-[0-9]{2}-[0-9]{2}:" SERVER_ROADMAP.md >/dev/null; then
     echo "[fail] architecture addenda must include at least one dated entry (- YYYY-MM-DD: ...)"
+    bad=1
+  fi
+fi
+
+if [[ "$bad" -ne 0 ]]; then
+  exit 1
+fi
+
+# matrix/workflow synchronization checks
+for token in phase2-driver-gates phase3-network-gates phase4-ui-gates phase4-ui-smoke-marker; do
+  if ! rg -n "$token" PHASE_READINESS_MATRIX.md >/dev/null; then
+    echo "[fail] readiness matrix missing CI token: $token"
+    bad=1
+  fi
+  if ! rg -n "$token" .github/workflows/compat-gates.yml .github/workflows/busybox-qemu-smoke.yml >/dev/null; then
+    echo "[fail] workflows missing CI token from matrix: $token"
+    bad=1
+  fi
+done
+
+# phase-complete semantic checks
+if rg -n "## Phase 2 — Device Driver Servers" -A 30 SERVER_ROADMAP.md | rg -n "🚧" >/dev/null; then
+  :
+else
+  if ! rg -n "PHASE2_DRIVER_CONTRACT.md" PHASE_READINESS_MATRIX.md >/dev/null; then
+    echo "[fail] phase2 appears complete but matrix/contract mapping is missing"
     bad=1
   fi
 fi
