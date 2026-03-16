@@ -13,6 +13,7 @@ Port user-space runtime to `x86_64-unknown-none` and provide a minimal musl sysd
 - [x] Introduce build profile knobs for freestanding userspace (panic=abort, LTO optional).
 - [ ] Verify `cargo build --target <x86_64-none-target>` works for `kernel_boot` and `init_server` without Linux ABI assumptions.
   - Current blocker: `core` is unavailable for this custom target in the current toolchain setup; next step is to wire `build-std`/`rust-src` strategy for the freestanding target.
+  - Bootstrap script added: `scripts/build-x86_64-none-bootstrap.sh` to enforce toolchain/rust-src checks and run the `-Z build-std` flow once prerequisites exist.
 
 ## Milestone 2 — ABI boundary contract for libc shim
 

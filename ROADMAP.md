@@ -65,6 +65,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Added cargo aliases for x86_64-none bring-up in `.cargo/config.toml`.
 - Added x86-none build profile knobs in `Cargo.toml` and wired them into x86 artifact staging.
 - Added x86_64 artifact and smoke scaffolds: `scripts/build-qemu-x86_64-artifacts.sh`, `scripts/qemu-x86_64-busybox-smoke.sh`.
+- Added freestanding build bootstrap helper script: `scripts/build-x86_64-none-bootstrap.sh` (checks nightly + rust-src before running `-Z build-std`).
 
 ## Immediate next 5 implementable steps
 
