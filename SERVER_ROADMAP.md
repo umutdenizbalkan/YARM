@@ -63,6 +63,9 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - ✅ `devfs.srv` scaffold implemented (`services/devfs/*` + thin `src/bin/devfs_srv.rs` entrypoint (console/null nodes)).
 - ✅ `ext4.srv` scaffold implemented (`services/ext4/*` + thin `src/bin/ext4_srv.rs` entrypoint).
 
+- 🚧 `fat.srv` scaffold started (`services/fat/*` + thin `src/bin/fat_srv.rs` entrypoint).
+- 🚧 `blkcache.srv` scaffold started (`services/blkcache/*` + thin `src/bin/blkcache_srv.rs` entrypoint).
+
 ## Phase 2 — Device Driver Servers
 
 ### Target servers

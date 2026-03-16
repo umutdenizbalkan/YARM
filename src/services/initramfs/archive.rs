@@ -1,4 +1,4 @@
-use crate::kernel::vfs_lite::{VfsBackend, VfsLiteError};
+use crate::kernel::vfs::{VfsBackend, VfsLiteError};
 
 pub const INITRAMFS_BUSYBOX_PATH_PTR: u64 = 0x494E_4954_4255_5359;
 

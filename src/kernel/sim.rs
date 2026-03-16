@@ -6,9 +6,10 @@ use super::init_server::{
 };
 use super::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
 use super::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
-use super::vfs_lite::VfsLiteService;
+use super::vfs_lite::{MountRouter, VfsLiteService};
 use super::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
 use crate::services::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
+use crate::services::ramfs::RamFsBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitBootSummary {
@@ -16,6 +17,46 @@ pub struct InitBootSummary {
     pub proc_wait_exit: u64,
     pub vfs_open_opcode: u16,
     pub vfs_read_opcode: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountOrchestrationSummary {
+    pub low_mount_opcode: u16,
+    pub high_mount_opcode: u16,
+}
+
+pub fn run_mount_orchestration_scenario() -> Result<MountOrchestrationSummary, KernelError> {
+    let router = MountRouter::new(0x8000, RamFsBackend::new(), InitramfsBackend::new(4096));
+    let mut vfs = VfsLiteService::with_backend(router);
+
+    let open_low = Message::with_header(
+        0,
+        VFS_OP_OPENAT,
+        0,
+        None,
+        &VfsV1Args::new(0, 0x1000, 0, 0).encode(),
+    )
+    .map_err(|_| KernelError::WrongObject)?;
+    let low_rep = vfs
+        .handle_request(open_low)
+        .map_err(|_| KernelError::WrongObject)?;
+
+    let open_high = Message::with_header(
+        0,
+        VFS_OP_OPENAT,
+        0,
+        None,
+        &VfsV1Args::new(0, INITRAMFS_BUSYBOX_PATH_PTR, 0, 0).encode(),
+    )
+    .map_err(|_| KernelError::WrongObject)?;
+    let high_rep = vfs
+        .handle_request(open_high)
+        .map_err(|_| KernelError::WrongObject)?;
+
+    Ok(MountOrchestrationSummary {
+        low_mount_opcode: low_rep.opcode,
+        high_mount_opcode: high_rep.opcode,
+    })
 }
 
 pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
@@ -227,6 +268,13 @@ mod tests {
             })
             .expect("spawn thread");
         handle.join().expect("join");
+    }
+
+    #[test]
+    fn deterministic_mount_orchestration_routes_low_and_high_mounts() {
+        let summary = run_mount_orchestration_scenario().expect("mount orchestration");
+        assert_eq!(summary.low_mount_opcode, VFS_OP_OPENAT);
+        assert_eq!(summary.high_mount_opcode, VFS_OP_OPENAT);
     }
 
     #[test]

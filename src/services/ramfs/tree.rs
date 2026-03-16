@@ -1,4 +1,4 @@
-use crate::kernel::vfs_lite::{VfsBackend, VfsLiteError};
+use crate::kernel::vfs::{VfsBackend, VfsLiteError};
 use crate::services::common::fs::{
     FdRecord, InodeRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend, find_inode_index,
 };

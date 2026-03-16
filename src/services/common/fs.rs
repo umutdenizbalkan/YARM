@@ -1,4 +1,4 @@
-use crate::kernel::vfs_lite::{VfsBackend, VfsLiteError};
+use crate::kernel::vfs::{VfsBackend, VfsLiteError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InodeRecord {

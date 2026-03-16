@@ -61,7 +61,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::vfs_lite::{VfsBackend, VfsLiteError};
+    use crate::kernel::vfs::{VfsBackend, VfsLiteError};
 
     #[test]
     fn ramfs_service_supports_write_then_stat() {

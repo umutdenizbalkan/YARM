@@ -16,6 +16,7 @@ pub mod task;
 pub mod timer;
 pub mod trap;
 pub mod trapframe;
+pub mod vfs;
 pub mod vfs_lite;
 pub mod vfs_proto;
 pub mod vm;

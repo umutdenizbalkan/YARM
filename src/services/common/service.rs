@@ -1,5 +1,5 @@
 use crate::kernel::ipc::Message;
-use crate::kernel::vfs_lite::{VfsBackend, VfsLiteError, VfsLiteService};
+use crate::kernel::vfs::{VfsBackend, VfsLiteError, VfsLiteService};
 
 #[derive(Debug)]
 pub struct FsService<B: VfsBackend> {

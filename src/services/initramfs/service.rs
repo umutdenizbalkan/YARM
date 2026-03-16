@@ -57,7 +57,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::vfs_lite::VfsLiteError;
+    use crate::kernel::vfs::VfsLiteError;
 
     #[test]
     fn initramfs_is_read_only() {
