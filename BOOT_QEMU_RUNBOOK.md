@@ -49,3 +49,16 @@ KERNEL_IMAGE=build/yarm-riscv64.bin \
 INITRAMFS_IMAGE=build/initramfs-busybox.cpio \
 scripts/qemu-riscv64-busybox-smoke.sh
 ```
+
+## Early x86_64-none bring-up commands
+
+```bash
+scripts/build-qemu-x86_64-artifacts.sh
+```
+
+```bash
+scripts/qemu-x86_64-busybox-smoke.sh
+```
+
+> These x86_64 scripts are bootstrap scaffolds for the chosen B path and may require a finalized bootable kernel image format before strict smoke mode is enforced.
+

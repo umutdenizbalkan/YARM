@@ -59,6 +59,12 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Rationale: better host/QEMU iteration on x86_64 while preserving microkernel-faithful runtime semantics (no Linux-hosted ABI dependency).
 - Tracking checklist: `X86_64_NONE_MUSL_PORT_TODO.md`.
 
+## 8) B-path bootstrap execution (started)
+
+- Added target spec: `targets/x86_64-yarm-none.json`.
+- Added cargo aliases for x86_64-none bring-up in `.cargo/config.toml`.
+- Added x86_64 artifact and smoke scaffolds: `scripts/build-qemu-x86_64-artifacts.sh`, `scripts/qemu-x86_64-busybox-smoke.sh`.
+
 ## Immediate next 5 implementable steps
 
 1. Wire synchronous IPC fast-path switching into measured scheduler path.

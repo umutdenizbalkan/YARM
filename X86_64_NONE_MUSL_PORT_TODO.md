@@ -8,8 +8,8 @@ Port user-space runtime to `x86_64-unknown-none` and provide a minimal musl sysd
 
 ## Milestone 1 — Target + toolchain baseline
 
-- [ ] Add a custom target JSON for `x86_64-unknown-none` (code model, relocation model, panic strategy).
-- [ ] Add `.cargo/config.toml` target aliases and runner configuration for x86_64 QEMU workflows.
+- [x] Add a custom target JSON for `x86_64-unknown-none` (code model, relocation model, panic strategy).
+- [x] Add `.cargo/config.toml` target aliases for x86_64-none workflows (runner wiring is deferred until bootable image format is finalized).
 - [ ] Introduce build profile knobs for freestanding userspace (panic=abort, LTO optional).
 - [ ] Verify `cargo build --target <x86_64-none-target>` works for `kernel_boot` and `init_server` without Linux ABI assumptions.
 
