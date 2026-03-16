@@ -1,0 +1,57 @@
+# x86_64-unknown-none + musl sysdeps shim TODO
+
+Status: **chosen direction** for local bring-up (hosted Linux ABI path is not the primary target).
+
+## Goal
+
+Port user-space runtime to `x86_64-unknown-none` and provide a minimal musl sysdeps shim that maps libc expectations to YARM microkernel mechanisms.
+
+## Milestone 1 — Target + toolchain baseline
+
+- [ ] Add a custom target JSON for `x86_64-unknown-none` (code model, relocation model, panic strategy).
+- [ ] Add `.cargo/config.toml` target aliases and runner configuration for x86_64 QEMU workflows.
+- [ ] Introduce build profile knobs for freestanding userspace (panic=abort, LTO optional).
+- [ ] Verify `cargo build --target <x86_64-none-target>` works for `kernel_boot` and `init_server` without Linux ABI assumptions.
+
+## Milestone 2 — ABI boundary contract for libc shim
+
+- [ ] Freeze a tiny libc-facing kernel ABI surface (threads/TLS, memory mapping, clocks, process lifecycle, IPC-backed fd model).
+- [ ] Document syscall numbering + calling convention expected by shim stubs.
+- [ ] Define error mapping policy (`errno` conversion from kernel/service status codes).
+- [ ] Add compatibility tests for edge cases (`EINTR`, partial I/O, invalid handle, timeout).
+
+## Milestone 3 — musl sysdeps shim (minimum viable)
+
+- [ ] Implement musl entry/exit glue (`crt` startup + `__libc_start_main` integration path).
+- [ ] Implement memory primitives (`mmap`/`munmap` equivalent, brk/no-brk policy).
+- [ ] Implement thread primitives expected by musl (`clone`/TLS hooks or equivalent shim model).
+- [ ] Implement futex-like wait/wake bridge using kernel IPC/synchronization primitives.
+- [ ] Implement time/clock stubs (`clock_gettime`, nanosleep) via timer service.
+- [ ] Implement minimal file/socket facade over VFS/network services.
+
+## Milestone 4 — Service integration on x86_64
+
+- [ ] Boot `init_server` + `procman_srv` + `vfs_srv` under x86_64 QEMU path.
+- [ ] Add x86_64 smoke script parallel to current RISC-V smoke flow.
+- [ ] Add strict boot markers for x86_64 (`YARM_BOOT_OK`, `YARM_INIT_DONE`, service health checks).
+- [ ] Validate linux-compat server behavior when hosted ABI is absent (or explicitly gate it off).
+
+## Milestone 5 — CI gates and migration hardening
+
+- [ ] Add CI job matrix entry for x86_64 freestanding target build.
+- [ ] Add deterministic contract tests that exercise shim boundary and `errno` mapping.
+- [ ] Keep RISC-V smoke optional while x86_64 becomes primary developer path.
+- [ ] Add regression suite for capability transfer + shared-memory descriptor paths under x86_64.
+
+## Risks / watchpoints
+
+- musl thread/TLS expectations can dominate complexity early.
+- fd/socket semantics need clear ownership between libc shim and user-space servers.
+- signal semantics should be explicitly unsupported or emulated deterministically.
+
+## Suggested immediate execution order (next 2 weeks)
+
+1. Target JSON + cargo config + successful x86_64 freestanding builds.
+2. Written libc-kernel ABI contract + error mapping table.
+3. Minimal startup + memory + clock sysdeps.
+4. `init_server` smoke on x86_64 QEMU with strict marker checks.

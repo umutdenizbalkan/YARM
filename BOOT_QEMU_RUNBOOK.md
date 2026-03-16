@@ -1,5 +1,8 @@
 # QEMU BusyBox Boot Runbook (RISC-V64)
 
+> Note: This runbook is currently RISC-V focused. The project has selected `x86_64-unknown-none` + musl sysdeps shim as the primary runtime direction for ongoing bring-up; see `X86_64_NONE_MUSL_PORT_TODO.md` for migration tasks.
+
+
 ## Prerequisites
 
 - Rust toolchain + `rustup`

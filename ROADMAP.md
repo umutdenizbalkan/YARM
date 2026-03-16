@@ -52,6 +52,13 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Add deterministic simulations (multi-task IPC + faults + interrupts + server IPC mix).
 - Keep architecture contract tests that verify normalized trap events expected by core.
 
+
+## 7) Chosen Runtime Target Direction (x86_64)
+
+- Decision: adopt **`x86_64-unknown-none` + custom musl sysdeps shim** as the primary path.
+- Rationale: better host/QEMU iteration on x86_64 while preserving microkernel-faithful runtime semantics (no Linux-hosted ABI dependency).
+- Tracking checklist: `X86_64_NONE_MUSL_PORT_TODO.md`.
+
 ## Immediate next 5 implementable steps
 
 1. Wire synchronous IPC fast-path switching into measured scheduler path.
