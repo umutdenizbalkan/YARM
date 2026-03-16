@@ -39,3 +39,13 @@ These numbers are already defined and tested in `src/services/compatibility/linu
 
 - Milestone 2 checklist items in `X86_64_NONE_MUSL_PORT_TODO.md` are grounded in the constants, mapping logic, and tests already present in `linux_compat/mod.rs`.
 - Milestone 3 begins in `src/services/compatibility/linux_compat/sysdeps.rs` with startup/memory hooks and a temporary clock stub (`ENOSYS`) until timer service plumbing lands.
+
+## Bootstrap sysdeps coverage now implemented
+
+- startup hook validation (`stack_top` sanity)
+- memory hooks (`mmap`, `munmap`, `mprotect`, `brk`) routed to kernel VM helpers
+- clock hooks (`clock_gettime`, `nanosleep`) for early userspace timing
+- thread/TLS hooks (`clone` id allocator + TLS slot set/get)
+- futex-like wait/wake bookkeeping hooks for deterministic synchronization tests
+
+These are intentionally bootstrap-oriented and will be replaced/refined as timer/process/sync services are fully integrated for production semantics.

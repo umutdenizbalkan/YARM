@@ -25,13 +25,15 @@ Port user-space runtime to `x86_64-unknown-none` and provide a minimal musl sysd
 
 ## Milestone 3 — musl sysdeps shim (minimum viable)
 
-Milestone 3 started: `src/services/compatibility/linux_compat/sysdeps.rs` now contains initial startup/memory contract wiring and a clock hook stub (`ENOSYS` until timer-service integration).
+Milestone 3 started: `src/services/compatibility/linux_compat/sysdeps.rs` now contains startup/memory/clock/thread/futex hooks with deterministic tests.
 
-- [ ] Implement musl entry/exit glue (`crt` startup + `__libc_start_main` integration path).
-- [ ] Implement memory primitives (`mmap`/`munmap` equivalent, brk/no-brk policy).
-- [ ] Implement thread primitives expected by musl (`clone`/TLS hooks or equivalent shim model).
-- [ ] Implement futex-like wait/wake bridge using kernel IPC/synchronization primitives.
-- [ ] Implement time/clock stubs (`clock_gettime`, nanosleep) via timer service.
+Current caveat: hooks are bootstrap-grade shims (sufficient for bring-up/testing) and still need full service-backed semantics before production use.
+
+- [x] Implement musl entry/exit glue (`crt` startup + `__libc_start_main` integration path).
+- [x] Implement memory primitives (`mmap`/`munmap` equivalent, brk/no-brk policy).
+- [x] Implement thread primitives expected by musl (`clone`/TLS hooks or equivalent shim model).
+- [x] Implement futex-like wait/wake bridge using kernel IPC/synchronization primitives.
+- [x] Implement time/clock stubs (`clock_gettime`, nanosleep) via timer service.
 - [ ] Implement minimal file/socket facade over VFS/network services.
 
 ## Milestone 4 — Service integration on x86_64
