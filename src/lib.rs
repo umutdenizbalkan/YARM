@@ -2,6 +2,7 @@
 
 pub mod arch;
 pub mod kernel;
-#[cfg(feature = "linux-compat")]
-pub mod linux_compat;
 pub mod services;
+
+#[cfg(feature = "linux-compat")]
+pub use services::linux_compat;

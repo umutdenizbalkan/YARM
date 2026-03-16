@@ -1,15 +1,15 @@
-#![no_std]
 extern crate std;
-
-use yarm::kernel::bootstrap::Bootstrap;
-use yarm::kernel::ipc::Message;
-use yarm::kernel::proc_proto::PROC_OP_GETPID;
-use yarm::kernel::trapframe::TrapFrame;
-use yarm::linux_compat::{LINUX_NR_GETPID, LinuxServiceBindings, dispatch};
 
 use std::println;
 
-fn main() {
+use crate::kernel::bootstrap::Bootstrap;
+use crate::kernel::ipc::Message;
+use crate::kernel::proc_proto::PROC_OP_GETPID;
+use crate::kernel::trapframe::TrapFrame;
+
+use super::{LINUX_NR_GETPID, LinuxServiceBindings, dispatch};
+
+pub fn run() {
     let mut kernel = Bootstrap::init().expect("init");
     let mut bindings = LinuxServiceBindings::default();
 

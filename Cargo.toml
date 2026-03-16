@@ -10,6 +10,6 @@ linux-compat = []
 [dependencies]
 
 [[bin]]
-name = "linux_compat_server"
-path = "src/bin/linux_compat_server.rs"
+name = "linux_compat_srv"
+path = "src/bin/linux_compat_srv.rs"
 required-features = ["linux-compat"]

@@ -4,5 +4,7 @@ pub mod devfs;
 pub mod ext4;
 pub mod fat;
 pub mod initramfs;
+#[cfg(feature = "linux-compat")]
+pub mod linux_compat;
 pub mod ramfs;
 pub mod virtio_blk;

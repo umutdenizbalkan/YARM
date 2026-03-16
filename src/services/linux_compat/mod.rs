@@ -1422,3 +1422,6 @@ mod tests {
         assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, expected.len());
     }
 }
+
+pub mod service;
+pub use service::run;
