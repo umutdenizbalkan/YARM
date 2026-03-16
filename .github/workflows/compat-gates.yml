@@ -30,6 +30,18 @@ jobs:
       - name: enforce service domain ownership boundaries
         run: scripts/check-service-domain-ownership.sh
 
+
+  phase2-driver-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: phase2 delegation + fault deterministic gates
+        run: |
+          cargo test -q kernel::bootstrap::tests::delegate_driver_bundle_checked_enforces_service_role_edges
+          cargo test -q kernel::bootstrap::tests::restart_denial_escalates_to_supervisor_every_threshold
+          cargo test -q kernel::bootstrap::tests::driver_restart_revokes_runtime_caps
+
   mount-failure-matrix-sim-gate:
     runs-on: ubuntu-latest
     steps:

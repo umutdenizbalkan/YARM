@@ -91,6 +91,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 ### Current implementation status
 
 - ✅ `virtio_blk.srv` scaffold implemented (`services/drivers/virtio_blk/*` + thin `src/bin/virtio_blk_srv.rs`).
+- 🚧 `irqmux.srv` scaffold started (`services/drivers/irqmux/*` + thin `src/bin/irqmux_srv.rs`).
 - 🚧 `uart.srv` scaffold started (`services/drivers/uart/*` + thin `src/bin/uart_srv.rs`).
 - 🚧 `virtio_net.srv` scaffold started (`services/drivers/virtio_net/*` + thin `src/bin/virtio_net_srv.rs`).
 - 🚧 `virtio_gpu.srv` scaffold started (`services/drivers/virtio_gpu/*` + thin `src/bin/virtio_gpu_srv.rs`).
@@ -98,8 +99,8 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ### Test gates
 
-- delegation gate: init->driver role edges and cap bundle validation
-- fault gate: revoke/restart behavior deterministic and test-covered
+- delegation gate: init->driver role edges and cap bundle validation (wired to compat-gates workflow).
+- fault gate: revoke/restart behavior deterministic and test-covered (wired to compat-gates workflow).
 
 ## Phase 3 — Networking Servers
 
