@@ -6,8 +6,9 @@ use super::init_server::{
 };
 use super::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
 use super::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
-use super::vfs_lite::{INITRAMFS_BUSYBOX_PATH_PTR, ReadOnlyInitramfsBackend, VfsLiteService};
+use super::vfs_lite::VfsLiteService;
 use super::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
+use crate::services::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitBootSummary {
@@ -68,7 +69,7 @@ pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError
     let waited =
         WaitPidV2Result::decode(wait_rep.as_slice()).map_err(|_| KernelError::WrongObject)?;
 
-    let mut vfs = VfsLiteService::with_backend(ReadOnlyInitramfsBackend::new(4096));
+    let mut vfs = VfsLiteService::with_backend(InitramfsBackend::new(4096));
     let open = Message::with_header(
         0,
         VFS_OP_OPENAT,

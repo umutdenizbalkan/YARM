@@ -7,10 +7,9 @@ use yarm::kernel::bootstrap::Bootstrap;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
 use yarm::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
-use yarm::kernel::vfs_lite::{
-    INITRAMFS_BUSYBOX_PATH_PTR, ReadOnlyInitramfsBackend, VfsLiteService,
-};
+use yarm::kernel::vfs_lite::VfsLiteService;
 use yarm::kernel::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
+use yarm::services::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 
 fn main() {
     let _ = Bootstrap::init().expect("kernel init");
@@ -40,7 +39,7 @@ fn main() {
     let wait_rep = proc.handle(wait).expect("wait rep");
     let waited = WaitPidV2Result::decode(wait_rep.as_slice()).expect("waited");
 
-    let mut vfs = VfsLiteService::with_backend(ReadOnlyInitramfsBackend::new(4096));
+    let mut vfs = VfsLiteService::with_backend(InitramfsBackend::new(4096));
     let open = Message::with_header(
         0,
         VFS_OP_OPENAT,

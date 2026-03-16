@@ -58,10 +58,10 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ### Current implementation status
 
-- ✅ `ramfs.srv` scaffold implemented (`RamFsBackend` + `RamFsService` + demo bin).
-- ✅ `initramfs.srv` scaffold implemented (`ReadOnlyInitramfsBackend` wrapped by `InitramfsService` + demo bin).
-- ✅ `devfs.srv` scaffold implemented (`DevFsBackend` + `DevFsService` + demo bin for `/dev/console` and `/dev/null`).
-- ✅ `ext4.srv` scaffold implemented (`Ext4Backend` + `Ext4Service` + demo bin).
+- ✅ `ramfs.srv` scaffold implemented (`services/ramfs/*` + thin `src/bin/ramfs_srv.rs` entrypoint).
+- ✅ `initramfs.srv` scaffold implemented (`services/initramfs/*` + thin `src/bin/initramfs_srv.rs` entrypoint).
+- ✅ `devfs.srv` scaffold implemented (`services/devfs/*` + thin `src/bin/devfs_srv.rs` entrypoint (console/null nodes)).
+- ✅ `ext4.srv` scaffold implemented (`services/ext4/*` + thin `src/bin/ext4_srv.rs` entrypoint).
 
 ## Phase 2 — Device Driver Servers
 
