@@ -22,13 +22,17 @@ jobs:
         run: scripts/check-service-arch-boundary.sh
 
 
-  mount-fallback-sim-gate:
+  mount-failure-matrix-sim-gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: deterministic mount fallback telemetry simulation gate
         run: cargo test -q kernel::sim::tests::deterministic_mount_fallback_telemetry_is_reported
+      - name: mount failure matrix (no fallback + fallback)
+        run: |
+          cargo test -q kernel::sim::tests::mount_failure_matrix_without_fallback_fails_all_fail_points
+          cargo test -q kernel::sim::tests::mount_failure_matrix_with_fallback_recovers
 
   core-profile:
     runs-on: ubuntu-latest

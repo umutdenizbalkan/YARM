@@ -122,6 +122,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - ✅ Next move 4: blkcache now has policy knobs + writeback scheduling and is integrated by FAT/EXT4 backends.
 - ✅ Next move 5: init launch flow now records mount execution status, with deterministic recovery/fallback simulation telemetry.
 - ✅ Next move 6: CI/service boundary gate added (`scripts/check-service-arch-boundary.sh`) and wired into compat gates workflow.
+- ✅ Storage service contract published (`STORAGE_SERVICE_CONTRACT.md`) for blkcache/fat/ext4/virtio_blk protocol stability.
 
 ## Readiness criteria
 

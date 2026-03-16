@@ -74,6 +74,40 @@ pub fn run_mount_fallback_telemetry_scenario() -> Result<MountFallbackTelemetry,
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountMatrixRow {
+    pub fail_at: Option<usize>,
+    pub allow_fallback: bool,
+    pub result: Result<MountFallbackTelemetry, KernelError>,
+}
+
+pub fn run_mount_failure_matrix_scenarios() -> [MountMatrixRow; 10] {
+    core::array::from_fn(|i| {
+        let allow_fallback = i >= 5;
+        let fail_at = match i % 5 {
+            0 => None,
+            1 => Some(0),
+            2 => Some(1),
+            3 => Some(2),
+            _ => Some(3),
+        };
+        let mut init = InitServerLite::new();
+        let mut plan = init.mount_plan();
+        plan.allow_fallback_to_fat = allow_fallback;
+        let _ = init.set_mount_plan(plan);
+        MountMatrixRow {
+            fail_at,
+            allow_fallback,
+            result: init.execute_mount_plan_with_fail_at(fail_at).map(|report| {
+                MountFallbackTelemetry {
+                    recovered_with_fat: report.recovered_with_fat,
+                    mounted_count: report.mounted_count,
+                }
+            }),
+        }
+    })
+}
+
 pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
     let mut kernel = Bootstrap::init()?;
     let mut init = InitServerLite::new();
@@ -290,6 +324,31 @@ mod tests {
         let telem = run_mount_fallback_telemetry_scenario().expect("mount fallback telemetry");
         assert!(telem.recovered_with_fat);
         assert!(telem.mounted_count >= 4);
+    }
+
+    #[test]
+    fn mount_failure_matrix_without_fallback_fails_all_fail_points() {
+        let matrix = run_mount_failure_matrix_scenarios();
+        for row in matrix.iter().filter(|row| !row.allow_fallback) {
+            if row.fail_at.is_some() {
+                assert!(row.result.is_err(), "row={:?}", row.fail_at);
+            } else {
+                assert!(row.result.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn mount_failure_matrix_with_fallback_recovers() {
+        let matrix = run_mount_failure_matrix_scenarios();
+        for row in matrix.iter().filter(|row| row.allow_fallback) {
+            let report = row.result.expect("fallback row should recover");
+            if row.fail_at.is_some() {
+                assert!(report.recovered_with_fat);
+            } else {
+                assert!(!report.recovered_with_fat);
+            }
+        }
     }
 
     #[test]

@@ -5,11 +5,15 @@ use std::println;
 use crate::kernel::ipc::Message;
 use crate::kernel::vfs::{FilesystemService, VfsLiteError};
 
-use super::device::{VirtioBlkDevice, VirtioBlkRequest};
+use super::device::{
+    VIRTIO_BLK_OP_READ, VIRTIO_BLK_OP_WRITE, VirtQueue, VirtioBlkDevice, VirtioBlkReqFrame,
+    VirtioBlkRequest, VirtioBlkRespFrame,
+};
 
 #[derive(Debug)]
 pub struct VirtioBlkService {
     dev: VirtioBlkDevice,
+    queue: VirtQueue,
 }
 
 impl Default for VirtioBlkService {
@@ -22,11 +26,42 @@ impl VirtioBlkService {
     pub const fn new() -> Self {
         Self {
             dev: VirtioBlkDevice::new(4096, 512),
+            queue: VirtQueue::new(),
         }
     }
 
     pub const fn stats(&self) -> (u64, u64) {
         (self.dev.reads, self.dev.writes)
+    }
+
+    fn process_once(&mut self) -> Result<VirtioBlkRespFrame, VfsLiteError> {
+        let req = self
+            .queue
+            .pop_next_request()
+            .ok_or(VfsLiteError::Unsupported)?;
+        let io = VirtioBlkRequest {
+            sector: req.sector,
+            len: req.len,
+        };
+        let result = match req.op {
+            VIRTIO_BLK_OP_READ => self.dev.read(io).map(|done| VirtioBlkRespFrame {
+                status: 0,
+                _pad: [0; 3],
+                done_len: done,
+                tag: req.tag,
+            }),
+            VIRTIO_BLK_OP_WRITE => self.dev.write(io).map(|done| VirtioBlkRespFrame {
+                status: 0,
+                _pad: [0; 3],
+                done_len: done,
+                tag: req.tag,
+            }),
+            _ => Err(()),
+        }
+        .map_err(|_| VfsLiteError::BadFd)?;
+
+        self.queue.push_used(result);
+        self.queue.take_last_used().ok_or(VfsLiteError::Unsupported)
     }
 }
 
@@ -36,37 +71,37 @@ impl FilesystemService for VirtioBlkService {
     }
 
     fn dispatch(&mut self, request: Message) -> Result<Message, VfsLiteError> {
-        let mut sector = [0u8; 8];
-        let payload = request.as_slice();
-        if payload.len() < 16 {
-            return Err(VfsLiteError::Malformed);
-        }
-        sector.copy_from_slice(&payload[..8]);
-        let mut len = [0u8; 8];
-        len.copy_from_slice(&payload[8..16]);
-        let req = VirtioBlkRequest {
-            sector: u64::from_le_bytes(sector),
-            len: u64::from_le_bytes(len),
-        };
-        let done = if request.opcode == 1 {
-            self.dev.read(req).map_err(|_| VfsLiteError::BadFd)?
-        } else {
-            self.dev.write(req).map_err(|_| VfsLiteError::BadFd)?
-        };
-        Message::with_header(0, request.opcode, 0, None, &done.to_le_bytes())
+        let req =
+            VirtioBlkReqFrame::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
+        self.queue
+            .push_request(req)
+            .map_err(|_| VfsLiteError::NoFd)?;
+        let resp = self.process_once()?;
+        Message::with_header(0, request.opcode, 0, None, &resp.encode())
             .map_err(|_| VfsLiteError::Malformed)
     }
 }
 
 pub fn run() {
     let mut svc = VirtioBlkService::new();
-    let mut payload = [0u8; 16];
-    payload[..8].copy_from_slice(&1u64.to_le_bytes());
-    payload[8..16].copy_from_slice(&512u64.to_le_bytes());
-    let read = Message::with_header(0, 1, 0, None, &payload).expect("read");
-    let write = Message::with_header(0, 2, 0, None, &payload).expect("write");
-    let _ = svc.dispatch(read).expect("read rep");
-    let _ = svc.dispatch(write).expect("write rep");
+    let read = VirtioBlkReqFrame {
+        op: VIRTIO_BLK_OP_READ,
+        _reserved: 0,
+        sector: 1,
+        len: 512,
+        tag: 11,
+    };
+    let write = VirtioBlkReqFrame {
+        op: VIRTIO_BLK_OP_WRITE,
+        _reserved: 0,
+        sector: 1,
+        len: 512,
+        tag: 12,
+    };
+    let read_msg = Message::with_header(0, 1, 0, None, &read.encode()).expect("read");
+    let write_msg = Message::with_header(0, 2, 0, None, &write.encode()).expect("write");
+    let _ = svc.dispatch(read_msg).expect("read rep");
+    let _ = svc.dispatch(write_msg).expect("write rep");
     let (reads, writes) = svc.stats();
     println!("virtio_blk.srv demo: reads={}, writes={}", reads, writes);
 }
@@ -76,15 +111,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn virtio_blk_service_counts_rw() {
+    fn service_roundtrips_frame_contract() {
         let mut svc = VirtioBlkService::new();
-        let mut payload = [0u8; 16];
-        payload[..8].copy_from_slice(&1u64.to_le_bytes());
-        payload[8..16].copy_from_slice(&64u64.to_le_bytes());
-        let read = Message::with_header(0, 1, 0, None, &payload).expect("read");
-        let write = Message::with_header(0, 2, 0, None, &payload).expect("write");
-        let _ = svc.dispatch(read).expect("read rep");
-        let _ = svc.dispatch(write).expect("write rep");
-        assert_eq!(svc.stats(), (1, 1));
+        let req = VirtioBlkReqFrame {
+            op: VIRTIO_BLK_OP_READ,
+            _reserved: 0,
+            sector: 2,
+            len: 128,
+            tag: 77,
+        };
+        let msg = Message::with_header(0, 1, 0, None, &req.encode()).expect("msg");
+        let rep = svc.dispatch(msg).expect("dispatch");
+        let resp = VirtioBlkRespFrame::decode(rep.as_slice()).expect("decode");
+        assert_eq!(resp.status, 0);
+        assert_eq!(resp.done_len, 128);
+        assert_eq!(resp.tag, 77);
     }
 }
