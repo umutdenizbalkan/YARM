@@ -10,8 +10,9 @@ Port user-space runtime to `x86_64-unknown-none` and provide a minimal musl sysd
 
 - [x] Add a custom target JSON for `x86_64-unknown-none` (code model, relocation model, panic strategy).
 - [x] Add `.cargo/config.toml` target aliases for x86_64-none workflows (runner wiring is deferred until bootable image format is finalized).
-- [ ] Introduce build profile knobs for freestanding userspace (panic=abort, LTO optional).
+- [x] Introduce build profile knobs for freestanding userspace (panic=abort, LTO optional).
 - [ ] Verify `cargo build --target <x86_64-none-target>` works for `kernel_boot` and `init_server` without Linux ABI assumptions.
+  - Current blocker: `core` is unavailable for this custom target in the current toolchain setup; next step is to wire `build-std`/`rust-src` strategy for the freestanding target.
 
 ## Milestone 2 — ABI boundary contract for libc shim
 

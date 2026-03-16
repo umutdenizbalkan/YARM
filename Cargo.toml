@@ -13,3 +13,8 @@ linux-compat = []
 name = "linux_compat_srv"
 path = "src/bin/linux_compat_srv.rs"
 required-features = ["linux-compat"]
+
+[profile.x86-none]
+inherits = "release"
+panic = "abort"
+lto = "thin"
