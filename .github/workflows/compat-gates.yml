@@ -22,6 +22,14 @@ jobs:
         run: scripts/check-service-arch-boundary.sh
 
 
+
+  service-domain-ownership-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: enforce service domain ownership boundaries
+        run: scripts/check-service-domain-ownership.sh
+
   mount-failure-matrix-sim-gate:
     runs-on: ubuntu-latest
     steps:

@@ -88,6 +88,14 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - `virtio_gpu.srv`
 - `input.srv`
 
+### Current implementation status
+
+- ✅ `virtio_blk.srv` scaffold implemented (`services/drivers/virtio_blk/*` + thin `src/bin/virtio_blk_srv.rs`).
+- 🚧 `uart.srv` scaffold started (`services/drivers/uart/*` + thin `src/bin/uart_srv.rs`).
+- 🚧 `virtio_net.srv` scaffold started (`services/drivers/virtio_net/*` + thin `src/bin/virtio_net_srv.rs`).
+- 🚧 `virtio_gpu.srv` scaffold started (`services/drivers/virtio_gpu/*` + thin `src/bin/virtio_gpu_srv.rs`).
+- 🚧 `input.srv` scaffold started (`services/drivers/input/*` + thin `src/bin/input_srv.rs`).
+
 ### Test gates
 
 - delegation gate: init->driver role edges and cap bundle validation
