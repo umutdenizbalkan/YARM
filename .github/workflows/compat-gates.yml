@@ -30,6 +30,13 @@ jobs:
       - name: enforce service domain ownership boundaries
         run: scripts/check-service-domain-ownership.sh
 
+  roadmap-readiness-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: enforce roadmap readiness invariants
+        run: scripts/check-roadmap-readiness.sh
+
 
   phase2-driver-gates:
     runs-on: ubuntu-latest
@@ -55,6 +62,7 @@ jobs:
           cargo test -q services::network::dns::service::tests::dns_timeout_retry_is_reproducible
           cargo test -q services::network::dhcp::service::tests::dhcp_lease_accounting_is_deterministic
           cargo test -q services::network::socket::service::tests::socket_adapter_roundtrip_is_accounted
+          cargo test -q services::network::sim::tests::deterministic_network_bootstrap_flow_is_stable
 
   phase4-ui-gates:
     runs-on: ubuntu-latest
@@ -67,6 +75,17 @@ jobs:
           cargo test -q services::ui::display::service::tests::display_tracks_modeset_and_present
           cargo test -q services::ui::compositor::service::tests::compositor_replay_is_deterministic
           cargo test -q services::ui::shell::service::tests::shell_session_counter_increments
+
+
+  phase4-ui-smoke-marker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: ensure boot marker appears in ui display run output
+        run: |
+          cargo run -q --bin display_srv | tee /tmp/display_srv.log
+          rg -n "\[ui\] boot-to-shell marker" /tmp/display_srv.log
 
   mount-failure-matrix-sim-gate:
     runs-on: ubuntu-latest

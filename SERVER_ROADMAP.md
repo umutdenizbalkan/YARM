@@ -91,11 +91,11 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 ### Current implementation status
 
 - ✅ `virtio_blk.srv` scaffold implemented (`services/drivers/virtio_blk/*` + thin `src/bin/virtio_blk_srv.rs`).
-- 🚧 `irqmux.srv` scaffold started (`services/drivers/irqmux/*` + thin `src/bin/irqmux_srv.rs`).
-- 🚧 `uart.srv` scaffold started (`services/drivers/uart/*` + thin `src/bin/uart_srv.rs`).
-- 🚧 `virtio_net.srv` scaffold started (`services/drivers/virtio_net/*` + thin `src/bin/virtio_net_srv.rs`).
-- 🚧 `virtio_gpu.srv` scaffold started (`services/drivers/virtio_gpu/*` + thin `src/bin/virtio_gpu_srv.rs`).
-- 🚧 `input.srv` scaffold started (`services/drivers/input/*` + thin `src/bin/input_srv.rs`).
+- ✅ `irqmux.srv` deterministic counters + routing/drop behavior implemented (`services/drivers/irqmux/*` + thin `src/bin/irqmux_srv.rs`).
+- ✅ `uart.srv` deterministic tx/rx accounting implemented (`services/drivers/uart/*` + thin `src/bin/uart_srv.rs`).
+- ✅ `virtio_net.srv` deterministic tx/rx packet accounting implemented (`services/drivers/virtio_net/*` + thin `src/bin/virtio_net_srv.rs`).
+- ✅ `virtio_gpu.srv` deterministic mode-set/frame-commit accounting implemented (`services/drivers/virtio_gpu/*` + thin `src/bin/virtio_gpu_srv.rs`).
+- ✅ `input.srv` deterministic accepted/dropped event accounting implemented (`services/drivers/input/*` + thin `src/bin/input_srv.rs`).
 
 ### Test gates
 
@@ -147,7 +147,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - input event routing deterministic replay (covered by deterministic compositor/shell path gates and existing input driver scaffolds).
 - display mode-set and frame-present checks (wired to compat-gates workflow).
 
-## Architecture follow-up status (completed)
+## Architecture follow-up status (frozen)
 
 - ✅ Next move 1: `kernel::vfs` promoted as primary API (with `vfs_lite` compatibility shim and migrated imports).
 - ✅ Next move 2: typed VFS request/response wrappers added in `kernel::vfs` and adopted by service entry/service tests.
@@ -156,6 +156,10 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - ✅ Next move 5: init launch flow now records mount execution status, with deterministic recovery/fallback simulation telemetry.
 - ✅ Next move 6: CI/service boundary gate added (`scripts/check-service-arch-boundary.sh`) and wired into compat gates workflow.
 - ✅ Storage service contract published (`STORAGE_SERVICE_CONTRACT.md`) for blkcache/fat/ext4/virtio_blk protocol stability.
+
+## Architecture follow-up addenda
+
+- Future architecture changes should be recorded here without mutating the frozen checklist above.
 
 ## Readiness criteria
 

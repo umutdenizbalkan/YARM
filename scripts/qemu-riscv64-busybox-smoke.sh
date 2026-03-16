@@ -49,7 +49,7 @@ timeout "$TIMEOUT_SECS" qemu-system-riscv64 \
 QEMU_STATUS=$?
 set -e
 
-if rg -n "YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|init_server|Welcome" "$LOGFILE" >/dev/null 2>&1; then
+if rg -n "YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|init_server|Welcome|\[ui\] boot-to-shell marker" "$LOGFILE" >/dev/null 2>&1; then
   echo "[ok] boot shell markers detected"
   exit 0
 fi
