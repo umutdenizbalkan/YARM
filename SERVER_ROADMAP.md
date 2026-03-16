@@ -146,6 +146,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - boot-to-shell marker in QEMU log (marker stabilized + gate wired for marker string stability).
 - input event routing deterministic replay (covered by deterministic compositor/shell path gates and existing input driver scaffolds).
 - display mode-set and frame-present checks (wired to compat-gates workflow).
+- phase contract gate: `PHASE4_UI_CONTRACT.md` published and enforced by readiness checks.
 
 ## Architecture follow-up status (frozen)
 
@@ -159,7 +160,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ## Architecture follow-up addenda
 
-- Future architecture changes should be recorded here without mutating the frozen checklist above.
+- 2026-03-16: Added phase-readiness automation, phase3 network recovery simulation, and strict UI marker validation in QEMU smoke/CI without mutating frozen architecture checklist.
 
 ## Readiness criteria
 

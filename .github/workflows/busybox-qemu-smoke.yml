@@ -38,4 +38,7 @@ jobs:
       - name: BusyBox QEMU smoke (strict)
         env:
           QEMU_SMOKE_STRICT: "1"
+          LOGFILE: qemu-busybox.log
         run: scripts/qemu-riscv64-busybox-smoke.sh
+      - name: Verify strict smoke log has UI boot marker
+        run: rg -n "\[ui\] boot-to-shell marker" qemu-busybox.log
