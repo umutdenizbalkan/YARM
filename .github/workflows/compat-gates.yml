@@ -34,6 +34,20 @@ jobs:
           cargo test -q kernel::sim::tests::mount_failure_matrix_without_fallback_fails_all_fail_points
           cargo test -q kernel::sim::tests::mount_failure_matrix_with_fallback_recovers
 
+
+  storage-contract-fast-lane:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: storage contract conformance (fast lane)
+        run: |
+          cargo test -q services::virtio_blk::device::tests::request_golden_vector_stable
+          cargo test -q services::virtio_blk::device::tests::response_golden_vector_stable
+          cargo test -q services::ext4::fs::framing_tests::ext4_request_frame_golden_vector_matches_contract
+          cargo test -q services::ext4::fs::framing_tests::ext4_response_frame_golden_vector_matches_contract
+          cargo test -q services::fat::fs::tests::bpb_parsing_reads_core_fields
+
   core-profile:
     runs-on: ubuntu-latest
     steps:

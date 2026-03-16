@@ -18,20 +18,31 @@ impl FatPath {
         Self { len, bytes }
     }
 
-    pub fn from_path_ptr(path_ptr: u64) -> Self {
-        // Typed layer: VFS still provides path_ptr, but FAT stores typed path objects.
-        let (s, len): (&[u8], usize) = match path_ptr {
-            0x5050 => (b"/hello.txt", 10usize),
-            0x6060 => (b"/etc/config", 11usize),
-            _ => (b"/unknown", 8usize),
-        };
-        let mut bytes = [0u8; MAX_PATH_LEN];
-        bytes[..len].copy_from_slice(&s[..len]);
-        Self {
-            len: len as u8,
-            bytes,
+    pub fn from_abi_path(path_ptr: u64) -> Result<Self, VfsLiteError> {
+        let src = abi_path_bytes(path_ptr).ok_or(VfsLiteError::BadFd)?;
+        if src.len() > MAX_PATH_LEN {
+            return Err(VfsLiteError::Malformed);
         }
+        let mut bytes = [0u8; MAX_PATH_LEN];
+        bytes[..src.len()].copy_from_slice(src);
+        Ok(Self {
+            len: src.len() as u8,
+            bytes,
+        })
     }
+}
+
+const ABI_PATH_TABLE: &[(u64, &[u8])] = &[
+    (0x5050, b"/hello.txt"),
+    (0x6060, b"/etc/config"),
+    (0x4040, b"/ext4/file.bin"),
+];
+
+fn abi_path_bytes(path_ptr: u64) -> Option<&'static [u8]> {
+    ABI_PATH_TABLE
+        .iter()
+        .find(|(ptr, _)| *ptr == path_ptr)
+        .map(|(_, bytes)| *bytes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,7 +299,7 @@ impl FatBackend {
     }
 
     pub fn cluster_chain_head_for_path(&self, path_ptr: u64) -> Option<FatCluster> {
-        let path = FatPath::from_path_ptr(path_ptr);
+        let path = FatPath::from_abi_path(path_ptr).ok()?;
         let idx = self.find_file_idx(path)?;
         let entry = self.files[idx]?;
         Some(FatCluster {
@@ -303,7 +314,7 @@ impl VfsBackend for FatBackend {
         if path_ptr == 0 {
             return Err(VfsLiteError::BadFd);
         }
-        let path = FatPath::from_path_ptr(path_ptr);
+        let path = FatPath::from_abi_path(path_ptr)?;
         let file_idx = self.alloc_file(path)?;
         self.alloc_fd(file_idx)
     }
@@ -331,7 +342,7 @@ impl VfsBackend for FatBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
-        let path = FatPath::from_path_ptr(path_ptr);
+        let path = FatPath::from_abi_path(path_ptr)?;
         let idx = self.find_file_idx(path).ok_or(VfsLiteError::BadFd)?;
         Ok(self.files[idx].ok_or(VfsLiteError::BadFd)?.file_len)
     }
@@ -381,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_pathname_layer_is_used() {
+    fn typed_pathname_layer_uses_abi_buffers() {
         let mut fs = FatBackend::new();
         let fd = fs.openat(0x5050).expect("open");
         let _ = fs.write(fd, 11).expect("write");

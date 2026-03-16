@@ -139,3 +139,37 @@ impl VfsBackend for Ext4Backend {
         Ok(self.inodes[idx].ok_or(VfsLiteError::BadFd)?.file_len)
     }
 }
+
+#[cfg(test)]
+mod framing_tests {
+    use crate::services::virtio_blk::device::{
+        VIRTIO_BLK_OP_READ, VirtioBlkReqFrame, VirtioBlkRespFrame,
+    };
+
+    #[test]
+    fn ext4_request_frame_golden_vector_matches_contract() {
+        let req = VirtioBlkReqFrame {
+            op: VIRTIO_BLK_OP_READ,
+            _reserved: 0,
+            sector: 42,
+            len: 4096,
+            tag: 7,
+        };
+        let expected: [u8; 20] = [1, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 7, 0, 0, 0];
+        assert_eq!(req.encode(), expected);
+        assert_eq!(VirtioBlkReqFrame::decode(&expected).expect("decode"), req);
+    }
+
+    #[test]
+    fn ext4_response_frame_golden_vector_matches_contract() {
+        let resp = VirtioBlkRespFrame {
+            status: 0,
+            _pad: [0; 3],
+            done_len: 4096,
+            tag: 7,
+        };
+        let expected: [u8; 12] = [0, 0, 0, 0, 0, 16, 0, 0, 7, 0, 0, 0];
+        assert_eq!(resp.encode(), expected);
+        assert_eq!(VirtioBlkRespFrame::decode(&expected).expect("decode"), resp);
+    }
+}

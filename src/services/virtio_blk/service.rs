@@ -7,7 +7,7 @@ use crate::kernel::vfs::{FilesystemService, VfsLiteError};
 
 use super::device::{
     VIRTIO_BLK_OP_READ, VIRTIO_BLK_OP_WRITE, VirtQueue, VirtioBlkDevice, VirtioBlkReqFrame,
-    VirtioBlkRequest, VirtioBlkRespFrame,
+    VirtioBlkRequest, VirtioBlkRespFrame, VirtqChain,
 };
 
 #[derive(Debug)]
@@ -35,32 +35,29 @@ impl VirtioBlkService {
     }
 
     fn process_once(&mut self) -> Result<VirtioBlkRespFrame, VfsLiteError> {
-        let req = self
+        let chain = self
             .queue
-            .pop_next_request()
+            .pop_next_chain()
             .ok_or(VfsLiteError::Unsupported)?;
+        let req = chain.request;
         let io = VirtioBlkRequest {
             sector: req.sector,
             len: req.len,
         };
         let result = match req.op {
-            VIRTIO_BLK_OP_READ => self.dev.read(io).map(|done| VirtioBlkRespFrame {
-                status: 0,
-                _pad: [0; 3],
-                done_len: done,
-                tag: req.tag,
-            }),
-            VIRTIO_BLK_OP_WRITE => self.dev.write(io).map(|done| VirtioBlkRespFrame {
-                status: 0,
-                _pad: [0; 3],
-                done_len: done,
-                tag: req.tag,
-            }),
+            VIRTIO_BLK_OP_READ => self.dev.read(io),
+            VIRTIO_BLK_OP_WRITE => self.dev.write(io),
             _ => Err(()),
         }
         .map_err(|_| VfsLiteError::BadFd)?;
 
-        self.queue.push_used(result);
+        let resp = VirtioBlkRespFrame {
+            status: 0,
+            _pad: [0; 3],
+            done_len: result,
+            tag: req.tag,
+        };
+        self.queue.push_used(resp);
         self.queue.take_last_used().ok_or(VfsLiteError::Unsupported)
     }
 }
@@ -73,8 +70,9 @@ impl FilesystemService for VirtioBlkService {
     fn dispatch(&mut self, request: Message) -> Result<Message, VfsLiteError> {
         let req =
             VirtioBlkReqFrame::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
+        let chain = VirtqChain::from_request(req);
         self.queue
-            .push_request(req)
+            .push_chain(chain)
             .map_err(|_| VfsLiteError::NoFd)?;
         let resp = self.process_once()?;
         Message::with_header(0, request.opcode, 0, None, &resp.encode())
