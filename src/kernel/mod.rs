@@ -5,6 +5,7 @@ pub mod driver_proto;
 pub mod init_server;
 pub mod ipc;
 pub mod lock;
+pub mod printk;
 pub mod proc_proto;
 pub mod process_manager;
 pub mod runtime;
