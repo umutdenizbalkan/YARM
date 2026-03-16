@@ -21,6 +21,15 @@ jobs:
       - name: enforce kernel/services split and thin service bins
         run: scripts/check-service-arch-boundary.sh
 
+
+  mount-fallback-sim-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: deterministic mount fallback telemetry simulation gate
+        run: cargo test -q kernel::sim::tests::deterministic_mount_fallback_telemetry_is_reported
+
   core-profile:
     runs-on: ubuntu-latest
     steps:

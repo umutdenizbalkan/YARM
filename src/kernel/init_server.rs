@@ -186,6 +186,7 @@ pub struct InitServerLite {
     launch_order: [Option<CoreServiceKind>; 3],
     launch_count: usize,
     mount_plan: MountPlan,
+    mount_status: Option<MountRecoveryReport>,
 }
 
 impl Default for InitServerLite {
@@ -209,6 +210,7 @@ impl InitServerLite {
             launch_order: [None; 3],
             launch_count: 0,
             mount_plan: MountPlan::baseline(),
+            mount_status: None,
         }
     }
 
@@ -251,11 +253,16 @@ impl InitServerLite {
         self.mount_plan
     }
 
+    pub const fn mount_status(&self) -> Option<MountRecoveryReport> {
+        self.mount_status
+    }
+
     pub fn set_mount_plan(&mut self, plan: MountPlan) -> Result<(), KernelError> {
         if plan.count == 0 || plan.count > plan.order.len() {
             return Err(KernelError::WrongObject);
         }
         self.mount_plan = plan;
+        self.mount_status = None;
         Ok(())
     }
 
@@ -372,6 +379,9 @@ impl InitServerLite {
             class: TaskClass::SystemServer,
         })?;
 
+        let mount_status = self.execute_mount_plan_with_fail_at(None)?;
+        self.mount_status = Some(mount_status);
+
         Ok(CoreLaunchReport {
             process_manager_spawned: true,
             vfs_spawned: true,
@@ -395,7 +405,10 @@ impl InitServerLite {
     }
 
     pub fn begin_running(&mut self) -> Result<(), KernelError> {
-        if self.phase != InitBootPhase::LaunchingCore || self.fault_handoff.is_none() {
+        if self.phase != InitBootPhase::LaunchingCore
+            || self.fault_handoff.is_none()
+            || self.mount_status.is_none()
+        {
             return Err(KernelError::WrongObject);
         }
         self.phase = InitBootPhase::Running;
@@ -521,6 +534,30 @@ mod tests {
                 Some(CoreServiceKind::Supervisor),
             ]
         );
+    }
+
+    #[test]
+    fn launch_sets_mount_status() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitServerLite::new();
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut state, graph)
+            .expect("register");
+        init.launch_core_services(
+            &mut state,
+            CoreServiceImagePlan {
+                process_manager_entry: 0x8000,
+                vfs_entry: 0x9000,
+                supervisor_entry: 0xA000,
+            },
+        )
+        .expect("launch");
+        assert!(init.mount_status().is_some());
     }
 
     #[test]

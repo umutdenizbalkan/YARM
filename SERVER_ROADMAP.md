@@ -65,6 +65,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 - 🚧 `fat.srv` scaffold started (`services/fat/*` + thin `src/bin/fat_srv.rs` entrypoint).
 - 🚧 `blkcache.srv` scaffold started (`services/blkcache/*` + thin `src/bin/blkcache_srv.rs` entrypoint).
+- 🚧 `virtio_blk.srv` scaffold started (`services/virtio_blk/*` + thin `src/bin/virtio_blk_srv.rs` entrypoint).
 
 ## Phase 2 — Device Driver Servers
 
@@ -117,9 +118,9 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 - ✅ Next move 1: `kernel::vfs` promoted as primary API (with `vfs_lite` compatibility shim and migrated imports).
 - ✅ Next move 2: typed VFS request/response wrappers added in `kernel::vfs` and adopted by service entry/service tests.
-- ✅ Next move 3: FAT scaffold evolved beyond placeholder with explicit backend semantics and typed VFS messaging path.
-- ✅ Next move 4: blkcache evolved into reusable cache abstraction and now integrated by FAT/EXT4 backends.
-- ✅ Next move 5: init control-plane includes explicit mount plan + deterministic recovery/fallback simulation hooks.
+- ✅ Next move 3: FAT scaffold now models directory entries + cluster growth and typed VFS messaging path.
+- ✅ Next move 4: blkcache now has policy knobs + writeback scheduling and is integrated by FAT/EXT4 backends.
+- ✅ Next move 5: init launch flow now records mount execution status, with deterministic recovery/fallback simulation telemetry.
 - ✅ Next move 6: CI/service boundary gate added (`scripts/check-service-arch-boundary.sh`) and wired into compat gates workflow.
 
 ## Readiness criteria

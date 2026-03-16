@@ -59,6 +59,21 @@ pub fn run_mount_orchestration_scenario() -> Result<MountOrchestrationSummary, K
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountFallbackTelemetry {
+    pub recovered_with_fat: bool,
+    pub mounted_count: usize,
+}
+
+pub fn run_mount_fallback_telemetry_scenario() -> Result<MountFallbackTelemetry, KernelError> {
+    let init = InitServerLite::new();
+    let report = init.execute_mount_plan_with_fail_at(Some(3))?;
+    Ok(MountFallbackTelemetry {
+        recovered_with_fat: report.recovered_with_fat,
+        mounted_count: report.mounted_count,
+    })
+}
+
 pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
     let mut kernel = Bootstrap::init()?;
     let mut init = InitServerLite::new();
@@ -268,6 +283,13 @@ mod tests {
             })
             .expect("spawn thread");
         handle.join().expect("join");
+    }
+
+    #[test]
+    fn deterministic_mount_fallback_telemetry_is_reported() {
+        let telem = run_mount_fallback_telemetry_scenario().expect("mount fallback telemetry");
+        assert!(telem.recovered_with_fat);
+        assert!(telem.mounted_count >= 4);
     }
 
     #[test]
