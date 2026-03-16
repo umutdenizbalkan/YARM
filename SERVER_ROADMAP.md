@@ -12,6 +12,16 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ## Milestones and test gates
 
+
+## Service domain layout
+
+- `src/services/control_plane/*` for init/procman/vfs/supervisor service implementations.
+- `src/services/fs/*` for filesystem and storage-facing services.
+- `src/services/drivers/*` for hardware/transport driver services.
+- `src/services/network/*` for networking services.
+- `src/services/ui/*` for display/input/session services.
+- `src/services/compatibility/*` for personality/compatibility servers.
+
 ## Phase 0 — Stabilize Core Control Plane ✅
 
 ### Scope

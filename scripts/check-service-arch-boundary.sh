@@ -8,7 +8,18 @@ if rg -n "Ext4|RamFs|DevFs|Initramfs|Fat|BlkCache" src/kernel/vfs.rs src/kernel/
   exit 1
 fi
 
-# 2) thin *_srv.rs binaries must delegate directly to yarm::services::*::run
+# 2) enforce service domain layout (no legacy flat service directories)
+allowed='^(common|compatibility|control_plane|drivers|fs|network|ui)$'
+for d in src/services/*; do
+  [[ -d "$d" ]] || continue
+  base=$(basename "$d")
+  if ! [[ "$base" =~ $allowed ]]; then
+    echo "[fail] legacy/non-domain service directory found: $d"
+    exit 1
+  fi
+done
+
+# 3) thin *_srv.rs binaries must delegate directly to yarm::services::*::run
 bad=0
 for f in src/bin/*_srv.rs; do
   [[ -e "$f" ]] || continue
