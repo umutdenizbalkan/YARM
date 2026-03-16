@@ -6,6 +6,7 @@ use crate::services::common::fs::{
 use super::dir::find_inode_index;
 use super::file::checked_append;
 use super::inode::Ext4Inode;
+use crate::services::blkcache::BlockCache;
 
 #[derive(Debug)]
 pub struct Ext4Backend {
@@ -14,6 +15,7 @@ pub struct Ext4Backend {
     inodes: [Option<Ext4Inode>; MAX_SERVICE_INODES],
     max_file_len: u64,
     journal_seq: u64,
+    cache: BlockCache,
 }
 
 impl Default for Ext4Backend {
@@ -30,6 +32,7 @@ impl Ext4Backend {
             inodes: [None; MAX_SERVICE_INODES],
             max_file_len: 16 * 1024 * 1024,
             journal_seq: 0,
+            cache: BlockCache::new(),
         }
     }
 
@@ -114,6 +117,7 @@ impl VfsBackend for Ext4Backend {
         let inode = self.inode_for_fd(fd).ok_or(VfsLiteError::BadFd)?;
         let idx = find_inode_index(&self.inodes, inode).ok_or(VfsLiteError::BadFd)?;
         let file_len = self.inodes[idx].ok_or(VfsLiteError::BadFd)?.file_len;
+        let _ = self.cache.get(fd);
         Ok(core::cmp::min(len, file_len))
     }
 
@@ -126,6 +130,7 @@ impl VfsBackend for Ext4Backend {
         inode_slot.file_len = checked_append(inode_slot.file_len, len, self.max_file_len)?;
         self.inodes[idx] = Some(inode_slot);
         self.journal_seq = self.journal_seq.saturating_add(1);
+        self.cache.put(fd, inode_slot.file_len);
         Ok(len)
     }
 

@@ -2,8 +2,9 @@ extern crate std;
 
 use std::println;
 
-use crate::kernel::ipc::Message;
-use crate::kernel::vfs_proto::{VFS_OP_OPENAT, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args};
+use crate::kernel::vfs::{
+    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
+};
 use crate::services::common::service::FsService;
 use crate::services::ramfs::tree::RamFsBackend;
 
@@ -12,13 +13,12 @@ pub type RamFsService = FsService<RamFsBackend>;
 pub fn run() {
     let mut svc = RamFsService::with_backend(RamFsBackend::new());
 
-    let open = Message::with_header(
-        0,
-        VFS_OP_OPENAT,
-        0,
-        None,
-        &VfsV1Args::new(0, 0xA000, 0, 0).encode(),
-    )
+    let open = openat_message(OpenAtRequest {
+        dirfd: 0,
+        path_ptr: 0xA000,
+        flags: 0,
+        mode: 0,
+    })
     .expect("open");
     let open_rep = svc.handle(open).expect("open rep");
 
@@ -26,23 +26,20 @@ pub fn run() {
     fd_bytes.copy_from_slice(open_rep.as_slice());
     let fd = u64::from_le_bytes(fd_bytes);
 
-    let write = Message::with_header(
-        0,
-        VFS_OP_WRITE,
-        0,
-        None,
-        &VfsV1Args::new(fd, 0, 64, 0).encode(),
-    )
+    let write = write_message(ReadWriteRequest {
+        fd,
+        buf_ptr: 0,
+        len: 64,
+    })
     .expect("write");
     let _ = svc.handle(write).expect("write rep");
 
-    let stat = Message::with_header(
-        0,
-        VFS_OP_STATX,
-        0,
-        None,
-        &VfsV1Args::new(0, 0xA000, 0, 0).encode(),
-    )
+    let stat = statx_message(StatxRequest {
+        dirfd: 0,
+        path_ptr: 0xA000,
+        flags: 0,
+        mask_or_buf: 0,
+    })
     .expect("stat");
     let stat_rep = svc.handle(stat).expect("stat rep");
 
@@ -66,36 +63,32 @@ mod tests {
     #[test]
     fn ramfs_service_supports_write_then_stat() {
         let mut svc = RamFsService::with_backend(RamFsBackend::new());
-        let open = Message::with_header(
-            0,
-            VFS_OP_OPENAT,
-            0,
-            None,
-            &VfsV1Args::new(0, 0x1010, 0, 0).encode(),
-        )
+        let open = openat_message(OpenAtRequest {
+            dirfd: 0,
+            path_ptr: 0x1010,
+            flags: 0,
+            mode: 0,
+        })
         .expect("open");
         let open_rep = svc.handle(open).expect("open rep");
         let mut fd_bytes = [0u8; 8];
         fd_bytes.copy_from_slice(open_rep.as_slice());
         let fd = u64::from_le_bytes(fd_bytes);
 
-        let write = Message::with_header(
-            0,
-            VFS_OP_WRITE,
-            0,
-            None,
-            &VfsV1Args::new(fd, 0, 128, 0).encode(),
-        )
+        let write = write_message(ReadWriteRequest {
+            fd,
+            buf_ptr: 0,
+            len: 128,
+        })
         .expect("write");
         let _ = svc.handle(write).expect("write rep");
 
-        let stat = Message::with_header(
-            0,
-            VFS_OP_STATX,
-            0,
-            None,
-            &VfsV1Args::new(0, 0x1010, 0, 0).encode(),
-        )
+        let stat = statx_message(StatxRequest {
+            dirfd: 0,
+            path_ptr: 0x1010,
+            flags: 0,
+            mask_or_buf: 0,
+        })
         .expect("stat");
         let stat_rep = svc.handle(stat).expect("stat rep");
         let mut len_bytes = [0u8; 8];

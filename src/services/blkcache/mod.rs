@@ -1,3 +1,3 @@
 pub mod service;
 
-pub use service::{BlkCacheService, run};
+pub use service::{BlkCacheService, BlockCache, run};

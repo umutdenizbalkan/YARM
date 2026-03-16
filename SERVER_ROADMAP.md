@@ -113,6 +113,15 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - input event routing deterministic replay
 - display mode-set and frame-present checks
 
+## Architecture follow-up status (completed)
+
+- ✅ Next move 1: `kernel::vfs` promoted as primary API (with `vfs_lite` compatibility shim and migrated imports).
+- ✅ Next move 2: typed VFS request/response wrappers added in `kernel::vfs` and adopted by service entry/service tests.
+- ✅ Next move 3: FAT scaffold evolved beyond placeholder with explicit backend semantics and typed VFS messaging path.
+- ✅ Next move 4: blkcache evolved into reusable cache abstraction and now integrated by FAT/EXT4 backends.
+- ✅ Next move 5: init control-plane includes explicit mount plan + deterministic recovery/fallback simulation hooks.
+- ✅ Next move 6: CI/service boundary gate added (`scripts/check-service-arch-boundary.sh`) and wired into compat gates workflow.
+
 ## Readiness criteria
 
 Phase N is considered complete only when:

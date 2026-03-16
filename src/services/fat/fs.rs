@@ -1,10 +1,12 @@
 use crate::kernel::vfs::VfsBackend;
 use crate::kernel::vfs::VfsLiteError;
+use crate::services::blkcache::BlockCache;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FatBackend {
     opened: Option<u64>,
     file_len: u64,
+    cache: BlockCache,
 }
 
 impl Default for FatBackend {
@@ -18,6 +20,7 @@ impl FatBackend {
         Self {
             opened: None,
             file_len: 1024,
+            cache: BlockCache::new(),
         }
     }
 }
@@ -44,6 +47,7 @@ impl VfsBackend for FatBackend {
         if self.opened != Some(fd) {
             return Err(VfsLiteError::BadFd);
         }
+        let _ = self.cache.get(fd);
         Ok(core::cmp::min(len, self.file_len))
     }
 
@@ -52,6 +56,7 @@ impl VfsBackend for FatBackend {
             return Err(VfsLiteError::BadFd);
         }
         self.file_len = self.file_len.saturating_add(len);
+        self.cache.put(fd, self.file_len);
         Ok(len)
     }
 

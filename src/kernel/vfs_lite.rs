@@ -1,3 +1,5 @@
+//! Legacy compatibility module; prefer `crate::kernel::vfs` for new code.
+
 use super::ipc::Message;
 use super::vfs_proto::{
     VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,

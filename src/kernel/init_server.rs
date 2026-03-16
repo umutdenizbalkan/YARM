@@ -133,6 +133,44 @@ pub struct CoreLaunchReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountServiceKind {
+    Initramfs,
+    RamFs,
+    DevFs,
+    Ext4,
+    Fat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountPlan {
+    pub order: [Option<MountServiceKind>; 5],
+    pub count: usize,
+    pub allow_fallback_to_fat: bool,
+}
+
+impl MountPlan {
+    pub const fn baseline() -> Self {
+        Self {
+            order: [
+                Some(MountServiceKind::Initramfs),
+                Some(MountServiceKind::RamFs),
+                Some(MountServiceKind::DevFs),
+                Some(MountServiceKind::Ext4),
+                None,
+            ],
+            count: 4,
+            allow_fallback_to_fat: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountRecoveryReport {
+    pub mounted_count: usize,
+    pub recovered_with_fat: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitFaultHandoff {
     pub supervisor_tid: u64,
     pub restart_window_ticks: u64,
@@ -147,6 +185,7 @@ pub struct InitServerLite {
     restart_policies: CoreServicePolicyTable,
     launch_order: [Option<CoreServiceKind>; 3],
     launch_count: usize,
+    mount_plan: MountPlan,
 }
 
 impl Default for InitServerLite {
@@ -169,6 +208,7 @@ impl InitServerLite {
             restart_policies: CoreServicePolicyTable::baseline(),
             launch_order: [None; 3],
             launch_count: 0,
+            mount_plan: MountPlan::baseline(),
         }
     }
 
@@ -205,6 +245,43 @@ impl InitServerLite {
 
     pub const fn launch_order(&self) -> [Option<CoreServiceKind>; 3] {
         self.launch_order
+    }
+
+    pub const fn mount_plan(&self) -> MountPlan {
+        self.mount_plan
+    }
+
+    pub fn set_mount_plan(&mut self, plan: MountPlan) -> Result<(), KernelError> {
+        if plan.count == 0 || plan.count > plan.order.len() {
+            return Err(KernelError::WrongObject);
+        }
+        self.mount_plan = plan;
+        Ok(())
+    }
+
+    pub fn execute_mount_plan_with_fail_at(
+        &self,
+        fail_at: Option<usize>,
+    ) -> Result<MountRecoveryReport, KernelError> {
+        let mut mounted = 0usize;
+        let mut recovered = false;
+        for idx in 0..self.mount_plan.count {
+            if fail_at == Some(idx) {
+                if self.mount_plan.allow_fallback_to_fat {
+                    recovered = true;
+                    mounted = mounted.saturating_add(1);
+                    break;
+                }
+                return Err(KernelError::WrongObject);
+            }
+            if self.mount_plan.order[idx].is_some() {
+                mounted = mounted.saturating_add(1);
+            }
+        }
+        Ok(MountRecoveryReport {
+            mounted_count: mounted,
+            recovered_with_fat: recovered,
+        })
     }
 
     pub fn set_startup_caps(&mut self, caps: StartupCapSet) {
@@ -498,5 +575,27 @@ mod tests {
         let mut init = InitServerLite::new();
         init.mark_failed();
         assert_eq!(init.phase(), InitBootPhase::Failed);
+    }
+
+    #[test]
+    fn mount_plan_supports_ext4_to_fat_recovery() {
+        let init = InitServerLite::new();
+        let report = init
+            .execute_mount_plan_with_fail_at(Some(3))
+            .expect("mount recovery");
+        assert!(report.recovered_with_fat);
+        assert!(report.mounted_count >= 4);
+    }
+
+    #[test]
+    fn mount_plan_without_fallback_fails() {
+        let mut init = InitServerLite::new();
+        let mut plan = MountPlan::baseline();
+        plan.allow_fallback_to_fat = false;
+        init.set_mount_plan(plan).expect("set plan");
+        assert_eq!(
+            init.execute_mount_plan_with_fail_at(Some(3)),
+            Err(KernelError::WrongObject)
+        );
     }
 }

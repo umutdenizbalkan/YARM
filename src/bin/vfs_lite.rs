@@ -2,7 +2,7 @@
 extern crate std;
 
 use yarm::kernel::ipc::Message;
-use yarm::kernel::vfs_lite::{InMemoryBackend, VfsLiteService};
+use yarm::kernel::vfs::{InMemoryBackend, VfsLiteService};
 use yarm::kernel::vfs_proto::{VFS_OP_OPENAT, VfsV1Args};
 
 use std::println;

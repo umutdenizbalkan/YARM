@@ -13,6 +13,14 @@ jobs:
       - name: enforce kernel/arch constant boundary
         run: scripts/check-kernel-arch-boundary.sh
 
+
+  service-boundary-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: enforce kernel/services split and thin service bins
+        run: scripts/check-service-arch-boundary.sh
+
   core-profile:
     runs-on: ubuntu-latest
     steps:
