@@ -35,3 +35,11 @@ This contract defines the minimum invariants for Phase-2 driver services (`irqmu
 - `kernel::bootstrap::tests::driver_restart_revokes_runtime_caps`
 
 The above are required to pass in `.github/workflows/compat-gates.yml` under `phase2-driver-gates`.
+
+## Backpressure and queueing contract
+
+- `uart.srv` enforces TX queue limits with deterministic drop accounting.
+- `virtio_net.srv` enforces TX queue limits with deterministic drop accounting and completion-based recovery.
+- `input.srv` enforces queue limits and deterministic overflow handling.
+- `virtio_gpu.srv` rejects frame commit before mode-set and reports deterministic rejection counters.
+- `irqmux.srv` supports per-line masking and deterministic masked/drop routing semantics.

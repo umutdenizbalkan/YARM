@@ -91,11 +91,11 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 ### Current implementation status
 
 - ✅ `virtio_blk.srv` scaffold implemented (`services/drivers/virtio_blk/*` + thin `src/bin/virtio_blk_srv.rs`).
-- ✅ `irqmux.srv` deterministic counters + routing/drop behavior implemented (`services/drivers/irqmux/*` + thin `src/bin/irqmux_srv.rs`).
-- ✅ `uart.srv` deterministic tx/rx accounting implemented (`services/drivers/uart/*` + thin `src/bin/uart_srv.rs`).
-- ✅ `virtio_net.srv` deterministic tx/rx packet accounting implemented (`services/drivers/virtio_net/*` + thin `src/bin/virtio_net_srv.rs`).
-- ✅ `virtio_gpu.srv` deterministic mode-set/frame-commit accounting implemented (`services/drivers/virtio_gpu/*` + thin `src/bin/virtio_gpu_srv.rs`).
-- ✅ `input.srv` deterministic accepted/dropped event accounting implemented (`services/drivers/input/*` + thin `src/bin/input_srv.rs`).
+- ✅ `irqmux.srv` deterministic routing/drop/mask behavior implemented (`services/drivers/irqmux/*` + thin `src/bin/irqmux_srv.rs`).
+- ✅ `uart.srv` deterministic tx/rx accounting with queue backpressure implemented (`services/drivers/uart/*` + thin `src/bin/uart_srv.rs`).
+- ✅ `virtio_net.srv` deterministic tx/rx packet accounting with queue backpressure implemented (`services/drivers/virtio_net/*` + thin `src/bin/virtio_net_srv.rs`).
+- ✅ `virtio_gpu.srv` deterministic mode-set/frame-commit gating implemented (`services/drivers/virtio_gpu/*` + thin `src/bin/virtio_gpu_srv.rs`).
+- ✅ `input.srv` deterministic accepted/dropped event accounting with queue limits implemented (`services/drivers/input/*` + thin `src/bin/input_srv.rs`).
 
 ### Test gates
 

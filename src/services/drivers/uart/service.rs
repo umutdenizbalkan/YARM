@@ -2,15 +2,19 @@ extern crate std;
 
 use std::println;
 
+const UART_TX_QUEUE_LIMIT: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UartStats {
     pub tx_bytes: u64,
     pub rx_bytes: u64,
+    pub dropped_tx_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UartService {
     stats: UartStats,
+    tx_inflight: usize,
 }
 
 impl UartService {
@@ -19,12 +23,24 @@ impl UartService {
             stats: UartStats {
                 tx_bytes: 0,
                 rx_bytes: 0,
+                dropped_tx_bytes: 0,
             },
+            tx_inflight: 0,
         }
     }
 
     pub fn write(&mut self, bytes: usize) {
-        self.stats.tx_bytes = self.stats.tx_bytes.saturating_add(bytes as u64);
+        let available = UART_TX_QUEUE_LIMIT.saturating_sub(self.tx_inflight);
+        let accepted = available.min(bytes);
+        let dropped = bytes.saturating_sub(accepted);
+
+        self.tx_inflight = self.tx_inflight.saturating_add(accepted);
+        self.stats.tx_bytes = self.stats.tx_bytes.saturating_add(accepted as u64);
+        self.stats.dropped_tx_bytes = self.stats.dropped_tx_bytes.saturating_add(dropped as u64);
+    }
+
+    pub fn complete_tx(&mut self, bytes: usize) {
+        self.tx_inflight = self.tx_inflight.saturating_sub(bytes);
     }
 
     pub fn ingest(&mut self, bytes: usize) {
@@ -41,8 +57,8 @@ pub fn run() {
     svc.write(4);
     let s = svc.stats();
     println!(
-        "uart.srv online: tx_bytes={}, rx_bytes={}",
-        s.tx_bytes, s.rx_bytes
+        "uart.srv online: tx_bytes={}, rx_bytes={}, dropped_tx_bytes={}",
+        s.tx_bytes, s.rx_bytes, s.dropped_tx_bytes
     );
 }
 
@@ -51,15 +67,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uart_tracks_tx_and_rx_bytes() {
+    fn uart_backpressure_is_deterministic() {
         let mut s = UartService::new();
-        s.write(12);
+        s.write(80);
         s.ingest(3);
+        s.complete_tx(32);
+        s.write(16);
         assert_eq!(
             s.stats(),
             UartStats {
-                tx_bytes: 12,
-                rx_bytes: 3
+                tx_bytes: 80,
+                rx_bytes: 3,
+                dropped_tx_bytes: 16,
             }
         );
     }
