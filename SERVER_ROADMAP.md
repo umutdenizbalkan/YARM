@@ -58,14 +58,14 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ### Current implementation status
 
-- ✅ `ramfs.srv` scaffold implemented (`services/ramfs/*` + thin `src/bin/ramfs_srv.rs` entrypoint).
-- ✅ `initramfs.srv` scaffold implemented (`services/initramfs/*` + thin `src/bin/initramfs_srv.rs` entrypoint).
-- ✅ `devfs.srv` scaffold implemented (`services/devfs/*` + thin `src/bin/devfs_srv.rs` entrypoint (console/null nodes)).
-- ✅ `ext4.srv` scaffold implemented (`services/ext4/*` + thin `src/bin/ext4_srv.rs` entrypoint).
+- ✅ `ramfs.srv` scaffold implemented (`services/fs/ramfs/*` + thin `src/bin/ramfs_srv.rs` entrypoint).
+- ✅ `initramfs.srv` scaffold implemented (`services/fs/initramfs/*` + thin `src/bin/initramfs_srv.rs` entrypoint).
+- ✅ `devfs.srv` scaffold implemented (`services/fs/devfs/*` + thin `src/bin/devfs_srv.rs` entrypoint (console/null nodes)).
+- ✅ `ext4.srv` scaffold implemented (`services/fs/ext4/*` + thin `src/bin/ext4_srv.rs` entrypoint).
 
-- 🚧 `fat.srv` scaffold started (`services/fat/*` + thin `src/bin/fat_srv.rs` entrypoint).
-- 🚧 `blkcache.srv` scaffold started (`services/blkcache/*` + thin `src/bin/blkcache_srv.rs` entrypoint).
-- 🚧 `virtio_blk.srv` scaffold started (`services/virtio_blk/*` + thin `src/bin/virtio_blk_srv.rs` entrypoint).
+- 🚧 `fat.srv` scaffold started (`services/fs/fat/*` + thin `src/bin/fat_srv.rs` entrypoint).
+- 🚧 `blkcache.srv` scaffold started (`services/fs/blkcache/*` + thin `src/bin/blkcache_srv.rs` entrypoint).
+- 🚧 `virtio_blk.srv` scaffold started (`services/drivers/virtio_blk/*` + thin `src/bin/virtio_blk_srv.rs` entrypoint).
 
 ## Phase 2 — Device Driver Servers
 

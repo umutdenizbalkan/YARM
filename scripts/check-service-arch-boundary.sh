@@ -17,7 +17,7 @@ for f in src/bin/*_srv.rs; do
     echo "[fail] $f is not thin (>$lines lines)"
     bad=1
   fi
-  if ! rg -n "yarm::services::[a-z0-9_]+::run\(\);" "$f" >/dev/null; then
+  if ! rg -n "yarm::services::[a-z0-9_:]+::run\(\);" "$f" >/dev/null; then
     echo "[fail] $f does not delegate to services::<name>::run()"
     bad=1
   fi

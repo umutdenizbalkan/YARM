@@ -1,10 +1,7 @@
-pub mod blkcache;
 pub mod common;
-pub mod devfs;
-pub mod ext4;
-pub mod fat;
-pub mod initramfs;
-#[cfg(feature = "linux-compat")]
-pub mod linux_compat;
-pub mod ramfs;
-pub mod virtio_blk;
+pub mod compatibility;
+pub mod control_plane;
+pub mod drivers;
+pub mod fs;
+pub mod network;
+pub mod ui;

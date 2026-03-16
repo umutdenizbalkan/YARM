@@ -6,7 +6,7 @@ use crate::services::common::fs::{
 use super::dir::find_inode_index;
 use super::file::checked_append;
 use super::inode::Ext4Inode;
-use crate::services::blkcache::BlockCache;
+use crate::services::fs::blkcache::BlockCache;
 
 #[derive(Debug)]
 pub struct Ext4Backend {
@@ -142,7 +142,7 @@ impl VfsBackend for Ext4Backend {
 
 #[cfg(test)]
 mod framing_tests {
-    use crate::services::virtio_blk::device::{
+    use crate::services::drivers::virtio_blk::device::{
         VIRTIO_BLK_OP_READ, VirtioBlkReqFrame, VirtioBlkRespFrame,
     };
 

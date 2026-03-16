@@ -1,5 +1,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::devfs::run();
+    yarm::services::fs::devfs::run();
 }

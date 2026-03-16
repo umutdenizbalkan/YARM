@@ -1,5 +1,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::initramfs::run();
+    yarm::services::fs::initramfs::run();
 }

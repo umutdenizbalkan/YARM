@@ -9,7 +9,7 @@ use yarm::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args}
 use yarm::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use yarm::kernel::vfs::VfsLiteService;
 use yarm::kernel::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
-use yarm::services::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
+use yarm::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 
 fn main() {
     let _ = Bootstrap::init().expect("kernel init");

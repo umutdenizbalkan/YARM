@@ -1,5 +1,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::virtio_blk::run();
+    yarm::services::drivers::virtio_blk::run();
 }

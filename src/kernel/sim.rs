@@ -8,8 +8,8 @@ use super::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
 use super::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use super::vfs::{MountRouter, VfsLiteService};
 use super::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
-use crate::services::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
-use crate::services::ramfs::RamFsBackend;
+use crate::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
+use crate::services::fs::ramfs::RamFsBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitBootSummary {

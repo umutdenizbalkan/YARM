@@ -1,5 +1,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::blkcache::run();
+    yarm::services::fs::blkcache::run();
 }

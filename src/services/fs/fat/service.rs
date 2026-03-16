@@ -6,7 +6,7 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
 use crate::services::common::service::FsService;
-use crate::services::fat::fs::FatBackend;
+use crate::services::fs::fat::fs::FatBackend;
 
 pub type FatService = FsService<FatBackend>;
 

@@ -6,7 +6,7 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, openat_message, read_message, write_message,
 };
 use crate::services::common::service::FsService;
-use crate::services::initramfs::archive::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
+use crate::services::fs::initramfs::archive::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 
 pub type InitramfsService = FsService<InitramfsBackend>;
 

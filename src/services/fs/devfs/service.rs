@@ -4,7 +4,7 @@ use std::println;
 
 use crate::kernel::vfs::{OpenAtRequest, ReadWriteRequest, openat_message, write_message};
 use crate::services::common::service::FsService;
-use crate::services::devfs::nodes::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
+use crate::services::fs::devfs::nodes::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
 
 pub type DevFsService = FsService<DevFsBackend>;
 

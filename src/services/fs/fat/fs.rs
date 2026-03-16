@@ -1,5 +1,5 @@
 use crate::kernel::vfs::{VfsBackend, VfsLiteError};
-use crate::services::blkcache::BlockCache;
+use crate::services::fs::blkcache::BlockCache;
 
 const MAX_FAT_FILES: usize = 8;
 const MAX_OPEN_FDS: usize = 8;

@@ -1,5 +1,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::fat::run();
+    yarm::services::fs::fat::run();
 }
