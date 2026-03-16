@@ -31,6 +31,21 @@ if rg -n "crate::services::(fs|network|ui)::|yarm::services::(fs|network|ui)::" 
   bad=1
 fi
 
+
+# fs should not depend directly on network/ui internals
+if rg -n "crate::services::(network|ui)::|yarm::services::(network|ui)::" src/services/fs >/dev/null; then
+  echo "[fail] fs domain must not depend on network/ui domain internals"
+  rg -n "crate::services::(network|ui)::|yarm::services::(network|ui)::" src/services/fs
+  bad=1
+fi
+
+# network should not depend directly on ui internals
+if rg -n "crate::services::ui::|yarm::services::ui::" src/services/network >/dev/null; then
+  echo "[fail] network domain must not depend on ui domain internals"
+  rg -n "crate::services::ui::|yarm::services::ui::" src/services/network
+  bad=1
+fi
+
 # drivers should not depend directly on fs internals
 if rg -n "crate::services::fs::|yarm::services::fs::" src/services/drivers >/dev/null; then
   echo "[fail] drivers domain must not depend on fs domain internals"

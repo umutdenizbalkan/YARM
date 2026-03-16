@@ -102,7 +102,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - delegation gate: init->driver role edges and cap bundle validation (wired to compat-gates workflow).
 - fault gate: revoke/restart behavior deterministic and test-covered (wired to compat-gates workflow).
 
-## Phase 3 — Networking Servers
+## Phase 3 — Networking Servers 🚧
 
 ### Target servers
 
@@ -112,13 +112,21 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - `dhcp.srv`
 - `socket.srv` adapter
 
+### Current implementation status
+
+- ✅ `netmgr.srv` now tracks deterministic link-state events (`services/network/netmgr/*` + thin `src/bin/netmgr_srv.rs`).
+- ✅ `tcpip.srv` scaffold implemented with deterministic route/drop counters (`services/network/tcpip/*` + thin `src/bin/tcpip_srv.rs`).
+- ✅ `dns.srv` scaffold implemented with deterministic cache/upstream accounting (`services/network/dns/*` + thin `src/bin/dns_srv.rs`).
+- ✅ `dhcp.srv` scaffold implemented with deterministic lease accounting (`services/network/dhcp/*` + thin `src/bin/dhcp_srv.rs`).
+- ✅ `socket.srv` adapter scaffold implemented (`services/network/socket/*` + thin `src/bin/socket_srv.rs`).
+
 ### Test gates
 
-- deterministic packet path simulation
-- timeout/retry policy reproducibility
-- compatibility adapter vector tests
+- deterministic packet path simulation (wired to compat-gates workflow).
+- timeout/retry policy reproducibility (wired to compat-gates workflow).
+- compatibility adapter vector tests (socket adapter coverage wired to compat-gates workflow).
 
-## Phase 4 — Display + UI input servers
+## Phase 4 — Display + UI input servers 🚧
 
 ### Target servers
 
@@ -127,11 +135,17 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - `input.srv` (if not complete in phase 2)
 - `shell.srv` / session manager
 
+### Current implementation status
+
+- ✅ `display.srv` scaffold now emits a stable boot marker and tracks mode-set/frame-present counters (`services/ui/display/*` + thin `src/bin/display_srv.rs`).
+- ✅ `compositor.srv` scaffold implemented with deterministic frame composition replay (`services/ui/compositor/*` + thin `src/bin/compositor_srv.rs`).
+- ✅ `shell.srv` session-manager scaffold implemented (`services/ui/shell/*` + thin `src/bin/shell_srv.rs`).
+
 ### Test gates
 
-- boot-to-shell marker in QEMU log
-- input event routing deterministic replay
-- display mode-set and frame-present checks
+- boot-to-shell marker in QEMU log (marker stabilized + gate wired for marker string stability).
+- input event routing deterministic replay (covered by deterministic compositor/shell path gates and existing input driver scaffolds).
+- display mode-set and frame-present checks (wired to compat-gates workflow).
 
 ## Architecture follow-up status (completed)
 

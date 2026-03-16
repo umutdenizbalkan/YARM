@@ -42,6 +42,32 @@ jobs:
           cargo test -q kernel::bootstrap::tests::restart_denial_escalates_to_supervisor_every_threshold
           cargo test -q kernel::bootstrap::tests::driver_restart_revokes_runtime_caps
 
+
+  phase3-network-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: phase3 deterministic networking gates
+        run: |
+          cargo test -q services::network::netmgr::service::tests::netmgr_tracks_link_state_events
+          cargo test -q services::network::tcpip::service::tests::tcpip_deterministic_packet_path
+          cargo test -q services::network::dns::service::tests::dns_timeout_retry_is_reproducible
+          cargo test -q services::network::dhcp::service::tests::dhcp_lease_accounting_is_deterministic
+          cargo test -q services::network::socket::service::tests::socket_adapter_roundtrip_is_accounted
+
+  phase4-ui-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: phase4 display/input deterministic gates
+        run: |
+          cargo test -q services::ui::display::service::tests::boot_marker_is_stable
+          cargo test -q services::ui::display::service::tests::display_tracks_modeset_and_present
+          cargo test -q services::ui::compositor::service::tests::compositor_replay_is_deterministic
+          cargo test -q services::ui::shell::service::tests::shell_session_counter_increments
+
   mount-failure-matrix-sim-gate:
     runs-on: ubuntu-latest
     steps:
