@@ -14,15 +14,18 @@ Port user-space runtime to `x86_64-unknown-none` and provide a minimal musl sysd
 - [ ] Verify `cargo build --target <x86_64-none-target>` works for `kernel_boot` and `init_server` without Linux ABI assumptions.
   - Current blocker: `core` is unavailable for this custom target in the current toolchain setup; next step is to wire `build-std`/`rust-src` strategy for the freestanding target.
   - Bootstrap script added: `scripts/build-x86_64-none-bootstrap.sh` to enforce toolchain/rust-src checks and run the `-Z build-std` flow once prerequisites exist.
+  - Milestone 1 verification remains blocked in this environment because downloading `nightly`/`rust-src` from `static.rust-lang.org` fails (network tunnel limitation).
 
 ## Milestone 2 — ABI boundary contract for libc shim
 
-- [ ] Freeze a tiny libc-facing kernel ABI surface (threads/TLS, memory mapping, clocks, process lifecycle, IPC-backed fd model).
-- [ ] Document syscall numbering + calling convention expected by shim stubs.
-- [ ] Define error mapping policy (`errno` conversion from kernel/service status codes).
-- [ ] Add compatibility tests for edge cases (`EINTR`, partial I/O, invalid handle, timeout).
+- [x] Freeze a tiny libc-facing kernel ABI surface (threads/TLS, memory mapping, clocks, process lifecycle, IPC-backed fd model).
+- [x] Document syscall numbering + calling convention expected by shim stubs.
+- [x] Define error mapping policy (`errno` conversion from kernel/service status codes).
+- [x] Add compatibility tests for edge cases (`EINTR`, partial I/O, invalid handle, timeout).
 
 ## Milestone 3 — musl sysdeps shim (minimum viable)
+
+Milestone 3 started: `src/services/compatibility/linux_compat/sysdeps.rs` now contains initial startup/memory contract wiring and a clock hook stub (`ENOSYS` until timer-service integration).
 
 - [ ] Implement musl entry/exit glue (`crt` startup + `__libc_start_main` integration path).
 - [ ] Implement memory primitives (`mmap`/`munmap` equivalent, brk/no-brk policy).
