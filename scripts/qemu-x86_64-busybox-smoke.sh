@@ -11,6 +11,24 @@ QEMU_MEMORY=${QEMU_MEMORY:-1024M}
 QEMU_SMP=${QEMU_SMP:-2}
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"console=ttyS0 rdinit=/init"}
 
+check_x86_kernel_bootability() {
+  local kernel="$1"
+  if ! command -v readelf >/dev/null 2>&1; then
+    return 0
+  fi
+  local ftype
+  ftype=$(file -b "$kernel" 2>/dev/null || true)
+  if [[ "$ftype" == *"ELF"* ]]; then
+    if ! readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
+      echo "[warn] kernel image is ELF but lacks PVH ELF note required for qemu -kernel direct boot"
+      echo "[hint] provide a Linux bzImage or add a PVH note / compatible boot protocol to the kernel image"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+
 if [[ ! -f "$KERNEL_IMAGE" ]]; then
   echo "[warn] kernel image missing: $KERNEL_IMAGE"
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
@@ -18,6 +36,11 @@ if [[ ! -f "$KERNEL_IMAGE" ]]; then
 fi
 if [[ ! -f "$INITRAMFS_IMAGE" ]]; then
   echo "[warn] initramfs image missing: $INITRAMFS_IMAGE"
+  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+  exit 0
+fi
+
+if ! check_x86_kernel_bootability "$KERNEL_IMAGE"; then
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
   exit 0
 fi

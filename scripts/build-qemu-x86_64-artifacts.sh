@@ -21,6 +21,22 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$TOOLCHAIN}
 RUST_SYSROOT=${RUST_SYSROOT:-$(rustup run "${RUSTUP_TOOLCHAIN}" rustc --print sysroot 2>/dev/null || true)}
 RUST_SRC_DIR=${RUST_SRC_DIR:-${RUST_SYSROOT}/lib/rustlib/src/rust}
 
+warn_if_kernel_not_qemu_direct_bootable() {
+  local kernel="$1"
+  if ! command -v readelf >/dev/null 2>&1; then
+    return 0
+  fi
+  local ftype
+  ftype=$(file -b "$kernel" 2>/dev/null || true)
+  if [[ "$ftype" == *"ELF"* ]]; then
+    if ! readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
+      echo "[warn] staged kernel image appears to be plain ELF without PVH note"
+      echo "[hint] qemu -kernel may reject it; provide bzImage or PVH-enabled ELF"
+    fi
+  fi
+}
+
+
 mkdir -p "$OUT_DIR" "$ROOTFS_DIR/bin" "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
 mkdir -p "$(dirname "$INITRAMFS_IMAGE")"
 INITRAMFS_IMAGE_ABS="$(cd "$(dirname "$INITRAMFS_IMAGE")" && pwd)/$(basename "$INITRAMFS_IMAGE")"
@@ -103,6 +119,7 @@ fi
 
 if [[ -f "$KERNEL_IMAGE" ]]; then
   echo "[ok] kernel image: $KERNEL_IMAGE"
+  warn_if_kernel_not_qemu_direct_bootable "$KERNEL_IMAGE"
 else
   echo "[warn] kernel image missing: $KERNEL_IMAGE"
   echo "[hint] provide a bootable x86_64 kernel image via KERNEL_IMAGE=<path>"
