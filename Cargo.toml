@@ -69,7 +69,6 @@ required-features = ["hosted-dev"]
 [[bin]]
 name = "init_server"
 path = "src/bin/init_server.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "initramfs_srv"
@@ -89,7 +88,6 @@ required-features = ["hosted-dev"]
 [[bin]]
 name = "kernel_boot"
 path = "src/bin/kernel_boot.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "linux_compat_srv"

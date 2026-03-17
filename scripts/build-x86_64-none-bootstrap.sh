@@ -7,6 +7,7 @@ TOOLCHAIN=${TOOLCHAIN:-nightly}
 
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$TOOLCHAIN}
 BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
+BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
 
 RUST_SYSROOT=${RUST_SYSROOT:-$(rustup run "${RUSTUP_TOOLCHAIN}" rustc --print sysroot 2>/dev/null || true)}
 RUST_SRC_DIR=${RUST_SRC_DIR:-${RUST_SYSROOT}/lib/rustlib/src/rust}
@@ -42,6 +43,7 @@ cargo +"${TOOLCHAIN}" build \
   -Z json-target-spec \
   --target "$TARGET_SPEC" \
   --profile "$PROFILE" \
+  ${BOOTSTRAP_FEATURE_ARGS} \
   --bin kernel_boot \
   --bin init_server
 
