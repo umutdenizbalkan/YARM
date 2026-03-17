@@ -73,3 +73,9 @@ mod tests {
         main();
     }
 }
+
+#[cfg(not(feature = "hosted-dev"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {}
+}
