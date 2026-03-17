@@ -13,15 +13,35 @@ INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-busybox.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-x86_64.elf}
 BUSYBOX_BIN=${BUSYBOX_BIN:-}
 ARTIFACTS_STRICT=${ARTIFACTS_STRICT:-0}
+TOOLCHAIN=${TOOLCHAIN:-nightly}
+BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
+BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
+
+RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$TOOLCHAIN}
+RUST_SYSROOT=${RUST_SYSROOT:-$(rustup run "${RUSTUP_TOOLCHAIN}" rustc --print sysroot 2>/dev/null || true)}
+RUST_SRC_DIR=${RUST_SRC_DIR:-${RUST_SYSROOT}/lib/rustlib/src/rust}
 
 mkdir -p "$OUT_DIR" "$ROOTFS_DIR/bin" "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
 mkdir -p "$(dirname "$INITRAMFS_IMAGE")"
 INITRAMFS_IMAGE_ABS="$(cd "$(dirname "$INITRAMFS_IMAGE")" && pwd)/$(basename "$INITRAMFS_IMAGE")"
 
-echo "[info] building server + kernel bins for target ${RUST_TARGET}"
+if ! rustup toolchain list | rg -q "^${TOOLCHAIN}"; then
+  echo "[warn] toolchain '${TOOLCHAIN}' is not installed"
+  echo "[hint] run: rustup toolchain install ${TOOLCHAIN}"
+  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+fi
+
+if [[ -z "$RUST_SYSROOT" || ! -d "$RUST_SRC_DIR" ]]; then
+  echo "[warn] rust-src is not installed for toolchain: ${RUSTUP_TOOLCHAIN}"
+  echo "[hint] run: rustup component add rust-src --toolchain ${RUSTUP_TOOLCHAIN}"
+  echo "[debug] looked for rust-src under: ${RUST_SRC_DIR}"
+  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+fi
+
+echo "[info] building server + kernel bins for target ${RUST_TARGET} (toolchain=${TOOLCHAIN}, build-std=${BUILD_STD_COMPONENTS})"
 BUILD_OK=1
 set +e
-cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" --bin "$SERVER_BIN" --bin "$KERNEL_BIN"
+cargo +"${TOOLCHAIN}" build -Z build-std=${BUILD_STD_COMPONENTS} -Z json-target-spec --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} --bin "$SERVER_BIN" --bin "$KERNEL_BIN"
 BUILD_STATUS=$?
 set -e
 if [[ "$BUILD_STATUS" -ne 0 ]]; then
