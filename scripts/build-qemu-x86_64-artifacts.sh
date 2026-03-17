@@ -111,3 +111,4 @@ fi
 
 echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"
 echo "[ok] x86_64 artifact staging complete in $OUT_DIR"
+echo "[next] run smoke boot: scripts/qemu-x86_64-busybox-smoke.sh"
