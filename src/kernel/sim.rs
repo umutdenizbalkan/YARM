@@ -17,6 +17,7 @@ pub struct InitBootSummary {
     pub proc_wait_exit: u64,
     pub vfs_open_opcode: u16,
     pub vfs_read_opcode: u16,
+    pub irq_notification_opcode: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +134,9 @@ pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError
     })?;
     init.begin_running()?;
 
+    let (_notif, notif_send_cap, notif_recv_cap) = kernel.create_notification(8)?;
+    kernel.bind_irq_notification(9, notif_send_cap)?;
+
     let mut proc = ProcessService::new();
     let spawn = Message::with_header(
         0,
@@ -186,11 +190,19 @@ pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError
         .handle_request(read)
         .map_err(|_| KernelError::WrongObject)?;
 
+    kernel.route_external_irq(9)?;
+    let irq_notification_opcode = kernel
+        .ipc_recv(notif_recv_cap)?
+        .ok_or(KernelError::WrongObject)
+        .map(|msg| msg.opcode)
+        .map(Some)?;
+
     Ok(InitBootSummary {
         init_phase: init.phase(),
         proc_wait_exit: waited.exit_code,
         vfs_open_opcode: open_rep.opcode,
         vfs_read_opcode: read_rep.opcode,
+        irq_notification_opcode,
     })
 }
 
@@ -314,6 +326,7 @@ mod tests {
                 assert_eq!(summary.proc_wait_exit, 5);
                 assert_eq!(summary.vfs_open_opcode, VFS_OP_OPENAT);
                 assert_eq!(summary.vfs_read_opcode, VFS_OP_READ);
+                assert_eq!(summary.irq_notification_opcode, Some(9));
             })
             .expect("spawn thread");
         handle.join().expect("join");

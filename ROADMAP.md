@@ -69,6 +69,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Added network/mirror bootstrap wrapper: `scripts/bootstrap-nightly-mirror.sh` (installs nightly + rust-src from configured Rust dist/update endpoints, then runs the freestanding bootstrap build).
 - Added Linux-compat sysdeps bootstrap module: `src/services/compatibility/linux_compat/sysdeps.rs` (startup + memory contract + clock stub).
 - Expanded sysdeps shim scaffolding with startup/memory/clock/thread/futex hooks and focused tests (bootstrap-grade semantics).
+- Expanded kernel deterministic bootstrap simulation to assert procman + VFS + IRQ notification routing in a single end-to-end flow (`run_init_core_bootstrap_scenario`).
 
 ## Immediate next 5 implementable steps
 
