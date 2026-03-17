@@ -5,7 +5,7 @@ TARGET_SPEC=${TARGET_SPEC:-targets/x86_64-yarm-none.json}
 PROFILE=${PROFILE:-x86-none}
 TOOLCHAIN=${TOOLCHAIN:-nightly}
 
-RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$(rustup show active-toolchain | awk '{print $1}')}
+RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$TOOLCHAIN}
 RUST_SRC_DIR=${RUST_SRC_DIR:-$HOME/.rustup/toolchains/${RUSTUP_TOOLCHAIN}/lib/rustlib/src/rust}
 
 if [[ ! -f "$TARGET_SPEC" ]]; then
@@ -20,15 +20,16 @@ if ! rustup toolchain list | rg -q "^${TOOLCHAIN}"; then
 fi
 
 if [[ ! -d "$RUST_SRC_DIR" ]]; then
-  echo "[warn] rust-src is not installed for active toolchain: ${RUSTUP_TOOLCHAIN}"
+  echo "[warn] rust-src is not installed for toolchain: ${RUSTUP_TOOLCHAIN}"
   echo "[hint] run: rustup component add rust-src --toolchain ${RUSTUP_TOOLCHAIN}"
   echo "[hint] then re-run this script to build std/core for custom target"
   exit 2
 fi
 
-echo "[info] building kernel_boot + init_server for ${TARGET_SPEC} with build-std"
+echo "[info] building kernel_boot + init_server for ${TARGET_SPEC} with build-std + json target spec"
 cargo +"${TOOLCHAIN}" build \
   -Z build-std=core,alloc,std,panic_abort \
+  -Z json-target-spec \
   --target "$TARGET_SPEC" \
   --profile "$PROFILE" \
   --bin kernel_boot \
