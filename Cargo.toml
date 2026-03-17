@@ -2,6 +2,7 @@
 name = "yarm"
 version = "0.1.0"
 edition = "2024"
+autobins = false
 
 [features]
 default = ["hosted-dev"]
@@ -11,9 +12,159 @@ linux-compat = []
 [dependencies]
 
 [[bin]]
+name = "blkcache_srv"
+path = "src/bin/blkcache_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "compositor_srv"
+path = "src/bin/compositor_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "console_driver"
+path = "src/bin/console_driver.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "core_profile_smoke"
+path = "src/bin/core_profile_smoke.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "devfs_srv"
+path = "src/bin/devfs_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "dhcp_srv"
+path = "src/bin/dhcp_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "display_srv"
+path = "src/bin/display_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "dns_srv"
+path = "src/bin/dns_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "driver_manager"
+path = "src/bin/driver_manager.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "ext4_srv"
+path = "src/bin/ext4_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "fat_srv"
+path = "src/bin/fat_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "init_server"
+path = "src/bin/init_server.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "init_srv"
+path = "src/bin/init_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "initramfs_srv"
+path = "src/bin/initramfs_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "input_srv"
+path = "src/bin/input_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "irqmux_srv"
+path = "src/bin/irqmux_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "kernel_boot"
+path = "src/bin/kernel_boot.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
 name = "linux_compat_srv"
 path = "src/bin/linux_compat_srv.rs"
-required-features = ["linux-compat"]
+required-features = ["hosted-dev", "linux-compat"]
+
+[[bin]]
+name = "netmgr_srv"
+path = "src/bin/netmgr_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "process_manager"
+path = "src/bin/process_manager.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "procman_srv"
+path = "src/bin/procman_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "ramfs_srv"
+path = "src/bin/ramfs_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "shell_srv"
+path = "src/bin/shell_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "socket_srv"
+path = "src/bin/socket_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "tcpip_srv"
+path = "src/bin/tcpip_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "uart_srv"
+path = "src/bin/uart_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "vfs_lite"
+path = "src/bin/vfs_lite.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "vfs_srv"
+path = "src/bin/vfs_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "virtio_blk_srv"
+path = "src/bin/virtio_blk_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "virtio_gpu_srv"
+path = "src/bin/virtio_gpu_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "virtio_net_srv"
+path = "src/bin/virtio_net_srv.rs"
+required-features = ["hosted-dev"]
 
 [profile.x86-none]
 inherits = "release"
