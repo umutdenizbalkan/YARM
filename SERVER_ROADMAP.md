@@ -22,6 +22,15 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - `src/services/ui/*` for display/input/session services.
 - `src/services/compatibility/*` for personality/compatibility servers.
 
+
+## Immediate next steps (review-driven)
+
+1. Add supervisor-first launch-order option in `InitServerLite` for faster recovery-manager readiness during early boot faults.
+2. Publish a restart-ownership matrix for `init.srv` vs `supervisor.srv` (who restarts `vfs/procman/drivers`, and fallback when supervisor fails).
+3. Convert all thin `src/bin/*_srv.rs` stubs to call real service entrypoints with explicit typed request loops (one service family per PR).
+4. Add deterministic fault-injection tests for each service family (`control_plane`, `drivers`, `fs`, `network`, `ui`) and wire them to `compat-gates`.
+5. Gate phase advancement on runnable profile evidence (QEMU smoke marker + deterministic sim + codec compatibility vectors).
+
 ## Phase 0 — Stabilize Core Control Plane ✅
 
 ### Scope

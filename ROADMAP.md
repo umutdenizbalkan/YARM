@@ -85,6 +85,22 @@ Progress notes:
 - ✅ Added IPC fastpath-vs-queued-vs-blocked telemetry tests under contention in `kernel::bootstrap` tests.
 - ✅ Added restart/redelegation stale-cap regression for checked driver delegation bundles.
 
+## Review follow-up next steps (after oversized placeholder PR)
+
+1. **Split architecture work into reviewable PR slices**
+   - PR A: arch module split + HAL adapter shims only.
+   - PR B: syscall/trap normalization only.
+   - PR C: platform layout constants + docs only.
+2. **Tighten CI to block placeholder/overscoped submissions**
+   - add commit/PR lint that rejects placeholder PR bodies and change sets spanning unrelated domains.
+   - require `compat-gates` and at least one architecture smoke job on every architecture-touching PR.
+3. **Promote contract docs from draft to enforced gates**
+   - pin `ABI_CONTRACT_FREEZE.md`, `SYSCALL_ABI.md`, and `PROC_VFS_CODEC_FREEZE.md` as CI-checked reference artifacts.
+4. **Reduce bootstrap script drift**
+   - consolidate x86/riscv qemu build/smoke scripts behind a shared helper to avoid duplicated maintenance.
+5. **Define a minimum runnable server profile**
+   - ship a single "core profile" path (`init/procman/vfs/supervisor + console + one FS`) and keep it green before expanding feature breadth.
+
 
 ## init.srv scaffold status
 
