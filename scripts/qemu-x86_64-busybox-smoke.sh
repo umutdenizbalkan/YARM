@@ -50,23 +50,53 @@ QEMU_CMD=(
   -append "$KERNEL_CMDLINE"
 )
 
-set +e
-if command -v timeout >/dev/null 2>&1; then
-  timeout "$TIMEOUT_SECS" "${QEMU_CMD[@]}" | tee "$LOGFILE"
-  QEMU_STATUS=$?
-else
-  echo "[warn] timeout command not found; running qemu without enforced timeout"
-  "${QEMU_CMD[@]}" | tee "$LOGFILE"
-  QEMU_STATUS=$?
-fi
-set -e
+MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|init_server|Welcome|\[ui\] boot-to-shell marker"
 
-if rg -n "YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|init_server|Welcome|\[ui\] boot-to-shell marker" "$LOGFILE" >/dev/null 2>&1; then
+set +e
+stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE" &
+PIPE_PID=$!
+QEMU_STATUS=0
+FOUND_MARKER=0
+
+START_TS=$(date +%s)
+while kill -0 "$PIPE_PID" >/dev/null 2>&1; do
+  if rg -n "$MARKER_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+    FOUND_MARKER=1
+    break
+  fi
+  NOW_TS=$(date +%s)
+  ELAPSED=$((NOW_TS - START_TS))
+  if [[ "$ELAPSED" -ge "$TIMEOUT_SECS" ]]; then
+    echo "[warn] timeout reached (${TIMEOUT_SECS}s) without marker detection"
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$FOUND_MARKER" -eq 1 ]]; then
+  kill "$PIPE_PID" >/dev/null 2>&1 || true
+  wait "$PIPE_PID"
+  QEMU_STATUS=$?
+  set -e
   echo "[ok] boot shell markers detected"
   exit 0
 fi
 
+if kill -0 "$PIPE_PID" >/dev/null 2>&1; then
+  kill "$PIPE_PID" >/dev/null 2>&1 || true
+  sleep 1
+  kill -9 "$PIPE_PID" >/dev/null 2>&1 || true
+fi
+wait "$PIPE_PID"
+QEMU_STATUS=$?
+set -e
+
 echo "[warn] boot shell markers not detected (status=$QEMU_STATUS)"
+if [[ -f "$LOGFILE" ]]; then
+  echo "[info] last 20 log lines from $LOGFILE"
+  tail -n 20 "$LOGFILE" || true
+fi
+
 if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
   exit 1
 fi
