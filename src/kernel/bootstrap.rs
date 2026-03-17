@@ -3022,6 +3022,50 @@ mod tests {
     }
 
     #[test]
+    fn ipc_fastpath_blocked_path_is_measured_without_switch() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(63).expect("sender");
+
+        let (_eid, send_cap, _recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+
+        let msg = Message::new(63, b"fp-block").expect("msg");
+        assert_eq!(
+            state.ipc_send_fastpath(send_cap, msg),
+            Err(KernelError::WouldBlock)
+        );
+
+        let t = state.ipc_path_telemetry();
+        assert_eq!(t.fastpath_attempts, 1);
+        assert_eq!(t.fastpath_switches, 0);
+        assert_eq!(t.blocked_sends, 1);
+        assert_eq!(t.queued_sends, 0);
+        assert_eq!(t.rendezvous_handoffs, 0);
+    }
+
+    #[test]
+    fn ipc_fastpath_on_buffered_endpoint_queues_without_switch() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(64).expect("sender");
+
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+
+        let msg = Message::new(64, b"fp-queued").expect("msg");
+        let result = state.ipc_send_fastpath(send_cap, msg).expect("fastpath");
+        assert!(!result.switched_to_waiter);
+
+        let delivered = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(delivered.as_slice(), b"fp-queued");
+
+        let t = state.ipc_path_telemetry();
+        assert_eq!(t.fastpath_attempts, 1);
+        assert_eq!(t.fastpath_switches, 0);
+        assert_eq!(t.queued_sends, 1);
+        assert_eq!(t.blocked_sends, 0);
+    }
+
+    #[test]
     fn delegate_driver_bundle_uses_standard_window_and_revokes_caps() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(59).expect("task");
@@ -3509,6 +3553,71 @@ mod tests {
             state.grant_driver_irq(33, irq),
             Err(KernelError::InvalidCapability)
         );
+    }
+
+    #[test]
+    fn delegation_checked_bundle_requires_redelegation_after_driver_restart() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(110).expect("init-task");
+        state.register_task(111).expect("driver-task");
+
+        state
+            .register_service_role(110, ServiceRole::Init)
+            .expect("role init");
+        state
+            .register_service_role(111, ServiceRole::Driver)
+            .expect("role driver");
+
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let iova_cap = state.create_iova_space_cap().expect("iova");
+
+        let first_bundle = state
+            .delegate_driver_bundle_checked(
+                110,
+                DriverBundlePlan {
+                    server_tid: ThreadId(111),
+                    irq_line: 14,
+                    mem_cap,
+                    iova_cap,
+                    iova_base: crate::kernel::vm::PAGE_SIZE * 4,
+                    iova_len: crate::kernel::vm::PAGE_SIZE,
+                },
+            )
+            .expect("first bundle");
+        assert!(state.cspace.get(first_bundle.irq_cap).is_some());
+        assert!(state.cspace.get(first_bundle.dma_cap).is_some());
+
+        let token = state.exit_task(111, 5).expect("exit");
+        state.restart_task(111, token).expect("restart");
+
+        assert!(state.cspace.get(first_bundle.irq_cap).is_none());
+        assert!(state.cspace.get(first_bundle.dma_cap).is_none());
+        assert_eq!(
+            state.grant_driver_irq(111, first_bundle.irq_cap),
+            Err(KernelError::InvalidCapability)
+        );
+
+        assert!(state.cspace.get(iova_cap).is_none());
+        let iova_cap2 = state.create_iova_space_cap().expect("iova2");
+
+        let second_bundle = state
+            .delegate_driver_bundle_checked(
+                110,
+                DriverBundlePlan {
+                    server_tid: ThreadId(111),
+                    irq_line: 14,
+                    mem_cap,
+                    iova_cap: iova_cap2,
+                    iova_base: crate::kernel::vm::PAGE_SIZE * 4,
+                    iova_len: crate::kernel::vm::PAGE_SIZE,
+                },
+            )
+            .expect("second bundle");
+
+        assert_ne!(first_bundle.irq_cap, second_bundle.irq_cap);
+        assert_ne!(first_bundle.dma_cap, second_bundle.dma_cap);
+        assert!(state.cspace.get(second_bundle.irq_cap).is_some());
+        assert!(state.cspace.get(second_bundle.dma_cap).is_some());
     }
 
     #[test]

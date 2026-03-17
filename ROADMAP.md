@@ -80,6 +80,10 @@ This checklist focuses on turning the current in-memory kernel model into a port
 4. Add minimal HAL trait conformance docs/tests for RISC-V and one additional ISA target.
 5. Expand deterministic end-to-end server flow tests (procman + VFS + notification routing).
 
+Progress notes:
+- ✅ Added IPC fastpath-vs-queued-vs-blocked telemetry tests under contention in `kernel::bootstrap` tests.
+- ✅ Added restart/redelegation stale-cap regression for checked driver delegation bundles.
+
 
 ## init.srv scaffold status
 
