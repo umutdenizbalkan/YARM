@@ -66,6 +66,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Added x86-none build profile knobs in `Cargo.toml` and wired them into x86 artifact staging.
 - Added x86_64 artifact and smoke scaffolds: `scripts/build-qemu-x86_64-artifacts.sh`, `scripts/qemu-x86_64-busybox-smoke.sh`.
 - Added freestanding build bootstrap helper script: `scripts/build-x86_64-none-bootstrap.sh` (checks nightly + rust-src before running `-Z build-std`).
+- Added network/mirror bootstrap wrapper: `scripts/bootstrap-nightly-mirror.sh` (installs nightly + rust-src from configured Rust dist/update endpoints, then runs the freestanding bootstrap build).
 - Added Linux-compat sysdeps bootstrap module: `src/services/compatibility/linux_compat/sysdeps.rs` (startup + memory contract + clock stub).
 - Expanded sysdeps shim scaffolding with startup/memory/clock/thread/futex hooks and focused tests (bootstrap-grade semantics).
 
