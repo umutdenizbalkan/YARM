@@ -32,20 +32,33 @@ LOGFILE=${LOGFILE:-qemu-x86_64-busybox.log}
 rm -f "$LOGFILE"
 
 echo "[info] qemu command: qemu-system-x86_64 -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
+echo "[info] waiting up to ${TIMEOUT_SECS}s for boot markers..."
+
+QEMU_CMD=(
+  qemu-system-x86_64
+  -machine "$QEMU_MACHINE"
+  -cpu "$QEMU_CPU"
+  -m "$QEMU_MEMORY"
+  -smp "$QEMU_SMP"
+  -nographic
+  -monitor none
+  -serial stdio
+  -no-reboot
+  -no-shutdown
+  -kernel "$KERNEL_IMAGE"
+  -initrd "$INITRAMFS_IMAGE"
+  -append "$KERNEL_CMDLINE"
+)
 
 set +e
-timeout "$TIMEOUT_SECS" qemu-system-x86_64 \
-  -machine "$QEMU_MACHINE" \
-  -cpu "$QEMU_CPU" \
-  -m "$QEMU_MEMORY" \
-  -smp "$QEMU_SMP" \
-  -nographic \
-  -serial mon:stdio \
-  -kernel "$KERNEL_IMAGE" \
-  -initrd "$INITRAMFS_IMAGE" \
-  -append "$KERNEL_CMDLINE" \
-  | tee "$LOGFILE"
-QEMU_STATUS=$?
+if command -v timeout >/dev/null 2>&1; then
+  timeout "$TIMEOUT_SECS" "${QEMU_CMD[@]}" | tee "$LOGFILE"
+  QEMU_STATUS=$?
+else
+  echo "[warn] timeout command not found; running qemu without enforced timeout"
+  "${QEMU_CMD[@]}" | tee "$LOGFILE"
+  QEMU_STATUS=$?
+fi
 set -e
 
 if rg -n "YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|init_server|Welcome|\[ui\] boot-to-shell marker" "$LOGFILE" >/dev/null 2>&1; then
