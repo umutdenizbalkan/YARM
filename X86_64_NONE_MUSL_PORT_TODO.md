@@ -34,7 +34,7 @@ Current caveat: hooks are bootstrap-grade shims (sufficient for bring-up/testing
 - [x] Implement thread primitives expected by musl (`clone`/TLS hooks or equivalent shim model).
 - [x] Implement futex-like wait/wake bridge using kernel IPC/synchronization primitives.
 - [x] Implement time/clock stubs (`clock_gettime`, nanosleep) via timer service.
-- [ ] Implement minimal file/socket facade over VFS/network services.
+- [x] Implement minimal file/socket facade over VFS/network services (bootstrap deterministic fd hooks in `linux_compat::sysdeps`; full service-backed semantics remain milestone-4+ integration work).
   - Mapping matrix artifact added: `MUSL_POSIX_IPC_MAPPING.md` (POSIX entry -> linux nr -> IPC opcode/service).
 
 ## Milestone 4 — Service integration on x86_64

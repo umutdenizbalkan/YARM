@@ -2,7 +2,7 @@ use super::{LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, Lin
 use crate::kernel::bootstrap::KernelState;
 use crate::kernel::capabilities::CapId;
 use crate::kernel::vm::PAGE_SIZE;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 /// Minimal sysdeps status used while porting musl to x86_64-unknown-none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +12,7 @@ pub struct SysdepsBootstrapStatus {
     pub clock_hooks_ready: bool,
     pub thread_hooks_ready: bool,
     pub futex_hooks_ready: bool,
+    pub io_hooks_ready: bool,
 }
 
 impl SysdepsBootstrapStatus {
@@ -22,6 +23,7 @@ impl SysdepsBootstrapStatus {
             clock_hooks_ready: true,
             thread_hooks_ready: true,
             futex_hooks_ready: true,
+            io_hooks_ready: true,
         }
     }
 }
@@ -179,6 +181,98 @@ pub fn futex_wake_hook(addr: usize, max_wake: u32) -> Result<u32, LinuxErrno> {
     Ok(woken)
 }
 
+static FD_TABLE: [AtomicU8; 64] = [const { AtomicU8::new(0) }; 64];
+static NEXT_FD: AtomicI32 = AtomicI32::new(3);
+
+const FD_KIND_FREE: u8 = 0;
+const FD_KIND_FILE: u8 = 1;
+const FD_KIND_SOCKET: u8 = 2;
+
+fn allocate_fd(kind: u8) -> Result<i32, LinuxErrno> {
+    if kind == FD_KIND_FREE {
+        return Err(LinuxErrno::Inval);
+    }
+
+    for _ in 0..FD_TABLE.len() {
+        let candidate = NEXT_FD.fetch_add(1, Ordering::Relaxed);
+        let idx = (candidate as usize) % FD_TABLE.len();
+        if idx < 3 {
+            continue;
+        }
+        if FD_TABLE[idx]
+            .compare_exchange(FD_KIND_FREE, kind, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(idx as i32);
+        }
+    }
+
+    Err(LinuxErrno::NoMem)
+}
+
+fn fd_kind(fd: i32) -> Result<u8, LinuxErrno> {
+    if fd < 0 {
+        return Err(LinuxErrno::Inval);
+    }
+    let idx = fd as usize;
+    if idx >= FD_TABLE.len() {
+        return Err(LinuxErrno::Inval);
+    }
+    let kind = FD_TABLE[idx].load(Ordering::Relaxed);
+    if kind == FD_KIND_FREE {
+        return Err(LinuxErrno::Inval);
+    }
+    Ok(kind)
+}
+
+pub fn openat_hook(path_len: usize, _flags: u32, _mode: u32) -> Result<i32, LinuxErrno> {
+    if path_len == 0 {
+        return Err(LinuxErrno::Inval);
+    }
+    allocate_fd(FD_KIND_FILE)
+}
+
+pub fn socket_hook(domain: i32, sock_type: i32, _protocol: i32) -> Result<i32, LinuxErrno> {
+    if domain <= 0 || sock_type <= 0 {
+        return Err(LinuxErrno::Inval);
+    }
+    allocate_fd(FD_KIND_SOCKET)
+}
+
+pub fn read_hook(fd: i32, buf_len: usize) -> Result<usize, LinuxErrno> {
+    let kind = fd_kind(fd)?;
+    if buf_len == 0 {
+        return Ok(0);
+    }
+    if kind == FD_KIND_FILE || kind == FD_KIND_SOCKET {
+        return Ok(buf_len.min(64));
+    }
+    Err(LinuxErrno::Inval)
+}
+
+pub fn write_hook(fd: i32, buf_len: usize) -> Result<usize, LinuxErrno> {
+    let kind = fd_kind(fd)?;
+    if kind == FD_KIND_FILE || kind == FD_KIND_SOCKET {
+        return Ok(buf_len);
+    }
+    Err(LinuxErrno::Inval)
+}
+
+pub fn close_hook(fd: i32) -> Result<(), LinuxErrno> {
+    if fd < 0 {
+        return Err(LinuxErrno::Inval);
+    }
+    let idx = fd as usize;
+    if idx >= FD_TABLE.len() {
+        return Err(LinuxErrno::Inval);
+    }
+    let prior = FD_TABLE[idx].swap(FD_KIND_FREE, Ordering::AcqRel);
+    if prior == FD_KIND_FREE {
+        return Err(LinuxErrno::Inval);
+    }
+    Ok(())
+}
+
 pub const fn default_mmap_len() -> usize {
     PAGE_SIZE
 }
@@ -290,5 +384,21 @@ mod tests {
         assert!(status.clock_hooks_ready);
         assert!(status.thread_hooks_ready);
         assert!(status.futex_hooks_ready);
+        assert!(status.io_hooks_ready);
+    }
+
+    #[test]
+    fn io_facade_hooks_allocate_and_release_file_and_socket_fds() {
+        let fd = openat_hook(8, 0, 0).expect("open");
+        assert!(fd >= 3);
+        assert_eq!(read_hook(fd, 128).expect("read"), 64);
+        assert_eq!(write_hook(fd, 11).expect("write"), 11);
+        close_hook(fd).expect("close");
+        assert_eq!(read_hook(fd, 1), Err(LinuxErrno::Inval));
+
+        let sock = socket_hook(2, 1, 0).expect("socket");
+        assert!(sock >= 3);
+        assert_eq!(write_hook(sock, 32).expect("sock write"), 32);
+        close_hook(sock).expect("sock close");
     }
 }
