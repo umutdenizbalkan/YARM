@@ -58,7 +58,7 @@ impl VfsV1Args {
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, VfsCodecError> {
-        if payload.len() < Self::ENCODED_LEN {
+        if payload.len() != Self::ENCODED_LEN {
             return Err(VfsCodecError::Malformed);
         }
         let mut values = [0u64; 4];
@@ -84,5 +84,25 @@ mod tests {
         let args = VfsV1Args::new(1, 2, 3, 4);
         let enc = args.encode();
         assert_eq!(VfsV1Args::decode(&enc), Ok(args));
+    }
+
+
+    #[test]
+    fn vfs_v1_rejects_non_exact_payload_lengths() {
+        let short = [0u8; VfsV1Args::ENCODED_LEN - 1];
+        assert_eq!(VfsV1Args::decode(&short), Err(VfsCodecError::Malformed));
+
+        let long = [0u8; VfsV1Args::ENCODED_LEN + 1];
+        assert_eq!(VfsV1Args::decode(&long), Err(VfsCodecError::Malformed));
+    }
+
+    #[test]
+    fn vfs_v1_constants_are_stable() {
+        assert_eq!(VFS_SERVER_ABI_VERSION, 1);
+        assert_eq!(VFS_CODEC_V1_VERSION, 1);
+        assert_eq!(VfsV1Args::VERSION, VFS_CODEC_V1_VERSION);
+        assert_eq!(VfsV1Args::ENCODED_LEN, 32);
+        assert_eq!(VFS_OP_OPENAT, 10);
+        assert_eq!(VFS_OP_READ, 12);
     }
 }

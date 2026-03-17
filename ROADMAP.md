@@ -38,6 +38,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Freeze typed request/reply payload codecs for process and VFS calls.
 - Add deterministic mixed-flow tests (`getpid/openat/exit`) across server boundaries.
 - Add mount routing and path-based dispatch abstractions in VFS server model.
+- ✅ Added codec freeze artifact and exact-length decode enforcement for `ProcV2Args`/`VfsV1Args`: `PROC_VFS_CODEC_FREEZE.md`.
 
 ## 5) Driver-as-Server Model Completion
 

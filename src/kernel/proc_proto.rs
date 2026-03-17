@@ -40,7 +40,7 @@ impl ProcV2Args {
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
-        if payload.len() < Self::ENCODED_LEN {
+        if payload.len() != Self::ENCODED_LEN {
             return Err(ProcCodecError::Malformed);
         }
         let mut a0 = [0u8; 8];
@@ -63,5 +63,25 @@ mod tests {
         let args = ProcV2Args::new(9, 11);
         let enc = args.encode();
         assert_eq!(ProcV2Args::decode(&enc), Ok(args));
+    }
+
+
+    #[test]
+    fn proc_v2_rejects_non_exact_payload_lengths() {
+        let short = [0u8; ProcV2Args::ENCODED_LEN - 1];
+        assert_eq!(ProcV2Args::decode(&short), Err(ProcCodecError::Malformed));
+
+        let long = [0u8; ProcV2Args::ENCODED_LEN + 1];
+        assert_eq!(ProcV2Args::decode(&long), Err(ProcCodecError::Malformed));
+    }
+
+    #[test]
+    fn proc_v2_constants_are_stable() {
+        assert_eq!(PROC_SERVER_ABI_VERSION, 1);
+        assert_eq!(PROC_CODEC_V2_VERSION, 2);
+        assert_eq!(ProcV2Args::VERSION, PROC_CODEC_V2_VERSION);
+        assert_eq!(ProcV2Args::ENCODED_LEN, 16);
+        assert_eq!(PROC_OP_SPAWN_V2, 4);
+        assert_eq!(PROC_OP_WAITPID_V2, 5);
     }
 }
