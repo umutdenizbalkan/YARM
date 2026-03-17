@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShellStats {
     pub sessions_started: u64,
@@ -33,7 +29,7 @@ impl ShellService {
 pub fn run() {
     let mut s = ShellService::new();
     s.start_session();
-    println!(
+    crate::yarm_log!(
         "shell.srv online: sessions_started={}",
         s.stats().sessions_started
     );

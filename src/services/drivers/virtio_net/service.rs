@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 const VIRTIO_NET_TX_QUEUE_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +54,7 @@ pub fn run() {
     let mut s = VirtioNetService::new();
     s.enqueue_tx(1);
     let stats = s.stats();
-    println!(
+    crate::yarm_log!(
         "virtio_net.srv online: tx_packets={}, rx_packets={}, dropped_tx_packets={}",
         stats.tx_packets, stats.rx_packets, stats.dropped_tx_packets
     );

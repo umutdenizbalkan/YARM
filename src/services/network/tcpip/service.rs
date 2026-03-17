@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpIpStats {
     pub routed_packets: u64,
@@ -40,7 +36,7 @@ pub fn run() {
     let mut svc = TcpIpService::new();
     svc.route_packet(true);
     let s = svc.stats();
-    println!(
+    crate::yarm_log!(
         "tcpip.srv online: routed_packets={}, dropped_packets={}",
         s.routed_packets, s.dropped_packets
     );

@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SocketAdapterStats {
     pub opens: u64,
@@ -40,7 +36,7 @@ pub fn run() {
     let mut svc = SocketAdapterService::new();
     svc.open();
     let s = svc.stats();
-    println!("socket.srv online: opens={}, closes={}", s.opens, s.closes);
+    crate::yarm_log!("socket.srv online: opens={}, closes={}", s.opens, s.closes);
 }
 
 #[cfg(test)]

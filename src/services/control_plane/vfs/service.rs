@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 use crate::kernel::ipc::Message;
 use crate::kernel::vfs::{InMemoryBackend, VfsLiteService};
 use crate::kernel::vfs_proto::{VFS_OP_OPENAT, VfsV1Args};
@@ -22,5 +18,5 @@ pub fn run() {
     bytes.copy_from_slice(&reply.as_slice()[..8]);
     let fd = u64::from_le_bytes(bytes);
 
-    println!("vfs-lite server demo: fd={}", fd);
+    crate::yarm_log!("vfs-lite server demo: fd={}", fd);
 }

@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
@@ -47,7 +43,7 @@ pub fn run() {
     len_bytes.copy_from_slice(stat_rep.as_slice());
     let file_len = u64::from_le_bytes(len_bytes);
 
-    println!(
+    crate::yarm_log!(
         "ramfs.srv demo: fd={}, file_len={}, handled={}",
         fd,
         file_len,

@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, openat_message, read_message, write_message,
 };
@@ -42,7 +38,7 @@ pub fn run() {
     .expect("write");
     let write_result = svc.handle(write);
 
-    println!(
+    crate::yarm_log!(
         "initramfs.srv demo: fd={}, write_allowed={}, handled={}",
         fd,
         write_result.is_ok(),

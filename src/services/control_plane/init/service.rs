@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 use crate::kernel::bootstrap::Bootstrap;
 use crate::kernel::init_server::{
     CoreServiceGraph, CoreServiceImagePlan, InitFaultHandoff, InitServerLite,
@@ -38,7 +34,7 @@ pub fn run() {
     .expect("handoff");
     init.begin_running().expect("running");
 
-    println!(
+    crate::yarm_log!(
         "init.srv scaffold online: phase={:?}, handles={:?}",
         init.phase(),
         init.handles()

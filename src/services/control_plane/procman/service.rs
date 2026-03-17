@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 use crate::kernel::ipc::Message;
 use crate::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
 use crate::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
@@ -33,7 +29,7 @@ pub fn run() {
     let wait_reply = service.handle(wait).expect("wait reply");
     let waited = WaitPidV2Result::decode(wait_reply.as_slice()).expect("wait decode");
 
-    println!(
+    crate::yarm_log!(
         "process-manager demo ready: pid={}, exit_code={}, handled={}",
         waited.waited_pid,
         waited.exit_code,

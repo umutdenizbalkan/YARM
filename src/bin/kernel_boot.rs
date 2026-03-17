@@ -1,8 +1,4 @@
 #![no_std]
-extern crate std;
-
-use std::println;
-
 use yarm::kernel::bootstrap::Bootstrap;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
@@ -13,7 +9,7 @@ use yarm::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend
 
 fn main() {
     let _ = Bootstrap::init().expect("kernel init");
-    println!("YARM_BOOT_OK");
+    yarm::yarm_log!("YARM_BOOT_OK");
 
     let mut proc = ProcessService::new();
     let spawn = Message::with_header(
@@ -62,7 +58,7 @@ fn main() {
     .expect("read");
     let read_rep = vfs.handle_request(read).expect("read rep");
 
-    println!(
+    yarm::yarm_log!(
         "YARM_PROC_VFS_OK pid={} exit={} read_opcode={}",
         child.pid, waited.exit_code, read_rep.opcode
     );

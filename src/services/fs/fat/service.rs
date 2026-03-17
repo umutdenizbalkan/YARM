@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
@@ -43,7 +39,7 @@ pub fn run() {
     let mut len_bytes = [0u8; 8];
     len_bytes.copy_from_slice(stat_rep.as_slice());
     let len = u64::from_le_bytes(len_bytes);
-    println!(
+    crate::yarm_log!(
         "fat.srv demo: fd={}, len={}, handled={}",
         fd,
         len,

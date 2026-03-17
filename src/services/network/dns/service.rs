@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DnsStats {
     pub cache_hits: u64,
@@ -40,7 +36,7 @@ pub fn run() {
     let mut svc = DnsService::new();
     svc.resolve(false);
     let s = svc.stats();
-    println!(
+    crate::yarm_log!(
         "dns.srv online: cache_hits={}, upstream_queries={}",
         s.cache_hits, s.upstream_queries
     );

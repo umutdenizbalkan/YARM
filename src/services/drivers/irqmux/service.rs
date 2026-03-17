@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 const MAX_IRQ_LINES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +69,7 @@ pub fn run() {
     let mut svc = IrqMuxService::new();
     let _ = svc.route_irq(1, true);
     let s = svc.stats();
-    println!(
+    crate::yarm_log!(
         "irqmux.srv online: routed_irqs={}, dropped_irqs={}, masked_irqs={}",
         s.routed_irqs, s.dropped_irqs, s.masked_irqs
     );

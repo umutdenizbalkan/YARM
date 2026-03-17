@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 pub const BOOT_TO_SHELL_MARKER: &str = "[ui] boot-to-shell marker";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,8 +39,8 @@ pub fn run() {
     svc.mode_set();
     svc.present();
     let s = svc.stats();
-    println!("{}", BOOT_TO_SHELL_MARKER);
-    println!(
+    crate::yarm_log!("{}", BOOT_TO_SHELL_MARKER);
+    crate::yarm_log!(
         "display.srv online: mode_sets={}, frame_presents={}",
         s.mode_sets, s.frame_presents
     );

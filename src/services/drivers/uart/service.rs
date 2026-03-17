@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 const UART_TX_QUEUE_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +52,7 @@ pub fn run() {
     let mut svc = UartService::new();
     svc.write(4);
     let s = svc.stats();
-    println!(
+    crate::yarm_log!(
         "uart.srv online: tx_bytes={}, rx_bytes={}, dropped_tx_bytes={}",
         s.tx_bytes, s.rx_bytes, s.dropped_tx_bytes
     );

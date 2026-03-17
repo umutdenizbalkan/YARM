@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 use crate::kernel::ipc::Message;
 use crate::kernel::vfs::{FilesystemService, VfsLiteError};
 
@@ -235,7 +231,7 @@ pub fn run() {
     let _ = svc.dispatch(get).expect("get rep");
     let _ = svc.dispatch(flush).expect("flush rep");
     let (puts, gets, evictions) = svc.stats();
-    println!(
+    crate::yarm_log!(
         "blkcache.srv demo: puts={}, gets={}, evictions={}",
         puts, gets, evictions
     );

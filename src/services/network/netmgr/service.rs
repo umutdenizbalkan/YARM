@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetmgrStats {
     pub links_up: u64,
@@ -40,7 +36,7 @@ pub fn run() {
     let mut svc = NetmgrService::new();
     svc.mark_link(true);
     let s = svc.stats();
-    println!(
+    crate::yarm_log!(
         "netmgr.srv online: links_up={}, links_down={}",
         s.links_up, s.links_down
     );

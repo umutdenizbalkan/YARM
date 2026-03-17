@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DhcpStats {
     pub leases_granted: u64,
@@ -40,7 +36,7 @@ pub fn run() {
     let mut svc = DhcpService::new();
     svc.grant_lease(false);
     let s = svc.stats();
-    println!(
+    crate::yarm_log!(
         "dhcp.srv online: leases_granted={}, lease_renewals={}",
         s.leases_granted, s.lease_renewals
     );

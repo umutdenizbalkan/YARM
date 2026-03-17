@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 use crate::kernel::ipc::Message;
 use crate::kernel::vfs::{FilesystemService, VfsLiteError};
 
@@ -101,7 +97,7 @@ pub fn run() {
     let _ = svc.dispatch(read_msg).expect("read rep");
     let _ = svc.dispatch(write_msg).expect("write rep");
     let (reads, writes) = svc.stats();
-    println!("virtio_blk.srv demo: reads={}, writes={}", reads, writes);
+    crate::yarm_log!("virtio_blk.srv demo: reads={}, writes={}", reads, writes);
 }
 
 #[cfg(test)]

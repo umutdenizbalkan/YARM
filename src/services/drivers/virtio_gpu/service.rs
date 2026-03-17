@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioGpuStats {
     pub frame_commits: u64,
@@ -50,7 +46,7 @@ pub fn run() {
     s.mode_set();
     s.commit_frame();
     let stats = s.stats();
-    println!(
+    crate::yarm_log!(
         "virtio_gpu.srv online: frame_commits={}, mode_sets={}, rejected_commits={}",
         stats.frame_commits, stats.mode_sets, stats.rejected_commits
     );

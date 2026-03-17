@@ -1,13 +1,10 @@
 #![no_std]
-extern crate std;
-
 use yarm::kernel::ipc::Message;
 use yarm::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
 use yarm::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use yarm::kernel::vfs::VfsLiteService;
 use yarm::kernel::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
 
-use std::println;
 
 fn main() {
     let mut proc = ProcessService::new();
@@ -58,7 +55,7 @@ fn main() {
     .expect("read");
     let _ = vfs.handle_request(read).expect("read rep");
 
-    println!(
+    yarm::yarm_log!(
         "core profile smoke ok: child_pid={}, waited_exit={}, proc_handled={}",
         child.pid,
         waited.exit_code,

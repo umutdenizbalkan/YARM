@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 const INPUT_QUEUE_LIMIT: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +49,7 @@ pub fn run() {
     let mut s = InputService::new();
     s.push_event(true);
     let stats = s.stats();
-    println!(
+    crate::yarm_log!(
         "input.srv online: events={}, dropped_events={}",
         stats.events, stats.dropped_events
     );

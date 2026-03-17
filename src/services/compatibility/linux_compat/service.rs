@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 use crate::kernel::bootstrap::Bootstrap;
 use crate::kernel::ipc::Message;
 use crate::kernel::proc_proto::PROC_OP_GETPID;
@@ -30,7 +26,7 @@ pub fn run() {
     dispatch(&mut kernel, &bindings, &mut frame);
 
     let routed = kernel.ipc_recv(proc_req_recv).expect("recv").is_some();
-    println!(
+    crate::yarm_log!(
         "linux-compat server demo: translated getpid -> ret={}, routed_request={}",
         frame.ret0, routed
     );

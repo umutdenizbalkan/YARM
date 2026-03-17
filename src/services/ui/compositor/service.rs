@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompositorStats {
     pub composed_frames: u64,
@@ -31,7 +27,7 @@ impl CompositorService {
 pub fn run() {
     let mut svc = CompositorService::new();
     svc.compose();
-    println!(
+    crate::yarm_log!(
         "compositor.srv online: composed_frames={}",
         svc.stats().composed_frames
     );

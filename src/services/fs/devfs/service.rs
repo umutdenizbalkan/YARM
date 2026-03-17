@@ -1,7 +1,3 @@
-extern crate std;
-
-use std::println;
-
 use crate::kernel::vfs::{OpenAtRequest, ReadWriteRequest, openat_message, write_message};
 use crate::services::common::service::FsService;
 use crate::services::fs::devfs::nodes::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
@@ -51,7 +47,7 @@ pub fn run() {
     let _ = svc.handle(write_console).expect("write console rep");
     let _ = svc.handle(write_null).expect("write null rep");
 
-    println!(
+    crate::yarm_log!(
         "devfs.srv demo: console_fd={}, null_fd={}, handled={}",
         console_fd,
         null_fd,
