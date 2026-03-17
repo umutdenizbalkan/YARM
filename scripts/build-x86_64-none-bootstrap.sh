@@ -6,6 +6,7 @@ PROFILE=${PROFILE:-x86-none}
 TOOLCHAIN=${TOOLCHAIN:-nightly}
 
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$TOOLCHAIN}
+BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
 
 RUST_SYSROOT=${RUST_SYSROOT:-$(rustup run "${RUSTUP_TOOLCHAIN}" rustc --print sysroot 2>/dev/null || true)}
 RUST_SRC_DIR=${RUST_SRC_DIR:-${RUST_SYSROOT}/lib/rustlib/src/rust}
@@ -30,14 +31,14 @@ fi
 if [[ ! -d "$RUST_SRC_DIR" ]]; then
   echo "[warn] rust-src is not installed for toolchain: ${RUSTUP_TOOLCHAIN}"
   echo "[hint] run: rustup component add rust-src --toolchain ${RUSTUP_TOOLCHAIN}"
-  echo "[hint] then re-run this script to build std/core for custom target"
+  echo "[hint] then re-run this script to build core/alloc for custom target"
   echo "[debug] looked for rust-src under: ${RUST_SRC_DIR}"
   exit 2
 fi
 
-echo "[info] building kernel_boot + init_server for ${TARGET_SPEC} with build-std + json target spec"
+echo "[info] building kernel_boot + init_server for ${TARGET_SPEC} with build-std=${BUILD_STD_COMPONENTS} + json target spec"
 cargo +"${TOOLCHAIN}" build \
-  -Z build-std=core,alloc,std,panic_abort \
+  -Z build-std=${BUILD_STD_COMPONENTS} \
   -Z json-target-spec \
   --target "$TARGET_SPEC" \
   --profile "$PROFILE" \
