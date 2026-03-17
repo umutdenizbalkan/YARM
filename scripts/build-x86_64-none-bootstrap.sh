@@ -48,3 +48,5 @@ cargo +"${TOOLCHAIN}" build \
   --bin init_server
 
 echo "[ok] x86_64-none build completed"
+echo "[next] stage qemu artifacts: scripts/build-qemu-x86_64-artifacts.sh"
+echo "[next] run smoke boot: scripts/qemu-x86_64-busybox-smoke.sh"
