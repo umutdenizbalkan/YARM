@@ -78,6 +78,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 2. Add delegation-bundle helper APIs for hardware servers with stale-cap regression tests.
 3. Freeze and document typed process/VFS server codecs with versioned structs.
 4. Add minimal HAL trait conformance docs/tests for RISC-V and one additional ISA target.
+   - ✅ Added HAL conformance note for RISC-V + x86 baseline: `HAL_CONFORMANCE.md`.
 5. Expand deterministic end-to-end server flow tests (procman + VFS + notification routing).
 
 Progress notes:
