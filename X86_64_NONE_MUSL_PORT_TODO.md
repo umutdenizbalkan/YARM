@@ -1,10 +1,10 @@
-# x86_64-unknown-none + musl sysdeps shim TODO
+# musl sysdeps shim TODO (all ISAs, x86_64 boot target-first)
 
-Status: **chosen direction** for local bring-up (hosted Linux ABI path is not the primary target).
+Status: **multi-ISA portability effort** with **x86_64 as the current boot target** (hosted Linux ABI path is not the primary target).
 
 ## Goal
 
-Port user-space runtime to `x86_64-unknown-none` and provide a minimal musl sysdeps shim that maps libc expectations to YARM microkernel mechanisms.
+Port user-space runtime behind an ISA-agnostic musl sysdeps shim that maps libc expectations to YARM microkernel mechanisms, then validate per-ISA runners. Current boot-first ISA: `x86_64`.
 
 ## Milestone 1 — Target + toolchain baseline
 

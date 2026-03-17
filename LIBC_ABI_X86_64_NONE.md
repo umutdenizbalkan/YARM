@@ -1,6 +1,6 @@
-# libc ABI contract for `x86_64-unknown-none` (B path)
+# libc ABI contract for freestanding musl shim (ISA-agnostic core, x86_64 first runner)
 
-This document freezes the minimum libc-facing ABI expected by the initial musl sysdeps shim.
+This document freezes the minimum libc-facing ABI expected by the musl sysdeps shim across ISAs; x86_64 is the first concrete boot runner.
 
 ## Calling convention
 

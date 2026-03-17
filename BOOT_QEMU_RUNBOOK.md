@@ -1,37 +1,38 @@
-# QEMU BusyBox Boot Runbook (RISC-V64)
+# QEMU BusyBox Boot Runbook (x86_64 target-first, multi-ISA support)
 
-> Note: This runbook is currently RISC-V focused. The project has selected `x86_64-unknown-none` + musl sysdeps shim as the primary runtime direction for ongoing bring-up; see `X86_64_NONE_MUSL_PORT_TODO.md` for migration tasks.
-
+This runbook is **x86_64-first** for booting a kernel to an initramfs BusyBox prompt, while keeping secondary ISA scaffolding available.
 
 ## Prerequisites
 
 - Rust toolchain + `rustup`
-- target: `riscv64gc-unknown-linux-gnu`
-- host tools: `qemu-system-riscv64`, `cpio`, `busybox` (or `busybox-static`)
+- host tools (x86_64 target path): `qemu-system-x86_64`, `cpio`, `busybox` (or `busybox-static`)
+- optional secondary ISA path: `qemu-system-riscv64`
 - optional: `llvm-objcopy` or `rust-objcopy`
 
-## One-command artifact staging
+## x86_64 target path (primary)
+
+### One-command artifact staging
 
 ```bash
-scripts/build-qemu-riscv64-artifacts.sh
+scripts/build-qemu-x86_64-artifacts.sh
 ```
 
 Strict mode (fail if missing target/tools/artifacts):
 
 ```bash
-ARTIFACTS_STRICT=1 scripts/build-qemu-riscv64-artifacts.sh
+ARTIFACTS_STRICT=1 scripts/build-qemu-x86_64-artifacts.sh
 ```
 
-## One-command smoke boot
+### One-command smoke boot
 
 ```bash
-scripts/qemu-riscv64-busybox-smoke.sh
+scripts/qemu-x86_64-busybox-smoke.sh
 ```
 
 Strict mode:
 
 ```bash
-QEMU_SMOKE_STRICT=1 scripts/qemu-riscv64-busybox-smoke.sh
+QEMU_SMOKE_STRICT=1 scripts/qemu-x86_64-busybox-smoke.sh
 ```
 
 ## Success markers searched in serial log
@@ -42,23 +43,19 @@ QEMU_SMOKE_STRICT=1 scripts/qemu-riscv64-busybox-smoke.sh
 - `YARM_INIT_DONE`
 - `BusyBox` or `/ #`
 
-## Override paths
+## Override paths (x86_64)
 
 ```bash
-KERNEL_IMAGE=build/yarm-riscv64.bin \
-INITRAMFS_IMAGE=build/initramfs-busybox.cpio \
-scripts/qemu-riscv64-busybox-smoke.sh
-```
-
-## Early x86_64-none bring-up commands
-
-```bash
-scripts/build-qemu-x86_64-artifacts.sh
-```
-
-```bash
+KERNEL_IMAGE=build-x86_64/yarm-x86_64.elf \
+INITRAMFS_IMAGE=build-x86_64/initramfs-busybox.cpio \
 scripts/qemu-x86_64-busybox-smoke.sh
 ```
 
-> These x86_64 scripts are bootstrap scaffolds for the chosen B path and may require a finalized bootable kernel image format before strict smoke mode is enforced.
+## Secondary ISA path (RISC-V scaffolding)
 
+```bash
+scripts/build-qemu-riscv64-artifacts.sh
+scripts/qemu-riscv64-busybox-smoke.sh
+```
+
+> musl sysdeps portability work is ISA-agnostic; boot scripts differ only in machine image/runner details.
