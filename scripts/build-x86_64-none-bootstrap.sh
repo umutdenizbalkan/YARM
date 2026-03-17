@@ -6,7 +6,9 @@ PROFILE=${PROFILE:-x86-none}
 TOOLCHAIN=${TOOLCHAIN:-nightly}
 
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$TOOLCHAIN}
-RUST_SRC_DIR=${RUST_SRC_DIR:-$HOME/.rustup/toolchains/${RUSTUP_TOOLCHAIN}/lib/rustlib/src/rust}
+
+RUST_SYSROOT=${RUST_SYSROOT:-$(rustup run "${RUSTUP_TOOLCHAIN}" rustc --print sysroot 2>/dev/null || true)}
+RUST_SRC_DIR=${RUST_SRC_DIR:-${RUST_SYSROOT}/lib/rustlib/src/rust}
 
 if [[ ! -f "$TARGET_SPEC" ]]; then
   echo "[error] missing target spec: $TARGET_SPEC"
@@ -19,10 +21,17 @@ if ! rustup toolchain list | rg -q "^${TOOLCHAIN}"; then
   exit 2
 fi
 
+if [[ -z "$RUST_SYSROOT" ]]; then
+  echo "[warn] unable to resolve sysroot for toolchain: ${RUSTUP_TOOLCHAIN}"
+  echo "[hint] run: rustup toolchain install ${RUSTUP_TOOLCHAIN}"
+  exit 2
+fi
+
 if [[ ! -d "$RUST_SRC_DIR" ]]; then
   echo "[warn] rust-src is not installed for toolchain: ${RUSTUP_TOOLCHAIN}"
   echo "[hint] run: rustup component add rust-src --toolchain ${RUSTUP_TOOLCHAIN}"
   echo "[hint] then re-run this script to build std/core for custom target"
+  echo "[debug] looked for rust-src under: ${RUST_SRC_DIR}"
   exit 2
 fi
 
