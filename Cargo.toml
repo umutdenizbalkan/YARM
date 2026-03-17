@@ -72,11 +72,6 @@ path = "src/bin/init_server.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
-name = "init_srv"
-path = "src/bin/init_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
 name = "initramfs_srv"
 path = "src/bin/initramfs_srv.rs"
 required-features = ["hosted-dev"]
@@ -112,11 +107,6 @@ path = "src/bin/process_manager.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
-name = "procman_srv"
-path = "src/bin/procman_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
 name = "ramfs_srv"
 path = "src/bin/ramfs_srv.rs"
 required-features = ["hosted-dev"]
@@ -144,11 +134,6 @@ required-features = ["hosted-dev"]
 [[bin]]
 name = "vfs_lite"
 path = "src/bin/vfs_lite.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "vfs_srv"
-path = "src/bin/vfs_srv.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
