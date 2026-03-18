@@ -1,5 +1,9 @@
+//! Legacy compatibility module; prefer `crate::kernel::vfs` for new code.
+
 use super::ipc::Message;
-use super::linux_compat::{VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX, VFS_OP_WRITE};
+use super::vfs_proto::{
+    VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
+};
 
 const MAX_FDS: usize = 16;
 
@@ -9,6 +13,7 @@ pub enum VfsLiteError {
     NoFd,
     BadFd,
     Unsupported,
+    PermissionDenied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,9 +192,30 @@ impl VfsBackend for InMemoryBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountNamespacePolicy {
+    pub allow_all: bool,
+}
+
+impl MountNamespacePolicy {
+    pub const fn baseline() -> Self {
+        Self { allow_all: true }
+    }
+
+    pub const fn deny_all() -> Self {
+        Self { allow_all: false }
+    }
+
+    pub const fn allows_path(self, _path_ptr: u64) -> bool {
+        self.allow_all
+    }
+}
+
 #[derive(Debug)]
 pub struct VfsLiteService<B: VfsBackend = InMemoryBackend> {
     backend: B,
+    policy: MountNamespacePolicy,
+    op_sequence: u64,
 }
 
 impl Default for VfsLiteService<InMemoryBackend> {
@@ -202,22 +228,27 @@ impl VfsLiteService<InMemoryBackend> {
     pub const fn new() -> Self {
         Self {
             backend: InMemoryBackend::new(),
+            policy: MountNamespacePolicy::baseline(),
+            op_sequence: 0,
         }
     }
 }
 
 impl<B: VfsBackend> VfsLiteService<B> {
     pub const fn with_backend(backend: B) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            policy: MountNamespacePolicy::baseline(),
+            op_sequence: 0,
+        }
     }
 
-    fn read_u64(payload: &[u8], idx: usize) -> Result<u64, VfsLiteError> {
-        let start = idx.checked_mul(8).ok_or(VfsLiteError::Malformed)?;
-        let end = start.checked_add(8).ok_or(VfsLiteError::Malformed)?;
-        let bytes = payload.get(start..end).ok_or(VfsLiteError::Malformed)?;
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(bytes);
-        Ok(u64::from_le_bytes(arr))
+    pub fn set_policy(&mut self, policy: MountNamespacePolicy) {
+        self.policy = policy;
+    }
+
+    pub const fn op_sequence(&self) -> u64 {
+        self.op_sequence
     }
 
     fn u64_reply(opcode: u16, value: u64) -> Result<Message, VfsLiteError> {
@@ -226,40 +257,42 @@ impl<B: VfsBackend> VfsLiteService<B> {
     }
 
     pub fn parse_request(request: Message) -> Result<VfsRequest, VfsLiteError> {
-        let payload = request.as_slice();
+        let args = VfsV1Args::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
         match request.opcode {
             VFS_OP_OPENAT => Ok(VfsRequest::OpenAt {
-                _dirfd: Self::read_u64(payload, 0)?,
-                path_ptr: Self::read_u64(payload, 1)?,
-                _flags: Self::read_u64(payload, 2)?,
-                _mode: Self::read_u64(payload, 3)?,
+                _dirfd: args.arg0,
+                path_ptr: args.arg1,
+                _flags: args.arg2,
+                _mode: args.arg3,
             }),
-            VFS_OP_CLOSE => Ok(VfsRequest::Close {
-                fd: Self::read_u64(payload, 0)?,
-            }),
+            VFS_OP_CLOSE => Ok(VfsRequest::Close { fd: args.arg0 }),
             VFS_OP_READ => Ok(VfsRequest::Read {
-                fd: Self::read_u64(payload, 0)?,
-                _buf_ptr: Self::read_u64(payload, 1)?,
-                len: Self::read_u64(payload, 2)?,
+                fd: args.arg0,
+                _buf_ptr: args.arg1,
+                len: args.arg2,
             }),
             VFS_OP_WRITE => Ok(VfsRequest::Write {
-                fd: Self::read_u64(payload, 0)?,
-                _buf_ptr: Self::read_u64(payload, 1)?,
-                len: Self::read_u64(payload, 2)?,
+                fd: args.arg0,
+                _buf_ptr: args.arg1,
+                len: args.arg2,
             }),
             VFS_OP_STATX => Ok(VfsRequest::Statx {
-                _dirfd: Self::read_u64(payload, 0)?,
-                path_ptr: Self::read_u64(payload, 1)?,
-                _flags: Self::read_u64(payload, 2)?,
-                _mask_or_buf: Self::read_u64(payload, 3)?,
+                _dirfd: args.arg0,
+                path_ptr: args.arg1,
+                _flags: args.arg2,
+                _mask_or_buf: args.arg3,
             }),
             _ => Err(VfsLiteError::Unsupported),
         }
     }
 
     pub fn handle_request(&mut self, request: Message) -> Result<Message, VfsLiteError> {
-        match Self::parse_request(request)? {
+        let parsed = Self::parse_request(request)?;
+        let reply = match parsed {
             VfsRequest::OpenAt { path_ptr, .. } => {
+                if !self.policy.allows_path(path_ptr) {
+                    return Err(VfsLiteError::PermissionDenied);
+                }
                 Self::u64_reply(VFS_OP_OPENAT, self.backend.openat(path_ptr)?)
             }
             VfsRequest::Close { fd } => Self::u64_reply(VFS_OP_CLOSE, self.backend.close(fd)?),
@@ -270,24 +303,24 @@ impl<B: VfsBackend> VfsLiteService<B> {
                 Self::u64_reply(VFS_OP_WRITE, self.backend.write(fd, len)?)
             }
             VfsRequest::Statx { path_ptr, .. } => {
+                if !self.policy.allows_path(path_ptr) {
+                    return Err(VfsLiteError::PermissionDenied);
+                }
                 Self::u64_reply(VFS_OP_STATX, self.backend.statx(path_ptr)?)
             }
-        }
+        }?;
+        self.op_sequence = self.op_sequence.saturating_add(1);
+        Ok(reply)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::linux_compat::{VFS_OP_OPENAT, VFS_OP_READ};
+    use crate::kernel::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
 
     fn pack(a0: u64, a1: u64, a2: u64, a3: u64) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        out[0..8].copy_from_slice(&a0.to_le_bytes());
-        out[8..16].copy_from_slice(&a1.to_le_bytes());
-        out[16..24].copy_from_slice(&a2.to_le_bytes());
-        out[24..32].copy_from_slice(&a3.to_le_bytes());
-        out
+        VfsV1Args::new(a0, a1, a2, a3).encode()
     }
 
     #[test]
@@ -326,6 +359,27 @@ mod tests {
             Message::with_header(0, VFS_OP_CLOSE, 0, None, &pack(fd, 0, 0, 0)).expect("close");
         let close_rep = svc.handle_request(close_req).expect("close rep");
         assert_eq!(close_rep.opcode, VFS_OP_CLOSE);
+    }
+
+    #[test]
+    fn deny_all_policy_blocks_open() {
+        let mut svc = VfsLiteService::new();
+        svc.set_policy(MountNamespacePolicy::deny_all());
+        let open =
+            Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1000, 0, 0)).expect("open");
+        assert_eq!(
+            svc.handle_request(open),
+            Err(VfsLiteError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn op_sequence_increments_per_successful_request() {
+        let mut svc = VfsLiteService::new();
+        let open =
+            Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1000, 0, 0)).expect("open");
+        let _ = svc.handle_request(open).expect("open rep");
+        assert_eq!(svc.op_sequence(), 1);
     }
 
     #[test]

@@ -1,12 +1,9 @@
 #![no_std]
-extern crate std;
-
 use yarm::kernel::bootstrap::Bootstrap;
 use yarm::kernel::driver_manager::DriverService;
 use yarm::kernel::driver_proto::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};
 use yarm::kernel::ipc::Message;
 
-use std::println;
 
 fn main() {
     let mut kernel = Bootstrap::init().expect("init");
@@ -22,5 +19,5 @@ fn main() {
         .handle_batch(&mut kernel, [register, grant])
         .expect("batch");
 
-    println!("driver-manager demo ready: handled={}", handled);
+    yarm::yarm_log!("driver-manager demo ready: handled={}", handled);
 }

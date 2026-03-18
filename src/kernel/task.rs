@@ -16,6 +16,8 @@ pub struct TickInstant(pub u64);
 pub enum WaitReason {
     EndpointReceive(CapId),
     EndpointSend(CapId),
+    Futex(usize),
+    Join(u64),
     Poll,
 }
 
@@ -37,6 +39,26 @@ pub enum TaskStatus {
     Dead,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadDetachState {
+    Joinable,
+    Detached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UserRegisterContext {
+    pub instruction_ptr: usize,
+    pub stack_ptr: usize,
+    pub arg0: usize,
+    pub arg1: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RobustFutexState {
+    pub head: usize,
+    pub len: usize,
+}
+
 /// Restart/backoff state tracked in scheduler ticks.
 ///
 /// `available_at` is an absolute tick instant in the same clock domain as
@@ -54,9 +76,17 @@ pub struct RestartState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThreadControlBlock {
     pub tid: ThreadId,
+    pub thread_group_id: u64,
     pub class: TaskClass,
     pub status: TaskStatus,
     pub asid: Option<Asid>,
+    pub tls_base: Option<usize>,
+    pub tls_restore_pending: bool,
+    pub user_entry: Option<usize>,
+    pub user_stack_top: Option<usize>,
+    pub user_context: UserRegisterContext,
+    pub detach_state: ThreadDetachState,
+    pub robust_futex: Option<RobustFutexState>,
     /// `None` means fallback to kernel/class policy in `KernelState`.
     pub fault_policy_override: Option<FaultPolicy>,
     pub brk_base: Option<VirtAddr>,
@@ -75,6 +105,8 @@ mod tests {
         let _ = TaskStatus::Runnable;
         let _ = TaskStatus::Running;
         let _ = TaskStatus::Blocked(WaitReason::Poll);
+        let _ = TaskStatus::Blocked(WaitReason::Futex(0x1000));
+        let _ = TaskStatus::Blocked(WaitReason::Join(7));
         let _ = TaskStatus::Faulted;
         let _ = TaskStatus::Exited;
         let _ = TaskStatus::Dead;
@@ -84,9 +116,25 @@ mod tests {
     fn tcb_uses_typed_fields() {
         let tcb = ThreadControlBlock {
             tid: ThreadId(7),
+            thread_group_id: 7,
             class: TaskClass::App,
             status: TaskStatus::Runnable,
             asid: Some(Asid(1)),
+            tls_base: Some(0xDEAD_BEEF),
+            tls_restore_pending: true,
+            user_entry: Some(0x4000),
+            user_stack_top: Some(0x8000),
+            user_context: UserRegisterContext {
+                instruction_ptr: 0x4000,
+                stack_ptr: 0x8000,
+                arg0: 1,
+                arg1: 2,
+            },
+            detach_state: ThreadDetachState::Joinable,
+            robust_futex: Some(RobustFutexState {
+                head: 0x9000,
+                len: 3,
+            }),
             fault_policy_override: Some(FaultPolicy::KillTask),
             brk_base: Some(VirtAddr(0x1000)),
             brk_end: Some(VirtAddr(0x2000)),
@@ -103,6 +151,18 @@ mod tests {
 
         assert_eq!(tcb.tid, ThreadId(7));
         assert_eq!(tcb.restart.backoff, TickDuration(10));
+        assert_eq!(tcb.thread_group_id, 7);
+        assert_eq!(tcb.tls_base, Some(0xDEAD_BEEF));
+        assert!(tcb.tls_restore_pending);
+        assert_eq!(tcb.user_context.instruction_ptr, 0x4000);
+        assert_eq!(tcb.detach_state, ThreadDetachState::Joinable);
+        assert_eq!(
+            tcb.robust_futex,
+            Some(RobustFutexState {
+                head: 0x9000,
+                len: 3
+            })
+        );
         assert_eq!(tcb.status, TaskStatus::Runnable);
     }
 }

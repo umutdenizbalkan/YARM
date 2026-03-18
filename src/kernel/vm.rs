@@ -1,3 +1,5 @@
+use crate::arch::vm_layout;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtAddr(pub u64);
 
@@ -43,11 +45,10 @@ pub struct Mapping {
     pub flags: PageFlags,
 }
 
-pub const PAGE_SIZE: usize = 4096;
-// Deliberately kept as a 32-bit split for this prototype kernel map.
-pub const KERNEL_SPACE_BASE: u64 = 0x8000_0000;
-pub const MAX_MAPPINGS: usize = 128;
-pub const MAX_ADDRESS_SPACES: usize = 16;
+pub const PAGE_SIZE: usize = vm_layout::PAGE_SIZE;
+pub const KERNEL_SPACE_BASE: u64 = vm_layout::KERNEL_SPACE_BASE;
+pub const MAX_MAPPINGS: usize = vm_layout::MAX_MAPPINGS;
+pub const MAX_ADDRESS_SPACES: usize = vm_layout::MAX_ADDRESS_SPACES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmError {
@@ -190,7 +191,8 @@ impl AddressSpaceManager {
     }
 
     fn allocate_asid(&mut self) -> Result<Asid, VmError> {
-        for _ in 0..u16::MAX {
+        let asid_capacity = (1u32 << vm_layout::ASID_BITS) - 1;
+        for _ in 0..asid_capacity {
             if self.next_asid == 0 {
                 self.next_asid = 1;
             }
@@ -248,6 +250,14 @@ impl AddressSpaceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vm_constants_are_arch_sourced() {
+        assert_eq!(PAGE_SIZE, vm_layout::PAGE_SIZE);
+        assert_eq!(KERNEL_SPACE_BASE, vm_layout::KERNEL_SPACE_BASE);
+        assert_eq!(MAX_MAPPINGS, vm_layout::MAX_MAPPINGS);
+        assert_eq!(MAX_ADDRESS_SPACES, vm_layout::MAX_ADDRESS_SPACES);
+    }
 
     #[test]
     fn map_and_resolve_page() {

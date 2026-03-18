@@ -1,0 +1,147 @@
+name: compatibility-gates
+
+on:
+  push:
+  pull_request:
+
+jobs:
+
+  arch-boundary-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: enforce kernel/arch constant boundary
+        run: scripts/check-kernel-arch-boundary.sh
+
+
+  service-boundary-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: enforce kernel/services split and thin service bins
+        run: scripts/check-service-arch-boundary.sh
+
+
+
+  service-domain-ownership-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: enforce service domain ownership boundaries
+        run: scripts/check-service-domain-ownership.sh
+
+  roadmap-readiness-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: enforce roadmap readiness invariants
+        run: scripts/check-roadmap-readiness.sh
+
+
+  phase2-driver-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: phase2 delegation + fault deterministic gates
+        run: |
+          cargo test -q kernel::bootstrap::tests::delegate_driver_bundle_checked_enforces_service_role_edges
+          cargo test -q kernel::bootstrap::tests::restart_denial_escalates_to_supervisor_every_threshold
+          cargo test -q kernel::bootstrap::tests::driver_restart_revokes_runtime_caps
+          cargo test -q services::drivers::irqmux::service::tests::irqmux_routes_masks_and_drops_deterministically
+          cargo test -q services::drivers::uart::service::tests::uart_backpressure_is_deterministic
+          cargo test -q services::drivers::virtio_net::service::tests::virtio_net_queue_backpressure_is_deterministic
+          cargo test -q services::drivers::virtio_gpu::service::tests::virtio_gpu_rejects_commit_before_modeset
+          cargo test -q services::drivers::input::service::tests::input_queue_overflow_and_drain_is_deterministic
+
+
+  phase3-network-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: phase3 deterministic networking gates
+        run: |
+          cargo test -q services::network::netmgr::service::tests::netmgr_tracks_link_state_events
+          cargo test -q services::network::tcpip::service::tests::tcpip_deterministic_packet_path
+          cargo test -q services::network::dns::service::tests::dns_timeout_retry_is_reproducible
+          cargo test -q services::network::dhcp::service::tests::dhcp_lease_accounting_is_deterministic
+          cargo test -q services::network::socket::service::tests::socket_adapter_roundtrip_is_accounted
+          cargo test -q services::network::sim::tests::deterministic_network_bootstrap_flow_is_stable
+
+  phase4-ui-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: phase4 display/input deterministic gates
+        run: |
+          cargo test -q services::ui::display::service::tests::boot_marker_is_stable
+          cargo test -q services::ui::display::service::tests::display_tracks_modeset_and_present
+          cargo test -q services::ui::compositor::service::tests::compositor_replay_is_deterministic
+          cargo test -q services::ui::shell::service::tests::shell_session_counter_increments
+
+
+  phase4-ui-smoke-marker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: ensure boot marker appears in ui display run output
+        run: |
+          cargo run -q --bin display_srv | tee /tmp/display_srv.log
+          rg -n "\[ui\] boot-to-shell marker" /tmp/display_srv.log
+
+
+  phase3-4-strict-runtime-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: phase3 recovery + ui marker combined gate
+        run: |
+          cargo test -q services::network::sim::tests::link_flap_dhcp_rebind_and_socket_recovery_is_deterministic
+          cargo run -q --bin display_srv | tee /tmp/display_srv_combined.log
+          rg -n "\[ui\] boot-to-shell marker" /tmp/display_srv_combined.log
+
+  mount-failure-matrix-sim-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: deterministic mount fallback telemetry simulation gate
+        run: cargo test -q kernel::sim::tests::deterministic_mount_fallback_telemetry_is_reported
+      - name: mount failure matrix (no fallback + fallback)
+        run: |
+          cargo test -q kernel::sim::tests::mount_failure_matrix_without_fallback_fails_all_fail_points
+          cargo test -q kernel::sim::tests::mount_failure_matrix_with_fallback_recovers
+
+
+  storage-contract-fast-lane:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: storage contract conformance (fast lane)
+        run: |
+          cargo test -q services::drivers::virtio_blk::device::tests::request_golden_vector_stable
+          cargo test -q services::drivers::virtio_blk::device::tests::response_golden_vector_stable
+          cargo test -q services::fs::ext4::fs::framing_tests::ext4_request_frame_golden_vector_matches_contract
+          cargo test -q services::fs::ext4::fs::framing_tests::ext4_response_frame_golden_vector_matches_contract
+          cargo test -q services::fs::fat::fs::tests::bpb_parsing_reads_core_fields
+
+  core-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: core profile tests
+        run: cargo test -q
+
+  linux-compat-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: linux-compat profile tests
+        run: cargo test -q --features linux-compat

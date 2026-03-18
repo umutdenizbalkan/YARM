@@ -5,7 +5,7 @@ This file marks the current in-kernel mechanism contracts as intentionally stabl
 ## Frozen contracts
 
 1. **Linux-compat syscall dispatch table order and membership**
-   - Source of truth: `LinuxCompatSyscall::DISPATCH_TABLE` in `src/kernel/linux_compat.rs`.
+   - Source of truth: `LinuxCompatSyscall::DISPATCH_TABLE` in `src/linux_compat/mod.rs`.
    - Guarded by test: `linux_dispatch_table_is_frozen_contract`.
 
 2. **Trap routing surface**
@@ -31,3 +31,12 @@ Any intentional ABI/contract change must:
 - Update this document and the corresponding module docs.
 - Add/adjust tests that assert the new contract.
 - Include migration notes if userspace-visible behavior changes.
+
+
+## Compatibility gates in CI semantics
+
+- Mechanism/core profile must pass: `cargo test`
+- Linux personality profile must pass: `cargo test --features linux-compat`
+- CI workflow source: `.github/workflows/compat-gates.yml`
+- Typed codec golden vectors and truncation-rejection tests are required gates for wire-compatibility changes.
+- No binary fixture blobs in-tree for compatibility gates (goldens should be source-level constants).

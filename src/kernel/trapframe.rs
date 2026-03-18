@@ -1,3 +1,6 @@
+use crate::arch::syscall_abi;
+use crate::kernel::task::UserRegisterContext;
+
 /// Register-width syscall/trap argument frame.
 ///
 /// `usize` is intentionally used here because these fields mirror machine
@@ -6,19 +9,23 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrapFrame {
     pub syscall_num: usize,
-    pub args: [usize; 6],
+    pub args: [usize; syscall_abi::TRAPFRAME_ARG_REGS],
     pub ret0: usize,
     pub ret1: usize,
+    pub ret2: usize,
     pub error: usize,
 }
 
+const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
+
 impl TrapFrame {
-    pub const fn new(syscall_num: usize, args: [usize; 6]) -> Self {
+    pub const fn new(syscall_num: usize, args: [usize; syscall_abi::TRAPFRAME_ARG_REGS]) -> Self {
         Self {
             syscall_num,
             args,
             ret0: 0,
             ret1: 0,
+            ret2: 0,
             error: 0,
         }
     }
@@ -26,6 +33,7 @@ impl TrapFrame {
     pub fn set_ok(&mut self, ret0: usize, ret1: usize) {
         self.ret0 = ret0;
         self.ret1 = ret1;
+        self.ret2 = 0;
         self.error = 0;
     }
 
@@ -34,11 +42,28 @@ impl TrapFrame {
     pub fn set_err(&mut self, code: usize) {
         self.ret0 = 0;
         self.ret1 = 0;
+        self.ret2 = 0;
         self.error = code;
     }
 
     pub const fn is_error(&self) -> bool {
         self.error != 0
+    }
+
+    pub fn capture_user_context(&self) -> UserRegisterContext {
+        UserRegisterContext {
+            instruction_ptr: self.ret0,
+            stack_ptr: self.ret1,
+            arg0: self.args[0],
+            arg1: self.args[1],
+        }
+    }
+
+    pub fn apply_user_context(&mut self, context: UserRegisterContext) {
+        self.ret0 = context.instruction_ptr;
+        self.ret1 = context.stack_ptr;
+        self.args[0] = context.arg0;
+        self.args[1] = context.arg1;
     }
 
     pub const fn error_code(&self) -> Option<usize> {
@@ -59,6 +84,7 @@ mod tests {
         let frame = TrapFrame::new(1, [2, 3, 4, 5, 6, 7]);
         assert_eq!(frame.ret0, 0);
         assert_eq!(frame.ret1, 0);
+        assert_eq!(frame.ret2, 0);
         assert_eq!(frame.error, 0);
         assert!(!frame.is_error());
         assert_eq!(frame.error_code(), None);
@@ -71,7 +97,30 @@ mod tests {
         frame.set_ok(11, 22);
         assert_eq!(frame.ret0, 11);
         assert_eq!(frame.ret1, 22);
+        assert_eq!(frame.ret2, 0);
         assert_eq!(frame.error, 0);
+    }
+
+    #[test]
+    fn capture_and_apply_user_context_roundtrip() {
+        let mut frame = TrapFrame::new(0, [5, 6, 0, 0, 0, 0]);
+        frame.set_ok(0x4000, 0x8000);
+        let ctx = frame.capture_user_context();
+        assert_eq!(ctx.instruction_ptr, 0x4000);
+        assert_eq!(ctx.stack_ptr, 0x8000);
+        assert_eq!(ctx.arg0, 5);
+        assert_eq!(ctx.arg1, 6);
+
+        frame.apply_user_context(UserRegisterContext {
+            instruction_ptr: 0x5000,
+            stack_ptr: 0x9000,
+            arg0: 7,
+            arg1: 8,
+        });
+        assert_eq!(frame.ret0, 0x5000);
+        assert_eq!(frame.ret1, 0x9000);
+        assert_eq!(frame.args[0], 7);
+        assert_eq!(frame.args[1], 8);
     }
 
     #[test]
