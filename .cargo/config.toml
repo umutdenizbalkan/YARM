@@ -1,0 +1,8 @@
+[alias]
+build-x86-none = "build --target targets/x86_64-yarm-none.json"
+check-x86-none = "check --target targets/x86_64-yarm-none.json"
+
+# Use scripts/build-x86_64-none-bootstrap.sh for build-std custom-target builds.
+
+[env]
+YARM_X86_64_NONE_TARGET = "targets/x86_64-yarm-none.json"

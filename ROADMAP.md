@@ -38,6 +38,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Freeze typed request/reply payload codecs for process and VFS calls.
 - Add deterministic mixed-flow tests (`getpid/openat/exit`) across server boundaries.
 - Add mount routing and path-based dispatch abstractions in VFS server model.
+- ✅ Added codec freeze artifact and exact-length decode enforcement for `ProcV2Args`/`VfsV1Args`: `PROC_VFS_CODEC_FREEZE.md`.
 
 ## 5) Driver-as-Server Model Completion
 
@@ -52,10 +53,56 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Add deterministic simulations (multi-task IPC + faults + interrupts + server IPC mix).
 - Keep architecture contract tests that verify normalized trap events expected by core.
 
+
+## 7) Chosen Runtime Target Direction (x86_64)
+
+- Decision: adopt **`x86_64-unknown-none` + custom musl sysdeps shim** as the primary path.
+- Rationale: better host/QEMU iteration on x86_64 while preserving microkernel-faithful runtime semantics (no Linux-hosted ABI dependency).
+- Tracking checklist: `X86_64_NONE_MUSL_PORT_TODO.md`.
+
+## 8) B-path bootstrap execution (started)
+
+- Added target spec: `targets/x86_64-yarm-none.json`.
+- Added cargo aliases for x86_64-none bring-up in `.cargo/config.toml`.
+- Added x86-none build profile knobs in `Cargo.toml` and wired them into x86 artifact staging.
+- Added x86_64 artifact and smoke scaffolds: `scripts/build-qemu-x86_64-artifacts.sh`, `scripts/qemu-x86_64-busybox-smoke.sh`.
+- Added freestanding build bootstrap helper script: `scripts/build-x86_64-none-bootstrap.sh` (checks nightly + rust-src before running `-Z build-std`).
+- Added network/mirror bootstrap wrapper: `scripts/bootstrap-nightly-mirror.sh` (installs nightly + rust-src from configured Rust dist/update endpoints, then runs the freestanding bootstrap build).
+- Added Linux-compat sysdeps bootstrap module: `src/services/compatibility/linux_compat/sysdeps.rs` (startup + memory contract + clock stub).
+- Expanded sysdeps shim scaffolding with startup/memory/clock/thread/futex hooks and focused tests (bootstrap-grade semantics).
+- Expanded kernel deterministic bootstrap simulation to assert procman + VFS + IRQ notification routing in a single end-to-end flow (`run_init_core_bootstrap_scenario`).
+
 ## Immediate next 5 implementable steps
 
 1. Wire synchronous IPC fast-path switching into measured scheduler path.
 2. Add delegation-bundle helper APIs for hardware servers with stale-cap regression tests.
 3. Freeze and document typed process/VFS server codecs with versioned structs.
 4. Add minimal HAL trait conformance docs/tests for RISC-V and one additional ISA target.
+   - ✅ Added HAL conformance note for RISC-V + x86 baseline: `HAL_CONFORMANCE.md`.
 5. Expand deterministic end-to-end server flow tests (procman + VFS + notification routing).
+
+Progress notes:
+- ✅ Added IPC fastpath-vs-queued-vs-blocked telemetry tests under contention in `kernel::bootstrap` tests.
+- ✅ Added restart/redelegation stale-cap regression for checked driver delegation bundles.
+
+## Review follow-up next steps (after oversized placeholder PR)
+
+1. **Split architecture work into reviewable PR slices**
+   - PR A: arch module split + HAL adapter shims only.
+   - PR B: syscall/trap normalization only.
+   - PR C: platform layout constants + docs only.
+2. **Tighten CI to block placeholder/overscoped submissions**
+   - add commit/PR lint that rejects placeholder PR bodies and change sets spanning unrelated domains.
+   - require `compat-gates` and at least one architecture smoke job on every architecture-touching PR.
+3. **Promote contract docs from draft to enforced gates**
+   - pin `ABI_CONTRACT_FREEZE.md`, `SYSCALL_ABI.md`, and `PROC_VFS_CODEC_FREEZE.md` as CI-checked reference artifacts.
+4. **Reduce bootstrap script drift**
+   - consolidate x86/riscv qemu build/smoke scripts behind a shared helper to avoid duplicated maintenance.
+5. **Define a minimum runnable server profile**
+   - ship a single "core profile" path (`init/procman/vfs/supervisor + console + one FS`) and keep it green before expanding feature breadth.
+
+
+## init.srv scaffold status
+
+- Initial boot-contract scaffold added: `INIT_SERVER_BOOT_CONTRACT.md`
+- Initial implementation added: `src/kernel/init_server.rs` + demo `src/bin/init_server.rs`

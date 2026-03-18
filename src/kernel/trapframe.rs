@@ -1,3 +1,5 @@
+use crate::arch::syscall_abi;
+
 /// Register-width syscall/trap argument frame.
 ///
 /// `usize` is intentionally used here because these fields mirror machine
@@ -6,19 +8,23 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrapFrame {
     pub syscall_num: usize,
-    pub args: [usize; 6],
+    pub args: [usize; syscall_abi::TRAPFRAME_ARG_REGS],
     pub ret0: usize,
     pub ret1: usize,
+    pub ret2: usize,
     pub error: usize,
 }
 
+const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
+
 impl TrapFrame {
-    pub const fn new(syscall_num: usize, args: [usize; 6]) -> Self {
+    pub const fn new(syscall_num: usize, args: [usize; syscall_abi::TRAPFRAME_ARG_REGS]) -> Self {
         Self {
             syscall_num,
             args,
             ret0: 0,
             ret1: 0,
+            ret2: 0,
             error: 0,
         }
     }
@@ -26,6 +32,7 @@ impl TrapFrame {
     pub fn set_ok(&mut self, ret0: usize, ret1: usize) {
         self.ret0 = ret0;
         self.ret1 = ret1;
+        self.ret2 = 0;
         self.error = 0;
     }
 
@@ -34,6 +41,7 @@ impl TrapFrame {
     pub fn set_err(&mut self, code: usize) {
         self.ret0 = 0;
         self.ret1 = 0;
+        self.ret2 = 0;
         self.error = code;
     }
 
@@ -59,6 +67,7 @@ mod tests {
         let frame = TrapFrame::new(1, [2, 3, 4, 5, 6, 7]);
         assert_eq!(frame.ret0, 0);
         assert_eq!(frame.ret1, 0);
+        assert_eq!(frame.ret2, 0);
         assert_eq!(frame.error, 0);
         assert!(!frame.is_error());
         assert_eq!(frame.error_code(), None);
@@ -71,6 +80,7 @@ mod tests {
         frame.set_ok(11, 22);
         assert_eq!(frame.ret0, 11);
         assert_eq!(frame.ret1, 22);
+        assert_eq!(frame.ret2, 0);
         assert_eq!(frame.error, 0);
     }
 

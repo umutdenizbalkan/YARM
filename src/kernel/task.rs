@@ -16,6 +16,7 @@ pub struct TickInstant(pub u64);
 pub enum WaitReason {
     EndpointReceive(CapId),
     EndpointSend(CapId),
+    Futex(usize),
     Poll,
 }
 
@@ -54,9 +55,13 @@ pub struct RestartState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThreadControlBlock {
     pub tid: ThreadId,
+    pub thread_group_id: u64,
     pub class: TaskClass,
     pub status: TaskStatus,
     pub asid: Option<Asid>,
+    pub tls_base: Option<usize>,
+    pub user_entry: Option<usize>,
+    pub user_stack_top: Option<usize>,
     /// `None` means fallback to kernel/class policy in `KernelState`.
     pub fault_policy_override: Option<FaultPolicy>,
     pub brk_base: Option<VirtAddr>,
@@ -75,6 +80,7 @@ mod tests {
         let _ = TaskStatus::Runnable;
         let _ = TaskStatus::Running;
         let _ = TaskStatus::Blocked(WaitReason::Poll);
+        let _ = TaskStatus::Blocked(WaitReason::Futex(0x1000));
         let _ = TaskStatus::Faulted;
         let _ = TaskStatus::Exited;
         let _ = TaskStatus::Dead;
@@ -84,9 +90,13 @@ mod tests {
     fn tcb_uses_typed_fields() {
         let tcb = ThreadControlBlock {
             tid: ThreadId(7),
+            thread_group_id: 7,
             class: TaskClass::App,
             status: TaskStatus::Runnable,
             asid: Some(Asid(1)),
+            tls_base: Some(0xDEAD_BEEF),
+            user_entry: Some(0x4000),
+            user_stack_top: Some(0x8000),
             fault_policy_override: Some(FaultPolicy::KillTask),
             brk_base: Some(VirtAddr(0x1000)),
             brk_end: Some(VirtAddr(0x2000)),
@@ -103,6 +113,8 @@ mod tests {
 
         assert_eq!(tcb.tid, ThreadId(7));
         assert_eq!(tcb.restart.backoff, TickDuration(10));
+        assert_eq!(tcb.thread_group_id, 7);
+        assert_eq!(tcb.tls_base, Some(0xDEAD_BEEF));
         assert_eq!(tcb.status, TaskStatus::Runnable);
     }
 }

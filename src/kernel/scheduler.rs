@@ -1,5 +1,7 @@
+use crate::arch::platform_layout;
+
 pub const MAX_RUN_QUEUE: usize = 128;
-pub const MAX_CPUS: usize = 8;
+pub const MAX_CPUS: usize = platform_layout::MAX_CPUS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuId(pub u8);

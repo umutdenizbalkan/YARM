@@ -1,0 +1,22 @@
+use crate::kernel::ipc::Message;
+use crate::kernel::vfs::{InMemoryBackend, VfsLiteService};
+use crate::kernel::vfs_proto::{VFS_OP_OPENAT, VfsV1Args};
+
+pub fn run() {
+    let mut vfs = VfsLiteService::with_backend(InMemoryBackend::new());
+
+    let synthetic_open = Message::with_header(
+        0,
+        VFS_OP_OPENAT,
+        0,
+        None,
+        &VfsV1Args::new(0, 0x1000, 0, 0).encode(),
+    )
+    .expect("request");
+    let reply = vfs.handle_request(synthetic_open).expect("vfs reply");
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&reply.as_slice()[..8]);
+    let fd = u64::from_le_bytes(bytes);
+
+    crate::yarm_log!("vfs-lite server demo: fd={}", fd);
+}
