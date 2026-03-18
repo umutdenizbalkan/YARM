@@ -14,7 +14,7 @@ This file documents the initial architecture split work for step 5b.
 
 ## Implemented
 
-- `src/arch/mod.rs` with `hal` + `riscv` modules.
+- `src/arch/mod.rs` with `hal` + `riscv` + `vm_layout` modules.
 - `src/arch/hal.rs` trait boundary for minimal machine adaptation.
 - `src/arch/riscv.rs` trap decoder:
   - maps RISC-V `scause`/`stval` into normalized kernel `TrapEvent`
@@ -23,10 +23,58 @@ This file documents the initial architecture split work for step 5b.
   - converts load/store page faults -> `Trap::PageFault` with `FaultInfo`
 - `KernelState::handle_trap_event` to consume normalized trap events from arch decoders.
 - `arch::riscv::handle_trap_entry` to set current CPU, drain per-CPU deferred work, then route normalized trap events.
+- HAL conformance unit coverage now includes three ISA-shaped mocks (RISC-V-like + x86-like + AArch64-like) validating that kernel-facing expectations remain identical across architectures.
+
+## HAL conformance checklist (RISC-V + x86 baseline)
+
+- [x] `switch_address_space` exercised with architecture-specific context wrapper.
+- [x] `acknowledge_interrupt` called with `(CpuId, irq_line)` pair.
+- [x] `program_timer_deadline` called with `(CpuId, ticks_from_now)`.
+- [x] `decode_trap_event` normalizes ISA-specific trap context into shared `TrapEvent`.
+- [x] Non-syscall trap path carries fault metadata (`FaultInfo`) through normalized event.
 
 ## Next
 
 - Connect real arch trap entry stubs to call `decode_trap`.
 - Route per-CPU timer + IPI interrupts into cross-CPU work handling.
 - Add architecture-specific context switch/trapframe save/restore.
-- Add second-ISA conformance for HAL trait (ARM or x86).
+- [x] Extend conformance coverage to ARM trap-context shape using the same HAL contract.
+
+
+## VM layout boundary
+
+- VM layout constants (page size, kernel split base, ASID width, static VM capacities) are now sourced from `src/arch/vm_layout.rs` and consumed by `kernel::vm` to keep architecture assumptions out of mechanism logic.
+
+
+## Per-ISA layout module rule (implemented)
+
+Architecture/address-space constants are now selected through per-ISA modules instead of scattered `#[cfg]` constants:
+
+- `src/arch/riscv64/{vm_layout,platform_layout,syscall_abi}.rs`
+- `src/arch/x86_64/{vm_layout,platform_layout,syscall_abi}.rs`
+- `src/arch/aarch64/{vm_layout,platform_layout,syscall_abi}.rs`
+- `src/arch/mod.rs` selects one ISA module and re-exports selected views via:
+  - `src/arch/vm_layout.rs`
+  - `src/arch/platform_layout.rs`
+  - `src/arch/syscall_abi.rs`
+
+Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layout,platform_layout,syscall_abi}`), which keeps mechanism code architecture-agnostic.
+
+
+## Boundary enforcement in CI
+
+- `scripts/check-kernel-arch-boundary.sh` rejects direct architecture-shape constants in `src/kernel/*` for selected migrated fields (CPU/IRQ sizing, trap arg width, IPC register lanes, bootstrap VA/PA seed constants).
+
+
+## Trap-entry plumbing status
+
+- Added trap decode + trap entry handlers for all three ISA bring-up paths:
+  - `src/arch/riscv64/trap.rs`
+  - `src/arch/x86_64/trap.rs`
+  - `src/arch/aarch64/trap.rs`
+- Added selected-ISA trap dispatch facade `src/arch/trap_entry.rs` so kernel integration can call one arch-selected entrypoint shape.
+
+
+## Runtime entry wiring
+
+- `KernelState::handle_selected_arch_trap_entry(...)` now forwards trap handling through `crate::arch::trap_entry::handle_trap_entry(...)`, so runtime integration can use the selected-ISA facade from kernel state.

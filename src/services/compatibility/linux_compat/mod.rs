@@ -1,16 +1,31 @@
-use super::bootstrap::{KernelError, KernelState};
-use super::capabilities::CapId;
-use super::ipc::Message;
-use super::trapframe::TrapFrame;
-use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
+use crate::kernel::bootstrap::{KernelError, KernelState};
+use crate::kernel::capabilities::CapId;
+use crate::kernel::ipc::Message;
+#[cfg(test)]
+use crate::kernel::proc_proto::{PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2, ProcV2Args};
+use crate::kernel::proc_proto::{
+    PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_SERVER_ABI_VERSION,
+};
+use crate::kernel::trapframe::TrapFrame;
+#[cfg(test)]
+use crate::kernel::vfs_proto::VFS_CODEC_V1_VERSION;
+use crate::kernel::vfs_proto::{
+    VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT,
+    VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE,
+    VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
+};
+use crate::kernel::vm::{PAGE_SIZE, PageFlags, VirtAddr};
+
+pub mod sim;
+pub mod sysdeps;
 
 // Linux syscall numbers in this module follow the LP64 numbering used by
 // RISC-V/AArch64 style ABIs in this prototype compatibility personality.
 
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
 pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 20;
-pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = 1;
-pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = 1;
+pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = PROC_SERVER_ABI_VERSION;
+pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = VFS_SERVER_ABI_VERSION;
 
 pub const LINUX_NR_BRK: usize = 214;
 pub const LINUX_NR_MUNMAP: usize = 215;
@@ -32,26 +47,6 @@ pub const LINUX_NR_EPOLL_CTL: usize = 21;
 pub const LINUX_NR_EPOLL_PWAIT: usize = 22;
 pub const LINUX_NR_SENDFILE: usize = 71;
 pub const LINUX_NR_STATX: usize = 291;
-
-pub const PROC_OP_GETPID: u16 = 1;
-pub const PROC_OP_EXIT: u16 = 2;
-pub const PROC_OP_GETPPID: u16 = 3;
-pub const PROC_OP_SPAWN_V2: u16 = 4;
-pub const PROC_OP_WAITPID_V2: u16 = 5;
-
-pub const VFS_OP_OPENAT: u16 = 10;
-pub const VFS_OP_CLOSE: u16 = 11;
-pub const VFS_OP_READ: u16 = 12;
-pub const VFS_OP_WRITE: u16 = 13;
-pub const VFS_OP_IOCTL: u16 = 14;
-pub const VFS_OP_DUP: u16 = 15;
-pub const VFS_OP_FCNTL: u16 = 16;
-pub const VFS_OP_POLL: u16 = 17;
-pub const VFS_OP_EPOLL_CREATE1: u16 = 18;
-pub const VFS_OP_EPOLL_CTL: u16 = 19;
-pub const VFS_OP_EPOLL_PWAIT: u16 = 20;
-pub const VFS_OP_SENDFILE: u16 = 21;
-pub const VFS_OP_STATX: u16 = 22;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -86,16 +81,16 @@ impl LinuxServiceBindings {
         request_send_cap: CapId,
         reply_recv_cap: CapId,
     ) -> Result<(), KernelError> {
-        if !kernel
-            .cspace
-            .has_right(request_send_cap, super::capabilities::CapRights::Send)
-        {
+        if !kernel.cspace.has_right(
+            request_send_cap,
+            crate::kernel::capabilities::CapRights::Send,
+        ) {
             return Err(KernelError::MissingRight);
         }
-        if !kernel
-            .cspace
-            .has_right(reply_recv_cap, super::capabilities::CapRights::Receive)
-        {
+        if !kernel.cspace.has_right(
+            reply_recv_cap,
+            crate::kernel::capabilities::CapRights::Receive,
+        ) {
             return Err(KernelError::MissingRight);
         }
         self.proc_mgr_request_send = Some(request_send_cap);
@@ -109,16 +104,16 @@ impl LinuxServiceBindings {
         request_send_cap: CapId,
         reply_recv_cap: CapId,
     ) -> Result<(), KernelError> {
-        if !kernel
-            .cspace
-            .has_right(request_send_cap, super::capabilities::CapRights::Send)
-        {
+        if !kernel.cspace.has_right(
+            request_send_cap,
+            crate::kernel::capabilities::CapRights::Send,
+        ) {
             return Err(KernelError::MissingRight);
         }
-        if !kernel
-            .cspace
-            .has_right(reply_recv_cap, super::capabilities::CapRights::Receive)
-        {
+        if !kernel.cspace.has_right(
+            reply_recv_cap,
+            crate::kernel::capabilities::CapRights::Receive,
+        ) {
             return Err(KernelError::MissingRight);
         }
         self.vfs_request_send = Some(request_send_cap);
@@ -306,45 +301,6 @@ impl LinuxCompatSyscall {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcV2Args {
-    pub arg0: u64,
-    pub arg1: u64,
-}
-
-impl ProcV2Args {
-    pub const fn new(arg0: u64, arg1: u64) -> Self {
-        Self { arg0, arg1 }
-    }
-
-    pub const fn encode(self) -> [u8; 16] {
-        let mut payload = [0u8; 16];
-        let a0 = self.arg0.to_le_bytes();
-        let a1 = self.arg1.to_le_bytes();
-        let mut i = 0;
-        while i < 8 {
-            payload[i] = a0[i];
-            payload[8 + i] = a1[i];
-            i += 1;
-        }
-        payload
-    }
-
-    pub fn decode(payload: &[u8]) -> Result<Self, LinuxErrno> {
-        if payload.len() < 16 {
-            return Err(LinuxErrno::Inval);
-        }
-        let mut a0 = [0u8; 8];
-        let mut a1 = [0u8; 8];
-        a0.copy_from_slice(&payload[..8]);
-        a1.copy_from_slice(&payload[8..16]);
-        Ok(Self {
-            arg0: u64::from_le_bytes(a0),
-            arg1: u64::from_le_bytes(a1),
-        })
-    }
-}
-
 fn round_up_page(value: usize) -> Result<usize, LinuxErrno> {
     if value.is_multiple_of(PAGE_SIZE) {
         Ok(value)
@@ -374,12 +330,7 @@ fn decode_u64_reply(reply: &[u8]) -> Result<usize, LinuxErrno> {
 }
 
 fn pack_vfs4(a0: usize, a1: usize, a2: usize, a3: usize) -> [u8; 32] {
-    let mut payload = [0u8; 32];
-    payload[0..8].copy_from_slice(&(a0 as u64).to_le_bytes());
-    payload[8..16].copy_from_slice(&(a1 as u64).to_le_bytes());
-    payload[16..24].copy_from_slice(&(a2 as u64).to_le_bytes());
-    payload[24..32].copy_from_slice(&(a3 as u64).to_le_bytes());
-    payload
+    VfsV1Args::new(a0 as u64, a1 as u64, a2 as u64, a3 as u64).encode()
 }
 
 fn pack_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> [u8; 32] {
@@ -783,6 +734,65 @@ mod tests {
     }
 
     #[test]
+    fn proc_v2_codec_golden_vector_is_frozen() {
+        let args = ProcV2Args::new(0x11, 0x22);
+        let encoded = args.encode();
+        assert_eq!(&encoded[..8], &0x11u64.to_le_bytes());
+        assert_eq!(&encoded[8..16], &0x22u64.to_le_bytes());
+    }
+
+    #[test]
+    fn vfs_v1_codec_golden_vector_is_frozen() {
+        let args = VfsV1Args::new(1, 2, 3, 4);
+        let encoded = args.encode();
+        assert_eq!(&encoded[..8], &1u64.to_le_bytes());
+        assert_eq!(&encoded[8..16], &2u64.to_le_bytes());
+        assert_eq!(&encoded[16..24], &3u64.to_le_bytes());
+        assert_eq!(&encoded[24..32], &4u64.to_le_bytes());
+    }
+
+    #[test]
+    fn vfs_v1_args_codec_roundtrip() {
+        let args = VfsV1Args::new(1, 2, 3, 4);
+        let encoded = args.encode();
+        let decoded = VfsV1Args::decode(&encoded).expect("decode");
+        assert_eq!(decoded, args);
+    }
+
+    #[test]
+    fn codec_fixture_vectors_are_frozen() {
+        let fixtures_proc = [
+            (ProcV2Args::new(0, 0), [0u8; 16]),
+            (ProcV2Args::new(1, 2), {
+                let mut b = [0u8; 16];
+                b[..8].copy_from_slice(&1u64.to_le_bytes());
+                b[8..16].copy_from_slice(&2u64.to_le_bytes());
+                b
+            }),
+        ];
+        for (args, expected) in fixtures_proc {
+            assert_eq!(args.encode(), expected);
+            assert_eq!(ProcV2Args::decode(&expected).expect("decode"), args);
+        }
+
+        let fixtures_vfs = [
+            VfsV1Args::new(0, 0, 0, 0),
+            VfsV1Args::new(9, 8, 7, 6),
+            VfsV1Args::new(u64::MAX, 1, 2, 3),
+        ];
+        for args in fixtures_vfs {
+            let encoded = args.encode();
+            assert_eq!(VfsV1Args::decode(&encoded).expect("decode"), args);
+        }
+    }
+
+    #[test]
+    fn codec_rejects_truncated_payloads() {
+        assert!(ProcV2Args::decode(&[0u8; 15]).is_err());
+        assert!(VfsV1Args::decode(&[0u8; 31]).is_err());
+    }
+
+    #[test]
     fn linux_compat_errno_mapping_stable() {
         assert_eq!(LinuxErrno::Inval.code(), EINVAL);
         assert_eq!(LinuxErrno::Perm.code(), EPERM);
@@ -797,14 +807,13 @@ mod tests {
         let statx = pack_statx(5, 0x2000, 0x4, 0x7FF);
 
         let decode = |payload: [u8; 32]| {
-            let mut out = [0usize; 4];
-            for (i, slot) in out.iter_mut().enumerate() {
-                let mut bytes = [0u8; 8];
-                let start = i * 8;
-                bytes.copy_from_slice(&payload[start..start + 8]);
-                *slot = u64::from_le_bytes(bytes) as usize;
-            }
-            out
+            let args = VfsV1Args::decode(&payload).expect("decode");
+            [
+                args.arg0 as usize,
+                args.arg1 as usize,
+                args.arg2 as usize,
+                args.arg3 as usize,
+            ]
         };
 
         assert_eq!(decode(epoll), [4, 2, 9, 0xABC0]);
@@ -818,6 +827,10 @@ mod tests {
         assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 20);
         assert_eq!(LINUX_PROC_SERVER_ABI_VERSION, 1);
         assert_eq!(LINUX_VFS_SERVER_ABI_VERSION, 1);
+        assert_eq!(PROC_CODEC_V2_VERSION, 2);
+        assert_eq!(ProcV2Args::VERSION, PROC_CODEC_V2_VERSION);
+        assert_eq!(VFS_CODEC_V1_VERSION, 1);
+        assert_eq!(VfsV1Args::VERSION, VFS_CODEC_V1_VERSION);
         assert_eq!(
             LinuxCompatSyscall::decode(LINUX_NR_EXIT),
             Ok(LinuxCompatSyscall::Exit)
@@ -1326,6 +1339,63 @@ mod tests {
     }
 
     #[test]
+    fn linux_personality_mixed_flow_with_notification_route_is_deterministic() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut bindings = LinuxServiceBindings::default();
+
+        let (_proc_req_ep, proc_req_send, proc_req_recv) =
+            state.create_endpoint(16).expect("proc req");
+        let (_proc_rep_ep, proc_rep_send, proc_rep_recv) =
+            state.create_endpoint(16).expect("proc rep");
+        bindings
+            .register_process_manager(&state, proc_req_send, proc_rep_recv)
+            .expect("register proc");
+
+        let (_vfs_req_ep, vfs_req_send, vfs_req_recv) = state.create_endpoint(16).expect("vfs req");
+        let (_vfs_rep_ep, vfs_rep_send, vfs_rep_recv) = state.create_endpoint(16).expect("vfs rep");
+        bindings
+            .register_vfs_manager(&state, vfs_req_send, vfs_rep_recv)
+            .expect("register vfs");
+
+        let (_notif, notif_cap, notif_recv) = state.create_notification(8).expect("notif");
+        state.bind_irq_notification(9, notif_cap).expect("bind");
+
+        state
+            .ipc_send(
+                proc_rep_send,
+                Message::with_header(0, PROC_OP_GETPID, 0, None, &700u64.to_le_bytes())
+                    .expect("pid"),
+            )
+            .expect("seed pid");
+        state
+            .ipc_send(
+                vfs_rep_send,
+                Message::with_header(0, VFS_OP_OPENAT, 0, None, &11u64.to_le_bytes()).expect("fd"),
+            )
+            .expect("seed fd");
+
+        let mut getpid = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &bindings, &mut getpid);
+        assert_eq!(getpid.ret0, 700);
+
+        state
+            .handle_trap_event(crate::kernel::trap::TrapEvent::external_interrupt(9), None)
+            .expect("irq");
+
+        let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x1234, 0, 0, 0, 0]);
+        dispatch(&mut state, &bindings, &mut openat);
+        assert_eq!(openat.ret0, 11);
+
+        let proc_req = state.ipc_recv(proc_req_recv).expect("recv").expect("msg");
+        let vfs_req = state.ipc_recv(vfs_req_recv).expect("recv").expect("msg");
+        let notif = state.ipc_recv(notif_recv).expect("recv").expect("msg");
+
+        assert_eq!(proc_req.opcode, PROC_OP_GETPID);
+        assert_eq!(vfs_req.opcode, VFS_OP_OPENAT);
+        assert_eq!(notif.opcode, 9);
+    }
+
+    #[test]
     fn linux_dispatch_table_is_frozen_contract() {
         let expected = [
             LINUX_NR_EXIT,
@@ -1353,3 +1423,6 @@ mod tests {
         assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, expected.len());
     }
 }
+
+pub mod service;
+pub use service::run;

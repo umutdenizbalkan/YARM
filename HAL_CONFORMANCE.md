@@ -1,0 +1,40 @@
+# HAL Conformance Notes (RISC-V + x86 baseline)
+
+This note freezes the minimum HAL portability checks expected by kernel-core code.
+
+## Contract surface
+
+Kernel core may depend on only these HAL primitives:
+
+1. address-space switch
+2. interrupt acknowledge/delivery handoff
+3. timer programming
+4. normalized trap event decode to `TrapEvent`
+
+## Baseline ISA conformance targets
+
+- RISC-V-like profile
+- x86-like profile
+
+Both profiles must satisfy identical kernel-facing semantics for:
+
+- ASID switch observability
+- IRQ acknowledge path observability
+- timer deadline programming observability
+- trap decode into normalized events (`syscall` / `page_fault`)
+
+## Test anchors
+
+- `src/arch/hal.rs`
+  - `hal_contract_is_isa_agnostic_for_riscv_like_impl`
+  - `hal_contract_is_isa_agnostic_for_x86_like_impl`
+- `src/arch/riscv64/trap.rs`
+  - trap entry routes through normalized kernel trap handling
+- `src/arch/x86_64/trap.rs`
+  - trap entry routes through normalized kernel trap handling
+
+## Invariants
+
+- syscall/trap arg register count must remain aligned across selected ISA ABI profiles for core syscall paths.
+- IPC register-lane width must stay compatible with core syscall ABI assertions.
+- per-ISA platform layout constants may differ, but kernel core must consume only `crate::arch::{platform_layout, syscall_abi, vm_layout}` re-exports.
