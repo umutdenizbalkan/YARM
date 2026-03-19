@@ -134,6 +134,25 @@ pub struct DriverBundlePlan {
     pub iova_len: usize,
 }
 
+impl DriverBundlePlan {
+    pub const fn standard(
+        server_tid: ThreadId,
+        irq_line: u16,
+        mem_cap: CapId,
+        iova_cap: CapId,
+        iova_base: usize,
+    ) -> Self {
+        Self {
+            server_tid,
+            irq_line,
+            mem_cap,
+            iova_cap,
+            iova_base,
+            iova_len: super::vm::PAGE_SIZE,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpcFastpathResult {
     pub switched_to_waiter: bool,
@@ -742,6 +761,36 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
         self.delegate_driver_bundle(plan)
+    }
+
+    pub fn validate_driver_bundle_live(
+        &self,
+        tid: u64,
+        bundle: DriverDelegationBundle,
+    ) -> Result<(), KernelError> {
+        let record = self
+            .drivers
+            .driver_records
+            .iter()
+            .flatten()
+            .find(|record| record.tid == ThreadId(tid))
+            .ok_or(KernelError::TaskMissing)?;
+
+        if record.irq_cap != Some(bundle.irq_cap)
+            || record.dma_cap != Some(bundle.dma_cap)
+            || record.iova_space_cap != Some(bundle.iova_cap)
+        {
+            return Err(KernelError::StaleCapability);
+        }
+
+        if self.cspace.get(bundle.irq_cap).is_none()
+            || self.cspace.get(bundle.dma_cap).is_none()
+            || self.cspace.get(bundle.iova_cap).is_none()
+        {
+            return Err(KernelError::StaleCapability);
+        }
+
+        Ok(())
     }
 
     pub fn configure_driver_dma_window(
@@ -1426,21 +1475,21 @@ impl KernelState {
     }
 
     pub fn join_thread(&mut self, tid: u64) -> Result<Option<u64>, KernelError> {
-        let current_tid = self.scheduler.current_tid();
-        if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
-            let joiner_pid = self
-                .process_id(joiner_tid)
-                .ok_or(KernelError::TaskMissing)?;
-            let target_pid = self.process_id(tid).ok_or(KernelError::TaskMissing)?;
-            if joiner_pid != target_pid {
-                return Err(KernelError::WrongObject);
-            }
-        }
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         if tcb.detach_state == ThreadDetachState::Detached {
             return Err(KernelError::WrongObject);
         }
         if tcb.status != TaskStatus::Exited {
+            let current_tid = self.scheduler.current_tid();
+            if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
+                let joiner_pid = self
+                    .process_id(joiner_tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                let target_pid = self.process_id(tid).ok_or(KernelError::TaskMissing)?;
+                if joiner_pid != target_pid {
+                    return Err(KernelError::WrongObject);
+                }
+            }
             if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
                 let joiner = self.tcb_mut(joiner_tid).ok_or(KernelError::TaskMissing)?;
                 joiner.status = TaskStatus::Blocked(WaitReason::Join(tid));
@@ -2022,19 +2071,24 @@ impl KernelState {
 
         if endpoint_mode == EndpointMode::Synchronous {
             if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
-                if self.ipc.endpoint_sender_waiters[endpoint_idx].is_some() {
-                    return Err(KernelError::EndpointQueueFull);
-                }
-                let sender_tid = ThreadId(
-                    self.scheduler
-                        .current_tid()
-                        .ok_or(KernelError::TaskMissing)?,
-                );
-                self.ipc.endpoint_sender_waiters[endpoint_idx] = Some((sender_tid, msg, false));
+                self.ipc.telemetry.fastpath_attempts =
+                    self.ipc.telemetry.fastpath_attempts.saturating_add(1);
+                let endpoint = self
+                    .ipc
+                    .endpoints
+                    .get_mut(endpoint_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(KernelError::WrongObject)?;
+                endpoint
+                    .send(msg)
+                    .map_err(|_| KernelError::EndpointQueueFull)?;
                 self.ipc.telemetry.rendezvous_handoffs =
                     self.ipc.telemetry.rendezvous_handoffs.saturating_add(1);
                 self.wake_waiter_for_endpoint(endpoint_idx)?;
-                let _ = self.switch_to_runnable_tid(waiter_tid)?;
+                if self.switch_to_runnable_tid(waiter_tid)? {
+                    self.ipc.telemetry.fastpath_switches =
+                        self.ipc.telemetry.fastpath_switches.saturating_add(1);
+                }
                 return Ok(());
             }
 
@@ -2073,19 +2127,31 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-        self.ipc.telemetry.fastpath_attempts =
-            self.ipc.telemetry.fastpath_attempts.saturating_add(1);
+        let endpoint_mode = self
+            .ipc
+            .endpoints
+            .get(endpoint_idx)
+            .and_then(Option::as_ref)
+            .ok_or(KernelError::WrongObject)?
+            .mode();
         let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx];
+        let inline_sync_handoff = endpoint_mode == EndpointMode::Synchronous && waiter_tid.is_some();
+        if !inline_sync_handoff {
+            self.ipc.telemetry.fastpath_attempts =
+                self.ipc.telemetry.fastpath_attempts.saturating_add(1);
+        }
 
         self.ipc_send(send_cap, msg)?;
 
-        let switched = if waiter_tid.is_some() {
+        let switched = if inline_sync_handoff {
+            true
+        } else if waiter_tid.is_some() {
             self.switch_to_runnable_tid(waiter_tid.expect("checked is_some"))?
         } else {
             false
         };
 
-        if switched {
+        if switched && !inline_sync_handoff {
             self.ipc.telemetry.fastpath_switches =
                 self.ipc.telemetry.fastpath_switches.saturating_add(1);
         }

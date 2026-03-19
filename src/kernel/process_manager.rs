@@ -1,6 +1,7 @@
 use super::ipc::Message;
 use super::proc_proto::{
-    ProcV2Args, PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
+    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply, PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID,
+    PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
 };
 
 const MAX_PROCESSES: usize = 64;
@@ -80,14 +81,14 @@ pub struct WaitPidV2Result {
 
 impl WaitPidV2Result {
     pub const fn encode(self) -> [u8; 16] {
-        ProcV2Args::new(self.waited_pid, self.exit_code).encode()
+        WaitPidV2Reply::new(self.waited_pid, self.exit_code).encode()
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, ProcessManagerError> {
-        let args = ProcV2Args::decode(payload).map_err(|_| ProcessManagerError::Malformed)?;
+        let args = WaitPidV2Reply::decode(payload).map_err(|_| ProcessManagerError::Malformed)?;
         Ok(Self {
-            waited_pid: args.arg0,
-            exit_code: args.arg1,
+            waited_pid: args.waited_pid,
+            exit_code: args.exit_code,
         })
     }
 }
@@ -163,19 +164,19 @@ impl ProcessManagerLite {
                 code: Self::read_u64(msg.as_slice())?,
             }),
             PROC_OP_SPAWN_V2 => {
-                let args = ProcV2Args::decode(msg.as_slice())
+                let args = SpawnV2Args::decode(msg.as_slice())
                     .map_err(|_| ProcessManagerError::Malformed)?;
                 Ok(ProcessRequest::SpawnV2(SpawnV2Request {
-                    parent_pid: args.arg0,
-                    image_id: args.arg1,
+                    parent_pid: args.parent_pid,
+                    image_id: args.image_id,
                 }))
             }
             PROC_OP_WAITPID_V2 => {
-                let args = ProcV2Args::decode(msg.as_slice())
+                let args = WaitPidV2Args::decode(msg.as_slice())
                     .map_err(|_| ProcessManagerError::Malformed)?;
                 Ok(ProcessRequest::WaitPidV2(WaitPidV2Request {
-                    caller_pid: args.arg0,
-                    target_pid: args.arg1,
+                    caller_pid: args.caller_pid,
+                    target_pid: args.target_pid,
                 }))
             }
             _ => Err(ProcessManagerError::Unsupported),
@@ -387,6 +388,7 @@ impl ProcessService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::proc_proto::ProcV2Args;
 
     #[test]
     fn elf_image_info_parser_accepts_minimal_elf64_header() {

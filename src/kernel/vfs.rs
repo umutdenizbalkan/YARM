@@ -5,7 +5,8 @@ pub use super::vfs_lite::*;
 
 use super::ipc::Message;
 use super::vfs_proto::{
-    VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
+    OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
+    VFS_OP_WRITE, VfsV1Args,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +91,7 @@ pub fn openat_message(req: OpenAtRequest) -> Result<Message, VfsLiteError> {
         VFS_OP_OPENAT,
         0,
         None,
-        &VfsV1Args::new(req.dirfd, req.path_ptr, req.flags, req.mode).encode(),
+        &OpenAtArgs::new(req.dirfd, req.path_ptr, req.flags, req.mode).encode(),
     )
     .map_err(|_| VfsLiteError::Malformed)
 }
@@ -112,7 +113,7 @@ pub fn read_message(req: ReadWriteRequest) -> Result<Message, VfsLiteError> {
         VFS_OP_READ,
         0,
         None,
-        &VfsV1Args::new(req.fd, req.buf_ptr, req.len, 0).encode(),
+        &ReadWriteArgs::new(req.fd, req.buf_ptr, req.len).encode(),
     )
     .map_err(|_| VfsLiteError::Malformed)
 }
@@ -123,7 +124,7 @@ pub fn write_message(req: ReadWriteRequest) -> Result<Message, VfsLiteError> {
         VFS_OP_WRITE,
         0,
         None,
-        &VfsV1Args::new(req.fd, req.buf_ptr, req.len, 0).encode(),
+        &ReadWriteArgs::new(req.fd, req.buf_ptr, req.len).encode(),
     )
     .map_err(|_| VfsLiteError::Malformed)
 }
@@ -134,7 +135,7 @@ pub fn statx_message(req: StatxRequest) -> Result<Message, VfsLiteError> {
         VFS_OP_STATX,
         0,
         None,
-        &VfsV1Args::new(req.dirfd, req.path_ptr, req.flags, req.mask_or_buf).encode(),
+        &StatxArgs::new(req.dirfd, req.path_ptr, req.flags, req.mask_or_buf).encode(),
     )
     .map_err(|_| VfsLiteError::Malformed)
 }

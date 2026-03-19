@@ -70,6 +70,12 @@ pub enum CoreServiceKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreLaunchStrategy {
+    ProcessManagerFirst,
+    SupervisorFirst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceRestartPolicy {
     pub max_restarts: u8,
     pub backoff_ticks: u64,
@@ -183,6 +189,7 @@ pub struct InitServerLite {
     startup_caps: StartupCapSet,
     fault_handoff: Option<InitFaultHandoff>,
     restart_policies: CoreServicePolicyTable,
+    launch_strategy: CoreLaunchStrategy,
     launch_order: [Option<CoreServiceKind>; 3],
     launch_count: usize,
     mount_plan: MountPlan,
@@ -207,6 +214,7 @@ impl InitServerLite {
             startup_caps: StartupCapSet::core_required_minimum(),
             fault_handoff: None,
             restart_policies: CoreServicePolicyTable::baseline(),
+            launch_strategy: CoreLaunchStrategy::ProcessManagerFirst,
             launch_order: [None; 3],
             launch_count: 0,
             mount_plan: MountPlan::baseline(),
@@ -249,6 +257,10 @@ impl InitServerLite {
         self.launch_order
     }
 
+    pub const fn launch_strategy(&self) -> CoreLaunchStrategy {
+        self.launch_strategy
+    }
+
     pub const fn mount_plan(&self) -> MountPlan {
         self.mount_plan
     }
@@ -263,6 +275,29 @@ impl InitServerLite {
         }
         self.mount_plan = plan;
         self.mount_status = None;
+        Ok(())
+    }
+
+    pub fn set_launch_strategy(&mut self, strategy: CoreLaunchStrategy) {
+        self.launch_strategy = strategy;
+    }
+
+    fn record_launch(
+        &mut self,
+        kernel: &mut KernelState,
+        kind: CoreServiceKind,
+        tid: u64,
+        entry: usize,
+        asid: u16,
+    ) -> Result<(), KernelError> {
+        self.launch_order[self.launch_count] = Some(kind);
+        self.launch_count += 1;
+        kernel.spawn_user_task_from_image(UserImageSpec {
+            tid,
+            entry,
+            asid: Some(Asid(asid)),
+            class: TaskClass::SystemServer,
+        })?;
         Ok(())
     }
 
@@ -354,30 +389,42 @@ impl InitServerLite {
             .supervisor_tid
             .ok_or(KernelError::WrongObject)?;
 
-        self.launch_order[self.launch_count] = Some(CoreServiceKind::ProcessManager);
-        self.launch_count += 1;
-        kernel.spawn_user_task_from_image(UserImageSpec {
-            tid: proc_tid,
-            entry: plan.process_manager_entry,
-            asid: Some(Asid(11)),
-            class: TaskClass::SystemServer,
-        })?;
-        self.launch_order[self.launch_count] = Some(CoreServiceKind::Vfs);
-        self.launch_count += 1;
-        kernel.spawn_user_task_from_image(UserImageSpec {
-            tid: vfs_tid,
-            entry: plan.vfs_entry,
-            asid: Some(Asid(12)),
-            class: TaskClass::SystemServer,
-        })?;
-        self.launch_order[self.launch_count] = Some(CoreServiceKind::Supervisor);
-        self.launch_count += 1;
-        kernel.spawn_user_task_from_image(UserImageSpec {
-            tid: supervisor_tid,
-            entry: plan.supervisor_entry,
-            asid: Some(Asid(13)),
-            class: TaskClass::SystemServer,
-        })?;
+        match self.launch_strategy {
+            CoreLaunchStrategy::ProcessManagerFirst => {
+                self.record_launch(
+                    kernel,
+                    CoreServiceKind::ProcessManager,
+                    proc_tid,
+                    plan.process_manager_entry,
+                    11,
+                )?;
+                self.record_launch(kernel, CoreServiceKind::Vfs, vfs_tid, plan.vfs_entry, 12)?;
+                self.record_launch(
+                    kernel,
+                    CoreServiceKind::Supervisor,
+                    supervisor_tid,
+                    plan.supervisor_entry,
+                    13,
+                )?;
+            }
+            CoreLaunchStrategy::SupervisorFirst => {
+                self.record_launch(
+                    kernel,
+                    CoreServiceKind::Supervisor,
+                    supervisor_tid,
+                    plan.supervisor_entry,
+                    13,
+                )?;
+                self.record_launch(
+                    kernel,
+                    CoreServiceKind::ProcessManager,
+                    proc_tid,
+                    plan.process_manager_entry,
+                    11,
+                )?;
+                self.record_launch(kernel, CoreServiceKind::Vfs, vfs_tid, plan.vfs_entry, 12)?;
+            }
+        }
 
         let mount_status = self.execute_mount_plan_with_fail_at(None)?;
         self.mount_status = Some(mount_status);
@@ -532,6 +579,39 @@ mod tests {
                 Some(CoreServiceKind::ProcessManager),
                 Some(CoreServiceKind::Vfs),
                 Some(CoreServiceKind::Supervisor),
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_order_can_prioritize_supervisor() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitServerLite::new();
+        init.set_launch_strategy(CoreLaunchStrategy::SupervisorFirst);
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut state, graph)
+            .expect("register");
+        let _ = init
+            .launch_core_services(
+                &mut state,
+                CoreServiceImagePlan {
+                    process_manager_entry: 0x8000,
+                    vfs_entry: 0x9000,
+                    supervisor_entry: 0xA000,
+                },
+            )
+            .expect("launch");
+        assert_eq!(
+            init.launch_order(),
+            [
+                Some(CoreServiceKind::Supervisor),
+                Some(CoreServiceKind::ProcessManager),
+                Some(CoreServiceKind::Vfs),
             ]
         );
     }

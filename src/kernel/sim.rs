@@ -373,39 +373,53 @@ mod tests {
 
     #[test]
     fn deterministic_core_simulation_replays_ipc_and_irq() {
-        let scenario = scenario_catalog()
-            .iter()
-            .find(|scenario| scenario.name == "ipc_and_irq_core")
-            .expect("scenario");
-        let summary = run_scenario(scenario).expect("sim");
+        let handle = std::thread::Builder::new()
+            .name("core-sim-ipc-irq".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let scenario = scenario_catalog()
+                    .iter()
+                    .find(|scenario| scenario.name == "ipc_and_irq_core")
+                    .expect("scenario");
+                let summary = run_scenario(scenario).expect("sim");
 
-        assert_eq!(
-            summary.last_received_opcode,
-            scenario.expected_last_received_opcode
-        );
-        assert_eq!(summary.last_irq_opcode, scenario.expected_irq);
-        assert_eq!(summary.send_count, scenario.expected_send_count);
+                assert_eq!(
+                    summary.last_received_opcode,
+                    scenario.expected_last_received_opcode
+                );
+                assert_eq!(summary.last_irq_opcode, scenario.expected_irq);
+                assert_eq!(summary.send_count, scenario.expected_send_count);
+            })
+            .expect("spawn thread");
+        handle.join().expect("join");
     }
 
     #[test]
     fn core_scenario_catalog_replays_all_with_expected_results() {
-        for scenario in scenario_catalog() {
-            let summary = run_scenario(scenario).expect("sim");
-            assert_eq!(
-                summary.last_received_opcode, scenario.expected_last_received_opcode,
-                "{}",
-                scenario.name
-            );
-            assert_eq!(
-                summary.last_irq_opcode, scenario.expected_irq,
-                "{}",
-                scenario.name
-            );
-            assert_eq!(
-                summary.send_count, scenario.expected_send_count,
-                "{}",
-                scenario.name
-            );
-        }
+        let handle = std::thread::Builder::new()
+            .name("core-scenario-catalog".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                for scenario in scenario_catalog() {
+                    let summary = run_scenario(scenario).expect("sim");
+                    assert_eq!(
+                        summary.last_received_opcode, scenario.expected_last_received_opcode,
+                        "{}",
+                        scenario.name
+                    );
+                    assert_eq!(
+                        summary.last_irq_opcode, scenario.expected_irq,
+                        "{}",
+                        scenario.name
+                    );
+                    assert_eq!(
+                        summary.send_count, scenario.expected_send_count,
+                        "{}",
+                        scenario.name
+                    );
+                }
+            })
+            .expect("spawn thread");
+        handle.join().expect("join");
     }
 }
