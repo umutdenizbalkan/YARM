@@ -28,7 +28,6 @@ fn write_byte(byte: u8) {
 
 #[cfg(not(feature = "hosted-dev"))]
 fn outb(port: u16, value: u8) {
-    // SAFETY: Raw x86 port I/O is the required mechanism for the early serial console.
     unsafe {
         core::arch::asm!(
             "out dx, al",
@@ -42,7 +41,6 @@ fn outb(port: u16, value: u8) {
 #[cfg(not(feature = "hosted-dev"))]
 fn inb(port: u16) -> u8 {
     let value: u8;
-    // SAFETY: Raw x86 port I/O is the required mechanism for the early serial console.
     unsafe {
         core::arch::asm!(
             "in al, dx",

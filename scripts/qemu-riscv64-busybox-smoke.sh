@@ -49,12 +49,16 @@ timeout "$TIMEOUT_SECS" qemu-system-riscv64 \
 QEMU_STATUS=$?
 set -e
 
-if rg -n "YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|init_server|Welcome|\[ui\] boot-to-shell marker" "$LOGFILE" >/dev/null 2>&1; then
-  echo "[ok] boot shell markers detected"
+MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
+INIT_SERVER_REGEX="init_server|first server|first-server"
+
+if rg -n "$MARKER_REGEX" "$LOGFILE" >/dev/null 2>&1 \
+  && rg -n "$INIT_SERVER_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+  echo "[ok] boot shell and init-server markers detected"
   exit 0
 fi
 
-echo "[warn] boot shell markers not detected (status=$QEMU_STATUS)"
+echo "[warn] boot shell and init-server markers not detected (status=$QEMU_STATUS)"
 if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
   exit 1
 fi

@@ -229,7 +229,7 @@ pub fn printk_args(level: LogLevel, context: PrintkContext, args: fmt::Arguments
     PRINTK.push(level, context, &sb.buf[..sb.len]);
     #[cfg(not(feature = "hosted-dev"))]
     {
-        let _ = threaded_drain_to(|_lvl, _ctx, msg| crate::kernel::console::write_line(msg));
+        let _ = threaded_drain_to(|_lvl, _ctx, msg| crate::arch::console::write_line(msg));
     }
 }
 
