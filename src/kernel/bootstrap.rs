@@ -3952,24 +3952,27 @@ mod tests {
         let iova_cap = state.create_iova_space_cap().expect("iova");
 
         let first_bundle = state
-            .delegate_driver_bundle_checked(
-                110,
-                DriverBundlePlan {
-                    server_tid: ThreadId(111),
-                    irq_line: 14,
-                    mem_cap,
-                    iova_cap,
-                    iova_base: crate::kernel::vm::PAGE_SIZE * 4,
-                    iova_len: crate::kernel::vm::PAGE_SIZE,
-                },
-            )
+            .delegate_driver_bundle_checked(110, DriverBundlePlan::standard(
+                ThreadId(111),
+                14,
+                mem_cap,
+                iova_cap,
+                crate::kernel::vm::PAGE_SIZE * 4,
+            ))
             .expect("first bundle");
+        state
+            .validate_driver_bundle_live(111, first_bundle)
+            .expect("bundle live");
         assert!(state.cspace.get(first_bundle.irq_cap).is_some());
         assert!(state.cspace.get(first_bundle.dma_cap).is_some());
 
         let token = state.exit_task(111, 5).expect("exit");
         state.restart_task(111, token).expect("restart");
 
+        assert_eq!(
+            state.validate_driver_bundle_live(111, first_bundle),
+            Err(KernelError::StaleCapability)
+        );
         assert!(state.cspace.get(first_bundle.irq_cap).is_none());
         assert!(state.cspace.get(first_bundle.dma_cap).is_none());
         assert_eq!(
@@ -3981,18 +3984,17 @@ mod tests {
         let iova_cap2 = state.create_iova_space_cap().expect("iova2");
 
         let second_bundle = state
-            .delegate_driver_bundle_checked(
-                110,
-                DriverBundlePlan {
-                    server_tid: ThreadId(111),
-                    irq_line: 14,
-                    mem_cap,
-                    iova_cap: iova_cap2,
-                    iova_base: crate::kernel::vm::PAGE_SIZE * 4,
-                    iova_len: crate::kernel::vm::PAGE_SIZE,
-                },
-            )
+            .delegate_driver_bundle_checked(110, DriverBundlePlan::standard(
+                ThreadId(111),
+                14,
+                mem_cap,
+                iova_cap2,
+                crate::kernel::vm::PAGE_SIZE * 4,
+            ))
             .expect("second bundle");
+        state
+            .validate_driver_bundle_live(111, second_bundle)
+            .expect("bundle live after redelegation");
 
         assert_ne!(first_bundle.irq_cap, second_bundle.irq_cap);
         assert_ne!(first_bundle.dma_cap, second_bundle.dma_cap);

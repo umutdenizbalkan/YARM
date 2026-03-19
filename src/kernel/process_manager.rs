@@ -388,7 +388,7 @@ impl ProcessService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::proc_proto::ProcV2Args;
+    use crate::kernel::proc_proto::{SpawnV2Args, WaitPidV2Args};
 
     #[test]
     fn elf_image_info_parser_accepts_minimal_elf64_header() {
@@ -422,7 +422,7 @@ mod tests {
             PROC_OP_SPAWN_V2,
             0,
             None,
-            &ProcV2Args::new(7, 99).encode(),
+            &SpawnV2Args::new(7, 99).encode(),
         )
         .expect("msg");
         let req = ProcessManagerLite::parse_request(msg).expect("parse");
@@ -443,7 +443,7 @@ mod tests {
             PROC_OP_SPAWN_V2,
             0,
             None,
-            &ProcV2Args::new(1, 2).encode(),
+            &SpawnV2Args::new(1, 2).encode(),
         )
         .expect("msg");
         let spawn_reply = pm.handle_request(spawn).expect("handle");
@@ -456,7 +456,7 @@ mod tests {
             PROC_OP_WAITPID_V2,
             0,
             None,
-            &ProcV2Args::new(1, spawned.pid).encode(),
+            &WaitPidV2Args::new(1, spawned.pid).encode(),
         )
         .expect("wait");
         let wait_reply = pm.handle_request(wait).expect("wait reply");
@@ -489,7 +489,7 @@ mod tests {
             PROC_OP_SPAWN_V2,
             0,
             None,
-            &ProcV2Args::new(1, 2).encode(),
+            &SpawnV2Args::new(1, 2).encode(),
         )
         .expect("spawn");
         let spawn_reply = pm.handle_request(spawn).expect("spawn reply");
@@ -501,7 +501,7 @@ mod tests {
             PROC_OP_WAITPID_V2,
             0,
             None,
-            &ProcV2Args::new(1, spawned.pid).encode(),
+            &WaitPidV2Args::new(1, spawned.pid).encode(),
         )
         .expect("wait");
         let _ = pm.handle_request(wait).expect("wait reply");
@@ -516,7 +516,7 @@ mod tests {
             PROC_OP_SPAWN_V2,
             0,
             None,
-            &ProcV2Args::new(1, 2).encode(),
+            &SpawnV2Args::new(1, 2).encode(),
         )
         .expect("spawn");
         let spawn_reply = pm.handle_request(spawn).expect("spawn reply");
@@ -527,7 +527,7 @@ mod tests {
             PROC_OP_WAITPID_V2,
             0,
             None,
-            &ProcV2Args::new(99, spawned.pid).encode(),
+            &WaitPidV2Args::new(99, spawned.pid).encode(),
         )
         .expect("wait");
         assert_eq!(
@@ -544,7 +544,7 @@ mod tests {
             PROC_OP_WAITPID_V2,
             0,
             None,
-            &ProcV2Args::new(1, 4242).encode(),
+            &WaitPidV2Args::new(1, 4242).encode(),
         )
         .expect("wait");
         assert_eq!(
@@ -561,7 +561,7 @@ mod tests {
             PROC_OP_SPAWN_V2,
             0,
             None,
-            &ProcV2Args::new(1, 2).encode(),
+            &SpawnV2Args::new(1, 2).encode(),
         )
         .expect("spawn");
         let getpid =

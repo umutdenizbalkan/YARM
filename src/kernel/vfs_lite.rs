@@ -2,7 +2,8 @@
 
 use super::ipc::Message;
 use super::vfs_proto::{
-    VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
+    OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
+    VFS_OP_WRITE, VfsV1Args,
 };
 
 const MAX_FDS: usize = 16;
@@ -257,31 +258,49 @@ impl<B: VfsBackend> VfsLiteService<B> {
     }
 
     pub fn parse_request(request: Message) -> Result<VfsRequest, VfsLiteError> {
-        let args = VfsV1Args::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
         match request.opcode {
-            VFS_OP_OPENAT => Ok(VfsRequest::OpenAt {
-                _dirfd: args.arg0,
-                path_ptr: args.arg1,
-                _flags: args.arg2,
-                _mode: args.arg3,
-            }),
-            VFS_OP_CLOSE => Ok(VfsRequest::Close { fd: args.arg0 }),
-            VFS_OP_READ => Ok(VfsRequest::Read {
-                fd: args.arg0,
-                _buf_ptr: args.arg1,
-                len: args.arg2,
-            }),
-            VFS_OP_WRITE => Ok(VfsRequest::Write {
-                fd: args.arg0,
-                _buf_ptr: args.arg1,
-                len: args.arg2,
-            }),
-            VFS_OP_STATX => Ok(VfsRequest::Statx {
-                _dirfd: args.arg0,
-                path_ptr: args.arg1,
-                _flags: args.arg2,
-                _mask_or_buf: args.arg3,
-            }),
+            VFS_OP_OPENAT => {
+                let args = OpenAtArgs::decode(request.as_slice())
+                    .map_err(|_| VfsLiteError::Malformed)?;
+                Ok(VfsRequest::OpenAt {
+                    _dirfd: args.dirfd,
+                    path_ptr: args.path_ptr,
+                    _flags: args.flags,
+                    _mode: args.mode,
+                })
+            }
+            VFS_OP_CLOSE => {
+                let args = VfsV1Args::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
+                Ok(VfsRequest::Close { fd: args.arg0 })
+            }
+            VFS_OP_READ => {
+                let args = ReadWriteArgs::decode(request.as_slice())
+                    .map_err(|_| VfsLiteError::Malformed)?;
+                Ok(VfsRequest::Read {
+                    fd: args.fd,
+                    _buf_ptr: args.buf_ptr,
+                    len: args.len,
+                })
+            }
+            VFS_OP_WRITE => {
+                let args = ReadWriteArgs::decode(request.as_slice())
+                    .map_err(|_| VfsLiteError::Malformed)?;
+                Ok(VfsRequest::Write {
+                    fd: args.fd,
+                    _buf_ptr: args.buf_ptr,
+                    len: args.len,
+                })
+            }
+            VFS_OP_STATX => {
+                let args = StatxArgs::decode(request.as_slice())
+                    .map_err(|_| VfsLiteError::Malformed)?;
+                Ok(VfsRequest::Statx {
+                    _dirfd: args.dirfd,
+                    path_ptr: args.path_ptr,
+                    _flags: args.flags,
+                    _mask_or_buf: args.mask_or_buf,
+                })
+            }
             _ => Err(VfsLiteError::Unsupported),
         }
     }
@@ -317,10 +336,10 @@ impl<B: VfsBackend> VfsLiteService<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
+    use crate::kernel::vfs_proto::{OpenAtArgs, VFS_OP_OPENAT, VFS_OP_READ};
 
     fn pack(a0: u64, a1: u64, a2: u64, a3: u64) -> [u8; 32] {
-        VfsV1Args::new(a0, a1, a2, a3).encode()
+        OpenAtArgs::new(a0, a1, a2, a3).encode()
     }
 
     #[test]

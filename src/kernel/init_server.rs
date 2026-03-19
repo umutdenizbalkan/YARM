@@ -369,6 +369,15 @@ impl InitServerLite {
         kernel: &mut KernelState,
         plan: CoreServiceImagePlan,
     ) -> Result<CoreLaunchReport, KernelError> {
+        self.launch_core_services_with_mount_fail_at(kernel, plan, None)
+    }
+
+    pub fn launch_core_services_with_mount_fail_at(
+        &mut self,
+        kernel: &mut KernelState,
+        plan: CoreServiceImagePlan,
+        fail_at: Option<usize>,
+    ) -> Result<CoreLaunchReport, KernelError> {
         if self.phase != InitBootPhase::CoreServicesRegistered {
             return Err(KernelError::WrongObject);
         }
@@ -426,7 +435,7 @@ impl InitServerLite {
             }
         }
 
-        let mount_status = self.execute_mount_plan_with_fail_at(None)?;
+        let mount_status = self.execute_mount_plan_with_fail_at(fail_at)?;
         self.mount_status = Some(mount_status);
 
         Ok(CoreLaunchReport {
@@ -714,5 +723,47 @@ mod tests {
             init.execute_mount_plan_with_fail_at(Some(3)),
             Err(KernelError::WrongObject)
         );
+    }
+
+    #[test]
+    fn supervisor_first_launch_fault_injection_preserves_boot_order_signal() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitServerLite::new();
+        init.set_launch_strategy(CoreLaunchStrategy::SupervisorFirst);
+        let mut mount_plan = MountPlan::baseline();
+        mount_plan.allow_fallback_to_fat = false;
+        init.set_mount_plan(mount_plan).expect("mount plan");
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut state, graph)
+            .expect("register");
+
+        assert_eq!(
+            init.launch_core_services_with_mount_fail_at(
+                &mut state,
+                CoreServiceImagePlan {
+                    process_manager_entry: 0x8000,
+                    vfs_entry: 0x9000,
+                    supervisor_entry: 0xA000,
+                },
+                Some(0),
+            ),
+            Err(KernelError::WrongObject)
+        );
+        assert_eq!(
+            init.launch_order(),
+            [
+                Some(CoreServiceKind::Supervisor),
+                Some(CoreServiceKind::ProcessManager),
+                Some(CoreServiceKind::Vfs),
+            ]
+        );
+        assert!(init.mount_status().is_none());
+        init.mark_failed();
+        assert_eq!(init.phase(), InitBootPhase::Failed);
     }
 }
