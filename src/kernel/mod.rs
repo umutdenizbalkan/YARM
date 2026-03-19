@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod capabilities;
+pub mod console;
 pub mod driver_manager;
 pub mod driver_proto;
 pub mod init_server;

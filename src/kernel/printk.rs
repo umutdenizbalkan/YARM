@@ -227,6 +227,10 @@ pub fn printk_args(level: LogLevel, context: PrintkContext, args: fmt::Arguments
     let mut sb = StackBuf::new();
     let _ = fmt::write(&mut sb, args);
     PRINTK.push(level, context, &sb.buf[..sb.len]);
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        let _ = threaded_drain_to(|_lvl, _ctx, msg| crate::kernel::console::write_line(msg));
+    }
 }
 
 #[macro_export]
