@@ -15,6 +15,44 @@ KERNEL_BIN_IMAGE=${KERNEL_BIN_IMAGE:-$OUT_DIR/yarm-aarch64.bin}
 BUSYBOX_BIN=${BUSYBOX_BIN:-}
 ARTIFACTS_STRICT=${ARTIFACTS_STRICT:-0}
 BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
+BUILD_LOG=${BUILD_LOG:-$OUT_DIR/aarch64-build.log}
+
+emit_missing_target_hint() {
+  local target="$1"
+  echo "[hint] cargo could not build for target '${target}' with the current toolchain"
+  if command -v rustup >/dev/null 2>&1; then
+    echo "[hint] try: rustup target add ${target}"
+  else
+    echo "[hint] rustup is not available; install target std artifacts for ${target} via your package manager or build on another machine and copy target/${target}/ artifacts here"
+    echo "[hint] on Termux, this usually means either using a toolchain that already ships ${target}, or prebuilding artifacts off-device"
+  fi
+  echo "[hint] build output was captured in: $BUILD_LOG"
+}
+
+archive_rootfs() {
+  if ! command -v cpio >/dev/null 2>&1; then
+    echo "[warn] cpio not found; creating placeholder initramfs archive file"
+    : > "$INITRAMFS_IMAGE_ABS"
+    [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+    return
+  fi
+
+  local cpio_help
+  cpio_help="$(cpio --help 2>&1 || true)"
+  if printf '%s' "$cpio_help" | rg -q -- '--null'; then
+    ( cd "$ROOTFS_DIR" && find . -print0 | cpio --null -ov --format=newc > "$INITRAMFS_IMAGE_ABS" ) >/dev/null
+    return
+  fi
+
+  if printf '%s' "$cpio_help" | rg -q -- ' -H '; then
+    ( cd "$ROOTFS_DIR" && find . -print | cpio -o -H newc > "$INITRAMFS_IMAGE_ABS" ) >/dev/null
+    return
+  fi
+
+  echo "[warn] cpio is installed but does not advertise --null or -H newc support; creating placeholder initramfs archive file"
+  : > "$INITRAMFS_IMAGE_ABS"
+  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+}
 
 mkdir -p "$OUT_DIR" "$ROOTFS_DIR/bin" "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
 mkdir -p "$(dirname "$INITRAMFS_IMAGE")"
@@ -27,11 +65,13 @@ fi
 echo "[info] building server + kernel bins for target ${RUST_TARGET}"
 BUILD_OK=1
 set +e
-cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} --bin "$SERVER_BIN" --bin "$KERNEL_BIN"
+cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} --bin "$SERVER_BIN" --bin "$KERNEL_BIN" \
+  2>&1 | tee "$BUILD_LOG"
 BUILD_STATUS=$?
 set -e
 if [[ "$BUILD_STATUS" -ne 0 ]]; then
   BUILD_OK=0
+  emit_missing_target_hint "$RUST_TARGET"
 fi
 
 if [[ "$BUILD_OK" -eq 1 && -f "$SERVER_ELF" ]]; then
@@ -75,13 +115,7 @@ exec sh
 SH
 chmod +x "$ROOTFS_DIR/init"
 
-if command -v cpio >/dev/null 2>&1; then
-  ( cd "$ROOTFS_DIR" && find . -print0 | cpio --null -ov --format=newc > "$INITRAMFS_IMAGE_ABS" ) >/dev/null
-else
-  echo "[warn] cpio not found; creating placeholder initramfs archive file"
-  : > "$INITRAMFS_IMAGE_ABS"
-  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
-fi
+archive_rootfs
 
 if [[ ! -f "$KERNEL_IMAGE" && -f "$KERNEL_ELF" ]]; then
   cp "$KERNEL_ELF" "$KERNEL_IMAGE"
