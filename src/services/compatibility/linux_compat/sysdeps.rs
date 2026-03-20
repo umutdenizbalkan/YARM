@@ -92,6 +92,89 @@ pub struct MuslStartupOutcome {
     pub main_return: i32,
 }
 
+pub const MUSL_TLS_ALIGN: usize = 16;
+pub const MUSL_STACK_ALIGN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuslThreadSpec {
+    pub tls_base: usize,
+    pub stack_top: usize,
+    pub entry: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuslThreadState {
+    pub tid: u64,
+    pub thread_pointer: usize,
+    pub stack_top: usize,
+    pub entry: usize,
+    pub thread_group_id: u64,
+    pub tls_restore_pending: bool,
+}
+
+pub fn validate_musl_thread_spec(spec: MuslThreadSpec) -> Result<MuslThreadSpec, LinuxErrno> {
+    if spec.tls_base == 0 || spec.stack_top == 0 || spec.entry == 0 {
+        return Err(LinuxErrno::Inval);
+    }
+    if !spec.tls_base.is_multiple_of(MUSL_TLS_ALIGN)
+        || !spec.stack_top.is_multiple_of(MUSL_STACK_ALIGN)
+    {
+        return Err(LinuxErrno::Inval);
+    }
+    Ok(spec)
+}
+
+pub fn validate_musl_thread_state(
+    kernel: &KernelState,
+    parent_tid: u64,
+    tid: u64,
+    spec: MuslThreadSpec,
+) -> Result<MuslThreadState, LinuxErrno> {
+    let spec = validate_musl_thread_spec(spec)?;
+    let thread_group_id = kernel.thread_group_id(tid).ok_or(LinuxErrno::Inval)?;
+    let parent_group_id = kernel
+        .thread_group_id(parent_tid)
+        .ok_or(LinuxErrno::Inval)?;
+    if thread_group_id != parent_group_id {
+        return Err(LinuxErrno::Inval);
+    }
+    if kernel.thread_tls_base(tid) != Some(spec.tls_base) {
+        return Err(LinuxErrno::Inval);
+    }
+    let context = kernel.thread_user_context(tid).ok_or(LinuxErrno::Inval)?;
+    if context.instruction_ptr != spec.entry || context.stack_ptr != spec.stack_top {
+        return Err(LinuxErrno::Inval);
+    }
+    let tls_restore_pending = kernel.tls_restore_pending(tid).ok_or(LinuxErrno::Inval)?;
+    if !tls_restore_pending {
+        return Err(LinuxErrno::Inval);
+    }
+    Ok(MuslThreadState {
+        tid,
+        thread_pointer: spec.tls_base,
+        stack_top: spec.stack_top,
+        entry: spec.entry,
+        thread_group_id,
+        tls_restore_pending,
+    })
+}
+
+pub fn spawn_musl_thread(
+    kernel: &mut KernelState,
+    parent_tid: u64,
+    spec: MuslThreadSpec,
+) -> Result<MuslThreadState, LinuxErrno> {
+    let spec = validate_musl_thread_spec(spec)?;
+    let tid = clone_thread_hook(
+        kernel,
+        parent_tid,
+        spec.tls_base,
+        spec.stack_top,
+        spec.entry,
+    )?;
+    validate_musl_thread_state(kernel, parent_tid, tid, spec)
+}
+
 fn word_size() -> usize {
     core::mem::size_of::<usize>()
 }
@@ -604,6 +687,96 @@ mod tests {
     fn prepare_musl_startup_rejects_missing_argv_terminator() {
         let words = [1, 0x1110, 0x2220, 0x3330];
         assert_eq!(prepare_musl_startup(0x7000, &words), Err(LinuxErrno::Inval));
+    }
+
+    #[test]
+    fn musl_thread_spawn_validates_kernel_state_against_musl_expectations() {
+        let mut kernel = Bootstrap::init().expect("init");
+        let (asid, _aspace_cap) = kernel.create_user_address_space().expect("asid");
+        kernel
+            .spawn_user_task_from_image(crate::kernel::bootstrap::UserImageSpec {
+                tid: 7,
+                entry: 0x4000,
+                asid: Some(asid),
+                class: TaskClass::App,
+            })
+            .expect("leader");
+
+        let state = spawn_musl_thread(
+            &mut kernel,
+            7,
+            MuslThreadSpec {
+                tls_base: 0x2000_0000,
+                stack_top: 0x8000_0010,
+                entry: 0x4010,
+            },
+        )
+        .expect("musl thread");
+
+        assert_eq!(state.thread_pointer, 0x2000_0000);
+        assert_eq!(state.stack_top, 0x8000_0010);
+        assert_eq!(state.entry, 0x4010);
+        assert_eq!(state.thread_group_id, 7);
+        assert!(state.tls_restore_pending);
+    }
+
+    #[test]
+    fn musl_thread_validation_rejects_unaligned_tls_or_stack() {
+        assert_eq!(
+            validate_musl_thread_spec(MuslThreadSpec {
+                tls_base: 3,
+                stack_top: 0x8000_0010,
+                entry: 0x4010,
+            }),
+            Err(LinuxErrno::Inval)
+        );
+        assert_eq!(
+            validate_musl_thread_spec(MuslThreadSpec {
+                tls_base: 0x2000_0000,
+                stack_top: 0x8000_0008,
+                entry: 0x4010,
+            }),
+            Err(LinuxErrno::Inval)
+        );
+    }
+
+    #[test]
+    fn musl_thread_validation_accepts_tls_updates_that_require_restore() {
+        let mut kernel = Bootstrap::init().expect("init");
+        let (asid, _aspace_cap) = kernel.create_user_address_space().expect("asid");
+        kernel
+            .spawn_user_task_from_image(crate::kernel::bootstrap::UserImageSpec {
+                tid: 9,
+                entry: 0x5000,
+                asid: Some(asid),
+                class: TaskClass::App,
+            })
+            .expect("leader");
+        let state = spawn_musl_thread(
+            &mut kernel,
+            9,
+            MuslThreadSpec {
+                tls_base: 0x3000_0000,
+                stack_top: 0x9000_0010,
+                entry: 0x5010,
+            },
+        )
+        .expect("thread");
+        set_tls_hook(&mut kernel, state.tid, 0x3000_0100).expect("set tls");
+
+        let refreshed = validate_musl_thread_state(
+            &kernel,
+            9,
+            state.tid,
+            MuslThreadSpec {
+                tls_base: 0x3000_0100,
+                stack_top: 0x9000_0010,
+                entry: 0x5010,
+            },
+        )
+        .expect("validate");
+        assert_eq!(refreshed.thread_pointer, 0x3000_0100);
+        assert!(refreshed.tls_restore_pending);
     }
 
     #[test]
