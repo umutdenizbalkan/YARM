@@ -1,4 +1,5 @@
-use crate::arch::platform_layout;
+use crate::arch::{platform_layout, topology};
+use crate::kernel::topology::CpuTopology;
 
 pub const MAX_RUN_QUEUE: usize = 64;
 pub const MAX_CPUS: usize = platform_layout::MAX_CPUS;
@@ -175,17 +176,15 @@ impl PriorityScheduler {
 #[derive(Debug)]
 pub struct SmpScheduler {
     schedulers: [PriorityScheduler; MAX_CPUS],
-    online: [bool; MAX_CPUS],
+    topology: CpuTopology,
     current_cpu: CpuId,
 }
 
 impl Default for SmpScheduler {
     fn default() -> Self {
-        let mut online = [false; MAX_CPUS];
-        online[0] = true;
         Self {
             schedulers: core::array::from_fn(|_| PriorityScheduler::default()),
-            online,
+            topology: CpuTopology::from_present_bitmap(topology::default_present_cpu_bitmap()),
             current_cpu: CpuId(0),
         }
     }
@@ -204,7 +203,7 @@ impl SmpScheduler {
         let mut best: Option<(usize, CpuId)> = None;
         let mut idx = 0usize;
         while idx < MAX_CPUS {
-            if self.online[idx] {
+            if self.topology.cpu_online(idx as u8) {
                 let load = self.schedulers[idx].runnable_count()
                     + usize::from(self.schedulers[idx].current_tid().is_some());
                 let cpu = CpuId(idx as u8);
@@ -227,7 +226,7 @@ impl SmpScheduler {
         let Some(idx) = Self::check_cpu(cpu) else {
             return Err(());
         };
-        if !self.online[idx] {
+        if !self.topology.cpu_online(idx as u8) {
             return Err(());
         }
         self.current_cpu = cpu;
@@ -235,21 +234,34 @@ impl SmpScheduler {
     }
 
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), ()> {
-        let Some(idx) = Self::check_cpu(cpu) else {
+        let Some(_idx) = Self::check_cpu(cpu) else {
             return Err(());
         };
-        self.online[idx] = true;
-        Ok(())
+        self.topology
+            .complete_secondary_bring_up(cpu.0)
+            .map_err(|_| ())
     }
 
     pub fn cpu_is_online(&self, cpu: CpuId) -> bool {
         Self::check_cpu(cpu)
-            .map(|idx| self.online[idx])
+            .map(|idx| self.topology.cpu_online(idx as u8))
             .unwrap_or(false)
     }
 
     pub fn online_cpu_count(&self) -> usize {
-        self.online.iter().filter(|online| **online).count()
+        self.topology.online_cpu_count()
+    }
+
+    pub fn present_cpu_count(&self) -> usize {
+        self.topology.present_cpu_count()
+    }
+
+    pub fn present_cpu_bitmap(&self) -> u64 {
+        self.topology.present_cpu_bitmap()
+    }
+
+    pub fn set_present_cpu_bitmap(&mut self, present: u64) {
+        self.topology = CpuTopology::from_present_bitmap(present);
     }
 
     pub fn enqueue_on_with_priority(
@@ -261,7 +273,7 @@ impl SmpScheduler {
         let Some(idx) = Self::check_cpu(cpu) else {
             return Err(tid);
         };
-        if !self.online[idx] {
+        if !self.topology.cpu_online(idx as u8) {
             return Err(tid);
         }
         self.schedulers[idx].enqueue_with_priority(tid, priority)
@@ -279,7 +291,7 @@ impl SmpScheduler {
 
     pub fn dispatch_next_on(&mut self, cpu: CpuId) -> Option<u64> {
         let idx = Self::check_cpu(cpu)?;
-        if !self.online[idx] {
+        if !self.topology.cpu_online(idx as u8) {
             return None;
         }
         self.schedulers[idx].dispatch_next()
@@ -287,7 +299,7 @@ impl SmpScheduler {
 
     pub fn on_preempt_on(&mut self, cpu: CpuId) -> Option<u64> {
         let idx = Self::check_cpu(cpu)?;
-        if !self.online[idx] {
+        if !self.topology.cpu_online(idx as u8) {
             return None;
         }
         self.schedulers[idx].on_preempt()
@@ -295,7 +307,7 @@ impl SmpScheduler {
 
     pub fn block_current_on(&mut self, cpu: CpuId) -> Option<u64> {
         let idx = Self::check_cpu(cpu)?;
-        if !self.online[idx] {
+        if !self.topology.cpu_online(idx as u8) {
             return None;
         }
         self.schedulers[idx].block_current()
@@ -303,7 +315,7 @@ impl SmpScheduler {
 
     pub fn current_tid_on(&self, cpu: CpuId) -> Option<u64> {
         let idx = Self::check_cpu(cpu)?;
-        if !self.online[idx] {
+        if !self.topology.cpu_online(idx as u8) {
             return None;
         }
         self.schedulers[idx].current_tid()
@@ -311,7 +323,7 @@ impl SmpScheduler {
 
     pub fn current_priority_on(&self, cpu: CpuId) -> Option<TaskPriority> {
         let idx = Self::check_cpu(cpu)?;
-        if !self.online[idx] {
+        if !self.topology.cpu_online(idx as u8) {
             return None;
         }
         self.schedulers[idx].current_priority()
@@ -321,7 +333,7 @@ impl SmpScheduler {
         let Some(idx) = Self::check_cpu(cpu) else {
             return 0;
         };
-        if !self.online[idx] {
+        if !self.topology.cpu_online(idx as u8) {
             return 0;
         }
         self.schedulers[idx].runnable_count()
@@ -389,9 +401,11 @@ mod tests {
         let mut sched = PriorityScheduler::default();
         assert!(sched.enqueue_with_priority(10, TaskPriority::Low).is_ok());
         assert!(sched.enqueue_with_priority(20, TaskPriority::High).is_ok());
-        assert!(sched
-            .enqueue_with_priority(30, TaskPriority::Normal)
-            .is_ok());
+        assert!(
+            sched
+                .enqueue_with_priority(30, TaskPriority::Normal)
+                .is_ok()
+        );
 
         assert_eq!(sched.dispatch_next(), Some(20));
         assert_eq!(sched.current_priority(), Some(TaskPriority::High));
@@ -401,9 +415,11 @@ mod tests {
     fn scheduler_wraparound_and_overflow_path() {
         let mut sched = PriorityScheduler::default();
         for tid in 0..MAX_RUN_QUEUE as u64 {
-            assert!(sched
-                .enqueue_with_priority(tid, TaskPriority::Normal)
-                .is_ok());
+            assert!(
+                sched
+                    .enqueue_with_priority(tid, TaskPriority::Normal)
+                    .is_ok()
+            );
         }
         assert_eq!(
             sched.enqueue_with_priority(999, TaskPriority::Normal),
@@ -415,9 +431,11 @@ mod tests {
             let _ = sched.block_current();
         }
         for tid in 1000..1000 + (MAX_RUN_QUEUE / 2) as u64 {
-            assert!(sched
-                .enqueue_with_priority(tid, TaskPriority::Normal)
-                .is_ok());
+            assert!(
+                sched
+                    .enqueue_with_priority(tid, TaskPriority::Normal)
+                    .is_ok()
+            );
         }
     }
 
@@ -428,12 +446,16 @@ mod tests {
         assert!(sched.bring_up_cpu(CpuId(1)).is_ok());
         assert_eq!(sched.online_cpu_count(), 2);
 
-        assert!(sched
-            .enqueue_on_with_priority(CpuId(0), 10, TaskPriority::Normal)
-            .is_ok());
-        assert!(sched
-            .enqueue_on_with_priority(CpuId(1), 20, TaskPriority::High)
-            .is_ok());
+        assert!(
+            sched
+                .enqueue_on_with_priority(CpuId(0), 10, TaskPriority::Normal)
+                .is_ok()
+        );
+        assert!(
+            sched
+                .enqueue_on_with_priority(CpuId(1), 20, TaskPriority::High)
+                .is_ok()
+        );
 
         assert_eq!(sched.dispatch_next_on(CpuId(0)), Some(10));
         assert_eq!(sched.dispatch_next_on(CpuId(1)), Some(20));

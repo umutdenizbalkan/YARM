@@ -36,8 +36,11 @@ pub fn run() {
     init.begin_running().expect("running");
 
     crate::yarm_log!(
-        "init.srv scaffold online: phase={:?}, handles={:?}",
+        "init.srv scaffold online: phase={:?}, handles={:?}, present_cpus={}, present_bitmap=0x{:x}, online_cpus={}",
         init.phase(),
-        init.handles()
+        init.handles(),
+        kernel.present_cpu_count(),
+        kernel.present_cpu_bitmap(),
+        kernel.online_cpu_count()
     );
 }

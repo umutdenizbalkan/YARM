@@ -1,8 +1,8 @@
 use super::capabilities::{CapId, CapObject, CapRights, Capability, CapabilitySpace};
 use super::ipc::{Endpoint, EndpointMode, Message};
 use super::scheduler::{CpuId, SmpScheduler, TaskPriority};
-use super::smp::{CrossCpuWorkQueue, WorkItem, MAX_CROSS_CPU_WORK};
-use super::syscall::{dispatch as dispatch_syscall, SyscallError};
+use super::smp::{CrossCpuWorkQueue, MAX_CROSS_CPU_WORK, WorkItem};
+use super::syscall::{SyscallError, dispatch as dispatch_syscall};
 use super::task::{
     RestartState, RestartToken, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock,
     ThreadDetachState, TickDuration, TickInstant, UserRegisterContext, WaitReason,
@@ -13,7 +13,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
 };
-use crate::arch::platform_layout;
+use crate::arch::{platform_layout, topology};
 use crate::kernel::ipc::ThreadId;
 
 const MAX_ENDPOINTS: usize = 16;
@@ -295,6 +295,7 @@ impl Bootstrap {
             })?;
 
         let mut scheduler = SmpScheduler::default();
+        scheduler.set_present_cpu_bitmap(topology::default_present_cpu_bitmap());
         scheduler
             .enqueue_on(CpuId(platform_layout::BOOTSTRAP_CPU_ID), 0)
             .map_err(|_| KernelError::SchedulerFull)?;
@@ -1101,6 +1102,14 @@ impl KernelState {
 
     pub fn online_cpu_count(&self) -> usize {
         self.scheduler.online_cpu_count()
+    }
+
+    pub fn present_cpu_count(&self) -> usize {
+        self.scheduler.present_cpu_count()
+    }
+
+    pub fn present_cpu_bitmap(&self) -> u64 {
+        self.scheduler.present_cpu_bitmap()
     }
 
     fn task_priority(&self, tid: u64) -> Result<TaskPriority, KernelError> {
@@ -3375,13 +3384,15 @@ mod tests {
         let (irq_cap, dma_cap) = state.delegate_device_server_caps(plan).expect("delegate");
         assert!(state.cspace.get(irq_cap).is_some());
         assert!(state.cspace.get(dma_cap).is_some());
-        assert!(state
-            .validate_driver_dma_iova(
-                34,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE,
-            )
-            .is_ok());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    34,
+                    crate::kernel::vm::PAGE_SIZE * 8,
+                    crate::kernel::vm::PAGE_SIZE,
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3703,16 +3714,22 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
 
-        assert!(state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
-            .is_ok());
-        assert!(state
-            .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
-            .is_err());
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+                .is_ok()
+        );
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
+                .is_err()
+        );
         assert!(state.mint_dma_region_cap(mem_cap, 0, 0).is_err());
-        assert!(state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-            .is_err());
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -3844,13 +3861,15 @@ mod tests {
         let token = state.exit_task(22, 1).expect("exit");
         state.restart_task(22, token).expect("restart");
 
-        assert!(state
-            .validate_driver_dma_iova(
-                22,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    22,
+                    crate::kernel::vm::PAGE_SIZE * 8,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -3887,22 +3906,26 @@ mod tests {
                 crate::kernel::vm::PAGE_SIZE,
             )
             .expect("window");
-        assert!(state
-            .validate_driver_dma_iova(
-                31,
-                crate::kernel::vm::PAGE_SIZE * 2,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    31,
+                    crate::kernel::vm::PAGE_SIZE * 2,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_ok()
+        );
 
         state.detach_driver_iova_space(31).expect("detach");
-        assert!(state
-            .validate_driver_dma_iova(
-                31,
-                crate::kernel::vm::PAGE_SIZE * 2,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    31,
+                    crate::kernel::vm::PAGE_SIZE * 2,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -4050,20 +4073,24 @@ mod tests {
             )
             .expect("window");
 
-        assert!(state
-            .validate_driver_dma_iova(
-                12,
-                crate::kernel::vm::PAGE_SIZE * 4,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok());
-        assert!(state
-            .validate_driver_dma_iova(
-                12,
-                crate::kernel::vm::PAGE_SIZE * 3,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    12,
+                    crate::kernel::vm::PAGE_SIZE * 4,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_ok()
+        );
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    12,
+                    crate::kernel::vm::PAGE_SIZE * 3,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 
     #[test]

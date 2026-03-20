@@ -24,4 +24,5 @@ pub mod syscall_abi;
 pub mod vm_layout;
 
 pub mod console;
+pub mod topology;
 pub mod trap_entry;
