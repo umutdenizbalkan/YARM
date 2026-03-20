@@ -54,20 +54,183 @@ pub const fn memory_syscall_numbers() -> MemorySyscallNumbers {
     }
 }
 
+const MAX_STARTUP_ARGS: usize = 16;
+const MAX_STARTUP_ENVP: usize = 16;
+const MAX_STARTUP_AUXV: usize = 16;
+pub const AUXV_AT_NULL: usize = 0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartupBootstrapInfo {
     pub stack_top: usize,
+    pub argc: usize,
     pub argv_ptr: usize,
     pub envp_ptr: usize,
     pub auxv_ptr: usize,
 }
 
-/// Placeholder startup hook for crt0/`__libc_start_main` integration wiring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuxVectorEntry {
+    pub key: usize,
+    pub value: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuslStartupFrame {
+    pub info: StartupBootstrapInfo,
+    pub argv: [usize; MAX_STARTUP_ARGS],
+    pub envp: [usize; MAX_STARTUP_ENVP],
+    pub auxv: [AuxVectorEntry; MAX_STARTUP_AUXV],
+    pub envc: usize,
+    pub auxc: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuslStartupOutcome {
+    pub info: StartupBootstrapInfo,
+    pub envc: usize,
+    pub auxc: usize,
+    pub main_return: i32,
+}
+
+fn word_size() -> usize {
+    core::mem::size_of::<usize>()
+}
+
+fn stack_base(stack_top: usize, words_len: usize) -> Result<usize, LinuxErrno> {
+    stack_top
+        .checked_sub(
+            words_len
+                .checked_mul(word_size())
+                .ok_or(LinuxErrno::Inval)?,
+        )
+        .ok_or(LinuxErrno::Inval)
+}
+
+pub fn parse_musl_initial_stack(
+    stack_top: usize,
+    words: &[usize],
+) -> Result<MuslStartupFrame, LinuxErrno> {
+    if stack_top == 0 || words.is_empty() {
+        return Err(LinuxErrno::Inval);
+    }
+    let argc = words[0];
+    if argc > MAX_STARTUP_ARGS {
+        return Err(LinuxErrno::Inval);
+    }
+    let argv_end = 1usize.checked_add(argc).ok_or(LinuxErrno::Inval)?;
+    if argv_end >= words.len() || words[argv_end] != 0 {
+        return Err(LinuxErrno::Inval);
+    }
+
+    let mut argv = [0usize; MAX_STARTUP_ARGS];
+    let mut idx = 0usize;
+    while idx < argc {
+        argv[idx] = words[1 + idx];
+        idx += 1;
+    }
+
+    let env_start = argv_end + 1;
+    let mut env_end = env_start;
+    while env_end < words.len() && words[env_end] != 0 {
+        env_end += 1;
+    }
+    if env_end >= words.len() {
+        return Err(LinuxErrno::Inval);
+    }
+    let envc = env_end - env_start;
+    if envc > MAX_STARTUP_ENVP {
+        return Err(LinuxErrno::Inval);
+    }
+    let mut envp = [0usize; MAX_STARTUP_ENVP];
+    idx = 0;
+    while idx < envc {
+        envp[idx] = words[env_start + idx];
+        idx += 1;
+    }
+
+    let aux_start = env_end + 1;
+    let mut auxv = [AuxVectorEntry { key: 0, value: 0 }; MAX_STARTUP_AUXV];
+    let mut auxc = 0usize;
+    let mut cursor = aux_start;
+    loop {
+        if cursor + 1 >= words.len() {
+            return Err(LinuxErrno::Inval);
+        }
+        let key = words[cursor];
+        let value = words[cursor + 1];
+        if key == AUXV_AT_NULL {
+            break;
+        }
+        if auxc >= MAX_STARTUP_AUXV {
+            return Err(LinuxErrno::Inval);
+        }
+        auxv[auxc] = AuxVectorEntry { key, value };
+        auxc += 1;
+        cursor += 2;
+    }
+
+    let base = stack_base(stack_top, words.len())?;
+    let info = StartupBootstrapInfo {
+        stack_top,
+        argc,
+        argv_ptr: base + word_size(),
+        envp_ptr: base + env_start * word_size(),
+        auxv_ptr: base + aux_start * word_size(),
+    };
+    Ok(MuslStartupFrame {
+        info,
+        argv,
+        envp,
+        auxv,
+        envc,
+        auxc,
+    })
+}
+
 pub fn startup_hook(info: StartupBootstrapInfo) -> Result<StartupBootstrapInfo, LinuxErrno> {
-    if info.stack_top == 0 {
+    if info.stack_top == 0 || info.argv_ptr == 0 || info.envp_ptr == 0 || info.auxv_ptr == 0 {
+        return Err(LinuxErrno::Inval);
+    }
+    if info.argc > MAX_STARTUP_ARGS
+        || info.argv_ptr >= info.stack_top
+        || info.envp_ptr >= info.stack_top
+        || info.auxv_ptr >= info.stack_top
+    {
+        return Err(LinuxErrno::Inval);
+    }
+    if !(info.argv_ptr <= info.envp_ptr && info.envp_ptr <= info.auxv_ptr) {
         return Err(LinuxErrno::Inval);
     }
     Ok(info)
+}
+
+pub fn prepare_musl_startup(
+    stack_top: usize,
+    words: &[usize],
+) -> Result<MuslStartupFrame, LinuxErrno> {
+    let frame = parse_musl_initial_stack(stack_top, words)?;
+    startup_hook(frame.info)?;
+    Ok(frame)
+}
+
+pub fn run_musl_startup(
+    stack_top: usize,
+    words: &[usize],
+    main: fn(usize, usize, usize, usize) -> i32,
+) -> Result<MuslStartupOutcome, LinuxErrno> {
+    let frame = prepare_musl_startup(stack_top, words)?;
+    let main_return = main(
+        frame.info.argc,
+        frame.info.argv_ptr,
+        frame.info.envp_ptr,
+        frame.info.auxv_ptr,
+    );
+    Ok(MuslStartupOutcome {
+        info: frame.info,
+        envc: frame.envc,
+        auxc: frame.auxc,
+        main_return,
+    })
 }
 
 pub struct LinuxSysdepsContext<'a, B: VfsBackend> {
@@ -374,21 +537,73 @@ mod tests {
     fn startup_hook_validates_nonzero_stack_top() {
         let ok = startup_hook(StartupBootstrapInfo {
             stack_top: 0x1000,
+            argc: 1,
             argv_ptr: 1,
             envp_ptr: 2,
             auxv_ptr: 3,
         })
         .expect("startup");
         assert_eq!(ok.stack_top, 0x1000);
+        assert_eq!(ok.argc, 1);
         assert_eq!(
             startup_hook(StartupBootstrapInfo {
                 stack_top: 0,
+                argc: 1,
                 argv_ptr: 1,
                 envp_ptr: 2,
                 auxv_ptr: 3
             }),
             Err(LinuxErrno::Inval)
         );
+    }
+
+    #[test]
+    fn prepare_musl_startup_parses_initial_stack_layout() {
+        let words = [2, 0x1110, 0x2220, 0, 0x3330, 0, 6, 0x4440, AUXV_AT_NULL, 0];
+        let stack_top = 0x9000;
+        let frame = prepare_musl_startup(stack_top, &words).expect("startup frame");
+        let base = stack_top - words.len() * core::mem::size_of::<usize>();
+        assert_eq!(frame.info.argc, 2);
+        assert_eq!(frame.info.argv_ptr, base + core::mem::size_of::<usize>());
+        assert_eq!(
+            frame.info.envp_ptr,
+            base + 4 * core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            frame.info.auxv_ptr,
+            base + 6 * core::mem::size_of::<usize>()
+        );
+        assert_eq!(&frame.argv[..2], &[0x1110, 0x2220]);
+        assert_eq!(&frame.envp[..1], &[0x3330]);
+        assert_eq!(
+            frame.auxv[0],
+            AuxVectorEntry {
+                key: 6,
+                value: 0x4440
+            }
+        );
+        assert_eq!(frame.envc, 1);
+        assert_eq!(frame.auxc, 1);
+    }
+
+    #[test]
+    fn run_musl_startup_invokes_main_with_prepared_vectors() {
+        fn fake_main(argc: usize, argv_ptr: usize, envp_ptr: usize, auxv_ptr: usize) -> i32 {
+            argc as i32 + ((argv_ptr < envp_ptr && envp_ptr <= auxv_ptr) as i32)
+        }
+
+        let words = [1, 0x1110, 0, 0x3330, 0, AUXV_AT_NULL, 0];
+        let outcome = run_musl_startup(0x8000, &words, fake_main).expect("startup run");
+        assert_eq!(outcome.info.argc, 1);
+        assert_eq!(outcome.envc, 1);
+        assert_eq!(outcome.auxc, 0);
+        assert_eq!(outcome.main_return, 2);
+    }
+
+    #[test]
+    fn prepare_musl_startup_rejects_missing_argv_terminator() {
+        let words = [1, 0x1110, 0x2220, 0x3330];
+        assert_eq!(prepare_musl_startup(0x7000, &words), Err(LinuxErrno::Inval));
     }
 
     #[test]
