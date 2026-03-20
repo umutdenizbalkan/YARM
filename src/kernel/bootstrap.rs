@@ -1,6 +1,6 @@
 use super::capabilities::{CapId, CapObject, CapRights, Capability, CapabilitySpace};
 use super::ipc::{Endpoint, EndpointMode, Message};
-use super::scheduler::{CpuId, SmpScheduler};
+use super::scheduler::{CpuId, SmpScheduler, TaskPriority};
 use super::smp::{CrossCpuWorkQueue, WorkItem, MAX_CROSS_CPU_WORK};
 use super::syscall::{dispatch as dispatch_syscall, SyscallError};
 use super::task::{
@@ -1065,9 +1065,7 @@ impl KernelState {
         tcb.restart.available_at = TickInstant(now_tick.0.saturating_add(tcb.restart.backoff.0));
         tcb.restart.token = None;
         tcb.status = TaskStatus::Runnable;
-        self.scheduler
-            .enqueue(tid)
-            .map_err(|_| KernelError::SchedulerFull)
+        self.enqueue_task(tid).map(|_| ())
     }
 
     pub fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError> {
@@ -1105,9 +1103,34 @@ impl KernelState {
         self.scheduler.online_cpu_count()
     }
 
-    pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
+    fn task_priority(&self, tid: u64) -> Result<TaskPriority, KernelError> {
+        if tid == 0 {
+            return Ok(TaskPriority::Normal);
+        }
+        let class = self
+            .tcbs
+            .iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .map(|tcb| tcb.class)
+            .ok_or(KernelError::TaskMissing)?;
+        Ok(match class {
+            TaskClass::SystemServer => TaskPriority::High,
+            TaskClass::Driver | TaskClass::App => TaskPriority::Normal,
+        })
+    }
+
+    fn enqueue_task(&mut self, tid: u64) -> Result<CpuId, KernelError> {
+        let priority = self.task_priority(tid)?;
         self.scheduler
-            .enqueue_on(cpu, tid)
+            .enqueue_balanced(tid, priority)
+            .map_err(|_| KernelError::SchedulerFull)
+    }
+
+    pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
+        let priority = self.task_priority(tid)?;
+        self.scheduler
+            .enqueue_on_with_priority(cpu, tid, priority)
             .map_err(|_| KernelError::SchedulerFull)
     }
 
@@ -1562,16 +1585,17 @@ impl KernelState {
     fn wake_joiners_for(&mut self, target_tid: u64) -> Result<u32, KernelError> {
         let mut woken = 0u32;
         for idx in 0..self.tcbs.len() {
-            let Some(tcb) = self.tcbs[idx].as_mut() else {
-                continue;
+            let wake_tid = {
+                let Some(tcb) = self.tcbs[idx].as_mut() else {
+                    continue;
+                };
+                if tcb.status != TaskStatus::Blocked(WaitReason::Join(target_tid)) {
+                    continue;
+                }
+                tcb.status = TaskStatus::Runnable;
+                tcb.tid.0
             };
-            if tcb.status != TaskStatus::Blocked(WaitReason::Join(target_tid)) {
-                continue;
-            }
-            tcb.status = TaskStatus::Runnable;
-            self.scheduler
-                .enqueue(tcb.tid.0)
-                .map_err(|_| KernelError::SchedulerFull)?;
+            self.enqueue_task(wake_tid)?;
             woken += 1;
         }
         Ok(woken)
@@ -1632,9 +1656,7 @@ impl KernelState {
             };
             tcb.status = TaskStatus::Runnable;
         }
-        self.scheduler
-            .enqueue(tid)
-            .map_err(|_| KernelError::SchedulerFull)?;
+        let _ = self.enqueue_task(tid)?;
         Ok(tid)
     }
 
@@ -1673,16 +1695,17 @@ impl KernelState {
             if woken >= max_wake {
                 break;
             }
-            let Some(tcb) = self.tcbs[idx].as_mut() else {
-                continue;
+            let wake_tid = {
+                let Some(tcb) = self.tcbs[idx].as_mut() else {
+                    continue;
+                };
+                if tcb.status != TaskStatus::Blocked(WaitReason::Futex(addr)) {
+                    continue;
+                }
+                tcb.status = TaskStatus::Runnable;
+                tcb.tid.0
             };
-            if tcb.status != TaskStatus::Blocked(WaitReason::Futex(addr)) {
-                continue;
-            }
-            tcb.status = TaskStatus::Runnable;
-            self.scheduler
-                .enqueue(tcb.tid.0)
-                .map_err(|_| KernelError::SchedulerFull)?;
+            self.enqueue_task(wake_tid)?;
             woken += 1;
         }
         Ok(woken)
@@ -1829,21 +1852,21 @@ impl KernelState {
 
     fn wake_waiter_for_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
         if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx].take() {
-            let tcb = self.tcb_mut(waiter_tid.0).ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Runnable;
-            self.scheduler
-                .enqueue(waiter_tid.0)
-                .map_err(|_| KernelError::SchedulerFull)?;
+            {
+                let tcb = self.tcb_mut(waiter_tid.0).ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Runnable;
+            }
+            self.enqueue_task(waiter_tid.0)?;
         }
         Ok(())
     }
 
     fn wake_sender_waiter(&mut self, sender_tid: ThreadId) -> Result<(), KernelError> {
-        let tcb = self.tcb_mut(sender_tid.0).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Runnable;
-        self.scheduler
-            .enqueue(sender_tid.0)
-            .map_err(|_| KernelError::SchedulerFull)
+        {
+            let tcb = self.tcb_mut(sender_tid.0).ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Runnable;
+        }
+        self.enqueue_task(sender_tid.0).map(|_| ())
     }
 
     fn resolve_endpoint_index(&self, object: CapObject) -> Result<usize, KernelError> {
@@ -2135,7 +2158,8 @@ impl KernelState {
             .ok_or(KernelError::WrongObject)?
             .mode();
         let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx];
-        let inline_sync_handoff = endpoint_mode == EndpointMode::Synchronous && waiter_tid.is_some();
+        let inline_sync_handoff =
+            endpoint_mode == EndpointMode::Synchronous && waiter_tid.is_some();
         if !inline_sync_handoff {
             self.ipc.telemetry.fastpath_attempts =
                 self.ipc.telemetry.fastpath_attempts.saturating_add(1);
@@ -3952,13 +3976,16 @@ mod tests {
         let iova_cap = state.create_iova_space_cap().expect("iova");
 
         let first_bundle = state
-            .delegate_driver_bundle_checked(110, DriverBundlePlan::standard(
-                ThreadId(111),
-                14,
-                mem_cap,
-                iova_cap,
-                crate::kernel::vm::PAGE_SIZE * 4,
-            ))
+            .delegate_driver_bundle_checked(
+                110,
+                DriverBundlePlan::standard(
+                    ThreadId(111),
+                    14,
+                    mem_cap,
+                    iova_cap,
+                    crate::kernel::vm::PAGE_SIZE * 4,
+                ),
+            )
             .expect("first bundle");
         state
             .validate_driver_bundle_live(111, first_bundle)
@@ -3984,13 +4011,16 @@ mod tests {
         let iova_cap2 = state.create_iova_space_cap().expect("iova2");
 
         let second_bundle = state
-            .delegate_driver_bundle_checked(110, DriverBundlePlan::standard(
-                ThreadId(111),
-                14,
-                mem_cap,
-                iova_cap2,
-                crate::kernel::vm::PAGE_SIZE * 4,
-            ))
+            .delegate_driver_bundle_checked(
+                110,
+                DriverBundlePlan::standard(
+                    ThreadId(111),
+                    14,
+                    mem_cap,
+                    iova_cap2,
+                    crate::kernel::vm::PAGE_SIZE * 4,
+                ),
+            )
             .expect("second bundle");
         state
             .validate_driver_bundle_live(111, second_bundle)
