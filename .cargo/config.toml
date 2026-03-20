@@ -1,8 +1,11 @@
 [alias]
 build-x86-none = "build --target targets/x86_64-yarm-none.json"
 check-x86-none = "check --target targets/x86_64-yarm-none.json"
+build-aarch64-none = "build --target aarch64-unknown-none --no-default-features --bin kernel_boot --bin init_server"
+check-aarch64-none = "check --target aarch64-unknown-none --no-default-features --bin kernel_boot --bin init_server"
 
 # Use scripts/build-x86_64-none-bootstrap.sh for build-std custom-target builds.
 
 [env]
 YARM_X86_64_NONE_TARGET = "targets/x86_64-yarm-none.json"
+YARM_AARCH64_NONE_TARGET = "aarch64-unknown-none"
