@@ -17,8 +17,8 @@ mod tests {
         dhcp.grant_lease(false);
         tcpip.route_packet(true);
         dns.resolve(false);
-        socket.open();
-        socket.close();
+        let fd = socket.open(2, 1, 0).expect("open");
+        socket.close(fd).expect("close");
 
         assert_eq!(netmgr.stats().links_up, 1);
         assert_eq!(dhcp.stats().leases_granted, 1);
@@ -38,14 +38,14 @@ mod tests {
         netmgr.mark_link(true);
         dhcp.grant_lease(false);
         tcpip.route_packet(true);
-        socket.open();
+        let fd = socket.open(2, 1, 0).expect("open");
 
         netmgr.mark_link(false);
         tcpip.route_packet(false);
         dhcp.grant_lease(true);
         netmgr.mark_link(true);
         tcpip.route_packet(true);
-        socket.close();
+        socket.close(fd).expect("close");
 
         assert_eq!(netmgr.stats().links_up, 2);
         assert_eq!(netmgr.stats().links_down, 1);

@@ -1,8 +1,16 @@
-use super::{LinuxErrno, LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP};
+use super::{LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, LinuxErrno};
 use crate::kernel::bootstrap::KernelState;
 use crate::kernel::capabilities::CapId;
+use crate::kernel::ipc::Message;
+use crate::kernel::proc_proto::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
+use crate::kernel::process_manager::ProcessService;
+use crate::kernel::vfs::{
+    CloseRequest, OpenAtRequest, ReadWriteRequest, VfsBackend, close_message, openat_message,
+    read_message, write_message,
+};
 use crate::kernel::vm::PAGE_SIZE;
-use core::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use crate::services::common::service::FsService;
+use crate::services::network::socket::service::SocketAdapterService;
 
 /// Minimal sysdeps status used while porting musl to x86_64-unknown-none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,16 +62,200 @@ pub struct StartupBootstrapInfo {
     pub auxv_ptr: usize,
 }
 
-static CLOCK_TICKS_NS: AtomicU64 = AtomicU64::new(0);
-static FUTEX_ADDR: AtomicUsize = AtomicUsize::new(0);
-static FUTEX_WAITERS: AtomicUsize = AtomicUsize::new(0);
-
 /// Placeholder startup hook for crt0/`__libc_start_main` integration wiring.
 pub fn startup_hook(info: StartupBootstrapInfo) -> Result<StartupBootstrapInfo, LinuxErrno> {
     if info.stack_top == 0 {
         return Err(LinuxErrno::Inval);
     }
     Ok(info)
+}
+
+pub struct LinuxSysdepsContext<'a, B: VfsBackend> {
+    pub kernel: &'a mut KernelState,
+    pub proc_service: &'a mut ProcessService,
+    pub vfs_service: &'a mut FsService<B>,
+    pub socket_service: &'a mut SocketAdapterService,
+}
+
+impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
+    pub fn new(
+        kernel: &'a mut KernelState,
+        proc_service: &'a mut ProcessService,
+        vfs_service: &'a mut FsService<B>,
+        socket_service: &'a mut SocketAdapterService,
+    ) -> Self {
+        Self {
+            kernel,
+            proc_service,
+            vfs_service,
+            socket_service,
+        }
+    }
+
+    fn decode_u64(reply: Message) -> Result<usize, LinuxErrno> {
+        if reply.as_slice().len() < 8 {
+            return Err(LinuxErrno::Inval);
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&reply.as_slice()[..8]);
+        usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| LinuxErrno::Inval)
+    }
+
+    pub fn clock_gettime_hook(&mut self) -> Result<u64, LinuxErrno> {
+        Ok(self
+            .kernel
+            .timer
+            .current_ticks()
+            .0
+            .saturating_mul(1_000_000))
+    }
+
+    pub fn nanosleep_hook(&mut self, nanos: u64) -> Result<(), LinuxErrno> {
+        if nanos == 0 {
+            return Ok(());
+        }
+        let ticks = nanos.saturating_add(999_999) / 1_000_000;
+        for _ in 0..ticks {
+            self.kernel.timer.tick();
+        }
+        Ok(())
+    }
+
+    pub fn getpid_hook(&mut self) -> Result<u64, LinuxErrno> {
+        let tid = self
+            .kernel
+            .scheduler
+            .current_tid()
+            .ok_or(LinuxErrno::NoSys)?;
+        let reply = self
+            .proc_service
+            .handle(
+                Message::with_header(0, PROC_OP_GETPID, 0, None, &tid.to_le_bytes())
+                    .map_err(|_| LinuxErrno::Inval)?,
+            )
+            .map_err(|_| LinuxErrno::Inval)?;
+        Ok(Self::decode_u64(reply)? as u64)
+    }
+
+    pub fn getppid_hook(&mut self) -> Result<u64, LinuxErrno> {
+        let tid = self
+            .kernel
+            .scheduler
+            .current_tid()
+            .ok_or(LinuxErrno::NoSys)?;
+        let reply = self
+            .proc_service
+            .handle(
+                Message::with_header(0, PROC_OP_GETPPID, 0, None, &tid.to_le_bytes())
+                    .map_err(|_| LinuxErrno::Inval)?,
+            )
+            .map_err(|_| LinuxErrno::Inval)?;
+        Ok(Self::decode_u64(reply)? as u64)
+    }
+
+    pub fn exit_hook(&mut self, code: u64) -> Result<(), LinuxErrno> {
+        self.proc_service
+            .handle(
+                Message::with_header(0, PROC_OP_EXIT, 0, None, &code.to_le_bytes())
+                    .map_err(|_| LinuxErrno::Inval)?,
+            )
+            .map_err(|_| LinuxErrno::Inval)?;
+        Ok(())
+    }
+
+    pub fn openat_hook(
+        &mut self,
+        path_ptr: usize,
+        flags: u32,
+        mode: u32,
+    ) -> Result<i32, LinuxErrno> {
+        let reply = self
+            .vfs_service
+            .handle(
+                openat_message(OpenAtRequest {
+                    dirfd: 0,
+                    path_ptr: path_ptr as u64,
+                    flags: flags as u64,
+                    mode: mode as u64,
+                })
+                .map_err(|_| LinuxErrno::Inval)?,
+            )
+            .map_err(|_| LinuxErrno::Inval)?;
+        i32::try_from(Self::decode_u64(reply)?).map_err(|_| LinuxErrno::Inval)
+    }
+
+    pub fn socket_hook(
+        &mut self,
+        domain: i32,
+        sock_type: i32,
+        protocol: i32,
+    ) -> Result<i32, LinuxErrno> {
+        self.socket_service
+            .open(domain, sock_type, protocol)
+            .map_err(|_| LinuxErrno::Inval)
+    }
+
+    pub fn read_hook(
+        &mut self,
+        fd: i32,
+        buf_ptr: usize,
+        buf_len: usize,
+    ) -> Result<usize, LinuxErrno> {
+        if self.socket_service.is_socket_fd(fd) {
+            return self
+                .socket_service
+                .read(fd, buf_len)
+                .map_err(|_| LinuxErrno::Inval);
+        }
+        let reply = self
+            .vfs_service
+            .handle(
+                read_message(ReadWriteRequest {
+                    fd: fd as u64,
+                    buf_ptr: buf_ptr as u64,
+                    len: buf_len as u64,
+                })
+                .map_err(|_| LinuxErrno::Inval)?,
+            )
+            .map_err(|_| LinuxErrno::Inval)?;
+        Self::decode_u64(reply)
+    }
+
+    pub fn write_hook(
+        &mut self,
+        fd: i32,
+        buf_ptr: usize,
+        buf_len: usize,
+    ) -> Result<usize, LinuxErrno> {
+        if self.socket_service.is_socket_fd(fd) {
+            return self
+                .socket_service
+                .write(fd, buf_len)
+                .map_err(|_| LinuxErrno::Inval);
+        }
+        let reply = self
+            .vfs_service
+            .handle(
+                write_message(ReadWriteRequest {
+                    fd: fd as u64,
+                    buf_ptr: buf_ptr as u64,
+                    len: buf_len as u64,
+                })
+                .map_err(|_| LinuxErrno::Inval)?,
+            )
+            .map_err(|_| LinuxErrno::Inval)?;
+        Self::decode_u64(reply)
+    }
+
+    pub fn close_hook(&mut self, fd: i32) -> Result<(), LinuxErrno> {
+        if self.socket_service.is_socket_fd(fd) {
+            return self.socket_service.close(fd).map_err(|_| LinuxErrno::Inval);
+        }
+        self.vfs_service
+            .handle(close_message(CloseRequest { fd: fd as u64 }).map_err(|_| LinuxErrno::Inval)?)
+            .map_err(|_| LinuxErrno::Inval)?;
+        Ok(())
+    }
 }
 
 pub fn mmap_hook(
@@ -113,19 +305,6 @@ pub fn brk_hook(
         .map_err(Into::into)
 }
 
-/// Monotonic bootstrap clock used before timer-service plumbing lands.
-pub fn clock_gettime_hook() -> Result<u64, LinuxErrno> {
-    Ok(CLOCK_TICKS_NS.fetch_add(1_000_000, Ordering::Relaxed) + 1_000_000)
-}
-
-pub fn nanosleep_hook(nanos: u64) -> Result<(), LinuxErrno> {
-    if nanos == 0 {
-        return Ok(());
-    }
-    CLOCK_TICKS_NS.fetch_add(nanos, Ordering::Relaxed);
-    Ok(())
-}
-
 pub fn clone_thread_hook(
     kernel: &mut KernelState,
     parent_tid: u64,
@@ -157,14 +336,9 @@ pub fn futex_wait_hook(
     expected: u32,
     observed: u32,
 ) -> Result<bool, LinuxErrno> {
-    let waited = kernel
+    kernel
         .futex_wait_current(addr, expected, observed)
-        .map_err(LinuxErrno::from)?;
-    if waited {
-        FUTEX_ADDR.store(addr, Ordering::Relaxed);
-        FUTEX_WAITERS.fetch_add(1, Ordering::Relaxed);
-    }
-    Ok(waited)
+        .map_err(LinuxErrno::from)
 }
 
 pub fn futex_wake_hook(
@@ -172,108 +346,7 @@ pub fn futex_wake_hook(
     addr: usize,
     max_wake: u32,
 ) -> Result<u32, LinuxErrno> {
-    let woken = kernel
-        .futex_wake(addr, max_wake)
-        .map_err(LinuxErrno::from)?;
-    if woken > 0 && FUTEX_ADDR.load(Ordering::Relaxed) == addr {
-        FUTEX_WAITERS.fetch_sub(woken as usize, Ordering::Relaxed);
-        if FUTEX_WAITERS.load(Ordering::Relaxed) == 0 {
-            FUTEX_ADDR.store(0, Ordering::Relaxed);
-        }
-    }
-    Ok(woken)
-}
-
-static FD_TABLE: [AtomicU8; 64] = [const { AtomicU8::new(0) }; 64];
-static NEXT_FD: AtomicI32 = AtomicI32::new(3);
-
-const FD_KIND_FREE: u8 = 0;
-const FD_KIND_FILE: u8 = 1;
-const FD_KIND_SOCKET: u8 = 2;
-
-fn allocate_fd(kind: u8) -> Result<i32, LinuxErrno> {
-    if kind == FD_KIND_FREE {
-        return Err(LinuxErrno::Inval);
-    }
-
-    for _ in 0..FD_TABLE.len() {
-        let candidate = NEXT_FD.fetch_add(1, Ordering::Relaxed);
-        let idx = (candidate as usize) % FD_TABLE.len();
-        if idx < 3 {
-            continue;
-        }
-        if FD_TABLE[idx]
-            .compare_exchange(FD_KIND_FREE, kind, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Ok(idx as i32);
-        }
-    }
-
-    Err(LinuxErrno::NoMem)
-}
-
-fn fd_kind(fd: i32) -> Result<u8, LinuxErrno> {
-    if fd < 0 {
-        return Err(LinuxErrno::Inval);
-    }
-    let idx = fd as usize;
-    if idx >= FD_TABLE.len() {
-        return Err(LinuxErrno::Inval);
-    }
-    let kind = FD_TABLE[idx].load(Ordering::Relaxed);
-    if kind == FD_KIND_FREE {
-        return Err(LinuxErrno::Inval);
-    }
-    Ok(kind)
-}
-
-pub fn openat_hook(path_len: usize, _flags: u32, _mode: u32) -> Result<i32, LinuxErrno> {
-    if path_len == 0 {
-        return Err(LinuxErrno::Inval);
-    }
-    allocate_fd(FD_KIND_FILE)
-}
-
-pub fn socket_hook(domain: i32, sock_type: i32, _protocol: i32) -> Result<i32, LinuxErrno> {
-    if domain <= 0 || sock_type <= 0 {
-        return Err(LinuxErrno::Inval);
-    }
-    allocate_fd(FD_KIND_SOCKET)
-}
-
-pub fn read_hook(fd: i32, buf_len: usize) -> Result<usize, LinuxErrno> {
-    let kind = fd_kind(fd)?;
-    if buf_len == 0 {
-        return Ok(0);
-    }
-    if kind == FD_KIND_FILE || kind == FD_KIND_SOCKET {
-        return Ok(buf_len.min(64));
-    }
-    Err(LinuxErrno::Inval)
-}
-
-pub fn write_hook(fd: i32, buf_len: usize) -> Result<usize, LinuxErrno> {
-    let kind = fd_kind(fd)?;
-    if kind == FD_KIND_FILE || kind == FD_KIND_SOCKET {
-        return Ok(buf_len);
-    }
-    Err(LinuxErrno::Inval)
-}
-
-pub fn close_hook(fd: i32) -> Result<(), LinuxErrno> {
-    if fd < 0 {
-        return Err(LinuxErrno::Inval);
-    }
-    let idx = fd as usize;
-    if idx >= FD_TABLE.len() {
-        return Err(LinuxErrno::Inval);
-    }
-    let prior = FD_TABLE[idx].swap(FD_KIND_FREE, Ordering::AcqRel);
-    if prior == FD_KIND_FREE {
-        return Err(LinuxErrno::Inval);
-    }
-    Ok(())
+    kernel.futex_wake(addr, max_wake).map_err(LinuxErrno::from)
 }
 
 pub const fn default_mmap_len() -> usize {
@@ -284,6 +357,9 @@ pub const fn default_mmap_len() -> usize {
 mod tests {
     use super::*;
     use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::vfs::InMemoryBackend;
+    use crate::services::common::service::FsService;
 
     #[test]
     fn memory_syscall_numbers_match_linux_compat_contract() {
@@ -309,18 +385,22 @@ mod tests {
                 stack_top: 0,
                 argv_ptr: 1,
                 envp_ptr: 2,
-                auxv_ptr: 3,
+                auxv_ptr: 3
             }),
             Err(LinuxErrno::Inval)
         );
     }
 
     #[test]
-    fn clock_and_sleep_hooks_are_callable() {
-        let before = clock_gettime_hook().expect("clock before");
-        nanosleep_hook(1_000_000).expect("sleep");
-        let after = clock_gettime_hook().expect("clock after");
-        assert!(after >= before);
+    fn service_backed_clock_hooks_use_kernel_timer() {
+        let mut kernel = Bootstrap::init().expect("init");
+        let mut proc = ProcessService::new();
+        let mut vfs = FsService::with_backend(InMemoryBackend::new());
+        let mut socket = SocketAdapterService::new();
+        let mut ctx = LinuxSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
+        assert_eq!(ctx.clock_gettime_hook().expect("before"), 0);
+        ctx.nanosleep_hook(2_500_000).expect("sleep");
+        assert_eq!(ctx.clock_gettime_hook().expect("after"), 3_000_000);
     }
 
     #[test]
@@ -332,7 +412,7 @@ mod tests {
                 tid: 7,
                 entry: 0x4000,
                 asid: Some(asid),
-                class: crate::kernel::task::TaskClass::App,
+                class: TaskClass::App,
             })
             .expect("parent");
         let tid =
@@ -343,15 +423,8 @@ mod tests {
             get_tls_hook(&kernel, tid).expect("get tls"),
             Some(0xFEED_CAFE)
         );
-
-        assert_eq!(
-            futex_wait_hook(&mut kernel, 0x1000, 3, 4).expect("mismatch"),
-            false
-        );
-        assert_eq!(
-            futex_wait_hook(&mut kernel, 0x1000, 3, 3).expect("wait"),
-            true
-        );
+        assert!(!futex_wait_hook(&mut kernel, 0x1000, 3, 4).expect("mismatch"));
+        assert!(futex_wait_hook(&mut kernel, 0x1000, 3, 3).expect("wait"));
         assert_eq!(futex_wake_hook(&mut kernel, 0x1000, 1).expect("wake"), 1);
         assert_eq!(
             futex_wake_hook(&mut kernel, 0x1000, 1).expect("wake empty"),
@@ -363,7 +436,6 @@ mod tests {
     fn memory_hooks_route_into_kernel_vm_helpers() {
         let mut state = Bootstrap::init().expect("init");
         let (_asid, aspace_cap) = state.create_user_address_space().expect("aspace");
-
         let addr = mmap_hook(
             &mut state,
             aspace_cap,
@@ -373,7 +445,6 @@ mod tests {
         )
         .expect("mmap");
         assert_eq!(addr, 0x8000);
-
         mprotect_hook(
             &mut state,
             aspace_cap,
@@ -382,7 +453,6 @@ mod tests {
             super::super::PROT_READ,
         )
         .expect("mprotect");
-
         munmap_hook(&mut state, aspace_cap, 0x8000, default_mmap_len()).expect("munmap");
     }
 
@@ -390,7 +460,6 @@ mod tests {
     fn brk_hook_routes_into_kernel_brk_helper() {
         let mut state = Bootstrap::init().expect("init");
         let (_asid, aspace_cap) = state.create_user_address_space().expect("aspace");
-
         let grown = brk_hook(
             &mut state,
             0,
@@ -414,17 +483,40 @@ mod tests {
     }
 
     #[test]
-    fn io_facade_hooks_allocate_and_release_file_and_socket_fds() {
-        let fd = openat_hook(8, 0, 0).expect("open");
-        assert!(fd >= 3);
-        assert_eq!(read_hook(fd, 128).expect("read"), 64);
-        assert_eq!(write_hook(fd, 11).expect("write"), 11);
-        close_hook(fd).expect("close");
-        assert_eq!(read_hook(fd, 1), Err(LinuxErrno::Inval));
+    fn service_backed_proc_and_vfs_hooks_roundtrip_real_services() {
+        let mut kernel = Bootstrap::init().expect("init");
+        kernel.register_task(41).expect("task");
+        kernel.scheduler.enqueue(41).expect("enqueue");
+        kernel.dispatch_next_task().expect("dispatch");
 
-        let sock = socket_hook(2, 1, 0).expect("socket");
-        assert!(sock >= 3);
-        assert_eq!(write_hook(sock, 32).expect("sock write"), 32);
-        close_hook(sock).expect("sock close");
+        let mut proc = ProcessService::new();
+        let mut vfs = FsService::with_backend(InMemoryBackend::new());
+        let mut socket = SocketAdapterService::new();
+        let mut ctx = LinuxSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
+
+        assert_eq!(ctx.getpid_hook().expect("getpid"), 41);
+        assert_eq!(ctx.getppid_hook().expect("getppid"), 40);
+        ctx.exit_hook(0).expect("exit");
+
+        let fd = ctx.openat_hook(0x1000, 0, 0).expect("open");
+        assert!(fd >= 3);
+        assert_eq!(ctx.read_hook(fd, 0x2000, 128).expect("read"), 128);
+        assert_eq!(ctx.write_hook(fd, 0x2000, 11).expect("write"), 11);
+        ctx.close_hook(fd).expect("close");
+        assert_eq!(ctx.read_hook(fd, 0x2000, 1), Err(LinuxErrno::Inval));
+    }
+
+    #[test]
+    fn socket_hooks_route_through_socket_service() {
+        let mut kernel = Bootstrap::init().expect("init");
+        let mut proc = ProcessService::new();
+        let mut vfs = FsService::with_backend(InMemoryBackend::new());
+        let mut socket = SocketAdapterService::new();
+        let mut ctx = LinuxSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
+        let fd = ctx.socket_hook(2, 1, 0).expect("socket");
+        assert!(fd >= 1000);
+        assert_eq!(ctx.read_hook(fd, 0, 128).expect("read"), 64);
+        assert_eq!(ctx.write_hook(fd, 0, 32).expect("write"), 32);
+        ctx.close_hook(fd).expect("close");
     }
 }
