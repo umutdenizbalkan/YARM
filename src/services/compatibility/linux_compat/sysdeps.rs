@@ -4,6 +4,7 @@ use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 use crate::kernel::proc_proto::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
 use crate::kernel::process_manager::ProcessService;
+use crate::kernel::task::ThreadGroupId;
 use crate::kernel::vfs::{
     CloseRequest, OpenAtRequest, ReadWriteRequest, VfsBackend, close_message, openat_message,
     read_message, write_message,
@@ -108,7 +109,7 @@ pub struct MuslThreadState {
     pub thread_pointer: usize,
     pub stack_top: usize,
     pub entry: usize,
-    pub thread_group_id: u64,
+    pub thread_group_id: ThreadGroupId,
     pub tls_restore_pending: bool,
 }
 
@@ -716,7 +717,7 @@ mod tests {
         assert_eq!(state.thread_pointer, 0x2000_0000);
         assert_eq!(state.stack_top, 0x8000_0010);
         assert_eq!(state.entry, 0x4010);
-        assert_eq!(state.thread_group_id, 7);
+        assert_eq!(state.thread_group_id, ThreadGroupId(7));
         assert!(state.tls_restore_pending);
     }
 

@@ -1,5 +1,4 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Tick(pub u64);
+use super::time::Tick;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timer {

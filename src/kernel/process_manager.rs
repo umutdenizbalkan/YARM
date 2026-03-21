@@ -1,8 +1,9 @@
 use super::ipc::Message;
 use super::proc_proto::{
-    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply, PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID,
-    PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
+    PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
+    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply,
 };
+use super::task::ThreadGroupId;
 
 const MAX_PROCESSES: usize = 64;
 const MAX_THREADS: usize = 128;
@@ -114,7 +115,7 @@ struct ProcessRecord {
 struct ThreadIdentityRecord {
     tid: u64,
     pid: u64,
-    thread_group_id: u64,
+    thread_group_id: ThreadGroupId,
 }
 
 #[derive(Debug)]
@@ -192,7 +193,7 @@ impl ProcessManagerLite {
         &mut self,
         pid: u64,
         tid: u64,
-        thread_group_id: u64,
+        thread_group_id: ThreadGroupId,
     ) -> Result<(), ProcessManagerError> {
         if self
             .threads
@@ -250,7 +251,7 @@ impl ProcessManagerLite {
                 exited: false,
                 exit_code: 0,
             });
-            self.register_thread_identity(pid, pid, pid)?;
+            self.register_thread_identity(pid, pid, ThreadGroupId(pid))?;
             Ok(pid)
         } else {
             Err(ProcessManagerError::TableFull)
@@ -576,11 +577,12 @@ mod tests {
     fn process_manager_tracks_explicit_thread_identities() {
         let mut pm = ProcessManagerLite::new();
         let pid = pm.alloc_process(1).expect("pid");
-        pm.register_thread_identity(pid, 2000, pid).expect("thread");
+        pm.register_thread_identity(pid, 2000, ThreadGroupId(pid))
+            .expect("thread");
         assert_eq!(pm.process_id_for_tid(2000), pid);
         assert_eq!(
             pm.thread_identity(2000).expect("identity").thread_group_id,
-            pid
+            ThreadGroupId(pid)
         );
     }
 }

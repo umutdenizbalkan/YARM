@@ -14,6 +14,7 @@ pub mod sim;
 pub mod smp;
 pub mod syscall;
 pub mod task;
+pub mod time;
 pub mod timer;
 pub mod topology;
 pub mod trap;

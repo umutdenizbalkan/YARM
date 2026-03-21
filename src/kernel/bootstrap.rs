@@ -5,8 +5,9 @@ use super::smp::{CrossCpuWorkQueue, MAX_CROSS_CPU_WORK, WorkItem};
 use super::syscall::{SyscallError, dispatch as dispatch_syscall};
 use super::task::{
     RestartState, RestartToken, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock,
-    ThreadDetachState, TickDuration, TickInstant, UserRegisterContext, WaitReason,
+    ThreadDetachState, ThreadGroupId, UserRegisterContext, WaitReason,
 };
+use super::time::{TickDuration, TickInstant};
 use super::timer::Timer;
 use super::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
 use super::trapframe::TrapFrame;
@@ -302,10 +303,7 @@ impl Bootstrap {
 
         let mut cspace = CapabilitySpace::default();
         cspace
-            .mint(Capability::new(
-                CapObject::Kernel,
-                &[CapRights::Schedule],
-            ))
+            .mint(Capability::new(CapObject::Kernel, &[CapRights::Schedule]))
             .map_err(|_| KernelError::CapabilityFull)?;
 
         let mut state = KernelState {
@@ -326,7 +324,7 @@ impl Bootstrap {
                 telemetry: IpcPathTelemetry::default(),
             },
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
-            tcbs: [None; MAX_TASKS],
+            tcbs: [const { None }; MAX_TASKS],
             memory: MemorySubsystem {
                 task_mem: [None; MAX_TASK_MEM_ENTRIES],
                 memory_objects: [None; MAX_MEMORY_OBJECTS],
@@ -1378,7 +1376,7 @@ impl KernelState {
         if let Some(slot) = self.tcbs.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(ThreadControlBlock {
                 tid: ThreadId(tid),
-                thread_group_id: tid,
+                thread_group_id: ThreadGroupId(tid),
                 class,
                 status: TaskStatus::Runnable,
                 asid: None,
@@ -1424,7 +1422,7 @@ impl KernelState {
         Err(KernelError::TaskTableFull)
     }
 
-    pub fn thread_group_id(&self, tid: u64) -> Option<u64> {
+    pub fn thread_group_id(&self, tid: u64) -> Option<ThreadGroupId> {
         self.tcbs
             .iter()
             .flatten()
@@ -1440,11 +1438,11 @@ impl KernelState {
             .and_then(|tcb| tcb.tls_base)
     }
     pub fn process_id(&self, tid: u64) -> Option<u64> {
-        self.thread_group_id(tid)
+        self.thread_group_id(tid).map(|group_id| group_id.0)
     }
 
     pub fn is_thread_group_leader(&self, tid: u64) -> bool {
-        self.process_id(tid) == Some(tid)
+        self.thread_group_id(tid) == Some(ThreadGroupId(tid))
     }
 
     pub fn thread_user_context(&self, tid: u64) -> Option<UserRegisterContext> {
@@ -1514,7 +1512,7 @@ impl KernelState {
             }
             if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
                 let joiner = self.tcb_mut(joiner_tid).ok_or(KernelError::TaskMissing)?;
-                joiner.status = TaskStatus::Blocked(WaitReason::Join(tid));
+                joiner.status = TaskStatus::Blocked(WaitReason::Join(ThreadId(tid)));
                 let _ = self.scheduler.block_current();
                 self.dispatch_next_task()?;
             }
@@ -1588,7 +1586,7 @@ impl KernelState {
                 let Some(tcb) = self.tcbs[idx].as_mut() else {
                     continue;
                 };
-                if tcb.status != TaskStatus::Blocked(WaitReason::Join(target_tid)) {
+                if tcb.status != TaskStatus::Blocked(WaitReason::Join(ThreadId(target_tid))) {
                     continue;
                 }
                 tcb.status = TaskStatus::Runnable;
@@ -1636,7 +1634,7 @@ impl KernelState {
             .iter()
             .flatten()
             .find(|tcb| tcb.tid.0 == parent_tid)
-            .copied()
+            .cloned()
             .ok_or(KernelError::TaskMissing)?;
         let tid = self.allocate_thread_id()?;
         self.register_task_with_class(tid, parent.class)?;
@@ -1676,7 +1674,7 @@ impl KernelState {
             .current_tid()
             .ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Blocked(WaitReason::Futex(addr));
+        tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
         let _ = self.scheduler.block_current();
         self.dispatch_next_task()?;
         Ok(true)
@@ -1698,7 +1696,7 @@ impl KernelState {
                 let Some(tcb) = self.tcbs[idx].as_mut() else {
                     continue;
                 };
-                if tcb.status != TaskStatus::Blocked(WaitReason::Futex(addr)) {
+                if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {
                     continue;
                 }
                 tcb.status = TaskStatus::Runnable;
@@ -1716,7 +1714,7 @@ impl KernelState {
     ) -> Result<SpawnedUserTask, KernelError> {
         self.register_task_with_class(spec.tid, spec.class)?;
         if let Some(tcb) = self.tcb_mut(spec.tid) {
-            tcb.thread_group_id = spec.tid;
+            tcb.thread_group_id = ThreadGroupId(spec.tid);
             tcb.asid = spec.asid;
             tcb.user_entry = Some(spec.entry);
             tcb.user_context.instruction_ptr = spec.entry;
@@ -3734,8 +3732,8 @@ mod tests {
         for _ in 0..8 {
             state
                 .submit_cross_cpu_work(WorkItem::Reschedule {
-                target_cpu: CpuId(1),
-            })
+                    target_cpu: CpuId(1),
+                })
                 .expect("work");
         }
         state
@@ -4209,7 +4207,7 @@ mod tests {
             .spawn_user_thread(7, 0xDEAD_BEEF, 0x8000_0000, 0x4010)
             .expect("thread");
 
-        assert_eq!(state.thread_group_id(tid), Some(7));
+        assert_eq!(state.thread_group_id(tid), Some(ThreadGroupId(7)));
         assert_eq!(state.task_asid(tid), Some(asid));
         assert_eq!(state.thread_tls_base(tid), Some(0xDEAD_BEEF));
         assert_eq!(state.task_status(tid), Some(TaskStatus::Runnable));
@@ -4227,7 +4225,7 @@ mod tests {
         assert!(state.futex_wait_current(0x1000, 3, 3).expect("wait"));
         assert_eq!(
             state.task_status(1),
-            Some(TaskStatus::Blocked(WaitReason::Futex(0x1000)))
+            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x1000))))
         );
         assert_eq!(state.futex_wake(0x1000, 1).expect("wake"), 1);
         assert_eq!(state.task_status(1), Some(TaskStatus::Runnable));
@@ -4370,7 +4368,7 @@ mod tests {
         assert_eq!(state.join_thread(30).expect("join pending"), None);
         assert_eq!(
             state.task_status(joiner),
-            Some(TaskStatus::Blocked(WaitReason::Join(30)))
+            Some(TaskStatus::Blocked(WaitReason::Join(ThreadId(30))))
         );
 
         state.exit_task(30, 5).expect("exit leader");
@@ -4396,7 +4394,7 @@ mod tests {
         assert!(state.futex_wait_current(0x2000, 1, 1).expect("wait"));
         assert_eq!(
             state.task_status(41),
-            Some(TaskStatus::Blocked(WaitReason::Futex(0x2000)))
+            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x2000))))
         );
         state.exit_task(40, 0).expect("owner exit");
         assert_eq!(state.task_status(41), Some(TaskStatus::Runnable));
