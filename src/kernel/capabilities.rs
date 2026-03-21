@@ -1,3 +1,5 @@
+use core::fmt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CapId(pub u64);
 
@@ -52,31 +54,26 @@ pub enum CapObject {
     AddressSpace { asid: u16 },
     IovaSpace { id: u64 },
     MemoryObject { id: u64 },
-    DmaRegion { id: u64, offset: usize, len: usize },
+    DmaRegion { id: u64, offset: u64, len: u64 },
     Notification { index: usize, generation: u64 },
     Irq { line: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capability {
-    pub name: &'static str,
     pub object: CapObject,
     rights_bits: u8,
 }
 
 impl Capability {
-    pub const fn new(name: &'static str, object: CapObject, rights: &[CapRights]) -> Self {
+    pub const fn new(object: CapObject, rights: &[CapRights]) -> Self {
         let mut idx = 0;
         let mut bits = 0;
         while idx < rights.len() {
             bits |= rights[idx].bit();
             idx += 1;
         }
-        Self {
-            name,
-            object,
-            rights_bits: bits,
-        }
+        Self { object, rights_bits: bits }
     }
 
     pub const fn has_right(self, right: CapRights) -> bool {
@@ -93,6 +90,19 @@ pub enum CapabilityDeriveError {
     ParentMissing,
     RightsEscalation,
     SpaceFull,
+    NotFound,
+}
+
+impl fmt::Display for CapabilityDeriveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::ParentMissing => "parent capability does not exist",
+            Self::RightsEscalation => "derived capability would escalate rights",
+            Self::SpaceFull => "capability space is full",
+            Self::NotFound => "capability does not exist",
+        };
+        f.write_str(message)
+    }
 }
 
 const MAX_CAPABILITIES: usize = 128;
@@ -128,7 +138,7 @@ impl Default for CapabilitySpace {
 }
 
 impl CapabilitySpace {
-    pub fn mint(&mut self, capability: Capability) -> Result<CapId, Capability> {
+    pub fn mint(&mut self, capability: Capability) -> Result<CapId, CapabilityDeriveError> {
         self.mint_with_parent(capability, None)
     }
 
@@ -136,78 +146,76 @@ impl CapabilitySpace {
         &mut self,
         capability: Capability,
         parent: Option<CapId>,
-    ) -> Result<CapId, Capability> {
-        let mut index = 0usize;
-        while index < MAX_CAPABILITIES {
+    ) -> Result<CapId, CapabilityDeriveError> {
+        for index in 0..MAX_CAPABILITIES {
             let slot = &mut self.slots[index];
             if slot.entry.is_none() {
                 let id = CapId::new(index, slot.generation);
                 slot.entry = Some(CapEntry { capability, parent });
                 return Ok(id);
             }
-            index += 1;
         }
-        Err(capability)
+        Err(CapabilityDeriveError::SpaceFull)
     }
 
     pub fn mint_derived(
         &mut self,
         parent: CapId,
-        name: &'static str,
         rights: &[CapRights],
     ) -> Result<CapId, CapabilityDeriveError> {
         let parent_cap = self
             .get(parent)
             .ok_or(CapabilityDeriveError::ParentMissing)?;
-        let derived = Capability::new(name, parent_cap.object, rights);
+        let derived = Capability::new(parent_cap.object, rights);
         if (derived.rights_bits() & !parent_cap.rights_bits()) != 0 {
             return Err(CapabilityDeriveError::RightsEscalation);
         }
 
         self.mint_with_parent(derived, Some(parent))
-            .map_err(|_| CapabilityDeriveError::SpaceFull)
     }
 
-    pub fn revoke(&mut self, id: CapId) -> bool {
+    pub fn revoke(&mut self, id: CapId) -> Result<(), CapabilityDeriveError> {
         if self.get(id).is_none() {
-            return false;
+            return Err(CapabilityDeriveError::NotFound);
         }
 
-        // Recursive revoke for derived lineage.
-        let mut stack = [None; MAX_CAPABILITIES];
-        let mut stack_len = 0usize;
-        stack[stack_len] = Some(id);
-        stack_len += 1;
+        let mut marked = [false; MAX_CAPABILITIES];
+        marked[id.index()] = true;
 
-        while stack_len > 0 {
-            stack_len -= 1;
-            let Some(current) = stack[stack_len] else {
+        loop {
+            let mut changed = false;
+            for idx in 0..MAX_CAPABILITIES {
+                if marked[idx] {
+                    continue;
+                }
+                if let Some(entry) = self.slots[idx].entry
+                    && let Some(parent) = entry.parent
+                    && parent.index() < MAX_CAPABILITIES
+                    && marked[parent.index()]
+                    && self.slots[parent.index()].generation == parent.generation()
+                {
+                    marked[idx] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for (idx, is_marked) in marked.iter().copied().enumerate() {
+            if !is_marked {
                 continue;
-            };
-
-            let mut idx = 0usize;
-            while idx < MAX_CAPABILITIES {
-                if let Some(entry) = self.slots[idx].entry {
-                    if entry.parent == Some(current) && stack_len < MAX_CAPABILITIES {
-                        let child_id = CapId::new(idx, self.slots[idx].generation);
-                        stack[stack_len] = Some(child_id);
-                        stack_len += 1;
-                    }
-                }
-                idx += 1;
             }
-
-            let slot_idx = current.index();
-            if slot_idx < MAX_CAPABILITIES {
-                let slot = &mut self.slots[slot_idx];
-                if slot.entry.is_some() && slot.generation == current.generation() {
-                    slot.entry = None;
-                    slot.generation = slot.generation.wrapping_add(1).max(1);
-                }
+            let slot = &mut self.slots[idx];
+            if slot.entry.is_some() {
+                slot.entry = None;
+                let next = slot.generation.wrapping_add(1);
+                slot.generation = if next == 0 { 1 } else { next };
             }
         }
 
-        true
+        Ok(())
     }
 
     pub fn get(&self, id: CapId) -> Option<Capability> {
@@ -237,7 +245,6 @@ mod tests {
     fn minted_capability_can_be_checked() {
         let mut cspace = CapabilitySpace::default();
         let cap = Capability::new(
-            "ipc_endpoint",
             CapObject::Endpoint {
                 index: 0,
                 generation: 1,
@@ -263,7 +270,6 @@ mod tests {
         let mut cspace = CapabilitySpace::default();
         let parent = cspace
             .mint(Capability::new(
-                "ep_full",
                 CapObject::Endpoint {
                     index: 0,
                     generation: 1,
@@ -273,17 +279,17 @@ mod tests {
             .expect("mint parent");
 
         let child = cspace
-            .mint_derived(parent, "ep_send_only", &[CapRights::Send])
+            .mint_derived(parent, &[CapRights::Send])
             .expect("derive subset rights");
         assert!(cspace.has_right(child, CapRights::Send));
         assert!(!cspace.has_right(child, CapRights::Receive));
 
         assert_eq!(
-            cspace.mint_derived(parent, "bad", &[CapRights::Schedule]),
+            cspace.mint_derived(parent, &[CapRights::Schedule]),
             Err(CapabilityDeriveError::RightsEscalation)
         );
 
-        assert!(cspace.revoke(parent));
+        assert_eq!(cspace.revoke(parent), Ok(()));
         assert!(cspace.get(parent).is_none());
         assert!(cspace.get(child).is_none());
     }
@@ -293,22 +299,22 @@ mod tests {
         let mut cspace = CapabilitySpace::default();
         for _ in 0..MAX_CAPABILITIES {
             let _ = cspace
-                .mint(Capability::new("x", CapObject::Kernel, &[CapRights::Read]))
+                .mint(Capability::new(CapObject::Kernel, &[CapRights::Read]))
                 .expect("room");
         }
-        let cap = Capability::new("overflow", CapObject::Kernel, &[CapRights::Write]);
-        assert_eq!(cspace.mint(cap), Err(cap));
+        let cap = Capability::new(CapObject::Kernel, &[CapRights::Write]);
+        assert_eq!(cspace.mint(cap), Err(CapabilityDeriveError::SpaceFull));
     }
 
     #[test]
     fn mint_derived_on_revoked_parent_returns_parent_missing() {
         let mut cspace = CapabilitySpace::default();
         let parent = cspace
-            .mint(Capability::new("p", CapObject::Kernel, &[CapRights::Read]))
+            .mint(Capability::new(CapObject::Kernel, &[CapRights::Read]))
             .expect("mint");
-        assert!(cspace.revoke(parent));
+        assert_eq!(cspace.revoke(parent), Ok(()));
         assert_eq!(
-            cspace.mint_derived(parent, "c", &[CapRights::Read]),
+            cspace.mint_derived(parent, &[CapRights::Read]),
             Err(CapabilityDeriveError::ParentMissing)
         );
     }
@@ -317,22 +323,25 @@ mod tests {
     fn revoke_missing_and_double_revoke_behave() {
         let mut cspace = CapabilitySpace::default();
         let id = cspace
-            .mint(Capability::new("p", CapObject::Kernel, &[CapRights::Read]))
+            .mint(Capability::new(CapObject::Kernel, &[CapRights::Read]))
             .expect("mint");
-        assert!(cspace.revoke(id));
-        assert!(!cspace.revoke(id));
-        assert!(!cspace.revoke(CapId(u64::MAX)));
+        assert_eq!(cspace.revoke(id), Ok(()));
+        assert_eq!(cspace.revoke(id), Err(CapabilityDeriveError::NotFound));
+        assert_eq!(
+            cspace.revoke(CapId(u64::MAX)),
+            Err(CapabilityDeriveError::NotFound)
+        );
     }
 
     #[test]
     fn revoked_slot_reuse_produces_fresh_cap_id() {
         let mut cspace = CapabilitySpace::default();
         let first = cspace
-            .mint(Capability::new("a", CapObject::Kernel, &[CapRights::Read]))
+            .mint(Capability::new(CapObject::Kernel, &[CapRights::Read]))
             .expect("mint");
-        assert!(cspace.revoke(first));
+        assert_eq!(cspace.revoke(first), Ok(()));
         let second = cspace
-            .mint(Capability::new("b", CapObject::Kernel, &[CapRights::Read]))
+            .mint(Capability::new(CapObject::Kernel, &[CapRights::Read]))
             .expect("mint2");
         assert_ne!(first, second);
         assert!(cspace.get(first).is_none());

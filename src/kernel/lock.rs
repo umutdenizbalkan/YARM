@@ -25,6 +25,7 @@ impl<T> SpinLock<T> {
         }
     }
 
+    #[must_use = "if unused, the lock is immediately released when the guard is dropped"]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         // Use compare_exchange_weak in the retry loop: weak CAS may spuriously
         // fail on LL/SC architectures, but is typically cheaper than strong CAS.
@@ -36,6 +37,7 @@ impl<T> SpinLock<T> {
             while self.held.load(Ordering::Relaxed) {
                 spin_loop();
             }
+            spin_loop();
         }
         SpinLockGuard {
             lock: self,

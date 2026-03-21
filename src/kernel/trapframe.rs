@@ -6,7 +6,7 @@ use crate::kernel::task::UserRegisterContext;
 /// `usize` is intentionally used here because these fields mirror machine
 /// register width at the ABI boundary.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrapFrame {
     pub syscall_num: usize,
     pub args: [usize; syscall_abi::TRAPFRAME_ARG_REGS],
@@ -14,9 +14,17 @@ pub struct TrapFrame {
     pub ret1: usize,
     pub ret2: usize,
     pub error: usize,
+    pub saved_pc: usize,
+    pub saved_sp: usize,
 }
 
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
+const _: () = assert!(core::mem::offset_of!(TrapFrame, syscall_num) == 0);
+const _: () = assert!(core::mem::offset_of!(TrapFrame, args) == core::mem::size_of::<usize>());
+const _: () = assert!(
+    core::mem::offset_of!(TrapFrame, ret0)
+        == core::mem::size_of::<usize>() * (1 + syscall_abi::TRAPFRAME_ARG_REGS)
+);
 
 impl TrapFrame {
     pub const fn new(syscall_num: usize, args: [usize; syscall_abi::TRAPFRAME_ARG_REGS]) -> Self {
@@ -27,13 +35,19 @@ impl TrapFrame {
             ret1: 0,
             ret2: 0,
             error: 0,
+            saved_pc: 0,
+            saved_sp: 0,
         }
     }
 
-    pub fn set_ok(&mut self, ret0: usize, ret1: usize) {
+    pub const fn zeroed() -> Self {
+        Self::new(0, [0; syscall_abi::TRAPFRAME_ARG_REGS])
+    }
+
+    pub fn set_ok(&mut self, ret0: usize, ret1: usize, ret2: usize) {
         self.ret0 = ret0;
         self.ret1 = ret1;
-        self.ret2 = 0;
+        self.ret2 = ret2;
         self.error = 0;
     }
 
@@ -51,15 +65,27 @@ impl TrapFrame {
     }
 
     pub fn capture_user_context(&self) -> UserRegisterContext {
+        let instruction_ptr = if self.ret0 != 0 {
+            self.ret0
+        } else {
+            self.saved_pc
+        };
+        let stack_ptr = if self.ret1 != 0 {
+            self.ret1
+        } else {
+            self.saved_sp
+        };
         UserRegisterContext {
-            instruction_ptr: self.ret0,
-            stack_ptr: self.ret1,
+            instruction_ptr,
+            stack_ptr,
             arg0: self.args[0],
             arg1: self.args[1],
         }
     }
 
     pub fn apply_user_context(&mut self, context: UserRegisterContext) {
+        self.saved_pc = context.instruction_ptr;
+        self.saved_sp = context.stack_ptr;
         self.ret0 = context.instruction_ptr;
         self.ret1 = context.stack_ptr;
         self.args[0] = context.arg0;
@@ -88,23 +114,26 @@ mod tests {
         assert_eq!(frame.error, 0);
         assert!(!frame.is_error());
         assert_eq!(frame.error_code(), None);
+        assert_eq!(frame.saved_pc, 0);
+        assert_eq!(frame.saved_sp, 0);
     }
 
     #[test]
     fn set_ok_clears_error() {
         let mut frame = TrapFrame::new(0, [0; 6]);
         frame.set_err(7);
-        frame.set_ok(11, 22);
+        frame.set_ok(11, 22, 33);
         assert_eq!(frame.ret0, 11);
         assert_eq!(frame.ret1, 22);
-        assert_eq!(frame.ret2, 0);
+        assert_eq!(frame.ret2, 33);
         assert_eq!(frame.error, 0);
     }
 
     #[test]
     fn capture_and_apply_user_context_roundtrip() {
         let mut frame = TrapFrame::new(0, [5, 6, 0, 0, 0, 0]);
-        frame.set_ok(0x4000, 0x8000);
+        frame.saved_pc = 0x4000;
+        frame.saved_sp = 0x8000;
         let ctx = frame.capture_user_context();
         assert_eq!(ctx.instruction_ptr, 0x4000);
         assert_eq!(ctx.stack_ptr, 0x8000);
@@ -117,8 +146,8 @@ mod tests {
             arg0: 7,
             arg1: 8,
         });
-        assert_eq!(frame.ret0, 0x5000);
-        assert_eq!(frame.ret1, 0x9000);
+        assert_eq!(frame.saved_pc, 0x5000);
+        assert_eq!(frame.saved_sp, 0x9000);
         assert_eq!(frame.args[0], 7);
         assert_eq!(frame.args[1], 8);
     }
@@ -126,7 +155,7 @@ mod tests {
     #[test]
     fn set_err_clears_returns_and_sets_error_code() {
         let mut frame = TrapFrame::new(0, [0; 6]);
-        frame.set_ok(55, 66);
+        frame.set_ok(55, 66, 77);
         frame.set_err(9);
         assert_eq!(frame.ret0, 0);
         assert_eq!(frame.ret1, 0);

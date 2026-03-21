@@ -13,6 +13,84 @@ pub const PROC_OP_SPAWN_V2: u16 = 4;
 pub const PROC_OP_WAITPID_V2: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnV2Args {
+    pub parent_pid: u64,
+    pub image_id: u64,
+}
+
+impl SpawnV2Args {
+    pub const VERSION: u16 = PROC_CODEC_V2_VERSION;
+
+    pub const fn new(parent_pid: u64, image_id: u64) -> Self {
+        Self {
+            parent_pid,
+            image_id,
+        }
+    }
+
+    pub const fn encode(self) -> [u8; ProcV2Args::ENCODED_LEN] {
+        ProcV2Args::new(self.parent_pid, self.image_id).encode()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        let args = ProcV2Args::decode(payload)?;
+        Ok(Self::new(args.arg0, args.arg1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitPidV2Args {
+    pub caller_pid: u64,
+    pub target_pid: u64,
+}
+
+impl WaitPidV2Args {
+    pub const VERSION: u16 = PROC_CODEC_V2_VERSION;
+
+    pub const fn new(caller_pid: u64, target_pid: u64) -> Self {
+        Self {
+            caller_pid,
+            target_pid,
+        }
+    }
+
+    pub const fn encode(self) -> [u8; ProcV2Args::ENCODED_LEN] {
+        ProcV2Args::new(self.caller_pid, self.target_pid).encode()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        let args = ProcV2Args::decode(payload)?;
+        Ok(Self::new(args.arg0, args.arg1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitPidV2Reply {
+    pub waited_pid: u64,
+    pub exit_code: u64,
+}
+
+impl WaitPidV2Reply {
+    pub const VERSION: u16 = PROC_CODEC_V2_VERSION;
+
+    pub const fn new(waited_pid: u64, exit_code: u64) -> Self {
+        Self {
+            waited_pid,
+            exit_code,
+        }
+    }
+
+    pub const fn encode(self) -> [u8; ProcV2Args::ENCODED_LEN] {
+        ProcV2Args::new(self.waited_pid, self.exit_code).encode()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        let args = ProcV2Args::decode(payload)?;
+        Ok(Self::new(args.arg0, args.arg1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcV2Args {
     pub arg0: u64,
     pub arg1: u64,
@@ -81,7 +159,22 @@ mod tests {
         assert_eq!(PROC_CODEC_V2_VERSION, 2);
         assert_eq!(ProcV2Args::VERSION, PROC_CODEC_V2_VERSION);
         assert_eq!(ProcV2Args::ENCODED_LEN, 16);
+        assert_eq!(SpawnV2Args::VERSION, PROC_CODEC_V2_VERSION);
+        assert_eq!(WaitPidV2Args::VERSION, PROC_CODEC_V2_VERSION);
+        assert_eq!(WaitPidV2Reply::VERSION, PROC_CODEC_V2_VERSION);
         assert_eq!(PROC_OP_SPAWN_V2, 4);
         assert_eq!(PROC_OP_WAITPID_V2, 5);
+    }
+
+    #[test]
+    fn typed_proc_v2_wrappers_roundtrip_via_frozen_codec() {
+        let spawn = SpawnV2Args::new(7, 9);
+        assert_eq!(SpawnV2Args::decode(&spawn.encode()), Ok(spawn));
+
+        let wait = WaitPidV2Args::new(3, 4);
+        assert_eq!(WaitPidV2Args::decode(&wait.encode()), Ok(wait));
+
+        let reply = WaitPidV2Reply::new(4, 255);
+        assert_eq!(WaitPidV2Reply::decode(&reply.encode()), Ok(reply));
     }
 }

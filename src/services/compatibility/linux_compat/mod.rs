@@ -2,7 +2,9 @@ use crate::kernel::bootstrap::{KernelError, KernelState};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 #[cfg(test)]
-use crate::kernel::proc_proto::{PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2, ProcV2Args};
+use crate::kernel::proc_proto::{
+    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply, PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2,
+};
 use crate::kernel::proc_proto::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_SERVER_ABI_VERSION,
 };
@@ -10,6 +12,7 @@ use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
 use crate::kernel::vfs_proto::VFS_CODEC_V1_VERSION;
 use crate::kernel::vfs_proto::{
+    OpenAtArgs, ReadWriteArgs, StatxArgs,
     VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT,
     VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE,
     VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
@@ -146,9 +149,10 @@ impl LinuxServiceBindings {
         let send_cap = self
             .proc_mgr_request_send
             .ok_or(KernelError::InvalidCapability)?;
-        let mut payload = [0u8; 16];
-        payload[..8].copy_from_slice(&arg0.to_le_bytes());
-        payload[8..16].copy_from_slice(&arg1.to_le_bytes());
+        let payload = match opcode {
+            PROC_OP_WAITPID_V2 => WaitPidV2Args::new(arg0, arg1).encode(),
+            _ => SpawnV2Args::new(arg0, arg1).encode(),
+        };
         let msg = Message::with_header(0, opcode, 0, None, &payload)
             .map_err(|_| KernelError::WrongObject)?;
         kernel.ipc_send(send_cap, msg)
@@ -342,7 +346,7 @@ fn pack_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) -
 }
 
 fn pack_statx(dirfd: usize, path_ptr: usize, flags: usize, mask: usize) -> [u8; 32] {
-    pack_vfs4(dirfd, path_ptr, flags, mask)
+    StatxArgs::new(dirfd as u64, path_ptr as u64, flags as u64, mask as u64).encode()
 }
 
 impl KernelState {
@@ -714,7 +718,7 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
     })();
 
     match result {
-        Ok(value) => frame.set_ok(value, 0),
+        Ok(value) => frame.set_ok(value, 0, 0),
         Err(errno) => frame.set_err(errno.code() as usize),
     }
 }
@@ -727,15 +731,15 @@ mod tests {
 
     #[test]
     fn proc_v2_args_codec_roundtrip() {
-        let args = ProcV2Args::new(10, 20);
+        let args = SpawnV2Args::new(10, 20);
         let encoded = args.encode();
-        let decoded = ProcV2Args::decode(&encoded).expect("decode");
+        let decoded = SpawnV2Args::decode(&encoded).expect("decode");
         assert_eq!(decoded, args);
     }
 
     #[test]
     fn proc_v2_codec_golden_vector_is_frozen() {
-        let args = ProcV2Args::new(0x11, 0x22);
+        let args = WaitPidV2Args::new(0x11, 0x22);
         let encoded = args.encode();
         assert_eq!(&encoded[..8], &0x11u64.to_le_bytes());
         assert_eq!(&encoded[8..16], &0x22u64.to_le_bytes());
@@ -743,7 +747,7 @@ mod tests {
 
     #[test]
     fn vfs_v1_codec_golden_vector_is_frozen() {
-        let args = VfsV1Args::new(1, 2, 3, 4);
+        let args = OpenAtArgs::new(1, 2, 3, 4);
         let encoded = args.encode();
         assert_eq!(&encoded[..8], &1u64.to_le_bytes());
         assert_eq!(&encoded[8..16], &2u64.to_le_bytes());
@@ -753,17 +757,17 @@ mod tests {
 
     #[test]
     fn vfs_v1_args_codec_roundtrip() {
-        let args = VfsV1Args::new(1, 2, 3, 4);
+        let args = ReadWriteArgs::new(1, 2, 3);
         let encoded = args.encode();
-        let decoded = VfsV1Args::decode(&encoded).expect("decode");
+        let decoded = ReadWriteArgs::decode(&encoded).expect("decode");
         assert_eq!(decoded, args);
     }
 
     #[test]
     fn codec_fixture_vectors_are_frozen() {
         let fixtures_proc = [
-            (ProcV2Args::new(0, 0), [0u8; 16]),
-            (ProcV2Args::new(1, 2), {
+            (WaitPidV2Reply::new(0, 0), [0u8; 16]),
+            (WaitPidV2Reply::new(1, 2), {
                 let mut b = [0u8; 16];
                 b[..8].copy_from_slice(&1u64.to_le_bytes());
                 b[8..16].copy_from_slice(&2u64.to_le_bytes());
@@ -772,24 +776,24 @@ mod tests {
         ];
         for (args, expected) in fixtures_proc {
             assert_eq!(args.encode(), expected);
-            assert_eq!(ProcV2Args::decode(&expected).expect("decode"), args);
+            assert_eq!(WaitPidV2Reply::decode(&expected).expect("decode"), args);
         }
 
         let fixtures_vfs = [
-            VfsV1Args::new(0, 0, 0, 0),
-            VfsV1Args::new(9, 8, 7, 6),
-            VfsV1Args::new(u64::MAX, 1, 2, 3),
+            OpenAtArgs::new(0, 0, 0, 0),
+            OpenAtArgs::new(9, 8, 7, 6),
+            OpenAtArgs::new(u64::MAX, 1, 2, 3),
         ];
         for args in fixtures_vfs {
             let encoded = args.encode();
-            assert_eq!(VfsV1Args::decode(&encoded).expect("decode"), args);
+            assert_eq!(OpenAtArgs::decode(&encoded).expect("decode"), args);
         }
     }
 
     #[test]
     fn codec_rejects_truncated_payloads() {
-        assert!(ProcV2Args::decode(&[0u8; 15]).is_err());
-        assert!(VfsV1Args::decode(&[0u8; 31]).is_err());
+        assert!(WaitPidV2Args::decode(&[0u8; 15]).is_err());
+        assert!(OpenAtArgs::decode(&[0u8; 31]).is_err());
     }
 
     #[test]
@@ -807,12 +811,12 @@ mod tests {
         let statx = pack_statx(5, 0x2000, 0x4, 0x7FF);
 
         let decode = |payload: [u8; 32]| {
-            let args = VfsV1Args::decode(&payload).expect("decode");
+            let args = StatxArgs::decode(&payload).expect("decode");
             [
-                args.arg0 as usize,
-                args.arg1 as usize,
-                args.arg2 as usize,
-                args.arg3 as usize,
+                args.dirfd as usize,
+                args.path_ptr as usize,
+                args.flags as usize,
+                args.mask_or_buf as usize,
             ]
         };
 
@@ -1199,8 +1203,8 @@ mod tests {
         let req = state.ipc_recv(req_recv).expect("recv").expect("msg");
         assert_eq!(req.opcode, PROC_OP_WAITPID_V2);
         assert_eq!(req.as_slice().len(), 16);
-        let args = ProcV2Args::decode(req.as_slice()).expect("decode");
-        assert_eq!(args, ProcV2Args::new(42, 0x10));
+        let args = WaitPidV2Args::decode(req.as_slice()).expect("decode");
+        assert_eq!(args, WaitPidV2Args::new(42, 0x10));
 
         state
             .ipc_send(

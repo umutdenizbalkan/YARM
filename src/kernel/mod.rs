@@ -15,6 +15,7 @@ pub mod smp;
 pub mod syscall;
 pub mod task;
 pub mod timer;
+pub mod topology;
 pub mod trap;
 pub mod trapframe;
 pub mod vfs;

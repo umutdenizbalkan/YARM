@@ -1,11 +1,12 @@
 use crate::kernel::bootstrap::Bootstrap;
 use crate::kernel::init_server::{
-    CoreServiceGraph, CoreServiceImagePlan, InitFaultHandoff, InitServerLite,
+    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitFaultHandoff, InitServerLite,
 };
 
 pub fn run() {
     let mut kernel = Bootstrap::init().expect("init");
     let mut init = InitServerLite::new();
+    init.set_launch_strategy(CoreLaunchStrategy::SupervisorFirst);
     let graph = CoreServiceGraph {
         init_tid: 1,
         process_manager_tid: 2,
@@ -35,8 +36,11 @@ pub fn run() {
     init.begin_running().expect("running");
 
     crate::yarm_log!(
-        "init.srv scaffold online: phase={:?}, handles={:?}",
+        "init.srv scaffold online: phase={:?}, handles={:?}, present_cpus={}, present_bitmap=0x{:x}, online_cpus={}",
         init.phase(),
-        init.handles()
+        init.handles(),
+        kernel.present_cpu_count(),
+        kernel.present_cpu_bitmap(),
+        kernel.online_cpu_count()
     );
 }

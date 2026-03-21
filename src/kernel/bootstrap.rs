@@ -1,8 +1,8 @@
 use super::capabilities::{CapId, CapObject, CapRights, Capability, CapabilitySpace};
 use super::ipc::{Endpoint, EndpointMode, Message};
-use super::scheduler::{CpuId, SmpScheduler};
-use super::smp::{CrossCpuWorkQueue, WorkItem, MAX_CROSS_CPU_WORK};
-use super::syscall::{dispatch as dispatch_syscall, SyscallError};
+use super::scheduler::{CpuId, SmpScheduler, TaskPriority};
+use super::smp::{CrossCpuWorkQueue, MAX_CROSS_CPU_WORK, WorkItem};
+use super::syscall::{SyscallError, dispatch as dispatch_syscall};
 use super::task::{
     RestartState, RestartToken, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock,
     ThreadDetachState, TickDuration, TickInstant, UserRegisterContext, WaitReason,
@@ -13,7 +13,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
 };
-use crate::arch::platform_layout;
+use crate::arch::{platform_layout, topology};
 use crate::kernel::ipc::ThreadId;
 
 const MAX_ENDPOINTS: usize = 16;
@@ -132,6 +132,25 @@ pub struct DriverBundlePlan {
     pub iova_cap: CapId,
     pub iova_base: usize,
     pub iova_len: usize,
+}
+
+impl DriverBundlePlan {
+    pub const fn standard(
+        server_tid: ThreadId,
+        irq_line: u16,
+        mem_cap: CapId,
+        iova_cap: CapId,
+        iova_base: usize,
+    ) -> Self {
+        Self {
+            server_tid,
+            irq_line,
+            mem_cap,
+            iova_cap,
+            iova_base,
+            iova_len: super::vm::PAGE_SIZE,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +295,7 @@ impl Bootstrap {
             })?;
 
         let mut scheduler = SmpScheduler::default();
+        scheduler.set_present_cpu_bitmap(topology::default_present_cpu_bitmap());
         scheduler
             .enqueue_on(CpuId(platform_layout::BOOTSTRAP_CPU_ID), 0)
             .map_err(|_| KernelError::SchedulerFull)?;
@@ -283,7 +303,6 @@ impl Bootstrap {
         let mut cspace = CapabilitySpace::default();
         cspace
             .mint(Capability::new(
-                "root_scheduler",
                 CapObject::Kernel,
                 &[CapRights::Schedule],
             ))
@@ -509,7 +528,6 @@ impl KernelState {
     pub fn mint_irq_cap(&mut self, line: u16) -> Result<CapId, KernelError> {
         self.cspace
             .mint(Capability::new(
-                "irq",
                 CapObject::Irq { line },
                 &[CapRights::Signal],
             ))
@@ -522,7 +540,6 @@ impl KernelState {
             self.drivers.next_iova_space_id.checked_add(1).unwrap_or(1);
         self.cspace
             .mint(Capability::new(
-                "iova_space",
                 CapObject::IovaSpace { id },
                 &[CapRights::Map],
             ))
@@ -591,8 +608,11 @@ impl KernelState {
 
         self.cspace
             .mint(Capability::new(
-                "dma_region",
-                CapObject::DmaRegion { id, offset, len },
+                CapObject::DmaRegion {
+                    id,
+                    offset: offset as u64,
+                    len: len as u64,
+                },
                 &[CapRights::Map, CapRights::Read, CapRights::Write],
             ))
             .map_err(|_| KernelError::CapabilityFull)
@@ -742,6 +762,36 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
         self.delegate_driver_bundle(plan)
+    }
+
+    pub fn validate_driver_bundle_live(
+        &self,
+        tid: u64,
+        bundle: DriverDelegationBundle,
+    ) -> Result<(), KernelError> {
+        let record = self
+            .drivers
+            .driver_records
+            .iter()
+            .flatten()
+            .find(|record| record.tid == ThreadId(tid))
+            .ok_or(KernelError::TaskMissing)?;
+
+        if record.irq_cap != Some(bundle.irq_cap)
+            || record.dma_cap != Some(bundle.dma_cap)
+            || record.iova_space_cap != Some(bundle.iova_cap)
+        {
+            return Err(KernelError::StaleCapability);
+        }
+
+        if self.cspace.get(bundle.irq_cap).is_none()
+            || self.cspace.get(bundle.dma_cap).is_none()
+            || self.cspace.get(bundle.iova_cap).is_none()
+        {
+            return Err(KernelError::StaleCapability);
+        }
+
+        Ok(())
     }
 
     pub fn configure_driver_dma_window(
@@ -1016,9 +1066,7 @@ impl KernelState {
         tcb.restart.available_at = TickInstant(now_tick.0.saturating_add(tcb.restart.backoff.0));
         tcb.restart.token = None;
         tcb.status = TaskStatus::Runnable;
-        self.scheduler
-            .enqueue(tid)
-            .map_err(|_| KernelError::SchedulerFull)
+        self.enqueue_task(tid).map(|_| ())
     }
 
     pub fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError> {
@@ -1056,9 +1104,42 @@ impl KernelState {
         self.scheduler.online_cpu_count()
     }
 
-    pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
+    pub fn present_cpu_count(&self) -> usize {
+        self.scheduler.present_cpu_count()
+    }
+
+    pub fn present_cpu_bitmap(&self) -> u64 {
+        self.scheduler.present_cpu_bitmap()
+    }
+
+    fn task_priority(&self, tid: u64) -> Result<TaskPriority, KernelError> {
+        if tid == 0 {
+            return Ok(TaskPriority::Normal);
+        }
+        let class = self
+            .tcbs
+            .iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .map(|tcb| tcb.class)
+            .ok_or(KernelError::TaskMissing)?;
+        Ok(match class {
+            TaskClass::SystemServer => TaskPriority::High,
+            TaskClass::Driver | TaskClass::App => TaskPriority::Normal,
+        })
+    }
+
+    fn enqueue_task(&mut self, tid: u64) -> Result<CpuId, KernelError> {
+        let priority = self.task_priority(tid)?;
         self.scheduler
-            .enqueue_on(cpu, tid)
+            .enqueue_balanced(tid, priority)
+            .map_err(|_| KernelError::SchedulerFull)
+    }
+
+    pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
+        let priority = self.task_priority(tid)?;
+        self.scheduler
+            .enqueue_on_with_priority(cpu, tid, priority)
             .map_err(|_| KernelError::SchedulerFull)
     }
 
@@ -1426,21 +1507,21 @@ impl KernelState {
     }
 
     pub fn join_thread(&mut self, tid: u64) -> Result<Option<u64>, KernelError> {
-        let current_tid = self.scheduler.current_tid();
-        if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
-            let joiner_pid = self
-                .process_id(joiner_tid)
-                .ok_or(KernelError::TaskMissing)?;
-            let target_pid = self.process_id(tid).ok_or(KernelError::TaskMissing)?;
-            if joiner_pid != target_pid {
-                return Err(KernelError::WrongObject);
-            }
-        }
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         if tcb.detach_state == ThreadDetachState::Detached {
             return Err(KernelError::WrongObject);
         }
         if tcb.status != TaskStatus::Exited {
+            let current_tid = self.scheduler.current_tid();
+            if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
+                let joiner_pid = self
+                    .process_id(joiner_tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                let target_pid = self.process_id(tid).ok_or(KernelError::TaskMissing)?;
+                if joiner_pid != target_pid {
+                    return Err(KernelError::WrongObject);
+                }
+            }
             if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
                 let joiner = self.tcb_mut(joiner_tid).ok_or(KernelError::TaskMissing)?;
                 joiner.status = TaskStatus::Blocked(WaitReason::Join(tid));
@@ -1513,16 +1594,17 @@ impl KernelState {
     fn wake_joiners_for(&mut self, target_tid: u64) -> Result<u32, KernelError> {
         let mut woken = 0u32;
         for idx in 0..self.tcbs.len() {
-            let Some(tcb) = self.tcbs[idx].as_mut() else {
-                continue;
+            let wake_tid = {
+                let Some(tcb) = self.tcbs[idx].as_mut() else {
+                    continue;
+                };
+                if tcb.status != TaskStatus::Blocked(WaitReason::Join(target_tid)) {
+                    continue;
+                }
+                tcb.status = TaskStatus::Runnable;
+                tcb.tid.0
             };
-            if tcb.status != TaskStatus::Blocked(WaitReason::Join(target_tid)) {
-                continue;
-            }
-            tcb.status = TaskStatus::Runnable;
-            self.scheduler
-                .enqueue(tcb.tid.0)
-                .map_err(|_| KernelError::SchedulerFull)?;
+            self.enqueue_task(wake_tid)?;
             woken += 1;
         }
         Ok(woken)
@@ -1583,9 +1665,7 @@ impl KernelState {
             };
             tcb.status = TaskStatus::Runnable;
         }
-        self.scheduler
-            .enqueue(tid)
-            .map_err(|_| KernelError::SchedulerFull)?;
+        let _ = self.enqueue_task(tid)?;
         Ok(tid)
     }
 
@@ -1624,16 +1704,17 @@ impl KernelState {
             if woken >= max_wake {
                 break;
             }
-            let Some(tcb) = self.tcbs[idx].as_mut() else {
-                continue;
+            let wake_tid = {
+                let Some(tcb) = self.tcbs[idx].as_mut() else {
+                    continue;
+                };
+                if tcb.status != TaskStatus::Blocked(WaitReason::Futex(addr)) {
+                    continue;
+                }
+                tcb.status = TaskStatus::Runnable;
+                tcb.tid.0
             };
-            if tcb.status != TaskStatus::Blocked(WaitReason::Futex(addr)) {
-                continue;
-            }
-            tcb.status = TaskStatus::Runnable;
-            self.scheduler
-                .enqueue(tcb.tid.0)
-                .map_err(|_| KernelError::SchedulerFull)?;
+            self.enqueue_task(wake_tid)?;
             woken += 1;
         }
         Ok(woken)
@@ -1780,21 +1861,21 @@ impl KernelState {
 
     fn wake_waiter_for_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
         if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx].take() {
-            let tcb = self.tcb_mut(waiter_tid.0).ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Runnable;
-            self.scheduler
-                .enqueue(waiter_tid.0)
-                .map_err(|_| KernelError::SchedulerFull)?;
+            {
+                let tcb = self.tcb_mut(waiter_tid.0).ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Runnable;
+            }
+            self.enqueue_task(waiter_tid.0)?;
         }
         Ok(())
     }
 
     fn wake_sender_waiter(&mut self, sender_tid: ThreadId) -> Result<(), KernelError> {
-        let tcb = self.tcb_mut(sender_tid.0).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Runnable;
-        self.scheduler
-            .enqueue(sender_tid.0)
-            .map_err(|_| KernelError::SchedulerFull)
+        {
+            let tcb = self.tcb_mut(sender_tid.0).ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Runnable;
+        }
+        self.enqueue_task(sender_tid.0).map(|_| ())
     }
 
     fn resolve_endpoint_index(&self, object: CapObject) -> Result<usize, KernelError> {
@@ -1871,7 +1952,6 @@ impl KernelState {
         let send_cap = self
             .cspace
             .mint(Capability::new(
-                "endpoint_send",
                 CapObject::Endpoint {
                     index: endpoint_idx,
                     generation: self.ipc.endpoint_generations[endpoint_idx],
@@ -1883,7 +1963,6 @@ impl KernelState {
         let recv_cap = self
             .cspace
             .mint(Capability::new(
-                "endpoint_receive",
                 CapObject::Endpoint {
                     index: endpoint_idx,
                     generation: self.ipc.endpoint_generations[endpoint_idx],
@@ -1922,7 +2001,6 @@ impl KernelState {
         let notification_cap = self
             .cspace
             .mint(Capability::new(
-                "notification",
                 CapObject::Notification {
                     index: notification_idx,
                     generation: self.ipc.notification_generations[notification_idx],
@@ -2022,19 +2100,24 @@ impl KernelState {
 
         if endpoint_mode == EndpointMode::Synchronous {
             if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
-                if self.ipc.endpoint_sender_waiters[endpoint_idx].is_some() {
-                    return Err(KernelError::EndpointQueueFull);
-                }
-                let sender_tid = ThreadId(
-                    self.scheduler
-                        .current_tid()
-                        .ok_or(KernelError::TaskMissing)?,
-                );
-                self.ipc.endpoint_sender_waiters[endpoint_idx] = Some((sender_tid, msg, false));
+                self.ipc.telemetry.fastpath_attempts =
+                    self.ipc.telemetry.fastpath_attempts.saturating_add(1);
+                let endpoint = self
+                    .ipc
+                    .endpoints
+                    .get_mut(endpoint_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(KernelError::WrongObject)?;
+                endpoint
+                    .send(msg)
+                    .map_err(|_| KernelError::EndpointQueueFull)?;
                 self.ipc.telemetry.rendezvous_handoffs =
                     self.ipc.telemetry.rendezvous_handoffs.saturating_add(1);
                 self.wake_waiter_for_endpoint(endpoint_idx)?;
-                let _ = self.switch_to_runnable_tid(waiter_tid)?;
+                if self.switch_to_runnable_tid(waiter_tid)? {
+                    self.ipc.telemetry.fastpath_switches =
+                        self.ipc.telemetry.fastpath_switches.saturating_add(1);
+                }
                 return Ok(());
             }
 
@@ -2073,19 +2156,32 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-        self.ipc.telemetry.fastpath_attempts =
-            self.ipc.telemetry.fastpath_attempts.saturating_add(1);
+        let endpoint_mode = self
+            .ipc
+            .endpoints
+            .get(endpoint_idx)
+            .and_then(Option::as_ref)
+            .ok_or(KernelError::WrongObject)?
+            .mode();
         let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx];
+        let inline_sync_handoff =
+            endpoint_mode == EndpointMode::Synchronous && waiter_tid.is_some();
+        if !inline_sync_handoff {
+            self.ipc.telemetry.fastpath_attempts =
+                self.ipc.telemetry.fastpath_attempts.saturating_add(1);
+        }
 
         self.ipc_send(send_cap, msg)?;
 
-        let switched = if waiter_tid.is_some() {
+        let switched = if inline_sync_handoff {
+            true
+        } else if waiter_tid.is_some() {
             self.switch_to_runnable_tid(waiter_tid.expect("checked is_some"))?
         } else {
             false
         };
 
-        if switched {
+        if switched && !inline_sync_handoff {
             self.ipc.telemetry.fastpath_switches =
                 self.ipc.telemetry.fastpath_switches.saturating_add(1);
         }
@@ -2170,7 +2266,6 @@ impl KernelState {
         let map_cap = self
             .cspace
             .mint(Capability::new(
-                "aspace_map",
                 CapObject::AddressSpace { asid: asid.0 },
                 &[CapRights::Map, CapRights::Read, CapRights::Write],
             ))
@@ -2221,7 +2316,6 @@ impl KernelState {
         let cap = self
             .cspace
             .mint(Capability::new(
-                "memobj_rw",
                 CapObject::MemoryObject { id },
                 &[CapRights::Read, CapRights::Write, CapRights::Map],
             ))
@@ -2696,12 +2790,12 @@ mod tests {
 
         let child = state
             .cspace
-            .mint_derived(send_cap, "send_child", &[CapRights::Send])
+            .mint_derived(send_cap, &[CapRights::Send])
             .expect("derive");
         let msg = Message::new(9, b"ok").expect("msg");
         assert!(state.ipc_send(child, msg).is_ok());
 
-        assert!(state.cspace.revoke(child));
+        assert_eq!(state.cspace.revoke(child), Ok(()));
         let msg2 = Message::new(9, b"no").expect("msg");
         assert_eq!(
             state.ipc_send(child, msg2),
@@ -2817,7 +2911,7 @@ mod tests {
 
         let read_only_cap = state
             .cspace
-            .mint_derived(aspace_map_cap, "aspace_read_only", &[CapRights::Read])
+            .mint_derived(aspace_map_cap, &[CapRights::Read])
             .expect("derive read-only aspace cap");
         let missing_right = state.map_user_page(
             read_only_cap,
@@ -2874,7 +2968,7 @@ mod tests {
 
         let readonly_mem = state
             .cspace
-            .mint_derived(mem_cap, "mem_ro", &[CapRights::Read])
+            .mint_derived(mem_cap, &[CapRights::Read])
             .expect("derive ro");
 
         let res = state.map_user_page_with_caps(
@@ -3285,13 +3379,15 @@ mod tests {
         let (irq_cap, dma_cap) = state.delegate_device_server_caps(plan).expect("delegate");
         assert!(state.cspace.get(irq_cap).is_some());
         assert!(state.cspace.get(dma_cap).is_some());
-        assert!(state
-            .validate_driver_dma_iova(
-                34,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE,
-            )
-            .is_ok());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    34,
+                    crate::kernel::vm::PAGE_SIZE * 8,
+                    crate::kernel::vm::PAGE_SIZE,
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3613,16 +3709,22 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
 
-        assert!(state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
-            .is_ok());
-        assert!(state
-            .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
-            .is_err());
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+                .is_ok()
+        );
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
+                .is_err()
+        );
         assert!(state.mint_dma_region_cap(mem_cap, 0, 0).is_err());
-        assert!(state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-            .is_err());
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -3754,13 +3856,15 @@ mod tests {
         let token = state.exit_task(22, 1).expect("exit");
         state.restart_task(22, token).expect("restart");
 
-        assert!(state
-            .validate_driver_dma_iova(
-                22,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    22,
+                    crate::kernel::vm::PAGE_SIZE * 8,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -3797,22 +3901,26 @@ mod tests {
                 crate::kernel::vm::PAGE_SIZE,
             )
             .expect("window");
-        assert!(state
-            .validate_driver_dma_iova(
-                31,
-                crate::kernel::vm::PAGE_SIZE * 2,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    31,
+                    crate::kernel::vm::PAGE_SIZE * 2,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_ok()
+        );
 
         state.detach_driver_iova_space(31).expect("detach");
-        assert!(state
-            .validate_driver_dma_iova(
-                31,
-                crate::kernel::vm::PAGE_SIZE * 2,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    31,
+                    crate::kernel::vm::PAGE_SIZE * 2,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -3888,22 +3996,28 @@ mod tests {
         let first_bundle = state
             .delegate_driver_bundle_checked(
                 110,
-                DriverBundlePlan {
-                    server_tid: ThreadId(111),
-                    irq_line: 14,
+                DriverBundlePlan::standard(
+                    ThreadId(111),
+                    14,
                     mem_cap,
                     iova_cap,
-                    iova_base: crate::kernel::vm::PAGE_SIZE * 4,
-                    iova_len: crate::kernel::vm::PAGE_SIZE,
-                },
+                    crate::kernel::vm::PAGE_SIZE * 4,
+                ),
             )
             .expect("first bundle");
+        state
+            .validate_driver_bundle_live(111, first_bundle)
+            .expect("bundle live");
         assert!(state.cspace.get(first_bundle.irq_cap).is_some());
         assert!(state.cspace.get(first_bundle.dma_cap).is_some());
 
         let token = state.exit_task(111, 5).expect("exit");
         state.restart_task(111, token).expect("restart");
 
+        assert_eq!(
+            state.validate_driver_bundle_live(111, first_bundle),
+            Err(KernelError::StaleCapability)
+        );
         assert!(state.cspace.get(first_bundle.irq_cap).is_none());
         assert!(state.cspace.get(first_bundle.dma_cap).is_none());
         assert_eq!(
@@ -3917,16 +4031,18 @@ mod tests {
         let second_bundle = state
             .delegate_driver_bundle_checked(
                 110,
-                DriverBundlePlan {
-                    server_tid: ThreadId(111),
-                    irq_line: 14,
+                DriverBundlePlan::standard(
+                    ThreadId(111),
+                    14,
                     mem_cap,
-                    iova_cap: iova_cap2,
-                    iova_base: crate::kernel::vm::PAGE_SIZE * 4,
-                    iova_len: crate::kernel::vm::PAGE_SIZE,
-                },
+                    iova_cap2,
+                    crate::kernel::vm::PAGE_SIZE * 4,
+                ),
             )
             .expect("second bundle");
+        state
+            .validate_driver_bundle_live(111, second_bundle)
+            .expect("bundle live after redelegation");
 
         assert_ne!(first_bundle.irq_cap, second_bundle.irq_cap);
         assert_ne!(first_bundle.dma_cap, second_bundle.dma_cap);
@@ -3952,20 +4068,24 @@ mod tests {
             )
             .expect("window");
 
-        assert!(state
-            .validate_driver_dma_iova(
-                12,
-                crate::kernel::vm::PAGE_SIZE * 4,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok());
-        assert!(state
-            .validate_driver_dma_iova(
-                12,
-                crate::kernel::vm::PAGE_SIZE * 3,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    12,
+                    crate::kernel::vm::PAGE_SIZE * 4,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_ok()
+        );
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    12,
+                    crate::kernel::vm::PAGE_SIZE * 3,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 
     #[test]

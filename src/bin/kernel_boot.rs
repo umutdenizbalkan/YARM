@@ -2,16 +2,22 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 use yarm::kernel::bootstrap::Bootstrap;
 use yarm::kernel::ipc::Message;
-use yarm::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, ProcV2Args};
+use yarm::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
 use yarm::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
-use yarm::kernel::vfs::VfsLiteService;
-use yarm::kernel::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ, VfsV1Args};
+use yarm::kernel::vfs::{
+    OpenAtRequest, ReadWriteRequest, VfsLiteService, openat_message, read_message,
+};
 use yarm::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 
 #[inline]
 fn run() {
-    let _ = Bootstrap::init().expect("kernel init");
-    yarm::yarm_log!("YARM_BOOT_OK");
+    let kernel = Bootstrap::init().expect("kernel init");
+    yarm::yarm_log!(
+        "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
+        kernel.present_cpu_count(),
+        kernel.present_cpu_bitmap(),
+        kernel.online_cpu_count()
+    );
 
     let mut proc = ProcessService::new();
     let spawn = Message::with_header(
@@ -19,7 +25,7 @@ fn run() {
         PROC_OP_SPAWN_V2,
         0,
         None,
-        &ProcV2Args::new(1, 99).encode(),
+        &SpawnV2Args::new(1, 99).encode(),
     )
     .expect("spawn");
     let spawn_rep = proc.handle(spawn).expect("spawn rep");
@@ -31,38 +37,37 @@ fn run() {
         PROC_OP_WAITPID_V2,
         0,
         None,
-        &ProcV2Args::new(1, child.pid).encode(),
+        &WaitPidV2Args::new(1, child.pid).encode(),
     )
     .expect("wait");
     let wait_rep = proc.handle(wait).expect("wait rep");
     let waited = WaitPidV2Result::decode(wait_rep.as_slice()).expect("waited");
 
     let mut vfs = VfsLiteService::with_backend(InitramfsBackend::new(4096));
-    let open = Message::with_header(
-        0,
-        VFS_OP_OPENAT,
-        0,
-        None,
-        &VfsV1Args::new(0, INITRAMFS_BUSYBOX_PATH_PTR, 0, 0).encode(),
-    )
+    let open = openat_message(OpenAtRequest {
+        dirfd: 0,
+        path_ptr: INITRAMFS_BUSYBOX_PATH_PTR,
+        flags: 0,
+        mode: 0,
+    })
     .expect("open");
     let open_rep = vfs.handle_request(open).expect("open rep");
     let mut fd_bytes = [0u8; 8];
     fd_bytes.copy_from_slice(open_rep.as_slice());
     let fd = u64::from_le_bytes(fd_bytes);
-    let read = Message::with_header(
-        0,
-        VFS_OP_READ,
-        0,
-        None,
-        &VfsV1Args::new(fd, 0, 16, 0).encode(),
-    )
+    let read = read_message(ReadWriteRequest {
+        fd,
+        buf_ptr: 0,
+        len: 16,
+    })
     .expect("read");
     let read_rep = vfs.handle_request(read).expect("read rep");
 
     yarm::yarm_log!(
         "YARM_PROC_VFS_OK pid={} exit={} read_opcode={}",
-        child.pid, waited.exit_code, read_rep.opcode
+        child.pid,
+        waited.exit_code,
+        read_rep.opcode
     );
 }
 
