@@ -93,7 +93,7 @@ mod tests {
             scause: EXC_USER_ECALL,
             stval: 0,
         });
-        assert_eq!(event.trap, Trap::Syscall);
+        assert_eq!(event.trap(), Trap::Syscall);
     }
 
     #[test]

@@ -37,6 +37,20 @@ impl PageFlags {
         execute: true,
         user: true,
     };
+
+    pub const USER_RW: Self = Self {
+        read: true,
+        write: true,
+        execute: false,
+        user: true,
+    };
+
+    pub const GUARD: Self = Self {
+        read: false,
+        write: false,
+        execute: false,
+        user: false,
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,19 +141,19 @@ impl AddressSpace {
     }
 
     fn mapping_is_allowed(&self, virt: VirtAddr, flags: PageFlags) -> bool {
-        // Current policy is intentionally strict: user address spaces only accept user pages
-        // below the split; kernel mappings are supervisor-only at/above the split.
+        let is_kernel_only = !flags.user && (flags.read || flags.write || flags.execute);
         match self.kind {
             AddressSpaceKind::Kernel => virt.0 >= KERNEL_SPACE_BASE && !flags.user,
-            AddressSpaceKind::User => virt.0 < KERNEL_SPACE_BASE && flags.user,
+            AddressSpaceKind::User => virt.0 < KERNEL_SPACE_BASE && !is_kernel_only,
         }
     }
 
     pub fn unmap_page(&mut self, virt: VirtAddr) -> Option<Mapping> {
         for slot in &mut self.entries {
-            if slot.as_ref().is_some_and(|entry| entry.virt == virt) {
-                let old = slot.take().expect("checked is_some");
-                return Some(old.mapping);
+            if let Some(entry) = slot.as_ref()
+                && entry.virt == virt
+            {
+                return slot.take().map(|old| old.mapping);
             }
         }
         None
@@ -191,8 +205,7 @@ impl AddressSpaceManager {
     }
 
     fn allocate_asid(&mut self) -> Result<Asid, VmError> {
-        let asid_capacity = (1u32 << vm_layout::ASID_BITS) - 1;
-        for _ in 0..asid_capacity {
+        for _ in 0..MAX_ADDRESS_SPACES {
             if self.next_asid == 0 {
                 self.next_asid = 1;
             }

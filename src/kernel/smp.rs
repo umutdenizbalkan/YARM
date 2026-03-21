@@ -1,22 +1,37 @@
 use super::ipc::ThreadId;
 use super::lock::SpinLock;
 use super::scheduler::CpuId;
-use super::vm::Asid;
+use super::vm::{Asid, VirtAddr};
 
 pub const MAX_CROSS_CPU_WORK: usize = 64;
+const _: () = assert!(MAX_CROSS_CPU_WORK.is_power_of_two());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkItem {
     Reschedule { target_cpu: CpuId },
-    TlbShootdown { target_cpu: CpuId, asid: Asid },
+    TlbShootdown {
+        target_cpu: CpuId,
+        asid: Asid,
+        va_range: Option<(VirtAddr, VirtAddr)>,
+    },
     WakeTask { target_cpu: CpuId, tid: ThreadId },
+}
+
+impl WorkItem {
+    pub const fn target_cpu(&self) -> CpuId {
+        match self {
+            Self::Reschedule { target_cpu }
+            | Self::TlbShootdown { target_cpu, .. }
+            | Self::WakeTask { target_cpu, .. } => *target_cpu,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct WorkQueue {
     ring: [Option<WorkItem>; MAX_CROSS_CPU_WORK],
     head: usize,
-    len: usize,
+    count: usize,
 }
 
 impl WorkQueue {
@@ -24,32 +39,33 @@ impl WorkQueue {
         Self {
             ring: [const { None }; MAX_CROSS_CPU_WORK],
             head: 0,
-            len: 0,
+            count: 0,
         }
     }
 
     fn push(&mut self, item: WorkItem) -> Result<(), WorkItem> {
-        if self.len >= MAX_CROSS_CPU_WORK {
+        if self.count >= MAX_CROSS_CPU_WORK {
             return Err(item);
         }
-        let tail = (self.head + self.len) & (MAX_CROSS_CPU_WORK - 1);
+        let tail = (self.head + self.count) & (MAX_CROSS_CPU_WORK - 1);
         self.ring[tail] = Some(item);
-        self.len += 1;
+        self.count += 1;
         Ok(())
     }
 
     fn pop(&mut self) -> Option<WorkItem> {
-        if self.len == 0 {
+        if self.count == 0 {
             return None;
         }
         let idx = self.head;
         self.head = (self.head + 1) & (MAX_CROSS_CPU_WORK - 1);
-        self.len -= 1;
+        self.count -= 1;
         self.ring[idx].take()
     }
 
-    fn len(&self) -> usize {
-        self.len
+    #[cfg(debug_assertions)]
+    fn item_count(&self) -> usize {
+        self.count
     }
 }
 
@@ -67,10 +83,6 @@ impl Default for CrossCpuWorkQueue {
 }
 
 impl CrossCpuWorkQueue {
-    /// Submits cross-CPU work into the shared ring.
-    ///
-    /// On overflow the original item is returned to the caller so it can retry,
-    /// log, or escalate rather than silently dropping work.
     pub fn submit(&self, item: WorkItem) -> Result<(), WorkItem> {
         self.inner.lock().push(item)
     }
@@ -79,20 +91,15 @@ impl CrossCpuWorkQueue {
         self.inner.lock().pop()
     }
 
-    /// Returns the instantaneous queued-item count.
-    ///
-    /// This value is for diagnostics/telemetry only: producers/consumers may
-    /// change the queue immediately after it is observed.
+    #[cfg(debug_assertions)]
     pub fn pending(&self) -> usize {
-        self.inner.lock().len()
+        self.inner.lock().item_count()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::ipc::ThreadId;
-    use crate::kernel::vm::Asid;
 
     #[test]
     fn cross_cpu_queue_is_fifo() {
@@ -109,6 +116,7 @@ mod tests {
             })
             .expect("queue 2");
 
+        #[cfg(debug_assertions)]
         assert_eq!(queue.pending(), 2);
         assert_eq!(
             queue.take(),
@@ -145,29 +153,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_and_empty_take_behave() {
-        let queue = CrossCpuWorkQueue::default();
-        assert_eq!(queue.pending(), 0);
-        assert_eq!(queue.take(), None);
-
-        queue
-            .submit(WorkItem::TlbShootdown {
-                target_cpu: CpuId(0),
-                asid: Asid(7),
-            })
-            .expect("submit");
-        assert_eq!(queue.pending(), 1);
-        assert!(matches!(
-            queue.take(),
-            Some(WorkItem::TlbShootdown {
-                target_cpu: CpuId(0),
-                asid: Asid(7)
-            })
-        ));
-        assert_eq!(queue.pending(), 0);
-    }
-
-    #[test]
     fn queue_wraparound_preserves_order() {
         let queue = CrossCpuWorkQueue::default();
 
@@ -201,5 +186,17 @@ mod tests {
             );
         }
         assert_eq!(queue.take(), None);
+    }
+
+    #[test]
+    fn tlb_shootdown_carries_optional_range() {
+        let queue = CrossCpuWorkQueue::default();
+        let item = WorkItem::TlbShootdown {
+            target_cpu: CpuId(0),
+            asid: Asid(7),
+            va_range: Some((VirtAddr(0x1000), VirtAddr(0x2000))),
+        };
+        queue.submit(item).expect("submit");
+        assert_eq!(queue.take(), Some(item));
     }
 }

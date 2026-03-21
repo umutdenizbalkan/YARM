@@ -95,7 +95,7 @@ mod tests {
             irq_line: None,
             is_timer_irq: false,
         });
-        assert_eq!(ev.trap, Trap::Syscall);
+        assert_eq!(ev.trap(), Trap::Syscall);
     }
 
     #[test]
@@ -106,7 +106,7 @@ mod tests {
             irq_line: None,
             is_timer_irq: true,
         });
-        assert_eq!(ev.trap, Trap::TimerInterrupt);
+        assert_eq!(ev.trap(), Trap::TimerInterrupt);
     }
 
     #[test]
@@ -117,8 +117,8 @@ mod tests {
             irq_line: Some(44),
             is_timer_irq: false,
         });
-        assert_eq!(ev.trap, Trap::ExternalInterrupt);
-        assert_eq!(ev.irq, Some(44));
+        assert_eq!(ev.trap(), Trap::ExternalInterrupt);
+        assert_eq!(ev.irq(), Some(44));
     }
 
     #[test]
@@ -129,9 +129,9 @@ mod tests {
             irq_line: None,
             is_timer_irq: false,
         });
-        assert_eq!(ev.trap, Trap::PageFault);
+        assert_eq!(ev.trap(), Trap::PageFault);
         assert_eq!(
-            ev.fault,
+            ev.fault(),
             Some(FaultInfo {
                 addr: VirtAddr(0xABCD_4000),
                 access: FaultAccess::Write,

@@ -1184,13 +1184,7 @@ impl KernelState {
         let mut processed = 0usize;
 
         while let Some(item) = self.ipc.cross_cpu_work.take() {
-            let target_cpu = match item {
-                WorkItem::Reschedule { target_cpu }
-                | WorkItem::TlbShootdown { target_cpu, .. }
-                | WorkItem::WakeTask { target_cpu, .. } => target_cpu,
-            };
-
-            if target_cpu == cpu {
+            if item.target_cpu() == cpu {
                 self.apply_cross_cpu_work(item)?;
                 processed += 1;
             } else if deferred_len < MAX_CROSS_CPU_WORK {
@@ -1199,15 +1193,11 @@ impl KernelState {
             }
         }
 
-        let mut idx = 0;
-        while idx < deferred_len {
-            if let Some(item) = deferred[idx] {
-                self.ipc
-                    .cross_cpu_work
-                    .submit(item)
-                    .map_err(|_| KernelError::TaskTableFull)?;
-            }
-            idx += 1;
+        for item in deferred.into_iter().flatten().take(deferred_len) {
+            self.ipc
+                .cross_cpu_work
+                .submit(item)
+                .map_err(|_| KernelError::TaskTableFull)?;
         }
 
         Ok(processed)
@@ -2497,24 +2487,23 @@ impl KernelState {
         event: TrapEvent,
         frame: Option<&mut TrapFrame>,
     ) -> Result<(), TrapHandleError> {
-        if let Some(fault) = event.fault {
+        if let Some(fault) = event.fault() {
             self.record_fault(fault);
         }
 
-        match event.trap {
-            Trap::PageFault => self
+        match event {
+            TrapEvent::PageFault(_) => self
                 .fault_current_task()
                 .map_err(SyscallError::from)
                 .map_err(TrapHandleError::Syscall),
-            Trap::ExternalInterrupt => {
-                if let Some(irq) = event.irq {
-                    self.route_external_irq(irq)
-                        .map_err(SyscallError::from)
-                        .map_err(TrapHandleError::Syscall)?;
-                }
+            TrapEvent::ExternalInterrupt(irq) => {
+                self.route_external_irq(irq)
+                    .map_err(SyscallError::from)
+                    .map_err(TrapHandleError::Syscall)?;
                 self.handle_trap(Trap::ExternalInterrupt, frame)
             }
-            other => self.handle_trap(other, frame),
+            TrapEvent::Syscall => self.handle_trap(Trap::Syscall, frame),
+            TrapEvent::TimerInterrupt => self.handle_trap(Trap::TimerInterrupt, frame),
         }
     }
 }
@@ -2635,6 +2624,7 @@ mod tests {
             .submit_cross_cpu_work(WorkItem::TlbShootdown {
                 target_cpu: CpuId(0),
                 asid: Asid(1),
+                va_range: None,
             })
             .expect("submit tlb");
 
@@ -3744,8 +3734,8 @@ mod tests {
         for _ in 0..8 {
             state
                 .submit_cross_cpu_work(WorkItem::Reschedule {
-                    target_cpu: CpuId(1),
-                })
+                target_cpu: CpuId(1),
+            })
                 .expect("work");
         }
         state

@@ -362,7 +362,7 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
         }
         let ticks = nanos.saturating_add(999_999) / 1_000_000;
         for _ in 0..ticks {
-            self.kernel.timer.tick();
+            let _ = self.kernel.timer.tick_and_check();
         }
         Ok(())
     }

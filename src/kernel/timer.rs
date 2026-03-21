@@ -5,45 +5,27 @@ pub struct Tick(pub u64);
 pub struct Timer {
     current: Tick,
     quantum_ticks: u64,
-    last_preempt_tick: Option<Tick>,
+    ticks_remaining: u64,
 }
 
 impl Timer {
-    /// Timer combines a monotonic tick counter with a simple quantum-based
-    /// preemption decision policy for the current running task.
     pub fn new(quantum_ticks: u64) -> Self {
         let bounded_quantum = quantum_ticks.max(1);
         Self {
             current: Tick(0),
             quantum_ticks: bounded_quantum,
-            last_preempt_tick: None,
+            ticks_remaining: bounded_quantum,
         }
-    }
-
-    pub fn tick(&mut self) -> Tick {
-        self.current.0 = self.current.0.wrapping_add(1);
-        self.current
-    }
-
-    /// Returns `true` at most once per quantum boundary tick.
-    pub fn should_preempt(&mut self) -> bool {
-        let at_boundary = self.current.0 != 0 && self.current.0 % self.quantum_ticks == 0;
-        if !at_boundary {
-            return false;
-        }
-
-        if self.last_preempt_tick == Some(self.current) {
-            return false;
-        }
-
-        self.last_preempt_tick = Some(self.current);
-        true
     }
 
     pub fn tick_and_check(&mut self) -> (Tick, bool) {
-        let tick = self.tick();
-        let should_preempt = self.should_preempt();
-        (tick, should_preempt)
+        self.current.0 = self.current.0.wrapping_add(1);
+        self.ticks_remaining = self.ticks_remaining.saturating_sub(1);
+        let should_preempt = self.ticks_remaining == 0;
+        if should_preempt {
+            self.ticks_remaining = self.quantum_ticks;
+        }
+        (self.current, should_preempt)
     }
 
     pub fn current_ticks(&self) -> Tick {
@@ -63,12 +45,9 @@ mod tests {
     fn timer_preempts_at_quantum_boundary() {
         let mut timer = Timer::new(2);
 
-        assert!(!timer.should_preempt());
-        timer.tick();
-        assert!(!timer.should_preempt());
-        timer.tick();
-        assert!(timer.should_preempt());
-        assert!(!timer.should_preempt());
+        assert_eq!(timer.tick_and_check(), (Tick(1), false));
+        assert_eq!(timer.tick_and_check(), (Tick(2), true));
+        assert_eq!(timer.tick_and_check(), (Tick(3), false));
     }
 
     #[test]
@@ -91,21 +70,16 @@ mod tests {
     #[test]
     fn current_ticks_matches_tick_return() {
         let mut timer = Timer::new(3);
-        let t = timer.tick();
+        let t = timer.tick_and_check().0;
         assert_eq!(timer.current_ticks(), t);
     }
 
     #[test]
     fn multiple_boundaries_preempt_once_per_tick() {
         let mut timer = Timer::new(2);
-        timer.tick();
-        assert!(!timer.should_preempt());
-        timer.tick();
-        assert!(timer.should_preempt());
-        assert!(!timer.should_preempt());
-        timer.tick();
-        assert!(!timer.should_preempt());
-        timer.tick();
-        assert!(timer.should_preempt());
+        assert_eq!(timer.tick_and_check(), (Tick(1), false));
+        assert_eq!(timer.tick_and_check(), (Tick(2), true));
+        assert_eq!(timer.tick_and_check(), (Tick(3), false));
+        assert_eq!(timer.tick_and_check(), (Tick(4), true));
     }
 }

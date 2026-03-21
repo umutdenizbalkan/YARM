@@ -89,7 +89,7 @@ mod tests {
             error_code: 0,
             fault_addr: 0,
         });
-        assert_eq!(ev.trap, Trap::Syscall);
+        assert_eq!(ev.trap(), Trap::Syscall);
     }
 
     #[test]
@@ -99,7 +99,7 @@ mod tests {
             error_code: 0,
             fault_addr: 0,
         });
-        assert_eq!(ev.trap, Trap::TimerInterrupt);
+        assert_eq!(ev.trap(), Trap::TimerInterrupt);
     }
 
     #[test]
@@ -109,8 +109,8 @@ mod tests {
             error_code: 0,
             fault_addr: 0,
         });
-        assert_eq!(ev.trap, Trap::ExternalInterrupt);
-        assert_eq!(ev.irq, Some(7));
+        assert_eq!(ev.trap(), Trap::ExternalInterrupt);
+        assert_eq!(ev.irq(), Some(7));
     }
 
     #[test]
@@ -120,9 +120,9 @@ mod tests {
             error_code: 0b10,
             fault_addr: 0xFACE_1000,
         });
-        assert_eq!(ev.trap, Trap::PageFault);
+        assert_eq!(ev.trap(), Trap::PageFault);
         assert_eq!(
-            ev.fault,
+            ev.fault(),
             Some(FaultInfo {
                 addr: VirtAddr(0xFACE_1000),
                 access: FaultAccess::Write,
