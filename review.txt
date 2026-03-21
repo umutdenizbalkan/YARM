@@ -1,0 +1,1294 @@
+YARM KERNEL CODE REVIEW
+=======================
+Project: YARM (Yet Another Rust Microkernel)
+Language: Rust (no_std, bare-metal)
+Targets: Embedded, aerospace, automotive (RISC-V, x86_64, AArch64, ...)
+Architecture: Capability-based microkernel, userspace servers for all services
+
+This document contains actionable fix instructions for each reviewed module.
+Severity: CRITICAL > HIGH > MEDIUM > LOW
+Format per issue: SEVERITY | FILE | ISSUE | FIX
+
+
+================================================================================
+MODULE: ipc.rs
+================================================================================
+
+CRITICAL | ipc.rs | send() returns Err(Message) instead of typed error
+The Endpoint::send() method returns Result<(), Message> on queue-full instead
+of Result<(), IpcError>. This is inconsistent with every other fallible function
+and prevents use of the ? operator.
+FIX: Add IpcError::EndpointFull variant. Change send() signature to
+Result<(), IpcError>. If the caller needs the message back on failure, use
+Result<(), (IpcError, Message)>.
+
+CRITICAL | ipc.rs | MAX_ENDPOINT_DEPTH power-of-two invariant unguarded
+The ring buffer uses bitmask indexing: (head + len) & (MAX_ENDPOINT_DEPTH - 1)
+which is only correct when MAX_ENDPOINT_DEPTH is a power of two. There is no
+compile-time check enforcing this.
+FIX: Add:
+  const _: () = assert!(MAX_ENDPOINT_DEPTH.is_power_of_two(),
+    "MAX_ENDPOINT_DEPTH must be a power of two for bitmask indexing");
+
+HIGH | ipc.rs | unpack_register_payload ignores len in output
+The len parameter only gates the None return path. The output array is always
+fully populated regardless of len. Callers passing len=4 still get all
+IPC_REGISTER_BYTES populated.
+FIX: Either return (array, len) tuple so the meaningful byte count is conveyed,
+or document explicitly that len is a validity bound only, not a trim hint.
+
+HIGH | ipc.rs | pack_register_payload silently truncates oversized payload
+If payload.len() > IPC_REGISTER_BYTES the excess bytes are dropped silently.
+FIX: Return Result<[usize; IPC_REGISTER_WORDS], IpcError> and return
+Err(IpcError::PayloadTooLarge) when payload is too long.
+
+HIGH | ipc.rs | Redundant compile-time assert catches nothing
+  const _: [(); IPC_REGISTER_WORDS] = [(); syscall_abi::IPC_REGISTER_WORDS];
+IPC_REGISTER_WORDS IS syscall_abi::IPC_REGISTER_WORDS so this always passes.
+FIX: Remove or replace with a meaningful invariant check.
+
+HIGH | ipc.rs | SharedMemoryRegion placement couples IPC to memory
+SharedMemoryRegion encode/decode belongs in a memory or capability module, not
+ipc.rs. IPC should pass opaque capability handles, not know about memory regions.
+FIX: Move SharedMemoryRegion to vm.rs or cap.rs. IPC layer passes CapId.
+
+MEDIUM | ipc.rs | while loops instead of for ranges (recurring pattern)
+All loops using while i < N { ...; i += 1 } should use for i in 0..N.
+FIX: Replace all while-counter loops with idiomatic for range loops throughout.
+
+MEDIUM | ipc.rs | IpcError missing Display impl
+FIX: Implement core::fmt::Display for IpcError with human-readable messages.
+
+MEDIUM | ipc.rs | Message::MAX_PAYLOAD = 56 is undocumented magic number
+FIX: Add a doc comment explaining where 56 comes from (register budget minus
+header fields) or derive it from a constant expression.
+
+LOW | ipc.rs | SharedMemoryRegion::decode could be const fn
+encode is const fn but decode is not. The manual byte loop pattern from encode
+can be applied to decode for symmetry.
+FIX: Rewrite decode using manual byte-by-byte indexing to make it const fn.
+
+
+================================================================================
+MODULE: capabilities.rs
+================================================================================
+
+CRITICAL | capabilities.rs | revoke() silently drops children when stack fills
+The iterative revoke uses a fixed-size stack array. When the stack fills during
+child enumeration, remaining children are silently skipped and never revoked.
+This leaves live capabilities with dangling parent references — a security hole.
+FIX: Replace the stack-based traversal with a mark-and-sweep approach:
+  1. Allocate a [bool; MAX_CAPABILITIES] marked array, set marked[id.index()] = true
+  2. Loop: for each slot, if entry.parent is marked and slot not marked, mark it, set changed=true
+  3. Repeat until !changed
+  4. Sweep: for all marked slots, clear entry and increment generation
+
+CRITICAL | capabilities.rs | mint() returns Err(Capability) instead of typed error
+Same pattern as ipc.rs send(). Forces callers to pattern-match a raw Capability
+to detect "space full". Makes ? unusable.
+FIX: Add CapabilityDeriveError::SpaceFull (or rename to CapError). Change
+mint() to return Result<CapId, CapabilityDeriveError>.
+
+CRITICAL | capabilities.rs | name: &'static str in Capability struct
+Every Capability carries 16 bytes (pointer + length) for a debug name. In a
+microkernel, capabilities are opaque kernel objects. Names are a userspace
+debugging concern. With 128 slots this wastes 2KB and couples the kernel to
+string literals.
+FIX: Remove the name field from Capability entirely. Remove it from Capability::new().
+If debug names are needed, use a cfg(debug_assertions) side table keyed by CapId.
+
+HIGH | capabilities.rs | NO_TRANSFER_CAP sentinel excludes valid cap ID u64::MAX
+CapId(u64::MAX) is a theoretically valid capability ID but is reserved as sentinel.
+FIX: Add a comment explicitly documenting the constraint. Consider a NonMaxU64
+newtype or use a separate bool field to indicate "no transfer".
+
+HIGH | capabilities.rs | DmaRegion uses usize for offset and len
+usize is 32 bits on 32-bit targets. DMA offsets and lengths should be u64.
+FIX: Change DmaRegion { id: u64, offset: u64, len: u64 }
+
+HIGH | capabilities.rs | revoke() returns bool instead of Result
+Inconsistent with all other fallible methods.
+FIX: Return Result<(), CapabilityDeriveError> where a NotFound or InvalidId
+variant signals that the ID was not valid.
+
+HIGH | capabilities.rs | CapRights is an enum, should be a bitflag set
+Using &[CapRights] for combining rights is awkward. A newtype over u8 with
+associated constants enables direct bit operations.
+FIX: Replace enum CapRights with:
+  pub struct CapRights(u8);
+  impl CapRights {
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    // etc.
+    pub const fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
+    pub const fn is_subset_of(self, other: Self) -> bool { (self.0 & !other.0) == 0 }
+  }
+The escalation check in mint_derived becomes:
+  if !derived.rights.is_subset_of(parent.rights) { return Err(...); }
+
+HIGH | capabilities.rs | CapObject monolithic enum couples all object types
+Every new kernel object type requires editing CapObject. Consider an opaque
+{ kind: u8, handle: u64 } pair instead, with semantics interpreted by the
+subsystem owning that object type.
+
+HIGH | capabilities.rs | generation skip-zero logic needs comment
+  slot.generation = slot.generation.wrapping_add(1).max(1);
+The .max(1) is doing load-bearing work silently.
+FIX: Replace with explicit branch:
+  let next = slot.generation.wrapping_add(1);
+  slot.generation = if next == 0 { 1 } else { next };
+
+MEDIUM | capabilities.rs | while loops instead of for ranges (recurring)
+FIX: Same as ipc.rs — replace all while-counter loops with for range loops.
+
+MEDIUM | capabilities.rs | Missing Display for CapabilityDeriveError
+FIX: Implement core::fmt::Display.
+
+MEDIUM | capabilities.rs | CapabilitySpace ~11KB — reducible
+Removing name field saves ~2KB. Switching to opaque CapObject saves ~2KB more.
+
+
+================================================================================
+MODULE: scheduler.rs
+================================================================================
+
+CRITICAL | scheduler.rs | encode_task/decode_task off-by-one corrupts tid=u64::MAX
+The +1/-1 sentinel trick encodes tid+1 to avoid NO_TASK=0. When tid=u64::MAX,
+(u64::MAX + 1) wraps to 0 which decodes as None — the task silently disappears.
+FIX: Use an explicit OCCUPIED_BIT instead of the +1 offset:
+  const OCCUPIED_BIT: u64 = 1 << 63;
+  const PRIORITY_SHIFT: u64 = 61;
+  const TID_MASK: u64 = (1u64 << PRIORITY_SHIFT) - 1;
+  fn encode_task(task: ScheduledTask) -> u64 {
+    OCCUPIED_BIT | ((task.priority as u64) << PRIORITY_SHIFT) | task.tid
+  }
+  fn decode_task(encoded: u64) -> Option<ScheduledTask> {
+    if encoded & OCCUPIED_BIT == 0 { return None; }
+    // extract priority and tid directly, no +1/-1
+  }
+This also makes TID 0 a valid task ID.
+
+CRITICAL | scheduler.rs | dequeue_highest silent None on invariant violation
+  let mut best = decode_task(self.run_queue[self.head])?;
+If self.run_queue[self.head] is NO_TASK despite self.len > 0, this returns None
+silently instead of panicking on the violated invariant.
+FIX: Use unwrap_or_else(|| panic!("scheduler invariant violated: len={} but head slot empty", self.len))
+
+CRITICAL | scheduler.rs | on_preempt suppresses higher-priority tasks on queue-full
+When enqueue fails during preemption, the current task is re-scheduled even if
+higher-priority tasks are waiting in the queue.
+FIX: If re-enqueue fails and the queue is non-empty, this is a kernel panic
+condition (scheduler inconsistency), not a silent re-run.
+
+CRITICAL | scheduler.rs | SmpScheduler owns current_cpu — wrong for SMP
+current_cpu as a field of shared SmpScheduler means CPU 0 can corrupt CPU 1's
+view of its own identity. current_cpu must be a CPU-local variable.
+FIX: Remove current_cpu from SmpScheduler entirely. Pass CpuId explicitly to
+all methods. Remove the convenience forwarders (dispatch_next, enqueue, etc.)
+that use self.current_cpu. Each CPU calls the _on(cpu) variants with its own
+locally-known CPU ID.
+
+CRITICAL | scheduler.rs | dequeue_highest is O(N) with array compaction in hot path
+The array compaction loop shifts all elements on every dispatch. This is O(N)
+per preemption.
+FIX: Replace the single run_queue ring with three per-priority rings:
+  queues: [RingQueue; 3],  // index by TaskPriority as u8
+enqueue is O(1), dequeue_highest scans 3 queues for first non-empty (O(1)),
+array compaction disappears entirely.
+
+HIGH | scheduler.rs | MAX_RUN_QUEUE power-of-two not asserted
+FIX: Add: const _: () = assert!(MAX_RUN_QUEUE.is_power_of_two());
+
+HIGH | scheduler.rs | duplicate enqueue silently drops priority update
+If a task is enqueued with Normal priority then re-enqueued with High, the
+second call returns Ok(()) but priority is not updated.
+FIX: Either return Err(SchedulerError::AlreadyQueued) for duplicates, or
+update the priority of the existing entry in-place.
+
+HIGH | scheduler.rs | SchedulerError defined but never returned
+All public methods return Result<_, u64> or Result<_, ()> instead of
+Result<_, SchedulerError>.
+FIX: Use SchedulerError in all return types. AlreadyQueued, QueueFull, InvalidCpu,
+CpuOffline are all useful and already defined.
+
+HIGH | scheduler.rs | Raw u64 for tid instead of ThreadId
+FIX: Replace all tid: u64 parameters and Option<u64> returns with ThreadId.
+
+HIGH | scheduler.rs | least_loaded_online_cpu biased toward CPU 0 on tie
+FIX: Track a starting offset that rotates on each call to implement round-robin
+tie-breaking instead of always preferring the lowest CPU ID.
+
+HIGH | scheduler.rs | set_present_cpu_bitmap silently resets online CPU state
+FIX: Document that this resets all CPU online state, or change it to only modify
+the present bitmap without touching online status.
+
+MEDIUM | scheduler.rs | while loops instead of for ranges (recurring)
+MEDIUM | scheduler.rs | is_none_or MSRV concern — stable since Rust 1.82
+FIX: Use best.map_or(true, |...| ...) if targeting older toolchains.
+MEDIUM | scheduler.rs | TaskPriority ordering is counterintuitive (High=0)
+FIX: Add a doc comment: "Lower numeric value = higher scheduling priority."
+MEDIUM | scheduler.rs | contains_tid O(N) on every enqueue
+FIX: Enforce uniqueness at call sites instead, removing the check from enqueue.
+
+
+================================================================================
+MODULE: smp.rs
+================================================================================
+
+CRITICAL | smp.rs | SpinLock without IRQ save causes deadlock from interrupt context
+CrossCpuWorkQueue uses SpinLock which does not disable interrupts. If submit()
+is called from an interrupt handler on a CPU that is already inside take(), the
+CPU deadlocks.
+FIX: Create a SpinLockIrq<T> wrapper that saves/restores interrupt flags on
+lock/unlock. Use SpinLockIrq for CrossCpuWorkQueue.
+
+CRITICAL | smp.rs | MAX_CROSS_CPU_WORK power-of-two not asserted
+FIX: Add: const _: () = assert!(MAX_CROSS_CPU_WORK.is_power_of_two());
+
+CRITICAL | smp.rs | target_cpu not validated at submit()
+WorkItem carries target_cpu but submit() accepts any WorkItem without checking
+whether target_cpu is online or valid.
+FIX: Validate target_cpu against a topology reference at submit() time, or make
+WorkItem constructors require a validated CpuId.
+
+CRITICAL | smp.rs | Single shared queue is wrong routing model for SMP
+A single CrossCpuWorkQueue means any CPU can drain work meant for another CPU.
+FIX: Use per-CPU inboxes:
+  pub struct SmpMailbox {
+    inboxes: [CrossCpuWorkQueue; MAX_CPUS],
+  }
+  impl SmpMailbox {
+    pub fn send_to(&self, cpu: CpuId, item: WorkItem) -> Result<(), WorkItem>
+    pub fn drain_current(&self, cpu: CpuId) -> impl Iterator<Item=WorkItem>
+  }
+With per-CPU inboxes, target_cpu inside WorkItem becomes redundant — remove it.
+
+HIGH | smp.rs | WorkItem conflates routing and payload
+target_cpu inside each variant is routing metadata that belongs at the queue
+level, not in the payload.
+FIX: After per-CPU inbox refactor, simplify to:
+  pub enum WorkItem { Reschedule, TlbShootdown { asid: Asid }, WakeTask { tid: ThreadId } }
+
+HIGH | smp.rs | TlbShootdown too coarse — no VA range
+FIX: Add optional VA range:
+  TlbShootdown { asid: Asid, va_range: Option<(VirtAddr, VirtAddr)> }
+This allows targeted sfence.vma instead of full ASID flush.
+
+HIGH | smp.rs | pending() TOCTOU hazard
+pending() acquires the lock then releases it. Any check-then-act on the result
+is inherently racy. This must not be used in production logic paths.
+FIX: Mark as #[cfg(debug_assertions)] or restrict to diagnostic/telemetry use only.
+Alternatively, expose len as an AtomicUsize for lock-free diagnostic reads.
+
+HIGH | smp.rs | Option<WorkItem> wastes space vs MaybeUninit
+FIX: Replace ring: [Option<WorkItem>; N] with ring: [MaybeUninit<WorkItem>; N].
+Use MaybeUninit::write on push, MaybeUninit::assume_init_read on pop.
+Safety invariant: slots in [head, head+len) mod capacity are initialized.
+
+MEDIUM | smp.rs | WorkQueue::len() shadows field name self.len
+FIX: Rename the field to count or the method to item_count.
+MEDIUM | smp.rs | Missing target_cpu() accessor on WorkItem
+FIX: Add fn target_cpu(&self) -> CpuId { match self { ... } }
+
+
+================================================================================
+MODULE: lock.rs
+================================================================================
+
+CRITICAL | lock.rs | lock() missing #[must_use]
+  pub fn lock(&self) -> SpinLockGuard<'_, T>
+A caller writing self.lock.lock(); immediately releases the lock and enters the
+protected region with no exclusion. The compiler gives no warning.
+FIX: Add #[must_use = "if unused, the lock is immediately released when the guard is dropped"]
+to lock().
+
+CRITICAL | lock.rs | Outer CAS retry path missing spin_loop() hint
+When compare_exchange_weak fails spuriously, the outer loop retries the CAS
+without calling spin_loop(). This burns pipeline resources without a hint.
+FIX: Add spin_loop() after the inner spin exits:
+  while self.held.compare_exchange_weak(...).is_err() {
+    while self.held.load(Relaxed) { spin_loop(); }
+    spin_loop();  // hint on CAS retry
+  }
+
+CRITICAL | lock.rs | No IRQ-save variant — deadlock risk from interrupt context
+The doc comment acknowledges this but provides no enforcement. All subsystems
+using SpinLock for interrupt-accessible resources are at risk.
+FIX: Add SpinLockIrq<T> that saves/restores RFLAGS (x86) or sstatus.SIE (RISC-V)
+on lock/unlock. The guard's Drop must restore IRQ state after releasing the lock.
+Note: restore IRQs AFTER releasing the spinlock, not before.
+
+HIGH | lock.rs | No cache-line padding between held and value
+held: AtomicBool and value: UnsafeCell<T> share a cache line. When the protected
+value is written, the cache line is invalidated on all waiting CPUs, forcing
+them to re-fetch just to spin on held.
+FIX: Pad held to its own cache line:
+  pub struct SpinLock<T> {
+    held: AtomicBool,
+    _pad: [u8; 63],
+    value: UnsafeCell<T>,
+  }
+Or use #[repr(align(64))] on a wrapper struct around held.
+
+HIGH | lock.rs | No debug-mode recursive lock detection
+A thread acquiring the same lock twice deadlocks silently in release builds.
+FIX: In debug builds, add owner_cpu: AtomicU8 field. On lock(), assert that
+owner_cpu != current_cpu_id(). Reset to sentinel on drop.
+
+MEDIUM | lock.rs | Relaxed failure ordering on try_lock CAS needs comment
+FIX: Add comment: "Failure ordering is Relaxed: a failed CAS acquires nothing,
+so no memory ordering guarantee is needed on the failure path."
+
+MEDIUM | lock.rs | PhantomData choice needs comment
+FIX: Add comment on _not_send field:
+"!Send: a guard must be released on the CPU/thread that acquired the lock.
+*const UnsafeCell<()> is !Send + !Sync without affecting other bounds."
+
+MEDIUM | lock.rs | No exponential backoff under high contention
+FIX: In the inner spin loop, double the spin_loop() count on each retry up to
+a MAX_BACKOFF constant. Reset on successful acquisition.
+
+LOW | lock.rs | Debug impl for SpinLockGuard should explain why T is omitted
+FIX: Add comment: "T is intentionally not printed: its Debug impl may acquire locks."
+
+
+================================================================================
+MODULE: syscall.rs
+================================================================================
+
+CRITICAL | syscall.rs | Unvalidated user pointer/len encoded into shared-mem region
+In handle_ipc_send, user_ptr_or_offset and len come directly from frame.args
+(raw userspace register values) and are encoded into a SharedMemoryRegion
+without any bounds checking. A malicious sender can encode arbitrary kernel
+addresses.
+FIX: Add before encoding:
+  fn validate_user_region(offset: u64, len: u64) -> Result<(), SyscallError> {
+    let end = offset.checked_add(len).ok_or(SyscallError::InvalidArgs)?;
+    if end > USER_ADDR_MAX { return Err(SyscallError::InvalidArgs); }
+    Ok(())
+  }
+Call this before constructing SharedMemoryRegion.
+
+CRITICAL | syscall.rs | Shared-mem detection via payload-length heuristic
+In handle_ipc_recv:
+  if msg.transferred_cap().is_some() && msg.as_slice().len() == SharedMemoryRegion::ENCODED_LEN
+A malicious sender can construct any 16-byte message with a cap attached and
+cause the receiver to misinterpret it as a SharedMemoryRegion.
+FIX: Use the Message::opcode field as a discriminant. Define:
+  pub const OPCODE_INLINE:     u16 = 0;
+  pub const OPCODE_SHARED_MEM: u16 = 1;
+The kernel sets opcode based on which send path was taken. The recv path
+dispatches on opcode, not payload length.
+
+CRITICAL | syscall.rs | No capability rights check before IPC send/recv
+handle_ipc_send calls kernel.ipc_send(cap, msg) without checking CapRights::Send
+on the capability. handle_ipc_recv does not check CapRights::Receive. Any thread
+that can name an endpoint's CapId can send to or receive from it.
+FIX: In handle_ipc_send, before calling ipc_send:
+  let endpoint_cap = kernel.cspace.get(cap).ok_or(SyscallError::InvalidCapability)?;
+  if !endpoint_cap.has_right(CapRights::Send) { return Err(SyscallError::MissingRight); }
+Similarly for handle_ipc_recv with CapRights::Receive.
+
+CRITICAL | syscall.rs | transfer_cap_arg treats raw == 0 as no-cap sentinel
+CapId(0) can be a valid capability (slot 0 with non-zero generation). Using 0
+as a second sentinel alongside u64::MAX is fragile.
+FIX: Use only SYSCALL_NO_TRANSFER_CAP (u64::MAX) as the sentinel. Document
+why 0 is safe to exclude if that remains the case, or remove the || raw == 0 check.
+
+CRITICAL | syscall.rs | Syscall layer directly matches CapObject variants
+The dispatch code pattern-matches on CapObject::MemoryObject and CapObject::DmaRegion
+directly. This couples the ABI to internal object representation.
+FIX: Move object-type checks into methods on KernelState:
+  kernel.validate_memory_grant_cap(cap)?
+  kernel.validate_ipc_send_cap(cap)?
+The syscall layer calls these methods; the object type logic lives in KernelState.
+
+HIGH | syscall.rs | sender_tid_to_ret fails on 32-bit for high TIDs
+usize::try_from(tid: u64) fails if tid > u32::MAX on 32-bit targets, causing
+Internal error after successfully dequeuing the message (which is then lost).
+FIX: Either restrict TIDs to usize range, or split sender TID across two return
+registers for 32-bit targets.
+
+HIGH | syscall.rs | Tautological compile-time asserts catch nothing
+  const _: [(); SYSCALL_COUNT] = [(); 3];  // SYSCALL_COUNT IS 3
+FIX: Replace with:
+  const _: () = assert!(SYSCALL_COUNT == Syscall::VARIANT_COUNT);
+  const _: () = assert!(SYSCALL_ARG_TRANSFER_CAP < syscall_abi::TRAPFRAME_ARG_REGS);
+
+HIGH | syscall.rs | SYSCALL_NO_TRANSFER_CAP and ipc.rs NO_TRANSFER_CAP are duplicated
+FIX: Define once in a shared ABI module. In syscall.rs:
+  pub const SYSCALL_NO_TRANSFER_CAP: u64 = crate::kernel::ipc::NO_TRANSFER_CAP;
+
+HIGH | syscall.rs | handle_ipc_recv writes back to frame.args (input registers)
+frame.args[SYSCALL_ARG_INLINE_PAYLOAD0] is overwritten as a return value. If
+the ABI doesn't define these as input/output registers, this silently corrupts
+caller-saved state.
+FIX: Add TrapFrame methods:
+  fn set_ret_payload(&mut self, words: [usize; 2])
+  fn ret_payload(&self) -> [usize; 2]
+Make the ABI contract explicit in TrapFrame's API.
+
+HIGH | syscall.rs | opcode always set to 0 — field is dead or misused
+FIX: Use opcode to distinguish message types (see shared-mem heuristic fix above).
+Define OPCODE_INLINE=0, OPCODE_SHARED_MEM=1, OPCODE_TASK_EXIT=0xEE, etc.
+
+MEDIUM | syscall.rs | handle_ipc_send too long with duplicated flag logic
+The flag/cap computation is duplicated across the large-payload and small-payload branches.
+FIX: Extract:
+  fn build_message(sender_tid: u64, transfer_cap: Option<CapId>, payload: &[u8])
+    -> Result<Message, SyscallError>
+
+MEDIUM | syscall.rs | Raw frame.args[N] indexing throughout
+FIX: Add TrapFrame accessor methods:
+  fn syscall_cap_arg(&self) -> u64
+  fn syscall_ptr_arg(&self) -> usize
+  fn syscall_len_arg(&self) -> usize
+
+
+================================================================================
+MODULE: task.rs
+================================================================================
+
+CRITICAL | task.rs | ThreadControlBlock derives Copy
+Copy on a TCB means any function taking it by value silently makes a bitwise
+duplicate. The TCB IS the thread's identity — there must be exactly one
+authoritative copy. With Copy, mutations to a local copy are silently discarded.
+FIX: Remove Copy from ThreadControlBlock. Keep Clone only if needed for
+explicit snapshot operations (e.g., debug dumps). Review all fields that derive
+Copy solely for TCB embeddability.
+
+CRITICAL | task.rs | TaskStatus::Running not enforced by scheduler
+Anyone with &mut ThreadControlBlock can write status = TaskStatus::Running
+without going through the scheduler, creating state divergence.
+FIX: Either:
+  Option A: Make status private, add transition methods that validate edges.
+  Option B: Remove Running from TaskStatus entirely. Derive "running" from
+    scheduler state: a task is running iff it is current on some CPU.
+Option B is architecturally correct for a microkernel.
+
+CRITICAL | task.rs | POSIX-layer fields in kernel TCB
+tls_restore_pending (TLS management), robust_futex (Linux robust futex lists),
+brk_base/brk_end (heap pointer for sbrk) are POSIX/libc concerns.
+FIX: Remove robust_futex, brk_base, brk_end from ThreadControlBlock.
+Reduce TLS to a single tls_ptr: Option<VirtAddr> for the context-switch register.
+Robust futex cleanup on task death should be a message to the POSIX server.
+brk management belongs in the allocator/POSIX server.
+
+CRITICAL | task.rs | WaitReason::Futex(usize) carries raw kernel virtual address
+FIX: Change to WaitReason::Futex(VirtAddr). Validate before use.
+
+HIGH | task.rs | brk_base and brk_end as separate Option<VirtAddr> fields
+Nothing prevents brk_base=None with brk_end=Some(x), or brk_end < brk_base.
+FIX: Combine into a single:
+  pub struct BrkRegion { pub base: VirtAddr, pub end: VirtAddr }
+  impl BrkRegion {
+    pub fn new(base: VirtAddr, end: VirtAddr) -> Option<Self> {
+      if end.0 >= base.0 { Some(Self { base, end }) } else { None }
+    }
+  }
+  pub brk: Option<BrkRegion>,
+
+HIGH | task.rs | RestartState::budget: u8 has no safe accessor
+FIX: Add:
+  impl RestartState {
+    pub fn can_restart(&self) -> bool { self.budget > 0 }
+    pub fn consume_restart(&mut self) -> bool {
+      if self.budget == 0 { return false; }
+      self.budget -= 1;
+      true
+    }
+  }
+
+HIGH | task.rs | WaitReason::Join(u64) should use ThreadId
+FIX: Change to WaitReason::Join(ThreadId).
+
+HIGH | task.rs | thread_group_id: u64 should be ThreadGroupId newtype
+FIX: Add pub struct ThreadGroupId(pub u64); and use it.
+
+HIGH | task.rs | TaskClass not tied to capability system
+FIX: Document explicitly which capabilities are granted to each TaskClass at
+creation time, or remove TaskClass and rely purely on held capabilities.
+
+HIGH | task.rs | FaultPolicy imported from bootstrap module
+Runtime task state depending on bootstrap types creates coupling.
+FIX: Move FaultPolicy definition to task.rs or a shared policy.rs module.
+
+MEDIUM | task.rs | tls_base, user_entry, user_stack_top typed as usize not VirtAddr
+FIX: Change all address-valued usize fields to VirtAddr.
+
+MEDIUM | task.rs | last_exit_code: Option<u64> ambiguous on None
+FIX: Encode exit code in status: TaskStatus::Exited(u64) so it is impossible
+to have Exited status without an exit code.
+
+MEDIUM | task.rs | No constructor for ThreadControlBlock
+FIX: Add ThreadControlBlock::new(tid: ThreadId, class: TaskClass, asid: Option<Asid>)
+with documented defaults for all other fields.
+
+
+================================================================================
+MODULE: timer.rs
+================================================================================
+
+CRITICAL | timer.rs | tick() and should_preempt() are order-dependent
+should_preempt() has hidden precondition: must be called after tick(). The
+deduplication via last_preempt_tick exists only to paper over independent calls.
+FIX: Make tick() and should_preempt() private or remove them. Make
+tick_and_check() the only public interface.
+
+CRITICAL | timer.rs | Tick(0) silently skipped as boundary after wrapping
+  let at_boundary = self.current.0 != 0 && ...
+After u64 wraps to 0, that boundary tick is skipped.
+FIX: Replace the modulo approach with a countdown counter (see performance fix
+below), which naturally handles wrap-around correctly.
+
+HIGH | timer.rs | Modulo division on every tick — use countdown counter
+  self.current.0 % self.quantum_ticks
+Division is expensive on embedded targets without hardware dividers.
+FIX: Replace Timer with a countdown design:
+  struct Timer {
+    current: Tick,
+    quantum_ticks: u64,
+    ticks_remaining: u64,
+  }
+  fn tick_and_check(&mut self) -> (Tick, bool) {
+    self.current.0 = self.current.0.wrapping_add(1);
+    self.ticks_remaining -= 1;
+    let preempt = self.ticks_remaining == 0;
+    if preempt { self.ticks_remaining = self.quantum_ticks; }
+    (self.current, preempt)
+  }
+This is O(1), has no division, fixes the wrap-around skip, and eliminates
+last_preempt_tick stale state entirely.
+
+HIGH | timer.rs | Tick and TickInstant from task.rs are the same type defined twice
+FIX: Define once in a shared time.rs module:
+  pub struct Tick(pub u64);       // absolute instant
+  pub struct TickDuration(pub u64); // relative duration
+Import everywhere. Timer::current_ticks() returns Tick. RestartState uses Tick.
+
+HIGH | timer.rs | Timer conflates tick source and preemption policy
+FIX: Separate into:
+  pub struct TickCounter { current: Tick }  // hardware abstraction
+  pub struct QuantumTracker { quantum_ticks: u64, ticks_remaining: u64 } // policy
+The scheduler holds a QuantumTracker per CPU. TickCounter is a shared clock.
+
+MEDIUM | timer.rs | quantum_ticks clamp is silent
+FIX: Add debug_assert!(quantum_ticks > 0, "quantum_ticks must be non-zero");
+alongside the .max(1) clamp.
+
+MEDIUM | timer.rs | No per-CPU ownership documented
+FIX: Add module-level doc: "One Timer instance must exist per CPU. Sharing
+across CPUs is incorrect — each CPU advances its own tick counter independently."
+
+MEDIUM | timer.rs | Tick missing arithmetic operations
+FIX: Implement:
+  impl Add<TickDuration> for Tick { type Output = Tick; ... }
+  impl Sub for Tick { type Output = TickDuration; ... }
+  impl Tick { pub fn page_align_down/up ... }  // for VirtAddr analog
+
+
+================================================================================
+MODULE: trap.rs
+================================================================================
+
+CRITICAL | trap.rs | TrapEvent public fields allow invalid combinations
+Any caller can construct:
+  TrapEvent { trap: Trap::PageFault, fault: None, irq: None }
+When the page fault handler unwraps event.fault it gets None unexpectedly.
+FIX: Make all TrapEvent fields private. Only the const constructor methods are
+public. Add public accessors:
+  pub fn trap(&self) -> Trap
+  pub fn fault(&self) -> Option<FaultInfo>
+  pub fn irq(&self) -> Option<u16>
+Better: Redesign as a enum to make invalid states unrepresentable:
+  pub enum TrapEvent {
+    Syscall,
+    PageFault(FaultInfo),
+    TimerInterrupt,
+    ExternalInterrupt(u16),
+  }
+Handlers then extract their payload via pattern matching with no unwrap risk.
+
+CRITICAL | trap.rs | Trap/TrapEvent should live in arch layer, not kernel
+TrapEvent classifies hardware exception causes, which is platform-specific.
+FIX: Move Trap and TrapEvent to crate::arch::trap. Keep TrapAction in
+crate::kernel::trap. Architecture layer produces TrapEvent; kernel maps to
+TrapAction.
+
+HIGH | trap.rs | route_trap takes TrapEvent by value but reads one field
+FIX: Change to fn route_trap(event: &TrapEvent) -> TrapAction
+
+HIGH | trap.rs | FaultAccess::Execute has no documented construction path
+FIX: Document when Execute faults occur on each supported architecture (NX
+violation, RISC-V PMP, etc.). Ensure arch entry path produces it correctly.
+
+HIGH | trap.rs | TrapAction::HandleDeviceInterrupt misleading for microkernel
+The kernel routes IRQs to driver servers; it doesn't handle them.
+FIX: Rename to TrapAction::RouteIrq.
+
+MEDIUM | trap.rs | irq: Option<u16> platform width assumption undocumented
+FIX: Add type alias pub type IrqNumber = u16; with a comment bounding the range.
+
+MEDIUM | trap.rs | TrapAction separation from Trap needs concrete future case
+FIX: Add a comment with specific planned non-1:1 mappings, e.g.:
+"PageFault during kernel copy-from-user → HandleKernelCopyFault (future)."
+
+
+================================================================================
+MODULE: trapframe.rs
+================================================================================
+
+CRITICAL | trapframe.rs | capture_user_context reads ret0/ret1 as PC/SP
+ret0 and ret1 are syscall return value registers, not the saved program counter
+and stack pointer. capture_user_context is reading the wrong registers, and
+apply_user_context writes them back, corrupting the trap return path.
+FIX: Add saved_pc and saved_sp fields to TrapFrame:
+  pub struct TrapFrame {
+    pub syscall_num: usize,
+    pub args: [usize; syscall_abi::TRAPFRAME_ARG_REGS],
+    pub ret0: usize,
+    pub ret1: usize,
+    pub ret2: usize,
+    pub error: usize,
+    pub saved_pc: usize,   // user PC at trap entry (sepc on RISC-V, rip on x86)
+    pub saved_sp: usize,   // user SP at trap entry
+  }
+capture_user_context reads saved_pc/saved_sp. apply_user_context writes them.
+
+CRITICAL | trapframe.rs | All fields are pub — ABI invariants bypassable
+set_ok zeroes ret0/ret1/ret2/error atomically for security (no stale data leak).
+But with public fields, any caller can write frame.ret0 = kernel_ptr then call
+frame.error = 0 directly, bypassing the zeroing.
+FIX: Make ret0, ret1, ret2, error private. Keep syscall_num and args public or
+provide named accessors. All access to return/error registers goes through
+set_ok, set_err, error_code, and the new transfer_cap accessor.
+
+CRITICAL | trapframe.rs | No layout verification against assembly trap entry stub
+#[repr(C)] makes layout predictable from Rust but nothing verifies it matches
+the assembly entry stub's register save layout.
+FIX: Add offset assertions:
+  const _: () = assert!(core::mem::offset_of!(TrapFrame, syscall_num) == 0);
+  const _: () = assert!(
+    core::mem::offset_of!(TrapFrame, args) == core::mem::size_of::<usize>());
+  // Add for every field referenced by offset in assembly
+
+HIGH | trapframe.rs | TrapFrame derives Copy — silent duplication of live register state
+FIX: Remove Copy. A trap frame is the live register state of a task; it must not
+be silently copied.
+
+HIGH | trapframe.rs | set_ok always zeroes ret2 then callers overwrite it
+Callers call set_ok(0,0) then immediately set ret2 via encode_transfer_cap_ret.
+FIX: Add a three-argument variant:
+  pub fn set_ok(&mut self, ret0: usize, ret1: usize, ret2: usize)
+Or add a dedicated method:
+  pub fn set_transfer_cap_ret(&mut self, cap: usize) { self.ret2 = cap; }
+  pub fn transfer_cap_ret(&self) -> usize { self.ret2 }
+
+HIGH | trapframe.rs | TrapFrame mixes syscall and general trap concerns
+For non-syscall traps (page fault, timer), syscall_num/ret0/ret1/ret2/error are
+meaningless. This makes it easy to accidentally read stale return values.
+FIX: At minimum document that TrapFrame is not reused across trap entries.
+Longer term: separate SyscallFrame from FaultFrame from InterruptFrame.
+
+MEDIUM | trapframe.rs | is_error() and error_code() are redundant
+is_error() == error_code().is_some()
+FIX: Remove is_error() and let callers use error_code().is_some().
+
+MEDIUM | trapframe.rs | No zeroed() constructor for test convenience
+FIX: Add: pub const fn zeroed() -> Self { Self::new(0, [0; TRAPFRAME_ARG_REGS]) }
+
+
+================================================================================
+MODULE: vm.rs
+================================================================================
+
+CRITICAL | vm.rs | mapping_is_allowed rejects guard pages from user spaces
+  AddressSpaceKind::User => virt.0 < KERNEL_SPACE_BASE && flags.user
+Requiring flags.user=true prevents guard pages (all flags false) from being
+mapped in user spaces. Guard pages are a legitimate security feature.
+FIX: The correct check is that user spaces don't accept kernel-only-flagged pages,
+not that they require the user bit:
+  AddressSpaceKind::User => virt.0 < KERNEL_SPACE_BASE && !is_kernel_only(flags)
+Define is_kernel_only as: !flags.user && (flags.read || flags.write || flags.execute)
+Document the exact policy for your target architecture.
+
+CRITICAL | vm.rs | allocate_asid loop bound is wrong
+  let asid_capacity = (1u32 << vm_layout::ASID_BITS) - 1;
+  for _ in 0..asid_capacity { ... if !self.asid_in_use(candidate) ... }
+If ASID_BITS=16, this scans 65535 candidates when at most MAX_ADDRESS_SPACES
+(e.g., 16) can ever be in use.
+FIX: Change loop bound to MAX_ADDRESS_SPACES. Add a comment explaining the
+relationship between ASID space and address space capacity.
+
+CRITICAL | vm.rs | No TLB shootdown on destroy
+When an address space is destroyed, CPUs holding TLB entries for that ASID
+continue using stale mappings — a cross-process memory access vulnerability.
+FIX: destroy() must enqueue a WorkItem::TlbShootdown for each online CPU before
+freeing the ASID. The ASID must not be recycled until all shootdowns complete.
+
+CRITICAL | vm.rs | AddressSpace is a software shadow, not a hardware page table
+map_page does not update the hardware page table or issue TLB flushes.
+FIX: Either document explicitly that AddressSpace is a software shadow and callers
+must call arch::vm::map_page() and issue TLB flushes separately, or add those
+calls to map_page/unmap_page.
+
+HIGH | vm.rs | VirtAddr and PhysAddr need range-check constructors
+FIX: Add:
+  impl VirtAddr {
+    pub fn new(addr: u64) -> Option<Self> {
+      if addr <= vm_layout::MAX_VIRT_ADDR { Some(Self(addr)) } else { None }
+    }
+    pub fn is_user(&self) -> bool { self.0 < KERNEL_SPACE_BASE }
+    pub fn is_kernel(&self) -> bool { self.0 >= KERNEL_SPACE_BASE }
+  }
+
+HIGH | vm.rs | VirtAddr and PhysAddr need arithmetic operations
+FIX: Implement:
+  impl Add<u64> for VirtAddr { type Output = VirtAddr; ... }
+  impl VirtAddr {
+    pub fn page_align_down(&self) -> Self
+    pub fn page_align_up(&self) -> Self
+  }
+
+HIGH | vm.rs | PageFlags missing cache policy for embedded/automotive targets
+FIX: Add:
+  pub enum CachePolicy { WriteBack, WriteThrough, Uncached, Device }
+  pub struct PageFlags {
+    pub read: bool, pub write: bool, pub execute: bool, pub user: bool,
+    pub cache: CachePolicy,
+  }
+Default to CachePolicy::WriteBack in existing constants.
+
+HIGH | vm.rs | Missing PageFlags constants
+FIX: Add:
+  pub const USER_RW: Self = Self { read: true, write: true, execute: false, user: true };
+  pub const GUARD: Self = Self { read: false, write: false, execute: false, user: false };
+
+MEDIUM | vm.rs | Option<Entry> overhead — use occupancy sentinel
+FIX: Replace Option<Entry> ring with occupancy tracking via a separate bool
+field or a sentinel VirtAddr value, avoiding the Option discriminant padding.
+
+MEDIUM | vm.rs | resolve() O(N) on every page fault
+FIX: Sort entries by virt and use binary search, or use a small hash table
+indexed by virt >> PAGE_SHIFT. Document complexity explicitly.
+
+MEDIUM | vm.rs | unmap_page uses expect after is_some check
+FIX: Use if let Some(entry) = slot.as_ref() { if entry.virt == virt { ... } }
+
+MEDIUM | vm.rs | vm_constants_are_arch_sourced test is tautological
+FIX: Replace with:
+  fn page_size_is_power_of_two_and_sane() {
+    assert!(PAGE_SIZE.is_power_of_two());
+    assert!(PAGE_SIZE >= 4096);
+    assert!(KERNEL_SPACE_BASE.is_power_of_two());
+  }
+
+MEDIUM | vm.rs | mappings() O(N) count
+FIX: Add len: usize field to AddressSpace, increment on map_page, decrement
+on unmap_page. Make mappings() return self.len.
+
+MEDIUM | vm.rs | AddressSpaceKind::Kernel per-instance semantics undocumented
+FIX: Add doc comment explaining whether this represents the one global kernel
+address space or a per-instance mapping.
+
+
+================================================================================
+MODULE: bootstrap.rs (KernelState integration layer)
+================================================================================
+
+CRITICAL | bootstrap.rs | ServiceRole encodes userspace architecture in kernel
+ServiceRole enum (Init, ProcessManager, Vfs, Driver, Supervisor) and the
+ALLOWED_SERVICE_DELEGATION_EDGES table encode userspace policy in the kernel.
+A microkernel must not know these service names exist.
+FIX: Remove entirely: ServiceRole, ServicePolicyEntry,
+ALLOWED_SERVICE_DELEGATION_EDGES, register_service_role,
+service_role, can_delegate_service, validate_service_delegation,
+delegate_driver_bundle_checked.
+Move service delegation policy to a userspace Init/Supervisor server. The kernel
+enforces capability rights hierarchy (mint_derived + escalation checks), which
+already provides the necessary mechanism without policy.
+
+CRITICAL | bootstrap.rs | task_mem byte-array is not a kernel primitive
+  task_mem: [Option<TaskMemByte>; MAX_TASK_MEM_ENTRIES]
+This table of individual bytes is a test harness, not a real kernel primitive.
+It is O(N^2) per copy (scan per byte, scan per validation) and caps total
+copyable user data at 2048 bytes system-wide.
+FIX: Replace with actual page-table-backed memory access:
+  fn copy_from_user(&self, asid: Asid, va: VirtAddr, dst: &mut [u8]) -> Result<(), KernelError>
+  fn copy_to_user(&mut self, asid: Asid, va: VirtAddr, src: &[u8]) -> Result<(), KernelError>
+In a test harness, back this with a HashMap<(Asid, VirtAddr), u8> or similar.
+In production, resolve the physical address through user_spaces and access directly.
+
+CRITICAL | bootstrap.rs | KernelState ~115KB returned by value — stack overflow risk
+task_mem alone is ~49KB. Total KernelState is ~115KB. Bootstrap::init() returns
+it by value, which would overflow most embedded boot stacks.
+FIX: KernelState must not live on any stack. Use one of:
+  Option A: static mut KERNEL_STATE: MaybeUninit<KernelState> = MaybeUninit::uninit();
+  Option B: static KERNEL_STATE: SpinLock<Option<KernelState>> = SpinLock::new(None);
+Bootstrap::init() initializes the static in-place. Return a reference or guard.
+
+CRITICAL | bootstrap.rs | process_cross_cpu_work_for_cpu silently drops work
+When deferred buffer fills (more than MAX_CROSS_CPU_WORK items for other CPUs),
+excess items are silently dropped. A dropped TlbShootdown or WakeTask causes
+stale TLB entries or permanently blocked tasks.
+FIX: Return Err(KernelError::TaskTableFull) when deferred buffer would overflow,
+allowing the caller to retry later. Or: drain remaining items back into the queue
+in a second pass.
+
+CRITICAL | bootstrap.rs | handle_trap silently ignores PageFault and ExternalInterrupt
+  Trap::PageFault | Trap::ExternalInterrupt => Ok(()),
+Calling handle_trap directly with PageFault returns Ok(()) with no action taken.
+FIX: Replace with:
+  Trap::PageFault | Trap::ExternalInterrupt =>
+    unreachable!("route these through handle_trap_event, not handle_trap"),
+Or return a new TrapHandleError::RoutingError variant.
+
+CRITICAL | bootstrap.rs | switch_to_runnable_tid is a busy loop in IPC fast path
+Calls yield_current() up to MAX_TASKS times trying to schedule a specific thread.
+FIX: Remove this method entirely. In the IPC fast path, after waking the waiter,
+enqueue it with elevated priority and return. Scheduling happens at the next
+natural preemption point. Do not spin-yield to force a specific task to run.
+
+CRITICAL | bootstrap.rs | Restart subsystem implements scheduling policy in kernel
+app_restart_policy, driver_restart_policy, system_restart_policy,
+escalation thresholds per class — these are supervisor-level policies.
+FIX: Keep kernel primitives: exit_task() returning a restart token, restart_task()
+checking the token. Remove policy from the kernel: budget tracking, backoff
+enforcement, and escalation notifications belong in a userspace supervisor server
+that holds a capability to re-enqueue tasks.
+
+CRITICAL | bootstrap.rs | mint_dma_region_cap size check against single PAGE_SIZE
+  if offset.checked_add(len)? > crate::kernel::vm::PAGE_SIZE
+This treats every memory object as exactly one page. Multi-page objects cannot
+have DMA caps spanning more than one page.
+FIX: Check against the actual size of the memory object (store size in
+MemoryObject struct), not PAGE_SIZE. Return a semantically correct error
+(OutOfBounds or Vm(Misaligned)) not WrongObject.
+
+HIGH | bootstrap.rs | cspace and kernel_aspace are public fields
+FIX: Make private. Add controlled accessor methods that enforce invariants.
+Remove direct state.cspace.mint() calls from tests; go through KernelState methods.
+
+HIGH | bootstrap.rs | emit_fault_report uses sender TID 0 — conflates with boot task
+FIX: Define: pub const KERNEL_SENDER_TID: u64 = u64::MAX;
+Use it for all kernel-generated messages. The fault handler can then
+distinguish kernel messages from task 0 messages.
+
+HIGH | bootstrap.rs | Magic opcodes 0xEE and 0xEF undocumented wire protocol
+FIX: Define named constants:
+  pub const OPCODE_TASK_EXIT_REPORT: u16 = 0xEE;
+  pub const OPCODE_RESTART_DENIAL:   u16 = 0xEF;
+Document these as part of the supervisor IPC ABI.
+
+HIGH | bootstrap.rs | alloc_anonymous_memory_object has no physical memory bound
+next_anon_phys increments without checking an upper bound.
+FIX: Add to platform_layout: ANON_PHYS_LIMIT: u64
+Check in alloc_anonymous_memory_object:
+  if self.memory.next_anon_phys >= platform_layout::ANON_PHYS_LIMIT {
+    return Err(KernelError::MemoryObjectFull);
+  }
+
+HIGH | bootstrap.rs | ipc_send_fastpath double-counts telemetry
+ipc_send_fastpath calls ipc_send which already increments fastpath_attempts,
+rendezvous_handoffs, and fastpath_switches. Then ipc_send_fastpath increments
+them again.
+FIX: Add a parameter to ipc_send to suppress telemetry when called from
+ipc_send_fastpath, or move all telemetry ownership to ipc_send_fastpath and
+pass a suppress_telemetry: bool flag down to ipc_send.
+
+HIGH | bootstrap.rs | tcb_mut / task_status are O(N) linear scans on every call
+Called on every IPC, yield, fault, etc.
+FIX: Add a tid_to_slot: [Option<usize>; MAX_TASKS] or equivalent index table.
+Update on register_task and when tasks are reaped. Makes tcb_mut O(1).
+
+HIGH | bootstrap.rs | spawn_user_thread / task management in kernel
+Thread creation with TLS setup, stack config, and group tracking is a userspace
+concern in a microkernel.
+FIX: Keep kernel primitives (allocate TCB, bind ASID, set entry). Move
+spawn_user_thread orchestration to a process server. Kernel provides:
+  alloc_tcb(tid, class) -> Result<(), KernelError>
+  set_tcb_entry(tid, entry: VirtAddr) -> Result<(), KernelError>
+  set_tcb_asid(tid, asid: Asid) -> Result<(), KernelError>
+
+HIGH | bootstrap.rs | register_task_with_class silently ignores class mismatch
+  if self.task_status(tid).is_some() { return Ok(()); }
+If the same TID is registered with a different class, it silently succeeds
+with the original class.
+FIX: Return Err(KernelError::TaskTableFull) or a new AlreadyExists error on
+duplicate TID registration.
+
+HIGH | bootstrap.rs | write_user_memory / read_user_memory while loops and O(N^2)
+FIX: Use for (i, &byte) in data.iter().enumerate() instead of while i < N.
+Fix O(N^2) by replacing the per-byte loop with a page-resolution then bulk copy.
+
+MEDIUM | bootstrap.rs | name field in all Capability::new() calls
+Every mint call passes a string literal ("root_scheduler", "endpoint_send", etc.)
+FIX: Once name is removed from Capability (see capabilities.rs fix), remove all
+name arguments from Capability::new() calls throughout bootstrap.rs.
+
+MEDIUM | bootstrap.rs | can_bring_up_secondary_cpu test reveals scheduler/TCB gap
+The test calls state.scheduler.dispatch_next() directly, bypassing
+dispatch_next_task() which updates TCB status to Running. The task ends up
+scheduled but with status=Runnable.
+FIX: Remove pub from SmpScheduler in KernelState, or route all dispatch calls
+through dispatch_next_task(). Fix the test to use KernelState methods only.
+
+================================================================================
+MODULE: topology.rs
+================================================================================
+
+CRITICAL | topology.rs | complete_secondary_bring_up bypasses the entire bring-up protocol
+The three-step SMP bring-up protocol is:
+  1. Bootstrap CPU calls start_secondary_cpu (sets started, pending_ack)
+  2. Secondary CPU calls acknowledge_secondary_cpu (clears pending_ack)
+  3. Bootstrap CPU calls mark_cpu_online (verifies ack, sets online bit)
+complete_secondary_bring_up calls all three in sequence from one CPU, which
+means the secondary CPU never actually participates. The ack is self-granted.
+This makes it impossible to use correctly in real SMP bring-up.
+FIX: Remove complete_secondary_bring_up from CpuTopology entirely.
+The bootstrap CPU calls start_secondary_cpu, then spins waiting for the secondary.
+The secondary CPU's entry point calls acknowledge_secondary_cpu on itself.
+The bootstrap CPU then calls mark_cpu_online once ack is confirmed.
+If a collapsed single-CPU test path is needed, keep it only under
+#[cfg(test)] with a clear comment explaining it bypasses the protocol.
+
+CRITICAL | topology.rs | wait_for_secondary_ack does not actually wait
+The method named wait_for_secondary_ack is a pure condition check with no
+spinning or blocking:
+  pub fn wait_for_secondary_ack(&self, cpu: u8) -> Result<(), ()> {
+    if (self.started & mask) == 0 || (self.pending_ack & mask) != 0 {
+      return Err(());  // returns immediately on failure
+    }
+    Ok(())
+  }
+Callers expecting a blocking wait will poll in a tight loop at the call site,
+or worse, assume the condition is met after a single Ok(()).
+FIX: Rename to check_secondary_ack. The actual wait loop belongs at the call
+site or in an arch-specific spin-with-timeout primitive:
+  pub fn check_secondary_ack(&self, cpu: u8) -> Result<(), ()>
+Document explicitly that the caller must retry until Ok(()) or timeout.
+
+CRITICAL | topology.rs | CpuTopology uses plain u64 bitmaps with no SMP protection
+present, online, started, pending_ack are plain u64 fields mutated by &mut self
+methods. In a real SMP kernel, multiple CPUs may read/write topology state
+concurrently (e.g., CPU 1 calling acknowledge while CPU 0 calls mark_cpu_online).
+FIX: Either:
+  Option A: Replace bitmaps with AtomicU64 and use atomic bit operations.
+  Option B: Document that CpuTopology must always be accessed under a SpinLockIrq
+  and enforce this by making all mutating methods take a lock guard.
+
+CRITICAL | topology.rs | detect_secondary_cpus saturating_add can loop forever
+  while (cpu as usize) < MAX_CPUS {
+    ...
+    cpu = cpu.saturating_add(1);
+  }
+If MAX_CPUS > 255, cpu reaches u8::MAX (255), saturating_add keeps returning
+255, and the loop never terminates. u8 cannot represent values >= 256.
+FIX: Use for cpu in 0..MAX_CPUS with cpu typed as usize, casting to u8 only
+when calling cpu_present:
+  for cpu in 0..MAX_CPUS {
+    let cpu_id = cpu as u8;
+    if cpu_id != platform_layout::BOOTSTRAP_CPU_ID && self.cpu_present(cpu_id) {
+      out[count] = Some(cpu_id);
+      count += 1;
+    }
+  }
+
+HIGH | topology.rs | CpuBitmap = u64 hard-limits to 64 CPUs with no assertion
+If MAX_CPUS > 64 is ever set in platform_layout, the bitmap silently truncates.
+cpu_present and cpu_online would return false for CPUs 64+.
+FIX: Add compile-time assert:
+  const _: () = assert!(MAX_CPUS <= CpuBitmap::BITS as usize,
+    "MAX_CPUS exceeds CpuBitmap width; increase CpuBitmap to u128 or wider");
+
+HIGH | topology.rs | started bitmap is never cleared after CPU goes offline
+Once a CPU is started it remains in the started bitmap forever, even if it
+subsequently crashes or goes offline. wait_for_secondary_ack would pass for a
+dead CPU.
+FIX: Add mark_cpu_offline that clears started, pending_ack, and online bits.
+Define valid state transitions explicitly in a doc comment.
+
+HIGH | topology.rs | Return type Result<(), ()> provides no error information
+All fallible methods return unit errors. Callers cannot distinguish "CPU not
+present", "CPU already online", "invalid CPU ID" etc.
+FIX: Define:
+  pub enum TopologyError {
+    CpuNotPresent,
+    CpuAlreadyOnline,
+    CpuNotStarted,
+    AckNotReceived,
+    InvalidCpuId,
+  }
+Use TopologyError in all Result return types.
+
+HIGH | topology.rs | from_present_bitmap silently forces bootstrap CPU into present set
+  let present = if masked == 0 { bootstrap } else { masked | bootstrap };
+If the caller passes a bitmap that doesn't include the bootstrap CPU, it is
+silently added. This hides misconfigured platform topology.
+FIX: Add a debug_assert or return an error if BOOTSTRAP_CPU_ID is not set in
+the provided bitmap. Silent correction of caller mistakes masks bugs.
+
+MEDIUM | topology.rs | while loop in detect_secondary_cpus should be for range
+FIX: As shown in the CRITICAL fix above, use for cpu in 0..MAX_CPUS.
+
+MEDIUM | topology.rs | Missing Display for TopologyError (once added)
+FIX: Implement core::fmt::Display for TopologyError.
+
+MEDIUM | topology.rs | cpu_present / cpu_online return false for cpu >= 64 silently
+checked_shl returns None for shift >= 64, so the mask is 0, and the function
+returns false. This is correct behavior but is not documented.
+FIX: Add doc comment: "Returns false for cpu >= 64 (bitmap capacity limit)."
+
+
+================================================================================
+MODULE: printk.rs
+================================================================================
+
+CRITICAL | printk.rs | dropped counter is incremented but message is still stored
+  if msg.len() > PRB_MSG_MAX {
+    self.dropped.fetch_add(1, Ordering::Relaxed);
+  }
+  self.slots[idx].write(seq, level, context, msg);  // write still happens
+write() truncates the message to PRB_MSG_MAX bytes and stores it. The dropped
+counter implies the message was lost entirely, but it was actually truncated
+and stored. This makes dropped_count() misleading to any console/monitoring tool.
+FIX: Either:
+  Option A: Increment dropped and return early (truly drop the message).
+  Option B: Do not increment dropped on truncation. Add a separate
+    truncated_count: AtomicU64 counter and increment it instead.
+  Option C: Include a truncation marker in the stored message (e.g., append "...")
+Decide which semantic you want and implement it consistently.
+
+CRITICAL | printk.rs | printk_args synchronously drains to console on every call
+  pub fn printk_args(...) {
+    ...
+    PRINTK.push(level, context, &sb.buf[..sb.len]);
+    let _ = threaded_drain_to(|...| crate::arch::console::write_line(msg));
+  }
+Every log call synchronously drains all pending messages to the console.
+In NMI context or interrupt context, calling write_line (which may spin on a
+UART register) from printk_args is a latency and re-entrancy hazard.
+The function is called printk_args but it contains a blocking side effect.
+FIX: Remove the inline drain from printk_args. Log to the ring only:
+  pub fn printk_args(level: LogLevel, context: PrintkContext, args: fmt::Arguments) {
+    let mut sb = StackBuf::new();
+    let _ = fmt::write(&mut sb, args);
+    PRINTK.push(level, context, &sb.buf[..sb.len]);
+    // No drain here — caller drives console flushing
+  }
+Add a separate printk_flush() function for normal-context callers. The timer
+interrupt handler or a dedicated console thread calls printk_flush periodically.
+
+HIGH | printk.rs | PrbSlot::bytes is [AtomicU8; 192] — 192 atomic loads per read
+read_if_seq loads each of the 192 message bytes individually as AtomicU8 with
+Relaxed ordering. On architectures where atomic load generates a memory barrier
+or fence, this is 192 unnecessary barriers per message read.
+FIX: Replace [AtomicU8; PRB_MSG_MAX] with a seqlock over a plain [u8; PRB_MSG_MAX]:
+  struct PrbSlot {
+    seq: AtomicU64,
+    len: AtomicU16,
+    level: AtomicU8,
+    context: AtomicU8,
+    committed: AtomicBool,
+    bytes: UnsafeCell<[u8; PRB_MSG_MAX]>,  // protected by the seqlock
+  }
+Write: acquire seq fence, write bytes directly, release seq fence.
+Read: seqlock pattern with retry on seq mismatch. This reduces atomic ops per
+read from 192 to 2 (seq before and after) plus non-atomic byte reads.
+
+HIGH | printk.rs | % PRB_SLOTS uses division instead of bitmask
+  let idx = (seq as usize) % PRB_SLOTS;
+Division is slow on targets without hardware divide. PRB_SLOTS is currently 128
+(power of two) but nothing enforces it.
+FIX: Add assertion and use bitmask:
+  const _: () = assert!(PRB_SLOTS.is_power_of_two(),
+    "PRB_SLOTS must be a power of two for bitmask indexing");
+  let idx = (seq as usize) & (PRB_SLOTS - 1);
+
+HIGH | printk.rs | reader_seq is a single global cursor — only one console reader
+drain_for_console updates a shared reader_seq. Two simultaneous console
+outputs (e.g., UART + VGA) would corrupt each other's position.
+FIX: Remove reader_seq from PrintkRing. Pass the starting sequence number into
+drain_for_console as a parameter, and return the new sequence position:
+  fn drain_for_console<F>(&self, from_seq: u64, sink: F) -> (usize, u64)
+Each console driver maintains its own cursor independently.
+
+HIGH | printk.rs | StackBuf::write_str silently truncates and returns Ok(())
+When the buffer is full, write_str copies nothing and returns Ok(()). The
+fmt::Write machinery thinks the write succeeded, so format_args may produce
+a silently truncated message with no indication of overflow.
+FIX: Track truncation:
+  fn write_str(&mut self, s: &str) -> fmt::Result {
+    let bytes = s.as_bytes();
+    let avail = PRB_MSG_MAX.saturating_sub(self.len);
+    let copy = core::cmp::min(avail, bytes.len());
+    self.buf[self.len..self.len + copy].copy_from_slice(&bytes[..copy]);
+    self.len += copy;
+    if bytes.len() > avail {
+      self.truncated = true;  // add this field
+    }
+    Ok(())
+  }
+If truncated, append "[truncated]" marker in printk_args before pushing to ring.
+
+HIGH | printk.rs | drain_for_console does not update reader_seq atomically on panic
+If sink() panics, reader_seq is not updated and the same messages are re-delivered
+on the next drain call. In a kernel, panicking in a log drain is a real scenario
+(e.g., console write_line encounters a hardware fault).
+FIX: Update reader_seq after each individual message rather than at the end:
+  self.reader_seq.store(seq + 1, Ordering::Release);  // inside the loop
+This makes progress unconditionally, even if the loop is interrupted.
+
+MEDIUM | printk.rs | read_if_seq memory ordering may allow torn reads
+The seqlock pattern in read_if_seq checks committed and seq before and after
+reading bytes. But if a writer begins after the first committed check and
+the slot is being written with the same seq (impossible with monotonic seqs
+but worth hardening), the reader could see partially written data.
+FIX: Add a compiler fence between the initial committed/seq check and the
+byte reads to prevent the compiler from reordering:
+  core::sync::atomic::fence(Ordering::Acquire);
+  // read bytes here
+  core::sync::atomic::fence(Ordering::Acquire);
+  // check seq1 and committed again
+
+MEDIUM | printk.rs | while loops in write() and read_if_seq() should be for ranges
+  while i < len { self.bytes[i].store(...); i += 1; }
+FIX: Replace with for i in 0..len throughout.
+
+MEDIUM | printk.rs | Level/context u8 → enum conversion uses manual match in read_if_seq
+FIX: Implement TryFrom<u8> for LogLevel and PrintkContext:
+  impl TryFrom<u8> for LogLevel {
+    type Error = ();
+    fn try_from(v: u8) -> Result<Self, ()> { match v { 0 => Ok(Self::Emerg), ... } }
+  }
+Use level.try_from(...).unwrap_or(LogLevel::Debug) in read_if_seq.
+
+MEDIUM | printk.rs | PrintkRecord is Copy and ~208 bytes — expensive copies
+Each snapshot_latest call copies records of ~208 bytes by value into the output
+slice. In a hot diagnostic path this adds up.
+FIX: Document the size in a comment. If records are frequently copied, consider
+a read-into-borrowed-slice API instead of returning by value.
+
+MEDIUM | printk.rs | threaded_drain_applies_console_loglevel test is stateful
+The test calls set_console_loglevel(LogLevel::Warn) on the global static PRINTK.
+Concurrent tests will see a modified log level.
+FIX: Tests that modify global state must either run sequentially (#[serial]) or
+use a local PrintkRing instance rather than the global static.
+
+LOW | printk.rs | printk_args is not marked inline
+On hot paths (frequent logging), the format_args overhead is fixed but the
+function call overhead adds up. Consider #[inline] on printk_args.
+
+LOW | printk.rs | PRINTK static ring ~26KB in BSS — should be documented
+128 slots × (8+2+1+1+1 + 192) bytes = ~26KB. Fine for a kernel, but document it.
+
+================================================================================
+CROSS-CUTTING ISSUES (affect multiple modules)
+================================================================================
+
+CROSS-1 | RECURRING: while loops instead of for ranges
+Every module uses while i < N { ...; i += 1 }
+FIX: Replace with for i in 0..N throughout the entire codebase.
+
+CROSS-2 | RECURRING: Missing Display impls for error types
+IpcError, CapabilityDeriveError, SchedulerError, VmError, KernelError, TopologyError
+all lack core::fmt::Display.
+FIX: Implement Display for all error types with human-readable messages.
+
+CROSS-3 | RECURRING: Power-of-two ring buffer sizes unasserted
+ipc.rs, scheduler.rs, smp.rs, printk.rs all use bitmask/modulo without asserting
+that capacity is a power of two.
+FIX: Add to each module:
+  const _: () = assert!(CAPACITY.is_power_of_two(), "must be power of two");
+
+CROSS-4 | RECURRING: Raw u64/usize for typed identifiers
+tid: u64, thread_group_id: u64, irq: u16 instead of ThreadId, ThreadGroupId, IrqNumber.
+FIX: Define newtypes for every domain identifier and use them consistently.
+
+CROSS-5 | RECURRING: Capability name field
+name: &'static str in Capability wastes 2KB across 128 slots.
+FIX: Remove name from Capability struct and all Capability::new() call sites.
+
+CROSS-6 | ARCHITECTURE: Tick/TickInstant/TickDuration defined in multiple places
+timer.rs defines Tick, task.rs defines TickInstant and TickDuration independently.
+FIX: Create time.rs with pub struct Tick(pub u64) and pub struct TickDuration(pub u64).
+Import everywhere. Remove duplicates.
+
+CROSS-7 | ARCHITECTURE: Copy on kernel identity types
+ThreadControlBlock and TrapFrame derive Copy — these represent unique kernel
+objects and must not be silently duplicated.
+FIX: Remove Copy from both. Audit all call sites.
+
+CROSS-8 | ARCHITECTURE: Bring-up protocol requires topology and scheduler coordination
+The SMP bring-up sequence spans CpuTopology, SmpScheduler, and KernelState.
+There is no single authoritative sequence document.
+FIX: Add a module-level doc comment in bootstrap.rs or a separate smp_bringup.rs
+documenting the exact sequence:
+  1. Bootstrap calls topology.start_secondary_cpu(cpu)
+  2. Bootstrap sends SIPI/platform-specific wake signal to secondary
+  3. Secondary entry runs, calls topology.acknowledge_secondary_cpu(self_id)
+  4. Bootstrap spins on topology.check_secondary_ack(cpu) until Ok
+  5. Bootstrap calls topology.mark_cpu_online(cpu)
+  6. Bootstrap enqueues initial task on secondary via scheduler.enqueue_on(cpu, tid)
+
+
+================================================================================
+PRIORITY ORDER FOR FIXES
+================================================================================
+
+PHASE 1 — Security and data corruption (fix before any deployment):
+  1.  capabilities.rs: Fix revoke() silent child drop (mark-and-sweep)
+  2.  syscall.rs: Add capability rights checks to ipc_send/ipc_recv
+  3.  syscall.rs: Add user pointer validation before SharedMemoryRegion encoding
+  4.  syscall.rs: Fix shared-mem detection (use opcode discriminant)
+  5.  trapframe.rs: Fix capture_user_context reading wrong registers
+  6.  lock.rs: Add #[must_use] to lock()
+  7.  lock.rs: Add SpinLockIrq variant
+  8.  printk.rs: Fix dropped counter / truncation semantic
+  9.  printk.rs: Remove synchronous console drain from printk_args
+  10. topology.rs: Fix complete_secondary_bring_up bypassing the protocol
+  11. topology.rs: Add SMP protection (AtomicU64 or SpinLockIrq)
+
+PHASE 2 — Architectural cleanup (define microkernel boundary):
+  12. bootstrap.rs: Remove ServiceRole and delegation edges
+  13. task.rs: Remove POSIX fields (robust_futex, brk_base/brk_end, tls_restore_pending)
+  14. bootstrap.rs: Remove task_mem byte-array, implement real copy_from/to_user
+  15. bootstrap.rs: Move restart policy enforcement to userspace
+  16. bootstrap.rs: Fix KernelState stack allocation (use static)
+  17. capabilities.rs: Remove name field from Capability
+  18. trap.rs: Redesign TrapEvent as enum (invalid states unrepresentable)
+
+PHASE 3 — Correctness and invariants:
+  19. scheduler.rs: Fix encode/decode (use OCCUPIED_BIT)
+  20. scheduler.rs: Remove current_cpu from SmpScheduler
+  21. scheduler.rs: Replace dequeue_highest with three-queue design
+  22. vm.rs: Fix mapping_is_allowed guard page rejection
+  23. vm.rs: Fix allocate_asid loop bound
+  24. vm.rs: Add TLB shootdown to destroy()
+  25. bootstrap.rs: Fix process_cross_cpu_work_for_cpu silent drop
+  26. bootstrap.rs: Fix handle_trap PageFault/ExternalInterrupt silent no-op
+  27. bootstrap.rs: Remove switch_to_runnable_tid busy loop
+  28. timer.rs: Replace modulo with countdown counter
+  29. topology.rs: Fix detect_secondary_cpus loop (for range, usize cpu)
+  30. topology.rs: Add CpuBitmap width assertion vs MAX_CPUS
+  31. topology.rs: Add TopologyError typed error type
+  32. printk.rs: Replace [AtomicU8; 192] per slot with seqlock over plain bytes
+  33. printk.rs: Remove global reader_seq, pass cursor to drain_for_console
+
+PHASE 4 — Type system and style:
+  34. All modules: Replace while-counter loops with for ranges
+  35. All modules: Add power-of-two assertions to ring buffers
+  36. All modules: Add Display impls to all error types
+  37. All modules: Replace raw u64/usize identifiers with newtypes
+  38. task.rs: Remove Copy from ThreadControlBlock
+  39. trapframe.rs: Remove Copy from TrapFrame
+  40. Create time.rs with shared Tick and TickDuration types
+  41. capabilities.rs: Replace CapRights enum with bitflag set
+  42. ipc.rs: Fix send() to return IpcError::EndpointFull
+  43. lock.rs: Add cache-line padding between held and value
+  44. printk.rs: Replace % PRB_SLOTS with & (PRB_SLOTS - 1) after power-of-two assert
+
+
+================================================================================
+END OF REVIEW
+================================================================================
