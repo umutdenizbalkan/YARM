@@ -66,14 +66,21 @@ pub struct Capability {
 }
 
 impl Capability {
-    pub const fn new(object: CapObject, rights: &[CapRights]) -> Self {
+    const fn rights_to_bits(rights: &[CapRights]) -> u8 {
         let mut idx = 0;
         let mut bits = 0;
         while idx < rights.len() {
             bits |= rights[idx].bit();
             idx += 1;
         }
-        Self { object, rights_bits: bits }
+        bits
+    }
+
+    pub const fn new(object: CapObject, rights: &[CapRights]) -> Self {
+        Self {
+            object,
+            rights_bits: Self::rights_to_bits(rights),
+        }
     }
 
     pub const fn has_right(self, right: CapRights) -> bool {
@@ -82,6 +89,17 @@ impl Capability {
 
     pub const fn rights_bits(self) -> u8 {
         self.rights_bits
+    }
+
+    pub const fn can_derive(self, rights: &[CapRights]) -> bool {
+        (Self::rights_to_bits(rights) & !self.rights_bits) == 0
+    }
+
+    pub const fn derive(self, rights: &[CapRights]) -> Result<Self, CapabilityDeriveError> {
+        if !self.can_derive(rights) {
+            return Err(CapabilityDeriveError::RightsEscalation);
+        }
+        Ok(Self::new(self.object, rights))
     }
 }
 
@@ -166,11 +184,7 @@ impl CapabilitySpace {
         let parent_cap = self
             .get(parent)
             .ok_or(CapabilityDeriveError::ParentMissing)?;
-        let derived = Capability::new(parent_cap.object, rights);
-        if (derived.rights_bits() & !parent_cap.rights_bits()) != 0 {
-            return Err(CapabilityDeriveError::RightsEscalation);
-        }
-
+        let derived = parent_cap.derive(rights)?;
         self.mint_with_parent(derived, Some(parent))
     }
 
@@ -235,6 +249,10 @@ impl CapabilitySpace {
             .map(|capability| capability.has_right(right))
             .unwrap_or(false)
     }
+
+    pub fn contains(&self, id: CapId) -> bool {
+        self.get(id).is_some()
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +280,32 @@ mod tests {
                 index: 0,
                 generation: 1
             }
+        );
+    }
+
+    #[test]
+    fn capability_can_derive_subset_without_escalation() {
+        let parent = Capability::new(
+            CapObject::Endpoint {
+                index: 0,
+                generation: 1,
+            },
+            &[CapRights::Send, CapRights::Receive],
+        );
+        assert!(parent.can_derive(&[CapRights::Send]));
+        assert_eq!(
+            parent.derive(&[CapRights::Send]).expect("subset"),
+            Capability::new(
+                CapObject::Endpoint {
+                    index: 0,
+                    generation: 1,
+                },
+                &[CapRights::Send],
+            )
+        );
+        assert_eq!(
+            parent.derive(&[CapRights::Schedule]),
+            Err(CapabilityDeriveError::RightsEscalation)
         );
     }
 
@@ -346,5 +390,7 @@ mod tests {
         assert_ne!(first, second);
         assert!(cspace.get(first).is_none());
         assert!(cspace.get(second).is_some());
+        assert!(cspace.contains(second));
+        assert!(!cspace.contains(first));
     }
 }

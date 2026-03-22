@@ -98,6 +98,35 @@ impl From<KernelError> for SyscallError {
     }
 }
 
+fn current_tid(kernel: &KernelState) -> Result<u64, SyscallError> {
+    kernel.current_tid().ok_or(SyscallError::Internal)
+}
+
+fn current_task_has_user_asid(kernel: &KernelState) -> Result<bool, SyscallError> {
+    Ok(kernel.task_asid(current_tid(kernel)?).is_some())
+}
+
+fn record_user_fault(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+    addr: usize,
+    access: FaultAccess,
+) {
+    kernel.record_fault(FaultInfo {
+        addr: VirtAddr(addr as u64),
+        access,
+    });
+    frame.set_err(SyscallError::PageFault.code());
+}
+
+fn transfer_flag_bits(transfer_cap: Option<CapId>) -> u16 {
+    if transfer_cap.is_some() {
+        Message::FLAG_CAP_TRANSFER
+    } else {
+        0
+    }
+}
+
 fn sender_tid_to_ret(tid: u64) -> Result<usize, SyscallError> {
     usize::try_from(tid).map_err(|_| SyscallError::Internal)
 }
@@ -184,9 +213,9 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         validate_transfer_cap(kernel, c)?;
     }
 
-    let sender_tid = kernel.current_tid().ok_or(SyscallError::Internal)?;
+    let sender_tid = current_tid(kernel)?;
 
-    let msg = if kernel.task_asid(sender_tid).is_some() {
+    let msg = if current_task_has_user_asid(kernel)? {
         if len > Message::MAX_PAYLOAD {
             let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
             let grant = kernel
@@ -214,11 +243,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             let payload = match kernel.copy_from_current_user(user_ptr_or_offset, len) {
                 Ok(payload) => payload,
                 Err(KernelError::UserMemoryFault) => {
-                    kernel.record_fault(FaultInfo {
-                        addr: VirtAddr(user_ptr_or_offset as u64),
-                        access: FaultAccess::Read,
-                    });
-                    frame.set_err(SyscallError::PageFault.code());
+                    record_user_fault(kernel, frame, user_ptr_or_offset, FaultAccess::Read);
                     return Ok(());
                 }
                 Err(other) => return Err(SyscallError::from(other)),
@@ -227,11 +252,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             Message::with_header(
                 sender_tid,
                 OPCODE_INLINE,
-                if transfer_cap.is_some() {
-                    Message::FLAG_CAP_TRANSFER
-                } else {
-                    0
-                },
+                transfer_flag_bits(transfer_cap),
                 transfer_cap.map(|c| c.0),
                 &payload[..len],
             )
@@ -242,11 +263,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         Message::with_header(
             sender_tid,
             OPCODE_INLINE,
-            if transfer_cap.is_some() {
-                Message::FLAG_CAP_TRANSFER
-            } else {
-                0
-            },
+            transfer_flag_bits(transfer_cap),
             transfer_cap.map(|c| c.0),
             &payload[..len],
         )
@@ -271,8 +288,7 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             let sender = sender_tid_to_ret(msg.sender_tid.0)?;
             encode_transfer_cap_ret(frame, msg.transferred_cap().map(|c| c.0))?;
 
-            let current_tid = kernel.current_tid().ok_or(SyscallError::Internal)?;
-            if kernel.task_asid(current_tid).is_some() {
+            if current_task_has_user_asid(kernel)? {
                 if msg.opcode == OPCODE_SHARED_MEM {
                     let desc = SharedMemoryRegion::decode(msg.as_slice())
                         .ok_or(SyscallError::InvalidArgs)?;
@@ -293,11 +309,7 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 match kernel.copy_to_current_user(user_ptr, msg.as_slice()) {
                     Ok(()) => frame.set_ok(sender, msg.len as usize, frame.ret2()),
                     Err(KernelError::UserMemoryFault) => {
-                        kernel.record_fault(FaultInfo {
-                            addr: VirtAddr(user_ptr as u64),
-                            access: FaultAccess::Write,
-                        });
-                        frame.set_err(SyscallError::PageFault.code());
+                        record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
                         return Ok(());
                     }
                     Err(other) => return Err(SyscallError::from(other)),
