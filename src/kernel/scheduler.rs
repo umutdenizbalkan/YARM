@@ -21,7 +21,6 @@ pub enum SchedulerError {
     CpuOffline,
     QueueFull,
     AlreadyQueued,
-    CurrentOccupied,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +94,10 @@ impl PriorityScheduler {
         let mut i = 0;
         while i < self.len {
             let idx = Self::queue_index(self.head + i);
-            if self.run_queue[idx].task().is_some_and(|task| task.tid == tid) {
+            if self.run_queue[idx]
+                .task()
+                .is_some_and(|task| task.tid == tid)
+            {
                 return true;
             }
             i += 1;
@@ -241,8 +243,7 @@ impl SmpScheduler {
             }
             idx += 1;
         }
-        best.map(|(_, cpu)| cpu)
-            .ok_or(SchedulerError::CpuOffline)
+        best.map(|(_, cpu)| cpu).ok_or(SchedulerError::CpuOffline)
     }
 
     pub fn current_cpu(&self) -> CpuId {
@@ -417,11 +418,9 @@ mod tests {
         let mut sched = PriorityScheduler::default();
         assert!(sched.enqueue_with_priority(10, TaskPriority::Low).is_ok());
         assert!(sched.enqueue_with_priority(20, TaskPriority::High).is_ok());
-        assert!(
-            sched
-                .enqueue_with_priority(30, TaskPriority::Normal)
-                .is_ok()
-        );
+        assert!(sched
+            .enqueue_with_priority(30, TaskPriority::Normal)
+            .is_ok());
 
         assert_eq!(sched.dispatch_next(), Some(20));
         assert_eq!(sched.current_priority(), Some(TaskPriority::High));
@@ -431,11 +430,9 @@ mod tests {
     fn scheduler_wraparound_and_overflow_path() {
         let mut sched = PriorityScheduler::default();
         for tid in 0..MAX_RUN_QUEUE as u64 {
-            assert!(
-                sched
-                    .enqueue_with_priority(tid, TaskPriority::Normal)
-                    .is_ok()
-            );
+            assert!(sched
+                .enqueue_with_priority(tid, TaskPriority::Normal)
+                .is_ok());
         }
         assert_eq!(
             sched.enqueue_with_priority(999, TaskPriority::Normal),
@@ -447,11 +444,9 @@ mod tests {
             let _ = sched.block_current();
         }
         for tid in 1000..1000 + (MAX_RUN_QUEUE / 2) as u64 {
-            assert!(
-                sched
-                    .enqueue_with_priority(tid, TaskPriority::Normal)
-                    .is_ok()
-            );
+            assert!(sched
+                .enqueue_with_priority(tid, TaskPriority::Normal)
+                .is_ok());
         }
     }
 
@@ -462,16 +457,12 @@ mod tests {
         assert!(sched.bring_up_cpu(CpuId(1)).is_ok());
         assert_eq!(sched.online_cpu_count(), 2);
 
-        assert!(
-            sched
-                .enqueue_on_with_priority(CpuId(0), 10, TaskPriority::Normal)
-                .is_ok()
-        );
-        assert!(
-            sched
-                .enqueue_on_with_priority(CpuId(1), 20, TaskPriority::High)
-                .is_ok()
-        );
+        assert!(sched
+            .enqueue_on_with_priority(CpuId(0), 10, TaskPriority::Normal)
+            .is_ok());
+        assert!(sched
+            .enqueue_on_with_priority(CpuId(1), 20, TaskPriority::High)
+            .is_ok());
 
         assert_eq!(sched.dispatch_next_on(CpuId(0)), Some(10));
         assert_eq!(sched.dispatch_next_on(CpuId(1)), Some(20));
@@ -482,13 +473,19 @@ mod tests {
     #[test]
     fn smp_enqueue_on_offline_cpu_returns_typed_error() {
         let mut sched = SmpScheduler::default();
-        assert_eq!(sched.enqueue_on(CpuId(2), 55), Err(SchedulerError::CpuOffline));
+        assert_eq!(
+            sched.enqueue_on(CpuId(2), 55),
+            Err(SchedulerError::CpuOffline)
+        );
     }
 
     #[test]
     fn smp_set_current_cpu_rejects_invalid_cpu() {
         let mut sched = SmpScheduler::default();
-        assert_eq!(sched.set_current_cpu(CpuId(MAX_CPUS as u8)), Err(SchedulerError::InvalidCpu));
+        assert_eq!(
+            sched.set_current_cpu(CpuId(MAX_CPUS as u8)),
+            Err(SchedulerError::InvalidCpu)
+        );
     }
 
     #[test]

@@ -1,12 +1,15 @@
 use super::ipc::Message;
 use super::proc_proto::{
-    PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
-    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply,
+    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply, PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID,
+    PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
 };
 use super::task::ThreadGroupId;
 
 const MAX_PROCESSES: usize = 64;
 const MAX_THREADS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProcessId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessManagerError {
@@ -20,24 +23,24 @@ pub enum ProcessManagerError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnV2Request {
-    pub parent_pid: u64,
+    pub parent_pid: ProcessId,
     pub image_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaitPidV2Request {
-    pub caller_pid: u64,
-    pub target_pid: u64,
+    pub caller_pid: ProcessId,
+    pub target_pid: ProcessId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnV2Result {
-    pub pid: u64,
+    pub pid: ProcessId,
 }
 
 impl SpawnV2Result {
     pub const fn encode(self) -> [u8; 8] {
-        self.pid.to_le_bytes()
+        self.pid.0.to_le_bytes()
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, ProcessManagerError> {
@@ -47,7 +50,7 @@ impl SpawnV2Result {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&payload[..8]);
         Ok(Self {
-            pid: u64::from_le_bytes(bytes),
+            pid: ProcessId(u64::from_le_bytes(bytes)),
         })
     }
 }
@@ -76,19 +79,19 @@ impl ElfImageInfo {
 }
 
 pub struct WaitPidV2Result {
-    pub waited_pid: u64,
+    pub waited_pid: ProcessId,
     pub exit_code: u64,
 }
 
 impl WaitPidV2Result {
     pub const fn encode(self) -> [u8; 16] {
-        WaitPidV2Reply::new(self.waited_pid, self.exit_code).encode()
+        WaitPidV2Reply::new(self.waited_pid.0, self.exit_code).encode()
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, ProcessManagerError> {
         let args = WaitPidV2Reply::decode(payload).map_err(|_| ProcessManagerError::Malformed)?;
         Ok(Self {
-            waited_pid: args.waited_pid,
+            waited_pid: ProcessId(args.waited_pid),
             exit_code: args.exit_code,
         })
     }
@@ -105,8 +108,8 @@ pub enum ProcessRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProcessRecord {
-    pid: u64,
-    parent_pid: u64,
+    pid: ProcessId,
+    parent_pid: ProcessId,
     exited: bool,
     exit_code: u64,
 }
@@ -114,13 +117,13 @@ struct ProcessRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ThreadIdentityRecord {
     tid: u64,
-    pid: u64,
+    pid: ProcessId,
     thread_group_id: ThreadGroupId,
 }
 
 #[derive(Debug)]
 pub struct ProcessManagerLite {
-    next_pid: u64,
+    next_pid: ProcessId,
     table: [Option<ProcessRecord>; MAX_PROCESSES],
     threads: [Option<ThreadIdentityRecord>; MAX_THREADS],
 }
@@ -134,7 +137,7 @@ impl Default for ProcessManagerLite {
 impl ProcessManagerLite {
     pub const fn new() -> Self {
         Self {
-            next_pid: 1000,
+            next_pid: ProcessId(1000),
             table: [None; MAX_PROCESSES],
             threads: [None; MAX_THREADS],
         }
@@ -168,7 +171,7 @@ impl ProcessManagerLite {
                 let args = SpawnV2Args::decode(msg.as_slice())
                     .map_err(|_| ProcessManagerError::Malformed)?;
                 Ok(ProcessRequest::SpawnV2(SpawnV2Request {
-                    parent_pid: args.parent_pid,
+                    parent_pid: ProcessId(args.parent_pid),
                     image_id: args.image_id,
                 }))
             }
@@ -176,8 +179,8 @@ impl ProcessManagerLite {
                 let args = WaitPidV2Args::decode(msg.as_slice())
                     .map_err(|_| ProcessManagerError::Malformed)?;
                 Ok(ProcessRequest::WaitPidV2(WaitPidV2Request {
-                    caller_pid: args.caller_pid,
-                    target_pid: args.target_pid,
+                    caller_pid: ProcessId(args.caller_pid),
+                    target_pid: ProcessId(args.target_pid),
                 }))
             }
             _ => Err(ProcessManagerError::Unsupported),
@@ -191,7 +194,7 @@ impl ProcessManagerLite {
 
     pub fn register_thread_identity(
         &mut self,
-        pid: u64,
+        pid: ProcessId,
         tid: u64,
         thread_group_id: ThreadGroupId,
     ) -> Result<(), ProcessManagerError> {
@@ -224,26 +227,26 @@ impl ProcessManagerLite {
             .copied()
     }
 
-    fn process_id_for_tid(&self, caller_tid: u64) -> u64 {
+    fn process_id_for_tid(&self, caller_tid: u64) -> ProcessId {
         self.thread_identity(caller_tid)
             .map(|record| record.pid)
-            .unwrap_or(caller_tid)
+            .unwrap_or(ProcessId(caller_tid))
     }
 
     pub fn spawn_from_elf_image(
         &mut self,
-        parent_pid: u64,
+        parent_pid: ProcessId,
         image_id: u64,
         image: &[u8],
-    ) -> Result<(u64, ElfImageInfo), ProcessManagerError> {
+    ) -> Result<(ProcessId, ElfImageInfo), ProcessManagerError> {
         let info = ElfImageInfo::parse(image_id, image)?;
         let pid = self.alloc_process(parent_pid)?;
         Ok((pid, info))
     }
 
-    fn alloc_process(&mut self, parent_pid: u64) -> Result<u64, ProcessManagerError> {
+    fn alloc_process(&mut self, parent_pid: ProcessId) -> Result<ProcessId, ProcessManagerError> {
         let pid = self.next_pid;
-        self.next_pid = self.next_pid.saturating_add(1);
+        self.next_pid = ProcessId(self.next_pid.0.saturating_add(1));
         if let Some(slot) = self.table.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(ProcessRecord {
                 pid,
@@ -251,14 +254,14 @@ impl ProcessManagerLite {
                 exited: false,
                 exit_code: 0,
             });
-            self.register_thread_identity(pid, pid, ThreadGroupId(pid))?;
+            self.register_thread_identity(pid, pid.0, ThreadGroupId(pid.0))?;
             Ok(pid)
         } else {
             Err(ProcessManagerError::TableFull)
         }
     }
 
-    pub fn mark_exit(&mut self, pid: u64, code: u64) -> Result<(), ProcessManagerError> {
+    pub fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessManagerError> {
         let record = self
             .table
             .iter_mut()
@@ -270,7 +273,7 @@ impl ProcessManagerLite {
         Ok(())
     }
 
-    fn lookup_parent(&self, pid: u64) -> Option<u64> {
+    fn lookup_parent(&self, pid: ProcessId) -> Option<ProcessId> {
         self.table
             .iter()
             .flatten()
@@ -278,7 +281,7 @@ impl ProcessManagerLite {
             .map(|record| record.parent_pid)
     }
 
-    fn wait_result(&mut self, target_pid: u64) -> WaitPidV2Result {
+    fn wait_result(&mut self, target_pid: ProcessId) -> WaitPidV2Result {
         if let Some((idx, record)) = self
             .table
             .iter()
@@ -313,13 +316,15 @@ impl ProcessManagerLite {
     pub fn handle_request(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
         match Self::parse_request(request)? {
             ProcessRequest::GetPid { caller_tid } => {
-                Self::u64_reply(PROC_OP_GETPID, self.process_id_for_tid(caller_tid))
+                Self::u64_reply(PROC_OP_GETPID, self.process_id_for_tid(caller_tid).0)
             }
             ProcessRequest::GetPpid { caller_tid } => {
                 let pid = self.process_id_for_tid(caller_tid);
                 Self::u64_reply(
                     PROC_OP_GETPPID,
-                    self.lookup_parent(pid).unwrap_or(pid.saturating_sub(1)),
+                    self.lookup_parent(pid)
+                        .unwrap_or(ProcessId(pid.0.saturating_sub(1)))
+                        .0,
                 )
             }
             ProcessRequest::Exit { .. } => Self::u64_reply(PROC_OP_EXIT, 0),
@@ -365,7 +370,7 @@ impl ProcessService {
         self.handled
     }
 
-    pub fn mark_exit(&mut self, pid: u64, code: u64) -> Result<(), ProcessManagerError> {
+    pub fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessManagerError> {
         self.manager.mark_exit(pid, code)
     }
 
@@ -409,9 +414,9 @@ mod tests {
         image[24..32].copy_from_slice(&0x402000u64.to_le_bytes());
 
         let (pid, info) = pm
-            .spawn_from_elf_image(1, 9, &image)
+            .spawn_from_elf_image(ProcessId(1), 9, &image)
             .expect("spawn from image");
-        assert!(pid >= 1000);
+        assert!(pid >= ProcessId(1000));
         assert_eq!(info.image_id, 9);
         assert_eq!(info.entry, 0x402000);
     }
@@ -430,7 +435,7 @@ mod tests {
         assert_eq!(
             req,
             ProcessRequest::SpawnV2(SpawnV2Request {
-                parent_pid: 7,
+                parent_pid: ProcessId(7),
                 image_id: 99,
             })
         );
@@ -457,7 +462,7 @@ mod tests {
             PROC_OP_WAITPID_V2,
             0,
             None,
-            &WaitPidV2Args::new(1, spawned.pid).encode(),
+            &WaitPidV2Args::new(1, spawned.pid.0).encode(),
         )
         .expect("wait");
         let wait_reply = pm.handle_request(wait).expect("wait reply");
@@ -502,7 +507,7 @@ mod tests {
             PROC_OP_WAITPID_V2,
             0,
             None,
-            &WaitPidV2Args::new(1, spawned.pid).encode(),
+            &WaitPidV2Args::new(1, spawned.pid.0).encode(),
         )
         .expect("wait");
         let _ = pm.handle_request(wait).expect("wait reply");
@@ -528,7 +533,7 @@ mod tests {
             PROC_OP_WAITPID_V2,
             0,
             None,
-            &WaitPidV2Args::new(99, spawned.pid).encode(),
+            &WaitPidV2Args::new(99, spawned.pid.0).encode(),
         )
         .expect("wait");
         assert_eq!(
@@ -576,13 +581,13 @@ mod tests {
     #[test]
     fn process_manager_tracks_explicit_thread_identities() {
         let mut pm = ProcessManagerLite::new();
-        let pid = pm.alloc_process(1).expect("pid");
-        pm.register_thread_identity(pid, 2000, ThreadGroupId(pid))
+        let pid = pm.alloc_process(ProcessId(1)).expect("pid");
+        pm.register_thread_identity(pid, 2000, ThreadGroupId(pid.0))
             .expect("thread");
         assert_eq!(pm.process_id_for_tid(2000), pid);
         assert_eq!(
             pm.thread_identity(2000).expect("identity").thread_group_id,
-            ThreadGroupId(pid)
+            ThreadGroupId(pid.0)
         );
     }
 }

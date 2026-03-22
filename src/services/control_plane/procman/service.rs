@@ -1,5 +1,5 @@
 use crate::kernel::ipc::Message;
-use crate::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
+use crate::kernel::proc_proto::{SpawnV2Args, WaitPidV2Args, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2};
 use crate::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use crate::services::common::service::{run_typed_request_loop, RequestResponseService};
 
@@ -20,8 +20,14 @@ pub fn run() {
 
     let replies = run_typed_request_loop(
         &mut service,
-        [Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &SpawnV2Args::new(1, 42).encode())
-            .expect("spawn")],
+        [Message::with_header(
+            0,
+            PROC_OP_SPAWN_V2,
+            0,
+            None,
+            &SpawnV2Args::new(1, 42).encode(),
+        )
+        .expect("spawn")],
     )
     .expect("spawn loop");
     let spawn_reply = replies[0];
@@ -36,7 +42,7 @@ pub fn run() {
             PROC_OP_WAITPID_V2,
             0,
             None,
-            &WaitPidV2Args::new(1, spawned.pid).encode(),
+            &WaitPidV2Args::new(1, spawned.pid.0).encode(),
         )
         .expect("wait")],
     )
@@ -45,7 +51,7 @@ pub fn run() {
 
     crate::yarm_log!(
         "process-manager demo ready: pid={}, exit_code={}, handled={}",
-        waited.waited_pid,
+        waited.waited_pid.0,
         waited.exit_code,
         service.handled_count()
     );

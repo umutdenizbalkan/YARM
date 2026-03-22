@@ -2,8 +2,9 @@
 use yarm::kernel::ipc::Message;
 use yarm::kernel::proc_proto::{SpawnV2Args, WaitPidV2Args, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2};
 use yarm::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
-use yarm::kernel::vfs::{openat_message, read_message, OpenAtRequest, ReadWriteRequest, VfsLiteService};
-
+use yarm::kernel::vfs::{
+    openat_message, read_message, OpenAtRequest, ReadWriteRequest, VfsLiteService,
+};
 
 fn main() {
     let mut proc = ProcessService::new();
@@ -24,7 +25,7 @@ fn main() {
         PROC_OP_WAITPID_V2,
         0,
         None,
-        &WaitPidV2Args::new(1, child.pid).encode(),
+        &WaitPidV2Args::new(1, child.pid.0).encode(),
     )
     .expect("wait");
     let wait_rep = proc.handle(wait).expect("wait rep");
@@ -84,7 +85,7 @@ mod tests {
             PROC_OP_WAITPID_V2,
             0,
             None,
-            &WaitPidV2Args::new(1, child.pid).encode(),
+            &WaitPidV2Args::new(1, child.pid.0).encode(),
         )
         .expect("wait");
         let wait_rep = proc.handle(wait).expect("wait rep");

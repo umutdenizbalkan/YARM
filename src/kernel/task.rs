@@ -57,6 +57,15 @@ pub struct RobustFutexState {
     pub len: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinuxThreadState {
+    pub tls_base: Option<usize>,
+    pub tls_restore_pending: bool,
+    pub robust_futex: Option<RobustFutexState>,
+    pub brk_base: Option<VirtAddr>,
+    pub brk_end: Option<VirtAddr>,
+}
+
 /// Restart/backoff state tracked in scheduler ticks.
 ///
 /// `available_at` is an absolute tick instant in the same clock domain as
@@ -78,17 +87,13 @@ pub struct ThreadControlBlock {
     pub class: TaskClass,
     pub status: TaskStatus,
     pub asid: Option<Asid>,
-    pub tls_base: Option<usize>,
-    pub tls_restore_pending: bool,
+    pub linux: LinuxThreadState,
     pub user_entry: Option<usize>,
     pub user_stack_top: Option<usize>,
     pub user_context: UserRegisterContext,
     pub detach_state: ThreadDetachState,
-    pub robust_futex: Option<RobustFutexState>,
     /// `None` means fallback to kernel/class policy in `KernelState`.
     pub fault_policy_override: Option<FaultPolicy>,
-    pub brk_base: Option<VirtAddr>,
-    pub brk_end: Option<VirtAddr>,
     pub restart: RestartState,
     pub last_exit_code: Option<u64>,
 }
@@ -118,8 +123,16 @@ mod tests {
             class: TaskClass::App,
             status: TaskStatus::Runnable,
             asid: Some(Asid(1)),
-            tls_base: Some(0xDEAD_BEEF),
-            tls_restore_pending: true,
+            linux: LinuxThreadState {
+                tls_base: Some(0xDEAD_BEEF),
+                tls_restore_pending: true,
+                robust_futex: Some(RobustFutexState {
+                    head: 0x9000,
+                    len: 3,
+                }),
+                brk_base: Some(VirtAddr(0x1000)),
+                brk_end: Some(VirtAddr(0x2000)),
+            },
             user_entry: Some(0x4000),
             user_stack_top: Some(0x8000),
             user_context: UserRegisterContext {
@@ -129,13 +142,7 @@ mod tests {
                 arg1: 2,
             },
             detach_state: ThreadDetachState::Joinable,
-            robust_futex: Some(RobustFutexState {
-                head: 0x9000,
-                len: 3,
-            }),
             fault_policy_override: Some(FaultPolicy::KillTask),
-            brk_base: Some(VirtAddr(0x1000)),
-            brk_end: Some(VirtAddr(0x2000)),
             restart: RestartState {
                 token: Some(RestartToken(9)),
                 budget: 3,
@@ -150,12 +157,12 @@ mod tests {
         assert_eq!(tcb.tid, ThreadId(7));
         assert_eq!(tcb.restart.backoff, TickDuration(10));
         assert_eq!(tcb.thread_group_id, ThreadGroupId(7));
-        assert_eq!(tcb.tls_base, Some(0xDEAD_BEEF));
-        assert!(tcb.tls_restore_pending);
+        assert_eq!(tcb.linux.tls_base, Some(0xDEAD_BEEF));
+        assert!(tcb.linux.tls_restore_pending);
         assert_eq!(tcb.user_context.instruction_ptr, 0x4000);
         assert_eq!(tcb.detach_state, ThreadDetachState::Joinable);
         assert_eq!(
-            tcb.robust_futex,
+            tcb.linux.robust_futex,
             Some(RobustFutexState {
                 head: 0x9000,
                 len: 3

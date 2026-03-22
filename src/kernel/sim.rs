@@ -1,14 +1,14 @@
 use super::bootstrap::{Bootstrap, KernelError};
-use super::ipc::Message;
 use super::init_server::{
     CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitFaultHandoff, InitServerLite,
 };
+use super::ipc::Message;
 use super::proc_proto::{SpawnV2Args, WaitPidV2Args, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2};
 use super::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use super::vfs::{
     openat_message, read_message, MountRouter, OpenAtRequest, ReadWriteRequest, VfsLiteService,
 };
-use crate::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
+use crate::services::fs::initramfs::{InitramfsBackend, INITRAMFS_BUSYBOX_PATH_PTR};
 use crate::services::fs::ramfs::RamFsBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +154,7 @@ pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError
         PROC_OP_WAITPID_V2,
         0,
         None,
-        &WaitPidV2Args::new(1, child.pid).encode(),
+        &WaitPidV2Args::new(1, child.pid.0).encode(),
     )
     .map_err(|_| KernelError::WrongObject)?;
     let wait_rep = proc.handle(wait).map_err(|_| KernelError::WrongObject)?;
@@ -308,8 +308,8 @@ pub fn run_deterministic_script(steps: &[SimStep]) -> Result<SimSummary, KernelE
 mod tests {
     extern crate std;
 
-    use super::*;
     use super::super::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ};
+    use super::*;
 
     #[test]
     fn deterministic_init_core_bootstrap_replays_proc_and_vfs_path() {
