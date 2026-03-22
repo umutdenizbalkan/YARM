@@ -2,12 +2,12 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 use yarm::kernel::bootstrap::Bootstrap;
 use yarm::kernel::ipc::Message;
-use yarm::kernel::proc_proto::{SpawnV2Args, WaitPidV2Args, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2};
+use yarm::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
 use yarm::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use yarm::kernel::vfs::{
-    openat_message, read_message, OpenAtRequest, ReadWriteRequest, VfsLiteService,
+    OpenAtRequest, ReadWriteRequest, VfsLiteService, openat_message, read_message,
 };
-use yarm::services::fs::initramfs::{InitramfsBackend, INITRAMFS_BUSYBOX_PATH_PTR};
+use yarm::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 
 #[inline]
 fn run() {
@@ -65,7 +65,7 @@ fn run() {
 
     yarm::yarm_log!(
         "YARM_PROC_VFS_OK pid={} exit={} read_opcode={}",
-        child.pid,
+        child.pid.0,
         waited.exit_code,
         read_rep.opcode
     );

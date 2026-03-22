@@ -448,6 +448,17 @@ mod tests {
     }
 
     #[test]
+    fn status_tracks_bootstrap_progress() {
+        let status = SysdepsBootstrapStatus::in_progress();
+        assert!(status.startup_hook_ready);
+        assert!(status.memory_hooks_ready);
+        assert!(status.clock_hooks_ready);
+        assert!(status.thread_hooks_ready);
+        assert!(status.futex_hooks_ready);
+        assert!(status.io_hooks_ready);
+    }
+
+    #[test]
     fn musl_thread_validation_accepts_tls_updates_that_require_restore() {
         let mut kernel = Bootstrap::init().expect("init");
         let (asid, _aspace_cap) = kernel.create_user_address_space().expect("asid");
