@@ -28,6 +28,6 @@ pub fn run() {
     let routed = kernel.ipc_recv(proc_req_recv).expect("recv").is_some();
     crate::yarm_log!(
         "linux-compat server demo: translated getpid -> ret={}, routed_request={}",
-        frame.ret0, routed
+        frame.ret0(), routed
     );
 }

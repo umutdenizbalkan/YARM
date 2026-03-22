@@ -116,7 +116,7 @@ fn transfer_cap_arg(kernel: &KernelState, frame: &TrapFrame) -> Result<Option<Ca
 
 fn encode_transfer_cap_ret(frame: &mut TrapFrame, cap: Option<u64>) -> Result<(), SyscallError> {
     let value = cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
-    frame.ret2 = usize::try_from(value).map_err(|_| SyscallError::Internal)?;
+    frame.set_ret2(usize::try_from(value).map_err(|_| SyscallError::Internal)?);
     Ok(())
 }
 
@@ -281,10 +281,12 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                         .ok_or(SyscallError::InvalidArgs)?;
                     let region_len =
                         usize::try_from(desc.len).map_err(|_| SyscallError::InvalidArgs)?;
-                    frame.set_ok(sender, region_len, frame.ret2);
-                    frame.args[SYSCALL_ARG_INLINE_PAYLOAD0] =
-                        usize::try_from(desc.offset).map_err(|_| SyscallError::InvalidArgs)?;
-                    frame.args[SYSCALL_ARG_INLINE_PAYLOAD1] = region_len;
+                    frame.set_ok(sender, region_len, frame.ret2());
+                    frame.set_arg(
+                        SYSCALL_ARG_INLINE_PAYLOAD0,
+                        usize::try_from(desc.offset).map_err(|_| SyscallError::InvalidArgs)?,
+                    );
+                    frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, region_len);
                     return Ok(());
                 }
 
@@ -292,7 +294,7 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                     return Err(SyscallError::InvalidArgs);
                 }
                 match kernel.copy_to_current_user(user_ptr, msg.as_slice()) {
-                    Ok(()) => frame.set_ok(sender, msg.len as usize, frame.ret2),
+                    Ok(()) => frame.set_ok(sender, msg.len as usize, frame.ret2()),
                     Err(KernelError::UserMemoryFault) => {
                         kernel.record_fault(FaultInfo {
                             addr: VirtAddr(user_ptr as u64),
@@ -304,11 +306,11 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                     Err(other) => return Err(SyscallError::from(other)),
                 };
             } else {
-                frame.set_ok(sender, msg.len as usize, frame.ret2);
+                frame.set_ok(sender, msg.len as usize, frame.ret2());
                 let words =
                     pack_register_payload(msg.as_slice()).map_err(|_| SyscallError::InvalidArgs)?;
-                frame.args[SYSCALL_ARG_INLINE_PAYLOAD0] = words[0];
-                frame.args[SYSCALL_ARG_INLINE_PAYLOAD1] = words[1];
+                frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, words[0]);
+                frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
             }
         }
         None => {

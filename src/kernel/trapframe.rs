@@ -44,6 +44,46 @@ impl TrapFrame {
         Self::new(0, [0; syscall_abi::TRAPFRAME_ARG_REGS])
     }
 
+    pub const fn arg(&self, index: usize) -> usize {
+        self.args[index]
+    }
+
+    pub fn set_arg(&mut self, index: usize, value: usize) {
+        self.args[index] = value;
+    }
+
+    pub const fn ret0(&self) -> usize {
+        self.ret0
+    }
+
+    pub const fn ret1(&self) -> usize {
+        self.ret1
+    }
+
+    pub const fn ret2(&self) -> usize {
+        self.ret2
+    }
+
+    pub fn set_ret2(&mut self, value: usize) {
+        self.ret2 = value;
+    }
+
+    pub const fn saved_pc(&self) -> usize {
+        self.saved_pc
+    }
+
+    pub const fn saved_sp(&self) -> usize {
+        self.saved_sp
+    }
+
+    pub fn set_saved_pc(&mut self, value: usize) {
+        self.saved_pc = value;
+    }
+
+    pub fn set_saved_sp(&mut self, value: usize) {
+        self.saved_sp = value;
+    }
+
     pub fn set_ok(&mut self, ret0: usize, ret1: usize, ret2: usize) {
         self.ret0 = ret0;
         self.ret1 = ret1;
@@ -108,14 +148,14 @@ mod tests {
     #[test]
     fn new_zeroes_return_fields() {
         let frame = TrapFrame::new(1, [2, 3, 4, 5, 6, 7]);
-        assert_eq!(frame.ret0, 0);
-        assert_eq!(frame.ret1, 0);
-        assert_eq!(frame.ret2, 0);
-        assert_eq!(frame.error, 0);
+        assert_eq!(frame.ret0(), 0);
+        assert_eq!(frame.ret1(), 0);
+        assert_eq!(frame.ret2(), 0);
+        assert_eq!(frame.error_code(), None);
         assert!(!frame.is_error());
         assert_eq!(frame.error_code(), None);
-        assert_eq!(frame.saved_pc, 0);
-        assert_eq!(frame.saved_sp, 0);
+        assert_eq!(frame.saved_pc(), 0);
+        assert_eq!(frame.saved_sp(), 0);
     }
 
     #[test]
@@ -123,17 +163,17 @@ mod tests {
         let mut frame = TrapFrame::new(0, [0; 6]);
         frame.set_err(7);
         frame.set_ok(11, 22, 33);
-        assert_eq!(frame.ret0, 11);
-        assert_eq!(frame.ret1, 22);
-        assert_eq!(frame.ret2, 33);
-        assert_eq!(frame.error, 0);
+        assert_eq!(frame.ret0(), 11);
+        assert_eq!(frame.ret1(), 22);
+        assert_eq!(frame.ret2(), 33);
+        assert_eq!(frame.error_code(), None);
     }
 
     #[test]
     fn capture_and_apply_user_context_roundtrip() {
         let mut frame = TrapFrame::new(0, [5, 6, 0, 0, 0, 0]);
-        frame.saved_pc = 0x4000;
-        frame.saved_sp = 0x8000;
+        frame.set_saved_pc(0x4000);
+        frame.set_saved_sp(0x8000);
         let ctx = frame.capture_user_context();
         assert_eq!(ctx.instruction_ptr, 0x4000);
         assert_eq!(ctx.stack_ptr, 0x8000);
@@ -146,10 +186,10 @@ mod tests {
             arg0: 7,
             arg1: 8,
         });
-        assert_eq!(frame.saved_pc, 0x5000);
-        assert_eq!(frame.saved_sp, 0x9000);
-        assert_eq!(frame.args[0], 7);
-        assert_eq!(frame.args[1], 8);
+        assert_eq!(frame.saved_pc(), 0x5000);
+        assert_eq!(frame.saved_sp(), 0x9000);
+        assert_eq!(frame.arg(0), 7);
+        assert_eq!(frame.arg(1), 8);
     }
 
     #[test]
@@ -157,8 +197,8 @@ mod tests {
         let mut frame = TrapFrame::new(0, [0; 6]);
         frame.set_ok(55, 66, 77);
         frame.set_err(9);
-        assert_eq!(frame.ret0, 0);
-        assert_eq!(frame.ret1, 0);
+        assert_eq!(frame.ret0(), 0);
+        assert_eq!(frame.ret1(), 0);
         assert!(frame.is_error());
         assert_eq!(frame.error_code(), Some(9));
     }

@@ -1002,15 +1002,15 @@ mod tests {
             ],
         );
         dispatch(&mut state, &bindings, &mut mmap_frame);
-        assert_eq!(mmap_frame.error, 0);
-        assert_eq!(mmap_frame.ret0, 0x8000);
+        assert_eq!(mmap_frame.error_code(), None);
+        assert_eq!(mmap_frame.ret0(), 0x8000);
 
         let mut munmap_frame = TrapFrame::new(
             LINUX_NR_MUNMAP,
             [aspace_cap.0 as usize, 0x8000, PAGE_SIZE * 2, 0, 0, 0],
         );
         dispatch(&mut state, &bindings, &mut munmap_frame);
-        assert_eq!(munmap_frame.error, 0);
+        assert_eq!(munmap_frame.error_code(), None);
     }
 
     #[test]
@@ -1042,8 +1042,8 @@ mod tests {
 
         let mut getpid_frame = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut getpid_frame);
-        assert_eq!(getpid_frame.error, 0);
-        assert_eq!(getpid_frame.ret0, pid as usize);
+        assert_eq!(getpid_frame.error_code(), None);
+        assert_eq!(getpid_frame.ret0(), pid as usize);
 
         let req_msg = state
             .ipc_recv(req_recv)
@@ -1053,8 +1053,8 @@ mod tests {
 
         let mut getppid_frame = TrapFrame::new(LINUX_NR_GETPPID, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut getppid_frame);
-        assert_eq!(getppid_frame.error, 0);
-        assert_eq!(getppid_frame.ret0, ppid as usize);
+        assert_eq!(getppid_frame.error_code(), None);
+        assert_eq!(getppid_frame.ret0(), ppid as usize);
 
         let getppid_req = state
             .ipc_recv(req_recv)
@@ -1064,7 +1064,7 @@ mod tests {
 
         let mut exit_frame = TrapFrame::new(LINUX_NR_EXIT, [7, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut exit_frame);
-        assert_eq!(exit_frame.error, 0);
+        assert_eq!(exit_frame.error_code(), None);
 
         let exit_req = state
             .ipc_recv(req_recv)
@@ -1097,66 +1097,66 @@ mod tests {
 
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [3, 0x2000, 0x10, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut openat);
-        assert_eq!(openat.error, 0);
-        assert_eq!(openat.ret0, 42);
+        assert_eq!(openat.error_code(), None);
+        assert_eq!(openat.ret0(), 42);
         let open_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(open_req.opcode, VFS_OP_OPENAT);
 
         let mut close = TrapFrame::new(LINUX_NR_CLOSE, [42, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut close);
-        assert_eq!(close.error, 0);
+        assert_eq!(close.error_code(), None);
         let close_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(close_req.opcode, VFS_OP_CLOSE);
 
         let mut read = TrapFrame::new(LINUX_NR_READ, [42, 0x3000, 128, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut read);
-        assert_eq!(read.error, 0);
-        assert_eq!(read.ret0, 128);
+        assert_eq!(read.error_code(), None);
+        assert_eq!(read.ret0(), 128);
         let read_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(read_req.opcode, VFS_OP_READ);
 
         let mut write = TrapFrame::new(LINUX_NR_WRITE, [42, 0x4000, 64, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut write);
-        assert_eq!(write.error, 0);
-        assert_eq!(write.ret0, 64);
+        assert_eq!(write.error_code(), None);
+        assert_eq!(write.ret0(), 64);
         let write_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(write_req.opcode, VFS_OP_WRITE);
 
         let mut ioctl = TrapFrame::new(LINUX_NR_IOCTL, [42, 0x1234, 0x5555, 0x6666, 0, 0]);
         dispatch(&mut state, &bindings, &mut ioctl);
-        assert_eq!(ioctl.error, 0);
+        assert_eq!(ioctl.error_code(), None);
         let ioctl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(ioctl_req.opcode, VFS_OP_IOCTL);
 
         let mut dup = TrapFrame::new(LINUX_NR_DUP, [42, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut dup);
-        assert_eq!(dup.error, 0);
-        assert_eq!(dup.ret0, 43);
+        assert_eq!(dup.error_code(), None);
+        assert_eq!(dup.ret0(), 43);
         let dup_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(dup_req.opcode, VFS_OP_DUP);
 
         let mut fcntl = TrapFrame::new(LINUX_NR_FCNTL, [42, 3, 0xF0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut fcntl);
-        assert_eq!(fcntl.error, 0);
+        assert_eq!(fcntl.error_code(), None);
         let fcntl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(fcntl_req.opcode, VFS_OP_FCNTL);
 
         let mut poll = TrapFrame::new(LINUX_NR_POLL, [0x9000, 2, 10, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut poll);
-        assert_eq!(poll.error, 0);
-        assert_eq!(poll.ret0, 1);
+        assert_eq!(poll.error_code(), None);
+        assert_eq!(poll.ret0(), 1);
         let poll_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(poll_req.opcode, VFS_OP_POLL);
         let mut epoll_create = TrapFrame::new(LINUX_NR_EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut epoll_create);
-        assert_eq!(epoll_create.error, 0);
-        assert_eq!(epoll_create.ret0, 7);
+        assert_eq!(epoll_create.error_code(), None);
+        assert_eq!(epoll_create.ret0(), 7);
         let epc_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(epc_req.opcode, VFS_OP_EPOLL_CREATE1);
 
         let mut epoll_ctl = TrapFrame::new(LINUX_NR_EPOLL_CTL, [7, 1, 42, 0xA000, 0, 0]);
         dispatch(&mut state, &bindings, &mut epoll_ctl);
-        assert_eq!(epoll_ctl.error, 0);
+        assert_eq!(epoll_ctl.error_code(), None);
         let epctl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(epctl_req.opcode, VFS_OP_EPOLL_CTL);
         assert_eq!(epctl_req.as_slice().len(), 32);
@@ -1164,15 +1164,15 @@ mod tests {
 
         let mut epoll_wait = TrapFrame::new(LINUX_NR_EPOLL_PWAIT, [7, 0xB000, 4, 10, 0, 0]);
         dispatch(&mut state, &bindings, &mut epoll_wait);
-        assert_eq!(epoll_wait.error, 0);
-        assert_eq!(epoll_wait.ret0, 1);
+        assert_eq!(epoll_wait.error_code(), None);
+        assert_eq!(epoll_wait.ret0(), 1);
         let epwait_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(epwait_req.opcode, VFS_OP_EPOLL_PWAIT);
 
         let mut sendfile = TrapFrame::new(LINUX_NR_SENDFILE, [1, 2, 0xC000, 99, 0, 0]);
         dispatch(&mut state, &bindings, &mut sendfile);
-        assert_eq!(sendfile.error, 0);
-        assert_eq!(sendfile.ret0, 99);
+        assert_eq!(sendfile.error_code(), None);
+        assert_eq!(sendfile.ret0(), 99);
         let sendfile_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(sendfile_req.opcode, VFS_OP_SENDFILE);
         assert_eq!(sendfile_req.as_slice().len(), 32);
@@ -1180,7 +1180,7 @@ mod tests {
 
         let mut statx = TrapFrame::new(LINUX_NR_STATX, [3, 0xD000, 0, 0xE000, 0, 0]);
         dispatch(&mut state, &bindings, &mut statx);
-        assert_eq!(statx.error, 0);
+        assert_eq!(statx.error_code(), None);
         let statx_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(statx_req.opcode, VFS_OP_STATX);
         assert_eq!(statx_req.as_slice().len(), 32);
@@ -1254,17 +1254,17 @@ mod tests {
 
         let mut getpid = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut getpid);
-        assert_eq!(getpid.error, 0);
-        assert_eq!(getpid.ret0, 42);
+        assert_eq!(getpid.error_code(), None);
+        assert_eq!(getpid.ret0(), 42);
 
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x2000, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut openat);
-        assert_eq!(openat.error, 0);
-        assert_eq!(openat.ret0, 3);
+        assert_eq!(openat.error_code(), None);
+        assert_eq!(openat.ret0(), 3);
 
         let mut exit = TrapFrame::new(LINUX_NR_EXIT, [5, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut exit);
-        assert_eq!(exit.error, 0);
+        assert_eq!(exit.error_code(), None);
 
         let proc_getpid = state.ipc_recv(proc_req_recv).expect("recv").expect("msg");
         assert_eq!(proc_getpid.opcode, PROC_OP_GETPID);
@@ -1323,8 +1323,8 @@ mod tests {
         for (i, nr) in sequence.iter().enumerate() {
             let mut frame = TrapFrame::new(*nr, [0, 0x2000 + i * 8, 0, 0, 0, 0]);
             dispatch(&mut state, &bindings, &mut frame);
-            assert_eq!(frame.error, 0);
-            observed[i] = frame.ret0;
+            assert_eq!(frame.error_code(), None);
+            observed[i] = frame.ret0();
         }
 
         assert_eq!(observed, [101, 3, 102, 4, 103, 5]);
@@ -1380,7 +1380,7 @@ mod tests {
 
         let mut getpid = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut getpid);
-        assert_eq!(getpid.ret0, 700);
+        assert_eq!(getpid.ret0(), 700);
 
         state
             .handle_trap_event(crate::kernel::trap::TrapEvent::external_interrupt(9), None)
@@ -1388,7 +1388,7 @@ mod tests {
 
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x1234, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut openat);
-        assert_eq!(openat.ret0, 11);
+        assert_eq!(openat.ret0(), 11);
 
         let proc_req = state.ipc_recv(proc_req_recv).expect("recv").expect("msg");
         let vfs_req = state.ipc_recv(vfs_req_recv).expect("recv").expect("msg");

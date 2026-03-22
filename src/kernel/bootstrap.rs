@@ -2465,7 +2465,7 @@ impl KernelState {
                 let trapframe = frame.ok_or(TrapHandleError::MissingTrapFrame)?;
                 let _ = self.sync_current_thread_from_frame(trapframe);
                 dispatch_syscall(self, trapframe).map_err(TrapHandleError::Syscall)?;
-                if trapframe.error == SyscallError::PageFault.code() {
+                if trapframe.error_code() == Some(SyscallError::PageFault.code()) {
                     self.fault_current_task()
                         .map_err(SyscallError::from)
                         .map_err(TrapHandleError::Syscall)?;
@@ -2839,7 +2839,7 @@ mod tests {
         state
             .handle_trap(Trap::Syscall, Some(&mut send_frame))
             .expect("syscall send");
-        assert_eq!(send_frame.error, 0);
+        assert_eq!(send_frame.error_code(), None);
 
         let mut recv_frame = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
@@ -2848,10 +2848,10 @@ mod tests {
         state
             .handle_trap(Trap::Syscall, Some(&mut recv_frame))
             .expect("syscall recv");
-        assert_eq!(recv_frame.error, 0);
-        assert_eq!(recv_frame.ret0 as u64, 0);
-        assert_eq!(recv_frame.ret1, 2);
-        assert_eq!(recv_frame.args[3] & 0xFF, b'h' as usize);
+        assert_eq!(recv_frame.error_code(), None);
+        assert_eq!(recv_frame.ret0() as u64, 0);
+        assert_eq!(recv_frame.ret1(), 2);
+        assert_eq!(recv_frame.arg(3) & 0xFF, b'h' as usize);
     }
 
     #[test]
@@ -3088,7 +3088,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_frame))
             .expect("recv syscall");
 
-        assert_eq!(recv_frame.error, 0);
+        assert_eq!(recv_frame.error_code(), None);
         let bytes = state.read_user_memory(0, 16, 2).expect("read back");
         assert_eq!(&bytes[..2], b"ok");
     }
@@ -3125,7 +3125,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_frame))
             .expect("recv syscall should return fault code, not trap error");
 
-        assert_eq!(recv_frame.error, SyscallError::PageFault.code());
+        assert_eq!(recv_frame.error_code(), Some(SyscallError::PageFault.code()));
         assert_eq!(
             state.last_fault(),
             Some(super::super::trap::FaultInfo {
@@ -3169,7 +3169,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_frame))
             .expect("syscall handled");
 
-        assert_eq!(recv_frame.error, SyscallError::PageFault.code());
+        assert_eq!(recv_frame.error_code(), Some(SyscallError::PageFault.code()));
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
         assert_eq!(state.scheduler.current_tid(), Some(1));
     }
@@ -3224,7 +3224,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_frame))
             .expect("syscall handled");
 
-        assert_eq!(recv_frame.error, SyscallError::PageFault.code());
+        assert_eq!(recv_frame.error_code(), Some(SyscallError::PageFault.code()));
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
         assert_eq!(state.scheduler.current_tid(), Some(1));
 
@@ -3281,7 +3281,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_frame))
             .expect("syscall handled");
 
-        assert_eq!(recv_frame.error, SyscallError::PageFault.code());
+        assert_eq!(recv_frame.error_code(), Some(SyscallError::PageFault.code()));
         assert_eq!(state.task_status(0), Some(TaskStatus::Running));
         assert_eq!(state.scheduler.current_tid(), Some(0));
 
@@ -3330,7 +3330,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_frame))
             .expect("syscall handled");
 
-        assert_eq!(recv_frame.error, SyscallError::PageFault.code());
+        assert_eq!(recv_frame.error_code(), Some(SyscallError::PageFault.code()));
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
         assert_eq!(state.scheduler.current_tid(), Some(1));
     }
@@ -4340,13 +4340,13 @@ mod tests {
             .resume_current_thread_with_frame(&mut frame)
             .expect("resume");
         assert_eq!(tls, Some(0xABCD_0000));
-        assert_eq!(frame.ret0, 0x7010);
-        assert_eq!(frame.ret1, 0x8800_0000);
+        assert_eq!(frame.ret0(), 0x7010);
+        assert_eq!(frame.ret1(), 0x8800_0000);
 
-        frame.ret0 = 0x9000;
-        frame.ret1 = 0x9900_0000;
-        frame.args[0] = 33;
-        frame.args[1] = 44;
+        frame.set_ok(0x9000, frame.ret1(), frame.ret2());
+        frame.set_ok(frame.ret0(), 0x9900_0000, frame.ret2());
+        frame.set_arg(0, 33);
+        frame.set_arg(1, 44);
         state
             .sync_current_thread_from_frame(&frame)
             .expect("capture");
