@@ -1,4 +1,4 @@
-use super::bootstrap::{KernelError, KernelState, ServiceRole, UserImageSpec};
+use super::bootstrap::{KernelError, KernelState, UserImageSpec};
 use super::task::TaskClass;
 use super::vm::Asid;
 
@@ -352,11 +352,6 @@ impl InitServerLite {
         kernel.register_task(graph.vfs_tid)?;
         kernel.register_task(graph.supervisor_tid)?;
 
-        kernel.register_service_role(graph.init_tid, ServiceRole::Init)?;
-        kernel.register_service_role(graph.process_manager_tid, ServiceRole::ProcessManager)?;
-        kernel.register_service_role(graph.vfs_tid, ServiceRole::Vfs)?;
-        kernel.register_service_role(graph.supervisor_tid, ServiceRole::Supervisor)?;
-
         self.handles.process_manager_tid = Some(graph.process_manager_tid);
         self.handles.vfs_tid = Some(graph.vfs_tid);
         self.handles.supervisor_tid = Some(graph.supervisor_tid);
@@ -470,27 +465,6 @@ impl InitServerLite {
         self.phase = InitBootPhase::Running;
         Ok(())
     }
-
-    pub fn validate_core_delegation_paths(
-        &self,
-        kernel: &KernelState,
-        init_tid: u64,
-    ) -> Result<(), KernelError> {
-        let proc_tid = self
-            .handles
-            .process_manager_tid
-            .ok_or(KernelError::WrongObject)?;
-        let vfs_tid = self.handles.vfs_tid.ok_or(KernelError::WrongObject)?;
-        let sup_tid = self
-            .handles
-            .supervisor_tid
-            .ok_or(KernelError::WrongObject)?;
-
-        kernel.validate_service_delegation(init_tid, proc_tid)?;
-        kernel.validate_service_delegation(init_tid, vfs_tid)?;
-        kernel.validate_service_delegation(init_tid, sup_tid)?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -534,8 +508,6 @@ mod tests {
         init.register_core_graph(&mut state, graph)
             .expect("register");
         assert_eq!(init.phase(), InitBootPhase::CoreServicesRegistered);
-        init.validate_core_delegation_paths(&state, 1)
-            .expect("validate delegation");
 
         let report = init
             .launch_core_services(

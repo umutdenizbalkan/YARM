@@ -26,6 +26,8 @@ use super::vm::{
 };
 use crate::arch::{platform_layout, topology};
 use crate::kernel::ipc::ThreadId;
+#[cfg(feature = "hosted-dev")]
+use crate::std::collections::BTreeMap;
 
 #[cfg(feature = "hosted-dev")]
 type KernelStorage<T> = crate::std::boxed::Box<T>;
@@ -43,7 +45,6 @@ fn store_kernel_value<T>(value: T) -> KernelStorage<T> {
 
 const MAX_ENDPOINTS: usize = 16;
 const MAX_TASKS: usize = 64;
-const MAX_TASK_MEM_ENTRIES: usize = 2048;
 const MAX_MEMORY_OBJECTS: usize = 128;
 const MAX_NOTIFICATIONS: usize = 16;
 const MAX_IRQ_LINES: usize = platform_layout::MAX_IRQ_LINES;
@@ -107,21 +108,6 @@ pub struct SpawnedUserTask {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceRole {
-    Init,
-    ProcessManager,
-    Vfs,
-    Driver,
-    Supervisor,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ServicePolicyEntry {
-    tid: ThreadId,
-    role: ServiceRole,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceServerDelegation {
     pub server_tid: ThreadId,
     pub irq_line: u16,
@@ -139,15 +125,6 @@ pub struct DriverDelegationBundle {
     pub dma_cap: CapId,
     pub iova_cap: CapId,
 }
-
-const ALLOWED_SERVICE_DELEGATION_EDGES: &[(ServiceRole, ServiceRole)] = &[
-    (ServiceRole::Init, ServiceRole::ProcessManager),
-    (ServiceRole::Init, ServiceRole::Vfs),
-    (ServiceRole::Init, ServiceRole::Driver),
-    (ServiceRole::Init, ServiceRole::Supervisor),
-    (ServiceRole::Supervisor, ServiceRole::Driver),
-    (ServiceRole::Supervisor, ServiceRole::Vfs),
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverBundlePlan {
@@ -204,13 +181,6 @@ pub struct RestartTelemetry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TaskMemByte {
-    tid: ThreadId,
-    addr: usize,
-    value: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MemoryObject {
     id: u64,
     phys: PhysAddr,
@@ -250,9 +220,16 @@ struct IpcSubsystem {
     telemetry: IpcPathTelemetry,
 }
 
+#[cfg(feature = "hosted-dev")]
+type UserMemoryStore = BTreeMap<(u16, u64), u8>;
+
+#[cfg(not(feature = "hosted-dev"))]
+#[derive(Debug, Default)]
+struct UserMemoryStore;
+
 #[derive(Debug)]
 struct MemorySubsystem {
-    task_mem: [Option<TaskMemByte>; MAX_TASK_MEM_ENTRIES],
+    user_memory: KernelStorage<UserMemoryStore>,
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
     next_memory_object_id: u64,
     next_anon_phys: u64,
@@ -262,7 +239,6 @@ struct MemorySubsystem {
 struct DriverSubsystem {
     driver_records: [Option<DriverRecord>; MAX_DRIVERS],
     next_iova_space_id: u64,
-    service_policy: [Option<ServicePolicyEntry>; MAX_TASKS],
 }
 
 #[derive(Debug)]
@@ -368,7 +344,7 @@ impl Bootstrap {
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
             tcbs: [const { None }; MAX_TASKS],
             memory: store_kernel_value(MemorySubsystem {
-                task_mem: [None; MAX_TASK_MEM_ENTRIES],
+                user_memory: store_kernel_value(UserMemoryStore::default()),
                 memory_objects: [None; MAX_MEMORY_OBJECTS],
                 next_memory_object_id: 1,
                 next_anon_phys: platform_layout::NEXT_ANON_PHYS_BASE,
@@ -376,7 +352,6 @@ impl Bootstrap {
             drivers: DriverSubsystem {
                 driver_records: [const { None }; MAX_DRIVERS],
                 next_iova_space_id: 1,
-                service_policy: [const { None }; MAX_TASKS],
             },
             tlb_shootdown_count: 0,
             faults: FaultSubsystem {
@@ -1533,48 +1508,6 @@ mod tests {
     }
 
     #[test]
-    fn delegation_policy_requires_init_and_driver_roles() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(70).expect("init-task");
-        state.register_task(71).expect("driver-task");
-        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-        let iova_cap = state.create_iova_space_cap().expect("iova");
-
-        state
-            .register_service_role(70, ServiceRole::Init)
-            .expect("role");
-        state
-            .register_service_role(71, ServiceRole::Driver)
-            .expect("role");
-
-        let ok = state.delegate_driver_bundle_checked(
-            70,
-            DriverBundlePlan {
-                server_tid: ThreadId(71),
-                irq_line: 3,
-                mem_cap,
-                iova_cap,
-                iova_base: crate::kernel::vm::PAGE_SIZE,
-                iova_len: crate::kernel::vm::PAGE_SIZE,
-            },
-        );
-        assert!(ok.is_ok());
-
-        let bad = state.delegate_driver_bundle_checked(
-            71,
-            DriverBundlePlan {
-                server_tid: ThreadId(71),
-                irq_line: 4,
-                mem_cap,
-                iova_cap,
-                iova_base: crate::kernel::vm::PAGE_SIZE * 2,
-                iova_len: crate::kernel::vm::PAGE_SIZE,
-            },
-        );
-        assert_eq!(bad, Err(KernelError::MissingRight));
-    }
-
-    #[test]
     fn rendezvous_delivery_is_single_copy_and_no_sender_stuck() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(80).expect("sender");
@@ -1606,42 +1539,6 @@ mod tests {
         let t = state.ipc_path_telemetry();
         assert!(t.rendezvous_handoffs >= 1);
         assert!(t.fastpath_attempts >= t.fastpath_switches);
-    }
-
-    #[test]
-    fn service_delegation_edges_table_is_auditable_and_frozen() {
-        let edges = KernelState::allowed_service_delegation_edges();
-        assert!(edges.contains(&(ServiceRole::Init, ServiceRole::Driver)));
-        assert!(edges.contains(&(ServiceRole::Supervisor, ServiceRole::Vfs)));
-        assert!(!edges.contains(&(ServiceRole::Driver, ServiceRole::ProcessManager)));
-        assert_eq!(edges.len(), 6);
-    }
-
-    #[test]
-    fn service_delegation_graph_allows_only_expected_edges() {
-        let mut state = Bootstrap::init().expect("init");
-        for tid in 90..=93 {
-            state.register_task(tid).expect("task");
-        }
-        state
-            .register_service_role(90, ServiceRole::Init)
-            .expect("role init");
-        state
-            .register_service_role(91, ServiceRole::Supervisor)
-            .expect("role sup");
-        state
-            .register_service_role(92, ServiceRole::Driver)
-            .expect("role drv");
-        state
-            .register_service_role(93, ServiceRole::ProcessManager)
-            .expect("role proc");
-
-        assert!(state.validate_service_delegation(90, 93).is_ok());
-        assert!(state.validate_service_delegation(91, 92).is_ok());
-        assert_eq!(
-            state.validate_service_delegation(92, 93),
-            Err(KernelError::MissingRight)
-        );
     }
 
     #[test]
@@ -2000,27 +1897,17 @@ mod tests {
         state.register_task(110).expect("init-task");
         state.register_task(111).expect("driver-task");
 
-        state
-            .register_service_role(110, ServiceRole::Init)
-            .expect("role init");
-        state
-            .register_service_role(111, ServiceRole::Driver)
-            .expect("role driver");
-
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         let iova_cap = state.create_iova_space_cap().expect("iova");
 
         let first_bundle = state
-            .delegate_driver_bundle_checked(
-                110,
-                DriverBundlePlan::standard(
-                    ThreadId(111),
-                    14,
-                    mem_cap,
-                    iova_cap,
-                    crate::kernel::vm::PAGE_SIZE * 4,
-                ),
-            )
+            .delegate_driver_bundle(DriverBundlePlan::standard(
+                ThreadId(111),
+                14,
+                mem_cap,
+                iova_cap,
+                crate::kernel::vm::PAGE_SIZE * 4,
+            ))
             .expect("first bundle");
         state
             .validate_driver_bundle_live(111, first_bundle)
@@ -2046,16 +1933,13 @@ mod tests {
         let iova_cap2 = state.create_iova_space_cap().expect("iova2");
 
         let second_bundle = state
-            .delegate_driver_bundle_checked(
-                110,
-                DriverBundlePlan::standard(
-                    ThreadId(111),
-                    14,
-                    mem_cap,
-                    iova_cap2,
-                    crate::kernel::vm::PAGE_SIZE * 4,
-                ),
-            )
+            .delegate_driver_bundle(DriverBundlePlan::standard(
+                ThreadId(111),
+                14,
+                mem_cap,
+                iova_cap2,
+                crate::kernel::vm::PAGE_SIZE * 4,
+            ))
             .expect("second bundle");
         state
             .validate_driver_bundle_live(111, second_bundle)

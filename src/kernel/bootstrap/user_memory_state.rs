@@ -1,50 +1,69 @@
-use super::{KernelError, KernelState, TaskMemByte};
-use crate::kernel::ipc::{Message, ThreadId};
-use crate::kernel::vm::{VirtAddr, VmError};
+use super::{KernelError, KernelState};
+use crate::kernel::ipc::Message;
+use crate::kernel::vm::{Asid, VirtAddr, VmError};
 
 impl KernelState {
+    #[cfg(feature = "hosted-dev")]
+    fn write_user_byte(&mut self, asid: Asid, va: VirtAddr, value: u8) {
+        self.memory.user_memory.insert((asid.0, va.0), value);
+    }
+
+    #[cfg(not(feature = "hosted-dev"))]
+    fn write_user_byte(&mut self, _asid: Asid, _va: VirtAddr, _value: u8) {}
+
+    #[cfg(feature = "hosted-dev")]
+    fn read_user_byte(&self, asid: Asid, va: VirtAddr) -> Option<u8> {
+        self.memory.user_memory.get(&(asid.0, va.0)).copied()
+    }
+
+    #[cfg(not(feature = "hosted-dev"))]
+    fn read_user_byte(&self, _asid: Asid, _va: VirtAddr) -> Option<u8> {
+        None
+    }
+
+    pub fn copy_to_user(
+        &mut self,
+        asid: Asid,
+        va: VirtAddr,
+        bytes: &[u8],
+    ) -> Result<(), KernelError> {
+        for (i, &byte) in bytes.iter().enumerate() {
+            let addr = va.0 as usize + i;
+            self.validate_user_access_for_asid(asid, addr, true)?;
+            self.write_user_byte(asid, VirtAddr(addr as u64), byte);
+        }
+        Ok(())
+    }
+
+    pub fn copy_from_user(
+        &self,
+        asid: Asid,
+        va: VirtAddr,
+        len: usize,
+    ) -> Result<[u8; Message::MAX_PAYLOAD], KernelError> {
+        if len > Message::MAX_PAYLOAD {
+            return Err(KernelError::UserMemoryFault);
+        }
+
+        let mut out = [0u8; Message::MAX_PAYLOAD];
+        for (i, slot) in out.iter_mut().take(len).enumerate() {
+            let addr = va.0 as usize + i;
+            self.validate_user_access_for_asid(asid, addr, false)?;
+            *slot = self
+                .read_user_byte(asid, VirtAddr(addr as u64))
+                .ok_or(KernelError::UserMemoryFault)?;
+        }
+        Ok(out)
+    }
+
     pub fn write_user_memory(
         &mut self,
         tid: u64,
         ptr: usize,
         data: &[u8],
     ) -> Result<(), KernelError> {
-        let _ = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
-
-        let mut i = 0;
-        while i < data.len() {
-            let va = ptr + i;
-            self.validate_user_access_for_tid(tid, va, true)?;
-
-            let mut found = false;
-            for slot in &mut self.memory.task_mem {
-                if slot
-                    .as_ref()
-                    .is_some_and(|entry| entry.tid == ThreadId(tid) && entry.addr == va)
-                {
-                    slot.as_mut().expect("checked").value = data[i];
-                    found = true;
-                    break;
-                }
-            }
-
-            if !found {
-                let slot = self
-                    .memory
-                    .task_mem
-                    .iter_mut()
-                    .find(|slot| slot.is_none())
-                    .ok_or(KernelError::TaskTableFull)?;
-                *slot = Some(TaskMemByte {
-                    tid: ThreadId(tid),
-                    addr: va,
-                    value: data[i],
-                });
-            }
-            i += 1;
-        }
-
-        Ok(())
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        self.copy_to_user(asid, VirtAddr(ptr as u64), data)
     }
 
     pub fn read_user_memory(
@@ -53,37 +72,16 @@ impl KernelState {
         ptr: usize,
         len: usize,
     ) -> Result<[u8; Message::MAX_PAYLOAD], KernelError> {
-        if len > Message::MAX_PAYLOAD {
-            return Err(KernelError::UserMemoryFault);
-        }
-
-        let mut out = [0u8; Message::MAX_PAYLOAD];
-        let mut i = 0;
-        while i < len {
-            let va = ptr + i;
-            self.validate_user_access_for_tid(tid, va, false)?;
-            let value = self
-                .memory
-                .task_mem
-                .iter()
-                .flatten()
-                .find(|entry| entry.tid == ThreadId(tid) && entry.addr == va)
-                .map(|entry| entry.value)
-                .ok_or(KernelError::UserMemoryFault)?;
-            out[i] = value;
-            i += 1;
-        }
-
-        Ok(out)
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        self.copy_from_user(asid, VirtAddr(ptr as u64), len)
     }
 
-    fn validate_user_access_for_tid(
+    fn validate_user_access_for_asid(
         &self,
-        tid: u64,
+        asid: Asid,
         va: usize,
         need_write: bool,
     ) -> Result<(), KernelError> {
-        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
         let aspace = self
             .user_spaces
             .get(asid)
@@ -107,7 +105,8 @@ impl KernelState {
             .scheduler
             .current_tid()
             .ok_or(KernelError::TaskMissing)?;
-        self.write_user_memory(tid, user_ptr, bytes)
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        self.copy_to_user(asid, VirtAddr(user_ptr as u64), bytes)
     }
 
     pub fn copy_from_current_user(
@@ -119,6 +118,7 @@ impl KernelState {
             .scheduler
             .current_tid()
             .ok_or(KernelError::TaskMissing)?;
-        self.read_user_memory(tid, user_ptr, len)
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        self.copy_from_user(asid, VirtAddr(user_ptr as u64), len)
     }
 }

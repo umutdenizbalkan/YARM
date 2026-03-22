@@ -3,12 +3,12 @@ use super::init_server::{
     CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitFaultHandoff, InitServerLite,
 };
 use super::ipc::Message;
-use super::proc_proto::{SpawnV2Args, WaitPidV2Args, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2};
+use super::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
 use super::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use super::vfs::{
-    openat_message, read_message, MountRouter, OpenAtRequest, ReadWriteRequest, VfsLiteService,
+    MountRouter, OpenAtRequest, ReadWriteRequest, VfsLiteService, openat_message, read_message,
 };
-use crate::services::fs::initramfs::{InitramfsBackend, INITRAMFS_BUSYBOX_PATH_PTR};
+use crate::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 use crate::services::fs::ramfs::RamFsBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +117,6 @@ pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError
         supervisor_tid: 4,
     };
     init.register_core_graph(&mut kernel, graph)?;
-    init.validate_core_delegation_paths(&kernel, graph.init_tid)?;
     let _ = init.launch_core_services(
         &mut kernel,
         CoreServiceImagePlan {

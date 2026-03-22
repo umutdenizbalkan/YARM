@@ -16,8 +16,6 @@ pub fn run() {
 
     init.register_core_graph(&mut kernel, graph)
         .expect("register graph");
-    init.validate_core_delegation_paths(&kernel, graph.init_tid)
-        .expect("delegation paths");
     let _ = init
         .launch_core_services(
             &mut kernel,
