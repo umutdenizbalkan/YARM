@@ -1,5 +1,5 @@
 use crate::kernel::bootstrap::Bootstrap;
-use crate::kernel::init_server::{
+use crate::kernel::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitFaultHandoff, InitServerLite,
 };
 
