@@ -54,6 +54,10 @@ impl KernelState {
         self.scheduler.present_cpu_bitmap()
     }
 
+    pub fn online_cpu_bitmap(&self) -> u64 {
+        self.scheduler.online_cpu_bitmap()
+    }
+
     fn task_priority(&self, tid: u64) -> Result<TaskPriority, KernelError> {
         if tid == 0 {
             return Ok(TaskPriority::Normal);
@@ -108,8 +112,14 @@ impl KernelState {
                 }
                 Ok(())
             }
-            WorkItem::TlbShootdown { .. } => {
+            WorkItem::TlbShootdown { target_cpu, asid, .. } => {
                 self.tlb_shootdown_count = self.tlb_shootdown_count.wrapping_add(1);
+                if self.current_cpu == target_cpu && self.user_spaces.retired_entry(asid).is_some() {
+                    let cpu_bit = 1u64 << target_cpu.0;
+                    self.user_spaces
+                        .acknowledge_shootdown(asid, cpu_bit)
+                        .map_err(KernelError::Vm)?;
+                }
                 Ok(())
             }
             WorkItem::WakeTask { target_cpu, tid } => {

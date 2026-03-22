@@ -3,6 +3,40 @@ use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError};
 
 impl KernelState {
+    pub fn destroy_user_address_space(&mut self, aspace_cap: CapId) -> Result<(), KernelError> {
+        let capability = self
+            .cspace
+            .get(aspace_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        let asid = match capability.object {
+            CapObject::AddressSpace { asid } => Asid(asid),
+            _ => return Err(KernelError::WrongObject),
+        };
+
+        self.cspace
+            .revoke(aspace_cap)
+            .map_err(|_| KernelError::InvalidCapability)?;
+
+        let pending_cpu_bitmap = self.online_cpu_bitmap();
+        self.user_spaces
+            .destroy(asid, pending_cpu_bitmap)
+            .map_err(KernelError::Vm)?;
+
+        for cpu in 0..u64::BITS as usize {
+            let cpu_bit = 1u64 << cpu;
+            if (pending_cpu_bitmap & cpu_bit) == 0 {
+                continue;
+            }
+            self.submit_cross_cpu_work(crate::kernel::smp::WorkItem::TlbShootdown {
+                target_cpu: crate::kernel::scheduler::CpuId(cpu as u8),
+                asid,
+                va_range: None,
+            })?;
+        }
+
+        Ok(())
+    }
+
     pub fn create_user_address_space(&mut self) -> Result<(Asid, CapId), KernelError> {
         let asid = self
             .user_spaces

@@ -1,4 +1,5 @@
 use crate::arch::vm_layout;
+use crate::kernel::topology::CpuBitmap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtAddr(pub u64);
@@ -181,10 +182,17 @@ struct AsEntry {
     aspace: AddressSpace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredAsid {
+    pub asid: Asid,
+    pub pending_cpu_bitmap: CpuBitmap,
+}
+
 #[derive(Debug)]
 pub struct AddressSpaceManager {
     next_asid: u16,
     entries: [Option<AsEntry>; MAX_ADDRESS_SPACES],
+    retired: [Option<RetiredAsid>; MAX_ADDRESS_SPACES],
 }
 
 impl Default for AddressSpaceManager {
@@ -192,6 +200,7 @@ impl Default for AddressSpaceManager {
         Self {
             next_asid: 1,
             entries: [const { None }; MAX_ADDRESS_SPACES],
+            retired: [None; MAX_ADDRESS_SPACES],
         }
     }
 }
@@ -202,6 +211,11 @@ impl AddressSpaceManager {
             .iter()
             .flatten()
             .any(|entry| entry.asid == asid)
+            || self
+                .retired
+                .iter()
+                .flatten()
+                .any(|entry| entry.asid == asid)
     }
 
     fn allocate_asid(&mut self) -> Result<Asid, VmError> {
@@ -249,14 +263,46 @@ impl AddressSpaceManager {
             .map(|entry| &mut entry.aspace)
     }
 
-    pub fn destroy(&mut self, asid: Asid) -> Result<(), VmError> {
+    pub fn destroy(&mut self, asid: Asid, pending_cpu_bitmap: CpuBitmap) -> Result<(), VmError> {
         for slot in &mut self.entries {
             if slot.as_ref().is_some_and(|entry| entry.asid == asid) {
                 *slot = None;
-                return Ok(());
+                if pending_cpu_bitmap == 0 {
+                    return Ok(());
+                }
+                for retired in &mut self.retired {
+                    if retired.is_none() {
+                        *retired = Some(RetiredAsid {
+                            asid,
+                            pending_cpu_bitmap,
+                        });
+                        return Ok(());
+                    }
+                }
+                return Err(VmError::Full);
             }
         }
         Err(VmError::InvalidAsid)
+    }
+
+    pub fn acknowledge_shootdown(&mut self, asid: Asid, cpu_bit: CpuBitmap) -> Result<bool, VmError> {
+        for slot in &mut self.retired {
+            if let Some(retired) = slot.as_mut()
+                && retired.asid == asid
+            {
+                retired.pending_cpu_bitmap &= !cpu_bit;
+                if retired.pending_cpu_bitmap == 0 {
+                    *slot = None;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+        }
+        Err(VmError::InvalidAsid)
+    }
+
+    pub fn retired_entry(&self, asid: Asid) -> Option<RetiredAsid> {
+        self.retired.iter().flatten().copied().find(|entry| entry.asid == asid)
     }
 }
 
@@ -325,8 +371,26 @@ mod tests {
         );
         assert_eq!(map_result, Ok(None));
 
-        assert!(mgr.destroy(asid).is_ok());
+        assert!(mgr.destroy(asid, 0).is_ok());
         assert!(mgr.get(asid).is_none());
+    }
+
+    #[test]
+    fn destroy_retires_asid_until_all_shootdowns_acknowledge() {
+        let mut mgr = AddressSpaceManager::default();
+        let asid = mgr.create_user_space().expect("create");
+
+        assert_eq!(mgr.destroy(asid, 0b11), Ok(()));
+        assert!(mgr.get(asid).is_none());
+        assert_eq!(mgr.retired_entry(asid).map(|entry| entry.pending_cpu_bitmap), Some(0b11));
+
+        let replacement = mgr.create_user_space().expect("replacement asid");
+        assert_ne!(replacement, asid);
+
+        assert_eq!(mgr.acknowledge_shootdown(asid, 0b01), Ok(false));
+        assert_eq!(mgr.retired_entry(asid).map(|entry| entry.pending_cpu_bitmap), Some(0b10));
+        assert_eq!(mgr.acknowledge_shootdown(asid, 0b10), Ok(true));
+        assert_eq!(mgr.retired_entry(asid), None);
     }
 
     #[test]
@@ -416,7 +480,7 @@ mod tests {
     #[test]
     fn manager_invalid_destroy_and_monotonic_asid() {
         let mut mgr = AddressSpaceManager::default();
-        assert_eq!(mgr.destroy(Asid(777)), Err(VmError::InvalidAsid));
+        assert_eq!(mgr.destroy(Asid(777), 0), Err(VmError::InvalidAsid));
 
         let a = mgr.create_user_space().expect("asid a");
         let b = mgr.create_user_space().expect("asid b");

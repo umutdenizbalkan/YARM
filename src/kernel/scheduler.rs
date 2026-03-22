@@ -244,6 +244,10 @@ impl SmpScheduler {
             .unwrap_or(false)
     }
 
+    pub fn online_cpu_bitmap(&self) -> u64 {
+        self.topology.online_cpu_bitmap()
+    }
+
     pub fn online_cpu_count(&self) -> usize {
         self.topology.online_cpu_count()
     }

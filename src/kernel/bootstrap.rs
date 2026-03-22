@@ -15,7 +15,7 @@ use super::scheduler::{CpuId, SchedulerError, SmpScheduler};
 use super::smp::{CrossCpuWorkQueue, MAX_CROSS_CPU_WORK, WorkItem};
 use super::syscall::SyscallError;
 use super::task::{
-    RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock, ThreadDetachState, ThreadGroupId,
+    RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock, ThreadGroupId,
     UserRegisterContext, WaitReason,
 };
 use super::timer::Timer;
@@ -567,6 +567,62 @@ mod tests {
             })
         );
         assert_eq!(state.drain_cross_cpu_work(), None);
+    }
+
+    #[test]
+    fn destroy_user_address_space_queues_shootdowns_and_retires_asid() {
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+
+        let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+        state
+            .destroy_user_address_space(aspace_cap)
+            .expect("destroy aspace");
+
+        assert!(state.user_spaces.get(asid).is_none());
+        assert_eq!(
+            state.user_spaces.retired_entry(asid).map(|entry| entry.pending_cpu_bitmap),
+            Some(0b11)
+        );
+
+        let mut seen = [false; 2];
+        while let Some(item) = state.drain_cross_cpu_work() {
+            if let WorkItem::TlbShootdown { target_cpu, asid: item_asid, va_range } = item {
+                assert_eq!(item_asid, asid);
+                assert_eq!(va_range, None);
+                seen[target_cpu.0 as usize] = true;
+            }
+        }
+        assert_eq!(seen, [true, true]);
+
+        state
+            .submit_cross_cpu_work(WorkItem::TlbShootdown {
+                target_cpu: CpuId(0),
+                asid,
+                va_range: None,
+            })
+            .expect("requeue cpu0 shootdown");
+        state
+            .submit_cross_cpu_work(WorkItem::TlbShootdown {
+                target_cpu: CpuId(1),
+                asid,
+                va_range: None,
+            })
+            .expect("requeue cpu1 shootdown");
+
+        state
+            .process_cross_cpu_work_for_cpu(CpuId(0))
+            .expect("process cpu0");
+        assert_eq!(
+            state.user_spaces.retired_entry(asid).map(|entry| entry.pending_cpu_bitmap),
+            Some(0b10)
+        );
+
+        state.set_current_cpu(CpuId(1)).expect("switch cpu1");
+        state
+            .process_cross_cpu_work_for_cpu(CpuId(1))
+            .expect("process cpu1");
+        assert_eq!(state.user_spaces.retired_entry(asid), None);
     }
 
     #[test]
