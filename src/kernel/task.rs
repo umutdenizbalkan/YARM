@@ -1,6 +1,5 @@
 use super::capabilities::CapId;
 use super::ipc::ThreadId;
-use super::time::{TickDuration, TickInstant};
 use super::vm::{Asid, VirtAddr};
 use crate::kernel::bootstrap::FaultPolicy;
 
@@ -66,18 +65,9 @@ pub struct LinuxThreadState {
     pub brk_end: Option<VirtAddr>,
 }
 
-/// Restart/backoff state tracked in scheduler ticks.
-///
-/// `available_at` is an absolute tick instant in the same clock domain as
-/// `Timer::current_ticks`, while `backoff` is a relative duration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RestartState {
     pub token: Option<RestartToken>,
-    pub budget: u8,
-    pub backoff: TickDuration,
-    pub available_at: TickInstant,
-    pub denied_count: u32,
-    pub escalation_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,17 +135,12 @@ mod tests {
             fault_policy_override: Some(FaultPolicy::KillTask),
             restart: RestartState {
                 token: Some(RestartToken(9)),
-                budget: 3,
-                backoff: TickDuration(10),
-                available_at: TickInstant(20),
-                denied_count: 1,
-                escalation_count: 0,
             },
             last_exit_code: Some(0),
         };
 
         assert_eq!(tcb.tid, ThreadId(7));
-        assert_eq!(tcb.restart.backoff, TickDuration(10));
+        assert_eq!(tcb.restart.token, Some(RestartToken(9)));
         assert_eq!(tcb.thread_group_id, ThreadGroupId(7));
         assert_eq!(tcb.linux.tls_base, Some(0xDEAD_BEEF));
         assert!(tcb.linux.tls_restore_pending);

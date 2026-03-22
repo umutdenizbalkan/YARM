@@ -1,56 +1,11 @@
-use super::{ClassPolicySnapshot, KernelError, KernelState, MAX_TASKS, RestartPolicy};
+use super::{KernelError, KernelState, MAX_TASKS};
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{
     LinuxThreadState, RestartState, TaskClass, TaskStatus, ThreadControlBlock, ThreadDetachState,
     ThreadGroupId, UserRegisterContext,
 };
-use crate::kernel::time::{TickDuration, TickInstant};
 
 impl KernelState {
-    pub fn set_class_escalation_threshold(&mut self, class: TaskClass, threshold: u32) {
-        let bounded = threshold.max(1);
-        match class {
-            TaskClass::App => self.restart.app_escalation_threshold = bounded,
-            TaskClass::Driver => self.restart.driver_escalation_threshold = bounded,
-            TaskClass::SystemServer => self.restart.system_escalation_threshold = bounded,
-        }
-    }
-
-    fn restart_policy_for_class(&self, class: TaskClass) -> RestartPolicy {
-        match class {
-            TaskClass::App => self.restart.app_restart_policy,
-            TaskClass::Driver => self.restart.driver_restart_policy,
-            TaskClass::SystemServer => self.restart.system_restart_policy,
-        }
-    }
-
-    pub fn class_policy_snapshot(&self, class: TaskClass) -> ClassPolicySnapshot {
-        let policy = self.restart_policy_for_class(class);
-        let escalation_threshold = match class {
-            TaskClass::App => self.restart.app_escalation_threshold,
-            TaskClass::Driver => self.restart.driver_escalation_threshold,
-            TaskClass::SystemServer => self.restart.system_escalation_threshold,
-        };
-        ClassPolicySnapshot {
-            class,
-            restart_budget: policy.budget,
-            restart_backoff_ticks: policy.backoff_ticks,
-            escalation_threshold,
-        }
-    }
-
-    pub fn set_class_restart_policy(&mut self, class: TaskClass, budget: u8, backoff_ticks: u64) {
-        let policy = RestartPolicy {
-            budget,
-            backoff_ticks,
-        };
-        match class {
-            TaskClass::App => self.restart.app_restart_policy = policy,
-            TaskClass::Driver => self.restart.driver_restart_policy = policy,
-            TaskClass::SystemServer => self.restart.system_restart_policy = policy,
-        }
-    }
-
     pub fn register_task_with_class(
         &mut self,
         tid: u64,
@@ -59,7 +14,6 @@ impl KernelState {
         if self.task_status(tid).is_some() {
             return Ok(());
         }
-        let policy = self.restart_policy_for_class(class);
         if let Some(slot) = self.tcbs.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(ThreadControlBlock {
                 tid: ThreadId(tid),
@@ -73,14 +27,7 @@ impl KernelState {
                 user_context: UserRegisterContext::default(),
                 detach_state: ThreadDetachState::Joinable,
                 fault_policy_override: None,
-                restart: RestartState {
-                    token: None,
-                    budget: policy.budget,
-                    backoff: TickDuration(policy.backoff_ticks),
-                    available_at: TickInstant(0),
-                    denied_count: 0,
-                    escalation_count: 0,
-                },
+                restart: RestartState::default(),
                 last_exit_code: None,
             });
             Ok(())

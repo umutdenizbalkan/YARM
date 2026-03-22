@@ -49,7 +49,6 @@ const MAX_MEMORY_OBJECTS: usize = 128;
 const MAX_NOTIFICATIONS: usize = 16;
 const MAX_IRQ_LINES: usize = platform_layout::MAX_IRQ_LINES;
 const MAX_DRIVERS: usize = 32;
-const RESTART_ESCALATION_THRESHOLD: u32 = 3;
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,14 +81,6 @@ pub enum TrapHandleError {
 pub enum FaultPolicy {
     KillTask,
     NotifyAndContinue,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClassPolicySnapshot {
-    pub class: TaskClass,
-    pub restart_budget: u8,
-    pub restart_backoff_ticks: u64,
-    pub escalation_threshold: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,17 +161,6 @@ pub struct IpcPathTelemetry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RestartTelemetry {
-    pub budget_remaining: u8,
-    pub backoff_ticks: u64,
-    pub available_at_tick: u64,
-    pub token_outstanding: bool,
-    pub denied_count: u32,
-    pub escalation_count: u32,
-    pub last_exit_code: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MemoryObject {
     id: u64,
     phys: PhysAddr,
@@ -189,12 +169,6 @@ struct MemoryObject {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NotificationObject {
     endpoint_idx: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RestartPolicy {
-    budget: u8,
-    backoff_ticks: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,12 +226,6 @@ struct FaultSubsystem {
 #[derive(Debug)]
 struct RestartSubsystem {
     next_restart_token: u64,
-    app_restart_policy: RestartPolicy,
-    driver_restart_policy: RestartPolicy,
-    system_restart_policy: RestartPolicy,
-    app_escalation_threshold: u32,
-    driver_escalation_threshold: u32,
-    system_escalation_threshold: u32,
 }
 
 #[derive(Debug)]
@@ -362,21 +330,6 @@ impl Bootstrap {
             },
             restart: RestartSubsystem {
                 next_restart_token: 1,
-                app_restart_policy: RestartPolicy {
-                    budget: 3,
-                    backoff_ticks: 10,
-                },
-                driver_restart_policy: RestartPolicy {
-                    budget: 5,
-                    backoff_ticks: 20,
-                },
-                system_restart_policy: RestartPolicy {
-                    budget: 8,
-                    backoff_ticks: 5,
-                },
-                app_escalation_threshold: RESTART_ESCALATION_THRESHOLD,
-                driver_escalation_threshold: RESTART_ESCALATION_THRESHOLD * 2,
-                system_escalation_threshold: RESTART_ESCALATION_THRESHOLD * 3,
             },
         };
 
@@ -1684,61 +1637,6 @@ mod tests {
     }
 
     #[test]
-    fn restart_telemetry_reports_budget_and_backoff() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(11).expect("task");
-        state.set_task_restart_policy(11, 2, 5).expect("policy");
-
-        let token = state.exit_task(11, 1).expect("exit");
-        let t0 = state.task_restart_telemetry(11).expect("telemetry");
-        assert_eq!(t0.budget_remaining, 2);
-        assert!(t0.token_outstanding);
-
-        assert!(state.restart_task(11, token).is_ok());
-        let t1 = state.task_restart_telemetry(11).expect("telemetry");
-        assert_eq!(t1.budget_remaining, 1);
-        assert!(!t1.token_outstanding);
-        assert!(t1.available_at_tick >= 5);
-    }
-
-    #[test]
-    fn restart_denial_escalates_to_supervisor_every_threshold() {
-        let mut state = Bootstrap::init().expect("init");
-        let (_e, _send, recv_cap) = state.create_endpoint(4).expect("endpoint");
-        state.set_supervisor_endpoint(recv_cap).expect("supervisor");
-
-        state.register_task(13).expect("task");
-        let _token = state.exit_task(13, 77).expect("exit");
-
-        for _ in 0..3 {
-            let _ = state.restart_task(13, 0xDEAD);
-        }
-
-        let telemetry = state.task_restart_telemetry(13).expect("telemetry");
-        assert_eq!(telemetry.denied_count, 3);
-        assert_eq!(telemetry.escalation_count, 1);
-
-        let exit_report = state.ipc_recv(recv_cap).expect("recv").expect("msg");
-        assert_eq!(exit_report.opcode, 0xEE);
-
-        let denial_report = state.ipc_recv(recv_cap).expect("recv").expect("msg");
-        assert_eq!(denial_report.opcode, 0xEF);
-    }
-
-    #[test]
-    fn class_restart_policy_applies_on_registration() {
-        let mut state = Bootstrap::init().expect("init");
-        state.set_class_restart_policy(TaskClass::Driver, 9, 33);
-        state
-            .register_task_with_class(21, TaskClass::Driver)
-            .expect("register");
-
-        let t = state.task_restart_telemetry(21).expect("telemetry");
-        assert_eq!(t.budget_remaining, 9);
-        assert_eq!(t.backoff_ticks, 33);
-    }
-
-    #[test]
     fn driver_restart_revokes_runtime_caps() {
         let mut state = Bootstrap::init().expect("init");
         state
@@ -1782,25 +1680,6 @@ mod tests {
     }
 
     #[test]
-    fn escalation_threshold_is_class_specific() {
-        let mut state = Bootstrap::init().expect("init");
-        let (_e, _send, recv_cap) = state.create_endpoint(8).expect("endpoint");
-        state.set_supervisor_endpoint(recv_cap).expect("supervisor");
-        state.set_class_escalation_threshold(TaskClass::Driver, 2);
-
-        state
-            .register_task_with_class(30, TaskClass::Driver)
-            .expect("task");
-        let _ = state.exit_task(30, 1).expect("exit");
-        let _ = state.restart_task(30, 0xBAD);
-        let _ = state.restart_task(30, 0xBAD);
-
-        let t = state.task_restart_telemetry(30).expect("telemetry");
-        assert_eq!(t.denied_count, 2);
-        assert_eq!(t.escalation_count, 1);
-    }
-
-    #[test]
     fn detach_iova_space_revokes_dma_window_validation() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(31).expect("task");
@@ -1835,19 +1714,6 @@ mod tests {
                 )
                 .is_err()
         );
-    }
-
-    #[test]
-    fn class_policy_snapshot_reports_driver_settings() {
-        let mut state = Bootstrap::init().expect("init");
-        state.set_class_restart_policy(TaskClass::Driver, 6, 40);
-        state.set_class_escalation_threshold(TaskClass::Driver, 4);
-
-        let snap = state.class_policy_snapshot(TaskClass::Driver);
-        assert_eq!(snap.class, TaskClass::Driver);
-        assert_eq!(snap.restart_budget, 6);
-        assert_eq!(snap.restart_backoff_ticks, 40);
-        assert_eq!(snap.escalation_threshold, 4);
     }
 
     #[test]
@@ -2050,19 +1916,6 @@ mod tests {
         assert_eq!(state.scheduler.current_tid(), Some(40));
         assert_eq!(state.task_status(40), Some(TaskStatus::Running));
         assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
-    }
-
-    #[test]
-    fn restart_task_honors_backoff_window() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(41).expect("task");
-        state.set_task_restart_policy(41, 2, 10).expect("policy");
-
-        let first = state.exit_task(41, 1).expect("exit1");
-        state.restart_task(41, first).expect("restart1");
-
-        let second = state.exit_task(41, 2).expect("exit2");
-        assert_eq!(state.restart_task(41, second), Err(KernelError::WouldBlock));
     }
 
     #[test]
