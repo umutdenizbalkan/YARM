@@ -702,7 +702,7 @@ mod tests {
 
         state
             .handle_trap_event(
-                TrapEvent::page_fault(FaultInfo {
+                TrapEvent::PageFault(FaultInfo {
                     addr: VirtAddr(0x1200),
                     access: super::super::trap::FaultAccess::Read,
                 }),
@@ -1361,7 +1361,7 @@ mod tests {
         state.bind_irq_notification(11, notif_cap).expect("bind");
 
         state
-            .handle_trap_event(TrapEvent::external_interrupt(11), None)
+            .handle_trap_event(TrapEvent::ExternalInterrupt(11), None)
             .expect("handle irq");
 
         let msg = state.ipc_recv(notif_recv_cap).expect("recv").expect("msg");
@@ -1695,7 +1695,7 @@ mod tests {
 
         for _ in 0..5 {
             state
-                .handle_trap_event(TrapEvent::external_interrupt(5), None)
+                .handle_trap_event(TrapEvent::ExternalInterrupt(5), None)
                 .expect("irq");
         }
 
@@ -1952,7 +1952,7 @@ mod tests {
                     .expect("work"),
                 1 => {
                     if state
-                        .handle_trap_event(TrapEvent::external_interrupt(7), None)
+                        .handle_trap_event(TrapEvent::ExternalInterrupt(7), None)
                         .is_err()
                     {
                         let _ = state.ipc_recv(nrecv);
@@ -1999,7 +1999,7 @@ mod tests {
         };
 
         state
-            .handle_trap_event(TrapEvent::page_fault(fault), None)
+            .handle_trap_event(TrapEvent::PageFault(fault), None)
             .expect("handle page fault");
 
         assert_eq!(state.last_fault(), Some(fault));

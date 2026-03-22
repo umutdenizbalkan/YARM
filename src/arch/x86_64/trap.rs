@@ -42,8 +42,8 @@ fn restore_arch_thread_state(
 
 pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {
     match context.vector {
-        VEC_SYSCALL => TrapEvent::syscall(),
-        VEC_TIMER => TrapEvent::timer_interrupt(),
+        VEC_SYSCALL => TrapEvent::Syscall,
+        VEC_TIMER => TrapEvent::TimerInterrupt,
         VEC_PAGE_FAULT => {
             let access = if (context.error_code & (1 << 1)) != 0 {
                 FaultAccess::Write
@@ -52,15 +52,15 @@ pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {
             } else {
                 FaultAccess::Read
             };
-            TrapEvent::page_fault(FaultInfo {
+            TrapEvent::PageFault(FaultInfo {
                 addr: VirtAddr(context.fault_addr),
                 access,
             })
         }
         v if (VEC_EXTERNAL_BASE..VEC_EXTERNAL_LIMIT).contains(&v) => {
-            TrapEvent::external_interrupt((v - VEC_EXTERNAL_BASE) as u16)
+            TrapEvent::ExternalInterrupt((v - VEC_EXTERNAL_BASE) as u16)
         }
-        _ => TrapEvent::external_interrupt(0),
+        _ => TrapEvent::ExternalInterrupt(0),
     }
 }
 

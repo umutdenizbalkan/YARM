@@ -42,21 +42,21 @@ fn restore_arch_thread_state(
 
 pub fn decode_trap_context(context: Aarch64TrapContext) -> TrapEvent {
     if context.is_timer_irq {
-        return TrapEvent::timer_interrupt();
+        return TrapEvent::TimerInterrupt;
     }
     if let Some(irq) = context.irq_line {
-        return TrapEvent::external_interrupt(irq);
+        return TrapEvent::ExternalInterrupt(irq);
     }
 
     match (context.esr_el1 >> 26) & ESR_EC_MASK {
-        ESR_EC_SVC64 => TrapEvent::syscall(),
-        ESR_EC_IABT_LOW => TrapEvent::page_fault(FaultInfo {
+        ESR_EC_SVC64 => TrapEvent::Syscall,
+        ESR_EC_IABT_LOW => TrapEvent::PageFault(FaultInfo {
             addr: VirtAddr(context.far_el1),
             access: FaultAccess::Execute,
         }),
         ESR_EC_DABT_LOW => {
             let is_write = ((context.esr_el1 >> 6) & 1) != 0;
-            TrapEvent::page_fault(FaultInfo {
+            TrapEvent::PageFault(FaultInfo {
                 addr: VirtAddr(context.far_el1),
                 access: if is_write {
                     FaultAccess::Write
@@ -65,7 +65,7 @@ pub fn decode_trap_context(context: Aarch64TrapContext) -> TrapEvent {
                 },
             })
         }
-        _ => TrapEvent::external_interrupt(0),
+        _ => TrapEvent::ExternalInterrupt(0),
     }
 }
 

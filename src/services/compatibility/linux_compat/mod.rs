@@ -1382,7 +1382,7 @@ mod tests {
         assert_eq!(getpid.ret0(), 700);
 
         state
-            .handle_trap_event(crate::kernel::trap::TrapEvent::external_interrupt(9), None)
+            .handle_trap_event(crate::kernel::trap::TrapEvent::ExternalInterrupt(9), None)
             .expect("irq");
 
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x1234, 0, 0, 0, 0]);

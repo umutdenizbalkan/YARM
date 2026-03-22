@@ -49,23 +49,23 @@ pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
 
     if is_interrupt {
         return match code {
-            IRQ_SUPERVISOR_TIMER => TrapEvent::timer_interrupt(),
-            IRQ_SUPERVISOR_EXTERNAL => TrapEvent::external_interrupt(context.stval as u16),
-            _ => TrapEvent::external_interrupt(0),
+            IRQ_SUPERVISOR_TIMER => TrapEvent::TimerInterrupt,
+            IRQ_SUPERVISOR_EXTERNAL => TrapEvent::ExternalInterrupt(context.stval as u16),
+            _ => TrapEvent::ExternalInterrupt(0),
         };
     }
 
     match code {
-        EXC_USER_ECALL => TrapEvent::syscall(),
-        EXC_LOAD_PAGE_FAULT => TrapEvent::page_fault(FaultInfo {
+        EXC_USER_ECALL => TrapEvent::Syscall,
+        EXC_LOAD_PAGE_FAULT => TrapEvent::PageFault(FaultInfo {
             addr: VirtAddr(context.stval as u64),
             access: FaultAccess::Read,
         }),
-        EXC_STORE_PAGE_FAULT => TrapEvent::page_fault(FaultInfo {
+        EXC_STORE_PAGE_FAULT => TrapEvent::PageFault(FaultInfo {
             addr: VirtAddr(context.stval as u64),
             access: FaultAccess::Write,
         }),
-        _ => TrapEvent::external_interrupt(0),
+        _ => TrapEvent::ExternalInterrupt(0),
     }
 }
 
