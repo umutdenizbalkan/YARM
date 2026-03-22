@@ -157,6 +157,19 @@ impl CpuTopology {
         Ok(())
     }
 
+    pub fn mark_cpu_offline(&self, cpu: u8) -> Result<(), TopologyError> {
+        let mask = 1u64
+            .checked_shl(cpu as u32)
+            .ok_or(TopologyError::InvalidCpuId)?;
+        if !self.cpu_online(cpu) {
+            return Err(TopologyError::CpuNotPresent);
+        }
+        self.online.fetch_and(!mask, Ordering::AcqRel);
+        self.started.fetch_and(!mask, Ordering::AcqRel);
+        self.pending_ack.fetch_and(!mask, Ordering::AcqRel);
+        Ok(())
+    }
+
     pub fn mark_cpu_online(&self, cpu: u8) -> Result<(), TopologyError> {
         let mask = 1u64
             .checked_shl(cpu as u32)
@@ -195,5 +208,21 @@ mod tests {
         topo.check_secondary_ack(1).expect("wait");
         topo.mark_cpu_online(1).expect("online");
         assert!(topo.cpu_online(1));
+    }
+
+    #[test]
+    fn mark_cpu_offline_clears_online_started_and_pending_ack() {
+        let topo = CpuTopology::from_present_bitmap(0b11);
+        topo.start_secondary_cpu(1).expect("start");
+        topo.acknowledge_secondary_cpu(1).expect("ack");
+        topo.mark_cpu_online(1).expect("online");
+
+        topo.mark_cpu_offline(1).expect("offline");
+        assert!(!topo.cpu_online(1));
+        assert_eq!(
+            topo.check_secondary_ack(1),
+            Err(TopologyError::CpuNotStarted)
+        );
+        assert_eq!(topo.mark_cpu_offline(1), Err(TopologyError::CpuNotPresent));
     }
 }

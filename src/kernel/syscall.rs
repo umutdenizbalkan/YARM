@@ -205,7 +205,7 @@ fn inline_payload_from_frame(
 
 fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
-    validate_endpoint_right(kernel, cap, CapRights::Send)?;
+    validate_endpoint_right(kernel, cap, CapRights::SEND)?;
     let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
     let transfer_cap = transfer_cap_arg(kernel, frame)?;
@@ -278,7 +278,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 
 fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
-    validate_endpoint_right(kernel, cap, CapRights::Receive)?;
+    validate_endpoint_right(kernel, cap, CapRights::RECEIVE)?;
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let user_len = frame.arg(SYSCALL_ARG_LEN);
     let received = kernel.ipc_recv(cap).map_err(SyscallError::from)?;
