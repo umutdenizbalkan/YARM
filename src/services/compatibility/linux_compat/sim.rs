@@ -1,6 +1,6 @@
 use crate::kernel::bootstrap::{Bootstrap, KernelError};
 use crate::kernel::ipc::Message;
-use crate::kernel::proc_abi::PROC_OP_GETPID;
+use crate::kernel::process_abi::PROC_OP_GETPID;
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vfs_abi::VFS_OP_OPENAT;
 

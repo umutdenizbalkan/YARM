@@ -1,5 +1,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::control_plane::procman::run();
+    yarm::services::control_plane::process_manager::run();
 }

@@ -18,7 +18,7 @@ use super::task::{
     FaultPolicy, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock, ThreadGroupId,
     UserRegisterContext, WaitReason,
 };
-use super::timer::Timer;
+use super::scheduler_timer::Timer;
 use super::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
 use super::trapframe::TrapFrame;
 use super::vm::{

@@ -1,7 +1,7 @@
 #![no_std]
 use yarm::kernel::ipc::Message;
-use yarm::kernel::proc_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
-use yarm::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
+use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
+use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use yarm::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, VfsService, openat_message, read_message,
 };

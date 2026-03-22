@@ -2,10 +2,10 @@ use crate::kernel::bootstrap::{KernelError, KernelState};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 #[cfg(test)]
-use crate::kernel::proc_abi::{
+use crate::kernel::process_abi::{
     PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args, WaitPidV2Reply,
 };
-use crate::kernel::proc_abi::{
+use crate::kernel::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_SERVER_ABI_VERSION,
 };
 use crate::kernel::trapframe::TrapFrame;
