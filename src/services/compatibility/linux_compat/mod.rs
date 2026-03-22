@@ -3,7 +3,7 @@ use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 #[cfg(test)]
 use crate::kernel::proc_proto::{
-    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply, PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2,
+    PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args, WaitPidV2Reply,
 };
 use crate::kernel::proc_proto::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_SERVER_ABI_VERSION,
@@ -12,10 +12,9 @@ use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
 use crate::kernel::vfs_proto::VFS_CODEC_V1_VERSION;
 use crate::kernel::vfs_proto::{
-    OpenAtArgs, ReadWriteArgs, StatxArgs,
-    VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT,
-    VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE,
-    VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
+    OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1,
+    VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL,
+    VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
 };
 use crate::kernel::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
@@ -462,260 +461,260 @@ impl KernelState {
 pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame: &mut TrapFrame) {
     // VM-related personality syscalls pass capability IDs in arguments by design
     // (e.g. mmap arg0/aspace-cap and brk arg1/aspace-cap) for capability routing.
-    let result: Result<usize, LinuxErrno> = (|| match LinuxCompatSyscall::decode(frame.syscall_num())?
-    {
-        LinuxCompatSyscall::Exit => {
-            let code = frame.arg(LINUX_ARG0) as u64;
-            bindings
-                .send_proc_request(kernel, PROC_OP_EXIT, code)
-                .map_err(LinuxErrno::from)?;
-            Ok(0)
-        }
-        LinuxCompatSyscall::Getpid => {
-            let tid = kernel.scheduler.current_tid().ok_or(LinuxErrno::NoSys)?;
-            bindings
-                .send_proc_request(kernel, PROC_OP_GETPID, tid)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_proc_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Getppid => {
-            let tid = kernel.scheduler.current_tid().ok_or(LinuxErrno::NoSys)?;
-            bindings
-                .send_proc_request(kernel, PROC_OP_GETPPID, tid)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_proc_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Openat => {
-            let payload = pack_vfs4(
-                frame.arg(LINUX_ARG0),
-                frame.arg(LINUX_ARG1),
-                frame.arg(LINUX_ARG2),
-                frame.arg(LINUX_ARG3),
-            );
-            bindings
-                .send_vfs_request(kernel, VFS_OP_OPENAT, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Close => {
-            let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
-            bindings
-                .send_vfs_request(kernel, VFS_OP_CLOSE, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Read => {
-            let payload = pack_vfs4(
-                frame.arg(LINUX_ARG0),
-                frame.arg(LINUX_ARG1),
-                frame.arg(LINUX_ARG2),
-                0,
-            );
-            bindings
-                .send_vfs_request(kernel, VFS_OP_READ, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Write => {
-            let payload = pack_vfs4(
-                frame.arg(LINUX_ARG0),
-                frame.arg(LINUX_ARG1),
-                frame.arg(LINUX_ARG2),
-                0,
-            );
-            bindings
-                .send_vfs_request(kernel, VFS_OP_WRITE, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Ioctl => {
-            let payload = pack_vfs4(
-                frame.arg(LINUX_ARG0),
-                frame.arg(LINUX_ARG1),
-                frame.arg(LINUX_ARG2),
-                frame.arg(LINUX_ARG3),
-            );
-            bindings
-                .send_vfs_request(kernel, VFS_OP_IOCTL, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Mmap => {
-            let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
-            let addr = frame.arg(LINUX_ARG1);
-            let len = frame.arg(LINUX_ARG2);
-            let prot = frame.arg(LINUX_ARG3);
-            kernel.linux_mmap_region(aspace_cap, addr, len, prot)
-        }
-        LinuxCompatSyscall::Munmap => {
-            let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
-            let addr = frame.arg(LINUX_ARG1);
-            let len = frame.arg(LINUX_ARG2);
-            kernel.linux_munmap_region(aspace_cap, addr, len)?;
-            Ok(0)
-        }
-        LinuxCompatSyscall::Mprotect => {
-            let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
-            let addr = frame.arg(LINUX_ARG1);
-            let len = frame.arg(LINUX_ARG2);
-            let prot = frame.arg(LINUX_ARG3);
-            kernel.linux_mprotect_region(aspace_cap, addr, len, prot)?;
-            Ok(0)
-        }
-        LinuxCompatSyscall::Dup => {
-            let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
-            bindings
-                .send_vfs_request(kernel, VFS_OP_DUP, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Fcntl => {
-            let payload = pack_vfs4(
-                frame.arg(LINUX_ARG0),
-                frame.arg(LINUX_ARG1),
-                frame.arg(LINUX_ARG2),
-                0,
-            );
-            bindings
-                .send_vfs_request(kernel, VFS_OP_FCNTL, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Poll => {
-            let payload = pack_vfs4(
-                frame.arg(LINUX_ARG0),
-                frame.arg(LINUX_ARG1),
-                frame.arg(LINUX_ARG2),
-                0,
-            );
-            bindings
-                .send_vfs_request(kernel, VFS_OP_POLL, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::EpollCreate1 => {
-            let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
-            bindings
-                .send_vfs_request(kernel, VFS_OP_EPOLL_CREATE1, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::EpollCtl => {
-            let payload = pack_epoll_ctl(
-                frame.arg(LINUX_ARG0),
-                frame.arg(LINUX_ARG1),
-                frame.arg(LINUX_ARG2),
-                frame.arg(LINUX_ARG3),
-            );
-            bindings
-                .send_vfs_request(kernel, VFS_OP_EPOLL_CTL, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::EpollPwait => {
-            let payload = pack_vfs4(
-                frame.arg(LINUX_ARG0),
-                frame.arg(LINUX_ARG1),
-                frame.arg(LINUX_ARG2),
-                frame.arg(LINUX_ARG3),
-            );
-            bindings
-                .send_vfs_request(kernel, VFS_OP_EPOLL_PWAIT, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Sendfile => {
-            let payload = pack_sendfile(
-                frame.arg(LINUX_ARG0),
-                frame.arg(LINUX_ARG1),
-                frame.arg(LINUX_ARG2),
-                frame.arg(LINUX_ARG3),
-            );
-            bindings
-                .send_vfs_request(kernel, VFS_OP_SENDFILE, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Statx => {
-            let payload = pack_statx(
-                frame.arg(LINUX_ARG0),
-                frame.arg(LINUX_ARG1),
-                frame.arg(LINUX_ARG2),
-                frame.arg(LINUX_ARG3),
-            );
-            bindings
-                .send_vfs_request(kernel, VFS_OP_STATX, &payload)
-                .map_err(LinuxErrno::from)?;
-            let reply = bindings
-                .recv_vfs_reply(kernel)
-                .map_err(LinuxErrno::from)?
-                .ok_or(LinuxErrno::NoSys)?;
-            decode_u64_reply(reply.as_slice())
-        }
-        LinuxCompatSyscall::Brk => {
-            let requested = frame.arg(LINUX_ARG0);
-            let aspace_cap = CapId(frame.arg(LINUX_ARG1) as u64);
-            let prot = frame.arg(LINUX_ARG2);
-            let tid = kernel.scheduler.current_tid().ok_or(LinuxErrno::NoSys)?;
-            kernel.linux_brk(tid, aspace_cap, requested, prot)
-        }
-    })();
+    let result: Result<usize, LinuxErrno> =
+        (|| match LinuxCompatSyscall::decode(frame.syscall_num())? {
+            LinuxCompatSyscall::Exit => {
+                let code = frame.arg(LINUX_ARG0) as u64;
+                bindings
+                    .send_proc_request(kernel, PROC_OP_EXIT, code)
+                    .map_err(LinuxErrno::from)?;
+                Ok(0)
+            }
+            LinuxCompatSyscall::Getpid => {
+                let tid = kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
+                bindings
+                    .send_proc_request(kernel, PROC_OP_GETPID, tid)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_proc_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Getppid => {
+                let tid = kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
+                bindings
+                    .send_proc_request(kernel, PROC_OP_GETPPID, tid)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_proc_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Openat => {
+                let payload = pack_vfs4(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    frame.arg(LINUX_ARG3),
+                );
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_OPENAT, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Close => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_CLOSE, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Read => {
+                let payload = pack_vfs4(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    0,
+                );
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_READ, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Write => {
+                let payload = pack_vfs4(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    0,
+                );
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_WRITE, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Ioctl => {
+                let payload = pack_vfs4(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    frame.arg(LINUX_ARG3),
+                );
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_IOCTL, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Mmap => {
+                let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
+                let addr = frame.arg(LINUX_ARG1);
+                let len = frame.arg(LINUX_ARG2);
+                let prot = frame.arg(LINUX_ARG3);
+                kernel.linux_mmap_region(aspace_cap, addr, len, prot)
+            }
+            LinuxCompatSyscall::Munmap => {
+                let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
+                let addr = frame.arg(LINUX_ARG1);
+                let len = frame.arg(LINUX_ARG2);
+                kernel.linux_munmap_region(aspace_cap, addr, len)?;
+                Ok(0)
+            }
+            LinuxCompatSyscall::Mprotect => {
+                let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
+                let addr = frame.arg(LINUX_ARG1);
+                let len = frame.arg(LINUX_ARG2);
+                let prot = frame.arg(LINUX_ARG3);
+                kernel.linux_mprotect_region(aspace_cap, addr, len, prot)?;
+                Ok(0)
+            }
+            LinuxCompatSyscall::Dup => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_DUP, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Fcntl => {
+                let payload = pack_vfs4(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    0,
+                );
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_FCNTL, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Poll => {
+                let payload = pack_vfs4(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    0,
+                );
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_POLL, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::EpollCreate1 => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_EPOLL_CREATE1, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::EpollCtl => {
+                let payload = pack_epoll_ctl(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    frame.arg(LINUX_ARG3),
+                );
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_EPOLL_CTL, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::EpollPwait => {
+                let payload = pack_vfs4(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    frame.arg(LINUX_ARG3),
+                );
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_EPOLL_PWAIT, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Sendfile => {
+                let payload = pack_sendfile(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    frame.arg(LINUX_ARG3),
+                );
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_SENDFILE, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Statx => {
+                let payload = pack_statx(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    frame.arg(LINUX_ARG3),
+                );
+                bindings
+                    .send_vfs_request(kernel, VFS_OP_STATX, &payload)
+                    .map_err(LinuxErrno::from)?;
+                let reply = bindings
+                    .recv_vfs_reply(kernel)
+                    .map_err(LinuxErrno::from)?
+                    .ok_or(LinuxErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            LinuxCompatSyscall::Brk => {
+                let requested = frame.arg(LINUX_ARG0);
+                let aspace_cap = CapId(frame.arg(LINUX_ARG1) as u64);
+                let prot = frame.arg(LINUX_ARG2);
+                let tid = kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
+                kernel.linux_brk(tid, aspace_cap, requested, prot)
+            }
+        })();
 
     match result {
         Ok(value) => frame.set_ok(value, 0, 0),

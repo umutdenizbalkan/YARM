@@ -47,6 +47,6 @@ fn main() {
         "YARM core online: mappings={}, runnable_tasks={}, current={}",
         kernel.kernel_aspace.mappings(),
         kernel.scheduler.runnable_count(),
-        kernel.scheduler.current_tid().unwrap_or(0)
+        kernel.current_tid().unwrap_or(0)
     );
 }

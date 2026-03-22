@@ -249,6 +249,7 @@ pub struct KernelState {
     pub cspace: CapabilitySpace,
     pub timer: Timer,
     pub user_spaces: AddressSpaceManager,
+    current_cpu: CpuId,
     ipc: KernelStorage<IpcSubsystem>,
     next_dynamic_tid: u64,
     tcbs: [Option<ThreadControlBlock>; MAX_TASKS],
@@ -314,6 +315,7 @@ impl Bootstrap {
             cspace,
             timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: AddressSpaceManager::default(),
+            current_cpu: CpuId(platform_layout::BOOTSTRAP_CPU_ID),
             ipc: store_kernel_value(IpcSubsystem {
                 cross_cpu_work: CrossCpuWorkQueue::default(),
                 endpoints: [const { None }; MAX_ENDPOINTS],
@@ -362,13 +364,13 @@ impl KernelState {
     fn switch_to_runnable_tid(&mut self, tid: ThreadId) -> Result<bool, KernelError> {
         let mut spins = 0usize;
         while spins < MAX_TASKS {
-            if self.scheduler.current_tid() == Some(tid.0) {
+            if self.current_tid() == Some(tid.0) {
                 return Ok(true);
             }
             self.yield_current()?;
             spins += 1;
         }
-        Ok(self.scheduler.current_tid() == Some(tid.0))
+        Ok(self.current_tid() == Some(tid.0))
     }
 
     fn tcb_mut(&mut self, tid: u64) -> Option<&mut ThreadControlBlock> {
@@ -511,7 +513,7 @@ mod tests {
         let state = Bootstrap::init().expect("bootstrap should fit static limits");
         assert_eq!(state.kernel_aspace.mappings(), 1);
         assert_eq!(state.online_cpu_count(), 1);
-        assert_eq!(state.scheduler.current_tid().expect("boot task"), 0);
+        assert_eq!(state.current_tid().expect("boot task"), 0);
         assert_eq!(state.task_status(0), Some(TaskStatus::Running));
     }
 
@@ -544,8 +546,8 @@ mod tests {
         state.enqueue_on_cpu(CpuId(1), 42).expect("enqueue cpu1");
 
         state.set_current_cpu(CpuId(1)).expect("switch cpu1");
-        assert_eq!(state.scheduler.dispatch_next(), Some(42));
-        assert_eq!(state.scheduler.current_tid(), Some(42));
+        assert_eq!(state.dispatch_next_current_cpu(), Some(42));
+        assert_eq!(state.current_tid(), Some(42));
         assert_eq!(state.task_status(42), Some(TaskStatus::Runnable));
     }
 
@@ -625,13 +627,13 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         state.timer = Timer::new(1);
         state.register_task(1).expect("register task 1");
-        state.scheduler.enqueue(1).expect("queue task 1");
+        state.enqueue_current_cpu(1).expect("queue task 1");
 
-        let running_before = state.scheduler.current_tid().expect("running");
+        let running_before = state.current_tid().expect("running");
         state
             .handle_trap(Trap::TimerInterrupt, None)
             .expect("timer trap should be handled");
-        let running_after = state.scheduler.current_tid().expect("running");
+        let running_after = state.current_tid().expect("running");
 
         assert_ne!(running_before, running_after);
         assert_eq!(state.task_status(running_after), Some(TaskStatus::Running));
@@ -641,7 +643,7 @@ mod tests {
     fn normalized_page_fault_event_faults_current_task() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue task1");
+        state.enqueue_current_cpu(1).expect("enqueue task1");
 
         state
             .handle_trap_event(
@@ -654,7 +656,7 @@ mod tests {
             .expect("page fault event handled");
 
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
         assert_eq!(
             state.last_fault(),
             Some(FaultInfo {
@@ -668,17 +670,17 @@ mod tests {
     fn recv_on_empty_endpoint_blocks_then_send_wakes() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("register task 1");
-        state.scheduler.enqueue(1).expect("queue task 1");
+        state.enqueue_current_cpu(1).expect("queue task 1");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
 
-        assert_eq!(state.scheduler.current_tid(), Some(0));
+        assert_eq!(state.current_tid(), Some(0));
         let first_try = state.ipc_recv(recv_cap).expect("recv call should not fail");
         assert!(first_try.is_none());
         assert_eq!(
             state.task_status(0),
             Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap)))
         );
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
 
         let msg = Message::new(1, b"ok").expect("msg");
         state
@@ -691,7 +693,7 @@ mod tests {
     fn synchronous_send_blocks_until_receiver_arrives() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("register task 1");
-        state.scheduler.enqueue(1).expect("queue task 1");
+        state.enqueue_current_cpu(1).expect("queue task 1");
         let (_eid, send_cap, recv_cap) = state
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("sync endpoint");
@@ -703,7 +705,7 @@ mod tests {
             state.task_status(0),
             Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
         );
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
 
         let recv = state
             .ipc_recv(recv_cap)
@@ -1091,7 +1093,7 @@ mod tests {
 
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue task1");
+        state.enqueue_current_cpu(1).expect("enqueue task1");
 
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind");
@@ -1124,7 +1126,7 @@ mod tests {
             Some(SyscallError::PageFault.code())
         );
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
     }
 
     #[test]
@@ -1145,7 +1147,7 @@ mod tests {
 
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue task1");
+        state.enqueue_current_cpu(1).expect("enqueue task1");
 
         let (_handler_eid, _handler_send, handler_recv) =
             state.create_endpoint(4).expect("handler endpoint");
@@ -1182,7 +1184,7 @@ mod tests {
             Some(SyscallError::PageFault.code())
         );
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
 
         let report = state
             .ipc_recv(handler_recv)
@@ -1204,7 +1206,7 @@ mod tests {
 
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue task1");
+        state.enqueue_current_cpu(1).expect("enqueue task1");
         state.set_fault_policy(FaultPolicy::NotifyAndContinue);
 
         let (_handler_eid, _handler_send, handler_recv) =
@@ -1242,7 +1244,7 @@ mod tests {
             Some(SyscallError::PageFault.code())
         );
         assert_eq!(state.task_status(0), Some(TaskStatus::Running));
-        assert_eq!(state.scheduler.current_tid(), Some(0));
+        assert_eq!(state.current_tid(), Some(0));
 
         let report = state
             .ipc_recv(handler_recv)
@@ -1261,7 +1263,7 @@ mod tests {
             .set_task_fault_policy(0, Some(FaultPolicy::KillTask))
             .expect("set override");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue task1");
+        state.enqueue_current_cpu(1).expect("enqueue task1");
 
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind");
@@ -1294,7 +1296,7 @@ mod tests {
             Some(SyscallError::PageFault.code())
         );
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
     }
 
     #[test]
@@ -1364,7 +1366,7 @@ mod tests {
             .create_endpoint_with_mode(2, EndpointMode::Synchronous)
             .expect("endpoint");
 
-        state.scheduler.enqueue(61).expect("enqueue receiver");
+        state.enqueue_current_cpu(61).expect("enqueue receiver");
         let mut recv_tf = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 0x9000, 0, 0, 0],
@@ -1373,7 +1375,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_tf))
             .expect("recv trap");
 
-        state.scheduler.enqueue(60).expect("enqueue sender");
+        state.enqueue_current_cpu(60).expect("enqueue sender");
         let msg = Message::new(60, b"fp").expect("msg");
         let fast = state.ipc_send_fastpath(send_cap, msg).expect("fastpath");
         assert!(fast.switched_to_waiter);
@@ -1489,7 +1491,7 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
 
-        state.scheduler.enqueue(81).expect("enqueue receiver");
+        state.enqueue_current_cpu(81).expect("enqueue receiver");
         let mut recv_tf = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 0x1100, 0, 0, 0],
@@ -1498,7 +1500,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_tf))
             .expect("recv trap");
 
-        state.scheduler.enqueue(80).expect("enqueue sender");
+        state.enqueue_current_cpu(80).expect("enqueue sender");
         state
             .ipc_send(send_cap, Message::new(80, b"rv").expect("msg"))
             .expect("send");
@@ -1523,7 +1525,7 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
 
-        state.scheduler.enqueue(36).expect("enqueue receiver");
+        state.enqueue_current_cpu(36).expect("enqueue receiver");
         let mut recv_tf = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 0x7000, 0, 0, 0],
@@ -1532,7 +1534,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_tf))
             .expect("recv trap");
 
-        state.scheduler.enqueue(35).expect("enqueue sender");
+        state.enqueue_current_cpu(35).expect("enqueue sender");
         let msg = Message::new(35, b"x").expect("msg");
         let result = state.ipc_send_fastpath(send_cap, msg).expect("fastpath");
         assert!(result.switched_to_waiter);
@@ -1927,12 +1929,12 @@ mod tests {
     fn yield_current_rotates_to_next_runnable_task() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(40).expect("task");
-        state.scheduler.enqueue(40).expect("enqueue");
+        state.enqueue_current_cpu(40).expect("enqueue");
 
-        assert_eq!(state.scheduler.current_tid(), Some(0));
+        assert_eq!(state.current_tid(), Some(0));
         state.yield_current().expect("yield");
 
-        assert_eq!(state.scheduler.current_tid(), Some(40));
+        assert_eq!(state.current_tid(), Some(40));
         assert_eq!(state.task_status(40), Some(TaskStatus::Running));
         assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
     }
@@ -2002,10 +2004,10 @@ mod tests {
     fn futex_wait_blocks_current_and_wake_requeues_waiter() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue");
+        state.enqueue_current_cpu(1).expect("enqueue");
         state.dispatch_next_task().expect("dispatch");
         state.yield_current().expect("switch");
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
 
         assert!(state.futex_wait_current(0x1000, 3, 3).expect("wait"));
         assert_eq!(
@@ -2032,7 +2034,7 @@ mod tests {
             .spawn_user_thread(20, 0xABCD_0000, 0x8800_0000, 0x7010)
             .expect("thread");
         state.yield_current().expect("switch");
-        assert_eq!(state.scheduler.current_tid(), Some(tid));
+        assert_eq!(state.current_tid(), Some(tid));
 
         let mut frame = TrapFrame::new(0, [11, 22, 0, 0, 0, 0]);
         let tls = state
@@ -2076,7 +2078,7 @@ mod tests {
             .spawn_user_thread(30, 0xCAFE_1000, 0x8100_0000, 0x4010)
             .expect("joiner");
         state.yield_current().expect("switch to joiner");
-        assert_eq!(state.scheduler.current_tid(), Some(joiner));
+        assert_eq!(state.current_tid(), Some(joiner));
 
         assert_eq!(state.join_thread(30).expect("join pending"), None);
         assert_eq!(

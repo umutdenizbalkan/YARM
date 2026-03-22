@@ -102,7 +102,10 @@ fn sender_tid_to_ret(tid: u64) -> Result<usize, SyscallError> {
     usize::try_from(tid).map_err(|_| SyscallError::Internal)
 }
 
-fn transfer_cap_arg(kernel: &KernelState, frame: &TrapFrame) -> Result<Option<CapId>, SyscallError> {
+fn transfer_cap_arg(
+    kernel: &KernelState,
+    frame: &TrapFrame,
+) -> Result<Option<CapId>, SyscallError> {
     let raw = frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64;
     if raw == SYSCALL_NO_TRANSFER_CAP {
         return Ok(None);
@@ -181,10 +184,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         validate_transfer_cap(kernel, c)?;
     }
 
-    let sender_tid = kernel
-        .scheduler
-        .current_tid()
-        .ok_or(SyscallError::Internal)?;
+    let sender_tid = kernel.current_tid().ok_or(SyscallError::Internal)?;
 
     let msg = if kernel.task_asid(sender_tid).is_some() {
         if len > Message::MAX_PAYLOAD {
@@ -271,10 +271,7 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             let sender = sender_tid_to_ret(msg.sender_tid.0)?;
             encode_transfer_cap_ret(frame, msg.transferred_cap().map(|c| c.0))?;
 
-            let current_tid = kernel
-                .scheduler
-                .current_tid()
-                .ok_or(SyscallError::Internal)?;
+            let current_tid = kernel.current_tid().ok_or(SyscallError::Internal)?;
             if kernel.task_asid(current_tid).is_some() {
                 if msg.opcode == OPCODE_SHARED_MEM {
                     let desc = SharedMemoryRegion::decode(msg.as_slice())

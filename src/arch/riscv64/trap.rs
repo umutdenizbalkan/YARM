@@ -114,7 +114,7 @@ mod tests {
         )
         .expect("timer");
 
-        assert_eq!(state.scheduler.current_cpu(), CpuId(1));
+        assert_eq!(state.current_cpu(), CpuId(1));
     }
 
     #[test]
@@ -136,7 +136,7 @@ mod tests {
             .spawn_user_thread(50, 0xCAFE_0000, 0x8100_0000, 0x4010)
             .expect("thread");
         state.yield_current().expect("switch");
-        assert_eq!(state.scheduler.current_tid(), Some(tid));
+        assert_eq!(state.current_tid(), Some(tid));
 
         let mut frame = TrapFrame::new(0, [0; 6]);
         handle_trap_entry(

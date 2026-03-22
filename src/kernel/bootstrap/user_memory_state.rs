@@ -101,10 +101,7 @@ impl KernelState {
         user_ptr: usize,
         bytes: &[u8],
     ) -> Result<(), KernelError> {
-        let tid = self
-            .scheduler
-            .current_tid()
-            .ok_or(KernelError::TaskMissing)?;
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
         self.copy_to_user(asid, VirtAddr(user_ptr as u64), bytes)
     }
@@ -114,10 +111,7 @@ impl KernelState {
         user_ptr: usize,
         len: usize,
     ) -> Result<[u8; Message::MAX_PAYLOAD], KernelError> {
-        let tid = self
-            .scheduler
-            .current_tid()
-            .ok_or(KernelError::TaskMissing)?;
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
         self.copy_from_user(asid, VirtAddr(user_ptr as u64), len)
     }

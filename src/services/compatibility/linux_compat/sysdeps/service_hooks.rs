@@ -220,7 +220,7 @@ mod tests {
     fn service_backed_proc_and_vfs_hooks_roundtrip_real_services() {
         let mut kernel = Bootstrap::init().expect("init");
         kernel.register_task(41).expect("task");
-        kernel.scheduler.enqueue(41).expect("enqueue");
+        kernel.enqueue_current_cpu(41).expect("enqueue");
         kernel.dispatch_next_task().expect("dispatch");
 
         let mut proc = ProcessService::new();

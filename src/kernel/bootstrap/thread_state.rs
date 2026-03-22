@@ -94,7 +94,7 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
         if tcb.status != TaskStatus::Exited {
-            let current_tid = self.scheduler.current_tid();
+            let current_tid = self.current_tid();
             if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
                 let joiner_pid = self
                     .process_id(joiner_tid)
@@ -107,7 +107,7 @@ impl KernelState {
             if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
                 let joiner = self.tcb_mut(joiner_tid).ok_or(KernelError::TaskMissing)?;
                 joiner.status = TaskStatus::Blocked(WaitReason::Join(ThreadId(tid)));
-                let _ = self.scheduler.block_current();
+                let _ = self.block_current_cpu();
                 self.dispatch_next_task()?;
             }
             return Ok(None);
@@ -154,20 +154,14 @@ impl KernelState {
         &mut self,
         frame: &TrapFrame,
     ) -> Result<(), KernelError> {
-        let tid = self
-            .scheduler
-            .current_tid()
-            .ok_or(KernelError::TaskMissing)?;
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.user_context = frame.capture_user_context();
         Ok(())
     }
 
     fn apply_current_thread_to_frame(&mut self, frame: &mut TrapFrame) -> Result<(), KernelError> {
-        let tid = self
-            .scheduler
-            .current_tid()
-            .ok_or(KernelError::TaskMissing)?;
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let context = self
             .thread_user_context(tid)
             .ok_or(KernelError::TaskMissing)?;
@@ -180,10 +174,7 @@ impl KernelState {
         frame: &mut TrapFrame,
     ) -> Result<Option<usize>, KernelError> {
         self.apply_current_thread_to_frame(frame)?;
-        let tid = self
-            .scheduler
-            .current_tid()
-            .ok_or(KernelError::TaskMissing)?;
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         self.take_tls_restore_request(tid)
     }
 

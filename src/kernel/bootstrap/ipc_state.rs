@@ -12,10 +12,7 @@ impl KernelState {
         endpoint_idx: usize,
         recv_cap: CapId,
     ) -> Result<(), KernelError> {
-        let blocked_tid = self
-            .scheduler
-            .block_current()
-            .ok_or(KernelError::TaskMissing)?;
+        let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
         self.ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
@@ -33,10 +30,7 @@ impl KernelState {
             return Err(KernelError::EndpointQueueFull);
         }
 
-        let blocked_tid = self
-            .scheduler
-            .block_current()
-            .ok_or(KernelError::TaskMissing)?;
+        let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
         self.ipc.endpoint_sender_waiters[endpoint_idx] = Some((ThreadId(blocked_tid), msg, true));

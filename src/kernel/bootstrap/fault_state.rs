@@ -47,20 +47,14 @@ impl KernelState {
     }
 
     fn fault_current_task(&mut self) -> Result<(), KernelError> {
-        let running_tid = self
-            .scheduler
-            .current_tid()
-            .ok_or(KernelError::TaskMissing)?;
+        let running_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         self.emit_fault_report(running_tid);
 
         if self.effective_fault_policy_for(running_tid) == FaultPolicy::NotifyAndContinue {
             return Ok(());
         }
 
-        let faulted_tid = self
-            .scheduler
-            .block_current()
-            .ok_or(KernelError::TaskMissing)?;
+        let faulted_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(faulted_tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Faulted;
         let _ = self.dispatch_next_task()?;

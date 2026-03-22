@@ -86,7 +86,7 @@ mod tests {
 
         let processed = kernel
             .with_cpu(CpuId(1), |state| {
-                assert_eq!(state.scheduler.current_cpu(), CpuId(1));
+                assert_eq!(state.current_cpu(), CpuId(1));
                 state
                     .process_cross_cpu_work_for_cpu(CpuId(1))
                     .expect("drain")

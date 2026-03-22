@@ -12,8 +12,34 @@ impl KernelState {
 
     pub fn set_current_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
         self.scheduler
-            .set_current_cpu(cpu)
-            .map_err(map_scheduler_error)
+            .validate_online_cpu(cpu)
+            .map_err(map_scheduler_error)?;
+        self.current_cpu = cpu;
+        Ok(())
+    }
+
+    pub fn current_cpu(&self) -> CpuId {
+        self.current_cpu
+    }
+
+    pub fn current_tid(&self) -> Option<u64> {
+        self.scheduler.current_tid_on(self.current_cpu)
+    }
+
+    pub fn dispatch_next_current_cpu(&mut self) -> Option<u64> {
+        self.scheduler.dispatch_next_on(self.current_cpu)
+    }
+
+    pub fn on_preempt_current_cpu(&mut self) -> Option<u64> {
+        self.scheduler.on_preempt_on(self.current_cpu)
+    }
+
+    pub fn block_current_cpu(&mut self) -> Option<u64> {
+        self.scheduler.block_current_on(self.current_cpu)
+    }
+
+    pub fn enqueue_current_cpu(&mut self, tid: u64) -> Result<(), KernelError> {
+        self.enqueue_on_cpu(self.current_cpu, tid)
     }
 
     pub fn online_cpu_count(&self) -> usize {
@@ -77,7 +103,7 @@ impl KernelState {
     fn apply_cross_cpu_work(&mut self, item: WorkItem) -> Result<(), KernelError> {
         match item {
             WorkItem::Reschedule { target_cpu } => {
-                if self.scheduler.current_cpu() == target_cpu {
+                if self.current_cpu == target_cpu {
                     self.yield_current()?;
                 }
                 Ok(())

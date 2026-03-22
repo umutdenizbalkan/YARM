@@ -51,8 +51,8 @@ impl KernelState {
         }
         let _ = self.wake_joiners_for(tid)?;
 
-        if self.scheduler.current_tid() == Some(tid) {
-            let _ = self.scheduler.block_current();
+        if self.current_tid() == Some(tid) {
+            let _ = self.block_current_cpu();
             let _ = self.dispatch_next_task()?;
         }
         if detached {
