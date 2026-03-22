@@ -1,9 +1,6 @@
 use super::{KernelError, KernelState, MAX_TASKS};
 use crate::kernel::ipc::ThreadId;
-use crate::kernel::task::{
-    RestartState, TaskClass, TaskStatus, ThreadControlBlock, ThreadDetachState, ThreadGroupId,
-    UserRegisterContext,
-};
+use crate::kernel::task::{TaskClass, ThreadControlBlock};
 
 impl KernelState {
     pub fn register_task_with_class(
@@ -15,21 +12,7 @@ impl KernelState {
             return Ok(());
         }
         if let Some(slot) = self.tcbs.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(ThreadControlBlock {
-                tid: ThreadId(tid),
-                thread_group_id: ThreadGroupId(tid),
-                class,
-                status: TaskStatus::Runnable,
-                asid: None,
-                tls_ptr: None,
-                user_entry: None,
-                user_stack_top: None,
-                user_context: UserRegisterContext::default(),
-                detach_state: ThreadDetachState::Joinable,
-                fault_policy_override: None,
-                restart: RestartState::default(),
-                last_exit_code: None,
-            });
+            *slot = Some(ThreadControlBlock::new(ThreadId(tid), class, None));
             Ok(())
         } else {
             Err(KernelError::TaskTableFull)

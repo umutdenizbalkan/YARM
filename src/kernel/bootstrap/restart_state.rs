@@ -36,9 +36,8 @@ impl KernelState {
         let robust = self.robust_futex_state(tid);
         let detached = self.thread_detach_state(tid) == Some(ThreadDetachState::Detached);
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Exited;
+        tcb.status = TaskStatus::Exited(code);
         tcb.restart.token = Some(RestartToken(token));
-        tcb.last_exit_code = Some(code);
         self.report_task_exit_to_supervisor(tid, code)?;
         if let Some(robust) = robust {
             let stride = core::mem::size_of::<usize>();

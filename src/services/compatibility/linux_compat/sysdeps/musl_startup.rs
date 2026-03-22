@@ -134,7 +134,9 @@ pub fn validate_musl_thread_state(
         return Err(LinuxErrno::Inval);
     }
     let context = kernel.thread_user_context(tid).ok_or(LinuxErrno::Inval)?;
-    if context.instruction_ptr != spec.entry || context.stack_ptr != spec.stack_top {
+    if context.instruction_ptr != crate::kernel::vm::VirtAddr(spec.entry as u64)
+        || context.stack_ptr != crate::kernel::vm::VirtAddr(spec.stack_top as u64)
+    {
         return Err(LinuxErrno::Inval);
     }
     let tls_restore_pending = kernel.tls_restore_pending(tid).ok_or(LinuxErrno::Inval)?;

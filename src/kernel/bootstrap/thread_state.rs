@@ -93,7 +93,7 @@ impl KernelState {
         if tcb.detach_state == ThreadDetachState::Detached {
             return Err(KernelError::WrongObject);
         }
-        if tcb.status != TaskStatus::Exited {
+        let TaskStatus::Exited(exit_code) = tcb.status else {
             let current_tid = self.current_tid();
             if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
                 let joiner_pid = self
@@ -111,10 +111,9 @@ impl KernelState {
                 self.dispatch_next_task()?;
             }
             return Ok(None);
-        }
-        let exit_code = tcb.last_exit_code;
+        };
         tcb.status = TaskStatus::Dead;
-        Ok(exit_code)
+        Ok(Some(exit_code))
     }
 
     pub fn set_robust_futex_head(
@@ -247,11 +246,11 @@ impl KernelState {
             tcb.thread_group_id = parent.thread_group_id;
             tcb.asid = parent.asid;
             tcb.tls_ptr = Some(crate::kernel::vm::VirtAddr(tls_base as u64));
-            tcb.user_entry = Some(user_entry);
-            tcb.user_stack_top = Some(user_stack_top);
+            tcb.user_entry = Some(crate::kernel::vm::VirtAddr(user_entry as u64));
+            tcb.user_stack_top = Some(crate::kernel::vm::VirtAddr(user_stack_top as u64));
             tcb.user_context = UserRegisterContext {
-                instruction_ptr: user_entry,
-                stack_ptr: user_stack_top,
+                instruction_ptr: crate::kernel::vm::VirtAddr(user_entry as u64),
+                stack_ptr: crate::kernel::vm::VirtAddr(user_stack_top as u64),
                 arg0: 0,
                 arg1: 0,
             };

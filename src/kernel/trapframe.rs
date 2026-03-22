@@ -114,16 +114,16 @@ impl TrapFrame {
 
     pub fn capture_user_context(&self) -> UserRegisterContext {
         UserRegisterContext {
-            instruction_ptr: self.saved_pc,
-            stack_ptr: self.saved_sp,
+            instruction_ptr: crate::kernel::vm::VirtAddr(self.saved_pc as u64),
+            stack_ptr: crate::kernel::vm::VirtAddr(self.saved_sp as u64),
             arg0: self.args[0],
             arg1: self.args[1],
         }
     }
 
     pub fn apply_user_context(&mut self, context: UserRegisterContext) {
-        self.saved_pc = context.instruction_ptr;
-        self.saved_sp = context.stack_ptr;
+        self.saved_pc = context.instruction_ptr.0 as usize;
+        self.saved_sp = context.stack_ptr.0 as usize;
         self.args[0] = context.arg0;
         self.args[1] = context.arg1;
     }
@@ -171,14 +171,14 @@ mod tests {
         frame.set_saved_pc(0x4000);
         frame.set_saved_sp(0x8000);
         let ctx = frame.capture_user_context();
-        assert_eq!(ctx.instruction_ptr, 0x4000);
-        assert_eq!(ctx.stack_ptr, 0x8000);
+        assert_eq!(ctx.instruction_ptr, crate::kernel::vm::VirtAddr(0x4000));
+        assert_eq!(ctx.stack_ptr, crate::kernel::vm::VirtAddr(0x8000));
         assert_eq!(ctx.arg0, 5);
         assert_eq!(ctx.arg1, 6);
 
         frame.apply_user_context(UserRegisterContext {
-            instruction_ptr: 0x5000,
-            stack_ptr: 0x9000,
+            instruction_ptr: crate::kernel::vm::VirtAddr(0x5000),
+            stack_ptr: crate::kernel::vm::VirtAddr(0x9000),
             arg0: 7,
             arg1: 8,
         });

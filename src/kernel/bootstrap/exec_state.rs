@@ -59,8 +59,8 @@ impl KernelState {
         if let Some(tcb) = self.tcb_mut(spec.tid) {
             tcb.thread_group_id = ThreadGroupId(spec.tid);
             tcb.asid = spec.asid;
-            tcb.user_entry = Some(spec.entry);
-            tcb.user_context.instruction_ptr = spec.entry;
+            tcb.user_entry = Some(VirtAddr(spec.entry as u64));
+            tcb.user_context.instruction_ptr = VirtAddr(spec.entry as u64);
             tcb.status = TaskStatus::Runnable;
         }
         Ok(SpawnedUserTask {

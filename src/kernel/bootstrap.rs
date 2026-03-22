@@ -15,7 +15,7 @@ use super::scheduler::{CpuId, SchedulerError, SmpScheduler};
 use super::smp::{SmpMailbox, WorkItem};
 use super::syscall::SyscallError;
 use super::task::{
-    RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock, ThreadGroupId,
+    FaultPolicy, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock, ThreadGroupId,
     UserRegisterContext, WaitReason,
 };
 use super::timer::Timer;
@@ -75,12 +75,6 @@ pub enum KernelError {
 pub enum TrapHandleError {
     MissingTrapFrame,
     Syscall(SyscallError),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FaultPolicy {
-    KillTask,
-    NotifyAndContinue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1644,7 +1638,7 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(9).expect("task");
         let token = state.exit_task(9, 12).expect("exit");
-        assert_eq!(state.task_status(9), Some(TaskStatus::Exited));
+        assert_eq!(state.task_status(9), Some(TaskStatus::Exited(12)));
 
         assert!(state.restart_task(9, token).is_ok());
         assert_eq!(state.task_status(9), Some(TaskStatus::Runnable));
@@ -2109,8 +2103,8 @@ mod tests {
         assert_eq!(
             state.thread_user_context(tid),
             Some(UserRegisterContext {
-                instruction_ptr: 0x9000,
-                stack_ptr: 0x9900_0000,
+                instruction_ptr: VirtAddr(0x9000),
+                stack_ptr: VirtAddr(0x9900_0000),
                 arg0: 33,
                 arg1: 44,
             })
