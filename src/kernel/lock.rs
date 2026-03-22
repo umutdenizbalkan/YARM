@@ -3,8 +3,13 @@ use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IrqState {
+#[derive(Debug)]
+#[repr(align(64))]
+struct CachePaddedFlag(AtomicBool);
+
+#[derive(Clone, Copy)]
+struct IrqState {
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     interrupts_were_enabled: bool,
 }
 
@@ -97,13 +102,13 @@ fn irq_restore(state: IrqState) {
 /// CPU, otherwise self-deadlock is possible.
 #[derive(Debug)]
 pub struct SpinLock<T> {
-    held: AtomicBool,
+    held: CachePaddedFlag,
     value: UnsafeCell<T>,
 }
 
 #[derive(Debug)]
 pub struct SpinLockIrq<T> {
-    held: AtomicBool,
+    held: CachePaddedFlag,
     value: UnsafeCell<T>,
 }
 
@@ -115,7 +120,7 @@ unsafe impl<T: Send> Sync for SpinLockIrq<T> {}
 impl<T> SpinLock<T> {
     pub const fn new(value: T) -> Self {
         Self {
-            held: AtomicBool::new(false),
+            held: CachePaddedFlag(AtomicBool::new(false)),
             value: UnsafeCell::new(value),
         }
     }
@@ -126,10 +131,11 @@ impl<T> SpinLock<T> {
         // fail on LL/SC architectures, but is typically cheaper than strong CAS.
         while self
             .held
+            .0
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            while self.held.load(Ordering::Relaxed) {
+            while self.held.0.load(Ordering::Relaxed) {
                 spin_loop();
             }
             spin_loop();
@@ -144,6 +150,7 @@ impl<T> SpinLock<T> {
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         if self
             .held
+            .0
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
@@ -160,28 +167,33 @@ impl<T> SpinLock<T> {
 impl<T> SpinLockIrq<T> {
     pub const fn new(value: T) -> Self {
         Self {
-            held: AtomicBool::new(false),
+            held: CachePaddedFlag(AtomicBool::new(false)),
             value: UnsafeCell::new(value),
         }
     }
 
     #[must_use = "if unused, the lock is immediately released when the guard is dropped"]
     pub fn lock(&self) -> SpinLockIrqGuard<'_, T> {
-        let irq_state = irq_save();
-        while self
-            .held
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            while self.held.load(Ordering::Relaxed) {
+        loop {
+            while self.held.0.load(Ordering::Relaxed) {
                 spin_loop();
             }
+
+            let irq_state = irq_save();
+            if self
+                .held
+                .0
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return SpinLockIrqGuard {
+                    lock: self,
+                    irq_state,
+                    _not_send: PhantomData,
+                };
+            }
+            irq_restore(irq_state);
             spin_loop();
-        }
-        SpinLockIrqGuard {
-            lock: self,
-            irq_state,
-            _not_send: PhantomData,
         }
     }
 }
@@ -214,7 +226,7 @@ impl<T> core::ops::DerefMut for SpinLockIrqGuard<'_, T> {
 
 impl<T> Drop for SpinLockIrqGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.held.store(false, Ordering::Release);
+        self.lock.held.0.store(false, Ordering::Release);
         irq_restore(self.irq_state);
     }
 }
@@ -252,7 +264,7 @@ impl<T> core::ops::DerefMut for SpinLockGuard<'_, T> {
 
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.held.store(false, Ordering::Release);
+        self.lock.held.0.store(false, Ordering::Release);
     }
 }
 
