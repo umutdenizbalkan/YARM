@@ -1,39 +1,33 @@
 use super::ipc::ThreadId;
 use super::lock::SpinLockIrq;
-use super::scheduler::CpuId;
+use super::scheduler::{CpuId, MAX_CPUS};
 use super::vm::{Asid, VirtAddr};
 
 pub const MAX_CROSS_CPU_WORK: usize = 64;
 const _: () = assert!(MAX_CROSS_CPU_WORK.is_power_of_two());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmpError {
+    InvalidCpu,
+    QueueFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkItem {
-    Reschedule {
-        target_cpu: CpuId,
-    },
+    Reschedule,
     TlbShootdown {
-        target_cpu: CpuId,
         asid: Asid,
         va_range: Option<(VirtAddr, VirtAddr)>,
     },
     WakeTask {
-        target_cpu: CpuId,
         tid: ThreadId,
     },
 }
 
-impl WorkItem {
-    pub const fn target_cpu(&self) -> CpuId {
-        match self {
-            Self::Reschedule { target_cpu }
-            | Self::TlbShootdown { target_cpu, .. }
-            | Self::WakeTask { target_cpu, .. } => *target_cpu,
-        }
-    }
-}
-
 #[derive(Debug)]
 struct WorkQueue {
+    // Prototype note: head/count already encode occupancy, so this could become
+    // `MaybeUninit<WorkItem>` later if queue footprint becomes material.
     ring: [Option<WorkItem>; MAX_CROSS_CPU_WORK],
     head: usize,
     count: usize,
@@ -48,9 +42,9 @@ impl WorkQueue {
         }
     }
 
-    fn push(&mut self, item: WorkItem) -> Result<(), WorkItem> {
+    fn push(&mut self, item: WorkItem) -> Result<(), SmpError> {
         if self.count >= MAX_CROSS_CPU_WORK {
-            return Err(item);
+            return Err(SmpError::QueueFull);
         }
         let tail = (self.head + self.count) & (MAX_CROSS_CPU_WORK - 1);
         self.ring[tail] = Some(item);
@@ -88,7 +82,7 @@ impl Default for CrossCpuWorkQueue {
 }
 
 impl CrossCpuWorkQueue {
-    pub fn submit(&self, item: WorkItem) -> Result<(), WorkItem> {
+    pub fn submit(&self, item: WorkItem) -> Result<(), SmpError> {
         self.inner.lock().push(item)
     }
 
@@ -102,6 +96,47 @@ impl CrossCpuWorkQueue {
     }
 }
 
+#[derive(Debug)]
+pub struct SmpMailbox {
+    inboxes: [CrossCpuWorkQueue; MAX_CPUS],
+}
+
+impl Default for SmpMailbox {
+    fn default() -> Self {
+        Self {
+            inboxes: core::array::from_fn(|_| CrossCpuWorkQueue::default()),
+        }
+    }
+}
+
+impl SmpMailbox {
+    fn inbox(&self, cpu: CpuId) -> Result<&CrossCpuWorkQueue, SmpError> {
+        self.inboxes
+            .get(cpu.0 as usize)
+            .ok_or(SmpError::InvalidCpu)
+    }
+
+    pub fn send_to(&self, cpu: CpuId, item: WorkItem) -> Result<(), SmpError> {
+        self.inbox(cpu)?.submit(item)
+    }
+
+    pub fn take_for_cpu(&self, cpu: CpuId) -> Result<Option<WorkItem>, SmpError> {
+        Ok(self.inbox(cpu)?.take())
+    }
+
+    pub fn drain_current<F: FnMut(WorkItem)>(&self, cpu: CpuId, mut f: F) -> Result<(), SmpError> {
+        while let Some(item) = self.take_for_cpu(cpu)? {
+            f(item);
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn pending_for_cpu(&self, cpu: CpuId) -> Result<usize, SmpError> {
+        Ok(self.inbox(cpu)?.pending())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,52 +144,28 @@ mod tests {
     #[test]
     fn cross_cpu_queue_is_fifo() {
         let queue = CrossCpuWorkQueue::default();
+        queue.submit(WorkItem::Reschedule).expect("queue 1");
         queue
-            .submit(WorkItem::Reschedule {
-                target_cpu: CpuId(1),
-            })
-            .expect("queue 1");
-        queue
-            .submit(WorkItem::WakeTask {
-                target_cpu: CpuId(2),
-                tid: ThreadId(44),
-            })
+            .submit(WorkItem::WakeTask { tid: ThreadId(44) })
             .expect("queue 2");
 
         #[cfg(debug_assertions)]
         assert_eq!(queue.pending(), 2);
-        assert_eq!(
-            queue.take(),
-            Some(WorkItem::Reschedule {
-                target_cpu: CpuId(1)
-            })
-        );
-        assert_eq!(
-            queue.take(),
-            Some(WorkItem::WakeTask {
-                target_cpu: CpuId(2),
-                tid: ThreadId(44)
-            })
-        );
+        assert_eq!(queue.take(), Some(WorkItem::Reschedule));
+        assert_eq!(queue.take(), Some(WorkItem::WakeTask { tid: ThreadId(44) }));
         assert_eq!(queue.take(), None);
     }
 
     #[test]
-    fn submit_returns_err_when_full() {
+    fn submit_returns_typed_err_when_full() {
         let queue = CrossCpuWorkQueue::default();
         for i in 0..MAX_CROSS_CPU_WORK {
             queue
-                .submit(WorkItem::WakeTask {
-                    target_cpu: CpuId(0),
-                    tid: ThreadId(i as u64),
-                })
+                .submit(WorkItem::WakeTask { tid: ThreadId(i as u64) })
                 .expect("fill queue");
         }
 
-        let overflow = WorkItem::Reschedule {
-            target_cpu: CpuId(1),
-        };
-        assert_eq!(queue.submit(overflow), Err(overflow));
+        assert_eq!(queue.submit(WorkItem::Reschedule), Err(SmpError::QueueFull));
     }
 
     #[test]
@@ -163,10 +174,7 @@ mod tests {
 
         for i in 0..MAX_CROSS_CPU_WORK {
             queue
-                .submit(WorkItem::WakeTask {
-                    target_cpu: CpuId(0),
-                    tid: ThreadId(i as u64),
-                })
+                .submit(WorkItem::WakeTask { tid: ThreadId(i as u64) })
                 .expect("prime");
         }
         for _ in 0..(MAX_CROSS_CPU_WORK / 2) {
@@ -174,21 +182,12 @@ mod tests {
         }
         for i in MAX_CROSS_CPU_WORK..(MAX_CROSS_CPU_WORK + MAX_CROSS_CPU_WORK / 2) {
             queue
-                .submit(WorkItem::WakeTask {
-                    target_cpu: CpuId(0),
-                    tid: ThreadId(i as u64),
-                })
+                .submit(WorkItem::WakeTask { tid: ThreadId(i as u64) })
                 .expect("wrap submit");
         }
 
         for i in (MAX_CROSS_CPU_WORK / 2)..(MAX_CROSS_CPU_WORK + MAX_CROSS_CPU_WORK / 2) {
-            assert_eq!(
-                queue.take(),
-                Some(WorkItem::WakeTask {
-                    target_cpu: CpuId(0),
-                    tid: ThreadId(i as u64)
-                })
-            );
+            assert_eq!(queue.take(), Some(WorkItem::WakeTask { tid: ThreadId(i as u64) }));
         }
         assert_eq!(queue.take(), None);
     }
@@ -197,11 +196,35 @@ mod tests {
     fn tlb_shootdown_carries_optional_range() {
         let queue = CrossCpuWorkQueue::default();
         let item = WorkItem::TlbShootdown {
-            target_cpu: CpuId(0),
             asid: Asid(7),
             va_range: Some((VirtAddr(0x1000), VirtAddr(0x2000))),
         };
         queue.submit(item).expect("submit");
         assert_eq!(queue.take(), Some(item));
+    }
+
+    #[test]
+    fn mailbox_routes_work_to_target_cpu_inbox() {
+        let mailbox = SmpMailbox::default();
+        mailbox.send_to(CpuId(1), WorkItem::Reschedule).expect("cpu1");
+        mailbox
+            .send_to(CpuId(2), WorkItem::WakeTask { tid: ThreadId(55) })
+            .expect("cpu2");
+
+        assert_eq!(mailbox.take_for_cpu(CpuId(0)), Ok(None));
+        assert_eq!(mailbox.take_for_cpu(CpuId(1)), Ok(Some(WorkItem::Reschedule)));
+        assert_eq!(
+            mailbox.take_for_cpu(CpuId(2)),
+            Ok(Some(WorkItem::WakeTask { tid: ThreadId(55) }))
+        );
+    }
+
+    #[test]
+    fn mailbox_rejects_invalid_cpu() {
+        let mailbox = SmpMailbox::default();
+        assert_eq!(
+            mailbox.send_to(CpuId(MAX_CPUS as u8), WorkItem::Reschedule),
+            Err(SmpError::InvalidCpu)
+        );
     }
 }

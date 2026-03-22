@@ -55,9 +55,7 @@ mod tests {
 
         kernel.with(|state| {
             state
-                .submit_cross_cpu_work(WorkItem::Reschedule {
-                    target_cpu: CpuId(0),
-                })
+                .submit_cross_cpu_work(CpuId(0), WorkItem::Reschedule)
                 .expect("submit");
         });
 
@@ -77,10 +75,7 @@ mod tests {
             state.bring_up_cpu(CpuId(1)).expect("cpu1");
             state.register_task(2).expect("task2");
             state
-                .submit_cross_cpu_work(WorkItem::WakeTask {
-                    target_cpu: CpuId(1),
-                    tid: ThreadId(2),
-                })
+                .submit_cross_cpu_work(CpuId(1), WorkItem::WakeTask { tid: ThreadId(2) })
                 .expect("submit");
         });
 
@@ -113,9 +108,7 @@ mod tests {
             for _ in 0..32 {
                 k1.with(|state| {
                     state
-                        .submit_cross_cpu_work(WorkItem::Reschedule {
-                            target_cpu: CpuId(0),
-                        })
+                        .submit_cross_cpu_work(CpuId(0), WorkItem::Reschedule)
                         .expect("submit t1");
                 });
             }
@@ -125,9 +118,7 @@ mod tests {
             for _ in 0..32 {
                 k2.with(|state| {
                     state
-                        .submit_cross_cpu_work(WorkItem::Reschedule {
-                            target_cpu: CpuId(0),
-                        })
+                        .submit_cross_cpu_work(CpuId(0), WorkItem::Reschedule)
                         .expect("submit t2");
                 });
             }

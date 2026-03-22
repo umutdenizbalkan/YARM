@@ -1,8 +1,15 @@
-use super::{KernelError, KernelState, MAX_CROSS_CPU_WORK, map_scheduler_error};
+use super::{KernelError, KernelState, map_scheduler_error};
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::scheduler::{CpuId, TaskPriority};
-use crate::kernel::smp::WorkItem;
+use crate::kernel::smp::{SmpError, WorkItem};
 use crate::kernel::task::{TaskClass, TaskStatus};
+
+fn map_smp_error(err: SmpError) -> KernelError {
+    match err {
+        SmpError::InvalidCpu => KernelError::VmFull,
+        SmpError::QueueFull => KernelError::TaskTableFull,
+    }
+}
 
 impl KernelState {
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
@@ -98,70 +105,61 @@ impl KernelState {
             .map_err(map_scheduler_error)
     }
 
-    pub fn submit_cross_cpu_work(&self, item: WorkItem) -> Result<(), KernelError> {
+    pub fn submit_cross_cpu_work(&self, cpu: CpuId, item: WorkItem) -> Result<(), KernelError> {
         self.ipc
             .cross_cpu_work
-            .submit(item)
-            .map_err(|_| KernelError::TaskTableFull)
+            .send_to(cpu, item)
+            .map_err(map_smp_error)
     }
 
-    pub fn drain_cross_cpu_work(&self) -> Option<WorkItem> {
-        self.ipc.cross_cpu_work.take()
+    pub fn drain_cross_cpu_work(&self) -> Result<Option<WorkItem>, KernelError> {
+        self.ipc
+            .cross_cpu_work
+            .take_for_cpu(self.current_cpu)
+            .map_err(map_smp_error)
     }
 
     pub fn tlb_shootdown_count(&self) -> u64 {
         self.tlb_shootdown_count
     }
 
-    fn apply_cross_cpu_work(&mut self, item: WorkItem) -> Result<(), KernelError> {
+    fn apply_cross_cpu_work(&mut self, cpu: CpuId, item: WorkItem) -> Result<(), KernelError> {
         match item {
-            WorkItem::Reschedule { target_cpu } => {
-                if self.current_cpu == target_cpu {
+            WorkItem::Reschedule => {
+                if self.current_cpu == cpu {
                     self.yield_current()?;
                 }
                 Ok(())
             }
-            WorkItem::TlbShootdown {
-                target_cpu, asid, ..
-            } => {
+            WorkItem::TlbShootdown { asid, .. } => {
                 self.tlb_shootdown_count = self.tlb_shootdown_count.wrapping_add(1);
-                if self.current_cpu == target_cpu && self.user_spaces.retired_entry(asid).is_some()
-                {
-                    let cpu_bit = 1u64 << target_cpu.0;
+                if self.current_cpu == cpu && self.user_spaces.retired_entry(asid).is_some() {
+                    let cpu_bit = 1u64 << cpu.0;
                     self.user_spaces
                         .acknowledge_shootdown(asid, cpu_bit)
                         .map_err(KernelError::Vm)?;
                 }
                 Ok(())
             }
-            WorkItem::WakeTask { target_cpu, tid } => {
+            WorkItem::WakeTask { tid } => {
                 let tcb = self.tcb_mut(tid.0).ok_or(KernelError::TaskMissing)?;
                 tcb.status = TaskStatus::Runnable;
-                self.enqueue_on_cpu(target_cpu, tid.0)
+                self.enqueue_on_cpu(cpu, tid.0)
             }
         }
     }
 
     pub fn process_cross_cpu_work_for_cpu(&mut self, cpu: CpuId) -> Result<usize, KernelError> {
-        let mut deferred = [None; MAX_CROSS_CPU_WORK];
-        let mut deferred_len = 0usize;
         let mut processed = 0usize;
 
-        while let Some(item) = self.ipc.cross_cpu_work.take() {
-            if item.target_cpu() == cpu {
-                self.apply_cross_cpu_work(item)?;
-                processed += 1;
-            } else if deferred_len < MAX_CROSS_CPU_WORK {
-                deferred[deferred_len] = Some(item);
-                deferred_len += 1;
-            }
-        }
-
-        for item in deferred.into_iter().flatten().take(deferred_len) {
-            self.ipc
-                .cross_cpu_work
-                .submit(item)
-                .map_err(|_| KernelError::TaskTableFull)?;
+        while let Some(item) = self
+            .ipc
+            .cross_cpu_work
+            .take_for_cpu(cpu)
+            .map_err(map_smp_error)?
+        {
+            self.apply_cross_cpu_work(cpu, item)?;
+            processed += 1;
         }
 
         Ok(processed)

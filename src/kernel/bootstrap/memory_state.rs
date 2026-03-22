@@ -27,11 +27,13 @@ impl KernelState {
             if (pending_cpu_bitmap & cpu_bit) == 0 {
                 continue;
             }
-            self.submit_cross_cpu_work(crate::kernel::smp::WorkItem::TlbShootdown {
-                target_cpu: crate::kernel::scheduler::CpuId(cpu as u8),
-                asid,
-                va_range: None,
-            })?;
+            self.submit_cross_cpu_work(
+                crate::kernel::scheduler::CpuId(cpu as u8),
+                crate::kernel::smp::WorkItem::TlbShootdown {
+                    asid,
+                    va_range: None,
+                },
+            )?;
         }
 
         Ok(())

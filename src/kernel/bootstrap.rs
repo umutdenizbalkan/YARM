@@ -12,7 +12,7 @@ mod user_memory_state;
 use super::capabilities::{CapId, CapObject, CapRights, Capability, CapabilitySpace};
 use super::ipc::{Endpoint, EndpointMode, IpcError, Message};
 use super::scheduler::{CpuId, SchedulerError, SmpScheduler};
-use super::smp::{CrossCpuWorkQueue, MAX_CROSS_CPU_WORK, WorkItem};
+use super::smp::{SmpMailbox, WorkItem};
 use super::syscall::SyscallError;
 use super::task::{
     RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock, ThreadGroupId,
@@ -196,7 +196,7 @@ struct RobustFutexRecord {
 
 #[derive(Debug)]
 struct IpcSubsystem {
-    cross_cpu_work: CrossCpuWorkQueue,
+    cross_cpu_work: SmpMailbox,
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
     endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
     endpoint_sender_waiters: [Option<(ThreadId, Message, bool)>; MAX_ENDPOINTS],
@@ -320,7 +320,7 @@ impl Bootstrap {
             user_spaces: AddressSpaceManager::default(),
             current_cpu: CpuId(platform_layout::BOOTSTRAP_CPU_ID),
             ipc: store_kernel_value(IpcSubsystem {
-                cross_cpu_work: CrossCpuWorkQueue::default(),
+                cross_cpu_work: SmpMailbox::default(),
                 endpoints: [const { None }; MAX_ENDPOINTS],
                 endpoint_waiters: [None; MAX_ENDPOINTS],
                 endpoint_sender_waiters: [None; MAX_ENDPOINTS],
@@ -556,20 +556,19 @@ mod tests {
 
     #[test]
     fn cross_cpu_work_queue_round_trip() {
-        let state = Bootstrap::init().expect("init");
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
         state
-            .submit_cross_cpu_work(WorkItem::Reschedule {
-                target_cpu: CpuId(1),
-            })
+            .submit_cross_cpu_work(CpuId(1), WorkItem::Reschedule)
             .expect("submit");
 
+        state.set_current_cpu(CpuId(1)).expect("switch cpu1");
+
         assert_eq!(
-            state.drain_cross_cpu_work(),
-            Some(WorkItem::Reschedule {
-                target_cpu: CpuId(1)
-            })
+            state.drain_cross_cpu_work().expect("drain"),
+            Some(WorkItem::Reschedule)
         );
-        assert_eq!(state.drain_cross_cpu_work(), None);
+        assert_eq!(state.drain_cross_cpu_work().expect("drain"), None);
     }
 
     #[test]
@@ -592,35 +591,34 @@ mod tests {
         );
 
         let mut seen = [false; 2];
-        while let Some(item) = state.drain_cross_cpu_work() {
-            if let WorkItem::TlbShootdown {
-                target_cpu,
+        for cpu in [CpuId(0), CpuId(1)] {
+            state.set_current_cpu(cpu).expect("switch cpu");
+            if let Some(WorkItem::TlbShootdown {
                 asid: item_asid,
                 va_range,
-            } = item
+            }) = state.drain_cross_cpu_work().expect("drain")
             {
                 assert_eq!(item_asid, asid);
                 assert_eq!(va_range, None);
-                seen[target_cpu.0 as usize] = true;
+                seen[cpu.0 as usize] = true;
             }
         }
         assert_eq!(seen, [true, true]);
 
         state
-            .submit_cross_cpu_work(WorkItem::TlbShootdown {
-                target_cpu: CpuId(0),
+            .submit_cross_cpu_work(CpuId(0), WorkItem::TlbShootdown {
                 asid,
                 va_range: None,
             })
             .expect("requeue cpu0 shootdown");
         state
-            .submit_cross_cpu_work(WorkItem::TlbShootdown {
-                target_cpu: CpuId(1),
+            .submit_cross_cpu_work(CpuId(1), WorkItem::TlbShootdown {
                 asid,
                 va_range: None,
             })
             .expect("requeue cpu1 shootdown");
 
+        state.set_current_cpu(CpuId(0)).expect("switch cpu0");
         state
             .process_cross_cpu_work_for_cpu(CpuId(0))
             .expect("process cpu0");
@@ -646,14 +644,10 @@ mod tests {
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
 
         state
-            .submit_cross_cpu_work(WorkItem::WakeTask {
-                target_cpu: CpuId(1),
-                tid: ThreadId(2),
-            })
+            .submit_cross_cpu_work(CpuId(1), WorkItem::WakeTask { tid: ThreadId(2) })
             .expect("submit wake");
         state
-            .submit_cross_cpu_work(WorkItem::TlbShootdown {
-                target_cpu: CpuId(0),
+            .submit_cross_cpu_work(CpuId(0), WorkItem::TlbShootdown {
                 asid: Asid(1),
                 va_range: None,
             })
@@ -666,13 +660,10 @@ mod tests {
         assert_eq!(state.tlb_shootdown_count(), 1);
 
         // WakeTask for cpu1 should still be queued.
-        let remaining = state.drain_cross_cpu_work();
+        state.set_current_cpu(CpuId(1)).expect("switch cpu1");
         assert_eq!(
-            remaining,
-            Some(WorkItem::WakeTask {
-                target_cpu: CpuId(1),
-                tid: ThreadId(2)
-            })
+            state.drain_cross_cpu_work().expect("drain cpu1"),
+            Some(WorkItem::WakeTask { tid: ThreadId(2) })
         );
     }
 
@@ -1701,9 +1692,7 @@ mod tests {
 
         for _ in 0..8 {
             state
-                .submit_cross_cpu_work(WorkItem::Reschedule {
-                    target_cpu: CpuId(1),
-                })
+                .submit_cross_cpu_work(CpuId(1), WorkItem::Reschedule)
                 .expect("work");
         }
         state
@@ -1965,9 +1954,7 @@ mod tests {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             match seed % 3 {
                 0 => state
-                    .submit_cross_cpu_work(WorkItem::Reschedule {
-                        target_cpu: CpuId((seed as u8) % 2),
-                    })
+                    .submit_cross_cpu_work(CpuId((seed as u8) % 2), WorkItem::Reschedule)
                     .expect("work"),
                 1 => {
                     if state
@@ -2031,9 +2018,7 @@ mod tests {
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
 
         state
-            .submit_cross_cpu_work(WorkItem::Reschedule {
-                target_cpu: CpuId(1),
-            })
+            .submit_cross_cpu_work(CpuId(1), WorkItem::Reschedule)
             .expect("submit");
 
         let processed_cpu0 = state
