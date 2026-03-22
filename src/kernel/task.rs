@@ -57,15 +57,6 @@ pub struct RobustFutexState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct LinuxThreadState {
-    pub tls_base: Option<usize>,
-    pub tls_restore_pending: bool,
-    pub robust_futex: Option<RobustFutexState>,
-    pub brk_base: Option<VirtAddr>,
-    pub brk_end: Option<VirtAddr>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RestartState {
     pub token: Option<RestartToken>,
 }
@@ -77,7 +68,7 @@ pub struct ThreadControlBlock {
     pub class: TaskClass,
     pub status: TaskStatus,
     pub asid: Option<Asid>,
-    pub linux: LinuxThreadState,
+    pub tls_ptr: Option<VirtAddr>,
     pub user_entry: Option<usize>,
     pub user_stack_top: Option<usize>,
     pub user_context: UserRegisterContext,
@@ -113,16 +104,7 @@ mod tests {
             class: TaskClass::App,
             status: TaskStatus::Runnable,
             asid: Some(Asid(1)),
-            linux: LinuxThreadState {
-                tls_base: Some(0xDEAD_BEEF),
-                tls_restore_pending: true,
-                robust_futex: Some(RobustFutexState {
-                    head: 0x9000,
-                    len: 3,
-                }),
-                brk_base: Some(VirtAddr(0x1000)),
-                brk_end: Some(VirtAddr(0x2000)),
-            },
+            tls_ptr: Some(VirtAddr(0xDEAD_BEEF)),
             user_entry: Some(0x4000),
             user_stack_top: Some(0x8000),
             user_context: UserRegisterContext {
@@ -142,17 +124,9 @@ mod tests {
         assert_eq!(tcb.tid, ThreadId(7));
         assert_eq!(tcb.restart.token, Some(RestartToken(9)));
         assert_eq!(tcb.thread_group_id, ThreadGroupId(7));
-        assert_eq!(tcb.linux.tls_base, Some(0xDEAD_BEEF));
-        assert!(tcb.linux.tls_restore_pending);
+        assert_eq!(tcb.tls_ptr, Some(VirtAddr(0xDEAD_BEEF)));
         assert_eq!(tcb.user_context.instruction_ptr, 0x4000);
         assert_eq!(tcb.detach_state, ThreadDetachState::Joinable);
-        assert_eq!(
-            tcb.linux.robust_futex,
-            Some(RobustFutexState {
-                head: 0x9000,
-                len: 3
-            })
-        );
         assert_eq!(tcb.status, TaskStatus::Runnable);
     }
 }

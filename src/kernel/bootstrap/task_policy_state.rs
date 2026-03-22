@@ -1,8 +1,8 @@
 use super::{KernelError, KernelState, MAX_TASKS};
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{
-    LinuxThreadState, RestartState, TaskClass, TaskStatus, ThreadControlBlock, ThreadDetachState,
-    ThreadGroupId, UserRegisterContext,
+    RestartState, TaskClass, TaskStatus, ThreadControlBlock, ThreadDetachState, ThreadGroupId,
+    UserRegisterContext,
 };
 
 impl KernelState {
@@ -21,7 +21,7 @@ impl KernelState {
                 class,
                 status: TaskStatus::Runnable,
                 asid: None,
-                linux: LinuxThreadState::default(),
+                tls_ptr: None,
                 user_entry: None,
                 user_stack_top: None,
                 user_context: UserRegisterContext::default(),

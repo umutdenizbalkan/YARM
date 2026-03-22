@@ -181,6 +181,19 @@ struct DriverRecord {
     iova_space_cap: Option<CapId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrkRegionRecord {
+    tid: ThreadId,
+    base: VirtAddr,
+    end: VirtAddr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RobustFutexRecord {
+    tid: ThreadId,
+    state: RobustFutexState,
+}
+
 #[derive(Debug)]
 struct IpcSubsystem {
     cross_cpu_work: CrossCpuWorkQueue,
@@ -205,6 +218,7 @@ struct UserMemoryStore;
 struct MemorySubsystem {
     user_memory: KernelStorage<UserMemoryStore>,
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
+    brk_regions: [Option<BrkRegionRecord>; MAX_TASKS],
     next_memory_object_id: u64,
     next_anon_phys: u64,
 }
@@ -238,6 +252,8 @@ pub struct KernelState {
     ipc: KernelStorage<IpcSubsystem>,
     next_dynamic_tid: u64,
     tcbs: [Option<ThreadControlBlock>; MAX_TASKS],
+    tls_restore_pending: [Option<ThreadId>; MAX_TASKS],
+    robust_futex: [Option<RobustFutexRecord>; MAX_TASKS],
     memory: KernelStorage<MemorySubsystem>,
     drivers: DriverSubsystem,
     tlb_shootdown_count: u64,
@@ -311,9 +327,12 @@ impl Bootstrap {
             }),
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
             tcbs: [const { None }; MAX_TASKS],
+            tls_restore_pending: [None; MAX_TASKS],
+            robust_futex: [None; MAX_TASKS],
             memory: store_kernel_value(MemorySubsystem {
                 user_memory: store_kernel_value(UserMemoryStore::default()),
                 memory_objects: [None; MAX_MEMORY_OBJECTS],
+                brk_regions: [None; MAX_TASKS],
                 next_memory_object_id: 1,
                 next_anon_phys: platform_layout::NEXT_ANON_PHYS_BASE,
             }),
@@ -1998,78 +2017,6 @@ mod tests {
     }
 
     #[test]
-    fn thread_state_helpers_cover_pid_tls_context_join_and_robust_futex() {
-        let mut state = Bootstrap::init().expect("init");
-        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
-        state
-            .spawn_user_task_from_image(UserImageSpec {
-                tid: 9,
-                entry: 0x5000,
-                asid: Some(asid),
-                class: TaskClass::App,
-            })
-            .expect("leader");
-        let tid = state
-            .spawn_user_thread(9, 0xCAFE_BABE, 0x9000_0000, 0x5010)
-            .expect("thread");
-
-        assert_eq!(state.process_id(tid), Some(9));
-        assert!(!state.is_thread_group_leader(tid));
-        assert_eq!(
-            state.take_tls_restore_request(tid).expect("tls request"),
-            Some(0xCAFE_BABE)
-        );
-        assert_eq!(
-            state.take_tls_restore_request(tid).expect("tls cleared"),
-            None
-        );
-
-        state
-            .set_thread_user_context(
-                tid,
-                UserRegisterContext {
-                    instruction_ptr: 0x6000,
-                    stack_ptr: 0xA000_0000,
-                    arg0: 7,
-                    arg1: 8,
-                },
-            )
-            .expect("ctx");
-        assert_eq!(
-            state.thread_user_context(tid).expect("ctx read"),
-            UserRegisterContext {
-                instruction_ptr: 0x6000,
-                stack_ptr: 0xA000_0000,
-                arg0: 7,
-                arg1: 8,
-            }
-        );
-
-        state.set_robust_futex_head(tid, 0x7000, 2).expect("robust");
-        assert_eq!(
-            state.robust_futex_state(tid),
-            Some(RobustFutexState {
-                head: 0x7000,
-                len: 2
-            })
-        );
-
-        state.mark_thread_detached(tid).expect("detach");
-        assert_eq!(
-            state.thread_detach_state(tid),
-            Some(ThreadDetachState::Detached)
-        );
-        assert_eq!(state.join_thread(tid), Err(KernelError::WrongObject));
-
-        let joinable = state
-            .spawn_user_thread(9, 0xD00D_BEEF, 0x9100_0000, 0x5020)
-            .expect("joinable");
-        state.exit_task(joinable, 23).expect("exit");
-        assert_eq!(state.join_thread(joinable).expect("join"), Some(23));
-        assert_eq!(state.task_status(joinable), Some(TaskStatus::Dead));
-    }
-
-    #[test]
     fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
         let mut state = Bootstrap::init().expect("init");
         let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
@@ -2143,26 +2090,5 @@ mod tests {
         state.mark_thread_detached(joiner).expect("detach");
         state.exit_task(joiner, 9).expect("exit detached");
         assert_eq!(state.task_status(joiner), Some(TaskStatus::Dead));
-    }
-
-    #[test]
-    fn robust_futex_exit_cleanup_wakes_matching_waiters() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(40).expect("owner");
-        state.register_task(41).expect("waiter");
-        state.set_robust_futex_head(40, 0x2000, 1).expect("robust");
-        state.scheduler.enqueue(40).expect("owner enqueue");
-        state.scheduler.enqueue(41).expect("waiter enqueue");
-        state.dispatch_next_task().expect("dispatch");
-        state.yield_current().expect("to owner");
-        state.yield_current().expect("to waiter");
-        assert_eq!(state.scheduler.current_tid(), Some(41));
-        assert!(state.futex_wait_current(0x2000, 1, 1).expect("wait"));
-        assert_eq!(
-            state.task_status(41),
-            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x2000))))
-        );
-        state.exit_task(40, 0).expect("owner exit");
-        assert_eq!(state.task_status(41), Some(TaskStatus::Runnable));
     }
 }

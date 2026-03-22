@@ -79,16 +79,12 @@ impl KernelState {
     }
 
     pub fn task_brk_bounds(&self, tid: u64) -> Option<(usize, usize)> {
-        self.tcbs
+        self.memory
+            .brk_regions
             .iter()
             .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .and_then(|tcb| {
-                Some((
-                    tcb.linux.brk_base?.0 as usize,
-                    tcb.linux.brk_end?.0 as usize,
-                ))
-            })
+            .find(|entry| entry.tid.0 == tid)
+            .map(|entry| (entry.base.0 as usize, entry.end.0 as usize))
     }
 
     pub fn set_task_brk_bounds(
@@ -97,10 +93,22 @@ impl KernelState {
         base: usize,
         end: usize,
     ) -> Result<(), KernelError> {
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.linux.brk_base = Some(VirtAddr(base as u64));
-        tcb.linux.brk_end = Some(VirtAddr(end as u64));
-        Ok(())
+        let _ = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        if let Some(slot) = self
+            .memory
+            .brk_regions
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|entry| entry.tid.0 == tid) || slot.is_none())
+        {
+            *slot = Some(super::BrkRegionRecord {
+                tid: crate::kernel::ipc::ThreadId(tid),
+                base: VirtAddr(base as u64),
+                end: VirtAddr(end as u64),
+            });
+            Ok(())
+        } else {
+            Err(KernelError::TaskTableFull)
+        }
     }
 
     fn resolve_memory_object_phys(

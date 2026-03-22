@@ -19,7 +19,8 @@ impl KernelState {
             .iter()
             .flatten()
             .find(|tcb| tcb.tid.0 == tid)
-            .and_then(|tcb| tcb.linux.tls_base)
+            .map(|tcb| tcb.tls_ptr.map(|ptr| ptr.0 as usize))
+            .flatten()
     }
 
     pub fn process_id(&self, tid: u64) -> Option<u64> {
@@ -53,16 +54,24 @@ impl KernelState {
             .iter()
             .flatten()
             .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.linux.tls_restore_pending)
+            .map(|tcb| {
+                self.tls_restore_pending
+                    .iter()
+                    .flatten()
+                    .any(|pending_tid| *pending_tid == tcb.tid)
+            })
     }
 
     pub fn take_tls_restore_request(&mut self, tid: u64) -> Result<Option<usize>, KernelError> {
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        if !tcb.linux.tls_restore_pending {
+        let idx = self
+            .tls_restore_pending
+            .iter()
+            .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == tid));
+        let Some(idx) = idx else {
             return Ok(None);
-        }
-        tcb.linux.tls_restore_pending = false;
-        Ok(tcb.linux.tls_base)
+        };
+        self.tls_restore_pending[idx] = None;
+        Ok(self.thread_tls_base(tid))
     }
 
     pub fn mark_thread_detached(&mut self, tid: u64) -> Result<(), KernelError> {
@@ -117,17 +126,28 @@ impl KernelState {
         if head == 0 || len == 0 {
             return Err(KernelError::WrongObject);
         }
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.linux.robust_futex = Some(RobustFutexState { head, len });
-        Ok(())
+        let _ = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        if let Some(slot) = self
+            .robust_futex
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|entry| entry.tid == ThreadId(tid)) || slot.is_none())
+        {
+            *slot = Some(super::RobustFutexRecord {
+                tid: ThreadId(tid),
+                state: RobustFutexState { head, len },
+            });
+            Ok(())
+        } else {
+            Err(KernelError::TaskTableFull)
+        }
     }
 
     pub fn robust_futex_state(&self, tid: u64) -> Option<RobustFutexState> {
-        self.tcbs
+        self.robust_futex
             .iter()
             .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .and_then(|tcb| tcb.linux.robust_futex)
+            .find(|entry| entry.tid.0 == tid)
+            .map(|entry| entry.state)
     }
 
     pub(crate) fn sync_current_thread_from_frame(
@@ -202,8 +222,14 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.linux.tls_base = Some(tls_base);
-        tcb.linux.tls_restore_pending = true;
+        tcb.tls_ptr = Some(crate::kernel::vm::VirtAddr(tls_base as u64));
+        if let Some(slot) = self
+            .tls_restore_pending
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == tid) || slot.is_none())
+        {
+            *slot = Some(ThreadId(tid));
+        }
         Ok(())
     }
 
@@ -229,8 +255,7 @@ impl KernelState {
         if let Some(tcb) = self.tcb_mut(tid) {
             tcb.thread_group_id = parent.thread_group_id;
             tcb.asid = parent.asid;
-            tcb.linux.tls_base = Some(tls_base);
-            tcb.linux.tls_restore_pending = true;
+            tcb.tls_ptr = Some(crate::kernel::vm::VirtAddr(tls_base as u64));
             tcb.user_entry = Some(user_entry);
             tcb.user_stack_top = Some(user_stack_top);
             tcb.user_context = UserRegisterContext {
@@ -240,6 +265,13 @@ impl KernelState {
                 arg1: 0,
             };
             tcb.status = TaskStatus::Runnable;
+        }
+        if let Some(slot) = self
+            .tls_restore_pending
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == tid) || slot.is_none())
+        {
+            *slot = Some(ThreadId(tid));
         }
         let _ = self.enqueue_task(tid)?;
         Ok(tid)
