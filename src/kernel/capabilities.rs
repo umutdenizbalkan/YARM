@@ -21,32 +21,59 @@ impl CapId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapRights {
-    Read,
-    Write,
-    Map,
-    Send,
-    Receive,
-    Schedule,
-    Signal,
-    Wait,
-}
+pub struct CapRights(u8);
 
 impl CapRights {
-    const fn bit(self) -> u8 {
-        match self {
-            Self::Read => 1 << 0,
-            Self::Write => 1 << 1,
-            Self::Map => 1 << 2,
-            Self::Send => 1 << 3,
-            Self::Receive => 1 << 4,
-            Self::Schedule => 1 << 5,
-            Self::Signal => 1 << 6,
-            Self::Wait => 1 << 7,
-        }
+    pub const NONE: Self = Self(0);
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
+    pub const MAP: Self = Self(1 << 2);
+    pub const SEND: Self = Self(1 << 3);
+    pub const RECEIVE: Self = Self(1 << 4);
+    pub const SCHEDULE: Self = Self(1 << 5);
+    pub const SIGNAL: Self = Self(1 << 6);
+    pub const WAIT: Self = Self(1 << 7);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn is_subset_of(self, other: Self) -> bool {
+        (self.0 & !other.0) == 0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
     }
 }
 
+impl core::ops::BitOr for CapRights {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.union(rhs)
+    }
+}
+
+impl core::ops::BitOrAssign for CapRights {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// Capability object identity remains a monolithic enum for now.
+///
+/// Long term, an opaque `{ kind, handle }` representation would decouple this
+/// module from the full kernel object taxonomy, but the current enum is kept
+/// until the object set stabilizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapObject {
     Kernel,
@@ -62,40 +89,31 @@ pub enum CapObject {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capability {
     pub object: CapObject,
-    rights_bits: u8,
+    rights: CapRights,
 }
 
 impl Capability {
-    const fn rights_to_bits(rights: &[CapRights]) -> u8 {
-        let mut idx = 0;
-        let mut bits = 0;
-        while idx < rights.len() {
-            bits |= rights[idx].bit();
-            idx += 1;
-        }
-        bits
-    }
-
-    pub const fn new(object: CapObject, rights: &[CapRights]) -> Self {
-        Self {
-            object,
-            rights_bits: Self::rights_to_bits(rights),
-        }
+    pub const fn new(object: CapObject, rights: CapRights) -> Self {
+        Self { object, rights }
     }
 
     pub const fn has_right(self, right: CapRights) -> bool {
-        (self.rights_bits & right.bit()) != 0
+        self.rights.contains(right)
     }
 
     pub const fn rights_bits(self) -> u8 {
-        self.rights_bits
+        self.rights.bits()
     }
 
-    pub const fn can_derive(self, rights: &[CapRights]) -> bool {
-        (Self::rights_to_bits(rights) & !self.rights_bits) == 0
+    pub const fn rights(self) -> CapRights {
+        self.rights
     }
 
-    pub const fn derive(self, rights: &[CapRights]) -> Result<Self, CapabilityDeriveError> {
+    pub const fn can_derive(self, rights: CapRights) -> bool {
+        rights.is_subset_of(self.rights)
+    }
+
+    pub const fn derive(self, rights: CapRights) -> Result<Self, CapabilityDeriveError> {
         if !self.can_derive(rights) {
             return Err(CapabilityDeriveError::RightsEscalation);
         }
@@ -179,7 +197,7 @@ impl CapabilitySpace {
     pub fn mint_derived(
         &mut self,
         parent: CapId,
-        rights: &[CapRights],
+        rights: CapRights,
     ) -> Result<CapId, CapabilityDeriveError> {
         let parent_cap = self
             .get(parent)
@@ -267,13 +285,13 @@ mod tests {
                 index: 0,
                 generation: 1,
             },
-            &[CapRights::Send, CapRights::Receive],
+            CapRights::SEND | CapRights::RECEIVE,
         );
 
         let id = cspace.mint(cap).expect("cspace should have room");
 
-        assert!(cspace.has_right(id, CapRights::Send));
-        assert!(!cspace.has_right(id, CapRights::Schedule));
+        assert!(cspace.has_right(id, CapRights::SEND));
+        assert!(!cspace.has_right(id, CapRights::SCHEDULE));
         assert_eq!(
             cspace.get(id).expect("cap should exist").object,
             CapObject::Endpoint {
@@ -290,21 +308,21 @@ mod tests {
                 index: 0,
                 generation: 1,
             },
-            &[CapRights::Send, CapRights::Receive],
+            CapRights::SEND | CapRights::RECEIVE,
         );
-        assert!(parent.can_derive(&[CapRights::Send]));
+        assert!(parent.can_derive(CapRights::SEND));
         assert_eq!(
-            parent.derive(&[CapRights::Send]).expect("subset"),
+            parent.derive(CapRights::SEND).expect("subset"),
             Capability::new(
                 CapObject::Endpoint {
                     index: 0,
                     generation: 1,
                 },
-                &[CapRights::Send],
+                CapRights::SEND,
             )
         );
         assert_eq!(
-            parent.derive(&[CapRights::Schedule]),
+            parent.derive(CapRights::SCHEDULE),
             Err(CapabilityDeriveError::RightsEscalation)
         );
     }
@@ -318,18 +336,18 @@ mod tests {
                     index: 0,
                     generation: 1,
                 },
-                &[CapRights::Send, CapRights::Receive],
+                CapRights::SEND | CapRights::RECEIVE,
             ))
             .expect("mint parent");
 
         let child = cspace
-            .mint_derived(parent, &[CapRights::Send])
+            .mint_derived(parent, CapRights::SEND)
             .expect("derive subset rights");
-        assert!(cspace.has_right(child, CapRights::Send));
-        assert!(!cspace.has_right(child, CapRights::Receive));
+        assert!(cspace.has_right(child, CapRights::SEND));
+        assert!(!cspace.has_right(child, CapRights::RECEIVE));
 
         assert_eq!(
-            cspace.mint_derived(parent, &[CapRights::Schedule]),
+            cspace.mint_derived(parent, CapRights::SCHEDULE),
             Err(CapabilityDeriveError::RightsEscalation)
         );
 
@@ -343,10 +361,10 @@ mod tests {
         let mut cspace = CapabilitySpace::default();
         for _ in 0..MAX_CAPABILITIES {
             let _ = cspace
-                .mint(Capability::new(CapObject::Kernel, &[CapRights::Read]))
+                .mint(Capability::new(CapObject::Kernel, CapRights::READ))
                 .expect("room");
         }
-        let cap = Capability::new(CapObject::Kernel, &[CapRights::Write]);
+        let cap = Capability::new(CapObject::Kernel, CapRights::WRITE);
         assert_eq!(cspace.mint(cap), Err(CapabilityDeriveError::SpaceFull));
     }
 
@@ -354,11 +372,11 @@ mod tests {
     fn mint_derived_on_revoked_parent_returns_parent_missing() {
         let mut cspace = CapabilitySpace::default();
         let parent = cspace
-            .mint(Capability::new(CapObject::Kernel, &[CapRights::Read]))
+            .mint(Capability::new(CapObject::Kernel, CapRights::READ))
             .expect("mint");
         assert_eq!(cspace.revoke(parent), Ok(()));
         assert_eq!(
-            cspace.mint_derived(parent, &[CapRights::Read]),
+            cspace.mint_derived(parent, CapRights::READ),
             Err(CapabilityDeriveError::ParentMissing)
         );
     }
@@ -367,7 +385,7 @@ mod tests {
     fn revoke_missing_and_double_revoke_behave() {
         let mut cspace = CapabilitySpace::default();
         let id = cspace
-            .mint(Capability::new(CapObject::Kernel, &[CapRights::Read]))
+            .mint(Capability::new(CapObject::Kernel, CapRights::READ))
             .expect("mint");
         assert_eq!(cspace.revoke(id), Ok(()));
         assert_eq!(cspace.revoke(id), Err(CapabilityDeriveError::NotFound));
@@ -381,11 +399,11 @@ mod tests {
     fn revoked_slot_reuse_produces_fresh_cap_id() {
         let mut cspace = CapabilitySpace::default();
         let first = cspace
-            .mint(Capability::new(CapObject::Kernel, &[CapRights::Read]))
+            .mint(Capability::new(CapObject::Kernel, CapRights::READ))
             .expect("mint");
         assert_eq!(cspace.revoke(first), Ok(()));
         let second = cspace
-            .mint(Capability::new(CapObject::Kernel, &[CapRights::Read]))
+            .mint(Capability::new(CapObject::Kernel, CapRights::READ))
             .expect("mint2");
         assert_ne!(first, second);
         assert!(cspace.get(first).is_none());

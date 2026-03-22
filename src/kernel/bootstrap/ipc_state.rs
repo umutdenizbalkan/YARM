@@ -138,7 +138,7 @@ impl KernelState {
                     index: endpoint_idx,
                     generation: self.ipc.endpoint_generations[endpoint_idx],
                 },
-                &[CapRights::Send],
+                CapRights::SEND,
             ))
             .map_err(|_| KernelError::CapabilityFull)?;
 
@@ -149,7 +149,7 @@ impl KernelState {
                     index: endpoint_idx,
                     generation: self.ipc.endpoint_generations[endpoint_idx],
                 },
-                &[CapRights::Receive],
+                CapRights::RECEIVE,
             ))
             .map_err(|_| KernelError::CapabilityFull)?;
 
@@ -187,7 +187,7 @@ impl KernelState {
                     index: notification_idx,
                     generation: self.ipc.notification_generations[notification_idx],
                 },
-                &[CapRights::Signal],
+                CapRights::SIGNAL,
             ))
             .map_err(|_| KernelError::CapabilityFull)?;
 
@@ -219,7 +219,7 @@ impl KernelState {
             .cspace
             .get(notification_cap)
             .ok_or(KernelError::InvalidCapability)?;
-        if !capability.has_right(CapRights::Signal) {
+        if !capability.has_right(CapRights::SIGNAL) {
             return Err(KernelError::MissingRight);
         }
 
@@ -264,7 +264,7 @@ impl KernelState {
             .cspace
             .get(send_cap)
             .ok_or(KernelError::InvalidCapability)?;
-        if !capability.has_right(CapRights::Send) {
+        if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
         }
 
@@ -331,7 +331,7 @@ impl KernelState {
             .cspace
             .get(send_cap)
             .ok_or(KernelError::InvalidCapability)?;
-        if !capability.has_right(CapRights::Send) {
+        if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
         }
 
@@ -398,7 +398,7 @@ impl KernelState {
             .cspace
             .get(recv_cap)
             .ok_or(KernelError::InvalidCapability)?;
-        if !capability.has_right(CapRights::Receive) {
+        if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }
 

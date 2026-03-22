@@ -85,13 +85,13 @@ impl LinuxServiceBindings {
     ) -> Result<(), KernelError> {
         if !kernel.cspace.has_right(
             request_send_cap,
-            crate::kernel::capabilities::CapRights::Send,
+            crate::kernel::capabilities::CapRights::SEND,
         ) {
             return Err(KernelError::MissingRight);
         }
         if !kernel.cspace.has_right(
             reply_recv_cap,
-            crate::kernel::capabilities::CapRights::Receive,
+            crate::kernel::capabilities::CapRights::RECEIVE,
         ) {
             return Err(KernelError::MissingRight);
         }
@@ -108,13 +108,13 @@ impl LinuxServiceBindings {
     ) -> Result<(), KernelError> {
         if !kernel.cspace.has_right(
             request_send_cap,
-            crate::kernel::capabilities::CapRights::Send,
+            crate::kernel::capabilities::CapRights::SEND,
         ) {
             return Err(KernelError::MissingRight);
         }
         if !kernel.cspace.has_right(
             reply_recv_cap,
-            crate::kernel::capabilities::CapRights::Receive,
+            crate::kernel::capabilities::CapRights::RECEIVE,
         ) {
             return Err(KernelError::MissingRight);
         }

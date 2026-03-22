@@ -46,7 +46,7 @@ impl KernelState {
             .cspace
             .mint(Capability::new(
                 CapObject::AddressSpace { asid: asid.0 },
-                &[CapRights::Map, CapRights::Read, CapRights::Write],
+                CapRights::MAP | CapRights::READ | CapRights::WRITE,
             ))
             .map_err(|_| KernelError::CapabilityFull)?;
         Ok((asid, map_cap))
@@ -66,7 +66,7 @@ impl KernelState {
             CapObject::AddressSpace { asid } => Asid(asid),
             _ => return Err(KernelError::WrongObject),
         };
-        if !capability.has_right(CapRights::Map) {
+        if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
 
@@ -96,7 +96,7 @@ impl KernelState {
             .cspace
             .mint(Capability::new(
                 CapObject::MemoryObject { id },
-                &[CapRights::Read, CapRights::Write, CapRights::Map],
+                CapRights::READ | CapRights::WRITE | CapRights::MAP,
             ))
             .map_err(|_| KernelError::CapabilityFull)?;
 
@@ -159,10 +159,10 @@ impl KernelState {
             _ => return Err(KernelError::WrongObject),
         };
 
-        if flags.read && !capability.has_right(CapRights::Read) {
+        if flags.read && !capability.has_right(CapRights::READ) {
             return Err(KernelError::MissingRight);
         }
-        if flags.write && !capability.has_right(CapRights::Write) {
+        if flags.write && !capability.has_right(CapRights::WRITE) {
             return Err(KernelError::MissingRight);
         }
 
@@ -199,7 +199,7 @@ impl KernelState {
             CapObject::AddressSpace { asid } => Asid(asid),
             _ => return Err(KernelError::WrongObject),
         };
-        if !capability.has_right(CapRights::Map) {
+        if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
         let aspace = self
@@ -223,7 +223,7 @@ impl KernelState {
             CapObject::AddressSpace { asid } => Asid(asid),
             _ => return Err(KernelError::WrongObject),
         };
-        if !capability.has_right(CapRights::Map) {
+        if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
         let aspace = self

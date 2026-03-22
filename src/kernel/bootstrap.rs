@@ -306,7 +306,7 @@ impl Bootstrap {
 
         let mut cspace = CapabilitySpace::default();
         cspace
-            .mint(Capability::new(CapObject::Kernel, &[CapRights::Schedule]))
+            .mint(Capability::new(CapObject::Kernel, CapRights::SCHEDULE))
             .map_err(|_| KernelError::CapabilityFull)?;
 
         let mut state = KernelState {
@@ -402,7 +402,7 @@ impl KernelState {
             .cspace
             .get(recv_cap)
             .ok_or(KernelError::InvalidCapability)?;
-        if !capability.has_right(CapRights::Receive) {
+        if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }
 
@@ -451,7 +451,7 @@ impl KernelState {
             .cspace
             .get(recv_cap)
             .ok_or(KernelError::InvalidCapability)?;
-        if !capability.has_right(CapRights::Receive) {
+        if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
@@ -581,13 +581,21 @@ mod tests {
 
         assert!(state.user_spaces.get(asid).is_none());
         assert_eq!(
-            state.user_spaces.retired_entry(asid).map(|entry| entry.pending_cpu_bitmap),
+            state
+                .user_spaces
+                .retired_entry(asid)
+                .map(|entry| entry.pending_cpu_bitmap),
             Some(0b11)
         );
 
         let mut seen = [false; 2];
         while let Some(item) = state.drain_cross_cpu_work() {
-            if let WorkItem::TlbShootdown { target_cpu, asid: item_asid, va_range } = item {
+            if let WorkItem::TlbShootdown {
+                target_cpu,
+                asid: item_asid,
+                va_range,
+            } = item
+            {
                 assert_eq!(item_asid, asid);
                 assert_eq!(va_range, None);
                 seen[target_cpu.0 as usize] = true;
@@ -614,7 +622,10 @@ mod tests {
             .process_cross_cpu_work_for_cpu(CpuId(0))
             .expect("process cpu0");
         assert_eq!(
-            state.user_spaces.retired_entry(asid).map(|entry| entry.pending_cpu_bitmap),
+            state
+                .user_spaces
+                .retired_entry(asid)
+                .map(|entry| entry.pending_cpu_bitmap),
             Some(0b10)
         );
 
@@ -797,7 +808,7 @@ mod tests {
 
         let child = state
             .cspace
-            .mint_derived(send_cap, &[CapRights::Send])
+            .mint_derived(send_cap, CapRights::SEND)
             .expect("derive");
         let msg = Message::new(9, b"ok").expect("msg");
         assert!(state.ipc_send(child, msg).is_ok());
@@ -918,7 +929,7 @@ mod tests {
 
         let read_only_cap = state
             .cspace
-            .mint_derived(aspace_map_cap, &[CapRights::Read])
+            .mint_derived(aspace_map_cap, CapRights::READ)
             .expect("derive read-only aspace cap");
         let missing_right = state.map_user_page(
             read_only_cap,
@@ -975,7 +986,7 @@ mod tests {
 
         let readonly_mem = state
             .cspace
-            .mint_derived(mem_cap, &[CapRights::Read])
+            .mint_derived(mem_cap, CapRights::READ)
             .expect("derive ro");
 
         let res = state.map_user_page_with_caps(

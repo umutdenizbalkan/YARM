@@ -48,7 +48,7 @@ impl KernelState {
             CapObject::Irq { .. } => {}
             _ => return Err(KernelError::WrongObject),
         }
-        if !capability.has_right(CapRights::Signal) {
+        if !capability.has_right(CapRights::SIGNAL) {
             return Err(KernelError::MissingRight);
         }
         let record = self
@@ -64,10 +64,7 @@ impl KernelState {
 
     pub fn mint_irq_cap(&mut self, line: u16) -> Result<CapId, KernelError> {
         self.cspace
-            .mint(Capability::new(
-                CapObject::Irq { line },
-                &[CapRights::Signal],
-            ))
+            .mint(Capability::new(CapObject::Irq { line }, CapRights::SIGNAL))
             .map_err(|_| KernelError::CapabilityFull)
     }
 
@@ -76,10 +73,7 @@ impl KernelState {
         self.drivers.next_iova_space_id =
             self.drivers.next_iova_space_id.checked_add(1).unwrap_or(1);
         self.cspace
-            .mint(Capability::new(
-                CapObject::IovaSpace { id },
-                &[CapRights::Map],
-            ))
+            .mint(Capability::new(CapObject::IovaSpace { id }, CapRights::MAP))
             .map_err(|_| KernelError::CapabilityFull)
     }
 
@@ -122,9 +116,9 @@ impl KernelState {
             CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
             _ => return Err(KernelError::WrongObject),
         };
-        if !capability.has_right(CapRights::Map)
-            || !capability.has_right(CapRights::Read)
-            || !capability.has_right(CapRights::Write)
+        if !capability.has_right(CapRights::MAP)
+            || !capability.has_right(CapRights::READ)
+            || !capability.has_right(CapRights::WRITE)
         {
             return Err(KernelError::MissingRight);
         }
@@ -150,7 +144,7 @@ impl KernelState {
                     offset: offset as u64,
                     len: len as u64,
                 },
-                &[CapRights::Map, CapRights::Read, CapRights::Write],
+                CapRights::MAP | CapRights::READ | CapRights::WRITE,
             ))
             .map_err(|_| KernelError::CapabilityFull)
     }
