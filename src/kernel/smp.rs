@@ -1,5 +1,5 @@
 use super::ipc::ThreadId;
-use super::lock::SpinLock;
+use super::lock::SpinLockIrq;
 use super::scheduler::CpuId;
 use super::vm::{Asid, VirtAddr};
 
@@ -8,13 +8,18 @@ const _: () = assert!(MAX_CROSS_CPU_WORK.is_power_of_two());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkItem {
-    Reschedule { target_cpu: CpuId },
+    Reschedule {
+        target_cpu: CpuId,
+    },
     TlbShootdown {
         target_cpu: CpuId,
         asid: Asid,
         va_range: Option<(VirtAddr, VirtAddr)>,
     },
-    WakeTask { target_cpu: CpuId, tid: ThreadId },
+    WakeTask {
+        target_cpu: CpuId,
+        tid: ThreadId,
+    },
 }
 
 impl WorkItem {
@@ -71,13 +76,13 @@ impl WorkQueue {
 
 #[derive(Debug)]
 pub struct CrossCpuWorkQueue {
-    inner: SpinLock<WorkQueue>,
+    inner: SpinLockIrq<WorkQueue>,
 }
 
 impl Default for CrossCpuWorkQueue {
     fn default() -> Self {
         Self {
-            inner: SpinLock::new(WorkQueue::new()),
+            inner: SpinLockIrq::new(WorkQueue::new()),
         }
     }
 }

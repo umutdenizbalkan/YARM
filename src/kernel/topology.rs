@@ -1,5 +1,6 @@
 use crate::arch::platform_layout;
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_CPUS: usize = platform_layout::MAX_CPUS;
 pub type CpuBitmap = u64;
@@ -30,21 +31,21 @@ impl fmt::Display for TopologyError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct CpuTopology {
-    present: CpuBitmap,
-    online: CpuBitmap,
-    started: CpuBitmap,
-    pending_ack: CpuBitmap,
+    present: AtomicU64,
+    online: AtomicU64,
+    started: AtomicU64,
+    pending_ack: AtomicU64,
 }
 
 impl CpuTopology {
     pub const fn new(present: CpuBitmap, online: CpuBitmap) -> Self {
         Self {
-            present,
-            online,
-            started: 0,
-            pending_ack: 0,
+            present: AtomicU64::new(present),
+            online: AtomicU64::new(online),
+            started: AtomicU64::new(0),
+            pending_ack: AtomicU64::new(0),
         }
     }
 
@@ -59,7 +60,11 @@ impl CpuTopology {
             (masked & bootstrap) != 0,
             "present bitmap must explicitly include the bootstrap CPU"
         );
-        let present = if masked == 0 { bootstrap } else { masked | bootstrap };
+        let present = if masked == 0 {
+            bootstrap
+        } else {
+            masked | bootstrap
+        };
         Self::new(present, bootstrap)
     }
 
@@ -71,27 +76,30 @@ impl CpuTopology {
         }
     }
 
-    pub const fn present_cpu_bitmap(&self) -> CpuBitmap {
-        self.present
+    pub fn present_cpu_bitmap(&self) -> CpuBitmap {
+        self.present.load(Ordering::Acquire)
     }
-    pub const fn online_cpu_bitmap(&self) -> CpuBitmap {
-        self.online
+
+    pub fn online_cpu_bitmap(&self) -> CpuBitmap {
+        self.online.load(Ordering::Acquire)
     }
-    pub const fn present_cpu_count(&self) -> usize {
-        self.present.count_ones() as usize
+
+    pub fn present_cpu_count(&self) -> usize {
+        self.present_cpu_bitmap().count_ones() as usize
     }
-    pub const fn online_cpu_count(&self) -> usize {
-        self.online.count_ones() as usize
+
+    pub fn online_cpu_count(&self) -> usize {
+        self.online_cpu_bitmap().count_ones() as usize
     }
 
     pub fn cpu_present(&self, cpu: u8) -> bool {
         let mask = 1u64.checked_shl(cpu as u32).unwrap_or(0);
-        (self.present & mask) != 0
+        (self.present_cpu_bitmap() & mask) != 0
     }
 
     pub fn cpu_online(&self, cpu: u8) -> bool {
         let mask = 1u64.checked_shl(cpu as u32).unwrap_or(0);
-        (self.online & mask) != 0
+        (self.online_cpu_bitmap() & mask) != 0
     }
 
     pub fn detect_secondary_cpus(&self) -> [Option<u8>; MAX_CPUS] {
@@ -107,7 +115,7 @@ impl CpuTopology {
         out
     }
 
-    pub fn start_secondary_cpu(&mut self, cpu: u8) -> Result<(), TopologyError> {
+    pub fn start_secondary_cpu(&self, cpu: u8) -> Result<(), TopologyError> {
         let mask = 1u64
             .checked_shl(cpu as u32)
             .ok_or(TopologyError::InvalidCpuId)?;
@@ -117,22 +125,22 @@ impl CpuTopology {
         if self.cpu_online(cpu) {
             return Err(TopologyError::CpuAlreadyOnline);
         }
-        self.started |= mask;
-        self.pending_ack |= mask;
+        self.started.fetch_or(mask, Ordering::AcqRel);
+        self.pending_ack.fetch_or(mask, Ordering::AcqRel);
         Ok(())
     }
 
-    pub fn acknowledge_secondary_cpu(&mut self, cpu: u8) -> Result<(), TopologyError> {
+    pub fn acknowledge_secondary_cpu(&self, cpu: u8) -> Result<(), TopologyError> {
         let mask = 1u64
             .checked_shl(cpu as u32)
             .ok_or(TopologyError::InvalidCpuId)?;
-        if (self.started & mask) == 0 {
+        if (self.started.load(Ordering::Acquire) & mask) == 0 {
             return Err(TopologyError::CpuNotStarted);
         }
-        if (self.pending_ack & mask) == 0 {
+        if (self.pending_ack.load(Ordering::Acquire) & mask) == 0 {
             return Err(TopologyError::AckNotReceived);
         }
-        self.pending_ack &= !mask;
+        self.pending_ack.fetch_and(!mask, Ordering::AcqRel);
         Ok(())
     }
 
@@ -140,16 +148,19 @@ impl CpuTopology {
         let mask = 1u64
             .checked_shl(cpu as u32)
             .ok_or(TopologyError::InvalidCpuId)?;
-        if (self.started & mask) == 0 {
+        if (self.started.load(Ordering::Acquire) & mask) == 0 {
             return Err(TopologyError::CpuNotStarted);
         }
-        if (self.pending_ack & mask) != 0 {
+        if (self.pending_ack.load(Ordering::Acquire) & mask) != 0 {
             return Err(TopologyError::AckNotReceived);
         }
         Ok(())
     }
 
-    pub fn mark_cpu_online(&mut self, cpu: u8) -> Result<(), TopologyError> {
+    pub fn mark_cpu_online(&self, cpu: u8) -> Result<(), TopologyError> {
+        let mask = 1u64
+            .checked_shl(cpu as u32)
+            .ok_or(TopologyError::InvalidCpuId)?;
         if !self.cpu_present(cpu) {
             return Err(TopologyError::CpuNotPresent);
         }
@@ -157,7 +168,7 @@ impl CpuTopology {
             return Err(TopologyError::CpuAlreadyOnline);
         }
         self.check_secondary_ack(cpu)?;
-        self.online |= 1u64 << cpu;
+        self.online.fetch_or(mask, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -177,7 +188,7 @@ mod tests {
 
     #[test]
     fn secondary_bring_up_requires_ack_before_online() {
-        let mut topo = CpuTopology::from_present_bitmap(0b11);
+        let topo = CpuTopology::from_present_bitmap(0b11);
         assert!(topo.start_secondary_cpu(1).is_ok());
         assert!(topo.mark_cpu_online(1).is_err());
         topo.acknowledge_secondary_cpu(1).expect("ack");

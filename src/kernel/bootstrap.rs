@@ -2355,11 +2355,11 @@ mod tests {
             .resume_current_thread_with_frame(&mut frame)
             .expect("resume");
         assert_eq!(tls, Some(0xABCD_0000));
-        assert_eq!(frame.ret0(), 0x7010);
-        assert_eq!(frame.ret1(), 0x8800_0000);
+        assert_eq!(frame.saved_pc(), 0x7010);
+        assert_eq!(frame.saved_sp(), 0x8800_0000);
 
-        frame.set_ok(0x9000, frame.ret1(), frame.ret2());
-        frame.set_ok(frame.ret0(), 0x9900_0000, frame.ret2());
+        frame.set_saved_pc(0x9000);
+        frame.set_saved_sp(0x9900_0000);
         frame.set_arg(0, 33);
         frame.set_arg(1, 44);
         state

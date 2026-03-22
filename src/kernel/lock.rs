@@ -3,6 +3,93 @@ use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrqState {
+    interrupts_were_enabled: bool,
+}
+
+#[cfg(feature = "hosted-dev")]
+#[inline]
+fn irq_save() -> IrqState {
+    IrqState {
+        interrupts_were_enabled: true,
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64"
+    )
+))]
+#[inline]
+fn irq_save() -> IrqState {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let flags: usize;
+        core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags));
+        core::arch::asm!("cli", options(nomem, preserves_flags));
+        return IrqState {
+            interrupts_were_enabled: (flags & (1 << 9)) != 0,
+        };
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        let sstatus: usize;
+        core::arch::asm!("csrrc {0}, sstatus, {1}", out(reg) sstatus, in(reg) 1usize << 1, options(nomem));
+        return IrqState {
+            interrupts_were_enabled: (sstatus & (1 << 1)) != 0,
+        };
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let daif: usize;
+        core::arch::asm!("mrs {0}, daif", out(reg) daif, options(nomem, preserves_flags));
+        core::arch::asm!("msr daifset, #2", options(nomem, preserves_flags));
+        return IrqState {
+            interrupts_were_enabled: (daif & (1 << 7)) == 0,
+        };
+    }
+}
+
+#[cfg(feature = "hosted-dev")]
+#[inline]
+fn irq_restore(_state: IrqState) {}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64"
+    )
+))]
+#[inline]
+fn irq_restore(state: IrqState) {
+    if !state.interrupts_were_enabled {
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("sti", options(nomem, preserves_flags));
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("csrs sstatus, {0}", in(reg) 1usize << 1, options(nomem));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nomem, preserves_flags));
+    }
+}
+
 /// A simple TTAS spin lock.
 ///
 /// This lock does **not** disable interrupts. Callers must ensure they do not
@@ -14,8 +101,16 @@ pub struct SpinLock<T> {
     value: UnsafeCell<T>,
 }
 
+#[derive(Debug)]
+pub struct SpinLockIrq<T> {
+    held: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
 unsafe impl<T: Send> Send for SpinLock<T> {}
 unsafe impl<T: Send> Sync for SpinLock<T> {}
+unsafe impl<T: Send> Send for SpinLockIrq<T> {}
+unsafe impl<T: Send> Sync for SpinLockIrq<T> {}
 
 impl<T> SpinLock<T> {
     pub const fn new(value: T) -> Self {
@@ -59,6 +154,68 @@ impl<T> SpinLock<T> {
         } else {
             None
         }
+    }
+}
+
+impl<T> SpinLockIrq<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            held: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    #[must_use = "if unused, the lock is immediately released when the guard is dropped"]
+    pub fn lock(&self) -> SpinLockIrqGuard<'_, T> {
+        let irq_state = irq_save();
+        while self
+            .held
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.held.load(Ordering::Relaxed) {
+                spin_loop();
+            }
+            spin_loop();
+        }
+        SpinLockIrqGuard {
+            lock: self,
+            irq_state,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+pub struct SpinLockIrqGuard<'a, T> {
+    lock: &'a SpinLockIrq<T>,
+    irq_state: IrqState,
+    _not_send: PhantomData<*const UnsafeCell<()>>,
+}
+
+impl<T> core::fmt::Debug for SpinLockIrqGuard<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SpinLockIrqGuard").finish_non_exhaustive()
+    }
+}
+
+impl<T> core::ops::Deref for SpinLockIrqGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> core::ops::DerefMut for SpinLockIrqGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for SpinLockIrqGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.held.store(false, Ordering::Release);
+        irq_restore(self.irq_state);
     }
 }
 

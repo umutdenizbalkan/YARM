@@ -113,19 +113,9 @@ impl TrapFrame {
     }
 
     pub fn capture_user_context(&self) -> UserRegisterContext {
-        let instruction_ptr = if self.ret0 != 0 {
-            self.ret0
-        } else {
-            self.saved_pc
-        };
-        let stack_ptr = if self.ret1 != 0 {
-            self.ret1
-        } else {
-            self.saved_sp
-        };
         UserRegisterContext {
-            instruction_ptr,
-            stack_ptr,
+            instruction_ptr: self.saved_pc,
+            stack_ptr: self.saved_sp,
             arg0: self.args[0],
             arg1: self.args[1],
         }
@@ -134,8 +124,6 @@ impl TrapFrame {
     pub fn apply_user_context(&mut self, context: UserRegisterContext) {
         self.saved_pc = context.instruction_ptr;
         self.saved_sp = context.stack_ptr;
-        self.ret0 = context.instruction_ptr;
-        self.ret1 = context.stack_ptr;
         self.args[0] = context.arg0;
         self.args[1] = context.arg1;
     }
