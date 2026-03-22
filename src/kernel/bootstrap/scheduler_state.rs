@@ -1,4 +1,5 @@
 use super::{KernelError, KernelState, MAX_CROSS_CPU_WORK, map_scheduler_error};
+use crate::kernel::ipc::ThreadId;
 use crate::kernel::scheduler::{CpuId, TaskPriority};
 use crate::kernel::smp::WorkItem;
 use crate::kernel::task::{TaskClass, TaskStatus};
@@ -23,19 +24,27 @@ impl KernelState {
     }
 
     pub fn current_tid(&self) -> Option<u64> {
-        self.scheduler.current_tid_on(self.current_cpu)
+        self.scheduler
+            .current_tid_on(self.current_cpu)
+            .map(|tid| tid.0)
     }
 
     pub fn dispatch_next_current_cpu(&mut self) -> Option<u64> {
-        self.scheduler.dispatch_next_on(self.current_cpu)
+        self.scheduler
+            .dispatch_next_on(self.current_cpu)
+            .map(|tid| tid.0)
     }
 
     pub fn on_preempt_current_cpu(&mut self) -> Option<u64> {
-        self.scheduler.on_preempt_on(self.current_cpu)
+        self.scheduler
+            .on_preempt_on(self.current_cpu)
+            .map(|tid| tid.0)
     }
 
     pub fn block_current_cpu(&mut self) -> Option<u64> {
-        self.scheduler.block_current_on(self.current_cpu)
+        self.scheduler
+            .block_current_on(self.current_cpu)
+            .map(|tid| tid.0)
     }
 
     pub fn enqueue_current_cpu(&mut self, tid: u64) -> Result<(), KernelError> {
@@ -78,14 +87,14 @@ impl KernelState {
     pub(crate) fn enqueue_task(&mut self, tid: u64) -> Result<CpuId, KernelError> {
         let priority = self.task_priority(tid)?;
         self.scheduler
-            .enqueue_balanced(tid, priority)
+            .enqueue_balanced(ThreadId(tid), priority)
             .map_err(map_scheduler_error)
     }
 
     pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
         let priority = self.task_priority(tid)?;
         self.scheduler
-            .enqueue_on_with_priority(cpu, tid, priority)
+            .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
             .map_err(map_scheduler_error)
     }
 
@@ -112,9 +121,12 @@ impl KernelState {
                 }
                 Ok(())
             }
-            WorkItem::TlbShootdown { target_cpu, asid, .. } => {
+            WorkItem::TlbShootdown {
+                target_cpu, asid, ..
+            } => {
                 self.tlb_shootdown_count = self.tlb_shootdown_count.wrapping_add(1);
-                if self.current_cpu == target_cpu && self.user_spaces.retired_entry(asid).is_some() {
+                if self.current_cpu == target_cpu && self.user_spaces.retired_entry(asid).is_some()
+                {
                     let cpu_bit = 1u64 << target_cpu.0;
                     self.user_spaces
                         .acknowledge_shootdown(asid, cpu_bit)

@@ -1,4 +1,5 @@
 use crate::arch::{platform_layout, topology};
+use crate::kernel::ipc::ThreadId;
 use crate::kernel::topology::CpuTopology;
 
 pub const MAX_RUN_QUEUE: usize = 64;
@@ -26,13 +27,13 @@ pub enum SchedulerError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScheduledTask {
-    tid: u64,
+    tid: ThreadId,
     priority: TaskPriority,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RingQueue {
-    tids: [u64; MAX_RUN_QUEUE],
+    tids: [ThreadId; MAX_RUN_QUEUE],
     head: usize,
     len: usize,
 }
@@ -40,7 +41,7 @@ struct RingQueue {
 impl RingQueue {
     const fn new() -> Self {
         Self {
-            tids: [0; MAX_RUN_QUEUE],
+            tids: [ThreadId(0); MAX_RUN_QUEUE],
             head: 0,
             len: 0,
         }
@@ -50,7 +51,7 @@ impl RingQueue {
         offset & (MAX_RUN_QUEUE - 1)
     }
 
-    fn contains(&self, tid: u64) -> bool {
+    fn contains(&self, tid: ThreadId) -> bool {
         for offset in 0..self.len {
             let idx = Self::index(self.head + offset);
             if self.tids[idx] == tid {
@@ -60,7 +61,7 @@ impl RingQueue {
         false
     }
 
-    fn push(&mut self, tid: u64) -> Result<(), SchedulerError> {
+    fn push(&mut self, tid: ThreadId) -> Result<(), SchedulerError> {
         if self.len >= MAX_RUN_QUEUE {
             return Err(SchedulerError::QueueFull);
         }
@@ -70,7 +71,7 @@ impl RingQueue {
         Ok(())
     }
 
-    fn pop(&mut self) -> Option<u64> {
+    fn pop(&mut self) -> Option<ThreadId> {
         if self.len == 0 {
             return None;
         }
@@ -101,7 +102,7 @@ impl PriorityScheduler {
         priority as usize
     }
 
-    fn contains_tid(&self, tid: u64) -> bool {
+    fn contains_tid(&self, tid: ThreadId) -> bool {
         if self.current.is_some_and(|task| task.tid == tid) {
             return true;
         }
@@ -110,7 +111,7 @@ impl PriorityScheduler {
 
     pub fn enqueue_with_priority(
         &mut self,
-        tid: u64,
+        tid: ThreadId,
         priority: TaskPriority,
     ) -> Result<(), SchedulerError> {
         if self.contains_tid(tid) {
@@ -128,7 +129,7 @@ impl PriorityScheduler {
         None
     }
 
-    pub fn dispatch_next(&mut self) -> Option<u64> {
+    pub fn dispatch_next(&mut self) -> Option<ThreadId> {
         if let Some(current) = self.current {
             return Some(current.tid);
         }
@@ -137,7 +138,7 @@ impl PriorityScheduler {
         Some(next.tid)
     }
 
-    pub fn on_preempt(&mut self) -> Option<u64> {
+    pub fn on_preempt(&mut self) -> Option<ThreadId> {
         if let Some(running) = self.current.take() {
             if let Err(err) = self.enqueue_with_priority(running.tid, running.priority) {
                 if err != SchedulerError::AlreadyQueued && self.runnable_count() != 0 {
@@ -153,12 +154,12 @@ impl PriorityScheduler {
         self.dispatch_next()
     }
 
-    pub fn block_current(&mut self) -> Option<u64> {
+    pub fn block_current(&mut self) -> Option<ThreadId> {
         let current = self.current.take()?;
         Some(current.tid)
     }
 
-    pub fn current_tid(&self) -> Option<u64> {
+    pub fn current_tid(&self) -> Option<ThreadId> {
         self.current.map(|task| task.tid)
     }
 
@@ -175,6 +176,7 @@ impl PriorityScheduler {
 pub struct SmpScheduler {
     schedulers: [PriorityScheduler; MAX_CPUS],
     topology: CpuTopology,
+    next_balance_cpu: usize,
 }
 
 impl Default for SmpScheduler {
@@ -182,6 +184,7 @@ impl Default for SmpScheduler {
         Self {
             schedulers: core::array::from_fn(|_| PriorityScheduler::default()),
             topology: CpuTopology::from_present_bitmap(topology::default_present_cpu_bitmap()),
+            next_balance_cpu: 0,
         }
     }
 }
@@ -207,16 +210,15 @@ impl SmpScheduler {
         self.check_online_cpu(cpu).map(|_| ())
     }
 
-    fn least_loaded_online_cpu(&self) -> Result<CpuId, SchedulerError> {
+    fn least_loaded_online_cpu(&self, start: usize) -> Result<CpuId, SchedulerError> {
         let mut best: Option<(usize, CpuId)> = None;
-        for idx in 0..MAX_CPUS {
+        for offset in 0..MAX_CPUS {
+            let idx = (start + offset) % MAX_CPUS;
             if self.topology.cpu_online(idx as u8) {
                 let load = self.schedulers[idx].runnable_count()
                     + usize::from(self.schedulers[idx].current_tid().is_some());
                 let cpu = CpuId(idx as u8);
-                if best.map_or(true, |(best_load, best_cpu)| {
-                    load < best_load || (load == best_load && cpu.0 < best_cpu.0)
-                }) {
+                if best.map_or(true, |(best_load, _)| load < best_load) {
                     best = Some((load, cpu));
                 }
             }
@@ -224,6 +226,13 @@ impl SmpScheduler {
         best.map(|(_, cpu)| cpu).ok_or(SchedulerError::CpuOffline)
     }
 
+    /// Simulates the full secondary-CPU bring-up handshake in a single call.
+    ///
+    /// This is suitable for tests and single-threaded simulation. On real SMP
+    /// hardware, the bootstrap CPU should call `start_secondary_cpu()`, the
+    /// secondary CPU's entry point should call `acknowledge_secondary_cpu()` on
+    /// itself, and only then should the bootstrap CPU call
+    /// `mark_cpu_online()`.
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), SchedulerError> {
         Self::check_cpu(cpu)?;
         self.topology
@@ -260,14 +269,20 @@ impl SmpScheduler {
         self.topology.present_cpu_bitmap()
     }
 
+    /// WARNING: Resets all secondary CPU online state.
+    ///
+    /// Any tasks already queued on secondary CPUs remain in their per-CPU run
+    /// queues, but those CPUs will appear offline until `bring_up_cpu()` is run
+    /// again for each secondary.
     pub fn set_present_cpu_bitmap(&mut self, present: u64) {
         self.topology = CpuTopology::from_present_bitmap(present);
+        self.next_balance_cpu = 0;
     }
 
     pub fn enqueue_on_with_priority(
         &mut self,
         cpu: CpuId,
-        tid: u64,
+        tid: ThreadId,
         priority: TaskPriority,
     ) -> Result<(), SchedulerError> {
         let idx = self.check_online_cpu(cpu)?;
@@ -276,34 +291,36 @@ impl SmpScheduler {
 
     pub fn enqueue_balanced(
         &mut self,
-        tid: u64,
+        tid: ThreadId,
         priority: TaskPriority,
     ) -> Result<CpuId, SchedulerError> {
-        let cpu = self.least_loaded_online_cpu()?;
+        let start = self.next_balance_cpu;
+        let cpu = self.least_loaded_online_cpu(start)?;
         self.enqueue_on_with_priority(cpu, tid, priority)?;
+        self.next_balance_cpu = (cpu.0 as usize + 1) % MAX_CPUS;
         Ok(cpu)
     }
 
-    pub fn enqueue_on(&mut self, cpu: CpuId, tid: u64) -> Result<(), SchedulerError> {
+    pub fn enqueue_on(&mut self, cpu: CpuId, tid: ThreadId) -> Result<(), SchedulerError> {
         self.enqueue_on_with_priority(cpu, tid, TaskPriority::Normal)
     }
 
-    pub fn dispatch_next_on(&mut self, cpu: CpuId) -> Option<u64> {
+    pub fn dispatch_next_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
         let idx = self.check_online_cpu(cpu).ok()?;
         self.schedulers[idx].dispatch_next()
     }
 
-    pub fn on_preempt_on(&mut self, cpu: CpuId) -> Option<u64> {
+    pub fn on_preempt_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
         let idx = self.check_online_cpu(cpu).ok()?;
         self.schedulers[idx].on_preempt()
     }
 
-    pub fn block_current_on(&mut self, cpu: CpuId) -> Option<u64> {
+    pub fn block_current_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
         let idx = self.check_online_cpu(cpu).ok()?;
         self.schedulers[idx].block_current()
     }
 
-    pub fn current_tid_on(&self, cpu: CpuId) -> Option<u64> {
+    pub fn current_tid_on(&self, cpu: CpuId) -> Option<ThreadId> {
         let idx = self.check_online_cpu(cpu).ok()?;
         self.schedulers[idx].current_tid()
     }
@@ -328,20 +345,32 @@ mod tests {
     #[test]
     fn scheduler_rotates_on_preempt() {
         let mut sched = PriorityScheduler::default();
-        assert!(sched.enqueue_with_priority(1, TaskPriority::Normal).is_ok());
-        assert!(sched.enqueue_with_priority(2, TaskPriority::Normal).is_ok());
+        assert!(
+            sched
+                .enqueue_with_priority(ThreadId(1), TaskPriority::Normal)
+                .is_ok()
+        );
+        assert!(
+            sched
+                .enqueue_with_priority(ThreadId(2), TaskPriority::Normal)
+                .is_ok()
+        );
 
-        assert_eq!(sched.dispatch_next().expect("task 1"), 1);
-        assert_eq!(sched.on_preempt().expect("task 2"), 2);
-        assert_eq!(sched.on_preempt().expect("task 1"), 1);
+        assert_eq!(sched.dispatch_next().expect("task 1"), ThreadId(1));
+        assert_eq!(sched.on_preempt().expect("task 2"), ThreadId(2));
+        assert_eq!(sched.on_preempt().expect("task 1"), ThreadId(1));
     }
 
     #[test]
     fn scheduler_duplicate_enqueue_is_rejected() {
         let mut sched = PriorityScheduler::default();
-        assert!(sched.enqueue_with_priority(7, TaskPriority::Normal).is_ok());
+        assert!(
+            sched
+                .enqueue_with_priority(ThreadId(7), TaskPriority::Normal)
+                .is_ok()
+        );
         assert_eq!(
-            sched.enqueue_with_priority(7, TaskPriority::High),
+            sched.enqueue_with_priority(ThreadId(7), TaskPriority::High),
             Err(SchedulerError::AlreadyQueued)
         );
         assert_eq!(sched.runnable_count(), 1);
@@ -350,15 +379,39 @@ mod tests {
     #[test]
     fn scheduler_prefers_higher_priority_work() {
         let mut sched = PriorityScheduler::default();
-        assert!(sched.enqueue_with_priority(10, TaskPriority::Low).is_ok());
-        assert!(sched.enqueue_with_priority(20, TaskPriority::High).is_ok());
         assert!(
             sched
-                .enqueue_with_priority(30, TaskPriority::Normal)
+                .enqueue_with_priority(ThreadId(10), TaskPriority::Low)
                 .is_ok()
         );
-        assert_eq!(sched.dispatch_next(), Some(20));
+        assert!(
+            sched
+                .enqueue_with_priority(ThreadId(20), TaskPriority::High)
+                .is_ok()
+        );
+        assert!(
+            sched
+                .enqueue_with_priority(ThreadId(30), TaskPriority::Normal)
+                .is_ok()
+        );
+        assert_eq!(sched.dispatch_next(), Some(ThreadId(20)));
         assert_eq!(sched.current_priority(), Some(TaskPriority::High));
+    }
+
+    #[test]
+    fn balanced_enqueue_round_robins_equal_load_cpus() {
+        let mut sched = SmpScheduler::default();
+        sched.bring_up_cpu(CpuId(1)).expect("cpu1");
+
+        let cpu_a = sched
+            .enqueue_balanced(ThreadId(10), TaskPriority::Normal)
+            .expect("enqueue a");
+        let cpu_b = sched
+            .enqueue_balanced(ThreadId(11), TaskPriority::Normal)
+            .expect("enqueue b");
+
+        assert_eq!(cpu_a, CpuId(0));
+        assert_eq!(cpu_b, CpuId(1));
     }
 
     #[test]
@@ -369,17 +422,17 @@ mod tests {
         assert_eq!(sched.online_cpu_count(), 2);
         assert!(
             sched
-                .enqueue_on_with_priority(CpuId(0), 10, TaskPriority::Normal)
+                .enqueue_on_with_priority(CpuId(0), ThreadId(10), TaskPriority::Normal)
                 .is_ok()
         );
         assert!(
             sched
-                .enqueue_on_with_priority(CpuId(1), 20, TaskPriority::High)
+                .enqueue_on_with_priority(CpuId(1), ThreadId(20), TaskPriority::High)
                 .is_ok()
         );
-        assert_eq!(sched.dispatch_next_on(CpuId(0)), Some(10));
-        assert_eq!(sched.dispatch_next_on(CpuId(1)), Some(20));
-        assert_eq!(sched.current_tid_on(CpuId(0)), Some(10));
-        assert_eq!(sched.current_tid_on(CpuId(1)), Some(20));
+        assert_eq!(sched.dispatch_next_on(CpuId(0)), Some(ThreadId(10)));
+        assert_eq!(sched.dispatch_next_on(CpuId(1)), Some(ThreadId(20)));
+        assert_eq!(sched.current_tid_on(CpuId(0)), Some(ThreadId(10)));
+        assert_eq!(sched.current_tid_on(CpuId(1)), Some(ThreadId(20)));
     }
 }

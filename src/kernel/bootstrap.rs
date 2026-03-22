@@ -301,7 +301,10 @@ impl Bootstrap {
         let mut scheduler = SmpScheduler::default();
         scheduler.set_present_cpu_bitmap(topology::default_present_cpu_bitmap());
         scheduler
-            .enqueue_on(CpuId(platform_layout::BOOTSTRAP_CPU_ID), 0)
+            .enqueue_on(
+                CpuId(platform_layout::BOOTSTRAP_CPU_ID),
+                crate::kernel::ipc::ThreadId(0),
+            )
             .map_err(map_scheduler_error)?;
 
         let mut cspace = CapabilitySpace::default();
