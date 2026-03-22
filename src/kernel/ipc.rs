@@ -1,4 +1,5 @@
 use crate::arch::syscall_abi;
+use core::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ThreadId(pub u64);
@@ -12,11 +13,26 @@ pub enum IpcError {
     MissingCapTransferFlag,
     InconsistentCapTransferFlag,
     InvalidEndpointDepth,
+    EndpointFull,
+}
+
+impl fmt::Display for IpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::PayloadTooLarge => "IPC payload exceeds register/message capacity",
+            Self::MissingCapTransferFlag => "transferred capability is missing the transfer flag",
+            Self::InconsistentCapTransferFlag => {
+                "capability transfer flag set without a transferred capability"
+            }
+            Self::InvalidEndpointDepth => "endpoint depth is outside the supported range",
+            Self::EndpointFull => "endpoint queue is full",
+        };
+        f.write_str(message)
+    }
 }
 
 pub const IPC_REGISTER_WORDS: usize = syscall_abi::IPC_REGISTER_WORDS;
 pub const IPC_REGISTER_BYTES: usize = IPC_REGISTER_WORDS * core::mem::size_of::<usize>();
-const _: [(); IPC_REGISTER_WORDS] = [(); syscall_abi::IPC_REGISTER_WORDS];
 
 pub fn unpack_register_payload(
     words: [usize; IPC_REGISTER_WORDS],
@@ -27,21 +43,21 @@ pub fn unpack_register_payload(
     }
 
     let mut out = [0u8; IPC_REGISTER_BYTES];
-    let mut i = 0;
-    while i < IPC_REGISTER_WORDS {
-        let bytes = words[i].to_le_bytes();
+    for (i, word) in words.iter().enumerate() {
+        let bytes = (*word).to_le_bytes();
         let start = i * core::mem::size_of::<usize>();
         let end = start + core::mem::size_of::<usize>();
         out[start..end].copy_from_slice(&bytes);
-        i += 1;
     }
     Some(out)
 }
 
-pub fn pack_register_payload(payload: &[u8]) -> [usize; IPC_REGISTER_WORDS] {
+pub fn pack_register_payload(payload: &[u8]) -> Result<[usize; IPC_REGISTER_WORDS], IpcError> {
+    if payload.len() > IPC_REGISTER_BYTES {
+        return Err(IpcError::PayloadTooLarge);
+    }
     let mut words = [0usize; IPC_REGISTER_WORDS];
-    let mut i = 0;
-    while i < IPC_REGISTER_WORDS {
+    for (i, slot) in words.iter_mut().enumerate() {
         let start = i * core::mem::size_of::<usize>();
         let end = start + core::mem::size_of::<usize>();
         let mut lane = [0u8; core::mem::size_of::<usize>()];
@@ -49,10 +65,9 @@ pub fn pack_register_payload(payload: &[u8]) -> [usize; IPC_REGISTER_WORDS] {
             let copy_end = core::cmp::min(end, payload.len());
             lane[..copy_end - start].copy_from_slice(&payload[start..copy_end]);
         }
-        words[i] = usize::from_le_bytes(lane);
-        i += 1;
+        *slot = usize::from_le_bytes(lane);
     }
-    words
+    Ok(words)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,14 +92,18 @@ impl SharedMemoryRegion {
         out
     }
 
-    pub fn decode(payload: &[u8]) -> Option<Self> {
+    pub const fn decode(payload: &[u8]) -> Option<Self> {
         if payload.len() < Self::ENCODED_LEN {
             return None;
         }
         let mut off = [0u8; 8];
         let mut len = [0u8; 8];
-        off.copy_from_slice(&payload[..8]);
-        len.copy_from_slice(&payload[8..Self::ENCODED_LEN]);
+        let mut i = 0;
+        while i < 8 {
+            off[i] = payload[i];
+            len[i] = payload[8 + i];
+            i += 1;
+        }
         Some(Self {
             offset: u64::from_le_bytes(off),
             len: u64::from_le_bytes(len),
@@ -105,9 +124,12 @@ pub struct Message {
 const _: () = assert!(Message::MAX_PAYLOAD <= (u8::MAX as usize));
 
 impl Message {
+    /// Two register-width payload lanes (16 bytes on 64-bit, 8 bytes on 32-bit)
+    /// are reserved for the syscall fast path, leaving 56 payload bytes in the
+    /// fixed in-kernel `Message` envelope on 64-bit targets.
     pub const MAX_PAYLOAD: usize = 56;
     pub const FLAG_CAP_TRANSFER: u16 = 1 << 0;
-    const NO_TRANSFER_CAP: u64 = u64::MAX;
+    pub const NO_TRANSFER_CAP: u64 = u64::MAX;
 
     pub fn new(sender_tid: u64, bytes: &[u8]) -> Result<Self, IpcError> {
         Self::with_header(sender_tid, 0, 0, None, bytes)
@@ -169,6 +191,10 @@ pub enum EndpointMode {
 }
 
 pub const MAX_ENDPOINT_DEPTH: usize = 64;
+const _: () = assert!(
+    MAX_ENDPOINT_DEPTH.is_power_of_two(),
+    "MAX_ENDPOINT_DEPTH must be a power of two for bitmask indexing",
+);
 
 #[derive(Debug)]
 pub struct Endpoint {
@@ -202,9 +228,9 @@ impl Endpoint {
         self.mode
     }
 
-    pub fn send(&mut self, msg: Message) -> Result<(), Message> {
+    pub fn send(&mut self, msg: Message) -> Result<(), IpcError> {
         if self.len >= self.max_depth {
-            return Err(msg);
+            return Err(IpcError::EndpointFull);
         }
 
         let tail = (self.head + self.len) & (MAX_ENDPOINT_DEPTH - 1);
@@ -278,7 +304,7 @@ mod tests {
     #[test]
     fn register_payload_roundtrip() {
         let source = [0xAAu8; IPC_REGISTER_BYTES];
-        let words = pack_register_payload(&source);
+        let words = pack_register_payload(&source).expect("pack");
         let decoded = unpack_register_payload(words, IPC_REGISTER_BYTES).expect("decode");
         assert_eq!(decoded, source);
     }

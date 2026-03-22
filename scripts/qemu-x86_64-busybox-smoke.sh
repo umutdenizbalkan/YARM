@@ -73,7 +73,8 @@ QEMU_CMD=(
   -append "$KERNEL_CMDLINE"
 )
 
-MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|init_server|Welcome|\[ui\] boot-to-shell marker"
+MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
+INIT_SERVER_REGEX="init_server|first server|first-server"
 
 set +e
 stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE" &
@@ -83,7 +84,8 @@ FOUND_MARKER=0
 
 START_TS=$(date +%s)
 while kill -0 "$PIPE_PID" >/dev/null 2>&1; do
-  if rg -n "$MARKER_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+    if rg -n "$MARKER_REGEX" "$LOGFILE" >/dev/null 2>&1 \
+    && rg -n "$INIT_SERVER_REGEX" "$LOGFILE" >/dev/null 2>&1; then
     FOUND_MARKER=1
     break
   fi
@@ -101,7 +103,7 @@ if [[ "$FOUND_MARKER" -eq 1 ]]; then
   wait "$PIPE_PID"
   QEMU_STATUS=$?
   set -e
-  echo "[ok] boot shell markers detected"
+  echo "[ok] boot shell and init-server markers detected"
   exit 0
 fi
 
@@ -114,7 +116,7 @@ wait "$PIPE_PID"
 QEMU_STATUS=$?
 set -e
 
-echo "[warn] boot shell markers not detected (status=$QEMU_STATUS)"
+echo "[warn] boot shell and init-server markers not detected (status=$QEMU_STATUS)"
 if [[ -f "$LOGFILE" ]]; then
   echo "[info] last 20 log lines from $LOGFILE"
   tail -n 20 "$LOGFILE" || true

@@ -1,5 +1,5 @@
 use super::bootstrap::{KernelError, KernelState};
-use super::capabilities::{CapId, CapObject};
+use super::capabilities::{CapId, CapObject, CapRights};
 use super::ipc::{
     IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
 };
@@ -23,7 +23,9 @@ pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;
 pub const SYSCALL_RET_STATUS: usize = 0;
 pub const SYSCALL_RET_AUX: usize = 1;
 pub const SYSCALL_RET_TRANSFER_CAP: usize = 2;
-pub const SYSCALL_NO_TRANSFER_CAP: u64 = u64::MAX;
+pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
+pub const OPCODE_INLINE: u16 = 0;
+pub const OPCODE_SHARED_MEM: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -49,9 +51,9 @@ impl Syscall {
     }
 }
 
-const _: [(); SYSCALL_COUNT] = [(); Syscall::VARIANT_COUNT];
+const _: () = assert!(SYSCALL_COUNT == Syscall::VARIANT_COUNT);
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
-const _: () = assert!(syscall_abi::TRAPFRAME_ARG_REGS > SYSCALL_ARG_TRANSFER_CAP);
+const _: () = assert!(SYSCALL_ARG_TRANSFER_CAP < syscall_abi::TRAPFRAME_ARG_REGS);
 const _: () = assert!(syscall_abi::TRAPFRAME_ARG_REGS > SYSCALL_ARG_INLINE_PAYLOAD1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,18 +102,48 @@ fn sender_tid_to_ret(tid: u64) -> Result<usize, SyscallError> {
     usize::try_from(tid).map_err(|_| SyscallError::Internal)
 }
 
-fn transfer_cap_arg(frame: &TrapFrame) -> Result<Option<CapId>, SyscallError> {
-    let raw = frame.args[SYSCALL_ARG_TRANSFER_CAP] as u64;
-    if raw == SYSCALL_NO_TRANSFER_CAP || raw == 0 {
+fn transfer_cap_arg(kernel: &KernelState, frame: &TrapFrame) -> Result<Option<CapId>, SyscallError> {
+    let raw = frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64;
+    if raw == SYSCALL_NO_TRANSFER_CAP {
         return Ok(None);
     }
     let cap = CapId(raw);
+    if raw == 0 && kernel.cspace.get(cap).is_none() {
+        return Ok(None);
+    }
     Ok(Some(cap))
 }
 
 fn encode_transfer_cap_ret(frame: &mut TrapFrame, cap: Option<u64>) -> Result<(), SyscallError> {
     let value = cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
-    frame.ret2 = usize::try_from(value).map_err(|_| SyscallError::Internal)?;
+    frame.set_ret2(usize::try_from(value).map_err(|_| SyscallError::Internal)?);
+    Ok(())
+}
+
+fn validate_user_region(offset: u64, len: u64) -> Result<(), SyscallError> {
+    const USER_ADDR_MAX: u64 = crate::arch::vm_layout::KERNEL_SPACE_BASE - 1;
+    let end = offset.checked_add(len).ok_or(SyscallError::InvalidArgs)?;
+    if end > USER_ADDR_MAX {
+        return Err(SyscallError::InvalidArgs);
+    }
+    Ok(())
+}
+
+fn validate_endpoint_right(
+    kernel: &KernelState,
+    cap: CapId,
+    right: CapRights,
+) -> Result<(), SyscallError> {
+    let endpoint_cap = kernel
+        .cspace
+        .get(cap)
+        .ok_or(SyscallError::InvalidCapability)?;
+    if !matches!(endpoint_cap.object, CapObject::Endpoint { .. }) {
+        return Err(SyscallError::WrongObject);
+    }
+    if !endpoint_cap.has_right(right) {
+        return Err(SyscallError::MissingRight);
+    }
     Ok(())
 }
 
@@ -130,8 +162,8 @@ fn inline_payload_from_frame(
         return Err(SyscallError::InvalidArgs);
     }
     let words = [
-        frame.args[SYSCALL_ARG_INLINE_PAYLOAD0],
-        frame.args[SYSCALL_ARG_INLINE_PAYLOAD1],
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
     ];
     let regs = unpack_register_payload(words, len).ok_or(SyscallError::InvalidArgs)?;
     let mut payload = [0u8; Message::MAX_PAYLOAD];
@@ -140,10 +172,11 @@ fn inline_payload_from_frame(
 }
 
 fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let cap = CapId(frame.args[SYSCALL_ARG_CAP] as u64);
-    let user_ptr_or_offset = frame.args[SYSCALL_ARG_PTR];
-    let len = frame.args[SYSCALL_ARG_LEN];
-    let transfer_cap = transfer_cap_arg(frame)?;
+    let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    validate_endpoint_right(kernel, cap, CapRights::Send)?;
+    let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    let transfer_cap = transfer_cap_arg(kernel, frame)?;
     if let Some(c) = transfer_cap {
         validate_transfer_cap(kernel, c)?;
     }
@@ -164,13 +197,14 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}
                 _ => return Err(SyscallError::WrongObject),
             }
+            validate_user_region(user_ptr_or_offset as u64, len as u64)?;
             let region = SharedMemoryRegion {
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
             };
             Message::with_header(
                 sender_tid,
-                0,
+                OPCODE_SHARED_MEM,
                 Message::FLAG_CAP_TRANSFER,
                 Some(grant_cap.0),
                 &region.encode(),
@@ -192,7 +226,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 
             Message::with_header(
                 sender_tid,
-                0,
+                OPCODE_INLINE,
                 if transfer_cap.is_some() {
                     Message::FLAG_CAP_TRANSFER
                 } else {
@@ -207,7 +241,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         let payload = inline_payload_from_frame(frame, len)?;
         Message::with_header(
             sender_tid,
-            0,
+            OPCODE_INLINE,
             if transfer_cap.is_some() {
                 Message::FLAG_CAP_TRANSFER
             } else {
@@ -220,15 +254,16 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     };
 
     kernel.ipc_send(cap, msg).map_err(SyscallError::from)?;
-    frame.set_ok(0, 0);
+    frame.set_ok(0, 0, 0);
     encode_transfer_cap_ret(frame, None)?;
     Ok(())
 }
 
 fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let cap = CapId(frame.args[SYSCALL_ARG_CAP] as u64);
-    let user_ptr = frame.args[SYSCALL_ARG_PTR];
-    let user_len = frame.args[SYSCALL_ARG_LEN];
+    let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    validate_endpoint_right(kernel, cap, CapRights::Receive)?;
+    let user_ptr = frame.arg(SYSCALL_ARG_PTR);
+    let user_len = frame.arg(SYSCALL_ARG_LEN);
     let received = kernel.ipc_recv(cap).map_err(SyscallError::from)?;
 
     match received {
@@ -241,17 +276,17 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 .current_tid()
                 .ok_or(SyscallError::Internal)?;
             if kernel.task_asid(current_tid).is_some() {
-                if msg.transferred_cap().is_some()
-                    && msg.as_slice().len() == SharedMemoryRegion::ENCODED_LEN
-                {
+                if msg.opcode == OPCODE_SHARED_MEM {
                     let desc = SharedMemoryRegion::decode(msg.as_slice())
                         .ok_or(SyscallError::InvalidArgs)?;
                     let region_len =
                         usize::try_from(desc.len).map_err(|_| SyscallError::InvalidArgs)?;
-                    frame.set_ok(sender, region_len);
-                    frame.args[SYSCALL_ARG_INLINE_PAYLOAD0] =
-                        usize::try_from(desc.offset).map_err(|_| SyscallError::InvalidArgs)?;
-                    frame.args[SYSCALL_ARG_INLINE_PAYLOAD1] = region_len;
+                    frame.set_ok(sender, region_len, frame.ret2());
+                    frame.set_arg(
+                        SYSCALL_ARG_INLINE_PAYLOAD0,
+                        usize::try_from(desc.offset).map_err(|_| SyscallError::InvalidArgs)?,
+                    );
+                    frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, region_len);
                     return Ok(());
                 }
 
@@ -259,7 +294,7 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                     return Err(SyscallError::InvalidArgs);
                 }
                 match kernel.copy_to_current_user(user_ptr, msg.as_slice()) {
-                    Ok(()) => frame.set_ok(sender, msg.len as usize),
+                    Ok(()) => frame.set_ok(sender, msg.len as usize, frame.ret2()),
                     Err(KernelError::UserMemoryFault) => {
                         kernel.record_fault(FaultInfo {
                             addr: VirtAddr(user_ptr as u64),
@@ -271,10 +306,11 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                     Err(other) => return Err(SyscallError::from(other)),
                 };
             } else {
-                frame.set_ok(sender, msg.len as usize);
-                let words = pack_register_payload(msg.as_slice());
-                frame.args[SYSCALL_ARG_INLINE_PAYLOAD0] = words[0];
-                frame.args[SYSCALL_ARG_INLINE_PAYLOAD1] = words[1];
+                frame.set_ok(sender, msg.len as usize, frame.ret2());
+                let words =
+                    pack_register_payload(msg.as_slice()).map_err(|_| SyscallError::InvalidArgs)?;
+                frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, words[0]);
+                frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
             }
         }
         None => {
@@ -286,10 +322,10 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 }
 
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    match Syscall::decode(frame.syscall_num)? {
+    match Syscall::decode(frame.syscall_num())? {
         Syscall::Yield => {
             kernel.yield_current().map_err(SyscallError::from)?;
-            frame.set_ok(0, 0);
+            frame.set_ok(0, 0, 0);
             Ok(())
         }
         Syscall::IpcSend => handle_ipc_send(kernel, frame),

@@ -153,3 +153,8 @@ required-features = ["hosted-dev"]
 inherits = "release"
 panic = "abort"
 lto = "thin"
+
+[profile.aarch64-none]
+inherits = "release"
+panic = "abort"
+lto = "thin"

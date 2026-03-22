@@ -127,13 +127,13 @@ pub fn run_deterministic_script(steps: &[SimStep]) -> Result<SimSummary, KernelE
             SimStep::SysGetPid => {
                 let mut frame = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
                 dispatch(&mut state, &bindings, &mut frame);
-                last_getpid = frame.ret0;
+                last_getpid = frame.ret0();
                 proc_requests = proc_requests.saturating_add(1);
             }
             SimStep::SysOpenAt(path) => {
                 let mut frame = TrapFrame::new(LINUX_NR_OPENAT, [0, path, 0, 0, 0, 0]);
                 dispatch(&mut state, &bindings, &mut frame);
-                last_openat = frame.ret0;
+                last_openat = frame.ret0();
                 vfs_requests = vfs_requests.saturating_add(1);
             }
             SimStep::ExternalIrq(line) => {

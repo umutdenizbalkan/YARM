@@ -21,6 +21,90 @@ pub const VFS_OP_SENDFILE: u16 = 21;
 pub const VFS_OP_STATX: u16 = 22;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenAtArgs {
+    pub dirfd: u64,
+    pub path_ptr: u64,
+    pub flags: u64,
+    pub mode: u64,
+}
+
+impl OpenAtArgs {
+    pub const VERSION: u16 = VFS_CODEC_V1_VERSION;
+
+    pub const fn new(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> Self {
+        Self {
+            dirfd,
+            path_ptr,
+            flags,
+            mode,
+        }
+    }
+
+    pub const fn encode(self) -> [u8; VfsV1Args::ENCODED_LEN] {
+        VfsV1Args::new(self.dirfd, self.path_ptr, self.flags, self.mode).encode()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, VfsCodecError> {
+        let args = VfsV1Args::decode(payload)?;
+        Ok(Self::new(args.arg0, args.arg1, args.arg2, args.arg3))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadWriteArgs {
+    pub fd: u64,
+    pub buf_ptr: u64,
+    pub len: u64,
+}
+
+impl ReadWriteArgs {
+    pub const VERSION: u16 = VFS_CODEC_V1_VERSION;
+
+    pub const fn new(fd: u64, buf_ptr: u64, len: u64) -> Self {
+        Self { fd, buf_ptr, len }
+    }
+
+    pub const fn encode(self) -> [u8; VfsV1Args::ENCODED_LEN] {
+        VfsV1Args::new(self.fd, self.buf_ptr, self.len, 0).encode()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, VfsCodecError> {
+        let args = VfsV1Args::decode(payload)?;
+        Ok(Self::new(args.arg0, args.arg1, args.arg2))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatxArgs {
+    pub dirfd: u64,
+    pub path_ptr: u64,
+    pub flags: u64,
+    pub mask_or_buf: u64,
+}
+
+impl StatxArgs {
+    pub const VERSION: u16 = VFS_CODEC_V1_VERSION;
+
+    pub const fn new(dirfd: u64, path_ptr: u64, flags: u64, mask_or_buf: u64) -> Self {
+        Self {
+            dirfd,
+            path_ptr,
+            flags,
+            mask_or_buf,
+        }
+    }
+
+    pub const fn encode(self) -> [u8; VfsV1Args::ENCODED_LEN] {
+        VfsV1Args::new(self.dirfd, self.path_ptr, self.flags, self.mask_or_buf).encode()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, VfsCodecError> {
+        let args = VfsV1Args::decode(payload)?;
+        Ok(Self::new(args.arg0, args.arg1, args.arg2, args.arg3))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfsV1Args {
     pub arg0: u64,
     pub arg1: u64,
@@ -102,7 +186,22 @@ mod tests {
         assert_eq!(VFS_CODEC_V1_VERSION, 1);
         assert_eq!(VfsV1Args::VERSION, VFS_CODEC_V1_VERSION);
         assert_eq!(VfsV1Args::ENCODED_LEN, 32);
+        assert_eq!(OpenAtArgs::VERSION, VFS_CODEC_V1_VERSION);
+        assert_eq!(ReadWriteArgs::VERSION, VFS_CODEC_V1_VERSION);
+        assert_eq!(StatxArgs::VERSION, VFS_CODEC_V1_VERSION);
         assert_eq!(VFS_OP_OPENAT, 10);
         assert_eq!(VFS_OP_READ, 12);
+    }
+
+    #[test]
+    fn typed_vfs_wrappers_roundtrip_via_frozen_codec() {
+        let open = OpenAtArgs::new(1, 2, 3, 4);
+        assert_eq!(OpenAtArgs::decode(&open.encode()), Ok(open));
+
+        let rw = ReadWriteArgs::new(7, 8, 9);
+        assert_eq!(ReadWriteArgs::decode(&rw.encode()), Ok(rw));
+
+        let stat = StatxArgs::new(10, 11, 12, 13);
+        assert_eq!(StatxArgs::decode(&stat.encode()), Ok(stat));
     }
 }

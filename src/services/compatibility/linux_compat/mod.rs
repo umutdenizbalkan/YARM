@@ -2,7 +2,9 @@ use crate::kernel::bootstrap::{KernelError, KernelState};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 #[cfg(test)]
-use crate::kernel::proc_proto::{PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2, ProcV2Args};
+use crate::kernel::proc_proto::{
+    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply, PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2,
+};
 use crate::kernel::proc_proto::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_SERVER_ABI_VERSION,
 };
@@ -10,6 +12,7 @@ use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
 use crate::kernel::vfs_proto::VFS_CODEC_V1_VERSION;
 use crate::kernel::vfs_proto::{
+    OpenAtArgs, ReadWriteArgs, StatxArgs,
     VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT,
     VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE,
     VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
@@ -146,9 +149,10 @@ impl LinuxServiceBindings {
         let send_cap = self
             .proc_mgr_request_send
             .ok_or(KernelError::InvalidCapability)?;
-        let mut payload = [0u8; 16];
-        payload[..8].copy_from_slice(&arg0.to_le_bytes());
-        payload[8..16].copy_from_slice(&arg1.to_le_bytes());
+        let payload = match opcode {
+            PROC_OP_WAITPID_V2 => WaitPidV2Args::new(arg0, arg1).encode(),
+            _ => SpawnV2Args::new(arg0, arg1).encode(),
+        };
         let msg = Message::with_header(0, opcode, 0, None, &payload)
             .map_err(|_| KernelError::WrongObject)?;
         kernel.ipc_send(send_cap, msg)
@@ -342,7 +346,7 @@ fn pack_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) -
 }
 
 fn pack_statx(dirfd: usize, path_ptr: usize, flags: usize, mask: usize) -> [u8; 32] {
-    pack_vfs4(dirfd, path_ptr, flags, mask)
+    StatxArgs::new(dirfd as u64, path_ptr as u64, flags as u64, mask as u64).encode()
 }
 
 impl KernelState {
@@ -458,10 +462,10 @@ impl KernelState {
 pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame: &mut TrapFrame) {
     // VM-related personality syscalls pass capability IDs in arguments by design
     // (e.g. mmap arg0/aspace-cap and brk arg1/aspace-cap) for capability routing.
-    let result: Result<usize, LinuxErrno> = (|| match LinuxCompatSyscall::decode(frame.syscall_num)?
+    let result: Result<usize, LinuxErrno> = (|| match LinuxCompatSyscall::decode(frame.syscall_num())?
     {
         LinuxCompatSyscall::Exit => {
-            let code = frame.args[LINUX_ARG0] as u64;
+            let code = frame.arg(LINUX_ARG0) as u64;
             bindings
                 .send_proc_request(kernel, PROC_OP_EXIT, code)
                 .map_err(LinuxErrno::from)?;
@@ -491,10 +495,10 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
         }
         LinuxCompatSyscall::Openat => {
             let payload = pack_vfs4(
-                frame.args[LINUX_ARG0],
-                frame.args[LINUX_ARG1],
-                frame.args[LINUX_ARG2],
-                frame.args[LINUX_ARG3],
+                frame.arg(LINUX_ARG0),
+                frame.arg(LINUX_ARG1),
+                frame.arg(LINUX_ARG2),
+                frame.arg(LINUX_ARG3),
             );
             bindings
                 .send_vfs_request(kernel, VFS_OP_OPENAT, &payload)
@@ -506,7 +510,7 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
             decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::Close => {
-            let payload = pack_vfs4(frame.args[LINUX_ARG0], 0, 0, 0);
+            let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
             bindings
                 .send_vfs_request(kernel, VFS_OP_CLOSE, &payload)
                 .map_err(LinuxErrno::from)?;
@@ -518,9 +522,9 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
         }
         LinuxCompatSyscall::Read => {
             let payload = pack_vfs4(
-                frame.args[LINUX_ARG0],
-                frame.args[LINUX_ARG1],
-                frame.args[LINUX_ARG2],
+                frame.arg(LINUX_ARG0),
+                frame.arg(LINUX_ARG1),
+                frame.arg(LINUX_ARG2),
                 0,
             );
             bindings
@@ -534,9 +538,9 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
         }
         LinuxCompatSyscall::Write => {
             let payload = pack_vfs4(
-                frame.args[LINUX_ARG0],
-                frame.args[LINUX_ARG1],
-                frame.args[LINUX_ARG2],
+                frame.arg(LINUX_ARG0),
+                frame.arg(LINUX_ARG1),
+                frame.arg(LINUX_ARG2),
                 0,
             );
             bindings
@@ -550,10 +554,10 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
         }
         LinuxCompatSyscall::Ioctl => {
             let payload = pack_vfs4(
-                frame.args[LINUX_ARG0],
-                frame.args[LINUX_ARG1],
-                frame.args[LINUX_ARG2],
-                frame.args[LINUX_ARG3],
+                frame.arg(LINUX_ARG0),
+                frame.arg(LINUX_ARG1),
+                frame.arg(LINUX_ARG2),
+                frame.arg(LINUX_ARG3),
             );
             bindings
                 .send_vfs_request(kernel, VFS_OP_IOCTL, &payload)
@@ -565,29 +569,29 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
             decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::Mmap => {
-            let aspace_cap = CapId(frame.args[LINUX_ARG0] as u64);
-            let addr = frame.args[LINUX_ARG1];
-            let len = frame.args[LINUX_ARG2];
-            let prot = frame.args[LINUX_ARG3];
+            let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
+            let addr = frame.arg(LINUX_ARG1);
+            let len = frame.arg(LINUX_ARG2);
+            let prot = frame.arg(LINUX_ARG3);
             kernel.linux_mmap_region(aspace_cap, addr, len, prot)
         }
         LinuxCompatSyscall::Munmap => {
-            let aspace_cap = CapId(frame.args[LINUX_ARG0] as u64);
-            let addr = frame.args[LINUX_ARG1];
-            let len = frame.args[LINUX_ARG2];
+            let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
+            let addr = frame.arg(LINUX_ARG1);
+            let len = frame.arg(LINUX_ARG2);
             kernel.linux_munmap_region(aspace_cap, addr, len)?;
             Ok(0)
         }
         LinuxCompatSyscall::Mprotect => {
-            let aspace_cap = CapId(frame.args[LINUX_ARG0] as u64);
-            let addr = frame.args[LINUX_ARG1];
-            let len = frame.args[LINUX_ARG2];
-            let prot = frame.args[LINUX_ARG3];
+            let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
+            let addr = frame.arg(LINUX_ARG1);
+            let len = frame.arg(LINUX_ARG2);
+            let prot = frame.arg(LINUX_ARG3);
             kernel.linux_mprotect_region(aspace_cap, addr, len, prot)?;
             Ok(0)
         }
         LinuxCompatSyscall::Dup => {
-            let payload = pack_vfs4(frame.args[LINUX_ARG0], 0, 0, 0);
+            let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
             bindings
                 .send_vfs_request(kernel, VFS_OP_DUP, &payload)
                 .map_err(LinuxErrno::from)?;
@@ -599,9 +603,9 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
         }
         LinuxCompatSyscall::Fcntl => {
             let payload = pack_vfs4(
-                frame.args[LINUX_ARG0],
-                frame.args[LINUX_ARG1],
-                frame.args[LINUX_ARG2],
+                frame.arg(LINUX_ARG0),
+                frame.arg(LINUX_ARG1),
+                frame.arg(LINUX_ARG2),
                 0,
             );
             bindings
@@ -615,9 +619,9 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
         }
         LinuxCompatSyscall::Poll => {
             let payload = pack_vfs4(
-                frame.args[LINUX_ARG0],
-                frame.args[LINUX_ARG1],
-                frame.args[LINUX_ARG2],
+                frame.arg(LINUX_ARG0),
+                frame.arg(LINUX_ARG1),
+                frame.arg(LINUX_ARG2),
                 0,
             );
             bindings
@@ -630,7 +634,7 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
             decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::EpollCreate1 => {
-            let payload = pack_vfs4(frame.args[LINUX_ARG0], 0, 0, 0);
+            let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
             bindings
                 .send_vfs_request(kernel, VFS_OP_EPOLL_CREATE1, &payload)
                 .map_err(LinuxErrno::from)?;
@@ -642,10 +646,10 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
         }
         LinuxCompatSyscall::EpollCtl => {
             let payload = pack_epoll_ctl(
-                frame.args[LINUX_ARG0],
-                frame.args[LINUX_ARG1],
-                frame.args[LINUX_ARG2],
-                frame.args[LINUX_ARG3],
+                frame.arg(LINUX_ARG0),
+                frame.arg(LINUX_ARG1),
+                frame.arg(LINUX_ARG2),
+                frame.arg(LINUX_ARG3),
             );
             bindings
                 .send_vfs_request(kernel, VFS_OP_EPOLL_CTL, &payload)
@@ -658,10 +662,10 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
         }
         LinuxCompatSyscall::EpollPwait => {
             let payload = pack_vfs4(
-                frame.args[LINUX_ARG0],
-                frame.args[LINUX_ARG1],
-                frame.args[LINUX_ARG2],
-                frame.args[LINUX_ARG3],
+                frame.arg(LINUX_ARG0),
+                frame.arg(LINUX_ARG1),
+                frame.arg(LINUX_ARG2),
+                frame.arg(LINUX_ARG3),
             );
             bindings
                 .send_vfs_request(kernel, VFS_OP_EPOLL_PWAIT, &payload)
@@ -674,10 +678,10 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
         }
         LinuxCompatSyscall::Sendfile => {
             let payload = pack_sendfile(
-                frame.args[LINUX_ARG0],
-                frame.args[LINUX_ARG1],
-                frame.args[LINUX_ARG2],
-                frame.args[LINUX_ARG3],
+                frame.arg(LINUX_ARG0),
+                frame.arg(LINUX_ARG1),
+                frame.arg(LINUX_ARG2),
+                frame.arg(LINUX_ARG3),
             );
             bindings
                 .send_vfs_request(kernel, VFS_OP_SENDFILE, &payload)
@@ -690,10 +694,10 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
         }
         LinuxCompatSyscall::Statx => {
             let payload = pack_statx(
-                frame.args[LINUX_ARG0],
-                frame.args[LINUX_ARG1],
-                frame.args[LINUX_ARG2],
-                frame.args[LINUX_ARG3],
+                frame.arg(LINUX_ARG0),
+                frame.arg(LINUX_ARG1),
+                frame.arg(LINUX_ARG2),
+                frame.arg(LINUX_ARG3),
             );
             bindings
                 .send_vfs_request(kernel, VFS_OP_STATX, &payload)
@@ -705,16 +709,16 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
             decode_u64_reply(reply.as_slice())
         }
         LinuxCompatSyscall::Brk => {
-            let requested = frame.args[LINUX_ARG0];
-            let aspace_cap = CapId(frame.args[LINUX_ARG1] as u64);
-            let prot = frame.args[LINUX_ARG2];
+            let requested = frame.arg(LINUX_ARG0);
+            let aspace_cap = CapId(frame.arg(LINUX_ARG1) as u64);
+            let prot = frame.arg(LINUX_ARG2);
             let tid = kernel.scheduler.current_tid().ok_or(LinuxErrno::NoSys)?;
             kernel.linux_brk(tid, aspace_cap, requested, prot)
         }
     })();
 
     match result {
-        Ok(value) => frame.set_ok(value, 0),
+        Ok(value) => frame.set_ok(value, 0, 0),
         Err(errno) => frame.set_err(errno.code() as usize),
     }
 }
@@ -727,15 +731,15 @@ mod tests {
 
     #[test]
     fn proc_v2_args_codec_roundtrip() {
-        let args = ProcV2Args::new(10, 20);
+        let args = SpawnV2Args::new(10, 20);
         let encoded = args.encode();
-        let decoded = ProcV2Args::decode(&encoded).expect("decode");
+        let decoded = SpawnV2Args::decode(&encoded).expect("decode");
         assert_eq!(decoded, args);
     }
 
     #[test]
     fn proc_v2_codec_golden_vector_is_frozen() {
-        let args = ProcV2Args::new(0x11, 0x22);
+        let args = WaitPidV2Args::new(0x11, 0x22);
         let encoded = args.encode();
         assert_eq!(&encoded[..8], &0x11u64.to_le_bytes());
         assert_eq!(&encoded[8..16], &0x22u64.to_le_bytes());
@@ -743,7 +747,7 @@ mod tests {
 
     #[test]
     fn vfs_v1_codec_golden_vector_is_frozen() {
-        let args = VfsV1Args::new(1, 2, 3, 4);
+        let args = OpenAtArgs::new(1, 2, 3, 4);
         let encoded = args.encode();
         assert_eq!(&encoded[..8], &1u64.to_le_bytes());
         assert_eq!(&encoded[8..16], &2u64.to_le_bytes());
@@ -753,17 +757,17 @@ mod tests {
 
     #[test]
     fn vfs_v1_args_codec_roundtrip() {
-        let args = VfsV1Args::new(1, 2, 3, 4);
+        let args = ReadWriteArgs::new(1, 2, 3);
         let encoded = args.encode();
-        let decoded = VfsV1Args::decode(&encoded).expect("decode");
+        let decoded = ReadWriteArgs::decode(&encoded).expect("decode");
         assert_eq!(decoded, args);
     }
 
     #[test]
     fn codec_fixture_vectors_are_frozen() {
         let fixtures_proc = [
-            (ProcV2Args::new(0, 0), [0u8; 16]),
-            (ProcV2Args::new(1, 2), {
+            (WaitPidV2Reply::new(0, 0), [0u8; 16]),
+            (WaitPidV2Reply::new(1, 2), {
                 let mut b = [0u8; 16];
                 b[..8].copy_from_slice(&1u64.to_le_bytes());
                 b[8..16].copy_from_slice(&2u64.to_le_bytes());
@@ -772,24 +776,24 @@ mod tests {
         ];
         for (args, expected) in fixtures_proc {
             assert_eq!(args.encode(), expected);
-            assert_eq!(ProcV2Args::decode(&expected).expect("decode"), args);
+            assert_eq!(WaitPidV2Reply::decode(&expected).expect("decode"), args);
         }
 
         let fixtures_vfs = [
-            VfsV1Args::new(0, 0, 0, 0),
-            VfsV1Args::new(9, 8, 7, 6),
-            VfsV1Args::new(u64::MAX, 1, 2, 3),
+            OpenAtArgs::new(0, 0, 0, 0),
+            OpenAtArgs::new(9, 8, 7, 6),
+            OpenAtArgs::new(u64::MAX, 1, 2, 3),
         ];
         for args in fixtures_vfs {
             let encoded = args.encode();
-            assert_eq!(VfsV1Args::decode(&encoded).expect("decode"), args);
+            assert_eq!(OpenAtArgs::decode(&encoded).expect("decode"), args);
         }
     }
 
     #[test]
     fn codec_rejects_truncated_payloads() {
-        assert!(ProcV2Args::decode(&[0u8; 15]).is_err());
-        assert!(VfsV1Args::decode(&[0u8; 31]).is_err());
+        assert!(WaitPidV2Args::decode(&[0u8; 15]).is_err());
+        assert!(OpenAtArgs::decode(&[0u8; 31]).is_err());
     }
 
     #[test]
@@ -807,12 +811,12 @@ mod tests {
         let statx = pack_statx(5, 0x2000, 0x4, 0x7FF);
 
         let decode = |payload: [u8; 32]| {
-            let args = VfsV1Args::decode(&payload).expect("decode");
+            let args = StatxArgs::decode(&payload).expect("decode");
             [
-                args.arg0 as usize,
-                args.arg1 as usize,
-                args.arg2 as usize,
-                args.arg3 as usize,
+                args.dirfd as usize,
+                args.path_ptr as usize,
+                args.flags as usize,
+                args.mask_or_buf as usize,
             ]
         };
 
@@ -998,15 +1002,15 @@ mod tests {
             ],
         );
         dispatch(&mut state, &bindings, &mut mmap_frame);
-        assert_eq!(mmap_frame.error, 0);
-        assert_eq!(mmap_frame.ret0, 0x8000);
+        assert_eq!(mmap_frame.error_code(), None);
+        assert_eq!(mmap_frame.ret0(), 0x8000);
 
         let mut munmap_frame = TrapFrame::new(
             LINUX_NR_MUNMAP,
             [aspace_cap.0 as usize, 0x8000, PAGE_SIZE * 2, 0, 0, 0],
         );
         dispatch(&mut state, &bindings, &mut munmap_frame);
-        assert_eq!(munmap_frame.error, 0);
+        assert_eq!(munmap_frame.error_code(), None);
     }
 
     #[test]
@@ -1038,8 +1042,8 @@ mod tests {
 
         let mut getpid_frame = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut getpid_frame);
-        assert_eq!(getpid_frame.error, 0);
-        assert_eq!(getpid_frame.ret0, pid as usize);
+        assert_eq!(getpid_frame.error_code(), None);
+        assert_eq!(getpid_frame.ret0(), pid as usize);
 
         let req_msg = state
             .ipc_recv(req_recv)
@@ -1049,8 +1053,8 @@ mod tests {
 
         let mut getppid_frame = TrapFrame::new(LINUX_NR_GETPPID, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut getppid_frame);
-        assert_eq!(getppid_frame.error, 0);
-        assert_eq!(getppid_frame.ret0, ppid as usize);
+        assert_eq!(getppid_frame.error_code(), None);
+        assert_eq!(getppid_frame.ret0(), ppid as usize);
 
         let getppid_req = state
             .ipc_recv(req_recv)
@@ -1060,7 +1064,7 @@ mod tests {
 
         let mut exit_frame = TrapFrame::new(LINUX_NR_EXIT, [7, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut exit_frame);
-        assert_eq!(exit_frame.error, 0);
+        assert_eq!(exit_frame.error_code(), None);
 
         let exit_req = state
             .ipc_recv(req_recv)
@@ -1093,66 +1097,66 @@ mod tests {
 
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [3, 0x2000, 0x10, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut openat);
-        assert_eq!(openat.error, 0);
-        assert_eq!(openat.ret0, 42);
+        assert_eq!(openat.error_code(), None);
+        assert_eq!(openat.ret0(), 42);
         let open_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(open_req.opcode, VFS_OP_OPENAT);
 
         let mut close = TrapFrame::new(LINUX_NR_CLOSE, [42, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut close);
-        assert_eq!(close.error, 0);
+        assert_eq!(close.error_code(), None);
         let close_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(close_req.opcode, VFS_OP_CLOSE);
 
         let mut read = TrapFrame::new(LINUX_NR_READ, [42, 0x3000, 128, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut read);
-        assert_eq!(read.error, 0);
-        assert_eq!(read.ret0, 128);
+        assert_eq!(read.error_code(), None);
+        assert_eq!(read.ret0(), 128);
         let read_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(read_req.opcode, VFS_OP_READ);
 
         let mut write = TrapFrame::new(LINUX_NR_WRITE, [42, 0x4000, 64, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut write);
-        assert_eq!(write.error, 0);
-        assert_eq!(write.ret0, 64);
+        assert_eq!(write.error_code(), None);
+        assert_eq!(write.ret0(), 64);
         let write_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(write_req.opcode, VFS_OP_WRITE);
 
         let mut ioctl = TrapFrame::new(LINUX_NR_IOCTL, [42, 0x1234, 0x5555, 0x6666, 0, 0]);
         dispatch(&mut state, &bindings, &mut ioctl);
-        assert_eq!(ioctl.error, 0);
+        assert_eq!(ioctl.error_code(), None);
         let ioctl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(ioctl_req.opcode, VFS_OP_IOCTL);
 
         let mut dup = TrapFrame::new(LINUX_NR_DUP, [42, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut dup);
-        assert_eq!(dup.error, 0);
-        assert_eq!(dup.ret0, 43);
+        assert_eq!(dup.error_code(), None);
+        assert_eq!(dup.ret0(), 43);
         let dup_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(dup_req.opcode, VFS_OP_DUP);
 
         let mut fcntl = TrapFrame::new(LINUX_NR_FCNTL, [42, 3, 0xF0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut fcntl);
-        assert_eq!(fcntl.error, 0);
+        assert_eq!(fcntl.error_code(), None);
         let fcntl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(fcntl_req.opcode, VFS_OP_FCNTL);
 
         let mut poll = TrapFrame::new(LINUX_NR_POLL, [0x9000, 2, 10, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut poll);
-        assert_eq!(poll.error, 0);
-        assert_eq!(poll.ret0, 1);
+        assert_eq!(poll.error_code(), None);
+        assert_eq!(poll.ret0(), 1);
         let poll_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(poll_req.opcode, VFS_OP_POLL);
         let mut epoll_create = TrapFrame::new(LINUX_NR_EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut epoll_create);
-        assert_eq!(epoll_create.error, 0);
-        assert_eq!(epoll_create.ret0, 7);
+        assert_eq!(epoll_create.error_code(), None);
+        assert_eq!(epoll_create.ret0(), 7);
         let epc_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(epc_req.opcode, VFS_OP_EPOLL_CREATE1);
 
         let mut epoll_ctl = TrapFrame::new(LINUX_NR_EPOLL_CTL, [7, 1, 42, 0xA000, 0, 0]);
         dispatch(&mut state, &bindings, &mut epoll_ctl);
-        assert_eq!(epoll_ctl.error, 0);
+        assert_eq!(epoll_ctl.error_code(), None);
         let epctl_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(epctl_req.opcode, VFS_OP_EPOLL_CTL);
         assert_eq!(epctl_req.as_slice().len(), 32);
@@ -1160,15 +1164,15 @@ mod tests {
 
         let mut epoll_wait = TrapFrame::new(LINUX_NR_EPOLL_PWAIT, [7, 0xB000, 4, 10, 0, 0]);
         dispatch(&mut state, &bindings, &mut epoll_wait);
-        assert_eq!(epoll_wait.error, 0);
-        assert_eq!(epoll_wait.ret0, 1);
+        assert_eq!(epoll_wait.error_code(), None);
+        assert_eq!(epoll_wait.ret0(), 1);
         let epwait_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(epwait_req.opcode, VFS_OP_EPOLL_PWAIT);
 
         let mut sendfile = TrapFrame::new(LINUX_NR_SENDFILE, [1, 2, 0xC000, 99, 0, 0]);
         dispatch(&mut state, &bindings, &mut sendfile);
-        assert_eq!(sendfile.error, 0);
-        assert_eq!(sendfile.ret0, 99);
+        assert_eq!(sendfile.error_code(), None);
+        assert_eq!(sendfile.ret0(), 99);
         let sendfile_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(sendfile_req.opcode, VFS_OP_SENDFILE);
         assert_eq!(sendfile_req.as_slice().len(), 32);
@@ -1176,7 +1180,7 @@ mod tests {
 
         let mut statx = TrapFrame::new(LINUX_NR_STATX, [3, 0xD000, 0, 0xE000, 0, 0]);
         dispatch(&mut state, &bindings, &mut statx);
-        assert_eq!(statx.error, 0);
+        assert_eq!(statx.error_code(), None);
         let statx_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(statx_req.opcode, VFS_OP_STATX);
         assert_eq!(statx_req.as_slice().len(), 32);
@@ -1199,8 +1203,8 @@ mod tests {
         let req = state.ipc_recv(req_recv).expect("recv").expect("msg");
         assert_eq!(req.opcode, PROC_OP_WAITPID_V2);
         assert_eq!(req.as_slice().len(), 16);
-        let args = ProcV2Args::decode(req.as_slice()).expect("decode");
-        assert_eq!(args, ProcV2Args::new(42, 0x10));
+        let args = WaitPidV2Args::decode(req.as_slice()).expect("decode");
+        assert_eq!(args, WaitPidV2Args::new(42, 0x10));
 
         state
             .ipc_send(
@@ -1250,17 +1254,17 @@ mod tests {
 
         let mut getpid = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut getpid);
-        assert_eq!(getpid.error, 0);
-        assert_eq!(getpid.ret0, 42);
+        assert_eq!(getpid.error_code(), None);
+        assert_eq!(getpid.ret0(), 42);
 
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x2000, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut openat);
-        assert_eq!(openat.error, 0);
-        assert_eq!(openat.ret0, 3);
+        assert_eq!(openat.error_code(), None);
+        assert_eq!(openat.ret0(), 3);
 
         let mut exit = TrapFrame::new(LINUX_NR_EXIT, [5, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut exit);
-        assert_eq!(exit.error, 0);
+        assert_eq!(exit.error_code(), None);
 
         let proc_getpid = state.ipc_recv(proc_req_recv).expect("recv").expect("msg");
         assert_eq!(proc_getpid.opcode, PROC_OP_GETPID);
@@ -1319,8 +1323,8 @@ mod tests {
         for (i, nr) in sequence.iter().enumerate() {
             let mut frame = TrapFrame::new(*nr, [0, 0x2000 + i * 8, 0, 0, 0, 0]);
             dispatch(&mut state, &bindings, &mut frame);
-            assert_eq!(frame.error, 0);
-            observed[i] = frame.ret0;
+            assert_eq!(frame.error_code(), None);
+            observed[i] = frame.ret0();
         }
 
         assert_eq!(observed, [101, 3, 102, 4, 103, 5]);
@@ -1376,7 +1380,7 @@ mod tests {
 
         let mut getpid = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut getpid);
-        assert_eq!(getpid.ret0, 700);
+        assert_eq!(getpid.ret0(), 700);
 
         state
             .handle_trap_event(crate::kernel::trap::TrapEvent::external_interrupt(9), None)
@@ -1384,7 +1388,7 @@ mod tests {
 
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x1234, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut openat);
-        assert_eq!(openat.ret0, 11);
+        assert_eq!(openat.ret0(), 11);
 
         let proc_req = state.ipc_recv(proc_req_recv).expect("recv").expect("msg");
         let vfs_req = state.ipc_recv(vfs_req_recv).expect("recv").expect("msg");

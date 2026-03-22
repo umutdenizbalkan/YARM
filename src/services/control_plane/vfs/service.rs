@@ -1,22 +1,22 @@
-use crate::kernel::ipc::Message;
-use crate::kernel::vfs::{InMemoryBackend, VfsLiteService};
-use crate::kernel::vfs_proto::{VFS_OP_OPENAT, VfsV1Args};
+use crate::kernel::vfs::InMemoryBackend;
+use crate::services::common::service::{run_typed_request_loop, FsService};
 
 pub fn run() {
-    let mut vfs = VfsLiteService::with_backend(InMemoryBackend::new());
-
-    let synthetic_open = Message::with_header(
-        0,
-        VFS_OP_OPENAT,
-        0,
-        None,
-        &VfsV1Args::new(0, 0x1000, 0, 0).encode(),
+    let mut vfs = FsService::with_backend(InMemoryBackend::new());
+    let reply = run_typed_request_loop(
+        &mut vfs,
+        [crate::kernel::vfs::openat_message(crate::kernel::vfs::OpenAtRequest {
+            dirfd: 0,
+            path_ptr: 0x1000,
+            flags: 0,
+            mode: 0,
+        })
+        .expect("request")],
     )
-    .expect("request");
-    let reply = vfs.handle_request(synthetic_open).expect("vfs reply");
+    .expect("vfs loop")[0];
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&reply.as_slice()[..8]);
     let fd = u64::from_le_bytes(bytes);
 
-    crate::yarm_log!("vfs-lite server demo: fd={}", fd);
+    crate::yarm_log!("vfs-lite server loop: fd={}, handled={}", fd, vfs.handled_count());
 }

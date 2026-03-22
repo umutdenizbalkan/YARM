@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 
 pub const PRB_SLOTS: usize = 128;
 pub const PRB_MSG_MAX: usize = 192;
+const _: () = assert!(PRB_SLOTS.is_power_of_two(), "PRB_SLOTS must be a power of two");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -129,6 +130,7 @@ impl PrbSlot {
 struct PrintkRing {
     next_seq: AtomicU64,
     dropped: AtomicU64,
+    truncated: AtomicU64,
     slots: [PrbSlot; PRB_SLOTS],
     console_loglevel: AtomicU8,
     reader_seq: AtomicU64,
@@ -139,6 +141,7 @@ impl PrintkRing {
         Self {
             next_seq: AtomicU64::new(1),
             dropped: AtomicU64::new(0),
+            truncated: AtomicU64::new(0),
             slots: [const { PrbSlot::new() }; PRB_SLOTS],
             console_loglevel: AtomicU8::new(LogLevel::Info as u8),
             reader_seq: AtomicU64::new(1),
@@ -147,9 +150,9 @@ impl PrintkRing {
 
     fn push(&self, level: LogLevel, context: PrintkContext, msg: &[u8]) {
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-        let idx = (seq as usize) % PRB_SLOTS;
+        let idx = (seq as usize) & (PRB_SLOTS - 1);
         if msg.len() > PRB_MSG_MAX {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.truncated.fetch_add(1, Ordering::Relaxed);
         }
         self.slots[idx].write(seq, level, context, msg);
     }
@@ -163,7 +166,7 @@ impl PrintkRing {
         let mut written = 0usize;
         let mut seq = start;
         while seq <= last && written < out.len() {
-            let idx = (seq as usize) % PRB_SLOTS;
+            let idx = (seq as usize) & (PRB_SLOTS - 1);
             if let Some(rec) = self.slots[idx].read_if_seq(seq) {
                 out[written] = rec;
                 written += 1;
@@ -179,7 +182,7 @@ impl PrintkRing {
         let mut seq = self.reader_seq.load(Ordering::Acquire);
         let last = self.next_seq.load(Ordering::Acquire).saturating_sub(1);
         while seq <= last {
-            let idx = (seq as usize) % PRB_SLOTS;
+            let idx = (seq as usize) & (PRB_SLOTS - 1);
             if let Some(rec) = self.slots[idx].read_if_seq(seq) {
                 if (rec.level as u8) <= threshold {
                     sink(rec.level, rec.context, rec.as_str());
@@ -229,6 +232,17 @@ pub fn printk_args(level: LogLevel, context: PrintkContext, args: fmt::Arguments
     PRINTK.push(level, context, &sb.buf[..sb.len]);
 }
 
+pub fn printk_flush() -> usize {
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        return threaded_drain_to(|_lvl, _ctx, msg| crate::arch::console::write_line(msg));
+    }
+    #[cfg(feature = "hosted-dev")]
+    {
+        0
+    }
+}
+
 #[macro_export]
 macro_rules! printk {
     ($lvl:expr, $ctx:expr, $($arg:tt)*) => {{
@@ -272,6 +286,10 @@ pub fn set_console_loglevel(level: LogLevel) {
 
 pub fn dropped_count() -> u64 {
     PRINTK.dropped.load(Ordering::Acquire)
+}
+
+pub fn truncated_count() -> u64 {
+    PRINTK.truncated.load(Ordering::Acquire)
 }
 
 pub fn snapshot_latest(out: &mut [PrintkRecord]) -> usize {

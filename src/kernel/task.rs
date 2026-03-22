@@ -1,5 +1,6 @@
 use super::capabilities::CapId;
 use super::ipc::ThreadId;
+use super::time::{TickDuration, TickInstant};
 use super::vm::{Asid, VirtAddr};
 use crate::kernel::bootstrap::FaultPolicy;
 
@@ -7,17 +8,14 @@ use crate::kernel::bootstrap::FaultPolicy;
 pub struct RestartToken(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TickDuration(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TickInstant(pub u64);
+pub struct ThreadGroupId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitReason {
     EndpointReceive(CapId),
     EndpointSend(CapId),
-    Futex(usize),
-    Join(u64),
+    Futex(VirtAddr),
+    Join(ThreadId),
     Poll,
 }
 
@@ -73,10 +71,10 @@ pub struct RestartState {
     pub escalation_count: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadControlBlock {
     pub tid: ThreadId,
-    pub thread_group_id: u64,
+    pub thread_group_id: ThreadGroupId,
     pub class: TaskClass,
     pub status: TaskStatus,
     pub asid: Option<Asid>,
@@ -105,8 +103,8 @@ mod tests {
         let _ = TaskStatus::Runnable;
         let _ = TaskStatus::Running;
         let _ = TaskStatus::Blocked(WaitReason::Poll);
-        let _ = TaskStatus::Blocked(WaitReason::Futex(0x1000));
-        let _ = TaskStatus::Blocked(WaitReason::Join(7));
+        let _ = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x1000)));
+        let _ = TaskStatus::Blocked(WaitReason::Join(ThreadId(7)));
         let _ = TaskStatus::Faulted;
         let _ = TaskStatus::Exited;
         let _ = TaskStatus::Dead;
@@ -116,7 +114,7 @@ mod tests {
     fn tcb_uses_typed_fields() {
         let tcb = ThreadControlBlock {
             tid: ThreadId(7),
-            thread_group_id: 7,
+            thread_group_id: ThreadGroupId(7),
             class: TaskClass::App,
             status: TaskStatus::Runnable,
             asid: Some(Asid(1)),
@@ -151,7 +149,7 @@ mod tests {
 
         assert_eq!(tcb.tid, ThreadId(7));
         assert_eq!(tcb.restart.backoff, TickDuration(10));
-        assert_eq!(tcb.thread_group_id, 7);
+        assert_eq!(tcb.thread_group_id, ThreadGroupId(7));
         assert_eq!(tcb.tls_base, Some(0xDEAD_BEEF));
         assert!(tcb.tls_restore_pending);
         assert_eq!(tcb.user_context.instruction_ptr, 0x4000);
