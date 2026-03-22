@@ -10,16 +10,22 @@ mod thread_state;
 mod user_memory_state;
 
 use super::capabilities::{CapId, CapObject, CapRights, Capability, CapabilitySpace};
-use super::ipc::{Endpoint, EndpointMode, IpcError, Message};
+use super::ipc::{Endpoint, IpcError, Message};
+#[cfg(test)]
+use super::ipc::EndpointMode;
 use super::scheduler::{CpuId, SchedulerError, SmpScheduler};
-use super::smp::{SmpMailbox, WorkItem};
+use super::smp::SmpMailbox;
+#[cfg(test)]
+use super::smp::WorkItem;
 use super::syscall::SyscallError;
-use super::task::{
-    FaultPolicy, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock, ThreadGroupId,
-    UserRegisterContext, WaitReason,
-};
+use super::task::{FaultPolicy, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock};
+#[cfg(test)]
+use super::task::{ThreadGroupId, UserRegisterContext, WaitReason};
 use super::scheduler_timer::Timer;
-use super::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
+use super::trap::FaultInfo;
+#[cfg(test)]
+use super::trap::{FaultAccess, Trap, TrapEvent};
+#[cfg(test)]
 use super::trapframe::TrapFrame;
 use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
