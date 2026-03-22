@@ -17,6 +17,20 @@ use super::vm::{
 use crate::arch::{platform_layout, topology};
 use crate::kernel::ipc::ThreadId;
 
+#[cfg(feature = "hosted-dev")]
+type KernelStorage<T> = crate::std::boxed::Box<T>;
+#[cfg(not(feature = "hosted-dev"))]
+type KernelStorage<T> = T;
+
+#[cfg(feature = "hosted-dev")]
+fn store_kernel_value<T>(value: T) -> KernelStorage<T> {
+    crate::std::boxed::Box::new(value)
+}
+#[cfg(not(feature = "hosted-dev"))]
+fn store_kernel_value<T>(value: T) -> KernelStorage<T> {
+    value
+}
+
 const MAX_ENDPOINTS: usize = 16;
 const MAX_TASKS: usize = 64;
 const MAX_TASK_MEM_ENTRIES: usize = 2048;
@@ -263,14 +277,14 @@ struct RestartSubsystem {
 #[derive(Debug)]
 pub struct KernelState {
     pub kernel_aspace: AddressSpace,
-    pub scheduler: SmpScheduler,
+    pub scheduler: KernelStorage<SmpScheduler>,
     pub cspace: CapabilitySpace,
     pub timer: Timer,
     pub user_spaces: AddressSpaceManager,
-    ipc: IpcSubsystem,
+    ipc: KernelStorage<IpcSubsystem>,
     next_dynamic_tid: u64,
     tcbs: [Option<ThreadControlBlock>; MAX_TASKS],
-    memory: MemorySubsystem,
+    memory: KernelStorage<MemorySubsystem>,
     drivers: DriverSubsystem,
     tlb_shootdown_count: u64,
     faults: FaultSubsystem,
@@ -308,11 +322,11 @@ impl Bootstrap {
 
         let mut state = KernelState {
             kernel_aspace,
-            scheduler,
+            scheduler: store_kernel_value(scheduler),
             cspace,
             timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: AddressSpaceManager::default(),
-            ipc: IpcSubsystem {
+            ipc: store_kernel_value(IpcSubsystem {
                 cross_cpu_work: CrossCpuWorkQueue::default(),
                 endpoints: [const { None }; MAX_ENDPOINTS],
                 endpoint_waiters: [None; MAX_ENDPOINTS],
@@ -322,15 +336,15 @@ impl Bootstrap {
                 notification_generations: [0; MAX_NOTIFICATIONS],
                 irq_routes: [None; MAX_IRQ_LINES],
                 telemetry: IpcPathTelemetry::default(),
-            },
+            }),
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
             tcbs: [const { None }; MAX_TASKS],
-            memory: MemorySubsystem {
+            memory: store_kernel_value(MemorySubsystem {
                 task_mem: [None; MAX_TASK_MEM_ENTRIES],
                 memory_objects: [None; MAX_MEMORY_OBJECTS],
                 next_memory_object_id: 1,
                 next_anon_phys: platform_layout::NEXT_ANON_PHYS_BASE,
-            },
+            }),
             drivers: DriverSubsystem {
                 driver_records: [const { None }; MAX_DRIVERS],
                 next_iova_space_id: 1,
