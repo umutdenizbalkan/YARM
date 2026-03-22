@@ -1,5 +1,5 @@
 use super::ipc::Message;
-use super::proc_proto::{
+use super::proc_abi::{
     SpawnV2Args, WaitPidV2Args, WaitPidV2Reply, PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID,
     PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
 };
@@ -394,7 +394,7 @@ impl ProcessService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::proc_proto::{SpawnV2Args, WaitPidV2Args};
+    use crate::kernel::proc_abi::{SpawnV2Args, WaitPidV2Args};
 
     #[test]
     fn elf_image_info_parser_accepts_minimal_elf64_header() {

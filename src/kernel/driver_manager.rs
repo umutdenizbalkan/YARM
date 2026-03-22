@@ -1,6 +1,6 @@
 use super::bootstrap::{KernelError, KernelState};
 use super::capabilities::CapId;
-use super::driver_proto::{
+use super::driver_abi::{
     DRIVER_OP_GRANT_DMA, DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, DRIVER_OP_RESTARTED,
 };
 use super::ipc::Message;
@@ -101,7 +101,7 @@ pub fn handle_request(kernel: &mut KernelState, request: Message) -> Result<Mess
 mod tests {
     use super::*;
     use crate::kernel::bootstrap::Bootstrap;
-    use crate::kernel::driver_proto::{DRIVER_OP_GRANT_IRQ, pack_driver_pair};
+    use crate::kernel::driver_abi::{DRIVER_OP_GRANT_IRQ, pack_driver_pair};
 
     #[test]
     fn driver_manager_register_and_grant_irq_roundtrip() {

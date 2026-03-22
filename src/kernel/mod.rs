@@ -1,12 +1,12 @@
 pub mod bootstrap;
 pub mod capabilities;
 pub mod driver_manager;
-pub mod driver_proto;
+pub mod driver_abi;
 pub mod init_server;
 pub mod ipc;
 pub mod lock;
 pub mod printk;
-pub mod proc_proto;
+pub mod proc_abi;
 pub mod process_manager;
 pub mod runtime;
 pub mod scheduler;
@@ -20,7 +20,7 @@ pub mod topology;
 pub mod trap;
 pub mod trapframe;
 pub mod vfs;
-pub mod vfs_proto;
+pub mod vfs_abi;
 pub mod vm;
 
 pub use bootstrap::{Bootstrap, KernelState};

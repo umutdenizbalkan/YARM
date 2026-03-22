@@ -1,4 +1,4 @@
-use crate::kernel::vfs::{VfsBackend, VfsLiteError};
+use crate::kernel::vfs::{VfsBackend, VfsError};
 
 pub const INITRAMFS_BUSYBOX_PATH_PTR: u64 = 0x494E_4954_4255_5359;
 
@@ -24,42 +24,42 @@ impl InitramfsBackend {
 }
 
 impl VfsBackend for InitramfsBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         if path_ptr != INITRAMFS_BUSYBOX_PATH_PTR {
-            return Err(VfsLiteError::BadFd);
+            return Err(VfsError::BadFd);
         }
         self.opened_fd = Some(10);
         Ok(10)
     }
 
-    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+    fn close(&mut self, fd: u64) -> Result<u64, VfsError> {
         if self.opened_fd == Some(fd) {
             self.opened_fd = None;
             Ok(0)
         } else {
-            Err(VfsLiteError::BadFd)
+            Err(VfsError::BadFd)
         }
     }
 
-    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
         if self.opened_fd != Some(fd) {
-            return Err(VfsLiteError::BadFd);
+            return Err(VfsError::BadFd);
         }
         Ok(core::cmp::min(len, self.file_len))
     }
 
-    fn write(&mut self, fd: u64, _len: u64) -> Result<u64, VfsLiteError> {
+    fn write(&mut self, fd: u64, _len: u64) -> Result<u64, VfsError> {
         if self.opened_fd != Some(fd) {
-            return Err(VfsLiteError::BadFd);
+            return Err(VfsError::BadFd);
         }
-        Err(VfsLiteError::Unsupported)
+        Err(VfsError::Unsupported)
     }
 
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         if path_ptr == INITRAMFS_BUSYBOX_PATH_PTR {
             Ok(self.file_len)
         } else {
-            Err(VfsLiteError::BadFd)
+            Err(VfsError::BadFd)
         }
     }
 }

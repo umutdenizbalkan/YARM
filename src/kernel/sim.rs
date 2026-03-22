@@ -3,10 +3,10 @@ use super::init_server::{
     CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitFaultHandoff, InitServerLite,
 };
 use super::ipc::Message;
-use super::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
+use super::proc_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
 use super::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use super::vfs::{
-    MountRouter, OpenAtRequest, ReadWriteRequest, VfsLiteService, openat_message, read_message,
+    MountRouter, OpenAtRequest, ReadWriteRequest, VfsService, openat_message, read_message,
 };
 use crate::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 use crate::services::fs::ramfs::RamFsBackend;
@@ -28,7 +28,7 @@ pub struct MountOrchestrationSummary {
 
 pub fn run_mount_orchestration_scenario() -> Result<MountOrchestrationSummary, KernelError> {
     let router = MountRouter::new(0x8000, RamFsBackend::new(), InitramfsBackend::new(4096));
-    let mut vfs = VfsLiteService::with_backend(router);
+    let mut vfs = VfsService::with_backend(router);
 
     let open_low = openat_message(OpenAtRequest {
         dirfd: 0,
@@ -160,7 +160,7 @@ pub fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError
     let waited =
         WaitPidV2Result::decode(wait_rep.as_slice()).map_err(|_| KernelError::WrongObject)?;
 
-    let mut vfs = VfsLiteService::with_backend(InitramfsBackend::new(4096));
+    let mut vfs = VfsService::with_backend(InitramfsBackend::new(4096));
     let open = openat_message(OpenAtRequest {
         dirfd: 0,
         path_ptr: INITRAMFS_BUSYBOX_PATH_PTR,
@@ -307,7 +307,7 @@ pub fn run_deterministic_script(steps: &[SimStep]) -> Result<SimSummary, KernelE
 mod tests {
     extern crate std;
 
-    use super::super::vfs_proto::{VFS_OP_OPENAT, VFS_OP_READ};
+    use super::super::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
     use super::*;
 
     #[test]

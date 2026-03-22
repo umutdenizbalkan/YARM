@@ -1,7 +1,7 @@
 use super::LinuxErrno;
 use crate::kernel::bootstrap::KernelState;
 use crate::kernel::ipc::Message;
-use crate::kernel::proc_proto::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
+use crate::kernel::proc_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
 use crate::kernel::process_manager::ProcessService;
 use crate::kernel::vfs::{
     CloseRequest, OpenAtRequest, ReadWriteRequest, VfsBackend, close_message, openat_message,

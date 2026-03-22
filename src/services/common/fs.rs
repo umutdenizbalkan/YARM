@@ -1,4 +1,4 @@
-use crate::kernel::vfs::{VfsBackend, VfsLiteError};
+use crate::kernel::vfs::{VfsBackend, VfsError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InodeRecord {
@@ -24,5 +24,5 @@ pub fn find_inode_index(inodes: &[Option<InodeRecord>], path_ptr: u64) -> Option
 
 pub trait ServiceFsBackend: VfsBackend {
     fn name(&self) -> &'static str;
-    fn validate(&self) -> Result<(), VfsLiteError>;
+    fn validate(&self) -> Result<(), VfsError>;
 }

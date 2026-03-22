@@ -1,5 +1,5 @@
 use crate::kernel::ipc::Message;
-use crate::kernel::proc_proto::{SpawnV2Args, WaitPidV2Args, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2};
+use crate::kernel::proc_abi::{SpawnV2Args, WaitPidV2Args, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2};
 use crate::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use crate::services::common::service::{run_typed_request_loop, RequestResponseService};
 

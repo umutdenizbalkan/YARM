@@ -2,7 +2,7 @@
 //! Concrete filesystem services must live under `src/services/*`.
 
 use super::ipc::Message;
-use super::vfs_proto::{
+use super::vfs_abi::{
     OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
     VFS_OP_WRITE, VfsV1Args,
 };
@@ -10,7 +10,7 @@ use super::vfs_proto::{
 const MAX_FDS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VfsLiteError {
+pub enum VfsError {
     Malformed,
     NoFd,
     BadFd,
@@ -54,11 +54,11 @@ pub enum VfsRequest {
 }
 
 pub trait VfsBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError>;
-    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError>;
-    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError>;
-    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError>;
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError>;
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError>;
+    fn close(&mut self, fd: u64) -> Result<u64, VfsError>;
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError>;
 }
 
 #[derive(Debug)]
@@ -81,14 +81,14 @@ impl InMemoryBackend {
         }
     }
 
-    fn alloc_fd(&mut self, inode: u64) -> Result<u64, VfsLiteError> {
+    fn alloc_fd(&mut self, inode: u64) -> Result<u64, VfsError> {
         let fd = self.next_fd;
         self.next_fd = self.next_fd.saturating_add(1);
         if let Some(slot) = self.fds.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(FdEntry { fd, inode });
             Ok(fd)
         } else {
-            Err(VfsLiteError::NoFd)
+            Err(VfsError::NoFd)
         }
     }
 
@@ -96,7 +96,7 @@ impl InMemoryBackend {
         self.fds.iter().flatten().any(|entry| entry.fd == fd)
     }
 
-    fn close_fd(&mut self, fd: u64) -> Result<(), VfsLiteError> {
+    fn close_fd(&mut self, fd: u64) -> Result<(), VfsError> {
         if let Some(slot) = self
             .fds
             .iter_mut()
@@ -105,7 +105,7 @@ impl InMemoryBackend {
             *slot = None;
             Ok(())
         } else {
-            Err(VfsLiteError::BadFd)
+            Err(VfsError::BadFd)
         }
     }
 }
@@ -144,52 +144,52 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
 }
 
 impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         self.route_by_path(path_ptr).openat(path_ptr)
     }
 
-    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+    fn close(&mut self, fd: u64) -> Result<u64, VfsError> {
         self.route_by_fd(fd).close(fd)
     }
 
-    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
         self.route_by_fd(fd).read(fd, len)
     }
 
-    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
         self.route_by_fd(fd).write(fd, len)
     }
 
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         self.route_by_path(path_ptr).statx(path_ptr)
     }
 }
 
 impl VfsBackend for InMemoryBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         self.alloc_fd(path_ptr)
     }
 
-    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+    fn close(&mut self, fd: u64) -> Result<u64, VfsError> {
         self.close_fd(fd)?;
         Ok(0)
     }
 
-    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
         if !self.has_fd(fd) {
-            return Err(VfsLiteError::BadFd);
+            return Err(VfsError::BadFd);
         }
         Ok(len)
     }
 
-    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
         if !self.has_fd(fd) {
-            return Err(VfsLiteError::BadFd);
+            return Err(VfsError::BadFd);
         }
         Ok(len)
     }
 
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         Ok(path_ptr)
     }
 }
@@ -290,19 +290,19 @@ impl MountNamespacePolicy {
 }
 
 #[derive(Debug)]
-pub struct VfsLiteService<B: VfsBackend = InMemoryBackend> {
+pub struct VfsService<B: VfsBackend = InMemoryBackend> {
     backend: B,
     policy: MountNamespacePolicy,
     op_sequence: u64,
 }
 
-impl Default for VfsLiteService<InMemoryBackend> {
+impl Default for VfsService<InMemoryBackend> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl VfsLiteService<InMemoryBackend> {
+impl VfsService<InMemoryBackend> {
     pub const fn new() -> Self {
         Self {
             backend: InMemoryBackend::new(),
@@ -312,7 +312,7 @@ impl VfsLiteService<InMemoryBackend> {
     }
 }
 
-impl<B: VfsBackend> VfsLiteService<B> {
+impl<B: VfsBackend> VfsService<B> {
     pub const fn with_backend(backend: B) -> Self {
         Self {
             backend,
@@ -329,16 +329,16 @@ impl<B: VfsBackend> VfsLiteService<B> {
         self.op_sequence
     }
 
-    fn u64_reply(opcode: u16, value: u64) -> Result<Message, VfsLiteError> {
+    fn u64_reply(opcode: u16, value: u64) -> Result<Message, VfsError> {
         Message::with_header(0, opcode, 0, None, &value.to_le_bytes())
-            .map_err(|_| VfsLiteError::Malformed)
+            .map_err(|_| VfsError::Malformed)
     }
 
-    pub fn parse_request(request: Message) -> Result<VfsRequest, VfsLiteError> {
+    pub fn parse_request(request: Message) -> Result<VfsRequest, VfsError> {
         match request.opcode {
             VFS_OP_OPENAT => {
                 let args = OpenAtArgs::decode(request.as_slice())
-                    .map_err(|_| VfsLiteError::Malformed)?;
+                    .map_err(|_| VfsError::Malformed)?;
                 Ok(VfsRequest::OpenAt {
                     _dirfd: args.dirfd,
                     path_ptr: args.path_ptr,
@@ -348,12 +348,12 @@ impl<B: VfsBackend> VfsLiteService<B> {
             }
             VFS_OP_CLOSE => {
                 let args =
-                    VfsV1Args::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
+                    VfsV1Args::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
                 Ok(VfsRequest::Close { fd: args.arg0 })
             }
             VFS_OP_READ => {
                 let args =
-                    ReadWriteArgs::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
+                    ReadWriteArgs::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
                 Ok(VfsRequest::Read {
                     fd: args.fd,
                     _buf_ptr: args.buf_ptr,
@@ -362,7 +362,7 @@ impl<B: VfsBackend> VfsLiteService<B> {
             }
             VFS_OP_WRITE => {
                 let args =
-                    ReadWriteArgs::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
+                    ReadWriteArgs::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
                 Ok(VfsRequest::Write {
                     fd: args.fd,
                     _buf_ptr: args.buf_ptr,
@@ -371,7 +371,7 @@ impl<B: VfsBackend> VfsLiteService<B> {
             }
             VFS_OP_STATX => {
                 let args =
-                    StatxArgs::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
+                    StatxArgs::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
                 Ok(VfsRequest::Statx {
                     _dirfd: args.dirfd,
                     path_ptr: args.path_ptr,
@@ -379,16 +379,16 @@ impl<B: VfsBackend> VfsLiteService<B> {
                     _mask_or_buf: args.mask_or_buf,
                 })
             }
-            _ => Err(VfsLiteError::Unsupported),
+            _ => Err(VfsError::Unsupported),
         }
     }
 
-    pub fn handle_request(&mut self, request: Message) -> Result<Message, VfsLiteError> {
+    pub fn handle_request(&mut self, request: Message) -> Result<Message, VfsError> {
         let parsed = Self::parse_request(request)?;
         let reply = match parsed {
             VfsRequest::OpenAt { path_ptr, .. } => {
                 if !self.policy.allows_path(path_ptr) {
-                    return Err(VfsLiteError::PermissionDenied);
+                    return Err(VfsError::PermissionDenied);
                 }
                 Self::u64_reply(VFS_OP_OPENAT, self.backend.openat(path_ptr)?)
             }
@@ -401,7 +401,7 @@ impl<B: VfsBackend> VfsLiteService<B> {
             }
             VfsRequest::Statx { path_ptr, .. } => {
                 if !self.policy.allows_path(path_ptr) {
-                    return Err(VfsLiteError::PermissionDenied);
+                    return Err(VfsError::PermissionDenied);
                 }
                 Self::u64_reply(VFS_OP_STATX, self.backend.statx(path_ptr)?)
             }
@@ -411,7 +411,7 @@ impl<B: VfsBackend> VfsLiteService<B> {
     }
 }
 
-pub fn openat_message(req: OpenAtRequest) -> Result<Message, VfsLiteError> {
+pub fn openat_message(req: OpenAtRequest) -> Result<Message, VfsError> {
     Message::with_header(
         0,
         VFS_OP_OPENAT,
@@ -419,10 +419,10 @@ pub fn openat_message(req: OpenAtRequest) -> Result<Message, VfsLiteError> {
         None,
         &OpenAtArgs::new(req.dirfd, req.path_ptr, req.flags, req.mode).encode(),
     )
-    .map_err(|_| VfsLiteError::Malformed)
+    .map_err(|_| VfsError::Malformed)
 }
 
-pub fn close_message(req: CloseRequest) -> Result<Message, VfsLiteError> {
+pub fn close_message(req: CloseRequest) -> Result<Message, VfsError> {
     Message::with_header(
         0,
         VFS_OP_CLOSE,
@@ -430,10 +430,10 @@ pub fn close_message(req: CloseRequest) -> Result<Message, VfsLiteError> {
         None,
         &VfsV1Args::new(req.fd, 0, 0, 0).encode(),
     )
-    .map_err(|_| VfsLiteError::Malformed)
+    .map_err(|_| VfsError::Malformed)
 }
 
-pub fn read_message(req: ReadWriteRequest) -> Result<Message, VfsLiteError> {
+pub fn read_message(req: ReadWriteRequest) -> Result<Message, VfsError> {
     Message::with_header(
         0,
         VFS_OP_READ,
@@ -441,10 +441,10 @@ pub fn read_message(req: ReadWriteRequest) -> Result<Message, VfsLiteError> {
         None,
         &ReadWriteArgs::new(req.fd, req.buf_ptr, req.len).encode(),
     )
-    .map_err(|_| VfsLiteError::Malformed)
+    .map_err(|_| VfsError::Malformed)
 }
 
-pub fn write_message(req: ReadWriteRequest) -> Result<Message, VfsLiteError> {
+pub fn write_message(req: ReadWriteRequest) -> Result<Message, VfsError> {
     Message::with_header(
         0,
         VFS_OP_WRITE,
@@ -452,10 +452,10 @@ pub fn write_message(req: ReadWriteRequest) -> Result<Message, VfsLiteError> {
         None,
         &ReadWriteArgs::new(req.fd, req.buf_ptr, req.len).encode(),
     )
-    .map_err(|_| VfsLiteError::Malformed)
+    .map_err(|_| VfsError::Malformed)
 }
 
-pub fn statx_message(req: StatxRequest) -> Result<Message, VfsLiteError> {
+pub fn statx_message(req: StatxRequest) -> Result<Message, VfsError> {
     Message::with_header(
         0,
         VFS_OP_STATX,
@@ -463,18 +463,18 @@ pub fn statx_message(req: StatxRequest) -> Result<Message, VfsLiteError> {
         None,
         &StatxArgs::new(req.dirfd, req.path_ptr, req.flags, req.mask_or_buf).encode(),
     )
-    .map_err(|_| VfsLiteError::Malformed)
+    .map_err(|_| VfsError::Malformed)
 }
 
 pub trait FilesystemService {
     fn service_name(&self) -> &'static str;
-    fn dispatch(&mut self, request: Message) -> Result<Message, VfsLiteError>;
+    fn dispatch(&mut self, request: Message) -> Result<Message, VfsError>;
 }
 
 pub fn dispatch_once<S: FilesystemService>(
     service: &mut S,
     request: Message,
-) -> Result<Message, VfsLiteError> {
+) -> Result<Message, VfsError> {
     service.dispatch(request)
 }
 
@@ -488,7 +488,7 @@ mod tests {
             "dummy"
         }
 
-        fn dispatch(&mut self, request: Message) -> Result<Message, VfsLiteError> {
+        fn dispatch(&mut self, request: Message) -> Result<Message, VfsError> {
             Ok(request)
         }
     }
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_openat_message_encodes_vfs_proto() {
+    fn typed_openat_message_encodes_vfs_abi() {
         let req = OpenAtRequest {
             dirfd: 0,
             path_ptr: 0x1000,
@@ -521,7 +521,7 @@ mod tests {
     fn parser_extracts_openat_fields() {
         let open_req = Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1000, 0x10, 0))
             .expect("open");
-        let parsed = VfsLiteService::<InMemoryBackend>::parse_request(open_req).expect("parse");
+        let parsed = VfsService::<InMemoryBackend>::parse_request(open_req).expect("parse");
         assert_eq!(
             parsed,
             VfsRequest::OpenAt {
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn open_read_close_lifecycle_is_stable() {
-        let mut svc = VfsLiteService::new();
+        let mut svc = VfsService::new();
 
         let open_req =
             Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1000, 0, 0)).expect("open");
@@ -557,16 +557,16 @@ mod tests {
 
     #[test]
     fn deny_all_policy_blocks_open() {
-        let mut svc = VfsLiteService::new();
+        let mut svc = VfsService::new();
         svc.set_policy(MountNamespacePolicy::deny_all());
         let open =
             Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1000, 0, 0)).expect("open");
-        assert_eq!(svc.handle_request(open), Err(VfsLiteError::PermissionDenied));
+        assert_eq!(svc.handle_request(open), Err(VfsError::PermissionDenied));
     }
 
     #[test]
     fn op_sequence_increments_per_successful_request() {
-        let mut svc = VfsLiteService::new();
+        let mut svc = VfsService::new();
         let open =
             Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1000, 0, 0)).expect("open");
         let _ = svc.handle_request(open).expect("open rep");
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn mount_router_routes_by_path_split() {
         let router = MountRouter::new(0x8000, InMemoryBackend::new(), InMemoryBackend::new());
-        let mut svc = VfsLiteService::with_backend(router);
+        let mut svc = VfsService::with_backend(router);
 
         let open_low =
             Message::with_header(0, VFS_OP_OPENAT, 0, None, &pack(0, 0x1000, 0, 0)).expect("open");
@@ -591,16 +591,16 @@ mod tests {
 
     #[test]
     fn read_rejects_unknown_fd() {
-        let mut svc = VfsLiteService::new();
+        let mut svc = VfsService::new();
         let read_req =
             Message::with_header(0, VFS_OP_READ, 0, None, &pack(99, 0, 1, 0)).expect("read");
-        assert_eq!(svc.handle_request(read_req), Err(VfsLiteError::BadFd));
+        assert_eq!(svc.handle_request(read_req), Err(VfsError::BadFd));
     }
 
     #[test]
     fn rejects_unsupported_opcode() {
-        let mut svc = VfsLiteService::new();
+        let mut svc = VfsService::new();
         let req = Message::with_header(0, 0xFFFF, 0, None, &pack(0, 0, 0, 0)).expect("msg");
-        assert_eq!(svc.handle_request(req), Err(VfsLiteError::Unsupported));
+        assert_eq!(svc.handle_request(req), Err(VfsError::Unsupported));
     }
 }

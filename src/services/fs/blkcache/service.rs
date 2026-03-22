@@ -1,5 +1,5 @@
 use crate::kernel::ipc::Message;
-use crate::kernel::vfs::{FilesystemService, VfsLiteError};
+use crate::kernel::vfs::{FilesystemService, VfsError};
 
 const MAX_CACHE_LINES: usize = 16;
 
@@ -210,7 +210,7 @@ impl FilesystemService for BlkCacheService {
         "blkcache"
     }
 
-    fn dispatch(&mut self, request: Message) -> Result<Message, VfsLiteError> {
+    fn dispatch(&mut self, request: Message) -> Result<Message, VfsError> {
         if request.opcode == 1 {
             self.cache.put(1, 1);
         } else if request.opcode == 2 {
@@ -218,7 +218,7 @@ impl FilesystemService for BlkCacheService {
         } else if request.opcode == 3 {
             let _ = self.cache.writeback_tick();
         }
-        Message::with_header(0, request.opcode, 0, None, &[0]).map_err(|_| VfsLiteError::Malformed)
+        Message::with_header(0, request.opcode, 0, None, &[0]).map_err(|_| VfsError::Malformed)
     }
 }
 

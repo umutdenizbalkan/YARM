@@ -1,8 +1,8 @@
 use crate::kernel::bootstrap::{Bootstrap, KernelError};
 use crate::kernel::ipc::Message;
-use crate::kernel::proc_proto::PROC_OP_GETPID;
+use crate::kernel::proc_abi::PROC_OP_GETPID;
 use crate::kernel::trapframe::TrapFrame;
-use crate::kernel::vfs_proto::VFS_OP_OPENAT;
+use crate::kernel::vfs_abi::VFS_OP_OPENAT;
 
 use super::{LINUX_NR_GETPID, LINUX_NR_OPENAT, LinuxServiceBindings, dispatch};
 

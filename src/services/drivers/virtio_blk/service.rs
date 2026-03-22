@@ -1,5 +1,5 @@
 use crate::kernel::ipc::Message;
-use crate::kernel::vfs::{FilesystemService, VfsLiteError};
+use crate::kernel::vfs::{FilesystemService, VfsError};
 
 use super::device::{
     VIRTIO_BLK_OP_READ, VIRTIO_BLK_OP_WRITE, VirtQueue, VirtioBlkDevice, VirtioBlkReqFrame,
@@ -30,11 +30,11 @@ impl VirtioBlkService {
         (self.dev.reads, self.dev.writes)
     }
 
-    fn process_once(&mut self) -> Result<VirtioBlkRespFrame, VfsLiteError> {
+    fn process_once(&mut self) -> Result<VirtioBlkRespFrame, VfsError> {
         let chain = self
             .queue
             .pop_next_chain()
-            .ok_or(VfsLiteError::Unsupported)?;
+            .ok_or(VfsError::Unsupported)?;
         let req = chain.request;
         let io = VirtioBlkRequest {
             sector: req.sector,
@@ -45,7 +45,7 @@ impl VirtioBlkService {
             VIRTIO_BLK_OP_WRITE => self.dev.write(io),
             _ => Err(()),
         }
-        .map_err(|_| VfsLiteError::BadFd)?;
+        .map_err(|_| VfsError::BadFd)?;
 
         let resp = VirtioBlkRespFrame {
             status: 0,
@@ -54,7 +54,7 @@ impl VirtioBlkService {
             tag: req.tag,
         };
         self.queue.push_used(resp);
-        self.queue.take_last_used().ok_or(VfsLiteError::Unsupported)
+        self.queue.take_last_used().ok_or(VfsError::Unsupported)
     }
 }
 
@@ -63,16 +63,16 @@ impl FilesystemService for VirtioBlkService {
         "virtio_blk"
     }
 
-    fn dispatch(&mut self, request: Message) -> Result<Message, VfsLiteError> {
+    fn dispatch(&mut self, request: Message) -> Result<Message, VfsError> {
         let req =
-            VirtioBlkReqFrame::decode(request.as_slice()).map_err(|_| VfsLiteError::Malformed)?;
+            VirtioBlkReqFrame::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
         let chain = VirtqChain::from_request(req);
         self.queue
             .push_chain(chain)
-            .map_err(|_| VfsLiteError::NoFd)?;
+            .map_err(|_| VfsError::NoFd)?;
         let resp = self.process_once()?;
         Message::with_header(0, request.opcode, 0, None, &resp.encode())
-            .map_err(|_| VfsLiteError::Malformed)
+            .map_err(|_| VfsError::Malformed)
     }
 }
 

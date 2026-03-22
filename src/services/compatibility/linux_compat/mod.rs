@@ -2,16 +2,16 @@ use crate::kernel::bootstrap::{KernelError, KernelState};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 #[cfg(test)]
-use crate::kernel::proc_proto::{
+use crate::kernel::proc_abi::{
     PROC_CODEC_V2_VERSION, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args, WaitPidV2Reply,
 };
-use crate::kernel::proc_proto::{
+use crate::kernel::proc_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_SERVER_ABI_VERSION,
 };
 use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
-use crate::kernel::vfs_proto::VFS_CODEC_V1_VERSION;
-use crate::kernel::vfs_proto::{
+use crate::kernel::vfs_abi::VFS_CODEC_V1_VERSION;
+use crate::kernel::vfs_abi::{
     OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1,
     VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL,
     VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,

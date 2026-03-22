@@ -54,7 +54,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::vfs::{VfsBackend, VfsLiteError};
+    use crate::kernel::vfs::{VfsBackend, VfsError};
 
     #[test]
     fn ext4_service_supports_write_stat() {
@@ -98,7 +98,7 @@ mod tests {
         let fd = backend.openat(0x3030).expect("open");
         assert_eq!(
             backend.write(fd, (16 * 1024 * 1024) + 1),
-            Err(VfsLiteError::Unsupported)
+            Err(VfsError::Unsupported)
         );
     }
 }

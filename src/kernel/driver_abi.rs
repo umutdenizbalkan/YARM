@@ -19,7 +19,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn driver_protocol_abi_is_frozen() {
+    fn driver_abi_is_frozen() {
         assert_eq!(DRIVER_SERVER_ABI_VERSION, 1);
         assert_eq!(DRIVER_OP_REGISTER, 1);
         assert_eq!(DRIVER_OP_GRANT_IRQ, 2);

@@ -2,10 +2,10 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 use yarm::kernel::bootstrap::Bootstrap;
 use yarm::kernel::ipc::Message;
-use yarm::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
+use yarm::kernel::proc_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
 use yarm::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use yarm::kernel::vfs::{
-    OpenAtRequest, ReadWriteRequest, VfsLiteService, openat_message, read_message,
+    OpenAtRequest, ReadWriteRequest, VfsService, openat_message, read_message,
 };
 use yarm::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 
@@ -43,7 +43,7 @@ fn run() {
     let wait_rep = proc.handle(wait).expect("wait rep");
     let waited = WaitPidV2Result::decode(wait_rep.as_slice()).expect("waited");
 
-    let mut vfs = VfsLiteService::with_backend(InitramfsBackend::new(4096));
+    let mut vfs = VfsService::with_backend(InitramfsBackend::new(4096));
     let open = openat_message(OpenAtRequest {
         dirfd: 0,
         path_ptr: INITRAMFS_BUSYBOX_PATH_PTR,
