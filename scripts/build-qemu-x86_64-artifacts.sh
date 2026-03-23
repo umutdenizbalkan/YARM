@@ -9,9 +9,10 @@ KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-x86-none}
 SERVER_ELF=${SERVER_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
 KERNEL_RAW_ELF=${KERNEL_RAW_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
-KERNEL_BOOTABLE_IMAGE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-$KERNEL_RAW_ELF}
+KERNEL_BOOTABLE_IMAGE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-busybox.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-x86_64.elf}
+KERNEL_DEBUG_ELF=${KERNEL_DEBUG_ELF:-$OUT_DIR/${KERNEL_BIN}.elf}
 BUSYBOX_BIN=${BUSYBOX_BIN:-}
 ARTIFACTS_STRICT=${ARTIFACTS_STRICT:-0}
 TOOLCHAIN=${TOOLCHAIN:-nightly}
@@ -22,19 +23,52 @@ RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$TOOLCHAIN}
 RUST_SYSROOT=${RUST_SYSROOT:-$(rustup run "${RUSTUP_TOOLCHAIN}" rustc --print sysroot 2>/dev/null || true)}
 RUST_SRC_DIR=${RUST_SRC_DIR:-${RUST_SYSROOT}/lib/rustlib/src/rust}
 
-warn_if_kernel_not_qemu_direct_bootable() {
+is_qemu_direct_bootable_x86_kernel() {
   local kernel="$1"
-  if ! command -v readelf >/dev/null 2>&1; then
-    return 0
+  if [[ ! -f "$kernel" ]]; then
+    return 1
   fi
   local ftype
-  ftype=$(file -b "$kernel" 2>/dev/null || true)
-  if [[ "$ftype" == *"ELF"* ]]; then
-    if ! readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
-      echo "[warn] staged kernel image appears to be plain ELF without PVH note"
-      echo "[hint] qemu -kernel may reject it; provide bzImage or PVH-enabled ELF"
-    fi
+  if command -v file >/dev/null 2>&1; then
+    ftype=$(file -b "$kernel" 2>/dev/null || true)
+  elif command -v readelf >/dev/null 2>&1 && readelf -h "$kernel" >/dev/null 2>&1; then
+    ftype="ELF"
+  else
+    return 1
   fi
+  if [[ "$ftype" != *"ELF"* ]]; then
+    return 0
+  fi
+  if ! command -v readelf >/dev/null 2>&1; then
+    return 1
+  fi
+  if readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
+    return 1
+  fi
+  return 1
+}
+
+explain_nonbootable_kernel_source() {
+  local kernel="$1"
+  if [[ ! -f "$kernel" ]]; then
+    echo "[warn] kernel boot source missing: $kernel"
+    return
+  fi
+  local ftype
+  if command -v file >/dev/null 2>&1; then
+    ftype=$(file -b "$kernel" 2>/dev/null || true)
+  elif command -v readelf >/dev/null 2>&1 && readelf -h "$kernel" >/dev/null 2>&1; then
+    ftype="ELF"
+  else
+    ftype="unknown"
+  fi
+  if [[ "$ftype" == *"ELF"* ]]; then
+    echo "[warn] freestanding ELF kernel is not staged as a qemu -kernel image by default"
+    echo "[hint] the built ${KERNEL_BIN} ELF is a debug artifact, not a verified direct-boot kernel for qemu-system-x86_64"
+    echo "[hint] provide a known bootable x86_64 kernel image via KERNEL_BOOTABLE_IMAGE_SOURCE=<path> (for example a Linux bzImage or other verified direct-boot image)"
+    return
+  fi
+  echo "[warn] kernel boot source does not look like a verified qemu -kernel artifact: $kernel"
 }
 
 
@@ -70,6 +104,10 @@ if [[ "$BUILD_OK" -eq 1 && -f "$SERVER_ELF" ]]; then
 else
   echo "[warn] compile for ${SERVER_BIN} failed or output missing (${SERVER_ELF})"
   [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+fi
+
+if [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
+  cp "$KERNEL_RAW_ELF" "$KERNEL_DEBUG_ELF"
 fi
 
 if [[ -n "$BUSYBOX_BIN" && -x "$BUSYBOX_BIN" ]]; then
@@ -115,23 +153,37 @@ else
   [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
 fi
 
-if [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_BOOTABLE_IMAGE_SOURCE" ]]; then
-  cp "$KERNEL_BOOTABLE_IMAGE_SOURCE" "$KERNEL_IMAGE"
-elif [[ ! -f "$KERNEL_IMAGE" && -f "$KERNEL_BOOTABLE_IMAGE_SOURCE" ]]; then
-  cp "$KERNEL_BOOTABLE_IMAGE_SOURCE" "$KERNEL_IMAGE"
+BOOTABLE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-}
+if [[ -z "$BOOTABLE_SOURCE" && -f "$KERNEL_IMAGE" ]]; then
+  BOOTABLE_SOURCE="$KERNEL_IMAGE"
+fi
+
+if [[ -n "$BOOTABLE_SOURCE" && -f "$BOOTABLE_SOURCE" ]] && is_qemu_direct_bootable_x86_kernel "$BOOTABLE_SOURCE"; then
+  if [[ "$BOOTABLE_SOURCE" != "$KERNEL_IMAGE" ]]; then
+    cp "$BOOTABLE_SOURCE" "$KERNEL_IMAGE"
+  fi
+elif [[ -n "$BOOTABLE_SOURCE" && -f "$BOOTABLE_SOURCE" ]]; then
+  rm -f "$KERNEL_IMAGE"
+  explain_nonbootable_kernel_source "$BOOTABLE_SOURCE"
+elif [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
+  rm -f "$KERNEL_IMAGE"
+  explain_nonbootable_kernel_source "$KERNEL_RAW_ELF"
 else
-  echo "[warn] compile for bootable kernel image failed or output missing (${KERNEL_BOOTABLE_IMAGE_SOURCE})"
+  echo "[warn] compile for bootable kernel image failed or output missing (${KERNEL_BOOTABLE_IMAGE_SOURCE:-unset})"
   [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
 fi
 
 if [[ -f "$KERNEL_IMAGE" ]]; then
   echo "[ok] kernel image: $KERNEL_IMAGE"
-  warn_if_kernel_not_qemu_direct_bootable "$KERNEL_IMAGE"
 else
   echo "[warn] kernel image missing: $KERNEL_IMAGE"
   echo "[hint] the first blocker is a direct-bootable x86 kernel artifact; the generated initramfs shell flow is staged as the second milestone"
   echo "[hint] provide a bootable x86_64 kernel image via KERNEL_BOOTABLE_IMAGE_SOURCE=<path> or KERNEL_IMAGE=<path>"
   [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+fi
+
+if [[ -f "$KERNEL_DEBUG_ELF" ]]; then
+  echo "[info] freestanding kernel ELF (debug artifact): $KERNEL_DEBUG_ELF"
 fi
 
 echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"

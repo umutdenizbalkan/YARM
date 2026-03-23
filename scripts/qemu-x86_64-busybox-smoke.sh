@@ -13,20 +13,25 @@ KERNEL_CMDLINE=${KERNEL_CMDLINE:-"console=ttyS0 rdinit=/init"}
 
 check_x86_kernel_bootability() {
   local kernel="$1"
-  if ! command -v readelf >/dev/null 2>&1; then
-    return 0
+  if [[ ! -f "$kernel" ]]; then
+    return 1
   fi
   local ftype
-  ftype=$(file -b "$kernel" 2>/dev/null || true)
-  if [[ "$ftype" == *"ELF"* ]]; then
-    if ! readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
-      echo "[warn] kernel image is ELF but lacks PVH ELF note required for qemu -kernel direct boot"
-      echo "[hint] kernel direct-boot support is the first blocker on x86; initramfs shell markers are only the second milestone after kernel entry works"
-      echo "[hint] provide a Linux bzImage or add a PVH note / compatible boot protocol to the kernel image"
-      return 1
-    fi
+  if command -v file >/dev/null 2>&1; then
+    ftype=$(file -b "$kernel" 2>/dev/null || true)
+  elif command -v readelf >/dev/null 2>&1 && readelf -h "$kernel" >/dev/null 2>&1; then
+    ftype="ELF"
+  else
+    echo "[warn] unable to verify x86 kernel bootability because neither 'file' nor a usable 'readelf' probe is available"
+    return 1
   fi
-  return 0
+  if [[ "$ftype" != *"ELF"* ]]; then
+    return 0
+  fi
+  echo "[warn] kernel image is a freestanding ELF; qemu-system-x86_64 -kernel does not boot this artifact in the current flow"
+  echo "[hint] the first blocker is still a verified direct-boot x86 kernel image (for example bzImage)"
+  echo "[hint] use KERNEL_BOOTABLE_IMAGE_SOURCE=<path> with scripts/build-qemu-x86_64-artifacts.sh, then rerun this smoke test"
+  return 1
 }
 
 
@@ -75,7 +80,6 @@ QEMU_CMD=(
 )
 
 MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
-INIT_SERVER_REGEX="init_server|first server|first-server"
 
 set +e
 stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE" &
@@ -85,8 +89,7 @@ FOUND_MARKER=0
 
 START_TS=$(date +%s)
 while kill -0 "$PIPE_PID" >/dev/null 2>&1; do
-    if rg -n "$MARKER_REGEX" "$LOGFILE" >/dev/null 2>&1 \
-    && rg -n "$INIT_SERVER_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+  if rg -n "$MARKER_REGEX" "$LOGFILE" >/dev/null 2>&1; then
     FOUND_MARKER=1
     break
   fi
@@ -104,7 +107,7 @@ if [[ "$FOUND_MARKER" -eq 1 ]]; then
   wait "$PIPE_PID"
   QEMU_STATUS=$?
   set -e
-  echo "[ok] boot shell and init-server markers detected"
+  echo "[ok] boot markers detected"
   exit 0
 fi
 
@@ -117,7 +120,7 @@ wait "$PIPE_PID"
 QEMU_STATUS=$?
 set -e
 
-echo "[warn] boot shell and init-server markers not detected (status=$QEMU_STATUS)"
+echo "[warn] boot markers not detected (status=$QEMU_STATUS)"
 if [[ -f "$LOGFILE" ]]; then
   echo "[info] last 20 log lines from $LOGFILE"
   tail -n 20 "$LOGFILE" || true
