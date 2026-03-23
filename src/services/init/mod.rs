@@ -4,6 +4,7 @@ mod policy;
 
 use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use crate::kernel::capabilities::{CapId, CapRights};
+use crate::kernel::supervisor_abi::TaskExitedEvent;
 use crate::kernel::task::TaskClass;
 use crate::kernel::vm::Asid;
 
@@ -328,8 +329,8 @@ impl InitService {
         kernel: &mut KernelState,
     ) -> Result<(), KernelError> {
         use crate::kernel::supervisor_abi::{
-            CoreServiceRegistrationKind, DEP_VFS, RegisterCoreServiceRequest,
-            register_core_service_message,
+            register_core_service_message, CoreServiceRegistrationKind, RegisterCoreServiceRequest,
+            DEP_VFS,
         };
 
         let handoff = self.fault_handoff.ok_or(KernelError::WrongObject)?;
@@ -375,6 +376,14 @@ impl InitService {
             kernel.ipc_send(handoff.supervisor_control_send_cap, msg)?;
         }
         Ok(())
+    }
+
+    pub fn restore_supervisor_control_plane(
+        &self,
+        kernel: &mut KernelState,
+    ) -> Result<usize, KernelError> {
+        self.seed_supervisor_registrations(kernel)?;
+        Ok(3)
     }
 
     pub fn poll_init_alert(
@@ -429,7 +438,15 @@ impl InitService {
         kernel.restart_task(supervisor_tid, restart_token)?;
         self.supervisor_restart_count = self.supervisor_restart_count.saturating_add(1);
         if let Some(handoff) = self.fault_handoff {
+            if let Some(msg) = kernel.try_ipc_recv(handoff.supervisor_fault_recv_cap)? {
+                let event =
+                    TaskExitedEvent::decode(msg.as_slice()).ok_or(KernelError::WrongObject)?;
+                if event.tid != supervisor_tid {
+                    return Err(KernelError::WrongObject);
+                }
+            }
             kernel.set_supervisor_endpoint(handoff.supervisor_fault_recv_cap)?;
+            let _ = self.restore_supervisor_control_plane(kernel)?;
             let msg = crate::kernel::supervisor_abi::init_alert_message(
                 self.handles.init_tid.unwrap_or(0),
                 crate::kernel::supervisor_abi::InitAlert {
@@ -740,13 +757,68 @@ mod tests {
             .expect("seed");
         init.begin_running(&state).expect("running");
         let token = state.exit_task(4, 99).expect("exit");
-        assert!(
-            init.recover_supervisor_failure(&mut state, token)
-                .expect("recover")
-        );
+        assert!(init
+            .recover_supervisor_failure(&mut state, token)
+            .expect("recover"));
         assert_eq!(
             state.task_status(4),
             Some(crate::kernel::task::TaskStatus::Runnable)
+        );
+    }
+
+    #[test]
+    fn recovering_supervisor_reseeds_control_plane_requests() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitService::new();
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut state, graph)
+            .expect("register");
+        init.launch_core_services(
+            &mut state,
+            CoreServiceImagePlan {
+                process_manager_entry: 0x8000,
+                vfs_entry: 0x9000,
+                supervisor_entry: 0xA000,
+            },
+        )
+        .expect("launch");
+        let handoff = init
+            .install_fault_handoff(&mut state, 100)
+            .expect("handoff");
+        init.seed_supervisor_registrations(&mut state)
+            .expect("seed");
+        let token = state.exit_task(4, 99).expect("exit");
+        init.recover_supervisor_failure(&mut state, token)
+            .expect("recover");
+
+        let first = state
+            .try_ipc_recv(handoff.supervisor_control_recv_cap)
+            .expect("recv")
+            .expect("first");
+        let second = state
+            .try_ipc_recv(handoff.supervisor_control_recv_cap)
+            .expect("recv")
+            .expect("second");
+        let third = state
+            .try_ipc_recv(handoff.supervisor_control_recv_cap)
+            .expect("recv")
+            .expect("third");
+        assert_eq!(
+            first.opcode,
+            crate::kernel::supervisor_abi::SUPERVISOR_OP_REGISTER_CORE_SERVICE
+        );
+        assert_eq!(
+            second.opcode,
+            crate::kernel::supervisor_abi::SUPERVISOR_OP_REGISTER_CORE_SERVICE
+        );
+        assert_eq!(
+            third.opcode,
+            crate::kernel::supervisor_abi::SUPERVISOR_OP_REGISTER_CORE_SERVICE
         );
     }
 

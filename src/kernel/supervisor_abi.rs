@@ -364,23 +364,39 @@ pub struct SupervisorStatusReply {
     pub pending_redelegation: bool,
     pub restart_attempts: u8,
     pub restart_group: u8,
+    pub max_restarts: u8,
+    pub restart_owner: u8,
+    pub last_exit_code: u64,
+    pub last_exit_tick: u64,
+    pub pending_restart_due: u64,
+    pub last_restart_tick: u64,
 }
 
 impl SupervisorStatusReply {
-    pub const ENCODED_LEN: usize = 16;
+    pub const ENCODED_LEN: usize = 48;
 
     pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
         let tid = self.tid.to_le_bytes();
+        let last_exit_code = self.last_exit_code.to_le_bytes();
+        let last_exit_tick = self.last_exit_tick.to_le_bytes();
+        let pending_restart_due = self.pending_restart_due.to_le_bytes();
+        let last_restart_tick = self.last_restart_tick.to_le_bytes();
         let mut i = 0;
         while i < 8 {
             out[i] = tid[i];
+            out[16 + i] = last_exit_code[i];
+            out[24 + i] = last_exit_tick[i];
+            out[32 + i] = pending_restart_due[i];
+            out[40 + i] = last_restart_tick[i];
             i += 1;
         }
         out[8] = self.degraded as u8;
         out[9] = self.pending_redelegation as u8;
         out[10] = self.restart_attempts;
         out[11] = self.restart_group;
+        out[12] = self.max_restarts;
+        out[13] = self.restart_owner;
         out
     }
 
@@ -389,13 +405,27 @@ impl SupervisorStatusReply {
             return None;
         }
         let mut tid = [0u8; 8];
+        let mut last_exit_code = [0u8; 8];
+        let mut last_exit_tick = [0u8; 8];
+        let mut pending_restart_due = [0u8; 8];
+        let mut last_restart_tick = [0u8; 8];
         tid.copy_from_slice(&payload[..8]);
+        last_exit_code.copy_from_slice(&payload[16..24]);
+        last_exit_tick.copy_from_slice(&payload[24..32]);
+        pending_restart_due.copy_from_slice(&payload[32..40]);
+        last_restart_tick.copy_from_slice(&payload[40..48]);
         Some(Self {
             tid: u64::from_le_bytes(tid),
             degraded: payload[8] != 0,
             pending_redelegation: payload[9] != 0,
             restart_attempts: payload[10],
             restart_group: payload[11],
+            max_restarts: payload[12],
+            restart_owner: payload[13],
+            last_exit_code: u64::from_le_bytes(last_exit_code),
+            last_exit_tick: u64::from_le_bytes(last_exit_tick),
+            pending_restart_due: u64::from_le_bytes(pending_restart_due),
+            last_restart_tick: u64::from_le_bytes(last_restart_tick),
         })
     }
 }

@@ -27,11 +27,18 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ## Immediate next steps (review-driven)
 
-1. Add supervisor-first launch-order option in `InitService` for faster recovery-manager readiness during early boot faults.
-2. Publish a restart-ownership matrix for `init.srv` vs `supervisor.srv` (who restarts `vfs/process_manager/drivers`, and fallback when supervisor fails).
-3. Convert all thin `src/bin/*_srv.rs` stubs to call real service entrypoints with explicit typed request loops (one service family per PR).
-4. Add deterministic fault-injection tests for each service family (`control_plane`, `drivers`, `fs`, `network`, `ui`) and wire them to `compat-gates`.
-5. Gate phase advancement on runnable profile evidence (QEMU smoke marker + deterministic sim + codec compatibility vectors).
+1. Convert all thin `src/bin/*_srv.rs` stubs to call real service entrypoints with explicit typed request loops (one service family per PR).
+2. Add deterministic fault-injection tests for each service family (`control_plane`, `drivers`, `fs`, `network`, `ui`) and wire them to `compat-gates`.
+3. Gate phase advancement on runnable profile evidence (QEMU smoke marker + deterministic sim + codec compatibility vectors).
+
+## Restart ownership matrix
+
+| Service | Primary restart owner | Fallback / recovery path |
+| --- | --- | --- |
+| `process_manager.srv` | `supervisor.srv` | mark degraded and alert `init.srv` if restart budget is exhausted |
+| `vfs.srv` | `supervisor.srv` | mark degraded and alert `init.srv` if restart budget is exhausted |
+| driver servers | `supervisor.srv` | redelegate bundle automatically when recovery plan is known; otherwise alert `init.srv` for manual redelegation |
+| `supervisor.srv` | `init.srv` | restart supervisor, replay core registrations, and rebind fault handoff |
 
 ## Phase 0 — Stabilize Core Control Plane ✅
 

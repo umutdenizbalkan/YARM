@@ -36,6 +36,7 @@ These IDs are registered by `InitService::register_core_graph` and assigned serv
 
 - Tasks for all core services are registered.
 - Fault/restart handoff is installed and bound to `supervisor_tid`.
+- Supervisor control-plane registration requests are seeded before `Running` and replayed if `supervisor.srv` is restarted by `init.srv`.
 - Service roles are assigned:
   - `Init`
   - `ProcessManager`
@@ -51,3 +52,4 @@ These IDs are registered by `InitService::register_core_graph` and assigned serv
 - This is a mechanism-level scaffold in `src/services/init/mod.rs` and `src/bin/init_server.rs`.
 - Launch ordering now routes through `launch_core_services` with explicit core image plan and failure transition support (`mark_failed`).
 - Restart/fault policy handoff is now represented by `InitFaultHandoff` and must be installed before `Running`.
+- Supervisor recovery includes replaying core-service registration requests so a fresh `supervisor.srv` instance can rebuild its managed-service table.
