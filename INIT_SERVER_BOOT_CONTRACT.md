@@ -1,6 +1,6 @@
-# init.srv Boot Contract (Scaffold v1)
+# init.srv Boot Contract (Checked core-profile contract)
 
-This document defines the initial boot orchestration contract for `init.srv` in the core profile.
+This document defines the checked boot orchestration contract for `init.srv` in the core profile.
 
 ## Scope
 
@@ -47,9 +47,18 @@ These IDs are registered by `InitService::register_core_graph` and assigned serv
   - `init -> vfs`
   - `init -> supervisor`
 
+## Checked contract requirements
+
+- `InitService::validate_boot_contract()` must succeed before entering `Running`.
+- The minimum core graph (`process_manager`, `vfs`, `supervisor`) must have registered task identities.
+- Fault handoff and delegation edges must be installed and validated.
+- The configured mount plan must complete through service-backed mount activity before `Running`.
+- Supervisor replay state must be populated from seeded control-plane registrations.
+
 ## Notes
 
-- This is a mechanism-level scaffold in `src/services/init/mod.rs`; the runtime init entrypoint in `src/services/control_plane/init/service.rs` now accepts an externally prepared `KernelState` plus `InitRuntimeBootConfig`, so boot/runtime wiring no longer has to be hardcoded to `Bootstrap::init()`.
-- Launch ordering now routes through `launch_core_services` with explicit core image plan and failure transition support (`mark_failed`).
-- Restart/fault policy handoff is now represented by `InitFaultHandoff` and must be installed before `Running`.
-- Supervisor recovery includes replaying core-service registration requests so a fresh `supervisor.srv` instance can rebuild its managed-service table.
+- The runtime init entrypoint in `src/services/control_plane/init/service.rs` accepts an externally prepared `KernelState` plus `InitRuntimeBootConfig`, so boot/runtime wiring no longer has to be hardcoded to `Bootstrap::init()`.
+- Launch ordering routes through `launch_core_services` with explicit core image plan and failure transition support (`mark_failed`).
+- Restart/fault policy handoff is represented by `InitFaultHandoff` and must be installed before `Running`.
+- Mount orchestration now executes real service-backed mount activity for the configured mount plan instead of only counting deterministic placeholders.
+- Supervisor recovery includes replaying core-service registration requests so a fresh `supervisor.srv` instance can rebuild its managed-service table, while init also exposes generic core-service recovery helpers for the core graph.

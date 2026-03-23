@@ -4,12 +4,21 @@ mod policy;
 
 use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use crate::kernel::capabilities::{CapId, CapRights};
+use crate::kernel::task::TaskStatus;
 use crate::kernel::supervisor_abi::{
     RegisterCoreServiceRequest, RegisterDriverRequest, TaskExitedEvent,
     register_core_service_message, register_driver_message,
 };
 use crate::kernel::task::TaskClass;
+use crate::kernel::vfs::{OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message};
 use crate::kernel::vm::Asid;
+use crate::services::fs::devfs::service::run_request_loop as run_devfs_request_loop;
+use crate::services::fs::devfs::{DevFsBackend, DevFsService};
+use crate::services::fs::ext4::{Ext4Backend, Ext4Service};
+use crate::services::fs::fat::{FatBackend, FatService};
+use crate::services::fs::initramfs::service::run_request_loop as run_initramfs_request_loop;
+use crate::services::fs::initramfs::{InitramfsBackend, InitramfsService};
+use crate::services::fs::ramfs::{RamFsBackend, RamFsService};
 
 pub use launch::{CoreLaunchReport, CoreServiceGraph, CoreServiceHandles, CoreServiceImagePlan};
 pub use mount::{MountPlan, MountRecoveryReport, MountServiceKind};
@@ -30,6 +39,8 @@ pub struct InitService {
     launch_count: usize,
     mount_plan: MountPlan,
     mount_status: Option<MountRecoveryReport>,
+    process_manager_restart_count: u8,
+    vfs_restart_count: u8,
     supervisor_restart_count: u8,
     supervisor_replay_log: [Option<SupervisorReplayEntry>; 16],
 }
@@ -64,6 +75,8 @@ impl InitService {
             launch_count: 0,
             mount_plan: MountPlan::baseline(),
             mount_status: None,
+            process_manager_restart_count: 0,
+            vfs_restart_count: 0,
             supervisor_restart_count: 0,
             supervisor_replay_log: [None; 16],
         }
@@ -116,6 +129,14 @@ impl InitService {
         self.mount_status
     }
 
+    pub const fn restart_counts(&self) -> (u8, u8, u8) {
+        (
+            self.process_manager_restart_count,
+            self.vfs_restart_count,
+            self.supervisor_restart_count,
+        )
+    }
+
     pub fn set_mount_plan(&mut self, plan: MountPlan) -> Result<(), KernelError> {
         if plan.count == 0 || plan.count > plan.order.len() {
             return Err(KernelError::WrongObject);
@@ -157,13 +178,15 @@ impl InitService {
         for idx in 0..self.mount_plan.count {
             if fail_at == Some(idx) {
                 if self.mount_plan.allow_fallback_to_fat {
+                    run_mount_service(MountServiceKind::Fat)?;
                     recovered = true;
                     mounted = mounted.saturating_add(1);
                     break;
                 }
                 return Err(KernelError::WrongObject);
             }
-            if self.mount_plan.order[idx].is_some() {
+            if let Some(kind) = self.mount_plan.order[idx] {
+                run_mount_service(kind)?;
                 mounted = mounted.saturating_add(1);
             }
         }
@@ -480,22 +503,8 @@ impl InitService {
     }
 
     pub fn monitor_supervisor(&mut self, kernel: &mut KernelState) -> Result<bool, KernelError> {
-        let supervisor_tid = self
-            .handles
-            .supervisor_tid
-            .ok_or(KernelError::WrongObject)?;
-        if kernel.task_status(supervisor_tid) != Some(crate::kernel::task::TaskStatus::Exited(99))
-            && !matches!(
-                kernel.task_status(supervisor_tid),
-                Some(crate::kernel::task::TaskStatus::Exited(_))
-            )
-        {
-            return Ok(false);
-        }
-        let token = kernel
-            .task_restart_token(supervisor_tid)
-            .ok_or(KernelError::WrongObject)?;
-        self.recover_supervisor_failure(kernel, token)
+        let supervisor_tid = self.handles.supervisor_tid.ok_or(KernelError::WrongObject)?;
+        self.monitor_core_service(kernel, supervisor_tid)
     }
 
     pub fn recover_supervisor_failure(
@@ -503,46 +512,180 @@ impl InitService {
         kernel: &mut KernelState,
         restart_token: u64,
     ) -> Result<bool, KernelError> {
-        let supervisor_tid = self
-            .handles
-            .supervisor_tid
-            .ok_or(KernelError::WrongObject)?;
-        let policy = self
-            .restart_policies
-            .policy_for(CoreServiceKind::Supervisor);
-        if self.supervisor_restart_count >= policy.max_restarts {
-            kernel.mark_task_dead(supervisor_tid)?;
-            self.mark_failed();
-            return Ok(false);
-        }
-        kernel.restart_task(supervisor_tid, restart_token)?;
-        self.supervisor_restart_count = self.supervisor_restart_count.saturating_add(1);
-        if let Some(handoff) = self.fault_handoff {
-            if let Some(msg) = kernel.try_ipc_recv(handoff.supervisor_fault_recv_cap)? {
-                let event =
-                    TaskExitedEvent::decode(msg.as_slice()).ok_or(KernelError::WrongObject)?;
-                if event.tid != supervisor_tid {
-                    return Err(KernelError::WrongObject);
-                }
-            }
-            kernel.set_supervisor_endpoint(handoff.supervisor_fault_recv_cap)?;
-            self.clear_supervisor_control_queue(kernel)?;
-            let _ = self.restore_supervisor_control_plane(kernel)?;
-            let msg = crate::kernel::supervisor_abi::init_alert_message(
-                self.handles.init_tid.unwrap_or(0),
-                crate::kernel::supervisor_abi::InitAlert {
-                    tid: supervisor_tid,
-                    kind: crate::kernel::supervisor_abi::InitAlertKind::SupervisorRestarted,
-                },
-            )
-            .map_err(|_| KernelError::WrongObject)?;
-            kernel.ipc_send(handoff.init_alert_send_cap, msg)?;
-        }
-        Ok(true)
+        self.recover_core_service_failure(kernel, CoreServiceKind::Supervisor, restart_token)
     }
 
     pub fn mark_failed(&mut self) {
         self.phase = InitBootPhase::Failed;
+    }
+
+    fn core_service_kind_for_tid(&self, tid: u64) -> Option<CoreServiceKind> {
+        if self.handles.process_manager_tid == Some(tid) {
+            Some(CoreServiceKind::ProcessManager)
+        } else if self.handles.vfs_tid == Some(tid) {
+            Some(CoreServiceKind::Vfs)
+        } else if self.handles.supervisor_tid == Some(tid) {
+            Some(CoreServiceKind::Supervisor)
+        } else {
+            None
+        }
+    }
+
+    fn core_service_tid(&self, kind: CoreServiceKind) -> Option<u64> {
+        match kind {
+            CoreServiceKind::ProcessManager => self.handles.process_manager_tid,
+            CoreServiceKind::Vfs => self.handles.vfs_tid,
+            CoreServiceKind::Supervisor => self.handles.supervisor_tid,
+        }
+    }
+
+    fn restart_count_for(&self, kind: CoreServiceKind) -> u8 {
+        match kind {
+            CoreServiceKind::ProcessManager => self.process_manager_restart_count,
+            CoreServiceKind::Vfs => self.vfs_restart_count,
+            CoreServiceKind::Supervisor => self.supervisor_restart_count,
+        }
+    }
+
+    fn increment_restart_count(&mut self, kind: CoreServiceKind) {
+        match kind {
+            CoreServiceKind::ProcessManager => {
+                self.process_manager_restart_count =
+                    self.process_manager_restart_count.saturating_add(1)
+            }
+            CoreServiceKind::Vfs => {
+                self.vfs_restart_count = self.vfs_restart_count.saturating_add(1)
+            }
+            CoreServiceKind::Supervisor => {
+                self.supervisor_restart_count = self.supervisor_restart_count.saturating_add(1)
+            }
+        }
+    }
+
+    pub fn recover_core_service_failure(
+        &mut self,
+        kernel: &mut KernelState,
+        kind: CoreServiceKind,
+        restart_token: u64,
+    ) -> Result<bool, KernelError> {
+        let tid = self.core_service_tid(kind).ok_or(KernelError::WrongObject)?;
+        let policy = self.restart_policies.policy_for(kind);
+        if self.restart_count_for(kind) >= policy.max_restarts {
+            kernel.mark_task_dead(tid)?;
+            self.mark_failed();
+            return Ok(false);
+        }
+        kernel.restart_task(tid, restart_token)?;
+        self.increment_restart_count(kind);
+        if matches!(kind, CoreServiceKind::Supervisor) {
+            if let Some(handoff) = self.fault_handoff {
+                if let Some(msg) = kernel.try_ipc_recv(handoff.supervisor_fault_recv_cap)? {
+                    let event =
+                        TaskExitedEvent::decode(msg.as_slice()).ok_or(KernelError::WrongObject)?;
+                    if event.tid != tid {
+                        return Err(KernelError::WrongObject);
+                    }
+                }
+                kernel.set_supervisor_endpoint(handoff.supervisor_fault_recv_cap)?;
+                self.clear_supervisor_control_queue(kernel)?;
+                let _ = self.restore_supervisor_control_plane(kernel)?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn recover_core_service_failure_by_tid(
+        &mut self,
+        kernel: &mut KernelState,
+        tid: u64,
+        restart_token: u64,
+    ) -> Result<bool, KernelError> {
+        let kind = self
+            .core_service_kind_for_tid(tid)
+            .ok_or(KernelError::WrongObject)?;
+        self.recover_core_service_failure(kernel, kind, restart_token)
+    }
+
+    pub fn handle_init_alert(
+        &mut self,
+        kernel: &mut KernelState,
+        alert: crate::kernel::supervisor_abi::InitAlert,
+    ) -> Result<bool, KernelError> {
+        match alert.kind {
+            crate::kernel::supervisor_abi::InitAlertKind::CoreServiceRestartRequired
+            | crate::kernel::supervisor_abi::InitAlertKind::SupervisorRestarted => {
+                let token = kernel
+                    .task_restart_token(alert.tid)
+                    .ok_or(KernelError::WrongObject)?;
+                self.recover_core_service_failure_by_tid(kernel, alert.tid, token)
+            }
+            crate::kernel::supervisor_abi::InitAlertKind::ServiceDegraded => {
+                self.mark_failed();
+                Ok(false)
+            }
+            crate::kernel::supervisor_abi::InitAlertKind::RedelegationRequired => Ok(false),
+        }
+    }
+
+    pub fn monitor_core_service(
+        &mut self,
+        kernel: &mut KernelState,
+        tid: u64,
+    ) -> Result<bool, KernelError> {
+        if !matches!(kernel.task_status(tid), Some(TaskStatus::Exited(_))) {
+            return Ok(false);
+        }
+        let token = kernel.task_restart_token(tid).ok_or(KernelError::WrongObject)?;
+        self.recover_core_service_failure_by_tid(kernel, tid, token)
+    }
+
+    pub fn monitor_core_failures(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
+        let mut recovered = 0usize;
+        while let Some(alert) = self.poll_init_alert(kernel)? {
+            if self.handle_init_alert(kernel, alert)? {
+                recovered += 1;
+            }
+        }
+        for kind in [
+            CoreServiceKind::ProcessManager,
+            CoreServiceKind::Vfs,
+            CoreServiceKind::Supervisor,
+        ] {
+            if CoreServicePolicyTable::restart_owner_for(kind) != RestartOwner::Init {
+                continue;
+            }
+            let Some(tid) = self.core_service_tid(kind) else {
+                continue;
+            };
+            if self.monitor_core_service(kernel, tid)? {
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
+
+    pub fn validate_boot_contract(&self, kernel: &KernelState) -> Result<(), KernelError> {
+        let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
+        let process_manager_tid = self
+            .handles
+            .process_manager_tid
+            .ok_or(KernelError::WrongObject)?;
+        let vfs_tid = self.handles.vfs_tid.ok_or(KernelError::WrongObject)?;
+        let supervisor_tid = self
+            .handles
+            .supervisor_tid
+            .ok_or(KernelError::WrongObject)?;
+        let _ = init_tid;
+        if self.mount_status.is_none() || self.fault_handoff.is_none() {
+            return Err(KernelError::WrongObject);
+        }
+        self.validate_delegation_edges(kernel)?;
+        for tid in [process_manager_tid, vfs_tid, supervisor_tid] {
+            if kernel.task_status(tid).is_none() {
+                return Err(KernelError::TaskMissing);
+            }
+        }
+        Ok(())
     }
 
     pub fn begin_running(&mut self, kernel: &KernelState) -> Result<(), KernelError> {
@@ -552,10 +695,94 @@ impl InitService {
         {
             return Err(KernelError::WrongObject);
         }
-        self.validate_delegation_edges(kernel)?;
+        self.validate_boot_contract(kernel)?;
         self.phase = InitBootPhase::Running;
         Ok(())
     }
+}
+
+fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
+    match kind {
+        MountServiceKind::Initramfs => {
+            let mut service = InitramfsService::with_backend(InitramfsBackend::new(4096));
+            let summary = run_initramfs_request_loop(&mut service).map_err(|_| KernelError::WrongObject)?;
+            if summary.write_allowed {
+                return Err(KernelError::WrongObject);
+            }
+        }
+        MountServiceKind::RamFs => {
+            let mut service = RamFsService::with_backend(RamFsBackend::new());
+            run_rw_mount_cycle(
+                &mut service,
+                0xA100,
+                64,
+            )?;
+        }
+        MountServiceKind::DevFs => {
+            let mut service = DevFsService::with_backend(DevFsBackend::default());
+            let _ = run_devfs_request_loop(&mut service).map_err(|_| KernelError::WrongObject)?;
+        }
+        MountServiceKind::Ext4 => {
+            let mut service = Ext4Service::with_backend(Ext4Backend::new());
+            run_rw_mount_cycle(&mut service, 0x4040, 4096)?;
+        }
+        MountServiceKind::Fat => {
+            let mut service = FatService::with_backend(FatBackend::new());
+            let open = openat_message(OpenAtRequest {
+                dirfd: 0,
+                path_ptr: 0x5050,
+                flags: 0,
+                mode: 0,
+            })
+            .map_err(|_| KernelError::WrongObject)?;
+            let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
+            let mut fd_bytes = [0u8; 8];
+            fd_bytes.copy_from_slice(open_reply.as_slice());
+            let fd = u64::from_le_bytes(fd_bytes);
+            let write = write_message(ReadWriteRequest {
+                fd,
+                buf_ptr: 0,
+                len: 33,
+            })
+            .map_err(|_| KernelError::WrongObject)?;
+            service.handle(write).map_err(|_| KernelError::WrongObject)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_rw_mount_cycle<B: crate::kernel::vfs::VfsBackend>(
+    service: &mut crate::services::common::service::FsService<B>,
+    path_ptr: u64,
+    write_len: u64,
+) -> Result<(), KernelError> {
+    let open = openat_message(OpenAtRequest {
+        dirfd: 0,
+        path_ptr,
+        flags: 0,
+        mode: 0,
+    })
+    .map_err(|_| KernelError::WrongObject)?;
+    let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
+    let mut fd_bytes = [0u8; 8];
+    fd_bytes.copy_from_slice(open_reply.as_slice());
+    let fd = u64::from_le_bytes(fd_bytes);
+    let write = write_message(ReadWriteRequest {
+        fd,
+        buf_ptr: 0,
+        len: write_len,
+    })
+    .map_err(|_| KernelError::WrongObject)?;
+    service.handle(write).map_err(|_| KernelError::WrongObject)?;
+    let stat = statx_message(StatxRequest {
+        dirfd: 0,
+        path_ptr,
+        flags: 0,
+        mask_or_buf: 0,
+    })
+    .map_err(|_| KernelError::WrongObject)?;
+    service.handle(stat).map_err(|_| KernelError::WrongObject)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -844,6 +1071,83 @@ mod tests {
         );
         assert_eq!(
             state.task_status(4),
+            Some(crate::kernel::task::TaskStatus::Runnable)
+        );
+    }
+
+    #[test]
+    fn init_recovers_process_manager_failure_within_budget() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitService::new();
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut state, graph)
+            .expect("register");
+        init.launch_core_services(
+            &mut state,
+            CoreServiceImagePlan {
+                process_manager_entry: 0x8000,
+                vfs_entry: 0x9000,
+                supervisor_entry: 0xA000,
+            },
+        )
+        .expect("launch");
+        let _handoff = init
+            .install_fault_handoff(&mut state, 100)
+            .expect("handoff");
+        init.seed_supervisor_registrations(&mut state)
+            .expect("seed");
+        init.begin_running(&state).expect("running");
+        let token = state.exit_task(2, 44).expect("exit");
+        assert!(
+            init.recover_core_service_failure(&mut state, CoreServiceKind::ProcessManager, token)
+                .expect("recover")
+        );
+        assert_eq!(
+            state.task_status(2),
+            Some(crate::kernel::task::TaskStatus::Runnable)
+        );
+    }
+
+    #[test]
+    fn init_recovers_vfs_failure_with_generic_core_helper() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitService::new();
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut state, graph)
+            .expect("register");
+        init.launch_core_services(
+            &mut state,
+            CoreServiceImagePlan {
+                process_manager_entry: 0x8000,
+                vfs_entry: 0x9000,
+                supervisor_entry: 0xA000,
+            },
+        )
+        .expect("launch");
+        let handoff = init
+            .install_fault_handoff(&mut state, 100)
+            .expect("handoff");
+        init.seed_supervisor_registrations(&mut state)
+            .expect("seed");
+        init.begin_running(&state).expect("running");
+        let _ = handoff;
+        let token = state.exit_task(3, 12).expect("exit");
+        assert!(
+            init.recover_core_service_failure(&mut state, CoreServiceKind::Vfs, token)
+                .expect("recover")
+        );
+        assert_eq!(
+            state.task_status(3),
             Some(crate::kernel::task::TaskStatus::Runnable)
         );
     }

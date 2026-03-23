@@ -70,6 +70,7 @@ pub enum InitAlertKind {
     RedelegationRequired = 1,
     ServiceDegraded = 2,
     SupervisorRestarted = 3,
+    CoreServiceRestartRequired = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +107,7 @@ impl InitAlert {
             1 => InitAlertKind::RedelegationRequired,
             2 => InitAlertKind::ServiceDegraded,
             3 => InitAlertKind::SupervisorRestarted,
+            4 => InitAlertKind::CoreServiceRestartRequired,
             _ => return None,
         };
         Some(Self {
