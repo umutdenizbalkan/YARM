@@ -1,3 +1,5 @@
+use crate::kernel::capabilities::CapId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitBootPhase {
     Uninitialized,
@@ -108,5 +110,20 @@ impl CoreServicePolicyTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitFaultHandoff {
     pub supervisor_tid: u64,
+    pub supervisor_fault_recv_cap: CapId,
     pub restart_window_ticks: u64,
+}
+
+impl InitFaultHandoff {
+    pub const fn new(
+        supervisor_tid: u64,
+        supervisor_fault_recv_cap: CapId,
+        restart_window_ticks: u64,
+    ) -> Self {
+        Self {
+            supervisor_tid,
+            supervisor_fault_recv_cap,
+            restart_window_ticks,
+        }
+    }
 }

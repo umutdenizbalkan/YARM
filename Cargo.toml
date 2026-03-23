@@ -149,6 +149,11 @@ name = "virtio_net_srv"
 path = "src/bin/virtio_net_srv.rs"
 required-features = ["hosted-dev"]
 
+[[bin]]
+name = "supervisor_srv"
+path = "src/bin/supervisor_srv.rs"
+required-features = ["hosted-dev"]
+
 [profile.x86-none]
 inherits = "release"
 panic = "abort"

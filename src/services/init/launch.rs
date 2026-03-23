@@ -8,6 +8,7 @@ pub struct CoreServiceGraph {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CoreServiceHandles {
+    pub init_tid: Option<u64>,
     pub process_manager_tid: Option<u64>,
     pub vfs_tid: Option<u64>,
     pub supervisor_tid: Option<u64>,

@@ -3,14 +3,15 @@ mod mount;
 mod policy;
 
 use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
+use crate::kernel::capabilities::CapId;
 use crate::kernel::task::TaskClass;
 use crate::kernel::vm::Asid;
 
 pub use launch::{CoreLaunchReport, CoreServiceGraph, CoreServiceHandles, CoreServiceImagePlan};
 pub use mount::{MountPlan, MountRecoveryReport, MountServiceKind};
 pub use policy::{
-    CoreLaunchStrategy, CoreServiceKind, CoreServicePolicyTable, InitBootPhase,
-    InitFaultHandoff, ServiceRestartPolicy, StartupCap, StartupCapSet,
+    CoreLaunchStrategy, CoreServiceKind, CoreServicePolicyTable, InitBootPhase, InitFaultHandoff,
+    ServiceRestartPolicy, StartupCap, StartupCapSet,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub struct InitService {
     launch_count: usize,
     mount_plan: MountPlan,
     mount_status: Option<MountRecoveryReport>,
+    supervisor_restart_count: u8,
 }
 
 impl Default for InitService {
@@ -38,6 +40,7 @@ impl InitService {
         Self {
             phase: InitBootPhase::Uninitialized,
             handles: CoreServiceHandles {
+                init_tid: None,
                 process_manager_tid: None,
                 vfs_tid: None,
                 supervisor_tid: None,
@@ -50,6 +53,7 @@ impl InitService {
             launch_count: 0,
             mount_plan: MountPlan::baseline(),
             mount_status: None,
+            supervisor_restart_count: 0,
         }
     }
 
@@ -183,6 +187,7 @@ impl InitService {
         kernel.register_task(graph.vfs_tid)?;
         kernel.register_task(graph.supervisor_tid)?;
 
+        self.handles.init_tid = Some(graph.init_tid);
         self.handles.process_manager_tid = Some(graph.process_manager_tid);
         self.handles.vfs_tid = Some(graph.vfs_tid);
         self.handles.supervisor_tid = Some(graph.supervisor_tid);
@@ -271,15 +276,53 @@ impl InitService {
         })
     }
 
-    pub fn install_fault_handoff(&mut self, handoff: InitFaultHandoff) -> Result<(), KernelError> {
+    pub fn install_fault_handoff(
+        &mut self,
+        kernel: &mut KernelState,
+        restart_window_ticks: u64,
+    ) -> Result<InitFaultHandoff, KernelError> {
         if self.phase != InitBootPhase::LaunchingCore {
             return Err(KernelError::WrongObject);
         }
-        if self.handles.supervisor_tid != Some(handoff.supervisor_tid) {
-            return Err(KernelError::WrongObject);
-        }
+        let supervisor_tid = self
+            .handles
+            .supervisor_tid
+            .ok_or(KernelError::WrongObject)?;
+        let (_, _, recv_cap) = kernel.create_endpoint(16)?;
+        kernel.set_supervisor_endpoint(recv_cap)?;
+        let handoff = InitFaultHandoff::new(supervisor_tid, recv_cap, restart_window_ticks);
         self.fault_handoff = Some(handoff);
-        Ok(())
+        Ok(handoff)
+    }
+
+    pub fn fault_endpoint_cap(&self) -> Option<CapId> {
+        self.fault_handoff
+            .map(|handoff| handoff.supervisor_fault_recv_cap)
+    }
+
+    pub fn recover_supervisor_failure(
+        &mut self,
+        kernel: &mut KernelState,
+        restart_token: u64,
+    ) -> Result<bool, KernelError> {
+        let supervisor_tid = self
+            .handles
+            .supervisor_tid
+            .ok_or(KernelError::WrongObject)?;
+        let policy = self
+            .restart_policies
+            .policy_for(CoreServiceKind::Supervisor);
+        if self.supervisor_restart_count >= policy.max_restarts {
+            kernel.mark_task_dead(supervisor_tid)?;
+            self.mark_failed();
+            return Ok(false);
+        }
+        kernel.restart_task(supervisor_tid, restart_token)?;
+        self.supervisor_restart_count = self.supervisor_restart_count.saturating_add(1);
+        if let Some(handoff) = self.fault_handoff {
+            kernel.set_supervisor_endpoint(handoff.supervisor_fault_recv_cap)?;
+        }
+        Ok(true)
     }
 
     pub fn mark_failed(&mut self) {
@@ -354,11 +397,8 @@ mod tests {
         assert!(report.vfs_spawned);
         assert!(report.supervisor_spawned);
 
-        init.install_fault_handoff(InitFaultHandoff {
-            supervisor_tid: 4,
-            restart_window_ticks: 50,
-        })
-        .expect("handoff");
+        let handoff = init.install_fault_handoff(&mut state, 50).expect("handoff");
+        assert_eq!(handoff.supervisor_tid, 4);
         init.begin_running().expect("running");
         assert_eq!(init.phase(), InitBootPhase::Running);
     }
@@ -514,6 +554,77 @@ mod tests {
             .expect("mount recovery");
         assert!(report.recovered_with_fat);
         assert!(report.mounted_count >= 4);
+    }
+
+    #[test]
+    fn supervisor_handoff_binds_kernel_endpoint() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitService::new();
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut state, graph)
+            .expect("register");
+        init.launch_core_services(
+            &mut state,
+            CoreServiceImagePlan {
+                process_manager_entry: 0x8000,
+                vfs_entry: 0x9000,
+                supervisor_entry: 0xA000,
+            },
+        )
+        .expect("launch");
+        let handoff = init
+            .install_fault_handoff(&mut state, 100)
+            .expect("handoff");
+        let token = state.exit_task(2, 5).expect("exit");
+        let msg = state
+            .ipc_recv(handoff.supervisor_fault_recv_cap)
+            .expect("recv")
+            .expect("msg");
+        let event =
+            crate::kernel::supervisor_abi::TaskExitedEvent::decode(msg.as_slice()).expect("event");
+        assert_eq!(event.tid, 2);
+        assert_eq!(event.restart_token, token);
+    }
+
+    #[test]
+    fn init_recovers_supervisor_failure_within_budget() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut init = InitService::new();
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut state, graph)
+            .expect("register");
+        init.launch_core_services(
+            &mut state,
+            CoreServiceImagePlan {
+                process_manager_entry: 0x8000,
+                vfs_entry: 0x9000,
+                supervisor_entry: 0xA000,
+            },
+        )
+        .expect("launch");
+        let _handoff = init
+            .install_fault_handoff(&mut state, 100)
+            .expect("handoff");
+        init.begin_running().expect("running");
+        let token = state.exit_task(4, 99).expect("exit");
+        assert!(
+            init.recover_supervisor_failure(&mut state, token)
+                .expect("recover")
+        );
+        assert_eq!(
+            state.task_status(4),
+            Some(crate::kernel::task::TaskStatus::Runnable)
+        );
     }
 
     #[test]

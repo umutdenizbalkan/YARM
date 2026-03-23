@@ -1,6 +1,6 @@
 use crate::kernel::boot::Bootstrap;
 use crate::services::init::{
-    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitFaultHandoff, InitService,
+    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitService,
 };
 
 pub fn run() {
@@ -26,11 +26,9 @@ pub fn run() {
             },
         )
         .expect("launch");
-    init.install_fault_handoff(InitFaultHandoff {
-        supervisor_tid: graph.supervisor_tid,
-        restart_window_ticks: 100,
-    })
-    .expect("handoff");
+    let _handoff = init
+        .install_fault_handoff(&mut kernel, 100)
+        .expect("handoff");
     init.begin_running().expect("running");
 
     crate::yarm_log!(

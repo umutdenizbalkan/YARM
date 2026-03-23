@@ -10,10 +10,11 @@ mod thread_state;
 mod user_memory_state;
 
 use super::capabilities::{CapId, CapObject, CapRights, Capability, CapabilitySpace};
-use super::ipc::{Endpoint, IpcError, Message};
 #[cfg(test)]
 use super::ipc::EndpointMode;
+use super::ipc::{Endpoint, IpcError, Message};
 use super::scheduler::{CpuId, SchedulerError, SmpScheduler};
+use super::scheduler_timer::Timer;
 use super::smp::SmpMailbox;
 #[cfg(test)]
 use super::smp::WorkItem;
@@ -21,7 +22,6 @@ use super::syscall::SyscallError;
 use super::task::{FaultPolicy, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock};
 #[cfg(test)]
 use super::task::{ThreadGroupId, UserRegisterContext, WaitReason};
-use super::scheduler_timer::Timer;
 use super::trap::FaultInfo;
 #[cfg(test)]
 use super::trap::{FaultAccess, Trap, TrapEvent};
@@ -606,16 +606,22 @@ mod tests {
         assert_eq!(seen, [true, true]);
 
         state
-            .submit_cross_cpu_work(CpuId(0), WorkItem::TlbShootdown {
-                asid,
-                va_range: None,
-            })
+            .submit_cross_cpu_work(
+                CpuId(0),
+                WorkItem::TlbShootdown {
+                    asid,
+                    va_range: None,
+                },
+            )
             .expect("requeue cpu0 shootdown");
         state
-            .submit_cross_cpu_work(CpuId(1), WorkItem::TlbShootdown {
-                asid,
-                va_range: None,
-            })
+            .submit_cross_cpu_work(
+                CpuId(1),
+                WorkItem::TlbShootdown {
+                    asid,
+                    va_range: None,
+                },
+            )
             .expect("requeue cpu1 shootdown");
 
         state.set_current_cpu(CpuId(0)).expect("switch cpu0");
@@ -647,10 +653,13 @@ mod tests {
             .submit_cross_cpu_work(CpuId(1), WorkItem::WakeTask { tid: ThreadId(2) })
             .expect("submit wake");
         state
-            .submit_cross_cpu_work(CpuId(0), WorkItem::TlbShootdown {
-                asid: Asid(1),
-                va_range: None,
-            })
+            .submit_cross_cpu_work(
+                CpuId(0),
+                WorkItem::TlbShootdown {
+                    asid: Asid(1),
+                    va_range: None,
+                },
+            )
             .expect("submit tlb");
 
         let done = state
@@ -1625,12 +1634,17 @@ mod tests {
             .set_supervisor_endpoint(recv_cap)
             .expect("supervisor ep");
         state
-            .report_task_exit_to_supervisor(7, 99)
+            .report_task_exit_to_supervisor(7, 99, 55)
             .expect("report exit");
 
         let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
         assert_eq!(msg.opcode, 0xEE);
-        assert_eq!(msg.as_slice().len(), 16);
+        assert_eq!(msg.as_slice().len(), 24);
+        let event =
+            crate::kernel::supervisor_abi::TaskExitedEvent::decode(msg.as_slice()).expect("event");
+        assert_eq!(event.tid, 7);
+        assert_eq!(event.exit_code, 99);
+        assert_eq!(event.restart_token, 55);
         assert_eq!(
             state
                 .ipc_send(send_cap, Message::new(0, b"ok").expect("m"))

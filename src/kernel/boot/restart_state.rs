@@ -1,5 +1,5 @@
-use super::{KernelError, KernelState, map_ipc_error};
-use crate::kernel::ipc::Message;
+use super::{KernelError, KernelState};
+use crate::kernel::supervisor_abi::{TaskExitedEvent, task_exited_message};
 use crate::kernel::task::{RestartToken, TaskStatus, ThreadDetachState};
 
 impl KernelState {
@@ -7,14 +7,20 @@ impl KernelState {
         &mut self,
         tid: u64,
         code: u64,
+        restart_token: u64,
     ) -> Result<(), KernelError> {
         let Some(endpoint_idx) = self.faults.supervisor_endpoint else {
             return Ok(());
         };
-        let mut payload = [0u8; 16];
-        payload[..8].copy_from_slice(&tid.to_le_bytes());
-        payload[8..16].copy_from_slice(&code.to_le_bytes());
-        let msg = Message::with_header(0, 0xEE, 0, None, &payload).map_err(map_ipc_error)?;
+        let msg = task_exited_message(
+            0,
+            TaskExitedEvent {
+                tid,
+                exit_code: code,
+                restart_token,
+            },
+        )
+        .map_err(|_| KernelError::WrongObject)?;
         let endpoint = self
             .ipc
             .endpoints
@@ -38,7 +44,7 @@ impl KernelState {
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Exited(code);
         tcb.restart.token = Some(RestartToken(token));
-        self.report_task_exit_to_supervisor(tid, code)?;
+        self.report_task_exit_to_supervisor(tid, code, token)?;
         if let Some(robust) = robust {
             let stride = core::mem::size_of::<usize>();
             let mut offset = 0usize;
