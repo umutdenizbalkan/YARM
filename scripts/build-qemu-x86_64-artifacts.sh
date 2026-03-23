@@ -43,7 +43,7 @@ is_qemu_direct_bootable_x86_kernel() {
     return 1
   fi
   if readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
-    return 1
+    return 0
   fi
   return 1
 }
@@ -63,9 +63,9 @@ explain_nonbootable_kernel_source() {
     ftype="unknown"
   fi
   if [[ "$ftype" == *"ELF"* ]]; then
-    echo "[warn] freestanding ELF kernel is not staged as a qemu -kernel image by default"
-    echo "[hint] the built ${KERNEL_BIN} ELF is a debug artifact, not a verified direct-boot kernel for qemu-system-x86_64"
-    echo "[hint] provide a known bootable x86_64 kernel image via KERNEL_BOOTABLE_IMAGE_SOURCE=<path> (for example a Linux bzImage or other verified direct-boot image)"
+    echo "[warn] freestanding ELF kernel is missing a verified PVH note / entry contract for qemu-system-x86_64 direct boot"
+    echo "[hint] the built ${KERNEL_BIN} ELF is kept as a debug artifact until it advertises a loadable PVH entrypoint"
+    echo "[hint] provide a known bootable x86_64 kernel image via KERNEL_BOOTABLE_IMAGE_SOURCE=<path> (for example a Linux bzImage or a verified PVH-enabled ELF)"
     return
   fi
   echo "[warn] kernel boot source does not look like a verified qemu -kernel artifact: $kernel"
