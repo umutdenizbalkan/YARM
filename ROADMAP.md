@@ -70,7 +70,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Added network/mirror bootstrap wrapper: `scripts/bootstrap-nightly-mirror.sh` (installs nightly + rust-src from configured Rust dist/update endpoints, then runs the freestanding bootstrap build).
 - Added Linux-compat sysdeps bootstrap module: `src/services/compatibility/linux_compat/sysdeps.rs` (startup + memory contract + clock stub).
 - Expanded sysdeps shim scaffolding with startup/memory/clock/thread/futex hooks and focused tests (bootstrap-grade semantics).
-- Expanded kernel deterministic bootstrap simulation to assert process_manager + VFS + IRQ notification routing in a single end-to-end flow (`run_init_core_bootstrap_scenario`).
+- Expanded deterministic end-to-end server coverage with `tests/kernel_scenarios.rs`, including the init/process_manager/VFS/IRQ flow exercised by `run_init_core_bootstrap_scenario()`.
 
 ## Immediate next 5 implementable steps
 
@@ -99,7 +99,7 @@ Progress notes:
 4. **Reduce bootstrap script drift**
    - consolidate x86/riscv qemu build/smoke scripts behind a shared helper to avoid duplicated maintenance.
 5. **Define a minimum runnable server profile**
-   - ship a single "core profile" path (`init/process_manager/vfs/supervisor + console + one FS`) and keep it green before expanding feature breadth.
+   - ship a single "core profile" path (`init/process_manager/vfs/supervisor + devfs + one FS`) and keep it green before expanding feature breadth.
 
 
 ## init.srv scaffold status

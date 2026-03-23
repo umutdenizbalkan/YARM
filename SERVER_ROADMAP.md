@@ -15,8 +15,10 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ## Service domain layout
 
-- `src/services/control_plane/*` for init/process_manager/vfs/supervisor service implementations.
-- `src/services/fs/*` for filesystem and storage-facing services.
+- `src/services/init/*` for init service policy, launch ordering, and mount orchestration.
+- `src/services/control_plane/process_manager/*` for process-manager control-plane logic.
+- `src/services/control_plane/vfs/*` for the control-plane VFS request loop and policy glue.
+- `src/services/fs/*` for filesystem and storage-facing services such as ramfs/initramfs/devfs/ext4/fat/blkcache.
 - `src/services/drivers/*` for hardware/transport driver services.
 - `src/services/network/*` for networking services.
 - `src/services/ui/*` for display/input/session services.

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 1) concrete FS/service types must not be in kernel vfs modules
+# 1) concrete FS/service types must not leak into the kernel VFS layer or the control-plane VFS shim
 if rg -n "Ext4|RamFs|DevFs|Initramfs|Fat|BlkCache" src/kernel/vfs.rs src/services/control_plane/vfs/service.rs >/dev/null; then
-  echo "[fail] concrete service names found in kernel vfs modules"
+  echo "[fail] concrete service names found in kernel VFS layer/control-plane shim"
   rg -n "Ext4|RamFs|DevFs|Initramfs|Fat|BlkCache" src/kernel/vfs.rs src/services/control_plane/vfs/service.rs
   exit 1
 fi

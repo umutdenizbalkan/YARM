@@ -14,10 +14,10 @@ This file tracks the 7 immediate tasks and their implementation status.
   - Implemented in `src/kernel/process.rs` as `ElfImageInfo::parse()` (ELF magic + entry extraction) with tests.
 
 - [x] 4. Implement read-only initramfs VFS backend.
-  - Implemented in `src/services/control_plane/vfs/service.rs` as `ReadOnlyInitramfsBackend` and `INITRAMFS_BUSYBOX_PATH_PTR`.
+  - Implemented in `src/services/fs/initramfs/archive.rs` as `InitramfsBackend` and `INITRAMFS_BUSYBOX_PATH_PTR`, then exercised through `src/services/fs/initramfs/service.rs` and `tests/kernel_scenarios.rs`.
 
 - [x] 5. Implement serial-console driver service path via VFS (`/dev/console`).
-  - Implemented in `src/services/control_plane/vfs/service.rs` as `ConsoleBackend` and `DEV_CONSOLE_PATH_PTR` with tests.
+  - Implemented in `src/services/fs/devfs/nodes.rs` as `DevFsBackend` and `DEV_CONSOLE_PATH_PTR`, then exercised through `src/services/fs/devfs/service.rs`.
 
 - [x] 6. Add QEMU boot script for one ISA.
   - Added `scripts/qemu-riscv64-busybox-smoke.sh`.
