@@ -8,7 +8,7 @@ use yarm::kernel::vfs::{MountRouter, OpenAtRequest, ReadWriteRequest, VfsService
 use yarm::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 use yarm::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 use yarm::services::fs::ramfs::RamFsBackend;
-use yarm::services::init::{CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitFaultHandoff, InitServerLite};
+use yarm::services::init::{CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitFaultHandoff, InitService};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InitBootSummary {
@@ -21,7 +21,7 @@ struct InitBootSummary {
 
 fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
     let mut kernel = Bootstrap::init()?;
-    let mut init = InitServerLite::new();
+    let mut init = InitService::new();
     let graph = CoreServiceGraph { init_tid: 1, process_manager_tid: 2, vfs_tid: 3, supervisor_tid: 4 };
     init.register_core_graph(&mut kernel, graph)?;
     let _ = init.launch_core_services(&mut kernel, CoreServiceImagePlan {

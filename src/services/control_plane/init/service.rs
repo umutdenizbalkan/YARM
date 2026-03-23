@@ -1,11 +1,11 @@
 use crate::kernel::boot::Bootstrap;
 use crate::services::init::{
-    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitFaultHandoff, InitServerLite,
+    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitFaultHandoff, InitService,
 };
 
 pub fn run() {
     let mut kernel = Bootstrap::init().expect("init");
-    let mut init = InitServerLite::new();
+    let mut init = InitService::new();
     init.set_launch_strategy(CoreLaunchStrategy::SupervisorFirst);
     let graph = CoreServiceGraph {
         init_tid: 1,

@@ -14,7 +14,7 @@ pub use policy::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InitServerLite {
+pub struct InitService {
     phase: InitBootPhase,
     handles: CoreServiceHandles,
     startup_caps: StartupCapSet,
@@ -27,13 +27,13 @@ pub struct InitServerLite {
     mount_status: Option<MountRecoveryReport>,
 }
 
-impl Default for InitServerLite {
+impl Default for InitService {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl InitServerLite {
+impl InitService {
     pub const fn new() -> Self {
         Self {
             phase: InitBootPhase::Uninitialized,
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn init_server_requires_minimum_startup_caps() {
         let mut state = Bootstrap::init().expect("init");
-        let mut init = InitServerLite::new();
+        let mut init = InitService::new();
         init.set_startup_caps(StartupCapSet {
             endpoint_factory: false,
             memory_object_factory: true,
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn init_server_launch_flow_registers_launches_and_enters_running() {
         let mut state = Bootstrap::init().expect("init");
-        let mut init = InitServerLite::new();
+        let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
             process_manager_tid: 2,
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn launch_order_is_deterministic() {
         let mut state = Bootstrap::init().expect("init");
-        let mut init = InitServerLite::new();
+        let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
             process_manager_tid: 2,
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn launch_order_can_prioritize_supervisor() {
         let mut state = Bootstrap::init().expect("init");
-        let mut init = InitServerLite::new();
+        let mut init = InitService::new();
         init.set_launch_strategy(CoreLaunchStrategy::SupervisorFirst);
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn launch_sets_mount_status() {
         let mut state = Bootstrap::init().expect("init");
-        let mut init = InitServerLite::new();
+        let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
             process_manager_tid: 2,
@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn begin_running_requires_fault_handoff() {
         let mut state = Bootstrap::init().expect("init");
-        let mut init = InitServerLite::new();
+        let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
             process_manager_tid: 2,
@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_restart_policies() {
-        let mut init = InitServerLite::new();
+        let mut init = InitService::new();
         let bad = CoreServicePolicyTable {
             process_manager: ServiceRestartPolicy {
                 max_restarts: 0,
@@ -501,14 +501,14 @@ mod tests {
 
     #[test]
     fn init_server_supports_failure_transition() {
-        let mut init = InitServerLite::new();
+        let mut init = InitService::new();
         init.mark_failed();
         assert_eq!(init.phase(), InitBootPhase::Failed);
     }
 
     #[test]
     fn mount_plan_supports_ext4_to_fat_recovery() {
-        let init = InitServerLite::new();
+        let init = InitService::new();
         let report = init
             .execute_mount_plan_with_fail_at(Some(3))
             .expect("mount recovery");
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn mount_plan_without_fallback_fails() {
-        let mut init = InitServerLite::new();
+        let mut init = InitService::new();
         let mut plan = MountPlan::baseline();
         plan.allow_fallback_to_fat = false;
         init.set_mount_plan(plan).expect("set plan");

@@ -130,8 +130,8 @@ path = "src/bin/uart_srv.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
-name = "vfs_lite"
-path = "src/bin/vfs_lite.rs"
+name = "vfs_server"
+path = "src/bin/vfs_server.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
