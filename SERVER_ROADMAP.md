@@ -28,6 +28,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 ## Immediate next steps (review-driven)
 
 1. Convert all thin `src/bin/*_srv.rs` stubs to call real service entrypoints with explicit typed request loops (one service family per PR).
+   - ✅ Core control-plane + minimum-profile filesystem entrypoints now route through explicit request-loop helpers in `process_manager`, `vfs`, `devfs`, and `initramfs` service modules.
 2. Add deterministic fault-injection tests for each service family (`control_plane`, `drivers`, `fs`, `network`, `ui`) and wire them to `compat-gates`.
 3. Gate phase advancement on runnable profile evidence (QEMU smoke marker + deterministic sim + codec compatibility vectors).
 
