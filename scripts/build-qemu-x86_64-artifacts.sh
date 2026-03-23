@@ -168,6 +168,8 @@ if [[ -n "$BOOTABLE_SOURCE" && -f "$BOOTABLE_SOURCE" ]] && is_qemu_direct_bootab
 elif [[ -n "$BOOTABLE_SOURCE" && -f "$BOOTABLE_SOURCE" ]]; then
   rm -f "$KERNEL_IMAGE"
   explain_nonbootable_kernel_source "$BOOTABLE_SOURCE"
+elif [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]] && is_qemu_direct_bootable_x86_kernel "$KERNEL_RAW_ELF"; then
+  cp "$KERNEL_RAW_ELF" "$KERNEL_IMAGE"
 elif [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
   rm -f "$KERNEL_IMAGE"
   explain_nonbootable_kernel_source "$KERNEL_RAW_ELF"
