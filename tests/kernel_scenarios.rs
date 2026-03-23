@@ -40,7 +40,8 @@ fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
         },
     )?;
     let _handoff = init.install_fault_handoff(&mut kernel, 100)?;
-    init.begin_running()?;
+    init.seed_supervisor_registrations(&mut kernel)?;
+    init.begin_running(&kernel)?;
 
     let (_notif, notif_send_cap, notif_recv_cap) = kernel.create_notification(8)?;
     kernel.bind_irq_notification(9, notif_send_cap)?;

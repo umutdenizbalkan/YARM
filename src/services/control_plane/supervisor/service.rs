@@ -1,13 +1,20 @@
-use crate::kernel::boot::{KernelError, KernelState};
+use crate::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
+use crate::kernel::capabilities::CapId;
+use crate::kernel::ipc::{Message, ThreadId};
 use crate::kernel::supervisor_abi::{
-    InitAlert, InitAlertKind, TaskExitedEvent, init_alert_message,
+    CoreServiceRegistrationKind, DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert,
+    InitAlertKind, RedelegationAckRequest, RegisterCoreServiceRequest, RegisterDriverRequest,
+    SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
+    SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, SupervisorStatusReply,
+    SupervisorStatusRequest, TaskExitedEvent, init_alert_message, status_reply_message,
 };
+use crate::kernel::time::{TickDuration, TickInstant};
 use crate::services::init::{
-    CoreServiceKind, CoreServicePolicyTable, InitFaultHandoff, ServiceRestartPolicy,
+    CoreServiceKind, CoreServicePolicyTable, InitFaultHandoff, RestartOwner, ServiceRestartPolicy,
 };
 
 const MAX_MANAGED_SERVICES: usize = 8;
-const MAX_PENDING_ALERTS: usize = 8;
+const MAX_DEPENDENTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedServiceKind {
@@ -17,11 +24,11 @@ pub enum ManagedServiceKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisorDecision {
-    Restarted {
+    ScheduledRestart {
         tid: u64,
         kind: ManagedServiceKind,
-        backoff_ticks: u64,
-        redelegation_required: bool,
+        due_tick: TickInstant,
+        redelegated: bool,
     },
     MarkedDead {
         tid: u64,
@@ -33,13 +40,28 @@ pub enum SupervisorDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DriverRecoveryPlan {
+    irq_line: u16,
+    mem_cap: CapId,
+    iova_cap: CapId,
+    iova_base: usize,
+    iova_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ManagedServiceRecord {
     tid: u64,
     kind: ManagedServiceKind,
     restart_attempts: u8,
+    restart_group: u8,
+    dependency_mask: u8,
+    last_restart_tick: TickInstant,
+    window_start_tick: TickInstant,
+    pending_restart_due: Option<TickInstant>,
+    pending_restart_token: Option<u64>,
     pending_redelegation: bool,
-    total_backoff_ticks: u64,
     driver_policy: Option<ServiceRestartPolicy>,
+    driver_plan: Option<DriverRecoveryPlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,8 +71,7 @@ pub struct SupervisorService {
     policies: CoreServicePolicyTable,
     managed: [Option<ManagedServiceRecord>; MAX_MANAGED_SERVICES],
     degraded: bool,
-    pending_alerts: [Option<InitAlert>; MAX_PENDING_ALERTS],
-    pending_alert_count: usize,
+    current_tick: TickInstant,
 }
 
 impl SupervisorService {
@@ -65,8 +86,7 @@ impl SupervisorService {
             policies,
             managed: [None; MAX_MANAGED_SERVICES],
             degraded: false,
-            pending_alerts: [None; MAX_PENDING_ALERTS],
-            pending_alert_count: 0,
+            current_tick: TickInstant(0),
         }
     }
 
@@ -74,34 +94,39 @@ impl SupervisorService {
         self.degraded
     }
 
-    pub fn register_core_service(
-        &mut self,
-        kind: CoreServiceKind,
-        tid: u64,
-    ) -> Result<(), KernelError> {
-        self.register_record(ManagedServiceRecord {
-            tid,
-            kind: ManagedServiceKind::Core(kind),
-            restart_attempts: 0,
-            pending_redelegation: false,
-            total_backoff_ticks: 0,
-            driver_policy: None,
-        })
+    pub const fn current_tick(&self) -> TickInstant {
+        self.current_tick
     }
 
-    pub fn register_driver(
+    pub fn advance_ticks(&mut self, delta: TickDuration) {
+        self.current_tick = self.current_tick + delta;
+    }
+
+    fn send_init_message(
         &mut self,
-        tid: u64,
-        policy: ServiceRestartPolicy,
+        kernel: &mut KernelState,
+        msg: Message,
     ) -> Result<(), KernelError> {
-        self.register_record(ManagedServiceRecord {
-            tid,
-            kind: ManagedServiceKind::Driver,
-            restart_attempts: 0,
-            pending_redelegation: false,
-            total_backoff_ticks: 0,
-            driver_policy: Some(policy),
-        })
+        kernel.ipc_send(self.handoff.init_alert_send_cap, msg)
+    }
+
+    fn send_init_alert(
+        &mut self,
+        kernel: &mut KernelState,
+        alert: InitAlert,
+    ) -> Result<(), KernelError> {
+        let msg = init_alert_message(self.init_tid, alert).map_err(|_| KernelError::WrongObject)?;
+        self.send_init_message(kernel, msg)
+    }
+
+    fn send_status_reply(
+        &mut self,
+        kernel: &mut KernelState,
+        reply: SupervisorStatusReply,
+    ) -> Result<(), KernelError> {
+        let msg =
+            status_reply_message(self.init_tid, reply).map_err(|_| KernelError::WrongObject)?;
+        self.send_init_message(kernel, msg)
     }
 
     fn register_record(&mut self, record: ManagedServiceRecord) -> Result<(), KernelError> {
@@ -119,11 +144,74 @@ impl SupervisorService {
         }
     }
 
+    pub fn register_core_service(
+        &mut self,
+        kind: CoreServiceKind,
+        tid: u64,
+        restart_group: u8,
+        dependency_mask: u8,
+    ) -> Result<(), KernelError> {
+        self.register_record(ManagedServiceRecord {
+            tid,
+            kind: ManagedServiceKind::Core(kind),
+            restart_attempts: 0,
+            restart_group,
+            dependency_mask,
+            last_restart_tick: TickInstant(0),
+            window_start_tick: TickInstant(0),
+            pending_restart_due: None,
+            pending_restart_token: None,
+            pending_redelegation: false,
+            driver_policy: None,
+            driver_plan: None,
+        })
+    }
+
+    pub(crate) fn register_driver(
+        &mut self,
+        tid: u64,
+        policy: ServiceRestartPolicy,
+        restart_group: u8,
+        plan: DriverRecoveryPlan,
+    ) -> Result<(), KernelError> {
+        self.register_record(ManagedServiceRecord {
+            tid,
+            kind: ManagedServiceKind::Driver,
+            restart_attempts: 0,
+            restart_group,
+            dependency_mask: 0,
+            last_restart_tick: TickInstant(0),
+            window_start_tick: TickInstant(0),
+            pending_restart_due: None,
+            pending_restart_token: None,
+            pending_redelegation: false,
+            driver_policy: Some(policy),
+            driver_plan: Some(plan),
+        })
+    }
+
+    fn find_record(&self, tid: u64) -> Option<ManagedServiceRecord> {
+        self.managed
+            .iter()
+            .flatten()
+            .find(|record| record.tid == tid)
+            .copied()
+    }
+
     fn find_record_mut(&mut self, tid: u64) -> Option<&mut ManagedServiceRecord> {
         self.managed
             .iter_mut()
             .flatten()
             .find(|record| record.tid == tid)
+    }
+
+    fn dependency_bit(kind: ManagedServiceKind) -> u8 {
+        match kind {
+            ManagedServiceKind::Core(CoreServiceKind::ProcessManager) => DEP_PROCESS_MANAGER,
+            ManagedServiceKind::Core(CoreServiceKind::Vfs) => DEP_VFS,
+            ManagedServiceKind::Core(CoreServiceKind::Supervisor) => DEP_SUPERVISOR,
+            ManagedServiceKind::Driver => 0,
+        }
     }
 
     fn policy_for(&self, record: ManagedServiceRecord) -> ServiceRestartPolicy {
@@ -136,26 +224,289 @@ impl SupervisorService {
         }
     }
 
-    fn push_alert(&mut self, alert: InitAlert) {
-        if self.pending_alert_count < self.pending_alerts.len() {
-            self.pending_alerts[self.pending_alert_count] = Some(alert);
-            self.pending_alert_count += 1;
+    fn dependent_tids(&self, failed: ManagedServiceRecord) -> [Option<u64>; MAX_DEPENDENTS] {
+        let mut out = [None; MAX_DEPENDENTS];
+        let failed_bit = Self::dependency_bit(failed.kind);
+        let mut count = 0usize;
+        if failed_bit == 0 {
+            return out;
         }
-    }
-
-    pub fn take_pending_alert(&mut self) -> Option<InitAlert> {
-        if self.pending_alert_count == 0 {
-            return None;
-        }
-        let alert = self.pending_alerts[0].take();
-        let mut idx = 1;
-        while idx < self.pending_alert_count {
-            self.pending_alerts[idx - 1] = self.pending_alerts[idx].take();
+        let mut idx = 0;
+        while idx < self.managed.len() && count < out.len() {
+            if let Some(record) = self.managed[idx] {
+                if record.tid != failed.tid
+                    && record.restart_group == failed.restart_group
+                    && (record.dependency_mask & failed_bit) != 0
+                {
+                    out[count] = Some(record.tid);
+                    count += 1;
+                }
+            }
             idx += 1;
         }
-        self.pending_alert_count -= 1;
-        self.pending_alerts[self.pending_alert_count] = None;
-        alert
+        out
+    }
+
+    fn schedule_restart(&mut self, tid: u64, token: u64) -> Result<TickInstant, KernelError> {
+        let snapshot = self.find_record(tid).ok_or(KernelError::TaskMissing)?;
+        let policy = self.policy_for(snapshot);
+        let restart_window_ticks = self.handoff.restart_window_ticks;
+        let current_tick = self.current_tick;
+        let record = self.find_record_mut(tid).ok_or(KernelError::TaskMissing)?;
+        if TickDuration(restart_window_ticks)
+            .has_elapsed_since(record.window_start_tick, current_tick)
+        {
+            record.window_start_tick = current_tick;
+            record.restart_attempts = 0;
+        }
+        record.restart_attempts = record.restart_attempts.saturating_add(1);
+        record.pending_restart_due = Some(current_tick + TickDuration(policy.backoff_ticks));
+        record.pending_restart_token = Some(token);
+        Ok(record.pending_restart_due.expect("due set"))
+    }
+
+    fn handle_control_request(
+        &mut self,
+        kernel: &mut KernelState,
+        request: Message,
+    ) -> Result<(), KernelError> {
+        match request.opcode {
+            SUPERVISOR_OP_REGISTER_CORE_SERVICE => {
+                let req = RegisterCoreServiceRequest::decode(request.as_slice())
+                    .ok_or(KernelError::WrongObject)?;
+                let kind = match req.kind {
+                    CoreServiceRegistrationKind::ProcessManager => CoreServiceKind::ProcessManager,
+                    CoreServiceRegistrationKind::Vfs => CoreServiceKind::Vfs,
+                    CoreServiceRegistrationKind::Supervisor => CoreServiceKind::Supervisor,
+                };
+                self.register_core_service(kind, req.tid, req.restart_group, req.dependency_mask)?;
+                match kind {
+                    CoreServiceKind::ProcessManager => {
+                        self.policies.process_manager = ServiceRestartPolicy {
+                            max_restarts: req.max_restarts,
+                            backoff_ticks: req.backoff_ticks,
+                        };
+                    }
+                    CoreServiceKind::Vfs => {
+                        self.policies.vfs = ServiceRestartPolicy {
+                            max_restarts: req.max_restarts,
+                            backoff_ticks: req.backoff_ticks,
+                        };
+                    }
+                    CoreServiceKind::Supervisor => {
+                        self.policies.supervisor = ServiceRestartPolicy {
+                            max_restarts: req.max_restarts,
+                            backoff_ticks: req.backoff_ticks,
+                        };
+                    }
+                }
+            }
+            SUPERVISOR_OP_REGISTER_DRIVER => {
+                let req = RegisterDriverRequest::decode(request.as_slice())
+                    .ok_or(KernelError::WrongObject)?;
+                self.register_driver(
+                    req.tid,
+                    ServiceRestartPolicy {
+                        max_restarts: req.max_restarts,
+                        backoff_ticks: req.backoff_ticks,
+                    },
+                    req.restart_group,
+                    DriverRecoveryPlan {
+                        irq_line: req.irq_line,
+                        mem_cap: CapId(req.mem_cap),
+                        iova_cap: CapId(req.iova_cap),
+                        iova_base: req.iova_base as usize,
+                        iova_len: req.iova_len as usize,
+                    },
+                )?;
+            }
+            SUPERVISOR_OP_QUERY_STATUS => {
+                let req = SupervisorStatusRequest::decode(request.as_slice())
+                    .ok_or(KernelError::WrongObject)?;
+                let record = self.find_record(req.tid).ok_or(KernelError::TaskMissing)?;
+                self.send_status_reply(
+                    kernel,
+                    SupervisorStatusReply {
+                        tid: record.tid,
+                        degraded: self.degraded,
+                        pending_redelegation: record.pending_redelegation,
+                        restart_attempts: record.restart_attempts,
+                        restart_group: record.restart_group,
+                    },
+                )?;
+            }
+            SUPERVISOR_OP_ACK_REDELEGATION => {
+                let req = RedelegationAckRequest::decode(request.as_slice())
+                    .ok_or(KernelError::WrongObject)?;
+                let _ = self.complete_redelegation(req.tid);
+            }
+            _ => return Err(KernelError::WrongObject),
+        }
+        Ok(())
+    }
+
+    fn execute_due_restarts(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
+        let mut restarted = 0usize;
+        let mut idx = 0usize;
+        while idx < self.managed.len() {
+            let Some(mut record) = self.managed[idx] else {
+                idx += 1;
+                continue;
+            };
+            let Some(due) = record.pending_restart_due else {
+                idx += 1;
+                continue;
+            };
+            if due.0 > self.current_tick.0 {
+                idx += 1;
+                continue;
+            }
+            let token = record
+                .pending_restart_token
+                .ok_or(KernelError::WrongObject)?;
+            kernel.restart_task(record.tid, token)?;
+            record.last_restart_tick = self.current_tick;
+            record.pending_restart_due = None;
+            record.pending_restart_token = None;
+            if matches!(record.kind, ManagedServiceKind::Driver) {
+                let plan = record.driver_plan;
+                if let Some(plan) = plan {
+                    let _ = kernel.delegate_driver_bundle(DriverBundlePlan {
+                        server_tid: ThreadId(record.tid),
+                        irq_line: plan.irq_line,
+                        mem_cap: plan.mem_cap,
+                        iova_cap: plan.iova_cap,
+                        iova_base: plan.iova_base,
+                        iova_len: plan.iova_len,
+                    })?;
+                    record.pending_redelegation = false;
+                } else {
+                    record.pending_redelegation = true;
+                    self.send_init_alert(
+                        kernel,
+                        InitAlert {
+                            tid: record.tid,
+                            kind: InitAlertKind::RedelegationRequired,
+                        },
+                    )?;
+                }
+            }
+            self.managed[idx] = Some(record);
+            restarted += 1;
+            idx += 1;
+        }
+        Ok(restarted)
+    }
+
+    fn next_due_tick(&self) -> Option<TickInstant> {
+        self.managed
+            .iter()
+            .flatten()
+            .filter_map(|record| record.pending_restart_due)
+            .min_by_key(|tick| tick.0)
+    }
+
+    pub fn run_until_idle(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
+        let mut progress = 0usize;
+        loop {
+            let mut changed = false;
+            while let Some(request) =
+                kernel.try_ipc_recv(self.handoff.supervisor_control_recv_cap)?
+            {
+                self.handle_control_request(kernel, request)?;
+                changed = true;
+                progress += 1;
+            }
+            while let Some(message) = kernel.try_ipc_recv(self.handoff.supervisor_fault_recv_cap)? {
+                let event =
+                    TaskExitedEvent::decode(message.as_slice()).ok_or(KernelError::WrongObject)?;
+                let _ = self.handle_task_exit(kernel, event)?;
+                changed = true;
+                progress += 1;
+            }
+            let restarted = self.execute_due_restarts(kernel)?;
+            if restarted > 0 {
+                changed = true;
+                progress += restarted;
+            }
+            if changed {
+                continue;
+            }
+            let Some(next_due) = self.next_due_tick() else {
+                break;
+            };
+            self.current_tick = next_due;
+        }
+        Ok(progress)
+    }
+
+    pub fn handle_task_exit(
+        &mut self,
+        kernel: &mut KernelState,
+        event: TaskExitedEvent,
+    ) -> Result<SupervisorDecision, KernelError> {
+        let Some(snapshot) = self.find_record(event.tid) else {
+            return Ok(SupervisorDecision::Ignored { tid: event.tid });
+        };
+        if matches!(snapshot.kind, ManagedServiceKind::Core(kind) if CoreServicePolicyTable::restart_owner_for(kind) == RestartOwner::Init)
+        {
+            self.send_init_alert(
+                kernel,
+                InitAlert {
+                    tid: event.tid,
+                    kind: InitAlertKind::SupervisorRestarted,
+                },
+            )?;
+            return Ok(SupervisorDecision::Ignored { tid: event.tid });
+        }
+        let policy = self.policy_for(snapshot);
+        let restart_window_ticks = self.handoff.restart_window_ticks;
+        let current_tick = self.current_tick;
+        let within_window_exhausted = {
+            let mut exhausted = false;
+            let record = self
+                .find_record_mut(event.tid)
+                .ok_or(KernelError::TaskMissing)?;
+            if TickDuration(restart_window_ticks)
+                .has_elapsed_since(record.window_start_tick, current_tick)
+            {
+                record.window_start_tick = current_tick;
+                record.restart_attempts = 0;
+            }
+            if record.restart_attempts >= policy.max_restarts {
+                exhausted = true;
+            }
+            exhausted
+        };
+        if within_window_exhausted {
+            kernel.mark_task_dead(event.tid)?;
+            self.degraded = true;
+            self.send_init_alert(
+                kernel,
+                InitAlert {
+                    tid: event.tid,
+                    kind: InitAlertKind::ServiceDegraded,
+                },
+            )?;
+            return Ok(SupervisorDecision::MarkedDead {
+                tid: event.tid,
+                kind: snapshot.kind,
+            });
+        }
+
+        let due_tick = self.schedule_restart(event.tid, event.restart_token)?;
+        for dependent_tid in self.dependent_tids(snapshot).into_iter().flatten() {
+            let token = kernel
+                .task_restart_token(dependent_tid)
+                .unwrap_or(event.restart_token);
+            let _ = self.schedule_restart(dependent_tid, token);
+        }
+        Ok(SupervisorDecision::ScheduledRestart {
+            tid: event.tid,
+            kind: snapshot.kind,
+            due_tick,
+            redelegated: !matches!(snapshot.kind, ManagedServiceKind::Driver),
+        })
     }
 
     pub fn complete_redelegation(&mut self, tid: u64) -> bool {
@@ -169,95 +520,53 @@ impl SupervisorService {
     }
 
     pub fn pending_redelegation(&self, tid: u64) -> bool {
-        self.managed
-            .iter()
-            .flatten()
-            .find(|record| record.tid == tid)
+        self.find_record(tid)
             .map(|record| record.pending_redelegation)
             .unwrap_or(false)
     }
 
-    pub fn handle_kernel_event(
-        &mut self,
-        kernel: &mut KernelState,
-    ) -> Result<Option<SupervisorDecision>, KernelError> {
-        let Some(message) = kernel.ipc_recv(self.handoff.supervisor_fault_recv_cap)? else {
-            return Ok(None);
-        };
-        let event = TaskExitedEvent::decode(message.as_slice()).ok_or(KernelError::WrongObject)?;
-        self.handle_task_exit(kernel, event).map(Some)
-    }
-
-    pub fn handle_task_exit(
-        &mut self,
-        kernel: &mut KernelState,
-        event: TaskExitedEvent,
-    ) -> Result<SupervisorDecision, KernelError> {
-        let Some(snapshot) = self
-            .managed
-            .iter()
-            .flatten()
-            .find(|record| record.tid == event.tid)
-            .copied()
-        else {
-            return Ok(SupervisorDecision::Ignored { tid: event.tid });
-        };
-        let policy = self.policy_for(snapshot);
-        let record = self
-            .find_record_mut(event.tid)
-            .ok_or(KernelError::TaskMissing)?;
-        let kind = record.kind;
-        if record.restart_attempts < policy.max_restarts {
-            record.restart_attempts = record.restart_attempts.saturating_add(1);
-            record.total_backoff_ticks = record
-                .total_backoff_ticks
-                .saturating_add(policy.backoff_ticks);
-            let redelegation_required = matches!(kind, ManagedServiceKind::Driver);
-            if redelegation_required {
-                record.pending_redelegation = true;
-            }
-            kernel.restart_task(event.tid, event.restart_token)?;
-            if redelegation_required {
-                self.push_alert(InitAlert {
-                    tid: event.tid,
-                    kind: InitAlertKind::RedelegationRequired,
-                });
-            }
-            return Ok(SupervisorDecision::Restarted {
-                tid: event.tid,
-                kind,
-                backoff_ticks: policy.backoff_ticks,
-                redelegation_required,
-            });
-        }
-
-        kernel.mark_task_dead(event.tid)?;
-        self.degraded = true;
-        self.push_alert(InitAlert {
-            tid: event.tid,
-            kind: InitAlertKind::ServiceDegraded,
-        });
-        Ok(SupervisorDecision::MarkedDead {
-            tid: event.tid,
-            kind,
+    pub fn status_for(&self, tid: u64) -> Option<SupervisorStatusReply> {
+        self.find_record(tid).map(|record| SupervisorStatusReply {
+            tid,
+            degraded: self.degraded,
+            pending_redelegation: record.pending_redelegation,
+            restart_attempts: record.restart_attempts,
+            restart_group: record.restart_group,
         })
-    }
-
-    pub fn emit_init_alert_message(&mut self) -> Option<crate::kernel::ipc::Message> {
-        let alert = self.take_pending_alert()?;
-        init_alert_message(self.init_tid, None, alert).ok()
     }
 }
 
 pub fn run() {
-    let handoff = InitFaultHandoff::new(4, crate::kernel::capabilities::CapId(0), 100);
-    let mut supervisor = SupervisorService::new(1, handoff, CoreServicePolicyTable::baseline());
-    let _ = supervisor.register_core_service(CoreServiceKind::ProcessManager, 2);
-    let _ = supervisor.register_core_service(CoreServiceKind::Vfs, 3);
+    let mut kernel = crate::kernel::boot::Bootstrap::init().expect("init");
+    let mut init = crate::services::init::InitService::new();
+    let graph = crate::services::init::CoreServiceGraph {
+        init_tid: 1,
+        process_manager_tid: 2,
+        vfs_tid: 3,
+        supervisor_tid: 4,
+    };
+    init.register_core_graph(&mut kernel, graph).expect("graph");
+    init.launch_core_services(
+        &mut kernel,
+        crate::services::init::CoreServiceImagePlan {
+            process_manager_entry: 0x8000,
+            vfs_entry: 0x9000,
+            supervisor_entry: 0xA000,
+        },
+    )
+    .expect("launch");
+    let handoff = init
+        .install_fault_handoff(&mut kernel, 100)
+        .expect("handoff");
+    init.seed_supervisor_registrations(&mut kernel)
+        .expect("seed");
+    let mut supervisor = SupervisorService::new(1, handoff, init.restart_policies());
+    let handled = supervisor.run_until_idle(&mut kernel).expect("loop");
     crate::yarm_log!(
-        "supervisor.srv scaffold online: init_tid={}, degraded={}",
-        1,
-        supervisor.degraded()
+        "supervisor.srv online: handled={}, degraded={}, tick={}",
+        handled,
+        supervisor.degraded(),
+        supervisor.current_tick().0
     );
 }
 
@@ -265,70 +574,78 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
+    use crate::kernel::supervisor_abi::{
+        InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
+        SupervisorStatusRequest, query_status_message, register_driver_message,
+    };
     use crate::kernel::task::{TaskClass, TaskStatus};
     use crate::kernel::vm::PAGE_SIZE;
+    use crate::services::init::{CoreServiceGraph, CoreServiceImagePlan, InitService};
 
-    fn setup_supervisor() -> (KernelState, InitFaultHandoff, SupervisorService) {
+    fn setup_supervisor() -> (
+        KernelState,
+        InitService,
+        InitFaultHandoff,
+        SupervisorService,
+    ) {
         let mut kernel = Bootstrap::init().expect("init");
-        for tid in [1u64, 2, 3, 4, 20] {
-            kernel.register_task(tid).expect("task");
-        }
-        let (_, _, recv_cap) = kernel.create_endpoint(8).expect("endpoint");
-        kernel.set_supervisor_endpoint(recv_cap).expect("bind");
-        let handoff = InitFaultHandoff::new(4, recv_cap, 100);
-        let mut supervisor = SupervisorService::new(1, handoff, CoreServicePolicyTable::baseline());
-        supervisor
-            .register_core_service(CoreServiceKind::ProcessManager, 2)
-            .expect("register proc");
-        supervisor
-            .register_core_service(CoreServiceKind::Vfs, 3)
-            .expect("register vfs");
-        supervisor
-            .register_core_service(CoreServiceKind::Supervisor, 4)
-            .expect("register sup");
-        (kernel, handoff, supervisor)
+        let mut init = InitService::new();
+        let graph = CoreServiceGraph {
+            init_tid: 1,
+            process_manager_tid: 2,
+            vfs_tid: 3,
+            supervisor_tid: 4,
+        };
+        init.register_core_graph(&mut kernel, graph).expect("graph");
+        init.launch_core_services(
+            &mut kernel,
+            CoreServiceImagePlan {
+                process_manager_entry: 0x8000,
+                vfs_entry: 0x9000,
+                supervisor_entry: 0xA000,
+            },
+        )
+        .expect("launch");
+        let handoff = init
+            .install_fault_handoff(&mut kernel, 20)
+            .expect("handoff");
+        init.seed_supervisor_registrations(&mut kernel)
+            .expect("seed");
+        let supervisor = SupervisorService::new(1, handoff, init.restart_policies());
+        (kernel, init, handoff, supervisor)
     }
 
     #[test]
-    fn exited_service_produces_supervisor_event() {
-        let (mut kernel, handoff, _supervisor) = setup_supervisor();
+    fn long_running_loop_registers_services_from_init_requests() {
+        let (mut kernel, _init, _handoff, mut supervisor) = setup_supervisor();
+        assert_eq!(supervisor.run_until_idle(&mut kernel).expect("loop"), 3);
+        assert!(supervisor.status_for(2).is_some());
+        assert!(supervisor.status_for(3).is_some());
+        assert!(supervisor.status_for(4).is_some());
+    }
+
+    #[test]
+    fn exited_service_produces_and_processes_supervisor_event() {
+        let (mut kernel, _init, handoff, mut supervisor) = setup_supervisor();
+        supervisor.run_until_idle(&mut kernel).expect("loop");
         let token = kernel.exit_task(2, 7).expect("exit");
-        let msg = kernel
-            .ipc_recv(handoff.supervisor_fault_recv_cap)
+        let raw = kernel
+            .try_ipc_recv(handoff.supervisor_fault_recv_cap)
             .expect("recv")
             .expect("msg");
-        let event = TaskExitedEvent::decode(msg.as_slice()).expect("event");
-        assert_eq!(event.tid, 2);
-        assert_eq!(event.exit_code, 7);
+        let event = TaskExitedEvent::decode(raw.as_slice()).expect("event");
         assert_eq!(event.restart_token, token);
+        kernel
+            .ipc_send(handoff.supervisor_fault_recv_cap, raw)
+            .expect_err("recv cap cannot send");
     }
 
     #[test]
-    fn restart_within_budget_succeeds() {
-        let (mut kernel, _handoff, mut supervisor) = setup_supervisor();
-        let _token = kernel.exit_task(2, 9).expect("exit");
-        let decision = supervisor
-            .handle_kernel_event(&mut kernel)
-            .expect("handle")
-            .expect("decision");
-        assert_eq!(
-            decision,
-            SupervisorDecision::Restarted {
-                tid: 2,
-                kind: ManagedServiceKind::Core(CoreServiceKind::ProcessManager),
-                backoff_ticks: 10,
-                redelegation_required: false,
-            }
-        );
-        assert_eq!(kernel.task_status(2), Some(TaskStatus::Runnable));
-    }
-
-    #[test]
-    fn exhausted_budget_marks_service_dead() {
-        let (mut kernel, _handoff, mut supervisor) = setup_supervisor();
-        supervisor.policies.process_manager.max_restarts = 1;
+    fn restart_window_and_backoff_are_enforced() {
+        let (mut kernel, _init, _handoff, mut supervisor) = setup_supervisor();
+        supervisor.run_until_idle(&mut kernel).expect("loop");
         let token = kernel.exit_task(2, 9).expect("exit");
-        let _ = supervisor
+        let decision = supervisor
             .handle_task_exit(
                 &mut kernel,
                 TaskExitedEvent {
@@ -337,60 +654,91 @@ mod tests {
                     restart_token: token,
                 },
             )
-            .expect("restart");
-        let token = kernel.exit_task(2, 10).expect("exit2");
-        let decision = supervisor
-            .handle_task_exit(
-                &mut kernel,
-                TaskExitedEvent {
-                    tid: 2,
-                    exit_code: 10,
-                    restart_token: token,
-                },
-            )
-            .expect("mark dead");
-        assert_eq!(
-            decision,
-            SupervisorDecision::MarkedDead {
-                tid: 2,
-                kind: ManagedServiceKind::Core(CoreServiceKind::ProcessManager),
+            .expect("decision");
+        match decision {
+            SupervisorDecision::ScheduledRestart { due_tick, .. } => {
+                assert_eq!(due_tick, TickInstant(10));
             }
-        );
-        assert!(supervisor.degraded());
-        assert_eq!(kernel.task_status(2), Some(TaskStatus::Dead));
+            _ => panic!("expected scheduled restart"),
+        }
+        assert_eq!(kernel.task_status(2), Some(TaskStatus::Exited(9)));
+        supervisor.run_until_idle(&mut kernel).expect("idle");
+        assert_eq!(supervisor.current_tick(), TickInstant(10));
+        assert_eq!(kernel.task_status(2), Some(TaskStatus::Runnable));
     }
 
     #[test]
-    fn driver_restart_requires_redelegation() {
-        let (mut kernel, _handoff, mut supervisor) = setup_supervisor();
+    fn dependency_aware_restart_groups_restart_dependents() {
+        let (mut kernel, _init, _handoff, mut supervisor) = setup_supervisor();
+        supervisor.run_until_idle(&mut kernel).expect("loop");
+        let token_vfs = kernel.exit_task(3, 1).expect("vfs exit");
+        let token_proc = kernel.exit_task(2, 2).expect("proc exit");
+        let _ = supervisor
+            .handle_task_exit(
+                &mut kernel,
+                TaskExitedEvent {
+                    tid: 3,
+                    exit_code: 1,
+                    restart_token: token_vfs,
+                },
+            )
+            .expect("schedule");
+        let proc_status = supervisor.status_for(2).expect("proc status");
+        assert_eq!(proc_status.restart_group, 1);
+        assert_eq!(kernel.task_restart_token(2), Some(token_proc));
+    }
+
+    #[test]
+    fn actual_init_supervisor_alert_delivery_and_status_query_work() {
+        let (mut kernel, _init, handoff, mut supervisor) = setup_supervisor();
+        supervisor.run_until_idle(&mut kernel).expect("loop");
+        let query = query_status_message(1, SupervisorStatusRequest { tid: 2 }).expect("query");
+        kernel
+            .ipc_send(handoff.supervisor_control_send_cap, query)
+            .expect("send");
+        supervisor
+            .run_until_idle(&mut kernel)
+            .expect("process query");
+        let reply = kernel
+            .try_ipc_recv(handoff.init_alert_recv_cap)
+            .expect("recv")
+            .expect("reply");
+        assert_eq!(reply.opcode, SUPERVISOR_OP_QUERY_STATUS);
+        let status = SupervisorStatusReply::decode(reply.as_slice()).expect("status");
+        assert_eq!(status.tid, 2);
+    }
+
+    #[test]
+    fn automatic_driver_redelegation_runs_after_restart() {
+        let (mut kernel, _init, handoff, mut supervisor) = setup_supervisor();
         kernel
             .register_task_with_class(20, TaskClass::Driver)
             .expect("task 20");
         kernel.register_driver(20).expect("driver");
         let (_id, mem) = kernel.alloc_anonymous_memory_object().expect("mem");
         let iova = kernel.create_iova_space_cap().expect("iova");
-        let bundle = kernel
-            .delegate_driver_bundle(crate::kernel::boot::DriverBundlePlan {
-                server_tid: crate::kernel::ipc::ThreadId(20),
+        let register = register_driver_message(
+            1,
+            RegisterDriverRequest {
+                tid: 20,
+                max_restarts: 2,
+                restart_group: 2,
+                backoff_ticks: 3,
                 irq_line: 5,
-                mem_cap: mem,
-                iova_cap: iova,
+                mem_cap: mem.0,
+                iova_cap: iova.0,
                 iova_base: 0x4000,
-                iova_len: PAGE_SIZE,
-            })
-            .expect("bundle");
-        supervisor
-            .register_driver(
-                20,
-                ServiceRestartPolicy {
-                    max_restarts: 2,
-                    backoff_ticks: 3,
-                },
-            )
-            .expect("reg driver");
+                iova_len: PAGE_SIZE as u64,
+            },
+        )
+        .expect("register");
+        kernel
+            .ipc_send(handoff.supervisor_control_send_cap, register)
+            .expect("send reg");
+        supervisor.run_until_idle(&mut kernel).expect("loop");
 
         let token = kernel.exit_task(20, 11).expect("exit");
-        let decision = supervisor
+        let _ = supervisor
             .handle_task_exit(
                 &mut kernel,
                 TaskExitedEvent {
@@ -399,33 +747,18 @@ mod tests {
                     restart_token: token,
                 },
             )
-            .expect("handle");
-        assert_eq!(
-            decision,
-            SupervisorDecision::Restarted {
-                tid: 20,
-                kind: ManagedServiceKind::Driver,
-                backoff_ticks: 3,
-                redelegation_required: true,
-            }
-        );
-        assert!(supervisor.pending_redelegation(20));
-        assert_eq!(
-            kernel.validate_driver_bundle_live(20, bundle),
-            Err(KernelError::StaleCapability)
-        );
-        let alert = supervisor.take_pending_alert().expect("alert");
-        assert_eq!(alert.kind, InitAlertKind::RedelegationRequired);
-        assert!(supervisor.complete_redelegation(20));
+            .expect("schedule");
+        supervisor.run_until_idle(&mut kernel).expect("restart");
         assert!(!supervisor.pending_redelegation(20));
     }
 
     #[test]
-    fn init_alert_messages_encode_pending_notifications() {
-        let (mut kernel, _handoff, mut supervisor) = setup_supervisor();
+    fn degraded_service_alert_is_delivered_to_init() {
+        let (mut kernel, _init, handoff, mut supervisor) = setup_supervisor();
+        supervisor.run_until_idle(&mut kernel).expect("loop");
         supervisor.policies.process_manager.max_restarts = 0;
         let token = kernel.exit_task(2, 9).expect("exit");
-        let _ = supervisor
+        let decision = supervisor
             .handle_task_exit(
                 &mut kernel,
                 TaskExitedEvent {
@@ -435,8 +768,21 @@ mod tests {
                 },
             )
             .expect("dead");
-        let msg = supervisor.emit_init_alert_message().expect("msg");
-        let alert = InitAlert::decode(msg.as_slice()).expect("alert");
-        assert_eq!(alert.kind, InitAlertKind::ServiceDegraded);
+        assert_eq!(
+            decision,
+            SupervisorDecision::MarkedDead {
+                tid: 2,
+                kind: ManagedServiceKind::Core(CoreServiceKind::ProcessManager),
+            }
+        );
+        let alert = kernel
+            .try_ipc_recv(handoff.init_alert_recv_cap)
+            .expect("recv")
+            .expect("alert");
+        assert_eq!(alert.opcode, SUPERVISOR_OP_INIT_ALERT);
+        assert_eq!(
+            InitAlert::decode(alert.as_slice()).expect("alert").kind,
+            InitAlertKind::ServiceDegraded
+        );
     }
 }

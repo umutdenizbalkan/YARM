@@ -3,7 +3,7 @@ mod mount;
 mod policy;
 
 use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
-use crate::kernel::capabilities::CapId;
+use crate::kernel::capabilities::{CapId, CapRights};
 use crate::kernel::task::TaskClass;
 use crate::kernel::vm::Asid;
 
@@ -11,7 +11,7 @@ pub use launch::{CoreLaunchReport, CoreServiceGraph, CoreServiceHandles, CoreSer
 pub use mount::{MountPlan, MountRecoveryReport, MountServiceKind};
 pub use policy::{
     CoreLaunchStrategy, CoreServiceKind, CoreServicePolicyTable, InitBootPhase, InitFaultHandoff,
-    ServiceRestartPolicy, StartupCap, StartupCapSet,
+    RestartOwner, ServiceRestartPolicy, StartupCap, StartupCapSet,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,9 +288,19 @@ impl InitService {
             .handles
             .supervisor_tid
             .ok_or(KernelError::WrongObject)?;
-        let (_, _, recv_cap) = kernel.create_endpoint(16)?;
-        kernel.set_supervisor_endpoint(recv_cap)?;
-        let handoff = InitFaultHandoff::new(supervisor_tid, recv_cap, restart_window_ticks);
+        let (_, _, fault_recv_cap) = kernel.create_endpoint(16)?;
+        kernel.set_supervisor_endpoint(fault_recv_cap)?;
+        let (_, control_send_cap, control_recv_cap) = kernel.create_endpoint(16)?;
+        let (_, init_alert_send_cap, init_alert_recv_cap) = kernel.create_endpoint(16)?;
+        let handoff = InitFaultHandoff::new(
+            supervisor_tid,
+            fault_recv_cap,
+            control_send_cap,
+            control_recv_cap,
+            init_alert_send_cap,
+            init_alert_recv_cap,
+            restart_window_ticks,
+        );
         self.fault_handoff = Some(handoff);
         Ok(handoff)
     }
@@ -298,6 +308,105 @@ impl InitService {
     pub fn fault_endpoint_cap(&self) -> Option<CapId> {
         self.fault_handoff
             .map(|handoff| handoff.supervisor_fault_recv_cap)
+    }
+
+    pub fn validate_delegation_edges(&self, kernel: &KernelState) -> Result<(), KernelError> {
+        let handoff = self.fault_handoff.ok_or(KernelError::WrongObject)?;
+        if !kernel.capability_has_right(handoff.supervisor_fault_recv_cap, CapRights::RECEIVE)
+            || !kernel.capability_has_right(handoff.supervisor_control_send_cap, CapRights::SEND)
+            || !kernel.capability_has_right(handoff.supervisor_control_recv_cap, CapRights::RECEIVE)
+            || !kernel.capability_has_right(handoff.init_alert_send_cap, CapRights::SEND)
+            || !kernel.capability_has_right(handoff.init_alert_recv_cap, CapRights::RECEIVE)
+        {
+            return Err(KernelError::MissingRight);
+        }
+        Ok(())
+    }
+
+    pub fn seed_supervisor_registrations(
+        &self,
+        kernel: &mut KernelState,
+    ) -> Result<(), KernelError> {
+        use crate::kernel::supervisor_abi::{
+            CoreServiceRegistrationKind, DEP_VFS, RegisterCoreServiceRequest,
+            register_core_service_message,
+        };
+
+        let handoff = self.fault_handoff.ok_or(KernelError::WrongObject)?;
+        let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
+        let proc_tid = self
+            .handles
+            .process_manager_tid
+            .ok_or(KernelError::WrongObject)?;
+        let vfs_tid = self.handles.vfs_tid.ok_or(KernelError::WrongObject)?;
+        let supervisor_tid = self
+            .handles
+            .supervisor_tid
+            .ok_or(KernelError::WrongObject)?;
+        let requests = [
+            RegisterCoreServiceRequest {
+                tid: proc_tid,
+                kind: CoreServiceRegistrationKind::ProcessManager,
+                max_restarts: self.restart_policies.process_manager.max_restarts,
+                restart_group: 1,
+                dependency_mask: DEP_VFS,
+                backoff_ticks: self.restart_policies.process_manager.backoff_ticks,
+            },
+            RegisterCoreServiceRequest {
+                tid: vfs_tid,
+                kind: CoreServiceRegistrationKind::Vfs,
+                max_restarts: self.restart_policies.vfs.max_restarts,
+                restart_group: 1,
+                dependency_mask: 0,
+                backoff_ticks: self.restart_policies.vfs.backoff_ticks,
+            },
+            RegisterCoreServiceRequest {
+                tid: supervisor_tid,
+                kind: CoreServiceRegistrationKind::Supervisor,
+                max_restarts: self.restart_policies.supervisor.max_restarts,
+                restart_group: 2,
+                dependency_mask: 0,
+                backoff_ticks: self.restart_policies.supervisor.backoff_ticks,
+            },
+        ];
+        for request in requests {
+            let msg = register_core_service_message(init_tid, request)
+                .map_err(|_| KernelError::WrongObject)?;
+            kernel.ipc_send(handoff.supervisor_control_send_cap, msg)?;
+        }
+        Ok(())
+    }
+
+    pub fn poll_init_alert(
+        &self,
+        kernel: &mut KernelState,
+    ) -> Result<Option<crate::kernel::supervisor_abi::InitAlert>, KernelError> {
+        let handoff = self.fault_handoff.ok_or(KernelError::WrongObject)?;
+        let Some(msg) = kernel.try_ipc_recv(handoff.init_alert_recv_cap)? else {
+            return Ok(None);
+        };
+        crate::kernel::supervisor_abi::InitAlert::decode(msg.as_slice())
+            .ok_or(KernelError::WrongObject)
+            .map(Some)
+    }
+
+    pub fn monitor_supervisor(&mut self, kernel: &mut KernelState) -> Result<bool, KernelError> {
+        let supervisor_tid = self
+            .handles
+            .supervisor_tid
+            .ok_or(KernelError::WrongObject)?;
+        if kernel.task_status(supervisor_tid) != Some(crate::kernel::task::TaskStatus::Exited(99))
+            && !matches!(
+                kernel.task_status(supervisor_tid),
+                Some(crate::kernel::task::TaskStatus::Exited(_))
+            )
+        {
+            return Ok(false);
+        }
+        let token = kernel
+            .task_restart_token(supervisor_tid)
+            .ok_or(KernelError::WrongObject)?;
+        self.recover_supervisor_failure(kernel, token)
     }
 
     pub fn recover_supervisor_failure(
@@ -321,6 +430,15 @@ impl InitService {
         self.supervisor_restart_count = self.supervisor_restart_count.saturating_add(1);
         if let Some(handoff) = self.fault_handoff {
             kernel.set_supervisor_endpoint(handoff.supervisor_fault_recv_cap)?;
+            let msg = crate::kernel::supervisor_abi::init_alert_message(
+                self.handles.init_tid.unwrap_or(0),
+                crate::kernel::supervisor_abi::InitAlert {
+                    tid: supervisor_tid,
+                    kind: crate::kernel::supervisor_abi::InitAlertKind::SupervisorRestarted,
+                },
+            )
+            .map_err(|_| KernelError::WrongObject)?;
+            kernel.ipc_send(handoff.init_alert_send_cap, msg)?;
         }
         Ok(true)
     }
@@ -329,13 +447,14 @@ impl InitService {
         self.phase = InitBootPhase::Failed;
     }
 
-    pub fn begin_running(&mut self) -> Result<(), KernelError> {
+    pub fn begin_running(&mut self, kernel: &KernelState) -> Result<(), KernelError> {
         if self.phase != InitBootPhase::LaunchingCore
             || self.fault_handoff.is_none()
             || self.mount_status.is_none()
         {
             return Err(KernelError::WrongObject);
         }
+        self.validate_delegation_edges(kernel)?;
         self.phase = InitBootPhase::Running;
         Ok(())
     }
@@ -399,7 +518,7 @@ mod tests {
 
         let handoff = init.install_fault_handoff(&mut state, 50).expect("handoff");
         assert_eq!(handoff.supervisor_tid, 4);
-        init.begin_running().expect("running");
+        init.begin_running(&state).expect("running");
         assert_eq!(init.phase(), InitBootPhase::Running);
     }
 
@@ -513,7 +632,7 @@ mod tests {
             },
         )
         .expect("launch");
-        assert_eq!(init.begin_running(), Err(KernelError::WrongObject));
+        assert_eq!(init.begin_running(&state), Err(KernelError::WrongObject));
     }
 
     #[test]
@@ -580,9 +699,11 @@ mod tests {
         let handoff = init
             .install_fault_handoff(&mut state, 100)
             .expect("handoff");
+        init.seed_supervisor_registrations(&mut state)
+            .expect("seed");
         let token = state.exit_task(2, 5).expect("exit");
         let msg = state
-            .ipc_recv(handoff.supervisor_fault_recv_cap)
+            .try_ipc_recv(handoff.supervisor_fault_recv_cap)
             .expect("recv")
             .expect("msg");
         let event =
@@ -615,7 +736,9 @@ mod tests {
         let _handoff = init
             .install_fault_handoff(&mut state, 100)
             .expect("handoff");
-        init.begin_running().expect("running");
+        init.seed_supervisor_registrations(&mut state)
+            .expect("seed");
+        init.begin_running(&state).expect("running");
         let token = state.exit_task(4, 99).expect("exit");
         assert!(
             init.recover_supervisor_failure(&mut state, token)

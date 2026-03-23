@@ -388,6 +388,18 @@ impl KernelState {
             .map(|tcb| tcb.status)
     }
 
+    pub fn task_restart_token(&self, tid: u64) -> Option<u64> {
+        self.tcbs
+            .iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .and_then(|tcb| tcb.restart.token.map(|token| token.0))
+    }
+
+    pub fn capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
+        self.cspace.has_right(cap, right)
+    }
+
     pub fn last_fault(&self) -> Option<FaultInfo> {
         self.faults.last_fault
     }

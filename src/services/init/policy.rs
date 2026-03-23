@@ -108,9 +108,28 @@ impl CoreServicePolicyTable {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartOwner {
+    Init,
+    Supervisor,
+}
+
+impl CoreServicePolicyTable {
+    pub const fn restart_owner_for(service: CoreServiceKind) -> RestartOwner {
+        match service {
+            CoreServiceKind::ProcessManager | CoreServiceKind::Vfs => RestartOwner::Supervisor,
+            CoreServiceKind::Supervisor => RestartOwner::Init,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitFaultHandoff {
     pub supervisor_tid: u64,
     pub supervisor_fault_recv_cap: CapId,
+    pub supervisor_control_send_cap: CapId,
+    pub supervisor_control_recv_cap: CapId,
+    pub init_alert_send_cap: CapId,
+    pub init_alert_recv_cap: CapId,
     pub restart_window_ticks: u64,
 }
 
@@ -118,11 +137,19 @@ impl InitFaultHandoff {
     pub const fn new(
         supervisor_tid: u64,
         supervisor_fault_recv_cap: CapId,
+        supervisor_control_send_cap: CapId,
+        supervisor_control_recv_cap: CapId,
+        init_alert_send_cap: CapId,
+        init_alert_recv_cap: CapId,
         restart_window_ticks: u64,
     ) -> Self {
         Self {
             supervisor_tid,
             supervisor_fault_recv_cap,
+            supervisor_control_send_cap,
+            supervisor_control_recv_cap,
+            init_alert_send_cap,
+            init_alert_recv_cap,
             restart_window_ticks,
         }
     }

@@ -393,6 +393,50 @@ impl KernelState {
         self.ipc_send(send_cap, msg)
     }
 
+    pub fn try_ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
+        let capability = self
+            .cspace
+            .get(recv_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        if !capability.has_right(CapRights::RECEIVE) {
+            return Err(KernelError::MissingRight);
+        }
+
+        let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+
+        let endpoint = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?;
+
+        if let Some(msg) = endpoint.recv() {
+            if let Some((sender_tid, pending_msg, sender_blocked)) =
+                self.ipc.endpoint_sender_waiters[endpoint_idx].take()
+            {
+                endpoint
+                    .send(pending_msg)
+                    .map_err(|_| KernelError::EndpointQueueFull)?;
+                if sender_blocked {
+                    self.wake_sender_waiter(sender_tid)?;
+                }
+            }
+            return Ok(Some(msg));
+        }
+
+        if let Some((sender_tid, pending_msg, sender_blocked)) =
+            self.ipc.endpoint_sender_waiters[endpoint_idx].take()
+        {
+            if sender_blocked {
+                self.wake_sender_waiter(sender_tid)?;
+            }
+            return Ok(Some(pending_msg));
+        }
+
+        Ok(None)
+    }
+
     pub fn ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
         let capability = self
             .cspace

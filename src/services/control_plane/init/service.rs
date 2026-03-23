@@ -29,7 +29,9 @@ pub fn run() {
     let _handoff = init
         .install_fault_handoff(&mut kernel, 100)
         .expect("handoff");
-    init.begin_running().expect("running");
+    init.seed_supervisor_registrations(&mut kernel)
+        .expect("seed");
+    init.begin_running(&kernel).expect("running");
 
     crate::yarm_log!(
         "init.srv scaffold online: phase={:?}, handles={:?}, present_cpus={}, present_bitmap=0x{:x}, online_cpus={}",
