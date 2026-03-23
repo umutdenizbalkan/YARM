@@ -1,5 +1,6 @@
 use crate::arch::syscall_abi;
 use crate::kernel::task::UserRegisterContext;
+use crate::kernel::vm::VirtAddr;
 
 /// Register-width syscall/trap argument frame.
 ///
@@ -24,6 +25,14 @@ const _: () = assert!(core::mem::offset_of!(TrapFrame, args) == core::mem::size_
 const _: () = assert!(
     core::mem::offset_of!(TrapFrame, ret0)
         == core::mem::size_of::<usize>() * (1 + syscall_abi::TRAPFRAME_ARG_REGS)
+);
+const _: () = assert!(
+    core::mem::offset_of!(TrapFrame, saved_pc)
+        == core::mem::size_of::<usize>() * (1 + syscall_abi::TRAPFRAME_ARG_REGS + 4)
+);
+const _: () = assert!(
+    core::mem::offset_of!(TrapFrame, saved_sp)
+        == core::mem::size_of::<usize>() * (1 + syscall_abi::TRAPFRAME_ARG_REGS + 5)
 );
 
 impl TrapFrame {
@@ -108,34 +117,23 @@ impl TrapFrame {
         self.error = code;
     }
 
+    /// Convenience shorthand for `self.error_code().is_some()`.
     pub const fn is_error(&self) -> bool {
         self.error != 0
     }
 
     pub fn capture_user_context(&self) -> UserRegisterContext {
-        let instruction_ptr = if self.ret0 != 0 {
-            self.ret0
-        } else {
-            self.saved_pc
-        };
-        let stack_ptr = if self.ret1 != 0 {
-            self.ret1
-        } else {
-            self.saved_sp
-        };
         UserRegisterContext {
-            instruction_ptr,
-            stack_ptr,
+            instruction_ptr: VirtAddr(self.saved_pc as u64),
+            stack_ptr: VirtAddr(self.saved_sp as u64),
             arg0: self.args[0],
             arg1: self.args[1],
         }
     }
 
     pub fn apply_user_context(&mut self, context: UserRegisterContext) {
-        self.saved_pc = context.instruction_ptr;
-        self.saved_sp = context.stack_ptr;
-        self.ret0 = context.instruction_ptr;
-        self.ret1 = context.stack_ptr;
+        self.saved_pc = context.instruction_ptr.0 as usize;
+        self.saved_sp = context.stack_ptr.0 as usize;
         self.args[0] = context.arg0;
         self.args[1] = context.arg1;
     }
@@ -183,14 +181,14 @@ mod tests {
         frame.set_saved_pc(0x4000);
         frame.set_saved_sp(0x8000);
         let ctx = frame.capture_user_context();
-        assert_eq!(ctx.instruction_ptr, 0x4000);
-        assert_eq!(ctx.stack_ptr, 0x8000);
+        assert_eq!(ctx.instruction_ptr, VirtAddr(0x4000));
+        assert_eq!(ctx.stack_ptr, VirtAddr(0x8000));
         assert_eq!(ctx.arg0, 5);
         assert_eq!(ctx.arg1, 6);
 
         frame.apply_user_context(UserRegisterContext {
-            instruction_ptr: 0x5000,
-            stack_ptr: 0x9000,
+            instruction_ptr: VirtAddr(0x5000),
+            stack_ptr: VirtAddr(0x9000),
             arg0: 7,
             arg1: 8,
         });

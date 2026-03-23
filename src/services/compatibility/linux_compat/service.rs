@@ -1,6 +1,6 @@
-use crate::kernel::bootstrap::Bootstrap;
+use crate::kernel::boot::Bootstrap;
 use crate::kernel::ipc::Message;
-use crate::kernel::proc_proto::PROC_OP_GETPID;
+use crate::kernel::process_abi::PROC_OP_GETPID;
 use crate::kernel::trapframe::TrapFrame;
 
 use super::{LINUX_NR_GETPID, LinuxServiceBindings, dispatch};

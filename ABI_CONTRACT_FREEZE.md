@@ -21,7 +21,7 @@ This file marks the current in-kernel mechanism contracts as intentionally stabl
    - Contract: at most one preempt decision per quantum boundary tick.
 
 5. **Restart/fault contracts at bootstrap boundary**
-   - `KernelState::restart_task`, `KernelState::exit_task`, `KernelState::handle_trap_event` in `src/kernel/bootstrap.rs`.
+   - `KernelState::restart_task`, `KernelState::exit_task`, `KernelState::handle_trap_event` in `src/kernel/boot/mod.rs`.
    - Contract: restart backoff/budget/token checks are enforced before making task runnable.
 
 ## Change process

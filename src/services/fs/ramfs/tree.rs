@@ -1,4 +1,4 @@
-use crate::kernel::vfs::{VfsBackend, VfsLiteError};
+use crate::kernel::vfs::{VfsBackend, VfsError};
 use crate::services::common::fs::{
     FdRecord, InodeRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend, find_inode_index,
 };
@@ -25,18 +25,18 @@ impl RamFsBackend {
         }
     }
 
-    fn alloc_fd(&mut self, inode: u64) -> Result<u64, VfsLiteError> {
+    fn alloc_fd(&mut self, inode: u64) -> Result<u64, VfsError> {
         let fd = self.next_fd;
         self.next_fd = self.next_fd.saturating_add(1);
         if let Some(slot) = self.fds.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(FdRecord { fd, inode });
             Ok(fd)
         } else {
-            Err(VfsLiteError::NoFd)
+            Err(VfsError::NoFd)
         }
     }
 
-    fn open_inode(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+    fn open_inode(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         if let Some(inode) = self
             .inodes
             .iter()
@@ -53,10 +53,10 @@ impl RamFsBackend {
             });
             return self.alloc_fd(path_ptr);
         }
-        Err(VfsLiteError::NoFd)
+        Err(VfsError::NoFd)
     }
 
-    fn close_fd(&mut self, fd: u64) -> Result<(), VfsLiteError> {
+    fn close_fd(&mut self, fd: u64) -> Result<(), VfsError> {
         if let Some(slot) = self
             .fds
             .iter_mut()
@@ -65,7 +65,7 @@ impl RamFsBackend {
             *slot = None;
             Ok(())
         } else {
-            Err(VfsLiteError::BadFd)
+            Err(VfsError::BadFd)
         }
     }
 
@@ -83,41 +83,41 @@ impl ServiceFsBackend for RamFsBackend {
         "ramfs"
     }
 
-    fn validate(&self) -> Result<(), VfsLiteError> {
+    fn validate(&self) -> Result<(), VfsError> {
         Ok(())
     }
 }
 
 impl VfsBackend for RamFsBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         self.open_inode(path_ptr)
     }
 
-    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+    fn close(&mut self, fd: u64) -> Result<u64, VfsError> {
         self.close_fd(fd)?;
         Ok(0)
     }
 
-    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
-        let inode = self.inode_for_fd(fd).ok_or(VfsLiteError::BadFd)?;
-        let idx = find_inode_index(&self.inodes, inode).ok_or(VfsLiteError::BadFd)?;
-        let file_len = self.inodes[idx].ok_or(VfsLiteError::BadFd)?.file_len;
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
+        let inode = self.inode_for_fd(fd).ok_or(VfsError::BadFd)?;
+        let idx = find_inode_index(&self.inodes, inode).ok_or(VfsError::BadFd)?;
+        let file_len = self.inodes[idx].ok_or(VfsError::BadFd)?.file_len;
         Ok(core::cmp::min(len, file_len))
     }
 
-    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
-        let inode = self.inode_for_fd(fd).ok_or(VfsLiteError::BadFd)?;
-        let idx = find_inode_index(&self.inodes, inode).ok_or(VfsLiteError::BadFd)?;
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
+        let inode = self.inode_for_fd(fd).ok_or(VfsError::BadFd)?;
+        let idx = find_inode_index(&self.inodes, inode).ok_or(VfsError::BadFd)?;
         let Some(mut inode_slot) = self.inodes[idx] else {
-            return Err(VfsLiteError::BadFd);
+            return Err(VfsError::BadFd);
         };
         inode_slot.file_len = inode_slot.file_len.saturating_add(len);
         self.inodes[idx] = Some(inode_slot);
         Ok(len)
     }
 
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
-        let idx = find_inode_index(&self.inodes, path_ptr).ok_or(VfsLiteError::BadFd)?;
-        Ok(self.inodes[idx].ok_or(VfsLiteError::BadFd)?.file_len)
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
+        let idx = find_inode_index(&self.inodes, path_ptr).ok_or(VfsError::BadFd)?;
+        Ok(self.inodes[idx].ok_or(VfsError::BadFd)?.file_len)
     }
 }

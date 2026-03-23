@@ -1,7 +1,6 @@
 use super::{
-    ALLOWED_SERVICE_DELEGATION_EDGES, DeviceServerDelegation, DriverBundlePlan,
-    DriverDelegationBundle, DriverRecord, IpcPathTelemetry, KernelError, KernelState,
-    ServicePolicyEntry, ServiceRole,
+    DeviceServerDelegation, DriverBundlePlan, DriverDelegationBundle, DriverRecord,
+    IpcPathTelemetry, KernelError, KernelState,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::ThreadId;
@@ -49,7 +48,7 @@ impl KernelState {
             CapObject::Irq { .. } => {}
             _ => return Err(KernelError::WrongObject),
         }
-        if !capability.has_right(CapRights::Signal) {
+        if !capability.has_right(CapRights::SIGNAL) {
             return Err(KernelError::MissingRight);
         }
         let record = self
@@ -65,10 +64,7 @@ impl KernelState {
 
     pub fn mint_irq_cap(&mut self, line: u16) -> Result<CapId, KernelError> {
         self.cspace
-            .mint(Capability::new(
-                CapObject::Irq { line },
-                &[CapRights::Signal],
-            ))
+            .mint(Capability::new(CapObject::Irq { line }, CapRights::SIGNAL))
             .map_err(|_| KernelError::CapabilityFull)
     }
 
@@ -77,10 +73,7 @@ impl KernelState {
         self.drivers.next_iova_space_id =
             self.drivers.next_iova_space_id.checked_add(1).unwrap_or(1);
         self.cspace
-            .mint(Capability::new(
-                CapObject::IovaSpace { id },
-                &[CapRights::Map],
-            ))
+            .mint(Capability::new(CapObject::IovaSpace { id }, CapRights::MAP))
             .map_err(|_| KernelError::CapabilityFull)
     }
 
@@ -123,9 +116,9 @@ impl KernelState {
             CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
             _ => return Err(KernelError::WrongObject),
         };
-        if !capability.has_right(CapRights::Map)
-            || !capability.has_right(CapRights::Read)
-            || !capability.has_right(CapRights::Write)
+        if !capability.has_right(CapRights::MAP)
+            || !capability.has_right(CapRights::READ)
+            || !capability.has_right(CapRights::WRITE)
         {
             return Err(KernelError::MissingRight);
         }
@@ -151,7 +144,7 @@ impl KernelState {
                     offset: offset as u64,
                     len: len as u64,
                 },
-                &[CapRights::Map, CapRights::Read, CapRights::Write],
+                CapRights::MAP | CapRights::READ | CapRights::WRITE,
             ))
             .map_err(|_| KernelError::CapabilityFull)
     }
@@ -219,88 +212,6 @@ impl KernelState {
 
     pub fn ipc_path_telemetry(&self) -> IpcPathTelemetry {
         self.ipc.telemetry
-    }
-
-    pub fn register_service_role(
-        &mut self,
-        tid: u64,
-        role: ServiceRole,
-    ) -> Result<(), KernelError> {
-        if self.tcb_mut(tid).is_none() {
-            return Err(KernelError::TaskMissing);
-        }
-        let tid = ThreadId(tid);
-        if let Some(entry) = self
-            .drivers
-            .service_policy
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.tid == tid)
-        {
-            entry.role = role;
-            return Ok(());
-        }
-        let slot = self
-            .drivers
-            .service_policy
-            .iter_mut()
-            .find(|slot| slot.is_none())
-            .ok_or(KernelError::TaskTableFull)?;
-        *slot = Some(ServicePolicyEntry { tid, role });
-        Ok(())
-    }
-
-    fn service_role(&self, tid: ThreadId) -> Option<ServiceRole> {
-        self.drivers
-            .service_policy
-            .iter()
-            .flatten()
-            .find(|entry| entry.tid == tid)
-            .map(|entry| entry.role)
-    }
-
-    pub const fn allowed_service_delegation_edges() -> &'static [(ServiceRole, ServiceRole)] {
-        ALLOWED_SERVICE_DELEGATION_EDGES
-    }
-
-    fn can_delegate_service(
-        &self,
-        delegator_role: ServiceRole,
-        receiver_role: ServiceRole,
-    ) -> bool {
-        Self::allowed_service_delegation_edges()
-            .iter()
-            .any(|edge| *edge == (delegator_role, receiver_role))
-    }
-
-    pub fn validate_service_delegation(
-        &self,
-        delegator_tid: u64,
-        receiver_tid: u64,
-    ) -> Result<(), KernelError> {
-        let Some(delegator_role) = self.service_role(ThreadId(delegator_tid)) else {
-            return Err(KernelError::MissingRight);
-        };
-        let Some(receiver_role) = self.service_role(ThreadId(receiver_tid)) else {
-            return Err(KernelError::WrongObject);
-        };
-        if self.can_delegate_service(delegator_role, receiver_role) {
-            Ok(())
-        } else {
-            Err(KernelError::MissingRight)
-        }
-    }
-
-    pub fn delegate_driver_bundle_checked(
-        &mut self,
-        delegator_tid: u64,
-        plan: DriverBundlePlan,
-    ) -> Result<DriverDelegationBundle, KernelError> {
-        self.validate_service_delegation(delegator_tid, plan.server_tid.0)?;
-        if self.service_role(plan.server_tid) != Some(ServiceRole::Driver) {
-            return Err(KernelError::WrongObject);
-        }
-        self.delegate_driver_bundle(plan)
     }
 
     pub fn validate_driver_bundle_live(

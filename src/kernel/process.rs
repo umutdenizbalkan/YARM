@@ -1,5 +1,5 @@
 use super::ipc::Message;
-use super::proc_proto::{
+use super::process_abi::{
     SpawnV2Args, WaitPidV2Args, WaitPidV2Reply, PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID,
     PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
 };
@@ -122,19 +122,19 @@ struct ThreadIdentityRecord {
 }
 
 #[derive(Debug)]
-pub struct ProcessManagerLite {
+pub struct ProcessManager {
     next_pid: ProcessId,
     table: [Option<ProcessRecord>; MAX_PROCESSES],
     threads: [Option<ThreadIdentityRecord>; MAX_THREADS],
 }
 
-impl Default for ProcessManagerLite {
+impl Default for ProcessManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ProcessManagerLite {
+impl ProcessManager {
     pub const fn new() -> Self {
         Self {
             next_pid: ProcessId(1000),
@@ -354,14 +354,14 @@ impl ProcessManagerLite {
 
 #[derive(Debug, Default)]
 pub struct ProcessService {
-    manager: ProcessManagerLite,
+    manager: ProcessManager,
     handled: usize,
 }
 
 impl ProcessService {
     pub const fn new() -> Self {
         Self {
-            manager: ProcessManagerLite::new(),
+            manager: ProcessManager::new(),
             handled: 0,
         }
     }
@@ -394,7 +394,7 @@ impl ProcessService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::proc_proto::{SpawnV2Args, WaitPidV2Args};
+    use crate::kernel::process_abi::{SpawnV2Args, WaitPidV2Args};
 
     #[test]
     fn elf_image_info_parser_accepts_minimal_elf64_header() {
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn spawn_from_elf_image_allocates_pid_and_returns_entry() {
-        let mut pm = ProcessManagerLite::new();
+        let mut pm = ProcessManager::new();
         let mut image = [0u8; 64];
         image[..4].copy_from_slice(b"ELF");
         image[24..32].copy_from_slice(&0x402000u64.to_le_bytes());
@@ -431,7 +431,7 @@ mod tests {
             &SpawnV2Args::new(7, 99).encode(),
         )
         .expect("msg");
-        let req = ProcessManagerLite::parse_request(msg).expect("parse");
+        let req = ProcessManager::parse_request(msg).expect("parse");
         assert_eq!(
             req,
             ProcessRequest::SpawnV2(SpawnV2Request {
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn process_manager_spawn_allocates_pid_and_wait_observes_exit() {
-        let mut pm = ProcessManagerLite::new();
+        let mut pm = ProcessManager::new();
         let spawn = Message::with_header(
             0,
             PROC_OP_SPAWN_V2,
@@ -482,14 +482,14 @@ mod tests {
         )
         .expect("msg");
         assert_eq!(
-            ProcessManagerLite::parse_request(msg),
+            ProcessManager::parse_request(msg),
             Err(ProcessManagerError::InvalidTransport)
         );
     }
 
     #[test]
     fn waitpid_reaps_exited_child() {
-        let mut pm = ProcessManagerLite::new();
+        let mut pm = ProcessManager::new();
         let spawn = Message::with_header(
             0,
             PROC_OP_SPAWN_V2,
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn waitpid_rejects_non_parent_caller() {
-        let mut pm = ProcessManagerLite::new();
+        let mut pm = ProcessManager::new();
         let spawn = Message::with_header(
             0,
             PROC_OP_SPAWN_V2,
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn waitpid_rejects_unknown_target() {
-        let mut pm = ProcessManagerLite::new();
+        let mut pm = ProcessManager::new();
         let wait = Message::with_header(
             0,
             PROC_OP_WAITPID_V2,
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn process_manager_tracks_explicit_thread_identities() {
-        let mut pm = ProcessManagerLite::new();
+        let mut pm = ProcessManager::new();
         let pid = pm.alloc_process(ProcessId(1)).expect("pid");
         pm.register_thread_identity(pid, 2000, ThreadGroupId(pid.0))
             .expect("thread");

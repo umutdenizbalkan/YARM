@@ -1,11 +1,11 @@
-use crate::kernel::bootstrap::Bootstrap;
-use crate::kernel::init_server::{
-    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitFaultHandoff, InitServerLite,
+use crate::kernel::boot::Bootstrap;
+use crate::services::init::{
+    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitService,
 };
 
 pub fn run() {
     let mut kernel = Bootstrap::init().expect("init");
-    let mut init = InitServerLite::new();
+    let mut init = InitService::new();
     init.set_launch_strategy(CoreLaunchStrategy::SupervisorFirst);
     let graph = CoreServiceGraph {
         init_tid: 1,
@@ -16,8 +16,6 @@ pub fn run() {
 
     init.register_core_graph(&mut kernel, graph)
         .expect("register graph");
-    init.validate_core_delegation_paths(&kernel, graph.init_tid)
-        .expect("delegation paths");
     let _ = init
         .launch_core_services(
             &mut kernel,
@@ -28,12 +26,12 @@ pub fn run() {
             },
         )
         .expect("launch");
-    init.install_fault_handoff(InitFaultHandoff {
-        supervisor_tid: graph.supervisor_tid,
-        restart_window_ticks: 100,
-    })
-    .expect("handoff");
-    init.begin_running().expect("running");
+    let _handoff = init
+        .install_fault_handoff(&mut kernel, 100)
+        .expect("handoff");
+    init.seed_supervisor_registrations(&mut kernel)
+        .expect("seed");
+    init.begin_running(&kernel).expect("running");
 
     crate::yarm_log!(
         "init.srv scaffold online: phase={:?}, handles={:?}, present_cpus={}, present_bitmap=0x{:x}, online_cpus={}",

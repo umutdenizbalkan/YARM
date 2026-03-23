@@ -53,9 +53,9 @@ mod tests {
 
         fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent {
             if context.scause == 8 {
-                TrapEvent::syscall()
+                TrapEvent::Syscall
             } else {
-                TrapEvent::page_fault(FaultInfo {
+                TrapEvent::PageFault(FaultInfo {
                     addr: VirtAddr(context.stval as u64),
                     access: FaultAccess::Write,
                 })
@@ -93,9 +93,9 @@ mod tests {
 
         fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent {
             if context.vector == 0x80 {
-                TrapEvent::syscall()
+                TrapEvent::Syscall
             } else {
-                TrapEvent::page_fault(FaultInfo {
+                TrapEvent::PageFault(FaultInfo {
                     addr: VirtAddr(context.fault_addr as u64),
                     access: FaultAccess::Read,
                 })
@@ -133,9 +133,9 @@ mod tests {
 
         fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent {
             if context.esr == 0x15 {
-                TrapEvent::syscall()
+                TrapEvent::Syscall
             } else {
-                TrapEvent::page_fault(FaultInfo {
+                TrapEvent::PageFault(FaultInfo {
                     addr: VirtAddr(context.far),
                     access: FaultAccess::Read,
                 })
@@ -154,7 +154,7 @@ mod tests {
             scause: 8,
             stval: 0,
         });
-        assert_eq!(trap, TrapEvent::syscall());
+        assert_eq!(trap, TrapEvent::Syscall);
         assert_eq!(hal.last_asid, Some(Asid(3)));
         assert_eq!(hal.last_irq, Some((CpuId(0), 9)));
         assert_eq!(hal.last_timer, Some((CpuId(0), 100)));
@@ -173,7 +173,7 @@ mod tests {
         });
         assert_eq!(
             trap,
-            TrapEvent::page_fault(FaultInfo {
+            TrapEvent::PageFault(FaultInfo {
                 addr: VirtAddr(0xDEAD_0000),
                 access: FaultAccess::Read,
             })
@@ -196,7 +196,7 @@ mod tests {
         });
         assert_eq!(
             trap,
-            TrapEvent::page_fault(FaultInfo {
+            TrapEvent::PageFault(FaultInfo {
                 addr: VirtAddr(0xABCD_1000),
                 access: FaultAccess::Read,
             })

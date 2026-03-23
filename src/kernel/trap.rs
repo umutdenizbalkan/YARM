@@ -2,10 +2,18 @@ use super::vm::VirtAddr;
 
 pub type IrqNumber = u16;
 
+// NOTE: `TrapEvent` and `Trap` currently live in the kernel layer for prototype
+// simplicity. When multi-arch support expands, `TrapEvent` should move to
+// `crate::arch::trap` so each architecture entry path produces a typed event
+// and the kernel layer only consumes `TrapAction`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultAccess {
     Read,
     Write,
+    /// Instruction fetch from a non-executable page.
+    /// RISC-V: instruction page fault / fetch-side fault classification from
+    /// `scause`.
+    /// x86-64: `#PF` with the instruction-fetch bit set in the error code.
     Execute,
 }
 
@@ -40,22 +48,6 @@ pub enum TrapEvent {
 }
 
 impl TrapEvent {
-    pub const fn syscall() -> Self {
-        Self::Syscall
-    }
-
-    pub const fn page_fault(fault: FaultInfo) -> Self {
-        Self::PageFault(fault)
-    }
-
-    pub const fn timer_interrupt() -> Self {
-        Self::TimerInterrupt
-    }
-
-    pub const fn external_interrupt(irq: IrqNumber) -> Self {
-        Self::ExternalInterrupt(irq)
-    }
-
     pub const fn trap(&self) -> Trap {
         match self {
             Self::Syscall => Trap::Syscall,
@@ -80,8 +72,12 @@ impl TrapEvent {
     }
 }
 
-/// Routing is currently 1:1 with trap kind. Kept as a separate action enum so
-/// future policy can map one trap kind to richer action flows.
+/// Routing is currently 1:1 with trap kind. Kept as a separate action enum for
+/// future non-trivial mappings, for example:
+///   - `PageFault` during a kernel copy-from-user -> `HandleKernelCopyFault`
+///     instead of suspending the current user task.
+///   - `ExternalInterrupt` on a known timer line on secondary CPUs ->
+///     `TickScheduler` rather than generic IRQ routing.
 pub fn route_trap(event: &TrapEvent) -> TrapAction {
     match event {
         TrapEvent::Syscall => TrapAction::DispatchSyscall,
@@ -97,30 +93,27 @@ mod tests {
 
     #[test]
     fn trap_router_maps_syscall() {
-        assert_eq!(route_trap(&TrapEvent::syscall()), TrapAction::DispatchSyscall);
+        assert_eq!(route_trap(&TrapEvent::Syscall), TrapAction::DispatchSyscall);
     }
 
     #[test]
     fn trap_event_can_carry_irq_number() {
-        let event = TrapEvent::external_interrupt(7);
+        let event = TrapEvent::ExternalInterrupt(7);
         assert_eq!(event.irq(), Some(7));
         assert_eq!(event.fault(), None);
     }
 
     #[test]
     fn router_covers_all_traps() {
-        assert_eq!(route_trap(&TrapEvent::syscall()), TrapAction::DispatchSyscall);
+        assert_eq!(route_trap(&TrapEvent::Syscall), TrapAction::DispatchSyscall);
         assert_eq!(
-            route_trap(&TrapEvent::page_fault(FaultInfo {
+            route_trap(&TrapEvent::PageFault(FaultInfo {
                 addr: VirtAddr(0x1000),
                 access: FaultAccess::Read,
             })),
             TrapAction::HandlePageFault
         );
-        assert_eq!(route_trap(&TrapEvent::timer_interrupt()), TrapAction::TickScheduler);
-        assert_eq!(
-            route_trap(&TrapEvent::external_interrupt(1)),
-            TrapAction::RouteIrq
-        );
+        assert_eq!(route_trap(&TrapEvent::TimerInterrupt), TrapAction::TickScheduler);
+        assert_eq!(route_trap(&TrapEvent::ExternalInterrupt(1)), TrapAction::RouteIrq);
     }
 }

@@ -30,9 +30,9 @@ This contract defines the minimum invariants for Phase-2 driver services (`irqmu
 
 ## CI gate mapping
 
-- `kernel::bootstrap::tests::delegate_driver_bundle_checked_enforces_service_role_edges`
-- `kernel::bootstrap::tests::restart_denial_escalates_to_supervisor_every_threshold`
-- `kernel::bootstrap::tests::driver_restart_revokes_runtime_caps`
+- `kernel::boot::tests::delegate_driver_bundle_checked_enforces_service_role_edges`
+- `kernel::boot::tests::restart_denial_escalates_to_supervisor_every_threshold`
+- `kernel::boot::tests::driver_restart_revokes_runtime_caps`
 
 The above are required to pass in `.github/workflows/compat-gates.yml` under `phase2-driver-gates`.
 

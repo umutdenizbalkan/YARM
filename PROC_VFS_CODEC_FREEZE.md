@@ -2,7 +2,7 @@
 
 This document freezes the typed wire payload contracts used by the process-manager and VFS service paths.
 
-## Process manager (`src/kernel/proc_proto.rs`)
+## Process manager (`src/kernel/process_abi.rs`)
 
 - Server ABI version: `PROC_SERVER_ABI_VERSION = 1`
 - Typed codec version: `PROC_CODEC_V2_VERSION = 2`
@@ -19,7 +19,7 @@ Opcodes frozen in this phase:
 - `PROC_OP_SPAWN_V2 = 4`
 - `PROC_OP_WAITPID_V2 = 5`
 
-## VFS (`src/kernel/vfs_proto.rs`)
+## VFS (`src/kernel/vfs_abi.rs`)
 
 - Server ABI version: `VFS_SERVER_ABI_VERSION = 1`
 - Typed codec version: `VFS_CODEC_V1_VERSION = 1`

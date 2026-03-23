@@ -1,5 +1,5 @@
 use super::LinuxErrno;
-use crate::kernel::bootstrap::KernelState;
+use crate::kernel::boot::KernelState;
 use crate::kernel::capabilities::CapId;
 use crate::kernel::vm::PAGE_SIZE;
 
@@ -101,15 +101,15 @@ pub const fn default_mmap_len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::boot::Bootstrap;
     use crate::kernel::task::TaskClass;
 
     #[test]
     fn thread_tls_and_futex_hooks_have_stable_semantics() {
-        let mut kernel = crate::kernel::bootstrap::Bootstrap::init().expect("init");
+        let mut kernel = crate::kernel::boot::Bootstrap::init().expect("init");
         let (asid, _aspace_cap) = kernel.create_user_address_space().expect("asid");
         kernel
-            .spawn_user_task_from_image(crate::kernel::bootstrap::UserImageSpec {
+            .spawn_user_task_from_image(crate::kernel::boot::UserImageSpec {
                 tid: 7,
                 entry: 0x4000,
                 asid: Some(asid),

@@ -34,6 +34,11 @@ impl fmt::Display for IpcError {
 pub const IPC_REGISTER_WORDS: usize = syscall_abi::IPC_REGISTER_WORDS;
 pub const IPC_REGISTER_BYTES: usize = IPC_REGISTER_WORDS * core::mem::size_of::<usize>();
 
+/// Returns all `IPC_REGISTER_BYTES` unpacked bytes from the register lanes.
+///
+/// Only the first `len` bytes are semantically meaningful to the caller; any
+/// remaining bytes are valid unpacked register contents but are considered
+/// unused payload. In other words, `len` is a validity bound, not a trim hint.
 pub fn unpack_register_payload(
     words: [usize; IPC_REGISTER_WORDS],
     len: usize,

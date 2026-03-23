@@ -1,4 +1,4 @@
-use crate::kernel::vfs::{VfsBackend, VfsLiteError};
+use crate::kernel::vfs::{VfsBackend, VfsError};
 use crate::services::fs::blkcache::BlockCache;
 
 const MAX_FAT_FILES: usize = 8;
@@ -18,10 +18,10 @@ impl FatPath {
         Self { len, bytes }
     }
 
-    pub fn from_abi_path(path_ptr: u64) -> Result<Self, VfsLiteError> {
-        let src = abi_path_bytes(path_ptr).ok_or(VfsLiteError::BadFd)?;
+    pub fn from_abi_path(path_ptr: u64) -> Result<Self, VfsError> {
+        let src = abi_path_bytes(path_ptr).ok_or(VfsError::BadFd)?;
         if src.len() > MAX_PATH_LEN {
-            return Err(VfsLiteError::Malformed);
+            return Err(VfsError::Malformed);
         }
         let mut bytes = [0u8; MAX_PATH_LEN];
         bytes[..src.len()].copy_from_slice(src);
@@ -56,9 +56,9 @@ pub struct FatBpb {
 }
 
 impl FatBpb {
-    pub fn parse(boot_sector: &[u8; 512]) -> Result<Self, VfsLiteError> {
+    pub fn parse(boot_sector: &[u8; 512]) -> Result<Self, VfsError> {
         if boot_sector[510] != 0x55 || boot_sector[511] != 0xAA {
-            return Err(VfsLiteError::Malformed);
+            return Err(VfsError::Malformed);
         }
         let mut bps = [0u8; 2];
         bps.copy_from_slice(&boot_sector[11..13]);
@@ -95,9 +95,9 @@ impl FatTable {
         }
     }
 
-    pub fn parse_from_bytes(bytes: &[u8]) -> Result<Self, VfsLiteError> {
+    pub fn parse_from_bytes(bytes: &[u8]) -> Result<Self, VfsError> {
         if bytes.len() < FAT_ENTRIES * 2 {
-            return Err(VfsLiteError::Malformed);
+            return Err(VfsError::Malformed);
         }
         let mut table = [0u16; FAT_ENTRIES];
         let mut idx = 0usize;
@@ -200,14 +200,14 @@ impl FatBackend {
         self.bpb.cluster_size_bytes()
     }
 
-    fn alloc_fd(&mut self, file_idx: usize) -> Result<u64, VfsLiteError> {
+    fn alloc_fd(&mut self, file_idx: usize) -> Result<u64, VfsError> {
         if let Some(slot) = self.open_fds.iter_mut().find(|slot| slot.is_none()) {
             let fd = self.next_fd;
             self.next_fd = self.next_fd.saturating_add(1);
             *slot = Some(OpenFd { fd, file_idx });
             Ok(fd)
         } else {
-            Err(VfsLiteError::NoFd)
+            Err(VfsError::NoFd)
         }
     }
 
@@ -217,11 +217,11 @@ impl FatBackend {
             .position(|slot| slot.map(|e| e.path == path).unwrap_or(false))
     }
 
-    fn alloc_file(&mut self, path: FatPath) -> Result<usize, VfsLiteError> {
+    fn alloc_file(&mut self, path: FatPath) -> Result<usize, VfsError> {
         if let Some(idx) = self.find_file_idx(path) {
             return Ok(idx);
         }
-        let start = self.fat.alloc_free_cluster().ok_or(VfsLiteError::NoFd)?;
+        let start = self.fat.alloc_free_cluster().ok_or(VfsError::NoFd)?;
         if let Some((idx, slot)) = self
             .files
             .iter_mut()
@@ -235,7 +235,7 @@ impl FatBackend {
             });
             Ok(idx)
         } else {
-            Err(VfsLiteError::NoFd)
+            Err(VfsError::NoFd)
         }
     }
 
@@ -247,7 +247,7 @@ impl FatBackend {
             .copied()
     }
 
-    fn close_fd(&mut self, fd: u64) -> Result<(), VfsLiteError> {
+    fn close_fd(&mut self, fd: u64) -> Result<(), VfsError> {
         if let Some(slot) = self
             .open_fds
             .iter_mut()
@@ -256,7 +256,7 @@ impl FatBackend {
             *slot = None;
             Ok(())
         } else {
-            Err(VfsLiteError::BadFd)
+            Err(VfsError::BadFd)
         }
     }
 
@@ -279,8 +279,8 @@ impl FatBackend {
         count
     }
 
-    fn append_cluster_to_chain(&mut self, start: u16) -> Result<(), VfsLiteError> {
-        let new_cluster = self.fat.alloc_free_cluster().ok_or(VfsLiteError::NoFd)?;
+    fn append_cluster_to_chain(&mut self, start: u16) -> Result<(), VfsError> {
+        let new_cluster = self.fat.alloc_free_cluster().ok_or(VfsError::NoFd)?;
         let mut tail = start;
         while let Some(next) = self.fat.next_cluster(tail) {
             tail = next;
@@ -290,7 +290,7 @@ impl FatBackend {
         Ok(())
     }
 
-    fn grow_chain_if_needed(&mut self, start: u16, file_len: u64) -> Result<(), VfsLiteError> {
+    fn grow_chain_if_needed(&mut self, start: u16, file_len: u64) -> Result<(), VfsError> {
         let needed = self.clusters_needed_for_len(file_len);
         while self.chain_len(start) < needed {
             self.append_cluster_to_chain(start)?;
@@ -310,30 +310,30 @@ impl FatBackend {
 }
 
 impl VfsBackend for FatBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         if path_ptr == 0 {
-            return Err(VfsLiteError::BadFd);
+            return Err(VfsError::BadFd);
         }
         let path = FatPath::from_abi_path(path_ptr)?;
         let file_idx = self.alloc_file(path)?;
         self.alloc_fd(file_idx)
     }
 
-    fn close(&mut self, fd: u64) -> Result<u64, VfsLiteError> {
+    fn close(&mut self, fd: u64) -> Result<u64, VfsError> {
         self.close_fd(fd)?;
         Ok(0)
     }
 
-    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
-        let opened = self.open_fd_lookup(fd).ok_or(VfsLiteError::BadFd)?;
-        let file = self.files[opened.file_idx].ok_or(VfsLiteError::BadFd)?;
+    fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
+        let opened = self.open_fd_lookup(fd).ok_or(VfsError::BadFd)?;
+        let file = self.files[opened.file_idx].ok_or(VfsError::BadFd)?;
         let _ = self.cache.get(fd);
         Ok(core::cmp::min(len, file.file_len))
     }
 
-    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsLiteError> {
-        let opened = self.open_fd_lookup(fd).ok_or(VfsLiteError::BadFd)?;
-        let mut file = self.files[opened.file_idx].ok_or(VfsLiteError::BadFd)?;
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
+        let opened = self.open_fd_lookup(fd).ok_or(VfsError::BadFd)?;
+        let mut file = self.files[opened.file_idx].ok_or(VfsError::BadFd)?;
         file.file_len = file.file_len.saturating_add(len);
         self.grow_chain_if_needed(file.start_cluster, file.file_len)?;
         self.files[opened.file_idx] = Some(file);
@@ -341,10 +341,10 @@ impl VfsBackend for FatBackend {
         Ok(len)
     }
 
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsLiteError> {
+    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         let path = FatPath::from_abi_path(path_ptr)?;
-        let idx = self.find_file_idx(path).ok_or(VfsLiteError::BadFd)?;
-        Ok(self.files[idx].ok_or(VfsLiteError::BadFd)?.file_len)
+        let idx = self.find_file_idx(path).ok_or(VfsError::BadFd)?;
+        Ok(self.files[idx].ok_or(VfsError::BadFd)?.file_len)
     }
 }
 

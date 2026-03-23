@@ -54,7 +54,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::vfs::{VfsBackend, VfsLiteError};
+    use crate::kernel::vfs::{VfsBackend, VfsError};
 
     #[test]
     fn ramfs_service_supports_write_then_stat() {
@@ -96,6 +96,6 @@ mod tests {
     #[test]
     fn ramfs_unknown_fd_read_fails() {
         let mut backend = RamFsBackend::new();
-        assert_eq!(backend.read(42, 1), Err(VfsLiteError::BadFd));
+        assert_eq!(backend.read(42, 1), Err(VfsError::BadFd));
     }
 }

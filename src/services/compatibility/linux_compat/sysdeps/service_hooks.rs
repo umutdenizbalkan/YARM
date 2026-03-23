@@ -1,8 +1,8 @@
 use super::LinuxErrno;
-use crate::kernel::bootstrap::KernelState;
+use crate::kernel::boot::KernelState;
 use crate::kernel::ipc::Message;
-use crate::kernel::proc_proto::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
-use crate::kernel::process_manager::ProcessService;
+use crate::kernel::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
+use crate::kernel::process::ProcessService;
 use crate::kernel::vfs::{
     CloseRequest, OpenAtRequest, ReadWriteRequest, VfsBackend, close_message, openat_message,
     read_message, write_message,
@@ -201,7 +201,7 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::boot::Bootstrap;
     use crate::kernel::vfs::InMemoryBackend;
 
     #[test]
@@ -220,7 +220,7 @@ mod tests {
     fn service_backed_proc_and_vfs_hooks_roundtrip_real_services() {
         let mut kernel = Bootstrap::init().expect("init");
         kernel.register_task(41).expect("task");
-        kernel.scheduler.enqueue(41).expect("enqueue");
+        kernel.enqueue_current_cpu(41).expect("enqueue");
         kernel.dispatch_next_task().expect("dispatch");
 
         let mut proc = ProcessService::new();

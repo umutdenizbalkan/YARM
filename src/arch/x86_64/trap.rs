@@ -1,4 +1,4 @@
-use crate::kernel::bootstrap::{KernelState, TrapHandleError};
+use crate::kernel::boot::{KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::trap::{FaultAccess, FaultInfo, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
@@ -42,8 +42,8 @@ fn restore_arch_thread_state(
 
 pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {
     match context.vector {
-        VEC_SYSCALL => TrapEvent::syscall(),
-        VEC_TIMER => TrapEvent::timer_interrupt(),
+        VEC_SYSCALL => TrapEvent::Syscall,
+        VEC_TIMER => TrapEvent::TimerInterrupt,
         VEC_PAGE_FAULT => {
             let access = if (context.error_code & (1 << 1)) != 0 {
                 FaultAccess::Write
@@ -52,15 +52,15 @@ pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {
             } else {
                 FaultAccess::Read
             };
-            TrapEvent::page_fault(FaultInfo {
+            TrapEvent::PageFault(FaultInfo {
                 addr: VirtAddr(context.fault_addr),
                 access,
             })
         }
         v if (VEC_EXTERNAL_BASE..VEC_EXTERNAL_LIMIT).contains(&v) => {
-            TrapEvent::external_interrupt((v - VEC_EXTERNAL_BASE) as u16)
+            TrapEvent::ExternalInterrupt((v - VEC_EXTERNAL_BASE) as u16)
         }
-        _ => TrapEvent::external_interrupt(0),
+        _ => TrapEvent::ExternalInterrupt(0),
     }
 }
 
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn trap_entry_sets_cpu_and_handles_timer() {
-        use crate::kernel::bootstrap::Bootstrap;
+        use crate::kernel::boot::Bootstrap;
 
         let mut state = Bootstrap::init().expect("init");
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
@@ -148,12 +148,12 @@ mod tests {
             None,
         )
         .expect("timer");
-        assert_eq!(state.scheduler.current_cpu(), CpuId(1));
+        assert_eq!(state.current_cpu(), CpuId(1));
     }
 
     #[test]
     fn trap_entry_restores_tls_for_resumed_thread() {
-        use crate::kernel::bootstrap::{Bootstrap, UserImageSpec};
+        use crate::kernel::boot::{Bootstrap, UserImageSpec};
         use crate::kernel::task::TaskClass;
 
         let mut state = Bootstrap::init().expect("init");
@@ -170,7 +170,7 @@ mod tests {
             .spawn_user_thread(50, 0xCAFE_0000, 0x8100_0000, 0x4010)
             .expect("thread");
         state.yield_current().expect("switch");
-        assert_eq!(state.scheduler.current_tid(), Some(tid));
+        assert_eq!(state.current_tid(), Some(tid));
 
         let mut frame = TrapFrame::new(0, [0; 6]);
         handle_trap_entry(

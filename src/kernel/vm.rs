@@ -1,10 +1,47 @@
 use crate::arch::vm_layout;
+use crate::kernel::topology::CpuBitmap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtAddr(pub u64);
 
+impl VirtAddr {
+    pub const fn new(addr: u64) -> Self {
+        Self(addr)
+    }
+
+    pub const fn is_user(self) -> bool {
+        self.0 < KERNEL_SPACE_BASE
+    }
+
+    pub const fn is_kernel(self) -> bool {
+        self.0 >= KERNEL_SPACE_BASE
+    }
+
+    pub const fn page_align_down(self) -> Self {
+        Self(self.0 & !(PAGE_SIZE as u64 - 1))
+    }
+
+    pub const fn page_align_up(self) -> Self {
+        Self((self.0 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1))
+    }
+}
+
+impl core::ops::Add<u64> for VirtAddr {
+    type Output = Self;
+
+    fn add(self, rhs: u64) -> Self::Output {
+        Self(self.0.wrapping_add(rhs))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysAddr(pub u64);
+
+impl PhysAddr {
+    pub const fn new(addr: u64) -> Self {
+        Self(addr)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Asid(pub u16);
@@ -17,6 +54,8 @@ pub enum AddressSpaceKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageFlags {
+    // TODO: Add CachePolicy (WriteBack/WriteThrough/Uncached/Device) before
+    // the DMA-capable driver subsystem is finalized for embedded targets.
     pub read: bool,
     pub write: bool,
     pub execute: bool,
@@ -78,10 +117,16 @@ struct Entry {
     mapping: Mapping,
 }
 
+/// Software shadow of the hardware page table.
+///
+/// `map_page` and `unmap_page` update only this in-kernel record. Callers are
+/// responsible for propagating changes into the arch-level page tables and for
+/// issuing any required TLB invalidations after remaps and unmaps.
 #[derive(Debug)]
 pub struct AddressSpace {
     kind: AddressSpaceKind,
     entries: [Option<Entry>; MAX_MAPPINGS],
+    len: usize,
 }
 
 impl AddressSpace {
@@ -89,6 +134,7 @@ impl AddressSpace {
         Self {
             kind: AddressSpaceKind::Kernel,
             entries: [None; MAX_MAPPINGS],
+            len: 0,
         }
     }
 
@@ -96,6 +142,7 @@ impl AddressSpace {
         Self {
             kind: AddressSpaceKind::User,
             entries: [None; MAX_MAPPINGS],
+            len: 0,
         }
     }
 
@@ -134,6 +181,7 @@ impl AddressSpace {
 
         if let Some(i) = first_free {
             self.entries[i] = Some(Entry { virt, mapping });
+            self.len += 1;
             return Ok(None);
         }
 
@@ -143,8 +191,8 @@ impl AddressSpace {
     fn mapping_is_allowed(&self, virt: VirtAddr, flags: PageFlags) -> bool {
         let is_kernel_only = !flags.user && (flags.read || flags.write || flags.execute);
         match self.kind {
-            AddressSpaceKind::Kernel => virt.0 >= KERNEL_SPACE_BASE && !flags.user,
-            AddressSpaceKind::User => virt.0 < KERNEL_SPACE_BASE && !is_kernel_only,
+            AddressSpaceKind::Kernel => virt.is_kernel() && !flags.user,
+            AddressSpaceKind::User => virt.is_user() && !is_kernel_only,
         }
     }
 
@@ -153,12 +201,18 @@ impl AddressSpace {
             if let Some(entry) = slot.as_ref()
                 && entry.virt == virt
             {
+                self.len = self.len.saturating_sub(1);
                 return slot.take().map(|old| old.mapping);
             }
         }
         None
     }
 
+    /// Resolves a virtual address to its mapping.
+    ///
+    /// Complexity: O(N) where N is `MAX_MAPPINGS`. For the current prototype
+    /// this remains acceptable, but a larger-scale implementation should use a
+    /// more efficient indexed structure.
     pub fn resolve(&self, virt: VirtAddr) -> Option<Mapping> {
         for slot in &self.entries {
             if let Some(entry) = slot {
@@ -171,7 +225,7 @@ impl AddressSpace {
     }
 
     pub fn mappings(&self) -> usize {
-        self.entries.iter().filter(|e| e.is_some()).count()
+        self.len
     }
 }
 
@@ -181,10 +235,23 @@ struct AsEntry {
     aspace: AddressSpace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredAsid {
+    pub asid: Asid,
+    pub pending_cpu_bitmap: CpuBitmap,
+}
+
+/// Tracks live and retired software address spaces.
+///
+/// NOTE: `retired` has the same capacity as `entries`. If all
+/// `MAX_ADDRESS_SPACES` are destroyed simultaneously with pending shootdowns,
+/// no further `destroy()` call can retire another ASID until an existing
+/// retired slot is cleared by `acknowledge_shootdown()`.
 #[derive(Debug)]
 pub struct AddressSpaceManager {
     next_asid: u16,
     entries: [Option<AsEntry>; MAX_ADDRESS_SPACES],
+    retired: [Option<RetiredAsid>; MAX_ADDRESS_SPACES],
 }
 
 impl Default for AddressSpaceManager {
@@ -192,6 +259,7 @@ impl Default for AddressSpaceManager {
         Self {
             next_asid: 1,
             entries: [const { None }; MAX_ADDRESS_SPACES],
+            retired: [None; MAX_ADDRESS_SPACES],
         }
     }
 }
@@ -202,6 +270,11 @@ impl AddressSpaceManager {
             .iter()
             .flatten()
             .any(|entry| entry.asid == asid)
+            || self
+                .retired
+                .iter()
+                .flatten()
+                .any(|entry| entry.asid == asid)
     }
 
     fn allocate_asid(&mut self) -> Result<Asid, VmError> {
@@ -249,14 +322,63 @@ impl AddressSpaceManager {
             .map(|entry| &mut entry.aspace)
     }
 
-    pub fn destroy(&mut self, asid: Asid) -> Result<(), VmError> {
+    /// Destroys a software address space shadow and optionally retires its ASID
+    /// until all CPUs in `pending_cpu_bitmap` acknowledge a shootdown.
+    ///
+    /// If `pending_cpu_bitmap == 0`, the ASID is immediately reusable and
+    /// callers must not later invoke `acknowledge_shootdown()` for that ASID.
+    pub fn destroy(&mut self, asid: Asid, pending_cpu_bitmap: CpuBitmap) -> Result<(), VmError> {
         for slot in &mut self.entries {
             if slot.as_ref().is_some_and(|entry| entry.asid == asid) {
                 *slot = None;
-                return Ok(());
+                if pending_cpu_bitmap == 0 {
+                    return Ok(());
+                }
+                for retired in &mut self.retired {
+                    if retired.is_none() {
+                        *retired = Some(RetiredAsid {
+                            asid,
+                            pending_cpu_bitmap,
+                        });
+                        return Ok(());
+                    }
+                }
+                return Err(VmError::Full);
             }
         }
         Err(VmError::InvalidAsid)
+    }
+
+    /// Acknowledges one CPU's shootdown for a retired ASID.
+    ///
+    /// This is only valid for ASIDs retired by `destroy()` with a non-zero
+    /// `pending_cpu_bitmap`.
+    pub fn acknowledge_shootdown(
+        &mut self,
+        asid: Asid,
+        cpu_bit: CpuBitmap,
+    ) -> Result<bool, VmError> {
+        for slot in &mut self.retired {
+            if let Some(retired) = slot.as_mut()
+                && retired.asid == asid
+            {
+                retired.pending_cpu_bitmap &= !cpu_bit;
+                if retired.pending_cpu_bitmap == 0 {
+                    *slot = None;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+        }
+        Err(VmError::InvalidAsid)
+    }
+
+    pub fn retired_entry(&self, asid: Asid) -> Option<RetiredAsid> {
+        self.retired
+            .iter()
+            .flatten()
+            .copied()
+            .find(|entry| entry.asid == asid)
     }
 }
 
@@ -265,11 +387,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vm_constants_are_arch_sourced() {
-        assert_eq!(PAGE_SIZE, vm_layout::PAGE_SIZE);
-        assert_eq!(KERNEL_SPACE_BASE, vm_layout::KERNEL_SPACE_BASE);
-        assert_eq!(MAX_MAPPINGS, vm_layout::MAX_MAPPINGS);
-        assert_eq!(MAX_ADDRESS_SPACES, vm_layout::MAX_ADDRESS_SPACES);
+    fn vm_constants_obey_basic_invariants() {
+        assert!(
+            PAGE_SIZE.is_power_of_two(),
+            "PAGE_SIZE must be a power of two"
+        );
+        assert!(PAGE_SIZE >= 4096, "PAGE_SIZE must be at least 4096");
+        assert!(
+            KERNEL_SPACE_BASE.is_power_of_two(),
+            "KERNEL_SPACE_BASE must be power-of-two aligned"
+        );
+        assert!(
+            KERNEL_SPACE_BASE > 0,
+            "KERNEL_SPACE_BASE must leave some lower user virtual space"
+        );
+        assert!(MAX_MAPPINGS > 0, "MAX_MAPPINGS must be non-zero");
+        assert!(
+            MAX_ADDRESS_SPACES > 0,
+            "MAX_ADDRESS_SPACES must be non-zero"
+        );
+    }
+
+    #[test]
+    fn virt_addr_helpers_cover_common_queries() {
+        let user = VirtAddr::new(0x1003);
+        let kernel = VirtAddr::new(KERNEL_SPACE_BASE);
+
+        assert!(user.is_user());
+        assert!(!user.is_kernel());
+        assert!(kernel.is_kernel());
+        assert!(!kernel.is_user());
+        assert_eq!(user.page_align_down(), VirtAddr(0x1000));
+        assert_eq!(user.page_align_up(), VirtAddr(0x2000));
+        assert_eq!(user + 5, VirtAddr(0x1008));
     }
 
     #[test]
@@ -325,8 +475,34 @@ mod tests {
         );
         assert_eq!(map_result, Ok(None));
 
-        assert!(mgr.destroy(asid).is_ok());
+        assert!(mgr.destroy(asid, 0).is_ok());
         assert!(mgr.get(asid).is_none());
+    }
+
+    #[test]
+    fn destroy_retires_asid_until_all_shootdowns_acknowledge() {
+        let mut mgr = AddressSpaceManager::default();
+        let asid = mgr.create_user_space().expect("create");
+
+        assert_eq!(mgr.destroy(asid, 0b11), Ok(()));
+        assert!(mgr.get(asid).is_none());
+        assert_eq!(
+            mgr.retired_entry(asid)
+                .map(|entry| entry.pending_cpu_bitmap),
+            Some(0b11)
+        );
+
+        let replacement = mgr.create_user_space().expect("replacement asid");
+        assert_ne!(replacement, asid);
+
+        assert_eq!(mgr.acknowledge_shootdown(asid, 0b01), Ok(false));
+        assert_eq!(
+            mgr.retired_entry(asid)
+                .map(|entry| entry.pending_cpu_bitmap),
+            Some(0b10)
+        );
+        assert_eq!(mgr.acknowledge_shootdown(asid, 0b10), Ok(true));
+        assert_eq!(mgr.retired_entry(asid), None);
     }
 
     #[test]
@@ -416,7 +592,7 @@ mod tests {
     #[test]
     fn manager_invalid_destroy_and_monotonic_asid() {
         let mut mgr = AddressSpaceManager::default();
-        assert_eq!(mgr.destroy(Asid(777)), Err(VmError::InvalidAsid));
+        assert_eq!(mgr.destroy(Asid(777), 0), Err(VmError::InvalidAsid));
 
         let a = mgr.create_user_space().expect("asid a");
         let b = mgr.create_user_space().expect("asid b");

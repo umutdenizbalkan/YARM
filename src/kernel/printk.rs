@@ -3,7 +3,10 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 
 pub const PRB_SLOTS: usize = 128;
 pub const PRB_MSG_MAX: usize = 192;
-const _: () = assert!(PRB_SLOTS.is_power_of_two(), "PRB_SLOTS must be a power of two");
+const _: () = assert!(
+    PRB_SLOTS.is_power_of_two(),
+    "PRB_SLOTS must be a power of two"
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -18,12 +21,37 @@ pub enum LogLevel {
     Debug = 7,
 }
 
+impl LogLevel {
+    const fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => Self::Emerg,
+            1 => Self::Alert,
+            2 => Self::Crit,
+            3 => Self::Err,
+            4 => Self::Warn,
+            5 => Self::Notice,
+            6 => Self::Info,
+            _ => Self::Debug,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PrintkContext {
     Normal = 0,
     Irq = 1,
     Nmi = 2,
+}
+
+impl PrintkContext {
+    const fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Irq,
+            2 => Self::Nmi,
+            _ => Self::Normal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,21 +127,8 @@ impl PrbSlot {
         let mut out = PrintkRecord::empty();
         out.seq = seq0;
         out.len = core::cmp::min(len, PRB_MSG_MAX);
-        out.level = match self.level.load(Ordering::Relaxed) {
-            0 => LogLevel::Emerg,
-            1 => LogLevel::Alert,
-            2 => LogLevel::Crit,
-            3 => LogLevel::Err,
-            4 => LogLevel::Warn,
-            5 => LogLevel::Notice,
-            6 => LogLevel::Info,
-            _ => LogLevel::Debug,
-        };
-        out.context = match self.context.load(Ordering::Relaxed) {
-            1 => PrintkContext::Irq,
-            2 => PrintkContext::Nmi,
-            _ => PrintkContext::Normal,
-        };
+        out.level = LogLevel::from_u8(self.level.load(Ordering::Relaxed));
+        out.context = PrintkContext::from_u8(self.context.load(Ordering::Relaxed));
         let mut i = 0usize;
         while i < out.len {
             out.message[i] = self.bytes[i].load(Ordering::Relaxed);
@@ -284,6 +299,10 @@ pub fn set_console_loglevel(level: LogLevel) {
         .store(level as u8, Ordering::Release);
 }
 
+pub fn console_loglevel() -> LogLevel {
+    LogLevel::from_u8(PRINTK.console_loglevel.load(Ordering::Acquire))
+}
+
 pub fn dropped_count() -> u64 {
     PRINTK.dropped.load(Ordering::Acquire)
 }
@@ -333,6 +352,13 @@ mod tests {
         let n = snapshot_latest(&mut recs);
         assert!(n >= 1);
         assert_eq!(recs[n - 1].context, PrintkContext::Nmi);
+    }
+
+    #[test]
+    fn console_loglevel_round_trips() {
+        set_console_loglevel(LogLevel::Warn);
+        assert_eq!(console_loglevel(), LogLevel::Warn);
+        set_console_loglevel(LogLevel::Info);
     }
 
     #[test]

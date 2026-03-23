@@ -3,6 +3,42 @@ use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError};
 
 impl KernelState {
+    pub fn destroy_user_address_space(&mut self, aspace_cap: CapId) -> Result<(), KernelError> {
+        let capability = self
+            .cspace
+            .get(aspace_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        let asid = match capability.object {
+            CapObject::AddressSpace { asid } => Asid(asid),
+            _ => return Err(KernelError::WrongObject),
+        };
+
+        self.cspace
+            .revoke(aspace_cap)
+            .map_err(|_| KernelError::InvalidCapability)?;
+
+        let pending_cpu_bitmap = self.online_cpu_bitmap();
+        self.user_spaces
+            .destroy(asid, pending_cpu_bitmap)
+            .map_err(KernelError::Vm)?;
+
+        for cpu in 0..u64::BITS as usize {
+            let cpu_bit = 1u64 << cpu;
+            if (pending_cpu_bitmap & cpu_bit) == 0 {
+                continue;
+            }
+            self.submit_cross_cpu_work(
+                crate::kernel::scheduler::CpuId(cpu as u8),
+                crate::kernel::smp::WorkItem::TlbShootdown {
+                    asid,
+                    va_range: None,
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
     pub fn create_user_address_space(&mut self) -> Result<(Asid, CapId), KernelError> {
         let asid = self
             .user_spaces
@@ -12,7 +48,7 @@ impl KernelState {
             .cspace
             .mint(Capability::new(
                 CapObject::AddressSpace { asid: asid.0 },
-                &[CapRights::Map, CapRights::Read, CapRights::Write],
+                CapRights::MAP | CapRights::READ | CapRights::WRITE,
             ))
             .map_err(|_| KernelError::CapabilityFull)?;
         Ok((asid, map_cap))
@@ -32,7 +68,7 @@ impl KernelState {
             CapObject::AddressSpace { asid } => Asid(asid),
             _ => return Err(KernelError::WrongObject),
         };
-        if !capability.has_right(CapRights::Map) {
+        if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
 
@@ -62,7 +98,7 @@ impl KernelState {
             .cspace
             .mint(Capability::new(
                 CapObject::MemoryObject { id },
-                &[CapRights::Read, CapRights::Write, CapRights::Map],
+                CapRights::READ | CapRights::WRITE | CapRights::MAP,
             ))
             .map_err(|_| KernelError::CapabilityFull)?;
 
@@ -79,16 +115,12 @@ impl KernelState {
     }
 
     pub fn task_brk_bounds(&self, tid: u64) -> Option<(usize, usize)> {
-        self.tcbs
+        self.memory
+            .brk_regions
             .iter()
             .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .and_then(|tcb| {
-                Some((
-                    tcb.linux.brk_base?.0 as usize,
-                    tcb.linux.brk_end?.0 as usize,
-                ))
-            })
+            .find(|entry| entry.tid.0 == tid)
+            .map(|entry| (entry.base.0 as usize, entry.end.0 as usize))
     }
 
     pub fn set_task_brk_bounds(
@@ -97,10 +129,22 @@ impl KernelState {
         base: usize,
         end: usize,
     ) -> Result<(), KernelError> {
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.linux.brk_base = Some(VirtAddr(base as u64));
-        tcb.linux.brk_end = Some(VirtAddr(end as u64));
-        Ok(())
+        let _ = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        if let Some(slot) = self
+            .memory
+            .brk_regions
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|entry| entry.tid.0 == tid) || slot.is_none())
+        {
+            *slot = Some(super::BrkRegionRecord {
+                tid: crate::kernel::ipc::ThreadId(tid),
+                base: VirtAddr(base as u64),
+                end: VirtAddr(end as u64),
+            });
+            Ok(())
+        } else {
+            Err(KernelError::TaskTableFull)
+        }
     }
 
     fn resolve_memory_object_phys(
@@ -117,10 +161,10 @@ impl KernelState {
             _ => return Err(KernelError::WrongObject),
         };
 
-        if flags.read && !capability.has_right(CapRights::Read) {
+        if flags.read && !capability.has_right(CapRights::READ) {
             return Err(KernelError::MissingRight);
         }
-        if flags.write && !capability.has_right(CapRights::Write) {
+        if flags.write && !capability.has_right(CapRights::WRITE) {
             return Err(KernelError::MissingRight);
         }
 
@@ -157,7 +201,7 @@ impl KernelState {
             CapObject::AddressSpace { asid } => Asid(asid),
             _ => return Err(KernelError::WrongObject),
         };
-        if !capability.has_right(CapRights::Map) {
+        if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
         let aspace = self
@@ -181,7 +225,7 @@ impl KernelState {
             CapObject::AddressSpace { asid } => Asid(asid),
             _ => return Err(KernelError::WrongObject),
         };
-        if !capability.has_right(CapRights::Map) {
+        if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
         let aspace = self

@@ -49,7 +49,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::vfs::VfsLiteError;
+    use crate::kernel::vfs::VfsError;
 
     #[test]
     fn initramfs_is_read_only() {
@@ -72,6 +72,6 @@ mod tests {
             len: 1,
         })
         .expect("write");
-        assert_eq!(svc.handle(write), Err(VfsLiteError::Unsupported));
+        assert_eq!(svc.handle(write), Err(VfsError::Unsupported));
     }
 }

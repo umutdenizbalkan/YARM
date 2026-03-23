@@ -1,7 +1,7 @@
 #![no_std]
 extern crate std;
 
-use yarm::kernel::bootstrap::Bootstrap;
+use yarm::kernel::boot::Bootstrap;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::syscall::Syscall;
 use yarm::kernel::trap::Trap;
@@ -47,6 +47,6 @@ fn main() {
         "YARM core online: mappings={}, runnable_tasks={}, current={}",
         kernel.kernel_aspace.mappings(),
         kernel.scheduler.runnable_count(),
-        kernel.scheduler.current_tid().unwrap_or(0)
+        kernel.current_tid().unwrap_or(0)
     );
 }

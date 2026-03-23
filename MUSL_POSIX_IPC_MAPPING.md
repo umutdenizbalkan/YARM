@@ -15,9 +15,9 @@ Design rule: keep kernel ABI mechanism-only and route POSIX semantics through se
 
 | POSIX / musl entry | Linux nr (compat) | IPC target | IPC opcode / codec | Return mapping |
 |---|---:|---|---|---|
-| `getpid()` | `LINUX_NR_GETPID` (172) | `procman.srv` | `PROC_OP_GETPID`, u64 reply | `pid_t` from u64 |
-| `getppid()` | `LINUX_NR_GETPPID` (173) | `procman.srv` | `PROC_OP_GETPPID`, u64 reply | `pid_t` from u64 |
-| `_Exit()/exit()` | `LINUX_NR_EXIT` (93) | `procman.srv` | `PROC_OP_EXIT`, arg0=`status` | no return |
+| `getpid()` | `LINUX_NR_GETPID` (172) | `process_manager.srv` | `PROC_OP_GETPID`, u64 reply | `pid_t` from u64 |
+| `getppid()` | `LINUX_NR_GETPPID` (173) | `process_manager.srv` | `PROC_OP_GETPPID`, u64 reply | `pid_t` from u64 |
+| `_Exit()/exit()` | `LINUX_NR_EXIT` (93) | `process_manager.srv` | `PROC_OP_EXIT`, arg0=`status` | no return |
 | `openat()` | `LINUX_NR_OPENAT` (56) | `vfs.srv` | `VFS_OP_OPENAT`, `VfsV1Args` | `fd` from u64 |
 | `close()` | `LINUX_NR_CLOSE` (57) | `vfs.srv` | `VFS_OP_CLOSE`, `VfsV1Args` | `0/-1` |
 | `read()` | `LINUX_NR_READ` (63) | `vfs.srv` | `VFS_OP_READ`, `VfsV1Args` | bytes read from u64 |

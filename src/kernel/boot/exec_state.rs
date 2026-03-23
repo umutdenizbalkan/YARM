@@ -15,13 +15,10 @@ impl KernelState {
         if expected != observed {
             return Ok(false);
         }
-        let tid = self
-            .scheduler
-            .current_tid()
-            .ok_or(KernelError::TaskMissing)?;
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
-        let _ = self.scheduler.block_current();
+        let _ = self.block_current_cpu();
         self.dispatch_next_task()?;
         Ok(true)
     }
@@ -62,8 +59,8 @@ impl KernelState {
         if let Some(tcb) = self.tcb_mut(spec.tid) {
             tcb.thread_group_id = ThreadGroupId(spec.tid);
             tcb.asid = spec.asid;
-            tcb.user_entry = Some(spec.entry);
-            tcb.user_context.instruction_ptr = spec.entry;
+            tcb.user_entry = Some(VirtAddr(spec.entry as u64));
+            tcb.user_context.instruction_ptr = VirtAddr(spec.entry as u64);
             tcb.status = TaskStatus::Runnable;
         }
         Ok(SpawnedUserTask {
@@ -74,7 +71,7 @@ impl KernelState {
     }
 
     pub(crate) fn dispatch_next_task(&mut self) -> Result<Option<u64>, KernelError> {
-        let next = self.scheduler.dispatch_next();
+        let next = self.dispatch_next_current_cpu();
         if let Some(tid) = next {
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Running;
@@ -83,12 +80,12 @@ impl KernelState {
     }
 
     pub fn yield_current(&mut self) -> Result<(), KernelError> {
-        if let Some(tid) = self.scheduler.current_tid() {
+        if let Some(tid) = self.current_tid() {
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Runnable;
         }
 
-        let next_tid = self.scheduler.on_preempt();
+        let next_tid = self.on_preempt_current_cpu();
         if let Some(tid) = next_tid {
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Running;

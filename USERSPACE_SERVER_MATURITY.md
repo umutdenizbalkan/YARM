@@ -4,7 +4,7 @@ This plan tracks the transition from mechanism-complete kernel internals to prod
 
 ## Scope
 
-- `procman.srv` maturity (parent/child semantics, wait/reap discipline, restart signaling)
+- `process_manager.srv` maturity (parent/child semantics, wait/reap discipline, restart signaling)
 - `vfs.srv` maturity (typed ABI conformance, mount routing, deterministic operation ordering)
 - `driver *.srv` maturity (delegation from `init.srv`, revoke/restart lifecycle)
 

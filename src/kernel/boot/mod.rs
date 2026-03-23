@@ -10,22 +10,30 @@ mod thread_state;
 mod user_memory_state;
 
 use super::capabilities::{CapId, CapObject, CapRights, Capability, CapabilitySpace};
-use super::ipc::{Endpoint, EndpointMode, IpcError, Message};
+#[cfg(test)]
+use super::ipc::EndpointMode;
+use super::ipc::{Endpoint, IpcError, Message};
 use super::scheduler::{CpuId, SchedulerError, SmpScheduler};
-use super::smp::{CrossCpuWorkQueue, MAX_CROSS_CPU_WORK, WorkItem};
+use super::scheduler_timer::Timer;
+use super::smp::SmpMailbox;
+#[cfg(test)]
+use super::smp::WorkItem;
 use super::syscall::SyscallError;
-use super::task::{
-    RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock, ThreadDetachState, ThreadGroupId,
-    UserRegisterContext, WaitReason,
-};
-use super::timer::Timer;
-use super::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
+use super::task::{FaultPolicy, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock};
+#[cfg(test)]
+use super::task::{ThreadGroupId, UserRegisterContext, WaitReason};
+use super::trap::FaultInfo;
+#[cfg(test)]
+use super::trap::{FaultAccess, Trap, TrapEvent};
+#[cfg(test)]
 use super::trapframe::TrapFrame;
 use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
 };
 use crate::arch::{platform_layout, topology};
 use crate::kernel::ipc::ThreadId;
+#[cfg(feature = "hosted-dev")]
+use crate::std::collections::BTreeMap;
 
 #[cfg(feature = "hosted-dev")]
 type KernelStorage<T> = crate::std::boxed::Box<T>;
@@ -43,12 +51,10 @@ fn store_kernel_value<T>(value: T) -> KernelStorage<T> {
 
 const MAX_ENDPOINTS: usize = 16;
 const MAX_TASKS: usize = 64;
-const MAX_TASK_MEM_ENTRIES: usize = 2048;
 const MAX_MEMORY_OBJECTS: usize = 128;
 const MAX_NOTIFICATIONS: usize = 16;
 const MAX_IRQ_LINES: usize = platform_layout::MAX_IRQ_LINES;
 const MAX_DRIVERS: usize = 32;
-const RESTART_ESCALATION_THRESHOLD: u32 = 3;
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,20 +84,6 @@ pub enum TrapHandleError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FaultPolicy {
-    KillTask,
-    NotifyAndContinue,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClassPolicySnapshot {
-    pub class: TaskClass,
-    pub restart_budget: u8,
-    pub restart_backoff_ticks: u64,
-    pub escalation_threshold: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserImageSpec {
     pub tid: u64,
     pub entry: usize,
@@ -104,21 +96,6 @@ pub struct SpawnedUserTask {
     pub tid: u64,
     pub entry: usize,
     pub asid: Option<Asid>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceRole {
-    Init,
-    ProcessManager,
-    Vfs,
-    Driver,
-    Supervisor,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ServicePolicyEntry {
-    tid: ThreadId,
-    role: ServiceRole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,15 +116,6 @@ pub struct DriverDelegationBundle {
     pub dma_cap: CapId,
     pub iova_cap: CapId,
 }
-
-const ALLOWED_SERVICE_DELEGATION_EDGES: &[(ServiceRole, ServiceRole)] = &[
-    (ServiceRole::Init, ServiceRole::ProcessManager),
-    (ServiceRole::Init, ServiceRole::Vfs),
-    (ServiceRole::Init, ServiceRole::Driver),
-    (ServiceRole::Init, ServiceRole::Supervisor),
-    (ServiceRole::Supervisor, ServiceRole::Driver),
-    (ServiceRole::Supervisor, ServiceRole::Vfs),
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverBundlePlan {
@@ -193,24 +161,6 @@ pub struct IpcPathTelemetry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RestartTelemetry {
-    pub budget_remaining: u8,
-    pub backoff_ticks: u64,
-    pub available_at_tick: u64,
-    pub token_outstanding: bool,
-    pub denied_count: u32,
-    pub escalation_count: u32,
-    pub last_exit_code: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TaskMemByte {
-    tid: ThreadId,
-    addr: usize,
-    value: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MemoryObject {
     id: u64,
     phys: PhysAddr,
@@ -219,12 +169,6 @@ struct MemoryObject {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NotificationObject {
     endpoint_idx: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RestartPolicy {
-    budget: u8,
-    backoff_ticks: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,9 +181,22 @@ struct DriverRecord {
     iova_space_cap: Option<CapId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrkRegionRecord {
+    tid: ThreadId,
+    base: VirtAddr,
+    end: VirtAddr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RobustFutexRecord {
+    tid: ThreadId,
+    state: RobustFutexState,
+}
+
 #[derive(Debug)]
 struct IpcSubsystem {
-    cross_cpu_work: CrossCpuWorkQueue,
+    cross_cpu_work: SmpMailbox,
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
     endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
     endpoint_sender_waiters: [Option<(ThreadId, Message, bool)>; MAX_ENDPOINTS],
@@ -250,10 +207,18 @@ struct IpcSubsystem {
     telemetry: IpcPathTelemetry,
 }
 
+#[cfg(feature = "hosted-dev")]
+type UserMemoryStore = BTreeMap<(u16, u64), u8>;
+
+#[cfg(not(feature = "hosted-dev"))]
+#[derive(Debug, Default)]
+struct UserMemoryStore;
+
 #[derive(Debug)]
 struct MemorySubsystem {
-    task_mem: [Option<TaskMemByte>; MAX_TASK_MEM_ENTRIES],
+    user_memory: KernelStorage<UserMemoryStore>,
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
+    brk_regions: [Option<BrkRegionRecord>; MAX_TASKS],
     next_memory_object_id: u64,
     next_anon_phys: u64,
 }
@@ -262,7 +227,6 @@ struct MemorySubsystem {
 struct DriverSubsystem {
     driver_records: [Option<DriverRecord>; MAX_DRIVERS],
     next_iova_space_id: u64,
-    service_policy: [Option<ServicePolicyEntry>; MAX_TASKS],
 }
 
 #[derive(Debug)]
@@ -276,12 +240,6 @@ struct FaultSubsystem {
 #[derive(Debug)]
 struct RestartSubsystem {
     next_restart_token: u64,
-    app_restart_policy: RestartPolicy,
-    driver_restart_policy: RestartPolicy,
-    system_restart_policy: RestartPolicy,
-    app_escalation_threshold: u32,
-    driver_escalation_threshold: u32,
-    system_escalation_threshold: u32,
 }
 
 #[derive(Debug)]
@@ -291,9 +249,12 @@ pub struct KernelState {
     pub cspace: CapabilitySpace,
     pub timer: Timer,
     pub user_spaces: AddressSpaceManager,
+    current_cpu: CpuId,
     ipc: KernelStorage<IpcSubsystem>,
     next_dynamic_tid: u64,
     tcbs: [Option<ThreadControlBlock>; MAX_TASKS],
+    tls_restore_pending: [Option<ThreadId>; MAX_TASKS],
+    robust_futex: [Option<RobustFutexRecord>; MAX_TASKS],
     memory: KernelStorage<MemorySubsystem>,
     drivers: DriverSubsystem,
     tlb_shootdown_count: u64,
@@ -340,12 +301,15 @@ impl Bootstrap {
         let mut scheduler = SmpScheduler::default();
         scheduler.set_present_cpu_bitmap(topology::default_present_cpu_bitmap());
         scheduler
-            .enqueue_on(CpuId(platform_layout::BOOTSTRAP_CPU_ID), 0)
+            .enqueue_on(
+                CpuId(platform_layout::BOOTSTRAP_CPU_ID),
+                crate::kernel::ipc::ThreadId(0),
+            )
             .map_err(map_scheduler_error)?;
 
         let mut cspace = CapabilitySpace::default();
         cspace
-            .mint(Capability::new(CapObject::Kernel, &[CapRights::Schedule]))
+            .mint(Capability::new(CapObject::Kernel, CapRights::SCHEDULE))
             .map_err(|_| KernelError::CapabilityFull)?;
 
         let mut state = KernelState {
@@ -354,8 +318,9 @@ impl Bootstrap {
             cspace,
             timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: AddressSpaceManager::default(),
+            current_cpu: CpuId(platform_layout::BOOTSTRAP_CPU_ID),
             ipc: store_kernel_value(IpcSubsystem {
-                cross_cpu_work: CrossCpuWorkQueue::default(),
+                cross_cpu_work: SmpMailbox::default(),
                 endpoints: [const { None }; MAX_ENDPOINTS],
                 endpoint_waiters: [None; MAX_ENDPOINTS],
                 endpoint_sender_waiters: [None; MAX_ENDPOINTS],
@@ -367,16 +332,18 @@ impl Bootstrap {
             }),
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
             tcbs: [const { None }; MAX_TASKS],
+            tls_restore_pending: [None; MAX_TASKS],
+            robust_futex: [None; MAX_TASKS],
             memory: store_kernel_value(MemorySubsystem {
-                task_mem: [None; MAX_TASK_MEM_ENTRIES],
+                user_memory: store_kernel_value(UserMemoryStore::default()),
                 memory_objects: [None; MAX_MEMORY_OBJECTS],
+                brk_regions: [None; MAX_TASKS],
                 next_memory_object_id: 1,
                 next_anon_phys: platform_layout::NEXT_ANON_PHYS_BASE,
             }),
             drivers: DriverSubsystem {
                 driver_records: [const { None }; MAX_DRIVERS],
                 next_iova_space_id: 1,
-                service_policy: [const { None }; MAX_TASKS],
             },
             tlb_shootdown_count: 0,
             faults: FaultSubsystem {
@@ -387,21 +354,6 @@ impl Bootstrap {
             },
             restart: RestartSubsystem {
                 next_restart_token: 1,
-                app_restart_policy: RestartPolicy {
-                    budget: 3,
-                    backoff_ticks: 10,
-                },
-                driver_restart_policy: RestartPolicy {
-                    budget: 5,
-                    backoff_ticks: 20,
-                },
-                system_restart_policy: RestartPolicy {
-                    budget: 8,
-                    backoff_ticks: 5,
-                },
-                app_escalation_threshold: RESTART_ESCALATION_THRESHOLD,
-                driver_escalation_threshold: RESTART_ESCALATION_THRESHOLD * 2,
-                system_escalation_threshold: RESTART_ESCALATION_THRESHOLD * 3,
             },
         };
 
@@ -415,13 +367,13 @@ impl KernelState {
     fn switch_to_runnable_tid(&mut self, tid: ThreadId) -> Result<bool, KernelError> {
         let mut spins = 0usize;
         while spins < MAX_TASKS {
-            if self.scheduler.current_tid() == Some(tid.0) {
+            if self.current_tid() == Some(tid.0) {
                 return Ok(true);
             }
             self.yield_current()?;
             spins += 1;
         }
-        Ok(self.scheduler.current_tid() == Some(tid.0))
+        Ok(self.current_tid() == Some(tid.0))
     }
 
     fn tcb_mut(&mut self, tid: u64) -> Option<&mut ThreadControlBlock> {
@@ -434,6 +386,18 @@ impl KernelState {
             .flatten()
             .find(|tcb| tcb.tid.0 == tid)
             .map(|tcb| tcb.status)
+    }
+
+    pub fn task_restart_token(&self, tid: u64) -> Option<u64> {
+        self.tcbs
+            .iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .and_then(|tcb| tcb.restart.token.map(|token| token.0))
+    }
+
+    pub fn capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
+        self.cspace.has_right(cap, right)
     }
 
     pub fn last_fault(&self) -> Option<FaultInfo> {
@@ -453,7 +417,7 @@ impl KernelState {
             .cspace
             .get(recv_cap)
             .ok_or(KernelError::InvalidCapability)?;
-        if !capability.has_right(CapRights::Receive) {
+        if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }
 
@@ -502,7 +466,7 @@ impl KernelState {
             .cspace
             .get(recv_cap)
             .ok_or(KernelError::InvalidCapability)?;
-        if !capability.has_right(CapRights::Receive) {
+        if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
@@ -564,7 +528,7 @@ mod tests {
         let state = Bootstrap::init().expect("bootstrap should fit static limits");
         assert_eq!(state.kernel_aspace.mappings(), 1);
         assert_eq!(state.online_cpu_count(), 1);
-        assert_eq!(state.scheduler.current_tid().expect("boot task"), 0);
+        assert_eq!(state.current_tid().expect("boot task"), 0);
         assert_eq!(state.task_status(0), Some(TaskStatus::Running));
     }
 
@@ -597,27 +561,98 @@ mod tests {
         state.enqueue_on_cpu(CpuId(1), 42).expect("enqueue cpu1");
 
         state.set_current_cpu(CpuId(1)).expect("switch cpu1");
-        assert_eq!(state.scheduler.dispatch_next(), Some(42));
-        assert_eq!(state.scheduler.current_tid(), Some(42));
+        assert_eq!(state.dispatch_next_current_cpu(), Some(42));
+        assert_eq!(state.current_tid(), Some(42));
         assert_eq!(state.task_status(42), Some(TaskStatus::Runnable));
     }
 
     #[test]
     fn cross_cpu_work_queue_round_trip() {
-        let state = Bootstrap::init().expect("init");
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
         state
-            .submit_cross_cpu_work(WorkItem::Reschedule {
-                target_cpu: CpuId(1),
-            })
+            .submit_cross_cpu_work(CpuId(1), WorkItem::Reschedule)
             .expect("submit");
 
+        state.set_current_cpu(CpuId(1)).expect("switch cpu1");
+
         assert_eq!(
-            state.drain_cross_cpu_work(),
-            Some(WorkItem::Reschedule {
-                target_cpu: CpuId(1)
-            })
+            state.drain_cross_cpu_work().expect("drain"),
+            Some(WorkItem::Reschedule)
         );
-        assert_eq!(state.drain_cross_cpu_work(), None);
+        assert_eq!(state.drain_cross_cpu_work().expect("drain"), None);
+    }
+
+    #[test]
+    fn destroy_user_address_space_queues_shootdowns_and_retires_asid() {
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+
+        let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+        state
+            .destroy_user_address_space(aspace_cap)
+            .expect("destroy aspace");
+
+        assert!(state.user_spaces.get(asid).is_none());
+        assert_eq!(
+            state
+                .user_spaces
+                .retired_entry(asid)
+                .map(|entry| entry.pending_cpu_bitmap),
+            Some(0b11)
+        );
+
+        let mut seen = [false; 2];
+        for cpu in [CpuId(0), CpuId(1)] {
+            state.set_current_cpu(cpu).expect("switch cpu");
+            if let Some(WorkItem::TlbShootdown {
+                asid: item_asid,
+                va_range,
+            }) = state.drain_cross_cpu_work().expect("drain")
+            {
+                assert_eq!(item_asid, asid);
+                assert_eq!(va_range, None);
+                seen[cpu.0 as usize] = true;
+            }
+        }
+        assert_eq!(seen, [true, true]);
+
+        state
+            .submit_cross_cpu_work(
+                CpuId(0),
+                WorkItem::TlbShootdown {
+                    asid,
+                    va_range: None,
+                },
+            )
+            .expect("requeue cpu0 shootdown");
+        state
+            .submit_cross_cpu_work(
+                CpuId(1),
+                WorkItem::TlbShootdown {
+                    asid,
+                    va_range: None,
+                },
+            )
+            .expect("requeue cpu1 shootdown");
+
+        state.set_current_cpu(CpuId(0)).expect("switch cpu0");
+        state
+            .process_cross_cpu_work_for_cpu(CpuId(0))
+            .expect("process cpu0");
+        assert_eq!(
+            state
+                .user_spaces
+                .retired_entry(asid)
+                .map(|entry| entry.pending_cpu_bitmap),
+            Some(0b10)
+        );
+
+        state.set_current_cpu(CpuId(1)).expect("switch cpu1");
+        state
+            .process_cross_cpu_work_for_cpu(CpuId(1))
+            .expect("process cpu1");
+        assert_eq!(state.user_spaces.retired_entry(asid), None);
     }
 
     #[test]
@@ -627,17 +662,16 @@ mod tests {
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
 
         state
-            .submit_cross_cpu_work(WorkItem::WakeTask {
-                target_cpu: CpuId(1),
-                tid: ThreadId(2),
-            })
+            .submit_cross_cpu_work(CpuId(1), WorkItem::WakeTask { tid: ThreadId(2) })
             .expect("submit wake");
         state
-            .submit_cross_cpu_work(WorkItem::TlbShootdown {
-                target_cpu: CpuId(0),
-                asid: Asid(1),
-                va_range: None,
-            })
+            .submit_cross_cpu_work(
+                CpuId(0),
+                WorkItem::TlbShootdown {
+                    asid: Asid(1),
+                    va_range: None,
+                },
+            )
             .expect("submit tlb");
 
         let done = state
@@ -647,13 +681,10 @@ mod tests {
         assert_eq!(state.tlb_shootdown_count(), 1);
 
         // WakeTask for cpu1 should still be queued.
-        let remaining = state.drain_cross_cpu_work();
+        state.set_current_cpu(CpuId(1)).expect("switch cpu1");
         assert_eq!(
-            remaining,
-            Some(WorkItem::WakeTask {
-                target_cpu: CpuId(1),
-                tid: ThreadId(2)
-            })
+            state.drain_cross_cpu_work().expect("drain cpu1"),
+            Some(WorkItem::WakeTask { tid: ThreadId(2) })
         );
     }
 
@@ -678,13 +709,13 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         state.timer = Timer::new(1);
         state.register_task(1).expect("register task 1");
-        state.scheduler.enqueue(1).expect("queue task 1");
+        state.enqueue_current_cpu(1).expect("queue task 1");
 
-        let running_before = state.scheduler.current_tid().expect("running");
+        let running_before = state.current_tid().expect("running");
         state
             .handle_trap(Trap::TimerInterrupt, None)
             .expect("timer trap should be handled");
-        let running_after = state.scheduler.current_tid().expect("running");
+        let running_after = state.current_tid().expect("running");
 
         assert_ne!(running_before, running_after);
         assert_eq!(state.task_status(running_after), Some(TaskStatus::Running));
@@ -694,11 +725,11 @@ mod tests {
     fn normalized_page_fault_event_faults_current_task() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue task1");
+        state.enqueue_current_cpu(1).expect("enqueue task1");
 
         state
             .handle_trap_event(
-                TrapEvent::page_fault(FaultInfo {
+                TrapEvent::PageFault(FaultInfo {
                     addr: VirtAddr(0x1200),
                     access: super::super::trap::FaultAccess::Read,
                 }),
@@ -707,7 +738,7 @@ mod tests {
             .expect("page fault event handled");
 
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
         assert_eq!(
             state.last_fault(),
             Some(FaultInfo {
@@ -721,17 +752,17 @@ mod tests {
     fn recv_on_empty_endpoint_blocks_then_send_wakes() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("register task 1");
-        state.scheduler.enqueue(1).expect("queue task 1");
+        state.enqueue_current_cpu(1).expect("queue task 1");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
 
-        assert_eq!(state.scheduler.current_tid(), Some(0));
+        assert_eq!(state.current_tid(), Some(0));
         let first_try = state.ipc_recv(recv_cap).expect("recv call should not fail");
         assert!(first_try.is_none());
         assert_eq!(
             state.task_status(0),
             Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap)))
         );
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
 
         let msg = Message::new(1, b"ok").expect("msg");
         state
@@ -744,7 +775,7 @@ mod tests {
     fn synchronous_send_blocks_until_receiver_arrives() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("register task 1");
-        state.scheduler.enqueue(1).expect("queue task 1");
+        state.enqueue_current_cpu(1).expect("queue task 1");
         let (_eid, send_cap, recv_cap) = state
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("sync endpoint");
@@ -756,7 +787,7 @@ mod tests {
             state.task_status(0),
             Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
         );
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
 
         let recv = state
             .ipc_recv(recv_cap)
@@ -792,7 +823,7 @@ mod tests {
 
         let child = state
             .cspace
-            .mint_derived(send_cap, &[CapRights::Send])
+            .mint_derived(send_cap, CapRights::SEND)
             .expect("derive");
         let msg = Message::new(9, b"ok").expect("msg");
         assert!(state.ipc_send(child, msg).is_ok());
@@ -913,7 +944,7 @@ mod tests {
 
         let read_only_cap = state
             .cspace
-            .mint_derived(aspace_map_cap, &[CapRights::Read])
+            .mint_derived(aspace_map_cap, CapRights::READ)
             .expect("derive read-only aspace cap");
         let missing_right = state.map_user_page(
             read_only_cap,
@@ -970,7 +1001,7 @@ mod tests {
 
         let readonly_mem = state
             .cspace
-            .mint_derived(mem_cap, &[CapRights::Read])
+            .mint_derived(mem_cap, CapRights::READ)
             .expect("derive ro");
 
         let res = state.map_user_page_with_caps(
@@ -1144,7 +1175,7 @@ mod tests {
 
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue task1");
+        state.enqueue_current_cpu(1).expect("enqueue task1");
 
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind");
@@ -1177,7 +1208,7 @@ mod tests {
             Some(SyscallError::PageFault.code())
         );
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
     }
 
     #[test]
@@ -1198,7 +1229,7 @@ mod tests {
 
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue task1");
+        state.enqueue_current_cpu(1).expect("enqueue task1");
 
         let (_handler_eid, _handler_send, handler_recv) =
             state.create_endpoint(4).expect("handler endpoint");
@@ -1235,7 +1266,7 @@ mod tests {
             Some(SyscallError::PageFault.code())
         );
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
 
         let report = state
             .ipc_recv(handler_recv)
@@ -1257,7 +1288,7 @@ mod tests {
 
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue task1");
+        state.enqueue_current_cpu(1).expect("enqueue task1");
         state.set_fault_policy(FaultPolicy::NotifyAndContinue);
 
         let (_handler_eid, _handler_send, handler_recv) =
@@ -1295,7 +1326,7 @@ mod tests {
             Some(SyscallError::PageFault.code())
         );
         assert_eq!(state.task_status(0), Some(TaskStatus::Running));
-        assert_eq!(state.scheduler.current_tid(), Some(0));
+        assert_eq!(state.current_tid(), Some(0));
 
         let report = state
             .ipc_recv(handler_recv)
@@ -1314,7 +1345,7 @@ mod tests {
             .set_task_fault_policy(0, Some(FaultPolicy::KillTask))
             .expect("set override");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue task1");
+        state.enqueue_current_cpu(1).expect("enqueue task1");
 
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind");
@@ -1347,7 +1378,7 @@ mod tests {
             Some(SyscallError::PageFault.code())
         );
         assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
     }
 
     #[test]
@@ -1357,7 +1388,7 @@ mod tests {
         state.bind_irq_notification(11, notif_cap).expect("bind");
 
         state
-            .handle_trap_event(TrapEvent::external_interrupt(11), None)
+            .handle_trap_event(TrapEvent::ExternalInterrupt(11), None)
             .expect("handle irq");
 
         let msg = state.ipc_recv(notif_recv_cap).expect("recv").expect("msg");
@@ -1417,7 +1448,7 @@ mod tests {
             .create_endpoint_with_mode(2, EndpointMode::Synchronous)
             .expect("endpoint");
 
-        state.scheduler.enqueue(61).expect("enqueue receiver");
+        state.enqueue_current_cpu(61).expect("enqueue receiver");
         let mut recv_tf = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 0x9000, 0, 0, 0],
@@ -1426,7 +1457,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_tf))
             .expect("recv trap");
 
-        state.scheduler.enqueue(60).expect("enqueue sender");
+        state.enqueue_current_cpu(60).expect("enqueue sender");
         let msg = Message::new(60, b"fp").expect("msg");
         let fast = state.ipc_send_fastpath(send_cap, msg).expect("fastpath");
         assert!(fast.switched_to_waiter);
@@ -1533,48 +1564,6 @@ mod tests {
     }
 
     #[test]
-    fn delegation_policy_requires_init_and_driver_roles() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(70).expect("init-task");
-        state.register_task(71).expect("driver-task");
-        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-        let iova_cap = state.create_iova_space_cap().expect("iova");
-
-        state
-            .register_service_role(70, ServiceRole::Init)
-            .expect("role");
-        state
-            .register_service_role(71, ServiceRole::Driver)
-            .expect("role");
-
-        let ok = state.delegate_driver_bundle_checked(
-            70,
-            DriverBundlePlan {
-                server_tid: ThreadId(71),
-                irq_line: 3,
-                mem_cap,
-                iova_cap,
-                iova_base: crate::kernel::vm::PAGE_SIZE,
-                iova_len: crate::kernel::vm::PAGE_SIZE,
-            },
-        );
-        assert!(ok.is_ok());
-
-        let bad = state.delegate_driver_bundle_checked(
-            71,
-            DriverBundlePlan {
-                server_tid: ThreadId(71),
-                irq_line: 4,
-                mem_cap,
-                iova_cap,
-                iova_base: crate::kernel::vm::PAGE_SIZE * 2,
-                iova_len: crate::kernel::vm::PAGE_SIZE,
-            },
-        );
-        assert_eq!(bad, Err(KernelError::MissingRight));
-    }
-
-    #[test]
     fn rendezvous_delivery_is_single_copy_and_no_sender_stuck() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(80).expect("sender");
@@ -1584,7 +1573,7 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
 
-        state.scheduler.enqueue(81).expect("enqueue receiver");
+        state.enqueue_current_cpu(81).expect("enqueue receiver");
         let mut recv_tf = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 0x1100, 0, 0, 0],
@@ -1593,7 +1582,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_tf))
             .expect("recv trap");
 
-        state.scheduler.enqueue(80).expect("enqueue sender");
+        state.enqueue_current_cpu(80).expect("enqueue sender");
         state
             .ipc_send(send_cap, Message::new(80, b"rv").expect("msg"))
             .expect("send");
@@ -1609,42 +1598,6 @@ mod tests {
     }
 
     #[test]
-    fn service_delegation_edges_table_is_auditable_and_frozen() {
-        let edges = KernelState::allowed_service_delegation_edges();
-        assert!(edges.contains(&(ServiceRole::Init, ServiceRole::Driver)));
-        assert!(edges.contains(&(ServiceRole::Supervisor, ServiceRole::Vfs)));
-        assert!(!edges.contains(&(ServiceRole::Driver, ServiceRole::ProcessManager)));
-        assert_eq!(edges.len(), 6);
-    }
-
-    #[test]
-    fn service_delegation_graph_allows_only_expected_edges() {
-        let mut state = Bootstrap::init().expect("init");
-        for tid in 90..=93 {
-            state.register_task(tid).expect("task");
-        }
-        state
-            .register_service_role(90, ServiceRole::Init)
-            .expect("role init");
-        state
-            .register_service_role(91, ServiceRole::Supervisor)
-            .expect("role sup");
-        state
-            .register_service_role(92, ServiceRole::Driver)
-            .expect("role drv");
-        state
-            .register_service_role(93, ServiceRole::ProcessManager)
-            .expect("role proc");
-
-        assert!(state.validate_service_delegation(90, 93).is_ok());
-        assert!(state.validate_service_delegation(91, 92).is_ok());
-        assert_eq!(
-            state.validate_service_delegation(92, 93),
-            Err(KernelError::MissingRight)
-        );
-    }
-
-    #[test]
     fn ipc_send_fastpath_detects_waiter() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(35).expect("sender");
@@ -1654,7 +1607,7 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
 
-        state.scheduler.enqueue(36).expect("enqueue receiver");
+        state.enqueue_current_cpu(36).expect("enqueue receiver");
         let mut recv_tf = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 8, 0x7000, 0, 0, 0],
@@ -1663,7 +1616,7 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut recv_tf))
             .expect("recv trap");
 
-        state.scheduler.enqueue(35).expect("enqueue sender");
+        state.enqueue_current_cpu(35).expect("enqueue sender");
         let msg = Message::new(35, b"x").expect("msg");
         let result = state.ipc_send_fastpath(send_cap, msg).expect("fastpath");
         assert!(result.switched_to_waiter);
@@ -1693,12 +1646,17 @@ mod tests {
             .set_supervisor_endpoint(recv_cap)
             .expect("supervisor ep");
         state
-            .report_task_exit_to_supervisor(7, 99)
+            .report_task_exit_to_supervisor(7, 99, 55)
             .expect("report exit");
 
         let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
         assert_eq!(msg.opcode, 0xEE);
-        assert_eq!(msg.as_slice().len(), 16);
+        assert_eq!(msg.as_slice().len(), 24);
+        let event =
+            crate::kernel::supervisor_abi::TaskExitedEvent::decode(msg.as_slice()).expect("event");
+        assert_eq!(event.tid, 7);
+        assert_eq!(event.exit_code, 99);
+        assert_eq!(event.restart_token, 55);
         assert_eq!(
             state
                 .ipc_send(send_cap, Message::new(0, b"ok").expect("m"))
@@ -1712,7 +1670,7 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(9).expect("task");
         let token = state.exit_task(9, 12).expect("exit");
-        assert_eq!(state.task_status(9), Some(TaskStatus::Exited));
+        assert_eq!(state.task_status(9), Some(TaskStatus::Exited(12)));
 
         assert!(state.restart_task(9, token).is_ok());
         assert_eq!(state.task_status(9), Some(TaskStatus::Runnable));
@@ -1760,9 +1718,7 @@ mod tests {
 
         for _ in 0..8 {
             state
-                .submit_cross_cpu_work(WorkItem::Reschedule {
-                    target_cpu: CpuId(1),
-                })
+                .submit_cross_cpu_work(CpuId(1), WorkItem::Reschedule)
                 .expect("work");
         }
         state
@@ -1771,7 +1727,7 @@ mod tests {
 
         for _ in 0..5 {
             state
-                .handle_trap_event(TrapEvent::external_interrupt(5), None)
+                .handle_trap_event(TrapEvent::ExternalInterrupt(5), None)
                 .expect("irq");
         }
 
@@ -1784,61 +1740,6 @@ mod tests {
         }
         assert_eq!(irq_msgs, 5);
         assert_eq!(state.online_cpu_count(), 2);
-    }
-
-    #[test]
-    fn restart_telemetry_reports_budget_and_backoff() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(11).expect("task");
-        state.set_task_restart_policy(11, 2, 5).expect("policy");
-
-        let token = state.exit_task(11, 1).expect("exit");
-        let t0 = state.task_restart_telemetry(11).expect("telemetry");
-        assert_eq!(t0.budget_remaining, 2);
-        assert!(t0.token_outstanding);
-
-        assert!(state.restart_task(11, token).is_ok());
-        let t1 = state.task_restart_telemetry(11).expect("telemetry");
-        assert_eq!(t1.budget_remaining, 1);
-        assert!(!t1.token_outstanding);
-        assert!(t1.available_at_tick >= 5);
-    }
-
-    #[test]
-    fn restart_denial_escalates_to_supervisor_every_threshold() {
-        let mut state = Bootstrap::init().expect("init");
-        let (_e, _send, recv_cap) = state.create_endpoint(4).expect("endpoint");
-        state.set_supervisor_endpoint(recv_cap).expect("supervisor");
-
-        state.register_task(13).expect("task");
-        let _token = state.exit_task(13, 77).expect("exit");
-
-        for _ in 0..3 {
-            let _ = state.restart_task(13, 0xDEAD);
-        }
-
-        let telemetry = state.task_restart_telemetry(13).expect("telemetry");
-        assert_eq!(telemetry.denied_count, 3);
-        assert_eq!(telemetry.escalation_count, 1);
-
-        let exit_report = state.ipc_recv(recv_cap).expect("recv").expect("msg");
-        assert_eq!(exit_report.opcode, 0xEE);
-
-        let denial_report = state.ipc_recv(recv_cap).expect("recv").expect("msg");
-        assert_eq!(denial_report.opcode, 0xEF);
-    }
-
-    #[test]
-    fn class_restart_policy_applies_on_registration() {
-        let mut state = Bootstrap::init().expect("init");
-        state.set_class_restart_policy(TaskClass::Driver, 9, 33);
-        state
-            .register_task_with_class(21, TaskClass::Driver)
-            .expect("register");
-
-        let t = state.task_restart_telemetry(21).expect("telemetry");
-        assert_eq!(t.budget_remaining, 9);
-        assert_eq!(t.backoff_ticks, 33);
     }
 
     #[test]
@@ -1885,25 +1786,6 @@ mod tests {
     }
 
     #[test]
-    fn escalation_threshold_is_class_specific() {
-        let mut state = Bootstrap::init().expect("init");
-        let (_e, _send, recv_cap) = state.create_endpoint(8).expect("endpoint");
-        state.set_supervisor_endpoint(recv_cap).expect("supervisor");
-        state.set_class_escalation_threshold(TaskClass::Driver, 2);
-
-        state
-            .register_task_with_class(30, TaskClass::Driver)
-            .expect("task");
-        let _ = state.exit_task(30, 1).expect("exit");
-        let _ = state.restart_task(30, 0xBAD);
-        let _ = state.restart_task(30, 0xBAD);
-
-        let t = state.task_restart_telemetry(30).expect("telemetry");
-        assert_eq!(t.denied_count, 2);
-        assert_eq!(t.escalation_count, 1);
-    }
-
-    #[test]
     fn detach_iova_space_revokes_dma_window_validation() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(31).expect("task");
@@ -1938,19 +1820,6 @@ mod tests {
                 )
                 .is_err()
         );
-    }
-
-    #[test]
-    fn class_policy_snapshot_reports_driver_settings() {
-        let mut state = Bootstrap::init().expect("init");
-        state.set_class_restart_policy(TaskClass::Driver, 6, 40);
-        state.set_class_escalation_threshold(TaskClass::Driver, 4);
-
-        let snap = state.class_policy_snapshot(TaskClass::Driver);
-        assert_eq!(snap.class, TaskClass::Driver);
-        assert_eq!(snap.restart_budget, 6);
-        assert_eq!(snap.restart_backoff_ticks, 40);
-        assert_eq!(snap.escalation_threshold, 4);
     }
 
     #[test]
@@ -2000,27 +1869,17 @@ mod tests {
         state.register_task(110).expect("init-task");
         state.register_task(111).expect("driver-task");
 
-        state
-            .register_service_role(110, ServiceRole::Init)
-            .expect("role init");
-        state
-            .register_service_role(111, ServiceRole::Driver)
-            .expect("role driver");
-
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         let iova_cap = state.create_iova_space_cap().expect("iova");
 
         let first_bundle = state
-            .delegate_driver_bundle_checked(
-                110,
-                DriverBundlePlan::standard(
-                    ThreadId(111),
-                    14,
-                    mem_cap,
-                    iova_cap,
-                    crate::kernel::vm::PAGE_SIZE * 4,
-                ),
-            )
+            .delegate_driver_bundle(DriverBundlePlan::standard(
+                ThreadId(111),
+                14,
+                mem_cap,
+                iova_cap,
+                crate::kernel::vm::PAGE_SIZE * 4,
+            ))
             .expect("first bundle");
         state
             .validate_driver_bundle_live(111, first_bundle)
@@ -2046,16 +1905,13 @@ mod tests {
         let iova_cap2 = state.create_iova_space_cap().expect("iova2");
 
         let second_bundle = state
-            .delegate_driver_bundle_checked(
-                110,
-                DriverBundlePlan::standard(
-                    ThreadId(111),
-                    14,
-                    mem_cap,
-                    iova_cap2,
-                    crate::kernel::vm::PAGE_SIZE * 4,
-                ),
-            )
+            .delegate_driver_bundle(DriverBundlePlan::standard(
+                ThreadId(111),
+                14,
+                mem_cap,
+                iova_cap2,
+                crate::kernel::vm::PAGE_SIZE * 4,
+            ))
             .expect("second bundle");
         state
             .validate_driver_bundle_live(111, second_bundle)
@@ -2124,13 +1980,11 @@ mod tests {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             match seed % 3 {
                 0 => state
-                    .submit_cross_cpu_work(WorkItem::Reschedule {
-                        target_cpu: CpuId((seed as u8) % 2),
-                    })
+                    .submit_cross_cpu_work(CpuId((seed as u8) % 2), WorkItem::Reschedule)
                     .expect("work"),
                 1 => {
                     if state
-                        .handle_trap_event(TrapEvent::external_interrupt(7), None)
+                        .handle_trap_event(TrapEvent::ExternalInterrupt(7), None)
                         .is_err()
                     {
                         let _ = state.ipc_recv(nrecv);
@@ -2158,27 +2012,14 @@ mod tests {
     fn yield_current_rotates_to_next_runnable_task() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(40).expect("task");
-        state.scheduler.enqueue(40).expect("enqueue");
+        state.enqueue_current_cpu(40).expect("enqueue");
 
-        assert_eq!(state.scheduler.current_tid(), Some(0));
+        assert_eq!(state.current_tid(), Some(0));
         state.yield_current().expect("yield");
 
-        assert_eq!(state.scheduler.current_tid(), Some(40));
+        assert_eq!(state.current_tid(), Some(40));
         assert_eq!(state.task_status(40), Some(TaskStatus::Running));
         assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
-    }
-
-    #[test]
-    fn restart_task_honors_backoff_window() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(41).expect("task");
-        state.set_task_restart_policy(41, 2, 10).expect("policy");
-
-        let first = state.exit_task(41, 1).expect("exit1");
-        state.restart_task(41, first).expect("restart1");
-
-        let second = state.exit_task(41, 2).expect("exit2");
-        assert_eq!(state.restart_task(41, second), Err(KernelError::WouldBlock));
     }
 
     #[test]
@@ -2190,7 +2031,7 @@ mod tests {
         };
 
         state
-            .handle_trap_event(TrapEvent::page_fault(fault), None)
+            .handle_trap_event(TrapEvent::PageFault(fault), None)
             .expect("handle page fault");
 
         assert_eq!(state.last_fault(), Some(fault));
@@ -2203,9 +2044,7 @@ mod tests {
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
 
         state
-            .submit_cross_cpu_work(WorkItem::Reschedule {
-                target_cpu: CpuId(1),
-            })
+            .submit_cross_cpu_work(CpuId(1), WorkItem::Reschedule)
             .expect("submit");
 
         let processed_cpu0 = state
@@ -2246,10 +2085,10 @@ mod tests {
     fn futex_wait_blocks_current_and_wake_requeues_waiter() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
-        state.scheduler.enqueue(1).expect("enqueue");
+        state.enqueue_current_cpu(1).expect("enqueue");
         state.dispatch_next_task().expect("dispatch");
         state.yield_current().expect("switch");
-        assert_eq!(state.scheduler.current_tid(), Some(1));
+        assert_eq!(state.current_tid(), Some(1));
 
         assert!(state.futex_wait_current(0x1000, 3, 3).expect("wait"));
         assert_eq!(
@@ -2258,78 +2097,6 @@ mod tests {
         );
         assert_eq!(state.futex_wake(0x1000, 1).expect("wake"), 1);
         assert_eq!(state.task_status(1), Some(TaskStatus::Runnable));
-    }
-
-    #[test]
-    fn thread_state_helpers_cover_pid_tls_context_join_and_robust_futex() {
-        let mut state = Bootstrap::init().expect("init");
-        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
-        state
-            .spawn_user_task_from_image(UserImageSpec {
-                tid: 9,
-                entry: 0x5000,
-                asid: Some(asid),
-                class: TaskClass::App,
-            })
-            .expect("leader");
-        let tid = state
-            .spawn_user_thread(9, 0xCAFE_BABE, 0x9000_0000, 0x5010)
-            .expect("thread");
-
-        assert_eq!(state.process_id(tid), Some(9));
-        assert!(!state.is_thread_group_leader(tid));
-        assert_eq!(
-            state.take_tls_restore_request(tid).expect("tls request"),
-            Some(0xCAFE_BABE)
-        );
-        assert_eq!(
-            state.take_tls_restore_request(tid).expect("tls cleared"),
-            None
-        );
-
-        state
-            .set_thread_user_context(
-                tid,
-                UserRegisterContext {
-                    instruction_ptr: 0x6000,
-                    stack_ptr: 0xA000_0000,
-                    arg0: 7,
-                    arg1: 8,
-                },
-            )
-            .expect("ctx");
-        assert_eq!(
-            state.thread_user_context(tid).expect("ctx read"),
-            UserRegisterContext {
-                instruction_ptr: 0x6000,
-                stack_ptr: 0xA000_0000,
-                arg0: 7,
-                arg1: 8,
-            }
-        );
-
-        state.set_robust_futex_head(tid, 0x7000, 2).expect("robust");
-        assert_eq!(
-            state.robust_futex_state(tid),
-            Some(RobustFutexState {
-                head: 0x7000,
-                len: 2
-            })
-        );
-
-        state.mark_thread_detached(tid).expect("detach");
-        assert_eq!(
-            state.thread_detach_state(tid),
-            Some(ThreadDetachState::Detached)
-        );
-        assert_eq!(state.join_thread(tid), Err(KernelError::WrongObject));
-
-        let joinable = state
-            .spawn_user_thread(9, 0xD00D_BEEF, 0x9100_0000, 0x5020)
-            .expect("joinable");
-        state.exit_task(joinable, 23).expect("exit");
-        assert_eq!(state.join_thread(joinable).expect("join"), Some(23));
-        assert_eq!(state.task_status(joinable), Some(TaskStatus::Dead));
     }
 
     #[test]
@@ -2348,18 +2115,18 @@ mod tests {
             .spawn_user_thread(20, 0xABCD_0000, 0x8800_0000, 0x7010)
             .expect("thread");
         state.yield_current().expect("switch");
-        assert_eq!(state.scheduler.current_tid(), Some(tid));
+        assert_eq!(state.current_tid(), Some(tid));
 
         let mut frame = TrapFrame::new(0, [11, 22, 0, 0, 0, 0]);
         let tls = state
             .resume_current_thread_with_frame(&mut frame)
             .expect("resume");
         assert_eq!(tls, Some(0xABCD_0000));
-        assert_eq!(frame.ret0(), 0x7010);
-        assert_eq!(frame.ret1(), 0x8800_0000);
+        assert_eq!(frame.saved_pc(), 0x7010);
+        assert_eq!(frame.saved_sp(), 0x8800_0000);
 
-        frame.set_ok(0x9000, frame.ret1(), frame.ret2());
-        frame.set_ok(frame.ret0(), 0x9900_0000, frame.ret2());
+        frame.set_saved_pc(0x9000);
+        frame.set_saved_sp(0x9900_0000);
         frame.set_arg(0, 33);
         frame.set_arg(1, 44);
         state
@@ -2368,8 +2135,8 @@ mod tests {
         assert_eq!(
             state.thread_user_context(tid),
             Some(UserRegisterContext {
-                instruction_ptr: 0x9000,
-                stack_ptr: 0x9900_0000,
+                instruction_ptr: VirtAddr(0x9000),
+                stack_ptr: VirtAddr(0x9900_0000),
                 arg0: 33,
                 arg1: 44,
             })
@@ -2392,7 +2159,7 @@ mod tests {
             .spawn_user_thread(30, 0xCAFE_1000, 0x8100_0000, 0x4010)
             .expect("joiner");
         state.yield_current().expect("switch to joiner");
-        assert_eq!(state.scheduler.current_tid(), Some(joiner));
+        assert_eq!(state.current_tid(), Some(joiner));
 
         assert_eq!(state.join_thread(30).expect("join pending"), None);
         assert_eq!(
@@ -2406,26 +2173,5 @@ mod tests {
         state.mark_thread_detached(joiner).expect("detach");
         state.exit_task(joiner, 9).expect("exit detached");
         assert_eq!(state.task_status(joiner), Some(TaskStatus::Dead));
-    }
-
-    #[test]
-    fn robust_futex_exit_cleanup_wakes_matching_waiters() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(40).expect("owner");
-        state.register_task(41).expect("waiter");
-        state.set_robust_futex_head(40, 0x2000, 1).expect("robust");
-        state.scheduler.enqueue(40).expect("owner enqueue");
-        state.scheduler.enqueue(41).expect("waiter enqueue");
-        state.dispatch_next_task().expect("dispatch");
-        state.yield_current().expect("to owner");
-        state.yield_current().expect("to waiter");
-        assert_eq!(state.scheduler.current_tid(), Some(41));
-        assert!(state.futex_wait_current(0x2000, 1, 1).expect("wait"));
-        assert_eq!(
-            state.task_status(41),
-            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x2000))))
-        );
-        state.exit_task(40, 0).expect("owner exit");
-        assert_eq!(state.task_status(41), Some(TaskStatus::Runnable));
     }
 }

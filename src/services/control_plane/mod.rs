@@ -1,3 +1,4 @@
 pub mod init;
-pub mod procman;
+pub mod process_manager;
+pub mod supervisor;
 pub mod vfs;

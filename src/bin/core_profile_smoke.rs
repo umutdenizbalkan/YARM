@@ -1,9 +1,9 @@
 #![no_std]
 use yarm::kernel::ipc::Message;
-use yarm::kernel::proc_proto::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
-use yarm::kernel::process_manager::{ProcessService, SpawnV2Result, WaitPidV2Result};
+use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
+use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use yarm::kernel::vfs::{
-    OpenAtRequest, ReadWriteRequest, VfsLiteService, openat_message, read_message,
+    OpenAtRequest, ReadWriteRequest, VfsService, openat_message, read_message,
 };
 
 fn main() {
@@ -31,7 +31,7 @@ fn main() {
     let wait_rep = proc.handle(wait).expect("wait rep");
     let waited = WaitPidV2Result::decode(wait_rep.as_slice()).expect("waited");
 
-    let mut vfs = VfsLiteService::new();
+    let mut vfs = VfsService::new();
     let open = openat_message(OpenAtRequest {
         dirfd: 0,
         path_ptr: 0x1000,
@@ -63,7 +63,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::kernel::vfs_proto::VFS_OP_READ;
+    use yarm::kernel::vfs_abi::VFS_OP_READ;
 
     #[test]
     fn core_profile_smoke_path_is_stable() {
@@ -92,7 +92,7 @@ mod tests {
         let waited = WaitPidV2Result::decode(wait_rep.as_slice()).expect("waited");
         assert_eq!(waited.exit_code, 3);
 
-        let mut vfs = VfsLiteService::new();
+        let mut vfs = VfsService::new();
         let open = openat_message(OpenAtRequest {
             dirfd: 0,
             path_ptr: 0x1000,

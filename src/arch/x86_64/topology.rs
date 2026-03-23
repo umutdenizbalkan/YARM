@@ -17,12 +17,17 @@ pub fn discover_present_cpu_bitmap(madt_or_apic: &[u8]) -> u64 {
             .split_whitespace()
             .find(|part| part.starts_with("apic_id=") || part.starts_with("cpu="))
         {
-            let raw = id_field.split('=').nth(1).unwrap_or("0");
-            if let Ok(cpu) = raw.parse::<u8>() {
-                if cpu < 64 {
-                    bitmap |= 1u64 << cpu;
-                }
+            let raw = id_field.split('=').nth(1).unwrap_or("");
+            match raw.parse::<u8>() {
+                Ok(cpu) if cpu < 64 => bitmap |= 1u64 << cpu,
+                Ok(cpu) => crate::pr_warn!("x86 topology: cpu id {} exceeds bitmap width", cpu),
+                Err(_) => crate::pr_warn!("x86 topology: malformed apic_id/cpu field '{}'", raw),
             }
+        } else {
+            crate::pr_warn!(
+                "x86 topology: LAPIC/APIC entry missing apic_id/cpu field: {}",
+                line
+            );
         }
     }
     if bitmap == 0 {

@@ -5,7 +5,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 ## Ownership model
 
 - **Kernel mechanisms owner**: kernel team (capability model, IPC transport, trap/IRQ routing, VM primitives)
-- **Core control-plane servers owner**: core runtime team (`init.srv`, `procman.srv`, `vfs.srv`)
+- **Core control-plane servers owner**: core runtime team (`init.srv`, `process_manager.srv`, `vfs.srv`)
 - **Driver servers owner**: device/runtime team (`*.drv.srv`, IRQ/DMA/IOMMU delegation)
 - **Networking servers owner**: net team (`netmgr.srv`, `tcpip.srv`, `dns.srv`, `dhcp.srv`)
 - **UI/display servers owner**: graphics/input team (`display.srv`, `compositor.srv`, `input.srv`)
@@ -15,8 +15,10 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ## Service domain layout
 
-- `src/services/control_plane/*` for init/procman/vfs/supervisor service implementations.
-- `src/services/fs/*` for filesystem and storage-facing services.
+- `src/services/init/*` for init service policy, launch ordering, and mount orchestration.
+- `src/services/control_plane/process_manager/*` for process-manager control-plane logic.
+- `src/services/control_plane/vfs/*` for the control-plane VFS request loop and policy glue.
+- `src/services/fs/*` for filesystem and storage-facing services such as ramfs/initramfs/devfs/ext4/fat/blkcache.
 - `src/services/drivers/*` for hardware/transport driver services.
 - `src/services/network/*` for networking services.
 - `src/services/ui/*` for display/input/session services.
@@ -25,25 +27,32 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ## Immediate next steps (review-driven)
 
-1. Add supervisor-first launch-order option in `InitServerLite` for faster recovery-manager readiness during early boot faults.
-2. Publish a restart-ownership matrix for `init.srv` vs `supervisor.srv` (who restarts `vfs/procman/drivers`, and fallback when supervisor fails).
-3. Convert all thin `src/bin/*_srv.rs` stubs to call real service entrypoints with explicit typed request loops (one service family per PR).
-4. Add deterministic fault-injection tests for each service family (`control_plane`, `drivers`, `fs`, `network`, `ui`) and wire them to `compat-gates`.
-5. Gate phase advancement on runnable profile evidence (QEMU smoke marker + deterministic sim + codec compatibility vectors).
+1. Convert all thin `src/bin/*_srv.rs` stubs to call real service entrypoints with explicit typed request loops (one service family per PR).
+2. Add deterministic fault-injection tests for each service family (`control_plane`, `drivers`, `fs`, `network`, `ui`) and wire them to `compat-gates`.
+3. Gate phase advancement on runnable profile evidence (QEMU smoke marker + deterministic sim + codec compatibility vectors).
+
+## Restart ownership matrix
+
+| Service | Primary restart owner | Fallback / recovery path |
+| --- | --- | --- |
+| `process_manager.srv` | `supervisor.srv` | mark degraded and alert `init.srv` if restart budget is exhausted |
+| `vfs.srv` | `supervisor.srv` | mark degraded and alert `init.srv` if restart budget is exhausted |
+| driver servers | `supervisor.srv` | redelegate bundle automatically when recovery plan is known; otherwise alert `init.srv` for manual redelegation |
+| `supervisor.srv` | `init.srv` | restart supervisor, replay core registrations, and rebind fault handoff |
 
 ## Phase 0 — Stabilize Core Control Plane ✅
 
 ### Scope
 
 - `init.srv`: deterministic launch ordering and restart-policy table sanity checks.
-- `procman.srv`: wait/reap lifecycle policy hardening (non-parent and unknown target rejection).
+- `process_manager.srv`: wait/reap lifecycle policy hardening (non-parent and unknown target rejection).
 - `vfs.srv`: mount namespace policy gate + deterministic operation ordering counter.
 
 ### Implemented
 
-- `InitServerLite` now carries a baseline restart-policy table, validates policy sanity, and records deterministic launch order (`procman -> vfs -> supervisor`).
-- `ProcessManagerLite` wait-path now rejects unknown targets and enforces parent ownership more strictly.
-- `VfsLiteService` now supports mount namespace policy (allow/deny boot-path classes) and deterministic op-sequence accounting for successful requests.
+- `InitService` now carries a baseline restart-policy table, validates policy sanity, and records deterministic launch order (`process_manager -> vfs -> supervisor`).
+- `ProcessManager` wait-path now rejects unknown targets and enforces parent ownership more strictly.
+- `VfsService` now supports mount namespace policy (allow/deny boot-path classes) and deterministic op-sequence accounting for successful requests.
 
 ### Test gates (must pass)
 
@@ -159,7 +168,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 ## Architecture follow-up status (frozen)
 
-- ✅ Next move 1: `kernel::vfs` promoted as primary API (with `vfs_lite` compatibility shim and migrated imports).
+- ✅ Next move 1: `kernel::vfs` promoted as primary API (with `vfs_server` binary naming and migrated imports).
 - ✅ Next move 2: typed VFS request/response wrappers added in `kernel::vfs` and adopted by service entry/service tests.
 - ✅ Next move 3: FAT scaffold now models directory entries + cluster growth and typed VFS messaging path.
 - ✅ Next move 4: blkcache now has policy knobs + writeback scheduling and is integrated by FAT/EXT4 backends.

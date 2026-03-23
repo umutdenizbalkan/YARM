@@ -9,9 +9,9 @@ This matrix maps roadmap phase completion to required contracts, CI jobs, and de
 - Required CI jobs:
   - `phase2-driver-gates`
 - Required deterministic tests:
-  - `kernel::bootstrap::tests::delegate_driver_bundle_checked_enforces_service_role_edges`
-  - `kernel::bootstrap::tests::restart_denial_escalates_to_supervisor_every_threshold`
-  - `kernel::bootstrap::tests::driver_restart_revokes_runtime_caps`
+  - `kernel::boot::tests::delegate_driver_bundle_checked_enforces_service_role_edges`
+  - `kernel::boot::tests::restart_denial_escalates_to_supervisor_every_threshold`
+  - `kernel::boot::tests::driver_restart_revokes_runtime_caps`
   - `services::drivers::irqmux::service::tests::irqmux_routes_masks_and_drops_deterministically`
   - `services::drivers::uart::service::tests::uart_backpressure_is_deterministic`
   - `services::drivers::virtio_net::service::tests::virtio_net_queue_backpressure_is_deterministic`

@@ -18,5 +18,5 @@ pub fn run() {
     bytes.copy_from_slice(&reply.as_slice()[..8]);
     let fd = u64::from_le_bytes(bytes);
 
-    crate::yarm_log!("vfs-lite server loop: fd={}, handled={}", fd, vfs.handled_count());
+    crate::yarm_log!("vfs server loop: fd={}, handled={}", fd, vfs.handled_count());
 }
