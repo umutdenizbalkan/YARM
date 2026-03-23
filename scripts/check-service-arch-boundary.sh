@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # 1) concrete FS/service types must not be in kernel vfs modules
-if rg -n "Ext4|RamFs|DevFs|Initramfs|Fat|BlkCache" src/kernel/vfs.rs src/kernel/vfs_lite.rs >/dev/null; then
+if rg -n "Ext4|RamFs|DevFs|Initramfs|Fat|BlkCache" src/kernel/vfs.rs src/services/control_plane/vfs/service.rs >/dev/null; then
   echo "[fail] concrete service names found in kernel vfs modules"
-  rg -n "Ext4|RamFs|DevFs|Initramfs|Fat|BlkCache" src/kernel/vfs.rs src/kernel/vfs_lite.rs
+  rg -n "Ext4|RamFs|DevFs|Initramfs|Fat|BlkCache" src/kernel/vfs.rs src/services/control_plane/vfs/service.rs
   exit 1
 fi
 
 # 2) enforce service domain layout (no legacy flat service directories)
-allowed='^(common|compatibility|control_plane|drivers|fs|network|ui)$'
+allowed='^(common|compatibility|control_plane|drivers|fs|init|network|ui)$'
 for d in src/services/*; do
   [[ -d "$d" ]] || continue
   base=$(basename "$d")

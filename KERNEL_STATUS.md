@@ -6,7 +6,7 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
 
 The kernel mechanism layer is now considered **complete for the current milestone**:
 
-- **Type consistency in integration paths:** key bootstrap internals now use typed identities (`ThreadId`) for driver records, endpoint waiters, and delegation routing.
+- **Type consistency in integration paths:** key boot internals now use typed identities (`ThreadId`) for driver records, endpoint waiters, and delegation routing.
 - **Kernel-state decomposition:** `KernelState` is no longer a flat god-struct; mechanism data is split into subsystem state blocks (`IpcSubsystem`, `MemorySubsystem`, `DriverSubsystem`, `FaultSubsystem`, `RestartSubsystem`).
 - **Trap/IPC/scheduler invariants:** targeted invariant tests cover preemption rotation, trap fault routing, restart backoff, and cross-CPU deferred-work behavior.
 - **Mechanism-policy separation:** service-specific Linux process/VFS manager wiring is outside `KernelState`; kernel mechanisms remain service-agnostic.

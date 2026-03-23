@@ -25,7 +25,7 @@ All user-space components are **servers**:
 ```
 /srv/
   init.srv
-  procman.srv
+  process_manager.srv
   vfs.srv
   ext4.srv
   tcp.srv

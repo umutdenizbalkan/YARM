@@ -19,7 +19,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 
 ## 2) Capability Delegation Chain (Init -> Server -> Server)
 
-- Define an explicit delegation path from `init.srv` to service graph (`procman.srv`, `vfs.srv`, `usb.srv`, etc.).
+- Define an explicit delegation path from `init.srv` to service graph (`process_manager.srv`, `vfs.srv`, `usb.srv`, etc.).
 - Keep kernel-side APIs mechanism-only: mint, transfer, revoke; policy remains in user-space supervisors.
 - Standardize delegation bundles for hardware servers (IRQ + MMIO + IOVA window).
 - Add tests for stale-cap rejection and delegation revocation behavior.
@@ -70,7 +70,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Added network/mirror bootstrap wrapper: `scripts/bootstrap-nightly-mirror.sh` (installs nightly + rust-src from configured Rust dist/update endpoints, then runs the freestanding bootstrap build).
 - Added Linux-compat sysdeps bootstrap module: `src/services/compatibility/linux_compat/sysdeps.rs` (startup + memory contract + clock stub).
 - Expanded sysdeps shim scaffolding with startup/memory/clock/thread/futex hooks and focused tests (bootstrap-grade semantics).
-- Expanded kernel deterministic bootstrap simulation to assert procman + VFS + IRQ notification routing in a single end-to-end flow (`run_init_core_bootstrap_scenario`).
+- Expanded kernel deterministic bootstrap simulation to assert process_manager + VFS + IRQ notification routing in a single end-to-end flow (`run_init_core_bootstrap_scenario`).
 
 ## Immediate next 5 implementable steps
 
@@ -79,10 +79,10 @@ This checklist focuses on turning the current in-memory kernel model into a port
 3. Freeze and document typed process/VFS server codecs with versioned structs.
 4. Add minimal HAL trait conformance docs/tests for RISC-V and one additional ISA target.
    - ✅ Added HAL conformance note for RISC-V + x86 baseline: `HAL_CONFORMANCE.md`.
-5. Expand deterministic end-to-end server flow tests (procman + VFS + notification routing).
+5. Expand deterministic end-to-end server flow tests (process_manager + VFS + notification routing).
 
 Progress notes:
-- ✅ Added IPC fastpath-vs-queued-vs-blocked telemetry tests under contention in `kernel::bootstrap` tests.
+- ✅ Added IPC fastpath-vs-queued-vs-blocked telemetry tests under contention in `kernel::boot` tests.
 - ✅ Added restart/redelegation stale-cap regression for checked driver delegation bundles.
 
 ## Review follow-up next steps (after oversized placeholder PR)
@@ -99,10 +99,10 @@ Progress notes:
 4. **Reduce bootstrap script drift**
    - consolidate x86/riscv qemu build/smoke scripts behind a shared helper to avoid duplicated maintenance.
 5. **Define a minimum runnable server profile**
-   - ship a single "core profile" path (`init/procman/vfs/supervisor + console + one FS`) and keep it green before expanding feature breadth.
+   - ship a single "core profile" path (`init/process_manager/vfs/supervisor + console + one FS`) and keep it green before expanding feature breadth.
 
 
 ## init.srv scaffold status
 
 - Initial boot-contract scaffold added: `INIT_SERVER_BOOT_CONTRACT.md`
-- Initial implementation added: `src/kernel/init_server.rs` + demo `src/bin/init_server.rs`
+- Initial implementation added: `src/services/init/mod.rs` + demo `src/bin/init_server.rs`

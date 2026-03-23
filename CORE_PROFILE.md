@@ -12,7 +12,7 @@ This checklist defines the **core-only** release profile for systems that do not
 
 - Mechanism code under `src/kernel/*` remains Linux-policy agnostic.
 - Linux compatibility translation stays in `src/linux_compat/*` and is feature-gated.
-- Protocol modules (`proc_proto`, `vfs_proto`) remain shared wire-contract modules and do not depend on Linux personality.
+- Protocol modules (`process_abi`, `vfs_abi`) remain shared wire-contract modules and do not depend on Linux personality.
 
 ## Core deliverables
 

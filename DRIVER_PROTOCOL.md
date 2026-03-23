@@ -11,7 +11,7 @@ Documentation and user-space layout should prefer `.srv` naming (`usb.srv`, `nvm
 ## ABI
 
 - Driver server ABI version: `1`
-- Kernel exports operation constants in `src/kernel/driver_proto.rs`.
+- Kernel exports operation constants in `src/kernel/driver_abi.rs`.
 
 ## Operations
 
