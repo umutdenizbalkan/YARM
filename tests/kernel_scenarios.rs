@@ -7,7 +7,8 @@ use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Arg
 use yarm::kernel::supervisor_abi::{DEP_PROCESS_MANAGER, DEP_VFS, RegisterDriverRequest};
 use yarm::kernel::task::TaskClass;
 use yarm::kernel::vfs::{
-    MountRouter, OpenAtRequest, ReadWriteRequest, VfsService, openat_message, read_message,
+    MountNamespacePolicy, MountRouter, OpenAtRequest, ReadWriteRequest, VfsError, VfsService,
+    openat_message, read_message,
 };
 use yarm::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 use yarm::services::control_plane::supervisor::SupervisorService;
@@ -119,11 +120,16 @@ fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
 struct MountOrchestrationSummary {
     low_mount_opcode: u16,
     high_mount_opcode: u16,
+    denied_dev_path: bool,
+    recovered_mounts: usize,
 }
 
 fn run_mount_orchestration_scenario() -> Result<MountOrchestrationSummary, KernelError> {
     let router = MountRouter::new(0x8000, RamFsBackend::new(), InitramfsBackend::new(4096));
     let mut vfs = VfsService::with_backend(router);
+    vfs.mount(0x1000, 1).map_err(|_| KernelError::WrongObject)?;
+    vfs.mount(INITRAMFS_BUSYBOX_PATH_PTR, 2)
+        .map_err(|_| KernelError::WrongObject)?;
     let open_low = openat_message(OpenAtRequest {
         dirfd: 0,
         path_ptr: 0x1000,
@@ -144,9 +150,28 @@ fn run_mount_orchestration_scenario() -> Result<MountOrchestrationSummary, Kerne
     let high_rep = vfs
         .handle_request(open_high)
         .map_err(|_| KernelError::WrongObject)?;
+    vfs.mark_mount_failed(0x1000)
+        .map_err(|_| KernelError::WrongObject)?;
+    vfs.recover_mount(0x1000)
+        .map_err(|_| KernelError::WrongObject)?;
+    vfs.set_policy(MountNamespacePolicy::boot_profile());
+    let denied_dev_path = matches!(
+        vfs.handle_request(
+            openat_message(OpenAtRequest {
+                dirfd: 0,
+                path_ptr: 0x3000,
+                flags: 0,
+                mode: 0,
+            })
+            .map_err(|_| KernelError::WrongObject)?,
+        ),
+        Err(VfsError::PermissionDenied)
+    );
     Ok(MountOrchestrationSummary {
         low_mount_opcode: low_rep.opcode,
         high_mount_opcode: high_rep.opcode,
+        denied_dev_path,
+        recovered_mounts: vfs.active_mounts(),
     })
 }
 
@@ -366,6 +391,8 @@ fn deterministic_mount_orchestration_routes_low_and_high_mounts() {
     let summary = run_mount_orchestration_scenario().expect("mount orchestration");
     assert_eq!(summary.low_mount_opcode, VFS_OP_OPENAT);
     assert_eq!(summary.high_mount_opcode, VFS_OP_OPENAT);
+    assert!(summary.denied_dev_path);
+    assert_eq!(summary.recovered_mounts, 2);
 }
 
 #[test]

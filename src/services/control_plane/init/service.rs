@@ -1,15 +1,15 @@
 use crate::kernel::boot::{Bootstrap, KernelError, KernelState};
+use crate::kernel::process::ProcessService;
+use crate::kernel::vfs::InMemoryBackend;
 use crate::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
-use crate::services::control_plane::supervisor::SupervisorService;
+use crate::services::common::service::FsService;
 use crate::services::control_plane::process_manager::service::run_request_loop as run_process_manager_request_loop;
+use crate::services::control_plane::supervisor::SupervisorService;
 use crate::services::control_plane::vfs::service::run_request_loop as run_vfs_request_loop;
 use crate::services::fs::devfs::service::run_request_loop as run_devfs_request_loop;
 use crate::services::fs::devfs::{DevFsBackend, DevFsService};
 use crate::services::fs::initramfs::service::run_request_loop as run_initramfs_request_loop;
 use crate::services::fs::initramfs::{InitramfsBackend, InitramfsService};
-use crate::kernel::process::ProcessService;
-use crate::kernel::vfs::InMemoryBackend;
-use crate::services::common::service::FsService;
 use crate::services::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitService,
 };
@@ -123,8 +123,8 @@ pub fn run_minimum_profile_with_kernel(
     let supervisor_managed_services = supervisor.run_until_idle(kernel)?;
 
     let mut proc = ProcessService::new();
-    let proc_summary =
-        run_process_manager_request_loop(&mut proc, 1, 99, 7).map_err(|_| KernelError::WrongObject)?;
+    let proc_summary = run_process_manager_request_loop(&mut proc, 1, 99, 7)
+        .map_err(|_| KernelError::WrongObject)?;
 
     let mut control_vfs = FsService::with_backend(InMemoryBackend::new());
     let control_vfs_summary =
@@ -232,7 +232,7 @@ mod tests {
         assert_eq!(summary.process_wait_exit, 7);
         assert_eq!(summary.process_loop_handled, 3);
         assert_eq!(summary.control_vfs_fd, 3);
-        assert_eq!(summary.control_vfs_handled, 1);
+        assert_eq!(summary.control_vfs_handled, 15);
         assert_eq!(summary.devfs_open_opcode, VFS_OP_OPENAT);
         assert_eq!(summary.devfs_handled, 4);
         assert_eq!(summary.initramfs_read_opcode, VFS_OP_READ);
