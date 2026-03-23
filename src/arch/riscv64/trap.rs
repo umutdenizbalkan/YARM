@@ -1,4 +1,4 @@
-use crate::kernel::bootstrap::{KernelState, TrapHandleError};
+use crate::kernel::boot::{KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::trap::{FaultAccess, FaultInfo, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn trap_entry_sets_cpu_and_handles_timer() {
-        use crate::kernel::bootstrap::Bootstrap;
+        use crate::kernel::boot::Bootstrap;
 
         let mut state = Bootstrap::init().expect("init");
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn trap_entry_restores_tls_for_resumed_thread() {
-        use crate::kernel::bootstrap::{Bootstrap, UserImageSpec};
+        use crate::kernel::boot::{Bootstrap, UserImageSpec};
         use crate::kernel::task::TaskClass;
 
         let mut state = Bootstrap::init().expect("init");

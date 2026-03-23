@@ -1,4 +1,4 @@
-use crate::kernel::bootstrap::{Bootstrap, KernelError};
+use crate::kernel::boot::{Bootstrap, KernelError};
 use crate::kernel::ipc::Message;
 use crate::kernel::process_abi::PROC_OP_GETPID;
 use crate::kernel::trapframe::TrapFrame;

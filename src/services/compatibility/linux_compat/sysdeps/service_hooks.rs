@@ -1,5 +1,5 @@
 use super::LinuxErrno;
-use crate::kernel::bootstrap::KernelState;
+use crate::kernel::boot::KernelState;
 use crate::kernel::ipc::Message;
 use crate::kernel::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
 use crate::kernel::process::ProcessService;
@@ -201,7 +201,7 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::boot::Bootstrap;
     use crate::kernel::vfs::InMemoryBackend;
 
     #[test]

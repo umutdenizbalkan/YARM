@@ -1,7 +1,7 @@
 #![no_std]
 extern crate std;
 
-use yarm::kernel::bootstrap::Bootstrap;
+use yarm::kernel::boot::Bootstrap;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::syscall::Syscall;
 use yarm::kernel::trap::Trap;

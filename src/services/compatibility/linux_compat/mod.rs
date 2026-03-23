@@ -1,4 +1,4 @@
-use crate::kernel::bootstrap::{KernelError, KernelState};
+use crate::kernel::boot::{KernelError, KernelState};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 #[cfg(test)]
@@ -725,7 +725,7 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::Message;
 
     #[test]

@@ -2,9 +2,9 @@ mod launch;
 mod mount;
 mod policy;
 
-use super::bootstrap::{KernelError, KernelState, UserImageSpec};
-use super::task::TaskClass;
-use super::vm::Asid;
+use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
+use crate::kernel::task::TaskClass;
+use crate::kernel::vm::Asid;
 
 pub use launch::{CoreLaunchReport, CoreServiceGraph, CoreServiceHandles, CoreServiceImagePlan};
 pub use mount::{MountPlan, MountRecoveryReport, MountServiceKind};
@@ -301,7 +301,7 @@ impl InitServerLite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::boot::Bootstrap;
 
     #[test]
     fn init_server_requires_minimum_startup_caps() {

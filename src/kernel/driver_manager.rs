@@ -1,4 +1,4 @@
-use super::bootstrap::{KernelError, KernelState};
+use super::boot::{KernelError, KernelState};
 use super::capabilities::CapId;
 use super::driver_abi::{
     DRIVER_OP_GRANT_DMA, DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, DRIVER_OP_RESTARTED,
@@ -100,7 +100,7 @@ pub fn handle_request(kernel: &mut KernelState, request: Message) -> Result<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::boot::Bootstrap;
     use crate::kernel::driver_abi::{DRIVER_OP_GRANT_IRQ, pack_driver_pair};
 
     #[test]

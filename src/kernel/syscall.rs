@@ -1,4 +1,4 @@
-use super::bootstrap::{KernelError, KernelState};
+use super::boot::{KernelError, KernelState};
 use super::capabilities::{CapId, CapObject, CapRights};
 use super::ipc::{
     IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,

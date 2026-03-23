@@ -1,6 +1,6 @@
 #![no_std]
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
-use yarm::kernel::bootstrap::Bootstrap;
+use yarm::kernel::boot::Bootstrap;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
 use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};

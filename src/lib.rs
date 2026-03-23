@@ -5,6 +5,7 @@ pub extern crate std;
 
 pub mod arch;
 pub mod kernel;
+pub mod runtime;
 pub mod services;
 
 #[cfg(feature = "linux-compat")]

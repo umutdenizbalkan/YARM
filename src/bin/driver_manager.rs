@@ -1,5 +1,5 @@
 #![no_std]
-use yarm::kernel::bootstrap::Bootstrap;
+use yarm::kernel::boot::Bootstrap;
 use yarm::kernel::driver_manager::DriverService;
 use yarm::kernel::driver_abi::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};
 use yarm::kernel::ipc::Message;

@@ -1,4 +1,4 @@
-use crate::kernel::bootstrap::{KernelState, TrapHandleError};
+use crate::kernel::boot::{KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::trap::TrapEvent;
 use crate::kernel::trapframe::TrapFrame;

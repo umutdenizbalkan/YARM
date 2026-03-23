@@ -1,7 +1,7 @@
 use super::{
     LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, LinuxErrno, clone_thread_hook,
 };
-use crate::kernel::bootstrap::KernelState;
+use crate::kernel::boot::KernelState;
 use crate::kernel::task::ThreadGroupId;
 
 /// Minimal sysdeps status used while porting musl to x86_64-unknown-none.
@@ -313,7 +313,7 @@ pub fn run_musl_startup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::boot::Bootstrap;
     use crate::kernel::task::TaskClass;
 
     #[test]
@@ -403,7 +403,7 @@ mod tests {
         let mut kernel = Bootstrap::init().expect("init");
         let (asid, _aspace_cap) = kernel.create_user_address_space().expect("asid");
         kernel
-            .spawn_user_task_from_image(crate::kernel::bootstrap::UserImageSpec {
+            .spawn_user_task_from_image(crate::kernel::boot::UserImageSpec {
                 tid: 7,
                 entry: 0x4000,
                 asid: Some(asid),
@@ -465,7 +465,7 @@ mod tests {
         let mut kernel = Bootstrap::init().expect("init");
         let (asid, _aspace_cap) = kernel.create_user_address_space().expect("asid");
         kernel
-            .spawn_user_task_from_image(crate::kernel::bootstrap::UserImageSpec {
+            .spawn_user_task_from_image(crate::kernel::boot::UserImageSpec {
                 tid: 9,
                 entry: 0x5000,
                 asid: Some(asid),

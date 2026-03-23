@@ -1,8 +1,8 @@
-use super::bootstrap::{KernelError, KernelState};
-use super::lock::SpinLock;
+use crate::kernel::boot::{KernelError, KernelState};
+use crate::kernel::lock::SpinLock;
 #[cfg(test)]
-use super::lock::SpinLockGuard;
-use super::scheduler::CpuId;
+use crate::kernel::lock::SpinLockGuard;
+use crate::kernel::scheduler::CpuId;
 
 #[derive(Debug)]
 pub struct SharedKernel {
@@ -42,7 +42,7 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use crate::kernel::bootstrap::Bootstrap;
+    use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::ThreadId;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::smp::WorkItem;
