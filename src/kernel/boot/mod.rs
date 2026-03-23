@@ -210,12 +210,9 @@ struct IpcSubsystem {
 #[cfg(feature = "hosted-dev")]
 type UserMemoryStore = BTreeMap<(u16, u64), u8>;
 
-#[cfg(not(feature = "hosted-dev"))]
-#[derive(Debug, Default)]
-struct UserMemoryStore;
-
 #[derive(Debug)]
 struct MemorySubsystem {
+    #[cfg(feature = "hosted-dev")]
     user_memory: KernelStorage<UserMemoryStore>,
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
     brk_regions: [Option<BrkRegionRecord>; MAX_TASKS],
@@ -335,6 +332,7 @@ impl Bootstrap {
             tls_restore_pending: [None; MAX_TASKS],
             robust_futex: [None; MAX_TASKS],
             memory: store_kernel_value(MemorySubsystem {
+                #[cfg(feature = "hosted-dev")]
                 user_memory: store_kernel_value(UserMemoryStore::default()),
                 memory_objects: [None; MAX_MEMORY_OBJECTS],
                 brk_regions: [None; MAX_TASKS],
