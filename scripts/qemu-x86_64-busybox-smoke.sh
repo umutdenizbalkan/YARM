@@ -2,6 +2,7 @@
 set -euo pipefail
 
 KERNEL_IMAGE=${KERNEL_IMAGE:-build-x86_64/yarm-x86_64.elf}
+KERNEL_DEBUG_ELF=${KERNEL_DEBUG_ELF:-build-x86_64/kernel_boot.elf}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build-x86_64/initramfs-busybox.cpio}
 TIMEOUT_SECS=${TIMEOUT_SECS:-30}
 QEMU_SMOKE_STRICT=${QEMU_SMOKE_STRICT:-0}
@@ -37,6 +38,11 @@ check_x86_kernel_bootability() {
 
 if [[ ! -f "$KERNEL_IMAGE" ]]; then
   echo "[warn] kernel image missing: $KERNEL_IMAGE"
+  if [[ -f "$KERNEL_DEBUG_ELF" ]]; then
+    echo "[info] debug-only freestanding kernel ELF is available at: $KERNEL_DEBUG_ELF"
+    echo "[hint] this ELF is not launched automatically because it is not a verified qemu-system-x86_64 -kernel image"
+  fi
+  echo "[hint] provide a bootable image via KERNEL_IMAGE=<path> or rerun scripts/build-qemu-x86_64-artifacts.sh with KERNEL_BOOTABLE_IMAGE_SOURCE=<path>"
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
   exit 0
 fi

@@ -187,5 +187,10 @@ if [[ -f "$KERNEL_DEBUG_ELF" ]]; then
 fi
 
 echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"
-echo "[ok] x86_64 artifact staging complete in $OUT_DIR"
-echo "[next] run smoke boot: scripts/qemu-x86_64-busybox-smoke.sh"
+if [[ -f "$KERNEL_IMAGE" ]]; then
+  echo "[ok] x86_64 artifact staging complete in $OUT_DIR"
+  echo "[next] run smoke boot: scripts/qemu-x86_64-busybox-smoke.sh"
+else
+  echo "[warn] x86_64 artifact staging is incomplete in $OUT_DIR (bootable kernel image missing)"
+  echo "[next] provide KERNEL_BOOTABLE_IMAGE_SOURCE=<path> and rerun: scripts/build-qemu-x86_64-artifacts.sh"
+fi
