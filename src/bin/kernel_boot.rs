@@ -1,5 +1,7 @@
 #![no_std]
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+use core::arch::global_asm;
 use yarm::kernel::boot::Bootstrap;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
@@ -8,6 +10,39 @@ use yarm::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, VfsService, openat_message, read_message,
 };
 use yarm::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+global_asm!(
+    r#"
+    .section .note.Xen,"a",@note
+    .align 4
+    .long 4
+    .long 4
+    .long 18
+    .asciz "Xen"
+    .align 4
+    .long _start
+
+    .section .bss.bootstack,"aw",@nobits
+    .align 16
+boot_stack:
+    .skip 16384
+boot_stack_end:
+
+    .section .text.boot,"ax",@progbits
+    .global _start
+    .type _start,@function
+_start:
+    cli
+    lea boot_stack_end(%rip), %rsp
+    xor %rbp, %rbp
+    mov %rbx, %rdi
+    call kernel_entry_x86_64
+1:
+    hlt
+    jmp 1b
+    "#
+);
 
 #[inline]
 fn run() {
@@ -76,11 +111,20 @@ fn main() {
     run();
 }
 
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), not(target_arch = "x86_64")))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     run();
     loop {}
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_entry_x86_64(_pvh_start_info: usize) -> ! {
+    run();
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[cfg(test)]
