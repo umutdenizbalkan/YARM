@@ -19,6 +19,7 @@ This checklist defines the **core-only** release profile for systems that do not
 - Kernel mechanism layer (scheduler, VM, capability checks, IPC transport).
 - Process manager and VFS services via protocol IPC contracts.
 - Deterministic core simulation (`src/kernel/sim.rs`) without Linux dispatch coupling.
+- Minimum runnable server profile smoke covering `init.srv`, `process_manager.srv`, `vfs.srv`, `supervisor.srv`, `devfs.srv`, and `initramfs.srv`.
 
 ## Gate criteria
 
@@ -26,3 +27,4 @@ This checklist defines the **core-only** release profile for systems that do not
 - `cargo test -q --bin core_profile_smoke` passes (core profile smoke path).
 - No mandatory dependency on `linux-compat` feature.
 - Core tests include deterministic simulation and protocol contract checks.
+- Core smoke validates the minimum runnable profile path with `devfs` + `initramfs` mounted behind init orchestration.

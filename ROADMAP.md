@@ -100,6 +100,7 @@ Progress notes:
    - consolidate x86/riscv qemu build/smoke scripts behind a shared helper to avoid duplicated maintenance.
 5. **Define a minimum runnable server profile**
    - ship a single "core profile" path (`init/process_manager/vfs/supervisor + devfs + one FS`) and keep it green before expanding feature breadth.
+   - ✅ The hosted smoke/runtime path now exercises `init/process_manager/vfs/supervisor + devfs + initramfs` through `run_minimum_profile_with_kernel(...)` and `src/bin/core_profile_smoke.rs`.
 
 
 ## init.srv scaffold status
