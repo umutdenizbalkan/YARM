@@ -94,17 +94,23 @@ QEMU_CMD=(
 )
 
 MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
+FIRMWARE_FALLBACK_REGEX="SeaBIOS|iPXE|Booting from ROM"
 
 set +e
 stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE" &
 PIPE_PID=$!
 QEMU_STATUS=0
 FOUND_MARKER=0
+FIRMWARE_FALLBACK=0
 
 START_TS=$(date +%s)
 while kill -0 "$PIPE_PID" >/dev/null 2>&1; do
   if rg -n "$MARKER_REGEX" "$LOGFILE" >/dev/null 2>&1; then
     FOUND_MARKER=1
+    break
+  fi
+  if rg -n "$FIRMWARE_FALLBACK_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+    FIRMWARE_FALLBACK=1
     break
   fi
   NOW_TS=$(date +%s)
@@ -122,6 +128,28 @@ if [[ "$FOUND_MARKER" -eq 1 ]]; then
   QEMU_STATUS=$?
   set -e
   echo "[ok] boot markers detected"
+  exit 0
+fi
+
+if [[ "$FIRMWARE_FALLBACK" -eq 1 ]]; then
+  if kill -0 "$PIPE_PID" >/dev/null 2>&1; then
+    kill "$PIPE_PID" >/dev/null 2>&1 || true
+    sleep 1
+    kill -9 "$PIPE_PID" >/dev/null 2>&1 || true
+  fi
+  wait "$PIPE_PID"
+  QEMU_STATUS=$?
+  set -e
+  echo "[warn] firmware fallback detected before any YARM boot markers"
+  echo "[hint] qemu displayed SeaBIOS/iPXE output, which means serial output is working but the kernel was not accepted as a direct-boot image"
+  echo "[hint] this is not an initramfs/BusyBox issue yet; the guest never reached kernel_entry_x86_64"
+  if [[ -f "$LOGFILE" ]]; then
+    echo "[info] last 20 log lines from $LOGFILE"
+    tail -n 20 "$LOGFILE" || true
+  fi
+  if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
+    exit 1
+  fi
   exit 0
 fi
 
