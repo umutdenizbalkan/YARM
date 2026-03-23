@@ -53,7 +53,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 ### Implemented
 
 - `InitService` now carries a baseline restart-policy table, validates policy sanity, and records deterministic launch order (`process_manager -> vfs -> supervisor`).
-- `ProcessManager` wait-path now rejects unknown targets and enforces parent ownership more strictly.
+- `ProcessManager` now routes `spawn_v2` through its image-backed launch helper, updates exit state through the service path, rejects unknown targets / non-parent waits, and reports a typed non-ready condition when a child has not exited yet.
 - `VfsService` now supports mount namespace policy (allow/deny boot-path classes) and deterministic op-sequence accounting for successful requests.
 
 ### Test gates (must pass)

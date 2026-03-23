@@ -2,7 +2,7 @@ use crate::kernel::ipc::Message;
 use crate::kernel::process::ProcessManagerError;
 use crate::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use crate::kernel::process_abi::{
-    PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args,
+    PROC_OP_EXIT, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args,
 };
 use crate::services::common::service::{RequestResponseService, run_typed_request_loop};
 
@@ -46,7 +46,17 @@ pub fn run_request_loop(
     let spawn_reply = replies[0];
     let spawned = SpawnV2Result::decode(spawn_reply.as_slice())?;
 
-    service.mark_exit(spawned.pid, exit_code)?;
+    let _ = run_typed_request_loop(
+        service,
+        [Message::with_header(
+            spawned.pid.0,
+            PROC_OP_EXIT,
+            0,
+            None,
+            &exit_code.to_le_bytes(),
+        )
+        .map_err(|_| ProcessManagerError::Malformed)?],
+    )?;
 
     let wait_reply = run_typed_request_loop(
         service,
@@ -92,6 +102,6 @@ mod tests {
 
         assert_eq!(summary.spawned_pid, summary.waited_pid);
         assert_eq!(summary.waited_exit, 9);
-        assert_eq!(summary.handled, 2);
+        assert_eq!(summary.handled, 3);
     }
 }

@@ -4,7 +4,7 @@ This plan tracks the transition from mechanism-complete kernel internals to prod
 
 ## Scope
 
-- `process_manager.srv` maturity (parent/child semantics, wait/reap discipline, restart signaling)
+- `process_manager.srv` maturity (parent/child semantics, integrated exit/wait discipline, restart signaling breadth)
 - `vfs.srv` maturity (typed ABI conformance, mount routing, deterministic operation ordering)
 - `driver *.srv` maturity (delegation from `init.srv`, revoke/restart lifecycle)
 
@@ -28,6 +28,8 @@ This plan tracks the transition from mechanism-complete kernel internals to prod
 4. **Lifecycle gate**
    - Restart/revoke behavior is test-covered for driver-facing runtime caps.
    - Process-manager wait/reap permissions are test-covered.
+   - `spawn_v2` drives an image-backed launch path rather than pid allocation only.
+   - `exit` mutates process lifecycle through the service path, and waiting on a running child yields a typed non-ready condition.
 
 5. **Scenario harness gate**
    - Reusable deterministic scenario catalog is present.

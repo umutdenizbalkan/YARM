@@ -19,6 +19,7 @@ pub enum ProcessManagerError {
     UnknownProcess,
     InvalidTransport,
     PermissionDenied,
+    WouldBlock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +102,7 @@ impl WaitPidV2Result {
 pub enum ProcessRequest {
     GetPid { caller_tid: u64 },
     GetPpid { caller_tid: u64 },
-    Exit { code: u64 },
+    Exit { caller_tid: u64, code: u64 },
     SpawnV2(SpawnV2Request),
     WaitPidV2(WaitPidV2Request),
 }
@@ -112,6 +113,8 @@ struct ProcessRecord {
     parent_pid: ProcessId,
     exited: bool,
     exit_code: u64,
+    image_id: u64,
+    entry: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +168,7 @@ impl ProcessManager {
                 caller_tid: Self::read_u64(msg.as_slice())?,
             }),
             PROC_OP_EXIT => Ok(ProcessRequest::Exit {
+                caller_tid: msg.sender_tid.0,
                 code: Self::read_u64(msg.as_slice())?,
             }),
             PROC_OP_SPAWN_V2 => {
@@ -241,7 +245,19 @@ impl ProcessManager {
     ) -> Result<(ProcessId, ElfImageInfo), ProcessManagerError> {
         let info = ElfImageInfo::parse(image_id, image)?;
         let pid = self.alloc_process(parent_pid)?;
+        if let Some(record) = self.table.iter_mut().flatten().find(|record| record.pid == pid) {
+            record.image_id = info.image_id;
+            record.entry = info.entry;
+        }
         Ok((pid, info))
+    }
+
+    fn synthetic_elf_image(image_id: u64) -> [u8; 64] {
+        let mut image = [0u8; 64];
+        image[..4].copy_from_slice(b"\x7FELF");
+        let entry = 0x400000u64.saturating_add(image_id.saturating_mul(0x1000));
+        image[24..32].copy_from_slice(&entry.to_le_bytes());
+        image
     }
 
     fn alloc_process(&mut self, parent_pid: ProcessId) -> Result<ProcessId, ProcessManagerError> {
@@ -253,6 +269,8 @@ impl ProcessManager {
                 parent_pid,
                 exited: false,
                 exit_code: 0,
+                image_id: 0,
+                entry: 0,
             });
             self.register_thread_identity(pid, pid.0, ThreadGroupId(pid.0))?;
             Ok(pid)
@@ -273,6 +291,28 @@ impl ProcessManager {
         Ok(())
     }
 
+    fn mark_exit_for_tid(&mut self, caller_tid: u64, code: u64) -> Result<(), ProcessManagerError> {
+        let caller_pid = self.process_id_for_tid(caller_tid);
+        if self.mark_exit(caller_pid, code).is_ok() {
+            return Ok(());
+        }
+        let slot = self
+            .table
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(ProcessManagerError::TableFull)?;
+        *slot = Some(ProcessRecord {
+            pid: caller_pid,
+            parent_pid: ProcessId(caller_pid.0.saturating_sub(1)),
+            exited: true,
+            exit_code: code,
+            image_id: 0,
+            entry: 0,
+        });
+        self.register_thread_identity(caller_pid, caller_tid, ThreadGroupId(caller_tid))?;
+        Ok(())
+    }
+
     fn lookup_parent(&self, pid: ProcessId) -> Option<ProcessId> {
         self.table
             .iter()
@@ -281,7 +321,7 @@ impl ProcessManager {
             .map(|record| record.parent_pid)
     }
 
-    fn wait_result(&mut self, target_pid: ProcessId) -> WaitPidV2Result {
+    fn wait_result(&mut self, target_pid: ProcessId) -> Result<WaitPidV2Result, ProcessManagerError> {
         if let Some((idx, record)) = self
             .table
             .iter()
@@ -289,28 +329,33 @@ impl ProcessManager {
             .find_map(|(idx, slot)| slot.map(|record| (idx, record)))
             .filter(|(_, record)| record.pid == target_pid)
         {
+            if !record.exited {
+                return Err(ProcessManagerError::WouldBlock);
+            }
             let result = WaitPidV2Result {
                 waited_pid: target_pid,
-                exit_code: if record.exited {
-                    record.exit_code
-                } else {
-                    u64::MAX
-                },
+                exit_code: record.exit_code,
             };
-            if record.exited {
-                self.table[idx] = None;
-            }
-            result
+            self.table[idx] = None;
+            Ok(result)
         } else {
-            WaitPidV2Result {
-                waited_pid: target_pid,
-                exit_code: u64::MAX,
-            }
+            Err(ProcessManagerError::UnknownProcess)
         }
     }
 
     pub fn live_process_count(&self) -> usize {
         self.table.iter().flatten().count()
+    }
+
+    pub fn process_image_info(&self, pid: ProcessId) -> Option<ElfImageInfo> {
+        self.table
+            .iter()
+            .flatten()
+            .find(|record| record.pid == pid)
+            .map(|record| ElfImageInfo {
+                entry: record.entry,
+                image_id: record.image_id,
+            })
     }
 
     pub fn handle_request(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
@@ -327,10 +372,13 @@ impl ProcessManager {
                         .0,
                 )
             }
-            ProcessRequest::Exit { .. } => Self::u64_reply(PROC_OP_EXIT, 0),
+            ProcessRequest::Exit { caller_tid, code } => {
+                self.mark_exit_for_tid(caller_tid, code)?;
+                Self::u64_reply(PROC_OP_EXIT, 0)
+            }
             ProcessRequest::SpawnV2(req) => {
-                let _ = req.image_id;
-                let pid = self.alloc_process(req.parent_pid)?;
+                let image = Self::synthetic_elf_image(req.image_id);
+                let (pid, _) = self.spawn_from_elf_image(req.parent_pid, req.image_id, &image)?;
                 let result = SpawnV2Result { pid };
                 Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
@@ -344,7 +392,7 @@ impl ProcessManager {
                         return Err(ProcessManagerError::PermissionDenied);
                     }
                 }
-                let result = self.wait_result(req.target_pid);
+                let result = self.wait_result(req.target_pid)?;
                 Message::with_header(0, PROC_OP_WAITPID_V2, 0, None, &result.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
             }
@@ -454,6 +502,9 @@ mod tests {
         .expect("msg");
         let spawn_reply = pm.handle_request(spawn).expect("handle");
         let spawned = SpawnV2Result::decode(spawn_reply.as_slice()).expect("decode");
+        let info = pm.process_image_info(spawned.pid).expect("image info");
+        assert_eq!(info.image_id, 2);
+        assert_eq!(info.entry, 0x402000);
 
         pm.mark_exit(spawned.pid, 17).expect("mark exit");
 
@@ -469,6 +520,60 @@ mod tests {
         let waited = WaitPidV2Result::decode(wait_reply.as_slice()).expect("decode");
         assert_eq!(waited.waited_pid, spawned.pid);
         assert_eq!(waited.exit_code, 17);
+    }
+
+    #[test]
+    fn waitpid_returns_would_block_for_running_child() {
+        let mut pm = ProcessManager::new();
+        let spawn = Message::with_header(
+            0,
+            PROC_OP_SPAWN_V2,
+            0,
+            None,
+            &SpawnV2Args::new(1, 3).encode(),
+        )
+        .expect("spawn");
+        let spawn_reply = pm.handle_request(spawn).expect("spawn reply");
+        let spawned = SpawnV2Result::decode(spawn_reply.as_slice()).expect("decode");
+        let wait = Message::with_header(
+            0,
+            PROC_OP_WAITPID_V2,
+            0,
+            None,
+            &WaitPidV2Args::new(1, spawned.pid.0).encode(),
+        )
+        .expect("wait");
+        assert_eq!(pm.handle_request(wait), Err(ProcessManagerError::WouldBlock));
+    }
+
+    #[test]
+    fn exit_request_marks_caller_process_exited() {
+        let mut pm = ProcessManager::new();
+        let spawn = Message::with_header(
+            0,
+            PROC_OP_SPAWN_V2,
+            0,
+            None,
+            &SpawnV2Args::new(1, 5).encode(),
+        )
+        .expect("spawn");
+        let spawn_reply = pm.handle_request(spawn).expect("spawn reply");
+        let spawned = SpawnV2Result::decode(spawn_reply.as_slice()).expect("decode");
+        let exit =
+            Message::with_header(spawned.pid.0, PROC_OP_EXIT, 0, None, &9u64.to_le_bytes())
+                .expect("exit");
+        let _ = pm.handle_request(exit).expect("exit reply");
+        let wait = Message::with_header(
+            0,
+            PROC_OP_WAITPID_V2,
+            0,
+            None,
+            &WaitPidV2Args::new(1, spawned.pid.0).encode(),
+        )
+        .expect("wait");
+        let wait_reply = pm.handle_request(wait).expect("wait reply");
+        let waited = WaitPidV2Result::decode(wait_reply.as_slice()).expect("decode");
+        assert_eq!(waited.exit_code, 9);
     }
 
     #[test]

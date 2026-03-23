@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(summary.seeded_registrations, 3);
         assert_eq!(summary.supervisor_managed_services, 3);
         assert_eq!(summary.process_wait_exit, 7);
-        assert_eq!(summary.process_loop_handled, 2);
+        assert_eq!(summary.process_loop_handled, 3);
         assert_eq!(summary.control_vfs_fd, 3);
         assert_eq!(summary.control_vfs_handled, 1);
         assert_eq!(summary.devfs_open_opcode, VFS_OP_OPENAT);
