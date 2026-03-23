@@ -105,6 +105,7 @@ echo "/ # "
 exec sh
 SH
 chmod +x "$ROOTFS_DIR/init"
+echo "[info] milestone 2 shell flow staged in initramfs (/init -> init_server -> /bin/sh); first blocker remains a bootable x86 kernel artifact"
 
 if command -v cpio >/dev/null 2>&1; then
   ( cd "$ROOTFS_DIR" && find . -print0 | cpio --null -ov --format=newc > "$INITRAMFS_IMAGE_ABS" ) >/dev/null
@@ -128,6 +129,7 @@ if [[ -f "$KERNEL_IMAGE" ]]; then
   warn_if_kernel_not_qemu_direct_bootable "$KERNEL_IMAGE"
 else
   echo "[warn] kernel image missing: $KERNEL_IMAGE"
+  echo "[hint] the first blocker is a direct-bootable x86 kernel artifact; the generated initramfs shell flow is staged as the second milestone"
   echo "[hint] provide a bootable x86_64 kernel image via KERNEL_BOOTABLE_IMAGE_SOURCE=<path> or KERNEL_IMAGE=<path>"
   [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
 fi

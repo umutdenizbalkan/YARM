@@ -21,6 +21,7 @@ check_x86_kernel_bootability() {
   if [[ "$ftype" == *"ELF"* ]]; then
     if ! readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
       echo "[warn] kernel image is ELF but lacks PVH ELF note required for qemu -kernel direct boot"
+      echo "[hint] kernel direct-boot support is the first blocker on x86; initramfs shell markers are only the second milestone after kernel entry works"
       echo "[hint] provide a Linux bzImage or add a PVH note / compatible boot protocol to the kernel image"
       return 1
     fi
