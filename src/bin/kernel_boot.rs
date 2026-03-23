@@ -34,9 +34,9 @@ boot_stack_end:
     .type _start,@function
 _start:
     cli
-    lea boot_stack_end(%rip), %rsp
-    xor %rbp, %rbp
-    mov %rbx, %rdi
+    lea rsp, [rip + boot_stack_end]
+    xor rbp, rbp
+    mov rdi, rbx
     call kernel_entry_x86_64
 1:
     hlt
