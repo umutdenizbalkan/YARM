@@ -220,6 +220,7 @@ mod tests {
         kernel.register_task(41).expect("task");
         kernel.enqueue_current_cpu(41).expect("enqueue");
         kernel.dispatch_next_task().expect("dispatch");
+        kernel.yield_current().expect("switch");
 
         let mut proc = ProcessService::new();
         let mut vfs = FsService::with_backend(InMemoryBackend::new());
