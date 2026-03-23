@@ -49,7 +49,7 @@ These IDs are registered by `InitService::register_core_graph` and assigned serv
 
 ## Notes
 
-- This is a mechanism-level scaffold in `src/services/init/mod.rs` and `src/bin/init_server.rs`.
+- This is a mechanism-level scaffold in `src/services/init/mod.rs`; the runtime init entrypoint in `src/services/control_plane/init/service.rs` now accepts an externally prepared `KernelState` plus `InitRuntimeBootConfig`, so boot/runtime wiring no longer has to be hardcoded to `Bootstrap::init()`.
 - Launch ordering now routes through `launch_core_services` with explicit core image plan and failure transition support (`mark_failed`).
 - Restart/fault policy handoff is now represented by `InitFaultHandoff` and must be installed before `Running`.
 - Supervisor recovery includes replaying core-service registration requests so a fresh `supervisor.srv` instance can rebuild its managed-service table.
