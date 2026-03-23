@@ -29,8 +29,13 @@ check_x86_kernel_bootability() {
   if [[ "$ftype" != *"ELF"* ]]; then
     return 0
   fi
-  if command -v readelf >/dev/null 2>&1 && readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
-    return 0
+  if command -v readelf >/dev/null 2>&1; then
+    if readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
+      return 0
+    fi
+    if readelf -S "$kernel" 2>/dev/null | rg -q "\.note\.Xen"; then
+      return 0
+    fi
   fi
   echo "[warn] kernel image is an ELF without a verified PVH direct-boot note"
   echo "[hint] the first blocker is still a verified direct-boot x86 kernel image (for example bzImage or PVH-enabled ELF)"
