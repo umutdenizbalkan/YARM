@@ -1,7 +1,7 @@
 use super::ipc::Message;
 use super::process_abi::{
-    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply, PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID,
-    PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
+    PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
+    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply,
 };
 use super::task::ThreadGroupId;
 

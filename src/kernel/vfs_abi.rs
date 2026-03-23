@@ -170,7 +170,6 @@ mod tests {
         assert_eq!(VfsV1Args::decode(&enc), Ok(args));
     }
 
-
     #[test]
     fn vfs_v1_rejects_non_exact_payload_lengths() {
         let short = [0u8; VfsV1Args::ENCODED_LEN - 1];

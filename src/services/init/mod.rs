@@ -5,8 +5,8 @@ mod policy;
 use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use crate::kernel::capabilities::{CapId, CapRights};
 use crate::kernel::supervisor_abi::{
-    register_core_service_message, register_driver_message, RegisterCoreServiceRequest,
-    RegisterDriverRequest, TaskExitedEvent,
+    RegisterCoreServiceRequest, RegisterDriverRequest, TaskExitedEvent,
+    register_core_service_message, register_driver_message,
 };
 use crate::kernel::task::TaskClass;
 use crate::kernel::vm::Asid;
@@ -387,7 +387,7 @@ impl InitService {
         kernel: &mut KernelState,
     ) -> Result<usize, KernelError> {
         use crate::kernel::supervisor_abi::{
-            CoreServiceRegistrationKind, RegisterCoreServiceRequest, DEP_VFS,
+            CoreServiceRegistrationKind, DEP_VFS, RegisterCoreServiceRequest,
         };
 
         let proc_tid = self
@@ -838,9 +838,10 @@ mod tests {
             .expect("seed");
         init.begin_running(&state).expect("running");
         let token = state.exit_task(4, 99).expect("exit");
-        assert!(init
-            .recover_supervisor_failure(&mut state, token)
-            .expect("recover"));
+        assert!(
+            init.recover_supervisor_failure(&mut state, token)
+                .expect("recover")
+        );
         assert_eq!(
             state.task_status(4),
             Some(crate::kernel::task::TaskStatus::Runnable)

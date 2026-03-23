@@ -1,5 +1,6 @@
-use super::{
-    LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, LinuxErrno, clone_thread_hook,
+use super::clone_thread_hook;
+use crate::services::compatibility::linux_compat::{
+    LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, LinuxErrno,
 };
 use crate::kernel::boot::KernelState;
 use crate::kernel::task::ThreadGroupId;

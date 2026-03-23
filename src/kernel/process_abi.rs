@@ -143,7 +143,6 @@ mod tests {
         assert_eq!(ProcV2Args::decode(&enc), Ok(args));
     }
 
-
     #[test]
     fn proc_v2_rejects_non_exact_payload_lengths() {
         let short = [0u8; ProcV2Args::ENCODED_LEN - 1];

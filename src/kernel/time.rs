@@ -45,10 +45,7 @@ mod tests {
 
     #[test]
     fn tick_instant_arithmetic_wraps_consistently() {
-        assert_eq!(
-            TickInstant(u64::MAX) + TickDuration(2),
-            TickInstant(1)
-        );
+        assert_eq!(TickInstant(u64::MAX) + TickDuration(2), TickInstant(1));
         assert_eq!(TickInstant(1) - TickInstant(u64::MAX), TickDuration(2));
     }
 

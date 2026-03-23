@@ -337,8 +337,8 @@ impl<B: VfsBackend> VfsService<B> {
     pub fn parse_request(request: Message) -> Result<VfsRequest, VfsError> {
         match request.opcode {
             VFS_OP_OPENAT => {
-                let args = OpenAtArgs::decode(request.as_slice())
-                    .map_err(|_| VfsError::Malformed)?;
+                let args =
+                    OpenAtArgs::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
                 Ok(VfsRequest::OpenAt {
                     _dirfd: args.dirfd,
                     path_ptr: args.path_ptr,

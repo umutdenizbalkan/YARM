@@ -1,7 +1,7 @@
 use super::{KernelError, KernelState, TrapHandleError};
-use crate::kernel::task::FaultPolicy;
 use crate::kernel::ipc::Message;
 use crate::kernel::syscall::{SyscallError, dispatch as dispatch_syscall};
+use crate::kernel::task::FaultPolicy;
 use crate::kernel::task::TaskStatus;
 use crate::kernel::trap::{FaultAccess, Trap, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;

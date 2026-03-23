@@ -111,9 +111,7 @@ impl Default for SmpMailbox {
 
 impl SmpMailbox {
     fn inbox(&self, cpu: CpuId) -> Result<&CrossCpuWorkQueue, SmpError> {
-        self.inboxes
-            .get(cpu.0 as usize)
-            .ok_or(SmpError::InvalidCpu)
+        self.inboxes.get(cpu.0 as usize).ok_or(SmpError::InvalidCpu)
     }
 
     pub fn send_to(&self, cpu: CpuId, item: WorkItem) -> Result<(), SmpError> {
@@ -161,7 +159,9 @@ mod tests {
         let queue = CrossCpuWorkQueue::default();
         for i in 0..MAX_CROSS_CPU_WORK {
             queue
-                .submit(WorkItem::WakeTask { tid: ThreadId(i as u64) })
+                .submit(WorkItem::WakeTask {
+                    tid: ThreadId(i as u64),
+                })
                 .expect("fill queue");
         }
 
@@ -174,7 +174,9 @@ mod tests {
 
         for i in 0..MAX_CROSS_CPU_WORK {
             queue
-                .submit(WorkItem::WakeTask { tid: ThreadId(i as u64) })
+                .submit(WorkItem::WakeTask {
+                    tid: ThreadId(i as u64),
+                })
                 .expect("prime");
         }
         for _ in 0..(MAX_CROSS_CPU_WORK / 2) {
@@ -182,12 +184,19 @@ mod tests {
         }
         for i in MAX_CROSS_CPU_WORK..(MAX_CROSS_CPU_WORK + MAX_CROSS_CPU_WORK / 2) {
             queue
-                .submit(WorkItem::WakeTask { tid: ThreadId(i as u64) })
+                .submit(WorkItem::WakeTask {
+                    tid: ThreadId(i as u64),
+                })
                 .expect("wrap submit");
         }
 
         for i in (MAX_CROSS_CPU_WORK / 2)..(MAX_CROSS_CPU_WORK + MAX_CROSS_CPU_WORK / 2) {
-            assert_eq!(queue.take(), Some(WorkItem::WakeTask { tid: ThreadId(i as u64) }));
+            assert_eq!(
+                queue.take(),
+                Some(WorkItem::WakeTask {
+                    tid: ThreadId(i as u64)
+                })
+            );
         }
         assert_eq!(queue.take(), None);
     }
@@ -206,13 +215,18 @@ mod tests {
     #[test]
     fn mailbox_routes_work_to_target_cpu_inbox() {
         let mailbox = SmpMailbox::default();
-        mailbox.send_to(CpuId(1), WorkItem::Reschedule).expect("cpu1");
+        mailbox
+            .send_to(CpuId(1), WorkItem::Reschedule)
+            .expect("cpu1");
         mailbox
             .send_to(CpuId(2), WorkItem::WakeTask { tid: ThreadId(55) })
             .expect("cpu2");
 
         assert_eq!(mailbox.take_for_cpu(CpuId(0)), Ok(None));
-        assert_eq!(mailbox.take_for_cpu(CpuId(1)), Ok(Some(WorkItem::Reschedule)));
+        assert_eq!(
+            mailbox.take_for_cpu(CpuId(1)),
+            Ok(Some(WorkItem::Reschedule))
+        );
         assert_eq!(
             mailbox.take_for_cpu(CpuId(2)),
             Ok(Some(WorkItem::WakeTask { tid: ThreadId(55) }))

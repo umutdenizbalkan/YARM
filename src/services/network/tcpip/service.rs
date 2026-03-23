@@ -38,7 +38,8 @@ pub fn run() {
     let s = svc.stats();
     crate::yarm_log!(
         "tcpip.srv online: routed_packets={}, dropped_packets={}",
-        s.routed_packets, s.dropped_packets
+        s.routed_packets,
+        s.dropped_packets
     );
 }
 

@@ -71,7 +71,9 @@ pub fn run() {
     let s = svc.stats();
     crate::yarm_log!(
         "irqmux.srv online: routed_irqs={}, dropped_irqs={}, masked_irqs={}",
-        s.routed_irqs, s.dropped_irqs, s.masked_irqs
+        s.routed_irqs,
+        s.dropped_irqs,
+        s.masked_irqs
     );
 }
 

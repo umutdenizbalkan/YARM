@@ -56,7 +56,9 @@ pub fn run() {
     let stats = s.stats();
     crate::yarm_log!(
         "virtio_net.srv online: tx_packets={}, rx_packets={}, dropped_tx_packets={}",
-        stats.tx_packets, stats.rx_packets, stats.dropped_tx_packets
+        stats.tx_packets,
+        stats.rx_packets,
+        stats.dropped_tx_packets
     );
 }
 

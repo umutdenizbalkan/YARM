@@ -61,7 +61,7 @@ impl<B: VfsBackend> RequestResponseService for FsService<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::vfs::{openat_message, InMemoryBackend, OpenAtRequest};
+    use crate::kernel::vfs::{InMemoryBackend, OpenAtRequest, openat_message};
 
     #[test]
     fn typed_request_loop_runs_all_requests() {

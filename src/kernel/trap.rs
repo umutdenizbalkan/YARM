@@ -113,7 +113,13 @@ mod tests {
             })),
             TrapAction::HandlePageFault
         );
-        assert_eq!(route_trap(&TrapEvent::TimerInterrupt), TrapAction::TickScheduler);
-        assert_eq!(route_trap(&TrapEvent::ExternalInterrupt(1)), TrapAction::RouteIrq);
+        assert_eq!(
+            route_trap(&TrapEvent::TimerInterrupt),
+            TrapAction::TickScheduler
+        );
+        assert_eq!(
+            route_trap(&TrapEvent::ExternalInterrupt(1)),
+            TrapAction::RouteIrq
+        );
     }
 }

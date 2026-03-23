@@ -51,7 +51,8 @@ pub fn run() {
     let stats = s.stats();
     crate::yarm_log!(
         "input.srv online: events={}, dropped_events={}",
-        stats.events, stats.dropped_events
+        stats.events,
+        stats.dropped_events
     );
 }
 

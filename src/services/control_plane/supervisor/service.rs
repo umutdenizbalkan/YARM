@@ -2,11 +2,11 @@ use crate::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::{Message, ThreadId};
 use crate::kernel::supervisor_abi::{
-    init_alert_message, status_reply_message, CoreServiceRegistrationKind, InitAlert,
+    CoreServiceRegistrationKind, DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert,
     InitAlertKind, RedelegationAckRequest, RegisterCoreServiceRequest, RegisterDriverRequest,
-    SupervisorStatusReply, SupervisorStatusRequest, TaskExitedEvent, DEP_PROCESS_MANAGER,
-    DEP_SUPERVISOR, DEP_VFS, SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
-    SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER,
+    SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
+    SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, SupervisorStatusReply,
+    SupervisorStatusRequest, TaskExitedEvent, init_alert_message, status_reply_message,
 };
 use crate::kernel::time::{TickDuration, TickInstant};
 use crate::services::init::{
@@ -615,8 +615,8 @@ mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::supervisor_abi::{
-        query_status_message, InitAlertKind, RegisterDriverRequest, SupervisorStatusRequest,
-        SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
+        InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
+        SupervisorStatusRequest, query_status_message,
     };
     use crate::kernel::task::{TaskClass, TaskStatus};
     use crate::kernel::vm::PAGE_SIZE;

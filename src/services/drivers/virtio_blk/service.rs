@@ -31,10 +31,7 @@ impl VirtioBlkService {
     }
 
     fn process_once(&mut self) -> Result<VirtioBlkRespFrame, VfsError> {
-        let chain = self
-            .queue
-            .pop_next_chain()
-            .ok_or(VfsError::Unsupported)?;
+        let chain = self.queue.pop_next_chain().ok_or(VfsError::Unsupported)?;
         let req = chain.request;
         let io = VirtioBlkRequest {
             sector: req.sector,
@@ -64,12 +61,9 @@ impl FilesystemService for VirtioBlkService {
     }
 
     fn dispatch(&mut self, request: Message) -> Result<Message, VfsError> {
-        let req =
-            VirtioBlkReqFrame::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
+        let req = VirtioBlkReqFrame::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
         let chain = VirtqChain::from_request(req);
-        self.queue
-            .push_chain(chain)
-            .map_err(|_| VfsError::NoFd)?;
+        self.queue.push_chain(chain).map_err(|_| VfsError::NoFd)?;
         let resp = self.process_once()?;
         Message::with_header(0, request.opcode, 0, None, &resp.encode())
             .map_err(|_| VfsError::Malformed)

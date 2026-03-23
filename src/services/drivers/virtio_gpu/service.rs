@@ -48,7 +48,9 @@ pub fn run() {
     let stats = s.stats();
     crate::yarm_log!(
         "virtio_gpu.srv online: frame_commits={}, mode_sets={}, rejected_commits={}",
-        stats.frame_commits, stats.mode_sets, stats.rejected_commits
+        stats.frame_commits,
+        stats.mode_sets,
+        stats.rejected_commits
     );
 }
 

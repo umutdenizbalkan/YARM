@@ -233,7 +233,9 @@ pub fn run() {
     let (puts, gets, evictions) = svc.stats();
     crate::yarm_log!(
         "blkcache.srv demo: puts={}, gets={}, evictions={}",
-        puts, gets, evictions
+        puts,
+        gets,
+        evictions
     );
 }
 

@@ -38,7 +38,8 @@ pub fn run() {
     let s = svc.stats();
     crate::yarm_log!(
         "dhcp.srv online: leases_granted={}, lease_renewals={}",
-        s.leases_granted, s.lease_renewals
+        s.leases_granted,
+        s.lease_renewals
     );
 }
 

@@ -1,8 +1,8 @@
-use super::LinuxErrno;
+use crate::services::compatibility::linux_compat::LinuxErrno;
 use crate::kernel::boot::KernelState;
 use crate::kernel::ipc::Message;
-use crate::kernel::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
 use crate::kernel::process::ProcessService;
+use crate::kernel::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
 use crate::kernel::vfs::{
     CloseRequest, OpenAtRequest, ReadWriteRequest, VfsBackend, close_message, openat_message,
     read_message, write_message,
@@ -64,7 +64,6 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
     pub fn getpid_hook(&mut self) -> Result<u64, LinuxErrno> {
         let tid = self
             .kernel
-            .scheduler
             .current_tid()
             .ok_or(LinuxErrno::NoSys)?;
         let reply = self
@@ -80,7 +79,6 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
     pub fn getppid_hook(&mut self) -> Result<u64, LinuxErrno> {
         let tid = self
             .kernel
-            .scheduler
             .current_tid()
             .ok_or(LinuxErrno::NoSys)?;
         let reply = self

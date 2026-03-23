@@ -54,7 +54,9 @@ pub fn run() {
     let s = svc.stats();
     crate::yarm_log!(
         "uart.srv online: tx_bytes={}, rx_bytes={}, dropped_tx_bytes={}",
-        s.tx_bytes, s.rx_bytes, s.dropped_tx_bytes
+        s.tx_bytes,
+        s.rx_bytes,
+        s.dropped_tx_bytes
     );
 }
 

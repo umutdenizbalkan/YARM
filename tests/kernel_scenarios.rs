@@ -3,15 +3,15 @@ extern crate yarm;
 use yarm::kernel::boot::{Bootstrap, KernelError};
 use yarm::kernel::ipc::Message;
 use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
-use yarm::kernel::process_abi::{SpawnV2Args, WaitPidV2Args, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2};
-use yarm::kernel::supervisor_abi::{RegisterDriverRequest, DEP_PROCESS_MANAGER, DEP_VFS};
+use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
+use yarm::kernel::supervisor_abi::{DEP_PROCESS_MANAGER, DEP_VFS, RegisterDriverRequest};
 use yarm::kernel::task::TaskClass;
 use yarm::kernel::vfs::{
-    openat_message, read_message, MountRouter, OpenAtRequest, ReadWriteRequest, VfsService,
+    MountRouter, OpenAtRequest, ReadWriteRequest, VfsService, openat_message, read_message,
 };
 use yarm::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 use yarm::services::control_plane::supervisor::SupervisorService;
-use yarm::services::fs::initramfs::{InitramfsBackend, INITRAMFS_BUSYBOX_PATH_PTR};
+use yarm::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
 use yarm::services::fs::ramfs::RamFsBackend;
 use yarm::services::init::{CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitService};
 

@@ -38,7 +38,8 @@ pub fn run() {
     let s = svc.stats();
     crate::yarm_log!(
         "dns.srv online: cache_hits={}, upstream_queries={}",
-        s.cache_hits, s.upstream_queries
+        s.cache_hits,
+        s.upstream_queries
     );
 }
 

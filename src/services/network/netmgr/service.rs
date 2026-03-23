@@ -38,7 +38,8 @@ pub fn run() {
     let s = svc.stats();
     crate::yarm_log!(
         "netmgr.srv online: links_up={}, links_down={}",
-        s.links_up, s.links_down
+        s.links_up,
+        s.links_down
     );
 }
 
