@@ -335,7 +335,8 @@ pvh_start32:
     or eax, 0x80000001
     mov cr0, eax
     push 0x08
-    push offset long_mode_entry
+    mov eax, offset long_mode_entry
+    push eax
     retf
 
     .section .text.boot,"ax",@progbits
