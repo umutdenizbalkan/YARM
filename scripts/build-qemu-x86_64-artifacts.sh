@@ -8,7 +8,8 @@ SERVER_BIN=${SERVER_BIN:-init_server}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-x86-none}
 SERVER_ELF=${SERVER_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
-KERNEL_ELF=${KERNEL_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
+KERNEL_RAW_ELF=${KERNEL_RAW_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
+KERNEL_BOOTABLE_IMAGE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-$KERNEL_RAW_ELF}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-busybox.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-x86_64.elf}
 BUSYBOX_BIN=${BUSYBOX_BIN:-}
@@ -113,8 +114,13 @@ else
   [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
 fi
 
-if [[ ! -f "$KERNEL_IMAGE" && -f "$KERNEL_ELF" ]]; then
-  cp "$KERNEL_ELF" "$KERNEL_IMAGE"
+if [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_BOOTABLE_IMAGE_SOURCE" ]]; then
+  cp "$KERNEL_BOOTABLE_IMAGE_SOURCE" "$KERNEL_IMAGE"
+elif [[ ! -f "$KERNEL_IMAGE" && -f "$KERNEL_BOOTABLE_IMAGE_SOURCE" ]]; then
+  cp "$KERNEL_BOOTABLE_IMAGE_SOURCE" "$KERNEL_IMAGE"
+else
+  echo "[warn] compile for bootable kernel image failed or output missing (${KERNEL_BOOTABLE_IMAGE_SOURCE})"
+  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
 fi
 
 if [[ -f "$KERNEL_IMAGE" ]]; then
@@ -122,7 +128,7 @@ if [[ -f "$KERNEL_IMAGE" ]]; then
   warn_if_kernel_not_qemu_direct_bootable "$KERNEL_IMAGE"
 else
   echo "[warn] kernel image missing: $KERNEL_IMAGE"
-  echo "[hint] provide a bootable x86_64 kernel image via KERNEL_IMAGE=<path>"
+  echo "[hint] provide a bootable x86_64 kernel image via KERNEL_BOOTABLE_IMAGE_SOURCE=<path> or KERNEL_IMAGE=<path>"
   [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
 fi
 
