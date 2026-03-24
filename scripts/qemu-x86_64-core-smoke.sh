@@ -10,7 +10,14 @@ QEMU_MACHINE=${QEMU_MACHINE:-q35}
 QEMU_CPU=${QEMU_CPU:-qemu64}
 QEMU_MEMORY=${QEMU_MEMORY:-1024M}
 QEMU_SMP=${QEMU_SMP:-2}
-KERNEL_CMDLINE=${KERNEL_CMDLINE:-"console=ttyS0 rdinit=/init"}
+DEFAULT_KERNEL_CMDLINE="console=ttyS0 rdinit=/init"
+KERNEL_CMDLINE=${KERNEL_CMDLINE:-"$DEFAULT_KERNEL_CMDLINE"}
+
+if [[ "$KERNEL_CMDLINE" != *"console="* ]] || [[ "${#KERNEL_CMDLINE}" -lt 12 ]]; then
+  echo "[warn] suspicious KERNEL_CMDLINE override detected: '$KERNEL_CMDLINE'"
+  echo "[hint] resetting to default kernel cmdline: '$DEFAULT_KERNEL_CMDLINE'"
+  KERNEL_CMDLINE="$DEFAULT_KERNEL_CMDLINE"
+fi
 
 check_x86_kernel_bootability() {
   local kernel="$1"
