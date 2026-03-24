@@ -72,6 +72,7 @@ explain_nonbootable_kernel_source() {
     if [[ "$QEMU_X86_ALLOW_ELF_KERNEL" != "1" ]]; then
       echo "[warn] ELF kernels are rejected by default for qemu x86 direct-boot staging in this script"
       echo "[hint] provide a known bootable non-ELF image via KERNEL_BOOTABLE_IMAGE_SOURCE=<path> (for example Linux bzImage), or set QEMU_X86_ALLOW_ELF_KERNEL=1 to opt-in to PVH ELF probing"
+      echo "[hint] helper: scripts/fetch-linux-bzimage.sh"
       return
     fi
     echo "[warn] freestanding ELF kernel is missing a verified PVH note / entry contract for qemu-system-x86_64 direct boot"

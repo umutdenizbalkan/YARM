@@ -40,6 +40,7 @@ check_x86_kernel_bootability() {
   if [[ "$QEMU_X86_ALLOW_ELF_KERNEL" != "1" ]]; then
     echo "[warn] refusing ELF kernel direct-boot probe by default for x86 smoke"
     echo "[hint] set QEMU_X86_ALLOW_ELF_KERNEL=1 to opt-in to PVH ELF probing"
+    echo "[hint] helper to fetch a known bootable image: scripts/fetch-linux-bzimage.sh"
     return 1
   fi
   if command -v readelf >/dev/null 2>&1; then
