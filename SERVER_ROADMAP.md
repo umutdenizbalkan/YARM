@@ -89,6 +89,10 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 ### Current implementation status
 
 - ✅ `ramfs.srv` scaffold implemented (`services/fs/ramfs/*` + thin `src/bin/ramfs_srv.rs` entrypoint).
+  - ✅ behavior contract captured in `RAMFS_CONTRACT.md` (fd/inode allocation, rw semantics, statx contract, in-flight fd failure policy, metrics).
+  - ✅ protocol gate hardened with frozen-codec vector assertions and malformed-payload rejection (`services::fs::ramfs::service::tests::ramfs_protocol_vectors_match_frozen_vfs_codec`, `ramfs_protocol_rejects_malformed_openat_payload`).
+  - ✅ mount gate hardened with mixed ramfs/initramfs routing plus path-policy denial assertions (`services::fs::ramfs::service::tests::ramfs_mount_gate_routes_with_policy_denial`).
+  - ✅ lifecycle gate hardened with mount failure/recovery and fd close semantics (`services::fs::ramfs::service::tests::ramfs_lifecycle_gate_covers_mount_failure_recovery_and_close`).
 - ✅ `initramfs.srv` scaffold implemented (`services/fs/initramfs/*` + thin `src/bin/initramfs_srv.rs` entrypoint).
   - ✅ behavior contract captured in `INITRAMFS_CONTRACT.md` (fd allocator, read-only semantics, statx contract, in-flight fd failure policy, metrics).
   - ✅ protocol gate hardened with frozen-codec vector assertions (`services::fs::initramfs::service::tests::initramfs_protocol_vectors_match_frozen_vfs_codec`).
