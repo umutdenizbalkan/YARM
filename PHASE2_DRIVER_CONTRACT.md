@@ -34,7 +34,8 @@ This contract defines the minimum invariants for Phase-2 driver services (`irqmu
 - `kernel::boot::tests::restart_denial_escalates_to_supervisor_every_threshold`
 - `kernel::boot::tests::driver_restart_revokes_runtime_caps`
 
-The above are required to pass in `.github/workflows/compat-gates.yml` under `phase2-driver-gates`.
+The above are required to pass in `.github/workflows/compat-gates.yml` under `phase2-driver-gates`
+and are executed via `scripts/phase2-driver-gates.sh`.
 
 ## Backpressure and queueing contract
 
