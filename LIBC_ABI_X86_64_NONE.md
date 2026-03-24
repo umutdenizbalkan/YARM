@@ -38,7 +38,7 @@ These numbers are already defined and tested in `src/services/compatibility/linu
 ## Relationship to milestone tracking
 
 - Milestone 2 checklist items in `X86_64_NONE_MUSL_PORT_TODO.md` are grounded in the constants, mapping logic, and tests already present in `linux_compat/mod.rs`.
-- Milestone 3 begins in `src/services/compatibility/linux_compat/sysdeps.rs` with startup/memory hooks and a temporary clock stub (`ENOSYS`) until timer service plumbing lands.
+- Milestone 3 is partially implemented in `src/services/compatibility/linux_compat/sysdeps.rs`: startup/memory/thread/futex hooks and timer-backed clock hooks exist, but full musl crt/`__libc_start_main` integration is still pending.
 
 ## Bootstrap sysdeps coverage now implemented
 
