@@ -40,7 +40,7 @@ This matrix maps roadmap phase completion to required contracts, CI jobs, and de
 - Required CI jobs:
   - `phase4-ui-gates`
   - `phase4-ui-smoke-marker`
-  - `riscv64-busybox-smoke-strict` (workflow_dispatch strict runtime path)
+  - `riscv64-core-smoke-strict` (workflow_dispatch strict runtime path)
 - Required deterministic tests/checks:
   - `services::ui::display::service::tests::boot_marker_is_stable`
   - `services::ui::display::service::tests::display_tracks_modeset_and_present`

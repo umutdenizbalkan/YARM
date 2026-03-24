@@ -1,11 +1,11 @@
-name: busybox-qemu-smoke
+name: core-qemu-smoke
 
 on:
   pull_request:
   workflow_dispatch:
 
 jobs:
-  riscv64-busybox-smoke:
+  riscv64-core-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,12 +16,12 @@ jobs:
           sudo apt-get install -y qemu-system-misc cpio busybox-static
       - name: Build staged artifacts (non-strict)
         run: scripts/build-qemu-riscv64-artifacts.sh
-      - name: BusyBox QEMU smoke (non-strict)
+      - name: Core-marker QEMU smoke (non-strict)
         env:
           QEMU_SMOKE_STRICT: "0"
-        run: scripts/qemu-riscv64-busybox-smoke.sh
+        run: scripts/qemu-riscv64-core-smoke.sh
 
-  riscv64-busybox-smoke-strict:
+  riscv64-core-smoke-strict:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -35,10 +35,10 @@ jobs:
         env:
           ARTIFACTS_STRICT: "1"
         run: scripts/build-qemu-riscv64-artifacts.sh
-      - name: BusyBox QEMU smoke (strict)
+      - name: Core-marker QEMU smoke (strict)
         env:
           QEMU_SMOKE_STRICT: "1"
-          LOGFILE: qemu-busybox.log
-        run: scripts/qemu-riscv64-busybox-smoke.sh
+          LOGFILE: qemu-core.log
+        run: scripts/qemu-riscv64-core-smoke.sh
       - name: Verify strict smoke log has UI boot marker
-        run: rg -n "\[ui\] boot-to-shell marker" qemu-busybox.log
+        run: rg -n "\[ui\] boot-to-shell marker" qemu-core.log

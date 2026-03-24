@@ -46,7 +46,7 @@ for token in phase2-driver-gates phase3-network-gates phase4-ui-gates phase4-ui-
     echo "[fail] readiness matrix missing CI token: $token"
     bad=1
   fi
-  if ! rg -n "$token" .github/workflows/compat-gates.yml .github/workflows/busybox-qemu-smoke.yml >/dev/null; then
+  if ! rg -n "$token" .github/workflows/compat-gates.yml .github/workflows/core-qemu-smoke.yml >/dev/null; then
     echo "[fail] workflows missing CI token from matrix: $token"
     bad=1
   fi

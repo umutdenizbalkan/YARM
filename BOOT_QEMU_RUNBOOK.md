@@ -26,13 +26,13 @@ ARTIFACTS_STRICT=1 scripts/build-qemu-x86_64-artifacts.sh
 ### One-command smoke boot
 
 ```bash
-scripts/qemu-x86_64-busybox-smoke.sh
+scripts/qemu-x86_64-core-smoke.sh
 ```
 
 Strict mode:
 
 ```bash
-QEMU_SMOKE_STRICT=1 scripts/qemu-x86_64-busybox-smoke.sh
+QEMU_SMOKE_STRICT=1 scripts/qemu-x86_64-core-smoke.sh
 ```
 
 ## Success markers searched in serial log
@@ -47,14 +47,14 @@ QEMU_SMOKE_STRICT=1 scripts/qemu-x86_64-busybox-smoke.sh
 ```bash
 KERNEL_IMAGE=build-x86_64/yarm-x86_64.elf \
 INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio \
-scripts/qemu-x86_64-busybox-smoke.sh
+scripts/qemu-x86_64-core-smoke.sh
 ```
 
 ## Secondary ISA path (RISC-V scaffolding)
 
 ```bash
 scripts/build-qemu-riscv64-artifacts.sh
-scripts/qemu-riscv64-busybox-smoke.sh
+scripts/qemu-riscv64-core-smoke.sh
 ```
 
 > musl sysdeps portability work is ISA-agnostic; boot scripts differ only in machine image/runner details.

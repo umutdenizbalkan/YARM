@@ -9,7 +9,7 @@ KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-aarch64-none}
 SERVER_ELF=${SERVER_ELF:-target/${RUST_TARGET}/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
 KERNEL_ELF=${KERNEL_ELF:-target/${RUST_TARGET}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
-INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-busybox.cpio}
+INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-aarch64.elf}
 KERNEL_BIN_IMAGE=${KERNEL_BIN_IMAGE:-$OUT_DIR/yarm-aarch64.bin}
 BUSYBOX_BIN=${BUSYBOX_BIN:-}
@@ -144,4 +144,4 @@ fi
 
 echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"
 echo "[ok] aarch64 artifact staging complete in $OUT_DIR"
-echo "[next] run smoke boot: scripts/qemu-aarch64-busybox-smoke.sh"
+echo "[next] run smoke boot: scripts/qemu-aarch64-core-smoke.sh"
