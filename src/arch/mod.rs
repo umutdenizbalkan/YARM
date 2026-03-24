@@ -1,4 +1,5 @@
 pub mod aarch64;
+pub mod boot_entry;
 pub mod hal;
 pub mod riscv64;
 pub mod x86_64;

@@ -1,3 +1,4 @@
+pub mod boot;
 pub mod console;
 pub mod platform_layout;
 pub mod syscall_abi;
