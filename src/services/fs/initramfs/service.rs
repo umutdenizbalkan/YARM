@@ -5,7 +5,7 @@ use crate::kernel::vfs::{
 };
 use crate::services::common::service::{FsService, run_typed_request_loop};
 use crate::services::fs::initramfs::archive::{
-    INITRAMFS_BOOT_MARKER_PATH_PTR, INITRAMFS_INIT_PATH_PTR, InitramfsBackend, InitramfsMetrics,
+    INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend, InitramfsMetrics,
 };
 
 pub type InitramfsService = FsService<InitramfsBackend>;
@@ -112,6 +112,7 @@ mod tests {
         OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_READ,
     };
     use crate::services::fs::devfs::{DEV_CONSOLE_PATH_PTR, DevFsBackend};
+    use crate::services::fs::initramfs::INITRAMFS_INIT_PATH_PTR;
 
     #[test]
     fn initramfs_is_read_only_with_metrics() {
