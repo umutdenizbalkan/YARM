@@ -11,7 +11,7 @@ SERVER_ELF=${SERVER_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${SERVE
 KERNEL_RAW_ELF=${KERNEL_RAW_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 KERNEL_BOOTABLE_IMAGE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
-KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-x86_64.elf}
+KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/bootable-kernel.img}
 KERNEL_DEBUG_ELF=${KERNEL_DEBUG_ELF:-$OUT_DIR/${KERNEL_BIN}.elf}
 ARTIFACTS_STRICT=${ARTIFACTS_STRICT:-0}
 TOOLCHAIN=${TOOLCHAIN:-nightly}
@@ -120,6 +120,7 @@ fi
 
 if [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
   cp "$KERNEL_RAW_ELF" "$KERNEL_DEBUG_ELF"
+  echo "[info] yarm freestanding kernel ELF (debug-only): $KERNEL_DEBUG_ELF"
 fi
 
 cat > "$ROOTFS_DIR/init" <<'SH'
@@ -153,6 +154,7 @@ if [[ -n "$BOOTABLE_SOURCE" && -f "$BOOTABLE_SOURCE" ]] && is_qemu_direct_bootab
   if [[ "$BOOTABLE_SOURCE" != "$KERNEL_IMAGE" ]]; then
     cp "$BOOTABLE_SOURCE" "$KERNEL_IMAGE"
   fi
+  echo "[info] bootable kernel source selected: $BOOTABLE_SOURCE"
 elif [[ -n "$BOOTABLE_SOURCE" && -f "$BOOTABLE_SOURCE" ]]; then
   rm -f "$KERNEL_IMAGE"
   explain_nonbootable_kernel_source "$BOOTABLE_SOURCE"

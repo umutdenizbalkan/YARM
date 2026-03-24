@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-KERNEL_IMAGE=${KERNEL_IMAGE:-build-x86_64/yarm-x86_64.elf}
+KERNEL_IMAGE=${KERNEL_IMAGE:-build-x86_64/bootable-kernel.img}
 KERNEL_DEBUG_ELF=${KERNEL_DEBUG_ELF:-build-x86_64/kernel_boot.elf}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build-x86_64/initramfs-core.cpio}
 TIMEOUT_SECS=${TIMEOUT_SECS:-30}
