@@ -18,16 +18,15 @@ Port user-space runtime behind an ISA-agnostic musl sysdeps shim that maps libc 
 
 ## Milestone 2 — ABI boundary contract for libc shim
 
-**Audit status (2026-03-24): partially complete.**
+**Audit status (2026-03-24): complete.**
 
 Completed:
 - [x] Freeze a tiny libc-facing kernel ABI surface (threads/TLS, memory mapping, clocks, process lifecycle, IPC-backed fd model).
 - [x] Document syscall numbering + calling convention expected by shim stubs.
 - [x] Define error mapping policy (`errno` conversion from kernel/service status codes).
 
-Still missing before claiming full completion:
-- [ ] Add compatibility tests that explicitly cover `EINTR` and timeout error mapping behavior at the shim boundary.
-- [ ] Add compatibility tests that explicitly assert partial I/O + invalid-handle semantics with errno-level expectations in the linux-compat shim surface.
+- [x] Add compatibility tests that explicitly cover `EINTR` and timeout error mapping behavior at the shim boundary.
+- [x] Add compatibility tests that explicitly assert partial I/O + invalid-handle semantics with errno-level expectations in the linux-compat shim surface.
 
 ## Milestone 3 — musl sysdeps shim (minimum viable)
 
