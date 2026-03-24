@@ -90,6 +90,10 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 - ✅ `ramfs.srv` scaffold implemented (`services/fs/ramfs/*` + thin `src/bin/ramfs_srv.rs` entrypoint).
 - ✅ `initramfs.srv` scaffold implemented (`services/fs/initramfs/*` + thin `src/bin/initramfs_srv.rs` entrypoint).
+  - ✅ behavior contract captured in `INITRAMFS_CONTRACT.md` (fd allocator, read-only semantics, statx contract, in-flight fd failure policy, metrics).
+  - ✅ protocol gate hardened with frozen-codec vector assertions (`services::fs::initramfs::service::tests::initramfs_protocol_vectors_match_frozen_vfs_codec`).
+  - ✅ mount gate hardened with mixed devfs/initramfs routing plus path-policy denial assertions (`services::fs::initramfs::service::tests::initramfs_mount_gate_routes_with_policy_denial`).
+  - ✅ lifecycle gate hardened with mount failure/recovery and fd close semantics (`services::fs::initramfs::service::tests::initramfs_lifecycle_gate_covers_mount_failure_recovery_and_close`).
 - ✅ `devfs.srv` scaffold implemented (`services/fs/devfs/*` + thin `src/bin/devfs_srv.rs` entrypoint (console/null nodes)).
   - ✅ behavior contract captured in `DEVFS_CONTRACT.md` (fd allocator, node semantics, statx, in-flight fd failure policy, metrics).
   - ✅ protocol gate hardened with frozen-codec vector assertions (`services::fs::devfs::service::tests::devfs_protocol_vectors_match_frozen_vfs_codec`).
