@@ -10,6 +10,7 @@ QEMU_MACHINE=${QEMU_MACHINE:-q35}
 QEMU_CPU=${QEMU_CPU:-qemu64}
 QEMU_MEMORY=${QEMU_MEMORY:-1024M}
 QEMU_SMP=${QEMU_SMP:-2}
+QEMU_X86_ALLOW_ELF_KERNEL=${QEMU_X86_ALLOW_ELF_KERNEL:-0}
 DEFAULT_KERNEL_CMDLINE="console=ttyS0 rdinit=/init"
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"$DEFAULT_KERNEL_CMDLINE"}
 
@@ -35,6 +36,11 @@ check_x86_kernel_bootability() {
   fi
   if [[ "$ftype" != *"ELF"* ]]; then
     return 0
+  fi
+  if [[ "$QEMU_X86_ALLOW_ELF_KERNEL" != "1" ]]; then
+    echo "[warn] refusing ELF kernel direct-boot probe by default for x86 smoke"
+    echo "[hint] set QEMU_X86_ALLOW_ELF_KERNEL=1 to opt-in to PVH ELF probing"
+    return 1
   fi
   if command -v readelf >/dev/null 2>&1; then
     if readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
