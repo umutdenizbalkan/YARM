@@ -96,6 +96,12 @@ QEMU_CMD=(
 MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE"
 FIRMWARE_FALLBACK_REGEX="SeaBIOS|iPXE|Booting from ROM"
 
+log_has_pattern() {
+  local pattern="$1"
+  [[ -f "$LOGFILE" ]] || return 1
+  tr '\r' '\n' <"$LOGFILE" | rg -a -n "$pattern" >/dev/null 2>&1
+}
+
 set +e
 stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE" &
 PIPE_PID=$!
@@ -105,11 +111,11 @@ FIRMWARE_FALLBACK=0
 
 START_TS=$(date +%s)
 while kill -0 "$PIPE_PID" >/dev/null 2>&1; do
-  if rg -n "$MARKER_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+  if log_has_pattern "$MARKER_REGEX"; then
     FOUND_MARKER=1
     break
   fi
-  if rg -n "$FIRMWARE_FALLBACK_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+  if log_has_pattern "$FIRMWARE_FALLBACK_REGEX"; then
     FIRMWARE_FALLBACK=1
     break
   fi
