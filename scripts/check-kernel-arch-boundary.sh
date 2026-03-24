@@ -20,6 +20,10 @@ check_absent 'pub args: \[usize; 6\]' src/kernel/trapframe.rs
 check_absent 'SYSCALL_ARG_TRANSFER_CAP: usize = 5' src/kernel/syscall.rs
 check_absent 'VirtAddr\(0xFFFF_0000\)' src/kernel/boot/mod.rs
 check_absent 'next_anon_phys: 0x1000_0000' src/kernel/boot/mod.rs
+check_absent 'core::arch::asm!' src/kernel/lock.rs
+check_absent 'target_arch = "x86_64"' src/kernel/lock.rs
+check_absent 'target_arch = "riscv64"' src/kernel/lock.rs
+check_absent 'target_arch = "aarch64"' src/kernel/lock.rs
 
 # Bin-layer ISA leakage checks: boot bin must route ISA details through src/arch/*.
 check_absent 'global_asm!' src/bin/kernel_boot.rs

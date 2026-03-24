@@ -7,92 +7,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[repr(align(64))]
 struct CachePaddedFlag(AtomicBool);
 
-#[derive(Clone, Copy)]
-struct IrqState {
-    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-    interrupts_were_enabled: bool,
+use crate::arch::irq_guard::{self, ArchIrqState};
+
+#[inline]
+fn irq_save() -> ArchIrqState {
+    irq_guard::irq_save()
 }
 
-#[cfg(feature = "hosted-dev")]
 #[inline]
-fn irq_save() -> IrqState {
-    IrqState {
-        interrupts_were_enabled: true,
-    }
-}
-
-#[cfg(all(
-    not(feature = "hosted-dev"),
-    any(
-        target_arch = "x86_64",
-        target_arch = "riscv64",
-        target_arch = "aarch64"
-    )
-))]
-#[inline]
-fn irq_save() -> IrqState {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let flags: usize;
-        core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags));
-        core::arch::asm!("cli", options(nomem, preserves_flags));
-        return IrqState {
-            interrupts_were_enabled: (flags & (1 << 9)) != 0,
-        };
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        let sstatus: usize;
-        core::arch::asm!("csrrc {0}, sstatus, {1}", out(reg) sstatus, in(reg) 1usize << 1, options(nomem));
-        return IrqState {
-            interrupts_were_enabled: (sstatus & (1 << 1)) != 0,
-        };
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let daif: usize;
-        core::arch::asm!("mrs {0}, daif", out(reg) daif, options(nomem, preserves_flags));
-        core::arch::asm!("msr daifset, #2", options(nomem, preserves_flags));
-        return IrqState {
-            interrupts_were_enabled: (daif & (1 << 7)) == 0,
-        };
-    }
-}
-
-#[cfg(feature = "hosted-dev")]
-#[inline]
-fn irq_restore(_state: IrqState) {}
-
-#[cfg(all(
-    not(feature = "hosted-dev"),
-    any(
-        target_arch = "x86_64",
-        target_arch = "riscv64",
-        target_arch = "aarch64"
-    )
-))]
-#[inline]
-fn irq_restore(state: IrqState) {
-    if !state.interrupts_were_enabled {
-        return;
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!("sti", options(nomem, preserves_flags));
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        core::arch::asm!("csrs sstatus, {0}", in(reg) 1usize << 1, options(nomem));
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("msr daifclr, #2", options(nomem, preserves_flags));
-    }
+fn irq_restore(state: ArchIrqState) {
+    irq_guard::irq_restore(state)
 }
 
 /// A simple TTAS spin lock.
@@ -200,7 +124,7 @@ impl<T> SpinLockIrq<T> {
 
 pub struct SpinLockIrqGuard<'a, T> {
     lock: &'a SpinLockIrq<T>,
-    irq_state: IrqState,
+    irq_state: ArchIrqState,
     _not_send: PhantomData<*const UnsafeCell<()>>,
 }
 
