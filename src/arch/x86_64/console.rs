@@ -1,14 +1,14 @@
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const COM1_PORT: u16 = 0x3F8;
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const COM1_LINE_STATUS: u16 = COM1_PORT + 5;
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const LINE_STATUS_THR_EMPTY: u8 = 1 << 5;
 
 #[cfg(feature = "hosted-dev")]
 pub fn write_line(_msg: &str) {}
 
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn write_line(msg: &str) {
     for &byte in msg.as_bytes() {
         if byte == b'\n' {
@@ -20,13 +20,13 @@ pub fn write_line(msg: &str) {
     write_byte(b'\n');
 }
 
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn write_byte(byte: u8) {
     while (inb(COM1_LINE_STATUS) & LINE_STATUS_THR_EMPTY) == 0 {}
     outb(COM1_PORT, byte);
 }
 
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn outb(port: u16, value: u8) {
     unsafe {
         core::arch::asm!(
@@ -38,7 +38,7 @@ fn outb(port: u16, value: u8) {
     }
 }
 
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn inb(port: u16) -> u8 {
     let value: u8;
     unsafe {
@@ -51,3 +51,6 @@ fn inb(port: u16) -> u8 {
     }
     value
 }
+
+#[cfg(all(not(feature = "hosted-dev"), not(target_arch = "x86_64")))]
+pub fn write_line(_msg: &str) {}

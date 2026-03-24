@@ -1,7 +1,7 @@
 #[cfg(feature = "hosted-dev")]
 pub fn write_line(_msg: &str) {}
 
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn write_line(msg: &str) {
     for &byte in msg.as_bytes() {
         if byte == b'\n' {
@@ -13,7 +13,7 @@ pub fn write_line(msg: &str) {
     write_byte(b'\n');
 }
 
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn write_byte(byte: u8) {
     // Legacy SBI console_putchar (a7=1, a0=char, ecall).
     unsafe {
@@ -25,6 +25,9 @@ fn write_byte(byte: u8) {
         );
     }
 }
+
+#[cfg(all(not(feature = "hosted-dev"), not(target_arch = "riscv64")))]
+pub fn write_line(_msg: &str) {}
 
 #[cfg(test)]
 mod tests {
