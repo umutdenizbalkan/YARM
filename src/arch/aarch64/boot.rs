@@ -11,7 +11,7 @@ boot_stack_aarch64:
 boot_stack_aarch64_end:
 
     .section .text.boot,"ax",@progbits
-    .globl _start
+    .weak _start
     .type _start,%function
 _start:
     adrp x0, boot_stack_aarch64_end

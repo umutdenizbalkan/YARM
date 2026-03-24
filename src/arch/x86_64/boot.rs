@@ -79,7 +79,7 @@ pvh_start32:
     .section .text.boot,"ax",@progbits
     .code64
 
-    .global _start
+    .weak _start
     .type _start,@function
 _start:
 long_mode_entry:

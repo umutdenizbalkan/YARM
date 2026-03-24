@@ -11,7 +11,7 @@ boot_stack_riscv64:
 boot_stack_riscv64_end:
 
     .section .text.boot,"ax",@progbits
-    .globl _start
+    .weak _start
     .type _start,@function
 _start:
     la sp, boot_stack_riscv64_end
