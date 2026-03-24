@@ -39,6 +39,14 @@ impl<B: VfsBackend> FsService<B> {
         self.handled
     }
 
+    pub const fn backend(&self) -> &B {
+        self.inner.backend()
+    }
+
+    pub fn backend_mut(&mut self) -> &mut B {
+        self.inner.backend_mut()
+    }
+
     pub fn handle(&mut self, request: Message) -> Result<Message, VfsError> {
         let reply = self.inner.handle_request(request)?;
         self.handled = self.handled.saturating_add(1);

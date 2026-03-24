@@ -6,6 +6,7 @@ This matrix maps roadmap phase completion to required contracts, CI jobs, and de
 
 - Contract docs:
   - `STORAGE_SERVICE_CONTRACT.md`
+  - `DEVFS_CONTRACT.md`
 - Required deterministic tests/checks:
   - `services::fs::devfs::service::tests::devfs_protocol_vectors_match_frozen_vfs_codec`
   - `services::fs::devfs::service::tests::devfs_mount_gate_routes_devfs_and_initramfs_with_policy_denial`

@@ -1,7 +1,12 @@
+use crate::kernel::ipc::Message;
 use crate::kernel::vfs::VfsError;
-use crate::kernel::vfs::{OpenAtRequest, ReadWriteRequest, openat_message, write_message};
+use crate::kernel::vfs::{
+    OpenAtRequest, ReadWriteRequest, openat_message, statx_message, write_message,
+};
 use crate::services::common::service::{FsService, run_typed_request_loop};
-use crate::services::fs::devfs::nodes::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
+use crate::services::fs::devfs::nodes::{
+    DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend, DevFsMetrics,
+};
 
 pub type DevFsService = FsService<DevFsBackend>;
 
@@ -10,56 +15,78 @@ pub struct DevFsLoopSummary {
     pub console_fd: u64,
     pub null_fd: u64,
     pub handled: usize,
+    pub metrics: DevFsMetrics,
+}
+
+fn decode_reply_u64(reply: Message) -> u64 {
+    let mut fd_bytes = [0u8; 8];
+    fd_bytes.copy_from_slice(reply.as_slice());
+    u64::from_le_bytes(fd_bytes)
+}
+
+fn scripted_bootstrap_requests() -> Result<[Message; 2], VfsError> {
+    Ok([
+        openat_message(OpenAtRequest {
+            dirfd: 0,
+            path_ptr: DEV_CONSOLE_PATH_PTR,
+            flags: 0,
+            mode: 0,
+        })?,
+        openat_message(OpenAtRequest {
+            dirfd: 0,
+            path_ptr: DEV_NULL_PATH_PTR,
+            flags: 0,
+            mode: 0,
+        })?,
+    ])
+}
+
+fn scripted_bootstrap_io(console_fd: u64, null_fd: u64) -> Result<[Message; 4], VfsError> {
+    Ok([
+        write_message(ReadWriteRequest {
+            fd: console_fd,
+            buf_ptr: 0,
+            len: 12,
+        })?,
+        write_message(ReadWriteRequest {
+            fd: null_fd,
+            buf_ptr: 0,
+            len: 12,
+        })?,
+        statx_message(crate::kernel::vfs::StatxRequest {
+            dirfd: 0,
+            path_ptr: DEV_CONSOLE_PATH_PTR,
+            flags: 0,
+            mask_or_buf: 0,
+        })?,
+        statx_message(crate::kernel::vfs::StatxRequest {
+            dirfd: 0,
+            path_ptr: DEV_NULL_PATH_PTR,
+            flags: 0,
+            mask_or_buf: 0,
+        })?,
+    ])
+}
+
+pub fn run_request_batch<const N: usize>(
+    service: &mut DevFsService,
+    requests: [Message; N],
+) -> Result<[Message; N], VfsError> {
+    run_typed_request_loop(service, requests)
 }
 
 pub fn run_request_loop(service: &mut DevFsService) -> Result<DevFsLoopSummary, VfsError> {
-    let replies = run_typed_request_loop(
-        service,
-        [
-            openat_message(OpenAtRequest {
-                dirfd: 0,
-                path_ptr: DEV_CONSOLE_PATH_PTR,
-                flags: 0,
-                mode: 0,
-            })
-            .map_err(|_| VfsError::Malformed)?,
-            openat_message(OpenAtRequest {
-                dirfd: 0,
-                path_ptr: DEV_NULL_PATH_PTR,
-                flags: 0,
-                mode: 0,
-            })
-            .map_err(|_| VfsError::Malformed)?,
-        ],
-    )?;
-    let mut fd_bytes = [0u8; 8];
-    fd_bytes.copy_from_slice(replies[0].as_slice());
-    let console_fd = u64::from_le_bytes(fd_bytes);
-    fd_bytes.copy_from_slice(replies[1].as_slice());
-    let null_fd = u64::from_le_bytes(fd_bytes);
+    let opens = run_request_batch(service, scripted_bootstrap_requests()?)?;
+    let console_fd = decode_reply_u64(opens[0]);
+    let null_fd = decode_reply_u64(opens[1]);
 
-    let _ = run_typed_request_loop(
-        service,
-        [
-            write_message(ReadWriteRequest {
-                fd: console_fd,
-                buf_ptr: 0,
-                len: 12,
-            })
-            .map_err(|_| VfsError::Malformed)?,
-            write_message(ReadWriteRequest {
-                fd: null_fd,
-                buf_ptr: 0,
-                len: 12,
-            })
-            .map_err(|_| VfsError::Malformed)?,
-        ],
-    )?;
+    let _ = run_request_batch(service, scripted_bootstrap_io(console_fd, null_fd)?)?;
 
     Ok(DevFsLoopSummary {
         console_fd,
         null_fd,
         handled: service.handled_count(),
+        metrics: service.backend().metrics(),
     })
 }
 
@@ -68,10 +95,14 @@ pub fn run() {
     let summary = run_request_loop(&mut svc).expect("devfs loop");
 
     crate::yarm_log!(
-        "devfs.srv request-loop ready: console_fd={}, null_fd={}, handled={}",
+        "devfs.srv request-loop ready: console_fd={}, null_fd={}, handled={}, opens={}, writes={}, statx={}, errors={}",
         summary.console_fd,
         summary.null_fd,
-        summary.handled
+        summary.handled,
+        summary.metrics.open_count,
+        summary.metrics.write_count,
+        summary.metrics.statx_count,
+        summary.metrics.error_count
     );
 }
 
@@ -82,7 +113,9 @@ mod tests {
         CloseRequest, MountNamespacePolicy, MountRouter, StatxRequest, VfsService, close_message,
         openat_message, statx_message, write_message,
     };
-    use crate::kernel::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_STATX, VFS_OP_WRITE};
+    use crate::kernel::vfs_abi::{
+        OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_STATX, VFS_OP_WRITE,
+    };
     use crate::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 
     #[test]
@@ -91,7 +124,10 @@ mod tests {
         let summary = run_request_loop(&mut svc).expect("loop");
         assert_eq!(summary.console_fd, 3);
         assert_eq!(summary.null_fd, 4);
-        assert_eq!(summary.handled, 4);
+        assert_eq!(summary.handled, 6);
+        assert_eq!(summary.metrics.open_count, 2);
+        assert_eq!(summary.metrics.write_count, 2);
+        assert_eq!(summary.metrics.statx_count, 2);
     }
 
     #[test]
@@ -149,7 +185,10 @@ mod tests {
         svc.set_policy(
             MountNamespacePolicy::deny_all()
                 .with_range(DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR)
-                .with_range(INITRAMFS_BOOT_MARKER_PATH_PTR, INITRAMFS_BOOT_MARKER_PATH_PTR),
+                .with_range(
+                    INITRAMFS_BOOT_MARKER_PATH_PTR,
+                    INITRAMFS_BOOT_MARKER_PATH_PTR,
+                ),
         );
 
         let open_dev = svc
@@ -196,7 +235,9 @@ mod tests {
         svc.mount(DEV_CONSOLE_PATH_PTR, 1).expect("mount");
         svc.mark_mount_failed(DEV_CONSOLE_PATH_PTR)
             .expect("mark failed");
-        let failed = svc.mount_record(DEV_CONSOLE_PATH_PTR).expect("failed mount");
+        let failed = svc
+            .mount_record(DEV_CONSOLE_PATH_PTR)
+            .expect("failed mount");
         assert!(failed.failed);
         assert!(!failed.active);
 
@@ -235,7 +276,68 @@ mod tests {
         );
         assert_eq!(write_after_close, Err(VfsError::BadFd));
 
+        svc.recover_mount(DEV_CONSOLE_PATH_PTR).expect("recover");
         svc.unmount(DEV_CONSOLE_PATH_PTR).expect("unmount");
         assert_eq!(svc.active_mounts(), 0);
+    }
+
+    #[test]
+    fn devfs_inflight_fd_survives_mount_failure_until_explicit_close() {
+        let mut svc = VfsService::with_backend(DevFsBackend::default());
+        svc.mount(DEV_CONSOLE_PATH_PTR, 1).expect("mount");
+        let open_console = svc
+            .handle_request(
+                openat_message(OpenAtRequest {
+                    dirfd: 0,
+                    path_ptr: DEV_CONSOLE_PATH_PTR,
+                    flags: 0,
+                    mode: 0,
+                })
+                .expect("open"),
+            )
+            .expect("open reply");
+        let console_fd = decode_reply_u64(open_console);
+
+        svc.mark_mount_failed(DEV_CONSOLE_PATH_PTR)
+            .expect("mark failed");
+        let write_while_failed = svc
+            .handle_request(
+                write_message(ReadWriteRequest {
+                    fd: console_fd,
+                    buf_ptr: 0,
+                    len: 9,
+                })
+                .expect("write"),
+            )
+            .expect("write on in-flight fd");
+        assert_eq!(decode_reply_u64(write_while_failed), 9);
+
+        svc.recover_mount(DEV_CONSOLE_PATH_PTR).expect("recover");
+        let write_after_recover = svc
+            .handle_request(
+                write_message(ReadWriteRequest {
+                    fd: console_fd,
+                    buf_ptr: 0,
+                    len: 3,
+                })
+                .expect("write"),
+            )
+            .expect("write after recover");
+        assert_eq!(decode_reply_u64(write_after_recover), 3);
+
+        let _ = svc
+            .handle_request(close_message(CloseRequest { fd: console_fd }).expect("close req"))
+            .expect("close");
+        assert_eq!(
+            svc.handle_request(
+                write_message(ReadWriteRequest {
+                    fd: console_fd,
+                    buf_ptr: 0,
+                    len: 1,
+                })
+                .expect("write"),
+            ),
+            Err(VfsError::BadFd)
+        );
     }
 }
