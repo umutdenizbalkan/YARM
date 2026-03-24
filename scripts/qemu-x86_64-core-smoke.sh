@@ -103,49 +103,22 @@ log_has_pattern() {
 }
 
 set +e
-stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE" &
-PIPE_PID=$!
-QEMU_STATUS=0
-FOUND_MARKER=0
-FIRMWARE_FALLBACK=0
+if command -v timeout >/dev/null 2>&1; then
+  timeout --foreground "${TIMEOUT_SECS}s" stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
+  QEMU_STATUS=${PIPESTATUS[0]}
+else
+  echo "[warn] 'timeout' command is unavailable; qemu run may not auto-terminate"
+  stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
+  QEMU_STATUS=${PIPESTATUS[0]}
+fi
+set -e
 
-START_TS=$(date +%s)
-while kill -0 "$PIPE_PID" >/dev/null 2>&1; do
-  if log_has_pattern "$MARKER_REGEX"; then
-    FOUND_MARKER=1
-    break
-  fi
-  if log_has_pattern "$FIRMWARE_FALLBACK_REGEX"; then
-    FIRMWARE_FALLBACK=1
-    break
-  fi
-  NOW_TS=$(date +%s)
-  ELAPSED=$((NOW_TS - START_TS))
-  if [[ "$ELAPSED" -ge "$TIMEOUT_SECS" ]]; then
-    echo "[warn] timeout reached (${TIMEOUT_SECS}s) without marker detection"
-    break
-  fi
-  sleep 1
-done
-
-if [[ "$FOUND_MARKER" -eq 1 ]]; then
-  kill "$PIPE_PID" >/dev/null 2>&1 || true
-  wait "$PIPE_PID"
-  QEMU_STATUS=$?
-  set -e
+if log_has_pattern "$MARKER_REGEX"; then
   echo "[ok] boot markers detected"
   exit 0
 fi
 
-if [[ "$FIRMWARE_FALLBACK" -eq 1 ]]; then
-  if kill -0 "$PIPE_PID" >/dev/null 2>&1; then
-    kill "$PIPE_PID" >/dev/null 2>&1 || true
-    sleep 1
-    kill -9 "$PIPE_PID" >/dev/null 2>&1 || true
-  fi
-  wait "$PIPE_PID"
-  QEMU_STATUS=$?
-  set -e
+if log_has_pattern "$FIRMWARE_FALLBACK_REGEX"; then
   echo "[warn] firmware fallback detected before any YARM boot markers"
   echo "[hint] qemu displayed SeaBIOS/iPXE output, which means serial output is working but the kernel was not accepted as a direct-boot image"
   echo "[hint] this is not an initramfs userspace issue yet; the guest never reached kernel_entry_x86_64"
@@ -159,14 +132,9 @@ if [[ "$FIRMWARE_FALLBACK" -eq 1 ]]; then
   exit 0
 fi
 
-if kill -0 "$PIPE_PID" >/dev/null 2>&1; then
-  kill "$PIPE_PID" >/dev/null 2>&1 || true
-  sleep 1
-  kill -9 "$PIPE_PID" >/dev/null 2>&1 || true
+if [[ "$QEMU_STATUS" -eq 124 ]]; then
+  echo "[warn] timeout reached (${TIMEOUT_SECS}s) without marker detection"
 fi
-wait "$PIPE_PID"
-QEMU_STATUS=$?
-set -e
 
 echo "[warn] boot markers not detected (status=$QEMU_STATUS)"
 if [[ -f "$LOGFILE" ]]; then
