@@ -69,4 +69,4 @@ echo "[info] building kernel_boot + init_server for ${TARGET_SPEC} with toolchai
 
 echo "[ok] x86_64-none build completed"
 echo "[next] stage qemu artifacts: scripts/build-qemu-x86_64-artifacts.sh"
-echo "[next] run smoke boot: scripts/qemu-x86_64-busybox-smoke.sh"
+echo "[next] run smoke boot (core markers): scripts/qemu-x86_64-busybox-smoke.sh"

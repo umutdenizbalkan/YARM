@@ -1,11 +1,11 @@
-# QEMU BusyBox Boot Runbook (x86_64 target-first, multi-ISA support)
+# QEMU Core-Marker Boot Runbook (x86_64 target-first, multi-ISA support)
 
-This runbook is **x86_64-first** for booting a kernel to an initramfs BusyBox prompt, while keeping secondary ISA scaffolding available.
+This runbook is **x86_64-first** for booting the kernel and validating serial success markers, while keeping secondary ISA scaffolding available.
 
 ## Prerequisites
 
 - Rust toolchain + `rustup`
-- host tools (x86_64 target path): `qemu-system-x86_64`, `cpio`, `busybox` (or `busybox-static`)
+- host tools (x86_64 target path): `qemu-system-x86_64`, `cpio`
 - optional secondary ISA path: `qemu-system-riscv64`
 - optional: `llvm-objcopy` or `rust-objcopy`
 
@@ -41,13 +41,12 @@ QEMU_SMOKE_STRICT=1 scripts/qemu-x86_64-busybox-smoke.sh
 - `YARM_PROC_VFS_OK`
 - `YARM_INIT_START`
 - `YARM_INIT_DONE`
-- `BusyBox` or `/ #`
 
 ## Override paths (x86_64)
 
 ```bash
 KERNEL_IMAGE=build-x86_64/yarm-x86_64.elf \
-INITRAMFS_IMAGE=build-x86_64/initramfs-busybox.cpio \
+INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio \
 scripts/qemu-x86_64-busybox-smoke.sh
 ```
 

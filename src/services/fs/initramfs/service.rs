@@ -3,7 +3,7 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, openat_message, read_message, write_message,
 };
 use crate::services::common::service::{FsService, run_typed_request_loop};
-use crate::services::fs::initramfs::archive::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
+use crate::services::fs::initramfs::archive::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 
 pub type InitramfsService = FsService<InitramfsBackend>;
 
@@ -19,7 +19,7 @@ pub fn run_request_loop(service: &mut InitramfsService) -> Result<InitramfsLoopS
         service,
         [openat_message(OpenAtRequest {
             dirfd: 0,
-            path_ptr: INITRAMFS_BUSYBOX_PATH_PTR,
+            path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
             flags: 0,
             mode: 0,
         })

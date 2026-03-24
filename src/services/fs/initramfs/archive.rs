@@ -1,6 +1,6 @@
 use crate::kernel::vfs::{VfsBackend, VfsError};
 
-pub const INITRAMFS_BUSYBOX_PATH_PTR: u64 = 0x494E_4954_4255_5359;
+pub const INITRAMFS_BOOT_MARKER_PATH_PTR: u64 = 0x494E_4954_424F_4F54;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitramfsBackend {
@@ -25,7 +25,7 @@ impl InitramfsBackend {
 
 impl VfsBackend for InitramfsBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        if path_ptr != INITRAMFS_BUSYBOX_PATH_PTR {
+        if path_ptr != INITRAMFS_BOOT_MARKER_PATH_PTR {
             return Err(VfsError::BadFd);
         }
         self.opened_fd = Some(10);
@@ -56,7 +56,7 @@ impl VfsBackend for InitramfsBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        if path_ptr == INITRAMFS_BUSYBOX_PATH_PTR {
+        if path_ptr == INITRAMFS_BOOT_MARKER_PATH_PTR {
             Ok(self.file_len)
         } else {
             Err(VfsError::BadFd)

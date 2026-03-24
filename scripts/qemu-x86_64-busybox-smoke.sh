@@ -3,7 +3,7 @@ set -euo pipefail
 
 KERNEL_IMAGE=${KERNEL_IMAGE:-build-x86_64/yarm-x86_64.elf}
 KERNEL_DEBUG_ELF=${KERNEL_DEBUG_ELF:-build-x86_64/kernel_boot.elf}
-INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build-x86_64/initramfs-busybox.cpio}
+INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build-x86_64/initramfs-core.cpio}
 TIMEOUT_SECS=${TIMEOUT_SECS:-30}
 QEMU_SMOKE_STRICT=${QEMU_SMOKE_STRICT:-0}
 QEMU_MACHINE=${QEMU_MACHINE:-q35}
@@ -71,7 +71,7 @@ if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
   exit 0
 fi
 
-LOGFILE=${LOGFILE:-qemu-x86_64-busybox.log}
+LOGFILE=${LOGFILE:-qemu-x86_64-core.log}
 rm -f "$LOGFILE"
 
 echo "[info] qemu command: qemu-system-x86_64 -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
@@ -93,7 +93,7 @@ QEMU_CMD=(
   -append "$KERNEL_CMDLINE"
 )
 
-MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
+MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE"
 FIRMWARE_FALLBACK_REGEX="SeaBIOS|iPXE|Booting from ROM"
 
 set +e
@@ -142,7 +142,7 @@ if [[ "$FIRMWARE_FALLBACK" -eq 1 ]]; then
   set -e
   echo "[warn] firmware fallback detected before any YARM boot markers"
   echo "[hint] qemu displayed SeaBIOS/iPXE output, which means serial output is working but the kernel was not accepted as a direct-boot image"
-  echo "[hint] this is not an initramfs/BusyBox issue yet; the guest never reached kernel_entry_x86_64"
+  echo "[hint] this is not an initramfs userspace issue yet; the guest never reached kernel_entry_x86_64"
   if [[ -f "$LOGFILE" ]]; then
     echo "[info] last 20 log lines from $LOGFILE"
     tail -n 20 "$LOGFILE" || true

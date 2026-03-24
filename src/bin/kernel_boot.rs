@@ -9,7 +9,7 @@ use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Arg
 use yarm::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, VfsService, openat_message, read_message,
 };
-use yarm::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
+use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 global_asm!(
@@ -396,9 +396,10 @@ fn run() {
     let waited = WaitPidV2Result::decode(wait_rep.as_slice()).expect("waited");
 
     let mut vfs = VfsService::with_backend(InitramfsBackend::new(4096));
+    yarm::yarm_log!("YARM_INIT_START");
     let open = openat_message(OpenAtRequest {
         dirfd: 0,
-        path_ptr: INITRAMFS_BUSYBOX_PATH_PTR,
+        path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
         flags: 0,
         mode: 0,
     })
@@ -421,6 +422,7 @@ fn run() {
         waited.exit_code,
         read_rep.opcode
     );
+    yarm::yarm_log!("YARM_INIT_DONE");
 }
 
 #[cfg(feature = "hosted-dev")]

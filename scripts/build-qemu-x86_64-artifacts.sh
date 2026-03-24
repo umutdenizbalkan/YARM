@@ -10,10 +10,9 @@ SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-x86-none}
 SERVER_ELF=${SERVER_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
 KERNEL_RAW_ELF=${KERNEL_RAW_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 KERNEL_BOOTABLE_IMAGE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-}
-INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-busybox.cpio}
+INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-x86_64.elf}
 KERNEL_DEBUG_ELF=${KERNEL_DEBUG_ELF:-$OUT_DIR/${KERNEL_BIN}.elf}
-BUSYBOX_BIN=${BUSYBOX_BIN:-}
 ARTIFACTS_STRICT=${ARTIFACTS_STRICT:-0}
 TOOLCHAIN=${TOOLCHAIN:-nightly}
 BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
@@ -75,7 +74,7 @@ explain_nonbootable_kernel_source() {
 }
 
 
-mkdir -p "$OUT_DIR" "$ROOTFS_DIR/bin" "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
+mkdir -p "$OUT_DIR" "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
 mkdir -p "$(dirname "$INITRAMFS_IMAGE")"
 INITRAMFS_IMAGE_ABS="$(cd "$(dirname "$INITRAMFS_IMAGE")" && pwd)/$(basename "$INITRAMFS_IMAGE")"
 
@@ -113,40 +112,19 @@ if [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
   cp "$KERNEL_RAW_ELF" "$KERNEL_DEBUG_ELF"
 fi
 
-if [[ -n "$BUSYBOX_BIN" && -x "$BUSYBOX_BIN" ]]; then
-  cp "$BUSYBOX_BIN" "$ROOTFS_DIR/bin/busybox"
-elif command -v busybox >/dev/null 2>&1; then
-  cp "$(command -v busybox)" "$ROOTFS_DIR/bin/busybox"
-else
-  echo "[warn] busybox not found; creating minimal /init fallback"
-  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
-fi
-
-if [[ -x "$ROOTFS_DIR/bin/busybox" ]]; then
-  chmod +x "$ROOTFS_DIR/bin/busybox"
-  for app in sh mount echo cat; do
-    ln -sf /bin/busybox "$ROOTFS_DIR/bin/$app"
-  done
-fi
-
 cat > "$ROOTFS_DIR/init" <<'SH'
 #!/bin/sh
 echo "YARM_INIT_START"
-mount -t proc none /proc 2>/dev/null || true
-mount -t sysfs none /sys 2>/dev/null || true
 if [ -x /sbin/init_server ]; then
   /sbin/init_server || true
 fi
 echo "YARM_INIT_DONE"
-if [ -x /bin/busybox ]; then
-  exec /bin/sh
-fi
-echo "BusyBox missing in initramfs"
-echo "/ # "
-exec sh
+while true; do
+  :
+done
 SH
 chmod +x "$ROOTFS_DIR/init"
-echo "[info] milestone 2 shell flow staged in initramfs (/init -> init_server -> /bin/sh); first blocker remains a bootable x86 kernel artifact"
+echo "[info] staged minimal initramfs marker flow (/init -> init_server) while primary x86 goal remains kernel serial markers"
 
 if command -v cpio >/dev/null 2>&1; then
   ( cd "$ROOTFS_DIR" && find . -print0 | cpio --null -ov --format=newc > "$INITRAMFS_IMAGE_ABS" ) >/dev/null
