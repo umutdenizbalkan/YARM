@@ -21,6 +21,7 @@ macro_rules! yarm_log {
         #[cfg(not(feature = "hosted-dev"))]
         {
             $crate::pr_info!($($arg)*);
+            let _ = $crate::kernel::printk::printk_flush();
         }
     }};
 }
