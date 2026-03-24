@@ -91,20 +91,10 @@ long_mode_entry:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    call yarm_kernel_main_x86_64
+    .weak yarm_kernel_main
+    call yarm_kernel_main
 1:
     hlt
     jmp 1b
     "#
 );
-
-#[cfg(not(feature = "hosted-dev"))]
-unsafe extern "C" {
-    fn yarm_kernel_main() -> !;
-}
-
-#[cfg(not(feature = "hosted-dev"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn yarm_kernel_main_x86_64(_pvh_start_info: usize) -> ! {
-    unsafe { yarm_kernel_main() }
-}

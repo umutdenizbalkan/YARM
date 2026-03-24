@@ -17,20 +17,10 @@ _start:
     adrp x0, boot_stack_aarch64_end
     add x0, x0, :lo12:boot_stack_aarch64_end
     mov sp, x0
-    bl yarm_kernel_main_aarch64
+    .weak yarm_kernel_main
+    bl yarm_kernel_main
 1:
     wfe
     b 1b
     "#
 );
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-unsafe extern "C" {
-    fn yarm_kernel_main() -> !;
-}
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn yarm_kernel_main_aarch64() -> ! {
-    unsafe { yarm_kernel_main() }
-}
