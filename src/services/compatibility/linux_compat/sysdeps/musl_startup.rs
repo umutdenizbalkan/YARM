@@ -85,6 +85,16 @@ pub struct MuslStartupOutcome {
     pub main_return: i32,
 }
 
+pub type MuslMainFn = extern "C" fn(i32, *const *const u8, *const *const u8) -> i32;
+pub type MuslHookFn = extern "C" fn();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuslCrtStartup {
+    pub argc: i32,
+    pub argv: *const *const u8,
+    pub envp: *const *const u8,
+}
+
 pub const MUSL_TLS_ALIGN: usize = 16;
 pub const MUSL_STACK_ALIGN: usize = 16;
 
@@ -311,11 +321,72 @@ pub fn run_musl_startup(
     })
 }
 
+pub fn prepare_musl_crt_startup(
+    stack_top: usize,
+    words: &[usize],
+) -> Result<MuslCrtStartup, LinuxErrno> {
+    let frame = prepare_musl_startup(stack_top, words)?;
+    let argc = i32::try_from(frame.info.argc).map_err(|_| LinuxErrno::Inval)?;
+    let argv = frame.info.argv_ptr as *const *const u8;
+    let envp = frame.info.envp_ptr as *const *const u8;
+    Ok(MuslCrtStartup { argc, argv, envp })
+}
+
+pub fn run_musl_crt_startup(
+    stack_top: usize,
+    words: &[usize],
+    main: MuslMainFn,
+    init: Option<MuslHookFn>,
+    fini: Option<MuslHookFn>,
+    rtld_fini: Option<MuslHookFn>,
+) -> Result<i32, LinuxErrno> {
+    let crt = prepare_musl_crt_startup(stack_top, words)?;
+    let code = musl_libc_start_main(main, crt.argc, crt.argv, crt.envp, init, fini, rtld_fini);
+    i32::try_from(code).map_err(|_| LinuxErrno::Inval)
+}
+
+pub extern "C" fn musl_libc_start_main(
+    main: MuslMainFn,
+    argc: i32,
+    argv: *const *const u8,
+    envp: *const *const u8,
+    init: Option<MuslHookFn>,
+    fini: Option<MuslHookFn>,
+    rtld_fini: Option<MuslHookFn>,
+) -> isize {
+    if let Some(init_fn) = init {
+        init_fn();
+    }
+    let code = main(argc, argv, envp);
+    if let Some(fini_fn) = fini {
+        fini_fn();
+    }
+    if let Some(rtld_fini_fn) = rtld_fini {
+        rtld_fini_fn();
+    }
+    code as isize
+}
+
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+#[unsafe(no_mangle)]
+pub extern "C" fn __libc_start_main(
+    main: MuslMainFn,
+    argc: i32,
+    argv: *const *const u8,
+    envp: *const *const u8,
+    init: Option<MuslHookFn>,
+    fini: Option<MuslHookFn>,
+    rtld_fini: Option<MuslHookFn>,
+) -> isize {
+    musl_libc_start_main(main, argc, argv, envp, init, fini, rtld_fini)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::task::TaskClass;
+    use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
     #[test]
     fn memory_syscall_numbers_match_linux_compat_contract() {
@@ -391,6 +462,97 @@ mod tests {
         assert_eq!(outcome.envc, 1);
         assert_eq!(outcome.auxc, 0);
         assert_eq!(outcome.main_return, 2);
+    }
+
+    static CALL_ORDER: [AtomicU8; 4] = [
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+    ];
+    static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static OBSERVED_ARGC: AtomicI32 = AtomicI32::new(0);
+    static OBSERVED_ARGV: AtomicUsize = AtomicUsize::new(0);
+    static OBSERVED_ENVP: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn crt_init_marker() {
+        let idx = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        CALL_ORDER[idx].store(b'i', Ordering::SeqCst);
+    }
+
+    extern "C" fn crt_main_marker(argc: i32, argv: *const *const u8, envp: *const *const u8) -> i32 {
+        let idx = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        CALL_ORDER[idx].store(b'm', Ordering::SeqCst);
+        OBSERVED_ARGC.store(argc, Ordering::SeqCst);
+        OBSERVED_ARGV.store(argv as usize, Ordering::SeqCst);
+        OBSERVED_ENVP.store(envp as usize, Ordering::SeqCst);
+        17
+    }
+
+    extern "C" fn crt_fini_marker() {
+        let idx = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        CALL_ORDER[idx].store(b'f', Ordering::SeqCst);
+    }
+
+    extern "C" fn crt_rtld_fini_marker() {
+        let idx = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+        CALL_ORDER[idx].store(b'r', Ordering::SeqCst);
+    }
+
+    #[test]
+    fn libc_start_main_runs_hooks_and_main_in_expected_order() {
+        for slot in &CALL_ORDER {
+            slot.store(0, Ordering::SeqCst);
+        }
+        CALL_COUNT.store(0, Ordering::SeqCst);
+        OBSERVED_ARGC.store(0, Ordering::SeqCst);
+        OBSERVED_ARGV.store(0, Ordering::SeqCst);
+        OBSERVED_ENVP.store(0, Ordering::SeqCst);
+
+        let argv = 0x1111usize as *const *const u8;
+        let envp = 0x2222usize as *const *const u8;
+        let rc = musl_libc_start_main(
+            crt_main_marker,
+            3,
+            argv,
+            envp,
+            Some(crt_init_marker),
+            Some(crt_fini_marker),
+            Some(crt_rtld_fini_marker),
+        );
+        assert_eq!(rc, 17);
+
+        assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 4);
+        assert_eq!(CALL_ORDER[0].load(Ordering::SeqCst), b'i');
+        assert_eq!(CALL_ORDER[1].load(Ordering::SeqCst), b'm');
+        assert_eq!(CALL_ORDER[2].load(Ordering::SeqCst), b'f');
+        assert_eq!(CALL_ORDER[3].load(Ordering::SeqCst), b'r');
+        assert_eq!(OBSERVED_ARGC.load(Ordering::SeqCst), 3);
+        assert_eq!(OBSERVED_ARGV.load(Ordering::SeqCst), 0x1111);
+        assert_eq!(OBSERVED_ENVP.load(Ordering::SeqCst), 0x2222);
+    }
+
+    #[test]
+    fn run_musl_crt_startup_bridges_stack_parser_to_libc_start_main() {
+        for slot in &CALL_ORDER {
+            slot.store(0, Ordering::SeqCst);
+        }
+        CALL_COUNT.store(0, Ordering::SeqCst);
+        let words = [1, 0x1110, 0, 0x3330, 0, AUXV_AT_NULL, 0];
+        let rc = run_musl_crt_startup(
+            0x8000,
+            &words,
+            crt_main_marker,
+            Some(crt_init_marker),
+            Some(crt_fini_marker),
+            None,
+        )
+        .expect("crt startup");
+        assert_eq!(rc, 17);
+        assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 3);
+        assert_eq!(CALL_ORDER[0].load(Ordering::SeqCst), b'i');
+        assert_eq!(CALL_ORDER[1].load(Ordering::SeqCst), b'm');
+        assert_eq!(CALL_ORDER[2].load(Ordering::SeqCst), b'f');
     }
 
     #[test]
