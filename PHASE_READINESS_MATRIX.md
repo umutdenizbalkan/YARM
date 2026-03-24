@@ -2,6 +2,15 @@
 
 This matrix maps roadmap phase completion to required contracts, CI jobs, and deterministic tests.
 
+## Phase 1 — File System Servers (basic set)
+
+- Contract docs:
+  - `STORAGE_SERVICE_CONTRACT.md`
+- Required deterministic tests/checks:
+  - `services::fs::devfs::service::tests::devfs_protocol_vectors_match_frozen_vfs_codec`
+  - `services::fs::devfs::service::tests::devfs_mount_gate_routes_devfs_and_initramfs_with_policy_denial`
+  - `services::fs::devfs::service::tests::devfs_lifecycle_gate_covers_mount_failure_recovery_and_fd_close`
+
 ## Phase 2 — Device Driver Servers
 
 - Contract docs:

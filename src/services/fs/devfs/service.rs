@@ -78,6 +78,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::vfs::{
+        CloseRequest, MountNamespacePolicy, MountRouter, StatxRequest, VfsService, close_message,
+        openat_message, statx_message, write_message,
+    };
+    use crate::kernel::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_STATX, VFS_OP_WRITE};
+    use crate::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 
     #[test]
     fn devfs_service_supports_console_and_null() {
@@ -86,5 +92,150 @@ mod tests {
         assert_eq!(summary.console_fd, 3);
         assert_eq!(summary.null_fd, 4);
         assert_eq!(summary.handled, 4);
+    }
+
+    #[test]
+    fn devfs_protocol_vectors_match_frozen_vfs_codec() {
+        let open_console = openat_message(OpenAtRequest {
+            dirfd: 0,
+            path_ptr: DEV_CONSOLE_PATH_PTR,
+            flags: 0,
+            mode: 0,
+        })
+        .expect("open console");
+        assert_eq!(open_console.opcode, VFS_OP_OPENAT);
+        assert_eq!(
+            open_console.as_slice(),
+            &OpenAtArgs::new(0, DEV_CONSOLE_PATH_PTR, 0, 0).encode()
+        );
+
+        let write_console = write_message(ReadWriteRequest {
+            fd: 3,
+            buf_ptr: 0,
+            len: 12,
+        })
+        .expect("write");
+        assert_eq!(write_console.opcode, VFS_OP_WRITE);
+        assert_eq!(
+            write_console.as_slice(),
+            &ReadWriteArgs::new(3, 0, 12).encode()
+        );
+
+        let stat_null = statx_message(StatxRequest {
+            dirfd: 0,
+            path_ptr: DEV_NULL_PATH_PTR,
+            flags: 0,
+            mask_or_buf: 0,
+        })
+        .expect("stat");
+        assert_eq!(stat_null.opcode, VFS_OP_STATX);
+        assert_eq!(
+            stat_null.as_slice(),
+            &StatxArgs::new(0, DEV_NULL_PATH_PTR, 0, 0).encode()
+        );
+    }
+
+    #[test]
+    fn devfs_mount_gate_routes_devfs_and_initramfs_with_policy_denial() {
+        let router = MountRouter::new(
+            0x4800_0000_0000_0000,
+            DevFsBackend::default(),
+            InitramfsBackend::new(4096),
+        );
+        let mut svc = VfsService::with_backend(router);
+        svc.mount(DEV_CONSOLE_PATH_PTR, 1).expect("mount devfs");
+        svc.mount(INITRAMFS_BOOT_MARKER_PATH_PTR, 2)
+            .expect("mount initramfs");
+        svc.set_policy(
+            MountNamespacePolicy::deny_all()
+                .with_range(DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR)
+                .with_range(INITRAMFS_BOOT_MARKER_PATH_PTR, INITRAMFS_BOOT_MARKER_PATH_PTR),
+        );
+
+        let open_dev = svc
+            .handle_request(
+                openat_message(OpenAtRequest {
+                    dirfd: 0,
+                    path_ptr: DEV_CONSOLE_PATH_PTR,
+                    flags: 0,
+                    mode: 0,
+                })
+                .expect("open dev"),
+            )
+            .expect("dev open reply");
+        assert_eq!(open_dev.opcode, VFS_OP_OPENAT);
+
+        let open_initramfs = svc
+            .handle_request(
+                openat_message(OpenAtRequest {
+                    dirfd: 0,
+                    path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
+                    flags: 0,
+                    mode: 0,
+                })
+                .expect("open initramfs"),
+            )
+            .expect("initramfs open reply");
+        assert_eq!(open_initramfs.opcode, VFS_OP_OPENAT);
+
+        let denied = svc.handle_request(
+            openat_message(OpenAtRequest {
+                dirfd: 0,
+                path_ptr: 0xDEAD,
+                flags: 0,
+                mode: 0,
+            })
+            .expect("denied request"),
+        );
+        assert_eq!(denied, Err(VfsError::PermissionDenied));
+    }
+
+    #[test]
+    fn devfs_lifecycle_gate_covers_mount_failure_recovery_and_fd_close() {
+        let mut svc = VfsService::with_backend(DevFsBackend::default());
+        svc.mount(DEV_CONSOLE_PATH_PTR, 1).expect("mount");
+        svc.mark_mount_failed(DEV_CONSOLE_PATH_PTR)
+            .expect("mark failed");
+        let failed = svc.mount_record(DEV_CONSOLE_PATH_PTR).expect("failed mount");
+        assert!(failed.failed);
+        assert!(!failed.active);
+
+        svc.recover_mount(DEV_CONSOLE_PATH_PTR).expect("recover");
+        let recovered = svc.mount_record(DEV_CONSOLE_PATH_PTR).expect("recovered");
+        assert!(!recovered.failed);
+        assert!(recovered.active);
+
+        let open_console = svc
+            .handle_request(
+                openat_message(OpenAtRequest {
+                    dirfd: 0,
+                    path_ptr: DEV_CONSOLE_PATH_PTR,
+                    flags: 0,
+                    mode: 0,
+                })
+                .expect("open"),
+            )
+            .expect("open reply");
+        let mut fd_bytes = [0u8; 8];
+        fd_bytes.copy_from_slice(open_console.as_slice());
+        let console_fd = u64::from_le_bytes(fd_bytes);
+        assert_eq!(console_fd, 3);
+
+        let _ = svc
+            .handle_request(close_message(CloseRequest { fd: console_fd }).expect("close req"))
+            .expect("close");
+
+        let write_after_close = svc.handle_request(
+            write_message(ReadWriteRequest {
+                fd: console_fd,
+                buf_ptr: 0,
+                len: 4,
+            })
+            .expect("write"),
+        );
+        assert_eq!(write_after_close, Err(VfsError::BadFd));
+
+        svc.unmount(DEV_CONSOLE_PATH_PTR).expect("unmount");
+        assert_eq!(svc.active_mounts(), 0);
     }
 }

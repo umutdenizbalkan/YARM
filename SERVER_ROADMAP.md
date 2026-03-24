@@ -91,6 +91,9 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - ✅ `ramfs.srv` scaffold implemented (`services/fs/ramfs/*` + thin `src/bin/ramfs_srv.rs` entrypoint).
 - ✅ `initramfs.srv` scaffold implemented (`services/fs/initramfs/*` + thin `src/bin/initramfs_srv.rs` entrypoint).
 - ✅ `devfs.srv` scaffold implemented (`services/fs/devfs/*` + thin `src/bin/devfs_srv.rs` entrypoint (console/null nodes)).
+  - ✅ protocol gate hardened with frozen-codec vector assertions (`services::fs::devfs::service::tests::devfs_protocol_vectors_match_frozen_vfs_codec`).
+  - ✅ mount gate hardened with mixed devfs/initramfs routing plus path-policy denial assertions (`services::fs::devfs::service::tests::devfs_mount_gate_routes_devfs_and_initramfs_with_policy_denial`).
+  - ✅ lifecycle gate hardened with mount failure/recovery and fd close/reject assertions (`services::fs::devfs::service::tests::devfs_lifecycle_gate_covers_mount_failure_recovery_and_fd_close`).
 - ✅ `ext4.srv` scaffold implemented (`services/fs/ext4/*` + thin `src/bin/ext4_srv.rs` entrypoint).
 
 - 🚧 `fat.srv` scaffold started (`services/fs/fat/*` + thin `src/bin/fat_srv.rs` entrypoint).
