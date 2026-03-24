@@ -25,3 +25,4 @@ This contract defines minimal invariants for networking services (`netmgr`, `tcp
 - `services::network::dhcp::service::tests::dhcp_lease_accounting_is_deterministic`
 - `services::network::socket::service::tests::socket_adapter_roundtrip_is_accounted`
 - `services::network::sim::tests::deterministic_network_bootstrap_flow_is_stable`
+- `services::network::sim::tests::link_flap_dhcp_rebind_and_socket_recovery_is_deterministic`
