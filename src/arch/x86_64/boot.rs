@@ -114,19 +114,21 @@ uart_putc32:
 _start:
 long_mode_entry:
     cli
-    mov dil, 'E'
-    call uart_putc64
     lea rsp, [rip + boot_stack_end]
     xor rbp, rbp
-    mov edi, esi
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov ss, ax
+    mov dil, 'E'
+    call uart_putc64
+    mov edi, esi
     mov dil, 'F'
     call uart_putc64
     .weak yarm_kernel_main
     call yarm_kernel_main
+    mov dil, 'G'
+    call uart_putc64
 1:
     hlt
     jmp 1b
