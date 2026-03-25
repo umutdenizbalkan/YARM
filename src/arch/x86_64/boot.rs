@@ -61,8 +61,12 @@ pvh_start32:
     cli
     mov esi, ebx
     mov esp, offset boot_stack_end
+    mov bl, 'A'
+    call uart_putc32
     mov eax, offset boot_pml4
     mov cr3, eax
+    mov bl, 'B'
+    call uart_putc32
     mov eax, cr4
     or eax, 0x20
     mov cr4, eax
@@ -70,14 +74,37 @@ pvh_start32:
     rdmsr
     or eax, 0x100
     wrmsr
+    mov bl, 'C'
+    call uart_putc32
     lgdt [gdt64_ptr]
     mov eax, cr0
     or eax, 0x80000001
     mov cr0, eax
+    mov bl, 'D'
+    call uart_putc32
     push 0x08
     mov eax, offset long_mode_entry
     push eax
     retf
+
+uart_wait32:
+    mov dx, 0x3FD
+2:
+    in al, dx
+    test al, 0x20
+    jz 2b
+    ret
+
+uart_putc32:
+    push eax
+    push edx
+    call uart_wait32
+    mov dx, 0x3F8
+    mov al, bl
+    out dx, al
+    pop edx
+    pop eax
+    ret
 
     .section .text.boot,"ax",@progbits
     .code64
@@ -87,6 +114,8 @@ pvh_start32:
 _start:
 long_mode_entry:
     cli
+    mov dil, 'E'
+    call uart_putc64
     lea rsp, [rip + boot_stack_end]
     xor rbp, rbp
     mov edi, esi
@@ -94,11 +123,32 @@ long_mode_entry:
     mov ds, ax
     mov es, ax
     mov ss, ax
+    mov dil, 'F'
+    call uart_putc64
     .weak yarm_kernel_main
     call yarm_kernel_main
 1:
     hlt
     jmp 1b
+
+uart_wait64:
+    mov dx, 0x3FD
+3:
+    in al, dx
+    test al, 0x20
+    jz 3b
+    ret
+
+uart_putc64:
+    push rax
+    push rdx
+    call uart_wait64
+    mov dx, 0x3F8
+    mov al, dil
+    out dx, al
+    pop rdx
+    pop rax
+    ret
     .att_syntax prefix
     "#
 );

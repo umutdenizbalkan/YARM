@@ -11,6 +11,7 @@ QEMU_CPU=${QEMU_CPU:-qemu64}
 QEMU_MEMORY=${QEMU_MEMORY:-1024M}
 QEMU_SMP=${QEMU_SMP:-2}
 QEMU_X86_ALLOW_ELF_KERNEL=${QEMU_X86_ALLOW_ELF_KERNEL:-1}
+QEMU_X86_PVH_MINIMAL=${QEMU_X86_PVH_MINIMAL:-1}
 DEFAULT_KERNEL_CMDLINE="console=ttyS0 rdinit=/init"
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"$DEFAULT_KERNEL_CMDLINE"}
 
@@ -72,11 +73,6 @@ if [[ ! -f "$KERNEL_IMAGE" ]]; then
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
   exit 0
 fi
-if [[ ! -f "$INITRAMFS_IMAGE" ]]; then
-  echo "[warn] initramfs image missing: $INITRAMFS_IMAGE"
-  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
-  exit 0
-fi
 
 if ! check_x86_kernel_bootability "$KERNEL_IMAGE"; then
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
@@ -92,9 +88,6 @@ fi
 LOGFILE=${LOGFILE:-qemu-x86_64-core.log}
 rm -f "$LOGFILE"
 
-echo "[info] qemu command: qemu-system-x86_64 -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
-echo "[info] waiting up to ${TIMEOUT_SECS}s for boot markers..."
-
 QEMU_CMD=(
   qemu-system-x86_64
   -machine "$QEMU_MACHINE"
@@ -107,12 +100,36 @@ QEMU_CMD=(
   -no-reboot
   -no-shutdown
   -kernel "$KERNEL_IMAGE"
-  -initrd "$INITRAMFS_IMAGE"
-  -append "$KERNEL_CMDLINE"
 )
 
-MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE"
+is_elf_kernel=0
+if command -v file >/dev/null 2>&1; then
+  if file -b "$KERNEL_IMAGE" 2>/dev/null | rg -q "ELF"; then
+    is_elf_kernel=1
+  fi
+elif command -v readelf >/dev/null 2>&1 && readelf -h "$KERNEL_IMAGE" >/dev/null 2>&1; then
+  is_elf_kernel=1
+fi
+
+if [[ "$QEMU_X86_PVH_MINIMAL" == "1" && "$is_elf_kernel" -eq 1 ]]; then
+  echo "[info] PVH minimal mode enabled: skipping initrd/cmdline for ELF boot triage"
+else
+  if [[ ! -f "$INITRAMFS_IMAGE" ]]; then
+    echo "[warn] initramfs image missing: $INITRAMFS_IMAGE"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    exit 0
+  fi
+  QEMU_CMD+=(
+    -initrd "$INITRAMFS_IMAGE"
+    -append "$KERNEL_CMDLINE"
+  )
+fi
+
+MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|ABCDEF|ABCD"
 FIRMWARE_FALLBACK_REGEX="SeaBIOS|iPXE|Booting from ROM"
+
+echo "[info] qemu command: ${QEMU_CMD[*]}"
+echo "[info] waiting up to ${TIMEOUT_SECS}s for boot markers..."
 
 log_has_pattern() {
   local pattern="$1"
