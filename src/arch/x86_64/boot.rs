@@ -34,8 +34,10 @@ boot_pdpt:
     .align 4096
 boot_pd:
     .set page_flags, 0x83
+    .set page_index, 0
     .rept 256
-    .quad (. - boot_pd) + page_flags
+    .quad (page_index * 0x200000) | page_flags
+    .set page_index, page_index + 1
     .endr
     .zero 2048
 
