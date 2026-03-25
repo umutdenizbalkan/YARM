@@ -14,5 +14,10 @@
   "relocation-model": "static",
   "code-model": "kernel",
   "linker-flavor": "gnu-lld",
-  "linker": "rust-lld"
+  "linker": "rust-lld",
+  "pre-link-args": {
+    "gnu-lld": [
+      "-Ttargets/x86_64-yarm-none.ld"
+    ]
+  }
 }

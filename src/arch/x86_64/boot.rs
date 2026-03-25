@@ -4,6 +4,7 @@ use core::arch::global_asm;
 #[cfg(not(feature = "hosted-dev"))]
 global_asm!(
     r#"
+    .intel_syntax noprefix
     .section .note.Xen,"a",@note
     .align 4
     .long 4
@@ -96,5 +97,6 @@ long_mode_entry:
 1:
     hlt
     jmp 1b
+    .att_syntax prefix
     "#
 );

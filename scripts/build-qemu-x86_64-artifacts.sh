@@ -45,6 +45,9 @@ is_qemu_direct_bootable_x86_kernel() {
   if ! command -v readelf >/dev/null 2>&1; then
     return 1
   fi
+  if ! readelf -l "$kernel" 2>/dev/null | rg -q "NOTE"; then
+    return 1
+  fi
   if readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
     return 0
   fi

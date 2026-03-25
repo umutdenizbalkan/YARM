@@ -44,6 +44,10 @@ check_x86_kernel_bootability() {
     return 1
   fi
   if command -v readelf >/dev/null 2>&1; then
+    if ! readelf -l "$kernel" 2>/dev/null | rg -q "NOTE"; then
+      echo "[warn] ELF kernel lacks a PT_NOTE program header; PVH entry note will be ignored by qemu"
+      return 1
+    fi
     if readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
       return 0
     fi
