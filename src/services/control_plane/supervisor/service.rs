@@ -623,12 +623,12 @@ mod tests {
     use crate::services::init::{CoreServiceGraph, CoreServiceImagePlan, InitService};
 
     fn setup_supervisor() -> (
-        KernelState,
+        crate::std::boxed::Box<KernelState>,
         InitService,
         InitFaultHandoff,
         SupervisorService,
     ) {
-        let mut kernel = Bootstrap::init().expect("init");
+        let mut kernel = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
