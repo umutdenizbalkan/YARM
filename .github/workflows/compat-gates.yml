@@ -43,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: phase2 delegation + fault deterministic gates
+      - name: phase2 delegation + fault + transfer-cap ABI deterministic gates
         run: scripts/phase2-driver-gates.sh
 
 
