@@ -585,6 +585,24 @@ mod tests {
     }
 
     #[test]
+    fn transfer_envelope_handles_are_single_use_and_replay_safe() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let payload = state.cspace.get(mem_cap).expect("payload");
+
+        let first = state.stash_transfer_envelope(payload).expect("stash first");
+        assert!(state.take_transfer_envelope(first).is_some());
+        assert!(state.take_transfer_envelope(first).is_none());
+
+        let second = state
+            .stash_transfer_envelope(payload)
+            .expect("stash second");
+        assert_ne!(first, second);
+        assert!(state.take_transfer_envelope(first).is_none());
+        assert!(state.take_transfer_envelope(second).is_some());
+    }
+
+    #[test]
     fn spawn_user_task_from_image_registers_asid_and_class() {
         let mut state = Bootstrap::init().expect("init");
         let spawned = state

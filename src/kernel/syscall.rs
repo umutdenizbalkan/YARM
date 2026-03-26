@@ -203,6 +203,23 @@ fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), Syscall
     Ok(())
 }
 
+fn stash_transfer_handle(
+    kernel: &mut KernelState,
+    transfer_cap: Option<CapId>,
+) -> Result<Option<u64>, SyscallError> {
+    let Some(source_cap_id) = transfer_cap else {
+        return Ok(None);
+    };
+    let source_cap = kernel
+        .current_task_capability(source_cap_id)
+        .ok_or(SyscallError::InvalidCapability)?;
+    Ok(Some(
+        kernel
+            .stash_transfer_envelope(source_cap)
+            .ok_or(SyscallError::QueueFull)?,
+    ))
+}
+
 fn inline_payload_from_frame(
     frame: &TrapFrame,
     len: usize,
@@ -229,22 +246,9 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     if let Some(c) = transfer_cap {
         validate_transfer_cap(kernel, c)?;
     }
-    let transfer_handle = if let Some(source_cap_id) = transfer_cap {
-        let source_cap = kernel
-            .current_task_capability(source_cap_id)
-            .ok_or(SyscallError::InvalidCapability)?;
-        Some(
-            kernel
-                .stash_transfer_envelope(source_cap)
-                .ok_or(SyscallError::QueueFull)?,
-        )
-    } else {
-        None
-    };
-
     let sender_tid = current_tid(kernel)?;
 
-    let msg = if current_task_has_user_asid(kernel)? {
+    let msg_result = if current_task_has_user_asid(kernel)? {
         if len > Message::MAX_PAYLOAD {
             let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
             let grant = kernel
@@ -259,6 +263,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
             };
+            let transfer_handle = stash_transfer_handle(kernel, transfer_cap)?;
             Message::with_header(
                 sender_tid,
                 OPCODE_SHARED_MEM,
@@ -266,7 +271,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 transfer_handle,
                 &region.encode(),
             )
-            .map_err(|_| SyscallError::InvalidArgs)?
+            .map_err(|_| SyscallError::InvalidArgs)
         } else {
             let payload = match kernel.copy_from_current_user(user_ptr_or_offset, len) {
                 Ok(payload) => payload,
@@ -277,6 +282,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 Err(other) => return Err(SyscallError::from(other)),
             };
 
+            let transfer_handle = stash_transfer_handle(kernel, transfer_cap)?;
             Message::with_header(
                 sender_tid,
                 OPCODE_INLINE,
@@ -284,10 +290,11 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 transfer_handle,
                 &payload[..len],
             )
-            .map_err(|_| SyscallError::InvalidArgs)?
+            .map_err(|_| SyscallError::InvalidArgs)
         }
     } else {
         let payload = inline_payload_from_frame(frame, len)?;
+        let transfer_handle = stash_transfer_handle(kernel, transfer_cap)?;
         Message::with_header(
             sender_tid,
             OPCODE_INLINE,
@@ -295,10 +302,19 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             transfer_handle,
             &payload[..len],
         )
-        .map_err(|_| SyscallError::InvalidArgs)?
+        .map_err(|_| SyscallError::InvalidArgs)
+    };
+    let msg = match msg_result {
+        Ok(msg) => msg,
+        Err(err) => return Err(err),
     };
 
-    kernel.ipc_send(cap, msg).map_err(SyscallError::from)?;
+    if let Err(err) = kernel.ipc_send(cap, msg) {
+        if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
+            let _ = kernel.take_transfer_envelope(handle);
+        }
+        return Err(SyscallError::from(err));
+    }
     frame.set_ok(0, 0, 0);
     encode_transfer_cap_ret(frame, None)?;
     Ok(())
@@ -448,5 +464,30 @@ mod tests {
             .get(recv_local)
             .expect("receiver-local transferred cap");
         assert!(matches!(mapped.object, CapObject::MemoryObject { .. }));
+    }
+
+    #[test]
+    fn failed_send_does_not_leak_transfer_envelopes() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(crate::kernel::vm::PhysAddr(0x9000))
+            .expect("mem");
+
+        for _ in 0..256 {
+            let mut send_frame = TrapFrame::new(
+                Syscall::IpcSend as usize,
+                [
+                    send_cap.0 as usize,
+                    0,
+                    Message::MAX_PAYLOAD + 1,
+                    0,
+                    0,
+                    mem_cap.0 as usize,
+                ],
+            );
+            let err = dispatch(&mut state, &mut send_frame).expect_err("invalid inline send");
+            assert_eq!(err, SyscallError::InvalidArgs);
+        }
     }
 }
