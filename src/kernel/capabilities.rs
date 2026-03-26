@@ -3,6 +3,9 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CapId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CNodeId(pub u16);
+
 impl CapId {
     const INDEX_BITS: u64 = 16;
     const INDEX_MASK: u64 = (1 << Self::INDEX_BITS) - 1;
@@ -141,7 +144,7 @@ impl fmt::Display for CapabilityDeriveError {
     }
 }
 
-const MAX_CAPABILITIES: usize = 128;
+pub const MAX_CAPABILITIES_PER_CSPACE: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapEntry {
@@ -157,7 +160,7 @@ struct CapSlot {
 
 #[derive(Debug)]
 pub struct CapabilitySpace {
-    slots: [CapSlot; MAX_CAPABILITIES],
+    slots: [CapSlot; MAX_CAPABILITIES_PER_CSPACE],
 }
 
 impl Default for CapabilitySpace {
@@ -168,7 +171,7 @@ impl Default for CapabilitySpace {
                     generation: 1,
                     entry: None,
                 }
-            }; MAX_CAPABILITIES],
+            }; MAX_CAPABILITIES_PER_CSPACE],
         }
     }
 }
@@ -183,7 +186,7 @@ impl CapabilitySpace {
         capability: Capability,
         parent: Option<CapId>,
     ) -> Result<CapId, CapabilityDeriveError> {
-        for index in 0..MAX_CAPABILITIES {
+        for index in 0..MAX_CAPABILITIES_PER_CSPACE {
             let slot = &mut self.slots[index];
             if slot.entry.is_none() {
                 let id = CapId::new(index, slot.generation);
@@ -211,18 +214,18 @@ impl CapabilitySpace {
             return Err(CapabilityDeriveError::NotFound);
         }
 
-        let mut marked = [false; MAX_CAPABILITIES];
+        let mut marked = [false; MAX_CAPABILITIES_PER_CSPACE];
         marked[id.index()] = true;
 
         loop {
             let mut changed = false;
-            for idx in 0..MAX_CAPABILITIES {
+            for idx in 0..MAX_CAPABILITIES_PER_CSPACE {
                 if marked[idx] {
                     continue;
                 }
                 if let Some(entry) = self.slots[idx].entry
                     && let Some(parent) = entry.parent
-                    && parent.index() < MAX_CAPABILITIES
+                    && parent.index() < MAX_CAPABILITIES_PER_CSPACE
                     && marked[parent.index()]
                     && self.slots[parent.index()].generation == parent.generation()
                 {
@@ -252,7 +255,7 @@ impl CapabilitySpace {
 
     pub fn get(&self, id: CapId) -> Option<Capability> {
         let index = id.index();
-        if index >= MAX_CAPABILITIES {
+        if index >= MAX_CAPABILITIES_PER_CSPACE {
             return None;
         }
         let slot = self.slots[index];
@@ -359,7 +362,7 @@ mod tests {
     #[test]
     fn mint_fails_when_space_full_and_returns_capability() {
         let mut cspace = CapabilitySpace::default();
-        for _ in 0..MAX_CAPABILITIES {
+        for _ in 0..MAX_CAPABILITIES_PER_CSPACE {
             let _ = cspace
                 .mint(Capability::new(CapObject::Kernel, CapRights::READ))
                 .expect("room");

@@ -1,4 +1,4 @@
-use super::capabilities::CapId;
+use super::capabilities::{CNodeId, CapId};
 use super::ipc::ThreadId;
 use super::vm::{Asid, VirtAddr};
 
@@ -81,6 +81,7 @@ pub struct RestartState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadControlBlock {
     pub tid: ThreadId,
+    pub cnode: CNodeId,
     pub thread_group_id: ThreadGroupId,
     pub class: TaskClass,
     pub status: TaskStatus,
@@ -99,6 +100,7 @@ impl ThreadControlBlock {
     pub fn new(tid: ThreadId, class: TaskClass, asid: Option<Asid>) -> Self {
         Self {
             tid,
+            cnode: CNodeId(tid.0 as u16),
             thread_group_id: ThreadGroupId(tid.0),
             class,
             status: TaskStatus::Runnable,
@@ -148,6 +150,7 @@ mod tests {
         };
 
         assert_eq!(tcb.tid, ThreadId(7));
+        assert_eq!(tcb.cnode, CNodeId(7));
         assert_eq!(tcb.restart.token, Some(RestartToken(9)));
         assert_eq!(tcb.thread_group_id, ThreadGroupId(7));
         assert_eq!(tcb.tls_ptr, Some(VirtAddr(0xDEAD_BEEF)));

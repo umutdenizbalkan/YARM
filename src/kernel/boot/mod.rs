@@ -243,7 +243,7 @@ struct RestartSubsystem {
 pub struct KernelState {
     pub kernel_aspace: AddressSpace,
     pub scheduler: KernelStorage<SmpScheduler>,
-    pub cspace: CapabilitySpace,
+    pub cspace: KernelStorage<CapabilitySpace>,
     pub timer: Timer,
     pub user_spaces: AddressSpaceManager,
     current_cpu: CpuId,
@@ -312,7 +312,7 @@ impl Bootstrap {
         let mut state = KernelState {
             kernel_aspace,
             scheduler: store_kernel_value(scheduler),
-            cspace,
+            cspace: store_kernel_value(cspace),
             timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: AddressSpaceManager::default(),
             current_cpu: CpuId(platform_layout::BOOTSTRAP_CPU_ID),
