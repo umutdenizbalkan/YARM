@@ -545,4 +545,41 @@ mod tests {
         let err = dispatch(&mut state, &mut recv_frame).expect_err("endpoint mismatch");
         assert_eq!(err, SyscallError::InvalidCapability);
     }
+
+    #[test]
+    fn transfer_envelope_waiter_binding_rejects_wrong_receiver_task() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (_e, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(crate::kernel::vm::PhysAddr(0xB000))
+            .expect("mem");
+
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        assert_eq!(state.ipc_recv(recv_cap).expect("block recv"), None);
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                2,
+                usize::from_le_bytes([b'o', b'k', 0, 0, 0, 0, 0, 0]),
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send");
+
+        let mut wrong_recv_frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let err = dispatch(&mut state, &mut wrong_recv_frame).expect_err("wrong receiver");
+        assert_eq!(err, SyscallError::InvalidCapability);
+    }
 }
