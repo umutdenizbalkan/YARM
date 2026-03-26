@@ -76,6 +76,8 @@ const MAX_MEMORY_OBJECTS: usize = 128;
 const MAX_NOTIFICATIONS: usize = 16;
 const MAX_IRQ_LINES: usize = platform_layout::MAX_IRQ_LINES;
 const MAX_DRIVERS: usize = 32;
+const MAX_DRIVER_IRQ_CAPS: usize = 8;
+const MAX_DRIVER_DMA_CAPS: usize = 8;
 const MAX_TRANSFER_ENVELOPES: usize = 64;
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
 
@@ -197,8 +199,8 @@ struct NotificationObject {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DriverRecord {
     tid: ThreadId,
-    irq_cap: Option<CapId>,
-    dma_cap: Option<CapId>,
+    irq_caps: [Option<CapId>; MAX_DRIVER_IRQ_CAPS],
+    dma_caps: [Option<CapId>; MAX_DRIVER_DMA_CAPS],
     dma_iova_base: Option<usize>,
     dma_iova_len: Option<usize>,
     iova_space_cap: Option<CapId>,
@@ -2245,6 +2247,35 @@ mod tests {
             .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
             .expect("dma");
         state.grant_driver_dma(3, dma_cap).expect("grant dma");
+    }
+
+    #[test]
+    fn driver_record_accepts_multiple_irq_and_dma_caps() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(44).expect("task");
+        state.register_driver(44).expect("driver");
+
+        let irq_a = state.mint_irq_cap(10).expect("irq a");
+        let irq_b = state.mint_irq_cap(11).expect("irq b");
+        state.grant_driver_irq(44, irq_a).expect("grant irq a");
+        state.grant_driver_irq(44, irq_b).expect("grant irq b");
+
+        let (_id_a, mem_a) = state.alloc_anonymous_memory_object().expect("mem a");
+        let (_id_b, mem_b) = state.alloc_anonymous_memory_object().expect("mem b");
+        let dma_a = state
+            .mint_dma_region_cap(mem_a, 0, crate::kernel::vm::PAGE_SIZE)
+            .expect("dma a");
+        let dma_b = state
+            .mint_dma_region_cap(mem_b, 0, crate::kernel::vm::PAGE_SIZE)
+            .expect("dma b");
+        state.grant_driver_dma(44, dma_a).expect("grant dma a");
+        state.grant_driver_dma(44, dma_b).expect("grant dma b");
+
+        state.revoke_driver_runtime_caps(44).expect("revoke");
+        assert!(state.cspace.get(irq_a).is_none());
+        assert!(state.cspace.get(irq_b).is_none());
+        assert!(state.cspace.get(dma_a).is_none());
+        assert!(state.cspace.get(dma_b).is_none());
     }
 
     #[test]

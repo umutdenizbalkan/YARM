@@ -27,8 +27,8 @@ impl KernelState {
         {
             *slot = Some(DriverRecord {
                 tid: ThreadId(tid),
-                irq_cap: None,
-                dma_cap: None,
+                irq_caps: [None; super::MAX_DRIVER_IRQ_CAPS],
+                dma_caps: [None; super::MAX_DRIVER_DMA_CAPS],
                 dma_iova_base: None,
                 dma_iova_len: None,
                 iova_space_cap: None,
@@ -58,8 +58,14 @@ impl KernelState {
             .flatten()
             .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
-        record.irq_cap = Some(irq_cap);
-        Ok(())
+        if record.irq_caps.contains(&Some(irq_cap)) {
+            return Ok(());
+        }
+        if let Some(slot) = record.irq_caps.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(irq_cap);
+            return Ok(());
+        }
+        return Err(KernelError::TaskTableFull);
     }
 
     pub fn mint_irq_cap(&mut self, line: u16) -> Result<CapId, KernelError> {
@@ -176,8 +182,14 @@ impl KernelState {
             .flatten()
             .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
-        record.dma_cap = Some(dma_cap);
-        Ok(())
+        if record.dma_caps.contains(&Some(dma_cap)) {
+            return Ok(());
+        }
+        if let Some(slot) = record.dma_caps.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(dma_cap);
+            return Ok(());
+        }
+        Err(KernelError::TaskTableFull)
     }
 
     pub fn delegate_device_server_caps(
@@ -236,8 +248,8 @@ impl KernelState {
             .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
 
-        if record.irq_cap != Some(bundle.irq_cap)
-            || record.dma_cap != Some(bundle.dma_cap)
+        if !record.irq_caps.contains(&Some(bundle.irq_cap))
+            || !record.dma_caps.contains(&Some(bundle.dma_cap))
             || record.iova_space_cap != Some(bundle.iova_cap)
         {
             return Err(KernelError::StaleCapability);
@@ -341,17 +353,19 @@ impl KernelState {
             .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
 
-        let irq_cap = record.irq_cap.take();
-        let dma_cap = record.dma_cap.take();
+        let irq_caps = record.irq_caps;
+        let dma_caps = record.dma_caps;
+        record.irq_caps = [None; super::MAX_DRIVER_IRQ_CAPS];
+        record.dma_caps = [None; super::MAX_DRIVER_DMA_CAPS];
         let iova_cap = record.iova_space_cap.take();
         record.dma_iova_base = None;
         record.dma_iova_len = None;
 
-        if let Some(cap) = irq_cap {
+        for cap in irq_caps.into_iter().flatten() {
             // Runtime bundle capabilities are globally minted and revoked by kernel policy.
             let _ = self.revoke_kernel_global_capability(cap);
         }
-        if let Some(cap) = dma_cap {
+        for cap in dma_caps.into_iter().flatten() {
             let _ = self.revoke_kernel_global_capability(cap);
         }
         if let Some(cap) = iova_cap {
