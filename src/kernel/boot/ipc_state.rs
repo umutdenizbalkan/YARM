@@ -336,14 +336,6 @@ impl KernelState {
         Ok(())
     }
 
-    pub fn ipc_send_task_local(
-        &mut self,
-        send_cap: CapId,
-        msg: Message,
-    ) -> Result<(), KernelError> {
-        self.ipc_send(send_cap, msg)
-    }
-
     pub fn ipc_send_fastpath(
         &mut self,
         send_cap: CapId,
@@ -388,14 +380,6 @@ impl KernelState {
         Ok(IpcFastpathResult {
             switched_to_waiter: switched,
         })
-    }
-
-    pub fn ipc_send_fastpath_task_local(
-        &mut self,
-        send_cap: CapId,
-        msg: Message,
-    ) -> Result<IpcFastpathResult, KernelError> {
-        self.ipc_send_fastpath(send_cap, msg)
     }
 
     pub fn ipc_send_with_cap_transfer(
@@ -522,9 +506,5 @@ impl KernelState {
 
         self.block_current_on_receive(endpoint_idx, recv_cap)?;
         Ok(None)
-    }
-
-    pub fn ipc_recv_task_local(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
-        self.ipc_recv(recv_cap)
     }
 }
