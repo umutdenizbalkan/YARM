@@ -152,12 +152,13 @@ fn materialize_received_transfer_cap(
     kernel: &mut KernelState,
     transfer_handle: Option<u64>,
     endpoint: CapObject,
+    receiver_tid: u64,
 ) -> Result<Option<u64>, SyscallError> {
     let Some(handle) = transfer_handle else {
         return Ok(None);
     };
     let source_cap = kernel
-        .take_transfer_envelope(handle, endpoint)
+        .take_transfer_envelope(handle, endpoint, crate::kernel::ipc::ThreadId(receiver_tid))
         .ok_or(SyscallError::InvalidCapability)?;
     let derived = kernel.cspace.mint(source_cap).map_err(|err| match err {
         CapabilityDeriveError::ParentMissing
@@ -215,9 +216,10 @@ fn stash_transfer_handle(
     let source_cap = kernel
         .current_task_capability(source_cap_id)
         .ok_or(SyscallError::InvalidCapability)?;
+    let receiver_tid = kernel.endpoint_waiter_tid(endpoint);
     Ok(Some(
         kernel
-            .stash_transfer_envelope(source_cap, endpoint)
+            .stash_transfer_envelope(source_cap, endpoint, receiver_tid)
             .ok_or(SyscallError::QueueFull)?,
     ))
 }
@@ -317,7 +319,11 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 
     if let Err(err) = kernel.ipc_send(cap, msg) {
         if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
-            let _ = kernel.take_transfer_envelope(handle, endpoint);
+            let _ = kernel.take_transfer_envelope(
+                handle,
+                endpoint,
+                crate::kernel::ipc::ThreadId(current_tid(kernel)?),
+            );
         }
         return Err(SyscallError::from(err));
     }
@@ -340,10 +346,12 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     match received {
         Some(msg) => {
             let sender = sender_tid_to_ret(msg.sender_tid.0)?;
+            let receiver_tid = current_tid(kernel)?;
             let recv_local_transfer = materialize_received_transfer_cap(
                 kernel,
                 msg.transferred_cap().map(|c| c.0),
                 endpoint,
+                receiver_tid,
             )?;
             encode_transfer_cap_ret(frame, recv_local_transfer)?;
 

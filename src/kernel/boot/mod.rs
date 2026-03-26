@@ -199,6 +199,7 @@ struct RobustFutexRecord {
 struct TransferEnvelope {
     capability: Capability,
     endpoint: CapObject,
+    receiver_tid: Option<ThreadId>,
 }
 
 #[derive(Debug)]
@@ -429,6 +430,7 @@ impl KernelState {
         &mut self,
         capability: Capability,
         endpoint: CapObject,
+        receiver_tid: Option<ThreadId>,
     ) -> Option<u64> {
         for idx in 0..MAX_TRANSFER_ENVELOPES {
             if self.ipc.transfer_envelopes[idx].is_some() {
@@ -442,6 +444,7 @@ impl KernelState {
             self.ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
                 capability,
                 endpoint,
+                receiver_tid,
             });
             let idx_part = u64::try_from(idx).ok()?;
             return Some((generation << 16) | idx_part);
@@ -453,6 +456,7 @@ impl KernelState {
         &mut self,
         handle: u64,
         endpoint: CapObject,
+        receiver_tid: ThreadId,
     ) -> Option<Capability> {
         let idx = usize::try_from(handle & 0xFFFF).ok()?;
         if idx >= MAX_TRANSFER_ENVELOPES {
@@ -466,8 +470,26 @@ impl KernelState {
         if envelope.endpoint != endpoint {
             return None;
         }
+        if let Some(bound_receiver) = envelope.receiver_tid {
+            if bound_receiver != receiver_tid {
+                return None;
+            }
+        }
         self.ipc.transfer_envelopes[idx] = None;
         Some(envelope.capability)
+    }
+
+    pub fn endpoint_waiter_tid(&self, endpoint: CapObject) -> Option<ThreadId> {
+        let CapObject::Endpoint { index, generation } = endpoint else {
+            return None;
+        };
+        if index >= MAX_ENDPOINTS {
+            return None;
+        }
+        if self.ipc.endpoint_generations[index] != generation {
+            return None;
+        }
+        self.ipc.endpoint_waiters[index]
     }
 
     pub fn capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
@@ -615,26 +637,56 @@ mod tests {
         let endpoint = state.cspace.get(send_cap).expect("send cap").object;
 
         let first = state
-            .stash_transfer_envelope(payload, endpoint)
+            .stash_transfer_envelope(payload, endpoint, None)
             .expect("stash first");
-        assert!(state.take_transfer_envelope(first, endpoint).is_some());
-        assert!(state.take_transfer_envelope(first, endpoint).is_none());
+        assert!(
+            state
+                .take_transfer_envelope(first, endpoint, ThreadId(0))
+                .is_some()
+        );
+        assert!(
+            state
+                .take_transfer_envelope(first, endpoint, ThreadId(0))
+                .is_none()
+        );
 
         let second = state
-            .stash_transfer_envelope(payload, endpoint)
+            .stash_transfer_envelope(payload, endpoint, None)
             .expect("stash second");
         assert_ne!(first, second);
-        assert!(state.take_transfer_envelope(first, endpoint).is_none());
+        assert!(
+            state
+                .take_transfer_envelope(first, endpoint, ThreadId(0))
+                .is_none()
+        );
         let wrong_endpoint = CapObject::Endpoint {
             index: usize::MAX,
             generation: 1,
         };
         assert!(
             state
-                .take_transfer_envelope(second, wrong_endpoint)
+                .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
                 .is_none()
         );
-        assert!(state.take_transfer_envelope(second, endpoint).is_some());
+        assert!(
+            state
+                .take_transfer_envelope(second, endpoint, ThreadId(0))
+                .is_some()
+        );
+
+        let bound = state
+            .stash_transfer_envelope(payload, endpoint, Some(ThreadId(9)))
+            .expect("stash bound");
+        assert!(
+            state
+                .take_transfer_envelope(bound, endpoint, ThreadId(8))
+                .is_none()
+        );
+        assert!(
+            state
+                .take_transfer_envelope(bound, endpoint, ThreadId(9))
+                .is_some()
+        );
     }
 
     #[test]
