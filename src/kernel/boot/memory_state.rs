@@ -5,17 +5,23 @@ use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError};
 impl KernelState {
     pub fn destroy_user_address_space(&mut self, aspace_cap: CapId) -> Result<(), KernelError> {
         let capability = self
-            .cspace
-            .get(aspace_cap)
+            .current_task_capability(aspace_cap)
+            .or_else(|| self.cspace.get(aspace_cap))
             .ok_or(KernelError::InvalidCapability)?;
         let asid = match capability.object {
             CapObject::AddressSpace { asid } => Asid(asid),
             _ => return Err(KernelError::WrongObject),
         };
+        if !capability.has_right(CapRights::MAP) {
+            return Err(KernelError::MissingRight);
+        }
 
         self.cspace
             .revoke(aspace_cap)
             .map_err(|_| KernelError::InvalidCapability)?;
+        if let Some(cnode) = self.current_task_cnode() {
+            self.revoke_capability_in_cnode(cnode, aspace_cap)?;
+        }
 
         let pending_cpu_bitmap = self.online_cpu_bitmap();
         self.user_spaces
@@ -44,13 +50,10 @@ impl KernelState {
             .user_spaces
             .create_user_space()
             .map_err(KernelError::Vm)?;
-        let map_cap = self
-            .cspace
-            .mint(Capability::new(
-                CapObject::AddressSpace { asid: asid.0 },
-                CapRights::MAP | CapRights::READ | CapRights::WRITE,
-            ))
-            .map_err(|_| KernelError::CapabilityFull)?;
+        let map_cap = self.mint_capability_for_current_context(Capability::new(
+            CapObject::AddressSpace { asid: asid.0 },
+            CapRights::MAP | CapRights::READ | CapRights::WRITE,
+        ))?;
         Ok((asid, map_cap))
     }
 
@@ -61,8 +64,8 @@ impl KernelState {
         mapping: Mapping,
     ) -> Result<Option<Mapping>, KernelError> {
         let capability = self
-            .cspace
-            .get(map_cap)
+            .current_task_capability(map_cap)
+            .or_else(|| self.cspace.get(map_cap))
             .ok_or(KernelError::InvalidCapability)?;
         let asid = match capability.object {
             CapObject::AddressSpace { asid } => Asid(asid),
@@ -94,13 +97,10 @@ impl KernelState {
             .ok_or(KernelError::MemoryObjectFull)?;
         *slot = Some(MemoryObject { id, phys });
 
-        let cap = self
-            .cspace
-            .mint(Capability::new(
-                CapObject::MemoryObject { id },
-                CapRights::READ | CapRights::WRITE | CapRights::MAP,
-            ))
-            .map_err(|_| KernelError::CapabilityFull)?;
+        let cap = self.mint_capability_for_current_context(Capability::new(
+            CapObject::MemoryObject { id },
+            CapRights::READ | CapRights::WRITE | CapRights::MAP,
+        ))?;
 
         Ok((id, cap))
     }

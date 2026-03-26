@@ -529,9 +529,7 @@ impl KernelState {
     }
 
     pub fn capability_for_cnode(&self, cnode: CNodeId, cap: CapId) -> Option<Capability> {
-        let capability = self
-            .capability_for_cnode_local(cnode, cap)
-            .or_else(|| self.cspace.get(cap))?;
+        let capability = self.capability_for_cnode_local(cnode, cap)?;
         self.capability_object_live(capability.object)?;
         Some(capability)
     }
@@ -574,7 +572,7 @@ impl KernelState {
         if let Some(slot) = self.cnode_spaces.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(CNodeSpace {
                 id: cnode,
-                cspace: store_kernel_value((*self.cspace).clone()),
+                cspace: store_kernel_value(CapabilitySpace::default()),
             });
             Ok(())
         } else {
@@ -601,6 +599,40 @@ impl KernelState {
         Ok(())
     }
 
+    pub fn mirror_global_capability_to_task(
+        &mut self,
+        tid: u64,
+        cap_id: CapId,
+    ) -> Result<(), KernelError> {
+        let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
+        let capability = self.cspace.get(cap_id).ok_or(KernelError::InvalidCapability)?;
+        self.mirror_capability_into_cnode(cnode, cap_id, capability)
+    }
+
+    pub fn duplicate_global_capability_to_task(
+        &mut self,
+        tid: u64,
+        cap_id: CapId,
+    ) -> Result<CapId, KernelError> {
+        let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
+        let capability = self.cspace.get(cap_id).ok_or(KernelError::InvalidCapability)?;
+        self.mint_capability_in_cnode(cnode, capability)
+    }
+
+    pub(crate) fn mint_capability_for_current_context(
+        &mut self,
+        capability: Capability,
+    ) -> Result<CapId, KernelError> {
+        let cap_id = self
+            .cspace
+            .mint(capability)
+            .map_err(|_| KernelError::CapabilityFull)?;
+        if let Some(cnode) = self.current_task_cnode() {
+            self.mirror_capability_into_cnode(cnode, cap_id, capability)?;
+        }
+        Ok(cap_id)
+    }
+
     pub(crate) fn mint_capability_in_cnode(
         &mut self,
         cnode: CNodeId,
@@ -611,6 +643,17 @@ impl KernelState {
             .ok_or(KernelError::TaskMissing)?
             .mint(capability)
             .map_err(|_| KernelError::CapabilityFull)
+    }
+
+    pub(crate) fn revoke_capability_in_cnode(
+        &mut self,
+        cnode: CNodeId,
+        cap: CapId,
+    ) -> Result<(), KernelError> {
+        self.cspace_for_cnode_mut(cnode)
+            .ok_or(KernelError::TaskMissing)?
+            .revoke(cap)
+            .map_err(|_| KernelError::InvalidCapability)
     }
 
     fn capability_object_live(&self, object: CapObject) -> Option<()> {

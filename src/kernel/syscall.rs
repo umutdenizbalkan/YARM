@@ -161,10 +161,15 @@ fn materialize_received_transfer_cap(
     let source_cap = kernel
         .take_transfer_envelope(handle, endpoint, crate::kernel::ipc::ThreadId(receiver_tid))
         .ok_or(SyscallError::InvalidCapability)?;
-    let cnode = kernel.current_task_cnode().ok_or(SyscallError::InvalidCapability)?;
     let derived = kernel
-        .mint_capability_in_cnode(cnode, source_cap)
+        .cspace
+        .mint(source_cap)
         .map_err(|_| SyscallError::QueueFull)?;
+    if let Some(cnode) = kernel.current_task_cnode() {
+        kernel
+            .mirror_capability_into_cnode(cnode, derived, source_cap)
+            .map_err(|_| SyscallError::QueueFull)?;
+    }
     Ok(Some(derived.0))
 }
 
@@ -454,13 +459,24 @@ mod tests {
         state.register_task(1).expect("task1");
         state.enqueue_current_cpu(1).expect("enqueue");
         state.dispatch_next_task().expect("dispatch");
-        let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .duplicate_global_capability_to_task(1, recv_cap_global)
+            .expect("dup recv cap");
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0x7000))
             .expect("mem");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
-        assert_eq!(state.ipc_recv(recv_cap).expect("block recv"), None);
+        assert!(
+            state.current_task_capability_has_right(recv_cap, CapRights::RECEIVE),
+            "receiver task must own receive cap"
+        );
+        let mut block_recv_frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv_frame).expect("block recv");
         assert_eq!(state.current_tid(), Some(0));
 
         let mut send_frame = TrapFrame::new(

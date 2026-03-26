@@ -266,8 +266,8 @@ impl KernelState {
 
     pub fn ipc_send(&mut self, send_cap: CapId, msg: Message) -> Result<(), KernelError> {
         let capability = self
-            .cspace
-            .get(send_cap)
+            .current_task_capability(send_cap)
+            .or_else(|| self.cspace.get(send_cap))
             .ok_or(KernelError::InvalidCapability)?;
         if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
@@ -333,8 +333,8 @@ impl KernelState {
         msg: Message,
     ) -> Result<IpcFastpathResult, KernelError> {
         let capability = self
-            .cspace
-            .get(send_cap)
+            .current_task_capability(send_cap)
+            .or_else(|| self.cspace.get(send_cap))
             .ok_or(KernelError::InvalidCapability)?;
         if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
@@ -462,8 +462,8 @@ impl KernelState {
 
     pub fn ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
         let capability = self
-            .cspace
-            .get(recv_cap)
+            .current_task_capability(recv_cap)
+            .or_else(|| self.cspace.get(recv_cap))
             .ok_or(KernelError::InvalidCapability)?;
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
