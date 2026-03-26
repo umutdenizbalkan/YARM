@@ -234,9 +234,10 @@ impl KernelState {
             return Err(KernelError::StaleCapability);
         }
 
-        if self.cspace.get(bundle.irq_cap).is_none()
-            || self.cspace.get(bundle.dma_cap).is_none()
-            || self.cspace.get(bundle.iova_cap).is_none()
+        // Driver delegation records are kernel-owned; validate against global caps.
+        if self.kernel_global_capability(bundle.irq_cap).is_none()
+            || self.kernel_global_capability(bundle.dma_cap).is_none()
+            || self.kernel_global_capability(bundle.iova_cap).is_none()
         {
             return Err(KernelError::StaleCapability);
         }
@@ -331,17 +332,22 @@ impl KernelState {
             .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
 
-        if let Some(cap) = record.irq_cap.take() {
-            let _ = self.cspace.revoke(cap);
-        }
-        if let Some(cap) = record.dma_cap.take() {
-            let _ = self.cspace.revoke(cap);
-        }
-        if let Some(cap) = record.iova_space_cap.take() {
-            let _ = self.cspace.revoke(cap);
-        }
+        let irq_cap = record.irq_cap.take();
+        let dma_cap = record.dma_cap.take();
+        let iova_cap = record.iova_space_cap.take();
         record.dma_iova_base = None;
         record.dma_iova_len = None;
+
+        if let Some(cap) = irq_cap {
+            // Runtime bundle capabilities are globally minted and revoked by kernel policy.
+            let _ = self.revoke_kernel_global_capability(cap);
+        }
+        if let Some(cap) = dma_cap {
+            let _ = self.revoke_kernel_global_capability(cap);
+        }
+        if let Some(cap) = iova_cap {
+            let _ = self.revoke_kernel_global_capability(cap);
+        }
         Ok(())
     }
 }

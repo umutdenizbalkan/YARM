@@ -524,8 +524,25 @@ impl KernelState {
         self.ipc.endpoint_waiters[index]
     }
 
-    pub fn capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
-        self.cspace.has_right(cap, right)
+    pub fn kernel_global_capability(&self, cap: CapId) -> Option<Capability> {
+        let capability = self.cspace.get(cap)?;
+        self.capability_object_live(capability.object)?;
+        Some(capability)
+    }
+
+    pub fn kernel_global_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
+        self.kernel_global_capability(cap)
+            .map(|capability| capability.has_right(right))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn revoke_kernel_global_capability(
+        &mut self,
+        cap: CapId,
+    ) -> Result<(), KernelError> {
+        self.cspace
+            .revoke(cap)
+            .map_err(|_| KernelError::InvalidCapability)
     }
 
     pub fn capability_for_cnode(&self, cnode: CNodeId, cap: CapId) -> Option<Capability> {
@@ -2688,5 +2705,28 @@ mod tests {
         state.mark_thread_detached(joiner).expect("detach");
         state.exit_task(joiner, 9).expect("exit detached");
         assert_eq!(state.task_status(joiner), Some(TaskStatus::Dead));
+    }
+
+    #[test]
+    fn global_cspace_access_is_routed_through_kernel_global_helpers() {
+        let files = [
+            ("driver_state.rs", include_str!("driver_state.rs")),
+            ("ipc_state.rs", include_str!("ipc_state.rs")),
+            ("memory_state.rs", include_str!("memory_state.rs")),
+        ];
+        for (name, source) in files {
+            assert!(
+                !source.contains("self.cspace.get("),
+                "direct self.cspace.get found in {name}"
+            );
+            assert!(
+                !source.contains("self.cspace.revoke("),
+                "direct self.cspace.revoke found in {name}"
+            );
+            assert!(
+                !source.contains("self.cspace.has_right("),
+                "direct self.cspace.has_right found in {name}"
+            );
+        }
     }
 }

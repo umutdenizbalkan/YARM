@@ -5,13 +5,13 @@ mod policy;
 use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use crate::kernel::capabilities::{CapId, CapRights};
 use crate::kernel::supervisor_abi::{
-    RegisterCoreServiceRequest, RegisterDriverRequest, TaskExitedEvent,
-    register_core_service_message, register_driver_message,
+    register_core_service_message, register_driver_message, RegisterCoreServiceRequest,
+    RegisterDriverRequest, TaskExitedEvent,
 };
 use crate::kernel::task::TaskClass;
 use crate::kernel::task::TaskStatus;
 use crate::kernel::vfs::{
-    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
+    openat_message, statx_message, write_message, OpenAtRequest, ReadWriteRequest, StatxRequest,
 };
 use crate::kernel::vm::Asid;
 use crate::services::fs::devfs::service::run_request_loop as run_devfs_request_loop;
@@ -352,11 +352,19 @@ impl InitService {
 
     pub fn validate_delegation_edges(&self, kernel: &KernelState) -> Result<(), KernelError> {
         let handoff = self.fault_handoff.ok_or(KernelError::WrongObject)?;
-        if !kernel.capability_has_right(handoff.supervisor_fault_recv_cap, CapRights::RECEIVE)
-            || !kernel.capability_has_right(handoff.supervisor_control_send_cap, CapRights::SEND)
-            || !kernel.capability_has_right(handoff.supervisor_control_recv_cap, CapRights::RECEIVE)
-            || !kernel.capability_has_right(handoff.init_alert_send_cap, CapRights::SEND)
-            || !kernel.capability_has_right(handoff.init_alert_recv_cap, CapRights::RECEIVE)
+        if !kernel.kernel_global_capability_has_right(
+            handoff.supervisor_fault_recv_cap,
+            CapRights::RECEIVE,
+        ) || !kernel.kernel_global_capability_has_right(
+            handoff.supervisor_control_send_cap,
+            CapRights::SEND,
+        ) || !kernel.kernel_global_capability_has_right(
+            handoff.supervisor_control_recv_cap,
+            CapRights::RECEIVE,
+        ) || !kernel
+            .kernel_global_capability_has_right(handoff.init_alert_send_cap, CapRights::SEND)
+            || !kernel
+                .kernel_global_capability_has_right(handoff.init_alert_recv_cap, CapRights::RECEIVE)
         {
             return Err(KernelError::MissingRight);
         }
@@ -415,7 +423,7 @@ impl InitService {
         kernel: &mut KernelState,
     ) -> Result<usize, KernelError> {
         use crate::kernel::supervisor_abi::{
-            CoreServiceRegistrationKind, DEP_VFS, RegisterCoreServiceRequest,
+            CoreServiceRegistrationKind, RegisterCoreServiceRequest, DEP_VFS,
         };
 
         let proc_tid = self
@@ -597,8 +605,10 @@ impl InitService {
                     }
                 }
                 let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
-                let local_fault_recv = kernel
-                    .duplicate_global_capability_to_task(init_tid, handoff.supervisor_fault_recv_cap)?;
+                let local_fault_recv = kernel.duplicate_global_capability_to_task(
+                    init_tid,
+                    handoff.supervisor_fault_recv_cap,
+                )?;
                 kernel.set_supervisor_endpoint_for_task(init_tid, local_fault_recv)?;
                 self.clear_supervisor_control_queue(kernel)?;
                 let _ = self.restore_supervisor_control_plane(kernel)?;
@@ -1084,10 +1094,9 @@ mod tests {
             .expect("seed");
         init.begin_running(&state).expect("running");
         let token = state.exit_task(4, 99).expect("exit");
-        assert!(
-            init.recover_supervisor_failure(&mut state, token)
-                .expect("recover")
-        );
+        assert!(init
+            .recover_supervisor_failure(&mut state, token)
+            .expect("recover"));
         assert_eq!(
             state.task_status(4),
             Some(crate::kernel::task::TaskStatus::Runnable)
@@ -1122,10 +1131,9 @@ mod tests {
             .expect("seed");
         init.begin_running(&state).expect("running");
         let token = state.exit_task(2, 44).expect("exit");
-        assert!(
-            init.recover_core_service_failure(&mut state, CoreServiceKind::ProcessManager, token)
-                .expect("recover")
-        );
+        assert!(init
+            .recover_core_service_failure(&mut state, CoreServiceKind::ProcessManager, token)
+            .expect("recover"));
         assert_eq!(
             state.task_status(2),
             Some(crate::kernel::task::TaskStatus::Runnable)
@@ -1161,10 +1169,9 @@ mod tests {
         init.begin_running(&state).expect("running");
         let _ = handoff;
         let token = state.exit_task(3, 12).expect("exit");
-        assert!(
-            init.recover_core_service_failure(&mut state, CoreServiceKind::Vfs, token)
-                .expect("recover")
-        );
+        assert!(init
+            .recover_core_service_failure(&mut state, CoreServiceKind::Vfs, token)
+            .expect("recover"));
         assert_eq!(
             state.task_status(3),
             Some(crate::kernel::task::TaskStatus::Runnable)

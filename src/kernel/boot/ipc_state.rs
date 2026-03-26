@@ -390,13 +390,13 @@ impl KernelState {
         transfer_cap: CapId,
         payload: &[u8],
     ) -> Result<(), KernelError> {
+        // Kernel-internal transfer-envelope staging intentionally references global
+        // capabilities because handles are bound and materialized across tasks.
         let transfer_payload = self
-            .cspace
-            .get(transfer_cap)
+            .kernel_global_capability(transfer_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let send_capability = self
-            .cspace
-            .get(send_cap)
+            .kernel_global_capability(send_cap)
             .ok_or(KernelError::InvalidCapability)?;
         if !send_capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
@@ -423,9 +423,9 @@ impl KernelState {
     }
 
     pub fn try_ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
+        // Kernel-internal probe path for globally held receive capabilities.
         let capability = self
-            .cspace
-            .get(recv_cap)
+            .kernel_global_capability(recv_cap)
             .ok_or(KernelError::InvalidCapability)?;
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
