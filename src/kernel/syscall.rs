@@ -8,7 +8,7 @@ use super::trapframe::TrapFrame;
 use super::vm::VirtAddr;
 use crate::arch::syscall_abi;
 
-pub const SYSCALL_ABI_VERSION: u16 = 2;
+pub const SYSCALL_ABI_VERSION: u16 = 3;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
@@ -19,6 +19,7 @@ pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
 pub const SYSCALL_ARG_INLINE_PAYLOAD0: usize = 3;
 pub const SYSCALL_ARG_INLINE_PAYLOAD1: usize = 4;
+/// Transfer-cap send requires a known waiting receiver; otherwise send returns `WouldBlock`.
 pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;
 pub const SYSCALL_RET_STATUS: usize = 0;
 pub const SYSCALL_RET_AUX: usize = 1;
@@ -420,7 +421,7 @@ mod tests {
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
-        assert_eq!(SYSCALL_ABI_VERSION, 2);
+        assert_eq!(SYSCALL_ABI_VERSION, 3);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
         assert_eq!(IPC_REGISTER_WORDS, 2);
@@ -600,5 +601,28 @@ mod tests {
         );
         let err = dispatch(&mut state, &mut wrong_recv_frame).expect_err("wrong receiver");
         assert_eq!(err, SyscallError::InvalidCapability);
+    }
+
+    #[test]
+    fn transfer_send_without_waiter_returns_would_block() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_e, send_cap, _recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(crate::kernel::vm::PhysAddr(0xC000))
+            .expect("mem");
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                2,
+                usize::from_le_bytes([b'o', b'k', 0, 0, 0, 0, 0, 0]),
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        let err = dispatch(&mut state, &mut send_frame).expect_err("receiver waiter required");
+        assert_eq!(err, SyscallError::WouldBlock);
     }
 }
