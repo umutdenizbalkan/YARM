@@ -804,6 +804,7 @@ impl KernelState {
 mod tests {
     use super::*;
     use crate::kernel::ipc::ThreadId;
+    use std::{format, string::String, vec::Vec};
 
     #[test]
     fn selected_arch_trap_entry_routes_timer() {
@@ -2709,23 +2710,53 @@ mod tests {
 
     #[test]
     fn global_cspace_access_is_routed_through_kernel_global_helpers() {
-        let files = [
-            ("driver_state.rs", include_str!("driver_state.rs")),
-            ("ipc_state.rs", include_str!("ipc_state.rs")),
-            ("memory_state.rs", include_str!("memory_state.rs")),
-        ];
-        for (name, source) in files {
-            assert!(
-                !source.contains("self.cspace.get("),
-                "direct self.cspace.get found in {name}"
-            );
-            assert!(
-                !source.contains("self.cspace.revoke("),
-                "direct self.cspace.revoke found in {name}"
-            );
-            assert!(
-                !source.contains("self.cspace.has_right("),
-                "direct self.cspace.has_right found in {name}"
+        fn visit_rs_files(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+            let entries = std::fs::read_dir(root).expect("read_dir");
+            for entry in entries {
+                let entry = entry.expect("entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    visit_rs_files(&path, f);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("read file");
+                f(&path, &source);
+            }
+        }
+
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders: Vec<String> = Vec::new();
+        let mut check = |path: &std::path::Path, source: &str| {
+            let rel = path
+                .strip_prefix(&repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            if rel == "src/kernel/boot/mod.rs" {
+                // Contains canonical helper and this guard test's own pattern literals.
+                return;
+            }
+            for pattern in [
+                "self.cspace.get(",
+                "self.cspace.revoke(",
+                "self.cspace.has_right(",
+            ] {
+                if source.contains(pattern) {
+                    offenders.push(format!("{rel}: {pattern}"));
+                }
+            }
+        };
+
+        visit_rs_files(&repo_root.join("src/kernel"), &mut check);
+        visit_rs_files(&repo_root.join("src/services"), &mut check);
+
+        if !offenders.is_empty() {
+            panic!(
+                "direct self.cspace access found outside allowed helpers:\n{}",
+                offenders.join("\n")
             );
         }
     }

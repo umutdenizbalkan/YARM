@@ -29,3 +29,6 @@ When adding or modifying kernel code:
 - Prefer task-local helpers first.
 - If global access is required, use the explicit `kernel_global_*` methods and add
   a short comment in code explaining why task-local semantics are not applicable.
+- The boot test guard scans `src/kernel/**/*.rs` and `src/services/**/*.rs` and
+  fails if direct `self.cspace.{get,revoke,has_right}` appears outside the
+  canonical helper definitions.
