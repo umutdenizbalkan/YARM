@@ -325,8 +325,9 @@ impl InitService {
             .handles
             .supervisor_tid
             .ok_or(KernelError::WrongObject)?;
+        let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
         let (_, _, fault_recv_cap) = kernel.create_endpoint(16)?;
-        kernel.set_supervisor_endpoint(fault_recv_cap)?;
+        kernel.set_supervisor_endpoint_for_task(init_tid, fault_recv_cap)?;
         let (_, control_send_cap, control_recv_cap) = kernel.create_endpoint(16)?;
         let (_, init_alert_send_cap, init_alert_recv_cap) = kernel.create_endpoint(16)?;
         let handoff = InitFaultHandoff::new(
@@ -593,7 +594,8 @@ impl InitService {
                         return Err(KernelError::WrongObject);
                     }
                 }
-                kernel.set_supervisor_endpoint(handoff.supervisor_fault_recv_cap)?;
+                let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
+                kernel.set_supervisor_endpoint_for_task(init_tid, handoff.supervisor_fault_recv_cap)?;
                 self.clear_supervisor_control_queue(kernel)?;
                 let _ = self.restore_supervisor_control_plane(kernel)?;
             }

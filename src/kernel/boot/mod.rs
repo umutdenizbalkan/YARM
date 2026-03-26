@@ -436,6 +436,10 @@ impl KernelState {
 
     pub fn current_task_cnode(&self) -> Option<CNodeId> {
         let tid = self.current_tid()?;
+        self.task_cnode(tid)
+    }
+
+    pub fn task_cnode(&self, tid: u64) -> Option<CNodeId> {
         self.tcbs
             .iter()
             .flatten()
@@ -445,11 +449,7 @@ impl KernelState {
 
     pub fn current_task_capability(&self, cap: CapId) -> Option<Capability> {
         let cnode = self.current_task_cnode()?;
-        if let Some(capability) = self.capability_for_cnode(cnode, cap) {
-            self.cspace.get(cap)?;
-            return Some(capability);
-        }
-        self.cspace.get(cap)
+        self.capability_for_cnode(cnode, cap)
     }
 
     pub fn current_task_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
@@ -529,7 +529,15 @@ impl KernelState {
     }
 
     pub fn capability_for_cnode(&self, cnode: CNodeId, cap: CapId) -> Option<Capability> {
-        self.cspace_for_cnode(cnode)?.get(cap)
+        let capability = self
+            .capability_for_cnode_local(cnode, cap)
+            .or_else(|| self.cspace.get(cap))?;
+        self.capability_object_live(capability.object)?;
+        Some(capability)
+    }
+
+    pub(crate) fn capability_for_cnode_local(&self, cnode: CNodeId, cap: CapId) -> Option<Capability> {
+        self.cspace_for_cnode(cnode).and_then(|cspace| cspace.get(cap))
     }
 
     pub fn cnode_capability_has_right(
@@ -593,6 +601,37 @@ impl KernelState {
         Ok(())
     }
 
+    pub(crate) fn mint_capability_in_cnode(
+        &mut self,
+        cnode: CNodeId,
+        capability: Capability,
+    ) -> Result<CapId, KernelError> {
+        self.ensure_cnode_space(cnode)?;
+        self.cspace_for_cnode_mut(cnode)
+            .ok_or(KernelError::TaskMissing)?
+            .mint(capability)
+            .map_err(|_| KernelError::CapabilityFull)
+    }
+
+    fn capability_object_live(&self, object: CapObject) -> Option<()> {
+        match object {
+            CapObject::Endpoint { index, generation } => {
+                if index >= MAX_ENDPOINTS || self.ipc.endpoint_generations[index] != generation {
+                    return None;
+                }
+            }
+            CapObject::Notification { index, generation } => {
+                if index >= MAX_NOTIFICATIONS
+                    || self.ipc.notification_generations[index] != generation
+                {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        Some(())
+    }
+
     pub fn last_fault(&self) -> Option<FaultInfo> {
         self.faults.last_fault
     }
@@ -606,9 +645,14 @@ impl KernelState {
     }
 
     pub fn set_fault_handler(&mut self, recv_cap: CapId) -> Result<(), KernelError> {
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        self.set_fault_handler_for_task(tid, recv_cap)
+    }
+
+    pub fn set_fault_handler_for_task(&mut self, tid: u64, recv_cap: CapId) -> Result<(), KernelError> {
+        let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
         let capability = self
-            .cspace
-            .get(recv_cap)
+            .capability_for_cnode(cnode, recv_cap)
             .ok_or(KernelError::InvalidCapability)?;
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
@@ -655,9 +699,18 @@ impl KernelState {
     }
 
     pub fn set_supervisor_endpoint(&mut self, recv_cap: CapId) -> Result<(), KernelError> {
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        self.set_supervisor_endpoint_for_task(tid, recv_cap)
+    }
+
+    pub fn set_supervisor_endpoint_for_task(
+        &mut self,
+        tid: u64,
+        recv_cap: CapId,
+    ) -> Result<(), KernelError> {
+        let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
         let capability = self
-            .cspace
-            .get(recv_cap)
+            .capability_for_cnode(cnode, recv_cap)
             .ok_or(KernelError::InvalidCapability)?;
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
@@ -1088,6 +1141,95 @@ mod tests {
             state.ipc_send(child, msg2),
             Err(KernelError::InvalidCapability)
         );
+    }
+
+    #[test]
+    fn same_cap_id_in_distinct_cnodes_does_not_alias() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.register_task(2).expect("task2");
+        let cnode1 = state.task_cnode(1).expect("cnode1");
+        let cnode2 = state.task_cnode(2).expect("cnode2");
+        let slot_index = 7usize;
+        let cap1 = state
+            .cspace_for_cnode_mut(cnode1)
+            .expect("cspace1")
+            .mint_at(
+                slot_index,
+                Capability::new(CapObject::MemoryObject { id: 0xA1 }, CapRights::READ),
+            )
+            .expect("mint1");
+        let cap2 = state
+            .cspace_for_cnode_mut(cnode2)
+            .expect("cspace2")
+            .mint_at(
+                slot_index,
+                Capability::new(CapObject::MemoryObject { id: 0xB2 }, CapRights::READ),
+            )
+            .expect("mint2");
+        assert_eq!(cap1, cap2);
+
+        state.enqueue_current_cpu(1).expect("enqueue1");
+        state.yield_current().expect("switch1");
+        assert_eq!(state.current_tid(), Some(1));
+        let task1_view = state.current_task_capability(cap1).expect("task1 cap");
+        assert_eq!(task1_view.object, CapObject::MemoryObject { id: 0xA1 });
+
+        state.enqueue_current_cpu(2).expect("enqueue2");
+        state.yield_current().expect("switch2a");
+        if state.current_tid() != Some(2) {
+            state.yield_current().expect("switch2b");
+        }
+        assert_eq!(state.current_tid(), Some(2));
+        let task2_view = state.current_task_capability(cap2).expect("task2 cap");
+        assert_eq!(task2_view.object, CapObject::MemoryObject { id: 0xB2 });
+    }
+
+    #[test]
+    fn revoke_isolated_to_owning_cnode_space() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.register_task(2).expect("task2");
+        let cnode1 = state.task_cnode(1).expect("cnode1");
+        let cnode2 = state.task_cnode(2).expect("cnode2");
+        let slot_index = 9usize;
+        let cap = state
+            .cspace_for_cnode_mut(cnode1)
+            .expect("cspace1")
+            .mint_at(
+                slot_index,
+                Capability::new(CapObject::MemoryObject { id: 0x111 }, CapRights::READ),
+            )
+            .expect("mint1");
+        let cap_other = state
+            .cspace_for_cnode_mut(cnode2)
+            .expect("cspace2")
+            .mint_at(
+                slot_index,
+                Capability::new(CapObject::MemoryObject { id: 0x222 }, CapRights::READ),
+            )
+            .expect("mint2");
+        assert_eq!(cap, cap_other);
+        assert_eq!(
+            state
+                .cspace_for_cnode_mut(cnode1)
+                .expect("cspace1")
+                .revoke(cap),
+            Ok(())
+        );
+        assert!(
+            state
+                .cspace_for_cnode(cnode1)
+                .expect("cspace1")
+                .get(cap)
+                .is_none()
+        );
+        let remaining = state
+            .cspace_for_cnode(cnode2)
+            .expect("cspace2")
+            .get(cap_other)
+            .expect("other cnode cap remains");
+        assert_eq!(remaining.object, CapObject::MemoryObject { id: 0x222 });
     }
 
     #[test]

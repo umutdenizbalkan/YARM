@@ -161,12 +161,10 @@ fn materialize_received_transfer_cap(
     let source_cap = kernel
         .take_transfer_envelope(handle, endpoint, crate::kernel::ipc::ThreadId(receiver_tid))
         .ok_or(SyscallError::InvalidCapability)?;
-    let derived = kernel.cspace.mint(source_cap).map_err(|_| SyscallError::QueueFull)?;
-    if let Some(cnode) = kernel.current_task_cnode() {
-        kernel
-            .mirror_capability_into_cnode(cnode, derived, source_cap)
-            .map_err(|_| SyscallError::QueueFull)?;
-    }
+    let cnode = kernel.current_task_cnode().ok_or(SyscallError::InvalidCapability)?;
+    let derived = kernel
+        .mint_capability_in_cnode(cnode, source_cap)
+        .map_err(|_| SyscallError::QueueFull)?;
     Ok(Some(derived.0))
 }
 
@@ -491,10 +489,15 @@ mod tests {
         let recv_local = CapId(frame.ret2() as u64);
         assert_ne!(recv_local, mem_cap);
         let mapped = state
-            .cspace
-            .get(recv_local)
+            .current_task_capability(recv_local)
             .expect("receiver-local transferred cap");
         assert!(matches!(mapped.object, CapObject::MemoryObject { .. }));
+        state.yield_current().expect("switch back to sender");
+        assert_eq!(state.current_tid(), Some(0));
+        let sender_cnode = state.task_cnode(0).expect("sender cnode");
+        if let Some(sender_cap) = state.capability_for_cnode_local(sender_cnode, recv_local) {
+            assert_ne!(sender_cap.object, mapped.object);
+        }
     }
 
     #[test]
