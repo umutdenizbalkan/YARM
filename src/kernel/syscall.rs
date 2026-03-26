@@ -1,5 +1,5 @@
 use super::boot::{KernelError, KernelState};
-use super::capabilities::{CapId, CapObject, CapRights};
+use super::capabilities::{CapId, CapObject, CapRights, CapabilityDeriveError};
 use super::ipc::{
     IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
 };
@@ -148,6 +148,32 @@ fn encode_transfer_cap_ret(frame: &mut TrapFrame, cap: Option<u64>) -> Result<()
     Ok(())
 }
 
+fn materialize_received_transfer_cap(
+    kernel: &mut KernelState,
+    transfer_cap: Option<u64>,
+) -> Result<Option<u64>, SyscallError> {
+    let Some(source_raw) = transfer_cap else {
+        return Ok(None);
+    };
+    let source = CapId(source_raw);
+    let source_cap = kernel
+        .current_task_capability(source)
+        .ok_or(SyscallError::InvalidCapability)?;
+    let derived = kernel
+        .cspace
+        .mint_derived(source, source_cap.rights())
+        .map_err(|err| match err {
+            CapabilityDeriveError::ParentMissing
+            | CapabilityDeriveError::NotFound
+            | CapabilityDeriveError::InvalidSlot => SyscallError::InvalidCapability,
+            CapabilityDeriveError::RightsEscalation => SyscallError::MissingRight,
+            CapabilityDeriveError::SpaceFull | CapabilityDeriveError::SlotOccupied => {
+                SyscallError::QueueFull
+            }
+        })?;
+    Ok(Some(derived.0))
+}
+
 fn validate_user_region(offset: u64, len: u64) -> Result<(), SyscallError> {
     const USER_ADDR_MAX: u64 = crate::arch::vm_layout::KERNEL_SPACE_BASE - 1;
     let end = offset.checked_add(len).ok_or(SyscallError::InvalidArgs)?;
@@ -280,7 +306,9 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     match received {
         Some(msg) => {
             let sender = sender_tid_to_ret(msg.sender_tid.0)?;
-            encode_transfer_cap_ret(frame, msg.transferred_cap().map(|c| c.0))?;
+            let recv_local_transfer =
+                materialize_received_transfer_cap(kernel, msg.transferred_cap().map(|c| c.0))?;
+            encode_transfer_cap_ret(frame, recv_local_transfer)?;
 
             if current_task_has_user_asid(kernel)? {
                 if msg.opcode == OPCODE_SHARED_MEM {
@@ -375,5 +403,38 @@ mod tests {
             transfer_cap_arg(&state, &frame).expect("decode transfer cap"),
             Some(CapId(0))
         );
+    }
+
+    #[test]
+    fn syscall_recv_materializes_receiver_local_transfer_cap() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(crate::kernel::vm::PhysAddr(0x7000))
+            .expect("mem");
+        state
+            .ipc_send_with_cap_transfer(
+                send_cap,
+                crate::kernel::ipc::ThreadId(0),
+                0x44,
+                mem_cap,
+                b"ok",
+            )
+            .expect("send");
+
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut frame).expect("recv syscall");
+
+        assert_eq!(frame.error_code(), None);
+        let recv_local = CapId(frame.ret2() as u64);
+        assert_ne!(recv_local, mem_cap);
+        let mapped = state
+            .cspace
+            .get(recv_local)
+            .expect("receiver-local transferred cap");
+        assert!(matches!(mapped.object, CapObject::MemoryObject { .. }));
     }
 }
