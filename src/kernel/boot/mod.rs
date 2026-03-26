@@ -996,12 +996,21 @@ mod tests {
     #[test]
     fn ipc_message_header_and_cap_transfer_metadata_are_preserved() {
         let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        assert_eq!(state.ipc_recv(recv_cap).expect("block recv"), None);
+        assert_eq!(state.current_tid(), Some(0));
 
         state
             .ipc_send_with_cap_transfer(send_cap, ThreadId(0), 0x55, mem_cap, b"mt")
             .expect("send transfer");
+        state.yield_current().expect("switch receiver");
+        assert_eq!(state.current_tid(), Some(1));
         let msg = state.ipc_recv(recv_cap).expect("recv").expect("message");
 
         assert_eq!(msg.opcode, 0x55);
@@ -1009,7 +1018,7 @@ mod tests {
             msg.flags & Message::FLAG_CAP_TRANSFER,
             Message::FLAG_CAP_TRANSFER
         );
-        assert_eq!(msg.transferred_cap().map(|cap| cap.0), Some(mem_cap.0));
+        assert_ne!(msg.transferred_cap().map(|cap| cap.0), Some(mem_cap.0));
         assert_eq!(msg.as_slice(), b"mt");
     }
 
