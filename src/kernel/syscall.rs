@@ -1,7 +1,7 @@
 use super::boot::{KernelError, KernelState};
 use super::capabilities::{CapId, CapObject, CapRights};
 use super::ipc::{
-    IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
+    pack_register_payload, unpack_register_payload, Message, SharedMemoryRegion, IPC_REGISTER_BYTES,
 };
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
@@ -552,9 +552,12 @@ mod tests {
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0xA000))
             .expect("mem");
+        let recv1_task1 = state
+            .duplicate_global_capability_to_task(1, recv1)
+            .expect("dup recv1 to task1");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
-        assert_eq!(state.ipc_recv(recv1).expect("block recv"), None);
+        assert_eq!(state.ipc_recv(recv1_task1).expect("block recv"), None);
         assert_eq!(state.current_tid(), Some(0));
 
         let mut send_frame = TrapFrame::new(
@@ -592,10 +595,13 @@ mod tests {
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0xB000))
             .expect("mem");
+        let recv_cap_task1 = state
+            .duplicate_global_capability_to_task(1, recv_cap)
+            .expect("dup recv to task1");
 
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
-        assert_eq!(state.ipc_recv(recv_cap).expect("block recv"), None);
+        assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
         assert_eq!(state.current_tid(), Some(0));
 
         let mut send_frame = TrapFrame::new(

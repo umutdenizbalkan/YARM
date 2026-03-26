@@ -534,16 +534,16 @@ impl KernelState {
         Some(capability)
     }
 
-    pub(crate) fn capability_for_cnode_local(&self, cnode: CNodeId, cap: CapId) -> Option<Capability> {
-        self.cspace_for_cnode(cnode).and_then(|cspace| cspace.get(cap))
-    }
-
-    pub fn cnode_capability_has_right(
+    pub(crate) fn capability_for_cnode_local(
         &self,
         cnode: CNodeId,
         cap: CapId,
-        right: CapRights,
-    ) -> bool {
+    ) -> Option<Capability> {
+        self.cspace_for_cnode(cnode)
+            .and_then(|cspace| cspace.get(cap))
+    }
+
+    pub fn cnode_capability_has_right(&self, cnode: CNodeId, cap: CapId, right: CapRights) -> bool {
         self.capability_for_cnode(cnode, cap)
             .map(|capability| capability.has_right(right))
             .unwrap_or(false)
@@ -605,7 +605,10 @@ impl KernelState {
         cap_id: CapId,
     ) -> Result<(), KernelError> {
         let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
-        let capability = self.cspace.get(cap_id).ok_or(KernelError::InvalidCapability)?;
+        let capability = self
+            .cspace
+            .get(cap_id)
+            .ok_or(KernelError::InvalidCapability)?;
         self.mirror_capability_into_cnode(cnode, cap_id, capability)
     }
 
@@ -615,7 +618,10 @@ impl KernelState {
         cap_id: CapId,
     ) -> Result<CapId, KernelError> {
         let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
-        let capability = self.cspace.get(cap_id).ok_or(KernelError::InvalidCapability)?;
+        let capability = self
+            .cspace
+            .get(cap_id)
+            .ok_or(KernelError::InvalidCapability)?;
         self.mint_capability_in_cnode(cnode, capability)
     }
 
@@ -692,7 +698,11 @@ impl KernelState {
         self.set_fault_handler_for_task(tid, recv_cap)
     }
 
-    pub fn set_fault_handler_for_task(&mut self, tid: u64, recv_cap: CapId) -> Result<(), KernelError> {
+    pub fn set_fault_handler_for_task(
+        &mut self,
+        tid: u64,
+        recv_cap: CapId,
+    ) -> Result<(), KernelError> {
         let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
         let capability = self
             .capability_for_cnode(cnode, recv_cap)
@@ -832,54 +842,40 @@ mod tests {
         let first = state
             .stash_transfer_envelope(payload, endpoint, None)
             .expect("stash first");
-        assert!(
-            state
-                .take_transfer_envelope(first, endpoint, ThreadId(0))
-                .is_some()
-        );
-        assert!(
-            state
-                .take_transfer_envelope(first, endpoint, ThreadId(0))
-                .is_none()
-        );
+        assert!(state
+            .take_transfer_envelope(first, endpoint, ThreadId(0))
+            .is_some());
+        assert!(state
+            .take_transfer_envelope(first, endpoint, ThreadId(0))
+            .is_none());
 
         let second = state
             .stash_transfer_envelope(payload, endpoint, None)
             .expect("stash second");
         assert_ne!(first, second);
-        assert!(
-            state
-                .take_transfer_envelope(first, endpoint, ThreadId(0))
-                .is_none()
-        );
+        assert!(state
+            .take_transfer_envelope(first, endpoint, ThreadId(0))
+            .is_none());
         let wrong_endpoint = CapObject::Endpoint {
             index: usize::MAX,
             generation: 1,
         };
-        assert!(
-            state
-                .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
-                .is_none()
-        );
-        assert!(
-            state
-                .take_transfer_envelope(second, endpoint, ThreadId(0))
-                .is_some()
-        );
+        assert!(state
+            .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
+            .is_none());
+        assert!(state
+            .take_transfer_envelope(second, endpoint, ThreadId(0))
+            .is_some());
 
         let bound = state
             .stash_transfer_envelope(payload, endpoint, Some(ThreadId(9)))
             .expect("stash bound");
-        assert!(
-            state
-                .take_transfer_envelope(bound, endpoint, ThreadId(8))
-                .is_none()
-        );
-        assert!(
-            state
-                .take_transfer_envelope(bound, endpoint, ThreadId(9))
-                .is_some()
-        );
+        assert!(state
+            .take_transfer_envelope(bound, endpoint, ThreadId(8))
+            .is_none());
+        assert!(state
+            .take_transfer_envelope(bound, endpoint, ThreadId(9))
+            .is_some());
     }
 
     #[test]
@@ -1104,6 +1100,9 @@ mod tests {
         state.register_task(1).expect("register task 1");
         state.enqueue_current_cpu(1).expect("queue task 1");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let send_cap_task1 = state
+            .duplicate_global_capability_to_task(1, send_cap)
+            .expect("dup send cap to task1");
 
         assert_eq!(state.current_tid(), Some(0));
         let first_try = state.ipc_recv(recv_cap).expect("recv call should not fail");
@@ -1116,7 +1115,7 @@ mod tests {
 
         let msg = Message::new(1, b"ok").expect("msg");
         state
-            .ipc_send(send_cap, msg)
+            .ipc_send(send_cap_task1, msg)
             .expect("send should wake waiter");
         assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
     }
@@ -1129,6 +1128,9 @@ mod tests {
         let (_eid, send_cap, recv_cap) = state
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("sync endpoint");
+        let recv_cap_task1 = state
+            .duplicate_global_capability_to_task(1, recv_cap)
+            .expect("dup recv cap to task1");
 
         let msg = Message::new(0, b"xy").expect("msg");
         let send_result = state.ipc_send(send_cap, msg);
@@ -1140,7 +1142,7 @@ mod tests {
         assert_eq!(state.current_tid(), Some(1));
 
         let recv = state
-            .ipc_recv(recv_cap)
+            .ipc_recv(recv_cap_task1)
             .expect("recv call")
             .expect("direct handoff message");
         assert_eq!(recv.as_slice(), b"xy");
@@ -1172,13 +1174,17 @@ mod tests {
         let (_eid, send_cap, _recv_cap) = state.create_endpoint(2).expect("endpoint");
 
         let child = state
-            .cspace
-            .mint_derived(send_cap, CapRights::SEND)
+            .current_task_capability(send_cap)
+            .map(|cap| cap.object)
+            .expect("source cap");
+        let child = state
+            .mint_capability_for_current_context(Capability::new(child, CapRights::SEND))
             .expect("derive");
         let msg = Message::new(9, b"ok").expect("msg");
         assert!(state.ipc_send(child, msg).is_ok());
 
-        assert_eq!(state.cspace.revoke(child), Ok(()));
+        let cnode = state.current_task_cnode().expect("cnode");
+        assert_eq!(state.revoke_capability_in_cnode(cnode, child), Ok(()));
         let msg2 = Message::new(9, b"no").expect("msg");
         assert_eq!(
             state.ipc_send(child, msg2),
@@ -1260,13 +1266,11 @@ mod tests {
                 .revoke(cap),
             Ok(())
         );
-        assert!(
-            state
-                .cspace_for_cnode(cnode1)
-                .expect("cspace1")
-                .get(cap)
-                .is_none()
-        );
+        assert!(state
+            .cspace_for_cnode(cnode1)
+            .expect("cspace1")
+            .get(cap)
+            .is_none());
         let remaining = state
             .cspace_for_cnode(cnode2)
             .expect("cspace2")
@@ -1283,9 +1287,12 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let recv_cap_task1 = state
+            .duplicate_global_capability_to_task(1, recv_cap)
+            .expect("dup recv to task1");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
-        assert_eq!(state.ipc_recv(recv_cap).expect("block recv"), None);
+        assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
         assert_eq!(state.current_tid(), Some(0));
 
         state
@@ -1293,7 +1300,10 @@ mod tests {
             .expect("send transfer");
         state.yield_current().expect("switch receiver");
         assert_eq!(state.current_tid(), Some(1));
-        let msg = state.ipc_recv(recv_cap).expect("recv").expect("message");
+        let msg = state
+            .ipc_recv(recv_cap_task1)
+            .expect("recv")
+            .expect("message");
 
         assert_eq!(msg.opcode, 0x55);
         assert_eq!(
@@ -1398,8 +1408,11 @@ mod tests {
         assert_eq!(wrong_object, Err(KernelError::WrongObject));
 
         let read_only_cap = state
-            .cspace
-            .mint_derived(aspace_map_cap, CapRights::READ)
+            .current_task_capability(aspace_map_cap)
+            .map(|cap| cap.object)
+            .expect("aspace cap object");
+        let read_only_cap = state
+            .mint_capability_for_current_context(Capability::new(read_only_cap, CapRights::READ))
             .expect("derive read-only aspace cap");
         let missing_right = state.map_user_page(
             read_only_cap,
@@ -1455,8 +1468,11 @@ mod tests {
             .expect("memobj");
 
         let readonly_mem = state
-            .cspace
-            .mint_derived(mem_cap, CapRights::READ)
+            .current_task_capability(mem_cap)
+            .map(|cap| cap.object)
+            .expect("mem cap object");
+        let readonly_mem = state
+            .mint_capability_for_current_context(Capability::new(readonly_mem, CapRights::READ))
             .expect("derive ro");
 
         let res = state.map_user_page_with_caps(
@@ -1525,9 +1541,12 @@ mod tests {
         state.bind_task_asid(0, asid).expect("bind");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let recv_cap_task1 = state
+            .duplicate_global_capability_to_task(1, recv_cap)
+            .expect("dup recv to task1");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
-        assert_eq!(state.ipc_recv(recv_cap).expect("block recv"), None);
+        assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
         assert_eq!(state.current_tid(), Some(0));
 
         let mut send_frame = TrapFrame::new(
@@ -1547,7 +1566,7 @@ mod tests {
 
         state.yield_current().expect("switch receiver");
         assert_eq!(state.current_tid(), Some(1));
-        let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        let msg = state.ipc_recv(recv_cap_task1).expect("recv").expect("msg");
         assert!(msg.transferred_cap().is_some());
         let region =
             crate::kernel::ipc::SharedMemoryRegion::decode(msg.as_slice()).expect("region");
@@ -1705,6 +1724,9 @@ mod tests {
         let (_handler_eid, _handler_send, handler_recv) =
             state.create_endpoint(4).expect("handler endpoint");
         state.set_fault_handler(handler_recv).expect("set handler");
+        let handler_recv_task1 = state
+            .duplicate_global_capability_to_task(1, handler_recv)
+            .expect("dup handler recv to task1");
 
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind");
@@ -1740,7 +1762,7 @@ mod tests {
         assert_eq!(state.current_tid(), Some(1));
 
         let report = state
-            .ipc_recv(handler_recv)
+            .ipc_recv(handler_recv_task1)
             .expect("handler recv")
             .expect("fault report");
         assert_eq!(report.sender_tid.0, 0);
@@ -1898,15 +1920,13 @@ mod tests {
         let (irq_cap, dma_cap) = state.delegate_device_server_caps(plan).expect("delegate");
         assert!(state.cspace.get(irq_cap).is_some());
         assert!(state.cspace.get(dma_cap).is_some());
-        assert!(
-            state
-                .validate_driver_dma_iova(
-                    34,
-                    crate::kernel::vm::PAGE_SIZE * 8,
-                    crate::kernel::vm::PAGE_SIZE,
-                )
-                .is_ok()
-        );
+        assert!(state
+            .validate_driver_dma_iova(
+                34,
+                crate::kernel::vm::PAGE_SIZE * 8,
+                crate::kernel::vm::PAGE_SIZE,
+            )
+            .is_ok());
     }
 
     #[test]
@@ -1918,19 +1938,34 @@ mod tests {
         let (_eid, send_cap, recv_cap) = state
             .create_endpoint_with_mode(2, EndpointMode::Synchronous)
             .expect("endpoint");
+        let recv_cap_task61 = state
+            .duplicate_global_capability_to_task(61, recv_cap)
+            .expect("dup recv to task61");
+        let send_cap_task60 = state
+            .duplicate_global_capability_to_task(60, send_cap)
+            .expect("dup send to task60");
 
         state.enqueue_current_cpu(61).expect("enqueue receiver");
+        state.yield_current().expect("run receiver");
+        assert_eq!(state.current_tid(), Some(61));
         let mut recv_tf = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, 8, 0x9000, 0, 0, 0],
+            [recv_cap_task61.0 as usize, 8, 0x9000, 0, 0, 0],
         );
         state
             .handle_trap(Trap::Syscall, Some(&mut recv_tf))
             .expect("recv trap");
 
         state.enqueue_current_cpu(60).expect("enqueue sender");
+        state.yield_current().expect("run sender");
+        if state.current_tid() != Some(60) {
+            state.yield_current().expect("run sender retry");
+        }
+        assert_eq!(state.current_tid(), Some(60));
         let msg = Message::new(60, b"fp").expect("msg");
-        let fast = state.ipc_send_fastpath(send_cap, msg).expect("fastpath");
+        let fast = state
+            .ipc_send_fastpath(send_cap_task60, msg)
+            .expect("fastpath");
         assert!(fast.switched_to_waiter);
 
         let (_beid, bsend_cap, _brecv_cap) = state.create_endpoint(2).expect("buffered");
@@ -2043,25 +2078,38 @@ mod tests {
         let (_eid, send_cap, recv_cap) = state
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
+        let recv_cap_task81 = state
+            .duplicate_global_capability_to_task(81, recv_cap)
+            .expect("dup recv to task81");
+        let send_cap_task80 = state
+            .duplicate_global_capability_to_task(80, send_cap)
+            .expect("dup send to task80");
 
         state.enqueue_current_cpu(81).expect("enqueue receiver");
+        state.yield_current().expect("run receiver");
+        assert_eq!(state.current_tid(), Some(81));
         let mut recv_tf = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, 8, 0x1100, 0, 0, 0],
+            [recv_cap_task81.0 as usize, 8, 0x1100, 0, 0, 0],
         );
         state
             .handle_trap(Trap::Syscall, Some(&mut recv_tf))
             .expect("recv trap");
 
         state.enqueue_current_cpu(80).expect("enqueue sender");
+        state.yield_current().expect("run sender");
+        assert_eq!(state.current_tid(), Some(80));
         state
-            .ipc_send(send_cap, Message::new(80, b"rv").expect("msg"))
+            .ipc_send(send_cap_task80, Message::new(80, b"rv").expect("msg"))
             .expect("send");
 
-        let delivered = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        let delivered = state.ipc_recv(recv_cap_task81).expect("recv").expect("msg");
         assert_eq!(delivered.as_slice(), b"rv");
-        assert!(state.ipc_recv(recv_cap).expect("recv2").is_none());
-        assert_eq!(state.task_status(80), Some(TaskStatus::Runnable));
+        assert!(state.ipc_recv(recv_cap_task81).expect("recv2").is_none());
+        assert!(matches!(
+            state.task_status(80),
+            Some(TaskStatus::Runnable | TaskStatus::Running)
+        ));
 
         let t = state.ipc_path_telemetry();
         assert!(t.rendezvous_handoffs >= 1);
@@ -2077,19 +2125,31 @@ mod tests {
         let (_eid, send_cap, recv_cap) = state
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
+        let recv_cap_task36 = state
+            .duplicate_global_capability_to_task(36, recv_cap)
+            .expect("dup recv to task36");
+        let send_cap_task35 = state
+            .duplicate_global_capability_to_task(35, send_cap)
+            .expect("dup send to task35");
 
         state.enqueue_current_cpu(36).expect("enqueue receiver");
+        state.yield_current().expect("run receiver");
+        assert_eq!(state.current_tid(), Some(36));
         let mut recv_tf = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, 8, 0x7000, 0, 0, 0],
+            [recv_cap_task36.0 as usize, 8, 0x7000, 0, 0, 0],
         );
         state
             .handle_trap(Trap::Syscall, Some(&mut recv_tf))
             .expect("recv trap");
 
         state.enqueue_current_cpu(35).expect("enqueue sender");
+        state.yield_current().expect("run sender");
+        assert_eq!(state.current_tid(), Some(35));
         let msg = Message::new(35, b"x").expect("msg");
-        let result = state.ipc_send_fastpath(send_cap, msg).expect("fastpath");
+        let result = state
+            .ipc_send_fastpath(send_cap_task35, msg)
+            .expect("fastpath");
         assert!(result.switched_to_waiter);
     }
 
@@ -2155,22 +2215,16 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
 
-        assert!(
-            state
-                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
-                .is_ok()
-        );
-        assert!(
-            state
-                .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
-                .is_err()
-        );
+        assert!(state
+            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+            .is_ok());
+        assert!(state
+            .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
+            .is_err());
         assert!(state.mint_dma_region_cap(mem_cap, 0, 0).is_err());
-        assert!(
-            state
-                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-                .is_err()
-        );
+        assert!(state
+            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+            .is_err());
     }
 
     #[test]
@@ -2245,15 +2299,13 @@ mod tests {
         let token = state.exit_task(22, 1).expect("exit");
         state.restart_task(22, token).expect("restart");
 
-        assert!(
-            state
-                .validate_driver_dma_iova(
-                    22,
-                    crate::kernel::vm::PAGE_SIZE * 8,
-                    crate::kernel::vm::PAGE_SIZE
-                )
-                .is_err()
-        );
+        assert!(state
+            .validate_driver_dma_iova(
+                22,
+                crate::kernel::vm::PAGE_SIZE * 8,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_err());
     }
 
     #[test]
@@ -2271,26 +2323,22 @@ mod tests {
                 crate::kernel::vm::PAGE_SIZE,
             )
             .expect("window");
-        assert!(
-            state
-                .validate_driver_dma_iova(
-                    31,
-                    crate::kernel::vm::PAGE_SIZE * 2,
-                    crate::kernel::vm::PAGE_SIZE
-                )
-                .is_ok()
-        );
+        assert!(state
+            .validate_driver_dma_iova(
+                31,
+                crate::kernel::vm::PAGE_SIZE * 2,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_ok());
 
         state.detach_driver_iova_space(31).expect("detach");
-        assert!(
-            state
-                .validate_driver_dma_iova(
-                    31,
-                    crate::kernel::vm::PAGE_SIZE * 2,
-                    crate::kernel::vm::PAGE_SIZE
-                )
-                .is_err()
-        );
+        assert!(state
+            .validate_driver_dma_iova(
+                31,
+                crate::kernel::vm::PAGE_SIZE * 2,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_err());
     }
 
     #[test]
@@ -2412,24 +2460,20 @@ mod tests {
             )
             .expect("window");
 
-        assert!(
-            state
-                .validate_driver_dma_iova(
-                    12,
-                    crate::kernel::vm::PAGE_SIZE * 4,
-                    crate::kernel::vm::PAGE_SIZE
-                )
-                .is_ok()
-        );
-        assert!(
-            state
-                .validate_driver_dma_iova(
-                    12,
-                    crate::kernel::vm::PAGE_SIZE * 3,
-                    crate::kernel::vm::PAGE_SIZE
-                )
-                .is_err()
-        );
+        assert!(state
+            .validate_driver_dma_iova(
+                12,
+                crate::kernel::vm::PAGE_SIZE * 4,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_ok());
+        assert!(state
+            .validate_driver_dma_iova(
+                12,
+                crate::kernel::vm::PAGE_SIZE * 3,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_err());
     }
 
     #[test]

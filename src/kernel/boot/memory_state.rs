@@ -4,9 +4,9 @@ use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError};
 
 impl KernelState {
     pub fn destroy_user_address_space(&mut self, aspace_cap: CapId) -> Result<(), KernelError> {
+        let cnode = self.current_task_cnode().ok_or(KernelError::TaskMissing)?;
         let capability = self
-            .current_task_capability(aspace_cap)
-            .or_else(|| self.cspace.get(aspace_cap))
+            .capability_for_cnode_local(cnode, aspace_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let asid = match capability.object {
             CapObject::AddressSpace { asid } => Asid(asid),
@@ -63,9 +63,9 @@ impl KernelState {
         virt: VirtAddr,
         mapping: Mapping,
     ) -> Result<Option<Mapping>, KernelError> {
+        let cnode = self.current_task_cnode().ok_or(KernelError::TaskMissing)?;
         let capability = self
-            .current_task_capability(map_cap)
-            .or_else(|| self.cspace.get(map_cap))
+            .capability_for_cnode_local(cnode, map_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let asid = match capability.object {
             CapObject::AddressSpace { asid } => Asid(asid),
