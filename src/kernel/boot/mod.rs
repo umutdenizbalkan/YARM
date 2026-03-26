@@ -1227,10 +1227,17 @@ mod tests {
     #[test]
     fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() {
         let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
         let (asid, _aspace_map_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        assert_eq!(state.ipc_recv(recv_cap).expect("block recv"), None);
+        assert_eq!(state.current_tid(), Some(0));
 
         let mut send_frame = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcSend as usize,
@@ -1247,6 +1254,8 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut send_frame))
             .expect("send syscall");
 
+        state.yield_current().expect("switch receiver");
+        assert_eq!(state.current_tid(), Some(1));
         let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
         assert!(msg.transferred_cap().is_some());
         let region =

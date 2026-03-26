@@ -216,10 +216,12 @@ fn stash_transfer_handle(
     let source_cap = kernel
         .current_task_capability(source_cap_id)
         .ok_or(SyscallError::InvalidCapability)?;
-    let receiver_tid = kernel.endpoint_waiter_tid(endpoint);
+    let receiver_tid = kernel
+        .endpoint_waiter_tid(endpoint)
+        .ok_or(SyscallError::WouldBlock)?;
     Ok(Some(
         kernel
-            .stash_transfer_envelope(source_cap, endpoint, receiver_tid)
+            .stash_transfer_envelope(source_cap, endpoint, Some(receiver_tid))
             .ok_or(SyscallError::QueueFull)?,
     ))
 }
@@ -453,10 +455,18 @@ mod tests {
     #[test]
     fn syscall_recv_materializes_receiver_local_transfer_cap() {
         let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0x7000))
             .expect("mem");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        assert_eq!(state.ipc_recv(recv_cap).expect("block recv"), None);
+        assert_eq!(state.current_tid(), Some(0));
+
         let mut send_frame = TrapFrame::new(
             Syscall::IpcSend as usize,
             [
@@ -470,6 +480,8 @@ mod tests {
         );
         dispatch(&mut state, &mut send_frame).expect("send syscall");
         assert_eq!(send_frame.error_code(), None);
+        state.yield_current().expect("switch to receiver");
+        assert_eq!(state.current_tid(), Some(1));
 
         let mut frame = TrapFrame::new(
             Syscall::IpcRecv as usize,
@@ -515,11 +527,18 @@ mod tests {
     #[test]
     fn transfer_envelope_handle_is_bound_to_endpoint_context() {
         let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
         let (_e1, send1, recv1) = state.create_endpoint(2).expect("endpoint1");
         let (_e2, send2, recv2) = state.create_endpoint(2).expect("endpoint2");
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0xA000))
             .expect("mem");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        assert_eq!(state.ipc_recv(recv1).expect("block recv"), None);
+        assert_eq!(state.current_tid(), Some(0));
 
         let mut send_frame = TrapFrame::new(
             Syscall::IpcSend as usize,
