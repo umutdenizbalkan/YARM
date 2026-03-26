@@ -70,6 +70,7 @@ fn kernel_mut<T>(value: &mut KernelStorage<T>) -> &mut T {
 }
 
 const MAX_ENDPOINTS: usize = 16;
+const MAX_ENDPOINT_SENDER_WAITERS: usize = 4;
 const MAX_TASKS: usize = 64;
 const MAX_MEMORY_OBJECTS: usize = 128;
 const MAX_NOTIFICATIONS: usize = 16;
@@ -223,12 +224,19 @@ struct TransferEnvelope {
     receiver_tid: Option<ThreadId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SenderWaiter {
+    tid: ThreadId,
+    msg: Message,
+    blocked: bool,
+}
+
 #[derive(Debug)]
 struct IpcSubsystem {
     cross_cpu_work: SmpMailbox,
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
     endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
-    endpoint_sender_waiters: [Option<(ThreadId, Message, bool)>; MAX_ENDPOINTS],
+    endpoint_sender_waiters: [[Option<SenderWaiter>; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
     endpoint_generations: [u64; MAX_ENDPOINTS],
     notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
     notification_generations: [u64; MAX_NOTIFICATIONS],
@@ -358,7 +366,10 @@ impl Bootstrap {
                 cross_cpu_work: SmpMailbox::default(),
                 endpoints: [const { None }; MAX_ENDPOINTS],
                 endpoint_waiters: [None; MAX_ENDPOINTS],
-                endpoint_sender_waiters: [None; MAX_ENDPOINTS],
+                endpoint_sender_waiters: [
+                    [None; MAX_ENDPOINT_SENDER_WAITERS];
+                    MAX_ENDPOINTS
+                ],
                 endpoint_generations: [0; MAX_ENDPOINTS],
                 notifications: [const { None }; MAX_NOTIFICATIONS],
                 notification_generations: [0; MAX_NOTIFICATIONS],
@@ -1166,6 +1177,54 @@ mod tests {
             .expect("direct handoff message");
         assert_eq!(recv.as_slice(), b"xy");
         assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
+    }
+
+    #[test]
+    fn synchronous_endpoint_supports_multiple_blocked_senders() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("register sender 1");
+        state.register_task(2).expect("register sender 2");
+        state.register_task(3).expect("register receiver");
+
+        let (_eid, send_cap, recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("sync endpoint");
+        let send_cap_task1 = state
+            .duplicate_global_capability_to_task(1, send_cap)
+            .expect("dup send cap to task1");
+        let recv_cap_task3 = state
+            .duplicate_global_capability_to_task(3, recv_cap)
+            .expect("dup recv cap to task3");
+
+        state.enqueue_current_cpu(1).expect("queue task 1");
+        state.enqueue_current_cpu(2).expect("queue task 2");
+        state.enqueue_current_cpu(3).expect("queue task 3");
+
+        let msg0 = Message::new(0, b"m0").expect("msg0");
+        assert_eq!(state.ipc_send(send_cap, msg0), Err(KernelError::WouldBlock));
+        assert_eq!(
+            state.task_status(0),
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+        );
+        assert_eq!(state.current_tid(), Some(1));
+
+        let msg1 = Message::new(1, b"m1").expect("msg1");
+        assert_eq!(
+            state.ipc_send(send_cap_task1, msg1),
+            Err(KernelError::WouldBlock)
+        );
+        assert_eq!(
+            state.task_status(1),
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap_task1)))
+        );
+
+        state.yield_current().expect("switch to receiver");
+        assert_eq!(state.current_tid(), Some(3));
+
+        let first = state.ipc_recv(recv_cap_task3).expect("recv1").expect("msg1");
+        let second = state.ipc_recv(recv_cap_task3).expect("recv2").expect("msg2");
+        assert_eq!(first.as_slice(), b"m0");
+        assert_eq!(second.as_slice(), b"m1");
     }
 
     #[test]

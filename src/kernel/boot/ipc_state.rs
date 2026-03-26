@@ -1,12 +1,35 @@
 use super::{
     map_ipc_error, IpcFastpathResult, KernelError, KernelState, NotificationObject, MAX_ENDPOINTS,
-    MAX_IRQ_LINES, MAX_NOTIFICATIONS,
+    MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, MAX_NOTIFICATIONS, SenderWaiter,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
 use crate::kernel::task::{TaskStatus, WaitReason};
 
 impl KernelState {
+    fn enqueue_sender_waiter(
+        &mut self,
+        endpoint_idx: usize,
+        waiter: SenderWaiter,
+    ) -> Result<(), KernelError> {
+        let queue = &mut self.ipc.endpoint_sender_waiters[endpoint_idx];
+        if let Some(slot) = queue.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(waiter);
+            return Ok(());
+        }
+        Err(KernelError::EndpointQueueFull)
+    }
+
+    fn dequeue_sender_waiter(&mut self, endpoint_idx: usize) -> Option<SenderWaiter> {
+        let queue = &mut self.ipc.endpoint_sender_waiters[endpoint_idx];
+        let head = queue[0].take()?;
+        for idx in 1..queue.len() {
+            queue[idx - 1] = queue[idx].take();
+        }
+        queue[queue.len() - 1] = None;
+        Some(head)
+    }
+
     fn resolve_send_cap_task_local(&self, send_cap: CapId) -> Result<Capability, KernelError> {
         let cnode = self.current_task_cnode().ok_or(KernelError::TaskMissing)?;
         self.capability_for_cnode_local(cnode, send_cap)
@@ -52,14 +75,17 @@ impl KernelState {
         send_cap: CapId,
         msg: Message,
     ) -> Result<(), KernelError> {
-        if self.ipc.endpoint_sender_waiters[endpoint_idx].is_some() {
-            return Err(KernelError::EndpointQueueFull);
-        }
-
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
         tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
-        self.ipc.endpoint_sender_waiters[endpoint_idx] = Some((ThreadId(blocked_tid), msg, true));
+        self.enqueue_sender_waiter(
+            endpoint_idx,
+            SenderWaiter {
+                tid: ThreadId(blocked_tid),
+                msg,
+                blocked: true,
+            },
+        )?;
         let _ = self.dispatch_next_task()?;
         Ok(())
     }
@@ -119,7 +145,7 @@ impl KernelState {
             self.faults.fault_handler_endpoint = None;
         }
         self.ipc.endpoint_waiters[endpoint_idx] = None;
-        self.ipc.endpoint_sender_waiters[endpoint_idx] = None;
+        self.ipc.endpoint_sender_waiters[endpoint_idx] = [None; MAX_ENDPOINT_SENDER_WAITERS];
         let mut next_generation = self.ipc.endpoint_generations[endpoint_idx].wrapping_add(1);
         if next_generation == 0 {
             next_generation = 1;
@@ -433,34 +459,35 @@ impl KernelState {
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
 
-        let endpoint = self
+        let dequeued = self
             .ipc
             .endpoints
             .get_mut(endpoint_idx)
             .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?;
+            .ok_or(KernelError::WrongObject)?
+            .recv();
 
-        if let Some(msg) = endpoint.recv() {
-            if let Some((sender_tid, pending_msg, sender_blocked)) =
-                self.ipc.endpoint_sender_waiters[endpoint_idx].take()
-            {
-                endpoint
-                    .send(pending_msg)
+        if let Some(msg) = dequeued {
+            if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
+                self.ipc
+                    .endpoints
+                    .get_mut(endpoint_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(KernelError::WrongObject)?
+                    .send(waiter.msg)
                     .map_err(|_| KernelError::EndpointQueueFull)?;
-                if sender_blocked {
-                    self.wake_sender_waiter(sender_tid)?;
+                if waiter.blocked {
+                    self.wake_sender_waiter(waiter.tid)?;
                 }
             }
             return Ok(Some(msg));
         }
 
-        if let Some((sender_tid, pending_msg, sender_blocked)) =
-            self.ipc.endpoint_sender_waiters[endpoint_idx].take()
-        {
-            if sender_blocked {
-                self.wake_sender_waiter(sender_tid)?;
+        if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
+            if waiter.blocked {
+                self.wake_sender_waiter(waiter.tid)?;
             }
-            return Ok(Some(pending_msg));
+            return Ok(Some(waiter.msg));
         }
 
         Ok(None)
@@ -474,34 +501,35 @@ impl KernelState {
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
 
-        let endpoint = self
+        let dequeued = self
             .ipc
             .endpoints
             .get_mut(endpoint_idx)
             .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?;
+            .ok_or(KernelError::WrongObject)?
+            .recv();
 
-        if let Some(msg) = endpoint.recv() {
-            if let Some((sender_tid, pending_msg, sender_blocked)) =
-                self.ipc.endpoint_sender_waiters[endpoint_idx].take()
-            {
-                endpoint
-                    .send(pending_msg)
+        if let Some(msg) = dequeued {
+            if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
+                self.ipc
+                    .endpoints
+                    .get_mut(endpoint_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(KernelError::WrongObject)?
+                    .send(waiter.msg)
                     .map_err(|_| KernelError::EndpointQueueFull)?;
-                if sender_blocked {
-                    self.wake_sender_waiter(sender_tid)?;
+                if waiter.blocked {
+                    self.wake_sender_waiter(waiter.tid)?;
                 }
             }
             return Ok(Some(msg));
         }
 
-        if let Some((sender_tid, pending_msg, sender_blocked)) =
-            self.ipc.endpoint_sender_waiters[endpoint_idx].take()
-        {
-            if sender_blocked {
-                self.wake_sender_waiter(sender_tid)?;
+        if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
+            if waiter.blocked {
+                self.wake_sender_waiter(waiter.tid)?;
             }
-            return Ok(Some(pending_msg));
+            return Ok(Some(waiter.msg));
         }
 
         self.block_current_on_receive(endpoint_idx, recv_cap)?;
