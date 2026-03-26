@@ -9,7 +9,7 @@ mod task_policy_state;
 mod thread_state;
 mod user_memory_state;
 
-use super::capabilities::{CapId, CapObject, CapRights, Capability, CapabilitySpace};
+use super::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability, CapabilitySpace};
 #[cfg(test)]
 use super::ipc::EndpointMode;
 use super::ipc::{Endpoint, IpcError, Message};
@@ -55,6 +55,7 @@ const MAX_MEMORY_OBJECTS: usize = 128;
 const MAX_NOTIFICATIONS: usize = 16;
 const MAX_IRQ_LINES: usize = platform_layout::MAX_IRQ_LINES;
 const MAX_DRIVERS: usize = 32;
+const MAX_TRANSFER_ENVELOPES: usize = 64;
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +195,13 @@ struct RobustFutexRecord {
     state: RobustFutexState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransferEnvelope {
+    capability: Capability,
+    endpoint: CapObject,
+    receiver_tid: Option<ThreadId>,
+}
+
 #[derive(Debug)]
 struct IpcSubsystem {
     cross_cpu_work: SmpMailbox,
@@ -204,6 +212,8 @@ struct IpcSubsystem {
     notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
     notification_generations: [u64; MAX_NOTIFICATIONS],
     irq_routes: [Option<usize>; MAX_IRQ_LINES],
+    transfer_envelopes: [Option<TransferEnvelope>; MAX_TRANSFER_ENVELOPES],
+    transfer_envelope_generations: [u64; MAX_TRANSFER_ENVELOPES],
     telemetry: IpcPathTelemetry,
 }
 
@@ -243,7 +253,7 @@ struct RestartSubsystem {
 pub struct KernelState {
     pub kernel_aspace: AddressSpace,
     pub scheduler: KernelStorage<SmpScheduler>,
-    pub cspace: CapabilitySpace,
+    pub cspace: KernelStorage<CapabilitySpace>,
     pub timer: Timer,
     pub user_spaces: AddressSpaceManager,
     current_cpu: CpuId,
@@ -312,7 +322,7 @@ impl Bootstrap {
         let mut state = KernelState {
             kernel_aspace,
             scheduler: store_kernel_value(scheduler),
-            cspace,
+            cspace: store_kernel_value(cspace),
             timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: AddressSpaceManager::default(),
             current_cpu: CpuId(platform_layout::BOOTSTRAP_CPU_ID),
@@ -325,6 +335,8 @@ impl Bootstrap {
                 notifications: [const { None }; MAX_NOTIFICATIONS],
                 notification_generations: [0; MAX_NOTIFICATIONS],
                 irq_routes: [None; MAX_IRQ_LINES],
+                transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
+                transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],
                 telemetry: IpcPathTelemetry::default(),
             }),
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
@@ -392,6 +404,92 @@ impl KernelState {
             .flatten()
             .find(|tcb| tcb.tid.0 == tid)
             .and_then(|tcb| tcb.restart.token.map(|token| token.0))
+    }
+
+    pub fn current_task_cnode(&self) -> Option<CNodeId> {
+        let tid = self.current_tid()?;
+        self.tcbs
+            .iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .map(|tcb| tcb.cnode)
+    }
+
+    pub fn current_task_capability(&self, cap: CapId) -> Option<Capability> {
+        let _cnode = self.current_task_cnode()?;
+        self.cspace.get(cap)
+    }
+
+    pub fn current_task_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
+        self.current_task_capability(cap)
+            .map(|capability| capability.has_right(right))
+            .unwrap_or(false)
+    }
+
+    pub fn stash_transfer_envelope(
+        &mut self,
+        capability: Capability,
+        endpoint: CapObject,
+        receiver_tid: Option<ThreadId>,
+    ) -> Option<u64> {
+        for idx in 0..MAX_TRANSFER_ENVELOPES {
+            if self.ipc.transfer_envelopes[idx].is_some() {
+                continue;
+            }
+            let mut generation = self.ipc.transfer_envelope_generations[idx].wrapping_add(1);
+            if generation == 0 {
+                generation = 1;
+            }
+            self.ipc.transfer_envelope_generations[idx] = generation;
+            self.ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
+                capability,
+                endpoint,
+                receiver_tid,
+            });
+            let idx_part = u64::try_from(idx).ok()?;
+            return Some((generation << 16) | idx_part);
+        }
+        None
+    }
+
+    pub fn take_transfer_envelope(
+        &mut self,
+        handle: u64,
+        endpoint: CapObject,
+        receiver_tid: ThreadId,
+    ) -> Option<Capability> {
+        let idx = usize::try_from(handle & 0xFFFF).ok()?;
+        if idx >= MAX_TRANSFER_ENVELOPES {
+            return None;
+        }
+        let generation = handle >> 16;
+        if generation == 0 || self.ipc.transfer_envelope_generations[idx] != generation {
+            return None;
+        }
+        let envelope = self.ipc.transfer_envelopes[idx]?;
+        if envelope.endpoint != endpoint {
+            return None;
+        }
+        if let Some(bound_receiver) = envelope.receiver_tid {
+            if bound_receiver != receiver_tid {
+                return None;
+            }
+        }
+        self.ipc.transfer_envelopes[idx] = None;
+        Some(envelope.capability)
+    }
+
+    pub fn endpoint_waiter_tid(&self, endpoint: CapObject) -> Option<ThreadId> {
+        let CapObject::Endpoint { index, generation } = endpoint else {
+            return None;
+        };
+        if index >= MAX_ENDPOINTS {
+            return None;
+        }
+        if self.ipc.endpoint_generations[index] != generation {
+            return None;
+        }
+        self.ipc.endpoint_waiters[index]
     }
 
     pub fn capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
@@ -528,6 +626,67 @@ mod tests {
         assert_eq!(state.online_cpu_count(), 1);
         assert_eq!(state.current_tid().expect("boot task"), 0);
         assert_eq!(state.task_status(0), Some(TaskStatus::Running));
+    }
+
+    #[test]
+    fn transfer_envelope_handles_are_single_use_and_replay_safe() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+        let payload = state.cspace.get(mem_cap).expect("payload");
+        let endpoint = state.cspace.get(send_cap).expect("send cap").object;
+
+        let first = state
+            .stash_transfer_envelope(payload, endpoint, None)
+            .expect("stash first");
+        assert!(
+            state
+                .take_transfer_envelope(first, endpoint, ThreadId(0))
+                .is_some()
+        );
+        assert!(
+            state
+                .take_transfer_envelope(first, endpoint, ThreadId(0))
+                .is_none()
+        );
+
+        let second = state
+            .stash_transfer_envelope(payload, endpoint, None)
+            .expect("stash second");
+        assert_ne!(first, second);
+        assert!(
+            state
+                .take_transfer_envelope(first, endpoint, ThreadId(0))
+                .is_none()
+        );
+        let wrong_endpoint = CapObject::Endpoint {
+            index: usize::MAX,
+            generation: 1,
+        };
+        assert!(
+            state
+                .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
+                .is_none()
+        );
+        assert!(
+            state
+                .take_transfer_envelope(second, endpoint, ThreadId(0))
+                .is_some()
+        );
+
+        let bound = state
+            .stash_transfer_envelope(payload, endpoint, Some(ThreadId(9)))
+            .expect("stash bound");
+        assert!(
+            state
+                .take_transfer_envelope(bound, endpoint, ThreadId(8))
+                .is_none()
+        );
+        assert!(
+            state
+                .take_transfer_envelope(bound, endpoint, ThreadId(9))
+                .is_some()
+        );
     }
 
     #[test]
@@ -837,12 +996,21 @@ mod tests {
     #[test]
     fn ipc_message_header_and_cap_transfer_metadata_are_preserved() {
         let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        assert_eq!(state.ipc_recv(recv_cap).expect("block recv"), None);
+        assert_eq!(state.current_tid(), Some(0));
 
         state
             .ipc_send_with_cap_transfer(send_cap, ThreadId(0), 0x55, mem_cap, b"mt")
             .expect("send transfer");
+        state.yield_current().expect("switch receiver");
+        assert_eq!(state.current_tid(), Some(1));
         let msg = state.ipc_recv(recv_cap).expect("recv").expect("message");
 
         assert_eq!(msg.opcode, 0x55);
@@ -850,7 +1018,7 @@ mod tests {
             msg.flags & Message::FLAG_CAP_TRANSFER,
             Message::FLAG_CAP_TRANSFER
         );
-        assert_eq!(msg.transferred_cap().map(|cap| cap.0), Some(mem_cap.0));
+        assert_ne!(msg.transferred_cap().map(|cap| cap.0), Some(mem_cap.0));
         assert_eq!(msg.as_slice(), b"mt");
     }
 
@@ -862,7 +1030,14 @@ mod tests {
         let send_payload = usize::from_le_bytes([b'h', b'i', 0, 0, 0, 0, 0, 0]);
         let mut send_frame = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcSend as usize,
-            [send_cap.0 as usize, 42, 2, send_payload, 0, 0],
+            [
+                send_cap.0 as usize,
+                42,
+                2,
+                send_payload,
+                0,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
         );
 
         state
@@ -1041,7 +1216,14 @@ mod tests {
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let mut send_frame = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcSend as usize,
-            [send_cap.0 as usize, 0, 2, 0, 0, 0],
+            [
+                send_cap.0 as usize,
+                0,
+                2,
+                0,
+                0,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
         );
         state
             .handle_trap(Trap::Syscall, Some(&mut send_frame))
@@ -1054,10 +1236,17 @@ mod tests {
     #[test]
     fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() {
         let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
         let (asid, _aspace_map_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        assert_eq!(state.ipc_recv(recv_cap).expect("block recv"), None);
+        assert_eq!(state.current_tid(), Some(0));
 
         let mut send_frame = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcSend as usize,
@@ -1074,6 +1263,8 @@ mod tests {
             .handle_trap(Trap::Syscall, Some(&mut send_frame))
             .expect("send syscall");
 
+        state.yield_current().expect("switch receiver");
+        assert_eq!(state.current_tid(), Some(1));
         let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
         assert!(msg.transferred_cap().is_some());
         let region =

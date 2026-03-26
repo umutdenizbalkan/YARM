@@ -2,13 +2,36 @@
 
 This matrix maps roadmap phase completion to required contracts, CI jobs, and deterministic tests.
 
+## Phase 1 — File System Servers (basic set)
+
+- Contract docs:
+  - `STORAGE_SERVICE_CONTRACT.md`
+  - `DEVFS_CONTRACT.md`
+  - `INITRAMFS_CONTRACT.md`
+  - `RAMFS_CONTRACT.md`
+- Required deterministic tests/checks:
+  - `services::fs::ramfs::service::tests::ramfs_protocol_vectors_match_frozen_vfs_codec`
+  - `services::fs::ramfs::service::tests::ramfs_mount_gate_routes_with_policy_denial`
+  - `services::fs::ramfs::service::tests::ramfs_lifecycle_gate_covers_mount_failure_recovery_and_close`
+  - `services::fs::ramfs::service::tests::ramfs_inflight_fd_survives_mount_failure_until_close`
+  - `services::fs::ramfs::service::tests::ramfs_protocol_rejects_malformed_openat_payload`
+  - `services::fs::devfs::service::tests::devfs_protocol_vectors_match_frozen_vfs_codec`
+  - `services::fs::devfs::service::tests::devfs_mount_gate_routes_devfs_and_initramfs_with_policy_denial`
+  - `services::fs::devfs::service::tests::devfs_lifecycle_gate_covers_mount_failure_recovery_and_fd_close`
+  - `services::fs::initramfs::service::tests::initramfs_protocol_vectors_match_frozen_vfs_codec`
+  - `services::fs::initramfs::service::tests::initramfs_mount_gate_routes_with_policy_denial`
+  - `services::fs::initramfs::service::tests::initramfs_lifecycle_gate_covers_mount_failure_recovery_and_close`
+  - `services::fs::initramfs::service::tests::initramfs_inflight_fd_survives_mount_failure_until_close`
+
 ## Phase 2 — Device Driver Servers
 
 - Contract docs:
   - `PHASE2_DRIVER_CONTRACT.md`
+  - `LIBC_ABI_X86_64_NONE.md` (Kernel IPC syscall ABI v3 transfer-cap freeze)
 - Required CI jobs:
   - `phase2-driver-gates`
 - Required deterministic tests:
+  - `kernel::syscall::tests::transfer_send_without_waiter_returns_would_block`
   - `kernel::boot::tests::delegate_driver_bundle_checked_enforces_service_role_edges`
   - `kernel::boot::tests::restart_denial_escalates_to_supervisor_every_threshold`
   - `kernel::boot::tests::driver_restart_revokes_runtime_caps`
@@ -25,6 +48,7 @@ This matrix maps roadmap phase completion to required contracts, CI jobs, and de
 - Required CI jobs:
   - `phase3-network-gates`
 - Required deterministic tests:
+  - `kernel::syscall::tests::transfer_send_without_waiter_returns_would_block`
   - `services::network::netmgr::service::tests::netmgr_tracks_link_state_events`
   - `services::network::tcpip::service::tests::tcpip_deterministic_packet_path`
   - `services::network::dns::service::tests::dns_timeout_retry_is_reproducible`
@@ -42,6 +66,7 @@ This matrix maps roadmap phase completion to required contracts, CI jobs, and de
   - `phase4-ui-smoke-marker`
   - `riscv64-core-smoke-strict` (workflow_dispatch strict runtime path)
 - Required deterministic tests/checks:
+  - `kernel::syscall::tests::transfer_send_without_waiter_returns_would_block`
   - `services::ui::display::service::tests::boot_marker_is_stable`
   - `services::ui::display::service::tests::display_tracks_modeset_and_present`
   - `services::ui::compositor::service::tests::compositor_replay_is_deterministic`

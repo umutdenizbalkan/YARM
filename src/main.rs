@@ -3,7 +3,7 @@ extern crate std;
 
 use yarm::kernel::boot::Bootstrap;
 use yarm::kernel::ipc::Message;
-use yarm::kernel::syscall::Syscall;
+use yarm::kernel::syscall::{SYSCALL_NO_TRANSFER_CAP, Syscall};
 use yarm::kernel::trap::Trap;
 use yarm::kernel::trapframe::TrapFrame;
 
@@ -25,7 +25,14 @@ fn main() {
     let send_payload = usize::from_le_bytes([b'o', b'k', 0, 0, 0, 0, 0, 0]);
     let mut send_tf = TrapFrame::new(
         Syscall::IpcSend as usize,
-        [send_cap.0 as usize, 1, 2, send_payload, 0, 0],
+        [
+            send_cap.0 as usize,
+            1,
+            2,
+            send_payload,
+            0,
+            SYSCALL_NO_TRANSFER_CAP as usize,
+        ],
     );
     kernel
         .handle_trap(Trap::Syscall, Some(&mut send_tf))

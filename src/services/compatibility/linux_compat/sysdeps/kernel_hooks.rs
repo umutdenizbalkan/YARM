@@ -1,7 +1,7 @@
-use crate::services::compatibility::linux_compat::LinuxErrno;
 use crate::kernel::boot::KernelState;
 use crate::kernel::capabilities::CapId;
 use crate::kernel::vm::PAGE_SIZE;
+use crate::services::compatibility::linux_compat::LinuxErrno;
 
 pub fn mmap_hook(
     kernel: &mut KernelState,

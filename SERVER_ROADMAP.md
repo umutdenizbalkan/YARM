@@ -89,8 +89,20 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 ### Current implementation status
 
 - ✅ `ramfs.srv` scaffold implemented (`services/fs/ramfs/*` + thin `src/bin/ramfs_srv.rs` entrypoint).
+  - ✅ behavior contract captured in `RAMFS_CONTRACT.md` (fd/inode allocation, rw semantics, statx contract, in-flight fd failure policy, metrics).
+  - ✅ protocol gate hardened with frozen-codec vector assertions and malformed-payload rejection (`services::fs::ramfs::service::tests::ramfs_protocol_vectors_match_frozen_vfs_codec`, `ramfs_protocol_rejects_malformed_openat_payload`).
+  - ✅ mount gate hardened with mixed ramfs/initramfs routing plus path-policy denial assertions (`services::fs::ramfs::service::tests::ramfs_mount_gate_routes_with_policy_denial`).
+  - ✅ lifecycle gate hardened with mount failure/recovery and fd close semantics (`services::fs::ramfs::service::tests::ramfs_lifecycle_gate_covers_mount_failure_recovery_and_close`).
 - ✅ `initramfs.srv` scaffold implemented (`services/fs/initramfs/*` + thin `src/bin/initramfs_srv.rs` entrypoint).
+  - ✅ behavior contract captured in `INITRAMFS_CONTRACT.md` (fd allocator, read-only semantics, statx contract, in-flight fd failure policy, metrics).
+  - ✅ protocol gate hardened with frozen-codec vector assertions (`services::fs::initramfs::service::tests::initramfs_protocol_vectors_match_frozen_vfs_codec`).
+  - ✅ mount gate hardened with mixed devfs/initramfs routing plus path-policy denial assertions (`services::fs::initramfs::service::tests::initramfs_mount_gate_routes_with_policy_denial`).
+  - ✅ lifecycle gate hardened with mount failure/recovery and fd close semantics (`services::fs::initramfs::service::tests::initramfs_lifecycle_gate_covers_mount_failure_recovery_and_close`).
 - ✅ `devfs.srv` scaffold implemented (`services/fs/devfs/*` + thin `src/bin/devfs_srv.rs` entrypoint (console/null nodes)).
+  - ✅ behavior contract captured in `DEVFS_CONTRACT.md` (fd allocator, node semantics, statx, in-flight fd failure policy, metrics).
+  - ✅ protocol gate hardened with frozen-codec vector assertions (`services::fs::devfs::service::tests::devfs_protocol_vectors_match_frozen_vfs_codec`).
+  - ✅ mount gate hardened with mixed devfs/initramfs routing plus path-policy denial assertions (`services::fs::devfs::service::tests::devfs_mount_gate_routes_devfs_and_initramfs_with_policy_denial`).
+  - ✅ lifecycle gate hardened with mount failure/recovery and fd close/reject assertions (`services::fs::devfs::service::tests::devfs_lifecycle_gate_covers_mount_failure_recovery_and_fd_close`).
 - ✅ `ext4.srv` scaffold implemented (`services/fs/ext4/*` + thin `src/bin/ext4_srv.rs` entrypoint).
 
 - 🚧 `fat.srv` scaffold started (`services/fs/fat/*` + thin `src/bin/fat_srv.rs` entrypoint).
@@ -121,6 +133,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 
 - delegation gate: init->driver role edges and cap bundle validation (wired to compat-gates workflow).
 - fault gate: revoke/restart behavior deterministic and test-covered (wired to compat-gates workflow).
+- transfer-cap ABI gate: waiter-required transfer-cap semantics (`kernel::syscall::tests::transfer_send_without_waiter_returns_would_block`) must pass in phase2/phase3 workflows.
 
 ## Phase 3 — Networking Servers 🚧
 
@@ -145,6 +158,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 - deterministic packet path simulation (wired to compat-gates workflow).
 - timeout/retry policy reproducibility (wired to compat-gates workflow).
 - compatibility adapter vector tests (socket adapter coverage wired to compat-gates workflow).
+- transfer-cap ABI prerequisite gate: waiter-required transfer semantics must pass before network suites.
 
 ## Phase 4 — Display + UI input servers 🚧
 
@@ -185,6 +199,7 @@ This roadmap tracks user-space server maturation from current scaffolds to a min
 ## Readiness criteria
 
 - Readiness evidence mapping is maintained in `PHASE_READINESS_MATRIX.md` and enforced by `scripts/check-roadmap-readiness.sh`.
+- IPC transfer-cap ABI requirements are frozen in `LIBC_ABI_X86_64_NONE.md` and treated as prerequisites for phase2+ service gates.
 
 Phase N is considered complete only when:
 

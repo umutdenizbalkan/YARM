@@ -12,7 +12,7 @@ use yarm::kernel::vfs::{
 };
 use yarm::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 use yarm::services::control_plane::supervisor::SupervisorService;
-use yarm::services::fs::initramfs::{INITRAMFS_BUSYBOX_PATH_PTR, InitramfsBackend};
+use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 use yarm::services::fs::ramfs::RamFsBackend;
 use yarm::services::init::{CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitService};
 
@@ -79,7 +79,7 @@ fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
     let mut vfs = VfsService::with_backend(InitramfsBackend::new(4096));
     let open = openat_message(OpenAtRequest {
         dirfd: 0,
-        path_ptr: INITRAMFS_BUSYBOX_PATH_PTR,
+        path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
         flags: 0,
         mode: 0,
     })
@@ -128,7 +128,7 @@ fn run_mount_orchestration_scenario() -> Result<MountOrchestrationSummary, Kerne
     let router = MountRouter::new(0x8000, RamFsBackend::new(), InitramfsBackend::new(4096));
     let mut vfs = VfsService::with_backend(router);
     vfs.mount(0x1000, 1).map_err(|_| KernelError::WrongObject)?;
-    vfs.mount(INITRAMFS_BUSYBOX_PATH_PTR, 2)
+    vfs.mount(INITRAMFS_BOOT_MARKER_PATH_PTR, 2)
         .map_err(|_| KernelError::WrongObject)?;
     let open_low = openat_message(OpenAtRequest {
         dirfd: 0,
@@ -142,7 +142,7 @@ fn run_mount_orchestration_scenario() -> Result<MountOrchestrationSummary, Kerne
         .map_err(|_| KernelError::WrongObject)?;
     let open_high = openat_message(OpenAtRequest {
         dirfd: 0,
-        path_ptr: INITRAMFS_BUSYBOX_PATH_PTR,
+        path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
         flags: 0,
         mode: 0,
     })

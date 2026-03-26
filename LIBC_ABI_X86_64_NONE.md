@@ -8,6 +8,18 @@ This document freezes the minimum libc-facing ABI expected by the musl sysdeps s
 - `TrapFrame::syscall_num` selects operation; arguments are read from lane indices 0..3 (and additional lanes where applicable).
 - Return value uses `ret0`; errors are returned as negative errno conventions in the compatibility personality.
 
+## Kernel IPC syscall ABI freeze (transfer-cap semantics)
+
+The kernel IPC trap ABI in `src/kernel/syscall.rs` is now frozen at **`SYSCALL_ABI_VERSION = 3`**.
+
+- Transfer-cap lane: `SYSCALL_ARG_TRANSFER_CAP` (last trapframe arg register).
+- No-transfer sentinel: `SYSCALL_NO_TRANSFER_CAP` (`u64::MAX` in message encoding).
+- Transfer-cap send rule (ABI v3): capability transfer is permitted only when a receiver is already waiting on the destination endpoint.
+  - If no waiter exists, send fails with `WouldBlock`.
+  - On success, userspace-visible transfer metadata is an opaque transfer-envelope handle, not the raw source capability id.
+
+This freeze is intentionally strict to avoid ambiguous capability ownership across queued sends and to keep recv-side materialization deterministic.
+
 ## Frozen syscall numbers for minimal bootstrap
 
 These numbers are already defined and tested in `src/services/compatibility/linux_compat/mod.rs`:
@@ -38,7 +50,7 @@ These numbers are already defined and tested in `src/services/compatibility/linu
 ## Relationship to milestone tracking
 
 - Milestone 2 checklist items in `X86_64_NONE_MUSL_PORT_TODO.md` are grounded in the constants, mapping logic, and tests already present in `linux_compat/mod.rs`.
-- Milestone 3 begins in `src/services/compatibility/linux_compat/sysdeps.rs` with startup/memory hooks and a temporary clock stub (`ENOSYS`) until timer service plumbing lands.
+- Milestone 3 is partially implemented in `src/services/compatibility/linux_compat/sysdeps.rs`: startup/memory/thread/futex hooks and timer-backed clock hooks exist, but full musl crt/`__libc_start_main` integration is still pending.
 
 ## Bootstrap sysdeps coverage now implemented
 

@@ -3,6 +3,9 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CapId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CNodeId(pub u16);
+
 impl CapId {
     const INDEX_BITS: u64 = 16;
     const INDEX_MASK: u64 = (1 << Self::INDEX_BITS) - 1;
@@ -126,6 +129,8 @@ pub enum CapabilityDeriveError {
     ParentMissing,
     RightsEscalation,
     SpaceFull,
+    SlotOccupied,
+    InvalidSlot,
     NotFound,
 }
 
@@ -135,13 +140,15 @@ impl fmt::Display for CapabilityDeriveError {
             Self::ParentMissing => "parent capability does not exist",
             Self::RightsEscalation => "derived capability would escalate rights",
             Self::SpaceFull => "capability space is full",
+            Self::SlotOccupied => "destination slot is occupied",
+            Self::InvalidSlot => "invalid destination slot",
             Self::NotFound => "capability does not exist",
         };
         f.write_str(message)
     }
 }
 
-const MAX_CAPABILITIES: usize = 128;
+pub const MAX_CAPABILITIES_PER_CSPACE: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapEntry {
@@ -157,7 +164,7 @@ struct CapSlot {
 
 #[derive(Debug)]
 pub struct CapabilitySpace {
-    slots: [CapSlot; MAX_CAPABILITIES],
+    slots: [CapSlot; MAX_CAPABILITIES_PER_CSPACE],
 }
 
 impl Default for CapabilitySpace {
@@ -168,7 +175,7 @@ impl Default for CapabilitySpace {
                     generation: 1,
                     entry: None,
                 }
-            }; MAX_CAPABILITIES],
+            }; MAX_CAPABILITIES_PER_CSPACE],
         }
     }
 }
@@ -183,7 +190,7 @@ impl CapabilitySpace {
         capability: Capability,
         parent: Option<CapId>,
     ) -> Result<CapId, CapabilityDeriveError> {
-        for index in 0..MAX_CAPABILITIES {
+        for index in 0..MAX_CAPABILITIES_PER_CSPACE {
             let slot = &mut self.slots[index];
             if slot.entry.is_none() {
                 let id = CapId::new(index, slot.generation);
@@ -206,23 +213,70 @@ impl CapabilitySpace {
         self.mint_with_parent(derived, Some(parent))
     }
 
+    pub fn mint_at(
+        &mut self,
+        slot_index: usize,
+        capability: Capability,
+    ) -> Result<CapId, CapabilityDeriveError> {
+        if slot_index >= MAX_CAPABILITIES_PER_CSPACE {
+            return Err(CapabilityDeriveError::InvalidSlot);
+        }
+        let slot = &mut self.slots[slot_index];
+        if slot.entry.is_some() {
+            return Err(CapabilityDeriveError::SlotOccupied);
+        }
+        let id = CapId::new(slot_index, slot.generation);
+        slot.entry = Some(CapEntry {
+            capability,
+            parent: None,
+        });
+        Ok(id)
+    }
+
+    pub fn grant_to(
+        &self,
+        source: CapId,
+        rights: CapRights,
+        destination: &mut CapabilitySpace,
+    ) -> Result<CapId, CapabilityDeriveError> {
+        let source_cap = self
+            .get(source)
+            .ok_or(CapabilityDeriveError::ParentMissing)?;
+        let derived = source_cap.derive(rights)?;
+        destination.mint(derived)
+    }
+
+    pub fn grant_to_slot(
+        &self,
+        source: CapId,
+        rights: CapRights,
+        destination: &mut CapabilitySpace,
+        destination_slot: usize,
+    ) -> Result<CapId, CapabilityDeriveError> {
+        let source_cap = self
+            .get(source)
+            .ok_or(CapabilityDeriveError::ParentMissing)?;
+        let derived = source_cap.derive(rights)?;
+        destination.mint_at(destination_slot, derived)
+    }
+
     pub fn revoke(&mut self, id: CapId) -> Result<(), CapabilityDeriveError> {
         if self.get(id).is_none() {
             return Err(CapabilityDeriveError::NotFound);
         }
 
-        let mut marked = [false; MAX_CAPABILITIES];
+        let mut marked = [false; MAX_CAPABILITIES_PER_CSPACE];
         marked[id.index()] = true;
 
         loop {
             let mut changed = false;
-            for idx in 0..MAX_CAPABILITIES {
+            for idx in 0..MAX_CAPABILITIES_PER_CSPACE {
                 if marked[idx] {
                     continue;
                 }
                 if let Some(entry) = self.slots[idx].entry
                     && let Some(parent) = entry.parent
-                    && parent.index() < MAX_CAPABILITIES
+                    && parent.index() < MAX_CAPABILITIES_PER_CSPACE
                     && marked[parent.index()]
                     && self.slots[parent.index()].generation == parent.generation()
                 {
@@ -252,7 +306,7 @@ impl CapabilitySpace {
 
     pub fn get(&self, id: CapId) -> Option<Capability> {
         let index = id.index();
-        if index >= MAX_CAPABILITIES {
+        if index >= MAX_CAPABILITIES_PER_CSPACE {
             return None;
         }
         let slot = self.slots[index];
@@ -359,7 +413,7 @@ mod tests {
     #[test]
     fn mint_fails_when_space_full_and_returns_capability() {
         let mut cspace = CapabilitySpace::default();
-        for _ in 0..MAX_CAPABILITIES {
+        for _ in 0..MAX_CAPABILITIES_PER_CSPACE {
             let _ = cspace
                 .mint(Capability::new(CapObject::Kernel, CapRights::READ))
                 .expect("room");
@@ -410,5 +464,55 @@ mod tests {
         assert!(cspace.get(second).is_some());
         assert!(cspace.contains(second));
         assert!(!cspace.contains(first));
+    }
+
+    #[test]
+    fn explicit_grant_to_destination_space_requires_subset_rights() {
+        let mut src = CapabilitySpace::default();
+        let mut dst = CapabilitySpace::default();
+
+        let root = src
+            .mint(Capability::new(
+                CapObject::Endpoint {
+                    index: 7,
+                    generation: 1,
+                },
+                CapRights::SEND | CapRights::RECEIVE,
+            ))
+            .expect("mint");
+
+        let granted = src
+            .grant_to(root, CapRights::SEND, &mut dst)
+            .expect("grant");
+        assert!(dst.has_right(granted, CapRights::SEND));
+        assert!(!dst.has_right(granted, CapRights::RECEIVE));
+
+        assert_eq!(
+            src.grant_to(root, CapRights::SCHEDULE, &mut dst),
+            Err(CapabilityDeriveError::RightsEscalation)
+        );
+    }
+
+    #[test]
+    fn explicit_grant_to_specific_slot_rejects_occupied_or_invalid_slot() {
+        let mut src = CapabilitySpace::default();
+        let mut dst = CapabilitySpace::default();
+        let root = src
+            .mint(Capability::new(CapObject::Kernel, CapRights::READ))
+            .expect("mint");
+
+        let first = src
+            .grant_to_slot(root, CapRights::READ, &mut dst, 3)
+            .expect("grant slot");
+        assert_eq!(first.index(), 3);
+
+        assert_eq!(
+            src.grant_to_slot(root, CapRights::READ, &mut dst, 3),
+            Err(CapabilityDeriveError::SlotOccupied)
+        );
+        assert_eq!(
+            src.grant_to_slot(root, CapRights::READ, &mut dst, MAX_CAPABILITIES_PER_CSPACE),
+            Err(CapabilityDeriveError::InvalidSlot)
+        );
     }
 }

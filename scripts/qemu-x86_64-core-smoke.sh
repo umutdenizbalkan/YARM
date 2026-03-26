@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-KERNEL_IMAGE=${KERNEL_IMAGE:-build-x86_64/yarm-x86_64.elf}
+KERNEL_IMAGE=${KERNEL_IMAGE:-build-x86_64/bootable-kernel.img}
 KERNEL_DEBUG_ELF=${KERNEL_DEBUG_ELF:-build-x86_64/kernel_boot.elf}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build-x86_64/initramfs-core.cpio}
 TIMEOUT_SECS=${TIMEOUT_SECS:-30}
@@ -10,7 +10,16 @@ QEMU_MACHINE=${QEMU_MACHINE:-q35}
 QEMU_CPU=${QEMU_CPU:-qemu64}
 QEMU_MEMORY=${QEMU_MEMORY:-1024M}
 QEMU_SMP=${QEMU_SMP:-2}
-KERNEL_CMDLINE=${KERNEL_CMDLINE:-"console=ttyS0 rdinit=/init"}
+QEMU_X86_ALLOW_ELF_KERNEL=${QEMU_X86_ALLOW_ELF_KERNEL:-1}
+QEMU_X86_PVH_MINIMAL=${QEMU_X86_PVH_MINIMAL:-1}
+DEFAULT_KERNEL_CMDLINE="console=ttyS0 rdinit=/init"
+KERNEL_CMDLINE=${KERNEL_CMDLINE:-"$DEFAULT_KERNEL_CMDLINE"}
+
+if [[ "$KERNEL_CMDLINE" != *"console="* ]] || [[ "${#KERNEL_CMDLINE}" -lt 12 ]]; then
+  echo "[warn] suspicious KERNEL_CMDLINE override detected: '$KERNEL_CMDLINE'"
+  echo "[hint] resetting to default kernel cmdline: '$DEFAULT_KERNEL_CMDLINE'"
+  KERNEL_CMDLINE="$DEFAULT_KERNEL_CMDLINE"
+fi
 
 check_x86_kernel_bootability() {
   local kernel="$1"
@@ -29,7 +38,17 @@ check_x86_kernel_bootability() {
   if [[ "$ftype" != *"ELF"* ]]; then
     return 0
   fi
+  if [[ "$QEMU_X86_ALLOW_ELF_KERNEL" != "1" ]]; then
+    echo "[warn] refusing ELF kernel direct-boot probe by default for x86 smoke"
+    echo "[hint] set QEMU_X86_ALLOW_ELF_KERNEL=1 to opt-in to PVH ELF probing"
+    echo "[hint] helper to fetch a known bootable image: scripts/fetch-linux-bzimage.sh"
+    return 1
+  fi
   if command -v readelf >/dev/null 2>&1; then
+    if ! readelf -l "$kernel" 2>/dev/null | rg -q "NOTE"; then
+      echo "[warn] ELF kernel lacks a PT_NOTE program header; PVH entry note will be ignored by qemu"
+      return 1
+    fi
     if readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
       return 0
     fi
@@ -54,11 +73,6 @@ if [[ ! -f "$KERNEL_IMAGE" ]]; then
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
   exit 0
 fi
-if [[ ! -f "$INITRAMFS_IMAGE" ]]; then
-  echo "[warn] initramfs image missing: $INITRAMFS_IMAGE"
-  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
-  exit 0
-fi
 
 if ! check_x86_kernel_bootability "$KERNEL_IMAGE"; then
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
@@ -74,9 +88,6 @@ fi
 LOGFILE=${LOGFILE:-qemu-x86_64-core.log}
 rm -f "$LOGFILE"
 
-echo "[info] qemu command: qemu-system-x86_64 -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
-echo "[info] waiting up to ${TIMEOUT_SECS}s for boot markers..."
-
 QEMU_CMD=(
   qemu-system-x86_64
   -machine "$QEMU_MACHINE"
@@ -89,57 +100,60 @@ QEMU_CMD=(
   -no-reboot
   -no-shutdown
   -kernel "$KERNEL_IMAGE"
-  -initrd "$INITRAMFS_IMAGE"
-  -append "$KERNEL_CMDLINE"
 )
 
-MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE"
+is_elf_kernel=0
+if command -v file >/dev/null 2>&1; then
+  if file -b "$KERNEL_IMAGE" 2>/dev/null | rg -q "ELF"; then
+    is_elf_kernel=1
+  fi
+elif command -v readelf >/dev/null 2>&1 && readelf -h "$KERNEL_IMAGE" >/dev/null 2>&1; then
+  is_elf_kernel=1
+fi
+
+if [[ "$QEMU_X86_PVH_MINIMAL" == "1" && "$is_elf_kernel" -eq 1 ]]; then
+  echo "[info] PVH minimal mode enabled: skipping initrd/cmdline for ELF boot triage"
+else
+  if [[ ! -f "$INITRAMFS_IMAGE" ]]; then
+    echo "[warn] initramfs image missing: $INITRAMFS_IMAGE"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    exit 0
+  fi
+  QEMU_CMD+=(
+    -initrd "$INITRAMFS_IMAGE"
+    -append "$KERNEL_CMDLINE"
+  )
+fi
+
+MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|ABCDEFG|ABCDEF|ABCD"
 FIRMWARE_FALLBACK_REGEX="SeaBIOS|iPXE|Booting from ROM"
 
+echo "[info] qemu command: ${QEMU_CMD[*]}"
+echo "[info] waiting up to ${TIMEOUT_SECS}s for boot markers..."
+
+log_has_pattern() {
+  local pattern="$1"
+  [[ -f "$LOGFILE" ]] || return 1
+  tr '\r' '\n' <"$LOGFILE" | rg -a -n "$pattern" >/dev/null 2>&1
+}
+
 set +e
-stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE" &
-PIPE_PID=$!
-QEMU_STATUS=0
-FOUND_MARKER=0
-FIRMWARE_FALLBACK=0
+if command -v timeout >/dev/null 2>&1; then
+  timeout --foreground "${TIMEOUT_SECS}s" stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
+  QEMU_STATUS=${PIPESTATUS[0]}
+else
+  echo "[warn] 'timeout' command is unavailable; qemu run may not auto-terminate"
+  stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
+  QEMU_STATUS=${PIPESTATUS[0]}
+fi
+set -e
 
-START_TS=$(date +%s)
-while kill -0 "$PIPE_PID" >/dev/null 2>&1; do
-  if rg -n "$MARKER_REGEX" "$LOGFILE" >/dev/null 2>&1; then
-    FOUND_MARKER=1
-    break
-  fi
-  if rg -n "$FIRMWARE_FALLBACK_REGEX" "$LOGFILE" >/dev/null 2>&1; then
-    FIRMWARE_FALLBACK=1
-    break
-  fi
-  NOW_TS=$(date +%s)
-  ELAPSED=$((NOW_TS - START_TS))
-  if [[ "$ELAPSED" -ge "$TIMEOUT_SECS" ]]; then
-    echo "[warn] timeout reached (${TIMEOUT_SECS}s) without marker detection"
-    break
-  fi
-  sleep 1
-done
-
-if [[ "$FOUND_MARKER" -eq 1 ]]; then
-  kill "$PIPE_PID" >/dev/null 2>&1 || true
-  wait "$PIPE_PID"
-  QEMU_STATUS=$?
-  set -e
+if log_has_pattern "$MARKER_REGEX"; then
   echo "[ok] boot markers detected"
   exit 0
 fi
 
-if [[ "$FIRMWARE_FALLBACK" -eq 1 ]]; then
-  if kill -0 "$PIPE_PID" >/dev/null 2>&1; then
-    kill "$PIPE_PID" >/dev/null 2>&1 || true
-    sleep 1
-    kill -9 "$PIPE_PID" >/dev/null 2>&1 || true
-  fi
-  wait "$PIPE_PID"
-  QEMU_STATUS=$?
-  set -e
+if log_has_pattern "$FIRMWARE_FALLBACK_REGEX"; then
   echo "[warn] firmware fallback detected before any YARM boot markers"
   echo "[hint] qemu displayed SeaBIOS/iPXE output, which means serial output is working but the kernel was not accepted as a direct-boot image"
   echo "[hint] this is not an initramfs userspace issue yet; the guest never reached kernel_entry_x86_64"
@@ -153,14 +167,9 @@ if [[ "$FIRMWARE_FALLBACK" -eq 1 ]]; then
   exit 0
 fi
 
-if kill -0 "$PIPE_PID" >/dev/null 2>&1; then
-  kill "$PIPE_PID" >/dev/null 2>&1 || true
-  sleep 1
-  kill -9 "$PIPE_PID" >/dev/null 2>&1 || true
+if [[ "$QEMU_STATUS" -eq 124 ]]; then
+  echo "[warn] timeout reached (${TIMEOUT_SECS}s) without marker detection"
 fi
-wait "$PIPE_PID"
-QEMU_STATUS=$?
-set -e
 
 echo "[warn] boot markers not detected (status=$QEMU_STATUS)"
 if [[ -f "$LOGFILE" ]]; then

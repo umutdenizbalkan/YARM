@@ -234,9 +234,9 @@ mod tests {
         assert_eq!(summary.control_vfs_fd, 3);
         assert_eq!(summary.control_vfs_handled, 15);
         assert_eq!(summary.devfs_open_opcode, VFS_OP_OPENAT);
-        assert_eq!(summary.devfs_handled, 4);
+        assert_eq!(summary.devfs_handled, 6);
         assert_eq!(summary.initramfs_read_opcode, VFS_OP_READ);
-        assert_eq!(summary.initramfs_handled, 2);
+        assert_eq!(summary.initramfs_handled, 3);
         assert_eq!(summary.mount_report.mounted_count, 4);
         assert_eq!(summary.recovered_core_services, 0);
     }

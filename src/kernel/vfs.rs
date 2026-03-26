@@ -608,6 +608,14 @@ impl<B: VfsBackend> VfsService<B> {
         self.policy = policy;
     }
 
+    pub const fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
     pub const fn op_sequence(&self) -> u64 {
         self.op_sequence
     }

@@ -2,9 +2,7 @@ use crate::kernel::boot::{KernelError, KernelState};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 #[cfg(test)]
-use crate::kernel::process_abi::{
-    PROC_CODEC_V2_VERSION, ProcV2Args, WaitPidV2Reply,
-};
+use crate::kernel::process_abi::{PROC_CODEC_V2_VERSION, ProcV2Args, WaitPidV2Reply};
 use crate::kernel::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_WAITPID_V2, PROC_SERVER_ABI_VERSION,
     SpawnV2Args, WaitPidV2Args,
@@ -57,7 +55,10 @@ pub const PROT_EXEC: usize = 0x4;
 
 pub const EINVAL: i32 = 22;
 pub const EPERM: i32 = 1;
+pub const EINTR: i32 = 4;
+pub const EAGAIN: i32 = 11;
 pub const ENOMEM: i32 = 12;
+pub const ETIMEDOUT: i32 = 110;
 pub const ENOSYS: i32 = 38;
 
 const LINUX_BRK_DEFAULT_BASE: usize = 0x4000_0000;
@@ -189,7 +190,10 @@ impl LinuxServiceBindings {
 pub enum LinuxErrno {
     Inval,
     Perm,
+    Intr,
+    Again,
     NoMem,
+    TimedOut,
     NoSys,
 }
 
@@ -198,7 +202,10 @@ impl LinuxErrno {
         match self {
             Self::Inval => EINVAL,
             Self::Perm => EPERM,
+            Self::Intr => EINTR,
+            Self::Again => EAGAIN,
             Self::NoMem => ENOMEM,
+            Self::TimedOut => ETIMEDOUT,
             Self::NoSys => ENOSYS,
         }
     }
@@ -206,12 +213,26 @@ impl LinuxErrno {
     pub const fn neg_code(self) -> isize {
         -(self.code() as isize)
     }
+
+    pub const fn from_raw_errno(errno: i32) -> Self {
+        match errno {
+            EINVAL => Self::Inval,
+            EPERM => Self::Perm,
+            EINTR => Self::Intr,
+            EAGAIN => Self::Again,
+            ENOMEM => Self::NoMem,
+            ETIMEDOUT => Self::TimedOut,
+            ENOSYS => Self::NoSys,
+            _ => Self::Inval,
+        }
+    }
 }
 
 impl From<KernelError> for LinuxErrno {
     fn from(value: KernelError) -> Self {
         match value {
             KernelError::MissingRight => Self::Perm,
+            KernelError::WouldBlock => Self::Intr,
             KernelError::VmFull | KernelError::TaskTableFull | KernelError::MemoryObjectFull => {
                 Self::NoMem
             }
@@ -329,8 +350,13 @@ fn decode_u64_reply(reply: &[u8]) -> Result<usize, LinuxErrno> {
     }
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&reply[..8]);
+    let raw = i64::from_le_bytes(bytes);
+    if raw < 0 {
+        let errno = i32::try_from((-raw) as u64).map_err(|_| LinuxErrno::Inval)?;
+        return Err(LinuxErrno::from_raw_errno(errno));
+    }
     // Keep conversion checked so narrower pointer-width targets do not silently truncate.
-    usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| LinuxErrno::Inval)
+    usize::try_from(raw as u64).map_err(|_| LinuxErrno::Inval)
 }
 
 fn pack_vfs4(a0: usize, a1: usize, a2: usize, a3: usize) -> [u8; 32] {
@@ -1185,6 +1211,69 @@ mod tests {
         assert_eq!(statx_req.opcode, VFS_OP_STATX);
         assert_eq!(statx_req.as_slice().len(), 32);
         assert_eq!(&statx_req.as_slice()[8..16], &(0xD000u64).to_le_bytes());
+    }
+
+    #[test]
+    fn linux_dispatch_maps_eintr_and_timeout_errno_at_shim_boundary() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut bindings = LinuxServiceBindings::default();
+        let (_req_ep, req_send, _req_recv) = state.create_endpoint(8).expect("vfs req");
+        let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(8).expect("vfs rep");
+        bindings
+            .register_vfs_manager(&state, req_send, rep_recv)
+            .expect("register vfs");
+
+        for errno in [EINTR, ETIMEDOUT] {
+            let raw = (-(errno as i64)).to_le_bytes();
+            state
+                .ipc_send(
+                    rep_send,
+                    Message::with_header(0, 0, 0, None, &raw).expect("reply"),
+                )
+                .expect("seed reply");
+        }
+
+        let mut poll = TrapFrame::new(LINUX_NR_POLL, [0x9000, 1, 10, 0, 0, 0]);
+        dispatch(&mut state, &bindings, &mut poll);
+        assert_eq!(poll.error_code(), Some(EINTR as usize));
+
+        let mut epoll_wait = TrapFrame::new(LINUX_NR_EPOLL_PWAIT, [7, 0xB000, 4, 25, 0, 0]);
+        dispatch(&mut state, &bindings, &mut epoll_wait);
+        assert_eq!(epoll_wait.error_code(), Some(ETIMEDOUT as usize));
+    }
+
+    #[test]
+    fn linux_dispatch_partial_io_and_invalid_handle_errno_are_explicit() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut bindings = LinuxServiceBindings::default();
+        let (_req_ep, req_send, _req_recv) = state.create_endpoint(8).expect("vfs req");
+        let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(8).expect("vfs rep");
+        bindings
+            .register_vfs_manager(&state, req_send, rep_recv)
+            .expect("register vfs");
+
+        state
+            .ipc_send(
+                rep_send,
+                Message::with_header(0, 0, 0, None, &5u64.to_le_bytes()).expect("partial"),
+            )
+            .expect("seed partial");
+        state
+            .ipc_send(
+                rep_send,
+                Message::with_header(0, 0, 0, None, &(-(EINVAL as i64)).to_le_bytes())
+                    .expect("bad fd"),
+            )
+            .expect("seed bad fd");
+
+        let mut partial_read = TrapFrame::new(LINUX_NR_READ, [42, 0x2000, 64, 0, 0, 0]);
+        dispatch(&mut state, &bindings, &mut partial_read);
+        assert_eq!(partial_read.error_code(), None);
+        assert_eq!(partial_read.ret0(), 5);
+
+        let mut bad_fd_read = TrapFrame::new(LINUX_NR_READ, [999, 0x2000, 64, 0, 0, 0]);
+        dispatch(&mut state, &bindings, &mut bad_fd_read);
+        assert_eq!(bad_fd_read.error_code(), Some(EINVAL as usize));
     }
 
     #[test]

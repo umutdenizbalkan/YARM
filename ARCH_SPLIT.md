@@ -78,3 +78,10 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
 ## Runtime entry wiring
 
 - `KernelState::handle_selected_arch_trap_entry(...)` now forwards trap handling through `crate::arch::trap_entry::handle_trap_entry(...)`, so runtime integration can use the selected-ISA facade from kernel state.
+
+
+## Boot entry migration status
+
+- `src/bin/kernel_boot.rs` is kept ISA-agnostic and delegates boot wiring via `src/arch/boot_entry.rs`.
+- ISA-specific boot assembly/symbols live under `src/arch/<isa>/boot.rs` (`x86_64`, `riscv64`, `aarch64`).
+- `scripts/check-kernel-arch-boundary.sh` also enforces a bin-layer leakage rule for `src/bin/kernel_boot.rs` (no `global_asm!`, no ISA cfg tags, no direct x86 kernel-entry symbol).

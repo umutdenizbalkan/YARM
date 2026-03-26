@@ -11,12 +11,13 @@ SERVER_ELF=${SERVER_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${SERVE
 KERNEL_RAW_ELF=${KERNEL_RAW_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 KERNEL_BOOTABLE_IMAGE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
-KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-x86_64.elf}
+KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/bootable-kernel.img}
 KERNEL_DEBUG_ELF=${KERNEL_DEBUG_ELF:-$OUT_DIR/${KERNEL_BIN}.elf}
 ARTIFACTS_STRICT=${ARTIFACTS_STRICT:-0}
 TOOLCHAIN=${TOOLCHAIN:-nightly}
 BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
 BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
+QEMU_X86_ALLOW_ELF_KERNEL=${QEMU_X86_ALLOW_ELF_KERNEL:-1}
 
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$TOOLCHAIN}
 RUST_SYSROOT=${RUST_SYSROOT:-$(rustup run "${RUSTUP_TOOLCHAIN}" rustc --print sysroot 2>/dev/null || true)}
@@ -38,7 +39,13 @@ is_qemu_direct_bootable_x86_kernel() {
   if [[ "$ftype" != *"ELF"* ]]; then
     return 0
   fi
+  if [[ "$QEMU_X86_ALLOW_ELF_KERNEL" != "1" ]]; then
+    return 1
+  fi
   if ! command -v readelf >/dev/null 2>&1; then
+    return 1
+  fi
+  if ! readelf -l "$kernel" 2>/dev/null | rg -q "NOTE"; then
     return 1
   fi
   if readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
@@ -65,6 +72,12 @@ explain_nonbootable_kernel_source() {
     ftype="unknown"
   fi
   if [[ "$ftype" == *"ELF"* ]]; then
+    if [[ "$QEMU_X86_ALLOW_ELF_KERNEL" != "1" ]]; then
+      echo "[warn] ELF kernels are rejected by default for qemu x86 direct-boot staging in this script"
+      echo "[hint] provide a known bootable non-ELF image via KERNEL_BOOTABLE_IMAGE_SOURCE=<path> (for example Linux bzImage), or set QEMU_X86_ALLOW_ELF_KERNEL=1 to opt-in to PVH ELF probing"
+      echo "[hint] helper: scripts/fetch-linux-bzimage.sh"
+      return
+    fi
     echo "[warn] freestanding ELF kernel is missing a verified PVH note / entry contract for qemu-system-x86_64 direct boot"
     echo "[hint] the built ${KERNEL_BIN} ELF is kept as a debug artifact until it advertises a loadable PVH entrypoint"
     echo "[hint] provide a known bootable x86_64 kernel image via KERNEL_BOOTABLE_IMAGE_SOURCE=<path> (for example a Linux bzImage or a verified PVH-enabled ELF)"
@@ -110,6 +123,7 @@ fi
 
 if [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
   cp "$KERNEL_RAW_ELF" "$KERNEL_DEBUG_ELF"
+  echo "[info] yarm freestanding kernel ELF (debug-only): $KERNEL_DEBUG_ELF"
 fi
 
 cat > "$ROOTFS_DIR/init" <<'SH'
@@ -143,6 +157,7 @@ if [[ -n "$BOOTABLE_SOURCE" && -f "$BOOTABLE_SOURCE" ]] && is_qemu_direct_bootab
   if [[ "$BOOTABLE_SOURCE" != "$KERNEL_IMAGE" ]]; then
     cp "$BOOTABLE_SOURCE" "$KERNEL_IMAGE"
   fi
+  echo "[info] bootable kernel source selected: $BOOTABLE_SOURCE"
 elif [[ -n "$BOOTABLE_SOURCE" && -f "$BOOTABLE_SOURCE" ]]; then
   rm -f "$KERNEL_IMAGE"
   explain_nonbootable_kernel_source "$BOOTABLE_SOURCE"

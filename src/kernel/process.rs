@@ -245,7 +245,12 @@ impl ProcessManager {
     ) -> Result<(ProcessId, ElfImageInfo), ProcessManagerError> {
         let info = ElfImageInfo::parse(image_id, image)?;
         let pid = self.alloc_process(parent_pid)?;
-        if let Some(record) = self.table.iter_mut().flatten().find(|record| record.pid == pid) {
+        if let Some(record) = self
+            .table
+            .iter_mut()
+            .flatten()
+            .find(|record| record.pid == pid)
+        {
             record.image_id = info.image_id;
             record.entry = info.entry;
         }
@@ -321,7 +326,10 @@ impl ProcessManager {
             .map(|record| record.parent_pid)
     }
 
-    fn wait_result(&mut self, target_pid: ProcessId) -> Result<WaitPidV2Result, ProcessManagerError> {
+    fn wait_result(
+        &mut self,
+        target_pid: ProcessId,
+    ) -> Result<WaitPidV2Result, ProcessManagerError> {
         if let Some((idx, record)) = self
             .table
             .iter()
@@ -543,7 +551,10 @@ mod tests {
             &WaitPidV2Args::new(1, spawned.pid.0).encode(),
         )
         .expect("wait");
-        assert_eq!(pm.handle_request(wait), Err(ProcessManagerError::WouldBlock));
+        assert_eq!(
+            pm.handle_request(wait),
+            Err(ProcessManagerError::WouldBlock)
+        );
     }
 
     #[test]
@@ -559,9 +570,8 @@ mod tests {
         .expect("spawn");
         let spawn_reply = pm.handle_request(spawn).expect("spawn reply");
         let spawned = SpawnV2Result::decode(spawn_reply.as_slice()).expect("decode");
-        let exit =
-            Message::with_header(spawned.pid.0, PROC_OP_EXIT, 0, None, &9u64.to_le_bytes())
-                .expect("exit");
+        let exit = Message::with_header(spawned.pid.0, PROC_OP_EXIT, 0, None, &9u64.to_le_bytes())
+            .expect("exit");
         let _ = pm.handle_request(exit).expect("exit reply");
         let wait = Message::with_header(
             0,

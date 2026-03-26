@@ -379,18 +379,36 @@ impl KernelState {
         transfer_cap: CapId,
         payload: &[u8],
     ) -> Result<(), KernelError> {
-        if self.cspace.get(transfer_cap).is_none() {
-            return Err(KernelError::InvalidCapability);
+        let transfer_payload = self
+            .cspace
+            .get(transfer_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        let send_capability = self
+            .cspace
+            .get(send_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        if !send_capability.has_right(CapRights::SEND) {
+            return Err(KernelError::MissingRight);
         }
+        let endpoint_idx = self.resolve_endpoint_index(send_capability.object)?;
+        let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx].ok_or(KernelError::WouldBlock)?;
+        let transfer_handle = self
+            .stash_transfer_envelope(transfer_payload, send_capability.object, Some(waiter_tid))
+            .ok_or(KernelError::EndpointQueueFull)?;
         let msg = Message::with_header(
             sender_tid.0,
             opcode,
             Message::FLAG_CAP_TRANSFER,
-            Some(transfer_cap.0),
+            Some(transfer_handle),
             payload,
         )
         .map_err(map_ipc_error)?;
-        self.ipc_send(send_cap, msg)
+        if let Err(err) = self.ipc_send(send_cap, msg) {
+            let _ =
+                self.take_transfer_envelope(transfer_handle, send_capability.object, sender_tid);
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub fn try_ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {

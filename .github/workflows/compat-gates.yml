@@ -43,16 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: phase2 delegation + fault deterministic gates
-        run: |
-          cargo test -q kernel::bootstrap::tests::delegate_driver_bundle_checked_enforces_service_role_edges
-          cargo test -q kernel::bootstrap::tests::restart_denial_escalates_to_supervisor_every_threshold
-          cargo test -q kernel::bootstrap::tests::driver_restart_revokes_runtime_caps
-          cargo test -q services::drivers::irqmux::service::tests::irqmux_routes_masks_and_drops_deterministically
-          cargo test -q services::drivers::uart::service::tests::uart_backpressure_is_deterministic
-          cargo test -q services::drivers::virtio_net::service::tests::virtio_net_queue_backpressure_is_deterministic
-          cargo test -q services::drivers::virtio_gpu::service::tests::virtio_gpu_rejects_commit_before_modeset
-          cargo test -q services::drivers::input::service::tests::input_queue_overflow_and_drain_is_deterministic
+      - name: phase2 delegation + fault + transfer-cap ABI deterministic gates
+        run: scripts/phase2-driver-gates.sh
 
 
   phase3-network-gates:
@@ -62,12 +54,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: phase3 deterministic networking gates
         run: |
+          cargo test -q kernel::syscall::tests::transfer_send_without_waiter_returns_would_block
           cargo test -q services::network::netmgr::service::tests::netmgr_tracks_link_state_events
           cargo test -q services::network::tcpip::service::tests::tcpip_deterministic_packet_path
           cargo test -q services::network::dns::service::tests::dns_timeout_retry_is_reproducible
           cargo test -q services::network::dhcp::service::tests::dhcp_lease_accounting_is_deterministic
           cargo test -q services::network::socket::service::tests::socket_adapter_roundtrip_is_accounted
           cargo test -q services::network::sim::tests::deterministic_network_bootstrap_flow_is_stable
+          cargo test -q services::network::sim::tests::link_flap_dhcp_rebind_and_socket_recovery_is_deterministic
 
   phase4-ui-gates:
     runs-on: ubuntu-latest
@@ -76,6 +70,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: phase4 display/input deterministic gates
         run: |
+          cargo test -q kernel::syscall::tests::transfer_send_without_waiter_returns_would_block
           cargo test -q services::ui::display::service::tests::boot_marker_is_stable
           cargo test -q services::ui::display::service::tests::display_tracks_modeset_and_present
           cargo test -q services::ui::compositor::service::tests::compositor_replay_is_deterministic

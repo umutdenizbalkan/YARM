@@ -18,24 +18,30 @@ Port user-space runtime behind an ISA-agnostic musl sysdeps shim that maps libc 
 
 ## Milestone 2 — ABI boundary contract for libc shim
 
+**Audit status (2026-03-24): complete.**
+
+Completed:
 - [x] Freeze a tiny libc-facing kernel ABI surface (threads/TLS, memory mapping, clocks, process lifecycle, IPC-backed fd model).
 - [x] Document syscall numbering + calling convention expected by shim stubs.
 - [x] Define error mapping policy (`errno` conversion from kernel/service status codes).
-- [x] Add compatibility tests for edge cases (`EINTR`, partial I/O, invalid handle, timeout).
+
+- [x] Add compatibility tests that explicitly cover `EINTR` and timeout error mapping behavior at the shim boundary.
+- [x] Add compatibility tests that explicitly assert partial I/O + invalid-handle semantics with errno-level expectations in the linux-compat shim surface.
 
 ## Milestone 3 — musl sysdeps shim (minimum viable)
 
-Milestone 3 started: `src/services/compatibility/linux_compat/sysdeps.rs` now contains startup/memory/clock/thread/futex hooks with deterministic tests.
+**Audit status (2026-03-24): partially complete.**
 
-Current caveat: hooks are bootstrap-grade shims (sufficient for bring-up/testing) and still need full service-backed semantics before production use.
-
-- [x] Implement musl entry/exit glue (`crt` startup + `__libc_start_main` integration path).
+Implemented bootstrap sysdeps pieces:
 - [x] Implement memory primitives (`mmap`/`munmap` equivalent, brk/no-brk policy).
 - [x] Implement thread primitives expected by musl (`clone`/TLS hooks or equivalent shim model).
 - [x] Implement futex-like wait/wake bridge using kernel IPC/synchronization primitives.
-- [x] Implement time/clock stubs (`clock_gettime`, nanosleep) via timer service.
+- [x] Implement time/clock hooks (`clock_gettime`, `nanosleep`) via kernel timer-backed service hooks for deterministic bring-up.
 - [x] Implement minimal file/socket facade over VFS/network services (bootstrap deterministic fd hooks in `linux_compat::sysdeps`; full service-backed semantics remain milestone-4+ integration work).
   - Mapping matrix artifact added: `MUSL_POSIX_IPC_MAPPING.md` (POSIX entry -> linux nr -> IPC opcode/service).
+
+Not yet complete:
+- [ ] Implement real musl entry/exit glue (`crt` startup + `__libc_start_main` integration path). Current code validates/parses startup vectors and runs a test main callback, but does not yet provide the full musl crt integration symbols.
 
 ## Milestone 4 — Service integration on x86_64
 

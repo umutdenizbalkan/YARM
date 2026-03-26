@@ -30,11 +30,18 @@ This contract defines the minimum invariants for Phase-2 driver services (`irqmu
 
 ## CI gate mapping
 
+- Transfer-cap ABI prerequisite:
+  - Kernel IPC syscall ABI is frozen at v3.
+  - Transfer-cap send requires a known waiting receiver (`WouldBlock` otherwise).
+  - Transfer metadata is an envelope handle (not a raw source capability id).
+  - Reference: `LIBC_ABI_X86_64_NONE.md`.
 - `kernel::boot::tests::delegate_driver_bundle_checked_enforces_service_role_edges`
 - `kernel::boot::tests::restart_denial_escalates_to_supervisor_every_threshold`
 - `kernel::boot::tests::driver_restart_revokes_runtime_caps`
+- `kernel::syscall::tests::transfer_send_without_waiter_returns_would_block`
 
-The above are required to pass in `.github/workflows/compat-gates.yml` under `phase2-driver-gates`.
+The above are required to pass in `.github/workflows/compat-gates.yml` under `phase2-driver-gates`
+and are executed via `scripts/phase2-driver-gates.sh`.
 
 ## Backpressure and queueing contract
 

@@ -1,4 +1,3 @@
-use crate::services::compatibility::linux_compat::LinuxErrno;
 use crate::kernel::boot::KernelState;
 use crate::kernel::ipc::Message;
 use crate::kernel::process::ProcessService;
@@ -8,6 +7,7 @@ use crate::kernel::vfs::{
     read_message, write_message,
 };
 use crate::services::common::service::FsService;
+use crate::services::compatibility::linux_compat::LinuxErrno;
 use crate::services::network::socket::service::SocketAdapterService;
 
 pub struct LinuxSysdepsContext<'a, B: VfsBackend> {
@@ -62,10 +62,7 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
     }
 
     pub fn getpid_hook(&mut self) -> Result<u64, LinuxErrno> {
-        let tid = self
-            .kernel
-            .current_tid()
-            .ok_or(LinuxErrno::NoSys)?;
+        let tid = self.kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
         let reply = self
             .proc_service
             .handle(
@@ -77,10 +74,7 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
     }
 
     pub fn getppid_hook(&mut self) -> Result<u64, LinuxErrno> {
-        let tid = self
-            .kernel
-            .current_tid()
-            .ok_or(LinuxErrno::NoSys)?;
+        let tid = self.kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
         let reply = self
             .proc_service
             .handle(
@@ -92,10 +86,7 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
     }
 
     pub fn exit_hook(&mut self, code: u64) -> Result<(), LinuxErrno> {
-        let tid = self
-            .kernel
-            .current_tid()
-            .ok_or(LinuxErrno::NoSys)?;
+        let tid = self.kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
         self.proc_service
             .handle(
                 Message::with_header(tid, PROC_OP_EXIT, 0, None, &code.to_le_bytes())

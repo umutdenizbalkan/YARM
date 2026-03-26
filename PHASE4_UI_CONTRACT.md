@@ -22,8 +22,16 @@ This contract defines minimal invariants for UI-facing services (`display`, `com
 - Shell session startup counter is deterministic and monotonic.
 - Session-manager startup is validated by deterministic unit coverage.
 
+## IPC transfer-cap ABI prerequisite
+
+- Kernel IPC syscall ABI is frozen at v3.
+- Transfer-cap send requires a known waiting receiver (`WouldBlock` otherwise).
+- Transfer metadata is an envelope handle (not a raw source capability id).
+- Reference: `LIBC_ABI_X86_64_NONE.md`.
+
 ## CI gate mapping
 
+- `kernel::syscall::tests::transfer_send_without_waiter_returns_would_block`
 - `services::ui::display::service::tests::boot_marker_is_stable`
 - `services::ui::display::service::tests::display_tracks_modeset_and_present`
 - `services::ui::compositor::service::tests::compositor_replay_is_deterministic`

@@ -4,13 +4,15 @@ mod policy;
 
 use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use crate::kernel::capabilities::{CapId, CapRights};
-use crate::kernel::task::TaskStatus;
 use crate::kernel::supervisor_abi::{
     RegisterCoreServiceRequest, RegisterDriverRequest, TaskExitedEvent,
     register_core_service_message, register_driver_message,
 };
 use crate::kernel::task::TaskClass;
-use crate::kernel::vfs::{OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message};
+use crate::kernel::task::TaskStatus;
+use crate::kernel::vfs::{
+    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
+};
 use crate::kernel::vm::Asid;
 use crate::services::fs::devfs::service::run_request_loop as run_devfs_request_loop;
 use crate::services::fs::devfs::{DevFsBackend, DevFsService};
@@ -503,7 +505,10 @@ impl InitService {
     }
 
     pub fn monitor_supervisor(&mut self, kernel: &mut KernelState) -> Result<bool, KernelError> {
-        let supervisor_tid = self.handles.supervisor_tid.ok_or(KernelError::WrongObject)?;
+        let supervisor_tid = self
+            .handles
+            .supervisor_tid
+            .ok_or(KernelError::WrongObject)?;
         self.monitor_core_service(kernel, supervisor_tid)
     }
 
@@ -568,7 +573,9 @@ impl InitService {
         kind: CoreServiceKind,
         restart_token: u64,
     ) -> Result<bool, KernelError> {
-        let tid = self.core_service_tid(kind).ok_or(KernelError::WrongObject)?;
+        let tid = self
+            .core_service_tid(kind)
+            .ok_or(KernelError::WrongObject)?;
         let policy = self.restart_policies.policy_for(kind);
         if self.restart_count_for(kind) >= policy.max_restarts {
             kernel.mark_task_dead(tid)?;
@@ -635,11 +642,16 @@ impl InitService {
         if !matches!(kernel.task_status(tid), Some(TaskStatus::Exited(_))) {
             return Ok(false);
         }
-        let token = kernel.task_restart_token(tid).ok_or(KernelError::WrongObject)?;
+        let token = kernel
+            .task_restart_token(tid)
+            .ok_or(KernelError::WrongObject)?;
         self.recover_core_service_failure_by_tid(kernel, tid, token)
     }
 
-    pub fn monitor_core_failures(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
+    pub fn monitor_core_failures(
+        &mut self,
+        kernel: &mut KernelState,
+    ) -> Result<usize, KernelError> {
         let mut recovered = 0usize;
         while let Some(alert) = self.poll_init_alert(kernel)? {
             if self.handle_init_alert(kernel, alert)? {
@@ -705,18 +717,15 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
     match kind {
         MountServiceKind::Initramfs => {
             let mut service = InitramfsService::with_backend(InitramfsBackend::new(4096));
-            let summary = run_initramfs_request_loop(&mut service).map_err(|_| KernelError::WrongObject)?;
+            let summary =
+                run_initramfs_request_loop(&mut service).map_err(|_| KernelError::WrongObject)?;
             if summary.write_allowed {
                 return Err(KernelError::WrongObject);
             }
         }
         MountServiceKind::RamFs => {
             let mut service = RamFsService::with_backend(RamFsBackend::new());
-            run_rw_mount_cycle(
-                &mut service,
-                0xA100,
-                64,
-            )?;
+            run_rw_mount_cycle(&mut service, 0xA100, 64)?;
         }
         MountServiceKind::DevFs => {
             let mut service = DevFsService::with_backend(DevFsBackend::default());
@@ -745,7 +754,9 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
                 len: 33,
             })
             .map_err(|_| KernelError::WrongObject)?;
-            service.handle(write).map_err(|_| KernelError::WrongObject)?;
+            service
+                .handle(write)
+                .map_err(|_| KernelError::WrongObject)?;
         }
     }
     Ok(())
@@ -773,7 +784,9 @@ fn run_rw_mount_cycle<B: crate::kernel::vfs::VfsBackend>(
         len: write_len,
     })
     .map_err(|_| KernelError::WrongObject)?;
-    service.handle(write).map_err(|_| KernelError::WrongObject)?;
+    service
+        .handle(write)
+        .map_err(|_| KernelError::WrongObject)?;
     let stat = statx_message(StatxRequest {
         dirfd: 0,
         path_ptr,

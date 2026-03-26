@@ -1,4 +1,6 @@
+pub mod boot;
 pub mod console;
+pub mod irq;
 pub mod platform_layout;
 pub mod syscall_abi;
 pub mod trap;

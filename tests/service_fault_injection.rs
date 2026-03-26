@@ -116,5 +116,6 @@ fn initramfs_fault_path_stays_read_only() {
         InitramfsService::with_backend(yarm::services::fs::initramfs::InitramfsBackend::new(2048));
     let summary = run_initramfs_request_loop(&mut initramfs).expect("loop");
     assert_eq!(summary.write_allowed, false);
-    assert_eq!(summary.handled, 2);
+    // initramfs bootstrap loop performs: open + read + statx.
+    assert_eq!(summary.handled, 3);
 }
