@@ -151,12 +151,13 @@ fn encode_transfer_cap_ret(frame: &mut TrapFrame, cap: Option<u64>) -> Result<()
 fn materialize_received_transfer_cap(
     kernel: &mut KernelState,
     transfer_handle: Option<u64>,
+    endpoint: CapObject,
 ) -> Result<Option<u64>, SyscallError> {
     let Some(handle) = transfer_handle else {
         return Ok(None);
     };
     let source_cap = kernel
-        .take_transfer_envelope(handle)
+        .take_transfer_envelope(handle, endpoint)
         .ok_or(SyscallError::InvalidCapability)?;
     let derived = kernel.cspace.mint(source_cap).map_err(|err| match err {
         CapabilityDeriveError::ParentMissing
@@ -206,6 +207,7 @@ fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), Syscall
 fn stash_transfer_handle(
     kernel: &mut KernelState,
     transfer_cap: Option<CapId>,
+    endpoint: CapObject,
 ) -> Result<Option<u64>, SyscallError> {
     let Some(source_cap_id) = transfer_cap else {
         return Ok(None);
@@ -215,7 +217,7 @@ fn stash_transfer_handle(
         .ok_or(SyscallError::InvalidCapability)?;
     Ok(Some(
         kernel
-            .stash_transfer_envelope(source_cap)
+            .stash_transfer_envelope(source_cap, endpoint)
             .ok_or(SyscallError::QueueFull)?,
     ))
 }
@@ -240,6 +242,10 @@ fn inline_payload_from_frame(
 fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     validate_endpoint_right(kernel, cap, CapRights::SEND)?;
+    let endpoint = kernel
+        .current_task_capability(cap)
+        .ok_or(SyscallError::InvalidCapability)?
+        .object;
     let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
     let transfer_cap = transfer_cap_arg(kernel, frame)?;
@@ -263,7 +269,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
             };
-            let transfer_handle = stash_transfer_handle(kernel, transfer_cap)?;
+            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
             Message::with_header(
                 sender_tid,
                 OPCODE_SHARED_MEM,
@@ -282,7 +288,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 Err(other) => return Err(SyscallError::from(other)),
             };
 
-            let transfer_handle = stash_transfer_handle(kernel, transfer_cap)?;
+            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
             Message::with_header(
                 sender_tid,
                 OPCODE_INLINE,
@@ -294,7 +300,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         }
     } else {
         let payload = inline_payload_from_frame(frame, len)?;
-        let transfer_handle = stash_transfer_handle(kernel, transfer_cap)?;
+        let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
         Message::with_header(
             sender_tid,
             OPCODE_INLINE,
@@ -311,7 +317,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 
     if let Err(err) = kernel.ipc_send(cap, msg) {
         if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
-            let _ = kernel.take_transfer_envelope(handle);
+            let _ = kernel.take_transfer_envelope(handle, endpoint);
         }
         return Err(SyscallError::from(err));
     }
@@ -323,6 +329,10 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     validate_endpoint_right(kernel, cap, CapRights::RECEIVE)?;
+    let endpoint = kernel
+        .current_task_capability(cap)
+        .ok_or(SyscallError::InvalidCapability)?
+        .object;
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let user_len = frame.arg(SYSCALL_ARG_LEN);
     let received = kernel.ipc_recv(cap).map_err(SyscallError::from)?;
@@ -330,8 +340,11 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     match received {
         Some(msg) => {
             let sender = sender_tid_to_ret(msg.sender_tid.0)?;
-            let recv_local_transfer =
-                materialize_received_transfer_cap(kernel, msg.transferred_cap().map(|c| c.0))?;
+            let recv_local_transfer = materialize_received_transfer_cap(
+                kernel,
+                msg.transferred_cap().map(|c| c.0),
+                endpoint,
+            )?;
             encode_transfer_cap_ret(frame, recv_local_transfer)?;
 
             if current_task_has_user_asid(kernel)? {
@@ -489,5 +502,39 @@ mod tests {
             let err = dispatch(&mut state, &mut send_frame).expect_err("invalid inline send");
             assert_eq!(err, SyscallError::InvalidArgs);
         }
+    }
+
+    #[test]
+    fn transfer_envelope_handle_is_bound_to_endpoint_context() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_e1, send1, recv1) = state.create_endpoint(2).expect("endpoint1");
+        let (_e2, send2, recv2) = state.create_endpoint(2).expect("endpoint2");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(crate::kernel::vm::PhysAddr(0xA000))
+            .expect("mem");
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send1.0 as usize,
+                0,
+                2,
+                usize::from_le_bytes([b'o', b'k', 0, 0, 0, 0, 0, 0]),
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send syscall");
+        let staged = state.ipc_recv(recv1).expect("recv1").expect("msg1");
+        let handle = staged.transferred_cap().expect("handle").0;
+
+        let forged = Message::with_header(0, 0, Message::FLAG_CAP_TRANSFER, Some(handle), b"zz")
+            .expect("forged");
+        state.ipc_send(send2, forged).expect("queue forged");
+
+        let mut recv_frame =
+            TrapFrame::new(Syscall::IpcRecv as usize, [recv2.0 as usize, 0, 0, 0, 0, 0]);
+        let err = dispatch(&mut state, &mut recv_frame).expect_err("endpoint mismatch");
+        assert_eq!(err, SyscallError::InvalidCapability);
     }
 }

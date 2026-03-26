@@ -195,6 +195,12 @@ struct RobustFutexRecord {
     state: RobustFutexState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransferEnvelope {
+    capability: Capability,
+    endpoint: CapObject,
+}
+
 #[derive(Debug)]
 struct IpcSubsystem {
     cross_cpu_work: SmpMailbox,
@@ -205,7 +211,7 @@ struct IpcSubsystem {
     notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
     notification_generations: [u64; MAX_NOTIFICATIONS],
     irq_routes: [Option<usize>; MAX_IRQ_LINES],
-    transfer_envelopes: [Option<Capability>; MAX_TRANSFER_ENVELOPES],
+    transfer_envelopes: [Option<TransferEnvelope>; MAX_TRANSFER_ENVELOPES],
     transfer_envelope_generations: [u64; MAX_TRANSFER_ENVELOPES],
     telemetry: IpcPathTelemetry,
 }
@@ -419,7 +425,11 @@ impl KernelState {
             .unwrap_or(false)
     }
 
-    pub fn stash_transfer_envelope(&mut self, capability: Capability) -> Option<u64> {
+    pub fn stash_transfer_envelope(
+        &mut self,
+        capability: Capability,
+        endpoint: CapObject,
+    ) -> Option<u64> {
         for idx in 0..MAX_TRANSFER_ENVELOPES {
             if self.ipc.transfer_envelopes[idx].is_some() {
                 continue;
@@ -429,14 +439,21 @@ impl KernelState {
                 generation = 1;
             }
             self.ipc.transfer_envelope_generations[idx] = generation;
-            self.ipc.transfer_envelopes[idx] = Some(capability);
+            self.ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
+                capability,
+                endpoint,
+            });
             let idx_part = u64::try_from(idx).ok()?;
             return Some((generation << 16) | idx_part);
         }
         None
     }
 
-    pub fn take_transfer_envelope(&mut self, handle: u64) -> Option<Capability> {
+    pub fn take_transfer_envelope(
+        &mut self,
+        handle: u64,
+        endpoint: CapObject,
+    ) -> Option<Capability> {
         let idx = usize::try_from(handle & 0xFFFF).ok()?;
         if idx >= MAX_TRANSFER_ENVELOPES {
             return None;
@@ -445,7 +462,12 @@ impl KernelState {
         if generation == 0 || self.ipc.transfer_envelope_generations[idx] != generation {
             return None;
         }
-        self.ipc.transfer_envelopes[idx].take()
+        let envelope = self.ipc.transfer_envelopes[idx]?;
+        if envelope.endpoint != endpoint {
+            return None;
+        }
+        self.ipc.transfer_envelopes[idx] = None;
+        Some(envelope.capability)
     }
 
     pub fn capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
@@ -588,18 +610,31 @@ mod tests {
     fn transfer_envelope_handles_are_single_use_and_replay_safe() {
         let mut state = Bootstrap::init().expect("init");
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
         let payload = state.cspace.get(mem_cap).expect("payload");
+        let endpoint = state.cspace.get(send_cap).expect("send cap").object;
 
-        let first = state.stash_transfer_envelope(payload).expect("stash first");
-        assert!(state.take_transfer_envelope(first).is_some());
-        assert!(state.take_transfer_envelope(first).is_none());
+        let first = state
+            .stash_transfer_envelope(payload, endpoint)
+            .expect("stash first");
+        assert!(state.take_transfer_envelope(first, endpoint).is_some());
+        assert!(state.take_transfer_envelope(first, endpoint).is_none());
 
         let second = state
-            .stash_transfer_envelope(payload)
+            .stash_transfer_envelope(payload, endpoint)
             .expect("stash second");
         assert_ne!(first, second);
-        assert!(state.take_transfer_envelope(first).is_none());
-        assert!(state.take_transfer_envelope(second).is_some());
+        assert!(state.take_transfer_envelope(first, endpoint).is_none());
+        let wrong_endpoint = CapObject::Endpoint {
+            index: usize::MAX,
+            generation: 1,
+        };
+        assert!(
+            state
+                .take_transfer_envelope(second, wrong_endpoint)
+                .is_none()
+        );
+        assert!(state.take_transfer_envelope(second, endpoint).is_some());
     }
 
     #[test]
