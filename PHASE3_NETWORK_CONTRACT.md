@@ -17,8 +17,16 @@ This contract defines minimal invariants for networking services (`netmgr`, `tcp
 - Socket open/close accounting must remain balanced for deterministic roundtrips.
 - Adapter behavior must remain transport-agnostic and not depend on FS/UI internals.
 
+## IPC transfer-cap ABI prerequisite
+
+- Kernel IPC syscall ABI is frozen at v3.
+- Transfer-cap send requires a known waiting receiver (`WouldBlock` otherwise).
+- Transfer metadata is an envelope handle (not a raw source capability id).
+- Reference: `LIBC_ABI_X86_64_NONE.md`.
+
 ## CI gate mapping
 
+- `kernel::syscall::tests::transfer_send_without_waiter_returns_would_block`
 - `services::network::netmgr::service::tests::netmgr_tracks_link_state_events`
 - `services::network::tcpip::service::tests::tcpip_deterministic_packet_path`
 - `services::network::dns::service::tests::dns_timeout_retry_is_reproducible`

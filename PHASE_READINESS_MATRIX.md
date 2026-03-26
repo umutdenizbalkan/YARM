@@ -46,6 +46,7 @@ This matrix maps roadmap phase completion to required contracts, CI jobs, and de
 - Required CI jobs:
   - `phase3-network-gates`
 - Required deterministic tests:
+  - `kernel::syscall::tests::transfer_send_without_waiter_returns_would_block`
   - `services::network::netmgr::service::tests::netmgr_tracks_link_state_events`
   - `services::network::tcpip::service::tests::tcpip_deterministic_packet_path`
   - `services::network::dns::service::tests::dns_timeout_retry_is_reproducible`

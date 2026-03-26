@@ -54,6 +54,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: phase3 deterministic networking gates
         run: |
+          cargo test -q kernel::syscall::tests::transfer_send_without_waiter_returns_would_block
           cargo test -q services::network::netmgr::service::tests::netmgr_tracks_link_state_events
           cargo test -q services::network::tcpip::service::tests::tcpip_deterministic_packet_path
           cargo test -q services::network::dns::service::tests::dns_timeout_retry_is_reproducible
