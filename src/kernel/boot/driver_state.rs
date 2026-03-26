@@ -129,10 +129,19 @@ impl KernelState {
         {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
+        let parent_len = self
+            .memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.len)
+            .ok_or(KernelError::MemoryObjectMissing)?;
+
         if offset
             .checked_add(len)
             .ok_or(KernelError::Vm(VmError::Misaligned))?
-            > crate::kernel::vm::PAGE_SIZE
+            > parent_len
         {
             return Err(KernelError::WrongObject);
         }

@@ -86,6 +86,7 @@ impl KernelState {
         if !phys.0.is_multiple_of(crate::kernel::vm::PAGE_SIZE as u64) {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
+        let len = crate::kernel::vm::PAGE_SIZE;
         let id = self.memory.next_memory_object_id;
         self.memory.next_memory_object_id = self.memory.next_memory_object_id.wrapping_add(1);
 
@@ -95,7 +96,7 @@ impl KernelState {
             .iter_mut()
             .find(|entry| entry.is_none())
             .ok_or(KernelError::MemoryObjectFull)?;
-        *slot = Some(MemoryObject { id, phys });
+        *slot = Some(MemoryObject { id, phys, len });
 
         let cap = self.mint_capability_for_current_context(Capability::new(
             CapObject::MemoryObject { id },

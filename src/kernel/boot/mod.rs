@@ -185,6 +185,7 @@ pub struct IpcPathTelemetry {
 struct MemoryObject {
     id: u64,
     phys: PhysAddr,
+    len: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2242,6 +2243,31 @@ mod tests {
         assert!(state.mint_dma_region_cap(mem_cap, 0, 0).is_err());
         assert!(state
             .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+            .is_err());
+    }
+
+    #[test]
+    fn dma_region_cap_uses_parent_memory_object_length() {
+        let mut state = Bootstrap::init().expect("init");
+        let (id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        let entry = state
+            .memory
+            .memory_objects
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.id == id)
+            .expect("memory object present");
+        entry.len = crate::kernel::vm::PAGE_SIZE * 4;
+
+        assert!(state
+            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+            .is_ok());
+        assert!(state
+            .mint_dma_region_cap(mem_cap, crate::kernel::vm::PAGE_SIZE * 3, crate::kernel::vm::PAGE_SIZE)
+            .is_ok());
+        assert!(state
+            .mint_dma_region_cap(mem_cap, crate::kernel::vm::PAGE_SIZE * 3, crate::kernel::vm::PAGE_SIZE * 2)
             .is_err());
     }
 
