@@ -9,7 +9,7 @@ mod task_policy_state;
 mod thread_state;
 mod user_memory_state;
 
-use super::capabilities::{CapId, CapObject, CapRights, Capability, CapabilitySpace};
+use super::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability, CapabilitySpace};
 #[cfg(test)]
 use super::ipc::EndpointMode;
 use super::ipc::{Endpoint, IpcError, Message};
@@ -392,6 +392,26 @@ impl KernelState {
             .flatten()
             .find(|tcb| tcb.tid.0 == tid)
             .and_then(|tcb| tcb.restart.token.map(|token| token.0))
+    }
+
+    pub fn current_task_cnode(&self) -> Option<CNodeId> {
+        let tid = self.current_tid()?;
+        self.tcbs
+            .iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .map(|tcb| tcb.cnode)
+    }
+
+    pub fn current_task_capability(&self, cap: CapId) -> Option<Capability> {
+        let _cnode = self.current_task_cnode();
+        self.cspace.get(cap)
+    }
+
+    pub fn current_task_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
+        self.current_task_capability(cap)
+            .map(|capability| capability.has_right(right))
+            .unwrap_or(false)
     }
 
     pub fn capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
@@ -862,7 +882,14 @@ mod tests {
         let send_payload = usize::from_le_bytes([b'h', b'i', 0, 0, 0, 0, 0, 0]);
         let mut send_frame = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcSend as usize,
-            [send_cap.0 as usize, 42, 2, send_payload, 0, 0],
+            [
+                send_cap.0 as usize,
+                42,
+                2,
+                send_payload,
+                0,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
         );
 
         state
@@ -1041,7 +1068,14 @@ mod tests {
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let mut send_frame = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcSend as usize,
-            [send_cap.0 as usize, 0, 2, 0, 0, 0],
+            [
+                send_cap.0 as usize,
+                0,
+                2,
+                0,
+                0,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
         );
         state
             .handle_trap(Trap::Syscall, Some(&mut send_frame))

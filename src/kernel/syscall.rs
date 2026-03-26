@@ -132,18 +132,14 @@ fn sender_tid_to_ret(tid: u64) -> Result<usize, SyscallError> {
 }
 
 fn transfer_cap_arg(
-    kernel: &KernelState,
+    _kernel: &KernelState,
     frame: &TrapFrame,
 ) -> Result<Option<CapId>, SyscallError> {
     let raw = frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64;
     if raw == SYSCALL_NO_TRANSFER_CAP {
         return Ok(None);
     }
-    let cap = CapId(raw);
-    if raw == 0 && kernel.cspace.get(cap).is_none() {
-        return Ok(None);
-    }
-    Ok(Some(cap))
+    Ok(Some(CapId(raw)))
 }
 
 fn encode_transfer_cap_ret(frame: &mut TrapFrame, cap: Option<u64>) -> Result<(), SyscallError> {
@@ -167,8 +163,7 @@ fn validate_endpoint_right(
     right: CapRights,
 ) -> Result<(), SyscallError> {
     let endpoint_cap = kernel
-        .cspace
-        .get(cap)
+        .current_task_capability(cap)
         .ok_or(SyscallError::InvalidCapability)?;
     if !matches!(endpoint_cap.object, CapObject::Endpoint { .. }) {
         return Err(SyscallError::WrongObject);
@@ -180,7 +175,7 @@ fn validate_endpoint_right(
 }
 
 fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), SyscallError> {
-    if kernel.cspace.get(cap).is_none() {
+    if kernel.current_task_capability(cap).is_none() {
         return Err(SyscallError::InvalidCapability);
     }
     Ok(())
@@ -219,8 +214,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         if len > Message::MAX_PAYLOAD {
             let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
             let grant = kernel
-                .cspace
-                .get(grant_cap)
+                .current_task_capability(grant_cap)
                 .ok_or(SyscallError::InvalidCapability)?;
             match grant.object {
                 CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}
@@ -345,7 +339,9 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::IPC_REGISTER_WORDS;
+    use crate::kernel::trapframe::TrapFrame;
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
@@ -366,5 +362,18 @@ mod tests {
         assert_eq!(SyscallError::WouldBlock.code(), 7);
         assert_eq!(SyscallError::PageFault.code(), 8);
         assert_eq!(SyscallError::Internal.code(), 255);
+    }
+
+    #[test]
+    fn transfer_cap_arg_zero_is_not_treated_as_none() {
+        let state = Bootstrap::init().expect("kernel");
+
+        let mut frame = TrapFrame::zeroed();
+        frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, 0);
+
+        assert_eq!(
+            transfer_cap_arg(&state, &frame).expect("decode transfer cap"),
+            Some(CapId(0))
+        );
     }
 }
