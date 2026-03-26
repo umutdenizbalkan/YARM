@@ -150,27 +150,23 @@ fn encode_transfer_cap_ret(frame: &mut TrapFrame, cap: Option<u64>) -> Result<()
 
 fn materialize_received_transfer_cap(
     kernel: &mut KernelState,
-    transfer_cap: Option<u64>,
+    transfer_handle: Option<u64>,
 ) -> Result<Option<u64>, SyscallError> {
-    let Some(source_raw) = transfer_cap else {
+    let Some(handle) = transfer_handle else {
         return Ok(None);
     };
-    let source = CapId(source_raw);
     let source_cap = kernel
-        .current_task_capability(source)
+        .take_transfer_envelope(handle)
         .ok_or(SyscallError::InvalidCapability)?;
-    let derived = kernel
-        .cspace
-        .mint_derived(source, source_cap.rights())
-        .map_err(|err| match err {
-            CapabilityDeriveError::ParentMissing
-            | CapabilityDeriveError::NotFound
-            | CapabilityDeriveError::InvalidSlot => SyscallError::InvalidCapability,
-            CapabilityDeriveError::RightsEscalation => SyscallError::MissingRight,
-            CapabilityDeriveError::SpaceFull | CapabilityDeriveError::SlotOccupied => {
-                SyscallError::QueueFull
-            }
-        })?;
+    let derived = kernel.cspace.mint(source_cap).map_err(|err| match err {
+        CapabilityDeriveError::ParentMissing
+        | CapabilityDeriveError::NotFound
+        | CapabilityDeriveError::InvalidSlot => SyscallError::InvalidCapability,
+        CapabilityDeriveError::RightsEscalation => SyscallError::MissingRight,
+        CapabilityDeriveError::SpaceFull | CapabilityDeriveError::SlotOccupied => {
+            SyscallError::QueueFull
+        }
+    })?;
     Ok(Some(derived.0))
 }
 
@@ -233,6 +229,18 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     if let Some(c) = transfer_cap {
         validate_transfer_cap(kernel, c)?;
     }
+    let transfer_handle = if let Some(source_cap_id) = transfer_cap {
+        let source_cap = kernel
+            .current_task_capability(source_cap_id)
+            .ok_or(SyscallError::InvalidCapability)?;
+        Some(
+            kernel
+                .stash_transfer_envelope(source_cap)
+                .ok_or(SyscallError::QueueFull)?,
+        )
+    } else {
+        None
+    };
 
     let sender_tid = current_tid(kernel)?;
 
@@ -255,7 +263,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 sender_tid,
                 OPCODE_SHARED_MEM,
                 Message::FLAG_CAP_TRANSFER,
-                Some(grant_cap.0),
+                transfer_handle,
                 &region.encode(),
             )
             .map_err(|_| SyscallError::InvalidArgs)?
@@ -273,7 +281,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 sender_tid,
                 OPCODE_INLINE,
                 transfer_flag_bits(transfer_cap),
-                transfer_cap.map(|c| c.0),
+                transfer_handle,
                 &payload[..len],
             )
             .map_err(|_| SyscallError::InvalidArgs)?
@@ -284,7 +292,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             sender_tid,
             OPCODE_INLINE,
             transfer_flag_bits(transfer_cap),
-            transfer_cap.map(|c| c.0),
+            transfer_handle,
             &payload[..len],
         )
         .map_err(|_| SyscallError::InvalidArgs)?
@@ -412,15 +420,19 @@ mod tests {
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0x7000))
             .expect("mem");
-        state
-            .ipc_send_with_cap_transfer(
-                send_cap,
-                crate::kernel::ipc::ThreadId(0),
-                0x44,
-                mem_cap,
-                b"ok",
-            )
-            .expect("send");
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                2,
+                usize::from_le_bytes([b'o', b'k', 0, 0, 0, 0, 0, 0]),
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send syscall");
+        assert_eq!(send_frame.error_code(), None);
 
         let mut frame = TrapFrame::new(
             Syscall::IpcRecv as usize,

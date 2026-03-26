@@ -55,6 +55,7 @@ const MAX_MEMORY_OBJECTS: usize = 128;
 const MAX_NOTIFICATIONS: usize = 16;
 const MAX_IRQ_LINES: usize = platform_layout::MAX_IRQ_LINES;
 const MAX_DRIVERS: usize = 32;
+const MAX_TRANSFER_ENVELOPES: usize = 64;
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +205,8 @@ struct IpcSubsystem {
     notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
     notification_generations: [u64; MAX_NOTIFICATIONS],
     irq_routes: [Option<usize>; MAX_IRQ_LINES],
+    transfer_envelopes: [Option<Capability>; MAX_TRANSFER_ENVELOPES],
+    transfer_envelope_generations: [u64; MAX_TRANSFER_ENVELOPES],
     telemetry: IpcPathTelemetry,
 }
 
@@ -325,6 +328,8 @@ impl Bootstrap {
                 notifications: [const { None }; MAX_NOTIFICATIONS],
                 notification_generations: [0; MAX_NOTIFICATIONS],
                 irq_routes: [None; MAX_IRQ_LINES],
+                transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
+                transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],
                 telemetry: IpcPathTelemetry::default(),
             }),
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
@@ -412,6 +417,35 @@ impl KernelState {
         self.current_task_capability(cap)
             .map(|capability| capability.has_right(right))
             .unwrap_or(false)
+    }
+
+    pub fn stash_transfer_envelope(&mut self, capability: Capability) -> Option<u64> {
+        for idx in 0..MAX_TRANSFER_ENVELOPES {
+            if self.ipc.transfer_envelopes[idx].is_some() {
+                continue;
+            }
+            let mut generation = self.ipc.transfer_envelope_generations[idx].wrapping_add(1);
+            if generation == 0 {
+                generation = 1;
+            }
+            self.ipc.transfer_envelope_generations[idx] = generation;
+            self.ipc.transfer_envelopes[idx] = Some(capability);
+            let idx_part = u64::try_from(idx).ok()?;
+            return Some((generation << 16) | idx_part);
+        }
+        None
+    }
+
+    pub fn take_transfer_envelope(&mut self, handle: u64) -> Option<Capability> {
+        let idx = usize::try_from(handle & 0xFFFF).ok()?;
+        if idx >= MAX_TRANSFER_ENVELOPES {
+            return None;
+        }
+        let generation = handle >> 16;
+        if generation == 0 || self.ipc.transfer_envelope_generations[idx] != generation {
+            return None;
+        }
+        self.ipc.transfer_envelopes[idx].take()
     }
 
     pub fn capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
