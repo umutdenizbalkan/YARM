@@ -1,12 +1,34 @@
 use super::{
-    IpcFastpathResult, KernelError, KernelState, MAX_ENDPOINTS, MAX_IRQ_LINES, MAX_NOTIFICATIONS,
-    NotificationObject, map_ipc_error,
+    map_ipc_error, IpcFastpathResult, KernelError, KernelState, NotificationObject, MAX_ENDPOINTS,
+    MAX_IRQ_LINES, MAX_NOTIFICATIONS,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
 use crate::kernel::task::{TaskStatus, WaitReason};
 
 impl KernelState {
+    fn resolve_send_cap_task_local(&self, send_cap: CapId) -> Result<Capability, KernelError> {
+        self.current_task_capability(send_cap)
+            .ok_or(KernelError::InvalidCapability)
+    }
+
+    fn resolve_send_cap_compat(&self, send_cap: CapId) -> Result<Capability, KernelError> {
+        self.current_task_capability(send_cap)
+            .or_else(|| self.cspace.get(send_cap))
+            .ok_or(KernelError::InvalidCapability)
+    }
+
+    fn resolve_recv_cap_task_local(&self, recv_cap: CapId) -> Result<Capability, KernelError> {
+        self.current_task_capability(recv_cap)
+            .ok_or(KernelError::InvalidCapability)
+    }
+
+    fn resolve_recv_cap_compat(&self, recv_cap: CapId) -> Result<Capability, KernelError> {
+        self.current_task_capability(recv_cap)
+            .or_else(|| self.cspace.get(recv_cap))
+            .ok_or(KernelError::InvalidCapability)
+    }
+
     fn mint_capability_for_active_cnode(
         &mut self,
         capability: Capability,
@@ -265,14 +287,74 @@ impl KernelState {
     }
 
     pub fn ipc_send(&mut self, send_cap: CapId, msg: Message) -> Result<(), KernelError> {
-        let capability = self
-            .current_task_capability(send_cap)
-            .or_else(|| self.cspace.get(send_cap))
-            .ok_or(KernelError::InvalidCapability)?;
+        let capability = self.resolve_send_cap_compat(send_cap)?;
         if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
         }
 
+        let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+
+        let endpoint_mode = self
+            .ipc
+            .endpoints
+            .get(endpoint_idx)
+            .and_then(Option::as_ref)
+            .ok_or(KernelError::WrongObject)?
+            .mode();
+
+        if endpoint_mode == EndpointMode::Synchronous {
+            if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+                self.ipc.telemetry.fastpath_attempts =
+                    self.ipc.telemetry.fastpath_attempts.saturating_add(1);
+                let endpoint = self
+                    .ipc
+                    .endpoints
+                    .get_mut(endpoint_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(KernelError::WrongObject)?;
+                endpoint
+                    .send(msg)
+                    .map_err(|_| KernelError::EndpointQueueFull)?;
+                self.ipc.telemetry.rendezvous_handoffs =
+                    self.ipc.telemetry.rendezvous_handoffs.saturating_add(1);
+                self.wake_waiter_for_endpoint(endpoint_idx)?;
+                if self.switch_to_runnable_tid(waiter_tid)? {
+                    self.ipc.telemetry.fastpath_switches =
+                        self.ipc.telemetry.fastpath_switches.saturating_add(1);
+                }
+                return Ok(());
+            }
+
+            self.block_current_on_send(endpoint_idx, send_cap, msg)?;
+            self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
+            return Err(KernelError::WouldBlock);
+        }
+
+        let endpoint = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?;
+
+        endpoint
+            .send(msg)
+            .map_err(|_| KernelError::EndpointQueueFull)?;
+
+        self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
+        self.wake_waiter_for_endpoint(endpoint_idx)?;
+        Ok(())
+    }
+
+    pub fn ipc_send_task_local(
+        &mut self,
+        send_cap: CapId,
+        msg: Message,
+    ) -> Result<(), KernelError> {
+        let capability = self.resolve_send_cap_task_local(send_cap)?;
+        if !capability.has_right(CapRights::SEND) {
+            return Err(KernelError::MissingRight);
+        }
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
 
         let endpoint_mode = self
@@ -332,10 +414,7 @@ impl KernelState {
         send_cap: CapId,
         msg: Message,
     ) -> Result<IpcFastpathResult, KernelError> {
-        let capability = self
-            .current_task_capability(send_cap)
-            .or_else(|| self.cspace.get(send_cap))
-            .ok_or(KernelError::InvalidCapability)?;
+        let capability = self.resolve_send_cap_compat(send_cap)?;
         if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
         }
@@ -357,6 +436,52 @@ impl KernelState {
         }
 
         self.ipc_send(send_cap, msg)?;
+
+        let switched = if inline_sync_handoff {
+            true
+        } else if waiter_tid.is_some() {
+            self.switch_to_runnable_tid(waiter_tid.expect("checked is_some"))?
+        } else {
+            false
+        };
+
+        if switched && !inline_sync_handoff {
+            self.ipc.telemetry.fastpath_switches =
+                self.ipc.telemetry.fastpath_switches.saturating_add(1);
+        }
+
+        Ok(IpcFastpathResult {
+            switched_to_waiter: switched,
+        })
+    }
+
+    pub fn ipc_send_fastpath_task_local(
+        &mut self,
+        send_cap: CapId,
+        msg: Message,
+    ) -> Result<IpcFastpathResult, KernelError> {
+        let capability = self.resolve_send_cap_task_local(send_cap)?;
+        if !capability.has_right(CapRights::SEND) {
+            return Err(KernelError::MissingRight);
+        }
+
+        let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+        let endpoint_mode = self
+            .ipc
+            .endpoints
+            .get(endpoint_idx)
+            .and_then(Option::as_ref)
+            .ok_or(KernelError::WrongObject)?
+            .mode();
+        let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx];
+        let inline_sync_handoff =
+            endpoint_mode == EndpointMode::Synchronous && waiter_tid.is_some();
+        if !inline_sync_handoff {
+            self.ipc.telemetry.fastpath_attempts =
+                self.ipc.telemetry.fastpath_attempts.saturating_add(1);
+        }
+
+        self.ipc_send_task_local(send_cap, msg)?;
 
         let switched = if inline_sync_handoff {
             true
@@ -461,16 +586,54 @@ impl KernelState {
     }
 
     pub fn ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
-        let capability = self
-            .current_task_capability(recv_cap)
-            .or_else(|| self.cspace.get(recv_cap))
-            .ok_or(KernelError::InvalidCapability)?;
+        let capability = self.resolve_recv_cap_compat(recv_cap)?;
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
 
+        let endpoint = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?;
+
+        if let Some(msg) = endpoint.recv() {
+            if let Some((sender_tid, pending_msg, sender_blocked)) =
+                self.ipc.endpoint_sender_waiters[endpoint_idx].take()
+            {
+                endpoint
+                    .send(pending_msg)
+                    .map_err(|_| KernelError::EndpointQueueFull)?;
+                if sender_blocked {
+                    self.wake_sender_waiter(sender_tid)?;
+                }
+            }
+            return Ok(Some(msg));
+        }
+
+        if let Some((sender_tid, pending_msg, sender_blocked)) =
+            self.ipc.endpoint_sender_waiters[endpoint_idx].take()
+        {
+            if sender_blocked {
+                self.wake_sender_waiter(sender_tid)?;
+            }
+            return Ok(Some(pending_msg));
+        }
+
+        self.block_current_on_receive(endpoint_idx, recv_cap)?;
+        Ok(None)
+    }
+
+    pub fn ipc_recv_task_local(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
+        let capability = self.resolve_recv_cap_task_local(recv_cap)?;
+        if !capability.has_right(CapRights::RECEIVE) {
+            return Err(KernelError::MissingRight);
+        }
+
+        let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
         let endpoint = self
             .ipc
             .endpoints
