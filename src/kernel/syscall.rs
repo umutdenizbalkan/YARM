@@ -1,5 +1,5 @@
 use super::boot::{KernelError, KernelState};
-use super::capabilities::{CapId, CapObject, CapRights, CapabilityDeriveError};
+use super::capabilities::{CapId, CapObject, CapRights};
 use super::ipc::{
     IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
 };
@@ -161,15 +161,12 @@ fn materialize_received_transfer_cap(
     let source_cap = kernel
         .take_transfer_envelope(handle, endpoint, crate::kernel::ipc::ThreadId(receiver_tid))
         .ok_or(SyscallError::InvalidCapability)?;
-    let derived = kernel.cspace.mint(source_cap).map_err(|err| match err {
-        CapabilityDeriveError::ParentMissing
-        | CapabilityDeriveError::NotFound
-        | CapabilityDeriveError::InvalidSlot => SyscallError::InvalidCapability,
-        CapabilityDeriveError::RightsEscalation => SyscallError::MissingRight,
-        CapabilityDeriveError::SpaceFull | CapabilityDeriveError::SlotOccupied => {
-            SyscallError::QueueFull
-        }
-    })?;
+    let derived = kernel.cspace.mint(source_cap).map_err(|_| SyscallError::QueueFull)?;
+    if let Some(cnode) = kernel.current_task_cnode() {
+        kernel
+            .mirror_capability_into_cnode(cnode, derived, source_cap)
+            .map_err(|_| SyscallError::QueueFull)?;
+    }
     Ok(Some(derived.0))
 }
 

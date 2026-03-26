@@ -11,8 +11,10 @@ impl KernelState {
         if self.task_status(tid).is_some() {
             return Ok(());
         }
-        if let Some(slot) = self.tcbs.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(ThreadControlBlock::new(ThreadId(tid), class, None));
+        if let Some(idx) = self.tcbs.iter().position(|slot| slot.is_none()) {
+            let tcb = ThreadControlBlock::new(ThreadId(tid), class, None);
+            self.ensure_cnode_space(tcb.cnode)?;
+            self.tcbs[idx] = Some(tcb);
             Ok(())
         } else {
             Err(KernelError::TaskTableFull)

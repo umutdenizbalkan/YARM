@@ -49,6 +49,26 @@ fn store_kernel_value<T>(value: T) -> KernelStorage<T> {
     value
 }
 
+#[cfg(feature = "hosted-dev")]
+fn kernel_ref<T>(value: &KernelStorage<T>) -> &T {
+    value.as_ref()
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+fn kernel_ref<T>(value: &KernelStorage<T>) -> &T {
+    value
+}
+
+#[cfg(feature = "hosted-dev")]
+fn kernel_mut<T>(value: &mut KernelStorage<T>) -> &mut T {
+    value.as_mut()
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+fn kernel_mut<T>(value: &mut KernelStorage<T>) -> &mut T {
+    value
+}
+
 const MAX_ENDPOINTS: usize = 16;
 const MAX_TASKS: usize = 64;
 const MAX_MEMORY_OBJECTS: usize = 128;
@@ -236,6 +256,12 @@ struct DriverSubsystem {
     next_iova_space_id: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CNodeSpace {
+    id: CNodeId,
+    cspace: KernelStorage<CapabilitySpace>,
+}
+
 #[derive(Debug)]
 struct FaultSubsystem {
     last_fault: Option<FaultInfo>,
@@ -258,6 +284,7 @@ pub struct KernelState {
     pub user_spaces: AddressSpaceManager,
     current_cpu: CpuId,
     ipc: KernelStorage<IpcSubsystem>,
+    cnode_spaces: KernelStorage<[Option<CNodeSpace>; MAX_TASKS]>,
     next_dynamic_tid: u64,
     tcbs: [Option<ThreadControlBlock>; MAX_TASKS],
     tls_restore_pending: [Option<ThreadId>; MAX_TASKS],
@@ -339,6 +366,7 @@ impl Bootstrap {
                 transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],
                 telemetry: IpcPathTelemetry::default(),
             }),
+            cnode_spaces: store_kernel_value([const { None }; MAX_TASKS]),
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
             tcbs: [const { None }; MAX_TASKS],
             tls_restore_pending: [None; MAX_TASKS],
@@ -416,7 +444,11 @@ impl KernelState {
     }
 
     pub fn current_task_capability(&self, cap: CapId) -> Option<Capability> {
-        let _cnode = self.current_task_cnode()?;
+        let cnode = self.current_task_cnode()?;
+        if let Some(capability) = self.capability_for_cnode(cnode, cap) {
+            self.cspace.get(cap)?;
+            return Some(capability);
+        }
         self.cspace.get(cap)
     }
 
@@ -494,6 +526,71 @@ impl KernelState {
 
     pub fn capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
         self.cspace.has_right(cap, right)
+    }
+
+    pub fn capability_for_cnode(&self, cnode: CNodeId, cap: CapId) -> Option<Capability> {
+        self.cspace_for_cnode(cnode)?.get(cap)
+    }
+
+    pub fn cnode_capability_has_right(
+        &self,
+        cnode: CNodeId,
+        cap: CapId,
+        right: CapRights,
+    ) -> bool {
+        self.capability_for_cnode(cnode, cap)
+            .map(|capability| capability.has_right(right))
+            .unwrap_or(false)
+    }
+
+    fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
+        self.cnode_spaces
+            .iter()
+            .flatten()
+            .find(|space| space.id == cnode)
+            .map(|space| kernel_ref(&space.cspace))
+    }
+
+    fn cspace_for_cnode_mut(&mut self, cnode: CNodeId) -> Option<&mut CapabilitySpace> {
+        self.cnode_spaces
+            .iter_mut()
+            .flatten()
+            .find(|space| space.id == cnode)
+            .map(|space| kernel_mut(&mut space.cspace))
+    }
+
+    pub(crate) fn ensure_cnode_space(&mut self, cnode: CNodeId) -> Result<(), KernelError> {
+        if self.cspace_for_cnode(cnode).is_some() {
+            return Ok(());
+        }
+        if let Some(slot) = self.cnode_spaces.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(CNodeSpace {
+                id: cnode,
+                cspace: store_kernel_value((*self.cspace).clone()),
+            });
+            Ok(())
+        } else {
+            Err(KernelError::TaskTableFull)
+        }
+    }
+
+    pub(crate) fn mirror_capability_into_cnode(
+        &mut self,
+        cnode: CNodeId,
+        cap_id: CapId,
+        capability: Capability,
+    ) -> Result<(), KernelError> {
+        self.ensure_cnode_space(cnode)?;
+        let slot_index = (cap_id.0 & 0xFFFF) as usize;
+        let local_id = self
+            .cspace_for_cnode_mut(cnode)
+            .ok_or(KernelError::TaskMissing)?
+            .mint_at(slot_index, capability)
+            .map_err(|_| KernelError::CapabilityFull)?;
+        if local_id != cap_id {
+            return Err(KernelError::CapabilityFull);
+        }
+        Ok(())
     }
 
     pub fn last_fault(&self) -> Option<FaultInfo> {

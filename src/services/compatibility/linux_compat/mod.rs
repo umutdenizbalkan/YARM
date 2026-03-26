@@ -85,13 +85,16 @@ impl LinuxServiceBindings {
         request_send_cap: CapId,
         reply_recv_cap: CapId,
     ) -> Result<(), KernelError> {
-        if !kernel.cspace.has_right(
+        let cnode = kernel.current_task_cnode().ok_or(KernelError::TaskMissing)?;
+        if !kernel.cnode_capability_has_right(
+            cnode,
             request_send_cap,
             crate::kernel::capabilities::CapRights::SEND,
         ) {
             return Err(KernelError::MissingRight);
         }
-        if !kernel.cspace.has_right(
+        if !kernel.cnode_capability_has_right(
+            cnode,
             reply_recv_cap,
             crate::kernel::capabilities::CapRights::RECEIVE,
         ) {
@@ -108,13 +111,16 @@ impl LinuxServiceBindings {
         request_send_cap: CapId,
         reply_recv_cap: CapId,
     ) -> Result<(), KernelError> {
-        if !kernel.cspace.has_right(
+        let cnode = kernel.current_task_cnode().ok_or(KernelError::TaskMissing)?;
+        if !kernel.cnode_capability_has_right(
+            cnode,
             request_send_cap,
             crate::kernel::capabilities::CapRights::SEND,
         ) {
             return Err(KernelError::MissingRight);
         }
-        if !kernel.cspace.has_right(
+        if !kernel.cnode_capability_has_right(
+            cnode,
             reply_recv_cap,
             crate::kernel::capabilities::CapRights::RECEIVE,
         ) {

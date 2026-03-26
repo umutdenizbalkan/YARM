@@ -7,6 +7,20 @@ use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
 use crate::kernel::task::{TaskStatus, WaitReason};
 
 impl KernelState {
+    fn mint_capability_for_active_cnode(
+        &mut self,
+        capability: Capability,
+    ) -> Result<CapId, KernelError> {
+        let cap_id = self
+            .cspace
+            .mint(capability)
+            .map_err(|_| KernelError::CapabilityFull)?;
+        if let Some(cnode) = self.current_task_cnode() {
+            self.mirror_capability_into_cnode(cnode, cap_id, capability)?;
+        }
+        Ok(cap_id)
+    }
+
     fn block_current_on_receive(
         &mut self,
         endpoint_idx: usize,
@@ -131,27 +145,21 @@ impl KernelState {
         self.ipc.endpoints[endpoint_idx] =
             Some(Endpoint::new_with_mode(max_depth, mode).map_err(map_ipc_error)?);
 
-        let send_cap = self
-            .cspace
-            .mint(Capability::new(
-                CapObject::Endpoint {
-                    index: endpoint_idx,
-                    generation: self.ipc.endpoint_generations[endpoint_idx],
-                },
-                CapRights::SEND,
-            ))
-            .map_err(|_| KernelError::CapabilityFull)?;
+        let send_cap = self.mint_capability_for_active_cnode(Capability::new(
+            CapObject::Endpoint {
+                index: endpoint_idx,
+                generation: self.ipc.endpoint_generations[endpoint_idx],
+            },
+            CapRights::SEND,
+        ))?;
 
-        let recv_cap = self
-            .cspace
-            .mint(Capability::new(
-                CapObject::Endpoint {
-                    index: endpoint_idx,
-                    generation: self.ipc.endpoint_generations[endpoint_idx],
-                },
-                CapRights::RECEIVE,
-            ))
-            .map_err(|_| KernelError::CapabilityFull)?;
+        let recv_cap = self.mint_capability_for_active_cnode(Capability::new(
+            CapObject::Endpoint {
+                index: endpoint_idx,
+                generation: self.ipc.endpoint_generations[endpoint_idx],
+            },
+            CapRights::RECEIVE,
+        ))?;
 
         Ok((endpoint_idx, send_cap, recv_cap))
     }
@@ -180,16 +188,13 @@ impl KernelState {
         self.ipc.notification_generations[notification_idx] = next_generation;
         self.ipc.notifications[notification_idx] = Some(NotificationObject { endpoint_idx });
 
-        let notification_cap = self
-            .cspace
-            .mint(Capability::new(
-                CapObject::Notification {
-                    index: notification_idx,
-                    generation: self.ipc.notification_generations[notification_idx],
-                },
-                CapRights::SIGNAL,
-            ))
-            .map_err(|_| KernelError::CapabilityFull)?;
+        let notification_cap = self.mint_capability_for_active_cnode(Capability::new(
+            CapObject::Notification {
+                index: notification_idx,
+                generation: self.ipc.notification_generations[notification_idx],
+            },
+            CapRights::SIGNAL,
+        ))?;
 
         let _ = notif_send_cap;
         Ok((notification_idx, notification_cap, recv_cap))

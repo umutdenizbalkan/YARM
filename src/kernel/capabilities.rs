@@ -162,7 +162,7 @@ struct CapSlot {
     entry: Option<CapEntry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CapabilitySpace {
     slots: [CapSlot; MAX_CAPABILITIES_PER_CSPACE],
 }
