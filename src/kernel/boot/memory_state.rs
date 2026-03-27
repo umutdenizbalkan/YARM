@@ -16,12 +16,7 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
 
-        self.cspace
-            .revoke(aspace_cap)
-            .map_err(|_| KernelError::InvalidCapability)?;
-        if let Some(cnode) = self.current_task_cnode() {
-            self.revoke_capability_in_cnode(cnode, aspace_cap)?;
-        }
+        self.revoke_capability_in_cnode(cnode, aspace_cap)?;
 
         let pending_cpu_bitmap = self.online_cpu_bitmap();
         self.user_spaces
