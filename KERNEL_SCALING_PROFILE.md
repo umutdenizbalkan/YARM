@@ -66,6 +66,8 @@ changes were made:
 ## Scope of what is solved
 
 - Multiple blocked sender waiters per endpoint are supported.
+- IPC queue policy is endpoint-class-aware (`ControlPlane` vs `DataPlane`) with
+  class-specific queue depth defaults.
 - Driver records can track multiple IRQ and DMA caps.
 - DMA region minting checks against parent memory object length.
 - Capacity values are profile-aware and documented.
@@ -85,13 +87,9 @@ Recommended follow-ups:
    - Replace fixed arrays for endpoints/notifications/drivers/tasks with slabs or
      arena-indexed vectors.
 
-3. **IPC queue model upgrades**
-   - Introduce queue depth policy per endpoint class (control-plane vs data-plane).
-
-4. **Memory object sizing model**
+3. **Memory object sizing model**
    - Support explicit multi-page memory-object creation in public APIs so DMA sizing
      can be expressed directly rather than inferred.
 
-5. **Capacity telemetry + pressure signals**
+4. **Capacity telemetry + pressure signals**
    - Export "near-full" metrics to supervisor/init for proactive remediation.
-

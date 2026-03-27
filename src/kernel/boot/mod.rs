@@ -11,7 +11,7 @@ mod user_memory_state;
 
 use super::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability, CapabilitySpace};
 #[cfg(test)]
-use super::ipc::EndpointMode;
+use super::ipc::{EndpointClass, EndpointMode};
 use super::ipc::{Endpoint, IpcError, Message};
 use super::scheduler::{CpuId, SchedulerError, SmpScheduler};
 use super::scheduler_timer::Timer;
@@ -1319,6 +1319,66 @@ mod tests {
         let second = state.ipc_recv(recv_cap_task3).expect("recv2").expect("msg2");
         assert_eq!(first.as_slice(), b"m0");
         assert_eq!(second.as_slice(), b"m1");
+    }
+
+    #[test]
+    fn endpoint_class_policy_controls_blocked_sender_queue_depth() {
+        let mut control = Bootstrap::init().expect("init");
+        for tid in 1..=4u64 {
+            control.register_task(tid).expect("task");
+        }
+        let (_eid, send_cap, _recv_cap) = control
+            .create_endpoint_with_class(EndpointClass::ControlPlane, EndpointMode::Synchronous)
+            .expect("control endpoint");
+        let send_caps: [CapId; 4] = [1u64, 2, 3, 4].map(|tid| {
+            control
+                .duplicate_global_capability_to_task(tid, send_cap)
+                .expect("dup send")
+        });
+        for tid in 1..=4u64 {
+            control.enqueue_current_cpu(tid).expect("enqueue");
+        }
+
+        assert_eq!(
+            control.ipc_send(send_cap, Message::new(0, b"c0").expect("msg")),
+            Err(KernelError::WouldBlock)
+        );
+        for (idx, cap) in send_caps.iter().copied().take(3).enumerate() {
+            assert_eq!(
+                control.ipc_send(cap, Message::new((idx + 1) as u64, b"cx").expect("msg")),
+                Err(KernelError::WouldBlock)
+            );
+        }
+        assert_eq!(
+            control.ipc_send(send_caps[3], Message::new(4, b"overflow").expect("msg")),
+            Err(KernelError::EndpointQueueFull)
+        );
+
+        let mut data = Bootstrap::init().expect("init");
+        for tid in 1..=5u64 {
+            data.register_task(tid).expect("task");
+        }
+        let (_eid, send_cap, _recv_cap) = data
+            .create_endpoint_with_class(EndpointClass::DataPlane, EndpointMode::Synchronous)
+            .expect("data endpoint");
+        let send_caps: [CapId; 5] = [1u64, 2, 3, 4, 5].map(|tid| {
+            data.duplicate_global_capability_to_task(tid, send_cap)
+                .expect("dup send")
+        });
+        for tid in 1..=5u64 {
+            data.enqueue_current_cpu(tid).expect("enqueue");
+        }
+
+        assert_eq!(
+            data.ipc_send(send_cap, Message::new(0, b"d0").expect("msg")),
+            Err(KernelError::WouldBlock)
+        );
+        for (idx, cap) in send_caps.iter().copied().enumerate() {
+            assert_eq!(
+                data.ipc_send(cap, Message::new((idx + 1) as u64, b"dx").expect("msg")),
+                Err(KernelError::WouldBlock)
+            );
+        }
     }
 
     #[test]

@@ -3,17 +3,32 @@ use super::{
     MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, MAX_NOTIFICATIONS, SenderWaiter,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
-use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
+use crate::kernel::ipc::{Endpoint, EndpointClass, EndpointMode, Message, ThreadId};
 use crate::kernel::task::{TaskStatus, WaitReason};
 
 impl KernelState {
+    fn endpoint_sender_waiter_limit(&self, endpoint_idx: usize) -> Result<usize, KernelError> {
+        let endpoint = self
+            .ipc
+            .endpoints
+            .get(endpoint_idx)
+            .and_then(Option::as_ref)
+            .ok_or(KernelError::WrongObject)?;
+        let limit = match endpoint.class() {
+            EndpointClass::ControlPlane => core::cmp::min(4, MAX_ENDPOINT_SENDER_WAITERS),
+            EndpointClass::DataPlane => MAX_ENDPOINT_SENDER_WAITERS,
+        };
+        Ok(limit)
+    }
+
     fn enqueue_sender_waiter(
         &mut self,
         endpoint_idx: usize,
         waiter: SenderWaiter,
     ) -> Result<(), KernelError> {
+        let limit = self.endpoint_sender_waiter_limit(endpoint_idx)?;
         let queue = &mut self.ipc.endpoint_sender_waiters[endpoint_idx];
-        if let Some(slot) = queue.iter_mut().find(|slot| slot.is_none()) {
+        if let Some(slot) = queue[..limit].iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(waiter);
             return Ok(());
         }
@@ -158,13 +173,30 @@ impl KernelState {
         &mut self,
         max_depth: usize,
     ) -> Result<(usize, CapId, CapId), KernelError> {
-        self.create_endpoint_with_mode(max_depth, EndpointMode::Buffered)
+        self.create_endpoint_with_mode_and_class(max_depth, EndpointMode::Buffered, EndpointClass::DataPlane)
     }
 
     pub fn create_endpoint_with_mode(
         &mut self,
         max_depth: usize,
         mode: EndpointMode,
+    ) -> Result<(usize, CapId, CapId), KernelError> {
+        self.create_endpoint_with_mode_and_class(max_depth, mode, EndpointClass::DataPlane)
+    }
+
+    pub fn create_endpoint_with_class(
+        &mut self,
+        class: EndpointClass,
+        mode: EndpointMode,
+    ) -> Result<(usize, CapId, CapId), KernelError> {
+        self.create_endpoint_with_mode_and_class(class.default_depth(), mode, class)
+    }
+
+    fn create_endpoint_with_mode_and_class(
+        &mut self,
+        max_depth: usize,
+        mode: EndpointMode,
+        class: EndpointClass,
     ) -> Result<(usize, CapId, CapId), KernelError> {
         let mut slot_index = None;
         for (idx, slot) in self.ipc.endpoints.iter().enumerate() {
@@ -181,7 +213,7 @@ impl KernelState {
         }
         self.ipc.endpoint_generations[endpoint_idx] = next_generation;
         self.ipc.endpoints[endpoint_idx] = Some(super::store_kernel_value(
-            Endpoint::new_with_mode(max_depth, mode).map_err(map_ipc_error)?,
+            Endpoint::new_with_mode_and_class(max_depth, mode, class).map_err(map_ipc_error)?,
         ));
 
         let send_cap = self.mint_capability_for_active_cnode(Capability::new(
