@@ -624,6 +624,20 @@ impl KernelState {
         self.capability_for_cnode(cnode, cap)
     }
 
+    pub fn task_capability(&self, tid: u64, cap: CapId) -> Option<Capability> {
+        let cnode = self.task_cnode(tid)?;
+        self.capability_for_cnode(cnode, cap)
+    }
+
+    pub(crate) fn resolve_capability_for_task(
+        &self,
+        tid: u64,
+        cap: CapId,
+    ) -> Result<Capability, KernelError> {
+        self.task_capability(tid, cap)
+            .ok_or(KernelError::InvalidCapability)
+    }
+
     pub fn current_task_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
         self.current_task_capability(cap)
             .map(|capability| capability.has_right(right))

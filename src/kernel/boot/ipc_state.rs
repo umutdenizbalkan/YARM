@@ -470,14 +470,10 @@ impl KernelState {
         transfer_cap: CapId,
         payload: &[u8],
     ) -> Result<(), KernelError> {
-        // Kernel-internal transfer-envelope staging intentionally references global
-        // capabilities because handles are bound and materialized across tasks.
-        let transfer_payload = self
-            .kernel_global_capability(transfer_cap)
-            .ok_or(KernelError::InvalidCapability)?;
-        let send_capability = self
-            .kernel_global_capability(send_cap)
-            .ok_or(KernelError::InvalidCapability)?;
+        // Resolve all capabilities in the sender's cspace to keep authorization
+        // task-local even for kernel-internal transfer staging paths.
+        let transfer_payload = self.resolve_capability_for_task(sender_tid.0, transfer_cap)?;
+        let send_capability = self.resolve_capability_for_task(sender_tid.0, send_cap)?;
         if !send_capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
         }
@@ -503,10 +499,8 @@ impl KernelState {
     }
 
     pub fn try_ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
-        // Kernel-internal probe path for globally held receive capabilities.
-        let capability = self
-            .kernel_global_capability(recv_cap)
-            .ok_or(KernelError::InvalidCapability)?;
+        // Probe path resolves receive capability in the current task cspace.
+        let capability = self.resolve_recv_cap_task_local(recv_cap)?;
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }
