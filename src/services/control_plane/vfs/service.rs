@@ -213,9 +213,17 @@ pub fn run_request_loop_over_kernel_ipc(
     })
 }
 
-pub fn run() {
+pub fn run_with_kernel_ipc(
+    kernel: &mut KernelState,
+    path_ptr: u64,
+) -> Result<VfsLoopSummary, VfsError> {
     let mut vfs = FsService::with_backend(InMemoryBackend::new());
-    let summary = run_request_loop(&mut vfs, 0x1000).expect("vfs loop");
+    run_request_loop_over_kernel_ipc(kernel, &mut vfs, path_ptr)
+}
+
+pub fn run() {
+    let mut kernel = crate::kernel::boot::Bootstrap::init().expect("kernel init");
+    let summary = run_with_kernel_ipc(&mut kernel, 0x1000).expect("vfs loop");
 
     crate::yarm_log!(
         "vfs request-loop ready: fd={}, dup_fd={}, epoll_fd={}, handled={}",
@@ -265,6 +273,16 @@ mod tests {
         let summary =
             run_request_loop_over_kernel_ipc(&mut kernel, &mut vfs, 0x1010).expect("loop");
 
+        assert_eq!(summary.fd, 3);
+        assert_eq!(summary.dup_fd, 4);
+        assert_eq!(summary.epoll_fd, 5);
+        assert_eq!(summary.handled, 15);
+    }
+
+    #[test]
+    fn vfs_run_with_kernel_ipc_bootstraps_server_loop() {
+        let mut kernel = Bootstrap::init().expect("kernel init");
+        let summary = run_with_kernel_ipc(&mut kernel, 0x1010).expect("loop");
         assert_eq!(summary.fd, 3);
         assert_eq!(summary.dup_fd, 4);
         assert_eq!(summary.epoll_fd, 5);
