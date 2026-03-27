@@ -329,19 +329,39 @@ impl InitService {
         let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
         let (_, _, fault_recv_cap) = kernel.create_endpoint(16)?;
         let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
-        let local_fault_recv_cap =
-            kernel.grant_capability_task_to_task(source_tid, fault_recv_cap, init_tid)?;
+        let local_fault_recv_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            fault_recv_cap,
+            init_tid,
+            CapRights::RECEIVE,
+        )?;
         kernel.set_supervisor_endpoint_for_task(init_tid, local_fault_recv_cap)?;
         let (_, control_send_cap, control_recv_cap) = kernel.create_endpoint(16)?;
-        let local_control_send_cap =
-            kernel.grant_capability_task_to_task(source_tid, control_send_cap, init_tid)?;
-        let local_control_recv_cap =
-            kernel.grant_capability_task_to_task(source_tid, control_recv_cap, init_tid)?;
+        let local_control_send_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            control_send_cap,
+            init_tid,
+            CapRights::SEND,
+        )?;
+        let local_control_recv_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            control_recv_cap,
+            init_tid,
+            CapRights::RECEIVE,
+        )?;
         let (_, init_alert_send_cap, init_alert_recv_cap) = kernel.create_endpoint(16)?;
-        let local_init_alert_send_cap =
-            kernel.grant_capability_task_to_task(source_tid, init_alert_send_cap, init_tid)?;
-        let local_init_alert_recv_cap =
-            kernel.grant_capability_task_to_task(source_tid, init_alert_recv_cap, init_tid)?;
+        let local_init_alert_send_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            init_alert_send_cap,
+            init_tid,
+            CapRights::SEND,
+        )?;
+        let local_init_alert_recv_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            init_alert_recv_cap,
+            init_tid,
+            CapRights::RECEIVE,
+        )?;
         let _ = local_control_send_cap;
         let _ = local_control_recv_cap;
         let _ = local_init_alert_send_cap;
@@ -627,10 +647,11 @@ impl InitService {
                 }
                 let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
                 let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
-                let local_fault_recv = kernel.grant_capability_task_to_task(
+                let local_fault_recv = kernel.grant_capability_task_to_task_with_rights(
                     source_tid,
                     handoff.supervisor_fault_recv_cap,
                     init_tid,
+                    CapRights::RECEIVE,
                 )?;
                 kernel.set_supervisor_endpoint_for_task(init_tid, local_fault_recv)?;
                 self.clear_supervisor_control_queue(kernel)?;

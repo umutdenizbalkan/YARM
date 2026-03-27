@@ -167,9 +167,17 @@ fn materialize_received_transfer_cap(
     let envelope = kernel
         .take_transfer_envelope(handle, endpoint, crate::kernel::ipc::ThreadId(receiver_tid))
         .ok_or(SyscallError::InvalidCapability)?;
+    let source_capability = kernel
+        .resolve_capability_for_task(envelope.source_tid.0, envelope.source_cap)
+        .map_err(SyscallError::from)?;
     let derived = kernel
         .capability_service_mut()
-        .grant_task_to_task(envelope.source_tid.0, envelope.source_cap, receiver_tid)
+        .grant_task_to_task_with_rights(
+            envelope.source_tid.0,
+            envelope.source_cap,
+            receiver_tid,
+            source_capability.rights(),
+        )
         .map_err(SyscallError::from)?;
     Ok(Some(derived.0))
 }
