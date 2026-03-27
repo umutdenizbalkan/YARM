@@ -219,6 +219,23 @@ pub struct IpcPathTelemetry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityPoolTelemetry {
+    pub used: usize,
+    pub capacity: usize,
+    pub near_full: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityTelemetry {
+    pub endpoints: CapacityPoolTelemetry,
+    pub notifications: CapacityPoolTelemetry,
+    pub tasks: CapacityPoolTelemetry,
+    pub drivers: CapacityPoolTelemetry,
+    pub memory_objects: CapacityPoolTelemetry,
+    pub capability_slots: CapacityPoolTelemetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MemoryObject {
     id: u64,
     phys: PhysAddr,
@@ -450,6 +467,47 @@ impl Bootstrap {
 }
 
 impl KernelState {
+    const CAPACITY_NEAR_FULL_PERCENT: usize = 90;
+
+    fn capacity_pool(used: usize, capacity: usize) -> CapacityPoolTelemetry {
+        let near_full = if capacity == 0 {
+            false
+        } else {
+            used.saturating_mul(100) >= capacity.saturating_mul(Self::CAPACITY_NEAR_FULL_PERCENT)
+        };
+        CapacityPoolTelemetry {
+            used,
+            capacity,
+            near_full,
+        }
+    }
+
+    pub fn capacity_telemetry(&self) -> CapacityTelemetry {
+        CapacityTelemetry {
+            endpoints: Self::capacity_pool(
+                self.ipc.endpoints.iter().flatten().count(),
+                MAX_ENDPOINTS,
+            ),
+            notifications: Self::capacity_pool(
+                self.ipc.notifications.iter().flatten().count(),
+                MAX_NOTIFICATIONS,
+            ),
+            tasks: Self::capacity_pool(self.tcbs.iter().flatten().count(), MAX_TASKS),
+            drivers: Self::capacity_pool(
+                self.drivers.driver_records.iter().flatten().count(),
+                MAX_DRIVERS,
+            ),
+            memory_objects: Self::capacity_pool(
+                self.memory.memory_objects.iter().flatten().count(),
+                MAX_MEMORY_OBJECTS,
+            ),
+            capability_slots: Self::capacity_pool(
+                self.cspace.occupied_slots(),
+                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+            ),
+        }
+    }
+
     fn switch_to_runnable_tid(&mut self, tid: ThreadId) -> Result<bool, KernelError> {
         let mut spins = 0usize;
         while spins < MAX_TASKS {
@@ -2092,6 +2150,33 @@ mod tests {
         assert_eq!(t.queued_sends, 1);
         assert_eq!(t.blocked_sends, 0);
         assert_eq!(t.rendezvous_handoffs, 1);
+    }
+
+    #[test]
+    fn capacity_telemetry_reports_bootstrap_usage() {
+        let state = Bootstrap::init().expect("init");
+        let t = state.capacity_telemetry();
+
+        assert_eq!(t.tasks.used, 1);
+        assert_eq!(t.tasks.capacity, super::MAX_TASKS);
+        assert_eq!(t.endpoints.used, 0);
+        assert_eq!(t.notifications.used, 0);
+        assert!(t.capability_slots.used >= 1);
+        assert!(!t.tasks.near_full);
+    }
+
+    #[test]
+    fn capacity_telemetry_marks_endpoint_pressure_near_full() {
+        let mut state = Bootstrap::init().expect("init");
+        let threshold = (super::MAX_ENDPOINTS * 9).div_ceil(10);
+        for _ in 0..threshold {
+            let _ = state.create_endpoint(1).expect("endpoint");
+        }
+
+        let t = state.capacity_telemetry();
+        assert_eq!(t.endpoints.used, threshold);
+        assert_eq!(t.endpoints.capacity, super::MAX_ENDPOINTS);
+        assert!(t.endpoints.near_full);
     }
 
     #[test]
