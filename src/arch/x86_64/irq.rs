@@ -20,11 +20,6 @@ pub fn init_lapic_mmio_base(base: usize) {
 }
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
-fn lapic_mmio_base() -> usize {
-    LAPIC_MMIO_BASE.load(Ordering::Relaxed)
-}
-
-#[cfg(any(test, not(feature = "hosted-dev")))]
 fn lapic_write_eoi(base: usize) {
     unsafe {
         write_volatile((base + LAPIC_EOI_OFFSET) as *mut u32, 0);
@@ -73,7 +68,7 @@ pub fn external_irq_eoi(_irq_line: u16) {}
 
 #[cfg(not(feature = "hosted-dev"))]
 pub fn external_irq_eoi(_irq_line: u16) {
-    lapic_write_eoi(lapic_mmio_base());
+    lapic_write_eoi(LAPIC_MMIO_BASE.load(Ordering::Relaxed));
 }
 
 #[cfg(test)]

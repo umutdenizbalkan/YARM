@@ -537,6 +537,7 @@ impl CapabilityService<'_> {
         self.kernel.task_capability(tid, cap)
     }
 
+    #[cfg(test)]
     pub(crate) fn current_task_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
         self.resolve_current_task_capability(cap)
             .map(|capability| capability.has_right(right))
@@ -545,16 +546,6 @@ impl CapabilityService<'_> {
 }
 
 impl CapabilityServiceMut<'_> {
-    pub(crate) fn grant_task_to_task(
-        &mut self,
-        source_tid: u64,
-        source_cap: CapId,
-        dest_tid: u64,
-    ) -> Result<CapId, KernelError> {
-        self.kernel
-            .grant_capability_task_to_task(source_tid, source_cap, dest_tid)
-    }
-
     pub(crate) fn grant_task_to_task_with_rights(
         &mut self,
         source_tid: u64,
@@ -782,6 +773,7 @@ impl KernelState {
         Some(envelope)
     }
 
+    #[cfg(test)]
     pub(crate) fn grant_capability_task_to_task(
         &mut self,
         source_tid: u64,
