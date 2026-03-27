@@ -92,7 +92,6 @@ impl KernelState {
             SenderWaiter {
                 tid: ThreadId(blocked_tid),
                 msg,
-                blocked: true,
             },
         )?;
         let _ = self.dispatch_next_task()?;
@@ -523,17 +522,13 @@ impl KernelState {
                     .ok_or(KernelError::WrongObject)?
                     .send(waiter.msg)
                     .map_err(|_| KernelError::EndpointQueueFull)?;
-                if waiter.blocked {
-                    self.wake_sender_waiter(waiter.tid)?;
-                }
+                self.wake_sender_waiter(waiter.tid)?;
             }
             return Ok(Some(msg));
         }
 
         if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-            if waiter.blocked {
-                self.wake_sender_waiter(waiter.tid)?;
-            }
+            self.wake_sender_waiter(waiter.tid)?;
             return Ok(Some(waiter.msg));
         }
 
@@ -565,17 +560,13 @@ impl KernelState {
                     .ok_or(KernelError::WrongObject)?
                     .send(waiter.msg)
                     .map_err(|_| KernelError::EndpointQueueFull)?;
-                if waiter.blocked {
-                    self.wake_sender_waiter(waiter.tid)?;
-                }
+                self.wake_sender_waiter(waiter.tid)?;
             }
             return Ok(Some(msg));
         }
 
         if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-            if waiter.blocked {
-                self.wake_sender_waiter(waiter.tid)?;
-            }
+            self.wake_sender_waiter(waiter.tid)?;
             return Ok(Some(waiter.msg));
         }
 

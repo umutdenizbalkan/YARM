@@ -238,7 +238,7 @@ impl KernelState {
                 irq_line: plan.irq_line,
                 mem_cap: plan.mem_cap,
                 dma_offset: 0,
-                dma_len: super::super::vm::PAGE_SIZE,
+                dma_len: plan.iova_len,
                 iova_cap: plan.iova_cap,
                 iova_base: plan.iova_base,
                 iova_len: plan.iova_len,

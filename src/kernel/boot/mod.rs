@@ -304,7 +304,6 @@ pub(crate) struct TransferEnvelope {
 struct SenderWaiter {
     tid: ThreadId,
     msg: Message,
-    blocked: bool,
 }
 
 #[derive(Debug)]

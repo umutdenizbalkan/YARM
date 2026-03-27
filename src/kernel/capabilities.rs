@@ -270,6 +270,10 @@ impl CapabilitySpace {
         destination.mint_at(destination_slot, derived)
     }
 
+    /// Revoke `id` and all descendants derived from it.
+    ///
+    /// Complexity is `O(n^2)` in worst-case slot count due to closure expansion
+    /// over parent links. This is acceptable at current bounded cspace sizes.
     pub fn revoke(&mut self, id: CapId) -> Result<(), CapabilityDeriveError> {
         if self.get(id).is_none() {
             return Err(CapabilityDeriveError::NotFound);
