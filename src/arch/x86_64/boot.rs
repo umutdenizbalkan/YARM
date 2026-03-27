@@ -33,19 +33,36 @@ boot_pdpt:
 
     .align 4096
 boot_pd:
-    // Hardening tranche (stage 2):
-    // - keep minimal executable bootstrap window (first 2MiB identity page)
+    // Hardening tranche (stage 3):
+    // - split first 2MiB identity map into 4KiB PTEs so executable scope is narrowed
+    // - keep only a minimal executable bootstrap window in early low memory
     // - mark remaining identity-mapped bootstrap pages NX to reduce executable surface
     // - keep writable data/stack support during early bring-up
-    .set page_flags_exec, 0x83
+    .set page_flags_pt, 0x03
     .set page_flags_data_nx, 0x8000000000000083
-    .quad (0 * 0x200000) | page_flags_exec
+    .quad boot_pt0 + page_flags_pt
     .set page_index, 1
     .rept 31
     .quad (page_index * 0x200000) | page_flags_data_nx
     .set page_index, page_index + 1
     .endr
     .zero 3840
+
+    .align 4096
+boot_pt0:
+    .set pte_flags_exec, 0x003
+    .set pte_flags_data_nx, 0x8000000000000003
+    // First 256KiB executable for bootstrap code/trampolines.
+    .set pte_index, 0
+    .rept 64
+    .quad (pte_index * 0x1000) | pte_flags_exec
+    .set pte_index, pte_index + 1
+    .endr
+    // Remaining first-2MiB identity region is writable + NX.
+    .rept 448
+    .quad (pte_index * 0x1000) | pte_flags_data_nx
+    .set pte_index, pte_index + 1
+    .endr
 
     .align 8
 gdt64:
