@@ -184,8 +184,11 @@ fn materialize_received_transfer_cap(
 
 fn validate_user_region(offset: u64, len: u64) -> Result<(), SyscallError> {
     const USER_ADDR_MAX: u64 = crate::arch::vm_layout::KERNEL_SPACE_BASE - 1;
-    let end = offset.checked_add(len).ok_or(SyscallError::InvalidArgs)?;
-    if end > USER_ADDR_MAX {
+    if offset > USER_ADDR_MAX {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let end_exclusive = offset.checked_add(len).ok_or(SyscallError::InvalidArgs)?;
+    if end_exclusive > USER_ADDR_MAX.saturating_add(1) {
         return Err(SyscallError::InvalidArgs);
     }
     Ok(())
