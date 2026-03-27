@@ -549,7 +549,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
         let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
         let recv_cap = state
-            .duplicate_global_capability_to_task(1, recv_cap_global)
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0x7000))
@@ -644,7 +644,7 @@ mod tests {
             .create_memory_object(crate::kernel::vm::PhysAddr(0xA000))
             .expect("mem");
         let recv1_task1 = state
-            .duplicate_global_capability_to_task(1, recv1)
+            .grant_capability_task_to_task(0, recv1, 1)
             .expect("dup recv1 to task1");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
@@ -687,7 +687,7 @@ mod tests {
             .create_memory_object(crate::kernel::vm::PhysAddr(0xB000))
             .expect("mem");
         let recv_cap_task1 = state
-            .duplicate_global_capability_to_task(1, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 1)
             .expect("dup recv to task1");
 
         state.yield_current().expect("switch to task1");

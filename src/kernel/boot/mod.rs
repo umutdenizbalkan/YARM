@@ -850,32 +850,6 @@ impl KernelState {
         Ok(())
     }
 
-    pub fn mirror_global_capability_to_task(
-        &mut self,
-        tid: u64,
-        cap_id: CapId,
-    ) -> Result<(), KernelError> {
-        let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
-        let capability = self
-            .cspace
-            .get(cap_id)
-            .ok_or(KernelError::InvalidCapability)?;
-        self.mirror_capability_into_cnode(cnode, cap_id, capability)
-    }
-
-    pub fn duplicate_global_capability_to_task(
-        &mut self,
-        tid: u64,
-        cap_id: CapId,
-    ) -> Result<CapId, KernelError> {
-        let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
-        let capability = self
-            .cspace
-            .get(cap_id)
-            .ok_or(KernelError::InvalidCapability)?;
-        self.mint_capability_in_cnode(cnode, capability)
-    }
-
     pub(crate) fn mint_capability_for_current_context(
         &mut self,
         capability: Capability,
@@ -1366,7 +1340,7 @@ mod tests {
         state.enqueue_current_cpu(1).expect("queue task 1");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let send_cap_task1 = state
-            .duplicate_global_capability_to_task(1, send_cap)
+            .grant_capability_task_to_task(0, send_cap, 1)
             .expect("dup send cap to task1");
 
         assert_eq!(state.current_tid(), Some(0));
@@ -1394,7 +1368,7 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("sync endpoint");
         let recv_cap_task1 = state
-            .duplicate_global_capability_to_task(1, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 1)
             .expect("dup recv cap to task1");
 
         let msg = Message::new(0, b"xy").expect("msg");
@@ -1425,10 +1399,10 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("sync endpoint");
         let send_cap_task1 = state
-            .duplicate_global_capability_to_task(1, send_cap)
+            .grant_capability_task_to_task(0, send_cap, 1)
             .expect("dup send cap to task1");
         let recv_cap_task3 = state
-            .duplicate_global_capability_to_task(3, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 3)
             .expect("dup recv cap to task3");
 
         state.enqueue_current_cpu(1).expect("queue task 1");
@@ -1481,7 +1455,7 @@ mod tests {
             .expect("control endpoint");
         let send_caps: [CapId; 4] = [1u64, 2, 3, 4].map(|tid| {
             control
-                .duplicate_global_capability_to_task(tid, send_cap)
+                .grant_capability_task_to_task(0, send_cap, tid)
                 .expect("dup send")
         });
         for tid in 1..=4u64 {
@@ -1511,7 +1485,7 @@ mod tests {
             .create_endpoint_with_class(EndpointClass::DataPlane, EndpointMode::Synchronous)
             .expect("data endpoint");
         let send_caps: [CapId; 5] = [1u64, 2, 3, 4, 5].map(|tid| {
-            data.duplicate_global_capability_to_task(tid, send_cap)
+            data.grant_capability_task_to_task(0, send_cap, tid)
                 .expect("dup send")
         });
         for tid in 1..=5u64 {
@@ -1671,7 +1645,7 @@ mod tests {
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
         let recv_cap_task1 = state
-            .duplicate_global_capability_to_task(1, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 1)
             .expect("dup recv to task1");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
@@ -1925,7 +1899,7 @@ mod tests {
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         let recv_cap_task1 = state
-            .duplicate_global_capability_to_task(1, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 1)
             .expect("dup recv to task1");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
@@ -2108,7 +2082,7 @@ mod tests {
             state.create_endpoint(4).expect("handler endpoint");
         state.set_fault_handler(handler_recv).expect("set handler");
         let handler_recv_task1 = state
-            .duplicate_global_capability_to_task(1, handler_recv)
+            .grant_capability_task_to_task(0, handler_recv, 1)
             .expect("dup handler recv to task1");
 
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
@@ -2327,10 +2301,10 @@ mod tests {
             .create_endpoint_with_mode(2, EndpointMode::Synchronous)
             .expect("endpoint");
         let recv_cap_task61 = state
-            .duplicate_global_capability_to_task(61, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 61)
             .expect("dup recv to task61");
         let send_cap_task60 = state
-            .duplicate_global_capability_to_task(60, send_cap)
+            .grant_capability_task_to_task(0, send_cap, 60)
             .expect("dup send to task60");
 
         state.enqueue_current_cpu(61).expect("enqueue receiver");
@@ -2532,10 +2506,10 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
         let recv_cap_task81 = state
-            .duplicate_global_capability_to_task(81, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 81)
             .expect("dup recv to task81");
         let send_cap_task80 = state
-            .duplicate_global_capability_to_task(80, send_cap)
+            .grant_capability_task_to_task(0, send_cap, 80)
             .expect("dup send to task80");
 
         state.enqueue_current_cpu(81).expect("enqueue receiver");
@@ -2579,10 +2553,10 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
         let recv_cap_task36 = state
-            .duplicate_global_capability_to_task(36, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 36)
             .expect("dup recv to task36");
         let send_cap_task35 = state
-            .duplicate_global_capability_to_task(35, send_cap)
+            .grant_capability_task_to_task(0, send_cap, 35)
             .expect("dup send to task35");
 
         state.enqueue_current_cpu(36).expect("enqueue receiver");
