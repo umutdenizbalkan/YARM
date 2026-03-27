@@ -246,8 +246,6 @@ impl KernelState {
         max_depth: usize,
     ) -> Result<(usize, CapId, CapId), KernelError> {
         let limits = self.runtime_capacity_config();
-        let (endpoint_idx, notif_send_cap, recv_cap) =
-            self.create_endpoint_with_mode(max_depth, EndpointMode::Buffered)?;
 
         let mut slot_index = None;
         for (idx, slot) in self
@@ -270,7 +268,7 @@ impl KernelState {
             next_generation = 1;
         }
         self.ipc.notification_generations[notification_idx] = next_generation;
-        self.ipc.notifications[notification_idx] = Some(NotificationObject { endpoint_idx });
+        self.ipc.notifications[notification_idx] = Some(NotificationObject::new(max_depth)?);
 
         let notification_cap = self.mint_capability_for_active_cnode(Capability::new(
             CapObject::Notification {
@@ -280,7 +278,14 @@ impl KernelState {
             CapRights::SIGNAL,
         ))?;
 
-        let _ = notif_send_cap;
+        let recv_cap = self.mint_capability_for_active_cnode(Capability::new(
+            CapObject::Notification {
+                index: notification_idx,
+                generation: self.ipc.notification_generations[notification_idx],
+            },
+            CapRights::RECEIVE,
+        ))?;
+
         Ok((notification_idx, notification_cap, recv_cap))
     }
 
@@ -327,18 +332,20 @@ impl KernelState {
         notification_idx: usize,
         irq_line: u16,
     ) -> Result<(), KernelError> {
-        let notif = self.ipc.notifications[notification_idx].ok_or(KernelError::WrongObject)?;
+        let notif = self.ipc.notifications[notification_idx]
+            .as_mut()
+            .ok_or(KernelError::WrongObject)?;
         let payload = irq_line.to_le_bytes();
         let msg = Message::with_header(0, irq_line, 0, None, &payload).map_err(map_ipc_error)?;
-        if let Some(endpoint) = self.ipc.endpoints[notif.endpoint_idx].as_mut() {
-            endpoint
-                .send(msg)
-                .map_err(|_| KernelError::EndpointQueueFull)?;
-            let _ = self.wake_waiter_for_endpoint(notif.endpoint_idx);
-            Ok(())
-        } else {
-            Err(KernelError::WrongObject)
+        notif.send(msg)?;
+        if let Some(waiter_tid) = self.ipc.notification_waiters[notification_idx].take() {
+            {
+                let tcb = self.tcb_mut(waiter_tid.0).ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Runnable;
+            }
+            self.enqueue_task(waiter_tid.0)?;
         }
+        Ok(())
     }
 
     pub fn route_external_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {
@@ -502,6 +509,13 @@ impl KernelState {
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }
+        if let CapObject::Notification { .. } = capability.object {
+            let notif_idx = self.resolve_notification_index(capability.object)?;
+            let notif = self.ipc.notifications[notif_idx]
+                .as_mut()
+                .ok_or(KernelError::WrongObject)?;
+            return Ok(notif.recv());
+        }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
 
@@ -539,6 +553,21 @@ impl KernelState {
         let capability = self.resolve_recv_cap_task_local(recv_cap)?;
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
+        }
+        if let CapObject::Notification { .. } = capability.object {
+            let notif_idx = self.resolve_notification_index(capability.object)?;
+            let notif = self.ipc.notifications[notif_idx]
+                .as_mut()
+                .ok_or(KernelError::WrongObject)?;
+            if let Some(msg) = notif.recv() {
+                return Ok(Some(msg));
+            }
+            let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
+            let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            self.ipc.notification_waiters[notif_idx] = Some(ThreadId(blocked_tid));
+            let _ = self.dispatch_next_task()?;
+            return Ok(None);
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;

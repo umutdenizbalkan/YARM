@@ -268,9 +268,33 @@ struct MemoryObject {
     len: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 struct NotificationObject {
-    endpoint_idx: usize,
+    queue: KernelStorage<Endpoint>,
+}
+
+impl NotificationObject {
+    fn new(max_depth: usize) -> Result<Self, KernelError> {
+        let endpoint = Endpoint::new_with_mode_and_class(
+            max_depth,
+            crate::kernel::ipc::EndpointMode::Buffered,
+            crate::kernel::ipc::EndpointClass::ControlPlane,
+        )
+        .map_err(map_ipc_error)?;
+        Ok(Self {
+            queue: store_kernel_value(endpoint),
+        })
+    }
+
+    fn send(&mut self, msg: Message) -> Result<(), KernelError> {
+        kernel_mut(&mut self.queue)
+            .send(msg)
+            .map_err(|_| KernelError::EndpointQueueFull)
+    }
+
+    fn recv(&mut self) -> Option<Message> {
+        kernel_mut(&mut self.queue).recv()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +342,7 @@ struct IpcSubsystem {
     endpoint_sender_waiters: [[Option<SenderWaiter>; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
     endpoint_generations: [u64; MAX_ENDPOINTS],
     notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
+    notification_waiters: [Option<ThreadId>; MAX_NOTIFICATIONS],
     notification_generations: [u64; MAX_NOTIFICATIONS],
     irq_routes: [Option<usize>; MAX_IRQ_LINES],
     transfer_envelopes: [Option<TransferEnvelope>; MAX_TRANSFER_ENVELOPES],
@@ -476,6 +501,7 @@ impl Bootstrap {
                 endpoint_sender_waiters: [[None; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
                 endpoint_generations: [0; MAX_ENDPOINTS],
                 notifications: [const { None }; MAX_NOTIFICATIONS],
+                notification_waiters: [None; MAX_NOTIFICATIONS],
                 notification_generations: [0; MAX_NOTIFICATIONS],
                 irq_routes: [None; MAX_IRQ_LINES],
                 transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
