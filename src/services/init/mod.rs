@@ -356,7 +356,8 @@ impl InitService {
         let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
         let has_right = |cap: CapId, right: CapRights| {
             kernel
-                .task_capability(init_tid, cap)
+                .capability_service()
+                .resolve_task_capability(init_tid, cap)
                 .map(|capability| capability.has_right(right))
                 .unwrap_or(false)
         };

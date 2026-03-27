@@ -168,7 +168,8 @@ fn materialize_received_transfer_cap(
         .take_transfer_envelope(handle, endpoint, crate::kernel::ipc::ThreadId(receiver_tid))
         .ok_or(SyscallError::InvalidCapability)?;
     let derived = kernel
-        .grant_capability_task_to_task(envelope.source_tid.0, envelope.source_cap, receiver_tid)
+        .capability_service_mut()
+        .grant_task_to_task(envelope.source_tid.0, envelope.source_cap, receiver_tid)
         .map_err(SyscallError::from)?;
     Ok(Some(derived.0))
 }
@@ -188,7 +189,8 @@ fn validate_endpoint_right(
     right: CapRights,
 ) -> Result<(), SyscallError> {
     let endpoint_cap = kernel
-        .current_task_capability(cap)
+        .capability_service()
+        .resolve_current_task_capability(cap)
         .ok_or(SyscallError::InvalidCapability)?;
     if !matches!(endpoint_cap.object, CapObject::Endpoint { .. }) {
         return Err(SyscallError::WrongObject);
@@ -200,7 +202,11 @@ fn validate_endpoint_right(
 }
 
 fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), SyscallError> {
-    if kernel.current_task_capability(cap).is_none() {
+    if kernel
+        .capability_service()
+        .resolve_current_task_capability(cap)
+        .is_none()
+    {
         return Err(SyscallError::InvalidCapability);
     }
     Ok(())
@@ -279,7 +285,8 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     validate_endpoint_right(kernel, cap, CapRights::SEND)?;
     let endpoint = kernel
-        .current_task_capability(cap)
+        .capability_service()
+        .resolve_current_task_capability(cap)
         .ok_or(SyscallError::InvalidCapability)?
         .object;
     let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
@@ -294,7 +301,8 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         if len > Message::MAX_PAYLOAD {
             let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
             let grant = kernel
-                .current_task_capability(grant_cap)
+                .capability_service()
+                .resolve_current_task_capability(grant_cap)
                 .ok_or(SyscallError::InvalidCapability)?;
             match grant.object {
                 CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}
@@ -370,7 +378,8 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     validate_endpoint_right(kernel, cap, CapRights::RECEIVE)?;
     let endpoint = kernel
-        .current_task_capability(cap)
+        .capability_service()
+        .resolve_current_task_capability(cap)
         .ok_or(SyscallError::InvalidCapability)?
         .object;
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
@@ -548,7 +557,9 @@ mod tests {
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
         assert!(
-            state.current_task_capability_has_right(recv_cap, CapRights::RECEIVE),
+            state
+                .capability_service()
+                .current_task_capability_has_right(recv_cap, CapRights::RECEIVE),
             "receiver task must own receive cap"
         );
         let mut block_recv_frame = TrapFrame::new(
@@ -584,7 +595,8 @@ mod tests {
         let recv_local = CapId(frame.ret2() as u64);
         assert_ne!(recv_local, mem_cap);
         let mapped = state
-            .current_task_capability(recv_local)
+            .capability_service()
+            .resolve_current_task_capability(recv_local)
             .expect("receiver-local transferred cap");
         assert!(matches!(mapped.object, CapObject::MemoryObject { .. }));
         state.yield_current().expect("switch back to sender");
