@@ -568,13 +568,49 @@ impl KernelState {
             .map_err(LinuxErrno::from)?;
         Ok(requested_end)
     }
+
+    pub fn linux_brk_current_task(
+        &mut self,
+        tid: u64,
+        requested_end: usize,
+        prot: usize,
+    ) -> Result<usize, LinuxErrno> {
+        let (base, current_end) = self
+            .task_brk_bounds(tid)
+            .unwrap_or((LINUX_BRK_DEFAULT_BASE, LINUX_BRK_DEFAULT_BASE));
+
+        if requested_end == 0 {
+            return Ok(current_end);
+        }
+        if requested_end < base {
+            return Err(LinuxErrno::Inval);
+        }
+
+        let current_rounded = round_up_page(current_end)?;
+        let requested_rounded = round_up_page(requested_end)?;
+
+        if requested_rounded > current_rounded {
+            let map_start = current_rounded;
+            let map_len = requested_rounded - map_start;
+            if map_len > 0 {
+                self.linux_mmap_region_current_task(map_start, map_len, prot)?;
+            }
+        } else if requested_rounded < current_rounded {
+            let unmap_len = current_rounded - requested_rounded;
+            self.linux_munmap_region_current_task(requested_rounded, unmap_len)?;
+        }
+
+        self.set_task_brk_bounds(tid, base, requested_end)
+            .map_err(LinuxErrno::from)?;
+        Ok(requested_end)
+    }
 }
 
 pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame: &mut TrapFrame) {
     // Linux ABI compatibility note:
     // - mmap/munmap/mprotect consume Linux argument order directly (addr/len/prot/...).
     // - Capability-targeted VM mapping is exposed via kernel-native `sys_vm_map`.
-    // - brk remains capability-routed for now via arg1.
+    // - brk consumes Linux arg0 (`requested_end`) and targets current task ASID.
     let result: Result<usize, LinuxErrno> =
         (|| match LinuxCompatSyscall::decode(frame.syscall_num())? {
             LinuxCompatSyscall::Exit => {
@@ -820,10 +856,8 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
             }
             LinuxCompatSyscall::Brk => {
                 let requested = frame.arg(LINUX_ARG0);
-                let aspace_cap = CapId(frame.arg(LINUX_ARG1) as u64);
-                let prot = frame.arg(LINUX_ARG2);
                 let tid = kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
-                kernel.linux_brk(tid, aspace_cap, requested, prot)
+                kernel.linux_brk_current_task(tid, requested, PROT_READ | PROT_WRITE)
             }
         })();
 
@@ -1112,6 +1146,20 @@ mod tests {
         let mut munmap_frame = TrapFrame::new(LINUX_NR_MUNMAP, [0x8000, PAGE_SIZE * 2, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut munmap_frame);
         assert_eq!(munmap_frame.error_code(), None);
+    }
+
+    #[test]
+    fn linux_dispatch_brk_uses_linux_arg_order() {
+        let mut state = Bootstrap::init().expect("init");
+        let bindings = LinuxServiceBindings::default();
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+
+        let requested = LINUX_BRK_DEFAULT_BASE + PAGE_SIZE;
+        let mut brk_frame = TrapFrame::new(LINUX_NR_BRK, [requested, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &bindings, &mut brk_frame);
+        assert_eq!(brk_frame.error_code(), None);
+        assert_eq!(brk_frame.ret0(), requested);
     }
 
     #[test]

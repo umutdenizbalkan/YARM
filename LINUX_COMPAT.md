@@ -66,7 +66,7 @@ A minimal `brk` region manager is implemented:
 - `mmap(addr,len,prot,flags,fd,off)` uses Linux argument positions.
 - `munmap(addr,len)` uses Linux argument positions.
 - `mprotect(addr,len,prot)` uses Linux argument positions.
-- `brk` currently remains capability-routed in arg1 for explicit heap mapping policy.
+- `brk(requested_end)` uses Linux argument position (`arg0`) and applies to the current task ASID.
 
 ## Process-manager vertical path
 
