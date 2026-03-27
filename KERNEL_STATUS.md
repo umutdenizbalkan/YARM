@@ -2,6 +2,12 @@
 
 This snapshot reflects the current branch after the mechanism-hardening pass.
 
+## Recent updates
+
+- **Unsupported ISA guardrails tightened:** architecture facade fallbacks now fail fast with `compile_error!` for unsupported `target_arch` values instead of silently selecting a RISC-V path.
+- **Trap decode correctness improved:** unknown architecture trap codes are normalized as `TrapEvent::Unknown { arch_code }` instead of being coerced into external IRQ semantics.
+- **Per-CPU TLS restore observability:** architecture trap paths now expose CPU-indexed TLS-restore slots and include isolation tests to verify CPU-local behavior.
+
 ## In-kernel mechanism status
 
 The kernel mechanism layer is now considered **complete for the current milestone**:

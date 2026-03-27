@@ -73,11 +73,23 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
   - `src/arch/x86_64/trap.rs`
   - `src/arch/aarch64/trap.rs`
 - Added selected-ISA trap dispatch facade `src/arch/trap_entry.rs` so kernel integration can call one arch-selected entrypoint shape.
+- Unknown ISA trap/exception codes now decode to `TrapEvent::Unknown { arch_code }` for explicit fault-policy handling instead of being folded into synthetic IRQ values.
+- Trap restore diagnostics now track last-restored TLS base per CPU (`MAX_CPUS`-indexed slots), with per-ISA tests that assert CPU-local slot isolation.
 
 
 ## Runtime entry wiring
 
 - `KernelState::handle_selected_arch_trap_entry(...)` now forwards trap handling through `crate::arch::trap_entry::handle_trap_entry(...)`, so runtime integration can use the selected-ISA facade from kernel state.
+
+
+## Unsupported-architecture policy
+
+- The architecture facade now fails loudly on unsupported targets:
+  - `src/arch/mod.rs` emits `compile_error!` when no supported ISA cfg matches.
+  - `src/arch/irq_guard.rs` emits `compile_error!` for unsupported `target_arch`.
+  - `src/arch/trap_entry.rs` emits `compile_error!` for unsupported `target_arch`.
+- This replaces the prior silent fallback behavior that could otherwise produce
+  incorrect binaries by compiling unsupported targets against RISC-V paths.
 
 
 ## Boot entry migration status

@@ -74,6 +74,18 @@ changes were made:
 - DMA region minting checks against parent memory object length.
 - Capacity values are profile-aware and documented.
 
+## Related architecture hardening updates
+
+Although not directly a capacity knob, the same hardening pass also tightened
+architecture boundary behavior:
+
+- unsupported `target_arch` selections now fail at compile time in
+  `arch::mod`, `arch::irq_guard`, and `arch::trap_entry` (no silent fallback);
+- trap decoding for unknown ISA-specific trap/exception codes now preserves
+  unknown-ness via `TrapEvent::Unknown { arch_code }`;
+- per-CPU TLS restore tracking includes explicit CPU-slot isolation tests in all
+  three ISA trap modules (`aarch64`, `riscv64`, `x86_64`).
+
 ## Remaining work
 
 The current approach still uses fixed-size arrays. To fully scale from minimal
