@@ -542,6 +542,8 @@ impl CapabilityServiceMut<'_> {
 
 impl KernelState {
     const CAPACITY_NEAR_FULL_PERCENT: usize = 90;
+    const MAX_CAPABILITY_SLOTS_ACROSS_KERNEL_AND_CNODES: usize =
+        (MAX_TASKS + 1) * crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE;
 
     fn capacity_pool(used: usize, capacity: usize) -> CapacityPoolTelemetry {
         let near_full = if capacity == 0 {
@@ -557,6 +559,13 @@ impl KernelState {
     }
 
     pub fn capacity_telemetry(&self) -> CapacityTelemetry {
+        let cnode_capability_slots_used: usize = self
+            .cnode_spaces
+            .iter()
+            .flatten()
+            .map(|space| kernel_ref(&space.cspace).occupied_slots())
+            .sum();
+        let capability_slots_used = self.cspace.occupied_slots() + cnode_capability_slots_used;
         CapacityTelemetry {
             endpoints: Self::capacity_pool(
                 self.ipc.endpoints.iter().flatten().count(),
@@ -576,8 +585,8 @@ impl KernelState {
                 MAX_MEMORY_OBJECTS,
             ),
             capability_slots: Self::capacity_pool(
-                self.cspace.occupied_slots(),
-                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                capability_slots_used,
+                Self::MAX_CAPABILITY_SLOTS_ACROSS_KERNEL_AND_CNODES,
             ),
         }
     }
@@ -595,7 +604,7 @@ impl KernelState {
                 max_drivers: MAX_DRIVERS,
                 max_memory_objects: MAX_MEMORY_OBJECTS,
                 max_transfer_envelopes: MAX_TRANSFER_ENVELOPES,
-                max_capability_slots: crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                max_capability_slots: Self::MAX_CAPABILITY_SLOTS_ACROSS_KERNEL_AND_CNODES,
             },
             KernelCapacityProfile::Constrained => RuntimeCapacityConfig {
                 max_endpoints: core::cmp::max(1, MAX_ENDPOINTS / 2),
@@ -606,7 +615,7 @@ impl KernelState {
                 max_transfer_envelopes: core::cmp::max(1, MAX_TRANSFER_ENVELOPES / 2),
                 max_capability_slots: core::cmp::max(
                     1,
-                    crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE / 2,
+                    Self::MAX_CAPABILITY_SLOTS_ACROSS_KERNEL_AND_CNODES / 2,
                 ),
             },
             KernelCapacityProfile::Throughput => RuntimeCapacityConfig {
@@ -616,7 +625,7 @@ impl KernelState {
                 max_drivers: MAX_DRIVERS,
                 max_memory_objects: MAX_MEMORY_OBJECTS,
                 max_transfer_envelopes: MAX_TRANSFER_ENVELOPES,
-                max_capability_slots: crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                max_capability_slots: Self::MAX_CAPABILITY_SLOTS_ACROSS_KERNEL_AND_CNODES,
             },
         }
     }
