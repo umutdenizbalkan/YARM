@@ -61,14 +61,8 @@ impl KernelState {
         &mut self,
         capability: Capability,
     ) -> Result<CapId, KernelError> {
-        let cap_id = self
-            .cspace
-            .mint(capability)
-            .map_err(|_| KernelError::CapabilityFull)?;
-        if let Some(cnode) = self.current_task_cnode() {
-            self.mirror_capability_into_cnode(cnode, cap_id, capability)?;
-        }
-        Ok(cap_id)
+        let cnode = self.current_task_cnode().ok_or(KernelError::TaskMissing)?;
+        self.mint_capability_in_cnode(cnode, capability)
     }
 
     fn block_current_on_receive(
@@ -313,8 +307,8 @@ impl KernelState {
         notification_cap: CapId,
     ) -> Result<(), KernelError> {
         let capability = self
-            .cspace
-            .get(notification_cap)
+            .capability_service()
+            .resolve_current_task_capability(notification_cap)
             .ok_or(KernelError::InvalidCapability)?;
         if !capability.has_right(CapRights::SIGNAL) {
             return Err(KernelError::MissingRight);

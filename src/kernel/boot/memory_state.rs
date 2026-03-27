@@ -149,8 +149,8 @@ impl KernelState {
         flags: PageFlags,
     ) -> Result<PhysAddr, KernelError> {
         let capability = self
-            .cspace
-            .get(mem_cap)
+            .capability_service()
+            .resolve_current_task_capability(mem_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let id = match capability.object {
             CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
@@ -208,8 +208,8 @@ impl KernelState {
         virt: VirtAddr,
     ) -> Result<Option<Mapping>, KernelError> {
         let capability = self
-            .cspace
-            .get(aspace_map_cap)
+            .capability_service()
+            .resolve_current_task_capability(aspace_map_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let asid = match capability.object {
             CapObject::AddressSpace { asid } => Asid(asid),
@@ -245,8 +245,8 @@ impl KernelState {
         new_flags: PageFlags,
     ) -> Result<Option<Mapping>, KernelError> {
         let capability = self
-            .cspace
-            .get(aspace_map_cap)
+            .capability_service()
+            .resolve_current_task_capability(aspace_map_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let asid = match capability.object {
             CapObject::AddressSpace { asid } => Asid(asid),

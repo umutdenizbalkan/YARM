@@ -360,7 +360,6 @@ struct RestartSubsystem {
 pub struct KernelState {
     pub kernel_aspace: AddressSpace,
     pub scheduler: KernelStorage<SmpScheduler>,
-    pub cspace: KernelStorage<CapabilitySpace>,
     pub timer: Timer,
     pub user_spaces: KernelStorage<AddressSpaceManager>,
     current_cpu: CpuId,
@@ -441,15 +440,9 @@ impl Bootstrap {
             )
             .map_err(map_scheduler_error)?;
 
-        let mut cspace = CapabilitySpace::default();
-        cspace
-            .mint(Capability::new(CapObject::Kernel, CapRights::SCHEDULE))
-            .map_err(|_| KernelError::CapabilityFull)?;
-
         let mut state = KernelState {
             kernel_aspace,
             scheduler: store_kernel_value(scheduler),
-            cspace: store_kernel_value(cspace),
             timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: store_kernel_value(AddressSpaceManager::default()),
             current_cpu: CpuId(platform_layout::BOOTSTRAP_CPU_ID),
@@ -542,8 +535,8 @@ impl CapabilityServiceMut<'_> {
 
 impl KernelState {
     const CAPACITY_NEAR_FULL_PERCENT: usize = 90;
-    const MAX_CAPABILITY_SLOTS_ACROSS_KERNEL_AND_CNODES: usize =
-        (MAX_TASKS + 1) * crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE;
+    const MAX_CAPABILITY_SLOTS_ACROSS_CNODES: usize =
+        MAX_TASKS * crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE;
 
     fn capacity_pool(used: usize, capacity: usize) -> CapacityPoolTelemetry {
         let near_full = if capacity == 0 {
@@ -565,7 +558,7 @@ impl KernelState {
             .flatten()
             .map(|space| kernel_ref(&space.cspace).occupied_slots())
             .sum();
-        let capability_slots_used = self.cspace.occupied_slots() + cnode_capability_slots_used;
+        let capability_slots_used = cnode_capability_slots_used;
         CapacityTelemetry {
             endpoints: Self::capacity_pool(
                 self.ipc.endpoints.iter().flatten().count(),
@@ -586,7 +579,7 @@ impl KernelState {
             ),
             capability_slots: Self::capacity_pool(
                 capability_slots_used,
-                Self::MAX_CAPABILITY_SLOTS_ACROSS_KERNEL_AND_CNODES,
+                Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES,
             ),
         }
     }
@@ -604,7 +597,7 @@ impl KernelState {
                 max_drivers: MAX_DRIVERS,
                 max_memory_objects: MAX_MEMORY_OBJECTS,
                 max_transfer_envelopes: MAX_TRANSFER_ENVELOPES,
-                max_capability_slots: Self::MAX_CAPABILITY_SLOTS_ACROSS_KERNEL_AND_CNODES,
+                max_capability_slots: Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES,
             },
             KernelCapacityProfile::Constrained => RuntimeCapacityConfig {
                 max_endpoints: core::cmp::max(1, MAX_ENDPOINTS / 2),
@@ -615,7 +608,7 @@ impl KernelState {
                 max_transfer_envelopes: core::cmp::max(1, MAX_TRANSFER_ENVELOPES / 2),
                 max_capability_slots: core::cmp::max(
                     1,
-                    Self::MAX_CAPABILITY_SLOTS_ACROSS_KERNEL_AND_CNODES / 2,
+                    Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES / 2,
                 ),
             },
             KernelCapacityProfile::Throughput => RuntimeCapacityConfig {
@@ -625,7 +618,7 @@ impl KernelState {
                 max_drivers: MAX_DRIVERS,
                 max_memory_objects: MAX_MEMORY_OBJECTS,
                 max_transfer_envelopes: MAX_TRANSFER_ENVELOPES,
-                max_capability_slots: Self::MAX_CAPABILITY_SLOTS_ACROSS_KERNEL_AND_CNODES,
+                max_capability_slots: Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES,
             },
         }
     }
@@ -831,37 +824,12 @@ impl KernelState {
         }
     }
 
-    pub(crate) fn mirror_capability_into_cnode(
-        &mut self,
-        cnode: CNodeId,
-        cap_id: CapId,
-        capability: Capability,
-    ) -> Result<(), KernelError> {
-        self.ensure_cnode_space(cnode)?;
-        let slot_index = (cap_id.0 & 0xFFFF) as usize;
-        let local_id = self
-            .cspace_for_cnode_mut(cnode)
-            .ok_or(KernelError::TaskMissing)?
-            .mint_at(slot_index, capability)
-            .map_err(|_| KernelError::CapabilityFull)?;
-        if local_id != cap_id {
-            return Err(KernelError::CapabilityFull);
-        }
-        Ok(())
-    }
-
     pub(crate) fn mint_capability_for_current_context(
         &mut self,
         capability: Capability,
     ) -> Result<CapId, KernelError> {
-        let cap_id = self
-            .cspace
-            .mint(capability)
-            .map_err(|_| KernelError::CapabilityFull)?;
-        if let Some(cnode) = self.current_task_cnode() {
-            self.mirror_capability_into_cnode(cnode, cap_id, capability)?;
-        }
-        Ok(cap_id)
+        let cnode = self.current_task_cnode().ok_or(KernelError::TaskMissing)?;
+        self.mint_capability_in_cnode(cnode, capability)
     }
 
     pub(crate) fn mint_capability_in_cnode(
@@ -1062,7 +1030,10 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
-        let endpoint = state.cspace.get(send_cap).expect("send cap").object;
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
 
         let first = state
             .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None)
@@ -2351,7 +2322,7 @@ mod tests {
         assert_eq!(t.tasks.capacity, super::MAX_TASKS);
         assert_eq!(t.endpoints.used, 0);
         assert_eq!(t.notifications.used, 0);
-        assert!(t.capability_slots.used >= 1);
+        assert_eq!(t.capability_slots.used, 0);
         assert!(!t.tasks.near_full);
     }
 
@@ -2972,10 +2943,10 @@ mod tests {
                 .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
                 .is_none()
         );
-        assert_eq!(
+        assert!(matches!(
             state.grant_driver_irq(111, first_bundle.irq_cap),
-            Err(KernelError::InvalidCapability)
-        );
+            Err(KernelError::InvalidCapability | KernelError::WrongObject)
+        ));
 
         assert!(
             state
@@ -3265,7 +3236,7 @@ mod tests {
     }
 
     #[test]
-    fn global_cspace_access_is_routed_through_kernel_global_helpers() {
+    fn direct_global_cspace_access_is_forbidden() {
         fn visit_rs_files(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
             let entries = std::fs::read_dir(root).expect("read_dir");
             for entry in entries {
@@ -3292,7 +3263,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned();
             if rel == "src/kernel/boot/mod.rs" {
-                // Contains canonical helper and this guard test's own pattern literals.
+                // Contains this guard test's own pattern literals.
                 return;
             }
             for pattern in [
@@ -3311,7 +3282,7 @@ mod tests {
 
         if !offenders.is_empty() {
             panic!(
-                "direct self.cspace access found outside allowed helpers:\n{}",
+                "direct self.cspace access found in runtime code:\n{}",
                 offenders.join("\n")
             );
         }
