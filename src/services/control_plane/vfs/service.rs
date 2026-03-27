@@ -5,6 +5,7 @@ use crate::kernel::vfs::{
     openat_message, poll_message, read_message, sendfile_message, statx_message, write_message,
 };
 use crate::services::common::service::{FsService, run_typed_request_loop};
+use crate::services::common::vfs_service::VfsReply;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfsLoopSummary {
@@ -14,10 +15,11 @@ pub struct VfsLoopSummary {
     pub handled: usize,
 }
 
-fn decode_u64(reply: crate::kernel::ipc::Message) -> u64 {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&reply.as_slice()[..8]);
-    u64::from_le_bytes(bytes)
+fn decode_fd_reply(reply: crate::kernel::ipc::Message) -> Result<u64, VfsError> {
+    match VfsReply::from_message(reply)? {
+        VfsReply::OpenAtFd(fd) | VfsReply::DupFd(fd) | VfsReply::EpollFd(fd) => Ok(fd),
+        _ => Err(VfsError::Malformed),
+    }
 }
 
 pub fn run_request_loop(
@@ -34,16 +36,16 @@ pub fn run_request_loop(
         })
         .map_err(|_| VfsError::Malformed)?],
     )?[0];
-    let fd = decode_u64(reply);
-    let dup_fd = decode_u64(
+    let fd = decode_fd_reply(reply)?;
+    let dup_fd = decode_fd_reply(
         run_typed_request_loop(vfs, [dup_message(fd).map_err(|_| VfsError::Malformed)?])?[0],
-    );
-    let epoll_fd = decode_u64(
+    )?;
+    let epoll_fd = decode_fd_reply(
         run_typed_request_loop(
             vfs,
             [epoll_create1_message(0).map_err(|_| VfsError::Malformed)?],
         )?[0],
-    );
+    )?;
     let _ = run_typed_request_loop(
         vfs,
         [

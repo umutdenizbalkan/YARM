@@ -11,7 +11,7 @@ use yarm::kernel::vfs::{
     read_message,
 };
 use yarm::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
-use yarm::services::common::vfs_service::VfsService;
+use yarm::services::common::vfs_service::{VfsReply, VfsService};
 use yarm::services::control_plane::supervisor::SupervisorService;
 use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 use yarm::services::fs::ramfs::RamFsBackend;
@@ -88,9 +88,10 @@ fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
     let open_rep = vfs
         .handle_request(open)
         .map_err(|_| KernelError::WrongObject)?;
-    let mut fd_bytes = [0u8; 8];
-    fd_bytes.copy_from_slice(open_rep.as_slice());
-    let fd = u64::from_le_bytes(fd_bytes);
+    let fd = match VfsReply::from_message(open_rep).map_err(|_| KernelError::WrongObject)? {
+        VfsReply::OpenAtFd(fd) => fd,
+        _ => return Err(KernelError::WrongObject),
+    };
     let read = read_message(ReadWriteRequest {
         fd,
         buf_ptr: 0,

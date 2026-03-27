@@ -736,6 +736,7 @@ pub fn dispatch_once<S: FilesystemService>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::common::vfs_service::VfsReply;
     use crate::services::common::vfs_service::VfsService;
 
     struct Dummy;
@@ -774,9 +775,21 @@ mod tests {
     }
 
     fn decode_reply_u64(reply: Message) -> u64 {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(reply.as_slice());
-        u64::from_le_bytes(bytes)
+        match VfsReply::from_message(reply).expect("decode reply") {
+            VfsReply::OpenAtFd(value)
+            | VfsReply::CloseResult(value)
+            | VfsReply::ReadLen(value)
+            | VfsReply::WriteLen(value)
+            | VfsReply::StatxValue(value)
+            | VfsReply::IoctlResult(value)
+            | VfsReply::DupFd(value)
+            | VfsReply::FcntlResult(value)
+            | VfsReply::PollEvents(value)
+            | VfsReply::EpollFd(value)
+            | VfsReply::EpollCtlResult(value)
+            | VfsReply::EpollWaitEvents(value)
+            | VfsReply::SendfileLen(value) => value,
+        }
     }
 
     #[test]

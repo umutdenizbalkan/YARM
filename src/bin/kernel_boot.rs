@@ -6,7 +6,7 @@ use yarm::kernel::ipc::Message;
 use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
 use yarm::kernel::vfs::{OpenAtRequest, ReadWriteRequest, openat_message, read_message};
-use yarm::services::common::vfs_service::VfsService;
+use yarm::services::common::vfs_service::{VfsReply, VfsService};
 use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 
 #[inline]
@@ -53,9 +53,10 @@ fn run() {
     })
     .expect("open");
     let open_rep = vfs.handle_request(open).expect("open rep");
-    let mut fd_bytes = [0u8; 8];
-    fd_bytes.copy_from_slice(open_rep.as_slice());
-    let fd = u64::from_le_bytes(fd_bytes);
+    let fd = match VfsReply::from_message(open_rep).expect("decode open reply") {
+        VfsReply::OpenAtFd(fd) => fd,
+        _ => panic!("unexpected open reply"),
+    };
     let read = read_message(ReadWriteRequest {
         fd,
         buf_ptr: 0,

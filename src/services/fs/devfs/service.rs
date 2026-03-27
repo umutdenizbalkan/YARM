@@ -4,6 +4,7 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, openat_message, statx_message, write_message,
 };
 use crate::services::common::service::{FsService, run_typed_request_loop};
+use crate::services::common::vfs_service::VfsReply;
 use crate::services::fs::devfs::nodes::{
     DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend, DevFsMetrics,
 };
@@ -19,9 +20,21 @@ pub struct DevFsLoopSummary {
 }
 
 fn decode_reply_u64(reply: Message) -> u64 {
-    let mut fd_bytes = [0u8; 8];
-    fd_bytes.copy_from_slice(reply.as_slice());
-    u64::from_le_bytes(fd_bytes)
+    match VfsReply::from_message(reply).expect("decode vfs reply") {
+        VfsReply::OpenAtFd(value)
+        | VfsReply::CloseResult(value)
+        | VfsReply::ReadLen(value)
+        | VfsReply::WriteLen(value)
+        | VfsReply::StatxValue(value)
+        | VfsReply::IoctlResult(value)
+        | VfsReply::DupFd(value)
+        | VfsReply::FcntlResult(value)
+        | VfsReply::PollEvents(value)
+        | VfsReply::EpollFd(value)
+        | VfsReply::EpollCtlResult(value)
+        | VfsReply::EpollWaitEvents(value)
+        | VfsReply::SendfileLen(value) => value,
+    }
 }
 
 fn scripted_bootstrap_requests() -> Result<[Message; 2], VfsError> {

@@ -10,6 +10,92 @@ use crate::kernel::vfs_abi::{
 
 const MAX_MOUNTS: usize = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsReply {
+    OpenAtFd(u64),
+    CloseResult(u64),
+    ReadLen(u64),
+    WriteLen(u64),
+    StatxValue(u64),
+    IoctlResult(u64),
+    DupFd(u64),
+    FcntlResult(u64),
+    PollEvents(u64),
+    EpollFd(u64),
+    EpollCtlResult(u64),
+    EpollWaitEvents(u64),
+    SendfileLen(u64),
+}
+
+impl VfsReply {
+    const fn opcode(self) -> u16 {
+        match self {
+            Self::OpenAtFd(_) => VFS_OP_OPENAT,
+            Self::CloseResult(_) => VFS_OP_CLOSE,
+            Self::ReadLen(_) => VFS_OP_READ,
+            Self::WriteLen(_) => VFS_OP_WRITE,
+            Self::StatxValue(_) => VFS_OP_STATX,
+            Self::IoctlResult(_) => VFS_OP_IOCTL,
+            Self::DupFd(_) => VFS_OP_DUP,
+            Self::FcntlResult(_) => VFS_OP_FCNTL,
+            Self::PollEvents(_) => VFS_OP_POLL,
+            Self::EpollFd(_) => VFS_OP_EPOLL_CREATE1,
+            Self::EpollCtlResult(_) => VFS_OP_EPOLL_CTL,
+            Self::EpollWaitEvents(_) => VFS_OP_EPOLL_PWAIT,
+            Self::SendfileLen(_) => VFS_OP_SENDFILE,
+        }
+    }
+
+    const fn value(self) -> u64 {
+        match self {
+            Self::OpenAtFd(value)
+            | Self::CloseResult(value)
+            | Self::ReadLen(value)
+            | Self::WriteLen(value)
+            | Self::StatxValue(value)
+            | Self::IoctlResult(value)
+            | Self::DupFd(value)
+            | Self::FcntlResult(value)
+            | Self::PollEvents(value)
+            | Self::EpollFd(value)
+            | Self::EpollCtlResult(value)
+            | Self::EpollWaitEvents(value)
+            | Self::SendfileLen(value) => value,
+        }
+    }
+
+    pub fn to_message(self) -> Result<Message, VfsError> {
+        Message::with_header(0, self.opcode(), 0, None, &self.value().to_le_bytes())
+            .map_err(|_| VfsError::Malformed)
+    }
+
+    pub fn from_message(message: Message) -> Result<Self, VfsError> {
+        let bytes = message.as_slice();
+        if bytes.len() != 8 {
+            return Err(VfsError::Malformed);
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(bytes);
+        let value = u64::from_le_bytes(arr);
+        match message.opcode {
+            VFS_OP_OPENAT => Ok(Self::OpenAtFd(value)),
+            VFS_OP_CLOSE => Ok(Self::CloseResult(value)),
+            VFS_OP_READ => Ok(Self::ReadLen(value)),
+            VFS_OP_WRITE => Ok(Self::WriteLen(value)),
+            VFS_OP_STATX => Ok(Self::StatxValue(value)),
+            VFS_OP_IOCTL => Ok(Self::IoctlResult(value)),
+            VFS_OP_DUP => Ok(Self::DupFd(value)),
+            VFS_OP_FCNTL => Ok(Self::FcntlResult(value)),
+            VFS_OP_POLL => Ok(Self::PollEvents(value)),
+            VFS_OP_EPOLL_CREATE1 => Ok(Self::EpollFd(value)),
+            VFS_OP_EPOLL_CTL => Ok(Self::EpollCtlResult(value)),
+            VFS_OP_EPOLL_PWAIT => Ok(Self::EpollWaitEvents(value)),
+            VFS_OP_SENDFILE => Ok(Self::SendfileLen(value)),
+            _ => Err(VfsError::Unsupported),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct VfsService<B: VfsBackend = InMemoryBackend> {
     backend: B,
@@ -139,11 +225,6 @@ impl<B: VfsBackend> VfsService<B> {
             .count()
     }
 
-    fn u64_reply(opcode: u16, value: u64) -> Result<Message, VfsError> {
-        Message::with_header(0, opcode, 0, None, &value.to_le_bytes())
-            .map_err(|_| VfsError::Malformed)
-    }
-
     pub fn parse_request(request: Message) -> Result<VfsRequest, VfsError> {
         match request.opcode {
             VFS_OP_OPENAT => {
@@ -267,52 +348,44 @@ impl<B: VfsBackend> VfsService<B> {
                 if !self.policy.allows_path(path_ptr) {
                     return Err(VfsError::PermissionDenied);
                 }
-                Self::u64_reply(VFS_OP_OPENAT, self.backend.openat(path_ptr)?)
+                VfsReply::OpenAtFd(self.backend.openat(path_ptr)?)
             }
-            VfsRequest::Close { fd } => Self::u64_reply(VFS_OP_CLOSE, self.backend.close(fd)?),
-            VfsRequest::Read { fd, len, .. } => {
-                Self::u64_reply(VFS_OP_READ, self.backend.read(fd, len)?)
-            }
-            VfsRequest::Write { fd, len, .. } => {
-                Self::u64_reply(VFS_OP_WRITE, self.backend.write(fd, len)?)
-            }
+            VfsRequest::Close { fd } => VfsReply::CloseResult(self.backend.close(fd)?),
+            VfsRequest::Read { fd, len, .. } => VfsReply::ReadLen(self.backend.read(fd, len)?),
+            VfsRequest::Write { fd, len, .. } => VfsReply::WriteLen(self.backend.write(fd, len)?),
             VfsRequest::Statx { path_ptr, .. } => {
                 if !self.policy.allows_path(path_ptr) {
                     return Err(VfsError::PermissionDenied);
                 }
-                Self::u64_reply(VFS_OP_STATX, self.backend.statx(path_ptr)?)
+                VfsReply::StatxValue(self.backend.statx(path_ptr)?)
             }
             VfsRequest::Ioctl { fd, request, arg } => {
-                Self::u64_reply(VFS_OP_IOCTL, self.backend.ioctl(fd, request, arg)?)
+                VfsReply::IoctlResult(self.backend.ioctl(fd, request, arg)?)
             }
-            VfsRequest::Dup { fd } => Self::u64_reply(VFS_OP_DUP, self.backend.dup(fd)?),
+            VfsRequest::Dup { fd } => VfsReply::DupFd(self.backend.dup(fd)?),
             VfsRequest::Fcntl { fd, cmd, arg } => {
-                Self::u64_reply(VFS_OP_FCNTL, self.backend.fcntl(fd, cmd, arg)?)
+                VfsReply::FcntlResult(self.backend.fcntl(fd, cmd, arg)?)
             }
             VfsRequest::Poll {
                 fds_ptr,
                 nfds,
                 timeout,
-            } => Self::u64_reply(VFS_OP_POLL, self.backend.poll(fds_ptr, nfds, timeout)?),
+            } => VfsReply::PollEvents(self.backend.poll(fds_ptr, nfds, timeout)?),
             VfsRequest::EpollCreate1 { flags } => {
-                Self::u64_reply(VFS_OP_EPOLL_CREATE1, self.backend.epoll_create1(flags)?)
+                VfsReply::EpollFd(self.backend.epoll_create1(flags)?)
             }
             VfsRequest::EpollCtl {
                 epfd,
                 op,
                 fd,
                 event_ptr,
-            } => Self::u64_reply(
-                VFS_OP_EPOLL_CTL,
-                self.backend.epoll_ctl(epfd, op, fd, event_ptr)?,
-            ),
+            } => VfsReply::EpollCtlResult(self.backend.epoll_ctl(epfd, op, fd, event_ptr)?),
             VfsRequest::EpollPwait {
                 epfd,
                 events_ptr,
                 maxevents,
                 timeout,
-            } => Self::u64_reply(
-                VFS_OP_EPOLL_PWAIT,
+            } => VfsReply::EpollWaitEvents(
                 self.backend
                     .epoll_pwait(epfd, events_ptr, maxevents, timeout)?,
             ),
@@ -321,12 +394,9 @@ impl<B: VfsBackend> VfsService<B> {
                 in_fd,
                 offset_ptr,
                 count,
-            } => Self::u64_reply(
-                VFS_OP_SENDFILE,
-                self.backend.sendfile(out_fd, in_fd, offset_ptr, count)?,
-            ),
-        }?;
+            } => VfsReply::SendfileLen(self.backend.sendfile(out_fd, in_fd, offset_ptr, count)?),
+        };
         self.op_sequence = self.op_sequence.saturating_add(1);
-        Ok(reply)
+        reply.to_message()
     }
 }
