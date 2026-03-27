@@ -6,6 +6,10 @@ const IDT_PRESENT: u8 = 1 << 7;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const VEC_TIMER: usize = 0x20;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const VEC_NMI: usize = 2;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const VEC_DOUBLE_FAULT: usize = 8;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const VEC_PAGE_FAULT: usize = 14;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const VEC_SYSCALL: usize = 0x80;
@@ -156,6 +160,12 @@ const KERNEL_CODE_SELECTOR: u16 = 0x08;
 const KERNEL_DATA_SELECTOR: u16 = 0x10;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const TSS_SELECTOR: u16 = 0x18;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const IST_SLOT_NMI: u8 = 1;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const IST_SLOT_DOUBLE_FAULT: u8 = 2;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const IST_SLOT_PAGE_FAULT: u8 = 3;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn encode_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
@@ -188,6 +198,16 @@ extern "C" fn page_fault_stub() -> ! {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+extern "C" fn nmi_interrupt_stub() -> ! {
+    default_interrupt_stub()
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+extern "C" fn double_fault_stub() -> ! {
+    default_interrupt_stub()
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 extern "C" fn syscall_interrupt_stub() -> ! {
     default_interrupt_stub()
 }
@@ -207,13 +227,40 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         for entry in &mut BOOT_IDT {
             *entry = X86IdtEntry::new_interrupt(handler, KERNEL_CODE_SELECTOR, 0, 0);
         }
-        BOOT_IDT[VEC_TIMER] =
-            X86IdtEntry::new_interrupt(timer_interrupt_stub as usize as u64, KERNEL_CODE_SELECTOR, 0, 0);
-        BOOT_IDT[VEC_PAGE_FAULT] =
-            X86IdtEntry::new_interrupt(page_fault_stub as usize as u64, KERNEL_CODE_SELECTOR, 0, 3);
-        BOOT_IDT[VEC_SYSCALL] =
-            X86IdtEntry::new_interrupt(syscall_interrupt_stub as usize as u64, KERNEL_CODE_SELECTOR, 3, 0);
+        BOOT_IDT[VEC_TIMER] = X86IdtEntry::new_interrupt(
+            timer_interrupt_stub as usize as u64,
+            KERNEL_CODE_SELECTOR,
+            0,
+            0,
+        );
+        BOOT_IDT[VEC_NMI] = X86IdtEntry::new_interrupt(
+            nmi_interrupt_stub as usize as u64,
+            KERNEL_CODE_SELECTOR,
+            0,
+            IST_SLOT_NMI,
+        );
+        BOOT_IDT[VEC_DOUBLE_FAULT] = X86IdtEntry::new_interrupt(
+            double_fault_stub as usize as u64,
+            KERNEL_CODE_SELECTOR,
+            0,
+            IST_SLOT_DOUBLE_FAULT,
+        );
+        BOOT_IDT[VEC_PAGE_FAULT] = X86IdtEntry::new_interrupt(
+            page_fault_stub as usize as u64,
+            KERNEL_CODE_SELECTOR,
+            0,
+            IST_SLOT_PAGE_FAULT,
+        );
+        BOOT_IDT[VEC_SYSCALL] = X86IdtEntry::new_interrupt(
+            syscall_interrupt_stub as usize as u64,
+            KERNEL_CODE_SELECTOR,
+            3,
+            0,
+        );
         for vector in VEC_EXTERNAL_BASE..VEC_EXTERNAL_LIMIT {
+            if vector == VEC_TIMER {
+                continue;
+            }
             BOOT_IDT[vector] = X86IdtEntry::new_interrupt(
                 external_interrupt_stub as usize as u64,
                 KERNEL_CODE_SELECTOR,
@@ -222,9 +269,10 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
             );
         }
 
-        let ist_nmi_top = core::ptr::addr_of!(IST_NMI.0) as u64 + core::mem::size_of::<IstStack>() as u64;
-        let ist_df_top =
-            core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64 + core::mem::size_of::<IstStack>() as u64;
+        let ist_nmi_top =
+            core::ptr::addr_of!(IST_NMI.0) as u64 + core::mem::size_of::<IstStack>() as u64;
+        let ist_df_top = core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64
+            + core::mem::size_of::<IstStack>() as u64;
         let ist_pf_top =
             core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64 + core::mem::size_of::<IstStack>() as u64;
         BOOT_TSS.ist1 = ist_nmi_top;
