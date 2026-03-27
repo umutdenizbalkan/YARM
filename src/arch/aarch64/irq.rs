@@ -44,3 +44,14 @@ pub fn irq_save() -> Aarch64IrqState {
 
 #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "aarch64")))]
 pub fn irq_restore(_state: Aarch64IrqState) {}
+
+#[cfg(feature = "hosted-dev")]
+pub fn external_irq_eoi(_irq_line: u16) {}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub fn external_irq_eoi(_irq_line: u16) {
+    // TODO(arch/aarch64): signal interrupt completion to GIC CPU interface.
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(target_arch = "aarch64")))]
+pub fn external_irq_eoi(_irq_line: u16) {}

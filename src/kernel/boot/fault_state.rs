@@ -118,9 +118,14 @@ impl KernelState {
                 .map_err(SyscallError::from)
                 .map_err(TrapHandleError::Syscall),
             TrapEvent::ExternalInterrupt(irq) => {
-                self.route_external_irq(irq)
+                let irq_state = crate::arch::irq_guard::irq_save();
+                let route_result = self
+                    .route_external_irq(irq)
                     .map_err(SyscallError::from)
-                    .map_err(TrapHandleError::Syscall)?;
+                    .map_err(TrapHandleError::Syscall);
+                crate::arch::irq_guard::external_irq_eoi(irq);
+                crate::arch::irq_guard::irq_restore(irq_state);
+                route_result?;
                 self.handle_trap(Trap::ExternalInterrupt, frame)
             }
             TrapEvent::Syscall => self.handle_trap(Trap::Syscall, frame),
