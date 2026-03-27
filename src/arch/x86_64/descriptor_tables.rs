@@ -3,6 +3,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub const IDT_ENTRIES: usize = 256;
 const IDT_GATE_INTERRUPT: u8 = 0x0E;
 const IDT_PRESENT: u8 = 1 << 7;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const VEC_TIMER: usize = 0x20;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const VEC_PAGE_FAULT: usize = 14;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const VEC_SYSCALL: usize = 0x80;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const VEC_EXTERNAL_BASE: usize = 0x20;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const VEC_EXTERNAL_LIMIT: usize = 0x30;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +140,15 @@ static mut BOOT_GDT: X86BootGdt = X86BootGdt {
         0,
     ],
 };
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(align(16))]
+struct IstStack([u8; 4096]);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut IST_NMI: IstStack = IstStack([0; 4096]);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut IST_DOUBLE_FAULT: IstStack = IstStack([0; 4096]);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut IST_PAGE_FAULT: IstStack = IstStack([0; 4096]);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const KERNEL_CODE_SELECTOR: u16 = 0x08;
@@ -159,6 +178,26 @@ extern "C" fn default_interrupt_stub() -> ! {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+extern "C" fn timer_interrupt_stub() -> ! {
+    default_interrupt_stub()
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+extern "C" fn page_fault_stub() -> ! {
+    default_interrupt_stub()
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+extern "C" fn syscall_interrupt_stub() -> ! {
+    default_interrupt_stub()
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+extern "C" fn external_interrupt_stub() -> ! {
+    default_interrupt_stub()
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn ensure_boot_descriptor_tables_scaffolded() {
     if DESCRIPTOR_SCAFFOLD_READY.swap(true, Ordering::AcqRel) {
         return;
@@ -168,6 +207,29 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         for entry in &mut BOOT_IDT {
             *entry = X86IdtEntry::new_interrupt(handler, KERNEL_CODE_SELECTOR, 0, 0);
         }
+        BOOT_IDT[VEC_TIMER] =
+            X86IdtEntry::new_interrupt(timer_interrupt_stub as usize as u64, KERNEL_CODE_SELECTOR, 0, 0);
+        BOOT_IDT[VEC_PAGE_FAULT] =
+            X86IdtEntry::new_interrupt(page_fault_stub as usize as u64, KERNEL_CODE_SELECTOR, 0, 3);
+        BOOT_IDT[VEC_SYSCALL] =
+            X86IdtEntry::new_interrupt(syscall_interrupt_stub as usize as u64, KERNEL_CODE_SELECTOR, 3, 0);
+        for vector in VEC_EXTERNAL_BASE..VEC_EXTERNAL_LIMIT {
+            BOOT_IDT[vector] = X86IdtEntry::new_interrupt(
+                external_interrupt_stub as usize as u64,
+                KERNEL_CODE_SELECTOR,
+                0,
+                0,
+            );
+        }
+
+        let ist_nmi_top = core::ptr::addr_of!(IST_NMI.0) as u64 + core::mem::size_of::<IstStack>() as u64;
+        let ist_df_top =
+            core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64 + core::mem::size_of::<IstStack>() as u64;
+        let ist_pf_top =
+            core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64 + core::mem::size_of::<IstStack>() as u64;
+        BOOT_TSS.ist1 = ist_nmi_top;
+        BOOT_TSS.ist2 = ist_df_top;
+        BOOT_TSS.ist3 = ist_pf_top;
 
         let tss_base = core::ptr::addr_of!(BOOT_TSS) as u64;
         let tss_limit = (core::mem::size_of::<X86TaskStateSegment>() - 1) as u32;
