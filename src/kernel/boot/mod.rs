@@ -184,6 +184,7 @@ pub struct DriverBundlePlan {
     pub server_tid: ThreadId,
     pub irq_line: u16,
     pub mem_cap: CapId,
+    pub dma_len: usize,
     pub iova_cap: CapId,
     pub iova_base: usize,
     pub iova_len: usize,
@@ -194,16 +195,19 @@ impl DriverBundlePlan {
         server_tid: ThreadId,
         irq_line: u16,
         mem_cap: CapId,
+        dma_len: usize,
         iova_cap: CapId,
         iova_base: usize,
+        iova_len: usize,
     ) -> Self {
         Self {
             server_tid,
             irq_line,
             mem_cap,
+            dma_len,
             iova_cap,
             iova_base,
-            iova_len: super::vm::PAGE_SIZE,
+            iova_len,
         }
     }
 }
@@ -2748,6 +2752,7 @@ mod tests {
                 server_tid: ThreadId(59),
                 irq_line: 12,
                 mem_cap,
+                dma_len: crate::kernel::vm::PAGE_SIZE,
                 iova_cap,
                 iova_base: crate::kernel::vm::PAGE_SIZE * 2,
                 iova_len: crate::kernel::vm::PAGE_SIZE,
@@ -3228,7 +3233,9 @@ mod tests {
                 ThreadId(111),
                 14,
                 mem_cap,
+                crate::kernel::vm::PAGE_SIZE,
                 iova_cap,
+                crate::kernel::vm::PAGE_SIZE * 4,
                 crate::kernel::vm::PAGE_SIZE * 4,
             ))
             .expect("first bundle");
@@ -3282,8 +3289,10 @@ mod tests {
                 ThreadId(111),
                 14,
                 mem_cap,
+                crate::kernel::vm::PAGE_SIZE,
                 iova_cap2,
                 crate::kernel::vm::PAGE_SIZE * 4,
+                crate::kernel::vm::PAGE_SIZE * 2,
             ))
             .expect("second bundle");
         state

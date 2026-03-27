@@ -62,12 +62,10 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
 
     pub fn getpid_hook(&mut self) -> Result<u64, LinuxErrno> {
         let tid = self.kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
-        let reply = self
-            .proc_service
-            .handle(
-                Message::with_header(0, PROC_OP_GETPID, 0, None, &tid.to_le_bytes())
-                    .map_err(|_| LinuxErrno::Inval)?,
-            );
+        let reply = self.proc_service.handle(
+            Message::with_header(0, PROC_OP_GETPID, 0, None, &tid.to_le_bytes())
+                .map_err(|_| LinuxErrno::Inval)?,
+        );
         if let Ok(reply) = reply {
             if let Ok(pid) = Self::decode_u64(reply) {
                 return Ok(pid as u64);
@@ -78,12 +76,10 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
 
     pub fn getppid_hook(&mut self) -> Result<u64, LinuxErrno> {
         let tid = self.kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
-        let reply = self
-            .proc_service
-            .handle(
-                Message::with_header(0, PROC_OP_GETPPID, 0, None, &tid.to_le_bytes())
-                    .map_err(|_| LinuxErrno::Inval)?,
-            );
+        let reply = self.proc_service.handle(
+            Message::with_header(0, PROC_OP_GETPPID, 0, None, &tid.to_le_bytes())
+                .map_err(|_| LinuxErrno::Inval)?,
+        );
         if let Ok(reply) = reply {
             if let Ok(ppid) = Self::decode_u64(reply) {
                 return Ok(ppid as u64);

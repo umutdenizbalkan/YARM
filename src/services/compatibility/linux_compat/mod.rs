@@ -61,7 +61,7 @@ pub const ENOMEM: i32 = 12;
 pub const ETIMEDOUT: i32 = 110;
 pub const ENOSYS: i32 = 38;
 
-const LINUX_BRK_DEFAULT_BASE: usize = 0x4000_0000;
+const LINUX_BRK_DEFAULT_BASE: usize = crate::arch::vm_layout::USER_BRK_DEFAULT_BASE;
 const LINUX_ARG0: usize = 0;
 const LINUX_ARG1: usize = 1;
 const LINUX_ARG2: usize = 2;
