@@ -73,7 +73,9 @@ pub fn decode_trap_context(context: Aarch64TrapContext) -> TrapEvent {
                 },
             })
         }
-        _ => TrapEvent::Unknown,
+        _ => TrapEvent::Unknown {
+            arch_code: context.esr_el1 as u64,
+        },
     }
 }
 

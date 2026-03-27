@@ -68,7 +68,9 @@ pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {
         v if (VEC_EXTERNAL_BASE..VEC_EXTERNAL_LIMIT).contains(&v) => {
             TrapEvent::ExternalInterrupt((v - VEC_EXTERNAL_BASE) as u16)
         }
-        _ => TrapEvent::Unknown,
+        _ => TrapEvent::Unknown {
+            arch_code: context.vector as u64,
+        },
     }
 }
 

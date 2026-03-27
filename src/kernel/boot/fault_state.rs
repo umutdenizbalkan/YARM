@@ -6,6 +6,8 @@ use crate::kernel::task::TaskStatus;
 use crate::kernel::trap::{FaultAccess, Trap, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
 
+const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
+
 impl KernelState {
     fn emit_fault_report(&mut self, faulted_tid: u64) {
         let Some(endpoint_idx) = self.faults.fault_handler_endpoint else {
@@ -123,7 +125,21 @@ impl KernelState {
             }
             TrapEvent::Syscall => self.handle_trap(Trap::Syscall, frame),
             TrapEvent::TimerInterrupt => self.handle_trap(Trap::TimerInterrupt, frame),
-            TrapEvent::Unknown => self.handle_trap(Trap::Unknown, frame),
+            TrapEvent::Unknown { arch_code } => {
+                crate::yarm_log!(
+                    "unknown trap event cpu={} arch_code=0x{:x}",
+                    self.current_cpu().0,
+                    arch_code
+                );
+                if STRICT_UNKNOWN_TRAPS {
+                    panic!(
+                        "strict unknown trap policy: cpu={} arch_code=0x{:x}",
+                        self.current_cpu().0,
+                        arch_code
+                    );
+                }
+                self.handle_trap(Trap::Unknown, frame)
+            }
         }
     }
 }

@@ -47,7 +47,7 @@ pub enum TrapEvent {
     PageFault(FaultInfo),
     TimerInterrupt,
     ExternalInterrupt(IrqNumber),
-    Unknown,
+    Unknown { arch_code: u64 },
 }
 
 impl TrapEvent {
@@ -57,7 +57,7 @@ impl TrapEvent {
             Self::PageFault(_) => Trap::PageFault,
             Self::TimerInterrupt => Trap::TimerInterrupt,
             Self::ExternalInterrupt(_) => Trap::ExternalInterrupt,
-            Self::Unknown => Trap::Unknown,
+            Self::Unknown { .. } => Trap::Unknown,
         }
     }
 
@@ -71,6 +71,13 @@ impl TrapEvent {
     pub const fn irq(&self) -> Option<IrqNumber> {
         match self {
             Self::ExternalInterrupt(irq) => Some(*irq),
+            _ => None,
+        }
+    }
+
+    pub const fn unknown_code(&self) -> Option<u64> {
+        match self {
+            Self::Unknown { arch_code } => Some(*arch_code),
             _ => None,
         }
     }
@@ -88,7 +95,7 @@ pub fn route_trap(event: &TrapEvent) -> TrapAction {
         TrapEvent::PageFault(_) => TrapAction::HandlePageFault,
         TrapEvent::TimerInterrupt => TrapAction::TickScheduler,
         TrapEvent::ExternalInterrupt(_) => TrapAction::RouteIrq,
-        TrapEvent::Unknown => TrapAction::Unhandled,
+        TrapEvent::Unknown { .. } => TrapAction::Unhandled,
     }
 }
 
@@ -126,6 +133,9 @@ mod tests {
             route_trap(&TrapEvent::ExternalInterrupt(1)),
             TrapAction::RouteIrq
         );
-        assert_eq!(route_trap(&TrapEvent::Unknown), TrapAction::Unhandled);
+        assert_eq!(
+            route_trap(&TrapEvent::Unknown { arch_code: 0xDEAD }),
+            TrapAction::Unhandled
+        );
     }
 }

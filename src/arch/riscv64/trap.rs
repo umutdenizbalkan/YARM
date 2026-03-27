@@ -59,7 +59,9 @@ pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
         return match code {
             IRQ_SUPERVISOR_TIMER => TrapEvent::TimerInterrupt,
             IRQ_SUPERVISOR_EXTERNAL => TrapEvent::ExternalInterrupt(context.stval as u16),
-            _ => TrapEvent::Unknown,
+            _ => TrapEvent::Unknown {
+                arch_code: context.scause as u64,
+            },
         };
     }
 
@@ -73,7 +75,9 @@ pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
             addr: VirtAddr(context.stval as u64),
             access: FaultAccess::Write,
         }),
-        _ => TrapEvent::Unknown,
+        _ => TrapEvent::Unknown {
+            arch_code: context.scause as u64,
+        },
     }
 }
 
