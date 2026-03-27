@@ -206,4 +206,58 @@ mod tests {
         .expect("trap");
         assert_eq!(last_restored_tls_base(CpuId(1)), Some(0xCAFE_0000));
     }
+
+    #[test]
+    fn tls_restore_slots_are_isolated_per_cpu() {
+        use crate::kernel::boot::{Bootstrap, UserImageSpec};
+        use crate::kernel::task::TaskClass;
+
+        let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state
+            .spawn_user_task_from_image(UserImageSpec {
+                tid: 60,
+                entry: 0x4000,
+                asid: Some(asid),
+                class: TaskClass::App,
+            })
+            .expect("leader");
+        let tid_a = state
+            .spawn_user_thread(60, 0xAAA0_0000, 0x8200_0000, 0x4010)
+            .expect("thread a");
+        state.set_current_cpu(CpuId(1)).expect("switch cpu1");
+        let _ = state.dispatch_next_task().expect("dispatch a");
+        assert_eq!(state.current_tid(), Some(tid_a));
+        let mut frame_a = TrapFrame::new(0, [0; 6]);
+        handle_trap_entry(
+            &mut state,
+            CpuId(1),
+            X86TrapContext {
+                vector: VEC_TIMER,
+                error_code: 0,
+                fault_addr: 0,
+            },
+            Some(&mut frame_a),
+        )
+        .expect("trap a");
+
+        state.set_thread_tls_base(0, 0xBBB0_0000).expect("set tls boot");
+        state.set_current_cpu(CpuId(0)).expect("switch cpu0");
+        let mut frame_b = TrapFrame::new(0, [0; 6]);
+        handle_trap_entry(
+            &mut state,
+            CpuId(0),
+            X86TrapContext {
+                vector: VEC_TIMER,
+                error_code: 0,
+                fault_addr: 0,
+            },
+            Some(&mut frame_b),
+        )
+        .expect("trap b");
+
+        assert_eq!(last_restored_tls_base(CpuId(1)), Some(0xAAA0_0000));
+        assert_eq!(last_restored_tls_base(CpuId(0)), Some(0xBBB0_0000));
+    }
 }
