@@ -63,6 +63,7 @@ impl KernelState {
         }
         if let Some(slot) = record.irq_caps.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(irq_cap);
+            self.mirror_global_capability_to_task(tid, irq_cap)?;
             return Ok(());
         }
         return Err(KernelError::TaskTableFull);
@@ -105,6 +106,7 @@ impl KernelState {
             .find(|record| record.tid == ThreadId(tid))
             .ok_or(KernelError::TaskMissing)?;
         record.iova_space_cap = Some(iova_cap);
+        self.mirror_global_capability_to_task(tid, iova_cap)?;
         Ok(())
     }
 
@@ -187,6 +189,7 @@ impl KernelState {
         }
         if let Some(slot) = record.dma_caps.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(dma_cap);
+            self.mirror_global_capability_to_task(tid, dma_cap)?;
             return Ok(());
         }
         Err(KernelError::TaskTableFull)
@@ -255,22 +258,18 @@ impl KernelState {
             return Err(KernelError::StaleCapability);
         }
 
-        // Prefer delegated-driver cspace visibility; keep global-liveness
-        // fallback during migration until delegation mirroring is completed.
+        // Validate liveness/rights through the delegated driver's cspace.
         let driver_cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
-        let irq_live = self
+        if self
             .capability_for_cnode(driver_cnode, bundle.irq_cap)
-            .is_some()
-            || self.kernel_global_capability(bundle.irq_cap).is_some();
-        let dma_live = self
-            .capability_for_cnode(driver_cnode, bundle.dma_cap)
-            .is_some()
-            || self.kernel_global_capability(bundle.dma_cap).is_some();
-        let iova_live = self
-            .capability_for_cnode(driver_cnode, bundle.iova_cap)
-            .is_some()
-            || self.kernel_global_capability(bundle.iova_cap).is_some();
-        if !irq_live || !dma_live || !iova_live {
+            .is_none()
+            || self
+                .capability_for_cnode(driver_cnode, bundle.dma_cap)
+                .is_none()
+            || self
+                .capability_for_cnode(driver_cnode, bundle.iova_cap)
+                .is_none()
+        {
             return Err(KernelError::StaleCapability);
         }
 
@@ -371,15 +370,18 @@ impl KernelState {
         let iova_cap = record.iova_space_cap.take();
         record.dma_iova_base = None;
         record.dma_iova_len = None;
+        let driver_cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
 
         for cap in irq_caps.into_iter().flatten() {
-            // Runtime bundle capabilities are globally minted and revoked by kernel policy.
+            let _ = self.revoke_capability_in_cnode(driver_cnode, cap);
             let _ = self.revoke_kernel_global_capability(cap);
         }
         for cap in dma_caps.into_iter().flatten() {
+            let _ = self.revoke_capability_in_cnode(driver_cnode, cap);
             let _ = self.revoke_kernel_global_capability(cap);
         }
         if let Some(cap) = iova_cap {
+            let _ = self.revoke_capability_in_cnode(driver_cnode, cap);
             let _ = self.revoke_kernel_global_capability(cap);
         }
         Ok(())
