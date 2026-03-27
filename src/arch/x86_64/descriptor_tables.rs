@@ -102,15 +102,106 @@ impl X86TaskStateSegment {
 
 static DESCRIPTOR_SCAFFOLD_READY: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct X86GdtPointer {
+    limit: u16,
+    base: u64,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(C, align(16))]
+struct X86BootGdt {
+    entries: [u64; 5],
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut BOOT_IDT: [X86IdtEntry; IDT_ENTRIES] = [const { X86IdtEntry::missing() }; IDT_ENTRIES];
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut BOOT_TSS: X86TaskStateSegment = X86TaskStateSegment::new();
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut BOOT_GDT: X86BootGdt = X86BootGdt {
+    entries: [
+        0x0000_0000_0000_0000, // null
+        0x00af_9a00_0000_ffff, // kernel code
+        0x00af_9200_0000_ffff, // kernel data
+        0,
+        0,
+    ],
+};
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const KERNEL_CODE_SELECTOR: u16 = 0x08;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const KERNEL_DATA_SELECTOR: u16 = 0x10;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const TSS_SELECTOR: u16 = 0x18;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn encode_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
+    let low = ((limit as u64) & 0xFFFF)
+        | ((base & 0x00FF_FFFF) << 16)
+        | (0x89u64 << 40)
+        | (((limit as u64 >> 16) & 0xF) << 48)
+        | (((base >> 24) & 0xFF) << 56);
+    let high = base >> 32;
+    (low, high)
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+extern "C" fn default_interrupt_stub() -> ! {
+    loop {
+        unsafe {
+            core::arch::asm!("cli", "hlt", options(noreturn));
+        }
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn ensure_boot_descriptor_tables_scaffolded() {
     if DESCRIPTOR_SCAFFOLD_READY.swap(true, Ordering::AcqRel) {
         return;
     }
-    // Scaffolding phase:
-    // - Keep typed IDT/TSS data structures in-tree.
-    // - Prepare caller-visible one-time init point for future `lidt`/`ltr` wiring.
+    unsafe {
+        let handler = default_interrupt_stub as usize as u64;
+        for entry in &mut BOOT_IDT {
+            *entry = X86IdtEntry::new_interrupt(handler, KERNEL_CODE_SELECTOR, 0, 0);
+        }
+
+        let tss_base = core::ptr::addr_of!(BOOT_TSS) as u64;
+        let tss_limit = (core::mem::size_of::<X86TaskStateSegment>() - 1) as u32;
+        let (tss_low, tss_high) = encode_tss_descriptor(tss_base, tss_limit);
+        BOOT_GDT.entries[3] = tss_low;
+        BOOT_GDT.entries[4] = tss_high;
+
+        let idtr = X86IdtPointer::from_table(&BOOT_IDT);
+        let gdtr = X86GdtPointer {
+            limit: (core::mem::size_of::<X86BootGdt>() - 1) as u16,
+            base: core::ptr::addr_of!(BOOT_GDT) as u64,
+        };
+
+        core::arch::asm!("lgdt [{}]", in(reg) &gdtr, options(readonly, nostack, preserves_flags));
+        core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
+        core::arch::asm!(
+            "mov ax, {data_sel:x}",
+            "mov ds, ax",
+            "mov es, ax",
+            "mov ss, ax",
+            data_sel = const KERNEL_DATA_SELECTOR,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            "mov ax, {tss_sel:x}",
+            "ltr ax",
+            tss_sel = const TSS_SELECTOR,
+            options(nostack, preserves_flags)
+        );
+    }
 }
+
+#[cfg(all(not(feature = "hosted-dev"), not(target_arch = "x86_64")))]
+pub fn ensure_boot_descriptor_tables_scaffolded() {}
 
 #[cfg(feature = "hosted-dev")]
 pub fn ensure_boot_descriptor_tables_scaffolded() {
