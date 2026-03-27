@@ -2,6 +2,7 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
 use crate::services::common::service::FsService;
+use crate::services::common::vfs_service::VfsReply;
 use crate::services::fs::ext4::fs::Ext4Backend;
 
 pub type Ext4Service = FsService<Ext4Backend>;
@@ -18,9 +19,9 @@ pub fn run() {
     .expect("open");
     let open_rep = svc.handle(open).expect("open rep");
 
-    let mut fd_bytes = [0u8; 8];
-    fd_bytes.copy_from_slice(open_rep.as_slice());
-    let fd = u64::from_le_bytes(fd_bytes);
+    let fd = VfsReply::from_message(open_rep)
+        .expect("decode open")
+        .as_u64();
 
     let write = write_message(ReadWriteRequest {
         fd,
@@ -39,9 +40,9 @@ pub fn run() {
     .expect("stat");
     let stat_rep = svc.handle(stat).expect("stat rep");
 
-    let mut len_bytes = [0u8; 8];
-    len_bytes.copy_from_slice(stat_rep.as_slice());
-    let file_len = u64::from_le_bytes(len_bytes);
+    let file_len = VfsReply::from_message(stat_rep)
+        .expect("decode stat")
+        .as_u64();
 
     crate::yarm_log!(
         "ext4.srv demo: fd={}, file_len={}, handled={}",
@@ -67,9 +68,9 @@ mod tests {
         })
         .expect("open");
         let open_rep = svc.handle(open).expect("open rep");
-        let mut fd_bytes = [0u8; 8];
-        fd_bytes.copy_from_slice(open_rep.as_slice());
-        let fd = u64::from_le_bytes(fd_bytes);
+        let fd = VfsReply::from_message(open_rep)
+            .expect("decode open")
+            .as_u64();
 
         let write = write_message(ReadWriteRequest {
             fd,
@@ -87,9 +88,12 @@ mod tests {
         })
         .expect("stat");
         let stat_rep = svc.handle(stat).expect("stat rep");
-        let mut len_bytes = [0u8; 8];
-        len_bytes.copy_from_slice(stat_rep.as_slice());
-        assert_eq!(u64::from_le_bytes(len_bytes), 4096);
+        assert_eq!(
+            VfsReply::from_message(stat_rep)
+                .expect("decode stat")
+                .as_u64(),
+            4096
+        );
     }
 
     #[test]

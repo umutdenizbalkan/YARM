@@ -7,6 +7,7 @@ use crate::kernel::vfs::{
     read_message, write_message,
 };
 use crate::services::common::service::FsService;
+use crate::services::common::vfs_service::VfsReply;
 use crate::services::compatibility::linux_compat::LinuxErrno;
 use crate::services::network::socket::service::SocketAdapterService;
 
@@ -33,12 +34,10 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
     }
 
     fn decode_u64(reply: Message) -> Result<usize, LinuxErrno> {
-        if reply.as_slice().len() < 8 {
-            return Err(LinuxErrno::Inval);
-        }
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&reply.as_slice()[..8]);
-        usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| LinuxErrno::Inval)
+        let value = VfsReply::from_message(reply)
+            .map_err(|_| LinuxErrno::Inval)?
+            .as_u64();
+        usize::try_from(value).map_err(|_| LinuxErrno::Inval)
     }
 
     pub fn clock_gettime_hook(&mut self) -> Result<u64, LinuxErrno> {

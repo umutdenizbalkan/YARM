@@ -46,7 +46,7 @@ impl VfsReply {
         }
     }
 
-    const fn value(self) -> u64 {
+    pub const fn as_u64(self) -> u64 {
         match self {
             Self::OpenAtFd(value)
             | Self::CloseResult(value)
@@ -65,7 +65,7 @@ impl VfsReply {
     }
 
     pub fn to_message(self) -> Result<Message, VfsError> {
-        Message::with_header(0, self.opcode(), 0, None, &self.value().to_le_bytes())
+        Message::with_header(0, self.opcode(), 0, None, &self.as_u64().to_le_bytes())
             .map_err(|_| VfsError::Malformed)
     }
 

@@ -14,6 +14,7 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
 use crate::kernel::vm::Asid;
+use crate::services::common::vfs_service::VfsReply;
 use crate::services::fs::devfs::service::run_request_loop as run_devfs_request_loop;
 use crate::services::fs::devfs::{DevFsBackend, DevFsService};
 use crate::services::fs::ext4::{Ext4Backend, Ext4Service};
@@ -761,9 +762,9 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
             })
             .map_err(|_| KernelError::WrongObject)?;
             let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
-            let mut fd_bytes = [0u8; 8];
-            fd_bytes.copy_from_slice(open_reply.as_slice());
-            let fd = u64::from_le_bytes(fd_bytes);
+            let fd = VfsReply::from_message(open_reply)
+                .map_err(|_| KernelError::WrongObject)?
+                .as_u64();
             let write = write_message(ReadWriteRequest {
                 fd,
                 buf_ptr: 0,
@@ -791,9 +792,9 @@ fn run_rw_mount_cycle<B: crate::kernel::vfs::VfsBackend>(
     })
     .map_err(|_| KernelError::WrongObject)?;
     let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
-    let mut fd_bytes = [0u8; 8];
-    fd_bytes.copy_from_slice(open_reply.as_slice());
-    let fd = u64::from_le_bytes(fd_bytes);
+    let fd = VfsReply::from_message(open_reply)
+        .map_err(|_| KernelError::WrongObject)?
+        .as_u64();
     let write = write_message(ReadWriteRequest {
         fd,
         buf_ptr: 0,

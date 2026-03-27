@@ -271,9 +271,9 @@ mod tests {
                 .expect("open"),
             )
             .expect("open reply");
-        let mut fd_bytes = [0u8; 8];
-        fd_bytes.copy_from_slice(open_console.as_slice());
-        let console_fd = u64::from_le_bytes(fd_bytes);
+        let console_fd = VfsReply::from_message(open_console)
+            .expect("decode open")
+            .as_u64();
         assert_eq!(console_fd, 3);
 
         let _ = svc
