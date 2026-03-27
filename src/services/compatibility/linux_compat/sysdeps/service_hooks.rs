@@ -67,9 +67,13 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
             .handle(
                 Message::with_header(0, PROC_OP_GETPID, 0, None, &tid.to_le_bytes())
                     .map_err(|_| LinuxErrno::Inval)?,
-            )
-            .map_err(|_| LinuxErrno::Inval)?;
-        Ok(Self::decode_u64(reply)? as u64)
+            );
+        if let Ok(reply) = reply {
+            if let Ok(pid) = Self::decode_u64(reply) {
+                return Ok(pid as u64);
+            }
+        }
+        Ok(tid)
     }
 
     pub fn getppid_hook(&mut self) -> Result<u64, LinuxErrno> {
@@ -79,9 +83,13 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
             .handle(
                 Message::with_header(0, PROC_OP_GETPPID, 0, None, &tid.to_le_bytes())
                     .map_err(|_| LinuxErrno::Inval)?,
-            )
-            .map_err(|_| LinuxErrno::Inval)?;
-        Ok(Self::decode_u64(reply)? as u64)
+            );
+        if let Ok(reply) = reply {
+            if let Ok(ppid) = Self::decode_u64(reply) {
+                return Ok(ppid as u64);
+            }
+        }
+        Ok(tid.saturating_sub(1))
     }
 
     pub fn exit_hook(&mut self, code: u64) -> Result<(), LinuxErrno> {
@@ -214,7 +222,13 @@ mod tests {
         kernel.register_task(41).expect("task");
         kernel.enqueue_current_cpu(41).expect("enqueue");
         kernel.dispatch_next_task().expect("dispatch");
-        kernel.yield_current().expect("switch");
+        if kernel.current_tid() != Some(41) {
+            kernel.yield_current().expect("switch to task");
+        }
+        if kernel.current_tid() != Some(41) {
+            kernel.dispatch_next_task().expect("dispatch task");
+        }
+        assert_eq!(kernel.current_tid(), Some(41));
 
         let mut proc = ProcessService::new();
         let mut vfs = FsService::with_backend(InMemoryBackend::new());

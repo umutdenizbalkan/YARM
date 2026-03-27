@@ -2837,7 +2837,7 @@ mod tests {
     }
 
     #[test]
-    fn revoke_driver_runtime_caps_revokes_from_cspace() {
+    fn revoke_driver_runtime_caps_revokes_from_driver_cnode() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(32).expect("task");
         state.register_driver(32).expect("driver");
@@ -3236,7 +3236,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_global_cspace_access_is_forbidden() {
+    fn direct_legacy_global_cspace_access_patterns_are_forbidden() {
         fn visit_rs_files(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
             let entries = std::fs::read_dir(root).expect("read_dir");
             for entry in entries {
@@ -3282,7 +3282,7 @@ mod tests {
 
         if !offenders.is_empty() {
             panic!(
-                "direct self.cspace access found in runtime code:\n{}",
+                "legacy self.cspace access pattern found in runtime code:\n{}",
                 offenders.join("\n")
             );
         }
