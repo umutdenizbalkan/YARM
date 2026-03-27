@@ -328,11 +328,44 @@ impl InitService {
             .ok_or(KernelError::WrongObject)?;
         let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
         let (_, _, fault_recv_cap) = kernel.create_endpoint(16)?;
-        let local_fault_recv_cap =
-            kernel.duplicate_global_capability_to_task(init_tid, fault_recv_cap)?;
+        let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
+        let local_fault_recv_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            fault_recv_cap,
+            init_tid,
+            CapRights::RECEIVE,
+        )?;
         kernel.set_supervisor_endpoint_for_task(init_tid, local_fault_recv_cap)?;
         let (_, control_send_cap, control_recv_cap) = kernel.create_endpoint(16)?;
+        let local_control_send_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            control_send_cap,
+            init_tid,
+            CapRights::SEND,
+        )?;
+        let local_control_recv_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            control_recv_cap,
+            init_tid,
+            CapRights::RECEIVE,
+        )?;
         let (_, init_alert_send_cap, init_alert_recv_cap) = kernel.create_endpoint(16)?;
+        let local_init_alert_send_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            init_alert_send_cap,
+            init_tid,
+            CapRights::SEND,
+        )?;
+        let local_init_alert_recv_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            init_alert_recv_cap,
+            init_tid,
+            CapRights::RECEIVE,
+        )?;
+        let _ = local_control_send_cap;
+        let _ = local_control_recv_cap;
+        let _ = local_init_alert_send_cap;
+        let _ = local_init_alert_recv_cap;
         let handoff = InitFaultHandoff::new(
             supervisor_tid,
             fault_recv_cap,
@@ -353,19 +386,26 @@ impl InitService {
 
     pub fn validate_delegation_edges(&self, kernel: &KernelState) -> Result<(), KernelError> {
         let handoff = self.fault_handoff.ok_or(KernelError::WrongObject)?;
-        if !kernel.kernel_global_capability_has_right(
-            handoff.supervisor_fault_recv_cap,
-            CapRights::RECEIVE,
-        ) || !kernel.kernel_global_capability_has_right(
-            handoff.supervisor_control_send_cap,
-            CapRights::SEND,
-        ) || !kernel.kernel_global_capability_has_right(
-            handoff.supervisor_control_recv_cap,
-            CapRights::RECEIVE,
-        ) || !kernel
-            .kernel_global_capability_has_right(handoff.init_alert_send_cap, CapRights::SEND)
-            || !kernel
-                .kernel_global_capability_has_right(handoff.init_alert_recv_cap, CapRights::RECEIVE)
+        let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
+        let source_tid = kernel.current_tid();
+        let has_right_for = |tid: u64, cap: CapId, right: CapRights| {
+            kernel
+                .capability_service()
+                .resolve_task_capability(tid, cap)
+                .map(|capability| capability.has_right(right))
+                .unwrap_or(false)
+        };
+        let has_right = |cap: CapId, right: CapRights| {
+            has_right_for(init_tid, cap, right)
+                || source_tid
+                    .map(|tid| has_right_for(tid, cap, right))
+                    .unwrap_or(false)
+        };
+        if !has_right(handoff.supervisor_fault_recv_cap, CapRights::RECEIVE)
+            || !has_right(handoff.supervisor_control_send_cap, CapRights::SEND)
+            || !has_right(handoff.supervisor_control_recv_cap, CapRights::RECEIVE)
+            || !has_right(handoff.init_alert_send_cap, CapRights::SEND)
+            || !has_right(handoff.init_alert_recv_cap, CapRights::RECEIVE)
         {
             return Err(KernelError::MissingRight);
         }
@@ -606,9 +646,12 @@ impl InitService {
                     }
                 }
                 let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
-                let local_fault_recv = kernel.duplicate_global_capability_to_task(
-                    init_tid,
+                let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
+                let local_fault_recv = kernel.grant_capability_task_to_task_with_rights(
+                    source_tid,
                     handoff.supervisor_fault_recv_cap,
+                    init_tid,
+                    CapRights::RECEIVE,
                 )?;
                 kernel.set_supervisor_endpoint_for_task(init_tid, local_fault_recv)?;
                 self.clear_supervisor_control_queue(kernel)?;
@@ -1286,6 +1329,7 @@ mod tests {
                 mem_cap: mem.0,
                 iova_cap: iova.0,
                 iova_base: 0x4000,
+                dma_len: crate::kernel::vm::PAGE_SIZE as u64,
                 iova_len: crate::kernel::vm::PAGE_SIZE as u64,
             },
         )

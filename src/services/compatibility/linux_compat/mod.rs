@@ -15,7 +15,7 @@ use crate::kernel::vfs_abi::{
     VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ,
     VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
 };
-use crate::kernel::vm::{PAGE_SIZE, PageFlags, VirtAddr};
+use crate::kernel::vm::{Asid, PAGE_SIZE, PageFlags, VirtAddr};
 
 pub mod sim;
 pub mod sysdeps;
@@ -61,7 +61,7 @@ pub const ENOMEM: i32 = 12;
 pub const ETIMEDOUT: i32 = 110;
 pub const ENOSYS: i32 = 38;
 
-const LINUX_BRK_DEFAULT_BASE: usize = 0x4000_0000;
+const LINUX_BRK_DEFAULT_BASE: usize = crate::arch::vm_layout::USER_BRK_DEFAULT_BASE;
 const LINUX_ARG0: usize = 0;
 const LINUX_ARG1: usize = 1;
 const LINUX_ARG2: usize = 2;
@@ -386,6 +386,11 @@ fn pack_statx(dirfd: usize, path_ptr: usize, flags: usize, mask: usize) -> [u8; 
 }
 
 impl KernelState {
+    fn current_linux_asid(&self) -> Result<Asid, LinuxErrno> {
+        let tid = self.current_tid().ok_or(LinuxErrno::NoSys)?;
+        self.task_asid(tid).ok_or(LinuxErrno::NoSys)
+    }
+
     pub fn linux_mmap_region(
         &mut self,
         aspace_map_cap: CapId,
@@ -413,6 +418,32 @@ impl KernelState {
         Ok(addr)
     }
 
+    pub fn linux_mmap_region_current_task(
+        &mut self,
+        addr: usize,
+        len: usize,
+        prot: usize,
+    ) -> Result<usize, LinuxErrno> {
+        if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
+            return Err(LinuxErrno::Inval);
+        }
+        let asid = self.current_linux_asid()?;
+        let flags = prot_to_page_flags(prot)?;
+        let end = addr
+            .checked_add(round_up_page(len)?)
+            .ok_or(LinuxErrno::Inval)?;
+        let mut va = addr;
+        while va < end {
+            let (_, mem_cap) = self
+                .alloc_anonymous_memory_object()
+                .map_err(LinuxErrno::from)?;
+            self.map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(va as u64), flags)
+                .map_err(LinuxErrno::from)?;
+            va += PAGE_SIZE;
+        }
+        Ok(addr)
+    }
+
     pub fn linux_munmap_region(
         &mut self,
         aspace_map_cap: CapId,
@@ -428,6 +459,27 @@ impl KernelState {
         let mut va = addr;
         while va < end {
             self.unmap_user_page(aspace_map_cap, VirtAddr(va as u64))
+                .map_err(LinuxErrno::from)?;
+            va += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    pub fn linux_munmap_region_current_task(
+        &mut self,
+        addr: usize,
+        len: usize,
+    ) -> Result<(), LinuxErrno> {
+        if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
+            return Err(LinuxErrno::Inval);
+        }
+        let asid = self.current_linux_asid()?;
+        let end = addr
+            .checked_add(round_up_page(len)?)
+            .ok_or(LinuxErrno::Inval)?;
+        let mut va = addr;
+        while va < end {
+            self.unmap_user_page_in_asid(asid, VirtAddr(va as u64))
                 .map_err(LinuxErrno::from)?;
             va += PAGE_SIZE;
         }
@@ -451,6 +503,29 @@ impl KernelState {
         let mut va = addr;
         while va < end {
             self.protect_user_page(aspace_map_cap, VirtAddr(va as u64), flags)
+                .map_err(LinuxErrno::from)?;
+            va += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    pub fn linux_mprotect_region_current_task(
+        &mut self,
+        addr: usize,
+        len: usize,
+        prot: usize,
+    ) -> Result<(), LinuxErrno> {
+        if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
+            return Err(LinuxErrno::Inval);
+        }
+        let asid = self.current_linux_asid()?;
+        let flags = prot_to_page_flags(prot)?;
+        let end = addr
+            .checked_add(round_up_page(len)?)
+            .ok_or(LinuxErrno::Inval)?;
+        let mut va = addr;
+        while va < end {
+            self.protect_user_page_in_asid(asid, VirtAddr(va as u64), flags)
                 .map_err(LinuxErrno::from)?;
             va += PAGE_SIZE;
         }
@@ -493,11 +568,49 @@ impl KernelState {
             .map_err(LinuxErrno::from)?;
         Ok(requested_end)
     }
+
+    pub fn linux_brk_current_task(
+        &mut self,
+        tid: u64,
+        requested_end: usize,
+        prot: usize,
+    ) -> Result<usize, LinuxErrno> {
+        let (base, current_end) = self
+            .task_brk_bounds(tid)
+            .unwrap_or((LINUX_BRK_DEFAULT_BASE, LINUX_BRK_DEFAULT_BASE));
+
+        if requested_end == 0 {
+            return Ok(current_end);
+        }
+        if requested_end < base {
+            return Err(LinuxErrno::Inval);
+        }
+
+        let current_rounded = round_up_page(current_end)?;
+        let requested_rounded = round_up_page(requested_end)?;
+
+        if requested_rounded > current_rounded {
+            let map_start = current_rounded;
+            let map_len = requested_rounded - map_start;
+            if map_len > 0 {
+                self.linux_mmap_region_current_task(map_start, map_len, prot)?;
+            }
+        } else if requested_rounded < current_rounded {
+            let unmap_len = current_rounded - requested_rounded;
+            self.linux_munmap_region_current_task(requested_rounded, unmap_len)?;
+        }
+
+        self.set_task_brk_bounds(tid, base, requested_end)
+            .map_err(LinuxErrno::from)?;
+        Ok(requested_end)
+    }
 }
 
 pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame: &mut TrapFrame) {
-    // VM-related personality syscalls pass capability IDs in arguments by design
-    // (e.g. mmap arg0/aspace-cap and brk arg1/aspace-cap) for capability routing.
+    // Linux ABI compatibility note:
+    // - mmap/munmap/mprotect consume Linux argument order directly (addr/len/prot/...).
+    // - Capability-targeted VM mapping is exposed via kernel-native `sys_vm_map`.
+    // - brk consumes Linux arg0 (`requested_end`) and targets current task ASID.
     let result: Result<usize, LinuxErrno> =
         (|| match LinuxCompatSyscall::decode(frame.syscall_num())? {
             LinuxCompatSyscall::Exit => {
@@ -605,25 +718,22 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 decode_u64_reply(reply.as_slice())
             }
             LinuxCompatSyscall::Mmap => {
-                let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
-                let addr = frame.arg(LINUX_ARG1);
-                let len = frame.arg(LINUX_ARG2);
-                let prot = frame.arg(LINUX_ARG3);
-                kernel.linux_mmap_region(aspace_cap, addr, len, prot)
+                let addr = frame.arg(LINUX_ARG0);
+                let len = frame.arg(LINUX_ARG1);
+                let prot = frame.arg(LINUX_ARG2);
+                kernel.linux_mmap_region_current_task(addr, len, prot)
             }
             LinuxCompatSyscall::Munmap => {
-                let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
-                let addr = frame.arg(LINUX_ARG1);
-                let len = frame.arg(LINUX_ARG2);
-                kernel.linux_munmap_region(aspace_cap, addr, len)?;
+                let addr = frame.arg(LINUX_ARG0);
+                let len = frame.arg(LINUX_ARG1);
+                kernel.linux_munmap_region_current_task(addr, len)?;
                 Ok(0)
             }
             LinuxCompatSyscall::Mprotect => {
-                let aspace_cap = CapId(frame.arg(LINUX_ARG0) as u64);
-                let addr = frame.arg(LINUX_ARG1);
-                let len = frame.arg(LINUX_ARG2);
-                let prot = frame.arg(LINUX_ARG3);
-                kernel.linux_mprotect_region(aspace_cap, addr, len, prot)?;
+                let addr = frame.arg(LINUX_ARG0);
+                let len = frame.arg(LINUX_ARG1);
+                let prot = frame.arg(LINUX_ARG2);
+                kernel.linux_mprotect_region_current_task(addr, len, prot)?;
                 Ok(0)
             }
             LinuxCompatSyscall::Dup => {
@@ -746,10 +856,8 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
             }
             LinuxCompatSyscall::Brk => {
                 let requested = frame.arg(LINUX_ARG0);
-                let aspace_cap = CapId(frame.arg(LINUX_ARG1) as u64);
-                let prot = frame.arg(LINUX_ARG2);
                 let tid = kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
-                kernel.linux_brk(tid, aspace_cap, requested, prot)
+                kernel.linux_brk_current_task(tid, requested, PROT_READ | PROT_WRITE)
             }
         })();
 
@@ -1024,29 +1132,34 @@ mod tests {
     fn linux_dispatch_table_drives_mmap_and_munmap() {
         let mut state = Bootstrap::init().expect("init");
         let bindings = LinuxServiceBindings::default();
-        let (_asid, aspace_cap) = state.create_user_address_space().expect("aspace");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
 
         let mut mmap_frame = TrapFrame::new(
             LINUX_NR_MMAP,
-            [
-                aspace_cap.0 as usize,
-                0x8000,
-                PAGE_SIZE * 2,
-                PROT_READ | PROT_WRITE,
-                0,
-                0,
-            ],
+            [0x8000, PAGE_SIZE * 2, PROT_READ | PROT_WRITE, 0, 0, 0],
         );
         dispatch(&mut state, &bindings, &mut mmap_frame);
         assert_eq!(mmap_frame.error_code(), None);
         assert_eq!(mmap_frame.ret0(), 0x8000);
 
-        let mut munmap_frame = TrapFrame::new(
-            LINUX_NR_MUNMAP,
-            [aspace_cap.0 as usize, 0x8000, PAGE_SIZE * 2, 0, 0, 0],
-        );
+        let mut munmap_frame = TrapFrame::new(LINUX_NR_MUNMAP, [0x8000, PAGE_SIZE * 2, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut munmap_frame);
         assert_eq!(munmap_frame.error_code(), None);
+    }
+
+    #[test]
+    fn linux_dispatch_brk_uses_linux_arg_order() {
+        let mut state = Bootstrap::init().expect("init");
+        let bindings = LinuxServiceBindings::default();
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+
+        let requested = LINUX_BRK_DEFAULT_BASE + PAGE_SIZE;
+        let mut brk_frame = TrapFrame::new(LINUX_NR_BRK, [requested, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &bindings, &mut brk_frame);
+        assert_eq!(brk_frame.error_code(), None);
+        assert_eq!(brk_frame.ret0(), requested);
     }
 
     #[test]

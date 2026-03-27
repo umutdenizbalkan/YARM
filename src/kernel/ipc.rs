@@ -129,10 +129,12 @@ pub struct Message {
 const _: () = assert!(Message::MAX_PAYLOAD <= (u8::MAX as usize));
 
 impl Message {
-    /// Two register-width payload lanes (16 bytes on 64-bit, 8 bytes on 32-bit)
-    /// are reserved for the syscall fast path, leaving 56 payload bytes in the
-    /// fixed in-kernel `Message` envelope on 64-bit targets.
-    pub const MAX_PAYLOAD: usize = 56;
+    /// Payload bytes encoded directly in the fixed in-kernel `Message` envelope.
+    ///
+    /// This is intentionally a full 64-byte lane so control-plane requests that
+    /// carry structured ABI records (for example supervisor registration records)
+    /// can encode distinct length fields without out-of-band packing.
+    pub const MAX_PAYLOAD: usize = 64;
     pub const FLAG_CAP_TRANSFER: u16 = 1 << 0;
     pub const NO_TRANSFER_CAP: u64 = u64::MAX;
 

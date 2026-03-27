@@ -43,6 +43,7 @@ pub enum SupervisorDecision {
 pub(crate) struct DriverRecoveryPlan {
     irq_line: u16,
     mem_cap: CapId,
+    dma_len: usize,
     iova_cap: CapId,
     iova_base: usize,
     iova_len: usize,
@@ -322,6 +323,7 @@ impl SupervisorService {
                     DriverRecoveryPlan {
                         irq_line: req.irq_line,
                         mem_cap: CapId(req.mem_cap),
+                        dma_len: req.dma_len as usize,
                         iova_cap: CapId(req.iova_cap),
                         iova_base: req.iova_base as usize,
                         iova_len: req.iova_len as usize,
@@ -374,6 +376,7 @@ impl SupervisorService {
                         server_tid: ThreadId(record.tid),
                         irq_line: plan.irq_line,
                         mem_cap: plan.mem_cap,
+                        dma_len: plan.dma_len,
                         iova_cap: plan.iova_cap,
                         iova_base: plan.iova_base,
                         iova_len: plan.iova_len,
@@ -771,6 +774,7 @@ mod tests {
                 mem_cap: mem.0,
                 iova_cap: iova.0,
                 iova_base: 0x4000,
+                dma_len: PAGE_SIZE as u64,
                 iova_len: PAGE_SIZE as u64,
             },
         )
@@ -905,6 +909,7 @@ mod tests {
                 mem_cap: mem.0,
                 iova_cap: iova.0,
                 iova_base: 0x4000,
+                dma_len: PAGE_SIZE as u64,
                 iova_len: PAGE_SIZE as u64,
             },
         )

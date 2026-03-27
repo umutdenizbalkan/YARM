@@ -142,8 +142,8 @@ impl PriorityScheduler {
         if let Some(running) = self.current.take() {
             if let Err(err) = self.enqueue_with_priority(running.tid, running.priority) {
                 if err != SchedulerError::AlreadyQueued && self.runnable_count() != 0 {
-                    panic!(
-                        "scheduler inconsistency: failed to re-enqueue preempted task {:?}",
+                    crate::yarm_log!(
+                        "scheduler inconsistency: failed to re-enqueue preempted task {:?}; preserving current task",
                         err
                     );
                 }

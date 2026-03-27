@@ -1,9 +1,10 @@
 use crate::kernel::boot::{KernelState, TrapHandleError};
-use crate::kernel::scheduler::{CpuId, MAX_CPUS};
+use crate::kernel::scheduler::CpuId;
+#[cfg(test)]
+use crate::kernel::scheduler::MAX_CPUS;
 use crate::kernel::trap::{FaultAccess, FaultInfo, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::VirtAddr;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 const ESR_EC_SVC64: u32 = 0x15;
 const ESR_EC_IABT_LOW: u32 = 0x20;
@@ -18,8 +19,13 @@ pub struct Aarch64TrapContext {
     pub is_timer_irq: bool,
 }
 
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
 static LAST_RESTORED_TLS_BASE: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
+#[cfg(test)]
 pub fn last_restored_tls_base(cpu: CpuId) -> Option<usize> {
     let idx = cpu.0 as usize;
     if idx >= MAX_CPUS {
@@ -41,10 +47,15 @@ fn restore_arch_thread_state(
         .resume_current_thread_with_frame(frame)
         .map_err(crate::kernel::syscall::SyscallError::from)
         .map_err(TrapHandleError::Syscall)?;
-    let idx = cpu.0 as usize;
-    if idx < MAX_CPUS {
-        LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
+    #[cfg(test)]
+    {
+        let idx = cpu.0 as usize;
+        if idx < MAX_CPUS {
+            LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
+        }
     }
+    #[cfg(not(test))]
+    let _ = (cpu, tls);
     Ok(())
 }
 
@@ -257,7 +268,9 @@ mod tests {
         )
         .expect("trap a");
 
-        state.set_thread_tls_base(0, 0xBBB0_0000).expect("set tls boot");
+        state
+            .set_thread_tls_base(0, 0xBBB0_0000)
+            .expect("set tls boot");
         state.set_current_cpu(CpuId(0)).expect("switch cpu0");
         let mut frame_b = TrapFrame::new(0, [0; 6]);
         handle_trap_entry(

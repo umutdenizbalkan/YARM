@@ -4,6 +4,7 @@
 
 pub const PAGE_SIZE: usize = 4096;
 pub const KERNEL_SPACE_BASE: u64 = 0x8000_0000;
+pub const USER_BRK_DEFAULT_BASE: usize = 0x4000_0000;
 pub const ASID_BITS: u8 = 16;
 
 #[cfg(feature = "hosted-dev")]

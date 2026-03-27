@@ -33,13 +33,19 @@ boot_pdpt:
 
     .align 4096
 boot_pd:
-    .set page_flags, 0x83
-    .set page_index, 0
-    .rept 256
-    .quad (page_index * 0x200000) | page_flags
+    // Hardening tranche (stage 2):
+    // - keep minimal executable bootstrap window (first 2MiB identity page)
+    // - mark remaining identity-mapped bootstrap pages NX to reduce executable surface
+    // - keep writable data/stack support during early bring-up
+    .set page_flags_exec, 0x83
+    .set page_flags_data_nx, 0x8000000000000083
+    .quad (0 * 0x200000) | page_flags_exec
+    .set page_index, 1
+    .rept 31
+    .quad (page_index * 0x200000) | page_flags_data_nx
     .set page_index, page_index + 1
     .endr
-    .zero 2048
+    .zero 3840
 
     .align 8
 gdt64:

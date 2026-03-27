@@ -8,8 +8,9 @@ Kernel core may depend on only these HAL primitives:
 
 1. address-space switch
 2. interrupt acknowledge/delivery handoff
-3. timer programming
-4. normalized trap event decode to `TrapEvent`
+3. external-interrupt completion (EOI/claim-complete)
+4. timer programming
+5. normalized trap event decode to `TrapEvent`
 
 ## Baseline ISA conformance targets
 
@@ -20,6 +21,7 @@ Both profiles must satisfy identical kernel-facing semantics for:
 
 - ASID switch observability
 - IRQ acknowledge path observability
+- external IRQ completion observability
 - timer deadline programming observability
 - trap decode into normalized events (`syscall` / `page_fault`)
 
@@ -28,10 +30,18 @@ Both profiles must satisfy identical kernel-facing semantics for:
 - `src/arch/hal.rs`
   - `hal_contract_is_isa_agnostic_for_riscv_like_impl`
   - `hal_contract_is_isa_agnostic_for_x86_like_impl`
+- `src/arch/irq_guard.rs`
+  - selected-ISA `external_irq_eoi(irq_line)` dispatch
+- `src/kernel/boot/fault_state.rs`
+  - external interrupt flow saves/restores IRQ state and calls arch EOI hook
 - `src/arch/riscv64/trap.rs`
   - trap entry routes through normalized kernel trap handling
 - `src/arch/x86_64/trap.rs`
   - trap entry routes through normalized kernel trap handling
+
+## Current implementation note
+
+- Architecture EOI hooks exist for `x86_64`, `riscv64`, and `aarch64`, but real APIC/GIC/PLIC register-level completion is still TODO in ISA IRQ backends.
 
 ## Invariants
 

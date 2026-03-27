@@ -270,32 +270,59 @@ impl CapabilitySpace {
         destination.mint_at(destination_slot, derived)
     }
 
+    /// Revoke `id` and all descendants derived from it.
+    ///
+    /// Complexity is `O(n)` in slot count for each revoke operation:
+    /// a single pass builds a parent->children index, then a stack walk marks
+    /// the transitive closure.
     pub fn revoke(&mut self, id: CapId) -> Result<(), CapabilityDeriveError> {
         if self.get(id).is_none() {
             return Err(CapabilityDeriveError::NotFound);
         }
 
-        let mut marked = [false; MAX_CAPABILITIES_PER_CSPACE];
-        marked[id.index()] = true;
-
-        loop {
-            let mut changed = false;
-            for idx in 0..MAX_CAPABILITIES_PER_CSPACE {
-                if marked[idx] {
-                    continue;
-                }
-                if let Some(entry) = self.slots[idx].entry
-                    && let Some(parent) = entry.parent
-                    && parent.index() < MAX_CAPABILITIES_PER_CSPACE
-                    && marked[parent.index()]
-                    && self.slots[parent.index()].generation == parent.generation()
-                {
-                    marked[idx] = true;
-                    changed = true;
-                }
+        let mut child_heads: [Option<usize>; MAX_CAPABILITIES_PER_CSPACE] =
+            [None; MAX_CAPABILITIES_PER_CSPACE];
+        let mut next_sibling: [Option<usize>; MAX_CAPABILITIES_PER_CSPACE] =
+            [None; MAX_CAPABILITIES_PER_CSPACE];
+        for idx in 0..MAX_CAPABILITIES_PER_CSPACE {
+            let Some(entry) = self.slots[idx].entry else {
+                continue;
+            };
+            let Some(parent) = entry.parent else {
+                continue;
+            };
+            let parent_idx = parent.index();
+            if parent_idx >= MAX_CAPABILITIES_PER_CSPACE {
+                continue;
             }
-            if !changed {
-                break;
+            if self.slots[parent_idx].generation != parent.generation() {
+                continue;
+            }
+            if self.slots[parent_idx].entry.is_none() {
+                continue;
+            }
+            next_sibling[idx] = child_heads[parent_idx];
+            child_heads[parent_idx] = Some(idx);
+        }
+
+        let mut marked = [false; MAX_CAPABILITIES_PER_CSPACE];
+        let mut stack = [0usize; MAX_CAPABILITIES_PER_CSPACE];
+        let mut sp = 0usize;
+        stack[sp] = id.index();
+        sp += 1;
+
+        while sp != 0 {
+            sp -= 1;
+            let node = stack[sp];
+            if marked[node] {
+                continue;
+            }
+            marked[node] = true;
+            let mut child = child_heads[node];
+            while let Some(idx) = child {
+                stack[sp] = idx;
+                sp += 1;
+                child = next_sibling[idx];
             }
         }
 

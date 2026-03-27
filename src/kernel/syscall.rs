@@ -5,15 +5,16 @@ use super::ipc::{
 };
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
-use super::vm::VirtAddr;
+use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
 
-pub const SYSCALL_ABI_VERSION: u16 = 3;
+pub const SYSCALL_ABI_VERSION: u16 = 4;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
-pub const SYSCALL_COUNT: usize = 3;
-const _: [(); SYSCALL_COUNT] = [(); 3];
+pub const SYSCALL_VM_MAP_NR: usize = 3;
+pub const SYSCALL_COUNT: usize = 4;
+const _: [(); SYSCALL_COUNT] = [(); 4];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -25,6 +26,9 @@ pub const SYSCALL_RET_STATUS: usize = 0;
 pub const SYSCALL_RET_AUX: usize = 1;
 pub const SYSCALL_RET_TRANSFER_CAP: usize = 2;
 pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
+pub const SYSCALL_VM_MAP_PROT_READ: usize = 0x1;
+pub const SYSCALL_VM_MAP_PROT_WRITE: usize = 0x2;
+pub const SYSCALL_VM_MAP_PROT_EXEC: usize = 0x4;
 pub const OPCODE_INLINE: u16 = 0;
 pub const OPCODE_SHARED_MEM: u16 = 1;
 
@@ -34,10 +38,11 @@ pub enum Syscall {
     Yield = SYSCALL_YIELD_NR,
     IpcSend = SYSCALL_IPC_SEND_NR,
     IpcRecv = SYSCALL_IPC_RECV_NR,
+    VmMap = SYSCALL_VM_MAP_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 3;
+    pub const VARIANT_COUNT: usize = 4;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -47,6 +52,7 @@ impl Syscall {
             SYSCALL_YIELD_NR => Ok(Self::Yield),
             SYSCALL_IPC_SEND_NR => Ok(Self::IpcSend),
             SYSCALL_IPC_RECV_NR => Ok(Self::IpcRecv),
+            SYSCALL_VM_MAP_NR => Ok(Self::VmMap),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -158,25 +164,31 @@ fn materialize_received_transfer_cap(
     let Some(handle) = transfer_handle else {
         return Ok(None);
     };
-    let source_cap = kernel
+    let envelope = kernel
         .take_transfer_envelope(handle, endpoint, crate::kernel::ipc::ThreadId(receiver_tid))
         .ok_or(SyscallError::InvalidCapability)?;
+    let source_capability = kernel
+        .resolve_capability_for_task(envelope.source_tid.0, envelope.source_cap)
+        .map_err(SyscallError::from)?;
     let derived = kernel
-        .cspace
-        .mint(source_cap)
-        .map_err(|_| SyscallError::QueueFull)?;
-    if let Some(cnode) = kernel.current_task_cnode() {
-        kernel
-            .mirror_capability_into_cnode(cnode, derived, source_cap)
-            .map_err(|_| SyscallError::QueueFull)?;
-    }
+        .capability_service_mut()
+        .grant_task_to_task_with_rights(
+            envelope.source_tid.0,
+            envelope.source_cap,
+            receiver_tid,
+            source_capability.rights(),
+        )
+        .map_err(SyscallError::from)?;
     Ok(Some(derived.0))
 }
 
 fn validate_user_region(offset: u64, len: u64) -> Result<(), SyscallError> {
-    const USER_ADDR_MAX: u64 = crate::arch::vm_layout::KERNEL_SPACE_BASE - 1;
-    let end = offset.checked_add(len).ok_or(SyscallError::InvalidArgs)?;
-    if end > USER_ADDR_MAX {
+    let user_end_exclusive = crate::arch::vm_layout::KERNEL_SPACE_BASE;
+    if offset >= user_end_exclusive {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let end_exclusive = offset.checked_add(len).ok_or(SyscallError::InvalidArgs)?;
+    if end_exclusive > user_end_exclusive {
         return Err(SyscallError::InvalidArgs);
     }
     Ok(())
@@ -188,7 +200,8 @@ fn validate_endpoint_right(
     right: CapRights,
 ) -> Result<(), SyscallError> {
     let endpoint_cap = kernel
-        .current_task_capability(cap)
+        .capability_service()
+        .resolve_current_task_capability(cap)
         .ok_or(SyscallError::InvalidCapability)?;
     if !matches!(endpoint_cap.object, CapObject::Endpoint { .. }) {
         return Err(SyscallError::WrongObject);
@@ -200,7 +213,11 @@ fn validate_endpoint_right(
 }
 
 fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), SyscallError> {
-    if kernel.current_task_capability(cap).is_none() {
+    if kernel
+        .capability_service()
+        .resolve_current_task_capability(cap)
+        .is_none()
+    {
         return Err(SyscallError::InvalidCapability);
     }
     Ok(())
@@ -214,15 +231,21 @@ fn stash_transfer_handle(
     let Some(source_cap_id) = transfer_cap else {
         return Ok(None);
     };
-    let source_cap = kernel
-        .current_task_capability(source_cap_id)
-        .ok_or(SyscallError::InvalidCapability)?;
+    let sender_tid = current_tid(kernel)?;
+    let _ = kernel
+        .resolve_capability_for_task(sender_tid, source_cap_id)
+        .map_err(SyscallError::from)?;
     let receiver_tid = kernel
         .endpoint_waiter_tid(endpoint)
         .ok_or(SyscallError::WouldBlock)?;
     Ok(Some(
         kernel
-            .stash_transfer_envelope(source_cap, endpoint, Some(receiver_tid))
+            .stash_transfer_envelope(
+                crate::kernel::ipc::ThreadId(sender_tid),
+                source_cap_id,
+                endpoint,
+                Some(receiver_tid),
+            )
             .ok_or(SyscallError::QueueFull)?,
     ))
 }
@@ -244,11 +267,37 @@ fn inline_payload_from_frame(
     Ok(payload)
 }
 
+fn vm_map_page_flags(prot: usize) -> Result<PageFlags, SyscallError> {
+    let unknown =
+        prot & !(SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE | SYSCALL_VM_MAP_PROT_EXEC);
+    if unknown != 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    Ok(PageFlags {
+        read: (prot & SYSCALL_VM_MAP_PROT_READ) != 0,
+        write: (prot & SYSCALL_VM_MAP_PROT_WRITE) != 0,
+        execute: (prot & SYSCALL_VM_MAP_PROT_EXEC) != 0,
+        user: true,
+    })
+}
+
+fn round_up_page(value: usize) -> Result<usize, SyscallError> {
+    if value.is_multiple_of(PAGE_SIZE) {
+        Ok(value)
+    } else {
+        let rounded = value
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(SyscallError::InvalidArgs)?;
+        Ok(rounded & !(PAGE_SIZE - 1))
+    }
+}
+
 fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     validate_endpoint_right(kernel, cap, CapRights::SEND)?;
     let endpoint = kernel
-        .current_task_capability(cap)
+        .capability_service()
+        .resolve_current_task_capability(cap)
         .ok_or(SyscallError::InvalidCapability)?
         .object;
     let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
@@ -263,7 +312,8 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         if len > Message::MAX_PAYLOAD {
             let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
             let grant = kernel
-                .current_task_capability(grant_cap)
+                .capability_service()
+                .resolve_current_task_capability(grant_cap)
                 .ok_or(SyscallError::InvalidCapability)?;
             match grant.object {
                 CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}
@@ -304,16 +354,44 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             .map_err(|_| SyscallError::InvalidArgs)
         }
     } else {
-        let payload = inline_payload_from_frame(frame, len)?;
-        let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
-        Message::with_header(
-            sender_tid,
-            OPCODE_INLINE,
-            transfer_flag_bits(transfer_cap),
-            transfer_handle,
-            &payload[..len],
-        )
-        .map_err(|_| SyscallError::InvalidArgs)
+        if len > Message::MAX_PAYLOAD {
+            return Err(SyscallError::InvalidArgs);
+        }
+        if len > IPC_REGISTER_BYTES {
+            let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
+            let grant = kernel
+                .capability_service()
+                .resolve_current_task_capability(grant_cap)
+                .ok_or(SyscallError::InvalidCapability)?;
+            match grant.object {
+                CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}
+                _ => return Err(SyscallError::WrongObject),
+            }
+            let region = SharedMemoryRegion {
+                offset: user_ptr_or_offset as u64,
+                len: len as u64,
+            };
+            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
+            Message::with_header(
+                sender_tid,
+                OPCODE_SHARED_MEM,
+                Message::FLAG_CAP_TRANSFER,
+                transfer_handle,
+                &region.encode(),
+            )
+            .map_err(|_| SyscallError::InvalidArgs)
+        } else {
+            let payload = inline_payload_from_frame(frame, len)?;
+            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
+            Message::with_header(
+                sender_tid,
+                OPCODE_INLINE,
+                transfer_flag_bits(transfer_cap),
+                transfer_handle,
+                &payload[..len],
+            )
+            .map_err(|_| SyscallError::InvalidArgs)
+        }
     };
     let msg = match msg_result {
         Ok(msg) => msg,
@@ -339,7 +417,8 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     validate_endpoint_right(kernel, cap, CapRights::RECEIVE)?;
     let endpoint = kernel
-        .current_task_capability(cap)
+        .capability_service()
+        .resolve_current_task_capability(cap)
         .ok_or(SyscallError::InvalidCapability)?
         .object;
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
@@ -400,6 +479,31 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     Ok(())
 }
 
+fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let aspace_map_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let addr = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
+    if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let map_len = round_up_page(len)?;
+    let end = addr.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
+    let flags = vm_map_page_flags(prot)?;
+    let mut va = addr;
+    while va < end {
+        let (_, mem_cap) = kernel
+            .alloc_anonymous_memory_object()
+            .map_err(SyscallError::from)?;
+        kernel
+            .map_user_page_with_caps(aspace_map_cap, mem_cap, VirtAddr(va as u64), flags)
+            .map_err(SyscallError::from)?;
+        va += PAGE_SIZE;
+    }
+    frame.set_ok(addr, map_len, 0);
+    Ok(())
+}
+
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     match Syscall::decode(frame.syscall_num())? {
         Syscall::Yield => {
@@ -409,6 +513,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         }
         Syscall::IpcSend => handle_ipc_send(kernel, frame),
         Syscall::IpcRecv => handle_ipc_recv(kernel, frame),
+        Syscall::VmMap => handle_vm_map(kernel, frame),
     }
 }
 
@@ -421,10 +526,32 @@ mod tests {
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
-        assert_eq!(SYSCALL_ABI_VERSION, 3);
+        assert_eq!(SYSCALL_ABI_VERSION, 4);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
         assert_eq!(IPC_REGISTER_WORDS, 2);
+    }
+
+    #[test]
+    fn vm_map_syscall_maps_aligned_region() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let mut frame = TrapFrame::new(
+            Syscall::VmMap as usize,
+            [
+                aspace_map_cap.0 as usize,
+                0x4000,
+                PAGE_SIZE * 2,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut frame).expect("vm_map");
+        assert_eq!(frame.error_code(), None);
+        assert_eq!(frame.ret0(), 0x4000);
+        assert_eq!(frame.ret1(), PAGE_SIZE * 2);
     }
 
     #[test]
@@ -461,7 +588,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
         let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
         let recv_cap = state
-            .duplicate_global_capability_to_task(1, recv_cap_global)
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0x7000))
@@ -469,7 +596,9 @@ mod tests {
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
         assert!(
-            state.current_task_capability_has_right(recv_cap, CapRights::RECEIVE),
+            state
+                .capability_service()
+                .current_task_capability_has_right(recv_cap, CapRights::RECEIVE),
             "receiver task must own receive cap"
         );
         let mut block_recv_frame = TrapFrame::new(
@@ -505,7 +634,8 @@ mod tests {
         let recv_local = CapId(frame.ret2() as u64);
         assert_ne!(recv_local, mem_cap);
         let mapped = state
-            .current_task_capability(recv_local)
+            .capability_service()
+            .resolve_current_task_capability(recv_local)
             .expect("receiver-local transferred cap");
         assert!(matches!(mapped.object, CapObject::MemoryObject { .. }));
         state.yield_current().expect("switch back to sender");
@@ -542,6 +672,49 @@ mod tests {
     }
 
     #[test]
+    fn kernel_inline_send_can_fall_back_to_shared_region_for_larger_payloads() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(crate::kernel::vm::PhysAddr(0xA000))
+            .expect("mem");
+        state.yield_current().expect("switch to task1");
+        let mut block_recv_frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv_frame).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x1200,
+                IPC_REGISTER_BYTES + 1,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send syscall");
+        assert_eq!(send_frame.error_code(), None);
+
+        let msg = state.ipc_recv(recv_cap_global).expect("recv").expect("msg");
+        assert_eq!(msg.opcode, OPCODE_SHARED_MEM);
+        assert!(msg.flags & Message::FLAG_CAP_TRANSFER != 0);
+        let region = SharedMemoryRegion::decode(msg.as_slice()).expect("region");
+        assert_eq!(region.offset, 0x1200);
+        assert_eq!(region.len as usize, IPC_REGISTER_BYTES + 1);
+    }
+
+    #[test]
     fn transfer_envelope_handle_is_bound_to_endpoint_context() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
@@ -553,7 +726,7 @@ mod tests {
             .create_memory_object(crate::kernel::vm::PhysAddr(0xA000))
             .expect("mem");
         let recv1_task1 = state
-            .duplicate_global_capability_to_task(1, recv1)
+            .grant_capability_task_to_task(0, recv1, 1)
             .expect("dup recv1 to task1");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
@@ -596,7 +769,7 @@ mod tests {
             .create_memory_object(crate::kernel::vm::PhysAddr(0xB000))
             .expect("mem");
         let recv_cap_task1 = state
-            .duplicate_global_capability_to_task(1, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 1)
             .expect("dup recv to task1");
 
         state.yield_current().expect("switch to task1");

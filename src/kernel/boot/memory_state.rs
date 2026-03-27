@@ -16,12 +16,7 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
 
-        self.cspace
-            .revoke(aspace_cap)
-            .map_err(|_| KernelError::InvalidCapability)?;
-        if let Some(cnode) = self.current_task_cnode() {
-            self.revoke_capability_in_cnode(cnode, aspace_cap)?;
-        }
+        self.revoke_capability_in_cnode(cnode, aspace_cap)?;
 
         let pending_cpu_bitmap = self.online_cpu_bitmap();
         self.user_spaces
@@ -154,8 +149,8 @@ impl KernelState {
         flags: PageFlags,
     ) -> Result<PhysAddr, KernelError> {
         let capability = self
-            .cspace
-            .get(mem_cap)
+            .capability_service()
+            .resolve_current_task_capability(mem_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let id = match capability.object {
             CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
@@ -189,14 +184,32 @@ impl KernelState {
         self.map_user_page(aspace_map_cap, virt, Mapping { phys, flags })
     }
 
+    #[cfg(feature = "linux-compat")]
+    pub(crate) fn map_user_page_in_asid_with_caps(
+        &mut self,
+        asid: Asid,
+        mem_cap: CapId,
+        virt: VirtAddr,
+        flags: PageFlags,
+    ) -> Result<Option<Mapping>, KernelError> {
+        let phys = self.resolve_memory_object_phys(mem_cap, flags)?;
+        let aspace = self
+            .user_spaces
+            .get_mut(asid)
+            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        aspace
+            .map_page(virt, Mapping { phys, flags })
+            .map_err(KernelError::Vm)
+    }
+
     pub fn unmap_user_page(
         &mut self,
         aspace_map_cap: CapId,
         virt: VirtAddr,
     ) -> Result<Option<Mapping>, KernelError> {
         let capability = self
-            .cspace
-            .get(aspace_map_cap)
+            .capability_service()
+            .resolve_current_task_capability(aspace_map_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let asid = match capability.object {
             CapObject::AddressSpace { asid } => Asid(asid),
@@ -212,6 +225,19 @@ impl KernelState {
         Ok(aspace.unmap_page(virt))
     }
 
+    #[cfg(feature = "linux-compat")]
+    pub(crate) fn unmap_user_page_in_asid(
+        &mut self,
+        asid: Asid,
+        virt: VirtAddr,
+    ) -> Result<Option<Mapping>, KernelError> {
+        let aspace = self
+            .user_spaces
+            .get_mut(asid)
+            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        Ok(aspace.unmap_page(virt))
+    }
+
     pub fn protect_user_page(
         &mut self,
         aspace_map_cap: CapId,
@@ -219,8 +245,8 @@ impl KernelState {
         new_flags: PageFlags,
     ) -> Result<Option<Mapping>, KernelError> {
         let capability = self
-            .cspace
-            .get(aspace_map_cap)
+            .capability_service()
+            .resolve_current_task_capability(aspace_map_cap)
             .ok_or(KernelError::InvalidCapability)?;
         let asid = match capability.object {
             CapObject::AddressSpace { asid } => Asid(asid),
@@ -229,6 +255,31 @@ impl KernelState {
         if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
+        let aspace = self
+            .user_spaces
+            .get_mut(asid)
+            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        let current = aspace
+            .resolve(virt)
+            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        aspace
+            .map_page(
+                virt,
+                Mapping {
+                    phys: current.phys,
+                    flags: new_flags,
+                },
+            )
+            .map_err(KernelError::Vm)
+    }
+
+    #[cfg(feature = "linux-compat")]
+    pub(crate) fn protect_user_page_in_asid(
+        &mut self,
+        asid: Asid,
+        virt: VirtAddr,
+        new_flags: PageFlags,
+    ) -> Result<Option<Mapping>, KernelError> {
         let aspace = self
             .user_spaces
             .get_mut(asid)

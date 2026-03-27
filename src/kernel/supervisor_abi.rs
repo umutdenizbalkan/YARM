@@ -215,11 +215,12 @@ pub struct RegisterDriverRequest {
     pub mem_cap: u64,
     pub iova_cap: u64,
     pub iova_base: u64,
+    pub dma_len: u64,
     pub iova_len: u64,
 }
 
 impl RegisterDriverRequest {
-    pub const ENCODED_LEN: usize = 56;
+    pub const ENCODED_LEN: usize = 64;
 
     pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
@@ -229,6 +230,7 @@ impl RegisterDriverRequest {
         let mem_cap = self.mem_cap.to_le_bytes();
         let iova_cap = self.iova_cap.to_le_bytes();
         let iova_base = self.iova_base.to_le_bytes();
+        let dma_len = self.dma_len.to_le_bytes();
         let iova_len = self.iova_len.to_le_bytes();
         let mut i = 0;
         while i < 8 {
@@ -237,7 +239,8 @@ impl RegisterDriverRequest {
             out[24 + i] = mem_cap[i];
             out[32 + i] = iova_cap[i];
             out[40 + i] = iova_base[i];
-            out[48 + i] = iova_len[i];
+            out[48 + i] = dma_len[i];
+            out[56 + i] = iova_len[i];
             i += 1;
         }
         out[8] = self.max_restarts;
@@ -249,7 +252,7 @@ impl RegisterDriverRequest {
     }
 
     pub fn decode(payload: &[u8]) -> Option<Self> {
-        if payload.len() < Self::ENCODED_LEN {
+        if payload.len() < 56 {
             return None;
         }
         let mut tid = [0u8; 8];
@@ -257,13 +260,21 @@ impl RegisterDriverRequest {
         let mut mem_cap = [0u8; 8];
         let mut iova_cap = [0u8; 8];
         let mut iova_base = [0u8; 8];
+        let mut dma_len = [0u8; 8];
         let mut iova_len = [0u8; 8];
         tid.copy_from_slice(&payload[..8]);
         backoff.copy_from_slice(&payload[16..24]);
         mem_cap.copy_from_slice(&payload[24..32]);
         iova_cap.copy_from_slice(&payload[32..40]);
         iova_base.copy_from_slice(&payload[40..48]);
-        iova_len.copy_from_slice(&payload[48..56]);
+        if payload.len() >= Self::ENCODED_LEN {
+            dma_len.copy_from_slice(&payload[48..56]);
+            iova_len.copy_from_slice(&payload[56..64]);
+        } else {
+            // Backward-compat decode for pre-split format.
+            dma_len.copy_from_slice(&payload[48..56]);
+            iova_len.copy_from_slice(&payload[48..56]);
+        }
         Some(Self {
             tid: u64::from_le_bytes(tid),
             max_restarts: payload[8],
@@ -274,6 +285,7 @@ impl RegisterDriverRequest {
             mem_cap: u64::from_le_bytes(mem_cap),
             iova_cap: u64::from_le_bytes(iova_cap),
             iova_base: u64::from_le_bytes(iova_base),
+            dma_len: u64::from_le_bytes(dma_len),
             iova_len: u64::from_le_bytes(iova_len),
         })
     }

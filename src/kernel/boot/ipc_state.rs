@@ -61,14 +61,8 @@ impl KernelState {
         &mut self,
         capability: Capability,
     ) -> Result<CapId, KernelError> {
-        let cap_id = self
-            .cspace
-            .mint(capability)
-            .map_err(|_| KernelError::CapabilityFull)?;
-        if let Some(cnode) = self.current_task_cnode() {
-            self.mirror_capability_into_cnode(cnode, cap_id, capability)?;
-        }
-        Ok(cap_id)
+        let cnode = self.current_task_cnode().ok_or(KernelError::TaskMissing)?;
+        self.mint_capability_in_cnode(cnode, capability)
     }
 
     fn block_current_on_receive(
@@ -98,7 +92,6 @@ impl KernelState {
             SenderWaiter {
                 tid: ThreadId(blocked_tid),
                 msg,
-                blocked: true,
             },
         )?;
         let _ = self.dispatch_next_task()?;
@@ -313,8 +306,8 @@ impl KernelState {
         notification_cap: CapId,
     ) -> Result<(), KernelError> {
         let capability = self
-            .cspace
-            .get(notification_cap)
+            .capability_service()
+            .resolve_current_task_capability(notification_cap)
             .ok_or(KernelError::InvalidCapability)?;
         if !capability.has_right(CapRights::SIGNAL) {
             return Err(KernelError::MissingRight);
@@ -470,21 +463,22 @@ impl KernelState {
         transfer_cap: CapId,
         payload: &[u8],
     ) -> Result<(), KernelError> {
-        // Kernel-internal transfer-envelope staging intentionally references global
-        // capabilities because handles are bound and materialized across tasks.
-        let transfer_payload = self
-            .kernel_global_capability(transfer_cap)
-            .ok_or(KernelError::InvalidCapability)?;
-        let send_capability = self
-            .kernel_global_capability(send_cap)
-            .ok_or(KernelError::InvalidCapability)?;
+        // Resolve all capabilities in the sender's cspace to keep authorization
+        // task-local even for kernel-internal transfer staging paths.
+        let _ = self.resolve_capability_for_task(sender_tid.0, transfer_cap)?;
+        let send_capability = self.resolve_capability_for_task(sender_tid.0, send_cap)?;
         if !send_capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
         }
         let endpoint_idx = self.resolve_endpoint_index(send_capability.object)?;
         let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx].ok_or(KernelError::WouldBlock)?;
         let transfer_handle = self
-            .stash_transfer_envelope(transfer_payload, send_capability.object, Some(waiter_tid))
+            .stash_transfer_envelope(
+                sender_tid,
+                transfer_cap,
+                send_capability.object,
+                Some(waiter_tid),
+            )
             .ok_or(KernelError::EndpointQueueFull)?;
         let msg = Message::with_header(
             sender_tid.0,
@@ -503,10 +497,8 @@ impl KernelState {
     }
 
     pub fn try_ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
-        // Kernel-internal probe path for globally held receive capabilities.
-        let capability = self
-            .kernel_global_capability(recv_cap)
-            .ok_or(KernelError::InvalidCapability)?;
+        // Probe path resolves receive capability in the current task cspace.
+        let capability = self.resolve_recv_cap_task_local(recv_cap)?;
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }
@@ -530,17 +522,13 @@ impl KernelState {
                     .ok_or(KernelError::WrongObject)?
                     .send(waiter.msg)
                     .map_err(|_| KernelError::EndpointQueueFull)?;
-                if waiter.blocked {
-                    self.wake_sender_waiter(waiter.tid)?;
-                }
+                self.wake_sender_waiter(waiter.tid)?;
             }
             return Ok(Some(msg));
         }
 
         if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-            if waiter.blocked {
-                self.wake_sender_waiter(waiter.tid)?;
-            }
+            self.wake_sender_waiter(waiter.tid)?;
             return Ok(Some(waiter.msg));
         }
 
@@ -572,17 +560,13 @@ impl KernelState {
                     .ok_or(KernelError::WrongObject)?
                     .send(waiter.msg)
                     .map_err(|_| KernelError::EndpointQueueFull)?;
-                if waiter.blocked {
-                    self.wake_sender_waiter(waiter.tid)?;
-                }
+                self.wake_sender_waiter(waiter.tid)?;
             }
             return Ok(Some(msg));
         }
 
         if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-            if waiter.blocked {
-                self.wake_sender_waiter(waiter.tid)?;
-            }
+            self.wake_sender_waiter(waiter.tid)?;
             return Ok(Some(waiter.msg));
         }
 

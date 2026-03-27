@@ -113,6 +113,10 @@ const MAX_DRIVER_DMA_CAPS: usize = 8;
 const MAX_TRANSFER_ENVELOPES: usize = 256;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_TRANSFER_ENVELOPES: usize = 64;
+#[cfg(feature = "hosted-dev")]
+const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
+#[cfg(not(feature = "hosted-dev"))]
+const MAX_DELEGATED_CAPABILITY_LINKS: usize = 2048;
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +184,7 @@ pub struct DriverBundlePlan {
     pub server_tid: ThreadId,
     pub irq_line: u16,
     pub mem_cap: CapId,
+    pub dma_len: usize,
     pub iova_cap: CapId,
     pub iova_base: usize,
     pub iova_len: usize,
@@ -190,16 +195,19 @@ impl DriverBundlePlan {
         server_tid: ThreadId,
         irq_line: u16,
         mem_cap: CapId,
+        dma_len: usize,
         iova_cap: CapId,
         iova_base: usize,
+        iova_len: usize,
     ) -> Self {
         Self {
             server_tid,
             irq_line,
             mem_cap,
+            dma_len,
             iova_cap,
             iova_base,
-            iova_len: super::vm::PAGE_SIZE,
+            iova_len,
         }
     }
 }
@@ -289,17 +297,17 @@ struct RobustFutexRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TransferEnvelope {
-    capability: Capability,
-    endpoint: CapObject,
-    receiver_tid: Option<ThreadId>,
+pub(crate) struct TransferEnvelope {
+    pub(crate) source_tid: ThreadId,
+    pub(crate) source_cap: CapId,
+    pub(crate) endpoint: CapObject,
+    pub(crate) receiver_tid: Option<ThreadId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SenderWaiter {
     tid: ThreadId,
     msg: Message,
-    blocked: bool,
 }
 
 #[derive(Debug)]
@@ -355,11 +363,24 @@ struct RestartSubsystem {
     next_restart_token: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DelegatedCapabilityLink {
+    source_tid: u64,
+    source_cap: CapId,
+    dest_tid: u64,
+    dest_cap: CapId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DelegatedCapRef {
+    tid: u64,
+    cap: CapId,
+}
+
 #[derive(Debug)]
 pub struct KernelState {
     pub kernel_aspace: AddressSpace,
     pub scheduler: KernelStorage<SmpScheduler>,
-    pub cspace: KernelStorage<CapabilitySpace>,
     pub timer: Timer,
     pub user_spaces: KernelStorage<AddressSpaceManager>,
     current_cpu: CpuId,
@@ -375,6 +396,16 @@ pub struct KernelState {
     tlb_shootdown_count: u64,
     faults: FaultSubsystem,
     restart: RestartSubsystem,
+    delegated_capability_links:
+        KernelStorage<[Option<DelegatedCapabilityLink>; MAX_DELEGATED_CAPABILITY_LINKS]>,
+}
+
+pub(crate) struct CapabilityService<'a> {
+    kernel: &'a KernelState,
+}
+
+pub(crate) struct CapabilityServiceMut<'a> {
+    kernel: &'a mut KernelState,
 }
 
 pub struct Bootstrap;
@@ -432,15 +463,9 @@ impl Bootstrap {
             )
             .map_err(map_scheduler_error)?;
 
-        let mut cspace = CapabilitySpace::default();
-        cspace
-            .mint(Capability::new(CapObject::Kernel, CapRights::SCHEDULE))
-            .map_err(|_| KernelError::CapabilityFull)?;
-
         let mut state = KernelState {
             kernel_aspace,
             scheduler: store_kernel_value(scheduler),
-            cspace: store_kernel_value(cspace),
             timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: store_kernel_value(AddressSpaceManager::default()),
             current_cpu: CpuId(platform_layout::BOOTSTRAP_CPU_ID),
@@ -485,6 +510,9 @@ impl Bootstrap {
             restart: RestartSubsystem {
                 next_restart_token: 1,
             },
+            delegated_capability_links: store_kernel_value(
+                [const { None }; MAX_DELEGATED_CAPABILITY_LINKS],
+            ),
         };
 
         state.register_task(0)?;
@@ -494,7 +522,49 @@ impl Bootstrap {
 }
 
 impl KernelState {
+    pub(crate) fn capability_service(&self) -> CapabilityService<'_> {
+        CapabilityService { kernel: self }
+    }
+
+    pub(crate) fn capability_service_mut(&mut self) -> CapabilityServiceMut<'_> {
+        CapabilityServiceMut { kernel: self }
+    }
+}
+
+impl CapabilityService<'_> {
+    pub(crate) fn resolve_current_task_capability(&self, cap: CapId) -> Option<Capability> {
+        self.kernel.current_task_capability(cap)
+    }
+
+    pub(crate) fn resolve_task_capability(&self, tid: u64, cap: CapId) -> Option<Capability> {
+        self.kernel.task_capability(tid, cap)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_task_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
+        self.resolve_current_task_capability(cap)
+            .map(|capability| capability.has_right(right))
+            .unwrap_or(false)
+    }
+}
+
+impl CapabilityServiceMut<'_> {
+    pub(crate) fn grant_task_to_task_with_rights(
+        &mut self,
+        source_tid: u64,
+        source_cap: CapId,
+        dest_tid: u64,
+        rights: CapRights,
+    ) -> Result<CapId, KernelError> {
+        self.kernel
+            .grant_capability_task_to_task_with_rights(source_tid, source_cap, dest_tid, rights)
+    }
+}
+
+impl KernelState {
     const CAPACITY_NEAR_FULL_PERCENT: usize = 90;
+    const MAX_CAPABILITY_SLOTS_ACROSS_CNODES: usize =
+        MAX_TASKS * crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE;
 
     fn capacity_pool(used: usize, capacity: usize) -> CapacityPoolTelemetry {
         let near_full = if capacity == 0 {
@@ -510,6 +580,13 @@ impl KernelState {
     }
 
     pub fn capacity_telemetry(&self) -> CapacityTelemetry {
+        let cnode_capability_slots_used: usize = self
+            .cnode_spaces
+            .iter()
+            .flatten()
+            .map(|space| kernel_ref(&space.cspace).occupied_slots())
+            .sum();
+        let capability_slots_used = cnode_capability_slots_used;
         CapacityTelemetry {
             endpoints: Self::capacity_pool(
                 self.ipc.endpoints.iter().flatten().count(),
@@ -529,8 +606,8 @@ impl KernelState {
                 MAX_MEMORY_OBJECTS,
             ),
             capability_slots: Self::capacity_pool(
-                self.cspace.occupied_slots(),
-                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                capability_slots_used,
+                Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES,
             ),
         }
     }
@@ -548,7 +625,7 @@ impl KernelState {
                 max_drivers: MAX_DRIVERS,
                 max_memory_objects: MAX_MEMORY_OBJECTS,
                 max_transfer_envelopes: MAX_TRANSFER_ENVELOPES,
-                max_capability_slots: crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                max_capability_slots: Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES,
             },
             KernelCapacityProfile::Constrained => RuntimeCapacityConfig {
                 max_endpoints: core::cmp::max(1, MAX_ENDPOINTS / 2),
@@ -559,7 +636,7 @@ impl KernelState {
                 max_transfer_envelopes: core::cmp::max(1, MAX_TRANSFER_ENVELOPES / 2),
                 max_capability_slots: core::cmp::max(
                     1,
-                    crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE / 2,
+                    Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES / 2,
                 ),
             },
             KernelCapacityProfile::Throughput => RuntimeCapacityConfig {
@@ -569,7 +646,7 @@ impl KernelState {
                 max_drivers: MAX_DRIVERS,
                 max_memory_objects: MAX_MEMORY_OBJECTS,
                 max_transfer_envelopes: MAX_TRANSFER_ENVELOPES,
-                max_capability_slots: crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                max_capability_slots: Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES,
             },
         }
     }
@@ -624,15 +701,30 @@ impl KernelState {
         self.capability_for_cnode(cnode, cap)
     }
 
+    pub fn task_capability(&self, tid: u64, cap: CapId) -> Option<Capability> {
+        let cnode = self.task_cnode(tid)?;
+        self.capability_for_cnode(cnode, cap)
+    }
+
+    pub(crate) fn resolve_capability_for_task(
+        &self,
+        tid: u64,
+        cap: CapId,
+    ) -> Result<Capability, KernelError> {
+        self.task_capability(tid, cap)
+            .ok_or(KernelError::InvalidCapability)
+    }
+
     pub fn current_task_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
         self.current_task_capability(cap)
             .map(|capability| capability.has_right(right))
             .unwrap_or(false)
     }
 
-    pub fn stash_transfer_envelope(
+    pub(crate) fn stash_transfer_envelope(
         &mut self,
-        capability: Capability,
+        source_tid: ThreadId,
+        source_cap: CapId,
         endpoint: CapObject,
         receiver_tid: Option<ThreadId>,
     ) -> Option<u64> {
@@ -646,7 +738,8 @@ impl KernelState {
             }
             self.ipc.transfer_envelope_generations[idx] = generation;
             self.ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
-                capability,
+                source_tid,
+                source_cap,
                 endpoint,
                 receiver_tid,
             });
@@ -656,12 +749,12 @@ impl KernelState {
         None
     }
 
-    pub fn take_transfer_envelope(
+    pub(crate) fn take_transfer_envelope(
         &mut self,
         handle: u64,
         endpoint: CapObject,
         receiver_tid: ThreadId,
-    ) -> Option<Capability> {
+    ) -> Option<TransferEnvelope> {
         let idx = usize::try_from(handle & 0xFFFF).ok()?;
         if idx >= MAX_TRANSFER_ENVELOPES {
             return None;
@@ -680,7 +773,38 @@ impl KernelState {
             }
         }
         self.ipc.transfer_envelopes[idx] = None;
-        Some(envelope.capability)
+        Some(envelope)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn grant_capability_task_to_task(
+        &mut self,
+        source_tid: u64,
+        source_cap: CapId,
+        dest_tid: u64,
+    ) -> Result<CapId, KernelError> {
+        let capability = self.resolve_capability_for_task(source_tid, source_cap)?;
+        let dest_cnode = self.task_cnode(dest_tid).ok_or(KernelError::TaskMissing)?;
+        let delegated_cap = self.mint_capability_in_cnode(dest_cnode, capability)?;
+        self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap)?;
+        Ok(delegated_cap)
+    }
+
+    pub(crate) fn grant_capability_task_to_task_with_rights(
+        &mut self,
+        source_tid: u64,
+        source_cap: CapId,
+        dest_tid: u64,
+        rights: CapRights,
+    ) -> Result<CapId, KernelError> {
+        let capability = self.resolve_capability_for_task(source_tid, source_cap)?;
+        let attenuated = capability
+            .derive(rights)
+            .map_err(|_| KernelError::MissingRight)?;
+        let dest_cnode = self.task_cnode(dest_tid).ok_or(KernelError::TaskMissing)?;
+        let delegated_cap = self.mint_capability_in_cnode(dest_cnode, attenuated)?;
+        self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap)?;
+        Ok(delegated_cap)
     }
 
     pub fn endpoint_waiter_tid(&self, endpoint: CapObject) -> Option<ThreadId> {
@@ -694,27 +818,6 @@ impl KernelState {
             return None;
         }
         self.ipc.endpoint_waiters[index]
-    }
-
-    pub fn kernel_global_capability(&self, cap: CapId) -> Option<Capability> {
-        let capability = self.cspace.get(cap)?;
-        self.capability_object_live(capability.object)?;
-        Some(capability)
-    }
-
-    pub fn kernel_global_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
-        self.kernel_global_capability(cap)
-            .map(|capability| capability.has_right(right))
-            .unwrap_or(false)
-    }
-
-    pub(crate) fn revoke_kernel_global_capability(
-        &mut self,
-        cap: CapId,
-    ) -> Result<(), KernelError> {
-        self.cspace
-            .revoke(cap)
-            .map_err(|_| KernelError::InvalidCapability)
     }
 
     pub fn capability_for_cnode(&self, cnode: CNodeId, cap: CapId) -> Option<Capability> {
@@ -769,63 +872,12 @@ impl KernelState {
         }
     }
 
-    pub(crate) fn mirror_capability_into_cnode(
-        &mut self,
-        cnode: CNodeId,
-        cap_id: CapId,
-        capability: Capability,
-    ) -> Result<(), KernelError> {
-        self.ensure_cnode_space(cnode)?;
-        let slot_index = (cap_id.0 & 0xFFFF) as usize;
-        let local_id = self
-            .cspace_for_cnode_mut(cnode)
-            .ok_or(KernelError::TaskMissing)?
-            .mint_at(slot_index, capability)
-            .map_err(|_| KernelError::CapabilityFull)?;
-        if local_id != cap_id {
-            return Err(KernelError::CapabilityFull);
-        }
-        Ok(())
-    }
-
-    pub fn mirror_global_capability_to_task(
-        &mut self,
-        tid: u64,
-        cap_id: CapId,
-    ) -> Result<(), KernelError> {
-        let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
-        let capability = self
-            .cspace
-            .get(cap_id)
-            .ok_or(KernelError::InvalidCapability)?;
-        self.mirror_capability_into_cnode(cnode, cap_id, capability)
-    }
-
-    pub fn duplicate_global_capability_to_task(
-        &mut self,
-        tid: u64,
-        cap_id: CapId,
-    ) -> Result<CapId, KernelError> {
-        let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
-        let capability = self
-            .cspace
-            .get(cap_id)
-            .ok_or(KernelError::InvalidCapability)?;
-        self.mint_capability_in_cnode(cnode, capability)
-    }
-
     pub(crate) fn mint_capability_for_current_context(
         &mut self,
         capability: Capability,
     ) -> Result<CapId, KernelError> {
-        let cap_id = self
-            .cspace
-            .mint(capability)
-            .map_err(|_| KernelError::CapabilityFull)?;
-        if let Some(cnode) = self.current_task_cnode() {
-            self.mirror_capability_into_cnode(cnode, cap_id, capability)?;
-        }
-        Ok(cap_id)
+        let cnode = self.current_task_cnode().ok_or(KernelError::TaskMissing)?;
+        self.mint_capability_in_cnode(cnode, capability)
     }
 
     pub(crate) fn mint_capability_in_cnode(
@@ -845,10 +897,140 @@ impl KernelState {
         cnode: CNodeId,
         cap: CapId,
     ) -> Result<(), KernelError> {
+        let source_tid = self.tid_for_cnode(cnode).ok_or(KernelError::TaskMissing)?;
+        let root = DelegatedCapRef {
+            tid: source_tid,
+            cap,
+        };
+        let descendants = self.collect_delegated_descendants(root);
         self.cspace_for_cnode_mut(cnode)
             .ok_or(KernelError::TaskMissing)?
             .revoke(cap)
-            .map_err(|_| KernelError::InvalidCapability)
+            .map_err(|_| KernelError::InvalidCapability)?;
+        for delegated in descendants.into_iter().flatten() {
+            self.revoke_capability_direct_in_task_cnode(delegated.tid, delegated.cap);
+        }
+        self.remove_delegation_links_for(root, descendants);
+        Ok(())
+    }
+
+    fn record_delegated_capability_link(
+        &mut self,
+        source_tid: u64,
+        source_cap: CapId,
+        dest_tid: u64,
+        dest_cap: CapId,
+    ) -> Result<(), KernelError> {
+        let links = kernel_mut(&mut self.delegated_capability_links);
+        if links.iter().flatten().any(|link| {
+            link.source_tid == source_tid
+                && link.source_cap == source_cap
+                && link.dest_tid == dest_tid
+                && link.dest_cap == dest_cap
+        }) {
+            return Ok(());
+        }
+        if let Some(slot) = links.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(DelegatedCapabilityLink {
+                source_tid,
+                source_cap,
+                dest_tid,
+                dest_cap,
+            });
+            Ok(())
+        } else {
+            Err(KernelError::CapabilityFull)
+        }
+    }
+
+    fn tid_for_cnode(&self, cnode: CNodeId) -> Option<u64> {
+        self.tcbs
+            .iter()
+            .flatten()
+            .find(|tcb| tcb.cnode == cnode)
+            .map(|tcb| tcb.tid.0)
+    }
+
+    fn revoke_capability_direct_in_task_cnode(&mut self, tid: u64, cap: CapId) {
+        if let Some(cnode) = self.task_cnode(tid)
+            && let Some(cspace) = self.cspace_for_cnode_mut(cnode)
+        {
+            let _ = cspace.revoke(cap);
+        }
+    }
+
+    fn contains_cap_ref(
+        set: &[Option<DelegatedCapRef>; MAX_DELEGATED_CAPABILITY_LINKS],
+        needle: DelegatedCapRef,
+    ) -> bool {
+        set.iter().flatten().any(|item| *item == needle)
+    }
+
+    fn collect_delegated_descendants(
+        &self,
+        root: DelegatedCapRef,
+    ) -> [Option<DelegatedCapRef>; MAX_DELEGATED_CAPABILITY_LINKS] {
+        let mut found = [None; MAX_DELEGATED_CAPABILITY_LINKS];
+        let mut queue = [None; MAX_DELEGATED_CAPABILITY_LINKS];
+        let mut found_len = 0usize;
+        let mut head = 0usize;
+        let mut tail = 0usize;
+        queue[tail] = Some(root);
+        tail += 1;
+        while head < tail {
+            let current = queue[head].expect("queue item");
+            head += 1;
+            for link in self.delegated_capability_links.iter().flatten() {
+                if link.source_tid != current.tid || link.source_cap != current.cap {
+                    continue;
+                }
+                let child = DelegatedCapRef {
+                    tid: link.dest_tid,
+                    cap: link.dest_cap,
+                };
+                if Self::contains_cap_ref(&found, child) {
+                    continue;
+                }
+                if found_len >= MAX_DELEGATED_CAPABILITY_LINKS
+                    || tail >= MAX_DELEGATED_CAPABILITY_LINKS
+                {
+                    break;
+                }
+                found[found_len] = Some(child);
+                found_len += 1;
+                queue[tail] = Some(child);
+                tail += 1;
+            }
+        }
+        found
+    }
+
+    fn remove_delegation_links_for(
+        &mut self,
+        root: DelegatedCapRef,
+        descendants: [Option<DelegatedCapRef>; MAX_DELEGATED_CAPABILITY_LINKS],
+    ) {
+        let links = kernel_mut(&mut self.delegated_capability_links);
+        for slot in links.iter_mut() {
+            let Some(link) = slot else {
+                continue;
+            };
+            let source = DelegatedCapRef {
+                tid: link.source_tid,
+                cap: link.source_cap,
+            };
+            let dest = DelegatedCapRef {
+                tid: link.dest_tid,
+                cap: link.dest_cap,
+            };
+            let involved = source == root
+                || dest == root
+                || Self::contains_cap_ref(&descendants, source)
+                || Self::contains_cap_ref(&descendants, dest);
+            if involved {
+                *slot = None;
+            }
+        }
     }
 
     fn capability_object_live(&self, object: CapObject) -> Option<()> {
@@ -1026,11 +1208,13 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
-        let payload = state.cspace.get(mem_cap).expect("payload");
-        let endpoint = state.cspace.get(send_cap).expect("send cap").object;
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
 
         let first = state
-            .stash_transfer_envelope(payload, endpoint, None)
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None)
             .expect("stash first");
         assert!(
             state
@@ -1044,7 +1228,7 @@ mod tests {
         );
 
         let second = state
-            .stash_transfer_envelope(payload, endpoint, None)
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None)
             .expect("stash second");
         assert_ne!(first, second);
         assert!(
@@ -1068,7 +1252,7 @@ mod tests {
         );
 
         let bound = state
-            .stash_transfer_envelope(payload, endpoint, Some(ThreadId(9)))
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, Some(ThreadId(9)))
             .expect("stash bound");
         assert!(
             state
@@ -1305,7 +1489,7 @@ mod tests {
         state.enqueue_current_cpu(1).expect("queue task 1");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let send_cap_task1 = state
-            .duplicate_global_capability_to_task(1, send_cap)
+            .grant_capability_task_to_task(0, send_cap, 1)
             .expect("dup send cap to task1");
 
         assert_eq!(state.current_tid(), Some(0));
@@ -1333,7 +1517,7 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("sync endpoint");
         let recv_cap_task1 = state
-            .duplicate_global_capability_to_task(1, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 1)
             .expect("dup recv cap to task1");
 
         let msg = Message::new(0, b"xy").expect("msg");
@@ -1364,10 +1548,10 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("sync endpoint");
         let send_cap_task1 = state
-            .duplicate_global_capability_to_task(1, send_cap)
+            .grant_capability_task_to_task(0, send_cap, 1)
             .expect("dup send cap to task1");
         let recv_cap_task3 = state
-            .duplicate_global_capability_to_task(3, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 3)
             .expect("dup recv cap to task3");
 
         state.enqueue_current_cpu(1).expect("queue task 1");
@@ -1420,7 +1604,7 @@ mod tests {
             .expect("control endpoint");
         let send_caps: [CapId; 4] = [1u64, 2, 3, 4].map(|tid| {
             control
-                .duplicate_global_capability_to_task(tid, send_cap)
+                .grant_capability_task_to_task(0, send_cap, tid)
                 .expect("dup send")
         });
         for tid in 1..=4u64 {
@@ -1450,7 +1634,7 @@ mod tests {
             .create_endpoint_with_class(EndpointClass::DataPlane, EndpointMode::Synchronous)
             .expect("data endpoint");
         let send_caps: [CapId; 5] = [1u64, 2, 3, 4, 5].map(|tid| {
-            data.duplicate_global_capability_to_task(tid, send_cap)
+            data.grant_capability_task_to_task(0, send_cap, tid)
                 .expect("dup send")
         });
         for tid in 1..=5u64 {
@@ -1602,6 +1786,154 @@ mod tests {
     }
 
     #[test]
+    fn grant_with_rights_attenuates_delegated_capability() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let cap = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::Kernel,
+                CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            ))
+            .expect("mint");
+        let delegated = state
+            .grant_capability_task_to_task_with_rights(0, cap, 1, CapRights::READ | CapRights::MAP)
+            .expect("grant");
+        let delegated_cap = state
+            .resolve_capability_for_task(1, delegated)
+            .expect("delegated cap");
+        assert!(delegated_cap.has_right(CapRights::READ));
+        assert!(delegated_cap.has_right(CapRights::MAP));
+        assert!(!delegated_cap.has_right(CapRights::WRITE));
+    }
+
+    #[test]
+    fn revoke_source_capability_cascades_to_delegated_descendants() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.register_task(2).expect("task2");
+        let root = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::Kernel,
+                CapRights::READ | CapRights::WRITE,
+            ))
+            .expect("root");
+        let delegated_task1 = state
+            .grant_capability_task_to_task_with_rights(0, root, 1, CapRights::READ)
+            .expect("delegate task1");
+        let delegated_task2 = state
+            .grant_capability_task_to_task_with_rights(1, delegated_task1, 2, CapRights::READ)
+            .expect("delegate task2");
+        assert!(
+            state
+                .resolve_capability_for_task(1, delegated_task1)
+                .is_ok()
+        );
+        assert!(
+            state
+                .resolve_capability_for_task(2, delegated_task2)
+                .is_ok()
+        );
+
+        let root_cnode = state.task_cnode(0).expect("root cnode");
+        assert_eq!(state.revoke_capability_in_cnode(root_cnode, root), Ok(()));
+        assert!(state.resolve_capability_for_task(0, root).is_err());
+        assert!(
+            state
+                .resolve_capability_for_task(1, delegated_task1)
+                .is_err()
+        );
+        assert!(
+            state
+                .resolve_capability_for_task(2, delegated_task2)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn source_revoke_cascades_to_multiple_direct_and_transitive_descendants() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.register_task(2).expect("task2");
+        state.register_task(3).expect("task3");
+
+        let root = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::Kernel,
+                CapRights::READ | CapRights::WRITE,
+            ))
+            .expect("root");
+        let direct_t1 = state
+            .grant_capability_task_to_task_with_rights(0, root, 1, CapRights::READ)
+            .expect("direct t1");
+        let direct_t2 = state
+            .grant_capability_task_to_task_with_rights(0, root, 2, CapRights::READ)
+            .expect("direct t2");
+        let transitive_t3 = state
+            .grant_capability_task_to_task_with_rights(1, direct_t1, 3, CapRights::READ)
+            .expect("transitive t3");
+
+        assert!(state.resolve_capability_for_task(1, direct_t1).is_ok());
+        assert!(state.resolve_capability_for_task(2, direct_t2).is_ok());
+        assert!(state.resolve_capability_for_task(3, transitive_t3).is_ok());
+
+        let root_cnode = state.task_cnode(0).expect("root cnode");
+        assert_eq!(state.revoke_capability_in_cnode(root_cnode, root), Ok(()));
+        assert!(state.resolve_capability_for_task(1, direct_t1).is_err());
+        assert!(state.resolve_capability_for_task(2, direct_t2).is_err());
+        assert!(state.resolve_capability_for_task(3, transitive_t3).is_err());
+    }
+
+    #[test]
+    fn source_revoke_only_impacts_delegated_descendants_not_unrelated_caps() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+
+        let root = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::Kernel,
+                CapRights::READ,
+            ))
+            .expect("root");
+        let delegated = state
+            .grant_capability_task_to_task_with_rights(0, root, 1, CapRights::READ)
+            .expect("delegated");
+        let unrelated = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::MemoryObject { id: 0xABCD },
+                CapRights::READ,
+            ))
+            .expect("unrelated");
+
+        let root_cnode = state.task_cnode(0).expect("root cnode");
+        assert_eq!(state.revoke_capability_in_cnode(root_cnode, root), Ok(()));
+        assert!(state.resolve_capability_for_task(1, delegated).is_err());
+        assert!(state.resolve_capability_for_task(0, unrelated).is_ok());
+    }
+
+    #[test]
+    fn invalid_source_revoke_does_not_revoke_delegated_descendants() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let root = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::Kernel,
+                CapRights::READ,
+            ))
+            .expect("root");
+        let delegated = state
+            .grant_capability_task_to_task_with_rights(0, root, 1, CapRights::READ)
+            .expect("delegate");
+        let root_cnode = state.task_cnode(0).expect("root cnode");
+        let bogus = CapId(root.0.wrapping_add(1));
+        assert_eq!(
+            state.revoke_capability_in_cnode(root_cnode, bogus),
+            Err(KernelError::InvalidCapability)
+        );
+        assert!(state.resolve_capability_for_task(0, root).is_ok());
+        assert!(state.resolve_capability_for_task(1, delegated).is_ok());
+    }
+
+    #[test]
     fn ipc_message_header_and_cap_transfer_metadata_are_preserved() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
@@ -1610,7 +1942,7 @@ mod tests {
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
         let recv_cap_task1 = state
-            .duplicate_global_capability_to_task(1, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 1)
             .expect("dup recv to task1");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
@@ -1864,7 +2196,7 @@ mod tests {
         let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         let recv_cap_task1 = state
-            .duplicate_global_capability_to_task(1, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 1)
             .expect("dup recv to task1");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
@@ -2047,7 +2379,7 @@ mod tests {
             state.create_endpoint(4).expect("handler endpoint");
         state.set_fault_handler(handler_recv).expect("set handler");
         let handler_recv_task1 = state
-            .duplicate_global_capability_to_task(1, handler_recv)
+            .grant_capability_task_to_task(0, handler_recv, 1)
             .expect("dup handler recv to task1");
 
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
@@ -2239,9 +2571,12 @@ mod tests {
             iova_len: crate::kernel::vm::PAGE_SIZE,
         };
 
-        let (irq_cap, dma_cap) = state.delegate_device_server_caps(plan).expect("delegate");
-        assert!(state.cspace.get(irq_cap).is_some());
-        assert!(state.cspace.get(dma_cap).is_some());
+        let (irq_cap, dma_cap, iova_cap) =
+            state.delegate_device_server_caps(plan).expect("delegate");
+        let driver_cnode = state.task_cnode(34).expect("driver cnode");
+        assert!(state.capability_for_cnode(driver_cnode, irq_cap).is_some());
+        assert!(state.capability_for_cnode(driver_cnode, dma_cap).is_some());
+        assert!(state.capability_for_cnode(driver_cnode, iova_cap).is_some());
         assert!(
             state
                 .validate_driver_dma_iova(
@@ -2263,10 +2598,10 @@ mod tests {
             .create_endpoint_with_mode(2, EndpointMode::Synchronous)
             .expect("endpoint");
         let recv_cap_task61 = state
-            .duplicate_global_capability_to_task(61, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 61)
             .expect("dup recv to task61");
         let send_cap_task60 = state
-            .duplicate_global_capability_to_task(60, send_cap)
+            .grant_capability_task_to_task(0, send_cap, 60)
             .expect("dup send to task60");
 
         state.enqueue_current_cpu(61).expect("enqueue receiver");
@@ -2313,7 +2648,7 @@ mod tests {
         assert_eq!(t.tasks.capacity, super::MAX_TASKS);
         assert_eq!(t.endpoints.used, 0);
         assert_eq!(t.notifications.used, 0);
-        assert!(t.capability_slots.used >= 1);
+        assert_eq!(t.capability_slots.used, 0);
         assert!(!t.tasks.near_full);
     }
 
@@ -2417,20 +2752,46 @@ mod tests {
                 server_tid: ThreadId(59),
                 irq_line: 12,
                 mem_cap,
+                dma_len: crate::kernel::vm::PAGE_SIZE,
                 iova_cap,
                 iova_base: crate::kernel::vm::PAGE_SIZE * 2,
                 iova_len: crate::kernel::vm::PAGE_SIZE,
             })
             .expect("bundle");
 
-        assert!(state.cspace.get(bundle.irq_cap).is_some());
-        assert!(state.cspace.get(bundle.dma_cap).is_some());
-        assert!(state.cspace.get(bundle.iova_cap).is_some());
+        let driver_cnode = state.task_cnode(59).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.irq_cap)
+                .is_some()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.dma_cap)
+                .is_some()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.iova_cap)
+                .is_some()
+        );
 
         state.revoke_driver_runtime_caps(59).expect("revoke");
-        assert!(state.cspace.get(bundle.irq_cap).is_none());
-        assert!(state.cspace.get(bundle.dma_cap).is_none());
-        assert!(state.cspace.get(bundle.iova_cap).is_none());
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.irq_cap)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.dma_cap)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.iova_cap)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2443,10 +2804,10 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
         let recv_cap_task81 = state
-            .duplicate_global_capability_to_task(81, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 81)
             .expect("dup recv to task81");
         let send_cap_task80 = state
-            .duplicate_global_capability_to_task(80, send_cap)
+            .grant_capability_task_to_task(0, send_cap, 80)
             .expect("dup send to task80");
 
         state.enqueue_current_cpu(81).expect("enqueue receiver");
@@ -2490,10 +2851,10 @@ mod tests {
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
         let recv_cap_task36 = state
-            .duplicate_global_capability_to_task(36, recv_cap)
+            .grant_capability_task_to_task(0, recv_cap, 36)
             .expect("dup recv to task36");
         let send_cap_task35 = state
-            .duplicate_global_capability_to_task(35, send_cap)
+            .grant_capability_task_to_task(0, send_cap, 35)
             .expect("dup send to task35");
 
         state.enqueue_current_cpu(36).expect("enqueue receiver");
@@ -2541,8 +2902,8 @@ mod tests {
 
         let irq_a = state.mint_irq_cap(10).expect("irq a");
         let irq_b = state.mint_irq_cap(11).expect("irq b");
-        state.grant_driver_irq(44, irq_a).expect("grant irq a");
-        state.grant_driver_irq(44, irq_b).expect("grant irq b");
+        let delegated_irq_a = state.grant_driver_irq(44, irq_a).expect("grant irq a");
+        let delegated_irq_b = state.grant_driver_irq(44, irq_b).expect("grant irq b");
 
         let (_id_a, mem_a) = state.alloc_anonymous_memory_object().expect("mem a");
         let (_id_b, mem_b) = state.alloc_anonymous_memory_object().expect("mem b");
@@ -2552,14 +2913,31 @@ mod tests {
         let dma_b = state
             .mint_dma_region_cap(mem_b, 0, crate::kernel::vm::PAGE_SIZE)
             .expect("dma b");
-        state.grant_driver_dma(44, dma_a).expect("grant dma a");
-        state.grant_driver_dma(44, dma_b).expect("grant dma b");
+        let delegated_dma_a = state.grant_driver_dma(44, dma_a).expect("grant dma a");
+        let delegated_dma_b = state.grant_driver_dma(44, dma_b).expect("grant dma b");
 
         state.revoke_driver_runtime_caps(44).expect("revoke");
-        assert!(state.cspace.get(irq_a).is_none());
-        assert!(state.cspace.get(irq_b).is_none());
-        assert!(state.cspace.get(dma_a).is_none());
-        assert!(state.cspace.get(dma_b).is_none());
+        let driver_cnode = state.task_cnode(44).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_irq_a)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_irq_b)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_dma_a)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_dma_b)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2786,27 +3164,40 @@ mod tests {
     }
 
     #[test]
-    fn revoke_driver_runtime_caps_revokes_from_cspace() {
+    fn revoke_driver_runtime_caps_revokes_from_driver_cnode() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(32).expect("task");
         state.register_driver(32).expect("driver");
 
         let irq = state.mint_irq_cap(4).expect("irq");
-        state.grant_driver_irq(32, irq).expect("grant irq");
+        let delegated_irq = state.grant_driver_irq(32, irq).expect("grant irq");
 
         let (_id, mem) = state.alloc_anonymous_memory_object().expect("mem");
         let dma = state
             .mint_dma_region_cap(mem, 0, crate::kernel::vm::PAGE_SIZE)
             .expect("dma");
-        state.grant_driver_dma(32, dma).expect("grant dma");
+        let delegated_dma = state.grant_driver_dma(32, dma).expect("grant dma");
 
         let iova = state.create_iova_space_cap().expect("iova");
-        state.grant_driver_iova_space(32, iova).expect("grant iova");
+        let delegated_iova = state.grant_driver_iova_space(32, iova).expect("grant iova");
 
         state.revoke_driver_runtime_caps(32).expect("revoke");
-        assert!(state.cspace.get(irq).is_none());
-        assert!(state.cspace.get(dma).is_none());
-        assert!(state.cspace.get(iova).is_none());
+        let driver_cnode = state.task_cnode(32).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_irq)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_dma)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_iova)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2816,14 +3207,16 @@ mod tests {
         state.register_driver(33).expect("driver");
 
         let irq = state.mint_irq_cap(8).expect("irq");
-        state.grant_driver_irq(33, irq).expect("grant irq");
+        let delegated_irq = state.grant_driver_irq(33, irq).expect("grant irq");
         state.revoke_driver_runtime_caps(33).expect("revoke");
 
-        assert!(state.cspace.get(irq).is_none());
-        assert_eq!(
-            state.grant_driver_irq(33, irq),
-            Err(KernelError::InvalidCapability)
+        let driver_cnode = state.task_cnode(33).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_irq)
+                .is_none()
         );
+        assert!(state.grant_driver_irq(33, irq).is_ok());
     }
 
     #[test]
@@ -2840,15 +3233,26 @@ mod tests {
                 ThreadId(111),
                 14,
                 mem_cap,
+                crate::kernel::vm::PAGE_SIZE,
                 iova_cap,
+                crate::kernel::vm::PAGE_SIZE * 4,
                 crate::kernel::vm::PAGE_SIZE * 4,
             ))
             .expect("first bundle");
         state
             .validate_driver_bundle_live(111, first_bundle)
             .expect("bundle live");
-        assert!(state.cspace.get(first_bundle.irq_cap).is_some());
-        assert!(state.cspace.get(first_bundle.dma_cap).is_some());
+        let driver_cnode = state.task_cnode(111).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
+                .is_some()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
+                .is_some()
+        );
 
         let token = state.exit_task(111, 5).expect("exit");
         state.restart_task(111, token).expect("restart");
@@ -2857,14 +3261,27 @@ mod tests {
             state.validate_driver_bundle_live(111, first_bundle),
             Err(KernelError::StaleCapability)
         );
-        assert!(state.cspace.get(first_bundle.irq_cap).is_none());
-        assert!(state.cspace.get(first_bundle.dma_cap).is_none());
-        assert_eq!(
-            state.grant_driver_irq(111, first_bundle.irq_cap),
-            Err(KernelError::InvalidCapability)
+        let driver_cnode = state.task_cnode(111).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
+                .is_none()
         );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
+                .is_none()
+        );
+        assert!(matches!(
+            state.grant_driver_irq(111, first_bundle.irq_cap),
+            Err(KernelError::InvalidCapability | KernelError::WrongObject)
+        ));
 
-        assert!(state.cspace.get(iova_cap).is_none());
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, first_bundle.iova_cap)
+                .is_none()
+        );
         let iova_cap2 = state.create_iova_space_cap().expect("iova2");
 
         let second_bundle = state
@@ -2872,8 +3289,10 @@ mod tests {
                 ThreadId(111),
                 14,
                 mem_cap,
+                crate::kernel::vm::PAGE_SIZE,
                 iova_cap2,
                 crate::kernel::vm::PAGE_SIZE * 4,
+                crate::kernel::vm::PAGE_SIZE * 2,
             ))
             .expect("second bundle");
         state
@@ -2882,8 +3301,17 @@ mod tests {
 
         assert_ne!(first_bundle.irq_cap, second_bundle.irq_cap);
         assert_ne!(first_bundle.dma_cap, second_bundle.dma_cap);
-        assert!(state.cspace.get(second_bundle.irq_cap).is_some());
-        assert!(state.cspace.get(second_bundle.dma_cap).is_some());
+        let driver_cnode = state.task_cnode(111).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, second_bundle.irq_cap)
+                .is_some()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, second_bundle.dma_cap)
+                .is_some()
+        );
     }
 
     #[test]
@@ -3139,7 +3567,7 @@ mod tests {
     }
 
     #[test]
-    fn global_cspace_access_is_routed_through_kernel_global_helpers() {
+    fn direct_legacy_global_cspace_access_patterns_are_forbidden() {
         fn visit_rs_files(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
             let entries = std::fs::read_dir(root).expect("read_dir");
             for entry in entries {
@@ -3166,7 +3594,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned();
             if rel == "src/kernel/boot/mod.rs" {
-                // Contains canonical helper and this guard test's own pattern literals.
+                // Contains this guard test's own pattern literals.
                 return;
             }
             for pattern in [
@@ -3185,7 +3613,7 @@ mod tests {
 
         if !offenders.is_empty() {
             panic!(
-                "direct self.cspace access found outside allowed helpers:\n{}",
+                "legacy self.cspace access pattern found in runtime code:\n{}",
                 offenders.join("\n")
             );
         }
