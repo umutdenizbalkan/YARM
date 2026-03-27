@@ -5,7 +5,7 @@ use crate::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 use crate::services::common::service::FsService;
 use crate::services::control_plane::process_manager::service::run_request_loop as run_process_manager_request_loop;
 use crate::services::control_plane::supervisor::SupervisorService;
-use crate::services::control_plane::vfs::service::run_request_loop as run_vfs_request_loop;
+use crate::services::control_plane::vfs::service::run_request_loop_over_kernel_ipc as run_vfs_request_loop;
 use crate::services::fs::devfs::service::run_request_loop as run_devfs_request_loop;
 use crate::services::fs::devfs::{DevFsBackend, DevFsService};
 use crate::services::fs::initramfs::service::run_request_loop as run_initramfs_request_loop;
@@ -127,8 +127,8 @@ pub fn run_minimum_profile_with_kernel(
         .map_err(|_| KernelError::WrongObject)?;
 
     let mut control_vfs = FsService::with_backend(InMemoryBackend::new());
-    let control_vfs_summary =
-        run_vfs_request_loop(&mut control_vfs, 0x1000).map_err(|_| KernelError::WrongObject)?;
+    let control_vfs_summary = run_vfs_request_loop(kernel, &mut control_vfs, 0x1000)
+        .map_err(|_| KernelError::WrongObject)?;
 
     let mut devfs = DevFsService::with_backend(DevFsBackend::default());
     let devfs_summary = run_devfs_request_loop(&mut devfs).map_err(|_| KernelError::WrongObject)?;

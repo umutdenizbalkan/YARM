@@ -1,3 +1,5 @@
+use crate::kernel::boot::KernelState;
+use crate::kernel::capabilities::CapId;
 use crate::kernel::vfs::VfsError;
 use crate::kernel::vfs::{
     InMemoryBackend, OpenAtRequest, ReadWriteRequest, StatxRequest, close_message, dup_message,
@@ -90,6 +92,126 @@ pub fn run_request_loop(
     })
 }
 
+fn map_kernel_ipc_err<T>(
+    result: Result<T, crate::kernel::boot::KernelError>,
+) -> Result<T, VfsError> {
+    result.map_err(|_| VfsError::Unsupported)
+}
+
+fn roundtrip_ipc(
+    kernel: &mut KernelState,
+    vfs: &mut FsService<InMemoryBackend>,
+    client_send_cap: CapId,
+    server_recv_cap: CapId,
+    server_send_cap: CapId,
+    client_recv_cap: CapId,
+    request: crate::kernel::ipc::Message,
+) -> Result<crate::kernel::ipc::Message, VfsError> {
+    map_kernel_ipc_err(kernel.ipc_send(client_send_cap, request))?;
+    let request_for_server =
+        map_kernel_ipc_err(kernel.ipc_recv(server_recv_cap))?.ok_or(VfsError::Malformed)?;
+    let response = vfs.handle(request_for_server)?;
+    map_kernel_ipc_err(kernel.ipc_send(server_send_cap, response))?;
+    map_kernel_ipc_err(kernel.ipc_recv(client_recv_cap))?.ok_or(VfsError::Malformed)
+}
+
+pub fn run_request_loop_over_kernel_ipc(
+    kernel: &mut KernelState,
+    vfs: &mut FsService<InMemoryBackend>,
+    path_ptr: u64,
+) -> Result<VfsLoopSummary, VfsError> {
+    let (_, client_send_cap, server_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(16))?;
+    let (_, server_send_cap, client_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(16))?;
+
+    let open_reply = roundtrip_ipc(
+        kernel,
+        vfs,
+        client_send_cap,
+        server_recv_cap,
+        server_send_cap,
+        client_recv_cap,
+        openat_message(OpenAtRequest {
+            dirfd: 0,
+            path_ptr,
+            flags: 0,
+            mode: 0,
+        })
+        .map_err(|_| VfsError::Malformed)?,
+    )?;
+    let fd = decode_fd_reply(open_reply)?;
+
+    let dup_fd = decode_fd_reply(roundtrip_ipc(
+        kernel,
+        vfs,
+        client_send_cap,
+        server_recv_cap,
+        server_send_cap,
+        client_recv_cap,
+        dup_message(fd).map_err(|_| VfsError::Malformed)?,
+    )?)?;
+
+    let epoll_fd = decode_fd_reply(roundtrip_ipc(
+        kernel,
+        vfs,
+        client_send_cap,
+        server_recv_cap,
+        server_send_cap,
+        client_recv_cap,
+        epoll_create1_message(0).map_err(|_| VfsError::Malformed)?,
+    )?)?;
+
+    let requests = [
+        read_message(ReadWriteRequest {
+            fd,
+            buf_ptr: 0x2000,
+            len: 64,
+        })
+        .map_err(|_| VfsError::Malformed)?,
+        write_message(ReadWriteRequest {
+            fd,
+            buf_ptr: 0x3000,
+            len: 32,
+        })
+        .map_err(|_| VfsError::Malformed)?,
+        statx_message(StatxRequest {
+            dirfd: 0,
+            path_ptr,
+            flags: 0,
+            mask_or_buf: 0,
+        })
+        .map_err(|_| VfsError::Malformed)?,
+        ioctl_message(fd, 0x1234, 0x55).map_err(|_| VfsError::Malformed)?,
+        fcntl_message(fd, 3, 9).map_err(|_| VfsError::Malformed)?,
+        poll_message(0x9000, 2, 10).map_err(|_| VfsError::Malformed)?,
+        epoll_ctl_message(epoll_fd, 1, fd, 0xA000).map_err(|_| VfsError::Malformed)?,
+        epoll_pwait_message(epoll_fd, 0xB000, 4, 10).map_err(|_| VfsError::Malformed)?,
+        sendfile_message(fd, dup_fd, 0xC000, 99).map_err(|_| VfsError::Malformed)?,
+        close_message(crate::kernel::vfs::CloseRequest { fd: dup_fd })
+            .map_err(|_| VfsError::Malformed)?,
+        close_message(crate::kernel::vfs::CloseRequest { fd }).map_err(|_| VfsError::Malformed)?,
+        close_message(crate::kernel::vfs::CloseRequest { fd: epoll_fd })
+            .map_err(|_| VfsError::Malformed)?,
+    ];
+    for request in requests {
+        let _ = roundtrip_ipc(
+            kernel,
+            vfs,
+            client_send_cap,
+            server_recv_cap,
+            server_send_cap,
+            client_recv_cap,
+            request,
+        )?;
+    }
+
+    Ok(VfsLoopSummary {
+        fd,
+        dup_fd,
+        epoll_fd,
+        handled: vfs.handled_count(),
+    })
+}
+
 pub fn run() {
     let mut vfs = FsService::with_backend(InMemoryBackend::new());
     let summary = run_request_loop(&mut vfs, 0x1000).expect("vfs loop");
@@ -106,11 +228,25 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::boot::Bootstrap;
 
     #[test]
     fn vfs_request_loop_entrypoint_opens_one_fd() {
         let mut vfs = FsService::with_backend(InMemoryBackend::new());
         let summary = run_request_loop(&mut vfs, 0x1010).expect("loop");
+
+        assert_eq!(summary.fd, 3);
+        assert_eq!(summary.dup_fd, 4);
+        assert_eq!(summary.epoll_fd, 5);
+        assert_eq!(summary.handled, 15);
+    }
+
+    #[test]
+    fn vfs_request_loop_can_roundtrip_over_kernel_ipc() {
+        let mut kernel = Bootstrap::init().expect("kernel init");
+        let mut vfs = FsService::with_backend(InMemoryBackend::new());
+        let summary =
+            run_request_loop_over_kernel_ipc(&mut kernel, &mut vfs, 0x1010).expect("loop");
 
         assert_eq!(summary.fd, 3);
         assert_eq!(summary.dup_fd, 4);
