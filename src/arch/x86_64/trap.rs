@@ -80,6 +80,7 @@ pub fn handle_trap_entry(
     context: X86TrapContext,
     mut frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
+    super::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
     // NOTE(arch/x86_64): This Rust entrypoint expects architecture-specific IDT setup
     // and assembly prologue/epilogue glue to populate `X86TrapContext` and `TrapFrame`.
     // Until those stubs are wired, tests exercise this path by constructing contexts directly.

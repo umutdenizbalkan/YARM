@@ -33,13 +33,17 @@ boot_pdpt:
 
     .align 4096
 boot_pd:
+    // Hardening tranche (stage 1):
+    // - shrink early identity map footprint from 512MiB to 64MiB
+    // - keep huge-page bootstrap simplicity while reducing writable surface
+    // Future tranche: split boot mapping into RX text + RW data/stack and set NX.
     .set page_flags, 0x83
     .set page_index, 0
-    .rept 256
+    .rept 32
     .quad (page_index * 0x200000) | page_flags
     .set page_index, page_index + 1
     .endr
-    .zero 2048
+    .zero 3840
 
     .align 8
 gdt64:
