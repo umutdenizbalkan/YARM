@@ -1,6 +1,6 @@
 use super::{
-    map_ipc_error, IpcFastpathResult, KernelError, KernelState, NotificationObject,
-    MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, SenderWaiter,
+    IpcFastpathResult, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
+    NotificationObject, SenderWaiter, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointClass, EndpointMode, Message, ThreadId};
@@ -175,7 +175,11 @@ impl KernelState {
         &mut self,
         max_depth: usize,
     ) -> Result<(usize, CapId, CapId), KernelError> {
-        self.create_endpoint_with_mode_and_class(max_depth, EndpointMode::Buffered, EndpointClass::DataPlane)
+        self.create_endpoint_with_mode_and_class(
+            max_depth,
+            EndpointMode::Buffered,
+            EndpointClass::DataPlane,
+        )
     }
 
     pub fn create_endpoint_with_mode(

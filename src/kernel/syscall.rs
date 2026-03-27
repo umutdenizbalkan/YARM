@@ -1,7 +1,7 @@
 use super::boot::{KernelError, KernelState};
 use super::capabilities::{CapId, CapObject, CapRights};
 use super::ipc::{
-    pack_register_payload, unpack_register_payload, Message, SharedMemoryRegion, IPC_REGISTER_BYTES,
+    IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
 };
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;

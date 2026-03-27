@@ -185,7 +185,10 @@ impl Default for CapabilitySpace {
 
 impl CapabilitySpace {
     pub fn occupied_slots(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.entry.is_some()).count()
+        self.slots
+            .iter()
+            .filter(|slot| slot.entry.is_some())
+            .count()
     }
 
     pub fn mint(&mut self, capability: Capability) -> Result<CapId, CapabilityDeriveError> {

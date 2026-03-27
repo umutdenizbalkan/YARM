@@ -5,13 +5,13 @@ mod policy;
 use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use crate::kernel::capabilities::{CapId, CapRights};
 use crate::kernel::supervisor_abi::{
-    register_core_service_message, register_driver_message, RegisterCoreServiceRequest,
-    RegisterDriverRequest, TaskExitedEvent,
+    RegisterCoreServiceRequest, RegisterDriverRequest, TaskExitedEvent,
+    register_core_service_message, register_driver_message,
 };
 use crate::kernel::task::TaskClass;
 use crate::kernel::task::TaskStatus;
 use crate::kernel::vfs::{
-    openat_message, statx_message, write_message, OpenAtRequest, ReadWriteRequest, StatxRequest,
+    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
 use crate::kernel::vm::Asid;
 use crate::services::fs::devfs::service::run_request_loop as run_devfs_request_loop;
@@ -423,7 +423,7 @@ impl InitService {
         kernel: &mut KernelState,
     ) -> Result<usize, KernelError> {
         use crate::kernel::supervisor_abi::{
-            CoreServiceRegistrationKind, RegisterCoreServiceRequest, DEP_VFS,
+            CoreServiceRegistrationKind, DEP_VFS, RegisterCoreServiceRequest,
         };
 
         let proc_tid = self
@@ -1094,9 +1094,10 @@ mod tests {
             .expect("seed");
         init.begin_running(&state).expect("running");
         let token = state.exit_task(4, 99).expect("exit");
-        assert!(init
-            .recover_supervisor_failure(&mut state, token)
-            .expect("recover"));
+        assert!(
+            init.recover_supervisor_failure(&mut state, token)
+                .expect("recover")
+        );
         assert_eq!(
             state.task_status(4),
             Some(crate::kernel::task::TaskStatus::Runnable)
@@ -1131,9 +1132,10 @@ mod tests {
             .expect("seed");
         init.begin_running(&state).expect("running");
         let token = state.exit_task(2, 44).expect("exit");
-        assert!(init
-            .recover_core_service_failure(&mut state, CoreServiceKind::ProcessManager, token)
-            .expect("recover"));
+        assert!(
+            init.recover_core_service_failure(&mut state, CoreServiceKind::ProcessManager, token)
+                .expect("recover")
+        );
         assert_eq!(
             state.task_status(2),
             Some(crate::kernel::task::TaskStatus::Runnable)
@@ -1169,9 +1171,10 @@ mod tests {
         init.begin_running(&state).expect("running");
         let _ = handoff;
         let token = state.exit_task(3, 12).expect("exit");
-        assert!(init
-            .recover_core_service_failure(&mut state, CoreServiceKind::Vfs, token)
-            .expect("recover"));
+        assert!(
+            init.recover_core_service_failure(&mut state, CoreServiceKind::Vfs, token)
+                .expect("recover")
+        );
         assert_eq!(
             state.task_status(3),
             Some(crate::kernel::task::TaskStatus::Runnable)

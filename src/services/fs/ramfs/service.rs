@@ -104,10 +104,11 @@ mod tests {
     use super::*;
     use crate::kernel::ipc::Message;
     use crate::kernel::vfs::{
-        CloseRequest, MountNamespacePolicy, MountRouter, VfsService, close_message, openat_message,
+        CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_message,
         statx_message,
     };
     use crate::kernel::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT};
+    use crate::services::common::vfs_service::VfsService;
     use crate::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 
     #[test]

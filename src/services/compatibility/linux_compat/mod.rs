@@ -85,7 +85,9 @@ impl LinuxServiceBindings {
         request_send_cap: CapId,
         reply_recv_cap: CapId,
     ) -> Result<(), KernelError> {
-        let cnode = kernel.current_task_cnode().ok_or(KernelError::TaskMissing)?;
+        let cnode = kernel
+            .current_task_cnode()
+            .ok_or(KernelError::TaskMissing)?;
         if !kernel.cnode_capability_has_right(
             cnode,
             request_send_cap,
@@ -111,7 +113,9 @@ impl LinuxServiceBindings {
         request_send_cap: CapId,
         reply_recv_cap: CapId,
     ) -> Result<(), KernelError> {
-        let cnode = kernel.current_task_cnode().ok_or(KernelError::TaskMissing)?;
+        let cnode = kernel
+            .current_task_cnode()
+            .ok_or(KernelError::TaskMissing)?;
         if !kernel.cnode_capability_has_right(
             cnode,
             request_send_cap,

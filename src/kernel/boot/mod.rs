@@ -10,9 +10,9 @@ mod thread_state;
 mod user_memory_state;
 
 use super::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability, CapabilitySpace};
+use super::ipc::{Endpoint, IpcError, Message};
 #[cfg(test)]
 use super::ipc::{EndpointClass, EndpointMode};
-use super::ipc::{Endpoint, IpcError, Message};
 use super::scheduler::{CpuId, SchedulerError, SmpScheduler};
 use super::scheduler_timer::Timer;
 use super::smp::SmpMailbox;
@@ -448,10 +448,7 @@ impl Bootstrap {
                 cross_cpu_work: SmpMailbox::default(),
                 endpoints: [const { None }; MAX_ENDPOINTS],
                 endpoint_waiters: [None; MAX_ENDPOINTS],
-                endpoint_sender_waiters: [
-                    [None; MAX_ENDPOINT_SENDER_WAITERS];
-                    MAX_ENDPOINTS
-                ],
+                endpoint_sender_waiters: [[None; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
                 endpoint_generations: [0; MAX_ENDPOINTS],
                 notifications: [const { None }; MAX_NOTIFICATIONS],
                 notification_generations: [0; MAX_NOTIFICATIONS],
@@ -1035,40 +1032,54 @@ mod tests {
         let first = state
             .stash_transfer_envelope(payload, endpoint, None)
             .expect("stash first");
-        assert!(state
-            .take_transfer_envelope(first, endpoint, ThreadId(0))
-            .is_some());
-        assert!(state
-            .take_transfer_envelope(first, endpoint, ThreadId(0))
-            .is_none());
+        assert!(
+            state
+                .take_transfer_envelope(first, endpoint, ThreadId(0))
+                .is_some()
+        );
+        assert!(
+            state
+                .take_transfer_envelope(first, endpoint, ThreadId(0))
+                .is_none()
+        );
 
         let second = state
             .stash_transfer_envelope(payload, endpoint, None)
             .expect("stash second");
         assert_ne!(first, second);
-        assert!(state
-            .take_transfer_envelope(first, endpoint, ThreadId(0))
-            .is_none());
+        assert!(
+            state
+                .take_transfer_envelope(first, endpoint, ThreadId(0))
+                .is_none()
+        );
         let wrong_endpoint = CapObject::Endpoint {
             index: usize::MAX,
             generation: 1,
         };
-        assert!(state
-            .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
-            .is_none());
-        assert!(state
-            .take_transfer_envelope(second, endpoint, ThreadId(0))
-            .is_some());
+        assert!(
+            state
+                .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
+                .is_none()
+        );
+        assert!(
+            state
+                .take_transfer_envelope(second, endpoint, ThreadId(0))
+                .is_some()
+        );
 
         let bound = state
             .stash_transfer_envelope(payload, endpoint, Some(ThreadId(9)))
             .expect("stash bound");
-        assert!(state
-            .take_transfer_envelope(bound, endpoint, ThreadId(8))
-            .is_none());
-        assert!(state
-            .take_transfer_envelope(bound, endpoint, ThreadId(9))
-            .is_some());
+        assert!(
+            state
+                .take_transfer_envelope(bound, endpoint, ThreadId(8))
+                .is_none()
+        );
+        assert!(
+            state
+                .take_transfer_envelope(bound, endpoint, ThreadId(9))
+                .is_some()
+        );
     }
 
     #[test]
@@ -1378,14 +1389,22 @@ mod tests {
         );
         assert_eq!(
             state.task_status(1),
-            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap_task1)))
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(
+                send_cap_task1
+            )))
         );
 
         state.yield_current().expect("switch to receiver");
         assert_eq!(state.current_tid(), Some(3));
 
-        let first = state.ipc_recv(recv_cap_task3).expect("recv1").expect("msg1");
-        let second = state.ipc_recv(recv_cap_task3).expect("recv2").expect("msg2");
+        let first = state
+            .ipc_recv(recv_cap_task3)
+            .expect("recv1")
+            .expect("msg1");
+        let second = state
+            .ipc_recv(recv_cap_task3)
+            .expect("recv2")
+            .expect("msg2");
         assert_eq!(first.as_slice(), b"m0");
         assert_eq!(second.as_slice(), b"m1");
     }
@@ -1567,11 +1586,13 @@ mod tests {
                 .revoke(cap),
             Ok(())
         );
-        assert!(state
-            .cspace_for_cnode(cnode1)
-            .expect("cspace1")
-            .get(cap)
-            .is_none());
+        assert!(
+            state
+                .cspace_for_cnode(cnode1)
+                .expect("cspace1")
+                .get(cap)
+                .is_none()
+        );
         let remaining = state
             .cspace_for_cnode(cnode2)
             .expect("cspace2")
@@ -2221,13 +2242,15 @@ mod tests {
         let (irq_cap, dma_cap) = state.delegate_device_server_caps(plan).expect("delegate");
         assert!(state.cspace.get(irq_cap).is_some());
         assert!(state.cspace.get(dma_cap).is_some());
-        assert!(state
-            .validate_driver_dma_iova(
-                34,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE,
-            )
-            .is_ok());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    34,
+                    crate::kernel::vm::PAGE_SIZE * 8,
+                    crate::kernel::vm::PAGE_SIZE,
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2585,16 +2608,22 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
 
-        assert!(state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
-            .is_ok());
-        assert!(state
-            .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
-            .is_err());
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+                .is_ok()
+        );
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
+                .is_err()
+        );
         assert!(state.mint_dma_region_cap(mem_cap, 0, 0).is_err());
-        assert!(state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-            .is_err());
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2611,15 +2640,29 @@ mod tests {
             .expect("memory object present");
         entry.len = crate::kernel::vm::PAGE_SIZE * 4;
 
-        assert!(state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-            .is_ok());
-        assert!(state
-            .mint_dma_region_cap(mem_cap, crate::kernel::vm::PAGE_SIZE * 3, crate::kernel::vm::PAGE_SIZE)
-            .is_ok());
-        assert!(state
-            .mint_dma_region_cap(mem_cap, crate::kernel::vm::PAGE_SIZE * 3, crate::kernel::vm::PAGE_SIZE * 2)
-            .is_err());
+        assert!(
+            state
+                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+                .is_ok()
+        );
+        assert!(
+            state
+                .mint_dma_region_cap(
+                    mem_cap,
+                    crate::kernel::vm::PAGE_SIZE * 3,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_ok()
+        );
+        assert!(
+            state
+                .mint_dma_region_cap(
+                    mem_cap,
+                    crate::kernel::vm::PAGE_SIZE * 3,
+                    crate::kernel::vm::PAGE_SIZE * 2
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -2694,13 +2737,15 @@ mod tests {
         let token = state.exit_task(22, 1).expect("exit");
         state.restart_task(22, token).expect("restart");
 
-        assert!(state
-            .validate_driver_dma_iova(
-                22,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    22,
+                    crate::kernel::vm::PAGE_SIZE * 8,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -2718,22 +2763,26 @@ mod tests {
                 crate::kernel::vm::PAGE_SIZE,
             )
             .expect("window");
-        assert!(state
-            .validate_driver_dma_iova(
-                31,
-                crate::kernel::vm::PAGE_SIZE * 2,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    31,
+                    crate::kernel::vm::PAGE_SIZE * 2,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_ok()
+        );
 
         state.detach_driver_iova_space(31).expect("detach");
-        assert!(state
-            .validate_driver_dma_iova(
-                31,
-                crate::kernel::vm::PAGE_SIZE * 2,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    31,
+                    crate::kernel::vm::PAGE_SIZE * 2,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -2855,20 +2904,24 @@ mod tests {
             )
             .expect("window");
 
-        assert!(state
-            .validate_driver_dma_iova(
-                12,
-                crate::kernel::vm::PAGE_SIZE * 4,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok());
-        assert!(state
-            .validate_driver_dma_iova(
-                12,
-                crate::kernel::vm::PAGE_SIZE * 3,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err());
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    12,
+                    crate::kernel::vm::PAGE_SIZE * 4,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_ok()
+        );
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    12,
+                    crate::kernel::vm::PAGE_SIZE * 3,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_err()
+        );
     }
 
     #[test]

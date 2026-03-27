@@ -7,10 +7,11 @@ use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Arg
 use yarm::kernel::supervisor_abi::{DEP_PROCESS_MANAGER, DEP_VFS, RegisterDriverRequest};
 use yarm::kernel::task::TaskClass;
 use yarm::kernel::vfs::{
-    MountNamespacePolicy, MountRouter, OpenAtRequest, ReadWriteRequest, VfsError, VfsService,
-    openat_message, read_message,
+    MountNamespacePolicy, MountRouter, OpenAtRequest, ReadWriteRequest, VfsError, openat_message,
+    read_message,
 };
 use yarm::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
+use yarm::services::common::vfs_service::VfsService;
 use yarm::services::control_plane::supervisor::SupervisorService;
 use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 use yarm::services::fs::ramfs::RamFsBackend;

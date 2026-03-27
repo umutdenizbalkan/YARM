@@ -5,9 +5,8 @@ use yarm::kernel::boot::Bootstrap;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
-use yarm::kernel::vfs::{
-    OpenAtRequest, ReadWriteRequest, VfsService, openat_message, read_message,
-};
+use yarm::kernel::vfs::{OpenAtRequest, ReadWriteRequest, openat_message, read_message};
+use yarm::services::common::vfs_service::VfsService;
 use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 
 #[inline]
