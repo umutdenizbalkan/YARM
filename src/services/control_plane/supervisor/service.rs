@@ -323,7 +323,7 @@ impl SupervisorService {
                     DriverRecoveryPlan {
                         irq_line: req.irq_line,
                         mem_cap: CapId(req.mem_cap),
-                        dma_len: req.iova_len as usize,
+                        dma_len: req.dma_len as usize,
                         iova_cap: CapId(req.iova_cap),
                         iova_base: req.iova_base as usize,
                         iova_len: req.iova_len as usize,
@@ -774,6 +774,7 @@ mod tests {
                 mem_cap: mem.0,
                 iova_cap: iova.0,
                 iova_base: 0x4000,
+                dma_len: PAGE_SIZE as u64,
                 iova_len: PAGE_SIZE as u64,
             },
         )
@@ -908,6 +909,7 @@ mod tests {
                 mem_cap: mem.0,
                 iova_cap: iova.0,
                 iova_base: 0x4000,
+                dma_len: PAGE_SIZE as u64,
                 iova_len: PAGE_SIZE as u64,
             },
         )

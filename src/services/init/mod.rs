@@ -1329,6 +1329,7 @@ mod tests {
                 mem_cap: mem.0,
                 iova_cap: iova.0,
                 iova_base: 0x4000,
+                dma_len: crate::kernel::vm::PAGE_SIZE as u64,
                 iova_len: crate::kernel::vm::PAGE_SIZE as u64,
             },
         )

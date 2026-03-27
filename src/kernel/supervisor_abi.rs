@@ -215,6 +215,10 @@ pub struct RegisterDriverRequest {
     pub mem_cap: u64,
     pub iova_cap: u64,
     pub iova_base: u64,
+    // NOTE: wire format currently carries one length lane (`iova_len`).
+    // `dma_len` is kept in the host-side struct for explicit callsite intent
+    // and currently aliases to `iova_len` in encode/decode.
+    pub dma_len: u64,
     pub iova_len: u64,
 }
 
@@ -249,7 +253,7 @@ impl RegisterDriverRequest {
     }
 
     pub fn decode(payload: &[u8]) -> Option<Self> {
-        if payload.len() < Self::ENCODED_LEN {
+        if payload.len() < 56 {
             return None;
         }
         let mut tid = [0u8; 8];
@@ -274,6 +278,7 @@ impl RegisterDriverRequest {
             mem_cap: u64::from_le_bytes(mem_cap),
             iova_cap: u64::from_le_bytes(iova_cap),
             iova_base: u64::from_le_bytes(iova_base),
+            dma_len: u64::from_le_bytes(iova_len),
             iova_len: u64::from_le_bytes(iova_len),
         })
     }
