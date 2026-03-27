@@ -54,7 +54,7 @@ impl KernelState {
         let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self
             .capability_service_mut()
-            .grant_task_to_task(source_tid, irq_cap, tid)?;
+            .grant_task_to_task_with_rights(source_tid, irq_cap, tid, CapRights::SIGNAL)?;
         let record = self
             .drivers
             .driver_records
@@ -106,7 +106,7 @@ impl KernelState {
         let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self
             .capability_service_mut()
-            .grant_task_to_task(source_tid, iova_cap, tid)?;
+            .grant_task_to_task_with_rights(source_tid, iova_cap, tid, CapRights::MAP)?;
         let record = self
             .drivers
             .driver_records
@@ -186,7 +186,12 @@ impl KernelState {
         let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self
             .capability_service_mut()
-            .grant_task_to_task(source_tid, dma_cap, tid)?;
+            .grant_task_to_task_with_rights(
+                source_tid,
+                dma_cap,
+                tid,
+                CapRights::MAP | CapRights::READ | CapRights::WRITE,
+            )?;
         let record = self
             .drivers
             .driver_records
