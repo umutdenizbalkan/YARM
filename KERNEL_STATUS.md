@@ -7,6 +7,8 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
 - **Unsupported ISA guardrails tightened:** architecture facade fallbacks now fail fast with `compile_error!` for unsupported `target_arch` values instead of silently selecting a RISC-V path.
 - **Trap decode correctness improved:** unknown architecture trap codes are normalized as `TrapEvent::Unknown { arch_code }` instead of being coerced into external IRQ semantics.
 - **Per-CPU TLS restore observability:** architecture trap paths now expose CPU-indexed TLS-restore slots and include isolation tests to verify CPU-local behavior.
+- **External IRQ completion plumbing added:** external IRQ trap handling now saves/restores interrupt state around routing and calls an ISA-selected `external_irq_eoi` hook for controller completion handoff.
+- **Remaining hardware integration work tracked:** x86 APIC / aarch64 GIC / riscv64 PLIC register-level EOI completion in ISA IRQ backends remains TODO.
 
 ## In-kernel mechanism status
 

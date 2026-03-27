@@ -5,15 +5,16 @@ use super::ipc::{
 };
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
-use super::vm::VirtAddr;
+use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
 
-pub const SYSCALL_ABI_VERSION: u16 = 3;
+pub const SYSCALL_ABI_VERSION: u16 = 4;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
-pub const SYSCALL_COUNT: usize = 3;
-const _: [(); SYSCALL_COUNT] = [(); 3];
+pub const SYSCALL_VM_MAP_NR: usize = 3;
+pub const SYSCALL_COUNT: usize = 4;
+const _: [(); SYSCALL_COUNT] = [(); 4];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -25,6 +26,9 @@ pub const SYSCALL_RET_STATUS: usize = 0;
 pub const SYSCALL_RET_AUX: usize = 1;
 pub const SYSCALL_RET_TRANSFER_CAP: usize = 2;
 pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
+pub const SYSCALL_VM_MAP_PROT_READ: usize = 0x1;
+pub const SYSCALL_VM_MAP_PROT_WRITE: usize = 0x2;
+pub const SYSCALL_VM_MAP_PROT_EXEC: usize = 0x4;
 pub const OPCODE_INLINE: u16 = 0;
 pub const OPCODE_SHARED_MEM: u16 = 1;
 
@@ -34,10 +38,11 @@ pub enum Syscall {
     Yield = SYSCALL_YIELD_NR,
     IpcSend = SYSCALL_IPC_SEND_NR,
     IpcRecv = SYSCALL_IPC_RECV_NR,
+    VmMap = SYSCALL_VM_MAP_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 3;
+    pub const VARIANT_COUNT: usize = 4;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -47,6 +52,7 @@ impl Syscall {
             SYSCALL_YIELD_NR => Ok(Self::Yield),
             SYSCALL_IPC_SEND_NR => Ok(Self::IpcSend),
             SYSCALL_IPC_RECV_NR => Ok(Self::IpcRecv),
+            SYSCALL_VM_MAP_NR => Ok(Self::VmMap),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -158,18 +164,12 @@ fn materialize_received_transfer_cap(
     let Some(handle) = transfer_handle else {
         return Ok(None);
     };
-    let source_cap = kernel
+    let envelope = kernel
         .take_transfer_envelope(handle, endpoint, crate::kernel::ipc::ThreadId(receiver_tid))
         .ok_or(SyscallError::InvalidCapability)?;
     let derived = kernel
-        .cspace
-        .mint(source_cap)
-        .map_err(|_| SyscallError::QueueFull)?;
-    if let Some(cnode) = kernel.current_task_cnode() {
-        kernel
-            .mirror_capability_into_cnode(cnode, derived, source_cap)
-            .map_err(|_| SyscallError::QueueFull)?;
-    }
+        .grant_capability_task_to_task(envelope.source_tid.0, envelope.source_cap, receiver_tid)
+        .map_err(SyscallError::from)?;
     Ok(Some(derived.0))
 }
 
@@ -214,15 +214,21 @@ fn stash_transfer_handle(
     let Some(source_cap_id) = transfer_cap else {
         return Ok(None);
     };
-    let source_cap = kernel
-        .current_task_capability(source_cap_id)
-        .ok_or(SyscallError::InvalidCapability)?;
+    let sender_tid = current_tid(kernel)?;
+    let _ = kernel
+        .resolve_capability_for_task(sender_tid, source_cap_id)
+        .map_err(SyscallError::from)?;
     let receiver_tid = kernel
         .endpoint_waiter_tid(endpoint)
         .ok_or(SyscallError::WouldBlock)?;
     Ok(Some(
         kernel
-            .stash_transfer_envelope(source_cap, endpoint, Some(receiver_tid))
+            .stash_transfer_envelope(
+                crate::kernel::ipc::ThreadId(sender_tid),
+                source_cap_id,
+                endpoint,
+                Some(receiver_tid),
+            )
             .ok_or(SyscallError::QueueFull)?,
     ))
 }
@@ -242,6 +248,31 @@ fn inline_payload_from_frame(
     let mut payload = [0u8; Message::MAX_PAYLOAD];
     payload[..len].copy_from_slice(&regs[..len]);
     Ok(payload)
+}
+
+fn vm_map_page_flags(prot: usize) -> Result<PageFlags, SyscallError> {
+    let unknown =
+        prot & !(SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE | SYSCALL_VM_MAP_PROT_EXEC);
+    if unknown != 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    Ok(PageFlags {
+        read: (prot & SYSCALL_VM_MAP_PROT_READ) != 0,
+        write: (prot & SYSCALL_VM_MAP_PROT_WRITE) != 0,
+        execute: (prot & SYSCALL_VM_MAP_PROT_EXEC) != 0,
+        user: true,
+    })
+}
+
+fn round_up_page(value: usize) -> Result<usize, SyscallError> {
+    if value.is_multiple_of(PAGE_SIZE) {
+        Ok(value)
+    } else {
+        let rounded = value
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(SyscallError::InvalidArgs)?;
+        Ok(rounded & !(PAGE_SIZE - 1))
+    }
 }
 
 fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
@@ -400,6 +431,31 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     Ok(())
 }
 
+fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let aspace_map_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let addr = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
+    if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let map_len = round_up_page(len)?;
+    let end = addr.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
+    let flags = vm_map_page_flags(prot)?;
+    let mut va = addr;
+    while va < end {
+        let (_, mem_cap) = kernel
+            .alloc_anonymous_memory_object()
+            .map_err(SyscallError::from)?;
+        kernel
+            .map_user_page_with_caps(aspace_map_cap, mem_cap, VirtAddr(va as u64), flags)
+            .map_err(SyscallError::from)?;
+        va += PAGE_SIZE;
+    }
+    frame.set_ok(addr, map_len, 0);
+    Ok(())
+}
+
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     match Syscall::decode(frame.syscall_num())? {
         Syscall::Yield => {
@@ -409,6 +465,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         }
         Syscall::IpcSend => handle_ipc_send(kernel, frame),
         Syscall::IpcRecv => handle_ipc_recv(kernel, frame),
+        Syscall::VmMap => handle_vm_map(kernel, frame),
     }
 }
 
@@ -421,10 +478,32 @@ mod tests {
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
-        assert_eq!(SYSCALL_ABI_VERSION, 3);
+        assert_eq!(SYSCALL_ABI_VERSION, 4);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
         assert_eq!(IPC_REGISTER_WORDS, 2);
+    }
+
+    #[test]
+    fn vm_map_syscall_maps_aligned_region() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let mut frame = TrapFrame::new(
+            Syscall::VmMap as usize,
+            [
+                aspace_map_cap.0 as usize,
+                0x4000,
+                PAGE_SIZE * 2,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut frame).expect("vm_map");
+        assert_eq!(frame.error_code(), None);
+        assert_eq!(frame.ret0(), 0x4000);
+        assert_eq!(frame.ret1(), PAGE_SIZE * 2);
     }
 
     #[test]

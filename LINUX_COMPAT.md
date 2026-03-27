@@ -2,6 +2,12 @@
 
 This document defines the Linux-compatibility bridge layer used to ease userland porting.
 
+> **Important ABI note (March 2026 update):**
+> Linux `mmap`/`munmap`/`mprotect` now consume Linux argument order directly
+> (`addr`, `len`, `prot`, ...). Capability-targeted VM mapping is no longer
+> encoded in Linux `mmap` arg0 and is instead exposed via the native YARM
+> syscall `sys_vm_map` in the kernel syscall ABI.
+
 ## Scope (implemented)
 
 - ABI version: `1`
@@ -40,6 +46,8 @@ This document defines the Linux-compatibility bridge layer used to ease userland
 - `linux_mmap_region(...)` supports multi-page mappings.
 - `linux_munmap_region(...)` supports multi-page unmapping.
 - `linux_mprotect_region(...)` supports multi-page protection changes.
+- `linux_*_current_task(...)` variants route Linux ABI VM calls against the
+  current task ASID so Linux argument order remains ABI-compatible.
 
 All range-based wrappers enforce page alignment and round-up page semantics.
 
@@ -54,6 +62,11 @@ A minimal `brk` region manager is implemented:
 ## Linux-compat dispatcher
 
 `linux_compat::dispatch(kernel, frame)` is separate from kernel-native syscall ABI and routes Linux syscall numbers through the compatibility table.
+
+- `mmap(addr,len,prot,flags,fd,off)` uses Linux argument positions.
+- `munmap(addr,len)` uses Linux argument positions.
+- `mprotect(addr,len,prot)` uses Linux argument positions.
+- `brk(requested_end)` uses Linux argument position (`arg0`) and applies to the current task ASID.
 
 ## Process-manager vertical path
 

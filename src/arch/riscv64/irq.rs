@@ -43,3 +43,14 @@ pub fn irq_save() -> Riscv64IrqState {
 
 #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "riscv64")))]
 pub fn irq_restore(_state: Riscv64IrqState) {}
+
+#[cfg(feature = "hosted-dev")]
+pub fn external_irq_eoi(_irq_line: u16) {}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn external_irq_eoi(_irq_line: u16) {
+    // TODO(arch/riscv64): complete PLIC claim/complete handshake for this IRQ line.
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(target_arch = "riscv64")))]
+pub fn external_irq_eoi(_irq_line: u16) {}

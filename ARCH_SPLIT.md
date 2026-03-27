@@ -7,9 +7,10 @@ This file documents the initial architecture split work for step 5b.
 - Keep `src/kernel/*` machine-neutral.
 - Introduce architecture decoder layer under `src/arch/*`.
 - Start with RISC-V trap decoding, add other ISAs later.
-- Keep a thin HAL contract (`src/arch/hal.rs`) for only three kernel dependencies:
+- Keep a thin HAL contract (`src/arch/hal.rs`) for only kernel dependencies:
   - address-space switch
   - interrupt acknowledge/delivery
+  - external-interrupt completion (EOI/claim-complete)
   - timer programming
 
 ## Implemented
@@ -75,6 +76,15 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
 - Added selected-ISA trap dispatch facade `src/arch/trap_entry.rs` so kernel integration can call one arch-selected entrypoint shape.
 - Unknown ISA trap/exception codes now decode to `TrapEvent::Unknown { arch_code }` for explicit fault-policy handling instead of being folded into synthetic IRQ values.
 - Trap restore diagnostics now track last-restored TLS base per CPU (`MAX_CPUS`-indexed slots), with per-ISA tests that assert CPU-local slot isolation.
+- External interrupt handling now routes through `KernelState::handle_trap_event(...)` with explicit IRQ save/restore and selected-ISA EOI hook (`arch::irq_guard::external_irq_eoi`).
+- x86 trap entry includes an explicit note that IDT + assembly entry stubs are still required for real hardware delivery into `handle_trap_entry`.
+
+## External IRQ completion status
+
+- Selected-ISA EOI plumbing is present:
+  - `src/arch/irq_guard.rs` facade
+  - `src/arch/{x86_64,riscv64,aarch64}/irq.rs` `external_irq_eoi(...)` hooks
+- Current ISA hooks are intentionally stubs for now; APIC/GIC/PLIC register-level completion remains TODO in backend IRQ modules.
 
 
 ## Runtime entry wiring

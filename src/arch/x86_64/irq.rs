@@ -34,3 +34,11 @@ pub fn irq_restore(state: X86IrqState) {
         core::arch::asm!("sti", options(nomem, preserves_flags));
     }
 }
+
+#[cfg(feature = "hosted-dev")]
+pub fn external_irq_eoi(_irq_line: u16) {}
+
+#[cfg(not(feature = "hosted-dev"))]
+pub fn external_irq_eoi(_irq_line: u16) {
+    // TODO(arch/x86_64): write LAPIC EOI register (0xB0) for external IRQ completion.
+}

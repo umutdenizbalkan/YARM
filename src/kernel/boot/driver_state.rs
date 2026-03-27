@@ -255,11 +255,22 @@ impl KernelState {
             return Err(KernelError::StaleCapability);
         }
 
-        // Driver delegation records are kernel-owned; validate against global caps.
-        if self.kernel_global_capability(bundle.irq_cap).is_none()
-            || self.kernel_global_capability(bundle.dma_cap).is_none()
-            || self.kernel_global_capability(bundle.iova_cap).is_none()
-        {
+        // Prefer delegated-driver cspace visibility; keep global-liveness
+        // fallback during migration until delegation mirroring is completed.
+        let driver_cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
+        let irq_live = self
+            .capability_for_cnode(driver_cnode, bundle.irq_cap)
+            .is_some()
+            || self.kernel_global_capability(bundle.irq_cap).is_some();
+        let dma_live = self
+            .capability_for_cnode(driver_cnode, bundle.dma_cap)
+            .is_some()
+            || self.kernel_global_capability(bundle.dma_cap).is_some();
+        let iova_live = self
+            .capability_for_cnode(driver_cnode, bundle.iova_cap)
+            .is_some()
+            || self.kernel_global_capability(bundle.iova_cap).is_some();
+        if !irq_live || !dma_live || !iova_live {
             return Err(KernelError::StaleCapability);
         }
 

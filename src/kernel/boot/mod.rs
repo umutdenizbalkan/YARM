@@ -289,10 +289,11 @@ struct RobustFutexRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TransferEnvelope {
-    capability: Capability,
-    endpoint: CapObject,
-    receiver_tid: Option<ThreadId>,
+pub(crate) struct TransferEnvelope {
+    pub(crate) source_tid: ThreadId,
+    pub(crate) source_cap: CapId,
+    pub(crate) endpoint: CapObject,
+    pub(crate) receiver_tid: Option<ThreadId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,15 +625,30 @@ impl KernelState {
         self.capability_for_cnode(cnode, cap)
     }
 
+    pub fn task_capability(&self, tid: u64, cap: CapId) -> Option<Capability> {
+        let cnode = self.task_cnode(tid)?;
+        self.capability_for_cnode(cnode, cap)
+    }
+
+    pub(crate) fn resolve_capability_for_task(
+        &self,
+        tid: u64,
+        cap: CapId,
+    ) -> Result<Capability, KernelError> {
+        self.task_capability(tid, cap)
+            .ok_or(KernelError::InvalidCapability)
+    }
+
     pub fn current_task_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
         self.current_task_capability(cap)
             .map(|capability| capability.has_right(right))
             .unwrap_or(false)
     }
 
-    pub fn stash_transfer_envelope(
+    pub(crate) fn stash_transfer_envelope(
         &mut self,
-        capability: Capability,
+        source_tid: ThreadId,
+        source_cap: CapId,
         endpoint: CapObject,
         receiver_tid: Option<ThreadId>,
     ) -> Option<u64> {
@@ -646,7 +662,8 @@ impl KernelState {
             }
             self.ipc.transfer_envelope_generations[idx] = generation;
             self.ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
-                capability,
+                source_tid,
+                source_cap,
                 endpoint,
                 receiver_tid,
             });
@@ -656,12 +673,12 @@ impl KernelState {
         None
     }
 
-    pub fn take_transfer_envelope(
+    pub(crate) fn take_transfer_envelope(
         &mut self,
         handle: u64,
         endpoint: CapObject,
         receiver_tid: ThreadId,
-    ) -> Option<Capability> {
+    ) -> Option<TransferEnvelope> {
         let idx = usize::try_from(handle & 0xFFFF).ok()?;
         if idx >= MAX_TRANSFER_ENVELOPES {
             return None;
@@ -680,7 +697,18 @@ impl KernelState {
             }
         }
         self.ipc.transfer_envelopes[idx] = None;
-        Some(envelope.capability)
+        Some(envelope)
+    }
+
+    pub(crate) fn grant_capability_task_to_task(
+        &mut self,
+        source_tid: u64,
+        source_cap: CapId,
+        dest_tid: u64,
+    ) -> Result<CapId, KernelError> {
+        let capability = self.resolve_capability_for_task(source_tid, source_cap)?;
+        let dest_cnode = self.task_cnode(dest_tid).ok_or(KernelError::TaskMissing)?;
+        self.mint_capability_in_cnode(dest_cnode, capability)
     }
 
     pub fn endpoint_waiter_tid(&self, endpoint: CapObject) -> Option<ThreadId> {
@@ -1026,11 +1054,10 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
-        let payload = state.cspace.get(mem_cap).expect("payload");
         let endpoint = state.cspace.get(send_cap).expect("send cap").object;
 
         let first = state
-            .stash_transfer_envelope(payload, endpoint, None)
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None)
             .expect("stash first");
         assert!(
             state
@@ -1044,7 +1071,7 @@ mod tests {
         );
 
         let second = state
-            .stash_transfer_envelope(payload, endpoint, None)
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None)
             .expect("stash second");
         assert_ne!(first, second);
         assert!(
@@ -1068,7 +1095,7 @@ mod tests {
         );
 
         let bound = state
-            .stash_transfer_envelope(payload, endpoint, Some(ThreadId(9)))
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, Some(ThreadId(9)))
             .expect("stash bound");
         assert!(
             state

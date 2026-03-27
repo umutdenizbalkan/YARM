@@ -257,7 +257,9 @@ mod tests {
         )
         .expect("trap a");
 
-        state.set_thread_tls_base(0, 0xBBB0_0000).expect("set tls boot");
+        state
+            .set_thread_tls_base(0, 0xBBB0_0000)
+            .expect("set tls boot");
         state.set_current_cpu(CpuId(0)).expect("switch cpu0");
         let mut frame_b = TrapFrame::new(0, [0; 6]);
         handle_trap_entry(
