@@ -457,3 +457,48 @@ pub fn status_reply_message(sender_tid: u64, reply: SupervisorStatusReply) -> Re
     )
     .map_err(|_| ())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_driver_request_roundtrips_split_dma_and_iova_lengths() {
+        let req = RegisterDriverRequest {
+            tid: 20,
+            max_restarts: 2,
+            restart_group: 3,
+            dependency_mask: 0x5,
+            backoff_ticks: 7,
+            irq_line: 11,
+            mem_cap: 0xAA,
+            iova_cap: 0xBB,
+            iova_base: 0x10_000,
+            dma_len: 0x20_000,
+            iova_len: 0x30_000,
+        };
+        let encoded = req.encode();
+        let decoded = RegisterDriverRequest::decode(&encoded).expect("decode");
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn register_driver_request_decode_accepts_legacy_56_byte_payload() {
+        let mut legacy = [0u8; 56];
+        legacy[..8].copy_from_slice(&20u64.to_le_bytes()); // tid
+        legacy[8] = 2; // max_restarts
+        legacy[9] = 3; // restart_group
+        legacy[10..12].copy_from_slice(&11u16.to_le_bytes()); // irq
+        legacy[12] = 0x5; // dependency_mask
+        legacy[16..24].copy_from_slice(&7u64.to_le_bytes()); // backoff
+        legacy[24..32].copy_from_slice(&0xAAu64.to_le_bytes()); // mem_cap
+        legacy[32..40].copy_from_slice(&0xBBu64.to_le_bytes()); // iova_cap
+        legacy[40..48].copy_from_slice(&0x10_000u64.to_le_bytes()); // iova_base
+        legacy[48..56].copy_from_slice(&0x30_000u64.to_le_bytes()); // legacy length lane
+
+        let decoded = RegisterDriverRequest::decode(&legacy).expect("decode legacy");
+        assert_eq!(decoded.tid, 20);
+        assert_eq!(decoded.dma_len, 0x30_000);
+        assert_eq!(decoded.iova_len, 0x30_000);
+    }
+}
