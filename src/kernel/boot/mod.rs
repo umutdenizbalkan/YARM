@@ -1855,6 +1855,67 @@ mod tests {
     }
 
     #[test]
+    fn source_revoke_cascades_to_multiple_direct_and_transitive_descendants() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.register_task(2).expect("task2");
+        state.register_task(3).expect("task3");
+
+        let root = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::Kernel,
+                CapRights::READ | CapRights::WRITE,
+            ))
+            .expect("root");
+        let direct_t1 = state
+            .grant_capability_task_to_task_with_rights(0, root, 1, CapRights::READ)
+            .expect("direct t1");
+        let direct_t2 = state
+            .grant_capability_task_to_task_with_rights(0, root, 2, CapRights::READ)
+            .expect("direct t2");
+        let transitive_t3 = state
+            .grant_capability_task_to_task_with_rights(1, direct_t1, 3, CapRights::READ)
+            .expect("transitive t3");
+
+        assert!(state.resolve_capability_for_task(1, direct_t1).is_ok());
+        assert!(state.resolve_capability_for_task(2, direct_t2).is_ok());
+        assert!(state.resolve_capability_for_task(3, transitive_t3).is_ok());
+
+        let root_cnode = state.task_cnode(0).expect("root cnode");
+        assert_eq!(state.revoke_capability_in_cnode(root_cnode, root), Ok(()));
+        assert!(state.resolve_capability_for_task(1, direct_t1).is_err());
+        assert!(state.resolve_capability_for_task(2, direct_t2).is_err());
+        assert!(state.resolve_capability_for_task(3, transitive_t3).is_err());
+    }
+
+    #[test]
+    fn source_revoke_only_impacts_delegated_descendants_not_unrelated_caps() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+
+        let root = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::Kernel,
+                CapRights::READ,
+            ))
+            .expect("root");
+        let delegated = state
+            .grant_capability_task_to_task_with_rights(0, root, 1, CapRights::READ)
+            .expect("delegated");
+        let unrelated = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::MemoryObject { id: 0xABCD },
+                CapRights::READ,
+            ))
+            .expect("unrelated");
+
+        let root_cnode = state.task_cnode(0).expect("root cnode");
+        assert_eq!(state.revoke_capability_in_cnode(root_cnode, root), Ok(()));
+        assert!(state.resolve_capability_for_task(1, delegated).is_err());
+        assert!(state.resolve_capability_for_task(0, unrelated).is_ok());
+    }
+
+    #[test]
     fn invalid_source_revoke_does_not_revoke_delegated_descendants() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
