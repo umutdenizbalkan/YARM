@@ -354,16 +354,44 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             .map_err(|_| SyscallError::InvalidArgs)
         }
     } else {
-        let payload = inline_payload_from_frame(frame, len)?;
-        let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
-        Message::with_header(
-            sender_tid,
-            OPCODE_INLINE,
-            transfer_flag_bits(transfer_cap),
-            transfer_handle,
-            &payload[..len],
-        )
-        .map_err(|_| SyscallError::InvalidArgs)
+        if len > Message::MAX_PAYLOAD {
+            return Err(SyscallError::InvalidArgs);
+        }
+        if len > IPC_REGISTER_BYTES {
+            let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
+            let grant = kernel
+                .capability_service()
+                .resolve_current_task_capability(grant_cap)
+                .ok_or(SyscallError::InvalidCapability)?;
+            match grant.object {
+                CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}
+                _ => return Err(SyscallError::WrongObject),
+            }
+            let region = SharedMemoryRegion {
+                offset: user_ptr_or_offset as u64,
+                len: len as u64,
+            };
+            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
+            Message::with_header(
+                sender_tid,
+                OPCODE_SHARED_MEM,
+                Message::FLAG_CAP_TRANSFER,
+                transfer_handle,
+                &region.encode(),
+            )
+            .map_err(|_| SyscallError::InvalidArgs)
+        } else {
+            let payload = inline_payload_from_frame(frame, len)?;
+            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
+            Message::with_header(
+                sender_tid,
+                OPCODE_INLINE,
+                transfer_flag_bits(transfer_cap),
+                transfer_handle,
+                &payload[..len],
+            )
+            .map_err(|_| SyscallError::InvalidArgs)
+        }
     };
     let msg = match msg_result {
         Ok(msg) => msg,
@@ -641,6 +669,49 @@ mod tests {
             let err = dispatch(&mut state, &mut send_frame).expect_err("invalid inline send");
             assert_eq!(err, SyscallError::InvalidArgs);
         }
+    }
+
+    #[test]
+    fn kernel_inline_send_can_fall_back_to_shared_region_for_larger_payloads() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(crate::kernel::vm::PhysAddr(0xA000))
+            .expect("mem");
+        state.yield_current().expect("switch to task1");
+        let mut block_recv_frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv_frame).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x1200,
+                IPC_REGISTER_BYTES + 1,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send syscall");
+        assert_eq!(send_frame.error_code(), None);
+
+        let msg = state.ipc_recv(recv_cap_global).expect("recv").expect("msg");
+        assert_eq!(msg.opcode, OPCODE_SHARED_MEM);
+        assert!(msg.flags & Message::FLAG_CAP_TRANSFER != 0);
+        let region = SharedMemoryRegion::decode(msg.as_slice()).expect("region");
+        assert_eq!(region.offset, 0x1200);
+        assert_eq!(region.len as usize, IPC_REGISTER_BYTES + 1);
     }
 
     #[test]
