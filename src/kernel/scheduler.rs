@@ -5,6 +5,10 @@ use crate::kernel::topology::CpuTopology;
 pub const MAX_RUN_QUEUE: usize = 64;
 pub const MAX_CPUS: usize = platform_layout::MAX_CPUS;
 const _: () = assert!(MAX_RUN_QUEUE.is_power_of_two());
+const MEMBERSHIP_SLOTS: usize = 64;
+const MEMBERSHIP_EMPTY: u8 = 0;
+const MEMBERSHIP_TOMBSTONE: u8 = 1;
+const MEMBERSHIP_FULL: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuId(pub u8);
@@ -86,6 +90,9 @@ impl RingQueue {
 pub struct PriorityScheduler {
     queues: [RingQueue; 3],
     current: Option<ScheduledTask>,
+    membership_keys: [ThreadId; MEMBERSHIP_SLOTS],
+    membership_state: [u8; MEMBERSHIP_SLOTS],
+    membership_tracking_exhausted: bool,
 }
 
 impl Default for PriorityScheduler {
@@ -93,20 +100,85 @@ impl Default for PriorityScheduler {
         Self {
             queues: [RingQueue::new(), RingQueue::new(), RingQueue::new()],
             current: None,
+            membership_keys: [ThreadId(0); MEMBERSHIP_SLOTS],
+            membership_state: [MEMBERSHIP_EMPTY; MEMBERSHIP_SLOTS],
+            membership_tracking_exhausted: false,
         }
     }
 }
 
 impl PriorityScheduler {
+    fn membership_hash(tid: ThreadId) -> usize {
+        tid.0 as usize & (MEMBERSHIP_SLOTS - 1)
+    }
+
+    fn membership_contains(&self, tid: ThreadId) -> bool {
+        let mut idx = Self::membership_hash(tid);
+        for _ in 0..MEMBERSHIP_SLOTS {
+            match self.membership_state[idx] {
+                MEMBERSHIP_EMPTY => return false,
+                MEMBERSHIP_FULL if self.membership_keys[idx] == tid => return true,
+                _ => idx = (idx + 1) & (MEMBERSHIP_SLOTS - 1),
+            }
+        }
+        false
+    }
+
+    fn membership_insert(&mut self, tid: ThreadId) -> Result<(), ()> {
+        let mut idx = Self::membership_hash(tid);
+        let mut first_tombstone: Option<usize> = None;
+        for _ in 0..MEMBERSHIP_SLOTS {
+            match self.membership_state[idx] {
+                MEMBERSHIP_FULL if self.membership_keys[idx] == tid => return Ok(()),
+                MEMBERSHIP_TOMBSTONE => {
+                    if first_tombstone.is_none() {
+                        first_tombstone = Some(idx);
+                    }
+                }
+                MEMBERSHIP_EMPTY => {
+                    let insert_idx = first_tombstone.unwrap_or(idx);
+                    self.membership_keys[insert_idx] = tid;
+                    self.membership_state[insert_idx] = MEMBERSHIP_FULL;
+                    return Ok(());
+                }
+                _ => {}
+            }
+            idx = (idx + 1) & (MEMBERSHIP_SLOTS - 1);
+        }
+        Err(())
+    }
+
+    fn membership_remove(&mut self, tid: ThreadId) {
+        let mut idx = Self::membership_hash(tid);
+        for _ in 0..MEMBERSHIP_SLOTS {
+            match self.membership_state[idx] {
+                MEMBERSHIP_EMPTY => return,
+                MEMBERSHIP_FULL if self.membership_keys[idx] == tid => {
+                    self.membership_state[idx] = MEMBERSHIP_TOMBSTONE;
+                    return;
+                }
+                _ => idx = (idx + 1) & (MEMBERSHIP_SLOTS - 1),
+            }
+        }
+    }
+
+    fn linear_contains_tid(&self, tid: ThreadId) -> bool {
+        if self.current.is_some_and(|task| task.tid == tid) {
+            return true;
+        }
+        self.queues.iter().any(|queue| queue.contains(tid))
+    }
+
     fn priority_index(priority: TaskPriority) -> usize {
         priority as usize
     }
 
     fn contains_tid(&self, tid: ThreadId) -> bool {
-        if self.current.is_some_and(|task| task.tid == tid) {
-            return true;
+        if self.membership_tracking_exhausted {
+            self.linear_contains_tid(tid)
+        } else {
+            self.membership_contains(tid)
         }
-        self.queues.iter().any(|queue| queue.contains(tid))
     }
 
     pub fn enqueue_with_priority(
@@ -117,7 +189,11 @@ impl PriorityScheduler {
         if self.contains_tid(tid) {
             return Err(SchedulerError::AlreadyQueued);
         }
-        self.queues[Self::priority_index(priority)].push(tid)
+        self.queues[Self::priority_index(priority)].push(tid)?;
+        if !self.membership_tracking_exhausted && self.membership_insert(tid).is_err() {
+            self.membership_tracking_exhausted = true;
+        }
+        Ok(())
     }
 
     fn dequeue_highest(&mut self) -> Option<ScheduledTask> {
@@ -140,12 +216,18 @@ impl PriorityScheduler {
 
     pub fn on_preempt(&mut self) -> Option<ThreadId> {
         if let Some(running) = self.current.take() {
+            if !self.membership_tracking_exhausted {
+                self.membership_remove(running.tid);
+            }
             if let Err(err) = self.enqueue_with_priority(running.tid, running.priority) {
                 if err != SchedulerError::AlreadyQueued && self.runnable_count() != 0 {
                     crate::yarm_log!(
                         "scheduler inconsistency: failed to re-enqueue preempted task {:?}; preserving current task",
                         err
                     );
+                }
+                if !self.membership_tracking_exhausted {
+                    let _ = self.membership_insert(running.tid);
                 }
                 self.current = Some(running);
                 return Some(running.tid);
@@ -156,6 +238,9 @@ impl PriorityScheduler {
 
     pub fn block_current(&mut self) -> Option<ThreadId> {
         let current = self.current.take()?;
+        if !self.membership_tracking_exhausted {
+            self.membership_remove(current.tid);
+        }
         Some(current.tid)
     }
 
