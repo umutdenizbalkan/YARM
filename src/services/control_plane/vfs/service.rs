@@ -2,9 +2,10 @@ use crate::kernel::boot::KernelState;
 use crate::kernel::capabilities::CapId;
 use crate::kernel::vfs::VfsError;
 use crate::kernel::vfs::{
-    InMemoryBackend, OpenAtRequest, ReadWriteRequest, StatxRequest, close_message, dup_message,
-    epoll_create1_message, epoll_ctl_message, epoll_pwait_message, fcntl_message, ioctl_message,
-    openat_message, poll_message, read_message, sendfile_message, statx_message, write_message,
+    InMemoryBackend, OpenAtRequest, ReadWriteRequest, StatxRequest, VfsBackend, close_message,
+    dup_message, epoll_create1_message, epoll_ctl_message, epoll_pwait_message, fcntl_message,
+    ioctl_message, openat_message, poll_message, read_message, sendfile_message, statx_message,
+    write_message,
 };
 use crate::services::common::service::{FsService, run_typed_request_loop};
 use crate::services::common::vfs_service::VfsReply;
@@ -98,9 +99,9 @@ fn map_kernel_ipc_err<T>(
     result.map_err(|_| VfsError::Unsupported)
 }
 
-fn roundtrip_ipc(
+fn roundtrip_ipc<B: VfsBackend>(
     kernel: &mut KernelState,
-    vfs: &mut FsService<InMemoryBackend>,
+    vfs: &mut FsService<B>,
     client_send_cap: CapId,
     server_recv_cap: CapId,
     server_send_cap: CapId,
@@ -117,7 +118,7 @@ fn roundtrip_ipc(
 
 pub fn run_request_loop_over_kernel_ipc(
     kernel: &mut KernelState,
-    vfs: &mut FsService<InMemoryBackend>,
+    vfs: &mut FsService<impl VfsBackend>,
     path_ptr: u64,
 ) -> Result<VfsLoopSummary, VfsError> {
     let (_, client_send_cap, server_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(16))?;
@@ -229,6 +230,22 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
+    use crate::services::fs::devfs::{DEV_NULL_PATH_PTR, DevFsBackend};
+    use crate::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
+    use crate::services::fs::ramfs::RamFsBackend;
+
+    fn setup_ipc_caps(kernel: &mut KernelState) -> (CapId, CapId, CapId, CapId) {
+        let (_, client_send_cap, server_recv_cap) =
+            map_kernel_ipc_err(kernel.create_endpoint(8)).expect("req endpoint");
+        let (_, server_send_cap, client_recv_cap) =
+            map_kernel_ipc_err(kernel.create_endpoint(8)).expect("rep endpoint");
+        (
+            client_send_cap,
+            server_recv_cap,
+            server_send_cap,
+            client_recv_cap,
+        )
+    }
 
     #[test]
     fn vfs_request_loop_entrypoint_opens_one_fd() {
@@ -252,5 +269,127 @@ mod tests {
         assert_eq!(summary.dup_fd, 4);
         assert_eq!(summary.epoll_fd, 5);
         assert_eq!(summary.handled, 15);
+    }
+
+    #[test]
+    fn devfs_and_ramfs_conformance_roundtrip_over_kernel_ipc() {
+        let mut kernel = Bootstrap::init().expect("kernel init");
+        let (client_send, server_recv, server_send, client_recv) = setup_ipc_caps(&mut kernel);
+
+        let mut devfs = FsService::with_backend(DevFsBackend::default());
+        let open_dev = roundtrip_ipc(
+            &mut kernel,
+            &mut devfs,
+            client_send,
+            server_recv,
+            server_send,
+            client_recv,
+            openat_message(OpenAtRequest {
+                dirfd: 0,
+                path_ptr: DEV_NULL_PATH_PTR,
+                flags: 0,
+                mode: 0,
+            })
+            .expect("open msg"),
+        )
+        .expect("open devfs");
+        let dev_fd = decode_fd_reply(open_dev).expect("fd");
+        let write_dev = roundtrip_ipc(
+            &mut kernel,
+            &mut devfs,
+            client_send,
+            server_recv,
+            server_send,
+            client_recv,
+            write_message(ReadWriteRequest {
+                fd: dev_fd,
+                buf_ptr: 0,
+                len: 9,
+            })
+            .expect("write msg"),
+        )
+        .expect("write devfs");
+        assert_eq!(
+            VfsReply::from_message(write_dev).expect("decode"),
+            VfsReply::WriteLen(9)
+        );
+
+        let mut ramfs = FsService::with_backend(RamFsBackend::new());
+        let open_ram = roundtrip_ipc(
+            &mut kernel,
+            &mut ramfs,
+            client_send,
+            server_recv,
+            server_send,
+            client_recv,
+            openat_message(OpenAtRequest {
+                dirfd: 0,
+                path_ptr: 0xABCD,
+                flags: 0,
+                mode: 0,
+            })
+            .expect("open msg"),
+        )
+        .expect("open ramfs");
+        let ram_fd = decode_fd_reply(open_ram).expect("fd");
+        let read_ram = roundtrip_ipc(
+            &mut kernel,
+            &mut ramfs,
+            client_send,
+            server_recv,
+            server_send,
+            client_recv,
+            read_message(ReadWriteRequest {
+                fd: ram_fd,
+                buf_ptr: 0,
+                len: 4,
+            })
+            .expect("read msg"),
+        )
+        .expect("read ramfs");
+        assert_eq!(
+            VfsReply::from_message(read_ram).expect("decode"),
+            VfsReply::ReadLen(0)
+        );
+    }
+
+    #[test]
+    fn initramfs_write_rejection_roundtrips_over_kernel_ipc() {
+        let mut kernel = Bootstrap::init().expect("kernel init");
+        let (client_send, server_recv, server_send, client_recv) = setup_ipc_caps(&mut kernel);
+
+        let mut initramfs = FsService::with_backend(InitramfsBackend::new(4096));
+        let open = roundtrip_ipc(
+            &mut kernel,
+            &mut initramfs,
+            client_send,
+            server_recv,
+            server_send,
+            client_recv,
+            openat_message(OpenAtRequest {
+                dirfd: 0,
+                path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
+                flags: 0,
+                mode: 0,
+            })
+            .expect("open msg"),
+        )
+        .expect("open initramfs");
+        let fd = decode_fd_reply(open).expect("fd");
+        let write = roundtrip_ipc(
+            &mut kernel,
+            &mut initramfs,
+            client_send,
+            server_recv,
+            server_send,
+            client_recv,
+            write_message(ReadWriteRequest {
+                fd,
+                buf_ptr: 0,
+                len: 1,
+            })
+            .expect("write msg"),
+        );
+        assert_eq!(write, Err(VfsError::Unsupported));
     }
 }
