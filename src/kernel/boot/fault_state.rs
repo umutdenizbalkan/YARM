@@ -88,7 +88,7 @@ impl KernelState {
                 }
                 Ok(())
             }
-            Trap::PageFault | Trap::ExternalInterrupt => Ok(()),
+            Trap::PageFault | Trap::ExternalInterrupt | Trap::Unknown => Ok(()),
         }
     }
 
@@ -123,6 +123,7 @@ impl KernelState {
             }
             TrapEvent::Syscall => self.handle_trap(Trap::Syscall, frame),
             TrapEvent::TimerInterrupt => self.handle_trap(Trap::TimerInterrupt, frame),
+            TrapEvent::Unknown => self.handle_trap(Trap::Unknown, frame),
         }
     }
 }

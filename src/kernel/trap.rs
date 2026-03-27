@@ -29,6 +29,7 @@ pub enum Trap {
     PageFault,
     TimerInterrupt,
     ExternalInterrupt,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub enum TrapAction {
     HandlePageFault,
     TickScheduler,
     RouteIrq,
+    Unhandled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +47,7 @@ pub enum TrapEvent {
     PageFault(FaultInfo),
     TimerInterrupt,
     ExternalInterrupt(IrqNumber),
+    Unknown,
 }
 
 impl TrapEvent {
@@ -54,6 +57,7 @@ impl TrapEvent {
             Self::PageFault(_) => Trap::PageFault,
             Self::TimerInterrupt => Trap::TimerInterrupt,
             Self::ExternalInterrupt(_) => Trap::ExternalInterrupt,
+            Self::Unknown => Trap::Unknown,
         }
     }
 
@@ -84,6 +88,7 @@ pub fn route_trap(event: &TrapEvent) -> TrapAction {
         TrapEvent::PageFault(_) => TrapAction::HandlePageFault,
         TrapEvent::TimerInterrupt => TrapAction::TickScheduler,
         TrapEvent::ExternalInterrupt(_) => TrapAction::RouteIrq,
+        TrapEvent::Unknown => TrapAction::Unhandled,
     }
 }
 
@@ -121,5 +126,6 @@ mod tests {
             route_trap(&TrapEvent::ExternalInterrupt(1)),
             TrapAction::RouteIrq
         );
+        assert_eq!(route_trap(&TrapEvent::Unknown), TrapAction::Unhandled);
     }
 }

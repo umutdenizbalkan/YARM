@@ -1,5 +1,5 @@
 use crate::kernel::boot::{KernelState, TrapHandleError};
-use crate::kernel::scheduler::CpuId;
+use crate::kernel::scheduler::{CpuId, MAX_CPUS};
 use crate::kernel::trap::{FaultAccess, FaultInfo, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::VirtAddr;
@@ -18,15 +18,20 @@ pub struct X86TrapContext {
     pub fault_addr: u64,
 }
 
-static LAST_RESTORED_TLS_BASE: AtomicUsize = AtomicUsize::new(0);
+static LAST_RESTORED_TLS_BASE: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
-pub fn last_restored_tls_base() -> Option<usize> {
-    let value = LAST_RESTORED_TLS_BASE.load(Ordering::Relaxed);
+pub fn last_restored_tls_base(cpu: CpuId) -> Option<usize> {
+    let idx = cpu.0 as usize;
+    if idx >= MAX_CPUS {
+        return None;
+    }
+    let value = LAST_RESTORED_TLS_BASE[idx].load(Ordering::Relaxed);
     (value != 0).then_some(value)
 }
 
 fn restore_arch_thread_state(
     kernel: &mut KernelState,
+    cpu: CpuId,
     frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
     let Some(frame) = frame else {
@@ -36,7 +41,10 @@ fn restore_arch_thread_state(
         .resume_current_thread_with_frame(frame)
         .map_err(crate::kernel::syscall::SyscallError::from)
         .map_err(TrapHandleError::Syscall)?;
-    LAST_RESTORED_TLS_BASE.store(tls.unwrap_or(0), Ordering::Relaxed);
+    let idx = cpu.0 as usize;
+    if idx < MAX_CPUS {
+        LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -60,7 +68,7 @@ pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {
         v if (VEC_EXTERNAL_BASE..VEC_EXTERNAL_LIMIT).contains(&v) => {
             TrapEvent::ExternalInterrupt((v - VEC_EXTERNAL_BASE) as u16)
         }
-        _ => TrapEvent::ExternalInterrupt(0),
+        _ => TrapEvent::Unknown,
     }
 }
 
@@ -73,7 +81,7 @@ pub fn handle_trap_entry(
     let _ = kernel.set_current_cpu(cpu);
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
     kernel.handle_trap_event(decode_trap_context(context), frame.as_deref_mut())?;
-    restore_arch_thread_state(kernel, frame)?;
+    restore_arch_thread_state(kernel, cpu, frame)?;
     Ok(())
 }
 
@@ -131,6 +139,16 @@ mod tests {
     }
 
     #[test]
+    fn decode_unknown_vector_is_unknown_event() {
+        let ev = decode_trap_context(X86TrapContext {
+            vector: 0x7F,
+            error_code: 0,
+            fault_addr: 0,
+        });
+        assert_eq!(ev.trap(), Trap::Unknown);
+    }
+
+    #[test]
     fn trap_entry_sets_cpu_and_handles_timer() {
         use crate::kernel::boot::Bootstrap;
 
@@ -184,6 +202,6 @@ mod tests {
             Some(&mut frame),
         )
         .expect("trap");
-        assert_eq!(last_restored_tls_base(), Some(0xCAFE_0000));
+        assert_eq!(last_restored_tls_base(CpuId(1)), Some(0xCAFE_0000));
     }
 }
