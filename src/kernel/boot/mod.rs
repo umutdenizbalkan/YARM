@@ -69,15 +69,49 @@ fn kernel_mut<T>(value: &mut KernelStorage<T>) -> &mut T {
     value
 }
 
-const MAX_ENDPOINTS: usize = 16;
+#[cfg(feature = "hosted-dev")]
+const MAX_ENDPOINTS: usize = 64;
+#[cfg(not(feature = "hosted-dev"))]
+const MAX_ENDPOINTS: usize = 32;
+
+#[cfg(feature = "hosted-dev")]
+const MAX_ENDPOINT_SENDER_WAITERS: usize = 8;
+#[cfg(not(feature = "hosted-dev"))]
 const MAX_ENDPOINT_SENDER_WAITERS: usize = 4;
+
+#[cfg(feature = "hosted-dev")]
 const MAX_TASKS: usize = 64;
-const MAX_MEMORY_OBJECTS: usize = 128;
-const MAX_NOTIFICATIONS: usize = 16;
+#[cfg(not(feature = "hosted-dev"))]
+const MAX_TASKS: usize = 128;
+
+#[cfg(feature = "hosted-dev")]
+const MAX_MEMORY_OBJECTS: usize = 1024;
+#[cfg(not(feature = "hosted-dev"))]
+const MAX_MEMORY_OBJECTS: usize = 256;
+
+#[cfg(feature = "hosted-dev")]
+const MAX_NOTIFICATIONS: usize = 64;
+#[cfg(not(feature = "hosted-dev"))]
+const MAX_NOTIFICATIONS: usize = 32;
 const MAX_IRQ_LINES: usize = platform_layout::MAX_IRQ_LINES;
+#[cfg(feature = "hosted-dev")]
+const MAX_DRIVERS: usize = 64;
+#[cfg(not(feature = "hosted-dev"))]
 const MAX_DRIVERS: usize = 32;
+
+#[cfg(feature = "hosted-dev")]
+const MAX_DRIVER_IRQ_CAPS: usize = 16;
+#[cfg(not(feature = "hosted-dev"))]
 const MAX_DRIVER_IRQ_CAPS: usize = 8;
+
+#[cfg(feature = "hosted-dev")]
+const MAX_DRIVER_DMA_CAPS: usize = 16;
+#[cfg(not(feature = "hosted-dev"))]
 const MAX_DRIVER_DMA_CAPS: usize = 8;
+
+#[cfg(feature = "hosted-dev")]
+const MAX_TRANSFER_ENVELOPES: usize = 256;
+#[cfg(not(feature = "hosted-dev"))]
 const MAX_TRANSFER_ENVELOPES: usize = 64;
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
 
@@ -236,7 +270,7 @@ struct SenderWaiter {
 #[derive(Debug)]
 struct IpcSubsystem {
     cross_cpu_work: SmpMailbox,
-    endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
+    endpoints: [Option<KernelStorage<Endpoint>>; MAX_ENDPOINTS],
     endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
     endpoint_sender_waiters: [[Option<SenderWaiter>; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
     endpoint_generations: [u64; MAX_ENDPOINTS],
@@ -292,14 +326,14 @@ pub struct KernelState {
     pub scheduler: KernelStorage<SmpScheduler>,
     pub cspace: KernelStorage<CapabilitySpace>,
     pub timer: Timer,
-    pub user_spaces: AddressSpaceManager,
+    pub user_spaces: KernelStorage<AddressSpaceManager>,
     current_cpu: CpuId,
     ipc: KernelStorage<IpcSubsystem>,
     cnode_spaces: KernelStorage<[Option<CNodeSpace>; MAX_TASKS]>,
     next_dynamic_tid: u64,
-    tcbs: [Option<ThreadControlBlock>; MAX_TASKS],
-    tls_restore_pending: [Option<ThreadId>; MAX_TASKS],
-    robust_futex: [Option<RobustFutexRecord>; MAX_TASKS],
+    tcbs: KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
+    tls_restore_pending: KernelStorage<[Option<ThreadId>; MAX_TASKS]>,
+    robust_futex: KernelStorage<[Option<RobustFutexRecord>; MAX_TASKS]>,
     memory: KernelStorage<MemorySubsystem>,
     drivers: DriverSubsystem,
     tlb_shootdown_count: u64,
@@ -362,7 +396,7 @@ impl Bootstrap {
             scheduler: store_kernel_value(scheduler),
             cspace: store_kernel_value(cspace),
             timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
-            user_spaces: AddressSpaceManager::default(),
+            user_spaces: store_kernel_value(AddressSpaceManager::default()),
             current_cpu: CpuId(platform_layout::BOOTSTRAP_CPU_ID),
             ipc: store_kernel_value(IpcSubsystem {
                 cross_cpu_work: SmpMailbox::default(),
@@ -382,9 +416,9 @@ impl Bootstrap {
             }),
             cnode_spaces: store_kernel_value([const { None }; MAX_TASKS]),
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
-            tcbs: [const { None }; MAX_TASKS],
-            tls_restore_pending: [None; MAX_TASKS],
-            robust_futex: [None; MAX_TASKS],
+            tcbs: store_kernel_value([const { None }; MAX_TASKS]),
+            tls_restore_pending: store_kernel_value([None; MAX_TASKS]),
+            robust_futex: store_kernel_value([None; MAX_TASKS]),
             memory: store_kernel_value(MemorySubsystem {
                 #[cfg(feature = "hosted-dev")]
                 user_memory: store_kernel_value(UserMemoryStore::default()),

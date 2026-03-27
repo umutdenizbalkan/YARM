@@ -143,7 +143,7 @@ mod tests {
     fn trap_entry_sets_cpu_and_handles_irq() {
         use crate::kernel::boot::Bootstrap;
 
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
         state.bring_up_cpu(CpuId(2)).expect("cpu2");
 
         handle_trap_entry(
@@ -167,7 +167,7 @@ mod tests {
         use crate::kernel::boot::{Bootstrap, UserImageSpec};
         use crate::kernel::task::TaskClass;
 
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
         let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
         state
             .spawn_user_task_from_image(UserImageSpec {

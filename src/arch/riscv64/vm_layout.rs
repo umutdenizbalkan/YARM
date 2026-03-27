@@ -4,7 +4,14 @@ pub const PAGE_SIZE: usize = 4096;
 pub const KERNEL_SPACE_BASE: u64 = 0x8000_0000;
 pub const ASID_BITS: u8 = 16;
 
+#[cfg(feature = "hosted-dev")]
 pub const MAX_MAPPINGS: usize = 128;
+#[cfg(not(feature = "hosted-dev"))]
+pub const MAX_MAPPINGS: usize = 128;
+
+#[cfg(feature = "hosted-dev")]
 pub const MAX_ADDRESS_SPACES: usize = 16;
+#[cfg(not(feature = "hosted-dev"))]
+pub const MAX_ADDRESS_SPACES: usize = 32;
 
 pub const PROFILE_IS_PLACEHOLDER: bool = false;

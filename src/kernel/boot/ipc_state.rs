@@ -180,8 +180,9 @@ impl KernelState {
             next_generation = 1;
         }
         self.ipc.endpoint_generations[endpoint_idx] = next_generation;
-        self.ipc.endpoints[endpoint_idx] =
-            Some(Endpoint::new_with_mode(max_depth, mode).map_err(map_ipc_error)?);
+        self.ipc.endpoints[endpoint_idx] = Some(super::store_kernel_value(
+            Endpoint::new_with_mode(max_depth, mode).map_err(map_ipc_error)?,
+        ));
 
         let send_cap = self.mint_capability_for_active_cnode(Capability::new(
             CapObject::Endpoint {

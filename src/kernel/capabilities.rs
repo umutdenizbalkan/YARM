@@ -148,6 +148,9 @@ impl fmt::Display for CapabilityDeriveError {
     }
 }
 
+#[cfg(feature = "hosted-dev")]
+pub const MAX_CAPABILITIES_PER_CSPACE: usize = 1024;
+#[cfg(not(feature = "hosted-dev"))]
 pub const MAX_CAPABILITIES_PER_CSPACE: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
