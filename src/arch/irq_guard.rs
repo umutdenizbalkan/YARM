@@ -36,23 +36,7 @@ pub fn irq_restore(state: ArchIrqState) {
     target_arch = "x86_64",
     target_arch = "aarch64"
 )))]
-pub type ArchIrqState = super::riscv64::irq::Riscv64IrqState;
-#[cfg(not(any(
-    target_arch = "riscv64",
-    target_arch = "x86_64",
-    target_arch = "aarch64"
-)))]
-pub fn irq_save() -> ArchIrqState {
-    super::riscv64::irq::irq_save()
-}
-#[cfg(not(any(
-    target_arch = "riscv64",
-    target_arch = "x86_64",
-    target_arch = "aarch64"
-)))]
-pub fn irq_restore(state: ArchIrqState) {
-    super::riscv64::irq::irq_restore(state)
-}
+compile_error!("unsupported target_arch for arch::irq_guard");
 
 #[cfg(test)]
 mod tests {

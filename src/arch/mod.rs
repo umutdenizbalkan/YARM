@@ -19,7 +19,7 @@ pub use self::aarch64 as selected_isa;
     target_arch = "x86_64",
     target_arch = "aarch64"
 )))]
-pub use self::riscv64 as selected_isa;
+compile_error!("unsupported target_arch for arch::selected_isa");
 
 pub mod platform_layout;
 pub mod syscall_abi;

@@ -56,28 +56,7 @@ pub fn handle_trap_entry(
     target_arch = "x86_64",
     target_arch = "aarch64"
 )))]
-pub type ArchTrapContext = super::riscv64::trap::Riscv64TrapContext;
-#[cfg(not(any(
-    target_arch = "riscv64",
-    target_arch = "x86_64",
-    target_arch = "aarch64"
-)))]
-pub fn decode_trap_context(context: ArchTrapContext) -> TrapEvent {
-    super::riscv64::trap::decode_trap_context(context)
-}
-#[cfg(not(any(
-    target_arch = "riscv64",
-    target_arch = "x86_64",
-    target_arch = "aarch64"
-)))]
-pub fn handle_trap_entry(
-    kernel: &mut KernelState,
-    cpu: CpuId,
-    context: ArchTrapContext,
-    frame: Option<&mut TrapFrame>,
-) -> Result<(), TrapHandleError> {
-    super::riscv64::trap::handle_trap_entry(kernel, cpu, context, frame)
-}
+compile_error!("unsupported target_arch for arch::trap_entry");
 
 #[cfg(test)]
 mod tests {
