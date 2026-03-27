@@ -353,19 +353,18 @@ impl InitService {
 
     pub fn validate_delegation_edges(&self, kernel: &KernelState) -> Result<(), KernelError> {
         let handoff = self.fault_handoff.ok_or(KernelError::WrongObject)?;
-        if !kernel.kernel_global_capability_has_right(
-            handoff.supervisor_fault_recv_cap,
-            CapRights::RECEIVE,
-        ) || !kernel.kernel_global_capability_has_right(
-            handoff.supervisor_control_send_cap,
-            CapRights::SEND,
-        ) || !kernel.kernel_global_capability_has_right(
-            handoff.supervisor_control_recv_cap,
-            CapRights::RECEIVE,
-        ) || !kernel
-            .kernel_global_capability_has_right(handoff.init_alert_send_cap, CapRights::SEND)
-            || !kernel
-                .kernel_global_capability_has_right(handoff.init_alert_recv_cap, CapRights::RECEIVE)
+        let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
+        let has_right = |cap: CapId, right: CapRights| {
+            kernel
+                .task_capability(init_tid, cap)
+                .map(|capability| capability.has_right(right))
+                .unwrap_or(false)
+        };
+        if !has_right(handoff.supervisor_fault_recv_cap, CapRights::RECEIVE)
+            || !has_right(handoff.supervisor_control_send_cap, CapRights::SEND)
+            || !has_right(handoff.supervisor_control_recv_cap, CapRights::RECEIVE)
+            || !has_right(handoff.init_alert_send_cap, CapRights::SEND)
+            || !has_right(handoff.init_alert_recv_cap, CapRights::RECEIVE)
         {
             return Err(KernelError::MissingRight);
         }

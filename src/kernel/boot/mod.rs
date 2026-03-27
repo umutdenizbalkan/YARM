@@ -724,18 +724,6 @@ impl KernelState {
         self.ipc.endpoint_waiters[index]
     }
 
-    pub fn kernel_global_capability(&self, cap: CapId) -> Option<Capability> {
-        let capability = self.cspace.get(cap)?;
-        self.capability_object_live(capability.object)?;
-        Some(capability)
-    }
-
-    pub fn kernel_global_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
-        self.kernel_global_capability(cap)
-            .map(|capability| capability.has_right(right))
-            .unwrap_or(false)
-    }
-
     pub(crate) fn revoke_kernel_global_capability(
         &mut self,
         cap: CapId,
