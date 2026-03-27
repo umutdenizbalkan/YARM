@@ -791,7 +791,7 @@ impl KernelState {
         let capability = self.resolve_capability_for_task(source_tid, source_cap)?;
         let dest_cnode = self.task_cnode(dest_tid).ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self.mint_capability_in_cnode(dest_cnode, capability)?;
-        self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap);
+        self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap)?;
         Ok(delegated_cap)
     }
 
@@ -808,7 +808,7 @@ impl KernelState {
             .map_err(|_| KernelError::MissingRight)?;
         let dest_cnode = self.task_cnode(dest_tid).ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self.mint_capability_in_cnode(dest_cnode, attenuated)?;
-        self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap);
+        self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap)?;
         Ok(delegated_cap)
     }
 
@@ -908,14 +908,15 @@ impl KernelState {
             cap,
         };
         let descendants = self.collect_delegated_descendants(root);
+        self.cspace_for_cnode_mut(cnode)
+            .ok_or(KernelError::TaskMissing)?
+            .revoke(cap)
+            .map_err(|_| KernelError::InvalidCapability)?;
         for delegated in descendants.into_iter().flatten() {
             self.revoke_capability_direct_in_task_cnode(delegated.tid, delegated.cap);
         }
         self.remove_delegation_links_for(root, descendants);
-        self.cspace_for_cnode_mut(cnode)
-            .ok_or(KernelError::TaskMissing)?
-            .revoke(cap)
-            .map_err(|_| KernelError::InvalidCapability)
+        Ok(())
     }
 
     fn record_delegated_capability_link(
@@ -924,7 +925,7 @@ impl KernelState {
         source_cap: CapId,
         dest_tid: u64,
         dest_cap: CapId,
-    ) {
+    ) -> Result<(), KernelError> {
         let links = kernel_mut(&mut self.delegated_capability_links);
         if links.iter().flatten().any(|link| {
             link.source_tid == source_tid
@@ -932,7 +933,7 @@ impl KernelState {
                 && link.dest_tid == dest_tid
                 && link.dest_cap == dest_cap
         }) {
-            return;
+            return Ok(());
         }
         if let Some(slot) = links.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(DelegatedCapabilityLink {
@@ -941,6 +942,9 @@ impl KernelState {
                 dest_tid,
                 dest_cap,
             });
+            Ok(())
+        } else {
+            Err(KernelError::CapabilityFull)
         }
     }
 
@@ -1848,6 +1852,29 @@ mod tests {
                 .resolve_capability_for_task(2, delegated_task2)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn invalid_source_revoke_does_not_revoke_delegated_descendants() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let root = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::Kernel,
+                CapRights::READ,
+            ))
+            .expect("root");
+        let delegated = state
+            .grant_capability_task_to_task_with_rights(0, root, 1, CapRights::READ)
+            .expect("delegate");
+        let root_cnode = state.task_cnode(0).expect("root cnode");
+        let bogus = CapId(root.0.wrapping_add(1));
+        assert_eq!(
+            state.revoke_capability_in_cnode(root_cnode, bogus),
+            Err(KernelError::InvalidCapability)
+        );
+        assert!(state.resolve_capability_for_task(0, root).is_ok());
+        assert!(state.resolve_capability_for_task(1, delegated).is_ok());
     }
 
     #[test]
