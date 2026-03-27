@@ -1,6 +1,6 @@
 use super::{
-    map_ipc_error, IpcFastpathResult, KernelError, KernelState, NotificationObject, MAX_ENDPOINTS,
-    MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, MAX_NOTIFICATIONS, SenderWaiter,
+    map_ipc_error, IpcFastpathResult, KernelError, KernelState, NotificationObject,
+    MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, SenderWaiter,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointClass, EndpointMode, Message, ThreadId};
@@ -128,9 +128,10 @@ impl KernelState {
     }
 
     pub(crate) fn resolve_endpoint_index(&self, object: CapObject) -> Result<usize, KernelError> {
+        let limits = self.runtime_capacity_config();
         match object {
             CapObject::Endpoint { index, generation } => {
-                if index >= MAX_ENDPOINTS {
+                if index >= limits.max_endpoints {
                     return Err(KernelError::WrongObject);
                 }
                 if self.ipc.endpoints[index].is_none() {
@@ -152,7 +153,8 @@ impl KernelState {
     }
 
     pub fn destroy_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
-        if endpoint_idx >= MAX_ENDPOINTS || self.ipc.endpoints[endpoint_idx].is_none() {
+        let limits = self.runtime_capacity_config();
+        if endpoint_idx >= limits.max_endpoints || self.ipc.endpoints[endpoint_idx].is_none() {
             return Err(KernelError::WrongObject);
         }
         self.ipc.endpoints[endpoint_idx] = None;
@@ -198,8 +200,15 @@ impl KernelState {
         mode: EndpointMode,
         class: EndpointClass,
     ) -> Result<(usize, CapId, CapId), KernelError> {
+        let limits = self.runtime_capacity_config();
         let mut slot_index = None;
-        for (idx, slot) in self.ipc.endpoints.iter().enumerate() {
+        for (idx, slot) in self
+            .ipc
+            .endpoints
+            .iter()
+            .take(limits.max_endpoints)
+            .enumerate()
+        {
             if slot.is_none() {
                 slot_index = Some(idx);
                 break;
@@ -239,11 +248,18 @@ impl KernelState {
         &mut self,
         max_depth: usize,
     ) -> Result<(usize, CapId, CapId), KernelError> {
+        let limits = self.runtime_capacity_config();
         let (endpoint_idx, notif_send_cap, recv_cap) =
             self.create_endpoint_with_mode(max_depth, EndpointMode::Buffered)?;
 
         let mut slot_index = None;
-        for (idx, slot) in self.ipc.notifications.iter().enumerate() {
+        for (idx, slot) in self
+            .ipc
+            .notifications
+            .iter()
+            .take(limits.max_notifications)
+            .enumerate()
+        {
             if slot.is_none() {
                 slot_index = Some(idx);
                 break;
@@ -272,9 +288,10 @@ impl KernelState {
     }
 
     fn resolve_notification_index(&self, object: CapObject) -> Result<usize, KernelError> {
+        let limits = self.runtime_capacity_config();
         match object {
             CapObject::Notification { index, generation } => {
-                if index >= MAX_NOTIFICATIONS || self.ipc.notifications[index].is_none() {
+                if index >= limits.max_notifications || self.ipc.notifications[index].is_none() {
                     return Err(KernelError::WrongObject);
                 }
                 if self.ipc.notification_generations[index] != generation {

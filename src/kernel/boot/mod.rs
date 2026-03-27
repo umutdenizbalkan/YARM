@@ -236,6 +236,24 @@ pub struct CapacityTelemetry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelCapacityProfile {
+    HostedDefault,
+    Constrained,
+    Throughput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeCapacityConfig {
+    pub max_endpoints: usize,
+    pub max_notifications: usize,
+    pub max_tasks: usize,
+    pub max_drivers: usize,
+    pub max_memory_objects: usize,
+    pub max_transfer_envelopes: usize,
+    pub max_capability_slots: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MemoryObject {
     id: u64,
     phys: PhysAddr,
@@ -353,6 +371,7 @@ pub struct KernelState {
     robust_futex: KernelStorage<[Option<RobustFutexRecord>; MAX_TASKS]>,
     memory: KernelStorage<MemorySubsystem>,
     drivers: DriverSubsystem,
+    capacity_profile: KernelCapacityProfile,
     tlb_shootdown_count: u64,
     faults: FaultSubsystem,
     restart: RestartSubsystem,
@@ -379,7 +398,17 @@ fn map_ipc_error(err: IpcError) -> KernelError {
 }
 
 impl Bootstrap {
+    pub const fn default_capacity_profile() -> KernelCapacityProfile {
+        KernelCapacityProfile::HostedDefault
+    }
+
     pub fn init() -> Result<KernelState, KernelError> {
+        Self::init_with_capacity_profile(Self::default_capacity_profile())
+    }
+
+    pub fn init_with_capacity_profile(
+        capacity_profile: KernelCapacityProfile,
+    ) -> Result<KernelState, KernelError> {
         let mut kernel_aspace = AddressSpace::new_kernel();
         kernel_aspace
             .map_page(
@@ -448,6 +477,7 @@ impl Bootstrap {
                 driver_records: [const { None }; MAX_DRIVERS],
                 next_iova_space_id: 1,
             },
+            capacity_profile,
             tlb_shootdown_count: 0,
             faults: FaultSubsystem {
                 last_fault: None,
@@ -505,6 +535,45 @@ impl KernelState {
                 self.cspace.occupied_slots(),
                 crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
             ),
+        }
+    }
+
+    pub fn capacity_profile(&self) -> KernelCapacityProfile {
+        self.capacity_profile
+    }
+
+    pub fn runtime_capacity_config(&self) -> RuntimeCapacityConfig {
+        match self.capacity_profile {
+            KernelCapacityProfile::HostedDefault => RuntimeCapacityConfig {
+                max_endpoints: MAX_ENDPOINTS,
+                max_notifications: MAX_NOTIFICATIONS,
+                max_tasks: MAX_TASKS,
+                max_drivers: MAX_DRIVERS,
+                max_memory_objects: MAX_MEMORY_OBJECTS,
+                max_transfer_envelopes: MAX_TRANSFER_ENVELOPES,
+                max_capability_slots: crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+            },
+            KernelCapacityProfile::Constrained => RuntimeCapacityConfig {
+                max_endpoints: core::cmp::max(1, MAX_ENDPOINTS / 2),
+                max_notifications: core::cmp::max(1, MAX_NOTIFICATIONS / 2),
+                max_tasks: core::cmp::max(2, MAX_TASKS / 2),
+                max_drivers: core::cmp::max(1, MAX_DRIVERS / 2),
+                max_memory_objects: core::cmp::max(1, MAX_MEMORY_OBJECTS / 2),
+                max_transfer_envelopes: core::cmp::max(1, MAX_TRANSFER_ENVELOPES / 2),
+                max_capability_slots: core::cmp::max(
+                    1,
+                    crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE / 2,
+                ),
+            },
+            KernelCapacityProfile::Throughput => RuntimeCapacityConfig {
+                max_endpoints: MAX_ENDPOINTS,
+                max_notifications: MAX_NOTIFICATIONS,
+                max_tasks: MAX_TASKS,
+                max_drivers: MAX_DRIVERS,
+                max_memory_objects: MAX_MEMORY_OBJECTS,
+                max_transfer_envelopes: MAX_TRANSFER_ENVELOPES,
+                max_capability_slots: crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+            },
         }
     }
 
@@ -2237,6 +2306,19 @@ mod tests {
         assert_eq!(t.endpoints.used, threshold);
         assert_eq!(t.endpoints.capacity, super::MAX_ENDPOINTS);
         assert!(t.endpoints.near_full);
+    }
+
+    #[test]
+    fn runtime_capacity_profile_constrained_limits_endpoint_creation() {
+        let mut state = Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
+            .expect("init");
+        let limits = state.runtime_capacity_config();
+        assert_eq!(state.capacity_profile(), KernelCapacityProfile::Constrained);
+
+        for _ in 0..limits.max_endpoints {
+            state.create_endpoint(1).expect("endpoint");
+        }
+        assert_eq!(state.create_endpoint(1), Err(KernelError::EndpointFull));
     }
 
     #[test]

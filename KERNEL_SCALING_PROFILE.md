@@ -68,6 +68,8 @@ changes were made:
 - Multiple blocked sender waiters per endpoint are supported.
 - IPC queue policy is endpoint-class-aware (`ControlPlane` vs `DataPlane`) with
   class-specific queue depth defaults.
+- Runtime capacity config phase 1 is available via boot-time profile selection
+  (`HostedDefault`, `Constrained`, `Throughput`).
 - Driver records can track multiple IRQ and DMA caps.
 - DMA region minting checks against parent memory object length.
 - Capacity values are profile-aware and documented.
@@ -80,16 +82,13 @@ model.
 
 Recommended follow-ups:
 
-1. **Runtime capacity config**
-   - Move from compile-time constants to a boot-time capacity descriptor.
-
-2. **Allocator-backed registries**
+1. **Allocator-backed registries**
    - Replace fixed arrays for endpoints/notifications/drivers/tasks with slabs or
      arena-indexed vectors.
 
-3. **Memory object sizing model**
+2. **Memory object sizing model**
    - Support explicit multi-page memory-object creation in public APIs so DMA sizing
      can be expressed directly rather than inferred.
 
-4. **Capacity telemetry + pressure signals**
+3. **Capacity telemetry + pressure signals**
    - Export "near-full" metrics to supervisor/init for proactive remediation.
