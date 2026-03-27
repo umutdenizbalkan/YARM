@@ -770,15 +770,6 @@ impl KernelState {
         self.ipc.endpoint_waiters[index]
     }
 
-    pub(crate) fn revoke_kernel_global_capability(
-        &mut self,
-        cap: CapId,
-    ) -> Result<(), KernelError> {
-        self.cspace
-            .revoke(cap)
-            .map_err(|_| KernelError::InvalidCapability)
-    }
-
     pub fn capability_for_cnode(&self, cnode: CNodeId, cap: CapId) -> Option<Capability> {
         let capability = self.capability_for_cnode_local(cnode, cap)?;
         self.capability_object_live(capability.object)?;
@@ -2300,9 +2291,12 @@ mod tests {
             iova_len: crate::kernel::vm::PAGE_SIZE,
         };
 
-        let (irq_cap, dma_cap) = state.delegate_device_server_caps(plan).expect("delegate");
-        assert!(state.cspace.get(irq_cap).is_some());
-        assert!(state.cspace.get(dma_cap).is_some());
+        let (irq_cap, dma_cap, iova_cap) =
+            state.delegate_device_server_caps(plan).expect("delegate");
+        let driver_cnode = state.task_cnode(34).expect("driver cnode");
+        assert!(state.capability_for_cnode(driver_cnode, irq_cap).is_some());
+        assert!(state.capability_for_cnode(driver_cnode, dma_cap).is_some());
+        assert!(state.capability_for_cnode(driver_cnode, iova_cap).is_some());
         assert!(
             state
                 .validate_driver_dma_iova(
@@ -2484,14 +2478,39 @@ mod tests {
             })
             .expect("bundle");
 
-        assert!(state.cspace.get(bundle.irq_cap).is_some());
-        assert!(state.cspace.get(bundle.dma_cap).is_some());
-        assert!(state.cspace.get(bundle.iova_cap).is_some());
+        let driver_cnode = state.task_cnode(59).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.irq_cap)
+                .is_some()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.dma_cap)
+                .is_some()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.iova_cap)
+                .is_some()
+        );
 
         state.revoke_driver_runtime_caps(59).expect("revoke");
-        assert!(state.cspace.get(bundle.irq_cap).is_none());
-        assert!(state.cspace.get(bundle.dma_cap).is_none());
-        assert!(state.cspace.get(bundle.iova_cap).is_none());
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.irq_cap)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.dma_cap)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, bundle.iova_cap)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2602,8 +2621,8 @@ mod tests {
 
         let irq_a = state.mint_irq_cap(10).expect("irq a");
         let irq_b = state.mint_irq_cap(11).expect("irq b");
-        state.grant_driver_irq(44, irq_a).expect("grant irq a");
-        state.grant_driver_irq(44, irq_b).expect("grant irq b");
+        let delegated_irq_a = state.grant_driver_irq(44, irq_a).expect("grant irq a");
+        let delegated_irq_b = state.grant_driver_irq(44, irq_b).expect("grant irq b");
 
         let (_id_a, mem_a) = state.alloc_anonymous_memory_object().expect("mem a");
         let (_id_b, mem_b) = state.alloc_anonymous_memory_object().expect("mem b");
@@ -2613,14 +2632,31 @@ mod tests {
         let dma_b = state
             .mint_dma_region_cap(mem_b, 0, crate::kernel::vm::PAGE_SIZE)
             .expect("dma b");
-        state.grant_driver_dma(44, dma_a).expect("grant dma a");
-        state.grant_driver_dma(44, dma_b).expect("grant dma b");
+        let delegated_dma_a = state.grant_driver_dma(44, dma_a).expect("grant dma a");
+        let delegated_dma_b = state.grant_driver_dma(44, dma_b).expect("grant dma b");
 
         state.revoke_driver_runtime_caps(44).expect("revoke");
-        assert!(state.cspace.get(irq_a).is_none());
-        assert!(state.cspace.get(irq_b).is_none());
-        assert!(state.cspace.get(dma_a).is_none());
-        assert!(state.cspace.get(dma_b).is_none());
+        let driver_cnode = state.task_cnode(44).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_irq_a)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_irq_b)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_dma_a)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_dma_b)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2853,21 +2889,34 @@ mod tests {
         state.register_driver(32).expect("driver");
 
         let irq = state.mint_irq_cap(4).expect("irq");
-        state.grant_driver_irq(32, irq).expect("grant irq");
+        let delegated_irq = state.grant_driver_irq(32, irq).expect("grant irq");
 
         let (_id, mem) = state.alloc_anonymous_memory_object().expect("mem");
         let dma = state
             .mint_dma_region_cap(mem, 0, crate::kernel::vm::PAGE_SIZE)
             .expect("dma");
-        state.grant_driver_dma(32, dma).expect("grant dma");
+        let delegated_dma = state.grant_driver_dma(32, dma).expect("grant dma");
 
         let iova = state.create_iova_space_cap().expect("iova");
-        state.grant_driver_iova_space(32, iova).expect("grant iova");
+        let delegated_iova = state.grant_driver_iova_space(32, iova).expect("grant iova");
 
         state.revoke_driver_runtime_caps(32).expect("revoke");
-        assert!(state.cspace.get(irq).is_none());
-        assert!(state.cspace.get(dma).is_none());
-        assert!(state.cspace.get(iova).is_none());
+        let driver_cnode = state.task_cnode(32).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_irq)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_dma)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_iova)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2877,14 +2926,16 @@ mod tests {
         state.register_driver(33).expect("driver");
 
         let irq = state.mint_irq_cap(8).expect("irq");
-        state.grant_driver_irq(33, irq).expect("grant irq");
+        let delegated_irq = state.grant_driver_irq(33, irq).expect("grant irq");
         state.revoke_driver_runtime_caps(33).expect("revoke");
 
-        assert!(state.cspace.get(irq).is_none());
-        assert_eq!(
-            state.grant_driver_irq(33, irq),
-            Err(KernelError::InvalidCapability)
+        let driver_cnode = state.task_cnode(33).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, delegated_irq)
+                .is_none()
         );
+        assert!(state.grant_driver_irq(33, irq).is_ok());
     }
 
     #[test]
@@ -2908,8 +2959,17 @@ mod tests {
         state
             .validate_driver_bundle_live(111, first_bundle)
             .expect("bundle live");
-        assert!(state.cspace.get(first_bundle.irq_cap).is_some());
-        assert!(state.cspace.get(first_bundle.dma_cap).is_some());
+        let driver_cnode = state.task_cnode(111).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
+                .is_some()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
+                .is_some()
+        );
 
         let token = state.exit_task(111, 5).expect("exit");
         state.restart_task(111, token).expect("restart");
@@ -2918,14 +2978,27 @@ mod tests {
             state.validate_driver_bundle_live(111, first_bundle),
             Err(KernelError::StaleCapability)
         );
-        assert!(state.cspace.get(first_bundle.irq_cap).is_none());
-        assert!(state.cspace.get(first_bundle.dma_cap).is_none());
+        let driver_cnode = state.task_cnode(111).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
+                .is_none()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
+                .is_none()
+        );
         assert_eq!(
             state.grant_driver_irq(111, first_bundle.irq_cap),
             Err(KernelError::InvalidCapability)
         );
 
-        assert!(state.cspace.get(iova_cap).is_none());
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, first_bundle.iova_cap)
+                .is_none()
+        );
         let iova_cap2 = state.create_iova_space_cap().expect("iova2");
 
         let second_bundle = state
@@ -2943,8 +3016,17 @@ mod tests {
 
         assert_ne!(first_bundle.irq_cap, second_bundle.irq_cap);
         assert_ne!(first_bundle.dma_cap, second_bundle.dma_cap);
-        assert!(state.cspace.get(second_bundle.irq_cap).is_some());
-        assert!(state.cspace.get(second_bundle.dma_cap).is_some());
+        let driver_cnode = state.task_cnode(111).expect("driver cnode");
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, second_bundle.irq_cap)
+                .is_some()
+        );
+        assert!(
+            state
+                .capability_for_cnode(driver_cnode, second_bundle.dma_cap)
+                .is_some()
+        );
     }
 
     #[test]
