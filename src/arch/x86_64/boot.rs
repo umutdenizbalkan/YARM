@@ -94,8 +94,6 @@ pvh_start32:
     mov eax, cr0
     or eax, 0x80000001
     mov cr0, eax
-    mov bl, 'D'
-    call uart_putc32
     push 0x08
     mov eax, offset long_mode_entry
     push eax
