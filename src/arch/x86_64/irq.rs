@@ -1,13 +1,15 @@
 #[cfg(any(test, not(feature = "hosted-dev")))]
 use core::ptr::write_volatile;
 #[cfg(any(test, not(feature = "hosted-dev")))]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
 const LAPIC_EOI_OFFSET: usize = 0xB0;
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
-static LAPIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(super::platform_layout::LAPIC_MMIO_BASE);
+static LAPIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(test, not(feature = "hosted-dev")))]
+static LAPIC_CONFIGURED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
 pub fn init_lapic_mmio_base(base: usize) {
@@ -15,6 +17,7 @@ pub fn init_lapic_mmio_base(base: usize) {
         return;
     }
     LAPIC_MMIO_BASE.store(base, Ordering::Relaxed);
+    LAPIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
 
 pub fn configure_lapic_from_platform_layout() {
@@ -70,6 +73,9 @@ pub fn external_irq_eoi(_irq_line: u16) {}
 
 #[cfg(not(feature = "hosted-dev"))]
 pub fn external_irq_eoi(_irq_line: u16) {
+    if !LAPIC_CONFIGURED.load(Ordering::Relaxed) {
+        return;
+    }
     lapic_write_eoi(LAPIC_MMIO_BASE.load(Ordering::Relaxed));
 }
 
@@ -83,5 +89,12 @@ mod tests {
         let base = regs.as_mut_ptr() as usize;
         lapic_write_eoi(base);
         assert_eq!(regs[LAPIC_EOI_OFFSET / core::mem::size_of::<u32>()], 0);
+    }
+
+    #[test]
+    fn init_lapic_marks_controller_configured() {
+        LAPIC_CONFIGURED.store(false, Ordering::Relaxed);
+        init_lapic_mmio_base(0x1000);
+        assert!(LAPIC_CONFIGURED.load(Ordering::Relaxed));
     }
 }

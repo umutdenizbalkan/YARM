@@ -9,6 +9,7 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
 - **Per-CPU TLS restore observability:** architecture trap paths now expose CPU-indexed TLS-restore slots and include isolation tests to verify CPU-local behavior.
 - **External IRQ completion plumbing added:** external IRQ trap handling now saves/restores interrupt state around routing and calls an ISA-selected `external_irq_eoi` hook for controller completion handoff.
 - **IRQ completion integration advanced:** x86 APIC / aarch64 GIC / riscv64 PLIC EOI backends now perform register-level completion writes using selected-ISA platform-layout initialization at boot entry.
+- **IRQ safety hardening added:** controller MMIO EOI writes are now explicitly configuration-gated, preventing accidental writes when controller state is not initialized.
 - **Remaining hardware integration work tracked:** source controller MMIO/context values from ACPI/DT/platform firmware instead of static profile constants.
 
 ## In-kernel mechanism status

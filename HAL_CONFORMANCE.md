@@ -42,6 +42,7 @@ Both profiles must satisfy identical kernel-facing semantics for:
 ## Current implementation note
 
 - Architecture EOI hooks exist for `x86_64`, `riscv64`, and `aarch64`, and now issue register-level completion writes after boot-time platform-layout initialization.
+- EOI backends are configuration-gated and no-op until initialized, avoiding accidental MMIO writes from implicit defaults.
 - Remaining integration work is feeding controller addresses/contexts from hardware discovery (ACPI/DT) rather than static platform profile constants.
 
 ## Invariants

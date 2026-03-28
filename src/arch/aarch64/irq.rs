@@ -1,13 +1,15 @@
 #[cfg(any(test, target_arch = "aarch64"))]
 use core::ptr::write_volatile;
 #[cfg(any(test, target_arch = "aarch64"))]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(any(test, target_arch = "aarch64"))]
 const GICC_EOIR_OFFSET: usize = 0x10;
 
 #[cfg(any(test, target_arch = "aarch64"))]
-static GIC_CPU_IF_BASE: AtomicUsize = AtomicUsize::new(super::platform_layout::GIC_CPU_IF_BASE);
+static GIC_CPU_IF_BASE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(test, target_arch = "aarch64"))]
+static GIC_CONFIGURED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(any(test, target_arch = "aarch64"))]
 pub fn init_gic_cpu_if_base(base: usize) {
@@ -15,6 +17,7 @@ pub fn init_gic_cpu_if_base(base: usize) {
         return;
     }
     GIC_CPU_IF_BASE.store(base, Ordering::Relaxed);
+    GIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
 
 pub fn configure_gic_from_platform_layout() {
@@ -80,6 +83,9 @@ pub fn external_irq_eoi(_irq_line: u16) {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 pub fn external_irq_eoi(irq_line: u16) {
+    if !GIC_CONFIGURED.load(Ordering::Relaxed) {
+        return;
+    }
     gic_write_eoir(GIC_CPU_IF_BASE.load(Ordering::Relaxed), irq_line);
 }
 
@@ -96,5 +102,12 @@ mod tests {
         let base = regs.as_mut_ptr() as usize;
         gic_write_eoir(base, 55);
         assert_eq!(regs[GICC_EOIR_OFFSET / core::mem::size_of::<u32>()], 55);
+    }
+
+    #[test]
+    fn init_gic_marks_controller_configured() {
+        GIC_CONFIGURED.store(false, Ordering::Relaxed);
+        init_gic_cpu_if_base(0x3000);
+        assert!(GIC_CONFIGURED.load(Ordering::Relaxed));
     }
 }

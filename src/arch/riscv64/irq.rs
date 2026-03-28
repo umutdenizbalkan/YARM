@@ -1,7 +1,7 @@
 #[cfg(any(test, target_arch = "riscv64"))]
 use core::ptr::write_volatile;
 #[cfg(any(test, target_arch = "riscv64"))]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(any(test, target_arch = "riscv64"))]
 const PLIC_CONTEXT_BASE_OFFSET: usize = 0x0020_0000;
@@ -11,10 +11,11 @@ const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 const PLIC_CLAIM_COMPLETE_OFFSET: usize = 0x4;
 
 #[cfg(any(test, target_arch = "riscv64"))]
-static PLIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(super::platform_layout::PLIC_MMIO_BASE);
+static PLIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(test, target_arch = "riscv64"))]
-static PLIC_CONTEXT_INDEX: AtomicUsize =
-    AtomicUsize::new(super::platform_layout::PLIC_SMODE_CONTEXT_INDEX);
+static PLIC_CONTEXT_INDEX: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(test, target_arch = "riscv64"))]
+static PLIC_CONFIGURED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(any(test, target_arch = "riscv64"))]
 pub fn init_plic_mmio_base(base: usize) {
@@ -22,11 +23,13 @@ pub fn init_plic_mmio_base(base: usize) {
         return;
     }
     PLIC_MMIO_BASE.store(base, Ordering::Relaxed);
+    PLIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
 
 #[cfg(any(test, target_arch = "riscv64"))]
 pub fn init_plic_context_index(context_index: usize) {
     PLIC_CONTEXT_INDEX.store(context_index, Ordering::Relaxed);
+    PLIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
 
 pub fn configure_plic_from_platform_layout() {
@@ -99,6 +102,9 @@ pub fn external_irq_eoi(_irq_line: u16) {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn external_irq_eoi(irq_line: u16) {
+    if !PLIC_CONFIGURED.load(Ordering::Relaxed) {
+        return;
+    }
     let base = PLIC_MMIO_BASE.load(Ordering::Relaxed);
     let context_index = PLIC_CONTEXT_INDEX.load(Ordering::Relaxed);
     let complete_addr = plic_claim_complete_addr(base, context_index);
@@ -123,5 +129,12 @@ mod tests {
         plic_write_complete(addr, 37);
         let word = (addr - (regs.as_mut_ptr() as usize)) / core::mem::size_of::<u32>();
         assert_eq!(regs[word], 37);
+    }
+
+    #[test]
+    fn init_plic_marks_controller_configured() {
+        PLIC_CONFIGURED.store(false, Ordering::Relaxed);
+        init_plic_mmio_base(0x2000);
+        assert!(PLIC_CONFIGURED.load(Ordering::Relaxed));
     }
 }

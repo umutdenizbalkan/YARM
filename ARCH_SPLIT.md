@@ -85,6 +85,7 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
   - `src/arch/irq_guard.rs` facade
   - `src/arch/{x86_64,riscv64,aarch64}/irq.rs` `external_irq_eoi(...)` hooks
 - Current ISA hooks now perform register-level completion writes and are initialized from selected-ISA `platform_layout` constants during boot entry.
+- IRQ backends now gate EOI writes on explicit controller configuration, so unconfigured paths no longer write using synthetic implicit defaults.
 - Remaining work is platform discovery/DT/ACPI handoff so runtime controller addresses/contexts come from hardware description instead of profile constants.
 
 
