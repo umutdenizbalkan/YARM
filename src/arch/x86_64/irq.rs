@@ -24,6 +24,34 @@ pub fn configure_lapic_from_platform_layout() {
     init_lapic_mmio_base(super::platform_layout::LAPIC_MMIO_BASE);
 }
 
+fn parse_usize_token(description: &[u8], key: &str) -> Option<usize> {
+    let text = core::str::from_utf8(description).ok()?;
+    for token in text.split_whitespace() {
+        let (lhs, rhs) = token.split_once('=')?;
+        if lhs != key {
+            continue;
+        }
+        if let Some(hex) = rhs.strip_prefix("0x").or_else(|| rhs.strip_prefix("0X")) {
+            return usize::from_str_radix(hex, 16).ok();
+        }
+        if let Ok(value) = rhs.parse::<usize>() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+pub fn try_configure_lapic_from_description(description: &[u8]) -> bool {
+    let Some(base) = parse_usize_token(description, "lapic_mmio_base") else {
+        return false;
+    };
+    if base == 0 {
+        return false;
+    }
+    init_lapic_mmio_base(base);
+    true
+}
+
 #[cfg(any(test, not(feature = "hosted-dev")))]
 fn lapic_write_eoi(base: usize) {
     unsafe {
@@ -95,6 +123,15 @@ mod tests {
     fn init_lapic_marks_controller_configured() {
         LAPIC_CONFIGURED.store(false, Ordering::Relaxed);
         init_lapic_mmio_base(0x1000);
+        assert!(LAPIC_CONFIGURED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn lapic_configuration_parses_description() {
+        LAPIC_CONFIGURED.store(false, Ordering::Relaxed);
+        assert!(try_configure_lapic_from_description(
+            b"lapic_mmio_base=0xfee00000"
+        ));
         assert!(LAPIC_CONFIGURED.load(Ordering::Relaxed));
     }
 }

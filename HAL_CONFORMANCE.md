@@ -43,6 +43,7 @@ Both profiles must satisfy identical kernel-facing semantics for:
 
 - Architecture EOI hooks exist for `x86_64`, `riscv64`, and `aarch64`, and now issue register-level completion writes after boot-time platform-layout initialization.
 - EOI backends are configuration-gated and no-op until initialized, avoiding accidental MMIO writes from implicit defaults.
+- Hosted-dev boot supports description-driven controller initialization via `YARM_IRQ_CONTROLLER_DESCRIPTION` with automatic fallback to platform layout defaults.
 - Remaining integration work is feeding controller addresses/contexts from hardware discovery (ACPI/DT) rather than static platform profile constants.
 
 ## Invariants

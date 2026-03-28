@@ -37,6 +37,38 @@ pub fn configure_plic_from_platform_layout() {
     init_plic_context_index(super::platform_layout::PLIC_SMODE_CONTEXT_INDEX);
 }
 
+fn parse_usize_token(description: &[u8], key: &str) -> Option<usize> {
+    let text = core::str::from_utf8(description).ok()?;
+    for token in text.split_whitespace() {
+        let (lhs, rhs) = token.split_once('=')?;
+        if lhs != key {
+            continue;
+        }
+        if let Some(hex) = rhs.strip_prefix("0x").or_else(|| rhs.strip_prefix("0X")) {
+            return usize::from_str_radix(hex, 16).ok();
+        }
+        if let Ok(value) = rhs.parse::<usize>() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+pub fn try_configure_plic_from_description(description: &[u8]) -> bool {
+    let Some(base) = parse_usize_token(description, "plic_mmio_base") else {
+        return false;
+    };
+    let Some(context_index) = parse_usize_token(description, "plic_smode_context") else {
+        return false;
+    };
+    if base == 0 {
+        return false;
+    }
+    init_plic_mmio_base(base);
+    init_plic_context_index(context_index);
+    true
+}
+
 #[cfg(any(test, target_arch = "riscv64"))]
 fn plic_claim_complete_addr(base: usize, context_index: usize) -> usize {
     base + PLIC_CONTEXT_BASE_OFFSET
@@ -135,6 +167,15 @@ mod tests {
     fn init_plic_marks_controller_configured() {
         PLIC_CONFIGURED.store(false, Ordering::Relaxed);
         init_plic_mmio_base(0x2000);
+        assert!(PLIC_CONFIGURED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn plic_configuration_parses_description() {
+        PLIC_CONFIGURED.store(false, Ordering::Relaxed);
+        assert!(try_configure_plic_from_description(
+            b"plic_mmio_base=0x0c000000 plic_smode_context=1"
+        ));
         assert!(PLIC_CONFIGURED.load(Ordering::Relaxed));
     }
 }
