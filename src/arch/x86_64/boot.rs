@@ -32,17 +32,15 @@ boot_pdpt:
 
     .align 4096
 boot_pd:
-    // Hardening tranche (stage 3):
-    // - split first 2MiB identity map into 4KiB PTEs so executable scope is narrowed
-    // - keep only a minimal executable bootstrap window in early low memory
-    // - mark remaining identity-mapped bootstrap pages NX to reduce executable surface
-    // - keep writable data/stack support during early bring-up
+    // Bootstrap identity map:
+    // - first 2MiB via 4KiB PTEs for early transition flexibility
+    // - 2MiB..64MiB via 2MiB executable pages to tolerate firmware/kernel placement
     .set page_flags_pt, 0x03
-    .set page_flags_data_nx, 0x8000000000000083
+    .set page_flags_exec, 0x83
     .quad boot_pt0 + page_flags_pt
     .set page_index, 1
     .rept 31
-    .quad (page_index * 0x200000) | page_flags_data_nx
+    .quad (page_index * 0x200000) | page_flags_exec
     .set page_index, page_index + 1
     .endr
     .zero 3840
@@ -50,9 +48,7 @@ boot_pd:
     .align 4096
 boot_pt0:
     .set pte_flags_exec, 0x003
-    .set pte_flags_data_nx, 0x8000000000000003
-    // Keep the first 2MiB executable until long-mode handoff is complete;
-    // firmware/kernel placement can land bootstrap text above 256KiB.
+    // Keep the first 2MiB executable until long-mode handoff is complete.
     .set pte_index, 0
     .rept 512
     .quad (pte_index * 0x1000) | pte_flags_exec
