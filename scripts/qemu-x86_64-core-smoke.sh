@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SMOKE_LOG=${SMOKE_LOG:-smoke.log}
+: >"$SMOKE_LOG"
+exec 19>>"$SMOKE_LOG"
+export BASH_XTRACEFD=19
+export PS4='+ ${BASH_SOURCE}:${LINENO}: '
+set -x
+
 KERNEL_IMAGE=${KERNEL_IMAGE:-build-x86_64/bootable-kernel.img}
 KERNEL_DEBUG_ELF=${KERNEL_DEBUG_ELF:-build-x86_64/kernel_boot.elf}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build-x86_64/initramfs-core.cpio}
