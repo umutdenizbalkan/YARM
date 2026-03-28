@@ -25,6 +25,19 @@ pub fn stage_irq_controller_description_from_firmware_blob(blob: &[u8]) -> bool 
     stage_irq_controller_description_for_boot(&canonical[..canonical_len])
 }
 
+#[inline]
+pub fn run_kernel_boot_with_firmware_blob(run: fn(), firmware_blob: Option<&[u8]>) {
+    if let Some(blob) = firmware_blob {
+        let mut canonical = [0u8; MAX_IRQ_DESCRIPTION_BYTES];
+        if let Some(canonical_len) =
+            crate::arch::topology::discover_irq_controller_description(blob, &mut canonical)
+        {
+            return run_kernel_boot_with_irq_description(run, Some(&canonical[..canonical_len]));
+        }
+    }
+    run_kernel_boot_with_irq_description(run, None);
+}
+
 fn take_staged_irq_description<'a>(
     scratch: &'a mut [u8; MAX_IRQ_DESCRIPTION_BYTES],
 ) -> Option<&'a [u8]> {
@@ -58,11 +71,16 @@ pub fn run_kernel_boot(run: fn()) {
     }
 
     #[cfg(feature = "hosted-dev")]
-    let irq_description = crate::std::env::var("YARM_IRQ_CONTROLLER_DESCRIPTION")
-        .ok()
-        .map(|s| s.into_bytes());
+    let irq_description = crate::std::env::var("YARM_IRQ_CONTROLLER_DESCRIPTION").ok();
     #[cfg(feature = "hosted-dev")]
-    return run_kernel_boot_with_irq_description(run, irq_description.as_deref());
+    if let Some(irq_description) = irq_description {
+        return run_kernel_boot_with_irq_description(run, Some(irq_description.as_bytes()));
+    }
+
+    #[cfg(feature = "hosted-dev")]
+    if let Ok(firmware_blob) = crate::std::env::var("YARM_IRQ_FIRMWARE_BLOB") {
+        return run_kernel_boot_with_firmware_blob(run, Some(firmware_blob.as_bytes()));
+    }
 
     #[cfg(not(feature = "hosted-dev"))]
     run_kernel_boot_with_irq_description(run, None);
@@ -109,5 +127,16 @@ mod tests {
         assert!(stage_irq_controller_description_from_firmware_blob(
             b"LAPIC_BASE=0xfee04000"
         ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn boot_entry_accepts_firmware_blob_path() {
+        crate::arch::x86_64::irq::reset_lapic_config_for_test();
+        run_kernel_boot_with_firmware_blob(|| {}, Some(b"LAPIC_BASE=0xfee05000"));
+        assert_eq!(
+            crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
+            0xFEE0_5000
+        );
     }
 }
