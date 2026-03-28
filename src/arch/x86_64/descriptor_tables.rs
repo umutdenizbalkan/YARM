@@ -65,9 +65,13 @@ pub struct X86IdtPointer {
 
 impl X86IdtPointer {
     pub fn from_table(table: &[X86IdtEntry; IDT_ENTRIES]) -> Self {
+        Self::from_ptr(table.as_ptr())
+    }
+
+    pub fn from_ptr(table: *const X86IdtEntry) -> Self {
         Self {
             limit: (core::mem::size_of::<X86IdtEntry>() * IDT_ENTRIES - 1) as u16,
-            base: table.as_ptr() as u64,
+            base: table as u64,
         }
     }
 }
@@ -218,41 +222,52 @@ extern "C" fn external_interrupt_stub() -> ! {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn handler_addr(handler: extern "C" fn() -> !) -> u64 {
+    handler as *const () as usize as u64
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn ensure_boot_descriptor_tables_scaffolded() {
     if DESCRIPTOR_SCAFFOLD_READY.swap(true, Ordering::AcqRel) {
         return;
     }
     unsafe {
-        let handler = default_interrupt_stub as usize as u64;
-        for entry in &mut BOOT_IDT {
-            *entry = X86IdtEntry::new_interrupt(handler, KERNEL_CODE_SELECTOR, 0, 0);
+        let handler = handler_addr(default_interrupt_stub);
+        let idt_ptr = core::ptr::addr_of_mut!(BOOT_IDT).cast::<X86IdtEntry>();
+        let mut i = 0usize;
+        while i < IDT_ENTRIES {
+            core::ptr::write(
+                idt_ptr.add(i),
+                X86IdtEntry::new_interrupt(handler, KERNEL_CODE_SELECTOR, 0, 0),
+            );
+            i += 1;
         }
         BOOT_IDT[VEC_TIMER] = X86IdtEntry::new_interrupt(
-            timer_interrupt_stub as usize as u64,
+            handler_addr(timer_interrupt_stub),
             KERNEL_CODE_SELECTOR,
             0,
             0,
         );
         BOOT_IDT[VEC_NMI] = X86IdtEntry::new_interrupt(
-            nmi_interrupt_stub as usize as u64,
+            handler_addr(nmi_interrupt_stub),
             KERNEL_CODE_SELECTOR,
             0,
             IST_SLOT_NMI,
         );
         BOOT_IDT[VEC_DOUBLE_FAULT] = X86IdtEntry::new_interrupt(
-            double_fault_stub as usize as u64,
+            handler_addr(double_fault_stub),
             KERNEL_CODE_SELECTOR,
             0,
             IST_SLOT_DOUBLE_FAULT,
         );
         BOOT_IDT[VEC_PAGE_FAULT] = X86IdtEntry::new_interrupt(
-            page_fault_stub as usize as u64,
+            handler_addr(page_fault_stub),
             KERNEL_CODE_SELECTOR,
             0,
             IST_SLOT_PAGE_FAULT,
         );
         BOOT_IDT[VEC_SYSCALL] = X86IdtEntry::new_interrupt(
-            syscall_interrupt_stub as usize as u64,
+            handler_addr(syscall_interrupt_stub),
             KERNEL_CODE_SELECTOR,
             3,
             0,
@@ -262,7 +277,7 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
                 continue;
             }
             BOOT_IDT[vector] = X86IdtEntry::new_interrupt(
-                external_interrupt_stub as usize as u64,
+                handler_addr(external_interrupt_stub),
                 KERNEL_CODE_SELECTOR,
                 0,
                 0,
@@ -285,7 +300,7 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         BOOT_GDT.entries[3] = tss_low;
         BOOT_GDT.entries[4] = tss_high;
 
-        let idtr = X86IdtPointer::from_table(&BOOT_IDT);
+        let idtr = X86IdtPointer::from_ptr(core::ptr::addr_of!(BOOT_IDT).cast::<X86IdtEntry>());
         let gdtr = X86GdtPointer {
             limit: (core::mem::size_of::<X86BootGdt>() - 1) as u16,
             base: core::ptr::addr_of!(BOOT_GDT) as u64,
