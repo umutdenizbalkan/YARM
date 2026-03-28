@@ -89,7 +89,7 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
 - Hosted-dev boot now attempts `YARM_IRQ_CONTROLLER_DESCRIPTION` parsing first, then falls back to selected-ISA `platform_layout` constants if absent/invalid.
 - `arch::boot_entry` now also exposes `run_kernel_boot_with_irq_description(...)`, allowing non-hosted callers to pass an explicit firmware-derived controller description blob.
 - `arch::boot_entry::stage_irq_controller_description_for_boot(...)` is now available for early-boot firmware handoff before `run_kernel_boot(...)`; staged descriptions are consumed once at boot.
-- `arch::boot_entry::stage_irq_controller_description_from_firmware_blob(...)` validates required ISA controller keys before staging a one-shot description for boot.
+- `arch::boot_entry::stage_irq_controller_description_from_firmware_blob(...)` validates required ISA controller keys and normalizes common alias keys (`LAPIC_BASE`, `plic_base`, `gicc_base`, etc.) into canonical description keys before staging.
 - Remaining work is platform discovery/DT/ACPI handoff so runtime controller addresses/contexts come from hardware description instead of profile constants.
 
 

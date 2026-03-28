@@ -16,17 +16,99 @@ pub fn stage_irq_controller_description_for_boot(description: &[u8]) -> bool {
 }
 
 pub fn stage_irq_controller_description_from_firmware_blob(blob: &[u8]) -> bool {
+    fn parse_first(blob: &[u8], keys: &[&str]) -> Option<usize> {
+        for key in keys {
+            if let Some(value) = crate::arch::irq_description::parse_usize_token(blob, key) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn push_byte(dst: &mut [u8], len: &mut usize, byte: u8) -> bool {
+        if *len >= dst.len() {
+            return false;
+        }
+        dst[*len] = byte;
+        *len += 1;
+        true
+    }
+
+    fn push_str(dst: &mut [u8], len: &mut usize, value: &str) -> bool {
+        for byte in value.as_bytes() {
+            if !push_byte(dst, len, *byte) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn push_hex(dst: &mut [u8], len: &mut usize, value: usize) -> bool {
+        if !push_str(dst, len, "0x") {
+            return false;
+        }
+        let mut started = false;
+        for shift in (0..(core::mem::size_of::<usize>() * 8)).rev().step_by(4) {
+            let nibble = ((value >> shift) & 0xF) as u8;
+            if nibble == 0 && !started && shift != 0 {
+                continue;
+            }
+            started = true;
+            let ch = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + (nibble - 10)
+            };
+            if !push_byte(dst, len, ch) {
+                return false;
+            }
+        }
+        true
+    }
+
+    let mut canonical = [0u8; MAX_IRQ_DESCRIPTION_BYTES];
+    let mut canonical_len = 0usize;
+
     #[cfg(target_arch = "x86_64")]
-    let valid = crate::arch::irq_description::parse_usize_token(blob, "lapic_mmio_base").is_some();
+    let valid = if let Some(base) = parse_first(
+        blob,
+        &["lapic_mmio_base", "lapic_base", "apic_base", "LAPIC_BASE"],
+    ) {
+        push_str(&mut canonical, &mut canonical_len, "lapic_mmio_base=")
+            && push_hex(&mut canonical, &mut canonical_len, base)
+    } else {
+        false
+    };
     #[cfg(target_arch = "riscv64")]
-    let valid = crate::arch::irq_description::parse_usize_token(blob, "plic_mmio_base").is_some()
-        && crate::arch::irq_description::parse_usize_token(blob, "plic_smode_context").is_some();
+    let valid = if let (Some(base), Some(context)) = (
+        parse_first(blob, &["plic_mmio_base", "plic_base", "PLIC_BASE"]),
+        parse_first(
+            blob,
+            &["plic_smode_context", "plic_context", "PLIC_CONTEXT"],
+        ),
+    ) {
+        push_str(&mut canonical, &mut canonical_len, "plic_mmio_base=")
+            && push_hex(&mut canonical, &mut canonical_len, base)
+            && push_byte(&mut canonical, &mut canonical_len, b' ')
+            && push_str(&mut canonical, &mut canonical_len, "plic_smode_context=")
+            && push_hex(&mut canonical, &mut canonical_len, context)
+    } else {
+        false
+    };
     #[cfg(target_arch = "aarch64")]
-    let valid = crate::arch::irq_description::parse_usize_token(blob, "gic_cpu_if_base").is_some();
+    let valid = if let Some(base) = parse_first(
+        blob,
+        &["gic_cpu_if_base", "gicc_base", "gic_cpu_base", "GICC_BASE"],
+    ) {
+        push_str(&mut canonical, &mut canonical_len, "gic_cpu_if_base=")
+            && push_hex(&mut canonical, &mut canonical_len, base)
+    } else {
+        false
+    };
     if !valid {
         return false;
     }
-    stage_irq_controller_description_for_boot(blob)
+    stage_irq_controller_description_for_boot(&canonical[..canonical_len])
 }
 
 fn take_staged_irq_description<'a>(
@@ -109,6 +191,9 @@ mod tests {
         ));
         assert!(stage_irq_controller_description_from_firmware_blob(
             b"lapic_mmio_base=0xfee03000"
+        ));
+        assert!(stage_irq_controller_description_from_firmware_blob(
+            b"LAPIC_BASE=0xfee04000"
         ));
     }
 }
