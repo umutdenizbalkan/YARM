@@ -1,3 +1,33 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+const MAX_IRQ_DESCRIPTION_BYTES: usize = 256;
+static IRQ_DESCRIPTION_LEN: AtomicUsize = AtomicUsize::new(0);
+static mut IRQ_DESCRIPTION_BUF: [u8; MAX_IRQ_DESCRIPTION_BYTES] = [0; MAX_IRQ_DESCRIPTION_BYTES];
+
+pub fn stage_irq_controller_description_for_boot(description: &[u8]) -> bool {
+    if description.is_empty() || description.len() > MAX_IRQ_DESCRIPTION_BYTES {
+        return false;
+    }
+    unsafe {
+        IRQ_DESCRIPTION_BUF[..description.len()].copy_from_slice(description);
+    }
+    IRQ_DESCRIPTION_LEN.store(description.len(), Ordering::Release);
+    true
+}
+
+fn take_staged_irq_description<'a>(
+    scratch: &'a mut [u8; MAX_IRQ_DESCRIPTION_BYTES],
+) -> Option<&'a [u8]> {
+    let len = IRQ_DESCRIPTION_LEN.swap(0, Ordering::AcqRel);
+    if len == 0 || len > MAX_IRQ_DESCRIPTION_BYTES {
+        return None;
+    }
+    unsafe {
+        scratch[..len].copy_from_slice(&IRQ_DESCRIPTION_BUF[..len]);
+    }
+    Some(&scratch[..len])
+}
+
 /// Selected-ISA boot entry facade used by top-level binaries.
 #[inline]
 pub fn run_kernel_boot_with_irq_description(run: fn(), irq_description: Option<&[u8]>) {
@@ -12,6 +42,11 @@ pub fn run_kernel_boot_with_irq_description(run: fn(), irq_description: Option<&
 
 #[inline]
 pub fn run_kernel_boot(run: fn()) {
+    let mut staged = [0u8; MAX_IRQ_DESCRIPTION_BYTES];
+    if let Some(description) = take_staged_irq_description(&mut staged) {
+        return run_kernel_boot_with_irq_description(run, Some(description));
+    }
+
     #[cfg(feature = "hosted-dev")]
     let irq_description = crate::std::env::var("YARM_IRQ_CONTROLLER_DESCRIPTION")
         .ok()
@@ -35,6 +70,20 @@ mod tests {
         assert_eq!(
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
             0xFEE0_1000
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn staged_description_is_consumed_once() {
+        crate::arch::x86_64::irq::reset_lapic_config_for_test();
+        assert!(stage_irq_controller_description_for_boot(
+            b"lapic_mmio_base=0xfee02000"
+        ));
+        run_kernel_boot(|| {});
+        assert_eq!(
+            crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
+            0xFEE0_2000
         );
     }
 }

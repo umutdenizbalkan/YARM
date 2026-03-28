@@ -45,6 +45,7 @@ Both profiles must satisfy identical kernel-facing semantics for:
 - EOI backends are configuration-gated and no-op until initialized, avoiding accidental MMIO writes from implicit defaults.
 - Hosted-dev boot supports description-driven controller initialization via `YARM_IRQ_CONTROLLER_DESCRIPTION` with automatic fallback to platform layout defaults.
 - Boot entry now provides an explicit description-injection API (`run_kernel_boot_with_irq_description`) so firmware handoff can bypass env-var plumbing and configure controllers directly.
+- Boot entry additionally supports one-shot staged description handoff (`stage_irq_controller_description_for_boot`) for early-boot contexts where direct run-hook plumbing is inconvenient.
 - Remaining integration work is feeding controller addresses/contexts from hardware discovery (ACPI/DT) rather than static platform profile constants.
 
 ## Invariants
