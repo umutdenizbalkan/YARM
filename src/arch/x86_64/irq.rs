@@ -26,7 +26,10 @@ pub fn configure_lapic_from_platform_layout() {
 
 fn parse_usize_token(description: &[u8], key: &str) -> Option<usize> {
     let text = core::str::from_utf8(description).ok()?;
-    for token in text.split_whitespace() {
+    for token in text.split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | ';')) {
+        if token.is_empty() {
+            continue;
+        }
         let (lhs, rhs) = token.split_once('=')?;
         if lhs != key {
             continue;
@@ -50,6 +53,17 @@ pub fn try_configure_lapic_from_description(description: &[u8]) -> bool {
     }
     init_lapic_mmio_base(base);
     true
+}
+
+#[cfg(test)]
+pub fn reset_lapic_config_for_test() {
+    LAPIC_CONFIGURED.store(false, Ordering::Relaxed);
+    LAPIC_MMIO_BASE.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn lapic_mmio_base_for_test() -> usize {
+    LAPIC_MMIO_BASE.load(Ordering::Relaxed)
 }
 
 #[cfg(any(test, not(feature = "hosted-dev")))]

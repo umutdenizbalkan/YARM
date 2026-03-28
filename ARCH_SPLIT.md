@@ -87,6 +87,7 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
 - Current ISA hooks now perform register-level completion writes and are initialized from selected-ISA `platform_layout` constants during boot entry.
 - IRQ backends now gate EOI writes on explicit controller configuration, so unconfigured paths no longer write using synthetic implicit defaults.
 - Hosted-dev boot now attempts `YARM_IRQ_CONTROLLER_DESCRIPTION` parsing first, then falls back to selected-ISA `platform_layout` constants if absent/invalid.
+- `arch::boot_entry` now also exposes `run_kernel_boot_with_irq_description(...)`, allowing non-hosted callers to pass an explicit firmware-derived controller description blob.
 - Remaining work is platform discovery/DT/ACPI handoff so runtime controller addresses/contexts come from hardware description instead of profile constants.
 
 

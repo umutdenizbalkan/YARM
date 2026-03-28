@@ -39,7 +39,10 @@ pub fn configure_plic_from_platform_layout() {
 
 fn parse_usize_token(description: &[u8], key: &str) -> Option<usize> {
     let text = core::str::from_utf8(description).ok()?;
-    for token in text.split_whitespace() {
+    for token in text.split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | ';')) {
+        if token.is_empty() {
+            continue;
+        }
         let (lhs, rhs) = token.split_once('=')?;
         if lhs != key {
             continue;
