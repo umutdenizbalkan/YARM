@@ -1,6 +1,10 @@
 #[cfg(target_arch = "riscv64")]
 pub type ArchIrqState = super::riscv64::irq::Riscv64IrqState;
 #[cfg(target_arch = "riscv64")]
+pub fn configure_external_irq_controller_from_platform_layout() {
+    super::riscv64::irq::configure_plic_from_platform_layout();
+}
+#[cfg(target_arch = "riscv64")]
 pub fn irq_save() -> ArchIrqState {
     super::riscv64::irq::irq_save()
 }
@@ -16,6 +20,10 @@ pub fn external_irq_eoi(irq_line: u16) {
 #[cfg(target_arch = "x86_64")]
 pub type ArchIrqState = super::x86_64::irq::X86IrqState;
 #[cfg(target_arch = "x86_64")]
+pub fn configure_external_irq_controller_from_platform_layout() {
+    super::x86_64::irq::configure_lapic_from_platform_layout();
+}
+#[cfg(target_arch = "x86_64")]
 pub fn irq_save() -> ArchIrqState {
     super::x86_64::irq::irq_save()
 }
@@ -30,6 +38,10 @@ pub fn external_irq_eoi(irq_line: u16) {
 
 #[cfg(target_arch = "aarch64")]
 pub type ArchIrqState = super::aarch64::irq::Aarch64IrqState;
+#[cfg(target_arch = "aarch64")]
+pub fn configure_external_irq_controller_from_platform_layout() {
+    super::aarch64::irq::configure_gic_from_platform_layout();
+}
 #[cfg(target_arch = "aarch64")]
 pub fn irq_save() -> ArchIrqState {
     super::aarch64::irq::irq_save()
@@ -56,9 +68,10 @@ mod tests {
 
     #[test]
     fn selected_arch_irq_facade_is_callable() {
+        let configure: fn() = configure_external_irq_controller_from_platform_layout;
         let save: fn() -> ArchIrqState = irq_save;
         let restore: fn(ArchIrqState) = irq_restore;
         let eoi: fn(u16) = external_irq_eoi;
-        let _ = (save, restore, eoi);
+        let _ = (configure, save, restore, eoi);
     }
 }

@@ -12,3 +12,5 @@ pub const MAX_CPUS: usize = 64;
 pub const BOOTSTRAP_CPU_ID: u8 = 0;
 pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 10;
 pub const PROFILE_IS_PLACEHOLDER: bool = true;
+
+pub const GIC_CPU_IF_BASE: usize = 0x0801_0000;

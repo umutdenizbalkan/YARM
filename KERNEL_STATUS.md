@@ -8,7 +8,8 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
 - **Trap decode correctness improved:** unknown architecture trap codes are normalized as `TrapEvent::Unknown { arch_code }` instead of being coerced into external IRQ semantics.
 - **Per-CPU TLS restore observability:** architecture trap paths now expose CPU-indexed TLS-restore slots and include isolation tests to verify CPU-local behavior.
 - **External IRQ completion plumbing added:** external IRQ trap handling now saves/restores interrupt state around routing and calls an ISA-selected `external_irq_eoi` hook for controller completion handoff.
-- **Remaining hardware integration work tracked:** x86 APIC / aarch64 GIC / riscv64 PLIC register-level EOI completion in ISA IRQ backends remains TODO.
+- **IRQ completion integration advanced:** x86 APIC / aarch64 GIC / riscv64 PLIC EOI backends now perform register-level completion writes using selected-ISA platform-layout initialization at boot entry.
+- **Remaining hardware integration work tracked:** source controller MMIO/context values from ACPI/DT/platform firmware instead of static profile constants.
 
 ## In-kernel mechanism status
 

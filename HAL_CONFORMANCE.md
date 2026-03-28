@@ -41,7 +41,8 @@ Both profiles must satisfy identical kernel-facing semantics for:
 
 ## Current implementation note
 
-- Architecture EOI hooks exist for `x86_64`, `riscv64`, and `aarch64`, but real APIC/GIC/PLIC register-level completion is still TODO in ISA IRQ backends.
+- Architecture EOI hooks exist for `x86_64`, `riscv64`, and `aarch64`, and now issue register-level completion writes after boot-time platform-layout initialization.
+- Remaining integration work is feeding controller addresses/contexts from hardware discovery (ACPI/DT) rather than static platform profile constants.
 
 ## Invariants
 

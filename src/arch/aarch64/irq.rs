@@ -4,12 +4,10 @@ use core::ptr::write_volatile;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(any(test, target_arch = "aarch64"))]
-const GIC_CPU_IF_DEFAULT_BASE: usize = 0x0801_0000;
-#[cfg(any(test, target_arch = "aarch64"))]
 const GICC_EOIR_OFFSET: usize = 0x10;
 
 #[cfg(any(test, target_arch = "aarch64"))]
-static GIC_CPU_IF_BASE: AtomicUsize = AtomicUsize::new(GIC_CPU_IF_DEFAULT_BASE);
+static GIC_CPU_IF_BASE: AtomicUsize = AtomicUsize::new(super::platform_layout::GIC_CPU_IF_BASE);
 
 #[cfg(any(test, target_arch = "aarch64"))]
 pub fn init_gic_cpu_if_base(base: usize) {
@@ -17,6 +15,10 @@ pub fn init_gic_cpu_if_base(base: usize) {
         return;
     }
     GIC_CPU_IF_BASE.store(base, Ordering::Relaxed);
+}
+
+pub fn configure_gic_from_platform_layout() {
+    init_gic_cpu_if_base(super::platform_layout::GIC_CPU_IF_BASE);
 }
 
 #[cfg(any(test, target_arch = "aarch64"))]

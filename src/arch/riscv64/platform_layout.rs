@@ -10,3 +10,6 @@ pub const MAX_CPUS: usize = 64;
 pub const BOOTSTRAP_CPU_ID: u8 = 0;
 pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 10;
 pub const PROFILE_IS_PLACEHOLDER: bool = false;
+
+pub const PLIC_MMIO_BASE: usize = 0x0C00_0000;
+pub const PLIC_SMODE_CONTEXT_INDEX: usize = 1;

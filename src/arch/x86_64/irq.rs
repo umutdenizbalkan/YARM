@@ -4,12 +4,10 @@ use core::ptr::write_volatile;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
-const LAPIC_MMIO_DEFAULT_BASE: usize = 0xFEE0_0000;
-#[cfg(any(test, not(feature = "hosted-dev")))]
 const LAPIC_EOI_OFFSET: usize = 0xB0;
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
-static LAPIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(LAPIC_MMIO_DEFAULT_BASE);
+static LAPIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(super::platform_layout::LAPIC_MMIO_BASE);
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
 pub fn init_lapic_mmio_base(base: usize) {
@@ -17,6 +15,10 @@ pub fn init_lapic_mmio_base(base: usize) {
         return;
     }
     LAPIC_MMIO_BASE.store(base, Ordering::Relaxed);
+}
+
+pub fn configure_lapic_from_platform_layout() {
+    init_lapic_mmio_base(super::platform_layout::LAPIC_MMIO_BASE);
 }
 
 #[cfg(any(test, not(feature = "hosted-dev")))]

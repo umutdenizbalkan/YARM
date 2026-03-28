@@ -4,20 +4,17 @@ use core::ptr::write_volatile;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(any(test, target_arch = "riscv64"))]
-const PLIC_DEFAULT_BASE: usize = 0x0C00_0000;
-#[cfg(any(test, target_arch = "riscv64"))]
 const PLIC_CONTEXT_BASE_OFFSET: usize = 0x0020_0000;
 #[cfg(any(test, target_arch = "riscv64"))]
 const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 #[cfg(any(test, target_arch = "riscv64"))]
-const PLIC_SMODE_CONTEXT: usize = 1;
-#[cfg(any(test, target_arch = "riscv64"))]
 const PLIC_CLAIM_COMPLETE_OFFSET: usize = 0x4;
 
 #[cfg(any(test, target_arch = "riscv64"))]
-static PLIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(PLIC_DEFAULT_BASE);
+static PLIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(super::platform_layout::PLIC_MMIO_BASE);
 #[cfg(any(test, target_arch = "riscv64"))]
-static PLIC_CONTEXT_INDEX: AtomicUsize = AtomicUsize::new(PLIC_SMODE_CONTEXT);
+static PLIC_CONTEXT_INDEX: AtomicUsize =
+    AtomicUsize::new(super::platform_layout::PLIC_SMODE_CONTEXT_INDEX);
 
 #[cfg(any(test, target_arch = "riscv64"))]
 pub fn init_plic_mmio_base(base: usize) {
@@ -30,6 +27,11 @@ pub fn init_plic_mmio_base(base: usize) {
 #[cfg(any(test, target_arch = "riscv64"))]
 pub fn init_plic_context_index(context_index: usize) {
     PLIC_CONTEXT_INDEX.store(context_index, Ordering::Relaxed);
+}
+
+pub fn configure_plic_from_platform_layout() {
+    init_plic_mmio_base(super::platform_layout::PLIC_MMIO_BASE);
+    init_plic_context_index(super::platform_layout::PLIC_SMODE_CONTEXT_INDEX);
 }
 
 #[cfg(any(test, target_arch = "riscv64"))]
