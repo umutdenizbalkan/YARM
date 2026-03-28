@@ -8,9 +8,10 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
 - **Trap decode correctness improved:** unknown architecture trap codes are normalized as `TrapEvent::Unknown { arch_code }` instead of being coerced into external IRQ semantics.
 - **Per-CPU TLS restore observability:** architecture trap paths now expose CPU-indexed TLS-restore slots and include isolation tests to verify CPU-local behavior.
 - **External IRQ completion plumbing added:** external IRQ trap handling now saves/restores interrupt state around routing and calls an ISA-selected `external_irq_eoi` hook for controller completion handoff.
-- **IRQ completion integration advanced:** x86 APIC / aarch64 GIC / riscv64 PLIC EOI backends now perform register-level completion writes using selected-ISA platform-layout initialization at boot entry.
-- **IRQ safety hardening added:** controller MMIO EOI writes are now explicitly configuration-gated, preventing accidental writes when controller state is not initialized.
-- **Remaining hardware integration work tracked:** source controller MMIO/context values from ACPI/DT/platform firmware instead of static profile constants.
+- **IRQ completion integration advanced:** x86 APIC / aarch64 GIC / riscv64 PLIC EOI backends perform register-level completion writes with selected-ISA dispatch.
+- **IRQ safety hardening added:** controller MMIO EOI writes are configuration-gated, preventing accidental writes when controller state is not initialized.
+- **Firmware-driven boot wiring added:** boot now accepts staged descriptions, hosted env (`YARM_IRQ_CONTROLLER_DESCRIPTION`, `YARM_IRQ_FIRMWARE_BLOB`), explicit firmware-blob API calls, and a non-hosted firmware-blob provider hook for early boot handoff.
+- **Remaining hardware integration work tracked:** implement concrete board/bootloader ACPI/DT extractors that feed the registered firmware-blob provider in production boot flows.
 
 ## In-kernel mechanism status
 
