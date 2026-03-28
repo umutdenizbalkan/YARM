@@ -26,11 +26,17 @@ pub fn init_plic_mmio_base(base: usize) {
     PLIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
 
+#[cfg(all(not(test), not(target_arch = "riscv64")))]
+pub fn init_plic_mmio_base(_base: usize) {}
+
 #[cfg(any(test, target_arch = "riscv64"))]
 pub fn init_plic_context_index(context_index: usize) {
     PLIC_CONTEXT_INDEX.store(context_index, Ordering::Relaxed);
     PLIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
+
+#[cfg(all(not(test), not(target_arch = "riscv64")))]
+pub fn init_plic_context_index(_context_index: usize) {}
 
 pub fn configure_plic_from_platform_layout() {
     init_plic_mmio_base(super::platform_layout::PLIC_MMIO_BASE);

@@ -20,6 +20,9 @@ pub fn init_gic_cpu_if_base(base: usize) {
     GIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
 
+#[cfg(all(not(test), not(target_arch = "aarch64")))]
+pub fn init_gic_cpu_if_base(_base: usize) {}
+
 pub fn configure_gic_from_platform_layout() {
     init_gic_cpu_if_base(super::platform_layout::GIC_CPU_IF_BASE);
 }

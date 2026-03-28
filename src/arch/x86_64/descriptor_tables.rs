@@ -294,7 +294,7 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         core::arch::asm!("lgdt [{}]", in(reg) &gdtr, options(readonly, nostack, preserves_flags));
         core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
         core::arch::asm!(
-            "mov ax, {data_sel:x}",
+            "mov ax, {data_sel}",
             "mov ds, ax",
             "mov es, ax",
             "mov ss, ax",
@@ -302,7 +302,7 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
             options(nostack, preserves_flags)
         );
         core::arch::asm!(
-            "mov ax, {tss_sel:x}",
+            "mov ax, {tss_sel}",
             "ltr ax",
             tss_sel = const TSS_SELECTOR,
             options(nostack, preserves_flags)
