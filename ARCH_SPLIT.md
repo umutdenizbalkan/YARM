@@ -91,6 +91,7 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
 - `arch::boot_entry` now also exposes `run_kernel_boot_with_irq_description(...)`, allowing non-hosted callers to pass an explicit firmware-derived controller description blob.
 - `arch::boot_entry::run_kernel_boot_with_firmware_blob(...)` provides an explicit non-env API that canonicalizes firmware blobs via selected-ISA topology parsing before boot configuration.
 - `arch::boot_entry::stage_irq_controller_description_for_boot(...)` is now available for early-boot firmware handoff before `run_kernel_boot(...)`; staged descriptions are consumed once at boot.
+- Boot-entry staged IRQ-description buffer access is now lock-guarded, preventing concurrent staged-copy races during staged handoff and consumption.
 - `arch::selected_isa::topology::discover_irq_controller_description(...)` now derives canonical IRQ-controller description strings from firmware blobs (including common alias keys), and `stage_irq_controller_description_from_firmware_blob(...)` stages that canonical output for boot.
 - Remaining work is platform discovery/DT/ACPI handoff so runtime controller addresses/contexts come from hardware description instead of profile constants.
 

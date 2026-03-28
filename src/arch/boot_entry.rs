@@ -1,13 +1,35 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const MAX_IRQ_DESCRIPTION_BYTES: usize = 256;
 static IRQ_DESCRIPTION_LEN: AtomicUsize = AtomicUsize::new(0);
+static IRQ_DESCRIPTION_LOCK: AtomicBool = AtomicBool::new(false);
 static mut IRQ_DESCRIPTION_BUF: [u8; MAX_IRQ_DESCRIPTION_BYTES] = [0; MAX_IRQ_DESCRIPTION_BYTES];
+
+struct IrqDescriptionLockGuard;
+
+impl IrqDescriptionLockGuard {
+    fn acquire() -> Self {
+        while IRQ_DESCRIPTION_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+impl Drop for IrqDescriptionLockGuard {
+    fn drop(&mut self) {
+        IRQ_DESCRIPTION_LOCK.store(false, Ordering::Release);
+    }
+}
 
 pub fn stage_irq_controller_description_for_boot(description: &[u8]) -> bool {
     if description.is_empty() || description.len() > MAX_IRQ_DESCRIPTION_BYTES {
         return false;
     }
+    let _guard = IrqDescriptionLockGuard::acquire();
     unsafe {
         IRQ_DESCRIPTION_BUF[..description.len()].copy_from_slice(description);
     }
@@ -45,6 +67,7 @@ fn take_staged_irq_description<'a>(
     if len == 0 || len > MAX_IRQ_DESCRIPTION_BYTES {
         return None;
     }
+    let _guard = IrqDescriptionLockGuard::acquire();
     unsafe {
         scratch[..len].copy_from_slice(&IRQ_DESCRIPTION_BUF[..len]);
     }

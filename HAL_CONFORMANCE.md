@@ -48,6 +48,7 @@ Both profiles must satisfy identical kernel-facing semantics for:
 - Boot entry now provides an explicit description-injection API (`run_kernel_boot_with_irq_description`) so firmware handoff can bypass env-var plumbing and configure controllers directly.
 - Boot entry also provides `run_kernel_boot_with_firmware_blob(...)` for explicit firmware-blob canonicalization + configuration without env vars.
 - Boot entry additionally supports one-shot staged description handoff (`stage_irq_controller_description_for_boot`) for early-boot contexts where direct run-hook plumbing is inconvenient.
+- Staged boot-description copy/read paths are now protected by a boot-entry lock guard to avoid concurrent staging races.
 - A firmware-blob staging helper now stages canonical per-ISA IRQ controller descriptions derived by selected-ISA topology discovery (`discover_irq_controller_description`), reducing malformed handoff risk.
 - Remaining integration work is feeding controller addresses/contexts from hardware discovery (ACPI/DT) rather than static platform profile constants.
 
