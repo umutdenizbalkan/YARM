@@ -24,28 +24,10 @@ pub fn configure_gic_from_platform_layout() {
     init_gic_cpu_if_base(super::platform_layout::GIC_CPU_IF_BASE);
 }
 
-fn parse_usize_token(description: &[u8], key: &str) -> Option<usize> {
-    let text = core::str::from_utf8(description).ok()?;
-    for token in text.split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | ';')) {
-        if token.is_empty() {
-            continue;
-        }
-        let (lhs, rhs) = token.split_once('=')?;
-        if lhs != key {
-            continue;
-        }
-        if let Some(hex) = rhs.strip_prefix("0x").or_else(|| rhs.strip_prefix("0X")) {
-            return usize::from_str_radix(hex, 16).ok();
-        }
-        if let Ok(value) = rhs.parse::<usize>() {
-            return Some(value);
-        }
-    }
-    None
-}
-
 pub fn try_configure_gic_from_description(description: &[u8]) -> bool {
-    let Some(base) = parse_usize_token(description, "gic_cpu_if_base") else {
+    let Some(base) =
+        crate::arch::irq_description::parse_usize_token(description, "gic_cpu_if_base")
+    else {
         return false;
     };
     if base == 0 {

@@ -37,31 +37,14 @@ pub fn configure_plic_from_platform_layout() {
     init_plic_context_index(super::platform_layout::PLIC_SMODE_CONTEXT_INDEX);
 }
 
-fn parse_usize_token(description: &[u8], key: &str) -> Option<usize> {
-    let text = core::str::from_utf8(description).ok()?;
-    for token in text.split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | ';')) {
-        if token.is_empty() {
-            continue;
-        }
-        let (lhs, rhs) = token.split_once('=')?;
-        if lhs != key {
-            continue;
-        }
-        if let Some(hex) = rhs.strip_prefix("0x").or_else(|| rhs.strip_prefix("0X")) {
-            return usize::from_str_radix(hex, 16).ok();
-        }
-        if let Ok(value) = rhs.parse::<usize>() {
-            return Some(value);
-        }
-    }
-    None
-}
-
 pub fn try_configure_plic_from_description(description: &[u8]) -> bool {
-    let Some(base) = parse_usize_token(description, "plic_mmio_base") else {
+    let Some(base) = crate::arch::irq_description::parse_usize_token(description, "plic_mmio_base")
+    else {
         return false;
     };
-    let Some(context_index) = parse_usize_token(description, "plic_smode_context") else {
+    let Some(context_index) =
+        crate::arch::irq_description::parse_usize_token(description, "plic_smode_context")
+    else {
         return false;
     };
     if base == 0 {
