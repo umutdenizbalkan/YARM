@@ -15,6 +15,20 @@ pub fn stage_irq_controller_description_for_boot(description: &[u8]) -> bool {
     true
 }
 
+pub fn stage_irq_controller_description_from_firmware_blob(blob: &[u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let valid = crate::arch::irq_description::parse_usize_token(blob, "lapic_mmio_base").is_some();
+    #[cfg(target_arch = "riscv64")]
+    let valid = crate::arch::irq_description::parse_usize_token(blob, "plic_mmio_base").is_some()
+        && crate::arch::irq_description::parse_usize_token(blob, "plic_smode_context").is_some();
+    #[cfg(target_arch = "aarch64")]
+    let valid = crate::arch::irq_description::parse_usize_token(blob, "gic_cpu_if_base").is_some();
+    if !valid {
+        return false;
+    }
+    stage_irq_controller_description_for_boot(blob)
+}
+
 fn take_staged_irq_description<'a>(
     scratch: &'a mut [u8; MAX_IRQ_DESCRIPTION_BYTES],
 ) -> Option<&'a [u8]> {
@@ -85,5 +99,16 @@ mod tests {
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
             0xFEE0_2000
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn firmware_blob_staging_validates_required_fields() {
+        assert!(!stage_irq_controller_description_from_firmware_blob(
+            b"cpu@0 enabled=1"
+        ));
+        assert!(stage_irq_controller_description_from_firmware_blob(
+            b"lapic_mmio_base=0xfee03000"
+        ));
     }
 }
