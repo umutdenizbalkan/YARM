@@ -51,15 +51,11 @@ boot_pd:
 boot_pt0:
     .set pte_flags_exec, 0x003
     .set pte_flags_data_nx, 0x8000000000000003
-    // First 256KiB executable for bootstrap code/trampolines.
+    // Keep the first 2MiB executable until long-mode handoff is complete;
+    // firmware/kernel placement can land bootstrap text above 256KiB.
     .set pte_index, 0
-    .rept 64
+    .rept 512
     .quad (pte_index * 0x1000) | pte_flags_exec
-    .set pte_index, pte_index + 1
-    .endr
-    // Remaining first-2MiB identity region is writable + NX.
-    .rept 448
-    .quad (pte_index * 0x1000) | pte_flags_data_nx
     .set pte_index, pte_index + 1
     .endr
 
