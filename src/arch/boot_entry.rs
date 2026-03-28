@@ -4,6 +4,7 @@ const MAX_IRQ_DESCRIPTION_BYTES: usize = 256;
 static IRQ_DESCRIPTION_LEN: AtomicUsize = AtomicUsize::new(0);
 static IRQ_DESCRIPTION_LOCK: AtomicBool = AtomicBool::new(false);
 static mut IRQ_DESCRIPTION_BUF: [u8; MAX_IRQ_DESCRIPTION_BYTES] = [0; MAX_IRQ_DESCRIPTION_BYTES];
+static FIRMWARE_BLOB_PROVIDER_PTR: AtomicUsize = AtomicUsize::new(0);
 
 struct IrqDescriptionLockGuard;
 
@@ -47,6 +48,10 @@ pub fn stage_irq_controller_description_from_firmware_blob(blob: &[u8]) -> bool 
     stage_irq_controller_description_for_boot(&canonical[..canonical_len])
 }
 
+pub fn set_firmware_blob_provider_for_boot(provider: fn(&mut [u8]) -> usize) {
+    FIRMWARE_BLOB_PROVIDER_PTR.store(provider as usize, Ordering::Release);
+}
+
 #[inline]
 pub fn run_kernel_boot_with_firmware_blob(run: fn(), firmware_blob: Option<&[u8]>) {
     if let Some(blob) = firmware_blob {
@@ -74,6 +79,21 @@ fn take_staged_irq_description<'a>(
     Some(&scratch[..len])
 }
 
+fn take_irq_firmware_blob_from_provider<'a>(
+    scratch: &'a mut [u8; MAX_IRQ_DESCRIPTION_BYTES],
+) -> Option<&'a [u8]> {
+    let provider_ptr = FIRMWARE_BLOB_PROVIDER_PTR.load(Ordering::Acquire);
+    if provider_ptr == 0 {
+        return None;
+    }
+    let provider: fn(&mut [u8]) -> usize = unsafe { core::mem::transmute(provider_ptr) };
+    let len = provider(scratch);
+    if len == 0 || len > scratch.len() {
+        return None;
+    }
+    Some(&scratch[..len])
+}
+
 /// Selected-ISA boot entry facade used by top-level binaries.
 #[inline]
 pub fn run_kernel_boot_with_irq_description(run: fn(), irq_description: Option<&[u8]>) {
@@ -91,6 +111,9 @@ pub fn run_kernel_boot(run: fn()) {
     let mut staged = [0u8; MAX_IRQ_DESCRIPTION_BYTES];
     if let Some(description) = take_staged_irq_description(&mut staged) {
         return run_kernel_boot_with_irq_description(run, Some(description));
+    }
+    if let Some(blob) = take_irq_firmware_blob_from_provider(&mut staged) {
+        return run_kernel_boot_with_firmware_blob(run, Some(blob));
     }
 
     #[cfg(feature = "hosted-dev")]
@@ -160,6 +183,23 @@ mod tests {
         assert_eq!(
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
             0xFEE0_5000
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn boot_entry_uses_registered_firmware_blob_provider() {
+        fn provider(buf: &mut [u8]) -> usize {
+            let blob = b"LAPIC_BASE=0xfee06000";
+            buf[..blob.len()].copy_from_slice(blob);
+            blob.len()
+        }
+        crate::arch::x86_64::irq::reset_lapic_config_for_test();
+        set_firmware_blob_provider_for_boot(provider);
+        run_kernel_boot(|| {});
+        assert_eq!(
+            crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
+            0xFEE0_6000
         );
     }
 }
