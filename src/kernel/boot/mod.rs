@@ -31,6 +31,7 @@ use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
 };
 use crate::arch::{platform_layout, topology};
+use crate::kernel::frame_allocator::{MemoryRegion, PhysicalFrameAllocator};
 use crate::kernel::ipc::ThreadId;
 #[cfg(feature = "hosted-dev")]
 use crate::std::collections::BTreeMap;
@@ -360,7 +361,7 @@ struct MemorySubsystem {
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
     brk_regions: [Option<BrkRegionRecord>; MAX_TASKS],
     next_memory_object_id: u64,
-    next_anon_phys: u64,
+    frame_allocator: PhysicalFrameAllocator,
 }
 
 #[derive(Debug)]
@@ -454,6 +455,14 @@ fn map_ipc_error(err: IpcError) -> KernelError {
 }
 
 impl Bootstrap {
+    fn default_boot_memory_map() -> [MemoryRegion; 1] {
+        [MemoryRegion {
+            start: platform_layout::NEXT_ANON_PHYS_BASE,
+            len: 512 * 1024 * 1024,
+            usable: true,
+        }]
+    }
+
     pub const fn default_capacity_profile() -> KernelCapacityProfile {
         KernelCapacityProfile::HostedDefault
     }
@@ -465,6 +474,11 @@ impl Bootstrap {
     pub fn init_with_capacity_profile(
         capacity_profile: KernelCapacityProfile,
     ) -> Result<KernelState, KernelError> {
+        let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
+        frame_allocator
+            .init_from_memory_map(&Self::default_boot_memory_map())
+            .map_err(|_| KernelError::MemoryObjectFull)?;
+
         let mut kernel_aspace = AddressSpace::new_kernel();
         kernel_aspace
             .map_page(
@@ -519,7 +533,7 @@ impl Bootstrap {
                 memory_objects: [None; MAX_MEMORY_OBJECTS],
                 brk_regions: [None; MAX_TASKS],
                 next_memory_object_id: 1,
-                next_anon_phys: platform_layout::NEXT_ANON_PHYS_BASE,
+                frame_allocator,
             }),
             drivers: DriverSubsystem {
                 driver_records: [const { None }; MAX_DRIVERS],

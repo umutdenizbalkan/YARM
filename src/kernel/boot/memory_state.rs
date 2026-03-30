@@ -1,4 +1,5 @@
 use super::{KernelError, KernelState, MemoryObject};
+use crate::kernel::frame_allocator::FrameAllocError;
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError};
 
@@ -102,11 +103,15 @@ impl KernelState {
     }
 
     pub fn alloc_anonymous_memory_object(&mut self) -> Result<(u64, CapId), KernelError> {
-        let phys = PhysAddr(self.memory.next_anon_phys);
-        self.memory.next_anon_phys = self
-            .memory
-            .next_anon_phys
-            .wrapping_add(crate::kernel::vm::PAGE_SIZE as u64);
+        let phys = PhysAddr(
+            self.memory
+                .frame_allocator
+                .alloc_frame()
+                .map_err(|err| match err {
+                    FrameAllocError::OutOfMemory => KernelError::MemoryObjectFull,
+                    _ => KernelError::Vm(VmError::Full),
+                })?,
+        );
         self.create_memory_object(phys)
     }
 
