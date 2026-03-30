@@ -91,6 +91,7 @@ const MAX_TASKS: usize = 128;
 const MAX_MEMORY_OBJECTS: usize = 1024;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_MEMORY_OBJECTS: usize = 256;
+const MAX_BOOT_MEMORY_REGIONS: usize = 64;
 
 #[cfg(feature = "hosted-dev")]
 const MAX_NOTIFICATIONS: usize = 64;
@@ -465,6 +466,114 @@ impl Bootstrap {
         }]
     }
 
+    fn default_reserved_ranges() -> [(u64, u64); 1] {
+        [(
+            platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE,
+            platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE + crate::kernel::vm::PAGE_SIZE as u64,
+        )]
+    }
+
+    fn push_region(
+        out: &mut [MemoryRegion; MAX_BOOT_MEMORY_REGIONS],
+        out_len: &mut usize,
+        start: u64,
+        end: u64,
+    ) {
+        if end <= start || *out_len >= MAX_BOOT_MEMORY_REGIONS {
+            return;
+        }
+        out[*out_len] = MemoryRegion {
+            start,
+            len: end - start,
+            usable: true,
+        };
+        *out_len += 1;
+    }
+
+    fn apply_reserved_ranges(
+        regions: &[MemoryRegion],
+        reserved: &[(u64, u64)],
+    ) -> ([MemoryRegion; MAX_BOOT_MEMORY_REGIONS], usize) {
+        let mut out = [MemoryRegion {
+            start: 0,
+            len: 0,
+            usable: false,
+        }; MAX_BOOT_MEMORY_REGIONS];
+        let mut out_len = 0usize;
+
+        for region in regions {
+            if !region.usable || region.len == 0 {
+                continue;
+            }
+            let mut segment_list = [MemoryRegion {
+                start: 0,
+                len: 0,
+                usable: false,
+            }; MAX_BOOT_MEMORY_REGIONS];
+            let mut seg_len = 1usize;
+            segment_list[0] = *region;
+
+            for &(res_start, res_end) in reserved {
+                if res_end <= res_start {
+                    continue;
+                }
+                let mut next = [MemoryRegion {
+                    start: 0,
+                    len: 0,
+                    usable: false,
+                }; MAX_BOOT_MEMORY_REGIONS];
+                let mut next_len = 0usize;
+
+                for seg in segment_list.iter().take(seg_len).copied() {
+                    if seg.len == 0 {
+                        continue;
+                    }
+                    let seg_start = seg.start;
+                    let seg_end = seg.start.saturating_add(seg.len);
+
+                    if res_end <= seg_start || res_start >= seg_end {
+                        if next_len < MAX_BOOT_MEMORY_REGIONS {
+                            next[next_len] = seg;
+                            next_len += 1;
+                        }
+                        continue;
+                    }
+
+                    if res_start > seg_start && next_len < MAX_BOOT_MEMORY_REGIONS {
+                        next[next_len] = MemoryRegion {
+                            start: seg_start,
+                            len: res_start - seg_start,
+                            usable: true,
+                        };
+                        next_len += 1;
+                    }
+                    if res_end < seg_end && next_len < MAX_BOOT_MEMORY_REGIONS {
+                        next[next_len] = MemoryRegion {
+                            start: res_end,
+                            len: seg_end - res_end,
+                            usable: true,
+                        };
+                        next_len += 1;
+                    }
+                }
+
+                segment_list = next;
+                seg_len = next_len;
+                if seg_len == 0 {
+                    break;
+                }
+            }
+
+            for seg in segment_list.iter().take(seg_len).copied() {
+                let seg_start = seg.start;
+                let seg_end = seg.start.saturating_add(seg.len);
+                Self::push_region(&mut out, &mut out_len, seg_start, seg_end);
+            }
+        }
+
+        (out, out_len)
+    }
+
     pub const fn default_capacity_profile() -> KernelCapacityProfile {
         KernelCapacityProfile::HostedDefault
     }
@@ -476,12 +585,23 @@ impl Bootstrap {
     pub fn init_with_capacity_profile(
         capacity_profile: KernelCapacityProfile,
     ) -> Result<KernelState, KernelError> {
-        let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
         let boot_map = Self::default_boot_memory_map();
+        let reserved = Self::default_reserved_ranges();
+        Self::init_with_boot_memory_map(capacity_profile, &boot_map, &reserved)
+    }
+
+    pub fn init_with_boot_memory_map(
+        capacity_profile: KernelCapacityProfile,
+        boot_regions: &[MemoryRegion],
+        reserved_ranges: &[(u64, u64)],
+    ) -> Result<KernelState, KernelError> {
+        let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
+        let (sanitized, sanitized_len) = Self::apply_reserved_ranges(boot_regions, reserved_ranges);
+        let sanitized = &sanitized[..sanitized_len];
         frame_allocator
-            .init_from_memory_map(&boot_map)
+            .init_from_memory_map(sanitized)
             .map_err(|_| KernelError::MemoryObjectFull)?;
-        init_pt_frame_allocator(&boot_map).map_err(|_| KernelError::MemoryObjectFull)?;
+        init_pt_frame_allocator(sanitized).map_err(|_| KernelError::MemoryObjectFull)?;
         crate::arch::selected_isa::page_table::reset_state();
 
         let mut kernel_aspace = AddressSpace::new_kernel();
@@ -1268,6 +1388,39 @@ mod tests {
     use super::*;
     use crate::kernel::ipc::ThreadId;
     use std::{format, string::String, vec::Vec};
+
+    #[test]
+    fn boot_memory_map_reservation_splits_usable_region() {
+        let regions = [MemoryRegion {
+            start: 0x1000_0000,
+            len: 0x20_000,
+            usable: true,
+        }];
+        let reserved = [(0x1000_8000, 0x1000_C000)];
+        let (sanitized, len) = Bootstrap::apply_reserved_ranges(&regions, &reserved);
+        let usable = &sanitized[..len];
+        assert_eq!(usable.len(), 2);
+        assert_eq!(usable[0].start, 0x1000_0000);
+        assert_eq!(usable[0].len, 0x8000);
+        assert_eq!(usable[1].start, 0x1000_C000);
+        assert_eq!(usable[1].len, 0x14000);
+    }
+
+    #[test]
+    fn init_with_boot_memory_map_uses_sanitized_ranges() {
+        let regions = [MemoryRegion {
+            start: 0x1000_0000,
+            len: 0x20_000,
+            usable: true,
+        }];
+        let reserved = [(0x1000_0000, 0x1000_1000)];
+        let state = Bootstrap::init_with_boot_memory_map(
+            Bootstrap::default_capacity_profile(),
+            &regions,
+            &reserved,
+        );
+        assert!(state.is_ok());
+    }
 
     #[test]
     fn selected_arch_trap_entry_routes_timer() {

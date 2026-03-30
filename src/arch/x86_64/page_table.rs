@@ -388,6 +388,7 @@ mod tests {
 
     #[test]
     fn map_and_resolve_4_level_page() {
+        reset_state();
         let asid = Asid(11);
         ensure_asid_root(asid).expect("root");
         let va = VirtAddr(0x0000_7f00_1234_5000);
@@ -400,6 +401,7 @@ mod tests {
 
     #[test]
     fn unmap_clears_leaf_entry() {
+        reset_state();
         let asid = Asid(12);
         ensure_asid_root(asid).expect("root");
         let va = VirtAddr(0x4000_0000);
@@ -410,6 +412,7 @@ mod tests {
 
     #[test]
     fn cr3_includes_low_pcid_bits() {
+        reset_state();
         let asid = Asid(0x1234);
         let cr3 = cr3_for_asid(asid).expect("cr3");
         assert_eq!(cr3 & 0x0fff, 0x234);
