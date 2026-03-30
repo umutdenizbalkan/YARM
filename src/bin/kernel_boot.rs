@@ -80,6 +80,11 @@ fn run() {
         read_rep.opcode
     );
     yarm::yarm_log!("YARM_INIT_DONE");
+
+    #[cfg(not(feature = "hosted-dev"))]
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -91,9 +96,7 @@ fn main() {
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_main() -> ! {
     yarm::arch::boot_entry::run_kernel_boot(run);
-    loop {
-        core::hint::spin_loop();
-    }
+    unreachable!("kernel run loop should not return");
 }
 
 #[cfg(test)]

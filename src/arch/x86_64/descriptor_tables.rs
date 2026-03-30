@@ -198,6 +198,10 @@ struct X86InterruptStackFrame {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_KERNEL_STATE_PTR: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const UNMAPPED_CPU: usize = usize::MAX;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static APIC_TO_CPU_ID: [AtomicUsize; 256] = [const { AtomicUsize::new(UNMAPPED_CPU) }; 256];
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn encode_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
@@ -213,12 +217,37 @@ fn encode_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn register_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState) {
     TRAP_KERNEL_STATE_PTR.store(kernel as *mut _ as usize, Ordering::Release);
+    register_apic_cpu_mapping(
+        raw_current_apic_id() as u8,
+        crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID),
+    );
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn raw_current_apic_id() -> u32 {
+    unsafe { core::arch::x86_64::__cpuid(1).ebx >> 24 }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn register_apic_cpu_mapping(apic_id: u8, cpu: crate::kernel::scheduler::CpuId) {
+    APIC_TO_CPU_ID[apic_id as usize].store(cpu.0 as usize, Ordering::Release);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn current_cpu_id() -> crate::kernel::scheduler::CpuId {
-    let apic = unsafe { core::arch::x86_64::__cpuid(1).ebx >> 24 };
-    crate::kernel::scheduler::CpuId(apic as u8)
+    let apic = raw_current_apic_id() as usize;
+    if let Some(mapped) = APIC_TO_CPU_ID
+        .get(apic)
+        .map(|slot| slot.load(Ordering::Acquire))
+        .filter(|mapped| *mapped != UNMAPPED_CPU && *mapped < crate::kernel::scheduler::MAX_CPUS)
+    {
+        return crate::kernel::scheduler::CpuId(mapped as u8);
+    }
+    if apic < crate::kernel::scheduler::MAX_CPUS {
+        crate::kernel::scheduler::CpuId(apic as u8)
+    } else {
+        crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID)
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
