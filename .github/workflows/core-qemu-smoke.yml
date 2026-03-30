@@ -5,6 +5,38 @@ on:
   workflow_dispatch:
 
 jobs:
+  x86_64-core-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build + qemu tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 cpio busybox-static
+      - name: Build staged artifacts (non-strict)
+        run: scripts/build-qemu-x86_64-artifacts.sh
+      - name: Core-marker QEMU smoke (non-strict)
+        env:
+          QEMU_SMOKE_STRICT: "0"
+        run: scripts/qemu-x86_64-core-smoke.sh
+
+  aarch64-core-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build + qemu tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm cpio busybox-static
+      - name: Build staged artifacts (non-strict)
+        run: scripts/build-qemu-aarch64-artifacts.sh
+      - name: Core-marker QEMU smoke (non-strict)
+        env:
+          QEMU_SMOKE_STRICT: "0"
+        run: scripts/qemu-aarch64-core-smoke.sh
+
   riscv64-core-smoke:
     runs-on: ubuntu-latest
     steps:
@@ -20,6 +52,30 @@ jobs:
         env:
           QEMU_SMOKE_STRICT: "0"
         run: scripts/qemu-riscv64-core-smoke.sh
+
+  aarch64-core-smoke-strict:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build + qemu tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm cpio busybox-static
+      - name: Build staged artifacts (strict)
+        env:
+          ARTIFACTS_STRICT: "1"
+        run: scripts/build-qemu-aarch64-artifacts.sh
+      - name: Core-marker QEMU smoke (strict)
+        env:
+          QEMU_SMOKE_STRICT: "1"
+          LOGFILE: qemu-aarch64-core.log
+        run: scripts/qemu-aarch64-core-smoke.sh
+      - name: Verify strict smoke log has init + UI markers
+        run: |
+          rg -n "YARM_INIT_DONE" qemu-aarch64-core.log
+          rg -n "\[ui\] boot-to-shell marker" qemu-aarch64-core.log
 
   riscv64-core-smoke-strict:
     if: github.event_name == 'workflow_dispatch'

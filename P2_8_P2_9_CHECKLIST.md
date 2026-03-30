@@ -10,7 +10,7 @@ Ordered by **risk first**, then **effort**.
 - [x] Implement non-hosted invalidation instructions in RISC-V backend:
   - page invalidation hook
   - ASID invalidation hook
-- [ ] Add architecture-targeted smoke validation for invalidation paths in CI (QEMU lanes).
+- [x] Add architecture-targeted smoke validation for invalidation paths in CI (QEMU lanes).
 - [ ] Add explicit doc note for hosted-dev no-op behavior and production expectations.
 
 ## 2) [High risk, higher effort] Physical frame allocator scaling strategy
