@@ -4,6 +4,8 @@ use core::arch::global_asm;
 #[cfg(not(feature = "hosted-dev"))]
 global_asm!(
     r#"
+    .intel_syntax noprefix
+
     .section .note.Xen,"a",@note
     .align 4
     .long 4
@@ -75,6 +77,20 @@ pvh_start32:
     cli
     mov esi, ebx
     mov esp, offset boot_stack_end
+
+    // FIX: The assembler/linker fills the sub-table pointer quads with full
+    // 64-bit *virtual* addresses.  The CPU uses those bits as *physical*
+    // addresses during a page-table walk, so a high-half VMA in the upper 32
+    // bits causes an immediate page fault the first time paging is enabled.
+    // Under our link convention (LMA == VMA & 0xFFFFFFFF) the lower 32 bits
+    // already hold the correct physical address; we only need to zero the
+    // upper 32 bits of each sub-table pointer entry before loading CR3.
+    mov dword ptr [boot_pml4 + 4], 0   // PML4[0]  upper dword → physical
+    mov dword ptr [boot_pdpt + 4], 0   // PDPT[0]  upper dword → physical
+    mov dword ptr [boot_pd   + 4], 0   // PD[0]    upper dword → physical
+    // The 2 MiB entries in boot_pd and all boot_pt0 entries are assembled
+    // from small immediates whose upper 32 bits are already zero.
+
     mov bl, 'A'
     call uart_putc32
     mov eax, offset boot_pml4
@@ -134,9 +150,11 @@ long_mode_entry:
     mov ss, ax
     mov dil, 'E'
     call uart_putc64
-    mov edi, esi
     mov dil, 'F'
     call uart_putc64
+    // FIX: move start-info pointer into rdi (first argument) *after* the
+    // last uart_putc64 call that uses dil, so we don't clobber its low byte.
+    mov edi, esi
     .weak yarm_kernel_main
     call yarm_kernel_main
     mov dil, 'G'
