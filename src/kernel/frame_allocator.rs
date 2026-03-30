@@ -3,6 +3,7 @@ use crate::kernel::vm::PAGE_SIZE;
 
 const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
 const MAX_FREE_EXTENTS: usize = 512;
+const CONTIG_SIZE_CLASSES: [usize; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryRegion {
@@ -36,6 +37,8 @@ pub struct PhysicalFrameAllocator {
     free_frames: usize,
     initialized: bool,
     extents: [Option<FreeExtent>; MAX_FREE_EXTENTS],
+    largest_free_run_pages: usize,
+    run_hint_by_class: [Option<usize>; CONTIG_SIZE_CLASSES.len()],
 }
 
 impl PhysicalFrameAllocator {
@@ -47,6 +50,8 @@ impl PhysicalFrameAllocator {
             free_frames: 0,
             initialized: false,
             extents: [const { None }; MAX_FREE_EXTENTS],
+            largest_free_run_pages: 0,
+            run_hint_by_class: [const { None }; CONTIG_SIZE_CLASSES.len()],
         }
     }
 
@@ -77,6 +82,8 @@ impl PhysicalFrameAllocator {
         self.free_frames = 0;
         self.initialized = true;
         self.extents = [const { None }; MAX_FREE_EXTENTS];
+        self.largest_free_run_pages = 0;
+        self.run_hint_by_class = [const { None }; CONTIG_SIZE_CLASSES.len()];
 
         for region in regions {
             if !region.usable || region.len == 0 {
@@ -96,6 +103,7 @@ impl PhysicalFrameAllocator {
         if self.total_frames == 0 {
             return Err(FrameAllocError::InvalidMemoryMap);
         }
+        self.refresh_run_metadata();
 
         Ok(())
     }
@@ -108,28 +116,14 @@ impl PhysicalFrameAllocator {
         if !self.initialized {
             return Err(FrameAllocError::InvalidMemoryMap);
         }
-        if pages == 0 || pages > self.free_frames {
+        if pages == 0 || pages > self.free_frames || pages > self.largest_free_run_pages {
             return Err(FrameAllocError::OutOfMemory);
         }
 
-        for slot in &mut self.extents {
-            let Some(mut extent) = *slot else {
-                continue;
-            };
-            if extent.pages < pages {
-                continue;
-            }
-            let alloc_phys = extent.start_phys;
-            extent.start_phys = extent
-                .start_phys
-                .saturating_add((pages as u64).saturating_mul(PAGE_SIZE_U64));
-            extent.pages -= pages;
-            if extent.pages == 0 {
-                *slot = None;
-            } else {
-                *slot = Some(extent);
-            }
+        if let Some(idx) = self.fast_path_extent_index(pages).or_else(|| self.find_extent_index(pages)) {
+            let alloc_phys = self.split_extent_for_allocation(idx, pages)?;
             self.free_frames = self.free_frames.saturating_sub(pages);
+            self.refresh_run_metadata();
             return Ok(alloc_phys);
         }
 
@@ -173,6 +167,7 @@ impl PhysicalFrameAllocator {
         }
         self.insert_extent(start_phys, pages)?;
         self.free_frames = self.free_frames.saturating_add(pages);
+        self.refresh_run_metadata();
         Ok(())
     }
 
@@ -217,6 +212,7 @@ impl PhysicalFrameAllocator {
             self.extents[slot_idx] = Some(extent);
             self.insert_extent(right_start, right_pages)?;
             self.free_frames = self.free_frames.saturating_sub(1);
+            self.refresh_run_metadata();
             return Ok(());
         }
         if extent.pages == 0 {
@@ -225,6 +221,7 @@ impl PhysicalFrameAllocator {
             self.extents[slot_idx] = Some(extent);
         }
         self.free_frames = self.free_frames.saturating_sub(1);
+        self.refresh_run_metadata();
         Ok(())
     }
 
@@ -286,6 +283,59 @@ impl PhysicalFrameAllocator {
         });
         self.sort_extents();
         Ok(())
+    }
+
+    fn split_extent_for_allocation(
+        &mut self,
+        idx: usize,
+        pages: usize,
+    ) -> Result<u64, FrameAllocError> {
+        let Some(mut extent) = self.extents[idx] else {
+            return Err(FrameAllocError::OutOfMemory);
+        };
+        if extent.pages < pages {
+            return Err(FrameAllocError::OutOfMemory);
+        }
+        let alloc_phys = extent.start_phys;
+        extent.start_phys = extent
+            .start_phys
+            .saturating_add((pages as u64).saturating_mul(PAGE_SIZE_U64));
+        extent.pages -= pages;
+        if extent.pages == 0 {
+            self.extents[idx] = None;
+        } else {
+            self.extents[idx] = Some(extent);
+        }
+        Ok(alloc_phys)
+    }
+
+    fn find_extent_index(&self, pages: usize) -> Option<usize> {
+        self.extents
+            .iter()
+            .enumerate()
+            .find_map(|(idx, extent)| extent.filter(|entry| entry.pages >= pages).map(|_| idx))
+    }
+
+    fn fast_path_extent_index(&self, pages: usize) -> Option<usize> {
+        let class = CONTIG_SIZE_CLASSES.iter().position(|&size| size >= pages)?;
+        self.run_hint_by_class[class]
+            .filter(|&idx| self.extents[idx].is_some_and(|extent| extent.pages >= pages))
+    }
+
+    fn refresh_run_metadata(&mut self) {
+        self.largest_free_run_pages = 0;
+        self.run_hint_by_class = [const { None }; CONTIG_SIZE_CLASSES.len()];
+        for (idx, extent) in self.extents.iter().enumerate() {
+            let Some(extent) = extent else {
+                continue;
+            };
+            self.largest_free_run_pages = self.largest_free_run_pages.max(extent.pages);
+            for (class_idx, class_pages) in CONTIG_SIZE_CLASSES.iter().enumerate() {
+                if extent.pages >= *class_pages && self.run_hint_by_class[class_idx].is_none() {
+                    self.run_hint_by_class[class_idx] = Some(idx);
+                }
+            }
+        }
     }
 
     fn sort_extents(&mut self) {
@@ -438,5 +488,28 @@ mod tests {
         alloc.free_contiguous(base, 4).expect("free contiguous");
         let next = alloc.alloc_contiguous(2).expect("alloc 2 pages");
         assert_eq!(next, 0x2000_0000);
+    }
+
+    #[test]
+    fn run_metadata_tracks_largest_free_extent() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc
+            .init_from_memory_map(&[
+                MemoryRegion {
+                    start: 0x3000_0000,
+                    len: 0x4_000,
+                    usable: true,
+                },
+                MemoryRegion {
+                    start: 0x3001_0000,
+                    len: 0x20_000,
+                    usable: true,
+                },
+            ])
+            .expect("init");
+
+        assert!(alloc.largest_free_run_pages >= 0x20_000 / PAGE_SIZE);
+        let _ = alloc.alloc_contiguous(8).expect("alloc 8 pages");
+        assert!(alloc.largest_free_run_pages >= 4);
     }
 }
