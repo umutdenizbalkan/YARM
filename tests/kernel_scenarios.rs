@@ -226,6 +226,7 @@ fn run_supervisor_replay_scenario() -> Result<SupervisorReplaySummary, KernelErr
             iova_cap: iova0.0,
             iova_base: 0x4000,
             iova_len: 4096,
+            dma_len: 4096,
         },
     )?;
     init.register_driver_with_supervisor(
@@ -241,6 +242,7 @@ fn run_supervisor_replay_scenario() -> Result<SupervisorReplaySummary, KernelErr
             iova_cap: iova1.0,
             iova_base: 0x5000,
             iova_len: 4096,
+            dma_len: 4096,
         },
     )?;
     init.register_driver_with_supervisor(
@@ -256,6 +258,7 @@ fn run_supervisor_replay_scenario() -> Result<SupervisorReplaySummary, KernelErr
             iova_cap: iova2.0,
             iova_base: 0x6000,
             iova_len: 4096,
+            dma_len: 4096,
         },
     )?;
 
