@@ -225,7 +225,7 @@ pub fn register_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState)
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn raw_current_apic_id() -> u32 {
-    unsafe { core::arch::x86_64::__cpuid(1).ebx >> 24 }
+    core::arch::x86_64::__cpuid(1).ebx >> 24
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -265,8 +265,8 @@ unsafe fn build_trap_frame_from_saved_regs(
     frame: *const X86InterruptStackFrame,
     vector: u64,
 ) -> crate::kernel::trapframe::TrapFrame {
-    let regs = &*regs;
-    let frame = &*frame;
+    let regs = unsafe { &*regs };
+    let frame = unsafe { &*frame };
     let mut trap = crate::kernel::trapframe::TrapFrame::zeroed();
     trap.set_saved_pc(frame.rip as usize);
     if (frame.cs & 0x3) == 0x3 {
@@ -332,7 +332,6 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 core::arch::global_asm!(
     r#"
-    .intel_syntax noprefix
     .section .text, "ax", @progbits
 
     .macro YARM_X86_TRAP_STUB vector has_error
@@ -404,14 +403,14 @@ macro_rules! declare_all_isr_stubs {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 core::arch::global_asm!(
     r#"
-    .intel_syntax noprefix
+    .altmacro
     .set vector_index, 0
     .rept 256
       .set has_error, 0
       .if vector_index == 8 || vector_index == 10 || vector_index == 11 || vector_index == 12 || vector_index == 13 || vector_index == 14 || vector_index == 17 || vector_index == 21
         .set has_error, 1
       .endif
-      YARM_X86_TRAP_STUB vector_index, has_error
+      YARM_X86_TRAP_STUB %vector_index, %has_error
       .set vector_index, vector_index + 1
     .endr
 "#
