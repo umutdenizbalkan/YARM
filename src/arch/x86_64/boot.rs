@@ -144,6 +144,12 @@ long_mode_entry:
     cli
     lea rsp, [rip + boot_stack_end]
     xor rbp, rbp
+    // Zero .bss/.common for static mut / atomics expected to start at 0.
+    lea rdi, [rip + __bss_start]
+    lea rcx, [rip + __bss_end]
+    sub rcx, rdi
+    xor eax, eax
+    rep stosb
     mov ax, 0x10
     mov ds, ax
     mov es, ax

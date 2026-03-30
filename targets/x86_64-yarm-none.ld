@@ -37,6 +37,8 @@ SECTIONS {
     *(.data*)
   } :data
 
+  __bss_start = .;
+
   .bss.bootstack (NOLOAD) : ALIGN(16) {
     *(.bss.bootstack)
   } :data
@@ -45,6 +47,8 @@ SECTIONS {
     *(.bss*)
     *(COMMON)
   } :data
+
+  __bss_end = .;
 
   /DISCARD/ : {
     *(.eh_frame*)
