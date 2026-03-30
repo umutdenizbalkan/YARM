@@ -1,15 +1,14 @@
 use crate::arch::x86_64::vm_layout;
+use crate::kernel::frame_allocator::{alloc_pt_frame, free_pt_frame};
 use crate::kernel::lock::SpinLock;
 use crate::kernel::vm::{Asid, PageFlags, PhysAddr, VirtAddr};
 
 const ENTRIES_PER_TABLE: usize = 512;
-const PAGE_SHIFT: u64 = 12;
 const PAGE_SIZE_U64: u64 = vm_layout::PAGE_SIZE as u64;
 const PAGE_MASK: u64 = !(PAGE_SIZE_U64 - 1);
 const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
-const PT_POOL_BASE: u64 = 0x0010_0000;
-const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES * 64;
-const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 64;
+const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
+const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageTableEntry(pub u64);
@@ -84,23 +83,56 @@ impl PageTableState {
     }
 
     fn page_index_from_phys(&self, phys: u64) -> Option<usize> {
-        if phys < PT_POOL_BASE {
-            return None;
+        for (idx, page) in self.pages.iter().enumerate() {
+            if page.is_some_and(|entry| entry.phys == phys) {
+                return Some(idx);
+            }
         }
-        let index = ((phys - PT_POOL_BASE) >> PAGE_SHIFT) as usize;
-        self.pages.get(index)?.as_ref()?;
-        Some(index)
+        None
     }
 
     fn alloc_page(&mut self) -> Result<usize, PageTableError> {
         for (idx, slot) in self.pages.iter_mut().enumerate() {
             if slot.is_none() {
-                let phys = PT_POOL_BASE + ((idx as u64) << PAGE_SHIFT);
+                let phys = alloc_pt_frame().map_err(|_| PageTableError::OutOfMemory)?;
                 *slot = Some(PageTablePage::new(phys));
                 return Ok(idx);
             }
         }
         Err(PageTableError::OutOfMemory)
+    }
+
+    fn free_table_hierarchy(&mut self, root_phys: u64, levels: usize) {
+        let mut stack: [(u64, usize); MAX_PT_PAGES] = [(0, 0); MAX_PT_PAGES];
+        let mut sp = 0usize;
+        stack[sp] = (root_phys, levels);
+        sp += 1;
+
+        while sp > 0 {
+            sp -= 1;
+            let (table_phys, level) = stack[sp];
+            let Some(table_idx) = self.page_index_from_phys(table_phys) else {
+                continue;
+            };
+
+            if level > 1 {
+                let entries = self.pages[table_idx].expect("table").entries;
+                for entry in entries {
+                    if !entry.is_present() {
+                        continue;
+                    }
+                    let child_phys = entry.addr();
+                    if self.page_index_from_phys(child_phys).is_some() && sp < MAX_PT_PAGES {
+                        stack[sp] = (child_phys, level - 1);
+                        sp += 1;
+                    }
+                }
+            }
+
+            if let Some(page) = self.pages[table_idx].take() {
+                let _ = free_pt_frame(page.phys);
+            }
+        }
     }
 
     fn find_asid_slot(&self, asid: Asid) -> Option<usize> {
@@ -134,12 +166,25 @@ impl PageTableState {
 
     fn remove_asid(&mut self, asid: Asid) {
         if let Some(slot) = self.find_asid_slot(asid) {
+            if let Some(root) = self.asids[slot] {
+                self.free_table_hierarchy(root.root_phys, 4);
+            }
             self.asids[slot] = None;
         }
     }
 }
 
 static PAGE_TABLE_STATE: SpinLock<PageTableState> = SpinLock::new(PageTableState::new());
+
+pub fn reset_state() {
+    let mut state = PAGE_TABLE_STATE.lock();
+    for page in &mut state.pages {
+        *page = None;
+    }
+    for asid in &mut state.asids {
+        *asid = None;
+    }
+}
 
 fn pml4_index(va: u64) -> usize {
     ((va >> 39) & 0x1ff) as usize

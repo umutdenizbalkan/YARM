@@ -31,7 +31,9 @@ use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
 };
 use crate::arch::{platform_layout, topology};
-use crate::kernel::frame_allocator::{MemoryRegion, PhysicalFrameAllocator};
+use crate::kernel::frame_allocator::{
+    MemoryRegion, PhysicalFrameAllocator, init_pt_frame_allocator,
+};
 use crate::kernel::ipc::ThreadId;
 #[cfg(feature = "hosted-dev")]
 use crate::std::collections::BTreeMap;
@@ -475,9 +477,12 @@ impl Bootstrap {
         capacity_profile: KernelCapacityProfile,
     ) -> Result<KernelState, KernelError> {
         let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
+        let boot_map = Self::default_boot_memory_map();
         frame_allocator
-            .init_from_memory_map(&Self::default_boot_memory_map())
+            .init_from_memory_map(&boot_map)
             .map_err(|_| KernelError::MemoryObjectFull)?;
+        init_pt_frame_allocator(&boot_map).map_err(|_| KernelError::MemoryObjectFull)?;
+        crate::arch::selected_isa::page_table::reset_state();
 
         let mut kernel_aspace = AddressSpace::new_kernel();
         kernel_aspace

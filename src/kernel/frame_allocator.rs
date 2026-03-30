@@ -1,4 +1,5 @@
 use crate::kernel::vm::PAGE_SIZE;
+use crate::kernel::lock::SpinLock;
 
 const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
 const MAX_TRACKED_FRAMES: usize = 131_072;
@@ -19,6 +20,7 @@ pub enum FrameAllocError {
     Misaligned,
     OutOfRange,
     AlreadyFree,
+    Uninitialized,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,6 +200,52 @@ impl PhysicalFrameAllocator {
         }
         count
     }
+}
+
+static PT_FRAME_ALLOCATOR: SpinLock<Option<PhysicalFrameAllocator>> = SpinLock::new(None);
+
+fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
+    [MemoryRegion {
+        start: crate::arch::platform_layout::NEXT_ANON_PHYS_BASE + (512 * 1024 * 1024),
+        len: 512 * 1024 * 1024,
+        usable: true,
+    }]
+}
+
+fn ensure_pt_allocator_initialized() -> Result<(), FrameAllocError> {
+    let mut guard = PT_FRAME_ALLOCATOR.lock();
+    if guard.is_some() {
+        return Ok(());
+    }
+    let mut allocator = PhysicalFrameAllocator::new_uninit();
+    allocator.init_from_memory_map(&default_pt_allocator_regions())?;
+    *guard = Some(allocator);
+    Ok(())
+}
+
+pub fn init_pt_frame_allocator(regions: &[MemoryRegion]) -> Result<(), FrameAllocError> {
+    let mut allocator = PhysicalFrameAllocator::new_uninit();
+    allocator.init_from_memory_map(regions)?;
+    *PT_FRAME_ALLOCATOR.lock() = Some(allocator);
+    Ok(())
+}
+
+pub fn alloc_pt_frame() -> Result<u64, FrameAllocError> {
+    ensure_pt_allocator_initialized()?;
+    let mut guard = PT_FRAME_ALLOCATOR.lock();
+    guard
+        .as_mut()
+        .ok_or(FrameAllocError::Uninitialized)?
+        .alloc_frame()
+}
+
+pub fn free_pt_frame(phys: u64) -> Result<(), FrameAllocError> {
+    ensure_pt_allocator_initialized()?;
+    let mut guard = PT_FRAME_ALLOCATOR.lock();
+    guard
+        .as_mut()
+        .ok_or(FrameAllocError::Uninitialized)?
+        .free_frame(phys)
 }
 
 const fn align_down(value: u64) -> u64 {
