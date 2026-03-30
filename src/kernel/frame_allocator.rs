@@ -129,6 +129,37 @@ impl PhysicalFrameAllocator {
         Err(FrameAllocError::OutOfMemory)
     }
 
+    pub fn alloc_contiguous(&mut self, pages: usize) -> Result<u64, FrameAllocError> {
+        if !self.initialized {
+            return Err(FrameAllocError::InvalidMemoryMap);
+        }
+        if pages == 0 || pages > self.total_frames {
+            return Err(FrameAllocError::OutOfMemory);
+        }
+
+        let limit = self.total_frames.saturating_sub(pages);
+        for start in 0..=limit {
+            let mut all_free = true;
+            for idx in start..start + pages {
+                if self.is_used(idx) {
+                    all_free = false;
+                    break;
+                }
+            }
+            if !all_free {
+                continue;
+            }
+            for idx in start..start + pages {
+                self.set_used(idx, true);
+            }
+            self.used_frames = self.used_frames.saturating_add(pages);
+            self.next_hint = start.saturating_add(pages);
+            return Ok(self.base_phys + (start as u64 * PAGE_SIZE_U64));
+        }
+
+        Err(FrameAllocError::OutOfMemory)
+    }
+
     pub fn free_frame(&mut self, phys: u64) -> Result<(), FrameAllocError> {
         let idx = self.frame_index(phys)?;
         if !self.is_used(idx) {
@@ -137,6 +168,28 @@ impl PhysicalFrameAllocator {
         self.set_used(idx, false);
         self.used_frames = self.used_frames.saturating_sub(1);
         self.next_hint = self.next_hint.min(idx);
+        Ok(())
+    }
+
+    pub fn free_contiguous(&mut self, start_phys: u64, pages: usize) -> Result<(), FrameAllocError> {
+        if pages == 0 {
+            return Ok(());
+        }
+        let start_idx = self.frame_index(start_phys)?;
+        let end_idx = start_idx.saturating_add(pages);
+        if end_idx > self.total_frames {
+            return Err(FrameAllocError::OutOfRange);
+        }
+        for idx in start_idx..end_idx {
+            if !self.is_used(idx) {
+                return Err(FrameAllocError::AlreadyFree);
+            }
+        }
+        for idx in start_idx..end_idx {
+            self.set_used(idx, false);
+        }
+        self.used_frames = self.used_frames.saturating_sub(pages);
+        self.next_hint = self.next_hint.min(start_idx);
         Ok(())
     }
 
@@ -307,5 +360,23 @@ mod tests {
         let second = alloc.alloc_frame().expect("second");
         assert_eq!(first, 0x1000_0000);
         assert_eq!(second, 0x1000_2000);
+    }
+
+    #[test]
+    fn alloc_and_free_contiguous_ranges() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc
+            .init_from_memory_map(&[MemoryRegion {
+                start: 0x2000_0000,
+                len: 0x10_000,
+                usable: true,
+            }])
+            .expect("init");
+
+        let base = alloc.alloc_contiguous(4).expect("alloc 4 pages");
+        assert_eq!(base, 0x2000_0000);
+        alloc.free_contiguous(base, 4).expect("free contiguous");
+        let next = alloc.alloc_contiguous(2).expect("alloc 2 pages");
+        assert_eq!(next, 0x2000_0000);
     }
 }

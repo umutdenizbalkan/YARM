@@ -88,7 +88,17 @@ impl KernelState {
         if !phys.0.is_multiple_of(crate::kernel::vm::PAGE_SIZE as u64) {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
-        let len = crate::kernel::vm::PAGE_SIZE;
+        self.create_memory_object_with_len(phys, crate::kernel::vm::PAGE_SIZE)
+    }
+
+    fn create_memory_object_with_len(
+        &mut self,
+        phys: PhysAddr,
+        len: usize,
+    ) -> Result<(u64, CapId), KernelError> {
+        if len == 0 || !len.is_multiple_of(crate::kernel::vm::PAGE_SIZE) {
+            return Err(KernelError::Vm(VmError::Misaligned));
+        }
         let id = self.memory.next_memory_object_id;
         self.memory.next_memory_object_id = self.memory.next_memory_object_id.wrapping_add(1);
 
@@ -115,15 +125,27 @@ impl KernelState {
     }
 
     pub fn alloc_anonymous_memory_object(&mut self) -> Result<(u64, CapId), KernelError> {
+        self.alloc_anonymous_memory_object_with_len(crate::kernel::vm::PAGE_SIZE)
+    }
+
+    pub fn alloc_anonymous_memory_object_with_len(
+        &mut self,
+        len: usize,
+    ) -> Result<(u64, CapId), KernelError> {
+        if len == 0 {
+            return Err(KernelError::Vm(VmError::Misaligned));
+        }
+        let pages = len.div_ceil(crate::kernel::vm::PAGE_SIZE);
+        let total_len = pages * crate::kernel::vm::PAGE_SIZE;
         let phys = PhysAddr(
             kernel_mut(&mut self.memory.frame_allocator)
-                .alloc_frame()
+                .alloc_contiguous(pages)
                 .map_err(|err| match err {
                     FrameAllocError::OutOfMemory => KernelError::MemoryObjectFull,
                     _ => KernelError::Vm(VmError::Full),
                 })?,
         );
-        self.create_memory_object(phys)
+        self.create_memory_object_with_len(phys, total_len)
     }
 
     pub fn task_brk_bounds(&self, tid: u64) -> Option<(usize, usize)> {
