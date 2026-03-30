@@ -187,6 +187,16 @@ struct X86SavedRegs {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(C)]
+struct X86InterruptStackFrame {
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_KERNEL_STATE_PTR: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -206,11 +216,43 @@ pub fn register_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState)
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn current_cpu_id() -> crate::kernel::scheduler::CpuId {
+    let apic = unsafe { core::arch::x86_64::__cpuid(1).ebx >> 24 };
+    crate::kernel::scheduler::CpuId(apic as u8)
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+unsafe fn build_trap_frame_from_saved_regs(
+    regs: *const X86SavedRegs,
+    frame: *const X86InterruptStackFrame,
+) -> crate::kernel::trapframe::TrapFrame {
+    let regs = &*regs;
+    let frame = &*frame;
+    let mut trap = crate::kernel::trapframe::TrapFrame::new(
+        regs.rax as usize,
+        [
+            regs.rdi as usize,
+            regs.rsi as usize,
+            regs.rdx as usize,
+            regs.r10 as usize,
+            regs.r8 as usize,
+            regs.r9 as usize,
+        ],
+    );
+    trap.set_saved_pc(frame.rip as usize);
+    if (frame.cs & 0x3) == 0x3 {
+        trap.set_saved_sp(frame.rsp as usize);
+    }
+    trap
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_x86_dispatch_trap_from_stub(
     vector: u64,
     error_code: u64,
-    _regs: *mut X86SavedRegs,
+    regs: *mut X86SavedRegs,
+    interrupt_frame: *const X86InterruptStackFrame,
 ) {
     let mut fault_addr = 0u64;
     if vector as usize == VEC_PAGE_FAULT {
@@ -236,11 +278,12 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         return;
     }
     let kernel = unsafe { &mut *(state_ptr as *mut crate::kernel::boot::KernelState) };
+    let mut trap_frame = unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame) };
     let _ = crate::arch::x86_64::trap::handle_trap_entry(
         kernel,
-        crate::kernel::scheduler::CpuId(0),
+        current_cpu_id(),
         context,
-        None,
+        Some(&mut trap_frame),
     );
 }
 
@@ -283,6 +326,7 @@ yarm_x86_common_trap_entry:
     mov rdi, qword ptr [rsp + 15 * 8]
     mov rsi, qword ptr [rsp + 16 * 8]
     mov rdx, rsp
+    lea rcx, [rsp + 17 * 8]
     call yarm_x86_dispatch_trap_from_stub
 
     pop r15

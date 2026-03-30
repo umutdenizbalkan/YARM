@@ -11,7 +11,15 @@ use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBac
 
 #[inline]
 fn run() {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    let mut kernel = Bootstrap::init().expect("kernel init");
+    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
     let kernel = Bootstrap::init().expect("kernel init");
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    {
+        yarm::arch::x86_64::descriptor_tables::register_trap_kernel_state(&mut kernel);
+        yarm::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
+    }
     yarm::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),
