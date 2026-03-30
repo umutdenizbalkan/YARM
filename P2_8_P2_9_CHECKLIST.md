@@ -17,7 +17,7 @@ Ordered by **risk first**, then **effort**.
 
 - [x] Replace single fixed bitmap capacity (`MAX_TRACKED_FRAMES`) with scalable storage.
 - [x] Add fast-path data structure for contiguous allocations (run list / buddy metadata).
-- [ ] Preserve O(1)-ish single-page allocation hinting under fragmentation pressure.
+- [x] Preserve O(1)-ish single-page allocation hinting under fragmentation pressure.
 - [ ] Add long-run fragmentation/throughput tests.
 - [ ] Add profile-aware sizing knobs for hosted-dev vs non-hosted deployments.
 

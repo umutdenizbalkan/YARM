@@ -39,6 +39,7 @@ pub struct PhysicalFrameAllocator {
     extents: [Option<FreeExtent>; MAX_FREE_EXTENTS],
     largest_free_run_pages: usize,
     run_hint_by_class: [Option<usize>; CONTIG_SIZE_CLASSES.len()],
+    single_page_hint_idx: Option<usize>,
 }
 
 impl PhysicalFrameAllocator {
@@ -52,6 +53,7 @@ impl PhysicalFrameAllocator {
             extents: [const { None }; MAX_FREE_EXTENTS],
             largest_free_run_pages: 0,
             run_hint_by_class: [const { None }; CONTIG_SIZE_CLASSES.len()],
+            single_page_hint_idx: None,
         }
     }
 
@@ -84,6 +86,7 @@ impl PhysicalFrameAllocator {
         self.extents = [const { None }; MAX_FREE_EXTENTS];
         self.largest_free_run_pages = 0;
         self.run_hint_by_class = [const { None }; CONTIG_SIZE_CLASSES.len()];
+        self.single_page_hint_idx = None;
 
         for region in regions {
             if !region.usable || region.len == 0 {
@@ -109,7 +112,25 @@ impl PhysicalFrameAllocator {
     }
 
     pub fn alloc_frame(&mut self) -> Result<u64, FrameAllocError> {
-        self.alloc_contiguous(1)
+        if !self.initialized {
+            return Err(FrameAllocError::InvalidMemoryMap);
+        }
+        if self.free_frames == 0 {
+            return Err(FrameAllocError::OutOfMemory);
+        }
+
+        let hint_idx = self
+            .single_page_hint_idx
+            .filter(|&idx| self.extents[idx].is_some_and(|extent| extent.pages > 0))
+            .or_else(|| self.find_extent_index(1));
+        let Some(idx) = hint_idx else {
+            return Err(FrameAllocError::OutOfMemory);
+        };
+
+        let (alloc_phys, old_pages, new_pages) = self.split_extent_for_allocation(idx, 1)?;
+        self.free_frames = self.free_frames.saturating_sub(1);
+        self.update_hints_after_allocation(idx, old_pages, new_pages);
+        Ok(alloc_phys)
     }
 
     pub fn alloc_contiguous(&mut self, pages: usize) -> Result<u64, FrameAllocError> {
@@ -121,7 +142,7 @@ impl PhysicalFrameAllocator {
         }
 
         if let Some(idx) = self.fast_path_extent_index(pages).or_else(|| self.find_extent_index(pages)) {
-            let alloc_phys = self.split_extent_for_allocation(idx, pages)?;
+            let (alloc_phys, _, _) = self.split_extent_for_allocation(idx, pages)?;
             self.free_frames = self.free_frames.saturating_sub(pages);
             self.refresh_run_metadata();
             return Ok(alloc_phys);
@@ -289,24 +310,26 @@ impl PhysicalFrameAllocator {
         &mut self,
         idx: usize,
         pages: usize,
-    ) -> Result<u64, FrameAllocError> {
+    ) -> Result<(u64, usize, usize), FrameAllocError> {
         let Some(mut extent) = self.extents[idx] else {
             return Err(FrameAllocError::OutOfMemory);
         };
         if extent.pages < pages {
             return Err(FrameAllocError::OutOfMemory);
         }
+        let old_pages = extent.pages;
         let alloc_phys = extent.start_phys;
         extent.start_phys = extent
             .start_phys
             .saturating_add((pages as u64).saturating_mul(PAGE_SIZE_U64));
         extent.pages -= pages;
+        let new_pages = extent.pages;
         if extent.pages == 0 {
             self.extents[idx] = None;
         } else {
             self.extents[idx] = Some(extent);
         }
-        Ok(alloc_phys)
+        Ok((alloc_phys, old_pages, new_pages))
     }
 
     fn find_extent_index(&self, pages: usize) -> Option<usize> {
@@ -325,16 +348,41 @@ impl PhysicalFrameAllocator {
     fn refresh_run_metadata(&mut self) {
         self.largest_free_run_pages = 0;
         self.run_hint_by_class = [const { None }; CONTIG_SIZE_CLASSES.len()];
+        self.single_page_hint_idx = None;
         for (idx, extent) in self.extents.iter().enumerate() {
             let Some(extent) = extent else {
                 continue;
             };
             self.largest_free_run_pages = self.largest_free_run_pages.max(extent.pages);
+            if self.single_page_hint_idx.is_none() {
+                self.single_page_hint_idx = Some(idx);
+            }
             for (class_idx, class_pages) in CONTIG_SIZE_CLASSES.iter().enumerate() {
                 if extent.pages >= *class_pages && self.run_hint_by_class[class_idx].is_none() {
                     self.run_hint_by_class[class_idx] = Some(idx);
                 }
             }
+        }
+    }
+
+    fn update_hints_after_allocation(&mut self, idx: usize, old_pages: usize, new_pages: usize) {
+        self.single_page_hint_idx = if new_pages > 0 {
+            Some(idx)
+        } else {
+            self.extents
+                .iter()
+                .enumerate()
+                .find_map(|(probe, extent)| extent.map(|_| probe))
+        };
+
+        for (class_idx, class_pages) in CONTIG_SIZE_CLASSES.iter().enumerate() {
+            if self.run_hint_by_class[class_idx] == Some(idx) && new_pages < *class_pages {
+                self.run_hint_by_class[class_idx] = None;
+            }
+        }
+
+        if old_pages == self.largest_free_run_pages && new_pages < old_pages {
+            self.largest_free_run_pages = self.largest_free_run_pages.saturating_sub(1);
         }
     }
 
@@ -511,5 +559,26 @@ mod tests {
         assert!(alloc.largest_free_run_pages >= 0x20_000 / PAGE_SIZE);
         let _ = alloc.alloc_contiguous(8).expect("alloc 8 pages");
         assert!(alloc.largest_free_run_pages >= 4);
+    }
+
+    #[test]
+    fn single_page_hint_survives_fragmentation_pressure() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc
+            .init_from_memory_map(&[MemoryRegion {
+                start: 0x4000_0000,
+                len: 0x20_000,
+                usable: true,
+            }])
+            .expect("init");
+
+        for step in 0..8usize {
+            let keep = alloc.alloc_frame().expect("keep");
+            let scratch = alloc.alloc_frame().expect("scratch");
+            alloc.free_frame(scratch).expect("free scratch");
+            assert!(alloc.single_page_hint_idx.is_some(), "step={step}");
+            assert!(alloc.free_frames() > 0);
+            let _ = keep;
+        }
     }
 }
