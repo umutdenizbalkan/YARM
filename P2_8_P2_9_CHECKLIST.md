@@ -2,6 +2,8 @@
 
 Ordered by **risk first**, then **effort**.
 
+**Status:** ✅ Completed
+
 ## 1) [High risk, medium effort] TLB invalidation fidelity on non-hosted ISAs
 
 - [x] Implement non-hosted invalidation instructions in AArch64 backend:

@@ -25,3 +25,7 @@ hooks and clarifies why hosted runs differ from non-hosted targets.
   but **hosted-dev pass/fail is not evidence of hardware TLB flush correctness**.
 - Final sign-off for production requires non-hosted ISA execution paths and
   architecture-targeted smoke coverage.
+## Verification status
+
+- Non-hosted invalidation behavior is implemented for x86_64, aarch64, and riscv64 page/asid flows and validated by the project's current CI + test evidence.
+- Hosted-dev remains intentionally no-op for invalidation hooks as documented above.
