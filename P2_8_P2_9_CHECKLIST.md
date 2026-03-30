@@ -19,7 +19,7 @@ Ordered by **risk first**, then **effort**.
 - [x] Add fast-path data structure for contiguous allocations (run list / buddy metadata).
 - [x] Preserve O(1)-ish single-page allocation hinting under fragmentation pressure.
 - [x] Add long-run fragmentation/throughput tests.
-- [ ] Add profile-aware sizing knobs for hosted-dev vs non-hosted deployments.
+- [x] Add profile-aware sizing knobs for hosted-dev vs non-hosted deployments.
 
 ## 3) [Medium risk, medium effort] Cross-CPU shootdown hardening
 

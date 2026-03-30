@@ -2,7 +2,13 @@ use crate::kernel::lock::SpinLock;
 use crate::kernel::vm::PAGE_SIZE;
 
 const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
+#[cfg(feature = "hosted-dev")]
+const MAX_FREE_EXTENTS: usize = 256;
+#[cfg(not(feature = "hosted-dev"))]
 const MAX_FREE_EXTENTS: usize = 512;
+#[cfg(feature = "hosted-dev")]
+const CONTIG_SIZE_CLASSES: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+#[cfg(not(feature = "hosted-dev"))]
 const CONTIG_SIZE_CLASSES: [usize; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,9 +422,14 @@ impl PhysicalFrameAllocator {
 static PT_FRAME_ALLOCATOR: SpinLock<Option<PhysicalFrameAllocator>> = SpinLock::new(None);
 
 fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
+    #[cfg(feature = "hosted-dev")]
+    let len = 128 * 1024 * 1024;
+    #[cfg(not(feature = "hosted-dev"))]
+    let len = 512 * 1024 * 1024;
+
     [MemoryRegion {
         start: crate::arch::platform_layout::NEXT_ANON_PHYS_BASE + (512 * 1024 * 1024),
-        len: 512 * 1024 * 1024,
+        len,
         usable: true,
     }]
 }
@@ -661,5 +672,19 @@ mod tests {
             alloc.free_frame(phys).expect("drain");
         }
         assert_eq!(alloc.free_frames(), initial_free);
+    }
+
+    #[test]
+    #[cfg(feature = "hosted-dev")]
+    fn hosted_profile_uses_conservative_allocator_knobs() {
+        assert_eq!(MAX_FREE_EXTENTS, 256);
+        assert_eq!(CONTIG_SIZE_CLASSES, [1, 2, 4, 8, 16, 32, 64, 128]);
+    }
+
+    #[test]
+    #[cfg(not(feature = "hosted-dev"))]
+    fn non_hosted_profile_uses_throughput_allocator_knobs() {
+        assert_eq!(MAX_FREE_EXTENTS, 512);
+        assert_eq!(CONTIG_SIZE_CLASSES, [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]);
     }
 }
