@@ -11,7 +11,7 @@ Ordered by **risk first**, then **effort**.
   - page invalidation hook
   - ASID invalidation hook
 - [x] Add architecture-targeted smoke validation for invalidation paths in CI (QEMU lanes).
-- [ ] Add explicit doc note for hosted-dev no-op behavior and production expectations.
+- [x] Add explicit doc note for hosted-dev no-op behavior and production expectations (`TLB_INVALIDATION_POLICY.md`).
 
 ## 2) [High risk, higher effort] Physical frame allocator scaling strategy
 
