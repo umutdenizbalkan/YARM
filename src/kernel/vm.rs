@@ -679,6 +679,28 @@ mod tests {
     }
 
     #[test]
+    fn repeated_destroy_recreate_cycles_with_pending_shootdowns() {
+        let mut mgr = AddressSpaceManager::default();
+
+        for cycle in 0..64usize {
+            let asid = mgr.create_user_space().expect("create");
+            assert_eq!(mgr.destroy(asid, 0b11), Ok(()));
+            assert!(mgr.retired_entry(asid).is_some());
+
+            if cycle % 2 == 0 {
+                assert_eq!(mgr.acknowledge_shootdown(asid, 0b01), Ok(false));
+                assert_eq!(mgr.acknowledge_shootdown(asid, 0b10), Ok(true));
+            } else {
+                for _ in 0..AddressSpaceManager::SHOOTDOWN_TIMEOUT_TICKS {
+                    let _ = mgr.tick_retired_shootdowns();
+                }
+            }
+
+            assert_eq!(mgr.retired_entry(asid), None);
+        }
+    }
+
+    #[test]
     fn map_rejects_misaligned_virt_and_phys() {
         let mut aspace = AddressSpace::new_user();
         let flags = PageFlags::USER_RX;
