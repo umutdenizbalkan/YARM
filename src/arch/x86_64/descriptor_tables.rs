@@ -251,6 +251,15 @@ fn current_cpu_id() -> crate::kernel::scheduler::CpuId {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn halt_forever() -> ! {
+    loop {
+        unsafe {
+            core::arch::asm!("cli", "hlt", options(noreturn));
+        }
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 unsafe fn build_trap_frame_from_saved_regs(
     regs: *const X86SavedRegs,
     frame: *const X86InterruptStackFrame,
@@ -298,22 +307,26 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     let state_ptr = TRAP_KERNEL_STATE_PTR.load(Ordering::Acquire);
     if state_ptr == 0 {
         if vector as usize == VEC_DOUBLE_FAULT {
-            loop {
-                unsafe {
-                    core::arch::asm!("cli", "hlt", options(noreturn));
-                }
-            }
+            halt_forever();
         }
         return;
     }
     let kernel = unsafe { &mut *(state_ptr as *mut crate::kernel::boot::KernelState) };
     let mut trap_frame = unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
-    let _ = crate::arch::x86_64::trap::handle_trap_entry(
+    if let Err(err) = crate::arch::x86_64::trap::handle_trap_entry(
         kernel,
         current_cpu_id(),
         context,
         Some(&mut trap_frame),
-    );
+    ) {
+        crate::pr_err!(
+            "x86 trap dispatch failed: vector={} error_code=0x{:x} err={:?}",
+            vector,
+            error_code,
+            err
+        );
+        halt_forever();
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
