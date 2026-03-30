@@ -111,26 +111,26 @@ pub enum VmError {
     InvalidAsid,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
 fn arch_register_asid(asid: Asid) -> Result<(), VmError> {
     crate::arch::selected_isa::page_table::ensure_asid_root(asid).map_err(|_| VmError::Full)
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
 fn arch_register_asid(_asid: Asid) -> Result<(), VmError> {
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
 fn arch_unregister_asid(asid: Asid) {
     crate::arch::selected_isa::page_table::remove_asid_root(asid);
     crate::arch::selected_isa::page_table::invalidate_asid(asid);
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
 fn arch_unregister_asid(_asid: Asid) {}
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
 fn arch_map_page(asid: Option<Asid>, virt: VirtAddr, mapping: Mapping) -> Result<(), VmError> {
     if let Some(asid) = asid {
         crate::arch::selected_isa::page_table::map_page(asid, virt, mapping.phys, mapping.flags)
@@ -139,27 +139,27 @@ fn arch_map_page(asid: Option<Asid>, virt: VirtAddr, mapping: Mapping) -> Result
     Ok(())
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
 fn arch_map_page(_asid: Option<Asid>, _virt: VirtAddr, _mapping: Mapping) -> Result<(), VmError> {
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
 fn arch_unmap_page(asid: Option<Asid>, virt: VirtAddr) {
     if let Some(asid) = asid {
         let _ = crate::arch::selected_isa::page_table::unmap_page(asid, virt);
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
 fn arch_unmap_page(_asid: Option<Asid>, _virt: VirtAddr) {}
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
 fn arch_cr3_for_asid(asid: Asid) -> Option<u64> {
     crate::arch::selected_isa::page_table::cr3_for_asid(asid)
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
 fn arch_cr3_for_asid(_asid: Asid) -> Option<u64> {
     None
 }
