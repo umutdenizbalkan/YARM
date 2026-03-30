@@ -361,7 +361,7 @@ struct MemorySubsystem {
     memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
     brk_regions: [Option<BrkRegionRecord>; MAX_TASKS],
     next_memory_object_id: u64,
-    frame_allocator: PhysicalFrameAllocator,
+    frame_allocator: KernelStorage<PhysicalFrameAllocator>,
 }
 
 #[derive(Debug)]
@@ -533,7 +533,7 @@ impl Bootstrap {
                 memory_objects: [None; MAX_MEMORY_OBJECTS],
                 brk_regions: [None; MAX_TASKS],
                 next_memory_object_id: 1,
-                frame_allocator,
+                frame_allocator: store_kernel_value(frame_allocator),
             }),
             drivers: DriverSubsystem {
                 driver_records: [const { None }; MAX_DRIVERS],
@@ -1046,7 +1046,7 @@ impl KernelState {
             return;
         }
 
-        let _ = self.memory.frame_allocator.free_frame(memory_object.phys.0);
+        let _ = kernel_mut(&mut self.memory.frame_allocator).free_frame(memory_object.phys.0);
         self.memory.memory_objects[slot_index] = None;
     }
 

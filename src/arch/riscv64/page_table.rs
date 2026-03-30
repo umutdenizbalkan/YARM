@@ -8,7 +8,8 @@ const PAGE_SIZE_U64: u64 = vm_layout::PAGE_SIZE as u64;
 const PAGE_MASK: u64 = !(PAGE_SIZE_U64 - 1);
 const PTE_ADDR_MASK: u64 = 0x003f_ffff_ffff_fc00;
 const PT_POOL_BASE: u64 = 0x0080_0000;
-const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
+const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES * 64;
+const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageTableEntry(pub u64);
@@ -70,14 +71,14 @@ struct AsidRoot {
 
 struct PageTableState {
     pages: [Option<PageTablePage>; MAX_PT_PAGES],
-    asids: [Option<AsidRoot>; vm_layout::MAX_ADDRESS_SPACES],
+    asids: [Option<AsidRoot>; MAX_ASID_ROOTS],
 }
 
 impl PageTableState {
     const fn new() -> Self {
         Self {
             pages: [const { None }; MAX_PT_PAGES],
-            asids: [const { None }; vm_layout::MAX_ADDRESS_SPACES],
+            asids: [const { None }; MAX_ASID_ROOTS],
         }
     }
 
