@@ -18,6 +18,38 @@ pub trait Hal {
     fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent;
 }
 
+#[derive(Debug, Default)]
+pub struct SelectedIsaHal {
+    active_asid: Option<Asid>,
+}
+
+impl SelectedIsaHal {
+    pub fn active_asid(&self) -> Option<Asid> {
+        self.active_asid
+    }
+}
+
+impl Hal for SelectedIsaHal {
+    type TrapContext = crate::arch::trap_entry::ArchTrapContext;
+
+    fn switch_address_space(&mut self, asid: Asid) {
+        let _ = crate::arch::selected_isa::page_table::activate_asid(asid);
+        self.active_asid = Some(asid);
+    }
+
+    fn acknowledge_interrupt(&mut self, _cpu: CpuId, _irq_line: u16) {}
+
+    fn complete_external_interrupt(&mut self, irq_line: u16) {
+        crate::arch::selected_isa::irq::external_irq_eoi(irq_line);
+    }
+
+    fn program_timer_deadline(&mut self, _cpu: CpuId, _ticks_from_now: u64) {}
+
+    fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent {
+        crate::arch::trap_entry::decode_trap_context(*context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +258,12 @@ mod tests {
         assert_eq!(hal.last_irq, Some((CpuId(2), 41)));
         assert_eq!(hal.last_completed_irq, Some(41));
         assert_eq!(hal.last_timer, Some((CpuId(2), 500)));
+    }
+
+    #[test]
+    fn selected_isa_hal_tracks_last_switched_asid() {
+        let mut hal = SelectedIsaHal::default();
+        hal.switch_address_space(Asid(42));
+        assert_eq!(hal.active_asid(), Some(Asid(42)));
     }
 }

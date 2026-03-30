@@ -248,6 +248,20 @@ pub fn cr3_for_asid(asid: Asid) -> Option<u64> {
     Some((root & PAGE_MASK) | asid_bits)
 }
 
+pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
+    let satp = cr3_for_asid(asid).ok_or(PageTableError::OutOfMemory)?;
+    #[cfg(not(feature = "hosted-dev"))]
+    unsafe {
+        core::arch::asm!(
+            "csrw satp, {value}",
+            "sfence.vma x0, x0",
+            value = in(reg) satp,
+            options(nostack, preserves_flags)
+        );
+    }
+    Ok(satp)
+}
+
 pub fn map_page(
     asid: Asid,
     virt: VirtAddr,
