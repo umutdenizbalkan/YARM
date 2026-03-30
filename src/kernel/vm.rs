@@ -111,6 +111,59 @@ pub enum VmError {
     InvalidAsid,
 }
 
+#[cfg(target_arch = "x86_64")]
+fn arch_register_asid(asid: Asid) -> Result<(), VmError> {
+    crate::arch::selected_isa::page_table::ensure_asid_root(asid).map_err(|_| VmError::Full)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn arch_register_asid(_asid: Asid) -> Result<(), VmError> {
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn arch_unregister_asid(asid: Asid) {
+    crate::arch::selected_isa::page_table::remove_asid_root(asid);
+    crate::arch::selected_isa::page_table::invalidate_asid(asid);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn arch_unregister_asid(_asid: Asid) {}
+
+#[cfg(target_arch = "x86_64")]
+fn arch_map_page(asid: Option<Asid>, virt: VirtAddr, mapping: Mapping) -> Result<(), VmError> {
+    if let Some(asid) = asid {
+        crate::arch::selected_isa::page_table::map_page(asid, virt, mapping.phys, mapping.flags)
+            .map_err(|_| VmError::Full)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn arch_map_page(_asid: Option<Asid>, _virt: VirtAddr, _mapping: Mapping) -> Result<(), VmError> {
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn arch_unmap_page(asid: Option<Asid>, virt: VirtAddr) {
+    if let Some(asid) = asid {
+        let _ = crate::arch::selected_isa::page_table::unmap_page(asid, virt);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn arch_unmap_page(_asid: Option<Asid>, _virt: VirtAddr) {}
+
+#[cfg(target_arch = "x86_64")]
+fn arch_cr3_for_asid(asid: Asid) -> Option<u64> {
+    crate::arch::selected_isa::page_table::cr3_for_asid(asid)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn arch_cr3_for_asid(_asid: Asid) -> Option<u64> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
     virt: VirtAddr,
@@ -125,6 +178,7 @@ struct Entry {
 #[derive(Debug)]
 pub struct AddressSpace {
     kind: AddressSpaceKind,
+    asid: Option<Asid>,
     entries: [Option<Entry>; MAX_MAPPINGS],
     len: usize,
 }
@@ -133,6 +187,7 @@ impl AddressSpace {
     pub fn new_kernel() -> Self {
         Self {
             kind: AddressSpaceKind::Kernel,
+            asid: None,
             entries: [None; MAX_MAPPINGS],
             len: 0,
         }
@@ -141,6 +196,16 @@ impl AddressSpace {
     pub fn new_user() -> Self {
         Self {
             kind: AddressSpaceKind::User,
+            asid: None,
+            entries: [None; MAX_MAPPINGS],
+            len: 0,
+        }
+    }
+
+    pub fn new_user_with_asid(asid: Asid) -> Self {
+        Self {
+            kind: AddressSpaceKind::User,
+            asid: Some(asid),
             entries: [None; MAX_MAPPINGS],
             len: 0,
         }
@@ -148,6 +213,10 @@ impl AddressSpace {
 
     pub fn kind(&self) -> AddressSpaceKind {
         self.kind
+    }
+
+    pub fn asid(&self) -> Option<Asid> {
+        self.asid
     }
 
     pub fn map_page(
@@ -170,6 +239,7 @@ impl AddressSpace {
             match self.entries[i].as_mut() {
                 Some(entry) if entry.virt == virt => {
                     let old = entry.mapping;
+                    arch_map_page(self.asid, virt, mapping)?;
                     entry.mapping = mapping;
                     return Ok(Some(old));
                 }
@@ -180,6 +250,7 @@ impl AddressSpace {
         }
 
         if let Some(i) = first_free {
+            arch_map_page(self.asid, virt, mapping)?;
             self.entries[i] = Some(Entry { virt, mapping });
             self.len += 1;
             return Ok(None);
@@ -202,7 +273,9 @@ impl AddressSpace {
                 && entry.virt == virt
             {
                 self.len = self.len.saturating_sub(1);
-                return slot.take().map(|old| old.mapping);
+                let old = slot.take().map(|old| old.mapping);
+                arch_unmap_page(self.asid, virt);
+                return old;
             }
         }
         None
@@ -294,15 +367,17 @@ impl AddressSpaceManager {
 
     pub fn create_user_space(&mut self) -> Result<Asid, VmError> {
         let asid = self.allocate_asid()?;
+        arch_register_asid(asid)?;
         for slot in &mut self.entries {
             if slot.is_none() {
                 *slot = Some(AsEntry {
                     asid,
-                    aspace: AddressSpace::new_user(),
+                    aspace: AddressSpace::new_user_with_asid(asid),
                 });
                 return Ok(asid);
             }
         }
+        arch_unregister_asid(asid);
         Err(VmError::Full)
     }
 
@@ -322,6 +397,13 @@ impl AddressSpaceManager {
             .map(|entry| &mut entry.aspace)
     }
 
+    pub fn cr3_for_asid(&self, asid: Asid) -> Option<u64> {
+        if self.get(asid).is_none() {
+            return None;
+        }
+        arch_cr3_for_asid(asid)
+    }
+
     /// Destroys a software address space shadow and optionally retires its ASID
     /// until all CPUs in `pending_cpu_bitmap` acknowledge a shootdown.
     ///
@@ -331,6 +413,7 @@ impl AddressSpaceManager {
         for slot in &mut self.entries {
             if slot.as_ref().is_some_and(|entry| entry.asid == asid) {
                 *slot = None;
+                arch_unregister_asid(asid);
                 if pending_cpu_bitmap == 0 {
                     return Ok(());
                 }

@@ -20,7 +20,7 @@ pub fn init_lapic_mmio_base(base: usize) {
     LAPIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
 
-#[cfg(feature = "hosted-dev")]
+#[cfg(all(feature = "hosted-dev", not(test)))]
 pub fn init_lapic_mmio_base(_base: usize) {}
 
 pub fn configure_lapic_from_platform_layout() {
