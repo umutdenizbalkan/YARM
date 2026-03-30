@@ -254,23 +254,23 @@ fn current_cpu_id() -> crate::kernel::scheduler::CpuId {
 unsafe fn build_trap_frame_from_saved_regs(
     regs: *const X86SavedRegs,
     frame: *const X86InterruptStackFrame,
+    vector: u64,
 ) -> crate::kernel::trapframe::TrapFrame {
     let regs = &*regs;
     let frame = &*frame;
-    let mut trap = crate::kernel::trapframe::TrapFrame::new(
-        regs.rax as usize,
-        [
-            regs.rdi as usize,
-            regs.rsi as usize,
-            regs.rdx as usize,
-            regs.r10 as usize,
-            regs.r8 as usize,
-            regs.r9 as usize,
-        ],
-    );
+    let mut trap = crate::kernel::trapframe::TrapFrame::zeroed();
     trap.set_saved_pc(frame.rip as usize);
     if (frame.cs & 0x3) == 0x3 {
         trap.set_saved_sp(frame.rsp as usize);
+    }
+    if vector as usize == VEC_SYSCALL {
+        trap.set_syscall_num(regs.rax as usize);
+        trap.set_arg(0, regs.rdi as usize);
+        trap.set_arg(1, regs.rsi as usize);
+        trap.set_arg(2, regs.rdx as usize);
+        trap.set_arg(3, regs.rcx as usize);
+        trap.set_arg(4, regs.r8 as usize);
+        trap.set_arg(5, regs.r9 as usize);
     }
     trap
 }
@@ -307,7 +307,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         return;
     }
     let kernel = unsafe { &mut *(state_ptr as *mut crate::kernel::boot::KernelState) };
-    let mut trap_frame = unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame) };
+    let mut trap_frame = unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
     let _ = crate::arch::x86_64::trap::handle_trap_entry(
         kernel,
         current_cpu_id(),
