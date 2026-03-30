@@ -2,8 +2,7 @@ use crate::kernel::lock::SpinLock;
 use crate::kernel::vm::PAGE_SIZE;
 
 const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
-const MAX_TRACKED_FRAMES: usize = 131_072;
-const BITMAP_WORDS: usize = MAX_TRACKED_FRAMES / 64;
+const MAX_FREE_EXTENTS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryRegion {
@@ -23,25 +22,31 @@ pub enum FrameAllocError {
     Uninitialized,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FreeExtent {
+    start_phys: u64,
+    pages: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PhysicalFrameAllocator {
     base_phys: u64,
+    end_phys_exclusive: u64,
     total_frames: usize,
-    used_frames: usize,
-    next_hint: usize,
+    free_frames: usize,
     initialized: bool,
-    bitmap: [u64; BITMAP_WORDS],
+    extents: [Option<FreeExtent>; MAX_FREE_EXTENTS],
 }
 
 impl PhysicalFrameAllocator {
     pub const fn new_uninit() -> Self {
         Self {
             base_phys: 0,
+            end_phys_exclusive: 0,
             total_frames: 0,
-            used_frames: 0,
-            next_hint: 0,
+            free_frames: 0,
             initialized: false,
-            bitmap: [u64::MAX; BITMAP_WORDS],
+            extents: [const { None }; MAX_FREE_EXTENTS],
         }
     }
 
@@ -66,20 +71,12 @@ impl PhysicalFrameAllocator {
             return Err(FrameAllocError::InvalidMemoryMap);
         }
 
-        let total_frames = ((max_phys - min_phys) / PAGE_SIZE_U64) as usize;
-        if total_frames == 0 {
-            return Err(FrameAllocError::InvalidMemoryMap);
-        }
-        if total_frames > MAX_TRACKED_FRAMES {
-            return Err(FrameAllocError::CapacityExceeded);
-        }
-
         self.base_phys = min_phys;
-        self.total_frames = total_frames;
-        self.used_frames = total_frames;
-        self.next_hint = 0;
+        self.end_phys_exclusive = max_phys;
+        self.total_frames = 0;
+        self.free_frames = 0;
         self.initialized = true;
-        self.bitmap.fill(u64::MAX);
+        self.extents = [const { None }; MAX_FREE_EXTENTS];
 
         for region in regions {
             if !region.usable || region.len == 0 {
@@ -90,85 +87,57 @@ impl PhysicalFrameAllocator {
             if end <= start {
                 continue;
             }
-            let start_idx = ((start - min_phys) / PAGE_SIZE_U64) as usize;
-            let end_idx = ((end - min_phys) / PAGE_SIZE_U64) as usize;
-            for idx in start_idx..end_idx.min(total_frames) {
-                self.set_used(idx, false);
-            }
+            let pages = ((end - start) / PAGE_SIZE_U64) as usize;
+            self.insert_extent(start, pages)?;
+            self.total_frames = self.total_frames.saturating_add(pages);
+            self.free_frames = self.free_frames.saturating_add(pages);
         }
 
-        self.used_frames = self.count_used();
+        if self.total_frames == 0 {
+            return Err(FrameAllocError::InvalidMemoryMap);
+        }
+
         Ok(())
     }
 
     pub fn alloc_frame(&mut self) -> Result<u64, FrameAllocError> {
-        if !self.initialized {
-            return Err(FrameAllocError::InvalidMemoryMap);
-        }
-        if self.used_frames >= self.total_frames {
-            return Err(FrameAllocError::OutOfMemory);
-        }
-
-        let start = self.next_hint.min(self.total_frames.saturating_sub(1));
-        for pass in 0..2 {
-            let range = if pass == 0 {
-                start..self.total_frames
-            } else {
-                0..start
-            };
-            for idx in range {
-                if !self.is_used(idx) {
-                    self.set_used(idx, true);
-                    self.used_frames = self.used_frames.saturating_add(1);
-                    self.next_hint = idx.saturating_add(1);
-                    return Ok(self.base_phys + (idx as u64 * PAGE_SIZE_U64));
-                }
-            }
-        }
-
-        Err(FrameAllocError::OutOfMemory)
+        self.alloc_contiguous(1)
     }
 
     pub fn alloc_contiguous(&mut self, pages: usize) -> Result<u64, FrameAllocError> {
         if !self.initialized {
             return Err(FrameAllocError::InvalidMemoryMap);
         }
-        if pages == 0 || pages > self.total_frames {
+        if pages == 0 || pages > self.free_frames {
             return Err(FrameAllocError::OutOfMemory);
         }
 
-        let limit = self.total_frames.saturating_sub(pages);
-        for start in 0..=limit {
-            let mut all_free = true;
-            for idx in start..start + pages {
-                if self.is_used(idx) {
-                    all_free = false;
-                    break;
-                }
-            }
-            if !all_free {
+        for slot in &mut self.extents {
+            let Some(mut extent) = *slot else {
+                continue;
+            };
+            if extent.pages < pages {
                 continue;
             }
-            for idx in start..start + pages {
-                self.set_used(idx, true);
+            let alloc_phys = extent.start_phys;
+            extent.start_phys = extent
+                .start_phys
+                .saturating_add((pages as u64).saturating_mul(PAGE_SIZE_U64));
+            extent.pages -= pages;
+            if extent.pages == 0 {
+                *slot = None;
+            } else {
+                *slot = Some(extent);
             }
-            self.used_frames = self.used_frames.saturating_add(pages);
-            self.next_hint = start.saturating_add(pages);
-            return Ok(self.base_phys + (start as u64 * PAGE_SIZE_U64));
+            self.free_frames = self.free_frames.saturating_sub(pages);
+            return Ok(alloc_phys);
         }
 
         Err(FrameAllocError::OutOfMemory)
     }
 
     pub fn free_frame(&mut self, phys: u64) -> Result<(), FrameAllocError> {
-        let idx = self.frame_index(phys)?;
-        if !self.is_used(idx) {
-            return Err(FrameAllocError::AlreadyFree);
-        }
-        self.set_used(idx, false);
-        self.used_frames = self.used_frames.saturating_sub(1);
-        self.next_hint = self.next_hint.min(idx);
-        Ok(())
+        self.free_contiguous(phys, 1)
     }
 
     pub fn free_contiguous(
@@ -176,33 +145,86 @@ impl PhysicalFrameAllocator {
         start_phys: u64,
         pages: usize,
     ) -> Result<(), FrameAllocError> {
+        if !self.initialized {
+            return Err(FrameAllocError::InvalidMemoryMap);
+        }
         if pages == 0 {
             return Ok(());
         }
-        let start_idx = self.frame_index(start_phys)?;
-        let end_idx = start_idx.saturating_add(pages);
-        if end_idx > self.total_frames {
+        if !start_phys.is_multiple_of(PAGE_SIZE_U64) {
+            return Err(FrameAllocError::Misaligned);
+        }
+        if start_phys < self.base_phys {
             return Err(FrameAllocError::OutOfRange);
         }
-        for idx in start_idx..end_idx {
-            if !self.is_used(idx) {
+        let span = (pages as u64).saturating_mul(PAGE_SIZE_U64);
+        let end_phys = start_phys.saturating_add(span);
+        if end_phys > self.end_phys_exclusive || end_phys <= start_phys {
+            return Err(FrameAllocError::OutOfRange);
+        }
+        for extent in self.extents.iter().flatten() {
+            let extent_end = extent
+                .start_phys
+                .saturating_add((extent.pages as u64).saturating_mul(PAGE_SIZE_U64));
+            let overlaps = start_phys < extent_end && end_phys > extent.start_phys;
+            if overlaps {
                 return Err(FrameAllocError::AlreadyFree);
             }
         }
-        for idx in start_idx..end_idx {
-            self.set_used(idx, false);
-        }
-        self.used_frames = self.used_frames.saturating_sub(pages);
-        self.next_hint = self.next_hint.min(start_idx);
+        self.insert_extent(start_phys, pages)?;
+        self.free_frames = self.free_frames.saturating_add(pages);
         Ok(())
     }
 
     pub fn reserve_frame(&mut self, phys: u64) -> Result<(), FrameAllocError> {
         let idx = self.frame_index(phys)?;
-        if !self.is_used(idx) {
-            self.set_used(idx, true);
-            self.used_frames = self.used_frames.saturating_add(1);
+        if idx >= self.total_frames {
+            return Err(FrameAllocError::OutOfRange);
         }
+        let mut found = None;
+        for (slot_idx, slot) in self.extents.iter_mut().enumerate() {
+            let Some(extent) = slot else {
+                continue;
+            };
+            let extent_end = extent
+                .start_phys
+                .saturating_add((extent.pages as u64).saturating_mul(PAGE_SIZE_U64));
+            if phys >= extent.start_phys && phys < extent_end {
+                found = Some(slot_idx);
+                break;
+            }
+        }
+        let Some(slot_idx) = found else {
+            return Ok(());
+        };
+        let mut extent = self.extents[slot_idx].expect("extent");
+        if extent.pages == 0 {
+            return Ok(());
+        }
+        let extent_end = extent
+            .start_phys
+            .saturating_add((extent.pages as u64).saturating_mul(PAGE_SIZE_U64));
+        if phys == extent.start_phys {
+            extent.start_phys = extent.start_phys.saturating_add(PAGE_SIZE_U64);
+            extent.pages -= 1;
+        } else if phys + PAGE_SIZE_U64 == extent_end {
+            extent.pages -= 1;
+        } else {
+            let left_pages = ((phys - extent.start_phys) / PAGE_SIZE_U64) as usize;
+            let right_start = phys.saturating_add(PAGE_SIZE_U64);
+            let right_pages = ((extent_end - right_start) / PAGE_SIZE_U64) as usize;
+            extent.pages = left_pages;
+            self.extents[slot_idx] = Some(extent);
+            self.insert_extent(right_start, right_pages)?;
+            self.free_frames = self.free_frames.saturating_sub(1);
+            return Ok(());
+        }
+        if extent.pages == 0 {
+            self.extents[slot_idx] = None;
+        } else {
+            self.extents[slot_idx] = Some(extent);
+        }
+        self.free_frames = self.free_frames.saturating_sub(1);
         Ok(())
     }
 
@@ -211,7 +233,7 @@ impl PhysicalFrameAllocator {
     }
 
     pub fn free_frames(&self) -> usize {
-        self.total_frames.saturating_sub(self.used_frames)
+        self.free_frames
     }
 
     fn frame_index(&self, phys: u64) -> Result<usize, FrameAllocError> {
@@ -221,41 +243,75 @@ impl PhysicalFrameAllocator {
         if !phys.is_multiple_of(PAGE_SIZE_U64) {
             return Err(FrameAllocError::Misaligned);
         }
-        if phys < self.base_phys {
+        if phys < self.base_phys || phys >= self.end_phys_exclusive {
             return Err(FrameAllocError::OutOfRange);
         }
-        let idx = ((phys - self.base_phys) / PAGE_SIZE_U64) as usize;
-        if idx >= self.total_frames {
-            return Err(FrameAllocError::OutOfRange);
+        Ok(((phys - self.base_phys) / PAGE_SIZE_U64) as usize)
+    }
+
+    fn insert_extent(&mut self, start_phys: u64, pages: usize) -> Result<(), FrameAllocError> {
+        if pages == 0 {
+            return Ok(());
         }
-        Ok(idx)
-    }
+        let mut start = start_phys;
+        let mut end = start_phys.saturating_add((pages as u64).saturating_mul(PAGE_SIZE_U64));
+        let mut slot = None;
 
-    fn is_used(&self, idx: usize) -> bool {
-        let word = idx / 64;
-        let bit = idx % 64;
-        ((self.bitmap[word] >> bit) & 1) != 0
-    }
-
-    fn set_used(&mut self, idx: usize, used: bool) {
-        let word = idx / 64;
-        let bit = idx % 64;
-        let mask = 1u64 << bit;
-        if used {
-            self.bitmap[word] |= mask;
-        } else {
-            self.bitmap[word] &= !mask;
-        }
-    }
-
-    fn count_used(&self) -> usize {
-        let mut count = 0usize;
-        for idx in 0..self.total_frames {
-            if self.is_used(idx) {
-                count += 1;
+        for idx in 0..self.extents.len() {
+            if let Some(extent) = self.extents[idx] {
+                let extent_end = extent
+                    .start_phys
+                    .saturating_add((extent.pages as u64).saturating_mul(PAGE_SIZE_U64));
+                if end < extent.start_phys || start > extent_end {
+                    continue;
+                }
+                if end == extent.start_phys || start == extent_end || (start < extent_end && end > extent.start_phys) {
+                    start = start.min(extent.start_phys);
+                    end = end.max(extent_end);
+                    self.extents[idx] = None;
+                    continue;
+                }
+            }
+            if slot.is_none() && self.extents[idx].is_none() {
+                slot = Some(idx);
             }
         }
-        count
+        let slot = slot.or_else(|| self.extents.iter().position(|entry| entry.is_none()));
+        let Some(slot_idx) = slot else {
+            return Err(FrameAllocError::CapacityExceeded);
+        };
+        self.extents[slot_idx] = Some(FreeExtent {
+            start_phys: start,
+            pages: ((end - start) / PAGE_SIZE_U64) as usize,
+        });
+        self.sort_extents();
+        Ok(())
+    }
+
+    fn sort_extents(&mut self) {
+        let mut write = 0usize;
+        for idx in 0..self.extents.len() {
+            if let Some(extent) = self.extents[idx] {
+                self.extents[write] = Some(extent);
+                if write != idx {
+                    self.extents[idx] = None;
+                }
+                write += 1;
+            }
+        }
+        for idx in write..self.extents.len() {
+            self.extents[idx] = None;
+        }
+        for i in 0..write {
+            for j in (i + 1)..write {
+                let left = self.extents[i].expect("left");
+                let right = self.extents[j].expect("right");
+                if right.start_phys < left.start_phys {
+                    self.extents[i] = Some(right);
+                    self.extents[j] = Some(left);
+                }
+            }
+        }
     }
 }
 

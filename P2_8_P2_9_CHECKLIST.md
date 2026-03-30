@@ -15,7 +15,7 @@ Ordered by **risk first**, then **effort**.
 
 ## 2) [High risk, higher effort] Physical frame allocator scaling strategy
 
-- [ ] Replace single fixed bitmap capacity (`MAX_TRACKED_FRAMES`) with scalable storage.
+- [x] Replace single fixed bitmap capacity (`MAX_TRACKED_FRAMES`) with scalable storage.
 - [ ] Add fast-path data structure for contiguous allocations (run list / buddy metadata).
 - [ ] Preserve O(1)-ish single-page allocation hinting under fragmentation pressure.
 - [ ] Add long-run fragmentation/throughput tests.
