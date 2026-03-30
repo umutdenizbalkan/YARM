@@ -120,6 +120,8 @@ fn main() {
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_main() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    yarm::arch::x86_64::console::write_line("KM0");
     yarm::arch::boot_entry::run_kernel_boot(run);
     unreachable!("kernel run loop should not return");
 }

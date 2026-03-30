@@ -97,22 +97,32 @@ fn take_irq_firmware_blob_from_provider<'a>(
 /// Selected-ISA boot entry facade used by top-level binaries.
 #[inline]
 pub fn run_kernel_boot_with_irq_description(run: fn(), irq_description: Option<&[u8]>) {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("BE0");
     let configured_from_description = irq_description.is_some_and(|description| {
         super::irq_guard::configure_external_irq_controller_from_description(description)
     });
     if !configured_from_description {
         super::irq_guard::configure_external_irq_controller_from_platform_layout();
     }
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("BE1");
     run();
 }
 
 #[inline]
 pub fn run_kernel_boot(run: fn()) {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("BK0");
     let mut staged = [0u8; MAX_IRQ_DESCRIPTION_BYTES];
     if let Some(description) = take_staged_irq_description(&mut staged) {
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+        crate::arch::x86_64::console::write_line("BK1");
         return run_kernel_boot_with_irq_description(run, Some(description));
     }
     if let Some(blob) = take_irq_firmware_blob_from_provider(&mut staged) {
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+        crate::arch::x86_64::console::write_line("BK2");
         return run_kernel_boot_with_firmware_blob(run, Some(blob));
     }
 
@@ -128,6 +138,9 @@ pub fn run_kernel_boot(run: fn()) {
         return run_kernel_boot_with_firmware_blob(run, Some(firmware_blob.as_bytes()));
     }
 
+    #[cfg(not(feature = "hosted-dev"))]
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::console::write_line("BK9");
     #[cfg(not(feature = "hosted-dev"))]
     run_kernel_boot_with_irq_description(run, None);
 }
