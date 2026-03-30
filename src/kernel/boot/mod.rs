@@ -3051,10 +3051,8 @@ mod tests {
                 .expect("init"),
         );
         let limits = driver_state.runtime_capacity_config();
-        let registerable_drivers = core::cmp::min(
-            limits.max_drivers,
-            limits.max_tasks.saturating_sub(1),
-        );
+        let registerable_drivers =
+            core::cmp::min(limits.max_drivers, limits.max_tasks.saturating_sub(1));
         for offset in 0..registerable_drivers {
             let tid = (offset + 2) as u64;
             driver_state.register_task(tid).expect("task");

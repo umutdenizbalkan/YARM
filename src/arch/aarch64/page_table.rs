@@ -349,6 +349,42 @@ pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     entry.is_present().then_some(entry)
 }
 
-pub fn invalidate_page(_virt: VirtAddr) {}
+pub fn invalidate_page(virt: VirtAddr) {
+    #[cfg(feature = "hosted-dev")]
+    {
+        let _ = virt;
+    }
 
-pub fn invalidate_asid(_asid: Asid) {}
+    #[cfg(not(feature = "hosted-dev"))]
+    unsafe {
+        let operand = virt.0 >> 12;
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vaae1is, {operand}",
+            "dsb ish",
+            "isb",
+            operand = in(reg) operand,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+pub fn invalidate_asid(asid: Asid) {
+    #[cfg(feature = "hosted-dev")]
+    {
+        let _ = asid;
+    }
+
+    #[cfg(not(feature = "hosted-dev"))]
+    unsafe {
+        let operand = (asid.0 as u64) << 48;
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi aside1is, {operand}",
+            "dsb ish",
+            "isb",
+            operand = in(reg) operand,
+            options(nostack, preserves_flags)
+        );
+    }
+}

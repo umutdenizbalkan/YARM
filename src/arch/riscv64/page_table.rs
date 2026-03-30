@@ -348,6 +348,34 @@ pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     entry.is_present().then_some(entry)
 }
 
-pub fn invalidate_page(_virt: VirtAddr) {}
+pub fn invalidate_page(virt: VirtAddr) {
+    #[cfg(feature = "hosted-dev")]
+    {
+        let _ = virt;
+    }
 
-pub fn invalidate_asid(_asid: Asid) {}
+    #[cfg(not(feature = "hosted-dev"))]
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma {vaddr}, x0",
+            vaddr = in(reg) virt.0 as usize,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+pub fn invalidate_asid(asid: Asid) {
+    #[cfg(feature = "hosted-dev")]
+    {
+        let _ = asid;
+    }
+
+    #[cfg(not(feature = "hosted-dev"))]
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma x0, {asid}",
+            asid = in(reg) asid.0 as usize,
+            options(nostack, preserves_flags)
+        );
+    }
+}
