@@ -75,7 +75,13 @@ impl KernelState {
             .user_spaces
             .get_mut(asid)
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        aspace.map_page(virt, mapping).map_err(KernelError::Vm)
+        let old = aspace.map_page(virt, mapping).map_err(KernelError::Vm)?;
+        if let Some(old_mapping) = old {
+            self.note_mapping_removed(old_mapping.phys);
+            self.reclaim_memory_object_for_phys(old_mapping.phys);
+        }
+        self.note_mapping_inserted(mapping.phys);
+        Ok(old)
     }
 
     pub fn create_memory_object(&mut self, phys: PhysAddr) -> Result<(u64, CapId), KernelError> {
@@ -92,7 +98,13 @@ impl KernelState {
             .iter_mut()
             .find(|entry| entry.is_none())
             .ok_or(KernelError::MemoryObjectFull)?;
-        *slot = Some(MemoryObject { id, phys, len });
+        *slot = Some(MemoryObject {
+            id,
+            phys,
+            len,
+            cap_refcount: 0,
+            map_refcount: 0,
+        });
 
         let cap = self.mint_capability_for_current_context(Capability::new(
             CapObject::MemoryObject { id },
@@ -201,9 +213,15 @@ impl KernelState {
             .user_spaces
             .get_mut(asid)
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        aspace
+        let old = aspace
             .map_page(virt, Mapping { phys, flags })
-            .map_err(KernelError::Vm)
+            .map_err(KernelError::Vm)?;
+        if let Some(old_mapping) = old {
+            self.note_mapping_removed(old_mapping.phys);
+            self.reclaim_memory_object_for_phys(old_mapping.phys);
+        }
+        self.note_mapping_inserted(phys);
+        Ok(old)
     }
 
     pub fn unmap_user_page(
@@ -228,6 +246,7 @@ impl KernelState {
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
         let unmapped = aspace.unmap_page(virt);
         if let Some(mapping) = unmapped {
+            self.note_mapping_removed(mapping.phys);
             self.reclaim_memory_object_for_phys(mapping.phys);
         }
         Ok(unmapped)
@@ -245,6 +264,7 @@ impl KernelState {
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
         let unmapped = aspace.unmap_page(virt);
         if let Some(mapping) = unmapped {
+            self.note_mapping_removed(mapping.phys);
             self.reclaim_memory_object_for_phys(mapping.phys);
         }
         Ok(unmapped)
@@ -274,7 +294,7 @@ impl KernelState {
         let current = aspace
             .resolve(virt)
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        aspace
+        let old = aspace
             .map_page(
                 virt,
                 Mapping {
@@ -282,7 +302,13 @@ impl KernelState {
                     flags: new_flags,
                 },
             )
-            .map_err(KernelError::Vm)
+            .map_err(KernelError::Vm)?;
+        if let Some(old_mapping) = old {
+            self.note_mapping_removed(old_mapping.phys);
+            self.reclaim_memory_object_for_phys(old_mapping.phys);
+        }
+        self.note_mapping_inserted(current.phys);
+        Ok(old)
     }
 
     #[cfg(feature = "linux-compat")]
@@ -299,7 +325,7 @@ impl KernelState {
         let current = aspace
             .resolve(virt)
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        aspace
+        let old = aspace
             .map_page(
                 virt,
                 Mapping {
@@ -307,6 +333,12 @@ impl KernelState {
                     flags: new_flags,
                 },
             )
-            .map_err(KernelError::Vm)
+            .map_err(KernelError::Vm)?;
+        if let Some(old_mapping) = old {
+            self.note_mapping_removed(old_mapping.phys);
+            self.reclaim_memory_object_for_phys(old_mapping.phys);
+        }
+        self.note_mapping_inserted(current.phys);
+        Ok(old)
     }
 }

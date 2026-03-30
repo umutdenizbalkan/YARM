@@ -88,7 +88,7 @@ const MAX_TASKS: usize = 64;
 const MAX_TASKS: usize = 128;
 
 #[cfg(feature = "hosted-dev")]
-const MAX_MEMORY_OBJECTS: usize = 1024;
+const MAX_MEMORY_OBJECTS: usize = 512;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_MEMORY_OBJECTS: usize = 256;
 const MAX_BOOT_MEMORY_REGIONS: usize = 64;
@@ -270,6 +270,8 @@ struct MemoryObject {
     id: u64,
     phys: PhysAddr,
     len: usize,
+    cap_refcount: u32,
+    map_refcount: u32,
 }
 
 #[derive(Debug)]
@@ -1051,10 +1053,13 @@ impl KernelState {
         capability: Capability,
     ) -> Result<CapId, KernelError> {
         self.ensure_cnode_space(cnode)?;
-        self.cspace_for_cnode_mut(cnode)
+        let minted = self
+            .cspace_for_cnode_mut(cnode)
             .ok_or(KernelError::TaskMissing)?
             .mint(capability)
-            .map_err(|_| KernelError::CapabilityFull)
+            .map_err(|_| KernelError::CapabilityFull)?;
+        self.adjust_memory_object_cap_refcount(capability.object, 1);
+        Ok(minted)
     }
 
     pub(crate) fn revoke_capability_in_cnode(
@@ -1080,6 +1085,7 @@ impl KernelState {
         }
         self.remove_delegation_links_for(root, descendants);
         if let Some(capability) = source_capability {
+            self.adjust_memory_object_cap_refcount(capability.object, -1);
             self.reclaim_memory_object_if_unreferenced(capability.object);
         }
         Ok(())
@@ -1131,16 +1137,59 @@ impl KernelState {
             let _ = cspace.revoke(cap);
         }
         if let Some(capability) = revoked_capability {
+            self.adjust_memory_object_cap_refcount(capability.object, -1);
             self.reclaim_memory_object_if_unreferenced(capability.object);
         }
     }
 
-    fn memory_object_cap_refcount(&self, id: u64) -> usize {
-        self.cnode_spaces
+    fn memory_object_slot_by_id(&self, id: u64) -> Option<usize> {
+        self.memory
+            .memory_objects
             .iter()
-            .flatten()
-            .map(|space| kernel_ref(&space.cspace).memory_object_id_refcount(id))
-            .sum()
+            .position(|entry| entry.is_some_and(|mem| mem.id == id))
+    }
+
+    fn adjust_memory_object_cap_refcount(&mut self, object: CapObject, delta: i32) {
+        let id = match object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
+            _ => return,
+        };
+        let Some(slot) = self.memory_object_slot_by_id(id) else {
+            return;
+        };
+        if let Some(memory_object) = self.memory.memory_objects[slot].as_mut() {
+            if delta > 0 {
+                memory_object.cap_refcount = memory_object.cap_refcount.saturating_add(delta as u32);
+            } else {
+                memory_object.cap_refcount = memory_object
+                    .cap_refcount
+                    .saturating_sub((-delta) as u32);
+            }
+        }
+    }
+
+    pub(crate) fn note_mapping_inserted(&mut self, phys: PhysAddr) {
+        if let Some(slot) = self
+            .memory
+            .memory_objects
+            .iter()
+            .position(|entry| entry.is_some_and(|mem| mem.phys == phys))
+            && let Some(memory_object) = self.memory.memory_objects[slot].as_mut()
+        {
+            memory_object.map_refcount = memory_object.map_refcount.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_mapping_removed(&mut self, phys: PhysAddr) {
+        if let Some(slot) = self
+            .memory
+            .memory_objects
+            .iter()
+            .position(|entry| entry.is_some_and(|mem| mem.phys == phys))
+            && let Some(memory_object) = self.memory.memory_objects[slot].as_mut()
+        {
+            memory_object.map_refcount = memory_object.map_refcount.saturating_sub(1);
+        }
     }
 
     fn reclaim_memory_object_if_unreferenced(&mut self, object: CapObject) {
@@ -1149,25 +1198,14 @@ impl KernelState {
             _ => return,
         };
 
-        let slot_index = self
-            .memory
-            .memory_objects
-            .iter()
-            .position(|entry| entry.is_some_and(|mem| mem.id == id));
-        let Some(slot_index) = slot_index else {
+        let Some(slot_index) = self.memory_object_slot_by_id(id) else {
             return;
         };
         let Some(memory_object) = self.memory.memory_objects[slot_index] else {
             return;
         };
 
-        if self.memory_object_cap_refcount(id) != 0 {
-            return;
-        }
-
-        if self.kernel_aspace.has_mapping_for_phys(memory_object.phys)
-            || self.user_spaces.any_mapping_for_phys(memory_object.phys)
-        {
+        if memory_object.cap_refcount != 0 || memory_object.map_refcount != 0 {
             return;
         }
 
