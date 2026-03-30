@@ -470,6 +470,7 @@ const fn align_up(value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::std::vec::Vec;
 
     #[test]
     fn allocates_and_frees_from_usable_region() {
@@ -580,5 +581,85 @@ mod tests {
             assert!(alloc.free_frames() > 0);
             let _ = keep;
         }
+    }
+
+    #[test]
+    fn long_run_fragmentation_stress_keeps_allocator_usable() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc
+            .init_from_memory_map(&[MemoryRegion {
+                start: 0x5000_0000,
+                len: 0x200_000,
+                usable: true,
+            }])
+            .expect("init");
+
+        let initial_free = alloc.free_frames();
+        let mut held: Vec<u64> = Vec::new();
+
+        for cycle in 0..64usize {
+            while held.len() < 256 {
+                held.push(alloc.alloc_frame().expect("alloc"));
+            }
+
+            for idx in (cycle % 2..held.len()).step_by(2) {
+                let phys = held[idx];
+                alloc.free_frame(phys).expect("free");
+            }
+            held = held
+                .into_iter()
+                .enumerate()
+                .filter_map(|(idx, phys)| {
+                    if idx % 2 == cycle % 2 {
+                        None
+                    } else {
+                        Some(phys)
+                    }
+                })
+                .collect();
+
+            let run = alloc.alloc_contiguous(8).expect("contig after fragmentation");
+            alloc.free_contiguous(run, 8).expect("free contig");
+        }
+
+        for phys in held {
+            alloc.free_frame(phys).expect("final free");
+        }
+        assert_eq!(alloc.free_frames(), initial_free);
+    }
+
+    #[test]
+    fn throughput_smoke_many_alloc_free_operations() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc
+            .init_from_memory_map(&[MemoryRegion {
+                start: 0x6000_0000,
+                len: 0x400_000,
+                usable: true,
+            }])
+            .expect("init");
+
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        let mut held: Vec<u64> = Vec::new();
+        let initial_free = alloc.free_frames();
+
+        for _ in 0..20_000usize {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let do_alloc = (seed & 1) == 0 || held.is_empty();
+            if do_alloc {
+                if let Ok(frame) = alloc.alloc_frame() {
+                    held.push(frame);
+                }
+            } else {
+                let idx = (seed as usize) % held.len();
+                let phys = held.swap_remove(idx);
+                alloc.free_frame(phys).expect("free");
+            }
+        }
+
+        while let Some(phys) = held.pop() {
+            alloc.free_frame(phys).expect("drain");
+        }
+        assert_eq!(alloc.free_frames(), initial_free);
     }
 }
