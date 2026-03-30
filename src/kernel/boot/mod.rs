@@ -747,6 +747,7 @@ impl KernelState {
     }
 
     pub fn capacity_telemetry(&self) -> CapacityTelemetry {
+        let limits = self.runtime_capacity_config();
         let cnode_capability_slots_used: usize = self
             .cnode_spaces
             .iter()
@@ -757,24 +758,24 @@ impl KernelState {
         CapacityTelemetry {
             endpoints: Self::capacity_pool(
                 self.ipc.endpoints.iter().flatten().count(),
-                MAX_ENDPOINTS,
+                limits.max_endpoints,
             ),
             notifications: Self::capacity_pool(
                 self.ipc.notifications.iter().flatten().count(),
-                MAX_NOTIFICATIONS,
+                limits.max_notifications,
             ),
-            tasks: Self::capacity_pool(self.tcbs.iter().flatten().count(), MAX_TASKS),
+            tasks: Self::capacity_pool(self.tcbs.iter().flatten().count(), limits.max_tasks),
             drivers: Self::capacity_pool(
                 self.drivers.driver_records.iter().flatten().count(),
-                MAX_DRIVERS,
+                limits.max_drivers,
             ),
             memory_objects: Self::capacity_pool(
                 self.memory.memory_objects.iter().flatten().count(),
-                MAX_MEMORY_OBJECTS,
+                limits.max_memory_objects,
             ),
             capability_slots: Self::capacity_pool(
                 capability_slots_used,
-                Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES,
+                limits.max_capability_slots,
             ),
         }
     }
@@ -1159,11 +1160,11 @@ impl KernelState {
         };
         if let Some(memory_object) = self.memory.memory_objects[slot].as_mut() {
             if delta > 0 {
-                memory_object.cap_refcount = memory_object.cap_refcount.saturating_add(delta as u32);
+                memory_object.cap_refcount =
+                    memory_object.cap_refcount.saturating_add(delta as u32);
             } else {
-                memory_object.cap_refcount = memory_object
-                    .cap_refcount
-                    .saturating_sub((-delta) as u32);
+                memory_object.cap_refcount =
+                    memory_object.cap_refcount.saturating_sub((-delta) as u32);
             }
         }
     }
@@ -3024,6 +3025,83 @@ mod tests {
             state.create_endpoint(1).expect("endpoint");
         }
         assert_eq!(state.create_endpoint(1), Err(KernelError::EndpointFull));
+    }
+
+    #[test]
+    fn runtime_capacity_profile_constrained_limits_task_creation() {
+        let mut task_state = crate::std::boxed::Box::new(
+            Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
+                .expect("init"),
+        );
+        let limits = task_state.runtime_capacity_config();
+
+        for tid in 2..=limits.max_tasks as u64 {
+            task_state.register_task(tid).expect("task");
+        }
+        assert_eq!(
+            task_state.register_task((limits.max_tasks + 1) as u64),
+            Err(KernelError::TaskTableFull)
+        );
+    }
+
+    #[test]
+    fn runtime_capacity_profile_constrained_limits_driver_registration() {
+        let mut driver_state = crate::std::boxed::Box::new(
+            Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
+                .expect("init"),
+        );
+        let limits = driver_state.runtime_capacity_config();
+        let registerable_drivers = core::cmp::min(
+            limits.max_drivers,
+            limits.max_tasks.saturating_sub(1),
+        );
+        for offset in 0..registerable_drivers {
+            let tid = (offset + 2) as u64;
+            driver_state.register_task(tid).expect("task");
+            driver_state.register_driver(tid).expect("driver");
+        }
+        if registerable_drivers == limits.max_drivers && limits.max_drivers < limits.max_tasks {
+            let overflow_tid = (limits.max_drivers + 2) as u64;
+            driver_state.register_task(overflow_tid).expect("task");
+            assert_eq!(
+                driver_state.register_driver(overflow_tid),
+                Err(KernelError::TaskTableFull)
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_capacity_profile_constrained_limits_memory_objects() {
+        let mut memory_state = crate::std::boxed::Box::new(
+            Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
+                .expect("init"),
+        );
+        let limits = memory_state.runtime_capacity_config();
+
+        for _ in 0..limits.max_memory_objects {
+            memory_state
+                .create_memory_object(crate::kernel::vm::PhysAddr(0x1000_0000))
+                .expect("memory object");
+        }
+        assert_eq!(
+            memory_state.create_memory_object(crate::kernel::vm::PhysAddr(0x1000_0000)),
+            Err(KernelError::MemoryObjectFull)
+        );
+    }
+
+    #[test]
+    fn capacity_telemetry_reports_runtime_profile_capacities() {
+        let state = Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
+            .expect("init");
+        let limits = state.runtime_capacity_config();
+        let t = state.capacity_telemetry();
+
+        assert_eq!(t.endpoints.capacity, limits.max_endpoints);
+        assert_eq!(t.notifications.capacity, limits.max_notifications);
+        assert_eq!(t.tasks.capacity, limits.max_tasks);
+        assert_eq!(t.drivers.capacity, limits.max_drivers);
+        assert_eq!(t.memory_objects.capacity, limits.max_memory_objects);
+        assert_eq!(t.capability_slots.capacity, limits.max_capability_slots);
     }
 
     #[test]

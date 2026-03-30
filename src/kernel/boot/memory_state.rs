@@ -1,6 +1,6 @@
 use super::{KernelError, KernelState, MemoryObject, kernel_mut};
-use crate::kernel::frame_allocator::FrameAllocError;
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
+use crate::kernel::frame_allocator::FrameAllocError;
 use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError};
 
 impl KernelState {
@@ -98,6 +98,11 @@ impl KernelState {
     ) -> Result<(u64, CapId), KernelError> {
         if len == 0 || !len.is_multiple_of(crate::kernel::vm::PAGE_SIZE) {
             return Err(KernelError::Vm(VmError::Misaligned));
+        }
+        if self.memory.memory_objects.iter().flatten().count()
+            >= self.runtime_capacity_config().max_memory_objects
+        {
+            return Err(KernelError::MemoryObjectFull);
         }
         let id = self.memory.next_memory_object_id;
         self.memory.next_memory_object_id = self.memory.next_memory_object_id.wrapping_add(1);

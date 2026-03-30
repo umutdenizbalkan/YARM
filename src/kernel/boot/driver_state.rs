@@ -18,6 +18,11 @@ impl KernelState {
         {
             return Ok(());
         }
+        if self.drivers.driver_records.iter().flatten().count()
+            >= self.runtime_capacity_config().max_drivers
+        {
+            return Err(KernelError::TaskTableFull);
+        }
 
         if let Some(slot) = self
             .drivers

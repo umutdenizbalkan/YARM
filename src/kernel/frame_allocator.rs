@@ -1,5 +1,5 @@
-use crate::kernel::vm::PAGE_SIZE;
 use crate::kernel::lock::SpinLock;
+use crate::kernel::vm::PAGE_SIZE;
 
 const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
 const MAX_TRACKED_FRAMES: usize = 131_072;
@@ -171,7 +171,11 @@ impl PhysicalFrameAllocator {
         Ok(())
     }
 
-    pub fn free_contiguous(&mut self, start_phys: u64, pages: usize) -> Result<(), FrameAllocError> {
+    pub fn free_contiguous(
+        &mut self,
+        start_phys: u64,
+        pages: usize,
+    ) -> Result<(), FrameAllocError> {
         if pages == 0 {
             return Ok(());
         }

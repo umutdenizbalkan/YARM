@@ -1,4 +1,4 @@
-use super::{KernelError, KernelState, MAX_TASKS};
+use super::{KernelError, KernelState};
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{TaskClass, ThreadControlBlock};
 
@@ -10,6 +10,10 @@ impl KernelState {
     ) -> Result<(), KernelError> {
         if self.task_status(tid).is_some() {
             return Ok(());
+        }
+        let limits = self.runtime_capacity_config();
+        if self.tcbs.iter().flatten().count() >= limits.max_tasks {
+            return Err(KernelError::TaskTableFull);
         }
         if let Some(idx) = self.tcbs.iter().position(|slot| slot.is_none()) {
             let tcb = ThreadControlBlock::new(ThreadId(tid), class, None);
@@ -26,8 +30,9 @@ impl KernelState {
     }
 
     pub fn allocate_thread_id(&mut self) -> Result<u64, KernelError> {
+        let limits = self.runtime_capacity_config();
         let mut candidate = self.next_dynamic_tid;
-        for _ in 0..MAX_TASKS.saturating_mul(4) {
+        for _ in 0..limits.max_tasks.saturating_mul(4) {
             self.next_dynamic_tid = self.next_dynamic_tid.saturating_add(1);
             if self.task_status(candidate).is_none() {
                 return Ok(candidate);

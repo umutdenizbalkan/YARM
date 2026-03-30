@@ -287,7 +287,8 @@ pub fn map_page(
         .ok_or(PageTableError::InvalidAddress)?;
     let table = state.pages[leaf_idx].as_mut().expect("leaf");
     let prev = table.entries[l3];
-    table.entries[l3] = PageTableEntry::with_addr_and_flags(phys.0, leaf_flags_from_page_flags(flags));
+    table.entries[l3] =
+        PageTableEntry::with_addr_and_flags(phys.0, leaf_flags_from_page_flags(flags));
     drop(state);
     invalidate_page(virt);
     Ok(prev.is_present().then_some(prev))
@@ -296,7 +297,12 @@ pub fn map_page(
 pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     let mut state = PAGE_TABLE_STATE.lock();
     let mut table_phys = state.root_for_asid(asid)?;
-    let levels = [level_index(virt.0, 39), level_index(virt.0, 30), level_index(virt.0, 21), level_index(virt.0, 12)];
+    let levels = [
+        level_index(virt.0, 39),
+        level_index(virt.0, 30),
+        level_index(virt.0, 21),
+        level_index(virt.0, 12),
+    ];
 
     for &level in &levels[..3] {
         let idx = state.page_index_from_phys(table_phys)?;
@@ -322,7 +328,12 @@ pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
 pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     let state = PAGE_TABLE_STATE.lock();
     let mut table_phys = state.root_for_asid(asid)?;
-    let levels = [level_index(virt.0, 39), level_index(virt.0, 30), level_index(virt.0, 21), level_index(virt.0, 12)];
+    let levels = [
+        level_index(virt.0, 39),
+        level_index(virt.0, 30),
+        level_index(virt.0, 21),
+        level_index(virt.0, 12),
+    ];
 
     for &level in &levels[..3] {
         let idx = state.page_index_from_phys(table_phys)?;
