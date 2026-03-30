@@ -202,6 +202,44 @@ static TRAP_KERNEL_STATE_PTR: AtomicUsize = AtomicUsize::new(0);
 const UNMAPPED_CPU: usize = usize::MAX;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static APIC_TO_CPU_ID: [AtomicUsize; 256] = [const { AtomicUsize::new(UNMAPPED_CPU) }; 256];
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const DEBUG_UART_DATA_PORT: u16 = 0x3F8;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const DEBUG_UART_LINE_STATUS_PORT: u16 = 0x3FD;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn debug_uart_putc(byte: u8) {
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "in al, dx",
+            "test al, 0x20",
+            "jz 2b",
+            in("dx") DEBUG_UART_LINE_STATUS_PORT,
+            lateout("al") _,
+            options(nomem, nostack)
+        );
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") DEBUG_UART_DATA_PORT,
+            in("al") byte,
+            options(nomem, nostack)
+        );
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn debug_uart_hex_u64(value: u64) {
+    for shift in (0..=60).rev().step_by(4) {
+        let nibble = ((value >> shift) & 0xF) as u8;
+        let ch = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
+        debug_uart_putc(ch);
+    }
+}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn encode_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
@@ -307,6 +345,9 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     let state_ptr = TRAP_KERNEL_STATE_PTR.load(Ordering::Acquire);
     if state_ptr == 0 {
         if vector as usize == VEC_DOUBLE_FAULT {
+            debug_uart_putc(b'!');
+            debug_uart_putc(b'D');
+            debug_uart_putc(b'F');
             halt_forever();
         }
         return;
@@ -325,6 +366,14 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             error_code,
             err
         );
+        debug_uart_putc(b'!');
+        debug_uart_putc(b'T');
+        debug_uart_putc(b'R');
+        debug_uart_putc(b'P');
+        debug_uart_putc(b'v');
+        debug_uart_hex_u64(vector);
+        debug_uart_putc(b'e');
+        debug_uart_hex_u64(error_code);
         halt_forever();
     }
 }

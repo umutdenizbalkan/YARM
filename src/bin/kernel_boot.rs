@@ -9,6 +9,27 @@ use yarm::kernel::vfs::{OpenAtRequest, ReadWriteRequest, openat_message, read_me
 use yarm::services::common::vfs_service::{VfsReply, VfsService};
 use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn debug_uart_marker(byte: u8) {
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "in al, dx",
+            "test al, 0x20",
+            "jz 2b",
+            in("dx") 0x3FDu16,
+            lateout("al") _,
+            options(nomem, nostack)
+        );
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x3F8u16,
+            in("al") byte,
+            options(nomem, nostack)
+        );
+    }
+}
+
 #[inline]
 fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -17,8 +38,10 @@ fn run() {
     let kernel = Bootstrap::init().expect("kernel init");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     {
+        debug_uart_marker(b'I');
         yarm::arch::x86_64::descriptor_tables::register_trap_kernel_state(&mut kernel);
         yarm::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
+        debug_uart_marker(b'J');
     }
     yarm::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
@@ -26,6 +49,8 @@ fn run() {
         kernel.present_cpu_bitmap(),
         kernel.online_cpu_count()
     );
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    debug_uart_marker(b'K');
 
     let mut proc = ProcessService::new();
     let spawn = Message::with_header(
