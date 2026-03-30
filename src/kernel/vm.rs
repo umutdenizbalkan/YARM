@@ -53,13 +53,20 @@ pub enum AddressSpaceKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    WriteBack,
+    WriteThrough,
+    Uncached,
+    Device,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageFlags {
-    // TODO: Add CachePolicy (WriteBack/WriteThrough/Uncached/Device) before
-    // the DMA-capable driver subsystem is finalized for embedded targets.
     pub read: bool,
     pub write: bool,
     pub execute: bool,
     pub user: bool,
+    pub cache_policy: CachePolicy,
 }
 
 impl PageFlags {
@@ -68,6 +75,7 @@ impl PageFlags {
         write: true,
         execute: false,
         user: false,
+        cache_policy: CachePolicy::WriteBack,
     };
 
     pub const USER_RX: Self = Self {
@@ -75,6 +83,7 @@ impl PageFlags {
         write: false,
         execute: true,
         user: true,
+        cache_policy: CachePolicy::WriteBack,
     };
 
     pub const USER_RW: Self = Self {
@@ -82,6 +91,15 @@ impl PageFlags {
         write: true,
         execute: false,
         user: true,
+        cache_policy: CachePolicy::WriteBack,
+    };
+
+    pub const DEVICE_RW: Self = Self {
+        read: true,
+        write: true,
+        execute: false,
+        user: false,
+        cache_policy: CachePolicy::Device,
     };
 
     pub const GUARD: Self = Self {
@@ -89,6 +107,7 @@ impl PageFlags {
         write: false,
         execute: false,
         user: false,
+        cache_policy: CachePolicy::WriteBack,
     };
 }
 
@@ -739,6 +758,7 @@ mod tests {
                 write: true,
                 execute: false,
                 user: true,
+                cache_policy: CachePolicy::WriteBack,
             },
         };
 

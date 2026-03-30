@@ -1,7 +1,7 @@
 use crate::arch::riscv64::vm_layout;
 use crate::kernel::frame_allocator::{alloc_pt_frame, free_pt_frame};
 use crate::kernel::lock::SpinLock;
-use crate::kernel::vm::{Asid, PageFlags, PhysAddr, VirtAddr};
+use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr};
 
 const ENTRIES_PER_TABLE: usize = 512;
 const PAGE_SHIFT: u64 = 12;
@@ -155,6 +155,7 @@ fn table_flags_from_page_flags(flags: PageFlags) -> u64 {
     if flags.user {
         bits |= PageTableEntry::USER;
     }
+    bits |= cache_policy_bits(flags.cache_policy);
     bits
 }
 
@@ -172,7 +173,18 @@ fn leaf_flags_from_page_flags(flags: PageFlags) -> u64 {
     if flags.user {
         bits |= PageTableEntry::USER;
     }
+    bits |= cache_policy_bits(flags.cache_policy);
     bits
+}
+
+fn cache_policy_bits(policy: CachePolicy) -> u64 {
+    match policy {
+        // Sv39 has no base per-PTE cache policy bits in the common profile.
+        CachePolicy::WriteBack
+        | CachePolicy::WriteThrough
+        | CachePolicy::Uncached
+        | CachePolicy::Device => 0,
+    }
 }
 
 fn walk_or_create(

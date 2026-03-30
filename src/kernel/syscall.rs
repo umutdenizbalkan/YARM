@@ -278,6 +278,7 @@ fn vm_map_page_flags(prot: usize) -> Result<PageFlags, SyscallError> {
         write: (prot & SYSCALL_VM_MAP_PROT_WRITE) != 0,
         execute: (prot & SYSCALL_VM_MAP_PROT_EXEC) != 0,
         user: true,
+        cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
     })
 }
 

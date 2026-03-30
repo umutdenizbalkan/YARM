@@ -29,6 +29,6 @@ Ordered by **risk first**, then **effort**.
 
 ## 4) [Medium risk, low effort] Mapping attribute completeness
 
-- [ ] Extend `PageFlags` with cache policy for DMA/device mappings.
-- [ ] Thread cache policy bits through each ISA page-table encoder.
-- [ ] Add tests for cache-policy encoding and validation.
+- [x] Extend `PageFlags` with cache policy for DMA/device mappings.
+- [x] Thread cache policy bits through each ISA page-table encoder.
+- [x] Add tests for cache-policy encoding and validation.

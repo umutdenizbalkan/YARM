@@ -1,7 +1,7 @@
 use crate::arch::x86_64::vm_layout;
 use crate::kernel::frame_allocator::{alloc_pt_frame, free_pt_frame};
 use crate::kernel::lock::SpinLock;
-use crate::kernel::vm::{Asid, PageFlags, PhysAddr, VirtAddr};
+use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr};
 
 const ENTRIES_PER_TABLE: usize = 512;
 const PAGE_SIZE_U64: u64 = vm_layout::PAGE_SIZE as u64;
@@ -209,6 +209,7 @@ fn table_flags_from_page_flags(flags: PageFlags) -> u64 {
     if flags.user {
         bits |= PageTableEntry::USER;
     }
+    bits |= cache_policy_bits(flags.cache_policy);
     bits
 }
 
@@ -223,7 +224,16 @@ fn leaf_flags_from_page_flags(flags: PageFlags) -> u64 {
     if !flags.execute {
         bits |= PageTableEntry::NO_EXECUTE;
     }
+    bits |= cache_policy_bits(flags.cache_policy);
     bits
+}
+
+fn cache_policy_bits(policy: CachePolicy) -> u64 {
+    match policy {
+        CachePolicy::WriteBack => 0,
+        CachePolicy::WriteThrough => PageTableEntry::WRITE_THROUGH,
+        CachePolicy::Uncached | CachePolicy::Device => PageTableEntry::CACHE_DISABLE,
+    }
 }
 
 fn walk_or_create_table(
@@ -448,5 +458,40 @@ mod tests {
         let asid = Asid(0x1234);
         let cr3 = cr3_for_asid(asid).expect("cr3");
         assert_eq!(cr3 & 0x0fff, 0x234);
+    }
+
+    #[test]
+    fn cache_policy_maps_to_leaf_cache_bits() {
+        reset_state();
+        let asid = Asid(13);
+        ensure_asid_root(asid).expect("root");
+        let va_wt = VirtAddr(0x0000_7f00_2000_0000);
+        let va_uc = VirtAddr(0x0000_7f00_2000_1000);
+
+        map_page(
+            asid,
+            va_wt,
+            PhysAddr(0x3000_0000),
+            PageFlags {
+                cache_policy: CachePolicy::WriteThrough,
+                ..PageFlags::USER_RW
+            },
+        )
+        .expect("map wt");
+        map_page(
+            asid,
+            va_uc,
+            PhysAddr(0x3000_1000),
+            PageFlags {
+                cache_policy: CachePolicy::Uncached,
+                ..PageFlags::USER_RW
+            },
+        )
+        .expect("map uc");
+
+        let wt_entry = resolve_page(asid, va_wt).expect("wt");
+        let uc_entry = resolve_page(asid, va_uc).expect("uc");
+        assert!(wt_entry.0 & PageTableEntry::WRITE_THROUGH != 0);
+        assert!(uc_entry.0 & PageTableEntry::CACHE_DISABLE != 0);
     }
 }

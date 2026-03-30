@@ -351,6 +351,7 @@ fn prot_to_page_flags(prot: usize) -> Result<PageFlags, LinuxErrno> {
         write: (prot & PROT_WRITE) != 0,
         execute: (prot & PROT_EXEC) != 0,
         user: true,
+        cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
     })
 }
 

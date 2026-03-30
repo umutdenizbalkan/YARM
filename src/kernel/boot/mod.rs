@@ -2365,6 +2365,7 @@ mod tests {
                     write: true,
                     execute: true,
                     user: true,
+                    cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
                 },
             },
         );
@@ -2442,6 +2443,7 @@ mod tests {
                 write: true,
                 execute: false,
                 user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
             },
         );
         assert_eq!(mapped, Ok(None));
@@ -2484,6 +2486,7 @@ mod tests {
                 write: true,
                 execute: false,
                 user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
             },
         );
         assert_eq!(res, Err(KernelError::MissingRight));
@@ -2552,6 +2555,7 @@ mod tests {
                         write: true,
                         execute: true,
                         user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
                     },
                 },
             )
@@ -2638,6 +2642,7 @@ mod tests {
                         write: true,
                         execute: false,
                         user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
                     },
                 },
             )

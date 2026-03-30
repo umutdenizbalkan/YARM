@@ -1,7 +1,7 @@
 use crate::arch::aarch64::vm_layout;
 use crate::kernel::frame_allocator::{alloc_pt_frame, free_pt_frame};
 use crate::kernel::lock::SpinLock;
-use crate::kernel::vm::{Asid, PageFlags, PhysAddr, VirtAddr};
+use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr};
 
 const ENTRIES_PER_TABLE: usize = 512;
 const PAGE_SIZE_U64: u64 = vm_layout::PAGE_SIZE as u64;
@@ -152,6 +152,7 @@ fn table_flags_from_page_flags(flags: PageFlags) -> u64 {
     if flags.user {
         bits |= PageTableEntry::USER;
     }
+    bits |= cache_policy_bits(flags.cache_policy);
     bits
 }
 
@@ -169,7 +170,19 @@ fn leaf_flags_from_page_flags(flags: PageFlags) -> u64 {
     if flags.user {
         bits |= PageTableEntry::PRIV_NO_EXECUTE;
     }
+    bits |= cache_policy_bits(flags.cache_policy);
     bits
+}
+
+fn cache_policy_bits(policy: CachePolicy) -> u64 {
+    const ATTR_SHIFT: u64 = 2;
+    let attr_index = match policy {
+        CachePolicy::WriteBack => 0u64,
+        CachePolicy::WriteThrough => 1u64,
+        CachePolicy::Uncached => 2u64,
+        CachePolicy::Device => 3u64,
+    };
+    attr_index << ATTR_SHIFT
 }
 
 fn walk_or_create(
