@@ -68,11 +68,19 @@ pub fn run_kernel_boot_with_firmware_blob(run: fn(), firmware_blob: Option<&[u8]
 fn take_staged_irq_description<'a>(
     scratch: &'a mut [u8; MAX_IRQ_DESCRIPTION_BYTES],
 ) -> Option<&'a [u8]> {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("TS0");
     let len = IRQ_DESCRIPTION_LEN.swap(0, Ordering::AcqRel);
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("TS1");
     if len == 0 || len > MAX_IRQ_DESCRIPTION_BYTES {
         return None;
     }
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("TS2");
     let _guard = IrqDescriptionLockGuard::acquire();
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("TS3");
     unsafe {
         scratch[..len].copy_from_slice(&IRQ_DESCRIPTION_BUF[..len]);
     }
@@ -82,12 +90,20 @@ fn take_staged_irq_description<'a>(
 fn take_irq_firmware_blob_from_provider<'a>(
     scratch: &'a mut [u8; MAX_IRQ_DESCRIPTION_BYTES],
 ) -> Option<&'a [u8]> {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("TP0");
     let provider_ptr = FIRMWARE_BLOB_PROVIDER_PTR.load(Ordering::Acquire);
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("TP1");
     if provider_ptr == 0 {
         return None;
     }
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("TP2");
     let provider: fn(&mut [u8]) -> usize = unsafe { core::mem::transmute(provider_ptr) };
     let len = provider(scratch);
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    crate::arch::x86_64::console::write_line("TP3");
     if len == 0 || len > scratch.len() {
         return None;
     }
