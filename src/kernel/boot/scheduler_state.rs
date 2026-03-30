@@ -16,7 +16,10 @@ impl KernelState {
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
         self.scheduler
             .bring_up_cpu(cpu)
-            .map_err(map_scheduler_error)
+            .map_err(map_scheduler_error)?;
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+        crate::arch::x86_64::descriptor_tables::register_apic_cpu_mapping(cpu.0, cpu);
+        Ok(())
     }
 
     pub fn set_current_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
