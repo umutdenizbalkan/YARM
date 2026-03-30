@@ -359,6 +359,7 @@ struct AsEntry {
 pub struct RetiredAsid {
     pub asid: Asid,
     pub pending_cpu_bitmap: CpuBitmap,
+    pub age_ticks: u32,
 }
 
 /// Tracks live and retired software address spaces.
@@ -385,6 +386,8 @@ impl Default for AddressSpaceManager {
 }
 
 impl AddressSpaceManager {
+    const SHOOTDOWN_TIMEOUT_TICKS: u32 = 16;
+
     fn asid_in_use(&self, asid: Asid) -> bool {
         self.entries
             .iter()
@@ -469,6 +472,7 @@ impl AddressSpaceManager {
                         *retired = Some(RetiredAsid {
                             asid,
                             pending_cpu_bitmap,
+                            age_ticks: 0,
                         });
                         return Ok(());
                     }
@@ -509,6 +513,21 @@ impl AddressSpaceManager {
             .flatten()
             .copied()
             .find(|entry| entry.asid == asid)
+    }
+
+    pub fn tick_retired_shootdowns(&mut self) -> usize {
+        let mut timed_out = 0usize;
+        for slot in &mut self.retired {
+            let Some(retired) = slot.as_mut() else {
+                continue;
+            };
+            retired.age_ticks = retired.age_ticks.saturating_add(1);
+            if retired.age_ticks >= Self::SHOOTDOWN_TIMEOUT_TICKS {
+                *slot = None;
+                timed_out += 1;
+            }
+        }
+        timed_out
     }
 
     pub fn any_mapping_for_phys(&self, phys: PhysAddr) -> bool {
@@ -639,6 +658,23 @@ mod tests {
             Some(0b10)
         );
         assert_eq!(mgr.acknowledge_shootdown(asid, 0b10), Ok(true));
+        assert_eq!(mgr.retired_entry(asid), None);
+    }
+
+    #[test]
+    fn retired_asid_timeout_prevents_indefinite_stall() {
+        let mut mgr = AddressSpaceManager::default();
+        let asid = mgr.create_user_space().expect("create");
+
+        assert_eq!(mgr.destroy(asid, 0b11), Ok(()));
+        assert!(mgr.retired_entry(asid).is_some());
+
+        let mut timed_out = 0usize;
+        for _ in 0..AddressSpaceManager::SHOOTDOWN_TIMEOUT_TICKS {
+            timed_out += mgr.tick_retired_shootdowns();
+        }
+
+        assert_eq!(timed_out, 1);
         assert_eq!(mgr.retired_entry(asid), None);
     }
 

@@ -425,6 +425,7 @@ pub struct KernelState {
     drivers: DriverSubsystem,
     capacity_profile: KernelCapacityProfile,
     tlb_shootdown_count: u64,
+    tlb_shootdown_timeout_count: u64,
     faults: FaultSubsystem,
     restart: RestartSubsystem,
     delegated_capability_links:
@@ -668,6 +669,7 @@ impl Bootstrap {
             },
             capacity_profile,
             tlb_shootdown_count: 0,
+            tlb_shootdown_timeout_count: 0,
             faults: FaultSubsystem {
                 last_fault: None,
                 fault_handler_endpoint: None,
@@ -1721,6 +1723,41 @@ mod tests {
             state.drain_cross_cpu_work().expect("drain cpu1"),
             Some(WorkItem::WakeTask { tid: ThreadId(2) })
         );
+    }
+
+    #[test]
+    fn retired_asid_timeout_escalates_and_increments_telemetry() {
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .set_supervisor_endpoint(recv_cap)
+            .expect("supervisor endpoint");
+
+        let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+        state
+            .destroy_user_address_space(aspace_cap)
+            .expect("destroy aspace");
+        assert!(state.user_spaces.retired_entry(asid).is_some());
+
+        // Drop queued shootdown work without processing ACKs; timeout path should
+        // eventually release the retired ASID and escalate.
+        state.set_current_cpu(CpuId(0)).expect("cpu0");
+        let _ = state.drain_cross_cpu_work().expect("drain cpu0");
+        state.set_current_cpu(CpuId(1)).expect("cpu1");
+        let _ = state.drain_cross_cpu_work().expect("drain cpu1");
+
+        state.set_current_cpu(CpuId(0)).expect("cpu0");
+        for _ in 0..16 {
+            let _ = state
+                .process_cross_cpu_work_for_cpu(CpuId(0))
+                .expect("tick timeout");
+        }
+
+        assert_eq!(state.user_spaces.retired_entry(asid), None);
+        assert_eq!(state.tlb_shootdown_timeout_count(), 1);
+        let escalated = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(escalated.as_slice().len(), 16);
     }
 
     #[test]

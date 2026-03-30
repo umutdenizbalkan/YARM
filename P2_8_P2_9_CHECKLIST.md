@@ -23,7 +23,7 @@ Ordered by **risk first**, then **effort**.
 
 ## 3) [Medium risk, medium effort] Cross-CPU shootdown hardening
 
-- [ ] Ensure ASID retirement ack path cannot stall indefinitely (timeouts/telemetry/escalation).
+- [x] Ensure ASID retirement ack path cannot stall indefinitely (timeouts/telemetry/escalation).
 - [ ] Add stress tests for repeated destroy/recreate cycles with pending shootdowns.
 - [ ] Validate arch-specific invalidate sequencing against shootdown completion semantics.
 

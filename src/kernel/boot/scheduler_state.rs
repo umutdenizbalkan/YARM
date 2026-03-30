@@ -1,4 +1,5 @@
 use super::{KernelError, KernelState, map_scheduler_error};
+use crate::kernel::ipc::Message;
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::scheduler::{CpuId, TaskPriority};
 use crate::kernel::smp::{SmpError, WorkItem};
@@ -123,6 +124,29 @@ impl KernelState {
         self.tlb_shootdown_count
     }
 
+    pub fn tlb_shootdown_timeout_count(&self) -> u64 {
+        self.tlb_shootdown_timeout_count
+    }
+
+    fn escalate_tlb_shootdown_timeout(&mut self, timed_out: usize) -> Result<(), KernelError> {
+        let Some(endpoint_idx) = self.faults.supervisor_endpoint else {
+            return Ok(());
+        };
+        let mut payload = [0u8; 16];
+        payload[..8].copy_from_slice(&(timed_out as u64).to_le_bytes());
+        payload[8..16].copy_from_slice(&(self.current_cpu.0 as u64).to_le_bytes());
+        let msg = Message::new(0, &payload).map_err(|_| KernelError::WrongObject)?;
+        let endpoint = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?;
+        endpoint.send(msg).map_err(|_| KernelError::EndpointQueueFull)?;
+        let _ = self.wake_waiter_for_endpoint(endpoint_idx);
+        Ok(())
+    }
+
     fn apply_cross_cpu_work(&mut self, cpu: CpuId, item: WorkItem) -> Result<(), KernelError> {
         match item {
             WorkItem::Reschedule => {
@@ -160,6 +184,14 @@ impl KernelState {
         {
             self.apply_cross_cpu_work(cpu, item)?;
             processed += 1;
+        }
+
+        let timed_out = self.user_spaces.tick_retired_shootdowns();
+        if timed_out > 0 {
+            self.tlb_shootdown_timeout_count = self
+                .tlb_shootdown_timeout_count
+                .wrapping_add(timed_out as u64);
+            self.escalate_tlb_shootdown_timeout(timed_out)?;
         }
 
         Ok(processed)
