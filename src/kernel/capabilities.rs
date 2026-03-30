@@ -362,6 +362,29 @@ impl CapabilitySpace {
     pub fn contains(&self, id: CapId) -> bool {
         self.get(id).is_some()
     }
+
+    pub fn object_refcount(&self, object: CapObject) -> usize {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.entry)
+            .filter(|entry| entry.capability.object == object)
+            .count()
+    }
+
+    pub fn memory_object_id_refcount(&self, id: u64) -> usize {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.entry)
+            .filter(|entry| {
+                matches!(
+                    entry.capability.object,
+                    CapObject::MemoryObject { id: object_id }
+                        | CapObject::DmaRegion { id: object_id, .. }
+                        if object_id == id
+                )
+            })
+            .count()
+    }
 }
 
 #[cfg(test)]

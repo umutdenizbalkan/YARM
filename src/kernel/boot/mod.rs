@@ -937,6 +937,9 @@ impl KernelState {
         cnode: CNodeId,
         cap: CapId,
     ) -> Result<(), KernelError> {
+        let source_capability = self
+            .cspace_for_cnode(cnode)
+            .and_then(|cspace| cspace.get(cap));
         let source_tid = self.tid_for_cnode(cnode).ok_or(KernelError::TaskMissing)?;
         let root = DelegatedCapRef {
             tid: source_tid,
@@ -951,6 +954,9 @@ impl KernelState {
             self.revoke_capability_direct_in_task_cnode(delegated.tid, delegated.cap);
         }
         self.remove_delegation_links_for(root, descendants);
+        if let Some(capability) = source_capability {
+            self.reclaim_memory_object_if_unreferenced(capability.object);
+        }
         Ok(())
     }
 
@@ -992,10 +998,68 @@ impl KernelState {
     }
 
     fn revoke_capability_direct_in_task_cnode(&mut self, tid: u64, cap: CapId) {
+        let mut revoked_capability = None;
         if let Some(cnode) = self.task_cnode(tid)
             && let Some(cspace) = self.cspace_for_cnode_mut(cnode)
         {
+            revoked_capability = cspace.get(cap);
             let _ = cspace.revoke(cap);
+        }
+        if let Some(capability) = revoked_capability {
+            self.reclaim_memory_object_if_unreferenced(capability.object);
+        }
+    }
+
+    fn memory_object_cap_refcount(&self, id: u64) -> usize {
+        self.cnode_spaces
+            .iter()
+            .flatten()
+            .map(|space| kernel_ref(&space.cspace).memory_object_id_refcount(id))
+            .sum()
+    }
+
+    fn reclaim_memory_object_if_unreferenced(&mut self, object: CapObject) {
+        let id = match object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
+            _ => return,
+        };
+
+        let slot_index = self
+            .memory
+            .memory_objects
+            .iter()
+            .position(|entry| entry.is_some_and(|mem| mem.id == id));
+        let Some(slot_index) = slot_index else {
+            return;
+        };
+        let Some(memory_object) = self.memory.memory_objects[slot_index] else {
+            return;
+        };
+
+        if self.memory_object_cap_refcount(id) != 0 {
+            return;
+        }
+
+        if self.kernel_aspace.has_mapping_for_phys(memory_object.phys)
+            || self.user_spaces.any_mapping_for_phys(memory_object.phys)
+        {
+            return;
+        }
+
+        let _ = self.memory.frame_allocator.free_frame(memory_object.phys.0);
+        self.memory.memory_objects[slot_index] = None;
+    }
+
+    pub(crate) fn reclaim_memory_object_for_phys(&mut self, phys: PhysAddr) {
+        let maybe_object = self
+            .memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|entry| entry.phys == phys)
+            .copied();
+        if let Some(object) = maybe_object {
+            self.reclaim_memory_object_if_unreferenced(CapObject::MemoryObject { id: object.id });
         }
     }
 
@@ -2181,6 +2245,53 @@ mod tests {
             },
         );
         assert_eq!(res, Err(KernelError::MissingRight));
+    }
+
+    #[test]
+    fn revoked_unmapped_memory_object_reclaims_frame() {
+        let mut state = Bootstrap::init().expect("init");
+        let (id, mem_cap) = state.alloc_anonymous_memory_object().expect("anon");
+        let phys = state
+            .memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.phys)
+            .expect("phys");
+
+        let cnode = state.current_task_cnode().expect("cnode");
+        state
+            .revoke_capability_in_cnode(cnode, mem_cap)
+            .expect("revoke mem cap");
+
+        assert!(
+            state
+                .memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .all(|entry| entry.id != id)
+        );
+
+        let (_next_id, next_cap) = state.alloc_anonymous_memory_object().expect("next anon");
+        let next_phys = state
+            .capability_service()
+            .resolve_current_task_capability(next_cap)
+            .expect("next cap")
+            .object;
+        let next_phys = match next_phys {
+            CapObject::MemoryObject { id } => state
+                .memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.phys)
+                .expect("next phys"),
+            _ => panic!("unexpected cap object"),
+        };
+        assert_eq!(next_phys, phys);
     }
 
     #[test]

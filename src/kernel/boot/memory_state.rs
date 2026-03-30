@@ -227,7 +227,11 @@ impl KernelState {
             .user_spaces
             .get_mut(asid)
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        Ok(aspace.unmap_page(virt))
+        let unmapped = aspace.unmap_page(virt);
+        if let Some(mapping) = unmapped {
+            self.reclaim_memory_object_for_phys(mapping.phys);
+        }
+        Ok(unmapped)
     }
 
     #[cfg(feature = "linux-compat")]
@@ -240,7 +244,11 @@ impl KernelState {
             .user_spaces
             .get_mut(asid)
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        Ok(aspace.unmap_page(virt))
+        let unmapped = aspace.unmap_page(virt);
+        if let Some(mapping) = unmapped {
+            self.reclaim_memory_object_for_phys(mapping.phys);
+        }
+        Ok(unmapped)
     }
 
     pub fn protect_user_page(

@@ -172,9 +172,9 @@ struct Entry {
 
 /// Software shadow of the hardware page table.
 ///
-/// `map_page` and `unmap_page` update only this in-kernel record. Callers are
-/// responsible for propagating changes into the arch-level page tables and for
-/// issuing any required TLB invalidations after remaps and unmaps.
+/// `map_page` and `unmap_page` keep this in-kernel record in sync with the
+/// selected-ISA page-table backend. Architecture hooks perform page-table
+/// updates and TLB invalidations as part of mapping changes.
 #[derive(Debug)]
 pub struct AddressSpace {
     kind: AddressSpaceKind,
@@ -299,6 +299,13 @@ impl AddressSpace {
 
     pub fn mappings(&self) -> usize {
         self.len
+    }
+
+    pub fn has_mapping_for_phys(&self, phys: PhysAddr) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.mapping.phys == phys)
     }
 }
 
@@ -462,6 +469,13 @@ impl AddressSpaceManager {
             .flatten()
             .copied()
             .find(|entry| entry.asid == asid)
+    }
+
+    pub fn any_mapping_for_phys(&self, phys: PhysAddr) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.aspace.has_mapping_for_phys(phys))
     }
 }
 
