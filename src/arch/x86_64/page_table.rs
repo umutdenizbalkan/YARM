@@ -175,6 +175,8 @@ impl PageTableState {
 }
 
 static PAGE_TABLE_STATE: SpinLock<PageTableState> = SpinLock::new(PageTableState::new());
+#[cfg(test)]
+static LAST_INVALIDATED_ASID: SpinLock<Option<Asid>> = SpinLock::new(None);
 
 pub fn reset_state() {
     let mut state = PAGE_TABLE_STATE.lock();
@@ -382,6 +384,11 @@ struct InvpcidDescriptor {
 }
 
 pub fn invalidate_asid(asid: Asid) {
+    #[cfg(test)]
+    {
+        *LAST_INVALIDATED_ASID.lock() = Some(asid);
+    }
+
     #[cfg(feature = "hosted-dev")]
     {
         let _ = asid;
@@ -400,6 +407,11 @@ pub fn invalidate_asid(asid: Asid) {
             options(nostack, preserves_flags)
         );
     }
+}
+
+#[cfg(test)]
+pub fn take_last_invalidated_asid_for_test() -> Option<Asid> {
+    LAST_INVALIDATED_ASID.lock().take()
 }
 
 #[cfg(test)]

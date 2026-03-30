@@ -1678,6 +1678,10 @@ mod tests {
             .process_cross_cpu_work_for_cpu(CpuId(0))
             .expect("process cpu0");
         assert_eq!(
+            crate::arch::selected_isa::page_table::take_last_invalidated_asid_for_test(),
+            Some(asid)
+        );
+        assert_eq!(
             state
                 .user_spaces
                 .retired_entry(asid)
@@ -1689,6 +1693,10 @@ mod tests {
         state
             .process_cross_cpu_work_for_cpu(CpuId(1))
             .expect("process cpu1");
+        assert_eq!(
+            crate::arch::selected_isa::page_table::take_last_invalidated_asid_for_test(),
+            Some(asid)
+        );
         assert_eq!(state.user_spaces.retired_entry(asid), None);
     }
 

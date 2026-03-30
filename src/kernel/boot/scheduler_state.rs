@@ -158,6 +158,7 @@ impl KernelState {
             WorkItem::TlbShootdown { asid, .. } => {
                 self.tlb_shootdown_count = self.tlb_shootdown_count.wrapping_add(1);
                 if self.current_cpu == cpu && self.user_spaces.retired_entry(asid).is_some() {
+                    crate::arch::selected_isa::page_table::invalidate_asid(asid);
                     let cpu_bit = 1u64 << cpu.0;
                     self.user_spaces
                         .acknowledge_shootdown(asid, cpu_bit)
