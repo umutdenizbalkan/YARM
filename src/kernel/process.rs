@@ -257,6 +257,7 @@ impl ProcessManager {
         Ok((pid, info))
     }
 
+    #[cfg(test)]
     fn synthetic_elf_image(image_id: u64) -> [u8; 64] {
         let mut image = [0u8; 64];
         image[..4].copy_from_slice(b"\x7FELF");
@@ -385,11 +386,19 @@ impl ProcessManager {
                 Self::u64_reply(PROC_OP_EXIT, 0)
             }
             ProcessRequest::SpawnV2(req) => {
-                let image = Self::synthetic_elf_image(req.image_id);
-                let (pid, _) = self.spawn_from_elf_image(req.parent_pid, req.image_id, &image)?;
-                let result = SpawnV2Result { pid };
-                Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
-                    .map_err(|_| ProcessManagerError::Malformed)
+                #[cfg(test)]
+                {
+                    let image = Self::synthetic_elf_image(req.image_id);
+                    let (pid, _) = self.spawn_from_elf_image(req.parent_pid, req.image_id, &image)?;
+                    let result = SpawnV2Result { pid };
+                    return Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
+                        .map_err(|_| ProcessManagerError::Malformed);
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = req;
+                    Err(ProcessManagerError::Unsupported)
+                }
             }
             ProcessRequest::WaitPidV2(req) => {
                 if req.caller_pid != req.target_pid {
