@@ -88,8 +88,8 @@ impl KernelState {
             .stack_top
             .ok_or(KernelError::WrongObject)?
             .0 as usize;
-        tcb.kernel_context.frame.stack_ptr = stack_top & !0xF;
-        tcb.kernel_context.frame.instruction_ptr = switch_entry;
+        tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
+        tcb.kernel_context.frame.set_instruction_ptr(switch_entry);
         tcb.kernel_context.initialized = true;
         Ok(())
     }
@@ -110,8 +110,10 @@ impl KernelState {
         self.set_thread_kernel_stack(tid, stack_base, stack_top)?;
 
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.kernel_context.frame.stack_ptr = stack_top & !0xF;
-        tcb.kernel_context.frame.instruction_ptr = yarm_kernel_thread_switch_trampoline as usize;
+        tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
+        tcb.kernel_context
+            .frame
+            .set_instruction_ptr(yarm_kernel_thread_switch_trampoline as usize);
         tcb.kernel_context.initialized = false;
         tcb.kernel_context.owns_stack = true;
         Ok(())

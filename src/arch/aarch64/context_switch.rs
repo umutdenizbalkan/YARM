@@ -1,4 +1,4 @@
-use crate::kernel::task::KernelSwitchFrame;
+use crate::kernel::task::ArchSwitchContext;
 
 #[inline]
-pub fn switch_frames(_prev: &mut KernelSwitchFrame, _next: &KernelSwitchFrame) {}
+pub fn switch_frames(_prev: &mut ArchSwitchContext, _next: &ArchSwitchContext) {}

@@ -1,8 +1,8 @@
-use crate::kernel::task::KernelSwitchFrame;
+use crate::kernel::task::ArchSwitchContext;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 unsafe extern "C" {
-    fn yarm_x86_switch_frame(prev: *mut KernelSwitchFrame, next: *const KernelSwitchFrame);
+    fn yarm_x86_switch_frame(prev: *mut ArchSwitchContext, next: *const ArchSwitchContext);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -36,7 +36,7 @@ yarm_x86_switch_frame:
 );
 
 #[inline]
-pub fn switch_frames(prev: &mut KernelSwitchFrame, next: &KernelSwitchFrame) {
+pub fn switch_frames(prev: &mut ArchSwitchContext, next: &ArchSwitchContext) {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     unsafe {
         yarm_x86_switch_frame(prev as *mut _, next as *const _);
@@ -54,17 +54,14 @@ mod tests {
 
     #[test]
     fn kernel_switch_frame_layout_matches_asm_offsets() {
-        let frame = KernelSwitchFrame::default();
-        let base = &frame as *const _ as usize;
-        assert_eq!(core::mem::offset_of!(KernelSwitchFrame, stack_ptr), 0);
-        assert_eq!(core::mem::offset_of!(KernelSwitchFrame, instruction_ptr), 8);
-        assert_eq!(core::mem::offset_of!(KernelSwitchFrame, rbx), 16);
-        assert_eq!(core::mem::offset_of!(KernelSwitchFrame, rbp), 24);
-        assert_eq!(core::mem::offset_of!(KernelSwitchFrame, r12), 32);
-        assert_eq!(core::mem::offset_of!(KernelSwitchFrame, r13), 40);
-        assert_eq!(core::mem::offset_of!(KernelSwitchFrame, r14), 48);
-        assert_eq!(core::mem::offset_of!(KernelSwitchFrame, r15), 56);
-        let end = base + core::mem::size_of::<KernelSwitchFrame>();
-        assert_eq!(end - base, 64);
+        let mut frame = ArchSwitchContext::default();
+        assert_eq!(
+            core::mem::size_of::<ArchSwitchContext>(),
+            ArchSwitchContext::WORDS * 8
+        );
+        frame.set_stack_ptr(0xAAA0);
+        frame.set_instruction_ptr(0xBBB0);
+        assert_eq!(frame.stack_ptr(), 0xAAA0);
+        assert_eq!(frame.instruction_ptr(), 0xBBB0);
     }
 }

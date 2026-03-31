@@ -78,23 +78,39 @@ pub struct RestartState {
     pub token: Option<RestartToken>,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct KernelSwitchFrame {
-    pub stack_ptr: usize,
-    pub instruction_ptr: usize,
-    pub rbx: usize,
-    pub rbp: usize,
-    pub r12: usize,
-    pub r13: usize,
-    pub r14: usize,
-    pub r15: usize,
+pub struct ArchSwitchContext {
+    words: [usize; 8],
+}
+
+impl ArchSwitchContext {
+    pub const WORDS: usize = 8;
+    const STACK_PTR_IDX: usize = 0;
+    const INSTRUCTION_PTR_IDX: usize = 1;
+
+    pub const fn stack_ptr(self) -> usize {
+        self.words[Self::STACK_PTR_IDX]
+    }
+
+    pub fn set_stack_ptr(&mut self, value: usize) {
+        self.words[Self::STACK_PTR_IDX] = value;
+    }
+
+    pub const fn instruction_ptr(self) -> usize {
+        self.words[Self::INSTRUCTION_PTR_IDX]
+    }
+
+    pub fn set_instruction_ptr(&mut self, value: usize) {
+        self.words[Self::INSTRUCTION_PTR_IDX] = value;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KernelExecutionContext {
     pub stack_base: Option<VirtAddr>,
     pub stack_top: Option<VirtAddr>,
-    pub frame: KernelSwitchFrame,
+    pub frame: ArchSwitchContext,
     pub initialized: bool,
     pub owns_stack: bool,
 }
@@ -171,8 +187,8 @@ mod tests {
         };
         tcb.kernel_context.stack_base = Some(VirtAddr(0x9000));
         tcb.kernel_context.stack_top = Some(VirtAddr(0xA000));
-        tcb.kernel_context.frame.stack_ptr = 0x9FF0;
-        tcb.kernel_context.frame.instruction_ptr = 0x1234;
+        tcb.kernel_context.frame.set_stack_ptr(0x9FF0);
+        tcb.kernel_context.frame.set_instruction_ptr(0x1234);
         tcb.kernel_context.initialized = true;
         tcb.kernel_context.owns_stack = true;
 
@@ -184,6 +200,8 @@ mod tests {
         assert_eq!(tcb.detach_state, ThreadDetachState::Joinable);
         assert_eq!(tcb.status, TaskStatus::Runnable);
         assert_eq!(tcb.kernel_context.stack_top, Some(VirtAddr(0xA000)));
+        assert_eq!(tcb.kernel_context.frame.stack_ptr(), 0x9FF0);
+        assert_eq!(tcb.kernel_context.frame.instruction_ptr(), 0x1234);
         assert!(tcb.kernel_context.initialized);
         assert!(tcb.kernel_context.owns_stack);
     }

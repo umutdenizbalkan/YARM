@@ -4082,8 +4082,8 @@ mod tests {
         let context = state.thread_kernel_context(55).expect("context");
         assert_eq!(context.stack_base, Some(VirtAddr(0x9000_0000)));
         assert_eq!(context.stack_top, Some(VirtAddr(0x9000_4000)));
-        assert_eq!(context.frame.instruction_ptr, 0x1234_5678);
-        assert_eq!(context.frame.stack_ptr & 0xF, 0);
+        assert_eq!(context.frame.instruction_ptr(), 0x1234_5678);
+        assert_eq!(context.frame.stack_ptr() & 0xF, 0);
         assert!(context.initialized);
     }
 
@@ -4135,7 +4135,7 @@ mod tests {
         assert!(context.owns_stack);
         assert!(context.stack_base.is_some());
         assert!(context.stack_top.is_some());
-        assert_ne!(context.frame.instruction_ptr, 0);
+        assert_ne!(context.frame.instruction_ptr(), 0);
         assert_eq!(context.initialized, false);
     }
 
