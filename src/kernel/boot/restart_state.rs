@@ -94,6 +94,7 @@ impl KernelState {
             tcb.status = TaskStatus::Dead;
             tcb.restart.token = None;
         }
+        let _ = self.release_kernel_context(tid);
         let _ = self.revoke_driver_runtime_caps(tid);
         self.maybe_cleanup_process_cnode_for_pid(process_pid);
         Ok(())

@@ -6,6 +6,16 @@ use crate::kernel::task::{
 };
 use crate::kernel::trapframe::TrapFrame;
 
+const KERNEL_STACK_REGION_BASE: usize = 0xFFFF_8000_0000_0000;
+const KERNEL_STACK_REGION_SIZE: usize = 0x4000;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 impl KernelState {
     pub fn thread_group_id(&self, tid: u64) -> Option<ThreadGroupId> {
         self.tcbs
@@ -81,6 +91,39 @@ impl KernelState {
         tcb.kernel_context.frame.stack_ptr = stack_top & !0xF;
         tcb.kernel_context.frame.instruction_ptr = switch_entry;
         tcb.kernel_context.initialized = true;
+        Ok(())
+    }
+
+    pub(crate) fn provision_default_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
+        let idx = self
+            .tcbs
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid))
+            .ok_or(KernelError::TaskMissing)?;
+
+        let stack_base = KERNEL_STACK_REGION_BASE
+            .checked_add(idx.saturating_mul(KERNEL_STACK_REGION_SIZE))
+            .ok_or(KernelError::VmFull)?;
+        let stack_top = stack_base
+            .checked_add(KERNEL_STACK_REGION_SIZE)
+            .ok_or(KernelError::VmFull)?;
+        self.set_thread_kernel_stack(tid, stack_base, stack_top)?;
+
+        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        tcb.kernel_context.frame.stack_ptr = stack_top & !0xF;
+        tcb.kernel_context.frame.instruction_ptr = yarm_kernel_thread_switch_trampoline as usize;
+        tcb.kernel_context.initialized = false;
+        tcb.kernel_context.owns_stack = true;
+        Ok(())
+    }
+
+    pub(crate) fn release_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
+        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        tcb.kernel_context.stack_base = None;
+        tcb.kernel_context.stack_top = None;
+        tcb.kernel_context.frame = Default::default();
+        tcb.kernel_context.initialized = false;
+        tcb.kernel_context.owns_stack = false;
         Ok(())
     }
 

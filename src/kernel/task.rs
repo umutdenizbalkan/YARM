@@ -96,6 +96,7 @@ pub struct KernelExecutionContext {
     pub stack_top: Option<VirtAddr>,
     pub frame: KernelSwitchFrame,
     pub initialized: bool,
+    pub owns_stack: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +174,7 @@ mod tests {
         tcb.kernel_context.frame.stack_ptr = 0x9FF0;
         tcb.kernel_context.frame.instruction_ptr = 0x1234;
         tcb.kernel_context.initialized = true;
+        tcb.kernel_context.owns_stack = true;
 
         assert_eq!(tcb.tid, ThreadId(7));
         assert_eq!(tcb.restart.token, Some(RestartToken(9)));
@@ -183,6 +185,7 @@ mod tests {
         assert_eq!(tcb.status, TaskStatus::Runnable);
         assert_eq!(tcb.kernel_context.stack_top, Some(VirtAddr(0xA000)));
         assert!(tcb.kernel_context.initialized);
+        assert!(tcb.kernel_context.owns_stack);
     }
 
     #[test]

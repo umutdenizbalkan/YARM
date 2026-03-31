@@ -4127,6 +4127,33 @@ mod tests {
     }
 
     #[test]
+    fn register_task_provisions_kernel_stack_with_trampoline_entry() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(58).expect("task");
+
+        let context = state.thread_kernel_context(58).expect("context");
+        assert!(context.owns_stack);
+        assert!(context.stack_base.is_some());
+        assert!(context.stack_top.is_some());
+        assert_ne!(context.frame.instruction_ptr, 0);
+        assert_eq!(context.initialized, false);
+    }
+
+    #[test]
+    fn mark_task_dead_releases_kernel_context_ownership() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(59).expect("task");
+        assert!(state.thread_kernel_context(59).expect("context").owns_stack);
+
+        state.mark_task_dead(59).expect("dead");
+        let context = state.thread_kernel_context(59).expect("context");
+        assert!(!context.owns_stack);
+        assert!(context.stack_base.is_none());
+        assert!(context.stack_top.is_none());
+        assert!(!context.initialized);
+    }
+
+    #[test]
     fn join_blocks_until_target_exits_and_detached_threads_reap_on_exit() {
         let mut state = Bootstrap::init().expect("init");
         let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");

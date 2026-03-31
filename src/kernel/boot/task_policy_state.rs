@@ -25,6 +25,7 @@ impl KernelState {
         if let Some(idx) = self.tcbs.iter().position(|slot| slot.is_none()) {
             let tcb = ThreadControlBlock::new(ThreadId(tid), class, None);
             self.tcbs[idx] = Some(tcb);
+            self.provision_default_kernel_context(tid)?;
             Ok(())
         } else {
             Err(KernelError::TaskTableFull)
