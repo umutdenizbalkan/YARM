@@ -869,13 +869,13 @@ impl KernelState {
     }
 
     pub fn task_cnode(&self, tid: u64) -> Option<CNodeId> {
-        let (pid, cached_cnode) = self
+        let pid = self
             .tcbs
             .iter()
             .flatten()
             .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| (tcb.thread_group_id.0, tcb.cnode))?;
-        self.process_cnode_for_pid(pid).or(Some(cached_cnode))
+            .map(|tcb| tcb.thread_group_id.0)?;
+        self.process_cnode_for_pid(pid)
     }
 
     pub(crate) fn process_cnode_for_pid(&self, pid: u64) -> Option<CNodeId> {
@@ -1170,13 +1170,6 @@ impl KernelState {
             .flatten()
             .find(|record| record.cnode == cnode)
             .map(|record| record.pid)
-            .or_else(|| {
-                self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.cnode == cnode)
-            .map(|tcb| tcb.tid.0)
-            })
     }
 
     fn revoke_capability_direct_in_task_cnode(&mut self, tid: u64, cap: CapId) {

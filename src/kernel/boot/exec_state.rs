@@ -61,7 +61,6 @@ impl KernelState {
         self.set_process_cnode_for_pid(spec.tid, cnode)?;
         if let Some(tcb) = self.tcb_mut(spec.tid) {
             tcb.thread_group_id = ThreadGroupId(spec.tid);
-            tcb.cnode = cnode;
             tcb.asid = spec.asid;
             tcb.user_entry = Some(VirtAddr(spec.entry as u64));
             tcb.user_context.instruction_ptr = VirtAddr(spec.entry as u64);

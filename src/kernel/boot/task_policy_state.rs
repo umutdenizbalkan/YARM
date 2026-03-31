@@ -23,7 +23,7 @@ impl KernelState {
         self.ensure_cnode_space(cnode)?;
         self.set_process_cnode_for_pid(process_pid, cnode)?;
         if let Some(idx) = self.tcbs.iter().position(|slot| slot.is_none()) {
-            let tcb = ThreadControlBlock::new(ThreadId(tid), cnode, class, None);
+            let tcb = ThreadControlBlock::new(ThreadId(tid), class, None);
             self.tcbs[idx] = Some(tcb);
             Ok(())
         } else {
