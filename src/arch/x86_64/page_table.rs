@@ -1,6 +1,6 @@
 use crate::arch::x86_64::vm_layout;
 use crate::kernel::frame_allocator::{alloc_pt_frame, free_pt_frame};
-use crate::kernel::lock::SpinLock;
+use crate::kernel::lock::SpinLockIrq;
 use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr};
 
 const ENTRIES_PER_TABLE: usize = 512;
@@ -174,9 +174,10 @@ impl PageTableState {
     }
 }
 
-static PAGE_TABLE_STATE: SpinLock<PageTableState> = SpinLock::new(PageTableState::new());
+static PAGE_TABLE_STATE: SpinLockIrq<PageTableState> = SpinLockIrq::new(PageTableState::new());
 #[cfg(test)]
-static LAST_INVALIDATED_ASID: SpinLock<Option<Asid>> = SpinLock::new(None);
+static LAST_INVALIDATED_ASID: crate::kernel::lock::SpinLock<Option<Asid>> =
+    crate::kernel::lock::SpinLock::new(None);
 
 pub fn reset_state() {
     let mut state = PAGE_TABLE_STATE.lock();
