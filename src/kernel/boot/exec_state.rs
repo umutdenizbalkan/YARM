@@ -1,4 +1,5 @@
 use super::{KernelError, KernelState, SpawnedUserTask, UserImageSpec};
+use crate::arch::hal::Hal;
 use crate::kernel::task::{TaskStatus, ThreadGroupId, WaitReason};
 use crate::kernel::vm::VirtAddr;
 
@@ -71,8 +72,15 @@ impl KernelState {
     }
 
     pub(crate) fn dispatch_next_task(&mut self) -> Result<Option<u64>, KernelError> {
+        let outgoing_asid = self.current_tid().and_then(|tid| self.task_asid(tid));
         let next = self.dispatch_next_current_cpu();
         if let Some(tid) = next {
+            let incoming_asid = self.task_asid(tid);
+            if let Some(asid) = incoming_asid
+                && incoming_asid != outgoing_asid
+            {
+                self.hal.switch_address_space(asid);
+            }
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Running;
         }
@@ -80,6 +88,7 @@ impl KernelState {
     }
 
     pub fn yield_current(&mut self) -> Result<(), KernelError> {
+        let outgoing_asid = self.current_tid().and_then(|tid| self.task_asid(tid));
         if let Some(tid) = self.current_tid() {
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Runnable;
@@ -87,6 +96,12 @@ impl KernelState {
 
         let next_tid = self.on_preempt_current_cpu();
         if let Some(tid) = next_tid {
+            let incoming_asid = self.task_asid(tid);
+            if let Some(asid) = incoming_asid
+                && incoming_asid != outgoing_asid
+            {
+                self.hal.switch_address_space(asid);
+            }
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Running;
         }

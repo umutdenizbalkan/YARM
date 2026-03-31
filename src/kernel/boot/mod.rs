@@ -411,6 +411,7 @@ struct DelegatedCapRef {
 #[derive(Debug)]
 pub struct KernelState {
     pub kernel_aspace: AddressSpace,
+    hal: crate::arch::hal::SelectedIsaHal,
     pub scheduler: KernelStorage<SmpScheduler>,
     pub timer: Timer,
     pub user_spaces: KernelStorage<AddressSpaceManager>,
@@ -632,6 +633,7 @@ impl Bootstrap {
 
         let mut state = KernelState {
             kernel_aspace,
+            hal: crate::arch::hal::SelectedIsaHal::default(),
             scheduler: store_kernel_value(scheduler),
             timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: store_kernel_value(AddressSpaceManager::default()),
