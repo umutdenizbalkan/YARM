@@ -67,7 +67,7 @@ impl ElfImageInfo {
         if image.len() < 32 {
             return Err(ProcessManagerError::Malformed);
         }
-        if &image[..4] != b"ELF" {
+        if &image[..4] != b"\x7FELF" {
             return Err(ProcessManagerError::Malformed);
         }
         let mut entry = [0u8; 8];
@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn elf_image_info_parser_accepts_minimal_elf64_header() {
         let mut image = [0u8; 64];
-        image[..4].copy_from_slice(b"ELF");
+        image[..4].copy_from_slice(b"\x7FELF");
         image[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
         let info = ElfImageInfo::parse(7, &image).expect("elf");
         assert_eq!(info.image_id, 7);
@@ -466,7 +466,7 @@ mod tests {
     fn spawn_from_elf_image_allocates_pid_and_returns_entry() {
         let mut pm = ProcessManager::new();
         let mut image = [0u8; 64];
-        image[..4].copy_from_slice(b"ELF");
+        image[..4].copy_from_slice(b"\x7FELF");
         image[24..32].copy_from_slice(&0x402000u64.to_le_bytes());
 
         let (pid, info) = pm
