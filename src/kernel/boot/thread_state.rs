@@ -242,8 +242,7 @@ impl KernelState {
             .ok_or(KernelError::TaskMissing)?;
         let parent_cnode = self.task_cnode(parent_tid).ok_or(KernelError::TaskMissing)?;
         let tid = self.allocate_thread_id()?;
-        self.register_task_with_class(tid, parent.class)?;
-        self.clear_process_cnode_for_pid(tid);
+        self.register_task_with_class_in_process(tid, parent.class, parent.thread_group_id.0)?;
         if let Some(tcb) = self.tcb_mut(tid) {
             tcb.thread_group_id = parent.thread_group_id;
             tcb.asid = parent.asid;

@@ -907,16 +907,6 @@ impl KernelState {
         Err(KernelError::TaskTableFull)
     }
 
-    pub(crate) fn clear_process_cnode_for_pid(&mut self, pid: u64) {
-        if let Some(slot) = self
-            .process_cnodes
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|record| record.pid == pid))
-        {
-            *slot = None;
-        }
-    }
-
     pub fn current_task_capability(&self, cap: CapId) -> Option<Capability> {
         let cnode = self.current_task_cnode()?;
         self.capability_for_cnode(cnode, cap)
@@ -1175,11 +1165,18 @@ impl KernelState {
     }
 
     fn tid_for_cnode(&self, cnode: CNodeId) -> Option<u64> {
-        self.tcbs
+        self.process_cnodes
+            .iter()
+            .flatten()
+            .find(|record| record.cnode == cnode)
+            .map(|record| record.pid)
+            .or_else(|| {
+                self.tcbs
             .iter()
             .flatten()
             .find(|tcb| tcb.cnode == cnode)
             .map(|tcb| tcb.tid.0)
+            })
     }
 
     fn revoke_capability_direct_in_task_cnode(&mut self, tid: u64, cap: CapId) {

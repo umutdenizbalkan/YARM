@@ -97,10 +97,10 @@ pub struct ThreadControlBlock {
 }
 
 impl ThreadControlBlock {
-    pub fn new(tid: ThreadId, class: TaskClass, asid: Option<Asid>) -> Self {
+    pub fn new(tid: ThreadId, cnode: CNodeId, class: TaskClass, asid: Option<Asid>) -> Self {
         Self {
             tid,
-            cnode: CNodeId(tid.0),
+            cnode,
             thread_group_id: ThreadGroupId(tid.0),
             class,
             status: TaskStatus::Runnable,
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn tcb_constructor_uses_typed_fields() {
-        let mut tcb = ThreadControlBlock::new(ThreadId(7), TaskClass::App, Some(Asid(1)));
+        let mut tcb = ThreadControlBlock::new(ThreadId(7), CNodeId(7), TaskClass::App, Some(Asid(1)));
         tcb.tls_ptr = Some(VirtAddr(0xDEAD_BEEF));
         tcb.user_entry = Some(VirtAddr(0x4000));
         tcb.user_stack_top = Some(VirtAddr(0x8000));
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn tcb_constructor_does_not_truncate_large_tid_for_cnode() {
         let tid = ThreadId(70_000);
-        let tcb = ThreadControlBlock::new(tid, TaskClass::App, None);
+        let tcb = ThreadControlBlock::new(tid, CNodeId(70_000), TaskClass::App, None);
 
         assert_eq!(tcb.cnode, CNodeId(70_000));
         assert_eq!(tcb.thread_group_id, ThreadGroupId(70_000));
