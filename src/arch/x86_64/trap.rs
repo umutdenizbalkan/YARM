@@ -10,6 +10,8 @@ const VEC_TIMER: u8 = 0x20;
 const VEC_EXTERNAL_BASE: u8 = 0x20;
 const VEC_EXTERNAL_LIMIT: u8 = 0x30;
 const VEC_PAGE_FAULT: u8 = 14;
+#[cfg(not(feature = "hosted-dev"))]
+const MSR_FS_BASE: u32 = 0xC000_0100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct X86TrapContext {
@@ -41,11 +43,55 @@ fn restore_arch_thread_state(
         .resume_current_thread_with_frame(frame)
         .map_err(crate::kernel::syscall::SyscallError::from)
         .map_err(TrapHandleError::Syscall)?;
+    restore_fs_base_if_needed(tls.unwrap_or(0));
     let idx = cpu.0 as usize;
     if idx < MAX_CPUS {
         LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
     }
     Ok(())
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+fn restore_fs_base_if_needed(target: usize) {
+    let current = read_msr(MSR_FS_BASE);
+    let target = target as u64;
+    if current != target {
+        write_msr(MSR_FS_BASE, target);
+    }
+}
+
+#[cfg(feature = "hosted-dev")]
+fn restore_fs_base_if_needed(_target: usize) {}
+
+#[cfg(not(feature = "hosted-dev"))]
+fn read_msr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack)
+        );
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+fn write_msr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack)
+        );
+    }
 }
 
 pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {
