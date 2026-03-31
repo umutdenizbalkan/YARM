@@ -410,7 +410,7 @@ struct DelegatedCapabilityLink {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DelegatedCapRef {
-    tid: u64,
+    pid: u64,
     cap: CapId,
 }
 
@@ -1132,9 +1132,9 @@ impl KernelState {
         let source_capability = self
             .cspace_for_cnode(cnode)
             .and_then(|cspace| cspace.get(cap));
-        let source_tid = self.tid_for_cnode(cnode).ok_or(KernelError::TaskMissing)?;
+        let source_pid = self.tid_for_cnode(cnode).ok_or(KernelError::TaskMissing)?;
         let root = DelegatedCapRef {
-            tid: source_tid,
+            pid: source_pid,
             cap,
         };
         let descendants = self.collect_delegated_descendants(root);
@@ -1143,7 +1143,7 @@ impl KernelState {
             .revoke(cap)
             .map_err(|_| KernelError::InvalidCapability)?;
         for delegated in descendants.into_iter().flatten() {
-            self.revoke_capability_direct_in_task_cnode(delegated.tid, delegated.cap);
+            self.revoke_capability_direct_in_process_cnode(delegated.pid, delegated.cap);
         }
         self.remove_delegation_links_for(root, descendants);
         if let Some(capability) = source_capability {
@@ -1190,9 +1190,9 @@ impl KernelState {
             .map(|record| record.pid)
     }
 
-    fn revoke_capability_direct_in_task_cnode(&mut self, tid: u64, cap: CapId) {
+    fn revoke_capability_direct_in_process_cnode(&mut self, pid: u64, cap: CapId) {
         let mut revoked_capability = None;
-        if let Some(cnode) = self.task_cnode(tid)
+        if let Some(cnode) = self.process_cnode_for_pid(pid)
             && let Some(cspace) = self.cspace_for_cnode_mut(cnode)
         {
             revoked_capability = cspace.get(cap);
@@ -1310,11 +1310,12 @@ impl KernelState {
             let current = queue[head].expect("queue item");
             head += 1;
             for link in self.delegated_capability_links.iter().flatten() {
-                if link.source_tid != current.tid || link.source_cap != current.cap {
+                let link_source_pid = self.process_id(link.source_tid).unwrap_or(link.source_tid);
+                if link_source_pid != current.pid || link.source_cap != current.cap {
                     continue;
                 }
                 let child = DelegatedCapRef {
-                    tid: link.dest_tid,
+                    pid: self.process_id(link.dest_tid).unwrap_or(link.dest_tid),
                     cap: link.dest_cap,
                 };
                 if Self::contains_cap_ref(&found, child) {
@@ -1339,17 +1340,16 @@ impl KernelState {
         root: DelegatedCapRef,
         descendants: [Option<DelegatedCapRef>; MAX_DELEGATED_CAPABILITY_LINKS],
     ) {
-        let links = kernel_mut(&mut self.delegated_capability_links);
-        for slot in links.iter_mut() {
-            let Some(link) = slot else {
+        for idx in 0..self.delegated_capability_links.len() {
+            let Some(link) = self.delegated_capability_links[idx] else {
                 continue;
             };
             let source = DelegatedCapRef {
-                tid: link.source_tid,
+                pid: self.process_id(link.source_tid).unwrap_or(link.source_tid),
                 cap: link.source_cap,
             };
             let dest = DelegatedCapRef {
-                tid: link.dest_tid,
+                pid: self.process_id(link.dest_tid).unwrap_or(link.dest_tid),
                 cap: link.dest_cap,
             };
             let involved = source == root
@@ -1357,7 +1357,7 @@ impl KernelState {
                 || Self::contains_cap_ref(&descendants, source)
                 || Self::contains_cap_ref(&descendants, dest);
             if involved {
-                *slot = None;
+                self.delegated_capability_links[idx] = None;
             }
         }
     }
