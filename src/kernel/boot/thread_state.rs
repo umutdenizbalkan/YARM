@@ -240,11 +240,14 @@ impl KernelState {
             .find(|tcb| tcb.tid.0 == parent_tid)
             .cloned()
             .ok_or(KernelError::TaskMissing)?;
+        let parent_cnode = self.task_cnode(parent_tid).ok_or(KernelError::TaskMissing)?;
         let tid = self.allocate_thread_id()?;
         self.register_task_with_class(tid, parent.class)?;
+        self.clear_process_cnode_for_pid(tid);
         if let Some(tcb) = self.tcb_mut(tid) {
             tcb.thread_group_id = parent.thread_group_id;
             tcb.asid = parent.asid;
+            tcb.cnode = parent_cnode;
             tcb.tls_ptr = Some(crate::kernel::vm::VirtAddr(tls_base as u64));
             tcb.user_entry = Some(crate::kernel::vm::VirtAddr(user_entry as u64));
             tcb.user_stack_top = Some(crate::kernel::vm::VirtAddr(user_stack_top as u64));

@@ -381,6 +381,12 @@ struct CNodeSpace {
     cspace: KernelStorage<CapabilitySpace>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessCNodeRecord {
+    pid: u64,
+    cnode: CNodeId,
+}
+
 #[derive(Debug)]
 struct FaultSubsystem {
     last_fault: Option<FaultInfo>,
@@ -418,6 +424,7 @@ pub struct KernelState {
     current_cpu: CpuId,
     ipc: KernelStorage<IpcSubsystem>,
     cnode_spaces: KernelStorage<[Option<CNodeSpace>; MAX_TASKS]>,
+    process_cnodes: KernelStorage<[Option<ProcessCNodeRecord>; MAX_TASKS]>,
     next_dynamic_tid: u64,
     tcbs: KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
     tls_restore_pending: KernelStorage<[Option<ThreadId>; MAX_TASKS]>,
@@ -653,6 +660,7 @@ impl Bootstrap {
                 telemetry: IpcPathTelemetry::default(),
             }),
             cnode_spaces: store_kernel_value([const { None }; MAX_TASKS]),
+            process_cnodes: store_kernel_value([const { None }; MAX_TASKS]),
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
             tcbs: store_kernel_value([const { None }; MAX_TASKS]),
             tls_restore_pending: store_kernel_value([None; MAX_TASKS]),
@@ -861,11 +869,52 @@ impl KernelState {
     }
 
     pub fn task_cnode(&self, tid: u64) -> Option<CNodeId> {
-        self.tcbs
+        let (pid, cached_cnode) = self
+            .tcbs
             .iter()
             .flatten()
             .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.cnode)
+            .map(|tcb| (tcb.thread_group_id.0, tcb.cnode))?;
+        self.process_cnode_for_pid(pid).or(Some(cached_cnode))
+    }
+
+    pub(crate) fn process_cnode_for_pid(&self, pid: u64) -> Option<CNodeId> {
+        self.process_cnodes
+            .iter()
+            .flatten()
+            .find(|record| record.pid == pid)
+            .map(|record| record.cnode)
+    }
+
+    pub(crate) fn set_process_cnode_for_pid(
+        &mut self,
+        pid: u64,
+        cnode: CNodeId,
+    ) -> Result<(), KernelError> {
+        if let Some(record) = self
+            .process_cnodes
+            .iter_mut()
+            .flatten()
+            .find(|record| record.pid == pid)
+        {
+            record.cnode = cnode;
+            return Ok(());
+        }
+        if let Some(slot) = self.process_cnodes.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(ProcessCNodeRecord { pid, cnode });
+            return Ok(());
+        }
+        Err(KernelError::TaskTableFull)
+    }
+
+    pub(crate) fn clear_process_cnode_for_pid(&mut self, pid: u64) {
+        if let Some(slot) = self
+            .process_cnodes
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|record| record.pid == pid))
+        {
+            *slot = None;
+        }
     }
 
     pub fn current_task_capability(&self, cap: CapId) -> Option<Capability> {
@@ -3941,6 +3990,7 @@ mod tests {
             .spawn_user_thread(7, 0xDEAD_BEEF, 0x8000_0000, 0x4010)
             .expect("thread");
 
+        assert_eq!(state.task_cnode(tid), state.task_cnode(7));
         assert_eq!(state.thread_group_id(tid), Some(ThreadGroupId(7)));
         assert_eq!(state.task_asid(tid), Some(asid));
         assert_eq!(state.thread_tls_base(tid), Some(0xDEAD_BEEF));

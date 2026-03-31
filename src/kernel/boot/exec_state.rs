@@ -57,8 +57,11 @@ impl KernelState {
         spec: UserImageSpec,
     ) -> Result<SpawnedUserTask, KernelError> {
         self.register_task_with_class(spec.tid, spec.class)?;
+        let cnode = self.task_cnode(spec.tid).ok_or(KernelError::TaskMissing)?;
+        self.set_process_cnode_for_pid(spec.tid, cnode)?;
         if let Some(tcb) = self.tcb_mut(spec.tid) {
             tcb.thread_group_id = ThreadGroupId(spec.tid);
+            tcb.cnode = cnode;
             tcb.asid = spec.asid;
             tcb.user_entry = Some(VirtAddr(spec.entry as u64));
             tcb.user_context.instruction_ptr = VirtAddr(spec.entry as u64);

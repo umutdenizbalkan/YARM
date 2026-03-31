@@ -17,8 +17,10 @@ impl KernelState {
         }
         if let Some(idx) = self.tcbs.iter().position(|slot| slot.is_none()) {
             let tcb = ThreadControlBlock::new(ThreadId(tid), class, None);
+            let cnode = tcb.cnode;
             self.ensure_cnode_space(tcb.cnode)?;
             self.tcbs[idx] = Some(tcb);
+            self.set_process_cnode_for_pid(tid, cnode)?;
             Ok(())
         } else {
             Err(KernelError::TaskTableFull)
