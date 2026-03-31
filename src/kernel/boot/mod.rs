@@ -4103,6 +4103,30 @@ mod tests {
     }
 
     #[test]
+    fn kernel_context_initialized_threads_can_take_scheduler_switch_paths() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(57).expect("task");
+        state.enqueue_current_cpu(57).expect("enqueue");
+
+        state
+            .set_thread_kernel_stack(0, 0xA000_0000, 0xA000_4000)
+            .expect("boot stack");
+        state
+            .initialize_thread_kernel_switch_frame(0, 0x1111_0000)
+            .expect("boot frame");
+        state
+            .set_thread_kernel_stack(57, 0xA001_0000, 0xA001_4000)
+            .expect("thread stack");
+        state
+            .initialize_thread_kernel_switch_frame(57, 0x2222_0000)
+            .expect("thread frame");
+
+        let _ = state.dispatch_next_task().expect("dispatch");
+        state.yield_current().expect("yield");
+        assert_eq!(state.current_tid(), Some(57));
+    }
+
+    #[test]
     fn join_blocks_until_target_exits_and_detached_threads_reap_on_exit() {
         let mut state = Bootstrap::init().expect("init");
         let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");

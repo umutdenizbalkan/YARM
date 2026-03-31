@@ -4,6 +4,62 @@ use crate::kernel::task::{TaskStatus, ThreadGroupId, WaitReason};
 use crate::kernel::vm::VirtAddr;
 
 impl KernelState {
+    fn maybe_switch_kernel_context(
+        &mut self,
+        outgoing_tid: Option<u64>,
+        incoming_tid: u64,
+    ) -> Result<(), KernelError> {
+        let Some(outgoing_tid) = outgoing_tid else {
+            return Ok(());
+        };
+        if outgoing_tid == incoming_tid {
+            return Ok(());
+        }
+
+        let outgoing_idx = self
+            .tcbs
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == outgoing_tid))
+            .ok_or(KernelError::TaskMissing)?;
+        let incoming_idx = self
+            .tcbs
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == incoming_tid))
+            .ok_or(KernelError::TaskMissing)?;
+
+        if outgoing_idx == incoming_idx {
+            return Ok(());
+        }
+
+        let (outgoing_tcb, incoming_tcb) = if outgoing_idx < incoming_idx {
+            let (left, right) = self.tcbs.split_at_mut(incoming_idx);
+            (
+                left[outgoing_idx]
+                    .as_mut()
+                    .ok_or(KernelError::TaskMissing)?,
+                right[0].as_mut().ok_or(KernelError::TaskMissing)?,
+            )
+        } else {
+            let (left, right) = self.tcbs.split_at_mut(outgoing_idx);
+            (
+                right[0].as_mut().ok_or(KernelError::TaskMissing)?,
+                left[incoming_idx]
+                    .as_mut()
+                    .ok_or(KernelError::TaskMissing)?,
+            )
+        };
+
+        if !outgoing_tcb.kernel_context.initialized || !incoming_tcb.kernel_context.initialized {
+            return Ok(());
+        }
+
+        crate::arch::selected_isa::context_switch::switch_frames(
+            &mut outgoing_tcb.kernel_context.frame,
+            &incoming_tcb.kernel_context.frame,
+        );
+        Ok(())
+    }
+
     pub fn futex_wait_current(
         &mut self,
         addr: usize,
@@ -74,7 +130,8 @@ impl KernelState {
     }
 
     pub(crate) fn dispatch_next_task(&mut self) -> Result<Option<u64>, KernelError> {
-        let outgoing_asid = self.current_tid().and_then(|tid| self.task_asid(tid));
+        let outgoing_tid = self.current_tid();
+        let outgoing_asid = outgoing_tid.and_then(|tid| self.task_asid(tid));
         let next = self.dispatch_next_current_cpu();
         if let Some(tid) = next {
             let incoming_asid = self.task_asid(tid);
@@ -83,6 +140,7 @@ impl KernelState {
             {
                 self.hal.switch_address_space(asid);
             }
+            self.maybe_switch_kernel_context(outgoing_tid, tid)?;
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Running;
         }
@@ -90,8 +148,9 @@ impl KernelState {
     }
 
     pub fn yield_current(&mut self) -> Result<(), KernelError> {
-        let outgoing_asid = self.current_tid().and_then(|tid| self.task_asid(tid));
-        if let Some(tid) = self.current_tid() {
+        let outgoing_tid = self.current_tid();
+        let outgoing_asid = outgoing_tid.and_then(|tid| self.task_asid(tid));
+        if let Some(tid) = outgoing_tid {
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Runnable;
         }
@@ -104,6 +163,7 @@ impl KernelState {
             {
                 self.hal.switch_address_space(asid);
             }
+            self.maybe_switch_kernel_context(outgoing_tid, tid)?;
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Running;
         }
