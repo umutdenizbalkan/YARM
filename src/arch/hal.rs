@@ -37,13 +37,17 @@ impl Hal for SelectedIsaHal {
         self.active_asid = Some(asid);
     }
 
-    fn acknowledge_interrupt(&mut self, _cpu: CpuId, _irq_line: u16) {}
+    fn acknowledge_interrupt(&mut self, _cpu: CpuId, irq_line: u16) {
+        crate::arch::selected_isa::irq::acknowledge_interrupt(irq_line);
+    }
 
     fn complete_external_interrupt(&mut self, irq_line: u16) {
         crate::arch::selected_isa::irq::external_irq_eoi(irq_line);
     }
 
-    fn program_timer_deadline(&mut self, _cpu: CpuId, _ticks_from_now: u64) {}
+    fn program_timer_deadline(&mut self, cpu: CpuId, ticks_from_now: u64) {
+        crate::arch::selected_isa::irq::program_timer_deadline(cpu, ticks_from_now);
+    }
 
     fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent {
         crate::arch::trap_entry::decode_trap_context(*context)

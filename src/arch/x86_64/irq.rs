@@ -1,12 +1,22 @@
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+use crate::kernel::vm::{Asid, PageFlags, PhysAddr, VirtAddr};
 #[cfg(any(test, not(feature = "hosted-dev")))]
 use core::ptr::write_volatile;
 #[cfg(any(test, not(feature = "hosted-dev")))]
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(all(not(test), not(feature = "hosted-dev")))]
-use crate::kernel::vm::{Asid, PageFlags, PhysAddr, VirtAddr};
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
 const LAPIC_EOI_OFFSET: usize = 0xB0;
+#[cfg(any(test, not(feature = "hosted-dev")))]
+const LAPIC_LVT_TIMER_OFFSET: usize = 0x320;
+#[cfg(any(test, not(feature = "hosted-dev")))]
+const LAPIC_TIMER_INITIAL_COUNT_OFFSET: usize = 0x380;
+#[cfg(any(test, not(feature = "hosted-dev")))]
+const LAPIC_TIMER_DIVIDE_CONFIG_OFFSET: usize = 0x3E0;
+#[cfg(any(test, not(feature = "hosted-dev")))]
+const LAPIC_TIMER_VECTOR: u32 = 0x20;
+#[cfg(any(test, not(feature = "hosted-dev")))]
+const LAPIC_TIMER_DIVIDE_BY_16: u32 = 0x3;
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
 static LAPIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -73,6 +83,45 @@ fn lapic_write_eoi(base: usize) {
     }
 }
 
+#[cfg(any(test, not(feature = "hosted-dev")))]
+fn lapic_write_u32(base: usize, offset: usize, value: u32) {
+    unsafe {
+        write_volatile((base + offset) as *mut u32, value);
+    }
+}
+
+#[cfg(any(test, not(feature = "hosted-dev")))]
+fn lapic_program_timer_deadline(base: usize, ticks_from_now: u64) {
+    let count = ticks_from_now.clamp(1, u32::MAX as u64) as u32;
+    lapic_write_u32(
+        base,
+        LAPIC_TIMER_DIVIDE_CONFIG_OFFSET,
+        LAPIC_TIMER_DIVIDE_BY_16,
+    );
+    lapic_write_u32(base, LAPIC_LVT_TIMER_OFFSET, LAPIC_TIMER_VECTOR);
+    lapic_write_u32(base, LAPIC_TIMER_INITIAL_COUNT_OFFSET, count);
+}
+
+pub fn acknowledge_interrupt(_irq_line: u16) {
+    #[cfg(any(test, not(feature = "hosted-dev")))]
+    {
+        if !LAPIC_CONFIGURED.load(Ordering::Relaxed) {
+            return;
+        }
+        lapic_write_eoi(LAPIC_MMIO_BASE.load(Ordering::Relaxed));
+    }
+}
+
+pub fn program_timer_deadline(_cpu: crate::kernel::scheduler::CpuId, _ticks_from_now: u64) {
+    #[cfg(any(test, not(feature = "hosted-dev")))]
+    {
+        if !LAPIC_CONFIGURED.load(Ordering::Relaxed) {
+            return;
+        }
+        lapic_program_timer_deadline(LAPIC_MMIO_BASE.load(Ordering::Relaxed), _ticks_from_now);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct X86IrqState {
     pub interrupts_were_enabled: bool,
@@ -114,11 +163,8 @@ pub fn irq_restore(state: X86IrqState) {
 pub fn external_irq_eoi(_irq_line: u16) {}
 
 #[cfg(not(feature = "hosted-dev"))]
-pub fn external_irq_eoi(_irq_line: u16) {
-    if !LAPIC_CONFIGURED.load(Ordering::Relaxed) {
-        return;
-    }
-    lapic_write_eoi(LAPIC_MMIO_BASE.load(Ordering::Relaxed));
+pub fn external_irq_eoi(irq_line: u16) {
+    acknowledge_interrupt(irq_line);
 }
 
 #[cfg(test)]
@@ -147,5 +193,27 @@ mod tests {
             b"lapic_mmio_base=0xfee00000"
         ));
         assert!(LAPIC_CONFIGURED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn program_timer_deadline_writes_lapic_timer_registers() {
+        let mut regs = [0u32; 512];
+        LAPIC_MMIO_BASE.store(regs.as_mut_ptr() as usize, Ordering::Relaxed);
+        LAPIC_CONFIGURED.store(true, Ordering::Relaxed);
+
+        program_timer_deadline(crate::kernel::scheduler::CpuId(0), 42);
+
+        assert_eq!(
+            regs[LAPIC_TIMER_DIVIDE_CONFIG_OFFSET / core::mem::size_of::<u32>()],
+            0x3
+        );
+        assert_eq!(
+            regs[LAPIC_LVT_TIMER_OFFSET / core::mem::size_of::<u32>()],
+            LAPIC_TIMER_VECTOR
+        );
+        assert_eq!(
+            regs[LAPIC_TIMER_INITIAL_COUNT_OFFSET / core::mem::size_of::<u32>()],
+            42
+        );
     }
 }

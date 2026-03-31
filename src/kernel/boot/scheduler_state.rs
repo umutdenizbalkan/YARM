@@ -1,4 +1,5 @@
 use super::{KernelError, KernelState, map_scheduler_error};
+use crate::arch::hal::Hal;
 use crate::kernel::ipc::Message;
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::scheduler::{CpuId, TaskPriority};
@@ -78,6 +79,11 @@ impl KernelState {
         self.scheduler.online_cpu_bitmap()
     }
 
+    pub fn program_timer_deadline_current_cpu(&mut self, ticks_from_now: u64) {
+        self.hal
+            .program_timer_deadline(self.current_cpu, ticks_from_now);
+    }
+
     fn task_priority(&self, tid: u64) -> Result<TaskPriority, KernelError> {
         if tid == 0 {
             return Ok(TaskPriority::Normal);
@@ -145,7 +151,9 @@ impl KernelState {
             .get_mut(endpoint_idx)
             .and_then(Option::as_mut)
             .ok_or(KernelError::WrongObject)?;
-        endpoint.send(msg).map_err(|_| KernelError::EndpointQueueFull)?;
+        endpoint
+            .send(msg)
+            .map_err(|_| KernelError::EndpointQueueFull)?;
         let _ = self.wake_waiter_for_endpoint(endpoint_idx);
         Ok(())
     }

@@ -1,4 +1,5 @@
 use super::{KernelError, KernelState, TrapHandleError};
+use crate::arch::hal::Hal;
 use crate::kernel::ipc::Message;
 use crate::kernel::syscall::{SyscallError, dispatch as dispatch_syscall};
 use crate::kernel::task::FaultPolicy;
@@ -82,12 +83,17 @@ impl KernelState {
                 Ok(())
             }
             Trap::TimerInterrupt => {
+                self.hal.acknowledge_interrupt(self.current_cpu(), 0);
                 let (_, should_preempt) = self.timer.tick_and_check();
                 if should_preempt {
                     self.yield_current()
                         .map_err(SyscallError::from)
                         .map_err(TrapHandleError::Syscall)?;
                 }
+                self.hal.program_timer_deadline(
+                    self.current_cpu(),
+                    crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+                );
                 Ok(())
             }
             Trap::PageFault | Trap::ExternalInterrupt | Trap::Unknown => Ok(()),
