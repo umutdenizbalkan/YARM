@@ -2,6 +2,8 @@
 use core::ptr::write_volatile;
 #[cfg(any(test, not(feature = "hosted-dev")))]
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+use crate::kernel::vm::{Asid, PageFlags, PhysAddr, VirtAddr};
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
 const LAPIC_EOI_OFFSET: usize = 0xB0;
@@ -15,6 +17,19 @@ static LAPIC_CONFIGURED: AtomicBool = AtomicBool::new(false);
 pub fn init_lapic_mmio_base(base: usize) {
     if base == 0 {
         return;
+    }
+    #[cfg(all(not(test), not(feature = "hosted-dev")))]
+    {
+        if crate::arch::selected_isa::page_table::map_page(
+            Asid(0),
+            VirtAddr(base as u64),
+            PhysAddr(base as u64),
+            PageFlags::DEVICE_RW,
+        )
+        .is_err()
+        {
+            return;
+        }
     }
     LAPIC_MMIO_BASE.store(base, Ordering::Relaxed);
     LAPIC_CONFIGURED.store(true, Ordering::Relaxed);
