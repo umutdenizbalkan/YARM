@@ -7,11 +7,11 @@ const IDT_GATE_INTERRUPT: u8 = 0x0E;
 const IDT_PRESENT: u8 = 1 << 7;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const VEC_NMI: usize = 2;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const VEC_DOUBLE_FAULT: usize = 8;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const VEC_PAGE_FAULT: usize = 14;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const VEC_SYSCALL: usize = 0x80;
 
 #[repr(C, packed)]
@@ -199,6 +199,8 @@ struct X86InterruptStackFrame {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_KERNEL_STATE_PTR: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static TRAP_DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const UNMAPPED_CPU: usize = usize::MAX;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static APIC_TO_CPU_ID: [AtomicUsize; 256] = [const { AtomicUsize::new(UNMAPPED_CPU) }; 256];
@@ -297,6 +299,11 @@ fn halt_forever() -> ! {
     }
 }
 
+#[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+const fn should_halt_without_kernel_state(vector: usize) -> bool {
+    vector < 32 && vector != VEC_SYSCALL
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 unsafe fn build_trap_frame_from_saved_regs(
     regs: *const X86SavedRegs,
@@ -342,6 +349,16 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     regs: *mut X86SavedRegs,
     interrupt_frame: *const X86InterruptStackFrame,
 ) {
+    let previous_depth = TRAP_DISPATCH_DEPTH.fetch_add(1, Ordering::AcqRel);
+    if previous_depth != 0 {
+        debug_uart_putc(b'!');
+        debug_uart_putc(b'N');
+        debug_uart_putc(b'S');
+        debug_uart_putc(b'T');
+        debug_uart_putc(b'v');
+        debug_uart_hex_u64(vector);
+        halt_forever();
+    }
     let mut fault_addr = 0u64;
     if vector as usize == VEC_PAGE_FAULT {
         unsafe {
@@ -356,12 +373,19 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
 
     let state_ptr = TRAP_KERNEL_STATE_PTR.load(Ordering::Acquire);
     if state_ptr == 0 {
-        if vector as usize == VEC_DOUBLE_FAULT {
+        if should_halt_without_kernel_state(vector as usize) {
             debug_uart_putc(b'!');
-            debug_uart_putc(b'D');
-            debug_uart_putc(b'F');
+            debug_uart_putc(b'E');
+            debug_uart_putc(b'R');
+            debug_uart_putc(b'L');
+            debug_uart_putc(b'v');
+            debug_uart_hex_u64(vector);
+            debug_uart_putc(b'e');
+            debug_uart_hex_u64(error_code);
+            TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
             halt_forever();
         }
+        TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
         return;
     }
     let kernel = unsafe { &mut *(state_ptr as *mut crate::kernel::boot::KernelState) };
@@ -391,6 +415,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     if vector as usize == VEC_SYSCALL {
         write_trap_returns_to_saved_regs(regs, &trap_frame);
     }
+    TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -840,5 +865,14 @@ mod tests {
             tss.io_map_base as usize,
             core::mem::size_of::<X86TaskStateSegment>()
         );
+    }
+
+    #[test]
+    fn halt_without_kernel_state_for_cpu_exception_vectors() {
+        assert!(should_halt_without_kernel_state(0));
+        assert!(should_halt_without_kernel_state(VEC_DOUBLE_FAULT));
+        assert!(should_halt_without_kernel_state(VEC_PAGE_FAULT));
+        assert!(!should_halt_without_kernel_state(VEC_SYSCALL));
+        assert!(!should_halt_without_kernel_state(0x40));
     }
 }

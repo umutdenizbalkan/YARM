@@ -104,6 +104,11 @@ fn debug_uart_marker(byte: u8) {
 #[inline]
 fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    {
+        debug_uart_marker(b'H');
+        yarm::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
+    }
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     let mut kernel = Bootstrap::init().expect("kernel init");
     #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
     let kernel = Bootstrap::init().expect("kernel init");
@@ -111,7 +116,6 @@ fn run() {
     {
         debug_uart_marker(b'I');
         yarm::arch::x86_64::descriptor_tables::register_trap_kernel_state(&mut kernel);
-        yarm::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
         debug_uart_marker(b'J');
     }
     yarm::yarm_log!(
