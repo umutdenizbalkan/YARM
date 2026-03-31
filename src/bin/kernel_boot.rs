@@ -10,6 +10,77 @@ use yarm::services::common::vfs_service::{VfsReply, VfsService};
 use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(C)]
+struct PvhStartInfo {
+    _magic: u32,
+    _version: u32,
+    _flags: u32,
+    _nr_modules: u32,
+    _modlist_paddr: u64,
+    _cmdline_paddr: u64,
+    _rsdp_paddr: u64,
+    memmap_paddr: u64,
+    memmap_entries: u32,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PvhMemMapEntry {
+    addr: u64,
+    size: u64,
+    kind: u32,
+    _reserved: u32,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
+    if start_info_ptr == 0 {
+        return;
+    }
+
+    let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+    if start_info.memmap_paddr == 0 || start_info.memmap_entries == 0 {
+        return;
+    }
+
+    let count = core::cmp::min(start_info.memmap_entries as usize, MAX_PVH_MEMMAP_ENTRIES);
+    let memmap = start_info.memmap_paddr as *const PvhMemMapEntry;
+    let entries = unsafe { core::slice::from_raw_parts(memmap, count) };
+
+    let mut regions = [yarm::kernel::frame_allocator::MemoryRegion {
+        start: 0,
+        len: 0,
+        usable: false,
+    }; MAX_PVH_MEMMAP_ENTRIES];
+    let mut used = 0usize;
+
+    for entry in entries {
+        if entry.size == 0 || entry.kind != 1 {
+            continue;
+        }
+        if used >= regions.len() {
+            break;
+        }
+        regions[used] = yarm::kernel::frame_allocator::MemoryRegion {
+            start: entry.addr,
+            len: entry.size,
+            usable: true,
+        };
+        used += 1;
+    }
+
+    if used == 0 {
+        return;
+    }
+
+    let _ = yarm::kernel::frame_allocator::init_pt_frame_allocator(&regions[..used]);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn debug_uart_marker(byte: u8) {
     unsafe {
         core::arch::asm!(
@@ -119,9 +190,11 @@ fn main() {
 
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn yarm_kernel_main() -> ! {
+pub extern "C" fn yarm_kernel_main(start_info_ptr: usize) -> ! {
     #[cfg(target_arch = "x86_64")]
     yarm::arch::x86_64::console::write_line("KM0");
+    #[cfg(target_arch = "x86_64")]
+    init_pt_allocator_from_pvh_memmap(start_info_ptr);
     yarm::arch::boot_entry::run_kernel_boot(run);
     unreachable!("kernel run loop should not return");
 }
