@@ -4117,6 +4117,53 @@ mod tests {
     }
 
     #[test]
+    fn capability_minted_in_process_cnode_is_visible_to_sibling_thread() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(710).expect("leader");
+        let sibling = state
+            .spawn_user_thread(710, 0xDEAD_2000, 0x8200_0000, 0x4010)
+            .expect("spawn sibling");
+        let cnode = state.task_cnode(710).expect("process cnode");
+        let cap = state
+            .mint_capability_in_cnode(
+                cnode,
+                Capability::new(CapObject::Kernel, CapRights::READ),
+            )
+            .expect("mint");
+
+        assert!(state.resolve_capability_for_task(710, cap).is_ok());
+        assert!(state.resolve_capability_for_task(sibling, cap).is_ok());
+    }
+
+    #[test]
+    fn capability_revoke_in_process_cnode_is_visible_to_sibling_thread() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(720).expect("leader");
+        let sibling = state
+            .spawn_user_thread(720, 0xDEAD_3000, 0x8300_0000, 0x4020)
+            .expect("spawn sibling");
+        let cnode = state.task_cnode(720).expect("process cnode");
+        let cap = state
+            .mint_capability_in_cnode(
+                cnode,
+                Capability::new(CapObject::Kernel, CapRights::READ),
+            )
+            .expect("mint");
+
+        state
+            .revoke_capability_in_cnode(cnode, cap)
+            .expect("revoke process cap");
+        assert_eq!(
+            state.resolve_capability_for_task(720, cap),
+            Err(KernelError::InvalidCapability)
+        );
+        assert_eq!(
+            state.resolve_capability_for_task(sibling, cap),
+            Err(KernelError::InvalidCapability)
+        );
+    }
+
+    #[test]
     fn direct_legacy_global_cspace_access_patterns_are_forbidden() {
         fn visit_rs_files(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
             let entries = std::fs::read_dir(root).expect("read_dir");
