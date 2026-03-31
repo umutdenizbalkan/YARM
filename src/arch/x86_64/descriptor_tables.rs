@@ -323,6 +323,18 @@ unsafe fn build_trap_frame_from_saved_regs(
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn write_trap_returns_to_saved_regs(
+    regs: *mut X86SavedRegs,
+    trap_frame: &crate::kernel::trapframe::TrapFrame,
+) {
+    let regs = unsafe { &mut *regs };
+    regs.rax = trap_frame.ret0 as u64;
+    regs.rbx = trap_frame.ret1 as u64;
+    regs.rdx = trap_frame.ret2 as u64;
+    regs.rcx = trap_frame.error as u64;
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_x86_dispatch_trap_from_stub(
     vector: u64,
@@ -375,6 +387,9 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         debug_uart_putc(b'e');
         debug_uart_hex_u64(error_code);
         halt_forever();
+    }
+    if vector as usize == VEC_SYSCALL {
+        write_trap_returns_to_saved_regs(regs, &trap_frame);
     }
 }
 
