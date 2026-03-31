@@ -907,6 +907,24 @@ impl KernelState {
         Err(KernelError::TaskTableFull)
     }
 
+    pub(crate) fn maybe_cleanup_process_cnode_for_pid(&mut self, pid: u64) {
+        let has_live_threads = self
+            .tcbs
+            .iter()
+            .flatten()
+            .any(|tcb| tcb.thread_group_id.0 == pid && tcb.status != TaskStatus::Dead);
+        if has_live_threads {
+            return;
+        }
+        if let Some(slot) = self
+            .process_cnodes
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|record| record.pid == pid))
+        {
+            *slot = None;
+        }
+    }
+
     pub fn current_task_capability(&self, cap: CapId) -> Option<Capability> {
         let cnode = self.current_task_cnode()?;
         self.capability_for_cnode(cnode, cap)
@@ -4079,6 +4097,23 @@ mod tests {
         state.mark_thread_detached(joiner).expect("detach");
         state.exit_task(joiner, 9).expect("exit detached");
         assert_eq!(state.task_status(joiner), Some(TaskStatus::Dead));
+    }
+
+    #[test]
+    fn process_cnode_entry_is_cleared_when_last_thread_is_dead() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(700).expect("leader");
+        let thread = state
+            .spawn_user_thread(700, 0xDEAD_1000, 0x8100_0000, 0x4000)
+            .expect("spawn thread");
+
+        assert!(state.process_cnode_for_pid(700).is_some());
+
+        state.mark_task_dead(thread).expect("dead thread");
+        assert!(state.process_cnode_for_pid(700).is_some());
+
+        state.mark_task_dead(700).expect("dead leader");
+        assert_eq!(state.process_cnode_for_pid(700), None);
     }
 
     #[test]

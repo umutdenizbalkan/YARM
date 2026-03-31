@@ -85,12 +85,17 @@ impl KernelState {
     }
 
     pub fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError> {
+        let process_pid = self
+            .thread_group_id(tid)
+            .map(|group| group.0)
+            .ok_or(KernelError::TaskMissing)?;
         {
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Dead;
             tcb.restart.token = None;
         }
         let _ = self.revoke_driver_runtime_caps(tid);
+        self.maybe_cleanup_process_cnode_for_pid(process_pid);
         Ok(())
     }
 }
