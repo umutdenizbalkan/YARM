@@ -4,7 +4,7 @@ use core::fmt;
 pub struct CapId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CNodeId(pub u16);
+pub struct CNodeId(pub u64);
 
 impl CapId {
     const INDEX_BITS: u64 = 16;

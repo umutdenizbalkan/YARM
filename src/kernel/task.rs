@@ -100,7 +100,7 @@ impl ThreadControlBlock {
     pub fn new(tid: ThreadId, class: TaskClass, asid: Option<Asid>) -> Self {
         Self {
             tid,
-            cnode: CNodeId(tid.0 as u16),
+            cnode: CNodeId(tid.0),
             thread_group_id: ThreadGroupId(tid.0),
             class,
             status: TaskStatus::Runnable,
@@ -157,5 +157,14 @@ mod tests {
         assert_eq!(tcb.user_context.instruction_ptr, VirtAddr(0x4000));
         assert_eq!(tcb.detach_state, ThreadDetachState::Joinable);
         assert_eq!(tcb.status, TaskStatus::Runnable);
+    }
+
+    #[test]
+    fn tcb_constructor_does_not_truncate_large_tid_for_cnode() {
+        let tid = ThreadId(70_000);
+        let tcb = ThreadControlBlock::new(tid, TaskClass::App, None);
+
+        assert_eq!(tcb.cnode, CNodeId(70_000));
+        assert_eq!(tcb.thread_group_id, ThreadGroupId(70_000));
     }
 }
