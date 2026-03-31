@@ -4068,6 +4068,41 @@ mod tests {
     }
 
     #[test]
+    fn kernel_switch_frame_can_be_initialized_for_thread() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(55).expect("task");
+
+        state
+            .set_thread_kernel_stack(55, 0x9000_0000, 0x9000_4000)
+            .expect("set stack");
+        state
+            .initialize_thread_kernel_switch_frame(55, 0x1234_5678)
+            .expect("init frame");
+
+        let context = state.thread_kernel_context(55).expect("context");
+        assert_eq!(context.stack_base, Some(VirtAddr(0x9000_0000)));
+        assert_eq!(context.stack_top, Some(VirtAddr(0x9000_4000)));
+        assert_eq!(context.frame.instruction_ptr, 0x1234_5678);
+        assert_eq!(context.frame.stack_ptr & 0xF, 0);
+        assert!(context.initialized);
+    }
+
+    #[test]
+    fn kernel_stack_configuration_rejects_invalid_bounds() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(56).expect("task");
+
+        assert_eq!(
+            state.set_thread_kernel_stack(56, 0x1000, 0x1000),
+            Err(KernelError::WrongObject)
+        );
+        assert_eq!(
+            state.initialize_thread_kernel_switch_frame(56, 0),
+            Err(KernelError::WrongObject)
+        );
+    }
+
+    #[test]
     fn join_blocks_until_target_exits_and_detached_threads_reap_on_exit() {
         let mut state = Bootstrap::init().expect("init");
         let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
@@ -4125,10 +4160,7 @@ mod tests {
             .expect("spawn sibling");
         let cnode = state.task_cnode(710).expect("process cnode");
         let cap = state
-            .mint_capability_in_cnode(
-                cnode,
-                Capability::new(CapObject::Kernel, CapRights::READ),
-            )
+            .mint_capability_in_cnode(cnode, Capability::new(CapObject::Kernel, CapRights::READ))
             .expect("mint");
 
         assert!(state.resolve_capability_for_task(710, cap).is_ok());
@@ -4144,10 +4176,7 @@ mod tests {
             .expect("spawn sibling");
         let cnode = state.task_cnode(720).expect("process cnode");
         let cap = state
-            .mint_capability_in_cnode(
-                cnode,
-                Capability::new(CapObject::Kernel, CapRights::READ),
-            )
+            .mint_capability_in_cnode(cnode, Capability::new(CapObject::Kernel, CapRights::READ))
             .expect("mint");
 
         state

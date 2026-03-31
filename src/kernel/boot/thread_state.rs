@@ -1,7 +1,8 @@
 use super::{KernelError, KernelState};
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{
-    RobustFutexState, TaskStatus, ThreadDetachState, ThreadGroupId, UserRegisterContext, WaitReason,
+    KernelExecutionContext, RobustFutexState, TaskStatus, ThreadDetachState, ThreadGroupId,
+    UserRegisterContext, WaitReason,
 };
 use crate::kernel::trapframe::TrapFrame;
 
@@ -37,6 +38,50 @@ impl KernelState {
             .flatten()
             .find(|tcb| tcb.tid.0 == tid)
             .map(|tcb| tcb.user_context)
+    }
+
+    pub fn thread_kernel_context(&self, tid: u64) -> Option<KernelExecutionContext> {
+        self.tcbs
+            .iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .map(|tcb| tcb.kernel_context)
+    }
+
+    pub fn set_thread_kernel_stack(
+        &mut self,
+        tid: u64,
+        stack_base: usize,
+        stack_top: usize,
+    ) -> Result<(), KernelError> {
+        if stack_base == 0 || stack_top == 0 || stack_base >= stack_top {
+            return Err(KernelError::WrongObject);
+        }
+        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        tcb.kernel_context.stack_base = Some(crate::kernel::vm::VirtAddr(stack_base as u64));
+        tcb.kernel_context.stack_top = Some(crate::kernel::vm::VirtAddr(stack_top as u64));
+        tcb.kernel_context.initialized = false;
+        Ok(())
+    }
+
+    pub fn initialize_thread_kernel_switch_frame(
+        &mut self,
+        tid: u64,
+        switch_entry: usize,
+    ) -> Result<(), KernelError> {
+        if switch_entry == 0 {
+            return Err(KernelError::WrongObject);
+        }
+        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        let stack_top = tcb
+            .kernel_context
+            .stack_top
+            .ok_or(KernelError::WrongObject)?
+            .0 as usize;
+        tcb.kernel_context.frame.stack_ptr = stack_top & !0xF;
+        tcb.kernel_context.frame.instruction_ptr = switch_entry;
+        tcb.kernel_context.initialized = true;
+        Ok(())
     }
 
     pub fn set_thread_user_context(

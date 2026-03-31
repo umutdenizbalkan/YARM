@@ -78,6 +78,26 @@ pub struct RestartState {
     pub token: Option<RestartToken>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KernelSwitchFrame {
+    pub stack_ptr: usize,
+    pub instruction_ptr: usize,
+    pub rbx: usize,
+    pub rbp: usize,
+    pub r12: usize,
+    pub r13: usize,
+    pub r14: usize,
+    pub r15: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KernelExecutionContext {
+    pub stack_base: Option<VirtAddr>,
+    pub stack_top: Option<VirtAddr>,
+    pub frame: KernelSwitchFrame,
+    pub initialized: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadControlBlock {
     pub tid: ThreadId,
@@ -93,6 +113,7 @@ pub struct ThreadControlBlock {
     /// `None` means fallback to kernel/class policy in `KernelState`.
     pub fault_policy_override: Option<FaultPolicy>,
     pub restart: RestartState,
+    pub kernel_context: KernelExecutionContext,
 }
 
 impl ThreadControlBlock {
@@ -110,6 +131,7 @@ impl ThreadControlBlock {
             detach_state: ThreadDetachState::Joinable,
             fault_policy_override: None,
             restart: RestartState::default(),
+            kernel_context: KernelExecutionContext::default(),
         }
     }
 }
@@ -146,6 +168,11 @@ mod tests {
         tcb.restart = RestartState {
             token: Some(RestartToken(9)),
         };
+        tcb.kernel_context.stack_base = Some(VirtAddr(0x9000));
+        tcb.kernel_context.stack_top = Some(VirtAddr(0xA000));
+        tcb.kernel_context.frame.stack_ptr = 0x9FF0;
+        tcb.kernel_context.frame.instruction_ptr = 0x1234;
+        tcb.kernel_context.initialized = true;
 
         assert_eq!(tcb.tid, ThreadId(7));
         assert_eq!(tcb.restart.token, Some(RestartToken(9)));
@@ -154,6 +181,8 @@ mod tests {
         assert_eq!(tcb.user_context.instruction_ptr, VirtAddr(0x4000));
         assert_eq!(tcb.detach_state, ThreadDetachState::Joinable);
         assert_eq!(tcb.status, TaskStatus::Runnable);
+        assert_eq!(tcb.kernel_context.stack_top, Some(VirtAddr(0xA000)));
+        assert!(tcb.kernel_context.initialized);
     }
 
     #[test]
