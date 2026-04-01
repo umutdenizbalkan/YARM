@@ -278,6 +278,7 @@ struct MemoryObject {
     len: usize,
     cap_refcount: u32,
     map_refcount: u32,
+    pin_refcount: u32,
 }
 
 #[derive(Debug)]
@@ -336,6 +337,7 @@ struct RobustFutexRecord {
 pub(crate) struct TransferEnvelope {
     pub(crate) source_tid: ThreadId,
     pub(crate) source_cap: CapId,
+    pub(crate) source_object: CapObject,
     pub(crate) endpoint: CapObject,
     pub(crate) receiver_tid: Option<ThreadId>,
     pub(crate) state: TransferState,
@@ -1092,10 +1094,18 @@ impl KernelState {
                     .saturating_add(1);
                 return None;
             }
+            let source_object = self
+                .resolve_capability_for_task(source_tid.0, source_cap)
+                .ok()?
+                .object;
+            if shared_region.is_some() {
+                self.adjust_memory_object_pin_refcount(source_object, 1);
+            }
             self.ipc.transfer_envelope_generations[idx] = generation;
             self.ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
                 source_tid,
                 source_cap,
+                source_object,
                 endpoint,
                 receiver_tid,
                 state: TransferState::Created,
@@ -1137,6 +1147,9 @@ impl KernelState {
             }
         }
         envelope = envelope.transition(TransferState::Released)?;
+        if envelope.shared_region.is_some() {
+            self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
+        }
         self.ipc.telemetry.transfer_records_materialized = self
             .ipc
             .telemetry
@@ -1417,6 +1430,25 @@ impl KernelState {
         }
     }
 
+    fn adjust_memory_object_pin_refcount(&mut self, object: CapObject, delta: i32) {
+        let id = match object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
+            _ => return,
+        };
+        let Some(slot) = self.memory_object_slot_by_id(id) else {
+            return;
+        };
+        if let Some(memory_object) = self.memory.memory_objects[slot].as_mut() {
+            if delta > 0 {
+                memory_object.pin_refcount =
+                    memory_object.pin_refcount.saturating_add(delta as u32);
+            } else {
+                memory_object.pin_refcount =
+                    memory_object.pin_refcount.saturating_sub((-delta) as u32);
+            }
+        }
+    }
+
     pub(crate) fn note_mapping_inserted(&mut self, phys: PhysAddr) {
         if let Some(slot) = self
             .memory
@@ -1454,7 +1486,10 @@ impl KernelState {
             return;
         };
 
-        if memory_object.cap_refcount != 0 || memory_object.map_refcount != 0 {
+        if memory_object.cap_refcount != 0
+            || memory_object.map_refcount != 0
+            || memory_object.pin_refcount != 0
+        {
             return;
         }
 
@@ -1957,6 +1992,7 @@ mod tests {
         let record = TransferEnvelope {
             source_tid: ThreadId(0),
             source_cap: CapId(1),
+            source_object: CapObject::Kernel,
             endpoint: CapObject::Kernel,
             receiver_tid: None,
             state: TransferState::Created,
@@ -1965,6 +2001,51 @@ mod tests {
         };
         assert!(record.transition(TransferState::MappedBoth).is_none());
         assert!(record.transition(TransferState::MappedReceiver).is_some());
+    }
+
+    #[test]
+    fn shared_transfer_pins_memory_object_until_materialized() {
+        let mut state = Bootstrap::init().expect("init");
+        let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                mem_cap,
+                endpoint,
+                None,
+                Some(TransferSharedRegion {
+                    offset: 0x2000,
+                    len: PAGE_SIZE as u64,
+                }),
+            )
+            .expect("stash");
+        let slot = state.memory_object_slot_by_id(mem_id).expect("slot");
+        let pinned = state.memory.memory_objects[slot].expect("object");
+        assert_eq!(pinned.pin_refcount, 1);
+
+        let cnode = state.current_task_cnode().expect("cnode");
+        state
+            .revoke_capability_in_cnode(cnode, mem_cap)
+            .expect("revoke");
+        assert!(
+            state.memory_object_slot_by_id(mem_id).is_some(),
+            "pinned object must remain alive after cap revoke"
+        );
+
+        let _ = state
+            .take_transfer_envelope(handle, endpoint, ThreadId(0))
+            .expect("materialize");
+        state.reclaim_memory_object_if_unreferenced(CapObject::MemoryObject { id: mem_id });
+        assert!(
+            state.memory_object_slot_by_id(mem_id).is_none(),
+            "object should reclaim after unpin + no cap/map refs"
+        );
     }
 
     #[test]

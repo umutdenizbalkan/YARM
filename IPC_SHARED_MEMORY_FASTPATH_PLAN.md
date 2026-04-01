@@ -16,10 +16,10 @@ revocation semantics suitable for sustained FS/network/display data-plane traffi
 
 ## Phase 1 — Transfer object model + metadata hardening
 
-- [ ] Introduce a dedicated shared-transfer kernel record type (transfer id, source tid, receiver tid, endpoint binding, memory object id / dma region id, byte range, rights mask, generation).
-- [ ] Extend descriptor validation (`offset`, `len`) with page alignment / overflow / bounds checks against the transferred memory object or DMA region.
-- [ ] Add explicit transfer states (`Created`, `MappedReceiver`, `MappedBoth`, `Released`, `Revoked`) and state transition guards.
-- [ ] Add telemetry counters for transfer creation/materialization/revocation/failures.
+- [x] Introduce a dedicated shared-transfer kernel record type (transfer id, source tid, receiver tid, endpoint binding, memory object id / dma region id, byte range, rights mask, generation).
+- [x] Extend descriptor validation (`offset`, `len`) with page alignment / overflow / bounds checks against the transferred memory object or DMA region.
+- [x] Add explicit transfer states (`Created`, `MappedReceiver`, `MappedBoth`, `Released`, `Revoked`) and state transition guards.
+- [x] Add telemetry counters for transfer creation/materialization/revocation/failures.
 
 Acceptance checks:
 - unit tests for malformed descriptors and illegal state transitions.
@@ -27,10 +27,10 @@ Acceptance checks:
 
 ## Phase 2 — Receiver auto-map plumbing
 
-- [ ] Add recv-side map request contract (target VA + map flags + optional fixed/anywhere policy).
-- [ ] On `IpcRecv` of `OPCODE_SHARED_MEM`, automatically map receiver pages from transferred capability according to policy.
-- [ ] Return mapping result metadata (mapped VA, mapped length, transfer id) through syscall return lanes.
-- [ ] Keep current descriptor return path as compatibility fallback behind a feature/ABI gate until migration is complete.
+- [x] Add recv-side map request contract (target VA + map flags + optional fixed/anywhere policy).
+- [x] On `IpcRecv` of `OPCODE_SHARED_MEM`, automatically map receiver pages from transferred capability according to policy.
+- [x] Return mapping result metadata (mapped VA, mapped length, transfer id) through syscall return lanes.
+- [x] Keep current descriptor return path as compatibility fallback behind a feature/ABI gate until migration is complete.
 
 Acceptance checks:
 - syscall tests proving map-on-receive success/failure behavior and deterministic error mapping.
@@ -38,7 +38,7 @@ Acceptance checks:
 
 ## Phase 3 — Sender/receiver dual-map + pinning lifecycle
 
-- [ ] Define pin/unpin rules for shared transfer frames while either side holds active mappings.
+- [x] Define pin/unpin rules for shared transfer frames while either side holds active mappings.
 - [ ] Ensure map refcounts are updated for both sides and survive task scheduling/restart boundaries.
 - [ ] Add unmap/release syscall path that drops active mapping references and transitions transfer state.
 
@@ -84,3 +84,9 @@ Each PR in this sequence should:
 2. Include focused tests for newly introduced state transitions and failure paths.
 3. Preserve backward compatibility until Phase 6 cleanup.
 4. Update this checklist with completed items and links to landed commits/PRs.
+
+## Progress notes
+
+- Phase 1 landed in PRs up to commit `5460f97`.
+- Phase 2 landed in PRs up to commit `7d1ab28`.
+- Current pass starts Phase 3 with transfer pin/unpin lifecycle groundwork.

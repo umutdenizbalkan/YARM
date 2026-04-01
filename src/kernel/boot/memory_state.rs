@@ -119,6 +119,7 @@ impl KernelState {
             len,
             cap_refcount: 0,
             map_refcount: 0,
+            pin_refcount: 0,
         });
 
         let cap = self.mint_capability_for_current_context(Capability::new(
