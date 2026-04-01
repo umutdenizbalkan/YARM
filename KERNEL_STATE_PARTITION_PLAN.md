@@ -1,0 +1,55 @@
+# KernelState partition plan (incremental)
+
+This document captures the concrete next steps for splitting `KernelState`
+into independently lockable domains while preserving behavior.
+
+## Phase 1 (this change)
+
+- Add explicit lock boundaries for scheduler-facing and IPC-mailbox-facing paths:
+  - `scheduler_state_lock: SpinLockIrq<()>`
+  - `ipc_state_lock: SpinLockIrq<()>`
+- Use `scheduler_state_lock` in scheduler entry points (`bring_up_cpu`,
+  dispatch/preempt/block paths, and enqueue paths) so scheduler mutations are
+  serialized through a dedicated lock domain.
+- Use `ipc_state_lock` in cross-CPU mailbox submit/drain entry points.
+
+## Phase 2
+
+- Extract `SchedulerState` into a dedicated struct:
+  - `scheduler: SmpScheduler`
+  - `timer: Timer`
+  - `current_cpu: CpuId`
+- Store as `SpinLockIrq<SchedulerState>` in `KernelState`.
+- Migrate scheduler call sites to lock the scheduler state explicitly and
+  remove direct field access.
+
+## Phase 3
+
+- Extract `IpcState` into a dedicated struct:
+  - endpoint tables/waiters/routes/envelopes
+  - IPC telemetry
+  - cross-CPU mailbox
+- Store as `SpinLockIrq<IpcState>` in `KernelState`.
+- Migrate IPC call sites to lock IPC state explicitly.
+
+## Phase 4
+
+- Extract VM/memory/task domains into additional lockable partitions:
+  - `VmState` (`kernel_aspace`, `user_spaces`)
+  - `TaskState` (`tcbs`, tls restore queue, robust futex state)
+  - `MemoryState` (allocator, memory objects, brk regions)
+- Introduce lock ordering rules and a small helper API to avoid deadlocks.
+
+## Lock ordering (proposed)
+
+To avoid deadlocks as partitioning progresses, acquire in this order:
+
+1. scheduler
+2. task
+3. ipc
+4. vm
+5. memory
+6. driver/fault/restart (if split further)
+
+No function should acquire a lock earlier in the order after acquiring a later
+one.

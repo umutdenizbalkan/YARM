@@ -37,6 +37,7 @@ use crate::kernel::frame_allocator::{
     MemoryRegion, PhysicalFrameAllocator, init_pt_frame_allocator,
 };
 use crate::kernel::ipc::ThreadId;
+use crate::kernel::lock::SpinLockIrq;
 #[cfg(feature = "hosted-dev")]
 use crate::std::collections::BTreeMap;
 
@@ -490,6 +491,8 @@ pub struct KernelState {
     pub timer: Timer,
     pub user_spaces: KernelStorage<AddressSpaceManager>,
     current_cpu: CpuId,
+    scheduler_state_lock: SpinLockIrq<()>,
+    ipc_state_lock: SpinLockIrq<()>,
     ipc: KernelStorage<IpcSubsystem>,
     cnode_spaces: KernelStorage<[Option<CNodeSpace>; MAX_TASKS]>,
     process_cnodes: KernelStorage<[Option<ProcessCNodeRecord>; MAX_TASKS]>,
@@ -713,6 +716,8 @@ impl Bootstrap {
             timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: store_kernel_value(AddressSpaceManager::default()),
             current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
+            scheduler_state_lock: SpinLockIrq::new(()),
+            ipc_state_lock: SpinLockIrq::new(()),
             ipc: store_kernel_value(IpcSubsystem {
                 cross_cpu_work: SmpMailbox::default(),
                 endpoints: [const { None }; MAX_ENDPOINTS],

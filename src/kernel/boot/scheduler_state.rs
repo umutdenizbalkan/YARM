@@ -15,6 +15,7 @@ fn map_smp_error(err: SmpError) -> KernelError {
 
 impl KernelState {
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler
             .bring_up_cpu(cpu)
             .map_err(map_scheduler_error)?;
@@ -23,6 +24,7 @@ impl KernelState {
     }
 
     pub fn set_current_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler
             .validate_online_cpu(cpu)
             .map_err(map_scheduler_error)?;
@@ -35,24 +37,28 @@ impl KernelState {
     }
 
     pub fn current_tid(&self) -> Option<u64> {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler
             .current_tid_on(self.current_cpu)
             .map(|tid| tid.0)
     }
 
     pub fn dispatch_next_current_cpu(&mut self) -> Option<u64> {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler
             .dispatch_next_on(self.current_cpu)
             .map(|tid| tid.0)
     }
 
     pub fn on_preempt_current_cpu(&mut self) -> Option<u64> {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler
             .on_preempt_on(self.current_cpu)
             .map(|tid| tid.0)
     }
 
     pub fn block_current_cpu(&mut self) -> Option<u64> {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler
             .block_current_on(self.current_cpu)
             .map(|tid| tid.0)
@@ -63,22 +69,27 @@ impl KernelState {
     }
 
     pub fn online_cpu_count(&self) -> usize {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler.online_cpu_count()
     }
 
     pub fn present_cpu_count(&self) -> usize {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler.present_cpu_count()
     }
 
     pub fn present_cpu_bitmap(&self) -> u64 {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler.present_cpu_bitmap()
     }
 
     pub fn online_cpu_bitmap(&self) -> u64 {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler.online_cpu_bitmap()
     }
 
     pub fn program_timer_deadline_current_cpu(&mut self, ticks_from_now: u64) {
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.hal
             .program_timer_deadline(self.current_cpu, ticks_from_now);
     }
@@ -127,6 +138,7 @@ impl KernelState {
     pub(crate) fn enqueue_task(&mut self, tid: u64) -> Result<CpuId, KernelError> {
         self.ensure_driver_affinity(tid)?;
         let priority = self.task_priority(tid)?;
+        let _sched_guard = self.scheduler_state_lock.lock();
         if let Some(cpu) = self.task_cpu_affinity(tid)? {
             self.scheduler
                 .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
@@ -141,12 +153,14 @@ impl KernelState {
 
     pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
         let priority = self.task_priority(tid)?;
+        let _sched_guard = self.scheduler_state_lock.lock();
         self.scheduler
             .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
             .map_err(map_scheduler_error)
     }
 
     pub fn submit_cross_cpu_work(&self, cpu: CpuId, item: WorkItem) -> Result<(), KernelError> {
+        let _ipc_guard = self.ipc_state_lock.lock();
         self.ipc
             .cross_cpu_work
             .send_to(cpu, item)
@@ -154,6 +168,7 @@ impl KernelState {
     }
 
     pub fn drain_cross_cpu_work(&self) -> Result<Option<WorkItem>, KernelError> {
+        let _ipc_guard = self.ipc_state_lock.lock();
         self.ipc
             .cross_cpu_work
             .take_for_cpu(self.current_cpu)
