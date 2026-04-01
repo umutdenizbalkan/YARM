@@ -172,7 +172,7 @@ with task/ipc/vm/memory paths while preserving behavior.
 - Focused driver-registration/delegation tests continue to validate behavior
   under the new lock domain.
 
-### Phase 6b (planned): Fault domain extraction
+### Phase 6b (completed in this pass): Fault domain extraction
 
 - Extract `FaultState` from `KernelState` fields currently used by
   `boot/fault_state.rs` and supervisor fault-reporting paths.
@@ -182,8 +182,11 @@ with task/ipc/vm/memory paths while preserving behavior.
   - `with_fault_state_mut(...)`
 - Migrate fault recording/reporting/policy call paths to the fault accessor
   layer and keep trap hot paths minimal.
-- Add tests for fault-policy behavior and supervisor notification wiring under
-  extracted fault state.
+- Migrate adjacent supervisor-endpoint and endpoint-destroy interactions in
+  `boot/scheduler_state.rs`, `boot/restart_state.rs`, and `boot/ipc_state.rs`
+  to fault accessors.
+- Fault-policy and supervisor notification tests continue to validate behavior
+  under extracted fault state.
 
 ### Phase 6c (planned): Restart domain extraction + lock-order hardening
 

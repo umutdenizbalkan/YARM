@@ -11,7 +11,7 @@ impl KernelState {
         code: u64,
         restart_token: u64,
     ) -> Result<(), KernelError> {
-        let Some(endpoint_idx) = self.faults.supervisor_endpoint else {
+        let Some(endpoint_idx) = self.with_fault_state(|faults| faults.supervisor_endpoint) else {
             return Ok(());
         };
         let msg = task_exited_message(
@@ -43,7 +43,7 @@ impl KernelState {
         base: u64,
         len: u64,
     ) -> Result<(), KernelError> {
-        let Some(endpoint_idx) = self.faults.supervisor_endpoint else {
+        let Some(endpoint_idx) = self.with_fault_state(|faults| faults.supervisor_endpoint) else {
             return Ok(());
         };
         let msg = transfer_revoked_message(

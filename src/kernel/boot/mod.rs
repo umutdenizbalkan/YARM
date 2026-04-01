@@ -498,6 +498,7 @@ pub struct KernelState {
     scheduler_state: SpinLockIrq<SchedulerState>,
     ipc_state_lock: SpinLockIrq<()>,
     driver_state_lock: SpinLockIrq<()>,
+    fault_state_lock: SpinLockIrq<()>,
     vm_state_lock: SpinLockIrq<()>,
     task_state_lock: SpinLockIrq<()>,
     memory_state_lock: SpinLockIrq<()>,
@@ -513,7 +514,7 @@ pub struct KernelState {
     capacity_profile: KernelCapacityProfile,
     tlb_shootdown_count: u64,
     tlb_shootdown_timeout_count: u64,
-    faults: FaultSubsystem,
+    faults: KernelStorage<FaultSubsystem>,
     restart: RestartSubsystem,
     delegated_capability_links:
         KernelStorage<[Option<DelegatedCapabilityLink>; MAX_DELEGATED_CAPABILITY_LINKS]>,
@@ -598,6 +599,16 @@ impl KernelState {
     fn with_driver_state_mut<R>(&mut self, f: impl FnOnce(&mut DriverSubsystem) -> R) -> R {
         let _driver_guard = self.driver_state_lock.lock();
         f(kernel_mut(&mut self.drivers))
+    }
+
+    fn with_fault_state<R>(&self, f: impl FnOnce(&FaultSubsystem) -> R) -> R {
+        let _fault_guard = self.fault_state_lock.lock();
+        f(kernel_ref(&self.faults))
+    }
+
+    fn with_fault_state_mut<R>(&mut self, f: impl FnOnce(&mut FaultSubsystem) -> R) -> R {
+        let _fault_guard = self.fault_state_lock.lock();
+        f(kernel_mut(&mut self.faults))
     }
 
     fn with_scheduler_then_ipc<R>(
@@ -836,6 +847,7 @@ impl Bootstrap {
             }),
             ipc_state_lock: SpinLockIrq::new(()),
             driver_state_lock: SpinLockIrq::new(()),
+            fault_state_lock: SpinLockIrq::new(()),
             vm_state_lock: SpinLockIrq::new(()),
             task_state_lock: SpinLockIrq::new(()),
             memory_state_lock: SpinLockIrq::new(()),
@@ -875,12 +887,12 @@ impl Bootstrap {
             capacity_profile,
             tlb_shootdown_count: 0,
             tlb_shootdown_timeout_count: 0,
-            faults: FaultSubsystem {
+            faults: store_kernel_value(FaultSubsystem {
                 last_fault: None,
                 fault_handler_endpoint: None,
                 supervisor_endpoint: None,
                 fault_policy: FaultPolicy::KillTask,
-            },
+            }),
             restart: RestartSubsystem {
                 next_restart_token: 1,
             },
@@ -1929,15 +1941,15 @@ impl KernelState {
     }
 
     pub fn last_fault(&self) -> Option<FaultInfo> {
-        self.faults.last_fault
+        self.with_fault_state(|faults| faults.last_fault)
     }
 
     pub fn clear_last_fault(&mut self) {
-        self.faults.last_fault = None;
+        self.with_fault_state_mut(|faults| faults.last_fault = None);
     }
 
     pub fn record_fault(&mut self, fault: FaultInfo) {
-        self.faults.last_fault = Some(fault);
+        self.with_fault_state_mut(|faults| faults.last_fault = Some(fault));
     }
 
     pub fn set_fault_handler(&mut self, recv_cap: CapId) -> Result<(), KernelError> {
@@ -1959,16 +1971,16 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-        self.faults.fault_handler_endpoint = Some(endpoint_idx);
+        self.with_fault_state_mut(|faults| faults.fault_handler_endpoint = Some(endpoint_idx));
         Ok(())
     }
 
     pub fn set_fault_policy(&mut self, policy: FaultPolicy) {
-        self.faults.fault_policy = policy;
+        self.with_fault_state_mut(|faults| faults.fault_policy = policy);
     }
 
     pub fn fault_policy(&self) -> FaultPolicy {
-        self.faults.fault_policy
+        self.with_fault_state(|faults| faults.fault_policy)
     }
 
     pub fn set_task_fault_policy(
@@ -1987,7 +1999,7 @@ impl KernelState {
                 .flatten()
                 .find(|tcb| tcb.tid.0 == tid)
                 .and_then(|tcb| tcb.fault_policy_override)
-                .unwrap_or(self.faults.fault_policy)
+                .unwrap_or(self.with_fault_state(|faults| faults.fault_policy))
         })
     }
 
@@ -2018,7 +2030,7 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-        self.faults.supervisor_endpoint = Some(endpoint_idx);
+        self.with_fault_state_mut(|faults| faults.supervisor_endpoint = Some(endpoint_idx));
         Ok(())
     }
 

@@ -196,7 +196,7 @@ impl KernelState {
     }
 
     fn escalate_tlb_shootdown_timeout(&mut self, timed_out: usize) -> Result<(), KernelError> {
-        let Some(endpoint_idx) = self.faults.supervisor_endpoint else {
+        let Some(endpoint_idx) = self.with_fault_state(|faults| faults.supervisor_endpoint) else {
             return Ok(());
         };
         let mut payload = [0u8; 16];

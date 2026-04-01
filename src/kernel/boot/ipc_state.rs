@@ -185,9 +185,11 @@ impl KernelState {
             ipc.endpoint_generations[endpoint_idx] = next_generation;
             Ok(())
         })?;
-        if self.faults.fault_handler_endpoint == Some(endpoint_idx) {
-            self.faults.fault_handler_endpoint = None;
-        }
+        self.with_fault_state_mut(|faults| {
+            if faults.fault_handler_endpoint == Some(endpoint_idx) {
+                faults.fault_handler_endpoint = None;
+            }
+        });
         Ok(())
     }
 
