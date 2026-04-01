@@ -1689,6 +1689,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn selected_arch_trap_entry_external_limit_vector_is_not_routed_as_irq() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_notif_idx, notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
+        let first_unmapped_irq = 16u16; // vector 0x30 is not in the decoded external IRQ range
+        state
+            .bind_irq_notification(first_unmapped_irq, notif_cap)
+            .expect("bind");
+        let ctx = crate::arch::trap_entry::ArchTrapContext {
+            vector: 0x30,
+            error_code: 0,
+            fault_addr: 0,
+        };
+
+        state
+            .handle_selected_arch_trap_entry(CpuId(0), ctx, None)
+            .expect("trap");
+
+        let msg = state.try_ipc_recv(notif_recv_cap).expect("probe");
+        assert!(msg.is_none());
+    }
+
+    #[test]
     fn bootstrap_sets_minimal_kernel_state() {
         let state = Bootstrap::init().expect("bootstrap should fit static limits");
         assert_eq!(state.kernel_aspace.mappings(), 1);
