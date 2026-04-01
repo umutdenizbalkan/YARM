@@ -68,9 +68,9 @@ Acceptance checks:
 
 ## Phase 6 — Contract freeze + migration cleanup
 
-- [ ] Freeze shared-transfer ABI fields and lifecycle semantics.
-- [ ] Remove compatibility fallback once all consumers migrate to auto-map path.
-- [ ] Publish integration guides for FS/network/display servers.
+- [x] Freeze shared-transfer ABI fields and lifecycle semantics.
+- [x] Remove compatibility fallback once all consumers migrate to auto-map path.
+- [x] Publish integration guides for FS/network/display servers.
 
 Acceptance checks:
 - ABI freeze document update.
@@ -92,3 +92,4 @@ Each PR in this sequence should:
 - Current pass completes Phase 4 by emitting structured transfer-revocation events to the supervisor fault endpoint while preserving forced-unmap semantics.
 - Phase 5 started with transfer-volume telemetry (`shared_mem_bytes_mapped`, `shared_mem_bytes_released`, `transfer_release_calls`) and a repeated map/release throughput smoke harness in syscall tests.
 - Phase 5 completed with batching/ring usage guidance (`SHARED_IPC_THROUGHPUT_GUIDE.md`) and a `TransferRelease` active-mapping fast path (`ptr=0`, `len=0`) that avoids userspace rematerialization of mapping bounds on steady-state recycle loops.
+- Phase 6 freezes the ABI/behavior at v6, removes user-mode descriptor-only shared-memory recv fallback, and publishes migration guidance in `SHARED_IPC_MIGRATION_GUIDE.md`.

@@ -1,6 +1,6 @@
-# YARM Syscall ABI v4 (Frozen Contract)
+# YARM Syscall ABI v6 (Frozen Contract)
 
-- ABI Version: `4`
+- ABI Version: `6`
 - Syscall count: `5`
 
 ## Syscall numbers
@@ -14,7 +14,7 @@
 ## Argument register layout (`args[0..]`)
 
 - `args[0]`: endpoint capability id
-- `args[1]`: user pointer (small copy path) or shared-region offset (grant path)
+- `args[1]`: user pointer (small copy path) or shared-region sender offset (grant path)
 - `args[2]`: length
 - `args[3]`: inline payload lane 0 (kernel/no-ASID path) and recv metadata lane 0
 - `args[4]`: inline payload lane 1 (kernel/no-ASID path) and recv metadata lane 1
@@ -29,9 +29,6 @@
 - `args[4]`: reserved (must be `0`)
 - `args[5]`: reserved (must be `0`)
 
-This syscall is intentionally YARM-native so Linux-compat `mmap` can keep Linux
-argument order instead of repurposing `arg0` for capabilities.
-
 ### `TransferRelease` argument layout
 
 - `args[0]`: receiver-local transferred capability id (`CapId`)
@@ -39,21 +36,22 @@ argument order instead of repurposing `arg0` for capabilities.
 - `args[2]`: mapped length in bytes (rounded up to page size by kernel)
 - `args[3..5]`: reserved (must be `0`)
 
+`TransferRelease` fast path for steady-state recycle loops:
+
+- `args[1]=0` and `args[2]=0` means “release via active mapping record”.
+- Kernel looks up the receiver’s active transfer mapping for `args[0]` and unmaps/revokes using recorded bounds.
+
 ## IPC model details
 
 - **Synchronous rendezvous-friendly path**: small payloads (up to register lanes) can be passed through register lanes without kernel-side user-buffer copying on kernel/no-ASID paths.
 - **Capability transfer opportunity on each IPC**: send can optionally attach a capability; recv returns transferred cap id in `ret2`.
-- **Large payload zero-copy descriptor path**: if send length exceeds `Message::MAX_PAYLOAD`, sender provides a transferable memory capability and the kernel sends a shared-memory descriptor (`offset`,`len`) as payload metadata instead of copying bytes.
+- **Large payload shared-memory path**: if send length exceeds `Message::MAX_PAYLOAD`, sender provides a transferable memory capability and kernel sends `OPCODE_SHARED_MEM` metadata (`SharedMemoryRegion { offset, len }`).
 
-### Shared-memory transfer status (current)
+## Shared-memory contract freeze (Phase 6)
 
-- `Message::MAX_PAYLOAD` is fixed at 64 bytes for inline IPC envelopes.
-- `OPCODE_SHARED_MEM` plus `SharedMemoryRegion { offset, len }` is implemented for large-send metadata.
-- Transfer-envelope handling and capability materialization on `IpcRecv` are implemented, so the receiver can obtain a delegated memory capability.
-- **Not yet implemented as an end-to-end fast path**: automatic/map-on-receive plumbing that wires the shared region into both communicating address spaces with lifecycle + revocation semantics suitable for sustained filesystem/network/display data-plane throughput.
-
-In short: descriptor + cap handoff is present, but production-grade shared-memory
-data-plane mapping policy/mechanics are still a critical remaining milestone.
+- For user tasks (tasks with a bound user ASID), `IpcRecv` for `OPCODE_SHARED_MEM` **requires** a non-zero mapping target pointer and sufficient length budget.
+- Compatibility descriptor-only receive fallback has been removed for user-mode shared-memory receives.
+- Receiver-side auto-map + active mapping tracking + `TransferRelease` lifecycle is the required migration path.
 
 ## Return layout
 
@@ -73,7 +71,6 @@ data-plane mapping policy/mechanics are still a critical remaining milestone.
 - `7`: `WouldBlock`
 - `8`: `PageFault`
 - `255`: `Internal`
-
 
 ## Per-ISA shape source of truth
 

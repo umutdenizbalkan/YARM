@@ -8,7 +8,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
 
-pub const SYSCALL_ABI_VERSION: u16 = 5;
+pub const SYSCALL_ABI_VERSION: u16 = 6;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
@@ -505,41 +505,32 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                         .ok_or(SyscallError::InvalidArgs)?;
                     let region_len =
                         usize::try_from(desc.len).map_err(|_| SyscallError::InvalidArgs)?;
-                    if user_ptr != 0 {
-                        if user_len < region_len {
-                            return Err(SyscallError::InvalidArgs);
-                        }
-                        let transfer_cap_raw =
-                            u64::try_from(frame.ret2()).map_err(|_| SyscallError::InvalidArgs)?;
-                        if transfer_cap_raw == SYSCALL_NO_TRANSFER_CAP {
-                            return Err(SyscallError::InvalidArgs);
-                        }
-                        let transfer_cap = CapId(transfer_cap_raw);
-                        let (mapped_va, mapped_len) = map_shared_region_into_receiver(
-                            kernel,
-                            transfer_cap,
-                            user_ptr,
-                            region_len,
-                        )?;
-                        kernel
-                            .register_active_transfer_mapping(
-                                crate::kernel::ipc::ThreadId(receiver_tid),
-                                transfer_cap,
-                                VirtAddr(mapped_va as u64),
-                                mapped_len,
-                            )
-                            .map_err(SyscallError::from)?;
-                        kernel.note_shared_mem_mapped(mapped_len);
-                        frame.set_ok(sender, mapped_len, frame.ret2());
-                        frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, mapped_va);
-                        frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, region_len);
-                        return Ok(());
+                    if user_ptr == 0 || user_len < region_len {
+                        return Err(SyscallError::InvalidArgs);
                     }
-                    frame.set_ok(sender, region_len, frame.ret2());
-                    frame.set_arg(
-                        SYSCALL_ARG_INLINE_PAYLOAD0,
-                        usize::try_from(desc.offset).map_err(|_| SyscallError::InvalidArgs)?,
-                    );
+                    let transfer_cap_raw =
+                        u64::try_from(frame.ret2()).map_err(|_| SyscallError::InvalidArgs)?;
+                    if transfer_cap_raw == SYSCALL_NO_TRANSFER_CAP {
+                        return Err(SyscallError::InvalidArgs);
+                    }
+                    let transfer_cap = CapId(transfer_cap_raw);
+                    let (mapped_va, mapped_len) = map_shared_region_into_receiver(
+                        kernel,
+                        transfer_cap,
+                        user_ptr,
+                        region_len,
+                    )?;
+                    kernel
+                        .register_active_transfer_mapping(
+                            crate::kernel::ipc::ThreadId(receiver_tid),
+                            transfer_cap,
+                            VirtAddr(mapped_va as u64),
+                            mapped_len,
+                        )
+                        .map_err(SyscallError::from)?;
+                    kernel.note_shared_mem_mapped(mapped_len);
+                    frame.set_ok(sender, mapped_len, frame.ret2());
+                    frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, mapped_va);
                     frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, region_len);
                     return Ok(());
                 }
@@ -665,7 +656,7 @@ mod tests {
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
-        assert_eq!(SYSCALL_ABI_VERSION, 5);
+        assert_eq!(SYSCALL_ABI_VERSION, 6);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
         assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4);
@@ -944,6 +935,52 @@ mod tests {
             [recv_cap.0 as usize, 0x8000, Message::MAX_PAYLOAD, 0, 0, 0],
         );
         let err = dispatch(&mut state, &mut recv).expect_err("len budget too small");
+        assert_eq!(err, SyscallError::InvalidArgs);
+    }
+
+    #[test]
+    fn syscall_recv_shared_mem_requires_nonzero_map_target() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send).expect("send");
+        state.yield_current().expect("switch receiver");
+
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, Message::MAX_PAYLOAD + 16, 0, 0, 0],
+        );
+        let err = dispatch(&mut state, &mut recv).expect_err("zero map target");
         assert_eq!(err, SyscallError::InvalidArgs);
     }
 
