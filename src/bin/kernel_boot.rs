@@ -306,11 +306,13 @@ fn run_process_vfs_smoke() {
         init::InitRuntimeBootConfig::baseline(),
     )
     .expect("minimum runnable profile");
+    let dispatched = kernel.dispatch_ready_task().expect("dispatch");
     yarm::yarm_log!(
-        "YARM_INIT_RUNTIME phase={:?} supervisor_managed={} initramfs_reads={}",
+        "YARM_INIT_RUNTIME phase={:?} supervisor_managed={} initramfs_reads={} dispatched_tid={:?}",
         summary.init_phase,
         summary.supervisor_managed_services,
-        summary.initramfs_handled
+        summary.initramfs_handled,
+        dispatched
     );
     yarm::yarm_log!("YARM_INIT_DONE");
 }

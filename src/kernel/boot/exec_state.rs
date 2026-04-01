@@ -147,6 +147,10 @@ impl KernelState {
         Ok(next)
     }
 
+    pub fn dispatch_ready_task(&mut self) -> Result<Option<u64>, KernelError> {
+        self.dispatch_next_task()
+    }
+
     pub fn yield_current(&mut self) -> Result<(), KernelError> {
         let outgoing_tid = self.current_tid();
         let outgoing_asid = outgoing_tid.and_then(|tid| self.task_asid(tid));
