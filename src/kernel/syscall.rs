@@ -1,4 +1,4 @@
-use super::boot::{KernelError, KernelState};
+use super::boot::{KernelError, KernelState, TransferSharedRegion};
 use super::capabilities::{CapId, CapObject, CapRights};
 use super::ipc::{
     IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
@@ -227,6 +227,7 @@ fn stash_transfer_handle(
     kernel: &mut KernelState,
     transfer_cap: Option<CapId>,
     endpoint: CapObject,
+    shared_region: Option<TransferSharedRegion>,
 ) -> Result<Option<u64>, SyscallError> {
     let Some(source_cap_id) = transfer_cap else {
         return Ok(None);
@@ -245,6 +246,7 @@ fn stash_transfer_handle(
                 source_cap_id,
                 endpoint,
                 Some(receiver_tid),
+                shared_region,
             )
             .ok_or(SyscallError::QueueFull)?,
     ))
@@ -325,7 +327,15 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
             };
-            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
+            let transfer_handle = stash_transfer_handle(
+                kernel,
+                transfer_cap,
+                endpoint,
+                Some(TransferSharedRegion {
+                    offset: region.offset,
+                    len: region.len,
+                }),
+            )?;
             Message::with_header(
                 sender_tid,
                 OPCODE_SHARED_MEM,
@@ -344,7 +354,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 Err(other) => return Err(SyscallError::from(other)),
             };
 
-            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
+            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
             Message::with_header(
                 sender_tid,
                 OPCODE_INLINE,
@@ -372,7 +382,15 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
             };
-            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
+            let transfer_handle = stash_transfer_handle(
+                kernel,
+                transfer_cap,
+                endpoint,
+                Some(TransferSharedRegion {
+                    offset: region.offset,
+                    len: region.len,
+                }),
+            )?;
             Message::with_header(
                 sender_tid,
                 OPCODE_SHARED_MEM,
@@ -383,7 +401,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             .map_err(|_| SyscallError::InvalidArgs)
         } else {
             let payload = inline_payload_from_frame(frame, len)?;
-            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint)?;
+            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
             Message::with_header(
                 sender_tid,
                 OPCODE_INLINE,

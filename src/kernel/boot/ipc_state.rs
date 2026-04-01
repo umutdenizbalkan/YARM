@@ -485,6 +485,7 @@ impl KernelState {
                 transfer_cap,
                 send_capability.object,
                 Some(waiter_tid),
+                None,
             )
             .ok_or(KernelError::EndpointQueueFull)?;
         let msg = Message::with_header(

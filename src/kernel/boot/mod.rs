@@ -230,6 +230,10 @@ pub struct IpcPathTelemetry {
     pub queued_sends: u64,
     pub blocked_sends: u64,
     pub rendezvous_handoffs: u64,
+    pub transfer_records_created: u64,
+    pub transfer_records_materialized: u64,
+    pub transfer_records_revoked: u64,
+    pub transfer_record_failures: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +338,50 @@ pub(crate) struct TransferEnvelope {
     pub(crate) source_cap: CapId,
     pub(crate) endpoint: CapObject,
     pub(crate) receiver_tid: Option<ThreadId>,
+    pub(crate) state: TransferState,
+    pub(crate) shared_region: Option<TransferSharedRegion>,
+    pub(crate) generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransferSharedRegion {
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum TransferState {
+    Created,
+    MappedReceiver,
+    MappedBoth,
+    Released,
+    Revoked,
+}
+
+impl TransferEnvelope {
+    fn transition(self, next: TransferState) -> Option<Self> {
+        use TransferState::*;
+        let legal = matches!(
+            (self.state, next),
+            (Created, MappedReceiver)
+                | (Created, Released)
+                | (Created, Revoked)
+                | (MappedReceiver, MappedBoth)
+                | (MappedReceiver, Released)
+                | (MappedReceiver, Revoked)
+                | (MappedBoth, Released)
+                | (MappedBoth, Revoked)
+                | (Released, Revoked)
+        );
+        if !legal {
+            return None;
+        }
+        Some(Self {
+            state: next,
+            ..self
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1023,6 +1071,7 @@ impl KernelState {
         source_cap: CapId,
         endpoint: CapObject,
         receiver_tid: Option<ThreadId>,
+        shared_region: Option<TransferSharedRegion>,
     ) -> Option<u64> {
         for idx in 0..MAX_TRANSFER_ENVELOPES {
             if self.ipc.transfer_envelopes[idx].is_some() {
@@ -1032,13 +1081,32 @@ impl KernelState {
             if generation == 0 {
                 generation = 1;
             }
+            if self
+                .validate_transfer_record_metadata(source_tid, source_cap, shared_region)
+                .is_err()
+            {
+                self.ipc.telemetry.transfer_record_failures = self
+                    .ipc
+                    .telemetry
+                    .transfer_record_failures
+                    .saturating_add(1);
+                return None;
+            }
             self.ipc.transfer_envelope_generations[idx] = generation;
             self.ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
                 source_tid,
                 source_cap,
                 endpoint,
                 receiver_tid,
+                state: TransferState::Created,
+                shared_region,
+                generation,
             });
+            self.ipc.telemetry.transfer_records_created = self
+                .ipc
+                .telemetry
+                .transfer_records_created
+                .saturating_add(1);
             let idx_part = u64::try_from(idx).ok()?;
             return Some((generation << 16) | idx_part);
         }
@@ -1059,7 +1127,7 @@ impl KernelState {
         if generation == 0 || self.ipc.transfer_envelope_generations[idx] != generation {
             return None;
         }
-        let envelope = self.ipc.transfer_envelopes[idx]?;
+        let mut envelope = self.ipc.transfer_envelopes[idx]?;
         if envelope.endpoint != endpoint {
             return None;
         }
@@ -1068,8 +1136,60 @@ impl KernelState {
                 return None;
             }
         }
+        envelope = envelope.transition(TransferState::Released)?;
+        self.ipc.telemetry.transfer_records_materialized = self
+            .ipc
+            .telemetry
+            .transfer_records_materialized
+            .saturating_add(1);
         self.ipc.transfer_envelopes[idx] = None;
         Some(envelope)
+    }
+
+    fn validate_transfer_record_metadata(
+        &self,
+        source_tid: ThreadId,
+        source_cap: CapId,
+        shared_region: Option<TransferSharedRegion>,
+    ) -> Result<(), KernelError> {
+        let capability = self.resolve_capability_for_task(source_tid.0, source_cap)?;
+        let Some(region) = shared_region else {
+            return Ok(());
+        };
+        if region.len == 0 {
+            return Err(KernelError::WrongObject);
+        }
+        let end = region
+            .offset
+            .checked_add(region.len)
+            .ok_or(KernelError::WrongObject)?;
+        match capability.object {
+            CapObject::MemoryObject { id } => {
+                let mem = self
+                    .memory
+                    .memory_objects
+                    .iter()
+                    .flatten()
+                    .find(|entry| entry.id == id)
+                    .ok_or(KernelError::MemoryObjectMissing)?;
+                let max_len = u64::try_from(mem.len).map_err(|_| KernelError::WrongObject)?;
+                if region.len > max_len || end < region.offset {
+                    return Err(KernelError::WrongObject);
+                }
+            }
+            CapObject::DmaRegion {
+                offset: base,
+                len: span,
+                ..
+            } => {
+                let cap_end = base.checked_add(span).ok_or(KernelError::WrongObject)?;
+                if region.offset < base || end > cap_end {
+                    return Err(KernelError::WrongObject);
+                }
+            }
+            _ => return Err(KernelError::WrongObject),
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1554,6 +1674,7 @@ impl KernelState {
 mod tests {
     use super::*;
     use crate::kernel::ipc::ThreadId;
+    use crate::kernel::vm::PAGE_SIZE;
     use std::{format, string::String, vec::Vec};
 
     #[test]
@@ -1731,7 +1852,7 @@ mod tests {
             .object;
 
         let first = state
-            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None)
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
             .expect("stash first");
         assert!(
             state
@@ -1745,7 +1866,7 @@ mod tests {
         );
 
         let second = state
-            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None)
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
             .expect("stash second");
         assert_ne!(first, second);
         assert!(
@@ -1769,7 +1890,7 @@ mod tests {
         );
 
         let bound = state
-            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, Some(ThreadId(9)))
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, Some(ThreadId(9)), None)
             .expect("stash bound");
         assert!(
             state
@@ -1781,6 +1902,69 @@ mod tests {
                 .take_transfer_envelope(bound, endpoint, ThreadId(9))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn transfer_envelope_shared_region_rejects_zero_len() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+
+        let handle = state.stash_transfer_envelope(
+            ThreadId(0),
+            mem_cap,
+            endpoint,
+            None,
+            Some(TransferSharedRegion {
+                offset: 0x1000,
+                len: 0,
+            }),
+        );
+        assert!(handle.is_none());
+        let telemetry = state.ipc_path_telemetry();
+        assert_eq!(telemetry.transfer_record_failures, 1);
+    }
+
+    #[test]
+    fn transfer_envelope_shared_region_rejects_memory_len_overflow() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+
+        let handle = state.stash_transfer_envelope(
+            ThreadId(0),
+            mem_cap,
+            endpoint,
+            None,
+            Some(TransferSharedRegion {
+                offset: 0x2000,
+                len: (PAGE_SIZE as u64) + 1,
+            }),
+        );
+        assert!(handle.is_none());
+    }
+
+    #[test]
+    fn transfer_state_transition_guard_rejects_invalid_hops() {
+        let record = TransferEnvelope {
+            source_tid: ThreadId(0),
+            source_cap: CapId(1),
+            endpoint: CapObject::Kernel,
+            receiver_tid: None,
+            state: TransferState::Created,
+            shared_region: None,
+            generation: 1,
+        };
+        assert!(record.transition(TransferState::MappedBoth).is_none());
+        assert!(record.transition(TransferState::MappedReceiver).is_some());
     }
 
     #[test]
@@ -4445,7 +4629,10 @@ mod tests {
 
         let source_cnode = state.task_cnode(740).expect("source cnode");
         let source_cap = state
-            .mint_capability_in_cnode(source_cnode, Capability::new(CapObject::Kernel, CapRights::READ))
+            .mint_capability_in_cnode(
+                source_cnode,
+                Capability::new(CapObject::Kernel, CapRights::READ),
+            )
             .expect("mint source cap");
         let mid_cap = state
             .grant_capability_task_to_task_with_rights(740, source_cap, 741, CapRights::READ)
@@ -4464,7 +4651,11 @@ mod tests {
 
         assert!(state.resolve_capability_for_task(741, mid_cap).is_ok());
         assert!(state.resolve_capability_for_task(742, leaf_cap).is_ok());
-        assert!(state.resolve_capability_for_task(743, unrelated_cap).is_ok());
+        assert!(
+            state
+                .resolve_capability_for_task(743, unrelated_cap)
+                .is_ok()
+        );
 
         state.mark_task_dead(740).expect("teardown source");
 
@@ -4477,7 +4668,11 @@ mod tests {
             state.resolve_capability_for_task(742, leaf_cap),
             Err(KernelError::InvalidCapability)
         );
-        assert!(state.resolve_capability_for_task(743, unrelated_cap).is_ok());
+        assert!(
+            state
+                .resolve_capability_for_task(743, unrelated_cap)
+                .is_ok()
+        );
     }
 
     #[test]
