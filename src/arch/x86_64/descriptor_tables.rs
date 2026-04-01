@@ -1014,4 +1014,42 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn real_stub_frame_builder_captures_syscall_and_user_stack_registers() {
+        let regs = X86SavedRegs {
+            rax: 7,
+            rdi: 11,
+            rsi: 12,
+            rdx: 13,
+            rcx: 14,
+            r8: 15,
+            r9: 16,
+            ..X86SavedRegs::default()
+        };
+        let frame = X86InterruptStackFrame {
+            rip: 0x4444,
+            cs: 0x1b, // ring3 selector, low bits set
+            rflags: 0x202,
+            rsp: 0x8888,
+            ss: 0x23,
+        };
+        let trap = unsafe {
+            build_trap_frame_from_saved_regs(
+                &regs as *const X86SavedRegs,
+                &frame as *const X86InterruptStackFrame,
+                VEC_SYSCALL as u64,
+            )
+        };
+        assert_eq!(trap.saved_pc(), 0x4444);
+        assert_eq!(trap.saved_sp(), 0x8888);
+        assert_eq!(trap.syscall_num(), 7);
+        assert_eq!(trap.arg(0), 11);
+        assert_eq!(trap.arg(1), 12);
+        assert_eq!(trap.arg(2), 13);
+        assert_eq!(trap.arg(3), 14);
+        assert_eq!(trap.arg(4), 15);
+        assert_eq!(trap.arg(5), 16);
+    }
 }
