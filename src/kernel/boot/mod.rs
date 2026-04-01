@@ -4262,8 +4262,7 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(57).expect("task");
         state.enqueue_current_cpu(57).expect("enqueue");
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::x86_64::context_switch::reset_switch_call_count_for_test();
+        crate::arch::selected_isa::context_switch::reset_switch_call_count_for_test();
 
         state
             .set_thread_kernel_stack(0, 0xA000_0000, 0xA000_4000)
@@ -4281,9 +4280,8 @@ mod tests {
         let _ = state.dispatch_next_task().expect("dispatch");
         state.yield_current().expect("yield");
         assert_eq!(state.current_tid(), Some(57));
-        #[cfg(target_arch = "x86_64")]
         assert!(
-            crate::arch::x86_64::context_switch::switch_call_count_for_test() > 0,
+            crate::arch::selected_isa::context_switch::switch_call_count_for_test() > 0,
             "scheduler transitions should invoke arch switch primitive when contexts are initialized"
         );
     }
