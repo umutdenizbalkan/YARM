@@ -19,6 +19,10 @@ use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBac
 const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_PHYS_EXCLUSIVE: u64 = 1u64 << 52;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const MAX_PVH_CMDLINE_BYTES: usize = 256;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const MAX_PVH_MODULE_ENTRIES: usize = 32;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[repr(C)]
@@ -26,9 +30,9 @@ struct PvhStartInfo {
     _magic: u32,
     _version: u32,
     _flags: u32,
-    _nr_modules: u32,
-    _modlist_paddr: u64,
-    _cmdline_paddr: u64,
+    nr_modules: u32,
+    modlist_paddr: u64,
+    cmdline_paddr: u64,
     _rsdp_paddr: u64,
     memmap_paddr: u64,
     memmap_entries: u32,
@@ -42,6 +46,76 @@ struct PvhMemMapEntry {
     size: u64,
     kind: u32,
     _reserved: u32,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PvhModuleEntry {
+    paddr: u64,
+    size: u64,
+    cmdline_paddr: u64,
+    _reserved: u64,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn log_pvh_boot_metadata(start_info_ptr: usize) {
+    if start_info_ptr == 0 {
+        return;
+    }
+    let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+
+    let mut cmdline_len = 0usize;
+    let mut cmdline_preview = [0u8; 32];
+    if start_info.cmdline_paddr != 0 {
+        let cmd_ptr = start_info.cmdline_paddr as *const u8;
+        let cmdline = unsafe { core::slice::from_raw_parts(cmd_ptr, MAX_PVH_CMDLINE_BYTES) };
+        for &b in cmdline {
+            if b == 0 {
+                break;
+            }
+            if cmdline_len < cmdline_preview.len() {
+                cmdline_preview[cmdline_len] = b;
+            }
+            cmdline_len = cmdline_len.saturating_add(1);
+        }
+    }
+
+    let mut module_count = 0usize;
+    let mut first_module_start = 0u64;
+    let mut first_module_size = 0u64;
+    let mut first_module_cmdline_len = 0usize;
+    if start_info.modlist_paddr != 0 && start_info.nr_modules != 0 {
+        let count = core::cmp::min(start_info.nr_modules as usize, MAX_PVH_MODULE_ENTRIES);
+        let mod_ptr = start_info.modlist_paddr as *const PvhModuleEntry;
+        let modules = unsafe { core::slice::from_raw_parts(mod_ptr, count) };
+        module_count = modules.len();
+        if let Some(first) = modules.first().copied() {
+            first_module_start = first.paddr;
+            first_module_size = first.size;
+            if first.cmdline_paddr != 0 {
+                let cmd_ptr = first.cmdline_paddr as *const u8;
+                let cmdline = unsafe { core::slice::from_raw_parts(cmd_ptr, MAX_PVH_CMDLINE_BYTES) };
+                for &b in cmdline {
+                    if b == 0 {
+                        break;
+                    }
+                    first_module_cmdline_len = first_module_cmdline_len.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    let preview_len = core::cmp::min(cmdline_len, cmdline_preview.len());
+    yarm::yarm_log!(
+        "YARM_PVH_BOOT_INFO cmdline_len={} cmdline_preview={:?} modules={} first_mod_start=0x{:x} first_mod_size={} first_mod_cmdline_len={}",
+        cmdline_len,
+        &cmdline_preview[..preview_len],
+        module_count,
+        first_module_start,
+        first_module_size,
+        first_module_cmdline_len
+    );
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -311,6 +385,8 @@ fn main() {
 pub extern "C" fn yarm_kernel_main(start_info_ptr: usize) -> ! {
     #[cfg(target_arch = "x86_64")]
     yarm::arch::x86_64::console::write_line("KM0");
+    #[cfg(target_arch = "x86_64")]
+    log_pvh_boot_metadata(start_info_ptr);
     #[cfg(target_arch = "x86_64")]
     init_pt_allocator_from_pvh_memmap(start_info_ptr);
     yarm::arch::boot_entry::run_kernel_boot(run);
