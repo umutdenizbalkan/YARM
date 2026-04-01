@@ -1459,6 +1459,7 @@ impl KernelState {
             self.revoke_capability_direct_in_process_cnode(delegated.pid, delegated.cap);
         }
         self.remove_delegation_links_for(root, descendants);
+        self.revoke_active_transfer_mappings_for_cap(source_pid, cap);
         if let Some(capability) = source_capability {
             self.adjust_memory_object_cap_refcount(capability.object, -1);
             self.reclaim_memory_object_if_unreferenced(capability.object);
@@ -1511,9 +1512,41 @@ impl KernelState {
             revoked_capability = cspace.get(cap);
             let _ = cspace.revoke(cap);
         }
+        self.revoke_active_transfer_mappings_for_cap(pid, cap);
         if let Some(capability) = revoked_capability {
             self.adjust_memory_object_cap_refcount(capability.object, -1);
             self.reclaim_memory_object_if_unreferenced(capability.object);
+        }
+    }
+
+    fn revoke_active_transfer_mappings_for_cap(&mut self, owner_pid: u64, cap: CapId) {
+        for idx in 0..MAX_TRANSFER_ENVELOPES {
+            let Some(mapping) = self.ipc.active_transfer_mappings[idx] else {
+                continue;
+            };
+            let mapping_pid = self
+                .process_id(mapping.owner_tid.0)
+                .unwrap_or(mapping.owner_tid.0);
+            if mapping_pid != owner_pid || mapping.transfer_cap != cap {
+                continue;
+            }
+            if let Some(asid) = self.task_asid(mapping.owner_tid.0) {
+                let mut va = mapping.base.0 as usize;
+                let end = va.saturating_add(mapping.len);
+                while va < end {
+                    let _ = self.unmap_user_page_in_asid(asid, VirtAddr(va as u64));
+                    va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
+                }
+            }
+            self.ipc.active_transfer_mappings[idx] = None;
+            self.note_transfer_record_revoked();
+            crate::yarm_log!(
+                "YARM_TRANSFER_REVOKE owner_pid={} cap={} base=0x{:x} len={}",
+                owner_pid,
+                cap.0,
+                mapping.base.0,
+                mapping.len
+            );
         }
     }
 
@@ -2260,6 +2293,58 @@ mod tests {
         let slot = state
             .memory_object_slot_by_id(mem_id)
             .expect("slot remains");
+        assert_eq!(
+            state.memory.memory_objects[slot]
+                .expect("object")
+                .map_refcount,
+            0
+        );
+    }
+
+    #[test]
+    fn revoking_transfer_cap_forces_unmap_of_active_transfer_mapping() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let mem_cap_task1 = state
+            .grant_capability_task_to_task(0, mem_cap, 1)
+            .expect("grant mem");
+
+        if state.current_tid() != Some(1) {
+            state.yield_current().expect("switch to task1");
+        }
+        state
+            .map_user_page_in_current_asid_with_caps(
+                mem_cap_task1,
+                VirtAddr(0xA000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+                },
+            )
+            .expect("map");
+        state
+            .register_active_transfer_mapping(
+                ThreadId(1),
+                mem_cap_task1,
+                VirtAddr(0xA000),
+                PAGE_SIZE,
+            )
+            .expect("register mapping");
+
+        state.revoke_capability_direct_in_process_cnode(1, mem_cap_task1);
+        assert!(
+            !state.remove_active_transfer_mapping(ThreadId(1), mem_cap_task1),
+            "revocation should remove active mapping"
+        );
+        let slot = state.memory_object_slot_by_id(mem_id).expect("slot");
         assert_eq!(
             state.memory.memory_objects[slot]
                 .expect("object")

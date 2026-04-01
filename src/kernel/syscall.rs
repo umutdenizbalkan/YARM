@@ -627,7 +627,6 @@ fn handle_transfer_release(
         .map_err(SyscallError::from)?;
     let owner = crate::kernel::ipc::ThreadId(current_tid(kernel)?);
     let _ = kernel.remove_active_transfer_mapping(owner, transfer_cap);
-    kernel.note_transfer_record_revoked();
     frame.set_ok(map_len, 0, 0);
     Ok(())
 }
