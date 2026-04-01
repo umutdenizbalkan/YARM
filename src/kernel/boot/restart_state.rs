@@ -70,9 +70,11 @@ impl KernelState {
     }
 
     pub fn exit_task(&mut self, tid: u64, code: u64) -> Result<u64, KernelError> {
-        let token = self.restart.next_restart_token;
-        self.restart.next_restart_token =
-            self.restart.next_restart_token.checked_add(1).unwrap_or(1);
+        let token = self.with_restart_state_mut(|restart| {
+            let token = restart.next_restart_token;
+            restart.next_restart_token = restart.next_restart_token.checked_add(1).unwrap_or(1);
+            token
+        });
 
         let robust = self.robust_futex_state(tid);
         let detached = self.thread_detach_state(tid) == Some(ThreadDetachState::Detached);

@@ -499,6 +499,7 @@ pub struct KernelState {
     ipc_state_lock: SpinLockIrq<()>,
     driver_state_lock: SpinLockIrq<()>,
     fault_state_lock: SpinLockIrq<()>,
+    restart_state_lock: SpinLockIrq<()>,
     vm_state_lock: SpinLockIrq<()>,
     task_state_lock: SpinLockIrq<()>,
     memory_state_lock: SpinLockIrq<()>,
@@ -515,7 +516,7 @@ pub struct KernelState {
     tlb_shootdown_count: u64,
     tlb_shootdown_timeout_count: u64,
     faults: KernelStorage<FaultSubsystem>,
-    restart: RestartSubsystem,
+    restart: KernelStorage<RestartSubsystem>,
     delegated_capability_links:
         KernelStorage<[Option<DelegatedCapabilityLink>; MAX_DELEGATED_CAPABILITY_LINKS]>,
 }
@@ -609,6 +610,16 @@ impl KernelState {
     fn with_fault_state_mut<R>(&mut self, f: impl FnOnce(&mut FaultSubsystem) -> R) -> R {
         let _fault_guard = self.fault_state_lock.lock();
         f(kernel_mut(&mut self.faults))
+    }
+
+    fn with_restart_state<R>(&self, f: impl FnOnce(&RestartSubsystem) -> R) -> R {
+        let _restart_guard = self.restart_state_lock.lock();
+        f(kernel_ref(&self.restart))
+    }
+
+    fn with_restart_state_mut<R>(&mut self, f: impl FnOnce(&mut RestartSubsystem) -> R) -> R {
+        let _restart_guard = self.restart_state_lock.lock();
+        f(kernel_mut(&mut self.restart))
     }
 
     fn with_scheduler_then_ipc<R>(
@@ -848,6 +859,7 @@ impl Bootstrap {
             ipc_state_lock: SpinLockIrq::new(()),
             driver_state_lock: SpinLockIrq::new(()),
             fault_state_lock: SpinLockIrq::new(()),
+            restart_state_lock: SpinLockIrq::new(()),
             vm_state_lock: SpinLockIrq::new(()),
             task_state_lock: SpinLockIrq::new(()),
             memory_state_lock: SpinLockIrq::new(()),
@@ -893,9 +905,9 @@ impl Bootstrap {
                 supervisor_endpoint: None,
                 fault_policy: FaultPolicy::KillTask,
             }),
-            restart: RestartSubsystem {
+            restart: store_kernel_value(RestartSubsystem {
                 next_restart_token: 1,
-            },
+            }),
             delegated_capability_links: store_kernel_value(
                 [const { None }; MAX_DELEGATED_CAPABILITY_LINKS],
             ),

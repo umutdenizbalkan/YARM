@@ -151,7 +151,7 @@ into independently lockable domains while preserving behavior.
     (`capacity_telemetry`) to `with_ipc_state(...)` accessors
 - This closes the extraction loop needed to start the next partitioning phase.
 
-## Phase 6 (in progress)
+## Phase 6 (completed)
 
 Split the remaining multi-concern boot state into explicit lockable domains for
 driver, fault, and restart flows. This phase focuses on reducing lock coupling
@@ -188,7 +188,7 @@ with task/ipc/vm/memory paths while preserving behavior.
 - Fault-policy and supervisor notification tests continue to validate behavior
   under extracted fault state.
 
-### Phase 6c (planned): Restart domain extraction + lock-order hardening
+### Phase 6c (completed in this pass): Restart domain extraction + lock-order hardening
 
 - Extract `RestartState` from `KernelState` fields currently used by
   `boot/restart_state.rs` (exit/restart tokens, lifecycle transitions).
@@ -200,8 +200,8 @@ with task/ipc/vm/memory paths while preserving behavior.
   cross-domain critical sections.
 - Add lock-order validation tests to cover any new multi-domain acquisition
   paths introduced by driver/fault/restart extraction.
-- Update lock-order guidance (below) from “if split further” to concrete domain
-  order once extraction lands.
+- Update lock-order guidance (below) to concrete domain order now that
+  driver/fault/restart extraction has landed.
 
 ## Lock ordering (proposed)
 
@@ -212,7 +212,9 @@ To avoid deadlocks as partitioning progresses, acquire in this order:
 3. ipc
 4. vm
 5. memory
-6. driver/fault/restart (if split further)
+6. driver
+7. fault
+8. restart
 
 No function should acquire a lock earlier in the order after acquiring a later
 one.
