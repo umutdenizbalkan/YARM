@@ -1,4 +1,4 @@
-# HAL Conformance Notes (RISC-V + x86 baseline)
+# HAL Conformance Notes (RISC-V + x86 + AArch64 baseline)
 
 This note freezes the minimum HAL portability checks expected by kernel-core code.
 
@@ -16,6 +16,7 @@ Kernel core may depend on only these HAL primitives:
 
 - RISC-V-like profile
 - x86-like profile
+- AArch64-like profile
 
 Both profiles must satisfy identical kernel-facing semantics for:
 
@@ -30,6 +31,7 @@ Both profiles must satisfy identical kernel-facing semantics for:
 - `src/arch/hal.rs`
   - `hal_contract_is_isa_agnostic_for_riscv_like_impl`
   - `hal_contract_is_isa_agnostic_for_x86_like_impl`
+  - `hal_contract_is_isa_agnostic_for_aarch64_like_impl`
 - `src/arch/irq_guard.rs`
   - selected-ISA `external_irq_eoi(irq_line)` dispatch
 - `src/kernel/boot/fault_state.rs`
@@ -38,6 +40,10 @@ Both profiles must satisfy identical kernel-facing semantics for:
   - trap entry routes through normalized kernel trap handling
 - `src/arch/x86_64/trap.rs`
   - trap entry routes through normalized kernel trap handling
+- `src/arch/aarch64/trap.rs`
+  - trap entry routes through normalized kernel trap handling
+- `scripts/check-hal-conformance-targets.sh`
+  - CI gate running baseline HAL + topology conformance tests across riscv64/x86_64/aarch64
 
 ## Current implementation note
 

@@ -107,3 +107,4 @@ Each PR in this sequence should:
 - Post-fastpath follow-up wired synchronous IPC handoff switches into measured scheduler telemetry (`scheduler_dispatch_calls`, `scheduler_yield_calls`, `scheduler_context_switches`, `scheduler_fastpath_handoffs`) and added regression assertions.
 - Post-fastpath follow-up added delegation-bundle helper APIs (`delegate_driver_bundle_checked`, `redelegate_driver_bundle`) plus stale-cap regression coverage for helper-driven redelegation.
 - Post-fastpath follow-up extended typed process/VFS codec freeze with stable golden vectors and CI enforcement (`scripts/check-proc-vfs-codec-freeze.sh`).
+- Post-fastpath follow-up added extra HAL conformance targets (riscv64/x86_64/aarch64 baseline) with enforcement via `scripts/check-hal-conformance-targets.sh`.

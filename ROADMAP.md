@@ -94,6 +94,7 @@ Progress notes:
 - ✅ Wired synchronous IPC fast-path switching into measured scheduler telemetry (`scheduler_*` counters) with regression assertions in `kernel::boot` fast-path tests.
 - ✅ Added delegation-bundle helper APIs (`delegate_driver_bundle_checked`, `redelegate_driver_bundle`) and stale-cap regression coverage for helper-driven redelegation paths.
 - ✅ Extended typed process/VFS codec freeze with stable golden vectors + CI enforcement script (`scripts/check-proc-vfs-codec-freeze.sh`).
+- ✅ Added extra HAL conformance targets (AArch64 baseline included) with CI gate script `scripts/check-hal-conformance-targets.sh`.
 
 ## Review follow-up next steps (after oversized placeholder PR)
 
