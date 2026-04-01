@@ -7,6 +7,8 @@ const ENTRIES_PER_TABLE: usize = 512;
 const PAGE_SIZE_U64: u64 = vm_layout::PAGE_SIZE as u64;
 const PAGE_MASK: u64 = !(PAGE_SIZE_U64 - 1);
 const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+const PCID_MASK: u16 = 0x0fff;
+const MAX_PCID: u16 = PCID_MASK;
 const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
 const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
 
@@ -67,6 +69,7 @@ impl PageTablePage {
 struct AsidCr3 {
     asid: Asid,
     root_phys: u64,
+    pcid: u16,
 }
 
 struct PageTableState {
@@ -146,6 +149,33 @@ impl PageTableState {
             .and_then(|slot| self.asids[slot].map(|entry| entry.root_phys))
     }
 
+    fn asid_pcid(&self, asid: Asid) -> Option<u16> {
+        self.find_asid_slot(asid)
+            .and_then(|slot| self.asids[slot].map(|entry| entry.pcid))
+    }
+
+    fn pcid_in_use(&self, pcid: u16) -> bool {
+        self.asids
+            .iter()
+            .flatten()
+            .any(|entry| entry.pcid == pcid)
+    }
+
+    fn allocate_pcid(&self, asid: Asid) -> Result<u16, PageTableError> {
+        let preferred = asid.0 & PCID_MASK;
+        if preferred != 0 && !self.pcid_in_use(preferred) {
+            return Ok(preferred);
+        }
+
+        for candidate in 1..=MAX_PCID {
+            if !self.pcid_in_use(candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        Err(PageTableError::OutOfMemory)
+    }
+
     fn ensure_asid(&mut self, asid: Asid) -> Result<u64, PageTableError> {
         if let Some(root) = self.asid_root_phys(asid) {
             return Ok(root);
@@ -153,10 +183,15 @@ impl PageTableState {
 
         let root_idx = self.alloc_page()?;
         let root_phys = self.pages[root_idx].expect("root page").phys;
+        let pcid = self.allocate_pcid(asid)?;
 
         for slot in &mut self.asids {
             if slot.is_none() {
-                *slot = Some(AsidCr3 { asid, root_phys });
+                *slot = Some(AsidCr3 {
+                    asid,
+                    root_phys,
+                    pcid,
+                });
                 return Ok(root_phys);
             }
         }
@@ -272,7 +307,9 @@ pub fn remove_asid_root(asid: Asid) {
 pub fn cr3_for_asid(asid: Asid) -> Option<u64> {
     let mut state = PAGE_TABLE_STATE.lock();
     let root_phys = state.ensure_asid(asid).ok()?;
-    let pcid = (asid.0 as u64) & 0x0fff;
+    // x86_64 PCID is 12 bits; software ASID is wider. Keep an explicit
+    // per-ASID PCID assignment so simultaneously-live ASIDs never alias.
+    let pcid = state.asid_pcid(asid)? as u64;
     Some((root_phys & PAGE_MASK) | pcid)
 }
 
@@ -407,8 +444,14 @@ pub fn invalidate_asid(asid: Asid) {
 
     #[cfg(not(feature = "hosted-dev"))]
     unsafe {
+        let pcid = {
+            let state = PAGE_TABLE_STATE.lock();
+            state
+                .asid_pcid(asid)
+                .unwrap_or_else(|| asid.0 & PCID_MASK) as u64
+        };
         let descriptor = InvpcidDescriptor {
-            pcid: (asid.0 as u64) & 0x0fff,
+            pcid,
             addr: 0,
         };
         core::arch::asm!(
@@ -459,6 +502,14 @@ mod tests {
         let asid = Asid(0x1234);
         let cr3 = cr3_for_asid(asid).expect("cr3");
         assert_eq!(cr3 & 0x0fff, 0x234);
+    }
+
+    #[test]
+    fn pcid_remains_unique_when_asid_low_bits_collide() {
+        reset_state();
+        let cr3_a = cr3_for_asid(Asid(1)).expect("cr3 a");
+        let cr3_b = cr3_for_asid(Asid(0x1001)).expect("cr3 b");
+        assert_ne!(cr3_a & 0x0fff, cr3_b & 0x0fff);
     }
 
     #[test]

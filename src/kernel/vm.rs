@@ -154,8 +154,8 @@ fn arch_register_asid(_asid: Asid) -> Result<(), VmError> {
     target_arch = "riscv64"
 ))]
 fn arch_unregister_asid(asid: Asid) {
-    crate::arch::selected_isa::page_table::remove_asid_root(asid);
     crate::arch::selected_isa::page_table::invalidate_asid(asid);
+    crate::arch::selected_isa::page_table::remove_asid_root(asid);
 }
 
 #[cfg(not(any(
