@@ -383,6 +383,14 @@ safe behavior preservation.
   - Extract rarely-mutated configuration/profile state if it still causes broad
     compile/runtime coupling.
 
+#### PR 7.6 status (completed in this pass)
+
+- Added `BootConfigSubsystem` + boot-config lock/accessors:
+  - `with_boot_config(...)`
+  - `with_boot_config_mut(...)`
+- Moved runtime capacity profile storage from top-level `KernelState` into the
+  boot-config subsystem and routed capacity-profile reads through accessors.
+
 ### Definition of done for Phase 7
 
 - Capability/cnode/global-link concerns are no longer directly mutated as

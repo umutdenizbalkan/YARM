@@ -484,6 +484,11 @@ struct TelemetrySubsystem {
 }
 
 #[derive(Debug)]
+struct BootConfigSubsystem {
+    capacity_profile: KernelCapacityProfile,
+}
+
+#[derive(Debug)]
 struct SchedulerState {
     scheduler: KernelStorage<SmpScheduler>,
     timer: Timer,
@@ -516,6 +521,7 @@ pub struct KernelState {
     restart_state_lock: SpinLockIrq<()>,
     capability_state_lock: SpinLockIrq<()>,
     telemetry_state_lock: SpinLockIrq<()>,
+    boot_config_state_lock: SpinLockIrq<()>,
     vm_state_lock: SpinLockIrq<()>,
     task_state_lock: SpinLockIrq<()>,
     memory_state_lock: SpinLockIrq<()>,
@@ -528,7 +534,7 @@ pub struct KernelState {
     memory: KernelStorage<MemorySubsystem>,
     drivers: KernelStorage<DriverSubsystem>,
     telemetry: KernelStorage<TelemetrySubsystem>,
-    capacity_profile: KernelCapacityProfile,
+    boot_config: KernelStorage<BootConfigSubsystem>,
     faults: KernelStorage<FaultSubsystem>,
     restart: KernelStorage<RestartSubsystem>,
 }
@@ -652,6 +658,16 @@ impl KernelState {
     fn with_telemetry_state_mut<R>(&mut self, f: impl FnOnce(&mut TelemetrySubsystem) -> R) -> R {
         let _telemetry_guard = self.telemetry_state_lock.lock();
         f(kernel_mut(&mut self.telemetry))
+    }
+
+    fn with_boot_config<R>(&self, f: impl FnOnce(&BootConfigSubsystem) -> R) -> R {
+        let _boot_config_guard = self.boot_config_state_lock.lock();
+        f(kernel_ref(&self.boot_config))
+    }
+
+    fn with_boot_config_mut<R>(&mut self, f: impl FnOnce(&mut BootConfigSubsystem) -> R) -> R {
+        let _boot_config_guard = self.boot_config_state_lock.lock();
+        f(kernel_mut(&mut self.boot_config))
     }
 
     fn with_task_then_capability<R>(
@@ -913,6 +929,7 @@ impl Bootstrap {
             restart_state_lock: SpinLockIrq::new(()),
             capability_state_lock: SpinLockIrq::new(()),
             telemetry_state_lock: SpinLockIrq::new(()),
+            boot_config_state_lock: SpinLockIrq::new(()),
             vm_state_lock: SpinLockIrq::new(()),
             task_state_lock: SpinLockIrq::new(()),
             memory_state_lock: SpinLockIrq::new(()),
@@ -958,7 +975,7 @@ impl Bootstrap {
                 tlb_shootdown_count: 0,
                 tlb_shootdown_timeout_count: 0,
             }),
-            capacity_profile,
+            boot_config: store_kernel_value(BootConfigSubsystem { capacity_profile }),
             faults: store_kernel_value(FaultSubsystem {
                 last_fault: None,
                 fault_handler_endpoint: None,
@@ -1067,11 +1084,11 @@ impl KernelState {
     }
 
     pub fn capacity_profile(&self) -> KernelCapacityProfile {
-        self.capacity_profile
+        self.with_boot_config(|boot_config| boot_config.capacity_profile)
     }
 
     pub fn runtime_capacity_config(&self) -> RuntimeCapacityConfig {
-        match self.capacity_profile {
+        match self.with_boot_config(|boot_config| boot_config.capacity_profile) {
             KernelCapacityProfile::HostedDefault => RuntimeCapacityConfig {
                 max_endpoints: MAX_ENDPOINTS,
                 max_notifications: MAX_NOTIFICATIONS,
