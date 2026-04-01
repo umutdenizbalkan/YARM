@@ -529,6 +529,7 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                                 mapped_len,
                             )
                             .map_err(SyscallError::from)?;
+                        kernel.note_shared_mem_mapped(mapped_len);
                         frame.set_ok(sender, mapped_len, frame.ret2());
                         frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, mapped_va);
                         frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, region_len);
@@ -627,6 +628,7 @@ fn handle_transfer_release(
         .map_err(SyscallError::from)?;
     let owner = crate::kernel::ipc::ThreadId(current_tid(kernel)?);
     let _ = kernel.remove_active_transfer_mapping(owner, transfer_cap);
+    kernel.note_shared_mem_released(map_len);
     frame.set_ok(map_len, 0, 0);
     Ok(())
 }
@@ -1074,7 +1076,88 @@ mod tests {
             state.copy_to_current_user(map_base, b"x"),
             Err(KernelError::UserMemoryFault)
         );
-        assert_eq!(state.ipc_path_telemetry().transfer_records_revoked, 1);
+        let t = state.ipc_path_telemetry();
+        assert_eq!(t.transfer_records_revoked, 1);
+        assert_eq!(t.transfer_release_calls, 1);
+        assert_eq!(t.shared_mem_bytes_mapped, PAGE_SIZE as u64);
+        assert_eq!(t.shared_mem_bytes_released, PAGE_SIZE as u64);
+    }
+
+    #[test]
+    fn shared_mem_fastpath_throughput_smoke_tracks_volume_for_repeated_map_release() {
+        let loops = 64usize;
+        let mut total_mapped = 0u64;
+        let mut total_released = 0u64;
+        let mut total_release_calls = 0u64;
+        for _ in 0..loops {
+            let mut state = Bootstrap::init().expect("kernel");
+            state.register_task(1).expect("task1");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+            let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+            state.bind_task_asid(0, asid0).expect("bind0");
+            state.bind_task_asid(1, asid1).expect("bind1");
+            let (_eid, send_cap, recv_cap_global) = state.create_endpoint(8).expect("endpoint");
+            let recv_cap = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("dup recv cap");
+            let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+            let map_base = 0xA000usize;
+            state.yield_current().expect("switch receiver");
+            let mut block_recv = TrapFrame::new(
+                Syscall::IpcRecv as usize,
+                [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+            );
+            dispatch(&mut state, &mut block_recv).expect("block recv");
+
+            let mut send = TrapFrame::new(
+                Syscall::IpcSend as usize,
+                [
+                    send_cap.0 as usize,
+                    0x2000,
+                    Message::MAX_PAYLOAD + 16,
+                    0,
+                    0,
+                    mem_cap.0 as usize,
+                ],
+            );
+            dispatch(&mut state, &mut send).expect("send");
+            state.yield_current().expect("switch receiver");
+            let mut recv = TrapFrame::new(
+                Syscall::IpcRecv as usize,
+                [
+                    recv_cap.0 as usize,
+                    map_base,
+                    Message::MAX_PAYLOAD + 16,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            dispatch(&mut state, &mut recv).expect("recv");
+            let recv_local_transfer = CapId(recv.ret2() as u64);
+            let mut release = TrapFrame::new(
+                Syscall::TransferRelease as usize,
+                [
+                    recv_local_transfer.0 as usize,
+                    map_base,
+                    Message::MAX_PAYLOAD + 16,
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            dispatch(&mut state, &mut release).expect("release");
+            let t = state.ipc_path_telemetry();
+            total_mapped = total_mapped.saturating_add(t.shared_mem_bytes_mapped);
+            total_released = total_released.saturating_add(t.shared_mem_bytes_released);
+            total_release_calls = total_release_calls.saturating_add(t.transfer_release_calls);
+        }
+        let mapped_per_loop = PAGE_SIZE as u64;
+        assert_eq!(total_release_calls, loops as u64);
+        assert_eq!(total_mapped, loops as u64 * mapped_per_loop);
+        assert_eq!(total_released, loops as u64 * mapped_per_loop);
     }
 
     #[test]

@@ -60,7 +60,7 @@ Acceptance checks:
 
 - [ ] Add batching/ring usage guidance for FS/network/display servers.
 - [ ] Minimize syscall overhead on steady-state transfer reuse.
-- [ ] Add fast-path telemetry and benchmark harnesses for large read/write, packet RX/TX, and framebuffer update flows.
+- [x] Add fast-path telemetry and benchmark harnesses for large read/write, packet RX/TX, and framebuffer update flows.
 
 Acceptance checks:
 - benchmark gates with minimum throughput/latency thresholds.
@@ -90,3 +90,4 @@ Each PR in this sequence should:
 - Phase 1 landed in PRs up to commit `5460f97`.
 - Phase 2 landed in PRs up to commit `7d1ab28`.
 - Current pass completes Phase 4 by emitting structured transfer-revocation events to the supervisor fault endpoint while preserving forced-unmap semantics.
+- Phase 5 started with transfer-volume telemetry (`shared_mem_bytes_mapped`, `shared_mem_bytes_released`, `transfer_release_calls`) and a repeated map/release throughput smoke harness in syscall tests.

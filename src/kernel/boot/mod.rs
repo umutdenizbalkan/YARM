@@ -234,6 +234,9 @@ pub struct IpcPathTelemetry {
     pub transfer_records_materialized: u64,
     pub transfer_records_revoked: u64,
     pub transfer_record_failures: u64,
+    pub shared_mem_bytes_mapped: u64,
+    pub shared_mem_bytes_released: u64,
+    pub transfer_release_calls: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1339,6 +1342,27 @@ impl KernelState {
             .telemetry
             .transfer_records_revoked
             .saturating_add(1);
+    }
+
+    pub(crate) fn note_shared_mem_mapped(&mut self, len: usize) {
+        self.ipc.telemetry.shared_mem_bytes_mapped = self
+            .ipc
+            .telemetry
+            .shared_mem_bytes_mapped
+            .saturating_add(len as u64);
+    }
+
+    pub(crate) fn note_shared_mem_released(&mut self, len: usize) {
+        self.ipc.telemetry.transfer_release_calls = self
+            .ipc
+            .telemetry
+            .transfer_release_calls
+            .saturating_add(1);
+        self.ipc.telemetry.shared_mem_bytes_released = self
+            .ipc
+            .telemetry
+            .shared_mem_bytes_released
+            .saturating_add(len as u64);
     }
 
     pub(crate) fn register_active_transfer_mapping(
