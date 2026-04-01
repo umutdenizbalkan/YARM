@@ -73,6 +73,11 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Expanded sysdeps shim scaffolding with startup/memory/clock/thread/futex hooks and focused tests (bootstrap-grade semantics).
 - Expanded deterministic end-to-end server coverage with `tests/kernel_scenarios.rs`, including the init/process_manager/VFS/IRQ flow exercised by `run_init_core_bootstrap_scenario()`.
 
+## 9) Shared-memory IPC fast-path implementation track
+
+- Stepwise execution plan: `IPC_SHARED_MEMORY_FASTPATH_PLAN.md`.
+- Scope: receiver auto-map path, lifecycle/refcount semantics, revocation behavior, and throughput tuning for FS/network/display data-plane traffic.
+
 ## Immediate next 5 implementable steps
 
 1. Wire synchronous IPC fast-path switching into measured scheduler path.
