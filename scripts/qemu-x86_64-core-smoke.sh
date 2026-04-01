@@ -162,6 +162,11 @@ if log_has_pattern "$MARKER_REGEX"; then
   fi
 
   strict_fail=0
+  irq_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_TIMER_IRQ_DELIVERED" || true)
+  eoi_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_TIMER_EOI_DONE" || true)
+  sched_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_SCHED_TICK" || true)
+  echo "[info] strict smoke marker counts: irq=${irq_count:-0} eoi=${eoi_count:-0} sched=${sched_count:-0}"
+
   if ! log_has_pattern "YARM_TIMER_IRQ_DELIVERED"; then
     echo "[warn] strict smoke: missing timer IRQ delivery marker"
     strict_fail=1
@@ -176,9 +181,18 @@ if log_has_pattern "$MARKER_REGEX"; then
   fi
 
   tick_lines=$(tr '\r' '\n' <"$LOGFILE" | rg -a -o "YARM_SCHED_TICK cpu=[0-9]+ tick=[0-9]+" || true)
+  tick_line_with_lineno=$(tr '\r' '\n' <"$LOGFILE" | rg -a -n "YARM_SCHED_TICK cpu=[0-9]+ tick=[0-9]+" || true)
   tick_count=$(printf '%s\n' "$tick_lines" | rg -c "YARM_SCHED_TICK" || true)
   first_tick=$(printf '%s\n' "$tick_lines" | head -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
   last_tick=$(printf '%s\n' "$tick_lines" | tail -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
+  first_tick_line=$(printf '%s\n' "$tick_line_with_lineno" | head -n1)
+  last_tick_line=$(printf '%s\n' "$tick_line_with_lineno" | tail -n1)
+  if [[ -n "$first_tick_line" ]]; then
+    echo "[info] strict smoke first tick line: $first_tick_line"
+  fi
+  if [[ -n "$last_tick_line" ]]; then
+    echo "[info] strict smoke last tick line: $last_tick_line"
+  fi
   if [[ -z "$first_tick" || -z "$last_tick" || "$tick_count" -lt 2 ]]; then
     echo "[warn] strict smoke: need at least two scheduler tick markers (got ${tick_count:-0})"
     strict_fail=1
