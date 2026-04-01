@@ -20,8 +20,7 @@ impl KernelState {
         self.revoke_capability_in_cnode(cnode, aspace_cap)?;
 
         let pending_cpu_bitmap = self.online_cpu_bitmap();
-        self.user_spaces
-            .destroy(asid, pending_cpu_bitmap)
+        self.with_user_spaces_mut(|spaces| spaces.destroy(asid, pending_cpu_bitmap))
             .map_err(KernelError::Vm)?;
 
         for cpu in 0..u64::BITS as usize {
@@ -43,8 +42,7 @@ impl KernelState {
 
     pub fn create_user_address_space(&mut self) -> Result<(Asid, CapId), KernelError> {
         let asid = self
-            .user_spaces
-            .create_user_space()
+            .with_user_spaces_mut(|spaces| spaces.create_user_space())
             .map_err(KernelError::Vm)?;
         let map_cap = self.mint_capability_for_current_context(Capability::new(
             CapObject::AddressSpace { asid: asid.0 },
@@ -71,11 +69,13 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
 
-        let aspace = self
-            .user_spaces
-            .get_mut(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let old = aspace.map_page(virt, mapping).map_err(KernelError::Vm)?;
+        let old = self
+            .with_user_spaces_mut(|spaces| {
+                let aspace = spaces
+                    .get_mut(asid)
+                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+                aspace.map_page(virt, mapping).map_err(KernelError::Vm)
+            })?;
         if let Some(old_mapping) = old {
             self.note_mapping_removed(old_mapping.phys);
             self.reclaim_memory_object_for_phys(old_mapping.phys);
@@ -99,28 +99,29 @@ impl KernelState {
         if len == 0 || !len.is_multiple_of(crate::kernel::vm::PAGE_SIZE) {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
-        if self.memory.memory_objects.iter().flatten().count()
+        if self.with_memory_state(|memory| memory.memory_objects.iter().flatten().count())
             >= self.runtime_capacity_config().max_memory_objects
         {
             return Err(KernelError::MemoryObjectFull);
         }
-        let id = self.memory.next_memory_object_id;
-        self.memory.next_memory_object_id = self.memory.next_memory_object_id.wrapping_add(1);
-
-        let slot = self
-            .memory
-            .memory_objects
-            .iter_mut()
-            .find(|entry| entry.is_none())
-            .ok_or(KernelError::MemoryObjectFull)?;
-        *slot = Some(MemoryObject {
-            id,
-            phys,
-            len,
-            cap_refcount: 0,
-            map_refcount: 0,
-            pin_refcount: 0,
-        });
+        let id = self.with_memory_state_mut(|memory| {
+            let id = memory.next_memory_object_id;
+            memory.next_memory_object_id = memory.next_memory_object_id.wrapping_add(1);
+            let slot = memory
+                .memory_objects
+                .iter_mut()
+                .find(|entry| entry.is_none())
+                .ok_or(KernelError::MemoryObjectFull)?;
+            *slot = Some(MemoryObject {
+                id,
+                phys,
+                len,
+                cap_refcount: 0,
+                map_refcount: 0,
+                pin_refcount: 0,
+            });
+            Ok::<u64, KernelError>(id)
+        })?;
 
         let cap = self.mint_capability_for_current_context(Capability::new(
             CapObject::MemoryObject { id },
@@ -143,24 +144,26 @@ impl KernelState {
         }
         let pages = len.div_ceil(crate::kernel::vm::PAGE_SIZE);
         let total_len = pages * crate::kernel::vm::PAGE_SIZE;
-        let phys = PhysAddr(
-            kernel_mut(&mut self.memory.frame_allocator)
+        let phys = PhysAddr(self.with_memory_state_mut(|memory| {
+            kernel_mut(&mut memory.frame_allocator)
                 .alloc_contiguous(pages)
                 .map_err(|err| match err {
                     FrameAllocError::OutOfMemory => KernelError::MemoryObjectFull,
                     _ => KernelError::Vm(VmError::Full),
-                })?,
-        );
+                })
+        })?);
         self.create_memory_object_with_len(phys, total_len)
     }
 
     pub fn task_brk_bounds(&self, tid: u64) -> Option<(usize, usize)> {
-        self.memory
-            .brk_regions
-            .iter()
-            .flatten()
-            .find(|entry| entry.tid.0 == tid)
-            .map(|entry| (entry.base.0 as usize, entry.end.0 as usize))
+        self.with_memory_state(|memory| {
+            memory
+                .brk_regions
+                .iter()
+                .flatten()
+                .find(|entry| entry.tid.0 == tid)
+                .map(|entry| (entry.base.0 as usize, entry.end.0 as usize))
+        })
     }
 
     pub fn set_task_brk_bounds(
@@ -170,21 +173,22 @@ impl KernelState {
         end: usize,
     ) -> Result<(), KernelError> {
         let _ = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        if let Some(slot) = self
-            .memory
-            .brk_regions
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|entry| entry.tid.0 == tid) || slot.is_none())
-        {
-            *slot = Some(super::BrkRegionRecord {
-                tid: crate::kernel::ipc::ThreadId(tid),
-                base: VirtAddr(base as u64),
-                end: VirtAddr(end as u64),
-            });
-            Ok(())
-        } else {
-            Err(KernelError::TaskTableFull)
-        }
+        self.with_memory_state_mut(|memory| {
+            if let Some(slot) = memory
+                .brk_regions
+                .iter_mut()
+                .find(|slot| slot.is_some_and(|entry| entry.tid.0 == tid) || slot.is_none())
+            {
+                *slot = Some(super::BrkRegionRecord {
+                    tid: crate::kernel::ipc::ThreadId(tid),
+                    base: VirtAddr(base as u64),
+                    end: VirtAddr(end as u64),
+                });
+                Ok(())
+            } else {
+                Err(KernelError::TaskTableFull)
+            }
+        })
     }
 
     fn resolve_memory_object_phys(
@@ -208,13 +212,15 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
 
-        self.memory
-            .memory_objects
-            .iter()
-            .flatten()
-            .find(|entry| entry.id == id)
-            .map(|entry| entry.phys)
-            .ok_or(KernelError::MemoryObjectMissing)
+        self.with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.phys)
+                .ok_or(KernelError::MemoryObjectMissing)
+        })
     }
 
     pub fn map_user_page_with_caps(

@@ -91,6 +91,15 @@ into independently lockable domains while preserving behavior.
   accessors (`task_priority`, affinity resolution/update, retired ASID checks,
   shootdown ack path, and retired shootdown ticking).
 
+### Phase 4b (completed in this pass)
+
+- Migrate core memory/address-space flows in `boot/memory_state.rs` to phase-4
+  accessors:
+  - user-space create/destroy/map paths via `with_user_spaces_mut(...)`
+  - memory-object allocation/lookup and frame allocation paths via
+    `with_memory_state(...)` / `with_memory_state_mut(...)`
+  - task brk bounds read/write paths via memory accessors
+
 ## Lock ordering (proposed)
 
 To avoid deadlocks as partitioning progresses, acquire in this order:

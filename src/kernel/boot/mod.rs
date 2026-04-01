@@ -637,6 +637,11 @@ impl KernelState {
         f(kernel_ref(&self.memory))
     }
 
+    fn with_memory_state_mut<R>(&mut self, f: impl FnOnce(&mut MemorySubsystem) -> R) -> R {
+        let _mem_guard = self.memory_state_lock.lock();
+        f(kernel_mut(&mut self.memory))
+    }
+
 }
 
 impl Bootstrap {
