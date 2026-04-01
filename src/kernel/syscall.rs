@@ -295,6 +295,44 @@ fn round_up_page(value: usize) -> Result<usize, SyscallError> {
     }
 }
 
+fn map_shared_region_into_receiver(
+    kernel: &mut KernelState,
+    receiver_mem_cap: CapId,
+    requested_va: usize,
+    region_len: usize,
+) -> Result<(usize, usize), SyscallError> {
+    if requested_va == 0 || region_len == 0 || !requested_va.is_multiple_of(PAGE_SIZE) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let mapped_len = round_up_page(region_len)?;
+    let mut va = requested_va;
+    let end = requested_va
+        .checked_add(mapped_len)
+        .ok_or(SyscallError::InvalidArgs)?;
+    let map_flags = PageFlags {
+        read: true,
+        write: true,
+        execute: false,
+        user: true,
+        cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+    };
+
+    while va < end {
+        if kernel
+            .map_user_page_in_current_asid_with_caps(
+                receiver_mem_cap,
+                VirtAddr(va as u64),
+                map_flags,
+            )
+            .is_err()
+        {
+            return Err(SyscallError::InvalidArgs);
+        }
+        va += PAGE_SIZE;
+    }
+    Ok((requested_va, mapped_len))
+}
+
 fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     validate_endpoint_right(kernel, cap, CapRights::SEND)?;
@@ -462,6 +500,24 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                         .ok_or(SyscallError::InvalidArgs)?;
                     let region_len =
                         usize::try_from(desc.len).map_err(|_| SyscallError::InvalidArgs)?;
+                    if user_ptr != 0 {
+                        let transfer_cap_raw =
+                            u64::try_from(frame.ret2()).map_err(|_| SyscallError::InvalidArgs)?;
+                        if transfer_cap_raw == SYSCALL_NO_TRANSFER_CAP {
+                            return Err(SyscallError::InvalidArgs);
+                        }
+                        let transfer_cap = CapId(transfer_cap_raw);
+                        let (mapped_va, mapped_len) = map_shared_region_into_receiver(
+                            kernel,
+                            transfer_cap,
+                            user_ptr,
+                            region_len,
+                        )?;
+                        frame.set_ok(sender, mapped_len, frame.ret2());
+                        frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, mapped_va);
+                        frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, region_len);
+                        return Ok(());
+                    }
                     frame.set_ok(sender, region_len, frame.ret2());
                     frame.set_arg(
                         SYSCALL_ARG_INLINE_PAYLOAD0,
@@ -663,6 +719,121 @@ mod tests {
         if let Some(sender_cap) = state.capability_for_cnode_local(sender_cnode, recv_local) {
             assert_ne!(sender_cap.object, mapped.object);
         }
+    }
+
+    #[test]
+    fn syscall_recv_shared_mem_can_auto_map_into_receiver_when_requested() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send).expect("send");
+
+        state.yield_current().expect("switch receiver");
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [
+                recv_cap.0 as usize,
+                0x8000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut recv).expect("recv");
+        assert_eq!(recv.error_code(), None);
+        assert_eq!(recv.arg(SYSCALL_ARG_INLINE_PAYLOAD0), 0x8000);
+        assert_eq!(
+            recv.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+            Message::MAX_PAYLOAD + 16
+        );
+        assert_eq!(
+            recv.ret1(),
+            round_up_page(Message::MAX_PAYLOAD + 16).expect("rounded")
+        );
+    }
+
+    #[test]
+    fn syscall_recv_shared_mem_auto_map_rejects_unaligned_target_va() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send).expect("send");
+        state.yield_current().expect("switch receiver");
+
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [
+                recv_cap.0 as usize,
+                0x8101,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                0,
+            ],
+        );
+        let err = dispatch(&mut state, &mut recv).expect_err("unaligned target");
+        assert_eq!(err, SyscallError::InvalidArgs);
     }
 
     #[test]

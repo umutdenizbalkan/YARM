@@ -227,6 +227,30 @@ impl KernelState {
         self.map_user_page(aspace_map_cap, virt, Mapping { phys, flags })
     }
 
+    pub(crate) fn map_user_page_in_current_asid_with_caps(
+        &mut self,
+        mem_cap: CapId,
+        virt: VirtAddr,
+        flags: PageFlags,
+    ) -> Result<Option<Mapping>, KernelError> {
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        let phys = self.resolve_memory_object_phys(mem_cap, flags)?;
+        let aspace = self
+            .user_spaces
+            .get_mut(asid)
+            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        let old = aspace
+            .map_page(virt, Mapping { phys, flags })
+            .map_err(KernelError::Vm)?;
+        if let Some(old_mapping) = old {
+            self.note_mapping_removed(old_mapping.phys);
+            self.reclaim_memory_object_for_phys(old_mapping.phys);
+        }
+        self.note_mapping_inserted(phys);
+        Ok(old)
+    }
+
     #[cfg(feature = "linux-compat")]
     pub(crate) fn map_user_page_in_asid_with_caps(
         &mut self,
