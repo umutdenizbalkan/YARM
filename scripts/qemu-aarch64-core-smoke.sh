@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "$0")/qemu-smoke-common.sh"
 
 KERNEL_IMAGE=${KERNEL_IMAGE:-build-aarch64/yarm-aarch64.elf}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build-aarch64/initramfs-core.cpio}
@@ -11,22 +12,9 @@ QEMU_MEMORY=${QEMU_MEMORY:-1024M}
 QEMU_SMP=${QEMU_SMP:-2}
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"console=ttyAMA0 rdinit=/init"}
 
-if [[ ! -f "$KERNEL_IMAGE" ]]; then
-  echo "[warn] kernel image missing: $KERNEL_IMAGE"
-  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
-  exit 0
-fi
-if [[ ! -f "$INITRAMFS_IMAGE" ]]; then
-  echo "[warn] initramfs image missing: $INITRAMFS_IMAGE"
-  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
-  exit 0
-fi
-
-if ! command -v qemu-system-aarch64 >/dev/null 2>&1; then
-  echo "[warn] qemu-system-aarch64 not installed"
-  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
-  exit 0
-fi
+require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
+require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
+require_qemu_or_warn "qemu-system-aarch64" "$QEMU_SMOKE_STRICT"
 
 LOGFILE=${LOGFILE:-qemu-aarch64-core.log}
 rm -f "$LOGFILE"
@@ -36,8 +24,7 @@ echo "[info] qemu command: qemu-system-aarch64 -machine $QEMU_MACHINE -cpu $QEMU
 MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
 INIT_SERVER_REGEX="init_server|first server|first-server"
 
-set +e
-timeout "$TIMEOUT_SECS" qemu-system-aarch64 \
+if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" qemu-system-aarch64 \
   -machine "$QEMU_MACHINE" \
   -cpu "$QEMU_CPU" \
   -m "$QEMU_MEMORY" \
@@ -48,13 +35,13 @@ timeout "$TIMEOUT_SECS" qemu-system-aarch64 \
   -kernel "$KERNEL_IMAGE" \
   -initrd "$INITRAMFS_IMAGE" \
   -append "$KERNEL_CMDLINE" \
-  | tee "$LOGFILE"
-QEMU_STATUS=$?
-set -e
+; then
+  QEMU_STATUS=0
+else
+  QEMU_STATUS=$?
+fi
 
-if rg -n "$MARKER_REGEX" "$LOGFILE" >/dev/null 2>&1 \
-  && rg -n "$INIT_SERVER_REGEX" "$LOGFILE" >/dev/null 2>&1; then
-  echo "[ok] boot shell and init-server markers detected"
+if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then
   exit 0
 fi
 

@@ -116,6 +116,7 @@ Progress notes:
    - ✅ Added `scripts/check-contract-doc-enforcement.sh` to enforce required freeze-doc markers and run targeted frozen-contract tests (`trap_router_maps_syscall`, `proc_v2_golden_vector_is_stable`, `vfs_v1_golden_vector_is_stable`).
 4. **Reduce bootstrap script drift**
    - consolidate x86/riscv qemu build/smoke scripts behind a shared helper to avoid duplicated maintenance.
+   - ✅ Added shared smoke helper `scripts/qemu-smoke-common.sh` and refactored riscv64/aarch64 smoke scripts to consume it for common file/QEMU checks, timeout logging, and marker validation.
 5. **Define a minimum runnable server profile**
    - ship a single "core profile" path (`init/process_manager/vfs/supervisor + devfs + one FS`) and keep it green before expanding feature breadth.
    - ✅ The hosted smoke/runtime path now exercises `init/process_manager/vfs/supervisor + devfs + initramfs` through `run_minimum_profile_with_kernel(...)` and `src/bin/core_profile_smoke.rs`.
