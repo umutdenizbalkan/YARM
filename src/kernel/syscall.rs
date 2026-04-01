@@ -318,15 +318,17 @@ fn map_shared_region_into_receiver(
     };
 
     while va < end {
-        if kernel
-            .map_user_page_in_current_asid_with_caps(
-                receiver_mem_cap,
-                VirtAddr(va as u64),
-                map_flags,
-            )
-            .is_err()
-        {
-            return Err(SyscallError::InvalidArgs);
+        if let Err(err) = kernel.map_user_page_in_current_asid_with_caps(
+            receiver_mem_cap,
+            VirtAddr(va as u64),
+            map_flags,
+        ) {
+            let mut rollback = requested_va;
+            while rollback < va {
+                let _ = kernel.unmap_user_page_in_current_asid(VirtAddr(rollback as u64));
+                rollback += PAGE_SIZE;
+            }
+            return Err(SyscallError::from(err));
         }
         va += PAGE_SIZE;
     }
@@ -501,6 +503,9 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                     let region_len =
                         usize::try_from(desc.len).map_err(|_| SyscallError::InvalidArgs)?;
                     if user_ptr != 0 {
+                        if user_len < region_len {
+                            return Err(SyscallError::InvalidArgs);
+                        }
                         let transfer_cap_raw =
                             u64::try_from(frame.ret2()).map_err(|_| SyscallError::InvalidArgs)?;
                         if transfer_cap_raw == SYSCALL_NO_TRANSFER_CAP {
@@ -834,6 +839,115 @@ mod tests {
         );
         let err = dispatch(&mut state, &mut recv).expect_err("unaligned target");
         assert_eq!(err, SyscallError::InvalidArgs);
+    }
+
+    #[test]
+    fn syscall_recv_shared_mem_auto_map_requires_len_budget() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send).expect("send");
+        state.yield_current().expect("switch receiver");
+
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0x8000, Message::MAX_PAYLOAD, 0, 0, 0],
+        );
+        let err = dispatch(&mut state, &mut recv).expect_err("len budget too small");
+        assert_eq!(err, SyscallError::InvalidArgs);
+    }
+
+    #[test]
+    fn syscall_recv_shared_mem_auto_map_reports_missing_write_right() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let readonly_object = state
+            .current_task_capability(mem_cap)
+            .expect("mem cap")
+            .object;
+        let readonly_cap = state
+            .mint_capability_for_current_context(crate::kernel::capabilities::Capability::new(
+                readonly_object,
+                CapRights::READ,
+            ))
+            .expect("readonly cap");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                readonly_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send).expect("send");
+        state.yield_current().expect("switch receiver");
+
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [
+                recv_cap.0 as usize,
+                0x9000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                0,
+            ],
+        );
+        let err = dispatch(&mut state, &mut recv).expect_err("missing write right");
+        assert_eq!(err, SyscallError::MissingRight);
     }
 
     #[test]

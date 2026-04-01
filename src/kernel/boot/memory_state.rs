@@ -251,6 +251,24 @@ impl KernelState {
         Ok(old)
     }
 
+    pub(crate) fn unmap_user_page_in_current_asid(
+        &mut self,
+        virt: VirtAddr,
+    ) -> Result<Option<Mapping>, KernelError> {
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        let aspace = self
+            .user_spaces
+            .get_mut(asid)
+            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        let unmapped = aspace.unmap_page(virt);
+        if let Some(mapping) = unmapped {
+            self.note_mapping_removed(mapping.phys);
+            self.reclaim_memory_object_for_phys(mapping.phys);
+        }
+        Ok(unmapped)
+    }
+
     #[cfg(feature = "linux-compat")]
     pub(crate) fn map_user_page_in_asid_with_caps(
         &mut self,
