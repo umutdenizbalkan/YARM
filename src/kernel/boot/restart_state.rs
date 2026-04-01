@@ -1,5 +1,7 @@
 use super::{KernelError, KernelState};
-use crate::kernel::supervisor_abi::{TaskExitedEvent, task_exited_message};
+use crate::kernel::supervisor_abi::{
+    TaskExitedEvent, TransferRevokedEvent, task_exited_message, transfer_revoked_message,
+};
 use crate::kernel::task::{RestartToken, TaskStatus, ThreadDetachState};
 
 impl KernelState {
@@ -18,6 +20,39 @@ impl KernelState {
                 tid,
                 exit_code: code,
                 restart_token,
+            },
+        )
+        .map_err(|_| KernelError::WrongObject)?;
+        let endpoint = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?;
+        endpoint
+            .send(msg)
+            .map_err(|_| KernelError::EndpointQueueFull)?;
+        let _ = self.wake_waiter_for_endpoint(endpoint_idx);
+        Ok(())
+    }
+
+    pub fn report_transfer_revoke_to_supervisor(
+        &mut self,
+        owner_pid: u64,
+        cap: u64,
+        base: u64,
+        len: u64,
+    ) -> Result<(), KernelError> {
+        let Some(endpoint_idx) = self.faults.supervisor_endpoint else {
+            return Ok(());
+        };
+        let msg = transfer_revoked_message(
+            0,
+            TransferRevokedEvent {
+                owner_pid,
+                cap,
+                base,
+                len,
             },
         )
         .map_err(|_| KernelError::WrongObject)?;

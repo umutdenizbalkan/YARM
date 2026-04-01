@@ -5,8 +5,10 @@ use crate::kernel::supervisor_abi::{
     CoreServiceRegistrationKind, DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert,
     InitAlertKind, RedelegationAckRequest, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
-    SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, SupervisorStatusReply,
-    SupervisorStatusRequest, TaskExitedEvent, init_alert_message, status_reply_message,
+    SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER,
+    SUPERVISOR_OP_TASK_EXITED, SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusReply,
+    SupervisorStatusRequest, TaskExitedEvent, TransferRevokedEvent, init_alert_message,
+    status_reply_message,
 };
 use crate::kernel::time::{TickDuration, TickInstant};
 use crate::services::init::{
@@ -415,9 +417,18 @@ impl SupervisorService {
             changed += 1;
         }
         while let Some(message) = kernel.try_ipc_recv(self.handoff.supervisor_fault_recv_cap)? {
-            let event =
-                TaskExitedEvent::decode(message.as_slice()).ok_or(KernelError::WrongObject)?;
-            let _ = self.handle_task_exit(kernel, event)?;
+            match message.opcode {
+                SUPERVISOR_OP_TASK_EXITED => {
+                    let event =
+                        TaskExitedEvent::decode(message.as_slice()).ok_or(KernelError::WrongObject)?;
+                    let _ = self.handle_task_exit(kernel, event)?;
+                }
+                SUPERVISOR_OP_TRANSFER_REVOKED => {
+                    let _ = TransferRevokedEvent::decode(message.as_slice())
+                        .ok_or(KernelError::WrongObject)?;
+                }
+                _ => return Err(KernelError::WrongObject),
+            }
             changed += 1;
         }
         changed += self.execute_due_restarts(kernel)?;
@@ -619,7 +630,8 @@ mod tests {
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::supervisor_abi::{
         InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
-        SupervisorStatusRequest, query_status_message,
+        SupervisorStatusRequest, TransferRevokedEvent, query_status_message,
+        transfer_revoked_message,
     };
     use crate::kernel::task::{TaskClass, TaskStatus};
     use crate::kernel::vm::PAGE_SIZE;
@@ -751,6 +763,35 @@ mod tests {
         assert_eq!(status.tid, 2);
         assert_eq!(status.max_restarts, 3);
         assert_eq!(status.restart_owner, 2);
+    }
+
+    #[test]
+    fn transfer_revocation_events_are_observable_without_breaking_supervisor_loop() {
+        let (mut kernel, _init, handoff, mut supervisor) = setup_supervisor();
+        supervisor.run_until_idle(&mut kernel).expect("loop");
+        let msg = transfer_revoked_message(
+            0,
+            TransferRevokedEvent {
+                owner_pid: 2,
+                cap: 9,
+                base: 0xA000,
+                len: PAGE_SIZE as u64,
+            },
+        )
+        .expect("event");
+        kernel
+            .report_transfer_revoke_to_supervisor(2, 9, 0xA000, PAGE_SIZE as u64)
+            .expect("send");
+        let queued = kernel
+            .try_ipc_recv(handoff.supervisor_fault_recv_cap)
+            .expect("recv")
+            .expect("queued");
+        assert_eq!(queued, msg);
+        kernel
+            .report_transfer_revoke_to_supervisor(2, 9, 0xA000, PAGE_SIZE as u64)
+            .expect("requeue");
+        let handled = supervisor.service_step(&mut kernel).expect("step");
+        assert_eq!(handled, 1);
     }
 
     #[test]

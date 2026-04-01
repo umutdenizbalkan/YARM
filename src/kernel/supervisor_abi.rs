@@ -2,6 +2,7 @@ use super::ipc::Message;
 
 pub const SUPERVISOR_OP_TASK_EXITED: u16 = 0xEE;
 pub const SUPERVISOR_OP_INIT_ALERT: u16 = 0xEF;
+pub const SUPERVISOR_OP_TRANSFER_REVOKED: u16 = 0xF0;
 pub const SUPERVISOR_OP_REGISTER_CORE_SERVICE: u16 = 0x40;
 pub const SUPERVISOR_OP_REGISTER_DRIVER: u16 = 0x41;
 pub const SUPERVISOR_OP_QUERY_STATUS: u16 = 0x42;
@@ -58,6 +59,69 @@ pub fn task_exited_message(sender_tid: u64, event: TaskExitedEvent) -> Result<Me
     Message::with_header(
         sender_tid,
         SUPERVISOR_OP_TASK_EXITED,
+        0,
+        None,
+        &event.encode(),
+    )
+    .map_err(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferRevokedEvent {
+    pub owner_pid: u64,
+    pub cap: u64,
+    pub base: u64,
+    pub len: u64,
+}
+
+impl TransferRevokedEvent {
+    pub const ENCODED_LEN: usize = 32;
+
+    pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        let owner_pid = self.owner_pid.to_le_bytes();
+        let cap = self.cap.to_le_bytes();
+        let base = self.base.to_le_bytes();
+        let len = self.len.to_le_bytes();
+        let mut i = 0;
+        while i < 8 {
+            out[i] = owner_pid[i];
+            out[8 + i] = cap[i];
+            out[16 + i] = base[i];
+            out[24 + i] = len[i];
+            i += 1;
+        }
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() < Self::ENCODED_LEN {
+            return None;
+        }
+        let mut owner_pid = [0u8; 8];
+        let mut cap = [0u8; 8];
+        let mut base = [0u8; 8];
+        let mut len = [0u8; 8];
+        owner_pid.copy_from_slice(&payload[..8]);
+        cap.copy_from_slice(&payload[8..16]);
+        base.copy_from_slice(&payload[16..24]);
+        len.copy_from_slice(&payload[24..32]);
+        Some(Self {
+            owner_pid: u64::from_le_bytes(owner_pid),
+            cap: u64::from_le_bytes(cap),
+            base: u64::from_le_bytes(base),
+            len: u64::from_le_bytes(len),
+        })
+    }
+}
+
+pub fn transfer_revoked_message(
+    sender_tid: u64,
+    event: TransferRevokedEvent,
+) -> Result<Message, ()> {
+    Message::with_header(
+        sender_tid,
+        SUPERVISOR_OP_TRANSFER_REVOKED,
         0,
         None,
         &event.encode(),

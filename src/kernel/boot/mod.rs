@@ -1540,6 +1540,12 @@ impl KernelState {
             }
             self.ipc.active_transfer_mappings[idx] = None;
             self.note_transfer_record_revoked();
+            let _ = self.report_transfer_revoke_to_supervisor(
+                owner_pid,
+                cap.0,
+                mapping.base.0,
+                mapping.len as u64,
+            );
             crate::yarm_log!(
                 "YARM_TRANSFER_REVOKE owner_pid={} cap={} base=0x{:x} len={}",
                 owner_pid,
@@ -4222,6 +4228,31 @@ mod tests {
                 .is_ok(),
             true
         );
+    }
+
+    #[test]
+    fn supervisor_receives_transfer_revoke_report() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_e, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .set_supervisor_endpoint(recv_cap)
+            .expect("supervisor ep");
+        state
+            .report_transfer_revoke_to_supervisor(7, 12, 0xA000, crate::kernel::vm::PAGE_SIZE as u64)
+            .expect("report revoke");
+
+        let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(
+            msg.opcode,
+            crate::kernel::supervisor_abi::SUPERVISOR_OP_TRANSFER_REVOKED
+        );
+        assert_eq!(msg.as_slice().len(), 32);
+        let event = crate::kernel::supervisor_abi::TransferRevokedEvent::decode(msg.as_slice())
+            .expect("event");
+        assert_eq!(event.owner_pid, 7);
+        assert_eq!(event.cap, 12);
+        assert_eq!(event.base, 0xA000);
+        assert_eq!(event.len, crate::kernel::vm::PAGE_SIZE as u64);
     }
 
     #[test]

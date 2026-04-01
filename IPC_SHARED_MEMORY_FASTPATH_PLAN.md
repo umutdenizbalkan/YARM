@@ -50,7 +50,7 @@ Acceptance checks:
 
 - [x] Integrate capability revocation with active shared-transfer mappings.
 - [x] Define deterministic behavior for revoked transfer while mapped (read-fault, write-fault, or forced unmap policy).
-- [ ] Emit supervisor-visible fault/revocation events for observability.
+- [x] Emit supervisor-visible fault/revocation events for observability.
 
 Acceptance checks:
 - targeted revocation tests (source revoke, receiver revoke, endpoint teardown).
@@ -89,4 +89,4 @@ Each PR in this sequence should:
 
 - Phase 1 landed in PRs up to commit `5460f97`.
 - Phase 2 landed in PRs up to commit `7d1ab28`.
-- Current pass starts Phase 4 by enforcing revoke-triggered forced-unmap for active transfer mappings and logging revocation events.
+- Current pass completes Phase 4 by emitting structured transfer-revocation events to the supervisor fault endpoint while preserving forced-unmap semantics.
