@@ -4461,6 +4461,36 @@ mod tests {
     }
 
     #[test]
+    fn driver_tasks_pin_to_first_enqueue_cpu() {
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        state
+            .register_task_with_class(71, TaskClass::Driver)
+            .expect("driver");
+
+        state.set_current_cpu(CpuId(0)).expect("cpu0");
+        assert_eq!(state.enqueue_task(71).expect("enqueue first"), CpuId(0));
+        assert!(state.scheduler.runnable_count_on(CpuId(0)) >= 1);
+        for _ in 0..4 {
+            if state.current_tid() == Some(71) {
+                break;
+            }
+            let _ = state.on_preempt_current_cpu();
+        }
+        if state.current_tid() == Some(71) {
+            let _ = state.block_current_cpu();
+        }
+
+        state.set_current_cpu(CpuId(1)).expect("cpu1");
+        assert_eq!(state.enqueue_task(71).expect("enqueue second"), CpuId(0));
+        assert_eq!(state.scheduler.runnable_count_on(CpuId(1)), 0);
+        assert!(state.scheduler.runnable_count_on(CpuId(0)) >= 1);
+
+        state.set_current_cpu(CpuId(0)).expect("cpu0");
+        assert_ne!(state.dispatch_next_current_cpu(), None);
+    }
+
+    #[test]
     fn detach_iova_space_revokes_dma_window_validation() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(31).expect("task");

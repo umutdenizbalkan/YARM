@@ -100,11 +100,43 @@ impl KernelState {
         })
     }
 
+    fn task_cpu_affinity(&self, tid: u64) -> Result<Option<CpuId>, KernelError> {
+        if tid == 0 {
+            return Ok(None);
+        }
+        self.tcbs
+            .iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .map(|tcb| tcb.cpu_affinity)
+            .ok_or(KernelError::TaskMissing)
+    }
+
+    fn ensure_driver_affinity(&mut self, tid: u64) -> Result<(), KernelError> {
+        if tid == 0 {
+            return Ok(());
+        }
+        let current_cpu = self.current_cpu;
+        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        if tcb.class == TaskClass::Driver && tcb.cpu_affinity.is_none() {
+            tcb.cpu_affinity = Some(current_cpu);
+        }
+        Ok(())
+    }
+
     pub(crate) fn enqueue_task(&mut self, tid: u64) -> Result<CpuId, KernelError> {
+        self.ensure_driver_affinity(tid)?;
         let priority = self.task_priority(tid)?;
-        self.scheduler
-            .enqueue_balanced(ThreadId(tid), priority)
-            .map_err(map_scheduler_error)
+        if let Some(cpu) = self.task_cpu_affinity(tid)? {
+            self.scheduler
+                .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
+                .map_err(map_scheduler_error)?;
+            Ok(cpu)
+        } else {
+            self.scheduler
+                .enqueue_balanced(ThreadId(tid), priority)
+                .map_err(map_scheduler_error)
+        }
     }
 
     pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {

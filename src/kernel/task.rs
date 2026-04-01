@@ -1,5 +1,6 @@
 use super::capabilities::CapId;
 use super::ipc::ThreadId;
+use super::scheduler::CpuId;
 use super::vm::{Asid, VirtAddr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -131,6 +132,8 @@ pub struct ThreadControlBlock {
     pub fault_policy_override: Option<FaultPolicy>,
     pub restart: RestartState,
     pub kernel_context: KernelExecutionContext,
+    /// If set, scheduler enqueues this task only on the selected CPU.
+    pub cpu_affinity: Option<CpuId>,
 }
 
 impl ThreadControlBlock {
@@ -149,6 +152,7 @@ impl ThreadControlBlock {
             fault_policy_override: None,
             restart: RestartState::default(),
             kernel_context: KernelExecutionContext::default(),
+            cpu_affinity: None,
         }
     }
 }
