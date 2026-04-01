@@ -1,4 +1,6 @@
 use crate::kernel::task::ArchSwitchContext;
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 unsafe extern "C" {
@@ -37,6 +39,10 @@ yarm_x86_switch_frame:
 
 #[inline]
 pub fn switch_frames(prev: &mut ArchSwitchContext, next: &ArchSwitchContext) {
+    #[cfg(test)]
+    {
+        SWITCH_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     unsafe {
         yarm_x86_switch_frame(prev as *mut _, next as *const _);
@@ -46,6 +52,19 @@ pub fn switch_frames(prev: &mut ArchSwitchContext, next: &ArchSwitchContext) {
     {
         let _ = (prev, next);
     }
+}
+
+#[cfg(test)]
+static SWITCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub fn reset_switch_call_count_for_test() {
+    SWITCH_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn switch_call_count_for_test() -> usize {
+    SWITCH_CALLS.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
