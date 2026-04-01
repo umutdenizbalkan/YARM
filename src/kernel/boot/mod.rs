@@ -548,6 +548,16 @@ impl KernelState {
         self.scheduler_state.lock()
     }
 
+    fn with_scheduler_state<R>(&self, f: impl FnOnce(&SchedulerState) -> R) -> R {
+        let sched = self.scheduler_state.lock();
+        f(&sched)
+    }
+
+    fn with_scheduler_state_mut<R>(&mut self, f: impl FnOnce(&mut SchedulerState) -> R) -> R {
+        let mut sched = self.scheduler_state.lock();
+        f(&mut sched)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_timer_for_test(&mut self, timer: Timer) {
         let mut sched = self.scheduler_state.lock();
@@ -574,6 +584,26 @@ impl KernelState {
     fn with_ipc_state_mut<R>(&mut self, f: impl FnOnce(&mut IpcSubsystem) -> R) -> R {
         let _ipc_guard = self.ipc_state_lock.lock();
         f(kernel_mut(&mut self.ipc))
+    }
+
+    fn with_scheduler_then_ipc<R>(
+        &self,
+        f: impl FnOnce(&SchedulerState, &IpcSubsystem) -> R,
+    ) -> R {
+        let sched = self.scheduler_state.lock();
+        let _ipc_guard = self.ipc_state_lock.lock();
+        f(&sched, kernel_ref(&self.ipc))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_order_snapshot_for_test(&self) -> (u8, usize, u64) {
+        self.with_scheduler_then_ipc(|sched, ipc| {
+            (
+                sched.current_cpu.0,
+                kernel_ref(&sched.scheduler).online_cpu_count(),
+                ipc.telemetry.scheduler_dispatch_calls,
+            )
+        })
     }
 }
 
@@ -4464,6 +4494,21 @@ mod tests {
         }
         assert_eq!(irq_msgs, 5);
         assert_eq!(state.online_cpu_count(), 2);
+    }
+
+    #[test]
+    fn lock_order_snapshot_reads_scheduler_then_ipc_domains() {
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(2).expect("ep");
+        state
+            .ipc_send(send_cap, Message::new(1, b"ok").expect("msg"))
+            .expect("send");
+
+        let (cpu, online, dispatch_calls) = state.lock_order_snapshot_for_test();
+        assert_eq!(cpu, 0);
+        assert!(online >= 1);
+        assert_eq!(dispatch_calls, 1);
     }
 
     #[test]

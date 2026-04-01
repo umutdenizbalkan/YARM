@@ -63,6 +63,16 @@ into independently lockable domains while preserving behavior.
 - Migrate endpoint waiter and capability liveness checks in `boot/mod.rs` to
   IPC accessor-backed reads.
 
+### Phase 3d (completed in this pass)
+
+- Add explicit lock-order helper API on `KernelState`:
+  - `with_scheduler_state(...)`
+  - `with_scheduler_state_mut(...)`
+  - `with_scheduler_then_ipc(...)` (ordered acquisition: scheduler -> IPC)
+- Migrate scheduler entry points to the new scheduler helper API.
+- Add a lock-order snapshot test that reads scheduler+IPC state through the
+  ordered helper.
+
 ## Phase 4
 
 - Extract VM/memory/task domains into additional lockable partitions:

@@ -16,32 +16,36 @@ fn map_smp_error(err: SmpError) -> KernelError {
 
 impl KernelState {
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
-        let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler)
-            .bring_up_cpu(cpu)
-            .map_err(map_scheduler_error)?;
+        self.with_scheduler_state_mut(|sched| {
+            kernel_mut(&mut sched.scheduler)
+                .bring_up_cpu(cpu)
+                .map_err(map_scheduler_error)
+        })?;
         crate::arch::cpu_mapping::register_cpu_mapping(cpu);
         Ok(())
     }
 
     pub fn set_current_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
-        let mut sched = self.scheduler_state();
-        kernel_ref(&sched.scheduler)
-            .validate_online_cpu(cpu)
-            .map_err(map_scheduler_error)?;
-        sched.current_cpu = cpu;
+        self.with_scheduler_state_mut(|sched| {
+            kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .map_err(map_scheduler_error)?;
+            sched.current_cpu = cpu;
+            Ok(())
+        })?;
         Ok(())
     }
 
     pub fn current_cpu(&self) -> CpuId {
-        self.scheduler_state().current_cpu
+        self.with_scheduler_state(|sched| sched.current_cpu)
     }
 
     pub fn current_tid(&self) -> Option<u64> {
-        let sched = self.scheduler_state();
-        kernel_ref(&sched.scheduler)
-            .current_tid_on(sched.current_cpu)
-            .map(|tid| tid.0)
+        self.with_scheduler_state(|sched| {
+            kernel_ref(&sched.scheduler)
+                .current_tid_on(sched.current_cpu)
+                .map(|tid| tid.0)
+        })
     }
 
     pub fn dispatch_next_current_cpu(&mut self) -> Option<u64> {
@@ -73,8 +77,7 @@ impl KernelState {
     }
 
     pub fn online_cpu_count(&self) -> usize {
-        let sched = self.scheduler_state();
-        kernel_ref(&sched.scheduler).online_cpu_count()
+        self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).online_cpu_count())
     }
 
     pub fn present_cpu_count(&self) -> usize {
