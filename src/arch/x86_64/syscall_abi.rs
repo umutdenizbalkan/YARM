@@ -1,5 +1,8 @@
 // x86_64 syscall/trap ABI shape constants for the prototype kernel ABI.
 //
+// Strategy lock-in (PR-5): user mode enters kernel syscalls via `int 0x80`
+// routed through a dedicated IDT gate path (not `syscall/sysret` yet).
+//
 // Register mapping (System V AMD64 ABI / YARM convention):
 //   syscall_num: rax
 //   args[0..5]:  rdi, rsi, rdx, rcx, r8, r9

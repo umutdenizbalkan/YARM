@@ -480,6 +480,23 @@ yarm_x86_common_trap_entry:
 );
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .section .text, "ax", @progbits
+    .global yarm_x86_syscall_entry
+    .type yarm_x86_syscall_entry, @function
+yarm_x86_syscall_entry:
+    push 0x80
+    jmp yarm_x86_common_trap_entry
+"#
+);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+unsafe extern "C" {
+    fn yarm_x86_syscall_entry();
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 macro_rules! declare_all_isr_stubs {
     ($($name:ident),* $(,)?) => {
         unsafe extern "C" {
@@ -774,11 +791,12 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         let idt_ptr = core::ptr::addr_of_mut!(BOOT_IDT).cast::<X86IdtEntry>();
         let mut i = 0usize;
         while i < IDT_ENTRIES {
-            let handler = ISR_STUBS[i] as *const () as u64;
+            let mut handler = ISR_STUBS[i] as *const () as u64;
             let mut dpl = 0;
             let mut ist = 0;
             if i == VEC_SYSCALL {
                 dpl = 3;
+                handler = yarm_x86_syscall_entry as *const () as u64;
             } else if i == VEC_NMI {
                 ist = IST_SLOT_NMI;
             } else if i == VEC_DOUBLE_FAULT {
