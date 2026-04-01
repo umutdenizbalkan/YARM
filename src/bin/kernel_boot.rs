@@ -2,11 +2,17 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 use yarm::kernel::boot::Bootstrap;
+#[cfg(not(test))]
 use yarm::kernel::ipc::Message;
+#[cfg(not(test))]
 use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
+#[cfg(not(test))]
 use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
+#[cfg(not(test))]
 use yarm::kernel::vfs::{OpenAtRequest, ReadWriteRequest, openat_message, read_message};
+#[cfg(not(test))]
 use yarm::services::common::vfs_service::{VfsReply, VfsService};
+#[cfg(not(test))]
 use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -102,7 +108,7 @@ fn debug_uart_marker(byte: u8) {
 }
 
 #[inline]
-fn run() {
+fn run_boot_markers() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     {
         debug_uart_marker(b'H');
@@ -129,7 +135,10 @@ fn run() {
     );
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     debug_uart_marker(b'K');
+}
 
+#[cfg(not(test))]
+fn run_process_vfs_smoke() {
     let mut proc = ProcessService::new();
     let spawn = Message::with_header(
         0,
@@ -183,6 +192,13 @@ fn run() {
         read_rep.opcode
     );
     yarm::yarm_log!("YARM_INIT_DONE");
+}
+
+fn run() {
+    run_boot_markers();
+
+    #[cfg(not(test))]
+    run_process_vfs_smoke();
 
     #[cfg(not(feature = "hosted-dev"))]
     loop {
@@ -212,7 +228,7 @@ mod tests {
 
     #[test]
     fn kernel_boot_markers_run() {
-        run();
+        run_boot_markers();
     }
 }
 
