@@ -156,7 +156,43 @@ fi
 set -e
 
 if log_has_pattern "$MARKER_REGEX"; then
-  echo "[ok] boot markers detected"
+  if [[ "$QEMU_SMOKE_STRICT" != "1" ]]; then
+    echo "[ok] boot markers detected"
+    exit 0
+  fi
+
+  strict_fail=0
+  if ! log_has_pattern "YARM_TIMER_IRQ_DELIVERED"; then
+    echo "[warn] strict smoke: missing timer IRQ delivery marker"
+    strict_fail=1
+  fi
+  if ! log_has_pattern "YARM_TIMER_EOI_DONE"; then
+    echo "[warn] strict smoke: missing timer EOI completion marker"
+    strict_fail=1
+  fi
+  if ! log_has_pattern "YARM_SCHED_TICK"; then
+    echo "[warn] strict smoke: missing scheduler tick marker"
+    strict_fail=1
+  fi
+
+  tick_lines=$(tr '\r' '\n' <"$LOGFILE" | rg -a -o "YARM_SCHED_TICK cpu=[0-9]+ tick=[0-9]+" || true)
+  tick_count=$(printf '%s\n' "$tick_lines" | rg -c "YARM_SCHED_TICK" || true)
+  first_tick=$(printf '%s\n' "$tick_lines" | head -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
+  last_tick=$(printf '%s\n' "$tick_lines" | tail -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
+  if [[ -z "$first_tick" || -z "$last_tick" || "$tick_count" -lt 2 ]]; then
+    echo "[warn] strict smoke: need at least two scheduler tick markers (got ${tick_count:-0})"
+    strict_fail=1
+  elif (( last_tick <= first_tick )); then
+    echo "[warn] strict smoke: scheduler tick did not progress (first=$first_tick last=$last_tick)"
+    strict_fail=1
+  fi
+
+  if [[ "$strict_fail" -eq 1 ]]; then
+    echo "[warn] strict x86 smoke marker checks failed"
+    exit 1
+  fi
+
+  echo "[ok] strict x86 smoke markers detected (timer IRQ + EOI + scheduler tick progress)"
   exit 0
 fi
 

@@ -84,7 +84,22 @@ impl KernelState {
             }
             Trap::TimerInterrupt => {
                 self.hal.acknowledge_interrupt(self.current_cpu(), 0);
-                let (_, should_preempt) = self.timer.tick_and_check();
+                #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+                crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);
+                let (_tick, should_preempt) = self.timer.tick_and_check();
+                #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+                crate::yarm_log!(
+                    "YARM_SCHED_TICK cpu={} tick={} preempt={}",
+                    self.current_cpu().0,
+                    _tick.0,
+                    should_preempt as u8
+                );
+                #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+                crate::yarm_log!(
+                    "YARM_TIMER_IRQ_DELIVERED cpu={} tick={}",
+                    self.current_cpu().0,
+                    _tick.0
+                );
                 if should_preempt {
                     self.yield_current()
                         .map_err(SyscallError::from)
