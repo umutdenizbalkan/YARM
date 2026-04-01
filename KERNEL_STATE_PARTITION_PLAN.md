@@ -151,6 +151,53 @@ into independently lockable domains while preserving behavior.
     (`capacity_telemetry`) to `with_ipc_state(...)` accessors
 - This closes the extraction loop needed to start the next partitioning phase.
 
+## Phase 6 (planned)
+
+Split the remaining multi-concern boot state into explicit lockable domains for
+driver, fault, and restart flows. This phase focuses on reducing lock coupling
+with task/ipc/vm/memory paths while preserving behavior.
+
+### Phase 6a (planned): Driver domain extraction
+
+- Extract `DriverState` from `KernelState` fields currently used by
+  `boot/driver_state.rs` and related helpers.
+- Add lock/accessor API:
+  - `driver_state_lock: SpinLockIrq<()>` (or `SpinLockIrq<DriverState>`)
+  - `with_driver_state(...)`
+  - `with_driver_state_mut(...)`
+- Migrate driver registration/delegation/runtime-capability bookkeeping call
+  paths to the new accessor layer.
+- Add focused tests for driver registration and delegation flows under the new
+  lock domain.
+
+### Phase 6b (planned): Fault domain extraction
+
+- Extract `FaultState` from `KernelState` fields currently used by
+  `boot/fault_state.rs` and supervisor fault-reporting paths.
+- Add lock/accessor API:
+  - `fault_state_lock: SpinLockIrq<()>` (or `SpinLockIrq<FaultState>`)
+  - `with_fault_state(...)`
+  - `with_fault_state_mut(...)`
+- Migrate fault recording/reporting/policy call paths to the fault accessor
+  layer and keep trap hot paths minimal.
+- Add tests for fault-policy behavior and supervisor notification wiring under
+  extracted fault state.
+
+### Phase 6c (planned): Restart domain extraction + lock-order hardening
+
+- Extract `RestartState` from `KernelState` fields currently used by
+  `boot/restart_state.rs` (exit/restart tokens, lifecycle transitions).
+- Add lock/accessor API:
+  - `restart_state_lock: SpinLockIrq<()>` (or `SpinLockIrq<RestartState>`)
+  - `with_restart_state(...)`
+  - `with_restart_state_mut(...)`
+- Migrate task-exit and restart paths to the restart accessor layer, minimizing
+  cross-domain critical sections.
+- Add lock-order validation tests to cover any new multi-domain acquisition
+  paths introduced by driver/fault/restart extraction.
+- Update lock-order guidance (below) from “if split further” to concrete domain
+  order once extraction lands.
+
 ## Lock ordering (proposed)
 
 To avoid deadlocks as partitioning progresses, acquire in this order:
