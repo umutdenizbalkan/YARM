@@ -8,6 +8,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(any(test, not(feature = "hosted-dev")))]
 const LAPIC_EOI_OFFSET: usize = 0xB0;
 #[cfg(any(test, not(feature = "hosted-dev")))]
+const LAPIC_SVR_OFFSET: usize = 0xF0;
+#[cfg(any(test, not(feature = "hosted-dev")))]
 const LAPIC_LVT_TIMER_OFFSET: usize = 0x320;
 #[cfg(any(test, not(feature = "hosted-dev")))]
 const LAPIC_TIMER_INITIAL_COUNT_OFFSET: usize = 0x380;
@@ -17,6 +19,10 @@ const LAPIC_TIMER_DIVIDE_CONFIG_OFFSET: usize = 0x3E0;
 const LAPIC_TIMER_VECTOR: u32 = 0x20;
 #[cfg(any(test, not(feature = "hosted-dev")))]
 const LAPIC_TIMER_DIVIDE_BY_16: u32 = 0x3;
+#[cfg(any(test, not(feature = "hosted-dev")))]
+const LAPIC_SPURIOUS_VECTOR: u32 = 0xFF;
+#[cfg(any(test, not(feature = "hosted-dev")))]
+const LAPIC_SVR_ENABLE: u32 = 1 << 8;
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
 static LAPIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -41,6 +47,7 @@ pub fn init_lapic_mmio_base(base: usize) {
             return;
         }
     }
+    lapic_write_u32(base, LAPIC_SVR_OFFSET, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR);
     LAPIC_MMIO_BASE.store(base, Ordering::Relaxed);
     LAPIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
@@ -181,8 +188,9 @@ mod tests {
 
     #[test]
     fn init_lapic_marks_controller_configured() {
+        let mut regs = [0u32; 512];
         LAPIC_CONFIGURED.store(false, Ordering::Relaxed);
-        init_lapic_mmio_base(0x1000);
+        init_lapic_mmio_base(regs.as_mut_ptr() as usize);
         assert!(LAPIC_CONFIGURED.load(Ordering::Relaxed));
     }
 
@@ -214,6 +222,16 @@ mod tests {
         assert_eq!(
             regs[LAPIC_TIMER_INITIAL_COUNT_OFFSET / core::mem::size_of::<u32>()],
             42
+        );
+    }
+
+    #[test]
+    fn init_lapic_programs_spurious_vector_enable_bit() {
+        let mut regs = [0u32; 512];
+        init_lapic_mmio_base(regs.as_mut_ptr() as usize);
+        assert_eq!(
+            regs[LAPIC_SVR_OFFSET / core::mem::size_of::<u32>()],
+            LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR
         );
     }
 }
