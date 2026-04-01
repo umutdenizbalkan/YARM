@@ -18,20 +18,21 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
 
 impl KernelState {
     pub fn thread_group_id(&self, tid: u64) -> Option<ThreadGroupId> {
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.thread_group_id)
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.thread_group_id)
+        })
     }
 
     pub fn thread_tls_base(&self, tid: u64) -> Option<usize> {
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.tls_ptr.map(|ptr| ptr.0 as usize))
-            .flatten()
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.tls_ptr.map(|ptr| ptr.0 as usize))
+        })
     }
 
     pub fn process_id(&self, tid: u64) -> Option<u64> {
@@ -43,19 +44,21 @@ impl KernelState {
     }
 
     pub fn thread_user_context(&self, tid: u64) -> Option<UserRegisterContext> {
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.user_context)
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.user_context)
+        })
     }
 
     pub fn thread_kernel_context(&self, tid: u64) -> Option<KernelExecutionContext> {
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.kernel_context)
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.kernel_context)
+        })
     }
 
     pub fn set_thread_kernel_stack(
@@ -96,9 +99,10 @@ impl KernelState {
 
     pub(crate) fn provision_default_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
         let idx = self
-            .tcbs
-            .iter()
-            .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid))
+            .with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == tid))
+            })
             .ok_or(KernelError::TaskMissing)?;
 
         let stack_base = KERNEL_STACK_REGION_BASE
@@ -140,16 +144,18 @@ impl KernelState {
     }
 
     pub fn tls_restore_pending(&self, tid: u64) -> Option<bool> {
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| {
-                self.tls_restore_pending
-                    .iter()
-                    .flatten()
-                    .any(|pending_tid| *pending_tid == tcb.tid)
-            })
+        let thread_id = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.tid)
+        })?;
+        Some(
+            self.tls_restore_pending
+                .iter()
+                .flatten()
+                .any(|pending_tid| *pending_tid == thread_id),
+        )
     }
 
     pub fn take_tls_restore_request(&mut self, tid: u64) -> Result<Option<usize>, KernelError> {
@@ -171,11 +177,12 @@ impl KernelState {
     }
 
     pub fn thread_detach_state(&self, tid: u64) -> Option<ThreadDetachState> {
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.detach_state)
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.detach_state)
+        })
     }
 
     pub fn join_thread(&mut self, tid: u64) -> Result<Option<u64>, KernelError> {
@@ -268,22 +275,26 @@ impl KernelState {
     }
 
     pub(crate) fn wake_joiners_for(&mut self, target_tid: u64) -> Result<u32, KernelError> {
-        let mut woken = 0u32;
-        for idx in 0..self.tcbs.len() {
-            let wake_tid = {
-                let Some(tcb) = self.tcbs[idx].as_mut() else {
-                    continue;
-                };
+        let wake_tids = self.with_tcbs_mut(|tcbs| {
+            let mut wake_tids = [None; super::MAX_TASKS];
+            let mut wake_count = 0usize;
+            for tcb in tcbs.iter_mut().flatten() {
                 if tcb.status != TaskStatus::Blocked(WaitReason::Join(ThreadId(target_tid))) {
                     continue;
                 }
                 tcb.status = TaskStatus::Runnable;
-                tcb.tid.0
-            };
-            self.enqueue_task(wake_tid)?;
-            woken += 1;
+                if wake_count < wake_tids.len() {
+                    wake_tids[wake_count] = Some(tcb.tid.0);
+                    wake_count += 1;
+                }
+            }
+            (wake_tids, wake_count)
+        });
+        let (wake_tids, wake_count) = wake_tids;
+        for wake_tid in wake_tids.iter().take(wake_count).flatten() {
+            self.enqueue_task(*wake_tid)?;
         }
-        Ok(woken)
+        Ok(wake_count as u32)
     }
 
     pub(crate) fn reap_if_detached(&mut self, tid: u64) -> Result<(), KernelError> {
@@ -324,11 +335,12 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
         let parent = self
-            .tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == parent_tid)
-            .cloned()
+            .with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == parent_tid)
+                    .cloned()
+            })
             .ok_or(KernelError::TaskMissing)?;
         let tid = self.allocate_thread_id()?;
         self.register_task_with_class_in_process(tid, parent.class, parent.thread_group_id.0)?;

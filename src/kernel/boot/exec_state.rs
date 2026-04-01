@@ -16,48 +16,52 @@ impl KernelState {
             return Ok(());
         }
 
-        let outgoing_idx = self
-            .tcbs
+        let outgoing_idx = self.with_tcbs(|tcbs| {
+            tcbs
             .iter()
             .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == outgoing_tid))
-            .ok_or(KernelError::TaskMissing)?;
-        let incoming_idx = self
-            .tcbs
+        })
+        .ok_or(KernelError::TaskMissing)?;
+        let incoming_idx = self.with_tcbs(|tcbs| {
+            tcbs
             .iter()
             .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == incoming_tid))
-            .ok_or(KernelError::TaskMissing)?;
+        })
+        .ok_or(KernelError::TaskMissing)?;
 
         if outgoing_idx == incoming_idx {
             return Ok(());
         }
 
-        let (outgoing_tcb, incoming_tcb) = if outgoing_idx < incoming_idx {
-            let (left, right) = self.tcbs.split_at_mut(incoming_idx);
-            (
-                left[outgoing_idx]
-                    .as_mut()
-                    .ok_or(KernelError::TaskMissing)?,
-                right[0].as_mut().ok_or(KernelError::TaskMissing)?,
-            )
-        } else {
-            let (left, right) = self.tcbs.split_at_mut(outgoing_idx);
-            (
-                right[0].as_mut().ok_or(KernelError::TaskMissing)?,
-                left[incoming_idx]
-                    .as_mut()
-                    .ok_or(KernelError::TaskMissing)?,
-            )
-        };
+        self.with_tcbs_mut(|tcbs| {
+            let (outgoing_tcb, incoming_tcb) = if outgoing_idx < incoming_idx {
+                let (left, right) = tcbs.split_at_mut(incoming_idx);
+                (
+                    left[outgoing_idx]
+                        .as_mut()
+                        .ok_or(KernelError::TaskMissing)?,
+                    right[0].as_mut().ok_or(KernelError::TaskMissing)?,
+                )
+            } else {
+                let (left, right) = tcbs.split_at_mut(outgoing_idx);
+                (
+                    right[0].as_mut().ok_or(KernelError::TaskMissing)?,
+                    left[incoming_idx]
+                        .as_mut()
+                        .ok_or(KernelError::TaskMissing)?,
+                )
+            };
 
-        if !outgoing_tcb.kernel_context.initialized || !incoming_tcb.kernel_context.initialized {
-            return Ok(());
-        }
+            if !outgoing_tcb.kernel_context.initialized || !incoming_tcb.kernel_context.initialized {
+                return Ok(());
+            }
 
-        crate::arch::selected_isa::context_switch::switch_frames(
-            &mut outgoing_tcb.kernel_context.frame,
-            &incoming_tcb.kernel_context.frame,
-        );
-        Ok(())
+            crate::arch::selected_isa::context_switch::switch_frames(
+                &mut outgoing_tcb.kernel_context.frame,
+                &incoming_tcb.kernel_context.frame,
+            );
+            Ok(())
+        })
     }
 
     pub fn futex_wait_current(
@@ -87,25 +91,26 @@ impl KernelState {
         if max_wake == 0 {
             return Ok(0);
         }
-        let mut woken = 0u32;
-        for idx in 0..self.tcbs.len() {
-            if woken >= max_wake {
-                break;
-            }
-            let wake_tid = {
-                let Some(tcb) = self.tcbs[idx].as_mut() else {
-                    continue;
-                };
+        let (wake_tids, wake_count) = self.with_tcbs_mut(|tcbs| {
+            let mut wake_tids = [None; super::MAX_TASKS];
+            let mut wake_count = 0usize;
+            for tcb in tcbs.iter_mut().flatten() {
+                if wake_count >= max_wake as usize {
+                    break;
+                }
                 if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {
                     continue;
                 }
                 tcb.status = TaskStatus::Runnable;
-                tcb.tid.0
-            };
-            self.enqueue_task(wake_tid)?;
-            woken += 1;
+                wake_tids[wake_count] = Some(tcb.tid.0);
+                wake_count += 1;
+            }
+            (wake_tids, wake_count)
+        });
+        for wake_tid in wake_tids.iter().take(wake_count).flatten() {
+            self.enqueue_task(*wake_tid)?;
         }
-        Ok(woken)
+        Ok(wake_count as u32)
     }
 
     pub fn spawn_user_task_from_image(
