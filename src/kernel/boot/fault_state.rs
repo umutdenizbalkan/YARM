@@ -107,7 +107,7 @@ impl KernelState {
                 }
                 self.hal.program_timer_deadline(
                     self.current_cpu(),
-                    crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+                    crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
                 );
                 Ok(())
             }

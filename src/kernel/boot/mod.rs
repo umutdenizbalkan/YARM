@@ -32,7 +32,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
 };
-use crate::arch::{platform_layout, topology};
+use crate::arch::{platform_constants, topology};
 use crate::kernel::frame_allocator::{
     MemoryRegion, PhysicalFrameAllocator, init_pt_frame_allocator,
 };
@@ -99,7 +99,7 @@ const MAX_BOOT_MEMORY_REGIONS: usize = 64;
 const MAX_NOTIFICATIONS: usize = 64;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_NOTIFICATIONS: usize = 32;
-const MAX_IRQ_LINES: usize = platform_layout::MAX_IRQ_LINES;
+const MAX_IRQ_LINES: usize = platform_constants::MAX_IRQ_LINES;
 #[cfg(feature = "hosted-dev")]
 const MAX_DRIVERS: usize = 64;
 #[cfg(not(feature = "hosted-dev"))]
@@ -539,7 +539,7 @@ fn map_ipc_error(err: IpcError) -> KernelError {
 impl Bootstrap {
     fn default_boot_memory_map() -> [MemoryRegion; 1] {
         [MemoryRegion {
-            start: platform_layout::NEXT_ANON_PHYS_BASE,
+            start: platform_constants::NEXT_ANON_PHYS_BASE,
             len: 512 * 1024 * 1024,
             usable: true,
         }]
@@ -547,8 +547,8 @@ impl Bootstrap {
 
     fn default_reserved_ranges() -> [(u64, u64); 1] {
         [(
-            platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE,
-            platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE + crate::kernel::vm::PAGE_SIZE as u64,
+            platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE,
+            platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE + crate::kernel::vm::PAGE_SIZE as u64,
         )]
     }
 
@@ -686,9 +686,9 @@ impl Bootstrap {
         let mut kernel_aspace = AddressSpace::new_kernel();
         kernel_aspace
             .map_page(
-                VirtAddr(platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE),
+                VirtAddr(platform_constants::KERNEL_BOOTSTRAP_VIRT_BASE),
                 Mapping {
-                    phys: PhysAddr(platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE),
+                    phys: PhysAddr(platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE),
                     flags: PageFlags::KERNEL_RW,
                 },
             )
@@ -701,7 +701,7 @@ impl Bootstrap {
         scheduler.set_present_cpu_bitmap(topology::default_present_cpu_bitmap());
         scheduler
             .enqueue_on(
-                CpuId(platform_layout::BOOTSTRAP_CPU_ID),
+                CpuId(platform_constants::BOOTSTRAP_CPU_ID),
                 crate::kernel::ipc::ThreadId(0),
             )
             .map_err(map_scheduler_error)?;
@@ -710,9 +710,9 @@ impl Bootstrap {
             kernel_aspace,
             hal: crate::arch::hal::SelectedIsaHal::default(),
             scheduler: store_kernel_value(scheduler),
-            timer: Timer::new(platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS),
+            timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: store_kernel_value(AddressSpaceManager::default()),
-            current_cpu: CpuId(platform_layout::BOOTSTRAP_CPU_ID),
+            current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
             ipc: store_kernel_value(IpcSubsystem {
                 cross_cpu_work: SmpMailbox::default(),
                 endpoints: [const { None }; MAX_ENDPOINTS],

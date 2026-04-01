@@ -428,7 +428,7 @@ fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
     let len = 512 * 1024 * 1024;
 
     [MemoryRegion {
-        start: crate::arch::platform_layout::NEXT_ANON_PHYS_BASE + (512 * 1024 * 1024),
+        start: crate::arch::platform_constants::NEXT_ANON_PHYS_BASE + (512 * 1024 * 1024),
         len,
         usable: true,
     }]

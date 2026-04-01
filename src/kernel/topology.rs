@@ -1,8 +1,8 @@
-use crate::arch::platform_layout;
+use crate::arch::platform_constants;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const MAX_CPUS: usize = platform_layout::MAX_CPUS;
+pub const MAX_CPUS: usize = platform_constants::MAX_CPUS;
 pub type CpuBitmap = u64;
 const _: () = assert!(
     MAX_CPUS <= CpuBitmap::BITS as usize,
@@ -54,7 +54,7 @@ impl CpuTopology {
     }
 
     pub fn from_present_bitmap(present: CpuBitmap) -> Self {
-        let bootstrap = 1u64 << platform_layout::BOOTSTRAP_CPU_ID;
+        let bootstrap = 1u64 << platform_constants::BOOTSTRAP_CPU_ID;
         let masked = present & Self::valid_mask();
         debug_assert!(
             (masked & bootstrap) != 0,
@@ -107,7 +107,7 @@ impl CpuTopology {
         let mut count = 0usize;
         for cpu in 0..MAX_CPUS {
             let cpu_id = cpu as u8;
-            if cpu_id != platform_layout::BOOTSTRAP_CPU_ID && self.cpu_present(cpu_id) {
+            if cpu_id != platform_constants::BOOTSTRAP_CPU_ID && self.cpu_present(cpu_id) {
                 out[count] = Some(cpu_id);
                 count += 1;
             }

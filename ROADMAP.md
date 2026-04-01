@@ -106,6 +106,7 @@ Progress notes:
    - PR B: syscall/trap normalization only.
      - ✅ Moved normalized trap types/routing into `src/arch/trap.rs` and switched ISA trap decoders to consume arch-layer trap normalization directly.
    - PR C: platform layout constants + docs only.
+     - ✅ Added `src/arch/platform_constants.rs` and moved kernel call sites to the platform-constants facade (`crate::arch::platform_constants`) instead of direct `platform_layout` constant use.
 2. **Tighten CI to block placeholder/overscoped submissions**
    - add commit/PR lint that rejects placeholder PR bodies and change sets spanning unrelated domains.
    - require `compat-gates` and at least one architecture smoke job on every architecture-touching PR.

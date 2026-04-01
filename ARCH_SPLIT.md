@@ -113,6 +113,12 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
 - ISA trap decode paths now consume `crate::arch::trap::*` directly (`src/arch/{riscv64,x86_64,aarch64}/trap.rs`) instead of importing trap normalization from kernel-layer modules.
 - `src/kernel/trap.rs` is now a compatibility re-export shim into `crate::arch::trap`, preserving existing kernel/service call sites while keeping normalization ownership in the architecture boundary.
 
+## PR C status: platform layout constants + docs
+
+- Added `src/arch/platform_constants.rs` as the kernel-facing constant facade over selected-ISA `platform_layout` values.
+- Kernel platform-constant call sites now consume `crate::arch::platform_constants` in scheduler/topology/boot/fault/frame-allocation paths, reducing direct `platform_layout` coupling in mechanism code.
+- This keeps PR C scoped to constant-surface cleanup and documentation with no syscall/trap behavior changes.
+
 
 ## Unsupported-architecture policy
 

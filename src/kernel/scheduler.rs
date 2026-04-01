@@ -1,9 +1,9 @@
-use crate::arch::{platform_layout, topology};
+use crate::arch::{platform_constants, topology};
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::topology::CpuTopology;
 
 pub const MAX_RUN_QUEUE: usize = 64;
-pub const MAX_CPUS: usize = platform_layout::MAX_CPUS;
+pub const MAX_CPUS: usize = platform_constants::MAX_CPUS;
 const _: () = assert!(MAX_RUN_QUEUE.is_power_of_two());
 const MEMBERSHIP_SLOTS: usize = 64;
 const MEMBERSHIP_EMPTY: u8 = 0;
