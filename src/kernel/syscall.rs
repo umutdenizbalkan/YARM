@@ -22,7 +22,9 @@ const _: [(); SYSCALL_COUNT] = [(); 5];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
+/// First inline IPC payload register lane in the stable cross-arch syscall ABI.
 pub const SYSCALL_ARG_INLINE_PAYLOAD0: usize = 3;
+/// Second inline IPC payload register lane in the stable cross-arch syscall ABI.
 pub const SYSCALL_ARG_INLINE_PAYLOAD1: usize = 4;
 /// Transfer-cap send requires a known waiting receiver; otherwise send returns `WouldBlock`.
 pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;
@@ -1188,14 +1190,7 @@ mod tests {
             let recv_local_transfer = CapId(recv.ret2() as u64);
             let mut release = TrapFrame::new(
                 Syscall::TransferRelease as usize,
-                [
-                    recv_local_transfer.0 as usize,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
+                [recv_local_transfer.0 as usize, 0, 0, 0, 0, 0],
             );
             dispatch(&mut state, &mut release).expect("release");
             let t = state.ipc_path_telemetry();
@@ -1249,7 +1244,14 @@ mod tests {
             state.yield_current().expect("switch receiver");
             let mut recv = TrapFrame::new(
                 Syscall::IpcRecv as usize,
-                [recv_cap.0 as usize, 0xA000, Message::MAX_PAYLOAD + 16, 0, 0, 0],
+                [
+                    recv_cap.0 as usize,
+                    0xA000,
+                    Message::MAX_PAYLOAD + 16,
+                    0,
+                    0,
+                    0,
+                ],
             );
             dispatch(&mut state, &mut recv).expect("recv");
             let transfer_cap = CapId(recv.ret2() as u64);
