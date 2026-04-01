@@ -1,5 +1,4 @@
 {
-  "SPDX-License-Identifier": "Apache-2.0",
   "llvm-target": "x86_64-unknown-none",
   "arch": "x86_64",
   "vendor": "yarm",
@@ -20,6 +19,5 @@
     "gnu-lld": [
       "-Ttargets/x86_64-yarm-none.ld"
     ]
-  },
-  "spdx-comment": "SPDX-License-Identifier: Apache-2.0"
+  }
 }
