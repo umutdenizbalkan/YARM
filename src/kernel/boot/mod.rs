@@ -1974,20 +1974,22 @@ impl KernelState {
     }
 
     fn effective_fault_policy_for(&self, tid: u64) -> FaultPolicy {
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .and_then(|tcb| tcb.fault_policy_override)
-            .unwrap_or(self.faults.fault_policy)
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.fault_policy_override)
+                .unwrap_or(self.faults.fault_policy)
+        })
     }
 
     pub fn task_asid(&self, tid: u64) -> Option<Asid> {
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .and_then(|tcb| tcb.asid)
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.asid)
+        })
     }
 
     pub fn set_supervisor_endpoint(&mut self, recv_cap: CapId) -> Result<(), KernelError> {
@@ -2013,7 +2015,7 @@ impl KernelState {
     }
 
     pub fn bind_task_asid(&mut self, tid: u64, asid: Asid) -> Result<(), KernelError> {
-        if self.user_spaces.get(asid).is_none() {
+        if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
             return Err(KernelError::Vm(VmError::InvalidAsid));
         }
         let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;

@@ -14,7 +14,7 @@ impl KernelState {
             return Ok(());
         }
         let limits = self.runtime_capacity_config();
-        if self.tcbs.iter().flatten().count() >= limits.max_tasks {
+        if self.with_tcbs(|tcbs| tcbs.iter().flatten().count()) >= limits.max_tasks {
             return Err(KernelError::TaskTableFull);
         }
         let cnode = self
@@ -22,14 +22,20 @@ impl KernelState {
             .unwrap_or(CNodeId(process_pid));
         self.ensure_cnode_space(cnode)?;
         self.set_process_cnode_for_pid(process_pid, cnode)?;
-        if let Some(idx) = self.tcbs.iter().position(|slot| slot.is_none()) {
-            let tcb = ThreadControlBlock::new(ThreadId(tid), class, None);
-            self.tcbs[idx] = Some(tcb);
-            self.provision_default_kernel_context(tid)?;
-            Ok(())
-        } else {
-            Err(KernelError::TaskTableFull)
+        let inserted = self.with_tcbs_mut(|tcbs| {
+            if let Some(idx) = tcbs.iter().position(|slot| slot.is_none()) {
+                let tcb = ThreadControlBlock::new(ThreadId(tid), class, None);
+                tcbs[idx] = Some(tcb);
+                true
+            } else {
+                false
+            }
+        });
+        if !inserted {
+            return Err(KernelError::TaskTableFull);
         }
+        self.provision_default_kernel_context(tid)?;
+        Ok(())
     }
 
     pub fn register_task_with_class(

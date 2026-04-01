@@ -100,6 +100,14 @@ into independently lockable domains while preserving behavior.
     `with_memory_state(...)` / `with_memory_state_mut(...)`
   - task brk bounds read/write paths via memory accessors
 
+### Phase 4c (completed in this pass)
+
+- Continue task/VM callsite migration:
+  - task registration capacity/slot assignment in `task_policy_state.rs` now
+    uses `with_tcbs(...)` / `with_tcbs_mut(...)`
+  - fault-policy and ASID lookup paths in `boot/mod.rs` now use `with_tcbs(...)`
+  - `bind_task_asid` ASID-existence check now uses `with_user_spaces(...)`
+
 ## Lock ordering (proposed)
 
 To avoid deadlocks as partitioning progresses, acquire in this order:
