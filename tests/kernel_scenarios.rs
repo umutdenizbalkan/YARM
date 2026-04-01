@@ -183,6 +183,7 @@ struct SupervisorReplaySummary {
     restored_driver_services: usize,
 }
 
+
 fn run_supervisor_replay_scenario() -> Result<SupervisorReplaySummary, KernelError> {
     let mut kernel = Bootstrap::init()?;
     let mut init = InitService::new();
@@ -434,4 +435,30 @@ fn deterministic_supervisor_replay_restores_core_and_driver_registrations() {
     let summary = run_supervisor_replay_scenario().expect("scenario");
     assert_eq!(summary.restored_managed_services, 6);
     assert_eq!(summary.restored_driver_services, 3);
+}
+
+#[test]
+fn deterministic_end_to_end_server_flow_covers_process_vfs_and_irq_notification_routing() {
+    let handle = std::thread::Builder::new()
+        .name("deterministic-e2e-flow".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mount = run_mount_orchestration_scenario().expect("mount scenario");
+            assert_eq!(mount.low_mount_opcode, VFS_OP_OPENAT);
+            assert_eq!(mount.high_mount_opcode, VFS_OP_OPENAT);
+            assert!(mount.denied_dev_path);
+
+            let summary = run_deterministic_script(&[
+                SimStep::SeedOpcode(PROC_OP_SPAWN_V2),
+                SimStep::SendOpcode(VFS_OP_OPENAT),
+                SimStep::SendOpcode(VFS_OP_READ),
+                SimStep::ExternalIrq(9),
+            ])
+            .expect("server flow");
+            assert_eq!(summary.last_received_opcode, Some(VFS_OP_OPENAT));
+            assert_eq!(summary.last_irq_opcode, Some(9));
+            assert_eq!(summary.send_count, 2);
+        })
+        .expect("spawn thread");
+    handle.join().expect("join");
 }

@@ -87,6 +87,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 4. Add minimal HAL trait conformance docs/tests for RISC-V and one additional ISA target.
    - ✅ Added HAL conformance note for RISC-V + x86 baseline: `HAL_CONFORMANCE.md`.
 5. Expand deterministic end-to-end server flow tests (process_manager + VFS + notification routing).
+   - ✅ Added deterministic end-to-end scenario replay coverage in `tests/kernel_scenarios.rs`, including minimum-profile process-manager/VFS flow and repeated IRQ notification routing checks.
 
 Progress notes:
 - ✅ Added IPC fastpath-vs-queued-vs-blocked telemetry tests under contention in `kernel::boot` tests.
@@ -95,6 +96,7 @@ Progress notes:
 - ✅ Added delegation-bundle helper APIs (`delegate_driver_bundle_checked`, `redelegate_driver_bundle`) and stale-cap regression coverage for helper-driven redelegation paths.
 - ✅ Extended typed process/VFS codec freeze with stable golden vectors + CI enforcement script (`scripts/check-proc-vfs-codec-freeze.sh`).
 - ✅ Added extra HAL conformance targets (AArch64 baseline included) with CI gate script `scripts/check-hal-conformance-targets.sh`.
+- ✅ Expanded deterministic end-to-end server flow test coverage for process-manager + VFS + notification routing with replay-stability assertions.
 
 ## Review follow-up next steps (after oversized placeholder PR)
 

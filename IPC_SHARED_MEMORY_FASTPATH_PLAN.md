@@ -108,3 +108,4 @@ Each PR in this sequence should:
 - Post-fastpath follow-up added delegation-bundle helper APIs (`delegate_driver_bundle_checked`, `redelegate_driver_bundle`) plus stale-cap regression coverage for helper-driven redelegation.
 - Post-fastpath follow-up extended typed process/VFS codec freeze with stable golden vectors and CI enforcement (`scripts/check-proc-vfs-codec-freeze.sh`).
 - Post-fastpath follow-up added extra HAL conformance targets (riscv64/x86_64/aarch64 baseline) with enforcement via `scripts/check-hal-conformance-targets.sh`.
+- Post-fastpath follow-up expanded deterministic end-to-end server flow tests (process-manager + VFS + notification routing) with replay-stability assertions in `tests/kernel_scenarios.rs`.
