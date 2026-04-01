@@ -2,6 +2,7 @@ pub mod aarch64;
 pub mod boot_entry;
 pub mod cpu_mapping;
 pub mod hal;
+pub mod hal_adapters;
 pub mod irq_description;
 pub mod irq_guard;
 pub mod riscv64;

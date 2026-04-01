@@ -101,6 +101,12 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
 
 - `KernelState::handle_selected_arch_trap_entry(...)` now forwards trap handling through `crate::arch::trap_entry::handle_trap_entry(...)`, so runtime integration can use the selected-ISA facade from kernel state.
 
+## PR A status: HAL adapter shims
+
+- Added `src/arch/hal_adapters.rs` as the single selected-ISA adapter surface used by `SelectedIsaHal`.
+- `src/arch/hal.rs` now routes address-space switch, IRQ acknowledge/EOI, timer programming, and trap decoding through adapter shim functions instead of directly calling selected-ISA modules.
+- This keeps the HAL implementation boundary stable while preserving current behavior and avoiding kernel-mechanism changes in PR A scope.
+
 
 ## Unsupported-architecture policy
 

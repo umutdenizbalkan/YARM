@@ -102,6 +102,7 @@ Progress notes:
 
 1. **Split architecture work into reviewable PR slices**
    - PR A: arch module split + HAL adapter shims only.
+     - ✅ Added `src/arch/hal_adapters.rs` and routed `SelectedIsaHal` through adapter shims to keep HAL call sites ISA-facade-only.
    - PR B: syscall/trap normalization only.
    - PR C: platform layout constants + docs only.
 2. **Tighten CI to block placeholder/overscoped submissions**
