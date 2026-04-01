@@ -174,6 +174,16 @@ mod tests {
     }
 
     #[test]
+    fn decode_external_vector_limit_is_exclusive() {
+        let ev = decode_trap_context(X86TrapContext {
+            vector: VEC_EXTERNAL_LIMIT,
+            error_code: 0,
+            fault_addr: 0,
+        });
+        assert_eq!(ev.trap(), Trap::Unknown);
+    }
+
+    #[test]
     fn decode_page_fault_uses_cr2_and_access_bits() {
         let ev = decode_trap_context(X86TrapContext {
             vector: VEC_PAGE_FAULT,
