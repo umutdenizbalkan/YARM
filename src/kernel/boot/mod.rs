@@ -1624,6 +1624,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn selected_arch_trap_entry_routes_external_irq_notification() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_notif_idx, notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
+        state.bind_irq_notification(1, notif_cap).expect("bind");
+        let ctx = crate::arch::trap_entry::ArchTrapContext {
+            vector: 0x21, // external IRQ line 1
+            error_code: 0,
+            fault_addr: 0,
+        };
+
+        state
+            .handle_selected_arch_trap_entry(CpuId(0), ctx, None)
+            .expect("trap");
+
+        let msg = state.ipc_recv(notif_recv_cap).expect("recv").expect("msg");
+        assert_eq!(msg.opcode, 1);
+        assert_eq!(msg.as_slice()[0], 1);
+    }
+
+    #[test]
     fn bootstrap_sets_minimal_kernel_state() {
         let state = Bootstrap::init().expect("bootstrap should fit static limits");
         assert_eq!(state.kernel_aspace.mappings(), 1);
