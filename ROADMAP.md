@@ -87,7 +87,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 4. Add minimal HAL trait conformance docs/tests for RISC-V and one additional ISA target.
    - ✅ Added HAL conformance note for RISC-V + x86 baseline: `HAL_CONFORMANCE.md`.
 5. Expand deterministic end-to-end server flow tests (process_manager + VFS + notification routing).
-   - ✅ Added deterministic end-to-end scenario replay coverage in `tests/kernel_scenarios.rs`, including minimum-profile process-manager/VFS flow and repeated IRQ notification routing checks.
+   - ✅ Added deterministic end-to-end scenario replay coverage in `tests/kernel_scenarios.rs`, including process-manager/VFS opcode flow checks and repeated IRQ notification routing checks.
 
 Progress notes:
 - ✅ Added IPC fastpath-vs-queued-vs-blocked telemetry tests under contention in `kernel::boot` tests.

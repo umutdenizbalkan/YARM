@@ -18,7 +18,7 @@ Kernel core may depend on only these HAL primitives:
 - x86-like profile
 - AArch64-like profile
 
-Both profiles must satisfy identical kernel-facing semantics for:
+All three profiles must satisfy identical kernel-facing semantics for:
 
 - ASID switch observability
 - IRQ acknowledge path observability
