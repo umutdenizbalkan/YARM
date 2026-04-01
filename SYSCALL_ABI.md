@@ -1,7 +1,7 @@
 # YARM Syscall ABI v4 (Frozen Contract)
 
 - ABI Version: `4`
-- Syscall count: `4`
+- Syscall count: `5`
 
 ## Syscall numbers
 
@@ -9,6 +9,7 @@
 - `1`: `IpcSend`
 - `2`: `IpcRecv`
 - `3`: `VmMap` (YARM-native VM map syscall, capability-targeted)
+- `4`: `TransferRelease` (release a recv auto-mapped shared-memory transfer)
 
 ## Argument register layout (`args[0..]`)
 
@@ -30,6 +31,13 @@
 
 This syscall is intentionally YARM-native so Linux-compat `mmap` can keep Linux
 argument order instead of repurposing `arg0` for capabilities.
+
+### `TransferRelease` argument layout
+
+- `args[0]`: receiver-local transferred capability id (`CapId`)
+- `args[1]`: mapped virtual base address (page-aligned)
+- `args[2]`: mapped length in bytes (rounded up to page size by kernel)
+- `args[3..5]`: reserved (must be `0`)
 
 ## IPC model details
 

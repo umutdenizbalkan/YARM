@@ -8,13 +8,14 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
 
-pub const SYSCALL_ABI_VERSION: u16 = 4;
+pub const SYSCALL_ABI_VERSION: u16 = 5;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
 pub const SYSCALL_VM_MAP_NR: usize = 3;
-pub const SYSCALL_COUNT: usize = 4;
-const _: [(); SYSCALL_COUNT] = [(); 4];
+pub const SYSCALL_TRANSFER_RELEASE_NR: usize = 4;
+pub const SYSCALL_COUNT: usize = 5;
+const _: [(); SYSCALL_COUNT] = [(); 5];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -39,10 +40,11 @@ pub enum Syscall {
     IpcSend = SYSCALL_IPC_SEND_NR,
     IpcRecv = SYSCALL_IPC_RECV_NR,
     VmMap = SYSCALL_VM_MAP_NR,
+    TransferRelease = SYSCALL_TRANSFER_RELEASE_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 4;
+    pub const VARIANT_COUNT: usize = 5;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -53,6 +55,7 @@ impl Syscall {
             SYSCALL_IPC_SEND_NR => Ok(Self::IpcSend),
             SYSCALL_IPC_RECV_NR => Ok(Self::IpcRecv),
             SYSCALL_VM_MAP_NR => Ok(Self::VmMap),
+            SYSCALL_TRANSFER_RELEASE_NR => Ok(Self::TransferRelease),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -584,6 +587,41 @@ fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
     Ok(())
 }
 
+fn handle_transfer_release(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    if !current_task_has_user_asid(kernel)? {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let transfer_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let base = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    if len == 0 || !base.is_multiple_of(PAGE_SIZE) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let map_len = round_up_page(len)?;
+    let end = base.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
+    let mut va = base;
+    while va < end {
+        let unmapped = kernel
+            .unmap_user_page_in_current_asid(VirtAddr(va as u64))
+            .map_err(SyscallError::from)?;
+        if unmapped.is_none() {
+            return Err(SyscallError::InvalidArgs);
+        }
+        va += PAGE_SIZE;
+    }
+
+    let cnode = kernel.current_task_cnode().ok_or(SyscallError::Internal)?;
+    kernel
+        .revoke_capability_in_cnode(cnode, transfer_cap)
+        .map_err(SyscallError::from)?;
+    kernel.note_transfer_record_revoked();
+    frame.set_ok(map_len, 0, 0);
+    Ok(())
+}
+
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     match Syscall::decode(frame.syscall_num())? {
         Syscall::Yield => {
@@ -594,6 +632,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::IpcSend => handle_ipc_send(kernel, frame),
         Syscall::IpcRecv => handle_ipc_recv(kernel, frame),
         Syscall::VmMap => handle_vm_map(kernel, frame),
+        Syscall::TransferRelease => handle_transfer_release(kernel, frame),
     }
 }
 
@@ -606,9 +645,10 @@ mod tests {
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
-        assert_eq!(SYSCALL_ABI_VERSION, 4);
+        assert_eq!(SYSCALL_ABI_VERSION, 5);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
+        assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
@@ -948,6 +988,97 @@ mod tests {
         );
         let err = dispatch(&mut state, &mut recv).expect_err("missing write right");
         assert_eq!(err, SyscallError::MissingRight);
+    }
+
+    #[test]
+    fn syscall_transfer_release_unmaps_receiver_range_and_revokes_transfer_cap() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send).expect("send");
+
+        state.yield_current().expect("switch receiver");
+        let map_base = 0xA000usize;
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [
+                recv_cap.0 as usize,
+                map_base,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut recv).expect("recv");
+        let recv_local_transfer = CapId(recv.ret2() as u64);
+
+        let mut release = TrapFrame::new(
+            Syscall::TransferRelease as usize,
+            [
+                recv_local_transfer.0 as usize,
+                map_base,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut release).expect("release");
+        assert_eq!(
+            state
+                .capability_service()
+                .resolve_current_task_capability(recv_local_transfer),
+            None
+        );
+        assert_eq!(
+            state.copy_to_current_user(map_base, b"x"),
+            Err(KernelError::UserMemoryFault)
+        );
+        assert_eq!(state.ipc_path_telemetry().transfer_records_revoked, 1);
+    }
+
+    #[test]
+    fn syscall_transfer_release_rejects_unaligned_base() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        let mut release = TrapFrame::new(
+            Syscall::TransferRelease as usize,
+            [0, 0xA001, PAGE_SIZE, 0, 0, 0],
+        );
+        let err = dispatch(&mut state, &mut release).expect_err("unaligned");
+        assert_eq!(err, SyscallError::InvalidArgs);
     }
 
     #[test]

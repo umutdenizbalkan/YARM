@@ -40,7 +40,7 @@ Acceptance checks:
 
 - [x] Define pin/unpin rules for shared transfer frames while either side holds active mappings.
 - [ ] Ensure map refcounts are updated for both sides and survive task scheduling/restart boundaries.
-- [ ] Add unmap/release syscall path that drops active mapping references and transitions transfer state.
+- [x] Add unmap/release syscall path that drops active mapping references and transitions transfer state.
 
 Acceptance checks:
 - tests validating refcount stability under map/unmap races and task handoff.
@@ -89,4 +89,4 @@ Each PR in this sequence should:
 
 - Phase 1 landed in PRs up to commit `5460f97`.
 - Phase 2 landed in PRs up to commit `7d1ab28`.
-- Current pass starts Phase 3 with transfer pin/unpin lifecycle groundwork.
+- Current pass extends Phase 3 with transfer-release syscall plumbing; remaining work is dual-map lifecycle/refcount behavior.

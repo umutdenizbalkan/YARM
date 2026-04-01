@@ -1270,6 +1270,14 @@ impl KernelState {
             .unwrap_or(false)
     }
 
+    pub(crate) fn note_transfer_record_revoked(&mut self) {
+        self.ipc.telemetry.transfer_records_revoked = self
+            .ipc
+            .telemetry
+            .transfer_records_revoked
+            .saturating_add(1);
+    }
+
     fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
         self.cnode_spaces
             .iter()
