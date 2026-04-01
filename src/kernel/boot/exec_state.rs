@@ -77,8 +77,15 @@ impl KernelState {
             return Ok(false);
         }
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+            Ok::<_, KernelError>(())
+        })?;
         let _ = self.block_current_cpu();
         self.dispatch_next_task()?;
         Ok(true)
@@ -120,13 +127,19 @@ impl KernelState {
         self.register_task_with_class(spec.tid, spec.class)?;
         let cnode = self.task_cnode(spec.tid).ok_or(KernelError::TaskMissing)?;
         self.set_process_cnode_for_pid(spec.tid, cnode)?;
-        if let Some(tcb) = self.tcb_mut(spec.tid) {
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == spec.tid)
+                .ok_or(KernelError::TaskMissing)?;
             tcb.thread_group_id = ThreadGroupId(spec.tid);
             tcb.asid = spec.asid;
             tcb.user_entry = Some(VirtAddr(spec.entry as u64));
             tcb.user_context.instruction_ptr = VirtAddr(spec.entry as u64);
             tcb.status = TaskStatus::Runnable;
-        }
+            Ok::<_, KernelError>(())
+        })?;
         Ok(SpawnedUserTask {
             tid: spec.tid,
             entry: spec.entry,
@@ -156,8 +169,15 @@ impl KernelState {
                         ipc.telemetry.scheduler_context_switches.saturating_add(1);
                 });
             }
-            let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Running;
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Running;
+                Ok::<_, KernelError>(())
+            })?;
         }
         Ok(next)
     }
@@ -174,8 +194,15 @@ impl KernelState {
         let outgoing_tid = self.current_tid();
         let outgoing_asid = outgoing_tid.and_then(|tid| self.task_asid(tid));
         if let Some(tid) = outgoing_tid {
-            let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Runnable;
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Runnable;
+                Ok::<_, KernelError>(())
+            })?;
         }
 
         let next_tid = self.on_preempt_current_cpu();
@@ -193,8 +220,15 @@ impl KernelState {
                         ipc.telemetry.scheduler_context_switches.saturating_add(1);
                 });
             }
-            let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Running;
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Running;
+                Ok::<_, KernelError>(())
+            })?;
         }
         Ok(())
     }

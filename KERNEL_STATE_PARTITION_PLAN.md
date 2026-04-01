@@ -108,6 +108,27 @@ into independently lockable domains while preserving behavior.
   - fault-policy and ASID lookup paths in `boot/mod.rs` now use `with_tcbs(...)`
   - `bind_task_asid` ASID-existence check now uses `with_user_spaces(...)`
 
+### Phase 4d (completed in this pass)
+
+- Migrate thread/task query paths in `boot/thread_state.rs` to task accessors:
+  - thread identity/context accessors (`thread_group_id`, `thread_tls_base`,
+    `thread_user_context`, `thread_kernel_context`, `thread_detach_state`)
+  - default kernel context provisioning index lookup and TLS-restore pending
+    query
+  - joiner wake scan and parent TCB lookup for thread spawn
+
+### Phase 4e (completed in this pass)
+
+- Migrate remaining thread/exec TCB mutation paths in this partitioning sweep to
+  task accessors:
+  - `boot/thread_state.rs`: kernel/user context mutation helpers, join state
+    transitions, TLS base update, spawn initialization, and frame-sync path now
+    use `with_tcbs_mut(...)` / `with_tcbs(...)`
+  - `boot/exec_state.rs`: futex wait status transitions, spawn image TCB
+    initialization, scheduler running/runnable state transitions, and
+    kernel-context switch frame selection now use `with_tcbs(...)` /
+    `with_tcbs_mut(...)`
+
 ## Lock ordering (proposed)
 
 To avoid deadlocks as partitioning progresses, acquire in this order:

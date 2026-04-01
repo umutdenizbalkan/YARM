@@ -70,11 +70,17 @@ impl KernelState {
         if stack_base == 0 || stack_top == 0 || stack_base >= stack_top {
             return Err(KernelError::WrongObject);
         }
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.kernel_context.stack_base = Some(crate::kernel::vm::VirtAddr(stack_base as u64));
-        tcb.kernel_context.stack_top = Some(crate::kernel::vm::VirtAddr(stack_top as u64));
-        tcb.kernel_context.initialized = false;
-        Ok(())
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.kernel_context.stack_base = Some(crate::kernel::vm::VirtAddr(stack_base as u64));
+            tcb.kernel_context.stack_top = Some(crate::kernel::vm::VirtAddr(stack_top as u64));
+            tcb.kernel_context.initialized = false;
+            Ok(())
+        })
     }
 
     pub fn initialize_thread_kernel_switch_frame(
@@ -85,16 +91,22 @@ impl KernelState {
         if switch_entry == 0 {
             return Err(KernelError::WrongObject);
         }
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        let stack_top = tcb
-            .kernel_context
-            .stack_top
-            .ok_or(KernelError::WrongObject)?
-            .0 as usize;
-        tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
-        tcb.kernel_context.frame.set_instruction_ptr(switch_entry);
-        tcb.kernel_context.initialized = true;
-        Ok(())
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            let stack_top = tcb
+                .kernel_context
+                .stack_top
+                .ok_or(KernelError::WrongObject)?
+                .0 as usize;
+            tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
+            tcb.kernel_context.frame.set_instruction_ptr(switch_entry);
+            tcb.kernel_context.initialized = true;
+            Ok(())
+        })
     }
 
     pub(crate) fn provision_default_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
@@ -113,24 +125,36 @@ impl KernelState {
             .ok_or(KernelError::VmFull)?;
         self.set_thread_kernel_stack(tid, stack_base, stack_top)?;
 
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
-        tcb.kernel_context
-            .frame
-            .set_instruction_ptr(yarm_kernel_thread_switch_trampoline as usize);
-        tcb.kernel_context.initialized = false;
-        tcb.kernel_context.owns_stack = true;
-        Ok(())
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
+            tcb.kernel_context
+                .frame
+                .set_instruction_ptr(yarm_kernel_thread_switch_trampoline as usize);
+            tcb.kernel_context.initialized = false;
+            tcb.kernel_context.owns_stack = true;
+            Ok(())
+        })
     }
 
     pub(crate) fn release_kernel_context(&mut self, tid: u64) -> Result<(), KernelError> {
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.kernel_context.stack_base = None;
-        tcb.kernel_context.stack_top = None;
-        tcb.kernel_context.frame = Default::default();
-        tcb.kernel_context.initialized = false;
-        tcb.kernel_context.owns_stack = false;
-        Ok(())
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.kernel_context.stack_base = None;
+            tcb.kernel_context.stack_top = None;
+            tcb.kernel_context.frame = Default::default();
+            tcb.kernel_context.initialized = false;
+            tcb.kernel_context.owns_stack = false;
+            Ok(())
+        })
     }
 
     pub fn set_thread_user_context(
@@ -138,9 +162,15 @@ impl KernelState {
         tid: u64,
         context: UserRegisterContext,
     ) -> Result<(), KernelError> {
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.user_context = context;
-        Ok(())
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.user_context = context;
+            Ok(())
+        })
     }
 
     pub fn tls_restore_pending(&self, tid: u64) -> Option<bool> {
@@ -171,9 +201,15 @@ impl KernelState {
     }
 
     pub fn mark_thread_detached(&mut self, tid: u64) -> Result<(), KernelError> {
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.detach_state = ThreadDetachState::Detached;
-        Ok(())
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.detach_state = ThreadDetachState::Detached;
+            Ok(())
+        })
     }
 
     pub fn thread_detach_state(&self, tid: u64) -> Option<ThreadDetachState> {
@@ -186,11 +222,18 @@ impl KernelState {
     }
 
     pub fn join_thread(&mut self, tid: u64) -> Result<Option<u64>, KernelError> {
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        if tcb.detach_state == ThreadDetachState::Detached {
+        let (detach_state, status) = self
+            .with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid)
+                    .map(|tcb| (tcb.detach_state, tcb.status))
+            })
+            .ok_or(KernelError::TaskMissing)?;
+        if detach_state == ThreadDetachState::Detached {
             return Err(KernelError::WrongObject);
         }
-        let TaskStatus::Exited(exit_code) = tcb.status else {
+        let TaskStatus::Exited(exit_code) = status else {
             let current_tid = self.current_tid();
             if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
                 let joiner_pid = self
@@ -202,14 +245,29 @@ impl KernelState {
                 }
             }
             if let Some(joiner_tid) = current_tid.filter(|joiner| *joiner != tid) {
-                let joiner = self.tcb_mut(joiner_tid).ok_or(KernelError::TaskMissing)?;
-                joiner.status = TaskStatus::Blocked(WaitReason::Join(ThreadId(tid)));
+                self.with_tcbs_mut(|tcbs| {
+                    let joiner = tcbs
+                        .iter_mut()
+                        .flatten()
+                        .find(|tcb| tcb.tid.0 == joiner_tid)
+                        .ok_or(KernelError::TaskMissing)?;
+                    joiner.status = TaskStatus::Blocked(WaitReason::Join(ThreadId(tid)));
+                    Ok::<_, KernelError>(())
+                })?;
                 let _ = self.block_current_cpu();
                 self.dispatch_next_task()?;
             }
             return Ok(None);
         };
-        tcb.status = TaskStatus::Dead;
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Dead;
+            Ok::<_, KernelError>(())
+        })?;
         Ok(Some(exit_code))
     }
 
@@ -222,7 +280,13 @@ impl KernelState {
         if head == 0 || len == 0 {
             return Err(KernelError::WrongObject);
         }
-        let _ = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .any(|tcb| tcb.tid.0 == tid)
+        })
+        .then_some(())
+        .ok_or(KernelError::TaskMissing)?;
         if let Some(slot) = self
             .robust_futex
             .iter_mut()
@@ -251,9 +315,15 @@ impl KernelState {
         frame: &TrapFrame,
     ) -> Result<(), KernelError> {
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.user_context = frame.capture_user_context();
-        Ok(())
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.user_context = frame.capture_user_context();
+            Ok(())
+        })
     }
 
     fn apply_current_thread_to_frame(&mut self, frame: &mut TrapFrame) -> Result<(), KernelError> {
@@ -312,8 +382,15 @@ impl KernelState {
         if tls_base == 0 {
             return Err(KernelError::WrongObject);
         }
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.tls_ptr = Some(crate::kernel::vm::VirtAddr(tls_base as u64));
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.tls_ptr = Some(crate::kernel::vm::VirtAddr(tls_base as u64));
+            Ok::<_, KernelError>(())
+        })?;
         if let Some(slot) = self
             .tls_restore_pending
             .iter_mut()
@@ -344,7 +421,12 @@ impl KernelState {
             .ok_or(KernelError::TaskMissing)?;
         let tid = self.allocate_thread_id()?;
         self.register_task_with_class_in_process(tid, parent.class, parent.thread_group_id.0)?;
-        if let Some(tcb) = self.tcb_mut(tid) {
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
             tcb.thread_group_id = parent.thread_group_id;
             tcb.asid = parent.asid;
             tcb.tls_ptr = Some(crate::kernel::vm::VirtAddr(tls_base as u64));
@@ -357,7 +439,8 @@ impl KernelState {
                 arg1: 0,
             };
             tcb.status = TaskStatus::Runnable;
-        }
+            Ok::<_, KernelError>(())
+        })?;
         if let Some(slot) = self
             .tls_restore_pending
             .iter_mut()
