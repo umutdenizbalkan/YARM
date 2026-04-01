@@ -113,6 +113,7 @@ Progress notes:
    - ✅ Added `scripts/check-pr-scope-and-message.sh` to reject placeholder/WIP commit markers and fail overscoped arch+kernel+services diffs by default.
 3. **Promote contract docs from draft to enforced gates**
    - pin `ABI_CONTRACT_FREEZE.md`, `SYSCALL_ABI.md`, and `PROC_VFS_CODEC_FREEZE.md` as CI-checked reference artifacts.
+   - ✅ Added `scripts/check-contract-doc-enforcement.sh` to enforce required freeze-doc markers and run targeted frozen-contract tests (`trap_router_maps_syscall`, `proc_v2_golden_vector_is_stable`, `vfs_v1_golden_vector_is_stable`).
 4. **Reduce bootstrap script drift**
    - consolidate x86/riscv qemu build/smoke scripts behind a shared helper to avoid duplicated maintenance.
 5. **Define a minimum runnable server profile**

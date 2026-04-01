@@ -9,7 +9,7 @@ This file marks the current in-kernel mechanism contracts as intentionally stabl
    - Guarded by test: `linux_dispatch_table_is_frozen_contract`.
 
 2. **Trap routing surface**
-   - `TrapEvent` constructors and `route_trap(TrapEvent) -> TrapAction` in `src/kernel/trap.rs`.
+   - `TrapEvent` constructors and `route_trap(TrapEvent) -> TrapAction` in `src/arch/trap.rs` (`src/kernel/trap.rs` is a compatibility re-export shim).
    - Contract: one canonical entry event, explicit payload (`fault`/`irq`) and deterministic routing.
 
 3. **Trap frame ABI encoding**
