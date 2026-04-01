@@ -8,7 +8,13 @@ use crate::kernel::vm::VmError;
 
 impl KernelState {
     pub fn register_driver(&mut self, tid: u64) -> Result<(), KernelError> {
-        let _ = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .any(|tcb| tcb.tid.0 == tid)
+        })
+        .then_some(())
+        .ok_or(KernelError::TaskMissing)?;
         if self
             .drivers
             .driver_records

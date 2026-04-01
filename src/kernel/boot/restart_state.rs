@@ -76,9 +76,16 @@ impl KernelState {
 
         let robust = self.robust_futex_state(tid);
         let detached = self.thread_detach_state(tid) == Some(ThreadDetachState::Detached);
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Exited(code);
-        tcb.restart.token = Some(RestartToken(token));
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Exited(code);
+            tcb.restart.token = Some(RestartToken(token));
+            Ok::<_, KernelError>(())
+        })?;
         self.report_task_exit_to_supervisor(tid, code, token)?;
         if let Some(robust) = robust {
             let stride = core::mem::size_of::<usize>();
@@ -103,19 +110,29 @@ impl KernelState {
     }
 
     pub fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelError> {
-        let token_matches = {
-            let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-            tcb.restart.token == Some(RestartToken(token))
-        };
+        let token_matches = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.restart.token == Some(RestartToken(token)))
+        });
+        let token_matches = token_matches.ok_or(KernelError::TaskMissing)?;
         if !token_matches {
             return Err(KernelError::WrongObject);
         }
 
         let _ = self.revoke_driver_runtime_caps(tid);
 
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.restart.token = None;
-        tcb.status = TaskStatus::Runnable;
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.restart.token = None;
+            tcb.status = TaskStatus::Runnable;
+            Ok::<_, KernelError>(())
+        })?;
         self.enqueue_task(tid).map(|_| ())
     }
 
@@ -124,11 +141,16 @@ impl KernelState {
             .thread_group_id(tid)
             .map(|group| group.0)
             .ok_or(KernelError::TaskMissing)?;
-        {
-            let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Dead;
             tcb.restart.token = None;
-        }
+            Ok::<_, KernelError>(())
+        })?;
         let _ = self.release_kernel_context(tid);
         let _ = self.revoke_driver_runtime_caps(tid);
         self.maybe_cleanup_process_cnode_for_pid(process_pid);

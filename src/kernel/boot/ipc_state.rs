@@ -71,8 +71,15 @@ impl KernelState {
         recv_cap: CapId,
     ) -> Result<(), KernelError> {
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
-        let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == blocked_tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            Ok::<_, KernelError>(())
+        })?;
         self.ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
         let _ = self.dispatch_next_task()?;
         Ok(())
@@ -85,8 +92,15 @@ impl KernelState {
         msg: Message,
     ) -> Result<(), KernelError> {
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
-        let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == blocked_tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
+            Ok::<_, KernelError>(())
+        })?;
         self.enqueue_sender_waiter(
             endpoint_idx,
             SenderWaiter {
@@ -103,20 +117,30 @@ impl KernelState {
         endpoint_idx: usize,
     ) -> Result<(), KernelError> {
         if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx].take() {
-            {
-                let tcb = self.tcb_mut(waiter_tid.0).ok_or(KernelError::TaskMissing)?;
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
+                    .ok_or(KernelError::TaskMissing)?;
                 tcb.status = TaskStatus::Runnable;
-            }
+                Ok::<_, KernelError>(())
+            })?;
             self.enqueue_task(waiter_tid.0)?;
         }
         Ok(())
     }
 
     fn wake_sender_waiter(&mut self, sender_tid: ThreadId) -> Result<(), KernelError> {
-        {
-            let tcb = self.tcb_mut(sender_tid.0).ok_or(KernelError::TaskMissing)?;
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == sender_tid.0)
+                .ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Runnable;
-        }
+            Ok::<_, KernelError>(())
+        })?;
         self.enqueue_task(sender_tid.0).map(|_| ())
     }
 
@@ -344,10 +368,15 @@ impl KernelState {
         let msg = Message::with_header(0, irq_line, 0, None, &payload).map_err(map_ipc_error)?;
         notif.send(msg)?;
         if let Some(waiter_tid) = self.ipc.notification_waiters[notification_idx].take() {
-            {
-                let tcb = self.tcb_mut(waiter_tid.0).ok_or(KernelError::TaskMissing)?;
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
+                    .ok_or(KernelError::TaskMissing)?;
                 tcb.status = TaskStatus::Runnable;
-            }
+                Ok::<_, KernelError>(())
+            })?;
             self.enqueue_task(waiter_tid.0)?;
         }
         Ok(())
@@ -581,8 +610,15 @@ impl KernelState {
                 return Ok(Some(msg));
             }
             let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
-            let tcb = self.tcb_mut(blocked_tid).ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == blocked_tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+                Ok::<_, KernelError>(())
+            })?;
             self.ipc.notification_waiters[notif_idx] = Some(ThreadId(blocked_tid));
             let _ = self.dispatch_next_task()?;
             return Ok(None);

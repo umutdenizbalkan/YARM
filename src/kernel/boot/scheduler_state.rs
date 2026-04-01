@@ -239,8 +239,15 @@ impl KernelState {
                 Ok(())
             }
             WorkItem::WakeTask { tid } => {
-                let tcb = self.tcb_mut(tid.0).ok_or(KernelError::TaskMissing)?;
-                tcb.status = TaskStatus::Runnable;
+                self.with_tcbs_mut(|tcbs| {
+                    let tcb = tcbs
+                        .iter_mut()
+                        .flatten()
+                        .find(|tcb| tcb.tid.0 == tid.0)
+                        .ok_or(KernelError::TaskMissing)?;
+                    tcb.status = TaskStatus::Runnable;
+                    Ok::<_, KernelError>(())
+                })?;
                 self.enqueue_on_cpu(cpu, tid.0)
             }
         }

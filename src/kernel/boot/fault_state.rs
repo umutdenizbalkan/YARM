@@ -58,8 +58,15 @@ impl KernelState {
         }
 
         let faulted_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
-        let tcb = self.tcb_mut(faulted_tid).ok_or(KernelError::TaskMissing)?;
-        tcb.status = TaskStatus::Faulted;
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == faulted_tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Faulted;
+            Ok::<_, KernelError>(())
+        })?;
         let _ = self.dispatch_next_task()?;
         Ok(())
     }

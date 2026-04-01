@@ -129,6 +129,18 @@ into independently lockable domains while preserving behavior.
     kernel-context switch frame selection now use `with_tcbs(...)` /
     `with_tcbs_mut(...)`
 
+### Phase 4f (completed in this pass)
+
+- Migrate remaining single-TCB state transitions in adjacent boot domains away
+  from `tcb_mut(...)` to task accessor APIs:
+  - `boot/ipc_state.rs`: endpoint/notification block + wake transitions now set
+    waiter/sender task status via `with_tcbs_mut(...)`
+  - `boot/restart_state.rs`: exit/restart/dead transitions and restart-token
+    checks now use `with_tcbs(...)` / `with_tcbs_mut(...)`
+  - `boot/fault_state.rs`, `boot/scheduler_state.rs`, `boot/driver_state.rs`,
+    and `boot/memory_state.rs`: migrated remaining task-existence/status updates
+    to task accessors
+
 ## Lock ordering (proposed)
 
 To avoid deadlocks as partitioning progresses, acquire in this order:
