@@ -35,3 +35,9 @@ This guide describes how to migrate servers and clients to the frozen shared-mem
 - Roll out by service class: filesystem, network, display.
 - Keep per-service canaries that verify map/release parity under load.
 - Treat any sustained map>release byte drift as a leak/regression signal.
+
+## Phase 7 hardening checks
+
+- Run `shared_mem_canary_map_release_parity_under_repeated_load` as a pre-merge runtime canary.
+- Run `scripts/phase7-shared-ipc-gates.sh` in CI to enforce docs/tests/migration invariants.
+- Escalate immediately if canary drift (`shared_mem_bytes_mapped != shared_mem_bytes_released`) persists for two consecutive runs.

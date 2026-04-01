@@ -1207,6 +1207,62 @@ mod tests {
     }
 
     #[test]
+    fn shared_mem_canary_map_release_parity_under_repeated_load() {
+        let loops = 32usize;
+        let mut total_mapped = 0u64;
+        let mut total_released = 0u64;
+        for _ in 0..loops {
+            let mut state = Bootstrap::init().expect("kernel");
+            state.register_task(1).expect("task1");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+            let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+            state.bind_task_asid(0, asid0).expect("bind0");
+            state.bind_task_asid(1, asid1).expect("bind1");
+            let (_eid, send_cap, recv_cap_global) = state.create_endpoint(8).expect("endpoint");
+            let recv_cap = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("dup recv cap");
+            let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+            state.yield_current().expect("switch receiver");
+            let mut block_recv = TrapFrame::new(
+                Syscall::IpcRecv as usize,
+                [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+            );
+            dispatch(&mut state, &mut block_recv).expect("block recv");
+            let mut send = TrapFrame::new(
+                Syscall::IpcSend as usize,
+                [
+                    send_cap.0 as usize,
+                    0x2000,
+                    Message::MAX_PAYLOAD + 16,
+                    0,
+                    0,
+                    mem_cap.0 as usize,
+                ],
+            );
+            dispatch(&mut state, &mut send).expect("send");
+            state.yield_current().expect("switch receiver");
+            let mut recv = TrapFrame::new(
+                Syscall::IpcRecv as usize,
+                [recv_cap.0 as usize, 0xA000, Message::MAX_PAYLOAD + 16, 0, 0, 0],
+            );
+            dispatch(&mut state, &mut recv).expect("recv");
+            let transfer_cap = CapId(recv.ret2() as u64);
+            let mut release = TrapFrame::new(
+                Syscall::TransferRelease as usize,
+                [transfer_cap.0 as usize, 0, 0, 0, 0, 0],
+            );
+            dispatch(&mut state, &mut release).expect("release");
+            let t = state.ipc_path_telemetry();
+            total_mapped = total_mapped.saturating_add(t.shared_mem_bytes_mapped);
+            total_released = total_released.saturating_add(t.shared_mem_bytes_released);
+        }
+        assert_eq!(total_mapped, total_released, "phase7 canary drift");
+    }
+
+    #[test]
     fn syscall_transfer_release_can_use_active_mapping_fast_path() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");

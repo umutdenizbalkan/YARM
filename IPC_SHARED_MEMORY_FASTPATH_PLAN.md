@@ -76,6 +76,16 @@ Acceptance checks:
 - ABI freeze document update.
 - CI coverage for migrated servers and shared-transfer conformance suite.
 
+## Phase 7 — Runtime hardening + CI enforcement
+
+- [x] Add canary/runtime assertions for shared-memory map/release parity under repeated load.
+- [x] Add CI gate script for shared-memory fast-path migration invariants and required tests.
+- [x] Document Phase 7 rollout checks and escalation signals.
+
+Acceptance checks:
+- deterministic canary test demonstrates zero map/release byte drift.
+- CI gate fails when migration docs/checkpoints/tests are missing.
+
 ## PR slicing guidance
 
 Each PR in this sequence should:
@@ -93,3 +103,4 @@ Each PR in this sequence should:
 - Phase 5 started with transfer-volume telemetry (`shared_mem_bytes_mapped`, `shared_mem_bytes_released`, `transfer_release_calls`) and a repeated map/release throughput smoke harness in syscall tests.
 - Phase 5 completed with batching/ring usage guidance (`SHARED_IPC_THROUGHPUT_GUIDE.md`) and a `TransferRelease` active-mapping fast path (`ptr=0`, `len=0`) that avoids userspace rematerialization of mapping bounds on steady-state recycle loops.
 - Phase 6 freezes the ABI/behavior at v6, removes user-mode descriptor-only shared-memory recv fallback, and publishes migration guidance in `SHARED_IPC_MIGRATION_GUIDE.md`.
+- Phase 7 adds runtime hardening canaries for shared-memory map/release parity and introduces a dedicated CI gate script (`scripts/phase7-shared-ipc-gates.sh`) to enforce migration/test/doc invariants.

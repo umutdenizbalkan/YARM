@@ -77,6 +77,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 
 - Stepwise execution plan: `IPC_SHARED_MEMORY_FASTPATH_PLAN.md`.
 - Scope: receiver auto-map path, lifecycle/refcount semantics, revocation behavior, and throughput tuning for FS/network/display data-plane traffic.
+- Post-fastpath hardening gate: `scripts/phase7-shared-ipc-gates.sh` + migration/runtime guides (`SHARED_IPC_MIGRATION_GUIDE.md`, `SHARED_IPC_THROUGHPUT_GUIDE.md`).
 
 ## Immediate next 5 implementable steps
 
