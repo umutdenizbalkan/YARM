@@ -111,6 +111,7 @@ Progress notes:
    - add commit/PR lint that rejects placeholder PR bodies and change sets spanning unrelated domains.
    - require `compat-gates` and at least one architecture smoke job on every architecture-touching PR.
    - ✅ Added `scripts/check-pr-scope-and-message.sh` to reject placeholder/WIP commit markers and fail overscoped arch+kernel+services diffs by default.
+   - ✅ Added `scripts/check-ci-workflow-enforcement.sh` and wired it into `compat-gates.yml` to enforce `compat-gates` profile jobs and core QEMU smoke workflow presence on pull requests.
 3. **Promote contract docs from draft to enforced gates**
    - pin `ABI_CONTRACT_FREEZE.md`, `SYSCALL_ABI.md`, and `PROC_VFS_CODEC_FREEZE.md` as CI-checked reference artifacts.
    - ✅ Added `scripts/check-contract-doc-enforcement.sh` to enforce required freeze-doc markers and run targeted frozen-contract tests (`trap_router_maps_syscall`, `proc_v2_golden_vector_is_stable`, `vfs_v1_golden_vector_is_stable`).

@@ -112,3 +112,4 @@ Each PR in this sequence should:
 - Post-fastpath follow-up tightened review-scope CI with `scripts/check-pr-scope-and-message.sh` to reject placeholder/WIP commits and overscoped arch PR slices by default.
 - Post-fastpath follow-up promoted contract docs to an enforced gate via `scripts/check-contract-doc-enforcement.sh` (ABI/syscall/codec freeze markers + targeted frozen-contract tests).
 - Post-fastpath follow-up reduced QEMU smoke-script drift by adding shared helper `scripts/qemu-smoke-common.sh` and refactoring riscv64/aarch64 smoke scripts to use common checks and marker validation helpers.
+- Post-fastpath follow-up added CI-workflow enforcement (`scripts/check-ci-workflow-enforcement.sh`) and wired it into `compat-gates.yml` to require compat profiles and core QEMU smoke workflow coverage on pull requests.

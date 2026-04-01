@@ -6,6 +6,13 @@ on:
 
 jobs:
 
+  ci-workflow-enforcement:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: enforce compat + smoke workflow invariants
+        run: scripts/check-ci-workflow-enforcement.sh
+
   arch-boundary-check:
     runs-on: ubuntu-latest
     steps:
