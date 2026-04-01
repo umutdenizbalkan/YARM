@@ -1106,7 +1106,8 @@ impl KernelState {
 
     fn purge_transfer_envelopes_for_pid(&mut self, pid: u64) {
         for idx in 0..MAX_TRANSFER_ENVELOPES {
-            let Some(envelope) = self.ipc.transfer_envelopes[idx] else {
+            let envelope = self.with_ipc_state(|ipc| ipc.transfer_envelopes[idx]);
+            let Some(envelope) = envelope else {
                 continue;
             };
             let source_pid = self
@@ -1124,14 +1125,15 @@ impl KernelState {
             if envelope.shared_region.is_some() {
                 self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
             }
-            self.ipc.transfer_envelopes[idx] = None;
+            self.with_ipc_state_mut(|ipc| ipc.transfer_envelopes[idx] = None);
             self.note_transfer_record_revoked();
         }
     }
 
     fn purge_active_transfer_mappings_for_pid(&mut self, pid: u64) {
         for idx in 0..MAX_TRANSFER_ENVELOPES {
-            let Some(mapping) = self.ipc.active_transfer_mappings[idx] else {
+            let mapping = self.with_ipc_state(|ipc| ipc.active_transfer_mappings[idx]);
+            let Some(mapping) = mapping else {
                 continue;
             };
             let owner_pid = self
@@ -1151,7 +1153,7 @@ impl KernelState {
             if let Some(cnode) = self.task_cnode(mapping.owner_tid.0) {
                 let _ = self.revoke_capability_in_cnode(cnode, mapping.transfer_cap);
             }
-            self.ipc.active_transfer_mappings[idx] = None;
+            self.with_ipc_state_mut(|ipc| ipc.active_transfer_mappings[idx] = None);
             self.note_transfer_record_revoked();
         }
     }
@@ -1190,10 +1192,11 @@ impl KernelState {
         shared_region: Option<TransferSharedRegion>,
     ) -> Option<u64> {
         for idx in 0..MAX_TRANSFER_ENVELOPES {
-            if self.ipc.transfer_envelopes[idx].is_some() {
+            if self.with_ipc_state(|ipc| ipc.transfer_envelopes[idx].is_some()) {
                 continue;
             }
-            let mut generation = self.ipc.transfer_envelope_generations[idx].wrapping_add(1);
+            let mut generation =
+                self.with_ipc_state(|ipc| ipc.transfer_envelope_generations[idx]).wrapping_add(1);
             if generation == 0 {
                 generation = 1;
             }
@@ -1201,11 +1204,10 @@ impl KernelState {
                 .validate_transfer_record_metadata(source_tid, source_cap, shared_region)
                 .is_err()
             {
-                self.ipc.telemetry.transfer_record_failures = self
-                    .ipc
-                    .telemetry
-                    .transfer_record_failures
-                    .saturating_add(1);
+                self.with_ipc_state_mut(|ipc| {
+                    ipc.telemetry.transfer_record_failures =
+                        ipc.telemetry.transfer_record_failures.saturating_add(1);
+                });
                 return None;
             }
             let source_object = self
@@ -1215,22 +1217,21 @@ impl KernelState {
             if shared_region.is_some() {
                 self.adjust_memory_object_pin_refcount(source_object, 1);
             }
-            self.ipc.transfer_envelope_generations[idx] = generation;
-            self.ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
-                source_tid,
-                source_cap,
-                source_object,
-                endpoint,
-                receiver_tid,
-                state: TransferState::Created,
-                shared_region,
-                generation,
+            self.with_ipc_state_mut(|ipc| {
+                ipc.transfer_envelope_generations[idx] = generation;
+                ipc.transfer_envelopes[idx] = Some(TransferEnvelope {
+                    source_tid,
+                    source_cap,
+                    source_object,
+                    endpoint,
+                    receiver_tid,
+                    state: TransferState::Created,
+                    shared_region,
+                    generation,
+                });
+                ipc.telemetry.transfer_records_created =
+                    ipc.telemetry.transfer_records_created.saturating_add(1);
             });
-            self.ipc.telemetry.transfer_records_created = self
-                .ipc
-                .telemetry
-                .transfer_records_created
-                .saturating_add(1);
             let idx_part = u64::try_from(idx).ok()?;
             return Some((generation << 16) | idx_part);
         }
@@ -1248,10 +1249,12 @@ impl KernelState {
             return None;
         }
         let generation = handle >> 16;
-        if generation == 0 || self.ipc.transfer_envelope_generations[idx] != generation {
+        if generation == 0
+            || self.with_ipc_state(|ipc| ipc.transfer_envelope_generations[idx]) != generation
+        {
             return None;
         }
-        let mut envelope = self.ipc.transfer_envelopes[idx]?;
+        let mut envelope = self.with_ipc_state(|ipc| ipc.transfer_envelopes[idx])?;
         if envelope.endpoint != endpoint {
             return None;
         }
@@ -1264,12 +1267,11 @@ impl KernelState {
         if envelope.shared_region.is_some() {
             self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
         }
-        self.ipc.telemetry.transfer_records_materialized = self
-            .ipc
-            .telemetry
-            .transfer_records_materialized
-            .saturating_add(1);
-        self.ipc.transfer_envelopes[idx] = None;
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.transfer_records_materialized =
+                ipc.telemetry.transfer_records_materialized.saturating_add(1);
+            ipc.transfer_envelopes[idx] = None;
+        });
         Some(envelope)
     }
 
@@ -1357,10 +1359,10 @@ impl KernelState {
         if index >= MAX_ENDPOINTS {
             return None;
         }
-        if self.ipc.endpoint_generations[index] != generation {
+        if self.with_ipc_state(|ipc| ipc.endpoint_generations[index]) != generation {
             return None;
         }
-        self.ipc.endpoint_waiters[index]
+        self.with_ipc_state(|ipc| ipc.endpoint_waiters[index])
     }
 
     pub fn capability_for_cnode(&self, cnode: CNodeId, cap: CapId) -> Option<Capability> {
@@ -1385,32 +1387,26 @@ impl KernelState {
     }
 
     pub(crate) fn note_transfer_record_revoked(&mut self) {
-        self.ipc.telemetry.transfer_records_revoked = self
-            .ipc
-            .telemetry
-            .transfer_records_revoked
-            .saturating_add(1);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.transfer_records_revoked =
+                ipc.telemetry.transfer_records_revoked.saturating_add(1);
+        });
     }
 
     pub(crate) fn note_shared_mem_mapped(&mut self, len: usize) {
-        self.ipc.telemetry.shared_mem_bytes_mapped = self
-            .ipc
-            .telemetry
-            .shared_mem_bytes_mapped
-            .saturating_add(len as u64);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.shared_mem_bytes_mapped =
+                ipc.telemetry.shared_mem_bytes_mapped.saturating_add(len as u64);
+        });
     }
 
     pub(crate) fn note_shared_mem_released(&mut self, len: usize) {
-        self.ipc.telemetry.transfer_release_calls = self
-            .ipc
-            .telemetry
-            .transfer_release_calls
-            .saturating_add(1);
-        self.ipc.telemetry.shared_mem_bytes_released = self
-            .ipc
-            .telemetry
-            .shared_mem_bytes_released
-            .saturating_add(len as u64);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.transfer_release_calls =
+                ipc.telemetry.transfer_release_calls.saturating_add(1);
+            ipc.telemetry.shared_mem_bytes_released =
+                ipc.telemetry.shared_mem_bytes_released.saturating_add(len as u64);
+        });
     }
 
     pub(crate) fn register_active_transfer_mapping(
@@ -1420,22 +1416,23 @@ impl KernelState {
         base: VirtAddr,
         len: usize,
     ) -> Result<(), KernelError> {
-        if let Some(slot) = self
-            .ipc
-            .active_transfer_mappings
-            .iter_mut()
-            .find(|slot| slot.is_none())
-        {
-            *slot = Some(ActiveTransferMapping {
-                owner_tid,
-                transfer_cap,
-                base,
-                len,
-            });
-            Ok(())
-        } else {
-            Err(KernelError::EndpointFull)
-        }
+        self.with_ipc_state_mut(|ipc| {
+            if let Some(slot) = ipc
+                .active_transfer_mappings
+                .iter_mut()
+                .find(|slot| slot.is_none())
+            {
+                *slot = Some(ActiveTransferMapping {
+                    owner_tid,
+                    transfer_cap,
+                    base,
+                    len,
+                });
+                Ok(())
+            } else {
+                Err(KernelError::EndpointFull)
+            }
+        })
     }
 
     pub(crate) fn remove_active_transfer_mapping(
@@ -1443,16 +1440,18 @@ impl KernelState {
         owner_tid: ThreadId,
         transfer_cap: CapId,
     ) -> bool {
-        for slot in self.ipc.active_transfer_mappings.iter_mut() {
-            let Some(mapping) = *slot else {
-                continue;
-            };
-            if mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap {
-                *slot = None;
-                return true;
+        self.with_ipc_state_mut(|ipc| {
+            for slot in ipc.active_transfer_mappings.iter_mut() {
+                let Some(mapping) = *slot else {
+                    continue;
+                };
+                if mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap {
+                    *slot = None;
+                    return true;
+                }
             }
-        }
-        false
+            false
+        })
     }
 
     pub(crate) fn active_transfer_mapping_for(
@@ -1460,12 +1459,15 @@ impl KernelState {
         owner_tid: ThreadId,
         transfer_cap: CapId,
     ) -> Option<(VirtAddr, usize)> {
-        self.ipc
-            .active_transfer_mappings
-            .iter()
-            .flatten()
-            .find(|mapping| mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap)
-            .map(|mapping| (mapping.base, mapping.len))
+        self.with_ipc_state(|ipc| {
+            ipc.active_transfer_mappings
+                .iter()
+                .flatten()
+                .find(|mapping| {
+                    mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap
+                })
+                .map(|mapping| (mapping.base, mapping.len))
+        })
     }
 
     fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
@@ -1606,7 +1608,8 @@ impl KernelState {
 
     fn revoke_active_transfer_mappings_for_cap(&mut self, owner_pid: u64, cap: CapId) {
         for idx in 0..MAX_TRANSFER_ENVELOPES {
-            let Some(mapping) = self.ipc.active_transfer_mappings[idx] else {
+            let mapping = self.with_ipc_state(|ipc| ipc.active_transfer_mappings[idx]);
+            let Some(mapping) = mapping else {
                 continue;
             };
             let mapping_pid = self
@@ -1623,7 +1626,7 @@ impl KernelState {
                     va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
                 }
             }
-            self.ipc.active_transfer_mappings[idx] = None;
+            self.with_ipc_state_mut(|ipc| ipc.active_transfer_mappings[idx] = None);
             self.note_transfer_record_revoked();
             let _ = self.report_transfer_revoke_to_supervisor(
                 owner_pid,
@@ -1824,13 +1827,15 @@ impl KernelState {
     fn capability_object_live(&self, object: CapObject) -> Option<()> {
         match object {
             CapObject::Endpoint { index, generation } => {
-                if index >= MAX_ENDPOINTS || self.ipc.endpoint_generations[index] != generation {
+                if index >= MAX_ENDPOINTS
+                    || self.with_ipc_state(|ipc| ipc.endpoint_generations[index]) != generation
+                {
                     return None;
                 }
             }
             CapObject::Notification { index, generation } => {
                 if index >= MAX_NOTIFICATIONS
-                    || self.ipc.notification_generations[index] != generation
+                    || self.with_ipc_state(|ipc| ipc.notification_generations[index]) != generation
                 {
                     return None;
                 }

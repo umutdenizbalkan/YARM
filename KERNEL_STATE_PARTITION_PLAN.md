@@ -53,6 +53,16 @@ into independently lockable domains while preserving behavior.
   - `bind_irq_notification`
   - `route_external_irq`
 
+### Phase 3c (completed in this pass)
+
+- Migrate transfer-envelope and shared-memory bookkeeping paths in
+  `boot/mod.rs` to the IPC accessor layer:
+  - envelope stash/materialize/revoke helpers
+  - active transfer mapping register/query/remove/revoke flows
+  - transfer telemetry counters (`*_records_*`, shared-memory byte counters)
+- Migrate endpoint waiter and capability liveness checks in `boot/mod.rs` to
+  IPC accessor-backed reads.
+
 ## Phase 4
 
 - Extract VM/memory/task domains into additional lockable partitions:
