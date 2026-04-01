@@ -244,6 +244,28 @@ fn debug_uart_hex_u64(value: u64) {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn debug_uart_trap_breadcrumb(
+    reason: u8,
+    vector: u64,
+    error_code: u64,
+    fault_addr: u64,
+    cpu_apic: u64,
+) {
+    debug_uart_putc(b'!');
+    debug_uart_putc(b'B');
+    debug_uart_putc(reason);
+    debug_uart_putc(b'v');
+    debug_uart_hex_u64(vector);
+    debug_uart_putc(b'e');
+    debug_uart_hex_u64(error_code);
+    debug_uart_putc(b'c');
+    debug_uart_hex_u64(fault_addr);
+    debug_uart_putc(b'a');
+    debug_uart_hex_u64(cpu_apic);
+    debug_uart_putc(b'\n');
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn encode_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
     let low = ((limit as u64) & 0xFFFF)
         | ((base & 0x00FF_FFFF) << 16)
@@ -349,14 +371,10 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     regs: *mut X86SavedRegs,
     interrupt_frame: *const X86InterruptStackFrame,
 ) {
+    let cpu_apic = raw_current_apic_id() as u64;
     let previous_depth = TRAP_DISPATCH_DEPTH.fetch_add(1, Ordering::AcqRel);
     if previous_depth != 0 {
-        debug_uart_putc(b'!');
-        debug_uart_putc(b'N');
-        debug_uart_putc(b'S');
-        debug_uart_putc(b'T');
-        debug_uart_putc(b'v');
-        debug_uart_hex_u64(vector);
+        debug_uart_trap_breadcrumb(b'N', vector, error_code, 0, cpu_apic);
         halt_forever();
     }
     let mut fault_addr = 0u64;
@@ -374,14 +392,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     let state_ptr = TRAP_KERNEL_STATE_PTR.load(Ordering::Acquire);
     if state_ptr == 0 {
         if should_halt_without_kernel_state(vector as usize) {
-            debug_uart_putc(b'!');
-            debug_uart_putc(b'E');
-            debug_uart_putc(b'R');
-            debug_uart_putc(b'L');
-            debug_uart_putc(b'v');
-            debug_uart_hex_u64(vector);
-            debug_uart_putc(b'e');
-            debug_uart_hex_u64(error_code);
+            debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, cpu_apic);
             TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
             halt_forever();
         }
@@ -402,14 +413,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             error_code,
             err
         );
-        debug_uart_putc(b'!');
-        debug_uart_putc(b'T');
-        debug_uart_putc(b'R');
-        debug_uart_putc(b'P');
-        debug_uart_putc(b'v');
-        debug_uart_hex_u64(vector);
-        debug_uart_putc(b'e');
-        debug_uart_hex_u64(error_code);
+        debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, cpu_apic);
         halt_forever();
     }
     if vector as usize == VEC_SYSCALL {
