@@ -1407,6 +1407,19 @@ impl KernelState {
         false
     }
 
+    pub(crate) fn active_transfer_mapping_for(
+        &self,
+        owner_tid: ThreadId,
+        transfer_cap: CapId,
+    ) -> Option<(VirtAddr, usize)> {
+        self.ipc
+            .active_transfer_mappings
+            .iter()
+            .flatten()
+            .find(|mapping| mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap)
+            .map(|mapping| (mapping.base, mapping.len))
+    }
+
     fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
         self.cnode_spaces
             .iter()

@@ -604,12 +604,22 @@ fn handle_transfer_release(
         return Err(SyscallError::InvalidArgs);
     }
     let transfer_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
-    let base = frame.arg(SYSCALL_ARG_PTR);
-    let len = frame.arg(SYSCALL_ARG_LEN);
-    if len == 0 || !base.is_multiple_of(PAGE_SIZE) {
-        return Err(SyscallError::InvalidArgs);
-    }
-    let map_len = round_up_page(len)?;
+    let owner = crate::kernel::ipc::ThreadId(current_tid(kernel)?);
+    let (base, map_len) = {
+        let base_arg = frame.arg(SYSCALL_ARG_PTR);
+        let len_arg = frame.arg(SYSCALL_ARG_LEN);
+        if base_arg == 0 && len_arg == 0 {
+            kernel
+                .active_transfer_mapping_for(owner, transfer_cap)
+                .map(|(base, len)| (base.0 as usize, len))
+                .ok_or(SyscallError::InvalidArgs)?
+        } else {
+            if len_arg == 0 || !base_arg.is_multiple_of(PAGE_SIZE) {
+                return Err(SyscallError::InvalidArgs);
+            }
+            (base_arg, round_up_page(len_arg)?)
+        }
+    };
     let end = base.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
     let mut va = base;
     while va < end {
@@ -626,7 +636,6 @@ fn handle_transfer_release(
     kernel
         .revoke_capability_in_cnode(cnode, transfer_cap)
         .map_err(SyscallError::from)?;
-    let owner = crate::kernel::ipc::ThreadId(current_tid(kernel)?);
     let _ = kernel.remove_active_transfer_mapping(owner, transfer_cap);
     kernel.note_shared_mem_released(map_len);
     frame.set_ok(map_len, 0, 0);
@@ -1141,8 +1150,8 @@ mod tests {
                 Syscall::TransferRelease as usize,
                 [
                     recv_local_transfer.0 as usize,
-                    map_base,
-                    Message::MAX_PAYLOAD + 16,
+                    0,
+                    0,
                     0,
                     0,
                     0,
@@ -1158,6 +1167,71 @@ mod tests {
         assert_eq!(total_release_calls, loops as u64);
         assert_eq!(total_mapped, loops as u64 * mapped_per_loop);
         assert_eq!(total_released, loops as u64 * mapped_per_loop);
+    }
+
+    #[test]
+    fn syscall_transfer_release_can_use_active_mapping_fast_path() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send).expect("send");
+
+        state.yield_current().expect("switch receiver");
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [
+                recv_cap.0 as usize,
+                0xA000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut recv).expect("recv");
+        let recv_local_transfer = CapId(recv.ret2() as u64);
+
+        let mut release = TrapFrame::new(
+            Syscall::TransferRelease as usize,
+            [recv_local_transfer.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut release).expect("release");
+        assert_eq!(release.ret0(), PAGE_SIZE);
+        assert_eq!(
+            state
+                .capability_service()
+                .resolve_current_task_capability(recv_local_transfer),
+            None
+        );
     }
 
     #[test]
