@@ -176,4 +176,15 @@ mod tests {
         let reply = WaitPidV2Reply::new(4, 255);
         assert_eq!(WaitPidV2Reply::decode(&reply.encode()), Ok(reply));
     }
+
+    #[test]
+    fn proc_v2_golden_vector_is_stable() {
+        let args = ProcV2Args::new(0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00);
+        let expected = [
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // arg0 LE
+            0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, // arg1 LE
+        ];
+        assert_eq!(args.encode(), expected);
+        assert_eq!(ProcV2Args::decode(&expected), Ok(args));
+    }
 }
