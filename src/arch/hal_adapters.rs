@@ -2,7 +2,7 @@ use crate::kernel::scheduler::CpuId;
 use crate::kernel::vm::Asid;
 
 pub type AdapterTrapContext = crate::arch::trap_entry::ArchTrapContext;
-pub type AdapterTrapEvent = crate::kernel::trap::TrapEvent;
+pub type AdapterTrapEvent = crate::arch::trap::TrapEvent;
 
 #[inline]
 pub fn switch_address_space(asid: Asid) {

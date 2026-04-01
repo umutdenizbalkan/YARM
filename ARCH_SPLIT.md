@@ -107,6 +107,12 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
 - `src/arch/hal.rs` now routes address-space switch, IRQ acknowledge/EOI, timer programming, and trap decoding through adapter shim functions instead of directly calling selected-ISA modules.
 - This keeps the HAL implementation boundary stable while preserving current behavior and avoiding kernel-mechanism changes in PR A scope.
 
+## PR B status: syscall/trap normalization
+
+- Added `src/arch/trap.rs` as the canonical home for normalized trap enums (`TrapEvent`, `TrapAction`, `Trap`, `FaultInfo`, `FaultAccess`) and `route_trap(...)`.
+- ISA trap decode paths now consume `crate::arch::trap::*` directly (`src/arch/{riscv64,x86_64,aarch64}/trap.rs`) instead of importing trap normalization from kernel-layer modules.
+- `src/kernel/trap.rs` is now a compatibility re-export shim into `crate::arch::trap`, preserving existing kernel/service call sites while keeping normalization ownership in the architecture boundary.
+
 
 ## Unsupported-architecture policy
 

@@ -1,6 +1,6 @@
 use crate::kernel::boot::{KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
-use crate::kernel::trap::TrapEvent;
+use crate::arch::trap::TrapEvent;
 use crate::kernel::trapframe::TrapFrame;
 
 #[cfg(target_arch = "riscv64")]

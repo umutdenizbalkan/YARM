@@ -1,6 +1,6 @@
 use crate::kernel::boot::{KernelState, TrapHandleError};
 use crate::kernel::scheduler::{CpuId, MAX_CPUS};
-use crate::kernel::trap::{FaultAccess, FaultInfo, TrapEvent};
+use crate::arch::trap::{FaultAccess, FaultInfo, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::VirtAddr;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -140,7 +140,7 @@ pub fn handle_trap_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::trap::Trap;
+    use crate::arch::trap::Trap;
 
     #[test]
     fn decode_syscall_vector() {
