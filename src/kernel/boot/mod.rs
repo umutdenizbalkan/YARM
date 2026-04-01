@@ -9,7 +9,9 @@ mod task_policy_state;
 mod thread_state;
 mod user_memory_state;
 
-use super::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability, CapabilitySpace};
+use super::capabilities::{
+    CNodeId, CapId, CapObject, CapRights, Capability, CapabilitySpace, MAX_CAPABILITIES_PER_CSPACE,
+};
 use super::ipc::{Endpoint, IpcError, Message};
 #[cfg(test)]
 use super::ipc::{EndpointClass, EndpointMode};
@@ -916,6 +918,47 @@ impl KernelState {
         if has_live_threads {
             return;
         }
+        let Some(cnode) = self.process_cnode_for_pid(pid) else {
+            return;
+        };
+
+        loop {
+            let live_caps = self
+                .cspace_for_cnode(cnode)
+                .map(|cspace| cspace.live_cap_ids())
+                .unwrap_or([None; MAX_CAPABILITIES_PER_CSPACE]);
+            let mut revoked_any = false;
+            for cap in live_caps.into_iter().flatten() {
+                if self.revoke_capability_in_cnode(cnode, cap).is_ok() {
+                    revoked_any = true;
+                }
+            }
+            if !revoked_any {
+                break;
+            }
+        }
+
+        for idx in 0..self.delegated_capability_links.len() {
+            let Some(record) = self.delegated_capability_links[idx] else {
+                continue;
+            };
+            let source_pid = self
+                .process_id(record.source_tid)
+                .unwrap_or(record.source_tid);
+            let dest_pid = self.process_id(record.dest_tid).unwrap_or(record.dest_tid);
+            if source_pid == pid || dest_pid == pid {
+                self.delegated_capability_links[idx] = None;
+            }
+        }
+
+        if let Some(slot) = self
+            .cnode_spaces
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|space| space.id == cnode))
+        {
+            *slot = None;
+        }
+
         if let Some(slot) = self
             .process_cnodes
             .iter_mut()
@@ -4246,6 +4289,38 @@ mod tests {
         );
         assert_eq!(
             state.resolve_capability_for_task(sibling, cap),
+            Err(KernelError::InvalidCapability)
+        );
+    }
+
+    #[test]
+    fn process_teardown_reclaims_process_cnode_space_and_delegated_descendants() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(730).expect("source process");
+        state.register_task(731).expect("dest process");
+
+        let source_cnode = state.task_cnode(730).expect("source cnode");
+        let source_cap = state
+            .mint_capability_in_cnode(
+                source_cnode,
+                Capability::new(CapObject::Kernel, CapRights::READ),
+            )
+            .expect("mint source cap");
+        let delegated_cap = state
+            .grant_capability_task_to_task_with_rights(730, source_cap, 731, CapRights::READ)
+            .expect("delegate");
+        assert!(
+            state
+                .resolve_capability_for_task(731, delegated_cap)
+                .is_ok()
+        );
+
+        state.mark_task_dead(730).expect("teardown source process");
+
+        assert_eq!(state.process_cnode_for_pid(730), None);
+        assert!(state.cspace_for_cnode(source_cnode).is_none());
+        assert_eq!(
+            state.resolve_capability_for_task(731, delegated_cap),
             Err(KernelError::InvalidCapability)
         );
     }

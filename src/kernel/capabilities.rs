@@ -385,6 +385,19 @@ impl CapabilitySpace {
             })
             .count()
     }
+
+    pub fn live_cap_ids(&self) -> [Option<CapId>; MAX_CAPABILITIES_PER_CSPACE] {
+        let mut ids = [None; MAX_CAPABILITIES_PER_CSPACE];
+        let mut used = 0usize;
+        for (index, slot) in self.slots.iter().enumerate() {
+            if slot.entry.is_none() || used >= ids.len() {
+                continue;
+            }
+            ids[used] = Some(CapId::new(index, slot.generation));
+            used += 1;
+        }
+        ids
+    }
 }
 
 #[cfg(test)]
