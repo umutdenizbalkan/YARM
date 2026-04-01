@@ -130,6 +130,16 @@ pub fn program_timer_deadline(_cpu: crate::kernel::scheduler::CpuId, _ticks_from
     }
 }
 
+#[cfg(feature = "hosted-dev")]
+pub fn enable_interrupts_for_boot() {}
+
+#[cfg(not(feature = "hosted-dev"))]
+pub fn enable_interrupts_for_boot() {
+    unsafe {
+        core::arch::asm!("sti", options(nomem, preserves_flags));
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct X86IrqState {
     pub interrupts_were_enabled: bool,

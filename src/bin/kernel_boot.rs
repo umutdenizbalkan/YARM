@@ -294,6 +294,7 @@ fn run_boot_markers() {
         kernel.program_timer_deadline_current_cpu(
             yarm::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
         );
+        yarm::arch::x86_64::irq::enable_interrupts_for_boot();
         debug_uart_marker(b'J');
     }
     yarm::yarm_log!(
