@@ -950,24 +950,20 @@ impl KernelState {
             .map(|space| kernel_ref(&space.cspace).occupied_slots())
             .sum();
         let capability_slots_used = cnode_capability_slots_used;
+        let endpoint_used = self.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().count());
+        let notification_used = self.with_ipc_state(|ipc| ipc.notifications.iter().flatten().count());
+        let task_used = self.with_tcbs(|tcbs| tcbs.iter().flatten().count());
+        let memory_object_used =
+            self.with_memory_state(|memory| memory.memory_objects.iter().flatten().count());
         CapacityTelemetry {
-            endpoints: Self::capacity_pool(
-                self.ipc.endpoints.iter().flatten().count(),
-                limits.max_endpoints,
-            ),
-            notifications: Self::capacity_pool(
-                self.ipc.notifications.iter().flatten().count(),
-                limits.max_notifications,
-            ),
-            tasks: Self::capacity_pool(self.tcbs.iter().flatten().count(), limits.max_tasks),
+            endpoints: Self::capacity_pool(endpoint_used, limits.max_endpoints),
+            notifications: Self::capacity_pool(notification_used, limits.max_notifications),
+            tasks: Self::capacity_pool(task_used, limits.max_tasks),
             drivers: Self::capacity_pool(
                 self.drivers.driver_records.iter().flatten().count(),
                 limits.max_drivers,
             ),
-            memory_objects: Self::capacity_pool(
-                self.memory.memory_objects.iter().flatten().count(),
-                limits.max_memory_objects,
-            ),
+            memory_objects: Self::capacity_pool(memory_object_used, limits.max_memory_objects),
             capability_slots: Self::capacity_pool(
                 capability_slots_used,
                 limits.max_capability_slots,

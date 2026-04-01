@@ -25,7 +25,7 @@ into independently lockable domains while preserving behavior.
 - Add scheduler/timer test helpers so architecture and boot tests no longer
   rely on direct field access.
 
-## Phase 3 (in progress)
+## Phase 3 (completed)
 
 - Extract `IpcState` into a dedicated struct:
   - endpoint tables/waiters/routes/envelopes
@@ -73,7 +73,7 @@ into independently lockable domains while preserving behavior.
 - Add a lock-order snapshot test that reads scheduler+IPC state through the
   ordered helper.
 
-## Phase 4 (in progress)
+## Phase 4 (completed)
 
 - Extract VM/memory/task domains into additional lockable partitions:
   - `VmState` (`kernel_aspace`, `user_spaces`)
@@ -140,6 +140,16 @@ into independently lockable domains while preserving behavior.
   - `boot/fault_state.rs`, `boot/scheduler_state.rs`, `boot/driver_state.rs`,
     and `boot/memory_state.rs`: migrated remaining task-existence/status updates
     to task accessors
+
+## Phase 5 (completed in this pass)
+
+- Complete IPC struct extraction closure work:
+  - mark IPC partitioning as complete (Phase 3 status update) now that IPC
+    endpoint/notification/waiter/telemetry/mailbox ownership is consistently in
+    the `IpcState` domain with accessor-mediated entry points
+  - migrate remaining non-IPC-module IPC capacity reads in `boot/mod.rs`
+    (`capacity_telemetry`) to `with_ipc_state(...)` accessors
+- This closes the extraction loop needed to start the next partitioning phase.
 
 ## Lock ordering (proposed)
 
