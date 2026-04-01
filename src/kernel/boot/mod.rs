@@ -470,6 +470,14 @@ struct RestartSubsystem {
 }
 
 #[derive(Debug)]
+struct CapabilitySubsystem {
+    cnode_spaces: KernelStorage<[Option<CNodeSpace>; MAX_TASKS]>,
+    process_cnodes: KernelStorage<[Option<ProcessCNodeRecord>; MAX_TASKS]>,
+    delegated_capability_links:
+        KernelStorage<[Option<DelegatedCapabilityLink>; MAX_DELEGATED_CAPABILITY_LINKS]>,
+}
+
+#[derive(Debug)]
 struct SchedulerState {
     scheduler: KernelStorage<SmpScheduler>,
     timer: Timer,
@@ -500,12 +508,12 @@ pub struct KernelState {
     driver_state_lock: SpinLockIrq<()>,
     fault_state_lock: SpinLockIrq<()>,
     restart_state_lock: SpinLockIrq<()>,
+    capability_state_lock: SpinLockIrq<()>,
     vm_state_lock: SpinLockIrq<()>,
     task_state_lock: SpinLockIrq<()>,
     memory_state_lock: SpinLockIrq<()>,
     ipc: KernelStorage<IpcSubsystem>,
-    cnode_spaces: KernelStorage<[Option<CNodeSpace>; MAX_TASKS]>,
-    process_cnodes: KernelStorage<[Option<ProcessCNodeRecord>; MAX_TASKS]>,
+    capability: CapabilitySubsystem,
     next_dynamic_tid: u64,
     tcbs: KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
     tls_restore_pending: KernelStorage<[Option<ThreadId>; MAX_TASKS]>,
@@ -517,8 +525,6 @@ pub struct KernelState {
     tlb_shootdown_timeout_count: u64,
     faults: KernelStorage<FaultSubsystem>,
     restart: KernelStorage<RestartSubsystem>,
-    delegated_capability_links:
-        KernelStorage<[Option<DelegatedCapabilityLink>; MAX_DELEGATED_CAPABILITY_LINKS]>,
 }
 
 pub(crate) struct CapabilityService<'a> {
@@ -620,6 +626,16 @@ impl KernelState {
     fn with_restart_state_mut<R>(&mut self, f: impl FnOnce(&mut RestartSubsystem) -> R) -> R {
         let _restart_guard = self.restart_state_lock.lock();
         f(kernel_mut(&mut self.restart))
+    }
+
+    fn with_capability_state<R>(&self, f: impl FnOnce(&CapabilitySubsystem) -> R) -> R {
+        let _capability_guard = self.capability_state_lock.lock();
+        f(&self.capability)
+    }
+
+    fn with_capability_state_mut<R>(&mut self, f: impl FnOnce(&mut CapabilitySubsystem) -> R) -> R {
+        let _capability_guard = self.capability_state_lock.lock();
+        f(&mut self.capability)
     }
 
     fn with_scheduler_then_ipc<R>(
@@ -860,6 +876,7 @@ impl Bootstrap {
             driver_state_lock: SpinLockIrq::new(()),
             fault_state_lock: SpinLockIrq::new(()),
             restart_state_lock: SpinLockIrq::new(()),
+            capability_state_lock: SpinLockIrq::new(()),
             vm_state_lock: SpinLockIrq::new(()),
             task_state_lock: SpinLockIrq::new(()),
             memory_state_lock: SpinLockIrq::new(()),
@@ -878,8 +895,13 @@ impl Bootstrap {
                 active_transfer_mappings: [const { None }; MAX_TRANSFER_ENVELOPES],
                 telemetry: IpcPathTelemetry::default(),
             }),
-            cnode_spaces: store_kernel_value([const { None }; MAX_TASKS]),
-            process_cnodes: store_kernel_value([const { None }; MAX_TASKS]),
+            capability: CapabilitySubsystem {
+                cnode_spaces: store_kernel_value([const { None }; MAX_TASKS]),
+                process_cnodes: store_kernel_value([const { None }; MAX_TASKS]),
+                delegated_capability_links: store_kernel_value(
+                    [const { None }; MAX_DELEGATED_CAPABILITY_LINKS],
+                ),
+            },
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
             tcbs: store_kernel_value([const { None }; MAX_TASKS]),
             tls_restore_pending: store_kernel_value([None; MAX_TASKS]),
@@ -908,9 +930,6 @@ impl Bootstrap {
             restart: store_kernel_value(RestartSubsystem {
                 next_restart_token: 1,
             }),
-            delegated_capability_links: store_kernel_value(
-                [const { None }; MAX_DELEGATED_CAPABILITY_LINKS],
-            ),
         };
 
         state.register_task(0)?;
@@ -979,12 +998,14 @@ impl KernelState {
 
     pub fn capacity_telemetry(&self) -> CapacityTelemetry {
         let limits = self.runtime_capacity_config();
-        let cnode_capability_slots_used: usize = self
-            .cnode_spaces
-            .iter()
-            .flatten()
-            .map(|space| kernel_ref(&space.cspace).occupied_slots())
-            .sum();
+        let cnode_capability_slots_used: usize = self.with_capability_state(|capability| {
+            capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .map(|space| kernel_ref(&space.cspace).occupied_slots())
+                .sum()
+        });
         let capability_slots_used = cnode_capability_slots_used;
         let endpoint_used = self.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().count());
         let notification_used = self.with_ipc_state(|ipc| ipc.notifications.iter().flatten().count());
@@ -1094,11 +1115,14 @@ impl KernelState {
     }
 
     pub(crate) fn process_cnode_for_pid(&self, pid: u64) -> Option<CNodeId> {
-        self.process_cnodes
-            .iter()
-            .flatten()
-            .find(|record| record.pid == pid)
-            .map(|record| record.cnode)
+        self.with_capability_state(|capability| {
+            capability
+                .process_cnodes
+                .iter()
+                .flatten()
+                .find(|record| record.pid == pid)
+                .map(|record| record.cnode)
+        })
     }
 
     pub(crate) fn set_process_cnode_for_pid(
@@ -1106,20 +1130,22 @@ impl KernelState {
         pid: u64,
         cnode: CNodeId,
     ) -> Result<(), KernelError> {
-        if let Some(record) = self
-            .process_cnodes
-            .iter_mut()
-            .flatten()
-            .find(|record| record.pid == pid)
-        {
-            record.cnode = cnode;
-            return Ok(());
-        }
-        if let Some(slot) = self.process_cnodes.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(ProcessCNodeRecord { pid, cnode });
-            return Ok(());
-        }
-        Err(KernelError::TaskTableFull)
+        self.with_capability_state_mut(|capability| {
+            if let Some(record) = capability
+                .process_cnodes
+                .iter_mut()
+                .flatten()
+                .find(|record| record.pid == pid)
+            {
+                record.cnode = cnode;
+                return Ok(());
+            }
+            if let Some(slot) = capability.process_cnodes.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(ProcessCNodeRecord { pid, cnode });
+                return Ok(());
+            }
+            Err(KernelError::TaskTableFull)
+        })
     }
 
     pub(crate) fn maybe_cleanup_process_cnode_for_pid(&mut self, pid: u64) {
@@ -1163,8 +1189,8 @@ impl KernelState {
             }
         }
 
-        for idx in 0..self.delegated_capability_links.len() {
-            let Some(record) = self.delegated_capability_links[idx] else {
+        for idx in 0..self.capability.delegated_capability_links.len() {
+            let Some(record) = self.capability.delegated_capability_links[idx] else {
                 continue;
             };
             let source_pid = self
@@ -1172,12 +1198,13 @@ impl KernelState {
                 .unwrap_or(record.source_tid);
             let dest_pid = self.process_id(record.dest_tid).unwrap_or(record.dest_tid);
             if source_pid == pid || dest_pid == pid {
-                self.delegated_capability_links[idx] = None;
+                self.capability.delegated_capability_links[idx] = None;
                 telemetry.removed_delegation_links =
                     telemetry.removed_delegation_links.saturating_add(1);
             }
         }
         if let Some(slot) = self
+            .capability
             .cnode_spaces
             .iter_mut()
             .find(|slot| slot.as_ref().is_some_and(|space| space.id == cnode))
@@ -1187,6 +1214,7 @@ impl KernelState {
         }
 
         if let Some(slot) = self
+            .capability
             .process_cnodes
             .iter_mut()
             .find(|slot| slot.is_some_and(|record| record.pid == pid))
@@ -1576,7 +1604,7 @@ impl KernelState {
     }
 
     fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
-        self.cnode_spaces
+        self.capability.cnode_spaces
             .iter()
             .flatten()
             .find(|space| space.id == cnode)
@@ -1584,7 +1612,7 @@ impl KernelState {
     }
 
     fn cspace_for_cnode_mut(&mut self, cnode: CNodeId) -> Option<&mut CapabilitySpace> {
-        self.cnode_spaces
+        self.capability.cnode_spaces
             .iter_mut()
             .flatten()
             .find(|space| space.id == cnode)
@@ -1595,7 +1623,7 @@ impl KernelState {
         if self.cspace_for_cnode(cnode).is_some() {
             return Ok(());
         }
-        if let Some(slot) = self.cnode_spaces.iter_mut().find(|slot| slot.is_none()) {
+        if let Some(slot) = self.capability.cnode_spaces.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(CNodeSpace {
                 id: cnode,
                 cspace: store_kernel_value(CapabilitySpace::default()),
@@ -1666,7 +1694,7 @@ impl KernelState {
         dest_tid: u64,
         dest_cap: CapId,
     ) -> Result<(), KernelError> {
-        let links = kernel_mut(&mut self.delegated_capability_links);
+        let links = kernel_mut(&mut self.capability.delegated_capability_links);
         if links.iter().flatten().any(|link| {
             link.source_tid == source_tid
                 && link.source_cap == source_cap
@@ -1689,7 +1717,7 @@ impl KernelState {
     }
 
     fn tid_for_cnode(&self, cnode: CNodeId) -> Option<u64> {
-        self.process_cnodes
+        self.capability.process_cnodes
             .iter()
             .flatten()
             .find(|record| record.cnode == cnode)
@@ -1878,7 +1906,7 @@ impl KernelState {
         while head < tail {
             let current = queue[head].expect("queue item");
             head += 1;
-            for link in self.delegated_capability_links.iter().flatten() {
+            for link in self.capability.delegated_capability_links.iter().flatten() {
                 let link_source_pid = self.process_id(link.source_tid).unwrap_or(link.source_tid);
                 if link_source_pid != current.pid || link.source_cap != current.cap {
                     continue;
@@ -1909,8 +1937,8 @@ impl KernelState {
         root: DelegatedCapRef,
         descendants: [Option<DelegatedCapRef>; MAX_DELEGATED_CAPABILITY_LINKS],
     ) {
-        for idx in 0..self.delegated_capability_links.len() {
-            let Some(link) = self.delegated_capability_links[idx] else {
+        for idx in 0..self.capability.delegated_capability_links.len() {
+            let Some(link) = self.capability.delegated_capability_links[idx] else {
                 continue;
             };
             let source = DelegatedCapRef {
@@ -1926,7 +1954,7 @@ impl KernelState {
                 || Self::contains_cap_ref(&descendants, source)
                 || Self::contains_cap_ref(&descendants, dest);
             if involved {
-                self.delegated_capability_links[idx] = None;
+                self.capability.delegated_capability_links[idx] = None;
             }
         }
     }

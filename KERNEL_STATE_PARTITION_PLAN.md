@@ -311,6 +311,16 @@ safe behavior preservation.
     new state, without broad callsite migration yet.
   - Add compile-only refactors and targeted constructor/init updates.
 
+#### PR 7.1 status (completed in this pass)
+
+- Added `CapabilityState` scaffold on `KernelState` with:
+  - `capability_state_lock`
+  - `with_capability_state(...)`
+  - `with_capability_state_mut(...)`
+- Moved `cnode_spaces`, `process_cnodes`, and delegated capability link storage
+  under the new capability subsystem.
+- Per PR 7.1 scope, broad capability callsite migration is deferred to PR 7.2.
+
 - **PR 7.2: Capability callsite migration (core)**
   - Migrate mint/revoke/resolve/grant/delegate/retype paths to
     `with_capability_state(...)` / `with_capability_state_mut(...)`.
