@@ -34,6 +34,21 @@ for f in src/bin/*_srv.rs; do
   fi
  done
 
+# 4) prevent boundary creep for high-risk kernel-only types.
+#    Existing compatibility/control-plane shims are temporarily allow-listed.
+deny_re='kernel::(trapframe::TrapFrame|boot::KernelState)'
+while IFS=: read -r path line rest; do
+  [[ -z "${path:-}" ]] && continue
+  case "$path" in
+    src/services/compatibility/linux_compat/*|src/services/control_plane/vfs/service.rs)
+      ;;
+    *)
+      echo "[fail] kernel-only boundary type imported outside allow-list: $path:$line:$rest"
+      bad=1
+      ;;
+  esac
+done < <(rg -n "$deny_re" src/services src/bin/*_srv.rs || true)
+
 if [[ "$bad" -ne 0 ]]; then
   exit 1
 fi
