@@ -976,6 +976,7 @@ impl KernelState {
         if has_live_threads {
             return;
         }
+        self.purge_transfer_envelopes_for_pid(pid);
         let Some(cnode) = self.process_cnode_for_pid(pid) else {
             return;
         };
@@ -1012,7 +1013,6 @@ impl KernelState {
                     telemetry.removed_delegation_links.saturating_add(1);
             }
         }
-
         if let Some(slot) = self
             .cnode_spaces
             .iter_mut()
@@ -1040,6 +1040,31 @@ impl KernelState {
             telemetry.removed_cnode_space as u8,
             telemetry.removed_process_record as u8
         );
+    }
+
+    fn purge_transfer_envelopes_for_pid(&mut self, pid: u64) {
+        for idx in 0..MAX_TRANSFER_ENVELOPES {
+            let Some(envelope) = self.ipc.transfer_envelopes[idx] else {
+                continue;
+            };
+            let source_pid = self
+                .process_id(envelope.source_tid.0)
+                .unwrap_or(envelope.source_tid.0);
+            let receiver_pid = envelope
+                .receiver_tid
+                .map(|tid| self.process_id(tid.0).unwrap_or(tid.0));
+            let source_matches = source_pid == pid || envelope.source_tid.0 == pid;
+            let receiver_matches =
+                receiver_pid == Some(pid) || envelope.receiver_tid == Some(ThreadId(pid));
+            if !source_matches && !receiver_matches {
+                continue;
+            }
+            if envelope.shared_region.is_some() {
+                self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
+            }
+            self.ipc.transfer_envelopes[idx] = None;
+            self.note_transfer_record_revoked();
+        }
     }
 
     pub fn current_task_capability(&self, cap: CapId) -> Option<Capability> {
@@ -2053,6 +2078,56 @@ mod tests {
         assert!(
             state.memory_object_slot_by_id(mem_id).is_none(),
             "object should reclaim after unpin + no cap/map refs"
+        );
+    }
+
+    #[test]
+    fn process_cleanup_purges_transfer_envelopes_and_unpins_memory() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                mem_cap,
+                endpoint,
+                Some(ThreadId(1)),
+                Some(TransferSharedRegion {
+                    offset: 0x4000,
+                    len: PAGE_SIZE as u64,
+                }),
+            )
+            .expect("stash");
+        let slot = state.memory_object_slot_by_id(mem_id).expect("slot");
+        assert_eq!(
+            state.memory.memory_objects[slot]
+                .expect("object")
+                .pin_refcount,
+            1
+        );
+
+        state.exit_task(1, 1).expect("exit");
+        state.purge_transfer_envelopes_for_pid(1);
+        assert!(
+            state
+                .take_transfer_envelope(handle, endpoint, ThreadId(1))
+                .is_none(),
+            "cleanup should purge envelope bound to dead process"
+        );
+        let slot = state
+            .memory_object_slot_by_id(mem_id)
+            .expect("slot remains");
+        assert_eq!(
+            state.memory.memory_objects[slot]
+                .expect("object")
+                .pin_refcount,
+            0
         );
     }
 

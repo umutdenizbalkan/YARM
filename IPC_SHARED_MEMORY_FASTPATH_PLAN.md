@@ -89,4 +89,4 @@ Each PR in this sequence should:
 
 - Phase 1 landed in PRs up to commit `5460f97`.
 - Phase 2 landed in PRs up to commit `7d1ab28`.
-- Current pass extends Phase 3 with transfer-release syscall plumbing; remaining work is dual-map lifecycle/refcount behavior.
+- Current pass extends Phase 3 with transfer-release syscall plumbing and process-cleanup envelope purge hooks; remaining work is full dual-map lifecycle/refcount behavior.
