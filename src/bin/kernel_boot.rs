@@ -300,7 +300,18 @@ fn run_boot_markers() {
 #[cfg(not(test))]
 fn run_process_vfs_smoke() {
     yarm::yarm_log!("YARM_INIT_START");
-    init::run();
+    let mut kernel = Bootstrap::init().expect("init");
+    let summary = init::run_minimum_profile_with_kernel(
+        &mut kernel,
+        init::InitRuntimeBootConfig::baseline(),
+    )
+    .expect("minimum runnable profile");
+    yarm::yarm_log!(
+        "YARM_INIT_RUNTIME phase={:?} supervisor_managed={} initramfs_reads={}",
+        summary.init_phase,
+        summary.supervisor_managed_services,
+        summary.initramfs_handled
+    );
     yarm::yarm_log!("YARM_INIT_DONE");
 }
 
