@@ -341,6 +341,16 @@ safe behavior preservation.
     call paths that touch capability mappings.
   - Add tests for process cleanup and cross-task capability delegation.
 
+#### PR 7.3 status (completed in this pass)
+
+- Migrated process-cnode and capability-lifecycle integrations to capability
+  accessors in core `boot/mod.rs` paths:
+  - process-cnode cleanup bookkeeping
+  - cspace ensure/mint/revoke/revoke-direct paths
+  - capability lookup helpers used by delegation/lifecycle paths
+- Kept task lifecycle semantics unchanged while reducing direct capability-state
+  field access in lifecycle-sensitive paths.
+
 - **PR 7.4: Lock-order hardening + helper consolidation**
   - Introduce/adjust ordered acquisition helpers for any new multi-domain
     pairs involving capability state.

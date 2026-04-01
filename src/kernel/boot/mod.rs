@@ -1173,10 +1173,15 @@ impl KernelState {
         let mut telemetry = ProcessCnodeCleanupTelemetry::default();
 
         loop {
-            let live_caps = self
-                .cspace_for_cnode(cnode)
-                .map(|cspace| cspace.live_cap_ids())
-                .unwrap_or([None; MAX_CAPABILITIES_PER_CSPACE]);
+            let live_caps = self.with_capability_state(|capability| {
+                capability
+                    .cnode_spaces
+                    .iter()
+                    .flatten()
+                    .find(|space| space.id == cnode)
+                    .map(|space| kernel_ref(&space.cspace).live_cap_ids())
+                    .unwrap_or([None; MAX_CAPABILITIES_PER_CSPACE])
+            });
             let mut revoked_any = false;
             for cap in live_caps.into_iter().flatten() {
                 if self.revoke_capability_in_cnode(cnode, cap).is_ok() {
@@ -1214,25 +1219,25 @@ impl KernelState {
         telemetry.removed_delegation_links = telemetry
             .removed_delegation_links
             .saturating_add(removed_delegation_links);
-        if let Some(slot) = self
-            .capability
-            .cnode_spaces
-            .iter_mut()
-            .find(|slot| slot.as_ref().is_some_and(|space| space.id == cnode))
-        {
-            *slot = None;
-            telemetry.removed_cnode_space = true;
-        }
+        self.with_capability_state_mut(|capability| {
+            if let Some(slot) = capability
+                .cnode_spaces
+                .iter_mut()
+                .find(|slot| slot.as_ref().is_some_and(|space| space.id == cnode))
+            {
+                *slot = None;
+                telemetry.removed_cnode_space = true;
+            }
 
-        if let Some(slot) = self
-            .capability
-            .process_cnodes
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|record| record.pid == pid))
-        {
-            *slot = None;
-            telemetry.removed_process_record = true;
-        }
+            if let Some(slot) = capability
+                .process_cnodes
+                .iter_mut()
+                .find(|slot| slot.is_some_and(|record| record.pid == pid))
+            {
+                *slot = None;
+                telemetry.removed_process_record = true;
+            }
+        });
 
         crate::yarm_log!(
             "YARM_PROC_CNODE_CLEANUP pid={} cnode={} revoked_caps={} removed_links={} removed_cspace={} removed_record={}",
@@ -1520,8 +1525,14 @@ impl KernelState {
         cnode: CNodeId,
         cap: CapId,
     ) -> Option<Capability> {
-        self.cspace_for_cnode(cnode)
-            .and_then(|cspace| cspace.get(cap))
+        self.with_capability_state(|capability| {
+            capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .and_then(|space| kernel_ref(&space.cspace).get(cap))
+        })
     }
 
     pub fn cnode_capability_has_right(&self, cnode: CNodeId, cap: CapId, right: CapRights) -> bool {
@@ -1614,6 +1625,7 @@ impl KernelState {
         })
     }
 
+    #[cfg(test)]
     fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
         self.capability.cnode_spaces
             .iter()
@@ -1622,6 +1634,7 @@ impl KernelState {
             .map(|space| kernel_ref(&space.cspace))
     }
 
+    #[cfg(test)]
     fn cspace_for_cnode_mut(&mut self, cnode: CNodeId) -> Option<&mut CapabilitySpace> {
         self.capability.cnode_spaces
             .iter_mut()
@@ -1631,18 +1644,25 @@ impl KernelState {
     }
 
     pub(crate) fn ensure_cnode_space(&mut self, cnode: CNodeId) -> Result<(), KernelError> {
-        if self.cspace_for_cnode(cnode).is_some() {
-            return Ok(());
-        }
-        if let Some(slot) = self.capability.cnode_spaces.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(CNodeSpace {
-                id: cnode,
-                cspace: store_kernel_value(CapabilitySpace::default()),
-            });
-            Ok(())
-        } else {
-            Err(KernelError::TaskTableFull)
-        }
+        self.with_capability_state_mut(|capability| {
+            if capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .any(|space| space.id == cnode)
+            {
+                return Ok(());
+            }
+            if let Some(slot) = capability.cnode_spaces.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(CNodeSpace {
+                    id: cnode,
+                    cspace: store_kernel_value(CapabilitySpace::default()),
+                });
+                Ok(())
+            } else {
+                Err(KernelError::TaskTableFull)
+            }
+        })
     }
 
     pub(crate) fn mint_capability_for_current_context(
@@ -1659,11 +1679,17 @@ impl KernelState {
         capability: Capability,
     ) -> Result<CapId, KernelError> {
         self.ensure_cnode_space(cnode)?;
-        let minted = self
-            .cspace_for_cnode_mut(cnode)
-            .ok_or(KernelError::TaskMissing)?
-            .mint(capability)
-            .map_err(|_| KernelError::CapabilityFull)?;
+        let minted = self.with_capability_state_mut(|capability_state| {
+            capability_state
+                .cnode_spaces
+                .iter_mut()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .map(|space| kernel_mut(&mut space.cspace))
+                .ok_or(KernelError::TaskMissing)?
+                .mint(capability)
+                .map_err(|_| KernelError::CapabilityFull)
+        })?;
         self.adjust_memory_object_cap_refcount(capability.object, 1);
         Ok(minted)
     }
@@ -1673,19 +1699,31 @@ impl KernelState {
         cnode: CNodeId,
         cap: CapId,
     ) -> Result<(), KernelError> {
-        let source_capability = self
-            .cspace_for_cnode(cnode)
-            .and_then(|cspace| cspace.get(cap));
+        let source_capability = self.with_capability_state(|capability_state| {
+            capability_state
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .and_then(|space| kernel_ref(&space.cspace).get(cap))
+        });
         let source_pid = self.tid_for_cnode(cnode).ok_or(KernelError::TaskMissing)?;
         let root = DelegatedCapRef {
             pid: source_pid,
             cap,
         };
         let descendants = self.collect_delegated_descendants(root);
-        self.cspace_for_cnode_mut(cnode)
-            .ok_or(KernelError::TaskMissing)?
-            .revoke(cap)
-            .map_err(|_| KernelError::InvalidCapability)?;
+        self.with_capability_state_mut(|capability_state| {
+            capability_state
+                .cnode_spaces
+                .iter_mut()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .map(|space| kernel_mut(&mut space.cspace))
+                .ok_or(KernelError::TaskMissing)?
+                .revoke(cap)
+                .map_err(|_| KernelError::InvalidCapability)
+        })?;
         for delegated in descendants.into_iter().flatten() {
             self.revoke_capability_direct_in_process_cnode(delegated.pid, delegated.cap);
         }
@@ -1742,11 +1780,19 @@ impl KernelState {
 
     fn revoke_capability_direct_in_process_cnode(&mut self, pid: u64, cap: CapId) {
         let mut revoked_capability = None;
-        if let Some(cnode) = self.process_cnode_for_pid(pid)
-            && let Some(cspace) = self.cspace_for_cnode_mut(cnode)
-        {
-            revoked_capability = cspace.get(cap);
-            let _ = cspace.revoke(cap);
+        if let Some(cnode) = self.process_cnode_for_pid(pid) {
+            self.with_capability_state_mut(|capability_state| {
+                if let Some(cspace) = capability_state
+                    .cnode_spaces
+                    .iter_mut()
+                    .flatten()
+                    .find(|space| space.id == cnode)
+                    .map(|space| kernel_mut(&mut space.cspace))
+                {
+                    revoked_capability = cspace.get(cap);
+                    let _ = cspace.revoke(cap);
+                }
+            });
         }
         self.revoke_active_transfer_mappings_for_cap(pid, cap);
         if let Some(capability) = revoked_capability {
