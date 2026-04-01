@@ -3,17 +3,7 @@
 
 use yarm::kernel::boot::Bootstrap;
 #[cfg(not(test))]
-use yarm::kernel::ipc::Message;
-#[cfg(not(test))]
-use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
-#[cfg(not(test))]
-use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
-#[cfg(not(test))]
-use yarm::kernel::vfs::{OpenAtRequest, ReadWriteRequest, openat_message, read_message};
-#[cfg(not(test))]
-use yarm::services::common::vfs_service::{VfsReply, VfsService};
-#[cfg(not(test))]
-use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
+use yarm::services::control_plane::init;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
@@ -309,58 +299,8 @@ fn run_boot_markers() {
 
 #[cfg(not(test))]
 fn run_process_vfs_smoke() {
-    let mut proc = ProcessService::new();
-    let spawn = Message::with_header(
-        0,
-        PROC_OP_SPAWN_V2,
-        0,
-        None,
-        &SpawnV2Args::new(1, 99).encode(),
-    )
-    .expect("spawn");
-    let spawn_rep = proc.handle(spawn).expect("spawn rep");
-    let child = SpawnV2Result::decode(spawn_rep.as_slice()).expect("child");
-    proc.mark_exit(child.pid, 7).expect("mark exit");
-
-    let wait = Message::with_header(
-        0,
-        PROC_OP_WAITPID_V2,
-        0,
-        None,
-        &WaitPidV2Args::new(1, child.pid.0).encode(),
-    )
-    .expect("wait");
-    let wait_rep = proc.handle(wait).expect("wait rep");
-    let waited = WaitPidV2Result::decode(wait_rep.as_slice()).expect("waited");
-
-    let mut vfs = VfsService::with_backend(InitramfsBackend::new(4096));
     yarm::yarm_log!("YARM_INIT_START");
-    let open = openat_message(OpenAtRequest {
-        dirfd: 0,
-        path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-        flags: 0,
-        mode: 0,
-    })
-    .expect("open");
-    let open_rep = vfs.handle_request(open).expect("open rep");
-    let fd = match VfsReply::from_message(open_rep).expect("decode open reply") {
-        VfsReply::OpenAtFd(fd) => fd,
-        _ => panic!("unexpected open reply"),
-    };
-    let read = read_message(ReadWriteRequest {
-        fd,
-        buf_ptr: 0,
-        len: 16,
-    })
-    .expect("read");
-    let read_rep = vfs.handle_request(read).expect("read rep");
-
-    yarm::yarm_log!(
-        "YARM_PROC_VFS_OK pid={} exit={} read_opcode={}",
-        child.pid.0,
-        waited.exit_code,
-        read_rep.opcode
-    );
+    init::run();
     yarm::yarm_log!("YARM_INIT_DONE");
 }
 
