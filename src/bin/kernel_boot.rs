@@ -17,6 +17,8 @@ use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBac
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const MAX_PVH_PHYS_EXCLUSIVE: u64 = 1u64 << 52;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[repr(C)]
@@ -44,6 +46,25 @@ struct PvhMemMapEntry {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
+    #[derive(Default)]
+    struct PvhMemmapTelemetry {
+        total_entries: usize,
+        usable_entries: usize,
+        accepted_entries: usize,
+        rejected_non_usable: usize,
+        rejected_zero_size: usize,
+        rejected_overflow: usize,
+        rejected_bounds: usize,
+        rejected_too_small: usize,
+        rejected_overlap: usize,
+        rejected_capacity: usize,
+        clipped_reserved_low: usize,
+        clipped_alignment: usize,
+    }
+
+    const PAGE_SIZE_U64: u64 = yarm::kernel::vm::PAGE_SIZE as u64;
+    const RESERVED_LOW_EXCLUSIVE: u64 = yarm::arch::platform_layout::NEXT_ANON_PHYS_BASE;
+
     if start_info_ptr == 0 {
         return;
     }
@@ -63,27 +84,101 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
         usable: false,
     }; MAX_PVH_MEMMAP_ENTRIES];
     let mut used = 0usize;
+    let mut telemetry = PvhMemmapTelemetry::default();
 
     for entry in entries {
-        if entry.size == 0 || entry.kind != 1 {
+        telemetry.total_entries = telemetry.total_entries.saturating_add(1);
+        if entry.kind != 1 {
+            telemetry.rejected_non_usable = telemetry.rejected_non_usable.saturating_add(1);
+            continue;
+        }
+        telemetry.usable_entries = telemetry.usable_entries.saturating_add(1);
+        if entry.size == 0 {
+            telemetry.rejected_zero_size = telemetry.rejected_zero_size.saturating_add(1);
+            continue;
+        }
+        let Some(raw_end) = entry.addr.checked_add(entry.size) else {
+            telemetry.rejected_overflow = telemetry.rejected_overflow.saturating_add(1);
+            continue;
+        };
+        let mut start = entry.addr;
+        let mut end = raw_end;
+
+        if end > MAX_PVH_PHYS_EXCLUSIVE {
+            end = MAX_PVH_PHYS_EXCLUSIVE;
+        }
+        if start >= end {
+            telemetry.rejected_bounds = telemetry.rejected_bounds.saturating_add(1);
+            continue;
+        }
+
+        if end <= RESERVED_LOW_EXCLUSIVE {
+            telemetry.rejected_bounds = telemetry.rejected_bounds.saturating_add(1);
+            continue;
+        }
+        if start < RESERVED_LOW_EXCLUSIVE {
+            start = RESERVED_LOW_EXCLUSIVE;
+            telemetry.clipped_reserved_low = telemetry.clipped_reserved_low.saturating_add(1);
+        }
+
+        let aligned_start = start
+            .saturating_add(PAGE_SIZE_U64 - 1)
+            .saturating_div(PAGE_SIZE_U64)
+            .saturating_mul(PAGE_SIZE_U64);
+        let aligned_end = end
+            .saturating_div(PAGE_SIZE_U64)
+            .saturating_mul(PAGE_SIZE_U64);
+        if aligned_start != start || aligned_end != end {
+            telemetry.clipped_alignment = telemetry.clipped_alignment.saturating_add(1);
+        }
+        if aligned_end <= aligned_start {
+            telemetry.rejected_too_small = telemetry.rejected_too_small.saturating_add(1);
+            continue;
+        }
+
+        if regions[..used].iter().any(|existing| {
+            let existing_end = existing.start.saturating_add(existing.len);
+            aligned_start < existing_end && aligned_end > existing.start
+        }) {
+            telemetry.rejected_overlap = telemetry.rejected_overlap.saturating_add(1);
             continue;
         }
         if used >= regions.len() {
+            telemetry.rejected_capacity = telemetry.rejected_capacity.saturating_add(1);
             break;
         }
         regions[used] = yarm::kernel::frame_allocator::MemoryRegion {
-            start: entry.addr,
-            len: entry.size,
+            start: aligned_start,
+            len: aligned_end - aligned_start,
             usable: true,
         };
         used += 1;
+        telemetry.accepted_entries = telemetry.accepted_entries.saturating_add(1);
     }
+
+    yarm::yarm_log!(
+        "YARM_PVH_MEMMAP total={} usable={} accepted={} rej_nonusable={} rej_zero={} rej_overflow={} rej_bounds={} rej_small={} rej_overlap={} rej_capacity={} clip_low={} clip_align={}",
+        telemetry.total_entries,
+        telemetry.usable_entries,
+        telemetry.accepted_entries,
+        telemetry.rejected_non_usable,
+        telemetry.rejected_zero_size,
+        telemetry.rejected_overflow,
+        telemetry.rejected_bounds,
+        telemetry.rejected_too_small,
+        telemetry.rejected_overlap,
+        telemetry.rejected_capacity,
+        telemetry.clipped_reserved_low,
+        telemetry.clipped_alignment
+    );
 
     if used == 0 {
         return;
     }
 
-    let _ = yarm::kernel::frame_allocator::init_pt_frame_allocator(&regions[..used]);
+    if let Err(err) = yarm::kernel::frame_allocator::init_pt_frame_allocator(&regions[..used]) {
+        yarm::yarm_log!("YARM_PVH_MEMMAP_INIT_ERR err={:?}", err);
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
