@@ -3,6 +3,49 @@
 This document captures the concrete next steps for splitting `KernelState`
 into independently lockable domains while preserving behavior.
 
+## Current status snapshot (after Phase 6)
+
+The original issue (“KernelState is a single monolithic struct”) is **partially
+fixed, but not fully eliminated**:
+
+- ✅ **Fixed in practice for major hot domains**: scheduler, IPC, driver, fault,
+  restart, VM/user-spaces, task/TCBs, and memory now have explicit lock-backed
+  accessor APIs and dedicated lock domains.
+- ⚠️ **Still structurally monolithic at the type level**: these domains still
+  live as fields inside `KernelState`, so compile-time coupling and some
+  cross-domain ergonomics remain.
+- ⚠️ **Residual non-partitioned areas remain**: capability/cnode bookkeeping and
+  some bootstrap/global counters are still managed as top-level `KernelState`
+  concerns rather than extracted domain structs.
+
+### What has been partitioned so far
+
+- Scheduler domain:
+  - `SchedulerState` + `with_scheduler_state(...)` /
+    `with_scheduler_state_mut(...)` / ordered `with_scheduler_then_ipc(...)`
+- IPC domain:
+  - `IpcState` (subsystem) + `with_ipc_state(...)` / `with_ipc_state_mut(...)`
+- Driver domain:
+  - `with_driver_state(...)` / `with_driver_state_mut(...)`
+- Fault domain:
+  - `with_fault_state(...)` / `with_fault_state_mut(...)`
+- Restart domain:
+  - `with_restart_state(...)` / `with_restart_state_mut(...)`
+- VM domain:
+  - `with_user_spaces(...)` / `with_user_spaces_mut(...)`
+- Task domain:
+  - `with_tcbs(...)` / `with_tcbs_mut(...)`
+- Memory domain:
+  - `with_memory_state(...)` / `with_memory_state_mut(...)`
+
+### Net effect vs original concern
+
+- The runtime locking model is no longer “single global state lock” for the
+  partitioned paths; major subsystem operations are now lock-scoped by domain.
+- The codebase still benefits from a future Phase 7+ effort to extract
+  capability/cnode and other residual global concerns into dedicated domains to
+  reduce remaining monolithic coupling.
+
 ## Phase 1 (completed)
 
 - Add explicit lock boundaries for scheduler-facing and IPC-mailbox-facing paths:
