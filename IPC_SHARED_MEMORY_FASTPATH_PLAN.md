@@ -109,3 +109,4 @@ Each PR in this sequence should:
 - Post-fastpath follow-up extended typed process/VFS codec freeze with stable golden vectors and CI enforcement (`scripts/check-proc-vfs-codec-freeze.sh`).
 - Post-fastpath follow-up added extra HAL conformance targets (riscv64/x86_64/aarch64 baseline) with enforcement via `scripts/check-hal-conformance-targets.sh`.
 - Post-fastpath follow-up expanded deterministic end-to-end server flow tests (process-manager + VFS + notification routing) with replay-stability assertions in `tests/kernel_scenarios.rs`.
+- Post-fastpath follow-up tightened review-scope CI with `scripts/check-pr-scope-and-message.sh` to reject placeholder/WIP commits and overscoped arch PR slices by default.

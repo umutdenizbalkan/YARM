@@ -110,6 +110,7 @@ Progress notes:
 2. **Tighten CI to block placeholder/overscoped submissions**
    - add commit/PR lint that rejects placeholder PR bodies and change sets spanning unrelated domains.
    - require `compat-gates` and at least one architecture smoke job on every architecture-touching PR.
+   - ✅ Added `scripts/check-pr-scope-and-message.sh` to reject placeholder/WIP commit markers and fail overscoped arch+kernel+services diffs by default.
 3. **Promote contract docs from draft to enforced gates**
    - pin `ABI_CONTRACT_FREEZE.md`, `SYSCALL_ABI.md`, and `PROC_VFS_CODEC_FREEZE.md` as CI-checked reference artifacts.
 4. **Reduce bootstrap script drift**
