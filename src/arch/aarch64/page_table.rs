@@ -10,7 +10,9 @@ const ENTRIES_PER_TABLE: usize = 512;
 const PAGE_SIZE_U64: u64 = vm_layout::PAGE_SIZE as u64;
 const PAGE_MASK: u64 = !(PAGE_SIZE_U64 - 1);
 const PTE_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
-const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
+const INTERMEDIATE_PT_PAGES_PER_MAPPING: usize = 4;
+const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES
+    * (1 + vm_layout::MAX_MAPPINGS * INTERMEDIATE_PT_PAGES_PER_MAPPING);
 const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

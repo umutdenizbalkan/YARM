@@ -12,7 +12,9 @@ const PAGE_MASK: u64 = !(PAGE_SIZE_U64 - 1);
 const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const PCID_MASK: u16 = 0x0fff;
 const MAX_PCID: u16 = PCID_MASK;
-const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
+const INTERMEDIATE_PT_PAGES_PER_MAPPING: usize = 4;
+const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES
+    * (1 + vm_layout::MAX_MAPPINGS * INTERMEDIATE_PT_PAGES_PER_MAPPING);
 const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,10 +160,7 @@ impl PageTableState {
     }
 
     fn pcid_in_use(&self, pcid: u16) -> bool {
-        self.asids
-            .iter()
-            .flatten()
-            .any(|entry| entry.pcid == pcid)
+        self.asids.iter().flatten().any(|entry| entry.pcid == pcid)
     }
 
     fn allocate_pcid(&self, asid: Asid) -> Result<u16, PageTableError> {
@@ -449,14 +448,9 @@ pub fn invalidate_asid(asid: Asid) {
     unsafe {
         let pcid = {
             let state = PAGE_TABLE_STATE.lock();
-            state
-                .asid_pcid(asid)
-                .unwrap_or_else(|| asid.0 & PCID_MASK) as u64
+            state.asid_pcid(asid).unwrap_or_else(|| asid.0 & PCID_MASK) as u64
         };
-        let descriptor = InvpcidDescriptor {
-            pcid,
-            addr: 0,
-        };
+        let descriptor = InvpcidDescriptor { pcid, addr: 0 };
         core::arch::asm!(
             "invpcid {kind:r}, [{desc}]",
             kind = in(reg) 1u64,
