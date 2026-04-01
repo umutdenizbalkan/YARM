@@ -989,4 +989,29 @@ mod tests {
             .expect("timer dispatch");
         assert_eq!(kernel.timer.current_ticks().0, 1);
     }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn real_stub_frame_syscall_path_reports_decode_error() {
+        let mut kernel = crate::kernel::boot::Bootstrap::init().expect("kernel");
+        let mut regs = X86SavedRegs {
+            rax: 0xFFFF, // invalid syscall number
+            ..X86SavedRegs::default()
+        };
+        let frame = X86InterruptStackFrame {
+            rip: 0x2000,
+            cs: KERNEL_CODE_SELECTOR as u64,
+            rflags: 0x202,
+            rsp: 0x9000,
+            ss: KERNEL_DATA_SELECTOR as u64,
+        };
+        let result =
+            dispatch_trap_from_stub_for_test(&mut kernel, VEC_SYSCALL as u64, 0, &mut regs, &frame);
+        assert_eq!(
+            result,
+            Err(crate::kernel::boot::TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::InvalidNumber
+            ))
+        );
+    }
 }
