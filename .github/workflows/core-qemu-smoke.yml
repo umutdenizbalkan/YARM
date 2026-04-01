@@ -21,6 +21,30 @@ jobs:
           QEMU_SMOKE_STRICT: "0"
         run: scripts/qemu-x86_64-core-smoke.sh
 
+  x86_64-core-smoke-strict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build + qemu tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 cpio busybox-static
+      - name: Build staged artifacts (strict)
+        env:
+          ARTIFACTS_STRICT: "1"
+        run: scripts/build-qemu-x86_64-artifacts.sh
+      - name: Core-marker QEMU smoke (strict)
+        env:
+          QEMU_SMOKE_STRICT: "1"
+          LOGFILE: qemu-x86_64-core.log
+        run: scripts/qemu-x86_64-core-smoke.sh
+      - name: Verify strict smoke log has x86 timer markers
+        run: |
+          rg -n "YARM_TIMER_IRQ_DELIVERED" qemu-x86_64-core.log
+          rg -n "YARM_TIMER_EOI_DONE" qemu-x86_64-core.log
+          rg -n "YARM_SCHED_TICK" qemu-x86_64-core.log
+
   aarch64-core-smoke:
     runs-on: ubuntu-latest
     steps:
