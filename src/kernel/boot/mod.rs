@@ -910,6 +910,14 @@ impl KernelState {
     }
 
     pub(crate) fn maybe_cleanup_process_cnode_for_pid(&mut self, pid: u64) {
+        #[derive(Default)]
+        struct ProcessCnodeCleanupTelemetry {
+            revoked_caps: usize,
+            removed_delegation_links: usize,
+            removed_cnode_space: bool,
+            removed_process_record: bool,
+        }
+
         let has_live_threads = self
             .tcbs
             .iter()
@@ -921,6 +929,7 @@ impl KernelState {
         let Some(cnode) = self.process_cnode_for_pid(pid) else {
             return;
         };
+        let mut telemetry = ProcessCnodeCleanupTelemetry::default();
 
         loop {
             let live_caps = self
@@ -931,6 +940,7 @@ impl KernelState {
             for cap in live_caps.into_iter().flatten() {
                 if self.revoke_capability_in_cnode(cnode, cap).is_ok() {
                     revoked_any = true;
+                    telemetry.revoked_caps = telemetry.revoked_caps.saturating_add(1);
                 }
             }
             if !revoked_any {
@@ -948,6 +958,8 @@ impl KernelState {
             let dest_pid = self.process_id(record.dest_tid).unwrap_or(record.dest_tid);
             if source_pid == pid || dest_pid == pid {
                 self.delegated_capability_links[idx] = None;
+                telemetry.removed_delegation_links =
+                    telemetry.removed_delegation_links.saturating_add(1);
             }
         }
 
@@ -957,6 +969,7 @@ impl KernelState {
             .find(|slot| slot.as_ref().is_some_and(|space| space.id == cnode))
         {
             *slot = None;
+            telemetry.removed_cnode_space = true;
         }
 
         if let Some(slot) = self
@@ -965,7 +978,18 @@ impl KernelState {
             .find(|slot| slot.is_some_and(|record| record.pid == pid))
         {
             *slot = None;
+            telemetry.removed_process_record = true;
         }
+
+        crate::yarm_log!(
+            "YARM_PROC_CNODE_CLEANUP pid={} cnode={} revoked_caps={} removed_links={} removed_cspace={} removed_record={}",
+            pid,
+            cnode.0,
+            telemetry.revoked_caps,
+            telemetry.removed_delegation_links,
+            telemetry.removed_cnode_space as u8,
+            telemetry.removed_process_record as u8
+        );
     }
 
     pub fn current_task_capability(&self, cap: CapId) -> Option<Capability> {
