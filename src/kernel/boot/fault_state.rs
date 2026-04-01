@@ -86,7 +86,7 @@ impl KernelState {
                 self.hal.acknowledge_interrupt(self.current_cpu(), 0);
                 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
                 crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);
-                let (_tick, should_preempt) = self.timer.tick_and_check();
+                let (_tick, should_preempt) = self.tick_scheduler_timer();
                 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
                 crate::yarm_log!(
                     "YARM_SCHED_TICK cpu={} tick={} preempt={}",

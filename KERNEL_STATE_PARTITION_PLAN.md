@@ -3,27 +3,29 @@
 This document captures the concrete next steps for splitting `KernelState`
 into independently lockable domains while preserving behavior.
 
-## Phase 1 (this change)
+## Phase 1 (completed)
 
 - Add explicit lock boundaries for scheduler-facing and IPC-mailbox-facing paths:
-  - `scheduler_state_lock: SpinLockIrq<()>`
+  - scheduler domain lock (initially `SpinLockIrq<()>`)
   - `ipc_state_lock: SpinLockIrq<()>`
-- Use `scheduler_state_lock` in scheduler entry points (`bring_up_cpu`,
+- Use the scheduler lock in scheduler entry points (`bring_up_cpu`,
   dispatch/preempt/block paths, and enqueue paths) so scheduler mutations are
   serialized through a dedicated lock domain.
 - Use `ipc_state_lock` in cross-CPU mailbox submit/drain entry points.
 
-## Phase 2
+## Phase 2 (completed in this pass)
 
 - Extract `SchedulerState` into a dedicated struct:
   - `scheduler: SmpScheduler`
   - `timer: Timer`
   - `current_cpu: CpuId`
 - Store as `SpinLockIrq<SchedulerState>` in `KernelState`.
-- Migrate scheduler call sites to lock the scheduler state explicitly and
-  remove direct field access.
+- Migrate scheduler call sites to lock scheduler state explicitly and remove
+  direct `KernelState::{scheduler,timer,current_cpu}` field access.
+- Add scheduler/timer test helpers so architecture and boot tests no longer
+  rely on direct field access.
 
-## Phase 3
+## Phase 3 (next)
 
 - Extract `IpcState` into a dedicated struct:
   - endpoint tables/waiters/routes/envelopes

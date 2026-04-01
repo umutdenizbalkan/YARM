@@ -996,10 +996,10 @@ mod tests {
             rsp: 0x8000,
             ss: KERNEL_DATA_SELECTOR as u64,
         };
-        assert_eq!(kernel.timer.current_ticks().0, 0);
+        assert_eq!(kernel.timer_ticks_for_test(), 0);
         dispatch_trap_from_stub_for_test(&mut kernel, VEC_TIMER as u64, 0, &mut regs, &frame)
             .expect("timer dispatch");
-        assert_eq!(kernel.timer.current_ticks().0, 1);
+        assert_eq!(kernel.timer_ticks_for_test(), 1);
     }
 
     #[test]

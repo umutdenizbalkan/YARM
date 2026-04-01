@@ -469,6 +469,13 @@ struct RestartSubsystem {
     next_restart_token: u64,
 }
 
+#[derive(Debug)]
+struct SchedulerState {
+    scheduler: KernelStorage<SmpScheduler>,
+    timer: Timer,
+    current_cpu: CpuId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DelegatedCapabilityLink {
     source_tid: u64,
@@ -487,11 +494,8 @@ struct DelegatedCapRef {
 pub struct KernelState {
     pub kernel_aspace: AddressSpace,
     hal: crate::arch::hal::SelectedIsaHal,
-    pub scheduler: KernelStorage<SmpScheduler>,
-    pub timer: Timer,
     pub user_spaces: KernelStorage<AddressSpaceManager>,
-    current_cpu: CpuId,
-    scheduler_state_lock: SpinLockIrq<()>,
+    scheduler_state: SpinLockIrq<SchedulerState>,
     ipc_state_lock: SpinLockIrq<()>,
     ipc: KernelStorage<IpcSubsystem>,
     cnode_spaces: KernelStorage<[Option<CNodeSpace>; MAX_TASKS]>,
@@ -536,6 +540,30 @@ fn map_ipc_error(err: IpcError) -> KernelError {
         | IpcError::MissingCapTransferFlag
         | IpcError::InconsistentCapTransferFlag
         | IpcError::InvalidEndpointDepth => KernelError::WrongObject,
+    }
+}
+
+impl KernelState {
+    fn scheduler_state(&self) -> crate::kernel::lock::SpinLockIrqGuard<'_, SchedulerState> {
+        self.scheduler_state.lock()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_timer_for_test(&mut self, timer: Timer) {
+        let mut sched = self.scheduler_state.lock();
+        sched.timer = timer;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runnable_count_on_for_test(&self, cpu: CpuId) -> usize {
+        let sched = self.scheduler_state.lock();
+        kernel_ref(&sched.scheduler).runnable_count_on(cpu)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timer_ticks_for_test(&self) -> u64 {
+        let sched = self.scheduler_state.lock();
+        sched.timer.current_ticks().0
     }
 }
 
@@ -712,11 +740,12 @@ impl Bootstrap {
         let mut state = KernelState {
             kernel_aspace,
             hal: crate::arch::hal::SelectedIsaHal::default(),
-            scheduler: store_kernel_value(scheduler),
-            timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS),
             user_spaces: store_kernel_value(AddressSpaceManager::default()),
-            current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
-            scheduler_state_lock: SpinLockIrq::new(()),
+            scheduler_state: SpinLockIrq::new(SchedulerState {
+                scheduler: store_kernel_value(scheduler),
+                timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS),
+                current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
+            }),
             ipc_state_lock: SpinLockIrq::new(()),
             ipc: store_kernel_value(IpcSubsystem {
                 cross_cpu_work: SmpMailbox::default(),
@@ -2623,7 +2652,7 @@ mod tests {
     #[test]
     fn timer_trap_preempts_and_rotates() {
         let mut state = Bootstrap::init().expect("init");
-        state.timer = Timer::new(1);
+        state.set_timer_for_test(Timer::new(1));
         state.register_task(1).expect("register task 1");
         state.enqueue_current_cpu(1).expect("queue task 1");
 
@@ -4475,7 +4504,7 @@ mod tests {
 
         state.set_current_cpu(CpuId(0)).expect("cpu0");
         assert_eq!(state.enqueue_task(71).expect("enqueue first"), CpuId(0));
-        assert!(state.scheduler.runnable_count_on(CpuId(0)) >= 1);
+        assert!(state.runnable_count_on_for_test(CpuId(0)) >= 1);
         for _ in 0..4 {
             if state.current_tid() == Some(71) {
                 break;
@@ -4488,8 +4517,8 @@ mod tests {
 
         state.set_current_cpu(CpuId(1)).expect("cpu1");
         assert_eq!(state.enqueue_task(71).expect("enqueue second"), CpuId(0));
-        assert_eq!(state.scheduler.runnable_count_on(CpuId(1)), 0);
-        assert!(state.scheduler.runnable_count_on(CpuId(0)) >= 1);
+        assert_eq!(state.runnable_count_on_for_test(CpuId(1)), 0);
+        assert!(state.runnable_count_on_for_test(CpuId(0)) >= 1);
 
         state.set_current_cpu(CpuId(0)).expect("cpu0");
         assert_ne!(state.dispatch_next_current_cpu(), None);
