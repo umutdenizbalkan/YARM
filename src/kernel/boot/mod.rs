@@ -1664,6 +1664,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn selected_arch_trap_entry_routes_highest_external_irq_notification() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_notif_idx, notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
+        let highest_irq = 15u16; // VEC_EXTERNAL_LIMIT (0x30) is exclusive, so max decodable IRQ is 15
+        let vector = 0x2F;
+        state
+            .bind_irq_notification(highest_irq, notif_cap)
+            .expect("bind");
+        let ctx = crate::arch::trap_entry::ArchTrapContext {
+            vector,
+            error_code: 0,
+            fault_addr: 0,
+        };
+
+        state
+            .handle_selected_arch_trap_entry(CpuId(0), ctx, None)
+            .expect("trap");
+
+        let msg = state.ipc_recv(notif_recv_cap).expect("recv").expect("msg");
+        assert_eq!(msg.opcode, highest_irq);
+        assert_eq!(msg.as_slice()[0], highest_irq as u8);
+    }
+
+    #[test]
     fn bootstrap_sets_minimal_kernel_state() {
         let state = Bootstrap::init().expect("bootstrap should fit static limits");
         assert_eq!(state.kernel_aspace.mappings(), 1);
