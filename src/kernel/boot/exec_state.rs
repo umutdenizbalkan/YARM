@@ -130,6 +130,11 @@ impl KernelState {
     }
 
     pub(crate) fn dispatch_next_task(&mut self) -> Result<Option<u64>, KernelError> {
+        self.ipc.telemetry.scheduler_dispatch_calls = self
+            .ipc
+            .telemetry
+            .scheduler_dispatch_calls
+            .saturating_add(1);
         let outgoing_tid = self.current_tid();
         let outgoing_asid = outgoing_tid.and_then(|tid| self.task_asid(tid));
         let next = self.dispatch_next_current_cpu();
@@ -141,6 +146,13 @@ impl KernelState {
                 self.hal.switch_address_space(asid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
+            if outgoing_tid != Some(tid) {
+                self.ipc.telemetry.scheduler_context_switches = self
+                    .ipc
+                    .telemetry
+                    .scheduler_context_switches
+                    .saturating_add(1);
+            }
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Running;
         }
@@ -152,6 +164,11 @@ impl KernelState {
     }
 
     pub fn yield_current(&mut self) -> Result<(), KernelError> {
+        self.ipc.telemetry.scheduler_yield_calls = self
+            .ipc
+            .telemetry
+            .scheduler_yield_calls
+            .saturating_add(1);
         let outgoing_tid = self.current_tid();
         let outgoing_asid = outgoing_tid.and_then(|tid| self.task_asid(tid));
         if let Some(tid) = outgoing_tid {
@@ -168,6 +185,13 @@ impl KernelState {
                 self.hal.switch_address_space(asid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
+            if outgoing_tid != Some(tid) {
+                self.ipc.telemetry.scheduler_context_switches = self
+                    .ipc
+                    .telemetry
+                    .scheduler_context_switches
+                    .saturating_add(1);
+            }
             let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Running;
         }

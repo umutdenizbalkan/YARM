@@ -91,6 +91,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 Progress notes:
 - ✅ Added IPC fastpath-vs-queued-vs-blocked telemetry tests under contention in `kernel::boot` tests.
 - ✅ Added restart/redelegation stale-cap regression for checked driver delegation bundles.
+- ✅ Wired synchronous IPC fast-path switching into measured scheduler telemetry (`scheduler_*` counters) with regression assertions in `kernel::boot` fast-path tests.
 
 ## Review follow-up next steps (after oversized placeholder PR)
 

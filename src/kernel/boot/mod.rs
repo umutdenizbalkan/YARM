@@ -237,6 +237,10 @@ pub struct IpcPathTelemetry {
     pub shared_mem_bytes_mapped: u64,
     pub shared_mem_bytes_released: u64,
     pub transfer_release_calls: u64,
+    pub scheduler_dispatch_calls: u64,
+    pub scheduler_yield_calls: u64,
+    pub scheduler_context_switches: u64,
+    pub scheduler_fastpath_handoffs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3862,6 +3866,9 @@ mod tests {
         assert_eq!(t.queued_sends, 1);
         assert_eq!(t.blocked_sends, 0);
         assert_eq!(t.rendezvous_handoffs, 1);
+        assert_eq!(t.scheduler_fastpath_handoffs, 1);
+        assert!(t.scheduler_context_switches >= 1);
+        assert!(t.scheduler_yield_calls >= 2);
     }
 
     #[test]
@@ -4017,6 +4024,7 @@ mod tests {
         assert_eq!(t.blocked_sends, 1);
         assert_eq!(t.queued_sends, 0);
         assert_eq!(t.rendezvous_handoffs, 0);
+        assert_eq!(t.scheduler_fastpath_handoffs, 0);
     }
 
     #[test]
@@ -4038,6 +4046,7 @@ mod tests {
         assert_eq!(t.fastpath_switches, 0);
         assert_eq!(t.queued_sends, 1);
         assert_eq!(t.blocked_sends, 0);
+        assert_eq!(t.scheduler_fastpath_handoffs, 0);
     }
 
     #[test]

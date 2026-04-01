@@ -391,6 +391,11 @@ impl KernelState {
                 if self.switch_to_runnable_tid(waiter_tid)? {
                     self.ipc.telemetry.fastpath_switches =
                         self.ipc.telemetry.fastpath_switches.saturating_add(1);
+                    self.ipc.telemetry.scheduler_fastpath_handoffs = self
+                        .ipc
+                        .telemetry
+                        .scheduler_fastpath_handoffs
+                        .saturating_add(1);
                 }
                 return Ok(());
             }
@@ -455,6 +460,11 @@ impl KernelState {
         if switched && !inline_sync_handoff {
             self.ipc.telemetry.fastpath_switches =
                 self.ipc.telemetry.fastpath_switches.saturating_add(1);
+            self.ipc.telemetry.scheduler_fastpath_handoffs = self
+                .ipc
+                .telemetry
+                .scheduler_fastpath_handoffs
+                .saturating_add(1);
         }
 
         Ok(IpcFastpathResult {
