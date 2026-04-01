@@ -565,6 +565,16 @@ impl KernelState {
         let sched = self.scheduler_state.lock();
         sched.timer.current_ticks().0
     }
+
+    fn with_ipc_state<R>(&self, f: impl FnOnce(&IpcSubsystem) -> R) -> R {
+        let _ipc_guard = self.ipc_state_lock.lock();
+        f(kernel_ref(&self.ipc))
+    }
+
+    fn with_ipc_state_mut<R>(&mut self, f: impl FnOnce(&mut IpcSubsystem) -> R) -> R {
+        let _ipc_guard = self.ipc_state_lock.lock();
+        f(kernel_mut(&mut self.ipc))
+    }
 }
 
 impl Bootstrap {

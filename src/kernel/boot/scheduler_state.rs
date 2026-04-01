@@ -168,18 +168,12 @@ impl KernelState {
     }
 
     pub fn submit_cross_cpu_work(&self, cpu: CpuId, item: WorkItem) -> Result<(), KernelError> {
-        let _ipc_guard = self.ipc_state_lock.lock();
-        self.ipc
-            .cross_cpu_work
-            .send_to(cpu, item)
+        self.with_ipc_state(|ipc| ipc.cross_cpu_work.send_to(cpu, item))
             .map_err(map_smp_error)
     }
 
     pub fn drain_cross_cpu_work(&self) -> Result<Option<WorkItem>, KernelError> {
-        let _ipc_guard = self.ipc_state_lock.lock();
-        self.ipc
-            .cross_cpu_work
-            .take_for_cpu(self.current_cpu())
+        self.with_ipc_state(|ipc| ipc.cross_cpu_work.take_for_cpu(self.current_cpu()))
             .map_err(map_smp_error)
     }
 

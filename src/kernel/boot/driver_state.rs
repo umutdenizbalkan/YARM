@@ -274,7 +274,7 @@ impl KernelState {
     }
 
     pub fn ipc_path_telemetry(&self) -> IpcPathTelemetry {
-        self.ipc.telemetry
+        self.with_ipc_state(|ipc| ipc.telemetry)
     }
 
     pub fn validate_driver_bundle_live(

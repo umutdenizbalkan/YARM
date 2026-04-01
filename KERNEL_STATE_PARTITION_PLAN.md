@@ -25,7 +25,7 @@ into independently lockable domains while preserving behavior.
 - Add scheduler/timer test helpers so architecture and boot tests no longer
   rely on direct field access.
 
-## Phase 3 (next)
+## Phase 3 (in progress)
 
 - Extract `IpcState` into a dedicated struct:
   - endpoint tables/waiters/routes/envelopes
@@ -33,6 +33,15 @@ into independently lockable domains while preserving behavior.
   - cross-CPU mailbox
 - Store as `SpinLockIrq<IpcState>` in `KernelState`.
 - Migrate IPC call sites to lock IPC state explicitly.
+
+### Phase 3a (completed in this pass)
+
+- Introduce IPC lock-backed accessors on `KernelState`:
+  - `with_ipc_state(...)`
+  - `with_ipc_state_mut(...)`
+- Migrate cross-CPU mailbox submit/drain paths to use IPC accessors.
+- Migrate non-IPC-module telemetry touch points (scheduler dispatch/yield/context
+  counters and driver telemetry snapshot) to use IPC accessors.
 
 ## Phase 4
 
