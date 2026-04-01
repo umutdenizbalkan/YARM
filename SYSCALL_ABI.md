@@ -37,6 +37,16 @@ argument order instead of repurposing `arg0` for capabilities.
 - **Capability transfer opportunity on each IPC**: send can optionally attach a capability; recv returns transferred cap id in `ret2`.
 - **Large payload zero-copy descriptor path**: if send length exceeds `Message::MAX_PAYLOAD`, sender provides a transferable memory capability and the kernel sends a shared-memory descriptor (`offset`,`len`) as payload metadata instead of copying bytes.
 
+### Shared-memory transfer status (current)
+
+- `Message::MAX_PAYLOAD` is fixed at 64 bytes for inline IPC envelopes.
+- `OPCODE_SHARED_MEM` plus `SharedMemoryRegion { offset, len }` is implemented for large-send metadata.
+- Transfer-envelope handling and capability materialization on `IpcRecv` are implemented, so the receiver can obtain a delegated memory capability.
+- **Not yet implemented as an end-to-end fast path**: automatic/map-on-receive plumbing that wires the shared region into both communicating address spaces with lifecycle + revocation semantics suitable for sustained filesystem/network/display data-plane throughput.
+
+In short: descriptor + cap handoff is present, but production-grade shared-memory
+data-plane mapping policy/mechanics are still a critical remaining milestone.
+
 ## Return layout
 
 - `ret0`: status/value (sender tid for recv)
