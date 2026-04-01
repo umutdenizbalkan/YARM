@@ -15,6 +15,7 @@ const VEC_DOUBLE_FAULT: usize = 8;
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const VEC_PAGE_FAULT: usize = 14;
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+#[allow(dead_code)]
 const VEC_TIMER: usize = 0x20;
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const VEC_SYSCALL: usize = 0x80;

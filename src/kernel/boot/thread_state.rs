@@ -137,7 +137,7 @@ impl KernelState {
             tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
             tcb.kernel_context
                 .frame
-                .set_instruction_ptr(yarm_kernel_thread_switch_trampoline as usize);
+                .set_instruction_ptr(yarm_kernel_thread_switch_trampoline as *const () as usize);
             tcb.kernel_context.initialized = false;
             tcb.kernel_context.owns_stack = true;
             Ok(())
@@ -283,13 +283,9 @@ impl KernelState {
         if head == 0 || len == 0 {
             return Err(KernelError::WrongObject);
         }
-        self.with_tcbs(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .any(|tcb| tcb.tid.0 == tid)
-        })
-        .then_some(())
-        .ok_or(KernelError::TaskMissing)?;
+        self.with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == tid))
+            .then_some(())
+            .ok_or(KernelError::TaskMissing)?;
         if let Some(slot) = self
             .robust_futex
             .iter_mut()
