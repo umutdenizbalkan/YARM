@@ -252,12 +252,13 @@ To avoid deadlocks as partitioning progresses, acquire in this order:
 
 1. scheduler
 2. task
-3. ipc
-4. vm
-5. memory
-6. driver
-7. fault
-8. restart
+3. capability
+4. ipc
+5. vm
+6. memory
+7. driver
+8. fault
+9. restart
 
 No function should acquire a lock earlier in the order after acquiring a later
 one.
@@ -355,6 +356,15 @@ safe behavior preservation.
   - Introduce/adjust ordered acquisition helpers for any new multi-domain
     pairs involving capability state.
   - Add lock-order snapshot tests to prove safe acquisition ordering.
+
+#### PR 7.4 status (completed in this pass)
+
+- Added ordered helper `with_task_then_capability(...)` to make task/capability
+  acquisition order explicit and reusable.
+- Migrated `task_cnode(...)` to the ordered helper so pid/cnode resolution
+  acquires task and capability domains in one ordered critical section.
+- Added lock-order snapshot coverage for task+capability domain reads.
+- Updated lock-order guidance to include the capability domain explicitly.
 
 - **PR 7.5: Optional telemetry/global split**
   - If profiling shows meaningful contention or coupling remains, split global

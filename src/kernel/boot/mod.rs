@@ -638,6 +638,15 @@ impl KernelState {
         f(&mut self.capability)
     }
 
+    fn with_task_then_capability<R>(
+        &self,
+        f: impl FnOnce(&[Option<ThreadControlBlock>; MAX_TASKS], &CapabilitySubsystem) -> R,
+    ) -> R {
+        let _task_guard = self.task_state_lock.lock();
+        let _capability_guard = self.capability_state_lock.lock();
+        f(kernel_ref(&self.tcbs), &self.capability)
+    }
+
     fn with_scheduler_then_ipc<R>(
         &self,
         f: impl FnOnce(&SchedulerState, &IpcSubsystem) -> R,
@@ -654,6 +663,16 @@ impl KernelState {
                 sched.current_cpu.0,
                 kernel_ref(&sched.scheduler).online_cpu_count(),
                 ipc.telemetry.scheduler_dispatch_calls,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_order_task_capability_snapshot_for_test(&self) -> (usize, usize) {
+        self.with_task_then_capability(|tcbs, capability| {
+            (
+                tcbs.iter().flatten().count(),
+                capability.process_cnodes.iter().flatten().count(),
             )
         })
     }
@@ -1105,13 +1124,19 @@ impl KernelState {
     }
 
     pub fn task_cnode(&self, tid: u64) -> Option<CNodeId> {
-        let pid = self
-            .tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.thread_group_id.0)?;
-        self.process_cnode_for_pid(pid)
+        self.with_task_then_capability(|tcbs, capability| {
+            let pid = tcbs
+                .iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.thread_group_id.0)?;
+            capability
+                .process_cnodes
+                .iter()
+                .flatten()
+                .find(|record| record.pid == pid)
+                .map(|record| record.cnode)
+        })
     }
 
     pub(crate) fn process_cnode_for_pid(&self, pid: u64) -> Option<CNodeId> {
@@ -4692,6 +4717,21 @@ mod tests {
         assert_eq!(cpu, 0);
         assert!(online >= 1);
         assert_eq!(dispatch_calls, 1);
+    }
+
+    #[test]
+    fn lock_order_snapshot_reads_task_then_capability_domains() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task_with_class(33, TaskClass::App).expect("task");
+        let cnode = CNodeId(33);
+        state.ensure_cnode_space(cnode).expect("cnode");
+        state
+            .set_process_cnode_for_pid(33, cnode)
+            .expect("process cnode");
+
+        let (tasks, process_cnodes) = state.lock_order_task_capability_snapshot_for_test();
+        assert!(tasks >= 2);
+        assert!(process_cnodes >= 2);
     }
 
     #[test]
