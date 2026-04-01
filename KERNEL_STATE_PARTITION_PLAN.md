@@ -261,3 +261,83 @@ To avoid deadlocks as partitioning progresses, acquire in this order:
 
 No function should acquire a lock earlier in the order after acquiring a later
 one.
+
+## Phase 7+ roadmap (planned): residual global-concern extraction
+
+Goal: reduce remaining top-level `KernelState` coupling by extracting
+capability/cnode and related global bookkeeping into explicit domains with
+lock-backed accessors.
+
+### Proposed Phase 7 domain targets
+
+1. **Capability/CNode domain**
+   - Extract:
+     - `cnode_spaces`
+     - `process_cnodes`
+     - delegated capability link table
+   - New APIs:
+     - `with_capability_state(...)`
+     - `with_capability_state_mut(...)`
+   - Scope:
+     - cspace lookup/mint/revoke/delegate paths
+     - process cnode binding/cleanup paths
+
+2. **Telemetry/Global counters domain (optional split)**
+   - Extract:
+     - cross-cutting counters that are still top-level and not owned by an
+       existing domain
+   - New APIs:
+     - `with_telemetry_state(...)`
+     - `with_telemetry_state_mut(...)`
+   - Scope:
+     - capacity snapshots and global accounting that currently touches mixed
+       domains
+
+3. **Bootstrap/Config domain (optional split)**
+   - Extract long-lived static/profile/config knobs that are read broadly but
+     mutated rarely.
+   - New APIs:
+     - `with_boot_config(...)`
+     - `with_boot_config_mut(...)` (if needed)
+
+### PR execution list (recommended)
+
+The following PR sequence is intentionally narrow to keep reviewable diffs and
+safe behavior preservation.
+
+- **PR 7.1: CapabilityState scaffold**
+  - Add `CapabilityState` struct + lock field + accessor helpers.
+  - Move `cnode_spaces`, `process_cnodes`, delegated capability links into the
+    new state, without broad callsite migration yet.
+  - Add compile-only refactors and targeted constructor/init updates.
+
+- **PR 7.2: Capability callsite migration (core)**
+  - Migrate mint/revoke/resolve/grant/delegate/retype paths to
+    `with_capability_state(...)` / `with_capability_state_mut(...)`.
+  - Keep behavior unchanged; add focused unit tests for cap lifecycle and stale
+    capability checks.
+
+- **PR 7.3: Process-CNode and task lifecycle migration**
+  - Migrate process-cnode bind/lookup/cleanup and task registration/teardown
+    call paths that touch capability mappings.
+  - Add tests for process cleanup and cross-task capability delegation.
+
+- **PR 7.4: Lock-order hardening + helper consolidation**
+  - Introduce/adjust ordered acquisition helpers for any new multi-domain
+    pairs involving capability state.
+  - Add lock-order snapshot tests to prove safe acquisition ordering.
+
+- **PR 7.5: Optional telemetry/global split**
+  - If profiling shows meaningful contention or coupling remains, split global
+    counters into a dedicated telemetry state.
+
+- **PR 7.6: Optional bootstrap/config split**
+  - Extract rarely-mutated configuration/profile state if it still causes broad
+    compile/runtime coupling.
+
+### Definition of done for Phase 7
+
+- Capability/cnode/global-link concerns are no longer directly mutated as
+  top-level `KernelState` fields.
+- Critical cap lifecycle paths run through accessor-backed domain APIs.
+- Lock-order guidance and tests are updated to include any new domain edges.
