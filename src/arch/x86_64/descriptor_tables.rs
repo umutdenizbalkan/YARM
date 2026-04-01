@@ -841,6 +841,8 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         return;
     }
     unsafe {
+        let rsp0: u64;
+        core::arch::asm!("mov {}, rsp", out(reg) rsp0, options(nomem, nostack, preserves_flags));
         populate_boot_idt_from_stubs();
 
         let ist_nmi_top =
@@ -849,6 +851,7 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
             + core::mem::size_of::<IstStack>() as u64;
         let ist_pf_top =
             core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64 + core::mem::size_of::<IstStack>() as u64;
+        BOOT_TSS.rsp0 = rsp0;
         BOOT_TSS.ist1 = ist_nmi_top;
         BOOT_TSS.ist2 = ist_df_top;
         BOOT_TSS.ist3 = ist_pf_top;
@@ -943,6 +946,15 @@ mod tests {
             tss.io_map_base as usize,
             core::mem::size_of::<X86TaskStateSegment>()
         );
+    }
+
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    #[test]
+    fn descriptor_scaffold_initializes_tss_rsp0() {
+        ensure_boot_descriptor_tables_scaffolded();
+        unsafe {
+            assert_ne!(BOOT_TSS.rsp0, 0);
+        }
     }
 
     #[test]
