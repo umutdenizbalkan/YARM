@@ -1645,6 +1645,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn selected_arch_trap_entry_external_irq_without_route_is_noop() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_notif_idx, _notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
+        let ctx = crate::arch::trap_entry::ArchTrapContext {
+            vector: 0x21, // external IRQ line 1
+            error_code: 0,
+            fault_addr: 0,
+        };
+
+        state
+            .handle_selected_arch_trap_entry(CpuId(0), ctx, None)
+            .expect("trap");
+
+        let msg = state.try_ipc_recv(notif_recv_cap).expect("probe");
+        assert!(msg.is_none());
+    }
+
+    #[test]
     fn bootstrap_sets_minimal_kernel_state() {
         let state = Bootstrap::init().expect("bootstrap should fit static limits");
         assert_eq!(state.kernel_aspace.mappings(), 1);
