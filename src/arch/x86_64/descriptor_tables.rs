@@ -5,12 +5,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub const IDT_ENTRIES: usize = 256;
 const IDT_GATE_INTERRUPT: u8 = 0x0E;
 const IDT_PRESENT: u8 = 1 << 7;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const VEC_NMI: usize = 2;
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const VEC_DOUBLE_FAULT: usize = 8;
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const VEC_PAGE_FAULT: usize = 14;
+#[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+const VEC_TIMER: usize = 0x20;
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const VEC_SYSCALL: usize = 0x80;
 
@@ -116,7 +118,7 @@ impl X86TaskStateSegment {
 
 static DESCRIPTOR_SCAFFOLD_READY: AtomicBool = AtomicBool::new(false);
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct X86GdtPointer {
@@ -124,17 +126,17 @@ struct X86GdtPointer {
     base: u64,
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 #[repr(C, align(16))]
 struct X86BootGdt {
     entries: [u64; 5],
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 static mut BOOT_IDT: [X86IdtEntry; IDT_ENTRIES] = [const { X86IdtEntry::missing() }; IDT_ENTRIES];
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 static mut BOOT_TSS: X86TaskStateSegment = X86TaskStateSegment::new();
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 static mut BOOT_GDT: X86BootGdt = X86BootGdt {
     entries: [
         0x0000_0000_0000_0000, // null
@@ -144,30 +146,31 @@ static mut BOOT_GDT: X86BootGdt = X86BootGdt {
         0,
     ],
 };
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 #[repr(align(16))]
 struct IstStack([u8; 4096]);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 static mut IST_NMI: IstStack = IstStack([0; 4096]);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 static mut IST_DOUBLE_FAULT: IstStack = IstStack([0; 4096]);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 static mut IST_PAGE_FAULT: IstStack = IstStack([0; 4096]);
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const KERNEL_CODE_SELECTOR: u16 = 0x08;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const KERNEL_DATA_SELECTOR: u16 = 0x10;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const TSS_SELECTOR: u16 = 0x18;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const IST_SLOT_NMI: u8 = 1;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const IST_SLOT_DOUBLE_FAULT: u8 = 2;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const IST_SLOT_PAGE_FAULT: u8 = 3;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 #[repr(C)]
+#[derive(Default)]
 struct X86SavedRegs {
     r15: u64,
     r14: u64,
@@ -186,7 +189,7 @@ struct X86SavedRegs {
     rax: u64,
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 #[repr(C)]
 struct X86InterruptStackFrame {
     rip: u64,
@@ -326,7 +329,7 @@ const fn should_halt_without_kernel_state(vector: usize) -> bool {
     vector < 32 && vector != VEC_SYSCALL
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 unsafe fn build_trap_frame_from_saved_regs(
     regs: *const X86SavedRegs,
     frame: *const X86InterruptStackFrame,
@@ -351,7 +354,7 @@ unsafe fn build_trap_frame_from_saved_regs(
     trap
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 fn write_trap_returns_to_saved_regs(
     regs: *mut X86SavedRegs,
     trap_frame: &crate::kernel::trapframe::TrapFrame,
@@ -361,6 +364,52 @@ fn write_trap_returns_to_saved_regs(
     regs.rbx = trap_frame.ret1 as u64;
     regs.rdx = trap_frame.ret2 as u64;
     regs.rcx = trap_frame.error as u64;
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+fn dispatch_trap_from_stub_for_test(
+    kernel: &mut crate::kernel::boot::KernelState,
+    vector: u64,
+    error_code: u64,
+    regs: &mut X86SavedRegs,
+    interrupt_frame: &X86InterruptStackFrame,
+) -> Result<(), crate::kernel::boot::TrapHandleError> {
+    let mut fault_addr = 0u64;
+    if vector as usize == VEC_PAGE_FAULT {
+        fault_addr = 0xDEAD_BEEF;
+    }
+    let context = crate::arch::x86_64::trap::X86TrapContext {
+        vector: vector as u8,
+        error_code,
+        fault_addr,
+    };
+    let mut trap_frame = unsafe {
+        build_trap_frame_from_saved_regs(
+            regs as *const X86SavedRegs,
+            interrupt_frame as *const X86InterruptStackFrame,
+            vector,
+        )
+    };
+    crate::arch::x86_64::trap::handle_trap_entry(
+        kernel,
+        crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID),
+        context,
+        Some(&mut trap_frame),
+    )?;
+    if vector as usize == VEC_SYSCALL {
+        write_trap_returns_to_saved_regs(regs as *mut X86SavedRegs, &trap_frame);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "hosted-dev", target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_x86_dispatch_trap_from_stub(
+    _vector: u64,
+    _error_code: u64,
+    _regs: *mut X86SavedRegs,
+    _interrupt_frame: *const X86InterruptStackFrame,
+) {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -422,7 +471,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 core::arch::global_asm!(
     r#"
     .section .text, "ax", @progbits
@@ -483,7 +532,7 @@ yarm_x86_common_trap_entry:
 "#
 );
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 core::arch::global_asm!(
     r#"
     .section .text, "ax", @progbits
@@ -495,12 +544,12 @@ yarm_x86_syscall_entry:
 "#
 );
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 unsafe extern "C" {
     fn yarm_x86_syscall_entry();
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 macro_rules! declare_all_isr_stubs {
     ($($name:ident),* $(,)?) => {
         unsafe extern "C" {
@@ -510,7 +559,7 @@ macro_rules! declare_all_isr_stubs {
     };
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 core::arch::global_asm!(
     r#"
     .altmacro
@@ -526,7 +575,7 @@ core::arch::global_asm!(
 "#
 );
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 declare_all_isr_stubs!(
     yarm_x86_isr_0,
     yarm_x86_isr_1,
@@ -792,28 +841,7 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         return;
     }
     unsafe {
-        let idt_ptr = core::ptr::addr_of_mut!(BOOT_IDT).cast::<X86IdtEntry>();
-        let mut i = 0usize;
-        while i < IDT_ENTRIES {
-            let mut handler = ISR_STUBS[i] as *const () as u64;
-            let mut dpl = 0;
-            let mut ist = 0;
-            if i == VEC_SYSCALL {
-                dpl = 3;
-                handler = yarm_x86_syscall_entry as *const () as u64;
-            } else if i == VEC_NMI {
-                ist = IST_SLOT_NMI;
-            } else if i == VEC_DOUBLE_FAULT {
-                ist = IST_SLOT_DOUBLE_FAULT;
-            } else if i == VEC_PAGE_FAULT {
-                ist = IST_SLOT_PAGE_FAULT;
-            }
-            core::ptr::write(
-                idt_ptr.add(i),
-                X86IdtEntry::new_interrupt(handler, KERNEL_CODE_SELECTOR, dpl, ist),
-            );
-            i += 1;
-        }
+        populate_boot_idt_from_stubs();
 
         let ist_nmi_top =
             core::ptr::addr_of!(IST_NMI.0) as u64 + core::mem::size_of::<IstStack>() as u64;
@@ -853,6 +881,34 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
             tss_sel = const TSS_SELECTOR,
             options(nostack, preserves_flags)
         );
+    }
+}
+
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+unsafe fn populate_boot_idt_from_stubs() {
+    let idt_ptr = core::ptr::addr_of_mut!(BOOT_IDT).cast::<X86IdtEntry>();
+    let mut i = 0usize;
+    while i < IDT_ENTRIES {
+        let mut handler = ISR_STUBS[i] as *const () as u64;
+        let mut dpl = 0;
+        let mut ist = 0;
+        if i == VEC_SYSCALL {
+            dpl = 3;
+            handler = yarm_x86_syscall_entry as *const () as u64;
+        } else if i == VEC_NMI {
+            ist = IST_SLOT_NMI;
+        } else if i == VEC_DOUBLE_FAULT {
+            ist = IST_SLOT_DOUBLE_FAULT;
+        } else if i == VEC_PAGE_FAULT {
+            ist = IST_SLOT_PAGE_FAULT;
+        }
+        unsafe {
+            core::ptr::write(
+                idt_ptr.add(i),
+                X86IdtEntry::new_interrupt(handler, KERNEL_CODE_SELECTOR, dpl, ist),
+            );
+        }
+        i += 1;
     }
 }
 
@@ -896,5 +952,41 @@ mod tests {
         assert!(should_halt_without_kernel_state(VEC_PAGE_FAULT));
         assert!(!should_halt_without_kernel_state(VEC_SYSCALL));
         assert!(!should_halt_without_kernel_state(0x40));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn decode_handler_addr(entry: X86IdtEntry) -> u64 {
+        entry.offset_low as u64
+            | ((entry.offset_mid as u64) << 16)
+            | ((entry.offset_high as u64) << 32)
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn idt_scaffold_binds_isr_stub_and_syscall_entry_handlers() {
+        unsafe { populate_boot_idt_from_stubs() };
+        let timer_handler = decode_handler_addr(unsafe { BOOT_IDT[VEC_TIMER] });
+        let syscall_handler = decode_handler_addr(unsafe { BOOT_IDT[VEC_SYSCALL] });
+        assert_eq!(timer_handler, ISR_STUBS[VEC_TIMER] as *const () as u64);
+        assert_eq!(syscall_handler, yarm_x86_syscall_entry as *const () as u64);
+        assert_eq!(unsafe { BOOT_IDT[VEC_SYSCALL] }.type_attr >> 5 & 0x3, 0x3);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn real_stub_frame_dispatch_path_advances_timer_tick() {
+        let mut kernel = crate::kernel::boot::Bootstrap::init().expect("kernel");
+        let mut regs = X86SavedRegs::default();
+        let frame = X86InterruptStackFrame {
+            rip: 0x1000,
+            cs: KERNEL_CODE_SELECTOR as u64,
+            rflags: 0x202,
+            rsp: 0x8000,
+            ss: KERNEL_DATA_SELECTOR as u64,
+        };
+        assert_eq!(kernel.timer.current_ticks().0, 0);
+        dispatch_trap_from_stub_for_test(&mut kernel, VEC_TIMER as u64, 0, &mut regs, &frame)
+            .expect("timer dispatch");
+        assert_eq!(kernel.timer.current_ticks().0, 1);
     }
 }
