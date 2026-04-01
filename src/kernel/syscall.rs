@@ -521,6 +521,14 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                             user_ptr,
                             region_len,
                         )?;
+                        kernel
+                            .register_active_transfer_mapping(
+                                crate::kernel::ipc::ThreadId(receiver_tid),
+                                transfer_cap,
+                                VirtAddr(mapped_va as u64),
+                                mapped_len,
+                            )
+                            .map_err(SyscallError::from)?;
                         frame.set_ok(sender, mapped_len, frame.ret2());
                         frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, mapped_va);
                         frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, region_len);
@@ -617,6 +625,8 @@ fn handle_transfer_release(
     kernel
         .revoke_capability_in_cnode(cnode, transfer_cap)
         .map_err(SyscallError::from)?;
+    let owner = crate::kernel::ipc::ThreadId(current_tid(kernel)?);
+    let _ = kernel.remove_active_transfer_mapping(owner, transfer_cap);
     kernel.note_transfer_record_revoked();
     frame.set_ok(map_len, 0, 0);
     Ok(())

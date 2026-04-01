@@ -322,7 +322,6 @@ impl KernelState {
         Ok(unmapped)
     }
 
-    #[cfg(feature = "linux-compat")]
     pub(crate) fn unmap_user_page_in_asid(
         &mut self,
         asid: Asid,

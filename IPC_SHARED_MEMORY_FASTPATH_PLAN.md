@@ -39,7 +39,7 @@ Acceptance checks:
 ## Phase 3 — Sender/receiver dual-map + pinning lifecycle
 
 - [x] Define pin/unpin rules for shared transfer frames while either side holds active mappings.
-- [ ] Ensure map refcounts are updated for both sides and survive task scheduling/restart boundaries.
+- [x] Ensure map refcounts are updated for both sides and survive task scheduling/restart boundaries.
 - [x] Add unmap/release syscall path that drops active mapping references and transitions transfer state.
 
 Acceptance checks:
@@ -89,4 +89,4 @@ Each PR in this sequence should:
 
 - Phase 1 landed in PRs up to commit `5460f97`.
 - Phase 2 landed in PRs up to commit `7d1ab28`.
-- Current pass extends Phase 3 with transfer-release syscall plumbing and process-cleanup envelope purge hooks; remaining work is full dual-map lifecycle/refcount behavior.
+- Current pass extends Phase 3 with transfer-release syscall plumbing and process-cleanup mapping/envelope purge hooks.

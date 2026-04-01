@@ -392,6 +392,14 @@ struct SenderWaiter {
     msg: Message,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveTransferMapping {
+    owner_tid: ThreadId,
+    transfer_cap: CapId,
+    base: VirtAddr,
+    len: usize,
+}
+
 #[derive(Debug)]
 struct IpcSubsystem {
     cross_cpu_work: SmpMailbox,
@@ -405,6 +413,7 @@ struct IpcSubsystem {
     irq_routes: [Option<usize>; MAX_IRQ_LINES],
     transfer_envelopes: [Option<TransferEnvelope>; MAX_TRANSFER_ENVELOPES],
     transfer_envelope_generations: [u64; MAX_TRANSFER_ENVELOPES],
+    active_transfer_mappings: [Option<ActiveTransferMapping>; MAX_TRANSFER_ENVELOPES],
     telemetry: IpcPathTelemetry,
 }
 
@@ -709,6 +718,7 @@ impl Bootstrap {
                 irq_routes: [None; MAX_IRQ_LINES],
                 transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
                 transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],
+                active_transfer_mappings: [const { None }; MAX_TRANSFER_ENVELOPES],
                 telemetry: IpcPathTelemetry::default(),
             }),
             cnode_spaces: store_kernel_value([const { None }; MAX_TASKS]),
@@ -977,6 +987,7 @@ impl KernelState {
             return;
         }
         self.purge_transfer_envelopes_for_pid(pid);
+        self.purge_active_transfer_mappings_for_pid(pid);
         let Some(cnode) = self.process_cnode_for_pid(pid) else {
             return;
         };
@@ -1063,6 +1074,33 @@ impl KernelState {
                 self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
             }
             self.ipc.transfer_envelopes[idx] = None;
+            self.note_transfer_record_revoked();
+        }
+    }
+
+    fn purge_active_transfer_mappings_for_pid(&mut self, pid: u64) {
+        for idx in 0..MAX_TRANSFER_ENVELOPES {
+            let Some(mapping) = self.ipc.active_transfer_mappings[idx] else {
+                continue;
+            };
+            let owner_pid = self
+                .process_id(mapping.owner_tid.0)
+                .unwrap_or(mapping.owner_tid.0);
+            if owner_pid != pid && mapping.owner_tid.0 != pid {
+                continue;
+            }
+            if let Some(asid) = self.task_asid(mapping.owner_tid.0) {
+                let mut va = mapping.base.0 as usize;
+                let end = va.saturating_add(mapping.len);
+                while va < end {
+                    let _ = self.unmap_user_page_in_asid(asid, VirtAddr(va as u64));
+                    va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
+                }
+            }
+            if let Some(cnode) = self.task_cnode(mapping.owner_tid.0) {
+                let _ = self.revoke_capability_in_cnode(cnode, mapping.transfer_cap);
+            }
+            self.ipc.active_transfer_mappings[idx] = None;
             self.note_transfer_record_revoked();
         }
     }
@@ -1301,6 +1339,48 @@ impl KernelState {
             .telemetry
             .transfer_records_revoked
             .saturating_add(1);
+    }
+
+    pub(crate) fn register_active_transfer_mapping(
+        &mut self,
+        owner_tid: ThreadId,
+        transfer_cap: CapId,
+        base: VirtAddr,
+        len: usize,
+    ) -> Result<(), KernelError> {
+        if let Some(slot) = self
+            .ipc
+            .active_transfer_mappings
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        {
+            *slot = Some(ActiveTransferMapping {
+                owner_tid,
+                transfer_cap,
+                base,
+                len,
+            });
+            Ok(())
+        } else {
+            Err(KernelError::EndpointFull)
+        }
+    }
+
+    pub(crate) fn remove_active_transfer_mapping(
+        &mut self,
+        owner_tid: ThreadId,
+        transfer_cap: CapId,
+    ) -> bool {
+        for slot in self.ipc.active_transfer_mappings.iter_mut() {
+            let Some(mapping) = *slot else {
+                continue;
+            };
+            if mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap {
+                *slot = None;
+                return true;
+            }
+        }
+        false
     }
 
     fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
@@ -2127,6 +2207,63 @@ mod tests {
             state.memory.memory_objects[slot]
                 .expect("object")
                 .pin_refcount,
+            0
+        );
+    }
+
+    #[test]
+    fn process_cleanup_purges_active_transfer_mappings_and_unmaps_pages() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let mem_cap_task1 = state
+            .grant_capability_task_to_task(0, mem_cap, 1)
+            .expect("grant mem");
+
+        if state.current_tid() != Some(1) {
+            state.yield_current().expect("switch to task1");
+        }
+        assert_eq!(state.current_tid(), Some(1));
+        state
+            .map_user_page_in_current_asid_with_caps(
+                mem_cap_task1,
+                VirtAddr(0x9000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+                },
+            )
+            .expect("map");
+        state
+            .register_active_transfer_mapping(
+                ThreadId(1),
+                mem_cap_task1,
+                VirtAddr(0x9000),
+                PAGE_SIZE,
+            )
+            .expect("register mapping");
+        state.exit_task(1, 1).expect("exit");
+        assert_eq!(state.current_tid(), Some(0));
+
+        state.purge_active_transfer_mappings_for_pid(1);
+        assert!(
+            !state.remove_active_transfer_mapping(ThreadId(1), mem_cap_task1),
+            "active mapping should be purged during process cleanup"
+        );
+        let slot = state
+            .memory_object_slot_by_id(mem_id)
+            .expect("slot remains");
+        assert_eq!(
+            state.memory.memory_objects[slot]
+                .expect("object")
+                .map_refcount,
             0
         );
     }
