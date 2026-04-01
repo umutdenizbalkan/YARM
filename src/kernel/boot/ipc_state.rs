@@ -123,18 +123,18 @@ impl KernelState {
     pub(crate) fn resolve_endpoint_index(&self, object: CapObject) -> Result<usize, KernelError> {
         let limits = self.runtime_capacity_config();
         match object {
-            CapObject::Endpoint { index, generation } => {
+            CapObject::Endpoint { index, generation } => self.with_ipc_state(|ipc| {
                 if index >= limits.max_endpoints {
                     return Err(KernelError::WrongObject);
                 }
-                if self.ipc.endpoints[index].is_none() {
+                if ipc.endpoints[index].is_none() {
                     return Err(KernelError::WrongObject);
                 }
-                if self.ipc.endpoint_generations[index] != generation {
+                if ipc.endpoint_generations[index] != generation {
                     return Err(KernelError::StaleCapability);
                 }
                 Ok(index)
-            }
+            }),
             CapObject::Kernel
             | CapObject::AddressSpace { .. }
             | CapObject::IovaSpace { .. }
@@ -147,20 +147,23 @@ impl KernelState {
 
     pub fn destroy_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
         let limits = self.runtime_capacity_config();
-        if endpoint_idx >= limits.max_endpoints || self.ipc.endpoints[endpoint_idx].is_none() {
-            return Err(KernelError::WrongObject);
-        }
-        self.ipc.endpoints[endpoint_idx] = None;
+        self.with_ipc_state_mut(|ipc| {
+            if endpoint_idx >= limits.max_endpoints || ipc.endpoints[endpoint_idx].is_none() {
+                return Err(KernelError::WrongObject);
+            }
+            ipc.endpoints[endpoint_idx] = None;
+            ipc.endpoint_waiters[endpoint_idx] = None;
+            ipc.endpoint_sender_waiters[endpoint_idx] = [None; MAX_ENDPOINT_SENDER_WAITERS];
+            let mut next_generation = ipc.endpoint_generations[endpoint_idx].wrapping_add(1);
+            if next_generation == 0 {
+                next_generation = 1;
+            }
+            ipc.endpoint_generations[endpoint_idx] = next_generation;
+            Ok(())
+        })?;
         if self.faults.fault_handler_endpoint == Some(endpoint_idx) {
             self.faults.fault_handler_endpoint = None;
         }
-        self.ipc.endpoint_waiters[endpoint_idx] = None;
-        self.ipc.endpoint_sender_waiters[endpoint_idx] = [None; MAX_ENDPOINT_SENDER_WAITERS];
-        let mut next_generation = self.ipc.endpoint_generations[endpoint_idx].wrapping_add(1);
-        if next_generation == 0 {
-            next_generation = 1;
-        }
-        self.ipc.endpoint_generations[endpoint_idx] = next_generation;
         Ok(())
     }
 
@@ -292,15 +295,15 @@ impl KernelState {
     fn resolve_notification_index(&self, object: CapObject) -> Result<usize, KernelError> {
         let limits = self.runtime_capacity_config();
         match object {
-            CapObject::Notification { index, generation } => {
-                if index >= limits.max_notifications || self.ipc.notifications[index].is_none() {
+            CapObject::Notification { index, generation } => self.with_ipc_state(|ipc| {
+                if index >= limits.max_notifications || ipc.notifications[index].is_none() {
                     return Err(KernelError::WrongObject);
                 }
-                if self.ipc.notification_generations[index] != generation {
+                if ipc.notification_generations[index] != generation {
                     return Err(KernelError::StaleCapability);
                 }
                 Ok(index)
-            }
+            }),
             _ => Err(KernelError::WrongObject),
         }
     }
@@ -323,7 +326,9 @@ impl KernelState {
         if irq_idx >= MAX_IRQ_LINES {
             return Err(KernelError::WrongObject);
         }
-        self.ipc.irq_routes[irq_idx] = Some(notif_idx);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.irq_routes[irq_idx] = Some(notif_idx);
+        });
         Ok(())
     }
 
@@ -350,7 +355,9 @@ impl KernelState {
 
     pub fn route_external_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {
         let irq_idx = irq_line as usize;
-        let Some(notification_idx) = self.ipc.irq_routes.get(irq_idx).copied().flatten() else {
+        let notification_idx = self
+            .with_ipc_state(|ipc| ipc.irq_routes.get(irq_idx).copied().flatten());
+        let Some(notification_idx) = notification_idx else {
             return Ok(());
         };
         self.signal_notification(notification_idx, irq_line)

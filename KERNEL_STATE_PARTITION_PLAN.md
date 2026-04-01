@@ -43,6 +43,16 @@ into independently lockable domains while preserving behavior.
 - Migrate non-IPC-module telemetry touch points (scheduler dispatch/yield/context
   counters and driver telemetry snapshot) to use IPC accessors.
 
+### Phase 3b (completed in this pass)
+
+- Migrate endpoint/notification validation and lifecycle entry points to the IPC
+  accessor layer:
+  - `resolve_endpoint_index`
+  - `destroy_endpoint`
+  - `resolve_notification_index`
+  - `bind_irq_notification`
+  - `route_external_irq`
+
 ## Phase 4
 
 - Extract VM/memory/task domains into additional lockable partitions:
