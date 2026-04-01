@@ -4326,6 +4326,51 @@ mod tests {
     }
 
     #[test]
+    fn process_teardown_reclaims_multi_hop_delegated_graph_without_touching_unrelated_process() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(740).expect("source");
+        state.register_task(741).expect("mid");
+        state.register_task(742).expect("leaf");
+        state.register_task(743).expect("unrelated");
+
+        let source_cnode = state.task_cnode(740).expect("source cnode");
+        let source_cap = state
+            .mint_capability_in_cnode(source_cnode, Capability::new(CapObject::Kernel, CapRights::READ))
+            .expect("mint source cap");
+        let mid_cap = state
+            .grant_capability_task_to_task_with_rights(740, source_cap, 741, CapRights::READ)
+            .expect("delegate source->mid");
+        let leaf_cap = state
+            .grant_capability_task_to_task_with_rights(741, mid_cap, 742, CapRights::READ)
+            .expect("delegate mid->leaf");
+
+        let unrelated_cnode = state.task_cnode(743).expect("unrelated cnode");
+        let unrelated_cap = state
+            .mint_capability_in_cnode(
+                unrelated_cnode,
+                Capability::new(CapObject::Kernel, CapRights::READ),
+            )
+            .expect("mint unrelated cap");
+
+        assert!(state.resolve_capability_for_task(741, mid_cap).is_ok());
+        assert!(state.resolve_capability_for_task(742, leaf_cap).is_ok());
+        assert!(state.resolve_capability_for_task(743, unrelated_cap).is_ok());
+
+        state.mark_task_dead(740).expect("teardown source");
+
+        assert_eq!(state.process_cnode_for_pid(740), None);
+        assert_eq!(
+            state.resolve_capability_for_task(741, mid_cap),
+            Err(KernelError::InvalidCapability)
+        );
+        assert_eq!(
+            state.resolve_capability_for_task(742, leaf_cap),
+            Err(KernelError::InvalidCapability)
+        );
+        assert!(state.resolve_capability_for_task(743, unrelated_cap).is_ok());
+    }
+
+    #[test]
     fn direct_legacy_global_cspace_access_patterns_are_forbidden() {
         fn visit_rs_files(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
             let entries = std::fs::read_dir(root).expect("read_dir");
