@@ -633,6 +633,7 @@ impl KernelState {
         f(kernel_mut(&mut self.faults))
     }
 
+    #[allow(dead_code)]
     fn with_restart_state<R>(&self, f: impl FnOnce(&RestartSubsystem) -> R) -> R {
         let _restart_guard = self.restart_state_lock.lock();
         f(kernel_ref(&self.restart))
@@ -668,6 +669,7 @@ impl KernelState {
         f(kernel_ref(&self.boot_config))
     }
 
+    #[allow(dead_code)]
     fn with_boot_config_mut<R>(&mut self, f: impl FnOnce(&mut BootConfigSubsystem) -> R) -> R {
         let _boot_config_guard = self.boot_config_state_lock.lock();
         f(kernel_mut(&mut self.boot_config))
@@ -682,6 +684,7 @@ impl KernelState {
         f(kernel_ref(&self.tcbs), &self.capability)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn with_scheduler_then_ipc<R>(&self, f: impl FnOnce(&SchedulerState, &IpcSubsystem) -> R) -> R {
         let sched = self.scheduler_state.lock();
         let _ipc_guard = self.ipc_state_lock.lock();
