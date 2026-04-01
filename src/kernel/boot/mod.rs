@@ -497,6 +497,9 @@ pub struct KernelState {
     pub user_spaces: KernelStorage<AddressSpaceManager>,
     scheduler_state: SpinLockIrq<SchedulerState>,
     ipc_state_lock: SpinLockIrq<()>,
+    vm_state_lock: SpinLockIrq<()>,
+    task_state_lock: SpinLockIrq<()>,
+    memory_state_lock: SpinLockIrq<()>,
     ipc: KernelStorage<IpcSubsystem>,
     cnode_spaces: KernelStorage<[Option<CNodeSpace>; MAX_TASKS]>,
     process_cnodes: KernelStorage<[Option<ProcessCNodeRecord>; MAX_TASKS]>,
@@ -605,6 +608,35 @@ impl KernelState {
             )
         })
     }
+
+    fn with_user_spaces<R>(&self, f: impl FnOnce(&AddressSpaceManager) -> R) -> R {
+        let _vm_guard = self.vm_state_lock.lock();
+        f(kernel_ref(&self.user_spaces))
+    }
+
+    fn with_user_spaces_mut<R>(&mut self, f: impl FnOnce(&mut AddressSpaceManager) -> R) -> R {
+        let _vm_guard = self.vm_state_lock.lock();
+        f(kernel_mut(&mut self.user_spaces))
+    }
+
+    fn with_tcbs<R>(&self, f: impl FnOnce(&[Option<ThreadControlBlock>; MAX_TASKS]) -> R) -> R {
+        let _task_guard = self.task_state_lock.lock();
+        f(kernel_ref(&self.tcbs))
+    }
+
+    fn with_tcbs_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut [Option<ThreadControlBlock>; MAX_TASKS]) -> R,
+    ) -> R {
+        let _task_guard = self.task_state_lock.lock();
+        f(kernel_mut(&mut self.tcbs))
+    }
+
+    fn with_memory_state<R>(&self, f: impl FnOnce(&MemorySubsystem) -> R) -> R {
+        let _mem_guard = self.memory_state_lock.lock();
+        f(kernel_ref(&self.memory))
+    }
+
 }
 
 impl Bootstrap {
@@ -787,6 +819,9 @@ impl Bootstrap {
                 current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
             }),
             ipc_state_lock: SpinLockIrq::new(()),
+            vm_state_lock: SpinLockIrq::new(()),
+            task_state_lock: SpinLockIrq::new(()),
+            memory_state_lock: SpinLockIrq::new(()),
             ipc: store_kernel_value(IpcSubsystem {
                 cross_cpu_work: SmpMailbox::default(),
                 endpoints: [const { None }; MAX_ENDPOINTS],
@@ -1325,11 +1360,14 @@ impl KernelState {
         match capability.object {
             CapObject::MemoryObject { id } => {
                 let mem = self
-                    .memory
-                    .memory_objects
-                    .iter()
-                    .flatten()
-                    .find(|entry| entry.id == id)
+                    .with_memory_state(|memory| {
+                        memory
+                            .memory_objects
+                            .iter()
+                            .flatten()
+                            .find(|entry| entry.id == id)
+                            .copied()
+                    })
                     .ok_or(KernelError::MemoryObjectMissing)?;
                 let max_len = u64::try_from(mem.len).map_err(|_| KernelError::WrongObject)?;
                 if region.len > max_len || end < region.offset {
@@ -1675,10 +1713,12 @@ impl KernelState {
     }
 
     fn memory_object_slot_by_id(&self, id: u64) -> Option<usize> {
-        self.memory
-            .memory_objects
-            .iter()
-            .position(|entry| entry.is_some_and(|mem| mem.id == id))
+        self.with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .position(|entry| entry.is_some_and(|mem| mem.id == id))
+        })
     }
 
     fn adjust_memory_object_cap_refcount(&mut self, object: CapObject, delta: i32) {

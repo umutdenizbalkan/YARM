@@ -109,13 +109,13 @@ impl KernelState {
         if tid == 0 {
             return Ok(TaskPriority::Normal);
         }
-        let class = self
-            .tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.class)
-            .ok_or(KernelError::TaskMissing)?;
+        let class = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.class)
+        });
+        let class = class.ok_or(KernelError::TaskMissing)?;
         Ok(match class {
             TaskClass::SystemServer => TaskPriority::High,
             TaskClass::Driver | TaskClass::App => TaskPriority::Normal,
@@ -126,12 +126,13 @@ impl KernelState {
         if tid == 0 {
             return Ok(None);
         }
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.cpu_affinity)
-            .ok_or(KernelError::TaskMissing)
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.cpu_affinity)
+                .ok_or(KernelError::TaskMissing)
+        })
     }
 
     fn ensure_driver_affinity(&mut self, tid: u64) -> Result<(), KernelError> {
@@ -139,11 +140,17 @@ impl KernelState {
             return Ok(());
         }
         let current_cpu = self.current_cpu();
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        if tcb.class == TaskClass::Driver && tcb.cpu_affinity.is_none() {
-            tcb.cpu_affinity = Some(current_cpu);
-        }
-        Ok(())
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            if tcb.class == TaskClass::Driver && tcb.cpu_affinity.is_none() {
+                tcb.cpu_affinity = Some(current_cpu);
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn enqueue_task(&mut self, tid: u64) -> Result<CpuId, KernelError> {
@@ -219,12 +226,15 @@ impl KernelState {
             }
             WorkItem::TlbShootdown { asid, .. } => {
                 self.tlb_shootdown_count = self.tlb_shootdown_count.wrapping_add(1);
-                if self.current_cpu() == cpu && self.user_spaces.retired_entry(asid).is_some() {
+                let retired = self.with_user_spaces(|spaces| spaces.retired_entry(asid).is_some());
+                if self.current_cpu() == cpu && retired {
                     crate::arch::selected_isa::page_table::invalidate_asid(asid);
                     let cpu_bit = 1u64 << cpu.0;
-                    self.user_spaces
-                        .acknowledge_shootdown(asid, cpu_bit)
-                        .map_err(KernelError::Vm)?;
+                    self.with_user_spaces_mut(|spaces| {
+                        spaces
+                            .acknowledge_shootdown(asid, cpu_bit)
+                            .map_err(KernelError::Vm)
+                    })?;
                 }
                 Ok(())
             }
@@ -249,7 +259,7 @@ impl KernelState {
             processed += 1;
         }
 
-        let timed_out = self.user_spaces.tick_retired_shootdowns();
+        let timed_out = self.with_user_spaces_mut(|spaces| spaces.tick_retired_shootdowns());
         if timed_out > 0 {
             self.tlb_shootdown_timeout_count = self
                 .tlb_shootdown_timeout_count

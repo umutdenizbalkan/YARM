@@ -73,13 +73,23 @@ into independently lockable domains while preserving behavior.
 - Add a lock-order snapshot test that reads scheduler+IPC state through the
   ordered helper.
 
-## Phase 4
+## Phase 4 (in progress)
 
 - Extract VM/memory/task domains into additional lockable partitions:
   - `VmState` (`kernel_aspace`, `user_spaces`)
   - `TaskState` (`tcbs`, tls restore queue, robust futex state)
   - `MemoryState` (allocator, memory objects, brk regions)
 - Introduce lock ordering rules and a small helper API to avoid deadlocks.
+
+### Phase 4a (completed in this pass)
+
+- Add new lock domains and helper accessors on `KernelState`:
+  - `vm_state_lock` + `with_user_spaces(...)` / `with_user_spaces_mut(...)`
+  - `task_state_lock` + `with_tcbs(...)` / `with_tcbs_mut(...)`
+  - `memory_state_lock` + `with_memory_state(...)`
+- Migrate representative scheduler and VM-touching call sites to use new
+  accessors (`task_priority`, affinity resolution/update, retired ASID checks,
+  shootdown ack path, and retired shootdown ticking).
 
 ## Lock ordering (proposed)
 
