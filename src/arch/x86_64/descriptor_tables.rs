@@ -118,7 +118,7 @@ impl X86TaskStateSegment {
 
 static DESCRIPTOR_SCAFFOLD_READY: AtomicBool = AtomicBool::new(false);
 
-#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct X86GdtPointer {
@@ -126,7 +126,7 @@ struct X86GdtPointer {
     base: u64,
 }
 
-#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[repr(C, align(16))]
 struct X86BootGdt {
     entries: [u64; 5],
@@ -134,9 +134,9 @@ struct X86BootGdt {
 
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 static mut BOOT_IDT: [X86IdtEntry; IDT_ENTRIES] = [const { X86IdtEntry::missing() }; IDT_ENTRIES];
-#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static mut BOOT_TSS: X86TaskStateSegment = X86TaskStateSegment::new();
-#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static mut BOOT_GDT: X86BootGdt = X86BootGdt {
     entries: [
         0x0000_0000_0000_0000, // null
@@ -146,21 +146,21 @@ static mut BOOT_GDT: X86BootGdt = X86BootGdt {
         0,
     ],
 };
-#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[repr(align(16))]
 struct IstStack([u8; 4096]);
-#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static mut IST_NMI: IstStack = IstStack([0; 4096]);
-#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static mut IST_DOUBLE_FAULT: IstStack = IstStack([0; 4096]);
-#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static mut IST_PAGE_FAULT: IstStack = IstStack([0; 4096]);
 
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const KERNEL_CODE_SELECTOR: u16 = 0x08;
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const KERNEL_DATA_SELECTOR: u16 = 0x10;
-#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const TSS_SELECTOR: u16 = 0x18;
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const IST_SLOT_NMI: u8 = 1;
