@@ -22,9 +22,34 @@ impl KernelState {
 
         self.revoke_capability_in_cnode(cnode, aspace_cap)?;
 
-        let pending_cpu_bitmap = self.online_cpu_bitmap();
-        self.with_user_spaces_mut(|spaces| spaces.destroy(asid, pending_cpu_bitmap))
+        self.destroy_user_address_space_by_asid(asid)
+    }
+
+    pub fn create_user_address_space(&mut self) -> Result<(Asid, CapId), KernelError> {
+        let asid = self
+            .with_user_spaces_mut(|spaces| spaces.create_user_space())
             .map_err(KernelError::Vm)?;
+        let map_cap = self.mint_capability_for_current_context(Capability::new(
+            CapObject::AddressSpace { asid: asid.0 },
+            CapRights::MAP | CapRights::READ | CapRights::WRITE,
+        ))?;
+        Ok((asid, map_cap))
+    }
+
+    pub(crate) fn destroy_user_address_space_by_asid(
+        &mut self,
+        asid: Asid,
+    ) -> Result<(), KernelError> {
+        let pending_cpu_bitmap = self.online_cpu_bitmap();
+        let drained = self
+            .with_user_spaces_mut(|spaces| {
+                spaces.destroy_and_collect_mappings(asid, pending_cpu_bitmap)
+            })
+            .map_err(KernelError::Vm)?;
+        for mapping in drained.into_iter().flatten() {
+            self.note_mapping_removed(mapping.phys);
+            self.reclaim_memory_object_for_phys(mapping.phys);
+        }
 
         for cpu in 0..u64::BITS as usize {
             let cpu_bit = 1u64 << cpu;
@@ -41,17 +66,6 @@ impl KernelState {
         }
 
         Ok(())
-    }
-
-    pub fn create_user_address_space(&mut self) -> Result<(Asid, CapId), KernelError> {
-        let asid = self
-            .with_user_spaces_mut(|spaces| spaces.create_user_space())
-            .map_err(KernelError::Vm)?;
-        let map_cap = self.mint_capability_for_current_context(Capability::new(
-            CapObject::AddressSpace { asid: asid.0 },
-            CapRights::MAP | CapRights::READ | CapRights::WRITE,
-        ))?;
-        Ok((asid, map_cap))
     }
 
     pub fn map_user_page(
@@ -72,13 +86,12 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
 
-        let old = self
-            .with_user_spaces_mut(|spaces| {
-                let aspace = spaces
-                    .get_mut(asid)
-                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-                aspace.map_page(virt, mapping).map_err(KernelError::Vm)
-            })?;
+        let old = self.with_user_spaces_mut(|spaces| {
+            let aspace = spaces
+                .get_mut(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+            aspace.map_page(virt, mapping).map_err(KernelError::Vm)
+        })?;
         if let Some(old_mapping) = old {
             self.note_mapping_removed(old_mapping.phys);
             self.reclaim_memory_object_for_phys(old_mapping.phys);
@@ -175,13 +188,9 @@ impl KernelState {
         base: usize,
         end: usize,
     ) -> Result<(), KernelError> {
-        self.with_tcbs(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .any(|tcb| tcb.tid.0 == tid)
-        })
-        .then_some(())
-        .ok_or(KernelError::TaskMissing)?;
+        self.with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == tid))
+            .then_some(())
+            .ok_or(KernelError::TaskMissing)?;
         self.with_memory_state_mut(|memory| {
             if let Some(slot) = memory
                 .brk_regions

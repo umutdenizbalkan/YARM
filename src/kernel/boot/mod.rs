@@ -682,10 +682,7 @@ impl KernelState {
         f(kernel_ref(&self.tcbs), &self.capability)
     }
 
-    fn with_scheduler_then_ipc<R>(
-        &self,
-        f: impl FnOnce(&SchedulerState, &IpcSubsystem) -> R,
-    ) -> R {
+    fn with_scheduler_then_ipc<R>(&self, f: impl FnOnce(&SchedulerState, &IpcSubsystem) -> R) -> R {
         let sched = self.scheduler_state.lock();
         let _ipc_guard = self.ipc_state_lock.lock();
         f(&sched, kernel_ref(&self.ipc))
@@ -744,7 +741,6 @@ impl KernelState {
         let _mem_guard = self.memory_state_lock.lock();
         f(kernel_mut(&mut self.memory))
     }
-
 }
 
 impl Bootstrap {
@@ -1066,7 +1062,8 @@ impl KernelState {
         });
         let capability_slots_used = cnode_capability_slots_used;
         let endpoint_used = self.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().count());
-        let notification_used = self.with_ipc_state(|ipc| ipc.notifications.iter().flatten().count());
+        let notification_used =
+            self.with_ipc_state(|ipc| ipc.notifications.iter().flatten().count());
         let task_used = self.with_tcbs(|tcbs| tcbs.iter().flatten().count());
         let memory_object_used =
             self.with_memory_state(|memory| memory.memory_objects.iter().flatten().count());
@@ -1204,7 +1201,11 @@ impl KernelState {
                 record.cnode = cnode;
                 return Ok(());
             }
-            if let Some(slot) = capability.process_cnodes.iter_mut().find(|slot| slot.is_none()) {
+            if let Some(slot) = capability
+                .process_cnodes
+                .iter_mut()
+                .find(|slot| slot.is_none())
+            {
                 *slot = Some(ProcessCNodeRecord { pid, cnode });
                 return Ok(());
             }
@@ -1228,6 +1229,37 @@ impl KernelState {
             .any(|tcb| tcb.thread_group_id.0 == pid && tcb.status != TaskStatus::Dead);
         if has_live_threads {
             return;
+        }
+        let mut reclaimed_asids = [None; MAX_TASKS];
+        let mut reclaimed_asid_len = 0usize;
+        self.with_tcbs(|tcbs| {
+            for tcb in tcbs.iter().flatten() {
+                if tcb.thread_group_id.0 != pid {
+                    continue;
+                }
+                let Some(asid) = tcb.asid else {
+                    continue;
+                };
+                if reclaimed_asids
+                    .iter()
+                    .take(reclaimed_asid_len)
+                    .flatten()
+                    .any(|candidate| *candidate == asid)
+                {
+                    continue;
+                }
+                if reclaimed_asid_len < reclaimed_asids.len() {
+                    reclaimed_asids[reclaimed_asid_len] = Some(asid);
+                    reclaimed_asid_len += 1;
+                }
+            }
+        });
+        for asid in reclaimed_asids
+            .into_iter()
+            .take(reclaimed_asid_len)
+            .flatten()
+        {
+            let _ = self.destroy_user_address_space_by_asid(asid);
         }
         self.purge_transfer_envelopes_for_pid(pid);
         self.purge_active_transfer_mappings_for_pid(pid);
@@ -1266,7 +1298,9 @@ impl KernelState {
             let Some(record) = maybe_record else {
                 continue;
             };
-            let source_pid = self.process_id(record.source_tid).unwrap_or(record.source_tid);
+            let source_pid = self
+                .process_id(record.source_tid)
+                .unwrap_or(record.source_tid);
             let dest_pid = self.process_id(record.dest_tid).unwrap_or(record.dest_tid);
             if source_pid == pid || dest_pid == pid {
                 remove_links[idx] = true;
@@ -1405,8 +1439,9 @@ impl KernelState {
             if self.with_ipc_state(|ipc| ipc.transfer_envelopes[idx].is_some()) {
                 continue;
             }
-            let mut generation =
-                self.with_ipc_state(|ipc| ipc.transfer_envelope_generations[idx]).wrapping_add(1);
+            let mut generation = self
+                .with_ipc_state(|ipc| ipc.transfer_envelope_generations[idx])
+                .wrapping_add(1);
             if generation == 0 {
                 generation = 1;
             }
@@ -1478,8 +1513,10 @@ impl KernelState {
             self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
         }
         self.with_ipc_state_mut(|ipc| {
-            ipc.telemetry.transfer_records_materialized =
-                ipc.telemetry.transfer_records_materialized.saturating_add(1);
+            ipc.telemetry.transfer_records_materialized = ipc
+                .telemetry
+                .transfer_records_materialized
+                .saturating_add(1);
             ipc.transfer_envelopes[idx] = None;
         });
         Some(envelope)
@@ -1614,8 +1651,10 @@ impl KernelState {
 
     pub(crate) fn note_shared_mem_mapped(&mut self, len: usize) {
         self.with_ipc_state_mut(|ipc| {
-            ipc.telemetry.shared_mem_bytes_mapped =
-                ipc.telemetry.shared_mem_bytes_mapped.saturating_add(len as u64);
+            ipc.telemetry.shared_mem_bytes_mapped = ipc
+                .telemetry
+                .shared_mem_bytes_mapped
+                .saturating_add(len as u64);
         });
     }
 
@@ -1623,8 +1662,10 @@ impl KernelState {
         self.with_ipc_state_mut(|ipc| {
             ipc.telemetry.transfer_release_calls =
                 ipc.telemetry.transfer_release_calls.saturating_add(1);
-            ipc.telemetry.shared_mem_bytes_released =
-                ipc.telemetry.shared_mem_bytes_released.saturating_add(len as u64);
+            ipc.telemetry.shared_mem_bytes_released = ipc
+                .telemetry
+                .shared_mem_bytes_released
+                .saturating_add(len as u64);
         });
     }
 
@@ -1691,7 +1732,8 @@ impl KernelState {
 
     #[cfg(test)]
     fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
-        self.capability.cnode_spaces
+        self.capability
+            .cnode_spaces
             .iter()
             .flatten()
             .find(|space| space.id == cnode)
@@ -1700,7 +1742,8 @@ impl KernelState {
 
     #[cfg(test)]
     fn cspace_for_cnode_mut(&mut self, cnode: CNodeId) -> Option<&mut CapabilitySpace> {
-        self.capability.cnode_spaces
+        self.capability
+            .cnode_spaces
             .iter_mut()
             .flatten()
             .find(|space| space.id == cnode)
@@ -1717,7 +1760,11 @@ impl KernelState {
             {
                 return Ok(());
             }
-            if let Some(slot) = capability.cnode_spaces.iter_mut().find(|slot| slot.is_none()) {
+            if let Some(slot) = capability
+                .cnode_spaces
+                .iter_mut()
+                .find(|slot| slot.is_none())
+            {
                 *slot = Some(CNodeSpace {
                     id: cnode,
                     cspace: store_kernel_value(CapabilitySpace::default()),
@@ -4610,7 +4657,12 @@ mod tests {
             .set_supervisor_endpoint(recv_cap)
             .expect("supervisor ep");
         state
-            .report_transfer_revoke_to_supervisor(7, 12, 0xA000, crate::kernel::vm::PAGE_SIZE as u64)
+            .report_transfer_revoke_to_supervisor(
+                7,
+                12,
+                0xA000,
+                crate::kernel::vm::PAGE_SIZE as u64,
+            )
             .expect("report revoke");
 
         let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
@@ -4761,7 +4813,9 @@ mod tests {
     #[test]
     fn lock_order_snapshot_reads_task_then_capability_domains() {
         let mut state = Bootstrap::init().expect("init");
-        state.register_task_with_class(33, TaskClass::App).expect("task");
+        state
+            .register_task_with_class(33, TaskClass::App)
+            .expect("task");
         let cnode = CNodeId(33);
         state.ensure_cnode_space(cnode).expect("cnode");
         state

@@ -369,6 +369,19 @@ impl AddressSpace {
             .flatten()
             .any(|entry| entry.mapping.phys == phys)
     }
+
+    pub fn drain_mappings(&mut self) -> [Option<Mapping>; MAX_MAPPINGS] {
+        let mut drained = [None; MAX_MAPPINGS];
+        for (idx, slot) in self.entries.iter_mut().enumerate() {
+            let Some(entry) = slot.take() else {
+                continue;
+            };
+            arch_unmap_page(self.asid, entry.virt);
+            drained[idx] = Some(entry.mapping);
+        }
+        self.len = 0;
+        drained
+    }
 }
 
 #[derive(Debug)]
@@ -482,12 +495,28 @@ impl AddressSpaceManager {
     /// If `pending_cpu_bitmap == 0`, the ASID is immediately reusable and
     /// callers must not later invoke `acknowledge_shootdown()` for that ASID.
     pub fn destroy(&mut self, asid: Asid, pending_cpu_bitmap: CpuBitmap) -> Result<(), VmError> {
+        let _ = self.destroy_and_collect_mappings(asid, pending_cpu_bitmap)?;
+        Ok(())
+    }
+
+    /// Destroys a software address space and returns all drained mappings.
+    ///
+    /// Callers can use the returned mappings to update mapping refcounts and
+    /// reclaim physical memory objects after the ASID is retired.
+    pub fn destroy_and_collect_mappings(
+        &mut self,
+        asid: Asid,
+        pending_cpu_bitmap: CpuBitmap,
+    ) -> Result<[Option<Mapping>; MAX_MAPPINGS], VmError> {
         for slot in &mut self.entries {
-            if slot.as_ref().is_some_and(|entry| entry.asid == asid) {
+            if slot.as_ref().is_some_and(|entry| entry.asid == asid)
+                && let Some(mut entry) = slot.take()
+            {
+                let drained = entry.aspace.drain_mappings();
                 *slot = None;
                 arch_unregister_asid(asid);
                 if pending_cpu_bitmap == 0 {
-                    return Ok(());
+                    return Ok(drained);
                 }
                 for retired in &mut self.retired {
                     if retired.is_none() {
@@ -496,7 +525,7 @@ impl AddressSpaceManager {
                             pending_cpu_bitmap,
                             age_ticks: 0,
                         });
-                        return Ok(());
+                        return Ok(drained);
                     }
                 }
                 return Err(VmError::Full);
