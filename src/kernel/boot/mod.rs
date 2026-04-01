@@ -478,6 +478,12 @@ struct CapabilitySubsystem {
 }
 
 #[derive(Debug)]
+struct TelemetrySubsystem {
+    tlb_shootdown_count: u64,
+    tlb_shootdown_timeout_count: u64,
+}
+
+#[derive(Debug)]
 struct SchedulerState {
     scheduler: KernelStorage<SmpScheduler>,
     timer: Timer,
@@ -509,6 +515,7 @@ pub struct KernelState {
     fault_state_lock: SpinLockIrq<()>,
     restart_state_lock: SpinLockIrq<()>,
     capability_state_lock: SpinLockIrq<()>,
+    telemetry_state_lock: SpinLockIrq<()>,
     vm_state_lock: SpinLockIrq<()>,
     task_state_lock: SpinLockIrq<()>,
     memory_state_lock: SpinLockIrq<()>,
@@ -520,9 +527,8 @@ pub struct KernelState {
     robust_futex: KernelStorage<[Option<RobustFutexRecord>; MAX_TASKS]>,
     memory: KernelStorage<MemorySubsystem>,
     drivers: KernelStorage<DriverSubsystem>,
+    telemetry: KernelStorage<TelemetrySubsystem>,
     capacity_profile: KernelCapacityProfile,
-    tlb_shootdown_count: u64,
-    tlb_shootdown_timeout_count: u64,
     faults: KernelStorage<FaultSubsystem>,
     restart: KernelStorage<RestartSubsystem>,
 }
@@ -636,6 +642,16 @@ impl KernelState {
     fn with_capability_state_mut<R>(&mut self, f: impl FnOnce(&mut CapabilitySubsystem) -> R) -> R {
         let _capability_guard = self.capability_state_lock.lock();
         f(&mut self.capability)
+    }
+
+    fn with_telemetry_state<R>(&self, f: impl FnOnce(&TelemetrySubsystem) -> R) -> R {
+        let _telemetry_guard = self.telemetry_state_lock.lock();
+        f(kernel_ref(&self.telemetry))
+    }
+
+    fn with_telemetry_state_mut<R>(&mut self, f: impl FnOnce(&mut TelemetrySubsystem) -> R) -> R {
+        let _telemetry_guard = self.telemetry_state_lock.lock();
+        f(kernel_mut(&mut self.telemetry))
     }
 
     fn with_task_then_capability<R>(
@@ -896,6 +912,7 @@ impl Bootstrap {
             fault_state_lock: SpinLockIrq::new(()),
             restart_state_lock: SpinLockIrq::new(()),
             capability_state_lock: SpinLockIrq::new(()),
+            telemetry_state_lock: SpinLockIrq::new(()),
             vm_state_lock: SpinLockIrq::new(()),
             task_state_lock: SpinLockIrq::new(()),
             memory_state_lock: SpinLockIrq::new(()),
@@ -937,9 +954,11 @@ impl Bootstrap {
                 driver_records: [const { None }; MAX_DRIVERS],
                 next_iova_space_id: 1,
             }),
+            telemetry: store_kernel_value(TelemetrySubsystem {
+                tlb_shootdown_count: 0,
+                tlb_shootdown_timeout_count: 0,
+            }),
             capacity_profile,
-            tlb_shootdown_count: 0,
-            tlb_shootdown_timeout_count: 0,
             faults: store_kernel_value(FaultSubsystem {
                 last_fault: None,
                 fault_handler_endpoint: None,

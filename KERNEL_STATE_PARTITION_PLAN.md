@@ -370,6 +370,15 @@ safe behavior preservation.
   - If profiling shows meaningful contention or coupling remains, split global
     counters into a dedicated telemetry state.
 
+#### PR 7.5 status (completed in this pass)
+
+- Introduced `TelemetrySubsystem` + telemetry lock/accessors:
+  - `with_telemetry_state(...)`
+  - `with_telemetry_state_mut(...)`
+- Migrated top-level TLB shootdown counters into telemetry state and updated
+  scheduler cross-CPU work accounting paths to mutate/read through telemetry
+  accessors.
+
 - **PR 7.6: Optional bootstrap/config split**
   - Extract rarely-mutated configuration/profile state if it still causes broad
     compile/runtime coupling.

@@ -188,11 +188,11 @@ impl KernelState {
     }
 
     pub fn tlb_shootdown_count(&self) -> u64 {
-        self.tlb_shootdown_count
+        self.with_telemetry_state(|telemetry| telemetry.tlb_shootdown_count)
     }
 
     pub fn tlb_shootdown_timeout_count(&self) -> u64 {
-        self.tlb_shootdown_timeout_count
+        self.with_telemetry_state(|telemetry| telemetry.tlb_shootdown_timeout_count)
     }
 
     fn escalate_tlb_shootdown_timeout(&mut self, timed_out: usize) -> Result<(), KernelError> {
@@ -225,7 +225,9 @@ impl KernelState {
                 Ok(())
             }
             WorkItem::TlbShootdown { asid, .. } => {
-                self.tlb_shootdown_count = self.tlb_shootdown_count.wrapping_add(1);
+                self.with_telemetry_state_mut(|telemetry| {
+                    telemetry.tlb_shootdown_count = telemetry.tlb_shootdown_count.wrapping_add(1);
+                });
                 let retired = self.with_user_spaces(|spaces| spaces.retired_entry(asid).is_some());
                 if self.current_cpu() == cpu && retired {
                     crate::arch::selected_isa::page_table::invalidate_asid(asid);
@@ -268,9 +270,11 @@ impl KernelState {
 
         let timed_out = self.with_user_spaces_mut(|spaces| spaces.tick_retired_shootdowns());
         if timed_out > 0 {
-            self.tlb_shootdown_timeout_count = self
-                .tlb_shootdown_timeout_count
-                .wrapping_add(timed_out as u64);
+            self.with_telemetry_state_mut(|telemetry| {
+                telemetry.tlb_shootdown_timeout_count = telemetry
+                    .tlb_shootdown_timeout_count
+                    .wrapping_add(timed_out as u64);
+            });
             self.escalate_tlb_shootdown_timeout(timed_out)?;
         }
 
