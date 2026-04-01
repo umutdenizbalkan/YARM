@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # HAL Conformance Notes (RISC-V + x86 + AArch64 baseline)
 
 This note freezes the minimum HAL portability checks expected by kernel-core code.

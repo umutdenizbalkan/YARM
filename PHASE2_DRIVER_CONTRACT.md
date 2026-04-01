@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Phase 2 Driver Contract (YARM)
 
 This contract defines the minimum invariants for Phase-2 driver services (`irqmux`, `uart`, `virtio_blk`, `virtio_net`, `virtio_gpu`, `input`).

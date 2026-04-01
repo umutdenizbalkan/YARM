@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Phase Readiness Matrix (YARM)
 
 This matrix maps roadmap phase completion to required contracts, CI jobs, and deterministic tests.

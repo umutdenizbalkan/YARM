@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 #[cfg(target_arch = "riscv64")]
 pub type ArchIrqState = super::riscv64::irq::Riscv64IrqState;
 #[cfg(target_arch = "riscv64")]

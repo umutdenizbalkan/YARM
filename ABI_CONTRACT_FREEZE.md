@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # ABI / Contract Freeze (Mechanism Layer)
 
 This file marks the current in-kernel mechanism contracts as intentionally stable for the next implementation phase.

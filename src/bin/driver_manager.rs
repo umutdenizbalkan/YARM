@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 #![no_std]
 use yarm::kernel::boot::Bootstrap;
 use yarm::kernel::driver_abi::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};

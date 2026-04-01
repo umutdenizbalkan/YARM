@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 # HAL conformance target gate: riscv64 + x86_64 + aarch64 baseline checks.

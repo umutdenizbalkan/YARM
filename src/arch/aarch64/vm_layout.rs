@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 // AArch64 prototype VM layout constants.
 // NOTE: values intentionally mirror current prototype behavior until
 // architecture-specific VM mappings are implemented.

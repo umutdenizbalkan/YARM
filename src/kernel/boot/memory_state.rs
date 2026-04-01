@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use super::{KernelError, KernelState, MemoryObject, kernel_mut};
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::frame_allocator::FrameAllocError;

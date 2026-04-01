@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 [alias]
 build-x86-none = "build --target targets/x86_64-yarm-none.json"
 check-x86-none = "check --target targets/x86_64-yarm-none.json"

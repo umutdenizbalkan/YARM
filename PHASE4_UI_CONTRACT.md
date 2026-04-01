@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Phase 4 UI Contract (YARM)
 
 This contract defines minimal invariants for UI-facing services (`display`, `compositor`, `shell`, and phase-linked `input`).

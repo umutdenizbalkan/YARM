@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # YARM Step 5b: Architecture Boundary (RISC-V First)
 
 This file documents the initial architecture split work for step 5b.

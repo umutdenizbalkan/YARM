@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 #[cfg(feature = "hosted-dev")]
 pub fn write_line(_msg: &str) {}
 

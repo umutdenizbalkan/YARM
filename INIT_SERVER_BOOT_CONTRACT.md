@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # init.srv Boot Contract (Checked core-profile contract)
 
 This document defines the checked boot orchestration contract for `init.srv` in the core profile.

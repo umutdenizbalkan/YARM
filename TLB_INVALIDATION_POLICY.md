@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # TLB Invalidation Policy (Hosted vs Production)
 
 This note defines the expected behavior of the architecture page-table invalidation

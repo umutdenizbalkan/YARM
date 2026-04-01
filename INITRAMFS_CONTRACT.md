@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Initramfs Service Contract (`initramfs.srv`)
 
 This document defines behavior for the in-tree read-only `initramfs.srv` implementation.

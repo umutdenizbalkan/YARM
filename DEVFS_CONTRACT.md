@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # DevFS Service Contract (`devfs.srv`)
 
 This document defines the behavior contract for the in-tree `devfs.srv` implementation.

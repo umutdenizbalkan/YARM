@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 // x86_64 syscall/trap ABI shape constants for the prototype kernel ABI.
 //
 // Strategy lock-in (PR-5): user mode enters kernel syscalls via `int 0x80`

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Core Profile Release Checklist
 
 This checklist defines the **core-only** release profile for systems that do not ship Linux personality compatibility.

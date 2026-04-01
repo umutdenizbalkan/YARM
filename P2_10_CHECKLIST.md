@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # P2.10 Checklist: Page-Table + Frame-Allocator Production Hardening
 
 **Status:** ✅ Completed (all checklist items implemented and validated)

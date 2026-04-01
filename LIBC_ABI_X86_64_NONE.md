@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # libc ABI contract for freestanding musl shim (ISA-agnostic core, x86_64 first runner)
 
 This document freezes the minimum libc-facing ABI expected by the musl sysdeps shim across ISAs; x86_64 is the first concrete boot runner.

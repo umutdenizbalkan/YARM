@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::kernel::vfs::{VfsBackend, VfsError};
 
 pub const INITRAMFS_BOOT_MARKER_PATH_PTR: u64 = 0x494E_4954_424F_4F54;

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # YARM Microkernel Next-Step Checklist (Portable POSIX Direction)
 
 This checklist focuses on turning the current in-memory kernel model into a portable, architecture-neutral microkernel core with a clear machine-adaptation boundary.

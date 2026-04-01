@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 const MAX_IRQ_LINES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

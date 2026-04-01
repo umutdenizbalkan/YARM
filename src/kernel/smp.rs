@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use super::ipc::ThreadId;
 use super::lock::SpinLockIrq;
 use super::scheduler::{CpuId, MAX_CPUS};

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::kernel::ipc::Message;
 use crate::kernel::vfs::{VfsBackend, VfsError};
 use crate::services::common::vfs_service::VfsService;

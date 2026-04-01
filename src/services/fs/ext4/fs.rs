@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::kernel::vfs::{VfsBackend, VfsError};
 use crate::services::common::fs::{
     FdRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend,

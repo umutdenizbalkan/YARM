@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Process/VFS Codec Freeze (v1)
 
 This document freezes the typed wire payload contracts used by the process-manager and VFS service paths.

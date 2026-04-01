@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 // x86_64 prototype platform layout constants.
 // NOTE: values intentionally mirror current prototype behavior until
 // architecture-specific bootstrap mappings are implemented.

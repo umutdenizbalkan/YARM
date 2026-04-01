@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 const VIRTQ_DEPTH: usize = 16;
 
 pub const VIRTIO_BLK_OP_READ: u16 = 1;

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # musl POSIX syscall → YARM IPC mapping plan (v1)
 
 This document defines the concrete mapping layer for `x86_64-unknown-none` musl sysdeps on YARM.

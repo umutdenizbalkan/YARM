@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 //! Driver-manager IPC protocol constants.
 
 pub const DRIVER_SERVER_ABI_VERSION: u16 = 1;

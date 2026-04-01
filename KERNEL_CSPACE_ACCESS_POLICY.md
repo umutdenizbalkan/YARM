@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Kernel CSpace/CNode Access Policy
 
 This document defines where kernel code is allowed to access capabilities from the

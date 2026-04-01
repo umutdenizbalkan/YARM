@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # YARM Syscall ABI v6 (Frozen Contract)
 
 - ABI Version: `6`

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShellStats {
     pub sessions_started: u64,

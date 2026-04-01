@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use super::boot::{KernelError, KernelState, TransferSharedRegion};
 use super::capabilities::{CapId, CapObject, CapRights};
 use super::ipc::{

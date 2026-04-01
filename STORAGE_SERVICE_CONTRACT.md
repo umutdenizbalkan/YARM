@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Storage Service Contract (blkcache / fat / ext4 / virtio_blk)
 
 This document defines the shared wire and behavior contract between block transport services and filesystem services.

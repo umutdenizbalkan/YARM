@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 #[cfg(not(feature = "hosted-dev"))]
 use core::ptr::{read_volatile, write_volatile};
 #[cfg(not(feature = "hosted-dev"))]

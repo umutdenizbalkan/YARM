@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 // RISC-V 64 prototype VM layout constants.
 
 pub const PAGE_SIZE: usize = 4096;

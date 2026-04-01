@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 pub fn default_present_cpu_bitmap() -> u64 {
     0b11
 }

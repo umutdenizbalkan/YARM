@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 // RISC-V 64 prototype platform layout constants.
 
 pub const KERNEL_BOOTSTRAP_VIRT_BASE: u64 = 0xFFFF_0000;

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # musl sysdeps shim TODO (all ISAs, x86_64 boot target-first)
 
 Status: **multi-ISA portability effort** with **x86_64 as the current boot target** (hosted Linux ABI path is not the primary target).

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # P2.8 / P2.9 Implementation Checklist
 
 Ordered by **risk first**, then **effort**.

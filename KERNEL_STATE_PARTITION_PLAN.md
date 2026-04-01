@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # KernelState partition plan (incremental)
 
 This document captures the concrete next steps for splitting `KernelState`

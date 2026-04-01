@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use super::{KernelError, KernelState};
 use crate::kernel::ipc::Message;
 use crate::kernel::vm::{Asid, VirtAddr, VmError};

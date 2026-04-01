@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Microkernel Boundary Contract
 
 This contract locks the kernel to mechanisms and pushes policies to user space.

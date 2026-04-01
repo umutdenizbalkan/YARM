@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Kernel Status (Mechanism Layer Completion)
 
 This snapshot reflects the current branch after the mechanism-hardening pass.

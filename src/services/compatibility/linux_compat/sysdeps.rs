@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 mod kernel_hooks;
 mod musl_startup;
 mod service_hooks;

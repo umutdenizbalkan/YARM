@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 //! Kernel-consumed platform constants facade.
 //!
 //! PR C keeps platform-layout constant usage explicit and centralized on the

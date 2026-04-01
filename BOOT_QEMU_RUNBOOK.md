@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # QEMU Core-Marker Boot Runbook (x86_64 target-first, multi-ISA support)
 
 This runbook is **x86_64-first** for booting the kernel and validating serial success markers, while keeping secondary ISA scaffolding available.

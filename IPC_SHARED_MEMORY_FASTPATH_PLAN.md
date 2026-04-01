@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # IPC Shared-Memory Fast Path Plan (Stepwise PR Roadmap)
 
 This document breaks the end-to-end shared-memory IPC fast path into incremental

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 //! Generic VFS primitives and shared abstractions.
 //! Concrete filesystem services must live under `src/services/*`.
 

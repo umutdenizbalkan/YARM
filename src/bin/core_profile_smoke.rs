@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 #![no_std]
 
 use yarm::services::control_plane::init::{InitRuntimeBootConfig, run_minimum_profile_with_kernel};

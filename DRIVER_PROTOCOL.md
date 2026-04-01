@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Device Server Delegation Protocol (v1)
 
 This file defines the initial IPC contract between user-space **device servers** and kernel-facing registration/grant paths.

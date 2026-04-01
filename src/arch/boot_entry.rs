@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const MAX_IRQ_DESCRIPTION_BYTES: usize = 256;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use super::capabilities::CapId;
 use super::ipc::ThreadId;
 use super::scheduler::CpuId;

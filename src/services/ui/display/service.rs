@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 pub const BOOT_TO_SHELL_MARKER: &str = "[ui] boot-to-shell marker";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Server Roadmap (YARM)
 
 This roadmap tracks user-space server maturation from current scaffolds to a minimal production-capable server set.

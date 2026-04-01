@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };

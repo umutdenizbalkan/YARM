@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 cargo test --lib selected_arch_irq_facade_is_callable

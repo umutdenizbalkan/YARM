@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Shared-memory IPC Migration Guide (Phase 6)
 
 This guide describes how to migrate servers and clients to the frozen shared-memory IPC contract.

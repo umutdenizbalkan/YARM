@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::arch::x86_64::vm_layout;
 use crate::kernel::frame_allocator::{alloc_pt_frame, free_pt_frame};
 use crate::kernel::lock::SpinLockIrq;

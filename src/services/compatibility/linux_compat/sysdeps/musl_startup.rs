@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use super::clone_thread_hook;
 use crate::kernel::boot::KernelState;
 use crate::kernel::task::ThreadGroupId;

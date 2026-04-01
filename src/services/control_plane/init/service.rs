@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::kernel::boot::{Bootstrap, KernelError, KernelState};
 use crate::kernel::process::ProcessService;
 use crate::kernel::vfs::InMemoryBackend;

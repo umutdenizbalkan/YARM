@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 TARGET_SPEC=${TARGET_SPEC:-targets/x86_64-yarm-none.json}

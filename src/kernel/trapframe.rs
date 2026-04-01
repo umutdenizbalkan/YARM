@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::arch::syscall_abi;
 use crate::kernel::task::UserRegisterContext;
 use crate::kernel::vm::VirtAddr;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use super::ipc::Message;
 
 pub const SUPERVISOR_OP_TASK_EXITED: u16 = 0xEE;

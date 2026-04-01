@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 use crate::kernel::vm::{Asid, PageFlags, PhysAddr, VirtAddr};
 #[cfg(any(test, not(feature = "hosted-dev")))]

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # YARM Linux Compatibility Slice v1
 
 This document defines the Linux-compatibility bridge layer used to ease userland porting.

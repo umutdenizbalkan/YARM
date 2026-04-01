@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Shared IPC Throughput Guide (FS / Network / Display)
 
 This guide captures recommended batching/ring usage patterns for the shared-memory IPC fast path.

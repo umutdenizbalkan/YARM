@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::kernel::task::ArchSwitchContext;
 #[cfg(test)]
 use core::sync::atomic::{AtomicUsize, Ordering};

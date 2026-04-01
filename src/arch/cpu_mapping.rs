@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::kernel::scheduler::CpuId;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]

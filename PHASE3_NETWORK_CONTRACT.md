@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Phase 3 Network Contract (YARM)
 
 This contract defines minimal invariants for networking services (`netmgr`, `tcpip`, `dns`, `dhcp`, `socket`).

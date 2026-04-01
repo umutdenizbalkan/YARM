@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const COM1_PORT: u16 = 0x3F8;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]

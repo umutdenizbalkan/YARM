@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Kernel Scaling Profile
 
 This document records the current scaling strategy for kernel fixed-size tables,

@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # User-space Server Maturity Plan (no_std microkernel profile)
 
 This plan tracks the transition from mechanism-complete kernel internals to production-quality user-space servers.

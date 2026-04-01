@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 pub fn parse_usize_token(description: &[u8], key: &str) -> Option<usize> {
     let text = core::str::from_utf8(description).ok()?;
     for token in text.split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | ';')) {

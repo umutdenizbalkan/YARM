@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 use core::arch::global_asm;
 

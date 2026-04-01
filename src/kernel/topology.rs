@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::arch::platform_constants;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};

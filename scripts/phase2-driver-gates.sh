@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 cargo test -q kernel::boot::tests::delegate_driver_bundle_checked_enforces_service_role_edges

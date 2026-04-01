@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # RamFS Service Contract (`ramfs.srv`)
 
 This document defines behavior for the in-tree `ramfs.srv` implementation.

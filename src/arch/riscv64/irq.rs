@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 #[cfg(any(test, target_arch = "riscv64"))]
 use core::ptr::write_volatile;
 #[cfg(any(test, target_arch = "riscv64"))]

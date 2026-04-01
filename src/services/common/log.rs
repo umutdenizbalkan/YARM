@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 //! log.srv IPC contract for freestanding-friendly userspace logging.
 
 pub const LOG_SERVER_ABI_VERSION: u16 = 1;

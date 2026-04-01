@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::marker::PhantomData;

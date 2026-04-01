@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use crate::kernel::capabilities::CapId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

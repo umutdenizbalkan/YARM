@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
 use super::{KernelError, KernelState, kernel_mut, kernel_ref, map_scheduler_error};
 use crate::arch::hal::Hal;
 use crate::kernel::ipc::Message;
