@@ -92,6 +92,7 @@ Progress notes:
 - ✅ Added IPC fastpath-vs-queued-vs-blocked telemetry tests under contention in `kernel::boot` tests.
 - ✅ Added restart/redelegation stale-cap regression for checked driver delegation bundles.
 - ✅ Wired synchronous IPC fast-path switching into measured scheduler telemetry (`scheduler_*` counters) with regression assertions in `kernel::boot` fast-path tests.
+- ✅ Added delegation-bundle helper APIs (`delegate_driver_bundle_checked`, `redelegate_driver_bundle`) and stale-cap regression coverage for helper-driven redelegation paths.
 
 ## Review follow-up next steps (after oversized placeholder PR)
 

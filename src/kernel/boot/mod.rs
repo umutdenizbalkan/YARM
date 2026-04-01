@@ -4649,6 +4649,86 @@ mod tests {
     }
 
     #[test]
+    fn checked_bundle_helper_validates_bundle_and_dma_window() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(120).expect("init-task");
+        state.register_task(121).expect("driver-task");
+
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let iova_cap = state.create_iova_space_cap().expect("iova");
+        let plan = DriverBundlePlan::standard(
+            ThreadId(121),
+            16,
+            mem_cap,
+            crate::kernel::vm::PAGE_SIZE,
+            iova_cap,
+            crate::kernel::vm::PAGE_SIZE * 8,
+            crate::kernel::vm::PAGE_SIZE * 8,
+        );
+        let bundle = state
+            .delegate_driver_bundle_checked(plan)
+            .expect("checked bundle");
+        state
+            .validate_driver_bundle_live(121, bundle)
+            .expect("bundle live");
+        assert!(
+            state
+                .validate_driver_dma_iova(
+                    121,
+                    crate::kernel::vm::PAGE_SIZE * 8,
+                    crate::kernel::vm::PAGE_SIZE
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn redelegate_bundle_helper_revokes_old_caps_and_rejects_stale_bundle() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(130).expect("init-task");
+        state.register_task(131).expect("driver-task");
+
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let first_iova = state.create_iova_space_cap().expect("iova1");
+        let first_plan = DriverBundlePlan::standard(
+            ThreadId(131),
+            17,
+            mem_cap,
+            crate::kernel::vm::PAGE_SIZE,
+            first_iova,
+            crate::kernel::vm::PAGE_SIZE * 4,
+            crate::kernel::vm::PAGE_SIZE * 4,
+        );
+        let first_bundle = state
+            .delegate_driver_bundle_checked(first_plan)
+            .expect("first bundle");
+        state
+            .validate_driver_bundle_live(131, first_bundle)
+            .expect("first live");
+
+        let second_iova = state.create_iova_space_cap().expect("iova2");
+        let second_plan = DriverBundlePlan::standard(
+            ThreadId(131),
+            18,
+            mem_cap,
+            crate::kernel::vm::PAGE_SIZE,
+            second_iova,
+            crate::kernel::vm::PAGE_SIZE * 12,
+            crate::kernel::vm::PAGE_SIZE * 4,
+        );
+        let second_bundle = state
+            .redelegate_driver_bundle(second_plan)
+            .expect("second bundle");
+        assert_eq!(
+            state.validate_driver_bundle_live(131, first_bundle),
+            Err(KernelError::StaleCapability)
+        );
+        state
+            .validate_driver_bundle_live(131, second_bundle)
+            .expect("second live");
+    }
+
+    #[test]
     fn iova_window_validation_requires_iova_space_and_range() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(12).expect("task");

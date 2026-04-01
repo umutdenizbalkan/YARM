@@ -105,3 +105,4 @@ Each PR in this sequence should:
 - Phase 6 freezes the ABI/behavior at v6, removes user-mode descriptor-only shared-memory recv fallback, and publishes migration guidance in `SHARED_IPC_MIGRATION_GUIDE.md`.
 - Phase 7 adds runtime hardening canaries for shared-memory map/release parity and introduces a dedicated CI gate script (`scripts/phase7-shared-ipc-gates.sh`) to enforce migration/test/doc invariants.
 - Post-fastpath follow-up wired synchronous IPC handoff switches into measured scheduler telemetry (`scheduler_dispatch_calls`, `scheduler_yield_calls`, `scheduler_context_switches`, `scheduler_fastpath_handoffs`) and added regression assertions.
+- Post-fastpath follow-up added delegation-bundle helper APIs (`delegate_driver_bundle_checked`, `redelegate_driver_bundle`) plus stale-cap regression coverage for helper-driven redelegation.

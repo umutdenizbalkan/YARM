@@ -255,6 +255,24 @@ impl KernelState {
         })
     }
 
+    pub fn delegate_driver_bundle_checked(
+        &mut self,
+        plan: DriverBundlePlan,
+    ) -> Result<DriverDelegationBundle, KernelError> {
+        let bundle = self.delegate_driver_bundle(plan)?;
+        self.validate_driver_bundle_live(plan.server_tid.0, bundle)?;
+        self.validate_driver_dma_iova(plan.server_tid.0, plan.iova_base, plan.dma_len)?;
+        Ok(bundle)
+    }
+
+    pub fn redelegate_driver_bundle(
+        &mut self,
+        plan: DriverBundlePlan,
+    ) -> Result<DriverDelegationBundle, KernelError> {
+        self.revoke_driver_runtime_caps(plan.server_tid.0)?;
+        self.delegate_driver_bundle_checked(plan)
+    }
+
     pub fn ipc_path_telemetry(&self) -> IpcPathTelemetry {
         self.ipc.telemetry
     }
