@@ -1189,20 +1189,31 @@ impl KernelState {
             }
         }
 
-        for idx in 0..self.capability.delegated_capability_links.len() {
-            let Some(record) = self.capability.delegated_capability_links[idx] else {
+        let link_snapshot =
+            self.with_capability_state(|capability| capability.delegated_capability_links.clone());
+        let mut remove_links = [false; MAX_DELEGATED_CAPABILITY_LINKS];
+        let mut removed_delegation_links = 0usize;
+        for (idx, maybe_record) in link_snapshot.iter().enumerate() {
+            let Some(record) = maybe_record else {
                 continue;
             };
-            let source_pid = self
-                .process_id(record.source_tid)
-                .unwrap_or(record.source_tid);
+            let source_pid = self.process_id(record.source_tid).unwrap_or(record.source_tid);
             let dest_pid = self.process_id(record.dest_tid).unwrap_or(record.dest_tid);
             if source_pid == pid || dest_pid == pid {
-                self.capability.delegated_capability_links[idx] = None;
-                telemetry.removed_delegation_links =
-                    telemetry.removed_delegation_links.saturating_add(1);
+                remove_links[idx] = true;
+                removed_delegation_links = removed_delegation_links.saturating_add(1);
             }
         }
+        self.with_capability_state_mut(|capability| {
+            for (idx, remove) in remove_links.iter().enumerate() {
+                if *remove {
+                    capability.delegated_capability_links[idx] = None;
+                }
+            }
+        });
+        telemetry.removed_delegation_links = telemetry
+            .removed_delegation_links
+            .saturating_add(removed_delegation_links);
         if let Some(slot) = self
             .capability
             .cnode_spaces
@@ -1694,34 +1705,39 @@ impl KernelState {
         dest_tid: u64,
         dest_cap: CapId,
     ) -> Result<(), KernelError> {
-        let links = kernel_mut(&mut self.capability.delegated_capability_links);
-        if links.iter().flatten().any(|link| {
-            link.source_tid == source_tid
-                && link.source_cap == source_cap
-                && link.dest_tid == dest_tid
-                && link.dest_cap == dest_cap
-        }) {
-            return Ok(());
-        }
-        if let Some(slot) = links.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(DelegatedCapabilityLink {
-                source_tid,
-                source_cap,
-                dest_tid,
-                dest_cap,
-            });
-            Ok(())
-        } else {
-            Err(KernelError::CapabilityFull)
-        }
+        self.with_capability_state_mut(|capability| {
+            let links = kernel_mut(&mut capability.delegated_capability_links);
+            if links.iter().flatten().any(|link| {
+                link.source_tid == source_tid
+                    && link.source_cap == source_cap
+                    && link.dest_tid == dest_tid
+                    && link.dest_cap == dest_cap
+            }) {
+                return Ok(());
+            }
+            if let Some(slot) = links.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(DelegatedCapabilityLink {
+                    source_tid,
+                    source_cap,
+                    dest_tid,
+                    dest_cap,
+                });
+                Ok(())
+            } else {
+                Err(KernelError::CapabilityFull)
+            }
+        })
     }
 
     fn tid_for_cnode(&self, cnode: CNodeId) -> Option<u64> {
-        self.capability.process_cnodes
-            .iter()
-            .flatten()
-            .find(|record| record.cnode == cnode)
-            .map(|record| record.pid)
+        self.with_capability_state(|capability| {
+            capability
+                .process_cnodes
+                .iter()
+                .flatten()
+                .find(|record| record.cnode == cnode)
+                .map(|record| record.pid)
+        })
     }
 
     fn revoke_capability_direct_in_process_cnode(&mut self, pid: u64, cap: CapId) {
@@ -1906,7 +1922,11 @@ impl KernelState {
         while head < tail {
             let current = queue[head].expect("queue item");
             head += 1;
-            for link in self.capability.delegated_capability_links.iter().flatten() {
+            for link in self
+                .with_capability_state(|capability| capability.delegated_capability_links.clone())
+                .iter()
+                .flatten()
+            {
                 let link_source_pid = self.process_id(link.source_tid).unwrap_or(link.source_tid);
                 if link_source_pid != current.pid || link.source_cap != current.cap {
                     continue;
@@ -1937,8 +1957,11 @@ impl KernelState {
         root: DelegatedCapRef,
         descendants: [Option<DelegatedCapRef>; MAX_DELEGATED_CAPABILITY_LINKS],
     ) {
-        for idx in 0..self.capability.delegated_capability_links.len() {
-            let Some(link) = self.capability.delegated_capability_links[idx] else {
+        let link_snapshot =
+            self.with_capability_state(|capability| capability.delegated_capability_links.clone());
+        let mut remove_links = [false; MAX_DELEGATED_CAPABILITY_LINKS];
+        for (idx, maybe_link) in link_snapshot.iter().enumerate() {
+            let Some(link) = maybe_link else {
                 continue;
             };
             let source = DelegatedCapRef {
@@ -1954,9 +1977,16 @@ impl KernelState {
                 || Self::contains_cap_ref(&descendants, source)
                 || Self::contains_cap_ref(&descendants, dest);
             if involved {
-                self.capability.delegated_capability_links[idx] = None;
+                remove_links[idx] = true;
             }
         }
+        self.with_capability_state_mut(|capability| {
+            for (idx, remove) in remove_links.iter().enumerate() {
+                if *remove {
+                    capability.delegated_capability_links[idx] = None;
+                }
+            }
+        });
     }
 
     fn capability_object_live(&self, object: CapObject) -> Option<()> {

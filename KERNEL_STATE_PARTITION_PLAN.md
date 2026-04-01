@@ -327,6 +327,15 @@ safe behavior preservation.
   - Keep behavior unchanged; add focused unit tests for cap lifecycle and stale
     capability checks.
 
+#### PR 7.2 status (completed in this pass)
+
+- Migrated core capability-state call paths to the capability accessor layer:
+  - process-cnode lookup/set helpers
+  - capability capacity-slot accounting
+  - delegated-capability link record/cleanup/descendant traversal paths
+- Kept behavior-preserving semantics while moving mutation/read ownership to the
+  capability domain scaffold introduced in PR 7.1.
+
 - **PR 7.3: Process-CNode and task lifecycle migration**
   - Migrate process-cnode bind/lookup/cleanup and task registration/teardown
     call paths that touch capability mappings.
