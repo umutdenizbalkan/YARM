@@ -497,6 +497,7 @@ pub struct KernelState {
     pub user_spaces: KernelStorage<AddressSpaceManager>,
     scheduler_state: SpinLockIrq<SchedulerState>,
     ipc_state_lock: SpinLockIrq<()>,
+    driver_state_lock: SpinLockIrq<()>,
     vm_state_lock: SpinLockIrq<()>,
     task_state_lock: SpinLockIrq<()>,
     memory_state_lock: SpinLockIrq<()>,
@@ -508,7 +509,7 @@ pub struct KernelState {
     tls_restore_pending: KernelStorage<[Option<ThreadId>; MAX_TASKS]>,
     robust_futex: KernelStorage<[Option<RobustFutexRecord>; MAX_TASKS]>,
     memory: KernelStorage<MemorySubsystem>,
-    drivers: DriverSubsystem,
+    drivers: KernelStorage<DriverSubsystem>,
     capacity_profile: KernelCapacityProfile,
     tlb_shootdown_count: u64,
     tlb_shootdown_timeout_count: u64,
@@ -587,6 +588,16 @@ impl KernelState {
     fn with_ipc_state_mut<R>(&mut self, f: impl FnOnce(&mut IpcSubsystem) -> R) -> R {
         let _ipc_guard = self.ipc_state_lock.lock();
         f(kernel_mut(&mut self.ipc))
+    }
+
+    fn with_driver_state<R>(&self, f: impl FnOnce(&DriverSubsystem) -> R) -> R {
+        let _driver_guard = self.driver_state_lock.lock();
+        f(kernel_ref(&self.drivers))
+    }
+
+    fn with_driver_state_mut<R>(&mut self, f: impl FnOnce(&mut DriverSubsystem) -> R) -> R {
+        let _driver_guard = self.driver_state_lock.lock();
+        f(kernel_mut(&mut self.drivers))
     }
 
     fn with_scheduler_then_ipc<R>(
@@ -824,6 +835,7 @@ impl Bootstrap {
                 current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
             }),
             ipc_state_lock: SpinLockIrq::new(()),
+            driver_state_lock: SpinLockIrq::new(()),
             vm_state_lock: SpinLockIrq::new(()),
             task_state_lock: SpinLockIrq::new(()),
             memory_state_lock: SpinLockIrq::new(()),
@@ -856,10 +868,10 @@ impl Bootstrap {
                 next_memory_object_id: 1,
                 frame_allocator: store_kernel_value(frame_allocator),
             }),
-            drivers: DriverSubsystem {
+            drivers: store_kernel_value(DriverSubsystem {
                 driver_records: [const { None }; MAX_DRIVERS],
                 next_iova_space_id: 1,
-            },
+            }),
             capacity_profile,
             tlb_shootdown_count: 0,
             tlb_shootdown_timeout_count: 0,
@@ -960,7 +972,7 @@ impl KernelState {
             notifications: Self::capacity_pool(notification_used, limits.max_notifications),
             tasks: Self::capacity_pool(task_used, limits.max_tasks),
             drivers: Self::capacity_pool(
-                self.drivers.driver_records.iter().flatten().count(),
+                self.with_driver_state(|driver| driver.driver_records.iter().flatten().count()),
                 limits.max_drivers,
             ),
             memory_objects: Self::capacity_pool(memory_object_used, limits.max_memory_objects),

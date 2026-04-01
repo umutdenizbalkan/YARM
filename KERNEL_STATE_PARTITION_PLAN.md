@@ -151,13 +151,13 @@ into independently lockable domains while preserving behavior.
     (`capacity_telemetry`) to `with_ipc_state(...)` accessors
 - This closes the extraction loop needed to start the next partitioning phase.
 
-## Phase 6 (planned)
+## Phase 6 (in progress)
 
 Split the remaining multi-concern boot state into explicit lockable domains for
 driver, fault, and restart flows. This phase focuses on reducing lock coupling
 with task/ipc/vm/memory paths while preserving behavior.
 
-### Phase 6a (planned): Driver domain extraction
+### Phase 6a (completed in this pass): Driver domain extraction
 
 - Extract `DriverState` from `KernelState` fields currently used by
   `boot/driver_state.rs` and related helpers.
@@ -167,8 +167,10 @@ with task/ipc/vm/memory paths while preserving behavior.
   - `with_driver_state_mut(...)`
 - Migrate driver registration/delegation/runtime-capability bookkeeping call
   paths to the new accessor layer.
-- Add focused tests for driver registration and delegation flows under the new
-  lock domain.
+- Migrate non-driver-module driver telemetry/capacity reads in `boot/mod.rs`
+  (`capacity_telemetry`) to `with_driver_state(...)`.
+- Focused driver-registration/delegation tests continue to validate behavior
+  under the new lock domain.
 
 ### Phase 6b (planned): Fault domain extraction
 

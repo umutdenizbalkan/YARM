@@ -15,39 +15,36 @@ impl KernelState {
         })
         .then_some(())
         .ok_or(KernelError::TaskMissing)?;
-        if self
-            .drivers
-            .driver_records
-            .iter()
-            .flatten()
-            .any(|record| record.tid == ThreadId(tid))
-        {
+        if self.with_driver_state(|driver| {
+            driver
+                .driver_records
+                .iter()
+                .flatten()
+                .any(|record| record.tid == ThreadId(tid))
+        }) {
             return Ok(());
         }
-        if self.drivers.driver_records.iter().flatten().count()
+        if self.with_driver_state(|driver| driver.driver_records.iter().flatten().count())
             >= self.runtime_capacity_config().max_drivers
         {
             return Err(KernelError::TaskTableFull);
         }
 
-        if let Some(slot) = self
-            .drivers
-            .driver_records
-            .iter_mut()
-            .find(|slot| slot.is_none())
-        {
-            *slot = Some(DriverRecord {
-                tid: ThreadId(tid),
-                irq_caps: [None; super::MAX_DRIVER_IRQ_CAPS],
-                dma_caps: [None; super::MAX_DRIVER_DMA_CAPS],
-                dma_iova_base: None,
-                dma_iova_len: None,
-                iova_space_cap: None,
-            });
-            Ok(())
-        } else {
-            Err(KernelError::TaskTableFull)
-        }
+        self.with_driver_state_mut(|driver| {
+            if let Some(slot) = driver.driver_records.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(DriverRecord {
+                    tid: ThreadId(tid),
+                    irq_caps: [None; super::MAX_DRIVER_IRQ_CAPS],
+                    dma_caps: [None; super::MAX_DRIVER_DMA_CAPS],
+                    dma_iova_base: None,
+                    dma_iova_len: None,
+                    iova_space_cap: None,
+                });
+                Ok(())
+            } else {
+                Err(KernelError::TaskTableFull)
+            }
+        })
     }
 
     pub fn grant_driver_irq(&mut self, tid: u64, irq_cap: CapId) -> Result<CapId, KernelError> {
@@ -66,21 +63,22 @@ impl KernelState {
         let delegated_cap = self
             .capability_service_mut()
             .grant_task_to_task_with_rights(source_tid, irq_cap, tid, CapRights::SIGNAL)?;
-        let record = self
-            .drivers
-            .driver_records
-            .iter_mut()
-            .flatten()
-            .find(|record| record.tid == ThreadId(tid))
-            .ok_or(KernelError::TaskMissing)?;
-        if record.irq_caps.contains(&Some(delegated_cap)) {
-            return Ok(delegated_cap);
-        }
-        if let Some(slot) = record.irq_caps.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(delegated_cap);
-            return Ok(delegated_cap);
-        }
-        Err(KernelError::TaskTableFull)
+        self.with_driver_state_mut(|driver| {
+            let record = driver
+                .driver_records
+                .iter_mut()
+                .flatten()
+                .find(|record| record.tid == ThreadId(tid))
+                .ok_or(KernelError::TaskMissing)?;
+            if record.irq_caps.contains(&Some(delegated_cap)) {
+                return Ok(delegated_cap);
+            }
+            if let Some(slot) = record.irq_caps.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(delegated_cap);
+                return Ok(delegated_cap);
+            }
+            Err(KernelError::TaskTableFull)
+        })
     }
 
     pub fn mint_irq_cap(&mut self, line: u16) -> Result<CapId, KernelError> {
@@ -91,9 +89,11 @@ impl KernelState {
     }
 
     pub fn create_iova_space_cap(&mut self) -> Result<CapId, KernelError> {
-        let id = self.drivers.next_iova_space_id;
-        self.drivers.next_iova_space_id =
-            self.drivers.next_iova_space_id.checked_add(1).unwrap_or(1);
+        let id = self.with_driver_state_mut(|driver| {
+            let id = driver.next_iova_space_id;
+            driver.next_iova_space_id = driver.next_iova_space_id.checked_add(1).unwrap_or(1);
+            id
+        });
         self.mint_capability_for_current_context(Capability::new(
             CapObject::IovaSpace { id },
             CapRights::MAP,
@@ -118,15 +118,16 @@ impl KernelState {
         let delegated_cap = self
             .capability_service_mut()
             .grant_task_to_task_with_rights(source_tid, iova_cap, tid, CapRights::MAP)?;
-        let record = self
-            .drivers
-            .driver_records
-            .iter_mut()
-            .flatten()
-            .find(|record| record.tid == ThreadId(tid))
-            .ok_or(KernelError::TaskMissing)?;
-        record.iova_space_cap = Some(delegated_cap);
-        Ok(delegated_cap)
+        self.with_driver_state_mut(|driver| {
+            let record = driver
+                .driver_records
+                .iter_mut()
+                .flatten()
+                .find(|record| record.tid == ThreadId(tid))
+                .ok_or(KernelError::TaskMissing)?;
+            record.iova_space_cap = Some(delegated_cap);
+            Ok(delegated_cap)
+        })
     }
 
     pub fn mint_dma_region_cap(
@@ -203,21 +204,22 @@ impl KernelState {
                 tid,
                 CapRights::MAP | CapRights::READ | CapRights::WRITE,
             )?;
-        let record = self
-            .drivers
-            .driver_records
-            .iter_mut()
-            .flatten()
-            .find(|record| record.tid == ThreadId(tid))
-            .ok_or(KernelError::TaskMissing)?;
-        if record.dma_caps.contains(&Some(delegated_cap)) {
-            return Ok(delegated_cap);
-        }
-        if let Some(slot) = record.dma_caps.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(delegated_cap);
-            return Ok(delegated_cap);
-        }
-        Err(KernelError::TaskTableFull)
+        self.with_driver_state_mut(|driver| {
+            let record = driver
+                .driver_records
+                .iter_mut()
+                .flatten()
+                .find(|record| record.tid == ThreadId(tid))
+                .ok_or(KernelError::TaskMissing)?;
+            if record.dma_caps.contains(&Some(delegated_cap)) {
+                return Ok(delegated_cap);
+            }
+            if let Some(slot) = record.dma_caps.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(delegated_cap);
+                return Ok(delegated_cap);
+            }
+            Err(KernelError::TaskTableFull)
+        })
     }
 
     pub fn delegate_device_server_caps(
@@ -288,13 +290,15 @@ impl KernelState {
         tid: u64,
         bundle: DriverDelegationBundle,
     ) -> Result<(), KernelError> {
-        let record = self
-            .drivers
-            .driver_records
-            .iter()
-            .flatten()
-            .find(|record| record.tid == ThreadId(tid))
-            .ok_or(KernelError::TaskMissing)?;
+        let record = self.with_driver_state(|driver| {
+            driver
+                .driver_records
+                .iter()
+                .flatten()
+                .find(|record| record.tid == ThreadId(tid))
+                .copied()
+        });
+        let record = record.ok_or(KernelError::TaskMissing)?;
 
         if !record.irq_caps.contains(&Some(bundle.irq_cap))
             || !record.dma_caps.contains(&Some(bundle.dma_cap))
@@ -334,16 +338,17 @@ impl KernelState {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
 
-        let record = self
-            .drivers
-            .driver_records
-            .iter_mut()
-            .flatten()
-            .find(|record| record.tid == ThreadId(tid))
-            .ok_or(KernelError::TaskMissing)?;
-        record.dma_iova_base = Some(iova_base);
-        record.dma_iova_len = Some(iova_len);
-        Ok(())
+        self.with_driver_state_mut(|driver| {
+            let record = driver
+                .driver_records
+                .iter_mut()
+                .flatten()
+                .find(|record| record.tid == ThreadId(tid))
+                .ok_or(KernelError::TaskMissing)?;
+            record.dma_iova_base = Some(iova_base);
+            record.dma_iova_len = Some(iova_len);
+            Ok(())
+        })
     }
 
     pub fn validate_driver_dma_iova(
@@ -358,13 +363,15 @@ impl KernelState {
         {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
-        let record = self
-            .drivers
-            .driver_records
-            .iter()
-            .flatten()
-            .find(|record| record.tid == ThreadId(tid))
-            .ok_or(KernelError::TaskMissing)?;
+        let record = self.with_driver_state(|driver| {
+            driver
+                .driver_records
+                .iter()
+                .flatten()
+                .find(|record| record.tid == ThreadId(tid))
+                .copied()
+        });
+        let record = record.ok_or(KernelError::TaskMissing)?;
 
         if record.iova_space_cap.is_none() {
             return Err(KernelError::WrongObject);
@@ -386,35 +393,38 @@ impl KernelState {
     }
 
     pub fn detach_driver_iova_space(&mut self, tid: u64) -> Result<(), KernelError> {
-        let record = self
-            .drivers
-            .driver_records
-            .iter_mut()
-            .flatten()
-            .find(|record| record.tid == ThreadId(tid))
-            .ok_or(KernelError::TaskMissing)?;
-        record.iova_space_cap = None;
-        record.dma_iova_base = None;
-        record.dma_iova_len = None;
-        Ok(())
+        self.with_driver_state_mut(|driver| {
+            let record = driver
+                .driver_records
+                .iter_mut()
+                .flatten()
+                .find(|record| record.tid == ThreadId(tid))
+                .ok_or(KernelError::TaskMissing)?;
+            record.iova_space_cap = None;
+            record.dma_iova_base = None;
+            record.dma_iova_len = None;
+            Ok(())
+        })
     }
 
     pub fn revoke_driver_runtime_caps(&mut self, tid: u64) -> Result<(), KernelError> {
-        let record = self
-            .drivers
-            .driver_records
-            .iter_mut()
-            .flatten()
-            .find(|record| record.tid == ThreadId(tid))
-            .ok_or(KernelError::TaskMissing)?;
+        let (irq_caps, dma_caps, iova_cap) = self.with_driver_state_mut(|driver| {
+            let record = driver
+                .driver_records
+                .iter_mut()
+                .flatten()
+                .find(|record| record.tid == ThreadId(tid))
+                .ok_or(KernelError::TaskMissing)?;
 
-        let irq_caps = record.irq_caps;
-        let dma_caps = record.dma_caps;
-        record.irq_caps = [None; super::MAX_DRIVER_IRQ_CAPS];
-        record.dma_caps = [None; super::MAX_DRIVER_DMA_CAPS];
-        let iova_cap = record.iova_space_cap.take();
-        record.dma_iova_base = None;
-        record.dma_iova_len = None;
+            let irq_caps = record.irq_caps;
+            let dma_caps = record.dma_caps;
+            record.irq_caps = [None; super::MAX_DRIVER_IRQ_CAPS];
+            record.dma_caps = [None; super::MAX_DRIVER_DMA_CAPS];
+            let iova_cap = record.iova_space_cap.take();
+            record.dma_iova_base = None;
+            record.dma_iova_len = None;
+            Ok::<_, KernelError>((irq_caps, dma_caps, iova_cap))
+        })?;
         let driver_cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
 
         for cap in irq_caps.into_iter().flatten() {
