@@ -17,7 +17,7 @@ This document defines the implementation slices for seL4-style reply-cap IPC.
    - Add `CapObject::Reply` with generation-protected slot identity.
    - Add bounded in-kernel reply-cap record table with owner/caller/endpoint binding metadata.
 
-2. **Call path integration** ⏳ pending
+2. **Call path integration** 🟡 partially implemented
    - Add syscall ABI entry for `IpcCall`.
    - During call send path, create ephemeral reply capability and transfer it to callee.
 

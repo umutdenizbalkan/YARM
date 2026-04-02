@@ -2988,7 +2988,9 @@ mod tests {
         );
         assert_eq!(
             state.task_status(1),
-            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap_task1)))
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(
+                send_cap_task1
+            )))
         );
         if state.current_tid() != Some(2) {
             state.yield_current().expect("switch to task2");

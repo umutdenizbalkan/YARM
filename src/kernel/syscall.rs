@@ -11,15 +11,16 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
 
-pub const SYSCALL_ABI_VERSION: u16 = 7;
+pub const SYSCALL_ABI_VERSION: u16 = 8;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
 pub const SYSCALL_VM_MAP_NR: usize = 3;
 pub const SYSCALL_TRANSFER_RELEASE_NR: usize = 4;
 pub const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
-pub const SYSCALL_COUNT: usize = 6;
-const _: [(); SYSCALL_COUNT] = [(); 6];
+pub const SYSCALL_IPC_CALL_NR: usize = 6;
+pub const SYSCALL_COUNT: usize = 7;
+const _: [(); SYSCALL_COUNT] = [(); 7];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -48,10 +49,11 @@ pub enum Syscall {
     VmMap = SYSCALL_VM_MAP_NR,
     TransferRelease = SYSCALL_TRANSFER_RELEASE_NR,
     IpcRecvTimeout = SYSCALL_IPC_RECV_TIMEOUT_NR,
+    IpcCall = SYSCALL_IPC_CALL_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 6;
+    pub const VARIANT_COUNT: usize = 7;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -64,6 +66,7 @@ impl Syscall {
             SYSCALL_VM_MAP_NR => Ok(Self::VmMap),
             SYSCALL_TRANSFER_RELEASE_NR => Ok(Self::TransferRelease),
             SYSCALL_IPC_RECV_TIMEOUT_NR => Ok(Self::IpcRecvTimeout),
+            SYSCALL_IPC_CALL_NR => Ok(Self::IpcCall),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -548,6 +551,75 @@ fn handle_ipc_recv_timeout(
     )
 }
 
+fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    validate_endpoint_right(kernel, cap, CapRights::SEND)?;
+    let endpoint = kernel
+        .capability_service()
+        .resolve_current_task_capability(cap)
+        .ok_or(SyscallError::InvalidCapability)?
+        .object;
+
+    let reply_recv_cap = CapId(frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64);
+    validate_endpoint_right(kernel, reply_recv_cap, CapRights::RECEIVE)?;
+
+    let sender_tid = current_tid(kernel)?;
+    let reply_cap = kernel
+        .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(sender_tid), reply_recv_cap)
+        .map_err(SyscallError::from)?;
+
+    let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    if len > Message::MAX_PAYLOAD {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    let msg = if current_task_has_user_asid(kernel)? {
+        let payload = match kernel.copy_from_current_user(user_ptr_or_offset, len) {
+            Ok(payload) => payload,
+            Err(KernelError::UserMemoryFault) => {
+                record_user_fault(kernel, frame, user_ptr_or_offset, FaultAccess::Read);
+                return Ok(());
+            }
+            Err(other) => return Err(SyscallError::from(other)),
+        };
+        let transfer_handle = stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
+        Message::with_header(
+            sender_tid,
+            OPCODE_INLINE,
+            Message::FLAG_CAP_TRANSFER,
+            transfer_handle,
+            &payload[..len],
+        )
+        .map_err(|_| SyscallError::InvalidArgs)?
+    } else {
+        let payload = inline_payload_from_frame(frame, len)?;
+        let transfer_handle = stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
+        Message::with_header(
+            sender_tid,
+            OPCODE_INLINE,
+            Message::FLAG_CAP_TRANSFER,
+            transfer_handle,
+            &payload[..len],
+        )
+        .map_err(|_| SyscallError::InvalidArgs)?
+    };
+
+    if let Err(err) = kernel.ipc_send(cap, msg) {
+        if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
+            let _ = kernel.take_transfer_envelope(
+                handle,
+                endpoint,
+                crate::kernel::ipc::ThreadId(current_tid(kernel)?),
+            );
+        }
+        return Err(SyscallError::from(err));
+    }
+    frame.set_ok(0, 0, 0);
+    encode_transfer_cap_ret(frame, None)?;
+    Ok(())
+}
+
 fn handle_ipc_recv_result(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
@@ -576,7 +648,6 @@ fn handle_ipc_recv_result_with_empty_error(
     received: Option<Message>,
     empty_error: SyscallError,
 ) -> Result<(), SyscallError> {
-
     match received {
         Some(msg) => {
             let sender = sender_tid_to_ret(msg.sender_tid.0)?;
@@ -733,6 +804,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::IpcSend => handle_ipc_send(kernel, frame),
         Syscall::IpcRecv => handle_ipc_recv(kernel, frame),
         Syscall::IpcRecvTimeout => handle_ipc_recv_timeout(kernel, frame),
+        Syscall::IpcCall => handle_ipc_call(kernel, frame),
         Syscall::VmMap => handle_vm_map(kernel, frame),
         Syscall::TransferRelease => handle_transfer_release(kernel, frame),
     }
@@ -747,11 +819,12 @@ mod tests {
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
-        assert_eq!(SYSCALL_ABI_VERSION, 7);
+        assert_eq!(SYSCALL_ABI_VERSION, 8);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
         assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4);
         assert_eq!(SYSCALL_IPC_RECV_TIMEOUT_NR, 5);
+        assert_eq!(SYSCALL_IPC_CALL_NR, 6);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
@@ -760,6 +833,14 @@ mod tests {
         assert_eq!(
             Syscall::decode(SYSCALL_IPC_RECV_TIMEOUT_NR).expect("decode"),
             Syscall::IpcRecvTimeout
+        );
+    }
+
+    #[test]
+    fn syscall_ipc_call_decode_is_stable() {
+        assert_eq!(
+            Syscall::decode(SYSCALL_IPC_CALL_NR).expect("decode"),
+            Syscall::IpcCall
         );
     }
 
@@ -804,6 +885,63 @@ mod tests {
         );
         dispatch(&mut state, &mut frame).expect("recv timeout");
         assert_eq!(frame.error_code(), Some(SyscallError::TimedOut.code()));
+    }
+
+    #[test]
+    fn syscall_ipc_call_attaches_single_use_reply_cap_to_request() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+
+        let (_call_eid, call_send_cap, call_recv_cap_global) =
+            state.create_endpoint(4).expect("call ep");
+        let call_recv_cap = state
+            .grant_capability_task_to_task(0, call_recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_reply_eid, _reply_send, reply_recv_cap) = state.create_endpoint(4).expect("reply ep");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [call_recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let payload_word = usize::from_le_bytes(*b"call0000");
+        let mut frame = TrapFrame::new(
+            Syscall::IpcCall as usize,
+            [
+                call_send_cap.0 as usize,
+                0,
+                8,
+                payload_word,
+                0,
+                reply_recv_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut frame).expect("ipc call");
+        assert_eq!(frame.error_code(), None);
+
+        state.yield_current().expect("switch receiver");
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [call_recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut recv).expect("recv syscall");
+
+        assert_eq!(recv.ret1(), 8);
+        let bytes = unpack_register_payload(
+            [
+                recv.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+                recv.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+            ],
+            recv.ret1(),
+        )
+        .expect("payload");
+        assert_eq!(&bytes[..8], b"call0000");
+        assert_ne!(recv.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
     }
 
     #[test]

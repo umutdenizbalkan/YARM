@@ -23,7 +23,10 @@ impl KernelState {
         })
     }
 
-    pub(crate) fn consume_ipc_timeout_fired_for_tid(&mut self, tid: u64) -> Result<bool, KernelError> {
+    pub(crate) fn consume_ipc_timeout_fired_for_tid(
+        &mut self,
+        tid: u64,
+    ) -> Result<bool, KernelError> {
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
@@ -176,7 +179,10 @@ impl KernelState {
         self.enqueue_task(sender_tid.0).map(|_| ())
     }
 
-    pub(crate) fn process_ipc_timeout_deadlines(&mut self, now_tick: u64) -> Result<usize, KernelError> {
+    pub(crate) fn process_ipc_timeout_deadlines(
+        &mut self,
+        now_tick: u64,
+    ) -> Result<usize, KernelError> {
         let mut expired = [None; super::MAX_TASKS];
         let mut expired_count = 0usize;
         self.with_tcbs_mut(|tcbs| {
@@ -269,7 +275,8 @@ impl KernelState {
                 if index >= super::MAX_REPLY_CAPS {
                     return Err(KernelError::WrongObject);
                 }
-                if ipc.reply_caps[index].is_none() || ipc.reply_cap_generations[index] != generation {
+                if ipc.reply_caps[index].is_none() || ipc.reply_cap_generations[index] != generation
+                {
                     return Err(KernelError::StaleCapability);
                 }
                 Ok(index)
@@ -283,7 +290,8 @@ impl KernelState {
         caller_tid: ThreadId,
         caller_reply_recv_cap: CapId,
     ) -> Result<CapId, KernelError> {
-        let reply_capability = self.resolve_capability_for_task(caller_tid.0, caller_reply_recv_cap)?;
+        let reply_capability =
+            self.resolve_capability_for_task(caller_tid.0, caller_reply_recv_cap)?;
         if !reply_capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
         }

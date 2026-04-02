@@ -28,14 +28,8 @@ fn bench_shared_descriptor_construct(iterations: usize) -> f64 {
     let start = Instant::now();
     let mut checksum = 0usize;
     for _ in 0..iterations {
-        let msg = Message::with_header(
-            7,
-            1,
-            Message::FLAG_CAP_TRANSFER,
-            Some(1),
-            &descriptor,
-        )
-        .expect("shared descriptor msg");
+        let msg = Message::with_header(7, 1, Message::FLAG_CAP_TRANSFER, Some(1), &descriptor)
+            .expect("shared descriptor msg");
         checksum ^= msg.len as usize;
     }
     let elapsed = start.elapsed();

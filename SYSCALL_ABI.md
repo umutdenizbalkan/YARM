@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# YARM Syscall ABI v7 (Frozen Contract)
+# YARM Syscall ABI v8 (Frozen Contract)
 
-- ABI Version: `7`
-- Syscall count: `6`
+- ABI Version: `8`
+- Syscall count: `7`
 
 ## Syscall numbers
 
@@ -13,6 +13,7 @@
 - `3`: `VmMap` (YARM-native VM map syscall, capability-targeted)
 - `4`: `TransferRelease` (release a recv auto-mapped shared-memory transfer)
 - `5`: `IpcRecvTimeout` (bounded non-blocking receive with scheduler-yield retry budget)
+- `6`: `IpcCall` (send with kernel-minted ephemeral reply-cap transfer)
 
 ## Argument register layout (`args[0..]`)
 
@@ -36,6 +37,14 @@
 
 - `args[3] == 0`: immediate probe, empty queue returns `WouldBlock`.
 - `args[3] > 0`: kernel arms a timed wait-state and returns `TimedOut` when the deadline expires without a message.
+
+### `IpcCall` argument layout
+
+- `args[0]`: send endpoint capability id
+- `args[1]`: payload pointer (user) or inline lane source selector (kernel/no-ASID)
+- `args[2]`: payload length (must be `<= Message::MAX_PAYLOAD`)
+- `args[3..4]`: inline payload lanes for kernel/no-ASID path
+- `args[5]`: caller reply-receive endpoint capability id (kernel mints and transfers ephemeral reply cap)
 
 ### `VmMap` argument layout
 

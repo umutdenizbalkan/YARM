@@ -14,9 +14,8 @@ const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
 
 impl KernelState {
     fn emit_fault_report(&mut self, faulted_tid: u64) {
-        let (endpoint_idx, fault) = self.with_fault_state(|faults| {
-            (faults.fault_handler_endpoint, faults.last_fault)
-        });
+        let (endpoint_idx, fault) =
+            self.with_fault_state(|faults| (faults.fault_handler_endpoint, faults.last_fault));
         let Some(endpoint_idx) = endpoint_idx else {
             return;
         };

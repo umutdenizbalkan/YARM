@@ -27,12 +27,12 @@ pub use self::aarch64 as selected_isa;
 )))]
 compile_error!("unsupported target_arch for arch::selected_isa");
 
-pub mod platform_layout;
 pub mod platform_constants;
+pub mod platform_layout;
 pub mod syscall_abi;
 pub mod vm_layout;
 
 pub mod console;
-pub mod trap;
 pub mod topology;
+pub mod trap;
 pub mod trap_entry;
