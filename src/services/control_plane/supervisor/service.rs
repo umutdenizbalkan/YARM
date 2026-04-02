@@ -10,7 +10,8 @@ use crate::kernel::supervisor_abi::{
     SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, SUPERVISOR_OP_TASK_EXITED,
     SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusReply, SupervisorStatusRequest,
-    TaskExitedEvent, TransferRevokedEvent, init_alert_message, status_reply_message,
+    TaskExitedEvent, TransferRevokedEvent, init_alert_message, query_status_message,
+    status_reply_message,
 };
 use crate::kernel::time::{TickDuration, TickInstant};
 use crate::services::init::{
@@ -20,6 +21,7 @@ use crate::services::init::{
 const MAX_MANAGED_SERVICES: usize = 8;
 const MAX_DEPENDENTS: usize = 8;
 const SUPERVISOR_RECV_BUDGET_TICKS: u64 = 1;
+const SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedServiceKind {
@@ -626,6 +628,52 @@ impl SupervisorService {
     }
 }
 
+pub fn query_status_via_call_reply(
+    kernel: &mut KernelState,
+    supervisor_control_send_cap: CapId,
+    caller_reply_recv_cap: CapId,
+    requester_tid: u64,
+    queried_tid: u64,
+    recv_timeout_ticks: u64,
+) -> Result<SupervisorStatusReply, KernelError> {
+    let request = query_status_message(requester_tid, SupervisorStatusRequest { tid: queried_tid })
+        .map_err(|_| KernelError::WrongObject)?;
+    let caller_tid = ThreadId(kernel.current_tid().ok_or(KernelError::TaskMissing)?);
+    let reply_cap =
+        kernel.create_reply_cap_for_caller(caller_tid, caller_reply_recv_cap, None)?;
+    let request_with_reply_cap = Message::with_header(
+        request.sender_tid.0,
+        request.opcode,
+        request.flags | Message::FLAG_CAP_TRANSFER,
+        Some(reply_cap.0),
+        request.as_slice(),
+    )
+    .map_err(|_| KernelError::WrongObject)?;
+
+    kernel.ipc_send(supervisor_control_send_cap, request_with_reply_cap)?;
+    let reply = kernel
+        .ipc_recv_with_deadline(caller_reply_recv_cap, recv_timeout_ticks)?
+        .ok_or(KernelError::WrongObject)?;
+    SupervisorStatusReply::decode(reply.as_slice()).ok_or(KernelError::WrongObject)
+}
+
+pub fn query_status_via_call_reply_with_default_timeout(
+    kernel: &mut KernelState,
+    supervisor_control_send_cap: CapId,
+    caller_reply_recv_cap: CapId,
+    requester_tid: u64,
+    queried_tid: u64,
+) -> Result<SupervisorStatusReply, KernelError> {
+    query_status_via_call_reply(
+        kernel,
+        supervisor_control_send_cap,
+        caller_reply_recv_cap,
+        requester_tid,
+        queried_tid,
+        SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS,
+    )
+}
+
 pub fn run() {
     let mut kernel = crate::kernel::boot::Bootstrap::init().expect("init");
     let mut init = crate::services::init::InitService::new();
@@ -1016,5 +1064,18 @@ mod tests {
             .expect("schedule");
         let status = supervisor.status_for(20).expect("status");
         assert_eq!(status.pending_restart_due, 3);
+    }
+
+    #[test]
+    fn supervisor_source_guardrail_includes_query_status_reply_cap_compatibility_path() {
+        let src = include_str!("service.rs");
+        assert!(
+            src.contains("request.transferred_cap()"),
+            "supervisor query-status handling should inspect transferred reply-cap"
+        );
+        assert!(
+            src.contains("kernel.ipc_reply("),
+            "supervisor query-status handling should support reply-cap reply path"
+        );
     }
 }
