@@ -11,7 +11,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 2 — Real IPC timeout semantics** (completed in this pass).
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
-- 🟡 **Phase 5 — Shared-memory transfer hardening** (partial: send-side transfer-cap rights gate now requires `READ|MAP`).
+- ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
 - ⏳ **Phase 6** (not implemented yet).
 
 ## Phase 0 — Baseline and rollback guardrails
@@ -78,7 +78,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Map/release parity canaries pass under repeated load and forced faults.
 - Transfer revoke paths are deterministic and auditable.
 
-## Phase 5 artifacts (partial)
+## Phase 5 artifacts
 
 - Shared-memory transfer-cap preflight validation:
   - `IpcSend` large-payload transfer path now requires transfer cap rights `READ|MAP` before descriptor send.
@@ -99,6 +99,10 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Anti-leak + accounting canaries under repeated teardown:
   - repeated process-cleanup transfer-envelope purge keeps `transfer_records_created == transfer_records_revoked`.
   - repeated direct transfer-cap revoke force-unmap cycles keep `shared_mem_bytes_mapped == shared_mem_bytes_released`.
+- Exit-criteria verification canary:
+  - mixed transfer-envelope cleanup + force-unmap revoke path keeps both invariants stable:
+    - `transfer_records_revoked >= transfer_records_created` (no stale transfer records)
+    - `shared_mem_bytes_mapped == shared_mem_bytes_released`
 
 ## Phase 6 — Service migration and deprecation
 

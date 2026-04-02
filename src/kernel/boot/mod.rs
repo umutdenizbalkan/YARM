@@ -2923,6 +2923,80 @@ mod tests {
     }
 
     #[test]
+    fn phase5_mixed_teardown_paths_keep_transfer_and_mapping_telemetry_balanced() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+
+        if state.current_tid() != Some(0) {
+            state.yield_current().expect("switch to task0");
+        }
+
+        for i in 0..3 {
+            let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+            state
+                .stash_transfer_envelope(
+                    ThreadId(0),
+                    mem_cap,
+                    endpoint,
+                    Some(ThreadId(1)),
+                    Some(TransferSharedRegion {
+                        offset: 0x5000 + (i * PAGE_SIZE) as u64,
+                        len: PAGE_SIZE as u64,
+                    }),
+                )
+                .expect("stash");
+
+            let mem_cap_task1 = state
+                .grant_capability_task_to_task(0, mem_cap, 1)
+                .expect("grant mem");
+            let base = 0xF000 + (i * PAGE_SIZE);
+            state.yield_current().expect("switch to task1");
+            state
+                .map_user_page_in_current_asid_with_caps(
+                    mem_cap_task1,
+                    VirtAddr(base as u64),
+                    PageFlags {
+                        read: true,
+                        write: true,
+                        execute: false,
+                        user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+                    },
+                )
+                .expect("map");
+            state
+                .register_active_transfer_mapping(
+                    ThreadId(1),
+                    mem_cap_task1,
+                    VirtAddr(base as u64),
+                    PAGE_SIZE,
+                )
+                .expect("register mapping");
+            state.note_shared_mem_mapped(PAGE_SIZE);
+            state.revoke_capability_direct_in_process_cnode(1, mem_cap_task1);
+            state.yield_current().expect("switch to task0");
+        }
+
+        state.exit_task(1, 1).expect("exit");
+        state.purge_transfer_envelopes_for_pid(1);
+        state.purge_active_transfer_mappings_for_pid(1);
+
+        let telemetry = state.ipc_path_telemetry();
+        assert_eq!(telemetry.transfer_records_created, 3);
+        assert_eq!(telemetry.transfer_records_revoked, 6);
+        assert_eq!(telemetry.shared_mem_bytes_mapped, telemetry.shared_mem_bytes_released);
+    }
+
+    #[test]
     fn spawn_user_task_from_image_registers_asid_and_class() {
         let mut state = Bootstrap::init().expect("init");
         let spawned = state
