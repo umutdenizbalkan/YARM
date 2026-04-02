@@ -244,7 +244,10 @@ fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), Syscall
 fn validate_shared_mem_transfer_rights(
     capability: &crate::kernel::capabilities::Capability,
 ) -> Result<(), SyscallError> {
-    if !capability.has_right(CapRights::READ) || !capability.has_right(CapRights::MAP) {
+    if !capability.has_right(CapRights::READ)
+        || !capability.has_right(CapRights::WRITE)
+        || !capability.has_right(CapRights::MAP)
+    {
         return Err(SyscallError::MissingRight);
     }
     Ok(())
@@ -1452,6 +1455,55 @@ mod tests {
         }
         let t = state.ipc_path_telemetry();
         assert_eq!(t.transfer_records_created, 0);
+    }
+
+    #[test]
+    fn syscall_send_shared_mem_requires_write_right_on_transfer_cap() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let no_write_object = state
+            .current_task_capability(mem_cap)
+            .expect("mem cap")
+            .object;
+        let no_write_cap = state
+            .mint_capability_for_current_context(crate::kernel::capabilities::Capability::new(
+                no_write_object,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("no-write cap");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0x2000,
+                Message::MAX_PAYLOAD + 16,
+                0,
+                0,
+                no_write_cap.0 as usize,
+            ],
+        );
+        let err = dispatch(&mut state, &mut send).expect_err("missing write right");
+        assert_eq!(err, SyscallError::MissingRight);
     }
 
     #[test]
