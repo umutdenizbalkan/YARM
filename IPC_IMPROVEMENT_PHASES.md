@@ -86,6 +86,8 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
   - repeated shared-memory send rejection due to missing transfer rights leaves `transfer_records_created` unchanged (`0`).
 - Recv-path rollback hardening:
   - shared-memory recv validation/map failures now revoke materialized transfer caps (no leaked receiver-local transfer cap on failure).
+- Receiver mapping-intent validation:
+  - shared-memory recv now validates optional map-intent flags (read required; unknown bits rejected) before mapping.
 
 ## Phase 6 — Service migration and deprecation
 
