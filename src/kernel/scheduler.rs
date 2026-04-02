@@ -172,6 +172,31 @@ impl PriorityScheduler {
         self.queues.iter().any(|queue| queue.contains(tid))
     }
 
+    fn rebuild_membership_table(&mut self) -> bool {
+        self.membership_keys = [ThreadId(0); MEMBERSHIP_SLOTS];
+        self.membership_state = [MEMBERSHIP_EMPTY; MEMBERSHIP_SLOTS];
+
+        let mut exhausted = false;
+        if let Some(current) = self.current
+            && self.membership_insert(current.tid).is_err()
+        {
+            exhausted = true;
+        }
+
+        for queue_idx in 0..self.queues.len() {
+            let queue_len = self.queues[queue_idx].len;
+            for offset in 0..queue_len {
+                let idx = RingQueue::index(self.queues[queue_idx].head + offset);
+                let tid = self.queues[queue_idx].tids[idx];
+                if self.membership_insert(tid).is_err() {
+                    exhausted = true;
+                }
+            }
+        }
+
+        exhausted
+    }
+
     fn priority_index(priority: TaskPriority) -> usize {
         priority as usize
     }
@@ -194,7 +219,7 @@ impl PriorityScheduler {
         }
         self.queues[Self::priority_index(priority)].push(tid)?;
         if !self.membership_tracking_exhausted && self.membership_insert(tid).is_err() {
-            self.membership_tracking_exhausted = true;
+            self.membership_tracking_exhausted = self.rebuild_membership_table();
         }
         Ok(())
     }
@@ -522,5 +547,33 @@ mod tests {
         assert_eq!(sched.dispatch_next_on(CpuId(1)), Some(ThreadId(20)));
         assert_eq!(sched.current_tid_on(CpuId(0)), Some(ThreadId(10)));
         assert_eq!(sched.current_tid_on(CpuId(1)), Some(ThreadId(20)));
+    }
+
+    #[test]
+    fn membership_tracking_rebuilds_before_falling_back_to_linear_scan() {
+        let mut sched = PriorityScheduler::default();
+        for tid in 1..=(MEMBERSHIP_SLOTS as u64) {
+            sched
+                .enqueue_with_priority(ThreadId(tid), TaskPriority::Normal)
+                .expect("seed queue");
+        }
+
+        for _ in 0..MEMBERSHIP_SLOTS {
+            assert!(sched.dispatch_next().is_some());
+            assert!(sched.block_current().is_some());
+        }
+        assert_eq!(sched.runnable_count(), 0);
+
+        for tid in 1000..(1000 + MEMBERSHIP_SLOTS as u64) {
+            sched
+                .enqueue_with_priority(ThreadId(tid), TaskPriority::Normal)
+                .expect("reused membership slot");
+        }
+
+        assert!(!sched.membership_tracking_exhausted);
+        assert_eq!(
+            sched.enqueue_with_priority(ThreadId(1000), TaskPriority::High),
+            Err(SchedulerError::AlreadyQueued)
+        );
     }
 }
