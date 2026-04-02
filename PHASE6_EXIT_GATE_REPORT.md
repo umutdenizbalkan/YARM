@@ -10,7 +10,7 @@ This report tracks the closure criteria for **Phase 6 — Service migration and 
 - ✅ Control-plane exit-gate migration bundle canary is active.
 - ✅ Process Manager kernel-IPC roundtrip uses reply-cap call/reply helper path.
 - ✅ VFS kernel-IPC roundtrip uses reply-cap call/reply helper path.
-- 🟡 Supervisor remains on budgeted receive loop migration and still needs explicit call/reply choreography evaluation/waiver finalization.
+- 🟡 Supervisor remains on budgeted receive loop migration; status-query path has reply-cap compatibility support, while broader call/reply choreography evaluation/waiver finalization is still pending.
 - 🟡 Init orchestration path requires explicit non-kernel-loop waiver closure in final migration guide bundle.
 
 ## Dated deprecation checkpoints

@@ -12,7 +12,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
 - ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
-- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–16 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze + control-plane-wide nonblocking regression expansion + process-manager kernel-IPC timed-recv migration + process-manager source guardrails + process-manager reply-cap call/reply helper migration + VFS reply-cap call/reply helper migration + exit-gate bundle bootstrap + draft exit-gate report/dated waivers; full core-service cutover/deprecation sunset pending).
+- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–17 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze + control-plane-wide nonblocking regression expansion + process-manager kernel-IPC timed-recv migration + process-manager source guardrails + process-manager reply-cap call/reply helper migration + VFS reply-cap call/reply helper migration + exit-gate bundle bootstrap + draft exit-gate report/dated waivers + supervisor query-status reply-cap compatibility; full core-service cutover/deprecation sunset pending).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -260,6 +260,11 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
     - dated deprecation checkpoints,
     - draft dated waivers for remaining supervisor/init closure items,
     - explicit remaining-work list required before Phase 6 completion.
+
+## Phase 6 artifacts (pass 17)
+
+- Supervisor call/reply compatibility slice:
+  - `src/services/control_plane/supervisor/service.rs` status-query reply path now supports replying through transferred reply-cap (`ipc_reply`) when present, with fallback to existing init-alert send path when no reply-cap is attached.
 
 ## Cross-phase quality gates
 

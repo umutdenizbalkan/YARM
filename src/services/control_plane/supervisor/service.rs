@@ -131,10 +131,15 @@ impl SupervisorService {
         &mut self,
         kernel: &mut KernelState,
         reply: SupervisorStatusReply,
+        reply_cap: Option<CapId>,
     ) -> Result<(), KernelError> {
         let msg =
             status_reply_message(self.init_tid, reply).map_err(|_| KernelError::WrongObject)?;
-        self.send_init_message(kernel, msg)
+        if let Some(reply_cap) = reply_cap {
+            kernel.ipc_reply(reply_cap, msg)
+        } else {
+            self.send_init_message(kernel, msg)
+        }
     }
 
     fn register_record(&mut self, record: ManagedServiceRecord) -> Result<(), KernelError> {
@@ -339,7 +344,8 @@ impl SupervisorService {
                 let req = SupervisorStatusRequest::decode(request.as_slice())
                     .ok_or(KernelError::WrongObject)?;
                 let record = self.find_record(req.tid).ok_or(KernelError::TaskMissing)?;
-                self.send_status_reply(kernel, self.status_reply(record))?;
+                let reply_cap = request.transferred_cap().map(|cap| CapId(cap.0));
+                self.send_status_reply(kernel, self.status_reply(record), reply_cap)?;
             }
             SUPERVISOR_OP_ACK_REDELEGATION => {
                 let req = RedelegationAckRequest::decode(request.as_slice())
