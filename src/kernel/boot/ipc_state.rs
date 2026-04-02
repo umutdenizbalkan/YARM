@@ -10,6 +10,19 @@ use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
 use crate::kernel::task::{TaskStatus, WaitReason};
 
 impl KernelState {
+    pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
+        self.with_ipc_state_mut(|ipc| {
+            let mut revoked = 0usize;
+            for slot in ipc.reply_caps.iter_mut() {
+                if slot.is_some_and(|record| record.caller_tid.0 == caller_tid) {
+                    *slot = None;
+                    revoked += 1;
+                }
+            }
+            revoked
+        })
+    }
+
     fn clear_ipc_timeout_for_tid(&mut self, tid: u64) -> Result<(), KernelError> {
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs

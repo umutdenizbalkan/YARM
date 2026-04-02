@@ -25,9 +25,9 @@ This document defines the implementation slices for seL4-style reply-cap IPC.
    - Add syscall ABI entry for `IpcReply`.
    - Resolve reply cap, deliver message to bound caller endpoint, invalidate reply cap record atomically.
 
-4. **Hardening** ⏳ pending
+4. **Hardening** 🟡 in progress
    - Prevent cap reuse after consume.
-   - Revoke orphaned reply caps on caller exit/restart.
+   - Revoke orphaned reply caps on caller exit/restart. ✅ caller-exit/reap revocation added.
    - Bind reply cap use to intended caller endpoint context.
 
 ## Test matrix

@@ -3219,6 +3219,30 @@ mod tests {
     }
 
     #[test]
+    fn reply_caps_are_revoked_when_caller_exits() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap)
+            .expect("create reply cap");
+
+        state.exit_task(1, 7).expect("exit caller");
+
+        let reply = Message::new(9, b"late").expect("reply");
+        assert_eq!(
+            state.ipc_reply(reply_cap, reply),
+            Err(KernelError::StaleCapability)
+        );
+    }
+
+    #[test]
     fn normalized_page_fault_event_faults_current_task() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
