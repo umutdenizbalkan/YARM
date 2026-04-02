@@ -12,7 +12,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
 - ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
-- ⏳ **Phase 6** (not implemented yet).
+- 🟡 **Phase 6 — Service migration and deprecation** (pass 1: migration matrix + compatibility window + deprecation policy documented; service-by-service runtime migration still pending).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -113,6 +113,17 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 **Exit criteria**
 - Core control-plane services run on new primitives.
 - Deprecated paths are either removed or formally sunset with dates.
+
+## Phase 6 artifacts (pass 1)
+
+- Migration matrix + compatibility window:
+  - `SYSCALL_ABI.md` now documents Phase 6 migration policy and compatibility targets for:
+    - timed recv (`IpcRecvTimeout`) adoption in control-plane waits,
+    - call/reply (`IpcCall`/`IpcReply`) adoption over ad-hoc two-endpoint request/reply choreography,
+    - shared-memory `TransferRelease` lifecycle requirement after auto-map receives.
+- Deprecation policy checkpoint:
+  - legacy two-endpoint request/reply choreography is marked as **deprecated for new/updated core services** during ABI v9 migration window.
+  - full removal is explicitly deferred until all core control-plane services are migrated.
 
 ## Cross-phase quality gates
 

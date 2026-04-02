@@ -92,6 +92,14 @@
 - Compatibility descriptor-only receive fallback has been removed for user-mode shared-memory receives.
 - Receiver-side auto-map + active mapping tracking + `TransferRelease` lifecycle is the required migration path.
 
+## Phase 6 migration policy (ABI v9 window)
+
+- **Timed wait migration target**: control-plane services should migrate blocking receive loops to `IpcRecvTimeout` with explicit tick budgets; indefinite waits are allowed only where watchdog/supervisor policy explicitly permits.
+- **Request/reply migration target**: for standard RPC flows, use `IpcCall`/`IpcReply` single-use reply-cap semantics instead of maintaining ad-hoc reply endpoints.
+- **Legacy choreography deprecation**: two-endpoint request/reply choreography is deprecated for new or updated core services during Phase 6. Existing deployments remain supported during the migration window.
+- **Shared-memory lifecycle requirement**: services receiving shared-memory auto-maps must complete `TransferRelease` as the release primitive; manual side-band cleanup protocols are deprecated.
+- **Removal gate**: legacy request/reply choreography removal is deferred until all core control-plane services are migrated and Phase 6 exit criteria are met.
+
 ## Return layout
 
 - `ret0`: status/value (sender tid for recv)
