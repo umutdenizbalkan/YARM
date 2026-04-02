@@ -26,3 +26,4 @@ Status values:
 3. Phase 6 completion requires this matrix to show all core services as either:
    - ✅ migrated, or
    - explicitly covered by dated deprecation/sunset waiver.
+4. Exit-gate bundle canary in `src/services/control_plane/mod.rs` must remain green for migrated invariants (VFS/process-manager reply-cap + timed receive, supervisor budgeted receive).

@@ -12,7 +12,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
 - ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
-- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–14 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze + control-plane-wide nonblocking regression expansion + process-manager kernel-IPC timed-recv migration + process-manager source guardrails + process-manager reply-cap call/reply helper migration + VFS reply-cap call/reply helper migration; full core-service cutover/deprecation sunset pending).
+- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–15 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze + control-plane-wide nonblocking regression expansion + process-manager kernel-IPC timed-recv migration + process-manager source guardrails + process-manager reply-cap call/reply helper migration + VFS reply-cap call/reply helper migration + exit-gate bundle bootstrap; full core-service cutover/deprecation sunset pending).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -243,6 +243,14 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - PR-6.3 call/reply migration slice (VFS):
   - `src/services/control_plane/vfs/service.rs` kernel-IPC roundtrip path now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) in place of ad-hoc dedicated server-send endpoint replies.
   - timed receive budget behavior (`ipc_recv_with_deadline`) remains in place for both server request receive and caller reply receive.
+
+## Phase 6 artifacts (pass 15)
+
+- PR-6.5 exit-gate bootstrap:
+  - `src/services/control_plane/mod.rs` now includes a phase-6 exit-gate bundle canary that asserts current migration invariants across core control-plane services:
+    - VFS: timed receive + reply-cap call/reply presence,
+    - Supervisor: budgeted receive helper presence,
+    - Process Manager: timed receive + reply-cap call/reply presence.
 
 ## Cross-phase quality gates
 

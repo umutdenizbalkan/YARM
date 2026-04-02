@@ -33,4 +33,32 @@ mod tests {
             "process-manager flow regressed to blocking ipc_recv"
         );
     }
+
+    #[test]
+    fn phase6_exit_gate_bundle_enforces_current_migration_invariants() {
+        let vfs_src = include_str!("vfs/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let process_manager_src = include_str!("process_manager/service.rs");
+
+        assert!(
+            vfs_src.contains("ipc_recv_with_deadline("),
+            "vfs must retain timed receive migration"
+        );
+        assert!(
+            vfs_src.contains("ipc_reply("),
+            "vfs must retain reply-cap call/reply migration"
+        );
+        assert!(
+            supervisor_src.contains("recv_with_budget"),
+            "supervisor must retain budgeted receive migration"
+        );
+        assert!(
+            process_manager_src.contains("ipc_recv_with_deadline("),
+            "process-manager must retain timed receive migration"
+        );
+        assert!(
+            process_manager_src.contains("ipc_reply("),
+            "process-manager must retain reply-cap call/reply migration"
+        );
+    }
 }
