@@ -33,7 +33,9 @@ boot_pml4:
     .align 4096
 boot_pdpt:
     .quad boot_pd + 0x3
-    .zero 4088
+    .zero 16
+    .quad boot_pd_hi + 0x3
+    .zero 4064
 
     .align 4096
 boot_pd:
@@ -59,6 +61,18 @@ boot_pt0:
     .quad (pte_index * 0x1000) | pte_flags_exec
     .set pte_index, pte_index + 1
     .endr
+
+    .align 4096
+boot_pd_hi:
+    // Bootstrap identity map for high MMIO space used during early x86_64 init.
+    // Map the default xAPIC + IOAPIC windows:
+    //   0xFEC0_0000..0xFEDF_FFFF  (PD idx 502, 2MiB page)
+    //   0xFEE0_0000..0xFEFF_FFFF  (PD idx 503, 2MiB page)
+    .set hi_page_flags_exec, 0x83
+    .zero 4016
+    .quad 0xFEC00000 | hi_page_flags_exec
+    .quad 0xFEE00000 | hi_page_flags_exec
+    .zero 64
 
     .align 8
 gdt64:
@@ -90,7 +104,9 @@ pvh_start32:
     // upper 32 bits of each sub-table pointer entry before loading CR3.
     mov dword ptr [boot_pml4 + 4], 0   // PML4[0]  upper dword → physical
     mov dword ptr [boot_pdpt + 4], 0   // PDPT[0]  upper dword → physical
+    mov dword ptr [boot_pdpt + 28], 0  // PDPT[3]  upper dword → physical
     mov dword ptr [boot_pd   + 4], 0   // PD[0]    upper dword → physical
+    mov dword ptr [boot_pd_hi + 4], 0  // PD_HI[0] upper dword → physical
     // The 2 MiB entries in boot_pd and all boot_pt0 entries are assembled
     // from small immediates whose upper 32 bits are already zero.
 
