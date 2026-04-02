@@ -3003,7 +3003,7 @@ mod tests {
     }
 
     #[test]
-    fn retired_asid_timeout_escalates_and_increments_telemetry() {
+    fn retired_asid_without_ack_stays_retired_and_does_not_timeout_escalate() {
         let mut state = Bootstrap::init().expect("init");
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
         let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
@@ -3017,8 +3017,8 @@ mod tests {
             .expect("destroy aspace");
         assert!(state.user_spaces.retired_entry(asid).is_some());
 
-        // Drop queued shootdown work without processing ACKs; timeout path should
-        // eventually release the retired ASID and escalate.
+        // Drop queued shootdown work without processing ACKs; retired ASIDs now
+        // require explicit acknowledgements and must not auto-timeout.
         state.set_current_cpu(CpuId(0)).expect("cpu0");
         let _ = state.drain_cross_cpu_work().expect("drain cpu0");
         state.set_current_cpu(CpuId(1)).expect("cpu1");
@@ -3031,10 +3031,9 @@ mod tests {
                 .expect("tick timeout");
         }
 
-        assert_eq!(state.user_spaces.retired_entry(asid), None);
-        assert_eq!(state.tlb_shootdown_timeout_count(), 1);
-        let escalated = state.ipc_recv(recv_cap).expect("recv").expect("msg");
-        assert_eq!(escalated.as_slice().len(), 16);
+        assert!(state.user_spaces.retired_entry(asid).is_some());
+        assert_eq!(state.tlb_shootdown_timeout_count(), 0);
+        assert_eq!(state.try_ipc_recv(recv_cap).expect("recv"), None);
     }
 
     #[test]

@@ -199,10 +199,10 @@ mod tests {
 
     #[test]
     fn lapic_configuration_parses_description() {
+        let mut regs = [0u32; 512];
+        let description = crate::std::format!("lapic_mmio_base=0x{:x}", regs.as_mut_ptr() as usize);
         LAPIC_CONFIGURED.store(false, Ordering::Relaxed);
-        assert!(try_configure_lapic_from_description(
-            b"lapic_mmio_base=0xfee00000"
-        ));
+        assert!(try_configure_lapic_from_description(description.as_bytes()));
         assert!(LAPIC_CONFIGURED.load(Ordering::Relaxed));
     }
 

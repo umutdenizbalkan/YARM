@@ -220,6 +220,9 @@ static PAGE_TABLE_STATE: SpinLockIrq<PageTableState> = SpinLockIrq::new(PageTabl
 #[cfg(test)]
 static LAST_INVALIDATED_ASID: crate::kernel::lock::SpinLock<Option<Asid>> =
     crate::kernel::lock::SpinLock::new(None);
+#[cfg(test)]
+static PAGE_TABLE_TEST_LOCK: crate::kernel::lock::SpinLock<()> =
+    crate::kernel::lock::SpinLock::new(());
 
 pub fn reset_state() {
     let mut state = PAGE_TABLE_STATE.lock();
@@ -518,6 +521,7 @@ mod tests {
 
     #[test]
     fn map_and_resolve_4_level_page() {
+        let _guard = PAGE_TABLE_TEST_LOCK.lock();
         reset_state();
         let asid = Asid(11);
         ensure_asid_root(asid).expect("root");
@@ -531,6 +535,7 @@ mod tests {
 
     #[test]
     fn unmap_clears_leaf_entry() {
+        let _guard = PAGE_TABLE_TEST_LOCK.lock();
         reset_state();
         let asid = Asid(12);
         ensure_asid_root(asid).expect("root");
@@ -542,6 +547,7 @@ mod tests {
 
     #[test]
     fn cr3_includes_low_pcid_bits() {
+        let _guard = PAGE_TABLE_TEST_LOCK.lock();
         reset_state();
         let asid = Asid(0x1234);
         let cr3 = cr3_for_asid(asid).expect("cr3");
@@ -550,6 +556,7 @@ mod tests {
 
     #[test]
     fn pcid_remains_unique_when_asid_low_bits_collide() {
+        let _guard = PAGE_TABLE_TEST_LOCK.lock();
         reset_state();
         let cr3_a = cr3_for_asid(Asid(1)).expect("cr3 a");
         let cr3_b = cr3_for_asid(Asid(0x1001)).expect("cr3 b");
@@ -558,6 +565,7 @@ mod tests {
 
     #[test]
     fn cache_policy_maps_to_leaf_cache_bits() {
+        let _guard = PAGE_TABLE_TEST_LOCK.lock();
         reset_state();
         let asid = Asid(13);
         ensure_asid_root(asid).expect("root");

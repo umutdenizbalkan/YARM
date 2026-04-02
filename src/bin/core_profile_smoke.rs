@@ -22,21 +22,17 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use yarm::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
+    use yarm::services::control_plane::init::{InitRuntimeBootConfig, run_with_kernel};
     use yarm::services::init::InitBootPhase;
 
     #[test]
     fn core_profile_smoke_path_is_stable() {
         let mut kernel = yarm::kernel::boot::Bootstrap::init().expect("init");
         let summary =
-            run_minimum_profile_with_kernel(&mut kernel, InitRuntimeBootConfig::baseline())
-                .expect("minimum profile");
+            run_with_kernel(&mut kernel, InitRuntimeBootConfig::baseline()).expect("runtime boot");
 
-        assert_eq!(summary.init_phase, InitBootPhase::Running);
-        assert_eq!(summary.supervisor_managed_services, 3);
-        assert_eq!(summary.process_wait_exit, 7);
-        assert_eq!(summary.devfs_open_opcode, VFS_OP_OPENAT);
-        assert_eq!(summary.initramfs_read_opcode, VFS_OP_READ);
+        assert_eq!(summary.phase, InitBootPhase::Running);
+        assert_eq!(summary.seeded_registrations, 3);
+        assert_eq!(summary.online_cpus, 1);
     }
 }

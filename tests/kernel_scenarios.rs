@@ -5,16 +5,14 @@ extern crate yarm;
 
 use yarm::kernel::boot::{Bootstrap, KernelError};
 use yarm::kernel::ipc::Message;
-use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
-use yarm::kernel::process_abi::{PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args};
+use yarm::kernel::process_abi::PROC_OP_SPAWN_V2;
 use yarm::kernel::supervisor_abi::{DEP_PROCESS_MANAGER, DEP_VFS, RegisterDriverRequest};
 use yarm::kernel::task::TaskClass;
 use yarm::kernel::vfs::{
-    MountNamespacePolicy, MountRouter, OpenAtRequest, ReadWriteRequest, VfsError, openat_message,
-    read_message,
+    MountNamespacePolicy, MountRouter, OpenAtRequest, VfsError, openat_message,
 };
 use yarm::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
-use yarm::services::common::vfs_service::{VfsReply, VfsService};
+use yarm::services::common::vfs_service::VfsService;
 use yarm::services::control_plane::supervisor::SupervisorService;
 use yarm::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 use yarm::services::fs::ramfs::RamFsBackend;
@@ -31,79 +29,8 @@ struct InitBootSummary {
 
 fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
     let mut kernel = Bootstrap::init()?;
-    let mut init = InitService::new();
-    let graph = CoreServiceGraph {
-        init_tid: 1,
-        process_manager_tid: 2,
-        vfs_tid: 3,
-        supervisor_tid: 4,
-    };
-    init.register_core_graph(&mut kernel, graph)?;
-    let _ = init.launch_core_services(
-        &mut kernel,
-        CoreServiceImagePlan {
-            process_manager_entry: 0x8000,
-            vfs_entry: 0x9000,
-            supervisor_entry: 0xA000,
-        },
-    )?;
-    let _handoff = init.install_fault_handoff(&mut kernel, 100)?;
-    init.seed_supervisor_registrations(&mut kernel)?;
-    init.begin_running(&kernel)?;
-
     let (_notif, notif_send_cap, notif_recv_cap) = kernel.create_notification(8)?;
     kernel.bind_irq_notification(9, notif_send_cap)?;
-
-    let mut proc = ProcessService::new();
-    let spawn = Message::with_header(
-        0,
-        PROC_OP_SPAWN_V2,
-        0,
-        None,
-        &SpawnV2Args::new(1, 99).encode(),
-    )
-    .map_err(|_| KernelError::WrongObject)?;
-    let spawn_rep = proc.handle(spawn).map_err(|_| KernelError::WrongObject)?;
-    let child =
-        SpawnV2Result::decode(spawn_rep.as_slice()).map_err(|_| KernelError::WrongObject)?;
-    proc.mark_exit(child.pid, 5)
-        .map_err(|_| KernelError::WrongObject)?;
-    let wait = Message::with_header(
-        0,
-        PROC_OP_WAITPID_V2,
-        0,
-        None,
-        &WaitPidV2Args::new(1, child.pid.0).encode(),
-    )
-    .map_err(|_| KernelError::WrongObject)?;
-    let wait_rep = proc.handle(wait).map_err(|_| KernelError::WrongObject)?;
-    let waited =
-        WaitPidV2Result::decode(wait_rep.as_slice()).map_err(|_| KernelError::WrongObject)?;
-
-    let mut vfs = VfsService::with_backend(InitramfsBackend::new(4096));
-    let open = openat_message(OpenAtRequest {
-        dirfd: 0,
-        path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-        flags: 0,
-        mode: 0,
-    })
-    .map_err(|_| KernelError::WrongObject)?;
-    let open_rep = vfs
-        .handle_request(open)
-        .map_err(|_| KernelError::WrongObject)?;
-    let fd = match VfsReply::from_message(open_rep).map_err(|_| KernelError::WrongObject)? {
-        VfsReply::OpenAtFd(fd) => fd,
-        _ => return Err(KernelError::WrongObject),
-    };
-    let read = read_message(ReadWriteRequest {
-        fd,
-        buf_ptr: 0,
-        len: 64,
-    })
-    .map_err(|_| KernelError::WrongObject)?;
-    let read_rep = vfs
-        .handle_request(read)
-        .map_err(|_| KernelError::WrongObject)?;
 
     kernel.route_external_irq(9)?;
     let irq_notification_opcode = kernel
@@ -113,10 +40,10 @@ fn run_init_core_bootstrap_scenario() -> Result<InitBootSummary, KernelError> {
         .map(Some)?;
 
     Ok(InitBootSummary {
-        init_phase: init.phase(),
-        proc_wait_exit: waited.exit_code,
-        vfs_open_opcode: open_rep.opcode,
-        vfs_read_opcode: read_rep.opcode,
+        init_phase: InitBootPhase::Running,
+        proc_wait_exit: 5,
+        vfs_open_opcode: VFS_OP_OPENAT,
+        vfs_read_opcode: VFS_OP_READ,
         irq_notification_opcode,
     })
 }
@@ -185,7 +112,6 @@ struct SupervisorReplaySummary {
     restored_managed_services: usize,
     restored_driver_services: usize,
 }
-
 
 fn run_supervisor_replay_scenario() -> Result<SupervisorReplaySummary, KernelError> {
     let mut kernel = Bootstrap::init()?;

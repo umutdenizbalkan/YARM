@@ -167,29 +167,41 @@ pub fn run_kernel_boot(run: fn()) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_arch = "x86_64")]
+    use crate::std::string::String;
+
+    #[cfg(target_arch = "x86_64")]
+    fn lapic_description_for_test(base: usize) -> String {
+        crate::std::format!("lapic_mmio_base=0x{base:x}")
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn boot_entry_accepts_explicit_irq_description() {
+        let mut regs = [0u32; 512];
+        let desc = crate::std::format!(
+            "{},ignored=1",
+            lapic_description_for_test(regs.as_mut_ptr() as usize)
+        );
         crate::arch::x86_64::irq::reset_lapic_config_for_test();
-        run_kernel_boot_with_irq_description(|| {}, Some(b"lapic_mmio_base=0xfee01000,ignored=1"));
+        run_kernel_boot_with_irq_description(|| {}, Some(desc.as_bytes()));
         assert_eq!(
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
-            0xFEE0_1000
+            regs.as_mut_ptr() as usize
         );
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn staged_description_is_consumed_once() {
+        let mut regs = [0u32; 512];
+        let desc = lapic_description_for_test(regs.as_mut_ptr() as usize);
         crate::arch::x86_64::irq::reset_lapic_config_for_test();
-        assert!(stage_irq_controller_description_for_boot(
-            b"lapic_mmio_base=0xfee02000"
-        ));
+        assert!(stage_irq_controller_description_for_boot(desc.as_bytes()));
         run_kernel_boot(|| {});
         assert_eq!(
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
-            0xFEE0_2000
+            regs.as_mut_ptr() as usize
         );
     }
 
@@ -210,20 +222,25 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn boot_entry_accepts_firmware_blob_path() {
+        let mut regs = [0u32; 512];
+        let blob = crate::std::format!("LAPIC_BASE=0x{:x}", regs.as_mut_ptr() as usize);
         crate::arch::x86_64::irq::reset_lapic_config_for_test();
-        run_kernel_boot_with_firmware_blob(|| {}, Some(b"LAPIC_BASE=0xfee05000"));
+        run_kernel_boot_with_firmware_blob(|| {}, Some(blob.as_bytes()));
         assert_eq!(
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
-            0xFEE0_5000
+            regs.as_mut_ptr() as usize
         );
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn boot_entry_uses_registered_firmware_blob_provider() {
+        static mut TEST_LAPIC_REGS: [u32; 512] = [0; 512];
+
         fn provider(buf: &mut [u8]) -> usize {
-            let blob = b"LAPIC_BASE=0xfee06000";
-            buf[..blob.len()].copy_from_slice(blob);
+            let base = core::ptr::addr_of_mut!(TEST_LAPIC_REGS) as usize;
+            let blob = crate::std::format!("LAPIC_BASE=0x{base:x}");
+            buf[..blob.len()].copy_from_slice(blob.as_bytes());
             blob.len()
         }
         crate::arch::x86_64::irq::reset_lapic_config_for_test();
@@ -231,7 +248,7 @@ mod tests {
         run_kernel_boot(|| {});
         assert_eq!(
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
-            0xFEE0_6000
+            core::ptr::addr_of_mut!(TEST_LAPIC_REGS) as usize
         );
     }
 }
