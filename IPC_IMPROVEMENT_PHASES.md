@@ -10,7 +10,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 1 — Payload capacity and framing policy** (completed in this pass).
 - ✅ **Phase 2 — Real IPC timeout semantics** (completed in this pass).
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
-- 🟡 **Phase 4 — Call/Reply capability model** (Slice 1 complete, Slice 2 partial: `IpcCall` syscall wiring added; `IpcReply` syscall + lifecycle hardening pending).
+- 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening pending).
 - ⏳ **Phases 5–6** (not implemented yet).
 
 ## Phase 0 — Baseline and rollback guardrails
@@ -134,3 +134,5 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
   - `create_reply_cap_for_caller(...)` and single-use `ipc_reply(...)` path.
 - Slice 2 implementation (partial):
   - `IpcCall` syscall ABI slot + kernel path that mints and transfers ephemeral reply cap.
+- Slice 3 implementation (partial):
+  - `IpcReply` syscall ABI slot + kernel path that consumes single-use reply cap and routes reply to the bound caller endpoint.

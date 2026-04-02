@@ -11,7 +11,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
 
-pub const SYSCALL_ABI_VERSION: u16 = 8;
+pub const SYSCALL_ABI_VERSION: u16 = 9;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
@@ -19,8 +19,9 @@ pub const SYSCALL_VM_MAP_NR: usize = 3;
 pub const SYSCALL_TRANSFER_RELEASE_NR: usize = 4;
 pub const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
 pub const SYSCALL_IPC_CALL_NR: usize = 6;
-pub const SYSCALL_COUNT: usize = 7;
-const _: [(); SYSCALL_COUNT] = [(); 7];
+pub const SYSCALL_IPC_REPLY_NR: usize = 7;
+pub const SYSCALL_COUNT: usize = 8;
+const _: [(); SYSCALL_COUNT] = [(); 8];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -50,10 +51,11 @@ pub enum Syscall {
     TransferRelease = SYSCALL_TRANSFER_RELEASE_NR,
     IpcRecvTimeout = SYSCALL_IPC_RECV_TIMEOUT_NR,
     IpcCall = SYSCALL_IPC_CALL_NR,
+    IpcReply = SYSCALL_IPC_REPLY_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 7;
+    pub const VARIANT_COUNT: usize = 8;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -67,6 +69,7 @@ impl Syscall {
             SYSCALL_TRANSFER_RELEASE_NR => Ok(Self::TransferRelease),
             SYSCALL_IPC_RECV_TIMEOUT_NR => Ok(Self::IpcRecvTimeout),
             SYSCALL_IPC_CALL_NR => Ok(Self::IpcCall),
+            SYSCALL_IPC_REPLY_NR => Ok(Self::IpcReply),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -620,6 +623,36 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     Ok(())
 }
 
+fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let reply_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let user_ptr = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    if len > Message::MAX_PAYLOAD {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let sender_tid = current_tid(kernel)?;
+    let msg = if current_task_has_user_asid(kernel)? {
+        let payload = match kernel.copy_from_current_user(user_ptr, len) {
+            Ok(payload) => payload,
+            Err(KernelError::UserMemoryFault) => {
+                record_user_fault(kernel, frame, user_ptr, FaultAccess::Read);
+                return Ok(());
+            }
+            Err(other) => return Err(SyscallError::from(other)),
+        };
+        Message::new(sender_tid, &payload[..len]).map_err(|_| SyscallError::InvalidArgs)?
+    } else {
+        let payload = inline_payload_from_frame(frame, len)?;
+        Message::new(sender_tid, &payload[..len]).map_err(|_| SyscallError::InvalidArgs)?
+    };
+    kernel
+        .ipc_reply(reply_cap, msg)
+        .map_err(SyscallError::from)?;
+    frame.set_ok(0, 0, 0);
+    encode_transfer_cap_ret(frame, None)?;
+    Ok(())
+}
+
 fn handle_ipc_recv_result(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
@@ -805,6 +838,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::IpcRecv => handle_ipc_recv(kernel, frame),
         Syscall::IpcRecvTimeout => handle_ipc_recv_timeout(kernel, frame),
         Syscall::IpcCall => handle_ipc_call(kernel, frame),
+        Syscall::IpcReply => handle_ipc_reply(kernel, frame),
         Syscall::VmMap => handle_vm_map(kernel, frame),
         Syscall::TransferRelease => handle_transfer_release(kernel, frame),
     }
@@ -819,12 +853,13 @@ mod tests {
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
-        assert_eq!(SYSCALL_ABI_VERSION, 8);
+        assert_eq!(SYSCALL_ABI_VERSION, 9);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
         assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4);
         assert_eq!(SYSCALL_IPC_RECV_TIMEOUT_NR, 5);
         assert_eq!(SYSCALL_IPC_CALL_NR, 6);
+        assert_eq!(SYSCALL_IPC_REPLY_NR, 7);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
@@ -841,6 +876,14 @@ mod tests {
         assert_eq!(
             Syscall::decode(SYSCALL_IPC_CALL_NR).expect("decode"),
             Syscall::IpcCall
+        );
+    }
+
+    #[test]
+    fn syscall_ipc_reply_decode_is_stable() {
+        assert_eq!(
+            Syscall::decode(SYSCALL_IPC_REPLY_NR).expect("decode"),
+            Syscall::IpcReply
         );
     }
 
@@ -942,6 +985,44 @@ mod tests {
         .expect("payload");
         assert_eq!(&bytes[..8], b"call0000");
         assert_ne!(recv.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
+    }
+
+    #[test]
+    fn syscall_ipc_reply_routes_message_and_consumes_reply_cap() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(0), recv_cap)
+            .expect("reply cap");
+        let payload_word = usize::from_le_bytes(*b"reply000");
+        let mut frame = TrapFrame::new(
+            Syscall::IpcReply as usize,
+            [reply_cap.0 as usize, 0, 8, payload_word, 0, 0],
+        );
+        dispatch(&mut state, &mut frame).expect("ipc reply");
+        assert_eq!(frame.error_code(), None);
+
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut recv).expect("recv syscall");
+        let bytes = unpack_register_payload(
+            [
+                recv.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+                recv.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+            ],
+            recv.ret1(),
+        )
+        .expect("payload");
+        assert_eq!(&bytes[..8], b"reply000");
+
+        let mut replay = TrapFrame::new(
+            Syscall::IpcReply as usize,
+            [reply_cap.0 as usize, 0, 8, payload_word, 0, 0],
+        );
+        let err = dispatch(&mut state, &mut replay).expect_err("single use");
+        assert_eq!(err, SyscallError::WrongObject);
     }
 
     #[test]
