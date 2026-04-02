@@ -25,15 +25,14 @@ impl KernelState {
             .unwrap_or(CNodeId(process_pid));
         self.ensure_cnode_space(cnode)?;
         self.set_process_cnode_for_pid(process_pid, cnode)?;
-        let inserted = self.with_tcbs_mut(|tcbs| {
-            if let Some(idx) = tcbs.iter().position(|slot| slot.is_none()) {
-                let tcb = ThreadControlBlock::new(ThreadId(tid), class, None);
-                tcbs[idx] = Some(tcb);
-                true
-            } else {
-                false
-            }
-        });
+        let inserted = if let Some(idx) = self.tcbs.iter().position(|slot| slot.is_none()) {
+            let tcb = ThreadControlBlock::new(ThreadId(tid), None);
+            self.tcbs[idx] = Some(tcb);
+            self.task_classes[idx] = Some(class);
+            true
+        } else {
+            false
+        };
         if !inserted {
             return Err(KernelError::TaskTableFull);
         }
@@ -64,5 +63,13 @@ impl KernelState {
             candidate = self.next_dynamic_tid;
         }
         Err(KernelError::TaskTableFull)
+    }
+
+    pub fn task_class(&self, tid: u64) -> Option<TaskClass> {
+        self.tcbs.iter().enumerate().find_map(|(idx, slot)| {
+            slot.as_ref()
+                .filter(|tcb| tcb.tid.0 == tid)
+                .and(self.task_classes[idx])
+        })
     }
 }

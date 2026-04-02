@@ -532,6 +532,7 @@ pub struct KernelState {
     capability: CapabilitySubsystem,
     next_dynamic_tid: u64,
     tcbs: KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
+    task_classes: KernelStorage<[Option<TaskClass>; MAX_TASKS]>,
     tls_restore_pending: KernelStorage<[Option<ThreadId>; MAX_TASKS]>,
     robust_futex: KernelStorage<[Option<RobustFutexRecord>; MAX_TASKS]>,
     memory: KernelStorage<MemorySubsystem>,
@@ -959,6 +960,7 @@ impl Bootstrap {
             },
             next_dynamic_tid: INITIAL_DYNAMIC_TID,
             tcbs: store_kernel_value([const { None }; MAX_TASKS]),
+            task_classes: store_kernel_value([None; MAX_TASKS]),
             tls_restore_pending: store_kernel_value([None; MAX_TASKS]),
             robust_futex: store_kernel_value([None; MAX_TASKS]),
             memory: store_kernel_value(MemorySubsystem {
@@ -2790,8 +2792,8 @@ mod tests {
         assert_eq!(spawned.tid, 55);
         assert_eq!(spawned.entry, 0x8000);
         assert_eq!(spawned.asid, Some(Asid(9)));
+        assert_eq!(state.task_class(55), Some(TaskClass::SystemServer));
         let tcb = state.tcb_mut(55).expect("tcb");
-        assert_eq!(tcb.class, TaskClass::SystemServer);
         assert_eq!(tcb.asid, Some(Asid(9)));
     }
 

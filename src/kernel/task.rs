@@ -123,7 +123,6 @@ pub struct KernelExecutionContext {
 pub struct ThreadControlBlock {
     pub tid: ThreadId,
     pub thread_group_id: ThreadGroupId,
-    pub class: TaskClass,
     pub status: TaskStatus,
     pub asid: Option<Asid>,
     pub tls_ptr: Option<VirtAddr>,
@@ -140,11 +139,10 @@ pub struct ThreadControlBlock {
 }
 
 impl ThreadControlBlock {
-    pub fn new(tid: ThreadId, class: TaskClass, asid: Option<Asid>) -> Self {
+    pub fn new(tid: ThreadId, asid: Option<Asid>) -> Self {
         Self {
             tid,
             thread_group_id: ThreadGroupId(tid.0),
-            class,
             status: TaskStatus::Runnable,
             asid,
             tls_ptr: None,
@@ -178,7 +176,7 @@ mod tests {
 
     #[test]
     fn tcb_constructor_uses_typed_fields() {
-        let mut tcb = ThreadControlBlock::new(ThreadId(7), TaskClass::App, Some(Asid(1)));
+        let mut tcb = ThreadControlBlock::new(ThreadId(7), Some(Asid(1)));
         tcb.tls_ptr = Some(VirtAddr(0xDEAD_BEEF));
         tcb.user_entry = Some(VirtAddr(0x4000));
         tcb.user_stack_top = Some(VirtAddr(0x8000));
@@ -216,7 +214,7 @@ mod tests {
     #[test]
     fn tcb_constructor_preserves_large_tid_for_thread_group() {
         let tid = ThreadId(70_000);
-        let tcb = ThreadControlBlock::new(tid, TaskClass::App, None);
+        let tcb = ThreadControlBlock::new(tid, None);
 
         assert_eq!(tcb.thread_group_id, ThreadGroupId(70_000));
     }

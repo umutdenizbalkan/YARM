@@ -418,8 +418,11 @@ impl KernelState {
                     .cloned()
             })
             .ok_or(KernelError::TaskMissing)?;
+        let parent_class = self
+            .task_class(parent_tid)
+            .ok_or(KernelError::TaskMissing)?;
         let tid = self.allocate_thread_id()?;
-        self.register_task_with_class_in_process(tid, parent.class, parent.thread_group_id.0)?;
+        self.register_task_with_class_in_process(tid, parent_class, parent.thread_group_id.0)?;
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()

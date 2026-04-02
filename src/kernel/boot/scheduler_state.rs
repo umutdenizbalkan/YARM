@@ -112,13 +112,7 @@ impl KernelState {
         if tid == 0 {
             return Ok(TaskPriority::Normal);
         }
-        let class = self.with_tcbs(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .map(|tcb| tcb.class)
-        });
-        let class = class.ok_or(KernelError::TaskMissing)?;
+        let class = self.task_class(tid).ok_or(KernelError::TaskMissing)?;
         Ok(match class {
             TaskClass::SystemServer => TaskPriority::High,
             TaskClass::Driver | TaskClass::App => TaskPriority::Normal,
@@ -143,13 +137,14 @@ impl KernelState {
             return Ok(());
         }
         let current_cpu = self.current_cpu();
+        let class = self.task_class(tid).ok_or(KernelError::TaskMissing)?;
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
                 .flatten()
                 .find(|tcb| tcb.tid.0 == tid)
                 .ok_or(KernelError::TaskMissing)?;
-            if tcb.class == TaskClass::Driver && tcb.cpu_affinity.is_none() {
+            if class == TaskClass::Driver && tcb.cpu_affinity.is_none() {
                 tcb.cpu_affinity = Some(current_cpu);
             }
             Ok(())
