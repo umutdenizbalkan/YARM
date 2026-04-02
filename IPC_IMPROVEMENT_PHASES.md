@@ -7,7 +7,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 ## Implementation status (current branch)
 
 - ✅ **Phase 0 — Baseline and rollback guardrails** (implemented in this pass).
-- 🟡 **Phase 1 — Payload capacity and framing policy** (partially implemented; payload lane raised, policy/benchmark matrix still pending).
+- ✅ **Phase 1 — Payload capacity and framing policy** (completed in this pass).
 - ⏳ **Phases 2–6** (not implemented yet).
 
 ## Phase 0 — Baseline and rollback guardrails
@@ -97,3 +97,10 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
   - Locks round-trip endpoint IPC behavior.
   - Locks IRQ notification routing behavior.
   - Locks shared-memory transfer descriptor + auto-map/release behavior.
+
+## Phase 1 artifacts
+
+- Payload policy + benchmark matrix: `PHASE1_PAYLOAD_POLICY.md`
+- Medium payload fragmentation design: `IPC_FRAGMENTATION_POLICY.md`
+- Repro benchmark command:
+  - `cargo test -q --test phase1_payload_bench -- --nocapture`
