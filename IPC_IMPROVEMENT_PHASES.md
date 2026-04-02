@@ -11,7 +11,8 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 2 — Real IPC timeout semantics** (completed in this pass).
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
-- ⏳ **Phases 5–6** (not implemented yet).
+- 🟡 **Phase 5 — Shared-memory transfer hardening** (partial: send-side transfer-cap rights gate now requires `READ|MAP`).
+- ⏳ **Phase 6** (not implemented yet).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -76,6 +77,11 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 **Exit criteria**
 - Map/release parity canaries pass under repeated load and forced faults.
 - Transfer revoke paths are deterministic and auditable.
+
+## Phase 5 artifacts (partial)
+
+- Shared-memory transfer-cap preflight validation:
+  - `IpcSend` large-payload transfer path now requires transfer cap rights `READ|MAP` before descriptor send.
 
 ## Phase 6 — Service migration and deprecation
 

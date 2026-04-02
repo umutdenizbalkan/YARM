@@ -241,6 +241,15 @@ fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), Syscall
     Ok(())
 }
 
+fn validate_shared_mem_transfer_rights(
+    capability: &crate::kernel::capabilities::Capability,
+) -> Result<(), SyscallError> {
+    if !capability.has_right(CapRights::READ) || !capability.has_right(CapRights::MAP) {
+        return Err(SyscallError::MissingRight);
+    }
+    Ok(())
+}
+
 fn stash_transfer_handle(
     kernel: &mut KernelState,
     transfer_cap: Option<CapId>,
@@ -380,6 +389,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}
                 _ => return Err(SyscallError::WrongObject),
             }
+            validate_shared_mem_transfer_rights(&grant)?;
             validate_user_region(user_ptr_or_offset as u64, len as u64)?;
             let region = SharedMemoryRegion {
                 offset: user_ptr_or_offset as u64,
@@ -436,6 +446,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}
                 _ => return Err(SyscallError::WrongObject),
             }
+            validate_shared_mem_transfer_rights(&grant)?;
             let region = SharedMemoryRegion {
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
@@ -1355,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn syscall_recv_shared_mem_auto_map_reports_missing_write_right() {
+    fn syscall_send_shared_mem_requires_map_right_on_transfer_cap() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
         state.enqueue_current_cpu(1).expect("enqueue");
@@ -1399,21 +1410,7 @@ mod tests {
                 readonly_cap.0 as usize,
             ],
         );
-        dispatch(&mut state, &mut send).expect("send");
-        state.yield_current().expect("switch receiver");
-
-        let mut recv = TrapFrame::new(
-            Syscall::IpcRecv as usize,
-            [
-                recv_cap.0 as usize,
-                0x9000,
-                Message::MAX_PAYLOAD + 16,
-                0,
-                0,
-                0,
-            ],
-        );
-        let err = dispatch(&mut state, &mut recv).expect_err("missing write right");
+        let err = dispatch(&mut state, &mut send).expect_err("missing map right");
         assert_eq!(err, SyscallError::MissingRight);
     }
 
