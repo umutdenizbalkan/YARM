@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+#[cfg(any(test, not(feature = "hosted-dev")))]
+use crate::kernel::vm::Asid;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
-use crate::kernel::vm::{Asid, PageFlags, PhysAddr, VirtAddr};
+use crate::kernel::vm::{PageFlags, PhysAddr, VirtAddr};
 #[cfg(any(test, not(feature = "hosted-dev")))]
 use core::ptr::write_volatile;
 #[cfg(any(test, not(feature = "hosted-dev")))]
@@ -31,6 +33,9 @@ const LAPIC_SVR_ENABLE: u32 = 1 << 8;
 static LAPIC_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(test, not(feature = "hosted-dev")))]
 static LAPIC_CONFIGURED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(test, not(feature = "hosted-dev")))]
+#[allow(dead_code)]
+const KERNEL_BOOT_ASID: Asid = Asid(0);
 
 #[cfg(any(test, not(feature = "hosted-dev")))]
 pub fn init_lapic_mmio_base(base: usize) {
@@ -42,7 +47,7 @@ pub fn init_lapic_mmio_base(base: usize) {
     #[cfg(all(not(test), not(feature = "hosted-dev")))]
     {
         if crate::arch::selected_isa::page_table::map_page(
-            Asid(0),
+            KERNEL_BOOT_ASID,
             VirtAddr(base as u64),
             PhysAddr(base as u64),
             PageFlags::DEVICE_RW,
@@ -51,6 +56,11 @@ pub fn init_lapic_mmio_base(base: usize) {
         {
             #[cfg(target_arch = "x86_64")]
             crate::arch::x86_64::console::write_line("LIE");
+            return;
+        }
+        if crate::arch::selected_isa::page_table::activate_asid(KERNEL_BOOT_ASID).is_err() {
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::console::write_line("LIC");
             return;
         }
     }

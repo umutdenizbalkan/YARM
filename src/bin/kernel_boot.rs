@@ -342,6 +342,10 @@ pub extern "C" fn yarm_kernel_main(start_info_ptr: usize) -> ! {
     #[cfg(target_arch = "x86_64")]
     yarm::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
     #[cfg(target_arch = "x86_64")]
+    {
+        let _ = yarm::arch::x86_64::page_table::activate_asid(yarm::kernel::vm::Asid(0));
+    }
+    #[cfg(target_arch = "x86_64")]
     yarm::arch::x86_64::console::write_line("KM0");
     #[cfg(target_arch = "x86_64")]
     log_pvh_boot_metadata(start_info_ptr);
