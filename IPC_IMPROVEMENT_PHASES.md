@@ -12,7 +12,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
 - ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
-- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–7 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails; full core-service cutover/deprecation sunset pending).
+- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–8 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze; full core-service cutover/deprecation sunset pending).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -187,7 +187,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - PR-6.1 — Core-service inventory + migration matrix freeze
   - produce a concrete table of all control-plane services, current receive/reply primitive, and target primitive (`try/timed recv`, `IpcCall/IpcReply`, notification path).
   - annotate owner + risk + test gate per service.
-  - **Exit check:** matrix is checked in and referenced by Phase 6 docs.
+  - **Exit check:** matrix is checked in and referenced by Phase 6 docs. ✅ (pass 8)
 
 - PR-6.2 — Remaining service receive-loop migration (timed/budgeted)
   - migrate each remaining service loop to budgeted receive helpers (nonblocking probe + timed wait fallback where allowed).
@@ -208,6 +208,12 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
   - publish operator/developer migration guide with per-service cutover status and compatibility window closure rules.
   - add a single Phase 6 gate suite that asserts all core control-plane services are migrated or have a dated sunset waiver.
   - **Exit check:** Phase 6 can be flipped from in-progress to complete once gate suite is green.
+
+## Phase 6 artifacts (pass 8)
+
+- Core-service inventory + migration matrix freeze (PR-6.1):
+  - added `PHASE6_SERVICE_MIGRATION_MATRIX.md` with per-service current state, target primitive, owner, risk, status, and planned PR sequence.
+  - matrix now serves as the canonical tracker for remaining Phase 6 implementation slices.
 
 ## Cross-phase quality gates
 
