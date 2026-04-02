@@ -103,6 +103,10 @@ impl PageTableState {
         for (idx, slot) in self.pages.iter_mut().enumerate() {
             if slot.is_none() {
                 let phys = alloc_pt_frame().map_err(|_| PageTableError::OutOfMemory)?;
+                #[cfg(all(not(feature = "hosted-dev"), not(test)))]
+                unsafe {
+                    core::ptr::write_bytes(phys as *mut u8, 0, vm_layout::PAGE_SIZE);
+                }
                 *slot = Some(PageTablePage::new(phys));
                 return Ok(idx);
             }
@@ -124,8 +128,9 @@ impl PageTableState {
             };
 
             if level > 1 {
-                let entries = self.pages[table_idx].expect("table").entries;
-                for entry in entries {
+                for entry_idx in 0..ENTRIES_PER_TABLE {
+                    let entry = read_table_entry(self, table_phys, entry_idx)
+                        .unwrap_or(PageTableEntry::empty());
                     if !entry.is_present() {
                         continue;
                     }
@@ -280,18 +285,19 @@ fn walk_or_create_table(
     index: usize,
     flags: PageFlags,
 ) -> Result<u64, PageTableError> {
-    let table_idx = state
-        .page_index_from_phys(table_phys)
-        .ok_or(PageTableError::InvalidAddress)?;
-    let entry = state.pages[table_idx].as_ref().expect("table page").entries[index];
+    let entry = read_table_entry(state, table_phys, index).ok_or(PageTableError::InvalidAddress)?;
     if entry.is_present() {
         return Ok(entry.addr());
     }
 
     let child_idx = state.alloc_page()?;
     let child_phys = state.pages[child_idx].expect("child page").phys;
-    state.pages[table_idx].as_mut().expect("table page").entries[index] =
-        PageTableEntry::with_addr_and_flags(child_phys, table_flags_from_page_flags(flags));
+    write_table_entry(
+        state,
+        table_phys,
+        index,
+        PageTableEntry::with_addr_and_flags(child_phys, table_flags_from_page_flags(flags)),
+    )?;
     Ok(child_phys)
 }
 
@@ -347,13 +353,13 @@ pub fn map_page(
     let pd_phys = walk_or_create_table(&mut state, pdpt_phys, l3, flags)?;
     let pt_phys = walk_or_create_table(&mut state, pd_phys, l2, flags)?;
 
-    let pt_idx = state
-        .page_index_from_phys(pt_phys)
-        .ok_or(PageTableError::InvalidAddress)?;
-    let table = state.pages[pt_idx].as_mut().expect("pt page");
-    let previous = table.entries[l1];
-    table.entries[l1] =
-        PageTableEntry::with_addr_and_flags(phys.0, leaf_flags_from_page_flags(flags));
+    let previous = read_table_entry(&state, pt_phys, l1).ok_or(PageTableError::InvalidAddress)?;
+    write_table_entry(
+        &mut state,
+        pt_phys,
+        l1,
+        PageTableEntry::with_addr_and_flags(phys.0, leaf_flags_from_page_flags(flags)),
+    )?;
     drop(state);
     invalidate_page(virt);
     Ok(previous.is_present().then_some(previous))
@@ -371,21 +377,20 @@ pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     ];
     let mut table_phys = root_phys;
     for &level in &levels[..3] {
-        let idx = state.page_index_from_phys(table_phys)?;
-        let entry = state.pages[idx].as_ref()?.entries[level];
+        let entry = read_table_entry(&state, table_phys, level)?;
         if !entry.is_present() {
             return None;
         }
         table_phys = entry.addr();
     }
 
-    let pt_idx = state.page_index_from_phys(table_phys)?;
-    let table = state.pages[pt_idx].as_mut()?;
-    let old = table.entries[levels[3]];
+    let old = read_table_entry(&state, table_phys, levels[3])?;
     if !old.is_present() {
         return None;
     }
-    table.entries[levels[3]] = PageTableEntry::empty();
+    if write_table_entry(&mut state, table_phys, levels[3], PageTableEntry::empty()).is_err() {
+        return None;
+    }
     drop(state);
     invalidate_page(virt);
     Some(old)
@@ -402,16 +407,58 @@ pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     ];
     let mut table_phys = root_phys;
     for &level in &levels[..3] {
-        let idx = state.page_index_from_phys(table_phys)?;
-        let entry = state.pages[idx].as_ref()?.entries[level];
+        let entry = read_table_entry(&state, table_phys, level)?;
         if !entry.is_present() {
             return None;
         }
         table_phys = entry.addr();
     }
-    let pt_idx = state.page_index_from_phys(table_phys)?;
-    let entry = state.pages[pt_idx].as_ref()?.entries[levels[3]];
+    let entry = read_table_entry(&state, table_phys, levels[3])?;
     entry.is_present().then_some(entry)
+}
+
+fn read_table_entry(
+    state: &PageTableState,
+    table_phys: u64,
+    index: usize,
+) -> Option<PageTableEntry> {
+    if index >= ENTRIES_PER_TABLE {
+        return None;
+    }
+    let table_idx = state.page_index_from_phys(table_phys)?;
+    #[cfg(all(not(feature = "hosted-dev"), not(test)))]
+    unsafe {
+        let ptr = (table_phys as usize + index * core::mem::size_of::<u64>()) as *const u64;
+        return Some(PageTableEntry(core::ptr::read_volatile(ptr)));
+    }
+    #[cfg(any(feature = "hosted-dev", test))]
+    {
+        Some(state.pages[table_idx].as_ref()?.entries[index])
+    }
+}
+
+fn write_table_entry(
+    state: &mut PageTableState,
+    table_phys: u64,
+    index: usize,
+    entry: PageTableEntry,
+) -> Result<(), PageTableError> {
+    if index >= ENTRIES_PER_TABLE {
+        return Err(PageTableError::InvalidAddress);
+    }
+    let table_idx = state
+        .page_index_from_phys(table_phys)
+        .ok_or(PageTableError::InvalidAddress)?;
+    state.pages[table_idx]
+        .as_mut()
+        .ok_or(PageTableError::InvalidAddress)?
+        .entries[index] = entry;
+    #[cfg(all(not(feature = "hosted-dev"), not(test)))]
+    unsafe {
+        let ptr = (table_phys as usize + index * core::mem::size_of::<u64>()) as *mut u64;
+        core::ptr::write_volatile(ptr, entry.0);
+    }
+    Ok(())
 }
 
 pub fn invalidate_page(virt: VirtAddr) {
