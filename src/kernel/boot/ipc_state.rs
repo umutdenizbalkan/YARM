@@ -302,6 +302,7 @@ impl KernelState {
         &mut self,
         caller_tid: ThreadId,
         caller_reply_recv_cap: CapId,
+        responder_tid: Option<ThreadId>,
     ) -> Result<CapId, KernelError> {
         let reply_capability =
             self.resolve_capability_for_task(caller_tid.0, caller_reply_recv_cap)?;
@@ -324,6 +325,7 @@ impl KernelState {
                     ipc.reply_caps[idx] = Some(ReplyCapRecord {
                         caller_tid,
                         reply_endpoint,
+                        responder_tid,
                     });
                     return Ok::<_, KernelError>((idx, next_generation));
                 }
@@ -346,6 +348,14 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
         let slot = self.resolve_reply_index(capability.object)?;
+        let replier_tid = ThreadId(self.current_tid().ok_or(KernelError::TaskMissing)?);
+        let allowed = self.with_ipc_state(|ipc| {
+            let rec = ipc.reply_caps[slot].ok_or(KernelError::StaleCapability)?;
+            Ok::<_, KernelError>(rec.responder_tid.is_none_or(|tid| tid == replier_tid))
+        })?;
+        if !allowed {
+            return Err(KernelError::MissingRight);
+        }
         let record = self.with_ipc_state_mut(|ipc| {
             let rec = ipc.reply_caps[slot].ok_or(KernelError::StaleCapability)?;
             ipc.reply_caps[slot] = None;

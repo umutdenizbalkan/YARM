@@ -429,6 +429,7 @@ struct ActiveTransferMapping {
 struct ReplyCapRecord {
     caller_tid: ThreadId,
     reply_endpoint: CapObject,
+    responder_tid: Option<ThreadId>,
 }
 
 #[derive(Debug)]
@@ -3199,7 +3200,7 @@ mod tests {
         let mut state = Bootstrap::init().expect("init");
         let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
         let reply_cap = state
-            .create_reply_cap_for_caller(ThreadId(0), recv_cap)
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
             .expect("create reply cap");
 
         let reply = Message::new(9, b"ok").expect("reply");
@@ -3230,7 +3231,7 @@ mod tests {
             .expect("dup recv cap");
 
         let reply_cap = state
-            .create_reply_cap_for_caller(ThreadId(1), recv_cap)
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
             .expect("create reply cap");
 
         state.exit_task(1, 7).expect("exit caller");
@@ -3253,7 +3254,7 @@ mod tests {
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let reply_cap = state
-            .create_reply_cap_for_caller(ThreadId(1), recv_cap)
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
             .expect("create reply cap");
 
         state.mark_task_dead(1).expect("mark dead");
@@ -3262,6 +3263,32 @@ mod tests {
         assert_eq!(
             state.ipc_reply(reply_cap, reply),
             Err(KernelError::StaleCapability)
+        );
+    }
+
+    #[test]
+    fn reply_cap_rejects_use_from_unbound_responder_task() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.register_task(2).expect("task2");
+        state.enqueue_current_cpu(1).expect("enqueue1");
+        state.enqueue_current_cpu(2).expect("enqueue2");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(1)))
+            .expect("create reply cap");
+        let reply_cap_task2 = state
+            .grant_capability_task_to_task(0, reply_cap, 2)
+            .expect("dup reply cap");
+
+        while state.current_tid() != Some(2) {
+            state.yield_current().expect("switch");
+        }
+        let msg = Message::new(2, b"bad").expect("reply");
+        assert_eq!(
+            state.ipc_reply(reply_cap_task2, msg),
+            Err(KernelError::MissingRight)
         );
     }
 

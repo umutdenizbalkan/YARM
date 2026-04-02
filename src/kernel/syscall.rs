@@ -565,10 +565,17 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 
     let reply_recv_cap = CapId(frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64);
     validate_endpoint_right(kernel, reply_recv_cap, CapRights::RECEIVE)?;
+    let responder_tid = kernel
+        .endpoint_waiter_tid(endpoint)
+        .ok_or(SyscallError::WouldBlock)?;
 
     let sender_tid = current_tid(kernel)?;
     let reply_cap = kernel
-        .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(sender_tid), reply_recv_cap)
+        .create_reply_cap_for_caller(
+            crate::kernel::ipc::ThreadId(sender_tid),
+            reply_recv_cap,
+            Some(responder_tid),
+        )
         .map_err(SyscallError::from)?;
 
     let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
@@ -992,7 +999,7 @@ mod tests {
         let mut state = Bootstrap::init().expect("kernel");
         let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
         let reply_cap = state
-            .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(0), recv_cap)
+            .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(0), recv_cap, None)
             .expect("reply cap");
         let payload_word = usize::from_le_bytes(*b"reply000");
         let mut frame = TrapFrame::new(

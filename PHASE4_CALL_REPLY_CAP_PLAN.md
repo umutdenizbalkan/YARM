@@ -28,7 +28,7 @@ This document defines the implementation slices for seL4-style reply-cap IPC.
 4. **Hardening** 🟡 in progress
    - Prevent cap reuse after consume.
    - Revoke orphaned reply caps on caller exit/restart. ✅ caller exit/reap/restart revocation added.
-   - Bind reply cap use to intended caller endpoint context.
+   - Bind reply cap use to intended caller endpoint context. ✅ call-minted reply caps now bind expected responder task.
 
 ## Test matrix
 
