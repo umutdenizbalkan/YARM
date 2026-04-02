@@ -12,7 +12,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
 - ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
-- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–6 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration; full core-service cutover/deprecation sunset pending).
+- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–7 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails; full core-service cutover/deprecation sunset pending).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -161,6 +161,13 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
   - added source-level canary requiring supervisor loop code to keep try/budgeted receive paths and reject regression to legacy blocking `ipc_recv`.
 - Exit-gate re-evaluation:
   - Phase 6 remains in-progress: VFS + supervisor receive-loop migration slices are landed, but full core control-plane migration/deprecation sunset is still pending.
+
+## Phase 6 artifacts (pass 7)
+
+- Cross-service migration guardrail:
+  - `src/services/control_plane/mod.rs` now includes a control-plane-wide canary that rejects legacy blocking `kernel.ipc_recv` calls in migrated VFS and supervisor service sources.
+- Gate reinforcement:
+  - pass-7 guardrail complements per-service guard tests by asserting migration invariants at the control-plane module boundary.
 
 ## Cross-phase quality gates
 
