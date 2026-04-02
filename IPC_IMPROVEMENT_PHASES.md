@@ -4,6 +4,12 @@
 
 This plan breaks the IPC hardening work into incremental, reviewable phases.
 
+## Implementation status (current branch)
+
+- ✅ **Phase 0 — Baseline and rollback guardrails** (implemented in this pass).
+- 🟡 **Phase 1 — Payload capacity and framing policy** (partially implemented; payload lane raised, policy/benchmark matrix still pending).
+- ⏳ **Phases 2–6** (not implemented yet).
+
 ## Phase 0 — Baseline and rollback guardrails
 
 - Re-validate current IPC behavior (send/recv, shared-memory transfer, notification routing).
@@ -84,3 +90,10 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Telemetry additions for each new IPC path.
 - Deterministic tests for all races introduced by each phase.
 - Security review checkpoint before enabling call/reply by default.
+
+## Phase 0 artifacts
+
+- Baseline gate doc: `PHASE0_IPC_BASELINE_GATES.md`
+  - Locks round-trip endpoint IPC behavior.
+  - Locks IRQ notification routing behavior.
+  - Locks shared-memory transfer descriptor + auto-map/release behavior.
