@@ -3,13 +3,55 @@
 
 use super::{
     IpcFastpathResult, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
-    NotificationObject, SenderWaiter, map_ipc_error,
+    NotificationObject, ReplyCapRecord, SenderWaiter, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
 use crate::kernel::task::{TaskStatus, WaitReason};
 
 impl KernelState {
+    pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
+        self.with_ipc_state_mut(|ipc| {
+            let mut revoked = 0usize;
+            for slot in ipc.reply_caps.iter_mut() {
+                if slot.is_some_and(|record| record.caller_tid.0 == caller_tid) {
+                    *slot = None;
+                    revoked += 1;
+                }
+            }
+            revoked
+        })
+    }
+
+    fn clear_ipc_timeout_for_tid(&mut self, tid: u64) -> Result<(), KernelError> {
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.ipc_timeout_deadline = None;
+            tcb.ipc_timeout_fired = false;
+            Ok::<_, KernelError>(())
+        })
+    }
+
+    pub(crate) fn consume_ipc_timeout_fired_for_tid(
+        &mut self,
+        tid: u64,
+    ) -> Result<bool, KernelError> {
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            let fired = tcb.ipc_timeout_fired;
+            tcb.ipc_timeout_fired = false;
+            Ok::<_, KernelError>(fired)
+        })
+    }
+
     fn endpoint_sender_waiter_limit(&self, endpoint_idx: usize) -> Result<usize, KernelError> {
         self.ipc
             .endpoints
@@ -63,10 +105,11 @@ impl KernelState {
         self.mint_capability_in_cnode(cnode, capability)
     }
 
-    fn block_current_on_receive(
+    fn block_current_on_receive_with_deadline(
         &mut self,
         endpoint_idx: usize,
         recv_cap: CapId,
+        deadline: Option<u64>,
     ) -> Result<(), KernelError> {
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         self.with_tcbs_mut(|tcbs| {
@@ -76,6 +119,8 @@ impl KernelState {
                 .find(|tcb| tcb.tid.0 == blocked_tid)
                 .ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            tcb.ipc_timeout_deadline = deadline;
+            tcb.ipc_timeout_fired = false;
             Ok::<_, KernelError>(())
         })?;
         self.ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
@@ -83,11 +128,12 @@ impl KernelState {
         Ok(())
     }
 
-    fn block_current_on_send(
+    fn block_current_on_send_with_deadline(
         &mut self,
         endpoint_idx: usize,
         send_cap: CapId,
         msg: Message,
+        deadline: Option<u64>,
     ) -> Result<(), KernelError> {
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         self.with_tcbs_mut(|tcbs| {
@@ -97,6 +143,8 @@ impl KernelState {
                 .find(|tcb| tcb.tid.0 == blocked_tid)
                 .ok_or(KernelError::TaskMissing)?;
             tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
+            tcb.ipc_timeout_deadline = deadline;
+            tcb.ipc_timeout_fired = false;
             Ok::<_, KernelError>(())
         })?;
         self.enqueue_sender_waiter(
@@ -124,6 +172,7 @@ impl KernelState {
                 tcb.status = TaskStatus::Runnable;
                 Ok::<_, KernelError>(())
             })?;
+            self.clear_ipc_timeout_for_tid(waiter_tid.0)?;
             self.enqueue_task(waiter_tid.0)?;
         }
         Ok(())
@@ -139,7 +188,72 @@ impl KernelState {
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
+        self.clear_ipc_timeout_for_tid(sender_tid.0)?;
         self.enqueue_task(sender_tid.0).map(|_| ())
+    }
+
+    pub(crate) fn process_ipc_timeout_deadlines(
+        &mut self,
+        now_tick: u64,
+    ) -> Result<usize, KernelError> {
+        let mut expired = [None; super::MAX_TASKS];
+        let mut expired_count = 0usize;
+        self.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                let Some(deadline) = tcb.ipc_timeout_deadline else {
+                    continue;
+                };
+                let blocked_ipc = matches!(
+                    tcb.status,
+                    TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                        | TaskStatus::Blocked(WaitReason::EndpointSend(_))
+                );
+                if !blocked_ipc {
+                    continue;
+                }
+                if now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline {
+                    tcb.status = TaskStatus::Runnable;
+                    tcb.ipc_timeout_deadline = None;
+                    tcb.ipc_timeout_fired = true;
+                    if expired_count < expired.len() {
+                        expired[expired_count] = Some(tcb.tid);
+                        expired_count += 1;
+                    }
+                }
+            }
+            Ok::<_, KernelError>(())
+        })?;
+
+        if expired_count == 0 {
+            return Ok(0);
+        }
+
+        self.with_ipc_state_mut(|ipc| {
+            for tid in expired.iter().flatten().copied() {
+                for waiter in ipc.endpoint_waiters.iter_mut() {
+                    if *waiter == Some(tid) {
+                        *waiter = None;
+                    }
+                }
+                for queue in ipc.endpoint_sender_waiters.iter_mut() {
+                    for slot in queue.iter_mut() {
+                        if slot.as_ref().is_some_and(|w| w.tid == tid) {
+                            *slot = None;
+                        }
+                    }
+                }
+                for waiter in ipc.notification_waiters.iter_mut() {
+                    if *waiter == Some(tid) {
+                        *waiter = None;
+                    }
+                }
+            }
+        });
+
+        for tid in expired.iter().flatten().copied() {
+            let _ = self.enqueue_task(tid.0)?;
+        }
+        Ok(expired_count)
     }
 
     pub(crate) fn resolve_endpoint_index(&self, object: CapObject) -> Result<usize, KernelError> {
@@ -163,8 +277,103 @@ impl KernelState {
             | CapObject::MemoryObject { .. }
             | CapObject::DmaRegion { .. }
             | CapObject::Notification { .. }
+            | CapObject::Reply { .. }
             | CapObject::Irq { .. } => Err(KernelError::WrongObject),
         }
+    }
+
+    fn resolve_reply_index(&self, object: CapObject) -> Result<usize, KernelError> {
+        match object {
+            CapObject::Reply { index, generation } => self.with_ipc_state(|ipc| {
+                if index >= super::MAX_REPLY_CAPS {
+                    return Err(KernelError::WrongObject);
+                }
+                if ipc.reply_caps[index].is_none() || ipc.reply_cap_generations[index] != generation
+                {
+                    return Err(KernelError::StaleCapability);
+                }
+                Ok(index)
+            }),
+            _ => Err(KernelError::WrongObject),
+        }
+    }
+
+    pub fn create_reply_cap_for_caller(
+        &mut self,
+        caller_tid: ThreadId,
+        caller_reply_recv_cap: CapId,
+        responder_tid: Option<ThreadId>,
+    ) -> Result<CapId, KernelError> {
+        let reply_capability =
+            self.resolve_capability_for_task(caller_tid.0, caller_reply_recv_cap)?;
+        if !reply_capability.has_right(CapRights::RECEIVE) {
+            return Err(KernelError::MissingRight);
+        }
+        let reply_endpoint = match reply_capability.object {
+            CapObject::Endpoint { .. } => reply_capability.object,
+            _ => return Err(KernelError::WrongObject),
+        };
+
+        let (slot, generation) = self.with_ipc_state_mut(|ipc| {
+            for idx in 0..super::MAX_REPLY_CAPS {
+                if ipc.reply_caps[idx].is_none() {
+                    let mut next_generation = ipc.reply_cap_generations[idx].wrapping_add(1);
+                    if next_generation == 0 {
+                        next_generation = 1;
+                    }
+                    ipc.reply_cap_generations[idx] = next_generation;
+                    ipc.reply_caps[idx] = Some(ReplyCapRecord {
+                        caller_tid,
+                        reply_endpoint,
+                        responder_tid,
+                    });
+                    return Ok::<_, KernelError>((idx, next_generation));
+                }
+            }
+            Err(KernelError::CapabilityFull)
+        })?;
+
+        self.mint_capability_for_active_cnode(Capability::new(
+            CapObject::Reply {
+                index: slot,
+                generation,
+            },
+            CapRights::SEND,
+        ))
+    }
+
+    pub fn ipc_reply(&mut self, reply_cap: CapId, msg: Message) -> Result<(), KernelError> {
+        let capability = self.resolve_send_cap_task_local(reply_cap)?;
+        if !capability.has_right(CapRights::SEND) {
+            return Err(KernelError::MissingRight);
+        }
+        let slot = self.resolve_reply_index(capability.object)?;
+        let replier_tid = ThreadId(self.current_tid().ok_or(KernelError::TaskMissing)?);
+        let allowed = self.with_ipc_state(|ipc| {
+            let rec = ipc.reply_caps[slot].ok_or(KernelError::StaleCapability)?;
+            Ok::<_, KernelError>(rec.responder_tid.is_none_or(|tid| tid == replier_tid))
+        })?;
+        if !allowed {
+            return Err(KernelError::MissingRight);
+        }
+        let record = self.with_ipc_state_mut(|ipc| {
+            let rec = ipc.reply_caps[slot].ok_or(KernelError::StaleCapability)?;
+            ipc.reply_caps[slot] = None;
+            Ok::<_, KernelError>(rec)
+        })?;
+
+        let endpoint_idx = self.resolve_endpoint_index(record.reply_endpoint)?;
+        let endpoint = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?;
+        endpoint
+            .send(msg)
+            .map_err(|_| KernelError::EndpointQueueFull)?;
+        self.wake_waiter_for_endpoint(endpoint_idx)?;
+        Ok(())
     }
 
     pub fn destroy_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {
@@ -343,9 +552,7 @@ impl KernelState {
         let notif = self.ipc.notifications[notification_idx]
             .as_mut()
             .ok_or(KernelError::WrongObject)?;
-        let payload = irq_line.to_le_bytes();
-        let msg = Message::with_header(0, irq_line, 0, None, &payload).map_err(map_ipc_error)?;
-        notif.send(msg)?;
+        notif.send_irq(irq_line)?;
         if let Some(waiter_tid) = self.ipc.notification_waiters[notification_idx].take() {
             self.with_tcbs_mut(|tcbs| {
                 let tcb = tcbs
@@ -372,6 +579,29 @@ impl KernelState {
     }
 
     pub fn ipc_send(&mut self, send_cap: CapId, msg: Message) -> Result<(), KernelError> {
+        self.ipc_send_with_optional_deadline(send_cap, msg, None)
+    }
+
+    pub fn ipc_send_with_deadline(
+        &mut self,
+        send_cap: CapId,
+        msg: Message,
+        timeout_ticks: u64,
+    ) -> Result<(), KernelError> {
+        let deadline = if timeout_ticks == 0 {
+            None
+        } else {
+            Some(self.scheduler_tick_now().wrapping_add(timeout_ticks))
+        };
+        self.ipc_send_with_optional_deadline(send_cap, msg, deadline)
+    }
+
+    fn ipc_send_with_optional_deadline(
+        &mut self,
+        send_cap: CapId,
+        msg: Message,
+        deadline: Option<u64>,
+    ) -> Result<(), KernelError> {
         let capability = self.resolve_send_cap_task_local(send_cap)?;
         if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
@@ -415,7 +645,7 @@ impl KernelState {
                 return Ok(());
             }
 
-            self.block_current_on_send(endpoint_idx, send_cap, msg)?;
+            self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
             self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
             return Err(KernelError::WouldBlock);
         }
@@ -576,6 +806,27 @@ impl KernelState {
     }
 
     pub fn ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
+        self.ipc_recv_with_optional_deadline(recv_cap, None)
+    }
+
+    pub fn ipc_recv_with_deadline(
+        &mut self,
+        recv_cap: CapId,
+        timeout_ticks: u64,
+    ) -> Result<Option<Message>, KernelError> {
+        let deadline = if timeout_ticks == 0 {
+            None
+        } else {
+            Some(self.scheduler_tick_now().wrapping_add(timeout_ticks))
+        };
+        self.ipc_recv_with_optional_deadline(recv_cap, deadline)
+    }
+
+    fn ipc_recv_with_optional_deadline(
+        &mut self,
+        recv_cap: CapId,
+        deadline: Option<u64>,
+    ) -> Result<Option<Message>, KernelError> {
         let capability = self.resolve_recv_cap_task_local(recv_cap)?;
         if !capability.has_right(CapRights::RECEIVE) {
             return Err(KernelError::MissingRight);
@@ -596,6 +847,8 @@ impl KernelState {
                     .find(|tcb| tcb.tid.0 == blocked_tid)
                     .ok_or(KernelError::TaskMissing)?;
                 tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+                tcb.ipc_timeout_deadline = deadline;
+                tcb.ipc_timeout_fired = false;
                 Ok::<_, KernelError>(())
             })?;
             self.ipc.notification_waiters[notif_idx] = Some(ThreadId(blocked_tid));
@@ -632,7 +885,7 @@ impl KernelState {
             return Ok(Some(waiter.msg));
         }
 
-        self.block_current_on_receive(endpoint_idx, recv_cap)?;
+        self.block_current_on_receive_with_deadline(endpoint_idx, recv_cap, deadline)?;
         Ok(None)
     }
 }

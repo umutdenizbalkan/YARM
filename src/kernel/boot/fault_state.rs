@@ -14,9 +14,8 @@ const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
 
 impl KernelState {
     fn emit_fault_report(&mut self, faulted_tid: u64) {
-        let (endpoint_idx, fault) = self.with_fault_state(|faults| {
-            (faults.fault_handler_endpoint, faults.last_fault)
-        });
+        let (endpoint_idx, fault) =
+            self.with_fault_state(|faults| (faults.fault_handler_endpoint, faults.last_fault));
         let Some(endpoint_idx) = endpoint_idx else {
             return;
         };
@@ -100,6 +99,10 @@ impl KernelState {
                 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
                 crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);
                 let (_tick, should_preempt) = self.tick_scheduler_timer();
+                let _ = self
+                    .process_ipc_timeout_deadlines(_tick.0)
+                    .map_err(SyscallError::from)
+                    .map_err(TrapHandleError::Syscall)?;
                 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
                 crate::yarm_log!(
                     "YARM_SCHED_TICK cpu={} tick={} preempt={}",

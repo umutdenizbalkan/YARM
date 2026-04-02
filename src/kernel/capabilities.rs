@@ -89,6 +89,7 @@ pub enum CapObject {
     MemoryObject { id: u64 },
     DmaRegion { id: u64, offset: u64, len: u64 },
     Notification { index: usize, generation: u64 },
+    Reply { index: usize, generation: u64 },
     Irq { line: u16 },
 }
 

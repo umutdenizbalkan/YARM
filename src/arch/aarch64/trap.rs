@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use crate::arch::trap::{FaultAccess, FaultInfo, TrapEvent};
 use crate::kernel::boot::{KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
 #[cfg(test)]
 use crate::kernel::scheduler::MAX_CPUS;
-use crate::arch::trap::{FaultAccess, FaultInfo, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::VirtAddr;
 

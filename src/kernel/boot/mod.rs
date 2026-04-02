@@ -122,6 +122,7 @@ const MAX_DRIVER_DMA_CAPS: usize = 8;
 const MAX_TRANSFER_ENVELOPES: usize = 256;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_TRANSFER_ENVELOPES: usize = 64;
+const MAX_REPLY_CAPS: usize = MAX_TASKS;
 #[cfg(feature = "hosted-dev")]
 const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
 #[cfg(not(feature = "hosted-dev"))]
@@ -293,27 +294,44 @@ struct MemoryObject {
 
 #[derive(Debug)]
 struct NotificationObject {
-    queue: KernelStorage<Endpoint>,
+    irq_queue: [u16; crate::kernel::ipc::MAX_ENDPOINT_DEPTH],
+    head: usize,
+    len: usize,
+    max_depth: usize,
 }
 
 impl NotificationObject {
     fn new(max_depth: usize) -> Result<Self, KernelError> {
-        let endpoint =
-            Endpoint::new_with_mode(max_depth, crate::kernel::ipc::EndpointMode::Buffered)
-                .map_err(map_ipc_error)?;
+        if max_depth == 0 || max_depth > crate::kernel::ipc::MAX_ENDPOINT_DEPTH {
+            return Err(KernelError::WrongObject);
+        }
         Ok(Self {
-            queue: store_kernel_value(endpoint),
+            irq_queue: [0; crate::kernel::ipc::MAX_ENDPOINT_DEPTH],
+            head: 0,
+            len: 0,
+            max_depth,
         })
     }
 
-    fn send(&mut self, msg: Message) -> Result<(), KernelError> {
-        kernel_mut(&mut self.queue)
-            .send(msg)
-            .map_err(|_| KernelError::EndpointQueueFull)
+    fn send_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {
+        if self.len >= self.max_depth {
+            return Err(KernelError::EndpointQueueFull);
+        }
+        let tail = (self.head + self.len) & (crate::kernel::ipc::MAX_ENDPOINT_DEPTH - 1);
+        self.irq_queue[tail] = irq_line;
+        self.len += 1;
+        Ok(())
     }
 
     fn recv(&mut self) -> Option<Message> {
-        kernel_mut(&mut self.queue).recv()
+        if self.len == 0 {
+            return None;
+        }
+        let irq_line = self.irq_queue[self.head];
+        self.head = (self.head + 1) & (crate::kernel::ipc::MAX_ENDPOINT_DEPTH - 1);
+        self.len -= 1;
+        let payload = irq_line.to_le_bytes();
+        Message::with_header(0, irq_line, 0, None, &payload).ok()
     }
 }
 
@@ -407,6 +425,13 @@ struct ActiveTransferMapping {
     len: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplyCapRecord {
+    caller_tid: ThreadId,
+    reply_endpoint: CapObject,
+    responder_tid: Option<ThreadId>,
+}
+
 #[derive(Debug)]
 struct IpcSubsystem {
     cross_cpu_work: SmpMailbox,
@@ -421,6 +446,8 @@ struct IpcSubsystem {
     transfer_envelopes: [Option<TransferEnvelope>; MAX_TRANSFER_ENVELOPES],
     transfer_envelope_generations: [u64; MAX_TRANSFER_ENVELOPES],
     active_transfer_mappings: [Option<ActiveTransferMapping>; MAX_TRANSFER_ENVELOPES],
+    reply_caps: [Option<ReplyCapRecord>; MAX_REPLY_CAPS],
+    reply_cap_generations: [u64; MAX_REPLY_CAPS],
     telemetry: IpcPathTelemetry,
 }
 
@@ -597,6 +624,11 @@ impl KernelState {
 
     #[cfg(test)]
     pub(crate) fn timer_ticks_for_test(&self) -> u64 {
+        let sched = self.scheduler_state.lock();
+        sched.timer.current_ticks().0
+    }
+
+    pub(crate) fn scheduler_tick_now(&self) -> u64 {
         let sched = self.scheduler_state.lock();
         sched.timer.current_ticks().0
     }
@@ -946,6 +978,8 @@ impl Bootstrap {
                 transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
                 transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],
                 active_transfer_mappings: [const { None }; MAX_TRANSFER_ENVELOPES],
+                reply_caps: [const { None }; MAX_REPLY_CAPS],
+                reply_cap_generations: [0; MAX_REPLY_CAPS],
                 telemetry: IpcPathTelemetry::default(),
             }),
             capability: CapabilitySubsystem {
@@ -2165,6 +2199,13 @@ impl KernelState {
                     return None;
                 }
             }
+            CapObject::Reply { index, generation } => {
+                if index >= MAX_REPLY_CAPS
+                    || self.with_ipc_state(|ipc| ipc.reply_cap_generations[index]) != generation
+                {
+                    return None;
+                }
+            }
             _ => {}
         }
         Some(())
@@ -2948,7 +2989,9 @@ mod tests {
         );
         assert_eq!(
             state.task_status(1),
-            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap_task1)))
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(
+                send_cap_task1
+            )))
         );
         if state.current_tid() != Some(2) {
             state.yield_current().expect("switch to task2");
@@ -3079,6 +3122,174 @@ mod tests {
 
         assert_ne!(running_before, running_after);
         assert_eq!(state.task_status(running_after), Some(TaskStatus::Running));
+    }
+
+    #[test]
+    fn ipc_recv_deadline_timeout_wakes_blocked_waiter_on_timer_tick() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_timer_for_test(Timer::new(1));
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch to task1");
+        let blocked_tid = state.current_tid().expect("running tid");
+
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let first = state
+            .ipc_recv_with_deadline(recv_cap, 1)
+            .expect("deadline recv should not fail");
+        assert_eq!(first, None);
+        assert_eq!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap)))
+        );
+
+        state
+            .handle_trap(Trap::TimerInterrupt, None)
+            .expect("timer trap");
+
+        assert!(matches!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Runnable | TaskStatus::Running)
+        ));
+        assert!(
+            state
+                .consume_ipc_timeout_fired_for_tid(blocked_tid)
+                .expect("consume timeout marker"),
+            "timeout marker should be set when deadline wake fires"
+        );
+    }
+
+    #[test]
+    fn ipc_send_deadline_timeout_wakes_blocked_sender_on_timer_tick() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_timer_for_test(Timer::new(1));
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch to task1");
+        let blocked_tid = state.current_tid().expect("running tid");
+
+        let (_eid, send_cap, _recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+        let msg = Message::new(1, b"x").expect("msg");
+        let send_result = state.ipc_send_with_deadline(send_cap, msg, 1);
+        assert_eq!(send_result, Err(KernelError::WouldBlock));
+        assert_eq!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+        );
+
+        state
+            .handle_trap(Trap::TimerInterrupt, None)
+            .expect("timer trap");
+
+        assert!(matches!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Runnable | TaskStatus::Running)
+        ));
+        assert!(
+            state
+                .consume_ipc_timeout_fired_for_tid(blocked_tid)
+                .expect("consume timeout marker"),
+            "timeout marker should be set when send wait times out"
+        );
+    }
+
+    #[test]
+    fn reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+
+        let reply = Message::new(9, b"ok").expect("reply");
+        state.ipc_reply(reply_cap, reply).expect("reply send");
+        let received = state
+            .ipc_recv(recv_cap)
+            .expect("recv")
+            .expect("message expected");
+        assert_eq!(received.sender_tid.0, 9);
+        assert_eq!(received.as_slice(), b"ok");
+
+        let replay = Message::new(9, b"no").expect("replay");
+        assert_eq!(
+            state.ipc_reply(reply_cap, replay),
+            Err(KernelError::StaleCapability)
+        );
+    }
+
+    #[test]
+    fn reply_caps_are_revoked_when_caller_exits() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("create reply cap");
+
+        state.exit_task(1, 7).expect("exit caller");
+
+        let reply = Message::new(9, b"late").expect("reply");
+        assert_eq!(
+            state.ipc_reply(reply_cap, reply),
+            Err(KernelError::StaleCapability)
+        );
+    }
+
+    #[test]
+    fn reply_caps_are_revoked_when_caller_marked_dead() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("create reply cap");
+
+        state.mark_task_dead(1).expect("mark dead");
+
+        let reply = Message::new(9, b"late").expect("reply");
+        assert_eq!(
+            state.ipc_reply(reply_cap, reply),
+            Err(KernelError::StaleCapability)
+        );
+    }
+
+    #[test]
+    fn reply_cap_rejects_use_from_unbound_responder_task() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.register_task(2).expect("task2");
+        state.enqueue_current_cpu(1).expect("enqueue1");
+        state.enqueue_current_cpu(2).expect("enqueue2");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(1)))
+            .expect("create reply cap");
+        let reply_cap_task2 = state
+            .grant_capability_task_to_task(0, reply_cap, 2)
+            .expect("dup reply cap");
+
+        while state.current_tid() != Some(2) {
+            state.yield_current().expect("switch");
+        }
+        let msg = Message::new(2, b"bad").expect("reply");
+        assert_eq!(
+            state.ipc_reply(reply_cap_task2, msg),
+            Err(KernelError::MissingRight)
+        );
     }
 
     #[test]

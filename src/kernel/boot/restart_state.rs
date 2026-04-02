@@ -91,6 +91,7 @@ impl KernelState {
             tcb.restart.token = Some(RestartToken(token));
             Ok::<_, KernelError>(())
         })?;
+        let _ = self.revoke_reply_caps_for_caller(tid);
         self.report_task_exit_to_supervisor(tid, code, token)?;
         if let Some(robust) = robust {
             let stride = core::mem::size_of::<usize>();
@@ -138,6 +139,7 @@ impl KernelState {
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
+        let _ = self.revoke_reply_caps_for_caller(tid);
         self.enqueue_task(tid).map(|_| ())
     }
 
@@ -156,6 +158,7 @@ impl KernelState {
             tcb.restart.token = None;
             Ok::<_, KernelError>(())
         })?;
+        let _ = self.revoke_reply_caps_for_caller(tid);
         let _ = self.release_kernel_context(tid);
         let _ = self.revoke_driver_runtime_caps(tid);
         self.maybe_cleanup_process_cnode_for_pid(process_pid);

@@ -8,10 +8,9 @@ use crate::kernel::supervisor_abi::{
     CoreServiceRegistrationKind, DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert,
     InitAlertKind, RedelegationAckRequest, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
-    SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER,
-    SUPERVISOR_OP_TASK_EXITED, SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusReply,
-    SupervisorStatusRequest, TaskExitedEvent, TransferRevokedEvent, init_alert_message,
-    status_reply_message,
+    SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, SUPERVISOR_OP_TASK_EXITED,
+    SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusReply, SupervisorStatusRequest,
+    TaskExitedEvent, TransferRevokedEvent, init_alert_message, status_reply_message,
 };
 use crate::kernel::time::{TickDuration, TickInstant};
 use crate::services::init::{
@@ -422,8 +421,8 @@ impl SupervisorService {
         while let Some(message) = kernel.try_ipc_recv(self.handoff.supervisor_fault_recv_cap)? {
             match message.opcode {
                 SUPERVISOR_OP_TASK_EXITED => {
-                    let event =
-                        TaskExitedEvent::decode(message.as_slice()).ok_or(KernelError::WrongObject)?;
+                    let event = TaskExitedEvent::decode(message.as_slice())
+                        .ok_or(KernelError::WrongObject)?;
                     let _ = self.handle_task_exit(kernel, event)?;
                 }
                 SUPERVISOR_OP_TRANSFER_REVOKED => {

@@ -392,7 +392,8 @@ impl ProcessManager {
                 #[cfg(test)]
                 {
                     let image = Self::synthetic_elf_image(req.image_id);
-                    let (pid, _) = self.spawn_from_elf_image(req.parent_pid, req.image_id, &image)?;
+                    let (pid, _) =
+                        self.spawn_from_elf_image(req.parent_pid, req.image_id, &image)?;
                     let result = SpawnV2Result { pid };
                     return Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
                         .map_err(|_| ProcessManagerError::Malformed);

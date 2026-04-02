@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# YARM Syscall ABI v6 (Frozen Contract)
+# YARM Syscall ABI v9 (Frozen Contract)
 
-- ABI Version: `6`
-- Syscall count: `5`
+- ABI Version: `9`
+- Syscall count: `8`
 
 ## Syscall numbers
 
@@ -12,6 +12,9 @@
 - `2`: `IpcRecv`
 - `3`: `VmMap` (YARM-native VM map syscall, capability-targeted)
 - `4`: `TransferRelease` (release a recv auto-mapped shared-memory transfer)
+- `5`: `IpcRecvTimeout` (bounded non-blocking receive with scheduler-yield retry budget)
+- `6`: `IpcCall` (send with kernel-minted ephemeral reply-cap transfer)
+- `7`: `IpcReply` (consume reply-cap and send reply to bound caller endpoint)
 
 ## Argument register layout (`args[0..]`)
 
@@ -21,6 +24,36 @@
 - `args[3]`: inline payload lane 0 (kernel/no-ASID path) and recv metadata lane 0
 - `args[4]`: inline payload lane 1 (kernel/no-ASID path) and recv metadata lane 1
 - `args[5]`: optional transfer capability id (`0` or `u64::MAX` => none)
+
+### `IpcRecvTimeout` argument layout
+
+- `args[0]`: receive endpoint capability id
+- `args[1]`: user receive buffer pointer
+- `args[2]`: user receive buffer length
+- `args[3]`: timeout budget in scheduler ticks (`0` means immediate probe)
+- `args[4]`: reserved (must be `0`)
+- `args[5]`: reserved (must be `0`)
+
+`IpcRecvTimeout` semantics:
+
+- `args[3] == 0`: immediate probe, empty queue returns `WouldBlock`.
+- `args[3] > 0`: kernel arms a timed wait-state and returns `TimedOut` when the deadline expires without a message.
+
+### `IpcCall` argument layout
+
+- `args[0]`: send endpoint capability id
+- `args[1]`: payload pointer (user) or inline lane source selector (kernel/no-ASID)
+- `args[2]`: payload length (must be `<= Message::MAX_PAYLOAD`)
+- `args[3..4]`: inline payload lanes for kernel/no-ASID path
+- `args[5]`: caller reply-receive endpoint capability id (kernel mints and transfers ephemeral reply cap)
+
+### `IpcReply` argument layout
+
+- `args[0]`: reply capability id (`CapObject::Reply` with `SEND` right)
+- `args[1]`: payload pointer (user) or inline lane source selector (kernel/no-ASID)
+- `args[2]`: payload length (must be `<= Message::MAX_PAYLOAD`)
+- `args[3..4]`: inline payload lanes for kernel/no-ASID path
+- `args[5]`: reserved (must be `0`)
 
 ### `VmMap` argument layout
 
@@ -47,7 +80,11 @@
 
 - **Synchronous rendezvous-friendly path**: small payloads (up to register lanes) can be passed through register lanes without kernel-side user-buffer copying on kernel/no-ASID paths.
 - **Capability transfer opportunity on each IPC**: send can optionally attach a capability; recv returns transferred cap id in `ret2`.
+- **Inline payload freeze**: `Message::MAX_PAYLOAD` is frozen at **128 bytes** for the current ABI generation.
+- **Medium payload policy** (`129..=1024` bytes): fragmentation protocol (see `IPC_FRAGMENTATION_POLICY.md`).
 - **Large payload shared-memory path**: if send length exceeds `Message::MAX_PAYLOAD`, sender provides a transferable memory capability and kernel sends `OPCODE_SHARED_MEM` metadata (`SharedMemoryRegion { offset, len }`).
+- **Shared-memory recv map intent (optional)**: for user-mode `IpcRecv` on `OPCODE_SHARED_MEM`, `args[4]` may carry map-intent bits (`READ=0x1`, `WRITE=0x2`); `0` keeps default read+write mapping intent. If `WRITE` is requested, transferred capability must also carry `WRITE`.
+- **Shared-memory recv attenuation**: when map-intent omits `WRITE`, receiver-local transferred capability is attenuated to `READ|MAP`.
 
 ## Shared-memory contract freeze (Phase 6)
 
@@ -72,6 +109,7 @@
 - `6`: `QueueFull`
 - `7`: `WouldBlock`
 - `8`: `PageFault`
+- `9`: `TimedOut`
 - `255`: `Internal`
 
 ## Per-ISA shape source of truth

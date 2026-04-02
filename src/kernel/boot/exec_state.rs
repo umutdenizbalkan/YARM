@@ -19,18 +19,18 @@ impl KernelState {
             return Ok(());
         }
 
-        let outgoing_idx = self.with_tcbs(|tcbs| {
-            tcbs
-            .iter()
-            .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == outgoing_tid))
-        })
-        .ok_or(KernelError::TaskMissing)?;
-        let incoming_idx = self.with_tcbs(|tcbs| {
-            tcbs
-            .iter()
-            .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == incoming_tid))
-        })
-        .ok_or(KernelError::TaskMissing)?;
+        let outgoing_idx = self
+            .with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == outgoing_tid))
+            })
+            .ok_or(KernelError::TaskMissing)?;
+        let incoming_idx = self
+            .with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == incoming_tid))
+            })
+            .ok_or(KernelError::TaskMissing)?;
 
         if outgoing_idx == incoming_idx {
             return Ok(());
@@ -55,7 +55,8 @@ impl KernelState {
                 )
             };
 
-            if !outgoing_tcb.kernel_context.initialized || !incoming_tcb.kernel_context.initialized {
+            if !outgoing_tcb.kernel_context.initialized || !incoming_tcb.kernel_context.initialized
+            {
                 return Ok(());
             }
 
