@@ -365,6 +365,12 @@ fn map_shared_region_into_receiver(
     Ok((requested_va, mapped_len))
 }
 
+fn revoke_current_transfer_cap_best_effort(kernel: &mut KernelState, transfer_cap: CapId) {
+    if let Some(cnode) = kernel.current_task_cnode() {
+        let _ = kernel.revoke_capability_in_cnode(cnode, transfer_cap);
+    }
+}
+
 fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     validate_endpoint_right(kernel, cap, CapRights::SEND)?;
@@ -721,6 +727,13 @@ fn handle_ipc_recv_result_with_empty_error(
                     let region_len =
                         usize::try_from(desc.len).map_err(|_| SyscallError::InvalidArgs)?;
                     if user_ptr == 0 || user_len < region_len {
+                        if frame.ret2() as u64 != SYSCALL_NO_TRANSFER_CAP {
+                            revoke_current_transfer_cap_best_effort(
+                                kernel,
+                                CapId(frame.ret2() as u64),
+                            );
+                            encode_transfer_cap_ret(frame, None)?;
+                        }
                         return Err(SyscallError::InvalidArgs);
                     }
                     let transfer_cap_raw =
@@ -729,12 +742,19 @@ fn handle_ipc_recv_result_with_empty_error(
                         return Err(SyscallError::InvalidArgs);
                     }
                     let transfer_cap = CapId(transfer_cap_raw);
-                    let (mapped_va, mapped_len) = map_shared_region_into_receiver(
+                    let (mapped_va, mapped_len) = match map_shared_region_into_receiver(
                         kernel,
                         transfer_cap,
                         user_ptr,
                         region_len,
-                    )?;
+                    ) {
+                        Ok(mapped) => mapped,
+                        Err(err) => {
+                            revoke_current_transfer_cap_best_effort(kernel, transfer_cap);
+                            encode_transfer_cap_ret(frame, None)?;
+                            return Err(err);
+                        }
+                    };
                     kernel
                         .register_active_transfer_mapping(
                             crate::kernel::ipc::ThreadId(receiver_tid),
@@ -742,7 +762,18 @@ fn handle_ipc_recv_result_with_empty_error(
                             VirtAddr(mapped_va as u64),
                             mapped_len,
                         )
-                        .map_err(SyscallError::from)?;
+                        .map_err(|e| {
+                            let mut rollback = mapped_va;
+                            let end = mapped_va.saturating_add(mapped_len);
+                            while rollback < end {
+                                let _ = kernel
+                                    .unmap_user_page_in_current_asid(VirtAddr(rollback as u64));
+                                rollback += PAGE_SIZE;
+                            }
+                            revoke_current_transfer_cap_best_effort(kernel, transfer_cap);
+                            let _ = encode_transfer_cap_ret(frame, None);
+                            SyscallError::from(e)
+                        })?;
                     kernel.note_shared_mem_mapped(mapped_len);
                     frame.set_ok(sender, mapped_len, frame.ret2());
                     frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, mapped_va);
@@ -1320,6 +1351,7 @@ mod tests {
         );
         let err = dispatch(&mut state, &mut recv).expect_err("len budget too small");
         assert_eq!(err, SyscallError::InvalidArgs);
+        assert_eq!(recv.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
     }
 
     #[test]
