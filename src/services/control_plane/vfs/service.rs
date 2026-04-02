@@ -113,15 +113,37 @@ fn roundtrip_ipc<B: VfsBackend>(
     client_recv_cap: CapId,
     request: crate::kernel::ipc::Message,
 ) -> Result<crate::kernel::ipc::Message, VfsError> {
+    roundtrip_ipc_with_budget(
+        kernel,
+        vfs,
+        client_send_cap,
+        server_recv_cap,
+        server_send_cap,
+        client_recv_cap,
+        request,
+        VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS,
+    )
+}
+
+fn roundtrip_ipc_with_budget<B: VfsBackend>(
+    kernel: &mut KernelState,
+    vfs: &mut FsService<B>,
+    client_send_cap: CapId,
+    server_recv_cap: CapId,
+    server_send_cap: CapId,
+    client_recv_cap: CapId,
+    request: crate::kernel::ipc::Message,
+    recv_timeout_ticks: u64,
+) -> Result<crate::kernel::ipc::Message, VfsError> {
     map_kernel_ipc_err(kernel.ipc_send(client_send_cap, request))?;
     let request_for_server = map_kernel_ipc_err(
-        kernel.ipc_recv_with_deadline(server_recv_cap, VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS),
+        kernel.ipc_recv_with_deadline(server_recv_cap, recv_timeout_ticks),
     )?
     .ok_or(VfsError::Malformed)?;
     let response = vfs.handle(request_for_server)?;
     map_kernel_ipc_err(kernel.ipc_send(server_send_cap, response))?;
     map_kernel_ipc_err(
-        kernel.ipc_recv_with_deadline(client_recv_cap, VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS),
+        kernel.ipc_recv_with_deadline(client_recv_cap, recv_timeout_ticks),
     )?
     .ok_or(VfsError::Malformed)
 }
@@ -301,6 +323,34 @@ mod tests {
             .consume_ipc_timeout_fired_for_tid(0)
             .expect("timeout consume");
         assert!(!fired, "no timer tick yet");
+    }
+
+    #[test]
+    fn vfs_roundtrip_accepts_explicit_zero_tick_recv_budget_when_messages_are_queued() {
+        let mut kernel = Bootstrap::init().expect("kernel init");
+        let (client_send, server_recv, server_send, client_recv) = setup_ipc_caps(&mut kernel);
+        let mut vfs = FsService::with_backend(InMemoryBackend::new());
+        let reply = roundtrip_ipc_with_budget(
+            &mut kernel,
+            &mut vfs,
+            client_send,
+            server_recv,
+            server_send,
+            client_recv,
+            openat_message(OpenAtRequest {
+                dirfd: 0,
+                path_ptr: 0x4444,
+                flags: 0,
+                mode: 0,
+            })
+            .expect("open"),
+            0,
+        )
+        .expect("roundtrip");
+        assert_eq!(
+            VfsReply::from_message(reply).expect("decode"),
+            VfsReply::OpenAtFd(3)
+        );
     }
 
     #[test]

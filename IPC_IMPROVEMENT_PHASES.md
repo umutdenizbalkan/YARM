@@ -132,6 +132,13 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Migration guard:
   - added VFS control-plane canary test for timed-receive empty-queue behavior under deadline receive path.
 
+## Phase 6 artifacts (pass 3)
+
+- Timed-recv migration hardening for first service cut (VFS):
+  - `src/services/control_plane/vfs/service.rs` now routes roundtrip receive operations through a budgeted helper (`roundtrip_ipc_with_budget`) so timeout policy is explicit and testable.
+- Migration guard coverage:
+  - added VFS canary validating zero-tick budget behavior on queued request/reply flow.
+
 ## Cross-phase quality gates
 
 - ABI versioning and changelog updates per phase.
