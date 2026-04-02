@@ -38,4 +38,4 @@ This report tracks the closure criteria for **Phase 6 — Service migration and 
 
 - Matrix rows are now marked as `✅ migrated` or `✅ waived (dated)` for all core control-plane services.
 - Exit-gate canaries are active and passing.
-- Phase 6 sign-off recommendation: **complete**, with dated waivers tracked through the September 30, 2026 hard sunset checkpoint.
+- Phase 6 service-slice sign-off recommendation: **ready**, but final closure is gated on outstanding Phase 4 call/reply lifecycle hardening completion.
