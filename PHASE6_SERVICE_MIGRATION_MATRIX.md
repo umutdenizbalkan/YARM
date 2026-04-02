@@ -27,3 +27,4 @@ Status values:
    - ✅ migrated, or
    - explicitly covered by dated deprecation/sunset waiver.
 4. Exit-gate bundle canary in `src/services/control_plane/mod.rs` must remain green for migrated invariants (VFS/process-manager reply-cap + timed receive, supervisor budgeted receive).
+5. `PHASE6_EXIT_GATE_REPORT.md` must be kept current with dated waivers and closure evidence before Phase 6 completion sign-off.
