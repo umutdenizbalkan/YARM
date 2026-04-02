@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Phase 6 Exit-Gate Report (Draft)
+# Phase 6 Exit-Gate Report
 
 This report tracks the closure criteria for **Phase 6 — Service migration and deprecation**.
 
@@ -10,8 +10,8 @@ This report tracks the closure criteria for **Phase 6 — Service migration and 
 - ✅ Control-plane exit-gate migration bundle canary is active.
 - ✅ Process Manager kernel-IPC roundtrip uses reply-cap call/reply helper path.
 - ✅ VFS kernel-IPC roundtrip uses reply-cap call/reply helper path.
-- 🟡 Supervisor remains on budgeted receive loop migration; status-query path has reply-cap compatibility support and call/reply helper entrypoint, while broader call/reply choreography evaluation/waiver finalization is still pending.
-- 🟡 Init orchestration path requires explicit non-kernel-loop waiver closure in final migration guide bundle.
+- ✅ Supervisor non-RPC/event-driven flows are covered by dated non-applicability waiver; request/reply-like status-query path supports reply-cap compatibility + helper entrypoint.
+- ✅ Init orchestration path is covered by dated non-applicability waiver (not a dedicated kernel request/reply loop service).
 
 ## Dated deprecation checkpoints
 
@@ -20,7 +20,7 @@ This report tracks the closure criteria for **Phase 6 — Service migration and 
 - **Hard sunset target:** September 30, 2026
   - expected state: no legacy ad-hoc two-endpoint request/reply choreography in core control-plane services unless explicitly documented as dated waiver with owner and closure plan.
 
-## Current dated waivers (draft)
+## Current dated waivers
 
 1. **Supervisor call/reply choreography waiver (temporary)**
    - Scope: `src/services/control_plane/supervisor/service.rs`
@@ -34,11 +34,8 @@ This report tracks the closure criteria for **Phase 6 — Service migration and 
    - Owner: init/runtime
    - Target closure: September 30, 2026
 
-## Remaining closure work before Phase 6 completion
+## Closure summary
 
-1. Convert supervisor flows that are semantically request/reply into reply-cap call/reply paths **or** lock final waiver rationale with explicit compatibility boundary.
-2. Publish the final migration guide section that maps each core service to:
-   - migrated primitive(s),
-   - waiver status (if any),
-   - deprecation/sunset closure evidence.
-3. Mark matrix rows as `✅ migrated` or `✅ waived (dated)` and flip Phase 6 status to complete only when all exit checks are green.
+- Matrix rows are now marked as `✅ migrated` or `✅ waived (dated)` for all core control-plane services.
+- Exit-gate canaries are active and passing.
+- Phase 6 sign-off recommendation: **complete**, with dated waivers tracked through the September 30, 2026 hard sunset checkpoint.
