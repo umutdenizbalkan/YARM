@@ -13,7 +13,7 @@ pub const MAX_IRQ_LINES: usize = 64;
 pub const MAX_CPUS: usize = 64;
 
 pub const BOOTSTRAP_CPU_ID: u8 = 0;
-pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 10;
+pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 50_000_000;
 pub const PROFILE_IS_PLACEHOLDER: bool = true;
 
 pub const LAPIC_MMIO_BASE: usize = 0xFEE0_0000;

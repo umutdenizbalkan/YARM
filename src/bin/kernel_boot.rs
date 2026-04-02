@@ -88,7 +88,8 @@ fn log_pvh_boot_metadata(start_info_ptr: usize) {
             first_module_size = first.size;
             if first.cmdline_paddr != 0 {
                 let cmd_ptr = first.cmdline_paddr as *const u8;
-                let cmdline = unsafe { core::slice::from_raw_parts(cmd_ptr, MAX_PVH_CMDLINE_BYTES) };
+                let cmdline =
+                    unsafe { core::slice::from_raw_parts(cmd_ptr, MAX_PVH_CMDLINE_BYTES) };
                 for &b in cmdline {
                     if b == 0 {
                         break;
@@ -304,11 +305,9 @@ fn run_boot_markers() {
 fn run_process_vfs_smoke() {
     yarm::yarm_log!("YARM_INIT_START");
     let mut kernel = Bootstrap::init().expect("init");
-    let summary = init::run_minimum_profile_with_kernel(
-        &mut kernel,
-        init::InitRuntimeBootConfig::baseline(),
-    )
-    .expect("minimum runnable profile");
+    let summary =
+        init::run_minimum_profile_with_kernel(&mut kernel, init::InitRuntimeBootConfig::baseline())
+            .expect("minimum runnable profile");
     let dispatched = kernel.dispatch_ready_task().expect("dispatch");
     yarm::yarm_log!(
         "YARM_INIT_RUNTIME phase={:?} supervisor_managed={} initramfs_reads={} dispatched_tid={:?}",
@@ -340,6 +339,8 @@ fn main() {
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_main(start_info_ptr: usize) -> ! {
+    #[cfg(target_arch = "x86_64")]
+    yarm::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
     #[cfg(target_arch = "x86_64")]
     yarm::arch::x86_64::console::write_line("KM0");
     #[cfg(target_arch = "x86_64")]
