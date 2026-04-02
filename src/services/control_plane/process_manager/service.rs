@@ -243,4 +243,17 @@ mod tests {
         assert_eq!(summary.waited_exit, 9);
         assert_eq!(summary.handled, 3);
     }
+
+    #[test]
+    fn process_manager_source_guardrail_prefers_budgeted_timed_receive_path() {
+        let src = include_str!("service.rs");
+        assert!(
+            src.contains("roundtrip_ipc_with_budget"),
+            "process-manager migration should keep budgeted roundtrip helper"
+        );
+        assert!(
+            src.contains("ipc_recv_with_deadline"),
+            "process-manager migration should keep timed receive call-sites"
+        );
+    }
 }

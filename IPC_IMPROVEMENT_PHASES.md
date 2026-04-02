@@ -12,7 +12,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
 - ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
-- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–10 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze + control-plane-wide nonblocking regression expansion + process-manager kernel-IPC timed-recv migration; full core-service cutover/deprecation sunset pending).
+- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–11 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze + control-plane-wide nonblocking regression expansion + process-manager kernel-IPC timed-recv migration + process-manager source guardrails; full core-service cutover/deprecation sunset pending).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -226,6 +226,11 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - PR-6.2 receive-loop migration slice:
   - `src/services/control_plane/process_manager/service.rs` now includes a kernel-IPC roundtrip loop (`run_request_loop_over_kernel_ipc`) that uses timed receive (`ipc_recv_with_deadline`) with explicit receive budget.
   - migration coverage now includes a dedicated process-manager kernel-IPC request-loop test to keep timed-recv path behavior under regression guard.
+
+## Phase 6 artifacts (pass 11)
+
+- PR-6.2 guardrail hardening for migrated process-manager path:
+  - `src/services/control_plane/process_manager/service.rs` now includes a source-level canary requiring budgeted roundtrip helper usage and timed receive (`ipc_recv_with_deadline`) call-sites in the migrated kernel-IPC loop.
 
 ## Cross-phase quality gates
 
