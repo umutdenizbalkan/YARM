@@ -101,6 +101,7 @@
 - **Removal gate**: legacy request/reply choreography removal is deferred until all core control-plane services are migrated and Phase 6 exit criteria are met.
 - **Current migration snapshot**: Phase 6 pass 2 migrates the VFS control-plane kernel-IPC roundtrip receive path to bounded timed receives (`IpcRecvTimeout`-equivalent kernel deadline receive), establishing the first service-level cut.
 - **Current migration snapshot (pass 3)**: VFS migration path now uses an explicit receive-budget helper for timed queue draining, including zero-tick budget coverage for already-queued request/reply flow.
+- **Current migration snapshot (pass 4)**: VFS migration includes a deprecation guardrail test that blocks regression to legacy blocking `IpcRecv` usage in the migrated control-plane roundtrip path.
 
 ## Return layout
 

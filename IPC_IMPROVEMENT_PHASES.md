@@ -139,6 +139,13 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Migration guard coverage:
   - added VFS canary validating zero-tick budget behavior on queued request/reply flow.
 
+## Phase 6 artifacts (pass 4)
+
+- Deprecation guardrail for migrated service:
+  - `src/services/control_plane/vfs/service.rs` now includes a source-level canary test that rejects regressions back to legacy blocking `ipc_recv` in the VFS control-plane roundtrip flow.
+- Compatibility validation checkpoint:
+  - pass-2 and pass-3 VFS timed-recv path tests remain green alongside the new deprecation guardrail.
+
 ## Cross-phase quality gates
 
 - ABI versioning and changelog updates per phase.

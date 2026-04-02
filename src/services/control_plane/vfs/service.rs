@@ -354,6 +354,20 @@ mod tests {
     }
 
     #[test]
+    fn vfs_source_guardrail_blocks_legacy_blocking_ipc_recv_regression() {
+        let src = include_str!("service.rs");
+        let legacy_call = ["kernel", ".ipc_recv", "("].concat();
+        assert!(
+            src.contains("ipc_recv_with_deadline("),
+            "phase6 migration requires timed receive path in vfs service"
+        );
+        assert!(
+            !src.contains(legacy_call.as_str()),
+            "legacy blocking ipc_recv path is deprecated for migrated vfs control-plane flow"
+        );
+    }
+
+    #[test]
     fn vfs_run_with_kernel_ipc_bootstraps_server_loop() {
         let mut kernel = Bootstrap::init().expect("kernel init");
         let summary = run_with_kernel_ipc(&mut kernel, 0x1010).expect("loop");
