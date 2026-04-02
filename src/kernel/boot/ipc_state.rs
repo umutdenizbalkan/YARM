@@ -3,7 +3,7 @@
 
 use super::{
     IpcFastpathResult, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
-    NotificationObject, SenderWaiter, map_ipc_error,
+    NotificationObject, ReplyCapRecord, SenderWaiter, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
@@ -258,8 +258,91 @@ impl KernelState {
             | CapObject::MemoryObject { .. }
             | CapObject::DmaRegion { .. }
             | CapObject::Notification { .. }
+            | CapObject::Reply { .. }
             | CapObject::Irq { .. } => Err(KernelError::WrongObject),
         }
+    }
+
+    fn resolve_reply_index(&self, object: CapObject) -> Result<usize, KernelError> {
+        match object {
+            CapObject::Reply { index, generation } => self.with_ipc_state(|ipc| {
+                if index >= super::MAX_REPLY_CAPS {
+                    return Err(KernelError::WrongObject);
+                }
+                if ipc.reply_caps[index].is_none() || ipc.reply_cap_generations[index] != generation {
+                    return Err(KernelError::StaleCapability);
+                }
+                Ok(index)
+            }),
+            _ => Err(KernelError::WrongObject),
+        }
+    }
+
+    pub fn create_reply_cap_for_caller(
+        &mut self,
+        caller_tid: ThreadId,
+        caller_reply_recv_cap: CapId,
+    ) -> Result<CapId, KernelError> {
+        let reply_capability = self.resolve_capability_for_task(caller_tid.0, caller_reply_recv_cap)?;
+        if !reply_capability.has_right(CapRights::RECEIVE) {
+            return Err(KernelError::MissingRight);
+        }
+        let reply_endpoint = match reply_capability.object {
+            CapObject::Endpoint { .. } => reply_capability.object,
+            _ => return Err(KernelError::WrongObject),
+        };
+
+        let (slot, generation) = self.with_ipc_state_mut(|ipc| {
+            for idx in 0..super::MAX_REPLY_CAPS {
+                if ipc.reply_caps[idx].is_none() {
+                    let mut next_generation = ipc.reply_cap_generations[idx].wrapping_add(1);
+                    if next_generation == 0 {
+                        next_generation = 1;
+                    }
+                    ipc.reply_cap_generations[idx] = next_generation;
+                    ipc.reply_caps[idx] = Some(ReplyCapRecord {
+                        caller_tid,
+                        reply_endpoint,
+                    });
+                    return Ok::<_, KernelError>((idx, next_generation));
+                }
+            }
+            Err(KernelError::CapabilityFull)
+        })?;
+
+        self.mint_capability_for_active_cnode(Capability::new(
+            CapObject::Reply {
+                index: slot,
+                generation,
+            },
+            CapRights::SEND,
+        ))
+    }
+
+    pub fn ipc_reply(&mut self, reply_cap: CapId, msg: Message) -> Result<(), KernelError> {
+        let capability = self.resolve_send_cap_task_local(reply_cap)?;
+        if !capability.has_right(CapRights::SEND) {
+            return Err(KernelError::MissingRight);
+        }
+        let slot = self.resolve_reply_index(capability.object)?;
+        let record = self.with_ipc_state_mut(|ipc| {
+            let rec = ipc.reply_caps[slot].ok_or(KernelError::StaleCapability)?;
+            ipc.reply_caps[slot] = None;
+            Ok::<_, KernelError>(rec)
+        })?;
+
+        let endpoint_idx = self.resolve_endpoint_index(record.reply_endpoint)?;
+        let endpoint = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?;
+        endpoint
+            .send(msg)
+            .map_err(|_| KernelError::EndpointQueueFull)?;
+        self.wake_waiter_for_endpoint(endpoint_idx)?;
+        Ok(())
     }
 
     pub fn destroy_endpoint(&mut self, endpoint_idx: usize) -> Result<(), KernelError> {

@@ -122,6 +122,7 @@ const MAX_DRIVER_DMA_CAPS: usize = 8;
 const MAX_TRANSFER_ENVELOPES: usize = 256;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_TRANSFER_ENVELOPES: usize = 64;
+const MAX_REPLY_CAPS: usize = MAX_TASKS;
 #[cfg(feature = "hosted-dev")]
 const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
 #[cfg(not(feature = "hosted-dev"))]
@@ -424,6 +425,12 @@ struct ActiveTransferMapping {
     len: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplyCapRecord {
+    caller_tid: ThreadId,
+    reply_endpoint: CapObject,
+}
+
 #[derive(Debug)]
 struct IpcSubsystem {
     cross_cpu_work: SmpMailbox,
@@ -438,6 +445,8 @@ struct IpcSubsystem {
     transfer_envelopes: [Option<TransferEnvelope>; MAX_TRANSFER_ENVELOPES],
     transfer_envelope_generations: [u64; MAX_TRANSFER_ENVELOPES],
     active_transfer_mappings: [Option<ActiveTransferMapping>; MAX_TRANSFER_ENVELOPES],
+    reply_caps: [Option<ReplyCapRecord>; MAX_REPLY_CAPS],
+    reply_cap_generations: [u64; MAX_REPLY_CAPS],
     telemetry: IpcPathTelemetry,
 }
 
@@ -968,6 +977,8 @@ impl Bootstrap {
                 transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
                 transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],
                 active_transfer_mappings: [const { None }; MAX_TRANSFER_ENVELOPES],
+                reply_caps: [const { None }; MAX_REPLY_CAPS],
+                reply_cap_generations: [0; MAX_REPLY_CAPS],
                 telemetry: IpcPathTelemetry::default(),
             }),
             capability: CapabilitySubsystem {
@@ -2187,6 +2198,13 @@ impl KernelState {
                     return None;
                 }
             }
+            CapObject::Reply { index, generation } => {
+                if index >= MAX_REPLY_CAPS
+                    || self.with_ipc_state(|ipc| ipc.reply_cap_generations[index]) != generation
+                {
+                    return None;
+                }
+            }
             _ => {}
         }
         Some(())
@@ -3171,6 +3189,30 @@ mod tests {
                 .consume_ipc_timeout_fired_for_tid(blocked_tid)
                 .expect("consume timeout marker"),
             "timeout marker should be set when send wait times out"
+        );
+    }
+
+    #[test]
+    fn reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap)
+            .expect("create reply cap");
+
+        let reply = Message::new(9, b"ok").expect("reply");
+        state.ipc_reply(reply_cap, reply).expect("reply send");
+        let received = state
+            .ipc_recv(recv_cap)
+            .expect("recv")
+            .expect("message expected");
+        assert_eq!(received.sender_tid.0, 9);
+        assert_eq!(received.as_slice(), b"ok");
+
+        let replay = Message::new(9, b"no").expect("replay");
+        assert_eq!(
+            state.ipc_reply(reply_cap, replay),
+            Err(KernelError::StaleCapability)
         );
     }
 

@@ -10,7 +10,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 1 — Payload capacity and framing policy** (completed in this pass).
 - ✅ **Phase 2 — Real IPC timeout semantics** (completed in this pass).
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
-- 🟡 **Phase 4 — Call/Reply capability model** (started in this pass; design and implementation slices documented, kernel object/syscall wiring still pending).
+- 🟡 **Phase 4 — Call/Reply capability model** (Slice 1 implemented in this pass: reply-cap object model + single-use record lifecycle; syscall call/reply wiring still pending).
 - ⏳ **Phases 5–6** (not implemented yet).
 
 ## Phase 0 — Baseline and rollback guardrails
@@ -129,3 +129,6 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 
 - Call/reply capability execution plan:
   - `PHASE4_CALL_REPLY_CAP_PLAN.md`
+- Slice 1 implementation:
+  - `CapObject::Reply` kernel object variant and generation-protected reply-cap record table.
+  - `create_reply_cap_for_caller(...)` and single-use `ipc_reply(...)` path.
