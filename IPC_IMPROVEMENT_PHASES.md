@@ -169,6 +169,19 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Gate reinforcement:
   - pass-7 guardrail complements per-service guard tests by asserting migration invariants at the control-plane module boundary.
 
+## Phase 6 remaining work (open items)
+
+- Core-service migration completion:
+  - migrate remaining control-plane services (beyond VFS + supervisor receive-loop) to timed receive and/or call/reply primitives where applicable.
+- Legacy choreography deprecation sunset:
+  - replace remaining ad-hoc two-endpoint request/reply patterns in core services, then set and publish a concrete removal target release/date for legacy flow.
+- Migration-guide completion:
+  - publish an operator/developer-facing migration guide with per-service status, required syscall primitive, and compatibility window closure criteria.
+- Exit-criteria closure bundle:
+  - add/refresh an explicit Phase 6 exit-gate test bundle that demonstrates:
+    - all core control-plane services use migrated receive/call-reply paths,
+    - deprecated paths are either removed or marked with a dated sunset policy.
+
 ## Cross-phase quality gates
 
 - ABI versioning and changelog updates per phase.
