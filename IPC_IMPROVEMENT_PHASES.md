@@ -12,7 +12,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
 - ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
-- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–8 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze; full core-service cutover/deprecation sunset pending).
+- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–9 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze + control-plane-wide nonblocking regression expansion; full core-service cutover/deprecation sunset pending).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -214,6 +214,12 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Core-service inventory + migration matrix freeze (PR-6.1):
   - added `PHASE6_SERVICE_MIGRATION_MATRIX.md` with per-service current state, target primitive, owner, risk, status, and planned PR sequence.
   - matrix now serves as the canonical tracker for remaining Phase 6 implementation slices.
+
+## Phase 6 artifacts (pass 9)
+
+- PR-6.2 guardrail expansion slice:
+  - `src/services/control_plane/mod.rs` now extends the control-plane source guardrail to include `init` and `process_manager` service sources in addition to VFS + supervisor.
+  - the guardrail rejects regressions to legacy blocking `kernel.ipc_recv` usage across all current core control-plane service modules.
 
 ## Cross-phase quality gates
 
