@@ -200,21 +200,6 @@ pub enum EndpointMode {
     Synchronous,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EndpointClass {
-    ControlPlane,
-    DataPlane,
-}
-
-impl EndpointClass {
-    pub const fn default_depth(self) -> usize {
-        match self {
-            Self::ControlPlane => 8,
-            Self::DataPlane => MAX_ENDPOINT_DEPTH,
-        }
-    }
-}
-
 pub const MAX_ENDPOINT_DEPTH: usize = 64;
 const _: () = assert!(
     MAX_ENDPOINT_DEPTH.is_power_of_two(),
@@ -228,27 +213,14 @@ pub struct Endpoint {
     len: usize,
     max_depth: usize,
     mode: EndpointMode,
-    class: EndpointClass,
 }
 
 impl Endpoint {
     pub fn new(max_depth: usize) -> Result<Self, IpcError> {
-        Self::new_with_mode_and_class(max_depth, EndpointMode::Buffered, EndpointClass::DataPlane)
+        Self::new_with_mode(max_depth, EndpointMode::Buffered)
     }
 
     pub fn new_with_mode(max_depth: usize, mode: EndpointMode) -> Result<Self, IpcError> {
-        Self::new_with_mode_and_class(max_depth, mode, EndpointClass::DataPlane)
-    }
-
-    pub fn new_with_class(class: EndpointClass, mode: EndpointMode) -> Result<Self, IpcError> {
-        Self::new_with_mode_and_class(class.default_depth(), mode, class)
-    }
-
-    pub fn new_with_mode_and_class(
-        max_depth: usize,
-        mode: EndpointMode,
-        class: EndpointClass,
-    ) -> Result<Self, IpcError> {
         if max_depth == 0 || max_depth > MAX_ENDPOINT_DEPTH {
             return Err(IpcError::InvalidEndpointDepth);
         }
@@ -259,16 +231,11 @@ impl Endpoint {
             len: 0,
             max_depth,
             mode,
-            class,
         })
     }
 
     pub fn mode(&self) -> EndpointMode {
         self.mode
-    }
-
-    pub fn class(&self) -> EndpointClass {
-        self.class
     }
 
     pub fn send(&mut self, msg: Message) -> Result<(), IpcError> {
