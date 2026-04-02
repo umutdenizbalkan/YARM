@@ -110,5 +110,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 
 - Tick-budget timeout receive syscall semantics:
   - `src/kernel/syscall.rs` (`IpcRecvTimeout` now interprets `args[3]` as timeout ticks).
+- Timeout expiry result semantics:
+  - non-zero timeout expiry now returns `TimedOut` (distinct from `WouldBlock`).
 - ABI doc update:
   - `SYSCALL_ABI.md` (`IpcRecvTimeout` args[3] documented as timeout ticks).

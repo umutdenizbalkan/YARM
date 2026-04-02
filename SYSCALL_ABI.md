@@ -84,6 +84,7 @@
 - `6`: `QueueFull`
 - `7`: `WouldBlock`
 - `8`: `PageFault`
+- `9`: `TimedOut`
 - `255`: `Internal`
 
 ## Per-ISA shape source of truth

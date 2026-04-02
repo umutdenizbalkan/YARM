@@ -85,6 +85,7 @@ pub enum SyscallError {
     QueueFull = 6,
     WouldBlock = 7,
     PageFault = 8,
+    TimedOut = 9,
     Internal = 255,
 }
 
@@ -518,18 +519,37 @@ fn handle_ipc_recv_timeout(
     let user_len = frame.arg(SYSCALL_ARG_LEN);
     let start_tick = kernel.scheduler_tick_now();
     let mut received;
+    let mut timed_out = false;
+    let mut yielded_steps = 0u64;
     loop {
         received = kernel.try_ipc_recv(cap).map_err(SyscallError::from)?;
         if received.is_some() {
             break;
         }
         let now = kernel.scheduler_tick_now();
-        if timeout_ticks == 0 || now.wrapping_sub(start_tick) >= timeout_ticks {
+        if timeout_ticks == 0
+            || now.wrapping_sub(start_tick) >= timeout_ticks
+            || yielded_steps >= timeout_ticks
+        {
+            timed_out = timeout_ticks != 0;
             break;
         }
         kernel.yield_current().map_err(SyscallError::from)?;
+        yielded_steps = yielded_steps.saturating_add(1);
     }
-    handle_ipc_recv_result(kernel, frame, endpoint, user_ptr, user_len, received)
+    handle_ipc_recv_result_with_empty_error(
+        kernel,
+        frame,
+        endpoint,
+        user_ptr,
+        user_len,
+        received,
+        if timed_out {
+            SyscallError::TimedOut
+        } else {
+            SyscallError::WouldBlock
+        },
+    )
 }
 
 fn handle_ipc_recv_result(
@@ -539,6 +559,26 @@ fn handle_ipc_recv_result(
     user_ptr: usize,
     user_len: usize,
     received: Option<Message>,
+) -> Result<(), SyscallError> {
+    handle_ipc_recv_result_with_empty_error(
+        kernel,
+        frame,
+        endpoint,
+        user_ptr,
+        user_len,
+        received,
+        SyscallError::WouldBlock,
+    )
+}
+
+fn handle_ipc_recv_result_with_empty_error(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+    endpoint: CapObject,
+    user_ptr: usize,
+    user_len: usize,
+    received: Option<Message>,
+    empty_error: SyscallError,
 ) -> Result<(), SyscallError> {
 
     match received {
@@ -609,7 +649,7 @@ fn handle_ipc_recv_result(
             }
         }
         None => {
-            frame.set_err(SyscallError::WouldBlock.code());
+            frame.set_err(empty_error.code());
             encode_transfer_cap_ret(frame, None)?;
         }
     }
@@ -758,6 +798,19 @@ mod tests {
     }
 
     #[test]
+    fn syscall_recv_timeout_nonzero_returns_timed_out_when_empty() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecvTimeout as usize,
+            [recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 1, 0, 0],
+        );
+        dispatch(&mut state, &mut frame).expect("recv timeout");
+        assert_eq!(frame.error_code(), Some(SyscallError::TimedOut.code()));
+    }
+
+    #[test]
     fn vm_map_syscall_maps_aligned_region() {
         let mut state = Bootstrap::init().expect("kernel");
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("aspace");
@@ -789,6 +842,7 @@ mod tests {
         assert_eq!(SyscallError::QueueFull.code(), 6);
         assert_eq!(SyscallError::WouldBlock.code(), 7);
         assert_eq!(SyscallError::PageFault.code(), 8);
+        assert_eq!(SyscallError::TimedOut.code(), 9);
         assert_eq!(SyscallError::Internal.code(), 255);
     }
 
