@@ -3461,6 +3461,59 @@ mod tests {
     }
 
     #[test]
+    fn reply_caps_are_revoked_when_caller_restarts() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("create reply cap");
+
+        let token = state.exit_task(1, 11).expect("exit");
+        state.restart_task(1, token).expect("restart");
+
+        let reply = Message::new(9, b"late").expect("reply");
+        assert_eq!(
+            state.ipc_reply(reply_cap, reply),
+            Err(KernelError::StaleCapability)
+        );
+    }
+
+    #[test]
+    fn old_reply_cap_replay_is_rejected_after_restart_and_remint() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let old_reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("create old reply cap");
+
+        let token = state.exit_task(1, 12).expect("exit");
+        state.restart_task(1, token).expect("restart");
+        let recv_cap_after_restart = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap after restart");
+        let new_reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap_after_restart, None)
+            .expect("create new reply cap");
+
+        let replay = Message::new(9, b"stale").expect("stale reply");
+        assert_eq!(
+            state.ipc_reply(old_reply_cap, replay),
+            Err(KernelError::StaleCapability)
+        );
+
+        let fresh = Message::new(9, b"fresh").expect("fresh reply");
+        state.ipc_reply(new_reply_cap, fresh).expect("fresh reply send");
+    }
+
+    #[test]
     fn normalized_page_fault_event_faults_current_task() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
