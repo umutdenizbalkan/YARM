@@ -19,8 +19,11 @@ if [[ ! -f "$BOOT_RS" ]]; then
 fi
 
 echo "[info] validating rust target spec parses: $TARGET_SPEC"
-if ! rustc --print cfg --target "$TARGET_SPEC" >/dev/null 2>&1; then
+if ! target_parse_err=$(rustc --print cfg --target "$TARGET_SPEC" >/dev/null 2>&1); then
   echo "[error] rustc failed to parse target spec: $TARGET_SPEC"
+  if [[ -n "$target_parse_err" ]]; then
+    echo "$target_parse_err"
+  fi
   exit 1
 fi
 
