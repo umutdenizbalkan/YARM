@@ -42,43 +42,64 @@ fn roundtrip_ipc(
     service: &mut ProcessService,
     client_send_cap: CapId,
     server_recv_cap: CapId,
-    server_send_cap: CapId,
     client_recv_cap: CapId,
     request: Message,
 ) -> Result<Message, ProcessManagerError> {
-    roundtrip_ipc_with_budget(
+    roundtrip_call_reply_with_budget(
         kernel,
         service,
         client_send_cap,
         server_recv_cap,
-        server_send_cap,
         client_recv_cap,
         request,
         PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS,
     )
 }
 
-fn roundtrip_ipc_with_budget(
+fn roundtrip_call_reply_with_budget(
     kernel: &mut KernelState,
     service: &mut ProcessService,
     client_send_cap: CapId,
     server_recv_cap: CapId,
-    server_send_cap: CapId,
     client_recv_cap: CapId,
     request: Message,
     recv_timeout_ticks: u64,
 ) -> Result<Message, ProcessManagerError> {
-    map_kernel_ipc_err(kernel.ipc_send(client_send_cap, request))?;
+    let caller_tid = crate::kernel::ipc::ThreadId(
+        kernel.current_tid().ok_or(ProcessManagerError::Malformed)?,
+    );
+    let reply_cap =
+        map_kernel_ipc_err(kernel.create_reply_cap_for_caller(caller_tid, client_recv_cap, None))?;
+    let request_with_reply_cap = Message::with_header(
+        request.sender_tid.0,
+        request.opcode,
+        request.flags | Message::FLAG_CAP_TRANSFER,
+        Some(reply_cap.0),
+        request.as_slice(),
+    )
+    .map_err(|_| ProcessManagerError::Malformed)?;
+
+    map_kernel_ipc_err(kernel.ipc_send(client_send_cap, request_with_reply_cap))?;
     let request_for_server = map_kernel_ipc_err(
         kernel.ipc_recv_with_deadline(server_recv_cap, recv_timeout_ticks),
     )?
     .ok_or(ProcessManagerError::Malformed)?;
-    let response = service.handle(request_for_server)?;
-    map_kernel_ipc_err(kernel.ipc_send(server_send_cap, response))?;
-    map_kernel_ipc_err(
-        kernel.ipc_recv_with_deadline(client_recv_cap, recv_timeout_ticks),
-    )?
-    .ok_or(ProcessManagerError::Malformed)
+    let reply_cap = request_for_server
+        .transferred_cap()
+        .map(|cap| CapId(cap.0))
+        .ok_or(ProcessManagerError::Malformed)?;
+    let sanitized_request = Message::with_header(
+        request_for_server.sender_tid.0,
+        request_for_server.opcode,
+        request_for_server.flags & !Message::FLAG_CAP_TRANSFER,
+        None,
+        request_for_server.as_slice(),
+    )
+    .map_err(|_| ProcessManagerError::Malformed)?;
+    let response = service.handle(sanitized_request)?;
+    map_kernel_ipc_err(kernel.ipc_reply(reply_cap, response))?;
+    map_kernel_ipc_err(kernel.ipc_recv_with_deadline(client_recv_cap, recv_timeout_ticks))?
+        .ok_or(ProcessManagerError::Malformed)
 }
 
 pub fn run_request_loop(
@@ -142,14 +163,13 @@ pub fn run_request_loop_over_kernel_ipc(
     exit_code: u64,
 ) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
     let (_, client_send_cap, server_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(8))?;
-    let (_, server_send_cap, client_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(8))?;
+    let (_, _, client_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(8))?;
 
     let spawn_reply = roundtrip_ipc(
         kernel,
         service,
         client_send_cap,
         server_recv_cap,
-        server_send_cap,
         client_recv_cap,
         Message::with_header(
             0,
@@ -167,7 +187,6 @@ pub fn run_request_loop_over_kernel_ipc(
         service,
         client_send_cap,
         server_recv_cap,
-        server_send_cap,
         client_recv_cap,
         Message::with_header(
             spawned.pid.0,
@@ -184,7 +203,6 @@ pub fn run_request_loop_over_kernel_ipc(
         service,
         client_send_cap,
         server_recv_cap,
-        server_send_cap,
         client_recv_cap,
         Message::with_header(
             0,
@@ -248,12 +266,16 @@ mod tests {
     fn process_manager_source_guardrail_prefers_budgeted_timed_receive_path() {
         let src = include_str!("service.rs");
         assert!(
-            src.contains("roundtrip_ipc_with_budget"),
-            "process-manager migration should keep budgeted roundtrip helper"
+            src.contains("roundtrip_call_reply_with_budget"),
+            "process-manager migration should keep budgeted call/reply helper"
         );
         assert!(
             src.contains("ipc_recv_with_deadline"),
             "process-manager migration should keep timed receive call-sites"
+        );
+        assert!(
+            src.contains("ipc_reply("),
+            "process-manager migration should keep reply-cap reply path"
         );
     }
 }
