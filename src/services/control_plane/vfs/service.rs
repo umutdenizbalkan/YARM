@@ -21,6 +21,8 @@ pub struct VfsLoopSummary {
     pub handled: usize,
 }
 
+const VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
+
 fn decode_fd_reply(reply: crate::kernel::ipc::Message) -> Result<u64, VfsError> {
     match VfsReply::from_message(reply)? {
         VfsReply::OpenAtFd(fd) | VfsReply::DupFd(fd) | VfsReply::EpollFd(fd) => Ok(fd),
@@ -112,11 +114,16 @@ fn roundtrip_ipc<B: VfsBackend>(
     request: crate::kernel::ipc::Message,
 ) -> Result<crate::kernel::ipc::Message, VfsError> {
     map_kernel_ipc_err(kernel.ipc_send(client_send_cap, request))?;
-    let request_for_server =
-        map_kernel_ipc_err(kernel.ipc_recv(server_recv_cap))?.ok_or(VfsError::Malformed)?;
+    let request_for_server = map_kernel_ipc_err(
+        kernel.ipc_recv_with_deadline(server_recv_cap, VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS),
+    )?
+    .ok_or(VfsError::Malformed)?;
     let response = vfs.handle(request_for_server)?;
     map_kernel_ipc_err(kernel.ipc_send(server_send_cap, response))?;
-    map_kernel_ipc_err(kernel.ipc_recv(client_recv_cap))?.ok_or(VfsError::Malformed)
+    map_kernel_ipc_err(
+        kernel.ipc_recv_with_deadline(client_recv_cap, VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS),
+    )?
+    .ok_or(VfsError::Malformed)
 }
 
 pub fn run_request_loop_over_kernel_ipc(
@@ -280,6 +287,20 @@ mod tests {
         assert_eq!(summary.dup_fd, 4);
         assert_eq!(summary.epoll_fd, 5);
         assert_eq!(summary.handled, 15);
+    }
+
+    #[test]
+    fn vfs_roundtrip_timed_recv_deadline_times_out_when_queue_empty() {
+        let mut kernel = Bootstrap::init().expect("kernel init");
+        let (_, _client_send_cap, server_recv_cap) =
+            map_kernel_ipc_err(kernel.create_endpoint(8)).expect("req endpoint");
+
+        let timed = kernel.ipc_recv_with_deadline(server_recv_cap, VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS);
+        assert_eq!(timed, Ok(None));
+        let fired = kernel
+            .consume_ipc_timeout_fired_for_tid(0)
+            .expect("timeout consume");
+        assert!(!fired, "no timer tick yet");
     }
 
     #[test]

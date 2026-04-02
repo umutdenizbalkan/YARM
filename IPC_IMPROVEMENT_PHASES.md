@@ -125,6 +125,13 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
   - legacy two-endpoint request/reply choreography is marked as **deprecated for new/updated core services** during ABI v9 migration window.
   - full removal is explicitly deferred until all core control-plane services are migrated.
 
+## Phase 6 artifacts (pass 2)
+
+- First core-service migration cut:
+  - `src/services/control_plane/vfs/service.rs` now uses timed receive (`ipc_recv_with_deadline`) in its kernel-IPC request/response roundtrip path for both server-side request receive and client-side reply receive.
+- Migration guard:
+  - added VFS control-plane canary test for timed-receive empty-queue behavior under deadline receive path.
+
 ## Cross-phase quality gates
 
 - ABI versioning and changelog updates per phase.
