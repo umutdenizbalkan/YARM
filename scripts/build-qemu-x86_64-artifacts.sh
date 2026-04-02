@@ -126,6 +126,7 @@ fi
 if [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
   cp "$KERNEL_RAW_ELF" "$KERNEL_DEBUG_ELF"
   echo "[info] yarm freestanding kernel ELF (debug-only): $KERNEL_DEBUG_ELF"
+  scripts/check-x86_64-bootstrap-invariants.sh "$KERNEL_RAW_ELF"
 fi
 
 cat > "$ROOTFS_DIR/init" <<'SH'

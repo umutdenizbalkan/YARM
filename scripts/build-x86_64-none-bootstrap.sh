@@ -69,6 +69,10 @@ echo "[info] building kernel_boot + init_server for ${TARGET_SPEC} with toolchai
   --bin kernel_boot \
   --bin init_server
 
+KERNEL_ELF_PATH="target/x86_64-yarm-none/${PROFILE}/kernel_boot"
+echo "[info] running x86_64 bootstrap invariant checks"
+scripts/check-x86_64-bootstrap-invariants.sh "$KERNEL_ELF_PATH"
+
 echo "[ok] x86_64-none build completed"
 echo "[next] stage qemu artifacts: scripts/build-qemu-x86_64-artifacts.sh"
 echo "[next] run smoke boot (core markers): scripts/qemu-x86_64-core-smoke.sh"
