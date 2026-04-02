@@ -8,13 +8,6 @@ TARGET_SPEC=${TARGET_SPEC:-"$ROOT_DIR/targets/x86_64-yarm-none.json"}
 BOOT_RS=${BOOT_RS:-"$ROOT_DIR/src/arch/x86_64/boot.rs"}
 KERNEL_ELF=${1:-}
 
-RUSTC_BIN=${RUSTC_BIN:-rustc}
-
-if ! command -v "$RUSTC_BIN" >/dev/null 2>&1; then
-  echo "[error] rust compiler not found: $RUSTC_BIN"
-  exit 1
-fi
-
 if [[ ! -f "$TARGET_SPEC" ]]; then
   echo "[error] missing target spec: $TARGET_SPEC"
   exit 1
@@ -26,10 +19,44 @@ if [[ ! -f "$BOOT_RS" ]]; then
 fi
 
 echo "[info] validating rust target spec parses: $TARGET_SPEC"
-if ! target_parse_err=$("$RUSTC_BIN" --print cfg --target "$TARGET_SPEC" >/dev/null 2>&1); then
+TARGET_PARSE_OK=0
+TARGET_PARSE_ERR=""
+
+if [[ -n "${RUSTC_BIN:-}" ]]; then
+  if ! command -v "$RUSTC_BIN" >/dev/null 2>&1; then
+    echo "[error] rust compiler not found: $RUSTC_BIN"
+    exit 1
+  fi
+  if target_parse_err=$("$RUSTC_BIN" --print cfg --target "$TARGET_SPEC" >/dev/null 2>&1); then
+    TARGET_PARSE_OK=1
+  else
+    TARGET_PARSE_ERR="$target_parse_err"
+  fi
+else
+  if ! command -v rustc >/dev/null 2>&1; then
+    echo "[error] rust compiler not found in PATH"
+    exit 1
+  fi
+  if target_parse_err=$(rustc --print cfg --target "$TARGET_SPEC" >/dev/null 2>&1); then
+    TARGET_PARSE_OK=1
+  else
+    TARGET_PARSE_ERR="$target_parse_err"
+    FALLBACK_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-nightly}
+    if command -v rustup >/dev/null 2>&1 && rustup toolchain list | rg -q "^${FALLBACK_TOOLCHAIN}"; then
+      echo "[warn] target parse failed with PATH rustc; retrying with rustup toolchain '${FALLBACK_TOOLCHAIN}'"
+      if target_parse_err=$(rustup run "${FALLBACK_TOOLCHAIN}" rustc --print cfg --target "$TARGET_SPEC" >/dev/null 2>&1); then
+        TARGET_PARSE_OK=1
+      else
+        TARGET_PARSE_ERR="$target_parse_err"
+      fi
+    fi
+  fi
+fi
+
+if [[ "$TARGET_PARSE_OK" != "1" ]]; then
   echo "[error] rustc failed to parse target spec: $TARGET_SPEC"
-  if [[ -n "$target_parse_err" ]]; then
-    echo "$target_parse_err"
+  if [[ -n "$TARGET_PARSE_ERR" ]]; then
+    echo "$TARGET_PARSE_ERR"
   fi
   exit 1
 fi
