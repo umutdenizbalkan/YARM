@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::lock::SpinLock;
+use crate::kernel::lock::SpinLockIrq;
 use crate::kernel::vm::PAGE_SIZE;
 
 const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
@@ -428,7 +428,7 @@ impl PhysicalFrameAllocator {
     }
 }
 
-static PT_FRAME_ALLOCATOR: SpinLock<Option<PhysicalFrameAllocator>> = SpinLock::new(None);
+static PT_FRAME_ALLOCATOR: SpinLockIrq<Option<PhysicalFrameAllocator>> = SpinLockIrq::new(None);
 
 fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
     #[cfg(feature = "hosted-dev")]
