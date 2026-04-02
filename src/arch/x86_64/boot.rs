@@ -68,7 +68,8 @@ boot_pd_hi:
     // Map the default xAPIC + IOAPIC windows:
     //   0xFEC0_0000..0xFEDF_FFFF  (PD idx 502, 2MiB page)
     //   0xFEE0_0000..0xFEFF_FFFF  (PD idx 503, 2MiB page)
-    .set hi_page_flags_exec, 0x83
+    // Mark APIC MMIO mappings uncacheable (PCD=1) for architectural correctness.
+    .set hi_page_flags_exec, 0x93
     .zero 4016
     .quad 0xFEC00000 | hi_page_flags_exec
     .quad 0xFEE00000 | hi_page_flags_exec
