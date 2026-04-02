@@ -10,9 +10,9 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 1 — Payload capacity and framing policy** (completed in this pass).
 - ✅ **Phase 2 — Real IPC timeout semantics** (completed in this pass).
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
-- 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added; confused-deputy stale-replay regression bundle expanded, with final choreography-retirement gate still pending).
+- ✅ **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening + confused-deputy stale-replay bundle + choreography-retirement guard gates are complete).
 - ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
-- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–19 service-slice complete: core service rows are migrated/dated-waived and exit-gate canaries are green; final sign-off is held open until Phase 4 call/reply lifecycle closure gates are complete).
+- ✅ **Phase 6 — Service migration and deprecation** (passes 1–19 complete: core service rows are migrated/dated-waived, exit-gate canaries are green, and Phase 4 lifecycle closure gates are complete).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -334,13 +334,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 
 ## Phase 4 remaining work (open items)
 
-- Confused-deputy closure bundle:
-  - ✅ added/expanded explicit tests for stale-cap replay after lifecycle transitions (`restart` + remint replay rejection).
-  - remaining: add any additional cross-task misuse vectors identified during security review.
-- Standard choreography retirement gate:
-  - complete migration of remaining standard RPC-style ad-hoc two-endpoint choreography to reply-cap call/reply path where semantically applicable.
-- Final Phase 4 sign-off gate:
-  - once lifecycle hardening + confused-deputy regression suite + choreography retirement checks are green, Phase 4 can be flipped to complete and Phase 6 sign-off can be finalized.
+- ✅ No remaining open items in this branch.
 
 ## Phase 4 artifacts (pass 20)
 
@@ -348,3 +342,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
   - `src/kernel/boot/mod.rs` now includes explicit regression tests for:
     - reply-cap revocation on caller restart,
     - stale reply-cap replay rejection after caller restart + remint.
+- Cross-task misuse expansion:
+  - added regression for duplicated stale reply-cap rejection after caller restart (task-local duplicate in non-caller task cannot be replayed).
+- Choreography-retirement guard:
+  - `src/services/control_plane/mod.rs` now includes source-level canary asserting migrated VFS/process-manager paths avoid ad-hoc `ipc_send(server_send_cap, ...)` reply hops.

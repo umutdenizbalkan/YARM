@@ -3514,6 +3514,37 @@ mod tests {
     }
 
     #[test]
+    fn duplicated_stale_reply_cap_is_rejected_after_caller_restart() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.register_task(2).expect("task2");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, Some(ThreadId(2)))
+            .expect("create reply cap");
+        let reply_cap_task2 = state
+            .grant_capability_task_to_task(0, reply_cap, 2)
+            .expect("dup reply cap to task2");
+
+        let token = state.exit_task(1, 13).expect("exit");
+        state.restart_task(1, token).expect("restart");
+
+        state.enqueue_current_cpu(2).expect("enqueue2");
+        state.dispatch_next_task().expect("dispatch2");
+        let replay = Message::new(2, b"stale").expect("stale reply");
+        assert!(
+            matches!(
+                state.ipc_reply(reply_cap_task2, replay),
+                Err(KernelError::StaleCapability | KernelError::WrongObject)
+            ),
+            "duplicated stale reply-cap should be rejected after caller restart"
+        );
+    }
+
+    #[test]
     fn normalized_page_fault_event_faults_current_task() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");

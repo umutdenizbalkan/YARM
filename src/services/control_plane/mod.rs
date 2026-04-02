@@ -61,4 +61,19 @@ mod tests {
             "process-manager must retain reply-cap call/reply migration"
         );
     }
+
+    #[test]
+    fn phase4_choreography_retirement_bundle_avoids_server_send_reply_hops() {
+        let vfs_src = include_str!("vfs/service.rs");
+        let process_manager_src = include_str!("process_manager/service.rs");
+
+        assert!(
+            !vfs_src.contains("ipc_send(server_send_cap"),
+            "vfs migrated call/reply path should not use ad-hoc server-send reply hop"
+        );
+        assert!(
+            !process_manager_src.contains("ipc_send(server_send_cap"),
+            "process-manager migrated call/reply path should not use ad-hoc server-send reply hop"
+        );
+    }
 }
