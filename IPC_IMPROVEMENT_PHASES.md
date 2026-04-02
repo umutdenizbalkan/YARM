@@ -93,6 +93,9 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Map/release telemetry canary on failure path:
   - repeated recv map-intent failures keep `shared_mem_bytes_mapped` and `shared_mem_bytes_released` at `0` (no accounting drift).
   - repeated recv write-intent (`WRITE`) failures against non-writable transfer caps also keep map/release counters stable.
+- Fault/cancel-path accounting closure:
+  - process-cleanup purge of active shared-memory transfer mappings now records `shared_mem_bytes_released`.
+  - direct transfer-cap revoke path that force-unmaps active shared-memory mappings now also records released-byte telemetry.
 
 ## Phase 6 — Service migration and deprecation
 

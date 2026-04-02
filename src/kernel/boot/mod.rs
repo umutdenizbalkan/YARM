@@ -1431,10 +1431,11 @@ impl KernelState {
                     va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
                 }
             }
+            self.with_ipc_state_mut(|ipc| ipc.active_transfer_mappings[idx] = None);
+            self.note_shared_mem_released(mapping.len);
             if let Some(cnode) = self.task_cnode(mapping.owner_tid.0) {
                 let _ = self.revoke_capability_in_cnode(cnode, mapping.transfer_cap);
             }
-            self.with_ipc_state_mut(|ipc| ipc.active_transfer_mappings[idx] = None);
             self.note_transfer_record_revoked();
         }
     }
@@ -1970,6 +1971,7 @@ impl KernelState {
                 }
             }
             self.with_ipc_state_mut(|ipc| ipc.active_transfer_mappings[idx] = None);
+            self.note_shared_mem_released(mapping.len);
             self.note_transfer_record_revoked();
             let _ = self.report_transfer_revoke_to_supervisor(
                 owner_pid,
@@ -2757,6 +2759,7 @@ mod tests {
                 PAGE_SIZE,
             )
             .expect("register mapping");
+        state.note_shared_mem_mapped(PAGE_SIZE);
         state.exit_task(1, 1).expect("exit");
         assert_eq!(state.current_tid(), Some(0));
 
@@ -2774,6 +2777,9 @@ mod tests {
                 .map_refcount,
             0
         );
+        let telemetry = state.ipc_path_telemetry();
+        assert_eq!(telemetry.shared_mem_bytes_mapped, PAGE_SIZE as u64);
+        assert_eq!(telemetry.shared_mem_bytes_released, PAGE_SIZE as u64);
     }
 
     #[test]
@@ -2813,6 +2819,7 @@ mod tests {
                 PAGE_SIZE,
             )
             .expect("register mapping");
+        state.note_shared_mem_mapped(PAGE_SIZE);
 
         state.revoke_capability_direct_in_process_cnode(1, mem_cap_task1);
         assert!(
@@ -2826,6 +2833,9 @@ mod tests {
                 .map_refcount,
             0
         );
+        let telemetry = state.ipc_path_telemetry();
+        assert_eq!(telemetry.shared_mem_bytes_mapped, PAGE_SIZE as u64);
+        assert_eq!(telemetry.shared_mem_bytes_released, PAGE_SIZE as u64);
     }
 
     #[test]
