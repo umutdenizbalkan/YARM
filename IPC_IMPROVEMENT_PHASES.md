@@ -96,6 +96,9 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Fault/cancel-path accounting closure:
   - process-cleanup purge of active shared-memory transfer mappings now records `shared_mem_bytes_released`.
   - direct transfer-cap revoke path that force-unmaps active shared-memory mappings now also records released-byte telemetry.
+- Anti-leak + accounting canaries under repeated teardown:
+  - repeated process-cleanup transfer-envelope purge keeps `transfer_records_created == transfer_records_revoked`.
+  - repeated direct transfer-cap revoke force-unmap cycles keep `shared_mem_bytes_mapped == shared_mem_bytes_released`.
 
 ## Phase 6 — Service migration and deprecation
 
