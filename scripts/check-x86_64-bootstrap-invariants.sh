@@ -8,6 +8,13 @@ TARGET_SPEC=${TARGET_SPEC:-"$ROOT_DIR/targets/x86_64-yarm-none.json"}
 BOOT_RS=${BOOT_RS:-"$ROOT_DIR/src/arch/x86_64/boot.rs"}
 KERNEL_ELF=${1:-}
 
+RUSTC_BIN=${RUSTC_BIN:-rustc}
+
+if ! command -v "$RUSTC_BIN" >/dev/null 2>&1; then
+  echo "[error] rust compiler not found: $RUSTC_BIN"
+  exit 1
+fi
+
 if [[ ! -f "$TARGET_SPEC" ]]; then
   echo "[error] missing target spec: $TARGET_SPEC"
   exit 1
@@ -19,7 +26,7 @@ if [[ ! -f "$BOOT_RS" ]]; then
 fi
 
 echo "[info] validating rust target spec parses: $TARGET_SPEC"
-if ! target_parse_err=$(rustc --print cfg --target "$TARGET_SPEC" >/dev/null 2>&1); then
+if ! target_parse_err=$("$RUSTC_BIN" --print cfg --target "$TARGET_SPEC" >/dev/null 2>&1); then
   echo "[error] rustc failed to parse target spec: $TARGET_SPEC"
   if [[ -n "$target_parse_err" ]]; then
     echo "$target_parse_err"

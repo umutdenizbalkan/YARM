@@ -30,6 +30,7 @@ if [[ "$RUSTUP_DISABLED" == "1" ]]; then
   RUST_SYSROOT=${RUST_SYSROOT:-$(rustc --print sysroot 2>/dev/null || true)}
   CARGO_CMD=(cargo)
   TOOLCHAIN_LABEL="host"
+  RUSTC_FOR_CHECK=${RUSTC_FOR_CHECK:-$(command -v rustc)}
 else
   if ! rustup toolchain list | rg -q "^${TOOLCHAIN}"; then
     echo "[warn] toolchain '${TOOLCHAIN}' is not installed"
@@ -39,6 +40,7 @@ else
   RUST_SYSROOT=${RUST_SYSROOT:-$(rustup run "${RUSTUP_TOOLCHAIN}" rustc --print sysroot 2>/dev/null || true)}
   CARGO_CMD=(cargo +"${TOOLCHAIN}")
   TOOLCHAIN_LABEL="${TOOLCHAIN}"
+  RUSTC_FOR_CHECK=${RUSTC_FOR_CHECK:-$(rustup which --toolchain "${RUSTUP_TOOLCHAIN}" rustc 2>/dev/null || true)}
 fi
 
 if [[ -z "$RUST_SYSROOT" ]]; then
@@ -71,7 +73,12 @@ echo "[info] building kernel_boot + init_server for ${TARGET_SPEC} with toolchai
 
 KERNEL_ELF_PATH="target/x86_64-yarm-none/${PROFILE}/kernel_boot"
 echo "[info] running x86_64 bootstrap invariant checks"
-scripts/check-x86_64-bootstrap-invariants.sh "$KERNEL_ELF_PATH"
+if [[ -z "$RUSTC_FOR_CHECK" ]]; then
+  echo "[warn] unable to resolve rustc path for toolchain=${TOOLCHAIN_LABEL}; falling back to PATH rustc in invariant checks"
+  scripts/check-x86_64-bootstrap-invariants.sh "$KERNEL_ELF_PATH"
+else
+  RUSTC_BIN="$RUSTC_FOR_CHECK" scripts/check-x86_64-bootstrap-invariants.sh "$KERNEL_ELF_PATH"
+fi
 
 echo "[ok] x86_64-none build completed"
 echo "[next] stage qemu artifacts: scripts/build-qemu-x86_64-artifacts.sh"
