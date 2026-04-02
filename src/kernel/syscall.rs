@@ -1642,6 +1642,71 @@ mod tests {
     }
 
     #[test]
+    fn shared_mem_recv_intent_failures_do_not_drift_map_release_telemetry() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        for _ in 0..8 {
+            if state.current_tid() != Some(1) {
+                state.yield_current().expect("switch receiver");
+            }
+            let mut block_recv = TrapFrame::new(
+                Syscall::IpcRecv as usize,
+                [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+            );
+            dispatch(&mut state, &mut block_recv).expect("block recv");
+            assert_eq!(state.current_tid(), Some(0));
+
+            let mut send = TrapFrame::new(
+                Syscall::IpcSend as usize,
+                [
+                    send_cap.0 as usize,
+                    0x3000,
+                    Message::MAX_PAYLOAD + 32,
+                    0,
+                    0,
+                    mem_cap.0 as usize,
+                ],
+            );
+            dispatch(&mut state, &mut send).expect("send");
+            if state.current_tid() != Some(1) {
+                state.yield_current().expect("switch receiver");
+            }
+
+            let mut recv = TrapFrame::new(
+                Syscall::IpcRecv as usize,
+                [
+                    recv_cap.0 as usize,
+                    0xB000,
+                    Message::MAX_PAYLOAD + 32,
+                    0,
+                    0x80,
+                    0,
+                ],
+            );
+            let err = dispatch(&mut state, &mut recv).expect_err("invalid map intent");
+            assert_eq!(err, SyscallError::InvalidArgs);
+            assert_eq!(recv.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
+            assert_eq!(state.current_tid(), Some(1));
+        }
+
+        let t = state.ipc_path_telemetry();
+        assert_eq!(t.shared_mem_bytes_mapped, 0);
+        assert_eq!(t.shared_mem_bytes_released, 0);
+    }
+
+    #[test]
     fn syscall_transfer_release_unmaps_receiver_range_and_revokes_transfer_cap() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");

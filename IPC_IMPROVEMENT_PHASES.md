@@ -89,6 +89,8 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Receiver mapping-intent validation:
   - shared-memory recv now validates optional map-intent flags (read required; unknown bits rejected) before mapping.
   - write-intent mapping is rejected unless the materialized transfer cap includes `WRITE`.
+- Map/release telemetry canary on failure path:
+  - repeated recv map-intent failures keep `shared_mem_bytes_mapped` and `shared_mem_bytes_released` at `0` (no accounting drift).
 
 ## Phase 6 — Service migration and deprecation
 
