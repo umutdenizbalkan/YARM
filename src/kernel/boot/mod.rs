@@ -2907,6 +2907,69 @@ mod tests {
     }
 
     #[test]
+    fn destroy_aspace_with_blocked_ipc_waiter_and_preemption_preserves_ordering() {
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        state.register_task(1).expect("task1");
+        state.register_task(2).expect("task2");
+        state.enqueue_current_cpu(1).expect("enqueue1");
+        state.enqueue_current_cpu(2).expect("enqueue2");
+
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(1, asid).expect("bind asid to task1");
+
+        let (_eid, send_cap, recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+        let send_cap_task1 = state
+            .grant_capability_task_to_task(0, send_cap, 1)
+            .expect("dup send cap");
+        let recv_cap_task2 = state
+            .grant_capability_task_to_task(0, recv_cap, 2)
+            .expect("dup recv cap");
+
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        assert_eq!(
+            state.ipc_send(send_cap_task1, Message::new(1, b"hold").expect("msg")),
+            Err(KernelError::WouldBlock)
+        );
+        assert_eq!(
+            state.task_status(1),
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap_task1)))
+        );
+        if state.current_tid() != Some(2) {
+            state.yield_current().expect("switch to task2");
+        }
+        assert_eq!(state.current_tid(), Some(2));
+
+        state
+            .destroy_user_address_space_by_asid(asid)
+            .expect("destroy aspace");
+        assert!(state.user_spaces.get(asid).is_none());
+        assert_eq!(
+            state
+                .user_spaces
+                .retired_entry(asid)
+                .map(|entry| entry.pending_cpu_bitmap),
+            Some(0b11)
+        );
+
+        assert!(state.on_preempt_current_cpu().is_some());
+        if state.current_tid() != Some(2) {
+            state.yield_current().expect("reschedule task2");
+        }
+        assert_eq!(state.current_tid(), Some(2));
+
+        let delivered = state
+            .ipc_recv(recv_cap_task2)
+            .expect("recv")
+            .expect("message");
+        assert_eq!(delivered.as_slice(), b"hold");
+        assert_eq!(state.task_status(1), Some(TaskStatus::Runnable));
+    }
+
+    #[test]
     fn process_cross_cpu_work_applies_matching_cpu_items_only() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(2).expect("task2");
