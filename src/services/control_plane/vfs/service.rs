@@ -113,7 +113,7 @@ fn roundtrip_ipc<B: VfsBackend>(
     client_recv_cap: CapId,
     request: crate::kernel::ipc::Message,
 ) -> Result<crate::kernel::ipc::Message, VfsError> {
-    roundtrip_ipc_with_budget(
+    roundtrip_call_reply_with_budget(
         kernel,
         vfs,
         client_send_cap,
@@ -125,6 +125,54 @@ fn roundtrip_ipc<B: VfsBackend>(
     )
 }
 
+fn roundtrip_call_reply_with_budget<B: VfsBackend>(
+    kernel: &mut KernelState,
+    vfs: &mut FsService<B>,
+    client_send_cap: CapId,
+    server_recv_cap: CapId,
+    _server_send_cap: CapId,
+    client_recv_cap: CapId,
+    request: crate::kernel::ipc::Message,
+    recv_timeout_ticks: u64,
+) -> Result<crate::kernel::ipc::Message, VfsError> {
+    let caller_tid =
+        crate::kernel::ipc::ThreadId(kernel.current_tid().ok_or(VfsError::Unsupported)?);
+    let reply_cap = map_kernel_ipc_err(
+        kernel.create_reply_cap_for_caller(caller_tid, client_recv_cap, None),
+    )?;
+    let request_with_reply_cap = crate::kernel::ipc::Message::with_header(
+        request.sender_tid.0,
+        request.opcode,
+        request.flags | crate::kernel::ipc::Message::FLAG_CAP_TRANSFER,
+        Some(reply_cap.0),
+        request.as_slice(),
+    )
+    .map_err(|_| VfsError::Malformed)?;
+
+    map_kernel_ipc_err(kernel.ipc_send(client_send_cap, request_with_reply_cap))?;
+    let request_for_server = map_kernel_ipc_err(
+        kernel.ipc_recv_with_deadline(server_recv_cap, recv_timeout_ticks),
+    )?
+    .ok_or(VfsError::Malformed)?;
+    let reply_cap = request_for_server
+        .transferred_cap()
+        .map(|cap| CapId(cap.0))
+        .ok_or(VfsError::Malformed)?;
+    let sanitized_request = crate::kernel::ipc::Message::with_header(
+        request_for_server.sender_tid.0,
+        request_for_server.opcode,
+        request_for_server.flags & !crate::kernel::ipc::Message::FLAG_CAP_TRANSFER,
+        None,
+        request_for_server.as_slice(),
+    )
+    .map_err(|_| VfsError::Malformed)?;
+    let response = vfs.handle(sanitized_request)?;
+    map_kernel_ipc_err(kernel.ipc_reply(reply_cap, response))?;
+    map_kernel_ipc_err(kernel.ipc_recv_with_deadline(client_recv_cap, recv_timeout_ticks))?
+        .ok_or(VfsError::Malformed)
+}
+
+#[allow(dead_code)]
 fn roundtrip_ipc_with_budget<B: VfsBackend>(
     kernel: &mut KernelState,
     vfs: &mut FsService<B>,
@@ -135,17 +183,16 @@ fn roundtrip_ipc_with_budget<B: VfsBackend>(
     request: crate::kernel::ipc::Message,
     recv_timeout_ticks: u64,
 ) -> Result<crate::kernel::ipc::Message, VfsError> {
-    map_kernel_ipc_err(kernel.ipc_send(client_send_cap, request))?;
-    let request_for_server = map_kernel_ipc_err(
-        kernel.ipc_recv_with_deadline(server_recv_cap, recv_timeout_ticks),
-    )?
-    .ok_or(VfsError::Malformed)?;
-    let response = vfs.handle(request_for_server)?;
-    map_kernel_ipc_err(kernel.ipc_send(server_send_cap, response))?;
-    map_kernel_ipc_err(
-        kernel.ipc_recv_with_deadline(client_recv_cap, recv_timeout_ticks),
-    )?
-    .ok_or(VfsError::Malformed)
+    roundtrip_call_reply_with_budget(
+        kernel,
+        vfs,
+        client_send_cap,
+        server_recv_cap,
+        server_send_cap,
+        client_recv_cap,
+        request,
+        recv_timeout_ticks,
+    )
 }
 
 pub fn run_request_loop_over_kernel_ipc(
@@ -360,6 +407,10 @@ mod tests {
         assert!(
             src.contains("ipc_recv_with_deadline("),
             "phase6 migration requires timed receive path in vfs service"
+        );
+        assert!(
+            src.contains("ipc_reply("),
+            "phase6 migration requires reply-cap call/reply path in vfs service"
         );
         assert!(
             !src.contains(legacy_call.as_str()),

@@ -106,6 +106,7 @@
 - **Current migration snapshot (pass 6)**: Supervisor control-plane receive loop now uses budget-aware receive draining (nonblocking probe plus timed receive when possible), with guardrails against regression to legacy blocking `IpcRecv`.
 - **Current migration snapshot (pass 7)**: control-plane module-level guardrails now assert migrated VFS/supervisor sources remain free of legacy blocking `IpcRecv` call-sites.
 - **Current migration snapshot (pass 13)**: Process Manager kernel-IPC roundtrip now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) instead of ad-hoc two-endpoint server reply sends.
+- **Current migration snapshot (pass 14)**: VFS kernel-IPC roundtrip now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) instead of ad-hoc two-endpoint server reply sends.
 
 ## Return layout
 

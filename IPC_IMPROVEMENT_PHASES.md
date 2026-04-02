@@ -12,7 +12,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
 - ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
-- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–13 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze + control-plane-wide nonblocking regression expansion + process-manager kernel-IPC timed-recv migration + process-manager source guardrails + process-manager reply-cap call/reply helper migration; full core-service cutover/deprecation sunset pending).
+- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–14 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration + cross-service guardrails + service migration matrix freeze + control-plane-wide nonblocking regression expansion + process-manager kernel-IPC timed-recv migration + process-manager source guardrails + process-manager reply-cap call/reply helper migration + VFS reply-cap call/reply helper migration; full core-service cutover/deprecation sunset pending).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -237,6 +237,12 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - PR-6.3 call/reply migration slice (process-manager):
   - `src/services/control_plane/process_manager/service.rs` kernel-IPC roundtrip path now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) instead of ad-hoc dedicated server-send endpoint replies.
   - source-level guardrail now asserts presence of budgeted helper + timed receive + reply-cap reply path in migrated process-manager loop.
+
+## Phase 6 artifacts (pass 14)
+
+- PR-6.3 call/reply migration slice (VFS):
+  - `src/services/control_plane/vfs/service.rs` kernel-IPC roundtrip path now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) in place of ad-hoc dedicated server-send endpoint replies.
+  - timed receive budget behavior (`ipc_recv_with_deadline`) remains in place for both server request receive and caller reply receive.
 
 ## Cross-phase quality gates
 
