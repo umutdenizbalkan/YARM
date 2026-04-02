@@ -10,7 +10,8 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 1 — Payload capacity and framing policy** (completed in this pass).
 - ✅ **Phase 2 — Real IPC timeout semantics** (completed in this pass).
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
-- ⏳ **Phases 4–6** (not implemented yet).
+- 🟡 **Phase 4 — Call/Reply capability model** (started in this pass; design and implementation slices documented, kernel object/syscall wiring still pending).
+- ⏳ **Phases 5–6** (not implemented yet).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -123,3 +124,8 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 
 - `NotificationObject` no longer wraps `Endpoint`; it now uses a lightweight IRQ ring.
 - IRQ routes queue raw IRQ codes and materialize `Message` only on receive boundary.
+
+## Phase 4 artifacts (partial)
+
+- Call/reply capability execution plan:
+  - `PHASE4_CALL_REPLY_CAP_PLAN.md`
