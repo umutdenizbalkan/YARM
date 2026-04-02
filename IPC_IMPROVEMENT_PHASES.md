@@ -91,6 +91,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
   - write-intent mapping is rejected unless the materialized transfer cap includes `WRITE`.
 - Map/release telemetry canary on failure path:
   - repeated recv map-intent failures keep `shared_mem_bytes_mapped` and `shared_mem_bytes_released` at `0` (no accounting drift).
+  - repeated recv write-intent (`WRITE`) failures against non-writable transfer caps also keep map/release counters stable.
 
 ## Phase 6 — Service migration and deprecation
 
