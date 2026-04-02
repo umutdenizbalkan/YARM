@@ -293,27 +293,44 @@ struct MemoryObject {
 
 #[derive(Debug)]
 struct NotificationObject {
-    queue: KernelStorage<Endpoint>,
+    irq_queue: [u16; crate::kernel::ipc::MAX_ENDPOINT_DEPTH],
+    head: usize,
+    len: usize,
+    max_depth: usize,
 }
 
 impl NotificationObject {
     fn new(max_depth: usize) -> Result<Self, KernelError> {
-        let endpoint =
-            Endpoint::new_with_mode(max_depth, crate::kernel::ipc::EndpointMode::Buffered)
-                .map_err(map_ipc_error)?;
+        if max_depth == 0 || max_depth > crate::kernel::ipc::MAX_ENDPOINT_DEPTH {
+            return Err(KernelError::WrongObject);
+        }
         Ok(Self {
-            queue: store_kernel_value(endpoint),
+            irq_queue: [0; crate::kernel::ipc::MAX_ENDPOINT_DEPTH],
+            head: 0,
+            len: 0,
+            max_depth,
         })
     }
 
-    fn send(&mut self, msg: Message) -> Result<(), KernelError> {
-        kernel_mut(&mut self.queue)
-            .send(msg)
-            .map_err(|_| KernelError::EndpointQueueFull)
+    fn send_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {
+        if self.len >= self.max_depth {
+            return Err(KernelError::EndpointQueueFull);
+        }
+        let tail = (self.head + self.len) & (crate::kernel::ipc::MAX_ENDPOINT_DEPTH - 1);
+        self.irq_queue[tail] = irq_line;
+        self.len += 1;
+        Ok(())
     }
 
     fn recv(&mut self) -> Option<Message> {
-        kernel_mut(&mut self.queue).recv()
+        if self.len == 0 {
+            return None;
+        }
+        let irq_line = self.irq_queue[self.head];
+        self.head = (self.head + 1) & (crate::kernel::ipc::MAX_ENDPOINT_DEPTH - 1);
+        self.len -= 1;
+        let payload = irq_line.to_le_bytes();
+        Message::with_header(0, irq_line, 0, None, &payload).ok()
     }
 }
 

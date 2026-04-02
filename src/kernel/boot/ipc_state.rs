@@ -438,9 +438,7 @@ impl KernelState {
         let notif = self.ipc.notifications[notification_idx]
             .as_mut()
             .ok_or(KernelError::WrongObject)?;
-        let payload = irq_line.to_le_bytes();
-        let msg = Message::with_header(0, irq_line, 0, None, &payload).map_err(map_ipc_error)?;
-        notif.send(msg)?;
+        notif.send_irq(irq_line)?;
         if let Some(waiter_tid) = self.ipc.notification_waiters[notification_idx].take() {
             self.with_tcbs_mut(|tcbs| {
                 let tcb = tcbs

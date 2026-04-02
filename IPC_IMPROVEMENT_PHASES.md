@@ -9,7 +9,8 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 0 — Baseline and rollback guardrails** (implemented in this pass).
 - ✅ **Phase 1 — Payload capacity and framing policy** (completed in this pass).
 - ✅ **Phase 2 — Real IPC timeout semantics** (completed in this pass).
-- ⏳ **Phases 3–6** (not implemented yet).
+- ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
+- ⏳ **Phases 4–6** (not implemented yet).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -117,3 +118,8 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
   - `src/kernel/boot/fault_state.rs` (timer interrupt now processes expired IPC deadlines).
 - ABI doc update:
   - `SYSCALL_ABI.md` (`IpcRecvTimeout` args[3] documented as timeout ticks).
+
+## Phase 3 artifacts
+
+- `NotificationObject` no longer wraps `Endpoint`; it now uses a lightweight IRQ ring.
+- IRQ routes queue raw IRQ codes and materialize `Message` only on receive boundary.
