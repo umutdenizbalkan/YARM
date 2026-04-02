@@ -20,6 +20,9 @@ pub struct TrapFrame {
     pub error: usize,
     pub saved_pc: usize,
     pub saved_sp: usize,
+    /// Architecture-populated general-purpose user register snapshot.
+    /// On architectures/paths without full-save support yet, lanes remain zero.
+    pub user_gprs: [usize; 16],
 }
 
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
@@ -49,6 +52,7 @@ impl TrapFrame {
             error: 0,
             saved_pc: 0,
             saved_sp: 0,
+            user_gprs: [0; 16],
         }
     }
 
@@ -102,6 +106,14 @@ impl TrapFrame {
 
     pub fn set_saved_sp(&mut self, value: usize) {
         self.saved_sp = value;
+    }
+
+    pub const fn user_gpr(&self, index: usize) -> usize {
+        self.user_gprs[index]
+    }
+
+    pub fn set_user_gpr(&mut self, index: usize, value: usize) {
+        self.user_gprs[index] = value;
     }
 
     pub fn set_ok(&mut self, ret0: usize, ret1: usize, ret2: usize) {

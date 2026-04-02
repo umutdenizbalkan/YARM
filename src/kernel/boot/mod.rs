@@ -30,7 +30,6 @@ use super::task::{ThreadGroupId, UserRegisterContext, WaitReason};
 use super::trap::FaultInfo;
 #[cfg(test)]
 use super::trap::{FaultAccess, Trap, TrapEvent};
-#[cfg(test)]
 use super::trapframe::TrapFrame;
 use super::vm::{
     AddressSpace, AddressSpaceManager, Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError,
@@ -459,6 +458,7 @@ struct ProcessCNodeRecord {
 #[derive(Debug)]
 struct FaultSubsystem {
     last_fault: Option<FaultInfo>,
+    last_fault_frame: Option<TrapFrame>,
     fault_handler_endpoint: Option<usize>,
     supervisor_endpoint: Option<usize>,
     fault_policy: FaultPolicy,
@@ -979,6 +979,7 @@ impl Bootstrap {
             boot_config: store_kernel_value(BootConfigSubsystem { capacity_profile }),
             faults: store_kernel_value(FaultSubsystem {
                 last_fault: None,
+                last_fault_frame: None,
                 fault_handler_endpoint: None,
                 supervisor_endpoint: None,
                 fault_policy: FaultPolicy::KillTask,
@@ -2174,11 +2175,22 @@ impl KernelState {
     }
 
     pub fn clear_last_fault(&mut self) {
-        self.with_fault_state_mut(|faults| faults.last_fault = None);
+        self.with_fault_state_mut(|faults| {
+            faults.last_fault = None;
+            faults.last_fault_frame = None;
+        });
     }
 
     pub fn record_fault(&mut self, fault: FaultInfo) {
         self.with_fault_state_mut(|faults| faults.last_fault = Some(fault));
+    }
+
+    pub fn record_fault_frame_snapshot(&mut self, frame: &TrapFrame) {
+        self.with_fault_state_mut(|faults| faults.last_fault_frame = Some(frame.clone()));
+    }
+
+    pub fn last_fault_frame(&self) -> Option<TrapFrame> {
+        self.with_fault_state(|faults| faults.last_fault_frame.clone())
     }
 
     pub fn set_fault_handler(&mut self, recv_cap: CapId) -> Result<(), KernelError> {

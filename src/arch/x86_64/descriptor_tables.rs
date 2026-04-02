@@ -355,6 +355,21 @@ unsafe fn build_trap_frame_from_saved_regs(
         trap.set_arg(4, regs.r8 as usize);
         trap.set_arg(5, regs.r9 as usize);
     }
+    trap.set_user_gpr(0, regs.rax as usize);
+    trap.set_user_gpr(1, regs.rbx as usize);
+    trap.set_user_gpr(2, regs.rcx as usize);
+    trap.set_user_gpr(3, regs.rdx as usize);
+    trap.set_user_gpr(4, regs.rsi as usize);
+    trap.set_user_gpr(5, regs.rdi as usize);
+    trap.set_user_gpr(6, regs.rbp as usize);
+    trap.set_user_gpr(7, regs.r8 as usize);
+    trap.set_user_gpr(8, regs.r9 as usize);
+    trap.set_user_gpr(9, regs.r10 as usize);
+    trap.set_user_gpr(10, regs.r11 as usize);
+    trap.set_user_gpr(11, regs.r12 as usize);
+    trap.set_user_gpr(12, regs.r13 as usize);
+    trap.set_user_gpr(13, regs.r14 as usize);
+    trap.set_user_gpr(14, regs.r15 as usize);
     trap
 }
 

@@ -144,6 +144,9 @@ impl KernelState {
     ) -> Result<(), TrapHandleError> {
         if let Some(fault) = event.fault() {
             self.record_fault(fault);
+            if let Some(frame) = frame.as_ref() {
+                self.record_fault_frame_snapshot(frame);
+            }
         }
 
         match event {
