@@ -150,7 +150,10 @@ impl PhysicalFrameAllocator {
             return Err(FrameAllocError::OutOfMemory);
         }
 
-        if let Some(idx) = self.fast_path_extent_index(pages).or_else(|| self.find_extent_index(pages)) {
+        if let Some(idx) = self
+            .fast_path_extent_index(pages)
+            .or_else(|| self.find_extent_index(pages))
+        {
             let (alloc_phys, _, _) = self.split_extent_for_allocation(idx, pages)?;
             self.free_frames = self.free_frames.saturating_sub(pages);
             self.refresh_run_metadata();
@@ -292,7 +295,10 @@ impl PhysicalFrameAllocator {
                 if end < extent.start_phys || start > extent_end {
                     continue;
                 }
-                if end == extent.start_phys || start == extent_end || (start < extent_end && end > extent.start_phys) {
+                if end == extent.start_phys
+                    || start == extent_end
+                    || (start < extent_end && end > extent.start_phys)
+                {
                     start = start.min(extent.start_phys);
                     end = end.max(extent_end);
                     self.extents[idx] = None;
@@ -427,9 +433,20 @@ static PT_FRAME_ALLOCATOR: SpinLock<Option<PhysicalFrameAllocator>> = SpinLock::
 fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
     #[cfg(feature = "hosted-dev")]
     let len = 128 * 1024 * 1024;
-    #[cfg(not(feature = "hosted-dev"))]
+    #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "x86_64")))]
     let len = 512 * 1024 * 1024;
 
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    {
+        // Keep bootstrap page-table frames inside the 0..64MiB identity map window
+        // until full-RAM identity/high-half mappings are established.
+        [MemoryRegion {
+            start: 0x0080_0000,
+            len: 0x0380_0000,
+            usable: true,
+        }]
+    }
+    #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
     [MemoryRegion {
         start: crate::arch::platform_constants::NEXT_ANON_PHYS_BASE + (512 * 1024 * 1024),
         len,
@@ -632,7 +649,9 @@ mod tests {
                 })
                 .collect();
 
-            let run = alloc.alloc_contiguous(8).expect("contig after fragmentation");
+            let run = alloc
+                .alloc_contiguous(8)
+                .expect("contig after fragmentation");
             alloc.free_contiguous(run, 8).expect("free contig");
         }
 
