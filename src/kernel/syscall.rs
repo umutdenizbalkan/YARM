@@ -1415,6 +1415,46 @@ mod tests {
     }
 
     #[test]
+    fn shared_mem_send_rights_rejection_does_not_create_transfer_envelopes() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let readonly_object = state
+            .current_task_capability(mem_cap)
+            .expect("mem cap")
+            .object;
+        let readonly_cap = state
+            .mint_capability_for_current_context(crate::kernel::capabilities::Capability::new(
+                readonly_object,
+                CapRights::READ,
+            ))
+            .expect("readonly cap");
+
+        for _ in 0..64 {
+            let mut send = TrapFrame::new(
+                Syscall::IpcSend as usize,
+                [
+                    send_cap.0 as usize,
+                    0x2000,
+                    Message::MAX_PAYLOAD + 16,
+                    0,
+                    0,
+                    readonly_cap.0 as usize,
+                ],
+            );
+            let err = dispatch(&mut state, &mut send).expect_err("missing map right");
+            assert_eq!(err, SyscallError::MissingRight);
+        }
+        let t = state.ipc_path_telemetry();
+        assert_eq!(t.transfer_records_created, 0);
+    }
+
+    #[test]
     fn syscall_transfer_release_unmaps_receiver_range_and_revokes_transfer_cap() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");

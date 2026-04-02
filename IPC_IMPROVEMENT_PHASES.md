@@ -82,6 +82,8 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 
 - Shared-memory transfer-cap preflight validation:
   - `IpcSend` large-payload transfer path now requires transfer cap rights `READ|MAP` before descriptor send.
+- Rights-rejection leak canary:
+  - repeated shared-memory send rejection due to missing `MAP` right leaves `transfer_records_created` unchanged (`0`).
 
 ## Phase 6 — Service migration and deprecation
 
