@@ -139,6 +139,7 @@ impl KernelState {
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
+        let _ = self.revoke_reply_caps_for_caller(tid);
         self.enqueue_task(tid).map(|_| ())
     }
 
