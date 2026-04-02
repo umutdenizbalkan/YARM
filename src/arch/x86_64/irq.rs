@@ -35,10 +35,6 @@ pub fn init_lapic_mmio_base(base: usize) {
     if base == 0 {
         return;
     }
-    #[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    crate::arch::x86_64::console::write_line("LI0");
-    #[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    crate::arch::x86_64::console::write_line("LI1");
     lapic_write_u32(
         base,
         LAPIC_SVR_OFFSET,
@@ -47,8 +43,6 @@ pub fn init_lapic_mmio_base(base: usize) {
     lapic_program_timer_deadline(base, super::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS);
     LAPIC_MMIO_BASE.store(base, Ordering::Relaxed);
     LAPIC_CONFIGURED.store(true, Ordering::Relaxed);
-    #[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    crate::arch::x86_64::console::write_line("LI2");
 }
 
 #[cfg(all(feature = "hosted-dev", not(test)))]
