@@ -513,18 +513,21 @@ fn handle_ipc_recv_timeout(
         .resolve_current_task_capability(cap)
         .ok_or(SyscallError::InvalidCapability)?
         .object;
-    let spin_budget = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
+    let timeout_ticks = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) as u64;
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let user_len = frame.arg(SYSCALL_ARG_LEN);
-    let mut received = kernel.try_ipc_recv(cap).map_err(SyscallError::from)?;
-    if received.is_none() {
-        for _ in 0..spin_budget {
-            kernel.yield_current().map_err(SyscallError::from)?;
-            received = kernel.try_ipc_recv(cap).map_err(SyscallError::from)?;
-            if received.is_some() {
-                break;
-            }
+    let start_tick = kernel.scheduler_tick_now();
+    let mut received;
+    loop {
+        received = kernel.try_ipc_recv(cap).map_err(SyscallError::from)?;
+        if received.is_some() {
+            break;
         }
+        let now = kernel.scheduler_tick_now();
+        if timeout_ticks == 0 || now.wrapping_sub(start_tick) >= timeout_ticks {
+            break;
+        }
+        kernel.yield_current().map_err(SyscallError::from)?;
     }
     handle_ipc_recv_result(kernel, frame, endpoint, user_ptr, user_len, received)
 }
@@ -739,6 +742,19 @@ mod tests {
         assert_eq!(frame.error_code(), None);
         assert_eq!(frame.ret0(), 7);
         assert_eq!(frame.ret1(), 2);
+    }
+
+    #[test]
+    fn syscall_recv_timeout_zero_returns_would_block_when_empty() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecvTimeout as usize,
+            [recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut frame).expect("recv timeout");
+        assert_eq!(frame.error_code(), Some(SyscallError::WouldBlock.code()));
     }
 
     #[test]

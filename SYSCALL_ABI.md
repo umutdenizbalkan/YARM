@@ -28,7 +28,7 @@
 - `args[0]`: receive endpoint capability id
 - `args[1]`: user receive buffer pointer
 - `args[2]`: user receive buffer length
-- `args[3]`: retry budget (number of scheduler-yield retries after initial probe)
+- `args[3]`: timeout budget in scheduler ticks (`0` means immediate probe)
 - `args[4]`: reserved (must be `0`)
 - `args[5]`: reserved (must be `0`)
 

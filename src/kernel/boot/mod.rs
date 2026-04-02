@@ -601,6 +601,11 @@ impl KernelState {
         sched.timer.current_ticks().0
     }
 
+    pub(crate) fn scheduler_tick_now(&self) -> u64 {
+        let sched = self.scheduler_state.lock();
+        sched.timer.current_ticks().0
+    }
+
     fn with_ipc_state<R>(&self, f: impl FnOnce(&IpcSubsystem) -> R) -> R {
         let _ipc_guard = self.ipc_state_lock.lock();
         f(kernel_ref(&self.ipc))

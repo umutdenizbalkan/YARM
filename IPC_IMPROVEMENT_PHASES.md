@@ -8,7 +8,8 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 
 - ✅ **Phase 0 — Baseline and rollback guardrails** (implemented in this pass).
 - ✅ **Phase 1 — Payload capacity and framing policy** (completed in this pass).
-- ⏳ **Phases 2–6** (not implemented yet).
+- 🟡 **Phase 2 — Real IPC timeout semantics** (partially implemented in this pass: timeout argument now tick-based in syscall path; timed wait-state/wakeup integration still pending).
+- ⏳ **Phases 3–6** (not implemented yet).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -104,3 +105,10 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Medium payload fragmentation design: `IPC_FRAGMENTATION_POLICY.md`
 - Repro benchmark command:
   - `cargo test -q --test phase1_payload_bench -- --nocapture`
+
+## Phase 2 artifacts (partial)
+
+- Tick-budget timeout receive syscall semantics:
+  - `src/kernel/syscall.rs` (`IpcRecvTimeout` now interprets `args[3]` as timeout ticks).
+- ABI doc update:
+  - `SYSCALL_ABI.md` (`IpcRecvTimeout` args[3] documented as timeout ticks).
