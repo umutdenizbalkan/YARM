@@ -182,6 +182,33 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
     - all core control-plane services use migrated receive/call-reply paths,
     - deprecated paths are either removed or marked with a dated sunset policy.
 
+### Proposed PR rollout (step-by-step)
+
+- PR-6.1 — Core-service inventory + migration matrix freeze
+  - produce a concrete table of all control-plane services, current receive/reply primitive, and target primitive (`try/timed recv`, `IpcCall/IpcReply`, notification path).
+  - annotate owner + risk + test gate per service.
+  - **Exit check:** matrix is checked in and referenced by Phase 6 docs.
+
+- PR-6.2 — Remaining service receive-loop migration (timed/budgeted)
+  - migrate each remaining service loop to budgeted receive helpers (nonblocking probe + timed wait fallback where allowed).
+  - add per-service source guardrails blocking regression to legacy blocking `ipc_recv`.
+  - **Exit check:** per-service migration tests and guardrails pass.
+
+- PR-6.3 — Request/reply choreography replacement (`IpcCall/IpcReply`)
+  - replace ad-hoc two-endpoint reply choreography in remaining core service RPC flows with reply-cap call/reply where semantically equivalent.
+  - preserve compatibility shims only where replacement is not yet safe.
+  - **Exit check:** call/reply lifecycle tests pass for migrated services (single-use + revocation + responder binding).
+
+- PR-6.4 — Deprecation sunset policy + dated removal target
+  - publish explicit deprecation timeline (target release/date) for legacy request/reply choreography and blocking receive usage in core services.
+  - mark any temporary compatibility shims with sunset milestone.
+  - **Exit check:** deprecation section includes concrete date/release and affected paths.
+
+- PR-6.5 — Migration guide + final exit-gate bundle
+  - publish operator/developer migration guide with per-service cutover status and compatibility window closure rules.
+  - add a single Phase 6 gate suite that asserts all core control-plane services are migrated or have a dated sunset waiver.
+  - **Exit check:** Phase 6 can be flipped from in-progress to complete once gate suite is green.
+
 ## Cross-phase quality gates
 
 - ABI versioning and changelog updates per phase.
