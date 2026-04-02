@@ -100,6 +100,10 @@ impl KernelState {
                 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
                 crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);
                 let (_tick, should_preempt) = self.tick_scheduler_timer();
+                let _ = self
+                    .process_ipc_timeout_deadlines(_tick.0)
+                    .map_err(SyscallError::from)
+                    .map_err(TrapHandleError::Syscall)?;
                 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
                 crate::yarm_log!(
                     "YARM_SCHED_TICK cpu={} tick={} preempt={}",

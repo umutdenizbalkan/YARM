@@ -32,6 +32,11 @@
 - `args[4]`: reserved (must be `0`)
 - `args[5]`: reserved (must be `0`)
 
+`IpcRecvTimeout` semantics:
+
+- `args[3] == 0`: immediate probe, empty queue returns `WouldBlock`.
+- `args[3] > 0`: kernel arms a timed wait-state and returns `TimedOut` when the deadline expires without a message.
+
 ### `VmMap` argument layout
 
 - `args[0]`: address-space mapping capability id (`CapId`)

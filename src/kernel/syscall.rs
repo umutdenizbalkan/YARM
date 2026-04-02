@@ -517,26 +517,22 @@ fn handle_ipc_recv_timeout(
     let timeout_ticks = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) as u64;
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let user_len = frame.arg(SYSCALL_ARG_LEN);
-    let start_tick = kernel.scheduler_tick_now();
-    let mut received;
-    let mut timed_out = false;
-    let mut yielded_steps = 0u64;
-    loop {
-        received = kernel.try_ipc_recv(cap).map_err(SyscallError::from)?;
-        if received.is_some() {
-            break;
-        }
-        let now = kernel.scheduler_tick_now();
-        if timeout_ticks == 0
-            || now.wrapping_sub(start_tick) >= timeout_ticks
-            || yielded_steps >= timeout_ticks
-        {
-            timed_out = timeout_ticks != 0;
-            break;
-        }
-        kernel.yield_current().map_err(SyscallError::from)?;
-        yielded_steps = yielded_steps.saturating_add(1);
-    }
+    let waiter_tid = current_tid(kernel)?;
+    let received = if timeout_ticks == 0 {
+        kernel.try_ipc_recv(cap).map_err(SyscallError::from)?
+    } else {
+        kernel
+            .ipc_recv_with_deadline(cap, timeout_ticks)
+            .map_err(SyscallError::from)?
+    };
+    let timed_out = if timeout_ticks == 0 {
+        false
+    } else {
+        let fired = kernel
+            .consume_ipc_timeout_fired_for_tid(waiter_tid)
+            .map_err(SyscallError::from)?;
+        fired || received.is_none()
+    };
     handle_ipc_recv_result_with_empty_error(
         kernel,
         frame,

@@ -8,7 +8,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 
 - ✅ **Phase 0 — Baseline and rollback guardrails** (implemented in this pass).
 - ✅ **Phase 1 — Payload capacity and framing policy** (completed in this pass).
-- 🟡 **Phase 2 — Real IPC timeout semantics** (partially implemented in this pass: timeout argument now tick-based in syscall path; timed wait-state/wakeup integration still pending).
+- ✅ **Phase 2 — Real IPC timeout semantics** (completed in this pass).
 - ⏳ **Phases 3–6** (not implemented yet).
 
 ## Phase 0 — Baseline and rollback guardrails
@@ -106,11 +106,14 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Repro benchmark command:
   - `cargo test -q --test phase1_payload_bench -- --nocapture`
 
-## Phase 2 artifacts (partial)
+## Phase 2 artifacts
 
 - Tick-budget timeout receive syscall semantics:
   - `src/kernel/syscall.rs` (`IpcRecvTimeout` now interprets `args[3]` as timeout ticks).
 - Timeout expiry result semantics:
   - non-zero timeout expiry now returns `TimedOut` (distinct from `WouldBlock`).
+- Timed wait-state + deadline wake integration:
+  - `src/kernel/boot/ipc_state.rs` (`ipc_recv_with_deadline`, `ipc_send_with_deadline`, per-task IPC timeout markers, deadline scanner).
+  - `src/kernel/boot/fault_state.rs` (timer interrupt now processes expired IPC deadlines).
 - ABI doc update:
   - `SYSCALL_ABI.md` (`IpcRecvTimeout` args[3] documented as timeout ticks).

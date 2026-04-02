@@ -136,6 +136,10 @@ pub struct ThreadControlBlock {
     pub kernel_context: KernelExecutionContext,
     /// If set, scheduler enqueues this task only on the selected CPU.
     pub cpu_affinity: Option<CpuId>,
+    /// Absolute scheduler tick at which an IPC wait should timeout.
+    pub ipc_timeout_deadline: Option<u64>,
+    /// Set when a blocked IPC wait is resumed due to timeout expiry.
+    pub ipc_timeout_fired: bool,
 }
 
 impl ThreadControlBlock {
@@ -154,6 +158,8 @@ impl ThreadControlBlock {
             restart: RestartState::default(),
             kernel_context: KernelExecutionContext::default(),
             cpu_affinity: None,
+            ipc_timeout_deadline: None,
+            ipc_timeout_fired: false,
         }
     }
 }

@@ -3087,6 +3087,77 @@ mod tests {
     }
 
     #[test]
+    fn ipc_recv_deadline_timeout_wakes_blocked_waiter_on_timer_tick() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_timer_for_test(Timer::new(1));
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch to task1");
+        let blocked_tid = state.current_tid().expect("running tid");
+
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let first = state
+            .ipc_recv_with_deadline(recv_cap, 1)
+            .expect("deadline recv should not fail");
+        assert_eq!(first, None);
+        assert_eq!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap)))
+        );
+
+        state
+            .handle_trap(Trap::TimerInterrupt, None)
+            .expect("timer trap");
+
+        assert!(matches!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Runnable | TaskStatus::Running)
+        ));
+        assert!(
+            state
+                .consume_ipc_timeout_fired_for_tid(blocked_tid)
+                .expect("consume timeout marker"),
+            "timeout marker should be set when deadline wake fires"
+        );
+    }
+
+    #[test]
+    fn ipc_send_deadline_timeout_wakes_blocked_sender_on_timer_tick() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_timer_for_test(Timer::new(1));
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch to task1");
+        let blocked_tid = state.current_tid().expect("running tid");
+
+        let (_eid, send_cap, _recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+        let msg = Message::new(1, b"x").expect("msg");
+        let send_result = state.ipc_send_with_deadline(send_cap, msg, 1);
+        assert_eq!(send_result, Err(KernelError::WouldBlock));
+        assert_eq!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+        );
+
+        state
+            .handle_trap(Trap::TimerInterrupt, None)
+            .expect("timer trap");
+
+        assert!(matches!(
+            state.task_status(blocked_tid),
+            Some(TaskStatus::Runnable | TaskStatus::Running)
+        ));
+        assert!(
+            state
+                .consume_ipc_timeout_fired_for_tid(blocked_tid)
+                .expect("consume timeout marker"),
+            "timeout marker should be set when send wait times out"
+        );
+    }
+
+    #[test]
     fn normalized_page_fault_event_faults_current_task() {
         let mut state = Bootstrap::init().expect("init");
         state.register_task(1).expect("task1");
