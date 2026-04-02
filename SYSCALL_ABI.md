@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# YARM Syscall ABI v6 (Frozen Contract)
+# YARM Syscall ABI v7 (Frozen Contract)
 
-- ABI Version: `6`
-- Syscall count: `5`
+- ABI Version: `7`
+- Syscall count: `6`
 
 ## Syscall numbers
 
@@ -12,6 +12,7 @@
 - `2`: `IpcRecv`
 - `3`: `VmMap` (YARM-native VM map syscall, capability-targeted)
 - `4`: `TransferRelease` (release a recv auto-mapped shared-memory transfer)
+- `5`: `IpcRecvTimeout` (bounded non-blocking receive with scheduler-yield retry budget)
 
 ## Argument register layout (`args[0..]`)
 
@@ -21,6 +22,15 @@
 - `args[3]`: inline payload lane 0 (kernel/no-ASID path) and recv metadata lane 0
 - `args[4]`: inline payload lane 1 (kernel/no-ASID path) and recv metadata lane 1
 - `args[5]`: optional transfer capability id (`0` or `u64::MAX` => none)
+
+### `IpcRecvTimeout` argument layout
+
+- `args[0]`: receive endpoint capability id
+- `args[1]`: user receive buffer pointer
+- `args[2]`: user receive buffer length
+- `args[3]`: retry budget (number of scheduler-yield retries after initial probe)
+- `args[4]`: reserved (must be `0`)
+- `args[5]`: reserved (must be `0`)
 
 ### `VmMap` argument layout
 

@@ -134,10 +134,10 @@ const _: () = assert!(Message::MAX_PAYLOAD <= (u8::MAX as usize));
 impl Message {
     /// Payload bytes encoded directly in the fixed in-kernel `Message` envelope.
     ///
-    /// This is intentionally a full 64-byte lane so control-plane requests that
+    /// This is intentionally a fixed-size lane so control-plane requests that
     /// carry structured ABI records (for example supervisor registration records)
     /// can encode distinct length fields without out-of-band packing.
-    pub const MAX_PAYLOAD: usize = 64;
+    pub const MAX_PAYLOAD: usize = 128;
     pub const FLAG_CAP_TRANSFER: u16 = 1 << 0;
     pub const NO_TRANSFER_CAP: u64 = u64::MAX;
 
