@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
-use crate::kernel::capabilities::CapId;
+use crate::kernel::capabilities::{CapId, CapRights};
 use crate::kernel::ipc::{Message, ThreadId};
 use crate::kernel::supervisor_abi::{
     CoreServiceRegistrationKind, DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert,
@@ -19,6 +19,7 @@ use crate::services::init::{
 
 const MAX_MANAGED_SERVICES: usize = 8;
 const MAX_DEPENDENTS: usize = 8;
+const SUPERVISOR_RECV_BUDGET_TICKS: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedServiceKind {
@@ -412,13 +413,42 @@ impl SupervisorService {
             .min_by_key(|tick| tick.0)
     }
 
+    fn recv_with_budget(
+        &self,
+        kernel: &mut KernelState,
+        recv_cap: CapId,
+    ) -> Result<Option<Message>, KernelError> {
+        match kernel.try_ipc_recv(recv_cap) {
+            Ok(Some(msg)) => return Ok(Some(msg)),
+            Ok(None) => {}
+            Err(KernelError::TaskMissing) => return Ok(None),
+            Err(other) => return Err(other),
+        }
+
+        if !kernel.current_task_capability_has_right(recv_cap, CapRights::RECEIVE) {
+            return Ok(None);
+        }
+
+        match kernel.ipc_recv_with_deadline(recv_cap, SUPERVISOR_RECV_BUDGET_TICKS) {
+            Ok(msg) => Ok(msg),
+            Err(KernelError::TaskMissing)
+            | Err(KernelError::InvalidCapability)
+            | Err(KernelError::MissingRight) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
     pub fn service_step(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
         let mut changed = 0usize;
-        while let Some(request) = kernel.try_ipc_recv(self.handoff.supervisor_control_recv_cap)? {
+        while let Some(request) =
+            self.recv_with_budget(kernel, self.handoff.supervisor_control_recv_cap)?
+        {
             self.handle_control_request(kernel, request)?;
             changed += 1;
         }
-        while let Some(message) = kernel.try_ipc_recv(self.handoff.supervisor_fault_recv_cap)? {
+        while let Some(message) =
+            self.recv_with_budget(kernel, self.handoff.supervisor_fault_recv_cap)?
+        {
             match message.opcode {
                 SUPERVISOR_OP_TASK_EXITED => {
                     let event = TaskExitedEvent::decode(message.as_slice())
@@ -670,6 +700,15 @@ mod tests {
             .expect("seed");
         let supervisor = SupervisorService::new(1, handoff, init.restart_policies());
         (kernel, init, handoff, supervisor)
+    }
+
+    #[test]
+    fn supervisor_source_guardrail_prefers_try_or_budgeted_receive_paths() {
+        let src = include_str!("service.rs");
+        let legacy_call = ["kernel", ".ipc_recv", "("].concat();
+        assert!(src.contains("try_ipc_recv("));
+        assert!(src.contains("ipc_recv_with_deadline("));
+        assert!(!src.contains(legacy_call.as_str()));
     }
 
     #[test]

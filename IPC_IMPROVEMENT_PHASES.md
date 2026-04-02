@@ -12,7 +12,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - ✅ **Phase 3 — Lightweight notification primitive** (completed in this pass).
 - 🟡 **Phase 4 — Call/Reply capability model** (Slices 1–3 syscall wiring complete: `IpcCall` + `IpcReply` available; lifecycle hardening in progress: caller exit/reap/restart revocation and responder-task binding added).
 - ✅ **Phase 5 — Shared-memory transfer hardening** (passes 1–3 complete: recv rights attenuation + failure rollback + fault/cancel accounting + repeated teardown canaries).
-- 🟡 **Phase 6 — Service migration and deprecation** (pass 1: migration matrix + compatibility window + deprecation policy documented; service-by-service runtime migration still pending).
+- 🟡 **Phase 6 — Service migration and deprecation** (passes 1–6 in progress: policy + VFS timed-recv migration + supervisor receive-loop budgeted migration; full core-service cutover/deprecation sunset pending).
 
 ## Phase 0 — Baseline and rollback guardrails
 
@@ -152,6 +152,15 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
   - pass-2 (timed recv path), pass-3 (explicit budget helper), and pass-4 (source guardrail) are now validated together as the pass-5 compatibility bundle.
 - Guardrail stabilization:
   - VFS source-level regression guardrail now checks for legacy blocking `ipc_recv` usage via a non-self-referential pattern, preventing false positives in the guard test itself.
+
+## Phase 6 artifacts (pass 6)
+
+- Supervisor receive-loop migration:
+  - `src/services/control_plane/supervisor/service.rs` now drains control/fault queues via a budget-aware helper (`recv_with_budget`) that probes nonblocking first and then uses timed receive where capability context allows.
+- Supervisor migration guardrail:
+  - added source-level canary requiring supervisor loop code to keep try/budgeted receive paths and reject regression to legacy blocking `ipc_recv`.
+- Exit-gate re-evaluation:
+  - Phase 6 remains in-progress: VFS + supervisor receive-loop migration slices are landed, but full core control-plane migration/deprecation sunset is still pending.
 
 ## Cross-phase quality gates
 

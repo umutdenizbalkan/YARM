@@ -103,6 +103,7 @@
 - **Current migration snapshot (pass 3)**: VFS migration path now uses an explicit receive-budget helper for timed queue draining, including zero-tick budget coverage for already-queued request/reply flow.
 - **Current migration snapshot (pass 4)**: VFS migration includes a deprecation guardrail test that blocks regression to legacy blocking `IpcRecv` usage in the migrated control-plane roundtrip path.
 - **Current migration snapshot (pass 5)**: VFS migration pass-2/3/4 bundle is validated together, with stabilized deprecation guardrail enforcement against legacy blocking `IpcRecv` regression.
+- **Current migration snapshot (pass 6)**: Supervisor control-plane receive loop now uses budget-aware receive draining (nonblocking probe plus timed receive when possible), with guardrails against regression to legacy blocking `IpcRecv`.
 
 ## Return layout
 
