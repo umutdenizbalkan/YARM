@@ -146,6 +146,13 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Compatibility validation checkpoint:
   - pass-2 and pass-3 VFS timed-recv path tests remain green alongside the new deprecation guardrail.
 
+## Phase 6 artifacts (pass 5)
+
+- Compatibility + deprecation validation expansion for first migrated cut (VFS):
+  - pass-2 (timed recv path), pass-3 (explicit budget helper), and pass-4 (source guardrail) are now validated together as the pass-5 compatibility bundle.
+- Guardrail stabilization:
+  - VFS source-level regression guardrail now checks for legacy blocking `ipc_recv` usage via a non-self-referential pattern, preventing false positives in the guard test itself.
+
 ## Cross-phase quality gates
 
 - ABI versioning and changelog updates per phase.
