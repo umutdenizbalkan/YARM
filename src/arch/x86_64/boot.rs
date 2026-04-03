@@ -42,6 +42,8 @@ boot_pd:
     // Bootstrap identity map:
     // - first 2MiB via 4KiB PTEs for early transition flexibility
     // - 2MiB..64MiB via 2MiB executable pages to tolerate firmware/kernel placement
+    // NOTE: W^X hardening is completed later once the final kernel page tables
+    // are installed and CR3 is switched away from this bootstrap map.
     .set page_flags_pt, 0x03
     .set page_flags_exec, 0x83
     .quad boot_pt0 + page_flags_pt
@@ -129,20 +131,20 @@ pvh_start32:
 
     mov esp, offset boot_stack_end
 
-    // FIX: The assembler/linker fills the sub-table pointer quads with full
-    // 64-bit *virtual* addresses.  The CPU uses those bits as *physical*
-    // addresses during a page-table walk, so a high-half VMA in the upper 32
-    // bits causes an immediate page fault the first time paging is enabled.
-    // Under our link convention (LMA == VMA & 0xFFFFFFFF) the lower 32 bits
-    // already hold the correct physical address; we only need to zero the
-    // upper 32 bits of each sub-table pointer entry before loading CR3.
+    // FIXUP: The assembler/linker may emit full 64-bit *virtual* addresses
+    // for page-table *pointer* entries. During the hardware walk these bits
+    // are interpreted as physical addresses, so we must clear the upper dword
+    // on pointer entries before loading CR3.
+    //
+    // We intentionally do NOT patch bootstrap 2MiB leaf mappings (boot_pd and
+    // boot_pd_hi data leaves). Their values are emitted from 32-bit immediates
+    // here, so upper dwords are already correct under the low-physical boot map.
     mov dword ptr [boot_pml4 + 4], 0   // PML4[0]  upper dword → physical
     mov dword ptr [boot_pdpt + 4], 0   // PDPT[0]  upper dword → physical
     mov dword ptr [boot_pdpt + 28], 0  // PDPT[3]  upper dword → physical
     mov dword ptr [boot_pd   + 4], 0   // PD[0]    upper dword → physical
-    mov dword ptr [boot_pd_hi + 4], 0  // PD_HI[0] upper dword → physical
-    // The 2 MiB entries in boot_pd and all boot_pt0 entries are assembled
-    // from small immediates whose upper 32 bits are already zero.
+    // The 2 MiB entries in boot_pd_hi at indices 502 and 503 are assembled
+    // from low 32-bit immediates; their upper 32 bits are already zero.
 
     mov bl, 'A'
     call uart_putc32
