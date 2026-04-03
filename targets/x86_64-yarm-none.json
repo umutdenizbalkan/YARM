@@ -12,7 +12,7 @@
   "disable-redzone": true,
   "panic-strategy": "abort",
   "relocation-model": "static",
-  "code-model": "kernel",
+  "code-model": "medium",
   "linker-flavor": "gnu-lld",
   "linker": "rust-lld",
   "pre-link-args": {

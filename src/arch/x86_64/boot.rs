@@ -87,13 +87,46 @@ gdt64_ptr:
     .long gdt64
     .long 0
 
+    .align 16
+boot_idt:
+    .rept 256
+    .word emergency_idt_stub
+    .word 0x08
+    .byte 0
+    .byte 0x8E
+    .word emergency_idt_stub >> 16
+    .long emergency_idt_stub >> 32
+    .long 0
+    .endr
+boot_idt_end:
+
+boot_idt_ptr:
+    .word boot_idt_end - boot_idt - 1
+    .quad boot_idt
+
     .section .text.boot32,"ax",@progbits
     .code32
     .global pvh_start32
     .type pvh_start32,@function
 pvh_start32:
     cli
+    mov al, 0xFF
+    out 0x21, al
+    out 0xA1, al
     mov esi, ebx
+
+    // Zero .bss/.common for static mut / atomics expected to start at 0.
+    mov edi, offset __bss_start
+    mov ecx, offset __bss_end
+    sub ecx, edi
+    xor eax, eax
+    mov edx, ecx
+    shr ecx, 2
+    rep stosl
+    mov ecx, edx
+    and ecx, 3
+    rep stosb
+
     mov esp, offset boot_stack_end
 
     // FIX: The assembler/linker fills the sub-table pointer quads with full
@@ -162,14 +195,9 @@ uart_putc32:
 _start:
 long_mode_entry:
     cli
+    lidt [rip + boot_idt_ptr]
     lea rsp, [rip + boot_stack_end]
     xor rbp, rbp
-    // Zero .bss/.common for static mut / atomics expected to start at 0.
-    lea rdi, [rip + __bss_start]
-    lea rcx, [rip + __bss_end]
-    sub rcx, rdi
-    xor eax, eax
-    rep stosb
     mov ax, 0x10
     mov ds, ax
     mov es, ax
@@ -207,5 +235,11 @@ uart_putc64:
     pop rdx
     pop rax
     ret
+
+emergency_idt_stub:
+    cli
+1:
+    hlt
+    jmp 1b
     "#
 );
