@@ -10,6 +10,8 @@ PHDRS {
 
 SECTIONS {
   . = 0x100000;
+  __kernel_start = .;
+  __kernel_rx_start = .;
 
   .note.Xen : ALIGN(4) {
     KEEP(*(.note.Xen))
@@ -30,6 +32,9 @@ SECTIONS {
   .rodata : ALIGN(16) {
     *(.rodata*)
   } :text
+  __kernel_rx_end = .;
+
+  __kernel_rw_start = .;
 
   .data.boot : ALIGN(4096) {
     *(.data.boot)
@@ -51,6 +56,8 @@ SECTIONS {
   } :data
 
   __bss_end = .;
+  __kernel_rw_end = .;
+  __kernel_end = .;
 
   /DISCARD/ : {
     *(.eh_frame*)
