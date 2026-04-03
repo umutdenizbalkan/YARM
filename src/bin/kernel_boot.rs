@@ -11,6 +11,8 @@ use yarm::services::control_plane::init;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const PVH_MAGIC: u32 = 0x336e_c578;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_PHYS_EXCLUSIVE: u64 = 1u64 << 52;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_CMDLINE_BYTES: usize = 256;
@@ -59,6 +61,10 @@ fn log_pvh_boot_metadata(start_info_ptr: usize) {
         return;
     }
     let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+    if start_info._magic != PVH_MAGIC {
+        yarm::arch::x86_64::console::write_line("PVH_MAGIC_MISMATCH");
+        return;
+    }
 
     let mut cmdline_len = 0usize;
     let mut cmdline_preview = [0u8; 32];
@@ -140,6 +146,9 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
     }
 
     let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+    if start_info._magic != PVH_MAGIC {
+        return;
+    }
     if start_info.memmap_paddr == 0 || start_info.memmap_entries == 0 {
         return;
     }
@@ -427,9 +436,15 @@ pub extern "C" fn yarm_kernel_main(start_info_ptr: usize) -> ! {
     #[cfg(target_arch = "x86_64")]
     yarm::arch::x86_64::console::write_line("KM0");
     #[cfg(target_arch = "x86_64")]
+    yarm::arch::x86_64::console::write_line("KM1");
+    #[cfg(target_arch = "x86_64")]
     log_pvh_boot_metadata(start_info_ptr);
     #[cfg(target_arch = "x86_64")]
+    yarm::arch::x86_64::console::write_line("KM2");
+    #[cfg(target_arch = "x86_64")]
     init_pt_allocator_from_pvh_memmap(start_info_ptr);
+    #[cfg(target_arch = "x86_64")]
+    yarm::arch::x86_64::console::write_line("KM3");
     yarm::arch::boot_entry::run_kernel_boot(run);
     unreachable!("kernel run loop should not return");
 }
