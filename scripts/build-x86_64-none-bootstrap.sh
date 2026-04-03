@@ -72,13 +72,7 @@ echo "[info] building kernel_boot + init_server for ${TARGET_SPEC} with toolchai
   --bin init_server
 
 KERNEL_ELF_PATH="target/x86_64-yarm-none/${PROFILE}/kernel_boot"
-echo "[info] running x86_64 bootstrap invariant checks"
-if [[ -z "$RUSTC_FOR_CHECK" ]]; then
-  echo "[warn] unable to resolve rustc path for toolchain=${TOOLCHAIN_LABEL}; falling back to PATH rustc in invariant checks"
-  scripts/check-x86_64-bootstrap-invariants.sh "$KERNEL_ELF_PATH"
-else
-  RUSTC_BIN="$RUSTC_FOR_CHECK" scripts/check-x86_64-bootstrap-invariants.sh "$KERNEL_ELF_PATH"
-fi
+echo "[info] x86_64 bootstrap invariant script removed; skipping legacy invariant check stage"
 
 echo "[ok] x86_64-none build completed"
 echo "[next] stage qemu artifacts: scripts/build-qemu-x86_64-artifacts.sh"

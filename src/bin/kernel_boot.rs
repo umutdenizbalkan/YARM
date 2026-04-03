@@ -312,10 +312,10 @@ fn bootstrap_kernel_vm_identity_and_switch_cr3() -> Result<(), ()> {
         cache_policy: yarm::kernel::vm::CachePolicy::WriteBack,
     };
 
-    let rx_start = unsafe { core::ptr::addr_of!(__kernel_rx_start) as u64 };
-    let rx_end = unsafe { core::ptr::addr_of!(__kernel_rx_end) as u64 };
-    let rw_start = unsafe { core::ptr::addr_of!(__kernel_rw_start) as u64 };
-    let rw_end = unsafe { core::ptr::addr_of!(__kernel_rw_end) as u64 };
+    let rx_start = core::ptr::addr_of!(__kernel_rx_start) as u64;
+    let rx_end = core::ptr::addr_of!(__kernel_rx_end) as u64;
+    let rw_start = core::ptr::addr_of!(__kernel_rw_start) as u64;
+    let rw_end = core::ptr::addr_of!(__kernel_rw_end) as u64;
 
     yarm::arch::x86_64::page_table::ensure_asid_root(BOOT_KERNEL_ASID).map_err(|_| ())?;
     map_identity_range(BOOT_KERNEL_ASID, rx_start, rx_end, kernel_rx).map_err(|_| ())?;
