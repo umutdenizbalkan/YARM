@@ -60,6 +60,11 @@ impl KernelState {
                 return Ok(());
             }
 
+            #[cfg(target_arch = "x86_64")]
+            if let Some(stack_top) = incoming_tcb.kernel_context.stack_top {
+                crate::arch::x86_64::descriptor_tables::refresh_boot_tss_rsp0(stack_top.0);
+            }
+
             crate::arch::selected_isa::context_switch::switch_frames(
                 &mut outgoing_tcb.kernel_context.frame,
                 &incoming_tcb.kernel_context.frame,

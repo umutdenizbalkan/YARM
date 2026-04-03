@@ -942,6 +942,17 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
     let _ = DESCRIPTOR_SCAFFOLD_READY.swap(true, Ordering::AcqRel);
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn refresh_boot_tss_rsp0(rsp0: u64) {
+    ensure_boot_descriptor_tables_scaffolded();
+    unsafe {
+        BOOT_TSS.rsp0 = rsp0;
+    }
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+pub fn refresh_boot_tss_rsp0(_rsp0: u64) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,6 +984,16 @@ mod tests {
         ensure_boot_descriptor_tables_scaffolded();
         unsafe {
             assert_ne!(BOOT_TSS.rsp0, 0);
+        }
+    }
+
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    #[test]
+    fn refresh_boot_tss_rsp0_updates_tss_kernel_stack_top() {
+        ensure_boot_descriptor_tables_scaffolded();
+        refresh_boot_tss_rsp0(0x1234_5000);
+        unsafe {
+            assert_eq!(BOOT_TSS.rsp0, 0x1234_5000);
         }
     }
 
