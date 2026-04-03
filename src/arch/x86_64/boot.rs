@@ -7,8 +7,6 @@ use core::arch::global_asm;
 #[cfg(not(feature = "hosted-dev"))]
 global_asm!(
     r#"
-    .intel_syntax noprefix
-
     .section .note.Xen,"a",@note
     .align 4
     .long 4
@@ -141,7 +139,7 @@ pvh_start32:
     xor eax, eax
     mov edx, ecx
     shr ecx, 2
-    rep stosl
+    rep stosd
     mov ecx, edx
     and ecx, 3
     rep stosb
