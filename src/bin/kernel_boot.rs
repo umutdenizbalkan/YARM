@@ -361,6 +361,13 @@ fn run_boot_markers() {
     {
         debug_uart_marker(b'I');
         yarm::arch::x86_64::descriptor_tables::register_trap_kernel_state(&mut kernel);
+        if bootstrap_kernel_vm_identity_and_switch_cr3().is_ok() {
+            yarm::arch::x86_64::console::write_line("KM1");
+            debug_uart_marker(b'V');
+        } else {
+            yarm::arch::x86_64::console::write_line("KM1_ERR");
+            debug_uart_marker(b'X');
+        }
         kernel.program_timer_deadline_current_cpu(
             yarm::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
         );
@@ -423,16 +430,6 @@ pub extern "C" fn yarm_kernel_main(start_info_ptr: usize) -> ! {
     log_pvh_boot_metadata(start_info_ptr);
     #[cfg(target_arch = "x86_64")]
     init_pt_allocator_from_pvh_memmap(start_info_ptr);
-    #[cfg(target_arch = "x86_64")]
-    {
-        if bootstrap_kernel_vm_identity_and_switch_cr3().is_ok() {
-            yarm::arch::x86_64::console::write_line("KM1");
-            debug_uart_marker(b'V');
-        } else {
-            yarm::arch::x86_64::console::write_line("KM1_ERR");
-            debug_uart_marker(b'X');
-        }
-    }
     yarm::arch::boot_entry::run_kernel_boot(run);
     unreachable!("kernel run loop should not return");
 }
