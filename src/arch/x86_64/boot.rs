@@ -112,6 +112,23 @@ boot_idt_ptr:
     .type pvh_start32,@function
 pvh_start32:
     cli
+    // Remap legacy 8259 PIC vectors away from CPU exception slots.
+    // Master: 0x20..0x27, Slave: 0x28..0x2F.
+    mov al, 0x11
+    out 0x20, al
+    out 0xA0, al
+    mov al, 0x20
+    out 0x21, al
+    mov al, 0x28
+    out 0xA1, al
+    mov al, 0x04
+    out 0x21, al
+    mov al, 0x02
+    out 0xA1, al
+    mov al, 0x01
+    out 0x21, al
+    out 0xA1, al
+    // Mask all PIC IRQ inputs; LAPIC/IOAPIC takeover happens later.
     mov al, 0xFF
     out 0x21, al
     out 0xA1, al
