@@ -89,15 +89,7 @@ gdt64_ptr:
 
     .align 16
 boot_idt:
-    .rept 256
-    .word emergency_idt_stub
-    .word 0x08
-    .byte 0
-    .byte 0x8E
-    .word emergency_idt_stub >> 16
-    .long emergency_idt_stub >> 32
-    .long 0
-    .endr
+    .zero 4096
 boot_idt_end:
 
 boot_idt_ptr:
@@ -212,6 +204,25 @@ uart_putc32:
 _start:
 long_mode_entry:
     cli
+    // Populate a minimal catch-all IDT in-memory: all 256 gates -> emergency_idt_stub.
+    lea r8, [rip + emergency_idt_stub]
+    lea rdi, [rip + boot_idt]
+    mov ecx, 256
+0:
+    mov word ptr [rdi + 0], r8w
+    mov word ptr [rdi + 2], 0x08
+    mov byte ptr [rdi + 4], 0
+    mov byte ptr [rdi + 5], 0x8E
+    mov rax, r8
+    shr rax, 16
+    mov word ptr [rdi + 6], ax
+    mov rax, r8
+    shr rax, 32
+    mov dword ptr [rdi + 8], eax
+    mov dword ptr [rdi + 12], 0
+    add rdi, 16
+    dec ecx
+    jnz 0b
     lidt [rip + boot_idt_ptr]
     lea rsp, [rip + boot_stack_end]
     xor rbp, rbp
