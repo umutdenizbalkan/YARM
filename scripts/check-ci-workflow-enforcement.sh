@@ -27,8 +27,8 @@ if ! rg -n "core-profile:" "$compat" >/dev/null; then
   echo "[fail] compat-gates workflow must include core-profile job"
   bad=1
 fi
-if ! rg -n "linux-compat-profile:" "$compat" >/dev/null; then
-  echo "[fail] compat-gates workflow must include linux-compat-profile job"
+if ! rg -n "posix-compat-profile:" "$compat" >/dev/null; then
+  echo "[fail] compat-gates workflow must include posix-compat-profile job"
   bad=1
 fi
 

@@ -392,7 +392,7 @@ mod tests {
     use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
     #[test]
-    fn memory_syscall_numbers_match_linux_abi_contract() {
+    fn memory_syscall_numbers_match_linux_backend_abi_contract() {
         let nums = memory_syscall_numbers();
         assert_eq!(nums.brk, LINUX_NR_BRK);
         assert_eq!(nums.mmap, LINUX_NR_MMAP);

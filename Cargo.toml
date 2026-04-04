@@ -9,7 +9,8 @@ autobins = false
 [features]
 default = ["hosted-dev"]
 hosted-dev = []
-linux-compat = []
+posix-compat = []
+linux-compat = ["posix-compat"]
 
 [dependencies]
 
@@ -94,7 +95,7 @@ path = "src/bin/kernel_boot.rs"
 [[bin]]
 name = "posix_compat_srv"
 path = "src/bin/posix_compat_srv.rs"
-required-features = ["hosted-dev", "linux-compat"]
+required-features = ["hosted-dev", "posix-compat"]
 
 [[bin]]
 name = "netmgr_srv"

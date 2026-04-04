@@ -294,7 +294,7 @@ impl KernelState {
         Ok(unmapped)
     }
 
-    #[cfg(feature = "linux-compat")]
+    #[cfg(feature = "posix-compat")]
     pub(crate) fn map_user_page_in_asid_with_caps(
         &mut self,
         asid: Asid,
@@ -404,7 +404,7 @@ impl KernelState {
         Ok(old)
     }
 
-    #[cfg(feature = "linux-compat")]
+    #[cfg(feature = "posix-compat")]
     pub(crate) fn protect_user_page_in_asid(
         &mut self,
         asid: Asid,

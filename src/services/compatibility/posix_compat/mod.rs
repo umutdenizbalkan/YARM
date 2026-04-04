@@ -399,7 +399,7 @@ impl KernelState {
         self.task_asid(tid).ok_or(PosixErrno::NoSys)
     }
 
-    pub fn linux_mmap_region(
+    pub fn posix_mmap_region(
         &mut self,
         aspace_map_cap: CapId,
         addr: usize,
@@ -426,7 +426,7 @@ impl KernelState {
         Ok(addr)
     }
 
-    pub fn linux_mmap_region_current_task(
+    pub fn posix_mmap_region_current_task(
         &mut self,
         addr: usize,
         len: usize,
@@ -452,7 +452,7 @@ impl KernelState {
         Ok(addr)
     }
 
-    pub fn linux_munmap_region(
+    pub fn posix_munmap_region(
         &mut self,
         aspace_map_cap: CapId,
         addr: usize,
@@ -473,7 +473,7 @@ impl KernelState {
         Ok(())
     }
 
-    pub fn linux_munmap_region_current_task(
+    pub fn posix_munmap_region_current_task(
         &mut self,
         addr: usize,
         len: usize,
@@ -494,7 +494,7 @@ impl KernelState {
         Ok(())
     }
 
-    pub fn linux_mprotect_region(
+    pub fn posix_mprotect_region(
         &mut self,
         aspace_map_cap: CapId,
         addr: usize,
@@ -517,7 +517,7 @@ impl KernelState {
         Ok(())
     }
 
-    pub fn linux_mprotect_region_current_task(
+    pub fn posix_mprotect_region_current_task(
         &mut self,
         addr: usize,
         len: usize,
@@ -540,7 +540,7 @@ impl KernelState {
         Ok(())
     }
 
-    pub fn linux_brk(
+    pub fn posix_brk(
         &mut self,
         tid: u64,
         aspace_map_cap: CapId,
@@ -565,11 +565,11 @@ impl KernelState {
             let map_start = current_rounded;
             let map_len = requested_rounded - map_start;
             if map_len > 0 {
-                self.linux_mmap_region(aspace_map_cap, map_start, map_len, prot)?;
+                self.posix_mmap_region(aspace_map_cap, map_start, map_len, prot)?;
             }
         } else if requested_rounded < current_rounded {
             let unmap_len = current_rounded - requested_rounded;
-            self.linux_munmap_region(aspace_map_cap, requested_rounded, unmap_len)?;
+            self.posix_munmap_region(aspace_map_cap, requested_rounded, unmap_len)?;
         }
 
         self.set_task_brk_bounds(tid, base, requested_end)
@@ -577,7 +577,7 @@ impl KernelState {
         Ok(requested_end)
     }
 
-    pub fn linux_brk_current_task(
+    pub fn posix_brk_current_task(
         &mut self,
         tid: u64,
         requested_end: usize,
@@ -601,11 +601,11 @@ impl KernelState {
             let map_start = current_rounded;
             let map_len = requested_rounded - map_start;
             if map_len > 0 {
-                self.linux_mmap_region_current_task(map_start, map_len, prot)?;
+                self.posix_mmap_region_current_task(map_start, map_len, prot)?;
             }
         } else if requested_rounded < current_rounded {
             let unmap_len = current_rounded - requested_rounded;
-            self.linux_munmap_region_current_task(requested_rounded, unmap_len)?;
+            self.posix_munmap_region_current_task(requested_rounded, unmap_len)?;
         }
 
         self.set_task_brk_bounds(tid, base, requested_end)
@@ -729,19 +729,19 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
                 let addr = frame.arg(LINUX_ARG0);
                 let len = frame.arg(LINUX_ARG1);
                 let prot = frame.arg(LINUX_ARG2);
-                kernel.linux_mmap_region_current_task(addr, len, prot)
+                kernel.posix_mmap_region_current_task(addr, len, prot)
             }
             PosixCompatSyscall::Munmap => {
                 let addr = frame.arg(LINUX_ARG0);
                 let len = frame.arg(LINUX_ARG1);
-                kernel.linux_munmap_region_current_task(addr, len)?;
+                kernel.posix_munmap_region_current_task(addr, len)?;
                 Ok(0)
             }
             PosixCompatSyscall::Mprotect => {
                 let addr = frame.arg(LINUX_ARG0);
                 let len = frame.arg(LINUX_ARG1);
                 let prot = frame.arg(LINUX_ARG2);
-                kernel.linux_mprotect_region_current_task(addr, len, prot)?;
+                kernel.posix_mprotect_region_current_task(addr, len, prot)?;
                 Ok(0)
             }
             PosixCompatSyscall::Dup => {
@@ -865,7 +865,7 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
             PosixCompatSyscall::Brk => {
                 let requested = frame.arg(LINUX_ARG0);
                 let tid = kernel.current_tid().ok_or(PosixErrno::NoSys)?;
-                kernel.linux_brk_current_task(tid, requested, PROT_READ | PROT_WRITE)
+                kernel.posix_brk_current_task(tid, requested, PROT_READ | PROT_WRITE)
             }
         })();
 
@@ -957,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_vfs_payload_helpers_are_stable() {
+    fn posix_vfs_payload_helpers_are_stable() {
         let epoll = pack_epoll_ctl(4, 2, 9, 0xABC0);
         let sendfile = pack_sendfile(3, 8, 0x1000, 4096);
         let statx = pack_statx(5, 0x2000, 0x4, 0x7FF);
@@ -1093,25 +1093,25 @@ mod tests {
         let (_asid, aspace_cap) = state.create_user_address_space().expect("aspace");
 
         let addr = state
-            .linux_mmap_region(aspace_cap, 0x4000, PAGE_SIZE * 3, PROT_READ | PROT_WRITE)
+            .posix_mmap_region(aspace_cap, 0x4000, PAGE_SIZE * 3, PROT_READ | PROT_WRITE)
             .expect("mmap");
         assert_eq!(addr, 0x4000);
 
         state
-            .linux_mprotect_region(aspace_cap, 0x4000, PAGE_SIZE * 3, PROT_READ)
+            .posix_mprotect_region(aspace_cap, 0x4000, PAGE_SIZE * 3, PROT_READ)
             .expect("mprotect");
         state
-            .linux_munmap_region(aspace_cap, 0x4000, PAGE_SIZE * 3)
+            .posix_munmap_region(aspace_cap, 0x4000, PAGE_SIZE * 3)
             .expect("munmap");
     }
 
     #[test]
-    fn linux_brk_grows_and_shrinks_heap_range() {
+    fn posix_brk_grows_and_shrinks_heap_range() {
         let mut state = Bootstrap::init().expect("init");
         let (_asid, aspace_cap) = state.create_user_address_space().expect("aspace");
 
         let grown = state
-            .linux_brk(
+            .posix_brk(
                 0,
                 aspace_cap,
                 LINUX_BRK_DEFAULT_BASE + PAGE_SIZE * 2,
@@ -1121,7 +1121,7 @@ mod tests {
         assert_eq!(grown, LINUX_BRK_DEFAULT_BASE + PAGE_SIZE * 2);
 
         let shrunk = state
-            .linux_brk(
+            .posix_brk(
                 0,
                 aspace_cap,
                 LINUX_BRK_DEFAULT_BASE + PAGE_SIZE,
@@ -1131,7 +1131,7 @@ mod tests {
         assert_eq!(shrunk, LINUX_BRK_DEFAULT_BASE + PAGE_SIZE);
 
         let query = state
-            .linux_brk(0, aspace_cap, 0, PROT_READ | PROT_WRITE)
+            .posix_brk(0, aspace_cap, 0, PROT_READ | PROT_WRITE)
             .expect("brk query");
         assert_eq!(query, shrunk);
     }

@@ -14,7 +14,7 @@ pub fn mmap_hook(
     prot: usize,
 ) -> Result<usize, PosixErrno> {
     kernel
-        .linux_mmap_region(aspace_cap, addr, len, prot)
+        .posix_mmap_region(aspace_cap, addr, len, prot)
         .map_err(Into::into)
 }
 
@@ -25,7 +25,7 @@ pub fn munmap_hook(
     len: usize,
 ) -> Result<(), PosixErrno> {
     kernel
-        .linux_munmap_region(aspace_cap, addr, len)
+        .posix_munmap_region(aspace_cap, addr, len)
         .map_err(Into::into)
 }
 
@@ -37,7 +37,7 @@ pub fn mprotect_hook(
     prot: usize,
 ) -> Result<(), PosixErrno> {
     kernel
-        .linux_mprotect_region(aspace_cap, addr, len, prot)
+        .posix_mprotect_region(aspace_cap, addr, len, prot)
         .map_err(Into::into)
 }
 
@@ -49,7 +49,7 @@ pub fn brk_hook(
     prot: usize,
 ) -> Result<usize, PosixErrno> {
     kernel
-        .linux_brk(tid, aspace_cap, requested, prot)
+        .posix_brk(tid, aspace_cap, requested, prot)
         .map_err(Into::into)
 }
 

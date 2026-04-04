@@ -11,7 +11,7 @@ pub mod kernel;
 pub mod runtime;
 pub mod services;
 
-#[cfg(feature = "linux-compat")]
+#[cfg(feature = "posix-compat")]
 pub use services::compatibility::posix_compat;
 
 #[macro_export]

@@ -142,10 +142,10 @@ jobs:
       - name: core profile tests
         run: cargo test -q
 
-  linux-compat-profile:
+  posix-compat-profile:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: linux-compat profile tests
-        run: cargo test -q --features linux-compat
+      - name: posix-compat profile tests
+        run: cargo test -q --features posix-compat
