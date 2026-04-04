@@ -61,6 +61,8 @@ fn log_pvh_boot_metadata(start_info_ptr: usize) {
 fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
     const PAGE_SIZE_U64: u64 = yarm::kernel::vm::PAGE_SIZE as u64;
     const RESERVED_LOW_EXCLUSIVE: u64 = yarm::arch::platform_layout::NEXT_ANON_PHYS_BASE;
+    const MEMMAP_ENTRY_SIZE: u64 = core::mem::size_of::<PvhMemMapEntry>() as u64;
+    const MEMMAP_ENTRY_ALIGN: u64 = core::mem::align_of::<PvhMemMapEntry>() as u64;
 
     if start_info_ptr == 0 {
         return;
@@ -73,10 +75,20 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
     if start_info.memmap_paddr == 0 || start_info.memmap_entries == 0 {
         return;
     }
+    if !start_info.memmap_paddr.is_multiple_of(MEMMAP_ENTRY_ALIGN) {
+        return;
+    }
 
     let count = core::cmp::min(start_info.memmap_entries as usize, MAX_PVH_MEMMAP_ENTRIES);
-    let memmap = start_info.memmap_paddr as *const PvhMemMapEntry;
-    let entries = unsafe { core::slice::from_raw_parts(memmap, count) };
+    let Some(memmap_bytes) = (count as u64).checked_mul(MEMMAP_ENTRY_SIZE) else {
+        return;
+    };
+    let Some(memmap_end) = start_info.memmap_paddr.checked_add(memmap_bytes) else {
+        return;
+    };
+    if memmap_end > MAX_PVH_PHYS_EXCLUSIVE {
+        return;
+    }
 
     let mut regions = [yarm::kernel::frame_allocator::MemoryRegion {
         start: 0,
@@ -85,7 +97,15 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
     }; MAX_PVH_MEMMAP_ENTRIES];
     let mut used = 0usize;
 
-    for entry in entries {
+    for idx in 0..count {
+        let Some(entry_paddr) = start_info
+            .memmap_paddr
+            .checked_add((idx as u64).saturating_mul(MEMMAP_ENTRY_SIZE))
+        else {
+            break;
+        };
+        let entry_ptr = entry_paddr as *const PvhMemMapEntry;
+        let entry = unsafe { core::ptr::read_unaligned(entry_ptr) };
         if entry.kind != 1 {
             continue;
         }
