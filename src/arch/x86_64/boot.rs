@@ -160,7 +160,11 @@ pvh_start32:
     mov bl, 'B'
     call uart_putc32
     mov eax, cr4
-    or eax, 0x20
+    // Enable PAE + SSE support expected by x86_64 Rust codegen:
+    // - CR4.PAE (bit 5)
+    // - CR4.OSFXSR (bit 9)
+    // - CR4.OSXMMEXCPT (bit 10)
+    or eax, 0x620
     mov cr4, eax
     mov ecx, 0xC0000080
     rdmsr
@@ -170,7 +174,10 @@ pvh_start32:
     call uart_putc32
     lgdt [gdt64_ptr]
     mov eax, cr0
-    or eax, 0x80000001
+    // Enable paging/protected mode, set CR0.MP, and clear CR0.EM so
+    // x87/SSE instructions (e.g. xorps/movups emitted by Rust) are valid.
+    and eax, 0xFFFFFFFB
+    or eax, 0x80000003
     mov cr0, eax
     push 0x08
     mov eax, offset long_mode_entry
