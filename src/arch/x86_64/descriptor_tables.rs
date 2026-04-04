@@ -256,6 +256,7 @@ fn debug_uart_trap_breadcrumb(
     vector: u64,
     error_code: u64,
     fault_addr: u64,
+    fault_rip: u64,
     cpu_apic: u64,
 ) {
     debug_uart_putc(b'!');
@@ -267,6 +268,8 @@ fn debug_uart_trap_breadcrumb(
     debug_uart_hex_u64(error_code);
     debug_uart_putc(b'c');
     debug_uart_hex_u64(fault_addr);
+    debug_uart_putc(b'i');
+    debug_uart_hex_u64(fault_rip);
     debug_uart_putc(b'a');
     debug_uart_hex_u64(cpu_apic);
     debug_uart_putc(b'\n');
@@ -439,10 +442,11 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     regs: *mut X86SavedRegs,
     interrupt_frame: *const X86InterruptStackFrame,
 ) {
+    let fault_rip = unsafe { (*interrupt_frame).rip };
     let cpu_apic = raw_current_apic_id() as u64;
     let previous_depth = TRAP_DISPATCH_DEPTH.fetch_add(1, Ordering::AcqRel);
     if previous_depth != 0 {
-        debug_uart_trap_breadcrumb(b'N', vector, error_code, 0, cpu_apic);
+        debug_uart_trap_breadcrumb(b'N', vector, error_code, 0, fault_rip, cpu_apic);
         halt_forever();
     }
     let mut fault_addr = 0u64;
@@ -460,7 +464,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     let state_ptr = TRAP_KERNEL_STATE_PTR.load(Ordering::Acquire);
     if state_ptr == 0 {
         if should_halt_without_kernel_state(vector as usize) {
-            debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, cpu_apic);
+            debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, fault_rip, cpu_apic);
             TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
             halt_forever();
         }
@@ -476,12 +480,13 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         Some(&mut trap_frame),
     ) {
         crate::pr_err!(
-            "x86 trap dispatch failed: vector={} error_code=0x{:x} err={:?}",
+            "x86 trap dispatch failed: vector={} error_code=0x{:x} rip=0x{:016x} err={:?}",
             vector,
             error_code,
+            fault_rip,
             err
         );
-        debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, cpu_apic);
+        debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
         halt_forever();
     }
     if vector as usize == VEC_SYSCALL {
