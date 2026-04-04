@@ -223,10 +223,23 @@ fn run_boot_markers() {
 fn run_process_vfs_smoke() {
     yarm::yarm_log!("YARM_INIT_START");
     let mut kernel = Bootstrap::init().expect("init");
-    let summary =
-        init::run_minimum_profile_with_kernel(&mut kernel, init::InitRuntimeBootConfig::baseline())
-            .expect("minimum runnable profile");
-    let dispatched = kernel.dispatch_ready_task().expect("dispatch");
+    let summary = match init::run_minimum_profile_with_kernel(
+        &mut kernel,
+        init::InitRuntimeBootConfig::baseline(),
+    ) {
+        Ok(summary) => summary,
+        Err(err) => {
+            yarm::yarm_log!("YARM_INIT_FAIL stage=minimum_profile err={:?}", err);
+            return;
+        }
+    };
+    let dispatched = match kernel.dispatch_ready_task() {
+        Ok(dispatched) => dispatched,
+        Err(err) => {
+            yarm::yarm_log!("YARM_INIT_FAIL stage=dispatch err={:?}", err);
+            return;
+        }
+    };
     yarm::yarm_log!(
         "YARM_INIT_RUNTIME phase={:?} supervisor_managed={} initramfs_reads={} dispatched_tid={:?}",
         summary.init_phase,
