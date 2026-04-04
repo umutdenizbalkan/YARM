@@ -19,7 +19,10 @@ global_asm!(
     .section .bss.bootstack,"aw",@nobits
     .align 16
 boot_stack:
-    .skip 16384
+    // Early Rust boot paths currently materialize a large KernelState on stack.
+    // Keep bootstrap stack comfortably above that footprint to avoid underflow
+    // before trap/kernel-state registration is completed.
+    .skip 0x02000000
 boot_stack_end:
 
     .section .data.boot,"aw",@progbits
