@@ -6,11 +6,11 @@ use crate::kernel::ipc::Message;
 use crate::kernel::process_abi::PROC_OP_GETPID;
 use crate::kernel::trapframe::TrapFrame;
 
-use super::{LINUX_NR_GETPID, LinuxServiceBindings, dispatch};
+use super::{LINUX_NR_GETPID, PosixServiceBindings, dispatch};
 
 pub fn run() {
     let mut kernel = Bootstrap::init().expect("init");
-    let mut bindings = LinuxServiceBindings::default();
+    let mut bindings = PosixServiceBindings::default();
 
     let (_proc_req_ep, proc_req_send, proc_req_recv) = kernel.create_endpoint(8).expect("proc req");
     let (_proc_rep_ep, proc_rep_send, proc_rep_recv) = kernel.create_endpoint(8).expect("proc rep");

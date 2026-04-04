@@ -30,6 +30,10 @@ pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
 pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 20;
 pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = PROC_SERVER_ABI_VERSION;
 pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = VFS_SERVER_ABI_VERSION;
+pub const POSIX_COMPAT_ABI_VERSION: u16 = LINUX_COMPAT_ABI_VERSION;
+pub const POSIX_COMPAT_SYSCALL_COUNT: usize = LINUX_COMPAT_SYSCALL_COUNT;
+pub const POSIX_PROC_SERVER_ABI_VERSION: u16 = LINUX_PROC_SERVER_ABI_VERSION;
+pub const POSIX_VFS_SERVER_ABI_VERSION: u16 = LINUX_VFS_SERVER_ABI_VERSION;
 
 pub const LINUX_NR_BRK: usize = 214;
 pub const LINUX_NR_MUNMAP: usize = 215;
@@ -70,18 +74,18 @@ const LINUX_ARG1: usize = 1;
 const LINUX_ARG2: usize = 2;
 const LINUX_ARG3: usize = 3;
 
-/// Userspace-owned bindings for Linux personality servers.
+/// Userspace-owned bindings for POSIX compatibility personality servers.
 ///
 /// Kept out of `KernelState` so the kernel remains service-agnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct LinuxServiceBindings {
+pub struct PosixServiceBindings {
     proc_mgr_request_send: Option<CapId>,
     proc_mgr_reply_recv: Option<CapId>,
     vfs_request_send: Option<CapId>,
     vfs_reply_recv: Option<CapId>,
 }
 
-impl LinuxServiceBindings {
+impl PosixServiceBindings {
     pub fn register_process_manager(
         &mut self,
         kernel: &KernelState,
@@ -200,7 +204,7 @@ impl LinuxServiceBindings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinuxErrno {
+pub enum PosixErrno {
     Inval,
     Perm,
     Intr,
@@ -210,7 +214,7 @@ pub enum LinuxErrno {
     NoSys,
 }
 
-impl LinuxErrno {
+impl PosixErrno {
     pub const fn code(self) -> i32 {
         match self {
             Self::Inval => EINVAL,
@@ -241,7 +245,7 @@ impl LinuxErrno {
     }
 }
 
-impl From<KernelError> for LinuxErrno {
+impl From<KernelError> for PosixErrno {
     fn from(value: KernelError) -> Self {
         match value {
             KernelError::MissingRight => Self::Perm,
@@ -261,7 +265,7 @@ impl From<KernelError> for LinuxErrno {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
-pub enum LinuxCompatSyscall {
+pub enum PosixCompatSyscall {
     Exit = LINUX_NR_EXIT,
     Getpid = LINUX_NR_GETPID,
     Getppid = LINUX_NR_GETPPID,
@@ -284,7 +288,7 @@ pub enum LinuxCompatSyscall {
     Mprotect = LINUX_NR_MPROTECT,
 }
 
-impl LinuxCompatSyscall {
+impl PosixCompatSyscall {
     const DISPATCH_TABLE: [usize; LINUX_COMPAT_SYSCALL_COUNT] = [
         LINUX_NR_EXIT,
         LINUX_NR_GETPID,
@@ -308,9 +312,9 @@ impl LinuxCompatSyscall {
         LINUX_NR_MPROTECT,
     ];
 
-    pub fn decode(raw: usize) -> Result<Self, LinuxErrno> {
+    pub fn decode(raw: usize) -> Result<Self, PosixErrno> {
         if !Self::DISPATCH_TABLE.contains(&raw) {
-            return Err(LinuxErrno::NoSys);
+            return Err(PosixErrno::NoSys);
         }
 
         match raw {
@@ -334,21 +338,21 @@ impl LinuxCompatSyscall {
             LINUX_NR_MUNMAP => Ok(Self::Munmap),
             LINUX_NR_MMAP => Ok(Self::Mmap),
             LINUX_NR_MPROTECT => Ok(Self::Mprotect),
-            _ => Err(LinuxErrno::NoSys),
+            _ => Err(PosixErrno::NoSys),
         }
     }
 }
 
-fn round_up_page(value: usize) -> Result<usize, LinuxErrno> {
+fn round_up_page(value: usize) -> Result<usize, PosixErrno> {
     if value.is_multiple_of(PAGE_SIZE) {
         Ok(value)
     } else {
-        let rounded = value.checked_add(PAGE_SIZE - 1).ok_or(LinuxErrno::Inval)?;
+        let rounded = value.checked_add(PAGE_SIZE - 1).ok_or(PosixErrno::Inval)?;
         Ok(rounded & !(PAGE_SIZE - 1))
     }
 }
 
-fn prot_to_page_flags(prot: usize) -> Result<PageFlags, LinuxErrno> {
+fn prot_to_page_flags(prot: usize) -> Result<PageFlags, PosixErrno> {
     Ok(PageFlags {
         read: (prot & PROT_READ) != 0,
         write: (prot & PROT_WRITE) != 0,
@@ -358,19 +362,19 @@ fn prot_to_page_flags(prot: usize) -> Result<PageFlags, LinuxErrno> {
     })
 }
 
-fn decode_u64_reply(reply: &[u8]) -> Result<usize, LinuxErrno> {
+fn decode_u64_reply(reply: &[u8]) -> Result<usize, PosixErrno> {
     if reply.len() < 8 {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&reply[..8]);
     let raw = i64::from_le_bytes(bytes);
     if raw < 0 {
-        let errno = i32::try_from((-raw) as u64).map_err(|_| LinuxErrno::Inval)?;
-        return Err(LinuxErrno::from_raw_errno(errno));
+        let errno = i32::try_from((-raw) as u64).map_err(|_| PosixErrno::Inval)?;
+        return Err(PosixErrno::from_raw_errno(errno));
     }
     // Keep conversion checked so narrower pointer-width targets do not silently truncate.
-    usize::try_from(raw as u64).map_err(|_| LinuxErrno::Inval)
+    usize::try_from(raw as u64).map_err(|_| PosixErrno::Inval)
 }
 
 fn pack_vfs4(a0: usize, a1: usize, a2: usize, a3: usize) -> [u8; 32] {
@@ -390,9 +394,9 @@ fn pack_statx(dirfd: usize, path_ptr: usize, flags: usize, mask: usize) -> [u8; 
 }
 
 impl KernelState {
-    fn current_linux_asid(&self) -> Result<Asid, LinuxErrno> {
-        let tid = self.current_tid().ok_or(LinuxErrno::NoSys)?;
-        self.task_asid(tid).ok_or(LinuxErrno::NoSys)
+    fn current_posix_asid(&self) -> Result<Asid, PosixErrno> {
+        let tid = self.current_tid().ok_or(PosixErrno::NoSys)?;
+        self.task_asid(tid).ok_or(PosixErrno::NoSys)
     }
 
     pub fn linux_mmap_region(
@@ -401,22 +405,22 @@ impl KernelState {
         addr: usize,
         len: usize,
         prot: usize,
-    ) -> Result<usize, LinuxErrno> {
+    ) -> Result<usize, PosixErrno> {
         if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(LinuxErrno::Inval);
+            return Err(PosixErrno::Inval);
         }
 
         let flags = prot_to_page_flags(prot)?;
         let end = addr
             .checked_add(round_up_page(len)?)
-            .ok_or(LinuxErrno::Inval)?;
+            .ok_or(PosixErrno::Inval)?;
         let mut va = addr;
         while va < end {
             let (_, mem_cap) = self
                 .alloc_anonymous_memory_object()
-                .map_err(LinuxErrno::from)?;
+                .map_err(PosixErrno::from)?;
             self.map_user_page_with_caps(aspace_map_cap, mem_cap, VirtAddr(va as u64), flags)
-                .map_err(LinuxErrno::from)?;
+                .map_err(PosixErrno::from)?;
             va += PAGE_SIZE;
         }
         Ok(addr)
@@ -427,22 +431,22 @@ impl KernelState {
         addr: usize,
         len: usize,
         prot: usize,
-    ) -> Result<usize, LinuxErrno> {
+    ) -> Result<usize, PosixErrno> {
         if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(LinuxErrno::Inval);
+            return Err(PosixErrno::Inval);
         }
-        let asid = self.current_linux_asid()?;
+        let asid = self.current_posix_asid()?;
         let flags = prot_to_page_flags(prot)?;
         let end = addr
             .checked_add(round_up_page(len)?)
-            .ok_or(LinuxErrno::Inval)?;
+            .ok_or(PosixErrno::Inval)?;
         let mut va = addr;
         while va < end {
             let (_, mem_cap) = self
                 .alloc_anonymous_memory_object()
-                .map_err(LinuxErrno::from)?;
+                .map_err(PosixErrno::from)?;
             self.map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(va as u64), flags)
-                .map_err(LinuxErrno::from)?;
+                .map_err(PosixErrno::from)?;
             va += PAGE_SIZE;
         }
         Ok(addr)
@@ -453,17 +457,17 @@ impl KernelState {
         aspace_map_cap: CapId,
         addr: usize,
         len: usize,
-    ) -> Result<(), LinuxErrno> {
+    ) -> Result<(), PosixErrno> {
         if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(LinuxErrno::Inval);
+            return Err(PosixErrno::Inval);
         }
         let end = addr
             .checked_add(round_up_page(len)?)
-            .ok_or(LinuxErrno::Inval)?;
+            .ok_or(PosixErrno::Inval)?;
         let mut va = addr;
         while va < end {
             self.unmap_user_page(aspace_map_cap, VirtAddr(va as u64))
-                .map_err(LinuxErrno::from)?;
+                .map_err(PosixErrno::from)?;
             va += PAGE_SIZE;
         }
         Ok(())
@@ -473,18 +477,18 @@ impl KernelState {
         &mut self,
         addr: usize,
         len: usize,
-    ) -> Result<(), LinuxErrno> {
+    ) -> Result<(), PosixErrno> {
         if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(LinuxErrno::Inval);
+            return Err(PosixErrno::Inval);
         }
-        let asid = self.current_linux_asid()?;
+        let asid = self.current_posix_asid()?;
         let end = addr
             .checked_add(round_up_page(len)?)
-            .ok_or(LinuxErrno::Inval)?;
+            .ok_or(PosixErrno::Inval)?;
         let mut va = addr;
         while va < end {
             self.unmap_user_page_in_asid(asid, VirtAddr(va as u64))
-                .map_err(LinuxErrno::from)?;
+                .map_err(PosixErrno::from)?;
             va += PAGE_SIZE;
         }
         Ok(())
@@ -496,18 +500,18 @@ impl KernelState {
         addr: usize,
         len: usize,
         prot: usize,
-    ) -> Result<(), LinuxErrno> {
+    ) -> Result<(), PosixErrno> {
         if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(LinuxErrno::Inval);
+            return Err(PosixErrno::Inval);
         }
         let flags = prot_to_page_flags(prot)?;
         let end = addr
             .checked_add(round_up_page(len)?)
-            .ok_or(LinuxErrno::Inval)?;
+            .ok_or(PosixErrno::Inval)?;
         let mut va = addr;
         while va < end {
             self.protect_user_page(aspace_map_cap, VirtAddr(va as u64), flags)
-                .map_err(LinuxErrno::from)?;
+                .map_err(PosixErrno::from)?;
             va += PAGE_SIZE;
         }
         Ok(())
@@ -518,19 +522,19 @@ impl KernelState {
         addr: usize,
         len: usize,
         prot: usize,
-    ) -> Result<(), LinuxErrno> {
+    ) -> Result<(), PosixErrno> {
         if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
-            return Err(LinuxErrno::Inval);
+            return Err(PosixErrno::Inval);
         }
-        let asid = self.current_linux_asid()?;
+        let asid = self.current_posix_asid()?;
         let flags = prot_to_page_flags(prot)?;
         let end = addr
             .checked_add(round_up_page(len)?)
-            .ok_or(LinuxErrno::Inval)?;
+            .ok_or(PosixErrno::Inval)?;
         let mut va = addr;
         while va < end {
             self.protect_user_page_in_asid(asid, VirtAddr(va as u64), flags)
-                .map_err(LinuxErrno::from)?;
+                .map_err(PosixErrno::from)?;
             va += PAGE_SIZE;
         }
         Ok(())
@@ -542,7 +546,7 @@ impl KernelState {
         aspace_map_cap: CapId,
         requested_end: usize,
         prot: usize,
-    ) -> Result<usize, LinuxErrno> {
+    ) -> Result<usize, PosixErrno> {
         let (base, current_end) = self
             .task_brk_bounds(tid)
             .unwrap_or((LINUX_BRK_DEFAULT_BASE, LINUX_BRK_DEFAULT_BASE));
@@ -551,7 +555,7 @@ impl KernelState {
             return Ok(current_end);
         }
         if requested_end < base {
-            return Err(LinuxErrno::Inval);
+            return Err(PosixErrno::Inval);
         }
 
         let current_rounded = round_up_page(current_end)?;
@@ -569,7 +573,7 @@ impl KernelState {
         }
 
         self.set_task_brk_bounds(tid, base, requested_end)
-            .map_err(LinuxErrno::from)?;
+            .map_err(PosixErrno::from)?;
         Ok(requested_end)
     }
 
@@ -578,7 +582,7 @@ impl KernelState {
         tid: u64,
         requested_end: usize,
         prot: usize,
-    ) -> Result<usize, LinuxErrno> {
+    ) -> Result<usize, PosixErrno> {
         let (base, current_end) = self
             .task_brk_bounds(tid)
             .unwrap_or((LINUX_BRK_DEFAULT_BASE, LINUX_BRK_DEFAULT_BASE));
@@ -587,7 +591,7 @@ impl KernelState {
             return Ok(current_end);
         }
         if requested_end < base {
-            return Err(LinuxErrno::Inval);
+            return Err(PosixErrno::Inval);
         }
 
         let current_rounded = round_up_page(current_end)?;
@@ -605,48 +609,48 @@ impl KernelState {
         }
 
         self.set_task_brk_bounds(tid, base, requested_end)
-            .map_err(LinuxErrno::from)?;
+            .map_err(PosixErrno::from)?;
         Ok(requested_end)
     }
 }
 
-pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame: &mut TrapFrame) {
+pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame: &mut TrapFrame) {
     // Linux ABI compatibility note:
     // - mmap/munmap/mprotect consume Linux argument order directly (addr/len/prot/...).
     // - Capability-targeted VM mapping is exposed via kernel-native `sys_vm_map`.
     // - brk consumes Linux arg0 (`requested_end`) and targets current task ASID.
-    let result: Result<usize, LinuxErrno> =
-        (|| match LinuxCompatSyscall::decode(frame.syscall_num())? {
-            LinuxCompatSyscall::Exit => {
+    let result: Result<usize, PosixErrno> =
+        (|| match PosixCompatSyscall::decode(frame.syscall_num())? {
+            PosixCompatSyscall::Exit => {
                 let code = frame.arg(LINUX_ARG0) as u64;
                 bindings
                     .send_proc_request(kernel, PROC_OP_EXIT, code)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 Ok(0)
             }
-            LinuxCompatSyscall::Getpid => {
-                let tid = kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
+            PosixCompatSyscall::Getpid => {
+                let tid = kernel.current_tid().ok_or(PosixErrno::NoSys)?;
                 bindings
                     .send_proc_request(kernel, PROC_OP_GETPID, tid)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_proc_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Getppid => {
-                let tid = kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
+            PosixCompatSyscall::Getppid => {
+                let tid = kernel.current_tid().ok_or(PosixErrno::NoSys)?;
                 bindings
                     .send_proc_request(kernel, PROC_OP_GETPPID, tid)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_proc_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Openat => {
+            PosixCompatSyscall::Openat => {
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
@@ -655,25 +659,25 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 );
                 bindings
                     .send_vfs_request(kernel, VFS_OP_OPENAT, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Close => {
+            PosixCompatSyscall::Close => {
                 let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
                 bindings
                     .send_vfs_request(kernel, VFS_OP_CLOSE, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Read => {
+            PosixCompatSyscall::Read => {
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
@@ -682,14 +686,14 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 );
                 bindings
                     .send_vfs_request(kernel, VFS_OP_READ, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Write => {
+            PosixCompatSyscall::Write => {
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
@@ -698,14 +702,14 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 );
                 bindings
                     .send_vfs_request(kernel, VFS_OP_WRITE, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Ioctl => {
+            PosixCompatSyscall::Ioctl => {
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
@@ -714,44 +718,44 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 );
                 bindings
                     .send_vfs_request(kernel, VFS_OP_IOCTL, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Mmap => {
+            PosixCompatSyscall::Mmap => {
                 let addr = frame.arg(LINUX_ARG0);
                 let len = frame.arg(LINUX_ARG1);
                 let prot = frame.arg(LINUX_ARG2);
                 kernel.linux_mmap_region_current_task(addr, len, prot)
             }
-            LinuxCompatSyscall::Munmap => {
+            PosixCompatSyscall::Munmap => {
                 let addr = frame.arg(LINUX_ARG0);
                 let len = frame.arg(LINUX_ARG1);
                 kernel.linux_munmap_region_current_task(addr, len)?;
                 Ok(0)
             }
-            LinuxCompatSyscall::Mprotect => {
+            PosixCompatSyscall::Mprotect => {
                 let addr = frame.arg(LINUX_ARG0);
                 let len = frame.arg(LINUX_ARG1);
                 let prot = frame.arg(LINUX_ARG2);
                 kernel.linux_mprotect_region_current_task(addr, len, prot)?;
                 Ok(0)
             }
-            LinuxCompatSyscall::Dup => {
+            PosixCompatSyscall::Dup => {
                 let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
                 bindings
                     .send_vfs_request(kernel, VFS_OP_DUP, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Fcntl => {
+            PosixCompatSyscall::Fcntl => {
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
@@ -760,14 +764,14 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 );
                 bindings
                     .send_vfs_request(kernel, VFS_OP_FCNTL, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Poll => {
+            PosixCompatSyscall::Poll => {
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
@@ -776,25 +780,25 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 );
                 bindings
                     .send_vfs_request(kernel, VFS_OP_POLL, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::EpollCreate1 => {
+            PosixCompatSyscall::EpollCreate1 => {
                 let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
                 bindings
                     .send_vfs_request(kernel, VFS_OP_EPOLL_CREATE1, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::EpollCtl => {
+            PosixCompatSyscall::EpollCtl => {
                 let payload = pack_epoll_ctl(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
@@ -803,14 +807,14 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 );
                 bindings
                     .send_vfs_request(kernel, VFS_OP_EPOLL_CTL, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::EpollPwait => {
+            PosixCompatSyscall::EpollPwait => {
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
@@ -819,14 +823,14 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 );
                 bindings
                     .send_vfs_request(kernel, VFS_OP_EPOLL_PWAIT, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Sendfile => {
+            PosixCompatSyscall::Sendfile => {
                 let payload = pack_sendfile(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
@@ -835,14 +839,14 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 );
                 bindings
                     .send_vfs_request(kernel, VFS_OP_SENDFILE, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Statx => {
+            PosixCompatSyscall::Statx => {
                 let payload = pack_statx(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
@@ -851,16 +855,16 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &LinuxServiceBindings, frame
                 );
                 bindings
                     .send_vfs_request(kernel, VFS_OP_STATX, &payload)
-                    .map_err(LinuxErrno::from)?;
+                    .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_vfs_reply(kernel)
-                    .map_err(LinuxErrno::from)?
-                    .ok_or(LinuxErrno::NoSys)?;
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
-            LinuxCompatSyscall::Brk => {
+            PosixCompatSyscall::Brk => {
                 let requested = frame.arg(LINUX_ARG0);
-                let tid = kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
+                let tid = kernel.current_tid().ok_or(PosixErrno::NoSys)?;
                 kernel.linux_brk_current_task(tid, requested, PROT_READ | PROT_WRITE)
             }
         })();
@@ -945,11 +949,11 @@ mod tests {
     }
 
     #[test]
-    fn linux_compat_errno_mapping_stable() {
-        assert_eq!(LinuxErrno::Inval.code(), EINVAL);
-        assert_eq!(LinuxErrno::Perm.code(), EPERM);
-        assert_eq!(LinuxErrno::NoMem.code(), ENOMEM);
-        assert_eq!(LinuxErrno::NoSys.code(), ENOSYS);
+    fn posix_compat_errno_mapping_stable() {
+        assert_eq!(PosixErrno::Inval.code(), EINVAL);
+        assert_eq!(PosixErrno::Perm.code(), EPERM);
+        assert_eq!(PosixErrno::NoMem.code(), ENOMEM);
+        assert_eq!(PosixErrno::NoSys.code(), ENOSYS);
     }
 
     #[test]
@@ -974,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_compat_abi_contract_is_frozen() {
+    fn posix_compat_abi_contract_is_frozen() {
         assert_eq!(LINUX_COMPAT_ABI_VERSION, 1);
         assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 20);
         assert_eq!(LINUX_PROC_SERVER_ABI_VERSION, 1);
@@ -984,86 +988,86 @@ mod tests {
         assert_eq!(VFS_CODEC_V1_VERSION, 1);
         assert_eq!(VfsV1Args::VERSION, VFS_CODEC_V1_VERSION);
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_EXIT),
-            Ok(LinuxCompatSyscall::Exit)
+            PosixCompatSyscall::decode(LINUX_NR_EXIT),
+            Ok(PosixCompatSyscall::Exit)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_GETPID),
-            Ok(LinuxCompatSyscall::Getpid)
+            PosixCompatSyscall::decode(LINUX_NR_GETPID),
+            Ok(PosixCompatSyscall::Getpid)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_GETPPID),
-            Ok(LinuxCompatSyscall::Getppid)
+            PosixCompatSyscall::decode(LINUX_NR_GETPPID),
+            Ok(PosixCompatSyscall::Getppid)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_OPENAT),
-            Ok(LinuxCompatSyscall::Openat)
+            PosixCompatSyscall::decode(LINUX_NR_OPENAT),
+            Ok(PosixCompatSyscall::Openat)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_CLOSE),
-            Ok(LinuxCompatSyscall::Close)
+            PosixCompatSyscall::decode(LINUX_NR_CLOSE),
+            Ok(PosixCompatSyscall::Close)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_READ),
-            Ok(LinuxCompatSyscall::Read)
+            PosixCompatSyscall::decode(LINUX_NR_READ),
+            Ok(PosixCompatSyscall::Read)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_WRITE),
-            Ok(LinuxCompatSyscall::Write)
+            PosixCompatSyscall::decode(LINUX_NR_WRITE),
+            Ok(PosixCompatSyscall::Write)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_IOCTL),
-            Ok(LinuxCompatSyscall::Ioctl)
+            PosixCompatSyscall::decode(LINUX_NR_IOCTL),
+            Ok(PosixCompatSyscall::Ioctl)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_DUP),
-            Ok(LinuxCompatSyscall::Dup)
+            PosixCompatSyscall::decode(LINUX_NR_DUP),
+            Ok(PosixCompatSyscall::Dup)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_FCNTL),
-            Ok(LinuxCompatSyscall::Fcntl)
+            PosixCompatSyscall::decode(LINUX_NR_FCNTL),
+            Ok(PosixCompatSyscall::Fcntl)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_POLL),
-            Ok(LinuxCompatSyscall::Poll)
+            PosixCompatSyscall::decode(LINUX_NR_POLL),
+            Ok(PosixCompatSyscall::Poll)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_EPOLL_CREATE1),
-            Ok(LinuxCompatSyscall::EpollCreate1)
+            PosixCompatSyscall::decode(LINUX_NR_EPOLL_CREATE1),
+            Ok(PosixCompatSyscall::EpollCreate1)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_EPOLL_CTL),
-            Ok(LinuxCompatSyscall::EpollCtl)
+            PosixCompatSyscall::decode(LINUX_NR_EPOLL_CTL),
+            Ok(PosixCompatSyscall::EpollCtl)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_EPOLL_PWAIT),
-            Ok(LinuxCompatSyscall::EpollPwait)
+            PosixCompatSyscall::decode(LINUX_NR_EPOLL_PWAIT),
+            Ok(PosixCompatSyscall::EpollPwait)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_SENDFILE),
-            Ok(LinuxCompatSyscall::Sendfile)
+            PosixCompatSyscall::decode(LINUX_NR_SENDFILE),
+            Ok(PosixCompatSyscall::Sendfile)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_STATX),
-            Ok(LinuxCompatSyscall::Statx)
+            PosixCompatSyscall::decode(LINUX_NR_STATX),
+            Ok(PosixCompatSyscall::Statx)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_BRK),
-            Ok(LinuxCompatSyscall::Brk)
+            PosixCompatSyscall::decode(LINUX_NR_BRK),
+            Ok(PosixCompatSyscall::Brk)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_MUNMAP),
-            Ok(LinuxCompatSyscall::Munmap)
+            PosixCompatSyscall::decode(LINUX_NR_MUNMAP),
+            Ok(PosixCompatSyscall::Munmap)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_MMAP),
-            Ok(LinuxCompatSyscall::Mmap)
+            PosixCompatSyscall::decode(LINUX_NR_MMAP),
+            Ok(PosixCompatSyscall::Mmap)
         );
         assert_eq!(
-            LinuxCompatSyscall::decode(LINUX_NR_MPROTECT),
-            Ok(LinuxCompatSyscall::Mprotect)
+            PosixCompatSyscall::decode(LINUX_NR_MPROTECT),
+            Ok(PosixCompatSyscall::Mprotect)
         );
-        assert_eq!(LinuxCompatSyscall::decode(0xFFFF), Err(LinuxErrno::NoSys));
+        assert_eq!(PosixCompatSyscall::decode(0xFFFF), Err(PosixErrno::NoSys));
     }
 
     #[test]
@@ -1080,7 +1084,7 @@ mod tests {
         assert_eq!(round_up_page(0), Ok(0));
         assert_eq!(round_up_page(PAGE_SIZE), Ok(PAGE_SIZE));
         assert_eq!(round_up_page(PAGE_SIZE + 1), Ok(PAGE_SIZE * 2));
-        assert_eq!(round_up_page(usize::MAX), Err(LinuxErrno::Inval));
+        assert_eq!(round_up_page(usize::MAX), Err(PosixErrno::Inval));
     }
 
     #[test]
@@ -1133,9 +1137,9 @@ mod tests {
     }
 
     #[test]
-    fn linux_dispatch_table_drives_mmap_and_munmap() {
+    fn posix_dispatch_table_drives_mmap_and_munmap() {
         let mut state = Bootstrap::init().expect("init");
-        let bindings = LinuxServiceBindings::default();
+        let bindings = PosixServiceBindings::default();
         let (asid, _aspace_cap) = state.create_user_address_space().expect("aspace");
         state.bind_task_asid(0, asid).expect("bind");
 
@@ -1153,9 +1157,9 @@ mod tests {
     }
 
     #[test]
-    fn linux_dispatch_brk_uses_linux_arg_order() {
+    fn posix_dispatch_brk_uses_linux_arg_order() {
         let mut state = Bootstrap::init().expect("init");
-        let bindings = LinuxServiceBindings::default();
+        let bindings = PosixServiceBindings::default();
         let (asid, _aspace_cap) = state.create_user_address_space().expect("aspace");
         state.bind_task_asid(0, asid).expect("bind");
 
@@ -1167,9 +1171,9 @@ mod tests {
     }
 
     #[test]
-    fn linux_dispatch_getpid_and_exit_route_to_process_manager_ipc() {
+    fn posix_dispatch_getpid_and_exit_route_to_process_manager_ipc() {
         let mut state = Bootstrap::init().expect("init");
-        let mut bindings = LinuxServiceBindings::default();
+        let mut bindings = PosixServiceBindings::default();
         let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("req ep");
         let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("rep ep");
         bindings
@@ -1228,9 +1232,9 @@ mod tests {
     }
 
     #[test]
-    fn linux_dispatch_vfs_syscalls_route_to_vfs_ipc() {
+    fn posix_dispatch_vfs_syscalls_route_to_vfs_ipc() {
         let mut state = Bootstrap::init().expect("init");
-        let mut bindings = LinuxServiceBindings::default();
+        let mut bindings = PosixServiceBindings::default();
         let (_req_ep, req_send, req_recv) = state.create_endpoint(16).expect("vfs req ep");
         let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(16).expect("vfs rep ep");
         bindings
@@ -1341,9 +1345,9 @@ mod tests {
     }
 
     #[test]
-    fn linux_dispatch_maps_eintr_and_timeout_errno_at_shim_boundary() {
+    fn posix_dispatch_maps_eintr_and_timeout_errno_at_shim_boundary() {
         let mut state = Bootstrap::init().expect("init");
-        let mut bindings = LinuxServiceBindings::default();
+        let mut bindings = PosixServiceBindings::default();
         let (_req_ep, req_send, _req_recv) = state.create_endpoint(8).expect("vfs req");
         let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(8).expect("vfs rep");
         bindings
@@ -1370,9 +1374,9 @@ mod tests {
     }
 
     #[test]
-    fn linux_dispatch_partial_io_and_invalid_handle_errno_are_explicit() {
+    fn posix_dispatch_partial_io_and_invalid_handle_errno_are_explicit() {
         let mut state = Bootstrap::init().expect("init");
-        let mut bindings = LinuxServiceBindings::default();
+        let mut bindings = PosixServiceBindings::default();
         let (_req_ep, req_send, _req_recv) = state.create_endpoint(8).expect("vfs req");
         let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(8).expect("vfs rep");
         bindings
@@ -1406,7 +1410,7 @@ mod tests {
     #[test]
     fn process_manager_v2_dual_arg_payload_roundtrip() {
         let mut state = Bootstrap::init().expect("init");
-        let mut bindings = LinuxServiceBindings::default();
+        let mut bindings = PosixServiceBindings::default();
         let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("req ep");
         let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("rep ep");
         bindings
@@ -1437,9 +1441,9 @@ mod tests {
     }
 
     #[test]
-    fn linux_personality_shim_end_to_end_open_getpid_and_exit() {
+    fn posix_personality_shim_end_to_end_open_getpid_and_exit() {
         let mut state = Bootstrap::init().expect("init");
-        let mut bindings = LinuxServiceBindings::default();
+        let mut bindings = PosixServiceBindings::default();
         let (_proc_req_ep, proc_req_send, proc_req_recv) =
             state.create_endpoint(8).expect("proc req");
         let (_proc_rep_ep, proc_rep_send, proc_rep_recv) =
@@ -1492,9 +1496,9 @@ mod tests {
     }
 
     #[test]
-    fn linux_personality_deterministic_sequence_is_stable() {
+    fn posix_personality_deterministic_sequence_is_stable() {
         let mut state = Bootstrap::init().expect("init");
-        let mut bindings = LinuxServiceBindings::default();
+        let mut bindings = PosixServiceBindings::default();
         let (_proc_req_ep, proc_req_send, proc_req_recv) =
             state.create_endpoint(16).expect("proc req");
         let (_proc_rep_ep, proc_rep_send, proc_rep_recv) =
@@ -1559,9 +1563,9 @@ mod tests {
     }
 
     #[test]
-    fn linux_personality_mixed_flow_with_notification_route_is_deterministic() {
+    fn posix_personality_mixed_flow_with_notification_route_is_deterministic() {
         let mut state = Bootstrap::init().expect("init");
-        let mut bindings = LinuxServiceBindings::default();
+        let mut bindings = PosixServiceBindings::default();
 
         let (_proc_req_ep, proc_req_send, proc_req_recv) =
             state.create_endpoint(16).expect("proc req");
@@ -1616,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_dispatch_table_is_frozen_contract() {
+    fn posix_dispatch_table_is_frozen_contract() {
         let expected = [
             LINUX_NR_EXIT,
             LINUX_NR_GETPID,
@@ -1639,7 +1643,7 @@ mod tests {
             LINUX_NR_MMAP,
             LINUX_NR_MPROTECT,
         ];
-        assert_eq!(LinuxCompatSyscall::DISPATCH_TABLE, expected);
+        assert_eq!(PosixCompatSyscall::DISPATCH_TABLE, expected);
         assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, expected.len());
     }
 }

@@ -42,7 +42,7 @@ deny_re='kernel::(trapframe::TrapFrame|boot::KernelState)'
 while IFS=: read -r path line rest; do
   [[ -z "${path:-}" ]] && continue
   case "$path" in
-    src/services/compatibility/linux_compat/*|src/services/control_plane/vfs/service.rs)
+    src/services/compatibility/posix_compat/*|src/services/control_plane/vfs/service.rs)
       ;;
     *)
       echo "[fail] kernel-only boundary type imported outside allow-list: $path:$line:$rest"

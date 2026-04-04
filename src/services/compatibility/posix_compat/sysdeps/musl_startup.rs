@@ -4,8 +4,8 @@
 use super::clone_thread_hook;
 use crate::kernel::boot::KernelState;
 use crate::kernel::task::ThreadGroupId;
-use crate::services::compatibility::linux_compat::{
-    LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, LinuxErrno,
+use crate::services::compatibility::posix_compat::{
+    LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, PosixErrno,
 };
 
 /// Minimal sysdeps status used while porting musl to x86_64-unknown-none.
@@ -118,14 +118,14 @@ pub struct MuslThreadState {
     pub tls_restore_pending: bool,
 }
 
-pub fn validate_musl_thread_spec(spec: MuslThreadSpec) -> Result<MuslThreadSpec, LinuxErrno> {
+pub fn validate_musl_thread_spec(spec: MuslThreadSpec) -> Result<MuslThreadSpec, PosixErrno> {
     if spec.tls_base == 0 || spec.stack_top == 0 || spec.entry == 0 {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     if !spec.tls_base.is_multiple_of(MUSL_TLS_ALIGN)
         || !spec.stack_top.is_multiple_of(MUSL_STACK_ALIGN)
     {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     Ok(spec)
 }
@@ -135,27 +135,27 @@ pub fn validate_musl_thread_state(
     parent_tid: u64,
     tid: u64,
     spec: MuslThreadSpec,
-) -> Result<MuslThreadState, LinuxErrno> {
+) -> Result<MuslThreadState, PosixErrno> {
     let spec = validate_musl_thread_spec(spec)?;
-    let thread_group_id = kernel.thread_group_id(tid).ok_or(LinuxErrno::Inval)?;
+    let thread_group_id = kernel.thread_group_id(tid).ok_or(PosixErrno::Inval)?;
     let parent_group_id = kernel
         .thread_group_id(parent_tid)
-        .ok_or(LinuxErrno::Inval)?;
+        .ok_or(PosixErrno::Inval)?;
     if thread_group_id != parent_group_id {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     if kernel.thread_tls_base(tid) != Some(spec.tls_base) {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
-    let context = kernel.thread_user_context(tid).ok_or(LinuxErrno::Inval)?;
+    let context = kernel.thread_user_context(tid).ok_or(PosixErrno::Inval)?;
     if context.instruction_ptr != crate::kernel::vm::VirtAddr(spec.entry as u64)
         || context.stack_ptr != crate::kernel::vm::VirtAddr(spec.stack_top as u64)
     {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
-    let tls_restore_pending = kernel.tls_restore_pending(tid).ok_or(LinuxErrno::Inval)?;
+    let tls_restore_pending = kernel.tls_restore_pending(tid).ok_or(PosixErrno::Inval)?;
     if !tls_restore_pending {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     Ok(MuslThreadState {
         tid,
@@ -171,7 +171,7 @@ pub fn spawn_musl_thread(
     kernel: &mut KernelState,
     parent_tid: u64,
     spec: MuslThreadSpec,
-) -> Result<MuslThreadState, LinuxErrno> {
+) -> Result<MuslThreadState, PosixErrno> {
     let spec = validate_musl_thread_spec(spec)?;
     let tid = clone_thread_hook(
         kernel,
@@ -187,30 +187,30 @@ fn word_size() -> usize {
     core::mem::size_of::<usize>()
 }
 
-fn stack_base(stack_top: usize, words_len: usize) -> Result<usize, LinuxErrno> {
+fn stack_base(stack_top: usize, words_len: usize) -> Result<usize, PosixErrno> {
     stack_top
         .checked_sub(
             words_len
                 .checked_mul(word_size())
-                .ok_or(LinuxErrno::Inval)?,
+                .ok_or(PosixErrno::Inval)?,
         )
-        .ok_or(LinuxErrno::Inval)
+        .ok_or(PosixErrno::Inval)
 }
 
 pub fn parse_musl_initial_stack(
     stack_top: usize,
     words: &[usize],
-) -> Result<MuslStartupFrame, LinuxErrno> {
+) -> Result<MuslStartupFrame, PosixErrno> {
     if stack_top == 0 || words.is_empty() {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     let argc = words[0];
     if argc > MAX_STARTUP_ARGS {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
-    let argv_end = 1usize.checked_add(argc).ok_or(LinuxErrno::Inval)?;
+    let argv_end = 1usize.checked_add(argc).ok_or(PosixErrno::Inval)?;
     if argv_end >= words.len() || words[argv_end] != 0 {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
 
     let mut argv = [0usize; MAX_STARTUP_ARGS];
@@ -226,11 +226,11 @@ pub fn parse_musl_initial_stack(
         env_end += 1;
     }
     if env_end >= words.len() {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     let envc = env_end - env_start;
     if envc > MAX_STARTUP_ENVP {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     let mut envp = [0usize; MAX_STARTUP_ENVP];
     idx = 0;
@@ -245,7 +245,7 @@ pub fn parse_musl_initial_stack(
     let mut cursor = aux_start;
     loop {
         if cursor + 1 >= words.len() {
-            return Err(LinuxErrno::Inval);
+            return Err(PosixErrno::Inval);
         }
         let key = words[cursor];
         let value = words[cursor + 1];
@@ -253,7 +253,7 @@ pub fn parse_musl_initial_stack(
             break;
         }
         if auxc >= MAX_STARTUP_AUXV {
-            return Err(LinuxErrno::Inval);
+            return Err(PosixErrno::Inval);
         }
         auxv[auxc] = AuxVectorEntry { key, value };
         auxc += 1;
@@ -278,19 +278,19 @@ pub fn parse_musl_initial_stack(
     })
 }
 
-pub fn startup_hook(info: StartupBootstrapInfo) -> Result<StartupBootstrapInfo, LinuxErrno> {
+pub fn startup_hook(info: StartupBootstrapInfo) -> Result<StartupBootstrapInfo, PosixErrno> {
     if info.stack_top == 0 || info.argv_ptr == 0 || info.envp_ptr == 0 || info.auxv_ptr == 0 {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     if info.argc > MAX_STARTUP_ARGS
         || info.argv_ptr >= info.stack_top
         || info.envp_ptr >= info.stack_top
         || info.auxv_ptr >= info.stack_top
     {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     if !(info.argv_ptr <= info.envp_ptr && info.envp_ptr <= info.auxv_ptr) {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     Ok(info)
 }
@@ -298,7 +298,7 @@ pub fn startup_hook(info: StartupBootstrapInfo) -> Result<StartupBootstrapInfo, 
 pub fn prepare_musl_startup(
     stack_top: usize,
     words: &[usize],
-) -> Result<MuslStartupFrame, LinuxErrno> {
+) -> Result<MuslStartupFrame, PosixErrno> {
     let frame = parse_musl_initial_stack(stack_top, words)?;
     startup_hook(frame.info)?;
     Ok(frame)
@@ -308,7 +308,7 @@ pub fn run_musl_startup(
     stack_top: usize,
     words: &[usize],
     main: fn(usize, usize, usize, usize) -> i32,
-) -> Result<MuslStartupOutcome, LinuxErrno> {
+) -> Result<MuslStartupOutcome, PosixErrno> {
     let frame = prepare_musl_startup(stack_top, words)?;
     let main_return = main(
         frame.info.argc,
@@ -327,9 +327,9 @@ pub fn run_musl_startup(
 pub fn prepare_musl_crt_startup(
     stack_top: usize,
     words: &[usize],
-) -> Result<MuslCrtStartup, LinuxErrno> {
+) -> Result<MuslCrtStartup, PosixErrno> {
     let frame = prepare_musl_startup(stack_top, words)?;
-    let argc = i32::try_from(frame.info.argc).map_err(|_| LinuxErrno::Inval)?;
+    let argc = i32::try_from(frame.info.argc).map_err(|_| PosixErrno::Inval)?;
     let argv = frame.info.argv_ptr as *const *const u8;
     let envp = frame.info.envp_ptr as *const *const u8;
     Ok(MuslCrtStartup { argc, argv, envp })
@@ -342,10 +342,10 @@ pub fn run_musl_crt_startup(
     init: Option<MuslHookFn>,
     fini: Option<MuslHookFn>,
     rtld_fini: Option<MuslHookFn>,
-) -> Result<i32, LinuxErrno> {
+) -> Result<i32, PosixErrno> {
     let crt = prepare_musl_crt_startup(stack_top, words)?;
     let code = musl_libc_start_main(main, crt.argc, crt.argv, crt.envp, init, fini, rtld_fini);
-    i32::try_from(code).map_err(|_| LinuxErrno::Inval)
+    i32::try_from(code).map_err(|_| PosixErrno::Inval)
 }
 
 pub extern "C" fn musl_libc_start_main(
@@ -392,7 +392,7 @@ mod tests {
     use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
     #[test]
-    fn memory_syscall_numbers_match_linux_compat_contract() {
+    fn memory_syscall_numbers_match_linux_abi_contract() {
         let nums = memory_syscall_numbers();
         assert_eq!(nums.brk, LINUX_NR_BRK);
         assert_eq!(nums.mmap, LINUX_NR_MMAP);
@@ -420,7 +420,7 @@ mod tests {
                 envp_ptr: 2,
                 auxv_ptr: 3
             }),
-            Err(LinuxErrno::Inval)
+            Err(PosixErrno::Inval)
         );
     }
 
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn prepare_musl_startup_rejects_missing_argv_terminator() {
         let words = [1, 0x1110, 0x2220, 0x3330];
-        assert_eq!(prepare_musl_startup(0x7000, &words), Err(LinuxErrno::Inval));
+        assert_eq!(prepare_musl_startup(0x7000, &words), Err(PosixErrno::Inval));
     }
 
     #[test]
@@ -607,7 +607,7 @@ mod tests {
                 stack_top: 0x8000_0010,
                 entry: 0x4010,
             }),
-            Err(LinuxErrno::Inval)
+            Err(PosixErrno::Inval)
         );
         assert_eq!(
             validate_musl_thread_spec(MuslThreadSpec {
@@ -615,7 +615,7 @@ mod tests {
                 stack_top: 0x8000_0008,
                 entry: 0x4010,
             }),
-            Err(LinuxErrno::Inval)
+            Err(PosixErrno::Inval)
         );
     }
 
@@ -652,7 +652,7 @@ mod tests {
             },
         )
         .expect("thread");
-        crate::services::compatibility::linux_compat::sysdeps::set_tls_hook(
+        crate::services::compatibility::posix_compat::sysdeps::set_tls_hook(
             &mut kernel,
             state.tid,
             0x3000_0100,

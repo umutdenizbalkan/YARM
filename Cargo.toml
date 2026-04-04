@@ -92,8 +92,8 @@ name = "kernel_boot"
 path = "src/bin/kernel_boot.rs"
 
 [[bin]]
-name = "linux_compat_srv"
-path = "src/bin/linux_compat_srv.rs"
+name = "posix_compat_srv"
+path = "src/bin/posix_compat_srv.rs"
 required-features = ["hosted-dev", "linux-compat"]
 
 [[bin]]

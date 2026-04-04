@@ -11,17 +11,17 @@ use crate::kernel::vfs::{
 };
 use crate::services::common::service::FsService;
 use crate::services::common::vfs_service::VfsReply;
-use crate::services::compatibility::linux_compat::LinuxErrno;
+use crate::services::compatibility::posix_compat::PosixErrno;
 use crate::services::network::socket::service::SocketAdapterService;
 
-pub struct LinuxSysdepsContext<'a, B: VfsBackend> {
+pub struct PosixSysdepsContext<'a, B: VfsBackend> {
     pub kernel: &'a mut KernelState,
     pub proc_service: &'a mut ProcessService,
     pub vfs_service: &'a mut FsService<B>,
     pub socket_service: &'a mut SocketAdapterService,
 }
 
-impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
+impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
     pub fn new(
         kernel: &'a mut KernelState,
         proc_service: &'a mut ProcessService,
@@ -36,14 +36,14 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
         }
     }
 
-    fn decode_u64(reply: Message) -> Result<usize, LinuxErrno> {
+    fn decode_u64(reply: Message) -> Result<usize, PosixErrno> {
         let value = VfsReply::from_message(reply)
-            .map_err(|_| LinuxErrno::Inval)?
+            .map_err(|_| PosixErrno::Inval)?
             .as_u64();
-        usize::try_from(value).map_err(|_| LinuxErrno::Inval)
+        usize::try_from(value).map_err(|_| PosixErrno::Inval)
     }
 
-    pub fn clock_gettime_hook(&mut self) -> Result<u64, LinuxErrno> {
+    pub fn clock_gettime_hook(&mut self) -> Result<u64, PosixErrno> {
         Ok(self
             .kernel
             .timer
@@ -52,7 +52,7 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
             .saturating_mul(1_000_000))
     }
 
-    pub fn nanosleep_hook(&mut self, nanos: u64) -> Result<(), LinuxErrno> {
+    pub fn nanosleep_hook(&mut self, nanos: u64) -> Result<(), PosixErrno> {
         if nanos == 0 {
             return Ok(());
         }
@@ -63,11 +63,11 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
         Ok(())
     }
 
-    pub fn getpid_hook(&mut self) -> Result<u64, LinuxErrno> {
-        let tid = self.kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
+    pub fn getpid_hook(&mut self) -> Result<u64, PosixErrno> {
+        let tid = self.kernel.current_tid().ok_or(PosixErrno::NoSys)?;
         let reply = self.proc_service.handle(
             Message::with_header(0, PROC_OP_GETPID, 0, None, &tid.to_le_bytes())
-                .map_err(|_| LinuxErrno::Inval)?,
+                .map_err(|_| PosixErrno::Inval)?,
         );
         if let Ok(reply) = reply {
             if let Ok(pid) = Self::decode_u64(reply) {
@@ -77,11 +77,11 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
         Ok(tid)
     }
 
-    pub fn getppid_hook(&mut self) -> Result<u64, LinuxErrno> {
-        let tid = self.kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
+    pub fn getppid_hook(&mut self) -> Result<u64, PosixErrno> {
+        let tid = self.kernel.current_tid().ok_or(PosixErrno::NoSys)?;
         let reply = self.proc_service.handle(
             Message::with_header(0, PROC_OP_GETPPID, 0, None, &tid.to_le_bytes())
-                .map_err(|_| LinuxErrno::Inval)?,
+                .map_err(|_| PosixErrno::Inval)?,
         );
         if let Ok(reply) = reply {
             if let Ok(ppid) = Self::decode_u64(reply) {
@@ -91,14 +91,14 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
         Ok(tid.saturating_sub(1))
     }
 
-    pub fn exit_hook(&mut self, code: u64) -> Result<(), LinuxErrno> {
-        let tid = self.kernel.current_tid().ok_or(LinuxErrno::NoSys)?;
+    pub fn exit_hook(&mut self, code: u64) -> Result<(), PosixErrno> {
+        let tid = self.kernel.current_tid().ok_or(PosixErrno::NoSys)?;
         self.proc_service
             .handle(
                 Message::with_header(tid, PROC_OP_EXIT, 0, None, &code.to_le_bytes())
-                    .map_err(|_| LinuxErrno::Inval)?,
+                    .map_err(|_| PosixErrno::Inval)?,
             )
-            .map_err(|_| LinuxErrno::Inval)?;
+            .map_err(|_| PosixErrno::Inval)?;
         Ok(())
     }
 
@@ -107,7 +107,7 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
         path_ptr: usize,
         flags: u32,
         mode: u32,
-    ) -> Result<i32, LinuxErrno> {
+    ) -> Result<i32, PosixErrno> {
         let reply = self
             .vfs_service
             .handle(
@@ -117,10 +117,10 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
                     flags: flags as u64,
                     mode: mode as u64,
                 })
-                .map_err(|_| LinuxErrno::Inval)?,
+                .map_err(|_| PosixErrno::Inval)?,
             )
-            .map_err(|_| LinuxErrno::Inval)?;
-        i32::try_from(Self::decode_u64(reply)?).map_err(|_| LinuxErrno::Inval)
+            .map_err(|_| PosixErrno::Inval)?;
+        i32::try_from(Self::decode_u64(reply)?).map_err(|_| PosixErrno::Inval)
     }
 
     pub fn socket_hook(
@@ -128,10 +128,10 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
         domain: i32,
         sock_type: i32,
         protocol: i32,
-    ) -> Result<i32, LinuxErrno> {
+    ) -> Result<i32, PosixErrno> {
         self.socket_service
             .open(domain, sock_type, protocol)
-            .map_err(|_| LinuxErrno::Inval)
+            .map_err(|_| PosixErrno::Inval)
     }
 
     pub fn read_hook(
@@ -139,12 +139,12 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
         fd: i32,
         buf_ptr: usize,
         buf_len: usize,
-    ) -> Result<usize, LinuxErrno> {
+    ) -> Result<usize, PosixErrno> {
         if self.socket_service.is_socket_fd(fd) {
             return self
                 .socket_service
                 .read(fd, buf_len)
-                .map_err(|_| LinuxErrno::Inval);
+                .map_err(|_| PosixErrno::Inval);
         }
         let reply = self
             .vfs_service
@@ -154,9 +154,9 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
                     buf_ptr: buf_ptr as u64,
                     len: buf_len as u64,
                 })
-                .map_err(|_| LinuxErrno::Inval)?,
+                .map_err(|_| PosixErrno::Inval)?,
             )
-            .map_err(|_| LinuxErrno::Inval)?;
+            .map_err(|_| PosixErrno::Inval)?;
         Self::decode_u64(reply)
     }
 
@@ -165,12 +165,12 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
         fd: i32,
         buf_ptr: usize,
         buf_len: usize,
-    ) -> Result<usize, LinuxErrno> {
+    ) -> Result<usize, PosixErrno> {
         if self.socket_service.is_socket_fd(fd) {
             return self
                 .socket_service
                 .write(fd, buf_len)
-                .map_err(|_| LinuxErrno::Inval);
+                .map_err(|_| PosixErrno::Inval);
         }
         let reply = self
             .vfs_service
@@ -180,19 +180,19 @@ impl<'a, B: VfsBackend> LinuxSysdepsContext<'a, B> {
                     buf_ptr: buf_ptr as u64,
                     len: buf_len as u64,
                 })
-                .map_err(|_| LinuxErrno::Inval)?,
+                .map_err(|_| PosixErrno::Inval)?,
             )
-            .map_err(|_| LinuxErrno::Inval)?;
+            .map_err(|_| PosixErrno::Inval)?;
         Self::decode_u64(reply)
     }
 
-    pub fn close_hook(&mut self, fd: i32) -> Result<(), LinuxErrno> {
+    pub fn close_hook(&mut self, fd: i32) -> Result<(), PosixErrno> {
         if self.socket_service.is_socket_fd(fd) {
-            return self.socket_service.close(fd).map_err(|_| LinuxErrno::Inval);
+            return self.socket_service.close(fd).map_err(|_| PosixErrno::Inval);
         }
         self.vfs_service
-            .handle(close_message(CloseRequest { fd: fd as u64 }).map_err(|_| LinuxErrno::Inval)?)
-            .map_err(|_| LinuxErrno::Inval)?;
+            .handle(close_message(CloseRequest { fd: fd as u64 }).map_err(|_| PosixErrno::Inval)?)
+            .map_err(|_| PosixErrno::Inval)?;
         Ok(())
     }
 }
@@ -209,7 +209,7 @@ mod tests {
         let mut proc = ProcessService::new();
         let mut vfs = FsService::with_backend(InMemoryBackend::new());
         let mut socket = SocketAdapterService::new();
-        let mut ctx = LinuxSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
+        let mut ctx = PosixSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
         assert_eq!(ctx.clock_gettime_hook().expect("before"), 0);
         ctx.nanosleep_hook(2_500_000).expect("sleep");
         assert_eq!(ctx.clock_gettime_hook().expect("after"), 3_000_000);
@@ -232,7 +232,7 @@ mod tests {
         let mut proc = ProcessService::new();
         let mut vfs = FsService::with_backend(InMemoryBackend::new());
         let mut socket = SocketAdapterService::new();
-        let mut ctx = LinuxSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
+        let mut ctx = PosixSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
 
         assert_eq!(ctx.getpid_hook().expect("getpid"), 41);
         assert_eq!(ctx.getppid_hook().expect("getppid"), 40);
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(ctx.read_hook(fd, 0x2000, 128).expect("read"), 128);
         assert_eq!(ctx.write_hook(fd, 0x2000, 11).expect("write"), 11);
         ctx.close_hook(fd).expect("close");
-        assert_eq!(ctx.read_hook(fd, 0x2000, 1), Err(LinuxErrno::Inval));
+        assert_eq!(ctx.read_hook(fd, 0x2000, 1), Err(PosixErrno::Inval));
     }
 
     #[test]
@@ -252,7 +252,7 @@ mod tests {
         let mut proc = ProcessService::new();
         let mut vfs = FsService::with_backend(InMemoryBackend::new());
         let mut socket = SocketAdapterService::new();
-        let mut ctx = LinuxSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
+        let mut ctx = PosixSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
         let fd = ctx.socket_hook(2, 1, 0).expect("socket");
         assert!(fd >= 1000);
         assert_eq!(ctx.read_hook(fd, 0, 128).expect("read"), 64);

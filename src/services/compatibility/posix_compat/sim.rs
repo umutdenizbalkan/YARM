@@ -7,7 +7,7 @@ use crate::kernel::process_abi::PROC_OP_GETPID;
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vfs_abi::VFS_OP_OPENAT;
 
-use super::{LINUX_NR_GETPID, LINUX_NR_OPENAT, LinuxServiceBindings, dispatch};
+use super::{LINUX_NR_GETPID, LINUX_NR_OPENAT, PosixServiceBindings, dispatch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimStep {
@@ -96,7 +96,7 @@ pub fn run_scenario(scenario: &Scenario) -> Result<SimSummary, KernelError> {
 
 pub fn run_deterministic_script(steps: &[SimStep]) -> Result<SimSummary, KernelError> {
     let mut state = Bootstrap::init()?;
-    let mut bindings = LinuxServiceBindings::default();
+    let mut bindings = PosixServiceBindings::default();
 
     let (_proc_req_ep, proc_req_send, _proc_req_recv) = state.create_endpoint(16)?;
     let (_proc_rep_ep, proc_rep_send, proc_rep_recv) = state.create_endpoint(16)?;
@@ -163,7 +163,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deterministic_linux_simulation_replays_mixed_subsystems() {
+    fn deterministic_posix_simulation_replays_mixed_subsystems() {
         let scenario = scenario_catalog()
             .iter()
             .find(|scenario| scenario.name == "mixed_irq_proc_vfs")
@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_scenario_catalog_replays_all_with_expected_results() {
+    fn posix_scenario_catalog_replays_all_with_expected_results() {
         for scenario in scenario_catalog() {
             let summary = run_scenario(scenario).expect("sim");
             assert_eq!(

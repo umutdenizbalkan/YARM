@@ -12,7 +12,7 @@ pub mod runtime;
 pub mod services;
 
 #[cfg(feature = "linux-compat")]
-pub use services::compatibility::linux_compat;
+pub use services::compatibility::posix_compat;
 
 #[macro_export]
 macro_rules! yarm_log {

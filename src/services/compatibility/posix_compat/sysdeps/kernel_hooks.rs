@@ -4,7 +4,7 @@
 use crate::kernel::boot::KernelState;
 use crate::kernel::capabilities::CapId;
 use crate::kernel::vm::PAGE_SIZE;
-use crate::services::compatibility::linux_compat::LinuxErrno;
+use crate::services::compatibility::posix_compat::PosixErrno;
 
 pub fn mmap_hook(
     kernel: &mut KernelState,
@@ -12,7 +12,7 @@ pub fn mmap_hook(
     addr: usize,
     len: usize,
     prot: usize,
-) -> Result<usize, LinuxErrno> {
+) -> Result<usize, PosixErrno> {
     kernel
         .linux_mmap_region(aspace_cap, addr, len, prot)
         .map_err(Into::into)
@@ -23,7 +23,7 @@ pub fn munmap_hook(
     aspace_cap: CapId,
     addr: usize,
     len: usize,
-) -> Result<(), LinuxErrno> {
+) -> Result<(), PosixErrno> {
     kernel
         .linux_munmap_region(aspace_cap, addr, len)
         .map_err(Into::into)
@@ -35,7 +35,7 @@ pub fn mprotect_hook(
     addr: usize,
     len: usize,
     prot: usize,
-) -> Result<(), LinuxErrno> {
+) -> Result<(), PosixErrno> {
     kernel
         .linux_mprotect_region(aspace_cap, addr, len, prot)
         .map_err(Into::into)
@@ -47,7 +47,7 @@ pub fn brk_hook(
     aspace_cap: CapId,
     requested: usize,
     prot: usize,
-) -> Result<usize, LinuxErrno> {
+) -> Result<usize, PosixErrno> {
     kernel
         .linux_brk(tid, aspace_cap, requested, prot)
         .map_err(Into::into)
@@ -59,21 +59,21 @@ pub fn clone_thread_hook(
     tls_base: usize,
     user_stack_top: usize,
     user_entry: usize,
-) -> Result<u64, LinuxErrno> {
+) -> Result<u64, PosixErrno> {
     kernel
         .spawn_user_thread(parent_tid, tls_base, user_stack_top, user_entry)
         .map_err(Into::into)
 }
 
-pub fn set_tls_hook(kernel: &mut KernelState, tid: u64, tls_base: usize) -> Result<(), LinuxErrno> {
+pub fn set_tls_hook(kernel: &mut KernelState, tid: u64, tls_base: usize) -> Result<(), PosixErrno> {
     kernel
         .set_thread_tls_base(tid, tls_base)
         .map_err(Into::into)
 }
 
-pub fn get_tls_hook(kernel: &KernelState, tid: u64) -> Result<Option<usize>, LinuxErrno> {
+pub fn get_tls_hook(kernel: &KernelState, tid: u64) -> Result<Option<usize>, PosixErrno> {
     if tid == 0 {
-        return Err(LinuxErrno::Inval);
+        return Err(PosixErrno::Inval);
     }
     Ok(kernel.thread_tls_base(tid))
 }
@@ -83,18 +83,18 @@ pub fn futex_wait_hook(
     addr: usize,
     expected: u32,
     observed: u32,
-) -> Result<bool, LinuxErrno> {
+) -> Result<bool, PosixErrno> {
     kernel
         .futex_wait_current(addr, expected, observed)
-        .map_err(LinuxErrno::from)
+        .map_err(PosixErrno::from)
 }
 
 pub fn futex_wake_hook(
     kernel: &mut KernelState,
     addr: usize,
     max_wake: u32,
-) -> Result<u32, LinuxErrno> {
-    kernel.futex_wake(addr, max_wake).map_err(LinuxErrno::from)
+) -> Result<u32, PosixErrno> {
+    kernel.futex_wake(addr, max_wake).map_err(PosixErrno::from)
 }
 
 pub const fn default_mmap_len() -> usize {
