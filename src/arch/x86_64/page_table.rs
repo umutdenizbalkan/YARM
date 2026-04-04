@@ -5,8 +5,6 @@ use crate::arch::x86_64::vm_layout;
 use crate::kernel::frame_allocator::{alloc_pt_frame, free_pt_frame};
 use crate::kernel::lock::SpinLockIrq;
 use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr};
-#[cfg(any(feature = "hosted-dev", test))]
-use crate::std::boxed::Box;
 
 const ENTRIES_PER_TABLE: usize = 512;
 const PAGE_SIZE_U64: u64 = vm_layout::PAGE_SIZE as u64;
@@ -60,11 +58,15 @@ pub enum PageTableError {
 #[derive(Clone, Copy)]
 struct PageTablePage {
     phys: u64,
+    entries: [PageTableEntry; ENTRIES_PER_TABLE],
 }
 
 impl PageTablePage {
     const fn new(phys: u64) -> Self {
-        Self { phys }
+        Self {
+            phys,
+            entries: [PageTableEntry::empty(); ENTRIES_PER_TABLE],
+        }
     }
 }
 
@@ -77,8 +79,6 @@ struct AsidCr3 {
 
 struct PageTableState {
     pages: [Option<PageTablePage>; MAX_PT_PAGES],
-    #[cfg(any(feature = "hosted-dev", test))]
-    hosted_entries: [Option<usize>; MAX_PT_PAGES],
     asids: [Option<AsidCr3>; MAX_ASID_ROOTS],
 }
 
@@ -86,8 +86,6 @@ impl PageTableState {
     const fn new() -> Self {
         Self {
             pages: [const { None }; MAX_PT_PAGES],
-            #[cfg(any(feature = "hosted-dev", test))]
-            hosted_entries: [const { None }; MAX_PT_PAGES],
             asids: [const { None }; MAX_ASID_ROOTS],
         }
     }
@@ -110,11 +108,6 @@ impl PageTableState {
                     core::ptr::write_bytes(phys as *mut u8, 0, vm_layout::PAGE_SIZE);
                 }
                 *slot = Some(PageTablePage::new(phys));
-                #[cfg(any(feature = "hosted-dev", test))]
-                {
-                    let entries = Box::new([PageTableEntry::empty(); ENTRIES_PER_TABLE]);
-                    self.hosted_entries[idx] = Some(Box::into_raw(entries) as usize);
-                }
                 return Ok(idx);
             }
         }
@@ -150,13 +143,6 @@ impl PageTableState {
             }
 
             if let Some(page) = self.pages[table_idx].take() {
-                #[cfg(any(feature = "hosted-dev", test))]
-                if let Some(entries_ptr) = self.hosted_entries[table_idx].take() {
-                    // SAFETY: entries_ptr was produced by Box::into_raw in alloc_page.
-                    let _ = unsafe {
-                        Box::from_raw(entries_ptr as *mut [PageTableEntry; ENTRIES_PER_TABLE])
-                    };
-                }
                 let _ = free_pt_frame(page.phys);
             }
         }
@@ -240,14 +226,8 @@ static PAGE_TABLE_TEST_LOCK: crate::kernel::lock::SpinLock<()> =
 
 pub fn reset_state() {
     let mut state = PAGE_TABLE_STATE.lock();
-    for idx in 0..MAX_PT_PAGES {
-        state.pages[idx] = None;
-        #[cfg(any(feature = "hosted-dev", test))]
-        if let Some(entries_ptr) = state.hosted_entries[idx].take() {
-            // SAFETY: entries_ptr was produced by Box::into_raw in alloc_page.
-            let _ =
-                unsafe { Box::from_raw(entries_ptr as *mut [PageTableEntry; ENTRIES_PER_TABLE]) };
-        }
+    for page in &mut state.pages {
+        *page = None;
     }
     for asid in &mut state.asids {
         *asid = None;
@@ -448,19 +428,15 @@ fn read_table_entry(
     if index >= ENTRIES_PER_TABLE {
         return None;
     }
-    #[cfg(any(feature = "hosted-dev", test))]
-    {
-        let table_idx = state.page_index_from_phys(table_phys)?;
-        let entries_ptr = state.hosted_entries[table_idx]?;
-        let ptr = (entries_ptr as *const PageTableEntry).wrapping_add(index);
-        // SAFETY: hosted_entries[table_idx] points to a valid boxed page-table array.
-        return Some(unsafe { core::ptr::read_volatile(ptr) });
-    }
+    let table_idx = state.page_index_from_phys(table_phys)?;
     #[cfg(all(not(feature = "hosted-dev"), not(test)))]
     unsafe {
-        state.page_index_from_phys(table_phys)?;
         let ptr = (table_phys as usize + index * core::mem::size_of::<u64>()) as *const u64;
         return Some(PageTableEntry(core::ptr::read_volatile(ptr)));
+    }
+    #[cfg(any(feature = "hosted-dev", test))]
+    {
+        Some(state.pages[table_idx].as_ref()?.entries[index])
     }
 }
 
@@ -473,23 +449,15 @@ fn write_table_entry(
     if index >= ENTRIES_PER_TABLE {
         return Err(PageTableError::InvalidAddress);
     }
-    #[cfg(any(feature = "hosted-dev", test))]
-    {
-        let table_idx = state
-            .page_index_from_phys(table_phys)
-            .ok_or(PageTableError::InvalidAddress)?;
-        let entries_ptr = state.hosted_entries[table_idx].ok_or(PageTableError::InvalidAddress)?;
-        let ptr = (entries_ptr as *mut PageTableEntry).wrapping_add(index);
-        // SAFETY: hosted_entries[table_idx] points to a valid boxed page-table array.
-        unsafe {
-            core::ptr::write_volatile(ptr, entry);
-        }
-    }
+    let table_idx = state
+        .page_index_from_phys(table_phys)
+        .ok_or(PageTableError::InvalidAddress)?;
+    state.pages[table_idx]
+        .as_mut()
+        .ok_or(PageTableError::InvalidAddress)?
+        .entries[index] = entry;
     #[cfg(all(not(feature = "hosted-dev"), not(test)))]
     unsafe {
-        state
-            .page_index_from_phys(table_phys)
-            .ok_or(PageTableError::InvalidAddress)?;
         let ptr = (table_phys as usize + index * core::mem::size_of::<u64>()) as *mut u64;
         core::ptr::write_volatile(ptr, entry.0);
     }
