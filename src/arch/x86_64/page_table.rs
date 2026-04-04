@@ -58,15 +58,11 @@ pub enum PageTableError {
 #[derive(Clone, Copy)]
 struct PageTablePage {
     phys: u64,
-    entries: [PageTableEntry; ENTRIES_PER_TABLE],
 }
 
 impl PageTablePage {
     const fn new(phys: u64) -> Self {
-        Self {
-            phys,
-            entries: [PageTableEntry::empty(); ENTRIES_PER_TABLE],
-        }
+        Self { phys }
     }
 }
 
@@ -428,15 +424,10 @@ fn read_table_entry(
     if index >= ENTRIES_PER_TABLE {
         return None;
     }
-    let table_idx = state.page_index_from_phys(table_phys)?;
-    #[cfg(all(not(feature = "hosted-dev"), not(test)))]
+    state.page_index_from_phys(table_phys)?;
     unsafe {
         let ptr = (table_phys as usize + index * core::mem::size_of::<u64>()) as *const u64;
-        return Some(PageTableEntry(core::ptr::read_volatile(ptr)));
-    }
-    #[cfg(any(feature = "hosted-dev", test))]
-    {
-        Some(state.pages[table_idx].as_ref()?.entries[index])
+        Some(PageTableEntry(core::ptr::read_volatile(ptr)))
     }
 }
 
@@ -449,14 +440,9 @@ fn write_table_entry(
     if index >= ENTRIES_PER_TABLE {
         return Err(PageTableError::InvalidAddress);
     }
-    let table_idx = state
+    state
         .page_index_from_phys(table_phys)
         .ok_or(PageTableError::InvalidAddress)?;
-    state.pages[table_idx]
-        .as_mut()
-        .ok_or(PageTableError::InvalidAddress)?
-        .entries[index] = entry;
-    #[cfg(all(not(feature = "hosted-dev"), not(test)))]
     unsafe {
         let ptr = (table_phys as usize + index * core::mem::size_of::<u64>()) as *mut u64;
         core::ptr::write_volatile(ptr, entry.0);

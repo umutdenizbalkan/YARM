@@ -14,8 +14,6 @@ const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
 const PVH_MAGIC: u32 = 0x336e_c578;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_PHYS_EXCLUSIVE: u64 = 1u64 << 52;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-const BOOT_KERNEL_ASID: yarm::kernel::vm::Asid = yarm::kernel::vm::Asid(1);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[repr(C)]
@@ -220,80 +218,6 @@ fn debug_uart_marker(byte: u8) {
     }
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-unsafe extern "C" {
-    static __kernel_rx_start: u8;
-    static __kernel_rx_end: u8;
-    static __kernel_rw_start: u8;
-    static __kernel_rw_end: u8;
-}
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn map_identity_range(
-    asid: yarm::kernel::vm::Asid,
-    start: u64,
-    end_exclusive: u64,
-    flags: yarm::kernel::vm::PageFlags,
-) -> Result<(), yarm::arch::x86_64::page_table::PageTableError> {
-    let page = yarm::kernel::vm::PAGE_SIZE as u64;
-    let mut current = start & !(page - 1);
-    let end = (end_exclusive + (page - 1)) & !(page - 1);
-    while current < end {
-        yarm::arch::x86_64::page_table::map_page(
-            asid,
-            yarm::kernel::vm::VirtAddr(current),
-            yarm::kernel::vm::PhysAddr(current),
-            flags,
-        )?;
-        current = current.saturating_add(page);
-    }
-    Ok(())
-}
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn bootstrap_kernel_vm_identity_and_switch_cr3() -> Result<(), ()> {
-    let kernel_rx = yarm::kernel::vm::PageFlags {
-        read: true,
-        write: false,
-        execute: true,
-        user: false,
-        cache_policy: yarm::kernel::vm::CachePolicy::WriteBack,
-    };
-
-    let rx_start = core::ptr::addr_of!(__kernel_rx_start) as u64;
-    let rx_end = core::ptr::addr_of!(__kernel_rx_end) as u64;
-    let rw_start = core::ptr::addr_of!(__kernel_rw_start) as u64;
-    let rw_end = core::ptr::addr_of!(__kernel_rw_end) as u64;
-
-    yarm::arch::x86_64::page_table::ensure_asid_root(BOOT_KERNEL_ASID).map_err(|_| ())?;
-    map_identity_range(BOOT_KERNEL_ASID, rx_start, rx_end, kernel_rx).map_err(|_| ())?;
-    map_identity_range(
-        BOOT_KERNEL_ASID,
-        rw_start,
-        rw_end,
-        yarm::kernel::vm::PageFlags::KERNEL_RW,
-    )
-    .map_err(|_| ())?;
-    map_identity_range(
-        BOOT_KERNEL_ASID,
-        yarm::arch::platform_layout::LAPIC_MMIO_BASE as u64,
-        (yarm::arch::platform_layout::LAPIC_MMIO_BASE as u64)
-            + (yarm::kernel::vm::PAGE_SIZE as u64),
-        yarm::kernel::vm::PageFlags::DEVICE_RW,
-    )
-    .map_err(|_| ())?;
-    map_identity_range(
-        BOOT_KERNEL_ASID,
-        yarm::arch::platform_layout::IOAPIC_MMIO_BASE as u64,
-        (yarm::arch::platform_layout::IOAPIC_MMIO_BASE as u64)
-            + (yarm::kernel::vm::PAGE_SIZE as u64),
-        yarm::kernel::vm::PageFlags::DEVICE_RW,
-    )
-    .map_err(|_| ())?;
-    yarm::arch::x86_64::page_table::activate_asid(BOOT_KERNEL_ASID).map_err(|_| ())?;
-    Ok(())
-}
-
 #[inline]
 fn run_boot_markers() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -309,13 +233,6 @@ fn run_boot_markers() {
     {
         debug_uart_marker(b'I');
         yarm::arch::x86_64::descriptor_tables::register_trap_kernel_state(&mut kernel);
-        if bootstrap_kernel_vm_identity_and_switch_cr3().is_ok() {
-            yarm::arch::x86_64::console::write_line("KM1");
-            debug_uart_marker(b'V');
-        } else {
-            yarm::arch::x86_64::console::write_line("KM1_ERR");
-            debug_uart_marker(b'X');
-        }
         kernel.program_timer_deadline_current_cpu(
             yarm::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
         );
