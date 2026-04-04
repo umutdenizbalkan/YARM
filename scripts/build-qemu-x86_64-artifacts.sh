@@ -20,6 +20,7 @@ TOOLCHAIN=${TOOLCHAIN:-nightly}
 BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
 BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
 QEMU_X86_ALLOW_ELF_KERNEL=${QEMU_X86_ALLOW_ELF_KERNEL:-1}
+X86_NONE_DEBUGINFO=${X86_NONE_DEBUGINFO:-2}
 
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$TOOLCHAIN}
 RUST_SYSROOT=${RUST_SYSROOT:-$(rustup run "${RUSTUP_TOOLCHAIN}" rustc --print sysroot 2>/dev/null || true)}
@@ -109,6 +110,7 @@ fi
 echo "[info] building server + kernel bins for target ${RUST_TARGET} (toolchain=${TOOLCHAIN}, build-std=${BUILD_STD_COMPONENTS})"
 BUILD_OK=1
 set +e
+CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
 cargo +"${TOOLCHAIN}" build -Z build-std=${BUILD_STD_COMPONENTS} -Z json-target-spec --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} --bin "$SERVER_BIN" --bin "$KERNEL_BIN"
 BUILD_STATUS=$?
 set -e

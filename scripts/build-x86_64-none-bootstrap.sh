@@ -11,6 +11,7 @@ RUSTUP_DISABLED=${RUSTUP_DISABLED:-0}
 RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$TOOLCHAIN}
 BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
 BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
+X86_NONE_DEBUGINFO=${X86_NONE_DEBUGINFO:-2}
 
 if [[ ! -f "$TARGET_SPEC" ]]; then
   echo "[error] missing target spec: $TARGET_SPEC"
@@ -62,6 +63,7 @@ if [[ ! -d "$RUST_SRC_DIR" ]]; then
 fi
 
 echo "[info] building kernel_boot + init_server for ${TARGET_SPEC} with toolchain=${TOOLCHAIN_LABEL}, build-std=${BUILD_STD_COMPONENTS}"
+CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
 "${CARGO_CMD[@]}" build \
   -Z build-std=${BUILD_STD_COMPONENTS} \
   -Z json-target-spec \
