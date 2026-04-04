@@ -20,6 +20,7 @@ BOOTSTRAP_SCRIPT="${BOOTSTRAP_SCRIPT:-$BOOTSTRAP_SCRIPT_DEFAULT}"
 TOOLCHAIN="${TOOLCHAIN:-nightly}"
 SKIP_NET_CHECK="${SKIP_NET_CHECK:-0}"
 RUSTUP_DISABLED="${RUSTUP_DISABLED:-0}"
+X86_NONE_DEBUGINFO="${X86_NONE_DEBUGINFO:-2}"
 
 usage() {
   cat <<USAGE
@@ -32,6 +33,7 @@ Environment overrides:
   BOOTSTRAP_SCRIPT     Delegate script path (default: ${BOOTSTRAP_SCRIPT_DEFAULT})
   SKIP_NET_CHECK       Set to 1 to skip endpoint reachability checks
   RUSTUP_DISABLED      Set to 1 to skip rustup install/component steps
+  X86_NONE_DEBUGINFO  Debuginfo level for x86-none profile builds (default: 2)
 USAGE
 }
 
@@ -119,4 +121,5 @@ RUSTUP_UPDATE_ROOT="$UPDATE_ROOT" \
 RUSTUP_TOOLCHAIN="$TOOLCHAIN" \
 TOOLCHAIN="$TOOLCHAIN" \
 RUSTUP_DISABLED="$RUSTUP_DISABLED" \
+X86_NONE_DEBUGINFO="$X86_NONE_DEBUGINFO" \
 "$BOOTSTRAP_SCRIPT"
