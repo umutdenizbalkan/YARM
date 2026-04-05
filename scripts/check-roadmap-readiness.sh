@@ -17,8 +17,8 @@ for f in PHASE2_DRIVER_CONTRACT.md PHASE3_NETWORK_CONTRACT.md PHASE4_UI_CONTRACT
   fi
 done
 
-if ! rg -n "phase2-driver-gates|phase3-network-gates|phase4-ui-gates|phase4-ui-smoke-marker" .github/workflows/compat-gates.yml >/dev/null; then
-  echo "[fail] compat-gates must include phase2/phase3/phase4 jobs"
+if ! rg -n "phase2-driver-gates|phase3-network-gates|phase4-ui-gates|phase4-ui-smoke-marker|phase5-boundary-gates" .github/workflows/compat-gates.yml >/dev/null; then
+  echo "[fail] compat-gates must include phase2/phase3/phase4/phase5 jobs"
   bad=1
 fi
 
@@ -43,7 +43,7 @@ if [[ "$bad" -ne 0 ]]; then
 fi
 
 # matrix/workflow synchronization checks
-for token in phase2-driver-gates phase3-network-gates phase4-ui-gates phase4-ui-smoke-marker; do
+for token in phase2-driver-gates phase3-network-gates phase4-ui-gates phase4-ui-smoke-marker phase5-boundary-gates; do
   if ! rg -n "$token" PHASE_READINESS_MATRIX.md >/dev/null; then
     echo "[fail] readiness matrix missing CI token: $token"
     bad=1

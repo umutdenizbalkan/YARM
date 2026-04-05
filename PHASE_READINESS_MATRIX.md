@@ -74,3 +74,13 @@ This matrix maps roadmap phase completion to required contracts, CI jobs, and de
   - `services::ui::compositor::service::tests::compositor_replay_is_deterministic`
   - `services::ui::shell::service::tests::shell_session_counter_increments`
   - strict QEMU log marker grep for `\[ui\] boot-to-shell marker`
+
+## Phase 5 — Structural boundary/type gates
+
+- Required CI jobs:
+  - `phase5-boundary-gates`
+- Required deterministic checks:
+  - `scripts/check-crate-graph-boundary.py`
+  - `scripts/check-server-crate-deps.sh`
+  - `scripts/check-service-arch-boundary.sh`
+  - compile checks for extracted server crates (`cargo check -p yarm-*-servers`, including `yarm-compat-servers --features posix-compat`)

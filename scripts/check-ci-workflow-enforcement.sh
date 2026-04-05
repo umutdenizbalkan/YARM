@@ -31,6 +31,10 @@ if ! rg -n "posix-compat-profile:" "$compat" >/dev/null; then
   echo "[fail] compat-gates workflow must include posix-compat-profile job"
   bad=1
 fi
+if ! rg -n "phase5-boundary-gates:" "$compat" >/dev/null; then
+  echo "[fail] compat-gates workflow must include phase5-boundary-gates job"
+  bad=1
+fi
 
 if ! rg -n "pull_request:" "$smoke" >/dev/null; then
   echo "[fail] core-qemu-smoke workflow must run on pull_request"
