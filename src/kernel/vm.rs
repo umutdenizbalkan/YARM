@@ -598,12 +598,13 @@ mod tests {
         );
         assert!(PAGE_SIZE >= 4096, "PAGE_SIZE must be at least 4096");
         assert!(
-            KERNEL_SPACE_BASE.is_power_of_two(),
-            "KERNEL_SPACE_BASE must be power-of-two aligned"
-        );
-        assert!(
             KERNEL_SPACE_BASE > 0,
             "KERNEL_SPACE_BASE must leave some lower user virtual space"
+        );
+        assert_eq!(
+            KERNEL_SPACE_BASE & ((PAGE_SIZE as u64) - 1),
+            0,
+            "KERNEL_SPACE_BASE must be page-aligned"
         );
         assert!(MAX_MAPPINGS > 0, "MAX_MAPPINGS must be non-zero");
         assert!(

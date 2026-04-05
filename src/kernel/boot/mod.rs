@@ -4086,7 +4086,7 @@ mod tests {
 
         let bad_range = state.map_user_page(
             aspace_map_cap,
-            VirtAddr(0x8000_0000),
+            VirtAddr(crate::kernel::vm::KERNEL_SPACE_BASE),
             Mapping {
                 phys: PhysAddr(0x3000),
                 flags: PageFlags::USER_RX,
