@@ -24,10 +24,10 @@ pub struct VfsLoopSummary {
 const VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 
 fn decode_fd_reply(reply: crate::kernel::ipc::Message) -> Result<u64, VfsError> {
-    VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
-        .ok_or(VfsError::Malformed)?
-        .as_fd()
-        .ok_or(VfsError::Malformed)
+    VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
+        .map_err(|_| VfsError::Malformed)?
+        .expect_fd(reply.opcode)
+        .map_err(|_| VfsError::Malformed)
 }
 
 pub fn run_request_loop(
@@ -377,8 +377,8 @@ mod tests {
         )
         .expect("roundtrip");
         assert_eq!(
-            VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
-                .ok_or(VfsError::Malformed)
+            VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
+                .map_err(|_| VfsError::Malformed)
                 .expect("decode"),
             VfsReply::OpenAtFd(3)
         );
@@ -451,7 +451,8 @@ mod tests {
         )
         .expect("write devfs");
         assert_eq!(
-            VfsReply::from_opcode_payload(write_dev.opcode, write_dev.as_slice()).expect("decode"),
+            VfsReply::from_opcode_payload_checked(write_dev.opcode, write_dev.as_slice())
+                .expect("decode"),
             VfsReply::WriteLen(9)
         );
 
@@ -489,7 +490,8 @@ mod tests {
         )
         .expect("read ramfs");
         assert_eq!(
-            VfsReply::from_opcode_payload(read_ram.opcode, read_ram.as_slice()).expect("decode"),
+            VfsReply::from_opcode_payload_checked(read_ram.opcode, read_ram.as_slice())
+                .expect("decode"),
             VfsReply::ReadLen(0)
         );
     }
@@ -576,7 +578,7 @@ mod tests {
         )
         .expect("read null reply");
         assert_eq!(
-            VfsReply::from_opcode_payload(dev_null_read.opcode, dev_null_read.as_slice())
+            VfsReply::from_opcode_payload_checked(dev_null_read.opcode, dev_null_read.as_slice())
                 .expect("decode"),
             VfsReply::ReadLen(0)
         );
@@ -616,8 +618,11 @@ mod tests {
         )
         .expect("write console reply");
         assert_eq!(
-            VfsReply::from_opcode_payload(dev_console_write.opcode, dev_console_write.as_slice())
-                .expect("decode"),
+            VfsReply::from_opcode_payload_checked(
+                dev_console_write.opcode,
+                dev_console_write.as_slice(),
+            )
+            .expect("decode"),
             VfsReply::WriteLen(17)
         );
 
@@ -674,7 +679,7 @@ mod tests {
         )
         .expect("stat ramfs reply");
         assert!(
-            VfsReply::from_opcode_payload(ram_stat.opcode, ram_stat.as_slice())
+            VfsReply::from_opcode_payload_checked(ram_stat.opcode, ram_stat.as_slice())
                 .expect("decode")
                 .as_u64()
                 > 0
@@ -717,7 +722,8 @@ mod tests {
         )
         .expect("read init reply");
         assert_eq!(
-            VfsReply::from_opcode_payload(init_read.opcode, init_read.as_slice()).expect("decode"),
+            VfsReply::from_opcode_payload_checked(init_read.opcode, init_read.as_slice())
+                .expect("decode"),
             VfsReply::ReadLen(4096)
         );
         let init_write = roundtrip_ipc(

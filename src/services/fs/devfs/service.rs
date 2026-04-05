@@ -23,7 +23,7 @@ pub struct DevFsLoopSummary {
 }
 
 fn decode_reply_u64(reply: Message) -> u64 {
-    VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
+    VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
         .expect("decode vfs reply")
         .as_u64()
 }
@@ -263,7 +263,7 @@ mod tests {
             )
             .expect("open reply");
         let console_fd =
-            VfsReply::from_opcode_payload(open_console.opcode, open_console.as_slice())
+            VfsReply::from_opcode_payload_checked(open_console.opcode, open_console.as_slice())
                 .expect("decode open")
                 .as_u64();
         assert_eq!(console_fd, 3);

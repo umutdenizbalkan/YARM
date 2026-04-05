@@ -57,10 +57,6 @@ impl VfsReply {
         }
     }
 
-    pub fn from_opcode_payload(opcode: u16, payload: &[u8]) -> Option<Self> {
-        Self::from_opcode_payload_checked(opcode, payload).ok()
-    }
-
     pub const fn as_u64(self) -> u64 {
         match self {
             Self::OpenAtFd(v)
