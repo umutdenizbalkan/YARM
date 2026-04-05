@@ -62,7 +62,7 @@ if [[ ! -d "$RUST_SRC_DIR" ]]; then
   exit 2
 fi
 
-echo "[info] building kernel_boot + init_server for ${TARGET_SPEC} with toolchain=${TOOLCHAIN_LABEL}, build-std=${BUILD_STD_COMPONENTS}"
+echo "[info] building kernel_boot (package=yarm) for ${TARGET_SPEC} with toolchain=${TOOLCHAIN_LABEL}, build-std=${BUILD_STD_COMPONENTS}"
 CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
 "${CARGO_CMD[@]}" build \
   -Z build-std=${BUILD_STD_COMPONENTS} \
@@ -70,7 +70,18 @@ CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
   --target "$TARGET_SPEC" \
   --profile "$PROFILE" \
   ${BOOTSTRAP_FEATURE_ARGS} \
-  --bin kernel_boot \
+  -p yarm \
+  --bin kernel_boot
+
+echo "[info] building init_server (package=yarm-control-plane-servers)"
+CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
+"${CARGO_CMD[@]}" build \
+  -Z build-std=${BUILD_STD_COMPONENTS} \
+  -Z json-target-spec \
+  --target "$TARGET_SPEC" \
+  --profile "$PROFILE" \
+  ${BOOTSTRAP_FEATURE_ARGS} \
+  -p yarm-control-plane-servers \
   --bin init_server
 
 KERNEL_ELF_PATH="target/x86_64-yarm-none/${PROFILE}/kernel_boot"
