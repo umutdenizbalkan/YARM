@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::control_plane::vfs::run();
+    yarm_server_runtime::control_plane::run_vfs_server();
 }

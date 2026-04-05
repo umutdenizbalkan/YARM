@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "yarm-server-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["hosted-dev"]
+hosted-dev = []
+posix-compat = ["yarm/posix-compat"]
+
+[dependencies]
+yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }

@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::compatibility::posix_compat::run();
+    yarm_server_runtime::run_posix_compat_server();
 }

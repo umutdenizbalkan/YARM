@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::drivers::input::run();
+    yarm_server_runtime::drivers::run_input();
 }

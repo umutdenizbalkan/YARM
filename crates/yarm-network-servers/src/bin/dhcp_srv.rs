@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::network::dhcp::run();
+    yarm_server_runtime::network::run_dhcp();
 }

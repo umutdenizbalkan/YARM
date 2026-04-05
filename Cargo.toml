@@ -19,6 +19,7 @@ members = [
     "crates/yarm-ui-servers",
     "crates/yarm-compat-servers",
     "crates/yarm-runtime-tools",
+    "crates/yarm-server-runtime",
 ]
 resolver = "2"
 

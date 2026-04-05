@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::network::tcpip::run();
+    yarm_server_runtime::network::run_tcpip();
 }

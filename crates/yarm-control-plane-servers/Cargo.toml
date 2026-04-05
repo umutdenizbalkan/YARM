@@ -11,7 +11,7 @@ default = ["hosted-dev"]
 hosted-dev = []
 
 [dependencies]
-yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
+yarm-server-runtime = { path = "../yarm-server-runtime", default-features = false, features = ["hosted-dev"] }
 
 [[bin]]
 name = "init_server"

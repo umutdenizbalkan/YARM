@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::ui::display::run();
+    yarm_server_runtime::ui::run_display();
 }

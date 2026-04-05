@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::fs::initramfs::run();
+    yarm_server_runtime::fs::run_initramfs();
 }

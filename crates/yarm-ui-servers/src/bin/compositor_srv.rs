@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::ui::compositor::run();
+    yarm_server_runtime::ui::run_compositor();
 }

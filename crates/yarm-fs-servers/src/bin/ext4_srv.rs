@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::fs::ext4::run();
+    yarm_server_runtime::fs::run_ext4();
 }

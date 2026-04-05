@@ -38,6 +38,7 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
   - `driver_manager` moved into `crates/yarm-control-plane-servers`
   - root package ownership reduced to non-server boot/smoke bins.
 - **PR-BND-4 sixth extraction slice landed:** `core_profile_smoke` moved into a dedicated hosted runtime tooling crate `crates/yarm-runtime-tools`, leaving root package bin ownership kernel-only (`kernel_boot`).
+- **PR-BND-4 pass E (server dependency rewiring bridge) landed:** extracted server bins now depend on `crates/yarm-server-runtime` wrappers instead of depending on root `yarm` directly, reducing direct monolith visibility from server entrypoints while keeping runtime behavior unchanged.
 - **Trap decode correctness improved:** unknown architecture trap codes are normalized as `TrapEvent::Unknown { arch_code }` instead of being coerced into external IRQ semantics.
 - **Per-CPU TLS restore observability:** architecture trap paths now expose CPU-indexed TLS-restore slots and include isolation tests to verify CPU-local behavior.
 - **External IRQ completion plumbing added:** external IRQ trap handling now saves/restores interrupt state around routing and calls an ISA-selected `external_irq_eoi` hook for controller completion handoff.

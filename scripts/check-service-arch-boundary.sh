@@ -36,7 +36,7 @@ for d in src/services/*; do
   fi
 done
 
-# 3) thin *_srv.rs binaries must delegate directly to yarm::services::*::run
+# 3) thin *_srv.rs binaries must delegate directly to yarm-server-runtime wrappers.
 bad=0
 for f in "${server_bin_files[@]}"; do
   [[ -e "$f" ]] || continue
@@ -45,8 +45,8 @@ for f in "${server_bin_files[@]}"; do
     echo "[fail] $f is not thin (>$lines lines)"
     bad=1
   fi
-  if ! rg -n "yarm::services::[a-z0-9_:]+::run\(\);" "$f" >/dev/null; then
-    echo "[fail] $f does not delegate to services::<name>::run()"
+  if ! rg -n "yarm_server_runtime::[a-z0-9_:]+\(\);" "$f" >/dev/null; then
+    echo "[fail] $f does not delegate to yarm-server-runtime entry wrapper"
     bad=1
   fi
  done

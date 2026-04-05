@@ -16,28 +16,28 @@ dependencies = [
 name = "yarm-compat-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
+ "yarm-server-runtime",
 ]
 
 [[package]]
 name = "yarm-control-plane-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
+ "yarm-server-runtime",
 ]
 
 [[package]]
 name = "yarm-driver-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
+ "yarm-server-runtime",
 ]
 
 [[package]]
 name = "yarm-fs-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
+ "yarm-server-runtime",
 ]
 
 [[package]]
@@ -52,11 +52,18 @@ version = "0.1.0"
 name = "yarm-network-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
+ "yarm-server-runtime",
 ]
 
 [[package]]
 name = "yarm-runtime-tools"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
+name = "yarm-server-runtime"
 version = "0.1.0"
 dependencies = [
  "yarm",
@@ -73,5 +80,5 @@ dependencies = [
 name = "yarm-ui-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
+ "yarm-server-runtime",
 ]

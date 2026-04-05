@@ -6,7 +6,7 @@
 
 #[inline]
 fn run() {
-    yarm::services::control_plane::init::run();
+    yarm_server_runtime::control_plane::run_init_server();
 }
 
 #[cfg(feature = "hosted-dev")]

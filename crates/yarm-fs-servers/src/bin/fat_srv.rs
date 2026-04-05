@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm::services::fs::fat::run();
+    yarm_server_runtime::fs::run_fat();
 }
