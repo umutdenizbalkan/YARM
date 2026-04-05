@@ -50,12 +50,12 @@ Hardware access is modeled as capabilities held by normal servers.
 
 - Arch/address-space constants and syscall shape constants are selected via `crate::arch::{vm_layout, platform_layout, syscall_abi}` and should not be newly introduced directly under `src/kernel/`.
 
-## Single-crate boundary risk and enforcement
+## Current boundary enforcement model
 
-- YARM currently keeps kernel + servers in one crate for iteration speed, which means `crate::kernel::*` is technically visible to service code.
-- To preserve microkernel user-space boundaries until a multi-crate split lands, CI rejects kernel-path imports from `src/services/**` and `src/bin/*_srv.rs` via `scripts/check-service-arch-boundary.sh`.
-- Workspace split is active with dedicated `yarm-ipc-abi` and `yarm-srv-common` crates; service-side VFS decode and control-plane call/reply helpers are now centralized there.
-- Remaining step is a full `yarm-kernel` crate extraction (and server crate wiring) so the type system fully enforces service/kernel separation instead of grep-based policy.
+- Kernel mechanism types are owned by `yarm-kernel`; extracted server bins are owned by dedicated server crates and call `yarm-server-runtime` wrapper entrypoints.
+- Structural boundary enforcement is now crate-graph driven (`scripts/check-crate-graph-boundary.py`) and compiled in CI via `phase5-boundary-gates`.
+- `scripts/check-service-arch-boundary.sh` remains as a complementary source-shape guard (thin entry wrappers + denylisted imports), not the primary boundary mechanism.
+- Root package binary ownership is kernel bootstrap only (`kernel_boot`).
 
 ## Remaining milestone PR list
 
@@ -105,6 +105,7 @@ This is the concrete PR sequence for closing the boundary milestone.
 - PR-BND-5 pass B landed with CI wiring (`scripts/phase5-boundary-gates.sh` + `phase5-boundary-gates` workflow job) to run structural boundary scripts and extracted server compile checks.
 - PR-BND-5 pass C promoted `phase5-boundary-gates` to required readiness/workflow token checks (`check-ci-workflow-enforcement`, `check-roadmap-readiness`, and `PHASE_READINESS_MATRIX`).
 - PR-BND-6 pass A started by removing redundant transitional dependency script (`check-server-crate-deps.sh`) now that crate-graph enforcement is active (`check-crate-graph-boundary.py`).
+- PR-BND-6 pass B landed by rewriting stale single-crate transition text to reflect the current enforcement model (crate-graph primary + source-shape companion guard).
 
 ## Definition of done for the boundary milestone
 
