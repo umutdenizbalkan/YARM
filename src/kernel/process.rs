@@ -85,7 +85,9 @@ impl ElfImageInfo {
         let end = offset
             .checked_add(2)
             .ok_or(ProcessManagerError::Malformed)?;
-        let bytes = image.get(offset..end).ok_or(ProcessManagerError::Malformed)?;
+        let bytes = image
+            .get(offset..end)
+            .ok_or(ProcessManagerError::Malformed)?;
         let mut raw = [0u8; 2];
         raw.copy_from_slice(bytes);
         Ok(if big_endian {
@@ -99,7 +101,9 @@ impl ElfImageInfo {
         let end = offset
             .checked_add(4)
             .ok_or(ProcessManagerError::Malformed)?;
-        let bytes = image.get(offset..end).ok_or(ProcessManagerError::Malformed)?;
+        let bytes = image
+            .get(offset..end)
+            .ok_or(ProcessManagerError::Malformed)?;
         let mut raw = [0u8; 4];
         raw.copy_from_slice(bytes);
         Ok(if big_endian {
@@ -113,7 +117,9 @@ impl ElfImageInfo {
         let end = offset
             .checked_add(8)
             .ok_or(ProcessManagerError::Malformed)?;
-        let bytes = image.get(offset..end).ok_or(ProcessManagerError::Malformed)?;
+        let bytes = image
+            .get(offset..end)
+            .ok_or(ProcessManagerError::Malformed)?;
         let mut raw = [0u8; 8];
         raw.copy_from_slice(bytes);
         Ok(if big_endian {
@@ -190,7 +196,10 @@ impl ElfImageInfo {
         let mut load_segments = 0usize;
         for idx in 0..phnum {
             let base = phoff
-                .checked_add(idx.checked_mul(phentsize).ok_or(ProcessManagerError::Malformed)?)
+                .checked_add(
+                    idx.checked_mul(phentsize)
+                        .ok_or(ProcessManagerError::Malformed)?,
+                )
                 .ok_or(ProcessManagerError::Malformed)?;
             let p_type = Self::read_u32(image, base, big_endian)?;
             if p_type != Self::PT_LOAD {
@@ -217,10 +226,7 @@ impl ElfImageInfo {
             return Err(ProcessManagerError::Malformed);
         }
 
-        Ok(Self {
-            entry,
-            image_id,
-        })
+        Ok(Self { entry, image_id })
     }
 }
 
@@ -628,7 +634,7 @@ impl ProcessService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::process_abi::{SpawnV2Args, WaitPidV2Args};
+    use yarm_ipc_abi::process_abi::{SpawnV2Args, WaitPidV2Args};
 
     #[test]
     fn elf_image_info_parser_accepts_minimal_elf64_header() {
