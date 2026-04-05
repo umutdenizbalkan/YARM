@@ -101,6 +101,7 @@ This is the concrete PR sequence for closing the boundary milestone.
 - Root package bin ownership is now kernel bootstrap only (`kernel_boot`).
 - PR-BND-4 pass E rewired extracted server crates to call `yarm-server-runtime` wrappers instead of root `yarm` paths directly at bin-entry level.
 - PR-BND-4 pass F added `scripts/check-server-crate-deps.sh` to fail if extracted server crates depend on root `yarm` directly instead of `yarm-server-runtime`.
+- PR-BND-5 pass A started with a crate-graph gate (`scripts/check-crate-graph-boundary.py`) that validates dependency edges via `cargo metadata` instead of source-path greps.
 
 ## Definition of done for the boundary milestone
 
