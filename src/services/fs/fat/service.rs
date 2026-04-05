@@ -5,8 +5,8 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
 use crate::services::common::service::FsService;
-use crate::services::common::vfs_service::VfsReply;
 use crate::services::fs::fat::fs::FatBackend;
+use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type FatService = FsService<FatBackend>;
 
@@ -20,7 +20,9 @@ pub fn run() {
     })
     .expect("open");
     let rep = svc.handle(open).expect("open rep");
-    let fd = VfsReply::from_message(rep).expect("decode open").as_u64();
+    let fd = VfsReply::from_opcode_payload(rep.opcode, rep.as_slice())
+        .expect("decode open")
+        .as_u64();
 
     let write = write_message(ReadWriteRequest {
         fd,
@@ -38,7 +40,7 @@ pub fn run() {
     })
     .expect("stat");
     let stat_rep = svc.handle(stat).expect("stat rep");
-    let len = VfsReply::from_message(stat_rep)
+    let len = VfsReply::from_opcode_payload(stat_rep.opcode, stat_rep.as_slice())
         .expect("decode stat")
         .as_u64();
     crate::yarm_log!(

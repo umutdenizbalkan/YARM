@@ -13,7 +13,6 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
 use crate::kernel::vm::Asid;
-use crate::services::common::vfs_service::VfsReply;
 use crate::services::fs::devfs::service::run_request_loop as run_devfs_request_loop;
 use crate::services::fs::devfs::{DevFsBackend, DevFsService};
 use crate::services::fs::ext4::{Ext4Backend, Ext4Service};
@@ -25,6 +24,7 @@ use yarm_ipc_abi::supervisor_abi::{
     InitAlert, InitAlertKind, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, TaskExitedEvent,
 };
+use yarm_srv_common::vfs_reply::VfsReply;
 
 pub use launch::{CoreLaunchReport, CoreServiceGraph, CoreServiceHandles, CoreServiceImagePlan};
 pub use mount::{MountPlan, MountRecoveryReport, MountServiceKind};
@@ -836,8 +836,8 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
             })
             .map_err(|_| KernelError::WrongObject)?;
             let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
-            let fd = VfsReply::from_message(open_reply)
-                .map_err(|_| KernelError::WrongObject)?
+            let fd = VfsReply::from_opcode_payload(open_reply.opcode, open_reply.as_slice())
+                .ok_or(KernelError::WrongObject)?
                 .as_u64();
             let write = write_message(ReadWriteRequest {
                 fd,
@@ -866,8 +866,8 @@ fn run_rw_mount_cycle<B: crate::kernel::vfs::VfsBackend>(
     })
     .map_err(|_| KernelError::WrongObject)?;
     let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
-    let fd = VfsReply::from_message(open_reply)
-        .map_err(|_| KernelError::WrongObject)?
+    let fd = VfsReply::from_opcode_payload(open_reply.opcode, open_reply.as_slice())
+        .ok_or(KernelError::WrongObject)?
         .as_u64();
     let write = write_message(ReadWriteRequest {
         fd,
