@@ -37,7 +37,7 @@ impl KernelState {
     }
 
     #[cfg(test)]
-    fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
+    pub(crate) fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
         self.capability
             .cnode_spaces
             .iter()
@@ -47,7 +47,7 @@ impl KernelState {
     }
 
     #[cfg(test)]
-    fn cspace_for_cnode_mut(&mut self, cnode: CNodeId) -> Option<&mut CapabilitySpace> {
+    pub(crate) fn cspace_for_cnode_mut(&mut self, cnode: CNodeId) -> Option<&mut CapabilitySpace> {
         self.capability
             .cnode_spaces
             .iter_mut()

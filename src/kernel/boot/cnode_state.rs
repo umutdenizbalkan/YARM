@@ -198,7 +198,7 @@ impl KernelState {
         );
     }
 
-    fn purge_transfer_envelopes_for_pid(&mut self, pid: u64) {
+    pub(crate) fn purge_transfer_envelopes_for_pid(&mut self, pid: u64) {
         for idx in 0..MAX_TRANSFER_ENVELOPES {
             let envelope = self.with_ipc_state(|ipc| ipc.transfer_envelopes[idx]);
             let Some(envelope) = envelope else {
@@ -224,7 +224,7 @@ impl KernelState {
         }
     }
 
-    fn purge_active_transfer_mappings_for_pid(&mut self, pid: u64) {
+    pub(crate) fn purge_active_transfer_mappings_for_pid(&mut self, pid: u64) {
         for idx in 0..MAX_TRANSFER_ENVELOPES {
             let mapping = self.with_ipc_state(|ipc| ipc.active_transfer_mappings[idx]);
             let Some(mapping) = mapping else {

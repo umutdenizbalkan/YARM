@@ -143,7 +143,7 @@ impl KernelState {
         })
     }
 
-    fn revoke_capability_direct_in_process_cnode(&mut self, pid: u64, cap: CapId) {
+    pub(crate) fn revoke_capability_direct_in_process_cnode(&mut self, pid: u64, cap: CapId) {
         let mut revoked_capability = None;
         if let Some(cnode) = self.process_cnode_for_pid(pid) {
             self.with_capability_state_mut(|capability_state| {

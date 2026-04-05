@@ -36,7 +36,7 @@ impl Bootstrap {
         *out_len += 1;
     }
 
-    fn apply_reserved_ranges(
+    pub(crate) fn apply_reserved_ranges(
         regions: &[MemoryRegion],
         reserved: &[(u64, u64)],
     ) -> ([MemoryRegion; MAX_BOOT_MEMORY_REGIONS], usize) {
