@@ -130,9 +130,10 @@ pub fn handle_trap_entry(
     mut frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
     super::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
-    // NOTE(arch/x86_64): This Rust entrypoint expects architecture-specific IDT setup
-    // and assembly prologue/epilogue glue to populate `X86TrapContext` and `TrapFrame`.
-    // Until those stubs are wired, tests exercise this path by constructing contexts directly.
+    // NOTE(arch/x86_64): Architecture-specific IDT setup and assembly trap stubs
+    // funnel hardware entries into this Rust dispatcher. Tests may still construct
+    // synthetic contexts directly, but real trap/interrupt/syscall vectors now use
+    // the same decode/dispatch path through descriptor_tables' stubs.
     let _ = kernel.set_current_cpu(cpu);
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
     kernel.handle_trap_event(decode_trap_context(context), frame.as_deref_mut())?;

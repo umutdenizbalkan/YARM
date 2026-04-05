@@ -563,6 +563,7 @@ core::arch::global_asm!(
     .global yarm_x86_syscall_entry
     .type yarm_x86_syscall_entry, @function
 yarm_x86_syscall_entry:
+    push 0
     push 0x80
     jmp yarm_x86_common_trap_entry
 "#
