@@ -35,6 +35,13 @@ name = "yarm-kernel"
 version = "0.1.0"
 
 [[package]]
+name = "yarm-network-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
 name = "yarm-srv-common"
 version = "0.1.0"
 dependencies = [

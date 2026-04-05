@@ -14,6 +14,7 @@ members = [
     "crates/yarm-kernel",
     "crates/yarm-control-plane-servers",
     "crates/yarm-fs-servers",
+    "crates/yarm-network-servers",
 ]
 resolver = "2"
 
@@ -49,18 +50,8 @@ path = "src/bin/core_profile_smoke.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
-name = "dhcp_srv"
-path = "src/bin/dhcp_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
 name = "display_srv"
 path = "src/bin/display_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "dns_srv"
-path = "src/bin/dns_srv.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
@@ -88,23 +79,8 @@ path = "src/bin/posix_compat_srv.rs"
 required-features = ["hosted-dev", "posix-compat"]
 
 [[bin]]
-name = "netmgr_srv"
-path = "src/bin/netmgr_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
 name = "shell_srv"
 path = "src/bin/shell_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "socket_srv"
-path = "src/bin/socket_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "tcpip_srv"
-path = "src/bin/tcpip_srv.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]

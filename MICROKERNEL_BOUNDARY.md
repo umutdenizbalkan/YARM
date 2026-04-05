@@ -87,6 +87,7 @@ This is the concrete PR sequence for closing the boundary milestone.
 - PR-BND-4 has started with extracted server packages:
   - `crates/yarm-control-plane-servers` (`init_server`, `process_manager`, `vfs_server`)
   - `crates/yarm-fs-servers` (`devfs_srv`, `ramfs_srv`, `initramfs_srv`, `ext4_srv`, `fat_srv`)
+  - `crates/yarm-network-servers` (`dhcp_srv`, `dns_srv`, `netmgr_srv`, `socket_srv`, `tcpip_srv`)
 - Remaining milestone focus shifts to broader server crate extraction/rewiring completion (PR-BND-4), CI promotion to structural/type gates (PR-BND-5), and final stale-path cleanup/freeze (PR-BND-6).
 
 ## Definition of done for the boundary milestone
