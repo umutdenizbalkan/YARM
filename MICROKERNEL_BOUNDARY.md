@@ -104,6 +104,7 @@ This is the concrete PR sequence for closing the boundary milestone.
 - PR-BND-5 pass A started with a crate-graph gate (`scripts/check-crate-graph-boundary.py`) that validates dependency edges via `cargo metadata` instead of source-path greps.
 - PR-BND-5 pass B landed with CI wiring (`scripts/phase5-boundary-gates.sh` + `phase5-boundary-gates` workflow job) to run structural boundary scripts and extracted server compile checks.
 - PR-BND-5 pass C promoted `phase5-boundary-gates` to required readiness/workflow token checks (`check-ci-workflow-enforcement`, `check-roadmap-readiness`, and `PHASE_READINESS_MATRIX`).
+- PR-BND-6 pass A started by removing redundant transitional dependency script (`check-server-crate-deps.sh`) now that crate-graph enforcement is active (`check-crate-graph-boundary.py`).
 
 ## Definition of done for the boundary milestone
 

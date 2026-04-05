@@ -5,7 +5,6 @@
 set -euo pipefail
 
 python3 scripts/check-crate-graph-boundary.py
-bash scripts/check-server-crate-deps.sh
 bash scripts/check-service-arch-boundary.sh
 
 # Structural compile checks for extracted server packages.
