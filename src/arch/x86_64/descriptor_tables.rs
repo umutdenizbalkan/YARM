@@ -3,6 +3,8 @@
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 use core::sync::atomic::AtomicUsize;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const IDT_ENTRIES: usize = 256;
@@ -133,7 +135,7 @@ struct X86GdtPointer {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[repr(C, align(16))]
 struct X86BootGdt {
-    entries: [u64; 5],
+    entries: [u64; 7],
 }
 
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
@@ -146,6 +148,8 @@ static mut BOOT_GDT: X86BootGdt = X86BootGdt {
         0x0000_0000_0000_0000, // null
         0x00af_9a00_0000_ffff, // kernel code
         0x00af_9200_0000_ffff, // kernel data
+        0x00af_f200_0000_ffff, // user data
+        0x00af_fa00_0000_ffff, // user code
         0,
         0,
     ],
@@ -165,7 +169,17 @@ const KERNEL_CODE_SELECTOR: u16 = 0x08;
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const KERNEL_DATA_SELECTOR: u16 = 0x10;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-const TSS_SELECTOR: u16 = 0x18;
+const TSS_SELECTOR: u16 = 0x28;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const USER_CODE_SELECTOR: u16 = 0x23;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const IA32_STAR_MSR: u32 = 0xC000_0081;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const IA32_LSTAR_MSR: u32 = 0xC000_0082;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const IA32_FMASK_MSR: u32 = 0xC000_0084;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RFLAGS_IF_MASK: u64 = 1 << 9;
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const IST_SLOT_NMI: u8 = 1;
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
@@ -215,6 +229,39 @@ static APIC_TO_CPU_ID: [AtomicUsize; 256] = [const { AtomicUsize::new(UNMAPPED_C
 const DEBUG_UART_DATA_PORT: u16 = 0x3F8;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_LINE_STATUS_PORT: u16 = 0x3FD;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+static YARM_X86_SYSCALL_RSP0: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+unsafe extern "C" {
+    fn yarm_x86_lstar_entry();
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn write_msr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn configure_syscall_fast_path(rsp0: u64) {
+    YARM_X86_SYSCALL_RSP0.store(rsp0, Ordering::Release);
+    // STAR[47:32] = kernel CS selector; STAR[63:48] = SYSRET CS base (CS-16).
+    let star = ((KERNEL_CODE_SELECTOR as u64) << 32) | (((USER_CODE_SELECTOR as u64) - 16) << 48);
+    write_msr(IA32_STAR_MSR, star);
+    write_msr(IA32_LSTAR_MSR, yarm_x86_lstar_entry as *const () as u64);
+    write_msr(IA32_FMASK_MSR, RFLAGS_IF_MASK);
+}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn debug_uart_putc(byte: u8) {
@@ -556,6 +603,78 @@ yarm_x86_common_trap_entry:
 "#
 );
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .section .text, "ax", @progbits
+    .global yarm_x86_lstar_entry
+    .type yarm_x86_lstar_entry, @function
+yarm_x86_lstar_entry:
+    // SYSCALL clobbers RCX/R11 with user RIP/RFLAGS. Preserve them explicitly.
+    mov r12, rcx
+    mov r13, r11
+    mov r14, rsp
+    mov rsp, qword ptr [rip + YARM_X86_SYSCALL_RSP0]
+    test rsp, rsp
+    jnz 1f
+    mov rsp, r14
+1:
+    // Materialize synthetic interrupt frame expected by dispatch.
+    sub rsp, 40
+    mov qword ptr [rsp + 0], r12
+    mov qword ptr [rsp + 8], 0x23
+    mov qword ptr [rsp + 16], r13
+    mov qword ptr [rsp + 24], r14
+    mov qword ptr [rsp + 32], 0x1b
+
+    // Keep arg3 compatible with trap ABI (rcx lane); syscall callers pass it in r10.
+    mov rcx, r10
+
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rbp
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rdi, 0x80
+    xor rsi, rsi
+    mov rdx, rsp
+    lea rcx, [rsp + 120]
+    call yarm_x86_dispatch_trap_from_stub
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rbp
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    mov rcx, qword ptr [rsp + 0]
+    mov r11, qword ptr [rsp + 16]
+    mov rsp, qword ptr [rsp + 24]
+    sysretq
+"#
+);
+
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 core::arch::global_asm!(
     r#"
@@ -884,8 +1003,8 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         let tss_base = core::ptr::addr_of!(BOOT_TSS) as u64;
         let tss_limit = (core::mem::size_of::<X86TaskStateSegment>() - 1) as u32;
         let (tss_low, tss_high) = encode_tss_descriptor(tss_base, tss_limit);
-        BOOT_GDT.entries[3] = tss_low;
-        BOOT_GDT.entries[4] = tss_high;
+        BOOT_GDT.entries[5] = tss_low;
+        BOOT_GDT.entries[6] = tss_high;
 
         let idtr = X86IdtPointer::from_ptr(core::ptr::addr_of!(BOOT_IDT).cast::<X86IdtEntry>());
         let gdtr = X86GdtPointer {
@@ -909,6 +1028,7 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
             tss_sel = const TSS_SELECTOR,
             options(nostack, preserves_flags)
         );
+        configure_syscall_fast_path(rsp0);
     }
 }
 
@@ -954,6 +1074,7 @@ pub fn refresh_boot_tss_rsp0(rsp0: u64) {
     unsafe {
         BOOT_TSS.rsp0 = rsp0;
     }
+    YARM_X86_SYSCALL_RSP0.store(rsp0, Ordering::Release);
 }
 
 #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]

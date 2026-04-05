@@ -3,8 +3,8 @@
 
 // x86_64 syscall/trap ABI shape constants for the prototype kernel ABI.
 //
-// Strategy lock-in (PR-5): user mode enters kernel syscalls via `int 0x80`
-// routed through a dedicated IDT gate path (not `syscall/sysret` yet).
+// Fast path: user mode enters kernel through `syscall/sysret`.
+// Compatibility fallback: `int 0x80` remains wired via the IDT trap path.
 //
 // Register mapping (System V AMD64 ABI / YARM convention):
 //   syscall_num: rax
@@ -24,4 +24,4 @@ pub const TRAPFRAME_ARG_REGS: usize = 6;
 /// metadata, leaving exactly args[3] and args[4] as inline payload words.
 pub const IPC_REGISTER_WORDS: usize = 2;
 
-pub const PROFILE_IS_PLACEHOLDER: bool = true;
+pub const PROFILE_IS_PLACEHOLDER: bool = false;
