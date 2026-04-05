@@ -60,3 +60,44 @@ With in-kernel mechanisms complete for this milestone, primary effort can now mo
 3. expand driver server runtime and hardware adapters,
 4. grow Linux personality coverage and compatibility conformance,
 5. complete crate split to a strict `yarm-kernel` + service crates boundary (remove residual single-crate visibility risk).
+
+## Proposed PR sequence (remaining boundary work)
+
+The following PR plan breaks down the remaining `shared-helper` hardening and `yarm-kernel` extraction work into mergeable slices.
+
+### PR-1: Shared-helper hardening baseline
+
+- Expand `yarm-srv-common` usage inventory and remove any remaining service-local decode/roundtrip helper duplication.
+- Add stricter helper contracts (typed error categories, canonical timeout/retry behavior, and reply payload invariants).
+- Add unit tests in helper crates for malformed payloads, invalid opcodes, and capability-attach edge cases.
+
+### PR-2: Shared-helper adoption completion across services
+
+- Migrate all services to the hardened helper APIs (including init/process-manager/VFS/filesystem adapters).
+- Remove legacy compatibility helper shims from service modules once all call sites are migrated.
+- Add integration coverage to ensure cross-service call/reply behavior stays ABI-consistent.
+
+### PR-3: Create `yarm-kernel` crate skeleton and move kernel-only modules
+
+- Introduce a new workspace crate `yarm-kernel` with kernel-owned modules (scheduler, trap routing, memory mechanisms, capability checks, IPC transport internals).
+- Re-export only stable kernel-facing mechanism interfaces required by existing binaries/tests.
+- Keep behavior identical (no semantic policy changes) while relocating code.
+
+### PR-4: Server crate extraction and dependency rewiring
+
+- Split service/runtime code into server-oriented crates (`init`, `process_manager`, `vfs`, fs servers, posix personality) or grouped workspace crates as appropriate.
+- Make services depend on `yarm-ipc-abi` and `yarm-srv-common`; disallow direct dependency on kernel-internal modules.
+- Move bin entrypoints to depend on the extracted crates.
+
+### PR-5: Type-enforced boundary gate in CI
+
+- Replace (or complement) grep-based boundary checks with compile-time enforcement:
+  - service crates cannot import private `yarm-kernel` internals by construction,
+  - visibility boundaries are validated by crate graph + Rust privacy.
+- Keep `scripts/check-service-arch-boundary.sh` as transitional defense until crate extraction is complete, then simplify/remove.
+
+### PR-6: Final cleanup + documentation lock
+
+- Delete dead compatibility code and stale module paths left from the extraction.
+- Refresh architecture docs and developer onboarding for the new crate layout.
+- Update status/contract docs and mark boundary enforcement milestone complete.

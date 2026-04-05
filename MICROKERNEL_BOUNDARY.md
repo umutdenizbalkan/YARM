@@ -56,3 +56,32 @@ Hardware access is modeled as capabilities held by normal servers.
 - To preserve microkernel user-space boundaries until a multi-crate split lands, CI rejects kernel-path imports from `src/services/**` and `src/bin/*_srv.rs` via `scripts/check-service-arch-boundary.sh`.
 - Workspace split is active with dedicated `yarm-ipc-abi` and `yarm-srv-common` crates; service-side VFS decode and control-plane call/reply helpers are now centralized there.
 - Remaining step is a full `yarm-kernel` crate extraction (and server crate wiring) so the type system fully enforces service/kernel separation instead of grep-based policy.
+
+## Remaining milestone PR list
+
+This is the concrete PR sequence for closing the boundary milestone.
+
+1. **PR-BND-1: Harden shared service helper contracts**
+   - tighten `yarm-srv-common` helper invariants (decode strictness, timeout/cap-attach semantics, typed errors),
+   - add negative-path tests for malformed ABI payloads and unsupported opcode handling.
+2. **PR-BND-2: Complete shared-helper migration**
+   - migrate remaining service call sites to hardened helpers,
+   - remove now-redundant local helper shims.
+3. **PR-BND-3: Extract `yarm-kernel` crate**
+   - move mechanism-only modules into `yarm-kernel`,
+   - expose only minimal stable interfaces required by boot/runtime consumers.
+4. **PR-BND-4: Extract/rewire server crates**
+   - split server code into workspace crates and wire bins to them,
+   - ensure services consume only `yarm-ipc-abi` + `yarm-srv-common` + approved runtime crates.
+5. **PR-BND-5: Promote type-system boundary enforcement in CI**
+   - make crate-graph and Rust visibility the primary boundary gate,
+   - keep grep guard as transitional defense, then retire it once no longer needed.
+6. **PR-BND-6: Cleanup and contract freeze update**
+   - remove stale paths/compat layers after extraction,
+   - update boundary docs and declare strict separation complete.
+
+## Definition of done for the boundary milestone
+
+- No server crate can access kernel internals except through explicitly exported mechanism interfaces.
+- Boundary enforcement is compile-time structural (crate graph + visibility), not primarily grep-policy based.
+- Shared helper usage is uniform and covered by negative/compat tests across service boundaries.
