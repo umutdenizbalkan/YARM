@@ -5,4 +5,5 @@
 
 pub mod driver_abi;
 pub mod process_abi;
+pub mod supervisor_abi;
 pub mod vfs_abi;

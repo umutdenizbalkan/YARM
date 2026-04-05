@@ -7,10 +7,6 @@ mod policy;
 
 use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use crate::kernel::capabilities::{CapId, CapRights};
-use crate::kernel::supervisor_abi::{
-    RegisterCoreServiceRequest, RegisterDriverRequest, TaskExitedEvent,
-    register_core_service_message, register_driver_message,
-};
 use crate::kernel::task::TaskClass;
 use crate::kernel::task::TaskStatus;
 use crate::kernel::vfs::{
@@ -25,6 +21,10 @@ use crate::services::fs::fat::{FatBackend, FatService};
 use crate::services::fs::initramfs::service::run_request_loop as run_initramfs_request_loop;
 use crate::services::fs::initramfs::{InitramfsBackend, InitramfsService};
 use crate::services::fs::ramfs::{RamFsBackend, RamFsService};
+use yarm_ipc_abi::supervisor_abi::{
+    InitAlert, InitAlertKind, RegisterCoreServiceRequest, RegisterDriverRequest,
+    SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, TaskExitedEvent,
+};
 
 pub use launch::{CoreLaunchReport, CoreServiceGraph, CoreServiceHandles, CoreServiceImagePlan};
 pub use mount::{MountPlan, MountRecoveryReport, MountServiceKind};
@@ -64,6 +64,34 @@ impl Default for InitService {
 }
 
 impl InitService {
+    fn register_core_service_message(
+        sender_tid: u64,
+        request: RegisterCoreServiceRequest,
+    ) -> Result<crate::kernel::ipc::Message, ()> {
+        crate::kernel::ipc::Message::with_header(
+            sender_tid,
+            SUPERVISOR_OP_REGISTER_CORE_SERVICE,
+            0,
+            None,
+            &request.encode(),
+        )
+        .map_err(|_| ())
+    }
+
+    fn register_driver_message(
+        sender_tid: u64,
+        request: RegisterDriverRequest,
+    ) -> Result<crate::kernel::ipc::Message, ()> {
+        crate::kernel::ipc::Message::with_header(
+            sender_tid,
+            SUPERVISOR_OP_REGISTER_DRIVER,
+            0,
+            None,
+            &request.encode(),
+        )
+        .map_err(|_| ())
+    }
+
     pub const fn new() -> Self {
         Self {
             phase: InitBootPhase::Uninitialized,
@@ -452,11 +480,12 @@ impl InitService {
         let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
         let msg = match entry {
             SupervisorReplayEntry::Core(request) => {
-                register_core_service_message(init_tid, request)
+                Self::register_core_service_message(init_tid, request)
                     .map_err(|_| KernelError::WrongObject)?
             }
             SupervisorReplayEntry::Driver(request) => {
-                register_driver_message(init_tid, request).map_err(|_| KernelError::WrongObject)?
+                Self::register_driver_message(init_tid, request)
+                    .map_err(|_| KernelError::WrongObject)?
             }
         };
         kernel.ipc_send(handoff.supervisor_control_send_cap, msg)
@@ -466,7 +495,7 @@ impl InitService {
         &mut self,
         kernel: &mut KernelState,
     ) -> Result<usize, KernelError> {
-        use crate::kernel::supervisor_abi::{
+        use yarm_ipc_abi::supervisor_abi::{
             CoreServiceRegistrationKind, DEP_VFS, RegisterCoreServiceRequest,
         };
 
@@ -549,12 +578,12 @@ impl InitService {
     pub fn poll_init_alert(
         &self,
         kernel: &mut KernelState,
-    ) -> Result<Option<crate::kernel::supervisor_abi::InitAlert>, KernelError> {
+    ) -> Result<Option<InitAlert>, KernelError> {
         let handoff = self.fault_handoff.ok_or(KernelError::WrongObject)?;
         let Some(msg) = kernel.try_ipc_recv(handoff.init_alert_recv_cap)? else {
             return Ok(None);
         };
-        crate::kernel::supervisor_abi::InitAlert::decode(msg.as_slice())
+        InitAlert::decode(msg.as_slice())
             .ok_or(KernelError::WrongObject)
             .map(Some)
     }
@@ -679,21 +708,20 @@ impl InitService {
     pub fn handle_init_alert(
         &mut self,
         kernel: &mut KernelState,
-        alert: crate::kernel::supervisor_abi::InitAlert,
+        alert: InitAlert,
     ) -> Result<bool, KernelError> {
         match alert.kind {
-            crate::kernel::supervisor_abi::InitAlertKind::CoreServiceRestartRequired
-            | crate::kernel::supervisor_abi::InitAlertKind::SupervisorRestarted => {
+            InitAlertKind::CoreServiceRestartRequired | InitAlertKind::SupervisorRestarted => {
                 let token = kernel
                     .task_restart_token(alert.tid)
                     .ok_or(KernelError::WrongObject)?;
                 self.recover_core_service_failure_by_tid(kernel, alert.tid, token)
             }
-            crate::kernel::supervisor_abi::InitAlertKind::ServiceDegraded => {
+            InitAlertKind::ServiceDegraded => {
                 self.mark_failed();
                 Ok(false)
             }
-            crate::kernel::supervisor_abi::InitAlertKind::RedelegationRequired => Ok(false),
+            InitAlertKind::RedelegationRequired => Ok(false),
         }
     }
 
@@ -1107,8 +1135,7 @@ mod tests {
             .try_ipc_recv(handoff.supervisor_fault_recv_cap)
             .expect("recv")
             .expect("msg");
-        let event =
-            crate::kernel::supervisor_abi::TaskExitedEvent::decode(msg.as_slice()).expect("event");
+        let event = TaskExitedEvent::decode(msg.as_slice()).expect("event");
         assert_eq!(event.tid, 2);
         assert_eq!(event.restart_token, token);
     }
@@ -1273,18 +1300,9 @@ mod tests {
         let fourth = state
             .try_ipc_recv(handoff.supervisor_control_recv_cap)
             .expect("recv");
-        assert_eq!(
-            first.opcode,
-            crate::kernel::supervisor_abi::SUPERVISOR_OP_REGISTER_CORE_SERVICE
-        );
-        assert_eq!(
-            second.opcode,
-            crate::kernel::supervisor_abi::SUPERVISOR_OP_REGISTER_CORE_SERVICE
-        );
-        assert_eq!(
-            third.opcode,
-            crate::kernel::supervisor_abi::SUPERVISOR_OP_REGISTER_CORE_SERVICE
-        );
+        assert_eq!(first.opcode, SUPERVISOR_OP_REGISTER_CORE_SERVICE);
+        assert_eq!(second.opcode, SUPERVISOR_OP_REGISTER_CORE_SERVICE);
+        assert_eq!(third.opcode, SUPERVISOR_OP_REGISTER_CORE_SERVICE);
         assert!(fourth.is_none());
     }
 
@@ -1347,7 +1365,7 @@ mod tests {
                 .try_ipc_recv(handoff.supervisor_control_recv_cap)
                 .expect("recv")
                 .expect("msg");
-            if msg.opcode == crate::kernel::supervisor_abi::SUPERVISOR_OP_REGISTER_DRIVER {
+            if msg.opcode == SUPERVISOR_OP_REGISTER_DRIVER {
                 register_driver_seen = true;
             }
         }

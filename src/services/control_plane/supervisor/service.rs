@@ -4,24 +4,68 @@
 use crate::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 use crate::kernel::capabilities::{CapId, CapRights};
 use crate::kernel::ipc::{Message, ThreadId};
-use crate::kernel::supervisor_abi::{
+use crate::kernel::time::{TickDuration, TickInstant};
+use crate::services::init::{
+    CoreServiceKind, CoreServicePolicyTable, InitFaultHandoff, RestartOwner, ServiceRestartPolicy,
+};
+use yarm_ipc_abi::supervisor_abi::{
     CoreServiceRegistrationKind, DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert,
     InitAlertKind, RedelegationAckRequest, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, SUPERVISOR_OP_TASK_EXITED,
     SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusReply, SupervisorStatusRequest,
-    TaskExitedEvent, TransferRevokedEvent, init_alert_message, query_status_message,
-    status_reply_message,
-};
-use crate::kernel::time::{TickDuration, TickInstant};
-use crate::services::init::{
-    CoreServiceKind, CoreServicePolicyTable, InitFaultHandoff, RestartOwner, ServiceRestartPolicy,
+    TaskExitedEvent, TransferRevokedEvent,
 };
 
 const MAX_MANAGED_SERVICES: usize = 8;
 const MAX_DEPENDENTS: usize = 8;
 const SUPERVISOR_RECV_BUDGET_TICKS: u64 = 1;
 const SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS: u64 = 1;
+
+fn init_alert_message(sender_tid: u64, alert: InitAlert) -> Result<Message, ()> {
+    Message::with_header(
+        sender_tid,
+        yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_INIT_ALERT,
+        0,
+        None,
+        &alert.encode(),
+    )
+    .map_err(|_| ())
+}
+
+fn status_reply_message(sender_tid: u64, reply: SupervisorStatusReply) -> Result<Message, ()> {
+    Message::with_header(
+        sender_tid,
+        SUPERVISOR_OP_QUERY_STATUS,
+        0,
+        None,
+        &reply.encode(),
+    )
+    .map_err(|_| ())
+}
+
+fn query_status_message(sender_tid: u64, request: SupervisorStatusRequest) -> Result<Message, ()> {
+    Message::with_header(
+        sender_tid,
+        SUPERVISOR_OP_QUERY_STATUS,
+        0,
+        None,
+        &request.encode(),
+    )
+    .map_err(|_| ())
+}
+
+#[cfg(test)]
+fn transfer_revoked_message(sender_tid: u64, event: TransferRevokedEvent) -> Result<Message, ()> {
+    Message::with_header(
+        sender_tid,
+        SUPERVISOR_OP_TRANSFER_REVOKED,
+        0,
+        None,
+        &event.encode(),
+    )
+    .map_err(|_| ())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedServiceKind {
@@ -639,8 +683,7 @@ pub fn query_status_via_call_reply(
     let request = query_status_message(requester_tid, SupervisorStatusRequest { tid: queried_tid })
         .map_err(|_| KernelError::WrongObject)?;
     let caller_tid = ThreadId(kernel.current_tid().ok_or(KernelError::TaskMissing)?);
-    let reply_cap =
-        kernel.create_reply_cap_for_caller(caller_tid, caller_reply_recv_cap, None)?;
+    let reply_cap = kernel.create_reply_cap_for_caller(caller_tid, caller_reply_recv_cap, None)?;
     let request_with_reply_cap = Message::with_header(
         request.sender_tid.0,
         request.opcode,
@@ -714,14 +757,13 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
-    use crate::kernel::supervisor_abi::{
-        InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
-        SupervisorStatusRequest, TransferRevokedEvent, query_status_message,
-        transfer_revoked_message,
-    };
     use crate::kernel::task::{TaskClass, TaskStatus};
     use crate::kernel::vm::PAGE_SIZE;
     use crate::services::init::{CoreServiceGraph, CoreServiceImagePlan, InitService};
+    use yarm_ipc_abi::supervisor_abi::{
+        InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
+        SupervisorStatusRequest, TransferRevokedEvent,
+    };
 
     fn setup_supervisor() -> (
         crate::std::boxed::Box<KernelState>,
