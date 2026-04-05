@@ -147,6 +147,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn message_roundtrip_preserves_header_and_payload() {
+        let msg = Message::with_header(42, 0x88, 0, None, b"abc").expect("message");
+        assert_eq!(msg.sender_tid, ThreadId(42));
+        assert_eq!(msg.opcode, 0x88);
+        assert_eq!(msg.flags, 0);
+        assert_eq!(msg.transferred_cap(), None);
+        assert_eq!(msg.as_slice(), b"abc");
+    }
+
+    #[test]
     fn message_requires_transfer_flag_consistency() {
         assert_eq!(
             Message::with_header(0, 1, 0, Some(9), &[]),
@@ -156,5 +166,21 @@ mod tests {
             Message::with_header(0, 1, Message::FLAG_CAP_TRANSFER, None, &[]),
             Err(IpcError::InconsistentCapTransferFlag)
         );
+    }
+
+    #[test]
+    fn message_rejects_oversized_payload() {
+        let payload = [0u8; Message::MAX_PAYLOAD + 1];
+        assert_eq!(Message::new(0, &payload), Err(IpcError::PayloadTooLarge));
+    }
+
+    #[test]
+    fn shared_memory_region_codec_roundtrip() {
+        let region = SharedMemoryRegion {
+            offset: 0x2000,
+            len: 16384,
+        };
+        let encoded = region.encode();
+        assert_eq!(SharedMemoryRegion::decode(&encoded), Some(region));
     }
 }

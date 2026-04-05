@@ -124,6 +124,7 @@ impl Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::mem;
 
     #[test]
     fn endpoint_enforces_queue_limit() {
@@ -195,5 +196,33 @@ mod tests {
             Endpoint::new(MAX_ENDPOINT_DEPTH + 1),
             Err(IpcError::InvalidEndpointDepth)
         ));
+    }
+
+    #[test]
+    fn extracted_ipc_types_are_reexported_without_layout_drift() {
+        assert_eq!(
+            mem::size_of::<Message>(),
+            mem::size_of::<yarm_kernel::ipc::Message>()
+        );
+        assert_eq!(
+            mem::size_of::<ThreadId>(),
+            mem::size_of::<yarm_kernel::ipc::ThreadId>()
+        );
+        assert_eq!(
+            mem::size_of::<TransferCapId>(),
+            mem::size_of::<yarm_kernel::ipc::TransferCapId>()
+        );
+
+        let message = Message::new(7, b"pass-a").expect("message");
+        let _kernel_message: yarm_kernel::ipc::Message = message;
+    }
+
+    #[test]
+    fn pass_a_guardrail_keeps_ipc_core_owned_by_yarm_kernel_crate() {
+        let src = include_str!("ipc.rs");
+        assert!(
+            src.contains("pub use yarm_kernel::ipc::{"),
+            "kernel ipc module must keep yarm-kernel re-export bridge"
+        );
     }
 }

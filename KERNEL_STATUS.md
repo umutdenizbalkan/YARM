@@ -22,6 +22,7 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
   - ST-8 / CB-6: bootstrap now programs SMEP/SMAP/NXE correctly and safely (CPUID-gated to avoid unsupported-bit boot faults).
 - **Boot-regression follow-up merged:** the post-hardening halt after serial marker `B` is addressed by CPUID-gating SMEP/SMAP/NXE writes before CR4/EFER updates in `pvh_start32`.
 - **Unsupported ISA guardrails tightened:** architecture facade fallbacks now fail fast with `compile_error!` for unsupported `target_arch` values instead of silently selecting a RISC-V path.
+- **PR-BND-3 pass A (IPC extraction stabilization) landed:** workspace now includes `yarm-kernel`; IPC core mechanism types (`ThreadId`, `TransferCapId`, `Message`, `SharedMemoryRegion`, `IpcError`) are owned by `crates/yarm-kernel/src/ipc.rs`, while `src/kernel/ipc.rs` retains endpoint queue mechanics and ISA register-lane pack/unpack wrappers via re-export bridge.
 - **Trap decode correctness improved:** unknown architecture trap codes are normalized as `TrapEvent::Unknown { arch_code }` instead of being coerced into external IRQ semantics.
 - **Per-CPU TLS restore observability:** architecture trap paths now expose CPU-indexed TLS-restore slots and include isolation tests to verify CPU-local behavior.
 - **External IRQ completion plumbing added:** external IRQ trap handling now saves/restores interrupt state around routing and calls an ISA-selected `external_irq_eoi` hook for controller completion handoff.
