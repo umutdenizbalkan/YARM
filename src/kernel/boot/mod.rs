@@ -2447,8 +2447,8 @@ mod tests {
     fn selected_arch_trap_entry_routes_highest_external_irq_notification() {
         let mut state = Bootstrap::init().expect("init");
         let (_notif_idx, notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
-        let highest_irq = 15u16; // VEC_EXTERNAL_LIMIT (0x30) is exclusive, so max decodable IRQ is 15
-        let vector = 0x2F;
+        let highest_irq = (crate::arch::platform_constants::MAX_IRQ_LINES - 1) as u16;
+        let vector = 0x20 + highest_irq as u8;
         state
             .bind_irq_notification(highest_irq, notif_cap)
             .expect("bind");
@@ -2472,12 +2472,12 @@ mod tests {
     fn selected_arch_trap_entry_external_limit_vector_is_not_routed_as_irq() {
         let mut state = Bootstrap::init().expect("init");
         let (_notif_idx, notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
-        let first_unmapped_irq = 16u16; // vector 0x30 is not in the decoded external IRQ range
+        let first_unmapped_irq = crate::arch::platform_constants::MAX_IRQ_LINES as u16;
         state
             .bind_irq_notification(first_unmapped_irq, notif_cap)
             .expect("bind");
         let ctx = crate::arch::trap_entry::ArchTrapContext {
-            vector: 0x30,
+            vector: 0x20 + first_unmapped_irq as u8,
             error_code: 0,
             fault_addr: 0,
         };
