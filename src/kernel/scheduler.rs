@@ -4,6 +4,7 @@
 use crate::arch::{platform_constants, topology};
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::topology::CpuTopology;
+pub use yarm_kernel::scheduler::{CpuId, SchedulerError, TaskPriority};
 
 pub const MAX_RUN_QUEUE: usize = 64;
 pub const MAX_CPUS: usize = platform_constants::MAX_CPUS;
@@ -12,25 +13,6 @@ const MEMBERSHIP_SLOTS: usize = 64;
 const MEMBERSHIP_EMPTY: u8 = 0;
 const MEMBERSHIP_TOMBSTONE: u8 = 1;
 const MEMBERSHIP_FULL: u8 = 2;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CpuId(pub u8);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u8)]
-pub enum TaskPriority {
-    High = 0,
-    Normal = 1,
-    Low = 2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchedulerError {
-    InvalidCpu,
-    CpuOffline,
-    QueueFull,
-    AlreadyQueued,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScheduledTask {
@@ -575,5 +557,20 @@ mod tests {
             sched.enqueue_with_priority(ThreadId(1000), TaskPriority::High),
             Err(SchedulerError::AlreadyQueued)
         );
+    }
+
+    #[test]
+    fn pass_b_scheduler_types_are_reexported_from_yarm_kernel() {
+        use core::mem;
+
+        assert_eq!(
+            mem::size_of::<CpuId>(),
+            mem::size_of::<yarm_kernel::scheduler::CpuId>()
+        );
+        assert_eq!(
+            TaskPriority::High as u8,
+            yarm_kernel::scheduler::TaskPriority::High as u8
+        );
+        let _err: yarm_kernel::scheduler::SchedulerError = SchedulerError::QueueFull;
     }
 }

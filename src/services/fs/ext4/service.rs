@@ -22,7 +22,7 @@ pub fn run() {
     .expect("open");
     let open_rep = svc.handle(open).expect("open rep");
 
-    let fd = VfsReply::from_opcode_payload(open_rep.opcode, open_rep.as_slice())
+    let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
         .expect("decode open")
         .as_u64();
 
@@ -43,7 +43,7 @@ pub fn run() {
     .expect("stat");
     let stat_rep = svc.handle(stat).expect("stat rep");
 
-    let file_len = VfsReply::from_opcode_payload(stat_rep.opcode, stat_rep.as_slice())
+    let file_len = VfsReply::from_opcode_payload_checked(stat_rep.opcode, stat_rep.as_slice())
         .expect("decode stat")
         .as_u64();
 
@@ -71,7 +71,7 @@ mod tests {
         })
         .expect("open");
         let open_rep = svc.handle(open).expect("open rep");
-        let fd = VfsReply::from_opcode_payload(open_rep.opcode, open_rep.as_slice())
+        let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
             .expect("decode open")
             .as_u64();
 
@@ -92,7 +92,7 @@ mod tests {
         .expect("stat");
         let stat_rep = svc.handle(stat).expect("stat rep");
         assert_eq!(
-            VfsReply::from_opcode_payload(stat_rep.opcode, stat_rep.as_slice())
+            VfsReply::from_opcode_payload_checked(stat_rep.opcode, stat_rep.as_slice())
                 .expect("decode stat")
                 .as_u64(),
             4096

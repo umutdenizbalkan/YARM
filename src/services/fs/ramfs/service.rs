@@ -25,7 +25,7 @@ pub struct RamFsLoopSummary {
 }
 
 fn decode_reply_u64(reply: Message) -> u64 {
-    VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
+    VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
         .expect("decode vfs reply")
         .as_u64()
 }

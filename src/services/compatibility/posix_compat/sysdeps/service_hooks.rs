@@ -12,6 +12,7 @@ use crate::services::common::service::FsService;
 use crate::services::compatibility::posix_compat::PosixErrno;
 use crate::services::network::socket::service::SocketAdapterService;
 use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
+use yarm_srv_common::decode::decode_u64_le;
 use yarm_srv_common::vfs_reply::VfsReply;
 
 pub struct PosixSysdepsContext<'a, B: VfsBackend> {
@@ -37,37 +38,26 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
     }
 
     fn decode_message_u64(reply: Message) -> Result<u64, PosixErrno> {
-        let payload = reply.as_slice();
-        if payload.len() < 8 {
-            return Err(PosixErrno::Inval);
-        }
-        let mut raw = [0u8; 8];
-        raw.copy_from_slice(&payload[..8]);
-        Ok(u64::from_le_bytes(raw))
+        decode_u64_le(reply.as_slice()).map_err(|_| PosixErrno::Inval)
     }
 
     fn decode_vfs_u64(reply: Message) -> Result<usize, PosixErrno> {
-        let value = VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
-            .ok_or(PosixErrno::Inval)?
+        let value = VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
+            .map_err(|_| PosixErrno::Inval)?
             .as_u64();
         usize::try_from(value).map_err(|_| PosixErrno::Inval)
     }
 
     fn decode_vfs_fd_i32(reply: Message) -> Result<i32, PosixErrno> {
-        let fd = VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
-            .ok_or(PosixErrno::Inval)?
-            .as_fd()
-            .ok_or(PosixErrno::Inval)?;
+        let fd = VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
+            .map_err(|_| PosixErrno::Inval)?
+            .expect_fd(reply.opcode)
+            .map_err(|_| PosixErrno::Inval)?;
         i32::try_from(fd).map_err(|_| PosixErrno::Inval)
     }
 
     pub fn clock_gettime_hook(&mut self) -> Result<u64, PosixErrno> {
-        Ok(self
-            .kernel
-            .timer
-            .current_ticks()
-            .0
-            .saturating_mul(1_000_000))
+        Ok(self.kernel.scheduler_tick_now().saturating_mul(1_000_000))
     }
 
     pub fn nanosleep_hook(&mut self, nanos: u64) -> Result<(), PosixErrno> {
@@ -76,7 +66,7 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
         }
         let ticks = nanos.saturating_add(999_999) / 1_000_000;
         for _ in 0..ticks {
-            let _ = self.kernel.timer.tick_and_check();
+            let _ = self.kernel.scheduler_tick_advance();
         }
         Ok(())
     }
@@ -220,6 +210,7 @@ mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::vfs::InMemoryBackend;
+    use yarm_ipc_abi::vfs_abi::VFS_OP_OPENAT;
 
     #[test]
     fn service_backed_clock_hooks_use_kernel_timer() {
@@ -276,5 +267,24 @@ mod tests {
         assert_eq!(ctx.read_hook(fd, 0, 128).expect("read"), 64);
         assert_eq!(ctx.write_hook(fd, 0, 32).expect("write"), 32);
         ctx.close_hook(fd).expect("close");
+    }
+
+    #[test]
+    fn decode_helpers_reject_malformed_or_mismatched_vfs_replies() {
+        let malformed = Message::with_header(0, VFS_OP_OPENAT, 0, None, &[1, 2, 3])
+            .expect("malformed payload message");
+        assert_eq!(
+            PosixSysdepsContext::<InMemoryBackend>::decode_vfs_fd_i32(malformed),
+            Err(PosixErrno::Inval)
+        );
+
+        let payload = 5u64.to_le_bytes();
+        let wrong_kind =
+            Message::with_header(0, yarm_ipc_abi::vfs_abi::VFS_OP_READ, 0, None, &payload)
+                .expect("read reply");
+        assert_eq!(
+            PosixSysdepsContext::<InMemoryBackend>::decode_vfs_fd_i32(wrong_kind),
+            Err(PosixErrno::Inval)
+        );
     }
 }

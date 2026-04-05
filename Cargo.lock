@@ -8,7 +8,36 @@ name = "yarm"
 version = "0.1.0"
 dependencies = [
  "yarm-ipc-abi",
+ "yarm-kernel",
  "yarm-srv-common",
+]
+
+[[package]]
+name = "yarm-compat-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
+name = "yarm-control-plane-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
+name = "yarm-driver-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
+name = "yarm-fs-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
 ]
 
 [[package]]
@@ -16,8 +45,33 @@ name = "yarm-ipc-abi"
 version = "0.1.0"
 
 [[package]]
+name = "yarm-kernel"
+version = "0.1.0"
+
+[[package]]
+name = "yarm-network-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
+name = "yarm-runtime-tools"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
 name = "yarm-srv-common"
 version = "0.1.0"
 dependencies = [
  "yarm-ipc-abi",
+]
+
+[[package]]
+name = "yarm-ui-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
 ]

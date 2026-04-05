@@ -836,9 +836,10 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
             })
             .map_err(|_| KernelError::WrongObject)?;
             let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
-            let fd = VfsReply::from_opcode_payload(open_reply.opcode, open_reply.as_slice())
-                .ok_or(KernelError::WrongObject)?
-                .as_u64();
+            let fd =
+                VfsReply::from_opcode_payload_checked(open_reply.opcode, open_reply.as_slice())
+                    .map_err(|_| KernelError::WrongObject)?
+                    .as_u64();
             let write = write_message(ReadWriteRequest {
                 fd,
                 buf_ptr: 0,
@@ -866,8 +867,8 @@ fn run_rw_mount_cycle<B: crate::kernel::vfs::VfsBackend>(
     })
     .map_err(|_| KernelError::WrongObject)?;
     let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
-    let fd = VfsReply::from_opcode_payload(open_reply.opcode, open_reply.as_slice())
-        .ok_or(KernelError::WrongObject)?
+    let fd = VfsReply::from_opcode_payload_checked(open_reply.opcode, open_reply.as_slice())
+        .map_err(|_| KernelError::WrongObject)?
         .as_u64();
     let write = write_message(ReadWriteRequest {
         fd,

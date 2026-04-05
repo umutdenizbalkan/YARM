@@ -7,6 +7,8 @@ use yarm_ipc_abi::vfs_abi::{
     VFS_OP_STATX, VFS_OP_WRITE,
 };
 
+use crate::decode::{DecodeError, decode_u64_le};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsReply {
     OpenAtFd(u64),
@@ -24,29 +26,34 @@ pub enum VfsReply {
     SendfileLen(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsReplyDecodeError {
+    Payload(DecodeError),
+    UnsupportedOpcode { opcode: u16 },
+    UnexpectedReplyKind { opcode: u16 },
+}
+
 impl VfsReply {
-    pub fn from_opcode_payload(opcode: u16, payload: &[u8]) -> Option<Self> {
-        if payload.len() < 8 {
-            return None;
-        }
-        let mut raw = [0u8; 8];
-        raw.copy_from_slice(&payload[..8]);
-        let value = u64::from_le_bytes(raw);
+    pub fn from_opcode_payload_checked(
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<Self, VfsReplyDecodeError> {
+        let value = decode_u64_le(payload).map_err(VfsReplyDecodeError::Payload)?;
         match opcode {
-            VFS_OP_OPENAT => Some(Self::OpenAtFd(value)),
-            VFS_OP_CLOSE => Some(Self::CloseResult(value)),
-            VFS_OP_READ => Some(Self::ReadLen(value)),
-            VFS_OP_WRITE => Some(Self::WriteLen(value)),
-            VFS_OP_STATX => Some(Self::StatxValue(value)),
-            VFS_OP_IOCTL => Some(Self::IoctlResult(value)),
-            VFS_OP_DUP => Some(Self::DupFd(value)),
-            VFS_OP_FCNTL => Some(Self::FcntlResult(value)),
-            VFS_OP_POLL => Some(Self::PollEvents(value)),
-            VFS_OP_EPOLL_CREATE1 => Some(Self::EpollFd(value)),
-            VFS_OP_EPOLL_CTL => Some(Self::EpollCtlResult(value)),
-            VFS_OP_EPOLL_PWAIT => Some(Self::EpollWaitEvents(value)),
-            VFS_OP_SENDFILE => Some(Self::SendfileLen(value)),
-            _ => None,
+            VFS_OP_OPENAT => Ok(Self::OpenAtFd(value)),
+            VFS_OP_CLOSE => Ok(Self::CloseResult(value)),
+            VFS_OP_READ => Ok(Self::ReadLen(value)),
+            VFS_OP_WRITE => Ok(Self::WriteLen(value)),
+            VFS_OP_STATX => Ok(Self::StatxValue(value)),
+            VFS_OP_IOCTL => Ok(Self::IoctlResult(value)),
+            VFS_OP_DUP => Ok(Self::DupFd(value)),
+            VFS_OP_FCNTL => Ok(Self::FcntlResult(value)),
+            VFS_OP_POLL => Ok(Self::PollEvents(value)),
+            VFS_OP_EPOLL_CREATE1 => Ok(Self::EpollFd(value)),
+            VFS_OP_EPOLL_CTL => Ok(Self::EpollCtlResult(value)),
+            VFS_OP_EPOLL_PWAIT => Ok(Self::EpollWaitEvents(value)),
+            VFS_OP_SENDFILE => Ok(Self::SendfileLen(value)),
+            _ => Err(VfsReplyDecodeError::UnsupportedOpcode { opcode }),
         }
     }
 
@@ -68,10 +75,48 @@ impl VfsReply {
         }
     }
 
-    pub const fn as_fd(self) -> Option<u64> {
+    pub const fn expect_fd(self, opcode: u16) -> Result<u64, VfsReplyDecodeError> {
         match self {
-            Self::OpenAtFd(fd) | Self::DupFd(fd) | Self::EpollFd(fd) => Some(fd),
-            _ => None,
+            Self::OpenAtFd(fd) | Self::DupFd(fd) | Self::EpollFd(fd) => Ok(fd),
+            _ => Err(VfsReplyDecodeError::UnexpectedReplyKind { opcode }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VFS_OP_OPENAT};
+
+    #[test]
+    fn checked_decode_rejects_short_payloads() {
+        assert_eq!(
+            VfsReply::from_opcode_payload_checked(VFS_OP_OPENAT, &[1, 2, 3]),
+            Err(VfsReplyDecodeError::Payload(DecodeError::PayloadTooShort {
+                expected: 8,
+                actual: 3
+            }))
+        );
+    }
+
+    #[test]
+    fn checked_decode_rejects_unsupported_opcodes() {
+        let payload = 12u64.to_le_bytes();
+        assert_eq!(
+            VfsReply::from_opcode_payload_checked(0xFFFF, &payload),
+            Err(VfsReplyDecodeError::UnsupportedOpcode { opcode: 0xFFFF })
+        );
+    }
+
+    #[test]
+    fn expect_fd_rejects_non_fd_reply_variants() {
+        let payload = 0u64.to_le_bytes();
+        let close = VfsReply::from_opcode_payload_checked(VFS_OP_CLOSE, &payload).expect("decode");
+        assert_eq!(
+            close.expect_fd(VFS_OP_CLOSE),
+            Err(VfsReplyDecodeError::UnexpectedReplyKind {
+                opcode: VFS_OP_CLOSE
+            })
+        );
     }
 }

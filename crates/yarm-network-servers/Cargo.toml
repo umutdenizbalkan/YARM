@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "yarm-network-servers"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[features]
+default = ["hosted-dev"]
+hosted-dev = []
+
+[dependencies]
+yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
+
+[[bin]]
+name = "dhcp_srv"
+path = "src/bin/dhcp_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "dns_srv"
+path = "src/bin/dns_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "netmgr_srv"
+path = "src/bin/netmgr_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "socket_srv"
+path = "src/bin/socket_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "tcpip_srv"
+path = "src/bin/tcpip_srv.rs"
+required-features = ["hosted-dev"]

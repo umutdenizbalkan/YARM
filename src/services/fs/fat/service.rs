@@ -20,7 +20,7 @@ pub fn run() {
     })
     .expect("open");
     let rep = svc.handle(open).expect("open rep");
-    let fd = VfsReply::from_opcode_payload(rep.opcode, rep.as_slice())
+    let fd = VfsReply::from_opcode_payload_checked(rep.opcode, rep.as_slice())
         .expect("decode open")
         .as_u64();
 
@@ -40,7 +40,7 @@ pub fn run() {
     })
     .expect("stat");
     let stat_rep = svc.handle(stat).expect("stat rep");
-    let len = VfsReply::from_opcode_payload(stat_rep.opcode, stat_rep.as_slice())
+    let len = VfsReply::from_opcode_payload_checked(stat_rep.opcode, stat_rep.as_slice())
         .expect("decode stat")
         .as_u64();
     crate::yarm_log!(

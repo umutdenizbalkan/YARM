@@ -24,3 +24,6 @@ pub mod vm;
 
 pub use boot::{Bootstrap, KernelState};
 pub use yarm_ipc_abi::{driver_abi, process_abi, vfs_abi};
+
+#[cfg(test)]
+mod extraction_bridge_tests;

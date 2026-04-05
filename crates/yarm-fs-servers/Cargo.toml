@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "yarm-fs-servers"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[features]
+default = ["hosted-dev"]
+hosted-dev = []
+
+[dependencies]
+yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
+
+[[bin]]
+name = "devfs_srv"
+path = "src/bin/devfs_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "ramfs_srv"
+path = "src/bin/ramfs_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "initramfs_srv"
+path = "src/bin/initramfs_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "ext4_srv"
+path = "src/bin/ext4_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "fat_srv"
+path = "src/bin/fat_srv.rs"
+required-features = ["hosted-dev"]

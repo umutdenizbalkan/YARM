@@ -4,7 +4,9 @@
 use super::*;
 
 impl KernelState {
-    pub(crate) fn scheduler_state(&self) -> crate::kernel::lock::SpinLockIrqGuard<'_, SchedulerState> {
+    pub(crate) fn scheduler_state(
+        &self,
+    ) -> crate::kernel::lock::SpinLockIrqGuard<'_, SchedulerState> {
         self.scheduler_state.lock()
     }
 
@@ -13,7 +15,10 @@ impl KernelState {
         f(&sched)
     }
 
-    pub(crate) fn with_scheduler_state_mut<R>(&mut self, f: impl FnOnce(&mut SchedulerState) -> R) -> R {
+    pub(crate) fn with_scheduler_state_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut SchedulerState) -> R,
+    ) -> R {
         let mut sched = self.scheduler_state.lock();
         f(&mut sched)
     }
@@ -41,6 +46,12 @@ impl KernelState {
         sched.timer.current_ticks().0
     }
 
+    #[cfg(feature = "posix-compat")]
+    pub(crate) fn scheduler_tick_advance(&mut self) -> u64 {
+        let mut sched = self.scheduler_state.lock();
+        sched.timer.tick_and_check().0.0
+    }
+
     pub(crate) fn with_ipc_state<R>(&self, f: impl FnOnce(&IpcSubsystem) -> R) -> R {
         let _ipc_guard = self.ipc_state_lock.lock();
         f(kernel_ref(&self.ipc))
@@ -56,7 +67,10 @@ impl KernelState {
         f(kernel_ref(&self.drivers))
     }
 
-    pub(crate) fn with_driver_state_mut<R>(&mut self, f: impl FnOnce(&mut DriverSubsystem) -> R) -> R {
+    pub(crate) fn with_driver_state_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut DriverSubsystem) -> R,
+    ) -> R {
         let _driver_guard = self.driver_state_lock.lock();
         f(kernel_mut(&mut self.drivers))
     }
@@ -66,7 +80,10 @@ impl KernelState {
         f(kernel_ref(&self.faults))
     }
 
-    pub(crate) fn with_fault_state_mut<R>(&mut self, f: impl FnOnce(&mut FaultSubsystem) -> R) -> R {
+    pub(crate) fn with_fault_state_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut FaultSubsystem) -> R,
+    ) -> R {
         let _fault_guard = self.fault_state_lock.lock();
         f(kernel_mut(&mut self.faults))
     }
@@ -77,7 +94,10 @@ impl KernelState {
         f(kernel_ref(&self.restart))
     }
 
-    pub(crate) fn with_restart_state_mut<R>(&mut self, f: impl FnOnce(&mut RestartSubsystem) -> R) -> R {
+    pub(crate) fn with_restart_state_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut RestartSubsystem) -> R,
+    ) -> R {
         let _restart_guard = self.restart_state_lock.lock();
         f(kernel_mut(&mut self.restart))
     }
@@ -87,7 +107,10 @@ impl KernelState {
         f(&self.capability)
     }
 
-    pub(crate) fn with_capability_state_mut<R>(&mut self, f: impl FnOnce(&mut CapabilitySubsystem) -> R) -> R {
+    pub(crate) fn with_capability_state_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut CapabilitySubsystem) -> R,
+    ) -> R {
         let _capability_guard = self.capability_state_lock.lock();
         f(&mut self.capability)
     }
@@ -97,7 +120,10 @@ impl KernelState {
         f(kernel_ref(&self.telemetry))
     }
 
-    pub(crate) fn with_telemetry_state_mut<R>(&mut self, f: impl FnOnce(&mut TelemetrySubsystem) -> R) -> R {
+    pub(crate) fn with_telemetry_state_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut TelemetrySubsystem) -> R,
+    ) -> R {
         let _telemetry_guard = self.telemetry_state_lock.lock();
         f(kernel_mut(&mut self.telemetry))
     }
@@ -108,7 +134,10 @@ impl KernelState {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn with_boot_config_mut<R>(&mut self, f: impl FnOnce(&mut BootConfigSubsystem) -> R) -> R {
+    pub(crate) fn with_boot_config_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut BootConfigSubsystem) -> R,
+    ) -> R {
         let _boot_config_guard = self.boot_config_state_lock.lock();
         f(kernel_mut(&mut self.boot_config))
     }
@@ -123,7 +152,10 @@ impl KernelState {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn with_scheduler_then_ipc<R>(&self, f: impl FnOnce(&SchedulerState, &IpcSubsystem) -> R) -> R {
+    pub(crate) fn with_scheduler_then_ipc<R>(
+        &self,
+        f: impl FnOnce(&SchedulerState, &IpcSubsystem) -> R,
+    ) -> R {
         let sched = self.scheduler_state.lock();
         let _ipc_guard = self.ipc_state_lock.lock();
         f(&sched, kernel_ref(&self.ipc))
@@ -155,12 +187,18 @@ impl KernelState {
         f(kernel_ref(&self.user_spaces))
     }
 
-    pub(crate) fn with_user_spaces_mut<R>(&mut self, f: impl FnOnce(&mut AddressSpaceManager) -> R) -> R {
+    pub(crate) fn with_user_spaces_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut AddressSpaceManager) -> R,
+    ) -> R {
         let _vm_guard = self.vm_state_lock.lock();
         f(kernel_mut(&mut self.user_spaces))
     }
 
-    pub(crate) fn with_tcbs<R>(&self, f: impl FnOnce(&[Option<ThreadControlBlock>; MAX_TASKS]) -> R) -> R {
+    pub(crate) fn with_tcbs<R>(
+        &self,
+        f: impl FnOnce(&[Option<ThreadControlBlock>; MAX_TASKS]) -> R,
+    ) -> R {
         let _task_guard = self.task_state_lock.lock();
         f(kernel_ref(&self.tcbs))
     }
@@ -178,7 +216,10 @@ impl KernelState {
         f(kernel_ref(&self.memory))
     }
 
-    pub(crate) fn with_memory_state_mut<R>(&mut self, f: impl FnOnce(&mut MemorySubsystem) -> R) -> R {
+    pub(crate) fn with_memory_state_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut MemorySubsystem) -> R,
+    ) -> R {
         let _mem_guard = self.memory_state_lock.lock();
         f(kernel_mut(&mut self.memory))
     }
