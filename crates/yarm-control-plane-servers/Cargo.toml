@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "yarm-control-plane-servers"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[features]
+default = ["hosted-dev"]
+hosted-dev = []
+
+[dependencies]
+yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
+
+[[bin]]
+name = "init_server"
+path = "src/bin/init_server.rs"
+
+[[bin]]
+name = "process_manager"
+path = "src/bin/process_manager.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "vfs_server"
+path = "src/bin/vfs_server.rs"
+required-features = ["hosted-dev"]

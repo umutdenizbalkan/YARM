@@ -13,6 +13,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yarm-control-plane-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
 name = "yarm-ipc-abi"
 version = "0.1.0"
 

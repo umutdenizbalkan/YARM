@@ -84,7 +84,8 @@ This is the concrete PR sequence for closing the boundary milestone.
 
 - PR-BND-1 and PR-BND-2 are complete (shared helper hardening + adoption).
 - PR-BND-3 is now complete through passes A-D (IPC core, capability/scheduler core, boot telemetry/capacity core, and bridge cleanup/lock tests).
-- Remaining milestone focus shifts to server crate extraction/rewiring (PR-BND-4), CI promotion to structural/type gates (PR-BND-5), and final stale-path cleanup/freeze (PR-BND-6).
+- PR-BND-4 has started with first extracted server package (`crates/yarm-control-plane-servers`) containing control-plane entrypoints (`init_server`, `process_manager`, `vfs_server`).
+- Remaining milestone focus shifts to broader server crate extraction/rewiring completion (PR-BND-4), CI promotion to structural/type gates (PR-BND-5), and final stale-path cleanup/freeze (PR-BND-6).
 
 ## Definition of done for the boundary milestone
 
