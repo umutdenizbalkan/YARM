@@ -7,7 +7,7 @@ edition = "2024"
 autobins = false
 
 [workspace]
-members = [".", "crates/yarm-ipc-abi", "crates/yarm-srv-common"]
+members = [".", "crates/yarm-ipc-abi", "crates/yarm-srv-common", "crates/yarm-kernel"]
 resolver = "2"
 
 [features]
@@ -18,6 +18,7 @@ linux-compat = ["posix-compat"]
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }
+yarm-kernel = { path = "crates/yarm-kernel" }
 yarm-srv-common = { path = "crates/yarm-srv-common" }
 
 [[bin]]

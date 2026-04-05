@@ -8,11 +8,16 @@ name = "yarm"
 version = "0.1.0"
 dependencies = [
  "yarm-ipc-abi",
+ "yarm-kernel",
  "yarm-srv-common",
 ]
 
 [[package]]
 name = "yarm-ipc-abi"
+version = "0.1.0"
+
+[[package]]
+name = "yarm-kernel"
 version = "0.1.0"
 
 [[package]]
