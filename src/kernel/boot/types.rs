@@ -2,6 +2,10 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::*;
+pub use yarm_kernel::boot::{
+    CapacityPoolTelemetry, CapacityTelemetry, IpcFastpathResult, IpcPathTelemetry,
+    KernelCapacityProfile, RuntimeCapacityConfig,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelError {
@@ -96,62 +100,33 @@ impl DriverBundlePlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IpcFastpathResult {
-    pub switched_to_waiter: bool,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct IpcPathTelemetry {
-    pub fastpath_attempts: u64,
-    pub fastpath_switches: u64,
-    pub queued_sends: u64,
-    pub blocked_sends: u64,
-    pub rendezvous_handoffs: u64,
-    pub transfer_records_created: u64,
-    pub transfer_records_materialized: u64,
-    pub transfer_records_revoked: u64,
-    pub transfer_record_failures: u64,
-    pub shared_mem_bytes_mapped: u64,
-    pub shared_mem_bytes_released: u64,
-    pub transfer_release_calls: u64,
-    pub scheduler_dispatch_calls: u64,
-    pub scheduler_yield_calls: u64,
-    pub scheduler_context_switches: u64,
-    pub scheduler_fastpath_handoffs: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CapacityPoolTelemetry {
-    pub used: usize,
-    pub capacity: usize,
-    pub near_full: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CapacityTelemetry {
-    pub endpoints: CapacityPoolTelemetry,
-    pub notifications: CapacityPoolTelemetry,
-    pub tasks: CapacityPoolTelemetry,
-    pub drivers: CapacityPoolTelemetry,
-    pub memory_objects: CapacityPoolTelemetry,
-    pub capability_slots: CapacityPoolTelemetry,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelCapacityProfile {
-    HostedDefault,
-    Constrained,
-    Throughput,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeCapacityConfig {
-    pub max_endpoints: usize,
-    pub max_notifications: usize,
-    pub max_tasks: usize,
-    pub max_drivers: usize,
-    pub max_memory_objects: usize,
-    pub max_transfer_envelopes: usize,
-    pub max_capability_slots: usize,
+    #[test]
+    fn pass_c_boot_telemetry_types_are_reexported_from_yarm_kernel() {
+        assert_eq!(
+            mem::size_of::<IpcPathTelemetry>(),
+            mem::size_of::<yarm_kernel::boot::IpcPathTelemetry>()
+        );
+        assert_eq!(
+            mem::size_of::<CapacityTelemetry>(),
+            mem::size_of::<yarm_kernel::boot::CapacityTelemetry>()
+        );
+        assert_eq!(
+            KernelCapacityProfile::HostedDefault as u8,
+            yarm_kernel::boot::KernelCapacityProfile::HostedDefault as u8
+        );
+        let _cfg: yarm_kernel::boot::RuntimeCapacityConfig = RuntimeCapacityConfig {
+            max_endpoints: 1,
+            max_notifications: 1,
+            max_tasks: 1,
+            max_drivers: 1,
+            max_memory_objects: 1,
+            max_transfer_envelopes: 1,
+            max_capability_slots: 1,
+        };
+    }
 }
