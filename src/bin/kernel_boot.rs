@@ -5,8 +5,6 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 use yarm::kernel::boot::Bootstrap;
-#[cfg(not(test))]
-use yarm::services::control_plane::init;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
@@ -230,40 +228,16 @@ fn run_boot_markers() -> yarm::kernel::boot::KernelState {
 }
 
 #[cfg(not(test))]
-fn run_process_vfs_smoke(kernel: &mut yarm::kernel::boot::KernelState) {
-    yarm::yarm_log!("YARM_INIT_START");
-    let summary = match init::run_minimum_profile_with_kernel(
-        kernel,
-        init::InitRuntimeBootConfig::baseline(),
-    ) {
-        Ok(summary) => summary,
-        Err(err) => {
-            yarm::yarm_log!("YARM_INIT_FAIL stage=minimum_profile err={:?}", err);
-            return;
-        }
-    };
-    let dispatched = match kernel.dispatch_ready_task() {
-        Ok(dispatched) => dispatched,
-        Err(err) => {
-            yarm::yarm_log!("YARM_INIT_FAIL stage=dispatch err={:?}", err);
-            return;
-        }
-    };
-    yarm::yarm_log!(
-        "YARM_INIT_RUNTIME phase={:?} supervisor_managed={} initramfs_reads={} dispatched_tid={:?}",
-        summary.init_phase,
-        summary.supervisor_managed_services,
-        summary.initramfs_handled,
-        dispatched
-    );
-    yarm::yarm_log!("YARM_INIT_DONE");
+fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
+    let initial = kernel.dispatch_ready_task().ok().flatten();
+    yarm::yarm_log!("YARM_SCHED_LOOP_START dispatched_tid={:?}", initial);
 }
 
 fn run() {
     #[cfg(not(test))]
     {
         let mut kernel = run_boot_markers();
-        run_process_vfs_smoke(&mut kernel);
+        run_scheduler_loop(&mut kernel);
     }
     #[cfg(test)]
     let _ = run_boot_markers();

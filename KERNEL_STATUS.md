@@ -24,6 +24,7 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
 - **IRQ safety hardening added:** controller MMIO EOI writes are configuration-gated, preventing accidental writes when controller state is not initialized.
 - **Firmware-driven boot wiring added:** boot now accepts staged descriptions, hosted env (`YARM_IRQ_CONTROLLER_DESCRIPTION`, `YARM_IRQ_FIRMWARE_BLOB`), explicit firmware-blob API calls, and a non-hosted firmware-blob provider hook for early boot handoff.
 - **x86_64 SMP AP startup wired in boot path:** a dedicated `arch::x86_64::smp` module now prepares a trampoline handoff page (`0x7000`), emits LAPIC INIT-SIPI-SIPI for present secondary CPUs, and then finalizes scheduler/topology online accounting through `KernelState::bring_up_cpu`; boot now emits `YARM_SMP_STARTUP` before `YARM_BOOT_OK`.
+- **Boot flow refactor scaffolded:** `kernel_boot` no longer runs the in-kernel init/process/VFS smoke bootstrap path directly; after `run_boot_markers` it now enters a scheduler-loop handoff scaffold (`YARM_SCHED_LOOP_START`) as a stepping stone toward loading `init_server` from initramfs in a separate user address space.
 - **Remaining hardware integration work tracked:** implement concrete board/bootloader ACPI/DT extractors that feed the registered firmware-blob provider in production boot flows.
 
 ## In-kernel mechanism status
