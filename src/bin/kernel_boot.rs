@@ -203,7 +203,14 @@ fn run_boot_markers() -> yarm::kernel::boot::KernelState {
     {
         debug_uart_marker(b'I');
         yarm::arch::x86_64::descriptor_tables::register_trap_kernel_state(&mut kernel);
-        let _ = kernel.bring_up_present_secondary_cpus();
+        let started_secondary =
+            yarm::arch::x86_64::smp::start_secondary_cpus(&mut kernel).unwrap_or(0);
+        yarm::yarm_log!(
+            "YARM_SMP_STARTUP started_secondary={} online_cpus={} present_cpus={}",
+            started_secondary,
+            kernel.online_cpu_count(),
+            kernel.present_cpu_count()
+        );
         kernel.program_timer_deadline_current_cpu(
             yarm::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
         );

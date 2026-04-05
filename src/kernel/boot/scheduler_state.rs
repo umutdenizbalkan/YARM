@@ -98,26 +98,6 @@ impl KernelState {
         kernel_ref(&sched.scheduler).online_cpu_bitmap()
     }
 
-    pub fn bring_up_present_secondary_cpus(&mut self) -> Result<usize, KernelError> {
-        let present = self.present_cpu_bitmap();
-        let mut brought_up = 0usize;
-        for cpu in 0..crate::kernel::scheduler::MAX_CPUS {
-            let cpu_id = CpuId(cpu as u8);
-            if cpu_id.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
-                continue;
-            }
-            if (present & (1u64 << cpu_id.0)) == 0 {
-                continue;
-            }
-            match self.bring_up_cpu(cpu_id) {
-                Ok(()) => brought_up += 1,
-                Err(KernelError::WrongObject) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(brought_up)
-    }
-
     pub fn program_timer_deadline_current_cpu(&mut self, ticks_from_now: u64) {
         let cpu = self.current_cpu();
         self.hal.program_timer_deadline(cpu, ticks_from_now);
