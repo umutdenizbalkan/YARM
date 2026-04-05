@@ -24,12 +24,10 @@ pub struct VfsLoopSummary {
 const VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 
 fn decode_fd_reply(reply: crate::kernel::ipc::Message) -> Result<u64, VfsError> {
-    match VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
+    VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
         .ok_or(VfsError::Malformed)?
-    {
-        VfsReply::OpenAtFd(fd) | VfsReply::DupFd(fd) | VfsReply::EpollFd(fd) => Ok(fd),
-        _ => Err(VfsError::Malformed),
-    }
+        .as_fd()
+        .ok_or(VfsError::Malformed)
 }
 
 pub fn run_request_loop(

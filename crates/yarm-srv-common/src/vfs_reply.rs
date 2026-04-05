@@ -67,4 +67,11 @@ impl VfsReply {
             | Self::SendfileLen(v) => v,
         }
     }
+
+    pub const fn as_fd(self) -> Option<u64> {
+        match self {
+            Self::OpenAtFd(fd) | Self::DupFd(fd) | Self::EpollFd(fd) => Some(fd),
+            _ => None,
+        }
+    }
 }
