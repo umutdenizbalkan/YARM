@@ -11,8 +11,72 @@ use crate::kernel::trap::{FaultAccess, Trap, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
 
 const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
+const DEMAND_STACK_GROWTH_WINDOW: u64 = 8 * 1024 * 1024;
 
 impl KernelState {
+    fn fault_addr_in_demand_backed_region(&self, tid: u64, fault_addr: u64) -> bool {
+        if let Some((base, end)) = self.task_brk_bounds(tid)
+            && fault_addr >= base as u64
+            && fault_addr < end as u64
+        {
+            return true;
+        }
+
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.user_stack_top)
+                .map(|top| {
+                    let low = top.0.saturating_sub(DEMAND_STACK_GROWTH_WINDOW);
+                    fault_addr >= low && fault_addr < top.0
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    fn try_handle_demand_page_fault(
+        &mut self,
+        fault: crate::arch::trap::FaultInfo,
+    ) -> Result<bool, KernelError> {
+        if matches!(fault.access, FaultAccess::Execute) {
+            return Ok(false);
+        }
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        let page = fault.addr.page_align_down();
+        if page.0 >= crate::kernel::vm::KERNEL_SPACE_BASE {
+            return Ok(false);
+        }
+        if !self.fault_addr_in_demand_backed_region(tid, page.0) {
+            return Ok(false);
+        }
+        let already_mapped = self
+            .user_spaces
+            .get(asid)
+            .ok_or(KernelError::Vm(crate::kernel::vm::VmError::InvalidAsid))?
+            .resolve(page)
+            .is_some();
+        if already_mapped {
+            return Ok(true);
+        }
+
+        let (_id, mem_cap) = self.alloc_anonymous_memory_object()?;
+        let flags = crate::kernel::vm::PageFlags::USER_RW;
+        self.map_user_page_in_current_asid_with_caps(mem_cap, page, flags)?;
+
+        #[cfg(feature = "hosted-dev")]
+        self.with_memory_state_mut(|memory| {
+            for byte in 0..crate::kernel::vm::PAGE_SIZE {
+                memory
+                    .user_memory
+                    .insert((asid.0, page.0 + byte as u64), 0);
+            }
+        });
+
+        Ok(true)
+    }
+
     fn emit_fault_report(&mut self, faulted_tid: u64) {
         let (endpoint_idx, fault) =
             self.with_fault_state(|faults| (faults.fault_handler_endpoint, faults.last_fault));
@@ -153,10 +217,18 @@ impl KernelState {
         }
 
         match event {
-            TrapEvent::PageFault(_) => self
-                .fault_current_task()
-                .map_err(SyscallError::from)
-                .map_err(TrapHandleError::Syscall),
+            TrapEvent::PageFault(fault) => {
+                if self
+                    .try_handle_demand_page_fault(fault)
+                    .map_err(SyscallError::from)
+                    .map_err(TrapHandleError::Syscall)?
+                {
+                    return Ok(());
+                }
+                self.fault_current_task()
+                    .map_err(SyscallError::from)
+                    .map_err(TrapHandleError::Syscall)
+            }
             TrapEvent::ExternalInterrupt(irq) => {
                 let irq_state = crate::arch::irq_guard::irq_save();
                 let route_result = self

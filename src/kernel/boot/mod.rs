@@ -5793,6 +5793,52 @@ mod tests {
     }
 
     #[test]
+    fn demand_page_fault_maps_heap_page_for_current_task() {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind");
+        state
+            .set_task_brk_bounds(0, 0x4000, 0x8000)
+            .expect("brk bounds");
+
+        let fault = FaultInfo {
+            addr: VirtAddr(0x5001),
+            access: FaultAccess::Write,
+        };
+        state
+            .handle_trap_event(TrapEvent::PageFault(fault), None)
+            .expect("demand page fault");
+
+        let mapping = state
+            .user_spaces
+            .get(asid)
+            .expect("aspace")
+            .resolve(VirtAddr(0x5000))
+            .expect("mapped");
+        assert!(mapping.flags.user);
+        assert!(mapping.flags.read);
+        assert!(mapping.flags.write);
+        assert_eq!(state.task_status(0), Some(TaskStatus::Running));
+    }
+
+    #[test]
+    fn page_fault_outside_demand_regions_still_faults_task() {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind");
+
+        let fault = FaultInfo {
+            addr: VirtAddr(0x9000),
+            access: FaultAccess::Read,
+        };
+        state
+            .handle_trap_event(TrapEvent::PageFault(fault), None)
+            .expect("page fault handled");
+
+        assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
+    }
+
+    #[test]
     fn cross_cpu_work_for_other_cpu_is_deferred_not_dropped() {
         let mut state = Bootstrap::init().expect("init");
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
