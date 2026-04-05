@@ -104,6 +104,10 @@ fn map_kernel_ipc_err<T>(
     result.map_err(|_| VfsError::Unsupported)
 }
 
+fn map_kernel_ipc_error(_: crate::kernel::boot::KernelError) -> VfsError {
+    VfsError::Unsupported
+}
+
 fn roundtrip_ipc<B: VfsBackend>(
     kernel: &mut KernelState,
     vfs: &mut FsService<B>,
@@ -135,39 +139,18 @@ fn roundtrip_call_reply_with_budget<B: VfsBackend>(
     request: crate::kernel::ipc::Message,
     recv_timeout_ticks: u64,
 ) -> Result<crate::kernel::ipc::Message, VfsError> {
-    let caller_tid =
-        crate::kernel::ipc::ThreadId(kernel.current_tid().ok_or(VfsError::Unsupported)?);
-    let reply_cap =
-        map_kernel_ipc_err(kernel.create_reply_cap_for_caller(caller_tid, client_recv_cap, None))?;
-    let request_with_reply_cap = crate::kernel::ipc::Message::with_header(
-        request.sender_tid.0,
-        request.opcode,
-        request.flags | crate::kernel::ipc::Message::FLAG_CAP_TRANSFER,
-        Some(reply_cap.0),
-        request.as_slice(),
+    crate::services::control_plane::ipc_roundtrip::roundtrip_call_reply_with_budget(
+        kernel,
+        vfs,
+        client_send_cap,
+        server_recv_cap,
+        client_recv_cap,
+        request,
+        recv_timeout_ticks,
+        map_kernel_ipc_error,
+        || VfsError::Malformed,
+        || VfsError::Unsupported,
     )
-    .map_err(|_| VfsError::Malformed)?;
-
-    map_kernel_ipc_err(kernel.ipc_send(client_send_cap, request_with_reply_cap))?;
-    let request_for_server =
-        map_kernel_ipc_err(kernel.ipc_recv_with_deadline(server_recv_cap, recv_timeout_ticks))?
-            .ok_or(VfsError::Malformed)?;
-    let reply_cap = request_for_server
-        .transferred_cap()
-        .map(|cap| CapId(cap.0))
-        .ok_or(VfsError::Malformed)?;
-    let sanitized_request = crate::kernel::ipc::Message::with_header(
-        request_for_server.sender_tid.0,
-        request_for_server.opcode,
-        request_for_server.flags & !crate::kernel::ipc::Message::FLAG_CAP_TRANSFER,
-        None,
-        request_for_server.as_slice(),
-    )
-    .map_err(|_| VfsError::Malformed)?;
-    let response = vfs.handle(sanitized_request)?;
-    map_kernel_ipc_err(kernel.ipc_reply(reply_cap, response))?;
-    map_kernel_ipc_err(kernel.ipc_recv_with_deadline(client_recv_cap, recv_timeout_ticks))?
-        .ok_or(VfsError::Malformed)
 }
 
 #[allow(dead_code)]

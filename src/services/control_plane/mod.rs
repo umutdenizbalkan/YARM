@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 pub mod init;
+pub(crate) mod ipc_roundtrip;
 pub mod process_manager;
 pub mod supervisor;
 pub mod vfs;
@@ -39,26 +40,31 @@ mod tests {
         let vfs_src = include_str!("vfs/service.rs");
         let supervisor_src = include_str!("supervisor/service.rs");
         let process_manager_src = include_str!("process_manager/service.rs");
+        let roundtrip_src = include_str!("ipc_roundtrip.rs");
 
         assert!(
-            vfs_src.contains("ipc_recv_with_deadline("),
-            "vfs must retain timed receive migration"
+            vfs_src.contains("roundtrip_call_reply_with_budget(")
+                && roundtrip_src.contains("ipc_recv_with_deadline("),
+            "vfs must retain timed receive migration via shared roundtrip helper"
         );
         assert!(
-            vfs_src.contains("ipc_reply("),
-            "vfs must retain reply-cap call/reply migration"
+            vfs_src.contains("roundtrip_call_reply_with_budget(")
+                && roundtrip_src.contains("ipc_reply("),
+            "vfs must retain reply-cap call/reply migration via shared roundtrip helper"
         );
         assert!(
             supervisor_src.contains("recv_with_budget"),
             "supervisor must retain budgeted receive migration"
         );
         assert!(
-            process_manager_src.contains("ipc_recv_with_deadline("),
-            "process-manager must retain timed receive migration"
+            process_manager_src.contains("roundtrip_call_reply_with_budget(")
+                && roundtrip_src.contains("ipc_recv_with_deadline("),
+            "process-manager must retain timed receive migration via shared roundtrip helper"
         );
         assert!(
-            process_manager_src.contains("ipc_reply("),
-            "process-manager must retain reply-cap call/reply migration"
+            process_manager_src.contains("roundtrip_call_reply_with_budget(")
+                && roundtrip_src.contains("ipc_reply("),
+            "process-manager must retain reply-cap call/reply migration via shared roundtrip helper"
         );
     }
 
