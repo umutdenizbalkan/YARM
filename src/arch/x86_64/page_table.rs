@@ -584,4 +584,22 @@ mod tests {
         assert!(wt_entry.0 & PageTableEntry::WRITE_THROUGH != 0);
         assert!(uc_entry.0 & PageTableEntry::CACHE_DISABLE != 0);
     }
+
+    #[test]
+    fn non_executable_mappings_set_nx_bit() {
+        let _guard = PAGE_TABLE_TEST_LOCK.lock();
+        reset_state();
+        let asid = Asid(14);
+        ensure_asid_root(asid).expect("root");
+        let va_nx = VirtAddr(0x0000_7f00_3000_0000);
+        let va_x = VirtAddr(0x0000_7f00_3000_1000);
+
+        map_page(asid, va_nx, PhysAddr(0x4000_0000), PageFlags::USER_RW).expect("map nx");
+        map_page(asid, va_x, PhysAddr(0x4000_1000), PageFlags::USER_RX).expect("map x");
+
+        let nx_entry = resolve_page(asid, va_nx).expect("nx");
+        let x_entry = resolve_page(asid, va_x).expect("x");
+        assert!(nx_entry.0 & PageTableEntry::NO_EXECUTE != 0);
+        assert!(x_entry.0 & PageTableEntry::NO_EXECUTE == 0);
+    }
 }

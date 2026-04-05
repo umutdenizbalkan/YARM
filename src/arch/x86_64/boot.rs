@@ -163,15 +163,21 @@ pvh_start32:
     mov bl, 'B'
     call uart_putc32
     mov eax, cr4
-    // Enable PAE + SSE support expected by x86_64 Rust codegen:
+    // Enable PAE + SSE support expected by x86_64 Rust codegen, plus
+    // supervisor protections:
     // - CR4.PAE (bit 5)
     // - CR4.OSFXSR (bit 9)
     // - CR4.OSXMMEXCPT (bit 10)
-    or eax, 0x620
+    // - CR4.SMEP (bit 20)
+    // - CR4.SMAP (bit 21)
+    or eax, 0x300620
     mov cr4, eax
     mov ecx, 0xC0000080
     rdmsr
-    or eax, 0x100
+    // Enable SYSCALL and NXE:
+    // - EFER.SCE (bit 8)
+    // - EFER.NXE (bit 11)
+    or eax, 0x900
     wrmsr
     mov bl, 'C'
     call uart_putc32
