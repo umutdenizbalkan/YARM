@@ -6,10 +6,10 @@ use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 use crate::kernel::process::ProcessManagerError;
 use crate::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
-use crate::kernel::process_abi::{
+use crate::services::common::service::{RequestResponseService, run_typed_request_loop};
+use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args,
 };
-use crate::services::common::service::{RequestResponseService, run_typed_request_loop};
 
 const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 
@@ -65,9 +65,8 @@ fn roundtrip_call_reply_with_budget(
     request: Message,
     recv_timeout_ticks: u64,
 ) -> Result<Message, ProcessManagerError> {
-    let caller_tid = crate::kernel::ipc::ThreadId(
-        kernel.current_tid().ok_or(ProcessManagerError::Malformed)?,
-    );
+    let caller_tid =
+        crate::kernel::ipc::ThreadId(kernel.current_tid().ok_or(ProcessManagerError::Malformed)?);
     let reply_cap =
         map_kernel_ipc_err(kernel.create_reply_cap_for_caller(caller_tid, client_recv_cap, None))?;
     let request_with_reply_cap = Message::with_header(
@@ -80,10 +79,9 @@ fn roundtrip_call_reply_with_budget(
     .map_err(|_| ProcessManagerError::Malformed)?;
 
     map_kernel_ipc_err(kernel.ipc_send(client_send_cap, request_with_reply_cap))?;
-    let request_for_server = map_kernel_ipc_err(
-        kernel.ipc_recv_with_deadline(server_recv_cap, recv_timeout_ticks),
-    )?
-    .ok_or(ProcessManagerError::Malformed)?;
+    let request_for_server =
+        map_kernel_ipc_err(kernel.ipc_recv_with_deadline(server_recv_cap, recv_timeout_ticks))?
+            .ok_or(ProcessManagerError::Malformed)?;
     let reply_cap = request_for_server
         .transferred_cap()
         .map(|cap| CapId(cap.0))

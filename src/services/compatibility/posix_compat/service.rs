@@ -3,8 +3,8 @@
 
 use crate::kernel::boot::Bootstrap;
 use crate::kernel::ipc::Message;
-use crate::kernel::process_abi::PROC_OP_GETPID;
 use crate::kernel::trapframe::TrapFrame;
+use yarm_ipc_abi::process_abi::PROC_OP_GETPID;
 
 use super::{LINUX_NR_GETPID, PosixServiceBindings, dispatch};
 

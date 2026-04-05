@@ -129,11 +129,11 @@ mod tests {
         CloseRequest, MountNamespacePolicy, MountRouter, StatxRequest, close_message,
         openat_message, statx_message, write_message,
     };
-    use crate::kernel::vfs_abi::{
-        OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_STATX, VFS_OP_WRITE,
-    };
     use crate::services::common::vfs_service::VfsService;
     use crate::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
+    use yarm_ipc_abi::vfs_abi::{
+        OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_STATX, VFS_OP_WRITE,
+    };
 
     #[test]
     fn devfs_service_supports_console_and_null() {

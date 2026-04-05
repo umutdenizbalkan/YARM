@@ -4,7 +4,6 @@
 use crate::kernel::boot::KernelState;
 use crate::kernel::ipc::Message;
 use crate::kernel::process::ProcessService;
-use crate::kernel::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
 use crate::kernel::vfs::{
     CloseRequest, OpenAtRequest, ReadWriteRequest, VfsBackend, close_message, openat_message,
     read_message, write_message,
@@ -13,6 +12,7 @@ use crate::services::common::service::FsService;
 use crate::services::common::vfs_service::VfsReply;
 use crate::services::compatibility::posix_compat::PosixErrno;
 use crate::services::network::socket::service::SocketAdapterService;
+use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
 
 pub struct PosixSysdepsContext<'a, B: VfsBackend> {
     pub kernel: &'a mut KernelState,

@@ -54,4 +54,4 @@ Hardware access is modeled as capabilities held by normal servers.
 
 - YARM currently keeps kernel + servers in one crate for iteration speed, which means `crate::kernel::*` is technically visible to service code.
 - To preserve microkernel user-space boundaries until a multi-crate split lands, CI rejects kernel-path imports from `src/services/**` and `src/bin/*_srv.rs` via `scripts/check-service-arch-boundary.sh`.
-- Planned longer-term shape: split into boundary-enforcing crates (for example `yarm-kernel`, `yarm-ipc`, `yarm-srv-common`) so the type system enforces separation instead of grep-based policy.
+- Workspace split has started with `yarm-ipc-abi` as a dedicated ABI crate; next steps are `yarm-kernel`/`yarm-srv-common` extraction so the type system fully enforces service/kernel separation instead of grep-based policy.

@@ -6,6 +6,10 @@ version = "0.1.0"
 edition = "2024"
 autobins = false
 
+[workspace]
+members = [".", "crates/yarm-ipc-abi"]
+resolver = "2"
+
 [features]
 default = ["hosted-dev"]
 hosted-dev = []
@@ -13,6 +17,7 @@ posix-compat = []
 linux-compat = ["posix-compat"]
 
 [dependencies]
+yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }
 
 [[bin]]
 name = "blkcache_srv"

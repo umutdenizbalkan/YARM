@@ -4,7 +4,6 @@
 use crate::kernel::boot::{Bootstrap, KernelError, KernelState};
 use crate::kernel::process::ProcessService;
 use crate::kernel::vfs::InMemoryBackend;
-use crate::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 use crate::services::common::service::FsService;
 use crate::services::control_plane::process_manager::service::run_request_loop as run_process_manager_request_loop;
 use crate::services::control_plane::supervisor::SupervisorService;
@@ -16,6 +15,7 @@ use crate::services::fs::initramfs::{InitramfsBackend, InitramfsService};
 use crate::services::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitService,
 };
+use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitRuntimeBootConfig {

@@ -3,9 +3,9 @@
 
 use crate::kernel::boot::{Bootstrap, KernelError};
 use crate::kernel::ipc::Message;
-use crate::kernel::process_abi::PROC_OP_GETPID;
 use crate::kernel::trapframe::TrapFrame;
-use crate::kernel::vfs_abi::VFS_OP_OPENAT;
+use yarm_ipc_abi::process_abi::PROC_OP_GETPID;
+use yarm_ipc_abi::vfs_abi::VFS_OP_OPENAT;
 
 use super::{LINUX_NR_GETPID, LINUX_NR_OPENAT, PosixServiceBindings, dispatch};
 

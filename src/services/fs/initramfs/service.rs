@@ -124,12 +124,10 @@ mod tests {
         CloseRequest, MountNamespacePolicy, MountRouter, StatxRequest, close_message,
         openat_message, read_message, statx_message,
     };
-    use crate::kernel::vfs_abi::{
-        OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_READ,
-    };
     use crate::services::common::vfs_service::VfsService;
     use crate::services::fs::devfs::{DEV_CONSOLE_PATH_PTR, DevFsBackend};
     use crate::services::fs::initramfs::INITRAMFS_INIT_PATH_PTR;
+    use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_READ};
 
     #[test]
     fn initramfs_is_read_only_with_metrics() {

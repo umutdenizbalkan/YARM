@@ -123,9 +123,9 @@ mod tests {
         CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_message,
         statx_message,
     };
-    use crate::kernel::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT};
     use crate::services::common::vfs_service::VfsService;
     use crate::services::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
+    use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT};
 
     #[test]
     fn ramfs_service_supports_write_read_and_stat_with_metrics() {
