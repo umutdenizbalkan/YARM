@@ -13,7 +13,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "yarm-compat-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
 name = "yarm-control-plane-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
+name = "yarm-driver-servers"
 version = "0.1.0"
 dependencies = [
  "yarm",
@@ -46,4 +60,11 @@ name = "yarm-srv-common"
 version = "0.1.0"
 dependencies = [
  "yarm-ipc-abi",
+]
+
+[[package]]
+name = "yarm-ui-servers"
+version = "0.1.0"
+dependencies = [
+ "yarm",
 ]

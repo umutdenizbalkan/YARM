@@ -15,6 +15,9 @@ members = [
     "crates/yarm-control-plane-servers",
     "crates/yarm-fs-servers",
     "crates/yarm-network-servers",
+    "crates/yarm-driver-servers",
+    "crates/yarm-ui-servers",
+    "crates/yarm-compat-servers",
 ]
 resolver = "2"
 
@@ -30,16 +33,6 @@ yarm-kernel = { path = "crates/yarm-kernel" }
 yarm-srv-common = { path = "crates/yarm-srv-common" }
 
 [[bin]]
-name = "blkcache_srv"
-path = "src/bin/blkcache_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "compositor_srv"
-path = "src/bin/compositor_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
 name = "console_driver"
 path = "src/bin/console_driver.rs"
 required-features = ["hosted-dev"]
@@ -50,63 +43,13 @@ path = "src/bin/core_profile_smoke.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
-name = "display_srv"
-path = "src/bin/display_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
 name = "driver_manager"
 path = "src/bin/driver_manager.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
-name = "input_srv"
-path = "src/bin/input_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "irqmux_srv"
-path = "src/bin/irqmux_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
 name = "kernel_boot"
 path = "src/bin/kernel_boot.rs"
-
-[[bin]]
-name = "posix_compat_srv"
-path = "src/bin/posix_compat_srv.rs"
-required-features = ["hosted-dev", "posix-compat"]
-
-[[bin]]
-name = "shell_srv"
-path = "src/bin/shell_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "uart_srv"
-path = "src/bin/uart_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "virtio_blk_srv"
-path = "src/bin/virtio_blk_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "virtio_gpu_srv"
-path = "src/bin/virtio_gpu_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "virtio_net_srv"
-path = "src/bin/virtio_net_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "supervisor_srv"
-path = "src/bin/supervisor_srv.rs"
-required-features = ["hosted-dev"]
 
 [profile.x86-none]
 inherits = "release"

@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "yarm-driver-servers"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[features]
+default = ["hosted-dev"]
+hosted-dev = []
+
+[dependencies]
+yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
+
+[[bin]]
+name = "blkcache_srv"
+path = "src/bin/blkcache_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "input_srv"
+path = "src/bin/input_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "irqmux_srv"
+path = "src/bin/irqmux_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "uart_srv"
+path = "src/bin/uart_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "virtio_blk_srv"
+path = "src/bin/virtio_blk_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "virtio_gpu_srv"
+path = "src/bin/virtio_gpu_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "virtio_net_srv"
+path = "src/bin/virtio_net_srv.rs"
+required-features = ["hosted-dev"]

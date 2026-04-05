@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "yarm-ui-servers"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[features]
+default = ["hosted-dev"]
+hosted-dev = []
+
+[dependencies]
+yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
+
+[[bin]]
+name = "compositor_srv"
+path = "src/bin/compositor_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "display_srv"
+path = "src/bin/display_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "shell_srv"
+path = "src/bin/shell_srv.rs"
+required-features = ["hosted-dev"]

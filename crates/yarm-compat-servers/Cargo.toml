@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "yarm-compat-servers"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[features]
+default = ["hosted-dev"]
+hosted-dev = []
+posix-compat = ["yarm/posix-compat"]
+
+[dependencies]
+yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
+
+[[bin]]
+name = "supervisor_srv"
+path = "src/bin/supervisor_srv.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
+name = "posix_compat_srv"
+path = "src/bin/posix_compat_srv.rs"
+required-features = ["hosted-dev", "posix-compat"]
