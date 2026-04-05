@@ -75,13 +75,6 @@ impl VfsReply {
         }
     }
 
-    pub const fn as_fd(self) -> Option<u64> {
-        match self {
-            Self::OpenAtFd(fd) | Self::DupFd(fd) | Self::EpollFd(fd) => Some(fd),
-            _ => None,
-        }
-    }
-
     pub const fn expect_fd(self, opcode: u16) -> Result<u64, VfsReplyDecodeError> {
         match self {
             Self::OpenAtFd(fd) | Self::DupFd(fd) | Self::EpollFd(fd) => Ok(fd),
