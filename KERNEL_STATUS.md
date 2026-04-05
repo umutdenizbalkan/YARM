@@ -30,9 +30,13 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
 - **PR-BND-4 second server-crate slice landed:** filesystem server entrypoints (`devfs_srv`, `ramfs_srv`, `initramfs_srv`, `ext4_srv`, `fat_srv`) moved from root package `src/bin/*` into dedicated workspace package `crates/yarm-fs-servers`.
 - **PR-BND-4 third server-crate slice landed:** network server entrypoints (`dhcp_srv`, `dns_srv`, `netmgr_srv`, `socket_srv`, `tcpip_srv`) moved from root package `src/bin/*` into dedicated workspace package `crates/yarm-network-servers`.
 - **PR-BND-4 fourth server-crate slice landed:** driver/UI/compat server entrypoints were extracted from root package `src/bin/*` into dedicated workspace packages:
-  - `crates/yarm-driver-servers` (`blkcache_srv`, `input_srv`, `irqmux_srv`, `uart_srv`, `virtio_blk_srv`, `virtio_gpu_srv`, `virtio_net_srv`)
+  - `crates/yarm-driver-servers` (`blkcache_srv`, `console_driver`, `input_srv`, `irqmux_srv`, `uart_srv`, `virtio_blk_srv`, `virtio_gpu_srv`, `virtio_net_srv`)
   - `crates/yarm-ui-servers` (`compositor_srv`, `display_srv`, `shell_srv`)
   - `crates/yarm-compat-servers` (`supervisor_srv`, `posix_compat_srv`)
+- **PR-BND-4 fifth server-crate slice landed:** remaining hosted service bins were removed from root package ownership:
+  - `console_driver` moved into `crates/yarm-driver-servers`
+  - `driver_manager` moved into `crates/yarm-control-plane-servers`
+  - root package now keeps only non-server boot/smoke bins (`kernel_boot`, `core_profile_smoke`)
 - **Trap decode correctness improved:** unknown architecture trap codes are normalized as `TrapEvent::Unknown { arch_code }` instead of being coerced into external IRQ semantics.
 - **Per-CPU TLS restore observability:** architecture trap paths now expose CPU-indexed TLS-restore slots and include isolation tests to verify CPU-local behavior.
 - **External IRQ completion plumbing added:** external IRQ trap handling now saves/restores interrupt state around routing and calls an ISA-selected `external_irq_eoi` hook for controller completion handoff.

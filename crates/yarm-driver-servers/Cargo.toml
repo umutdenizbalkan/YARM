@@ -19,6 +19,11 @@ path = "src/bin/blkcache_srv.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
+name = "console_driver"
+path = "src/bin/console_driver.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
 name = "input_srv"
 path = "src/bin/input_srv.rs"
 required-features = ["hosted-dev"]

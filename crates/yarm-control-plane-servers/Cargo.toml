@@ -23,6 +23,11 @@ path = "src/bin/process_manager.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
+name = "driver_manager"
+path = "src/bin/driver_manager.rs"
+required-features = ["hosted-dev"]
+
+[[bin]]
 name = "vfs_server"
 path = "src/bin/vfs_server.rs"
 required-features = ["hosted-dev"]

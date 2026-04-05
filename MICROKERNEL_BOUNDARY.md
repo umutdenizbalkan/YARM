@@ -85,13 +85,16 @@ This is the concrete PR sequence for closing the boundary milestone.
 - PR-BND-1 and PR-BND-2 are complete (shared helper hardening + adoption).
 - PR-BND-3 is now complete through passes A-D (IPC core, capability/scheduler core, boot telemetry/capacity core, and bridge cleanup/lock tests).
 - PR-BND-4 has started with extracted server packages:
-  - `crates/yarm-driver-servers` (`blkcache_srv`, `input_srv`, `irqmux_srv`, `uart_srv`, `virtio_blk_srv`, `virtio_gpu_srv`, `virtio_net_srv`)
+  - `crates/yarm-driver-servers` (`blkcache_srv`, `console_driver`, `input_srv`, `irqmux_srv`, `uart_srv`, `virtio_blk_srv`, `virtio_gpu_srv`, `virtio_net_srv`)
   - `crates/yarm-ui-servers` (`compositor_srv`, `display_srv`, `shell_srv`)
   - `crates/yarm-compat-servers` (`supervisor_srv`, `posix_compat_srv`)
-  - `crates/yarm-control-plane-servers` (`init_server`, `process_manager`, `vfs_server`)
+  - `crates/yarm-control-plane-servers` (`init_server`, `process_manager`, `driver_manager`, `vfs_server`)
   - `crates/yarm-fs-servers` (`devfs_srv`, `ramfs_srv`, `initramfs_srv`, `ext4_srv`, `fat_srv`)
   - `crates/yarm-network-servers` (`dhcp_srv`, `dns_srv`, `netmgr_srv`, `socket_srv`, `tcpip_srv`)
 - Remaining milestone focus shifts to broader server crate extraction/rewiring completion (PR-BND-4), CI promotion to structural/type gates (PR-BND-5), and final stale-path cleanup/freeze (PR-BND-6).
+- Latest PR-BND-4 pass also moved remaining hosted service bins out of root package ownership:
+  - `console_driver` -> `crates/yarm-driver-servers`
+  - `driver_manager` -> `crates/yarm-control-plane-servers`
 
 ## Definition of done for the boundary milestone
 

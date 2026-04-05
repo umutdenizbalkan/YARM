@@ -33,18 +33,8 @@ yarm-kernel = { path = "crates/yarm-kernel" }
 yarm-srv-common = { path = "crates/yarm-srv-common" }
 
 [[bin]]
-name = "console_driver"
-path = "src/bin/console_driver.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
 name = "core_profile_smoke"
 path = "src/bin/core_profile_smoke.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
-name = "driver_manager"
-path = "src/bin/driver_manager.rs"
 required-features = ["hosted-dev"]
 
 [[bin]]
