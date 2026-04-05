@@ -6,6 +6,11 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
 
 ## Recent updates
 
+- **PR-B migration/polish pass closed on this branch:** service-side decode and control-plane call/reply helpers were fully consolidated onto shared workspace utilities:
+  - VFS reply decode ladders in `devfs` / `initramfs` / `ramfs` now use `yarm_srv_common::vfs_reply::VfsReply::{from_opcode_payload, as_u64}`.
+  - POSIX service hooks now use consistent decode/error-mapping paths (`decode_message_u64`, `decode_vfs_u64`, `decode_vfs_fd_i32`) with shared `VfsReply`.
+  - `services::control_plane::ipc_roundtrip::roundtrip_call_reply_with_budget` now centralizes reply-cap attach + timed call/reply choreography and is used by control-plane `vfs` and `process_manager`.
+  - Remaining compatibility decode shims (`VfsReply::from_message(...)`) in `services::init`, `services::fs::ext4`, and `services::fs::fat` were retired in favor of `yarm-srv-common` decode helpers.
 - **Stability tracker ST-1..ST-8 closed on this branch:** the previously-blocking bootstrap/runtime items are implemented and integrated:
   - ST-1 / CB-1: single-kernel boot flow (no dual `Bootstrap::init()` split between boot markers and init smoke path).
   - ST-2 / CB-3: x86_64 IDT assembly trap stub table with common GPR save/restore dispatch glue.
@@ -51,6 +56,7 @@ The kernel mechanism layer is now considered **complete for the current mileston
 With in-kernel mechanisms complete for this milestone, primary effort can now move to user-space components:
 
 1. continue maturing `InitService` launch/mount orchestration and recovery policy,
-2. harden the process-manager and VFS service surfaces around the frozen ABI modules,
+2. harden the process-manager and VFS service surfaces around the frozen ABI modules and shared roundtrip/decode helpers,
 3. expand driver server runtime and hardware adapters,
-4. grow Linux personality coverage and compatibility conformance.
+4. grow Linux personality coverage and compatibility conformance,
+5. complete crate split to a strict `yarm-kernel` + service crates boundary (remove residual single-crate visibility risk).
