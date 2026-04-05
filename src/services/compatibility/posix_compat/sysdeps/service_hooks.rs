@@ -36,11 +36,29 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
         }
     }
 
-    fn decode_u64(reply: Message) -> Result<usize, PosixErrno> {
+    fn decode_message_u64(reply: Message) -> Result<u64, PosixErrno> {
+        let payload = reply.as_slice();
+        if payload.len() < 8 {
+            return Err(PosixErrno::Inval);
+        }
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&payload[..8]);
+        Ok(u64::from_le_bytes(raw))
+    }
+
+    fn decode_vfs_u64(reply: Message) -> Result<usize, PosixErrno> {
         let value = VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
-            .map_err(|_| PosixErrno::Inval)?
+            .ok_or(PosixErrno::Inval)?
             .as_u64();
         usize::try_from(value).map_err(|_| PosixErrno::Inval)
+    }
+
+    fn decode_vfs_fd_i32(reply: Message) -> Result<i32, PosixErrno> {
+        let fd = VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
+            .ok_or(PosixErrno::Inval)?
+            .as_fd()
+            .ok_or(PosixErrno::Inval)?;
+        i32::try_from(fd).map_err(|_| PosixErrno::Inval)
     }
 
     pub fn clock_gettime_hook(&mut self) -> Result<u64, PosixErrno> {
@@ -70,8 +88,8 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
                 .map_err(|_| PosixErrno::Inval)?,
         );
         if let Ok(reply) = reply {
-            if let Ok(pid) = Self::decode_u64(reply) {
-                return Ok(pid as u64);
+            if let Ok(pid) = Self::decode_message_u64(reply) {
+                return Ok(pid);
             }
         }
         Ok(tid)
@@ -84,8 +102,8 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
                 .map_err(|_| PosixErrno::Inval)?,
         );
         if let Ok(reply) = reply {
-            if let Ok(ppid) = Self::decode_u64(reply) {
-                return Ok(ppid as u64);
+            if let Ok(ppid) = Self::decode_message_u64(reply) {
+                return Ok(ppid);
             }
         }
         Ok(tid.saturating_sub(1))
@@ -120,7 +138,7 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
                 .map_err(|_| PosixErrno::Inval)?,
             )
             .map_err(|_| PosixErrno::Inval)?;
-        i32::try_from(Self::decode_u64(reply)?).map_err(|_| PosixErrno::Inval)
+        Self::decode_vfs_fd_i32(reply)
     }
 
     pub fn socket_hook(
@@ -157,7 +175,7 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
                 .map_err(|_| PosixErrno::Inval)?,
             )
             .map_err(|_| PosixErrno::Inval)?;
-        Self::decode_u64(reply)
+        Self::decode_vfs_u64(reply)
     }
 
     pub fn write_hook(
@@ -183,7 +201,7 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
                 .map_err(|_| PosixErrno::Inval)?,
             )
             .map_err(|_| PosixErrno::Inval)?;
-        Self::decode_u64(reply)
+        Self::decode_vfs_u64(reply)
     }
 
     pub fn close_hook(&mut self, fd: i32) -> Result<(), PosixErrno> {
