@@ -83,11 +83,11 @@ With in-kernel mechanisms complete for this milestone, primary effort can now mo
 2. harden the process-manager and VFS service surfaces around the frozen ABI modules and shared roundtrip/decode helpers,
 3. expand driver server runtime and hardware adapters,
 4. grow Linux personality coverage and compatibility conformance,
-5. complete crate split to a strict `yarm-kernel` + service crates boundary (remove residual single-crate visibility risk).
+5. keep structural boundary gates green (`phase5-boundary-gates`) and prevent regression to direct kernel/server coupling.
 
-## Proposed PR sequence (remaining boundary work)
+## Boundary milestone PR sequence (completed archive)
 
-The following PR plan breaks down the remaining `shared-helper` hardening and `yarm-kernel` extraction work into mergeable slices.
+The following PR sequence is retained as an archive of the completed boundary closure work.
 
 ### PR-1: Shared-helper hardening baseline
 

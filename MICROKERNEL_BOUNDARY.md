@@ -57,9 +57,9 @@ Hardware access is modeled as capabilities held by normal servers.
 - `scripts/check-service-arch-boundary.sh` remains as a complementary source-shape guard (thin entry wrappers + denylisted imports), not the primary boundary mechanism.
 - Root package binary ownership is kernel bootstrap only (`kernel_boot`).
 
-## Remaining milestone PR list
+## Boundary milestone PR record (completed)
 
-This is the concrete PR sequence for closing the boundary milestone.
+This is the completed PR sequence that closed the boundary milestone.
 
 1. **PR-BND-1: Harden shared service helper contracts**
    - tighten `yarm-srv-common` helper invariants (decode strictness, timeout/cap-attach semantics, typed errors),
@@ -86,11 +86,11 @@ This is the concrete PR sequence for closing the boundary milestone.
 - Primary enforcement is structural/type-driven (crate graph + Rust visibility via extracted crates and CI boundary gates).
 - Source-shape guards remain as companion checks, not primary policy.
 
-### Current extraction progress snapshot
+### Extraction progress snapshot (final)
 
 - PR-BND-1 and PR-BND-2 are complete (shared helper hardening + adoption).
 - PR-BND-3 is now complete through passes A-D (IPC core, capability/scheduler core, boot telemetry/capacity core, and bridge cleanup/lock tests).
-- PR-BND-4 has started with extracted server packages:
+- PR-BND-4 extracted server packages:
   - `crates/yarm-driver-servers` (`blkcache_srv`, `console_driver`, `input_srv`, `irqmux_srv`, `uart_srv`, `virtio_blk_srv`, `virtio_gpu_srv`, `virtio_net_srv`)
   - `crates/yarm-ui-servers` (`compositor_srv`, `display_srv`, `shell_srv`)
   - `crates/yarm-compat-servers` (`supervisor_srv`, `posix_compat_srv`)
@@ -99,14 +99,13 @@ This is the concrete PR sequence for closing the boundary milestone.
   - `crates/yarm-network-servers` (`dhcp_srv`, `dns_srv`, `netmgr_srv`, `socket_srv`, `tcpip_srv`)
   - `crates/yarm-runtime-tools` (`core_profile_smoke`)
   - `crates/yarm-server-runtime` (server entry wrapper surface used by extracted server-bin crates)
-- PR-BND-4 is complete through passes A-F (server bin extraction, root ownership cleanup, `yarm-server-runtime` rewiring bridge, and dependency-wiring closeout checks).
-- Remaining milestone focus shifts to CI promotion to structural/type gates (PR-BND-5) and final stale-path cleanup/freeze (PR-BND-6).
-- Latest PR-BND-4 pass also moved remaining hosted service bins out of root package ownership:
+- PR-BND-4 complete through passes A-F (server bin extraction, root ownership cleanup, `yarm-server-runtime` rewiring bridge, and dependency-wiring closeout checks).
+- Latest PR-BND-4 passes also moved remaining hosted service bins out of root package ownership:
   - `console_driver` -> `crates/yarm-driver-servers`
   - `driver_manager` -> `crates/yarm-control-plane-servers`
 - Root package bin ownership is now kernel bootstrap only (`kernel_boot`).
 - PR-BND-4 pass E rewired extracted server crates to call `yarm-server-runtime` wrappers instead of root `yarm` paths directly at bin-entry level.
-- PR-BND-4 pass F added `scripts/check-server-crate-deps.sh` to fail if extracted server crates depend on root `yarm` directly instead of `yarm-server-runtime`.
+- PR-BND-4 pass F added `scripts/check-server-crate-deps.sh` (later retired in PR-BND-6 pass A after crate-graph gate promotion).
 - PR-BND-5 pass A started with a crate-graph gate (`scripts/check-crate-graph-boundary.py`) that validates dependency edges via `cargo metadata` instead of source-path greps.
 - PR-BND-5 pass B landed with CI wiring (`scripts/phase5-boundary-gates.sh` + `phase5-boundary-gates` workflow job) to run structural boundary scripts and extracted server compile checks.
 - PR-BND-5 pass C promoted `phase5-boundary-gates` to required readiness/workflow token checks (`check-ci-workflow-enforcement`, `check-roadmap-readiness`, and `PHASE_READINESS_MATRIX`).
