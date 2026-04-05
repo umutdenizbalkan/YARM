@@ -6,6 +6,16 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
 
 ## Recent updates
 
+- **Stability tracker ST-1..ST-8 closed on this branch:** the previously-blocking bootstrap/runtime items are implemented and integrated:
+  - ST-1 / CB-1: single-kernel boot flow (no dual `Bootstrap::init()` split between boot markers and init smoke path).
+  - ST-2 / CB-3: x86_64 IDT assembly trap stub table with common GPR save/restore dispatch glue.
+  - ST-3 / CB-2: canonical higher-half x86_64 split (`KERNEL_SPACE_BASE = 0xFFFF_8000_0000_0000`) with dependent constant/linker updates.
+  - ST-4 / H-3: ELF64 parser now validates header/program-header structure and `PT_LOAD` bounds instead of magic+entry-only parsing.
+  - ST-5 / CB-4: `syscall/sysret` fast-path wired (MSR programming + LSTAR entry), with `int 0x80` compatibility path retained.
+  - ST-6 / MISS-1: demand paging path added for qualifying user page faults (heap/brk and bounded stack-growth windows).
+  - ST-7 / CB-5: external IRQ decode range widened to platform-configured IRQ line count (64 lines currently).
+  - ST-8 / CB-6: bootstrap now programs SMEP/SMAP/NXE correctly and safely (CPUID-gated to avoid unsupported-bit boot faults).
+- **Boot-regression follow-up merged:** the post-hardening halt after serial marker `B` is addressed by CPUID-gating SMEP/SMAP/NXE writes before CR4/EFER updates in `pvh_start32`.
 - **Unsupported ISA guardrails tightened:** architecture facade fallbacks now fail fast with `compile_error!` for unsupported `target_arch` values instead of silently selecting a RISC-V path.
 - **Trap decode correctness improved:** unknown architecture trap codes are normalized as `TrapEvent::Unknown { arch_code }` instead of being coerced into external IRQ semantics.
 - **Per-CPU TLS restore observability:** architecture trap paths now expose CPU-indexed TLS-restore slots and include isolation tests to verify CPU-local behavior.
