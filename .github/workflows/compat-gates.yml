@@ -39,6 +39,14 @@ jobs:
       - name: enforce service domain ownership boundaries
         run: scripts/check-service-domain-ownership.sh
 
+  phase5-boundary-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: phase5 crate-graph + server dependency + compile boundary gates
+        run: scripts/phase5-boundary-gates.sh
+
   roadmap-readiness-check:
     runs-on: ubuntu-latest
     steps:
