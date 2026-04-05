@@ -189,7 +189,7 @@ fn debug_uart_marker(byte: u8) {
 }
 
 #[inline]
-fn run_boot_markers() {
+fn run_boot_markers() -> yarm::kernel::boot::KernelState {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     {
         debug_uart_marker(b'H');
@@ -217,14 +217,15 @@ fn run_boot_markers() {
     );
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     debug_uart_marker(b'K');
+
+    kernel
 }
 
 #[cfg(not(test))]
-fn run_process_vfs_smoke() {
+fn run_process_vfs_smoke(kernel: &mut yarm::kernel::boot::KernelState) {
     yarm::yarm_log!("YARM_INIT_START");
-    let mut kernel = Bootstrap::init().expect("init");
     let summary = match init::run_minimum_profile_with_kernel(
-        &mut kernel,
+        kernel,
         init::InitRuntimeBootConfig::baseline(),
     ) {
         Ok(summary) => summary,
@@ -251,10 +252,13 @@ fn run_process_vfs_smoke() {
 }
 
 fn run() {
-    run_boot_markers();
-
     #[cfg(not(test))]
-    run_process_vfs_smoke();
+    {
+        let mut kernel = run_boot_markers();
+        run_process_vfs_smoke(&mut kernel);
+    }
+    #[cfg(test)]
+    let _ = run_boot_markers();
 
     #[cfg(not(feature = "hosted-dev"))]
     loop {
