@@ -9,10 +9,10 @@ use crate::kernel::vfs::{
     read_message, write_message,
 };
 use crate::services::common::service::FsService;
-use crate::services::common::vfs_service::VfsReply;
 use crate::services::compatibility::posix_compat::PosixErrno;
 use crate::services::network::socket::service::SocketAdapterService;
 use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
+use yarm_srv_common::vfs_reply::VfsReply;
 
 pub struct PosixSysdepsContext<'a, B: VfsBackend> {
     pub kernel: &'a mut KernelState,
@@ -37,7 +37,7 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
     }
 
     fn decode_u64(reply: Message) -> Result<usize, PosixErrno> {
-        let value = VfsReply::from_message(reply)
+        let value = VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
             .map_err(|_| PosixErrno::Inval)?
             .as_u64();
         usize::try_from(value).map_err(|_| PosixErrno::Inval)

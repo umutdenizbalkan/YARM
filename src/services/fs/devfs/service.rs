@@ -7,10 +7,10 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, openat_message, statx_message, write_message,
 };
 use crate::services::common::service::{FsService, run_typed_request_loop};
-use crate::services::common::vfs_service::VfsReply;
 use crate::services::fs::devfs::nodes::{
     DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend, DevFsMetrics,
 };
+use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type DevFsService = FsService<DevFsBackend>;
 
@@ -23,7 +23,7 @@ pub struct DevFsLoopSummary {
 }
 
 fn decode_reply_u64(reply: Message) -> u64 {
-    match VfsReply::from_message(reply).expect("decode vfs reply") {
+    match VfsReply::from_opcode_payload(reply.opcode, reply.as_slice()).expect("decode vfs reply") {
         VfsReply::OpenAtFd(value)
         | VfsReply::CloseResult(value)
         | VfsReply::ReadLen(value)
@@ -274,9 +274,10 @@ mod tests {
                 .expect("open"),
             )
             .expect("open reply");
-        let console_fd = VfsReply::from_message(open_console)
-            .expect("decode open")
-            .as_u64();
+        let console_fd =
+            VfsReply::from_opcode_payload(open_console.opcode, open_console.as_slice())
+                .expect("decode open")
+                .as_u64();
         assert_eq!(console_fd, 3);
 
         let _ = svc

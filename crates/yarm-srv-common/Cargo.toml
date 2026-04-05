@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "yarm-srv-common"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+yarm-ipc-abi = { path = "../yarm-ipc-abi" }

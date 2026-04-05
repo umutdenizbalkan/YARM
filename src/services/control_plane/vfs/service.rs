@@ -11,7 +11,7 @@ use crate::kernel::vfs::{
     write_message,
 };
 use crate::services::common::service::{FsService, run_typed_request_loop};
-use crate::services::common::vfs_service::VfsReply;
+use yarm_srv_common::vfs_reply::VfsReply;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfsLoopSummary {
@@ -24,7 +24,9 @@ pub struct VfsLoopSummary {
 const VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 
 fn decode_fd_reply(reply: crate::kernel::ipc::Message) -> Result<u64, VfsError> {
-    match VfsReply::from_message(reply)? {
+    match VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
+        .ok_or(VfsError::Malformed)?
+    {
         VfsReply::OpenAtFd(fd) | VfsReply::DupFd(fd) | VfsReply::EpollFd(fd) => Ok(fd),
         _ => Err(VfsError::Malformed),
     }
@@ -137,9 +139,8 @@ fn roundtrip_call_reply_with_budget<B: VfsBackend>(
 ) -> Result<crate::kernel::ipc::Message, VfsError> {
     let caller_tid =
         crate::kernel::ipc::ThreadId(kernel.current_tid().ok_or(VfsError::Unsupported)?);
-    let reply_cap = map_kernel_ipc_err(
-        kernel.create_reply_cap_for_caller(caller_tid, client_recv_cap, None),
-    )?;
+    let reply_cap =
+        map_kernel_ipc_err(kernel.create_reply_cap_for_caller(caller_tid, client_recv_cap, None))?;
     let request_with_reply_cap = crate::kernel::ipc::Message::with_header(
         request.sender_tid.0,
         request.opcode,
@@ -150,10 +151,9 @@ fn roundtrip_call_reply_with_budget<B: VfsBackend>(
     .map_err(|_| VfsError::Malformed)?;
 
     map_kernel_ipc_err(kernel.ipc_send(client_send_cap, request_with_reply_cap))?;
-    let request_for_server = map_kernel_ipc_err(
-        kernel.ipc_recv_with_deadline(server_recv_cap, recv_timeout_ticks),
-    )?
-    .ok_or(VfsError::Malformed)?;
+    let request_for_server =
+        map_kernel_ipc_err(kernel.ipc_recv_with_deadline(server_recv_cap, recv_timeout_ticks))?
+            .ok_or(VfsError::Malformed)?;
     let reply_cap = request_for_server
         .transferred_cap()
         .map(|cap| CapId(cap.0))
@@ -364,7 +364,8 @@ mod tests {
         let (_, _client_send_cap, server_recv_cap) =
             map_kernel_ipc_err(kernel.create_endpoint(8)).expect("req endpoint");
 
-        let timed = kernel.ipc_recv_with_deadline(server_recv_cap, VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS);
+        let timed =
+            kernel.ipc_recv_with_deadline(server_recv_cap, VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS);
         assert_eq!(timed, Ok(None));
         let fired = kernel
             .consume_ipc_timeout_fired_for_tid(0)
@@ -395,7 +396,9 @@ mod tests {
         )
         .expect("roundtrip");
         assert_eq!(
-            VfsReply::from_message(reply).expect("decode"),
+            VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
+                .ok_or(VfsError::Malformed)
+                .expect("decode"),
             VfsReply::OpenAtFd(3)
         );
     }
@@ -467,7 +470,7 @@ mod tests {
         )
         .expect("write devfs");
         assert_eq!(
-            VfsReply::from_message(write_dev).expect("decode"),
+            VfsReply::from_opcode_payload(write_dev.opcode, write_dev.as_slice()).expect("decode"),
             VfsReply::WriteLen(9)
         );
 
@@ -505,7 +508,7 @@ mod tests {
         )
         .expect("read ramfs");
         assert_eq!(
-            VfsReply::from_message(read_ram).expect("decode"),
+            VfsReply::from_opcode_payload(read_ram.opcode, read_ram.as_slice()).expect("decode"),
             VfsReply::ReadLen(0)
         );
     }
@@ -592,7 +595,8 @@ mod tests {
         )
         .expect("read null reply");
         assert_eq!(
-            VfsReply::from_message(dev_null_read).expect("decode"),
+            VfsReply::from_opcode_payload(dev_null_read.opcode, dev_null_read.as_slice())
+                .expect("decode"),
             VfsReply::ReadLen(0)
         );
 
@@ -631,7 +635,8 @@ mod tests {
         )
         .expect("write console reply");
         assert_eq!(
-            VfsReply::from_message(dev_console_write).expect("decode"),
+            VfsReply::from_opcode_payload(dev_console_write.opcode, dev_console_write.as_slice())
+                .expect("decode"),
             VfsReply::WriteLen(17)
         );
 
@@ -687,7 +692,12 @@ mod tests {
             .expect("stat ramfs"),
         )
         .expect("stat ramfs reply");
-        assert!(VfsReply::from_message(ram_stat).expect("decode").as_u64() > 0);
+        assert!(
+            VfsReply::from_opcode_payload(ram_stat.opcode, ram_stat.as_slice())
+                .expect("decode")
+                .as_u64()
+                > 0
+        );
 
         // Initramfs: read succeeds (bounded by file length) and write is rejected.
         let mut initramfs = FsService::with_backend(InitramfsBackend::new(4096));
@@ -726,7 +736,7 @@ mod tests {
         )
         .expect("read init reply");
         assert_eq!(
-            VfsReply::from_message(init_read).expect("decode"),
+            VfsReply::from_opcode_payload(init_read.opcode, init_read.as_slice()).expect("decode"),
             VfsReply::ReadLen(4096)
         );
         let init_write = roundtrip_ipc(
