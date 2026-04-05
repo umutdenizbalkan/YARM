@@ -66,17 +66,159 @@ pub struct ElfImageInfo {
 }
 
 impl ElfImageInfo {
+    const EI_CLASS: usize = 4;
+    const EI_DATA: usize = 5;
+    const EI_OSABI: usize = 7;
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const ELFDATA2MSB: u8 = 2;
+    const ELFOSABI_SYSV: u8 = 0;
+    const ELFOSABI_GNU: u8 = 3;
+    const ELFOSABI_STANDALONE: u8 = 255;
+    const ET_EXEC: u16 = 2;
+    const ET_DYN: u16 = 3;
+    const PT_LOAD: u32 = 1;
+    const ELF64_EHDR_SIZE: usize = 64;
+    const ELF64_PHDR_SIZE: usize = 56;
+
+    fn read_u16(image: &[u8], offset: usize, big_endian: bool) -> Result<u16, ProcessManagerError> {
+        let end = offset
+            .checked_add(2)
+            .ok_or(ProcessManagerError::Malformed)?;
+        let bytes = image.get(offset..end).ok_or(ProcessManagerError::Malformed)?;
+        let mut raw = [0u8; 2];
+        raw.copy_from_slice(bytes);
+        Ok(if big_endian {
+            u16::from_be_bytes(raw)
+        } else {
+            u16::from_le_bytes(raw)
+        })
+    }
+
+    fn read_u32(image: &[u8], offset: usize, big_endian: bool) -> Result<u32, ProcessManagerError> {
+        let end = offset
+            .checked_add(4)
+            .ok_or(ProcessManagerError::Malformed)?;
+        let bytes = image.get(offset..end).ok_or(ProcessManagerError::Malformed)?;
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(bytes);
+        Ok(if big_endian {
+            u32::from_be_bytes(raw)
+        } else {
+            u32::from_le_bytes(raw)
+        })
+    }
+
+    fn read_u64(image: &[u8], offset: usize, big_endian: bool) -> Result<u64, ProcessManagerError> {
+        let end = offset
+            .checked_add(8)
+            .ok_or(ProcessManagerError::Malformed)?;
+        let bytes = image.get(offset..end).ok_or(ProcessManagerError::Malformed)?;
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(bytes);
+        Ok(if big_endian {
+            u64::from_be_bytes(raw)
+        } else {
+            u64::from_le_bytes(raw)
+        })
+    }
+
+    fn expected_machine() -> u16 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            return 0x3E;
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            return 0xF3;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            return 0xB7;
+        }
+        #[allow(unreachable_code)]
+        0
+    }
+
     pub fn parse(image_id: u64, image: &[u8]) -> Result<Self, ProcessManagerError> {
-        if image.len() < 32 {
+        if image.len() < Self::ELF64_EHDR_SIZE {
             return Err(ProcessManagerError::Malformed);
         }
         if &image[..4] != b"\x7FELF" {
             return Err(ProcessManagerError::Malformed);
         }
-        let mut entry = [0u8; 8];
-        entry.copy_from_slice(&image[24..32]);
+        if image[Self::EI_CLASS] != Self::ELFCLASS64 {
+            return Err(ProcessManagerError::Unsupported);
+        }
+        let data = image[Self::EI_DATA];
+        let big_endian = match data {
+            Self::ELFDATA2LSB => false,
+            Self::ELFDATA2MSB => true,
+            _ => return Err(ProcessManagerError::Unsupported),
+        };
+        match image[Self::EI_OSABI] {
+            Self::ELFOSABI_SYSV | Self::ELFOSABI_GNU | Self::ELFOSABI_STANDALONE => {}
+            _ => return Err(ProcessManagerError::Unsupported),
+        }
+
+        let e_type = Self::read_u16(image, 16, big_endian)?;
+        if e_type != Self::ET_EXEC && e_type != Self::ET_DYN {
+            return Err(ProcessManagerError::Unsupported);
+        }
+        let e_machine = Self::read_u16(image, 18, big_endian)?;
+        if e_machine != Self::expected_machine() {
+            return Err(ProcessManagerError::Unsupported);
+        }
+
+        let entry = Self::read_u64(image, 24, big_endian)?;
+        let phoff = Self::read_u64(image, 32, big_endian)? as usize;
+        let phentsize = Self::read_u16(image, 54, big_endian)? as usize;
+        let phnum = Self::read_u16(image, 56, big_endian)? as usize;
+        if phnum == 0 || phentsize < Self::ELF64_PHDR_SIZE {
+            return Err(ProcessManagerError::Malformed);
+        }
+        let ph_table_size = phnum
+            .checked_mul(phentsize)
+            .ok_or(ProcessManagerError::Malformed)?;
+        let ph_end = phoff
+            .checked_add(ph_table_size)
+            .ok_or(ProcessManagerError::Malformed)?;
+        if ph_end > image.len() {
+            return Err(ProcessManagerError::Malformed);
+        }
+
+        let mut load_segments = 0usize;
+        for idx in 0..phnum {
+            let base = phoff
+                .checked_add(idx.checked_mul(phentsize).ok_or(ProcessManagerError::Malformed)?)
+                .ok_or(ProcessManagerError::Malformed)?;
+            let p_type = Self::read_u32(image, base, big_endian)?;
+            if p_type != Self::PT_LOAD {
+                continue;
+            }
+            load_segments = load_segments.saturating_add(1);
+            let p_offset = Self::read_u64(image, base + 8, big_endian)? as usize;
+            let _p_vaddr = Self::read_u64(image, base + 16, big_endian)?;
+            let _p_paddr = Self::read_u64(image, base + 24, big_endian)?;
+            let p_filesz = Self::read_u64(image, base + 32, big_endian)? as usize;
+            let p_memsz = Self::read_u64(image, base + 40, big_endian)? as usize;
+            let _p_flags = Self::read_u32(image, base + 4, big_endian)?;
+            if p_filesz > p_memsz {
+                return Err(ProcessManagerError::Malformed);
+            }
+            let seg_end = p_offset
+                .checked_add(p_filesz)
+                .ok_or(ProcessManagerError::Malformed)?;
+            if seg_end > image.len() {
+                return Err(ProcessManagerError::Malformed);
+            }
+        }
+        if load_segments == 0 {
+            return Err(ProcessManagerError::Malformed);
+        }
+
         Ok(Self {
-            entry: u64::from_le_bytes(entry),
+            entry,
             image_id,
         })
     }
@@ -261,11 +403,34 @@ impl ProcessManager {
     }
 
     #[cfg(test)]
-    fn synthetic_elf_image(image_id: u64) -> [u8; 64] {
-        let mut image = [0u8; 64];
+    fn synthetic_elf_image(image_id: u64) -> [u8; 128] {
+        let mut image = [0u8; 128];
         image[..4].copy_from_slice(b"\x7FELF");
+        image[4] = 2; // ELFCLASS64
+        image[5] = 1; // little-endian
+        image[6] = 1; // version
+        image[7] = 0; // SYSV ABI
+        image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        image[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        image[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
         let entry = 0x400000u64.saturating_add(image_id.saturating_mul(0x1000));
         image[24..32].copy_from_slice(&entry.to_le_bytes());
+        image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        image[52..54].copy_from_slice(&(64u16).to_le_bytes()); // e_ehsize
+        image[54..56].copy_from_slice(&(56u16).to_le_bytes()); // e_phentsize
+        image[56..58].copy_from_slice(&(1u16).to_le_bytes()); // e_phnum
+
+        // Single PT_LOAD segment.
+        let ph = 64usize;
+        image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        image[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // RX
+        image[ph + 8..ph + 16].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        image[ph + 16..ph + 24].copy_from_slice(&(entry & !0xFFF).to_le_bytes()); // p_vaddr
+        image[ph + 24..ph + 32].copy_from_slice(&0u64.to_le_bytes()); // p_paddr
+        image[ph + 32..ph + 40].copy_from_slice(&8u64.to_le_bytes()); // p_filesz
+        image[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes()); // p_memsz
+        image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        image[120..128].copy_from_slice(&[0x90; 8]);
         image
     }
 
@@ -467,8 +632,7 @@ mod tests {
 
     #[test]
     fn elf_image_info_parser_accepts_minimal_elf64_header() {
-        let mut image = [0u8; 64];
-        image[..4].copy_from_slice(b"\x7FELF");
+        let mut image = ProcessManager::synthetic_elf_image(1);
         image[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
         let info = ElfImageInfo::parse(7, &image).expect("elf");
         assert_eq!(info.image_id, 7);
@@ -478,8 +642,7 @@ mod tests {
     #[test]
     fn spawn_from_elf_image_allocates_pid_and_returns_entry() {
         let mut pm = ProcessManager::new();
-        let mut image = [0u8; 64];
-        image[..4].copy_from_slice(b"\x7FELF");
+        let mut image = ProcessManager::synthetic_elf_image(2);
         image[24..32].copy_from_slice(&0x402000u64.to_le_bytes());
 
         let (pid, info) = pm
@@ -507,6 +670,36 @@ mod tests {
                 parent_pid: ProcessId(7),
                 image_id: 99,
             })
+        );
+    }
+
+    #[test]
+    fn elf_parser_rejects_non_elf64_class() {
+        let mut image = ProcessManager::synthetic_elf_image(1);
+        image[4] = 1;
+        assert_eq!(
+            ElfImageInfo::parse(1, &image),
+            Err(ProcessManagerError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn elf_parser_rejects_wrong_machine() {
+        let mut image = ProcessManager::synthetic_elf_image(1);
+        image[18..20].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            ElfImageInfo::parse(1, &image),
+            Err(ProcessManagerError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn elf_parser_rejects_missing_load_segments() {
+        let mut image = ProcessManager::synthetic_elf_image(1);
+        image[64..68].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            ElfImageInfo::parse(1, &image),
+            Err(ProcessManagerError::Malformed)
         );
     }
 
