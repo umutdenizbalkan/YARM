@@ -80,6 +80,12 @@ This is the concrete PR sequence for closing the boundary milestone.
    - remove stale paths/compat layers after extraction,
    - update boundary docs and declare strict separation complete.
 
+## Boundary milestone status
+
+- ✅ **COMPLETE**: PR-BND-1 through PR-BND-6 are now landed on this branch.
+- Primary enforcement is structural/type-driven (crate graph + Rust visibility via extracted crates and CI boundary gates).
+- Source-shape guards remain as companion checks, not primary policy.
+
 ### Current extraction progress snapshot
 
 - PR-BND-1 and PR-BND-2 are complete (shared helper hardening + adoption).
@@ -106,6 +112,7 @@ This is the concrete PR sequence for closing the boundary milestone.
 - PR-BND-5 pass C promoted `phase5-boundary-gates` to required readiness/workflow token checks (`check-ci-workflow-enforcement`, `check-roadmap-readiness`, and `PHASE_READINESS_MATRIX`).
 - PR-BND-6 pass A started by removing redundant transitional dependency script (`check-server-crate-deps.sh`) now that crate-graph enforcement is active (`check-crate-graph-boundary.py`).
 - PR-BND-6 pass B landed by rewriting stale single-crate transition text to reflect the current enforcement model (crate-graph primary + source-shape companion guard).
+- PR-BND-6 pass C landed by locking a completion marker + freeze checks (`scripts/check-boundary-milestone-freeze.sh`) into the boundary gate path.
 
 ## Definition of done for the boundary milestone
 
