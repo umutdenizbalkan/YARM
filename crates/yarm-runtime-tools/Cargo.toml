@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "yarm-runtime-tools"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[features]
+default = ["hosted-dev"]
+hosted-dev = []
+
+[dependencies]
+yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
+
+[[bin]]
+name = "core_profile_smoke"
+path = "src/bin/core_profile_smoke.rs"
+required-features = ["hosted-dev"]

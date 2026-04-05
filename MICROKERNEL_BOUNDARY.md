@@ -91,10 +91,12 @@ This is the concrete PR sequence for closing the boundary milestone.
   - `crates/yarm-control-plane-servers` (`init_server`, `process_manager`, `driver_manager`, `vfs_server`)
   - `crates/yarm-fs-servers` (`devfs_srv`, `ramfs_srv`, `initramfs_srv`, `ext4_srv`, `fat_srv`)
   - `crates/yarm-network-servers` (`dhcp_srv`, `dns_srv`, `netmgr_srv`, `socket_srv`, `tcpip_srv`)
+  - `crates/yarm-runtime-tools` (`core_profile_smoke`)
 - Remaining milestone focus shifts to broader server crate extraction/rewiring completion (PR-BND-4), CI promotion to structural/type gates (PR-BND-5), and final stale-path cleanup/freeze (PR-BND-6).
 - Latest PR-BND-4 pass also moved remaining hosted service bins out of root package ownership:
   - `console_driver` -> `crates/yarm-driver-servers`
   - `driver_manager` -> `crates/yarm-control-plane-servers`
+- Root package bin ownership is now kernel bootstrap only (`kernel_boot`).
 
 ## Definition of done for the boundary milestone
 

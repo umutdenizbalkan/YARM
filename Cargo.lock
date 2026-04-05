@@ -56,6 +56,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yarm-runtime-tools"
+version = "0.1.0"
+dependencies = [
+ "yarm",
+]
+
+[[package]]
 name = "yarm-srv-common"
 version = "0.1.0"
 dependencies = [

@@ -18,6 +18,7 @@ members = [
     "crates/yarm-driver-servers",
     "crates/yarm-ui-servers",
     "crates/yarm-compat-servers",
+    "crates/yarm-runtime-tools",
 ]
 resolver = "2"
 
@@ -31,11 +32,6 @@ linux-compat = ["posix-compat"]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }
 yarm-kernel = { path = "crates/yarm-kernel" }
 yarm-srv-common = { path = "crates/yarm-srv-common" }
-
-[[bin]]
-name = "core_profile_smoke"
-path = "src/bin/core_profile_smoke.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "kernel_boot"
