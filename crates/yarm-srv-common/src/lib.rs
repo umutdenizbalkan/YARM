@@ -3,4 +3,5 @@
 
 #![no_std]
 
+pub mod decode;
 pub mod vfs_reply;
