@@ -58,11 +58,15 @@ pub enum PageTableError {
 #[derive(Clone, Copy)]
 struct PageTablePage {
     phys: u64,
+    entries: [PageTableEntry; ENTRIES_PER_TABLE],
 }
 
 impl PageTablePage {
     const fn new(phys: u64) -> Self {
-        Self { phys }
+        Self {
+            phys,
+            entries: [PageTableEntry::empty(); ENTRIES_PER_TABLE],
+        }
     }
 }
 
@@ -99,10 +103,6 @@ impl PageTableState {
         for (idx, slot) in self.pages.iter_mut().enumerate() {
             if slot.is_none() {
                 let phys = alloc_pt_frame().map_err(|_| PageTableError::OutOfMemory)?;
-                #[cfg(all(not(feature = "hosted-dev"), not(test)))]
-                unsafe {
-                    core::ptr::write_bytes(phys as *mut u8, 0, vm_layout::PAGE_SIZE);
-                }
                 *slot = Some(PageTablePage::new(phys));
                 return Ok(idx);
             }
@@ -424,11 +424,8 @@ fn read_table_entry(
     if index >= ENTRIES_PER_TABLE {
         return None;
     }
-    state.page_index_from_phys(table_phys)?;
-    unsafe {
-        let ptr = (table_phys as usize + index * core::mem::size_of::<u64>()) as *const u64;
-        Some(PageTableEntry(core::ptr::read_volatile(ptr)))
-    }
+    let table_idx = state.page_index_from_phys(table_phys)?;
+    Some(state.pages[table_idx].as_ref()?.entries[index])
 }
 
 fn write_table_entry(
@@ -440,23 +437,23 @@ fn write_table_entry(
     if index >= ENTRIES_PER_TABLE {
         return Err(PageTableError::InvalidAddress);
     }
-    state
+    let table_idx = state
         .page_index_from_phys(table_phys)
         .ok_or(PageTableError::InvalidAddress)?;
-    unsafe {
-        let ptr = (table_phys as usize + index * core::mem::size_of::<u64>()) as *mut u64;
-        core::ptr::write_volatile(ptr, entry.0);
+    if let Some(table) = state.pages[table_idx].as_mut() {
+        table.entries[index] = entry;
+        return Ok(());
     }
-    Ok(())
+    return Err(PageTableError::InvalidAddress);
 }
 
 pub fn invalidate_page(virt: VirtAddr) {
-    #[cfg(feature = "hosted-dev")]
+    #[cfg(any(feature = "hosted-dev", test))]
     {
         let _ = virt;
     }
 
-    #[cfg(not(feature = "hosted-dev"))]
+    #[cfg(all(not(feature = "hosted-dev"), not(test)))]
     unsafe {
         core::arch::asm!("invlpg [{addr}]", addr = in(reg) virt.0 as usize, options(nostack, preserves_flags));
     }
@@ -475,12 +472,12 @@ pub fn invalidate_asid(asid: Asid) {
         *LAST_INVALIDATED_ASID.lock() = Some(asid);
     }
 
-    #[cfg(feature = "hosted-dev")]
+    #[cfg(any(feature = "hosted-dev", test))]
     {
         let _ = asid;
     }
 
-    #[cfg(not(feature = "hosted-dev"))]
+    #[cfg(all(not(feature = "hosted-dev"), not(test)))]
     unsafe {
         let pcid = {
             let state = PAGE_TABLE_STATE.lock();
