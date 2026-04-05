@@ -7,10 +7,10 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, openat_message, read_message, statx_message, write_message,
 };
 use crate::services::common::service::{FsService, run_typed_request_loop};
-use crate::services::common::vfs_service::VfsReply;
 use crate::services::fs::initramfs::archive::{
     INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend, InitramfsMetrics,
 };
+use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type InitramfsService = FsService<InitramfsBackend>;
 
@@ -25,21 +25,9 @@ pub struct InitramfsLoopSummary {
 }
 
 fn decode_reply_u64(reply: Message) -> u64 {
-    match VfsReply::from_message(reply).expect("decode vfs reply") {
-        VfsReply::OpenAtFd(value)
-        | VfsReply::CloseResult(value)
-        | VfsReply::ReadLen(value)
-        | VfsReply::WriteLen(value)
-        | VfsReply::StatxValue(value)
-        | VfsReply::IoctlResult(value)
-        | VfsReply::DupFd(value)
-        | VfsReply::FcntlResult(value)
-        | VfsReply::PollEvents(value)
-        | VfsReply::EpollFd(value)
-        | VfsReply::EpollCtlResult(value)
-        | VfsReply::EpollWaitEvents(value)
-        | VfsReply::SendfileLen(value) => value,
-    }
+    VfsReply::from_opcode_payload(reply.opcode, reply.as_slice())
+        .expect("decode vfs reply")
+        .as_u64()
 }
 
 fn scripted_bootstrap_requests() -> Result<[Message; 1], VfsError> {
