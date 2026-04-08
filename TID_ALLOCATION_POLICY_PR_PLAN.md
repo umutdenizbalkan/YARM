@@ -19,7 +19,7 @@ Define and enforce a clear split between static/bootstrap TIDs and dynamically a
    - Add policy-aware telemetry (`dynamic_tid_allocations`, `dynamic_tid_wraps`, `gap_floor_repairs`).
    - Emit structured boot-time diagnostics for configured policy boundaries.
 
-4. **Phase 4 — static/dynamic boundary validation in CI**
+4. **Phase 4 — static/dynamic boundary validation in CI (completed)**
    - Add tests/check scripts that fail if dynamic allocation returns a TID below floor.
    - Include a targeted kernel test suite command in CI for TID policy invariants.
 

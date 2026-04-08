@@ -47,6 +47,14 @@ jobs:
       - name: phase5 crate-graph + server dependency + compile boundary gates
         run: scripts/phase5-boundary-gates.sh
 
+  tid-allocation-policy-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: enforce dynamic tid floor/wrap/telemetry invariants
+        run: scripts/check-tid-allocation-policy.sh
+
   roadmap-readiness-check:
     runs-on: ubuntu-latest
     steps:
