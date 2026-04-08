@@ -58,3 +58,23 @@ Phase 2 includes deterministic tests for:
 - valid manifest decode with all required entries,
 - duplicate/missing path rejection,
 - corrupt zero `entry_addr` / zero `file_len` rejection.
+
+## Phase 3 integration: ELF validation + load-segment extraction
+
+`build_core_service_elf_launch_plan(...)` consumes:
+
+- a validated manifest payload, and
+- image bytes keyed by manifest `path_ptr`.
+
+For each core service image, it performs:
+
+1. strict ELF validation via `ElfImageInfo::parse(...)`,
+2. entry-address cross-check (`ELF e_entry` must match manifest `entry_addr`),
+3. PT_LOAD extraction into a fixed-size segment plan.
+
+The function rejects launch planning when:
+
+- image payload is missing for any required core-service path,
+- image byte length does not match manifest `file_len`,
+- ELF validation fails,
+- PT_LOAD table is malformed or exceeds bounded segment capacity.

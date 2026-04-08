@@ -11,6 +11,8 @@ pub use archive::{
     InitramfsBackend, InitramfsMetrics,
 };
 pub use manifest::{
-    CoreServiceImageManifest, InitramfsManifestError, ManifestEntryWire, parse_core_service_manifest,
+    CoreServiceElfLaunchPlan, CoreServiceImageManifest, ElfLoadSegmentPlan, InitramfsManifestError,
+    ManifestEntryWire, ServiceElfLaunchPlan, build_core_service_elf_launch_plan,
+    parse_core_service_manifest,
 };
 pub use service::{InitramfsService, run};
