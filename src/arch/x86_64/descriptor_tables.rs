@@ -344,7 +344,7 @@ pub fn register_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState)
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn raw_current_apic_id() -> u32 {
-    core::arch::x86_64::__cpuid(1).ebx >> 24
+    unsafe { core::arch::x86_64::__cpuid(1).ebx >> 24 }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
