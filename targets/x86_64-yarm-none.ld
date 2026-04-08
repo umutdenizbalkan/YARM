@@ -12,6 +12,10 @@ PHDRS {
 }
 
 SECTIONS {
+  .ap_trampoline 0x7000 : AT(0x7000) {
+    KEEP(*(.text.ap_trampoline))
+  } :text
+
   . = 0x100000;
   __kernel_start = .;
   __kernel_rx_start = .;
