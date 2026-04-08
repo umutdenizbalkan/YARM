@@ -7,6 +7,8 @@ use crate::arch::x86_64::vm_layout;
 use crate::kernel::frame_allocator::{alloc_pt_frame, free_pt_frame};
 use crate::kernel::lock::SpinLockIrq;
 use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr};
+#[cfg(not(feature = "hosted-dev"))]
+use core::sync::atomic::{AtomicU8, Ordering};
 
 const ENTRIES_PER_TABLE: usize = 512;
 const PAGE_SIZE_U64: u64 = vm_layout::PAGE_SIZE as u64;
@@ -510,6 +512,51 @@ struct InvpcidDescriptor {
     addr: u64,
 }
 
+
+#[cfg(not(feature = "hosted-dev"))]
+const INVPCID_SUPPORT_UNKNOWN: u8 = 0;
+#[cfg(not(feature = "hosted-dev"))]
+const INVPCID_SUPPORT_AVAILABLE: u8 = 1;
+#[cfg(not(feature = "hosted-dev"))]
+const INVPCID_SUPPORT_UNAVAILABLE: u8 = 2;
+#[cfg(not(feature = "hosted-dev"))]
+static INVPCID_SUPPORT: AtomicU8 = AtomicU8::new(INVPCID_SUPPORT_UNKNOWN);
+
+#[cfg(not(feature = "hosted-dev"))]
+fn cpu_supports_invpcid() -> bool {
+    match INVPCID_SUPPORT.load(Ordering::Relaxed) {
+        INVPCID_SUPPORT_AVAILABLE => true,
+        INVPCID_SUPPORT_UNAVAILABLE => false,
+        _ => {
+            let max_leaf = unsafe { core::arch::x86_64::__cpuid(0) }.eax;
+            let supported = if max_leaf >= 7 {
+                let leaf7 = unsafe { core::arch::x86_64::__cpuid_count(7, 0) };
+                (leaf7.ebx & (1 << 10)) != 0
+            } else {
+                false
+            };
+            INVPCID_SUPPORT.store(
+                if supported {
+                    INVPCID_SUPPORT_AVAILABLE
+                } else {
+                    INVPCID_SUPPORT_UNAVAILABLE
+                },
+                Ordering::Relaxed,
+            );
+            supported
+        }
+    }
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+unsafe fn fallback_flush_tlb_via_cr3() {
+    let mut cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags));
+    // Clear the no-flush bit (bit 63) to force an architectural flush.
+    let flushed_cr3 = cr3 & !(1u64 << 63);
+    core::arch::asm!("mov cr3, {}", in(reg) flushed_cr3, options(nostack, preserves_flags));
+}
+
 pub fn invalidate_asid(asid: Asid) {
     #[cfg(test)]
     {
@@ -523,17 +570,21 @@ pub fn invalidate_asid(asid: Asid) {
 
     #[cfg(not(feature = "hosted-dev"))]
     unsafe {
-        let pcid = {
-            let state = PAGE_TABLE_STATE.lock();
-            state.asid_pcid(asid).unwrap_or_else(|| asid.0 & PCID_MASK) as u64
-        };
-        let descriptor = InvpcidDescriptor { pcid, addr: 0 };
-        core::arch::asm!(
-            "invpcid {kind:r}, [{desc}]",
-            kind = in(reg) 1u64,
-            desc = in(reg) &descriptor,
-            options(nostack, preserves_flags)
-        );
+        if cpu_supports_invpcid() {
+            let pcid = {
+                let state = PAGE_TABLE_STATE.lock();
+                state.asid_pcid(asid).unwrap_or_else(|| asid.0 & PCID_MASK) as u64
+            };
+            let descriptor = InvpcidDescriptor { pcid, addr: 0 };
+            core::arch::asm!(
+                "invpcid {kind:r}, [{desc}]",
+                kind = in(reg) 1u64,
+                desc = in(reg) &descriptor,
+                options(nostack, preserves_flags)
+            );
+        } else {
+            fallback_flush_tlb_via_cr3();
+        }
     }
 }
 
