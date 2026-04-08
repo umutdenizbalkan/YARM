@@ -7,7 +7,9 @@ OUT_DIR=${OUT_DIR:-build-x86_64}
 ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
 RUST_TARGET=${RUST_TARGET:-targets/x86_64-yarm-none.json}
 SERVER_BIN=${SERVER_BIN:-init_server}
+SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
+KERNEL_PACKAGE=${KERNEL_PACKAGE:-yarm}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-x86-none}
 SERVER_ELF=${SERVER_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
 KERNEL_RAW_ELF=${KERNEL_RAW_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
@@ -109,23 +111,47 @@ fi
 
 echo "[info] building server + kernel bins for target ${RUST_TARGET} (toolchain=${TOOLCHAIN}, build-std=${BUILD_STD_COMPONENTS})"
 BUILD_OK=1
+SERVER_BUILD_OK=1
+KERNEL_BUILD_OK=1
 set +e
 CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
-cargo +"${TOOLCHAIN}" build -Z build-std=${BUILD_STD_COMPONENTS} -Z json-target-spec --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} --bin "$SERVER_BIN" --bin "$KERNEL_BIN"
-BUILD_STATUS=$?
+cargo +"${TOOLCHAIN}" build \
+  -Z build-std=${BUILD_STD_COMPONENTS} \
+  -Z json-target-spec \
+  --target "$RUST_TARGET" \
+  --profile "$SERVER_BUILD_PROFILE" \
+  ${BOOTSTRAP_FEATURE_ARGS} \
+  -p "$SERVER_PACKAGE" \
+  --bin "$SERVER_BIN"
+SERVER_BUILD_STATUS=$?
+CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
+cargo +"${TOOLCHAIN}" build \
+  -Z build-std=${BUILD_STD_COMPONENTS} \
+  -Z json-target-spec \
+  --target "$RUST_TARGET" \
+  --profile "$SERVER_BUILD_PROFILE" \
+  ${BOOTSTRAP_FEATURE_ARGS} \
+  -p "$KERNEL_PACKAGE" \
+  --bin "$KERNEL_BIN"
+KERNEL_BUILD_STATUS=$?
 set -e
-if [[ "$BUILD_STATUS" -ne 0 ]]; then
+if [[ "$SERVER_BUILD_STATUS" -ne 0 ]]; then
+  SERVER_BUILD_OK=0
+  BUILD_OK=0
+fi
+if [[ "$KERNEL_BUILD_STATUS" -ne 0 ]]; then
+  KERNEL_BUILD_OK=0
   BUILD_OK=0
 fi
 
-if [[ "$BUILD_OK" -eq 1 && -f "$SERVER_ELF" ]]; then
+if [[ "$SERVER_BUILD_OK" -eq 1 && -f "$SERVER_ELF" ]]; then
   cp "$SERVER_ELF" "$ROOTFS_DIR/sbin/${SERVER_BIN}"
 else
-  echo "[warn] compile for ${SERVER_BIN} failed or output missing (${SERVER_ELF})"
+  echo "[warn] compile for ${SERVER_BIN} (${SERVER_PACKAGE}) failed or output missing (${SERVER_ELF})"
   [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
 fi
 
-if [[ "$BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
+if [[ "$KERNEL_BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
   cp "$KERNEL_RAW_ELF" "$KERNEL_DEBUG_ELF"
   echo "[info] yarm freestanding kernel ELF (debug-only): $KERNEL_DEBUG_ELF"
   echo "[info] x86_64 bootstrap invariant script removed; skipping legacy invariant check stage"
