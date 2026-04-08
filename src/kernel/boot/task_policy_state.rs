@@ -7,15 +7,6 @@ use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{TaskClass, ThreadControlBlock};
 
 impl KernelState {
-    fn next_dynamic_tid_after(tid: u64) -> u64 {
-        let next = tid.wrapping_add(1);
-        if next < super::INITIAL_DYNAMIC_TID {
-            super::INITIAL_DYNAMIC_TID
-        } else {
-            next
-        }
-    }
-
     pub(crate) fn register_task_with_class_in_process(
         &mut self,
         tid: u64,
@@ -66,15 +57,30 @@ impl KernelState {
         if self.with_tcbs(|tcbs| tcbs.iter().flatten().count()) >= limits.max_tasks {
             return Err(KernelError::TaskTableFull);
         }
-        let mut candidate = self.next_dynamic_tid.max(super::INITIAL_DYNAMIC_TID);
+        let policy = self.tid_allocation_policy;
+        let mut candidate = self.tid_allocation_cursor.next_dynamic_tid(policy);
         for _ in 0..=limits.max_tasks {
+            debug_assert!(candidate > policy.static_tid_upper_bound());
             if self.task_status(candidate).is_none() {
-                self.next_dynamic_tid = Self::next_dynamic_tid_after(candidate);
+                self.tid_allocation_cursor
+                    .advance_after_allocation(policy, candidate);
                 return Ok(candidate);
             }
-            candidate = Self::next_dynamic_tid_after(candidate);
+            candidate = policy.advance_dynamic_cursor(candidate);
         }
         Err(KernelError::TaskTableFull)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_dynamic_tid_cursor_for_test(&mut self, next_dynamic_tid: u64) {
+        self.tid_allocation_cursor
+            .set_next_dynamic_tid_for_test(next_dynamic_tid);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_dynamic_tid_for_test(&self) -> u64 {
+        self.tid_allocation_cursor
+            .next_dynamic_tid(self.tid_allocation_policy)
     }
 
     pub fn task_class(&self, tid: u64) -> Option<TaskClass> {

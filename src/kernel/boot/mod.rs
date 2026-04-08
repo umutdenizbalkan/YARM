@@ -21,6 +21,7 @@ mod restart_state;
 mod scheduler_state;
 mod task_core_state;
 mod task_policy_state;
+mod tid_allocation_policy;
 mod thread_state;
 mod transfer_state;
 mod types;
@@ -54,6 +55,7 @@ use crate::kernel::frame_allocator::{
 };
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::lock::SpinLockIrq;
+use tid_allocation_policy::{TidAllocationCursor, TidAllocationPolicy};
 #[cfg(feature = "hosted-dev")]
 use crate::std::collections::BTreeMap;
 
@@ -108,6 +110,7 @@ const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_DELEGATED_CAPABILITY_LINKS: usize = 2048;
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
+const STATIC_TID_UPPER_BOUND: u64 = INITIAL_DYNAMIC_TID - 1;
 
 pub use types::*;
 pub(crate) use defs::*;
@@ -130,7 +133,8 @@ pub struct KernelState {
     memory_state_lock: SpinLockIrq<()>,
     ipc: KernelStorage<IpcSubsystem>,
     capability: CapabilitySubsystem,
-    next_dynamic_tid: u64,
+    tid_allocation_policy: TidAllocationPolicy,
+    tid_allocation_cursor: TidAllocationCursor,
     tcbs: KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
     task_classes: KernelStorage<[Option<TaskClass>; MAX_TASKS]>,
     tls_restore_pending: KernelStorage<[Option<ThreadId>; MAX_TASKS]>,

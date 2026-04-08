@@ -5,12 +5,12 @@ Define and enforce a clear split between static/bootstrap TIDs and dynamically a
 
 ## Proposed PR sequence
 
-1. **Phase 1 — policy floor + gap enforcement (this change set)**
+1. **Phase 1 — policy floor + gap enforcement (completed)**
    - Codify the dynamic allocation floor (`INITIAL_DYNAMIC_TID`) as a hard lower bound.
    - Normalize allocator cursor state if it falls below the dynamic range.
    - Add regression tests for floor enforcement and wrap behavior.
 
-2. **Phase 2 — explicit allocation model + cursor abstraction**
+2. **Phase 2 — explicit allocation model + cursor abstraction (completed)**
    - Introduce a small `TidAllocationPolicy`/cursor helper in `kernel::boot`.
    - Make allocation semantics explicit (reserved range, dynamic range, wrap contract).
    - Remove ad-hoc cursor arithmetic from state methods.

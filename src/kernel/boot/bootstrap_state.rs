@@ -216,7 +216,14 @@ impl Bootstrap {
                     [const { None }; MAX_DELEGATED_CAPABILITY_LINKS],
                 ),
             },
-            next_dynamic_tid: INITIAL_DYNAMIC_TID,
+            tid_allocation_policy: TidAllocationPolicy::new(
+                STATIC_TID_UPPER_BOUND,
+                INITIAL_DYNAMIC_TID,
+            ),
+            tid_allocation_cursor: TidAllocationCursor::new(TidAllocationPolicy::new(
+                STATIC_TID_UPPER_BOUND,
+                INITIAL_DYNAMIC_TID,
+            )),
             tcbs: store_kernel_value([const { None }; MAX_TASKS]),
             task_classes: store_kernel_value([None; MAX_TASKS]),
             tls_restore_pending: store_kernel_value([None; MAX_TASKS]),

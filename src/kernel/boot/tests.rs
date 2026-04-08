@@ -3799,21 +3799,21 @@ fn capability_revoke_in_process_cnode_is_visible_to_sibling_thread() {
 #[test]
 fn allocate_thread_id_enforces_dynamic_tid_gap_floor() {
     let mut state = Bootstrap::init().expect("init");
-    state.next_dynamic_tid = 42;
+    state.set_dynamic_tid_cursor_for_test(42);
 
     let tid = state.allocate_thread_id().expect("allocate");
     assert_eq!(tid, INITIAL_DYNAMIC_TID);
-    assert_eq!(state.next_dynamic_tid, INITIAL_DYNAMIC_TID + 1);
+    assert_eq!(state.next_dynamic_tid_for_test(), INITIAL_DYNAMIC_TID + 1);
 }
 
 #[test]
 fn allocate_thread_id_wraps_to_dynamic_floor_after_u64_max() {
     let mut state = Bootstrap::init().expect("init");
-    state.next_dynamic_tid = u64::MAX;
+    state.set_dynamic_tid_cursor_for_test(u64::MAX);
 
     let tid = state.allocate_thread_id().expect("allocate");
     assert_eq!(tid, u64::MAX);
-    assert_eq!(state.next_dynamic_tid, INITIAL_DYNAMIC_TID);
+    assert_eq!(state.next_dynamic_tid_for_test(), INITIAL_DYNAMIC_TID);
 
     let second = state.allocate_thread_id().expect("second allocate");
     assert_eq!(second, INITIAL_DYNAMIC_TID);
