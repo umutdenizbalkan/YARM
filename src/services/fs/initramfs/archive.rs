@@ -6,9 +6,12 @@ use crate::kernel::vfs::{VfsBackend, VfsError};
 pub const INITRAMFS_BOOT_MARKER_PATH_PTR: u64 = 0x494E_4954_424F_4F54;
 pub const INITRAMFS_INIT_PATH_PTR: u64 = 0x494E_4954_524F_4F54;
 pub const INITRAMFS_ETC_HOSTS_PATH_PTR: u64 = 0x494E_4954_484F_5354;
+pub const INITRAMFS_PROC_MGR_PATH_PTR: u64 = 0x494E_4954_5052_4F43;
+pub const INITRAMFS_VFS_PATH_PTR: u64 = 0x494E_4954_5F56_4653;
+pub const INITRAMFS_SUPERVISOR_PATH_PTR: u64 = 0x494E_4954_5355_5056;
 
 const MAX_INITRAMFS_HANDLES: usize = 16;
-const MAX_INITRAMFS_INODES: usize = 4;
+const MAX_INITRAMFS_INODES: usize = 8;
 const INITRAMFS_STATX_TYPE_REGULAR: u64 = 0x1000_0000_0000_0000;
 const INITRAMFS_MODE_OWNER_READ: u64 = 0o400;
 
@@ -67,6 +70,19 @@ impl InitramfsBackend {
                     path_ptr: INITRAMFS_ETC_HOSTS_PATH_PTR,
                     file_len: 256,
                 }),
+                Some(InitramfsInode {
+                    path_ptr: INITRAMFS_PROC_MGR_PATH_PTR,
+                    file_len: 1536,
+                }),
+                Some(InitramfsInode {
+                    path_ptr: INITRAMFS_VFS_PATH_PTR,
+                    file_len: 1536,
+                }),
+                Some(InitramfsInode {
+                    path_ptr: INITRAMFS_SUPERVISOR_PATH_PTR,
+                    file_len: 1536,
+                }),
+                None,
                 None,
             ],
             metrics: InitramfsMetrics {
@@ -261,5 +277,19 @@ mod tests {
         assert_eq!(metrics.write_count, 1);
         assert_eq!(metrics.close_count, 1);
         assert_eq!(metrics.error_count, 2);
+    }
+
+    #[test]
+    fn initramfs_core_service_paths_exist_with_stable_statx_sizes() {
+        let mut fs = InitramfsBackend::new(4096);
+        let proc_stat = fs.statx(INITRAMFS_PROC_MGR_PATH_PTR).expect("proc stat");
+        let vfs_stat = fs.statx(INITRAMFS_VFS_PATH_PTR).expect("vfs stat");
+        let supervisor_stat = fs
+            .statx(INITRAMFS_SUPERVISOR_PATH_PTR)
+            .expect("supervisor stat");
+        let expected = INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (1536 << 16);
+        assert_eq!(proc_stat, expected);
+        assert_eq!(vfs_stat, expected);
+        assert_eq!(supervisor_stat, expected);
     }
 }
