@@ -8,12 +8,11 @@ use yarm::kernel::boot::Bootstrap;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const MAX_PVH_MODULES: usize = 32;
 const PVH_MAGIC: u32 = 0x336e_c578;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_PHYS_EXCLUSIVE: u64 = 1u64 << 52;
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[repr(C)]
 struct PvhStartInfo {
     _magic: u32,
@@ -27,6 +26,15 @@ struct PvhStartInfo {
     memmap_entries: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PvhModule {
+    paddr_start: u64,
+    paddr_end: u64,
+    cmdline_paddr: u64,
+    _reserved: u64,
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -35,6 +43,55 @@ struct PvhMemMapEntry {
     size: u64,
     kind: u32,
     _reserved: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PvhModuleWindow {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PvhModuleSummary {
+    module_count: usize,
+    initramfs: Option<PvhModuleWindow>,
+}
+
+fn read_pvh_module_summary(start_info_ptr: usize) -> Option<PvhModuleSummary> {
+    if start_info_ptr == 0 {
+        return None;
+    }
+    let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+    if start_info._magic != PVH_MAGIC {
+        return None;
+    }
+    if start_info.nr_modules == 0 || start_info.modlist_paddr == 0 {
+        return Some(PvhModuleSummary {
+            module_count: 0,
+            initramfs: None,
+        });
+    }
+
+    let module_count = core::cmp::min(start_info.nr_modules as usize, MAX_PVH_MODULES);
+    let mut initramfs = None;
+    for idx in 0..module_count {
+        let module_ptr = (start_info.modlist_paddr as *const PvhModule).wrapping_add(idx);
+        let module = unsafe { core::ptr::read_unaligned(module_ptr) };
+        if module.paddr_start == 0 || module.paddr_end <= module.paddr_start {
+            continue;
+        }
+        if initramfs.is_none() {
+            initramfs = Some(PvhModuleWindow {
+                start: module.paddr_start,
+                end: module.paddr_end,
+            });
+        }
+    }
+
+    Some(PvhModuleSummary {
+        module_count,
+        initramfs,
+    })
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -51,8 +108,14 @@ fn log_pvh_boot_metadata(start_info_ptr: usize) {
         return;
     }
     write_line("PVH: magic OK");
-    // Intentionally avoid formatter-based yarm_log! while diagnosing early-boot faults.
-    // cmdline/modlist parsing is intentionally skipped in this temporary path.
+    if let Some(summary) = read_pvh_module_summary(start_info_ptr) {
+        yarm::yarm_log!(
+            "YARM_BOOT_PVH_MODULES total={} initramfs_start=0x{:x} initramfs_end=0x{:x}",
+            summary.module_count,
+            summary.initramfs.map(|window| window.start).unwrap_or(0),
+            summary.initramfs.map(|window| window.end).unwrap_or(0)
+        );
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -277,6 +340,66 @@ pub extern "C" fn yarm_kernel_main(start_info_ptr: usize) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pvh_module_summary_selects_first_valid_module_as_initramfs() {
+        let modules = [
+            PvhModule {
+                paddr_start: 0x4000_0000,
+                paddr_end: 0x4008_0000,
+                cmdline_paddr: 0,
+                _reserved: 0,
+            },
+            PvhModule {
+                paddr_start: 0x5000_0000,
+                paddr_end: 0x5008_0000,
+                cmdline_paddr: 0,
+                _reserved: 0,
+            },
+        ];
+        let start_info = PvhStartInfo {
+            _magic: PVH_MAGIC,
+            _version: 0,
+            _flags: 0,
+            nr_modules: modules.len() as u32,
+            modlist_paddr: modules.as_ptr() as u64,
+            cmdline_paddr: 0,
+            _rsdp_paddr: 0,
+            memmap_paddr: 0,
+            memmap_entries: 0,
+        };
+        let summary =
+            read_pvh_module_summary((&start_info as *const PvhStartInfo) as usize).expect("pvh");
+        assert_eq!(summary.module_count, 2);
+        let initramfs = summary.initramfs.expect("initramfs window");
+        assert_eq!(initramfs.start, 0x4000_0000);
+        assert_eq!(initramfs.end, 0x4008_0000);
+    }
+
+    #[test]
+    fn pvh_module_summary_ignores_invalid_windows() {
+        let modules = [PvhModule {
+            paddr_start: 0x6000_0000,
+            paddr_end: 0x6000_0000,
+            cmdline_paddr: 0,
+            _reserved: 0,
+        }];
+        let start_info = PvhStartInfo {
+            _magic: PVH_MAGIC,
+            _version: 0,
+            _flags: 0,
+            nr_modules: modules.len() as u32,
+            modlist_paddr: modules.as_ptr() as u64,
+            cmdline_paddr: 0,
+            _rsdp_paddr: 0,
+            memmap_paddr: 0,
+            memmap_entries: 0,
+        };
+        let summary =
+            read_pvh_module_summary((&start_info as *const PvhStartInfo) as usize).expect("pvh");
+        assert_eq!(summary.module_count, 1);
+        assert!(summary.initramfs.is_none());
+    }
 
     #[test]
     fn kernel_boot_markers_run() {
