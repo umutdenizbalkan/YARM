@@ -7,8 +7,8 @@ edition = "2024"
 
 [features]
 default = ["hosted-dev"]
-hosted-dev = []
+hosted-dev = ["yarm/hosted-dev"]
 posix-compat = ["yarm/posix-compat"]
 
 [dependencies]
-yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
+yarm = { path = "../..", default-features = false }

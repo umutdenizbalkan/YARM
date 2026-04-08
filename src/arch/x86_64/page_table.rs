@@ -434,14 +434,15 @@ fn read_table_entry(
     if index >= ENTRIES_PER_TABLE {
         return None;
     }
-    let table_idx = state.page_index_from_phys(table_phys)?;
     #[cfg(any(feature = "hosted-dev", test))]
     {
+        let table_idx = state.page_index_from_phys(table_phys)?;
         let entry = state.pages[table_idx].as_ref()?.entries[index];
         return Some(PageTableEntry(entry));
     }
     #[cfg(all(not(feature = "hosted-dev"), not(test)))]
     unsafe {
+        state.page_index_from_phys(table_phys)?;
         let table_ptr = phys_to_virt_table_ptr(table_phys)?;
         let ptr = (table_ptr as usize + index * core::mem::size_of::<u64>()) as *const u64;
         Some(PageTableEntry(core::ptr::read_volatile(ptr)))
@@ -457,11 +458,11 @@ fn write_table_entry(
     if index >= ENTRIES_PER_TABLE {
         return Err(PageTableError::InvalidAddress);
     }
-    let table_idx = state
-        .page_index_from_phys(table_phys)
-        .ok_or(PageTableError::InvalidAddress)?;
     #[cfg(any(feature = "hosted-dev", test))]
     {
+        let table_idx = state
+            .page_index_from_phys(table_phys)
+            .ok_or(PageTableError::InvalidAddress)?;
         if let Some(table) = state.pages[table_idx].as_mut() {
             table.entries[index] = entry.0;
             return Ok(());
@@ -470,6 +471,9 @@ fn write_table_entry(
     }
     #[cfg(all(not(feature = "hosted-dev"), not(test)))]
     {
+        state
+            .page_index_from_phys(table_phys)
+            .ok_or(PageTableError::InvalidAddress)?;
         unsafe {
             let table_ptr =
                 phys_to_virt_table_ptr(table_phys).ok_or(PageTableError::InvalidAddress)?;
