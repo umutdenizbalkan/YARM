@@ -21,6 +21,7 @@ const AP_HANDOFF_OFFSET: usize = 0x100;
 const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 const AP_STACK_BYTES: usize = 16 * 1024;
 const AP_STACK_TOP_BASE: u64 = 0x0000_0000_2000_0000;
+const AP_READY_POLL_ITERS: usize = 2_000_000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -137,6 +138,9 @@ fn send_init_sipi_sipi(apic_id: u8) {
         ICR_DELIVERY_MODE_STARTUP | AP_TRAMPOLINE_VECTOR as u32,
     );
     spin_delay(200);
+
+    #[cfg(test)]
+    AP_READY_FLAGS[apic_id as usize].store(true, Ordering::Release);
 }
 
 fn spin_delay(iterations: usize) {
@@ -178,14 +182,24 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
 
         prepare_trampoline_for_cpu(kernel, cpu);
         send_init_sipi_sipi(cpu.0);
-        AP_READY_FLAGS[cpu.0 as usize].store(true, Ordering::Release);
 
-        if AP_READY_FLAGS[cpu.0 as usize].load(Ordering::Acquire) {
+        let mut ready = false;
+        for _ in 0..AP_READY_POLL_ITERS {
+            if AP_READY_FLAGS[cpu.0 as usize].load(Ordering::Acquire) {
+                ready = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        if ready {
             match kernel.bring_up_cpu(cpu) {
                 Ok(()) => started += 1,
                 Err(KernelError::WrongObject) => {}
                 Err(err) => return Err(err),
             }
+        } else {
+            crate::yarm_log!("YARM_SMP_AP_TIMEOUT cpu={} trampoline=0x{:x}", cpu.0, AP_TRAMPOLINE_PHYS);
         }
     }
 
