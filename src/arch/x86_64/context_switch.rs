@@ -5,12 +5,12 @@ use crate::kernel::task::ArchSwitchContext;
 #[cfg(test)]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 unsafe extern "C" {
     fn yarm_x86_switch_frame(prev: *mut ArchSwitchContext, next: *const ArchSwitchContext);
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 core::arch::global_asm!(
     r#"
     .section .text, "ax", @progbits
@@ -46,12 +46,12 @@ pub fn switch_frames(prev: &mut ArchSwitchContext, next: &ArchSwitchContext) {
     {
         SWITCH_CALLS.fetch_add(1, Ordering::Relaxed);
     }
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    #[cfg(all(not(test), target_arch = "x86_64"))]
     unsafe {
         yarm_x86_switch_frame(prev as *mut _, next as *const _);
     }
 
-    #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+    #[cfg(any(test, not(target_arch = "x86_64")))]
     {
         let _ = (prev, next);
     }
