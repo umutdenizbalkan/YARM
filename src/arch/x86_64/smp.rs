@@ -44,6 +44,7 @@ global_asm!(
     .global yarm_ap_trampoline_end
     .global yarm_ap_trampoline_handoff
     .code16
+    .set AP_TRAMPOLINE_BASE, 0x7000
     .set AP_OFF_REAL_L1, 1f - yarm_ap_trampoline_start
     .set AP_OFF_GDTR, 2f - yarm_ap_trampoline_start
     .set AP_OFF_PM_L5, 5f - yarm_ap_trampoline_start
@@ -67,7 +68,7 @@ yarm_ap_trampoline_start:
     or eax, 1
     mov cr0, eax
     .byte 0xEA
-    .word 3f
+        .word AP_TRAMPOLINE_BASE + (3f - yarm_ap_trampoline_start)
     .word 0x08
 
 2:
@@ -102,7 +103,7 @@ yarm_ap_trampoline_start:
     or eax, 0x80000000
     mov cr0, eax
     .byte 0xEA
-    .long 6f
+        .long AP_TRAMPOLINE_BASE + (6f - yarm_ap_trampoline_start)
     .word 0x10
 
     .code64
