@@ -173,6 +173,10 @@ const TSS_SELECTOR: u16 = 0x28;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const USER_CODE_SELECTOR: u16 = 0x23;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const IA32_EFER_MSR: u32 = 0xC000_0080;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const IA32_EFER_SCE: u64 = 1 << 0;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const IA32_STAR_MSR: u32 = 0xC000_0081;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const IA32_LSTAR_MSR: u32 = 0xC000_0082;
@@ -239,6 +243,22 @@ unsafe extern "C" {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn read_msr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn write_msr(msr: u32, value: u64) {
     let low = value as u32;
     let high = (value >> 32) as u32;
@@ -258,6 +278,9 @@ fn configure_syscall_fast_path(rsp0: u64) {
     YARM_X86_SYSCALL_RSP0.store(rsp0, Ordering::Release);
     // STAR[47:32] = kernel CS selector; STAR[63:48] = SYSRET CS base (CS-16).
     let star = ((KERNEL_CODE_SELECTOR as u64) << 32) | (((USER_CODE_SELECTOR as u64) - 16) << 48);
+    let mut efer = read_msr(IA32_EFER_MSR);
+    efer |= IA32_EFER_SCE;
+    write_msr(IA32_EFER_MSR, efer);
     write_msr(IA32_STAR_MSR, star);
     write_msr(IA32_LSTAR_MSR, yarm_x86_lstar_entry as *const () as u64);
     write_msr(IA32_FMASK_MSR, RFLAGS_IF_MASK);
