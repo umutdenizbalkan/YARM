@@ -78,3 +78,15 @@ The function rejects launch planning when:
 - image byte length does not match manifest `file_len`,
 - ELF validation fails,
 - PT_LOAD table is malformed or exceeds bounded segment capacity.
+
+## Phase 4 integration: init runtime uses manifest-derived entry plan
+
+`InitRuntimeBootConfig` now supports selecting core image source via:
+
+- fixed entry plan (`InitCoreImageSource::Fixed`), or
+- manifest/image-backed launch plan (`InitCoreImageSource::Manifest`).
+
+When manifest-backed mode is selected, init boot resolves
+`CoreServiceImagePlan` from `build_core_service_elf_launch_plan(...)` and then
+launches `process_manager`, `vfs`, and `supervisor` using manifest-derived
+validated ELF entry addresses.

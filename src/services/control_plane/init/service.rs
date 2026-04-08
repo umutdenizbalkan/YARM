@@ -10,6 +10,7 @@ use crate::services::control_plane::supervisor::SupervisorService;
 use crate::services::control_plane::vfs::service::run_request_loop_over_kernel_ipc as run_vfs_request_loop;
 use crate::services::fs::devfs::service::run_request_loop as run_devfs_request_loop;
 use crate::services::fs::devfs::{DevFsBackend, DevFsService};
+use crate::services::fs::initramfs::build_core_service_elf_launch_plan;
 use crate::services::fs::initramfs::service::run_request_loop as run_initramfs_request_loop;
 use crate::services::fs::initramfs::{InitramfsBackend, InitramfsService};
 use crate::services::init::{
@@ -18,14 +19,23 @@ use crate::services::init::{
 use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InitRuntimeBootConfig {
+pub enum InitCoreImageSource<'a> {
+    Fixed(CoreServiceImagePlan),
+    Manifest {
+        manifest_bytes: &'a [u8],
+        images: &'a [(u64, &'a [u8])],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitRuntimeBootConfig<'a> {
     pub launch_strategy: CoreLaunchStrategy,
     pub graph: CoreServiceGraph,
-    pub image_plan: CoreServiceImagePlan,
+    pub image_source: InitCoreImageSource<'a>,
     pub restart_window_ticks: u64,
 }
 
-impl InitRuntimeBootConfig {
+impl InitRuntimeBootConfig<'_> {
     pub const fn baseline() -> Self {
         Self {
             launch_strategy: CoreLaunchStrategy::SupervisorFirst,
@@ -35,17 +45,17 @@ impl InitRuntimeBootConfig {
                 vfs_tid: 3,
                 supervisor_tid: 4,
             },
-            image_plan: CoreServiceImagePlan {
+            image_source: InitCoreImageSource::Fixed(CoreServiceImagePlan {
                 process_manager_entry: 0x8000,
                 vfs_entry: 0x9000,
                 supervisor_entry: 0xA000,
-            },
+            }),
             restart_window_ticks: 100,
         }
     }
 }
 
-impl Default for InitRuntimeBootConfig {
+impl Default for InitRuntimeBootConfig<'_> {
     fn default() -> Self {
         Self::baseline()
     }
@@ -65,12 +75,12 @@ pub struct InitRuntimeSummary {
 
 fn boot_init_runtime(
     kernel: &mut KernelState,
-    config: InitRuntimeBootConfig,
+    config: InitRuntimeBootConfig<'_>,
 ) -> Result<(InitService, usize), KernelError> {
     let mut init = InitService::new();
     init.set_launch_strategy(config.launch_strategy);
     init.register_core_graph(kernel, config.graph)?;
-    init.launch_core_services(kernel, config.image_plan)?;
+    init.launch_core_services(kernel, resolve_core_image_plan(config.image_source)?)?;
     init.install_fault_handoff(kernel, config.restart_window_ticks)?;
     let seeded_registrations = init.seed_supervisor_registrations(kernel)?;
     init.begin_running(kernel)?;
@@ -79,7 +89,7 @@ fn boot_init_runtime(
 
 pub fn run_with_kernel(
     kernel: &mut KernelState,
-    config: InitRuntimeBootConfig,
+    config: InitRuntimeBootConfig<'_>,
 ) -> Result<InitRuntimeSummary, KernelError> {
     let (init, seeded_registrations) = boot_init_runtime(kernel, config)?;
 
@@ -114,7 +124,7 @@ pub struct MinimumRunnableProfileSummary {
 
 pub fn run_minimum_profile_with_kernel(
     kernel: &mut KernelState,
-    config: InitRuntimeBootConfig,
+    config: InitRuntimeBootConfig<'_>,
 ) -> Result<MinimumRunnableProfileSummary, KernelError> {
     let (mut init, seeded_registrations) = boot_init_runtime(kernel, config)?;
     let handoff = init.fault_handoff().ok_or(KernelError::WrongObject)?;
@@ -164,6 +174,24 @@ pub fn run_minimum_profile_with_kernel(
     })
 }
 
+fn resolve_core_image_plan(source: InitCoreImageSource<'_>) -> Result<CoreServiceImagePlan, KernelError> {
+    match source {
+        InitCoreImageSource::Fixed(plan) => Ok(plan),
+        InitCoreImageSource::Manifest {
+            manifest_bytes,
+            images,
+        } => {
+            let launch =
+                build_core_service_elf_launch_plan(manifest_bytes, images).map_err(|_| KernelError::WrongObject)?;
+            Ok(CoreServiceImagePlan {
+                process_manager_entry: launch.process_manager.validated_entry as usize,
+                vfs_entry: launch.vfs.validated_entry as usize,
+                supervisor_entry: launch.supervisor.validated_entry as usize,
+            })
+        }
+    }
+}
+
 pub fn run() {
     let mut kernel = Bootstrap::init().expect("init");
     let summary = run_minimum_profile_with_kernel(&mut kernel, InitRuntimeBootConfig::baseline())
@@ -182,6 +210,58 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::fs::initramfs::{
+        INITRAMFS_INIT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR, INITRAMFS_SUPERVISOR_PATH_PTR,
+        INITRAMFS_VFS_PATH_PTR,
+    };
+    use crate::services::fs::initramfs::ManifestEntryWire;
+    use crate::std::vec::Vec;
+
+    const MANIFEST_MAGIC: u32 = 0x5941_524D;
+    const MANIFEST_VERSION_V1: u16 = 1;
+
+    fn encode_manifest(entries: &[ManifestEntryWire]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&MANIFEST_MAGIC.to_le_bytes());
+        out.extend_from_slice(&MANIFEST_VERSION_V1.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            out.extend_from_slice(&entry.path_ptr.to_le_bytes());
+            out.extend_from_slice(&entry.file_len.to_le_bytes());
+            out.extend_from_slice(&entry.entry_addr.to_le_bytes());
+            out.extend_from_slice(&entry.abi.to_le_bytes());
+            out.extend_from_slice(&entry.flags.to_le_bytes());
+        }
+        out
+    }
+
+    fn synthetic_elf_image(entry: u64) -> [u8; 192] {
+        let mut image = [0u8; 192];
+        image[..4].copy_from_slice(b"\x7FELF");
+        image[4] = 2;
+        image[5] = 1;
+        image[6] = 1;
+        image[7] = 0;
+        image[16..18].copy_from_slice(&2u16.to_le_bytes());
+        image[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        image[20..24].copy_from_slice(&1u32.to_le_bytes());
+        image[24..32].copy_from_slice(&entry.to_le_bytes());
+        image[32..40].copy_from_slice(&64u64.to_le_bytes());
+        image[52..54].copy_from_slice(&(64u16).to_le_bytes());
+        image[54..56].copy_from_slice(&(56u16).to_le_bytes());
+        image[56..58].copy_from_slice(&(1u16).to_le_bytes());
+
+        let ph = 64usize;
+        image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+        image[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes());
+        image[ph + 8..ph + 16].copy_from_slice(&184u64.to_le_bytes());
+        image[ph + 16..ph + 24].copy_from_slice(&(entry & !0xFFF).to_le_bytes());
+        image[ph + 32..ph + 40].copy_from_slice(&8u64.to_le_bytes());
+        image[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes());
+        image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        image[184..192].copy_from_slice(&[0x90; 8]);
+        image
+    }
 
     #[test]
     fn runtime_boot_config_can_drive_external_kernel_state() {
@@ -242,5 +322,60 @@ mod tests {
         assert_eq!(summary.initramfs_handled, 3);
         assert_eq!(summary.mount_report.mounted_count, 4);
         assert_eq!(summary.recovered_core_services, 0);
+    }
+
+    #[test]
+    fn runtime_boot_config_can_resolve_core_entries_from_manifest() {
+        let init = synthetic_elf_image(0x410000);
+        let proc = synthetic_elf_image(0x420000);
+        let vfs = synthetic_elf_image(0x430000);
+        let supervisor = synthetic_elf_image(0x440000);
+        let entries = [
+            ManifestEntryWire {
+                path_ptr: INITRAMFS_INIT_PATH_PTR,
+                file_len: init.len() as u64,
+                entry_addr: 0x410000,
+                abi: 1,
+                flags: 0,
+            },
+            ManifestEntryWire {
+                path_ptr: INITRAMFS_PROC_MGR_PATH_PTR,
+                file_len: proc.len() as u64,
+                entry_addr: 0x420000,
+                abi: 1,
+                flags: 0,
+            },
+            ManifestEntryWire {
+                path_ptr: INITRAMFS_VFS_PATH_PTR,
+                file_len: vfs.len() as u64,
+                entry_addr: 0x430000,
+                abi: 1,
+                flags: 0,
+            },
+            ManifestEntryWire {
+                path_ptr: INITRAMFS_SUPERVISOR_PATH_PTR,
+                file_len: supervisor.len() as u64,
+                entry_addr: 0x440000,
+                abi: 1,
+                flags: 0,
+            },
+        ];
+        let manifest_storage = encode_manifest(&entries);
+        let images = [
+            (INITRAMFS_INIT_PATH_PTR, init.as_slice()),
+            (INITRAMFS_PROC_MGR_PATH_PTR, proc.as_slice()),
+            (INITRAMFS_VFS_PATH_PTR, vfs.as_slice()),
+            (INITRAMFS_SUPERVISOR_PATH_PTR, supervisor.as_slice()),
+        ];
+
+        let plan = resolve_core_image_plan(InitCoreImageSource::Manifest {
+            manifest_bytes: &manifest_storage,
+            images: &images,
+        })
+        .expect("plan");
+
+        assert_eq!(plan.process_manager_entry, 0x420000usize);
+        assert_eq!(plan.vfs_entry, 0x430000usize);
+        assert_eq!(plan.supervisor_entry, 0x440000usize);
     }
 }
