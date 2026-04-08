@@ -23,7 +23,7 @@ Define and enforce a clear split between static/bootstrap TIDs and dynamically a
    - Add tests/check scripts that fail if dynamic allocation returns a TID below floor.
    - Include a targeted kernel test suite command in CI for TID policy invariants.
 
-5. **Phase 5 — follow-on integration cleanup**
+5. **Phase 5 — follow-on integration cleanup (completed)**
    - Audit callers assuming monotonic non-wrapping TIDs and update contracts/docs.
    - Update roadmap/status docs to reflect stable allocation policy.
 

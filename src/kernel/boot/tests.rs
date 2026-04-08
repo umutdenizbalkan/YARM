@@ -3836,6 +3836,19 @@ fn tid_allocation_telemetry_tracks_repairs_allocations_and_wraps() {
 }
 
 #[test]
+fn dynamic_tid_classification_is_stable_across_wrap_boundaries() {
+    let mut state = Bootstrap::init().expect("init");
+    state.set_dynamic_tid_cursor_for_test(u64::MAX);
+    let wrapped_edge = state.allocate_thread_id().expect("max allocate");
+    let wrapped_floor = state.allocate_thread_id().expect("floor allocate");
+
+    assert!(state.is_dynamic_tid(wrapped_edge));
+    assert!(state.is_dynamic_tid(wrapped_floor));
+    assert!(wrapped_floor < wrapped_edge);
+    assert_eq!(state.static_tid_upper_bound() + 1, state.dynamic_tid_floor());
+}
+
+#[test]
 fn process_teardown_reclaims_process_cnode_space_and_delegated_descendants() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(730).expect("source process");

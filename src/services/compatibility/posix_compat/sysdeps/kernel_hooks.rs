@@ -121,7 +121,7 @@ mod tests {
             .expect("parent");
         let tid =
             clone_thread_hook(&mut kernel, 7, 0xDEAD_BEEF, 0x8000_0000, 0x4010).expect("clone");
-        assert!(tid >= 10_000);
+        assert!(tid >= kernel.dynamic_tid_floor());
         set_tls_hook(&mut kernel, tid, 0xFEED_CAFE).expect("set tls");
         assert_eq!(
             get_tls_hook(&kernel, tid).expect("get tls"),

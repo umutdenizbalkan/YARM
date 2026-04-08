@@ -123,4 +123,16 @@ impl KernelState {
     pub fn tid_allocation_telemetry(&self) -> TidAllocationTelemetry {
         self.with_telemetry_state(|telemetry| telemetry.tid_allocation)
     }
+
+    pub fn dynamic_tid_floor(&self) -> u64 {
+        self.tid_allocation_policy.dynamic_tid_floor()
+    }
+
+    pub fn static_tid_upper_bound(&self) -> u64 {
+        self.tid_allocation_policy.static_tid_upper_bound()
+    }
+
+    pub fn is_dynamic_tid(&self, tid: u64) -> bool {
+        tid >= self.dynamic_tid_floor()
+    }
 }
