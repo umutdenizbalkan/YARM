@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 pub use yarm_kernel::capability::{CNodeId, CapId, CapRights, CapabilityDeriveError};
+use crate::kernel::lock::SpinLockIrq;
 
 /// Capability object identity remains a monolithic enum for now.
 ///
@@ -90,6 +91,32 @@ impl Default for CapabilitySpace {
         }
     }
 }
+
+struct RevokeScratch {
+    child_heads: [Option<usize>; MAX_CAPABILITIES_PER_CSPACE],
+    next_sibling: [Option<usize>; MAX_CAPABILITIES_PER_CSPACE],
+    marked: [bool; MAX_CAPABILITIES_PER_CSPACE],
+    stack: [usize; MAX_CAPABILITIES_PER_CSPACE],
+}
+
+impl RevokeScratch {
+    const fn new() -> Self {
+        Self {
+            child_heads: [None; MAX_CAPABILITIES_PER_CSPACE],
+            next_sibling: [None; MAX_CAPABILITIES_PER_CSPACE],
+            marked: [false; MAX_CAPABILITIES_PER_CSPACE],
+            stack: [0; MAX_CAPABILITIES_PER_CSPACE],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.child_heads.fill(None);
+        self.next_sibling.fill(None);
+        self.marked.fill(false);
+    }
+}
+
+static REVOKE_SCRATCH: SpinLockIrq<RevokeScratch> = SpinLockIrq::new(RevokeScratch::new());
 
 impl CapabilitySpace {
     pub fn occupied_slots(&self) -> usize {
@@ -188,10 +215,8 @@ impl CapabilitySpace {
             return Err(CapabilityDeriveError::NotFound);
         }
 
-        let mut child_heads: [Option<usize>; MAX_CAPABILITIES_PER_CSPACE] =
-            [None; MAX_CAPABILITIES_PER_CSPACE];
-        let mut next_sibling: [Option<usize>; MAX_CAPABILITIES_PER_CSPACE] =
-            [None; MAX_CAPABILITIES_PER_CSPACE];
+        let mut scratch = REVOKE_SCRATCH.lock();
+        scratch.clear();
         for idx in 0..MAX_CAPABILITIES_PER_CSPACE {
             let Some(entry) = self.slots[idx].entry else {
                 continue;
@@ -209,32 +234,30 @@ impl CapabilitySpace {
             if self.slots[parent_idx].entry.is_none() {
                 continue;
             }
-            next_sibling[idx] = child_heads[parent_idx];
-            child_heads[parent_idx] = Some(idx);
+            scratch.next_sibling[idx] = scratch.child_heads[parent_idx];
+            scratch.child_heads[parent_idx] = Some(idx);
         }
 
-        let mut marked = [false; MAX_CAPABILITIES_PER_CSPACE];
-        let mut stack = [0usize; MAX_CAPABILITIES_PER_CSPACE];
         let mut sp = 0usize;
-        stack[sp] = id.index();
+        scratch.stack[sp] = id.index();
         sp += 1;
 
         while sp != 0 {
             sp -= 1;
-            let node = stack[sp];
-            if marked[node] {
+            let node = scratch.stack[sp];
+            if scratch.marked[node] {
                 continue;
             }
-            marked[node] = true;
-            let mut child = child_heads[node];
+            scratch.marked[node] = true;
+            let mut child = scratch.child_heads[node];
             while let Some(idx) = child {
-                stack[sp] = idx;
+                scratch.stack[sp] = idx;
                 sp += 1;
-                child = next_sibling[idx];
+                child = scratch.next_sibling[idx];
             }
         }
 
-        for (idx, is_marked) in marked.iter().copied().enumerate() {
+        for (idx, is_marked) in scratch.marked.iter().copied().enumerate() {
             if !is_marked {
                 continue;
             }
