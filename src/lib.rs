@@ -3,7 +3,12 @@
 
 #![no_std]
 
-#[cfg(feature = "hosted-dev")]
+#[cfg(all(feature = "hosted-dev", target_os = "none"))]
+compile_error!(
+    "feature `hosted-dev` cannot be enabled for bare-metal targets (target_os=\"none\"); build with --no-default-features for x86_64-yarm-none"
+);
+
+#[cfg(all(feature = "hosted-dev", not(target_os = "none")))]
 pub extern crate std;
 
 pub mod arch;
