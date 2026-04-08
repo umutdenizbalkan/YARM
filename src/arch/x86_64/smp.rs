@@ -66,7 +66,9 @@ yarm_ap_trampoline_start:
     mov eax, cr0
     or eax, 1
     mov cr0, eax
-    jmp far 0x08:3f
+    .byte 0xEA
+    .word 3f
+    .word 0x08
 
 2:
     .word 4f - 1
@@ -99,7 +101,9 @@ yarm_ap_trampoline_start:
     mov eax, cr0
     or eax, 0x80000000
     mov cr0, eax
-    jmp far 0x10:6f
+    .byte 0xEA
+    .long 6f
+    .word 0x10
 
     .code64
 6:
