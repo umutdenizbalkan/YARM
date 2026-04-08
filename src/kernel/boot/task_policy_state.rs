@@ -7,6 +7,15 @@ use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{TaskClass, ThreadControlBlock};
 
 impl KernelState {
+    fn next_dynamic_tid_after(tid: u64) -> u64 {
+        let next = tid.wrapping_add(1);
+        if next < super::INITIAL_DYNAMIC_TID {
+            super::INITIAL_DYNAMIC_TID
+        } else {
+            next
+        }
+    }
+
     pub(crate) fn register_task_with_class_in_process(
         &mut self,
         tid: u64,
@@ -54,13 +63,16 @@ impl KernelState {
 
     pub fn allocate_thread_id(&mut self) -> Result<u64, KernelError> {
         let limits = self.runtime_capacity_config();
-        let mut candidate = self.next_dynamic_tid;
-        for _ in 0..limits.max_tasks.saturating_mul(4) {
-            self.next_dynamic_tid = self.next_dynamic_tid.saturating_add(1);
+        if self.with_tcbs(|tcbs| tcbs.iter().flatten().count()) >= limits.max_tasks {
+            return Err(KernelError::TaskTableFull);
+        }
+        let mut candidate = self.next_dynamic_tid.max(super::INITIAL_DYNAMIC_TID);
+        for _ in 0..=limits.max_tasks {
             if self.task_status(candidate).is_none() {
+                self.next_dynamic_tid = Self::next_dynamic_tid_after(candidate);
                 return Ok(candidate);
             }
-            candidate = self.next_dynamic_tid;
+            candidate = Self::next_dynamic_tid_after(candidate);
         }
         Err(KernelError::TaskTableFull)
     }
