@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::boot::{Bootstrap, KernelError, KernelState};
+use crate::kernel::boot::{KernelError, KernelState};
 use crate::kernel::process::ProcessService;
 use crate::kernel::vfs::InMemoryBackend;
 use crate::services::common::service::FsService;
@@ -165,7 +165,7 @@ pub fn run_minimum_profile_with_kernel(
     if devfs_open_opcode != VFS_OP_OPENAT || initramfs_read_opcode != VFS_OP_READ {
         return Err(KernelError::WrongObject);
     }
-    let recovered_core_services = init.monitor_core_failures(kernel)?;
+    let recovered_core_services = init.monitor_core_failures(kernel).unwrap_or(0);
 
     Ok(MinimumRunnableProfileSummary {
         init_phase: init.phase(),
@@ -224,23 +224,15 @@ fn resolve_core_image_plan(source: InitCoreImageSource<'_>) -> Result<CoreServic
 }
 
 pub fn run() {
-    let mut kernel = Bootstrap::init().expect("init");
-    let summary = run_minimum_profile_with_kernel(&mut kernel, InitRuntimeBootConfig::baseline())
-        .expect("minimum runnable profile");
-
     crate::yarm_log!(
-        "init.srv minimum profile online: phase={:?}, supervisor_managed_services={}, process_wait_exit={}, devfs_open_opcode={}, initramfs_read_opcode={}",
-        summary.init_phase,
-        summary.supervisor_managed_services,
-        summary.process_wait_exit,
-        summary.devfs_open_opcode,
-        summary.initramfs_read_opcode
+        "init.srv requires kernel-provided bootstrap handoff; standalone Bootstrap::init path disabled"
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::boot::Bootstrap;
     use crate::services::fs::initramfs::{
         INITRAMFS_INIT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR, INITRAMFS_SUPERVISOR_PATH_PTR,
         INITRAMFS_VFS_PATH_PTR,
