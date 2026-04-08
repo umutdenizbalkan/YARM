@@ -19,6 +19,7 @@ const ICR_LEVEL_ASSERT: u32 = 1 << 14;
 const AP_TRAMPOLINE_PHYS: usize = 0x7000;
 const AP_TRAMPOLINE_VECTOR: u8 = (AP_TRAMPOLINE_PHYS >> 12) as u8;
 const AP_TRAMPOLINE_SIZE: usize = crate::kernel::vm::PAGE_SIZE;
+#[cfg(any(test, feature = "hosted-dev"))]
 const AP_HANDOFF_OFFSET: usize = 0x100;
 const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 const AP_STACK_BYTES: usize = 16 * 1024;
@@ -43,6 +44,11 @@ global_asm!(
     .global yarm_ap_trampoline_end
     .global yarm_ap_trampoline_handoff
     .code16
+    .set AP_OFF_REAL_L1, 1f - yarm_ap_trampoline_start
+    .set AP_OFF_GDTR, 2f - yarm_ap_trampoline_start
+    .set AP_OFF_PM_L5, 5f - yarm_ap_trampoline_start
+    .set AP_OFF_HANDOFF, yarm_ap_trampoline_handoff - yarm_ap_trampoline_start
+
 yarm_ap_trampoline_start:
     cli
     xor ax, ax
@@ -54,13 +60,13 @@ yarm_ap_trampoline_start:
     call 1f
 1:
     pop si
-    sub si, 1b - yarm_ap_trampoline_start
-    lgdt [si + (2f - yarm_ap_trampoline_start)]
+    sub si, AP_OFF_REAL_L1
+    lgdt [si + AP_OFF_GDTR]
 
     mov eax, cr0
     or eax, 1
     mov cr0, eax
-    ljmp 0x08, 3f
+    jmp 0x08:3f
 
 2:
     .word 4f - 1
@@ -76,9 +82,9 @@ yarm_ap_trampoline_start:
     call 5f
 5:
     pop ebx
-    sub ebx, 5b - yarm_ap_trampoline_start
+    sub ebx, AP_OFF_PM_L5
 
-    mov eax, [ebx + (yarm_ap_trampoline_handoff + 24 - yarm_ap_trampoline_start)]
+    mov eax, [ebx + AP_OFF_HANDOFF + 24]
     mov cr3, eax
 
     mov eax, cr4
@@ -93,7 +99,7 @@ yarm_ap_trampoline_start:
     mov eax, cr0
     or eax, 0x80000000
     mov cr0, eax
-    ljmp 0x10, 6f
+    jmp 0x10:6f
 
     .code64
 6:
@@ -103,8 +109,8 @@ yarm_ap_trampoline_start:
     mov ss, ax
 
     lea rbx, [rip + yarm_ap_trampoline_start]
-    mov rsp, [rbx + (yarm_ap_trampoline_handoff + 8 - yarm_ap_trampoline_start)]
-    lea rdi, [rbx + (yarm_ap_trampoline_handoff - yarm_ap_trampoline_start)]
+    mov rsp, [rbx + AP_OFF_HANDOFF + 8]
+    lea rdi, [rbx + AP_OFF_HANDOFF]
     movabs rax, yarm_x86_64_ap_entry
     call rax
 

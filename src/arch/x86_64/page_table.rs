@@ -523,6 +523,7 @@ const INVPCID_SUPPORT_UNAVAILABLE: u8 = 2;
 static INVPCID_SUPPORT: AtomicU8 = AtomicU8::new(INVPCID_SUPPORT_UNKNOWN);
 
 #[cfg(not(feature = "hosted-dev"))]
+#[allow(unused_unsafe)]
 fn cpu_supports_invpcid() -> bool {
     match INVPCID_SUPPORT.load(Ordering::Relaxed) {
         INVPCID_SUPPORT_AVAILABLE => true,
@@ -551,10 +552,10 @@ fn cpu_supports_invpcid() -> bool {
 #[cfg(not(feature = "hosted-dev"))]
 unsafe fn fallback_flush_tlb_via_cr3() {
     let mut cr3: u64;
-    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags));
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags)); }
     // Clear the no-flush bit (bit 63) to force an architectural flush.
     let flushed_cr3 = cr3 & !(1u64 << 63);
-    core::arch::asm!("mov cr3, {}", in(reg) flushed_cr3, options(nostack, preserves_flags));
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) flushed_cr3, options(nostack, preserves_flags)); }
 }
 
 pub fn invalidate_asid(asid: Asid) {
