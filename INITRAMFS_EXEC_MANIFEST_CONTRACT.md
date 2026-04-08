@@ -90,3 +90,13 @@ When manifest-backed mode is selected, init boot resolves
 `CoreServiceImagePlan` from `build_core_service_elf_launch_plan(...)` and then
 launches `process_manager`, `vfs`, and `supervisor` using manifest-derived
 validated ELF entry addresses.
+
+## Phase 5 hardening: core-service address-space isolation audit
+
+After core-service launch planning, init runtime performs an isolation audit that
+requires:
+
+- `process_manager`, `vfs`, and `supervisor` all have assigned ASIDs, and
+- all three ASIDs are pairwise distinct.
+
+Boot fails closed (`KernelError::WrongObject`) if the isolation audit fails.

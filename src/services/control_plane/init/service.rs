@@ -71,27 +71,36 @@ pub struct InitRuntimeSummary {
     pub present_cpu_bitmap: u64,
     pub online_cpus: usize,
     pub restart_counts: (u8, u8, u8),
+    pub isolation: CoreServiceIsolationReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreServiceIsolationReport {
+    pub process_manager_asid: u16,
+    pub vfs_asid: u16,
+    pub supervisor_asid: u16,
 }
 
 fn boot_init_runtime(
     kernel: &mut KernelState,
     config: InitRuntimeBootConfig<'_>,
-) -> Result<(InitService, usize), KernelError> {
+) -> Result<(InitService, usize, CoreServiceIsolationReport), KernelError> {
     let mut init = InitService::new();
     init.set_launch_strategy(config.launch_strategy);
     init.register_core_graph(kernel, config.graph)?;
     init.launch_core_services(kernel, resolve_core_image_plan(config.image_source)?)?;
     init.install_fault_handoff(kernel, config.restart_window_ticks)?;
+    let isolation = validate_core_service_isolation(kernel, &init)?;
     let seeded_registrations = init.seed_supervisor_registrations(kernel)?;
     init.begin_running(kernel)?;
-    Ok((init, seeded_registrations))
+    Ok((init, seeded_registrations, isolation))
 }
 
 pub fn run_with_kernel(
     kernel: &mut KernelState,
     config: InitRuntimeBootConfig<'_>,
 ) -> Result<InitRuntimeSummary, KernelError> {
-    let (init, seeded_registrations) = boot_init_runtime(kernel, config)?;
+    let (init, seeded_registrations, isolation) = boot_init_runtime(kernel, config)?;
 
     Ok(InitRuntimeSummary {
         phase: init.phase(),
@@ -102,6 +111,7 @@ pub fn run_with_kernel(
         present_cpu_bitmap: kernel.present_cpu_bitmap(),
         online_cpus: kernel.online_cpu_count(),
         restart_counts: init.restart_counts(),
+        isolation,
     })
 }
 
@@ -126,7 +136,7 @@ pub fn run_minimum_profile_with_kernel(
     kernel: &mut KernelState,
     config: InitRuntimeBootConfig<'_>,
 ) -> Result<MinimumRunnableProfileSummary, KernelError> {
-    let (mut init, seeded_registrations) = boot_init_runtime(kernel, config)?;
+    let (mut init, seeded_registrations, _) = boot_init_runtime(kernel, config)?;
     let handoff = init.fault_handoff().ok_or(KernelError::WrongObject)?;
     let mut supervisor = SupervisorService::new(
         init.handles().init_tid.ok_or(KernelError::WrongObject)?,
@@ -171,6 +181,27 @@ pub fn run_minimum_profile_with_kernel(
         initramfs_handled: initramfs_summary.handled,
         mount_report: init.mount_status().ok_or(KernelError::WrongObject)?,
         recovered_core_services,
+    })
+}
+
+fn validate_core_service_isolation(
+    kernel: &KernelState,
+    init: &InitService,
+) -> Result<CoreServiceIsolationReport, KernelError> {
+    let handles = init.handles();
+    let proc_tid = handles.process_manager_tid.ok_or(KernelError::WrongObject)?;
+    let vfs_tid = handles.vfs_tid.ok_or(KernelError::WrongObject)?;
+    let supervisor_tid = handles.supervisor_tid.ok_or(KernelError::WrongObject)?;
+    let proc_asid = kernel.task_asid(proc_tid).ok_or(KernelError::WrongObject)?;
+    let vfs_asid = kernel.task_asid(vfs_tid).ok_or(KernelError::WrongObject)?;
+    let supervisor_asid = kernel.task_asid(supervisor_tid).ok_or(KernelError::WrongObject)?;
+    if proc_asid == vfs_asid || proc_asid == supervisor_asid || vfs_asid == supervisor_asid {
+        return Err(KernelError::WrongObject);
+    }
+    Ok(CoreServiceIsolationReport {
+        process_manager_asid: proc_asid.0,
+        vfs_asid: vfs_asid.0,
+        supervisor_asid: supervisor_asid.0,
     })
 }
 
@@ -276,6 +307,9 @@ mod tests {
         assert_eq!(summary.handles.supervisor_tid, Some(4));
         assert_eq!(summary.seeded_registrations, 3);
         assert_eq!(summary.mount_report.mounted_count, 4);
+        assert_eq!(summary.isolation.process_manager_asid, 11);
+        assert_eq!(summary.isolation.vfs_asid, 12);
+        assert_eq!(summary.isolation.supervisor_asid, 13);
     }
 
     #[test]
@@ -378,4 +412,5 @@ mod tests {
         assert_eq!(plan.vfs_entry, 0x430000usize);
         assert_eq!(plan.supervisor_entry, 0x440000usize);
     }
+
 }
