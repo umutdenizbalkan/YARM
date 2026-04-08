@@ -26,6 +26,13 @@ pub struct IpcPathTelemetry {
     pub scheduler_fastpath_handoffs: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TidAllocationTelemetry {
+    pub dynamic_tid_allocations: u64,
+    pub dynamic_tid_wraps: u64,
+    pub gap_floor_repairs: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacityPoolTelemetry {
     pub used: usize,
@@ -70,6 +77,10 @@ mod tests {
         let telemetry = IpcPathTelemetry::default();
         assert_eq!(telemetry.fastpath_attempts, 0);
         assert_eq!(telemetry.scheduler_fastpath_handoffs, 0);
+        let tid = TidAllocationTelemetry::default();
+        assert_eq!(tid.dynamic_tid_allocations, 0);
+        assert_eq!(tid.dynamic_tid_wraps, 0);
+        assert_eq!(tid.gap_floor_repairs, 0);
     }
 
     #[test]

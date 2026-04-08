@@ -243,6 +243,7 @@ impl Bootstrap {
             telemetry: store_kernel_value(TelemetrySubsystem {
                 tlb_shootdown_count: 0,
                 tlb_shootdown_timeout_count: 0,
+                tid_allocation: TidAllocationTelemetry::default(),
             }),
             boot_config: store_kernel_value(BootConfigSubsystem { capacity_profile }),
             faults: store_kernel_value(FaultSubsystem {
@@ -256,6 +257,14 @@ impl Bootstrap {
                 next_restart_token: 1,
             }),
         };
+        crate::yarm_log!(
+            "YARM_TID_POLICY static_max={} dynamic_floor={} next_dynamic_tid={}",
+            state.tid_allocation_policy.static_tid_upper_bound(),
+            state.tid_allocation_policy.dynamic_tid_floor(),
+            state
+                .tid_allocation_cursor
+                .next_dynamic_tid(state.tid_allocation_policy)
+        );
 
         state.register_task(0)?;
         state.dispatch_next_task()?;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::{KernelError, KernelState};
+use super::{KernelError, KernelState, TidAllocationTelemetry};
 use crate::kernel::capabilities::CNodeId;
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{TaskClass, ThreadControlBlock};
@@ -58,12 +58,41 @@ impl KernelState {
             return Err(KernelError::TaskTableFull);
         }
         let policy = self.tid_allocation_policy;
+        let raw_cursor = self.tid_allocation_cursor.raw_next_dynamic_tid();
         let mut candidate = self.tid_allocation_cursor.next_dynamic_tid(policy);
+        if raw_cursor < policy.dynamic_tid_floor() {
+            self.with_telemetry_state_mut(|telemetry| {
+                telemetry.tid_allocation.gap_floor_repairs = telemetry
+                    .tid_allocation
+                    .gap_floor_repairs
+                    .saturating_add(1);
+            });
+        }
         for _ in 0..=limits.max_tasks {
             debug_assert!(candidate > policy.static_tid_upper_bound());
             if self.task_status(candidate).is_none() {
+                let wraps = policy.advance_dynamic_cursor(candidate) == policy.dynamic_tid_floor();
                 self.tid_allocation_cursor
                     .advance_after_allocation(policy, candidate);
+                self.with_telemetry_state_mut(|telemetry| {
+                    telemetry.tid_allocation.dynamic_tid_allocations = telemetry
+                        .tid_allocation
+                        .dynamic_tid_allocations
+                        .saturating_add(1);
+                    if wraps {
+                        telemetry.tid_allocation.dynamic_tid_wraps = telemetry
+                            .tid_allocation
+                            .dynamic_tid_wraps
+                            .saturating_add(1);
+                    }
+                });
+                if wraps {
+                    crate::yarm_log!(
+                        "YARM_TID_ALLOC_WRAP allocated={} reset_cursor_to={}",
+                        candidate,
+                        policy.dynamic_tid_floor()
+                    );
+                }
                 return Ok(candidate);
             }
             candidate = policy.advance_dynamic_cursor(candidate);
@@ -89,5 +118,9 @@ impl KernelState {
                 .filter(|tcb| tcb.tid.0 == tid)
                 .and(self.task_classes[idx])
         })
+    }
+
+    pub fn tid_allocation_telemetry(&self) -> TidAllocationTelemetry {
+        self.with_telemetry_state(|telemetry| telemetry.tid_allocation)
     }
 }

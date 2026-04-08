@@ -53,6 +53,10 @@ impl TidAllocationCursor {
         policy.normalize_dynamic_cursor(self.next_dynamic_tid)
     }
 
+    pub(crate) const fn raw_next_dynamic_tid(self) -> u64 {
+        self.next_dynamic_tid
+    }
+
     pub(crate) fn advance_after_allocation(
         &mut self,
         policy: TidAllocationPolicy,

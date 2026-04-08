@@ -15,7 +15,7 @@ Define and enforce a clear split between static/bootstrap TIDs and dynamically a
    - Make allocation semantics explicit (reserved range, dynamic range, wrap contract).
    - Remove ad-hoc cursor arithmetic from state methods.
 
-3. **Phase 3 — gap accounting + diagnostics**
+3. **Phase 3 — gap accounting + diagnostics (completed)**
    - Add policy-aware telemetry (`dynamic_tid_allocations`, `dynamic_tid_wraps`, `gap_floor_repairs`).
    - Emit structured boot-time diagnostics for configured policy boundaries.
 

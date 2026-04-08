@@ -4,7 +4,7 @@
 use super::*;
 pub use yarm_kernel::boot::{
     CapacityPoolTelemetry, CapacityTelemetry, IpcFastpathResult, IpcPathTelemetry,
-    KernelCapacityProfile, RuntimeCapacityConfig,
+    KernelCapacityProfile, RuntimeCapacityConfig, TidAllocationTelemetry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

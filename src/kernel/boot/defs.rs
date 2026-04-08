@@ -264,6 +264,7 @@ pub(crate) struct CapabilitySubsystem {
 pub(crate) struct TelemetrySubsystem {
     pub(crate) tlb_shootdown_count: u64,
     pub(crate) tlb_shootdown_timeout_count: u64,
+    pub(crate) tid_allocation: TidAllocationTelemetry,
 }
 
 #[derive(Debug)]

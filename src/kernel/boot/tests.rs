@@ -3820,6 +3820,22 @@ fn allocate_thread_id_wraps_to_dynamic_floor_after_u64_max() {
 }
 
 #[test]
+fn tid_allocation_telemetry_tracks_repairs_allocations_and_wraps() {
+    let mut state = Bootstrap::init().expect("init");
+    state.set_dynamic_tid_cursor_for_test(7);
+    let first = state.allocate_thread_id().expect("allocate first");
+    assert_eq!(first, INITIAL_DYNAMIC_TID);
+    state.set_dynamic_tid_cursor_for_test(u64::MAX);
+    let second = state.allocate_thread_id().expect("allocate second");
+    assert_eq!(second, u64::MAX);
+
+    let telemetry = state.tid_allocation_telemetry();
+    assert_eq!(telemetry.dynamic_tid_allocations, 2);
+    assert_eq!(telemetry.gap_floor_repairs, 1);
+    assert_eq!(telemetry.dynamic_tid_wraps, 1);
+}
+
+#[test]
 fn process_teardown_reclaims_process_cnode_space_and_delegated_descendants() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(730).expect("source process");
