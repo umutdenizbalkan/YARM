@@ -3,6 +3,8 @@
 
 use crate::kernel::boot::{KernelError, KernelState};
 use crate::kernel::scheduler::CpuId;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+use core::arch::global_asm;
 use core::ptr::copy_nonoverlapping;
 use core::ptr::write_volatile;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +35,120 @@ struct ApHandoff {
     ready_flag_ptr: u64,
 }
 
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+global_asm!(
+    r#"
+    .section .text.ap_trampoline,"ax",@progbits
+    .global yarm_ap_trampoline_start
+    .global yarm_ap_trampoline_end
+    .global yarm_ap_trampoline_handoff
+    .code16
+yarm_ap_trampoline_start:
+    cli
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x6ff0
+
+    call 1f
+1:
+    pop si
+    sub si, 1b - yarm_ap_trampoline_start
+    lgdt [si + (2f - yarm_ap_trampoline_start)]
+
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
+    ljmp 0x08, 3f
+
+2:
+    .word 4f - 1
+    .long 0
+
+    .code32
+3:
+    mov ax, 0x18
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+
+    call 5f
+5:
+    pop ebx
+    sub ebx, 5b - yarm_ap_trampoline_start
+
+    mov eax, [ebx + (yarm_ap_trampoline_handoff + 24 - yarm_ap_trampoline_start)]
+    mov cr3, eax
+
+    mov eax, cr4
+    or eax, (1 << 5)
+    mov cr4, eax
+
+    mov ecx, 0xC0000080
+    rdmsr
+    or eax, (1 << 8)
+    wrmsr
+
+    mov eax, cr0
+    or eax, 0x80000000
+    mov cr0, eax
+    ljmp 0x10, 6f
+
+    .code64
+6:
+    mov ax, 0x18
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+
+    lea rbx, [rip + yarm_ap_trampoline_start]
+    mov rsp, [rbx + (yarm_ap_trampoline_handoff + 8 - yarm_ap_trampoline_start)]
+    lea rdi, [rbx + (yarm_ap_trampoline_handoff - yarm_ap_trampoline_start)]
+    movabs rax, yarm_x86_64_ap_entry
+    call rax
+
+7:
+    hlt
+    jmp 7b
+
+    .align 8
+4:
+    .quad 0x0000000000000000
+    .quad 0x00cf9a000000ffff
+    .quad 0x00af9a000000ffff
+    .quad 0x00cf92000000ffff
+
+    .align 8
+yarm_ap_trampoline_handoff:
+    .zero 40
+
+yarm_ap_trampoline_end:
+    .code64
+"#
+);
+
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+unsafe extern "C" {
+    static yarm_ap_trampoline_start: u8;
+    static yarm_ap_trampoline_end: u8;
+    static yarm_ap_trampoline_handoff: u8;
+}
+
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> ! {
+    let handoff = unsafe { &*handoff_ptr };
+    if handoff.magic == AP_HANDOFF_MAGIC {
+        let ready_ptr = handoff.ready_flag_ptr as usize as *const AtomicBool;
+        unsafe { (*ready_ptr).store(true, Ordering::Release) };
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(any(test, feature = "hosted-dev"))]
 const AP_STUB: [u8; 16] = [
     0xFA, // cli
     0xF4, // hlt
@@ -45,6 +161,26 @@ static AP_READY_FLAGS: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
 
 fn encode_handoff(page: &mut [u8; AP_TRAMPOLINE_SIZE], handoff: ApHandoff) {
     page.fill(0);
+    #[cfg(all(not(test), not(feature = "hosted-dev")))]
+    unsafe {
+        let start = &yarm_ap_trampoline_start as *const u8;
+        let end = &yarm_ap_trampoline_end as *const u8;
+        let handoff_ptr = &yarm_ap_trampoline_handoff as *const u8;
+        let len = end.offset_from(start) as usize;
+        if len <= AP_TRAMPOLINE_SIZE {
+            copy_nonoverlapping(start, page.as_mut_ptr(), len);
+            let handoff_off = handoff_ptr.offset_from(start) as usize;
+            let handoff_bytes = core::slice::from_raw_parts(
+                (&handoff as *const ApHandoff).cast::<u8>(),
+                core::mem::size_of::<ApHandoff>(),
+            );
+            page[handoff_off..handoff_off + handoff_bytes.len()].copy_from_slice(handoff_bytes);
+        }
+        return;
+    }
+
+    #[cfg(any(test, feature = "hosted-dev"))]
+    {
     page[..AP_STUB.len()].copy_from_slice(&AP_STUB);
 
     let handoff_bytes = unsafe {
@@ -54,6 +190,7 @@ fn encode_handoff(page: &mut [u8; AP_TRAMPOLINE_SIZE], handoff: ApHandoff) {
         )
     };
     page[AP_HANDOFF_OFFSET..AP_HANDOFF_OFFSET + handoff_bytes.len()].copy_from_slice(handoff_bytes);
+    }
 }
 
 #[cfg(not(test))]
@@ -154,12 +291,21 @@ fn ap_stack_top(cpu: CpuId) -> u64 {
 }
 
 fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
+    #[cfg(all(not(test), not(feature = "hosted-dev")))]
+    let _ = kernel;
     let mut page = [0u8; AP_TRAMPOLINE_SIZE];
     AP_READY_FLAGS[cpu.0 as usize].store(false, Ordering::Release);
     let handoff = ApHandoff {
         magic: AP_HANDOFF_MAGIC,
         cpu_id: cpu.0 as u32,
         stack_top: ap_stack_top(cpu),
+        #[cfg(all(not(test), not(feature = "hosted-dev")))]
+        kernel_state_ptr: {
+            let mut cr3: u64 = 0;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags)); }
+            cr3
+        },
+        #[cfg(any(test, feature = "hosted-dev"))]
         kernel_state_ptr: kernel as *const _ as usize as u64,
         ready_flag_ptr: (&AP_READY_FLAGS[cpu.0 as usize] as *const AtomicBool as usize) as u64,
     };
