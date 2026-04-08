@@ -449,39 +449,13 @@ unsafe fn build_trap_frame_from_saved_regs(
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 fn write_trap_returns_to_saved_regs(
     regs: *mut X86SavedRegs,
-    interrupt_frame: *mut X86InterruptStackFrame,
     trap_frame: &crate::kernel::trapframe::TrapFrame,
 ) {
     let regs = unsafe { &mut *regs };
-    regs.rax = trap_frame.user_gpr(0) as u64;
-    regs.rbx = trap_frame.user_gpr(1) as u64;
-    regs.rcx = trap_frame.user_gpr(2) as u64;
-    regs.rdx = trap_frame.user_gpr(3) as u64;
-    regs.rsi = trap_frame.user_gpr(4) as u64;
-    regs.rdi = trap_frame.user_gpr(5) as u64;
-    regs.rbp = trap_frame.user_gpr(6) as u64;
-    regs.r8 = trap_frame.user_gpr(7) as u64;
-    regs.r9 = trap_frame.user_gpr(8) as u64;
-    regs.r10 = trap_frame.user_gpr(9) as u64;
-    regs.r11 = trap_frame.user_gpr(10) as u64;
-    regs.r12 = trap_frame.user_gpr(11) as u64;
-    regs.r13 = trap_frame.user_gpr(12) as u64;
-    regs.r14 = trap_frame.user_gpr(13) as u64;
-    regs.r15 = trap_frame.user_gpr(14) as u64;
-
-    // Preserve syscall return lanes for existing ABI behavior.
     regs.rax = trap_frame.ret0 as u64;
     regs.rbx = trap_frame.ret1 as u64;
     regs.rdx = trap_frame.ret2 as u64;
     regs.rcx = trap_frame.error as u64;
-
-    let frame = unsafe { &mut *interrupt_frame };
-    if trap_frame.saved_pc() != 0 {
-        frame.rip = trap_frame.saved_pc() as u64;
-    }
-    if (frame.cs & 0x3) == 0x3 && trap_frame.saved_sp() != 0 {
-        frame.rsp = trap_frame.saved_sp() as u64;
-    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -515,11 +489,7 @@ fn dispatch_trap_from_stub_for_test(
         Some(&mut trap_frame),
     )?;
     if vector as usize == VEC_SYSCALL {
-        write_trap_returns_to_saved_regs(
-            regs as *mut X86SavedRegs,
-            interrupt_frame as *const X86InterruptStackFrame as *mut X86InterruptStackFrame,
-            &trap_frame,
-        );
+        write_trap_returns_to_saved_regs(regs as *mut X86SavedRegs, &trap_frame);
     }
     Ok(())
 }
@@ -589,8 +559,8 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
         halt_forever();
     }
-    if unsafe { ((*interrupt_frame).cs & 0x3) == 0x3 } {
-        write_trap_returns_to_saved_regs(regs, interrupt_frame as *mut X86InterruptStackFrame, &trap_frame);
+    if vector as usize == VEC_SYSCALL {
+        write_trap_returns_to_saved_regs(regs, &trap_frame);
     }
     TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
 }
