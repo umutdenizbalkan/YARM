@@ -246,6 +246,25 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
+    fn find_entry_index(&self, virt: VirtAddr) -> Result<usize, usize> {
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + ((hi - lo) / 2);
+            let mid_virt = self.entries[mid].expect("dense mapping table").virt;
+            if mid_virt.0 < virt.0 {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < self.len && self.entries[lo].is_some_and(|entry| entry.virt == virt) {
+            Ok(lo)
+        } else {
+            Err(lo)
+        }
+    }
+
     pub fn new_kernel() -> Self {
         Self {
             kind: AddressSpaceKind::Kernel,
@@ -296,29 +315,27 @@ impl AddressSpace {
             return Err(VmError::PrivilegeViolation);
         }
 
-        let mut first_free: Option<usize> = None;
-        for i in 0..MAX_MAPPINGS {
-            match self.entries[i].as_mut() {
-                Some(entry) if entry.virt == virt => {
-                    let old = entry.mapping;
-                    arch_map_page(self.asid, virt, mapping)?;
-                    entry.mapping = mapping;
-                    return Ok(Some(old));
+        match self.find_entry_index(virt) {
+            Ok(i) => {
+                let entry = self.entries[i].as_mut().expect("entry");
+                let old = entry.mapping;
+                arch_map_page(self.asid, virt, mapping)?;
+                entry.mapping = mapping;
+                Ok(Some(old))
+            }
+            Err(i) => {
+                if self.len >= MAX_MAPPINGS {
+                    return Err(VmError::Full);
                 }
-                Some(_) => {}
-                None if first_free.is_none() => first_free = Some(i),
-                None => {}
+                arch_map_page(self.asid, virt, mapping)?;
+                for shift_idx in (i..self.len).rev() {
+                    self.entries[shift_idx + 1] = self.entries[shift_idx];
+                }
+                self.entries[i] = Some(Entry { virt, mapping });
+                self.len += 1;
+                Ok(None)
             }
         }
-
-        if let Some(i) = first_free {
-            arch_map_page(self.asid, virt, mapping)?;
-            self.entries[i] = Some(Entry { virt, mapping });
-            self.len += 1;
-            return Ok(None);
-        }
-
-        Err(VmError::Full)
     }
 
     fn mapping_is_allowed(&self, virt: VirtAddr, flags: PageFlags) -> bool {
@@ -330,33 +347,25 @@ impl AddressSpace {
     }
 
     pub fn unmap_page(&mut self, virt: VirtAddr) -> Option<Mapping> {
-        for slot in &mut self.entries {
-            if let Some(entry) = slot.as_ref()
-                && entry.virt == virt
-            {
-                self.len = self.len.saturating_sub(1);
-                let old = slot.take().map(|old| old.mapping);
-                arch_unmap_page(self.asid, virt);
-                return old;
-            }
+        let idx = self.find_entry_index(virt).ok()?;
+        let old = self.entries[idx]?.mapping;
+        arch_unmap_page(self.asid, virt);
+        for shift_idx in idx..self.len.saturating_sub(1) {
+            self.entries[shift_idx] = self.entries[shift_idx + 1];
         }
-        None
+        if self.len > 0 {
+            self.entries[self.len - 1] = None;
+            self.len -= 1;
+        }
+        Some(old)
     }
 
     /// Resolves a virtual address to its mapping.
     ///
-    /// Complexity: O(N) where N is `MAX_MAPPINGS`. For the current prototype
-    /// this remains acceptable, but a larger-scale implementation should use a
-    /// more efficient indexed structure.
+    /// Complexity: O(log N) over the sorted fixed-size mapping table.
     pub fn resolve(&self, virt: VirtAddr) -> Option<Mapping> {
-        for slot in &self.entries {
-            if let Some(entry) = slot {
-                if entry.virt == virt {
-                    return Some(entry.mapping);
-                }
-            }
-        }
-        None
+        let idx = self.find_entry_index(virt).ok()?;
+        Some(self.entries[idx]?.mapping)
     }
 
     pub fn mappings(&self) -> usize {
@@ -364,7 +373,7 @@ impl AddressSpace {
     }
 
     pub fn has_mapping_for_phys(&self, phys: PhysAddr) -> bool {
-        self.entries
+        self.entries[..self.len]
             .iter()
             .flatten()
             .any(|entry| entry.mapping.phys == phys)
@@ -372,12 +381,13 @@ impl AddressSpace {
 
     pub fn drain_mappings(&mut self) -> [Option<Mapping>; MAX_MAPPINGS] {
         let mut drained = [None; MAX_MAPPINGS];
-        for (idx, slot) in self.entries.iter_mut().enumerate() {
-            let Some(entry) = slot.take() else {
-                continue;
-            };
+        for (idx, slot) in self.entries.iter_mut().take(self.len).enumerate() {
+            let Some(entry) = slot.take() else { continue };
             arch_unmap_page(self.asid, entry.virt);
             drained[idx] = Some(entry.mapping);
+        }
+        for slot in self.entries.iter_mut().skip(self.len) {
+            *slot = None;
         }
         self.len = 0;
         drained
