@@ -189,12 +189,16 @@ fn validate_core_service_isolation(
     init: &InitService,
 ) -> Result<CoreServiceIsolationReport, KernelError> {
     let handles = init.handles();
-    let proc_tid = handles.process_manager_tid.ok_or(KernelError::WrongObject)?;
+    let proc_tid = handles
+        .process_manager_tid
+        .ok_or(KernelError::WrongObject)?;
     let vfs_tid = handles.vfs_tid.ok_or(KernelError::WrongObject)?;
     let supervisor_tid = handles.supervisor_tid.ok_or(KernelError::WrongObject)?;
     let proc_asid = kernel.task_asid(proc_tid).ok_or(KernelError::WrongObject)?;
     let vfs_asid = kernel.task_asid(vfs_tid).ok_or(KernelError::WrongObject)?;
-    let supervisor_asid = kernel.task_asid(supervisor_tid).ok_or(KernelError::WrongObject)?;
+    let supervisor_asid = kernel
+        .task_asid(supervisor_tid)
+        .ok_or(KernelError::WrongObject)?;
     if proc_asid == vfs_asid || proc_asid == supervisor_asid || vfs_asid == supervisor_asid {
         return Err(KernelError::WrongObject);
     }
@@ -205,15 +209,17 @@ fn validate_core_service_isolation(
     })
 }
 
-fn resolve_core_image_plan(source: InitCoreImageSource<'_>) -> Result<CoreServiceImagePlan, KernelError> {
+fn resolve_core_image_plan(
+    source: InitCoreImageSource<'_>,
+) -> Result<CoreServiceImagePlan, KernelError> {
     match source {
         InitCoreImageSource::Fixed(plan) => Ok(plan),
         InitCoreImageSource::Manifest {
             manifest_bytes,
             images,
         } => {
-            let launch =
-                build_core_service_elf_launch_plan(manifest_bytes, images).map_err(|_| KernelError::WrongObject)?;
+            let launch = build_core_service_elf_launch_plan(manifest_bytes, images)
+                .map_err(|_| KernelError::WrongObject)?;
             Ok(CoreServiceImagePlan {
                 process_manager_entry: launch.process_manager.validated_entry as usize,
                 vfs_entry: launch.vfs.validated_entry as usize,
@@ -233,11 +239,11 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
+    use crate::services::fs::initramfs::ManifestEntryWire;
     use crate::services::fs::initramfs::{
         INITRAMFS_INIT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR, INITRAMFS_SUPERVISOR_PATH_PTR,
         INITRAMFS_VFS_PATH_PTR,
     };
-    use crate::services::fs::initramfs::ManifestEntryWire;
     use crate::std::vec::Vec;
 
     const MANIFEST_MAGIC: u32 = 0x5941_524D;
@@ -404,5 +410,4 @@ mod tests {
         assert_eq!(plan.vfs_entry, 0x430000usize);
         assert_eq!(plan.supervisor_entry, 0x440000usize);
     }
-
 }

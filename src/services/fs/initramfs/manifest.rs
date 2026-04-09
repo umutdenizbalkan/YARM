@@ -314,7 +314,8 @@ mod tests {
     use crate::std::vec::Vec;
 
     fn encode_manifest(entries: &[ManifestEntryWire]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(MANIFEST_HEADER_BYTES + entries.len() * MANIFEST_ENTRY_BYTES);
+        let mut out =
+            Vec::with_capacity(MANIFEST_HEADER_BYTES + entries.len() * MANIFEST_ENTRY_BYTES);
         out.extend_from_slice(&MANIFEST_MAGIC.to_le_bytes());
         out.extend_from_slice(&MANIFEST_VERSION_V1.to_le_bytes());
         out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
@@ -406,7 +407,10 @@ mod tests {
         let bytes = encode_manifest(&baseline_entries());
         let manifest = parse_core_service_manifest(&bytes).expect("manifest");
         assert_eq!(manifest.init.path_ptr, INITRAMFS_INIT_PATH_PTR);
-        assert_eq!(manifest.process_manager.path_ptr, INITRAMFS_PROC_MGR_PATH_PTR);
+        assert_eq!(
+            manifest.process_manager.path_ptr,
+            INITRAMFS_PROC_MGR_PATH_PTR
+        );
         assert_eq!(manifest.vfs.path_ptr, INITRAMFS_VFS_PATH_PTR);
         assert_eq!(manifest.supervisor.path_ptr, INITRAMFS_SUPERVISOR_PATH_PTR);
     }

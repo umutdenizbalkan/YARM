@@ -9,6 +9,7 @@ const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
 const MAX_FREE_EXTENTS: usize = 256;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_FREE_EXTENTS: usize = 512;
+const MAX_TRACKED_FRAME_REFS: usize = 8192;
 #[cfg(feature = "hosted-dev")]
 const CONTIG_SIZE_CLASSES: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 #[cfg(not(feature = "hosted-dev"))]
@@ -38,6 +39,12 @@ struct FreeExtent {
     pages: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameRefCount {
+    phys: u64,
+    refs: u16,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PhysicalFrameAllocator {
     base_phys: u64,
@@ -49,6 +56,7 @@ pub struct PhysicalFrameAllocator {
     largest_free_run_pages: usize,
     run_hint_by_class: [Option<usize>; CONTIG_SIZE_CLASSES.len()],
     single_page_hint_idx: Option<usize>,
+    frame_refs: [Option<FrameRefCount>; MAX_TRACKED_FRAME_REFS],
 }
 
 impl PhysicalFrameAllocator {
@@ -63,6 +71,7 @@ impl PhysicalFrameAllocator {
             largest_free_run_pages: 0,
             run_hint_by_class: [const { None }; CONTIG_SIZE_CLASSES.len()],
             single_page_hint_idx: None,
+            frame_refs: [const { None }; MAX_TRACKED_FRAME_REFS],
         }
     }
 
@@ -96,6 +105,7 @@ impl PhysicalFrameAllocator {
         self.largest_free_run_pages = 0;
         self.run_hint_by_class = [const { None }; CONTIG_SIZE_CLASSES.len()];
         self.single_page_hint_idx = None;
+        self.frame_refs = [const { None }; MAX_TRACKED_FRAME_REFS];
 
         for region in regions {
             if !region.usable || region.len == 0 {
@@ -139,6 +149,7 @@ impl PhysicalFrameAllocator {
         let (alloc_phys, old_pages, new_pages) = self.split_extent_for_allocation(idx, 1)?;
         self.free_frames = self.free_frames.saturating_sub(1);
         self.update_hints_after_allocation(idx, old_pages, new_pages);
+        self.track_new_frame_ref(alloc_phys)?;
         Ok(alloc_phys)
     }
 
@@ -157,6 +168,10 @@ impl PhysicalFrameAllocator {
             let (alloc_phys, _, _) = self.split_extent_for_allocation(idx, pages)?;
             self.free_frames = self.free_frames.saturating_sub(pages);
             self.refresh_run_metadata();
+            for page in 0..pages {
+                let phys = alloc_phys.saturating_add((page as u64).saturating_mul(PAGE_SIZE_U64));
+                self.track_new_frame_ref(phys)?;
+            }
             return Ok(alloc_phys);
         }
 
@@ -189,17 +204,14 @@ impl PhysicalFrameAllocator {
         if end_phys > self.end_phys_exclusive || end_phys <= start_phys {
             return Err(FrameAllocError::OutOfRange);
         }
-        for extent in self.extents.iter().flatten() {
-            let extent_end = extent
-                .start_phys
-                .saturating_add((extent.pages as u64).saturating_mul(PAGE_SIZE_U64));
-            let overlaps = start_phys < extent_end && end_phys > extent.start_phys;
-            if overlaps {
-                return Err(FrameAllocError::AlreadyFree);
+        for page in 0..pages {
+            let phys = start_phys.saturating_add((page as u64).saturating_mul(PAGE_SIZE_U64));
+            let remaining = self.untrack_frame_ref(phys)?;
+            if remaining == 0 {
+                self.insert_extent(phys, 1)?;
+                self.free_frames = self.free_frames.saturating_add(1);
             }
         }
-        self.insert_extent(start_phys, pages)?;
-        self.free_frames = self.free_frames.saturating_add(pages);
         self.refresh_run_metadata();
         Ok(())
     }
@@ -246,6 +258,7 @@ impl PhysicalFrameAllocator {
             self.insert_extent(right_start, right_pages)?;
             self.free_frames = self.free_frames.saturating_sub(1);
             self.refresh_run_metadata();
+            self.track_new_frame_ref(phys)?;
             return Ok(());
         }
         if extent.pages == 0 {
@@ -255,7 +268,21 @@ impl PhysicalFrameAllocator {
         }
         self.free_frames = self.free_frames.saturating_sub(1);
         self.refresh_run_metadata();
+        self.track_new_frame_ref(phys)?;
         Ok(())
+    }
+
+    pub fn retain_frame(&mut self, phys: u64) -> Result<u16, FrameAllocError> {
+        self.frame_index(phys)?;
+        self.inc_frame_ref(phys)
+    }
+
+    pub fn frame_refcount(&self, phys: u64) -> Result<u16, FrameAllocError> {
+        self.frame_index(phys)?;
+        Ok(self
+            .frame_ref_slot(phys)
+            .map(|idx| self.frame_refs[idx].expect("ref slot").refs)
+            .unwrap_or(0))
     }
 
     pub fn total_frames(&self) -> usize {
@@ -277,6 +304,47 @@ impl PhysicalFrameAllocator {
             return Err(FrameAllocError::OutOfRange);
         }
         Ok(((phys - self.base_phys) / PAGE_SIZE_U64) as usize)
+    }
+
+    fn frame_ref_slot(&self, phys: u64) -> Option<usize> {
+        self.frame_refs
+            .iter()
+            .position(|slot| slot.is_some_and(|entry| entry.phys == phys))
+    }
+
+    fn track_new_frame_ref(&mut self, phys: u64) -> Result<(), FrameAllocError> {
+        if self.frame_ref_slot(phys).is_some() {
+            return Err(FrameAllocError::AlreadyFree);
+        }
+        let Some(slot) = self.frame_refs.iter_mut().find(|entry| entry.is_none()) else {
+            return Err(FrameAllocError::CapacityExceeded);
+        };
+        *slot = Some(FrameRefCount { phys, refs: 1 });
+        Ok(())
+    }
+
+    fn inc_frame_ref(&mut self, phys: u64) -> Result<u16, FrameAllocError> {
+        let Some(slot) = self.frame_ref_slot(phys) else {
+            return Err(FrameAllocError::AlreadyFree);
+        };
+        let mut entry = self.frame_refs[slot].expect("slot");
+        entry.refs = entry.refs.saturating_add(1);
+        self.frame_refs[slot] = Some(entry);
+        Ok(entry.refs)
+    }
+
+    fn untrack_frame_ref(&mut self, phys: u64) -> Result<u16, FrameAllocError> {
+        let Some(slot) = self.frame_ref_slot(phys) else {
+            return Err(FrameAllocError::AlreadyFree);
+        };
+        let mut entry = self.frame_refs[slot].expect("slot");
+        if entry.refs > 1 {
+            entry.refs -= 1;
+            self.frame_refs[slot] = Some(entry);
+            return Ok(entry.refs);
+        }
+        self.frame_refs[slot] = None;
+        Ok(0)
     }
 
     fn insert_extent(&mut self, start_phys: u64, pages: usize) -> Result<(), FrameAllocError> {

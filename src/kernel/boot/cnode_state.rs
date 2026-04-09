@@ -252,5 +252,4 @@ impl KernelState {
             self.note_transfer_record_revoked();
         }
     }
-
 }

@@ -68,9 +68,7 @@ impl KernelState {
         #[cfg(feature = "hosted-dev")]
         self.with_memory_state_mut(|memory| {
             for byte in 0..crate::kernel::vm::PAGE_SIZE {
-                memory
-                    .user_memory
-                    .insert((asid.0, page.0 + byte as u64), 0);
+                memory.user_memory.insert((asid.0, page.0 + byte as u64), 0);
             }
         });
 

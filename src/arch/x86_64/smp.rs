@@ -192,15 +192,16 @@ fn encode_handoff(page: &mut [u8; AP_TRAMPOLINE_SIZE], handoff: ApHandoff) {
 
     #[cfg(any(test, feature = "hosted-dev"))]
     {
-    page[..AP_STUB.len()].copy_from_slice(&AP_STUB);
+        page[..AP_STUB.len()].copy_from_slice(&AP_STUB);
 
-    let handoff_bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&handoff as *const ApHandoff).cast::<u8>(),
-            core::mem::size_of::<ApHandoff>(),
-        )
-    };
-    page[AP_HANDOFF_OFFSET..AP_HANDOFF_OFFSET + handoff_bytes.len()].copy_from_slice(handoff_bytes);
+        let handoff_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&handoff as *const ApHandoff).cast::<u8>(),
+                core::mem::size_of::<ApHandoff>(),
+            )
+        };
+        page[AP_HANDOFF_OFFSET..AP_HANDOFF_OFFSET + handoff_bytes.len()]
+            .copy_from_slice(handoff_bytes);
     }
 }
 
@@ -313,7 +314,9 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
         #[cfg(all(not(test), not(feature = "hosted-dev")))]
         kernel_state_ptr: {
             let mut cr3: u64 = 0;
-            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags)); }
+            unsafe {
+                core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags));
+            }
             cr3
         },
         #[cfg(any(test, feature = "hosted-dev"))]
@@ -356,7 +359,11 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                 Err(err) => return Err(err),
             }
         } else {
-            crate::yarm_log!("YARM_SMP_AP_TIMEOUT cpu={} trampoline=0x{:x}", cpu.0, AP_TRAMPOLINE_PHYS);
+            crate::yarm_log!(
+                "YARM_SMP_AP_TIMEOUT cpu={} trampoline=0x{:x}",
+                cpu.0,
+                AP_TRAMPOLINE_PHYS
+            );
         }
     }
 

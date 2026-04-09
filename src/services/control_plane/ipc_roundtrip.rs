@@ -57,7 +57,9 @@ where
     )
     .map_err(|_| malformed_err())?;
     let response = service.handle(sanitized_request)?;
-    kernel.ipc_reply(reply_cap, response).map_err(map_kernel_err)?;
+    kernel
+        .ipc_reply(reply_cap, response)
+        .map_err(map_kernel_err)?;
     kernel
         .ipc_recv_with_deadline(client_recv_cap, recv_timeout_ticks)
         .map_err(map_kernel_err)?

@@ -457,12 +457,7 @@ fn process_cleanup_purges_active_transfer_mappings_and_unmaps_pages() {
         )
         .expect("map");
     state
-        .register_active_transfer_mapping(
-            ThreadId(1),
-            mem_cap_task1,
-            VirtAddr(0x9000),
-            PAGE_SIZE,
-        )
+        .register_active_transfer_mapping(ThreadId(1), mem_cap_task1, VirtAddr(0x9000), PAGE_SIZE)
         .expect("register mapping");
     state.note_shared_mem_mapped(PAGE_SIZE);
     state.exit_task(1, 1).expect("exit");
@@ -517,12 +512,7 @@ fn revoking_transfer_cap_forces_unmap_of_active_transfer_mapping() {
         )
         .expect("map");
     state
-        .register_active_transfer_mapping(
-            ThreadId(1),
-            mem_cap_task1,
-            VirtAddr(0xA000),
-            PAGE_SIZE,
-        )
+        .register_active_transfer_mapping(ThreadId(1), mem_cap_task1, VirtAddr(0xA000), PAGE_SIZE)
         .expect("register mapping");
     state.note_shared_mem_mapped(PAGE_SIZE);
 
@@ -664,7 +654,10 @@ fn phase5_mixed_teardown_paths_keep_transfer_and_mapping_telemetry_balanced() {
     let telemetry = state.ipc_path_telemetry();
     assert_eq!(telemetry.transfer_records_created, 3);
     assert_eq!(telemetry.transfer_records_revoked, 6);
-    assert_eq!(telemetry.shared_mem_bytes_mapped, telemetry.shared_mem_bytes_released);
+    assert_eq!(
+        telemetry.shared_mem_bytes_mapped,
+        telemetry.shared_mem_bytes_released
+    );
 }
 
 #[test]
@@ -1181,7 +1174,9 @@ fn old_reply_cap_replay_is_rejected_after_restart_and_remint() {
     );
 
     let fresh = Message::new(9, b"fresh").expect("fresh reply");
-    state.ipc_reply(new_reply_cap, fresh).expect("fresh reply send");
+    state
+        .ipc_reply(new_reply_cap, fresh)
+        .expect("fresh reply send");
 }
 
 #[test]
@@ -1619,10 +1614,7 @@ fn source_revoke_only_impacts_delegated_descendants_not_unrelated_caps() {
     state.register_task(1).expect("task1");
 
     let root = state
-        .mint_capability_for_current_context(Capability::new(
-            CapObject::Kernel,
-            CapRights::READ,
-        ))
+        .mint_capability_for_current_context(Capability::new(CapObject::Kernel, CapRights::READ))
         .expect("root");
     let delegated = state
         .grant_capability_task_to_task_with_rights(0, root, 1, CapRights::READ)
@@ -1645,10 +1637,7 @@ fn invalid_source_revoke_does_not_revoke_delegated_descendants() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
     let root = state
-        .mint_capability_for_current_context(Capability::new(
-            CapObject::Kernel,
-            CapRights::READ,
-        ))
+        .mint_capability_for_current_context(Capability::new(CapObject::Kernel, CapRights::READ))
         .expect("root");
     let delegated = state
         .grant_capability_task_to_task_with_rights(0, root, 1, CapRights::READ)
@@ -2003,8 +1992,7 @@ fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() 
     assert_eq!(state.current_tid(), Some(1));
     let msg = state.ipc_recv(recv_cap_task1).expect("recv").expect("msg");
     assert!(msg.transferred_cap().is_some());
-    let region =
-        crate::kernel::ipc::SharedMemoryRegion::decode(msg.as_slice()).expect("region");
+    let region = crate::kernel::ipc::SharedMemoryRegion::decode(msg.as_slice()).expect("region");
     assert_eq!(region.offset, 0x2000);
     assert_eq!(region.len as usize, Message::MAX_PAYLOAD + 16);
 }
@@ -2353,8 +2341,7 @@ fn delegate_device_server_caps_configures_driver_record() {
         iova_len: crate::kernel::vm::PAGE_SIZE,
     };
 
-    let (irq_cap, dma_cap, iova_cap) =
-        state.delegate_device_server_caps(plan).expect("delegate");
+    let (irq_cap, dma_cap, iova_cap) = state.delegate_device_server_caps(plan).expect("delegate");
     let driver_cnode = state.task_cnode(34).expect("driver cnode");
     assert!(state.capability_for_cnode(driver_cnode, irq_cap).is_some());
     assert!(state.capability_for_cnode(driver_cnode, dma_cap).is_some());
@@ -2453,8 +2440,8 @@ fn capacity_telemetry_marks_endpoint_pressure_near_full() {
 
 #[test]
 fn runtime_capacity_profile_constrained_limits_endpoint_creation() {
-    let mut state = Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
-        .expect("init");
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
     let limits = state.runtime_capacity_config();
     assert_eq!(state.capacity_profile(), KernelCapacityProfile::Constrained);
 
@@ -2467,8 +2454,7 @@ fn runtime_capacity_profile_constrained_limits_endpoint_creation() {
 #[test]
 fn runtime_capacity_profile_constrained_limits_task_creation() {
     let mut task_state = crate::std::boxed::Box::new(
-        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
-            .expect("init"),
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init"),
     );
     let limits = task_state.runtime_capacity_config();
 
@@ -2484,8 +2470,7 @@ fn runtime_capacity_profile_constrained_limits_task_creation() {
 #[test]
 fn runtime_capacity_profile_constrained_limits_driver_registration() {
     let mut driver_state = crate::std::boxed::Box::new(
-        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
-            .expect("init"),
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init"),
     );
     let limits = driver_state.runtime_capacity_config();
     let registerable_drivers =
@@ -2508,8 +2493,7 @@ fn runtime_capacity_profile_constrained_limits_driver_registration() {
 #[test]
 fn runtime_capacity_profile_constrained_limits_memory_objects() {
     let mut memory_state = crate::std::boxed::Box::new(
-        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
-            .expect("init"),
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init"),
     );
     let limits = memory_state.runtime_capacity_config();
 
@@ -2526,8 +2510,8 @@ fn runtime_capacity_profile_constrained_limits_memory_objects() {
 
 #[test]
 fn capacity_telemetry_reports_runtime_profile_capacities() {
-    let state = Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
-        .expect("init");
+    let state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
     let limits = state.runtime_capacity_config();
     let t = state.capacity_telemetry();
 
@@ -2837,12 +2821,7 @@ fn supervisor_receives_transfer_revoke_report() {
         .set_supervisor_endpoint(recv_cap)
         .expect("supervisor ep");
     state
-        .report_transfer_revoke_to_supervisor(
-            7,
-            12,
-            0xA000,
-            crate::kernel::vm::PAGE_SIZE as u64,
-        )
+        .report_transfer_revoke_to_supervisor(7, 12, 0xA000, crate::kernel::vm::PAGE_SIZE as u64)
         .expect("report revoke");
 
     let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
@@ -2851,8 +2830,8 @@ fn supervisor_receives_transfer_revoke_report() {
         crate::kernel::supervisor_abi::SUPERVISOR_OP_TRANSFER_REVOKED
     );
     assert_eq!(msg.as_slice().len(), 32);
-    let event = crate::kernel::supervisor_abi::TransferRevokedEvent::decode(msg.as_slice())
-        .expect("event");
+    let event =
+        crate::kernel::supervisor_abi::TransferRevokedEvent::decode(msg.as_slice()).expect("event");
     assert_eq!(event.owner_pid, 7);
     assert_eq!(event.cap, 12);
     assert_eq!(event.base, 0xA000);
@@ -3845,7 +3824,10 @@ fn dynamic_tid_classification_is_stable_across_wrap_boundaries() {
     assert!(state.is_dynamic_tid(wrapped_edge));
     assert!(state.is_dynamic_tid(wrapped_floor));
     assert!(wrapped_floor < wrapped_edge);
-    assert_eq!(state.static_tid_upper_bound() + 1, state.dynamic_tid_floor());
+    assert_eq!(
+        state.static_tid_upper_bound() + 1,
+        state.dynamic_tid_floor()
+    );
 }
 
 #[test]

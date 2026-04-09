@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-pub use yarm_kernel::capability::{CNodeId, CapId, CapRights, CapabilityDeriveError};
 use crate::kernel::lock::SpinLockIrq;
+pub use yarm_kernel::capability::{CNodeId, CapId, CapRights, CapabilityDeriveError};
 
 /// Capability object identity remains a monolithic enum for now.
 ///

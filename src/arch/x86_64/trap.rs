@@ -11,7 +11,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 const VEC_SYSCALL: u8 = 0x80;
 const VEC_TIMER: u8 = 0x20;
 const VEC_EXTERNAL_BASE: u8 = 0x20;
-const VEC_EXTERNAL_LIMIT: u8 = VEC_EXTERNAL_BASE + crate::arch::platform_constants::MAX_IRQ_LINES as u8;
+const VEC_EXTERNAL_LIMIT: u8 =
+    VEC_EXTERNAL_BASE + crate::arch::platform_constants::MAX_IRQ_LINES as u8;
 const VEC_PAGE_FAULT: u8 = 14;
 #[cfg(not(feature = "hosted-dev"))]
 const MSR_FS_BASE: u32 = 0xC000_0100;

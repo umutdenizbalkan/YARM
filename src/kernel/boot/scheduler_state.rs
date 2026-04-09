@@ -235,7 +235,8 @@ impl KernelState {
                     telemetry.tlb_shootdown_count = telemetry.tlb_shootdown_count.wrapping_add(1);
                 });
                 let retired = self.with_user_spaces(|spaces| spaces.retired_entry(asid).is_some());
-                let current_matches = self.current_tid().and_then(|tid| self.task_asid(tid)) == Some(asid);
+                let current_matches =
+                    self.current_tid().and_then(|tid| self.task_asid(tid)) == Some(asid);
                 if self.current_cpu() == cpu && (retired || current_matches) {
                     crate::arch::selected_isa::page_table::invalidate_asid(asid);
                     if retired {

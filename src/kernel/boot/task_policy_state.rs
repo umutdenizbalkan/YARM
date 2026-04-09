@@ -62,10 +62,8 @@ impl KernelState {
         let mut candidate = self.tid_allocation_cursor.next_dynamic_tid(policy);
         if raw_cursor < policy.dynamic_tid_floor() {
             self.with_telemetry_state_mut(|telemetry| {
-                telemetry.tid_allocation.gap_floor_repairs = telemetry
-                    .tid_allocation
-                    .gap_floor_repairs
-                    .saturating_add(1);
+                telemetry.tid_allocation.gap_floor_repairs =
+                    telemetry.tid_allocation.gap_floor_repairs.saturating_add(1);
             });
         }
         for _ in 0..=limits.max_tasks {
@@ -80,10 +78,8 @@ impl KernelState {
                         .dynamic_tid_allocations
                         .saturating_add(1);
                     if wraps {
-                        telemetry.tid_allocation.dynamic_tid_wraps = telemetry
-                            .tid_allocation
-                            .dynamic_tid_wraps
-                            .saturating_add(1);
+                        telemetry.tid_allocation.dynamic_tid_wraps =
+                            telemetry.tid_allocation.dynamic_tid_wraps.saturating_add(1);
                     }
                 });
                 if wraps {
