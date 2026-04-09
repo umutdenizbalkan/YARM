@@ -3,7 +3,6 @@
 
 use crate::arch::vm_layout;
 use crate::kernel::topology::CpuBitmap;
-use crate::std::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtAddr(pub u64);
@@ -379,15 +378,15 @@ impl AddressSpace {
         self.len
     }
 
-    pub fn mapping_entries(&self) -> Vec<MappingEntry> {
-        let mut out = Vec::with_capacity(self.len);
-        for entry in self.entries.iter().take(self.len).flatten() {
-            out.push(MappingEntry {
-                virt: entry.virt,
-                mapping: entry.mapping,
-            });
+    pub fn mapping_at(&self, index: usize) -> Option<MappingEntry> {
+        if index >= self.len {
+            return None;
         }
-        out
+        let entry = self.entries[index]?;
+        Some(MappingEntry {
+            virt: entry.virt,
+            mapping: entry.mapping,
+        })
     }
 
     pub fn has_mapping_for_phys(&self, phys: PhysAddr) -> bool {

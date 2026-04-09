@@ -173,17 +173,19 @@ impl KernelState {
         &mut self,
         parent_asid: Asid,
     ) -> Result<Asid, KernelError> {
-        let snapshot = self.with_user_spaces(|spaces| {
-            spaces
-                .get(parent_asid)
-                .map(|aspace| aspace.mapping_entries())
-        });
-        let snapshot = snapshot.ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        if self.with_user_spaces(|spaces| spaces.get(parent_asid).is_none()) {
+            return Err(KernelError::Vm(VmError::InvalidAsid));
+        }
         let child_asid = self
             .with_user_spaces_mut(|spaces| spaces.create_user_space())
             .map_err(KernelError::Vm)?;
 
-        for MappingEntry { virt, mapping } in snapshot.iter().copied() {
+        let mut index = 0usize;
+        while let Some(MappingEntry { virt, mapping }) = self.with_user_spaces(|spaces| {
+            spaces
+                .get(parent_asid)
+                .and_then(|aspace| aspace.mapping_at(index))
+        }) {
             let mut shared_flags = mapping.flags;
             if mapping.flags.write {
                 shared_flags.write = false;
@@ -208,11 +210,8 @@ impl KernelState {
                 self.mark_cow_page(parent_asid, virt)?;
                 self.mark_cow_page(child_asid, virt)?;
             }
-        }
-
-        #[cfg(feature = "hosted-dev")]
-        self.with_memory_state_mut(|memory| {
-            for MappingEntry { virt, .. } in snapshot.iter().copied() {
+            #[cfg(feature = "hosted-dev")]
+            self.with_memory_state_mut(|memory| {
                 for offset in 0..crate::kernel::vm::PAGE_SIZE {
                     let from = (parent_asid.0, virt.0 + offset as u64);
                     let to = (child_asid.0, virt.0 + offset as u64);
@@ -220,8 +219,9 @@ impl KernelState {
                         memory.user_memory.insert(to, value);
                     }
                 }
-            }
-        });
+            });
+            index += 1;
+        }
 
         Ok(child_asid)
     }
