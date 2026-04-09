@@ -5,6 +5,12 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 use yarm::kernel::boot::Bootstrap;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+use yarm::kernel::boot::{KernelError, UserImageSpec};
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+use yarm::kernel::task::TaskClass;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+use yarm::kernel::vm::{PageFlags, VirtAddr};
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
@@ -299,8 +305,87 @@ fn run_boot_markers() -> yarm::kernel::boot::KernelState {
 
 #[cfg(not(test))]
 fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    if let Err(err) = spawn_first_ring3_init_server(kernel) {
+        yarm::pr_err!(
+            "failed to spawn ring-3 init_server bootstrap task: {:?}",
+            err
+        );
+    }
+
     let initial = kernel.dispatch_ready_task().ok().flatten();
     yarm::yarm_log!("YARM_SCHED_LOOP_START dispatched_tid={:?}", initial);
+
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    if let Some(tid) = initial
+        && let Some(context) = kernel.thread_user_context(tid)
+        && context.instruction_ptr.0 != 0
+        && context.stack_ptr.0 != 0
+    {
+        yarm::yarm_log!(
+            "YARM_RING3_INIT_TASK tid={} entry=0x{:x} stack_top=0x{:x}",
+            tid,
+            context.instruction_ptr.0,
+            context.stack_ptr.0
+        );
+        yarm::arch::x86_64::descriptor_tables::enter_user_mode_iret(
+            context.instruction_ptr.0,
+            context.stack_ptr.0,
+            context.arg0 as u64,
+            context.arg1 as u64,
+        );
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RING3_INIT_SERVER_TID: u64 = 1;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_1000;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RING3_INIT_SERVER_CODE_PAGE: u64 = 0x0040_0000;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RING3_INIT_SERVER_ASID: u16 = 1;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn spawn_first_ring3_init_server(
+    kernel: &mut yarm::kernel::boot::KernelState,
+) -> Result<(), KernelError> {
+    if kernel.task_asid(RING3_INIT_SERVER_TID).is_some() {
+        return Ok(());
+    }
+
+    let (asid, aspace_cap) = kernel.create_user_address_space()?;
+    if asid.0 != RING3_INIT_SERVER_ASID {
+        return Err(KernelError::WrongObject);
+    }
+    kernel.spawn_user_task_from_image(UserImageSpec {
+        tid: RING3_INIT_SERVER_TID,
+        entry: RING3_INIT_SERVER_ENTRY as usize,
+        asid: Some(asid),
+        class: TaskClass::SystemServer,
+    })?;
+
+    let (_mem_id, mem_cap) = kernel.alloc_anonymous_memory_object()?;
+    kernel.map_user_page_with_caps(
+        aspace_cap,
+        mem_cap,
+        VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
+        PageFlags::USER_RW,
+    )?;
+
+    // mov eax, SYSCALL_YIELD_NR ; int 0x80 ; jmp $
+    let code: [u8; 9] = [0xB8, 0x00, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xEB, 0xFE];
+    kernel.write_user_memory(
+        RING3_INIT_SERVER_TID,
+        RING3_INIT_SERVER_ENTRY as usize,
+        &code,
+    )?;
+    let _ = kernel.protect_user_page(
+        aspace_cap,
+        VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
+        PageFlags::USER_RX,
+    )?;
+    Ok(())
 }
 
 fn run() {

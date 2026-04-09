@@ -1140,6 +1140,44 @@ pub fn refresh_boot_tss_rsp0(rsp0: u64) {
 #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
 pub fn refresh_boot_tss_rsp0(_rsp0: u64) {}
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+unsafe extern "C" {
+    fn yarm_x86_enter_ring3(entry: u64, stack_top: u64, arg0: u64, arg1: u64) -> !;
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn enter_user_mode_iret(entry: u64, stack_top: u64, arg0: u64, arg1: u64) -> ! {
+    unsafe { yarm_x86_enter_ring3(entry, stack_top, arg0, arg1) }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .section .text, "ax", @progbits
+    .global yarm_x86_enter_ring3
+    .type yarm_x86_enter_ring3, @function
+yarm_x86_enter_ring3:
+    mov r8, rdi
+    mov r9, rsi
+    mov rdi, rdx
+    mov rsi, rcx
+    mov ax, 0x23
+    mov ds, ax
+    mov es, ax
+    push 0x23
+    push r9
+    push 0x202
+    push 0x1b
+    push r8
+    iretq
+"#
+);
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+pub fn enter_user_mode_iret(_entry: u64, _stack_top: u64, _arg0: u64, _arg1: u64) -> ! {
+    panic!("x86_64 ring-3 iret entry is unavailable on this build target")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
