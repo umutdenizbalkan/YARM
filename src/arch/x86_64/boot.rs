@@ -81,16 +81,15 @@ boot_pt0:
 
     .align 4096
 boot_pd_hi:
-    // Bootstrap identity map for high MMIO space used during early x86_64 init.
-    // Map the default xAPIC + IOAPIC windows:
-    //   0xFEC0_0000..0xFEDF_FFFF  (PD idx 502, 2MiB page)
-    //   0xFEE0_0000..0xFEFF_FFFF  (PD idx 503, 2MiB page)
-    // Mark APIC MMIO mappings uncacheable (PCD=1) for architectural correctness.
-    .set hi_page_flags_exec, 0x93
-    .zero 4016
-    .quad 0xFEC00000 | hi_page_flags_exec
-    .quad 0xFEE00000 | hi_page_flags_exec
-    .zero 64
+    // Bootstrap identity map for the 3GiB..4GiB window (PDPT[3]).
+    // This keeps early stack/data accesses valid even when linker placement
+    // pushes boot sections near the top of low 32-bit virtual space.
+    .set hi_page_flags_exec, 0x83
+    .set hi_page_index, 0
+    .rept 512
+    .quad (0xC0000000 + (hi_page_index * 0x200000)) | hi_page_flags_exec
+    .set hi_page_index, hi_page_index + 1
+    .endr
 
     .align 8
 gdt64:
