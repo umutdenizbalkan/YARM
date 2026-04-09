@@ -158,13 +158,10 @@ impl KernelState {
                 ipc.telemetry.scheduler_dispatch_calls.saturating_add(1);
         });
         let outgoing_tid = self.current_tid();
-        let outgoing_asid = outgoing_tid.and_then(|tid| self.task_asid(tid));
         let next = self.dispatch_next_current_cpu();
         if let Some(tid) = next {
             let incoming_asid = self.task_asid(tid);
-            if let Some(asid) = incoming_asid
-                && incoming_asid != outgoing_asid
-            {
+            if let Some(asid) = incoming_asid {
                 self.hal.switch_address_space(asid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
@@ -197,7 +194,6 @@ impl KernelState {
                 ipc.telemetry.scheduler_yield_calls.saturating_add(1);
         });
         let outgoing_tid = self.current_tid();
-        let outgoing_asid = outgoing_tid.and_then(|tid| self.task_asid(tid));
         if let Some(tid) = outgoing_tid {
             self.with_tcbs_mut(|tcbs| {
                 let tcb = tcbs
@@ -213,9 +209,7 @@ impl KernelState {
         let next_tid = self.on_preempt_current_cpu();
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);
-            if let Some(asid) = incoming_asid
-                && incoming_asid != outgoing_asid
-            {
+            if let Some(asid) = incoming_asid {
                 self.hal.switch_address_space(asid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
