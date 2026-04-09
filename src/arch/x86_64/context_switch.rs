@@ -17,6 +17,8 @@ core::arch::global_asm!(
     .global yarm_x86_switch_frame
     .type yarm_x86_switch_frame, @function
 yarm_x86_switch_frame:
+    fxsave [rdi + 64]
+
     mov [rdi + 16], rbx
     mov [rdi + 24], rbp
     mov [rdi + 32], r12
@@ -28,6 +30,8 @@ yarm_x86_switch_frame:
     mov [rdi + 8], rax
     lea rax, [rsp + 8]
     mov [rdi + 0], rax
+
+    fxrstor [rsi + 64]
 
     mov rbx, [rsi + 16]
     mov rbp, [rsi + 24]
@@ -57,6 +61,25 @@ pub fn switch_frames(prev: &mut ArchSwitchContext, next: &ArchSwitchContext) {
     }
 }
 
+
+#[inline]
+pub fn initialize_frame_fpu_state(frame: &mut ArchSwitchContext) {
+    #[cfg(all(not(test), target_arch = "x86_64"))]
+    unsafe {
+        core::arch::asm!(
+            "fninit",
+            "fxsave [{}]",
+            in(reg) ((frame as *mut ArchSwitchContext as *mut u8).add(64)),
+            options(nostack)
+        );
+    }
+
+    #[cfg(any(test, not(target_arch = "x86_64")))]
+    {
+        let _ = frame;
+    }
+}
+
 #[cfg(test)]
 static SWITCH_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -79,7 +102,7 @@ mod tests {
         let mut frame = ArchSwitchContext::default();
         assert_eq!(
             core::mem::size_of::<ArchSwitchContext>(),
-            ArchSwitchContext::WORDS * 8
+            ArchSwitchContext::WORDS * 8 + ArchSwitchContext::FXSAVE_BYTES
         );
         frame.set_stack_ptr(0xAAA0);
         frame.set_instruction_ptr(0xBBB0);

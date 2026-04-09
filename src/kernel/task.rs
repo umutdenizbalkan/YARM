@@ -82,14 +82,25 @@ pub struct RestartState {
     pub token: Option<RestartToken>,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchSwitchContext {
     words: [usize; 8],
+    fxsave: [u8; 512],
+}
+
+impl Default for ArchSwitchContext {
+    fn default() -> Self {
+        Self {
+            words: [0; 8],
+            fxsave: [0; 512],
+        }
+    }
 }
 
 impl ArchSwitchContext {
     pub const WORDS: usize = 8;
+    pub const FXSAVE_BYTES: usize = 512;
     const STACK_PTR_IDX: usize = 0;
     const INSTRUCTION_PTR_IDX: usize = 1;
 
