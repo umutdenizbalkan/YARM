@@ -389,7 +389,7 @@ impl KernelState {
         })
     }
 
-    fn resolve_memory_object_phys(
+    pub(crate) fn resolve_memory_object_phys(
         &self,
         mem_cap: CapId,
         flags: PageFlags,
@@ -421,7 +421,7 @@ impl KernelState {
         })
     }
 
-    fn map_user_page_in_asid_raw(
+    pub(crate) fn map_user_page_in_asid_raw(
         &mut self,
         asid: Asid,
         virt: VirtAddr,

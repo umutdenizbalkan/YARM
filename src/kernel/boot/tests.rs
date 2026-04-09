@@ -663,20 +663,33 @@ fn phase5_mixed_teardown_paths_keep_transfer_and_mapping_telemetry_balanced() {
 #[test]
 fn spawn_user_task_from_image_registers_asid_and_class() {
     let mut state = Bootstrap::init().expect("init");
+    let (asid, _map_cap) = state.create_user_address_space().expect("asid");
     let spawned = state
         .spawn_user_task_from_image(UserImageSpec {
             tid: 55,
             entry: 0x8000,
-            asid: Some(Asid(9)),
+            asid: Some(asid),
             class: TaskClass::SystemServer,
         })
         .expect("spawn");
     assert_eq!(spawned.tid, 55);
     assert_eq!(spawned.entry, 0x8000);
-    assert_eq!(spawned.asid, Some(Asid(9)));
+    assert_eq!(spawned.asid, Some(asid));
     assert_eq!(state.task_class(55), Some(TaskClass::SystemServer));
     let tcb = state.tcb_mut(55).expect("tcb");
-    assert_eq!(tcb.asid, Some(Asid(9)));
+    assert_eq!(tcb.asid, Some(asid));
+    let stack_top = tcb.user_stack_top.expect("stack top");
+    let stack_base = VirtAddr(stack_top.0 - 64 * crate::kernel::vm::PAGE_SIZE as u64);
+    let guard = VirtAddr(stack_base.0 - crate::kernel::vm::PAGE_SIZE as u64);
+    let aspace = state.user_spaces.get(asid).expect("aspace");
+    assert!(
+        aspace.resolve(stack_base).is_some(),
+        "stack page should be mapped"
+    );
+    assert!(
+        aspace.resolve(guard).is_none(),
+        "guard page below stack must stay unmapped"
+    );
 }
 
 #[test]

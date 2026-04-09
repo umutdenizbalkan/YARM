@@ -145,6 +145,19 @@ impl KernelState {
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
+        if spec.asid.is_some() {
+            let stack_top = self.allocate_user_stack_with_guard(spec.tid, 64)?;
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == spec.tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.user_stack_top = Some(stack_top);
+                tcb.user_context.stack_ptr = stack_top;
+                Ok::<_, KernelError>(())
+            })?;
+        }
         Ok(SpawnedUserTask {
             tid: spec.tid,
             entry: spec.entry,
