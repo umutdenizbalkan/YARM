@@ -136,4 +136,11 @@ Kernel code consumes only the selected re-export modules (`crate::arch::{vm_layo
 
 - `src/bin/kernel_boot.rs` is kept ISA-agnostic and delegates boot wiring via `src/arch/boot_entry.rs`.
 - ISA-specific boot assembly/symbols live under `src/arch/<isa>/boot.rs` (`x86_64`, `riscv64`, `aarch64`).
+- `arch::boot_entry` now forwards a boot-runtime surface to selected ISA boot modules:
+  - `run_with_prepared_kernel(fn(&mut KernelState))`
+  - `prepare_arch_boot(start_info_ptr)`
+  - `emit_panic(&PanicInfo)`
+  - `bootstrap_first_user_task(...)`
+  - `enter_dispatched_user_task_if_available(...)`
+- x86_64-specific PVH parsing, memmap-backed PT allocator seeding, early UART marker writes, and ring-3 first-task entry (`enter_user_mode_iret`) are now implemented in `src/arch/x86_64/boot.rs` / `src/arch/x86_64/descriptor_tables.rs`, not in `src/bin/kernel_boot.rs`.
 - `scripts/check-kernel-arch-boundary.sh` also enforces a bin-layer leakage rule for `src/bin/kernel_boot.rs` (no `global_asm!`, no ISA cfg tags, no direct x86 kernel-entry symbol).

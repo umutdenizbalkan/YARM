@@ -68,7 +68,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 - Added cargo aliases for x86_64-none bring-up in `.cargo/config.toml`.
 - Added x86-none build profile knobs in `Cargo.toml` and wired them into x86 artifact staging.
 - Added x86_64 artifact and smoke scaffolds: `scripts/build-qemu-x86_64-artifacts.sh`, `scripts/qemu-x86_64-core-smoke.sh`.
-- For x86 QEMU bring-up, the first blocker is producing a direct-bootable kernel artifact (PVH-enabled ELF or `bzImage`); immediate validation target is serial success markers (`YARM_BOOT_OK`, `YARM_PROC_VFS_OK`, `YARM_INIT_START`, `YARM_INIT_DONE`) once kernel entry is working.
+- For x86 QEMU bring-up, the first blocker is producing a direct-bootable kernel artifact (PVH-enabled ELF or `bzImage`); immediate validation target is serial success markers from the current arch-routed boot path (`YARM_BOOT_OK`, `YARM_SMP_STARTUP`, `YARM_SCHED_LOOP_START`, `YARM_RING3_INIT_TASK`) once kernel entry is working.
 - Added freestanding build bootstrap helper script: `scripts/build-x86_64-none-bootstrap.sh` (checks nightly + rust-src before running `-Z build-std`).
 - Added network/mirror bootstrap wrapper: `scripts/bootstrap-nightly-mirror.sh` (installs nightly + rust-src from configured Rust dist/update endpoints, then runs the freestanding bootstrap build).
 - Added Linux-compat sysdeps bootstrap module: `src/services/compatibility/linux_compat/sysdeps.rs` (startup + memory contract + clock stub).

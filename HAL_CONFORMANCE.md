@@ -55,6 +55,8 @@ All three profiles must satisfy identical kernel-facing semantics for:
 - Hosted-dev boot additionally supports firmware-blob input via `YARM_IRQ_FIRMWARE_BLOB`, canonicalized by selected-ISA topology helpers before controller configuration.
 - Boot entry now provides an explicit description-injection API (`run_kernel_boot_with_irq_description`) so firmware handoff can bypass env-var plumbing and configure controllers directly.
 - Boot entry also provides `run_kernel_boot_with_firmware_blob(...)` for explicit firmware-blob canonicalization + configuration without env vars.
+- Boot entry now also routes top-level kernel startup through selected-ISA boot hooks (`run_with_prepared_kernel`, `prepare_arch_boot`, `emit_panic`) to keep `src/bin/kernel_boot.rs` architecture-neutral.
+- First user-task bootstrap/entry handoff is likewise routed through `arch::boot_entry` (`bootstrap_first_user_task`, `enter_dispatched_user_task_if_available`) with ISA-specific implementations in `src/arch/<isa>/boot.rs`.
 - Boot entry additionally supports one-shot staged description handoff (`stage_irq_controller_description_for_boot`) for early-boot contexts where direct run-hook plumbing is inconvenient.
 - Staged boot-description copy/read paths are now protected by a boot-entry lock guard to avoid concurrent staging races.
 - Non-hosted early boot can now register a firmware-blob provider (`set_firmware_blob_provider_for_boot`) that run-boot consumes before env/platform fallbacks.
