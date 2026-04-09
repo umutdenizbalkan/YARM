@@ -65,6 +65,10 @@ pub fn clone_thread_hook(
         .map_err(Into::into)
 }
 
+pub fn fork_process_hook(kernel: &mut KernelState, parent_tid: u64) -> Result<u64, PosixErrno> {
+    kernel.fork_user_process_cow(parent_tid).map_err(Into::into)
+}
+
 pub fn set_tls_hook(kernel: &mut KernelState, tid: u64, tls_base: usize) -> Result<(), PosixErrno> {
     kernel
         .set_thread_tls_base(tid, tls_base)

@@ -1,14 +1,67 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::{KernelError, KernelState, MemoryObject, kernel_mut};
+use super::{KernelError, KernelState, MemoryObject, kernel_mut, kernel_ref};
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::frame_allocator::FrameAllocError;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::topology::CpuBitmap;
-use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError};
+use crate::kernel::vm::{Asid, Mapping, MappingEntry, PageFlags, PhysAddr, VirtAddr, VmError};
 
 impl KernelState {
+    fn mark_cow_page(&mut self, asid: Asid, virt: VirtAddr) -> Result<(), KernelError> {
+        self.with_memory_state_mut(|memory| {
+            if memory
+                .cow_pages
+                .iter()
+                .flatten()
+                .any(|entry| entry.asid == asid && entry.virt == virt)
+            {
+                return Ok(());
+            }
+            let Some(slot) = kernel_mut(&mut memory.cow_pages)
+                .iter_mut()
+                .find(|slot| slot.is_none())
+            else {
+                return Err(KernelError::MemoryObjectFull);
+            };
+            *slot = Some(super::CowPageRecord { asid, virt });
+            Ok(())
+        })
+    }
+
+    fn clear_cow_page(&mut self, asid: Asid, virt: VirtAddr) {
+        self.with_memory_state_mut(|memory| {
+            for slot in kernel_mut(&mut memory.cow_pages).iter_mut() {
+                if matches!(
+                    slot.as_ref(),
+                    Some(entry) if entry.asid == asid && entry.virt == virt
+                ) {
+                    *slot = None;
+                }
+            }
+        });
+    }
+
+    fn clear_cow_pages_for_asid(&mut self, asid: Asid) {
+        self.with_memory_state_mut(|memory| {
+            for slot in kernel_mut(&mut memory.cow_pages).iter_mut() {
+                if matches!(slot.as_ref(), Some(entry) if entry.asid == asid) {
+                    *slot = None;
+                }
+            }
+        });
+    }
+
+    pub(crate) fn is_cow_page(&self, asid: Asid, virt: VirtAddr) -> bool {
+        self.with_memory_state(|memory| {
+            kernel_ref(&memory.cow_pages)
+                .iter()
+                .flatten()
+                .any(|entry| entry.asid == asid && entry.virt == virt)
+        })
+    }
+
     pub fn destroy_user_address_space(&mut self, aspace_cap: CapId) -> Result<(), KernelError> {
         let cnode = self.current_task_cnode().ok_or(KernelError::TaskMissing)?;
         let capability = self
@@ -87,6 +140,7 @@ impl KernelState {
         &mut self,
         asid: Asid,
     ) -> Result<(), KernelError> {
+        self.clear_cow_pages_for_asid(asid);
         let pending_cpu_bitmap = self.online_cpu_bitmap();
         let drained = self
             .with_user_spaces_mut(|spaces| {
@@ -115,6 +169,96 @@ impl KernelState {
         Ok(())
     }
 
+    pub(crate) fn clone_user_address_space_cow(
+        &mut self,
+        parent_asid: Asid,
+    ) -> Result<Asid, KernelError> {
+        let snapshot = self.with_user_spaces(|spaces| {
+            spaces
+                .get(parent_asid)
+                .map(|aspace| aspace.mapping_entries())
+        });
+        let snapshot = snapshot.ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        let child_asid = self
+            .with_user_spaces_mut(|spaces| spaces.create_user_space())
+            .map_err(KernelError::Vm)?;
+
+        for MappingEntry { virt, mapping } in snapshot.iter().copied() {
+            let mut shared_flags = mapping.flags;
+            if mapping.flags.write {
+                shared_flags.write = false;
+            }
+            self.map_user_page_in_asid_raw(
+                child_asid,
+                virt,
+                Mapping {
+                    phys: mapping.phys,
+                    flags: shared_flags,
+                },
+            )?;
+            if mapping.flags.write {
+                self.map_user_page_in_asid_raw(
+                    parent_asid,
+                    virt,
+                    Mapping {
+                        phys: mapping.phys,
+                        flags: shared_flags,
+                    },
+                )?;
+                self.mark_cow_page(parent_asid, virt)?;
+                self.mark_cow_page(child_asid, virt)?;
+            }
+        }
+
+        #[cfg(feature = "hosted-dev")]
+        self.with_memory_state_mut(|memory| {
+            for MappingEntry { virt, .. } in snapshot.iter().copied() {
+                for offset in 0..crate::kernel::vm::PAGE_SIZE {
+                    let from = (parent_asid.0, virt.0 + offset as u64);
+                    let to = (child_asid.0, virt.0 + offset as u64);
+                    if let Some(value) = memory.user_memory.get(&from).copied() {
+                        memory.user_memory.insert(to, value);
+                    }
+                }
+            }
+        });
+
+        Ok(child_asid)
+    }
+
+    pub(crate) fn try_handle_cow_fault(
+        &mut self,
+        asid: Asid,
+        fault_addr: VirtAddr,
+    ) -> Result<bool, KernelError> {
+        let page = fault_addr.page_align_down();
+        if !self.is_cow_page(asid, page) {
+            return Ok(false);
+        }
+        let mapping = self
+            .with_user_spaces(|spaces| spaces.get(asid).and_then(|aspace| aspace.resolve(page)))
+            .ok_or(KernelError::UserMemoryFault)?;
+        if mapping.flags.write {
+            self.clear_cow_page(asid, page);
+            return Ok(true);
+        }
+        let (_id, mem_cap) = self.alloc_anonymous_memory_object()?;
+        let new_phys = self.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)?;
+        let mut flags = mapping.flags;
+        flags.write = true;
+        self.map_user_page_in_asid_raw(
+            asid,
+            page,
+            Mapping {
+                phys: new_phys,
+                flags,
+            },
+        )
+        .map(|_| ())?;
+        self.clear_cow_page(asid, page);
+        Ok(true)
+    }
+
     pub fn map_user_page(
         &mut self,
         map_cap: CapId,
@@ -133,18 +277,7 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
 
-        let old = self.with_user_spaces_mut(|spaces| {
-            let aspace = spaces
-                .get_mut(asid)
-                .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-            aspace.map_page(virt, mapping).map_err(KernelError::Vm)
-        })?;
-        if let Some(old_mapping) = old {
-            self.note_mapping_removed(old_mapping.phys);
-            self.reclaim_memory_object_for_phys(old_mapping.phys);
-        }
-        self.note_mapping_inserted(mapping.phys);
-        Ok(old)
+        self.map_user_page_in_asid_raw(asid, virt, mapping)
     }
 
     pub fn create_memory_object(&mut self, phys: PhysAddr) -> Result<(u64, CapId), KernelError> {
@@ -288,6 +421,30 @@ impl KernelState {
         })
     }
 
+    fn map_user_page_in_asid_raw(
+        &mut self,
+        asid: Asid,
+        virt: VirtAddr,
+        mapping: Mapping,
+    ) -> Result<Option<Mapping>, KernelError> {
+        let old = self.with_user_spaces_mut(|spaces| {
+            let aspace = spaces
+                .get_mut(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+            aspace.map_page(virt, mapping).map_err(KernelError::Vm)
+        })?;
+        if let Some(old_mapping) = old {
+            self.clear_cow_page(asid, virt);
+            self.note_mapping_removed(old_mapping.phys);
+            self.reclaim_memory_object_for_phys(old_mapping.phys);
+        }
+        if mapping.flags.write {
+            self.clear_cow_page(asid, virt);
+        }
+        self.note_mapping_inserted(mapping.phys);
+        Ok(old)
+    }
+
     pub fn map_user_page_with_caps(
         &mut self,
         aspace_map_cap: CapId,
@@ -308,19 +465,7 @@ impl KernelState {
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
         let phys = self.resolve_memory_object_phys(mem_cap, flags)?;
-        let aspace = self
-            .user_spaces
-            .get_mut(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let old = aspace
-            .map_page(virt, Mapping { phys, flags })
-            .map_err(KernelError::Vm)?;
-        if let Some(old_mapping) = old {
-            self.note_mapping_removed(old_mapping.phys);
-            self.reclaim_memory_object_for_phys(old_mapping.phys);
-        }
-        self.note_mapping_inserted(phys);
-        Ok(old)
+        self.map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags })
     }
 
     pub(crate) fn unmap_user_page_in_current_asid(
@@ -335,6 +480,7 @@ impl KernelState {
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
         let unmapped = aspace.unmap_page(virt);
         if let Some(mapping) = unmapped {
+            self.clear_cow_page(asid, virt);
             self.note_mapping_removed(mapping.phys);
             self.reclaim_memory_object_for_phys(mapping.phys);
             self.request_live_asid_shootdown(asid, virt)?;
@@ -367,19 +513,7 @@ impl KernelState {
         flags: PageFlags,
     ) -> Result<Option<Mapping>, KernelError> {
         let phys = self.resolve_memory_object_phys(mem_cap, flags)?;
-        let aspace = self
-            .user_spaces
-            .get_mut(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let old = aspace
-            .map_page(virt, Mapping { phys, flags })
-            .map_err(KernelError::Vm)?;
-        if let Some(old_mapping) = old {
-            self.note_mapping_removed(old_mapping.phys);
-            self.reclaim_memory_object_for_phys(old_mapping.phys);
-        }
-        self.note_mapping_inserted(phys);
-        Ok(old)
+        self.map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags })
     }
 
     pub fn unmap_user_page(
@@ -404,6 +538,7 @@ impl KernelState {
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
         let unmapped = aspace.unmap_page(virt);
         if let Some(mapping) = unmapped {
+            self.clear_cow_page(asid, virt);
             self.note_mapping_removed(mapping.phys);
             self.reclaim_memory_object_for_phys(mapping.phys);
             self.request_live_asid_shootdown(asid, virt)?;
@@ -422,6 +557,7 @@ impl KernelState {
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
         let unmapped = aspace.unmap_page(virt);
         if let Some(mapping) = unmapped {
+            self.clear_cow_page(asid, virt);
             self.note_mapping_removed(mapping.phys);
             self.reclaim_memory_object_for_phys(mapping.phys);
             self.request_live_asid_shootdown(asid, virt)?;
@@ -463,8 +599,12 @@ impl KernelState {
             )
             .map_err(KernelError::Vm)?;
         if let Some(old_mapping) = old {
+            self.clear_cow_page(asid, virt);
             self.note_mapping_removed(old_mapping.phys);
             self.reclaim_memory_object_for_phys(old_mapping.phys);
+        }
+        if new_flags.write {
+            self.clear_cow_page(asid, virt);
         }
         self.note_mapping_inserted(current.phys);
         Ok(old)
@@ -494,8 +634,12 @@ impl KernelState {
             )
             .map_err(KernelError::Vm)?;
         if let Some(old_mapping) = old {
+            self.clear_cow_page(asid, virt);
             self.note_mapping_removed(old_mapping.phys);
             self.reclaim_memory_object_for_phys(old_mapping.phys);
+        }
+        if new_flags.write {
+            self.clear_cow_page(asid, virt);
         }
         self.note_mapping_inserted(current.phys);
         Ok(old)

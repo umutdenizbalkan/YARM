@@ -453,4 +453,43 @@ impl KernelState {
         let _ = self.enqueue_task(tid)?;
         Ok(tid)
     }
+
+    pub fn fork_user_process_cow(&mut self, parent_tid: u64) -> Result<u64, KernelError> {
+        let parent = self
+            .with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == parent_tid)
+                    .cloned()
+            })
+            .ok_or(KernelError::TaskMissing)?;
+        let parent_class = self
+            .task_class(parent_tid)
+            .ok_or(KernelError::TaskMissing)?;
+        let parent_asid = parent.asid.ok_or(KernelError::UserMemoryFault)?;
+        let child_asid = self.clone_user_address_space_cow(parent_asid)?;
+
+        let child_tid = self.allocate_thread_id()?;
+        self.register_task_with_class(child_tid, parent_class)?;
+        let child_cnode = self.task_cnode(child_tid).ok_or(KernelError::TaskMissing)?;
+        self.set_process_cnode_for_pid(child_tid, child_cnode)?;
+        self.with_tcbs_mut(|tcbs| {
+            let child = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == child_tid)
+                .ok_or(KernelError::TaskMissing)?;
+            child.thread_group_id = ThreadGroupId(child_tid);
+            child.asid = Some(child_asid);
+            child.tls_ptr = parent.tls_ptr;
+            child.user_entry = parent.user_entry;
+            child.user_stack_top = parent.user_stack_top;
+            child.user_context = parent.user_context;
+            child.user_context.arg0 = 0;
+            child.status = TaskStatus::Runnable;
+            Ok::<_, KernelError>(())
+        })?;
+        let _ = self.enqueue_task(child_tid)?;
+        Ok(child_tid)
+    }
 }

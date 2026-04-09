@@ -216,6 +216,17 @@ impl KernelState {
 
         match event {
             TrapEvent::PageFault(fault) => {
+                if matches!(fault.access, FaultAccess::Write) {
+                    if let Some(tid) = self.current_tid()
+                        && let Some(asid) = self.task_asid(tid)
+                        && self
+                            .try_handle_cow_fault(asid, fault.addr)
+                            .map_err(SyscallError::from)
+                            .map_err(TrapHandleError::Syscall)?
+                    {
+                        return Ok(());
+                    }
+                }
                 if self
                     .try_handle_demand_page_fault(fault)
                     .map_err(SyscallError::from)

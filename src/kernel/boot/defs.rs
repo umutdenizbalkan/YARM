@@ -108,6 +108,12 @@ pub(crate) struct BrkRegionRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CowPageRecord {
+    pub(crate) asid: Asid,
+    pub(crate) virt: VirtAddr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RobustFutexRecord {
     pub(crate) tid: ThreadId,
     pub(crate) state: RobustFutexState,
@@ -216,6 +222,7 @@ pub(crate) struct MemorySubsystem {
     pub(crate) user_memory: KernelStorage<UserMemoryStore>,
     pub(crate) memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
     pub(crate) brk_regions: [Option<BrkRegionRecord>; MAX_TASKS],
+    pub(crate) cow_pages: KernelStorage<[Option<CowPageRecord>; MAX_COW_PAGES]>,
     pub(crate) next_memory_object_id: u64,
     pub(crate) frame_allocator: KernelStorage<PhysicalFrameAllocator>,
 }

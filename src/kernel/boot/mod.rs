@@ -72,6 +72,10 @@ const MAX_TASKS: usize = 128;
 
 const MAX_MEMORY_OBJECTS: usize = 512;
 const MAX_BOOT_MEMORY_REGIONS: usize = 64;
+#[cfg(feature = "hosted-dev")]
+const MAX_COW_PAGES: usize = 1024;
+#[cfg(not(feature = "hosted-dev"))]
+const MAX_COW_PAGES: usize = 256;
 
 #[cfg(feature = "hosted-dev")]
 const MAX_NOTIFICATIONS: usize = 64;

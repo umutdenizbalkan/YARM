@@ -233,6 +233,7 @@ impl Bootstrap {
                 user_memory: store_kernel_value(UserMemoryStore::default()),
                 memory_objects: [None; MAX_MEMORY_OBJECTS],
                 brk_regions: [None; MAX_TASKS],
+                cow_pages: store_kernel_value([None; MAX_COW_PAGES]),
                 next_memory_object_id: 1,
                 frame_allocator: store_kernel_value(frame_allocator),
             }),

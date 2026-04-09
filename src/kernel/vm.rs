@@ -3,6 +3,7 @@
 
 use crate::arch::vm_layout;
 use crate::kernel::topology::CpuBitmap;
+use crate::std::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtAddr(pub u64);
@@ -232,6 +233,12 @@ struct Entry {
     mapping: Mapping,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappingEntry {
+    pub virt: VirtAddr,
+    pub mapping: Mapping,
+}
+
 /// Software shadow of the hardware page table.
 ///
 /// `map_page` and `unmap_page` keep this in-kernel record in sync with the
@@ -370,6 +377,17 @@ impl AddressSpace {
 
     pub fn mappings(&self) -> usize {
         self.len
+    }
+
+    pub fn mapping_entries(&self) -> Vec<MappingEntry> {
+        let mut out = Vec::with_capacity(self.len);
+        for entry in self.entries.iter().take(self.len).flatten() {
+            out.push(MappingEntry {
+                virt: entry.virt,
+                mapping: entry.mapping,
+            });
+        }
+        out
     }
 
     pub fn has_mapping_for_phys(&self, phys: PhysAddr) -> bool {
