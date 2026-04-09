@@ -650,6 +650,9 @@ fn debug_uart_marker(byte: u8) {
 pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
     use crate::kernel::boot::Bootstrap;
 
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
     debug_uart_marker(b'H');
     let kernel_state = Bootstrap::init().expect("kernel init");
     let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(kernel_state);
