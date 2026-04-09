@@ -2,6 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+use core::sync::atomic::AtomicU8;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 use core::sync::atomic::AtomicU64;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 use core::sync::atomic::AtomicUsize;
@@ -230,13 +232,21 @@ struct X86InterruptStackFrame {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-static TRAP_KERNEL_STATE_PTR: AtomicUsize = AtomicUsize::new(0);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const UNMAPPED_CPU: usize = usize::MAX;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static APIC_TO_CPU_ID: [AtomicUsize; 256] = [const { AtomicUsize::new(UNMAPPED_CPU) }; 256];
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const TRAP_KERNEL_STATE_UNINITIALIZED: u8 = 0;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const TRAP_KERNEL_STATE_READY: u8 = 1;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static TRAP_KERNEL_STATE_STATUS: AtomicU8 = AtomicU8::new(TRAP_KERNEL_STATE_UNINITIALIZED);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[unsafe(link_section = ".bss.kernel_state")]
+static mut TRAP_KERNEL_STATE: core::mem::MaybeUninit<crate::kernel::boot::KernelState> =
+    core::mem::MaybeUninit::uninit();
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_DATA_PORT: u16 = 0x3F8;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -365,12 +375,34 @@ fn encode_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-pub fn register_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState) {
-    TRAP_KERNEL_STATE_PTR.store(kernel as *mut _ as usize, Ordering::Release);
+pub fn install_trap_kernel_state(
+    kernel: crate::kernel::boot::KernelState,
+) -> &'static mut crate::kernel::boot::KernelState {
+    if TRAP_KERNEL_STATE_STATUS
+        .compare_exchange(
+            TRAP_KERNEL_STATE_UNINITIALIZED,
+            TRAP_KERNEL_STATE_READY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        panic!("trap kernel state already installed");
+    }
+    let kernel = unsafe { TRAP_KERNEL_STATE.write(kernel) };
     register_apic_cpu_mapping(
         raw_current_apic_id() as u8,
         crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID),
     );
+    kernel
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelState> {
+    if TRAP_KERNEL_STATE_STATUS.load(Ordering::Acquire) != TRAP_KERNEL_STATE_READY {
+        return None;
+    }
+    Some(unsafe { TRAP_KERNEL_STATE.assume_init_mut() })
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -539,8 +571,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         fault_addr,
     };
 
-    let state_ptr = TRAP_KERNEL_STATE_PTR.load(Ordering::Acquire);
-    if state_ptr == 0 {
+    let Some(kernel) = trap_kernel_state_mut() else {
         if should_halt_without_kernel_state(vector as usize) {
             debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, fault_rip, cpu_apic);
             TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
@@ -548,8 +579,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         }
         TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
         return;
-    }
-    let kernel = unsafe { &mut *(state_ptr as *mut crate::kernel::boot::KernelState) };
+    };
     let mut trap_frame = unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
     if let Err(err) = crate::arch::x86_64::trap::handle_trap_entry(
         kernel,

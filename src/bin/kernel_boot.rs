@@ -5,8 +5,6 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 use yarm::kernel::boot::Bootstrap;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-use yarm::kernel::boot::KernelState;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
@@ -257,18 +255,13 @@ fn debug_uart_marker(byte: u8) {
 
 #[inline]
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-#[unsafe(link_section = ".bss.kernel_state")]
-static mut BOOT_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
-    core::mem::MaybeUninit::uninit();
-
-#[inline]
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn run_boot_markers() -> &'static mut KernelState {
+fn run_boot_markers() -> &'static mut yarm::kernel::boot::KernelState {
     debug_uart_marker(b'H');
     yarm::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
-    let kernel = unsafe { BOOT_KERNEL_STATE.write(Bootstrap::init().expect("kernel init")) };
+    let kernel = yarm::arch::x86_64::descriptor_tables::install_trap_kernel_state(
+        Bootstrap::init().expect("kernel init"),
+    );
     debug_uart_marker(b'I');
-    yarm::arch::x86_64::descriptor_tables::register_trap_kernel_state(kernel);
     let started_secondary = yarm::arch::x86_64::smp::start_secondary_cpus(kernel).unwrap_or(0);
     yarm::yarm_log!(
         "YARM_SMP_STARTUP started_secondary={} online_cpus={} present_cpus={}",
