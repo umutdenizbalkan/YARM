@@ -20,9 +20,8 @@ global_asm!(
     .align 16
 boot_stack:
     // Early bootstrap stack used until Rust runtime/state setup completes.
-    // Keep this large enough to tolerate temporary large stack frames during
-    // early Rust bootstrap before trap-kernel-state handoff is fully active.
-    .skip 0x01000000
+    // Keep this inside the bootstrap identity-map footprint.
+    .skip 0x00200000
 boot_stack_end:
 
     .section .data.boot,"aw",@progbits
