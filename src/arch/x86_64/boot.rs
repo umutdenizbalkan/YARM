@@ -20,9 +20,9 @@ global_asm!(
     .align 16
 boot_stack:
     // Early bootstrap stack used until Rust runtime/state setup completes.
-    // KernelState is placed in dedicated .bss storage, so this stack no longer
-    // needs to reserve tens of MiB for by-value KernelState construction.
-    .skip 0x00200000
+    // Keep this large enough to tolerate temporary large stack frames during
+    // early Rust bootstrap before trap-kernel-state handoff is fully active.
+    .skip 0x01000000
 boot_stack_end:
 
     .section .data.boot,"aw",@progbits
