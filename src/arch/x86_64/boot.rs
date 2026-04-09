@@ -28,15 +28,30 @@ boot_stack_end:
     .section .data.boot,"aw",@progbits
     .align 4096
 boot_pml4:
-    .quad boot_pdpt + 0x3
-    .zero 4088
+    .quad boot_pdpt_low + 0x3
+    .zero 2040
+    // Mirror physical memory into the higher-half direct-map window.
+    .quad boot_pdpt_direct + 0x3
+    .zero 2032
 
     .align 4096
-boot_pdpt:
+boot_pdpt_low:
     .quad boot_pd + 0x3
     .zero 16
     .quad boot_pd_hi + 0x3
     .zero 4064
+
+    .align 4096
+boot_pdpt_direct:
+    // 512 * 1GiB = 512GiB of higher-half direct physical mapping.
+    // This gives page-table code a stable virtual alias for PT pages allocated
+    // anywhere in early-boot RAM (up to the direct-map span).
+    .set direct_map_page_flags, 0x83
+    .set direct_map_index, 0
+    .rept 512
+    .quad (direct_map_index * 0x40000000) | direct_map_page_flags
+    .set direct_map_index, direct_map_index + 1
+    .endr
 
     .align 4096
 boot_pd:
@@ -150,8 +165,9 @@ pvh_start32:
     // boot_pd_hi data leaves). Their values are emitted from 32-bit immediates
     // here, so upper dwords are already correct under the low-physical boot map.
     mov dword ptr [boot_pml4 + 4], 0   // PML4[0]  upper dword → physical
-    mov dword ptr [boot_pdpt + 4], 0   // PDPT[0]  upper dword → physical
-    mov dword ptr [boot_pdpt + 28], 0  // PDPT[3]  upper dword → physical
+    mov dword ptr [boot_pml4 + 2052], 0 // PML4[256] upper dword → physical
+    mov dword ptr [boot_pdpt_low + 4], 0   // PDPT[0]  upper dword → physical
+    mov dword ptr [boot_pdpt_low + 28], 0  // PDPT[3]  upper dword → physical
     mov dword ptr [boot_pd   + 4], 0   // PD[0]    upper dword → physical
     // The 2 MiB entries in boot_pd_hi at indices 502 and 503 are assembled
     // from low 32-bit immediates; their upper 32 bits are already zero.

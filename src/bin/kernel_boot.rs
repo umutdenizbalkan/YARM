@@ -8,8 +8,6 @@ use yarm::kernel::boot::Bootstrap;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-const BOOTSTRAP_IDENTITY_MAP_LIMIT: u64 = 64 * 1024 * 1024;
 const MAX_PVH_MODULES: usize = 32;
 const PVH_MAGIC: u32 = 0x336e_c578;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -124,6 +122,7 @@ fn log_pvh_boot_metadata(start_info_ptr: usize) {
 fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
     const PAGE_SIZE_U64: u64 = yarm::kernel::vm::PAGE_SIZE as u64;
     const RESERVED_LOW_EXCLUSIVE: u64 = yarm::arch::platform_layout::NEXT_ANON_PHYS_BASE;
+    const DIRECT_MAP_LIMIT: u64 = yarm::arch::platform_layout::KERNEL_PHYS_DIRECT_MAP_BYTES;
     const MEMMAP_ENTRY_SIZE: u64 = core::mem::size_of::<PvhMemMapEntry>() as u64;
     const MEMMAP_ENTRY_ALIGN: u64 = core::mem::align_of::<PvhMemMapEntry>() as u64;
 
@@ -184,8 +183,8 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
         if end > MAX_PVH_PHYS_EXCLUSIVE {
             end = MAX_PVH_PHYS_EXCLUSIVE;
         }
-        if end > BOOTSTRAP_IDENTITY_MAP_LIMIT {
-            end = BOOTSTRAP_IDENTITY_MAP_LIMIT;
+        if end > DIRECT_MAP_LIMIT {
+            end = DIRECT_MAP_LIMIT;
         }
         if start >= end {
             continue;

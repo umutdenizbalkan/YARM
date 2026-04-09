@@ -438,11 +438,10 @@ fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
 
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     {
-        // Keep bootstrap page-table frames inside the 0..64MiB identity map window
-        // until full-RAM identity/high-half mappings are established.
+        // Keep default page-table frames inside the early higher-half direct map.
         [MemoryRegion {
-            start: 0x0080_0000,
-            len: 0x0380_0000,
+            start: crate::arch::platform_constants::NEXT_ANON_PHYS_BASE,
+            len: 512 * 1024 * 1024,
             usable: true,
         }]
     }

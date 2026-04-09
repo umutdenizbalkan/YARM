@@ -489,6 +489,9 @@ fn write_table_entry(
 #[cfg(all(not(feature = "hosted-dev"), not(test)))]
 fn phys_to_virt_table_ptr(table_phys: u64) -> Option<*mut u8> {
     let phys_off = table_phys.checked_sub(platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE)?;
+    if phys_off >= platform_layout::KERNEL_PHYS_DIRECT_MAP_BYTES {
+        return None;
+    }
     let virt = platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(phys_off)?;
     Some(virt as usize as *mut u8)
 }
@@ -511,7 +514,6 @@ struct InvpcidDescriptor {
     pcid: u64,
     addr: u64,
 }
-
 
 #[cfg(not(feature = "hosted-dev"))]
 const INVPCID_SUPPORT_UNKNOWN: u8 = 0;
@@ -552,10 +554,14 @@ fn cpu_supports_invpcid() -> bool {
 #[cfg(not(feature = "hosted-dev"))]
 unsafe fn fallback_flush_tlb_via_cr3() {
     let mut cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags)); }
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags));
+    }
     // Clear the no-flush bit (bit 63) to force an architectural flush.
     let flushed_cr3 = cr3 & !(1u64 << 63);
-    unsafe { core::arch::asm!("mov cr3, {}", in(reg) flushed_cr3, options(nostack, preserves_flags)); }
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) flushed_cr3, options(nostack, preserves_flags));
+    }
 }
 
 pub fn invalidate_asid(asid: Asid) {
