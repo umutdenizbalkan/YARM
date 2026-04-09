@@ -595,7 +595,7 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
             continue;
         };
         let mut start = entry.addr;
-        let mut end = raw_end.min(MAX_PVH_PHYS_EXCLUSIVE).min(DIRECT_MAP_LIMIT);
+        let end = raw_end.min(MAX_PVH_PHYS_EXCLUSIVE).min(DIRECT_MAP_LIMIT);
         if end <= RESERVED_LOW_EXCLUSIVE || start >= end {
             continue;
         }

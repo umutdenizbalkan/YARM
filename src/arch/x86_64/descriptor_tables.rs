@@ -244,9 +244,15 @@ const TRAP_KERNEL_STATE_READY: u8 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_KERNEL_STATE_STATUS: AtomicU8 = AtomicU8::new(TRAP_KERNEL_STATE_UNINITIALIZED);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+struct TrapKernelStateCell(
+    core::cell::UnsafeCell<core::mem::MaybeUninit<crate::kernel::boot::KernelState>>,
+);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+unsafe impl Sync for TrapKernelStateCell {}
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[unsafe(link_section = ".bss.kernel_state")]
-static mut TRAP_KERNEL_STATE: core::mem::MaybeUninit<crate::kernel::boot::KernelState> =
-    core::mem::MaybeUninit::uninit();
+static TRAP_KERNEL_STATE: TrapKernelStateCell =
+    TrapKernelStateCell(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_DATA_PORT: u16 = 0x3F8;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -389,7 +395,10 @@ pub fn install_trap_kernel_state(
     {
         panic!("trap kernel state already installed");
     }
-    let kernel = unsafe { TRAP_KERNEL_STATE.write(kernel) };
+    let kernel = unsafe {
+        let slot = &mut *TRAP_KERNEL_STATE.0.get();
+        slot.write(kernel)
+    };
     register_apic_cpu_mapping(
         raw_current_apic_id() as u8,
         crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID),
@@ -402,12 +411,15 @@ fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelSta
     if TRAP_KERNEL_STATE_STATUS.load(Ordering::Acquire) != TRAP_KERNEL_STATE_READY {
         return None;
     }
-    Some(unsafe { TRAP_KERNEL_STATE.assume_init_mut() })
+    Some(unsafe {
+        let slot = &mut *TRAP_KERNEL_STATE.0.get();
+        &mut *slot.as_mut_ptr()
+    })
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn raw_current_apic_id() -> u32 {
-    unsafe { core::arch::x86_64::__cpuid(1).ebx >> 24 }
+    core::arch::x86_64::__cpuid(1).ebx >> 24
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
