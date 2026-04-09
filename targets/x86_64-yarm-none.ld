@@ -57,6 +57,10 @@ SECTIONS {
     *(.bss.bootstack)
   } :data
 
+  .bss.kernel_state (NOLOAD) : ALIGN(64) {
+    *(.bss.kernel_state)
+  } :data
+
   .bss (NOLOAD) : ALIGN(16) {
     *(.bss*)
     *(COMMON)

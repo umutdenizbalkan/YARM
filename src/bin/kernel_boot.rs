@@ -5,6 +5,8 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 use yarm::kernel::boot::Bootstrap;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+use yarm::kernel::boot::KernelState;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
@@ -254,43 +256,51 @@ fn debug_uart_marker(byte: u8) {
 }
 
 #[inline]
-fn run_boot_markers() -> yarm::kernel::boot::KernelState {
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    {
-        debug_uart_marker(b'H');
-        yarm::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
-    }
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    let mut kernel = Bootstrap::init().expect("kernel init");
-    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
-    let kernel = Bootstrap::init().expect("kernel init");
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    {
-        debug_uart_marker(b'I');
-        yarm::arch::x86_64::descriptor_tables::register_trap_kernel_state(&mut kernel);
-        let started_secondary =
-            yarm::arch::x86_64::smp::start_secondary_cpus(&mut kernel).unwrap_or(0);
-        yarm::yarm_log!(
-            "YARM_SMP_STARTUP started_secondary={} online_cpus={} present_cpus={}",
-            started_secondary,
-            kernel.online_cpu_count(),
-            kernel.present_cpu_count()
-        );
-        kernel.program_timer_deadline_current_cpu(
-            yarm::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
-        );
-        yarm::arch::x86_64::irq::enable_interrupts_for_boot();
-        debug_uart_marker(b'J');
-    }
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[unsafe(link_section = ".bss.kernel_state")]
+static mut BOOT_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
+    core::mem::MaybeUninit::uninit();
+
+#[inline]
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn run_boot_markers() -> &'static mut KernelState {
+    debug_uart_marker(b'H');
+    yarm::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
+    let kernel = unsafe { BOOT_KERNEL_STATE.write(Bootstrap::init().expect("kernel init")) };
+    debug_uart_marker(b'I');
+    yarm::arch::x86_64::descriptor_tables::register_trap_kernel_state(kernel);
+    let started_secondary = yarm::arch::x86_64::smp::start_secondary_cpus(kernel).unwrap_or(0);
+    yarm::yarm_log!(
+        "YARM_SMP_STARTUP started_secondary={} online_cpus={} present_cpus={}",
+        started_secondary,
+        kernel.online_cpu_count(),
+        kernel.present_cpu_count()
+    );
+    kernel.program_timer_deadline_current_cpu(
+        yarm::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+    );
+    yarm::arch::x86_64::irq::enable_interrupts_for_boot();
+    debug_uart_marker(b'J');
     yarm::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),
         kernel.present_cpu_bitmap(),
         kernel.online_cpu_count()
     );
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     debug_uart_marker(b'K');
+    kernel
+}
 
+#[inline]
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+fn run_boot_markers() -> yarm::kernel::boot::KernelState {
+    let kernel = Bootstrap::init().expect("kernel init");
+    yarm::yarm_log!(
+        "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
+        kernel.present_cpu_count(),
+        kernel.present_cpu_bitmap(),
+        kernel.online_cpu_count()
+    );
     kernel
 }
 
@@ -303,8 +313,13 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
 fn run() {
     #[cfg(not(test))]
     {
-        let mut kernel = run_boot_markers();
-        run_scheduler_loop(&mut kernel);
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+        run_scheduler_loop(run_boot_markers());
+        #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+        {
+            let mut kernel = run_boot_markers();
+            run_scheduler_loop(&mut kernel);
+        }
     }
     #[cfg(test)]
     let _ = run_boot_markers();
