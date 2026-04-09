@@ -58,7 +58,11 @@ impl KernelState {
         bitmap
     }
 
-    fn request_live_asid_shootdown(&mut self, asid: Asid, virt: VirtAddr) -> Result<(), KernelError> {
+    fn request_live_asid_shootdown(
+        &mut self,
+        asid: Asid,
+        virt: VirtAddr,
+    ) -> Result<(), KernelError> {
         let targets = self.live_cpu_bitmap_for_asid(asid);
         if targets == 0 {
             return Ok(());
@@ -336,6 +340,22 @@ impl KernelState {
             self.request_live_asid_shootdown(asid, virt)?;
         }
         Ok(unmapped)
+    }
+
+    pub(crate) fn is_user_page_mapped_in_current_asid(
+        &self,
+        virt: VirtAddr,
+    ) -> Result<bool, KernelError> {
+        if !virt.0.is_multiple_of(crate::kernel::vm::PAGE_SIZE as u64) {
+            return Err(KernelError::WrongObject);
+        }
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        let aspace = self
+            .user_spaces
+            .get(asid)
+            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        Ok(aspace.resolve(virt).is_some())
     }
 
     #[cfg(feature = "posix-compat")]

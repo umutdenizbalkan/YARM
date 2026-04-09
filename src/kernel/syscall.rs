@@ -888,6 +888,20 @@ fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
     let map_len = round_up_page(len)?;
     let end = addr.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
     let flags = vm_map_page_flags(prot)?;
+
+    // Reserve one unmapped page immediately below writable non-executable
+    // mappings so downward-growing task stacks can fault deterministically
+    // on overflow instead of silently corrupting adjacent pages.
+    if flags.write
+        && !flags.execute
+        && let Some(guard_page) = addr.checked_sub(PAGE_SIZE)
+        && kernel
+            .is_user_page_mapped_in_current_asid(VirtAddr(guard_page as u64))
+            .map_err(SyscallError::from)?
+    {
+        return Err(SyscallError::InvalidArgs);
+    }
+
     let mut va = addr;
     while va < end {
         let (_, mem_cap) = kernel
@@ -1166,6 +1180,41 @@ mod tests {
         assert_eq!(frame.error_code(), None);
         assert_eq!(frame.ret0(), 0x4000);
         assert_eq!(frame.ret1(), PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn vm_map_writable_region_requires_unmapped_guard_page_below_base() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+
+        let mut first = TrapFrame::new(
+            Syscall::VmMap as usize,
+            [
+                aspace_map_cap.0 as usize,
+                0x3000,
+                PAGE_SIZE,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut first).expect("first map");
+        assert_eq!(first.error_code(), None);
+
+        let mut second = TrapFrame::new(
+            Syscall::VmMap as usize,
+            [
+                aspace_map_cap.0 as usize,
+                0x4000,
+                PAGE_SIZE,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+            ],
+        );
+        let err = dispatch(&mut state, &mut second).expect_err("guard conflict");
+        assert_eq!(err, SyscallError::InvalidArgs);
     }
 
     #[test]
