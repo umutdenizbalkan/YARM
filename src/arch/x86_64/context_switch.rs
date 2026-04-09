@@ -45,11 +45,20 @@ yarm_x86_switch_frame:
 );
 
 #[inline]
-pub fn switch_frames(prev: &mut ArchSwitchContext, next: &ArchSwitchContext) {
+pub fn switch_frames(
+    prev: &mut ArchSwitchContext,
+    next: &ArchSwitchContext,
+    next_kernel_stack_top: Option<u64>,
+) {
     #[cfg(test)]
     {
         SWITCH_CALLS.fetch_add(1, Ordering::Relaxed);
     }
+    #[cfg(target_arch = "x86_64")]
+    if let Some(rsp0) = next_kernel_stack_top {
+        crate::arch::x86_64::descriptor_tables::refresh_boot_tss_rsp0(rsp0);
+    }
+
     #[cfg(all(not(test), target_arch = "x86_64"))]
     unsafe {
         yarm_x86_switch_frame(prev as *mut _, next as *const _);
@@ -57,10 +66,9 @@ pub fn switch_frames(prev: &mut ArchSwitchContext, next: &ArchSwitchContext) {
 
     #[cfg(any(test, not(target_arch = "x86_64")))]
     {
-        let _ = (prev, next);
+        let _ = (prev, next, next_kernel_stack_top);
     }
 }
-
 
 #[inline]
 pub fn initialize_frame_fpu_state(frame: &mut ArchSwitchContext) {

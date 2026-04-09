@@ -6,7 +6,11 @@ use crate::kernel::task::ArchSwitchContext;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[inline]
-pub fn switch_frames(_prev: &mut ArchSwitchContext, _next: &ArchSwitchContext) {
+pub fn switch_frames(
+    _prev: &mut ArchSwitchContext,
+    _next: &ArchSwitchContext,
+    _next_kernel_stack_top: Option<u64>,
+) {
     #[cfg(test)]
     {
         SWITCH_CALLS.fetch_add(1, Ordering::Relaxed);
