@@ -7,21 +7,47 @@ use crate::kernel::vm::{Asid, VirtAddr, VmError};
 
 impl KernelState {
     #[cfg(feature = "hosted-dev")]
-    fn write_user_byte(&mut self, asid: Asid, va: VirtAddr, value: u8) {
+    fn write_user_byte(&mut self, asid: Asid, va: VirtAddr, value: u8) -> Result<(), KernelError> {
         self.memory.user_memory.insert((asid.0, va.0), value);
+        Ok(())
     }
 
     #[cfg(not(feature = "hosted-dev"))]
-    fn write_user_byte(&mut self, _asid: Asid, _va: VirtAddr, _value: u8) {}
+    fn write_user_byte(
+        &mut self,
+        _asid: Asid,
+        _va: VirtAddr,
+        value: u8,
+    ) -> Result<(), KernelError> {
+        let ptr = Self::phys_to_direct_map_ptr(_va.0).ok_or(KernelError::UserMemoryFault)?;
+        unsafe {
+            core::ptr::write_volatile(ptr, value);
+        }
+        Ok(())
+    }
 
     #[cfg(feature = "hosted-dev")]
-    fn read_user_byte(&self, asid: Asid, va: VirtAddr) -> Option<u8> {
-        self.memory.user_memory.get(&(asid.0, va.0)).copied()
+    fn read_user_byte(&self, asid: Asid, va: VirtAddr) -> Result<u8, KernelError> {
+        self.memory
+            .user_memory
+            .get(&(asid.0, va.0))
+            .copied()
+            .ok_or(KernelError::UserMemoryFault)
     }
 
     #[cfg(not(feature = "hosted-dev"))]
-    fn read_user_byte(&self, _asid: Asid, _va: VirtAddr) -> Option<u8> {
-        None
+    fn read_user_byte(&self, _asid: Asid, va: VirtAddr) -> Result<u8, KernelError> {
+        let ptr = Self::phys_to_direct_map_ptr(va.0).ok_or(KernelError::UserMemoryFault)?;
+        Ok(unsafe { core::ptr::read_volatile(ptr) })
+    }
+
+    #[cfg(not(feature = "hosted-dev"))]
+    fn phys_to_direct_map_ptr(phys: u64) -> Option<*mut u8> {
+        if phys >= crate::arch::platform_layout::KERNEL_PHYS_DIRECT_MAP_BYTES {
+            return None;
+        }
+        let virt = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(phys)?;
+        Some(virt as usize as *mut u8)
     }
 
     pub fn copy_to_user(
@@ -32,8 +58,8 @@ impl KernelState {
     ) -> Result<(), KernelError> {
         for (i, &byte) in bytes.iter().enumerate() {
             let addr = va.0 as usize + i;
-            self.validate_user_access_for_asid(asid, addr, true)?;
-            self.write_user_byte(asid, VirtAddr(addr as u64), byte);
+            let phys = self.validate_user_access_for_asid(asid, addr, true)?;
+            self.write_user_byte(asid, VirtAddr(phys), byte)?;
         }
         Ok(())
     }
@@ -51,10 +77,8 @@ impl KernelState {
         let mut out = [0u8; Message::MAX_PAYLOAD];
         for (i, slot) in out.iter_mut().take(len).enumerate() {
             let addr = va.0 as usize + i;
-            self.validate_user_access_for_asid(asid, addr, false)?;
-            *slot = self
-                .read_user_byte(asid, VirtAddr(addr as u64))
-                .ok_or(KernelError::UserMemoryFault)?;
+            let phys = self.validate_user_access_for_asid(asid, addr, false)?;
+            *slot = self.read_user_byte(asid, VirtAddr(phys))?;
         }
         Ok(out)
     }
@@ -84,19 +108,24 @@ impl KernelState {
         asid: Asid,
         va: usize,
         need_write: bool,
-    ) -> Result<(), KernelError> {
+    ) -> Result<u64, KernelError> {
         let aspace = self
             .user_spaces
             .get(asid)
             .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1);
+        let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1usize);
+        let page_off = (va - page_base) as u64;
         let mapping = aspace
             .resolve(VirtAddr(page_base as u64))
             .ok_or(KernelError::UserMemoryFault)?;
         if !mapping.flags.user || !mapping.flags.read || (need_write && !mapping.flags.write) {
             return Err(KernelError::UserMemoryFault);
         }
-        Ok(())
+        mapping
+            .phys
+            .0
+            .checked_add(page_off)
+            .ok_or(KernelError::UserMemoryFault)
     }
 
     pub fn copy_to_current_user(
