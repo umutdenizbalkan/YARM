@@ -421,6 +421,38 @@ mod tests {
 
 #[cfg(not(feature = "hosted-dev"))]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::fmt::Write;
+
+        struct PanicUartWriter;
+
+        impl Write for PanicUartWriter {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &byte in s.as_bytes() {
+                    debug_uart_marker(byte);
+                }
+                Ok(())
+            }
+        }
+
+        let mut writer = PanicUartWriter;
+        let _ = writer.write_str("PANIC ");
+        if let Some(location) = info.location() {
+            let _ = write!(
+                writer,
+                "{}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            );
+        } else {
+            let _ = writer.write_str("<unknown>");
+        }
+        let _ = writer.write_str(": ");
+        let _ = write!(writer, "{}", info.message());
+        let _ = writer.write_str("\n");
+    }
     loop {}
 }
