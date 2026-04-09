@@ -2,9 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-use core::sync::atomic::AtomicUsize;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 use core::sync::atomic::AtomicU64;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const IDT_ENTRIES: usize = 256;
@@ -156,13 +156,21 @@ static mut BOOT_GDT: X86BootGdt = X86BootGdt {
 };
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[repr(align(16))]
-struct IstStack([u8; 4096]);
+struct IstStack<const BYTES: usize>([u8; BYTES]);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-static mut IST_NMI: IstStack = IstStack([0; 4096]);
+const IST_NMI_STACK_BYTES: usize = 16 * 1024;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-static mut IST_DOUBLE_FAULT: IstStack = IstStack([0; 4096]);
+const IST_DOUBLE_FAULT_STACK_BYTES: usize = 64 * 1024;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-static mut IST_PAGE_FAULT: IstStack = IstStack([0; 4096]);
+const IST_PAGE_FAULT_STACK_BYTES: usize = 16 * 1024;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut IST_NMI: IstStack<IST_NMI_STACK_BYTES> = IstStack([0; IST_NMI_STACK_BYTES]);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut IST_DOUBLE_FAULT: IstStack<IST_DOUBLE_FAULT_STACK_BYTES> =
+    IstStack([0; IST_DOUBLE_FAULT_STACK_BYTES]);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut IST_PAGE_FAULT: IstStack<IST_PAGE_FAULT_STACK_BYTES> =
+    IstStack([0; IST_PAGE_FAULT_STACK_BYTES]);
 
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const KERNEL_CODE_SELECTOR: u16 = 0x08;
@@ -1012,12 +1020,11 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         core::arch::asm!("mov {}, rsp", out(reg) rsp0, options(nomem, nostack, preserves_flags));
         populate_boot_idt_from_stubs();
 
-        let ist_nmi_top =
-            core::ptr::addr_of!(IST_NMI.0) as u64 + core::mem::size_of::<IstStack>() as u64;
-        let ist_df_top = core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64
-            + core::mem::size_of::<IstStack>() as u64;
+        let ist_nmi_top = core::ptr::addr_of!(IST_NMI.0) as u64 + IST_NMI_STACK_BYTES as u64;
+        let ist_df_top =
+            core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64 + IST_DOUBLE_FAULT_STACK_BYTES as u64;
         let ist_pf_top =
-            core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64 + core::mem::size_of::<IstStack>() as u64;
+            core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64 + IST_PAGE_FAULT_STACK_BYTES as u64;
         BOOT_TSS.rsp0 = rsp0;
         BOOT_TSS.ist1 = ist_nmi_top;
         BOOT_TSS.ist2 = ist_df_top;
