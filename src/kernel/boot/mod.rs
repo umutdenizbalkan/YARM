@@ -2,14 +2,14 @@
 // Copyright 2026 Umut Deniz Balkan
 
 mod bootstrap_state;
+mod capability_lifecycle_state;
+mod capability_service_state;
 mod capability_state;
 mod capacity_state;
 mod cnode_state;
-mod capability_lifecycle_state;
-mod capability_service_state;
-mod driver_state;
 mod defs;
 mod delegation_state;
+mod driver_state;
 mod exec_state;
 mod fault_endpoint_state;
 mod fault_state;
@@ -21,8 +21,8 @@ mod restart_state;
 mod scheduler_state;
 mod task_core_state;
 mod task_policy_state;
-mod tid_allocation_policy;
 mod thread_state;
+mod tid_allocation_policy;
 mod transfer_state;
 mod types;
 mod user_memory_state;
@@ -55,29 +55,22 @@ use crate::kernel::frame_allocator::{
 };
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::lock::SpinLockIrq;
-use tid_allocation_policy::{TidAllocationCursor, TidAllocationPolicy};
 #[cfg(feature = "hosted-dev")]
 use crate::std::collections::BTreeMap;
+use tid_allocation_policy::{TidAllocationCursor, TidAllocationPolicy};
 
-#[cfg(feature = "hosted-dev")]
 const MAX_ENDPOINTS: usize = 64;
-#[cfg(not(feature = "hosted-dev"))]
-const MAX_ENDPOINTS: usize = 32;
 
 #[cfg(feature = "hosted-dev")]
 const MAX_ENDPOINT_SENDER_WAITERS: usize = 8;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_ENDPOINT_SENDER_WAITERS: usize = 4;
 
-#[cfg(feature = "hosted-dev")]
-const MAX_TASKS: usize = 64;
-#[cfg(not(feature = "hosted-dev"))]
+// Keep task capacity consistent across hosted-dev and freestanding builds so
+// capacity-sensitive tests match deployed behavior.
 const MAX_TASKS: usize = 128;
 
-#[cfg(feature = "hosted-dev")]
 const MAX_MEMORY_OBJECTS: usize = 512;
-#[cfg(not(feature = "hosted-dev"))]
-const MAX_MEMORY_OBJECTS: usize = 256;
 const MAX_BOOT_MEMORY_REGIONS: usize = 64;
 
 #[cfg(feature = "hosted-dev")]
@@ -112,8 +105,8 @@ const MAX_DELEGATED_CAPABILITY_LINKS: usize = 2048;
 const INITIAL_DYNAMIC_TID: u64 = 10_000;
 const STATIC_TID_UPPER_BOUND: u64 = INITIAL_DYNAMIC_TID - 1;
 
-pub use types::*;
 pub(crate) use defs::*;
+pub use types::*;
 
 #[derive(Debug)]
 pub struct KernelState {
