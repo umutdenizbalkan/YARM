@@ -25,3 +25,30 @@ _start:
     j 1b
     "#
 );
+
+pub fn bootstrap_first_user_task(
+    _kernel: &mut crate::kernel::boot::KernelState,
+) -> Result<(), crate::kernel::boot::KernelError> {
+    Ok(())
+}
+
+pub fn enter_dispatched_user_task_if_available(
+    _kernel: &crate::kernel::boot::KernelState,
+    _dispatched_tid: Option<u64>,
+) {
+}
+
+pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
+    let mut kernel = crate::kernel::boot::Bootstrap::init().expect("kernel init");
+    crate::yarm_log!(
+        "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
+        kernel.present_cpu_count(),
+        kernel.present_cpu_bitmap(),
+        kernel.online_cpu_count()
+    );
+    run(&mut kernel);
+}
+
+pub fn prepare_arch_boot(_start_info_ptr: usize) {}
+
+pub fn emit_panic(_info: &core::panic::PanicInfo<'_>) {}

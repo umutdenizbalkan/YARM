@@ -22,6 +22,18 @@ pub fn enter_dispatched_user_task_if_available(
     crate::arch::selected_isa::boot::enter_dispatched_user_task_if_available(kernel, dispatched_tid)
 }
 
+pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
+    crate::arch::selected_isa::boot::run_with_prepared_kernel(run)
+}
+
+pub fn prepare_arch_boot(start_info_ptr: usize) {
+    crate::arch::selected_isa::boot::prepare_arch_boot(start_info_ptr)
+}
+
+pub fn emit_panic(info: &core::panic::PanicInfo<'_>) {
+    crate::arch::selected_isa::boot::emit_panic(info)
+}
+
 struct IrqDescriptionLockGuard;
 
 impl IrqDescriptionLockGuard {

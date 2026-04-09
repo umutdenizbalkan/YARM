@@ -424,3 +424,317 @@ pub fn enter_dispatched_user_task_if_available(
     _dispatched_tid: Option<u64>,
 ) {
 }
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const MAX_PVH_MEMMAP_ENTRIES: usize = 128;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const MAX_PVH_MODULES: usize = 32;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const PVH_MAGIC: u32 = 0x336e_c578;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const MAX_PVH_PHYS_EXCLUSIVE: u64 = 1u64 << 52;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(C)]
+struct PvhStartInfo {
+    _magic: u32,
+    _version: u32,
+    _flags: u32,
+    nr_modules: u32,
+    modlist_paddr: u64,
+    cmdline_paddr: u64,
+    _rsdp_paddr: u64,
+    memmap_paddr: u64,
+    memmap_entries: u32,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PvhModule {
+    paddr_start: u64,
+    paddr_end: u64,
+    cmdline_paddr: u64,
+    _reserved: u64,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PvhMemMapEntry {
+    addr: u64,
+    size: u64,
+    kind: u32,
+    _reserved: u32,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct PvhModuleWindow {
+    start: u64,
+    end: u64,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct PvhModuleSummary {
+    module_count: usize,
+    initramfs: Option<PvhModuleWindow>,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn read_pvh_module_summary(start_info_ptr: usize) -> Option<PvhModuleSummary> {
+    if start_info_ptr == 0 {
+        return None;
+    }
+    let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+    if start_info._magic != PVH_MAGIC {
+        return None;
+    }
+    if start_info.nr_modules == 0 || start_info.modlist_paddr == 0 {
+        return Some(PvhModuleSummary {
+            module_count: 0,
+            initramfs: None,
+        });
+    }
+
+    let module_count = core::cmp::min(start_info.nr_modules as usize, MAX_PVH_MODULES);
+    let mut initramfs = None;
+    for idx in 0..module_count {
+        let module_ptr = (start_info.modlist_paddr as *const PvhModule).wrapping_add(idx);
+        let module = unsafe { core::ptr::read_unaligned(module_ptr) };
+        if module.paddr_start == 0 || module.paddr_end <= module.paddr_start {
+            continue;
+        }
+        if initramfs.is_none() {
+            initramfs = Some(PvhModuleWindow {
+                start: module.paddr_start,
+                end: module.paddr_end,
+            });
+        }
+    }
+
+    Some(PvhModuleSummary {
+        module_count,
+        initramfs,
+    })
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn log_pvh_boot_metadata(start_info_ptr: usize) {
+    use crate::arch::x86_64::console::write_line;
+
+    if start_info_ptr == 0 {
+        write_line("PVH: null ptr");
+        return;
+    }
+    let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+    if start_info._magic != PVH_MAGIC {
+        write_line("PVH: bad magic");
+        return;
+    }
+    write_line("PVH: magic OK");
+    if let Some(summary) = read_pvh_module_summary(start_info_ptr) {
+        crate::yarm_log!(
+            "YARM_BOOT_PVH_MODULES total={} initramfs_start=0x{:x} initramfs_end=0x{:x}",
+            summary.module_count,
+            summary.initramfs.map(|window| window.start).unwrap_or(0),
+            summary.initramfs.map(|window| window.end).unwrap_or(0)
+        );
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
+    const PAGE_SIZE_U64: u64 = crate::kernel::vm::PAGE_SIZE as u64;
+    const RESERVED_LOW_EXCLUSIVE: u64 = crate::arch::platform_layout::NEXT_ANON_PHYS_BASE;
+    const DIRECT_MAP_LIMIT: u64 = crate::arch::platform_layout::KERNEL_PHYS_DIRECT_MAP_BYTES;
+    const MEMMAP_ENTRY_SIZE: u64 = core::mem::size_of::<PvhMemMapEntry>() as u64;
+    const MEMMAP_ENTRY_ALIGN: u64 = core::mem::align_of::<PvhMemMapEntry>() as u64;
+
+    if start_info_ptr == 0 {
+        return;
+    }
+    let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+    if start_info._magic != PVH_MAGIC
+        || start_info.memmap_paddr == 0
+        || start_info.memmap_entries == 0
+        || !start_info.memmap_paddr.is_multiple_of(MEMMAP_ENTRY_ALIGN)
+    {
+        return;
+    }
+    let count = core::cmp::min(start_info.memmap_entries as usize, MAX_PVH_MEMMAP_ENTRIES);
+    let Some(memmap_bytes) = (count as u64).checked_mul(MEMMAP_ENTRY_SIZE) else {
+        return;
+    };
+    let Some(memmap_end) = start_info.memmap_paddr.checked_add(memmap_bytes) else {
+        return;
+    };
+    if memmap_end > MAX_PVH_PHYS_EXCLUSIVE {
+        return;
+    }
+
+    let mut regions = [crate::kernel::frame_allocator::MemoryRegion {
+        start: 0,
+        len: 0,
+        usable: false,
+    }; MAX_PVH_MEMMAP_ENTRIES];
+    let mut used = 0usize;
+    for idx in 0..count {
+        let Some(entry_paddr) = start_info
+            .memmap_paddr
+            .checked_add((idx as u64).saturating_mul(MEMMAP_ENTRY_SIZE))
+        else {
+            break;
+        };
+        let entry = unsafe { core::ptr::read_unaligned(entry_paddr as *const PvhMemMapEntry) };
+        if entry.kind != 1 || entry.size == 0 {
+            continue;
+        }
+        let Some(raw_end) = entry.addr.checked_add(entry.size) else {
+            continue;
+        };
+        let mut start = entry.addr;
+        let mut end = raw_end.min(MAX_PVH_PHYS_EXCLUSIVE).min(DIRECT_MAP_LIMIT);
+        if end <= RESERVED_LOW_EXCLUSIVE || start >= end {
+            continue;
+        }
+        if start < RESERVED_LOW_EXCLUSIVE {
+            start = RESERVED_LOW_EXCLUSIVE;
+        }
+        let aligned_start = start.div_ceil(PAGE_SIZE_U64) * PAGE_SIZE_U64;
+        let aligned_end = (end / PAGE_SIZE_U64) * PAGE_SIZE_U64;
+        if aligned_end <= aligned_start || used >= regions.len() {
+            continue;
+        }
+        if regions[..used].iter().any(|existing| {
+            let existing_end = existing.start.saturating_add(existing.len);
+            aligned_start < existing_end && aligned_end > existing.start
+        }) {
+            continue;
+        }
+        regions[used] = crate::kernel::frame_allocator::MemoryRegion {
+            start: aligned_start,
+            len: aligned_end - aligned_start,
+            usable: true,
+        };
+        used += 1;
+    }
+    if used > 0 {
+        let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(&regions[..used]);
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn debug_uart_marker(byte: u8) {
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "in al, dx",
+            "test al, 0x20",
+            "jz 2b",
+            in("dx") 0x3FDu16,
+            lateout("al") _,
+            options(nomem, nostack)
+        );
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x3F8u16,
+            in("al") byte,
+            options(nomem, nostack)
+        );
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
+    use crate::kernel::boot::Bootstrap;
+
+    debug_uart_marker(b'H');
+    crate::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
+    let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(
+        Bootstrap::init().expect("kernel init"),
+    );
+    debug_uart_marker(b'I');
+    let started_secondary = crate::arch::x86_64::smp::start_secondary_cpus(kernel).unwrap_or(0);
+    crate::yarm_log!(
+        "YARM_SMP_STARTUP started_secondary={} online_cpus={} present_cpus={}",
+        started_secondary,
+        kernel.online_cpu_count(),
+        kernel.present_cpu_count()
+    );
+    kernel.program_timer_deadline_current_cpu(
+        crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+    );
+    crate::arch::x86_64::irq::enable_interrupts_for_boot();
+    debug_uart_marker(b'J');
+    crate::yarm_log!(
+        "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
+        kernel.present_cpu_count(),
+        kernel.present_cpu_bitmap(),
+        kernel.online_cpu_count()
+    );
+    debug_uart_marker(b'K');
+    run(kernel);
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
+    use crate::kernel::boot::Bootstrap;
+    let mut kernel = Bootstrap::init().expect("kernel init");
+    crate::yarm_log!(
+        "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
+        kernel.present_cpu_count(),
+        kernel.present_cpu_bitmap(),
+        kernel.online_cpu_count()
+    );
+    run(&mut kernel);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn prepare_arch_boot(start_info_ptr: usize) {
+    crate::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
+    crate::arch::x86_64::console::write_line("KM0");
+    crate::arch::x86_64::console::write_line("KM1");
+    log_pvh_boot_metadata(start_info_ptr);
+    crate::arch::x86_64::console::write_line("KM2");
+    init_pt_allocator_from_pvh_memmap(start_info_ptr);
+    crate::arch::x86_64::console::write_line("KM3");
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+pub fn prepare_arch_boot(_start_info_ptr: usize) {}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn emit_panic(info: &core::panic::PanicInfo<'_>) {
+    use core::fmt::Write;
+
+    struct PanicUartWriter;
+    impl Write for PanicUartWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &byte in s.as_bytes() {
+                debug_uart_marker(byte);
+            }
+            Ok(())
+        }
+    }
+    let mut writer = PanicUartWriter;
+    let _ = writer.write_str("PANIC ");
+    if let Some(location) = info.location() {
+        let _ = write!(
+            writer,
+            "{}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        );
+    } else {
+        let _ = writer.write_str("<unknown>");
+    }
+    let _ = writer.write_str(": ");
+    let _ = write!(writer, "{}", info.message());
+    let _ = writer.write_str("\n");
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+pub fn emit_panic(_info: &core::panic::PanicInfo<'_>) {}
