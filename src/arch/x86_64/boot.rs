@@ -651,9 +651,10 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     use crate::kernel::boot::Bootstrap;
 
     debug_uart_marker(b'H');
-    let kernel_state = Bootstrap::init().expect("kernel init");
-    let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(kernel_state);
     crate::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
+    let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(
+        Bootstrap::init().expect("kernel init"),
+    );
     debug_uart_marker(b'I');
     let started_secondary = crate::arch::x86_64::smp::start_secondary_cpus(kernel).unwrap_or(0);
     crate::yarm_log!(
@@ -692,6 +693,7 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn prepare_arch_boot(start_info_ptr: usize) {
+    crate::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
     crate::arch::x86_64::console::write_line("KM0");
     crate::arch::x86_64::console::write_line("KM1");
     log_pvh_boot_metadata(start_info_ptr);
