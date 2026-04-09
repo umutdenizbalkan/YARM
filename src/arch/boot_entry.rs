@@ -9,6 +9,19 @@ static IRQ_DESCRIPTION_LOCK: AtomicBool = AtomicBool::new(false);
 static mut IRQ_DESCRIPTION_BUF: [u8; MAX_IRQ_DESCRIPTION_BYTES] = [0; MAX_IRQ_DESCRIPTION_BYTES];
 static FIRMWARE_BLOB_PROVIDER_PTR: AtomicUsize = AtomicUsize::new(0);
 
+pub fn bootstrap_first_user_task(
+    kernel: &mut crate::kernel::boot::KernelState,
+) -> Result<(), crate::kernel::boot::KernelError> {
+    crate::arch::selected_isa::boot::bootstrap_first_user_task(kernel)
+}
+
+pub fn enter_dispatched_user_task_if_available(
+    kernel: &crate::kernel::boot::KernelState,
+    dispatched_tid: Option<u64>,
+) {
+    crate::arch::selected_isa::boot::enter_dispatched_user_task_if_available(kernel, dispatched_tid)
+}
+
 struct IrqDescriptionLockGuard;
 
 impl IrqDescriptionLockGuard {

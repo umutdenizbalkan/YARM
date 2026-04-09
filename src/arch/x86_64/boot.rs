@@ -330,3 +330,97 @@ emergency_idt_stub:
     jmp 1b
     "#
 );
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RING3_INIT_SERVER_TID: u64 = 1;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_1000;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RING3_INIT_SERVER_CODE_PAGE: u64 = 0x0040_0000;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RING3_INIT_SERVER_ASID: u16 = 1;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn bootstrap_first_user_task(
+    kernel: &mut crate::kernel::boot::KernelState,
+) -> Result<(), crate::kernel::boot::KernelError> {
+    use crate::kernel::boot::UserImageSpec;
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::vm::{PageFlags, VirtAddr};
+
+    if kernel.task_asid(RING3_INIT_SERVER_TID).is_some() {
+        return Ok(());
+    }
+
+    let (asid, aspace_cap) = kernel.create_user_address_space()?;
+    if asid.0 != RING3_INIT_SERVER_ASID {
+        return Err(crate::kernel::boot::KernelError::WrongObject);
+    }
+    kernel.spawn_user_task_from_image(UserImageSpec {
+        tid: RING3_INIT_SERVER_TID,
+        entry: RING3_INIT_SERVER_ENTRY as usize,
+        asid: Some(asid),
+        class: TaskClass::SystemServer,
+    })?;
+
+    let (_mem_id, mem_cap) = kernel.alloc_anonymous_memory_object()?;
+    kernel.map_user_page_with_caps(
+        aspace_cap,
+        mem_cap,
+        VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
+        PageFlags::USER_RW,
+    )?;
+
+    // mov eax, SYSCALL_YIELD_NR ; int 0x80 ; jmp $
+    let code: [u8; 9] = [0xB8, 0x00, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xEB, 0xFE];
+    kernel.write_user_memory(
+        RING3_INIT_SERVER_TID,
+        RING3_INIT_SERVER_ENTRY as usize,
+        &code,
+    )?;
+    let _ = kernel.protect_user_page(
+        aspace_cap,
+        VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
+        PageFlags::USER_RX,
+    )?;
+    Ok(())
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+pub fn bootstrap_first_user_task(
+    _kernel: &mut crate::kernel::boot::KernelState,
+) -> Result<(), crate::kernel::boot::KernelError> {
+    Ok(())
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn enter_dispatched_user_task_if_available(
+    kernel: &crate::kernel::boot::KernelState,
+    dispatched_tid: Option<u64>,
+) {
+    if let Some(tid) = dispatched_tid
+        && let Some(context) = kernel.thread_user_context(tid)
+        && context.instruction_ptr.0 != 0
+        && context.stack_ptr.0 != 0
+    {
+        crate::yarm_log!(
+            "YARM_RING3_INIT_TASK tid={} entry=0x{:x} stack_top=0x{:x}",
+            tid,
+            context.instruction_ptr.0,
+            context.stack_ptr.0
+        );
+        super::descriptor_tables::enter_user_mode_iret(
+            context.instruction_ptr.0,
+            context.stack_ptr.0,
+            context.arg0 as u64,
+            context.arg1 as u64,
+        );
+    }
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+pub fn enter_dispatched_user_task_if_available(
+    _kernel: &crate::kernel::boot::KernelState,
+    _dispatched_tid: Option<u64>,
+) {
+}
