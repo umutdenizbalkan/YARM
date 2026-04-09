@@ -65,6 +65,7 @@ This checklist focuses on turning the current in-memory kernel model into a port
 ## 8) B-path bootstrap execution (started)
 
 - Added target spec: `targets/x86_64-yarm-none.json`.
+- Execution ticket board for loading `init_server` from initramfs into a separate user AS: `INIT_SERVER_INITRAMFS_BOOT_PR_BOARD.md`.
 - Added cargo aliases for x86_64-none bring-up in `.cargo/config.toml`.
 - Added x86-none build profile knobs in `Cargo.toml` and wired them into x86 artifact staging.
 - Added x86_64 artifact and smoke scaffolds: `scripts/build-qemu-x86_64-artifacts.sh`, `scripts/qemu-x86_64-core-smoke.sh`.
