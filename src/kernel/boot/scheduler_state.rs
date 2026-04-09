@@ -51,6 +51,14 @@ impl KernelState {
         })
     }
 
+    pub fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_state(|sched| {
+            kernel_ref(&sched.scheduler)
+                .current_tid_on(cpu)
+                .map(|tid| tid.0)
+        })
+    }
+
     pub fn dispatch_next_current_cpu(&mut self) -> Option<u64> {
         let mut sched = self.scheduler_state();
         let cpu = sched.current_cpu;
@@ -227,14 +235,17 @@ impl KernelState {
                     telemetry.tlb_shootdown_count = telemetry.tlb_shootdown_count.wrapping_add(1);
                 });
                 let retired = self.with_user_spaces(|spaces| spaces.retired_entry(asid).is_some());
-                if self.current_cpu() == cpu && retired {
+                let current_matches = self.current_tid().and_then(|tid| self.task_asid(tid)) == Some(asid);
+                if self.current_cpu() == cpu && (retired || current_matches) {
                     crate::arch::selected_isa::page_table::invalidate_asid(asid);
-                    let cpu_bit = 1u64 << cpu.0;
-                    self.with_user_spaces_mut(|spaces| {
-                        spaces
-                            .acknowledge_shootdown(asid, cpu_bit)
-                            .map_err(KernelError::Vm)
-                    })?;
+                    if retired {
+                        let cpu_bit = 1u64 << cpu.0;
+                        self.with_user_spaces_mut(|spaces| {
+                            spaces
+                                .acknowledge_shootdown(asid, cpu_bit)
+                                .map_err(KernelError::Vm)
+                        })?;
+                    }
                 }
                 Ok(())
             }

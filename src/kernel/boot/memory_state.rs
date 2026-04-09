@@ -4,6 +4,8 @@
 use super::{KernelError, KernelState, MemoryObject, kernel_mut};
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::frame_allocator::FrameAllocError;
+use crate::kernel::scheduler::CpuId;
+use crate::kernel::topology::CpuBitmap;
 use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr, VmError};
 
 impl KernelState {
@@ -34,6 +36,47 @@ impl KernelState {
             CapRights::MAP | CapRights::READ | CapRights::WRITE,
         ))?;
         Ok((asid, map_cap))
+    }
+
+    fn live_cpu_bitmap_for_asid(&self, asid: Asid) -> CpuBitmap {
+        let online = self.online_cpu_bitmap();
+        let mut bitmap: CpuBitmap = 0;
+        for cpu in 0..u64::BITS as usize {
+            let cpu_bit = 1u64 << cpu;
+            if (online & cpu_bit) == 0 {
+                continue;
+            }
+            let cpu_id = CpuId(cpu as u8);
+            if self
+                .current_tid_on_cpu(cpu_id)
+                .and_then(|tid| self.task_asid(tid))
+                == Some(asid)
+            {
+                bitmap |= cpu_bit;
+            }
+        }
+        bitmap
+    }
+
+    fn request_live_asid_shootdown(&mut self, asid: Asid, virt: VirtAddr) -> Result<(), KernelError> {
+        let targets = self.live_cpu_bitmap_for_asid(asid);
+        if targets == 0 {
+            return Ok(());
+        }
+        for cpu in 0..u64::BITS as usize {
+            let cpu_bit = 1u64 << cpu;
+            if (targets & cpu_bit) == 0 {
+                continue;
+            }
+            self.submit_cross_cpu_work(
+                CpuId(cpu as u8),
+                crate::kernel::smp::WorkItem::TlbShootdown {
+                    asid,
+                    va_range: Some((virt, virt + crate::kernel::vm::PAGE_SIZE as u64)),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn destroy_user_address_space_by_asid(
@@ -290,6 +333,7 @@ impl KernelState {
         if let Some(mapping) = unmapped {
             self.note_mapping_removed(mapping.phys);
             self.reclaim_memory_object_for_phys(mapping.phys);
+            self.request_live_asid_shootdown(asid, virt)?;
         }
         Ok(unmapped)
     }
@@ -342,6 +386,7 @@ impl KernelState {
         if let Some(mapping) = unmapped {
             self.note_mapping_removed(mapping.phys);
             self.reclaim_memory_object_for_phys(mapping.phys);
+            self.request_live_asid_shootdown(asid, virt)?;
         }
         Ok(unmapped)
     }
@@ -359,6 +404,7 @@ impl KernelState {
         if let Some(mapping) = unmapped {
             self.note_mapping_removed(mapping.phys);
             self.reclaim_memory_object_for_phys(mapping.phys);
+            self.request_live_asid_shootdown(asid, virt)?;
         }
         Ok(unmapped)
     }
