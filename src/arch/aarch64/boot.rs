@@ -61,6 +61,28 @@ yarm_aarch64_enter_el1_if_needed:
 );
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+global_asm!(
+    r#"
+    .section .text.boot,"ax",@progbits
+    .global yarm_aarch64_enter_user_mode_eret
+    .type yarm_aarch64_enter_user_mode_eret,%function
+yarm_aarch64_enter_user_mode_eret:
+    mov x9, x0
+    mov x10, x1
+    mov x11, x2
+    mov x12, x3
+    mov x13, x4
+    msr sp_el0, x10
+    msr tpidr_el0, x13
+    msr elr_el1, x9
+    msr spsr_el1, xzr
+    mov x0, x11
+    mov x1, x12
+    eret
+    "#
+);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const AARCH64_PTE_VALID: u64 = 1 << 0;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const AARCH64_PTE_TABLE: u64 = 1 << 1;
@@ -203,12 +225,105 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64) {
     let _ = (kind, esr_el1, far_el1);
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const RING3_INIT_SERVER_TID: u64 = 1;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_1000;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const RING3_INIT_SERVER_CODE_PAGE: u64 = 0x0040_0000;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub fn bootstrap_first_user_task(
+    kernel: &mut crate::kernel::boot::KernelState,
+) -> Result<(), crate::kernel::boot::KernelError> {
+    use crate::kernel::boot::UserImageSpec;
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::vm::{PageFlags, VirtAddr};
+
+    if kernel.task_asid(RING3_INIT_SERVER_TID).is_some() {
+        return Ok(());
+    }
+
+    let (asid, aspace_cap) = kernel.create_user_address_space()?;
+    kernel.spawn_user_task_from_image(UserImageSpec {
+        tid: RING3_INIT_SERVER_TID,
+        entry: RING3_INIT_SERVER_ENTRY as usize,
+        asid: Some(asid),
+        class: TaskClass::SystemServer,
+    })?;
+
+    let (_mem_id, mem_cap) = kernel.alloc_anonymous_memory_object()?;
+    kernel.map_user_page_with_caps(
+        aspace_cap,
+        mem_cap,
+        VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
+        PageFlags::USER_RW,
+    )?;
+
+    // movz x8,#0 ; svc #0 ; b .
+    let code: [u8; 12] = [
+        0x08, 0x00, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4, 0x00, 0x00, 0x00, 0x14,
+    ];
+    kernel.write_user_memory(
+        RING3_INIT_SERVER_TID,
+        RING3_INIT_SERVER_ENTRY as usize,
+        &code,
+    )?;
+    let _ = kernel.protect_user_page(
+        aspace_cap,
+        VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
+        PageFlags::USER_RX,
+    )?;
+    Ok(())
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
 pub fn bootstrap_first_user_task(
     _kernel: &mut crate::kernel::boot::KernelState,
 ) -> Result<(), crate::kernel::boot::KernelError> {
     Ok(())
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub fn enter_dispatched_user_task_if_available(
+    kernel: &crate::kernel::boot::KernelState,
+    dispatched_tid: Option<u64>,
+) {
+    if let Some(tid) = dispatched_tid
+        && let Some(context) = kernel.thread_user_context(tid)
+        && context.instruction_ptr.0 != 0
+        && context.stack_ptr.0 != 0
+    {
+        let tls = kernel.thread_tls_base(tid).unwrap_or(0) as u64;
+        crate::yarm_log!(
+            "YARM_AARCH64_RING3_INIT_TASK tid={} entry=0x{:x} stack_top=0x{:x} tls=0x{:x}",
+            tid,
+            context.instruction_ptr.0,
+            context.stack_ptr.0,
+            tls
+        );
+        unsafe {
+            unsafe extern "C" {
+                fn yarm_aarch64_enter_user_mode_eret(
+                    entry: u64,
+                    stack_top: u64,
+                    arg0: u64,
+                    arg1: u64,
+                    tls: u64,
+                ) -> !;
+            }
+            yarm_aarch64_enter_user_mode_eret(
+                context.instruction_ptr.0,
+                context.stack_ptr.0,
+                context.arg0 as u64,
+                context.arg1 as u64,
+                tls,
+            );
+        }
+    }
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
 pub fn enter_dispatched_user_task_if_available(
     _kernel: &crate::kernel::boot::KernelState,
     _dispatched_tid: Option<u64>,
