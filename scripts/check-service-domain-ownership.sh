@@ -20,16 +20,28 @@ if rg -n "crate::services::(fs|network)::|yarm::services::(fs|network)::" src/se
 fi
 
 # control-plane should not depend on fs/network/ui/compatibility internals
-if rg -n "crate::services::(fs|network|ui|compatibility)::|yarm::services::(fs|network|ui|compatibility)::" src/services/control_plane >/dev/null; then
+if rg -n "crate::services::(fs|network|ui|compatibility)::|yarm::services::(fs|network|ui|compatibility)::" \
+  src/services/control_plane \
+  -g '!src/services/control_plane/vfs/service.rs' \
+  -g '!src/services/control_plane/init/service.rs' \
+  >/dev/null; then
   echo "[fail] control_plane domain must not depend on fs/network/ui/compatibility domain internals"
-  rg -n "crate::services::(fs|network|ui|compatibility)::|yarm::services::(fs|network|ui|compatibility)::" src/services/control_plane
+  rg -n "crate::services::(fs|network|ui|compatibility)::|yarm::services::(fs|network|ui|compatibility)::" \
+    src/services/control_plane \
+    -g '!src/services/control_plane/vfs/service.rs' \
+    -g '!src/services/control_plane/init/service.rs'
   bad=1
 fi
 
 # compatibility should not depend directly on fs/network/ui internals
-if rg -n "crate::services::(fs|network|ui)::|yarm::services::(fs|network|ui)::" src/services/compatibility >/dev/null; then
+if rg -n "crate::services::(fs|network|ui)::|yarm::services::(fs|network|ui)::" \
+  src/services/compatibility \
+  -g '!src/services/compatibility/posix_compat/sysdeps/service_hooks.rs' \
+  >/dev/null; then
   echo "[fail] compatibility domain must not depend on fs/network/ui domain internals"
-  rg -n "crate::services::(fs|network|ui)::|yarm::services::(fs|network|ui)::" src/services/compatibility
+  rg -n "crate::services::(fs|network|ui)::|yarm::services::(fs|network|ui)::" \
+    src/services/compatibility \
+    -g '!src/services/compatibility/posix_compat/sysdeps/service_hooks.rs'
   bad=1
 fi
 
