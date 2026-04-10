@@ -3,6 +3,8 @@
 
 set -euo pipefail
 
+export RUST_MIN_STACK=${RUST_MIN_STACK:-33554432}
+
 cargo test -q kernel::boot::tests::delegate_driver_bundle_checked_enforces_service_role_edges
 cargo test -q kernel::boot::tests::restart_denial_escalates_to_supervisor_every_threshold
 cargo test -q kernel::boot::tests::driver_restart_revokes_runtime_caps
