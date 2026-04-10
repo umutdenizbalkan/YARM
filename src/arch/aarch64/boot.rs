@@ -47,7 +47,8 @@ yarm_aarch64_enter_el1_if_needed:
     msr CPACR_EL1, x1
     mrs x1, SCTLR_EL1
     msr SCTLR_EL1, x1
-    msr SP_EL1, sp
+    mov x2, sp
+    msr SP_EL1, x2
     adr x1, 1f
     msr ELR_EL2, x1
     mov x1, #0x3C5
