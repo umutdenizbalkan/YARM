@@ -24,6 +24,7 @@ Boot `kernel_boot` on `qemu-system-aarch64` (`virt`) to stable kernel markers, t
 - Add AArch64 exception vector table and `VBAR_EL1` setup.
 - Establish EL2→EL1 transition path when booting from EL2.
 - Define minimal trap entry/return ABI for synchronous exceptions and IRQs.
+- Configure `CPACR_EL1.FPEN` before entering Rust code paths that may use FP/NEON instructions.
 
 **Acceptance**
 - Deliberate exception test reaches trap handler and returns/halts predictably.
@@ -47,6 +48,7 @@ Boot `kernel_boot` on `qemu-system-aarch64` (`virt`) to stable kernel markers, t
 **Scope**
 - Build initial EL1 page tables for kernel text/data/bss/stack + direct-map window.
 - Program MAIR/TCR/TTBR and enable MMU/cache in SCTLR.
+- Include MMU-transition maintenance sequence (`TLBI VMALLE1`, `IC IALLU`, `DSB ISH`, `ISB`) around enable.
 - Remove placeholder assumptions in aarch64 page-table bootstrap path.
 
 **Acceptance**
@@ -83,6 +85,7 @@ Boot `kernel_boot` on `qemu-system-aarch64` (`virt`) to stable kernel markers, t
 **Scope**
 - Implement `bootstrap_first_user_task` for AArch64 (real task/image setup).
 - Implement `enter_dispatched_user_task_if_available` with EL0 handoff (`eret`).
+- Ensure initial capability space/bootstrap namespace is populated before EL0 handoff.
 - Remove AArch64 no-op first-task boot stubs.
 
 **Acceptance**
@@ -112,6 +115,26 @@ Boot `kernel_boot` on `qemu-system-aarch64` (`virt`) to stable kernel markers, t
 **Acceptance**
 - AArch64 gate scripts run green in strict mode.
 - No known flaky test/script exemptions remain for this path.
+
+---
+
+## TODOs captured from review notes
+- [ ] Keep EL2→EL1 drop as an explicit, review-visible implementation item inside PR2 (do not bury in vector-only changes).  
+- [ ] Add explicit `.bss` zeroing in AArch64 boot assembly before entering Rust.  
+- [ ] Preserve DTB pointer from boot register (`x0`) across EL2→EL1 transition and into early boot parsing.  
+- [ ] Keep CPACR/FPEN setup explicitly called out in PR2 acceptance/testing notes.  
+- [ ] Keep MMU enable maintenance sequence (TLBI/ICACHE barriers) explicit in PR4 implementation checklist.  
+- [ ] Add SMP/PSCI placeholder follow-up as **PR10** (single-core bringup first, SMP later).  
+- [ ] Call out initial capability-space bootstrap as a first-class item in PR7 description/checklist.  
+
+### PR10 placeholder — SMP/PSCI bring-up (post-boot baseline)
+**Scope**
+- Add PSCI CPU onlining scaffold and topology integration for secondary cores.
+- Define bootstrap-core-only fallback behavior when PSCI/firmware paths are unavailable.
+
+**Acceptance**
+- Secondary CPU online path is detectable/telemetry-visible.
+- Single-core fallback remains stable when SMP is disabled/unavailable.
 
 ---
 
