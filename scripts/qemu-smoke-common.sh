@@ -68,3 +68,16 @@ check_log_sequence() {
   done
   return 0
 }
+
+check_required_patterns() {
+  local logfile="$1"
+  shift
+  local pattern=""
+  for pattern in "$@"; do
+    if ! rg -n "$pattern" "$logfile" >/dev/null 2>&1; then
+      echo "[warn] required pattern missing: $pattern"
+      return 1
+    fi
+  done
+  return 0
+}

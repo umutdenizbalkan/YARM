@@ -112,6 +112,11 @@ Boot `kernel_boot` on `qemu-system-aarch64` (`virt`) to stable kernel markers, t
 - Convert temporary skips/lenient paths back to strict where stability is proven.
 - Add targeted regression tests for previously failing bring-up points.
 
+**Status update**
+- In-progress: AArch64 smoke now checks ordered early boot progression markers
+  and requires timer progression markers (`YARM_TIMER_IRQ_DELIVERED`,
+  `YARM_TIMER_EOI_DONE`, `YARM_SCHED_TICK`) when strict mode is enabled.
+
 **Acceptance**
 - AArch64 gate scripts run green in strict mode.
 - No known flaky test/script exemptions remain for this path.

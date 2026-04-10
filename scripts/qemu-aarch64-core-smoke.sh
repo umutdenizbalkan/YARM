@@ -32,7 +32,12 @@ INIT_SERVER_REGEX="init_server|first server|first-server"
 EARLY_MARKER_SEQUENCE=(
   "YARM_AARCH64_BOOT_MARKER stage=_start"
   "YARM_AARCH64_BOOT_MARKER stage=prepare_arch_boot"
+  "YARM_AARCH64_BOOT_MARKER stage=vbar_el1_ready"
+  "YARM_AARCH64_BOOT_MARKER stage=mmu_enabled"
   "YARM_AARCH64_BOOT_MARKER stage=run_with_prepared_kernel"
+  "YARM_BOOT_OK"
+  "YARM_INIT_START"
+  "YARM_INIT_DONE"
 )
 
 if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" \
@@ -53,14 +58,26 @@ else
 fi
 
 if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then
-  if check_log_sequence "$LOGFILE" "${EARLY_MARKER_SEQUENCE[@]}"; then
-    echo "[ok] aarch64 early boot marker sequence detected"
+  if ! check_required_patterns "$LOGFILE" "${EARLY_MARKER_SEQUENCE[@]}"; then
+    echo "[warn] aarch64 strict required markers are incomplete"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
     exit 0
   fi
-  echo "[warn] aarch64 early boot marker sequence missing or out of order"
-  if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
-    exit 1
+  if ! check_log_sequence "$LOGFILE" "${EARLY_MARKER_SEQUENCE[@]}"; then
+    echo "[warn] aarch64 early boot marker sequence missing or out of order"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    exit 0
   fi
+
+  if ! check_required_patterns "$LOGFILE" \
+      "YARM_TIMER_IRQ_DELIVERED" \
+      "YARM_TIMER_EOI_DONE" \
+      "YARM_SCHED_TICK"; then
+    echo "[warn] aarch64 timer progression markers missing"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    exit 0
+  fi
+  echo "[ok] aarch64 strict marker progression detected"
   exit 0
 fi
 
