@@ -683,17 +683,12 @@ fn debug_uart_marker(byte: u8) {
 pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
     use crate::kernel::boot::Bootstrap;
 
-    debug_uart_marker(b'H');
     // Descriptor tables are scaffolded during prepare_arch_boot() before run_kernel_boot().
-    // Avoid re-scaffolding here while narrowing early-boot fault localization.
-    debug_uart_marker(b'0');
+    // Keep the run path free from additional serial-marker calls so boot remains deterministic.
     let prepared_len = PREPARED_PVH_BOOT_MEMMAP_LEN.load(core::sync::atomic::Ordering::Acquire);
-    debug_uart_marker(b'1');
     let kernel_state = if prepared_len > 0 {
-        debug_uart_marker(b'2');
         let boot_regions = unsafe { &PREPARED_PVH_BOOT_MEMMAP[..prepared_len] };
         let reserved_ranges = Bootstrap::default_reserved_ranges_for_arch_boot();
-        debug_uart_marker(b'3');
         Bootstrap::init_with_boot_memory_map(
             Bootstrap::default_capacity_profile(),
             boot_regions,
@@ -701,14 +696,10 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         )
         .expect("kernel init with pvh memmap")
     } else {
-        debug_uart_marker(b'4');
         Bootstrap::init().expect("kernel init")
     };
-    debug_uart_marker(b'5');
     crate::yarm_log!("YARM_BOOT_INIT_READY prepared_pvh_regions={}", prepared_len);
     let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(kernel_state);
-    debug_uart_marker(b'6');
-    debug_uart_marker(b'I');
     let started_secondary = crate::arch::x86_64::smp::start_secondary_cpus(kernel).unwrap_or(0);
     crate::yarm_log!(
         "YARM_SMP_STARTUP started_secondary={} online_cpus={} present_cpus={}",
@@ -727,7 +718,6 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.present_cpu_bitmap(),
         kernel.online_cpu_count()
     );
-    debug_uart_marker(b'K');
     run(kernel);
 }
 
