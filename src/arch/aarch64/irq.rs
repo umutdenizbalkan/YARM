@@ -7,6 +7,7 @@ use core::ptr::write_volatile;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(any(test, target_arch = "aarch64"))]
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 const GICC_EOIR_OFFSET: usize = 0x10;
 
 #[cfg(any(test, target_arch = "aarch64"))]
@@ -44,6 +45,7 @@ pub fn try_configure_gic_from_description(description: &[u8]) -> bool {
 }
 
 #[cfg(any(test, target_arch = "aarch64"))]
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 fn gic_write_eoir(base: usize, irq_line: u16) {
     unsafe {
         write_volatile((base + GICC_EOIR_OFFSET) as *mut u32, irq_line as u32);
