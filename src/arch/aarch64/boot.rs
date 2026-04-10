@@ -236,6 +236,23 @@ const RING3_INIT_SERVER_CODE_PAGE: u64 = 0x0040_0000;
 pub fn bootstrap_first_user_task(
     kernel: &mut crate::kernel::boot::KernelState,
 ) -> Result<(), crate::kernel::boot::KernelError> {
+    use crate::services::control_plane::init::service::{
+        InitRuntimeBootConfig, run_minimum_profile_with_kernel,
+    };
+
+    crate::yarm_log!("YARM_INIT_START arch=aarch64 mode=initramfs_min_profile");
+    if let Ok(summary) = run_minimum_profile_with_kernel(kernel, InitRuntimeBootConfig::baseline())
+    {
+        crate::yarm_log!(
+            "YARM_INIT_DONE arch=aarch64 phase={:?} seeded={} initramfs_handled={} devfs_handled={}",
+            summary.init_phase,
+            summary.seeded_registrations,
+            summary.initramfs_handled,
+            summary.devfs_handled
+        );
+        return Ok(());
+    }
+
     use crate::kernel::boot::UserImageSpec;
     use crate::kernel::task::TaskClass;
     use crate::kernel::vm::{PageFlags, VirtAddr};
@@ -274,6 +291,9 @@ pub fn bootstrap_first_user_task(
         VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
         PageFlags::USER_RX,
     )?;
+    crate::yarm_log!(
+        "YARM_INIT_DONE arch=aarch64 phase=fallback_ring3_stub seeded=0 initramfs_handled=0 devfs_handled=0"
+    );
     Ok(())
 }
 
