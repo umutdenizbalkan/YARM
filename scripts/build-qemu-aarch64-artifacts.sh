@@ -20,6 +20,21 @@ BUSYBOX_BIN=${BUSYBOX_BIN:-}
 ARTIFACTS_STRICT=${ARTIFACTS_STRICT:-0}
 BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
 BUILD_LOG=${BUILD_LOG:-$OUT_DIR/aarch64-build.log}
+BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
+
+CARGO_Z_ARGS=()
+if cargo -V 2>/dev/null | rg -q "nightly"; then
+  CARGO_Z_ARGS=(-Z "build-std=${BUILD_STD_COMPONENTS}")
+else
+  echo "[warn] cargo is not nightly; skipping -Z build-std"
+  echo "[hint] install nightly cargo to build std from source for ${RUST_TARGET}"
+fi
+
+exit_if_strict_mode() {
+  if [[ "$ARTIFACTS_STRICT" == "1" ]]; then
+    exit 1
+  fi
+}
 
 emit_missing_target_hint() {
   local target="$1"
@@ -37,7 +52,7 @@ archive_rootfs() {
   if ! command -v cpio >/dev/null 2>&1; then
     echo "[warn] cpio not found; creating placeholder initramfs archive file"
     : > "$INITRAMFS_IMAGE_ABS"
-    [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+    exit_if_strict_mode
     return
   fi
 
@@ -55,7 +70,7 @@ archive_rootfs() {
 
   echo "[warn] cpio is installed but does not advertise --null or -H newc support; creating placeholder initramfs archive file"
   : > "$INITRAMFS_IMAGE_ABS"
-  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+  exit_if_strict_mode
 }
 
 mkdir -p "$OUT_DIR" "$ROOTFS_DIR/bin" "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
@@ -70,6 +85,7 @@ echo "[info] building ${KERNEL_PACKAGE}/${KERNEL_BIN} for target ${RUST_TARGET}"
 BUILD_OK=1
 set +e
 cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$KERNEL_PACKAGE" --bin "$KERNEL_BIN" \
+  "${CARGO_Z_ARGS[@]}" \
   2>&1 | tee "$BUILD_LOG"
 KERNEL_BUILD_STATUS=$?
 set -e
@@ -81,6 +97,7 @@ fi
 echo "[info] building ${SERVER_PACKAGE}/${SERVER_BIN} for target ${RUST_TARGET}"
 set +e
 cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$SERVER_BIN" \
+  "${CARGO_Z_ARGS[@]}" \
   2>&1 | tee "$BUILD_LOG"
 SERVER_BUILD_STATUS=$?
 set -e
@@ -93,7 +110,7 @@ if [[ "$BUILD_OK" -eq 1 && -f "$SERVER_ELF" ]]; then
   cp "$SERVER_ELF" "$ROOTFS_DIR/sbin/${SERVER_BIN}"
 else
   echo "[warn] compile for ${SERVER_BIN} failed or output missing (${SERVER_ELF})"
-  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+  exit_if_strict_mode
 fi
 
 if [[ -n "$BUSYBOX_BIN" && -x "$BUSYBOX_BIN" ]]; then
@@ -102,7 +119,7 @@ elif command -v busybox >/dev/null 2>&1; then
   cp "$(command -v busybox)" "$ROOTFS_DIR/bin/busybox"
 else
   echo "[warn] busybox not found; creating minimal /init fallback"
-  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+  exit_if_strict_mode
 fi
 
 if [[ -x "$ROOTFS_DIR/bin/busybox" ]]; then
@@ -148,7 +165,7 @@ if [[ -f "$KERNEL_IMAGE" ]]; then
   echo "[ok] kernel image: $KERNEL_IMAGE"
 else
   echo "[warn] kernel image missing: $KERNEL_IMAGE"
-  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+  exit_if_strict_mode
 fi
 
 if [[ -f "$KERNEL_BIN_IMAGE" ]]; then
