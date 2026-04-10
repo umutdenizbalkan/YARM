@@ -142,6 +142,12 @@ pub fn external_irq_eoi(irq_line: u16) {
 pub fn external_irq_eoi(_irq_line: u16) {}
 
 pub fn acknowledge_interrupt(irq_line: u16) {
+    #[cfg(test)]
+    {
+        let _ = irq_line;
+        return;
+    }
+    #[cfg(not(test))]
     external_irq_eoi(irq_line);
 }
 

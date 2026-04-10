@@ -369,12 +369,18 @@ pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
 }
 
 pub fn invalidate_page(virt: VirtAddr) {
-    #[cfg(feature = "hosted-dev")]
+    #[cfg(test)]
+    {
+        let _ = virt;
+        return;
+    }
+
+    #[cfg(all(feature = "hosted-dev", not(test)))]
     {
         let _ = virt;
     }
 
-    #[cfg(not(feature = "hosted-dev"))]
+    #[cfg(all(not(feature = "hosted-dev"), not(test)))]
     unsafe {
         core::arch::asm!(
             "sfence.vma {vaddr}, x0",
@@ -388,14 +394,15 @@ pub fn invalidate_asid(asid: Asid) {
     #[cfg(test)]
     {
         *LAST_INVALIDATED_ASID.lock() = Some(asid);
+        return;
     }
 
-    #[cfg(feature = "hosted-dev")]
+    #[cfg(all(feature = "hosted-dev", not(test)))]
     {
         let _ = asid;
     }
 
-    #[cfg(not(feature = "hosted-dev"))]
+    #[cfg(all(not(feature = "hosted-dev"), not(test)))]
     unsafe {
         core::arch::asm!(
             "sfence.vma x0, {asid}",

@@ -36,6 +36,7 @@ impl KernelState {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn timer_ticks_for_test(&self) -> u64 {
         let sched = self.scheduler_state.lock();
         sched.timer.current_ticks().0
