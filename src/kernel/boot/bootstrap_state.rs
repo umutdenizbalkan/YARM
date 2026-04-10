@@ -19,6 +19,10 @@ impl Bootstrap {
         )]
     }
 
+    pub fn default_reserved_ranges_for_arch_boot() -> [(u64, u64); 1] {
+        Self::default_reserved_ranges()
+    }
+
     fn push_region(
         out: &mut [MemoryRegion; MAX_BOOT_MEMORY_REGIONS],
         out_len: &mut usize,

@@ -688,10 +688,11 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     let prepared_len = PREPARED_PVH_BOOT_MEMMAP_LEN.load(core::sync::atomic::Ordering::Acquire);
     let kernel_state = if prepared_len > 0 {
         let boot_regions = unsafe { &PREPARED_PVH_BOOT_MEMMAP[..prepared_len] };
+        let reserved_ranges = Bootstrap::default_reserved_ranges_for_arch_boot();
         Bootstrap::init_with_boot_memory_map(
             Bootstrap::default_capacity_profile(),
             boot_regions,
-            &[],
+            &reserved_ranges,
         )
         .expect("kernel init with pvh memmap")
     } else {
