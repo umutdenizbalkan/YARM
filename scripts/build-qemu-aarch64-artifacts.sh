@@ -8,6 +8,8 @@ ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
 RUST_TARGET=${RUST_TARGET:-aarch64-unknown-none}
 SERVER_BIN=${SERVER_BIN:-init_server}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
+SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
+KERNEL_PACKAGE=${KERNEL_PACKAGE:-yarm}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-aarch64-none}
 SERVER_ELF=${SERVER_ELF:-target/${RUST_TARGET}/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
 KERNEL_ELF=${KERNEL_ELF:-target/${RUST_TARGET}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
@@ -64,14 +66,25 @@ if command -v rustup >/dev/null 2>&1; then
   rustup target add "$RUST_TARGET" >/dev/null 2>&1 || true
 fi
 
-echo "[info] building server + kernel bins for target ${RUST_TARGET}"
+echo "[info] building ${KERNEL_PACKAGE}/${KERNEL_BIN} for target ${RUST_TARGET}"
 BUILD_OK=1
 set +e
-cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} --bin "$SERVER_BIN" --bin "$KERNEL_BIN" \
+cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$KERNEL_PACKAGE" --bin "$KERNEL_BIN" \
   2>&1 | tee "$BUILD_LOG"
-BUILD_STATUS=$?
+KERNEL_BUILD_STATUS=$?
 set -e
-if [[ "$BUILD_STATUS" -ne 0 ]]; then
+if [[ "$KERNEL_BUILD_STATUS" -ne 0 ]]; then
+  BUILD_OK=0
+  emit_missing_target_hint "$RUST_TARGET"
+fi
+
+echo "[info] building ${SERVER_PACKAGE}/${SERVER_BIN} for target ${RUST_TARGET}"
+set +e
+cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$SERVER_BIN" \
+  2>&1 | tee "$BUILD_LOG"
+SERVER_BUILD_STATUS=$?
+set -e
+if [[ "$SERVER_BUILD_STATUS" -ne 0 ]]; then
   BUILD_OK=0
   emit_missing_target_hint "$RUST_TARGET"
 fi
