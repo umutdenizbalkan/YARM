@@ -4,6 +4,8 @@
 
 set -euo pipefail
 
+export RUST_MIN_STACK=${RUST_MIN_STACK:-33554432}
+
 python3 scripts/check-crate-graph-boundary.py
 bash scripts/check-service-arch-boundary.sh
 bash scripts/check-boundary-milestone-freeze.sh
