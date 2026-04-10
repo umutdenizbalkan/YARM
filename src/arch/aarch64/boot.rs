@@ -195,6 +195,7 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
 pub fn prepare_arch_boot(_start_info_ptr: usize) {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     {
+        let start_info_ptr = _start_info_ptr;
         crate::arch::aarch64::console::write_line(
             "YARM_AARCH64_BOOT_MARKER stage=prepare_arch_boot",
         );
@@ -207,7 +208,71 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
             core::arch::asm!("isb", options(nomem, preserves_flags));
         }
         crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=vbar_el1_ready");
+
+        if let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) {
+            if let Some(parsed) = crate::arch::aarch64::dtb::parse_boot_dtb(dtb) {
+                crate::yarm_log!(
+                    "YARM_AARCH64_DTB memory_start=0x{:x} memory_len=0x{:x} initrd_start=0x{:x} initrd_end=0x{:x} gic_cpu_if_base=0x{:x}",
+                    parsed.memory_start.unwrap_or(0),
+                    parsed.memory_len.unwrap_or(0),
+                    parsed.initrd_start.unwrap_or(0),
+                    parsed.initrd_end.unwrap_or(0),
+                    parsed.gic_cpu_if_base.unwrap_or(0),
+                );
+                if let (Some(start), Some(len)) = (parsed.memory_start, parsed.memory_len) {
+                    let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(&[
+                        crate::kernel::frame_allocator::MemoryRegion { start, len },
+                    ]);
+                }
+                if let Some(gic_base) = parsed.gic_cpu_if_base {
+                    let mut desc = [0u8; 40];
+                    if let Some(desc_len) = encode_irq_desc_gic_cpu_if_base(gic_base, &mut desc) {
+                        let _ = crate::arch::boot_entry::stage_irq_controller_description_for_boot(
+                            &desc[..desc_len],
+                        );
+                    }
+                }
+            }
+        }
     }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn dtb_slice_from_start_info(start_info_ptr: usize) -> Option<&'static [u8]> {
+    if start_info_ptr == 0 {
+        return None;
+    }
+    let total_size_be = unsafe { core::ptr::read_unaligned((start_info_ptr + 4) as *const u32) };
+    let total_size = u32::from_be(total_size_be) as usize;
+    if total_size < 40 || total_size > 2 * 1024 * 1024 {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(start_info_ptr as *const u8, total_size) })
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn encode_irq_desc_gic_cpu_if_base(base: usize, out: &mut [u8]) -> Option<usize> {
+    let prefix = b"gic_cpu_if_base=0x";
+    if out.len() < prefix.len() + 16 {
+        return None;
+    }
+    out[..prefix.len()].copy_from_slice(prefix);
+    let mut cursor = prefix.len();
+    let nybbles = core::mem::size_of::<usize>() * 2;
+    let mut emitted = false;
+    for shift in (0..nybbles).rev() {
+        let nibble = ((base >> (shift * 4)) & 0xF) as u8;
+        if nibble != 0 || emitted || shift == 0 {
+            out[cursor] = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + (nibble - 10)
+            };
+            cursor += 1;
+            emitted = true;
+        }
+    }
+    Some(cursor)
 }
 
 pub fn emit_panic(info: &core::panic::PanicInfo<'_>) {

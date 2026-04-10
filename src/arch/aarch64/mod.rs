@@ -4,6 +4,7 @@
 pub mod boot;
 pub mod console;
 pub mod context_switch;
+pub mod dtb;
 pub mod irq;
 pub mod page_table;
 pub mod platform_layout;
