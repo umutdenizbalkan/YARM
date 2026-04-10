@@ -428,32 +428,47 @@ fn setup_bootstrap_mmu() {
         let l1_addr = core::ptr::addr_of!(BOOT_L1_TABLE) as u64;
         let l2_addr = core::ptr::addr_of!(BOOT_L2_TABLE) as u64;
         let l3_uart_addr = core::ptr::addr_of!(BOOT_L3_UART_TABLE) as u64;
+        let l1_ptr = core::ptr::addr_of_mut!(BOOT_L1_TABLE.0) as *mut u64;
+        let l2_ptr = core::ptr::addr_of_mut!(BOOT_L2_TABLE.0) as *mut u64;
+        let l3_uart_ptr = core::ptr::addr_of_mut!(BOOT_L3_UART_TABLE.0) as *mut u64;
 
-        BOOT_L1_TABLE.0.fill(0);
-        BOOT_L2_TABLE.0.fill(0);
-        BOOT_L3_UART_TABLE.0.fill(0);
+        for idx in 0..512 {
+            core::ptr::write(l1_ptr.add(idx), 0);
+            core::ptr::write(l2_ptr.add(idx), 0);
+            core::ptr::write(l3_uart_ptr.add(idx), 0);
+        }
 
-        BOOT_L1_TABLE.0[0] = (l2_addr & !0xFFF) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE;
+        core::ptr::write(
+            l1_ptr,
+            (l2_addr & !0xFFF) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE,
+        );
         for idx in 0..512 {
             let base = (idx as u64) * AARCH64_BLOCK_2M;
-            BOOT_L2_TABLE.0[idx] = base
-                | AARCH64_PTE_VALID
-                | AARCH64_PTE_AF
-                | AARCH64_PTE_SH_INNER
-                | (AARCH64_ATTRIDX_NORMAL_WB << AARCH64_PTE_ATTR_SHIFT);
+            core::ptr::write(
+                l2_ptr.add(idx),
+                base | AARCH64_PTE_VALID
+                    | AARCH64_PTE_AF
+                    | AARCH64_PTE_SH_INNER
+                    | (AARCH64_ATTRIDX_NORMAL_WB << AARCH64_PTE_ATTR_SHIFT),
+            );
         }
 
         let uart_l2_index = (AARCH64_UART_MMIO_BASE / AARCH64_BLOCK_2M) as usize;
-        BOOT_L2_TABLE.0[uart_l2_index] =
-            (l3_uart_addr & !0xFFF) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE;
+        core::ptr::write(
+            l2_ptr.add(uart_l2_index),
+            (l3_uart_addr & !0xFFF) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE,
+        );
         let uart_block_base = AARCH64_UART_MMIO_BASE & !(AARCH64_BLOCK_2M - 1);
         for idx in 0..512 {
             let page_base = uart_block_base + ((idx as u64) << 12);
-            BOOT_L3_UART_TABLE.0[idx] = page_base
-                | AARCH64_PTE_VALID
-                | AARCH64_PTE_TABLE
-                | AARCH64_PTE_AF
-                | (AARCH64_ATTRIDX_DEVICE_NGNRNE << AARCH64_PTE_ATTR_SHIFT);
+            core::ptr::write(
+                l3_uart_ptr.add(idx),
+                page_base
+                    | AARCH64_PTE_VALID
+                    | AARCH64_PTE_TABLE
+                    | AARCH64_PTE_AF
+                    | (AARCH64_ATTRIDX_DEVICE_NGNRNE << AARCH64_PTE_ATTR_SHIFT),
+            );
         }
 
         let mair: u64 = 0x00_04_ff;
