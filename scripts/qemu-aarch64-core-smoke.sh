@@ -27,8 +27,13 @@ rm -f "$LOGFILE"
 
 echo "[info] qemu command: $QEMU_BIN -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
 
-MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
+MARKER_REGEX="YARM_AARCH64_BOOT_MARKER|YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
 INIT_SERVER_REGEX="init_server|first server|first-server"
+EARLY_MARKER_SEQUENCE=(
+  "YARM_AARCH64_BOOT_MARKER stage=_start"
+  "YARM_AARCH64_BOOT_MARKER stage=prepare_arch_boot"
+  "YARM_AARCH64_BOOT_MARKER stage=run_with_prepared_kernel"
+)
 
 if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" \
   -machine "$QEMU_MACHINE" \
@@ -48,6 +53,14 @@ else
 fi
 
 if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then
+  if check_log_sequence "$LOGFILE" "${EARLY_MARKER_SEQUENCE[@]}"; then
+    echo "[ok] aarch64 early boot marker sequence detected"
+    exit 0
+  fi
+  echo "[warn] aarch64 early boot marker sequence missing or out of order"
+  if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
+    exit 1
+  fi
   exit 0
 fi
 

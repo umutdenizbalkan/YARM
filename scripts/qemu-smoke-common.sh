@@ -49,3 +49,22 @@ check_common_boot_markers() {
   fi
   return 1
 }
+
+check_log_sequence() {
+  local logfile="$1"
+  shift
+  local last_line=0
+  local pattern=""
+  local line=0
+  for pattern in "$@"; do
+    line=$(rg -n -m 1 "$pattern" "$logfile" | cut -d: -f1 | head -n1 || true)
+    if [[ -z "$line" ]]; then
+      return 1
+    fi
+    if (( line <= last_line )); then
+      return 1
+    fi
+    last_line=$line
+  done
+  return 0
+}
