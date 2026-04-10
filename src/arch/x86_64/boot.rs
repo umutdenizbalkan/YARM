@@ -310,7 +310,9 @@ long_mode_entry:
     dec ecx
     jnz 0b
     lidt [rip + boot_idt_ptr]
-    lea rsp, [rip + boot_stack_end]
+    // Force a canonical low bootstrap stack pointer (zero-extended from 32-bit
+    // physical offset) before entering Rust code.
+    mov esp, offset boot_stack_end
     xor rbp, rbp
     mov ax, 0x10
     mov ds, ax
