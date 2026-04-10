@@ -401,7 +401,11 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                 );
                 if let (Some(start), Some(len)) = (parsed.memory_start, parsed.memory_len) {
                     let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(&[
-                        crate::kernel::frame_allocator::MemoryRegion { start, len },
+                        crate::kernel::frame_allocator::MemoryRegion {
+                            start,
+                            len,
+                            usable: true,
+                        },
                     ]);
                 }
                 if let Some(gic_base) = parsed.gic_cpu_if_base {
