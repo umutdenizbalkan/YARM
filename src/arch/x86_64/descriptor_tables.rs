@@ -1054,13 +1054,18 @@ declare_all_isr_stubs!(
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn ensure_boot_descriptor_tables_scaffolded() {
+    debug_uart_putc(b's');
     if DESCRIPTOR_SCAFFOLD_READY.swap(true, Ordering::AcqRel) {
+        debug_uart_putc(b'S');
         return;
     }
+    debug_uart_putc(b't');
     unsafe {
         let rsp0: u64;
         core::arch::asm!("mov {}, rsp", out(reg) rsp0, options(nomem, nostack, preserves_flags));
+        debug_uart_putc(b'u');
         populate_boot_idt_from_stubs();
+        debug_uart_putc(b'v');
 
         let ist_nmi_top = core::ptr::addr_of!(IST_NMI.0) as u64 + IST_NMI_STACK_BYTES as u64;
         let ist_df_top =
@@ -1077,6 +1082,7 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         let (tss_low, tss_high) = encode_tss_descriptor(tss_base, tss_limit);
         BOOT_GDT.entries[5] = tss_low;
         BOOT_GDT.entries[6] = tss_high;
+        debug_uart_putc(b'w');
 
         let idtr = X86IdtPointer::from_ptr(core::ptr::addr_of!(BOOT_IDT).cast::<X86IdtEntry>());
         let gdtr = X86GdtPointer {
@@ -1086,6 +1092,7 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
 
         core::arch::asm!("lgdt [{}]", in(reg) &gdtr, options(readonly, nostack, preserves_flags));
         core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
+        debug_uart_putc(b'x');
         core::arch::asm!(
             "mov ax, {data_sel}",
             "mov ds, ax",
@@ -1100,7 +1107,9 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
             tss_sel = const TSS_SELECTOR,
             options(nostack, preserves_flags)
         );
+        debug_uart_putc(b'y');
         configure_syscall_fast_path(rsp0);
+        debug_uart_putc(b'z');
     }
 }
 
