@@ -37,6 +37,9 @@ fn main() {
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_main(start_info_ptr: usize) -> ! {
     yarm::arch::boot_entry::prepare_arch_boot(start_info_ptr);
+    #[cfg(target_arch = "x86_64")]
+    run();
+    #[cfg(not(target_arch = "x86_64"))]
     yarm::arch::boot_entry::run_kernel_boot(run);
     unreachable!("kernel run loop should not return");
 }
