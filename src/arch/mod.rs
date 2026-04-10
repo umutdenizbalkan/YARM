@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+#[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 pub mod boot_entry;
 pub mod cpu_mapping;
@@ -8,7 +9,9 @@ pub mod hal;
 pub mod hal_adapters;
 pub mod irq_description;
 pub mod irq_guard;
+#[cfg(target_arch = "riscv64")]
 pub mod riscv64;
+#[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
 #[cfg(target_arch = "riscv64")]
