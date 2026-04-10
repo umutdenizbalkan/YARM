@@ -143,11 +143,21 @@ fn take_irq_firmware_blob_from_provider<'a>(
 pub fn run_kernel_boot_with_irq_description(run: fn(), irq_description: Option<&[u8]>) {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     crate::arch::x86_64::console::write_line("BE0");
-    let configured_from_description = irq_description.is_some_and(|description| {
-        super::irq_guard::configure_external_irq_controller_from_description(description)
-    });
-    if !configured_from_description {
-        super::irq_guard::configure_external_irq_controller_from_platform_layout();
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    let _ = irq_description;
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    {
+        // Defer external IRQ controller programming until kernel state is installed.
+        // Early pre-kernel MMIO programming can fault before run_with_prepared_kernel executes.
+    }
+    #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+    {
+        let configured_from_description = irq_description.is_some_and(|description| {
+            super::irq_guard::configure_external_irq_controller_from_description(description)
+        });
+        if !configured_from_description {
+            super::irq_guard::configure_external_irq_controller_from_platform_layout();
+        }
     }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     crate::arch::x86_64::console::write_line("BE1");
