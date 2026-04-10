@@ -191,6 +191,7 @@ pub fn run_kernel_boot(run: fn()) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
     #[cfg(target_arch = "x86_64")]
     use crate::std::string::String;

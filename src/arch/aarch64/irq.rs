@@ -111,6 +111,12 @@ pub fn external_irq_eoi(irq_line: u16) {
 #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "aarch64")))]
 pub fn external_irq_eoi(_irq_line: u16) {}
 
+pub fn acknowledge_interrupt(irq_line: u16) {
+    external_irq_eoi(irq_line);
+}
+
+pub fn program_timer_deadline(_cpu: crate::kernel::scheduler::CpuId, _ticks_from_now: u64) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

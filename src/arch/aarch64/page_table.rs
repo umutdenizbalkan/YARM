@@ -15,6 +15,9 @@ const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES
     * (1 + vm_layout::MAX_MAPPINGS * INTERMEDIATE_PT_PAGES_PER_MAPPING);
 const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
 
+#[cfg(test)]
+static LAST_INVALIDATED_ASID: SpinLock<Option<Asid>> = SpinLock::new(None);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageTableEntry(pub u64);
 
@@ -388,6 +391,11 @@ pub fn invalidate_page(virt: VirtAddr) {
 }
 
 pub fn invalidate_asid(asid: Asid) {
+    #[cfg(test)]
+    {
+        *LAST_INVALIDATED_ASID.lock() = Some(asid);
+    }
+
     #[cfg(feature = "hosted-dev")]
     {
         let _ = asid;
@@ -405,4 +413,9 @@ pub fn invalidate_asid(asid: Asid) {
             options(nostack, preserves_flags)
         );
     }
+}
+
+#[cfg(test)]
+pub fn take_last_invalidated_asid_for_test() -> Option<Asid> {
+    LAST_INVALIDATED_ASID.lock().take()
 }
