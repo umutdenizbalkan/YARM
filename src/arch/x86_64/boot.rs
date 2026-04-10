@@ -167,22 +167,37 @@ pvh_start32:
 
     mov esp, offset boot_stack_end
 
-    // FIXUP: The assembler/linker may emit full 64-bit *virtual* addresses
-    // for page-table *pointer* entries. During the hardware walk these bits
-    // are interpreted as physical addresses, so we must clear the upper dword
-    // on pointer entries before loading CR3.
-    //
-    // We intentionally do NOT patch bootstrap 2MiB leaf mappings (boot_pd and
-    // boot_pd_hi data leaves). Their values are emitted from 32-bit immediates
-    // here, so upper dwords are already correct under the low-physical boot map.
-    mov dword ptr [boot_pml4 + 4], 0   // PML4[0]  upper dword → physical
-    mov dword ptr [boot_pml4 + 2052], 0 // PML4[256] upper dword → physical
-    mov dword ptr [boot_pml4 + 4092], 0 // PML4[511] upper dword → physical
-    mov dword ptr [boot_pdpt_low + 4], 0   // PDPT[0]  upper dword → physical
-    mov dword ptr [boot_pdpt_low + 28], 0  // PDPT[3]  upper dword → physical
-    mov dword ptr [boot_pd   + 4], 0   // PD[0]    upper dword → physical
-    // The 2 MiB entries in boot_pd_hi at indices 502 and 503 are assembled
-    // from low 32-bit immediates; their upper 32 bits are already zero.
+    // FIXUP: Materialize bootstrap page-table *pointer* entries from low
+    // runtime offsets so CR3 walks never see relocated virtual pointers.
+    mov eax, offset boot_pdpt_low
+    or eax, 0x3
+    mov dword ptr [boot_pml4 + 0], eax
+    mov dword ptr [boot_pml4 + 4], 0
+
+    mov eax, offset boot_pdpt_direct
+    or eax, 0x3
+    mov dword ptr [boot_pml4 + 2048], eax
+    mov dword ptr [boot_pml4 + 2052], 0
+
+    mov eax, offset boot_pdpt_high
+    or eax, 0x3
+    mov dword ptr [boot_pml4 + 4088], eax
+    mov dword ptr [boot_pml4 + 4092], 0
+
+    mov eax, offset boot_pd
+    or eax, 0x3
+    mov dword ptr [boot_pdpt_low + 0], eax
+    mov dword ptr [boot_pdpt_low + 4], 0
+
+    mov eax, offset boot_pd_hi
+    or eax, 0x3
+    mov dword ptr [boot_pdpt_low + 24], eax
+    mov dword ptr [boot_pdpt_low + 28], 0
+
+    mov eax, offset boot_pt0
+    or eax, 0x3
+    mov dword ptr [boot_pd + 0], eax
+    mov dword ptr [boot_pd + 4], 0
 
     mov bl, 'A'
     call uart_putc32
