@@ -13,6 +13,7 @@ const ESR_EC_SVC64: u32 = 0x15;
 const ESR_EC_IABT_LOW: u32 = 0x20;
 const ESR_EC_DABT_LOW: u32 = 0x24;
 const ESR_EC_MASK: u32 = 0x3F;
+const ARCH_TIMER_PPI_IRQ: u16 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Aarch64TrapContext {
@@ -64,6 +65,9 @@ fn restore_arch_thread_state(
 
 pub fn decode_trap_context(context: Aarch64TrapContext) -> TrapEvent {
     if context.is_timer_irq {
+        return TrapEvent::TimerInterrupt;
+    }
+    if context.irq_line == Some(ARCH_TIMER_PPI_IRQ) {
         return TrapEvent::TimerInterrupt;
     }
     if let Some(irq) = context.irq_line {
@@ -129,6 +133,17 @@ mod tests {
             far_el1: 0,
             irq_line: None,
             is_timer_irq: true,
+        });
+        assert_eq!(ev.trap(), Trap::TimerInterrupt);
+    }
+
+    #[test]
+    fn decode_arch_timer_ppi_irq_as_timer() {
+        let ev = decode_trap_context(Aarch64TrapContext {
+            esr_el1: 0,
+            far_el1: 0,
+            irq_line: Some(30),
+            is_timer_irq: false,
         });
         assert_eq!(ev.trap(), Trap::TimerInterrupt);
     }

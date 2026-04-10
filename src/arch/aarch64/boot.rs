@@ -221,6 +221,13 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         "YARM_AARCH64_BOOT_MARKER stage=run_with_prepared_kernel",
     );
     let mut kernel = crate::kernel::boot::Bootstrap::init().expect("kernel init");
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    {
+        kernel.program_timer_deadline_current_cpu(
+            crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+        );
+        crate::arch::aarch64::irq::enable_interrupts_for_boot();
+    }
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),
