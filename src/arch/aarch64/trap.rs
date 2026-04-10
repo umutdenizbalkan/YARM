@@ -51,6 +51,10 @@ fn restore_arch_thread_state(
         .resume_current_thread_with_frame(frame)
         .map_err(crate::kernel::syscall::SyscallError::from)
         .map_err(TrapHandleError::Syscall)?;
+    frame.set_user_gpr(
+        crate::arch::aarch64::syscall_abi::REG_X18_TLS,
+        tls.unwrap_or(0),
+    );
     #[cfg(test)]
     {
         let idx = cpu.0 as usize;
@@ -61,6 +65,28 @@ fn restore_arch_thread_state(
     #[cfg(not(test))]
     let _ = (cpu, tls);
     Ok(())
+}
+
+fn import_syscall_abi_from_user_gprs(frame: &mut TrapFrame) {
+    frame.set_syscall_num(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8));
+    frame.set_arg(0, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0));
+    frame.set_arg(1, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1));
+    frame.set_arg(2, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2));
+    frame.set_arg(3, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X3));
+    frame.set_arg(4, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X4));
+    frame.set_arg(5, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X5));
+}
+
+fn export_syscall_result_to_user_gprs(frame: &mut TrapFrame) {
+    if let Some(error) = frame.error_code() {
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, error);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, 0);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, 0);
+    } else {
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.ret0());
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, frame.ret1());
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, frame.ret2());
+    }
 }
 
 pub fn decode_trap_context(context: Aarch64TrapContext) -> TrapEvent {
@@ -103,9 +129,20 @@ pub fn handle_trap_entry(
     context: Aarch64TrapContext,
     mut frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
+    let event = decode_trap_context(context);
+    if matches!(event, TrapEvent::Syscall) {
+        if let Some(trapframe) = frame.as_deref_mut() {
+            import_syscall_abi_from_user_gprs(trapframe);
+        }
+    }
     let _ = kernel.set_current_cpu(cpu);
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
-    kernel.handle_trap_event(decode_trap_context(context), frame.as_deref_mut())?;
+    kernel.handle_trap_event(event, frame.as_deref_mut())?;
+    if matches!(event, TrapEvent::Syscall) {
+        if let Some(trapframe) = frame.as_deref_mut() {
+            export_syscall_result_to_user_gprs(trapframe);
+        }
+    }
     restore_arch_thread_state(kernel, cpu, frame)?;
     Ok(())
 }
@@ -158,6 +195,44 @@ mod tests {
         });
         assert_eq!(ev.trap(), Trap::ExternalInterrupt);
         assert_eq!(ev.irq(), Some(44));
+    }
+
+    #[test]
+    fn syscall_abi_imports_x_register_arguments() {
+        let mut frame = TrapFrame::new(0, [0; 6]);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X8, 42);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, 10);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, 11);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, 12);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X3, 13);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X4, 14);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X5, 15);
+
+        import_syscall_abi_from_user_gprs(&mut frame);
+
+        assert_eq!(frame.syscall_num(), 42);
+        assert_eq!(frame.arg(0), 10);
+        assert_eq!(frame.arg(1), 11);
+        assert_eq!(frame.arg(2), 12);
+        assert_eq!(frame.arg(3), 13);
+        assert_eq!(frame.arg(4), 14);
+        assert_eq!(frame.arg(5), 15);
+    }
+
+    #[test]
+    fn syscall_abi_exports_return_registers() {
+        let mut frame = TrapFrame::new(0, [0; 6]);
+        frame.set_ok(7, 8, 9);
+        export_syscall_result_to_user_gprs(&mut frame);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0), 7);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1), 8);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2), 9);
+
+        frame.set_err(5);
+        export_syscall_result_to_user_gprs(&mut frame);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0), 5);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1), 0);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2), 0);
     }
 
     #[test]
@@ -247,6 +322,10 @@ mod tests {
         )
         .expect("trap");
         assert_eq!(last_restored_tls_base(CpuId(2)), Some(0xCAFE_0000));
+        assert_eq!(
+            frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X18_TLS),
+            0xCAFE_0000
+        );
     }
 
     #[test]
