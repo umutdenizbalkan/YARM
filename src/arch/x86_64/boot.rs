@@ -684,7 +684,8 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     use crate::kernel::boot::Bootstrap;
 
     debug_uart_marker(b'H');
-    crate::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
+    // Descriptor tables are scaffolded during prepare_arch_boot() before run_kernel_boot().
+    // Avoid re-scaffolding here while narrowing early-boot fault localization.
     debug_uart_marker(b'0');
     let prepared_len = PREPARED_PVH_BOOT_MEMMAP_LEN.load(core::sync::atomic::Ordering::Acquire);
     debug_uart_marker(b'1');
