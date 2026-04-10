@@ -32,7 +32,10 @@ boot_pml4:
     // Mirror physical memory into the higher-half direct-map window.
     .quad boot_pdpt_direct + 0x3
     .zero 2024
-    .quad boot_pdpt_direct + 0x3
+    // Map canonical kernel high-half window (PML4[511]) back to low bootstrap
+    // physical memory so linked kernel symbols near 0xFFFF_FFFF_8000_0000 are
+    // valid before final kernel page tables are installed.
+    .quad boot_pdpt_high + 0x3
 
     .align 4096
 boot_pdpt_low:
@@ -52,6 +55,14 @@ boot_pdpt_direct:
     .quad (direct_map_index * 0x40000000) | direct_map_page_flags
     .set direct_map_index, direct_map_index + 1
     .endr
+
+    .align 4096
+boot_pdpt_high:
+    // Populate only the canonical high-half 1GiB slot used by
+    // 0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_BFFF_FFFF (PDPT[510]).
+    .zero 4080
+    .quad boot_pd + 0x3
+    .zero 8
 
     .align 4096
 boot_pd:
