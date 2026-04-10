@@ -31,7 +31,8 @@ boot_pml4:
     .zero 2040
     // Mirror physical memory into the higher-half direct-map window.
     .quad boot_pdpt_direct + 0x3
-    .zero 2032
+    .zero 2024
+    .quad boot_pdpt_direct + 0x3
 
     .align 4096
 boot_pdpt_low:
@@ -164,6 +165,7 @@ pvh_start32:
     // here, so upper dwords are already correct under the low-physical boot map.
     mov dword ptr [boot_pml4 + 4], 0   // PML4[0]  upper dword → physical
     mov dword ptr [boot_pml4 + 2052], 0 // PML4[256] upper dword → physical
+    mov dword ptr [boot_pml4 + 4092], 0 // PML4[511] upper dword → physical
     mov dword ptr [boot_pdpt_low + 4], 0   // PDPT[0]  upper dword → physical
     mov dword ptr [boot_pdpt_low + 28], 0  // PDPT[3]  upper dword → physical
     mov dword ptr [boot_pd   + 4], 0   // PD[0]    upper dword → physical
