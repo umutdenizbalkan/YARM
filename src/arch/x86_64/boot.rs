@@ -546,14 +546,33 @@ fn log_pvh_boot_metadata(start_info_ptr: usize) {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
+    let (regions, used) = collect_pvh_usable_regions(start_info_ptr);
+    if used > 0 {
+        let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(&regions[..used]);
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn collect_pvh_usable_regions(
+    start_info_ptr: usize,
+) -> (
+    [crate::kernel::frame_allocator::MemoryRegion; MAX_PVH_MEMMAP_ENTRIES],
+    usize,
+) {
     const PAGE_SIZE_U64: u64 = crate::kernel::vm::PAGE_SIZE as u64;
     const RESERVED_LOW_EXCLUSIVE: u64 = crate::arch::platform_layout::NEXT_ANON_PHYS_BASE;
     const DIRECT_MAP_LIMIT: u64 = crate::arch::platform_layout::KERNEL_PHYS_DIRECT_MAP_BYTES;
     const MEMMAP_ENTRY_SIZE: u64 = core::mem::size_of::<PvhMemMapEntry>() as u64;
     const MEMMAP_ENTRY_ALIGN: u64 = core::mem::align_of::<PvhMemMapEntry>() as u64;
 
+    let mut regions = [crate::kernel::frame_allocator::MemoryRegion {
+        start: 0,
+        len: 0,
+        usable: false,
+    }; MAX_PVH_MEMMAP_ENTRIES];
+
     if start_info_ptr == 0 {
-        return;
+        return (regions, 0);
     }
     let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
     if start_info._magic != PVH_MAGIC
@@ -561,24 +580,19 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
         || start_info.memmap_entries == 0
         || !start_info.memmap_paddr.is_multiple_of(MEMMAP_ENTRY_ALIGN)
     {
-        return;
+        return (regions, 0);
     }
     let count = core::cmp::min(start_info.memmap_entries as usize, MAX_PVH_MEMMAP_ENTRIES);
     let Some(memmap_bytes) = (count as u64).checked_mul(MEMMAP_ENTRY_SIZE) else {
-        return;
+        return (regions, 0);
     };
     let Some(memmap_end) = start_info.memmap_paddr.checked_add(memmap_bytes) else {
-        return;
+        return (regions, 0);
     };
     if memmap_end > MAX_PVH_PHYS_EXCLUSIVE {
-        return;
+        return (regions, 0);
     }
 
-    let mut regions = [crate::kernel::frame_allocator::MemoryRegion {
-        start: 0,
-        len: 0,
-        usable: false,
-    }; MAX_PVH_MEMMAP_ENTRIES];
     let mut used = 0usize;
     for idx in 0..count {
         let Some(entry_paddr) = start_info
@@ -620,9 +634,28 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
         };
         used += 1;
     }
-    if used > 0 {
-        let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(&regions[..used]);
+    (regions, used)
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static PREPARED_PVH_BOOT_MEMMAP_LEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut PREPARED_PVH_BOOT_MEMMAP: [crate::kernel::frame_allocator::MemoryRegion;
+    MAX_PVH_MEMMAP_ENTRIES] = [crate::kernel::frame_allocator::MemoryRegion {
+    start: 0,
+    len: 0,
+    usable: false,
+}; MAX_PVH_MEMMAP_ENTRIES];
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn store_prepared_boot_memory_map(regions: &[crate::kernel::frame_allocator::MemoryRegion]) {
+    let count = core::cmp::min(regions.len(), MAX_PVH_MEMMAP_ENTRIES);
+    unsafe {
+        PREPARED_PVH_BOOT_MEMMAP[..count].copy_from_slice(&regions[..count]);
     }
+    PREPARED_PVH_BOOT_MEMMAP_LEN.store(count, core::sync::atomic::Ordering::Release);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -652,9 +685,19 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
 
     debug_uart_marker(b'H');
     crate::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
-    let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(
-        Bootstrap::init().expect("kernel init"),
-    );
+    let prepared_len = PREPARED_PVH_BOOT_MEMMAP_LEN.load(core::sync::atomic::Ordering::Acquire);
+    let kernel_state = if prepared_len > 0 {
+        let boot_regions = unsafe { &PREPARED_PVH_BOOT_MEMMAP[..prepared_len] };
+        Bootstrap::init_with_boot_memory_map(
+            Bootstrap::default_capacity_profile(),
+            boot_regions,
+            &[],
+        )
+        .expect("kernel init with pvh memmap")
+    } else {
+        Bootstrap::init().expect("kernel init")
+    };
+    let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(kernel_state);
     debug_uart_marker(b'I');
     let started_secondary = crate::arch::x86_64::smp::start_secondary_cpus(kernel).unwrap_or(0);
     crate::yarm_log!(
@@ -698,6 +741,8 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
     crate::arch::x86_64::console::write_line("KM1");
     log_pvh_boot_metadata(start_info_ptr);
     crate::arch::x86_64::console::write_line("KM2");
+    let (regions, used) = collect_pvh_usable_regions(start_info_ptr);
+    store_prepared_boot_memory_map(&regions[..used]);
     init_pt_allocator_from_pvh_memmap(start_info_ptr);
     crate::arch::x86_64::console::write_line("KM3");
 }
