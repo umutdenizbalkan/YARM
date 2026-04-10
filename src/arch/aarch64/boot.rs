@@ -61,6 +61,44 @@ yarm_aarch64_enter_el1_if_needed:
 );
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_PTE_VALID: u64 = 1 << 0;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_PTE_TABLE: u64 = 1 << 1;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_PTE_AF: u64 = 1 << 10;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_PTE_SH_INNER: u64 = 0b11 << 8;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_PTE_ATTR_SHIFT: u64 = 2;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_ATTRIDX_NORMAL_WB: u64 = 0;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_ATTRIDX_DEVICE_NGNRNE: u64 = 3;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_BLOCK_2M: u64 = 2 * 1024 * 1024;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_UART_MMIO_BASE: u64 = 0x0900_0000;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[repr(C, align(4096))]
+struct AlignedL3([u64; 512]);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[repr(C, align(4096))]
+struct AlignedL2([u64; 512]);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[repr(C, align(4096))]
+struct AlignedL1([u64; 512]);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static mut BOOT_L1_TABLE: AlignedL1 = AlignedL1([0; 512]);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static mut BOOT_L2_TABLE: AlignedL2 = AlignedL2([0; 512]);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static mut BOOT_L3_UART_TABLE: AlignedL3 = AlignedL3([0; 512]);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 global_asm!(
     r#"
     .section .text.boot,"ax",@progbits
@@ -234,7 +272,74 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                 }
             }
         }
+        setup_bootstrap_mmu();
     }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn setup_bootstrap_mmu() {
+    unsafe {
+        let l1_addr = core::ptr::addr_of!(BOOT_L1_TABLE) as u64;
+        let l2_addr = core::ptr::addr_of!(BOOT_L2_TABLE) as u64;
+        let l3_uart_addr = core::ptr::addr_of!(BOOT_L3_UART_TABLE) as u64;
+
+        BOOT_L1_TABLE.0.fill(0);
+        BOOT_L2_TABLE.0.fill(0);
+        BOOT_L3_UART_TABLE.0.fill(0);
+
+        BOOT_L1_TABLE.0[0] = (l2_addr & !0xFFF) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE;
+        for idx in 0..512 {
+            let base = (idx as u64) * AARCH64_BLOCK_2M;
+            BOOT_L2_TABLE.0[idx] = base
+                | AARCH64_PTE_VALID
+                | AARCH64_PTE_AF
+                | AARCH64_PTE_SH_INNER
+                | (AARCH64_ATTRIDX_NORMAL_WB << AARCH64_PTE_ATTR_SHIFT);
+        }
+
+        let uart_l2_index = (AARCH64_UART_MMIO_BASE / AARCH64_BLOCK_2M) as usize;
+        BOOT_L2_TABLE.0[uart_l2_index] =
+            (l3_uart_addr & !0xFFF) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE;
+        let uart_block_base = AARCH64_UART_MMIO_BASE & !(AARCH64_BLOCK_2M - 1);
+        for idx in 0..512 {
+            let page_base = uart_block_base + ((idx as u64) << 12);
+            BOOT_L3_UART_TABLE.0[idx] = page_base
+                | AARCH64_PTE_VALID
+                | AARCH64_PTE_TABLE
+                | AARCH64_PTE_AF
+                | (AARCH64_ATTRIDX_DEVICE_NGNRNE << AARCH64_PTE_ATTR_SHIFT);
+        }
+
+        let mair: u64 = 0x00_04_ff;
+        let tcr: u64 = 16
+            | (16 << 16)
+            | (1 << 8)
+            | (1 << 10)
+            | (0b11 << 12)
+            | (1 << 24)
+            | (1 << 26)
+            | (0b11 << 28)
+            | (0b10 << 30)
+            | (0b010 << 32);
+
+        core::arch::asm!("msr MAIR_EL1, {0}", in(reg) mair, options(nostack, preserves_flags));
+        core::arch::asm!("msr TCR_EL1, {0}", in(reg) tcr, options(nostack, preserves_flags));
+        core::arch::asm!("msr TTBR0_EL1, {0}", in(reg) l1_addr, options(nostack, preserves_flags));
+        core::arch::asm!("msr TTBR1_EL1, xzr", options(nostack, preserves_flags));
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+        core::arch::asm!("tlbi vmalle1", options(nostack, preserves_flags));
+        core::arch::asm!("ic iallu", options(nostack, preserves_flags));
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+
+        let mut sctlr: u64;
+        core::arch::asm!("mrs {0}, SCTLR_EL1", out(reg) sctlr, options(nostack, preserves_flags));
+        sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
+        core::arch::asm!("msr SCTLR_EL1, {0}", in(reg) sctlr, options(nostack, preserves_flags));
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=mmu_enabled");
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
