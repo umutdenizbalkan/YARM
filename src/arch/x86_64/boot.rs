@@ -58,11 +58,12 @@ boot_pdpt_direct:
 
     .align 4096
 boot_pdpt_high:
-    // Populate only the canonical high-half 1GiB slot used by
-    // 0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_BFFF_FFFF (PDPT[510]).
+    // Populate the top canonical high-half 2GiB window used during early boot:
+    // - PDPT[510]: 0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_BFFF_FFFF
+    // - PDPT[511]: 0xFFFF_FFFF_C000_0000..0xFFFF_FFFF_FFFF_FFFF
     .zero 4080
     .quad boot_pd + 0x3
-    .zero 8
+    .quad boot_pd + 0x3
 
     .align 4096
 boot_pd:
