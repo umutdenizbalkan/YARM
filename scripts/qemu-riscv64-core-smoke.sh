@@ -17,14 +17,18 @@ KERNEL_CMDLINE=${KERNEL_CMDLINE:-"console=ttyS0 rdinit=/init"}
 
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
-require_qemu_or_warn "qemu-system-riscv64" "$QEMU_SMOKE_STRICT"
+QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64-hwe}
+if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
+  QEMU_BIN=qemu-system-riscv64
+fi
+require_qemu_or_warn "$QEMU_BIN" "$QEMU_SMOKE_STRICT"
 
 LOGFILE=${LOGFILE:-qemu-core.log}
 rm -f "$LOGFILE"
 
-echo "[info] qemu command: qemu-system-riscv64 -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -bios $QEMU_BIOS -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
+echo "[info] qemu command: $QEMU_BIN -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -bios $QEMU_BIOS -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
 
-if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" qemu-system-riscv64 \
+if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" \
   -machine "$QEMU_MACHINE" \
   -cpu "$QEMU_CPU" \
   -m "$QEMU_MEMORY" \

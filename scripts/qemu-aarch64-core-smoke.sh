@@ -16,17 +16,21 @@ KERNEL_CMDLINE=${KERNEL_CMDLINE:-"console=ttyAMA0 rdinit=/init"}
 
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
-require_qemu_or_warn "qemu-system-aarch64" "$QEMU_SMOKE_STRICT"
+QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64-hwe}
+if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
+  QEMU_BIN=qemu-system-aarch64
+fi
+require_qemu_or_warn "$QEMU_BIN" "$QEMU_SMOKE_STRICT"
 
 LOGFILE=${LOGFILE:-qemu-aarch64-core.log}
 rm -f "$LOGFILE"
 
-echo "[info] qemu command: qemu-system-aarch64 -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
+echo "[info] qemu command: $QEMU_BIN -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
 
 MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
 INIT_SERVER_REGEX="init_server|first server|first-server"
 
-if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" qemu-system-aarch64 \
+if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" \
   -machine "$QEMU_MACHINE" \
   -cpu "$QEMU_CPU" \
   -m "$QEMU_MEMORY" \
