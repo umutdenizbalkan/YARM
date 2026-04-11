@@ -144,8 +144,20 @@ static mut BOOT_L1_TABLE: AlignedL1 = AlignedL1([0; 512]);
 static mut BOOT_L2_TABLE: AlignedL2 = AlignedL2([0; 512]);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-static mut BOOT_KERNEL_STATE: core::mem::MaybeUninit<crate::kernel::boot::KernelState> =
-    core::mem::MaybeUninit::uninit();
+struct BootKernelStateSlot(core::cell::UnsafeCell<core::mem::MaybeUninit<crate::kernel::boot::KernelState>>);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+unsafe impl Sync for BootKernelStateSlot {}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+impl BootKernelStateSlot {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()))
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static BOOT_KERNEL_STATE: BootKernelStateSlot = BootKernelStateSlot::new();
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 global_asm!(
@@ -436,8 +448,9 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         // `KernelState` is large; keeping it as a local here can overflow the
         // tiny early boot stack before regular scheduling/VM paths are active.
         // Materialize it in static storage instead of on the bootstrap stack.
-        BOOT_KERNEL_STATE.write(crate::kernel::boot::Bootstrap::init().expect("kernel init"));
-        &mut *BOOT_KERNEL_STATE.as_mut_ptr()
+        let slot = BOOT_KERNEL_STATE.0.get();
+        (*slot).write(crate::kernel::boot::Bootstrap::init().expect("kernel init"));
+        &mut *(*slot).as_mut_ptr()
     };
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
