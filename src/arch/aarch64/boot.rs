@@ -139,42 +139,43 @@ global_asm!(
     .global yarm_aarch64_vector_table_el1
     .type yarm_aarch64_vector_table_el1,%function
 yarm_aarch64_vector_table_el1:
-    // Current EL with SP0
+    // Current EL with SP0 (offsets 0x000..0x180)
+    .balign 128
     b yarm_aarch64_vector_sync_lower_a64_sp0
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_irq_lower_a64_sp0
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_fiq_lower_a64_sp0
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_serror_lower_a64_sp0
-    .space 124
-    // Current EL with SPx
+    // Current EL with SPx (offsets 0x200..0x380)
+    .balign 128
     b yarm_aarch64_vector_sync_current
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_irq_current
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_fiq_current
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_serror_current
-    .space 124
-    // Lower EL using AArch64
+    // Lower EL using AArch64 (offsets 0x400..0x580)
+    .balign 128
     b yarm_aarch64_vector_sync_lower_a64
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_irq_lower_a64
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_fiq_lower_a64
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_serror_lower_a64
-    .space 124
-    // Lower EL using AArch32
+    // Lower EL using AArch32 (offsets 0x600..0x780)
+    .balign 128
     b yarm_aarch64_vector_sync_lower_a32
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_irq_lower_a32
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_fiq_lower_a32
-    .space 124
+    .balign 128
     b yarm_aarch64_vector_serror_lower_a32
-    .space 124
+    .balign 128
 
     .macro YARM_AARCH64_VECTOR_STUB name kind
     .global \name
