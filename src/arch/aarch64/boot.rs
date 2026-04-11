@@ -257,7 +257,26 @@ extern "C" fn yarm_aarch64_enable_fp_simd() {
 extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64) {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_VECTOR_ENTRY");
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=exception");
-    let _ = (kind, esr_el1, far_el1);
+    let ec = (esr_el1 >> 26) & 0x3f;
+    let il = (esr_el1 >> 25) & 0x1;
+    let iss = esr_el1 & 0x1ff_ffff;
+    let mut elr_el1: u64 = 0;
+    let mut spsr_el1: u64 = 0;
+    unsafe {
+        core::arch::asm!("mrs {0}, ELR_EL1", out(reg) elr_el1, options(nomem, preserves_flags));
+        core::arch::asm!("mrs {0}, SPSR_EL1", out(reg) spsr_el1, options(nomem, preserves_flags));
+    }
+    crate::yarm_log!(
+        "YARM_AARCH64_EXCEPTION kind={} ec=0x{:x} il={} iss=0x{:x} esr=0x{:x} far=0x{:x} elr=0x{:x} spsr=0x{:x}",
+        kind,
+        ec,
+        il,
+        iss,
+        esr_el1,
+        far_el1,
+        elr_el1,
+        spsr_el1
+    );
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -528,18 +547,28 @@ fn setup_bootstrap_mmu() {
         core::arch::asm!("msr TTBR0_EL1, {0}", in(reg) l1_addr, options(nostack, preserves_flags));
         core::arch::asm!("msr TTBR1_EL1, xzr", options(nostack, preserves_flags));
         crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1");
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1A");
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1B");
         core::arch::asm!("isb", options(nostack, preserves_flags));
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1C");
         core::arch::asm!("tlbi vmalle1", options(nostack, preserves_flags));
-        core::arch::asm!("ic iallu", options(nostack, preserves_flags));
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1D");
+        // Keep the bootstrap sequence conservative: some emulated CPU configs can
+        // fault on IC invalidate-all during early bring-up. We can safely defer this
+        // for now because MMU/caches are just being enabled.
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1E");
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1F");
         core::arch::asm!("isb", options(nostack, preserves_flags));
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1G");
 
         let mut sctlr: u64;
         core::arch::asm!("mrs {0}, SCTLR_EL1", out(reg) sctlr, options(nostack, preserves_flags));
         sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
         core::arch::asm!("msr SCTLR_EL1, {0}", in(reg) sctlr, options(nostack, preserves_flags));
         core::arch::asm!("isb", options(nostack, preserves_flags));
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1H");
     }
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M2");
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=mmu_enabled");
