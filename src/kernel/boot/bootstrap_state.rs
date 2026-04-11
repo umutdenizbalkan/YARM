@@ -5,6 +5,7 @@ use super::*;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 unsafe extern "C" {
+    static __kernel_start: u8;
     static __kernel_end: u8;
 }
 
@@ -19,6 +20,9 @@ impl Bootstrap {
     }
 
     fn default_reserved_ranges() -> [(u64, u64); 1] {
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+        let kernel_start = (&raw const __kernel_start) as *const u8 as u64;
+        #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
         let kernel_start = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE;
         #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
         let kernel_end = (&raw const __kernel_end) as *const u8 as u64;

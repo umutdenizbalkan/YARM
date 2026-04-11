@@ -12,7 +12,7 @@ global_asm!(
     .section .bss.bootstack,"aw",@nobits
     .align 16
 boot_stack_aarch64:
-    .skip 16384
+    .skip 65536
 boot_stack_aarch64_end:
 
     .section .text.boot,"ax",@progbits
@@ -219,6 +219,8 @@ yarm_aarch64_vector_table_el1:
 yarm_aarch64_vector_dispatch:
     mrs x1, esr_el1
     mrs x2, far_el1
+    mrs x3, elr_el1
+    mrs x4, spsr_el1
     msr daifset, #0xf
     bl yarm_aarch64_vector_entry
 1:
@@ -273,7 +275,7 @@ extern "C" fn yarm_aarch64_enable_fp_simd() {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
-extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64) {
+extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64, elr_el1: u64, spsr_el1: u64) {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_VECTOR_ENTRY");
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=exception");
     struct FixedBufWriter<'a> {
@@ -290,16 +292,18 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64) {
             Ok(())
         }
     }
-    let mut line = [0u8; 96];
+    let mut line = [0u8; 160];
     let mut writer = FixedBufWriter {
         buf: &mut line,
         len: 0,
     };
     let _ = write!(
         writer,
-        "YARM_AARCH64_EXCEPTION_REGS esr_el1=0x{:016x} far_el1=0x{:016x}",
+        "YARM_AARCH64_EXCEPTION_REGS esr_el1=0x{:016x} far_el1=0x{:016x} elr_el1=0x{:016x} spsr_el1=0x{:016x}",
         esr_el1,
-        far_el1
+        far_el1,
+        elr_el1,
+        spsr_el1
     );
     let line_len = writer.len;
     if let Ok(msg) = core::str::from_utf8(&line[..line_len]) {

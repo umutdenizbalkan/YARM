@@ -25,7 +25,7 @@ SECTIONS {
     __kernel_start = .;
     __kernel_rx_start = .;
 
-    .text.boot : ALIGN(16) {
+    .text.boot : ALIGN(2048) {
         KEEP(*(.text.boot))
     } :text
 
