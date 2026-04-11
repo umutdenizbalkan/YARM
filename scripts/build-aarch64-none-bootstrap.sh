@@ -10,15 +10,10 @@ TOOLCHAIN=${TOOLCHAIN:-nightly}
 RUSTUP_DISABLED=${RUSTUP_DISABLED:-0}
 BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
 BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
-CARGO_Z_ARGS=("-Z" "build-std=${BUILD_STD_COMPONENTS}")
-
-if [[ "$RUST_TARGET" == *.json ]]; then
-  CARGO_Z_ARGS+=("-Z" "json-target-spec")
-fi
+CARGO_Z_ARGS=()
 
 if [[ "$RUST_TARGET" != *.json && -f "targets/${RUST_TARGET}.json" ]]; then
   RUST_TARGET="targets/${RUST_TARGET}.json"
-  CARGO_Z_ARGS+=("-Z" "json-target-spec")
 fi
 
 if [[ "$RUSTUP_DISABLED" == "0" ]] && ! command -v rustup >/dev/null 2>&1; then
@@ -40,6 +35,15 @@ else
   fi
   CARGO_CMD=(cargo +"${TOOLCHAIN}")
   TOOLCHAIN_LABEL="$TOOLCHAIN"
+fi
+
+if "${CARGO_CMD[@]}" -V 2>/dev/null | rg -q "nightly"; then
+  CARGO_Z_ARGS=("-Z" "build-std=${BUILD_STD_COMPONENTS}")
+  if [[ "$RUST_TARGET" == *.json ]]; then
+    CARGO_Z_ARGS+=("-Z" "json-target-spec")
+  fi
+else
+  echo "[warn] selected cargo is not nightly; building without -Z build-std/json-target-spec"
 fi
 
 echo "[info] building kernel_boot for ${RUST_TARGET} profile=${PROFILE} toolchain=${TOOLCHAIN_LABEL}"
