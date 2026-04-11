@@ -158,10 +158,10 @@ pub fn program_timer_deadline(_cpu: crate::kernel::scheduler::CpuId, _ticks_from
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 pub fn program_timer_deadline(_cpu: crate::kernel::scheduler::CpuId, ticks_from_now: u64) {
-    let clamped = ticks_from_now.clamp(1, u32::MAX as u64) as u32;
+    let clamped = ticks_from_now.clamp(1, u32::MAX as u64);
     unsafe {
-        core::arch::asm!("msr cntp_tval_el0, {0:w}", in(reg) clamped, options(nostack, preserves_flags));
-        core::arch::asm!("msr cntp_ctl_el0, {0:w}", in(reg) 1u32, options(nostack, preserves_flags));
+        core::arch::asm!("msr cntp_tval_el0, {0}", in(reg) clamped, options(nostack, preserves_flags));
+        core::arch::asm!("msr cntp_ctl_el0, {0}", in(reg) 1u64, options(nostack, preserves_flags));
         core::arch::asm!("isb", options(nostack, preserves_flags));
     }
 }
