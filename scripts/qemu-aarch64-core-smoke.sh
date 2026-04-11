@@ -12,7 +12,9 @@ QEMU_MACHINE=${QEMU_MACHINE:-virt}
 QEMU_CPU=${QEMU_CPU:-cortex-a72}
 QEMU_MEMORY=${QEMU_MEMORY:-1024M}
 QEMU_SMP=${QEMU_SMP:-2}
-KERNEL_CMDLINE=${KERNEL_CMDLINE:-"console=ttyAMA0 rdinit=/init"}
+# Keep kernel cmdline empty by default until AArch64 command-line parsing is
+# explicitly validated. Override if needed via KERNEL_CMDLINE=...
+KERNEL_CMDLINE=${KERNEL_CMDLINE:-}
 
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
@@ -25,7 +27,22 @@ require_qemu_or_warn "$QEMU_BIN" "$QEMU_SMOKE_STRICT"
 LOGFILE=${LOGFILE:-qemu-aarch64-core.log}
 rm -f "$LOGFILE"
 
-echo "[info] qemu command: $QEMU_BIN -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
+QEMU_ARGS=(
+  -machine "$QEMU_MACHINE"
+  -cpu "$QEMU_CPU"
+  -m "$QEMU_MEMORY"
+  -smp "$QEMU_SMP"
+  -nographic
+  -monitor none
+  -serial stdio
+  -kernel "$KERNEL_IMAGE"
+  -initrd "$INITRAMFS_IMAGE"
+)
+if [[ -n "$KERNEL_CMDLINE" ]]; then
+  QEMU_ARGS+=(-append "$KERNEL_CMDLINE")
+fi
+
+echo "[info] qemu command: $QEMU_BIN ${QEMU_ARGS[*]}"
 
 MARKER_REGEX="YARM_AARCH64_BOOT_MARKER|YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
 INIT_SERVER_REGEX="init_server|first server|first-server"
@@ -40,18 +57,7 @@ EARLY_MARKER_SEQUENCE=(
   "YARM_INIT_DONE"
 )
 
-if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" \
-  -machine "$QEMU_MACHINE" \
-  -cpu "$QEMU_CPU" \
-  -m "$QEMU_MEMORY" \
-  -smp "$QEMU_SMP" \
-  -nographic \
-  -monitor none \
-  -serial stdio \
-  -kernel "$KERNEL_IMAGE" \
-  -initrd "$INITRAMFS_IMAGE" \
-  -append "$KERNEL_CMDLINE" \
-; then
+if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" "${QEMU_ARGS[@]}"; then
   QEMU_STATUS=0
 else
   QEMU_STATUS=$?

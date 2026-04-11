@@ -75,6 +75,14 @@ Run strict smoke:
 QEMU_SMOKE_STRICT=1 scripts/qemu-aarch64-core-smoke.sh
 ```
 
+By default, the AArch64 smoke runner now launches QEMU **without** `-append`
+kernel command-line arguments so early bring-up debugging can rely on serial
+breadcrumbs even when cmdline parsing is not implemented yet. You can override:
+
+```bash
+KERNEL_CMDLINE="console=ttyAMA0 rdinit=/init" scripts/qemu-aarch64-core-smoke.sh
+```
+
 The hardened AArch64 smoke gate now requires ordered progression markers (not marker-only presence):
 
 - `YARM_AARCH64_BOOT_MARKER stage=_start`
