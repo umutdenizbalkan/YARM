@@ -138,6 +138,16 @@ global_asm!(
     .global yarm_aarch64_vector_table_el1
     .type yarm_aarch64_vector_table_el1,%function
 yarm_aarch64_vector_table_el1:
+    // Current EL with SP0
+    b yarm_aarch64_vector_sync_lower_a64_sp0
+    .space 124
+    b yarm_aarch64_vector_irq_lower_a64_sp0
+    .space 124
+    b yarm_aarch64_vector_fiq_lower_a64_sp0
+    .space 124
+    b yarm_aarch64_vector_serror_lower_a64_sp0
+    .space 124
+    // Current EL with SPx
     b yarm_aarch64_vector_sync_current
     .space 124
     b yarm_aarch64_vector_irq_current
@@ -146,6 +156,7 @@ yarm_aarch64_vector_table_el1:
     .space 124
     b yarm_aarch64_vector_serror_current
     .space 124
+    // Lower EL using AArch64
     b yarm_aarch64_vector_sync_lower_a64
     .space 124
     b yarm_aarch64_vector_irq_lower_a64
@@ -154,6 +165,7 @@ yarm_aarch64_vector_table_el1:
     .space 124
     b yarm_aarch64_vector_serror_lower_a64
     .space 124
+    // Lower EL using AArch32
     b yarm_aarch64_vector_sync_lower_a32
     .space 124
     b yarm_aarch64_vector_irq_lower_a32
@@ -161,14 +173,6 @@ yarm_aarch64_vector_table_el1:
     b yarm_aarch64_vector_fiq_lower_a32
     .space 124
     b yarm_aarch64_vector_serror_lower_a32
-    .space 124
-    b yarm_aarch64_vector_sync_lower_a64_sp0
-    .space 124
-    b yarm_aarch64_vector_irq_lower_a64_sp0
-    .space 124
-    b yarm_aarch64_vector_fiq_lower_a64_sp0
-    .space 124
-    b yarm_aarch64_vector_serror_lower_a64_sp0
     .space 124
 
     .macro YARM_AARCH64_VECTOR_STUB name kind
@@ -179,22 +183,22 @@ yarm_aarch64_vector_table_el1:
     b yarm_aarch64_vector_dispatch
     .endm
 
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_sync_current, 1
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_irq_current, 2
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_fiq_current, 3
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_serror_current, 4
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_sync_lower_a64, 5
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_irq_lower_a64, 6
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_fiq_lower_a64, 7
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_serror_lower_a64, 8
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_sync_lower_a32, 9
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_irq_lower_a32, 10
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_fiq_lower_a32, 11
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_serror_lower_a32, 12
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_sync_lower_a64_sp0, 13
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_irq_lower_a64_sp0, 14
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_fiq_lower_a64_sp0, 15
-    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_serror_lower_a64_sp0, 16
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_sync_lower_a64_sp0, 1
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_irq_lower_a64_sp0, 2
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_fiq_lower_a64_sp0, 3
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_serror_lower_a64_sp0, 4
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_sync_current, 5
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_irq_current, 6
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_fiq_current, 7
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_serror_current, 8
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_sync_lower_a64, 9
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_irq_lower_a64, 10
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_fiq_lower_a64, 11
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_serror_lower_a64, 12
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_sync_lower_a32, 13
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_irq_lower_a32, 14
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_fiq_lower_a32, 15
+    YARM_AARCH64_VECTOR_STUB yarm_aarch64_vector_serror_lower_a32, 16
 
     .global yarm_aarch64_vector_dispatch
     .type yarm_aarch64_vector_dispatch,%function
