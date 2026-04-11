@@ -219,6 +219,7 @@ yarm_aarch64_vector_table_el1:
 yarm_aarch64_vector_dispatch:
     mrs x1, esr_el1
     mrs x2, far_el1
+    msr daifset, #0xf
     bl yarm_aarch64_vector_entry
 1:
     wfe
@@ -275,26 +276,26 @@ extern "C" fn yarm_aarch64_enable_fp_simd() {
 extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64) {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_VECTOR_ENTRY");
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=exception");
-    let ec = (esr_el1 >> 26) & 0x3f;
-    let il = (esr_el1 >> 25) & 0x1;
-    let iss = esr_el1 & 0x1ff_ffff;
-    let mut elr_el1: u64 = 0;
-    let mut spsr_el1: u64 = 0;
-    unsafe {
-        core::arch::asm!("mrs {0}, ELR_EL1", out(reg) elr_el1, options(nomem, preserves_flags));
-        core::arch::asm!("mrs {0}, SPSR_EL1", out(reg) spsr_el1, options(nomem, preserves_flags));
+    match kind {
+        1 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_current_sp0"),
+        2 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_current_sp0"),
+        3 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_current_sp0"),
+        4 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_current_sp0"),
+        5 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_current_spx"),
+        6 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_current_spx"),
+        7 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_current_spx"),
+        8 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_current_spx"),
+        9 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_lower_a64"),
+        10 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_lower_a64"),
+        11 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_lower_a64"),
+        12 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_lower_a64"),
+        13 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_lower_a32"),
+        14 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_lower_a32"),
+        15 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_lower_a32"),
+        16 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_lower_a32"),
+        _ => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND unknown"),
     }
-    crate::yarm_log!(
-        "YARM_AARCH64_EXCEPTION kind={} ec=0x{:x} il={} iss=0x{:x} esr=0x{:x} far=0x{:x} elr=0x{:x} spsr=0x{:x}",
-        kind,
-        ec,
-        il,
-        iss,
-        esr_el1,
-        far_el1,
-        elr_el1,
-        spsr_el1
-    );
+    let _ = (esr_el1, far_el1);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
