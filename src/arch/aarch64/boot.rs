@@ -53,6 +53,15 @@ yarm_aarch64_enter_el1_if_needed:
     // Program a known baseline: EL1 runs AArch64 (RW=1), everything else clear.
     mov x1, #(1 << 31)
     msr HCR_EL2, x1
+    // Clear common EL2 trap controls so EL1 sysreg/MMU setup does not trap
+    // unexpectedly during early bring-up.
+    msr CPTR_EL2, xzr
+    msr HSTR_EL2, xzr
+    msr MDCR_EL2, xzr
+    mrs x1, CNTHCTL_EL2
+    orr x1, x1, #3
+    msr CNTHCTL_EL2, x1
+    msr CNTVOFF_EL2, xzr
     mov x1, #(3 << 20)
     msr CPACR_EL1, x1
     mrs x1, SCTLR_EL1
