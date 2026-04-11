@@ -26,6 +26,9 @@ BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_
 CARGO_Z_ARGS=()
 if cargo -V 2>/dev/null | rg -q "nightly"; then
   CARGO_Z_ARGS=(-Z "build-std=${BUILD_STD_COMPONENTS}")
+  if [[ "$RUST_TARGET" == *.json ]]; then
+    CARGO_Z_ARGS+=(-Z "json-target-spec")
+  fi
 else
   echo "[warn] cargo is not nightly; skipping -Z build-std"
   echo "[hint] install nightly cargo to build std from source for ${RUST_TARGET}"

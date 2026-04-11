@@ -10,6 +10,11 @@ TOOLCHAIN=${TOOLCHAIN:-nightly}
 RUSTUP_DISABLED=${RUSTUP_DISABLED:-0}
 BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
 BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
+CARGO_Z_ARGS=("-Z" "build-std=${BUILD_STD_COMPONENTS}")
+
+if [[ "$RUST_TARGET" == *.json ]]; then
+  CARGO_Z_ARGS+=("-Z" "json-target-spec")
+fi
 
 if [[ "$RUSTUP_DISABLED" == "0" ]] && ! command -v rustup >/dev/null 2>&1; then
   echo "[warn] rustup not found; switching to host toolchain mode (RUSTUP_DISABLED=1)"
@@ -34,7 +39,7 @@ fi
 
 echo "[info] building kernel_boot for ${RUST_TARGET} profile=${PROFILE} toolchain=${TOOLCHAIN_LABEL}"
 "${CARGO_CMD[@]}" build \
-  -Z build-std=${BUILD_STD_COMPONENTS} \
+  "${CARGO_Z_ARGS[@]}" \
   --target "$RUST_TARGET" \
   --profile "$PROFILE" \
   ${BOOTSTRAP_FEATURE_ARGS} \
@@ -43,7 +48,7 @@ echo "[info] building kernel_boot for ${RUST_TARGET} profile=${PROFILE} toolchai
 
 echo "[info] building init_server for ${RUST_TARGET} profile=${PROFILE}"
 "${CARGO_CMD[@]}" build \
-  -Z build-std=${BUILD_STD_COMPONENTS} \
+  "${CARGO_Z_ARGS[@]}" \
   --target "$RUST_TARGET" \
   --profile "$PROFILE" \
   ${BOOTSTRAP_FEATURE_ARGS} \
