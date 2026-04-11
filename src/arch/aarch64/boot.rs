@@ -144,6 +144,10 @@ static mut BOOT_L1_TABLE: AlignedL1 = AlignedL1([0; 512]);
 static mut BOOT_L2_TABLE: AlignedL2 = AlignedL2([0; 512]);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static mut BOOT_KERNEL_STATE: core::mem::MaybeUninit<crate::kernel::boot::KernelState> =
+    core::mem::MaybeUninit::uninit();
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 global_asm!(
     r#"
     .section .text.boot,"ax",@progbits
@@ -428,22 +432,20 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     crate::arch::aarch64::console::write_line(
         "YARM_AARCH64_BOOT_MARKER stage=run_with_prepared_kernel",
     );
-    let mut kernel = crate::kernel::boot::Bootstrap::init().expect("kernel init");
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    {
-        // Do not touch EL1 physical timer registers during early bootstrap.
-        // On some boot paths (e.g. direct EL1 entry), CNTHCTL_EL2 may still
-        // trap EL1 timer sysreg accesses, which raises a synchronous exception
-        // right after this stage marker. Timer/IRQ bring-up is deferred to the
-        // normal init path once platform control is fully established.
-    }
+    let kernel = unsafe {
+        // `KernelState` is large; keeping it as a local here can overflow the
+        // tiny early boot stack before regular scheduling/VM paths are active.
+        // Materialize it in static storage instead of on the bootstrap stack.
+        BOOT_KERNEL_STATE.write(crate::kernel::boot::Bootstrap::init().expect("kernel init"));
+        &mut *BOOT_KERNEL_STATE.as_mut_ptr()
+    };
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),
         kernel.present_cpu_bitmap(),
         kernel.online_cpu_count()
     );
-    run(&mut kernel);
+    run(kernel);
 }
 
 pub fn prepare_arch_boot(_start_info_ptr: usize) {
