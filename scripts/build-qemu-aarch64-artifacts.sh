@@ -5,7 +5,7 @@ set -euo pipefail
 
 OUT_DIR=${OUT_DIR:-build-aarch64}
 ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
-RUST_TARGET=${RUST_TARGET:-targets/aarch64-yarm-none.json}
+RUST_TARGET=${RUST_TARGET:-aarch64-yarm-none}
 RUST_TARGET_DIR=${RUST_TARGET_DIR:-aarch64-yarm-none}
 SERVER_BIN=${SERVER_BIN:-init_server}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
@@ -32,6 +32,13 @@ if cargo -V 2>/dev/null | rg -q "nightly"; then
 else
   echo "[warn] cargo is not nightly; skipping -Z build-std"
   echo "[hint] install nightly cargo to build std from source for ${RUST_TARGET}"
+fi
+
+if [[ "$RUST_TARGET" != *.json && -f "targets/${RUST_TARGET}.json" ]]; then
+  RUST_TARGET="targets/${RUST_TARGET}.json"
+  if [[ " ${CARGO_Z_ARGS[*]} " != *" json-target-spec "* ]]; then
+    CARGO_Z_ARGS+=(-Z "json-target-spec")
+  fi
 fi
 
 exit_if_strict_mode() {

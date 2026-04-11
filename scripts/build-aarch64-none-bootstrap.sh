@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-RUST_TARGET=${RUST_TARGET:-targets/aarch64-yarm-none.json}
+RUST_TARGET=${RUST_TARGET:-aarch64-yarm-none}
 PROFILE=${PROFILE:-aarch64-none}
 TOOLCHAIN=${TOOLCHAIN:-nightly}
 RUSTUP_DISABLED=${RUSTUP_DISABLED:-0}
@@ -13,6 +13,11 @@ BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
 CARGO_Z_ARGS=("-Z" "build-std=${BUILD_STD_COMPONENTS}")
 
 if [[ "$RUST_TARGET" == *.json ]]; then
+  CARGO_Z_ARGS+=("-Z" "json-target-spec")
+fi
+
+if [[ "$RUST_TARGET" != *.json && -f "targets/${RUST_TARGET}.json" ]]; then
+  RUST_TARGET="targets/${RUST_TARGET}.json"
   CARGO_Z_ARGS+=("-Z" "json-target-spec")
 fi
 

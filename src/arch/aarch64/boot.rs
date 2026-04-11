@@ -9,13 +9,19 @@ use core::fmt::Write;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 global_asm!(
     r#"
+    .section .bss.bootstack,"aw",@nobits
+    .align 16
+boot_stack_aarch64:
+    .skip 16384
+boot_stack_aarch64_end:
+
     .section .text.boot,"ax",@progbits
     .weak _start
     .type _start,%function
 _start:
     mov x20, x0
-    adrp x0, __boot_stack_top
-    add x0, x0, :lo12:__boot_stack_top
+    adrp x0, boot_stack_aarch64_end
+    add x0, x0, :lo12:boot_stack_aarch64_end
     mov sp, x0
     adrp x1, __bss_start
     add x1, x1, :lo12:__bss_start
@@ -64,8 +70,9 @@ yarm_aarch64_enter_el1_if_needed:
     msr CNTVOFF_EL2, xzr
     mov x1, #(3 << 20)
     msr CPACR_EL1, x1
-    mrs x1, SCTLR_EL1
+    ldr x1, =0x30D00800
     msr SCTLR_EL1, x1
+    isb
     mov x2, sp
     msr SP_EL1, x2
     adr x1, 1f
@@ -115,15 +122,13 @@ const AARCH64_PTE_ATTR_SHIFT: u64 = 2;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const AARCH64_ATTRIDX_NORMAL_WB: u64 = 0;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-const AARCH64_ATTRIDX_DEVICE_NGNRNE: u64 = 3;
+const AARCH64_ATTRIDX_DEVICE_NGNRE: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const AARCH64_BLOCK_2M: u64 = 2 * 1024 * 1024;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-const AARCH64_UART_MMIO_BASE: u64 = 0x0900_0000;
-
+const AARCH64_BLOCK_1G: u64 = 1024 * 1024 * 1024;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-#[repr(C, align(4096))]
-struct AlignedL3([u64; 512]);
+const AARCH64_UART_MMIO_BASE: u64 = 0x0900_0000;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[repr(C, align(4096))]
@@ -137,8 +142,6 @@ struct AlignedL1([u64; 512]);
 static mut BOOT_L1_TABLE: AlignedL1 = AlignedL1([0; 512]);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static mut BOOT_L2_TABLE: AlignedL2 = AlignedL2([0; 512]);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-static mut BOOT_L3_UART_TABLE: AlignedL3 = AlignedL3([0; 512]);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 global_asm!(
@@ -501,21 +504,27 @@ fn setup_bootstrap_mmu() {
     unsafe {
         let l1_addr = core::ptr::addr_of!(BOOT_L1_TABLE) as u64;
         let l2_addr = core::ptr::addr_of!(BOOT_L2_TABLE) as u64;
-        let l3_uart_addr = core::ptr::addr_of!(BOOT_L3_UART_TABLE) as u64;
         let l1_ptr = core::ptr::addr_of_mut!(BOOT_L1_TABLE.0) as *mut u64;
         let l2_ptr = core::ptr::addr_of_mut!(BOOT_L2_TABLE.0) as *mut u64;
-        let l3_uart_ptr = core::ptr::addr_of_mut!(BOOT_L3_UART_TABLE.0) as *mut u64;
 
         for idx in 0..512 {
             core::ptr::write(l1_ptr.add(idx), 0);
             core::ptr::write(l2_ptr.add(idx), 0);
-            core::ptr::write(l3_uart_ptr.add(idx), 0);
         }
 
         core::ptr::write(
             l1_ptr,
             (l2_addr & !0xFFF) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE,
         );
+        core::ptr::write(
+            l1_ptr.add(1),
+            AARCH64_BLOCK_1G
+                | AARCH64_PTE_VALID
+                | AARCH64_PTE_AF
+                | AARCH64_PTE_SH_INNER
+                | (AARCH64_ATTRIDX_NORMAL_WB << AARCH64_PTE_ATTR_SHIFT),
+        );
+
         for idx in 0..512 {
             let base = (idx as u64) * AARCH64_BLOCK_2M;
             core::ptr::write(
@@ -527,33 +536,23 @@ fn setup_bootstrap_mmu() {
             );
         }
 
+        let device_block = |base: u64| -> u64 {
+            base | AARCH64_PTE_VALID
+                | AARCH64_PTE_AF
+                | (AARCH64_ATTRIDX_DEVICE_NGNRE << AARCH64_PTE_ATTR_SHIFT)
+        };
+        let gic_l2_index = (0x0800_0000u64 / AARCH64_BLOCK_2M) as usize;
+        core::ptr::write(l2_ptr.add(gic_l2_index), device_block(0x0800_0000));
         let uart_l2_index = (AARCH64_UART_MMIO_BASE / AARCH64_BLOCK_2M) as usize;
-        core::ptr::write(
-            l2_ptr.add(uart_l2_index),
-            (l3_uart_addr & !0xFFF) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE,
-        );
-        let uart_block_base = AARCH64_UART_MMIO_BASE & !(AARCH64_BLOCK_2M - 1);
-        for idx in 0..512 {
-            let page_base = uart_block_base + ((idx as u64) << 12);
-            core::ptr::write(
-                l3_uart_ptr.add(idx),
-                page_base
-                    | AARCH64_PTE_VALID
-                    | AARCH64_PTE_TABLE
-                    | AARCH64_PTE_AF
-                    | (AARCH64_ATTRIDX_DEVICE_NGNRNE << AARCH64_PTE_ATTR_SHIFT),
-            );
-        }
+        core::ptr::write(l2_ptr.add(uart_l2_index), device_block(AARCH64_UART_MMIO_BASE));
 
-        let mair: u64 = 0x00_04_ff;
-        let tcr: u64 = 16
-            | (16 << 16)
+        let mair: u64 = 0x04_ff;
+        let tcr: u64 = 25u64
             | (1 << 8)
             | (1 << 10)
             | (0b11 << 12)
-            | (1 << 24)
-            | (1 << 26)
-            | (0b11 << 28)
+            | (25u64 << 16)
+            | (1u64 << 23)
             | (0b10 << 30)
             | (0b010 << 32);
 
