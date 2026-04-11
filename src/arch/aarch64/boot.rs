@@ -20,9 +20,6 @@ boot_stack_aarch64_end:
     .type _start,%function
 _start:
     mov x20, x0
-    adrp x0, boot_stack_aarch64_end
-    add x0, x0, :lo12:boot_stack_aarch64_end
-    mov sp, x0
     adrp x1, __bss_start
     add x1, x1, :lo12:__bss_start
     adrp x2, __bss_end
@@ -34,6 +31,9 @@ _start:
     subs x2, x2, #8
     b.gt 1b
 2:
+    adrp x0, boot_stack_aarch64_end
+    add x0, x0, :lo12:boot_stack_aarch64_end
+    mov sp, x0
     bl yarm_aarch64_boot_breadcrumb_b0
     bl yarm_aarch64_boot_marker_start
     bl yarm_aarch64_boot_breadcrumb_b1
