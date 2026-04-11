@@ -563,12 +563,25 @@ fn setup_bootstrap_mmu() {
         core::arch::asm!("isb", options(nostack, preserves_flags));
         crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1G");
 
-        let mut sctlr: u64;
-        core::arch::asm!("mrs {0}, SCTLR_EL1", out(reg) sctlr, options(nostack, preserves_flags));
-        sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
-        core::arch::asm!("msr SCTLR_EL1, {0}", in(reg) sctlr, options(nostack, preserves_flags));
-        core::arch::asm!("isb", options(nostack, preserves_flags));
         crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1H");
+        // Program SCTLR_EL1 explicitly instead of read-modify-write to avoid
+        // depending on prior EL firmware state and to sidestep early bring-up
+        // issues around MRS/System-register handling on some emulated setups.
+        // RES1 bits follow Arm ARM requirements for AArch64 EL1.
+        let sctlr: u64 = (1 << 29)
+            | (1 << 28)
+            | (1 << 23)
+            | (1 << 22)
+            | (1 << 20)
+            | (1 << 11)
+            | (1 << 0) // M: MMU enable
+            | (1 << 2) // C: data/unified cache enable
+            | (1 << 12); // I: instruction cache enable
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1I");
+        core::arch::asm!("msr SCTLR_EL1, {0}", in(reg) sctlr, options(nostack, preserves_flags));
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1J");
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1K");
     }
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M2");
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=mmu_enabled");
