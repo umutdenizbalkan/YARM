@@ -23,9 +23,13 @@ _start:
     adrp x0, boot_stack_aarch64_end
     add x0, x0, :lo12:boot_stack_aarch64_end
     mov sp, x0
+    bl yarm_aarch64_boot_breadcrumb_b0
     bl yarm_aarch64_boot_marker_start
+    bl yarm_aarch64_boot_breadcrumb_b1
     bl yarm_aarch64_enter_el1_if_needed
+    bl yarm_aarch64_boot_breadcrumb_b2
     bl yarm_aarch64_enable_fp_simd
+    bl yarm_aarch64_boot_breadcrumb_b3
     mov x0, x20
     .weak yarm_kernel_main
     bl yarm_kernel_main
@@ -208,6 +212,31 @@ extern "C" fn yarm_aarch64_boot_marker_start() {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_boot_breadcrumb_b0() {
+    crate::arch::aarch64::console::init_early_mmio_base(0x0900_0000);
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB B0");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_boot_breadcrumb_b1() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB B1");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_boot_breadcrumb_b2() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB B2");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_boot_breadcrumb_b3() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB B3");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_enable_fp_simd() {
     unsafe {
         let mut cpacr_el1: u64;
@@ -377,6 +406,7 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     {
         let start_info_ptr = _start_info_ptr;
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB P0");
         crate::arch::aarch64::console::write_line(
             "YARM_AARCH64_BOOT_MARKER stage=prepare_arch_boot",
         );
@@ -391,6 +421,7 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
         crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=vbar_el1_ready");
 
         if let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB P1");
             if let Some(parsed) = crate::arch::aarch64::dtb::parse_boot_dtb(dtb) {
                 crate::yarm_log!(
                     "YARM_AARCH64_DTB memory_start=0x{:x} memory_len=0x{:x} initrd_start=0x{:x} initrd_end=0x{:x} gic_cpu_if_base=0x{:x}",
@@ -419,12 +450,15 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                 }
             }
         }
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB P2");
         setup_bootstrap_mmu();
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB P3");
     }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn setup_bootstrap_mmu() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M0");
     unsafe {
         let l1_addr = core::ptr::addr_of!(BOOT_L1_TABLE) as u64;
         let l2_addr = core::ptr::addr_of!(BOOT_L2_TABLE) as u64;
@@ -488,6 +522,7 @@ fn setup_bootstrap_mmu() {
         core::arch::asm!("msr TCR_EL1, {0}", in(reg) tcr, options(nostack, preserves_flags));
         core::arch::asm!("msr TTBR0_EL1, {0}", in(reg) l1_addr, options(nostack, preserves_flags));
         core::arch::asm!("msr TTBR1_EL1, xzr", options(nostack, preserves_flags));
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1");
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
         core::arch::asm!("isb", options(nostack, preserves_flags));
         core::arch::asm!("tlbi vmalle1", options(nostack, preserves_flags));
@@ -501,6 +536,7 @@ fn setup_bootstrap_mmu() {
         core::arch::asm!("msr SCTLR_EL1, {0}", in(reg) sctlr, options(nostack, preserves_flags));
         core::arch::asm!("isb", options(nostack, preserves_flags));
     }
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M2");
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=mmu_enabled");
 }
 
