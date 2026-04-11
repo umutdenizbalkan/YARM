@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-RUST_TARGET=${RUST_TARGET:-aarch64-unknown-none}
+RUST_TARGET=${RUST_TARGET:-targets/aarch64-yarm-none.json}
 PROFILE=${PROFILE:-aarch64-none}
 TOOLCHAIN=${TOOLCHAIN:-nightly}
 RUSTUP_DISABLED=${RUSTUP_DISABLED:-0}
@@ -25,7 +25,9 @@ else
     echo "[hint] run: rustup toolchain install ${TOOLCHAIN}"
     exit 2
   fi
-  rustup target add "$RUST_TARGET" --toolchain "$TOOLCHAIN" >/dev/null 2>&1 || true
+  if [[ "$RUST_TARGET" != *.json ]]; then
+    rustup target add "$RUST_TARGET" --toolchain "$TOOLCHAIN" >/dev/null 2>&1 || true
+  fi
   CARGO_CMD=(cargo +"${TOOLCHAIN}")
   TOOLCHAIN_LABEL="$TOOLCHAIN"
 fi

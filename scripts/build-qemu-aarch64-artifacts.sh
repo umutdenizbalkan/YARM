@@ -5,14 +5,15 @@ set -euo pipefail
 
 OUT_DIR=${OUT_DIR:-build-aarch64}
 ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
-RUST_TARGET=${RUST_TARGET:-aarch64-unknown-none}
+RUST_TARGET=${RUST_TARGET:-targets/aarch64-yarm-none.json}
+RUST_TARGET_DIR=${RUST_TARGET_DIR:-aarch64-yarm-none}
 SERVER_BIN=${SERVER_BIN:-init_server}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
 KERNEL_PACKAGE=${KERNEL_PACKAGE:-yarm}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-aarch64-none}
-SERVER_ELF=${SERVER_ELF:-target/${RUST_TARGET}/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
-KERNEL_ELF=${KERNEL_ELF:-target/${RUST_TARGET}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
+SERVER_ELF=${SERVER_ELF:-target/${RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
+KERNEL_ELF=${KERNEL_ELF:-target/${RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-aarch64.elf}
 KERNEL_BIN_IMAGE=${KERNEL_BIN_IMAGE:-$OUT_DIR/yarm-aarch64.bin}
@@ -78,7 +79,9 @@ mkdir -p "$(dirname "$INITRAMFS_IMAGE")"
 INITRAMFS_IMAGE_ABS="$(cd "$(dirname "$INITRAMFS_IMAGE")" && pwd)/$(basename "$INITRAMFS_IMAGE")"
 
 if command -v rustup >/dev/null 2>&1; then
-  rustup target add "$RUST_TARGET" >/dev/null 2>&1 || true
+  if [[ "$RUST_TARGET" != *.json ]]; then
+    rustup target add "$RUST_TARGET" >/dev/null 2>&1 || true
+  fi
 fi
 
 echo "[info] building ${KERNEL_PACKAGE}/${KERNEL_BIN} for target ${RUST_TARGET}"

@@ -9,20 +9,25 @@ use core::fmt::Write;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 global_asm!(
     r#"
-    .section .bss.bootstack,"aw",@nobits
-    .align 16
-boot_stack_aarch64:
-    .skip 16384
-boot_stack_aarch64_end:
-
     .section .text.boot,"ax",@progbits
     .weak _start
     .type _start,%function
 _start:
     mov x20, x0
-    adrp x0, boot_stack_aarch64_end
-    add x0, x0, :lo12:boot_stack_aarch64_end
+    adrp x0, __boot_stack_top
+    add x0, x0, :lo12:__boot_stack_top
     mov sp, x0
+    adrp x1, __bss_start
+    add x1, x1, :lo12:__bss_start
+    adrp x2, __bss_end
+    add x2, x2, :lo12:__bss_end
+    sub x2, x2, x1
+    cbz x2, 2f
+1:
+    str xzr, [x1], #8
+    subs x2, x2, #8
+    b.gt 1b
+2:
     bl yarm_aarch64_boot_breadcrumb_b0
     bl yarm_aarch64_boot_marker_start
     bl yarm_aarch64_boot_breadcrumb_b1
@@ -33,9 +38,9 @@ _start:
     mov x0, x20
     .weak yarm_kernel_main
     bl yarm_kernel_main
-1:
+3:
     wfe
-    b 1b
+    b 3b
 
     .global yarm_aarch64_enter_el1_if_needed
     .type yarm_aarch64_enter_el1_if_needed,%function
