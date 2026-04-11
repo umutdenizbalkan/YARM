@@ -12,5 +12,5 @@
   "relocation-model": "static",
   "disable-redzone": true,
   "features": "+strict-align",
-  "target-pointer-width": "64"
+  "target-pointer-width": 64
 }
