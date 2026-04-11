@@ -13,7 +13,7 @@
   "panic-strategy": "abort",
   "relocation-model": "static",
   "code-model": "small",
-  "features": "+v8a,+strict-align,-fp-armv8",
+  "features": "+v8a,+strict-align,+neon",
   "linker-flavor": "gnu-lld",
   "linker": "rust-lld",
   "pre-link-args": {
