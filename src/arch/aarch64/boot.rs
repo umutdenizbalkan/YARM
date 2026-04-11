@@ -301,7 +301,8 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64) {
         esr_el1,
         far_el1
     );
-    if let Ok(msg) = core::str::from_utf8(&line[..writer.len]) {
+    let line_len = writer.len;
+    if let Ok(msg) = core::str::from_utf8(&line[..line_len]) {
         crate::arch::aarch64::console::write_line(msg);
     }
     match kind {

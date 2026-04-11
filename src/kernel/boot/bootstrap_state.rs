@@ -21,7 +21,7 @@ impl Bootstrap {
     fn default_reserved_ranges() -> [(u64, u64); 1] {
         let kernel_start = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE;
         #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-        let kernel_end = unsafe { (&raw const __kernel_end) as *const u8 as u64 };
+        let kernel_end = (&raw const __kernel_end) as *const u8 as u64;
         #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
         let kernel_end =
             platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE + crate::kernel::vm::PAGE_SIZE as u64;
