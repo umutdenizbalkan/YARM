@@ -276,6 +276,34 @@ extern "C" fn yarm_aarch64_enable_fp_simd() {
 extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64) {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_VECTOR_ENTRY");
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=exception");
+    struct FixedBufWriter<'a> {
+        buf: &'a mut [u8],
+        len: usize,
+    }
+    impl Write for FixedBufWriter<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let remaining = self.buf.len().saturating_sub(self.len);
+            let copy_len = remaining.min(bytes.len());
+            self.buf[self.len..self.len + copy_len].copy_from_slice(&bytes[..copy_len]);
+            self.len += copy_len;
+            Ok(())
+        }
+    }
+    let mut line = [0u8; 96];
+    let mut writer = FixedBufWriter {
+        buf: &mut line,
+        len: 0,
+    };
+    let _ = write!(
+        writer,
+        "YARM_AARCH64_EXCEPTION_REGS esr_el1=0x{:016x} far_el1=0x{:016x}",
+        esr_el1,
+        far_el1
+    );
+    if let Ok(msg) = core::str::from_utf8(&line[..writer.len]) {
+        crate::arch::aarch64::console::write_line(msg);
+    }
     match kind {
         1 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_current_sp0"),
         2 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_current_sp0"),
@@ -295,7 +323,6 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64) {
         16 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_lower_a32"),
         _ => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND unknown"),
     }
-    let _ = (esr_el1, far_el1);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
