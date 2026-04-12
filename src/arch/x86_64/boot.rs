@@ -43,15 +43,17 @@ boot_pdpt_low:
 
     .align 4096
 boot_pdpt_direct:
-    // 512 * 1GiB = 512GiB of higher-half direct physical mapping.
-    // This gives page-table code a stable virtual alias for PT pages allocated
-    // anywhere in early-boot RAM (up to the direct-map span).
+    // Higher-half direct physical mapping for KERNEL_BOOTSTRAP_VIRT_BASE.
+    // Keep the top canonical 2GiB window (PDPT[510..511]) wired to boot_pd so
+    // linked kernel high-half symbols remain valid during bootstrap.
     .set direct_map_page_flags, 0x83
     .set direct_map_index, 0
-    .rept 512
+    .rept 510
     .quad (direct_map_index * 0x40000000) | direct_map_page_flags
     .set direct_map_index, direct_map_index + 1
     .endr
+    .quad boot_pd + 0x3
+    .quad boot_pd + 0x3
 
     .align 4096
 boot_pd:
