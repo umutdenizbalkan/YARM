@@ -613,7 +613,7 @@ fn setup_bootstrap_mmu() {
         let uart_l2_index = (AARCH64_UART_MMIO_BASE / AARCH64_BLOCK_2M) as usize;
         core::ptr::write(l2_ptr.add(uart_l2_index), device_block(AARCH64_UART_MMIO_BASE));
 
-        let mair: u64 = 0x04_ff;
+        let mair: u64 = 0x444;
         let tcr: u64 = 25u64
             | (1 << 8)
             | (1 << 10)
