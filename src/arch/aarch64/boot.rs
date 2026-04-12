@@ -14,6 +14,10 @@ global_asm!(
 boot_stack_aarch64:
     .skip 65536
 boot_stack_aarch64_end:
+    .align 16
+exc_stack_aarch64:
+    .skip 8192
+exc_stack_aarch64_end:
 
     .section .text.boot,"ax",@progbits
     .weak _start
@@ -217,12 +221,20 @@ yarm_aarch64_vector_table_el1:
     .global yarm_aarch64_vector_dispatch
     .type yarm_aarch64_vector_dispatch,%function
 yarm_aarch64_vector_dispatch:
+    mov x5, sp
+    adrp x6, exc_stack_aarch64_end
+    add x6, x6, :lo12:exc_stack_aarch64_end
+    and x6, x6, #~0xf
+    mov sp, x6
+    stp x5, x30, [sp, #-16]!
     mrs x1, esr_el1
     mrs x2, far_el1
     mrs x3, elr_el1
     mrs x4, spsr_el1
     msr daifset, #0xf
     bl yarm_aarch64_vector_entry
+    ldp x5, x30, [sp], #16
+    mov sp, x5
 1:
     wfe
     b 1b
@@ -460,7 +472,28 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     crate::arch::aarch64::console::write_line(
         "YARM_AARCH64_BOOT_MARKER stage=run_with_prepared_kernel",
     );
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    let saved_ttbr0: u64 = {
+        let ttbr0: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {0}, ttbr0_el1",
+                out(reg) ttbr0,
+                options(nostack, preserves_flags)
+            );
+        }
+        ttbr0
+    };
     let mut kernel = crate::kernel::boot::Bootstrap::init().expect("kernel init");
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {0}",
+            "isb",
+            in(reg) saved_ttbr0,
+            options(nostack, preserves_flags)
+        );
+    }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     {
         // Do not touch EL1 physical timer registers during early bootstrap.
@@ -618,6 +651,9 @@ fn setup_bootstrap_mmu() {
         core::arch::asm!("mrs {0}, SCTLR_EL1", out(reg) sctlr, options(nostack, preserves_flags));
         sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
         crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1I");
+        core::arch::asm!("ic iallu", options(nostack, preserves_flags));
+        core::arch::asm!("dsb nsh", options(nostack, preserves_flags));
+        core::arch::asm!("isb", options(nostack, preserves_flags));
         core::arch::asm!("msr SCTLR_EL1, {0}", in(reg) sctlr, options(nostack, preserves_flags));
         crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M1J");
         core::arch::asm!("isb", options(nostack, preserves_flags));
