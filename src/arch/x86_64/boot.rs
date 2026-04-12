@@ -44,8 +44,10 @@ boot_pdpt_low:
     .align 4096
 boot_pdpt_direct:
     // Higher-half direct physical mapping for KERNEL_BOOTSTRAP_VIRT_BASE.
-    // Keep the top canonical 2GiB window (PDPT[510..511]) wired to boot_pd so
-    // linked kernel high-half symbols remain valid during bootstrap.
+    // Keep the top canonical 2GiB window wired to bootstrap PDs:
+    // - PDPT[510] -> boot_pd    (low identity/kernel image window)
+    // - PDPT[511] -> boot_pd_hi (3GiB..4GiB high aliases)
+    // so linked high-half symbols remain valid during bootstrap.
     .set direct_map_page_flags, 0x83
     .set direct_map_index, 0
     .rept 510
@@ -53,7 +55,7 @@ boot_pdpt_direct:
     .set direct_map_index, direct_map_index + 1
     .endr
     .quad boot_pd + 0x3
-    .quad boot_pd + 0x3
+    .quad boot_pd_hi + 0x3
 
     .align 4096
 boot_pd:
@@ -176,13 +178,13 @@ pvh_start32:
     mov dword ptr [boot_pdpt_low + 4], 0
     mov dword ptr [boot_pdpt_direct + 4080], eax
     mov dword ptr [boot_pdpt_direct + 4084], 0
-    mov dword ptr [boot_pdpt_direct + 4088], eax
-    mov dword ptr [boot_pdpt_direct + 4092], 0
 
     mov eax, offset boot_pd_hi
     or eax, 0x3
     mov dword ptr [boot_pdpt_low + 24], eax
     mov dword ptr [boot_pdpt_low + 28], 0
+    mov dword ptr [boot_pdpt_direct + 4088], eax
+    mov dword ptr [boot_pdpt_direct + 4092], 0
 
     mov eax, offset boot_pt0
     or eax, 0x3
