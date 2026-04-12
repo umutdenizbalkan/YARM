@@ -27,15 +27,12 @@ boot_stack_end:
     .section .data.boot,"aw",@progbits
     .align 4096
 boot_pml4:
+    // PML4[0]   → boot_pdpt_low   : identity map for first 4GiB.
     .quad boot_pdpt_low + 0x3
-    .zero 2040
-    // Mirror physical memory into the higher-half direct-map window.
+    // PML4[1..510] → null.
+    .zero 4080
+    // PML4[511] → canonical upper-half direct physical map.
     .quad boot_pdpt_direct + 0x3
-    .zero 2024
-    // Map canonical kernel high-half window (PML4[511]) back to low bootstrap
-    // physical memory so linked kernel symbols near 0xFFFF_FFFF_8000_0000 are
-    // valid before final kernel page tables are installed.
-    .quad boot_pdpt_high + 0x3
 
     .align 4096
 boot_pdpt_low:
@@ -55,15 +52,6 @@ boot_pdpt_direct:
     .quad (direct_map_index * 0x40000000) | direct_map_page_flags
     .set direct_map_index, direct_map_index + 1
     .endr
-
-    .align 4096
-boot_pdpt_high:
-    // Populate the top canonical high-half 2GiB window used during early boot:
-    // - PDPT[510]: 0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_BFFF_FFFF
-    // - PDPT[511]: 0xFFFF_FFFF_C000_0000..0xFFFF_FFFF_FFFF_FFFF
-    .zero 4080
-    .quad boot_pd + 0x3
-    .quad boot_pd + 0x3
 
     .align 4096
 boot_pd:
@@ -97,7 +85,8 @@ boot_pd_hi:
     // Bootstrap identity map for the 3GiB..4GiB window (PDPT[3]).
     // This keeps early stack/data accesses valid even when linker placement
     // pushes boot sections near the top of low 32-bit virtual space.
-    .set hi_page_flags_exec, 0x83
+    // Includes PCD (bit 4) so LAPIC/IOAPIC MMIO in this range is uncacheable.
+    .set hi_page_flags_exec, 0x93
     .set hi_page_index, 0
     .rept 512
     .quad (0xC0000000 + (hi_page_index * 0x200000)) | hi_page_flags_exec
@@ -175,11 +164,6 @@ pvh_start32:
     mov dword ptr [boot_pml4 + 4], 0
 
     mov eax, offset boot_pdpt_direct
-    or eax, 0x3
-    mov dword ptr [boot_pml4 + 2048], eax
-    mov dword ptr [boot_pml4 + 2052], 0
-
-    mov eax, offset boot_pdpt_high
     or eax, 0x3
     mov dword ptr [boot_pml4 + 4088], eax
     mov dword ptr [boot_pml4 + 4092], 0
