@@ -174,6 +174,10 @@ pvh_start32:
     or eax, 0x3
     mov dword ptr [boot_pdpt_low + 0], eax
     mov dword ptr [boot_pdpt_low + 4], 0
+    mov dword ptr [boot_pdpt_direct + 4080], eax
+    mov dword ptr [boot_pdpt_direct + 4084], 0
+    mov dword ptr [boot_pdpt_direct + 4088], eax
+    mov dword ptr [boot_pdpt_direct + 4092], 0
 
     mov eax, offset boot_pd_hi
     or eax, 0x3
