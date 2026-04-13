@@ -583,14 +583,16 @@ fn setup_bootstrap_mmu() {
             l1_ptr,
             (l2_addr & !0xFFF) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE,
         );
-        core::ptr::write(
-            l1_ptr.add(1),
-            AARCH64_BLOCK_1G
-                | AARCH64_PTE_VALID
-                | AARCH64_PTE_AF
-                | AARCH64_PTE_SH_INNER
-                | (AARCH64_ATTRIDX_NORMAL_WB << AARCH64_PTE_ATTR_SHIFT),
-        );
+        for idx in 1..512 {
+            let base = (idx as u64) * AARCH64_BLOCK_1G;
+            core::ptr::write(
+                l1_ptr.add(idx),
+                base | AARCH64_PTE_VALID
+                    | AARCH64_PTE_AF
+                    | AARCH64_PTE_SH_INNER
+                    | (AARCH64_ATTRIDX_NORMAL_WB << AARCH64_PTE_ATTR_SHIFT),
+            );
+        }
 
         for idx in 0..512 {
             let base = (idx as u64) * AARCH64_BLOCK_2M;
@@ -666,6 +668,10 @@ fn setup_bootstrap_mmu() {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn dtb_slice_from_start_info(start_info_ptr: usize) -> Option<&'static [u8]> {
     if start_info_ptr == 0 {
+        return None;
+    }
+    let magic_be = unsafe { core::ptr::read_unaligned(start_info_ptr as *const u32) };
+    if u32::from_be(magic_be) != 0xd00dfeed {
         return None;
     }
     let total_size_be = unsafe { core::ptr::read_unaligned((start_info_ptr + 4) as *const u32) };
