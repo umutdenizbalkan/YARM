@@ -634,6 +634,9 @@ yarm_x86_isr_\vector:
     .global yarm_x86_common_trap_entry
     .type yarm_x86_common_trap_entry, @function
 yarm_x86_common_trap_entry:
+    // Force trap handling onto the low canonical alias of the current stack.
+    // This avoids depending on higher-half aliases during very early bootstrap.
+    mov esp, esp
     push rax
     push rbx
     push rcx
@@ -654,6 +657,8 @@ yarm_x86_common_trap_entry:
     mov rsi, qword ptr [rsp + 16 * 8]
     mov rdx, rsp
     lea rcx, [rsp + 17 * 8]
+    mov edx, edx
+    mov ecx, ecx
     call yarm_x86_dispatch_trap_from_stub
 
     pop r15
