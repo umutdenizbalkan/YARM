@@ -1067,11 +1067,15 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         populate_boot_idt_from_stubs();
         debug_uart_putc(b'v');
 
-        let ist_nmi_top = core::ptr::addr_of!(IST_NMI.0) as u64 + IST_NMI_STACK_BYTES as u64;
+        let ist_nmi_top = (core::ptr::addr_of!(IST_NMI.0) as u64 + IST_NMI_STACK_BYTES as u64)
+            & 0x0000_0000_FFFF_FFFF;
         let ist_df_top =
-            core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64 + IST_DOUBLE_FAULT_STACK_BYTES as u64;
+            (core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64 + IST_DOUBLE_FAULT_STACK_BYTES as u64)
+                & 0x0000_0000_FFFF_FFFF;
         let ist_pf_top =
-            core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64 + IST_PAGE_FAULT_STACK_BYTES as u64;
+            (core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64 + IST_PAGE_FAULT_STACK_BYTES as u64)
+                & 0x0000_0000_FFFF_FFFF;
+        let rsp0 = rsp0 & 0x0000_0000_FFFF_FFFF;
         BOOT_TSS.rsp0 = rsp0;
         BOOT_TSS.ist1 = ist_nmi_top;
         BOOT_TSS.ist2 = ist_df_top;
