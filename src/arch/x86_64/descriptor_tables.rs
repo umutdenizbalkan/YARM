@@ -564,11 +564,10 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     regs: *mut X86SavedRegs,
     interrupt_frame: *const X86InterruptStackFrame,
 ) {
-    let fault_rip = unsafe { (*interrupt_frame).rip };
     let cpu_apic = raw_current_apic_id() as u64;
     let previous_depth = TRAP_DISPATCH_DEPTH.fetch_add(1, Ordering::AcqRel);
     if previous_depth != 0 {
-        debug_uart_trap_breadcrumb(b'N', vector, error_code, 0, fault_rip, cpu_apic);
+        debug_uart_trap_breadcrumb(b'N', vector, error_code, 0, 0, cpu_apic);
         halt_forever();
     }
     let mut fault_addr = 0u64;
@@ -585,13 +584,14 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
 
     let Some(kernel) = trap_kernel_state_mut() else {
         if should_halt_without_kernel_state(vector as usize) {
-            debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, fault_rip, cpu_apic);
+            debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, 0, cpu_apic);
             TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
             halt_forever();
         }
         TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
         return;
     };
+    let fault_rip = unsafe { (*interrupt_frame).rip };
     let mut trap_frame = unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
     if let Err(err) = crate::arch::x86_64::trap::handle_trap_entry(
         kernel,
