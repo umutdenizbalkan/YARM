@@ -302,10 +302,10 @@ long_mode_entry:
     dec ecx
     jnz 0b
     lidt [rip + boot_idt_ptr]
-    // Materialize the canonical 64-bit address explicitly in long mode.
-    // Using a 32-bit immediate move here can sign-extend high addresses and
-    // produce a non-mapped stack (e.g. 0xffff_ffff_fe..).
+    // Materialize stack in long mode, then force a low canonical alias so the
+    // bootstrap path does not depend on higher-half stack mappings.
     lea rsp, [rip + boot_stack_end]
+    mov esp, esp
     xor rbp, rbp
     mov ax, 0x10
     mov ds, ax
