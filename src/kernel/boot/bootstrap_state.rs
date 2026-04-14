@@ -3,6 +3,12 @@
 
 use super::*;
 
+#[cfg(not(feature = "hosted-dev"))]
+unsafe extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
+}
+
 static mut BOOTSTRAP_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
     core::mem::MaybeUninit::uninit();
 
@@ -16,10 +22,22 @@ impl Bootstrap {
     }
 
     fn default_reserved_ranges() -> [(u64, u64); 1] {
-        let kernel_start = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE;
-        let kernel_end =
-            platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE + crate::kernel::vm::PAGE_SIZE as u64;
-        [(kernel_start, kernel_end)]
+        #[cfg(not(feature = "hosted-dev"))]
+        {
+            let page = crate::kernel::vm::PAGE_SIZE as u64;
+            let kernel_start = unsafe { core::ptr::addr_of!(__kernel_start) as u64 } & !(page - 1);
+            let kernel_end_raw = unsafe { core::ptr::addr_of!(__kernel_end) as u64 };
+            let kernel_end = (kernel_end_raw + (page - 1)) & !(page - 1);
+            return [(kernel_start, kernel_end)];
+        }
+
+        #[cfg(feature = "hosted-dev")]
+        {
+            let kernel_start = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE;
+            let kernel_end =
+                platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE + crate::kernel::vm::PAGE_SIZE as u64;
+            [(kernel_start, kernel_end)]
+        }
     }
 
     pub fn default_reserved_ranges_for_arch_boot() -> [(u64, u64); 1] {
