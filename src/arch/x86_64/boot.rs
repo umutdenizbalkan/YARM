@@ -21,7 +21,7 @@ global_asm!(
 boot_stack:
     // Early bootstrap stack used until Rust runtime/state setup completes.
     // Keep this inside the bootstrap identity-map footprint.
-    .skip 0x00200000
+    .skip 0x01000000
 boot_stack_end:
 
     .section .data.boot,"aw",@progbits
@@ -708,6 +708,7 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     // Descriptor tables are scaffolded during prepare_arch_boot() before run_kernel_boot().
     // Keep the run path free from additional serial-marker calls so boot remains deterministic.
     let prepared_len = PREPARED_PVH_BOOT_MEMMAP_LEN.load(core::sync::atomic::Ordering::Acquire);
+    crate::arch::x86_64::console::write_line("KI0");
     let kernel_state = if prepared_len > 0 {
         let boot_regions = unsafe { &PREPARED_PVH_BOOT_MEMMAP[..prepared_len] };
         let reserved_ranges = Bootstrap::default_reserved_ranges_for_arch_boot();
@@ -720,6 +721,7 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     } else {
         Bootstrap::init().expect("kernel init")
     };
+    crate::arch::x86_64::console::write_line("KI1");
     crate::yarm_log!("YARM_BOOT_INIT_READY prepared_pvh_regions={}", prepared_len);
     let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(kernel_state);
     let started_secondary = crate::arch::x86_64::smp::start_secondary_cpus(kernel).unwrap_or(0);
