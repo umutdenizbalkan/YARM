@@ -150,9 +150,23 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> ! {
     let handoff = unsafe { &*handoff_ptr };
+    crate::yarm_log!(
+        "YARM_SMP_AP_ENTRY cpu={} magic=0x{:08x} stack_top=0x{:x} ready_ptr=0x{:x}",
+        handoff.cpu_id,
+        handoff.magic,
+        handoff.stack_top,
+        handoff.ready_flag_ptr
+    );
     if handoff.magic == AP_HANDOFF_MAGIC {
         let ready_ptr = handoff.ready_flag_ptr as usize as *const AtomicBool;
         unsafe { (*ready_ptr).store(true, Ordering::Release) };
+        crate::yarm_log!("YARM_SMP_AP_READY_SET cpu={}", handoff.cpu_id);
+    } else {
+        crate::yarm_log!(
+            "YARM_SMP_AP_BAD_HANDOFF cpu={} expected_magic=0x{:08x}",
+            handoff.cpu_id,
+            AP_HANDOFF_MAGIC
+        );
     }
     loop {
         core::hint::spin_loop();
@@ -265,6 +279,14 @@ fn lapic_mmio_base() -> usize {
 
 fn write_icr(apic_id: u8, value: u32) {
     let base = lapic_mmio_base();
+    #[cfg(not(test))]
+    crate::yarm_log!(
+        "YARM_SMP_ICR_WRITE apic_id={} high=0x{:08x} low=0x{:08x} base=0x{:x}",
+        apic_id,
+        (apic_id as u32) << 24,
+        value,
+        base
+    );
     unsafe {
         write_volatile(
             (base + LAPIC_ICR_HIGH_OFFSET) as *mut u32,
@@ -275,6 +297,13 @@ fn write_icr(apic_id: u8, value: u32) {
 }
 
 fn send_init_sipi_sipi(apic_id: u8) {
+    #[cfg(not(test))]
+    crate::yarm_log!(
+        "YARM_SMP_IPI_SEQUENCE_BEGIN apic_id={} trampoline_phys=0x{:x} vector=0x{:02x}",
+        apic_id,
+        AP_TRAMPOLINE_PHYS,
+        AP_TRAMPOLINE_VECTOR
+    );
     write_icr(apic_id, ICR_DELIVERY_MODE_INIT | ICR_LEVEL_ASSERT);
     spin_delay(20_000);
     write_icr(
@@ -282,6 +311,12 @@ fn send_init_sipi_sipi(apic_id: u8) {
         ICR_DELIVERY_MODE_STARTUP | AP_TRAMPOLINE_VECTOR as u32,
     );
     spin_delay(200);
+    #[cfg(not(test))]
+    crate::yarm_log!(
+        "YARM_SMP_IPI_SEQUENCE_DONE apic_id={} vector=0x{:02x}",
+        apic_id,
+        AP_TRAMPOLINE_VECTOR
+    );
     write_icr(
         apic_id,
         ICR_DELIVERY_MODE_STARTUP | AP_TRAMPOLINE_VECTOR as u32,
@@ -323,6 +358,15 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
         kernel_state_ptr: kernel as *const _ as usize as u64,
         ready_flag_ptr: (&AP_READY_FLAGS[cpu.0 as usize] as *const AtomicBool as usize) as u64,
     };
+    #[cfg(not(test))]
+    crate::yarm_log!(
+        "YARM_SMP_AP_PREPARE cpu={} stack_top=0x{:x} kernel_state=0x{:x} ready_ptr=0x{:x} trampoline=0x{:x}",
+        cpu.0,
+        handoff.stack_top,
+        handoff.kernel_state_ptr,
+        handoff.ready_flag_ptr,
+        AP_TRAMPOLINE_PHYS
+    );
     encode_handoff(&mut page, handoff);
     write_trampoline_page(&page);
 }
@@ -341,18 +385,36 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         }
 
         prepare_trampoline_for_cpu(kernel, cpu);
+        #[cfg(not(test))]
+        crate::yarm_log!(
+            "YARM_SMP_AP_WAIT_BEGIN cpu={} poll_iters={}",
+            cpu.0,
+            AP_READY_POLL_ITERS
+        );
         send_init_sipi_sipi(cpu.0);
 
         let mut ready = false;
+        #[cfg(not(test))]
+        let mut ready_iter = 0usize;
         for _ in 0..AP_READY_POLL_ITERS {
             if AP_READY_FLAGS[cpu.0 as usize].load(Ordering::Acquire) {
                 ready = true;
                 break;
             }
+            #[cfg(not(test))]
+            {
+                ready_iter += 1;
+            }
             core::hint::spin_loop();
         }
 
         if ready {
+            #[cfg(not(test))]
+            crate::yarm_log!(
+                "YARM_SMP_AP_READY_OBSERVED cpu={} poll_iter={}",
+                cpu.0,
+                ready_iter
+            );
             match kernel.bring_up_cpu(cpu) {
                 Ok(()) => started += 1,
                 Err(KernelError::WrongObject) => {}
