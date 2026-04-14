@@ -569,8 +569,15 @@ fn log_pvh_boot_metadata(start_info_ptr: usize) {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
     let (regions, used) = collect_pvh_usable_regions(start_info_ptr);
-    if used > 0 {
-        let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(&regions[..used]);
+    if used == 0 {
+        return;
+    }
+
+    let reserved = crate::kernel::boot::Bootstrap::default_reserved_ranges_for_arch_boot();
+    let (sanitized, sanitized_len) =
+        crate::kernel::boot::Bootstrap::apply_reserved_ranges(&regions[..used], &reserved);
+    if sanitized_len > 0 {
+        let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(&sanitized[..sanitized_len]);
     }
 }
 
