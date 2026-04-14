@@ -3,11 +3,6 @@
 
 use super::*;
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-unsafe extern "C" {
-    static __kernel_end: u8;
-}
-
 static mut BOOTSTRAP_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
     core::mem::MaybeUninit::uninit();
 
@@ -21,13 +16,7 @@ impl Bootstrap {
     }
 
     fn default_reserved_ranges() -> [(u64, u64); 1] {
-        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
         let kernel_start = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE;
-        #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
-        let kernel_start = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE;
-        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-        let kernel_end = unsafe { (&__kernel_end as *const u8) as u64 };
-        #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
         let kernel_end =
             platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE + crate::kernel::vm::PAGE_SIZE as u64;
         [(kernel_start, kernel_end)]
@@ -173,9 +162,6 @@ impl Bootstrap {
         boot_regions: &[MemoryRegion],
         reserved_ranges: &[(u64, u64)],
     ) -> Result<&'static mut KernelState, KernelError> {
-        #[cfg(target_arch = "aarch64")]
-        crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOTSTRAP stage=init_static_enter");
-
         let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
         let (sanitized, sanitized_len) = Self::apply_reserved_ranges(boot_regions, reserved_ranges);
         let sanitized = &sanitized[..sanitized_len];
