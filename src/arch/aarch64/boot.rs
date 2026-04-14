@@ -12,11 +12,11 @@ global_asm!(
     .section .bss.bootstack,"aw",@nobits
     .align 16
 boot_stack_aarch64:
-    .skip 65536
+    .skip 0x01000000
 boot_stack_aarch64_end:
     .align 16
 exc_stack_aarch64:
-    .skip 8192
+    .skip 65536
 exc_stack_aarch64_end:
 
     .section .text.boot,"ax",@progbits
@@ -484,7 +484,11 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         }
         ttbr0
     };
-    let mut kernel = crate::kernel::boot::Bootstrap::init().expect("kernel init");
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_begin");
+    let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_done");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     unsafe {
         core::arch::asm!(
@@ -508,7 +512,7 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.present_cpu_bitmap(),
         kernel.online_cpu_count()
     );
-    run(&mut kernel);
+    run(kernel);
 }
 
 pub fn prepare_arch_boot(_start_info_ptr: usize) {
@@ -615,7 +619,8 @@ fn setup_bootstrap_mmu() {
         let uart_l2_index = (AARCH64_UART_MMIO_BASE / AARCH64_BLOCK_2M) as usize;
         core::ptr::write(l2_ptr.add(uart_l2_index), device_block(AARCH64_UART_MMIO_BASE));
 
-        let mair: u64 = 0x444;
+                // AttrIdx0 = normal WB/WA cacheable (0xff), AttrIdx1 = device-nGnRE (0x04).
+        let mair: u64 = 0x04ff;
         let tcr: u64 = 25u64
             | (1 << 8)
             | (1 << 10)
