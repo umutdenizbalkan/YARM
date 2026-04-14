@@ -577,7 +577,8 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
     let (sanitized, sanitized_len) =
         crate::kernel::boot::Bootstrap::apply_reserved_ranges(&regions[..used], &reserved);
     if sanitized_len > 0 {
-        let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(&sanitized[..sanitized_len]);
+        let _ =
+            crate::kernel::frame_allocator::init_pt_frame_allocator(&sanitized[..sanitized_len]);
     }
 }
 
@@ -728,10 +729,13 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     } else {
         Bootstrap::init_static().expect("kernel init")
     };
-    let kernel_state = unsafe { core::ptr::read(kernel_state as *mut crate::kernel::boot::KernelState) };
+    let kernel_state =
+        unsafe { core::ptr::read(kernel_state as *mut crate::kernel::boot::KernelState) };
     crate::arch::x86_64::console::write_line("KI1");
     crate::yarm_log!("YARM_BOOT_INIT_READY prepared_pvh_regions={}", prepared_len);
     let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(kernel_state);
+    crate::arch::irq_guard::configure_external_irq_controller_from_platform_layout();
+    crate::yarm_log!("YARM_SMP_LAPIC_READY source=platform_layout");
     let started_secondary = crate::arch::x86_64::smp::start_secondary_cpus(kernel).unwrap_or(0);
     crate::yarm_log!(
         "YARM_SMP_STARTUP started_secondary={} online_cpus={} present_cpus={}",
