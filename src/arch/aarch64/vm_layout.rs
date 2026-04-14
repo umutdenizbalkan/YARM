@@ -6,7 +6,10 @@
 // architecture-specific VM mappings are implemented.
 
 pub const PAGE_SIZE: usize = 4096;
-pub const KERNEL_SPACE_BASE: u64 = 0x8000_0000;
+// Keep the prototype kernel image (linked at 0x4008_0000) in the kernel half
+// of the software VM split. A higher split caused bootstrap kernel mappings
+// at 0x4008_xxxx to be rejected as user-space addresses during init.
+pub const KERNEL_SPACE_BASE: u64 = 0x4000_0000;
 pub const USER_BRK_DEFAULT_BASE: usize = 0x4000_0000;
 pub const ASID_BITS: u8 = 16;
 
