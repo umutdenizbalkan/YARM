@@ -231,6 +231,14 @@ struct X86InterruptStackFrame {
     ss: u64,
 }
 
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[repr(C)]
+struct X86InterruptStackFrameHeader {
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -465,10 +473,11 @@ unsafe fn build_trap_frame_from_saved_regs(
     vector: u64,
 ) -> crate::kernel::trapframe::TrapFrame {
     let regs = unsafe { &*regs };
-    let frame = unsafe { &*frame };
+    let frame_header = unsafe { &*(frame as *const X86InterruptStackFrameHeader) };
     let mut trap = crate::kernel::trapframe::TrapFrame::zeroed();
-    trap.set_saved_pc(frame.rip as usize);
-    if (frame.cs & 0x3) == 0x3 {
+    trap.set_saved_pc(frame_header.rip as usize);
+    if (frame_header.cs & 0x3) == 0x3 {
+        let frame = unsafe { &*frame };
         trap.set_saved_sp(frame.rsp as usize);
     }
     if vector as usize == VEC_SYSCALL {
@@ -587,7 +596,9 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
 
     let Some(kernel) = trap_kernel_state_mut() else {
         if should_halt_without_kernel_state(vector as usize) {
-            let fault_rip = unsafe { (*interrupt_frame_low).rip };
+            let fault_rip = unsafe {
+                (*(interrupt_frame_low as *const X86InterruptStackFrameHeader)).rip
+            };
             debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, fault_rip, cpu_apic);
             TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
             halt_forever();
@@ -595,7 +606,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
         return;
     };
-    let fault_rip = unsafe { (*interrupt_frame_low).rip };
+    let fault_rip = unsafe { (*(interrupt_frame_low as *const X86InterruptStackFrameHeader)).rip };
     let mut trap_frame =
         unsafe { build_trap_frame_from_saved_regs(regs_low, interrupt_frame_low, vector) };
     if let Err(err) = crate::arch::x86_64::trap::handle_trap_entry(
@@ -664,7 +675,9 @@ yarm_x86_common_trap_entry:
     lea rcx, [rsp + 17 * 8]
     mov edx, edx
     mov ecx, ecx
+    sub rsp, 8
     call yarm_x86_dispatch_trap_from_stub
+    add rsp, 8
 
     pop r15
     pop r14
@@ -733,7 +746,9 @@ yarm_x86_lstar_entry:
     xor rsi, rsi
     mov rdx, rsp
     lea rcx, [rsp + 120]
+    sub rsp, 8
     call yarm_x86_dispatch_trap_from_stub
+    add rsp, 8
 
     pop r15
     pop r14
