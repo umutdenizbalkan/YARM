@@ -25,8 +25,8 @@ impl Bootstrap {
         #[cfg(not(feature = "hosted-dev"))]
         {
             let page = crate::kernel::vm::PAGE_SIZE as u64;
-            let kernel_start = unsafe { core::ptr::addr_of!(__kernel_start) as u64 } & !(page - 1);
-            let kernel_end_raw = unsafe { core::ptr::addr_of!(__kernel_end) as u64 };
+            let kernel_start = (core::ptr::addr_of!(__kernel_start) as u64) & !(page - 1);
+            let kernel_end_raw = core::ptr::addr_of!(__kernel_end) as u64;
             let kernel_end = (kernel_end_raw + (page - 1)) & !(page - 1);
             return [(kernel_start, kernel_end)];
         }
@@ -34,8 +34,8 @@ impl Bootstrap {
         #[cfg(feature = "hosted-dev")]
         {
             let kernel_start = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE;
-            let kernel_end =
-                platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE + crate::kernel::vm::PAGE_SIZE as u64;
+            let kernel_end = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE
+                + crate::kernel::vm::PAGE_SIZE as u64;
             [(kernel_start, kernel_end)]
         }
     }
@@ -315,5 +315,4 @@ impl Bootstrap {
             Ok(state)
         }
     }
-
 }
