@@ -6,6 +6,7 @@ use crate::kernel::scheduler::CpuId;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 use core::arch::global_asm;
 use core::ptr::copy_nonoverlapping;
+use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,7 +15,10 @@ const LAPIC_ICR_HIGH_OFFSET: usize = 0x310;
 
 const ICR_DELIVERY_MODE_INIT: u32 = 0b101 << 8;
 const ICR_DELIVERY_MODE_STARTUP: u32 = 0b110 << 8;
+const ICR_DELIVERY_STATUS_PENDING: u32 = 1 << 12;
+const ICR_LEVEL_DEASSERT: u32 = 0;
 const ICR_LEVEL_ASSERT: u32 = 1 << 14;
+const ICR_TRIGGER_MODE_LEVEL: u32 = 1 << 15;
 
 const AP_TRAMPOLINE_PHYS: usize = 0x7000;
 const AP_TRAMPOLINE_VECTOR: u8 = (AP_TRAMPOLINE_PHYS >> 12) as u8;
@@ -25,6 +29,7 @@ const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 const AP_STACK_BYTES: usize = 16 * 1024;
 const AP_STACK_TOP_BASE: u64 = 0x0000_0000_2000_0000;
 const AP_READY_POLL_ITERS: usize = 2_000_000;
+const ICR_IDLE_POLL_ITERS: usize = 100_000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -296,6 +301,28 @@ fn write_icr(apic_id: u8, value: u32) {
     }
 }
 
+fn wait_for_icr_idle(apic_id: u8, phase: &str) {
+    let base = lapic_mmio_base();
+    let mut idle = false;
+    for _ in 0..ICR_IDLE_POLL_ITERS {
+        let low = unsafe { read_volatile((base + LAPIC_ICR_LOW_OFFSET) as *const u32) };
+        if (low & ICR_DELIVERY_STATUS_PENDING) == 0 {
+            idle = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if !idle {
+        crate::yarm_log!(
+            "YARM_SMP_ICR_STUCK apic_id={} phase={} low=0x{:08x} base=0x{:x}",
+            apic_id,
+            phase,
+            unsafe { read_volatile((base + LAPIC_ICR_LOW_OFFSET) as *const u32) },
+            base
+        );
+    }
+}
+
 fn send_init_sipi_sipi(apic_id: u8) {
     #[cfg(not(test))]
     crate::yarm_log!(
@@ -304,12 +331,22 @@ fn send_init_sipi_sipi(apic_id: u8) {
         AP_TRAMPOLINE_PHYS,
         AP_TRAMPOLINE_VECTOR
     );
-    write_icr(apic_id, ICR_DELIVERY_MODE_INIT | ICR_LEVEL_ASSERT);
+    write_icr(
+        apic_id,
+        ICR_DELIVERY_MODE_INIT | ICR_TRIGGER_MODE_LEVEL | ICR_LEVEL_ASSERT,
+    );
+    wait_for_icr_idle(apic_id, "init_assert");
+    write_icr(
+        apic_id,
+        ICR_DELIVERY_MODE_INIT | ICR_TRIGGER_MODE_LEVEL | ICR_LEVEL_DEASSERT,
+    );
+    wait_for_icr_idle(apic_id, "init_deassert");
     spin_delay(20_000);
     write_icr(
         apic_id,
         ICR_DELIVERY_MODE_STARTUP | AP_TRAMPOLINE_VECTOR as u32,
     );
+    wait_for_icr_idle(apic_id, "sipi1");
     spin_delay(200);
     #[cfg(not(test))]
     crate::yarm_log!(
@@ -321,6 +358,7 @@ fn send_init_sipi_sipi(apic_id: u8) {
         apic_id,
         ICR_DELIVERY_MODE_STARTUP | AP_TRAMPOLINE_VECTOR as u32,
     );
+    wait_for_icr_idle(apic_id, "sipi2");
     spin_delay(200);
 
     #[cfg(test)]
