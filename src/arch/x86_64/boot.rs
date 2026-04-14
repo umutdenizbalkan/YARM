@@ -719,8 +719,9 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         )
         .expect("kernel init with pvh memmap")
     } else {
-        Bootstrap::init().expect("kernel init")
+        Bootstrap::init_static().expect("kernel init")
     };
+    let kernel_state = unsafe { core::ptr::read(kernel_state as *mut crate::kernel::boot::KernelState) };
     crate::arch::x86_64::console::write_line("KI1");
     crate::yarm_log!("YARM_BOOT_INIT_READY prepared_pvh_regions={}", prepared_len);
     let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(kernel_state);
