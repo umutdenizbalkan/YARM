@@ -11,7 +11,9 @@ use crate::kernel::vm::VirtAddr;
 
 const ESR_EC_SVC64: u32 = 0x15;
 const ESR_EC_IABT_LOW: u32 = 0x20;
+const ESR_EC_IABT_CUR: u32 = 0x21;
 const ESR_EC_DABT_LOW: u32 = 0x24;
+const ESR_EC_DABT_CUR: u32 = 0x25;
 const ESR_EC_MASK: u32 = 0x3F;
 const ARCH_TIMER_PPI_IRQ: u16 = 30;
 
@@ -102,11 +104,11 @@ pub fn decode_trap_context(context: Aarch64TrapContext) -> TrapEvent {
 
     match (context.esr_el1 >> 26) & ESR_EC_MASK {
         ESR_EC_SVC64 => TrapEvent::Syscall,
-        ESR_EC_IABT_LOW => TrapEvent::PageFault(FaultInfo {
+        ESR_EC_IABT_LOW | ESR_EC_IABT_CUR => TrapEvent::PageFault(FaultInfo {
             addr: VirtAddr(context.far_el1),
             access: FaultAccess::Execute,
         }),
-        ESR_EC_DABT_LOW => {
+        ESR_EC_DABT_LOW | ESR_EC_DABT_CUR => {
             let is_write = ((context.esr_el1 >> 6) & 1) != 0;
             TrapEvent::PageFault(FaultInfo {
                 addr: VirtAddr(context.far_el1),
@@ -249,6 +251,23 @@ mod tests {
             Some(FaultInfo {
                 addr: VirtAddr(0xABCD_4000),
                 access: FaultAccess::Write,
+            })
+        );
+    }
+
+    #[test]
+    fn decode_data_abort_current_el_is_page_fault() {
+        let ev = decode_trap_context(Aarch64TrapContext {
+            esr_el1: ESR_EC_DABT_CUR << 26,
+            far_el1: 0x6000,
+            irq_line: None,
+            is_timer_irq: false,
+        });
+        assert_eq!(
+            ev,
+            TrapEvent::PageFault(FaultInfo {
+                addr: VirtAddr(0x6000),
+                access: FaultAccess::Read,
             })
         );
     }
