@@ -363,6 +363,25 @@ extern "C" fn yarm_aarch64_enable_fp_simd() {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static TRAP_KERNEL_STATE_PTR: core::sync::atomic::AtomicPtr<crate::kernel::boot::KernelState> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn install_trap_kernel_state(kernel: &'static mut crate::kernel::boot::KernelState) {
+    TRAP_KERNEL_STATE_PTR.store(kernel as *mut _, core::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelState> {
+    let ptr = TRAP_KERNEL_STATE_PTR.load(core::sync::atomic::Ordering::SeqCst);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *ptr })
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[repr(C, align(16))]
 struct Aarch64VectorFrame {
     gprs: [u64; 31],
@@ -372,6 +391,18 @@ struct Aarch64VectorFrame {
     esr_el1: u64,
     far_el1: u64,
     neon: [[u8; 16]; 32],
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn write_trapframe_back_to_vector_frame(
+    frame: &mut Aarch64VectorFrame,
+    trap_frame: &crate::kernel::trapframe::TrapFrame,
+) {
+    for idx in 0..31 {
+        frame.gprs[idx] = trap_frame.user_gpr(idx) as u64;
+    }
+    frame.sp_el0 = trap_frame.saved_sp() as u64;
+    frame.elr_el1 = trap_frame.saved_pc() as u64;
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -413,6 +444,35 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     let line_len = writer.len;
     if let Ok(msg) = core::str::from_utf8(&line[..line_len]) {
         crate::arch::aarch64::console::write_line(msg);
+    }
+    let is_irq_kind = matches!(kind, 2 | 6 | 10 | 14);
+    if let Some(kernel) = trap_kernel_state_mut() {
+        let mut trap_frame = crate::kernel::trapframe::TrapFrame::zeroed();
+        trap_frame.set_saved_pc(frame.elr_el1 as usize);
+        trap_frame.set_saved_sp(frame.sp_el0 as usize);
+        for idx in 0..31 {
+            trap_frame.set_user_gpr(idx, frame.gprs[idx] as usize);
+        }
+        let context = crate::arch::aarch64::trap::Aarch64TrapContext {
+            esr_el1: frame.esr_el1 as u32,
+            far_el1: frame.far_el1,
+            irq_line: None,
+            is_timer_irq: is_irq_kind,
+        };
+        if crate::arch::aarch64::trap::handle_trap_entry(
+            kernel,
+            crate::kernel::scheduler::CpuId(0),
+            context,
+            Some(&mut trap_frame),
+        )
+        .is_ok()
+        {
+            write_trapframe_back_to_vector_frame(frame, &trap_frame);
+        } else {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE failed");
+        }
+    } else {
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE no_kernel_state");
     }
     match kind {
         1 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_current_sp0"),
@@ -579,6 +639,8 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_begin");
     let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    install_trap_kernel_state(kernel);
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_done");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
