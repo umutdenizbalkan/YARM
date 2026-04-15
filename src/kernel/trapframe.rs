@@ -21,8 +21,9 @@ pub struct TrapFrame {
     pub saved_pc: usize,
     pub saved_sp: usize,
     /// Architecture-populated general-purpose user register snapshot.
-    /// On architectures/paths without full-save support yet, lanes remain zero.
-    pub user_gprs: [usize; 16],
+    /// 32 lanes covers x86_64 (RAX..R15), AArch64 (X0..X30 plus SP lane),
+    /// and RISC-V integer register snapshots.
+    pub user_gprs: [usize; 32],
 }
 
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
@@ -52,7 +53,7 @@ impl TrapFrame {
             error: 0,
             saved_pc: 0,
             saved_sp: 0,
-            user_gprs: [0; 16],
+            user_gprs: [0; 32],
         }
     }
 
@@ -222,5 +223,12 @@ mod tests {
         assert_eq!(frame.ret1(), 0);
         assert!(frame.is_error());
         assert_eq!(frame.error_code(), Some(9));
+    }
+
+    #[test]
+    fn user_gpr_snapshot_supports_32_register_lanes() {
+        let mut frame = TrapFrame::zeroed();
+        frame.set_user_gpr(31, 0xfeed_beef);
+        assert_eq!(frame.user_gpr(31), 0xfeed_beef);
     }
 }
