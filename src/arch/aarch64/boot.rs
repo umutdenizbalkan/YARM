@@ -126,7 +126,7 @@ const AARCH64_PTE_ATTR_SHIFT: u64 = 2;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const AARCH64_ATTRIDX_NORMAL_WB: u64 = 0;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-const AARCH64_ATTRIDX_DEVICE_NGNRE: u64 = 1;
+const AARCH64_ATTRIDX_DEVICE_NGNRE: u64 = 3;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const AARCH64_BLOCK_2M: u64 = 2 * 1024 * 1024;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -618,8 +618,11 @@ fn setup_bootstrap_mmu() {
         let uart_l2_index = (AARCH64_UART_MMIO_BASE / AARCH64_BLOCK_2M) as usize;
         core::ptr::write(l2_ptr.add(uart_l2_index), device_block(AARCH64_UART_MMIO_BASE));
 
-                // AttrIdx0 = normal WB/WA cacheable (0xff), AttrIdx1 = device-nGnRE (0x04).
-        let mair: u64 = 0x04ff;
+        // AttrIdx0 = normal WB/WA cacheable (0xff).
+        // AttrIdx1 = normal WT cacheable (0xbb).
+        // AttrIdx2 = normal non-cacheable (0x44).
+        // AttrIdx3 = device nGnRE (0x04).
+        let mair: u64 = 0xff | (0xbb << 8) | (0x44 << 16) | (0x04 << 24);
         let tcr: u64 = 25u64
             | (1 << 8)
             | (1 << 10)
