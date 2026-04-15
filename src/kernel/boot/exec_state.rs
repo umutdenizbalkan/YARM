@@ -11,8 +11,6 @@ const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
-const PF_W: u32 = 2;
-const PF_R: u32 = 4;
 
 fn read_u16_le(image: &[u8], offset: usize) -> Result<u16, KernelError> {
     let end = offset.checked_add(2).ok_or(KernelError::WrongObject)?;
@@ -96,8 +94,11 @@ impl KernelState {
             let page_start = seg_start & !(page_size - 1);
             let page_end = (seg_end + page_size - 1) & !(page_size - 1);
             let flags = PageFlags {
-                read: (p_flags & PF_R) != 0,
-                write: (p_flags & PF_W) != 0,
+                // Loader maps writable/readable so copy_to_user can materialize
+                // PT_LOAD bytes; tightening to final RX/RW permissions can be
+                // layered later once per-segment reprotect is wired.
+                read: true,
+                write: true,
                 execute: (p_flags & PF_X) != 0,
                 user: true,
                 cache_policy: CachePolicy::WriteBack,
