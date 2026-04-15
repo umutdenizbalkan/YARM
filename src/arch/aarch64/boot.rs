@@ -367,7 +367,7 @@ static TRAP_KERNEL_STATE_PTR: core::sync::atomic::AtomicPtr<crate::kernel::boot:
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-fn install_trap_kernel_state(kernel: &'static mut crate::kernel::boot::KernelState) {
+fn install_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState) {
     TRAP_KERNEL_STATE_PTR.store(kernel as *mut _, core::sync::atomic::Ordering::SeqCst);
 }
 
@@ -410,7 +410,7 @@ fn write_trapframe_back_to_vector_frame(
 extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFrame) {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_VECTOR_ENTRY");
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=exception");
-    let Some(frame) = (unsafe { frame.as_ref() }) else {
+    let Some(frame) = (unsafe { frame.as_mut() }) else {
         crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_FRAME missing");
         return;
     };
