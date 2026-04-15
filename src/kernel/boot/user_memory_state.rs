@@ -103,24 +103,20 @@ impl KernelState {
         self.copy_from_user(asid, VirtAddr(ptr as u64), len)
     }
 
+    #[cfg(any(
+        feature = "hosted-dev",
+        not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))
+    ))]
     fn validate_user_access_for_asid(
         &self,
         asid: Asid,
         va: usize,
         need_write: bool,
     ) -> Result<u64, KernelError> {
-        #[cfg(all(
-            not(feature = "hosted-dev"),
-            any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "riscv64"
-            )
-        ))]
-        {
-            return self.validate_user_access_via_page_table(asid, va, need_write);
-        }
-
         let aspace = self
             .user_spaces
             .get(asid)
@@ -148,7 +144,7 @@ impl KernelState {
             target_arch = "riscv64"
         )
     ))]
-    fn validate_user_access_via_page_table(
+    fn validate_user_access_for_asid(
         &self,
         asid: Asid,
         va: usize,
