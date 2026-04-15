@@ -542,23 +542,6 @@ fn initramfs_static_hello_world_elf() -> [u8; 256] {
 pub fn bootstrap_first_user_task(
     kernel: &mut crate::kernel::boot::KernelState,
 ) -> Result<(), crate::kernel::boot::KernelError> {
-    use crate::services::control_plane::init::service::{
-        InitRuntimeBootConfig, run_minimum_profile_with_kernel,
-    };
-
-    crate::yarm_log!("YARM_INIT_START arch=aarch64 mode=initramfs_min_profile");
-    if let Ok(summary) = run_minimum_profile_with_kernel(kernel, InitRuntimeBootConfig::baseline())
-    {
-        crate::yarm_log!(
-            "YARM_INIT_DONE arch=aarch64 phase={:?} seeded={} initramfs_handled={} devfs_handled={}",
-            summary.init_phase,
-            summary.seeded_registrations,
-            summary.initramfs_handled,
-            summary.devfs_handled
-        );
-        return Ok(());
-    }
-
     use crate::kernel::boot::UserImageSpec;
     use crate::kernel::task::TaskClass;
 
@@ -576,7 +559,7 @@ pub fn bootstrap_first_user_task(
         class: TaskClass::SystemServer,
     })?;
     crate::yarm_log!(
-        "YARM_INIT_DONE arch=aarch64 phase=fallback_initramfs_static_elf image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
+        "YARM_INIT_DONE arch=aarch64 phase=kernel_static_init_elf image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
         INITRAMFS_HELLO_WORLD_IMAGE_ID
     );
     Ok(())
