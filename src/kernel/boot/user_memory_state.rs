@@ -46,8 +46,29 @@ impl KernelState {
         if phys >= crate::arch::platform_layout::KERNEL_PHYS_DIRECT_MAP_BYTES {
             return None;
         }
-        let virt = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(phys)?;
-        Some(virt as usize as *mut u8)
+        #[cfg(target_arch = "x86_64")]
+        {
+            let virt =
+                crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(phys)?;
+            Some(virt as usize as *mut u8)
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        {
+            // Early non-hosted AArch64/RISC-V bootstrap uses identity-mapped
+            // lower memory in TTBR0/SATP, so physical addresses are directly
+            // accessible as kernel virtual addresses in this phase.
+            Some(phys as usize as *mut u8)
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )))]
+        {
+            let virt =
+                crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(phys)?;
+            Some(virt as usize as *mut u8)
+        }
     }
 
     pub fn copy_to_user(
