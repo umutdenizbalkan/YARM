@@ -345,7 +345,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64, e
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const RING3_INIT_SERVER_TID: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_0000;
+const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_1000;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const RING3_INIT_SERVER_CODE_PAGE: u64 = 0x0040_0000;
 
@@ -393,6 +393,13 @@ pub fn bootstrap_first_user_task(
         VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
         PageFlags::USER_RW,
     )?;
+    let (_entry_mem_id, entry_mem_cap) = kernel.alloc_anonymous_memory_object()?;
+    kernel.map_user_page_with_caps(
+        aspace_cap,
+        entry_mem_cap,
+        VirtAddr(RING3_INIT_SERVER_ENTRY),
+        PageFlags::USER_RW,
+    )?;
 
     // movz x8,#0 ; svc #0 ; b .
     let code: [u8; 12] = [
@@ -406,6 +413,11 @@ pub fn bootstrap_first_user_task(
     let _ = kernel.protect_user_page(
         aspace_cap,
         VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
+        PageFlags::USER_RX,
+    )?;
+    let _ = kernel.protect_user_page(
+        aspace_cap,
+        VirtAddr(RING3_INIT_SERVER_ENTRY),
         PageFlags::USER_RX,
     )?;
     crate::yarm_log!(
