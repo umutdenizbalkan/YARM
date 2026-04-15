@@ -706,6 +706,10 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
     {
         let start_info_ptr = _start_info_ptr;
         crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB P0");
+        crate::yarm_log!(
+            "YARM_AARCH64_START_INFO_PTR value=0x{:x}",
+            start_info_ptr as u64
+        );
         crate::arch::aarch64::console::write_line(
             "YARM_AARCH64_BOOT_MARKER stage=prepare_arch_boot",
         );
@@ -865,15 +869,26 @@ fn setup_bootstrap_mmu() {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn dtb_slice_from_start_info(start_info_ptr: usize) -> Option<&'static [u8]> {
     if start_info_ptr == 0 {
+        crate::yarm_log!("YARM_AARCH64_DTB_STATUS missing_start_info_ptr");
         return None;
     }
     let magic_be = unsafe { core::ptr::read_unaligned(start_info_ptr as *const u32) };
     if u32::from_be(magic_be) != 0xd00dfeed {
+        crate::yarm_log!(
+            "YARM_AARCH64_DTB_STATUS bad_magic value=0x{:x} ptr=0x{:x}",
+            u32::from_be(magic_be),
+            start_info_ptr as u64
+        );
         return None;
     }
     let total_size_be = unsafe { core::ptr::read_unaligned((start_info_ptr + 4) as *const u32) };
     let total_size = u32::from_be(total_size_be) as usize;
     if total_size < 40 || total_size > 2 * 1024 * 1024 {
+        crate::yarm_log!(
+            "YARM_AARCH64_DTB_STATUS bad_size size={} ptr=0x{:x}",
+            total_size,
+            start_info_ptr as u64
+        );
         return None;
     }
     Some(unsafe { core::slice::from_raw_parts(start_info_ptr as *const u8, total_size) })

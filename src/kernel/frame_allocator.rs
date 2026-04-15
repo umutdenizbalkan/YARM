@@ -502,7 +502,7 @@ fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
     #[cfg(feature = "hosted-dev")]
     let len = 128 * 1024 * 1024;
     #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "x86_64")))]
-    let len = 512 * 1024 * 1024;
+    let len = 256 * 1024 * 1024;
 
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     {
@@ -515,7 +515,10 @@ fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
     }
     #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
     [MemoryRegion {
-        start: crate::arch::platform_constants::NEXT_ANON_PHYS_BASE + (512 * 1024 * 1024),
+        // Keep the default allocator in a conservative window immediately after
+        // NEXT_ANON_PHYS_BASE so low-memory board/QEMU configs do not walk into
+        // unmapped physical space when DTB/RAM probing is unavailable.
+        start: crate::arch::platform_constants::NEXT_ANON_PHYS_BASE,
         len,
         usable: true,
     }]
