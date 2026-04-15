@@ -356,7 +356,7 @@ emergency_idt_stub:
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const RING3_INIT_SERVER_TID: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_1000;
+const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_0000;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const RING3_INIT_SERVER_CODE_PAGE: u64 = 0x0040_0000;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
