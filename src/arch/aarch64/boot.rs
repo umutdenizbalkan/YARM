@@ -393,14 +393,6 @@ pub fn bootstrap_first_user_task(
         VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
         PageFlags::USER_RW,
     )?;
-    let (_entry_mem_id, entry_mem_cap) = kernel.alloc_anonymous_memory_object()?;
-    kernel.map_user_page_with_caps(
-        aspace_cap,
-        entry_mem_cap,
-        VirtAddr(RING3_INIT_SERVER_ENTRY),
-        PageFlags::USER_RW,
-    )?;
-
     // movz x8,#0 ; svc #0 ; b .
     let code: [u8; 12] = [
         0x08, 0x00, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4, 0x00, 0x00, 0x00, 0x14,
@@ -413,11 +405,6 @@ pub fn bootstrap_first_user_task(
     let _ = kernel.protect_user_page(
         aspace_cap,
         VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
-        PageFlags::USER_RX,
-    )?;
-    let _ = kernel.protect_user_page(
-        aspace_cap,
-        VirtAddr(RING3_INIT_SERVER_ENTRY),
         PageFlags::USER_RX,
     )?;
     crate::yarm_log!(
