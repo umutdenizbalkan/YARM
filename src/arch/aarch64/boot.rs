@@ -674,13 +674,15 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_done");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    unsafe {
-        core::arch::asm!(
-            "msr ttbr0_el1, {0}",
-            "isb",
-            in(reg) saved_ttbr0,
-            options(nostack, preserves_flags)
-        );
+    if saved_ttbr0 != 0 {
+        unsafe {
+            core::arch::asm!(
+                "msr ttbr0_el1, {0}",
+                "isb",
+                in(reg) saved_ttbr0,
+                options(nostack, preserves_flags)
+            );
+        }
     }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     {
