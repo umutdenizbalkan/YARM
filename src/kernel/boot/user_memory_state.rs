@@ -109,6 +109,18 @@ impl KernelState {
         va: usize,
         need_write: bool,
     ) -> Result<u64, KernelError> {
+        #[cfg(all(
+            not(feature = "hosted-dev"),
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            )
+        ))]
+        {
+            return self.validate_user_access_via_page_table(asid, va, need_write);
+        }
+
         let aspace = self
             .user_spaces
             .get(asid)
@@ -126,6 +138,70 @@ impl KernelState {
             .0
             .checked_add(page_off)
             .ok_or(KernelError::UserMemoryFault)
+    }
+
+    #[cfg(all(
+        not(feature = "hosted-dev"),
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    ))]
+    fn validate_user_access_via_page_table(
+        &self,
+        asid: Asid,
+        va: usize,
+        need_write: bool,
+    ) -> Result<u64, KernelError> {
+        let _ = self
+            .user_spaces
+            .get(asid)
+            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1usize);
+        let page_off = (va - page_base) as u64;
+        let pte =
+            crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(page_base as u64))
+                .ok_or(KernelError::UserMemoryFault)?;
+        if !Self::pte_allows_user_access(pte, need_write) {
+            return Err(KernelError::UserMemoryFault);
+        }
+        pte.addr()
+            .checked_add(page_off)
+            .ok_or(KernelError::UserMemoryFault)
+    }
+
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    fn pte_allows_user_access(
+        pte: crate::arch::selected_isa::page_table::PageTableEntry,
+        need_write: bool,
+    ) -> bool {
+        let user = (pte.0 & crate::arch::selected_isa::page_table::PageTableEntry::USER) != 0;
+        let writable =
+            (pte.0 & crate::arch::selected_isa::page_table::PageTableEntry::WRITABLE) != 0;
+        user && (!need_write || writable)
+    }
+
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    fn pte_allows_user_access(
+        pte: crate::arch::selected_isa::page_table::PageTableEntry,
+        need_write: bool,
+    ) -> bool {
+        let user = (pte.0 & crate::arch::selected_isa::page_table::PageTableEntry::USER) != 0;
+        let read_only =
+            (pte.0 & crate::arch::selected_isa::page_table::PageTableEntry::READ_ONLY) != 0;
+        user && (!need_write || !read_only)
+    }
+
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    fn pte_allows_user_access(
+        pte: crate::arch::selected_isa::page_table::PageTableEntry,
+        need_write: bool,
+    ) -> bool {
+        let user = (pte.0 & crate::arch::selected_isa::page_table::PageTableEntry::USER) != 0;
+        let readable = (pte.0 & crate::arch::selected_isa::page_table::PageTableEntry::READ) != 0;
+        let writable = (pte.0 & crate::arch::selected_isa::page_table::PageTableEntry::WRITE) != 0;
+        user && readable && (!need_write || writable)
     }
 
     pub fn copy_to_current_user(
