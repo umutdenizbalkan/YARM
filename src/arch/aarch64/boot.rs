@@ -345,7 +345,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, esr_el1: u64, far_el1: u64, e
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const RING3_INIT_SERVER_TID: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_1000;
+const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_0000;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const RING3_INIT_SERVER_CODE_PAGE: u64 = 0x0040_0000;
 

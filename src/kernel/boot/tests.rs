@@ -24,14 +24,14 @@ fn boot_memory_map_reservation_splits_usable_region() {
 }
 
 #[test]
-fn init_with_boot_memory_map_uses_sanitized_ranges() {
+fn init_static_with_boot_memory_map_uses_sanitized_ranges() {
     let regions = [MemoryRegion {
         start: 0x1000_0000,
         len: 0x20_000,
         usable: true,
     }];
     let reserved = [(0x1000_0000, 0x1000_1000)];
-    let state = Bootstrap::init_with_boot_memory_map(
+    let state = Bootstrap::init_static_with_boot_memory_map(
         Bootstrap::default_capacity_profile(),
         &regions,
         &reserved,

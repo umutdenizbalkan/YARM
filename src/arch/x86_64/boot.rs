@@ -356,7 +356,7 @@ emergency_idt_stub:
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const RING3_INIT_SERVER_TID: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_1000;
+const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_0000;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const RING3_INIT_SERVER_CODE_PAGE: u64 = 0x0040_0000;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -712,15 +712,16 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     let kernel_state = if prepared_len > 0 {
         let boot_regions = unsafe { &PREPARED_PVH_BOOT_MEMMAP[..prepared_len] };
         let reserved_ranges = Bootstrap::default_reserved_ranges_for_arch_boot();
-        Bootstrap::init_with_boot_memory_map(
+        Bootstrap::init_static_with_boot_memory_map(
             Bootstrap::default_capacity_profile(),
             boot_regions,
             &reserved_ranges,
         )
         .expect("kernel init with pvh memmap")
     } else {
-        Bootstrap::init().expect("kernel init")
+        Bootstrap::init_static().expect("kernel init")
     };
+    let kernel_state = unsafe { core::ptr::read(kernel_state as *mut crate::kernel::boot::KernelState) };
     crate::arch::x86_64::console::write_line("KI1");
     crate::yarm_log!("YARM_BOOT_INIT_READY prepared_pvh_regions={}", prepared_len);
     let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(kernel_state);
