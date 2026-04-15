@@ -436,10 +436,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     let _ = write!(
         writer,
         "YARM_AARCH64_EXCEPTION_REGS esr_el1=0x{:016x} far_el1=0x{:016x} elr_el1=0x{:016x} spsr_el1=0x{:016x}",
-        frame.esr_el1,
-        frame.far_el1,
-        frame.elr_el1,
-        frame.spsr_el1
+        frame.esr_el1, frame.far_el1, frame.elr_el1, frame.spsr_el1
     );
     let line_len = writer.len;
     if let Ok(msg) = core::str::from_utf8(&line[..line_len]) {
@@ -475,22 +472,54 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE no_kernel_state");
     }
     match kind {
-        1 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_current_sp0"),
-        2 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_current_sp0"),
-        3 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_current_sp0"),
-        4 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_current_sp0"),
-        5 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_current_spx"),
-        6 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_current_spx"),
-        7 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_current_spx"),
-        8 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_current_spx"),
-        9 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_lower_a64"),
-        10 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_lower_a64"),
-        11 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_lower_a64"),
-        12 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_lower_a64"),
-        13 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_lower_a32"),
-        14 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_lower_a32"),
-        15 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_lower_a32"),
-        16 => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_lower_a32"),
+        1 => crate::arch::aarch64::console::write_line(
+            "YARM_AARCH64_EXCEPTION_KIND sync_current_sp0",
+        ),
+        2 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_current_sp0")
+        }
+        3 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_current_sp0")
+        }
+        4 => crate::arch::aarch64::console::write_line(
+            "YARM_AARCH64_EXCEPTION_KIND serr_current_sp0",
+        ),
+        5 => crate::arch::aarch64::console::write_line(
+            "YARM_AARCH64_EXCEPTION_KIND sync_current_spx",
+        ),
+        6 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_current_spx")
+        }
+        7 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_current_spx")
+        }
+        8 => crate::arch::aarch64::console::write_line(
+            "YARM_AARCH64_EXCEPTION_KIND serr_current_spx",
+        ),
+        9 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_lower_a64")
+        }
+        10 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_lower_a64")
+        }
+        11 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_lower_a64")
+        }
+        12 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_lower_a64")
+        }
+        13 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND sync_lower_a32")
+        }
+        14 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND irq_lower_a32")
+        }
+        15 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND fiq_lower_a32")
+        }
+        16 => {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND serr_lower_a32")
+        }
         _ => crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_KIND unknown"),
     }
 }
@@ -531,9 +560,9 @@ fn initramfs_static_hello_world_elf() -> [u8; 256] {
     image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
     // Minimal "hello world" init image code stub:
-    // movz x8,#0 ; svc #0 ; b .
+    // movz x8,#0 ; svc #0 ; b svc
     image[128..140].copy_from_slice(&[
-        0x08, 0x00, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4, 0x00, 0x00, 0x00, 0x14,
+        0x08, 0x00, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4, 0xFF, 0xFF, 0xFF, 0x17,
     ]);
     image
 }
@@ -636,7 +665,9 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         ttbr0
     };
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_begin");
+    crate::arch::aarch64::console::write_line(
+        "YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_begin",
+    );
     let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     install_trap_kernel_state(kernel);
@@ -770,7 +801,10 @@ fn setup_bootstrap_mmu() {
         let gic_l2_index = (0x0800_0000u64 / AARCH64_BLOCK_2M) as usize;
         core::ptr::write(l2_ptr.add(gic_l2_index), device_block(0x0800_0000));
         let uart_l2_index = (AARCH64_UART_MMIO_BASE / AARCH64_BLOCK_2M) as usize;
-        core::ptr::write(l2_ptr.add(uart_l2_index), device_block(AARCH64_UART_MMIO_BASE));
+        core::ptr::write(
+            l2_ptr.add(uart_l2_index),
+            device_block(AARCH64_UART_MMIO_BASE),
+        );
 
         // AttrIdx0 = normal WB/WA cacheable (0xff).
         // AttrIdx1 = normal WT cacheable (0xbb).
