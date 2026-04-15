@@ -3,10 +3,136 @@
 
 use super::{KernelError, KernelState, SpawnedUserTask, UserImageSpec};
 use crate::arch::hal::Hal;
+use crate::kernel::frame_allocator::alloc_pt_frame;
 use crate::kernel::task::{TaskStatus, ThreadGroupId, WaitReason};
-use crate::kernel::vm::VirtAddr;
+use crate::kernel::vm::{Asid, CachePolicy, Mapping, PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
+
+const ELF64_EHDR_SIZE: usize = 64;
+const ELF64_PHDR_SIZE: usize = 56;
+const PT_LOAD: u32 = 1;
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
+
+fn read_u16_le(image: &[u8], offset: usize) -> Result<u16, KernelError> {
+    let end = offset.checked_add(2).ok_or(KernelError::WrongObject)?;
+    let bytes = image.get(offset..end).ok_or(KernelError::WrongObject)?;
+    let mut raw = [0u8; 2];
+    raw.copy_from_slice(bytes);
+    Ok(u16::from_le_bytes(raw))
+}
+
+fn read_u32_le(image: &[u8], offset: usize) -> Result<u32, KernelError> {
+    let end = offset.checked_add(4).ok_or(KernelError::WrongObject)?;
+    let bytes = image.get(offset..end).ok_or(KernelError::WrongObject)?;
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(bytes);
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn read_u64_le(image: &[u8], offset: usize) -> Result<u64, KernelError> {
+    let end = offset.checked_add(8).ok_or(KernelError::WrongObject)?;
+    let bytes = image.get(offset..end).ok_or(KernelError::WrongObject)?;
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(bytes);
+    Ok(u64::from_le_bytes(raw))
+}
 
 impl KernelState {
+    /// Minimal ELF64 loader for PT_LOAD segments:
+    /// validates headers, maps pages for each load segment, copies file bytes,
+    /// and zero-fills the BSS tail.
+    pub fn load_elf_pt_load_segments(
+        &mut self,
+        asid: Asid,
+        image: &[u8],
+    ) -> Result<usize, KernelError> {
+        if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
+            return Err(KernelError::WrongObject);
+        }
+        let entry = read_u64_le(image, 24)?;
+        let phoff = read_u64_le(image, 32)? as usize;
+        let phentsize = read_u16_le(image, 54)? as usize;
+        let phnum = read_u16_le(image, 56)? as usize;
+        if phnum == 0 || phentsize < ELF64_PHDR_SIZE {
+            return Err(KernelError::WrongObject);
+        }
+        let table_size = phnum
+            .checked_mul(phentsize)
+            .ok_or(KernelError::WrongObject)?;
+        let phend = phoff.checked_add(table_size).ok_or(KernelError::WrongObject)?;
+        if phend > image.len() {
+            return Err(KernelError::WrongObject);
+        }
+
+        for idx in 0..phnum {
+            let base = phoff
+                .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
+                .ok_or(KernelError::WrongObject)?;
+            let p_type = read_u32_le(image, base)?;
+            if p_type != PT_LOAD {
+                continue;
+            }
+            let p_flags = read_u32_le(image, base + 4)?;
+            let p_offset = read_u64_le(image, base + 8)? as usize;
+            let p_vaddr = read_u64_le(image, base + 16)?;
+            let p_filesz = read_u64_le(image, base + 32)? as usize;
+            let p_memsz = read_u64_le(image, base + 40)? as usize;
+            if p_filesz > p_memsz {
+                return Err(KernelError::WrongObject);
+            }
+            let file_end = p_offset
+                .checked_add(p_filesz)
+                .ok_or(KernelError::WrongObject)?;
+            if file_end > image.len() {
+                return Err(KernelError::WrongObject);
+            }
+
+            let page_size = PAGE_SIZE as u64;
+            let seg_start = p_vaddr;
+            let seg_end = p_vaddr
+                .checked_add(p_memsz as u64)
+                .ok_or(KernelError::WrongObject)?;
+            let page_start = seg_start & !(page_size - 1);
+            let page_end = (seg_end + page_size - 1) & !(page_size - 1);
+            let flags = PageFlags {
+                read: (p_flags & PF_R) != 0,
+                write: (p_flags & PF_W) != 0,
+                execute: (p_flags & PF_X) != 0,
+                user: true,
+                cache_policy: CachePolicy::WriteBack,
+            };
+            let mut va = page_start;
+            while va < page_end {
+                let phys = alloc_pt_frame().map_err(|_| KernelError::MemoryObjectFull)?;
+                self.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr(va),
+                    Mapping {
+                        phys: PhysAddr(phys),
+                        flags,
+                    },
+                )?;
+                va += page_size;
+            }
+
+            let file_bytes = &image[p_offset..file_end];
+            self.copy_to_user(asid, VirtAddr(p_vaddr), file_bytes)?;
+            if p_memsz > p_filesz {
+                let mut remaining = p_memsz - p_filesz;
+                let mut cursor = p_vaddr + p_filesz as u64;
+                let zeros = [0u8; 256];
+                while remaining > 0 {
+                    let chunk = remaining.min(zeros.len());
+                    self.copy_to_user(asid, VirtAddr(cursor), &zeros[..chunk])?;
+                    remaining -= chunk;
+                    cursor += chunk as u64;
+                }
+            }
+        }
+        Ok(entry as usize)
+    }
+
     fn maybe_switch_kernel_context(
         &mut self,
         outgoing_tid: Option<u64>,
