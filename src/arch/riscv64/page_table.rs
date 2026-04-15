@@ -262,10 +262,15 @@ pub fn remove_asid_root(asid: Asid) {
 }
 
 pub fn cr3_for_asid(asid: Asid) -> Option<u64> {
+    const SATP_MODE_SV39: u64 = 8u64 << 60;
+    const SATP_ASID_SHIFT: u64 = 44;
+
     let mut state = PAGE_TABLE_STATE.lock();
     let root = state.ensure_asid(asid).ok()?;
-    let asid_bits = (asid.0 as u64) & ((1u64 << vm_layout::ASID_BITS.min(16)) - 1);
-    Some((root & PAGE_MASK) | asid_bits)
+    let asid_mask = (1u64 << vm_layout::ASID_BITS.min(16)) - 1;
+    let asid_bits = ((asid.0 as u64) & asid_mask) << SATP_ASID_SHIFT;
+    let root_ppn = (root & PAGE_MASK) >> PAGE_SHIFT;
+    Some(SATP_MODE_SV39 | asid_bits | root_ppn)
 }
 
 pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
