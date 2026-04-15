@@ -498,9 +498,45 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const RING3_INIT_SERVER_TID: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-const RING3_INIT_SERVER_ENTRY: u64 = 0x0040_1000;
+const INITRAMFS_HELLO_WORLD_IMAGE_ID: u64 = 0x494E_4954_4845_4C4F; // "INITHELO"
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-const RING3_INIT_SERVER_CODE_PAGE: u64 = 0x0040_0000;
+fn initramfs_static_hello_world_elf() -> [u8; 256] {
+    let mut image = [0u8; 256];
+    // ELF header.
+    image[..4].copy_from_slice(b"\x7FELF");
+    image[4] = 2; // ELFCLASS64
+    image[5] = 1; // little-endian
+    image[6] = 1; // EV_CURRENT
+    image[7] = 0; // SYSV ABI
+    image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    image[18..20].copy_from_slice(&0xB7u16.to_le_bytes()); // EM_AARCH64
+    image[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+    let entry = 0x0040_1000u64;
+    image[24..32].copy_from_slice(&entry.to_le_bytes());
+    image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    image[52..54].copy_from_slice(&(64u16).to_le_bytes()); // e_ehsize
+    image[54..56].copy_from_slice(&(56u16).to_le_bytes()); // e_phentsize
+    image[56..58].copy_from_slice(&(1u16).to_le_bytes()); // e_phnum
+
+    // Single PT_LOAD segment.
+    let ph = 64usize;
+    image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    image[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // RX
+    image[ph + 8..ph + 16].copy_from_slice(&128u64.to_le_bytes()); // p_offset
+    image[ph + 16..ph + 24].copy_from_slice(&(entry & !0xFFF).to_le_bytes()); // p_vaddr
+    image[ph + 24..ph + 32].copy_from_slice(&0u64.to_le_bytes()); // p_paddr
+    image[ph + 32..ph + 40].copy_from_slice(&12u64.to_le_bytes()); // p_filesz
+    image[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes()); // p_memsz
+    image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+    // Minimal "hello world" init image code stub:
+    // movz x8,#0 ; svc #0 ; b .
+    image[128..140].copy_from_slice(&[
+        0x08, 0x00, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4, 0x00, 0x00, 0x00, 0x14,
+    ]);
+    image
+}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 pub fn bootstrap_first_user_task(
@@ -525,43 +561,23 @@ pub fn bootstrap_first_user_task(
 
     use crate::kernel::boot::UserImageSpec;
     use crate::kernel::task::TaskClass;
-    use crate::kernel::vm::{PageFlags, VirtAddr};
 
     if kernel.task_asid(RING3_INIT_SERVER_TID).is_some() {
         return Ok(());
     }
 
-    let (asid, aspace_cap) = kernel.create_user_address_space()?;
+    let (asid, _aspace_cap) = kernel.create_user_address_space()?;
+    let image = initramfs_static_hello_world_elf();
+    let entry = kernel.load_elf_pt_load_segments(asid, &image)?;
     kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
-        entry: RING3_INIT_SERVER_ENTRY as usize,
+        entry,
         asid: Some(asid),
         class: TaskClass::SystemServer,
     })?;
-
-    let (_mem_id, mem_cap) = kernel.alloc_anonymous_memory_object()?;
-    kernel.map_user_page_with_caps(
-        aspace_cap,
-        mem_cap,
-        VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
-        PageFlags::USER_RW,
-    )?;
-    // movz x8,#0 ; svc #0 ; b .
-    let code: [u8; 12] = [
-        0x08, 0x00, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4, 0x00, 0x00, 0x00, 0x14,
-    ];
-    kernel.write_user_memory(
-        RING3_INIT_SERVER_TID,
-        RING3_INIT_SERVER_ENTRY as usize,
-        &code,
-    )?;
-    let _ = kernel.protect_user_page(
-        aspace_cap,
-        VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
-        PageFlags::USER_RX,
-    )?;
     crate::yarm_log!(
-        "YARM_INIT_DONE arch=aarch64 phase=fallback_ring3_stub seeded=0 initramfs_handled=0 devfs_handled=0"
+        "YARM_INIT_DONE arch=aarch64 phase=fallback_initramfs_static_elf image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
+        INITRAMFS_HELLO_WORLD_IMAGE_ID
     );
     Ok(())
 }
