@@ -392,14 +392,6 @@ pub fn bootstrap_first_user_task(
         VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
         PageFlags::USER_RW,
     )?;
-    let (_entry_mem_id, entry_mem_cap) = kernel.alloc_anonymous_memory_object()?;
-    kernel.map_user_page_with_caps(
-        aspace_cap,
-        entry_mem_cap,
-        VirtAddr(RING3_INIT_SERVER_ENTRY),
-        PageFlags::USER_RW,
-    )?;
-
     // mov eax, SYSCALL_YIELD_NR ; int 0x80 ; jmp $
     let code: [u8; 9] = [0xB8, 0x00, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xEB, 0xFE];
     kernel.write_user_memory(
@@ -410,11 +402,6 @@ pub fn bootstrap_first_user_task(
     let _ = kernel.protect_user_page(
         aspace_cap,
         VirtAddr(RING3_INIT_SERVER_CODE_PAGE),
-        PageFlags::USER_RX,
-    )?;
-    let _ = kernel.protect_user_page(
-        aspace_cap,
-        VirtAddr(RING3_INIT_SERVER_ENTRY),
         PageFlags::USER_RX,
     )?;
     Ok(())
