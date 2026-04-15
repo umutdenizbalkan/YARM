@@ -868,30 +868,63 @@ fn setup_bootstrap_mmu() {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn dtb_slice_from_start_info(start_info_ptr: usize) -> Option<&'static [u8]> {
-    if start_info_ptr == 0 {
+    let mut candidate_ptr = start_info_ptr;
+    if candidate_ptr == 0 {
         crate::yarm_log!("YARM_AARCH64_DTB_STATUS missing_start_info_ptr");
+        candidate_ptr = probe_qemu_virt_dtb_pointer().unwrap_or(0);
+        if candidate_ptr != 0 {
+            crate::yarm_log!(
+                "YARM_AARCH64_DTB_STATUS recovered_ptr ptr=0x{:x}",
+                candidate_ptr as u64
+            );
+        }
+    }
+    if candidate_ptr == 0 {
         return None;
     }
-    let magic_be = unsafe { core::ptr::read_unaligned(start_info_ptr as *const u32) };
+    let magic_be = unsafe { core::ptr::read_unaligned(candidate_ptr as *const u32) };
     if u32::from_be(magic_be) != 0xd00dfeed {
         crate::yarm_log!(
             "YARM_AARCH64_DTB_STATUS bad_magic value=0x{:x} ptr=0x{:x}",
             u32::from_be(magic_be),
-            start_info_ptr as u64
+            candidate_ptr as u64
         );
         return None;
     }
-    let total_size_be = unsafe { core::ptr::read_unaligned((start_info_ptr + 4) as *const u32) };
+    let total_size_be = unsafe { core::ptr::read_unaligned((candidate_ptr + 4) as *const u32) };
     let total_size = u32::from_be(total_size_be) as usize;
     if total_size < 40 || total_size > 2 * 1024 * 1024 {
         crate::yarm_log!(
             "YARM_AARCH64_DTB_STATUS bad_size size={} ptr=0x{:x}",
             total_size,
-            start_info_ptr as u64
+            candidate_ptr as u64
         );
         return None;
     }
-    Some(unsafe { core::slice::from_raw_parts(start_info_ptr as *const u8, total_size) })
+    Some(unsafe { core::slice::from_raw_parts(candidate_ptr as *const u8, total_size) })
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn probe_qemu_virt_dtb_pointer() -> Option<usize> {
+    const FDT_MAGIC_BE: u32 = 0xd00dfeed;
+    const PROBE_START: u64 = 0x4000_0000;
+    const PROBE_BYTES: u64 = 256 * 1024 * 1024;
+    const PROBE_STEP: u64 = 0x1000;
+
+    let mut addr = PROBE_START;
+    let end = PROBE_START + PROBE_BYTES;
+    while addr < end {
+        let magic_be = unsafe { core::ptr::read_unaligned(addr as *const u32) };
+        if magic_be == FDT_MAGIC_BE {
+            let total_size_be = unsafe { core::ptr::read_unaligned((addr + 4) as *const u32) };
+            let total_size = u32::from_be(total_size_be) as usize;
+            if (40..=2 * 1024 * 1024).contains(&total_size) {
+                return Some(addr as usize);
+            }
+        }
+        addr += PROBE_STEP;
+    }
+    None
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
