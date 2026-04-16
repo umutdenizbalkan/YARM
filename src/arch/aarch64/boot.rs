@@ -735,6 +735,13 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     parsed.gic_cpu_if_base.unwrap_or(0),
                 );
                 if let (Some(start), Some(len)) = (parsed.memory_start, parsed.memory_len) {
+                    let _ = crate::arch::boot_entry::stage_detected_ram_for_bootstrap(&[
+                        crate::kernel::frame_allocator::MemoryRegion {
+                            start,
+                            len,
+                            usable: true,
+                        },
+                    ]);
                     let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(&[
                         crate::kernel::frame_allocator::MemoryRegion {
                             start,
@@ -906,16 +913,16 @@ fn dtb_slice_from_start_info(start_info_ptr: usize) -> Option<&'static [u8]> {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn probe_qemu_virt_dtb_pointer() -> Option<usize> {
-    const FDT_MAGIC_BE: u32 = 0xd00dfeed;
+    const FDT_MAGIC: u32 = 0xd00dfeed;
     const PROBE_START: u64 = 0x4000_0000;
-    const PROBE_BYTES: u64 = 256 * 1024 * 1024;
+    const PROBE_BYTES: u64 = 64 * 1024 * 1024;
     const PROBE_STEP: u64 = 0x1000;
 
     let mut addr = PROBE_START;
     let end = PROBE_START + PROBE_BYTES;
     while addr < end {
-        let magic_be = unsafe { core::ptr::read_unaligned(addr as *const u32) };
-        if magic_be == FDT_MAGIC_BE {
+        let raw_magic = unsafe { core::ptr::read_unaligned(addr as *const u32) };
+        if u32::from_be(raw_magic) == FDT_MAGIC {
             let total_size_be = unsafe { core::ptr::read_unaligned((addr + 4) as *const u32) };
             let total_size = u32::from_be(total_size_be) as usize;
             if (40..=2 * 1024 * 1024).contains(&total_size) {

@@ -13,12 +13,27 @@ static mut BOOTSTRAP_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
     core::mem::MaybeUninit::uninit();
 
 impl Bootstrap {
-    fn default_boot_memory_map() -> [MemoryRegion; 1] {
-        [MemoryRegion {
+    fn default_boot_memory_map() -> ([MemoryRegion; MAX_BOOT_MEMORY_REGIONS], usize) {
+        let mut staged = [MemoryRegion {
+            start: 0,
+            len: 0,
+            usable: false,
+        }; MAX_BOOT_MEMORY_REGIONS];
+        if let Some(regions) = crate::arch::boot_entry::take_staged_ram_for_bootstrap(&mut staged) {
+            let regions_len = regions.len();
+            return (staged, regions_len);
+        }
+        let mut fallback = [MemoryRegion {
+            start: 0,
+            len: 0,
+            usable: false,
+        }; MAX_BOOT_MEMORY_REGIONS];
+        fallback[0] = MemoryRegion {
             start: platform_constants::NEXT_ANON_PHYS_BASE,
             len: 512 * 1024 * 1024,
             usable: true,
-        }]
+        };
+        (fallback, 1)
     }
 
     fn default_reserved_ranges() -> [(u64, u64); 1] {
@@ -160,17 +175,25 @@ impl Bootstrap {
     pub fn init_static_with_capacity_profile(
         capacity_profile: KernelCapacityProfile,
     ) -> Result<&'static mut KernelState, KernelError> {
-        let boot_map = Self::default_boot_memory_map();
+        let (boot_map, boot_map_len) = Self::default_boot_memory_map();
         let reserved = Self::default_reserved_ranges();
-        Self::init_static_with_boot_memory_map(capacity_profile, &boot_map, &reserved)
+        Self::init_static_with_boot_memory_map(
+            capacity_profile,
+            &boot_map[..boot_map_len],
+            &reserved,
+        )
     }
 
     pub fn init_with_capacity_profile(
         capacity_profile: KernelCapacityProfile,
     ) -> Result<KernelState, KernelError> {
-        let boot_map = Self::default_boot_memory_map();
+        let (boot_map, boot_map_len) = Self::default_boot_memory_map();
         let reserved = Self::default_reserved_ranges();
-        let state = Self::init_static_with_boot_memory_map(capacity_profile, &boot_map, &reserved)?;
+        let state = Self::init_static_with_boot_memory_map(
+            capacity_profile,
+            &boot_map[..boot_map_len],
+            &reserved,
+        )?;
         let state_ptr = state as *mut KernelState;
         Ok(unsafe { core::ptr::read(state_ptr) })
     }

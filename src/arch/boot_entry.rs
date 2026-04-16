@@ -4,10 +4,19 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const MAX_IRQ_DESCRIPTION_BYTES: usize = 256;
+const MAX_STAGED_BOOT_RAM_REGIONS: usize = 16;
 static IRQ_DESCRIPTION_LEN: AtomicUsize = AtomicUsize::new(0);
 static IRQ_DESCRIPTION_LOCK: AtomicBool = AtomicBool::new(false);
 static mut IRQ_DESCRIPTION_BUF: [u8; MAX_IRQ_DESCRIPTION_BYTES] = [0; MAX_IRQ_DESCRIPTION_BYTES];
 static FIRMWARE_BLOB_PROVIDER_PTR: AtomicUsize = AtomicUsize::new(0);
+static STAGED_BOOT_RAM_REGIONS_LEN: AtomicUsize = AtomicUsize::new(0);
+static STAGED_BOOT_RAM_REGIONS_LOCK: AtomicBool = AtomicBool::new(false);
+static mut STAGED_BOOT_RAM_REGIONS: [crate::kernel::frame_allocator::MemoryRegion;
+    MAX_STAGED_BOOT_RAM_REGIONS] = [crate::kernel::frame_allocator::MemoryRegion {
+    start: 0,
+    len: 0,
+    usable: false,
+}; MAX_STAGED_BOOT_RAM_REGIONS];
 
 pub fn bootstrap_first_user_task(
     kernel: &mut crate::kernel::boot::KernelState,
@@ -54,6 +63,26 @@ impl Drop for IrqDescriptionLockGuard {
     }
 }
 
+struct StagedBootRamLockGuard;
+
+impl StagedBootRamLockGuard {
+    fn acquire() -> Self {
+        while STAGED_BOOT_RAM_REGIONS_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+impl Drop for StagedBootRamLockGuard {
+    fn drop(&mut self) {
+        STAGED_BOOT_RAM_REGIONS_LOCK.store(false, Ordering::Release);
+    }
+}
+
 pub fn stage_irq_controller_description_for_boot(description: &[u8]) -> bool {
     if description.is_empty() || description.len() > MAX_IRQ_DESCRIPTION_BYTES {
         return false;
@@ -74,6 +103,55 @@ pub fn stage_irq_controller_description_from_firmware_blob(blob: &[u8]) -> bool 
         return false;
     };
     stage_irq_controller_description_for_boot(&canonical[..canonical_len])
+}
+
+pub fn stage_detected_ram_for_bootstrap(
+    regions: &[crate::kernel::frame_allocator::MemoryRegion],
+) -> bool {
+    if regions.is_empty() || regions.len() > MAX_STAGED_BOOT_RAM_REGIONS {
+        return false;
+    }
+    let mut validated = [crate::kernel::frame_allocator::MemoryRegion {
+        start: 0,
+        len: 0,
+        usable: false,
+    }; MAX_STAGED_BOOT_RAM_REGIONS];
+    let mut validated_len = 0usize;
+    for region in regions.iter().copied() {
+        if !region.usable || region.len == 0 {
+            continue;
+        }
+        if validated_len >= MAX_STAGED_BOOT_RAM_REGIONS {
+            return false;
+        }
+        validated[validated_len] = region;
+        validated_len += 1;
+    }
+    if validated_len == 0 {
+        return false;
+    }
+
+    let _guard = StagedBootRamLockGuard::acquire();
+    unsafe {
+        STAGED_BOOT_RAM_REGIONS[..validated_len].copy_from_slice(&validated[..validated_len]);
+    }
+    STAGED_BOOT_RAM_REGIONS_LEN.store(validated_len, Ordering::Release);
+    true
+}
+
+pub fn take_staged_ram_for_bootstrap<'a>(
+    scratch: &'a mut [crate::kernel::frame_allocator::MemoryRegion],
+) -> Option<&'a [crate::kernel::frame_allocator::MemoryRegion]> {
+    let len = STAGED_BOOT_RAM_REGIONS_LEN.swap(0, Ordering::AcqRel);
+    if len == 0 || len > MAX_STAGED_BOOT_RAM_REGIONS || len > scratch.len() {
+        return None;
+    }
+
+    let _guard = StagedBootRamLockGuard::acquire();
+    unsafe {
+        scratch[..len].copy_from_slice(&STAGED_BOOT_RAM_REGIONS[..len]);
+    }
+    Some(&scratch[..len])
 }
 
 pub fn set_firmware_blob_provider_for_boot(provider: fn(&mut [u8]) -> usize) {
@@ -286,5 +364,34 @@ mod tests {
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
             core::ptr::addr_of_mut!(TEST_LAPIC_REGS) as usize
         );
+    }
+
+    #[test]
+    fn staged_bootstrap_ram_regions_are_consumed_once() {
+        let regions = [crate::kernel::frame_allocator::MemoryRegion {
+            start: 0x4000_0000,
+            len: 0x2000_0000,
+            usable: true,
+        }];
+        assert!(stage_detected_ram_for_bootstrap(&regions));
+        let mut scratch = [crate::kernel::frame_allocator::MemoryRegion {
+            start: 0,
+            len: 0,
+            usable: false,
+        }; 4];
+        let consumed = take_staged_ram_for_bootstrap(&mut scratch).expect("staged ram");
+        assert_eq!(consumed, &regions);
+        assert!(take_staged_ram_for_bootstrap(&mut scratch).is_none());
+    }
+
+    #[test]
+    fn stage_detected_ram_rejects_empty_or_unusable_regions() {
+        assert!(!stage_detected_ram_for_bootstrap(&[]));
+        let unusable = [crate::kernel::frame_allocator::MemoryRegion {
+            start: 0x4000_0000,
+            len: 0x1000,
+            usable: false,
+        }];
+        assert!(!stage_detected_ram_for_bootstrap(&unusable));
     }
 }
