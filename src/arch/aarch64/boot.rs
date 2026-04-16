@@ -786,7 +786,37 @@ fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
 extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_SMP_SECONDARY_ONLINE");
     crate::yarm_log!("YARM_AARCH64_SMP_SECONDARY cpu={}", cpu_id);
+    let cpu = crate::kernel::scheduler::CpuId(cpu_id as u8);
+    unsafe {
+        unsafe extern "C" {
+            static yarm_aarch64_vector_table_el1: u8;
+        }
+        let vector_base = (&yarm_aarch64_vector_table_el1 as *const u8) as u64;
+        core::arch::asm!("msr VBAR_EL1, {0}", in(reg) vector_base, options(nomem, preserves_flags));
+        core::arch::asm!("isb", options(nomem, preserves_flags));
+    }
+
+    let kernel = loop {
+        if let Some(kernel) = trap_kernel_state_mut() {
+            break kernel;
+        }
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    };
+    let _ = kernel.set_current_cpu(cpu);
+    let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
+    kernel.program_timer_deadline_current_cpu(
+        crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+    );
+    crate::yarm_log!("YARM_AARCH64_SMP_SECONDARY_JOINED cpu={}", cpu_id);
+
     loop {
+        let _ = kernel.set_current_cpu(cpu);
+        let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
+        if let Ok(Some(tid)) = kernel.dispatch_ready_task() {
+            enter_dispatched_user_task_if_available(kernel, Some(tid));
+        }
         unsafe {
             core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
         }
