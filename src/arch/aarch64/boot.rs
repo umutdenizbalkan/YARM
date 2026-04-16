@@ -918,20 +918,38 @@ fn probe_qemu_virt_dtb_pointer() -> Option<usize> {
     // On QEMU `virt`, the DTB can be placed well beyond the first 64 MiB when
     // guest RAM is large (for example with multi-GiB `-m` values).
     const PROBE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-    const PROBE_STEP: u64 = 0x1000;
+    const PROBE_STEP_PAGE: u64 = 0x1000;
+    const PROBE_UNALIGNED_WINDOW: u64 = 128 * 1024 * 1024;
+    const PROBE_STEP_UNALIGNED: u64 = 8;
+
+    let candidate_is_valid = |addr: u64| -> bool {
+        let raw_magic = unsafe { core::ptr::read_unaligned(addr as *const u32) };
+        if u32::from_be(raw_magic) != FDT_MAGIC {
+            return false;
+        }
+        let total_size_be = unsafe { core::ptr::read_unaligned((addr + 4) as *const u32) };
+        let total_size = u32::from_be(total_size_be) as usize;
+        (40..=2 * 1024 * 1024).contains(&total_size)
+    };
 
     let mut addr = PROBE_START;
     let end = PROBE_START + PROBE_BYTES;
     while addr < end {
-        let raw_magic = unsafe { core::ptr::read_unaligned(addr as *const u32) };
-        if u32::from_be(raw_magic) == FDT_MAGIC {
-            let total_size_be = unsafe { core::ptr::read_unaligned((addr + 4) as *const u32) };
-            let total_size = u32::from_be(total_size_be) as usize;
-            if (40..=2 * 1024 * 1024).contains(&total_size) {
-                return Some(addr as usize);
-            }
+        if candidate_is_valid(addr) {
+            return Some(addr as usize);
         }
-        addr += PROBE_STEP;
+        addr += PROBE_STEP_PAGE;
+    }
+
+    // Some firmware/QEMU combinations place the DTB at an address that is not
+    // 4 KiB-aligned. Retry a dense probe in the low-RAM window before giving up.
+    let mut unaligned = PROBE_START;
+    let unaligned_end = PROBE_START + PROBE_UNALIGNED_WINDOW;
+    while unaligned < unaligned_end {
+        if candidate_is_valid(unaligned) {
+            return Some(unaligned as usize);
+        }
+        unaligned += PROBE_STEP_UNALIGNED;
     }
     None
 }
