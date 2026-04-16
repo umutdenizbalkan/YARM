@@ -920,8 +920,8 @@ fn probe_qemu_virt_dtb_pointer() -> Option<usize> {
     // is installed (observed at FAR=0x6000_0000 on 512 MiB guests).
     const PROBE_BYTES: u64 = 512 * 1024 * 1024;
     const PROBE_STEP_PAGE: u64 = 0x1000;
-    const PROBE_UNALIGNED_WINDOW: u64 = 128 * 1024 * 1024;
-    const PROBE_STEP_UNALIGNED: u64 = 8;
+    const PROBE_INTRA_PAGE_SCAN_BYTES: u64 = 128;
+    const PROBE_INTRA_PAGE_STEP: u64 = 8;
 
     let candidate_is_valid = |addr: u64| -> bool {
         let raw_magic = unsafe { core::ptr::read_unaligned(addr as *const u32) };
@@ -939,18 +939,15 @@ fn probe_qemu_virt_dtb_pointer() -> Option<usize> {
         if candidate_is_valid(addr) {
             return Some(addr as usize);
         }
-        addr += PROBE_STEP_PAGE;
-    }
-
-    // Some firmware/QEMU combinations place the DTB at an address that is not
-    // 4 KiB-aligned. Retry a dense probe in the low-RAM window before giving up.
-    let mut unaligned = PROBE_START;
-    let unaligned_end = PROBE_START + PROBE_UNALIGNED_WINDOW;
-    while unaligned < unaligned_end {
-        if candidate_is_valid(unaligned) {
-            return Some(unaligned as usize);
+        let page_scan_end = (addr + PROBE_INTRA_PAGE_SCAN_BYTES).min(end);
+        let mut probe = addr + PROBE_INTRA_PAGE_STEP;
+        while probe < page_scan_end {
+            if candidate_is_valid(probe) {
+                return Some(probe as usize);
+            }
+            probe += PROBE_INTRA_PAGE_STEP;
         }
-        unaligned += PROBE_STEP_UNALIGNED;
+        addr += PROBE_STEP_PAGE;
     }
     None
 }
