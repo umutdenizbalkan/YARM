@@ -739,12 +739,16 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
 fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize {
     let mut started = 0usize;
     let secondary_entry = yarm_aarch64_secondary_entry as usize as u64;
-    for cpu in kernel
-        .detect_secondary_cpus()
-        .into_iter()
-        .flatten()
-        .map(crate::kernel::scheduler::CpuId)
-    {
+    let present = kernel.present_cpu_bitmap();
+    for cpu_id in 0..64u8 {
+        if cpu_id == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+            continue;
+        }
+        let mask = 1u64 << cpu_id;
+        if (present & mask) == 0 {
+            continue;
+        }
+        let cpu = crate::kernel::scheduler::CpuId(cpu_id);
         let psci_ret = psci_cpu_on(cpu.0 as u64, secondary_entry, cpu.0 as u64);
         crate::yarm_log!("YARM_SMP_PSCI cpu={} ret={}", cpu.0, psci_ret);
         if psci_ret == 0 && kernel.bring_up_cpu(cpu).is_ok() {
