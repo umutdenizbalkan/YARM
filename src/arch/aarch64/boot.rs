@@ -915,9 +915,10 @@ fn dtb_slice_from_start_info(start_info_ptr: usize) -> Option<&'static [u8]> {
 fn probe_qemu_virt_dtb_pointer() -> Option<usize> {
     const FDT_MAGIC: u32 = 0xd00dfeed;
     const PROBE_START: u64 = 0x4000_0000;
-    // On QEMU `virt`, the DTB can be placed well beyond the first 64 MiB when
-    // guest RAM is large (for example with multi-GiB `-m` values).
-    const PROBE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    // Probe within the first 512 MiB from RAM base. Without firmware-provided
+    // RAM size metadata, probing past absent RAM can fault before kernel state
+    // is installed (observed at FAR=0x6000_0000 on 512 MiB guests).
+    const PROBE_BYTES: u64 = 512 * 1024 * 1024;
     const PROBE_STEP_PAGE: u64 = 0x1000;
     const PROBE_UNALIGNED_WINDOW: u64 = 128 * 1024 * 1024;
     const PROBE_STEP_UNALIGNED: u64 = 8;
