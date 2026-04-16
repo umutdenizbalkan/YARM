@@ -227,7 +227,9 @@ impl Bootstrap {
             })?;
 
         let mut scheduler = SmpScheduler::default();
-        scheduler.set_present_cpu_bitmap(topology::default_present_cpu_bitmap());
+        let present_cpu_bitmap = crate::arch::boot_entry::take_staged_present_cpu_bitmap_for_bootstrap()
+            .unwrap_or_else(topology::default_present_cpu_bitmap);
+        scheduler.set_present_cpu_bitmap(present_cpu_bitmap);
         scheduler
             .enqueue_on(
                 CpuId(platform_constants::BOOTSTRAP_CPU_ID),

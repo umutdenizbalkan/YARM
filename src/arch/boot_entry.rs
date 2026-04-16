@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const MAX_IRQ_DESCRIPTION_BYTES: usize = 256;
 const MAX_STAGED_BOOT_RAM_REGIONS: usize = 16;
@@ -11,6 +11,7 @@ static mut IRQ_DESCRIPTION_BUF: [u8; MAX_IRQ_DESCRIPTION_BYTES] = [0; MAX_IRQ_DE
 static FIRMWARE_BLOB_PROVIDER_PTR: AtomicUsize = AtomicUsize::new(0);
 static STAGED_BOOT_RAM_REGIONS_LEN: AtomicUsize = AtomicUsize::new(0);
 static STAGED_BOOT_RAM_REGIONS_LOCK: AtomicBool = AtomicBool::new(false);
+static STAGED_PRESENT_CPU_BITMAP: AtomicU64 = AtomicU64::new(0);
 static mut STAGED_BOOT_RAM_REGIONS: [crate::kernel::frame_allocator::MemoryRegion;
     MAX_STAGED_BOOT_RAM_REGIONS] = [crate::kernel::frame_allocator::MemoryRegion {
     start: 0,
@@ -152,6 +153,19 @@ pub fn take_staged_ram_for_bootstrap<'a>(
         scratch[..len].copy_from_slice(&STAGED_BOOT_RAM_REGIONS[..len]);
     }
     Some(&scratch[..len])
+}
+
+pub fn stage_present_cpu_bitmap_for_bootstrap(bitmap: u64) -> bool {
+    if bitmap == 0 {
+        return false;
+    }
+    STAGED_PRESENT_CPU_BITMAP.store(bitmap, Ordering::Release);
+    true
+}
+
+pub fn take_staged_present_cpu_bitmap_for_bootstrap() -> Option<u64> {
+    let bitmap = STAGED_PRESENT_CPU_BITMAP.swap(0, Ordering::AcqRel);
+    if bitmap == 0 { None } else { Some(bitmap) }
 }
 
 pub fn set_firmware_blob_provider_for_boot(provider: fn(&mut [u8]) -> usize) {
@@ -393,5 +407,13 @@ mod tests {
             usable: false,
         }];
         assert!(!stage_detected_ram_for_bootstrap(&unusable));
+    }
+
+    #[test]
+    fn staged_present_cpu_bitmap_is_consumed_once() {
+        assert!(stage_present_cpu_bitmap_for_bootstrap(0b1111));
+        assert_eq!(take_staged_present_cpu_bitmap_for_bootstrap(), Some(0b1111));
+        assert_eq!(take_staged_present_cpu_bitmap_for_bootstrap(), None);
+        assert!(!stage_present_cpu_bitmap_for_bootstrap(0));
     }
 }

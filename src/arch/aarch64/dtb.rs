@@ -15,6 +15,7 @@ pub struct ParsedDtb {
     pub initrd_start: Option<u64>,
     pub initrd_end: Option<u64>,
     pub gic_cpu_if_base: Option<usize>,
+    pub present_cpu_bitmap: Option<u64>,
 }
 
 pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
@@ -44,6 +45,7 @@ pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
     let mut inside_chosen = false;
     let mut inside_interrupt_controller = false;
     let mut gic_prefers_second_reg = false;
+    let mut present_cpu_bitmap = 0u64;
 
     while cursor + 4 <= struct_block.len() {
         let token = read_be_u32(struct_block, cursor)?;
@@ -58,6 +60,9 @@ pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
                 inside_interrupt_controller =
                     name.starts_with(b"intc") || name.starts_with(b"interrupt-controller");
                 gic_prefers_second_reg = false;
+                if let Some(cpu_id) = parse_cpu_id_from_node_name(name) {
+                    present_cpu_bitmap |= 1u64 << cpu_id;
+                }
             }
             FDT_END_NODE => {
                 depth = depth.saturating_sub(1);
@@ -121,7 +126,30 @@ pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
             _ => return None,
         }
     }
+    if present_cpu_bitmap != 0 {
+        out.present_cpu_bitmap = Some(present_cpu_bitmap);
+    }
     Some(out)
+}
+
+fn parse_cpu_id_from_node_name(name: &[u8]) -> Option<u8> {
+    let suffix = name.strip_prefix(b"cpu@")?;
+    let mut value = 0u64;
+    let mut consumed = 0usize;
+    for byte in suffix.iter().copied() {
+        let nibble = match byte {
+            b'0'..=b'9' => (byte - b'0') as u64,
+            b'a'..=b'f' => (byte - b'a' + 10) as u64,
+            b'A'..=b'F' => (byte - b'A' + 10) as u64,
+            _ => break,
+        };
+        value = (value << 4) | nibble;
+        consumed += 1;
+    }
+    if consumed == 0 || value >= 64 {
+        return None;
+    }
+    Some(value as u8)
 }
 
 fn read_initrd_scalar(bytes: &[u8]) -> Option<u64> {
@@ -305,5 +333,42 @@ mod tests {
         assert_eq!(parsed.initrd_start, Some(0x4800_0000));
         assert_eq!(parsed.initrd_end, Some(0x4810_0000));
         assert_eq!(parsed.gic_cpu_if_base, Some(0x0801_0000));
+        assert_eq!(parsed.present_cpu_bitmap, None);
+    }
+
+    #[test]
+    fn parse_boot_dtb_extracts_cpu_bitmap_from_cpu_nodes() {
+        let mut struct_block = Vec::new();
+        let mut strings = Vec::new();
+
+        push_begin_node(&mut struct_block, "");
+        push_begin_node(&mut struct_block, "cpus");
+        push_begin_node(&mut struct_block, "cpu@0");
+        push_be_u32(&mut struct_block, FDT_END_NODE);
+        push_begin_node(&mut struct_block, "cpu@3");
+        push_be_u32(&mut struct_block, FDT_END_NODE);
+        push_be_u32(&mut struct_block, FDT_END_NODE);
+        push_be_u32(&mut struct_block, FDT_END_NODE);
+        push_be_u32(&mut struct_block, FDT_END);
+
+        let header_size = 40usize;
+        let off_struct = header_size;
+        let off_strings = off_struct + struct_block.len();
+        let total = off_strings + strings.len();
+        let mut dtb = Vec::new();
+        push_be_u32(&mut dtb, FDT_MAGIC);
+        push_be_u32(&mut dtb, total as u32);
+        push_be_u32(&mut dtb, off_struct as u32);
+        push_be_u32(&mut dtb, off_strings as u32);
+        push_be_u32(&mut dtb, header_size as u32);
+        push_be_u32(&mut dtb, 17);
+        push_be_u32(&mut dtb, 16);
+        push_be_u32(&mut dtb, 0);
+        push_be_u32(&mut dtb, strings.len() as u32);
+        push_be_u32(&mut dtb, struct_block.len() as u32);
+        dtb.extend_from_slice(&struct_block);
+
+        let parsed = parse_boot_dtb(&dtb).expect("parsed");
+        assert_eq!(parsed.present_cpu_bitmap, Some(0b1001));
     }
 }

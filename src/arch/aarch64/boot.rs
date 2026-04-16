@@ -670,6 +670,8 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     );
     let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    let started_secondary = start_secondary_cpus(kernel);
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     install_trap_kernel_state(kernel);
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_done");
@@ -692,6 +694,13 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         // right after this stage marker. Timer/IRQ bring-up is deferred to the
         // normal init path once platform control is fully established.
     }
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    crate::yarm_log!(
+        "YARM_SMP_STARTUP started_secondary={} online_cpus={} present_cpus={}",
+        started_secondary,
+        kernel.online_cpu_count(),
+        kernel.present_cpu_count()
+    );
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),
@@ -699,6 +708,22 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.online_cpu_count()
     );
     run(kernel);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize {
+    let mut started = 0usize;
+    for cpu in kernel
+        .detect_secondary_cpus()
+        .into_iter()
+        .flatten()
+        .map(crate::kernel::scheduler::CpuId)
+    {
+        if kernel.bring_up_cpu(cpu).is_ok() {
+            started += 1;
+        }
+    }
+    started
 }
 
 pub fn prepare_arch_boot(_start_info_ptr: usize) {
@@ -734,6 +759,14 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     parsed.initrd_end.unwrap_or(0),
                     parsed.gic_cpu_if_base.unwrap_or(0),
                 );
+                if let Some(bitmap) = parsed.present_cpu_bitmap {
+                    let _ = crate::arch::boot_entry::stage_present_cpu_bitmap_for_bootstrap(bitmap);
+                    crate::yarm_log!(
+                        "YARM_AARCH64_DTB_CPU_BITMAP value=0x{:x} count={}",
+                        bitmap,
+                        bitmap.count_ones()
+                    );
+                }
                 if let (Some(start), Some(len)) = (parsed.memory_start, parsed.memory_len) {
                     let _ = crate::arch::boot_entry::stage_detected_ram_for_bootstrap(&[
                         crate::kernel::frame_allocator::MemoryRegion {
