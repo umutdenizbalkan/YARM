@@ -405,6 +405,15 @@ enum PsciConduit {
 static PSCI_CONDUIT: AtomicU8 = AtomicU8::new(PsciConduit::Unknown as u8);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn fallback_psci_conduit() -> PsciConduit {
+    match option_env!("YARM_AARCH64_PSCI_FALLBACK") {
+        Some("smc") | Some("SMC") => PsciConduit::Smc,
+        Some("hvc") | Some("HVC") => PsciConduit::Hvc,
+        _ => PsciConduit::Unknown,
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn install_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState) {
     TRAP_KERNEL_STATE_PTR.store(kernel as *mut _, core::sync::atomic::Ordering::SeqCst);
 }
@@ -755,11 +764,14 @@ fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize 
     let conduit = match PSCI_CONDUIT.load(Ordering::Acquire) {
         x if x == PsciConduit::Smc as u8 => PsciConduit::Smc,
         x if x == PsciConduit::Hvc as u8 => PsciConduit::Hvc,
-        _ => PsciConduit::Unknown,
+        _ => fallback_psci_conduit(),
     };
     if matches!(conduit, PsciConduit::Unknown) {
         crate::yarm_log!("YARM_SMP_PSCI unavailable_conduit");
         return 0;
+    }
+    if PSCI_CONDUIT.load(Ordering::Acquire) == PsciConduit::Unknown as u8 {
+        crate::yarm_log!("YARM_SMP_PSCI using_fallback_conduit={:?}", conduit);
     }
     let present = kernel.present_cpu_bitmap();
     for cpu_id in 0..64u8 {
