@@ -5,6 +5,8 @@
 use core::arch::global_asm;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 use core::fmt::Write;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+use core::sync::atomic::{AtomicU8, Ordering};
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 global_asm!(
@@ -392,6 +394,17 @@ static TRAP_KERNEL_STATE_PTR: core::sync::atomic::AtomicPtr<crate::kernel::boot:
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PsciConduit {
+    Unknown = 0,
+    Smc = 1,
+    Hvc = 2,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static PSCI_CONDUIT: AtomicU8 = AtomicU8::new(PsciConduit::Unknown as u8);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn install_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState) {
     TRAP_KERNEL_STATE_PTR.store(kernel as *mut _, core::sync::atomic::Ordering::SeqCst);
 }
@@ -695,11 +708,11 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     );
     let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    let started_secondary = start_secondary_cpus(kernel);
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     install_trap_kernel_state(kernel);
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_done");
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    let started_secondary = start_secondary_cpus(kernel);
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if saved_ttbr0 != 0 {
         unsafe {
@@ -739,6 +752,15 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
 fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize {
     let mut started = 0usize;
     let secondary_entry = yarm_aarch64_secondary_entry as usize as u64;
+    let conduit = match PSCI_CONDUIT.load(Ordering::Acquire) {
+        x if x == PsciConduit::Smc as u8 => PsciConduit::Smc,
+        x if x == PsciConduit::Hvc as u8 => PsciConduit::Hvc,
+        _ => PsciConduit::Unknown,
+    };
+    if matches!(conduit, PsciConduit::Unknown) {
+        crate::yarm_log!("YARM_SMP_PSCI unavailable_conduit");
+        return 0;
+    }
     let present = kernel.present_cpu_bitmap();
     for cpu_id in 0..64u8 {
         if cpu_id == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
@@ -749,7 +771,7 @@ fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize 
             continue;
         }
         let cpu = crate::kernel::scheduler::CpuId(cpu_id);
-        let psci_ret = psci_cpu_on(cpu.0 as u64, secondary_entry, cpu.0 as u64);
+        let psci_ret = psci_cpu_on(conduit, cpu.0 as u64, secondary_entry, cpu.0 as u64);
         crate::yarm_log!("YARM_SMP_PSCI cpu={} ret={}", cpu.0, psci_ret);
         if psci_ret == 0 && kernel.bring_up_cpu(cpu).is_ok() {
             started += 1;
@@ -767,20 +789,31 @@ unsafe extern "C" {
 const PSCI_CPU_ON_FID: u64 = 0xC400_0003;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
+fn psci_cpu_on(conduit: PsciConduit, target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
     let mut x0 = PSCI_CPU_ON_FID;
     let x1 = target_cpu;
     let x2 = entry_point;
     let x3 = context_id;
     unsafe {
-        core::arch::asm!(
-            "smc #0",
-            inout("x0") x0,
-            in("x1") x1,
-            in("x2") x2,
-            in("x3") x3,
-            options(nostack)
-        );
+        match conduit {
+            PsciConduit::Smc => core::arch::asm!(
+                "smc #0",
+                inout("x0") x0,
+                in("x1") x1,
+                in("x2") x2,
+                in("x3") x3,
+                options(nostack)
+            ),
+            PsciConduit::Hvc => core::arch::asm!(
+                "hvc #0",
+                inout("x0") x0,
+                in("x1") x1,
+                in("x2") x2,
+                in("x3") x3,
+                options(nostack)
+            ),
+            PsciConduit::Unknown => return -1,
+        }
     }
     x0 as i64
 }
@@ -868,6 +901,13 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                         bitmap.count_ones()
                     );
                 }
+                let conduit = match parsed.psci_conduit {
+                    crate::arch::aarch64::dtb::PsciConduit::Smc => PsciConduit::Smc,
+                    crate::arch::aarch64::dtb::PsciConduit::Hvc => PsciConduit::Hvc,
+                    crate::arch::aarch64::dtb::PsciConduit::Unknown => PsciConduit::Unknown,
+                };
+                PSCI_CONDUIT.store(conduit as u8, Ordering::Release);
+                crate::yarm_log!("YARM_AARCH64_DTB_PSCI conduit={:?}", conduit);
                 if let (Some(start), Some(len)) = (parsed.memory_start, parsed.memory_len) {
                     let _ = crate::arch::boot_entry::stage_detected_ram_for_bootstrap(&[
                         crate::kernel::frame_allocator::MemoryRegion {

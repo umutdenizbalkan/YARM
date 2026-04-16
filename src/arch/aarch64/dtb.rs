@@ -9,6 +9,14 @@ const FDT_NOP: u32 = 0x4;
 const FDT_END: u32 = 0x9;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PsciConduit {
+    #[default]
+    Unknown,
+    Smc,
+    Hvc,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ParsedDtb {
     pub memory_start: Option<u64>,
     pub memory_len: Option<u64>,
@@ -16,6 +24,7 @@ pub struct ParsedDtb {
     pub initrd_end: Option<u64>,
     pub gic_cpu_if_base: Option<usize>,
     pub present_cpu_bitmap: Option<u64>,
+    pub psci_conduit: PsciConduit,
 }
 
 pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
@@ -44,6 +53,7 @@ pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
     let mut inside_memory = false;
     let mut inside_chosen = false;
     let mut inside_interrupt_controller = false;
+    let mut inside_psci = false;
     let mut gic_prefers_second_reg = false;
     let mut present_cpu_bitmap = 0u64;
 
@@ -59,6 +69,7 @@ pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
                 inside_chosen = name == b"chosen";
                 inside_interrupt_controller =
                     name.starts_with(b"intc") || name.starts_with(b"interrupt-controller");
+                inside_psci = name.starts_with(b"psci");
                 gic_prefers_second_reg = false;
                 if let Some(cpu_id) = parse_cpu_id_from_node_name(name) {
                     present_cpu_bitmap |= 1u64 << cpu_id;
@@ -69,6 +80,7 @@ pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
                 inside_memory = false;
                 inside_chosen = false;
                 inside_interrupt_controller = false;
+                inside_psci = false;
                 gic_prefers_second_reg = false;
             }
             FDT_PROP => {
@@ -119,6 +131,14 @@ pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
                             first
                         };
                     }
+                } else if inside_psci && prop_name == b"method" {
+                    out.psci_conduit = if prop_data.starts_with(b"hvc") {
+                        PsciConduit::Hvc
+                    } else if prop_data.starts_with(b"smc") {
+                        PsciConduit::Smc
+                    } else {
+                        PsciConduit::Unknown
+                    };
                 }
             }
             FDT_NOP => {}
@@ -268,6 +288,10 @@ mod tests {
         push_prop(&mut struct_block, &mut strings, "reg", &mem_reg);
         push_be_u32(&mut struct_block, FDT_END_NODE);
 
+        push_begin_node(&mut struct_block, "psci");
+        push_prop(&mut struct_block, &mut strings, "method", b"hvc\0");
+        push_be_u32(&mut struct_block, FDT_END_NODE);
+
         push_begin_node(&mut struct_block, "intc@8000000");
         push_prop(
             &mut struct_block,
@@ -334,6 +358,7 @@ mod tests {
         assert_eq!(parsed.initrd_end, Some(0x4810_0000));
         assert_eq!(parsed.gic_cpu_if_base, Some(0x0801_0000));
         assert_eq!(parsed.present_cpu_bitmap, None);
+        assert_eq!(parsed.psci_conduit, PsciConduit::Hvc);
     }
 
     #[test]
@@ -370,5 +395,6 @@ mod tests {
 
         let parsed = parse_boot_dtb(&dtb).expect("parsed");
         assert_eq!(parsed.present_cpu_bitmap, Some(0b1001));
+        assert_eq!(parsed.psci_conduit, PsciConduit::Unknown);
     }
 }
