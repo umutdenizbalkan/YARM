@@ -915,7 +915,9 @@ fn dtb_slice_from_start_info(start_info_ptr: usize) -> Option<&'static [u8]> {
 fn probe_qemu_virt_dtb_pointer() -> Option<usize> {
     const FDT_MAGIC: u32 = 0xd00dfeed;
     const PROBE_START: u64 = 0x4000_0000;
-    const PROBE_BYTES: u64 = 64 * 1024 * 1024;
+    // On QEMU `virt`, the DTB can be placed well beyond the first 64 MiB when
+    // guest RAM is large (for example with multi-GiB `-m` values).
+    const PROBE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
     const PROBE_STEP: u64 = 0x1000;
 
     let mut addr = PROBE_START;
