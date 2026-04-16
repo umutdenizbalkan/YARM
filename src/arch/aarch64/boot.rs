@@ -18,6 +18,10 @@ boot_stack_aarch64_end:
 exc_stack_aarch64:
     .skip 65536
 exc_stack_aarch64_end:
+    .align 16
+secondary_boot_stacks:
+    .skip 0x00100000
+secondary_boot_stacks_end:
 
     .section .text.boot,"ax",@progbits
     .weak _start
@@ -88,6 +92,27 @@ yarm_aarch64_enter_el1_if_needed:
 1:
 2:
     ret
+    "#
+);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+global_asm!(
+    r#"
+    .section .text.boot,"ax",@progbits
+    .global yarm_aarch64_secondary_entry
+    .type yarm_aarch64_secondary_entry,%function
+yarm_aarch64_secondary_entry:
+    mrs x0, MPIDR_EL1
+    and x0, x0, #0xff
+    adrp x1, secondary_boot_stacks_end
+    add x1, x1, :lo12:secondary_boot_stacks_end
+    mov x2, #0x4000
+    mul x3, x0, x2
+    sub sp, x1, x3
+    bl yarm_aarch64_secondary_cpu_boot
+1:
+    wfe
+    b 1b
     "#
 );
 
@@ -713,17 +738,59 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize {
     let mut started = 0usize;
+    let secondary_entry = yarm_aarch64_secondary_entry as usize as u64;
     for cpu in kernel
         .detect_secondary_cpus()
         .into_iter()
         .flatten()
         .map(crate::kernel::scheduler::CpuId)
     {
-        if kernel.bring_up_cpu(cpu).is_ok() {
+        let psci_ret = psci_cpu_on(cpu.0 as u64, secondary_entry, cpu.0 as u64);
+        crate::yarm_log!("YARM_SMP_PSCI cpu={} ret={}", cpu.0, psci_ret);
+        if psci_ret == 0 && kernel.bring_up_cpu(cpu).is_ok() {
             started += 1;
         }
     }
     started
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+unsafe extern "C" {
+    fn yarm_aarch64_secondary_entry() -> !;
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const PSCI_CPU_ON_FID: u64 = 0xC400_0003;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
+    let mut x0 = PSCI_CPU_ON_FID;
+    let x1 = target_cpu;
+    let x2 = entry_point;
+    let x3 = context_id;
+    unsafe {
+        core::arch::asm!(
+            "smc #0",
+            inout("x0") x0,
+            in("x1") x1,
+            in("x2") x2,
+            in("x3") x3,
+            options(nostack)
+        );
+    }
+    x0 as i64
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_SMP_SECONDARY_ONLINE");
+    crate::yarm_log!("YARM_AARCH64_SMP_SECONDARY cpu={}", cpu_id);
+    loop {
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
 }
 
 pub fn prepare_arch_boot(_start_info_ptr: usize) {
