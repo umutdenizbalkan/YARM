@@ -80,6 +80,16 @@ pub struct CapabilitySpace {
     slots: Box<[CapSlot]>,
     slot_capacity: usize,
     revoke_scratch_cache: Option<RevokeScratch>,
+    revoke_scratch_cache_hits: u64,
+    revoke_scratch_cache_misses: u64,
+    revoke_scratch_cache_drops: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevokeScratchTelemetry {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_drops: u64,
 }
 
 impl Default for CapabilitySpace {
@@ -152,6 +162,9 @@ impl CapabilitySpace {
             slots: slots.into_boxed_slice(),
             slot_capacity: bounded_capacity,
             revoke_scratch_cache: None,
+            revoke_scratch_cache_hits: 0,
+            revoke_scratch_cache_misses: 0,
+            revoke_scratch_cache_drops: 0,
         })
     }
 
@@ -208,6 +221,7 @@ impl CapabilitySpace {
             .is_some_and(|scratch| scratch.capacity() < self.slot_capacity)
         {
             self.revoke_scratch_cache = None;
+            self.revoke_scratch_cache_drops = self.revoke_scratch_cache_drops.saturating_add(1);
         }
         Ok(())
     }
@@ -372,9 +386,19 @@ impl CapabilitySpace {
         if let Some(scratch) = self.revoke_scratch_cache.take()
             && scratch.capacity() >= self.slot_capacity
         {
+            self.revoke_scratch_cache_hits = self.revoke_scratch_cache_hits.saturating_add(1);
             return Ok(scratch);
         }
+        self.revoke_scratch_cache_misses = self.revoke_scratch_cache_misses.saturating_add(1);
         RevokeScratch::try_with_capacity(self.slot_capacity)
+    }
+
+    pub fn revoke_scratch_telemetry(&self) -> RevokeScratchTelemetry {
+        RevokeScratchTelemetry {
+            cache_hits: self.revoke_scratch_cache_hits,
+            cache_misses: self.revoke_scratch_cache_misses,
+            cache_drops: self.revoke_scratch_cache_drops,
+        }
     }
 
     pub fn get(&self, id: CapId) -> Option<Capability> {
@@ -703,6 +727,22 @@ mod tests {
                 .map(|cap| cap.index()),
             Ok(5)
         );
+    }
+
+    #[test]
+    fn revoke_scratch_cache_telemetry_tracks_hits_and_misses() {
+        let mut cspace = CapabilitySpace::with_slots(4);
+        let cap = Capability::new(CapObject::Kernel, CapRights::READ);
+
+        let root1 = cspace.mint_at(0, cap).expect("slot 0");
+        cspace.revoke(root1).expect("first revoke");
+
+        let root2 = cspace.mint_at(1, cap).expect("slot 1");
+        cspace.revoke(root2).expect("second revoke");
+
+        let telemetry = cspace.revoke_scratch_telemetry();
+        assert!(telemetry.cache_misses >= 1);
+        assert!(telemetry.cache_hits >= 1);
     }
 
     #[test]
