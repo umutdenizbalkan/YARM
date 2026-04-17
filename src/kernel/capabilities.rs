@@ -130,6 +130,18 @@ impl CapabilitySpace {
         self.slot_capacity
     }
 
+    pub fn resize_slots(&mut self, slot_capacity: usize) -> Result<(), CapabilityDeriveError> {
+        if slot_capacity == 0 || slot_capacity > MAX_CAPABILITIES_PER_CSPACE {
+            return Err(CapabilityDeriveError::InvalidSlot);
+        }
+        let occupied = self.occupied_slots();
+        if slot_capacity < occupied {
+            return Err(CapabilityDeriveError::SpaceFull);
+        }
+        self.slot_capacity = slot_capacity;
+        Ok(())
+    }
+
     pub fn occupied_slots(&self) -> usize {
         self.slots
             .iter()
@@ -574,6 +586,18 @@ mod tests {
         assert_eq!(ids.next(), Some(first));
         assert_eq!(ids.next(), Some(second));
         assert_eq!(ids.next(), None);
+    }
+
+    #[test]
+    fn resize_slots_rejects_shrink_below_occupied() {
+        let mut cspace = CapabilitySpace::with_slots(4);
+        let cap = Capability::new(CapObject::Kernel, CapRights::READ);
+        cspace.mint_at(0, cap).expect("slot 0");
+        cspace.mint_at(1, cap).expect("slot 1");
+        assert_eq!(
+            cspace.resize_slots(1),
+            Err(CapabilityDeriveError::SpaceFull)
+        );
     }
 
     #[test]

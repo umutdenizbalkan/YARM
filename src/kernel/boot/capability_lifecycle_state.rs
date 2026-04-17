@@ -64,6 +64,63 @@ impl KernelState {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resize_process_cnode_slots(
+        &mut self,
+        process_pid: u64,
+        slot_capacity: usize,
+    ) -> Result<(), KernelError> {
+        let class = self
+            .task_class(process_pid)
+            .ok_or(KernelError::TaskMissing)?;
+        match class {
+            TaskClass::Driver | TaskClass::SystemServer => {}
+            TaskClass::App => return Err(KernelError::MissingRight),
+        }
+        let cnode = self
+            .process_cnode_for_pid(process_pid)
+            .ok_or(KernelError::TaskMissing)?;
+        self.resize_cnode_slots(cnode, slot_capacity)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resize_cnode_slots(
+        &mut self,
+        cnode: CNodeId,
+        slot_capacity: usize,
+    ) -> Result<(), KernelError> {
+        let max_total_cnode_slots = self.runtime_capacity_config().max_total_cnode_slots;
+        let bounded_slot_capacity =
+            slot_capacity.clamp(1, crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE);
+        self.with_capability_state_mut(|capability| {
+            let reserved_other_slots: usize = capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .filter(|space| space.id != cnode)
+                .map(|space| space.slot_capacity)
+                .sum();
+            if reserved_other_slots.saturating_add(bounded_slot_capacity) > max_total_cnode_slots {
+                return Err(KernelError::CapabilityFull);
+            }
+            let space = capability
+                .cnode_spaces
+                .iter_mut()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .ok_or(KernelError::TaskMissing)?;
+            kernel_mut(&mut space.cspace)
+                .resize_slots(bounded_slot_capacity)
+                .map_err(|err| match err {
+                    CapabilityDeriveError::SpaceFull => KernelError::CapabilityFull,
+                    CapabilityDeriveError::InvalidSlot => KernelError::WrongObject,
+                    _ => KernelError::WrongObject,
+                })?;
+            space.slot_capacity = bounded_slot_capacity;
+            Ok(())
+        })
+    }
+
     pub(crate) fn mint_capability_for_current_context(
         &mut self,
         capability: Capability,

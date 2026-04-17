@@ -2564,6 +2564,54 @@ fn cnode_slot_budget_rejects_overcommit() {
 }
 
 #[test]
+fn driver_process_can_resize_its_cnode_slots() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    state
+        .register_task_with_class(222, TaskClass::Driver)
+        .expect("driver task");
+    let cnode = state.process_cnode_for_pid(222).expect("cnode");
+    let before = state.cnode_slot_capacity(cnode).expect("capacity");
+    assert!(before > 1);
+    state
+        .resize_process_cnode_slots(222, before - 1)
+        .expect("resize down");
+    assert_eq!(state.cnode_slot_capacity(cnode), Some(before - 1));
+}
+
+#[test]
+fn app_process_cnode_resize_is_denied_by_policy() {
+    let mut state = Bootstrap::init().expect("init");
+    state
+        .register_task_with_class(223, TaskClass::App)
+        .expect("app task");
+    assert_eq!(
+        state.resize_process_cnode_slots(223, 2),
+        Err(KernelError::MissingRight)
+    );
+}
+
+#[test]
+fn cnode_resize_rejects_shrink_below_occupied_slots() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    state
+        .register_task_with_class(224, TaskClass::Driver)
+        .expect("driver task");
+    let cnode = state.process_cnode_for_pid(224).expect("cnode");
+    state
+        .mint_capability_in_cnode(cnode, Capability::new(CapObject::Kernel, CapRights::READ))
+        .expect("mint one");
+    state
+        .mint_capability_in_cnode(cnode, Capability::new(CapObject::Kernel, CapRights::READ))
+        .expect("mint two");
+    assert_eq!(
+        state.resize_cnode_slots(cnode, 1),
+        Err(KernelError::CapabilityFull)
+    );
+}
+
+#[test]
 fn synchronous_endpoint_blocked_send_updates_telemetry() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(62).expect("sender");
