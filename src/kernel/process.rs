@@ -407,6 +407,7 @@ impl ProcessManager {
         parent_pid: ProcessId,
         image_id: u64,
         image: &[u8],
+        requested_cnode_slots: Option<usize>,
     ) -> Result<(ProcessId, ElfImageInfo), ProcessManagerError> {
         let info = ElfImageInfo::parse(image_id, image)?;
         let pid = self.alloc_process(parent_pid)?;
@@ -418,6 +419,7 @@ impl ProcessManager {
         {
             record.image_id = info.image_id;
             record.entry = info.entry;
+            record.requested_cnode_slots = requested_cnode_slots;
         }
         Ok((pid, info))
     }
@@ -587,11 +589,12 @@ impl ProcessManager {
                 #[cfg(test)]
                 {
                     let image = Self::synthetic_elf_image(req.image_id);
-                    let (pid, _) =
-                        self.spawn_from_elf_image(req.parent_pid, req.image_id, &image)?;
-                    if let Some(record) = self.table.iter_mut().flatten().find(|r| r.pid == pid) {
-                        record.requested_cnode_slots = req.requested_cnode_slots;
-                    }
+                    let (pid, _) = self.spawn_from_elf_image(
+                        req.parent_pid,
+                        req.image_id,
+                        &image,
+                        req.requested_cnode_slots,
+                    )?;
                     let result = SpawnV2Result { pid };
                     return Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
                         .map_err(|_| ProcessManagerError::Malformed);
@@ -683,7 +686,7 @@ mod tests {
         image[24..32].copy_from_slice(&0x402000u64.to_le_bytes());
 
         let (pid, info) = pm
-            .spawn_from_elf_image(ProcessId(1), 9, &image)
+            .spawn_from_elf_image(ProcessId(1), 9, &image, None)
             .expect("spawn from image");
         assert!(pid >= ProcessId(1000));
         assert_eq!(info.image_id, 9);
