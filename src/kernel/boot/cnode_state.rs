@@ -116,6 +116,7 @@ impl KernelState {
         let Some(cnode) = self.process_cnode_for_pid(pid) else {
             return;
         };
+        let cnode_slot_capacity = self.cnode_slot_capacity(cnode).unwrap_or(0);
         let mut telemetry = ProcessCnodeCleanupTelemetry::default();
 
         loop {
@@ -188,9 +189,10 @@ impl KernelState {
         });
 
         crate::yarm_log!(
-            "YARM_PROC_CNODE_CLEANUP pid={} cnode={} revoked_caps={} removed_links={} removed_cspace={} removed_record={}",
+            "YARM_PROC_CNODE_CLEANUP pid={} cnode={} slots={} revoked_caps={} removed_links={} removed_cspace={} removed_record={}",
             pid,
             cnode.0,
+            cnode_slot_capacity,
             telemetry.revoked_caps,
             telemetry.removed_delegation_links,
             telemetry.removed_cnode_space as u8,

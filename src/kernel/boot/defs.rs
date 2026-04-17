@@ -236,6 +236,7 @@ pub(crate) struct DriverSubsystem {
 #[derive(Debug, Clone)]
 pub(crate) struct CNodeSpace {
     pub(crate) id: CNodeId,
+    pub(crate) slot_capacity: usize,
     pub(crate) cspace: KernelStorage<CapabilitySpace>,
 }
 

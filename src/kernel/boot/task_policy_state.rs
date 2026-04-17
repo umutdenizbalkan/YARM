@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::{KernelError, KernelState, TidAllocationTelemetry};
+use super::{KernelError, KernelState, RuntimeCapacityConfig, TidAllocationTelemetry};
 use crate::kernel::capabilities::CNodeId;
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{TaskClass, ThreadControlBlock};
@@ -23,7 +23,8 @@ impl KernelState {
         let cnode = self
             .process_cnode_for_pid(process_pid)
             .unwrap_or(CNodeId(process_pid));
-        self.ensure_cnode_space(cnode)?;
+        let cnode_slots = Self::default_cnode_slot_capacity_for_class(class, limits);
+        self.ensure_cnode_space_with_slots(cnode, cnode_slots)?;
         self.set_process_cnode_for_pid(process_pid, cnode)?;
         let inserted = if let Some(idx) = self.tcbs.iter().position(|slot| slot.is_none()) {
             let tcb = ThreadControlBlock::new(ThreadId(tid), None);
@@ -130,5 +131,18 @@ impl KernelState {
 
     pub fn is_dynamic_tid(&self, tid: u64) -> bool {
         tid >= self.dynamic_tid_floor()
+    }
+
+    fn default_cnode_slot_capacity_for_class(
+        class: TaskClass,
+        limits: RuntimeCapacityConfig,
+    ) -> usize {
+        match class {
+            TaskClass::Driver => crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+            TaskClass::App | TaskClass::SystemServer => core::cmp::max(
+                1,
+                limits.max_capability_slots / core::cmp::max(1, limits.max_tasks),
+            ),
+        }
     }
 }

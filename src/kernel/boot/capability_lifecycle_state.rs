@@ -5,6 +5,17 @@ use super::*;
 
 impl KernelState {
     pub(crate) fn ensure_cnode_space(&mut self, cnode: CNodeId) -> Result<(), KernelError> {
+        let slot_capacity = crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE;
+        self.ensure_cnode_space_with_slots(cnode, slot_capacity)
+    }
+
+    pub(crate) fn ensure_cnode_space_with_slots(
+        &mut self,
+        cnode: CNodeId,
+        slot_capacity: usize,
+    ) -> Result<(), KernelError> {
+        let bounded_slot_capacity =
+            slot_capacity.clamp(1, crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE);
         self.with_capability_state_mut(|capability| {
             if capability
                 .cnode_spaces
@@ -21,12 +32,24 @@ impl KernelState {
             {
                 *slot = Some(CNodeSpace {
                     id: cnode,
-                    cspace: store_kernel_value(CapabilitySpace::default()),
+                    slot_capacity: bounded_slot_capacity,
+                    cspace: store_kernel_value(CapabilitySpace::with_slots(bounded_slot_capacity)),
                 });
                 Ok(())
             } else {
                 Err(KernelError::TaskTableFull)
             }
+        })
+    }
+
+    pub(crate) fn cnode_slot_capacity(&self, cnode: CNodeId) -> Option<usize> {
+        self.with_capability_state(|capability| {
+            capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .map(|space| space.slot_capacity)
         })
     }
 

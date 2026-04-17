@@ -183,54 +183,40 @@ fn transfer_envelope_handles_are_single_use_and_replay_safe() {
     let first = state
         .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
         .expect("stash first");
-    assert!(
-        state
-            .take_transfer_envelope(first, endpoint, ThreadId(0))
-            .is_some()
-    );
-    assert!(
-        state
-            .take_transfer_envelope(first, endpoint, ThreadId(0))
-            .is_none()
-    );
+    assert!(state
+        .take_transfer_envelope(first, endpoint, ThreadId(0))
+        .is_some());
+    assert!(state
+        .take_transfer_envelope(first, endpoint, ThreadId(0))
+        .is_none());
 
     let second = state
         .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
         .expect("stash second");
     assert_ne!(first, second);
-    assert!(
-        state
-            .take_transfer_envelope(first, endpoint, ThreadId(0))
-            .is_none()
-    );
+    assert!(state
+        .take_transfer_envelope(first, endpoint, ThreadId(0))
+        .is_none());
     let wrong_endpoint = CapObject::Endpoint {
         index: usize::MAX,
         generation: 1,
     };
-    assert!(
-        state
-            .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
-            .is_none()
-    );
-    assert!(
-        state
-            .take_transfer_envelope(second, endpoint, ThreadId(0))
-            .is_some()
-    );
+    assert!(state
+        .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
+        .is_none());
+    assert!(state
+        .take_transfer_envelope(second, endpoint, ThreadId(0))
+        .is_some());
 
     let bound = state
         .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, Some(ThreadId(9)), None)
         .expect("stash bound");
-    assert!(
-        state
-            .take_transfer_envelope(bound, endpoint, ThreadId(8))
-            .is_none()
-    );
-    assert!(
-        state
-            .take_transfer_envelope(bound, endpoint, ThreadId(9))
-            .is_some()
-    );
+    assert!(state
+        .take_transfer_envelope(bound, endpoint, ThreadId(8))
+        .is_none());
+    assert!(state
+        .take_transfer_envelope(bound, endpoint, ThreadId(9))
+        .is_some());
 }
 
 #[test]
@@ -1508,13 +1494,11 @@ fn revoke_isolated_to_owning_cnode_space() {
             .revoke(cap),
         Ok(())
     );
-    assert!(
-        state
-            .cspace_for_cnode(cnode1)
-            .expect("cspace1")
-            .get(cap)
-            .is_none()
-    );
+    assert!(state
+        .cspace_for_cnode(cnode1)
+        .expect("cspace1")
+        .get(cap)
+        .is_none());
     let remaining = state
         .cspace_for_cnode(cnode2)
         .expect("cspace2")
@@ -1561,30 +1545,22 @@ fn revoke_source_capability_cascades_to_delegated_descendants() {
     let delegated_task2 = state
         .grant_capability_task_to_task_with_rights(1, delegated_task1, 2, CapRights::READ)
         .expect("delegate task2");
-    assert!(
-        state
-            .resolve_capability_for_task(1, delegated_task1)
-            .is_ok()
-    );
-    assert!(
-        state
-            .resolve_capability_for_task(2, delegated_task2)
-            .is_ok()
-    );
+    assert!(state
+        .resolve_capability_for_task(1, delegated_task1)
+        .is_ok());
+    assert!(state
+        .resolve_capability_for_task(2, delegated_task2)
+        .is_ok());
 
     let root_cnode = state.task_cnode(0).expect("root cnode");
     assert_eq!(state.revoke_capability_in_cnode(root_cnode, root), Ok(()));
     assert!(state.resolve_capability_for_task(0, root).is_err());
-    assert!(
-        state
-            .resolve_capability_for_task(1, delegated_task1)
-            .is_err()
-    );
-    assert!(
-        state
-            .resolve_capability_for_task(2, delegated_task2)
-            .is_err()
-    );
+    assert!(state
+        .resolve_capability_for_task(1, delegated_task1)
+        .is_err());
+    assert!(state
+        .resolve_capability_for_task(2, delegated_task2)
+        .is_err());
 }
 
 #[test]
@@ -1896,14 +1872,12 @@ fn revoked_unmapped_memory_object_reclaims_frame() {
         .revoke_capability_in_cnode(cnode, mem_cap)
         .expect("revoke mem cap");
 
-    assert!(
-        state
-            .memory
-            .memory_objects
-            .iter()
-            .flatten()
-            .all(|entry| entry.id != id)
-    );
+    assert!(state
+        .memory
+        .memory_objects
+        .iter()
+        .flatten()
+        .all(|entry| entry.id != id));
 
     let (_next_id, next_cap) = state.alloc_anonymous_memory_object().expect("next anon");
     let next_phys = state
@@ -2359,15 +2333,13 @@ fn delegate_device_server_caps_configures_driver_record() {
     assert!(state.capability_for_cnode(driver_cnode, irq_cap).is_some());
     assert!(state.capability_for_cnode(driver_cnode, dma_cap).is_some());
     assert!(state.capability_for_cnode(driver_cnode, iova_cap).is_some());
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                34,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE,
-            )
-            .is_ok()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            34,
+            crate::kernel::vm::PAGE_SIZE * 8,
+            crate::kernel::vm::PAGE_SIZE,
+        )
+        .is_ok());
 }
 
 #[test]
@@ -2537,6 +2509,40 @@ fn capacity_telemetry_reports_runtime_profile_capacities() {
 }
 
 #[test]
+fn constrained_profile_uses_smaller_default_cnode_slot_capacity_for_apps() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    let limits = state.runtime_capacity_config();
+    state
+        .register_task_with_class(220, TaskClass::App)
+        .expect("app task");
+
+    let cnode = state.process_cnode_for_pid(220).expect("process cnode");
+    assert_eq!(
+        state.cnode_slot_capacity(cnode),
+        Some(core::cmp::max(
+            1,
+            limits.max_capability_slots / core::cmp::max(1, limits.max_tasks),
+        ))
+    );
+}
+
+#[test]
+fn driver_tasks_get_max_cnode_slot_capacity() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    state
+        .register_task_with_class(221, TaskClass::Driver)
+        .expect("driver task");
+
+    let cnode = state.process_cnode_for_pid(221).expect("process cnode");
+    assert_eq!(
+        state.cnode_slot_capacity(cnode),
+        Some(crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE)
+    );
+}
+
+#[test]
 fn synchronous_endpoint_blocked_send_updates_telemetry() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(62).expect("sender");
@@ -2619,38 +2625,26 @@ fn delegate_driver_bundle_uses_standard_window_and_revokes_caps() {
         .expect("bundle");
 
     let driver_cnode = state.task_cnode(59).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.irq_cap)
-            .is_some()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.dma_cap)
-            .is_some()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.iova_cap)
-            .is_some()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.irq_cap)
+        .is_some());
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.dma_cap)
+        .is_some());
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.iova_cap)
+        .is_some());
 
     state.revoke_driver_runtime_caps(59).expect("revoke");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.irq_cap)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.dma_cap)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.iova_cap)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.irq_cap)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.dma_cap)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.iova_cap)
+        .is_none());
 }
 
 #[test]
@@ -2777,26 +2771,18 @@ fn driver_record_accepts_multiple_irq_and_dma_caps() {
 
     state.revoke_driver_runtime_caps(44).expect("revoke");
     let driver_cnode = state.task_cnode(44).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_irq_a)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_irq_b)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_dma_a)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_dma_b)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_irq_a)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_irq_b)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_dma_a)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_dma_b)
+        .is_none());
 }
 
 #[test]
@@ -2870,22 +2856,16 @@ fn dma_region_cap_enforces_window_constraints() {
     let mut state = Bootstrap::init().expect("init");
     let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
 
-    assert!(
-        state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
-            .is_ok()
-    );
-    assert!(
-        state
-            .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
-            .is_err()
-    );
+    assert!(state
+        .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+        .is_ok());
+    assert!(state
+        .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
+        .is_err());
     assert!(state.mint_dma_region_cap(mem_cap, 0, 0).is_err());
-    assert!(
-        state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-            .is_err()
-    );
+    assert!(state
+        .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+        .is_err());
 }
 
 #[test]
@@ -2902,29 +2882,23 @@ fn dma_region_cap_uses_parent_memory_object_length() {
         .expect("memory object present");
     entry.len = crate::kernel::vm::PAGE_SIZE * 4;
 
-    assert!(
-        state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-            .is_ok()
-    );
-    assert!(
-        state
-            .mint_dma_region_cap(
-                mem_cap,
-                crate::kernel::vm::PAGE_SIZE * 3,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok()
-    );
-    assert!(
-        state
-            .mint_dma_region_cap(
-                mem_cap,
-                crate::kernel::vm::PAGE_SIZE * 3,
-                crate::kernel::vm::PAGE_SIZE * 2
-            )
-            .is_err()
-    );
+    assert!(state
+        .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+        .is_ok());
+    assert!(state
+        .mint_dma_region_cap(
+            mem_cap,
+            crate::kernel::vm::PAGE_SIZE * 3,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_ok());
+    assert!(state
+        .mint_dma_region_cap(
+            mem_cap,
+            crate::kernel::vm::PAGE_SIZE * 3,
+            crate::kernel::vm::PAGE_SIZE * 2
+        )
+        .is_err());
 }
 
 #[test]
@@ -3031,15 +3005,13 @@ fn driver_restart_revokes_runtime_caps() {
     let token = state.exit_task(22, 1).expect("exit");
     state.restart_task(22, token).expect("restart");
 
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                22,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            22,
+            crate::kernel::vm::PAGE_SIZE * 8,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_err());
 }
 
 #[test]
@@ -3087,26 +3059,22 @@ fn detach_iova_space_revokes_dma_window_validation() {
             crate::kernel::vm::PAGE_SIZE,
         )
         .expect("window");
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                31,
-                crate::kernel::vm::PAGE_SIZE * 2,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            31,
+            crate::kernel::vm::PAGE_SIZE * 2,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_ok());
 
     state.detach_driver_iova_space(31).expect("detach");
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                31,
-                crate::kernel::vm::PAGE_SIZE * 2,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            31,
+            crate::kernel::vm::PAGE_SIZE * 2,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_err());
 }
 
 #[test]
@@ -3129,21 +3097,15 @@ fn revoke_driver_runtime_caps_revokes_from_driver_cnode() {
 
     state.revoke_driver_runtime_caps(32).expect("revoke");
     let driver_cnode = state.task_cnode(32).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_irq)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_dma)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_iova)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_irq)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_dma)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_iova)
+        .is_none());
 }
 
 #[test]
@@ -3157,11 +3119,9 @@ fn stale_driver_caps_are_rejected_after_revocation() {
     state.revoke_driver_runtime_caps(33).expect("revoke");
 
     let driver_cnode = state.task_cnode(33).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_irq)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_irq)
+        .is_none());
     assert!(state.grant_driver_irq(33, irq).is_ok());
 }
 
@@ -3189,16 +3149,12 @@ fn delegation_checked_bundle_requires_redelegation_after_driver_restart() {
         .validate_driver_bundle_live(111, first_bundle)
         .expect("bundle live");
     let driver_cnode = state.task_cnode(111).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
-            .is_some()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
-            .is_some()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
+        .is_some());
+    assert!(state
+        .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
+        .is_some());
 
     let token = state.exit_task(111, 5).expect("exit");
     state.restart_task(111, token).expect("restart");
@@ -3208,26 +3164,20 @@ fn delegation_checked_bundle_requires_redelegation_after_driver_restart() {
         Err(KernelError::StaleCapability)
     );
     let driver_cnode = state.task_cnode(111).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
+        .is_none());
     assert!(matches!(
         state.grant_driver_irq(111, first_bundle.irq_cap),
         Err(KernelError::InvalidCapability | KernelError::WrongObject)
     ));
 
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, first_bundle.iova_cap)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, first_bundle.iova_cap)
+        .is_none());
     let iova_cap2 = state.create_iova_space_cap().expect("iova2");
 
     let second_bundle = state
@@ -3248,16 +3198,12 @@ fn delegation_checked_bundle_requires_redelegation_after_driver_restart() {
     assert_ne!(first_bundle.irq_cap, second_bundle.irq_cap);
     assert_ne!(first_bundle.dma_cap, second_bundle.dma_cap);
     let driver_cnode = state.task_cnode(111).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, second_bundle.irq_cap)
-            .is_some()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, second_bundle.dma_cap)
-            .is_some()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, second_bundle.irq_cap)
+        .is_some());
+    assert!(state
+        .capability_for_cnode(driver_cnode, second_bundle.dma_cap)
+        .is_some());
 }
 
 #[test]
@@ -3283,15 +3229,13 @@ fn checked_bundle_helper_validates_bundle_and_dma_window() {
     state
         .validate_driver_bundle_live(121, bundle)
         .expect("bundle live");
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                121,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            121,
+            crate::kernel::vm::PAGE_SIZE * 8,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_ok());
 }
 
 #[test]
@@ -3358,24 +3302,20 @@ fn iova_window_validation_requires_iova_space_and_range() {
         )
         .expect("window");
 
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                12,
-                crate::kernel::vm::PAGE_SIZE * 4,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok()
-    );
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                12,
-                crate::kernel::vm::PAGE_SIZE * 3,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            12,
+            crate::kernel::vm::PAGE_SIZE * 4,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_ok());
+    assert!(state
+        .validate_driver_dma_iova(
+            12,
+            crate::kernel::vm::PAGE_SIZE * 3,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_err());
 }
 
 #[test]
@@ -3859,11 +3799,9 @@ fn process_teardown_reclaims_process_cnode_space_and_delegated_descendants() {
     let delegated_cap = state
         .grant_capability_task_to_task_with_rights(730, source_cap, 731, CapRights::READ)
         .expect("delegate");
-    assert!(
-        state
-            .resolve_capability_for_task(731, delegated_cap)
-            .is_ok()
-    );
+    assert!(state
+        .resolve_capability_for_task(731, delegated_cap)
+        .is_ok());
 
     state.mark_task_dead(730).expect("teardown source process");
 
@@ -3907,11 +3845,9 @@ fn process_teardown_reclaims_multi_hop_delegated_graph_without_touching_unrelate
 
     assert!(state.resolve_capability_for_task(741, mid_cap).is_ok());
     assert!(state.resolve_capability_for_task(742, leaf_cap).is_ok());
-    assert!(
-        state
-            .resolve_capability_for_task(743, unrelated_cap)
-            .is_ok()
-    );
+    assert!(state
+        .resolve_capability_for_task(743, unrelated_cap)
+        .is_ok());
 
     state.mark_task_dead(740).expect("teardown source");
 
@@ -3924,11 +3860,9 @@ fn process_teardown_reclaims_multi_hop_delegated_graph_without_touching_unrelate
         state.resolve_capability_for_task(742, leaf_cap),
         Err(KernelError::InvalidCapability)
     );
-    assert!(
-        state
-            .resolve_capability_for_task(743, unrelated_cap)
-            .is_ok()
-    );
+    assert!(state
+        .resolve_capability_for_task(743, unrelated_cap)
+        .is_ok());
 }
 
 #[test]
