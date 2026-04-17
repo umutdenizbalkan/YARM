@@ -51,7 +51,7 @@ mod non_hosted {
         pages: u64,
     }
 
-    // Locking / SMP discipline:
+    // Locking / SMP discipline (final note):
     // - Each slab size class has its own SpinLockIrq<u64> guarding that class's page list head
     //   and all metadata mutations for pages belonging to the class (free-list, bitmap, used count,
     //   unlink/reclaim decisions).
@@ -61,6 +61,9 @@ mod non_hosted {
     // IRQ context note:
     // - SpinLockIrq disables local IRQs while held, so allocator lock holders cannot be preempted by
     //   IRQ handlers on the same CPU acquiring the same lock.
+    // Test limitation note:
+    // - Current allocator tests in this repository are interleaving/model based; true multi-core
+    //   parallel race execution is not exercised in the hosted-dev unit-test harness.
     static SLAB_CLASS_LOCK_0: SpinLockIrq<u64> = SpinLockIrq::new(0);
     static SLAB_CLASS_LOCK_1: SpinLockIrq<u64> = SpinLockIrq::new(0);
     static SLAB_CLASS_LOCK_2: SpinLockIrq<u64> = SpinLockIrq::new(0);
