@@ -16,7 +16,7 @@ impl KernelState {
     ) -> Result<(), KernelError> {
         let max_total_cnode_slots = self.runtime_capacity_config().max_total_cnode_slots;
         let bounded_slot_capacity =
-            slot_capacity.clamp(1, crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE);
+            slot_capacity.clamp(1, crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE_HARD);
         self.with_capability_state_mut(|capability| {
             if capability
                 .cnode_spaces
@@ -93,7 +93,7 @@ impl KernelState {
     ) -> Result<(), KernelError> {
         let max_total_cnode_slots = self.runtime_capacity_config().max_total_cnode_slots;
         let bounded_slot_capacity =
-            slot_capacity.clamp(1, crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE);
+            slot_capacity.clamp(1, crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE_HARD);
         self.with_capability_state_mut(|capability| {
             let reserved_other_slots: usize = capability
                 .cnode_spaces

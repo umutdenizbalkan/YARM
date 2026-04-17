@@ -61,6 +61,7 @@ impl Capability {
 pub const MAX_CAPABILITIES_PER_CSPACE: usize = 1024;
 #[cfg(not(feature = "hosted-dev"))]
 pub const MAX_CAPABILITIES_PER_CSPACE: usize = 512;
+pub const MAX_CAPABILITIES_PER_CSPACE_HARD: usize = (CapId::INDEX_MASK as usize) + 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapEntry {
@@ -121,7 +122,7 @@ impl RevokeScratch {
 
 impl CapabilitySpace {
     pub fn try_with_slots(slot_capacity: usize) -> Result<Self, CapabilityDeriveError> {
-        let bounded_capacity = slot_capacity.clamp(1, MAX_CAPABILITIES_PER_CSPACE);
+        let bounded_capacity = slot_capacity.clamp(1, MAX_CAPABILITIES_PER_CSPACE_HARD);
         let mut slots = Vec::new();
         slots
             .try_reserve_exact(bounded_capacity)
@@ -147,7 +148,7 @@ impl CapabilitySpace {
     }
 
     pub fn resize_slots(&mut self, slot_capacity: usize) -> Result<(), CapabilityDeriveError> {
-        if slot_capacity == 0 || slot_capacity > MAX_CAPABILITIES_PER_CSPACE {
+        if slot_capacity == 0 || slot_capacity > MAX_CAPABILITIES_PER_CSPACE_HARD {
             return Err(CapabilityDeriveError::InvalidSlot);
         }
         if slot_capacity == self.slots.len() {
@@ -624,6 +625,13 @@ mod tests {
             cspace.resize_slots(1),
             Err(CapabilityDeriveError::SpaceFull)
         );
+    }
+
+    #[test]
+    fn cspace_can_grow_beyond_profile_default_max() {
+        let cspace = CapabilitySpace::try_with_slots(MAX_CAPABILITIES_PER_CSPACE + 1)
+            .expect("allocation should succeed");
+        assert_eq!(cspace.capacity(), MAX_CAPABILITIES_PER_CSPACE + 1);
     }
 
     #[test]
