@@ -120,24 +120,19 @@ impl KernelState {
         let mut telemetry = ProcessCnodeCleanupTelemetry::default();
 
         loop {
-            let live_caps = self.with_capability_state(|capability| {
+            let next_live_cap = self.with_capability_state(|capability| {
                 capability
                     .cnode_spaces
                     .iter()
                     .flatten()
                     .find(|space| space.id == cnode)
-                    .map(|space| kernel_ref(&space.cspace).live_cap_ids())
-                    .unwrap_or([None; MAX_CAPABILITIES_PER_CSPACE])
+                    .and_then(|space| kernel_ref(&space.cspace).live_cap_ids().next())
             });
-            let mut revoked_any = false;
-            for cap in live_caps.into_iter().flatten() {
-                if self.revoke_capability_in_cnode(cnode, cap).is_ok() {
-                    revoked_any = true;
-                    telemetry.revoked_caps = telemetry.revoked_caps.saturating_add(1);
-                }
-            }
-            if !revoked_any {
+            let Some(cap) = next_live_cap else {
                 break;
+            };
+            if self.revoke_capability_in_cnode(cnode, cap).is_ok() {
+                telemetry.revoked_caps = telemetry.revoked_caps.saturating_add(1);
             }
         }
 

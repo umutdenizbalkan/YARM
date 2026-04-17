@@ -337,17 +337,16 @@ impl CapabilitySpace {
             .count()
     }
 
-    pub fn live_cap_ids(&self) -> [Option<CapId>; MAX_CAPABILITIES_PER_CSPACE] {
-        let mut ids = [None; MAX_CAPABILITIES_PER_CSPACE];
-        let mut used = 0usize;
-        for (index, slot) in self.slots.iter().take(self.slot_capacity).enumerate() {
-            if slot.entry.is_none() || used >= ids.len() {
-                continue;
-            }
-            ids[used] = Some(CapId::new(index, slot.generation));
-            used += 1;
-        }
-        ids
+    pub fn live_cap_ids(&self) -> impl Iterator<Item = CapId> + '_ {
+        self.slots
+            .iter()
+            .take(self.slot_capacity)
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.entry
+                    .as_ref()
+                    .map(|_| CapId::new(index, slot.generation))
+            })
     }
 }
 
@@ -562,6 +561,19 @@ mod tests {
             cspace.mint_at(4, Capability::new(CapObject::Kernel, CapRights::READ)),
             Err(CapabilityDeriveError::InvalidSlot)
         );
+    }
+
+    #[test]
+    fn live_cap_ids_iterator_reports_only_live_entries() {
+        let mut cspace = CapabilitySpace::with_slots(4);
+        let cap = Capability::new(CapObject::Kernel, CapRights::READ);
+        let first = cspace.mint_at(0, cap).expect("slot 0");
+        let second = cspace.mint_at(2, cap).expect("slot 2");
+
+        let mut ids = cspace.live_cap_ids();
+        assert_eq!(ids.next(), Some(first));
+        assert_eq!(ids.next(), Some(second));
+        assert_eq!(ids.next(), None);
     }
 
     #[test]

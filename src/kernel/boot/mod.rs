@@ -28,7 +28,7 @@ mod types;
 mod user_memory_state;
 
 use super::capabilities::{
-    CNodeId, CapId, CapObject, CapRights, Capability, CapabilitySpace, MAX_CAPABILITIES_PER_CSPACE,
+    CNodeId, CapId, CapObject, CapRights, Capability, CapabilitySpace,
 };
 #[cfg(test)]
 use super::ipc::EndpointMode;
