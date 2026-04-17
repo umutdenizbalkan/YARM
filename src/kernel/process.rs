@@ -267,6 +267,7 @@ struct ProcessRecord {
     exit_code: u64,
     image_id: u64,
     entry: u64,
+    requested_cnode_slots: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,10 +336,12 @@ impl ProcessManager {
             PROC_OP_SPAWN_V3 => {
                 let args = SpawnV3Args::decode(msg.as_slice())
                     .map_err(|_| ProcessManagerError::Malformed)?;
+                let requested_cnode_slots = usize::try_from(args.requested_cnode_slots)
+                    .map_err(|_| ProcessManagerError::Malformed)?;
                 Ok(ProcessRequest::SpawnV2(SpawnV2Request {
                     parent_pid: ProcessId(args.parent_pid),
                     image_id: args.image_id,
-                    requested_cnode_slots: usize::try_from(args.requested_cnode_slots).ok(),
+                    requested_cnode_slots: Some(requested_cnode_slots),
                 }))
             }
             PROC_OP_WAITPID_V2 => {
@@ -462,6 +465,7 @@ impl ProcessManager {
                 exit_code: 0,
                 image_id: 0,
                 entry: 0,
+                requested_cnode_slots: None,
             });
             self.register_thread_identity(pid, pid.0, ThreadGroupId(pid.0))?;
             Ok(pid)
@@ -499,6 +503,7 @@ impl ProcessManager {
             exit_code: code,
             image_id: 0,
             entry: 0,
+            requested_cnode_slots: None,
         });
         self.register_thread_identity(caller_pid, caller_tid, ThreadGroupId(caller_tid))?;
         Ok(())
@@ -552,6 +557,14 @@ impl ProcessManager {
             })
     }
 
+    pub fn process_requested_cnode_slots(&self, pid: ProcessId) -> Option<Option<usize>> {
+        self.table
+            .iter()
+            .flatten()
+            .find(|record| record.pid == pid)
+            .map(|record| record.requested_cnode_slots)
+    }
+
     pub fn handle_request(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
         match Self::parse_request(request)? {
             ProcessRequest::GetPid { caller_tid } => {
@@ -576,6 +589,9 @@ impl ProcessManager {
                     let image = Self::synthetic_elf_image(req.image_id);
                     let (pid, _) =
                         self.spawn_from_elf_image(req.parent_pid, req.image_id, &image)?;
+                    if let Some(record) = self.table.iter_mut().flatten().find(|r| r.pid == pid) {
+                        record.requested_cnode_slots = req.requested_cnode_slots;
+                    }
                     let result = SpawnV2Result { pid };
                     return Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
                         .map_err(|_| ProcessManagerError::Malformed);
@@ -710,6 +726,22 @@ mod tests {
                 requested_cnode_slots: Some(64),
             })
         );
+    }
+
+    #[test]
+    fn process_manager_v3_spawn_records_requested_cnode_slots() {
+        let mut pm = ProcessManager::new();
+        let spawn = Message::with_header(
+            0,
+            PROC_OP_SPAWN_V3,
+            0,
+            None,
+            &SpawnV3Args::new(1, 2, 96).encode(),
+        )
+        .expect("msg");
+        let spawn_reply = pm.handle_request(spawn).expect("handle");
+        let spawned = SpawnV2Result::decode(spawn_reply.as_slice()).expect("decode");
+        assert_eq!(pm.process_requested_cnode_slots(spawned.pid), Some(Some(96)));
     }
 
     #[test]

@@ -374,12 +374,13 @@ fn spawn_request_message(
     requested_cnode_slots: Option<usize>,
 ) -> Result<Message, ProcessManagerError> {
     if let Some(slots) = requested_cnode_slots {
+        let slots = u64::try_from(slots).map_err(|_| ProcessManagerError::Malformed)?;
         return Message::with_header(
             0,
             PROC_OP_SPAWN_V3,
             0,
             None,
-            &SpawnV3Args::new(parent_pid, image_id, slots as u64).encode(),
+            &SpawnV3Args::new(parent_pid, image_id, slots).encode(),
         )
         .map_err(|_| ProcessManagerError::Malformed);
     }
