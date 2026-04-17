@@ -79,6 +79,7 @@ struct CapSlot {
 pub struct CapabilitySpace {
     slots: Box<[CapSlot]>,
     slot_capacity: usize,
+    revoke_scratch_cache: Option<RevokeScratch>,
 }
 
 impl Default for CapabilitySpace {
@@ -88,6 +89,7 @@ impl Default for CapabilitySpace {
     }
 }
 
+#[derive(Debug, Clone)]
 struct RevokeScratch {
     child_heads: Vec<Option<usize>>,
     next_sibling: Vec<Option<usize>>,
@@ -119,6 +121,17 @@ impl RevokeScratch {
             stack,
         })
     }
+
+    fn capacity(&self) -> usize {
+        self.child_heads.len()
+    }
+
+    fn clear_for_len(&mut self, len: usize) {
+        self.child_heads[..len].fill(None);
+        self.next_sibling[..len].fill(None);
+        self.marked[..len].fill(false);
+        self.stack.clear();
+    }
 }
 
 impl CapabilitySpace {
@@ -138,6 +151,7 @@ impl CapabilitySpace {
         Ok(Self {
             slots: slots.into_boxed_slice(),
             slot_capacity: bounded_capacity,
+            revoke_scratch_cache: None,
         })
     }
 
@@ -188,6 +202,13 @@ impl CapabilitySpace {
         }
         self.slots = slots.into_boxed_slice();
         self.slot_capacity = slot_capacity;
+        if self
+            .revoke_scratch_cache
+            .as_ref()
+            .is_some_and(|scratch| scratch.capacity() < self.slot_capacity)
+        {
+            self.revoke_scratch_cache = None;
+        }
         Ok(())
     }
 
@@ -288,7 +309,8 @@ impl CapabilitySpace {
             return Err(CapabilityDeriveError::NotFound);
         }
 
-        let mut scratch = RevokeScratch::try_with_capacity(self.slot_capacity)?;
+        let mut scratch = self.take_revoke_scratch()?;
+        scratch.clear_for_len(self.slot_capacity);
         for idx in 0..self.slot_capacity {
             let Some(entry) = self.slots[idx].entry else {
                 continue;
@@ -342,7 +364,17 @@ impl CapabilitySpace {
             }
         }
 
+        self.revoke_scratch_cache = Some(scratch);
         Ok(())
+    }
+
+    fn take_revoke_scratch(&mut self) -> Result<RevokeScratch, CapabilityDeriveError> {
+        if let Some(scratch) = self.revoke_scratch_cache.take()
+            && scratch.capacity() >= self.slot_capacity
+        {
+            return Ok(scratch);
+        }
+        RevokeScratch::try_with_capacity(self.slot_capacity)
     }
 
     pub fn get(&self, id: CapId) -> Option<Capability> {
