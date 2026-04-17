@@ -707,6 +707,13 @@ mod tests {
     }
 
     #[test]
+    fn cspace_capacity_is_still_bounded_by_hard_representation_limit() {
+        let cspace = CapabilitySpace::try_with_slots(MAX_CAPABILITIES_PER_CSPACE_HARD + 1)
+            .expect("allocation should succeed with clamp");
+        assert_eq!(cspace.capacity(), MAX_CAPABILITIES_PER_CSPACE_HARD);
+    }
+
+    #[test]
     fn resize_within_existing_backing_updates_logical_capacity() {
         let mut cspace = CapabilitySpace::with_slots(8);
         cspace
@@ -743,6 +750,25 @@ mod tests {
         let telemetry = cspace.revoke_scratch_telemetry();
         assert!(telemetry.cache_misses >= 1);
         assert!(telemetry.cache_hits >= 1);
+    }
+
+    #[test]
+    fn revoke_scratch_worklists_scale_with_runtime_slot_capacity() {
+        let slot_capacity = MAX_CAPABILITIES_PER_CSPACE + 64;
+        let mut cspace = CapabilitySpace::try_with_slots(slot_capacity)
+            .expect("allocation should succeed");
+        let cap = Capability::new(CapObject::Kernel, CapRights::READ);
+
+        let root = cspace
+            .mint_at(slot_capacity - 1, cap)
+            .expect("root at high slot index");
+        let child = cspace
+            .mint_derived(root, CapRights::READ)
+            .expect("derived child");
+
+        cspace.revoke(root).expect("revoke should traverse dynamic worklists");
+        assert!(cspace.get(root).is_none());
+        assert!(cspace.get(child).is_none());
     }
 
     #[test]

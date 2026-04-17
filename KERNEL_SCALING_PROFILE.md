@@ -91,6 +91,7 @@ The current implementation is **dynamically sizable**, but not yet "fully dynami
 - ✅ Slot capacity is dynamic per cnode (`ensure_cnode_space_with_slots`, `resize_cnode_slots`).
 - ✅ Per-class defaults and request-time overrides are supported (policy-gated).
 - ✅ Capacity accounting is global-budget-aware (`max_total_cnode_slots`) and exposed in telemetry.
+- ✅ Revoke traversal scratch/worklists are allocator-backed (`Vec`) and sized to each cspace's runtime `slot_capacity` (no hidden fallback to `MAX_CAPABILITIES_PER_CSPACE` for traversal buffers).
 - ⚠️ Slot capacity is still hard-capped by `MAX_CAPABILITIES_PER_CSPACE_HARD`.
 - ⚠️ CNode registry count remains bounded by kernel capability table sizing (not allocator-unbounded).
 
