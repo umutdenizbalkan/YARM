@@ -57,8 +57,16 @@ impl Capability {
     }
 }
 
+/// Runtime default CNode slot capacity for hosted profile policy.
+///
+/// This is *not* a hard storage ceiling: CNodes are allocator-backed and may
+/// be resized at runtime subject to policy/accounting and `CapId` encodability.
 #[cfg(feature = "hosted-dev")]
 pub const MAX_CAPABILITIES_PER_CSPACE: usize = 1024;
+/// Runtime default CNode slot capacity for non-hosted profile policy.
+///
+/// This is *not* a hard storage ceiling: CNodes are allocator-backed and may
+/// be resized at runtime subject to policy/accounting and `CapId` encodability.
 #[cfg(not(feature = "hosted-dev"))]
 pub const MAX_CAPABILITIES_PER_CSPACE: usize = 512;
 

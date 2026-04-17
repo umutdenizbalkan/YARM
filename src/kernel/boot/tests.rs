@@ -2664,6 +2664,117 @@ fn capability_space_telemetry_tracks_revoke_scratch_cache_reuse() {
     assert!(telemetry.revoke_scratch_cache_hits >= 1);
 }
 
+fn total_reserved_cnode_slots(state: &KernelState) -> usize {
+    state.with_capability_state(|capability| {
+        capability
+            .cnode_spaces
+            .iter()
+            .flatten()
+            .map(|space| space.slot_capacity)
+            .sum()
+    })
+}
+
+#[test]
+fn cnode_resize_grow_updates_total_slot_accounting() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    state
+        .register_task_with_class(232, TaskClass::Driver)
+        .expect("driver task");
+    let cnode = state.process_cnode_for_pid(232).expect("cnode");
+    let before_total = total_reserved_cnode_slots(&state);
+    let before = state.cnode_slot_capacity(cnode).expect("capacity");
+    let grow_by = 7usize;
+
+    state
+        .resize_cnode_slots(cnode, before.saturating_add(grow_by))
+        .expect("grow");
+
+    let after_total = total_reserved_cnode_slots(&state);
+    assert_eq!(after_total, before_total.saturating_add(grow_by));
+}
+
+#[test]
+fn cnode_resize_shrink_updates_total_slot_accounting() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    state
+        .register_task_with_class(233, TaskClass::Driver)
+        .expect("driver task");
+    let cnode = state.process_cnode_for_pid(233).expect("cnode");
+    let before_total = total_reserved_cnode_slots(&state);
+    let before = state.cnode_slot_capacity(cnode).expect("capacity");
+    assert!(before > 8);
+    let shrink_by = 8usize;
+
+    state
+        .resize_cnode_slots(cnode, before.saturating_sub(shrink_by))
+        .expect("shrink");
+
+    let after_total = total_reserved_cnode_slots(&state);
+    assert_eq!(after_total, before_total.saturating_sub(shrink_by));
+}
+
+#[test]
+fn failed_cnode_grow_keeps_total_slot_accounting_unchanged() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    state
+        .register_task_with_class(234, TaskClass::Driver)
+        .expect("driver task");
+    let limits = state.runtime_capacity_config();
+    let cnode = state.process_cnode_for_pid(234).expect("cnode");
+    let before_total = total_reserved_cnode_slots(&state);
+    let before = state.cnode_slot_capacity(cnode).expect("capacity");
+    let over_budget_target = before
+        .saturating_add(limits.max_total_cnode_slots)
+        .saturating_add(1);
+
+    assert_eq!(
+        state.resize_cnode_slots(cnode, over_budget_target),
+        Err(KernelError::CapabilityFull)
+    );
+    assert_eq!(total_reserved_cnode_slots(&state), before_total);
+}
+
+#[test]
+fn process_cnode_cleanup_releases_total_slot_accounting() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    state
+        .register_task_with_class(235, TaskClass::Driver)
+        .expect("driver task");
+    let cnode = state.process_cnode_for_pid(235).expect("cnode");
+    let cnode_slots = state.cnode_slot_capacity(cnode).expect("capacity");
+    let before_total = total_reserved_cnode_slots(&state);
+
+    state.mark_task_dead(235).expect("dead");
+
+    let after_total = total_reserved_cnode_slots(&state);
+    assert_eq!(after_total, before_total.saturating_sub(cnode_slots));
+}
+
+#[test]
+fn repeated_cnode_resize_cycles_do_not_drift_total_slot_accounting() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    state
+        .register_task_with_class(236, TaskClass::Driver)
+        .expect("driver task");
+    let cnode = state.process_cnode_for_pid(236).expect("cnode");
+    let base = state.cnode_slot_capacity(cnode).expect("capacity");
+    let baseline_total = total_reserved_cnode_slots(&state);
+
+    for _ in 0..32 {
+        state
+            .resize_cnode_slots(cnode, base.saturating_add(9))
+            .expect("grow cycle");
+        state.resize_cnode_slots(cnode, base).expect("shrink cycle");
+        assert_eq!(total_reserved_cnode_slots(&state), baseline_total);
+    }
+}
+
 #[test]
 fn system_server_control_plane_can_resize_other_process_cnode() {
     let mut state = Bootstrap::init().expect("init");

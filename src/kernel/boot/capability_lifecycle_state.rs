@@ -4,6 +4,13 @@
 use super::*;
 
 impl KernelState {
+    /// Runtime bounds for a requested CNode slot capacity:
+    /// - must be non-zero
+    /// - must be within per-CNode policy (`max_capability_slots`)
+    /// - must fit within `CapId` index encoding
+    ///
+    /// Global pool accounting (`max_total_cnode_slots`) is enforced by the
+    /// caller before committing create/resize.
     fn normalize_requested_cnode_slots(
         slot_capacity: usize,
         limits: RuntimeCapacityConfig,
