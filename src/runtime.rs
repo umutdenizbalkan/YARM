@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::boot::{KernelError, KernelState};
+use crate::kernel::boot::{KernelError, KernelState, TrapHandleError};
 use crate::kernel::lock::SpinLock;
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
@@ -38,6 +38,16 @@ impl SharedKernel {
         guard.set_current_cpu(cpu)?;
         Ok(f(&mut guard))
     }
+
+    pub fn control_plane_set_process_cnode_slots_via_syscall(
+        &self,
+        target_pid: u64,
+        slot_capacity: usize,
+    ) -> Result<(), TrapHandleError> {
+        self.with(|state| {
+            state.control_plane_set_process_cnode_slots_via_syscall(target_pid, slot_capacity)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -49,6 +59,7 @@ mod tests {
     use crate::kernel::ipc::ThreadId;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::smp::WorkItem;
+    use crate::kernel::task::TaskClass;
     use std::sync::Arc;
     use std::thread;
 
@@ -140,5 +151,61 @@ mod tests {
                 .expect("drain cpu0")
         });
         assert_eq!(drained_cpu0, 64);
+    }
+
+    #[test]
+    fn shared_kernel_control_plane_syscall_wrapper_resizes_target_cnode() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state
+                .register_task_with_class(900, TaskClass::SystemServer)
+                .expect("system server");
+            state
+                .register_task_with_class(901, TaskClass::App)
+                .expect("target app");
+            state.enqueue_current_cpu(900).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(900) {
+                state.yield_current().expect("switch");
+            }
+        });
+
+        let (target_cnode, before) = kernel.with(|state| {
+            let cnode = state.process_cnode_for_pid(901).expect("target cnode");
+            let before = state.cnode_slot_capacity(cnode).expect("before");
+            (cnode, before)
+        });
+        let requested = before.saturating_add(4);
+        kernel
+            .control_plane_set_process_cnode_slots_via_syscall(901, requested)
+            .expect("resize");
+        let after = kernel.with(|state| state.cnode_slot_capacity(target_cnode));
+        assert_eq!(after, Some(requested));
+    }
+
+    #[test]
+    fn shared_kernel_control_plane_syscall_wrapper_denies_unprivileged_cross_process_resize() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state
+                .register_task_with_class(910, TaskClass::App)
+                .expect("requester");
+            state
+                .register_task_with_class(911, TaskClass::App)
+                .expect("target");
+            state.enqueue_current_cpu(910).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(910) {
+                state.yield_current().expect("switch");
+            }
+        });
+
+        let err = kernel
+            .control_plane_set_process_cnode_slots_via_syscall(911, 8)
+            .expect_err("must deny");
+        assert_eq!(
+            err,
+            TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::MissingRight)
+        );
     }
 }
