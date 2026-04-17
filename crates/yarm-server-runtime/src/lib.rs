@@ -3,6 +3,11 @@
 
 #![no_std]
 
+#[cfg(not(feature = "hosted-dev"))]
+#[global_allocator]
+static KERNEL_GLOBAL_ALLOCATOR: yarm::kernel::global_allocator::KernelGlobalAllocator =
+    yarm::kernel::global_allocator::KERNEL_GLOBAL_ALLOCATOR;
+
 pub mod control_plane {
     pub fn run_init_server() {
         yarm::services::control_plane::init::run();
