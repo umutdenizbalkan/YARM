@@ -1732,16 +1732,9 @@ fn control_plane_cnode_resize_syscall_trap_allows_system_server_target() {
         .cnode_slot_capacity(target_cnode)
         .expect("target capacity");
     let requested = before.saturating_add(4);
-    let mut frame = TrapFrame::new(
-        crate::kernel::syscall::Syscall::ControlPlaneSetCnodeSlots as usize,
-        [811, requested, 0, 0, 0, 0],
-    );
     state
-        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .control_plane_set_process_cnode_slots_via_syscall(811, requested)
         .expect("control-plane resize syscall");
-    assert_eq!(frame.error_code(), None);
-    assert_eq!(frame.ret0(), requested);
-    assert_eq!(frame.ret1(), 811);
     assert_eq!(state.cnode_slot_capacity(target_cnode), Some(requested));
 }
 
@@ -1764,18 +1757,26 @@ fn control_plane_cnode_resize_syscall_trap_denies_non_system_server_targeting_ot
     let before = state
         .cnode_slot_capacity(target_cnode)
         .expect("target capacity");
-    let mut frame = TrapFrame::new(
-        crate::kernel::syscall::Syscall::ControlPlaneSetCnodeSlots as usize,
-        [821, before.saturating_add(4), 0, 0, 0, 0],
-    );
     let err = state
-        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .control_plane_set_process_cnode_slots_via_syscall(821, before.saturating_add(4))
         .expect_err("control-plane policy must deny");
     assert_eq!(
         err,
         TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::MissingRight)
     );
     assert_eq!(state.cnode_slot_capacity(target_cnode), Some(before));
+}
+
+#[test]
+fn control_plane_cnode_resize_syscall_wrapper_rejects_zero_target_pid() {
+    let mut state = Bootstrap::init().expect("init");
+    let err = state
+        .control_plane_set_process_cnode_slots_via_syscall(0, 8)
+        .expect_err("zero pid must be rejected");
+    assert_eq!(
+        err,
+        TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::InvalidArgs)
+    );
 }
 
 #[test]

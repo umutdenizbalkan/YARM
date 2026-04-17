@@ -4,7 +4,7 @@
 use super::{KernelError, KernelState, TrapHandleError};
 use crate::arch::hal::Hal;
 use crate::kernel::ipc::Message;
-use crate::kernel::syscall::{SyscallError, dispatch as dispatch_syscall};
+use crate::kernel::syscall::{Syscall, SyscallError, dispatch as dispatch_syscall};
 use crate::kernel::task::FaultPolicy;
 use crate::kernel::task::TaskStatus;
 use crate::kernel::trap::{FaultAccess, Trap, TrapEvent};
@@ -191,6 +191,21 @@ impl KernelState {
             }
             Trap::PageFault | Trap::ExternalInterrupt | Trap::Unknown => Ok(()),
         }
+    }
+
+    pub fn control_plane_set_process_cnode_slots_via_syscall(
+        &mut self,
+        target_pid: u64,
+        slot_capacity: usize,
+    ) -> Result<(), TrapHandleError> {
+        let Ok(target_pid_arg) = usize::try_from(target_pid) else {
+            return Err(TrapHandleError::Syscall(SyscallError::InvalidArgs));
+        };
+        let mut frame = TrapFrame::new(
+            Syscall::ControlPlaneSetCnodeSlots as usize,
+            [target_pid_arg, slot_capacity, 0, 0, 0, 0],
+        );
+        self.handle_trap(Trap::Syscall, Some(&mut frame))
     }
 
     pub fn handle_selected_arch_trap_entry(
