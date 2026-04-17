@@ -17,6 +17,7 @@ mod non_hosted {
     const SLAB_CLASS_SIZES: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
     const SMALL_ALLOC_MAX: usize = 2048;
     const FREE_NONE: u16 = u16::MAX;
+    const KEEP_ONE_WARM_EMPTY_PAGE_PER_CLASS: bool = true;
     const SLAB_MAGIC: u64 = 0x5941_524d_534c_4142; // "YARMSLAB"
     const LARGE_MAGIC: u64 = 0x5941_524d_4c41_5247; // "YARMLARG"
 
@@ -250,6 +251,72 @@ mod non_hosted {
             true
         }
 
+        unsafe fn unlink_slab_page(
+            state: &mut AllocatorState,
+            class_idx: usize,
+            target_phys: u64,
+        ) -> bool {
+            let mut prev_phys = 0u64;
+            let mut phys = state.class_heads_phys[class_idx];
+            while phys != 0 {
+                let page_ptr = Self::phys_to_ptr(phys);
+                if page_ptr.is_null() {
+                    return false;
+                }
+                let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
+                let next = header.next_page_phys;
+                if phys == target_phys {
+                    if prev_phys == 0 {
+                        state.class_heads_phys[class_idx] = next;
+                    } else {
+                        let prev_ptr = Self::phys_to_ptr(prev_phys);
+                        if prev_ptr.is_null() {
+                            return false;
+                        }
+                        let prev_header = unsafe { &mut *(prev_ptr as *mut SlabPageHeader) };
+                        prev_header.next_page_phys = next;
+                    }
+                    return true;
+                }
+                prev_phys = phys;
+                phys = next;
+            }
+            false
+        }
+
+        unsafe fn try_reclaim_empty_slab_page(
+            state: &mut AllocatorState,
+            class_idx: usize,
+            target_page_ptr: *mut u8,
+        ) {
+            let target_phys = Self::ptr_to_phys(target_page_ptr as *const u8);
+            let mut empty_pages = 0usize;
+            let mut phys = state.class_heads_phys[class_idx];
+            while phys != 0 {
+                let page_ptr = Self::phys_to_ptr(phys);
+                if page_ptr.is_null() {
+                    return;
+                }
+                let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
+                if header.magic == SLAB_MAGIC
+                    && header.class_idx as usize == class_idx
+                    && header.used == 0
+                {
+                    empty_pages = empty_pages.saturating_add(1);
+                }
+                phys = header.next_page_phys;
+            }
+
+            let should_keep_warm = KEEP_ONE_WARM_EMPTY_PAGE_PER_CLASS && empty_pages <= 1;
+            if should_keep_warm {
+                return;
+            }
+
+            if unsafe { Self::unlink_slab_page(state, class_idx, target_phys) } {
+                let _ = free_pt_frame(target_phys);
+            }
+        }
+
         unsafe fn alloc_small(state: &mut AllocatorState, class_idx: usize) -> *mut u8 {
             let mut phys = state.class_heads_phys[class_idx];
             while phys != 0 {
@@ -326,14 +393,21 @@ mod non_hosted {
                 return;
             }
 
-            let _state = ALLOCATOR_LOCK.lock();
+            let mut state = ALLOCATOR_LOCK.lock();
 
             let page_base = (ptr as usize) & !(PAGE_SIZE - 1);
             let page_ptr = page_base as *mut u8;
             if !page_ptr.is_null() {
                 let magic = unsafe { core::ptr::read_unaligned(page_ptr as *const u64) };
                 if magic == SLAB_MAGIC {
-                    let _ = unsafe { Self::slab_dealloc_from_page(page_ptr, ptr) };
+                    let ok = unsafe { Self::slab_dealloc_from_page(page_ptr, ptr) };
+                    if ok {
+                        let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
+                        let class_idx = header.class_idx as usize;
+                        if class_idx < SLAB_CLASS_SIZES.len() && header.used == 0 {
+                            unsafe { Self::try_reclaim_empty_slab_page(&mut state, class_idx, page_ptr) };
+                        }
+                    }
                     return;
                 }
             }
@@ -399,6 +473,7 @@ mod hosted_dev_allocator_model_tests {
         let start = align_up(SLAB_HEADER_BYTES, obj);
         (PAGE_SIZE - start) / obj
     }
+    const KEEP_ONE_WARM_EMPTY_PAGE_PER_CLASS: bool = true;
 
     #[derive(Default)]
     struct ClassPool {
@@ -411,6 +486,97 @@ mod hosted_dev_allocator_model_tests {
         next_addr: usize,
         small: [ClassPool; CLASS_SIZES.len()],
         live_large: BTreeSet<usize>,
+    }
+
+    #[derive(Default)]
+    struct ReclaimPage {
+        free: Vec<usize>,
+        live: BTreeSet<usize>,
+    }
+
+    #[derive(Default)]
+    struct ReclaimClassPool {
+        pages: Vec<ReclaimPage>,
+        reclaimed_pages: usize,
+    }
+
+    struct ReclaimModelAlloc {
+        next_addr: usize,
+        classes: [ReclaimClassPool; CLASS_SIZES.len()],
+    }
+
+    impl ReclaimModelAlloc {
+        fn new() -> Self {
+            Self {
+                next_addr: 0x2000_0000,
+                classes: array::from_fn(|_| ReclaimClassPool::default()),
+            }
+        }
+
+        fn class_for(size: usize, align: usize) -> Option<usize> {
+            ModelAlloc::class_for(size, align)
+        }
+
+        fn alloc(&mut self, size: usize, align: usize) -> Option<usize> {
+            let class_idx = Self::class_for(size, align)?;
+            let obj = CLASS_SIZES[class_idx];
+            for page in &mut self.classes[class_idx].pages {
+                if let Some(ptr) = page.free.pop() {
+                    page.live.insert(ptr);
+                    return Some(ptr);
+                }
+            }
+
+            let cap = class_capacity(class_idx);
+            let start = align_up(SLAB_HEADER_BYTES, obj);
+            let base = align_up(self.next_addr, PAGE_SIZE);
+            self.next_addr = base + PAGE_SIZE;
+            let mut page = ReclaimPage::default();
+            for idx in 0..cap {
+                page.free.push(base + start + idx * obj);
+            }
+            let ptr = page.free.pop()?;
+            page.live.insert(ptr);
+            self.classes[class_idx].pages.push(page);
+            Some(ptr)
+        }
+
+        fn dealloc(&mut self, size: usize, align: usize, ptr: usize) -> bool {
+            let Some(class_idx) = Self::class_for(size, align) else {
+                return false;
+            };
+            let mut target_page_idx = None;
+            for (idx, page) in self.classes[class_idx].pages.iter_mut().enumerate() {
+                if page.live.remove(&ptr) {
+                    page.free.push(ptr);
+                    target_page_idx = Some(idx);
+                    break;
+                }
+            }
+            let Some(page_idx) = target_page_idx else {
+                return false;
+            };
+
+            let cap = class_capacity(class_idx);
+            let page_is_empty = self.classes[class_idx].pages[page_idx].live.is_empty()
+                && self.classes[class_idx].pages[page_idx].free.len() == cap;
+            if !page_is_empty {
+                return true;
+            }
+
+            let empty_pages = self.classes[class_idx]
+                .pages
+                .iter()
+                .filter(|page| page.live.is_empty() && page.free.len() == cap)
+                .count();
+            if KEEP_ONE_WARM_EMPTY_PAGE_PER_CLASS && empty_pages <= 1 {
+                return true;
+            }
+
+            self.classes[class_idx].pages.swap_remove(page_idx);
+            self.classes[class_idx].reclaimed_pages += 1;
+            true
+        }
     }
 
     impl ModelAlloc {
@@ -671,5 +837,83 @@ mod hosted_dev_allocator_model_tests {
         }
         assert!(transitions >= 3);
         assert!(a.dealloc(cap * elem_size, elem_size, current_ptr));
+    }
+
+    #[test]
+    fn empty_page_gets_reclaimed_when_multiple_empty_pages_exist() {
+        let mut a = ReclaimModelAlloc::new();
+        let class_idx = ReclaimModelAlloc::class_for(16, 8).expect("class");
+        let cap = class_capacity(class_idx);
+        let total = cap * 2;
+        let mut ptrs = Vec::new();
+        for _ in 0..total {
+            ptrs.push(a.alloc(16, 8).expect("alloc"));
+        }
+        assert!(a.classes[class_idx].pages.len() >= 2);
+        for ptr in ptrs {
+            assert!(a.dealloc(16, 8, ptr));
+        }
+        assert_eq!(a.classes[class_idx].pages.len(), 1);
+        assert!(a.classes[class_idx].reclaimed_pages >= 1);
+    }
+
+    #[test]
+    fn warm_page_policy_keeps_one_empty_page_per_class() {
+        let mut a = ReclaimModelAlloc::new();
+        let class_idx = ReclaimModelAlloc::class_for(64, 8).expect("class");
+        let cap = class_capacity(class_idx);
+        let mut ptrs = Vec::new();
+        for _ in 0..cap {
+            ptrs.push(a.alloc(64, 8).expect("alloc"));
+        }
+        for ptr in ptrs {
+            assert!(a.dealloc(64, 8, ptr));
+        }
+        assert_eq!(a.classes[class_idx].pages.len(), 1);
+        assert_eq!(a.classes[class_idx].reclaimed_pages, 0);
+    }
+
+    #[test]
+    fn repeated_reallocate_after_reclamation_still_works() {
+        let mut a = ReclaimModelAlloc::new();
+        let class_idx = ReclaimModelAlloc::class_for(32, 8).expect("class");
+        let cap = class_capacity(class_idx);
+        for _ in 0..32 {
+            let mut ptrs = Vec::new();
+            for _ in 0..(cap * 2 + 7) {
+                ptrs.push(a.alloc(32, 8).expect("alloc"));
+            }
+            for ptr in ptrs {
+                assert!(a.dealloc(32, 8, ptr));
+            }
+            assert!(a.classes[class_idx].pages.len() <= 1);
+        }
+    }
+
+    #[test]
+    fn reclamation_does_not_corrupt_other_classes() {
+        let mut a = ReclaimModelAlloc::new();
+        let class_a = ReclaimModelAlloc::class_for(16, 8).expect("class a");
+        let class_b = ReclaimModelAlloc::class_for(512, 8).expect("class b");
+        let cap_a = class_capacity(class_a);
+        let mut a_ptrs = Vec::new();
+        let mut b_ptrs = Vec::new();
+
+        for _ in 0..(cap_a * 2 + 1) {
+            a_ptrs.push(a.alloc(16, 8).expect("alloc a"));
+        }
+        for _ in 0..8 {
+            b_ptrs.push(a.alloc(512, 8).expect("alloc b"));
+        }
+        for ptr in a_ptrs {
+            assert!(a.dealloc(16, 8, ptr));
+        }
+        assert!(a.classes[class_a].reclaimed_pages >= 1);
+        for ptr in b_ptrs {
+            assert!(a.dealloc(512, 8, ptr));
+        }
+        assert!(a.classes[class_b].pages.len() <= 1);
+        let again_b = a.alloc(512, 8).expect("realloc b");
+        assert!(a.dealloc(512, 8, again_b));
     }
 }
