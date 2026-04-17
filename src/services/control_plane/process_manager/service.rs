@@ -6,6 +6,7 @@ use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 use crate::kernel::process::ProcessManagerError;
 use crate::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
+use crate::runtime::SharedKernel;
 use crate::services::common::service::{RequestResponseService, run_typed_request_loop};
 use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args,
@@ -487,6 +488,23 @@ pub fn run_request_loop_over_kernel_ipc(
     })
 }
 
+pub fn run_request_loop_over_shared_kernel_with_cnode_resize(
+    kernel: &SharedKernel,
+    service: &mut ProcessService,
+    parent_pid: u64,
+    image_id: u64,
+    exit_code: u64,
+    requested_cnode_slots: usize,
+) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
+    let summary = kernel.with(|state| {
+        run_request_loop_over_kernel_ipc(state, service, parent_pid, image_id, exit_code)
+    })?;
+    kernel
+        .control_plane_set_process_cnode_slots_via_syscall(summary.spawned_pid, requested_cnode_slots)
+        .map_err(|_| ProcessManagerError::Malformed)?;
+    Ok(summary)
+}
+
 pub fn run() {
     let mut service = ProcessService::new();
     let summary = run_request_loop(&mut service, 1, 42, 0).expect("process-manager loop");
@@ -503,6 +521,7 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
+    use crate::kernel::task::TaskClass;
 
     fn synthetic_elf_image(entry: u64) -> [u8; 160] {
         let mut image = [0u8; 160];
@@ -551,6 +570,46 @@ mod tests {
         assert_eq!(summary.spawned_pid, summary.waited_pid);
         assert_eq!(summary.waited_exit, 9);
         assert_eq!(summary.handled, 3);
+    }
+
+    #[test]
+    fn process_manager_shared_kernel_path_can_resize_spawned_process_cnode() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("kernel init"));
+        kernel.with(|state| {
+            state
+                .register_task_with_class(960, TaskClass::SystemServer)
+                .expect("system-server");
+            state.enqueue_current_cpu(960).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(960) {
+                state.yield_current().expect("switch");
+            }
+        });
+
+        let mut service = ProcessService::new();
+        let requested = kernel.with(|state| {
+            state
+                .runtime_capacity_config()
+                .default_cnode_slot_capacity
+                .saturating_add(4)
+        });
+        let summary = run_request_loop_over_shared_kernel_with_cnode_resize(
+            &kernel,
+            &mut service,
+            7,
+            42,
+            9,
+            requested,
+        )
+        .expect("shared-kernel loop");
+
+        let cnode_slots = kernel.with(|state| {
+            let cnode = state
+                .process_cnode_for_pid(summary.spawned_pid)
+                .expect("spawned cnode");
+            state.cnode_slot_capacity(cnode)
+        });
+        assert_eq!(cnode_slots, Some(requested));
     }
 
     #[test]
