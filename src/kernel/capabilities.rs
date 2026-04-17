@@ -78,6 +78,7 @@ struct CapSlot {
 #[derive(Debug, Clone)]
 pub struct CapabilitySpace {
     slots: Box<[CapSlot]>,
+    slot_capacity: usize,
 }
 
 impl Default for CapabilitySpace {
@@ -136,6 +137,7 @@ impl CapabilitySpace {
         );
         Ok(Self {
             slots: slots.into_boxed_slice(),
+            slot_capacity: bounded_capacity,
         })
     }
 
@@ -144,31 +146,40 @@ impl CapabilitySpace {
     }
 
     pub fn capacity(&self) -> usize {
-        self.slots.len()
+        self.slot_capacity
     }
 
     pub fn resize_slots(&mut self, slot_capacity: usize) -> Result<(), CapabilityDeriveError> {
         if slot_capacity == 0 || slot_capacity > MAX_CAPABILITIES_PER_CSPACE_HARD {
             return Err(CapabilityDeriveError::InvalidSlot);
         }
-        if slot_capacity == self.slots.len() {
+        if slot_capacity == self.slot_capacity {
             return Ok(());
         }
-        if slot_capacity < self.slots.len()
-            && self.slots[slot_capacity..]
+        if slot_capacity < self.slot_capacity
+            && self.slots[slot_capacity..self.slot_capacity]
                 .iter()
                 .any(|slot| slot.entry.is_some())
         {
             return Err(CapabilityDeriveError::SpaceFull);
         }
+        if slot_capacity <= self.slots.len() {
+            self.slot_capacity = slot_capacity;
+            return Ok(());
+        }
+        let target_backing = slot_capacity.next_power_of_two();
+        let target_backing = core::cmp::min(target_backing, MAX_CAPABILITIES_PER_CSPACE_HARD);
+        if target_backing < slot_capacity {
+            return Err(CapabilityDeriveError::InvalidSlot);
+        }
         let mut slots = Vec::new();
         slots
-            .try_reserve_exact(slot_capacity)
+            .try_reserve_exact(target_backing)
             .map_err(|_| CapabilityDeriveError::AllocFailed)?;
-        slots.extend_from_slice(&self.slots[..core::cmp::min(self.slots.len(), slot_capacity)]);
-        if slot_capacity > slots.len() {
+        slots.extend_from_slice(&self.slots[..self.slot_capacity]);
+        if target_backing > slots.len() {
             slots.resize(
-                slot_capacity,
+                target_backing,
                 CapSlot {
                     generation: 1,
                     entry: None,
@@ -176,12 +187,14 @@ impl CapabilitySpace {
             );
         }
         self.slots = slots.into_boxed_slice();
+        self.slot_capacity = slot_capacity;
         Ok(())
     }
 
     pub fn occupied_slots(&self) -> usize {
         self.slots
             .iter()
+            .take(self.slot_capacity)
             .filter(|slot| slot.entry.is_some())
             .count()
     }
@@ -195,7 +208,7 @@ impl CapabilitySpace {
         capability: Capability,
         parent: Option<CapId>,
     ) -> Result<CapId, CapabilityDeriveError> {
-        for index in 0..self.slots.len() {
+        for index in 0..self.slot_capacity {
             let slot = &mut self.slots[index];
             if slot.entry.is_none() {
                 let id = CapId::new(index, slot.generation);
@@ -223,7 +236,7 @@ impl CapabilitySpace {
         slot_index: usize,
         capability: Capability,
     ) -> Result<CapId, CapabilityDeriveError> {
-        if slot_index >= self.slots.len() {
+        if slot_index >= self.slot_capacity {
             return Err(CapabilityDeriveError::InvalidSlot);
         }
         let slot = &mut self.slots[slot_index];
@@ -275,8 +288,8 @@ impl CapabilitySpace {
             return Err(CapabilityDeriveError::NotFound);
         }
 
-        let mut scratch = RevokeScratch::try_with_capacity(self.slots.len())?;
-        for idx in 0..self.slots.len() {
+        let mut scratch = RevokeScratch::try_with_capacity(self.slot_capacity)?;
+        for idx in 0..self.slot_capacity {
             let Some(entry) = self.slots[idx].entry else {
                 continue;
             };
@@ -284,7 +297,7 @@ impl CapabilitySpace {
                 continue;
             };
             let parent_idx = parent.index();
-            if parent_idx >= self.slots.len() {
+            if parent_idx >= self.slot_capacity {
                 continue;
             }
             if self.slots[parent_idx].generation != parent.generation() {
@@ -315,7 +328,7 @@ impl CapabilitySpace {
             .marked
             .iter()
             .copied()
-            .take(self.slots.len())
+            .take(self.slot_capacity)
             .enumerate()
         {
             if !is_marked {
@@ -334,7 +347,7 @@ impl CapabilitySpace {
 
     pub fn get(&self, id: CapId) -> Option<Capability> {
         let index = id.index();
-        if index >= self.slots.len() {
+        if index >= self.slot_capacity {
             return None;
         }
         let slot = self.slots[index];
@@ -357,6 +370,7 @@ impl CapabilitySpace {
     pub fn object_refcount(&self, object: CapObject) -> usize {
         self.slots
             .iter()
+            .take(self.slot_capacity)
             .filter_map(|slot| slot.entry)
             .filter(|entry| entry.capability.object == object)
             .count()
@@ -365,6 +379,7 @@ impl CapabilitySpace {
     pub fn memory_object_id_refcount(&self, id: u64) -> usize {
         self.slots
             .iter()
+            .take(self.slot_capacity)
             .filter_map(|slot| slot.entry)
             .filter(|entry| {
                 matches!(
@@ -380,6 +395,7 @@ impl CapabilitySpace {
     pub fn live_cap_ids(&self) -> impl Iterator<Item = CapId> + '_ {
         self.slots
             .iter()
+            .take(self.slot_capacity)
             .enumerate()
             .filter_map(|(index, slot)| {
                 slot.entry
@@ -632,6 +648,29 @@ mod tests {
         let cspace = CapabilitySpace::try_with_slots(MAX_CAPABILITIES_PER_CSPACE + 1)
             .expect("allocation should succeed");
         assert_eq!(cspace.capacity(), MAX_CAPABILITIES_PER_CSPACE + 1);
+    }
+
+    #[test]
+    fn resize_within_existing_backing_updates_logical_capacity() {
+        let mut cspace = CapabilitySpace::with_slots(8);
+        cspace
+            .mint_at(7, Capability::new(CapObject::Kernel, CapRights::READ))
+            .expect("slot 7");
+        cspace.resize_slots(8).expect("same size");
+        cspace.revoke(CapId::new(7, 1)).expect("revoke");
+
+        cspace.resize_slots(4).expect("shrink logical");
+        assert_eq!(
+            cspace.mint_at(5, Capability::new(CapObject::Kernel, CapRights::READ)),
+            Err(CapabilityDeriveError::InvalidSlot)
+        );
+
+        cspace.resize_slots(6).expect("grow logical");
+        assert_eq!(
+            cspace.mint_at(5, Capability::new(CapObject::Kernel, CapRights::READ))
+                .map(|cap| cap.index()),
+            Ok(5)
+        );
     }
 
     #[test]
