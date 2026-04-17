@@ -4,9 +4,10 @@
 use super::ipc::Message;
 use super::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
-    PROC_OP_WAITPID_V2, SpawnV2Args, SpawnV3Args, WaitPidV2Args, WaitPidV2Reply,
+    PROC_OP_SPAWN_V4, PROC_OP_WAITPID_V2, SpawnV2Args, SpawnV3Args, SpawnV4Args, WaitPidV2Args,
+    WaitPidV2Reply,
 };
-use super::task::ThreadGroupId;
+use super::task::{TaskClass, ThreadGroupId};
 
 const MAX_PROCESSES: usize = 64;
 const MAX_THREADS: usize = 128;
@@ -30,6 +31,7 @@ pub struct SpawnV2Request {
     pub parent_pid: ProcessId,
     pub image_id: u64,
     pub requested_cnode_slots: Option<usize>,
+    pub requested_task_class: Option<TaskClass>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +270,7 @@ struct ProcessRecord {
     image_id: u64,
     entry: u64,
     requested_cnode_slots: Option<usize>,
+    requested_task_class: Option<TaskClass>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +334,7 @@ impl ProcessManager {
                     parent_pid: ProcessId(args.parent_pid),
                     image_id: args.image_id,
                     requested_cnode_slots: None,
+                    requested_task_class: None,
                 }))
             }
             PROC_OP_SPAWN_V3 => {
@@ -342,6 +346,25 @@ impl ProcessManager {
                     parent_pid: ProcessId(args.parent_pid),
                     image_id: args.image_id,
                     requested_cnode_slots: Some(requested_cnode_slots),
+                    requested_task_class: None,
+                }))
+            }
+            PROC_OP_SPAWN_V4 => {
+                let args = SpawnV4Args::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                let requested_cnode_slots = usize::try_from(args.requested_cnode_slots)
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                let requested_task_class = match args.task_class_hint {
+                    0 => TaskClass::App,
+                    1 => TaskClass::Driver,
+                    2 => TaskClass::SystemServer,
+                    _ => return Err(ProcessManagerError::Malformed),
+                };
+                Ok(ProcessRequest::SpawnV2(SpawnV2Request {
+                    parent_pid: ProcessId(args.parent_pid),
+                    image_id: args.image_id,
+                    requested_cnode_slots: Some(requested_cnode_slots),
+                    requested_task_class: Some(requested_task_class),
                 }))
             }
             PROC_OP_WAITPID_V2 => {
@@ -408,6 +431,7 @@ impl ProcessManager {
         image_id: u64,
         image: &[u8],
         requested_cnode_slots: Option<usize>,
+        requested_task_class: Option<TaskClass>,
     ) -> Result<(ProcessId, ElfImageInfo), ProcessManagerError> {
         let info = ElfImageInfo::parse(image_id, image)?;
         let pid = self.alloc_process(parent_pid)?;
@@ -420,6 +444,7 @@ impl ProcessManager {
             record.image_id = info.image_id;
             record.entry = info.entry;
             record.requested_cnode_slots = requested_cnode_slots;
+            record.requested_task_class = requested_task_class;
         }
         Ok((pid, info))
     }
@@ -468,6 +493,7 @@ impl ProcessManager {
                 image_id: 0,
                 entry: 0,
                 requested_cnode_slots: None,
+                requested_task_class: None,
             });
             self.register_thread_identity(pid, pid.0, ThreadGroupId(pid.0))?;
             Ok(pid)
@@ -506,6 +532,7 @@ impl ProcessManager {
             image_id: 0,
             entry: 0,
             requested_cnode_slots: None,
+            requested_task_class: None,
         });
         self.register_thread_identity(caller_pid, caller_tid, ThreadGroupId(caller_tid))?;
         Ok(())
@@ -567,6 +594,14 @@ impl ProcessManager {
             .map(|record| record.requested_cnode_slots)
     }
 
+    pub fn process_requested_task_class(&self, pid: ProcessId) -> Option<Option<TaskClass>> {
+        self.table
+            .iter()
+            .flatten()
+            .find(|record| record.pid == pid)
+            .map(|record| record.requested_task_class)
+    }
+
     pub fn handle_request(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
         match Self::parse_request(request)? {
             ProcessRequest::GetPid { caller_tid } => {
@@ -594,6 +629,7 @@ impl ProcessManager {
                         req.image_id,
                         &image,
                         req.requested_cnode_slots,
+                        req.requested_task_class,
                     )?;
                     let result = SpawnV2Result { pid };
                     return Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
@@ -644,6 +680,10 @@ impl ProcessService {
         self.manager.process_requested_cnode_slots(ProcessId(pid))
     }
 
+    pub fn requested_task_class_for_process(&self, pid: u64) -> Option<Option<TaskClass>> {
+        self.manager.process_requested_task_class(ProcessId(pid))
+    }
+
     pub fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessManagerError> {
         self.manager.mark_exit(pid, code)
     }
@@ -668,7 +708,7 @@ impl ProcessService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm_ipc_abi::process_abi::{SpawnV2Args, SpawnV3Args, WaitPidV2Args};
+    use yarm_ipc_abi::process_abi::{SpawnV2Args, SpawnV3Args, SpawnV4Args, WaitPidV2Args};
 
     #[test]
     fn elf_image_info_parser_accepts_minimal_elf64_header() {
@@ -686,7 +726,7 @@ mod tests {
         image[24..32].copy_from_slice(&0x402000u64.to_le_bytes());
 
         let (pid, info) = pm
-            .spawn_from_elf_image(ProcessId(1), 9, &image, None)
+            .spawn_from_elf_image(ProcessId(1), 9, &image, None, None)
             .expect("spawn from image");
         assert!(pid >= ProcessId(1000));
         assert_eq!(info.image_id, 9);
@@ -710,6 +750,7 @@ mod tests {
                 parent_pid: ProcessId(7),
                 image_id: 99,
                 requested_cnode_slots: None,
+                requested_task_class: None,
             })
         );
     }
@@ -731,6 +772,29 @@ mod tests {
                 parent_pid: ProcessId(7),
                 image_id: 99,
                 requested_cnode_slots: Some(64),
+                requested_task_class: None,
+            })
+        );
+    }
+
+    #[test]
+    fn process_manager_parses_v4_payloads_with_requested_slots_and_class() {
+        let msg = Message::with_header(
+            0,
+            PROC_OP_SPAWN_V4,
+            0,
+            None,
+            &SpawnV4Args::new(7, 99, 64, 2).encode(),
+        )
+        .expect("msg");
+        let req = ProcessManager::parse_request(msg).expect("parse");
+        assert_eq!(
+            req,
+            ProcessRequest::SpawnV2(SpawnV2Request {
+                parent_pid: ProcessId(7),
+                image_id: 99,
+                requested_cnode_slots: Some(64),
+                requested_task_class: Some(TaskClass::SystemServer),
             })
         );
     }
@@ -749,6 +813,27 @@ mod tests {
         let spawn_reply = pm.handle_request(spawn).expect("handle");
         let spawned = SpawnV2Result::decode(spawn_reply.as_slice()).expect("decode");
         assert_eq!(pm.process_requested_cnode_slots(spawned.pid), Some(Some(96)));
+        assert_eq!(pm.process_requested_task_class(spawned.pid), Some(None));
+    }
+
+    #[test]
+    fn process_manager_v4_spawn_records_requested_slots_and_task_class() {
+        let mut pm = ProcessManager::new();
+        let spawn = Message::with_header(
+            0,
+            PROC_OP_SPAWN_V4,
+            0,
+            None,
+            &SpawnV4Args::new(1, 2, 96, 1).encode(),
+        )
+        .expect("msg");
+        let spawn_reply = pm.handle_request(spawn).expect("handle");
+        let spawned = SpawnV2Result::decode(spawn_reply.as_slice()).expect("decode");
+        assert_eq!(pm.process_requested_cnode_slots(spawned.pid), Some(Some(96)));
+        assert_eq!(
+            pm.process_requested_task_class(spawned.pid),
+            Some(Some(TaskClass::Driver))
+        );
     }
 
     #[test]

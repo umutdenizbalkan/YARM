@@ -6,11 +6,12 @@ use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 use crate::kernel::process::ProcessManagerError;
 use crate::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
+use crate::kernel::task::TaskClass;
 use crate::runtime::SharedKernel;
 use crate::services::common::service::{RequestResponseService, run_typed_request_loop};
 use yarm_ipc_abi::process_abi::{
-    PROC_OP_EXIT, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3, PROC_OP_WAITPID_V2, SpawnV2Args,
-    SpawnV3Args, WaitPidV2Args,
+    PROC_OP_EXIT, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4, PROC_OP_WAITPID_V2,
+    SpawnV2Args, SpawnV3Args, SpawnV4Args, WaitPidV2Args,
 };
 
 const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
@@ -372,7 +373,24 @@ fn spawn_request_message(
     parent_pid: u64,
     image_id: u64,
     requested_cnode_slots: Option<usize>,
+    requested_task_class: Option<TaskClass>,
 ) -> Result<Message, ProcessManagerError> {
+    if let (Some(slots), Some(task_class)) = (requested_cnode_slots, requested_task_class) {
+        let slots = u64::try_from(slots).map_err(|_| ProcessManagerError::Malformed)?;
+        let class_hint = match task_class {
+            TaskClass::App => 0,
+            TaskClass::Driver => 1,
+            TaskClass::SystemServer => 2,
+        };
+        return Message::with_header(
+            0,
+            PROC_OP_SPAWN_V4,
+            0,
+            None,
+            &SpawnV4Args::new(parent_pid, image_id, slots, class_hint).encode(),
+        )
+        .map_err(|_| ProcessManagerError::Malformed);
+    }
     if let Some(slots) = requested_cnode_slots {
         let slots = u64::try_from(slots).map_err(|_| ProcessManagerError::Malformed)?;
         return Message::with_header(
@@ -476,7 +494,12 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
         client_send_cap,
         server_recv_cap,
         client_recv_cap,
-        spawn_request_message(parent_pid, image_id, requested_cnode_slots)?,
+        spawn_request_message(
+            parent_pid,
+            image_id,
+            requested_cnode_slots,
+            requested_cnode_slots.map(|_| TaskClass::App),
+        )?,
     )?;
     let spawned = SpawnV2Result::decode(spawn_reply.as_slice())?;
     let recorded_requested_slots = service
@@ -704,6 +727,10 @@ mod tests {
         assert!(
             src.contains("PROC_OP_SPAWN_V3"),
             "process-manager migration should include v3 spawn path for requested cnode slots"
+        );
+        assert!(
+            src.contains("PROC_OP_SPAWN_V4"),
+            "process-manager migration should include v4 spawn path for task class metadata"
         );
     }
 
