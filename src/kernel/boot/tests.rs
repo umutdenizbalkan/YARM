@@ -2541,6 +2541,41 @@ fn driver_tasks_get_max_cnode_slot_capacity() {
 }
 
 #[test]
+fn system_server_can_request_larger_cnode_slots_on_registration() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    let limits = state.runtime_capacity_config();
+    let requested = limits.default_cnode_slot_capacity.saturating_add(32);
+    state
+        .register_task_with_class_and_cnode_slots_in_process(
+            225,
+            TaskClass::SystemServer,
+            225,
+            Some(requested),
+        )
+        .expect("system server task");
+    let cnode = state.process_cnode_for_pid(225).expect("process cnode");
+    assert_eq!(state.cnode_slot_capacity(cnode), Some(requested));
+}
+
+#[test]
+fn app_cannot_request_non_default_cnode_slots_on_registration() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    let limits = state.runtime_capacity_config();
+    let requested = limits.default_cnode_slot_capacity.saturating_add(1);
+    assert_eq!(
+        state.register_task_with_class_and_cnode_slots_in_process(
+            226,
+            TaskClass::App,
+            226,
+            Some(requested),
+        ),
+        Err(KernelError::MissingRight)
+    );
+}
+
+#[test]
 fn cnode_slot_budget_rejects_overcommit() {
     let mut state =
         Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");

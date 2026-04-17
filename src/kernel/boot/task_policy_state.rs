@@ -7,11 +7,12 @@ use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{TaskClass, ThreadControlBlock};
 
 impl KernelState {
-    pub(crate) fn register_task_with_class_in_process(
+    pub(crate) fn register_task_with_class_and_cnode_slots_in_process(
         &mut self,
         tid: u64,
         class: TaskClass,
         process_pid: u64,
+        requested_cnode_slots: Option<usize>,
     ) -> Result<(), KernelError> {
         if self.task_status(tid).is_some() {
             return Ok(());
@@ -23,7 +24,8 @@ impl KernelState {
         let cnode = self
             .process_cnode_for_pid(process_pid)
             .unwrap_or(CNodeId(process_pid));
-        let cnode_slots = Self::default_cnode_slot_capacity_for_class(class, limits);
+        let cnode_slots =
+            Self::requested_cnode_slot_capacity_for_class(class, limits, requested_cnode_slots)?;
         self.ensure_cnode_space_with_slots(cnode, cnode_slots)?;
         self.set_process_cnode_for_pid(process_pid, cnode)?;
         let inserted = if let Some(idx) = self.tcbs.iter().position(|slot| slot.is_none()) {
@@ -39,6 +41,15 @@ impl KernelState {
         }
         self.provision_default_kernel_context(tid)?;
         Ok(())
+    }
+
+    pub(crate) fn register_task_with_class_in_process(
+        &mut self,
+        tid: u64,
+        class: TaskClass,
+        process_pid: u64,
+    ) -> Result<(), KernelError> {
+        self.register_task_with_class_and_cnode_slots_in_process(tid, class, process_pid, None)
     }
 
     pub fn register_task_with_class(
@@ -141,5 +152,26 @@ impl KernelState {
             TaskClass::Driver => limits.driver_cnode_slot_capacity,
             TaskClass::App | TaskClass::SystemServer => limits.default_cnode_slot_capacity,
         }
+    }
+
+    fn requested_cnode_slot_capacity_for_class(
+        class: TaskClass,
+        limits: RuntimeCapacityConfig,
+        requested: Option<usize>,
+    ) -> Result<usize, KernelError> {
+        let default = Self::default_cnode_slot_capacity_for_class(class, limits);
+        let requested = requested.unwrap_or(default);
+        if requested == 0 {
+            return Err(KernelError::WrongObject);
+        }
+        match class {
+            TaskClass::App => {
+                if requested != default {
+                    return Err(KernelError::MissingRight);
+                }
+            }
+            TaskClass::SystemServer | TaskClass::Driver => {}
+        }
+        Ok(requested)
     }
 }
