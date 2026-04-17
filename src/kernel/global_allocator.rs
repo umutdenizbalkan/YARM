@@ -30,19 +30,6 @@ mod non_hosted {
     const SLAB_MAGIC: u64 = 0x5941_524d_534c_4142; // "YARMSLAB"
     const LARGE_MAGIC: u64 = 0x5941_524d_4c41_5247; // "YARMLARG"
 
-    #[derive(Clone, Copy)]
-    struct AllocatorState {
-        class_heads_phys: [u64; SLAB_CLASS_SIZES.len()],
-    }
-
-    impl AllocatorState {
-        const fn new() -> Self {
-            Self {
-                class_heads_phys: [0; SLAB_CLASS_SIZES.len()],
-            }
-        }
-    }
-
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct SlabPageHeader {
@@ -64,12 +51,44 @@ mod non_hosted {
         pages: u64,
     }
 
-    static ALLOCATOR_LOCK: SpinLockIrq<AllocatorState> = SpinLockIrq::new(AllocatorState::new());
+    // Locking / SMP discipline:
+    // - Each slab size class has its own SpinLockIrq<u64> guarding that class's page list head
+    //   and all metadata mutations for pages belonging to the class (free-list, bitmap, used count,
+    //   unlink/reclaim decisions).
+    // - Large allocation path uses a separate lock to serialize large-header lifecycle operations.
+    // - No nested allocator locks are taken (class lock and large lock are disjoint paths).
+    // - Lock hold may span frame allocator calls; this is intentional to prevent reclaim/list races.
+    // IRQ context note:
+    // - SpinLockIrq disables local IRQs while held, so allocator lock holders cannot be preempted by
+    //   IRQ handlers on the same CPU acquiring the same lock.
+    static SLAB_CLASS_LOCK_0: SpinLockIrq<u64> = SpinLockIrq::new(0);
+    static SLAB_CLASS_LOCK_1: SpinLockIrq<u64> = SpinLockIrq::new(0);
+    static SLAB_CLASS_LOCK_2: SpinLockIrq<u64> = SpinLockIrq::new(0);
+    static SLAB_CLASS_LOCK_3: SpinLockIrq<u64> = SpinLockIrq::new(0);
+    static SLAB_CLASS_LOCK_4: SpinLockIrq<u64> = SpinLockIrq::new(0);
+    static SLAB_CLASS_LOCK_5: SpinLockIrq<u64> = SpinLockIrq::new(0);
+    static SLAB_CLASS_LOCK_6: SpinLockIrq<u64> = SpinLockIrq::new(0);
+    static SLAB_CLASS_LOCK_7: SpinLockIrq<u64> = SpinLockIrq::new(0);
+    static LARGE_ALLOC_LOCK: SpinLockIrq<()> = SpinLockIrq::new(());
 
     #[derive(Clone, Copy)]
     pub struct KernelGlobalAllocator;
 
     impl KernelGlobalAllocator {
+        fn class_lock(class_idx: usize) -> &'static SpinLockIrq<u64> {
+            match class_idx {
+                0 => &SLAB_CLASS_LOCK_0,
+                1 => &SLAB_CLASS_LOCK_1,
+                2 => &SLAB_CLASS_LOCK_2,
+                3 => &SLAB_CLASS_LOCK_3,
+                4 => &SLAB_CLASS_LOCK_4,
+                5 => &SLAB_CLASS_LOCK_5,
+                6 => &SLAB_CLASS_LOCK_6,
+                7 => &SLAB_CLASS_LOCK_7,
+                _ => &SLAB_CLASS_LOCK_0,
+            }
+        }
+
         fn phys_to_ptr(phys: u64) -> *mut u8 {
             #[cfg(target_arch = "x86_64")]
             {
@@ -260,13 +279,9 @@ mod non_hosted {
             true
         }
 
-        unsafe fn unlink_slab_page(
-            state: &mut AllocatorState,
-            class_idx: usize,
-            target_phys: u64,
-        ) -> bool {
+        unsafe fn unlink_slab_page(class_head: &mut u64, target_phys: u64) -> bool {
             let mut prev_phys = 0u64;
-            let mut phys = state.class_heads_phys[class_idx];
+            let mut phys = *class_head;
             while phys != 0 {
                 let page_ptr = Self::phys_to_ptr(phys);
                 if page_ptr.is_null() {
@@ -276,7 +291,7 @@ mod non_hosted {
                 let next = header.next_page_phys;
                 if phys == target_phys {
                     if prev_phys == 0 {
-                        state.class_heads_phys[class_idx] = next;
+                        *class_head = next;
                     } else {
                         let prev_ptr = Self::phys_to_ptr(prev_phys);
                         if prev_ptr.is_null() {
@@ -294,13 +309,13 @@ mod non_hosted {
         }
 
         unsafe fn try_reclaim_empty_slab_page(
-            state: &mut AllocatorState,
+            class_head: &mut u64,
             class_idx: usize,
             target_page_ptr: *mut u8,
         ) {
             let target_phys = Self::ptr_to_phys(target_page_ptr as *const u8);
             let mut empty_pages = 0usize;
-            let mut phys = state.class_heads_phys[class_idx];
+            let mut phys = *class_head;
             while phys != 0 {
                 let page_ptr = Self::phys_to_ptr(phys);
                 if page_ptr.is_null() {
@@ -321,13 +336,13 @@ mod non_hosted {
                 return;
             }
 
-            if unsafe { Self::unlink_slab_page(state, class_idx, target_phys) } {
+            if unsafe { Self::unlink_slab_page(class_head, target_phys) } {
                 let _ = free_pt_frame(target_phys);
             }
         }
 
-        unsafe fn alloc_small(state: &mut AllocatorState, class_idx: usize) -> *mut u8 {
-            let mut phys = state.class_heads_phys[class_idx];
+        unsafe fn alloc_small(class_head: &mut u64, class_idx: usize) -> *mut u8 {
+            let mut phys = *class_head;
             while phys != 0 {
                 let page_ptr = Self::phys_to_ptr(phys);
                 if page_ptr.is_null() {
@@ -352,11 +367,11 @@ mod non_hosted {
                 return null_mut();
             }
 
-            if !unsafe { Self::slab_init_page(page_ptr, class_idx, state.class_heads_phys[class_idx]) } {
+            if !unsafe { Self::slab_init_page(page_ptr, class_idx, *class_head) } {
                 let _ = free_pt_frame(new_phys);
                 return null_mut();
             }
-            state.class_heads_phys[class_idx] = new_phys;
+            *class_head = new_phys;
             unsafe { Self::slab_alloc_from_page(page_ptr) }
         }
 
@@ -390,10 +405,11 @@ mod non_hosted {
                 return null_mut();
             }
 
-            let mut state = ALLOCATOR_LOCK.lock();
             if let Some(class_idx) = Self::slab_class_for(layout) {
-                return unsafe { Self::alloc_small(&mut state, class_idx) };
+                let mut class_head = Self::class_lock(class_idx).lock();
+                return unsafe { Self::alloc_small(&mut class_head, class_idx) };
             }
+            let _large_guard = LARGE_ALLOC_LOCK.lock();
             unsafe { Self::alloc_large(layout) }
         }
 
@@ -402,22 +418,23 @@ mod non_hosted {
                 return;
             }
 
-            let mut state = ALLOCATOR_LOCK.lock();
-
             let page_base = (ptr as usize) & !(PAGE_SIZE - 1);
             let page_ptr = page_base as *mut u8;
             if !page_ptr.is_null() {
                 let magic = unsafe { core::ptr::read_unaligned(page_ptr as *const u64) };
                 if magic == SLAB_MAGIC {
-                    let ok = unsafe { Self::slab_dealloc_from_page(page_ptr, ptr) };
-                    if ok {
-                        let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
-                        let class_idx = header.class_idx as usize;
-                        if class_idx < SLAB_CLASS_SIZES.len() && header.used == 0 {
-                            unsafe { Self::try_reclaim_empty_slab_page(&mut state, class_idx, page_ptr) };
+                    let class_idx = unsafe { (&*(page_ptr as *const SlabPageHeader)).class_idx as usize };
+                    if class_idx < SLAB_CLASS_SIZES.len() {
+                        let mut class_head = Self::class_lock(class_idx).lock();
+                        let ok = unsafe { Self::slab_dealloc_from_page(page_ptr, ptr) };
+                        if ok {
+                            let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
+                            if header.used == 0 {
+                                unsafe { Self::try_reclaim_empty_slab_page(&mut class_head, class_idx, page_ptr) };
+                            }
                         }
+                        return;
                     }
-                    return;
                 }
             }
 
@@ -425,6 +442,7 @@ mod non_hosted {
                 return;
             }
 
+            let _large_guard = LARGE_ALLOC_LOCK.lock();
             let header_ptr = unsafe { ptr.sub(PAGE_SIZE) as *const LargeAllocHeader };
             #[cfg(target_arch = "x86_64")]
             if (header_ptr as usize as u64) < platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE {
@@ -924,5 +942,115 @@ mod hosted_dev_allocator_model_tests {
         assert!(a.classes[class_b].pages.len() <= 1);
         let again_b = a.alloc(512, 8).expect("realloc b");
         assert!(a.dealloc(512, 8, again_b));
+    }
+
+    #[test]
+    fn interleaving_same_class_alloc_free_keeps_consistency() {
+        let mut a = ModelAlloc::new();
+        let class_idx = ModelAlloc::class_for(64, 8).expect("class");
+        let mut t0_live = Vec::new();
+        let mut t1_live = Vec::new();
+
+        for step in 0..2_000usize {
+            if step % 3 != 0 || t0_live.is_empty() {
+                t0_live.push(a.alloc(64, 8).expect("t0 alloc"));
+            } else {
+                let ptr = t0_live.pop().expect("t0 pop");
+                assert!(a.dealloc(64, 8, ptr));
+            }
+
+            if step % 5 != 0 || t1_live.is_empty() {
+                t1_live.push(a.alloc(64, 8).expect("t1 alloc"));
+            } else {
+                let ptr = t1_live.pop().expect("t1 pop");
+                assert!(a.dealloc(64, 8, ptr));
+            }
+        }
+
+        for ptr in t0_live {
+            assert!(a.dealloc(64, 8, ptr));
+        }
+        for ptr in t1_live {
+            assert!(a.dealloc(64, 8, ptr));
+        }
+
+        assert!(a.small[class_idx].live.is_empty());
+    }
+
+    #[test]
+    fn reclamation_interleaving_preserves_class_integrity() {
+        let mut a = ReclaimModelAlloc::new();
+        let class_idx = ReclaimModelAlloc::class_for(32, 8).expect("class");
+        let cap = class_capacity(class_idx);
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+
+        for i in 0..(cap * 3) {
+            let ptr = a.alloc(32, 8).expect("alloc");
+            if i % 2 == 0 {
+                left.push(ptr);
+            } else {
+                right.push(ptr);
+            }
+        }
+
+        while let Some(ptr) = left.pop() {
+            assert!(a.dealloc(32, 8, ptr));
+        }
+        while let Some(ptr) = right.pop() {
+            assert!(a.dealloc(32, 8, ptr));
+        }
+
+        // At most one warm empty page should remain.
+        assert!(a.classes[class_idx].pages.len() <= 1);
+    }
+
+    #[test]
+    fn repeated_same_class_cycles_preserve_page_accounting() {
+        let mut a = ReclaimModelAlloc::new();
+        let class_idx = ReclaimModelAlloc::class_for(128, 8).expect("class");
+        let cap = class_capacity(class_idx);
+
+        for _ in 0..64 {
+            let mut ptrs = Vec::new();
+            for _ in 0..(cap * 2 + 11) {
+                ptrs.push(a.alloc(128, 8).expect("alloc"));
+            }
+            for ptr in ptrs {
+                assert!(a.dealloc(128, 8, ptr));
+            }
+            assert!(a.classes[class_idx].pages.len() <= 1);
+        }
+    }
+
+    #[test]
+    fn large_path_interleaving_bookkeeping_is_stable() {
+        let mut a = ModelAlloc::new();
+        let mut live_a = Vec::new();
+        let mut live_b = Vec::new();
+
+        for i in 0..512usize {
+            if i % 2 == 0 {
+                live_a.push(a.alloc(8192, 64).expect("alloc a"));
+            } else {
+                live_b.push(a.alloc(16_384, 64).expect("alloc b"));
+            }
+            if i % 7 == 0 && !live_a.is_empty() {
+                let ptr = live_a.swap_remove(0);
+                assert!(a.dealloc(8192, 64, ptr));
+            }
+            if i % 11 == 0 && !live_b.is_empty() {
+                let ptr = live_b.swap_remove(0);
+                assert!(a.dealloc(16_384, 64, ptr));
+            }
+        }
+
+        for ptr in live_a {
+            assert!(a.dealloc(8192, 64, ptr));
+        }
+        for ptr in live_b {
+            assert!(a.dealloc(16_384, 64, ptr));
+        }
+        assert!(a.live_large.is_empty());
     }
 }
