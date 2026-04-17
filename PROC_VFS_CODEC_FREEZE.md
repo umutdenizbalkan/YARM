@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Process/VFS Codec Freeze (v1)
+# Process/VFS Codec Freeze (v2+)
 
 This document freezes the typed wire payload contracts used by the process-manager and VFS service paths.
 
@@ -8,6 +8,9 @@ This document freezes the typed wire payload contracts used by the process-manag
 
 - Server ABI version: `PROC_SERVER_ABI_VERSION = 1`
 - Typed codec version: `PROC_CODEC_V2_VERSION = 2`
+- Extended typed codec versions:
+  - `PROC_CODEC_V3_VERSION = 3` (`ProcV3Args`)
+  - `PROC_CODEC_V4_VERSION = 4` (`ProcV4Args`)
 - Typed request args: `ProcV2Args`
   - Encoding: little-endian `[arg0:u64, arg1:u64]`
   - Exact payload length: `16` bytes
@@ -16,6 +19,21 @@ This document freezes the typed wire payload contracts used by the process-manag
     - args = `(0x1122334455667788, 0x99aabbccddeeff00)`
     - bytes = `88 77 66 55 44 33 22 11 00 ff ee dd cc bb aa 99`
 
+Additional frozen process payloads:
+
+- `ProcV3Args(parent_pid, image_id, requested_cnode_slots)`
+  - Encoding: little-endian `[arg0:u64, arg1:u64, arg2:u64]`
+  - Exact payload length: `24` bytes
+  - Decode policy: **exact-length only**
+- `ProcV4Args(parent_pid, image_id, requested_cnode_slots, task_class_hint)`
+  - Encoding: little-endian `[arg0:u64, arg1:u64, arg2:u64, arg3:u64]`
+  - Exact payload length: `32` bytes
+  - Decode policy: **exact-length only**
+  - `task_class_hint` values:
+    - `0` => `TaskClass::App`
+    - `1` => `TaskClass::Driver`
+    - `2` => `TaskClass::SystemServer`
+
 Opcodes frozen in this phase:
 
 - `PROC_OP_GETPID = 1`
@@ -23,6 +41,8 @@ Opcodes frozen in this phase:
 - `PROC_OP_GETPPID = 3`
 - `PROC_OP_SPAWN_V2 = 4`
 - `PROC_OP_WAITPID_V2 = 5`
+- `PROC_OP_SPAWN_V3 = 6`
+- `PROC_OP_SPAWN_V4 = 7`
 
 ## VFS (`src/kernel/vfs_abi.rs`)
 

@@ -6,6 +6,7 @@ This snapshot reflects the current branch after the mechanism-hardening pass.
 
 ## Recent updates
 
+- **CNode sizing/status update:** process cnode slot capacity is now runtime-resizable and policy/budget checked (`default_cnode_slot_capacity`, `driver_cnode_slot_capacity`, `max_total_cnode_slots`, control-plane resize syscall path). This is dynamic sizing, but still constrained by hard per-cspace slot caps and bounded cnode-space registries (not yet allocator-unbounded "true dynamic" cnode infrastructure).
 - **PR-B migration/polish pass closed on this branch:** service-side decode and control-plane call/reply helpers were fully consolidated onto shared workspace utilities:
   - VFS reply decode ladders in `devfs` / `initramfs` / `ramfs` now use `yarm_srv_common::vfs_reply::VfsReply::{from_opcode_payload, as_u64}`.
   - POSIX service hooks now use consistent decode/error-mapping paths (`decode_message_u64`, `decode_vfs_u64`, `decode_vfs_fd_i32`) with shared `VfsReply`.

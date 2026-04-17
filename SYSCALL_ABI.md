@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# YARM Syscall ABI v9 (Frozen Contract)
+# YARM Syscall ABI v10 (Frozen Contract)
 
-- ABI Version: `9`
-- Syscall count: `8`
+- ABI Version: `10`
+- Syscall count: `9`
 
 ## Syscall numbers
 
@@ -15,6 +15,7 @@
 - `5`: `IpcRecvTimeout` (bounded non-blocking receive with scheduler-yield retry budget)
 - `6`: `IpcCall` (send with kernel-minted ephemeral reply-cap transfer)
 - `7`: `IpcReply` (consume reply-cap and send reply to bound caller endpoint)
+- `8`: `ControlPlaneSetCnodeSlots` (control-plane cnode slot-capacity resize by target process id)
 
 ## Argument register layout (`args[0..]`)
 
@@ -71,6 +72,26 @@
 - `args[2]`: mapped length in bytes (rounded up to page size by kernel)
 - `args[3..5]`: reserved (must be `0`)
 
+### `ControlPlaneSetCnodeSlots` argument layout
+
+- `args[0]`: target process id (`pid != 0`)
+- `args[1]`: requested cnode slot capacity (kernel clamps to `[1, MAX_CAPABILITIES_PER_CSPACE_HARD]`)
+- `args[2..5]`: reserved (must be `0`)
+
+`ControlPlaneSetCnodeSlots` semantics:
+
+- Caller policy:
+  - `TaskClass::SystemServer`: may resize any target process cnode.
+  - non-system-server caller: may only resize its own process cnode.
+- Existing process cnode:
+  - resized in-place if present.
+- Missing process cnode:
+  - kernel creates process cnode binding with requested capacity (subject to policy and global slot budget).
+- Errors:
+  - `InvalidArgs` for `pid == 0` and malformed reserved-arg usage.
+  - `MissingRight` when caller policy does not permit targeting the requested process.
+  - `Internal` when kernel capacity/budget constraints reject the resize path.
+
 `TransferRelease` fast path for steady-state recycle loops:
 
 - `args[1]=0` and `args[2]=0` means “release via active mapping record”.
@@ -92,7 +113,7 @@
 - Compatibility descriptor-only receive fallback has been removed for user-mode shared-memory receives.
 - Receiver-side auto-map + active mapping tracking + `TransferRelease` lifecycle is the required migration path.
 
-## Phase 6 migration policy (ABI v9 window)
+## Phase 6 migration policy (ABI v10 window)
 
 - **Timed wait migration target**: control-plane services should migrate blocking receive loops to `IpcRecvTimeout` with explicit tick budgets; indefinite waits are allowed only where watchdog/supervisor policy explicitly permits.
 - **Request/reply migration target**: for standard RPC flows, use `IpcCall`/`IpcReply` single-use reply-cap semantics instead of maintaining ad-hoc reply endpoints.

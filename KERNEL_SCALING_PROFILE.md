@@ -40,6 +40,12 @@ and `#[cfg(not(feature = "hosted-dev"))]`.
 |---|---:|---:|
 | `MAX_CAPABILITIES_PER_CSPACE` | 1024 | 512 |
 
+Runtime profile config also carries:
+
+- `default_cnode_slot_capacity`
+- `driver_cnode_slot_capacity`
+- `max_total_cnode_slots` (global budget across all process cnode spaces)
+
 ### VM layout (`src/arch/*/vm_layout.rs`)
 
 Across `aarch64`, `x86_64`, and `riscv64`:
@@ -75,6 +81,18 @@ changes were made:
 - Driver records can track multiple IRQ and DMA caps.
 - DMA region minting checks against parent memory object length.
 - Capacity values are profile-aware and documented.
+- Per-process cnode spaces can be created/resized with runtime-selected slot capacities.
+- Global cnode slot consumption is bounded via `max_total_cnode_slots` budget checks.
+
+## Dynamic CNode sizing status
+
+The current implementation is **dynamically sizable**, but not yet "fully dynamic/unbounded":
+
+- ✅ Slot capacity is dynamic per cnode (`ensure_cnode_space_with_slots`, `resize_cnode_slots`).
+- ✅ Per-class defaults and request-time overrides are supported (policy-gated).
+- ✅ Capacity accounting is global-budget-aware (`max_total_cnode_slots`) and exposed in telemetry.
+- ⚠️ Slot capacity is still hard-capped by `MAX_CAPABILITIES_PER_CSPACE_HARD`.
+- ⚠️ CNode registry count remains bounded by kernel capability table sizing (not allocator-unbounded).
 
 ## Related architecture hardening updates
 
@@ -97,7 +115,7 @@ model.
 Recommended follow-ups:
 
 1. **Allocator-backed registries**
-   - Replace fixed arrays for endpoints/notifications/drivers/tasks with slabs or
+   - Replace fixed arrays for endpoints/notifications/drivers/tasks/**cnode registries** with slabs or
      arena-indexed vectors.
 
 2. **Memory object sizing model**

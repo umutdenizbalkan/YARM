@@ -122,7 +122,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
     - call/reply (`IpcCall`/`IpcReply`) adoption over ad-hoc two-endpoint request/reply choreography,
     - shared-memory `TransferRelease` lifecycle requirement after auto-map receives.
 - Deprecation policy checkpoint:
-  - legacy two-endpoint request/reply choreography is marked as **deprecated for new/updated core services** during ABI v9 migration window.
+  - legacy two-endpoint request/reply choreography is marked as **deprecated for new/updated core services** during ABI v10 migration window.
   - full removal is explicitly deferred until all core control-plane services are migrated.
 
 ## Phase 6 artifacts (pass 2)
