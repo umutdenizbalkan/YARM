@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use alloc::{boxed::Box, vec::Vec};
 use crate::kernel::lock::SpinLockIrq;
 pub use yarm_kernel::capability::{CNodeId, CapId, CapRights, CapabilityDeriveError};
 
@@ -76,13 +77,13 @@ struct CapSlot {
 
 #[derive(Debug, Clone)]
 pub struct CapabilitySpace {
-    slots: [CapSlot; MAX_CAPABILITIES_PER_CSPACE],
-    slot_capacity: usize,
+    slots: Box<[CapSlot]>,
 }
 
 impl Default for CapabilitySpace {
     fn default() -> Self {
-        Self::with_slots(MAX_CAPABILITIES_PER_CSPACE)
+        Self::try_with_slots(MAX_CAPABILITIES_PER_CSPACE)
+            .expect("default capability space allocation should succeed")
     }
 }
 
@@ -113,39 +114,67 @@ impl RevokeScratch {
 static REVOKE_SCRATCH: SpinLockIrq<RevokeScratch> = SpinLockIrq::new(RevokeScratch::new());
 
 impl CapabilitySpace {
-    pub fn with_slots(slot_capacity: usize) -> Self {
+    pub fn try_with_slots(slot_capacity: usize) -> Result<Self, CapabilityDeriveError> {
         let bounded_capacity = slot_capacity.clamp(1, MAX_CAPABILITIES_PER_CSPACE);
-        Self {
-            slots: [const {
-                CapSlot {
-                    generation: 1,
-                    entry: None,
-                }
-            }; MAX_CAPABILITIES_PER_CSPACE],
-            slot_capacity: bounded_capacity,
-        }
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(bounded_capacity)
+            .map_err(|_| CapabilityDeriveError::AllocFailed)?;
+        slots.resize(
+            bounded_capacity,
+            CapSlot {
+                generation: 1,
+                entry: None,
+            },
+        );
+        Ok(Self {
+            slots: slots.into_boxed_slice(),
+        })
     }
 
-    pub const fn capacity(&self) -> usize {
-        self.slot_capacity
+    pub fn with_slots(slot_capacity: usize) -> Self {
+        Self::try_with_slots(slot_capacity).expect("capability space allocation should succeed")
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
     }
 
     pub fn resize_slots(&mut self, slot_capacity: usize) -> Result<(), CapabilityDeriveError> {
         if slot_capacity == 0 || slot_capacity > MAX_CAPABILITIES_PER_CSPACE {
             return Err(CapabilityDeriveError::InvalidSlot);
         }
-        let occupied = self.occupied_slots();
-        if slot_capacity < occupied {
+        if slot_capacity == self.slots.len() {
+            return Ok(());
+        }
+        if slot_capacity < self.slots.len()
+            && self.slots[slot_capacity..]
+                .iter()
+                .any(|slot| slot.entry.is_some())
+        {
             return Err(CapabilityDeriveError::SpaceFull);
         }
-        self.slot_capacity = slot_capacity;
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(slot_capacity)
+            .map_err(|_| CapabilityDeriveError::AllocFailed)?;
+        slots.extend_from_slice(&self.slots[..core::cmp::min(self.slots.len(), slot_capacity)]);
+        if slot_capacity > slots.len() {
+            slots.resize(
+                slot_capacity,
+                CapSlot {
+                    generation: 1,
+                    entry: None,
+                },
+            );
+        }
+        self.slots = slots.into_boxed_slice();
         Ok(())
     }
 
     pub fn occupied_slots(&self) -> usize {
         self.slots
             .iter()
-            .take(self.slot_capacity)
             .filter(|slot| slot.entry.is_some())
             .count()
     }
@@ -159,7 +188,7 @@ impl CapabilitySpace {
         capability: Capability,
         parent: Option<CapId>,
     ) -> Result<CapId, CapabilityDeriveError> {
-        for index in 0..self.slot_capacity {
+        for index in 0..self.slots.len() {
             let slot = &mut self.slots[index];
             if slot.entry.is_none() {
                 let id = CapId::new(index, slot.generation);
@@ -187,7 +216,7 @@ impl CapabilitySpace {
         slot_index: usize,
         capability: Capability,
     ) -> Result<CapId, CapabilityDeriveError> {
-        if slot_index >= self.slot_capacity {
+        if slot_index >= self.slots.len() {
             return Err(CapabilityDeriveError::InvalidSlot);
         }
         let slot = &mut self.slots[slot_index];
@@ -241,7 +270,7 @@ impl CapabilitySpace {
 
         let mut scratch = REVOKE_SCRATCH.lock();
         scratch.clear();
-        for idx in 0..self.slot_capacity {
+        for idx in 0..self.slots.len() {
             let Some(entry) = self.slots[idx].entry else {
                 continue;
             };
@@ -249,7 +278,7 @@ impl CapabilitySpace {
                 continue;
             };
             let parent_idx = parent.index();
-            if parent_idx >= self.slot_capacity {
+            if parent_idx >= self.slots.len() {
                 continue;
             }
             if self.slots[parent_idx].generation != parent.generation() {
@@ -285,7 +314,7 @@ impl CapabilitySpace {
             .marked
             .iter()
             .copied()
-            .take(self.slot_capacity)
+            .take(self.slots.len())
             .enumerate()
         {
             if !is_marked {
@@ -304,7 +333,7 @@ impl CapabilitySpace {
 
     pub fn get(&self, id: CapId) -> Option<Capability> {
         let index = id.index();
-        if index >= self.slot_capacity {
+        if index >= self.slots.len() {
             return None;
         }
         let slot = self.slots[index];
@@ -327,7 +356,6 @@ impl CapabilitySpace {
     pub fn object_refcount(&self, object: CapObject) -> usize {
         self.slots
             .iter()
-            .take(self.slot_capacity)
             .filter_map(|slot| slot.entry)
             .filter(|entry| entry.capability.object == object)
             .count()
@@ -336,7 +364,6 @@ impl CapabilitySpace {
     pub fn memory_object_id_refcount(&self, id: u64) -> usize {
         self.slots
             .iter()
-            .take(self.slot_capacity)
             .filter_map(|slot| slot.entry)
             .filter(|entry| {
                 matches!(
@@ -352,7 +379,6 @@ impl CapabilitySpace {
     pub fn live_cap_ids(&self) -> impl Iterator<Item = CapId> + '_ {
         self.slots
             .iter()
-            .take(self.slot_capacity)
             .enumerate()
             .filter_map(|(index, slot)| {
                 slot.entry

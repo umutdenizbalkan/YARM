@@ -41,10 +41,12 @@ impl KernelState {
                 .iter_mut()
                 .find(|slot| slot.is_none())
             {
+                let cspace = CapabilitySpace::try_with_slots(bounded_slot_capacity)
+                    .map_err(|_| KernelError::CapabilityFull)?;
                 *slot = Some(CNodeSpace {
                     id: cnode,
                     slot_capacity: bounded_slot_capacity,
-                    cspace: store_kernel_value(CapabilitySpace::with_slots(bounded_slot_capacity)),
+                    cspace: store_kernel_value(cspace),
                 });
                 Ok(())
             } else {
@@ -113,6 +115,7 @@ impl KernelState {
                 .resize_slots(bounded_slot_capacity)
                 .map_err(|err| match err {
                     CapabilityDeriveError::SpaceFull => KernelError::CapabilityFull,
+                    CapabilityDeriveError::AllocFailed => KernelError::CapabilityFull,
                     CapabilityDeriveError::InvalidSlot => KernelError::WrongObject,
                     _ => KernelError::WrongObject,
                 })?;
