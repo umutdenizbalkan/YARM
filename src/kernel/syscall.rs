@@ -11,7 +11,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
 
-pub const SYSCALL_ABI_VERSION: u16 = 9;
+pub const SYSCALL_ABI_VERSION: u16 = 10;
 pub const SYSCALL_YIELD_NR: usize = 0;
 pub const SYSCALL_IPC_SEND_NR: usize = 1;
 pub const SYSCALL_IPC_RECV_NR: usize = 2;
@@ -20,8 +20,9 @@ pub const SYSCALL_TRANSFER_RELEASE_NR: usize = 4;
 pub const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
 pub const SYSCALL_IPC_CALL_NR: usize = 6;
 pub const SYSCALL_IPC_REPLY_NR: usize = 7;
-pub const SYSCALL_COUNT: usize = 8;
-const _: [(); SYSCALL_COUNT] = [(); 8];
+pub const SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR: usize = 8;
+pub const SYSCALL_COUNT: usize = 9;
+const _: [(); SYSCALL_COUNT] = [(); 9];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -54,10 +55,11 @@ pub enum Syscall {
     IpcRecvTimeout = SYSCALL_IPC_RECV_TIMEOUT_NR,
     IpcCall = SYSCALL_IPC_CALL_NR,
     IpcReply = SYSCALL_IPC_REPLY_NR,
+    ControlPlaneSetCnodeSlots = SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 8;
+    pub const VARIANT_COUNT: usize = 9;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -72,6 +74,7 @@ impl Syscall {
             SYSCALL_IPC_RECV_TIMEOUT_NR => Ok(Self::IpcRecvTimeout),
             SYSCALL_IPC_CALL_NR => Ok(Self::IpcCall),
             SYSCALL_IPC_REPLY_NR => Ok(Self::IpcReply),
+            SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR => Ok(Self::ControlPlaneSetCnodeSlots),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -962,6 +965,23 @@ fn handle_transfer_release(
     Ok(())
 }
 
+fn handle_control_plane_set_cnode_slots(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    let requester_tid = current_tid(kernel)?;
+    let target_pid = frame.arg(SYSCALL_ARG_CAP) as u64;
+    let slot_capacity = frame.arg(SYSCALL_ARG_PTR);
+    if target_pid == 0 || slot_capacity == 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    kernel
+        .control_plane_set_process_cnode_slots(requester_tid, target_pid, slot_capacity)
+        .map_err(SyscallError::from)?;
+    frame.set_ok(slot_capacity, target_pid as usize, 0);
+    Ok(())
+}
+
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     match Syscall::decode(frame.syscall_num())? {
         Syscall::Yield => {
@@ -974,6 +994,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::IpcRecvTimeout => handle_ipc_recv_timeout(kernel, frame),
         Syscall::IpcCall => handle_ipc_call(kernel, frame),
         Syscall::IpcReply => handle_ipc_reply(kernel, frame),
+        Syscall::ControlPlaneSetCnodeSlots => handle_control_plane_set_cnode_slots(kernel, frame),
         Syscall::VmMap => handle_vm_map(kernel, frame),
         Syscall::TransferRelease => handle_transfer_release(kernel, frame),
     }
@@ -988,13 +1009,14 @@ mod tests {
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
-        assert_eq!(SYSCALL_ABI_VERSION, 9);
+        assert_eq!(SYSCALL_ABI_VERSION, 10);
         assert_eq!(SYSCALL_ARG_TRANSFER_CAP, 5);
         assert_eq!(SYSCALL_RET_TRANSFER_CAP, 2);
         assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4);
         assert_eq!(SYSCALL_IPC_RECV_TIMEOUT_NR, 5);
         assert_eq!(SYSCALL_IPC_CALL_NR, 6);
         assert_eq!(SYSCALL_IPC_REPLY_NR, 7);
+        assert_eq!(SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR, 8);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
@@ -1019,6 +1041,14 @@ mod tests {
         assert_eq!(
             Syscall::decode(SYSCALL_IPC_REPLY_NR).expect("decode"),
             Syscall::IpcReply
+        );
+    }
+
+    #[test]
+    fn syscall_control_plane_set_cnode_slots_decode_is_stable() {
+        assert_eq!(
+            Syscall::decode(SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR).expect("decode"),
+            Syscall::ControlPlaneSetCnodeSlots
         );
     }
 
@@ -2216,6 +2246,58 @@ mod tests {
         );
         let err = dispatch(&mut state, &mut release).expect_err("unaligned");
         assert_eq!(err, SyscallError::InvalidArgs);
+    }
+
+    #[test]
+    fn syscall_control_plane_set_cnode_slots_respects_policy() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state
+            .register_task_with_class(230, crate::kernel::task::TaskClass::App)
+            .expect("register requester");
+        state
+            .register_task_with_class(231, crate::kernel::task::TaskClass::App)
+            .expect("register target");
+        state.enqueue_current_cpu(230).expect("enqueue requester");
+        state.dispatch_next_task().expect("dispatch requester");
+        if state.current_tid() != Some(230) {
+            state.yield_current().expect("switch to requester");
+        }
+
+        let mut frame = TrapFrame::new(
+            Syscall::ControlPlaneSetCnodeSlots as usize,
+            [231, 16, 0, 0, 0, 0],
+        );
+        let err = dispatch(&mut state, &mut frame).expect_err("policy");
+        assert_eq!(err, SyscallError::MissingRight);
+    }
+
+    #[test]
+    fn syscall_control_plane_set_cnode_slots_allows_system_server_targeting_other_process() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state
+            .register_task_with_class(228, crate::kernel::task::TaskClass::SystemServer)
+            .expect("register system server");
+        state
+            .register_task_with_class(229, crate::kernel::task::TaskClass::App)
+            .expect("register app");
+        let app_cnode = state.process_cnode_for_pid(229).expect("app cnode");
+        let before = state.cnode_slot_capacity(app_cnode).expect("slot capacity");
+        let requested = before.saturating_add(8);
+        state.enqueue_current_cpu(228).expect("enqueue system server");
+        state.dispatch_next_task().expect("dispatch system server");
+        if state.current_tid() != Some(228) {
+            state.yield_current().expect("switch to system server");
+        }
+
+        let mut frame = TrapFrame::new(
+            Syscall::ControlPlaneSetCnodeSlots as usize,
+            [229, requested, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut frame).expect("syscall dispatch");
+        assert_eq!(frame.error_code(), None);
+        assert_eq!(frame.ret0(), requested);
+        assert_eq!(frame.ret1(), 229);
+        assert_eq!(state.cnode_slot_capacity(app_cnode), Some(requested));
     }
 
     #[test]
