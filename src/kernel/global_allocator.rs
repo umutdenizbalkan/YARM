@@ -14,6 +14,15 @@ mod non_hosted {
     use crate::kernel::lock::SpinLockIrq;
     use crate::kernel::vm::PAGE_SIZE;
 
+    // Allocator design note (final cleanup):
+    // - Slab size classes: 16, 32, 64, 128, 256, 512, 1024, 2048 bytes.
+    // - Small/large split: allocations with max(size, align) <= 2048 use slabs; larger
+    //   requests use the large contiguous-page path.
+    // - Warm empty page policy: keep up to one fully empty slab page per class.
+    // - Empty-page reclamation: if a class has more than one fully empty slab page, dealloc can
+    //   unlink and return extra empty pages to the frame allocator.
+    // - Known limitations: invalid-free detection is best-effort (magic/shape/bitmap checks),
+    //   and empty-page reclamation does a linear scan over class pages.
     const SLAB_CLASS_SIZES: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
     const SMALL_ALLOC_MAX: usize = 2048;
     const FREE_NONE: u16 = u16::MAX;
