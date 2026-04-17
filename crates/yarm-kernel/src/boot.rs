@@ -50,6 +50,14 @@ pub struct CapacityTelemetry {
     pub capability_slots: CapacityPoolTelemetry,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CapabilitySpaceTelemetry {
+    pub cnode_spaces: usize,
+    pub revoke_scratch_cache_hits: u64,
+    pub revoke_scratch_cache_misses: u64,
+    pub revoke_scratch_cache_drops: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelCapacityProfile {
     HostedDefault,

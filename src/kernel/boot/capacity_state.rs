@@ -52,6 +52,29 @@ impl KernelState {
         }
     }
 
+    pub fn capability_space_telemetry(&self) -> CapabilitySpaceTelemetry {
+        self.with_capability_state(|capability| {
+            capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .fold(CapabilitySpaceTelemetry::default(), |mut acc, space| {
+                    let telemetry = kernel_ref(&space.cspace).revoke_scratch_telemetry();
+                    acc.cnode_spaces = acc.cnode_spaces.saturating_add(1);
+                    acc.revoke_scratch_cache_hits = acc
+                        .revoke_scratch_cache_hits
+                        .saturating_add(telemetry.cache_hits);
+                    acc.revoke_scratch_cache_misses = acc
+                        .revoke_scratch_cache_misses
+                        .saturating_add(telemetry.cache_misses);
+                    acc.revoke_scratch_cache_drops = acc
+                        .revoke_scratch_cache_drops
+                        .saturating_add(telemetry.cache_drops);
+                    acc
+                })
+        })
+    }
+
     pub fn capacity_profile(&self) -> KernelCapacityProfile {
         self.with_boot_config(|boot_config| boot_config.capacity_profile)
     }

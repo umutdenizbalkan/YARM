@@ -2576,6 +2576,28 @@ fn app_cannot_request_non_default_cnode_slots_on_registration() {
 }
 
 #[test]
+fn capability_space_telemetry_tracks_revoke_scratch_cache_reuse() {
+    let mut state = Bootstrap::init().expect("init");
+    state
+        .register_task_with_class(227, TaskClass::Driver)
+        .expect("driver task");
+    let cnode = state.process_cnode_for_pid(227).expect("process cnode");
+    let cap = Capability::new(CapObject::Kernel, CapRights::READ);
+
+    let first = state.mint_capability_in_cnode(cnode, cap).expect("mint first");
+    state.revoke_capability_in_cnode(cnode, first).expect("revoke first");
+    let second = state.mint_capability_in_cnode(cnode, cap).expect("mint second");
+    state
+        .revoke_capability_in_cnode(cnode, second)
+        .expect("revoke second");
+
+    let telemetry = state.capability_space_telemetry();
+    assert!(telemetry.cnode_spaces >= 1);
+    assert!(telemetry.revoke_scratch_cache_misses >= 1);
+    assert!(telemetry.revoke_scratch_cache_hits >= 1);
+}
+
+#[test]
 fn cnode_slot_budget_rejects_overcommit() {
     let mut state =
         Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");

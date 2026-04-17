@@ -3,7 +3,8 @@
 
 use super::*;
 pub use yarm_kernel::boot::{
-    CapacityPoolTelemetry, CapacityTelemetry, IpcFastpathResult, IpcPathTelemetry,
+    CapabilitySpaceTelemetry, CapacityPoolTelemetry, CapacityTelemetry, IpcFastpathResult,
+    IpcPathTelemetry,
     KernelCapacityProfile, RuntimeCapacityConfig, TidAllocationTelemetry,
 };
 
@@ -114,6 +115,10 @@ mod tests {
         assert_eq!(
             mem::size_of::<CapacityTelemetry>(),
             mem::size_of::<yarm_kernel::boot::CapacityTelemetry>()
+        );
+        assert_eq!(
+            mem::size_of::<CapabilitySpaceTelemetry>(),
+            mem::size_of::<yarm_kernel::boot::CapabilitySpaceTelemetry>()
         );
         assert_eq!(
             KernelCapacityProfile::HostedDefault as u8,
