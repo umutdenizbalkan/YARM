@@ -34,3 +34,33 @@ When adding or modifying kernel code:
 - The boot test guard scans `src/kernel/**/*.rs` and `src/services/**/*.rs` and
   fails if direct `self.cspace.{get,revoke,has_right}` appears outside the
   canonical helper definitions.
+
+## CNode Storage/Resize Invariants (internal note)
+
+This subsystem now uses allocator-backed CNode slot storage and runtime resize.
+
+### Enforced runtime bounds
+
+- Requested CNode slot capacity must be non-zero.
+- Requested capacity must be within runtime per-CNode policy (`max_capability_slots`).
+- Requested capacity must be representable by `CapId` index encoding.
+- Global reserved slot accounting must remain within runtime pool
+  (`max_total_cnode_slots`).
+- Profile constants like `MAX_CAPABILITIES_PER_CSPACE` are runtime defaults/policy
+  inputs, not fixed representation ceilings.
+
+### Resize and accounting invariants
+
+- Grow/shrink are fallible operations.
+- Shrink is rejected when any truncated slot is live.
+- Grow allocates new backing and commits only on success (replace-on-success).
+- Failed resize must leave both slot contents and slot accounting unchanged.
+- Successful resize must update CNode slot accounting by exactly the delta.
+- Process CNode cleanup must release its reserved slot accounting.
+
+### Revoke scratch behavior
+
+- Revoke traversal scratch/worklists are allocator-backed (`Vec`) and sized from
+  current runtime CNode capacity.
+- Scratch may be cached and reused between revokes when capacity is sufficient.
+- Scratch cache is dropped/rebuilt when capacity growth requires larger buffers.
