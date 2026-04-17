@@ -551,6 +551,18 @@ pub fn alloc_pt_frame() -> Result<u64, FrameAllocError> {
         .alloc_frame()
 }
 
+pub fn alloc_pt_contiguous_frames(pages: usize) -> Result<u64, FrameAllocError> {
+    if pages == 0 {
+        return Err(FrameAllocError::InvalidMemoryMap);
+    }
+    ensure_pt_allocator_initialized()?;
+    let mut guard = PT_FRAME_ALLOCATOR.lock();
+    guard
+        .as_mut()
+        .ok_or(FrameAllocError::Uninitialized)?
+        .alloc_contiguous(pages)
+}
+
 pub fn free_pt_frame(phys: u64) -> Result<(), FrameAllocError> {
     ensure_pt_allocator_initialized()?;
     let mut guard = PT_FRAME_ALLOCATOR.lock();
@@ -558,6 +570,20 @@ pub fn free_pt_frame(phys: u64) -> Result<(), FrameAllocError> {
         .as_mut()
         .ok_or(FrameAllocError::Uninitialized)?
         .free_frame(phys)
+}
+
+pub fn free_pt_contiguous_frames(base_phys: u64, pages: usize) -> Result<(), FrameAllocError> {
+    if pages == 0 {
+        return Err(FrameAllocError::InvalidMemoryMap);
+    }
+    ensure_pt_allocator_initialized()?;
+    let mut guard = PT_FRAME_ALLOCATOR.lock();
+    let allocator = guard.as_mut().ok_or(FrameAllocError::Uninitialized)?;
+    for page in 0..pages {
+        let phys = base_phys.saturating_add((page as u64).saturating_mul(PAGE_SIZE_U64));
+        allocator.free_frame(phys)?;
+    }
+    Ok(())
 }
 
 const fn align_down(value: u64) -> u64 {
