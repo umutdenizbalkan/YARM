@@ -433,7 +433,14 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     }
     let sender_tid = current_tid(kernel)?;
 
-    let msg_result = if current_task_has_user_asid(kernel)? {
+    let sender_has_user_asid = current_task_has_user_asid(kernel)?;
+    let send_timeout_ticks = if sender_has_user_asid || len == 0 {
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) as u64
+    } else {
+        0
+    };
+
+    let msg_result = if sender_has_user_asid {
         if len > Message::MAX_PAYLOAD {
             let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
             let grant = kernel
@@ -541,13 +548,27 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         Err(err) => return Err(err),
     };
 
-    if let Err(err) = kernel.ipc_send(cap, msg) {
+    let send_result = if send_timeout_ticks == 0 {
+        kernel.ipc_send(cap, msg)
+    } else {
+        kernel.ipc_send_with_deadline(cap, msg, send_timeout_ticks)
+    };
+    if let Err(err) = send_result {
         if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
             let _ = kernel.take_transfer_envelope(
                 handle,
                 endpoint,
                 crate::kernel::ipc::ThreadId(current_tid(kernel)?),
             );
+        }
+        if err == KernelError::WouldBlock && send_timeout_ticks != 0 {
+            let sender_tid = current_tid(kernel)?;
+            let timed_out = kernel
+                .consume_ipc_timeout_fired_for_tid(sender_tid)
+                .map_err(SyscallError::from)?;
+            if timed_out {
+                return Err(SyscallError::TimedOut);
+            }
         }
         return Err(SyscallError::from(err));
     }
@@ -1004,7 +1025,8 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
-    use crate::kernel::ipc::IPC_REGISTER_WORDS;
+    use crate::kernel::ipc::{EndpointMode, IPC_REGISTER_WORDS};
+    use crate::kernel::scheduler_timer::Timer;
     use crate::kernel::trapframe::TrapFrame;
 
     #[test]
@@ -1093,6 +1115,53 @@ mod tests {
         );
         dispatch(&mut state, &mut frame).expect("recv timeout");
         assert_eq!(frame.error_code(), Some(SyscallError::TimedOut.code()));
+    }
+
+    #[test]
+    fn syscall_send_timeout_marks_blocked_sender_after_deadline_tick() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.set_timer_for_test(Timer::new(1));
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, send_cap_global, _recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+        let send_cap = state
+            .grant_capability_task_to_task(0, send_cap_global, 1)
+            .expect("dup send cap");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        assert!(
+            state
+                .capability_service()
+                .current_task_capability_has_right(send_cap, CapRights::SEND),
+            "task1 must hold send right"
+        );
+
+        let mut frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                0,
+                0,
+                1,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        let err = dispatch(&mut state, &mut frame).expect_err("blocked send");
+        assert_eq!(err, SyscallError::WouldBlock);
+
+        state
+            .handle_trap(crate::kernel::trap::Trap::TimerInterrupt, None)
+            .expect("timer trap");
+        assert!(
+            state
+                .consume_ipc_timeout_fired_for_tid(1)
+                .expect("consume timeout marker"),
+            "send timeout marker should fire after deadline"
+        );
     }
 
     #[test]
