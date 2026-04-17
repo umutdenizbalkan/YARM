@@ -2,7 +2,6 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use alloc::{boxed::Box, vec::Vec};
-use crate::kernel::lock::SpinLockIrq;
 pub use yarm_kernel::capability::{CNodeId, CapId, CapRights, CapabilityDeriveError};
 
 /// Capability object identity remains a monolithic enum for now.
@@ -88,30 +87,37 @@ impl Default for CapabilitySpace {
 }
 
 struct RevokeScratch {
-    child_heads: [Option<usize>; MAX_CAPABILITIES_PER_CSPACE],
-    next_sibling: [Option<usize>; MAX_CAPABILITIES_PER_CSPACE],
-    marked: [bool; MAX_CAPABILITIES_PER_CSPACE],
-    stack: [usize; MAX_CAPABILITIES_PER_CSPACE],
+    child_heads: Vec<Option<usize>>,
+    next_sibling: Vec<Option<usize>>,
+    marked: Vec<bool>,
+    stack: Vec<usize>,
 }
 
 impl RevokeScratch {
-    const fn new() -> Self {
-        Self {
-            child_heads: [None; MAX_CAPABILITIES_PER_CSPACE],
-            next_sibling: [None; MAX_CAPABILITIES_PER_CSPACE],
-            marked: [false; MAX_CAPABILITIES_PER_CSPACE],
-            stack: [0; MAX_CAPABILITIES_PER_CSPACE],
+    fn try_with_capacity(capacity: usize) -> Result<Self, CapabilityDeriveError> {
+        fn try_vec_clone<T: Clone>(
+            capacity: usize,
+            value: T,
+        ) -> Result<Vec<T>, CapabilityDeriveError> {
+            let mut out = Vec::new();
+            out.try_reserve_exact(capacity)
+                .map_err(|_| CapabilityDeriveError::AllocFailed)?;
+            out.resize(capacity, value);
+            Ok(out)
         }
-    }
 
-    fn clear(&mut self) {
-        self.child_heads.fill(None);
-        self.next_sibling.fill(None);
-        self.marked.fill(false);
+        let mut stack = Vec::new();
+        stack
+            .try_reserve_exact(capacity)
+            .map_err(|_| CapabilityDeriveError::AllocFailed)?;
+        Ok(Self {
+            child_heads: try_vec_clone(capacity, None)?,
+            next_sibling: try_vec_clone(capacity, None)?,
+            marked: try_vec_clone(capacity, false)?,
+            stack,
+        })
     }
 }
-
-static REVOKE_SCRATCH: SpinLockIrq<RevokeScratch> = SpinLockIrq::new(RevokeScratch::new());
 
 impl CapabilitySpace {
     pub fn try_with_slots(slot_capacity: usize) -> Result<Self, CapabilityDeriveError> {
@@ -268,8 +274,7 @@ impl CapabilitySpace {
             return Err(CapabilityDeriveError::NotFound);
         }
 
-        let mut scratch = REVOKE_SCRATCH.lock();
-        scratch.clear();
+        let mut scratch = RevokeScratch::try_with_capacity(self.slots.len())?;
         for idx in 0..self.slots.len() {
             let Some(entry) = self.slots[idx].entry else {
                 continue;
@@ -291,21 +296,16 @@ impl CapabilitySpace {
             scratch.child_heads[parent_idx] = Some(idx);
         }
 
-        let mut sp = 0usize;
-        scratch.stack[sp] = id.index();
-        sp += 1;
+        scratch.stack.push(id.index());
 
-        while sp != 0 {
-            sp -= 1;
-            let node = scratch.stack[sp];
+        while let Some(node) = scratch.stack.pop() {
             if scratch.marked[node] {
                 continue;
             }
             scratch.marked[node] = true;
             let mut child = scratch.child_heads[node];
             while let Some(idx) = child {
-                scratch.stack[sp] = idx;
-                sp += 1;
+                scratch.stack.push(idx);
                 child = scratch.next_sibling[idx];
             }
         }
