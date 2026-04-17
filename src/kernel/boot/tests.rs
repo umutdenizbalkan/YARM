@@ -1713,6 +1713,72 @@ fn syscall_trap_dispatches_ipc_send_recv() {
 }
 
 #[test]
+fn control_plane_cnode_resize_syscall_trap_allows_system_server_target() {
+    let mut state = Bootstrap::init().expect("init");
+    state
+        .register_task_with_class(810, TaskClass::SystemServer)
+        .expect("register system server");
+    state
+        .register_task_with_class(811, TaskClass::App)
+        .expect("register app");
+    state.enqueue_current_cpu(810).expect("enqueue system server");
+    state.dispatch_next_task().expect("dispatch");
+    if state.current_tid() != Some(810) {
+        state.yield_current().expect("switch to system server");
+    }
+
+    let target_cnode = state.process_cnode_for_pid(811).expect("target cnode");
+    let before = state
+        .cnode_slot_capacity(target_cnode)
+        .expect("target capacity");
+    let requested = before.saturating_add(4);
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::ControlPlaneSetCnodeSlots as usize,
+        [811, requested, 0, 0, 0, 0],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("control-plane resize syscall");
+    assert_eq!(frame.error_code(), None);
+    assert_eq!(frame.ret0(), requested);
+    assert_eq!(frame.ret1(), 811);
+    assert_eq!(state.cnode_slot_capacity(target_cnode), Some(requested));
+}
+
+#[test]
+fn control_plane_cnode_resize_syscall_trap_denies_non_system_server_targeting_other_process() {
+    let mut state = Bootstrap::init().expect("init");
+    state
+        .register_task_with_class(820, TaskClass::App)
+        .expect("register requester");
+    state
+        .register_task_with_class(821, TaskClass::App)
+        .expect("register target");
+    state.enqueue_current_cpu(820).expect("enqueue requester");
+    state.dispatch_next_task().expect("dispatch");
+    if state.current_tid() != Some(820) {
+        state.yield_current().expect("switch to requester");
+    }
+
+    let target_cnode = state.process_cnode_for_pid(821).expect("target cnode");
+    let before = state
+        .cnode_slot_capacity(target_cnode)
+        .expect("target capacity");
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::ControlPlaneSetCnodeSlots as usize,
+        [821, before.saturating_add(4), 0, 0, 0, 0],
+    );
+    let err = state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect_err("control-plane policy must deny");
+    assert_eq!(
+        err,
+        TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::MissingRight)
+    );
+    assert_eq!(state.cnode_slot_capacity(target_cnode), Some(before));
+}
+
+#[test]
 fn user_address_space_mapping_enforces_split_and_alignment() {
     let mut state = Bootstrap::init().expect("init");
     let (_asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
