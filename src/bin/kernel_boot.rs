@@ -55,12 +55,3 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     yarm::arch::boot_entry::emit_panic(info);
     loop {}
 }
-
-#[cfg(all(not(feature = "hosted-dev"), not(test)))]
-#[alloc_error_handler]
-fn alloc_error(_layout: core::alloc::Layout) -> ! {
-    yarm::pr_err!("kernel global allocator OOM");
-    loop {
-        core::hint::spin_loop();
-    }
-}

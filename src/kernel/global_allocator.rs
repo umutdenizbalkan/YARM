@@ -34,6 +34,7 @@ mod non_hosted {
 
     static ALLOCATOR_LOCK: SpinLockIrq<()> = SpinLockIrq::new(());
 
+    #[derive(Clone, Copy)]
     pub struct KernelGlobalAllocator;
 
     impl KernelGlobalAllocator {
@@ -111,8 +112,10 @@ mod non_hosted {
                 magic: ALLOCATION_MAGIC,
                 pages: total_pages as u64,
             };
-            core::ptr::write(base_ptr as *mut AllocationHeader, header);
-            base_ptr.add(PAGE_SIZE)
+            unsafe {
+                core::ptr::write(base_ptr as *mut AllocationHeader, header);
+                base_ptr.add(PAGE_SIZE)
+            }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
@@ -120,14 +123,14 @@ mod non_hosted {
                 return;
             }
             let _guard = ALLOCATOR_LOCK.lock();
-            let header_ptr = ptr.sub(PAGE_SIZE) as *const AllocationHeader;
+            let header_ptr = unsafe { ptr.sub(PAGE_SIZE) as *const AllocationHeader };
 
             #[cfg(target_arch = "x86_64")]
             if (header_ptr as usize as u64) < platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE {
                 return;
             }
 
-            let header = core::ptr::read(header_ptr);
+            let header = unsafe { core::ptr::read(header_ptr) };
             let Some(pages) = Self::header_pages_if_valid(header) else {
                 return;
             };
