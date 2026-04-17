@@ -3,8 +3,8 @@
 
 use super::ipc::Message;
 use super::process_abi::{
-    PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2,
-    SpawnV2Args, WaitPidV2Args, WaitPidV2Reply,
+    PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
+    PROC_OP_WAITPID_V2, SpawnV2Args, SpawnV3Args, WaitPidV2Args, WaitPidV2Reply,
 };
 use super::task::ThreadGroupId;
 
@@ -29,6 +29,7 @@ pub enum ProcessManagerError {
 pub struct SpawnV2Request {
     pub parent_pid: ProcessId,
     pub image_id: u64,
+    pub requested_cnode_slots: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +329,16 @@ impl ProcessManager {
                 Ok(ProcessRequest::SpawnV2(SpawnV2Request {
                     parent_pid: ProcessId(args.parent_pid),
                     image_id: args.image_id,
+                    requested_cnode_slots: None,
+                }))
+            }
+            PROC_OP_SPAWN_V3 => {
+                let args = SpawnV3Args::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                Ok(ProcessRequest::SpawnV2(SpawnV2Request {
+                    parent_pid: ProcessId(args.parent_pid),
+                    image_id: args.image_id,
+                    requested_cnode_slots: usize::try_from(args.requested_cnode_slots).ok(),
                 }))
             }
             PROC_OP_WAITPID_V2 => {
@@ -634,7 +645,7 @@ impl ProcessService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm_ipc_abi::process_abi::{SpawnV2Args, WaitPidV2Args};
+    use yarm_ipc_abi::process_abi::{SpawnV2Args, SpawnV3Args, WaitPidV2Args};
 
     #[test]
     fn elf_image_info_parser_accepts_minimal_elf64_header() {
@@ -675,6 +686,28 @@ mod tests {
             ProcessRequest::SpawnV2(SpawnV2Request {
                 parent_pid: ProcessId(7),
                 image_id: 99,
+                requested_cnode_slots: None,
+            })
+        );
+    }
+
+    #[test]
+    fn process_manager_parses_v3_payloads_with_requested_cnode_slots() {
+        let msg = Message::with_header(
+            0,
+            PROC_OP_SPAWN_V3,
+            0,
+            None,
+            &SpawnV3Args::new(7, 99, 64).encode(),
+        )
+        .expect("msg");
+        let req = ProcessManager::parse_request(msg).expect("parse");
+        assert_eq!(
+            req,
+            ProcessRequest::SpawnV2(SpawnV2Request {
+                parent_pid: ProcessId(7),
+                image_id: 99,
+                requested_cnode_slots: Some(64),
             })
         );
     }

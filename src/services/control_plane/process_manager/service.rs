@@ -9,7 +9,8 @@ use crate::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use crate::runtime::SharedKernel;
 use crate::services::common::service::{RequestResponseService, run_typed_request_loop};
 use yarm_ipc_abi::process_abi::{
-    PROC_OP_EXIT, PROC_OP_SPAWN_V2, PROC_OP_WAITPID_V2, SpawnV2Args, WaitPidV2Args,
+    PROC_OP_EXIT, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3, PROC_OP_WAITPID_V2, SpawnV2Args,
+    SpawnV3Args, WaitPidV2Args,
 };
 
 const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
@@ -367,6 +368,31 @@ fn roundtrip_call_reply_with_budget(
     )
 }
 
+fn spawn_request_message(
+    parent_pid: u64,
+    image_id: u64,
+    requested_cnode_slots: Option<usize>,
+) -> Result<Message, ProcessManagerError> {
+    if let Some(slots) = requested_cnode_slots {
+        return Message::with_header(
+            0,
+            PROC_OP_SPAWN_V3,
+            0,
+            None,
+            &SpawnV3Args::new(parent_pid, image_id, slots as u64).encode(),
+        )
+        .map_err(|_| ProcessManagerError::Malformed);
+    }
+    Message::with_header(
+        0,
+        PROC_OP_SPAWN_V2,
+        0,
+        None,
+        &SpawnV2Args::new(parent_pid, image_id).encode(),
+    )
+    .map_err(|_| ProcessManagerError::Malformed)
+}
+
 pub fn run_request_loop(
     service: &mut ProcessService,
     parent_pid: u64,
@@ -427,6 +453,19 @@ pub fn run_request_loop_over_kernel_ipc(
     image_id: u64,
     exit_code: u64,
 ) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
+    run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
+        kernel, service, parent_pid, image_id, exit_code, None,
+    )
+}
+
+fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
+    kernel: &mut KernelState,
+    service: &mut ProcessService,
+    parent_pid: u64,
+    image_id: u64,
+    exit_code: u64,
+    requested_cnode_slots: Option<usize>,
+) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
     let (_, client_send_cap, server_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(8))?;
     let (_, _, client_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(8))?;
 
@@ -436,14 +475,7 @@ pub fn run_request_loop_over_kernel_ipc(
         client_send_cap,
         server_recv_cap,
         client_recv_cap,
-        Message::with_header(
-            0,
-            PROC_OP_SPAWN_V2,
-            0,
-            None,
-            &SpawnV2Args::new(parent_pid, image_id).encode(),
-        )
-        .map_err(|_| ProcessManagerError::Malformed)?,
+        spawn_request_message(parent_pid, image_id, requested_cnode_slots)?,
     )?;
     let spawned = SpawnV2Result::decode(spawn_reply.as_slice())?;
 
@@ -497,7 +529,14 @@ pub fn run_request_loop_over_shared_kernel_with_cnode_resize(
     requested_cnode_slots: usize,
 ) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
     let summary = kernel.with(|state| {
-        run_request_loop_over_kernel_ipc(state, service, parent_pid, image_id, exit_code)
+        run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
+            state,
+            service,
+            parent_pid,
+            image_id,
+            exit_code,
+            Some(requested_cnode_slots),
+        )
     })?;
     kernel
         .control_plane_set_process_cnode_slots_via_syscall(summary.spawned_pid, requested_cnode_slots)
@@ -626,6 +665,10 @@ mod tests {
         assert!(
             src.contains("ipc_reply("),
             "process-manager migration should keep reply-cap reply path"
+        );
+        assert!(
+            src.contains("PROC_OP_SPAWN_V3"),
+            "process-manager migration should include v3 spawn path for requested cnode slots"
         );
     }
 

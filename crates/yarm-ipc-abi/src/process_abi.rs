@@ -8,12 +8,14 @@ pub enum ProcCodecError {
 
 pub const PROC_SERVER_ABI_VERSION: u16 = 1;
 pub const PROC_CODEC_V2_VERSION: u16 = 2;
+pub const PROC_CODEC_V3_VERSION: u16 = 3;
 
 pub const PROC_OP_GETPID: u16 = 1;
 pub const PROC_OP_EXIT: u16 = 2;
 pub const PROC_OP_GETPPID: u16 = 3;
 pub const PROC_OP_SPAWN_V2: u16 = 4;
 pub const PROC_OP_WAITPID_V2: u16 = 5;
+pub const PROC_OP_SPAWN_V3: u16 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnV2Args {
@@ -38,6 +40,34 @@ impl SpawnV2Args {
     pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
         let args = ProcV2Args::decode(payload)?;
         Ok(Self::new(args.arg0, args.arg1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnV3Args {
+    pub parent_pid: u64,
+    pub image_id: u64,
+    pub requested_cnode_slots: u64,
+}
+
+impl SpawnV3Args {
+    pub const VERSION: u16 = PROC_CODEC_V3_VERSION;
+
+    pub const fn new(parent_pid: u64, image_id: u64, requested_cnode_slots: u64) -> Self {
+        Self {
+            parent_pid,
+            image_id,
+            requested_cnode_slots,
+        }
+    }
+
+    pub const fn encode(self) -> [u8; ProcV3Args::ENCODED_LEN] {
+        ProcV3Args::new(self.parent_pid, self.image_id, self.requested_cnode_slots).encode()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        let args = ProcV3Args::decode(payload)?;
+        Ok(Self::new(args.arg0, args.arg1, args.arg2))
     }
 }
 
@@ -97,6 +127,54 @@ impl WaitPidV2Reply {
 pub struct ProcV2Args {
     pub arg0: u64,
     pub arg1: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcV3Args {
+    pub arg0: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+}
+
+impl ProcV3Args {
+    pub const VERSION: u16 = PROC_CODEC_V3_VERSION;
+    pub const ENCODED_LEN: usize = 24;
+
+    pub const fn new(arg0: u64, arg1: u64, arg2: u64) -> Self {
+        Self { arg0, arg1, arg2 }
+    }
+
+    pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut payload = [0u8; Self::ENCODED_LEN];
+        let a0 = self.arg0.to_le_bytes();
+        let a1 = self.arg1.to_le_bytes();
+        let a2 = self.arg2.to_le_bytes();
+        let mut i = 0;
+        while i < 8 {
+            payload[i] = a0[i];
+            payload[8 + i] = a1[i];
+            payload[16 + i] = a2[i];
+            i += 1;
+        }
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() != Self::ENCODED_LEN {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut a0 = [0u8; 8];
+        let mut a1 = [0u8; 8];
+        let mut a2 = [0u8; 8];
+        a0.copy_from_slice(&payload[..8]);
+        a1.copy_from_slice(&payload[8..16]);
+        a2.copy_from_slice(&payload[16..Self::ENCODED_LEN]);
+        Ok(Self {
+            arg0: u64::from_le_bytes(a0),
+            arg1: u64::from_le_bytes(a1),
+            arg2: u64::from_le_bytes(a2),
+        })
+    }
 }
 
 impl ProcV2Args {
@@ -166,6 +244,11 @@ mod tests {
         assert_eq!(WaitPidV2Reply::VERSION, PROC_CODEC_V2_VERSION);
         assert_eq!(PROC_OP_SPAWN_V2, 4);
         assert_eq!(PROC_OP_WAITPID_V2, 5);
+        assert_eq!(PROC_CODEC_V3_VERSION, 3);
+        assert_eq!(ProcV3Args::VERSION, PROC_CODEC_V3_VERSION);
+        assert_eq!(ProcV3Args::ENCODED_LEN, 24);
+        assert_eq!(SpawnV3Args::VERSION, PROC_CODEC_V3_VERSION);
+        assert_eq!(PROC_OP_SPAWN_V3, 6);
     }
 
     #[test]
@@ -178,6 +261,9 @@ mod tests {
 
         let reply = WaitPidV2Reply::new(4, 255);
         assert_eq!(WaitPidV2Reply::decode(&reply.encode()), Ok(reply));
+
+        let spawn_v3 = SpawnV3Args::new(7, 9, 64);
+        assert_eq!(SpawnV3Args::decode(&spawn_v3.encode()), Ok(spawn_v3));
     }
 
     #[test]
@@ -189,5 +275,21 @@ mod tests {
         ];
         assert_eq!(args.encode(), expected);
         assert_eq!(ProcV2Args::decode(&expected), Ok(args));
+    }
+
+    #[test]
+    fn proc_v3_golden_vector_is_stable() {
+        let args = ProcV3Args::new(
+            0x1122_3344_5566_7788,
+            0x99aa_bbcc_ddee_ff00,
+            0x0102_0304_0506_0708,
+        );
+        let expected = [
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // arg0 LE
+            0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, // arg1 LE
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // arg2 LE
+        ];
+        assert_eq!(args.encode(), expected);
+        assert_eq!(ProcV3Args::decode(&expected), Ok(args));
     }
 }
