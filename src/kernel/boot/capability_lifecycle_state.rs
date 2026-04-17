@@ -4,6 +4,33 @@
 use super::*;
 
 impl KernelState {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn control_plane_set_process_cnode_slots(
+        &mut self,
+        requester_tid: u64,
+        target_pid: u64,
+        slot_capacity: usize,
+    ) -> Result<(), KernelError> {
+        let requester_class = self.task_class(requester_tid).ok_or(KernelError::TaskMissing)?;
+        let requester_pid = self.process_id(requester_tid).unwrap_or(requester_tid);
+        let requester_is_system_server = requester_class == TaskClass::SystemServer;
+        if !requester_is_system_server && requester_pid != target_pid {
+            return Err(KernelError::MissingRight);
+        }
+
+        if let Some(existing_cnode) = self.process_cnode_for_pid(target_pid) {
+            if requester_is_system_server {
+                self.resize_cnode_slots(existing_cnode, slot_capacity)
+            } else {
+                self.resize_process_cnode_slots(target_pid, slot_capacity)
+            }
+        } else {
+            let target_cnode = CNodeId(target_pid);
+            self.ensure_cnode_space_with_slots(target_cnode, slot_capacity)?;
+            self.set_process_cnode_for_pid(target_pid, target_cnode)
+        }
+    }
+
     pub(crate) fn ensure_cnode_space(&mut self, cnode: CNodeId) -> Result<(), KernelError> {
         let slot_capacity = crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE;
         self.ensure_cnode_space_with_slots(cnode, slot_capacity)

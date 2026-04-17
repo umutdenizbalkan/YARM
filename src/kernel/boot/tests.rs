@@ -2598,6 +2598,37 @@ fn capability_space_telemetry_tracks_revoke_scratch_cache_reuse() {
 }
 
 #[test]
+fn system_server_control_plane_can_resize_other_process_cnode() {
+    let mut state = Bootstrap::init().expect("init");
+    state
+        .register_task_with_class(228, TaskClass::SystemServer)
+        .expect("system server task");
+    state
+        .register_task_with_class(229, TaskClass::App)
+        .expect("app task");
+
+    let app_cnode = state.process_cnode_for_pid(229).expect("app cnode");
+    let before = state.cnode_slot_capacity(app_cnode).expect("capacity");
+    let requested = before.saturating_add(8);
+
+    state
+        .control_plane_set_process_cnode_slots(228, 229, requested)
+        .expect("control-plane resize");
+    assert_eq!(state.cnode_slot_capacity(app_cnode), Some(requested));
+}
+
+#[test]
+fn non_system_server_control_plane_cannot_resize_other_process_cnode() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task_with_class(230, TaskClass::App).expect("app 1");
+    state.register_task_with_class(231, TaskClass::App).expect("app 2");
+    assert_eq!(
+        state.control_plane_set_process_cnode_slots(230, 231, 16),
+        Err(KernelError::MissingRight)
+    );
+}
+
+#[test]
 fn cnode_slot_budget_rejects_overcommit() {
     let mut state =
         Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
