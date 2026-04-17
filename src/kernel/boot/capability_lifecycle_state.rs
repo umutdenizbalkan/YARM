@@ -14,6 +14,7 @@ impl KernelState {
         cnode: CNodeId,
         slot_capacity: usize,
     ) -> Result<(), KernelError> {
+        let max_total_cnode_slots = self.runtime_capacity_config().max_total_cnode_slots;
         let bounded_slot_capacity =
             slot_capacity.clamp(1, crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE);
         self.with_capability_state_mut(|capability| {
@@ -25,6 +26,16 @@ impl KernelState {
             {
                 return Ok(());
             }
+            let reserved_slots: usize = capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .map(|space| space.slot_capacity)
+                .sum();
+            if reserved_slots.saturating_add(bounded_slot_capacity) > max_total_cnode_slots {
+                return Err(KernelError::CapabilityFull);
+            }
+
             if let Some(slot) = capability
                 .cnode_spaces
                 .iter_mut()

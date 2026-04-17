@@ -65,6 +65,9 @@ pub struct RuntimeCapacityConfig {
     pub max_drivers: usize,
     pub max_memory_objects: usize,
     pub max_transfer_envelopes: usize,
+    pub default_cnode_slot_capacity: usize,
+    pub driver_cnode_slot_capacity: usize,
+    pub max_total_cnode_slots: usize,
     pub max_capability_slots: usize,
 }
 

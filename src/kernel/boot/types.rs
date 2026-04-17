@@ -126,6 +126,9 @@ mod tests {
             max_drivers: 1,
             max_memory_objects: 1,
             max_transfer_envelopes: 1,
+            default_cnode_slot_capacity: 1,
+            driver_cnode_slot_capacity: 1,
+            max_total_cnode_slots: 1,
             max_capability_slots: 1,
         };
     }

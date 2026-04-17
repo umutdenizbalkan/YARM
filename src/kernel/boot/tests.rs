@@ -2505,7 +2505,7 @@ fn capacity_telemetry_reports_runtime_profile_capacities() {
     assert_eq!(t.tasks.capacity, limits.max_tasks);
     assert_eq!(t.drivers.capacity, limits.max_drivers);
     assert_eq!(t.memory_objects.capacity, limits.max_memory_objects);
-    assert_eq!(t.capability_slots.capacity, limits.max_capability_slots);
+    assert_eq!(t.capability_slots.capacity, limits.max_total_cnode_slots);
 }
 
 #[test]
@@ -2520,10 +2520,7 @@ fn constrained_profile_uses_smaller_default_cnode_slot_capacity_for_apps() {
     let cnode = state.process_cnode_for_pid(220).expect("process cnode");
     assert_eq!(
         state.cnode_slot_capacity(cnode),
-        Some(core::cmp::max(
-            1,
-            limits.max_capability_slots / core::cmp::max(1, limits.max_tasks),
-        ))
+        Some(limits.default_cnode_slot_capacity)
     );
 }
 
@@ -2531,6 +2528,7 @@ fn constrained_profile_uses_smaller_default_cnode_slot_capacity_for_apps() {
 fn driver_tasks_get_max_cnode_slot_capacity() {
     let mut state =
         Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    let limits = state.runtime_capacity_config();
     state
         .register_task_with_class(221, TaskClass::Driver)
         .expect("driver task");
@@ -2538,8 +2536,31 @@ fn driver_tasks_get_max_cnode_slot_capacity() {
     let cnode = state.process_cnode_for_pid(221).expect("process cnode");
     assert_eq!(
         state.cnode_slot_capacity(cnode),
-        Some(crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE)
+        Some(limits.driver_cnode_slot_capacity)
     );
+}
+
+#[test]
+fn cnode_slot_budget_rejects_overcommit() {
+    let mut state =
+        Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained).expect("init");
+    let limits = state.runtime_capacity_config();
+    let mut saw_overcommit_rejection = false;
+
+    for idx in 0..=limits.max_tasks {
+        let cnode = CNodeId(10_000 + idx as u64);
+        let result = state.ensure_cnode_space_with_slots(cnode, limits.driver_cnode_slot_capacity);
+        if result == Err(KernelError::CapabilityFull) {
+            saw_overcommit_rejection = true;
+            break;
+        }
+        assert!(
+            result.is_ok(),
+            "unexpected cnode creation error: {result:?}"
+        );
+    }
+
+    assert!(saw_overcommit_rejection);
 }
 
 #[test]

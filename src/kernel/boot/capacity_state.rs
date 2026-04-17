@@ -5,8 +5,6 @@ use super::*;
 
 impl KernelState {
     const CAPACITY_NEAR_FULL_PERCENT: usize = 90;
-    const MAX_CAPABILITY_SLOTS_ACROSS_CNODES: usize =
-        MAX_TASKS * crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE;
 
     fn capacity_pool(used: usize, capacity: usize) -> CapacityPoolTelemetry {
         let near_full = if capacity == 0 {
@@ -49,7 +47,7 @@ impl KernelState {
             memory_objects: Self::capacity_pool(memory_object_used, limits.max_memory_objects),
             capability_slots: Self::capacity_pool(
                 capability_slots_used,
-                limits.max_capability_slots,
+                limits.max_total_cnode_slots,
             ),
         }
     }
@@ -60,36 +58,68 @@ impl KernelState {
 
     pub fn runtime_capacity_config(&self) -> RuntimeCapacityConfig {
         match self.with_boot_config(|boot_config| boot_config.capacity_profile) {
-            KernelCapacityProfile::HostedDefault => RuntimeCapacityConfig {
-                max_endpoints: MAX_ENDPOINTS,
-                max_notifications: MAX_NOTIFICATIONS,
-                max_tasks: MAX_TASKS,
-                max_drivers: MAX_DRIVERS,
-                max_memory_objects: MAX_MEMORY_OBJECTS,
-                max_transfer_envelopes: MAX_TRANSFER_ENVELOPES,
-                max_capability_slots: Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES,
-            },
-            KernelCapacityProfile::Constrained => RuntimeCapacityConfig {
-                max_endpoints: core::cmp::max(1, MAX_ENDPOINTS / 2),
-                max_notifications: core::cmp::max(1, MAX_NOTIFICATIONS / 2),
-                max_tasks: core::cmp::max(2, MAX_TASKS / 2),
-                max_drivers: core::cmp::max(1, MAX_DRIVERS / 2),
-                max_memory_objects: core::cmp::max(1, MAX_MEMORY_OBJECTS / 2),
-                max_transfer_envelopes: core::cmp::max(1, MAX_TRANSFER_ENVELOPES / 2),
-                max_capability_slots: core::cmp::max(
+            KernelCapacityProfile::HostedDefault => Self::runtime_capacity_config_with_cnodes(
+                MAX_ENDPOINTS,
+                MAX_NOTIFICATIONS,
+                MAX_TASKS,
+                MAX_DRIVERS,
+                MAX_MEMORY_OBJECTS,
+                MAX_TRANSFER_ENVELOPES,
+                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+            ),
+            KernelCapacityProfile::Constrained => Self::runtime_capacity_config_with_cnodes(
+                core::cmp::max(1, MAX_ENDPOINTS / 2),
+                core::cmp::max(1, MAX_NOTIFICATIONS / 2),
+                core::cmp::max(2, MAX_TASKS / 2),
+                core::cmp::max(1, MAX_DRIVERS / 2),
+                core::cmp::max(1, MAX_MEMORY_OBJECTS / 2),
+                core::cmp::max(1, MAX_TRANSFER_ENVELOPES / 2),
+                core::cmp::max(
                     1,
-                    Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES / 2,
+                    crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE / 2,
                 ),
-            },
-            KernelCapacityProfile::Throughput => RuntimeCapacityConfig {
-                max_endpoints: MAX_ENDPOINTS,
-                max_notifications: MAX_NOTIFICATIONS,
-                max_tasks: MAX_TASKS,
-                max_drivers: MAX_DRIVERS,
-                max_memory_objects: MAX_MEMORY_OBJECTS,
-                max_transfer_envelopes: MAX_TRANSFER_ENVELOPES,
-                max_capability_slots: Self::MAX_CAPABILITY_SLOTS_ACROSS_CNODES,
-            },
+                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+            ),
+            KernelCapacityProfile::Throughput => Self::runtime_capacity_config_with_cnodes(
+                MAX_ENDPOINTS,
+                MAX_NOTIFICATIONS,
+                MAX_TASKS,
+                MAX_DRIVERS,
+                MAX_MEMORY_OBJECTS,
+                MAX_TRANSFER_ENVELOPES,
+                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+                crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
+            ),
+        }
+    }
+
+    fn runtime_capacity_config_with_cnodes(
+        max_endpoints: usize,
+        max_notifications: usize,
+        max_tasks: usize,
+        max_drivers: usize,
+        max_memory_objects: usize,
+        max_transfer_envelopes: usize,
+        default_cnode_slot_capacity: usize,
+        driver_cnode_slot_capacity: usize,
+    ) -> RuntimeCapacityConfig {
+        let app_slots = max_tasks
+            .saturating_sub(max_drivers)
+            .saturating_mul(default_cnode_slot_capacity);
+        let driver_slots = max_drivers.saturating_mul(driver_cnode_slot_capacity);
+        let max_total_cnode_slots = app_slots.saturating_add(driver_slots);
+        RuntimeCapacityConfig {
+            max_endpoints,
+            max_notifications,
+            max_tasks,
+            max_drivers,
+            max_memory_objects,
+            max_transfer_envelopes,
+            default_cnode_slot_capacity,
+            driver_cnode_slot_capacity,
+            max_total_cnode_slots,
+            max_capability_slots: max_total_cnode_slots,
         }
     }
 }

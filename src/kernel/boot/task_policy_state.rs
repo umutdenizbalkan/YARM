@@ -138,11 +138,8 @@ impl KernelState {
         limits: RuntimeCapacityConfig,
     ) -> usize {
         match class {
-            TaskClass::Driver => crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE,
-            TaskClass::App | TaskClass::SystemServer => core::cmp::max(
-                1,
-                limits.max_capability_slots / core::cmp::max(1, limits.max_tasks),
-            ),
+            TaskClass::Driver => limits.driver_cnode_slot_capacity,
+            TaskClass::App | TaskClass::SystemServer => limits.default_cnode_slot_capacity,
         }
     }
 }
