@@ -13,6 +13,15 @@ mod non_hosted {
     use crate::kernel::lock::SpinLockIrq;
     use crate::kernel::vm::PAGE_SIZE;
 
+    // Design note (current transitional allocator contract):
+    // - Accepted alignment: power-of-two alignments up to PAGE_SIZE; larger alignments are rejected.
+    // - Layout: one metadata header page at base, one-or-more user pages immediately after base + PAGE_SIZE.
+    // - Invalid-free detection: best-effort only (pointer shape + header magic/page-count sanity), not full
+    //   ownership-proofing against all forged/stale pointers.
+    // - Small-allocation waste: worst case is (2 * PAGE_SIZE - 1) bytes wasted for a 1-byte allocation
+    //   (one dedicated header page + one user page minimum).
+    // - Planned direction: replace with slab/small-object allocation for sub-page objects while preserving
+    //   contiguous-page backing for large allocations.
     const HEADER_SIZE: usize = core::mem::size_of::<AllocationHeader>();
     const ALLOC_ALIGN_LIMIT: usize = PAGE_SIZE;
     const ALLOCATION_MAGIC: u64 = 0x5941_524d_4741_4c4c; // "YARMGALL"
