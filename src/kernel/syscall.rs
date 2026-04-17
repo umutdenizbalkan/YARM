@@ -562,12 +562,22 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             );
         }
         if err == KernelError::WouldBlock && send_timeout_ticks != 0 {
-            let sender_tid = current_tid(kernel)?;
             let timed_out = kernel
                 .consume_ipc_timeout_fired_for_tid(sender_tid)
                 .map_err(SyscallError::from)?;
             if timed_out {
                 return Err(SyscallError::TimedOut);
+            }
+            let still_blocked = matches!(
+                kernel.task_status(sender_tid),
+                Some(crate::kernel::task::TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointSend(_)
+                ))
+            );
+            if !still_blocked {
+                frame.set_ok(0, 0, 0);
+                encode_transfer_cap_ret(frame, None)?;
+                return Ok(());
             }
         }
         return Err(SyscallError::from(err));
@@ -1152,6 +1162,18 @@ mod tests {
         );
         let err = dispatch(&mut state, &mut frame).expect_err("blocked send");
         assert_eq!(err, SyscallError::WouldBlock);
+        assert_eq!(
+            state.task_status(1),
+            Some(crate::kernel::task::TaskStatus::Blocked(
+                crate::kernel::task::WaitReason::EndpointSend(send_cap)
+            ))
+        );
+        assert!(
+            !state
+                .consume_ipc_timeout_fired_for_tid(1)
+                .expect("pre-tick timeout marker"),
+            "timeout marker must not fire before timer progression"
+        );
 
         state
             .handle_trap(crate::kernel::trap::Trap::TimerInterrupt, None)
@@ -1162,6 +1184,82 @@ mod tests {
                 .expect("consume timeout marker"),
             "send timeout marker should fire after deadline"
         );
+        assert!(matches!(
+            state.task_status(1),
+            Some(
+                crate::kernel::task::TaskStatus::Runnable
+                    | crate::kernel::task::TaskStatus::Running
+            )
+        ));
+    }
+
+    #[test]
+    fn syscall_send_zero_timeout_keeps_would_block_behavior() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, send_cap_global, _recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+        let send_cap = state
+            .grant_capability_task_to_task(0, send_cap_global, 1)
+            .expect("dup send cap");
+        state.yield_current().expect("switch to task1");
+
+        let mut frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                0,
+                0,
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        let err = dispatch(&mut state, &mut frame).expect_err("blocked send");
+        assert_eq!(err, SyscallError::WouldBlock);
+    }
+
+    #[test]
+    fn syscall_send_with_timeout_succeeds_when_receiver_waiting() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("receiver");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, send_cap_global, recv_cap_global) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+        state
+            .grant_capability_task_to_task(0, send_cap_global, 1)
+            .expect("dup send cap");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv cap");
+        state.yield_current().expect("switch to receiver");
+        assert_eq!(state.current_tid(), Some(1));
+
+        let mut recv_frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut recv_frame).expect("block receiver");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap_global.0 as usize,
+                0,
+                0,
+                0,
+                5,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send before timeout");
+        assert_eq!(send_frame.error_code(), None);
     }
 
     #[test]
