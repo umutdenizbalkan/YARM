@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::boot::{KernelError, KernelState};
+use crate::kernel::boot::{KernelError, KernelState, TrapHandleError};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 use crate::kernel::process::ProcessManagerError;
 use crate::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
+use crate::kernel::syscall::SyscallError;
 use crate::kernel::task::TaskClass;
 use crate::runtime::SharedKernel;
 use crate::services::common::service::{RequestResponseService, run_typed_request_loop};
@@ -320,11 +321,48 @@ pub struct ProcessManagerLoopSummary {
 }
 
 fn map_kernel_ipc_err<T>(result: Result<T, KernelError>) -> Result<T, ProcessManagerError> {
-    result.map_err(|_| ProcessManagerError::Malformed)
+    result.map_err(map_kernel_ipc_error)
 }
 
-fn map_kernel_ipc_error(_: KernelError) -> ProcessManagerError {
-    ProcessManagerError::Malformed
+fn map_kernel_ipc_error(err: KernelError) -> ProcessManagerError {
+    match err {
+        KernelError::MissingRight => ProcessManagerError::PermissionDenied,
+        KernelError::WouldBlock => ProcessManagerError::WouldBlock,
+        KernelError::CapabilityFull
+        | KernelError::EndpointFull
+        | KernelError::EndpointQueueFull
+        | KernelError::TaskTableFull
+        | KernelError::MemoryObjectFull
+        | KernelError::SchedulerFull
+        | KernelError::VmFull => ProcessManagerError::TableFull,
+        KernelError::InvalidCapability
+        | KernelError::WrongObject
+        | KernelError::StaleCapability
+        | KernelError::UserMemoryFault
+        | KernelError::TaskMissing
+        | KernelError::MemoryObjectMissing
+        | KernelError::Vm(_) => ProcessManagerError::Malformed,
+    }
+}
+
+fn map_trap_ipc_error(err: TrapHandleError) -> ProcessManagerError {
+    match err {
+        TrapHandleError::Syscall(syscall_err) => map_syscall_error(syscall_err),
+        TrapHandleError::MissingTrapFrame => ProcessManagerError::InvalidTransport,
+    }
+}
+
+fn map_syscall_error(err: SyscallError) -> ProcessManagerError {
+    match err {
+        SyscallError::MissingRight => ProcessManagerError::PermissionDenied,
+        SyscallError::WouldBlock | SyscallError::TimedOut => ProcessManagerError::WouldBlock,
+        SyscallError::QueueFull | SyscallError::Internal => ProcessManagerError::TableFull,
+        SyscallError::InvalidNumber
+        | SyscallError::InvalidArgs
+        | SyscallError::InvalidCapability
+        | SyscallError::WrongObject
+        | SyscallError::PageFault => ProcessManagerError::Malformed,
+    }
 }
 
 fn roundtrip_ipc(
@@ -513,7 +551,7 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
     if let Some(requested_slots) = recorded_requested_slots.or(requested_cnode_slots) {
         kernel
             .control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)
-            .map_err(|_| ProcessManagerError::Malformed)?;
+            .map_err(map_trap_ipc_error)?;
     }
 
     let _ = roundtrip_ipc(
@@ -697,7 +735,31 @@ mod tests {
             32,
         )
         .expect_err("unprivileged resize must fail");
-        assert_eq!(err, ProcessManagerError::Malformed);
+        assert_eq!(err, ProcessManagerError::PermissionDenied);
+    }
+
+    #[test]
+    fn process_manager_ipc_error_mapping_covers_policy_budget_and_transport_paths() {
+        assert_eq!(
+            map_kernel_ipc_error(KernelError::MissingRight),
+            ProcessManagerError::PermissionDenied
+        );
+        assert_eq!(
+            map_kernel_ipc_error(KernelError::CapabilityFull),
+            ProcessManagerError::TableFull
+        );
+        assert_eq!(
+            map_trap_ipc_error(TrapHandleError::MissingTrapFrame),
+            ProcessManagerError::InvalidTransport
+        );
+        assert_eq!(
+            map_trap_ipc_error(TrapHandleError::Syscall(SyscallError::InvalidArgs)),
+            ProcessManagerError::Malformed
+        );
+        assert_eq!(
+            map_trap_ipc_error(TrapHandleError::Syscall(SyscallError::Internal)),
+            ProcessManagerError::TableFull
+        );
     }
 
     #[test]
