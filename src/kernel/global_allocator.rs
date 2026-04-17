@@ -13,11 +13,13 @@ mod non_hosted {
     use crate::kernel::lock::SpinLockIrq;
     use crate::kernel::vm::PAGE_SIZE;
 
-    const HEADER_SIZE: usize = core::mem::size_of::<u64>();
+    const HEADER_SIZE: usize = core::mem::size_of::<AllocationHeader>();
     const ALLOC_ALIGN_LIMIT: usize = PAGE_SIZE;
+    const ALLOCATION_MAGIC: u64 = 0x5941_524d_4741_4c4c; // "YARMGALL"
 
     #[derive(Debug, Clone, Copy)]
     struct AllocationHeader {
+        magic: u64,
         pages: u64,
     }
 
@@ -75,6 +77,7 @@ mod non_hosted {
             }
 
             let header = AllocationHeader {
+                magic: ALLOCATION_MAGIC,
                 pages: total_pages as u64,
             };
             core::ptr::write(base_ptr as *mut AllocationHeader, header);
@@ -85,11 +88,23 @@ mod non_hosted {
             if ptr.is_null() {
                 return;
             }
+            if !(ptr as usize).is_multiple_of(PAGE_SIZE) {
+                return;
+            }
             let _guard = ALLOCATOR_LOCK.lock();
             let header_ptr = ptr.sub(PAGE_SIZE) as *const AllocationHeader;
+
+            #[cfg(target_arch = "x86_64")]
+            if (header_ptr as usize as u64) < platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE {
+                return;
+            }
+
             let header = core::ptr::read(header_ptr);
+            if header.magic != ALLOCATION_MAGIC {
+                return;
+            }
             let pages = header.pages as usize;
-            if pages == 0 {
+            if !(2..=u64::MAX as usize).contains(&pages) {
                 return;
             }
 
