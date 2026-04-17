@@ -479,7 +479,15 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
         spawn_request_message(parent_pid, image_id, requested_cnode_slots)?,
     )?;
     let spawned = SpawnV2Result::decode(spawn_reply.as_slice())?;
-    if let Some(requested_slots) = requested_cnode_slots {
+    let recorded_requested_slots = service
+        .requested_cnode_slots_for_process(spawned.pid.0)
+        .flatten();
+    if let Some(requested_slots) = requested_cnode_slots
+        && recorded_requested_slots != Some(requested_slots)
+    {
+        return Err(ProcessManagerError::Malformed);
+    }
+    if let Some(requested_slots) = recorded_requested_slots.or(requested_cnode_slots) {
         kernel
             .control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)
             .map_err(|_| ProcessManagerError::Malformed)?;

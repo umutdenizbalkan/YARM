@@ -637,6 +637,10 @@ impl ProcessService {
         self.handled
     }
 
+    pub fn requested_cnode_slots_for_process(&self, pid: u64) -> Option<Option<usize>> {
+        self.manager.process_requested_cnode_slots(ProcessId(pid))
+    }
+
     pub fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessManagerError> {
         self.manager.mark_exit(pid, code)
     }
