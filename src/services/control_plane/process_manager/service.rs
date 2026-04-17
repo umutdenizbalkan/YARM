@@ -479,6 +479,11 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
         spawn_request_message(parent_pid, image_id, requested_cnode_slots)?,
     )?;
     let spawned = SpawnV2Result::decode(spawn_reply.as_slice())?;
+    if let Some(requested_slots) = requested_cnode_slots {
+        kernel
+            .control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)
+            .map_err(|_| ProcessManagerError::Malformed)?;
+    }
 
     let _ = roundtrip_ipc(
         kernel,
@@ -529,7 +534,7 @@ pub fn run_request_loop_over_shared_kernel_with_cnode_resize(
     exit_code: u64,
     requested_cnode_slots: usize,
 ) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
-    let summary = kernel.with(|state| {
+    kernel.with(|state| {
         run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
             state,
             service,
@@ -538,11 +543,7 @@ pub fn run_request_loop_over_shared_kernel_with_cnode_resize(
             exit_code,
             Some(requested_cnode_slots),
         )
-    })?;
-    kernel
-        .control_plane_set_process_cnode_slots_via_syscall(summary.spawned_pid, requested_cnode_slots)
-        .map_err(|_| ProcessManagerError::Malformed)?;
-    Ok(summary)
+    })
 }
 
 pub fn run() {
