@@ -381,18 +381,35 @@ pub use hosted::KernelGlobalAllocator;
 
 #[cfg(all(test, feature = "hosted-dev"))]
 mod hosted_dev_allocator_model_tests {
+    use std::array;
     use std::collections::BTreeSet;
     use std::vec::Vec;
 
     const PAGE_SIZE: usize = 4096;
     const CLASS_SIZES: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
     const SMALL_MAX: usize = 2048;
+    const SLAB_HEADER_BYTES: usize = 64;
+
+    fn align_up(value: usize, align: usize) -> usize {
+        (value + align - 1) & !(align - 1)
+    }
+
+    fn class_capacity(class_idx: usize) -> usize {
+        let obj = CLASS_SIZES[class_idx];
+        let start = align_up(SLAB_HEADER_BYTES, obj);
+        (PAGE_SIZE - start) / obj
+    }
 
     #[derive(Default)]
+    struct ClassPool {
+        free: Vec<usize>,
+        live: BTreeSet<usize>,
+        pages: usize,
+    }
+
     struct ModelAlloc {
         next_addr: usize,
-        free_small: [Vec<usize>; CLASS_SIZES.len()],
-        live_small: BTreeSet<usize>,
+        small: [ClassPool; CLASS_SIZES.len()],
         live_large: BTreeSet<usize>,
     }
 
@@ -400,7 +417,8 @@ mod hosted_dev_allocator_model_tests {
         fn new() -> Self {
             Self {
                 next_addr: 0x1000_0000,
-                ..Default::default()
+                small: array::from_fn(|_| ClassPool::default()),
+                live_large: BTreeSet::new(),
             }
         }
 
@@ -417,15 +435,24 @@ mod hosted_dev_allocator_model_tests {
 
         fn alloc(&mut self, size: usize, align: usize) -> Option<usize> {
             if let Some(class_idx) = Self::class_for(size, align) {
-                if let Some(ptr) = self.free_small[class_idx].pop() {
-                    self.live_small.insert(ptr);
+                if self.small[class_idx].free.is_empty() {
+                    let obj = CLASS_SIZES[class_idx];
+                    let start = align_up(SLAB_HEADER_BYTES, obj);
+                    let cap = class_capacity(class_idx);
+                    let page_base = align_up(self.next_addr, PAGE_SIZE);
+                    self.next_addr = page_base + PAGE_SIZE;
+                    self.small[class_idx].pages += 1;
+                    for idx in 0..cap {
+                        self.small[class_idx]
+                            .free
+                            .push(page_base + start + idx * obj);
+                    }
+                }
+                if let Some(ptr) = self.small[class_idx].free.pop() {
+                    self.small[class_idx].live.insert(ptr);
                     return Some(ptr);
                 }
-                let step = CLASS_SIZES[class_idx];
-                let ptr = (self.next_addr + (step - 1)) & !(step - 1);
-                self.next_addr = ptr + step;
-                self.live_small.insert(ptr);
-                return Some(ptr);
+                return None;
             }
             if align > PAGE_SIZE || !align.is_power_of_two() {
                 return None;
@@ -439,10 +466,10 @@ mod hosted_dev_allocator_model_tests {
 
         fn dealloc(&mut self, size: usize, align: usize, ptr: usize) -> bool {
             if let Some(class_idx) = Self::class_for(size, align) {
-                if !self.live_small.remove(&ptr) {
+                if !self.small[class_idx].live.remove(&ptr) {
                     return false;
                 }
-                self.free_small[class_idx].push(ptr);
+                self.small[class_idx].free.push(ptr);
                 return true;
             }
             self.live_large.remove(&ptr)
@@ -499,7 +526,7 @@ mod hosted_dev_allocator_model_tests {
         let mut a = ModelAlloc::new();
         let s = a.alloc(SMALL_MAX, 8).expect("small");
         let l = a.alloc(SMALL_MAX + 1, 8).expect("large");
-        assert!(a.live_small.contains(&s));
+        assert!(a.small[7].live.contains(&s));
         assert!(a.live_large.contains(&l));
         assert!(a.dealloc(SMALL_MAX, 8, s));
         assert!(a.dealloc(SMALL_MAX + 1, 8, l));
@@ -546,5 +573,103 @@ mod hosted_dev_allocator_model_tests {
         assert!(!a.dealloc(32, 8, p + 8));
         assert!(a.dealloc(32, 8, p));
         assert!(!a.dealloc(32, 8, p));
+    }
+
+    #[test]
+    fn free_all_objects_from_page_then_reallocate_all() {
+        let mut a = ModelAlloc::new();
+        let class_idx = ModelAlloc::class_for(24, 8).expect("class");
+        let cap = class_capacity(class_idx);
+        let mut first_round = Vec::new();
+        for _ in 0..cap {
+            first_round.push(a.alloc(24, 8).expect("alloc"));
+        }
+        assert_eq!(a.small[class_idx].pages, 1);
+        let first_set: BTreeSet<usize> = first_round.iter().copied().collect();
+        for ptr in first_round {
+            assert!(a.dealloc(24, 8, ptr));
+        }
+        let mut second_round = Vec::new();
+        for _ in 0..cap {
+            second_round.push(a.alloc(24, 8).expect("realloc"));
+        }
+        let second_set: BTreeSet<usize> = second_round.iter().copied().collect();
+        assert_eq!(first_set, second_set);
+    }
+
+    #[test]
+    fn exhausting_one_class_spans_multiple_pages() {
+        let mut a = ModelAlloc::new();
+        let class_idx = ModelAlloc::class_for(16, 8).expect("class");
+        let cap = class_capacity(class_idx);
+        let total = cap * 2 + 17;
+        let mut ptrs = Vec::new();
+        for _ in 0..total {
+            ptrs.push(a.alloc(16, 8).expect("alloc"));
+        }
+        assert!(a.small[class_idx].pages >= 3);
+        for ptr in ptrs {
+            assert!(a.dealloc(16, 8, ptr));
+        }
+    }
+
+    #[test]
+    fn mixed_allocate_free_interleavings_stay_consistent() {
+        let mut a = ModelAlloc::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut live = Vec::new();
+
+        for _ in 0..20_000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let do_alloc = (seed & 1) == 0 || live.is_empty();
+            if do_alloc {
+                let bucket = (seed as usize) % 5;
+                let size = match bucket {
+                    0 => 8,
+                    1 => 40,
+                    2 => 96,
+                    3 => 400,
+                    _ => 1600,
+                };
+                let align = 1usize << (((seed >> 3) as usize) % 5);
+                if let Some(ptr) = a.alloc(size, align) {
+                    live.push((size, align, ptr));
+                }
+            } else {
+                let idx = (seed as usize) % live.len();
+                let (size, align, ptr) = live.swap_remove(idx);
+                assert!(a.dealloc(size, align, ptr));
+            }
+        }
+
+        for (size, align, ptr) in live {
+            assert!(a.dealloc(size, align, ptr));
+        }
+    }
+
+    #[test]
+    fn repeated_vec_growth_transitions_size_classes() {
+        let mut a = ModelAlloc::new();
+        let elem_size = 8usize;
+        let mut cap = 1usize;
+        let mut current_ptr = a.alloc(cap * elem_size, elem_size).expect("alloc");
+        let mut current_class = ModelAlloc::class_for(cap * elem_size, elem_size);
+        let mut transitions = 0usize;
+
+        for _ in 0..16 {
+            let next_cap = cap.saturating_mul(2);
+            let next_size = next_cap * elem_size;
+            let next_ptr = a.alloc(next_size, elem_size).expect("grow");
+            assert!(a.dealloc(cap * elem_size, elem_size, current_ptr));
+            let next_class = ModelAlloc::class_for(next_size, elem_size);
+            if next_class != current_class {
+                transitions += 1;
+            }
+            current_class = next_class;
+            cap = next_cap;
+            current_ptr = next_ptr;
+        }
+        assert!(transitions >= 3);
+        assert!(a.dealloc(cap * elem_size, elem_size, current_ptr));
     }
 }
