@@ -654,6 +654,31 @@ mod tests {
     }
 
     #[test]
+    fn process_manager_shared_kernel_requested_resize_is_denied_without_system_server_context() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("kernel init"));
+        let mut service = ProcessService::new();
+        let err = run_request_loop_over_shared_kernel_with_cnode_resize(
+            &kernel,
+            &mut service,
+            7,
+            42,
+            9,
+            32,
+        )
+        .expect_err("unprivileged resize must fail");
+        assert_eq!(err, ProcessManagerError::Malformed);
+    }
+
+    #[test]
+    fn process_manager_kernel_ipc_v2_spawn_path_does_not_create_process_cnode_resize_side_effect() {
+        let mut kernel = Bootstrap::init().expect("kernel init");
+        let mut service = ProcessService::new();
+        let summary = run_request_loop_over_kernel_ipc(&mut kernel, &mut service, 7, 42, 9)
+            .expect("kernel ipc loop");
+        assert!(kernel.process_cnode_for_pid(summary.spawned_pid).is_none());
+    }
+
+    #[test]
     fn process_manager_source_guardrail_prefers_budgeted_timed_receive_path() {
         let src = include_str!("service.rs");
         assert!(
