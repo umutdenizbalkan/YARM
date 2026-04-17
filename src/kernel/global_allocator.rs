@@ -28,6 +28,34 @@ mod non_hosted {
     pub struct KernelGlobalAllocator;
 
     impl KernelGlobalAllocator {
+        fn is_supported_alignment(align: usize) -> bool {
+            align.is_power_of_two() && align <= ALLOC_ALIGN_LIMIT
+        }
+
+        fn allocation_pages_for(layout: Layout) -> Option<usize> {
+            if layout.size() == 0 || !Self::is_supported_alignment(layout.align()) {
+                return None;
+            }
+            let user_bytes = layout.size().saturating_add(HEADER_SIZE);
+            let pages = user_bytes.div_ceil(PAGE_SIZE).max(1);
+            Some(pages.saturating_add(1))
+        }
+
+        fn is_valid_user_pointer(ptr: *mut u8) -> bool {
+            !ptr.is_null() && (ptr as usize).is_multiple_of(PAGE_SIZE)
+        }
+
+        fn header_pages_if_valid(header: AllocationHeader) -> Option<usize> {
+            if header.magic != ALLOCATION_MAGIC {
+                return None;
+            }
+            let pages = header.pages as usize;
+            if !(2..=u64::MAX as usize).contains(&pages) {
+                return None;
+            }
+            Some(pages)
+        }
+
         fn phys_to_ptr(phys: u64) -> *mut u8 {
             #[cfg(target_arch = "x86_64")]
             {
@@ -56,17 +84,11 @@ mod non_hosted {
 
     unsafe impl GlobalAlloc for KernelGlobalAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            if layout.size() == 0 {
+            let Some(total_pages) = Self::allocation_pages_for(layout) else {
                 return null_mut();
-            }
-            if layout.align() > ALLOC_ALIGN_LIMIT {
-                return null_mut();
-            }
+            };
 
             let _guard = ALLOCATOR_LOCK.lock();
-            let user_bytes = layout.size().saturating_add(HEADER_SIZE);
-            let pages = user_bytes.div_ceil(PAGE_SIZE).max(1);
-            let total_pages = pages.saturating_add(1);
             let Ok(base_phys) = alloc_pt_contiguous_frames(total_pages) else {
                 return null_mut();
             };
@@ -85,10 +107,7 @@ mod non_hosted {
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-            if ptr.is_null() {
-                return;
-            }
-            if !(ptr as usize).is_multiple_of(PAGE_SIZE) {
+            if !Self::is_valid_user_pointer(ptr) {
                 return;
             }
             let _guard = ALLOCATOR_LOCK.lock();
@@ -100,13 +119,9 @@ mod non_hosted {
             }
 
             let header = core::ptr::read(header_ptr);
-            if header.magic != ALLOCATION_MAGIC {
+            let Some(pages) = Self::header_pages_if_valid(header) else {
                 return;
-            }
-            let pages = header.pages as usize;
-            if !(2..=u64::MAX as usize).contains(&pages) {
-                return;
-            }
+            };
 
             #[cfg(target_arch = "x86_64")]
             let base_phys = (header_ptr as usize as u64)
@@ -126,6 +141,166 @@ mod non_hosted {
     }
 
     pub static KERNEL_GLOBAL_ALLOCATOR: KernelGlobalAllocator = KernelGlobalAllocator;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::std::collections::BTreeMap;
+        use crate::std::vec::Vec;
+
+        struct AllocSim {
+            next_base: usize,
+            live: BTreeMap<usize, usize>,
+        }
+
+        impl AllocSim {
+            fn new(base: usize) -> Self {
+                Self {
+                    next_base: base,
+                    live: BTreeMap::new(),
+                }
+            }
+
+            fn alloc(&mut self, layout: Layout) -> Option<usize> {
+                let total_pages = KernelGlobalAllocator::allocation_pages_for(layout)?;
+                let base = self.next_base;
+                self.next_base = self
+                    .next_base
+                    .saturating_add(total_pages.saturating_mul(PAGE_SIZE));
+                self.live.insert(base, total_pages);
+                Some(base.saturating_add(PAGE_SIZE))
+            }
+
+            fn dealloc(&mut self, user_ptr: usize) -> bool {
+                if !KernelGlobalAllocator::is_valid_user_pointer(user_ptr as *mut u8) {
+                    return false;
+                }
+                let base = user_ptr.saturating_sub(PAGE_SIZE);
+                let Some(pages) = self.live.get(&base).copied() else {
+                    return false;
+                };
+                let header = AllocationHeader {
+                    magic: ALLOCATION_MAGIC,
+                    pages: pages as u64,
+                };
+                let Some(valid_pages) = KernelGlobalAllocator::header_pages_if_valid(header) else {
+                    return false;
+                };
+                if valid_pages != pages {
+                    return false;
+                }
+                self.live.remove(&base).is_some()
+            }
+        }
+
+        #[test]
+        fn allocation_alignment_gate_accepts_only_power_of_two_up_to_page() {
+            assert!(KernelGlobalAllocator::is_supported_alignment(1));
+            assert!(KernelGlobalAllocator::is_supported_alignment(8));
+            assert!(KernelGlobalAllocator::is_supported_alignment(PAGE_SIZE));
+            assert!(!KernelGlobalAllocator::is_supported_alignment(0));
+            assert!(!KernelGlobalAllocator::is_supported_alignment(3));
+            assert!(!KernelGlobalAllocator::is_supported_alignment(PAGE_SIZE.saturating_mul(2)));
+        }
+
+        #[test]
+        fn returned_user_pointer_is_page_aligned_for_supported_layouts() {
+            let mut sim = AllocSim::new(0x4000_0000);
+            for align in [1usize, 2, 4, 8, 16, 32, 64, 256, 1024, PAGE_SIZE] {
+                let layout = Layout::from_size_align(33, align).expect("layout");
+                let user_ptr = sim.alloc(layout).expect("alloc");
+                assert_eq!(user_ptr % PAGE_SIZE, 0, "align={align}");
+            }
+        }
+
+        #[test]
+        fn many_small_alloc_free_cycles_leave_no_live_allocations() {
+            let mut sim = AllocSim::new(0x5000_0000);
+            for _ in 0..10_000usize {
+                let layout = Layout::from_size_align(1, 1).expect("layout");
+                let user_ptr = sim.alloc(layout).expect("alloc");
+                assert!(sim.dealloc(user_ptr));
+            }
+            assert!(sim.live.is_empty());
+        }
+
+        #[test]
+        fn mixed_size_allocations_and_frees_are_tracked_correctly() {
+            let mut sim = AllocSim::new(0x6000_0000);
+            let sizes = [1usize, 15, 128, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE * 3 + 17];
+            let mut ptrs = Vec::new();
+            for size in sizes {
+                let layout = Layout::from_size_align(size, 8).expect("layout");
+                ptrs.push(sim.alloc(layout).expect("alloc"));
+            }
+            for ptr in ptrs.into_iter().rev() {
+                assert!(sim.dealloc(ptr));
+            }
+            assert!(sim.live.is_empty());
+        }
+
+        #[test]
+        fn vec_like_grow_shrink_patterns_are_safe_under_allocator_model() {
+            let mut sim = AllocSim::new(0x7000_0000);
+            let mut current: Option<usize> = None;
+            let mut cap = 8usize;
+
+            for _ in 0..128usize {
+                let grow = Layout::from_size_align(cap, 8).expect("layout");
+                let next = sim.alloc(grow).expect("grow alloc");
+                if let Some(old) = current.take() {
+                    assert!(sim.dealloc(old));
+                }
+                current = Some(next);
+                cap = cap.saturating_mul(2).min(PAGE_SIZE * 8);
+            }
+
+            for _ in 0..128usize {
+                let shrink = Layout::from_size_align(cap.max(8), 8).expect("layout");
+                let next = sim.alloc(shrink).expect("shrink alloc");
+                if let Some(old) = current.take() {
+                    assert!(sim.dealloc(old));
+                }
+                current = Some(next);
+                cap = (cap / 2).max(8);
+            }
+
+            if let Some(last) = current {
+                assert!(sim.dealloc(last));
+            }
+            assert!(sim.live.is_empty());
+        }
+
+        #[test]
+        fn invalid_free_rejection_requires_page_aligned_known_pointer() {
+            let mut sim = AllocSim::new(0x8000_0000);
+            let layout = Layout::from_size_align(64, 8).expect("layout");
+            let ptr = sim.alloc(layout).expect("alloc");
+            assert!(!sim.dealloc(ptr + 1));
+            assert!(!sim.dealloc(0x1234_5678));
+            assert!(sim.dealloc(ptr));
+        }
+
+        #[test]
+        fn double_free_is_rejected_by_live_set_tracking_model() {
+            let mut sim = AllocSim::new(0x9000_0000);
+            let layout = Layout::from_size_align(256, 16).expect("layout");
+            let ptr = sim.alloc(layout).expect("alloc");
+            assert!(sim.dealloc(ptr));
+            assert!(!sim.dealloc(ptr));
+        }
+
+        #[test]
+        fn alignment_sensitive_layouts_above_page_size_are_rejected() {
+            let mut sim = AllocSim::new(0xa000_0000);
+            let ok = Layout::from_size_align(128, PAGE_SIZE).expect("ok layout");
+            assert!(sim.alloc(ok).is_some());
+
+            let too_large = Layout::from_size_align(128, PAGE_SIZE.saturating_mul(2))
+                .expect("too large align layout");
+            assert!(sim.alloc(too_large).is_none());
+        }
+    }
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -142,3 +317,200 @@ pub use non_hosted::KernelGlobalAllocator;
 pub use hosted::KERNEL_GLOBAL_ALLOCATOR;
 #[cfg(feature = "hosted-dev")]
 pub use hosted::KernelGlobalAllocator;
+
+#[cfg(all(test, feature = "hosted-dev"))]
+mod hosted_dev_allocator_model_tests {
+    use core::alloc::Layout;
+    use std::collections::BTreeMap;
+    use std::vec::Vec;
+
+    use crate::kernel::vm::PAGE_SIZE;
+
+    const HEADER_SIZE: usize = core::mem::size_of::<u64>() * 2;
+    const ALLOC_ALIGN_LIMIT: usize = PAGE_SIZE;
+    const ALLOCATION_MAGIC: u64 = 0x5941_524d_4741_4c4c; // "YARMGALL"
+
+    #[derive(Clone, Copy)]
+    struct Header {
+        magic: u64,
+        pages: u64,
+    }
+
+    fn is_supported_alignment(align: usize) -> bool {
+        align.is_power_of_two() && align <= ALLOC_ALIGN_LIMIT
+    }
+
+    fn allocation_pages_for(layout: Layout) -> Option<usize> {
+        if layout.size() == 0 || !is_supported_alignment(layout.align()) {
+            return None;
+        }
+        let user_bytes = layout.size().saturating_add(HEADER_SIZE);
+        let pages = user_bytes.div_ceil(PAGE_SIZE).max(1);
+        Some(pages.saturating_add(1))
+    }
+
+    fn is_valid_user_pointer(ptr: usize) -> bool {
+        ptr != 0 && ptr.is_multiple_of(PAGE_SIZE)
+    }
+
+    fn header_pages_if_valid(header: Header) -> Option<usize> {
+        if header.magic != ALLOCATION_MAGIC {
+            return None;
+        }
+        let pages = header.pages as usize;
+        if !(2..=u64::MAX as usize).contains(&pages) {
+            return None;
+        }
+        Some(pages)
+    }
+
+    struct AllocSim {
+        next_base: usize,
+        live: BTreeMap<usize, usize>,
+    }
+
+    impl AllocSim {
+        fn new(base: usize) -> Self {
+            Self {
+                next_base: base,
+                live: BTreeMap::new(),
+            }
+        }
+
+        fn alloc(&mut self, layout: Layout) -> Option<usize> {
+            let total_pages = allocation_pages_for(layout)?;
+            let base = self.next_base;
+            self.next_base = self
+                .next_base
+                .saturating_add(total_pages.saturating_mul(PAGE_SIZE));
+            self.live.insert(base, total_pages);
+            Some(base.saturating_add(PAGE_SIZE))
+        }
+
+        fn dealloc(&mut self, user_ptr: usize) -> bool {
+            if !is_valid_user_pointer(user_ptr) {
+                return false;
+            }
+            let base = user_ptr.saturating_sub(PAGE_SIZE);
+            let Some(pages) = self.live.get(&base).copied() else {
+                return false;
+            };
+            let header = Header {
+                magic: ALLOCATION_MAGIC,
+                pages: pages as u64,
+            };
+            if header_pages_if_valid(header) != Some(pages) {
+                return false;
+            }
+            self.live.remove(&base).is_some()
+        }
+    }
+
+    #[test]
+    fn allocation_alignment_gate_accepts_only_power_of_two_up_to_page() {
+        assert!(is_supported_alignment(1));
+        assert!(is_supported_alignment(8));
+        assert!(is_supported_alignment(PAGE_SIZE));
+        assert!(!is_supported_alignment(0));
+        assert!(!is_supported_alignment(3));
+        assert!(!is_supported_alignment(PAGE_SIZE.saturating_mul(2)));
+    }
+
+    #[test]
+    fn returned_user_pointer_is_page_aligned_for_supported_layouts() {
+        let mut sim = AllocSim::new(0x4000_0000);
+        for align in [1usize, 2, 4, 8, 16, 32, 64, 256, 1024, PAGE_SIZE] {
+            let layout = Layout::from_size_align(33, align).expect("layout");
+            let user_ptr = sim.alloc(layout).expect("alloc");
+            assert_eq!(user_ptr % PAGE_SIZE, 0, "align={align}");
+        }
+    }
+
+    #[test]
+    fn many_small_alloc_free_cycles_leave_no_live_allocations() {
+        let mut sim = AllocSim::new(0x5000_0000);
+        for _ in 0..10_000usize {
+            let layout = Layout::from_size_align(1, 1).expect("layout");
+            let user_ptr = sim.alloc(layout).expect("alloc");
+            assert!(sim.dealloc(user_ptr));
+        }
+        assert!(sim.live.is_empty());
+    }
+
+    #[test]
+    fn mixed_size_allocations_and_frees_are_tracked_correctly() {
+        let mut sim = AllocSim::new(0x6000_0000);
+        let sizes = [1usize, 15, 128, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE * 3 + 17];
+        let mut ptrs = Vec::new();
+        for size in sizes {
+            let layout = Layout::from_size_align(size, 8).expect("layout");
+            ptrs.push(sim.alloc(layout).expect("alloc"));
+        }
+        for ptr in ptrs.into_iter().rev() {
+            assert!(sim.dealloc(ptr));
+        }
+        assert!(sim.live.is_empty());
+    }
+
+    #[test]
+    fn vec_like_grow_shrink_patterns_are_safe_under_allocator_model() {
+        let mut sim = AllocSim::new(0x7000_0000);
+        let mut current: Option<usize> = None;
+        let mut cap = 8usize;
+
+        for _ in 0..128usize {
+            let grow = Layout::from_size_align(cap, 8).expect("layout");
+            let next = sim.alloc(grow).expect("grow alloc");
+            if let Some(old) = current.take() {
+                assert!(sim.dealloc(old));
+            }
+            current = Some(next);
+            cap = cap.saturating_mul(2).min(PAGE_SIZE * 8);
+        }
+
+        for _ in 0..128usize {
+            let shrink = Layout::from_size_align(cap.max(8), 8).expect("layout");
+            let next = sim.alloc(shrink).expect("shrink alloc");
+            if let Some(old) = current.take() {
+                assert!(sim.dealloc(old));
+            }
+            current = Some(next);
+            cap = (cap / 2).max(8);
+        }
+
+        if let Some(last) = current {
+            assert!(sim.dealloc(last));
+        }
+        assert!(sim.live.is_empty());
+    }
+
+    #[test]
+    fn invalid_free_rejection_requires_page_aligned_known_pointer() {
+        let mut sim = AllocSim::new(0x8000_0000);
+        let layout = Layout::from_size_align(64, 8).expect("layout");
+        let ptr = sim.alloc(layout).expect("alloc");
+        assert!(!sim.dealloc(ptr + 1));
+        assert!(!sim.dealloc(0x1234_5678));
+        assert!(sim.dealloc(ptr));
+    }
+
+    #[test]
+    fn double_free_is_rejected_by_live_set_tracking_model() {
+        let mut sim = AllocSim::new(0x9000_0000);
+        let layout = Layout::from_size_align(256, 16).expect("layout");
+        let ptr = sim.alloc(layout).expect("alloc");
+        assert!(sim.dealloc(ptr));
+        assert!(!sim.dealloc(ptr));
+    }
+
+    #[test]
+    fn alignment_sensitive_layouts_above_page_size_are_rejected() {
+        let mut sim = AllocSim::new(0xa000_0000);
+        let ok = Layout::from_size_align(128, PAGE_SIZE).expect("ok layout");
+        assert!(sim.alloc(ok).is_some());
+
+        let too_large = Layout::from_size_align(128, PAGE_SIZE.saturating_mul(2))
+            .expect("too large align layout");
+        assert!(sim.alloc(too_large).is_none());
+    }
+}
