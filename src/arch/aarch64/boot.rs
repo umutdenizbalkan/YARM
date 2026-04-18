@@ -857,6 +857,15 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
     }
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+unsafe extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const MAX_PT_ALLOCATOR_REGIONS: usize = 8;
+
 pub fn prepare_arch_boot(_start_info_ptr: usize) {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     {
@@ -913,13 +922,62 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                             usable: true,
                         },
                     ]);
-                    let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(&[
-                        crate::kernel::frame_allocator::MemoryRegion {
-                            start,
-                            len,
-                            usable: true,
-                        },
-                    ]);
+                    let mut reserved: [(u64, u64); 5] = [(0, 0); 5];
+                    let mut reserved_len = 0usize;
+                    let page = crate::kernel::vm::PAGE_SIZE as u64;
+                    let kernel_start = (core::ptr::addr_of!(__kernel_start) as u64) & !(page - 1);
+                    let kernel_end = ((core::ptr::addr_of!(__kernel_end) as u64)
+                        .saturating_add(page - 1))
+                        & !(page - 1);
+                    if kernel_end > kernel_start {
+                        reserved[reserved_len] = (kernel_start, kernel_end);
+                        reserved_len += 1;
+                    }
+                    let l1_start = (core::ptr::addr_of!(BOOT_L1_TABLE) as u64) & !(page - 1);
+                    let l1_end = ((core::ptr::addr_of!(BOOT_L1_TABLE) as u64)
+                        .saturating_add(core::mem::size_of::<AlignedL1>() as u64)
+                        .saturating_add(page - 1))
+                        & !(page - 1);
+                    if l1_end > l1_start {
+                        reserved[reserved_len] = (l1_start, l1_end);
+                        reserved_len += 1;
+                    }
+                    let l2_start = (core::ptr::addr_of!(BOOT_L2_TABLE) as u64) & !(page - 1);
+                    let l2_end = ((core::ptr::addr_of!(BOOT_L2_TABLE) as u64)
+                        .saturating_add(core::mem::size_of::<AlignedL2>() as u64)
+                        .saturating_add(page - 1))
+                        & !(page - 1);
+                    if l2_end > l2_start {
+                        reserved[reserved_len] = (l2_start, l2_end);
+                        reserved_len += 1;
+                    }
+                    let dtb_start = dtb.as_ptr() as u64;
+                    let dtb_end = dtb_start.saturating_add(dtb.len() as u64);
+                    if dtb_end > dtb_start {
+                        reserved[reserved_len] = (dtb_start & !(page - 1), (dtb_end + (page - 1)) & !(page - 1));
+                        reserved_len += 1;
+                    }
+                    if let (Some(initrd_start), Some(initrd_end)) = (parsed.initrd_start, parsed.initrd_end)
+                        && initrd_end > initrd_start
+                        && reserved_len < reserved.len()
+                    {
+                        reserved[reserved_len] = (
+                            initrd_start & !(page - 1),
+                            (initrd_end.saturating_add(page - 1)) & !(page - 1),
+                        );
+                        reserved_len += 1;
+                    }
+                    let (alloc_regions, alloc_regions_len) = build_allocator_regions_from_ram(
+                        start,
+                        len,
+                        crate::arch::platform_layout::NEXT_ANON_PHYS_BASE,
+                        &reserved[..reserved_len],
+                    );
+                    if alloc_regions_len > 0 {
+                        let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(
+                            &alloc_regions[..alloc_regions_len],
+                        );
+                    }
                 }
                 if let Some(gic_base) = parsed.gic_cpu_if_base {
                     let mut desc = [0u8; 40];
@@ -935,6 +993,95 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
         setup_bootstrap_mmu();
         crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB P3");
     }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn build_allocator_regions_from_ram(
+    ram_base: u64,
+    ram_size: u64,
+    alloc_start: u64,
+    reserved: &[(u64, u64)],
+) -> (
+    [crate::kernel::frame_allocator::MemoryRegion; MAX_PT_ALLOCATOR_REGIONS],
+    usize,
+) {
+    let mut out = [crate::kernel::frame_allocator::MemoryRegion {
+        start: 0,
+        len: 0,
+        usable: false,
+    }; MAX_PT_ALLOCATOR_REGIONS];
+    let page = crate::kernel::vm::PAGE_SIZE as u64;
+    let Some(ram_end) = ram_base.checked_add(ram_size) else {
+        return (out, 0);
+    };
+    let start = align_up_u64(ram_base.max(alloc_start), page);
+    let end = align_down_u64(ram_end, page);
+    if end <= start {
+        return (out, 0);
+    }
+
+    let mut segments = [(0u64, 0u64); MAX_PT_ALLOCATOR_REGIONS];
+    let mut seg_len = 1usize;
+    segments[0] = (start, end);
+
+    for &(res_start, res_end) in reserved {
+        if res_end <= res_start {
+            continue;
+        }
+        let res_start = align_down_u64(res_start, page).max(start);
+        let res_end = align_up_u64(res_end, page).min(end);
+        if res_end <= res_start {
+            continue;
+        }
+        let mut next = [(0u64, 0u64); MAX_PT_ALLOCATOR_REGIONS];
+        let mut next_len = 0usize;
+        for &(seg_start, seg_end) in segments.iter().take(seg_len) {
+            if res_end <= seg_start || res_start >= seg_end {
+                if next_len < MAX_PT_ALLOCATOR_REGIONS {
+                    next[next_len] = (seg_start, seg_end);
+                    next_len += 1;
+                }
+                continue;
+            }
+            if seg_start < res_start && next_len < MAX_PT_ALLOCATOR_REGIONS {
+                next[next_len] = (seg_start, res_start);
+                next_len += 1;
+            }
+            if res_end < seg_end && next_len < MAX_PT_ALLOCATOR_REGIONS {
+                next[next_len] = (res_end, seg_end);
+                next_len += 1;
+            }
+        }
+        segments = next;
+        seg_len = next_len;
+        if seg_len == 0 {
+            break;
+        }
+    }
+
+    let mut out_len = 0usize;
+    for &(seg_start, seg_end) in segments.iter().take(seg_len) {
+        if seg_end <= seg_start {
+            continue;
+        }
+        out[out_len] = crate::kernel::frame_allocator::MemoryRegion {
+            start: seg_start,
+            len: seg_end - seg_start,
+            usable: true,
+        };
+        out_len += 1;
+    }
+    (out, out_len)
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const fn align_down_u64(value: u64, align: u64) -> u64 {
+    value & !(align - 1)
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const fn align_up_u64(value: u64, align: u64) -> u64 {
+    value.saturating_add(align - 1) & !(align - 1)
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]

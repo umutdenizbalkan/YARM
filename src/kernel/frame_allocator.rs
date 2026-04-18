@@ -502,7 +502,7 @@ fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
     #[cfg(feature = "hosted-dev")]
     let len = 128 * 1024 * 1024;
     #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "x86_64")))]
-    let len = 256 * 1024 * 1024;
+    let len = 16 * 1024 * 1024;
 
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     {
@@ -513,15 +513,30 @@ fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
             usable: true,
         }]
     }
-    #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
-    [MemoryRegion {
-        // Keep the default allocator in a conservative window immediately after
-        // NEXT_ANON_PHYS_BASE so low-memory board/QEMU configs do not walk into
-        // unmapped physical space when DTB/RAM probing is unavailable.
-        start: crate::arch::platform_constants::NEXT_ANON_PHYS_BASE,
-        len,
-        usable: true,
-    }]
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    {
+        [MemoryRegion {
+            // Conservative fallback only: keep allocator seed near the bootstrap
+            // image window until DTB RAM parsing can provide exact bounds.
+            start: crate::arch::platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE + 32 * 1024 * 1024,
+            len,
+            usable: true,
+        }]
+    }
+    #[cfg(any(
+        feature = "hosted-dev",
+        all(not(target_arch = "x86_64"), not(target_arch = "aarch64"))
+    ))]
+    {
+        [MemoryRegion {
+            // Keep the default allocator in a conservative window immediately after
+            // NEXT_ANON_PHYS_BASE so low-memory board/QEMU configs do not walk into
+            // unmapped physical space when DTB/RAM probing is unavailable.
+            start: crate::arch::platform_constants::NEXT_ANON_PHYS_BASE,
+            len,
+            usable: true,
+        }]
+    }
 }
 
 fn ensure_pt_allocator_initialized() -> Result<(), FrameAllocError> {
