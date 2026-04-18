@@ -43,10 +43,19 @@ fn restore_arch_thread_state(
     let Some(frame) = frame else {
         return Ok(());
     };
-    let tls = kernel
-        .resume_current_thread_with_frame(frame)
-        .map_err(crate::kernel::syscall::SyscallError::from)
-        .map_err(TrapHandleError::Syscall)?;
+    let tls = match kernel.resume_current_thread_with_frame(frame) {
+    Ok(tls) => tls,
+    Err(crate::kernel::boot::KernelError::TaskMissing) => {
+        // No user task scheduled yet (normal during early boot).
+        // Skip frame restore and return cleanly so DEPTH resets to 0.
+        return Ok(());
+    }
+    Err(e) => {
+        return Err(TrapHandleError::Syscall(
+            crate::kernel::syscall::SyscallError::from(e),
+        ));
+    }
+    };
     restore_fs_base_if_needed(tls.unwrap_or(0));
     let idx = cpu.0 as usize;
     if idx < MAX_CPUS {
