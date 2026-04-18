@@ -713,7 +713,9 @@ yarm_x86_lstar_entry:
     mov rsp, qword ptr [rip + YARM_X86_SYSCALL_RSP0]
     test rsp, rsp
     jnz 1f
-    mov rsp, r14
+    // RSP0 must be initialized before any real user SYSCALL entry.
+    // A zero value indicates broken descriptor/TSS setup; fail hard.
+    ud2
 1:
     // Materialize synthetic interrupt frame expected by dispatch.
     sub rsp, 40
