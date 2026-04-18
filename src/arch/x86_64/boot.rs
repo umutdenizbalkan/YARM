@@ -433,10 +433,14 @@ pub fn enter_dispatched_user_task_if_available(
     dispatched_tid: Option<u64>,
 ) {
     if let Some(tid) = dispatched_tid
+        && let Some(asid) = kernel.task_asid(tid)
         && let Some(context) = kernel.thread_user_context(tid)
         && context.instruction_ptr.0 != 0
         && context.stack_ptr.0 != 0
     {
+        if super::page_table::activate_asid(asid).is_err() {
+            return;
+        }
         crate::yarm_log!(
             "YARM_RING3_INIT_TASK tid={} entry=0x{:x} stack_top=0x{:x}",
             tid,
