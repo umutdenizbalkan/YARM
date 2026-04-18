@@ -926,35 +926,37 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     let mut reserved_len = 0usize;
                     let page = crate::kernel::vm::PAGE_SIZE as u64;
                     let kernel_start = (core::ptr::addr_of!(__kernel_start) as u64) & !(page - 1);
-                    let kernel_end = ((core::ptr::addr_of!(__kernel_end) as u64)
-                        .saturating_add(page - 1))
-                        & !(page - 1);
+                    let kernel_end = align_up_u64(core::ptr::addr_of!(__kernel_end) as u64, page)
+                        .unwrap_or(kernel_start);
                     if kernel_end > kernel_start {
                         reserved[reserved_len] = (kernel_start, kernel_end);
                         reserved_len += 1;
                     }
                     let l1_start = (core::ptr::addr_of!(BOOT_L1_TABLE) as u64) & !(page - 1);
-                    let l1_end = ((core::ptr::addr_of!(BOOT_L1_TABLE) as u64)
-                        .saturating_add(core::mem::size_of::<AlignedL1>() as u64)
-                        .saturating_add(page - 1))
-                        & !(page - 1);
+                    let l1_end_raw = (core::ptr::addr_of!(BOOT_L1_TABLE) as u64)
+                        .checked_add(core::mem::size_of::<AlignedL1>() as u64);
+                    let l1_end =
+                        l1_end_raw.and_then(|value| align_up_u64(value, page)).unwrap_or(l1_start);
                     if l1_end > l1_start {
                         reserved[reserved_len] = (l1_start, l1_end);
                         reserved_len += 1;
                     }
                     let l2_start = (core::ptr::addr_of!(BOOT_L2_TABLE) as u64) & !(page - 1);
-                    let l2_end = ((core::ptr::addr_of!(BOOT_L2_TABLE) as u64)
-                        .saturating_add(core::mem::size_of::<AlignedL2>() as u64)
-                        .saturating_add(page - 1))
-                        & !(page - 1);
+                    let l2_end_raw = (core::ptr::addr_of!(BOOT_L2_TABLE) as u64)
+                        .checked_add(core::mem::size_of::<AlignedL2>() as u64);
+                    let l2_end =
+                        l2_end_raw.and_then(|value| align_up_u64(value, page)).unwrap_or(l2_start);
                     if l2_end > l2_start {
                         reserved[reserved_len] = (l2_start, l2_end);
                         reserved_len += 1;
                     }
                     let dtb_start = dtb.as_ptr() as u64;
-                    let dtb_end = dtb_start.saturating_add(dtb.len() as u64);
+                    let dtb_end = dtb_start
+                        .checked_add(dtb.len() as u64)
+                        .unwrap_or(dtb_start);
                     if dtb_end > dtb_start {
-                        reserved[reserved_len] = (dtb_start & !(page - 1), (dtb_end + (page - 1)) & !(page - 1));
+                        let dtb_reserved_end = align_up_u64(dtb_end, page).unwrap_or(dtb_start);
+                        reserved[reserved_len] = (dtb_start & !(page - 1), dtb_reserved_end);
                         reserved_len += 1;
                     }
                     if let (Some(initrd_start), Some(initrd_end)) = (parsed.initrd_start, parsed.initrd_end)
@@ -963,7 +965,7 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     {
                         reserved[reserved_len] = (
                             initrd_start & !(page - 1),
-                            (initrd_end.saturating_add(page - 1)) & !(page - 1),
+                            align_up_u64(initrd_end, page).unwrap_or(initrd_start),
                         );
                         reserved_len += 1;
                     }
@@ -976,6 +978,13 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     if alloc_regions_len > 0 {
                         let _ = crate::kernel::frame_allocator::init_pt_frame_allocator(
                             &alloc_regions[..alloc_regions_len],
+                        );
+                    } else {
+                        crate::yarm_log!(
+                            "YARM_AARCH64_DTB_ALLOCATOR no_usable_regions ram_start=0x{:x} ram_len=0x{:x} alloc_start=0x{:x}",
+                            start,
+                            len,
+                            crate::arch::platform_layout::NEXT_ANON_PHYS_BASE
                         );
                     }
                 }
@@ -1014,7 +1023,9 @@ fn build_allocator_regions_from_ram(
     let Some(ram_end) = ram_base.checked_add(ram_size) else {
         return (out, 0);
     };
-    let start = align_up_u64(ram_base.max(alloc_start), page);
+    let Some(start) = align_up_u64(ram_base.max(alloc_start), page) else {
+        return (out, 0);
+    };
     let end = align_down_u64(ram_end, page);
     if end <= start {
         return (out, 0);
@@ -1029,7 +1040,10 @@ fn build_allocator_regions_from_ram(
             continue;
         }
         let res_start = align_down_u64(res_start, page).max(start);
-        let res_end = align_up_u64(res_end, page).min(end);
+        let Some(res_end_aligned) = align_up_u64(res_end, page) else {
+            continue;
+        };
+        let res_end = res_end_aligned.min(end);
         if res_end <= res_start {
             continue;
         }
@@ -1080,8 +1094,9 @@ const fn align_down_u64(value: u64, align: u64) -> u64 {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-const fn align_up_u64(value: u64, align: u64) -> u64 {
-    value.saturating_add(align - 1) & !(align - 1)
+const fn align_up_u64(value: u64, align: u64) -> Option<u64> {
+    let added = value.checked_add(align - 1)?;
+    Some(added & !(align - 1))
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
