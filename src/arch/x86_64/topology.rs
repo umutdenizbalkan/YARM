@@ -17,9 +17,11 @@ fn bitmap_from_logical_count(raw_count: u32) -> u64 {
 fn detect_logical_cpu_count_cpuid() -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
+        #[allow(unused_unsafe)]
         let max_leaf = unsafe { core::arch::x86_64::__cpuid(0).eax };
 
         if max_leaf >= 0xB {
+            #[allow(unused_unsafe)]
             let level1 = unsafe { core::arch::x86_64::__cpuid_count(0xB, 1) };
             let logical = level1.ebx & 0xFFFF;
             if logical != 0 {
@@ -28,6 +30,7 @@ fn detect_logical_cpu_count_cpuid() -> u32 {
         }
 
         if max_leaf >= 1 {
+            #[allow(unused_unsafe)]
             let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
             let logical = (leaf1.ebx >> 16) & 0xFF;
             if logical != 0 {
