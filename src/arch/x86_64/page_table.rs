@@ -198,6 +198,7 @@ impl PageTableState {
 
         let root_idx = self.alloc_page()?;
         let root_phys = self.pages[root_idx].expect("root page").phys;
+        clone_kernel_pml4_half_into_root(root_phys)?;
         let pcid = self.allocate_pcid(asid)?;
 
         for slot in &mut self.asids {
@@ -222,6 +223,26 @@ impl PageTableState {
             self.asids[slot] = None;
         }
     }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(test)))]
+fn clone_kernel_pml4_half_into_root(root_phys: u64) -> Result<(), PageTableError> {
+    let mut active_cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nostack, preserves_flags));
+    }
+    let active_root_phys = active_cr3 & PAGE_MASK;
+    let kernel_l4_base = pml4_index(vm_layout::KERNEL_SPACE_BASE);
+    for idx in kernel_l4_base..ENTRIES_PER_TABLE {
+        let entry = unsafe { read_raw_table_entry(active_root_phys, idx)? };
+        unsafe { write_raw_table_entry(root_phys, idx, entry)? };
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "hosted-dev", test))]
+fn clone_kernel_pml4_half_into_root(_root_phys: u64) -> Result<(), PageTableError> {
+    Ok(())
 }
 
 static PAGE_TABLE_STATE: SpinLockIrq<PageTableState> = SpinLockIrq::new(PageTableState::new());
@@ -494,6 +515,31 @@ fn phys_to_virt_table_ptr(table_phys: u64) -> Option<*mut u8> {
     }
     let virt = platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(phys_off)?;
     Some(virt as usize as *mut u8)
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(test)))]
+unsafe fn read_raw_table_entry(table_phys: u64, index: usize) -> Result<PageTableEntry, PageTableError> {
+    if index >= ENTRIES_PER_TABLE {
+        return Err(PageTableError::InvalidAddress);
+    }
+    let table_ptr = phys_to_virt_table_ptr(table_phys).ok_or(PageTableError::InvalidAddress)?;
+    let ptr = (table_ptr as usize + index * core::mem::size_of::<u64>()) as *const u64;
+    Ok(PageTableEntry(unsafe { core::ptr::read_volatile(ptr) }))
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(test)))]
+unsafe fn write_raw_table_entry(
+    table_phys: u64,
+    index: usize,
+    entry: PageTableEntry,
+) -> Result<(), PageTableError> {
+    if index >= ENTRIES_PER_TABLE {
+        return Err(PageTableError::InvalidAddress);
+    }
+    let table_ptr = phys_to_virt_table_ptr(table_phys).ok_or(PageTableError::InvalidAddress)?;
+    let ptr = (table_ptr as usize + index * core::mem::size_of::<u64>()) as *mut u64;
+    unsafe { core::ptr::write_volatile(ptr, entry.0) };
+    Ok(())
 }
 
 pub fn invalidate_page(virt: VirtAddr) {
