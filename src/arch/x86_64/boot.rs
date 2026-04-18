@@ -388,8 +388,9 @@ fn initramfs_static_hello_world_elf() -> [u8; 256] {
     image[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes()); // p_memsz
     image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
-    // mov eax, SYSCALL_YIELD_NR; int 0x80; jmp mov.
-    image[128..137].copy_from_slice(&[0xB8, 0x00, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xEB, 0xF7]);
+    // mov eax, SYSCALL_YIELD_NR; syscall; jmp syscall.
+    // Use the production LSTAR syscall fast path for bring-up.
+    image[128..137].copy_from_slice(&[0xB8, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFC]);
     image
 }
 

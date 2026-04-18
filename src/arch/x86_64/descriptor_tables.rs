@@ -780,6 +780,8 @@ core::arch::global_asm!(
     .global yarm_x86_syscall_entry
     .type yarm_x86_syscall_entry, @function
 yarm_x86_syscall_entry:
+    // INT 0x80 compatibility entry: funnels into the shared trap/syscall
+    // dispatch path. Production fast path is yarm_x86_lstar_entry.
     push 0
     push 0x80
     jmp yarm_x86_common_trap_entry
