@@ -86,6 +86,7 @@ struct AsidCr3 {
 struct PageTableState {
     pages: [Option<PageTablePage>; MAX_PT_PAGES],
     asids: [Option<AsidCr3>; MAX_ASID_ROOTS],
+    canonical_kernel_root_phys: Option<u64>,
 }
 
 impl PageTableState {
@@ -93,6 +94,7 @@ impl PageTableState {
         Self {
             pages: [const { None }; MAX_PT_PAGES],
             asids: [const { None }; MAX_ASID_ROOTS],
+            canonical_kernel_root_phys: None,
         }
     }
 
@@ -198,7 +200,15 @@ impl PageTableState {
 
         let root_idx = self.alloc_page()?;
         let root_phys = self.pages[root_idx].expect("root page").phys;
-        clone_kernel_pml4_half_into_root(root_phys)?;
+        let canonical_kernel_root_phys =
+            if let Some(existing) = self.canonical_kernel_root_phys {
+                existing
+            } else {
+                let detected = detect_active_root_phys_from_cr3()?;
+                self.canonical_kernel_root_phys = Some(detected);
+                detected
+            };
+        clone_kernel_pml4_half_into_root(canonical_kernel_root_phys, root_phys)?;
         let pcid = self.allocate_pcid(asid)?;
 
         for slot in &mut self.asids {
@@ -226,23 +236,38 @@ impl PageTableState {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), not(test)))]
-fn clone_kernel_pml4_half_into_root(root_phys: u64) -> Result<(), PageTableError> {
-    let mut active_cr3: u64;
-    unsafe {
-        core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nostack, preserves_flags));
-    }
-    let active_root_phys = active_cr3 & PAGE_MASK;
+fn clone_kernel_pml4_half_into_root(
+    source_root_phys: u64,
+    dest_root_phys: u64,
+) -> Result<(), PageTableError> {
     let kernel_l4_base = pml4_index(vm_layout::KERNEL_SPACE_BASE);
     for idx in kernel_l4_base..ENTRIES_PER_TABLE {
-        let entry = unsafe { read_raw_table_entry(active_root_phys, idx)? };
-        unsafe { write_raw_table_entry(root_phys, idx, entry)? };
+        let entry = unsafe { read_raw_table_entry(source_root_phys, idx)? };
+        unsafe { write_raw_table_entry(dest_root_phys, idx, entry)? };
     }
     Ok(())
 }
 
 #[cfg(any(feature = "hosted-dev", test))]
-fn clone_kernel_pml4_half_into_root(_root_phys: u64) -> Result<(), PageTableError> {
+fn clone_kernel_pml4_half_into_root(
+    _source_root_phys: u64,
+    _dest_root_phys: u64,
+) -> Result<(), PageTableError> {
     Ok(())
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(test)))]
+fn detect_active_root_phys_from_cr3() -> Result<u64, PageTableError> {
+    let mut active_cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nostack, preserves_flags));
+    }
+    Ok(active_cr3 & PAGE_MASK)
+}
+
+#[cfg(any(feature = "hosted-dev", test))]
+fn detect_active_root_phys_from_cr3() -> Result<u64, PageTableError> {
+    Ok(0)
 }
 
 static PAGE_TABLE_STATE: SpinLockIrq<PageTableState> = SpinLockIrq::new(PageTableState::new());
@@ -261,6 +286,7 @@ pub fn reset_state() {
     for asid in &mut state.asids {
         *asid = None;
     }
+    state.canonical_kernel_root_phys = None;
 }
 
 fn pml4_index(va: u64) -> usize {
