@@ -2,7 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 pub fn default_present_cpu_bitmap() -> u64 {
-    0b11
+    // Without a valid DTB CPU map, use a conservative single-CPU fallback.
+    0b1
 }
 
 pub fn discover_present_cpu_bitmap(dtb: &[u8]) -> u64 {
