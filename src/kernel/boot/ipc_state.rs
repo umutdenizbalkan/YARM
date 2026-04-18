@@ -110,7 +110,7 @@ impl KernelState {
         endpoint_idx: usize,
         recv_cap: CapId,
         deadline: Option<u64>,
-    ) -> Result<(), KernelError> {
+    ) -> Result<ThreadId, KernelError> {
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
@@ -125,7 +125,7 @@ impl KernelState {
         })?;
         self.ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
         let _ = self.dispatch_next_task()?;
-        Ok(())
+        Ok(ThreadId(blocked_tid))
     }
 
     fn block_current_on_send_with_deadline(
@@ -134,7 +134,7 @@ impl KernelState {
         send_cap: CapId,
         msg: Message,
         deadline: Option<u64>,
-    ) -> Result<(), KernelError> {
+    ) -> Result<ThreadId, KernelError> {
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
@@ -155,7 +155,7 @@ impl KernelState {
             },
         )?;
         let _ = self.dispatch_next_task()?;
-        Ok(())
+        Ok(ThreadId(blocked_tid))
     }
 
     pub(crate) fn wake_waiter_for_endpoint(
@@ -645,7 +645,8 @@ impl KernelState {
                 return Ok(());
             }
 
-            self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
+            let _ =
+                self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
             self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
             return Err(KernelError::WouldBlock);
         }
@@ -656,10 +657,12 @@ impl KernelState {
             .get_mut(endpoint_idx)
             .and_then(Option::as_mut)
             .ok_or(KernelError::WrongObject)?;
-
-        endpoint
-            .send(msg)
-            .map_err(|_| KernelError::EndpointQueueFull)?;
+        if endpoint.send(msg).is_err() {
+            let _ =
+                self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
+            self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
+            return Err(KernelError::WouldBlock);
+        }
 
         self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
         self.wake_waiter_for_endpoint(endpoint_idx)?;
@@ -885,7 +888,7 @@ impl KernelState {
             return Ok(Some(waiter.msg));
         }
 
-        self.block_current_on_receive_with_deadline(endpoint_idx, recv_cap, deadline)?;
+        let _ = self.block_current_on_receive_with_deadline(endpoint_idx, recv_cap, deadline)?;
         Ok(None)
     }
 }
