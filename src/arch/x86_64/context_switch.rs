@@ -49,15 +49,10 @@ pub fn switch_frames(
     prev: &mut ArchSwitchContext,
     next: &ArchSwitchContext,
     next_kernel_stack_top: Option<u64>,
-    next_asid: Option<crate::kernel::vm::Asid>,
 ) {
     #[cfg(test)]
     {
         SWITCH_CALLS.fetch_add(1, Ordering::Relaxed);
-    }
-    #[cfg(target_arch = "x86_64")]
-    if let Some(asid) = next_asid {
-        let _ = crate::arch::x86_64::page_table::activate_asid(asid);
     }
     #[cfg(target_arch = "x86_64")]
     if let Some(rsp0) = next_kernel_stack_top {
@@ -71,7 +66,7 @@ pub fn switch_frames(
 
     #[cfg(any(test, not(target_arch = "x86_64")))]
     {
-        let _ = (prev, next, next_kernel_stack_top, next_asid);
+        let _ = (prev, next, next_kernel_stack_top);
     }
 }
 
