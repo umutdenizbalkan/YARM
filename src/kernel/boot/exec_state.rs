@@ -4,7 +4,7 @@
 use super::{KernelError, KernelState, SpawnedUserTask, UserImageSpec};
 use crate::arch::hal::Hal;
 use crate::kernel::frame_allocator::alloc_pt_frame;
-use crate::kernel::task::{TaskStatus, ThreadGroupId, WaitReason};
+use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext, WaitReason};
 use crate::kernel::vm::{Asid, CachePolicy, Mapping, PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
 
 const ELF64_EHDR_SIZE: usize = 64;
@@ -256,9 +256,18 @@ impl KernelState {
         &mut self,
         spec: UserImageSpec,
     ) -> Result<SpawnedUserTask, KernelError> {
+        if spec.entry == 0 {
+            return Err(KernelError::WrongObject);
+        }
+        let asid = spec.asid.ok_or(KernelError::UserMemoryFault)?;
+        if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
+            return Err(KernelError::UserMemoryFault);
+        }
+
         self.register_task_with_class(spec.tid, spec.class)?;
         let cnode = self.task_cnode(spec.tid).ok_or(KernelError::TaskMissing)?;
         self.set_process_cnode_for_pid(spec.tid, cnode)?;
+        let stack_top = self.allocate_user_stack_with_guard(spec.tid, 64)?;
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
@@ -266,29 +275,22 @@ impl KernelState {
                 .find(|tcb| tcb.tid.0 == spec.tid)
                 .ok_or(KernelError::TaskMissing)?;
             tcb.thread_group_id = ThreadGroupId(spec.tid);
-            tcb.asid = spec.asid;
+            tcb.asid = Some(asid);
             tcb.user_entry = Some(VirtAddr(spec.entry as u64));
-            tcb.user_context.instruction_ptr = VirtAddr(spec.entry as u64);
+            tcb.user_stack_top = Some(stack_top);
+            tcb.user_context = UserRegisterContext {
+                instruction_ptr: VirtAddr(spec.entry as u64),
+                stack_ptr: stack_top,
+                arg0: 0,
+                arg1: 0,
+            };
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
-        if spec.asid.is_some() {
-            let stack_top = self.allocate_user_stack_with_guard(spec.tid, 64)?;
-            self.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == spec.tid)
-                    .ok_or(KernelError::TaskMissing)?;
-                tcb.user_stack_top = Some(stack_top);
-                tcb.user_context.stack_ptr = stack_top;
-                Ok::<_, KernelError>(())
-            })?;
-        }
         Ok(SpawnedUserTask {
             tid: spec.tid,
             entry: spec.entry,
-            asid: spec.asid,
+            asid: Some(asid),
         })
     }
 

@@ -665,6 +665,9 @@ fn spawn_user_task_from_image_registers_asid_and_class() {
     let tcb = state.tcb_mut(55).expect("tcb");
     assert_eq!(tcb.asid, Some(asid));
     let stack_top = tcb.user_stack_top.expect("stack top");
+    assert_ne!(stack_top.0, 0, "user stack top must be non-zero");
+    assert_eq!(tcb.user_context.instruction_ptr, VirtAddr(0x8000));
+    assert_eq!(tcb.user_context.stack_ptr, stack_top);
     let stack_base = VirtAddr(stack_top.0 - 64 * crate::kernel::vm::PAGE_SIZE as u64);
     let guard = VirtAddr(stack_base.0 - crate::kernel::vm::PAGE_SIZE as u64);
     let aspace = state.user_spaces.get(asid).expect("aspace");
@@ -676,6 +679,20 @@ fn spawn_user_task_from_image_registers_asid_and_class() {
         aspace.resolve(guard).is_none(),
         "guard page below stack must stay unmapped"
     );
+}
+
+#[test]
+fn spawn_user_task_from_image_requires_valid_asid() {
+    let mut state = Bootstrap::init().expect("init");
+    let err = state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 77,
+            entry: 0x9000,
+            asid: None,
+            class: TaskClass::App,
+        })
+        .expect_err("missing asid should fail");
+    assert_eq!(err, KernelError::UserMemoryFault);
 }
 
 #[test]
