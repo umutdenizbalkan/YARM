@@ -116,10 +116,23 @@ impl KernelState {
         asid: Asid,
         virt: VirtAddr,
     ) -> Result<(), KernelError> {
-        let targets = self.live_cpu_bitmap_for_asid(asid);
+        let requester = self.current_cpu();
+        let requester_bit = 1u64 << requester.0;
+        let targets = self.live_cpu_bitmap_for_asid(asid) & !requester_bit;
         if targets == 0 {
             return Ok(());
         }
+        let sequence = self.with_ipc_state_mut(|ipc| {
+            let seq = ipc.live_tlb_shootdown_next_seq;
+            ipc.live_tlb_shootdown_next_seq = ipc.live_tlb_shootdown_next_seq.wrapping_add(1);
+            if ipc.live_tlb_shootdown_next_seq == 0 {
+                ipc.live_tlb_shootdown_next_seq = 1;
+            }
+            ipc.live_tlb_shootdown_wait_seq = seq;
+            ipc.live_tlb_shootdown_wait_pending = targets;
+            ipc.live_tlb_shootdown_wait_requester = Some(requester);
+            seq
+        });
         for cpu in 0..u64::BITS as usize {
             let cpu_bit = 1u64 << cpu;
             if (targets & cpu_bit) == 0 {
@@ -130,9 +143,29 @@ impl KernelState {
                 crate::kernel::smp::WorkItem::TlbShootdown {
                     asid,
                     va_range: Some((virt, virt + crate::kernel::vm::PAGE_SIZE as u64)),
+                    requester: Some(requester),
+                    sequence,
                 },
             )?;
         }
+        while self.with_ipc_state(|ipc| ipc.live_tlb_shootdown_wait_pending) != 0 {
+            for cpu in 0..u64::BITS as usize {
+                let cpu_bit = 1u64 << cpu;
+                if (targets & cpu_bit) == 0 {
+                    continue;
+                }
+                let remote = CpuId(cpu as u8);
+                let previous = self.current_cpu();
+                self.set_current_cpu(remote)?;
+                let _ = self.process_cross_cpu_work_for_cpu(remote)?;
+                self.set_current_cpu(previous)?;
+            }
+            let _ = self.process_cross_cpu_work_for_cpu(requester)?;
+        }
+        self.with_ipc_state_mut(|ipc| {
+            ipc.live_tlb_shootdown_wait_seq = 0;
+            ipc.live_tlb_shootdown_wait_requester = None;
+        });
         Ok(())
     }
 
@@ -162,6 +195,8 @@ impl KernelState {
                 crate::kernel::smp::WorkItem::TlbShootdown {
                     asid,
                     va_range: None,
+                    requester: None,
+                    sequence: 0,
                 },
             )?;
         }

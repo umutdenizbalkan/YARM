@@ -766,6 +766,7 @@ fn destroy_user_address_space_queues_shootdowns_and_retires_asid() {
         if let Some(WorkItem::TlbShootdown {
             asid: item_asid,
             va_range,
+            ..
         }) = state.drain_cross_cpu_work().expect("drain")
         {
             assert_eq!(item_asid, asid);
@@ -781,6 +782,8 @@ fn destroy_user_address_space_queues_shootdowns_and_retires_asid() {
             WorkItem::TlbShootdown {
                 asid,
                 va_range: None,
+                requester: None,
+                sequence: 0,
             },
         )
         .expect("requeue cpu0 shootdown");
@@ -790,6 +793,8 @@ fn destroy_user_address_space_queues_shootdowns_and_retires_asid() {
             WorkItem::TlbShootdown {
                 asid,
                 va_range: None,
+                requester: None,
+                sequence: 0,
             },
         )
         .expect("requeue cpu1 shootdown");
@@ -901,6 +906,8 @@ fn process_cross_cpu_work_applies_matching_cpu_items_only() {
             WorkItem::TlbShootdown {
                 asid: Asid(1),
                 va_range: None,
+                requester: None,
+                sequence: 0,
             },
         )
         .expect("submit tlb");
@@ -1931,6 +1938,58 @@ fn memory_object_capability_controls_mapping_and_unmap_protect() {
         .expect("unmap")
         .expect("mapped entry");
     assert_eq!(unmapped.phys, PhysAddr(0x9000));
+}
+
+#[test]
+fn smp_unmap_waits_for_live_tlb_shootdown_completion() {
+    let mut state = Bootstrap::init().expect("init");
+    state.bring_up_cpu(CpuId(1)).expect("cpu1");
+
+    let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind cpu0 task");
+    state.register_task(1).expect("task1");
+    state.bind_task_asid(1, asid).expect("bind cpu1 task");
+    state.enqueue_on_cpu(CpuId(1), 1).expect("enqueue cpu1");
+    state.set_current_cpu(CpuId(1)).expect("switch cpu1");
+    state.dispatch_next_task().expect("dispatch cpu1");
+    assert_eq!(state.current_tid_on_cpu(CpuId(1)), Some(1));
+    state.set_current_cpu(CpuId(0)).expect("switch cpu0");
+
+    let (_mem_id, mem_cap) = state
+        .create_memory_object(PhysAddr(0xB000))
+        .expect("memobj");
+    state
+        .map_user_page_with_caps(
+            aspace_map_cap,
+            mem_cap,
+            VirtAddr(0x4000),
+            PageFlags {
+                read: true,
+                write: true,
+                execute: false,
+                user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+            },
+        )
+        .expect("map");
+
+    let _ = state
+        .unmap_user_page(aspace_map_cap, VirtAddr(0x4000))
+        .expect("unmap")
+        .expect("mapped");
+
+    assert!(
+        state.tlb_shootdown_count() >= 1,
+        "remote shootdown handler should run at least once"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.live_tlb_shootdown_wait_pending),
+        0
+    );
+    state.set_current_cpu(CpuId(0)).expect("switch cpu0");
+    assert_eq!(state.drain_cross_cpu_work().expect("drain cpu0"), None);
+    state.set_current_cpu(CpuId(1)).expect("switch cpu1");
+    assert_eq!(state.drain_cross_cpu_work().expect("drain cpu1"), None);
 }
 
 #[test]

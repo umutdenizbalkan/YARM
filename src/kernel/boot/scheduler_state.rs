@@ -230,15 +230,37 @@ impl KernelState {
                 }
                 Ok(())
             }
-            WorkItem::TlbShootdown { asid, .. } => {
+            WorkItem::TlbShootdown {
+                asid,
+                va_range,
+                requester,
+                sequence,
+            } => {
                 self.with_telemetry_state_mut(|telemetry| {
                     telemetry.tlb_shootdown_count = telemetry.tlb_shootdown_count.wrapping_add(1);
                 });
                 let retired = self.with_user_spaces(|spaces| spaces.retired_entry(asid).is_some());
-                let current_matches =
-                    self.current_tid().and_then(|tid| self.task_asid(tid)) == Some(asid);
-                if self.current_cpu() == cpu && (retired || current_matches) {
-                    crate::arch::selected_isa::page_table::invalidate_asid(asid);
+                if self.current_cpu() == cpu {
+                    if let Some((start, end)) = va_range {
+                        let mut va = start.0;
+                        while va < end.0 {
+                            crate::arch::selected_isa::page_table::invalidate_page(
+                                crate::kernel::vm::VirtAddr(va),
+                            );
+                            va = va.saturating_add(crate::kernel::vm::PAGE_SIZE as u64);
+                        }
+                    } else {
+                        crate::arch::selected_isa::page_table::invalidate_asid(asid);
+                    }
+                    if let Some(requester_cpu) = requester {
+                        self.submit_cross_cpu_work(
+                            requester_cpu,
+                            WorkItem::TlbShootdownAck {
+                                sequence,
+                                from_cpu: cpu,
+                            },
+                        )?;
+                    }
                     if retired {
                         let cpu_bit = 1u64 << cpu.0;
                         self.with_user_spaces_mut(|spaces| {
@@ -248,6 +270,21 @@ impl KernelState {
                         })?;
                     }
                 }
+                Ok(())
+            }
+            WorkItem::TlbShootdownAck { sequence, from_cpu } => {
+                if self.current_cpu() != cpu {
+                    return Ok(());
+                }
+                self.with_ipc_state_mut(|ipc| {
+                    if ipc.live_tlb_shootdown_wait_requester != Some(cpu)
+                        || ipc.live_tlb_shootdown_wait_seq != sequence
+                    {
+                        return;
+                    }
+                    let from_bit = 1u64 << from_cpu.0;
+                    ipc.live_tlb_shootdown_wait_pending &= !from_bit;
+                });
                 Ok(())
             }
             WorkItem::WakeTask { tid } => {

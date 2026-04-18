@@ -227,8 +227,9 @@ impl Bootstrap {
             })?;
 
         let mut scheduler = SmpScheduler::default();
-        let present_cpu_bitmap = crate::arch::boot_entry::take_staged_present_cpu_bitmap_for_bootstrap()
-            .unwrap_or_else(topology::default_present_cpu_bitmap);
+        let present_cpu_bitmap =
+            crate::arch::boot_entry::take_staged_present_cpu_bitmap_for_bootstrap()
+                .unwrap_or_else(topology::default_present_cpu_bitmap);
         scheduler.set_present_cpu_bitmap(present_cpu_bitmap);
         scheduler
             .enqueue_on(
@@ -260,6 +261,10 @@ impl Bootstrap {
                 memory_state_lock: SpinLockIrq::new(()),
                 ipc: store_kernel_value(IpcSubsystem {
                     cross_cpu_work: SmpMailbox::default(),
+                    live_tlb_shootdown_next_seq: 1,
+                    live_tlb_shootdown_wait_seq: 0,
+                    live_tlb_shootdown_wait_pending: 0,
+                    live_tlb_shootdown_wait_requester: None,
                     endpoints: [const { None }; MAX_ENDPOINTS],
                     endpoint_waiters: [None; MAX_ENDPOINTS],
                     endpoint_sender_waiters: [[None; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],

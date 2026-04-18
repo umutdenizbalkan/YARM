@@ -196,6 +196,10 @@ pub(crate) struct ReplyCapRecord {
 #[derive(Debug)]
 pub(crate) struct IpcSubsystem {
     pub(crate) cross_cpu_work: SmpMailbox,
+    pub(crate) live_tlb_shootdown_next_seq: u64,
+    pub(crate) live_tlb_shootdown_wait_seq: u64,
+    pub(crate) live_tlb_shootdown_wait_pending: u64,
+    pub(crate) live_tlb_shootdown_wait_requester: Option<CpuId>,
     pub(crate) endpoints: [Option<KernelStorage<Endpoint>>; MAX_ENDPOINTS],
     pub(crate) endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
     pub(crate) endpoint_sender_waiters:

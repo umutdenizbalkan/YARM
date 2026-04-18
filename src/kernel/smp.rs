@@ -21,6 +21,12 @@ pub enum WorkItem {
     TlbShootdown {
         asid: Asid,
         va_range: Option<(VirtAddr, VirtAddr)>,
+        requester: Option<CpuId>,
+        sequence: u64,
+    },
+    TlbShootdownAck {
+        sequence: u64,
+        from_cpu: CpuId,
     },
     WakeTask {
         tid: ThreadId,
@@ -210,6 +216,8 @@ mod tests {
         let item = WorkItem::TlbShootdown {
             asid: Asid(7),
             va_range: Some((VirtAddr(0x1000), VirtAddr(0x2000))),
+            requester: Some(CpuId(0)),
+            sequence: 1,
         };
         queue.submit(item).expect("submit");
         assert_eq!(queue.take(), Some(item));
