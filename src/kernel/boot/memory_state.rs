@@ -9,6 +9,38 @@ use crate::kernel::topology::CpuBitmap;
 use crate::kernel::vm::{Asid, Mapping, MappingEntry, PageFlags, PhysAddr, VirtAddr, VmError};
 
 impl KernelState {
+    fn begin_live_tlb_shootdown_wait(&mut self, requester: CpuId, targets: CpuBitmap) -> u64 {
+        self.with_ipc_state_mut(|ipc| {
+            let sequence = ipc.live_tlb_shootdown.next_sequence;
+            ipc.live_tlb_shootdown.next_sequence =
+                ipc.live_tlb_shootdown.next_sequence.wrapping_add(1);
+            if ipc.live_tlb_shootdown.next_sequence == 0 {
+                ipc.live_tlb_shootdown.next_sequence = 1;
+            }
+            ipc.live_tlb_shootdown.active = Some(super::LiveTlbShootdownWait {
+                sequence,
+                pending_cpu_bitmap: targets,
+                requester_cpu: requester,
+            });
+            sequence
+        })
+    }
+
+    fn live_tlb_shootdown_pending(&self) -> u64 {
+        self.with_ipc_state(|ipc| {
+            ipc.live_tlb_shootdown
+                .active
+                .map(|wait| wait.pending_cpu_bitmap)
+                .unwrap_or(0)
+        })
+    }
+
+    fn clear_live_tlb_shootdown_wait(&mut self) {
+        self.with_ipc_state_mut(|ipc| {
+            ipc.live_tlb_shootdown.active = None;
+        });
+    }
+
     fn mark_cow_page(&mut self, asid: Asid, virt: VirtAddr) -> Result<(), KernelError> {
         self.with_memory_state_mut(|memory| {
             if memory
@@ -122,17 +154,10 @@ impl KernelState {
         if targets == 0 {
             return Ok(());
         }
-        let sequence = self.with_ipc_state_mut(|ipc| {
-            let seq = ipc.live_tlb_shootdown_next_seq;
-            ipc.live_tlb_shootdown_next_seq = ipc.live_tlb_shootdown_next_seq.wrapping_add(1);
-            if ipc.live_tlb_shootdown_next_seq == 0 {
-                ipc.live_tlb_shootdown_next_seq = 1;
-            }
-            ipc.live_tlb_shootdown_wait_seq = seq;
-            ipc.live_tlb_shootdown_wait_pending = targets;
-            ipc.live_tlb_shootdown_wait_requester = Some(requester);
-            seq
-        });
+        let sequence = self.begin_live_tlb_shootdown_wait(requester, targets);
+        // Ordering note: mapping removal completes before we publish shootdown
+        // work items, so remote CPUs can only ACK after invalidating post-unmap
+        // state.
         for cpu in 0..u64::BITS as usize {
             let cpu_bit = 1u64 << cpu;
             if (targets & cpu_bit) == 0 {
@@ -148,7 +173,8 @@ impl KernelState {
                 },
             )?;
         }
-        while self.with_ipc_state(|ipc| ipc.live_tlb_shootdown_wait_pending) != 0 {
+        while self.live_tlb_shootdown_pending() != 0 {
+            let pending_before = self.live_tlb_shootdown_pending();
             for cpu in 0..u64::BITS as usize {
                 let cpu_bit = 1u64 << cpu;
                 if (targets & cpu_bit) == 0 {
@@ -161,11 +187,13 @@ impl KernelState {
                 self.set_current_cpu(previous)?;
             }
             let _ = self.process_cross_cpu_work_for_cpu(requester)?;
+            if self.live_tlb_shootdown_pending() == pending_before {
+                // Avoid pure tight spinning while waiting for remote mailbox
+                // progress; this keeps the wait path scheduler-friendly.
+                self.yield_current()?;
+            }
         }
-        self.with_ipc_state_mut(|ipc| {
-            ipc.live_tlb_shootdown_wait_seq = 0;
-            ipc.live_tlb_shootdown_wait_requester = None;
-        });
+        self.clear_live_tlb_shootdown_wait();
         Ok(())
     }
 

@@ -1983,7 +1983,12 @@ fn smp_unmap_waits_for_live_tlb_shootdown_completion() {
         "remote shootdown handler should run at least once"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.live_tlb_shootdown_wait_pending),
+        state.with_ipc_state(|ipc| {
+            ipc.live_tlb_shootdown
+                .active
+                .map(|wait| wait.pending_cpu_bitmap)
+                .unwrap_or(0)
+        }),
         0
     );
     state.set_current_cpu(CpuId(0)).expect("switch cpu0");

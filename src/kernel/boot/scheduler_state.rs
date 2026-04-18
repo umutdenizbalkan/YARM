@@ -253,6 +253,8 @@ impl KernelState {
                         crate::arch::selected_isa::page_table::invalidate_asid(asid);
                     }
                     if let Some(requester_cpu) = requester {
+                        // Ordering note: ACK is queued only after local
+                        // invalidation has been executed on this CPU.
                         self.submit_cross_cpu_work(
                             requester_cpu,
                             WorkItem::TlbShootdownAck {
@@ -277,13 +279,14 @@ impl KernelState {
                     return Ok(());
                 }
                 self.with_ipc_state_mut(|ipc| {
-                    if ipc.live_tlb_shootdown_wait_requester != Some(cpu)
-                        || ipc.live_tlb_shootdown_wait_seq != sequence
-                    {
+                    let Some(wait) = ipc.live_tlb_shootdown.active.as_mut() else {
+                        return;
+                    };
+                    if wait.requester_cpu != cpu || wait.sequence != sequence {
                         return;
                     }
                     let from_bit = 1u64 << from_cpu.0;
-                    ipc.live_tlb_shootdown_wait_pending &= !from_bit;
+                    wait.pending_cpu_bitmap &= !from_bit;
                 });
                 Ok(())
             }

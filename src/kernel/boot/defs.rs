@@ -193,13 +193,23 @@ pub(crate) struct ReplyCapRecord {
     pub(crate) responder_tid: Option<ThreadId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveTlbShootdownWait {
+    pub(crate) sequence: u64,
+    pub(crate) pending_cpu_bitmap: u64,
+    pub(crate) requester_cpu: CpuId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveTlbShootdownState {
+    pub(crate) next_sequence: u64,
+    pub(crate) active: Option<LiveTlbShootdownWait>,
+}
+
 #[derive(Debug)]
 pub(crate) struct IpcSubsystem {
     pub(crate) cross_cpu_work: SmpMailbox,
-    pub(crate) live_tlb_shootdown_next_seq: u64,
-    pub(crate) live_tlb_shootdown_wait_seq: u64,
-    pub(crate) live_tlb_shootdown_wait_pending: u64,
-    pub(crate) live_tlb_shootdown_wait_requester: Option<CpuId>,
+    pub(crate) live_tlb_shootdown: LiveTlbShootdownState,
     pub(crate) endpoints: [Option<KernelStorage<Endpoint>>; MAX_ENDPOINTS],
     pub(crate) endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
     pub(crate) endpoint_sender_waiters:
