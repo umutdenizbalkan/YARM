@@ -191,6 +191,7 @@ impl KernelState {
                 &mut outgoing_tcb.kernel_context.frame,
                 &incoming_tcb.kernel_context.frame,
                 incoming_tcb.kernel_context.stack_top.map(|top| top.0),
+                incoming_tcb.asid,
             );
             Ok(())
         })
