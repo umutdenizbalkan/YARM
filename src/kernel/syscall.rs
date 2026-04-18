@@ -172,6 +172,10 @@ fn transfer_cap_arg(
     Ok(Some(CapId(raw)))
 }
 
+fn decode_ipc_send_timeout_ticks(frame: &TrapFrame) -> u64 {
+    frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) as u64
+}
+
 fn encode_transfer_cap_ret(frame: &mut TrapFrame, cap: Option<u64>) -> Result<(), SyscallError> {
     let value = cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
     frame.set_ret2(usize::try_from(value).map_err(|_| SyscallError::Internal)?);
@@ -435,7 +439,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 
     let sender_has_user_asid = current_task_has_user_asid(kernel)?;
     let send_timeout_ticks = if sender_has_user_asid || len == 0 {
-        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) as u64
+        decode_ipc_send_timeout_ticks(frame)
     } else {
         0
     };
@@ -1058,7 +1062,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         });
         let blocking_syscall = match syscall {
             Syscall::IpcRecv | Syscall::IpcCall => true,
-            Syscall::IpcSend => frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) == 0,
+            Syscall::IpcSend => decode_ipc_send_timeout_ticks(frame) == 0,
             _ => false,
         };
         if blocking_syscall && caller_blocked {
