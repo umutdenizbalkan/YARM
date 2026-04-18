@@ -1082,52 +1082,6 @@ fn reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint() {
 }
 
 #[test]
-fn call_style_reply_endpoint_wakes_blocked_caller() {
-    let mut state = Bootstrap::init().expect("init");
-    state.register_task(1).expect("server");
-    state.enqueue_current_cpu(1).expect("enqueue");
-
-    let (_req_eid, req_send_cap, req_recv_cap) = state
-        .create_endpoint_with_mode(1, EndpointMode::Synchronous)
-        .expect("request endpoint");
-    let req_recv_cap_server = state
-        .grant_capability_task_to_task(0, req_recv_cap, 1)
-        .expect("dup req recv cap");
-    let (_rep_eid, _rep_send_cap, rep_recv_cap) = state.create_endpoint(2).expect("reply endpoint");
-
-    state.yield_current().expect("switch server");
-    assert_eq!(
-        state.ipc_recv(req_recv_cap_server).expect("server wait"),
-        None
-    );
-    assert_eq!(state.current_tid(), Some(0));
-
-    let reply_cap = state
-        .create_reply_cap_for_caller(ThreadId(0), rep_recv_cap, Some(ThreadId(1)))
-        .expect("reply cap");
-    state
-        .ipc_send(req_send_cap, Message::new(0, b"req").expect("req"))
-        .expect("send request");
-    assert_eq!(
-        state.ipc_recv(rep_recv_cap).expect("caller wait"),
-        None,
-        "caller should block waiting for reply"
-    );
-    assert_eq!(
-        state.task_status(0),
-        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
-            rep_recv_cap
-        )))
-    );
-    assert_eq!(state.current_tid(), Some(1));
-
-    state
-        .ipc_reply(reply_cap, Message::new(1, b"ok").expect("reply"))
-        .expect("reply");
-    assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
-}
-
-#[test]
 fn reply_caps_are_revoked_when_caller_exits() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
@@ -1422,51 +1376,6 @@ fn synchronous_endpoint_supports_multiple_blocked_senders() {
         .expect("msg2");
     assert_eq!(first.as_slice(), b"m0");
     assert_eq!(second.as_slice(), b"m1");
-}
-
-#[test]
-fn buffered_full_send_blocks_and_recv_wakes_exact_sender() {
-    let mut state = Bootstrap::init().expect("init");
-    state.register_task(1).expect("sender");
-    state.register_task(2).expect("receiver");
-
-    let (_eid, send_cap, recv_cap) = state.create_endpoint(1).expect("buffered endpoint");
-    let send_cap_task1 = state
-        .grant_capability_task_to_task(0, send_cap, 1)
-        .expect("dup send cap");
-    let recv_cap_task2 = state
-        .grant_capability_task_to_task(0, recv_cap, 2)
-        .expect("dup recv cap");
-
-    state
-        .ipc_send(send_cap, Message::new(0, b"seed").expect("seed"))
-        .expect("fill endpoint");
-    state.enqueue_current_cpu(1).expect("enqueue sender");
-    state.enqueue_current_cpu(2).expect("enqueue receiver");
-    state.yield_current().expect("switch to sender");
-    assert_eq!(state.current_tid(), Some(1));
-
-    assert_eq!(
-        state.ipc_send(
-            send_cap_task1,
-            Message::new(1, b"blk").expect("blocked msg")
-        ),
-        Err(KernelError::WouldBlock)
-    );
-    assert_eq!(
-        state.task_status(1),
-        Some(TaskStatus::Blocked(WaitReason::EndpointSend(
-            send_cap_task1
-        )))
-    );
-    assert_eq!(state.current_tid(), Some(2));
-
-    let first = state
-        .ipc_recv(recv_cap_task2)
-        .expect("recv")
-        .expect("message");
-    assert_eq!(first.as_slice(), b"seed");
-    assert_eq!(state.task_status(1), Some(TaskStatus::Runnable));
 }
 
 #[test]

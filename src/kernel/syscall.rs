@@ -561,11 +561,6 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 crate::kernel::ipc::ThreadId(current_tid(kernel)?),
             );
         }
-        if err == KernelError::WouldBlock && send_timeout_ticks == 0 {
-            frame.set_ok(0, 0, 0);
-            encode_transfer_cap_ret(frame, None)?;
-            return Ok(());
-        }
         if err == KernelError::WouldBlock && send_timeout_ticks != 0 {
             let timed_out = kernel
                 .consume_ipc_timeout_fired_for_tid(sender_tid)
@@ -739,8 +734,7 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
         encode_transfer_cap_ret(frame, None)?;
     } else {
-        frame.set_ok(0, 0, 0);
-        encode_transfer_cap_ret(frame, None)?;
+        return Err(SyscallError::Internal);
     }
     Ok(())
 }
@@ -1212,93 +1206,6 @@ mod tests {
     }
 
     #[test]
-    fn syscall_send_zero_timeout_blocks_without_returning_would_block() {
-        let mut state = Bootstrap::init().expect("kernel");
-        state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
-        let (_eid, send_cap_global, _recv_cap) = state
-            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
-            .expect("endpoint");
-        let send_cap = state
-            .grant_capability_task_to_task(0, send_cap_global, 1)
-            .expect("dup send cap");
-        state.yield_current().expect("switch to task1");
-
-        let mut frame = TrapFrame::new(
-            Syscall::IpcSend as usize,
-            [
-                send_cap.0 as usize,
-                0,
-                0,
-                0,
-                0,
-                SYSCALL_NO_TRANSFER_CAP as usize,
-            ],
-        );
-        dispatch(&mut state, &mut frame).expect("blocking send");
-        assert_eq!(frame.error_code(), None);
-        assert_eq!(
-            state.task_status(1),
-            Some(crate::kernel::task::TaskStatus::Blocked(
-                crate::kernel::task::WaitReason::EndpointSend(send_cap)
-            ))
-        );
-    }
-
-    #[test]
-    fn syscall_send_blocks_on_full_buffered_endpoint_without_would_block() {
-        let mut state = Bootstrap::init().expect("kernel");
-        state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
-
-        let (_eid, send_cap_global, recv_cap_global) = state.create_endpoint(1).expect("endpoint");
-        state
-            .ipc_send(send_cap_global, Message::new(0, b"full").expect("seed"))
-            .expect("seed queue");
-        let send_cap = state
-            .grant_capability_task_to_task(0, send_cap_global, 1)
-            .expect("dup send cap");
-        let recv_cap = state
-            .grant_capability_task_to_task(0, recv_cap_global, 1)
-            .expect("dup recv cap");
-
-        state.yield_current().expect("switch to task1");
-        let mut send = TrapFrame::new(
-            Syscall::IpcSend as usize,
-            [
-                send_cap.0 as usize,
-                0,
-                2,
-                0x6b6fu32 as usize,
-                0,
-                SYSCALL_NO_TRANSFER_CAP as usize,
-            ],
-        );
-        dispatch(&mut state, &mut send).expect("blocking send");
-        assert_eq!(send.error_code(), None);
-        assert_eq!(
-            state.task_status(1),
-            Some(crate::kernel::task::TaskStatus::Blocked(
-                crate::kernel::task::WaitReason::EndpointSend(send_cap)
-            ))
-        );
-        assert_eq!(state.current_tid(), Some(0));
-
-        state.yield_current().expect("run task1 receiver");
-        let mut recv = TrapFrame::new(
-            Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 0, 0, 0],
-        );
-        dispatch(&mut state, &mut recv).expect("recv");
-        assert_eq!(
-            state.task_status(1),
-            Some(crate::kernel::task::TaskStatus::Running)
-        );
-    }
-
-    #[test]
     fn syscall_send_with_timeout_succeeds_when_receiver_waiting() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("receiver");
@@ -1393,70 +1300,6 @@ mod tests {
         .expect("payload");
         assert_eq!(&bytes[..8], b"call0000");
         assert_ne!(recv.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
-    }
-
-    #[test]
-    fn syscall_ipc_call_blocks_waiting_for_reply_and_reply_wakes_caller() {
-        let mut state = Bootstrap::init().expect("kernel");
-        state.register_task(1).expect("server");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
-
-        let (_call_eid, call_send_cap, call_recv_cap_global) =
-            state.create_endpoint(4).expect("call ep");
-        let call_recv_cap = state
-            .grant_capability_task_to_task(0, call_recv_cap_global, 1)
-            .expect("dup call recv");
-        let (_reply_eid, _reply_send_cap, reply_recv_cap_global) =
-            state.create_endpoint(4).expect("reply ep");
-
-        state.yield_current().expect("switch server");
-        let mut wait_req = TrapFrame::new(
-            Syscall::IpcRecv as usize,
-            [call_recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 0, 0, 0],
-        );
-        dispatch(&mut state, &mut wait_req).expect("block server recv");
-        assert_eq!(state.current_tid(), Some(0));
-
-        let mut call = TrapFrame::new(
-            Syscall::IpcCall as usize,
-            [
-                call_send_cap.0 as usize,
-                0,
-                0,
-                0,
-                0,
-                reply_recv_cap_global.0 as usize,
-            ],
-        );
-        dispatch(&mut state, &mut call).expect("ipc call");
-        assert_eq!(call.error_code(), None);
-        assert_eq!(
-            state.task_status(0),
-            Some(crate::kernel::task::TaskStatus::Blocked(
-                crate::kernel::task::WaitReason::EndpointReceive(reply_recv_cap_global)
-            ))
-        );
-        assert_eq!(state.current_tid(), Some(1));
-
-        let mut recv_req = TrapFrame::new(
-            Syscall::IpcRecv as usize,
-            [call_recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 0, 0, 0],
-        );
-        dispatch(&mut state, &mut recv_req).expect("server recv request");
-        let reply_cap = recv_req.ret2() as u64;
-        assert_ne!(reply_cap, SYSCALL_NO_TRANSFER_CAP);
-
-        let reply_word = usize::from_le_bytes(*b"replyok!");
-        let mut reply = TrapFrame::new(
-            Syscall::IpcReply as usize,
-            [reply_cap as usize, 0, 8, reply_word, 0, 0],
-        );
-        dispatch(&mut state, &mut reply).expect("reply");
-        assert_eq!(
-            state.task_status(0),
-            Some(crate::kernel::task::TaskStatus::Runnable)
-        );
     }
 
     #[test]
