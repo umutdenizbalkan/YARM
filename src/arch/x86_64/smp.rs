@@ -78,7 +78,7 @@ yarm_ap_trampoline_start:
 
 2:
     .word 4f - 1
-    .long 0
+    .long 4f
 
     .code32
 3:
@@ -92,7 +92,7 @@ yarm_ap_trampoline_start:
     pop ebx
     sub ebx, AP_OFF_PM_L5
 
-    mov eax, [ebx + AP_OFF_HANDOFF + 24]
+    mov eax, [ebx + AP_OFF_HANDOFF + 16]
     mov cr3, eax
 
     mov eax, cr4
