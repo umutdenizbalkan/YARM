@@ -1275,6 +1275,42 @@ mod tests {
     }
 
     #[test]
+    fn blocking_ipc_send_dispatch_switches_away_without_userspace_resume() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        let (_eid, send_cap_global, _recv_cap) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("endpoint");
+        let send_cap = state
+            .grant_capability_task_to_task(0, send_cap_global, 1)
+            .expect("dup send cap");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+
+        let mut frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                0,
+                0,
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        dispatch(&mut state, &mut frame).expect("blocking send consumed by dispatch");
+        assert_eq!(
+            state.task_status(1),
+            Some(crate::kernel::task::TaskStatus::Blocked(
+                crate::kernel::task::WaitReason::EndpointSend(send_cap)
+            ))
+        );
+        assert_ne!(state.current_tid(), Some(1));
+    }
+
+    #[test]
     fn syscall_ipc_call_attaches_single_use_reply_cap_to_request() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
@@ -1329,6 +1365,49 @@ mod tests {
         .expect("payload");
         assert_eq!(&bytes[..8], b"call0000");
         assert_ne!(recv.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
+    }
+
+    #[test]
+    fn blocking_ipc_call_dispatch_switches_away_while_waiting_for_reply() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("server");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+
+        let (_call_eid, call_send_cap, call_recv_cap_global) =
+            state.create_endpoint(4).expect("call ep");
+        let call_recv_cap = state
+            .grant_capability_task_to_task(0, call_recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_reply_eid, _reply_send, reply_recv_cap) = state.create_endpoint(4).expect("reply ep");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [call_recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let mut call = TrapFrame::new(
+            Syscall::IpcCall as usize,
+            [
+                call_send_cap.0 as usize,
+                0,
+                0,
+                0,
+                0,
+                reply_recv_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut call).expect("blocking call consumed by dispatch");
+        assert_eq!(
+            state.task_status(0),
+            Some(crate::kernel::task::TaskStatus::Blocked(
+                crate::kernel::task::WaitReason::EndpointReceive(reply_recv_cap)
+            ))
+        );
+        assert_ne!(state.current_tid(), Some(0));
     }
 
     #[test]
