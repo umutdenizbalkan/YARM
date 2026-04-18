@@ -596,6 +596,9 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         .ok_or(SyscallError::InvalidCapability)?
         .object;
     let received = kernel.ipc_recv(cap).map_err(SyscallError::from)?;
+    if received.is_none() {
+        return Err(SyscallError::WouldBlock);
+    }
     handle_ipc_recv_result(
         kernel,
         frame,
@@ -734,7 +737,7 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
         encode_transfer_cap_ret(frame, None)?;
     } else {
-        return Err(SyscallError::Internal);
+        return Err(SyscallError::WouldBlock);
     }
     Ok(())
 }
@@ -1026,7 +1029,9 @@ fn handle_control_plane_set_cnode_slots(
 }
 
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    match Syscall::decode(frame.syscall_num())? {
+    let syscall = Syscall::decode(frame.syscall_num())?;
+    let caller_tid = kernel.current_tid();
+    let result = match syscall {
         Syscall::Yield => {
             kernel.yield_current().map_err(SyscallError::from)?;
             frame.set_ok(0, 0, 0);
@@ -1040,7 +1045,27 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::ControlPlaneSetCnodeSlots => handle_control_plane_set_cnode_slots(kernel, frame),
         Syscall::VmMap => handle_vm_map(kernel, frame),
         Syscall::TransferRelease => handle_transfer_release(kernel, frame),
+    };
+    if result == Err(SyscallError::WouldBlock) {
+        let caller_blocked = caller_tid.is_some_and(|tid| {
+            matches!(
+                kernel.task_status(tid),
+                Some(crate::kernel::task::TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointSend(_)
+                        | crate::kernel::task::WaitReason::EndpointReceive(_)
+                ))
+            )
+        });
+        let blocking_syscall = match syscall {
+            Syscall::IpcRecv | Syscall::IpcCall => true,
+            Syscall::IpcSend => frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) == 0,
+            _ => false,
+        };
+        if blocking_syscall && caller_blocked {
+            return Ok(());
+        }
     }
+    result
 }
 
 #[cfg(test)]

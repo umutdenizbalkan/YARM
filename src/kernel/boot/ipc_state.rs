@@ -10,17 +10,6 @@ use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
 use crate::kernel::task::{TaskStatus, WaitReason};
 
 impl KernelState {
-    fn block_until_tid_unblocked(&mut self, tid: ThreadId) -> Result<(), KernelError> {
-        while matches!(self.task_status(tid.0), Some(TaskStatus::Blocked(_))) {
-            if self.current_tid().is_none() {
-                let _ = self.dispatch_next_task()?;
-            } else {
-                self.yield_current()?;
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
@@ -656,13 +645,9 @@ impl KernelState {
                 return Ok(());
             }
 
-            let blocked_tid =
+            let _ =
                 self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
             self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
-            if deadline.is_none() {
-                self.block_until_tid_unblocked(blocked_tid)?;
-                return Ok(());
-            }
             return Err(KernelError::WouldBlock);
         }
 
@@ -673,13 +658,9 @@ impl KernelState {
             .and_then(Option::as_mut)
             .ok_or(KernelError::WrongObject)?;
         if endpoint.send(msg).is_err() {
-            let blocked_tid =
+            let _ =
                 self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
             self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
-            if deadline.is_none() {
-                self.block_until_tid_unblocked(blocked_tid)?;
-                return Ok(());
-            }
             return Err(KernelError::WouldBlock);
         }
 
@@ -849,77 +830,65 @@ impl KernelState {
         recv_cap: CapId,
         deadline: Option<u64>,
     ) -> Result<Option<Message>, KernelError> {
-        loop {
-            let capability = self.resolve_recv_cap_task_local(recv_cap)?;
-            if !capability.has_right(CapRights::RECEIVE) {
-                return Err(KernelError::MissingRight);
-            }
-            if let CapObject::Notification { .. } = capability.object {
-                let notif_idx = self.resolve_notification_index(capability.object)?;
-                let notif = self.ipc.notifications[notif_idx]
-                    .as_mut()
-                    .ok_or(KernelError::WrongObject)?;
-                if let Some(msg) = notif.recv() {
-                    return Ok(Some(msg));
-                }
-                let blocked_tid =
-                    ThreadId(self.block_current_cpu().ok_or(KernelError::TaskMissing)?);
-                self.with_tcbs_mut(|tcbs| {
-                    let tcb = tcbs
-                        .iter_mut()
-                        .flatten()
-                        .find(|tcb| tcb.tid.0 == blocked_tid.0)
-                        .ok_or(KernelError::TaskMissing)?;
-                    tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
-                    tcb.ipc_timeout_deadline = deadline;
-                    tcb.ipc_timeout_fired = false;
-                    Ok::<_, KernelError>(())
-                })?;
-                self.ipc.notification_waiters[notif_idx] = Some(blocked_tid);
-                let _ = self.dispatch_next_task()?;
-                if deadline.is_none() {
-                    self.block_until_tid_unblocked(blocked_tid)?;
-                    continue;
-                }
-                return Ok(None);
-            }
-
-            let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-
-            let dequeued = self
-                .ipc
-                .endpoints
-                .get_mut(endpoint_idx)
-                .and_then(Option::as_mut)
-                .ok_or(KernelError::WrongObject)?
-                .recv();
-
-            if let Some(msg) = dequeued {
-                if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-                    self.ipc
-                        .endpoints
-                        .get_mut(endpoint_idx)
-                        .and_then(Option::as_mut)
-                        .ok_or(KernelError::WrongObject)?
-                        .send(waiter.msg)
-                        .map_err(|_| KernelError::EndpointQueueFull)?;
-                    self.wake_sender_waiter(waiter.tid)?;
-                }
+        let capability = self.resolve_recv_cap_task_local(recv_cap)?;
+        if !capability.has_right(CapRights::RECEIVE) {
+            return Err(KernelError::MissingRight);
+        }
+        if let CapObject::Notification { .. } = capability.object {
+            let notif_idx = self.resolve_notification_index(capability.object)?;
+            let notif = self.ipc.notifications[notif_idx]
+                .as_mut()
+                .ok_or(KernelError::WrongObject)?;
+            if let Some(msg) = notif.recv() {
                 return Ok(Some(msg));
             }
-
-            if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-                self.wake_sender_waiter(waiter.tid)?;
-                return Ok(Some(waiter.msg));
-            }
-
-            let blocked_tid =
-                self.block_current_on_receive_with_deadline(endpoint_idx, recv_cap, deadline)?;
-            if deadline.is_none() {
-                self.block_until_tid_unblocked(blocked_tid)?;
-                continue;
-            }
+            let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == blocked_tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+                tcb.ipc_timeout_deadline = deadline;
+                tcb.ipc_timeout_fired = false;
+                Ok::<_, KernelError>(())
+            })?;
+            self.ipc.notification_waiters[notif_idx] = Some(ThreadId(blocked_tid));
+            let _ = self.dispatch_next_task()?;
             return Ok(None);
         }
+
+        let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+
+        let dequeued = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?
+            .recv();
+
+        if let Some(msg) = dequeued {
+            if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
+                self.ipc
+                    .endpoints
+                    .get_mut(endpoint_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(KernelError::WrongObject)?
+                    .send(waiter.msg)
+                    .map_err(|_| KernelError::EndpointQueueFull)?;
+                self.wake_sender_waiter(waiter.tid)?;
+            }
+            return Ok(Some(msg));
+        }
+
+        if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
+            self.wake_sender_waiter(waiter.tid)?;
+            return Ok(Some(waiter.msg));
+        }
+
+        let _ = self.block_current_on_receive_with_deadline(endpoint_idx, recv_cap, deadline)?;
+        Ok(None)
     }
 }
