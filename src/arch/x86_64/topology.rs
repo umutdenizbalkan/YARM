@@ -2,7 +2,41 @@
 // Copyright 2026 Umut Deniz Balkan
 
 pub fn default_present_cpu_bitmap() -> u64 {
-    0b1111
+    bitmap_from_logical_count(detect_logical_cpu_count_cpuid())
+}
+
+fn bitmap_from_logical_count(raw_count: u32) -> u64 {
+    let count = raw_count.clamp(1, 64);
+    if count >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << count) - 1
+    }
+}
+
+fn detect_logical_cpu_count_cpuid() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let max_leaf = unsafe { core::arch::x86_64::__cpuid(0).eax };
+
+        if max_leaf >= 0xB {
+            let level1 = unsafe { core::arch::x86_64::__cpuid_count(0xB, 1) };
+            let logical = level1.ebx & 0xFFFF;
+            if logical != 0 {
+                return logical;
+            }
+        }
+
+        if max_leaf >= 1 {
+            let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
+            let logical = (leaf1.ebx >> 16) & 0xFF;
+            if logical != 0 {
+                return logical;
+            }
+        }
+    }
+
+    1
 }
 
 pub fn discover_present_cpu_bitmap(madt_or_apic: &[u8]) -> u64 {
@@ -92,5 +126,15 @@ mod tests {
             .expect("x86 description should parse");
         let text = core::str::from_utf8(&out[..len]).expect("valid utf8");
         assert_eq!(text, "lapic_mmio_base=0xfee00000");
+    }
+
+    #[test]
+    fn bitmap_from_logical_count_clamps_and_sets_bits() {
+        assert_eq!(bitmap_from_logical_count(0), 0b1);
+        assert_eq!(bitmap_from_logical_count(1), 0b1);
+        assert_eq!(bitmap_from_logical_count(2), 0b11);
+        assert_eq!(bitmap_from_logical_count(4), 0b1111);
+        assert_eq!(bitmap_from_logical_count(64), u64::MAX);
+        assert_eq!(bitmap_from_logical_count(128), u64::MAX);
     }
 }
