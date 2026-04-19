@@ -690,10 +690,6 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         let live_root = detect_active_root_phys_from_cr3().unwrap_or(0);
         let rsp_probe = rsp.saturating_sub(8);
         let (idt_base, gdt_base, tss_base) = read_descriptor_bases();
-        let done_fmt_addr = b"ASID_SWITCH_WRITE_CR3_DONE\0".as_ptr() as u64;
-        let breadcrumb_fn_addr = crate::arch::x86_64::console::write_breadcrumb as usize as u64;
-        let printk_flush_fn_addr = crate::kernel::printk::printk_flush as usize as u64;
-        let printk_state_addr = crate::kernel::printk::printk_state_addr() as u64;
         let rip_higher = bootstrap_higher_half_alias(rip);
         let rsp_higher = bootstrap_higher_half_alias(rsp_probe);
         crate::yarm_log!(
@@ -714,13 +710,6 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             idt_base,
             gdt_base,
             tss_base
-        );
-        crate::yarm_log!(
-            "ASID_POST_SWITCH_DEPS done_fmt=0x{:x} breadcrumb_fn=0x{:x} printk_flush_fn=0x{:x} printk_state=0x{:x}",
-            done_fmt_addr,
-            breadcrumb_fn_addr,
-            printk_flush_fn_addr,
-            printk_state_addr
         );
         log_root_chain(live_root, "live_rip", VirtAddr(rip));
         log_root_chain(target_root, "target_rip_before", VirtAddr(rip));
@@ -751,21 +740,6 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             gdt_base != 0 && resolve_page_in_root(target_root, VirtAddr(gdt_base)).is_some();
         let target_tss_ok =
             tss_base != 0 && resolve_page_in_root(target_root, VirtAddr(tss_base)).is_some();
-        let live_done_fmt_ok = resolve_page_in_root(live_root, VirtAddr(done_fmt_addr)).is_some();
-        let live_breadcrumb_fn_ok =
-            resolve_page_in_root(live_root, VirtAddr(breadcrumb_fn_addr)).is_some();
-        let live_printk_flush_fn_ok =
-            resolve_page_in_root(live_root, VirtAddr(printk_flush_fn_addr)).is_some();
-        let live_printk_state_ok =
-            resolve_page_in_root(live_root, VirtAddr(printk_state_addr)).is_some();
-        let target_done_fmt_ok =
-            resolve_page_in_root(target_root, VirtAddr(done_fmt_addr)).is_some();
-        let target_breadcrumb_fn_ok =
-            resolve_page_in_root(target_root, VirtAddr(breadcrumb_fn_addr)).is_some();
-        let target_printk_flush_fn_ok =
-            resolve_page_in_root(target_root, VirtAddr(printk_flush_fn_addr)).is_some();
-        let target_printk_state_ok =
-            resolve_page_in_root(target_root, VirtAddr(printk_state_addr)).is_some();
         let live_rip_hi_ok =
             rip_higher.is_some_and(|a| resolve_page_in_root(live_root, VirtAddr(a)).is_some());
         let live_rsp_hi_ok =
@@ -795,26 +769,11 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             target_gdt_ok,
             target_tss_ok
         );
-        crate::yarm_log!(
-            "ASID_POST_SWITCH_DEPS_MAP live[fmt={},bc_fn={},flush_fn={},state={}] target[fmt={},bc_fn={},flush_fn={},state={}]",
-            live_done_fmt_ok,
-            live_breadcrumb_fn_ok,
-            live_printk_flush_fn_ok,
-            live_printk_state_ok,
-            target_done_fmt_ok,
-            target_breadcrumb_fn_ok,
-            target_printk_flush_fn_ok,
-            target_printk_state_ok
-        );
         if (!target_rip_raw_ok
             || !target_rsp_raw_ok
             || !target_idt_ok
             || !target_gdt_ok
-            || !target_tss_ok
-            || !target_done_fmt_ok
-            || !target_breadcrumb_fn_ok
-            || !target_printk_flush_fn_ok
-            || !target_printk_state_ok)
+            || !target_tss_ok)
             && target_rip_hi_ok
             && target_rsp_hi_ok
         {
@@ -863,30 +822,6 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
                     VirtAddr(tss_base),
                 )?;
             }
-            clone_low_alias_page_from_live_root(
-                &mut state,
-                live_root,
-                target_root_phys,
-                VirtAddr(done_fmt_addr),
-            )?;
-            clone_low_alias_page_from_live_root(
-                &mut state,
-                live_root,
-                target_root_phys,
-                VirtAddr(breadcrumb_fn_addr),
-            )?;
-            clone_low_alias_page_from_live_root(
-                &mut state,
-                live_root,
-                target_root_phys,
-                VirtAddr(printk_flush_fn_addr),
-            )?;
-            clone_low_alias_page_from_live_root(
-                &mut state,
-                live_root,
-                target_root_phys,
-                VirtAddr(printk_state_addr),
-            )?;
             drop(state);
             let target_rip_raw_after = resolve_page(asid, VirtAddr(rip)).is_some();
             let target_rsp_raw_after = resolve_page(asid, VirtAddr(rsp_probe)).is_some();
@@ -917,17 +852,43 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
                 log_root_chain(target_root_phys, "target_tss_after", VirtAddr(tss_base));
             }
         }
+        let mut rip_at_switch: u64 = 0;
+        unsafe {
+            core::arch::asm!("lea {}, [rip + 0]", out(reg) rip_at_switch, options(nostack, preserves_flags));
+        }
+        let rip_at_switch_ok = resolve_page(asid, VirtAddr(rip_at_switch)).is_some();
+        crate::yarm_log!(
+            "ASID_SWITCH_EXEC_RIP asid={} rip_at_switch=0x{:x} ok={}",
+            asid.0,
+            rip_at_switch,
+            rip_at_switch_ok
+        );
+        if !rip_at_switch_ok {
+            let mut state = PAGE_TABLE_STATE.lock();
+            let target_root_phys = state.asid_root_phys(asid).ok_or(PageTableError::InvalidAddress)?;
+            clone_low_alias_page_from_live_root(
+                &mut state,
+                live_root,
+                target_root_phys,
+                VirtAddr(rip_at_switch),
+            )?;
+            drop(state);
+            log_root_chain(target_root_phys, "target_rip_switch_after", VirtAddr(rip_at_switch));
+        }
         let rip_ok = resolve_page(asid, VirtAddr(rip)).is_some();
         let rsp_ok = resolve_page(asid, VirtAddr(rsp_probe)).is_some();
+        let rip_switch_ok = resolve_page(asid, VirtAddr(rip_at_switch)).is_some();
         crate::yarm_log!(
-            "ASID_SWITCH_PRECHECK asid={} rip=0x{:x} rip_ok={} rsp=0x{:x} rsp_ok={}",
+            "ASID_SWITCH_PRECHECK asid={} rip=0x{:x} rip_ok={} rsp=0x{:x} rsp_ok={} rip_switch=0x{:x} rip_switch_ok={}",
             asid.0,
             rip,
             rip_ok,
             rsp,
-            rsp_ok
+            rsp_ok,
+            rip_at_switch,
+            rip_switch_ok
         );
-        if !rip_ok || !rsp_ok {
+        if !rip_ok || !rsp_ok || !rip_switch_ok {
             crate::yarm_log!("ASID_SWITCH_ABORT asid={} reason=kernel_mapping_missing", asid.0);
             return Err(PageTableError::InvalidAddress);
         }
@@ -943,10 +904,24 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
     }
     #[cfg(not(feature = "hosted-dev"))]
-    crate::arch::x86_64::console::write_breadcrumb(b'C');
+    unsafe {
+        core::arch::asm!(
+            "mov dx, 0x3f8",
+            "mov al, {ch}",
+            "out dx, al",
+            ch = const b'C',
+            options(nomem, nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            "mov dx, 0x3f8",
+            "mov al, {ch}",
+            "out dx, al",
+            ch = const b'D',
+            options(nomem, nostack, preserves_flags)
+        );
+    }
     #[cfg(not(feature = "hosted-dev"))]
     {
-        crate::arch::x86_64::console::write_breadcrumb(b'D');
         let mut active_cr3: u64 = 0;
         unsafe {
             core::arch::asm!(
