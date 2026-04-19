@@ -594,17 +594,13 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
         return;
     }
 
-    let mut reserved = crate::kernel::boot::Bootstrap::default_reserved_ranges_for_arch_boot();
+    let default_reserved = crate::kernel::boot::Bootstrap::default_reserved_ranges_for_arch_boot();
     // Reserve contiguous AP stack backing memory so frame allocator cannot
     // reuse it after SMP bring-up.
     let ap_stack_total =
         AP_STACK_BYTES.saturating_mul(crate::arch::platform_constants::MAX_CPUS as u64);
-    if ap_stack_total != 0 {
-        let _ = reserved.push(crate::kernel::boot::ReservedRange {
-            start: AP_STACK_PHYS_BASE,
-            len: ap_stack_total,
-        });
-    }
+    let ap_stack_end = AP_STACK_PHYS_BASE.saturating_add(ap_stack_total);
+    let reserved = [default_reserved[0], (AP_STACK_PHYS_BASE, ap_stack_end)];
     let (sanitized, sanitized_len) =
         crate::kernel::boot::Bootstrap::apply_reserved_ranges(&regions[..used], &reserved);
     if sanitized_len > 0 {
