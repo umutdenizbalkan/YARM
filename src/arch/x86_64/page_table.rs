@@ -110,7 +110,17 @@ impl PageTableState {
     fn alloc_page(&mut self) -> Result<usize, PageTableError> {
         for (idx, slot) in self.pages.iter_mut().enumerate() {
             if slot.is_none() {
-                let phys = alloc_pt_frame().map_err(|_| PageTableError::OutOfMemory)?;
+                let phys = match alloc_pt_frame() {
+                    Ok(phys) => phys,
+                    Err(_) => {
+                        crate::yarm_log!(
+                            "PT_ALLOC_PAGE_FAIL reason=alloc_pt_frame used_pages={} max_pages={}",
+                            self.pages.iter().flatten().count(),
+                            MAX_PT_PAGES
+                        );
+                        return Err(PageTableError::OutOfMemory);
+                    }
+                };
                 #[cfg(all(not(feature = "hosted-dev"), not(test)))]
                 unsafe {
                     let page_ptr =
@@ -121,6 +131,11 @@ impl PageTableState {
                 return Ok(idx);
             }
         }
+        crate::yarm_log!(
+            "PT_ALLOC_PAGE_FAIL reason=page_tracking_full used_pages={} max_pages={}",
+            self.pages.iter().flatten().count(),
+            MAX_PT_PAGES
+        );
         Err(PageTableError::OutOfMemory)
     }
 
@@ -190,6 +205,10 @@ impl PageTableState {
             }
         }
 
+        crate::yarm_log!(
+            "PT_ALLOC_PCID_FAIL asid={} reason=pcid_exhausted",
+            asid.0
+        );
         Err(PageTableError::OutOfMemory)
     }
 
@@ -198,7 +217,17 @@ impl PageTableState {
             return Ok(root);
         }
 
-        let root_idx = self.alloc_page()?;
+        let root_idx = match self.alloc_page() {
+            Ok(idx) => idx,
+            Err(err) => {
+                crate::yarm_log!(
+                    "PT_ENSURE_ASID_FAIL asid={} reason=root_alloc_failed err={:?}",
+                    asid.0,
+                    err
+                );
+                return Err(err);
+            }
+        };
         let root_phys = self.pages[root_idx].expect("root page").phys;
         let canonical_kernel_root_phys =
             if let Some(existing) = self.canonical_kernel_root_phys {
@@ -208,8 +237,27 @@ impl PageTableState {
                 self.canonical_kernel_root_phys = Some(detected);
                 detected
             };
-        clone_kernel_pml4_half_into_root(canonical_kernel_root_phys, root_phys)?;
-        let pcid = self.allocate_pcid(asid)?;
+        if let Err(err) = clone_kernel_pml4_half_into_root(canonical_kernel_root_phys, root_phys) {
+            crate::yarm_log!(
+                "PT_ENSURE_ASID_FAIL asid={} reason=clone_kernel_root_failed src=0x{:x} dst=0x{:x} err={:?}",
+                asid.0,
+                canonical_kernel_root_phys,
+                root_phys,
+                err
+            );
+            return Err(err);
+        }
+        let pcid = match self.allocate_pcid(asid) {
+            Ok(pcid) => pcid,
+            Err(err) => {
+                crate::yarm_log!(
+                    "PT_ENSURE_ASID_FAIL asid={} reason=pcid_alloc_failed err={:?}",
+                    asid.0,
+                    err
+                );
+                return Err(err);
+            }
+        };
 
         for slot in &mut self.asids {
             if slot.is_none() {
@@ -222,6 +270,12 @@ impl PageTableState {
             }
         }
 
+        crate::yarm_log!(
+            "PT_ENSURE_ASID_FAIL asid={} reason=asid_slot_full used_asid_roots={} max_asid_roots={}",
+            asid.0,
+            self.asids.iter().flatten().count(),
+            MAX_ASID_ROOTS
+        );
         Err(PageTableError::OutOfMemory)
     }
 
@@ -245,11 +299,6 @@ fn clone_kernel_pml4_half_into_root(
         let entry = unsafe { read_raw_table_entry(source_root_phys, idx)? };
         unsafe { write_raw_table_entry(dest_root_phys, idx, entry)? };
     }
-    // While bootstrap still executes in a low alias, preserve the active low
-    // PML4 slot as well so CR3 switches cannot strand the kernel stack/text.
-    let low_alias_idx = pml4_index(0);
-    let low_entry = unsafe { read_raw_table_entry(source_root_phys, low_alias_idx)? };
-    unsafe { write_raw_table_entry(dest_root_phys, low_alias_idx, low_entry)? };
     Ok(())
 }
 
@@ -408,7 +457,18 @@ fn walk_or_create_table(
         return Ok(entry.addr());
     }
 
-    let child_idx = state.alloc_page()?;
+    let child_idx = match state.alloc_page() {
+        Ok(idx) => idx,
+        Err(err) => {
+            crate::yarm_log!(
+                "PT_WALK_CREATE_FAIL reason=alloc_child_table table=0x{:x} index={} err={:?}",
+                table_phys,
+                index,
+                err
+            );
+            return Err(err);
+        }
+    };
     let child_phys = state.pages[child_idx].expect("child page").phys;
     write_table_entry(
         state,
@@ -557,15 +617,60 @@ pub fn map_page(
     }
 
     let mut state = PAGE_TABLE_STATE.lock();
-    let root_phys = state.ensure_asid(asid)?;
+    let root_phys = match state.ensure_asid(asid) {
+        Ok(root) => root,
+        Err(err) => {
+            crate::yarm_log!(
+                "PT_MAP_FAIL asid={} va=0x{:x} pa=0x{:x} reason=ensure_asid_failed err={:?}",
+                asid.0,
+                virt.0,
+                phys.0,
+                err
+            );
+            return Err(err);
+        }
+    };
     let l4 = pml4_index(virt.0);
     let l3 = pdpt_index(virt.0);
     let l2 = pd_index(virt.0);
     let l1 = pt_index(virt.0);
 
-    let pdpt_phys = walk_or_create_table(&mut state, root_phys, l4, flags)?;
-    let pd_phys = walk_or_create_table(&mut state, pdpt_phys, l3, flags)?;
-    let pt_phys = walk_or_create_table(&mut state, pd_phys, l2, flags)?;
+    let pdpt_phys = match walk_or_create_table(&mut state, root_phys, l4, flags) {
+        Ok(phys) => phys,
+        Err(err) => {
+            crate::yarm_log!(
+                "PT_MAP_FAIL asid={} va=0x{:x} reason=pdpt_alloc_walk_failed err={:?}",
+                asid.0,
+                virt.0,
+                err
+            );
+            return Err(err);
+        }
+    };
+    let pd_phys = match walk_or_create_table(&mut state, pdpt_phys, l3, flags) {
+        Ok(phys) => phys,
+        Err(err) => {
+            crate::yarm_log!(
+                "PT_MAP_FAIL asid={} va=0x{:x} reason=pd_alloc_walk_failed err={:?}",
+                asid.0,
+                virt.0,
+                err
+            );
+            return Err(err);
+        }
+    };
+    let pt_phys = match walk_or_create_table(&mut state, pd_phys, l2, flags) {
+        Ok(phys) => phys,
+        Err(err) => {
+            crate::yarm_log!(
+                "PT_MAP_FAIL asid={} va=0x{:x} reason=pt_alloc_walk_failed err={:?}",
+                asid.0,
+                virt.0,
+                err
+            );
+            return Err(err);
+        }
+    };
 
     let previous = read_table_entry(&state, pt_phys, l1).ok_or(PageTableError::InvalidAddress)?;
     write_table_entry(

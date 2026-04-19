@@ -139,7 +139,14 @@ pub enum VmError {
     target_arch = "riscv64"
 ))]
 fn arch_register_asid(asid: Asid) -> Result<(), VmError> {
-    crate::arch::selected_isa::page_table::ensure_asid_root(asid).map_err(|_| VmError::Full)
+    crate::arch::selected_isa::page_table::ensure_asid_root(asid).map_err(|err| {
+        crate::yarm_log!(
+            "VM_FULL reason=ensure_asid_root_failed asid={} err={:?}",
+            asid.0,
+            err
+        );
+        VmError::Full
+    })
 }
 
 #[cfg(not(any(
@@ -176,7 +183,16 @@ fn arch_unregister_asid(_asid: Asid) {}
 fn arch_map_page(asid: Option<Asid>, virt: VirtAddr, mapping: Mapping) -> Result<(), VmError> {
     if let Some(asid) = asid {
         crate::arch::selected_isa::page_table::map_page(asid, virt, mapping.phys, mapping.flags)
-            .map_err(|_| VmError::Full)?;
+            .map_err(|err| {
+                crate::yarm_log!(
+                    "VM_FULL reason=arch_map_page_failed asid={} va=0x{:x} pa=0x{:x} err={:?}",
+                    asid.0,
+                    virt.0,
+                    mapping.phys.0,
+                    err
+                );
+                VmError::Full
+            })?;
     }
     Ok(())
 }
@@ -331,6 +347,13 @@ impl AddressSpace {
             }
             Err(i) => {
                 if self.len >= MAX_MAPPINGS {
+                    crate::yarm_log!(
+                        "VM_FULL reason=mapping_bookkeeping_full asid={:?} len={} max_mappings={} va=0x{:x}",
+                        self.asid.map(|v| v.0),
+                        self.len,
+                        MAX_MAPPINGS,
+                        virt.0
+                    );
                     return Err(VmError::Full);
                 }
                 arch_map_page(self.asid, virt, mapping)?;
