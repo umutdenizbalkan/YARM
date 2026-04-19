@@ -387,20 +387,68 @@ pub fn remove_asid_root(asid: Asid) {
 pub fn cr3_for_asid(asid: Asid) -> Option<u64> {
     let mut state = PAGE_TABLE_STATE.lock();
     let root_phys = state.ensure_asid(asid).ok()?;
+    let kernel_l4_base = pml4_index(vm_layout::KERNEL_SPACE_BASE);
+    let mut kernel_half_present = false;
+    for idx in kernel_l4_base..ENTRIES_PER_TABLE {
+        let entry = read_table_entry(&state, root_phys, idx)?;
+        if entry.is_present() {
+            kernel_half_present = true;
+            break;
+        }
+    }
     if pcide_enabled() {
         // x86_64 PCID is 12 bits; software ASID is wider. Keep an explicit
         // per-ASID PCID assignment so simultaneously-live ASIDs never alias.
         let pcid = state.asid_pcid(asid)? as u64;
-        Some((root_phys & PAGE_MASK) | pcid)
+        let cr3 = (root_phys & PAGE_MASK) | pcid;
+        crate::yarm_log!(
+            "ASID_CR3_PREP asid={} root=0x{:x} pcide=true kernel_half_present={} cr3=0x{:x}",
+            asid.0,
+            root_phys,
+            kernel_half_present,
+            cr3
+        );
+        Some(cr3)
     } else {
         // CR4.PCIDE is not enabled; CR3 low bits must remain clear (except
         // legacy PWT/PCD), so do not encode software ASID in CR3.
-        Some(root_phys & PAGE_MASK)
+        let cr3 = root_phys & PAGE_MASK;
+        crate::yarm_log!(
+            "ASID_CR3_PREP asid={} root=0x{:x} pcide=false kernel_half_present={} cr3=0x{:x}",
+            asid.0,
+            root_phys,
+            kernel_half_present,
+            cr3
+        );
+        Some(cr3)
     }
 }
 
 pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     let cr3 = cr3_for_asid(asid).ok_or(PageTableError::OutOfMemory)?;
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        let mut rip: u64 = 0;
+        let mut rsp: u64 = 0;
+        unsafe {
+            core::arch::asm!("lea {}, [rip + 0]", out(reg) rip, options(nostack, preserves_flags));
+            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags));
+        }
+        let rip_ok = resolve_page(asid, VirtAddr(rip)).is_some();
+        let rsp_ok = resolve_page(asid, VirtAddr(rsp.saturating_sub(8))).is_some();
+        crate::yarm_log!(
+            "ASID_SWITCH_PRECHECK asid={} rip=0x{:x} rip_ok={} rsp=0x{:x} rsp_ok={}",
+            asid.0,
+            rip,
+            rip_ok,
+            rsp,
+            rsp_ok
+        );
+        if !rip_ok || !rsp_ok {
+            crate::yarm_log!("ASID_SWITCH_ABORT asid={} reason=kernel_mapping_missing", asid.0);
+            return Err(PageTableError::InvalidAddress);
+        }
+    }
     #[cfg(not(feature = "hosted-dev"))]
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
