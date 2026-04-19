@@ -414,6 +414,78 @@ fn bootstrap_higher_half_alias(addr: u64) -> Option<u64> {
     platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(addr)
 }
 
+#[cfg(all(not(feature = "hosted-dev"), not(test)))]
+fn clone_low_alias_page_from_live_root(
+    state: &mut PageTableState,
+    live_root_phys: u64,
+    target_root_phys: u64,
+    virt: VirtAddr,
+) -> Result<(), PageTableError> {
+    let l4 = pml4_index(virt.0);
+    let l3 = pdpt_index(virt.0);
+    let l2 = pd_index(virt.0);
+    let l1 = pt_index(virt.0);
+
+    let src_l4 = unsafe { read_raw_table_entry(live_root_phys, l4)? };
+    if !src_l4.is_present() {
+        return Err(PageTableError::InvalidAddress);
+    }
+
+    let mut dst_table = target_root_phys;
+    let mut src_table = src_l4.addr();
+
+    let src_l3 = unsafe { read_raw_table_entry(src_table, l3)? };
+    if !src_l3.is_present() {
+        return Err(PageTableError::InvalidAddress);
+    }
+    let mut dst_l4 = read_table_entry(state, dst_table, l4).ok_or(PageTableError::InvalidAddress)?;
+    if !dst_l4.is_present() {
+        let new_idx = state.alloc_page()?;
+        let new_phys = state.pages[new_idx].expect("new l3").phys;
+        dst_l4 = PageTableEntry::with_addr_and_flags(new_phys, src_l4.0 & !PAGE_MASK);
+        write_table_entry(state, dst_table, l4, dst_l4)?;
+    }
+    dst_table = dst_l4.addr();
+    if (src_l3.0 & PageTableEntry::HUGE_PAGE) != 0 {
+        write_table_entry(state, dst_table, l3, src_l3)?;
+        return Ok(());
+    }
+
+    src_table = src_l3.addr();
+    let src_l2 = unsafe { read_raw_table_entry(src_table, l2)? };
+    if !src_l2.is_present() {
+        return Err(PageTableError::InvalidAddress);
+    }
+    let mut dst_l3 = read_table_entry(state, dst_table, l3).ok_or(PageTableError::InvalidAddress)?;
+    if !dst_l3.is_present() {
+        let new_idx = state.alloc_page()?;
+        let new_phys = state.pages[new_idx].expect("new l2").phys;
+        dst_l3 = PageTableEntry::with_addr_and_flags(new_phys, src_l3.0 & !PAGE_MASK);
+        write_table_entry(state, dst_table, l3, dst_l3)?;
+    }
+    dst_table = dst_l3.addr();
+    if (src_l2.0 & PageTableEntry::HUGE_PAGE) != 0 {
+        write_table_entry(state, dst_table, l2, src_l2)?;
+        return Ok(());
+    }
+
+    src_table = src_l2.addr();
+    let src_l1 = unsafe { read_raw_table_entry(src_table, l1)? };
+    if !src_l1.is_present() {
+        return Err(PageTableError::InvalidAddress);
+    }
+    let mut dst_l2 = read_table_entry(state, dst_table, l2).ok_or(PageTableError::InvalidAddress)?;
+    if !dst_l2.is_present() {
+        let new_idx = state.alloc_page()?;
+        let new_phys = state.pages[new_idx].expect("new l1").phys;
+        dst_l2 = PageTableEntry::with_addr_and_flags(new_phys, src_l2.0 & !PAGE_MASK);
+        write_table_entry(state, dst_table, l2, dst_l2)?;
+    }
+    dst_table = dst_l2.addr();
+    write_table_entry(state, dst_table, l1, src_l1)?;
+    Ok(())
+}
+
 fn table_flags_from_page_flags(flags: PageFlags) -> u64 {
     let mut bits = PageTableEntry::PRESENT | PageTableEntry::WRITABLE;
     if flags.user {
@@ -582,6 +654,32 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             target_rip_hi_ok,
             target_rsp_hi_ok
         );
+        if (!target_rip_raw_ok || !target_rsp_raw_ok) && target_rip_hi_ok && target_rsp_hi_ok {
+            let mut state = PAGE_TABLE_STATE.lock();
+            let target_root_phys = state.asid_root_phys(asid).ok_or(PageTableError::InvalidAddress)?;
+            crate::yarm_log!(
+                "ASID_SWITCH_MIN_LOW_ALIAS_BEGIN asid={} live_root=0x{:x} target_root=0x{:x}",
+                asid.0,
+                live_root,
+                target_root_phys
+            );
+            clone_low_alias_page_from_live_root(&mut state, live_root, target_root_phys, VirtAddr(rip))?;
+            clone_low_alias_page_from_live_root(
+                &mut state,
+                live_root,
+                target_root_phys,
+                VirtAddr(rsp_probe),
+            )?;
+            drop(state);
+            let target_rip_raw_after = resolve_page(asid, VirtAddr(rip)).is_some();
+            let target_rsp_raw_after = resolve_page(asid, VirtAddr(rsp_probe)).is_some();
+            crate::yarm_log!(
+                "ASID_SWITCH_MIN_LOW_ALIAS_DONE asid={} target_raw_after[rip={},rsp={}]",
+                asid.0,
+                target_rip_raw_after,
+                target_rsp_raw_after
+            );
+        }
         let rip_ok = resolve_page(asid, VirtAddr(rip)).is_some();
         let rsp_ok = resolve_page(asid, VirtAddr(rsp_probe)).is_some();
         crate::yarm_log!(
