@@ -216,6 +216,10 @@ impl PrintkRing {
 
 static PRINTK: PrintkRing = PrintkRing::new();
 
+pub fn printk_state_addr() -> usize {
+    core::ptr::addr_of!(PRINTK) as usize
+}
+
 struct StackBuf {
     len: usize,
     buf: [u8; PRB_MSG_MAX],

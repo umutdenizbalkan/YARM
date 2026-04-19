@@ -24,6 +24,15 @@ pub fn write_line(msg: &str) {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn write_breadcrumb(byte: u8) {
+    // Debug port breadcrumb (QEMU/Bochs-style). No formatting, no allocation.
+    outb(0xE9, byte);
+}
+
+#[cfg(feature = "hosted-dev")]
+pub fn write_breadcrumb(_byte: u8) {}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn write_byte(byte: u8) {
     while (inb(COM1_LINE_STATUS) & LINE_STATUS_THR_EMPTY) == 0 {}
     outb(COM1_PORT, byte);
