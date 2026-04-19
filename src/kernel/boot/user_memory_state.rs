@@ -77,12 +77,14 @@ impl KernelState {
         va: VirtAddr,
         bytes: &[u8],
     ) -> Result<(), KernelError> {
-        crate::yarm_log!(
-            "COPY_TO_USER asid={} va=0x{:x} len={}",
-            asid.0,
-            va.0,
-            bytes.len()
-        );
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "COPY_TO_USER asid={} va=0x{:x} len={}",
+                asid.0,
+                va.0,
+                bytes.len()
+            );
+        }
         let mut last_page_base: Option<usize> = None;
         for (i, &byte) in bytes.iter().enumerate() {
             let addr = va.0 as usize + i;
@@ -91,13 +93,15 @@ impl KernelState {
                 let pte_present =
                     crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(page_base as u64))
                         .is_some();
-                crate::yarm_log!(
-                    "COPY_TO_USER_PAGE asid={} page_va=0x{:x} pte_present={} offset={}",
-                    asid.0,
-                    page_base,
-                    pte_present,
-                    i
-                );
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!(
+                        "COPY_TO_USER_PAGE asid={} page_va=0x{:x} pte_present={} offset={}",
+                        asid.0,
+                        page_base,
+                        pte_present,
+                        i
+                    );
+                }
                 last_page_base = Some(page_base);
             }
             let phys = self.validate_user_access_for_asid(asid, addr, true)?;
@@ -192,14 +196,18 @@ impl KernelState {
         va: usize,
         need_write: bool,
     ) -> Result<u64, KernelError> {
-        crate::yarm_log!(
-            "VALIDATE asid={} va=0x{:x} need_write={}",
-            asid.0,
-            va,
-            need_write
-        );
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "VALIDATE asid={} va=0x{:x} need_write={}",
+                asid.0,
+                va,
+                need_write
+            );
+        }
         let user_space_exists = self.user_spaces.get(asid).is_some();
-        crate::yarm_log!("ASID_EXISTS={}", user_space_exists);
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!("ASID_EXISTS={}", user_space_exists);
+        }
         let _ = self.user_spaces.get(asid).ok_or(KernelError::Vm(VmError::InvalidAsid))?;
         let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1usize);
         let page_off = (va - page_base) as u64;
@@ -210,34 +218,40 @@ impl KernelState {
             .is_some();
         let pte_result =
             crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(page_base as u64));
-        crate::yarm_log!(
-            "VALIDATE_PAGE asid={} page_va=0x{:x} shadow_present={} resolve_ok={}",
-            asid.0,
-            page_base,
-            shadow_mapping_present,
-            pte_result.is_some()
-        );
-        let pte = pte_result.ok_or(KernelError::UserMemoryFault)?;
-        if !Self::pte_allows_user_access(pte, need_write) {
+        if cfg!(not(feature = "hosted-dev")) {
             crate::yarm_log!(
-                "VALIDATE_PERM_FAIL asid={} page_va=0x{:x} pte=0x{:x}",
+                "VALIDATE_PAGE asid={} page_va=0x{:x} shadow_present={} resolve_ok={}",
                 asid.0,
                 page_base,
-                pte.0
+                shadow_mapping_present,
+                pte_result.is_some()
             );
+        }
+        let pte = pte_result.ok_or(KernelError::UserMemoryFault)?;
+        if !Self::pte_allows_user_access(pte, need_write) {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!(
+                    "VALIDATE_PERM_FAIL asid={} page_va=0x{:x} pte=0x{:x}",
+                    asid.0,
+                    page_base,
+                    pte.0
+                );
+            }
             return Err(KernelError::UserMemoryFault);
         }
         let resolved_phys = pte
             .addr()
             .checked_add(page_off)
             .ok_or(KernelError::UserMemoryFault)?;
-        crate::yarm_log!(
-            "VALIDATE_OK asid={} page_va=0x{:x} page_off=0x{:x} phys=0x{:x}",
-            asid.0,
-            page_base,
-            page_off,
-            resolved_phys
-        );
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "VALIDATE_OK asid={} page_va=0x{:x} page_off=0x{:x} phys=0x{:x}",
+                asid.0,
+                page_base,
+                page_off,
+                resolved_phys
+            );
+        }
         Ok(resolved_phys)
     }
 

@@ -106,15 +106,17 @@ impl KernelState {
             let mut va = page_start;
             while va < page_end {
                 let phys = alloc_pt_frame().map_err(|_| KernelError::MemoryObjectFull)?;
-                crate::yarm_log!(
-                    "ELF_MAP_PAGE_BEGIN asid={} seg_vbase=0x{:x} page_va=0x{:x} phys=0x{:x} memsz={} filesz={}",
-                    asid.0,
-                    p_vaddr,
-                    va,
-                    phys,
-                    p_memsz,
-                    p_filesz
-                );
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!(
+                        "ELF_MAP_PAGE_BEGIN asid={} seg_vbase=0x{:x} page_va=0x{:x} phys=0x{:x} memsz={} filesz={}",
+                        asid.0,
+                        p_vaddr,
+                        va,
+                        phys,
+                        p_memsz,
+                        p_filesz
+                    );
+                }
                 self.map_user_page_in_asid_raw(
                     asid,
                     VirtAddr(va),
@@ -126,19 +128,23 @@ impl KernelState {
                 let post_map_present =
                     crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
                         .is_some();
-                crate::yarm_log!(
-                    "ELF_MAP_PAGE_DONE asid={} page_va=0x{:x} post_resolve={}",
-                    asid.0,
-                    va,
-                    post_map_present
-                );
-                if !post_map_present {
+                if cfg!(not(feature = "hosted-dev")) {
                     crate::yarm_log!(
-                        "ELF_MAP_PAGE_INVARIANT_FAIL asid={} page_va=0x{:x} phys=0x{:x}",
+                        "ELF_MAP_PAGE_DONE asid={} page_va=0x{:x} post_resolve={}",
                         asid.0,
                         va,
-                        phys
+                        post_map_present
                     );
+                }
+                if !post_map_present {
+                    if cfg!(not(feature = "hosted-dev")) {
+                        crate::yarm_log!(
+                            "ELF_MAP_PAGE_INVARIANT_FAIL asid={} page_va=0x{:x} phys=0x{:x}",
+                            asid.0,
+                            va,
+                            phys
+                        );
+                    }
                     return Err(KernelError::UserMemoryFault);
                 }
                 va += page_size;
