@@ -353,6 +353,9 @@ impl KernelState {
     }
 
     pub(crate) fn dispatch_next_task(&mut self) -> Result<Option<u64>, KernelError> {
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!("DISPATCH: begin");
+        }
         self.with_ipc_state_mut(|ipc| {
             ipc.telemetry.scheduler_dispatch_calls =
                 ipc.telemetry.scheduler_dispatch_calls.saturating_add(1);
@@ -360,9 +363,38 @@ impl KernelState {
         let outgoing_tid = self.current_tid();
         let next = self.dispatch_next_current_cpu();
         if let Some(tid) = next {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!("DISPATCH: selected_tid={}", tid);
+            }
             let incoming_asid = self.task_asid(tid);
             if let Some(asid) = incoming_asid {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!("DISPATCH: before switch_address_space asid={}", asid.0);
+                }
                 self.hal.switch_address_space(asid);
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!("DISPATCH: after switch_address_space asid={}", asid.0);
+                }
+            }
+            if cfg!(not(feature = "hosted-dev")) {
+                let (context_ptr, kernel_stack_top) = self.with_tcbs(|tcbs| {
+                    tcbs.iter()
+                        .flatten()
+                        .find(|tcb| tcb.tid.0 == tid)
+                        .map(|tcb| {
+                            (
+                                &tcb.kernel_context.frame as *const _ as usize,
+                                tcb.kernel_context.stack_top.map(|top| top.0).unwrap_or(0),
+                            )
+                        })
+                        .unwrap_or((0, 0))
+                });
+                crate::yarm_log!(
+                    "DISPATCH: before loading context tid={} ctx_ptr=0x{:x} kernel_stack_top=0x{:x}",
+                    tid,
+                    context_ptr,
+                    kernel_stack_top
+                );
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
             if outgoing_tid != Some(tid) {
@@ -380,6 +412,11 @@ impl KernelState {
                 tcb.status = TaskStatus::Running;
                 Ok::<_, KernelError>(())
             })?;
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!("DISPATCH: task_running tid={}", tid);
+            }
+        } else if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!("DISPATCH: no_runnable_task");
         }
         Ok(next)
     }

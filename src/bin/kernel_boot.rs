@@ -17,6 +17,7 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
 
     let initial = kernel.dispatch_ready_task().ok().flatten();
     yarm::yarm_log!("YARM_SCHED_LOOP_START dispatched_tid={:?}", initial);
+    yarm::yarm_log!("DISPATCH: before enter_user_call");
     yarm::arch::boot_entry::enter_dispatched_user_task_if_available(kernel, initial);
 }
 

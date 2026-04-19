@@ -9,7 +9,43 @@ pub type AdapterTrapEvent = crate::arch::trap::TrapEvent;
 
 #[inline]
 pub fn switch_address_space(asid: Asid) {
-    let _ = crate::arch::selected_isa::page_table::activate_asid(asid);
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    let mut cr3_before: u64 = 0;
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr3",
+            out(reg) cr3_before,
+            options(nostack, preserves_flags)
+        );
+    }
+    match crate::arch::selected_isa::page_table::activate_asid(asid) {
+        Ok(cr3) => {
+            #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+            {
+                let mut cr3_after: u64 = 0;
+                unsafe {
+                    core::arch::asm!(
+                        "mov {}, cr3",
+                        out(reg) cr3_after,
+                        options(nostack, preserves_flags)
+                    );
+                }
+                crate::yarm_log!(
+                    "CR3_SWITCH_OK asid={} target_cr3=0x{:x} before=0x{:x} after=0x{:x}",
+                    asid.0,
+                    cr3,
+                    cr3_before,
+                    cr3_after
+                );
+            }
+            #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+            crate::yarm_log!("CR3_SWITCH_OK asid={} target_cr3=0x{:x}", asid.0, cr3);
+        }
+        Err(err) => {
+            crate::yarm_log!("CR3_SWITCH_FAIL asid={} err={:?}", asid.0, err);
+        }
+    }
 }
 
 #[inline]
