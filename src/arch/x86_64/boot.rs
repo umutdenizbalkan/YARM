@@ -815,17 +815,20 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.online_cpu_count(),
         kernel.present_cpu_count()
     );
+    crate::yarm_log!("YARM_BOOT_STAGE post_smp_startup");
     kernel.program_timer_deadline_current_cpu(
         crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
     );
     crate::arch::x86_64::irq::enable_interrupts_for_boot();
     debug_uart_marker(b'J');
+    crate::yarm_log!("YARM_BOOT_STAGE pre_boot_ok");
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),
         kernel.present_cpu_bitmap(),
         kernel.online_cpu_count()
     );
+    crate::yarm_log!("YARM_BOOT_STAGE pre_scheduler_bootstrap");
     run(kernel);
 }
 
