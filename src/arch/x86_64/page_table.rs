@@ -690,11 +690,6 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         let live_root = detect_active_root_phys_from_cr3().unwrap_or(0);
         let rsp_probe = rsp.saturating_sub(8);
         let (idt_base, gdt_base, tss_base) = read_descriptor_bases();
-        const DONE_FMT: &str = "ASID_SWITCH_WRITE_CR3_DONE asid={} active_cr3=0x{:x}";
-        let done_fmt_addr = DONE_FMT.as_ptr() as u64;
-        let printk_args_fn_addr = crate::kernel::printk::printk_args as usize as u64;
-        let printk_flush_fn_addr = crate::kernel::printk::printk_flush as usize as u64;
-        let printk_state_addr = crate::kernel::printk::printk_state_addr() as u64;
         let rip_higher = bootstrap_higher_half_alias(rip);
         let rsp_higher = bootstrap_higher_half_alias(rsp_probe);
         crate::yarm_log!(
@@ -715,13 +710,6 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             idt_base,
             gdt_base,
             tss_base
-        );
-        crate::yarm_log!(
-            "ASID_DONE_DEPS fmt=0x{:x} printk_args=0x{:x} printk_flush=0x{:x} printk_state=0x{:x}",
-            done_fmt_addr,
-            printk_args_fn_addr,
-            printk_flush_fn_addr,
-            printk_state_addr
         );
         log_root_chain(live_root, "live_rip", VirtAddr(rip));
         log_root_chain(target_root, "target_rip_before", VirtAddr(rip));
@@ -752,21 +740,6 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             gdt_base != 0 && resolve_page_in_root(target_root, VirtAddr(gdt_base)).is_some();
         let target_tss_ok =
             tss_base != 0 && resolve_page_in_root(target_root, VirtAddr(tss_base)).is_some();
-        let live_done_fmt_ok = resolve_page_in_root(live_root, VirtAddr(done_fmt_addr)).is_some();
-        let live_printk_args_ok =
-            resolve_page_in_root(live_root, VirtAddr(printk_args_fn_addr)).is_some();
-        let live_printk_flush_ok =
-            resolve_page_in_root(live_root, VirtAddr(printk_flush_fn_addr)).is_some();
-        let live_printk_state_ok =
-            resolve_page_in_root(live_root, VirtAddr(printk_state_addr)).is_some();
-        let target_done_fmt_ok =
-            resolve_page_in_root(target_root, VirtAddr(done_fmt_addr)).is_some();
-        let target_printk_args_ok =
-            resolve_page_in_root(target_root, VirtAddr(printk_args_fn_addr)).is_some();
-        let target_printk_flush_ok =
-            resolve_page_in_root(target_root, VirtAddr(printk_flush_fn_addr)).is_some();
-        let target_printk_state_ok =
-            resolve_page_in_root(target_root, VirtAddr(printk_state_addr)).is_some();
         let live_rip_hi_ok =
             rip_higher.is_some_and(|a| resolve_page_in_root(live_root, VirtAddr(a)).is_some());
         let live_rsp_hi_ok =
@@ -795,17 +768,6 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             target_idt_ok,
             target_gdt_ok,
             target_tss_ok
-        );
-        crate::yarm_log!(
-            "ASID_DONE_DEPS_MAP live[fmt={},args={},flush={},state={}] target[fmt={},args={},flush={},state={}]",
-            live_done_fmt_ok,
-            live_printk_args_ok,
-            live_printk_flush_ok,
-            live_printk_state_ok,
-            target_done_fmt_ok,
-            target_printk_args_ok,
-            target_printk_flush_ok,
-            target_printk_state_ok
         );
         if (!target_rip_raw_ok
             || !target_rsp_raw_ok
@@ -960,15 +922,6 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     }
     #[cfg(not(feature = "hosted-dev"))]
     {
-        unsafe {
-            core::arch::asm!(
-                "mov dx, 0x3f8",
-                "mov al, {ch}",
-                "out dx, al",
-                ch = const b'E',
-                options(nomem, nostack, preserves_flags)
-            );
-        }
         let mut active_cr3: u64 = 0;
         unsafe {
             core::arch::asm!(
@@ -976,45 +929,12 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
                 out(reg) active_cr3,
                 options(nostack, preserves_flags)
             );
-            core::arch::asm!(
-                "mov dx, 0x3f8",
-                "mov al, {ch}",
-                "out dx, al",
-                ch = const b'F',
-                options(nomem, nostack, preserves_flags)
-            );
-            core::arch::asm!(
-                "mov dx, 0x3f8",
-                "mov al, {ch}",
-                "out dx, al",
-                ch = const b'G',
-                options(nomem, nostack, preserves_flags)
-            );
         }
-        crate::pr_info!(
+        crate::yarm_log!(
             "ASID_SWITCH_WRITE_CR3_DONE asid={} active_cr3=0x{:x}",
             asid.0,
             active_cr3
         );
-        unsafe {
-            core::arch::asm!(
-                "mov dx, 0x3f8",
-                "mov al, {ch}",
-                "out dx, al",
-                ch = const b'H',
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-        let _ = crate::kernel::printk::printk_flush();
-        unsafe {
-            core::arch::asm!(
-                "mov dx, 0x3f8",
-                "mov al, {ch}",
-                "out dx, al",
-                ch = const b'I',
-                options(nomem, nostack, preserves_flags)
-            );
-        }
     }
     Ok(cr3)
 }
