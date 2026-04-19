@@ -490,12 +490,35 @@ impl KernelState {
         virt: VirtAddr,
         mapping: Mapping,
     ) -> Result<Option<Mapping>, KernelError> {
+        crate::yarm_log!(
+            "MAP_USER_RAW_BEGIN asid={} virt=0x{:x} phys=0x{:x} user={} rwx={}{}{}",
+            asid.0,
+            virt.0,
+            mapping.phys.0,
+            mapping.flags.user,
+            if mapping.flags.read { "r" } else { "-" },
+            if mapping.flags.write { "w" } else { "-" },
+            if mapping.flags.execute { "x" } else { "-" }
+        );
         let old = self.with_user_spaces_mut(|spaces| {
             let aspace = spaces
                 .get_mut(asid)
                 .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+            crate::yarm_log!(
+                "MAP_USER_RAW_ASPACE asid={} aspace_asid={}",
+                asid.0,
+                aspace.asid().map(|asid| asid.0).unwrap_or(0)
+            );
             aspace.map_page(virt, mapping).map_err(KernelError::Vm)
         })?;
+        let resolved = crate::arch::selected_isa::page_table::resolve_page(asid, virt).is_some();
+        crate::yarm_log!(
+            "MAP_USER_RAW_DONE asid={} virt=0x{:x} had_old={} resolve_ok={}",
+            asid.0,
+            virt.0,
+            old.is_some(),
+            resolved
+        );
         if let Some(old_mapping) = old {
             self.clear_cow_page(asid, virt);
             self.note_mapping_removed(old_mapping.phys);
