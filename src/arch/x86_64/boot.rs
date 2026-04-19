@@ -404,20 +404,44 @@ pub fn bootstrap_first_user_task(
 ) -> Result<(), crate::kernel::boot::KernelError> {
     use crate::kernel::boot::UserImageSpec;
     use crate::kernel::task::TaskClass;
+    crate::yarm_log!("BOOTSTRAP_STAGE: begin");
 
     if kernel.task_asid(RING3_INIT_SERVER_TID).is_some() {
         return Ok(());
     }
 
-    let (asid, _aspace_cap) = kernel.create_user_address_space()?;
+    let (asid, _aspace_cap) = match kernel.create_user_address_space() {
+        Ok(value) => value,
+        Err(err) => {
+            crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
+            return Err(err);
+        }
+    };
     let image = initramfs_static_hello_world_elf();
-    let entry = kernel.load_elf_pt_load_segments(asid, &image)?;
-    kernel.spawn_user_task_from_image(UserImageSpec {
+    let entry = match kernel.load_elf_pt_load_segments(asid, &image) {
+        Ok(entry) => {
+            crate::yarm_log!("BOOTSTRAP_STAGE: after ELF load");
+            crate::yarm_log!("BOOTSTRAP_STAGE: after copy_to_user");
+            entry
+        }
+        Err(err) => {
+            crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
+            return Err(err);
+        }
+    };
+    crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
+    match kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
         entry,
         asid: Some(asid),
         class: TaskClass::SystemServer,
-    })?;
+    }) {
+        Ok(_) => crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation"),
+        Err(err) => {
+            crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
+            return Err(err);
+        }
+    }
     crate::yarm_log!(
         "YARM_INIT_DONE arch=x86_64 phase=kernel_static_init_elf image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
         INITRAMFS_HELLO_WORLD_IMAGE_ID
@@ -460,6 +484,7 @@ pub fn enter_dispatched_user_task_if_available(
         if !entry_resolve || !stack_resolve {
             return;
         }
+        crate::yarm_log!("BOOTSTRAP_STAGE: before enter_user_mode");
         let Ok(cr3) = super::page_table::activate_asid(asid) else {
             return;
         };

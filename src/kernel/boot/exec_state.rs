@@ -300,7 +300,23 @@ impl KernelState {
         self.register_task_with_class(spec.tid, spec.class)?;
         let cnode = self.task_cnode(spec.tid).ok_or(KernelError::TaskMissing)?;
         self.set_process_cnode_for_pid(spec.tid, cnode)?;
-        let stack_top = self.allocate_user_stack_with_guard(spec.tid, 64)?;
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
+        }
+        let stack_top = match self.allocate_user_stack_with_guard(spec.tid, 64) {
+            Ok(top) => top,
+            Err(err) => {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
+                }
+                return Err(err);
+            }
+        };
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation");
+            crate::yarm_log!("BOOTSTRAP_STAGE: before entry setup");
+            crate::yarm_log!("USER_ENTRY rip=0x{:x}", spec.entry);
+        }
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
