@@ -357,6 +357,10 @@ emergency_idt_stub:
 const RING3_INIT_SERVER_TID: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const INITRAMFS_HELLO_WORLD_IMAGE_ID: u64 = 0x494E_4954_5848_454C; // "INITXHEL"
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const AP_STACK_PHYS_BASE: u64 = 0x0180_0000;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const AP_STACK_BYTES: u64 = 16 * 1024;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn initramfs_static_hello_world_elf() -> [u8; 256] {
@@ -590,7 +594,17 @@ fn init_pt_allocator_from_pvh_memmap(start_info_ptr: usize) {
         return;
     }
 
-    let reserved = crate::kernel::boot::Bootstrap::default_reserved_ranges_for_arch_boot();
+    let mut reserved = crate::kernel::boot::Bootstrap::default_reserved_ranges_for_arch_boot();
+    // Reserve contiguous AP stack backing memory so frame allocator cannot
+    // reuse it after SMP bring-up.
+    let ap_stack_total =
+        AP_STACK_BYTES.saturating_mul(crate::arch::platform_constants::MAX_CPUS as u64);
+    if ap_stack_total != 0 {
+        let _ = reserved.push(crate::kernel::boot::ReservedRange {
+            start: AP_STACK_PHYS_BASE,
+            len: ap_stack_total,
+        });
+    }
     let (sanitized, sanitized_len) =
         crate::kernel::boot::Bootstrap::apply_reserved_ranges(&regions[..used], &reserved);
     if sanitized_len > 0 {

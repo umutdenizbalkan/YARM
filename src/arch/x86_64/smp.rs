@@ -27,7 +27,12 @@ const AP_TRAMPOLINE_SIZE: usize = crate::kernel::vm::PAGE_SIZE;
 const AP_HANDOFF_OFFSET: usize = 0x100;
 const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 const AP_STACK_BYTES: usize = 16 * 1024;
-const AP_STACK_TOP_BASE: u64 = 0x0000_0000_2000_0000;
+const AP_STACK_PHYS_BASE: u64 = 0x0180_0000; // 24 MiB, safely inside low RAM.
+// APs switch to paging before loading RSP from handoff. Use the higher-half
+// direct-map VA for AP stacks instead of a low identity VA (e.g. 0x2000_0000),
+// because early identity mapping is intentionally limited during bootstrap.
+const AP_STACK_TOP_BASE: u64 =
+    crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE + AP_STACK_PHYS_BASE;
 const AP_READY_POLL_ITERS: usize = 2_000_000;
 const ICR_IDLE_POLL_ITERS: usize = 100_000;
 
