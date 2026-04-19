@@ -217,6 +217,11 @@ impl PriorityScheduler {
 
     pub fn dispatch_next(&mut self) -> Option<ThreadId> {
         if let Some(current) = self.current {
+            if current.tid.0 == 0 && self.runnable_count() > 0 {
+                let next = self.dequeue_highest()?;
+                self.current = Some(next);
+                return Some(next.tid);
+            }
             return Some(current.tid);
         }
         let next = self.dequeue_highest()?;
@@ -402,7 +407,21 @@ impl SmpScheduler {
 
     pub fn dispatch_next_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
         let idx = self.check_online_cpu(cpu).ok()?;
-        self.schedulers[idx].dispatch_next()
+        let idle_tid = self.schedulers[idx].current_tid().unwrap_or(ThreadId(0));
+        let runq_len = self.schedulers[idx].runnable_count();
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "SCHED cpu={} idle_tid={} runq_len={}",
+                cpu.0,
+                idle_tid.0,
+                runq_len
+            );
+        }
+        let final_tid = self.schedulers[idx].dispatch_next();
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!("SCHED cpu={} final_tid={:?}", cpu.0, final_tid);
+        }
+        final_tid
     }
 
     pub fn on_preempt_on(&mut self, cpu: CpuId) -> Option<ThreadId> {

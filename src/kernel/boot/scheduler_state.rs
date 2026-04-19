@@ -171,11 +171,18 @@ impl KernelState {
             kernel_mut(&mut sched.scheduler)
                 .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
                 .map_err(map_scheduler_error)?;
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
+            }
             Ok(cpu)
         } else {
-            kernel_mut(&mut sched.scheduler)
+            let cpu = kernel_mut(&mut sched.scheduler)
                 .enqueue_balanced(ThreadId(tid), priority)
-                .map_err(map_scheduler_error)
+                .map_err(map_scheduler_error)?;
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
+            }
+            Ok(cpu)
         }
     }
 
