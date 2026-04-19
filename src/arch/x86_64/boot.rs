@@ -461,12 +461,24 @@ pub fn enter_dispatched_user_task_if_available(
     kernel: &crate::kernel::boot::KernelState,
     dispatched_tid: Option<u64>,
 ) {
-    if let Some(tid) = dispatched_tid
-        && let Some(asid) = kernel.task_asid(tid)
-        && let Some(context) = kernel.thread_user_context(tid)
-        && context.instruction_ptr.0 != 0
-        && context.stack_ptr.0 != 0
-    {
+    let Some(tid) = dispatched_tid else {
+        crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid=<none>");
+        return;
+    };
+    crate::yarm_log!("ENTER_USER_LOOKUP tid={}", tid);
+    if tid == 0 {
+        crate::yarm_log!("ENTER_USER_REJECT_IDLE tid={}", tid);
+        return;
+    }
+    let Some(asid) = kernel.task_asid(tid) else {
+        crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid={} reason=missing_asid", tid);
+        return;
+    };
+    let Some(context) = kernel.thread_user_context(tid) else {
+        crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid={} reason=missing_context", tid);
+        return;
+    };
+    if context.instruction_ptr.0 != 0 && context.stack_ptr.0 != 0 {
         let entry_resolve =
             super::page_table::resolve_page(asid, context.instruction_ptr).is_some();
         let stack_probe = crate::kernel::vm::VirtAddr(context.stack_ptr.0.saturating_sub(8));

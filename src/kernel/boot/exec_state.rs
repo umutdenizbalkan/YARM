@@ -345,6 +345,10 @@ impl KernelState {
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
+        let _ = self.enqueue_task(spec.tid)?;
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!("BOOTSTRAP_FIRST_USER tid={} enqueued=true", spec.tid);
+        }
         Ok(SpawnedUserTask {
             tid: spec.tid,
             entry: spec.entry,

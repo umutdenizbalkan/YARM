@@ -62,9 +62,13 @@ impl KernelState {
     pub fn dispatch_next_current_cpu(&mut self) -> Option<u64> {
         let mut sched = self.scheduler_state();
         let cpu = sched.current_cpu;
-        kernel_mut(&mut sched.scheduler)
+        let next = kernel_mut(&mut sched.scheduler)
             .dispatch_next_on(cpu)
-            .map(|tid| tid.0)
+            .map(|tid| tid.0);
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!("DISPATCH_NEXT cpu={} result_tid={:?}", cpu.0, next);
+        }
+        next
     }
 
     pub fn on_preempt_current_cpu(&mut self) -> Option<u64> {
