@@ -12,7 +12,11 @@ use crate::kernel::trapframe::TrapFrame;
 const KERNEL_STACK_REGION_BASE: usize = 0xFFFF_8000_0000_0000;
 const KERNEL_STACK_REGION_SIZE: usize = 0x4000;
 const USER_STACK_STRIDE_BYTES: u64 = 2 * 1024 * 1024;
-const USER_STACK_TOP_BASE: u64 = crate::kernel::vm::KERNEL_SPACE_BASE - USER_STACK_STRIDE_BYTES;
+#[cfg(target_arch = "x86_64")]
+const USER_VIRT_TOP_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
+#[cfg(not(target_arch = "x86_64"))]
+const USER_VIRT_TOP_EXCLUSIVE: u64 = crate::kernel::vm::KERNEL_SPACE_BASE;
+const USER_STACK_TOP_BASE: u64 = USER_VIRT_TOP_EXCLUSIVE - USER_STACK_STRIDE_BYTES;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
@@ -449,6 +453,23 @@ impl KernelState {
                     flags: crate::kernel::vm::PageFlags::USER_RW,
                 },
             )?;
+        }
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!("USER_STACK asid={} base=0x{:x} top=0x{:x}", asid.0, base, top);
+        }
+        let stack_probe = crate::kernel::vm::VirtAddr(top - 8);
+        let stack_resolve =
+            crate::arch::selected_isa::page_table::resolve_page(asid, stack_probe).is_some();
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "USER_STACK_RESOLVE asid={} probe=0x{:x} ok={}",
+                asid.0,
+                stack_probe.0,
+                stack_resolve
+            );
+        }
+        if !stack_resolve {
+            return Err(KernelError::UserMemoryFault);
         }
         Ok(crate::kernel::vm::VirtAddr(top))
     }

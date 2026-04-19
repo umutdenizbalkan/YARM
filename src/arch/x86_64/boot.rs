@@ -443,15 +443,35 @@ pub fn enter_dispatched_user_task_if_available(
         && context.instruction_ptr.0 != 0
         && context.stack_ptr.0 != 0
     {
-        if super::page_table::activate_asid(asid).is_err() {
+        let entry_resolve =
+            super::page_table::resolve_page(asid, context.instruction_ptr).is_some();
+        let stack_probe = crate::kernel::vm::VirtAddr(context.stack_ptr.0.saturating_sub(8));
+        let stack_resolve = super::page_table::resolve_page(asid, stack_probe).is_some();
+        crate::yarm_log!(
+            "YARM_RING3_PRECHECK tid={} asid={} entry=0x{:x} entry_ok={} stack_top=0x{:x} stack_probe=0x{:x} stack_ok={}",
+            tid,
+            asid.0,
+            context.instruction_ptr.0,
+            entry_resolve,
+            context.stack_ptr.0,
+            stack_probe.0,
+            stack_resolve
+        );
+        if !entry_resolve || !stack_resolve {
             return;
         }
+        let Ok(cr3) = super::page_table::activate_asid(asid) else {
+            return;
+        };
         crate::yarm_log!(
-            "YARM_RING3_INIT_TASK tid={} entry=0x{:x} stack_top=0x{:x}",
+            "YARM_RING3_INIT_TASK tid={} asid={} cr3=0x{:x} entry=0x{:x} stack_top=0x{:x}",
             tid,
+            asid.0,
+            cr3,
             context.instruction_ptr.0,
             context.stack_ptr.0
         );
+        crate::yarm_log!("USER_ENTRY rip=0x{:x}", context.instruction_ptr.0);
         super::descriptor_tables::enter_user_mode_iret(
             context.instruction_ptr.0,
             context.stack_ptr.0,
