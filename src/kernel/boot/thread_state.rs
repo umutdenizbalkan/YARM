@@ -409,26 +409,64 @@ impl KernelState {
     pub(crate) fn allocate_user_stack_with_guard(
         &mut self,
         tid: u64,
+        asid: crate::kernel::vm::Asid,
         stack_pages: usize,
     ) -> Result<crate::kernel::vm::VirtAddr, KernelError> {
         if stack_pages == 0 {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!("STACK_ALLOC_FAIL reason=stack_pages_zero");
+            }
             return Err(KernelError::WrongObject);
         }
-        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
         let stack_bytes = (stack_pages as u64)
             .checked_mul(crate::kernel::vm::PAGE_SIZE as u64)
-            .ok_or(KernelError::WrongObject)?;
+            .ok_or_else(|| {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!("STACK_ALLOC_FAIL reason=stack_bytes_overflow");
+                }
+                KernelError::WrongObject
+            })?;
         let stride = USER_STACK_STRIDE_BYTES.max(stack_bytes + crate::kernel::vm::PAGE_SIZE as u64);
         let top = USER_STACK_TOP_BASE
             .checked_sub(tid.saturating_mul(stride))
-            .ok_or(KernelError::WrongObject)?;
+            .ok_or_else(|| {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!("STACK_ALLOC_FAIL reason=top_underflow");
+                }
+                KernelError::WrongObject
+            })?;
         let base = top
             .checked_sub(stack_bytes)
-            .ok_or(KernelError::WrongObject)?;
+            .ok_or_else(|| {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!("STACK_ALLOC_FAIL reason=base_underflow");
+                }
+                KernelError::WrongObject
+            })?;
         let guard = base
             .checked_sub(crate::kernel::vm::PAGE_SIZE as u64)
-            .ok_or(KernelError::WrongObject)?;
+            .ok_or_else(|| {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!("STACK_ALLOC_FAIL reason=guard_underflow");
+                }
+                KernelError::WrongObject
+            })?;
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "STACK_ALLOC_BEGIN asid={} base=0x{:x} top=0x{:x}",
+                asid.0,
+                base,
+                top
+            );
+        }
         if top >= crate::kernel::vm::KERNEL_SPACE_BASE || guard == 0 {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!(
+                    "STACK_ALLOC_FAIL reason=outside_user_range top=0x{:x} guard=0x{:x}",
+                    top,
+                    guard
+                );
+            }
             return Err(KernelError::WrongObject);
         }
         for page in (guard..top).step_by(crate::kernel::vm::PAGE_SIZE) {
@@ -438,10 +476,16 @@ impl KernelState {
                     .and_then(|aspace| aspace.resolve(crate::kernel::vm::VirtAddr(page)))
                     .is_some()
             }) {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!("STACK_ALLOC_FAIL reason=virtual_overlap page=0x{:x}", page);
+                }
                 return Err(KernelError::WrongObject);
             }
         }
         for page in (base..top).step_by(crate::kernel::vm::PAGE_SIZE) {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!("STACK_MAP page_va=0x{:x}", page);
+            }
             let (_mem_id, mem_cap) = self.alloc_anonymous_memory_object()?;
             let phys =
                 self.resolve_memory_object_phys(mem_cap, crate::kernel::vm::PageFlags::USER_RW)?;
@@ -453,6 +497,20 @@ impl KernelState {
                     flags: crate::kernel::vm::PageFlags::USER_RW,
                 },
             )?;
+            let pte = crate::arch::selected_isa::page_table::resolve_page(
+                asid,
+                crate::kernel::vm::VirtAddr(page),
+            );
+            let resolve_ok = pte.is_some();
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!("STACK_MAP_RESULT va=0x{:x} resolve_ok={}", page, resolve_ok);
+            }
+            if !resolve_ok {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!("STACK_ALLOC_FAIL reason=map_not_visible page=0x{:x}", page);
+                }
+                return Err(KernelError::UserMemoryFault);
+            }
         }
         if cfg!(not(feature = "hosted-dev")) {
             crate::yarm_log!("USER_STACK asid={} base=0x{:x} top=0x{:x}", asid.0, base, top);

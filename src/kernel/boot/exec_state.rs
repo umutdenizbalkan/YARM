@@ -303,7 +303,7 @@ impl KernelState {
         if cfg!(not(feature = "hosted-dev")) {
             crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
         }
-        let stack_top = match self.allocate_user_stack_with_guard(spec.tid, 64) {
+        let stack_top = match self.allocate_user_stack_with_guard(spec.tid, asid, 64) {
             Ok(top) => top,
             Err(err) => {
                 if cfg!(not(feature = "hosted-dev")) {
