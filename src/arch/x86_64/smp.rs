@@ -28,9 +28,12 @@ const AP_HANDOFF_OFFSET: usize = 0x100;
 const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 const AP_STACK_BYTES: usize = 16 * 1024;
 const AP_STACK_PHYS_BASE: u64 = 0x0180_0000; // 24 MiB, safely inside low RAM.
+const BOOTSTRAP_LOW_IDENTITY_BYTES: u64 = 64 * 1024 * 1024;
 // APs switch to paging before loading RSP from handoff. Use the higher-half
 // direct-map VA for AP stacks instead of a low identity VA (e.g. 0x2000_0000),
 // because early identity mapping is intentionally limited during bootstrap.
+// Keep physical backing in the low identity window as a safety net for any
+// transitional path that still touches these stacks via low physical aliases.
 const AP_STACK_TOP_BASE: u64 =
     crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE + AP_STACK_PHYS_BASE;
 const AP_READY_POLL_ITERS: usize = 2_000_000;
@@ -385,6 +388,13 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
     let _ = kernel;
     let mut page = [0u8; AP_TRAMPOLINE_SIZE];
     AP_READY_FLAGS[cpu.0 as usize].store(false, Ordering::Release);
+    let ap_stack_phys_end = AP_STACK_PHYS_BASE.saturating_add(
+        (crate::arch::platform_constants::MAX_CPUS as u64).saturating_mul(AP_STACK_BYTES as u64),
+    );
+    debug_assert!(
+        ap_stack_phys_end <= BOOTSTRAP_LOW_IDENTITY_BYTES,
+        "AP stack backing must stay in bootstrap low identity map"
+    );
     let handoff = ApHandoff {
         magic: AP_HANDOFF_MAGIC,
         cpu_id: cpu.0 as u32,
@@ -512,5 +522,12 @@ mod tests {
         let started = start_secondary_cpus(&mut kernel).expect("smp startup");
         assert_eq!(started, kernel.present_cpu_count().saturating_sub(1));
         assert_eq!(kernel.online_cpu_count(), kernel.present_cpu_count());
+    }
+
+    #[test]
+    fn ap_stack_backing_fits_bootstrap_low_identity_window() {
+        let total_ap_stack_bytes =
+            (crate::arch::platform_constants::MAX_CPUS as u64).saturating_mul(AP_STACK_BYTES as u64);
+        assert!(AP_STACK_PHYS_BASE + total_ap_stack_bytes <= BOOTSTRAP_LOW_IDENTITY_BYTES);
     }
 }
