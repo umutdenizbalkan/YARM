@@ -270,6 +270,20 @@ fn detect_active_root_phys_from_cr3() -> Result<u64, PageTableError> {
     Ok(0)
 }
 
+#[cfg(all(not(feature = "hosted-dev"), not(test)))]
+fn pcide_enabled() -> bool {
+    let mut cr4: u64 = 0;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, preserves_flags));
+    }
+    (cr4 & (1 << 17)) != 0
+}
+
+#[cfg(any(feature = "hosted-dev", test))]
+fn pcide_enabled() -> bool {
+    true
+}
+
 static PAGE_TABLE_STATE: SpinLockIrq<PageTableState> = SpinLockIrq::new(PageTableState::new());
 #[cfg(test)]
 static LAST_INVALIDATED_ASID: crate::kernel::lock::SpinLock<Option<Asid>> =
@@ -373,10 +387,16 @@ pub fn remove_asid_root(asid: Asid) {
 pub fn cr3_for_asid(asid: Asid) -> Option<u64> {
     let mut state = PAGE_TABLE_STATE.lock();
     let root_phys = state.ensure_asid(asid).ok()?;
-    // x86_64 PCID is 12 bits; software ASID is wider. Keep an explicit
-    // per-ASID PCID assignment so simultaneously-live ASIDs never alias.
-    let pcid = state.asid_pcid(asid)? as u64;
-    Some((root_phys & PAGE_MASK) | pcid)
+    if pcide_enabled() {
+        // x86_64 PCID is 12 bits; software ASID is wider. Keep an explicit
+        // per-ASID PCID assignment so simultaneously-live ASIDs never alias.
+        let pcid = state.asid_pcid(asid)? as u64;
+        Some((root_phys & PAGE_MASK) | pcid)
+    } else {
+        // CR4.PCIDE is not enabled; CR3 low bits must remain clear (except
+        // legacy PWT/PCD), so do not encode software ASID in CR3.
+        Some(root_phys & PAGE_MASK)
+    }
 }
 
 pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
