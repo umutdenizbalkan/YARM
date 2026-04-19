@@ -486,6 +486,48 @@ fn clone_low_alias_page_from_live_root(
     Ok(())
 }
 
+#[cfg(all(not(feature = "hosted-dev"), not(test)))]
+fn log_root_chain(root_phys: u64, label: &str, virt: VirtAddr) {
+    let l4 = pml4_index(virt.0);
+    let l3 = pdpt_index(virt.0);
+    let l2 = pd_index(virt.0);
+    let l1 = pt_index(virt.0);
+    let l4e = unsafe { read_raw_table_entry(root_phys, l4).ok() };
+    let mut l3e: Option<PageTableEntry> = None;
+    let mut l2e: Option<PageTableEntry> = None;
+    let mut l1e: Option<PageTableEntry> = None;
+    if let Some(e4) = l4e
+        && e4.is_present()
+    {
+        l3e = unsafe { read_raw_table_entry(e4.addr(), l3).ok() };
+        if let Some(e3) = l3e
+            && e3.is_present()
+            && (e3.0 & PageTableEntry::HUGE_PAGE) == 0
+        {
+            l2e = unsafe { read_raw_table_entry(e3.addr(), l2).ok() };
+            if let Some(e2) = l2e
+                && e2.is_present()
+                && (e2.0 & PageTableEntry::HUGE_PAGE) == 0
+            {
+                l1e = unsafe { read_raw_table_entry(e2.addr(), l1).ok() };
+            }
+        }
+    }
+    crate::yarm_log!(
+        "ASID_CHAIN {} va=0x{:x} l4[{}]={:#x?} l3[{}]={:#x?} l2[{}]={:#x?} l1[{}]={:#x?}",
+        label,
+        virt.0,
+        l4,
+        l4e.map(|e| e.0),
+        l3,
+        l3e.map(|e| e.0),
+        l2,
+        l2e.map(|e| e.0),
+        l1,
+        l1e.map(|e| e.0)
+    );
+}
+
 fn table_flags_from_page_flags(flags: PageFlags) -> u64 {
     let mut bits = PageTableEntry::PRESENT | PageTableEntry::WRITABLE;
     if flags.user {
@@ -608,17 +650,20 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     {
         let mut rip: u64 = 0;
         let mut rsp: u64 = 0;
+        let mut return_rip: u64 = 0;
         unsafe {
             core::arch::asm!("lea {}, [rip + 0]", out(reg) rip, options(nostack, preserves_flags));
             core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags));
+            return_rip = core::ptr::read(rsp as *const u64);
         }
         let target_root = cr3 & PAGE_MASK;
         let live_root = detect_active_root_phys_from_cr3().unwrap_or(0);
         let rsp_probe = rsp.saturating_sub(8);
+        let return_rip_higher = bootstrap_higher_half_alias(return_rip);
         let rip_higher = bootstrap_higher_half_alias(rip);
         let rsp_higher = bootstrap_higher_half_alias(rsp_probe);
         crate::yarm_log!(
-            "ASID_SWITCH_ADDR asid={} live_root=0x{:x} target_root=0x{:x} rip_raw=0x{:x} rip_canonical=0x{:x} rip_higher={:#x?} rsp_raw=0x{:x} rsp_probe=0x{:x} rsp_canonical=0x{:x} rsp_higher={:#x?}",
+            "ASID_SWITCH_ADDR asid={} live_root=0x{:x} target_root=0x{:x} rip_raw=0x{:x} rip_canonical=0x{:x} rip_higher={:#x?} rsp_raw=0x{:x} rsp_probe=0x{:x} rsp_canonical=0x{:x} rsp_higher={:#x?} ret_raw=0x{:x} ret_higher={:#x?}",
             asid.0,
             live_root,
             target_root,
@@ -628,8 +673,16 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             rsp,
             rsp_probe,
             canonicalize_virt_addr(rsp_probe),
-            rsp_higher
+            rsp_higher,
+            return_rip,
+            return_rip_higher
         );
+        log_root_chain(live_root, "live_rip", VirtAddr(rip));
+        log_root_chain(target_root, "target_rip_before", VirtAddr(rip));
+        log_root_chain(live_root, "live_rsp", VirtAddr(rsp_probe));
+        log_root_chain(target_root, "target_rsp_before", VirtAddr(rsp_probe));
+        log_root_chain(live_root, "live_ret", VirtAddr(return_rip));
+        log_root_chain(target_root, "target_ret_before", VirtAddr(return_rip));
         let live_rip_raw_ok = resolve_page_in_root(live_root, VirtAddr(rip)).is_some();
         let live_rsp_raw_ok = resolve_page_in_root(live_root, VirtAddr(rsp_probe)).is_some();
         let target_rip_raw_ok = resolve_page_in_root(target_root, VirtAddr(rip)).is_some();
@@ -670,15 +723,32 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
                 target_root_phys,
                 VirtAddr(rsp_probe),
             )?;
+            clone_low_alias_page_from_live_root(
+                &mut state,
+                live_root,
+                target_root_phys,
+                VirtAddr(rsp),
+            )?;
+            clone_low_alias_page_from_live_root(
+                &mut state,
+                live_root,
+                target_root_phys,
+                VirtAddr(return_rip),
+            )?;
             drop(state);
             let target_rip_raw_after = resolve_page(asid, VirtAddr(rip)).is_some();
             let target_rsp_raw_after = resolve_page(asid, VirtAddr(rsp_probe)).is_some();
+            let target_ret_raw_after = resolve_page(asid, VirtAddr(return_rip)).is_some();
             crate::yarm_log!(
-                "ASID_SWITCH_MIN_LOW_ALIAS_DONE asid={} target_raw_after[rip={},rsp={}]",
+                "ASID_SWITCH_MIN_LOW_ALIAS_DONE asid={} target_raw_after[rip={},rsp={},ret={}]",
                 asid.0,
                 target_rip_raw_after,
-                target_rsp_raw_after
+                target_rsp_raw_after,
+                target_ret_raw_after
             );
+            log_root_chain(target_root_phys, "target_rip_after", VirtAddr(rip));
+            log_root_chain(target_root_phys, "target_rsp_after", VirtAddr(rsp_probe));
+            log_root_chain(target_root_phys, "target_ret_after", VirtAddr(return_rip));
         }
         let rip_ok = resolve_page(asid, VirtAddr(rip)).is_some();
         let rsp_ok = resolve_page(asid, VirtAddr(rsp_probe)).is_some();
