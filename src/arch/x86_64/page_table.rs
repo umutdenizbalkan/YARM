@@ -696,8 +696,30 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         }
     }
     #[cfg(not(feature = "hosted-dev"))]
+    crate::yarm_log!(
+        "ASID_SWITCH_WRITE_CR3_BEGIN asid={} cr3=0x{:x}",
+        asid.0,
+        cr3
+    );
+    #[cfg(not(feature = "hosted-dev"))]
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        let mut active_cr3: u64 = 0;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, cr3",
+                out(reg) active_cr3,
+                options(nostack, preserves_flags)
+            );
+        }
+        crate::yarm_log!(
+            "ASID_SWITCH_WRITE_CR3_DONE asid={} active_cr3=0x{:x}",
+            asid.0,
+            active_cr3
+        );
     }
     Ok(cr3)
 }
