@@ -25,7 +25,10 @@ pub fn write_line(msg: &str) {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn write_breadcrumb(byte: u8) {
-    // Debug port breadcrumb (QEMU/Bochs-style). No formatting, no allocation.
+    // Raw COM1 breadcrumb for -serial output capture (no formatting/allocation).
+    while (inb(COM1_LINE_STATUS) & LINE_STATUS_THR_EMPTY) == 0 {}
+    outb(COM1_PORT, byte);
+    // Keep debugcon breadcrumb as secondary channel when enabled.
     outb(0xE9, byte);
 }
 
