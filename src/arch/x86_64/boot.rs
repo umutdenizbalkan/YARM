@@ -484,10 +484,42 @@ pub fn enter_dispatched_user_task_if_available(
         if !entry_resolve || !stack_resolve {
             return;
         }
+        if (context.stack_ptr.0 & 0xF) != 0 {
+            crate::yarm_log!(
+                "ENTER_USER_ABORT reason=stack_unaligned rsp=0x{:x}",
+                context.stack_ptr.0
+            );
+            return;
+        }
         crate::yarm_log!("BOOTSTRAP_STAGE: before enter_user_mode");
         let Ok(cr3) = super::page_table::activate_asid(asid) else {
             return;
         };
+        let mut active_cr3: u64 = 0;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, cr3",
+                out(reg) active_cr3,
+                options(nostack, preserves_flags)
+            );
+        }
+        let cs: u16 = 0x1b;
+        let ss: u16 = 0x23;
+        let rflags: u64 = 0x202;
+        crate::yarm_log!(
+            "ENTER_USER asid={} rip=0x{:x} rsp=0x{:x}",
+            asid.0,
+            context.instruction_ptr.0,
+            context.stack_ptr.0
+        );
+        crate::yarm_log!(
+            "ENTER_USER_CTX cr3=0x{:x} active_cr3=0x{:x} cs=0x{:x} ss=0x{:x} rflags=0x{:x}",
+            cr3,
+            active_cr3,
+            cs,
+            ss,
+            rflags
+        );
         crate::yarm_log!(
             "YARM_RING3_INIT_TASK tid={} asid={} cr3=0x{:x} entry=0x{:x} stack_top=0x{:x}",
             tid,
@@ -497,12 +529,16 @@ pub fn enter_dispatched_user_task_if_available(
             context.stack_ptr.0
         );
         crate::yarm_log!("USER_ENTRY rip=0x{:x}", context.instruction_ptr.0);
-        super::descriptor_tables::enter_user_mode_iret(
-            context.instruction_ptr.0,
-            context.stack_ptr.0,
-            context.arg0 as u64,
-            context.arg1 as u64,
-        );
+        #[allow(unreachable_code)]
+        {
+            super::descriptor_tables::enter_user_mode_iret(
+                context.instruction_ptr.0,
+                context.stack_ptr.0,
+                context.arg0 as u64,
+                context.arg1 as u64,
+            );
+            crate::yarm_log!("RETURNED_FROM_USER");
+        }
     }
 }
 
