@@ -532,10 +532,16 @@ pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
         pt_index(virt.0),
     ];
     let mut table_phys = root_phys;
-    for &level in &levels[..3] {
+    for (depth, &level) in levels[..3].iter().enumerate() {
         let entry = read_table_entry(&state, table_phys, level)?;
         if !entry.is_present() {
             return None;
+        }
+        // Huge page leaves can appear at PDPT (1GiB) or PD (2MiB) levels.
+        // Treat them as resolved mappings instead of descending as if they
+        // were pointers to the next-level table.
+        if depth >= 1 && (entry.0 & PageTableEntry::HUGE_PAGE) != 0 {
+            return Some(entry);
         }
         table_phys = entry.addr();
     }
