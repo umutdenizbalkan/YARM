@@ -917,7 +917,6 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
     }
 
     loop {
-        let _ = kernel.set_current_cpu(cpu);
         let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
         unsafe {
             core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));

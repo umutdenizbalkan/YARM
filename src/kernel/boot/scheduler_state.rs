@@ -38,12 +38,6 @@ impl KernelState {
             sched.current_cpu = cpu;
             Ok(())
         })?;
-        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-        crate::yarm_log!(
-            "SET_CURRENT_CPU cpu={} mpidr=0x{:x} src=scheduler_state::set_current_cpu",
-            cpu.0,
-            crate::arch::aarch64::read_mpidr_el1()
-        );
         Ok(())
     }
 
@@ -78,12 +72,6 @@ impl KernelState {
 
     pub fn dispatch_next_current_cpu(&mut self) -> Option<u64> {
         let cpu = self.current_cpu();
-        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-        crate::yarm_log!(
-            "GET_CURRENT_CPU cpu={} mpidr=0x{:x} src=scheduler_dispatch_lookup",
-            cpu.0,
-            crate::arch::aarch64::read_mpidr_el1()
-        );
         let mut sched = self.scheduler_state();
         let next = kernel_mut(&mut sched.scheduler)
             .dispatch_next_on(cpu)
