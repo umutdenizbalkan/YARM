@@ -25,6 +25,10 @@ pub fn bootstrap_first_user_task(
     crate::arch::selected_isa::boot::bootstrap_first_user_task(kernel)
 }
 
+pub fn release_secondary_cpus_after_bootstrap() {
+    crate::arch::selected_isa::boot::release_secondary_cpus_after_bootstrap()
+}
+
 pub fn enter_dispatched_user_task_if_available(
     kernel: &crate::kernel::boot::KernelState,
     dispatched_tid: Option<u64>,

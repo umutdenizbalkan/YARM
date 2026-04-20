@@ -14,6 +14,7 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
     if let Err(err) = yarm::arch::boot_entry::bootstrap_first_user_task(kernel) {
         yarm::pr_err!("failed to bootstrap first user task: {:?}", err);
     }
+    yarm::arch::boot_entry::release_secondary_cpus_after_bootstrap();
 
     let initial = kernel.dispatch_ready_task().ok().flatten();
     yarm::yarm_log!("YARM_SCHED_LOOP_START dispatched_tid={:?}", initial);

@@ -6,7 +6,7 @@ use core::arch::global_asm;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 use core::fmt::Write;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 global_asm!(
@@ -392,6 +392,8 @@ extern "C" fn yarm_aarch64_enable_fp_simd() {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static TRAP_KERNEL_STATE_PTR: core::sync::atomic::AtomicPtr<crate::kernel::boot::KernelState> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static BSP_RELEASED_SECONDARIES: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -640,6 +642,18 @@ pub fn bootstrap_first_user_task(
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub fn release_secondary_cpus_after_bootstrap() {
+    BSP_RELEASED_SECONDARIES.store(true, Ordering::Release);
+    crate::yarm_log!("YARM_AARCH64_SMP_RELEASE cpu=0 released=1");
+    unsafe {
+        core::arch::asm!("sev", options(nomem, nostack, preserves_flags));
+    }
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
+pub fn release_secondary_cpus_after_bootstrap() {}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 pub fn enter_dispatched_user_task_if_available(
     kernel: &crate::kernel::boot::KernelState,
     dispatched_tid: Option<u64>,
@@ -711,6 +725,8 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     install_trap_kernel_state(kernel);
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_done");
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    BSP_RELEASED_SECONDARIES.store(false, Ordering::Release);
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     let started_secondary = start_secondary_cpus(kernel);
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -841,6 +857,16 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
             core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
         }
     };
+    crate::yarm_log!(
+        "YARM_AARCH64_SMP_WAIT cpu={} state=waiting_for_bsp_release",
+        cpu_id
+    );
+    while !BSP_RELEASED_SECONDARIES.load(Ordering::Acquire) {
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
+    crate::yarm_log!("YARM_AARCH64_SMP_WAIT cpu={} state=released", cpu_id);
     let _ = kernel.set_current_cpu(cpu);
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
     kernel.program_timer_deadline_current_cpu(
@@ -935,8 +961,9 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     let l1_start = (core::ptr::addr_of!(BOOT_L1_TABLE) as u64) & !(page - 1);
                     let l1_end_raw = (core::ptr::addr_of!(BOOT_L1_TABLE) as u64)
                         .checked_add(core::mem::size_of::<AlignedL1>() as u64);
-                    let l1_end =
-                        l1_end_raw.and_then(|value| align_up_u64(value, page)).unwrap_or(l1_start);
+                    let l1_end = l1_end_raw
+                        .and_then(|value| align_up_u64(value, page))
+                        .unwrap_or(l1_start);
                     if l1_end > l1_start {
                         reserved[reserved_len] = (l1_start, l1_end);
                         reserved_len += 1;
@@ -944,22 +971,22 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     let l2_start = (core::ptr::addr_of!(BOOT_L2_TABLE) as u64) & !(page - 1);
                     let l2_end_raw = (core::ptr::addr_of!(BOOT_L2_TABLE) as u64)
                         .checked_add(core::mem::size_of::<AlignedL2>() as u64);
-                    let l2_end =
-                        l2_end_raw.and_then(|value| align_up_u64(value, page)).unwrap_or(l2_start);
+                    let l2_end = l2_end_raw
+                        .and_then(|value| align_up_u64(value, page))
+                        .unwrap_or(l2_start);
                     if l2_end > l2_start {
                         reserved[reserved_len] = (l2_start, l2_end);
                         reserved_len += 1;
                     }
                     let dtb_start = dtb.as_ptr() as u64;
-                    let dtb_end = dtb_start
-                        .checked_add(dtb.len() as u64)
-                        .unwrap_or(dtb_start);
+                    let dtb_end = dtb_start.checked_add(dtb.len() as u64).unwrap_or(dtb_start);
                     if dtb_end > dtb_start {
                         let dtb_reserved_end = align_up_u64(dtb_end, page).unwrap_or(dtb_start);
                         reserved[reserved_len] = (dtb_start & !(page - 1), dtb_reserved_end);
                         reserved_len += 1;
                     }
-                    if let (Some(initrd_start), Some(initrd_end)) = (parsed.initrd_start, parsed.initrd_end)
+                    if let (Some(initrd_start), Some(initrd_end)) =
+                        (parsed.initrd_start, parsed.initrd_end)
                         && initrd_end > initrd_start
                         && reserved_len < reserved.len()
                     {

@@ -117,20 +117,46 @@ impl KernelState {
     }
 
     fn fault_current_task(&mut self) -> Result<(), KernelError> {
-        let running_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        let cpu = self.current_cpu();
+        let running_tid = self.current_tid().ok_or_else(|| {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!(
+                    "TASK_MISSING site=fault_current_task/current_tid cpu={}",
+                    cpu.0
+                );
+            }
+            KernelError::TaskMissing
+        })?;
         self.emit_fault_report(running_tid);
 
         if self.effective_fault_policy_for(running_tid) == FaultPolicy::NotifyAndContinue {
             return Ok(());
         }
 
-        let faulted_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
+        let faulted_tid = self.block_current_cpu().ok_or_else(|| {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!(
+                    "TASK_MISSING site=fault_current_task/block_current cpu={}",
+                    cpu.0
+                );
+            }
+            KernelError::TaskMissing
+        })?;
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
                 .flatten()
                 .find(|tcb| tcb.tid.0 == faulted_tid)
-                .ok_or(KernelError::TaskMissing)?;
+                .ok_or_else(|| {
+                    if cfg!(not(feature = "hosted-dev")) {
+                        crate::yarm_log!(
+                            "TASK_MISSING site=fault_current_task/faulted_tcb_lookup cpu={} tid={}",
+                            cpu.0,
+                            faulted_tid
+                        );
+                    }
+                    KernelError::TaskMissing
+                })?;
             tcb.status = TaskStatus::Faulted;
             Ok::<_, KernelError>(())
         })?;

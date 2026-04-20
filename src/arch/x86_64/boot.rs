@@ -456,6 +456,8 @@ pub fn bootstrap_first_user_task(
     Ok(())
 }
 
+pub fn release_secondary_cpus_after_bootstrap() {}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn enter_dispatched_user_task_if_available(
     kernel: &crate::kernel::boot::KernelState,

@@ -104,6 +104,8 @@ pub fn bootstrap_first_user_task(
     Ok(())
 }
 
+pub fn release_secondary_cpus_after_bootstrap() {}
+
 pub fn enter_dispatched_user_task_if_available(
     _kernel: &crate::kernel::boot::KernelState,
     _dispatched_tid: Option<u64>,

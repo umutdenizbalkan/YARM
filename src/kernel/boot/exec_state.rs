@@ -5,7 +5,7 @@ use super::{KernelError, KernelState, SpawnedUserTask, UserImageSpec};
 use crate::arch::hal::Hal;
 use crate::kernel::frame_allocator::alloc_pt_frame;
 use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext, WaitReason};
-use crate::kernel::vm::{Asid, CachePolicy, Mapping, PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
+use crate::kernel::vm::{Asid, CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
@@ -36,6 +36,13 @@ fn read_u64_le(image: &[u8], offset: usize) -> Result<u64, KernelError> {
     Ok(u64::from_le_bytes(raw))
 }
 
+fn task_missing_with_site(site: &'static str, cpu: u8) -> KernelError {
+    if cfg!(not(feature = "hosted-dev")) {
+        crate::yarm_log!("TASK_MISSING site={} cpu={}", site, cpu);
+    }
+    KernelError::TaskMissing
+}
+
 impl KernelState {
     /// Minimal ELF64 loader for PT_LOAD segments:
     /// validates headers, maps pages for each load segment, copies file bytes,
@@ -58,7 +65,9 @@ impl KernelState {
         let table_size = phnum
             .checked_mul(phentsize)
             .ok_or(KernelError::WrongObject)?;
-        let phend = phoff.checked_add(table_size).ok_or(KernelError::WrongObject)?;
+        let phend = phoff
+            .checked_add(table_size)
+            .ok_or(KernelError::WrongObject)?;
         if phend > image.len() {
             return Err(KernelError::WrongObject);
         }
@@ -289,6 +298,7 @@ impl KernelState {
         &mut self,
         spec: UserImageSpec,
     ) -> Result<SpawnedUserTask, KernelError> {
+        let cpu = self.current_cpu();
         if spec.entry == 0 {
             return Err(KernelError::WrongObject);
         }
@@ -297,15 +307,38 @@ impl KernelState {
             return Err(KernelError::UserMemoryFault);
         }
 
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "FIRST_USER_CREATE_BEGIN cpu={} tid={} asid={} entry=0x{:x}",
+                cpu.0,
+                spec.tid,
+                asid.0,
+                spec.entry
+            );
+        }
         self.register_task_with_class(spec.tid, spec.class)?;
-        let cnode = self.task_cnode(spec.tid).ok_or(KernelError::TaskMissing)?;
+        let cnode = self.task_cnode(spec.tid).ok_or(task_missing_with_site(
+            "spawn_user_task_from_image/task_cnode",
+            cpu.0,
+        ))?;
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "FIRST_USER_LOOKUP cpu={} tid={} cnode={} status=found",
+                cpu.0,
+                spec.tid,
+                cnode.0
+            );
+        }
         self.set_process_cnode_for_pid(spec.tid, cnode)?;
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
                 .flatten()
                 .find(|tcb| tcb.tid.0 == spec.tid)
-                .ok_or(KernelError::TaskMissing)?;
+                .ok_or(task_missing_with_site(
+                    "spawn_user_task_from_image/set_asid_tcb_lookup",
+                    cpu.0,
+                ))?;
             tcb.asid = Some(asid);
             Ok::<_, KernelError>(())
         })?;
@@ -331,7 +364,10 @@ impl KernelState {
                 .iter_mut()
                 .flatten()
                 .find(|tcb| tcb.tid.0 == spec.tid)
-                .ok_or(KernelError::TaskMissing)?;
+                .ok_or(task_missing_with_site(
+                    "spawn_user_task_from_image/set_context_tcb_lookup",
+                    cpu.0,
+                ))?;
             tcb.thread_group_id = ThreadGroupId(spec.tid);
             tcb.asid = Some(asid);
             tcb.user_entry = Some(VirtAddr(spec.entry as u64));
@@ -345,8 +381,14 @@ impl KernelState {
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
-        let _ = self.enqueue_task(spec.tid)?;
+        let enqueued_cpu = self.enqueue_task(spec.tid)?;
         if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "FIRST_USER_ENQUEUE cpu={} tid={} target_cpu={} status=ok",
+                cpu.0,
+                spec.tid,
+                enqueued_cpu.0
+            );
             crate::yarm_log!("BOOTSTRAP_FIRST_USER tid={} enqueued=true", spec.tid);
         }
         Ok(SpawnedUserTask {
