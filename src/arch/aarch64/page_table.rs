@@ -103,6 +103,7 @@ impl PageTableState {
             if slot.is_none() {
                 let phys = alloc_pt_frame().map_err(|_| PageTableError::OutOfMemory)?;
                 *slot = Some(PageTablePage::new(phys));
+                clear_physical_table_page(phys)?;
                 return Ok(idx);
             }
         }
@@ -138,6 +139,74 @@ impl PageTableState {
             .find(|entry| entry.asid == asid)
             .map(|entry| entry.root_phys)
     }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(test), target_arch = "aarch64"))]
+#[inline]
+fn phys_to_virt_table_ptr(table_phys: u64) -> *mut u64 {
+    table_phys as usize as *mut u64
+}
+
+#[cfg(any(feature = "hosted-dev", test, not(target_arch = "aarch64")))]
+#[inline]
+fn phys_to_virt_table_ptr(_table_phys: u64) -> *mut u64 {
+    core::ptr::null_mut()
+}
+
+fn clear_physical_table_page(table_phys: u64) -> Result<(), PageTableError> {
+    let ptr = phys_to_virt_table_ptr(table_phys);
+    if ptr.is_null() {
+        return Ok(());
+    }
+    for idx in 0..ENTRIES_PER_TABLE {
+        unsafe {
+            core::ptr::write_volatile(ptr.add(idx), 0);
+        }
+    }
+    Ok(())
+}
+
+fn read_table_entry(
+    state: &mut PageTableState,
+    table_idx: usize,
+    index: usize,
+) -> Result<PageTableEntry, PageTableError> {
+    if index >= ENTRIES_PER_TABLE {
+        return Err(PageTableError::InvalidAddress);
+    }
+    let page = state.pages[table_idx]
+        .as_mut()
+        .ok_or(PageTableError::InvalidAddress)?;
+    let ptr = phys_to_virt_table_ptr(page.phys);
+    if ptr.is_null() {
+        return Ok(page.entries[index]);
+    }
+    let raw = unsafe { core::ptr::read_volatile(ptr.add(index)) };
+    let entry = PageTableEntry(raw);
+    page.entries[index] = entry;
+    Ok(entry)
+}
+
+fn write_table_entry(
+    state: &mut PageTableState,
+    table_idx: usize,
+    index: usize,
+    entry: PageTableEntry,
+) -> Result<(), PageTableError> {
+    if index >= ENTRIES_PER_TABLE {
+        return Err(PageTableError::InvalidAddress);
+    }
+    let page = state.pages[table_idx]
+        .as_mut()
+        .ok_or(PageTableError::InvalidAddress)?;
+    page.entries[index] = entry;
+    let ptr = phys_to_virt_table_ptr(page.phys);
+    if !ptr.is_null() {
+        unsafe {
+            core::ptr::write_volatile(ptr.add(index), entry.0);
+        }
+    }
+    Ok(())
 }
 
 static PAGE_TABLE_STATE: SpinLockIrq<PageTableState> = SpinLockIrq::new(PageTableState::new());
@@ -204,14 +273,18 @@ fn walk_or_create(
     let table_idx = state
         .page_index_from_phys(table_phys)
         .ok_or(PageTableError::InvalidAddress)?;
-    let entry = state.pages[table_idx].as_ref().expect("table").entries[index];
+    let entry = read_table_entry(state, table_idx, index)?;
     if entry.is_present() {
         return Ok(entry.addr());
     }
     let child_idx = state.alloc_page()?;
     let child_phys = state.pages[child_idx].expect("child").phys;
-    state.pages[table_idx].as_mut().expect("table").entries[index] =
-        PageTableEntry::with_addr_and_flags(child_phys, table_flags_from_page_flags(flags));
+    write_table_entry(
+        state,
+        table_idx,
+        index,
+        PageTableEntry::with_addr_and_flags(child_phys, table_flags_from_page_flags(flags)),
+    )?;
     Ok(child_phys)
 }
 
@@ -240,7 +313,11 @@ pub fn remove_asid_root(asid: Asid) {
                     continue;
                 };
                 if level > 1 {
-                    let entries = state.pages[table_idx].expect("table").entries;
+                    let mut entries = [PageTableEntry::empty(); ENTRIES_PER_TABLE];
+                    for (idx, entry) in entries.iter_mut().enumerate() {
+                        *entry = read_table_entry(&mut state, table_idx, idx)
+                            .unwrap_or(PageTableEntry::empty());
+                    }
                     for entry in entries {
                         if !entry.is_present() {
                             continue;
@@ -265,7 +342,7 @@ pub fn cr3_for_asid(asid: Asid) -> Option<u64> {
     let mut state = PAGE_TABLE_STATE.lock();
     let root = state.ensure_asid(asid).ok()?;
     let asid_bits = (asid.0 as u64) & ((1u64 << vm_layout::ASID_BITS.min(16)) - 1);
-    Some((root & PAGE_MASK) | asid_bits)
+    Some((root & PAGE_MASK) | (asid_bits << 48))
 }
 
 pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
@@ -308,10 +385,13 @@ pub fn map_page(
     let leaf_idx = state
         .page_index_from_phys(next3)
         .ok_or(PageTableError::InvalidAddress)?;
-    let table = state.pages[leaf_idx].as_mut().expect("leaf");
-    let prev = table.entries[l3];
-    table.entries[l3] =
-        PageTableEntry::with_addr_and_flags(phys.0, leaf_flags_from_page_flags(flags));
+    let prev = read_table_entry(&mut state, leaf_idx, l3)?;
+    write_table_entry(
+        &mut state,
+        leaf_idx,
+        l3,
+        PageTableEntry::with_addr_and_flags(phys.0, leaf_flags_from_page_flags(flags)),
+    )?;
     drop(state);
     invalidate_page(virt);
     Ok(prev.is_present().then_some(prev))
@@ -329,7 +409,7 @@ pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
 
     for &level in &levels[..3] {
         let idx = state.page_index_from_phys(table_phys)?;
-        let entry = state.pages[idx].as_ref()?.entries[level];
+        let entry = read_table_entry(&mut state, idx, level).ok()?;
         if !entry.is_present() {
             return None;
         }
@@ -337,12 +417,11 @@ pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     }
 
     let leaf_idx = state.page_index_from_phys(table_phys)?;
-    let table = state.pages[leaf_idx].as_mut()?;
-    let old = table.entries[levels[3]];
+    let old = read_table_entry(&mut state, leaf_idx, levels[3]).ok()?;
     if !old.is_present() {
         return None;
     }
-    table.entries[levels[3]] = PageTableEntry::empty();
+    write_table_entry(&mut state, leaf_idx, levels[3], PageTableEntry::empty()).ok()?;
     drop(state);
     invalidate_page(virt);
     Some(old)
@@ -360,7 +439,7 @@ pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
 
     for &level in &levels[..3] {
         let idx = state.page_index_from_phys(table_phys)?;
-        let entry = state.pages[idx].as_ref()?.entries[level];
+        let entry = read_table_entry(&mut state, idx, level).ok()?;
         if !entry.is_present() {
             return None;
         }
@@ -368,7 +447,7 @@ pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     }
 
     let leaf_idx = state.page_index_from_phys(table_phys)?;
-    let entry = state.pages[leaf_idx].as_ref()?.entries[levels[3]];
+    let entry = read_table_entry(&mut state, leaf_idx, levels[3]).ok()?;
     entry.is_present().then_some(entry)
 }
 
