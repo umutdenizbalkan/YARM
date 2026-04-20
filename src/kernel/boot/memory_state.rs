@@ -490,7 +490,7 @@ impl KernelState {
         virt: VirtAddr,
         mapping: Mapping,
     ) -> Result<Option<Mapping>, KernelError> {
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
             crate::yarm_log!(
                 "MAP_USER_RAW_BEGIN asid={} virt=0x{:x} phys=0x{:x} user={} rwx={}{}{}",
                 asid.0,
@@ -506,7 +506,7 @@ impl KernelState {
             let aspace = spaces
                 .get_mut(asid)
                 .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
                 crate::yarm_log!(
                     "MAP_USER_RAW_ASPACE asid={} aspace_asid={}",
                     asid.0,
@@ -516,7 +516,7 @@ impl KernelState {
             aspace.map_page(virt, mapping).map_err(KernelError::Vm)
         })?;
         let resolved = crate::arch::selected_isa::page_table::resolve_page(asid, virt).is_some();
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
             crate::yarm_log!(
                 "MAP_USER_RAW_DONE asid={} virt=0x{:x} had_old={} resolve_ok={}",
                 asid.0,

@@ -28,6 +28,7 @@ default = ["hosted-dev"]
 hosted-dev = []
 posix-compat = []
 linux-compat = ["posix-compat"]
+trace_boot_vm = []
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }

@@ -55,6 +55,8 @@ fn should_pin_bootstrap_task_to_bsp(kernel: &KernelState, candidate_tid: u64) ->
     })
 }
 
+const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
+
 impl KernelState {
     /// Minimal ELF64 loader for PT_LOAD segments:
     /// validates headers, maps pages for each load segment, copies file bytes,
@@ -393,18 +395,47 @@ impl KernelState {
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
-        let enqueued_cpu = if should_pin_bootstrap_task_to_bsp(self, spec.tid) {
-            let bootstrap_cpu = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+        let bootstrap_cpu = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+        let should_pin = spec.tid == BOOTSTRAP_FIRST_USER_TID
+            && should_pin_bootstrap_task_to_bsp(self, spec.tid);
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "FIRST_USER_ENQUEUE_DECISION cpu={} tid={} chosen_cpu={} reason={}",
+                cpu.0,
+                spec.tid,
+                bootstrap_cpu.0,
+                if should_pin {
+                    "bootstrap_pin"
+                } else {
+                    "scheduler_default"
+                }
+            );
+        }
+
+        let enqueued_cpu = if should_pin {
+            let chosen_cpu = bootstrap_cpu;
             if cfg!(not(feature = "hosted-dev")) {
                 crate::yarm_log!(
-                    "FIRST_USER_ENQUEUE_DECISION cpu={} tid={} chosen_cpu={} reason=bootstrap_pin",
+                    "FINAL_FIRST_USER_ENQUEUE_SITE cpu={} tid={} chosen_cpu={} bootstrap_pin={}",
                     cpu.0,
                     spec.tid,
-                    bootstrap_cpu.0
+                    chosen_cpu.0,
+                    should_pin as u8
                 );
             }
-            self.enqueue_on_cpu(bootstrap_cpu, spec.tid)?;
-            bootstrap_cpu
+            if chosen_cpu != bootstrap_cpu {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!(
+                        "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
+                        cpu.0,
+                        spec.tid,
+                        chosen_cpu.0
+                    );
+                }
+            }
+            assert_eq!(chosen_cpu.0, bootstrap_cpu.0);
+            self.enqueue_on_cpu(chosen_cpu, spec.tid)?;
+            chosen_cpu
         } else {
             self.enqueue_task(spec.tid)?
         };

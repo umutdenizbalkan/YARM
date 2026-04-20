@@ -77,7 +77,7 @@ impl KernelState {
         va: VirtAddr,
         bytes: &[u8],
     ) -> Result<(), KernelError> {
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
             crate::yarm_log!(
                 "COPY_TO_USER asid={} va=0x{:x} len={}",
                 asid.0,
@@ -90,9 +90,11 @@ impl KernelState {
             let addr = va.0 as usize + i;
             let page_base = addr & !(crate::kernel::vm::PAGE_SIZE - 1usize);
             if last_page_base != Some(page_base) {
-                let pte_present =
-                    crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(page_base as u64))
-                        .is_some();
+                let pte_present = crate::arch::selected_isa::page_table::resolve_page(
+                    asid,
+                    VirtAddr(page_base as u64),
+                )
+                .is_some();
                 if cfg!(not(feature = "hosted-dev")) {
                     crate::yarm_log!(
                         "COPY_TO_USER_PAGE asid={} page_va=0x{:x} pte_present={} offset={}",
@@ -196,7 +198,7 @@ impl KernelState {
         va: usize,
         need_write: bool,
     ) -> Result<u64, KernelError> {
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
             crate::yarm_log!(
                 "VALIDATE asid={} va=0x{:x} need_write={}",
                 asid.0,
@@ -205,10 +207,13 @@ impl KernelState {
             );
         }
         let user_space_exists = self.user_spaces.get(asid).is_some();
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
             crate::yarm_log!("ASID_EXISTS={}", user_space_exists);
         }
-        let _ = self.user_spaces.get(asid).ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+        let _ = self
+            .user_spaces
+            .get(asid)
+            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
         let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1usize);
         let page_off = (va - page_base) as u64;
         let shadow_mapping_present = self
@@ -218,7 +223,7 @@ impl KernelState {
             .is_some();
         let pte_result =
             crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(page_base as u64));
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
             crate::yarm_log!(
                 "VALIDATE_PAGE asid={} page_va=0x{:x} shadow_present={} resolve_ok={}",
                 asid.0,
@@ -229,7 +234,7 @@ impl KernelState {
         }
         let pte = pte_result.ok_or(KernelError::UserMemoryFault)?;
         if !Self::pte_allows_user_access(pte, need_write) {
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
                 crate::yarm_log!(
                     "VALIDATE_PERM_FAIL asid={} page_va=0x{:x} pte=0x{:x}",
                     asid.0,
@@ -243,7 +248,7 @@ impl KernelState {
             .addr()
             .checked_add(page_off)
             .ok_or(KernelError::UserMemoryFault)?;
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
             crate::yarm_log!(
                 "VALIDATE_OK asid={} page_va=0x{:x} page_off=0x{:x} phys=0x{:x}",
                 asid.0,
