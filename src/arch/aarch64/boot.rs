@@ -1095,8 +1095,10 @@ const fn align_down_u64(value: u64, align: u64) -> u64 {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const fn align_up_u64(value: u64, align: u64) -> Option<u64> {
-    let added = value.checked_add(align - 1)?;
-    Some(added & !(align - 1))
+    match value.checked_add(align - 1) {
+        Some(added) => Some(added & !(align - 1)),
+        None => None,
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]

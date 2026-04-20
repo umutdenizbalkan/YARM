@@ -7,6 +7,7 @@ mod non_hosted {
     use core::mem::size_of;
     use core::ptr::null_mut;
 
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     use crate::arch::platform_layout;
     use crate::kernel::frame_allocator::{
         alloc_pt_contiguous_frames, alloc_pt_frame, free_pt_contiguous_frames, free_pt_frame,
