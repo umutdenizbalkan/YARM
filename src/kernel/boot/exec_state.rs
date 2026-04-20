@@ -461,6 +461,11 @@ impl KernelState {
             }
             let incoming_asid = self.task_asid(tid);
             if let Some(asid) = incoming_asid {
+                if cfg!(not(feature = "hosted-dev"))
+                    && self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+                {
+                    crate::yarm_log!("BSP_BEFORE_ASPACE_SWITCH tid={}", tid);
+                }
                 if cfg!(not(feature = "hosted-dev")) {
                     crate::yarm_log!("DISPATCH: before switch_address_space asid={}", asid.0);
                 }

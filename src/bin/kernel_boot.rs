@@ -11,15 +11,28 @@ static KERNEL_GLOBAL_ALLOCATOR: yarm::kernel::global_allocator::KernelGlobalAllo
 
 #[cfg(not(test))]
 fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
+    let cpu = kernel.current_cpu();
     if let Err(err) = yarm::arch::boot_entry::bootstrap_first_user_task(kernel) {
         yarm::pr_err!("failed to bootstrap first user task: {:?}", err);
     }
     yarm::arch::boot_entry::release_secondary_cpus_after_bootstrap();
+    yarm::yarm_log!("BSP_POST_RELEASE cpu={}", cpu.0);
+    yarm::yarm_log!("BSP_REDISPATCH_BEGIN cpu={}", cpu.0);
 
     let initial = kernel.dispatch_ready_task().ok().flatten();
+    yarm::yarm_log!("BSP_REDISPATCH_SELECTED tid={:?}", initial);
     yarm::yarm_log!("YARM_SCHED_LOOP_START dispatched_tid={:?}", initial);
-    yarm::yarm_log!("DISPATCH: before enter_user_call");
-    yarm::arch::boot_entry::enter_dispatched_user_task_if_available(kernel, initial);
+    if let Some(tid) = initial {
+        yarm::yarm_log!("BSP_BEFORE_ENTER_USER tid={}", tid);
+        yarm::yarm_log!("DISPATCH: before enter_user_call");
+        yarm::arch::boot_entry::enter_dispatched_user_task_if_available(kernel, Some(tid));
+    } else {
+        if cpu.0 == yarm::arch::platform_constants::BOOTSTRAP_CPU_ID {
+            yarm::yarm_log!("BSP_REDISPATCH_SELECTED tid=None");
+        } else {
+            yarm::yarm_log!("AP_IDLE_PATH cpu={} dispatched_tid=None", cpu.0);
+        }
+    }
 }
 
 fn run() {
