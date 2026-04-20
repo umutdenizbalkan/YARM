@@ -125,15 +125,20 @@ global_asm!(
     .global yarm_aarch64_enter_user_mode_eret
     .type yarm_aarch64_enter_user_mode_eret,%function
 yarm_aarch64_enter_user_mode_eret:
-    mov x9, x0
-    mov x10, x1
-    mov x11, x2
-    mov x12, x3
-    mov x13, x4
+    sub sp, sp, #48
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    str x4, [sp, #32]
+    bl yarm_aarch64_user_entry_marker_0
+    ldp x9, x10, [sp, #0]
+    ldp x11, x12, [sp, #16]
+    ldr x13, [sp, #32]
+    add sp, sp, #48
     msr sp_el0, x10
     msr tpidr_el0, x13
     msr elr_el1, x9
     msr spsr_el1, xzr
+    bl yarm_aarch64_user_entry_marker_1
     mov x0, x11
     mov x1, x12
     eret
@@ -375,6 +380,18 @@ extern "C" fn yarm_aarch64_boot_breadcrumb_b2() {
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_boot_breadcrumb_b3() {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB B3");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_user_entry_marker_0() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_USER_ENTRY U0");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_user_entry_marker_1() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_USER_ENTRY U1");
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -696,11 +713,32 @@ pub fn enter_dispatched_user_task_if_available(
             tls
         );
         if kernel.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+            let ttbr0_el1: u64 = {
+                let value: u64;
+                unsafe {
+                    core::arch::asm!(
+                        "mrs {0}, ttbr0_el1",
+                        out(reg) value,
+                        options(nomem, preserves_flags)
+                    );
+                }
+                value
+            };
             crate::yarm_log!(
                 "BSP_BEFORE_ENTER_RING3 tid={} entry=0x{:x} stack_top=0x{:x}",
                 tid,
                 context.instruction_ptr.0,
                 context.stack_ptr.0
+            );
+            crate::yarm_log!(
+                "BSP_CONTEXT_RESTORE_DUMP tid={} elr=0x{:x} sp=0x{:x} spsr=0x{:x} ttbr0=0x{:x} arg0=0x{:x} arg1=0x{:x}",
+                tid,
+                context.instruction_ptr.0,
+                context.stack_ptr.0,
+                0u64,
+                ttbr0_el1,
+                context.arg0 as u64,
+                context.arg1 as u64
             );
         }
         unsafe {
