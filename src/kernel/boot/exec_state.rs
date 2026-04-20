@@ -44,17 +44,6 @@ fn task_missing_with_site(site: &'static str, cpu: u8) -> KernelError {
     KernelError::TaskMissing
 }
 
-fn should_pin_bootstrap_task_to_bsp(kernel: &KernelState, candidate_tid: u64) -> bool {
-    kernel.with_tcbs(|tcbs| {
-        !tcbs.iter().flatten().any(|tcb| {
-            if tcb.tid.0 == candidate_tid {
-                return false;
-            }
-            matches!(tcb.status, TaskStatus::Runnable | TaskStatus::Running)
-        })
-    })
-}
-
 const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
 
 impl KernelState {
@@ -396,8 +385,7 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         let bootstrap_cpu = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
-        let should_pin = spec.tid == BOOTSTRAP_FIRST_USER_TID
-            && should_pin_bootstrap_task_to_bsp(self, spec.tid);
+        let should_pin = spec.tid == BOOTSTRAP_FIRST_USER_TID;
         if cfg!(not(feature = "hosted-dev")) {
             crate::yarm_log!(
                 "FIRST_USER_ENQUEUE_DECISION cpu={} tid={} chosen_cpu={} reason={}",

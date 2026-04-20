@@ -17,6 +17,8 @@ fn map_smp_error(err: SmpError) -> KernelError {
     }
 }
 
+const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
+
 impl KernelState {
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
         self.with_scheduler_state_mut(|sched| {
@@ -188,10 +190,50 @@ impl KernelState {
 
     pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
         let priority = self.task_priority(tid)?;
+        let current_cpu = self.current_cpu();
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "ENQUEUE_CALL cpu_current={} cpu_target={} tid={}",
+                current_cpu.0,
+                cpu.0,
+                tid
+            );
+        }
+        if tid == BOOTSTRAP_FIRST_USER_TID {
+            if cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+                && cfg!(not(feature = "hosted-dev"))
+            {
+                crate::yarm_log!(
+                    "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
+                    current_cpu.0,
+                    tid,
+                    cpu.0
+                );
+            }
+            assert_eq!(cpu.0, crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+            assert_eq!(
+                cpu.0 as usize,
+                crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize
+            );
+        }
         let mut sched = self.scheduler_state();
         kernel_mut(&mut sched.scheduler)
             .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
-            .map_err(map_scheduler_error)
+            .map_err(map_scheduler_error)?;
+        if tid == BOOTSTRAP_FIRST_USER_TID && cfg!(not(feature = "hosted-dev")) {
+            let queue0 = kernel_ref(&sched.scheduler).runnable_count_on(CpuId(0));
+            let queue1 = kernel_ref(&sched.scheduler).runnable_count_on(CpuId(1));
+            let queue2 = kernel_ref(&sched.scheduler).runnable_count_on(CpuId(2));
+            let queue3 = kernel_ref(&sched.scheduler).runnable_count_on(CpuId(3));
+            crate::yarm_log!(
+                "BOOTSTRAP_ENQUEUE_VERIFY tid=1 queue0_len={} queue1_len={} queue2_len={} queue3_len={}",
+                queue0,
+                queue1,
+                queue2,
+                queue3
+            );
+        }
+        Ok(())
     }
 
     pub fn submit_cross_cpu_work(&self, cpu: CpuId, item: WorkItem) -> Result<(), KernelError> {

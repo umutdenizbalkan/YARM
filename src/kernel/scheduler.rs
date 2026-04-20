@@ -386,7 +386,21 @@ impl SmpScheduler {
         priority: TaskPriority,
     ) -> Result<(), SchedulerError> {
         let idx = self.check_online_cpu(cpu)?;
-        self.schedulers[idx].enqueue_with_priority(tid, priority)
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!(
+                "ENQUEUE_QUEUE_INDEX tid={} requested_cpu={} queue_index={}",
+                tid.0,
+                cpu.0,
+                idx
+            );
+        }
+        self.schedulers[idx]
+            .enqueue_with_priority(tid, priority)
+            .map(|_| {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!("ENQUEUE_COMMIT tid={} queue_cpu={}", tid.0, cpu.0);
+                }
+            })
     }
 
     pub fn enqueue_balanced(
