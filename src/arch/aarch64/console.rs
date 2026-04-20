@@ -2,6 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 #[cfg(not(feature = "hosted-dev"))]
+use crate::kernel::lock::SpinLockIrq;
+#[cfg(not(feature = "hosted-dev"))]
 use core::ptr::{read_volatile, write_volatile};
 #[cfg(not(feature = "hosted-dev"))]
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -17,6 +19,8 @@ const PL011_FR_TXFF: u32 = 1 << 5;
 
 #[cfg(not(feature = "hosted-dev"))]
 static UART_BASE: AtomicUsize = AtomicUsize::new(QEMU_VIRT_PL011_BASE);
+#[cfg(not(feature = "hosted-dev"))]
+static UART_LOG_LOCK: SpinLockIrq<()> = SpinLockIrq::new(());
 
 #[cfg(feature = "hosted-dev")]
 pub fn write_line(_msg: &str) {}
@@ -30,6 +34,9 @@ pub fn init_early_mmio_base(base: usize) {
 
 #[cfg(not(feature = "hosted-dev"))]
 pub fn write_line(msg: &str) {
+    // Serialize full-line emission under an IRQ-safe lock so SMP CPUs and local
+    // IRQ/exception re-entry cannot interleave UART bytes mid-line.
+    let _guard = UART_LOG_LOCK.lock();
     for &byte in msg.as_bytes() {
         if byte == b'\n' {
             write_byte(b'\r');
