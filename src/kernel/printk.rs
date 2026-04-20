@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+#[cfg(not(feature = "hosted-dev"))]
+use crate::kernel::lock::SpinLockIrq;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 
@@ -215,6 +217,8 @@ impl PrintkRing {
 }
 
 static PRINTK: PrintkRing = PrintkRing::new();
+#[cfg(not(feature = "hosted-dev"))]
+static PRINTK_DRAIN_LOCK: SpinLockIrq<()> = SpinLockIrq::new(());
 
 pub fn printk_state_addr() -> usize {
     core::ptr::addr_of!(PRINTK) as usize
@@ -257,6 +261,7 @@ pub fn printk_args(level: LogLevel, context: PrintkContext, args: fmt::Arguments
 pub fn printk_flush() -> usize {
     #[cfg(not(feature = "hosted-dev"))]
     {
+        let _drain_guard = PRINTK_DRAIN_LOCK.lock();
         return threaded_drain_to(|_lvl, _ctx, msg| crate::arch::console::write_line(msg));
     }
     #[cfg(feature = "hosted-dev")]

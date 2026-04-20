@@ -7,6 +7,7 @@ use crate::kernel::frame_allocator::alloc_pt_frame;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext, WaitReason};
 use crate::kernel::vm::{Asid, CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
@@ -45,6 +46,7 @@ fn task_missing_with_site(site: &'static str, cpu: u8) -> KernelError {
 }
 
 const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
+static DISPATCH_CONTEXT_LOAD_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl KernelState {
     /// Minimal ELF64 loader for PT_LOAD segments:
@@ -480,11 +482,29 @@ impl KernelState {
                         })
                         .unwrap_or((0, 0))
                 });
+                let event_id = DISPATCH_CONTEXT_LOAD_EVENT_ID.fetch_add(1, Ordering::Relaxed);
                 crate::yarm_log!(
-                    "DISPATCH: before loading context tid={} ctx_ptr=0x{:x} kernel_stack_top=0x{:x}",
+                    "DISPATCH: before loading context tid={} ctx_ptr=0x{:x} kernel_stack_top=0x{:x} src=dispatch_context_load event_id={}",
                     tid,
                     context_ptr,
-                    kernel_stack_top
+                    kernel_stack_top,
+                    event_id
+                );
+            }
+            let current_cpu = self.current_cpu();
+            if tid == BOOTSTRAP_FIRST_USER_TID
+                && current_cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+            {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!(
+                        "TASK_CPU_OWNERSHIP_VIOLATION cpu={} tid={}",
+                        current_cpu.0,
+                        tid
+                    );
+                }
+                assert_eq!(
+                    current_cpu.0,
+                    crate::arch::platform_constants::BOOTSTRAP_CPU_ID
                 );
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;

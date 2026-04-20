@@ -6,7 +6,7 @@ use core::arch::global_asm;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 use core::fmt::Write;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 global_asm!(
@@ -394,6 +394,14 @@ static TRAP_KERNEL_STATE_PTR: core::sync::atomic::AtomicPtr<crate::kernel::boot:
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static BSP_RELEASED_SECONDARIES: AtomicBool = AtomicBool::new(false);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static BSP_RELEASE_LOGGED: AtomicBool = AtomicBool::new(false);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static SECONDARY_ONLINE_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static SECONDARY_READY_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static SECONDARY_JOINED_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -644,7 +652,9 @@ pub fn bootstrap_first_user_task(
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 pub fn release_secondary_cpus_after_bootstrap() {
     BSP_RELEASED_SECONDARIES.store(true, Ordering::Release);
-    crate::yarm_log!("YARM_AARCH64_SMP_RELEASE cpu=0 released=1");
+    if !BSP_RELEASE_LOGGED.swap(true, Ordering::AcqRel) {
+        crate::yarm_log!("YARM_AARCH64_SMP_RELEASE cpu=0 released=1 src=boot_release_hook");
+    }
     unsafe {
         core::arch::asm!("sev", options(nomem, nostack, preserves_flags));
     }
@@ -837,7 +847,12 @@ fn psci_cpu_on(conduit: PsciConduit, target_cpu: u64, entry_point: u64, context_
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
-    crate::arch::aarch64::console::write_line("YARM_AARCH64_SMP_SECONDARY_ONLINE");
+    let cpu_bit = 1u64.checked_shl(cpu_id as u32).unwrap_or(0);
+    if cpu_bit != 0
+        && (SECONDARY_ONLINE_LOGGED_MASK.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit) == 0
+    {
+        crate::arch::aarch64::console::write_line("YARM_AARCH64_SMP_SECONDARY_ONLINE");
+    }
     crate::yarm_log!("YARM_AARCH64_SMP_SECONDARY cpu={}", cpu_id);
     let cpu = crate::kernel::scheduler::CpuId(cpu_id as u8);
     unsafe {
@@ -872,11 +887,19 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
     kernel.program_timer_deadline_current_cpu(
         crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
     );
-    crate::yarm_log!(
-        "YARM_AARCH64_SMP_SECONDARY_READY cpu={} state=local_scheduler_initialized",
-        cpu_id
-    );
-    crate::yarm_log!("YARM_AARCH64_SMP_SECONDARY_JOINED cpu={}", cpu_id);
+    if cpu_bit != 0
+        && (SECONDARY_READY_LOGGED_MASK.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit) == 0
+    {
+        crate::yarm_log!(
+            "YARM_AARCH64_SMP_SECONDARY_READY cpu={} state=local_scheduler_initialized",
+            cpu_id
+        );
+    }
+    if cpu_bit != 0
+        && (SECONDARY_JOINED_LOGGED_MASK.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit) == 0
+    {
+        crate::yarm_log!("YARM_AARCH64_SMP_SECONDARY_JOINED cpu={}", cpu_id);
+    }
 
     loop {
         let _ = kernel.set_current_cpu(cpu);
