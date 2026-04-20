@@ -872,6 +872,10 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
     kernel.program_timer_deadline_current_cpu(
         crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
     );
+    crate::yarm_log!(
+        "YARM_AARCH64_SMP_SECONDARY_READY cpu={} state=local_scheduler_initialized",
+        cpu_id
+    );
     crate::yarm_log!("YARM_AARCH64_SMP_SECONDARY_JOINED cpu={}", cpu_id);
 
     loop {

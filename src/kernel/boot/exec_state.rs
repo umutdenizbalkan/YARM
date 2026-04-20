@@ -4,6 +4,7 @@
 use super::{KernelError, KernelState, SpawnedUserTask, UserImageSpec};
 use crate::arch::hal::Hal;
 use crate::kernel::frame_allocator::alloc_pt_frame;
+use crate::kernel::scheduler::CpuId;
 use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext, WaitReason};
 use crate::kernel::vm::{Asid, CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 
@@ -41,6 +42,17 @@ fn task_missing_with_site(site: &'static str, cpu: u8) -> KernelError {
         crate::yarm_log!("TASK_MISSING site={} cpu={}", site, cpu);
     }
     KernelError::TaskMissing
+}
+
+fn should_pin_bootstrap_task_to_bsp(kernel: &KernelState, candidate_tid: u64) -> bool {
+    kernel.with_tcbs(|tcbs| {
+        !tcbs.iter().flatten().any(|tcb| {
+            if tcb.tid.0 == candidate_tid {
+                return false;
+            }
+            matches!(tcb.status, TaskStatus::Runnable | TaskStatus::Running)
+        })
+    })
 }
 
 impl KernelState {
@@ -381,7 +393,21 @@ impl KernelState {
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
-        let enqueued_cpu = self.enqueue_task(spec.tid)?;
+        let enqueued_cpu = if should_pin_bootstrap_task_to_bsp(self, spec.tid) {
+            let bootstrap_cpu = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!(
+                    "FIRST_USER_ENQUEUE_DECISION cpu={} tid={} chosen_cpu={} reason=bootstrap_pin",
+                    cpu.0,
+                    spec.tid,
+                    bootstrap_cpu.0
+                );
+            }
+            self.enqueue_on_cpu(bootstrap_cpu, spec.tid)?;
+            bootstrap_cpu
+        } else {
+            self.enqueue_task(spec.tid)?
+        };
         if cfg!(not(feature = "hosted-dev")) {
             crate::yarm_log!(
                 "FIRST_USER_ENQUEUE cpu={} tid={} target_cpu={} status=ok",
