@@ -731,6 +731,10 @@ pub fn enter_dispatched_user_task_if_available(
                 context.stack_ptr.0
             );
             crate::yarm_log!(
+                "CTX3 inside enter_dispatched_user_task_if_available tid={}",
+                tid
+            );
+            crate::yarm_log!(
                 "BSP_CONTEXT_RESTORE_DUMP tid={} elr=0x{:x} sp=0x{:x} spsr=0x{:x} ttbr0=0x{:x} arg0=0x{:x} arg1=0x{:x}",
                 tid,
                 context.instruction_ptr.0,

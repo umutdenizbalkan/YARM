@@ -518,9 +518,45 @@ impl KernelState {
             if cfg!(not(feature = "hosted-dev"))
                 && current_cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
             {
+                let (ctx_ptr, user_pc, user_sp, user_x0, user_x1) = self.with_tcbs(|tcbs| {
+                    tcbs.iter()
+                        .flatten()
+                        .find(|tcb| tcb.tid.0 == tid)
+                        .map(|tcb| {
+                            (
+                                &tcb.kernel_context.frame as *const _ as usize,
+                                tcb.user_context.instruction_ptr.0,
+                                tcb.user_context.stack_ptr.0,
+                                tcb.user_context.arg0 as u64,
+                                tcb.user_context.arg1 as u64,
+                            )
+                        })
+                        .unwrap_or((0, 0, 0, 0, 0))
+                });
                 crate::yarm_log!("BSP_BEFORE_CONTEXT_RESTORE tid={}", tid);
+                crate::yarm_log!(
+                    "BSP_CONTEXT_RESTORE_RAW tid={} ctx_ptr=0x{:x} pc=0x{:x} sp=0x{:x} spsr=0x0 x0=0x{:x} x1=0x{:x}",
+                    tid,
+                    ctx_ptr,
+                    user_pc,
+                    user_sp,
+                    user_x0,
+                    user_x1
+                );
+            }
+            if cfg!(not(feature = "hosted-dev"))
+                && tid == BOOTSTRAP_FIRST_USER_TID
+                && current_cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+            {
+                crate::yarm_log!("CTX0 before maybe_switch_kernel_context tid={}", tid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
+            if cfg!(not(feature = "hosted-dev"))
+                && tid == BOOTSTRAP_FIRST_USER_TID
+                && current_cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+            {
+                crate::yarm_log!("CTX1 after maybe_switch_kernel_context tid={}", tid);
+            }
             if outgoing_tid != Some(tid) {
                 self.with_ipc_state_mut(|ipc| {
                     ipc.telemetry.scheduler_context_switches =

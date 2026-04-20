@@ -35,6 +35,10 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
     yarm::yarm_log!("YARM_SCHED_LOOP_START dispatched_tid={:?}", initial);
     if let Some(tid) = initial {
         yarm::yarm_log!("BSP_BEFORE_ENTER_USER tid={}", tid);
+        yarm::yarm_log!(
+            "CTX2 before enter_dispatched_user_task_if_available tid={}",
+            tid
+        );
         yarm::yarm_log!("DISPATCH: before enter_user_call");
         yarm::arch::boot_entry::enter_dispatched_user_task_if_available(kernel, Some(tid));
     } else {

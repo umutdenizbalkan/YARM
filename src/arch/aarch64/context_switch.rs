@@ -11,12 +11,24 @@ unsafe extern "C" {
 }
 
 #[cfg(all(not(test), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_ctxsw_marker_0() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_CTXSW C0");
+}
+
+#[cfg(all(not(test), target_arch = "aarch64"))]
 core::arch::global_asm!(
     r#"
     .section .text, "ax", @progbits
     .global yarm_aarch64_switch_frame
     .type yarm_aarch64_switch_frame, %function
 yarm_aarch64_switch_frame:
+    sub sp, sp, #16
+    stp x0, x1, [sp, #0]
+    bl yarm_aarch64_ctxsw_marker_0
+    ldp x0, x1, [sp, #0]
+    add sp, sp, #16
+
     // Save callee-saved SIMD q8..q15 into ArchSwitchContext::fxsave area.
     stp q8, q9, [x0, #128]
     stp q10, q11, [x0, #160]
