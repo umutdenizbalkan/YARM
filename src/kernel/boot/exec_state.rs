@@ -472,6 +472,9 @@ impl KernelState {
                 self.hal.switch_address_space(asid);
                 if cfg!(not(feature = "hosted-dev")) {
                     crate::yarm_log!("DISPATCH: after switch_address_space asid={}", asid.0);
+                    if self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+                        crate::yarm_log!("BSP_AFTER_ASPACE_SWITCH tid={}", tid);
+                    }
                 }
             }
             if cfg!(not(feature = "hosted-dev")) {
@@ -511,6 +514,11 @@ impl KernelState {
                     current_cpu.0,
                     crate::arch::platform_constants::BOOTSTRAP_CPU_ID
                 );
+            }
+            if cfg!(not(feature = "hosted-dev"))
+                && current_cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+            {
+                crate::yarm_log!("BSP_BEFORE_CONTEXT_RESTORE tid={}", tid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
             if outgoing_tid != Some(tid) {

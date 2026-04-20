@@ -492,6 +492,20 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     }
     let is_irq_kind = matches!(kind, 2 | 6 | 10 | 14);
     if let Some(kernel) = trap_kernel_state_mut() {
+        let trap_cpu =
+            crate::kernel::scheduler::CpuId((crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8);
+        let current_tid = kernel.current_tid();
+        if current_tid == Some(1) {
+            crate::yarm_log!(
+                "AARCH64_HANDOFF_TRAP cpu={} tid={} ESR_EL1=0x{:016x} ELR_EL1=0x{:016x} FAR_EL1=0x{:016x} SPSR_EL1=0x{:016x}",
+                trap_cpu.0,
+                current_tid.unwrap_or(0),
+                frame.esr_el1,
+                frame.elr_el1,
+                frame.far_el1,
+                frame.spsr_el1
+            );
+        }
         let mut trap_frame = crate::kernel::trapframe::TrapFrame::zeroed();
         trap_frame.set_saved_pc(frame.elr_el1 as usize);
         trap_frame.set_saved_sp(frame.sp_el0 as usize);
@@ -506,7 +520,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         };
         if crate::arch::aarch64::trap::handle_trap_entry(
             kernel,
-            crate::kernel::scheduler::CpuId(0),
+            trap_cpu,
             context,
             Some(&mut trap_frame),
         )
@@ -681,6 +695,14 @@ pub fn enter_dispatched_user_task_if_available(
             context.stack_ptr.0,
             tls
         );
+        if kernel.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+            crate::yarm_log!(
+                "BSP_BEFORE_ENTER_RING3 tid={} entry=0x{:x} stack_top=0x{:x}",
+                tid,
+                context.instruction_ptr.0,
+                context.stack_ptr.0
+            );
+        }
         unsafe {
             unsafe extern "C" {
                 fn yarm_aarch64_enter_user_mode_eret(
@@ -698,6 +720,10 @@ pub fn enter_dispatched_user_task_if_available(
                 context.arg1 as u64,
                 tls,
             );
+        }
+        #[allow(unreachable_code)]
+        if kernel.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+            crate::yarm_log!("BSP_ENTER_RING3_DONE tid={}", tid);
         }
     }
 }
