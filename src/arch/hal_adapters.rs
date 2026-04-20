@@ -20,7 +20,7 @@ pub fn switch_address_space(asid: Asid) {
         );
     }
     match crate::arch::selected_isa::page_table::activate_asid(asid) {
-        Ok(cr3) => {
+        Ok(target_root) => {
             #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
             {
                 let mut cr3_after: u64 = 0;
@@ -32,18 +32,22 @@ pub fn switch_address_space(asid: Asid) {
                     );
                 }
                 crate::yarm_log!(
-                    "CR3_SWITCH_OK asid={} target_cr3=0x{:x} before=0x{:x} after=0x{:x}",
+                    "ADDRESS_SPACE_SWITCH_OK asid={} target_root=0x{:x} before=0x{:x} after=0x{:x}",
                     asid.0,
-                    cr3,
+                    target_root,
                     cr3_before,
                     cr3_after
                 );
             }
             #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
-            crate::yarm_log!("CR3_SWITCH_OK asid={} target_cr3=0x{:x}", asid.0, cr3);
+            crate::yarm_log!(
+                "ADDRESS_SPACE_SWITCH_OK asid={} target_root=0x{:x}",
+                asid.0,
+                target_root
+            );
         }
         Err(err) => {
-            crate::yarm_log!("CR3_SWITCH_FAIL asid={} err={:?}", asid.0, err);
+            crate::yarm_log!("ADDRESS_SPACE_SWITCH_FAIL asid={} err={:?}", asid.0, err);
         }
     }
 }
