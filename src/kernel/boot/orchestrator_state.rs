@@ -2,6 +2,13 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::*;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static WITH_TCBS_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_with_tcbs_probe(active: bool) {
+    WITH_TCBS_PROBE_ACTIVE.store(active, Ordering::Release);
+}
 
 impl KernelState {
     pub(crate) fn scheduler_state(
@@ -201,7 +208,27 @@ impl KernelState {
         f: impl FnOnce(&[Option<ThreadControlBlock>; MAX_TASKS]) -> R,
     ) -> R {
         let _task_guard = self.task_state_lock.lock();
-        f(kernel_ref(&self.tcbs))
+        #[cfg(not(feature = "hosted-dev"))]
+        let probe_active = WITH_TCBS_PROBE_ACTIVE.load(Ordering::Acquire)
+            && self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
+        #[cfg(feature = "hosted-dev")]
+        let probe_active = false;
+        if probe_active {
+            crate::yarm_log!(
+                "WX2 after acquiring with_tcbs lock self_ptr=0x{:x} task_lock_ptr=0x{:x}",
+                self as *const _ as usize,
+                &self.task_state_lock as *const _ as usize
+            );
+        }
+        let tcbs = kernel_ref(&self.tcbs);
+        if probe_active {
+            crate::yarm_log!(
+                "WX3 after obtaining tcbs container pointer tcbs_ptr=0x{:x} tcbs_storage_ptr=0x{:x}",
+                tcbs as *const _ as usize,
+                &self.tcbs as *const _ as usize
+            );
+        }
+        f(tcbs)
     }
 
     pub(crate) fn with_tcbs_mut<R>(

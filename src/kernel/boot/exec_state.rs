@@ -484,9 +484,19 @@ impl KernelState {
                     crate::yarm_log!("LCTX0 after aspace switch tid={}", tid);
                     crate::yarm_log!("LCTX1 before reading task/tcb pointer tid={}", tid);
                     crate::yarm_log!("LCTX1A before with_tcbs tid={}", tid);
+                    crate::yarm_log!(
+                        "WX0 before calling with_tcbs tid={} self_ptr=0x{:x} scheduler_state_ptr=0x{:x} task_lock_ptr=0x{:x} tcbs_storage_ptr=0x{:x}",
+                        tid,
+                        self as *const _ as usize,
+                        &self.scheduler_state as *const _ as usize,
+                        &self.task_state_lock as *const _ as usize,
+                        &self.tcbs as *const _ as usize
+                    );
+                    crate::kernel::boot::orchestrator_state::set_with_tcbs_probe(true);
                 }
                 let (task_ptr, kernel_context_ptr, frame_ptr, kernel_stack_top) = self.with_tcbs(|tcbs| {
                     if lctx_bsp_tid1 {
+                        crate::yarm_log!("WX1 at first line inside with_tcbs closure entry tid={}", tid);
                         crate::yarm_log!("LCTX1B after with_tcbs entry tid={}", tid);
                     }
                     tcbs.iter()
@@ -505,6 +515,9 @@ impl KernelState {
                         })
                         .unwrap_or((0, 0, 0, 0))
                 });
+                if lctx_bsp_tid1 {
+                    crate::kernel::boot::orchestrator_state::set_with_tcbs_probe(false);
+                }
                 if lctx_bsp_tid1 {
                     crate::yarm_log!(
                         "LCTX2 after reading task/tcb/context pointer tid={} task_ptr=0x{:x} kernel_ctx_ptr=0x{:x} frame_ptr=0x{:x} kernel_stack_top=0x{:x}",
