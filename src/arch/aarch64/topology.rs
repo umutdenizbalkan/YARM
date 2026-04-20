@@ -53,7 +53,10 @@ mod tests {
     use super::*;
     #[test]
     fn invalid_blob_falls_back_to_default_cpu_bitmap() {
-        assert_eq!(discover_present_cpu_bitmap(b"not-a-dtb"), default_present_cpu_bitmap());
+        assert_eq!(
+            discover_present_cpu_bitmap(b"not-a-dtb"),
+            default_present_cpu_bitmap()
+        );
     }
 
     #[test]

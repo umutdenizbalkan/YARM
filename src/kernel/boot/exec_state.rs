@@ -478,18 +478,37 @@ impl KernelState {
                 }
             }
             if cfg!(not(feature = "hosted-dev")) {
-                let (context_ptr, kernel_stack_top) = self.with_tcbs(|tcbs| {
+                if tid == BOOTSTRAP_FIRST_USER_TID
+                    && self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+                {
+                    crate::yarm_log!("LCTX0 after aspace switch tid={}", tid);
+                    crate::yarm_log!("LCTX1 before reading task/context pointers tid={}", tid);
+                }
+                let (task_ptr, context_ptr, kernel_stack_top) = self.with_tcbs(|tcbs| {
                     tcbs.iter()
                         .flatten()
                         .find(|tcb| tcb.tid.0 == tid)
                         .map(|tcb| {
                             (
+                                tcb as *const _ as usize,
                                 &tcb.kernel_context.frame as *const _ as usize,
                                 tcb.kernel_context.stack_top.map(|top| top.0).unwrap_or(0),
                             )
                         })
-                        .unwrap_or((0, 0))
+                        .unwrap_or((0, 0, 0))
                 });
+                if tid == BOOTSTRAP_FIRST_USER_TID
+                    && self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+                {
+                    crate::yarm_log!(
+                        "LCTX2 after reading task/context pointers tid={} task_ptr=0x{:x} ctx_ptr=0x{:x} kernel_stack_top=0x{:x}",
+                        tid,
+                        task_ptr,
+                        context_ptr,
+                        kernel_stack_top
+                    );
+                    crate::yarm_log!("LCTX3 before loading-context log tid={}", tid);
+                }
                 let event_id = DISPATCH_CONTEXT_LOAD_EVENT_ID.fetch_add(1, Ordering::Relaxed);
                 crate::yarm_log!(
                     "DISPATCH: before loading context tid={} ctx_ptr=0x{:x} kernel_stack_top=0x{:x} src=dispatch_context_load event_id={}",

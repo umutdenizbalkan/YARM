@@ -596,9 +596,8 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
 
     let Some(kernel) = trap_kernel_state_mut() else {
         if should_halt_without_kernel_state(vector as usize) {
-            let fault_rip = unsafe {
-                (*(interrupt_frame_low as *const X86InterruptStackFrameHeader)).rip
-            };
+            let fault_rip =
+                unsafe { (*(interrupt_frame_low as *const X86InterruptStackFrameHeader)).rip };
             debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, fault_rip, cpu_apic);
             TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
             halt_forever();
@@ -1093,12 +1092,12 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
 
         let ist_nmi_top = (core::ptr::addr_of!(IST_NMI.0) as u64 + IST_NMI_STACK_BYTES as u64)
             & 0x0000_0000_FFFF_FFFF;
-        let ist_df_top =
-            (core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64 + IST_DOUBLE_FAULT_STACK_BYTES as u64)
-                & 0x0000_0000_FFFF_FFFF;
-        let ist_pf_top =
-            (core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64 + IST_PAGE_FAULT_STACK_BYTES as u64)
-                & 0x0000_0000_FFFF_FFFF;
+        let ist_df_top = (core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64
+            + IST_DOUBLE_FAULT_STACK_BYTES as u64)
+            & 0x0000_0000_FFFF_FFFF;
+        let ist_pf_top = (core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64
+            + IST_PAGE_FAULT_STACK_BYTES as u64)
+            & 0x0000_0000_FFFF_FFFF;
         let rsp0 = rsp0 & 0x0000_0000_FFFF_FFFF;
         BOOT_TSS.rsp0 = rsp0;
         BOOT_TSS.ist1 = ist_nmi_top;

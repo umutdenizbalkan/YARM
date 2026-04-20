@@ -526,8 +526,8 @@ mod tests {
 
     #[test]
     fn ap_stack_backing_fits_bootstrap_low_identity_window() {
-        let total_ap_stack_bytes =
-            (crate::arch::platform_constants::MAX_CPUS as u64).saturating_mul(AP_STACK_BYTES as u64);
+        let total_ap_stack_bytes = (crate::arch::platform_constants::MAX_CPUS as u64)
+            .saturating_mul(AP_STACK_BYTES as u64);
         assert!(AP_STACK_PHYS_BASE + total_ap_stack_bytes <= BOOTSTRAP_LOW_IDENTITY_BYTES);
     }
 }

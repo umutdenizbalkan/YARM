@@ -205,10 +205,7 @@ impl PageTableState {
             }
         }
 
-        crate::yarm_log!(
-            "PT_ALLOC_PCID_FAIL asid={} reason=pcid_exhausted",
-            asid.0
-        );
+        crate::yarm_log!("PT_ALLOC_PCID_FAIL asid={} reason=pcid_exhausted", asid.0);
         Err(PageTableError::OutOfMemory)
     }
 
@@ -229,14 +226,13 @@ impl PageTableState {
             }
         };
         let root_phys = self.pages[root_idx].expect("root page").phys;
-        let canonical_kernel_root_phys =
-            if let Some(existing) = self.canonical_kernel_root_phys {
-                existing
-            } else {
-                let detected = detect_active_root_phys_from_cr3()?;
-                self.canonical_kernel_root_phys = Some(detected);
-                detected
-            };
+        let canonical_kernel_root_phys = if let Some(existing) = self.canonical_kernel_root_phys {
+            existing
+        } else {
+            let detected = detect_active_root_phys_from_cr3()?;
+            self.canonical_kernel_root_phys = Some(detected);
+            detected
+        };
         if let Err(err) = clone_kernel_pml4_half_into_root(canonical_kernel_root_phys, root_phys) {
             crate::yarm_log!(
                 "PT_ENSURE_ASID_FAIL asid={} reason=clone_kernel_root_failed src=0x{:x} dst=0x{:x} err={:?}",
@@ -438,7 +434,8 @@ fn clone_low_alias_page_from_live_root(
     if !src_l3.is_present() {
         return Err(PageTableError::InvalidAddress);
     }
-    let mut dst_l4 = read_table_entry(state, dst_table, l4).ok_or(PageTableError::InvalidAddress)?;
+    let mut dst_l4 =
+        read_table_entry(state, dst_table, l4).ok_or(PageTableError::InvalidAddress)?;
     if !dst_l4.is_present() {
         let new_idx = state.alloc_page()?;
         let new_phys = state.pages[new_idx].expect("new l3").phys;
@@ -456,7 +453,8 @@ fn clone_low_alias_page_from_live_root(
     if !src_l2.is_present() {
         return Err(PageTableError::InvalidAddress);
     }
-    let mut dst_l3 = read_table_entry(state, dst_table, l3).ok_or(PageTableError::InvalidAddress)?;
+    let mut dst_l3 =
+        read_table_entry(state, dst_table, l3).ok_or(PageTableError::InvalidAddress)?;
     if !dst_l3.is_present() {
         let new_idx = state.alloc_page()?;
         let new_phys = state.pages[new_idx].expect("new l2").phys;
@@ -474,7 +472,8 @@ fn clone_low_alias_page_from_live_root(
     if !src_l1.is_present() {
         return Err(PageTableError::InvalidAddress);
     }
-    let mut dst_l2 = read_table_entry(state, dst_table, l2).ok_or(PageTableError::InvalidAddress)?;
+    let mut dst_l2 =
+        read_table_entry(state, dst_table, l2).ok_or(PageTableError::InvalidAddress)?;
     if !dst_l2.is_present() {
         let new_idx = state.alloc_page()?;
         let new_phys = state.pages[new_idx].expect("new l1").phys;
@@ -731,9 +730,12 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         let live_rsp_raw_ok = resolve_page_in_root(live_root, VirtAddr(rsp_probe)).is_some();
         let target_rip_raw_ok = resolve_page_in_root(target_root, VirtAddr(rip)).is_some();
         let target_rsp_raw_ok = resolve_page_in_root(target_root, VirtAddr(rsp_probe)).is_some();
-        let live_idt_ok = idt_base != 0 && resolve_page_in_root(live_root, VirtAddr(idt_base)).is_some();
-        let live_gdt_ok = gdt_base != 0 && resolve_page_in_root(live_root, VirtAddr(gdt_base)).is_some();
-        let live_tss_ok = tss_base != 0 && resolve_page_in_root(live_root, VirtAddr(tss_base)).is_some();
+        let live_idt_ok =
+            idt_base != 0 && resolve_page_in_root(live_root, VirtAddr(idt_base)).is_some();
+        let live_gdt_ok =
+            gdt_base != 0 && resolve_page_in_root(live_root, VirtAddr(gdt_base)).is_some();
+        let live_tss_ok =
+            tss_base != 0 && resolve_page_in_root(live_root, VirtAddr(tss_base)).is_some();
         let target_idt_ok =
             idt_base != 0 && resolve_page_in_root(target_root, VirtAddr(idt_base)).is_some();
         let target_gdt_ok =
@@ -778,14 +780,21 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             && target_rsp_hi_ok
         {
             let mut state = PAGE_TABLE_STATE.lock();
-            let target_root_phys = state.asid_root_phys(asid).ok_or(PageTableError::InvalidAddress)?;
+            let target_root_phys = state
+                .asid_root_phys(asid)
+                .ok_or(PageTableError::InvalidAddress)?;
             crate::yarm_log!(
                 "ASID_SWITCH_MIN_LOW_ALIAS_BEGIN asid={} live_root=0x{:x} target_root=0x{:x}",
                 asid.0,
                 live_root,
                 target_root_phys
             );
-            clone_low_alias_page_from_live_root(&mut state, live_root, target_root_phys, VirtAddr(rip))?;
+            clone_low_alias_page_from_live_root(
+                &mut state,
+                live_root,
+                target_root_phys,
+                VirtAddr(rip),
+            )?;
             clone_low_alias_page_from_live_root(
                 &mut state,
                 live_root,
@@ -865,7 +874,9 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         );
         if !rip_at_switch_ok {
             let mut state = PAGE_TABLE_STATE.lock();
-            let target_root_phys = state.asid_root_phys(asid).ok_or(PageTableError::InvalidAddress)?;
+            let target_root_phys = state
+                .asid_root_phys(asid)
+                .ok_or(PageTableError::InvalidAddress)?;
             clone_low_alias_page_from_live_root(
                 &mut state,
                 live_root,
@@ -873,7 +884,11 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
                 VirtAddr(rip_at_switch),
             )?;
             drop(state);
-            log_root_chain(target_root_phys, "target_rip_switch_after", VirtAddr(rip_at_switch));
+            log_root_chain(
+                target_root_phys,
+                "target_rip_switch_after",
+                VirtAddr(rip_at_switch),
+            );
         }
         let rip_ok = resolve_page(asid, VirtAddr(rip)).is_some();
         let rsp_ok = resolve_page(asid, VirtAddr(rsp_probe)).is_some();
@@ -889,7 +904,10 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             rip_switch_ok
         );
         if !rip_ok || !rsp_ok || !rip_switch_ok {
-            crate::yarm_log!("ASID_SWITCH_ABORT asid={} reason=kernel_mapping_missing", asid.0);
+            crate::yarm_log!(
+                "ASID_SWITCH_ABORT asid={} reason=kernel_mapping_missing",
+                asid.0
+            );
             return Err(PageTableError::InvalidAddress);
         }
     }
@@ -1146,7 +1164,10 @@ fn phys_to_virt_table_ptr(table_phys: u64) -> Option<*mut u8> {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), not(test)))]
-unsafe fn read_raw_table_entry(table_phys: u64, index: usize) -> Result<PageTableEntry, PageTableError> {
+unsafe fn read_raw_table_entry(
+    table_phys: u64,
+    index: usize,
+) -> Result<PageTableEntry, PageTableError> {
     if index >= ENTRIES_PER_TABLE {
         return Err(PageTableError::InvalidAddress);
     }

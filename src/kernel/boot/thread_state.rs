@@ -455,7 +455,12 @@ impl KernelState {
             )?;
         }
         if cfg!(not(feature = "hosted-dev")) {
-            crate::yarm_log!("USER_STACK asid={} base=0x{:x} top=0x{:x}", asid.0, base, top);
+            crate::yarm_log!(
+                "USER_STACK asid={} base=0x{:x} top=0x{:x}",
+                asid.0,
+                base,
+                top
+            );
         }
         let stack_probe = crate::kernel::vm::VirtAddr(top - 8);
         let stack_resolve =

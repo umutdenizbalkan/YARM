@@ -812,7 +812,10 @@ mod tests {
         .expect("msg");
         let spawn_reply = pm.handle_request(spawn).expect("handle");
         let spawned = SpawnV2Result::decode(spawn_reply.as_slice()).expect("decode");
-        assert_eq!(pm.process_requested_cnode_slots(spawned.pid), Some(Some(96)));
+        assert_eq!(
+            pm.process_requested_cnode_slots(spawned.pid),
+            Some(Some(96))
+        );
         assert_eq!(pm.process_requested_task_class(spawned.pid), Some(None));
     }
 
@@ -829,7 +832,10 @@ mod tests {
         .expect("msg");
         let spawn_reply = pm.handle_request(spawn).expect("handle");
         let spawned = SpawnV2Result::decode(spawn_reply.as_slice()).expect("decode");
-        assert_eq!(pm.process_requested_cnode_slots(spawned.pid), Some(Some(96)));
+        assert_eq!(
+            pm.process_requested_cnode_slots(spawned.pid),
+            Some(Some(96))
+        );
         assert_eq!(
             pm.process_requested_task_class(spawned.pid),
             Some(Some(TaskClass::Driver))

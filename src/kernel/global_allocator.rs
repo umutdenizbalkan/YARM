@@ -96,7 +96,8 @@ mod non_hosted {
         fn phys_to_ptr(phys: u64) -> *mut u8 {
             #[cfg(target_arch = "x86_64")]
             {
-                let Some(virt) = platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(phys) else {
+                let Some(virt) = platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(phys)
+                else {
                     return null_mut();
                 };
                 return virt as usize as *mut u8;
@@ -111,7 +112,8 @@ mod non_hosted {
                 target_arch = "riscv64"
             )))]
             {
-                let Some(virt) = platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(phys) else {
+                let Some(virt) = platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.checked_add(phys)
+                else {
                     return null_mut();
                 };
                 return virt as usize as *mut u8;
@@ -427,14 +429,21 @@ mod non_hosted {
             if !page_ptr.is_null() {
                 let magic = unsafe { core::ptr::read_unaligned(page_ptr as *const u64) };
                 if magic == SLAB_MAGIC {
-                    let class_idx = unsafe { (&*(page_ptr as *const SlabPageHeader)).class_idx as usize };
+                    let class_idx =
+                        unsafe { (&*(page_ptr as *const SlabPageHeader)).class_idx as usize };
                     if class_idx < SLAB_CLASS_SIZES.len() {
                         let mut class_head = Self::class_lock(class_idx).lock();
                         let ok = unsafe { Self::slab_dealloc_from_page(page_ptr, ptr) };
                         if ok {
                             let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
                             if header.used == 0 {
-                                unsafe { Self::try_reclaim_empty_slab_page(&mut class_head, class_idx, page_ptr) };
+                                unsafe {
+                                    Self::try_reclaim_empty_slab_page(
+                                        &mut class_head,
+                                        class_idx,
+                                        page_ptr,
+                                    )
+                                };
                             }
                         }
                         return;
@@ -475,14 +484,14 @@ mod hosted {
     pub static KERNEL_GLOBAL_ALLOCATOR: KernelGlobalAllocator = KernelGlobalAllocator;
 }
 
-#[cfg(not(feature = "hosted-dev"))]
-pub use non_hosted::KERNEL_GLOBAL_ALLOCATOR;
-#[cfg(not(feature = "hosted-dev"))]
-pub use non_hosted::KernelGlobalAllocator;
 #[cfg(feature = "hosted-dev")]
 pub use hosted::KERNEL_GLOBAL_ALLOCATOR;
 #[cfg(feature = "hosted-dev")]
 pub use hosted::KernelGlobalAllocator;
+#[cfg(not(feature = "hosted-dev"))]
+pub use non_hosted::KERNEL_GLOBAL_ALLOCATOR;
+#[cfg(not(feature = "hosted-dev"))]
+pub use non_hosted::KernelGlobalAllocator;
 
 #[cfg(all(test, feature = "hosted-dev"))]
 mod hosted_dev_allocator_model_tests {

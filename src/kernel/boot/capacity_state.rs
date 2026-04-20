@@ -54,11 +54,9 @@ impl KernelState {
 
     pub fn capability_space_telemetry(&self) -> CapabilitySpaceTelemetry {
         self.with_capability_state(|capability| {
-            capability
-                .cnode_spaces
-                .iter()
-                .flatten()
-                .fold(CapabilitySpaceTelemetry::default(), |mut acc, space| {
+            capability.cnode_spaces.iter().flatten().fold(
+                CapabilitySpaceTelemetry::default(),
+                |mut acc, space| {
                     let telemetry = kernel_ref(&space.cspace).revoke_scratch_telemetry();
                     acc.cnode_spaces = acc.cnode_spaces.saturating_add(1);
                     acc.revoke_scratch_cache_hits = acc
@@ -71,7 +69,8 @@ impl KernelState {
                         .revoke_scratch_cache_drops
                         .saturating_add(telemetry.cache_drops);
                     acc
-                })
+                },
+            )
         })
     }
 
