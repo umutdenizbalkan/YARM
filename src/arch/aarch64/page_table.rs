@@ -122,7 +122,6 @@ impl PageTableState {
 
         let root_idx = self.alloc_page()?;
         let root_phys = self.pages[root_idx].expect("root page").phys;
-        clone_current_kernel_root_into_asid_root(self, root_idx, root_phys)?;
         for slot in &mut self.asids {
             if slot.is_none() {
                 *slot = Some(AsidRoot { asid, root_phys });
@@ -139,61 +138,6 @@ impl PageTableState {
             .find(|entry| entry.asid == asid)
             .map(|entry| entry.root_phys)
     }
-}
-
-#[cfg(all(not(feature = "hosted-dev"), not(test), target_arch = "aarch64"))]
-#[inline]
-fn read_current_ttbr0_root_phys() -> u64 {
-    let ttbr0: u64;
-    unsafe {
-        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nostack, preserves_flags));
-    }
-    ttbr0 & PAGE_MASK
-}
-
-#[cfg(any(feature = "hosted-dev", test, not(target_arch = "aarch64")))]
-#[inline]
-fn read_current_ttbr0_root_phys() -> u64 {
-    0
-}
-
-#[cfg(all(not(feature = "hosted-dev"), not(test), target_arch = "aarch64"))]
-#[inline]
-fn phys_table_ptr(table_phys: u64) -> *mut u64 {
-    table_phys as usize as *mut u64
-}
-
-#[cfg(any(feature = "hosted-dev", test, not(target_arch = "aarch64")))]
-#[inline]
-fn phys_table_ptr(_table_phys: u64) -> *mut u64 {
-    core::ptr::null_mut()
-}
-
-fn clone_current_kernel_root_into_asid_root(
-    state: &mut PageTableState,
-    dst_root_idx: usize,
-    dst_root_phys: u64,
-) -> Result<(), PageTableError> {
-    let src_root_phys = read_current_ttbr0_root_phys();
-    if src_root_phys == 0 {
-        return Ok(());
-    }
-    let dst_page = state.pages[dst_root_idx]
-        .as_mut()
-        .ok_or(PageTableError::InvalidAddress)?;
-    let src_ptr = phys_table_ptr(src_root_phys);
-    let dst_ptr = phys_table_ptr(dst_root_phys);
-    if src_ptr.is_null() || dst_ptr.is_null() {
-        return Ok(());
-    }
-    for idx in 0..ENTRIES_PER_TABLE {
-        let raw = unsafe { core::ptr::read_volatile(src_ptr.add(idx)) };
-        dst_page.entries[idx] = PageTableEntry(raw);
-        unsafe {
-            core::ptr::write_volatile(dst_ptr.add(idx), raw);
-        }
-    }
-    Ok(())
 }
 
 static PAGE_TABLE_STATE: SpinLockIrq<PageTableState> = SpinLockIrq::new(PageTableState::new());
