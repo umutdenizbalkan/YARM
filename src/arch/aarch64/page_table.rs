@@ -428,7 +428,7 @@ pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
 }
 
 pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
-    let state = PAGE_TABLE_STATE.lock();
+    let mut state = PAGE_TABLE_STATE.lock();
     let mut table_phys = state.root_for_asid(asid)?;
     let levels = [
         level_index(virt.0, 39),
