@@ -751,7 +751,7 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize {
     let mut started = 0usize;
-    let secondary_entry = yarm_aarch64_secondary_entry as usize as u64;
+    let secondary_entry = yarm_aarch64_secondary_entry as *const () as usize as u64;
     let conduit = match PSCI_CONDUIT.load(Ordering::Acquire) {
         x if x == PsciConduit::Smc as u8 => PsciConduit::Smc,
         x if x == PsciConduit::Hvc as u8 => PsciConduit::Hvc,
