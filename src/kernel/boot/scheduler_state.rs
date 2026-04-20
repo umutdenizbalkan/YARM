@@ -38,17 +38,32 @@ impl KernelState {
             sched.current_cpu = cpu;
             Ok(())
         })?;
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+        crate::yarm_log!(
+            "SET_CURRENT_CPU cpu={} mpidr=0x{:x} src=scheduler_state::set_current_cpu",
+            cpu.0,
+            crate::arch::aarch64::read_mpidr_el1()
+        );
         Ok(())
     }
 
     pub fn current_cpu(&self) -> CpuId {
-        self.with_scheduler_state(|sched| sched.current_cpu)
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+        {
+            let mpidr = crate::arch::aarch64::read_mpidr_el1();
+            return CpuId((mpidr & 0xff) as u8);
+        }
+        #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
+        {
+            self.with_scheduler_state(|sched| sched.current_cpu)
+        }
     }
 
     pub fn current_tid(&self) -> Option<u64> {
+        let cpu = self.current_cpu();
         self.with_scheduler_state(|sched| {
             kernel_ref(&sched.scheduler)
-                .current_tid_on(sched.current_cpu)
+                .current_tid_on(cpu)
                 .map(|tid| tid.0)
         })
     }
@@ -62,8 +77,14 @@ impl KernelState {
     }
 
     pub fn dispatch_next_current_cpu(&mut self) -> Option<u64> {
+        let cpu = self.current_cpu();
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+        crate::yarm_log!(
+            "GET_CURRENT_CPU cpu={} mpidr=0x{:x} src=scheduler_dispatch_lookup",
+            cpu.0,
+            crate::arch::aarch64::read_mpidr_el1()
+        );
         let mut sched = self.scheduler_state();
-        let cpu = sched.current_cpu;
         let next = kernel_mut(&mut sched.scheduler)
             .dispatch_next_on(cpu)
             .map(|tid| tid.0);
@@ -74,16 +95,16 @@ impl KernelState {
     }
 
     pub fn on_preempt_current_cpu(&mut self) -> Option<u64> {
+        let cpu = self.current_cpu();
         let mut sched = self.scheduler_state();
-        let cpu = sched.current_cpu;
         kernel_mut(&mut sched.scheduler)
             .on_preempt_on(cpu)
             .map(|tid| tid.0)
     }
 
     pub fn block_current_cpu(&mut self) -> Option<u64> {
+        let cpu = self.current_cpu();
         let mut sched = self.scheduler_state();
-        let cpu = sched.current_cpu;
         kernel_mut(&mut sched.scheduler)
             .block_current_on(cpu)
             .map(|tid| tid.0)

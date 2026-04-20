@@ -13,3 +13,19 @@ pub mod trap;
 pub mod vm_layout;
 
 pub mod topology;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[inline]
+pub fn read_mpidr_el1() -> u64 {
+    let mpidr: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, MPIDR_EL1", out(reg) mpidr, options(nomem, preserves_flags));
+    }
+    mpidr
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
+#[inline]
+pub fn read_mpidr_el1() -> u64 {
+    0
+}

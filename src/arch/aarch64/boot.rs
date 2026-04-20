@@ -883,6 +883,21 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
     }
     crate::yarm_log!("YARM_AARCH64_SMP_WAIT cpu={} state=released", cpu_id);
     let _ = kernel.set_current_cpu(cpu);
+    let observed_cpu = kernel.current_cpu();
+    if observed_cpu.0 != cpu.0 {
+        crate::yarm_log!(
+            "AP_CPU_IDENTITY_VIOLATION assigned_cpu={} observed_cpu={} mpidr=0x{:x}",
+            cpu.0,
+            observed_cpu.0,
+            crate::arch::aarch64::read_mpidr_el1()
+        );
+    }
+    assert_eq!(observed_cpu.0, cpu.0);
+    crate::yarm_log!(
+        "GET_CURRENT_CPU cpu={} mpidr=0x{:x} src=aarch64_secondary_post_set",
+        observed_cpu.0,
+        crate::arch::aarch64::read_mpidr_el1()
+    );
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
     kernel.program_timer_deadline_current_cpu(
         crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,

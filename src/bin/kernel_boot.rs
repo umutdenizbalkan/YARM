@@ -18,6 +18,17 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
     yarm::arch::boot_entry::release_secondary_cpus_after_bootstrap();
     yarm::yarm_log!("BSP_POST_RELEASE cpu={}", cpu.0);
     yarm::yarm_log!("BSP_REDISPATCH_BEGIN cpu={}", cpu.0);
+    let observed_cpu = kernel.current_cpu();
+    if observed_cpu.0 != yarm::arch::platform_constants::BOOTSTRAP_CPU_ID {
+        yarm::yarm_log!(
+            "BSP_CPU_IDENTITY_VIOLATION observed_cpu={} expected_cpu=0",
+            observed_cpu.0
+        );
+    }
+    assert_eq!(
+        observed_cpu.0,
+        yarm::arch::platform_constants::BOOTSTRAP_CPU_ID
+    );
 
     let initial = kernel.dispatch_ready_task().ok().flatten();
     yarm::yarm_log!("BSP_REDISPATCH_SELECTED tid={:?}", initial);
