@@ -478,17 +478,24 @@ impl KernelState {
                 }
             }
             if cfg!(not(feature = "hosted-dev")) {
-                if tid == BOOTSTRAP_FIRST_USER_TID
-                    && self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
-                {
+                let lctx_bsp_tid1 = tid == BOOTSTRAP_FIRST_USER_TID
+                    && self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
+                if lctx_bsp_tid1 {
                     crate::yarm_log!("LCTX0 after aspace switch tid={}", tid);
                     crate::yarm_log!("LCTX1 before reading task/tcb pointer tid={}", tid);
+                    crate::yarm_log!("LCTX1A before with_tcbs tid={}", tid);
                 }
                 let (task_ptr, kernel_context_ptr, frame_ptr, kernel_stack_top) = self.with_tcbs(|tcbs| {
+                    if lctx_bsp_tid1 {
+                        crate::yarm_log!("LCTX1B after with_tcbs entry tid={}", tid);
+                    }
                     tcbs.iter()
                         .flatten()
                         .find(|tcb| tcb.tid.0 == tid)
                         .map(|tcb| {
+                            if lctx_bsp_tid1 {
+                                crate::yarm_log!("LCTX1C after slot lookup tid={}", tid);
+                            }
                             (
                                 tcb as *const _ as usize,
                                 &tcb.kernel_context as *const _ as usize,
@@ -498,9 +505,7 @@ impl KernelState {
                         })
                         .unwrap_or((0, 0, 0, 0))
                 });
-                if tid == BOOTSTRAP_FIRST_USER_TID
-                    && self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
-                {
+                if lctx_bsp_tid1 {
                     crate::yarm_log!(
                         "LCTX2 after reading task/tcb/context pointer tid={} task_ptr=0x{:x} kernel_ctx_ptr=0x{:x} frame_ptr=0x{:x} kernel_stack_top=0x{:x}",
                         tid,
