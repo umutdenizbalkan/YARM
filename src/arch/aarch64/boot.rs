@@ -961,11 +961,6 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
         );
     }
     assert_eq!(observed_cpu.0, cpu.0);
-    crate::yarm_log!(
-        "GET_CURRENT_CPU cpu={} mpidr=0x{:x} src=aarch64_secondary_post_set",
-        observed_cpu.0,
-        crate::arch::aarch64::read_mpidr_el1()
-    );
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
     kernel.program_timer_deadline_current_cpu(
         crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,

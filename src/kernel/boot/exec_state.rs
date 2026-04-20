@@ -186,25 +186,10 @@ impl KernelState {
         outgoing_tid: Option<u64>,
         incoming_tid: u64,
     ) -> Result<(), KernelError> {
-        let trace_first_user =
-            cfg!(not(feature = "hosted-dev")) && incoming_tid == BOOTSTRAP_FIRST_USER_TID;
-        if trace_first_user {
-            crate::yarm_log!(
-                "MK0 entry out_tid={:?} in_tid={}",
-                outgoing_tid,
-                incoming_tid
-            );
-        }
         let Some(outgoing_tid) = outgoing_tid else {
-            if trace_first_user {
-                crate::yarm_log!("MK2 early_return reason=no_outgoing_tid");
-            }
             return Ok(());
         };
         if outgoing_tid == incoming_tid {
-            if trace_first_user {
-                crate::yarm_log!("MK2 early_return reason=outgoing_equals_incoming");
-            }
             return Ok(());
         }
 
@@ -221,49 +206,7 @@ impl KernelState {
             })
             .ok_or(KernelError::TaskMissing)?;
 
-        let (out_has_kctx, in_has_kctx) = self.with_tcbs(|tcbs| {
-            let out = tcbs
-                .get(outgoing_idx)
-                .and_then(Option::as_ref)
-                .map(|tcb| tcb.kernel_context.initialized)
-                .unwrap_or(false);
-            let incoming = tcbs
-                .get(incoming_idx)
-                .and_then(Option::as_ref)
-                .map(|tcb| tcb.kernel_context.initialized)
-                .unwrap_or(false);
-            (out, incoming)
-        });
-        let do_switch = outgoing_idx != incoming_idx
-            && out_has_kctx
-            && in_has_kctx
-            && incoming_tid != BOOTSTRAP_FIRST_USER_TID;
-        if trace_first_user {
-            crate::yarm_log!(
-                "MK_CLASSIFY out_tid={} in_tid={} out_has_kctx={} in_has_kctx={} do_switch={}",
-                outgoing_tid,
-                incoming_tid,
-                out_has_kctx as u8,
-                in_has_kctx as u8,
-                do_switch as u8
-            );
-            crate::yarm_log!(
-                "MK1 classified outgoing_idx={} incoming_idx={}",
-                outgoing_idx,
-                incoming_idx
-            );
-        }
-
         if outgoing_idx == incoming_idx {
-            if trace_first_user {
-                crate::yarm_log!("MK2 early_return reason=same_tcb_slot");
-            }
-            return Ok(());
-        }
-        if !do_switch {
-            if trace_first_user {
-                crate::yarm_log!("MK2 early_return reason=skip_kernel_frame_switch");
-            }
             return Ok(());
         }
 
@@ -288,18 +231,7 @@ impl KernelState {
 
             if !outgoing_tcb.kernel_context.initialized || !incoming_tcb.kernel_context.initialized
             {
-                if trace_first_user {
-                    crate::yarm_log!("MK2 early_return reason=kernel_context_uninitialized");
-                }
                 return Ok(());
-            }
-            if trace_first_user {
-                crate::yarm_log!(
-                    "MK3 before low_level_switch out_frame=0x{:x} in_frame=0x{:x} in_stack_top=0x{:x}",
-                    &outgoing_tcb.kernel_context.frame as *const _ as usize,
-                    &incoming_tcb.kernel_context.frame as *const _ as usize,
-                    incoming_tcb.kernel_context.stack_top.map(|top| top.0).unwrap_or(0)
-                );
             }
 
             crate::arch::selected_isa::context_switch::switch_frames(
@@ -307,9 +239,6 @@ impl KernelState {
                 &incoming_tcb.kernel_context.frame,
                 incoming_tcb.kernel_context.stack_top.map(|top| top.0),
             );
-            if trace_first_user {
-                crate::yarm_log!("MK4 after low_level_switch");
-            }
             Ok(())
         })
     }
@@ -568,6 +497,15 @@ impl KernelState {
                     context_ptr,
                     kernel_stack_top,
                     event_id
+                );
+                if tid == BOOTSTRAP_FIRST_USER_TID {
+                    crate::yarm_log!("BCTX0 after loading context log tid={}", tid);
+                }
+            }
+            if cfg!(not(feature = "hosted-dev")) && tid == BOOTSTRAP_FIRST_USER_TID {
+                crate::yarm_log!(
+                    "BCTX1 before cpu-ownership/context-restore gate tid={}",
+                    tid
                 );
             }
             let current_cpu = self.current_cpu();
