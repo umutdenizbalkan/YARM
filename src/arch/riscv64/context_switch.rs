@@ -33,34 +33,6 @@ yarm_riscv64_switch_frame:
     sd ra, 8(a0)
     sd sp, 0(a0)
 
-    // Save callee-saved floating-point registers (if F/D is enabled).
-    fsd fs0, 128(a0)
-    fsd fs1, 136(a0)
-    fsd fs2, 144(a0)
-    fsd fs3, 152(a0)
-    fsd fs4, 160(a0)
-    fsd fs5, 168(a0)
-    fsd fs6, 176(a0)
-    fsd fs7, 184(a0)
-    fsd fs8, 192(a0)
-    fsd fs9, 200(a0)
-    fsd fs10, 208(a0)
-    fsd fs11, 216(a0)
-
-    // Restore callee-saved floating-point registers from next frame.
-    fld fs0, 128(a1)
-    fld fs1, 136(a1)
-    fld fs2, 144(a1)
-    fld fs3, 152(a1)
-    fld fs4, 160(a1)
-    fld fs5, 168(a1)
-    fld fs6, 176(a1)
-    fld fs7, 184(a1)
-    fld fs8, 192(a1)
-    fld fs9, 200(a1)
-    fld fs10, 208(a1)
-    fld fs11, 216(a1)
-
     // Restore callee-saved integer registers.
     ld s0, 16(a1)
     ld s1, 24(a1)

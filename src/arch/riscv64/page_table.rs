@@ -3,7 +3,7 @@
 
 use crate::arch::riscv64::vm_layout;
 use crate::kernel::frame_allocator::{alloc_pt_frame, free_pt_frame};
-use crate::kernel::lock::{SpinLock, SpinLockIrq};
+use crate::kernel::lock::SpinLockIrq;
 use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr};
 
 const ENTRIES_PER_TABLE: usize = 512;
