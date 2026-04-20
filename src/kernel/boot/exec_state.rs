@@ -483,6 +483,10 @@ impl KernelState {
                 if lctx_bsp_tid1 {
                     crate::yarm_log!("LCTX0 after aspace switch tid={}", tid);
                     crate::yarm_log!("LCTX1 before reading task/tcb pointer tid={}", tid);
+                    crate::yarm_log!("GX0 immediately after LCTX1");
+                    crate::yarm_log!("GX1 before evaluating next helper/breadcrumb");
+                    crate::yarm_log!("GX2 before preparing any with_tcbs pre-call references");
+                    crate::yarm_log!("GX3 immediately before WX0");
                     crate::yarm_log!("LCTX1A before with_tcbs tid={}", tid);
                     crate::yarm_log!(
                         "WX0 before calling with_tcbs tid={} self_ptr=0x{:x} scheduler_state_ptr=0x{:x} task_lock_ptr=0x{:x} tcbs_storage_ptr=0x{:x}",
