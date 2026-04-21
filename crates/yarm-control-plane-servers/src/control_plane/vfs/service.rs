@@ -297,6 +297,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yarm::std::thread;
     use yarm::kernel::boot::Bootstrap;
     use crate::yarm_fs_servers::devfs::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
     use crate::yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
@@ -315,6 +316,17 @@ mod tests {
         )
     }
 
+    fn run_with_large_stack<F>(f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let handle = thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large-stack test thread");
+        handle.join().expect("join large-stack test thread");
+    }
+
     #[test]
     fn vfs_request_loop_entrypoint_opens_one_fd() {
         let mut vfs = FsService::with_backend(InMemoryBackend::new());
@@ -327,17 +339,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy vfs integration path overflows in hosted-dev unit-test harness"]
     fn vfs_request_loop_can_roundtrip_over_kernel_ipc() {
-        let mut kernel = Bootstrap::init().expect("kernel init");
-        let mut vfs = FsService::with_backend(InMemoryBackend::new());
-        let summary =
-            run_request_loop_over_kernel_ipc(&mut kernel, &mut vfs, 0x1010).expect("loop");
+        run_with_large_stack(|| {
+            let mut kernel = Bootstrap::init().expect("kernel init");
+            let mut vfs = FsService::with_backend(InMemoryBackend::new());
+            let summary =
+                run_request_loop_over_kernel_ipc(&mut kernel, &mut vfs, 0x1010).expect("loop");
 
-        assert_eq!(summary.fd, 3);
-        assert_eq!(summary.dup_fd, 4);
-        assert_eq!(summary.epoll_fd, 5);
-        assert_eq!(summary.handled, 15);
+            assert_eq!(summary.fd, 3);
+            assert_eq!(summary.dup_fd, 4);
+            assert_eq!(summary.epoll_fd, 5);
+            assert_eq!(summary.handled, 15);
+        });
     }
 
     #[test]

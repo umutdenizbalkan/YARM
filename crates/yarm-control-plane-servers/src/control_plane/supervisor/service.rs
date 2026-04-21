@@ -756,23 +756,24 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::kernel::boot::Bootstrap;
+    use yarm::std::thread;
+        use yarm::kernel::boot::Bootstrap;
     use yarm::kernel::task::{TaskClass, TaskStatus};
     use yarm::kernel::vm::PAGE_SIZE;
     use yarm::services::init::{CoreServiceGraph, CoreServiceImagePlan, InitService};
     use yarm_ipc_abi::supervisor_abi::{
-        InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
+        CoreServiceRegistrationKind, InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
         SupervisorStatusRequest, TransferRevokedEvent,
     };
 
     fn setup_supervisor() -> (
         yarm::std::boxed::Box<KernelState>,
-        InitService,
+        yarm::std::boxed::Box<InitService>,
         InitFaultHandoff,
-        SupervisorService,
+        yarm::std::boxed::Box<SupervisorService>,
     ) {
         let mut kernel = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
-        let mut init = InitService::new();
+        let mut init = yarm::std::boxed::Box::new(InitService::new());
         let graph = CoreServiceGraph {
             init_tid: 1,
             process_manager_tid: 2,
@@ -794,8 +795,20 @@ mod tests {
             .expect("handoff");
         init.seed_supervisor_registrations(&mut kernel)
             .expect("seed");
-        let supervisor = SupervisorService::new(1, handoff, init.restart_policies());
+        let supervisor =
+            yarm::std::boxed::Box::new(SupervisorService::new(1, handoff, init.restart_policies()));
         (kernel, init, handoff, supervisor)
+    }
+
+    fn run_with_large_stack<F>(f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let handle = thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large-stack test thread");
+        handle.join().expect("join large-stack test thread");
     }
 
     #[test]
@@ -808,13 +821,93 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy supervisor integration path overflows in hosted-dev unit-test harness"]
     fn long_running_loop_registers_services_from_init_requests() {
-        let (mut kernel, _init, _handoff, mut supervisor) = setup_supervisor();
-        assert_eq!(supervisor.run_until_idle(&mut kernel).expect("loop"), 3);
-        assert!(supervisor.status_for(2).is_some());
-        assert!(supervisor.status_for(3).is_some());
-        assert!(supervisor.status_for(4).is_some());
+        run_with_large_stack(|| {
+            let mut kernel = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
+            let (_, _supervisor_fault_send_cap, supervisor_fault_recv_cap) =
+                kernel.create_endpoint(8).expect("fault endpoint");
+            let (_, supervisor_control_send_cap, supervisor_control_recv_cap) =
+                kernel.create_endpoint(8).expect("control endpoint");
+            let (_, init_alert_send_cap, init_alert_recv_cap) =
+                kernel.create_endpoint(8).expect("init alert endpoint");
+            let handoff = InitFaultHandoff::new(
+                1,
+                supervisor_fault_recv_cap,
+                supervisor_control_send_cap,
+                supervisor_control_recv_cap,
+                init_alert_send_cap,
+                init_alert_recv_cap,
+                20,
+            );
+            let mut supervisor = yarm::std::boxed::Box::new(SupervisorService::new(
+                1,
+                handoff,
+                CoreServicePolicyTable::baseline(),
+            ));
+
+            let register_proc = Message::with_header(
+                1,
+                SUPERVISOR_OP_REGISTER_CORE_SERVICE,
+                0,
+                None,
+                &RegisterCoreServiceRequest {
+                    tid: 2,
+                    kind: CoreServiceRegistrationKind::ProcessManager,
+                    max_restarts: 3,
+                    restart_group: 1,
+                    dependency_mask: 0,
+                    backoff_ticks: 10,
+                }
+                .encode(),
+            )
+            .expect("proc registration");
+            let register_vfs = Message::with_header(
+                1,
+                SUPERVISOR_OP_REGISTER_CORE_SERVICE,
+                0,
+                None,
+                &RegisterCoreServiceRequest {
+                    tid: 3,
+                    kind: CoreServiceRegistrationKind::Vfs,
+                    max_restarts: 3,
+                    restart_group: 1,
+                    dependency_mask: 0,
+                    backoff_ticks: 10,
+                }
+                .encode(),
+            )
+            .expect("vfs registration");
+            let register_supervisor = Message::with_header(
+                1,
+                SUPERVISOR_OP_REGISTER_CORE_SERVICE,
+                0,
+                None,
+                &RegisterCoreServiceRequest {
+                    tid: 4,
+                    kind: CoreServiceRegistrationKind::Supervisor,
+                    max_restarts: 8,
+                    restart_group: 2,
+                    dependency_mask: 0,
+                    backoff_ticks: 5,
+                }
+                .encode(),
+            )
+            .expect("supervisor registration");
+            kernel
+                .ipc_send(supervisor_control_send_cap, register_proc)
+                .expect("send proc registration");
+            kernel
+                .ipc_send(supervisor_control_send_cap, register_vfs)
+                .expect("send vfs registration");
+            kernel
+                .ipc_send(supervisor_control_send_cap, register_supervisor)
+                .expect("send supervisor registration");
+
+            assert_eq!(supervisor.run_until_idle(&mut kernel).expect("loop"), 3);
+            assert!(supervisor.status_for(2).is_some());
+            assert!(supervisor.status_for(3).is_some());
+            assert!(supervisor.status_for(4).is_some());
+        });
     }
 
     #[test]
