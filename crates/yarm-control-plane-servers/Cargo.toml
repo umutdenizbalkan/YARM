@@ -13,6 +13,8 @@ hosted-dev = ["yarm/hosted-dev"]
 [dependencies]
 yarm = { path = "../..", default-features = false }
 yarm-fs-servers = { path = "../yarm-fs-servers", default-features = false }
+yarm-ipc-abi = { path = "../yarm-ipc-abi" }
+yarm-srv-common = { path = "../yarm-srv-common" }
 
 [lib]
 path = "src/lib.rs"

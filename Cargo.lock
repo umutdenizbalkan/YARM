@@ -25,6 +25,8 @@ version = "0.1.0"
 dependencies = [
  "yarm",
  "yarm-fs-servers",
+ "yarm-ipc-abi",
+ "yarm-srv-common",
 ]
 
 [[package]]
@@ -39,6 +41,8 @@ name = "yarm-fs-servers"
 version = "0.1.0"
 dependencies = [
  "yarm",
+ "yarm-ipc-abi",
+ "yarm-srv-common",
 ]
 
 [[package]]

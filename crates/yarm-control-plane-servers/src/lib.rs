@@ -3,20 +3,22 @@
 
 #![no_std]
 
+pub mod control_plane;
+
 pub fn run_init_server() {
-    yarm::services::control_plane::init::run();
+    control_plane::init::run();
 }
 
 pub fn run_process_manager() {
-    yarm::services::control_plane::process_manager::run();
+    control_plane::process_manager::run();
 }
 
 pub fn run_vfs_server() {
-    yarm::services::control_plane::vfs::run();
+    control_plane::vfs::run();
 }
 
 pub fn run_supervisor_server() {
-    yarm::services::control_plane::supervisor::run();
+    control_plane::supervisor::run();
 }
 
 pub fn run_driver_manager_demo() {
@@ -39,4 +41,27 @@ pub fn run_driver_manager_demo() {
         .expect("batch");
 
     yarm::yarm_log!("driver-manager demo ready: handled={}", handled);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn control_plane_impl_does_not_delegate_back_to_legacy_control_plane_or_fs_namespaces() {
+        let init_src = include_str!("control_plane/init/service.rs");
+        let proc_src = include_str!("control_plane/process_manager/service.rs");
+        let sup_src = include_str!("control_plane/supervisor/service.rs");
+        let vfs_src = include_str!("control_plane/vfs/service.rs");
+        let legacy_cp = ["yarm", "::services::", "control_plane::"].concat();
+        let legacy_fs = ["yarm", "::services::", "fs::"].concat();
+        for src in [init_src, proc_src, sup_src, vfs_src] {
+            assert!(
+                !src.contains(legacy_cp.as_str()),
+                "workspace control-plane impl must not delegate to legacy control_plane namespace"
+            );
+            assert!(
+                !src.contains(legacy_fs.as_str()),
+                "workspace control-plane impl must not delegate to legacy fs namespace"
+            );
+        }
+    }
 }
