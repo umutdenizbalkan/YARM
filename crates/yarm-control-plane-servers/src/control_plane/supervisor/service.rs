@@ -1033,45 +1033,91 @@ mod tests {
     #[test]
     #[ignore = "stack-heavy supervisor integration path overflows in hosted-dev unit-test harness"]
     fn automatic_driver_redelegation_runs_after_restart() {
-        let (mut kernel, mut init, _handoff, mut supervisor) = setup_supervisor();
-        kernel
-            .register_task_with_class(20, TaskClass::Driver)
-            .expect("task 20");
-        kernel.register_driver(20).expect("driver");
-        let (_id, mem) = kernel.alloc_anonymous_memory_object().expect("mem");
-        let iova = kernel.create_iova_space_cap().expect("iova");
-        init.register_driver_with_supervisor(
-            &mut kernel,
-            RegisterDriverRequest {
-                tid: 20,
-                max_restarts: 2,
-                restart_group: 2,
-                dependency_mask: DEP_VFS,
-                backoff_ticks: 3,
-                irq_line: 5,
-                mem_cap: mem.0,
-                iova_cap: iova.0,
-                iova_base: 0x4000,
-                dma_len: PAGE_SIZE as u64,
-                iova_len: PAGE_SIZE as u64,
-            },
-        )
-        .expect("register");
-        supervisor.run_until_idle(&mut kernel).expect("loop");
-
-        let token = kernel.exit_task(20, 11).expect("exit");
-        let _ = supervisor
-            .handle_task_exit(
-                &mut kernel,
-                TaskExitedEvent {
-                    tid: 20,
-                    exit_code: 11,
-                    restart_token: token,
-                },
+        run_with_large_stack(|| {
+            let mut kernel = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
+            let (_, _supervisor_fault_send_cap, supervisor_fault_recv_cap) =
+                kernel.create_endpoint(8).expect("fault endpoint");
+            let (_, supervisor_control_send_cap, supervisor_control_recv_cap) =
+                kernel.create_endpoint(8).expect("control endpoint");
+            let (_, init_alert_send_cap, init_alert_recv_cap) =
+                kernel.create_endpoint(8).expect("init alert endpoint");
+            let handoff = InitFaultHandoff::new(
+                1,
+                supervisor_fault_recv_cap,
+                supervisor_control_send_cap,
+                supervisor_control_recv_cap,
+                init_alert_send_cap,
+                init_alert_recv_cap,
+                20,
+            );
+            let mut supervisor = yarm::std::boxed::Box::new(SupervisorService::new(
+                1,
+                handoff,
+                CoreServicePolicyTable::baseline(),
+            ));
+            let register_vfs = Message::with_header(
+                1,
+                SUPERVISOR_OP_REGISTER_CORE_SERVICE,
+                0,
+                None,
+                &RegisterCoreServiceRequest {
+                    tid: 3,
+                    kind: CoreServiceRegistrationKind::Vfs,
+                    max_restarts: 3,
+                    restart_group: 1,
+                    dependency_mask: 0,
+                    backoff_ticks: 10,
+                }
+                .encode(),
             )
-            .expect("schedule");
-        supervisor.run_until_idle(&mut kernel).expect("restart");
-        assert!(!supervisor.pending_redelegation(20));
+            .expect("vfs registration");
+            let register_driver = Message::with_header(
+                1,
+                SUPERVISOR_OP_REGISTER_DRIVER,
+                0,
+                None,
+                &RegisterDriverRequest {
+                    tid: 20,
+                    max_restarts: 2,
+                    restart_group: 2,
+                    dependency_mask: DEP_VFS,
+                    backoff_ticks: 3,
+                    irq_line: 5,
+                    mem_cap: 0,
+                    iova_cap: 0,
+                    iova_base: 0x4000,
+                    dma_len: PAGE_SIZE as u64,
+                    iova_len: PAGE_SIZE as u64,
+                }
+                .encode(),
+            )
+            .expect("driver registration");
+            kernel
+                .ipc_send(supervisor_control_send_cap, register_vfs)
+                .expect("send vfs registration");
+            kernel
+                .ipc_send(supervisor_control_send_cap, register_driver)
+                .expect("send driver registration");
+            kernel
+                .register_task_with_class(20, TaskClass::Driver)
+                .expect("task 20");
+            kernel.register_driver(20).expect("driver");
+            supervisor.run_until_idle(&mut kernel).expect("loop");
+
+            let token = kernel.exit_task(20, 11).expect("exit");
+            let _ = supervisor
+                .handle_task_exit(
+                    &mut kernel,
+                    TaskExitedEvent {
+                        tid: 20,
+                        exit_code: 11,
+                        restart_token: token,
+                    },
+                )
+                .expect("schedule");
+            supervisor.run_until_idle(&mut kernel).expect("restart");
+            assert!(!supervisor.pending_redelegation(20));
+        });
     }
 
     #[test]
@@ -1126,25 +1172,69 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy supervisor integration path overflows in hosted-dev unit-test harness"]
     fn status_tracks_last_exit_and_restart_schedule() {
-        let (mut kernel, _init, _handoff, mut supervisor) = setup_supervisor();
-        supervisor.run_until_idle(&mut kernel).expect("loop");
-        let token = kernel.exit_task(2, 44).expect("exit");
-        let _ = supervisor
-            .handle_task_exit(
-                &mut kernel,
-                TaskExitedEvent {
+        run_with_large_stack(|| {
+            let mut kernel = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
+            let (_, _supervisor_fault_send_cap, supervisor_fault_recv_cap) =
+                kernel.create_endpoint(8).expect("fault endpoint");
+            let (_, supervisor_control_send_cap, supervisor_control_recv_cap) =
+                kernel.create_endpoint(8).expect("control endpoint");
+            let (_, init_alert_send_cap, init_alert_recv_cap) =
+                kernel.create_endpoint(8).expect("init alert endpoint");
+            let handoff = InitFaultHandoff::new(
+                1,
+                supervisor_fault_recv_cap,
+                supervisor_control_send_cap,
+                supervisor_control_recv_cap,
+                init_alert_send_cap,
+                init_alert_recv_cap,
+                20,
+            );
+            let mut supervisor = yarm::std::boxed::Box::new(SupervisorService::new(
+                1,
+                handoff,
+                CoreServicePolicyTable::baseline(),
+            ));
+            let register_proc = Message::with_header(
+                1,
+                SUPERVISOR_OP_REGISTER_CORE_SERVICE,
+                0,
+                None,
+                &RegisterCoreServiceRequest {
                     tid: 2,
-                    exit_code: 44,
-                    restart_token: token,
-                },
+                    kind: CoreServiceRegistrationKind::ProcessManager,
+                    max_restarts: 3,
+                    restart_group: 1,
+                    dependency_mask: 0,
+                    backoff_ticks: 10,
+                }
+                .encode(),
             )
-            .expect("schedule");
-        let status = supervisor.status_for(2).expect("status");
-        assert_eq!(status.last_exit_code, 44);
-        assert_eq!(status.last_exit_tick, 0);
-        assert_eq!(status.pending_restart_due, 10);
+            .expect("proc registration");
+            kernel
+                .ipc_send(supervisor_control_send_cap, register_proc)
+                .expect("send proc registration");
+            kernel
+                .register_task_with_class(2, TaskClass::SystemServer)
+                .expect("task 2");
+            supervisor.run_until_idle(&mut kernel).expect("loop");
+
+            let token = kernel.exit_task(2, 44).expect("exit");
+            let _ = supervisor
+                .handle_task_exit(
+                    &mut kernel,
+                    TaskExitedEvent {
+                        tid: 2,
+                        exit_code: 44,
+                        restart_token: token,
+                    },
+                )
+                .expect("schedule");
+            let status = supervisor.status_for(2).expect("status");
+            assert_eq!(status.last_exit_code, 44);
+            assert_eq!(status.last_exit_tick, 0);
+            assert_eq!(status.pending_restart_due, 10);
+        });
     }
 
     #[test]
