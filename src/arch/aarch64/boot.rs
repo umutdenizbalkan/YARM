@@ -229,6 +229,8 @@ yarm_aarch64_vector_table_el1:
     .global \name
     .type \name,%function
 \name:
+    sub sp, sp, #16
+    str x0, [sp, #0]
     mov x0, #\kind
     b yarm_aarch64_vector_dispatch
     .endm
@@ -278,6 +280,8 @@ yarm_aarch64_vector_dispatch:
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
     str x30, [sp, #240]
+    ldr x9, [sp, #800]
+    str x9, [sp, #0]
     mrs x9, sp_el0
     str x9, [sp, #248]
     mrs x9, elr_el1
@@ -345,7 +349,7 @@ yarm_aarch64_vector_dispatch:
     ldp x4, x5, [sp, #32]
     ldp x2, x3, [sp, #16]
     ldp x0, x1, [sp, #0]
-    add sp, sp, #800
+    add sp, sp, #816
     eret
     "#
 );
