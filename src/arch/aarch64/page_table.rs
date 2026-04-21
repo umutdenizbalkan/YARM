@@ -247,6 +247,23 @@ fn copy_bootstrap_kernel_root_entries(
     Ok(())
 }
 
+#[cfg(all(not(feature = "hosted-dev"), not(test), target_arch = "aarch64"))]
+#[inline]
+fn raw_uart_marker(tag: u8) {
+    const UART_BASE: usize = 0x0900_0000;
+    const PL011_DR: usize = 0x000;
+    const PL011_FR: usize = 0x018;
+    const PL011_FR_TXFF: u32 = 1 << 5;
+    unsafe {
+        while core::ptr::read_volatile((UART_BASE + PL011_FR) as *const u32) & PL011_FR_TXFF != 0 {}
+        core::ptr::write_volatile((UART_BASE + PL011_DR) as *mut u32, tag as u32);
+    }
+}
+
+#[cfg(any(feature = "hosted-dev", test, not(target_arch = "aarch64")))]
+#[inline]
+fn raw_uart_marker(_tag: u8) {}
+
 static PAGE_TABLE_STATE: SpinLockIrq<PageTableState> = SpinLockIrq::new(PageTableState::new());
 
 pub fn reset_state() {
@@ -391,14 +408,27 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     crate::yarm_log!("ASW1 after computing TTBR0 asid={} ttbr0=0x{:x}", asid.0, ttbr0);
     #[cfg(not(feature = "hosted-dev"))]
     unsafe {
+        let sp: u64;
+        core::arch::asm!("mov {0}, sp", out(reg) sp, options(nostack, preserves_flags));
+        let pc_sym = activate_asid as usize as u64;
+        let asw3_msg_ptr = b"ASW3_RAW".as_ptr() as u64;
+        crate::yarm_log!(
+            "ASW1V switch_va_snapshot asid={} pc_sym=0x{:x} sp=0x{:x} asw3_msg_ptr=0x{:x}",
+            asid.0,
+            pc_sym,
+            sp,
+            asw3_msg_ptr
+        );
         crate::yarm_log!("ASW2 before msr ttbr0_el1 asid={} ttbr0=0x{:x}", asid.0, ttbr0);
         core::arch::asm!(
             "msr ttbr0_el1, {value}",
             value = in(reg) ttbr0,
             options(nostack, preserves_flags)
         );
+        raw_uart_marker(b'3');
         crate::yarm_log!("ASW3 immediately after msr ttbr0_el1 asid={}", asid.0);
         core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+        raw_uart_marker(b'4');
         crate::yarm_log!("ASW4 after barriers/isb asid={}", asid.0);
     }
     Ok(ttbr0)
