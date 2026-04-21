@@ -304,7 +304,7 @@ pub fn remove_asid_root(asid: Asid) {
         if let Some(root) = state.asids[slot] {
             let mut stack: [(u64, usize); MAX_PT_PAGES] = [(0, 0); MAX_PT_PAGES];
             let mut sp = 0usize;
-            stack[sp] = (root.root_phys, 4);
+            stack[sp] = (root.root_phys, 3);
             sp += 1;
             while sp > 0 {
                 sp -= 1;
@@ -373,17 +373,15 @@ pub fn map_page(
 
     let mut state = PAGE_TABLE_STATE.lock();
     let root = state.ensure_asid(asid)?;
-    let l0 = level_index(virt.0, 39);
     let l1 = level_index(virt.0, 30);
     let l2 = level_index(virt.0, 21);
     let l3 = level_index(virt.0, 12);
 
-    let next1 = walk_or_create(&mut state, root, l0, flags)?;
-    let next2 = walk_or_create(&mut state, next1, l1, flags)?;
-    let next3 = walk_or_create(&mut state, next2, l2, flags)?;
+    let next1 = walk_or_create(&mut state, root, l1, flags)?;
+    let next2 = walk_or_create(&mut state, next1, l2, flags)?;
 
     let leaf_idx = state
-        .page_index_from_phys(next3)
+        .page_index_from_phys(next2)
         .ok_or(PageTableError::InvalidAddress)?;
     let prev = read_table_entry(&mut state, leaf_idx, l3)?;
     write_table_entry(
@@ -401,13 +399,12 @@ pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     let mut state = PAGE_TABLE_STATE.lock();
     let mut table_phys = state.root_for_asid(asid)?;
     let levels = [
-        level_index(virt.0, 39),
         level_index(virt.0, 30),
         level_index(virt.0, 21),
         level_index(virt.0, 12),
     ];
 
-    for &level in &levels[..3] {
+    for &level in &levels[..2] {
         let idx = state.page_index_from_phys(table_phys)?;
         let entry = read_table_entry(&mut state, idx, level).ok()?;
         if !entry.is_present() {
@@ -417,11 +414,11 @@ pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     }
 
     let leaf_idx = state.page_index_from_phys(table_phys)?;
-    let old = read_table_entry(&mut state, leaf_idx, levels[3]).ok()?;
+    let old = read_table_entry(&mut state, leaf_idx, levels[2]).ok()?;
     if !old.is_present() {
         return None;
     }
-    write_table_entry(&mut state, leaf_idx, levels[3], PageTableEntry::empty()).ok()?;
+    write_table_entry(&mut state, leaf_idx, levels[2], PageTableEntry::empty()).ok()?;
     drop(state);
     invalidate_page(virt);
     Some(old)
@@ -431,13 +428,12 @@ pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     let mut state = PAGE_TABLE_STATE.lock();
     let mut table_phys = state.root_for_asid(asid)?;
     let levels = [
-        level_index(virt.0, 39),
         level_index(virt.0, 30),
         level_index(virt.0, 21),
         level_index(virt.0, 12),
     ];
 
-    for &level in &levels[..3] {
+    for &level in &levels[..2] {
         let idx = state.page_index_from_phys(table_phys)?;
         let entry = read_table_entry(&mut state, idx, level).ok()?;
         if !entry.is_present() {
@@ -447,7 +443,7 @@ pub fn resolve_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     }
 
     let leaf_idx = state.page_index_from_phys(table_phys)?;
-    let entry = read_table_entry(&mut state, leaf_idx, levels[3]).ok()?;
+    let entry = read_table_entry(&mut state, leaf_idx, levels[2]).ok()?;
     entry.is_present().then_some(entry)
 }
 
