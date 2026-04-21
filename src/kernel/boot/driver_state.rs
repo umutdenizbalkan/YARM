@@ -24,6 +24,15 @@ pub struct DriverRedelegationDebug {
 }
 
 impl KernelState {
+    fn owner_tid_for_cap(&self, cap: CapId) -> Option<u64> {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .map(|tcb| tcb.tid.0)
+                .find(|tid| self.task_capability(*tid, cap).is_some())
+        })
+    }
+
     pub fn debug_driver_redelegation_context(
         &self,
         source_tid: u64,
@@ -90,10 +99,17 @@ impl KernelState {
     }
 
     pub fn grant_driver_irq(&mut self, tid: u64, irq_cap: CapId) -> Result<CapId, KernelError> {
-        let capability = self
-            .capability_service()
-            .resolve_current_task_capability(irq_cap)
-            .ok_or(KernelError::InvalidCapability)?;
+        let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        self.grant_driver_irq_from(source_tid, tid, irq_cap)
+    }
+
+    fn grant_driver_irq_from(
+        &mut self,
+        source_tid: u64,
+        tid: u64,
+        irq_cap: CapId,
+    ) -> Result<CapId, KernelError> {
+        let capability = self.resolve_capability_for_task(source_tid, irq_cap)?;
         match capability.object {
             CapObject::Irq { .. } => {}
             _ => return Err(KernelError::WrongObject),
@@ -101,7 +117,6 @@ impl KernelState {
         if !capability.has_right(CapRights::SIGNAL) {
             return Err(KernelError::MissingRight);
         }
-        let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self
             .capability_service_mut()
             .grant_task_to_task_with_rights(source_tid, irq_cap, tid, CapRights::SIGNAL)?;
@@ -130,6 +145,14 @@ impl KernelState {
         ))
     }
 
+    fn mint_irq_cap_for_task(&mut self, source_tid: u64, line: u16) -> Result<CapId, KernelError> {
+        let source_cnode = self.task_cnode(source_tid).ok_or(KernelError::TaskMissing)?;
+        self.mint_capability_in_cnode(
+            source_cnode,
+            Capability::new(CapObject::Irq { line }, CapRights::SIGNAL),
+        )
+    }
+
     pub fn create_iova_space_cap(&mut self) -> Result<CapId, KernelError> {
         let id = self.with_driver_state_mut(|driver| {
             let id = driver.next_iova_space_id;
@@ -147,16 +170,21 @@ impl KernelState {
         tid: u64,
         iova_cap: CapId,
     ) -> Result<CapId, KernelError> {
-        let capability = self
-            .capability_service()
-            .resolve_current_task_capability(iova_cap)
-            .ok_or(KernelError::InvalidCapability)?;
+        let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        self.grant_driver_iova_space_from(source_tid, tid, iova_cap)
+    }
+
+    fn grant_driver_iova_space_from(
+        &mut self,
+        source_tid: u64,
+        tid: u64,
+        iova_cap: CapId,
+    ) -> Result<CapId, KernelError> {
+        let capability = self.resolve_capability_for_task(source_tid, iova_cap)?;
         match capability.object {
             CapObject::IovaSpace { .. } => {}
             _ => return Err(KernelError::WrongObject),
         }
-
-        let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self
             .capability_service_mut()
             .grant_task_to_task_with_rights(source_tid, iova_cap, tid, CapRights::MAP)?;
@@ -178,10 +206,18 @@ impl KernelState {
         offset: usize,
         len: usize,
     ) -> Result<CapId, KernelError> {
-        let capability = self
-            .capability_service()
-            .resolve_current_task_capability(mem_cap)
-            .ok_or(KernelError::InvalidCapability)?;
+        let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        self.mint_dma_region_cap_for_task(source_tid, mem_cap, offset, len)
+    }
+
+    fn mint_dma_region_cap_for_task(
+        &mut self,
+        source_tid: u64,
+        mem_cap: CapId,
+        offset: usize,
+        len: usize,
+    ) -> Result<CapId, KernelError> {
+        let capability = self.resolve_capability_for_task(source_tid, mem_cap)?;
         let id = match capability.object {
             CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
             _ => return Err(KernelError::WrongObject),
@@ -216,28 +252,37 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
 
-        self.mint_capability_for_current_context(Capability::new(
+        let source_cnode = self.task_cnode(source_tid).ok_or(KernelError::TaskMissing)?;
+        self.mint_capability_in_cnode(
+            source_cnode,
+            Capability::new(
             CapObject::DmaRegion {
                 id,
                 offset: offset as u64,
                 len: len as u64,
             },
             CapRights::MAP | CapRights::READ | CapRights::WRITE,
-        ))
+            ),
+        )
     }
 
     pub fn grant_driver_dma(&mut self, tid: u64, dma_cap: CapId) -> Result<CapId, KernelError> {
-        let capability = self
-            .capability_service()
-            .resolve_current_task_capability(dma_cap)
-            .ok_or(KernelError::InvalidCapability)?;
+        let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        self.grant_driver_dma_from(source_tid, tid, dma_cap)
+    }
+
+    fn grant_driver_dma_from(
+        &mut self,
+        source_tid: u64,
+        tid: u64,
+        dma_cap: CapId,
+    ) -> Result<CapId, KernelError> {
+        let capability = self.resolve_capability_for_task(source_tid, dma_cap)?;
         match capability.object {
             CapObject::DmaRegion { len, .. } if len > 0 => {}
             CapObject::DmaRegion { .. } => return Err(KernelError::WrongObject),
             _ => return Err(KernelError::WrongObject),
         }
-
-        let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self
             .capability_service_mut()
             .grant_task_to_task_with_rights(
@@ -269,15 +314,20 @@ impl KernelState {
         plan: DeviceServerDelegation,
     ) -> Result<(CapId, CapId, CapId), KernelError> {
         self.register_driver(plan.server_tid.0)?;
+        let source_tid = self
+            .current_tid()
+            .or_else(|| self.owner_tid_for_cap(plan.mem_cap))
+            .or_else(|| self.owner_tid_for_cap(plan.iova_cap))
+            .ok_or(KernelError::TaskMissing)?;
 
-        let source_irq_cap = self.mint_irq_cap(plan.irq_line)?;
-        let irq_cap = self.grant_driver_irq(plan.server_tid.0, source_irq_cap)?;
+        let source_irq_cap = self.mint_irq_cap_for_task(source_tid, plan.irq_line)?;
+        let irq_cap = self.grant_driver_irq_from(source_tid, plan.server_tid.0, source_irq_cap)?;
 
         let source_dma_cap =
-            self.mint_dma_region_cap(plan.mem_cap, plan.dma_offset, plan.dma_len)?;
-        let dma_cap = self.grant_driver_dma(plan.server_tid.0, source_dma_cap)?;
+            self.mint_dma_region_cap_for_task(source_tid, plan.mem_cap, plan.dma_offset, plan.dma_len)?;
+        let dma_cap = self.grant_driver_dma_from(source_tid, plan.server_tid.0, source_dma_cap)?;
 
-        let iova_cap = self.grant_driver_iova_space(plan.server_tid.0, plan.iova_cap)?;
+        let iova_cap = self.grant_driver_iova_space_from(source_tid, plan.server_tid.0, plan.iova_cap)?;
         self.configure_driver_dma_window(plan.server_tid.0, plan.iova_base, plan.iova_len)?;
 
         Ok((irq_cap, dma_cap, iova_cap))

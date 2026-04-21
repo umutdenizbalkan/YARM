@@ -1065,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "isolated blocker: kernel restart-time driver redelegation still returns TaskMissing in grant path even with deterministic owner-task context"]
+    #[ignore = "isolated blocker: supervisor recv-budget path can consume owner task context and stall restart progression under hosted-dev harness"]
     fn automatic_driver_redelegation_runs_after_restart() {
         run_with_large_stack(|| {
             let mut kernel = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
@@ -1155,19 +1155,12 @@ mod tests {
             assert_eq!(kernel.task_status(20), Some(TaskStatus::Exited(11)));
             assert_eq!(kernel.task_class(20), Some(TaskClass::Driver));
             restore_delegation_owner_context(&mut kernel, owner_tid);
-            match supervisor.run_until_idle(&mut kernel) {
-                Ok(_) => {}
-                Err(err) => {
-                    let debug = kernel.debug_driver_redelegation_context(
-                        owner_tid,
-                        20,
-                        CapId(mem_cap),
-                        CapId(iova_cap),
-                    );
-                    panic!("restart: {err:?}; redelegation_debug={debug:?}");
-                }
-            }
+            let handled = supervisor
+                .run_live_for_ticks(&mut kernel, 8)
+                .expect("restart live");
+            assert!(handled >= 1);
             assert!(!supervisor.pending_redelegation(20));
+            assert_eq!(kernel.task_status(20), Some(TaskStatus::Runnable));
         });
     }
 
