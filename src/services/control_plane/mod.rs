@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+//! Deprecated legacy namespace.
+//! Workspace crates under `crates/` are the runtime dispatch entrypoints.
+
 pub mod init;
 pub(crate) mod ipc_roundtrip;
 pub mod process_manager;

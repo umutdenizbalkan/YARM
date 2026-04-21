@@ -3,5 +3,5 @@
 
 #![no_std]
 fn main() {
-    yarm_server_runtime::control_plane::run_driver_manager_demo();
+    yarm_control_plane_servers::run_driver_manager_demo();
 }

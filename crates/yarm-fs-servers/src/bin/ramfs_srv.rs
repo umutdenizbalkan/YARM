@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm_server_runtime::fs::run_ramfs();
+    yarm_fs_servers::run_ramfs();
 }

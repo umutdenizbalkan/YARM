@@ -23,7 +23,8 @@ dependencies = [
 name = "yarm-control-plane-servers"
 version = "0.1.0"
 dependencies = [
- "yarm-server-runtime",
+ "yarm",
+ "yarm-fs-servers",
 ]
 
 [[package]]
@@ -37,7 +38,7 @@ dependencies = [
 name = "yarm-fs-servers"
 version = "0.1.0"
 dependencies = [
- "yarm-server-runtime",
+ "yarm",
 ]
 
 [[package]]
@@ -67,6 +68,8 @@ name = "yarm-server-runtime"
 version = "0.1.0"
 dependencies = [
  "yarm",
+ "yarm-control-plane-servers",
+ "yarm-fs-servers",
 ]
 
 [[package]]

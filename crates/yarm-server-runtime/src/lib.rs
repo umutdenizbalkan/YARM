@@ -10,67 +10,49 @@ static KERNEL_GLOBAL_ALLOCATOR: yarm::kernel::global_allocator::KernelGlobalAllo
 
 pub mod control_plane {
     pub fn run_init_server() {
-        yarm::services::control_plane::init::run();
+        yarm_control_plane_servers::run_init_server();
     }
 
     pub fn run_process_manager() {
-        yarm::services::control_plane::process_manager::run();
+        yarm_control_plane_servers::run_process_manager();
     }
 
     pub fn run_vfs_server() {
-        yarm::services::control_plane::vfs::run();
+        yarm_control_plane_servers::run_vfs_server();
     }
 
     pub fn run_supervisor_server() {
-        yarm::services::control_plane::supervisor::run();
+        yarm_control_plane_servers::run_supervisor_server();
     }
 
     pub fn run_driver_manager_demo() {
-        use yarm::kernel::boot::Bootstrap;
-        use yarm::kernel::driver_abi::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};
-        use yarm::kernel::driver_manager::DriverService;
-        use yarm::kernel::ipc::Message;
-
-        let mut kernel = Bootstrap::init().expect("init");
-        kernel.register_task(2).expect("task");
-
-        let register = Message::with_header(0, DRIVER_OP_REGISTER, 0, None, &2u64.to_le_bytes())
-            .expect("register msg");
-        let grant = Message::with_header(0, DRIVER_OP_GRANT_IRQ, 0, None, &pack_driver_pair(2, 9))
-            .expect("grant msg");
-
-        let mut service = DriverService::new();
-        let handled = service
-            .handle_batch(&mut kernel, [register, grant])
-            .expect("batch");
-
-        yarm::yarm_log!("driver-manager demo ready: handled={}", handled);
+        yarm_control_plane_servers::run_driver_manager_demo();
     }
 }
 
 pub mod fs {
     pub fn run_devfs() {
-        yarm::services::fs::devfs::run();
+        yarm_fs_servers::run_devfs();
     }
 
     pub fn run_initramfs() {
-        yarm::services::fs::initramfs::run();
+        yarm_fs_servers::run_initramfs();
     }
 
     pub fn run_ramfs() {
-        yarm::services::fs::ramfs::run();
+        yarm_fs_servers::run_ramfs();
     }
 
     pub fn run_ext4() {
-        yarm::services::fs::ext4::run();
+        yarm_fs_servers::run_ext4();
     }
 
     pub fn run_fat() {
-        yarm::services::fs::fat::run();
+        yarm_fs_servers::run_fat();
     }
 
     pub fn run_blkcache() {
-        yarm::services::fs::blkcache::run();
+        yarm_fs_servers::run_blkcache();
     }
 }
 
@@ -139,4 +121,30 @@ pub mod ui {
 #[cfg(feature = "posix-compat")]
 pub fn run_posix_compat_server() {
     yarm::services::compatibility::posix_compat::run();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn scoped_dispatch_is_workspace_crate_routed() {
+        let src = include_str!("lib.rs");
+        let legacy_cp = ["yarm", "::services::", "control_plane::"].concat();
+        let legacy_fs = ["yarm", "::services::", "fs::"].concat();
+        assert!(
+            !src.contains(legacy_cp.as_str()),
+            "server-runtime control-plane dispatch must route via workspace server crate"
+        );
+        assert!(
+            !src.contains(legacy_fs.as_str()),
+            "server-runtime fs dispatch must route via workspace server crate"
+        );
+        assert!(
+            src.contains("yarm_control_plane_servers::"),
+            "server-runtime must depend on control-plane workspace crate dispatch"
+        );
+        assert!(
+            src.contains("yarm_fs_servers::"),
+            "server-runtime must depend on fs workspace crate dispatch"
+        );
+    }
 }

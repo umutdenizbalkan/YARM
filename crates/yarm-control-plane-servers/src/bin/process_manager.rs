@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm_server_runtime::control_plane::run_process_manager();
+    yarm_control_plane_servers::run_process_manager();
 }
