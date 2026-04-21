@@ -9,7 +9,50 @@ use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::vm::VmError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverRedelegationDebug {
+    pub current_tid: Option<u64>,
+    pub source_tid: u64,
+    pub target_tid: u64,
+    pub source_task_exists: bool,
+    pub target_task_exists: bool,
+    pub source_cnode: Option<crate::kernel::capabilities::CNodeId>,
+    pub target_cnode: Option<crate::kernel::capabilities::CNodeId>,
+    pub source_has_mem_cap: bool,
+    pub source_has_iova_cap: bool,
+    pub target_driver_registered: bool,
+}
+
 impl KernelState {
+    pub fn debug_driver_redelegation_context(
+        &self,
+        source_tid: u64,
+        target_tid: u64,
+        mem_cap: CapId,
+        iova_cap: CapId,
+    ) -> DriverRedelegationDebug {
+        let source_cnode = self.task_cnode(source_tid);
+        let target_cnode = self.task_cnode(target_tid);
+        DriverRedelegationDebug {
+            current_tid: self.current_tid(),
+            source_tid,
+            target_tid,
+            source_task_exists: self.task_status(source_tid).is_some(),
+            target_task_exists: self.task_status(target_tid).is_some(),
+            source_cnode,
+            target_cnode,
+            source_has_mem_cap: self.task_capability(source_tid, mem_cap).is_some(),
+            source_has_iova_cap: self.task_capability(source_tid, iova_cap).is_some(),
+            target_driver_registered: self.with_driver_state(|driver| {
+                driver
+                    .driver_records
+                    .iter()
+                    .flatten()
+                    .any(|record| record.tid == ThreadId(target_tid))
+            }),
+        }
+    }
+
     pub fn register_driver(&mut self, tid: u64) -> Result<(), KernelError> {
         self.with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == tid))
             .then_some(())

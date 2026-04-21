@@ -1153,8 +1153,20 @@ mod tests {
                 )
                 .expect("schedule");
             assert_eq!(kernel.task_status(20), Some(TaskStatus::Exited(11)));
+            assert_eq!(kernel.task_class(20), Some(TaskClass::Driver));
             restore_delegation_owner_context(&mut kernel, owner_tid);
-            supervisor.run_until_idle(&mut kernel).expect("restart");
+            match supervisor.run_until_idle(&mut kernel) {
+                Ok(_) => {}
+                Err(err) => {
+                    let debug = kernel.debug_driver_redelegation_context(
+                        owner_tid,
+                        20,
+                        CapId(mem_cap),
+                        CapId(iova_cap),
+                    );
+                    panic!("restart: {err:?}; redelegation_debug={debug:?}");
+                }
+            }
             assert!(!supervisor.pending_redelegation(20));
         });
     }
