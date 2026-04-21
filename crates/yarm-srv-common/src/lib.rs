@@ -5,3 +5,4 @@
 
 pub mod decode;
 pub mod vfs_reply;
+pub mod vfs_core;

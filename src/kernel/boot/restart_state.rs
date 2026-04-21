@@ -2,10 +2,12 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::{KernelError, KernelState};
-use crate::kernel::supervisor_abi::{
-    TaskExitedEvent, TransferRevokedEvent, task_exited_message, transfer_revoked_message,
-};
+use crate::kernel::ipc::Message;
 use crate::kernel::task::{RestartToken, TaskStatus, ThreadDetachState};
+use yarm_ipc_abi::supervisor_abi::{
+    SUPERVISOR_OP_TASK_EXITED, SUPERVISOR_OP_TRANSFER_REVOKED, TaskExitedEvent,
+    TransferRevokedEvent,
+};
 
 impl KernelState {
     pub fn report_task_exit_to_supervisor(
@@ -17,13 +19,17 @@ impl KernelState {
         let Some(endpoint_idx) = self.with_fault_state(|faults| faults.supervisor_endpoint) else {
             return Ok(());
         };
-        let msg = task_exited_message(
+        let msg = Message::with_header(
             0,
-            TaskExitedEvent {
+            SUPERVISOR_OP_TASK_EXITED,
+            0,
+            None,
+            &TaskExitedEvent {
                 tid,
                 exit_code: code,
                 restart_token,
-            },
+            }
+            .encode(),
         )
         .map_err(|_| KernelError::WrongObject)?;
         let endpoint = self
@@ -49,14 +55,18 @@ impl KernelState {
         let Some(endpoint_idx) = self.with_fault_state(|faults| faults.supervisor_endpoint) else {
             return Ok(());
         };
-        let msg = transfer_revoked_message(
+        let msg = Message::with_header(
             0,
-            TransferRevokedEvent {
+            SUPERVISOR_OP_TRANSFER_REVOKED,
+            0,
+            None,
+            &TransferRevokedEvent {
                 owner_pid,
                 cap,
                 base,
                 len,
-            },
+            }
+            .encode(),
         )
         .map_err(|_| KernelError::WrongObject)?;
         let endpoint = self
