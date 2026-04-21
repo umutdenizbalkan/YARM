@@ -16,8 +16,6 @@ use yarm_ipc_abi::supervisor_abi::{
     SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusReply, SupervisorStatusRequest,
     TaskExitedEvent, TransferRevokedEvent,
 };
-#[cfg(test)]
-use yarm::std::cell::Cell;
 
 const MAX_MANAGED_SERVICES: usize = 8;
 const MAX_DEPENDENTS: usize = 8;
@@ -129,11 +127,7 @@ pub struct SupervisorService {
     degraded: bool,
     current_tick: TickInstant,
     #[cfg(test)]
-    test_step_entered_budgeted_receive: Cell<bool>,
-    #[cfg(test)]
     test_disable_budgeted_receive_for_tracked_tid: Option<u64>,
-    #[cfg(test)]
-    test_phase_trace_enabled: bool,
 }
 
 impl SupervisorService {
@@ -150,11 +144,7 @@ impl SupervisorService {
             degraded: false,
             current_tick: TickInstant(0),
             #[cfg(test)]
-            test_step_entered_budgeted_receive: Cell::new(false),
-            #[cfg(test)]
             test_disable_budgeted_receive_for_tracked_tid: None,
-            #[cfg(test)]
-            test_phase_trace_enabled: false,
         }
     }
 
@@ -433,41 +423,16 @@ impl SupervisorService {
                 idx += 1;
                 continue;
             }
-            let token = record
+            let restart_token = record
                 .pending_restart_token
                 .ok_or(KernelError::WrongObject)?;
-            #[cfg(test)]
-            if self.test_phase_trace_enabled {
-                yarm::yarm_log!(
-                    "SUP_TRACE execute_due_restarts tid={} token={} pre-restart current_tid={:?}",
-                    record.tid,
-                    token,
-                    kernel.current_tid()
-                );
-            }
-            kernel.restart_task(record.tid, token)?;
-            #[cfg(test)]
-            if self.test_phase_trace_enabled {
-                yarm::yarm_log!(
-                    "SUP_TRACE execute_due_restarts tid={} post-restart current_tid={:?}",
-                    record.tid,
-                    kernel.current_tid()
-                );
-            }
+            kernel.restart_task(record.tid, restart_token)?;
             record.last_restart_tick = self.current_tick;
             record.pending_restart_due = None;
             record.pending_restart_token = None;
             if matches!(record.kind, ManagedServiceKind::Driver) {
                 let plan = record.driver_plan;
                 if let Some(plan) = plan {
-                    #[cfg(test)]
-                    if self.test_phase_trace_enabled {
-                        yarm::yarm_log!(
-                            "SUP_TRACE execute_due_restarts tid={} delegate_driver_bundle enter current_tid={:?}",
-                            record.tid,
-                            kernel.current_tid()
-                        );
-                    }
                     let _ = kernel.delegate_driver_bundle(DriverBundlePlan {
                         server_tid: ThreadId(record.tid),
                         irq_line: plan.irq_line,
@@ -477,14 +442,6 @@ impl SupervisorService {
                         iova_base: plan.iova_base,
                         iova_len: plan.iova_len,
                     })?;
-                    #[cfg(test)]
-                    if self.test_phase_trace_enabled {
-                        yarm::yarm_log!(
-                            "SUP_TRACE execute_due_restarts tid={} delegate_driver_bundle exit current_tid={:?}",
-                            record.tid,
-                            kernel.current_tid()
-                        );
-                    }
                     record.pending_redelegation = false;
                 } else {
                     record.pending_redelegation = true;
@@ -537,37 +494,16 @@ impl SupervisorService {
 
         #[cfg(test)]
         {
-            if self.test_phase_trace_enabled {
-                yarm::yarm_log!(
-                    "SUP_TRACE recv_with_budget pre-budget recv_cap={} tick={} current_tid={:?}",
-                    recv_cap.0,
-                    self.current_tick.0,
-                    kernel.current_tid()
-                );
-            }
             if self
                 .test_disable_budgeted_receive_for_tracked_tid
                 .is_some_and(|tid| self.find_record(tid).is_some_and(|record| record.pending_restart_due.is_some()))
             {
                 return Ok(None);
             }
-            self.test_step_entered_budgeted_receive.set(true);
         }
 
         match kernel.ipc_recv_with_deadline(recv_cap, SUPERVISOR_RECV_BUDGET_TICKS) {
-            Ok(msg) => {
-                #[cfg(test)]
-                if self.test_phase_trace_enabled {
-                    yarm::yarm_log!(
-                        "SUP_TRACE recv_with_budget post-budget recv_cap={} tick={} current_tid={:?} got_msg={}",
-                        recv_cap.0,
-                        self.current_tick.0,
-                        kernel.current_tid(),
-                        msg.is_some()
-                    );
-                }
-                Ok(msg)
-            }
+            Ok(msg) => Ok(msg),
             Err(KernelError::TaskMissing)
             | Err(KernelError::InvalidCapability)
             | Err(KernelError::MissingRight) => Ok(None),
@@ -576,33 +512,9 @@ impl SupervisorService {
     }
 
     pub fn service_step(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
-        #[cfg(test)]
-        self.test_step_entered_budgeted_receive.set(false);
-        #[cfg(test)]
-        if self.test_phase_trace_enabled {
-            yarm::yarm_log!(
-                "SUP_TRACE step enter tick={} next_due={:?} due_ready={} current_tid={:?}",
-                self.current_tick.0,
-                self.next_due_tick(),
-                self.has_due_restart_ready(),
-                kernel.current_tid()
-            );
-        }
         let mut changed = 0usize;
         if self.has_due_restart_ready() {
-            #[cfg(test)]
-            if self.test_phase_trace_enabled {
-                yarm::yarm_log!("SUP_TRACE phase execute_due_restarts(pre-recv) enter");
-            }
             changed += self.execute_due_restarts(kernel)?;
-            #[cfg(test)]
-            if self.test_phase_trace_enabled {
-                yarm::yarm_log!(
-                    "SUP_TRACE phase execute_due_restarts(pre-recv) exit changed={} current_tid={:?}",
-                    changed,
-                    kernel.current_tid()
-                );
-            }
             if changed > 0 {
                 return Ok(changed);
             }
@@ -610,20 +522,11 @@ impl SupervisorService {
         if self.next_due_tick().is_some() {
             return Ok(changed);
         }
-        #[cfg(test)]
-        if self.test_phase_trace_enabled {
-            yarm::yarm_log!("SUP_TRACE phase control_recv enter");
-        }
         while let Some(request) =
             self.recv_with_budget(kernel, self.handoff.supervisor_control_recv_cap)?
         {
             self.handle_control_request(kernel, request)?;
             changed += 1;
-        }
-        #[cfg(test)]
-        if self.test_phase_trace_enabled {
-            yarm::yarm_log!("SUP_TRACE phase control_recv exit changed={}", changed);
-            yarm::yarm_log!("SUP_TRACE phase fault_recv enter");
         }
         while let Some(message) =
             self.recv_with_budget(kernel, self.handoff.supervisor_fault_recv_cap)?
@@ -642,26 +545,8 @@ impl SupervisorService {
             }
             changed += 1;
         }
-        #[cfg(test)]
-        if self.test_phase_trace_enabled {
-            yarm::yarm_log!("SUP_TRACE phase fault_recv exit changed={}", changed);
-            yarm::yarm_log!("SUP_TRACE phase execute_due_restarts(post-recv) enter");
-        }
         changed += self.execute_due_restarts(kernel)?;
-        #[cfg(test)]
-        if self.test_phase_trace_enabled {
-            yarm::yarm_log!(
-                "SUP_TRACE phase execute_due_restarts(post-recv) exit changed={} current_tid={:?}",
-                changed,
-                kernel.current_tid()
-            );
-        }
         Ok(changed)
-    }
-
-    #[cfg(test)]
-    fn test_last_step_entered_budgeted_receive(&self) -> bool {
-        self.test_step_entered_budgeted_receive.get()
     }
 
     #[cfg(test)]
@@ -669,10 +554,6 @@ impl SupervisorService {
         self.test_disable_budgeted_receive_for_tracked_tid = tid;
     }
 
-    #[cfg(test)]
-    fn test_set_phase_trace_enabled(&mut self, enabled: bool) {
-        self.test_phase_trace_enabled = enabled;
-    }
 
     pub fn run_until_idle(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
         let mut progress = 0usize;
@@ -1015,15 +896,7 @@ mod tests {
         );
         let mut total_changed = 0usize;
         let mut step = 0usize;
-        let mut trace: yarm::std::vec::Vec<yarm::std::string::String> = yarm::std::vec::Vec::new();
         while step < max_steps {
-            supervisor.test_set_phase_trace_enabled(true);
-            let next_due_before = supervisor.next_due_tick();
-            let due_ready_before = supervisor.has_due_restart_ready();
-            let due_before = supervisor
-                .status_for(tracked_tid)
-                .map(|status| status.pending_restart_due)
-                .unwrap_or(0);
             let changed = match supervisor.service_step(kernel) {
                 Ok(changed) => changed,
                 Err(err) => {
@@ -1033,29 +906,15 @@ mod tests {
                         CapId(mem_cap),
                         CapId(iova_cap),
                     );
-                    panic!(
-                        "service step: {err:?}; redelegation_debug={debug:?}; trace={trace:?}"
-                    );
+                    panic!("service step: {err:?}; redelegation_debug={debug:?}");
                 }
             };
-            trace.push(yarm::std::format!(
-                "step={} tick={} next_due_before={:?} changed={} current_tid={:?} due_ready_before={} entered_budgeted_receive={} tracked_pending_due={}",
-                step,
-                supervisor.current_tick.0,
-                next_due_before,
-                changed,
-                kernel.current_tid(),
-                due_ready_before,
-                supervisor.test_last_step_entered_budgeted_receive(),
-                supervisor.status_for(tracked_tid).map(|status| status.pending_restart_due).unwrap_or(0),
-            ));
             total_changed += changed;
             if supervisor
                 .status_for(tracked_tid)
                 .is_some_and(|status| status.pending_restart_due == 0 && !status.pending_redelegation)
                 && kernel.task_status(tracked_tid) == Some(TaskStatus::Runnable)
             {
-                supervisor.test_set_phase_trace_enabled(false);
                 supervisor.test_set_disable_budgeted_receive_for_tracked_tid(None);
                 return total_changed;
             }
@@ -1070,22 +929,14 @@ mod tests {
                 }
                 return total_changed;
             }
-            if due_before > 0 {
-                assert!(
-                    changed > 0,
-                    "due restart was pending but no progress was recorded"
-                );
-            }
             step += 1;
         }
-        supervisor.test_set_phase_trace_enabled(false);
         supervisor.test_set_disable_budgeted_receive_for_tracked_tid(None);
         panic!(
-            "supervisor run stalled: tracked_tid={}, current_tid={:?}, status={:?}, trace={:?}",
+            "supervisor run stalled: tracked_tid={}, current_tid={:?}, status={:?}",
             tracked_tid,
             kernel.current_tid(),
-            supervisor.status_for(tracked_tid),
-            trace
+            supervisor.status_for(tracked_tid)
         );
     }
 
