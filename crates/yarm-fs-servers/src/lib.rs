@@ -4,7 +4,7 @@
 #![no_std]
 
 pub mod fs;
-pub use fs::{devfs, initramfs, ramfs};
+pub use fs::{devfs, ext4, fat, initramfs, ramfs};
 
 pub fn run_devfs() {
     fs::devfs::run();
@@ -19,11 +19,11 @@ pub fn run_ramfs() {
 }
 
 pub fn run_ext4() {
-    yarm::services::fs::ext4::run();
+    fs::ext4::run();
 }
 
 pub fn run_fat() {
-    yarm::services::fs::fat::run();
+    fs::fat::run();
 }
 
 pub fn run_blkcache() {
@@ -37,8 +37,10 @@ mod tests {
         let devfs_src = include_str!("fs/devfs/service.rs");
         let initramfs_src = include_str!("fs/initramfs/service.rs");
         let ramfs_src = include_str!("fs/ramfs/service.rs");
+        let ext4_src = include_str!("fs/ext4/service.rs");
+        let fat_src = include_str!("fs/fat/service.rs");
         let legacy_fs = ["yarm", "::services::", "fs::"].concat();
-        for src in [devfs_src, initramfs_src, ramfs_src] {
+        for src in [devfs_src, initramfs_src, ramfs_src, ext4_src, fat_src] {
             assert!(
                 !src.contains(legacy_fs.as_str()),
                 "workspace scoped fs impl must not delegate to legacy fs namespace"

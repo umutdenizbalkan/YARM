@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::inode::Ext4Inode;
+#![allow(deprecated)]
 
-pub fn find_inode_index(inodes: &[Option<Ext4Inode>], path_ptr: u64) -> Option<usize> {
-    inodes.iter().position(|slot| {
-        slot.map(|inode| inode.path_ptr == path_ptr)
-            .unwrap_or(false)
-    })
-}
+// Legacy shim: authoritative implementation lives in workspace crate source.
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/crates/yarm-fs-servers/src/fs/ext4/dir.rs"
+));

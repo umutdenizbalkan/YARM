@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ext4Inode {
-    pub path_ptr: u64,
-    pub file_len: u64,
-}
+#![allow(deprecated)]
+
+// Legacy shim: authoritative implementation lives in workspace crate source.
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/crates/yarm-fs-servers/src/fs/ext4/inode.rs"
+));
