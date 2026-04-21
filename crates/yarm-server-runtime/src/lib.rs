@@ -58,27 +58,27 @@ pub mod fs {
 
 pub mod drivers {
     pub fn run_input() {
-        yarm::services::drivers::input::run();
+        yarm_driver_servers::run_input();
     }
 
     pub fn run_irqmux() {
-        yarm::services::drivers::irqmux::run();
+        yarm_driver_servers::run_irqmux();
     }
 
     pub fn run_uart() {
-        yarm::services::drivers::uart::run();
+        yarm_driver_servers::run_uart();
     }
 
     pub fn run_virtio_blk() {
-        yarm::services::drivers::virtio_blk::run();
+        yarm_driver_servers::run_virtio_blk();
     }
 
     pub fn run_virtio_gpu() {
-        yarm::services::drivers::virtio_gpu::run();
+        yarm_driver_servers::run_virtio_gpu();
     }
 
     pub fn run_virtio_net() {
-        yarm::services::drivers::virtio_net::run();
+        yarm_driver_servers::run_virtio_net();
     }
 }
 
@@ -129,10 +129,15 @@ mod tests {
     fn scoped_dispatch_is_workspace_crate_routed() {
         let src = include_str!("lib.rs");
         let legacy_cp = ["yarm", "::services::", "control_plane::"].concat();
+        let legacy_drivers = ["yarm", "::services::", "drivers::"].concat();
         let legacy_fs = ["yarm", "::services::", "fs::"].concat();
         assert!(
             !src.contains(legacy_cp.as_str()),
             "server-runtime control-plane dispatch must route via workspace server crate"
+        );
+        assert!(
+            !src.contains(legacy_drivers.as_str()),
+            "server-runtime driver dispatch must route via workspace server crate"
         );
         assert!(
             !src.contains(legacy_fs.as_str()),
@@ -145,6 +150,10 @@ mod tests {
         assert!(
             src.contains("yarm_fs_servers::"),
             "server-runtime must depend on fs workspace crate dispatch"
+        );
+        assert!(
+            src.contains("yarm_driver_servers::"),
+            "server-runtime must depend on driver workspace crate dispatch"
         );
     }
 }

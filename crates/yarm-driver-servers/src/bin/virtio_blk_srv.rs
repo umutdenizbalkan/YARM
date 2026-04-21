@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm_server_runtime::drivers::run_virtio_blk();
+    yarm_driver_servers::run_virtio_blk();
 }

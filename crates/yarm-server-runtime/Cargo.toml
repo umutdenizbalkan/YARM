@@ -14,3 +14,4 @@ posix-compat = ["yarm/posix-compat"]
 yarm = { path = "../..", default-features = false }
 yarm-control-plane-servers = { path = "../yarm-control-plane-servers", default-features = false }
 yarm-fs-servers = { path = "../yarm-fs-servers", default-features = false }
+yarm-driver-servers = { path = "../yarm-driver-servers", default-features = false }

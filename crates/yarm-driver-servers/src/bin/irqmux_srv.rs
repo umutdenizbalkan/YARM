@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm_server_runtime::drivers::run_irqmux();
+    yarm_driver_servers::run_irqmux();
 }

@@ -33,7 +33,8 @@ dependencies = [
 name = "yarm-driver-servers"
 version = "0.1.0"
 dependencies = [
- "yarm-server-runtime",
+ "yarm",
+ "yarm-fs-servers",
 ]
 
 [[package]]
@@ -73,6 +74,7 @@ version = "0.1.0"
 dependencies = [
  "yarm",
  "yarm-control-plane-servers",
+ "yarm-driver-servers",
  "yarm-fs-servers",
 ]
 
