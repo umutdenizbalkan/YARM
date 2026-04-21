@@ -123,6 +123,7 @@ impl PageTableState {
 
         let root_idx = self.alloc_page()?;
         let root_phys = self.pages[root_idx].expect("root page").phys;
+        copy_bootstrap_kernel_root_entries(self, root_idx)?;
         for slot in &mut self.asids {
             if slot.is_none() {
                 *slot = Some(AsidRoot { asid, root_phys });
@@ -204,6 +205,43 @@ fn write_table_entry(
     if !ptr.is_null() {
         unsafe {
             core::ptr::write_volatile(ptr.add(index), entry.0);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(test), target_arch = "aarch64"))]
+#[inline]
+fn current_ttbr0_root_phys() -> u64 {
+    let ttbr0: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nostack, preserves_flags));
+    }
+    ttbr0 & PAGE_MASK
+}
+
+#[cfg(any(feature = "hosted-dev", test, not(target_arch = "aarch64")))]
+#[inline]
+fn current_ttbr0_root_phys() -> u64 {
+    0
+}
+
+fn copy_bootstrap_kernel_root_entries(
+    state: &mut PageTableState,
+    dst_root_idx: usize,
+) -> Result<(), PageTableError> {
+    let src_root_phys = current_ttbr0_root_phys();
+    if src_root_phys == 0 {
+        return Ok(());
+    }
+    let src_ptr = phys_to_virt_table_ptr(src_root_phys);
+    if src_ptr.is_null() {
+        return Ok(());
+    }
+    for idx in 1..ENTRIES_PER_TABLE {
+        let raw = unsafe { core::ptr::read_volatile(src_ptr.add(idx)) };
+        if raw != 0 {
+            write_table_entry(state, dst_root_idx, idx, PageTableEntry(raw))?;
         }
     }
     Ok(())
