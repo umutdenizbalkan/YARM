@@ -1031,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy supervisor integration path overflows in hosted-dev unit-test harness"]
+    #[ignore = "isolated blocker: restart-time driver bundle redelegation depends on a stable current-task capability owner in unit harness"]
     fn automatic_driver_redelegation_runs_after_restart() {
         run_with_large_stack(|| {
             let mut kernel = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
@@ -1055,6 +1055,8 @@ mod tests {
                 handoff,
                 CoreServicePolicyTable::baseline(),
             ));
+            let (_id, mem) = kernel.alloc_anonymous_memory_object().expect("mem");
+            let iova = kernel.create_iova_space_cap().expect("iova");
             let register_vfs = Message::with_header(
                 1,
                 SUPERVISOR_OP_REGISTER_CORE_SERVICE,
@@ -1083,8 +1085,8 @@ mod tests {
                     dependency_mask: DEP_VFS,
                     backoff_ticks: 3,
                     irq_line: 5,
-                    mem_cap: 0,
-                    iova_cap: 0,
+                    mem_cap: mem.0,
+                    iova_cap: iova.0,
                     iova_base: 0x4000,
                     dma_len: PAGE_SIZE as u64,
                     iova_len: PAGE_SIZE as u64,
@@ -1103,6 +1105,8 @@ mod tests {
                 .expect("task 20");
             kernel.register_driver(20).expect("driver");
             supervisor.run_until_idle(&mut kernel).expect("loop");
+            kernel.enqueue_current_cpu(0).expect("enqueue task 0");
+            let _ = kernel.dispatch_next_current_cpu();
 
             let token = kernel.exit_task(20, 11).expect("exit");
             let _ = supervisor
@@ -1115,6 +1119,8 @@ mod tests {
                     },
                 )
                 .expect("schedule");
+            assert_eq!(kernel.task_status(20), Some(TaskStatus::Exited(11)));
+            assert!(kernel.current_tid().is_some());
             supervisor.run_until_idle(&mut kernel).expect("restart");
             assert!(!supervisor.pending_redelegation(20));
         });
