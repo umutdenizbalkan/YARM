@@ -346,15 +346,22 @@ pub fn cr3_for_asid(asid: Asid) -> Option<u64> {
 }
 
 pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
+    #[cfg(not(feature = "hosted-dev"))]
+    crate::yarm_log!("ASW0 before computing TTBR0 asid={}", asid.0);
     let ttbr0 = cr3_for_asid(asid).ok_or(PageTableError::OutOfMemory)?;
     #[cfg(not(feature = "hosted-dev"))]
+    crate::yarm_log!("ASW1 after computing TTBR0 asid={} ttbr0=0x{:x}", asid.0, ttbr0);
+    #[cfg(not(feature = "hosted-dev"))]
     unsafe {
+        crate::yarm_log!("ASW2 before msr ttbr0_el1 asid={} ttbr0=0x{:x}", asid.0, ttbr0);
         core::arch::asm!(
             "msr ttbr0_el1, {value}",
-            "isb",
             value = in(reg) ttbr0,
             options(nostack, preserves_flags)
         );
+        crate::yarm_log!("ASW3 immediately after msr ttbr0_el1 asid={}", asid.0);
+        core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+        crate::yarm_log!("ASW4 after barriers/isb asid={}", asid.0);
     }
     Ok(ttbr0)
 }
