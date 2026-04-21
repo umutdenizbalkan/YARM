@@ -28,8 +28,13 @@ impl KernelState {
         self.with_tcbs(|tcbs| {
             tcbs.iter()
                 .flatten()
-                .map(|tcb| tcb.tid.0)
-                .find(|tid| self.task_capability(*tid, cap).is_some())
+                .find_map(|tcb| {
+                    let pid = tcb.thread_group_id.0;
+                    let cnode = self
+                        .process_cnode_for_pid(pid)
+                        .unwrap_or(crate::kernel::capabilities::CNodeId(pid));
+                    self.capability_for_cnode(cnode, cap).map(|_| tcb.tid.0)
+                })
         })
     }
 
@@ -319,7 +324,6 @@ impl KernelState {
             .or_else(|| self.owner_tid_for_cap(plan.iova_cap))
             .or_else(|| self.current_tid())
             .ok_or(KernelError::TaskMissing)?;
-
         let source_irq_cap = self.mint_irq_cap_for_task(source_tid, plan.irq_line)?;
         let irq_cap = self.grant_driver_irq_from(source_tid, plan.server_tid.0, source_irq_cap)?;
 
