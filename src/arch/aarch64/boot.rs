@@ -634,14 +634,18 @@ fn initramfs_static_hello_world_elf() -> [u8; 256] {
     image[ph + 8..ph + 16].copy_from_slice(&128u64.to_le_bytes()); // p_offset
     image[ph + 16..ph + 24].copy_from_slice(&(entry & !0xFFF).to_le_bytes()); // p_vaddr
     image[ph + 24..ph + 32].copy_from_slice(&0u64.to_le_bytes()); // p_paddr
-    image[ph + 32..ph + 40].copy_from_slice(&12u64.to_le_bytes()); // p_filesz
-    image[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes()); // p_memsz
+    image[ph + 32..ph + 40].copy_from_slice(&20u64.to_le_bytes()); // p_filesz
+    image[ph + 40..ph + 48].copy_from_slice(&20u64.to_le_bytes()); // p_memsz
     image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
-    // Minimal "hello world" init image code stub:
-    // movz x8,#0 ; svc #0 ; b svc
-    image[128..140].copy_from_slice(&[
-        0x08, 0x00, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4, 0xFF, 0xFF, 0xFF, 0x17,
+    // Minimal first-user diagnostic stub:
+    // movz x8,#0 ; movz x0,#0x1234 ; movz x1,#0xBEEF ; svc #0 ; b .
+    image[128..148].copy_from_slice(&[
+        0x08, 0x00, 0x80, 0xD2, // movz x8, #0
+        0x80, 0x46, 0x82, 0xD2, // movz x0, #0x1234
+        0xE1, 0xDD, 0x97, 0xD2, // movz x1, #0xBEEF
+        0x01, 0x00, 0x00, 0xD4, // svc #0
+        0x00, 0x00, 0x00, 0x14, // b .
     ]);
     image
 }
