@@ -7,7 +7,7 @@ use yarm::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, openat_message, read_message, statx_message, write_message,
 };
 use yarm::services::common::service::{FsService, run_typed_request_loop};
-use crate::fs::initramfs::archive::{
+use super::archive::{
     INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend, InitramfsMetrics,
 };
 use yarm_srv_common::vfs_reply::VfsReply;
@@ -113,8 +113,8 @@ mod tests {
         openat_message, read_message, statx_message,
     };
     use yarm::services::common::vfs_service::VfsService;
-    use crate::fs::devfs::{DEV_CONSOLE_PATH_PTR, DevFsBackend};
-    use crate::fs::initramfs::INITRAMFS_INIT_PATH_PTR;
+    use super::super::super::devfs::{DEV_CONSOLE_PATH_PTR, DevFsBackend};
+    use super::super::INITRAMFS_INIT_PATH_PTR;
     use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_READ};
 
     #[test]

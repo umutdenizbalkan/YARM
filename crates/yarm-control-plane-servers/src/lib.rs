@@ -3,6 +3,8 @@
 
 #![no_std]
 
+pub use yarm_fs_servers;
+
 pub mod control_plane;
 
 pub fn run_init_server() {

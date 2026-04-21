@@ -4,6 +4,7 @@
 #![no_std]
 
 extern crate alloc;
+extern crate self as yarm;
 
 #[cfg(all(feature = "hosted-dev", target_os = "none"))]
 compile_error!(
@@ -17,6 +18,11 @@ pub mod arch;
 pub mod kernel;
 pub mod runtime;
 pub mod services;
+
+#[doc(hidden)]
+pub mod yarm_fs_servers {
+    pub use crate::services::fs::{devfs, initramfs, ramfs};
+}
 
 #[cfg(feature = "posix-compat")]
 pub use services::compatibility::posix_compat;

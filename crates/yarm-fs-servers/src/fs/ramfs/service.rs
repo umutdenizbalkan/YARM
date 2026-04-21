@@ -8,7 +8,7 @@ use yarm::kernel::vfs::{
     write_message,
 };
 use yarm::services::common::service::{FsService, run_typed_request_loop};
-use crate::fs::ramfs::tree::{RamFsBackend, RamFsMetrics};
+use super::tree::{RamFsBackend, RamFsMetrics};
 use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type RamFsService = FsService<RamFsBackend>;
@@ -112,7 +112,7 @@ mod tests {
         statx_message,
     };
     use yarm::services::common::vfs_service::VfsService;
-    use crate::fs::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
+    use super::super::super::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
     use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT};
 
     #[test]

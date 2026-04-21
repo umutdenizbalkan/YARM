@@ -5,14 +5,14 @@ use yarm::kernel::boot::{KernelError, KernelState};
 use yarm::kernel::process::ProcessService;
 use yarm::kernel::vfs::InMemoryBackend;
 use yarm::services::common::service::FsService;
-use crate::control_plane::process_manager::service::run_request_loop as run_process_manager_request_loop;
-use crate::control_plane::supervisor::SupervisorService;
-use crate::control_plane::vfs::service::run_request_loop_over_kernel_ipc as run_vfs_request_loop;
-use yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
-use yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
-use yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
-use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
-use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
+use super::super::process_manager::service::run_request_loop as run_process_manager_request_loop;
+use super::super::supervisor::SupervisorService;
+use super::super::vfs::service::run_request_loop_over_kernel_ipc as run_vfs_request_loop;
+use crate::yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
+use crate::yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
+use crate::yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
+use crate::yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
+use crate::yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
 use yarm::services::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitService,
 };
@@ -239,8 +239,8 @@ pub fn run() {
 mod tests {
     use super::*;
     use yarm::kernel::boot::Bootstrap;
-    use yarm_fs_servers::initramfs::ManifestEntryWire;
-    use yarm_fs_servers::initramfs::{
+    use crate::yarm_fs_servers::initramfs::ManifestEntryWire;
+    use crate::yarm_fs_servers::initramfs::{
         INITRAMFS_INIT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR, INITRAMFS_SUPERVISOR_PATH_PTR,
         INITRAMFS_VFS_PATH_PTR,
     };

@@ -139,7 +139,7 @@ fn roundtrip_call_reply_with_budget<B: VfsBackend>(
     request: yarm::kernel::ipc::Message,
     recv_timeout_ticks: u64,
 ) -> Result<yarm::kernel::ipc::Message, VfsError> {
-    crate::control_plane::ipc_roundtrip::roundtrip_call_reply_with_budget(
+    super::super::ipc_roundtrip::roundtrip_call_reply_with_budget(
         kernel,
         vfs,
         client_send_cap,
@@ -298,9 +298,9 @@ pub fn run() {
 mod tests {
     use super::*;
     use yarm::kernel::boot::Bootstrap;
-    use yarm_fs_servers::devfs::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
-    use yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
-    use yarm_fs_servers::ramfs::RamFsBackend;
+    use crate::yarm_fs_servers::devfs::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
+    use crate::yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
+    use crate::yarm_fs_servers::ramfs::RamFsBackend;
 
     fn setup_ipc_caps(kernel: &mut KernelState) -> (CapId, CapId, CapId, CapId) {
         let (_, client_send_cap, server_recv_cap) =

@@ -381,7 +381,7 @@ fn roundtrip_call_reply_with_budget(
     request: Message,
     recv_timeout_ticks: u64,
 ) -> Result<Message, ProcessManagerError> {
-    crate::control_plane::ipc_roundtrip::roundtrip_call_reply_with_budget(
+    super::super::ipc_roundtrip::roundtrip_call_reply_with_budget(
         kernel,
         service,
         client_send_cap,
