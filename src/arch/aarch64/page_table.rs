@@ -16,6 +16,8 @@ const INTERMEDIATE_PT_PAGES_PER_MAPPING: usize = 4;
 const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES
     * (1 + vm_layout::MAX_MAPPINGS * INTERMEDIATE_PT_PAGES_PER_MAPPING);
 const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
+const EARLY_UART_MMIO_VA: u64 = 0x0900_0000;
+const EARLY_UART_MMIO_PA: u64 = 0x0900_0000;
 
 #[cfg(test)]
 static LAST_INVALIDATED_ASID: SpinLock<Option<Asid>> = SpinLock::new(None);
@@ -124,6 +126,7 @@ impl PageTableState {
         let root_idx = self.alloc_page()?;
         let root_phys = self.pages[root_idx].expect("root page").phys;
         copy_bootstrap_kernel_root_entries(self, root_idx)?;
+        ensure_early_uart_mapping(self, root_idx)?;
         for slot in &mut self.asids {
             if slot.is_none() {
                 *slot = Some(AsidRoot { asid, root_phys });
@@ -245,6 +248,33 @@ fn copy_bootstrap_kernel_root_entries(
         }
     }
     Ok(())
+}
+
+fn ensure_early_uart_mapping(
+    state: &mut PageTableState,
+    root_idx: usize,
+) -> Result<(), PageTableError> {
+    let root_phys = state.pages[root_idx]
+        .as_ref()
+        .ok_or(PageTableError::InvalidAddress)?
+        .phys;
+    let l1 = level_index(EARLY_UART_MMIO_VA, 30);
+    let l2 = level_index(EARLY_UART_MMIO_VA, 21);
+    let l3 = level_index(EARLY_UART_MMIO_VA, 12);
+    let l2_phys = walk_or_create(state, root_phys, l1, PageFlags::KERNEL_RW)?;
+    let l3_phys = walk_or_create(state, l2_phys, l2, PageFlags::KERNEL_RW)?;
+    let l3_idx = state
+        .page_index_from_phys(l3_phys)
+        .ok_or(PageTableError::InvalidAddress)?;
+    write_table_entry(
+        state,
+        l3_idx,
+        l3,
+        PageTableEntry::with_addr_and_flags(
+            EARLY_UART_MMIO_PA,
+            leaf_flags_from_page_flags(PageFlags::DEVICE_RW),
+        ),
+    )
 }
 
 #[cfg(all(not(feature = "hosted-dev"), not(test), target_arch = "aarch64"))]
