@@ -42,3 +42,8 @@ required-features = ["hosted-dev"]
 name = "fat_srv"
 path = "src/bin/fat_srv.rs"
 required-features = ["hosted-dev"]
+
+[[bin]]
+name = "blkcache_srv"
+path = "src/bin/blkcache_srv.rs"
+required-features = ["hosted-dev"]
