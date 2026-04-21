@@ -16,6 +16,8 @@ use yarm_ipc_abi::supervisor_abi::{
     SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusReply, SupervisorStatusRequest,
     TaskExitedEvent, TransferRevokedEvent,
 };
+#[cfg(test)]
+use yarm::std::cell::Cell;
 
 const MAX_MANAGED_SERVICES: usize = 8;
 const MAX_DEPENDENTS: usize = 8;
@@ -118,7 +120,7 @@ struct ManagedServiceRecord {
     driver_plan: Option<DriverRecoveryPlan>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisorService {
     init_tid: u64,
     handoff: InitFaultHandoff,
@@ -126,6 +128,10 @@ pub struct SupervisorService {
     managed: [Option<ManagedServiceRecord>; MAX_MANAGED_SERVICES],
     degraded: bool,
     current_tick: TickInstant,
+    #[cfg(test)]
+    test_step_entered_budgeted_receive: Cell<bool>,
+    #[cfg(test)]
+    test_disable_budgeted_receive_for_tracked_tid: Option<u64>,
 }
 
 impl SupervisorService {
@@ -141,6 +147,10 @@ impl SupervisorService {
             managed: [None; MAX_MANAGED_SERVICES],
             degraded: false,
             current_tick: TickInstant(0),
+            #[cfg(test)]
+            test_step_entered_budgeted_receive: Cell::new(false),
+            #[cfg(test)]
+            test_disable_budgeted_receive_for_tracked_tid: None,
         }
     }
 
@@ -488,6 +498,17 @@ impl SupervisorService {
             return Ok(None);
         }
 
+        #[cfg(test)]
+        {
+            if self
+                .test_disable_budgeted_receive_for_tracked_tid
+                .is_some_and(|tid| self.find_record(tid).is_some_and(|record| record.pending_restart_due.is_some()))
+            {
+                return Ok(None);
+            }
+            self.test_step_entered_budgeted_receive.set(true);
+        }
+
         match kernel.ipc_recv_with_deadline(recv_cap, SUPERVISOR_RECV_BUDGET_TICKS) {
             Ok(msg) => Ok(msg),
             Err(KernelError::TaskMissing)
@@ -498,6 +519,8 @@ impl SupervisorService {
     }
 
     pub fn service_step(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
+        #[cfg(test)]
+        self.test_step_entered_budgeted_receive.set(false);
         let mut changed = 0usize;
         if self.has_due_restart_ready() {
             changed += self.execute_due_restarts(kernel)?;
@@ -533,6 +556,16 @@ impl SupervisorService {
         }
         changed += self.execute_due_restarts(kernel)?;
         Ok(changed)
+    }
+
+    #[cfg(test)]
+    fn test_last_step_entered_budgeted_receive(&self) -> bool {
+        self.test_step_entered_budgeted_receive.get()
+    }
+
+    #[cfg(test)]
+    fn test_set_disable_budgeted_receive_for_tracked_tid(&mut self, tid: Option<u64>) {
+        self.test_disable_budgeted_receive_for_tracked_tid = tid;
     }
 
     pub fn run_until_idle(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
@@ -868,11 +901,18 @@ mod tests {
         owner_tid: u64,
         mem_cap: u64,
         iova_cap: u64,
+        disable_budgeted_receive_for_tracked: bool,
         max_steps: usize,
     ) -> usize {
+        supervisor.test_set_disable_budgeted_receive_for_tracked_tid(
+            disable_budgeted_receive_for_tracked.then_some(tracked_tid),
+        );
         let mut total_changed = 0usize;
         let mut step = 0usize;
+        let mut trace: yarm::std::vec::Vec<yarm::std::string::String> = yarm::std::vec::Vec::new();
         while step < max_steps {
+            let next_due_before = supervisor.next_due_tick();
+            let due_ready_before = supervisor.has_due_restart_ready();
             let due_before = supervisor
                 .status_for(tracked_tid)
                 .map(|status| status.pending_restart_due)
@@ -886,9 +926,22 @@ mod tests {
                         CapId(mem_cap),
                         CapId(iova_cap),
                     );
-                    panic!("service step: {err:?}; redelegation_debug={debug:?}");
+                    panic!(
+                        "service step: {err:?}; redelegation_debug={debug:?}; trace={trace:?}"
+                    );
                 }
             };
+            trace.push(yarm::std::format!(
+                "step={} tick={} next_due_before={:?} changed={} current_tid={:?} due_ready_before={} entered_budgeted_receive={} tracked_pending_due={}",
+                step,
+                supervisor.current_tick.0,
+                next_due_before,
+                changed,
+                kernel.current_tid(),
+                due_ready_before,
+                supervisor.test_last_step_entered_budgeted_receive(),
+                supervisor.status_for(tracked_tid).map(|status| status.pending_restart_due).unwrap_or(0),
+            ));
             total_changed += changed;
             if changed == 0 {
                 if let Some(next_due) = supervisor
@@ -909,11 +962,13 @@ mod tests {
             }
             step += 1;
         }
+        supervisor.test_set_disable_budgeted_receive_for_tracked_tid(None);
         panic!(
-            "supervisor run stalled: tracked_tid={}, current_tid={:?}, status={:?}",
+            "supervisor run stalled: tracked_tid={}, current_tid={:?}, status={:?}, trace={:?}",
             tracked_tid,
             kernel.current_tid(),
-            supervisor.status_for(tracked_tid)
+            supervisor.status_for(tracked_tid),
+            trace
         );
     }
 
@@ -1200,17 +1255,16 @@ mod tests {
                 .encode(),
             )
             .expect("driver registration");
-            kernel
-                .ipc_send(supervisor_control_send_cap, register_vfs)
-                .expect("send vfs registration");
-            kernel
-                .ipc_send(supervisor_control_send_cap, register_driver)
-                .expect("send driver registration");
+            supervisor
+                .handle_control_request(&mut kernel, register_vfs)
+                .expect("register vfs");
+            supervisor
+                .handle_control_request(&mut kernel, register_driver)
+                .expect("register driver");
             kernel
                 .register_task_with_class(20, TaskClass::Driver)
                 .expect("task 20");
             kernel.register_driver(20).expect("driver");
-            supervisor.run_until_idle(&mut kernel).expect("loop");
             restore_delegation_owner_context(&mut kernel, owner_tid);
 
             let token = kernel.exit_task(20, 11).expect("exit");
@@ -1228,7 +1282,16 @@ mod tests {
             assert_eq!(kernel.task_class(20), Some(TaskClass::Driver));
             restore_delegation_owner_context(&mut kernel, owner_tid);
             let handled =
-                run_until_idle_with_progress_guard(&mut supervisor, &mut kernel, 20, owner_tid, mem_cap, iova_cap, 64);
+                run_until_idle_with_progress_guard(
+                    &mut supervisor,
+                    &mut kernel,
+                    20,
+                    owner_tid,
+                    mem_cap,
+                    iova_cap,
+                    true,
+                    64,
+                );
             assert!(handled >= 1);
             assert!(!supervisor.pending_redelegation(20));
             assert_eq!(kernel.task_status(20), Some(TaskStatus::Runnable));
