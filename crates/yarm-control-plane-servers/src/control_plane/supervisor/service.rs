@@ -465,6 +465,13 @@ impl SupervisorService {
             .min_by_key(|tick| tick.0)
     }
 
+    fn has_due_restart_ready(&self) -> bool {
+        self.managed
+            .iter()
+            .flatten()
+            .any(|record| record.pending_restart_due.is_some_and(|due| due.0 <= self.current_tick.0))
+    }
+
     fn recv_with_budget(
         &self,
         kernel: &mut KernelState,
@@ -492,6 +499,15 @@ impl SupervisorService {
 
     pub fn service_step(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
         let mut changed = 0usize;
+        if self.has_due_restart_ready() {
+            changed += self.execute_due_restarts(kernel)?;
+            if changed > 0 {
+                return Ok(changed);
+            }
+        }
+        if self.next_due_tick().is_some() {
+            return Ok(changed);
+        }
         while let Some(request) =
             self.recv_with_budget(kernel, self.handoff.supervisor_control_recv_cap)?
         {
@@ -845,6 +861,62 @@ mod tests {
         assert_eq!(kernel.current_tid(), Some(owner_tid));
     }
 
+    fn run_until_idle_with_progress_guard(
+        supervisor: &mut SupervisorService,
+        kernel: &mut KernelState,
+        tracked_tid: u64,
+        owner_tid: u64,
+        mem_cap: u64,
+        iova_cap: u64,
+        max_steps: usize,
+    ) -> usize {
+        let mut total_changed = 0usize;
+        let mut step = 0usize;
+        while step < max_steps {
+            let due_before = supervisor
+                .status_for(tracked_tid)
+                .map(|status| status.pending_restart_due)
+                .unwrap_or(0);
+            let changed = match supervisor.service_step(kernel) {
+                Ok(changed) => changed,
+                Err(err) => {
+                    let debug = kernel.debug_driver_redelegation_context(
+                        owner_tid,
+                        tracked_tid,
+                        CapId(mem_cap),
+                        CapId(iova_cap),
+                    );
+                    panic!("service step: {err:?}; redelegation_debug={debug:?}");
+                }
+            };
+            total_changed += changed;
+            if changed == 0 {
+                if let Some(next_due) = supervisor
+                    .status_for(tracked_tid)
+                    .and_then(|status| (status.pending_restart_due > 0).then_some(TickInstant(status.pending_restart_due)))
+                {
+                    supervisor.current_tick = next_due;
+                    step += 1;
+                    continue;
+                }
+                return total_changed;
+            }
+            if due_before > 0 {
+                assert!(
+                    changed > 0,
+                    "due restart was pending but no progress was recorded"
+                );
+            }
+            step += 1;
+        }
+        panic!(
+            "supervisor run stalled: tracked_tid={}, current_tid={:?}, status={:?}",
+            tracked_tid,
+            kernel.current_tid(),
+            supervisor.status_for(tracked_tid)
+        );
+    }
+
     #[test]
     fn supervisor_source_guardrail_prefers_try_or_budgeted_receive_paths() {
         let src = include_str!("service.rs");
@@ -1065,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "isolated blocker: supervisor recv-budget path can consume owner task context and stall restart progression under hosted-dev harness"]
+    #[ignore = "isolated blocker: restart progression still stalls in supervisor loop under hosted-dev harness after explicit-owner redelegation fix"]
     fn automatic_driver_redelegation_runs_after_restart() {
         run_with_large_stack(|| {
             let mut kernel = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
@@ -1155,9 +1227,8 @@ mod tests {
             assert_eq!(kernel.task_status(20), Some(TaskStatus::Exited(11)));
             assert_eq!(kernel.task_class(20), Some(TaskClass::Driver));
             restore_delegation_owner_context(&mut kernel, owner_tid);
-            let handled = supervisor
-                .run_live_for_ticks(&mut kernel, 8)
-                .expect("restart live");
+            let handled =
+                run_until_idle_with_progress_guard(&mut supervisor, &mut kernel, 20, owner_tid, mem_cap, iova_cap, 64);
             assert!(handled >= 1);
             assert!(!supervisor.pending_redelegation(20));
             assert_eq!(kernel.task_status(20), Some(TaskStatus::Runnable));

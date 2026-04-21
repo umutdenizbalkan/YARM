@@ -315,9 +315,9 @@ impl KernelState {
     ) -> Result<(CapId, CapId, CapId), KernelError> {
         self.register_driver(plan.server_tid.0)?;
         let source_tid = self
-            .current_tid()
-            .or_else(|| self.owner_tid_for_cap(plan.mem_cap))
+            .owner_tid_for_cap(plan.mem_cap)
             .or_else(|| self.owner_tid_for_cap(plan.iova_cap))
+            .or_else(|| self.current_tid())
             .ok_or(KernelError::TaskMissing)?;
 
         let source_irq_cap = self.mint_irq_cap_for_task(source_tid, plan.irq_line)?;
