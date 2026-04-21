@@ -799,7 +799,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy supervisor integration path overflows in hosted-dev unit-test harness"]
     fn supervisor_source_guardrail_prefers_try_or_budgeted_receive_paths() {
         let src = include_str!("service.rs");
         let legacy_call = ["kernel", ".ipc_recv", "("].concat();
@@ -1122,7 +1121,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy supervisor integration path overflows in hosted-dev unit-test harness"]
     fn supervisor_source_guardrail_includes_query_status_reply_cap_compatibility_path() {
         let src = include_str!("service.rs");
         assert!(

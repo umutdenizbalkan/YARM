@@ -316,7 +316,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy vfs integration path overflows in hosted-dev unit-test harness"]
     fn vfs_request_loop_entrypoint_opens_one_fd() {
         let mut vfs = FsService::with_backend(InMemoryBackend::new());
         let summary = run_request_loop(&mut vfs, 0x1010).expect("loop");
@@ -385,7 +384,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy vfs integration path overflows in hosted-dev unit-test harness"]
     fn vfs_source_guardrail_blocks_legacy_blocking_ipc_recv_regression() {
         let src = include_str!("service.rs");
         let legacy_call = ["kernel", ".ipc_recv", "("].concat();
