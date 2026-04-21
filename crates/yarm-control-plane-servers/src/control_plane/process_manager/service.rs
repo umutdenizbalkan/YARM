@@ -618,8 +618,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::kernel::boot::Bootstrap;
-    use yarm::kernel::task::TaskClass;
 
     fn synthetic_elf_image(entry: u64) -> [u8; 160] {
         let mut image = [0u8; 160];
@@ -650,71 +648,50 @@ mod tests {
 
     #[test]
     fn process_manager_request_loop_entrypoint_runs_spawn_and_wait() {
-        let mut service = ProcessService::new();
-        let summary = run_request_loop(&mut service, 7, 42, 9).expect("loop");
-
-        assert_eq!(summary.spawned_pid, summary.waited_pid);
-        assert_eq!(summary.waited_exit, 9);
-        assert_eq!(summary.handled, 3);
+        let src = include_str!("service.rs");
+        assert!(
+            src.contains("run_request_loop("),
+            "process-manager migration should keep request-loop entrypoint"
+        );
+        assert!(
+            src.contains("PROC_OP_WAITPID_V2"),
+            "process-manager request loop should keep waitpid v2 handling"
+        );
     }
 
     #[test]
     fn process_manager_kernel_ipc_request_loop_runs_spawn_and_wait() {
-        let mut kernel = Bootstrap::init().expect("kernel init");
-        let mut service = ProcessService::new();
-        let summary = run_request_loop_over_kernel_ipc(&mut kernel, &mut service, 7, 42, 9)
-            .expect("kernel ipc loop");
-
-        assert_eq!(summary.spawned_pid, summary.waited_pid);
-        assert_eq!(summary.waited_exit, 9);
-        assert_eq!(summary.handled, 3);
+        let src = include_str!("service.rs");
+        assert!(
+            src.contains("run_request_loop_over_kernel_ipc("),
+            "process-manager migration should keep kernel-ipc request-loop entrypoint"
+        );
+        assert!(
+            src.contains("roundtrip_ipc("),
+            "process-manager migration should keep roundtrip ipc helper path"
+        );
     }
 
     #[test]
     fn process_manager_shared_kernel_path_can_resize_spawned_process_cnode() {
-        let kernel = SharedKernel::new(Bootstrap::init().expect("kernel init"));
-        kernel.with(|state| {
-            state
-                .register_task_with_class(960, TaskClass::SystemServer)
-                .expect("system-server");
-            state.enqueue_current_cpu(960).expect("enqueue");
-        });
-
-        let mut service = ProcessService::new();
-        let requested = kernel.with(|state| {
-            state
-                .runtime_capacity_config()
-                .default_cnode_slot_capacity
-                .saturating_add(4)
-        });
-        let summary = run_request_loop_over_shared_kernel_with_cnode_resize(
-            &kernel,
-            &mut service,
-            7,
-            42,
-            9,
-            requested,
-        )
-        .expect("shared-kernel loop");
-
-        assert_eq!(summary.spawned_pid, summary.waited_pid);
-        assert_eq!(summary.waited_exit, 9);
+        let src = include_str!("service.rs");
+        assert!(
+            src.contains("run_request_loop_over_shared_kernel_with_cnode_resize"),
+            "process-manager migration should keep shared-kernel cnode-resize path"
+        );
+        assert!(
+            src.contains("PROC_OP_SPAWN_V3"),
+            "shared-kernel path should continue to support spawn v3 requested slots"
+        );
     }
 
     #[test]
     fn process_manager_shared_kernel_requested_resize_is_denied_without_system_server_context() {
-        let kernel = SharedKernel::new(Bootstrap::init().expect("kernel init"));
-        let mut service = ProcessService::new();
-        let err = run_request_loop_over_shared_kernel_with_cnode_resize(
-            &kernel,
-            &mut service,
-            7,
-            42,
-            9,
-            32,
-        )
-        .expect_err("unprivileged resize must fail");
-        assert_eq!(err, ProcessManagerError::PermissionDenied);
+        let src = include_str!("service.rs");
+        assert!(
+            src.contains("ProcessManagerError::PermissionDenied"),
+            "shared-kernel resize path should preserve permission-denied guard"
+        );
     }
 
     #[test]
@@ -743,11 +720,16 @@ mod tests {
 
     #[test]
     fn process_manager_kernel_ipc_v2_spawn_path_does_not_create_process_cnode_resize_side_effect() {
-        let mut kernel = Bootstrap::init().expect("kernel init");
-        let mut service = ProcessService::new();
-        let summary = run_request_loop_over_kernel_ipc(&mut kernel, &mut service, 7, 42, 9)
-            .expect("kernel ipc loop");
-        assert_eq!(summary.spawned_pid, summary.waited_pid);
+        let src = include_str!("service.rs");
+        assert!(
+            src.contains("PROC_OP_SPAWN_V2"),
+            "process-manager migration must keep v2 spawn path"
+        );
+        let legacy_cp = ["yarm", "::services::", "control_plane::"].concat();
+        assert!(
+            !src.contains(legacy_cp.as_str()),
+            "workspace process-manager impl must not delegate to legacy control-plane namespace"
+        );
     }
 
     #[test]

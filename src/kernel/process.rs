@@ -8,6 +8,7 @@ use super::process_abi::{
     WaitPidV2Reply,
 };
 use super::task::{TaskClass, ThreadGroupId};
+use crate::services::common::service::RequestResponseService;
 
 const MAX_PROCESSES: usize = 64;
 const MAX_THREADS: usize = 128;
@@ -702,6 +703,18 @@ impl ProcessService {
             self.handle(request)?;
         }
         Ok(self.handled)
+    }
+}
+
+impl RequestResponseService for ProcessService {
+    type Error = ProcessManagerError;
+
+    fn service_name(&self) -> &'static str {
+        "process_manager"
+    }
+
+    fn handle(&mut self, request: Message) -> Result<Message, Self::Error> {
+        ProcessService::handle(self, request)
     }
 }
 

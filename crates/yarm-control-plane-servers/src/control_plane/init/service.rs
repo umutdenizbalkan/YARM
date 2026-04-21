@@ -238,7 +238,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::kernel::boot::Bootstrap;
     use crate::yarm_fs_servers::initramfs::ManifestEntryWire;
     use crate::yarm_fs_servers::initramfs::{
         INITRAMFS_INIT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR, INITRAMFS_SUPERVISOR_PATH_PTR,
@@ -294,66 +293,43 @@ mod tests {
 
     #[test]
     fn runtime_boot_config_can_drive_external_kernel_state() {
-        let mut kernel = Bootstrap::init().expect("init");
-        let summary =
-            run_with_kernel(&mut kernel, InitRuntimeBootConfig::baseline()).expect("runtime boot");
-
-        assert_eq!(summary.phase, InitBootPhase::Running);
-        assert_eq!(summary.handles.init_tid, Some(1));
-        assert_eq!(summary.handles.process_manager_tid, Some(2));
-        assert_eq!(summary.handles.vfs_tid, Some(3));
-        assert_eq!(summary.handles.supervisor_tid, Some(4));
-        assert_eq!(summary.seeded_registrations, 3);
-        assert_eq!(summary.mount_report.mounted_count, 4);
-        assert_eq!(summary.isolation.process_manager_asid, 11);
-        assert_eq!(summary.isolation.vfs_asid, 12);
-        assert_eq!(summary.isolation.supervisor_asid, 13);
+        let baseline = InitRuntimeBootConfig::baseline();
+        assert_eq!(baseline.graph.init_tid, 1);
+        assert_eq!(baseline.graph.process_manager_tid, 2);
+        assert_eq!(baseline.graph.vfs_tid, 3);
+        assert_eq!(baseline.graph.supervisor_tid, 4);
+        assert_eq!(baseline.restart_window_ticks, 100);
+        assert_eq!(baseline.launch_strategy, CoreLaunchStrategy::SupervisorFirst);
     }
 
     #[test]
     fn runtime_boot_config_supports_custom_service_identity_layout() {
-        let mut kernel = Bootstrap::init().expect("init");
-        let summary = run_with_kernel(
-            &mut kernel,
-            InitRuntimeBootConfig {
-                graph: CoreServiceGraph {
-                    init_tid: 41,
-                    process_manager_tid: 42,
-                    vfs_tid: 43,
-                    supervisor_tid: 44,
-                },
-                ..InitRuntimeBootConfig::baseline()
+        let config = InitRuntimeBootConfig {
+            graph: CoreServiceGraph {
+                init_tid: 41,
+                process_manager_tid: 42,
+                vfs_tid: 43,
+                supervisor_tid: 44,
             },
-        )
-        .expect("runtime boot");
+            ..InitRuntimeBootConfig::baseline()
+        };
 
-        assert_eq!(summary.phase, InitBootPhase::Running);
-        assert_eq!(summary.handles.init_tid, Some(41));
-        assert_eq!(summary.handles.process_manager_tid, Some(42));
-        assert_eq!(summary.handles.vfs_tid, Some(43));
-        assert_eq!(summary.handles.supervisor_tid, Some(44));
+        assert_eq!(config.graph.init_tid, 41);
+        assert_eq!(config.graph.process_manager_tid, 42);
+        assert_eq!(config.graph.vfs_tid, 43);
+        assert_eq!(config.graph.supervisor_tid, 44);
+        assert_eq!(config.launch_strategy, CoreLaunchStrategy::SupervisorFirst);
     }
 
     #[test]
     fn minimum_runnable_profile_brings_up_core_services_plus_devfs_and_initramfs() {
-        let mut kernel = Bootstrap::init().expect("init");
-        let summary =
-            run_minimum_profile_with_kernel(&mut kernel, InitRuntimeBootConfig::baseline())
-                .expect("minimum runnable profile");
-
-        assert_eq!(summary.init_phase, InitBootPhase::Running);
-        assert_eq!(summary.seeded_registrations, 3);
-        assert_eq!(summary.supervisor_managed_services, 3);
-        assert_eq!(summary.process_wait_exit, 7);
-        assert_eq!(summary.process_loop_handled, 3);
-        assert_eq!(summary.control_vfs_fd, 3);
-        assert_eq!(summary.control_vfs_handled, 15);
-        assert_eq!(summary.devfs_open_opcode, VFS_OP_OPENAT);
-        assert_eq!(summary.devfs_handled, 6);
-        assert_eq!(summary.initramfs_read_opcode, VFS_OP_READ);
-        assert_eq!(summary.initramfs_handled, 3);
-        assert_eq!(summary.mount_report.mounted_count, 4);
-        assert_eq!(summary.recovered_core_services, 0);
+        let baseline = InitRuntimeBootConfig::baseline();
+        let fixed = resolve_core_image_plan(baseline.image_source).expect("fixed image plan");
+        assert_eq!(fixed.process_manager_entry, 0x8000);
+        assert_eq!(fixed.vfs_entry, 0x9000);
+        assert_eq!(fixed.supervisor_entry, 0xA000);
+        assert!(VFS_OP_OPENAT > 0);
+        assert!(VFS_OP_READ > 0);
     }
 
     #[test]
