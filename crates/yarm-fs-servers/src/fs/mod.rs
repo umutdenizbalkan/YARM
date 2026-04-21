@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+pub mod blkcache;
 pub mod devfs;
 pub mod ext4;
 pub mod fat;

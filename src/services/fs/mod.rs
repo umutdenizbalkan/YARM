@@ -15,6 +15,7 @@ pub mod ramfs;
 mod tests {
     #[test]
     fn legacy_scoped_fs_modules_are_include_only_shims() {
+        let blkcache_service = include_str!("blkcache/service.rs");
         let devfs_nodes = include_str!("devfs/nodes.rs");
         let devfs_service = include_str!("devfs/service.rs");
         let initramfs_archive = include_str!("initramfs/archive.rs");
@@ -30,6 +31,7 @@ mod tests {
         let fat_fs = include_str!("fat/fs.rs");
         let fat_service = include_str!("fat/service.rs");
 
+        assert!(blkcache_service.contains("/crates/yarm-fs-servers/src/fs/blkcache/service.rs"));
         assert!(devfs_nodes.contains("/crates/yarm-fs-servers/src/fs/devfs/nodes.rs"));
         assert!(devfs_service.contains("/crates/yarm-fs-servers/src/fs/devfs/service.rs"));
         assert!(initramfs_archive.contains("/crates/yarm-fs-servers/src/fs/initramfs/archive.rs"));
