@@ -811,6 +811,40 @@ mod tests {
         handle.join().expect("join large-stack test thread");
     }
 
+    fn enter_delegation_owner_context(
+        kernel: &mut KernelState,
+        owner_tid: u64,
+    ) -> (u64, u64) {
+        if kernel.task_status(owner_tid).is_none() {
+            kernel
+                .register_task_with_class(owner_tid, TaskClass::SystemServer)
+                .expect("register delegation owner");
+        }
+        switch_to_current_task(kernel, owner_tid);
+        let (_id, mem) = kernel.alloc_anonymous_memory_object().expect("mem");
+        let iova = kernel.create_iova_space_cap().expect("iova");
+        (mem.0, iova.0)
+    }
+
+    fn switch_to_current_task(kernel: &mut KernelState, tid: u64) {
+        if kernel.current_tid() == Some(tid) {
+            return;
+        }
+        match kernel.enqueue_current_cpu(tid) {
+            Ok(()) | Err(KernelError::WouldBlock) => {}
+            Err(err) => panic!("enqueue task: {err:?}"),
+        }
+        let _ = kernel.dispatch_next_current_cpu();
+        assert_eq!(kernel.current_tid(), Some(tid));
+    }
+
+    fn restore_delegation_owner_context(kernel: &mut KernelState, owner_tid: u64) {
+        if kernel.current_tid() != Some(owner_tid) {
+            switch_to_current_task(kernel, owner_tid);
+        }
+        assert_eq!(kernel.current_tid(), Some(owner_tid));
+    }
+
     #[test]
     fn supervisor_source_guardrail_prefers_try_or_budgeted_receive_paths() {
         let src = include_str!("service.rs");
@@ -1031,10 +1065,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "isolated blocker: restart-time driver bundle redelegation depends on a stable current-task capability owner in unit harness"]
+    #[ignore = "isolated blocker: kernel restart-time driver redelegation still returns TaskMissing in grant path even with deterministic owner-task context"]
     fn automatic_driver_redelegation_runs_after_restart() {
         run_with_large_stack(|| {
             let mut kernel = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
+            let owner_tid = 31;
+            let (mem_cap, iova_cap) = enter_delegation_owner_context(&mut kernel, owner_tid);
             let (_, _supervisor_fault_send_cap, supervisor_fault_recv_cap) =
                 kernel.create_endpoint(8).expect("fault endpoint");
             let (_, supervisor_control_send_cap, supervisor_control_recv_cap) =
@@ -1055,8 +1091,6 @@ mod tests {
                 handoff,
                 CoreServicePolicyTable::baseline(),
             ));
-            let (_id, mem) = kernel.alloc_anonymous_memory_object().expect("mem");
-            let iova = kernel.create_iova_space_cap().expect("iova");
             let register_vfs = Message::with_header(
                 1,
                 SUPERVISOR_OP_REGISTER_CORE_SERVICE,
@@ -1085,8 +1119,8 @@ mod tests {
                     dependency_mask: DEP_VFS,
                     backoff_ticks: 3,
                     irq_line: 5,
-                    mem_cap: mem.0,
-                    iova_cap: iova.0,
+                    mem_cap,
+                    iova_cap,
                     iova_base: 0x4000,
                     dma_len: PAGE_SIZE as u64,
                     iova_len: PAGE_SIZE as u64,
@@ -1105,8 +1139,7 @@ mod tests {
                 .expect("task 20");
             kernel.register_driver(20).expect("driver");
             supervisor.run_until_idle(&mut kernel).expect("loop");
-            kernel.enqueue_current_cpu(0).expect("enqueue task 0");
-            let _ = kernel.dispatch_next_current_cpu();
+            restore_delegation_owner_context(&mut kernel, owner_tid);
 
             let token = kernel.exit_task(20, 11).expect("exit");
             let _ = supervisor
@@ -1120,7 +1153,7 @@ mod tests {
                 )
                 .expect("schedule");
             assert_eq!(kernel.task_status(20), Some(TaskStatus::Exited(11)));
-            assert!(kernel.current_tid().is_some());
+            restore_delegation_owner_context(&mut kernel, owner_tid);
             supervisor.run_until_idle(&mut kernel).expect("restart");
             assert!(!supervisor.pending_redelegation(20));
         });
