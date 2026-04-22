@@ -125,13 +125,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: phase4 display/input deterministic gates
-        run: |
-          cargo test -q kernel::syscall::tests::transfer_send_without_waiter_returns_would_block
-          cargo test -q services::ui::display::service::tests::boot_marker_is_stable
-          cargo test -q services::ui::display::service::tests::display_tracks_modeset_and_present
-          cargo test -q services::ui::compositor::service::tests::compositor_replay_is_deterministic
-          cargo test -q services::ui::shell::service::tests::shell_session_counter_increments
+      - name: phase4 display/input deterministic gates (workspace authoritative)
+        run: scripts/phase4-ui-gates.sh
 
 
   phase4-ui-smoke-marker:
@@ -141,7 +136,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: ensure boot marker appears in ui display run output
         run: |
-          cargo run -q --bin display_srv | tee /tmp/display_srv.log
+          cargo run -q -p yarm-ui-servers --bin display_srv | tee /tmp/display_srv.log
           rg -n "\[ui\] boot-to-shell marker" /tmp/display_srv.log
 
 
@@ -153,7 +148,7 @@ jobs:
       - name: phase3 recovery + ui marker combined gate
         run: |
           cargo test -q services::network::sim::tests::link_flap_dhcp_rebind_and_socket_recovery_is_deterministic
-          cargo run -q --bin display_srv | tee /tmp/display_srv_combined.log
+          cargo run -q -p yarm-ui-servers --bin display_srv | tee /tmp/display_srv_combined.log
           rg -n "\[ui\] boot-to-shell marker" /tmp/display_srv_combined.log
 
   mount-failure-matrix-sim-gate:
