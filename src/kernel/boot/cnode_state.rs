@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::*;
+use alloc::boxed::Box;
 
 impl KernelState {
     pub fn current_task_cnode(&self) -> Option<CNodeId> {
@@ -136,9 +137,10 @@ impl KernelState {
             }
         }
 
-        let link_snapshot =
-            self.with_capability_state(|capability| capability.delegated_capability_links.clone());
-        let mut remove_links = [false; MAX_DELEGATED_CAPABILITY_LINKS];
+        let link_snapshot = Box::new(
+            self.with_capability_state(|capability| capability.delegated_capability_links.clone()),
+        );
+        let mut remove_links = Box::new([false; MAX_DELEGATED_CAPABILITY_LINKS]);
         let mut removed_delegation_links = 0usize;
         for (idx, maybe_record) in link_snapshot.iter().enumerate() {
             let Some(record) = maybe_record else {

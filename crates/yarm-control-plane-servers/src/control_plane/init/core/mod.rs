@@ -5,6 +5,10 @@ mod launch;
 mod mount;
 mod policy;
 
+use crate::yarm_fs_servers::common::service::FsService;
+use crate::yarm_fs_servers::common::vfs_ipc::{
+    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
+};
 use crate::yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
 use crate::yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
 use crate::yarm_fs_servers::ext4::{Ext4Backend, Ext4Service};
@@ -17,10 +21,6 @@ use yarm::kernel::capabilities::{CapId, CapRights};
 use yarm::kernel::task::TaskClass;
 use yarm::kernel::task::TaskStatus;
 use yarm::kernel::vm::Asid;
-use crate::yarm_fs_servers::common::service::FsService;
-use crate::yarm_fs_servers::common::vfs_ipc::{
-    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
-};
 use yarm_ipc_abi::supervisor_abi::{
     InitAlert, InitAlertKind, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, TaskExitedEvent,
@@ -191,17 +191,26 @@ impl InitService {
         kind: CoreServiceKind,
         tid: u64,
         entry: usize,
-        asid: u16,
+        asid: Asid,
     ) -> Result<(), KernelError> {
         self.launch_order[self.launch_count] = Some(kind);
         self.launch_count += 1;
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid,
             entry,
-            asid: Some(Asid(asid)),
+            asid: Some(asid),
             class: TaskClass::SystemServer,
         })?;
         Ok(())
+    }
+
+    fn allocate_core_service_asids(
+        kernel: &mut KernelState,
+    ) -> Result<(Asid, Asid, Asid), KernelError> {
+        let (proc_asid, _proc_aspace_cap) = kernel.create_user_address_space()?;
+        let (vfs_asid, _vfs_aspace_cap) = kernel.create_user_address_space()?;
+        let (supervisor_asid, _supervisor_aspace_cap) = kernel.create_user_address_space()?;
+        Ok((proc_asid, vfs_asid, supervisor_asid))
     }
 
     pub fn execute_mount_plan_with_fail_at(
@@ -288,6 +297,7 @@ impl InitService {
         }
         self.launch_order = [None; 3];
         self.launch_count = 0;
+        let (proc_asid, vfs_asid, supervisor_asid) = Self::allocate_core_service_asids(kernel)?;
 
         let proc_tid = self
             .handles
@@ -306,15 +316,21 @@ impl InitService {
                     CoreServiceKind::ProcessManager,
                     proc_tid,
                     plan.process_manager_entry,
-                    11,
+                    proc_asid,
                 )?;
-                self.record_launch(kernel, CoreServiceKind::Vfs, vfs_tid, plan.vfs_entry, 12)?;
+                self.record_launch(
+                    kernel,
+                    CoreServiceKind::Vfs,
+                    vfs_tid,
+                    plan.vfs_entry,
+                    vfs_asid,
+                )?;
                 self.record_launch(
                     kernel,
                     CoreServiceKind::Supervisor,
                     supervisor_tid,
                     plan.supervisor_entry,
-                    13,
+                    supervisor_asid,
                 )?;
             }
             CoreLaunchStrategy::SupervisorFirst => {
@@ -323,16 +339,22 @@ impl InitService {
                     CoreServiceKind::Supervisor,
                     supervisor_tid,
                     plan.supervisor_entry,
-                    13,
+                    supervisor_asid,
                 )?;
                 self.record_launch(
                     kernel,
                     CoreServiceKind::ProcessManager,
                     proc_tid,
                     plan.process_manager_entry,
-                    11,
+                    proc_asid,
                 )?;
-                self.record_launch(kernel, CoreServiceKind::Vfs, vfs_tid, plan.vfs_entry, 12)?;
+                self.record_launch(
+                    kernel,
+                    CoreServiceKind::Vfs,
+                    vfs_tid,
+                    plan.vfs_entry,
+                    vfs_asid,
+                )?;
             }
         }
 
@@ -858,7 +880,9 @@ fn run_mount_fat() -> Result<(), KernelError> {
         len: 33,
     })
     .map_err(|_| KernelError::WrongObject)?;
-    service.handle(write).map_err(|_| KernelError::WrongObject)?;
+    service
+        .handle(write)
+        .map_err(|_| KernelError::WrongObject)?;
     Ok(())
 }
 
@@ -1189,7 +1213,17 @@ mod tests {
 
     #[test]
     fn init_recovers_proc_mgr_failure_within_budget() {
-        let mut state = Bootstrap::init().expect("init");
+        yarm::std::thread::Builder::new()
+            .name("init_recovers_proc_mgr_failure_within_budget".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(run_init_recovers_proc_mgr_failure_within_budget)
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    fn run_init_recovers_proc_mgr_failure_within_budget() {
+        let mut state = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,

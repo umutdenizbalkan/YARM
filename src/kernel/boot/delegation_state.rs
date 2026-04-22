@@ -2,34 +2,29 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::*;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 impl KernelState {
-    fn contains_cap_ref(
-        set: &[Option<DelegatedCapRef>; MAX_DELEGATED_CAPABILITY_LINKS],
-        needle: DelegatedCapRef,
-    ) -> bool {
-        set.iter().flatten().any(|item| *item == needle)
+    fn contains_cap_ref(set: &[DelegatedCapRef], needle: DelegatedCapRef) -> bool {
+        set.contains(&needle)
     }
 
     pub(crate) fn collect_delegated_descendants(
         &self,
         root: DelegatedCapRef,
-    ) -> [Option<DelegatedCapRef>; MAX_DELEGATED_CAPABILITY_LINKS] {
-        let mut found = [None; MAX_DELEGATED_CAPABILITY_LINKS];
-        let mut queue = [None; MAX_DELEGATED_CAPABILITY_LINKS];
-        let mut found_len = 0usize;
+    ) -> Vec<DelegatedCapRef> {
+        let links_snapshot = Box::new(
+            self.with_capability_state(|capability| capability.delegated_capability_links.clone()),
+        );
+        let mut found = Vec::with_capacity(64);
+        let mut queue = Vec::with_capacity(64);
         let mut head = 0usize;
-        let mut tail = 0usize;
-        queue[tail] = Some(root);
-        tail += 1;
-        while head < tail {
-            let current = queue[head].expect("queue item");
+        queue.push(root);
+        while head < queue.len() {
+            let current = queue[head];
             head += 1;
-            for link in self
-                .with_capability_state(|capability| capability.delegated_capability_links.clone())
-                .iter()
-                .flatten()
-            {
+            for link in links_snapshot.iter().flatten() {
                 let link_source_pid = self.process_id(link.source_tid).unwrap_or(link.source_tid);
                 if link_source_pid != current.pid || link.source_cap != current.cap {
                     continue;
@@ -41,15 +36,13 @@ impl KernelState {
                 if Self::contains_cap_ref(&found, child) {
                     continue;
                 }
-                if found_len >= MAX_DELEGATED_CAPABILITY_LINKS
-                    || tail >= MAX_DELEGATED_CAPABILITY_LINKS
+                if found.len() >= MAX_DELEGATED_CAPABILITY_LINKS
+                    || queue.len() >= MAX_DELEGATED_CAPABILITY_LINKS
                 {
                     break;
                 }
-                found[found_len] = Some(child);
-                found_len += 1;
-                queue[tail] = Some(child);
-                tail += 1;
+                found.push(child);
+                queue.push(child);
             }
         }
         found
@@ -58,11 +51,12 @@ impl KernelState {
     pub(crate) fn remove_delegation_links_for(
         &mut self,
         root: DelegatedCapRef,
-        descendants: [Option<DelegatedCapRef>; MAX_DELEGATED_CAPABILITY_LINKS],
+        descendants: &[DelegatedCapRef],
     ) {
-        let link_snapshot =
-            self.with_capability_state(|capability| capability.delegated_capability_links.clone());
-        let mut remove_links = [false; MAX_DELEGATED_CAPABILITY_LINKS];
+        let link_snapshot = Box::new(
+            self.with_capability_state(|capability| capability.delegated_capability_links.clone()),
+        );
+        let mut remove_links = Box::new([false; MAX_DELEGATED_CAPABILITY_LINKS]);
         for (idx, maybe_link) in link_snapshot.iter().enumerate() {
             let Some(link) = maybe_link else {
                 continue;
@@ -77,8 +71,8 @@ impl KernelState {
             };
             let involved = source == root
                 || dest == root
-                || Self::contains_cap_ref(&descendants, source)
-                || Self::contains_cap_ref(&descendants, dest);
+                || Self::contains_cap_ref(descendants, source)
+                || Self::contains_cap_ref(descendants, dest);
             if involved {
                 remove_links[idx] = true;
             }

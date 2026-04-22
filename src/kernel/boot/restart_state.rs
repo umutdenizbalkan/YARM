@@ -139,7 +139,10 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         let _ = self.revoke_reply_caps_for_caller(tid);
-        self.enqueue_task(tid).map(|_| ())
+        match self.enqueue_task(tid) {
+            Ok(_) | Err(KernelError::WouldBlock) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     pub fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError> {

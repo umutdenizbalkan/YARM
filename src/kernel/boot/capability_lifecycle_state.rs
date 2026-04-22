@@ -236,10 +236,10 @@ impl KernelState {
                 .revoke(cap)
                 .map_err(|_| KernelError::InvalidCapability)
         })?;
-        for delegated in descendants.into_iter().flatten() {
+        for delegated in descendants.iter().copied() {
             self.revoke_capability_direct_in_process_cnode(delegated.pid, delegated.cap);
         }
-        self.remove_delegation_links_for(root, descendants);
+        self.remove_delegation_links_for(root, &descendants);
         self.revoke_active_transfer_mappings_for_cap(source_pid, cap);
         if let Some(capability) = source_capability {
             self.adjust_memory_object_cap_refcount(capability.object, -1);
