@@ -6,6 +6,18 @@ set -euo pipefail
 
 export RUST_MIN_STACK=${RUST_MIN_STACK:-33554432}
 
+SCRIPT_PATH=${BASH_SOURCE[0]}
+
+# Guard against drift: this gate must keep workspace-authoritative targets as primary signals.
+rg -F -- "-p yarm-network-servers" "$SCRIPT_PATH" >/dev/null || {
+  echo "[fail] phase3/4 strict runtime gate lost -p yarm-network-servers authoritative target"
+  exit 1
+}
+rg -F -- "-p yarm-ui-servers" "$SCRIPT_PATH" >/dev/null || {
+  echo "[fail] phase3/4 strict runtime gate lost -p yarm-ui-servers authoritative target"
+  exit 1
+}
+
 # Primary authoritative signal: workspace-owned network service behavior.
 cargo test -q -p yarm-network-servers network::netmgr::service::tests::netmgr_tracks_link_state_events
 
