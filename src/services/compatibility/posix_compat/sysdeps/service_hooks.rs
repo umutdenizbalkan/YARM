@@ -209,7 +209,8 @@ mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
     use crate::services::compatibility::posix_compat::socket_errno_test_helpers::{
-        assert_errno_hook_result, assert_socket_request_shape, SocketErrnoCase,
+        assert_errno_hook_result, assert_socket_request_shape, setup_socket_ipc_fixture,
+        SocketErrnoCase,
     };
     use crate::std::thread;
     use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
@@ -431,8 +432,8 @@ mod tests {
     fn sendto_hook_propagates_negative_errno_from_socket_reply() {
         run_with_large_stack(|| {
             let mut kernel = Bootstrap::init().expect("init");
-            let (_, socket_req_send, socket_req_recv) = kernel.create_endpoint(8).expect("socket req");
-            let (_, socket_rep_send, socket_rep_recv) = kernel.create_endpoint(8).expect("socket rep");
+            let (socket_req_send, socket_req_recv, socket_rep_send, socket_rep_recv) =
+                setup_socket_ipc_fixture(&mut kernel, 8);
             let mut ctx = PosixSysdepsContext::new(&mut kernel);
             ctx.register_socket_manager(socket_req_send, socket_rep_recv)
                 .expect("bind socket");
@@ -462,8 +463,8 @@ mod tests {
     fn connect_hook_propagates_negative_errno_from_socket_reply() {
         run_with_large_stack(|| {
             let mut kernel = Bootstrap::init().expect("init");
-            let (_, socket_req_send, socket_req_recv) = kernel.create_endpoint(8).expect("socket req");
-            let (_, socket_rep_send, socket_rep_recv) = kernel.create_endpoint(8).expect("socket rep");
+            let (socket_req_send, socket_req_recv, socket_rep_send, socket_rep_recv) =
+                setup_socket_ipc_fixture(&mut kernel, 8);
             let mut ctx = PosixSysdepsContext::new(&mut kernel);
             ctx.register_socket_manager(socket_req_send, socket_rep_recv)
                 .expect("bind socket");
@@ -493,8 +494,8 @@ mod tests {
     fn socket_hook_propagates_negative_errno_from_socket_reply() {
         run_with_large_stack(|| {
             let mut kernel = Bootstrap::init().expect("init");
-            let (_, socket_req_send, socket_req_recv) = kernel.create_endpoint(8).expect("socket req");
-            let (_, socket_rep_send, socket_rep_recv) = kernel.create_endpoint(8).expect("socket rep");
+            let (socket_req_send, socket_req_recv, socket_rep_send, socket_rep_recv) =
+                setup_socket_ipc_fixture(&mut kernel, 8);
             let mut ctx = PosixSysdepsContext::new(&mut kernel);
             ctx.register_socket_manager(socket_req_send, socket_rep_recv)
                 .expect("bind socket");
@@ -530,8 +531,8 @@ mod tests {
 
         run_with_large_stack(move || {
             let mut kernel = Bootstrap::init().expect("init");
-            let (_, socket_req_send, socket_req_recv) = kernel.create_endpoint(8).expect("socket req");
-            let (_, socket_rep_send, socket_rep_recv) = kernel.create_endpoint(8).expect("socket rep");
+            let (socket_req_send, socket_req_recv, socket_rep_send, socket_rep_recv) =
+                setup_socket_ipc_fixture(&mut kernel, 8);
             let mut ctx = PosixSysdepsContext::new(&mut kernel);
             ctx.register_socket_manager(socket_req_send, socket_rep_recv)
                 .expect("bind socket");

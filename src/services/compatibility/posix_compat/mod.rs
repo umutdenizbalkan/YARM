@@ -1001,7 +1001,8 @@ mod tests {
     use crate::kernel::ipc::Message;
     use crate::std::thread;
     use crate::services::compatibility::posix_compat::socket_errno_test_helpers::{
-        assert_errno_trapframe, assert_socket_request_shape, SocketErrnoCase,
+        assert_errno_trapframe, assert_socket_request_shape, setup_socket_ipc_fixture,
+        SocketErrnoCase,
     };
 
     fn run_with_large_stack<F>(f: F)
@@ -1501,8 +1502,7 @@ mod tests {
         run_with_large_stack(|| {
             let mut state = Bootstrap::init().expect("init");
             let mut bindings = PosixServiceBindings::default();
-            let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("socket req ep");
-            let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("socket rep ep");
+            let (req_send, req_recv, rep_send, rep_recv) = setup_socket_ipc_fixture(&mut state, 4);
             bindings
                 .register_socket_manager(&state, req_send, rep_recv)
                 .expect("register socket");
@@ -1585,8 +1585,7 @@ mod tests {
         run_with_large_stack(|| {
             let mut state = Bootstrap::init().expect("init");
             let mut bindings = PosixServiceBindings::default();
-            let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("socket req ep");
-            let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("socket rep ep");
+            let (req_send, req_recv, rep_send, rep_recv) = setup_socket_ipc_fixture(&mut state, 4);
             bindings
                 .register_socket_manager(&state, req_send, rep_recv)
                 .expect("register socket");
@@ -1614,8 +1613,7 @@ mod tests {
         run_with_large_stack(|| {
             let mut state = Bootstrap::init().expect("init");
             let mut bindings = PosixServiceBindings::default();
-            let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("socket req ep");
-            let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("socket rep ep");
+            let (req_send, req_recv, rep_send, rep_recv) = setup_socket_ipc_fixture(&mut state, 4);
             bindings
                 .register_socket_manager(&state, req_send, rep_recv)
                 .expect("register socket");
@@ -1643,8 +1641,7 @@ mod tests {
         run_with_large_stack(|| {
             let mut state = Bootstrap::init().expect("init");
             let mut bindings = PosixServiceBindings::default();
-            let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("socket req ep");
-            let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("socket rep ep");
+            let (req_send, req_recv, rep_send, rep_recv) = setup_socket_ipc_fixture(&mut state, 4);
             bindings
                 .register_socket_manager(&state, req_send, rep_recv)
                 .expect("register socket");
@@ -1701,8 +1698,7 @@ mod tests {
         run_with_large_stack(move || {
             let mut state = Bootstrap::init().expect("init");
             let mut bindings = PosixServiceBindings::default();
-            let (_req_ep, req_send, req_recv) = state.create_endpoint(8).expect("socket req ep");
-            let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(8).expect("socket rep ep");
+            let (req_send, req_recv, rep_send, rep_recv) = setup_socket_ipc_fixture(&mut state, 8);
             bindings
                 .register_socket_manager(&state, req_send, rep_recv)
                 .expect("register socket");
@@ -2042,6 +2038,8 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod socket_errno_test_helpers {
+    use crate::kernel::boot::KernelState;
+    use crate::kernel::capabilities::CapId;
     use crate::kernel::trapframe::TrapFrame;
     use crate::services::compatibility::posix_compat::PosixErrno;
     use yarm_ipc_abi::socket_abi::{
@@ -2111,6 +2109,19 @@ pub(crate) mod socket_errno_test_helpers {
                 assert_eq!(decoded.addrlen, 16);
             }
         }
+    }
+
+    pub fn setup_socket_ipc_fixture(
+        kernel: &mut KernelState,
+        queue_depth: usize,
+    ) -> (CapId, CapId, CapId, CapId) {
+        let (_req_ep, req_send, req_recv) = kernel
+            .create_endpoint(queue_depth)
+            .expect("socket req ep");
+        let (_rep_ep, rep_send, rep_recv) = kernel
+            .create_endpoint(queue_depth)
+            .expect("socket rep ep");
+        (req_send, req_recv, rep_send, rep_recv)
     }
 }
 
