@@ -4,7 +4,7 @@
 use super::super::process_manager::service::ProcessService;
 use super::super::process_manager::service::run_request_loop as run_process_manager_request_loop;
 use super::super::supervisor::SupervisorService;
-use super::super::vfs::service::run_request_loop_over_kernel_ipc as run_vfs_request_loop;
+use super::super::vfs::service::run_request_loop as run_vfs_request_loop;
 use crate::yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
 use crate::yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
 use crate::yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
@@ -150,7 +150,7 @@ pub fn run_minimum_profile_with_kernel(
         .map_err(|_| KernelError::WrongObject)?;
 
     let mut control_vfs = FsService::with_backend(InMemoryBackend::new());
-    let control_vfs_summary = run_vfs_request_loop(kernel, &mut control_vfs, 0x1000)
+    let control_vfs_summary = run_vfs_request_loop(&mut control_vfs, 0x1000)
         .map_err(|_| KernelError::WrongObject)?;
 
     let mut devfs = DevFsService::with_backend(DevFsBackend::default());

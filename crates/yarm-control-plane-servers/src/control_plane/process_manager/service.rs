@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::boot::{KernelError, KernelState, TrapHandleError};
+use yarm::kernel::boot::{KernelError, TrapHandleError};
+#[cfg(test)]
+use yarm::kernel::boot::KernelState;
+#[cfg(test)]
 use yarm::kernel::capabilities::CapId;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::process::{ProcessId, ProcessManager, ProcessManagerError};
 use yarm::kernel::syscall::SyscallError;
 use yarm::kernel::task::TaskClass;
+#[cfg(test)]
 use yarm::runtime::SharedKernel;
 use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
@@ -16,6 +20,7 @@ use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
 
+#[cfg(test)]
 const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 const MAX_EXEC_LOAD_SEGMENTS: usize = 8;
 const MAX_EXEC_STACK_BYTES: usize = 4096;
@@ -725,6 +730,7 @@ fn synthetic_elf_image(image_id: u64) -> [u8; 128] {
     image
 }
 
+#[cfg(test)]
 fn roundtrip_ipc(
     kernel: &mut KernelState,
     service: &mut ProcessService,
@@ -744,6 +750,7 @@ fn roundtrip_ipc(
     )
 }
 
+#[cfg(test)]
 fn synthetic_roundtrip_call_reply_with_budget(
     kernel: &mut KernelState,
     service: &mut ProcessService,
@@ -863,6 +870,7 @@ pub fn run_request_loop(
     })
 }
 
+#[cfg(test)]
 pub fn run_request_loop_over_kernel_ipc(
     kernel: &mut KernelState,
     service: &mut ProcessService,
@@ -875,6 +883,7 @@ pub fn run_request_loop_over_kernel_ipc(
     )
 }
 
+#[cfg(test)]
 fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
     kernel: &mut KernelState,
     service: &mut ProcessService,
@@ -955,6 +964,7 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
     })
 }
 
+#[cfg(test)]
 pub fn run_request_loop_over_shared_kernel_with_cnode_resize(
     kernel: &SharedKernel,
     service: &mut ProcessService,

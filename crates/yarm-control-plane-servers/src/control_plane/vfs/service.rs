@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+#[cfg(test)]
 use yarm::kernel::boot::KernelState;
+#[cfg(test)]
 use yarm::kernel::capabilities::CapId;
 use yarm::yarm_fs_servers::common::vfs_ipc::VfsError;
 use yarm::yarm_fs_servers::common::vfs_ipc::{
-    InMemoryBackend, OpenAtRequest, ReadWriteRequest, StatxRequest, VfsBackend, close_message,
+    InMemoryBackend, OpenAtRequest, ReadWriteRequest, StatxRequest, close_message,
     dup_message, epoll_create1_message, epoll_ctl_message, epoll_pwait_message, fcntl_message,
     ioctl_message, openat_message, poll_message, read_message, sendfile_message, statx_message,
     write_message,
 };
+#[cfg(test)]
+use yarm::yarm_fs_servers::common::vfs_ipc::VfsBackend;
 use yarm::yarm_fs_servers::common::service::FsService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_srv_common::vfs_reply::VfsReply;
@@ -22,6 +26,7 @@ pub struct VfsLoopSummary {
     pub handled: usize,
 }
 
+#[cfg(test)]
 const VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 
 fn decode_fd_reply(reply: yarm::kernel::ipc::Message) -> Result<u64, VfsError> {
@@ -99,16 +104,19 @@ pub fn run_request_loop(
     })
 }
 
+#[cfg(test)]
 fn map_kernel_ipc_err<T>(
     result: Result<T, yarm::kernel::boot::KernelError>,
 ) -> Result<T, VfsError> {
     result.map_err(|_| VfsError::Unsupported)
 }
 
+#[cfg(test)]
 fn map_kernel_ipc_error(_: yarm::kernel::boot::KernelError) -> VfsError {
     VfsError::Unsupported
 }
 
+#[cfg(test)]
 fn roundtrip_ipc<B: VfsBackend>(
     kernel: &mut KernelState,
     vfs: &mut FsService<B>,
@@ -130,6 +138,7 @@ fn roundtrip_ipc<B: VfsBackend>(
     )
 }
 
+#[cfg(test)]
 fn synthetic_roundtrip_call_reply_with_budget<B: VfsBackend>(
     kernel: &mut KernelState,
     vfs: &mut FsService<B>,
@@ -155,6 +164,7 @@ fn synthetic_roundtrip_call_reply_with_budget<B: VfsBackend>(
 }
 
 #[allow(dead_code)]
+#[cfg(test)]
 fn roundtrip_ipc_with_budget<B: VfsBackend>(
     kernel: &mut KernelState,
     vfs: &mut FsService<B>,
@@ -177,6 +187,7 @@ fn roundtrip_ipc_with_budget<B: VfsBackend>(
     )
 }
 
+#[cfg(test)]
 pub fn run_request_loop_over_kernel_ipc(
     kernel: &mut KernelState,
     vfs: &mut FsService<impl VfsBackend>,
@@ -274,6 +285,7 @@ pub fn run_request_loop_over_kernel_ipc(
     })
 }
 
+#[cfg(test)]
 pub fn run_with_kernel_ipc(
     kernel: &mut KernelState,
     path_ptr: u64,
@@ -283,8 +295,8 @@ pub fn run_with_kernel_ipc(
 }
 
 pub fn run() {
-    let mut kernel = yarm::kernel::boot::Bootstrap::init().expect("kernel init");
-    let summary = run_with_kernel_ipc(&mut kernel, 0x1000).expect("vfs loop");
+    let mut vfs = FsService::with_backend(InMemoryBackend::new());
+    let summary = run_request_loop(&mut vfs, 0x1000).expect("vfs loop");
 
     yarm::yarm_log!(
         "vfs request-loop ready: fd={}, dup_fd={}, epoll_fd={}, handled={}",
