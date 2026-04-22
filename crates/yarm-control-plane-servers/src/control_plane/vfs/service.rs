@@ -118,7 +118,7 @@ fn roundtrip_ipc<B: VfsBackend>(
     client_recv_cap: CapId,
     request: yarm::kernel::ipc::Message,
 ) -> Result<yarm::kernel::ipc::Message, VfsError> {
-    roundtrip_call_reply_with_budget(
+    synthetic_roundtrip_call_reply_with_budget(
         kernel,
         vfs,
         client_send_cap,
@@ -130,7 +130,7 @@ fn roundtrip_ipc<B: VfsBackend>(
     )
 }
 
-fn roundtrip_call_reply_with_budget<B: VfsBackend>(
+fn synthetic_roundtrip_call_reply_with_budget<B: VfsBackend>(
     kernel: &mut KernelState,
     vfs: &mut FsService<B>,
     client_send_cap: CapId,
@@ -140,7 +140,7 @@ fn roundtrip_call_reply_with_budget<B: VfsBackend>(
     request: yarm::kernel::ipc::Message,
     recv_timeout_ticks: u64,
 ) -> Result<yarm::kernel::ipc::Message, VfsError> {
-    super::super::ipc_roundtrip::roundtrip_call_reply_with_budget(
+    super::super::ipc_roundtrip::synthetic_roundtrip_call_reply_with_budget(
         kernel,
         vfs,
         client_send_cap,
@@ -165,7 +165,7 @@ fn roundtrip_ipc_with_budget<B: VfsBackend>(
     request: yarm::kernel::ipc::Message,
     recv_timeout_ticks: u64,
 ) -> Result<yarm::kernel::ipc::Message, VfsError> {
-    roundtrip_call_reply_with_budget(
+    synthetic_roundtrip_call_reply_with_budget(
         kernel,
         vfs,
         client_send_cap,

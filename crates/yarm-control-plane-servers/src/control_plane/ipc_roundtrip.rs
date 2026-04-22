@@ -6,7 +6,13 @@ use yarm::kernel::capabilities::CapId;
 use yarm::kernel::ipc::{Message, ThreadId};
 use yarm_srv_common::service_loop::RequestResponseService;
 
-pub fn roundtrip_call_reply_with_budget<S, E, FKernel, FMalformed, FMissingTid>(
+/// Executes a synthetic client/server IPC roundtrip inside the same kernel-owned
+/// control-flow for migration harnesses and deterministic tests.
+///
+/// This helper is intentionally *not* a privilege/domain boundary crossing path:
+/// it receives a server request, invokes `service.handle(...)` directly, and then
+/// posts the reply via a reply capability.
+pub fn synthetic_roundtrip_call_reply_with_budget<S, E, FKernel, FMalformed, FMissingTid>(
     kernel: &mut KernelState,
     service: &mut S,
     client_send_cap: CapId,

@@ -47,12 +47,12 @@ mod tests {
         let roundtrip_src = include_str!("ipc_roundtrip.rs");
 
         assert!(
-            vfs_src.contains("roundtrip_call_reply_with_budget(")
+            vfs_src.contains("synthetic_roundtrip_call_reply_with_budget(")
                 && roundtrip_src.contains("ipc_recv_with_deadline("),
             "vfs must retain timed receive migration via shared roundtrip helper"
         );
         assert!(
-            vfs_src.contains("roundtrip_call_reply_with_budget(")
+            vfs_src.contains("synthetic_roundtrip_call_reply_with_budget(")
                 && roundtrip_src.contains("ipc_reply("),
             "vfs must retain reply-cap call/reply migration via shared roundtrip helper"
         );
@@ -61,12 +61,12 @@ mod tests {
             "supervisor must retain budgeted receive migration"
         );
         assert!(
-            process_manager_src.contains("roundtrip_call_reply_with_budget(")
+            process_manager_src.contains("synthetic_roundtrip_call_reply_with_budget(")
                 && roundtrip_src.contains("ipc_recv_with_deadline("),
             "process-manager must retain timed receive migration via shared roundtrip helper"
         );
         assert!(
-            process_manager_src.contains("roundtrip_call_reply_with_budget(")
+            process_manager_src.contains("synthetic_roundtrip_call_reply_with_budget(")
                 && roundtrip_src.contains("ipc_reply("),
             "process-manager must retain reply-cap call/reply migration via shared roundtrip helper"
         );

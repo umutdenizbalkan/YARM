@@ -733,7 +733,7 @@ fn roundtrip_ipc(
     client_recv_cap: CapId,
     request: Message,
 ) -> Result<Message, ProcessManagerError> {
-    roundtrip_call_reply_with_budget(
+    synthetic_roundtrip_call_reply_with_budget(
         kernel,
         service,
         client_send_cap,
@@ -744,7 +744,7 @@ fn roundtrip_ipc(
     )
 }
 
-fn roundtrip_call_reply_with_budget(
+fn synthetic_roundtrip_call_reply_with_budget(
     kernel: &mut KernelState,
     service: &mut ProcessService,
     client_send_cap: CapId,
@@ -753,7 +753,7 @@ fn roundtrip_call_reply_with_budget(
     request: Message,
     recv_timeout_ticks: u64,
 ) -> Result<Message, ProcessManagerError> {
-    super::super::ipc_roundtrip::roundtrip_call_reply_with_budget(
+    super::super::ipc_roundtrip::synthetic_roundtrip_call_reply_with_budget(
         kernel,
         service,
         client_send_cap,
@@ -1108,7 +1108,7 @@ mod tests {
     fn process_manager_source_guardrail_prefers_budgeted_timed_receive_path() {
         let src = include_str!("service.rs");
         assert!(
-            src.contains("roundtrip_call_reply_with_budget"),
+            src.contains("synthetic_roundtrip_call_reply_with_budget"),
             "process-manager migration should keep budgeted call/reply helper"
         );
         assert!(
