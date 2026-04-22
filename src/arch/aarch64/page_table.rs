@@ -435,12 +435,16 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     crate::yarm_log!("ASW0 before computing TTBR0 asid={}", asid.0);
     let ttbr0 = cr3_for_asid(asid).ok_or(PageTableError::OutOfMemory)?;
     #[cfg(not(feature = "hosted-dev"))]
-    crate::yarm_log!("ASW1 after computing TTBR0 asid={} ttbr0=0x{:x}", asid.0, ttbr0);
+    crate::yarm_log!(
+        "ASW1 after computing TTBR0 asid={} ttbr0=0x{:x}",
+        asid.0,
+        ttbr0
+    );
     #[cfg(not(feature = "hosted-dev"))]
     unsafe {
         let sp: u64;
         core::arch::asm!("mov {0}, sp", out(reg) sp, options(nostack, preserves_flags));
-        let pc_sym = activate_asid as usize as u64;
+        let pc_sym = activate_asid as *const () as usize as u64;
         let asw3_msg_ptr = b"ASW3_RAW".as_ptr() as u64;
         crate::yarm_log!(
             "ASW1V switch_va_snapshot asid={} pc_sym=0x{:x} sp=0x{:x} asw3_msg_ptr=0x{:x}",
@@ -449,7 +453,11 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             sp,
             asw3_msg_ptr
         );
-        crate::yarm_log!("ASW2 before msr ttbr0_el1 asid={} ttbr0=0x{:x}", asid.0, ttbr0);
+        crate::yarm_log!(
+            "ASW2 before msr ttbr0_el1 asid={} ttbr0=0x{:x}",
+            asid.0,
+            ttbr0
+        );
         core::arch::asm!(
             "msr ttbr0_el1, {value}",
             value = in(reg) ttbr0,
