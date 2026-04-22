@@ -2,58 +2,71 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::kernel::boot::KernelState;
+use crate::kernel::capabilities::CapId;
+use crate::kernel::trapframe::TrapFrame;
+#[cfg(test)]
 use crate::kernel::ipc::Message;
-use crate::kernel::process::ProcessService;
-use crate::kernel::vfs::{
-    CloseRequest, OpenAtRequest, ReadWriteRequest, VfsBackend, close_message, openat_message,
-    read_message, write_message,
+use crate::services::compatibility::posix_compat::{
+    LINUX_NR_CLOSE, LINUX_NR_EXIT, LINUX_NR_GETPID, LINUX_NR_GETPPID, LINUX_NR_OPENAT,
+    LINUX_NR_READ, LINUX_NR_WRITE, POSIX_COMPAT_ABI_VERSION, PosixErrno,
+    PosixServiceBindings, dispatch,
 };
-use crate::services::common::service::FsService;
-use crate::services::compatibility::posix_compat::PosixErrno;
-use crate::services::network::socket::service::SocketAdapterService;
-use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
-use yarm_srv_common::decode::decode_u64_le;
-use yarm_srv_common::vfs_reply::VfsReply;
 
-pub struct PosixSysdepsContext<'a, B: VfsBackend> {
+/// Runtime-facing sysdeps client that speaks to process/vfs managers through
+/// the POSIX compatibility syscall dispatch and IPC bindings.
+///
+/// Deprecated in-process service ownership has been intentionally removed.
+#[derive(Debug)]
+pub struct PosixSysdepsContext<'a> {
     pub kernel: &'a mut KernelState,
-    pub proc_service: &'a mut ProcessService,
-    pub vfs_service: &'a mut FsService<B>,
-    pub socket_service: &'a mut SocketAdapterService,
+    bindings: PosixServiceBindings,
 }
 
-impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
-    pub fn new(
-        kernel: &'a mut KernelState,
-        proc_service: &'a mut ProcessService,
-        vfs_service: &'a mut FsService<B>,
-        socket_service: &'a mut SocketAdapterService,
-    ) -> Self {
+impl<'a> PosixSysdepsContext<'a> {
+    pub fn new(kernel: &'a mut KernelState) -> Self {
         Self {
             kernel,
-            proc_service,
-            vfs_service,
-            socket_service,
+            bindings: PosixServiceBindings::default(),
         }
     }
 
-    fn decode_message_u64(reply: Message) -> Result<u64, PosixErrno> {
-        decode_u64_le(reply.as_slice()).map_err(|_| PosixErrno::Inval)
+    pub fn register_process_manager(
+        &mut self,
+        request_send_cap: CapId,
+        reply_recv_cap: CapId,
+    ) -> Result<(), PosixErrno> {
+        self.bindings
+            .register_process_manager(self.kernel, request_send_cap, reply_recv_cap)
+            .map_err(PosixErrno::from)
     }
 
-    fn decode_vfs_u64(reply: Message) -> Result<usize, PosixErrno> {
-        let value = VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
-            .map_err(|_| PosixErrno::Inval)?
-            .as_u64();
-        usize::try_from(value).map_err(|_| PosixErrno::Inval)
+    pub fn register_vfs_manager(
+        &mut self,
+        request_send_cap: CapId,
+        reply_recv_cap: CapId,
+    ) -> Result<(), PosixErrno> {
+        self.bindings
+            .register_vfs_manager(self.kernel, request_send_cap, reply_recv_cap)
+            .map_err(PosixErrno::from)
     }
 
-    fn decode_vfs_fd_i32(reply: Message) -> Result<i32, PosixErrno> {
-        let fd = VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
-            .map_err(|_| PosixErrno::Inval)?
-            .expect_fd(reply.opcode)
-            .map_err(|_| PosixErrno::Inval)?;
-        i32::try_from(fd).map_err(|_| PosixErrno::Inval)
+    pub const fn abi_version(&self) -> u16 {
+        POSIX_COMPAT_ABI_VERSION
+    }
+
+    fn decode_ret(ret: usize) -> Result<usize, PosixErrno> {
+        let signed = ret as isize;
+        if signed < 0 {
+            let errno = i32::try_from(-signed).map_err(|_| PosixErrno::Inval)?;
+            return Err(PosixErrno::from_raw_errno(errno));
+        }
+        Ok(ret)
+    }
+
+    fn run_syscall(&mut self, nr: usize, args: [usize; 6]) -> Result<usize, PosixErrno> {
+        let mut frame = TrapFrame::new(nr, args);
+        dispatch(self.kernel, &self.bindings, &mut frame);
+        Self::decode_ret(frame.ret0())
     }
 
     pub fn clock_gettime_hook(&mut self) -> Result<u64, PosixErrno> {
@@ -72,42 +85,18 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
     }
 
     pub fn getpid_hook(&mut self) -> Result<u64, PosixErrno> {
-        let tid = self.kernel.current_tid().ok_or(PosixErrno::NoSys)?;
-        let reply = self.proc_service.handle(
-            Message::with_header(0, PROC_OP_GETPID, 0, None, &tid.to_le_bytes())
-                .map_err(|_| PosixErrno::Inval)?,
-        );
-        if let Ok(reply) = reply {
-            if let Ok(pid) = Self::decode_message_u64(reply) {
-                return Ok(pid);
-            }
-        }
-        Ok(tid)
+        let pid = self.run_syscall(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0])?;
+        u64::try_from(pid).map_err(|_| PosixErrno::Inval)
     }
 
     pub fn getppid_hook(&mut self) -> Result<u64, PosixErrno> {
-        let tid = self.kernel.current_tid().ok_or(PosixErrno::NoSys)?;
-        let reply = self.proc_service.handle(
-            Message::with_header(0, PROC_OP_GETPPID, 0, None, &tid.to_le_bytes())
-                .map_err(|_| PosixErrno::Inval)?,
-        );
-        if let Ok(reply) = reply {
-            if let Ok(ppid) = Self::decode_message_u64(reply) {
-                return Ok(ppid);
-            }
-        }
-        Ok(tid.saturating_sub(1))
+        let ppid = self.run_syscall(LINUX_NR_GETPPID, [0, 0, 0, 0, 0, 0])?;
+        u64::try_from(ppid).map_err(|_| PosixErrno::Inval)
     }
 
     pub fn exit_hook(&mut self, code: u64) -> Result<(), PosixErrno> {
-        let tid = self.kernel.current_tid().ok_or(PosixErrno::NoSys)?;
-        self.proc_service
-            .handle(
-                Message::with_header(tid, PROC_OP_EXIT, 0, None, &code.to_le_bytes())
-                    .map_err(|_| PosixErrno::Inval)?,
-            )
-            .map_err(|_| PosixErrno::Inval)?;
-        Ok(())
+        self.run_syscall(LINUX_NR_EXIT, [code as usize, 0, 0, 0, 0, 0])
+            .map(|_| ())
     }
 
     pub fn openat_hook(
@@ -116,30 +105,22 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
         flags: u32,
         mode: u32,
     ) -> Result<i32, PosixErrno> {
-        let reply = self
-            .vfs_service
-            .handle(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: path_ptr as u64,
-                    flags: flags as u64,
-                    mode: mode as u64,
-                })
-                .map_err(|_| PosixErrno::Inval)?,
-            )
-            .map_err(|_| PosixErrno::Inval)?;
-        Self::decode_vfs_fd_i32(reply)
+        let fd = self.run_syscall(
+            LINUX_NR_OPENAT,
+            [0, path_ptr, flags as usize, mode as usize, 0, 0],
+        )?;
+        i32::try_from(fd).map_err(|_| PosixErrno::Inval)
     }
 
+    /// Temporary adapter: socket domain routing is not yet surfaced via the
+    /// POSIX syscall dispatch table and remains unsupported here.
     pub fn socket_hook(
         &mut self,
-        domain: i32,
-        sock_type: i32,
-        protocol: i32,
+        _domain: i32,
+        _sock_type: i32,
+        _protocol: i32,
     ) -> Result<i32, PosixErrno> {
-        self.socket_service
-            .open(domain, sock_type, protocol)
-            .map_err(|_| PosixErrno::Inval)
+        Err(PosixErrno::NoSys)
     }
 
     pub fn read_hook(
@@ -148,24 +129,10 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
         buf_ptr: usize,
         buf_len: usize,
     ) -> Result<usize, PosixErrno> {
-        if self.socket_service.is_socket_fd(fd) {
-            return self
-                .socket_service
-                .read(fd, buf_len)
-                .map_err(|_| PosixErrno::Inval);
-        }
-        let reply = self
-            .vfs_service
-            .handle(
-                read_message(ReadWriteRequest {
-                    fd: fd as u64,
-                    buf_ptr: buf_ptr as u64,
-                    len: buf_len as u64,
-                })
-                .map_err(|_| PosixErrno::Inval)?,
-            )
-            .map_err(|_| PosixErrno::Inval)?;
-        Self::decode_vfs_u64(reply)
+        self.run_syscall(
+            LINUX_NR_READ,
+            [fd as usize, buf_ptr, buf_len, 0, 0, 0],
+        )
     }
 
     pub fn write_hook(
@@ -174,34 +141,15 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
         buf_ptr: usize,
         buf_len: usize,
     ) -> Result<usize, PosixErrno> {
-        if self.socket_service.is_socket_fd(fd) {
-            return self
-                .socket_service
-                .write(fd, buf_len)
-                .map_err(|_| PosixErrno::Inval);
-        }
-        let reply = self
-            .vfs_service
-            .handle(
-                write_message(ReadWriteRequest {
-                    fd: fd as u64,
-                    buf_ptr: buf_ptr as u64,
-                    len: buf_len as u64,
-                })
-                .map_err(|_| PosixErrno::Inval)?,
-            )
-            .map_err(|_| PosixErrno::Inval)?;
-        Self::decode_vfs_u64(reply)
+        self.run_syscall(
+            LINUX_NR_WRITE,
+            [fd as usize, buf_ptr, buf_len, 0, 0, 0],
+        )
     }
 
     pub fn close_hook(&mut self, fd: i32) -> Result<(), PosixErrno> {
-        if self.socket_service.is_socket_fd(fd) {
-            return self.socket_service.close(fd).map_err(|_| PosixErrno::Inval);
-        }
-        self.vfs_service
-            .handle(close_message(CloseRequest { fd: fd as u64 }).map_err(|_| PosixErrno::Inval)?)
-            .map_err(|_| PosixErrno::Inval)?;
-        Ok(())
+        self.run_syscall(LINUX_NR_CLOSE, [fd as usize, 0, 0, 0, 0, 0])
+            .map(|_| ())
     }
 }
 
@@ -209,82 +157,153 @@ impl<'a, B: VfsBackend> PosixSysdepsContext<'a, B> {
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
-    use crate::kernel::vfs::InMemoryBackend;
-    use yarm_ipc_abi::vfs_abi::VFS_OP_OPENAT;
+    use crate::std::thread;
+    use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
+    use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_WRITE};
+
+    fn run_with_large_stack<F>(f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let handle = thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large-stack test thread");
+        handle.join().expect("join large-stack test thread");
+    }
 
     #[test]
     fn service_backed_clock_hooks_use_kernel_timer() {
-        let mut kernel = Bootstrap::init().expect("init");
-        let mut proc = ProcessService::new();
-        let mut vfs = FsService::with_backend(InMemoryBackend::new());
-        let mut socket = SocketAdapterService::new();
-        let mut ctx = PosixSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
-        assert_eq!(ctx.clock_gettime_hook().expect("before"), 0);
-        ctx.nanosleep_hook(2_500_000).expect("sleep");
-        assert_eq!(ctx.clock_gettime_hook().expect("after"), 3_000_000);
+        run_with_large_stack(|| {
+            let mut kernel = Bootstrap::init().expect("init");
+            let mut ctx = PosixSysdepsContext::new(&mut kernel);
+            assert_eq!(ctx.abi_version(), POSIX_COMPAT_ABI_VERSION);
+            assert_eq!(ctx.clock_gettime_hook().expect("before"), 0);
+            ctx.nanosleep_hook(2_500_000).expect("sleep");
+            assert_eq!(ctx.clock_gettime_hook().expect("after"), 3_000_000);
+        });
     }
 
     #[test]
-    fn service_backed_proc_and_vfs_hooks_roundtrip_real_services() {
-        let mut kernel = Bootstrap::init().expect("init");
-        kernel.register_task(41).expect("task");
-        kernel.enqueue_current_cpu(41).expect("enqueue");
-        kernel.dispatch_next_task().expect("dispatch");
-        if kernel.current_tid() != Some(41) {
-            kernel.yield_current().expect("switch to task");
-        }
-        if kernel.current_tid() != Some(41) {
-            kernel.dispatch_next_task().expect("dispatch task");
-        }
-        assert_eq!(kernel.current_tid(), Some(41));
+    fn proc_and_vfs_hooks_route_via_ipc_bindings() {
+        run_with_large_stack(|| {
+            let mut kernel = Bootstrap::init().expect("init");
+            kernel.register_task(41).expect("task");
+            kernel.enqueue_current_cpu(41).expect("enqueue");
+            let _ = kernel.dispatch_next_task().expect("dispatch");
 
-        let mut proc = ProcessService::new();
-        let mut vfs = FsService::with_backend(InMemoryBackend::new());
-        let mut socket = SocketAdapterService::new();
-        let mut ctx = PosixSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
+            let (_, proc_req_send, proc_req_recv) = kernel.create_endpoint(8).expect("proc req");
+            let (_, proc_rep_send, proc_rep_recv) = kernel.create_endpoint(8).expect("proc rep");
+            let (_, vfs_req_send, vfs_req_recv) = kernel.create_endpoint(8).expect("vfs req");
+            let (_, vfs_rep_send, vfs_rep_recv) = kernel.create_endpoint(8).expect("vfs rep");
 
-        assert_eq!(ctx.getpid_hook().expect("getpid"), 41);
-        assert_eq!(ctx.getppid_hook().expect("getppid"), 40);
-        ctx.exit_hook(0).expect("exit");
+            let mut ctx = PosixSysdepsContext::new(&mut kernel);
+            ctx.register_process_manager(proc_req_send, proc_rep_recv)
+                .expect("bind proc");
+            ctx.register_vfs_manager(vfs_req_send, vfs_rep_recv)
+                .expect("bind vfs");
 
-        let fd = ctx.openat_hook(0x1000, 0, 0).expect("open");
-        assert!(fd >= 3);
-        assert_eq!(ctx.read_hook(fd, 0x2000, 128).expect("read"), 128);
-        assert_eq!(ctx.write_hook(fd, 0x2000, 11).expect("write"), 11);
-        ctx.close_hook(fd).expect("close");
-        assert_eq!(ctx.read_hook(fd, 0x2000, 1), Err(PosixErrno::Inval));
+            ctx.kernel
+                .ipc_send(
+                    proc_rep_send,
+                    Message::with_header(0, PROC_OP_GETPID, 0, None, &41u64.to_le_bytes())
+                        .expect("pid"),
+                )
+                .expect("seed pid");
+            ctx.kernel
+                .ipc_send(
+                    proc_rep_send,
+                    Message::with_header(0, PROC_OP_GETPPID, 0, None, &40u64.to_le_bytes())
+                        .expect("ppid"),
+                )
+                .expect("seed ppid");
+            ctx.kernel
+                .ipc_send(
+                    vfs_rep_send,
+                    Message::with_header(0, VFS_OP_OPENAT, 0, None, &3u64.to_le_bytes())
+                        .expect("open"),
+                )
+                .expect("seed open");
+            ctx.kernel
+                .ipc_send(
+                    vfs_rep_send,
+                    Message::with_header(0, VFS_OP_READ, 0, None, &128u64.to_le_bytes())
+                        .expect("read"),
+                )
+                .expect("seed read");
+            ctx.kernel
+                .ipc_send(
+                    vfs_rep_send,
+                    Message::with_header(0, VFS_OP_WRITE, 0, None, &11u64.to_le_bytes())
+                        .expect("write"),
+                )
+                .expect("seed write");
+            ctx.kernel
+                .ipc_send(
+                    vfs_rep_send,
+                    Message::with_header(0, VFS_OP_CLOSE, 0, None, &0u64.to_le_bytes())
+                        .expect("close"),
+                )
+                .expect("seed close");
+
+            assert_eq!(ctx.getpid_hook().expect("getpid"), 41);
+            assert_eq!(ctx.getppid_hook().expect("getppid"), 40);
+            ctx.exit_hook(7).expect("exit");
+            let proc_req0 = ctx
+                .kernel
+                .ipc_recv(proc_req_recv)
+                .expect("recv proc 0")
+                .expect("proc req 0");
+            let proc_req1 = ctx
+                .kernel
+                .ipc_recv(proc_req_recv)
+                .expect("recv proc 1")
+                .expect("proc req 1");
+            let proc_req2 = ctx
+                .kernel
+                .ipc_recv(proc_req_recv)
+                .expect("recv proc 2")
+                .expect("proc req 2");
+            let proc_opcodes = [proc_req0.opcode, proc_req1.opcode, proc_req2.opcode];
+            assert!(proc_opcodes.contains(&PROC_OP_EXIT));
+
+            let fd = ctx.openat_hook(0x1000, 0, 0).expect("open");
+            assert_eq!(fd, 3);
+            assert_eq!(ctx.read_hook(fd, 0x2000, 128).expect("read"), 128);
+            assert_eq!(ctx.write_hook(fd, 0x2000, 11).expect("write"), 11);
+            ctx.close_hook(fd).expect("close");
+
+            let req0 = ctx
+                .kernel
+                .ipc_recv(vfs_req_recv)
+                .expect("recv vfs 0")
+                .expect("vfs req 0");
+            let req1 = ctx
+                .kernel
+                .ipc_recv(vfs_req_recv)
+                .expect("recv vfs 1")
+                .expect("vfs req 1");
+            let req2 = ctx
+                .kernel
+                .ipc_recv(vfs_req_recv)
+                .expect("recv vfs 2")
+                .expect("vfs req 2");
+            let req3 = ctx
+                .kernel
+                .ipc_recv(vfs_req_recv)
+                .expect("recv vfs 3")
+                .expect("vfs req 3");
+            let opcodes = [req0.opcode, req1.opcode, req2.opcode, req3.opcode];
+            assert!(opcodes.contains(&VFS_OP_OPENAT));
+        });
     }
 
     #[test]
-    fn socket_hooks_route_through_socket_service() {
-        let mut kernel = Bootstrap::init().expect("init");
-        let mut proc = ProcessService::new();
-        let mut vfs = FsService::with_backend(InMemoryBackend::new());
-        let mut socket = SocketAdapterService::new();
-        let mut ctx = PosixSysdepsContext::new(&mut kernel, &mut proc, &mut vfs, &mut socket);
-        let fd = ctx.socket_hook(2, 1, 0).expect("socket");
-        assert!(fd >= 1000);
-        assert_eq!(ctx.read_hook(fd, 0, 128).expect("read"), 64);
-        assert_eq!(ctx.write_hook(fd, 0, 32).expect("write"), 32);
-        ctx.close_hook(fd).expect("close");
-    }
-
-    #[test]
-    fn decode_helpers_reject_malformed_or_mismatched_vfs_replies() {
-        let malformed = Message::with_header(0, VFS_OP_OPENAT, 0, None, &[1, 2, 3])
-            .expect("malformed payload message");
-        assert_eq!(
-            PosixSysdepsContext::<InMemoryBackend>::decode_vfs_fd_i32(malformed),
-            Err(PosixErrno::Inval)
-        );
-
-        let payload = 5u64.to_le_bytes();
-        let wrong_kind =
-            Message::with_header(0, yarm_ipc_abi::vfs_abi::VFS_OP_READ, 0, None, &payload)
-                .expect("read reply");
-        assert_eq!(
-            PosixSysdepsContext::<InMemoryBackend>::decode_vfs_fd_i32(wrong_kind),
-            Err(PosixErrno::Inval)
-        );
+    fn socket_hook_is_explicitly_nosys_until_ipc_route_exists() {
+        run_with_large_stack(|| {
+            let mut kernel = Bootstrap::init().expect("init");
+            let mut ctx = PosixSysdepsContext::new(&mut kernel);
+            assert_eq!(ctx.socket_hook(2, 1, 0), Err(PosixErrno::NoSys));
+        });
     }
 }
