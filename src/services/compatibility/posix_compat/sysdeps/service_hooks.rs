@@ -535,4 +535,99 @@ mod tests {
             assert_eq!(socket_args.protocol, 0);
         });
     }
+
+    #[test]
+    fn socket_hooks_errno_propagation_is_uniform_across_routed_socket_syscalls() {
+        #[derive(Clone, Copy)]
+        struct Case {
+            name: &'static str,
+            opcode: u16,
+        }
+
+        let cases = [
+            Case {
+                name: "socket_hook",
+                opcode: SOCKET_OP_SOCKET,
+            },
+            Case {
+                name: "connect_hook",
+                opcode: SOCKET_OP_CONNECT,
+            },
+            Case {
+                name: "sendto_hook",
+                opcode: SOCKET_OP_SENDTO,
+            },
+        ];
+
+        run_with_large_stack(move || {
+            let mut kernel = Bootstrap::init().expect("init");
+            let (_, socket_req_send, socket_req_recv) = kernel.create_endpoint(8).expect("socket req");
+            let (_, socket_rep_send, socket_rep_recv) = kernel.create_endpoint(8).expect("socket rep");
+            let mut ctx = PosixSysdepsContext::new(&mut kernel);
+            ctx.register_socket_manager(socket_req_send, socket_rep_recv)
+                .expect("bind socket");
+
+            for case in cases {
+                let errno = crate::services::compatibility::posix_compat::EINVAL as i64;
+                ctx.kernel
+                    .ipc_send(
+                        socket_rep_send,
+                        Message::with_header(0, case.opcode, 0, None, &(-errno).to_le_bytes())
+                            .expect("error reply"),
+                    )
+                    .expect("seed error reply");
+
+                match case.name {
+                    "socket_hook" => {
+                        let err = ctx.socket_hook(2, 1, 0).expect_err("socket should fail");
+                        assert_eq!(err, PosixErrno::Inval);
+                    }
+                    "connect_hook" => {
+                        let err = ctx
+                            .connect_hook(1001, 0xCAFE, 16)
+                            .expect_err("connect should fail");
+                        assert_eq!(err, PosixErrno::Inval);
+                    }
+                    "sendto_hook" => {
+                        let err = ctx
+                            .sendto_hook(1001, 0xBEEF, 7, 0, 0xD00D, 16)
+                            .expect_err("sendto should fail");
+                        assert_eq!(err, PosixErrno::Inval);
+                    }
+                    _ => panic!("unknown case"),
+                }
+
+                let req = ctx
+                    .kernel
+                    .ipc_recv(socket_req_recv)
+                    .expect("recv socket req")
+                    .expect("socket req");
+                assert_eq!(req.opcode, case.opcode, "{}", case.name);
+                match case.name {
+                    "socket_hook" => {
+                        let decoded = SocketArgs::decode(req.as_slice()).expect("decode socket");
+                        assert_eq!(decoded.domain, 2);
+                        assert_eq!(decoded.sock_type, 1);
+                        assert_eq!(decoded.protocol, 0);
+                    }
+                    "connect_hook" => {
+                        let decoded = ConnectArgs::decode(req.as_slice()).expect("decode connect");
+                        assert_eq!(decoded.fd, 1001);
+                        assert_eq!(decoded.addr_ptr, 0xCAFE);
+                        assert_eq!(decoded.addr_len, 16);
+                    }
+                    "sendto_hook" => {
+                        let decoded = SendToArgs::decode(req.as_slice()).expect("decode sendto");
+                        assert_eq!(decoded.fd, 1001);
+                        assert_eq!(decoded.buf_ptr, 0xBEEF);
+                        assert_eq!(decoded.len, 7);
+                        assert_eq!(decoded.flags, 0);
+                        assert_eq!(decoded.dest_addr_ptr, 0xD00D);
+                        assert_eq!(decoded.addrlen, 16);
+                    }
+                    _ => panic!("unknown case"),
+                }
+            }
+        });
+    }
 }
