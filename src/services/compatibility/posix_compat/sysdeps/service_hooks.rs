@@ -76,6 +76,10 @@ impl<'a> PosixSysdepsContext<'a> {
     fn run_syscall(&mut self, nr: usize, args: [usize; 6]) -> Result<usize, PosixErrno> {
         let mut frame = TrapFrame::new(nr, args);
         dispatch(self.kernel, &self.bindings, &mut frame);
+        if let Some(errno) = frame.error_code() {
+            let raw = i32::try_from(errno).map_err(|_| PosixErrno::Inval)?;
+            return Err(PosixErrno::from_raw_errno(raw));
+        }
         Self::decode_ret(frame.ret0())
     }
 
@@ -404,6 +408,46 @@ mod tests {
                 .sendto_hook(1001, 0xBEEF, 7, 0, 0xD00D, 16)
                 .expect("sendto");
             assert_eq!(sent, 7);
+            let sendto_req = ctx
+                .kernel
+                .ipc_recv(socket_req_recv)
+                .expect("recv sendto req")
+                .expect("sendto req");
+            assert_eq!(sendto_req.opcode, SOCKET_OP_SENDTO);
+            let sendto_args = SendToArgs::decode(sendto_req.as_slice()).expect("decode sendto");
+            assert_eq!(sendto_args.fd, 1001);
+            assert_eq!(sendto_args.buf_ptr, 0xBEEF);
+            assert_eq!(sendto_args.len, 7);
+            assert_eq!(sendto_args.flags, 0);
+            assert_eq!(sendto_args.dest_addr_ptr, 0xD00D);
+            assert_eq!(sendto_args.addrlen, 16);
+        });
+    }
+
+    #[test]
+    fn sendto_hook_propagates_negative_errno_from_socket_reply() {
+        run_with_large_stack(|| {
+            let mut kernel = Bootstrap::init().expect("init");
+            let (_, socket_req_send, socket_req_recv) = kernel.create_endpoint(8).expect("socket req");
+            let (_, socket_rep_send, socket_rep_recv) = kernel.create_endpoint(8).expect("socket rep");
+            let mut ctx = PosixSysdepsContext::new(&mut kernel);
+            ctx.register_socket_manager(socket_req_send, socket_rep_recv)
+                .expect("bind socket");
+
+            let errno = crate::services::compatibility::posix_compat::EINVAL as i64;
+            ctx.kernel
+                .ipc_send(
+                    socket_rep_send,
+                    Message::with_header(0, SOCKET_OP_SENDTO, 0, None, &(-errno).to_le_bytes())
+                        .expect("sendto error reply"),
+                )
+                .expect("seed sendto error reply");
+
+            let err = ctx
+                .sendto_hook(1001, 0xBEEF, 7, 0, 0xD00D, 16)
+                .expect_err("sendto should fail");
+            assert_eq!(err, PosixErrno::Inval);
+
             let sendto_req = ctx
                 .kernel
                 .ipc_recv(socket_req_recv)

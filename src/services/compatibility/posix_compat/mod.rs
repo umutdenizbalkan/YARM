@@ -1578,6 +1578,43 @@ mod tests {
     }
 
     #[test]
+    fn posix_dispatch_sendto_negative_errno_maps_to_trapframe_error() {
+        run_with_large_stack(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let mut bindings = PosixServiceBindings::default();
+            let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("socket req ep");
+            let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("socket rep ep");
+            bindings
+                .register_socket_manager(&state, req_send, rep_recv)
+                .expect("register socket");
+
+            let errno = EINVAL as i64;
+            state
+                .ipc_send(
+                    rep_send,
+                    Message::with_header(0, SOCKET_OP_SENDTO, 0, None, &(-errno).to_le_bytes())
+                        .expect("sendto reply"),
+                )
+                .expect("seed sendto reply");
+
+            let mut sendto = TrapFrame::new(LINUX_NR_SENDTO, [1001, 0xBEEF, 7, 0, 0xD00D, 16]);
+            dispatch(&mut state, &bindings, &mut sendto);
+            assert_eq!(sendto.error_code(), Some(EINVAL as usize));
+            assert_eq!(sendto.ret0(), 0);
+
+            let sendto_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+            assert_eq!(sendto_req.opcode, SOCKET_OP_SENDTO);
+            let sendto_args = SendToArgs::decode(sendto_req.as_slice()).expect("decode args");
+            assert_eq!(sendto_args.fd, 1001);
+            assert_eq!(sendto_args.buf_ptr, 0xBEEF);
+            assert_eq!(sendto_args.len, 7);
+            assert_eq!(sendto_args.flags, 0);
+            assert_eq!(sendto_args.dest_addr_ptr, 0xD00D);
+            assert_eq!(sendto_args.addrlen, 16);
+        });
+    }
+
+    #[test]
     fn posix_dispatch_maps_eintr_and_timeout_errno_at_shim_boundary() {
         let mut state = Bootstrap::init().expect("init");
         let mut bindings = PosixServiceBindings::default();
