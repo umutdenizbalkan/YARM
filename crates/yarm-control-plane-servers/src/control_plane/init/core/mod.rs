@@ -21,7 +21,7 @@ use yarm::kernel::capabilities::{CapId, CapRights};
 use yarm::kernel::task::TaskClass;
 use yarm::kernel::task::TaskStatus;
 use yarm::kernel::vm::Asid;
-use yarm::std::boxed::Box;
+use alloc::boxed::Box;
 use yarm_ipc_abi::supervisor_abi::{
     InitAlert, InitAlertKind, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, TaskExitedEvent,

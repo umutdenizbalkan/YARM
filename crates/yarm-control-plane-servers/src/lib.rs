@@ -3,6 +3,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub use yarm_fs_servers;
 
 pub mod control_plane;
