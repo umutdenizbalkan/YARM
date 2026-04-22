@@ -5,7 +5,10 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 #[cfg(not(feature = "hosted-dev"))]
-mod freestanding_alloc;
+yarm_freestanding_alloc::install!(
+    2 * 1024 * 1024,
+    "control-plane server freestanding allocator OOM"
+);
 
 #[inline]
 fn run() {

@@ -20,6 +20,7 @@ members = [
     "crates/yarm-compat-servers",
     "crates/yarm-runtime-tools",
     "crates/yarm-server-runtime",
+    "crates/yarm-freestanding-alloc",
 ]
 resolver = "2"
 

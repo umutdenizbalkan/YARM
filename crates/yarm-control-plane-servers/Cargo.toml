@@ -12,6 +12,7 @@ hosted-dev = ["yarm/hosted-dev"]
 
 [dependencies]
 yarm = { path = "../..", default-features = false }
+yarm-freestanding-alloc = { path = "../yarm-freestanding-alloc" }
 yarm-fs-servers = { path = "../yarm-fs-servers", default-features = false }
 yarm-ipc-abi = { path = "../yarm-ipc-abi" }
 yarm-srv-common = { path = "../yarm-srv-common" }

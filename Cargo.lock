@@ -24,6 +24,7 @@ name = "yarm-control-plane-servers"
 version = "0.1.0"
 dependencies = [
  "yarm",
+ "yarm-freestanding-alloc",
  "yarm-fs-servers",
  "yarm-ipc-abi",
  "yarm-srv-common",
@@ -36,6 +37,10 @@ dependencies = [
  "yarm",
  "yarm-fs-servers",
 ]
+
+[[package]]
+name = "yarm-freestanding-alloc"
+version = "0.1.0"
 
 [[package]]
 name = "yarm-fs-servers"
@@ -75,6 +80,7 @@ dependencies = [
  "yarm",
  "yarm-control-plane-servers",
  "yarm-driver-servers",
+ "yarm-freestanding-alloc",
  "yarm-fs-servers",
  "yarm-network-servers",
  "yarm-ui-servers",
