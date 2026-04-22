@@ -3276,7 +3276,7 @@ fn supervisor_receives_task_exit_report() {
     assert_eq!(msg.opcode, 0xEE);
     assert_eq!(msg.as_slice().len(), 24);
     let event =
-        crate::kernel::supervisor_abi::TaskExitedEvent::decode(msg.as_slice()).expect("event");
+        yarm_ipc_abi::supervisor_abi::TaskExitedEvent::decode(msg.as_slice()).expect("event");
     assert_eq!(event.tid, 7);
     assert_eq!(event.exit_code, 99);
     assert_eq!(event.restart_token, 55);
@@ -3302,11 +3302,11 @@ fn supervisor_receives_transfer_revoke_report() {
     let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
     assert_eq!(
         msg.opcode,
-        crate::kernel::supervisor_abi::SUPERVISOR_OP_TRANSFER_REVOKED
+        yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TRANSFER_REVOKED
     );
     assert_eq!(msg.as_slice().len(), 32);
     let event =
-        crate::kernel::supervisor_abi::TransferRevokedEvent::decode(msg.as_slice()).expect("event");
+        yarm_ipc_abi::supervisor_abi::TransferRevokedEvent::decode(msg.as_slice()).expect("event");
     assert_eq!(event.owner_pid, 7);
     assert_eq!(event.cap, 12);
     assert_eq!(event.base, 0xA000);

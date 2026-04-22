@@ -6,7 +6,7 @@ extern crate yarm;
 use yarm::kernel::boot::{Bootstrap, KernelError};
 use yarm::kernel::ipc::Message;
 use yarm::kernel::process_abi::PROC_OP_SPAWN_V2;
-use yarm::kernel::supervisor_abi::{DEP_PROCESS_MANAGER, DEP_VFS, RegisterDriverRequest};
+use yarm_ipc_abi::supervisor_abi::{DEP_PROCESS_MANAGER, DEP_VFS, RegisterDriverRequest};
 use yarm::kernel::task::TaskClass;
 use yarm::kernel::vfs::{
     MountNamespacePolicy, MountRouter, OpenAtRequest, VfsError, openat_message,

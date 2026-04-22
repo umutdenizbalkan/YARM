@@ -13,7 +13,6 @@ pub mod process;
 pub mod scheduler;
 pub mod scheduler_timer;
 pub mod smp;
-pub mod supervisor_abi;
 pub mod syscall;
 pub mod task;
 pub mod time;
