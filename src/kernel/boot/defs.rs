@@ -4,13 +4,13 @@
 use super::*;
 
 #[cfg(feature = "hosted-dev")]
-pub(crate) type KernelStorage<T> = crate::std::boxed::Box<T>;
+pub(crate) type KernelStorage<T> = alloc::boxed::Box<T>;
 #[cfg(not(feature = "hosted-dev"))]
 pub(crate) type KernelStorage<T> = T;
 
 #[cfg(feature = "hosted-dev")]
 pub(crate) fn store_kernel_value<T>(value: T) -> KernelStorage<T> {
-    crate::std::boxed::Box::new(value)
+    alloc::boxed::Box::new(value)
 }
 #[cfg(not(feature = "hosted-dev"))]
 pub(crate) fn store_kernel_value<T>(value: T) -> KernelStorage<T> {

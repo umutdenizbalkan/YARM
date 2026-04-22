@@ -170,7 +170,7 @@ impl Bootstrap {
         Self::init_with_capacity_profile(Self::default_capacity_profile())
     }
 
-    pub fn init_boxed() -> Result<crate::std::boxed::Box<KernelState>, KernelError> {
+    pub fn init_boxed() -> Result<alloc::boxed::Box<KernelState>, KernelError> {
         Self::init_boxed_with_capacity_profile(Self::default_capacity_profile())
     }
 
@@ -201,7 +201,7 @@ impl Bootstrap {
     #[inline(never)]
     pub fn init_boxed_with_capacity_profile(
         capacity_profile: KernelCapacityProfile,
-    ) -> Result<crate::std::boxed::Box<KernelState>, KernelError> {
+    ) -> Result<alloc::boxed::Box<KernelState>, KernelError> {
         let (boot_map, boot_map_len) = Self::default_boot_memory_map();
         let reserved = Self::default_reserved_ranges();
         let state = Self::init_static_with_boot_memory_map(
@@ -209,8 +209,7 @@ impl Bootstrap {
             &boot_map[..boot_map_len],
             &reserved,
         )?;
-        let mut boxed =
-            crate::std::boxed::Box::new(core::mem::MaybeUninit::<KernelState>::uninit());
+        let mut boxed = alloc::boxed::Box::new(core::mem::MaybeUninit::<KernelState>::uninit());
         unsafe {
             core::ptr::copy_nonoverlapping(state as *mut KernelState, boxed.as_mut_ptr(), 1);
             Ok(boxed.assume_init())

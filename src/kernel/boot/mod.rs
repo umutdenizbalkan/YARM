@@ -56,7 +56,7 @@ use crate::kernel::frame_allocator::{
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::lock::SpinLockIrq;
 #[cfg(feature = "hosted-dev")]
-use crate::std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
 use tid_allocation_policy::{TidAllocationCursor, TidAllocationPolicy};
 
 const MAX_ENDPOINTS: usize = 64;
