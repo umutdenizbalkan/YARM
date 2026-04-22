@@ -3,10 +3,10 @@
 
 use core::mem;
 
-use crate::kernel::boot::{CapacityTelemetry, IpcPathTelemetry, KernelCapacityProfile};
-use crate::kernel::capabilities::{CNodeId, CapId, CapRights, CapabilityDeriveError};
-use crate::kernel::ipc::{Message, SharedMemoryRegion, ThreadId, TransferCapId};
-use crate::kernel::scheduler::{CpuId, SchedulerError, TaskPriority};
+use yarm::kernel::boot::{CapacityTelemetry, IpcPathTelemetry, KernelCapacityProfile};
+use yarm::kernel::capabilities::{CNodeId, CapId, CapRights, CapabilityDeriveError};
+use yarm::kernel::ipc::{Message, SharedMemoryRegion, ThreadId, TransferCapId};
+use yarm::kernel::scheduler::{CpuId, SchedulerError, TaskPriority};
 
 #[test]
 fn extracted_kernel_type_families_match_yarm_kernel_layouts() {
@@ -69,10 +69,10 @@ fn extracted_kernel_type_families_match_yarm_kernel_layouts() {
 
 #[test]
 fn extraction_bridge_sources_keep_yarm_kernel_reexports() {
-    let ipc_src = include_str!("ipc.rs");
-    let cap_src = include_str!("capabilities.rs");
-    let sched_src = include_str!("scheduler.rs");
-    let boot_types_src = include_str!("boot/types.rs");
+    let ipc_src = include_str!("../src/kernel/ipc.rs");
+    let cap_src = include_str!("../src/kernel/capabilities.rs");
+    let sched_src = include_str!("../src/kernel/scheduler.rs");
+    let boot_types_src = include_str!("../src/kernel/boot/types.rs");
 
     assert!(ipc_src.contains("pub use yarm_kernel::ipc::{"));
     assert!(cap_src.contains("pub use yarm_kernel::capability::{"));

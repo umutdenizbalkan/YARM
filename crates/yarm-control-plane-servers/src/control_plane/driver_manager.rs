@@ -104,41 +104,59 @@ pub fn handle_request(kernel: &mut KernelState, request: Message) -> Result<Mess
 mod tests {
     use super::*;
     use yarm::kernel::boot::Bootstrap;
+    use yarm::std::thread;
     use yarm_ipc_abi::driver_abi::{DRIVER_OP_GRANT_IRQ, pack_driver_pair};
+
+    fn run_with_large_stack<F>(f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let handle = thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large-stack test thread");
+        handle.join().expect("join large-stack test thread");
+    }
 
     #[test]
     fn driver_manager_register_and_grant_irq_roundtrip() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(7).expect("task");
+        run_with_large_stack(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(7).expect("task");
 
-        let register_msg =
-            Message::with_header(0, DRIVER_OP_REGISTER, 0, None, &7u64.to_le_bytes()).expect("msg");
-        let register_reply = handle_request(&mut state, register_msg).expect("handle");
-        assert_eq!(register_reply.opcode, DRIVER_OP_REGISTER);
-
-        let grant_msg =
-            Message::with_header(0, DRIVER_OP_GRANT_IRQ, 0, None, &pack_driver_pair(7, 9))
+            let register_msg = Message::with_header(0, DRIVER_OP_REGISTER, 0, None, &7u64.to_le_bytes())
                 .expect("msg");
-        let reply = handle_request(&mut state, grant_msg).expect("handle");
-        assert_eq!(reply.opcode, DRIVER_OP_GRANT_IRQ);
-        assert!(reply.transferred_cap().is_some());
+            let register_reply = handle_request(&mut state, register_msg).expect("handle");
+            assert_eq!(register_reply.opcode, DRIVER_OP_REGISTER);
+
+            let grant_msg =
+                Message::with_header(0, DRIVER_OP_GRANT_IRQ, 0, None, &pack_driver_pair(7, 9))
+                    .expect("msg");
+            let reply = handle_request(&mut state, grant_msg).expect("handle");
+            assert_eq!(reply.opcode, DRIVER_OP_GRANT_IRQ);
+            assert!(reply.transferred_cap().is_some());
+        });
     }
 
     #[test]
     fn driver_service_tracks_handled_requests() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(5).expect("task");
+        run_with_large_stack(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(5).expect("task");
 
-        let register = Message::with_header(0, DRIVER_OP_REGISTER, 0, None, &5u64.to_le_bytes())
-            .expect("register");
-        let irq = Message::with_header(0, DRIVER_OP_GRANT_IRQ, 0, None, &pack_driver_pair(5, 2))
-            .expect("irq");
+            let register =
+                Message::with_header(0, DRIVER_OP_REGISTER, 0, None, &5u64.to_le_bytes())
+                    .expect("register");
+            let irq =
+                Message::with_header(0, DRIVER_OP_GRANT_IRQ, 0, None, &pack_driver_pair(5, 2))
+                    .expect("irq");
 
-        let mut service = DriverService::new();
-        let handled = service
-            .handle_batch(&mut state, [register, irq])
-            .expect("batch");
-        assert_eq!(handled, 2);
-        assert_eq!(service.handled_count(), 2);
+            let mut service = DriverService::new();
+            let handled = service
+                .handle_batch(&mut state, [register, irq])
+                .expect("batch");
+            assert_eq!(handled, 2);
+            assert_eq!(service.handled_count(), 2);
+        });
     }
 }
