@@ -145,11 +145,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: phase3 recovery + ui marker combined gate
-        run: |
-          cargo test -q services::network::sim::tests::link_flap_dhcp_rebind_and_socket_recovery_is_deterministic
-          cargo run -q -p yarm-ui-servers --bin display_srv | tee /tmp/display_srv_combined.log
-          rg -n "\[ui\] boot-to-shell marker" /tmp/display_srv_combined.log
+      - name: phase3 recovery + ui marker combined gate (workspace authoritative)
+        run: scripts/phase3-4-strict-runtime-gate.sh
 
   mount-failure-matrix-sim-gate:
     runs-on: ubuntu-latest
