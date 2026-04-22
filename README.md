@@ -195,6 +195,14 @@ scripts/phase5-boundary-gates.sh --driver-runtime-entrypoint
 
 This checks driver runtime-entrypoint parity and driver bins buildability.
 
+Before pushing network service/runtime changes, run:
+
+```bash
+scripts/phase5-boundary-gates.sh --network-runtime-entrypoint
+```
+
+This checks network runtime-entrypoint parity and network bins buildability.
+
 ---
 
 <div align="center">
