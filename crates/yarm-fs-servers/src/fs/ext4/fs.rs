@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::vfs::{VfsBackend, VfsError};
-use yarm::service_common::fs::{FdRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend};
+use super::super::common::fs::{FdRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend};
 
 use super::dir::find_inode_index;
 use super::file::checked_append;

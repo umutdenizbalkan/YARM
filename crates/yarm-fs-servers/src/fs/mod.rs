@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 pub mod blkcache;
+pub mod common;
 pub mod devfs;
 pub mod ext4;
 pub mod fat;

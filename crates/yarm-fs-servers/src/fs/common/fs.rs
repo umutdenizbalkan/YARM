@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::vfs::{VfsBackend, VfsError};
+use yarm::kernel::vfs::{VfsBackend, VfsError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InodeRecord {

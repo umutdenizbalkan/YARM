@@ -855,7 +855,7 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
 }
 
 fn run_rw_mount_cycle<B: yarm::kernel::vfs::VfsBackend>(
-    service: &mut yarm::service_common::service::FsService<B>,
+    service: &mut yarm::yarm_fs_servers::common::service::FsService<B>,
     path_ptr: u64,
     write_len: u64,
 ) -> Result<(), KernelError> {

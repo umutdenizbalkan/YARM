@@ -4,7 +4,7 @@
 use yarm::kernel::boot::{KernelError, KernelState};
 use yarm::kernel::capabilities::CapId;
 use yarm::kernel::ipc::{Message, ThreadId};
-use yarm::service_common::service::RequestResponseService;
+use yarm_srv_common::service_loop::RequestResponseService;
 
 pub fn roundtrip_call_reply_with_budget<S, E, FKernel, FMalformed, FMissingTid>(
     kernel: &mut KernelState,
@@ -19,7 +19,7 @@ pub fn roundtrip_call_reply_with_budget<S, E, FKernel, FMalformed, FMissingTid>(
     missing_tid_err: FMissingTid,
 ) -> Result<Message, E>
 where
-    S: RequestResponseService<Error = E>,
+    S: RequestResponseService<Message, Message, Error = E>,
     FKernel: Fn(KernelError) -> E + Copy,
     FMalformed: Fn() -> E + Copy,
     FMissingTid: Fn() -> E + Copy,

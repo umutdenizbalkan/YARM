@@ -17,8 +17,6 @@ pub extern crate std;
 pub mod arch;
 pub mod kernel;
 pub mod runtime;
-#[path = "services/common/mod.rs"]
-pub mod service_common;
 #[path = "services/compatibility/mod.rs"]
 pub mod compatibility;
 #[path = "../crates/yarm-control-plane-servers/src/control_plane/init/core/mod.rs"]

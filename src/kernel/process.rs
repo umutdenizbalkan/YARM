@@ -8,7 +8,7 @@ use super::process_abi::{
     WaitPidV2Reply,
 };
 use super::task::{TaskClass, ThreadGroupId};
-use crate::service_common::service::RequestResponseService;
+use yarm_srv_common::service_loop::RequestResponseService;
 
 const MAX_PROCESSES: usize = 64;
 const MAX_THREADS: usize = 128;
@@ -706,7 +706,7 @@ impl ProcessService {
     }
 }
 
-impl RequestResponseService for ProcessService {
+impl RequestResponseService<Message, Message> for ProcessService {
     type Error = ProcessManagerError;
 
     fn service_name(&self) -> &'static str {

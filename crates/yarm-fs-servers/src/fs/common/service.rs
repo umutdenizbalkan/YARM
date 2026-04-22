@@ -1,29 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::ipc::Message;
-use crate::kernel::vfs::{VfsBackend, VfsError};
-use crate::service_common::vfs_service::VfsService;
-
-pub trait RequestResponseService {
-    type Error;
-
-    fn service_name(&self) -> &'static str;
-    fn handle(&mut self, request: Message) -> Result<Message, Self::Error>;
-}
-
-pub fn run_typed_request_loop<S: RequestResponseService, const N: usize>(
-    service: &mut S,
-    requests: [Message; N],
-) -> Result<[Message; N], S::Error> {
-    let mut replies = [const { None }; N];
-    let mut idx = 0;
-    while idx < N {
-        replies[idx] = Some(service.handle(requests[idx])?);
-        idx += 1;
-    }
-    Ok(replies.map(|reply| reply.expect("all replies are populated")))
-}
+use yarm::kernel::ipc::Message;
+use yarm::kernel::vfs::{VfsBackend, VfsError};
+use super::vfs_service::VfsService;
+use yarm_srv_common::service_loop::RequestResponseService;
 
 #[derive(Debug)]
 pub struct FsService<B: VfsBackend> {
@@ -58,7 +39,7 @@ impl<B: VfsBackend> FsService<B> {
     }
 }
 
-impl<B: VfsBackend> RequestResponseService for FsService<B> {
+impl<B: VfsBackend> RequestResponseService<Message, Message> for FsService<B> {
     type Error = VfsError;
 
     fn service_name(&self) -> &'static str {
@@ -73,7 +54,8 @@ impl<B: VfsBackend> RequestResponseService for FsService<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::vfs::{InMemoryBackend, OpenAtRequest, openat_message};
+    use yarm::kernel::vfs::{InMemoryBackend, OpenAtRequest, openat_message};
+    use yarm_srv_common::service_loop::run_typed_request_loop;
 
     #[test]
     fn typed_request_loop_runs_all_requests() {

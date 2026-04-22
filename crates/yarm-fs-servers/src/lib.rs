@@ -4,7 +4,7 @@
 #![no_std]
 
 pub mod fs;
-pub use fs::{blkcache, devfs, ext4, fat, initramfs, ramfs};
+pub use fs::{blkcache, common, devfs, ext4, fat, initramfs, ramfs};
 
 pub fn run_devfs() {
     fs::devfs::run();

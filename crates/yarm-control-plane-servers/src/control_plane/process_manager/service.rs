@@ -9,7 +9,7 @@ use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
 use yarm::kernel::syscall::SyscallError;
 use yarm::kernel::task::TaskClass;
 use yarm::runtime::SharedKernel;
-use yarm::service_common::service::run_typed_request_loop;
+use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4, PROC_OP_WAITPID_V2,
     SpawnV2Args, SpawnV3Args, SpawnV4Args, WaitPidV2Args,

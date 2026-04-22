@@ -5,7 +5,7 @@ use super::fs::FatBackend;
 use yarm::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
-use yarm::service_common::service::FsService;
+use super::super::common::service::FsService;
 use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type FatService = FsService<FatBackend>;

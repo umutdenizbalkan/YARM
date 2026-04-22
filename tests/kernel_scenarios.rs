@@ -12,7 +12,7 @@ use yarm::kernel::vfs::{
     MountNamespacePolicy, MountRouter, OpenAtRequest, VfsError, openat_message,
 };
 use yarm::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
-use yarm::service_common::vfs_service::VfsService;
+use yarm::yarm_fs_servers::common::vfs_service::VfsService;
 use yarm::yarm_control_plane_servers::supervisor::SupervisorService;
 use yarm::yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
 use yarm::yarm_fs_servers::ramfs::RamFsBackend;
