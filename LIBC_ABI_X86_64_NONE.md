@@ -24,7 +24,7 @@ This freeze is intentionally strict to avoid ambiguous capability ownership acro
 
 ## Frozen syscall numbers for minimal bootstrap
 
-These numbers are already defined and tested in `src/services/compatibility/linux_compat/mod.rs`:
+These numbers are already defined and tested in `crates/yarm-compat-servers/src/posix_compat/mod.rs`:
 
 - `brk`: 214
 - `mmap`: 222
@@ -52,7 +52,7 @@ These numbers are already defined and tested in `src/services/compatibility/linu
 ## Relationship to milestone tracking
 
 - Milestone 2 checklist items in `X86_64_NONE_MUSL_PORT_TODO.md` are grounded in the constants, mapping logic, and tests already present in `linux_compat/mod.rs`.
-- Milestone 3 is partially implemented in `src/services/compatibility/linux_compat/sysdeps.rs`: startup/memory/thread/futex hooks and timer-backed clock hooks exist, but full musl crt/`__libc_start_main` integration is still pending.
+- Milestone 3 is partially implemented in `crates/yarm-compat-servers/src/posix_compat/sysdeps.rs`: startup/memory/thread/futex hooks and timer-backed clock hooks exist, but full musl crt/`__libc_start_main` integration is still pending.
 
 ## Bootstrap sysdeps coverage now implemented
 

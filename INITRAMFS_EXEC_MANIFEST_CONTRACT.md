@@ -12,7 +12,7 @@ core service images in initramfs.
   - `process_manager.srv`
   - `vfs.srv`
   - `supervisor.srv`
-- Parser: `src/services/fs/initramfs/manifest.rs`
+- Parser: `crates/yarm-fs-servers/src/fs/initramfs/manifest.rs`
 
 ## Wire format (little-endian)
 

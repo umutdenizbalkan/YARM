@@ -87,7 +87,7 @@ into a dedicated user address space.
 ### File touch-list
 - `src/arch/x86_64/boot.rs`
 - `src/kernel/boot/exec_state.rs`
-- `src/services/fs/initramfs/manifest.rs` (if additional metadata is needed)
+- `crates/yarm-fs-servers/src/fs/initramfs/manifest.rs` (if additional metadata is needed)
 
 ### Acceptance tests
 - First dispatched user task entrypoint equals manifest/ELF entrypoint.
@@ -113,7 +113,7 @@ into a dedicated user address space.
 - `src/kernel/boot/capability_state.rs`
 - `src/kernel/boot/cnode_state.rs`
 - `src/kernel/boot/task_policy_state.rs`
-- `src/services/init/mod.rs`
+- `crates/yarm-control-plane-servers/src/control_plane/init/core/mod.rs`
 - `INIT_SERVER_BOOT_CONTRACT.md`
 
 ### Acceptance tests
@@ -137,8 +137,8 @@ into a dedicated user address space.
 - Keep boot/runtime policy boundaries explicit.
 
 ### File touch-list
-- `src/services/control_plane/init/service.rs`
-- `src/services/init/mod.rs`
+- `crates/yarm-control-plane-servers/src/control_plane/init/service.rs`
+- `crates/yarm-control-plane-servers/src/control_plane/init/core/mod.rs`
 - `src/arch/x86_64/boot.rs`
 - `src/kernel/boot/types.rs`
 

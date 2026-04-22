@@ -34,8 +34,8 @@ This contract defines minimal invariants for UI-facing services (`display`, `com
 ## CI gate mapping
 
 - `kernel::syscall::tests::transfer_send_without_waiter_returns_would_block`
-- `services::ui::display::service::tests::boot_marker_is_stable`
-- `services::ui::display::service::tests::display_tracks_modeset_and_present`
-- `services::ui::compositor::service::tests::compositor_replay_is_deterministic`
-- `services::ui::shell::service::tests::shell_session_counter_increments`
+- `yarm_ui_servers::ui::display::service::tests::boot_marker_is_stable`
+- `yarm_ui_servers::ui::display::service::tests::display_tracks_modeset_and_present`
+- `yarm_ui_servers::ui::compositor::service::tests::compositor_replay_is_deterministic`
+- `yarm_ui_servers::ui::shell::service::tests::shell_session_counter_increments`
 - `phase4-ui-smoke-marker` job in `.github/workflows/compat-gates.yml`

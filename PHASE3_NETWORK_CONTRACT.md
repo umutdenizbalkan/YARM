@@ -29,10 +29,10 @@ This contract defines minimal invariants for networking services (`netmgr`, `tcp
 ## CI gate mapping
 
 - `kernel::syscall::tests::transfer_send_without_waiter_returns_would_block`
-- `services::network::netmgr::service::tests::netmgr_tracks_link_state_events`
-- `services::network::tcpip::service::tests::tcpip_deterministic_packet_path`
-- `services::network::dns::service::tests::dns_timeout_retry_is_reproducible`
-- `services::network::dhcp::service::tests::dhcp_lease_accounting_is_deterministic`
-- `services::network::socket::service::tests::socket_adapter_roundtrip_is_accounted`
-- `services::network::sim::tests::deterministic_network_bootstrap_flow_is_stable`
-- `services::network::sim::tests::link_flap_dhcp_rebind_and_socket_recovery_is_deterministic`
+- `yarm_network_servers::network::netmgr::service::tests::netmgr_tracks_link_state_events`
+- `yarm_network_servers::network::tcpip::service::tests::tcpip_deterministic_packet_path`
+- `yarm_network_servers::network::dns::service::tests::dns_timeout_retry_is_reproducible`
+- `yarm_network_servers::network::dhcp::service::tests::dhcp_lease_accounting_is_deterministic`
+- `yarm_network_servers::network::socket::service::tests::socket_adapter_roundtrip_is_accounted`
+- `yarm_network_servers::network::sim::tests::deterministic_network_bootstrap_flow_is_stable`
+- `yarm_network_servers::network::sim::tests::link_flap_dhcp_rebind_and_socket_recovery_is_deterministic`

@@ -59,7 +59,7 @@ These IDs are registered by `InitService::register_core_graph` and assigned serv
 
 ## Notes
 
-- The runtime init entrypoint in `src/services/control_plane/init/service.rs` accepts an externally prepared `KernelState` plus `InitRuntimeBootConfig`, so boot/runtime wiring no longer has to be hardcoded to `Bootstrap::init()`.
+- The runtime init entrypoint in `crates/yarm-control-plane-servers/src/control_plane/init/service.rs` accepts an externally prepared `KernelState` plus `InitRuntimeBootConfig`, so boot/runtime wiring no longer has to be hardcoded to `Bootstrap::init()`.
 - Launch ordering routes through `launch_core_services` with explicit core image plan and failure transition support (`mark_failed`).
 - Restart/fault policy handoff is represented by `InitFaultHandoff` and must be installed before `Running`.
 - Mount orchestration now executes real service-backed mount activity for the configured mount plan instead of only counting deterministic placeholders.

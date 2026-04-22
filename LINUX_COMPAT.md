@@ -108,7 +108,7 @@ The payload shape is a fixed 16-byte little-endian tuple (`arg0`, `arg1`) and is
 
 The process-manager v2 path also defines a typed `ProcV2Args` 16-byte codec (`arg0`, `arg1`) with explicit codec version constant (`PROC_CODEC_V2_VERSION`) to freeze payload semantics before adding broader spawn/wait APIs.
 
-A minimal VFS service scaffold now exists in the control-plane service layer (`src/services/control_plane/vfs/service.rs`) and is exercised by `src/bin/vfs_server.rs`.
+A minimal VFS service scaffold now exists in the control-plane service layer (`crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs`) and is exercised by `crates/yarm-control-plane-servers/src/bin/vfs_server.rs`.
 
 The compatibility test suite now includes an end-to-end personality shim flow (`getpid` + `openat` + `exit`) to verify process-manager and VFS routing in one sequence.
 The compatibility test suite also includes a deterministic mixed syscall sequence (`getpid`/`openat`) to ensure stable cross-server routing behavior over repeated dispatch cycles.

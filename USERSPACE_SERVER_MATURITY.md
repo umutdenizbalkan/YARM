@@ -1,43 +1,43 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# User-space Server Maturity Plan (no_std microkernel profile)
+# Userspace Server Maturity (Current)
 
-This plan tracks the transition from mechanism-complete kernel internals to production-quality user-space servers.
+This document tracks maturity by extracted workspace service domain.
 
-## Scope
+## Domain map
 
-- `process_manager.srv` maturity (parent/child semantics, integrated exit/wait discipline, restart signaling breadth)
-- `vfs.srv` maturity (typed ABI conformance, mount routing, deterministic operation ordering)
-- `driver *.srv` maturity (delegation from `init.srv`, revoke/restart lifecycle)
+- Control plane: `crates/yarm-control-plane-servers`
+- Drivers: `crates/yarm-driver-servers`
+- Filesystems: `crates/yarm-fs-servers`
+- Networking: `crates/yarm-network-servers`
+- UI: `crates/yarm-ui-servers`
+- Compatibility: `crates/yarm-compat-servers`
 
-## Maturity gates
+## Current maturity signals
 
-1. **Protocol gate**
-   - All IPC request/reply payloads have versioned typed codecs.
-   - Golden-vector tests prevent silent wire-format drift.
+### Structural
 
-2. **Policy gate**
-   - Delegation chain is explicit (`init.srv` -> service).
-   - Service role policy is enforced for hardware delegation.
-   - Delegation graph remains mechanism-auditable (allowed role edges are explicit and test-covered).
+- Dedicated workspace crates own service code and bins.
+- Root crate is no longer the monolithic service owner.
+- Boundary checks enforce crate-graph and source-shape constraints.
 
-3. **Determinism gate**
-   - Deterministic simulation scripts cover mixed subsystem interaction:
-     - process-manager requests
-     - VFS requests
-     - notification/IRQ delivery
+### Behavioral
 
-4. **Lifecycle gate**
-   - Restart/revoke behavior is test-covered for driver-facing runtime caps.
-   - Process-manager wait/reap permissions are test-covered.
-   - `spawn_v2` drives an image-backed launch path rather than pid allocation only.
-   - `exit` mutates process lifecycle through the service path, and waiting on a running child yields a typed non-ready condition.
+- Domain-specific deterministic tests exist in service crates.
+- Runtime-entrypoint parity checks exist for FS/driver/network/UI domains.
+- Shared ABI contracts are centralized in `crates/yarm-ipc-abi`.
 
-5. **Scenario harness gate**
-   - Reusable deterministic scenario catalog is present.
-   - All catalog scenarios must replay to fixed expected summaries (proc/vfs/irq + request counts).
+### Compatibility
 
-## Constraints
+- POSIX compatibility is crate-owned (`yarm-compat-servers`) and binding-backed.
+- Socket syscall routing uses shared socket ABI contracts and IPC dispatch bindings.
 
-- Keep kernel code `#![no_std]` and avoid `std` usage in mechanism paths.
-- Keep architecture-specific logic under `arch/*`; kernel modules remain portable.
+## Main maturity gates contributors should run
+
+```bash
+scripts/phase5-boundary-gates.sh
+scripts/phase5-boundary-gates.sh --fs-runtime-entrypoint
+scripts/phase5-boundary-gates.sh --driver-runtime-entrypoint
+scripts/phase5-boundary-gates.sh --network-runtime-entrypoint
+scripts/phase5-boundary-gates.sh --ui-runtime-entrypoint
+```

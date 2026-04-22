@@ -1,45 +1,33 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Shared-memory IPC Migration Guide (Phase 6)
+# Shared IPC Migration Guide (Current)
 
-This guide describes how to migrate servers and clients to the frozen shared-memory IPC contract.
+This guide reflects the current workspace boundary.
 
-## What changed in Phase 6
+## Ownership model
 
-- User-mode `IpcRecv` for `OPCODE_SHARED_MEM` now requires auto-map inputs (`ptr != 0`, sufficient `len`).
-- Descriptor-only user receive fallback is removed.
-- Transfer lifecycle must use:
-  1. `IpcRecv` auto-map
-  2. consume mapped region
-  3. `TransferRelease` (explicit bounds or fast-path `ptr=0,len=0`)
+- ABI opcode/payload ownership: `crates/yarm-ipc-abi`
+- Shared service-side helper/runtime glue: `crates/yarm-srv-common`
+- Service implementation ownership: extracted server crates (`yarm-*-servers`)
 
-## Sender-side requirements
+## Migration rule
 
-1. For payloads larger than inline size, send a transfer-cap-enabled message.
-2. Ensure descriptor offset/length remain page-aligned and bounded by the delegated memory object.
-3. Reuse transfer windows to reduce allocation churn under steady throughput.
+When migrating an IPC surface:
 
-## Receiver-side requirements
+1. Define/freeze request+reply codec in `yarm-ipc-abi`.
+2. Use shared decode/reply helpers from `yarm-srv-common` where applicable.
+3. Keep policy/orchestration in service crates, not kernel.
+4. Add deterministic tests in the owning service crate.
 
-1. Call `IpcRecv(recv_cap, target_va, budget_len, ...)` with page-aligned `target_va`.
-2. Read mapped bytes from `ret` metadata and process in-place.
-3. Call `TransferRelease(transfer_cap, 0, 0, ...)` for active-mapping fast-path recycle, or pass explicit bounds when needed.
+## Shared-memory flow expectations
 
-## Compatibility checklist
+For transfer-cap/shared-memory flows:
 
-- [ ] no user client relies on descriptor-only shared-memory receive
-- [ ] every shared-memory receive path has a `TransferRelease` path
-- [ ] server/client rings apply bounded in-flight transfer depth
-- [ ] telemetry (`shared_mem_bytes_mapped`, `shared_mem_bytes_released`, `transfer_release_calls`) is monitored
+1. receive/map through the current IPC contract,
+2. consume in bounded region,
+3. release transfer mapping (`TransferRelease`) to avoid leaks/drift.
 
-## Rollout notes
+## Gate expectations
 
-- Roll out by service class: filesystem, network, display.
-- Keep per-service canaries that verify map/release parity under load.
-- Treat any sustained map>release byte drift as a leak/regression signal.
-
-## Phase 7 hardening checks
-
-- Run `shared_mem_canary_map_release_parity_under_repeated_load` as a pre-merge runtime canary.
-- Run `scripts/phase7-shared-ipc-gates.sh` in CI to enforce docs/tests/migration invariants.
-- Escalate immediately if canary drift (`shared_mem_bytes_mapped != shared_mem_bytes_released`) persists for two consecutive runs.
+- run `scripts/phase7-shared-ipc-gates.sh` for shared-IPC migration checks
+- keep map/release parity checks green in canary tests

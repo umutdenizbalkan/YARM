@@ -128,21 +128,21 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 ## Phase 6 artifacts (pass 2)
 
 - First core-service migration cut:
-  - `src/services/control_plane/vfs/service.rs` now uses timed receive (`ipc_recv_with_deadline`) in its kernel-IPC request/response roundtrip path for both server-side request receive and client-side reply receive.
+  - `crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs` now uses timed receive (`ipc_recv_with_deadline`) in its kernel-IPC request/response roundtrip path for both server-side request receive and client-side reply receive.
 - Migration guard:
   - added VFS control-plane canary test for timed-receive empty-queue behavior under deadline receive path.
 
 ## Phase 6 artifacts (pass 3)
 
 - Timed-recv migration hardening for first service cut (VFS):
-  - `src/services/control_plane/vfs/service.rs` now routes roundtrip receive operations through a budgeted helper (`roundtrip_ipc_with_budget`) so timeout policy is explicit and testable.
+  - `crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs` now routes roundtrip receive operations through a budgeted helper (`roundtrip_ipc_with_budget`) so timeout policy is explicit and testable.
 - Migration guard coverage:
   - added VFS canary validating zero-tick budget behavior on queued request/reply flow.
 
 ## Phase 6 artifacts (pass 4)
 
 - Deprecation guardrail for migrated service:
-  - `src/services/control_plane/vfs/service.rs` now includes a source-level canary test that rejects regressions back to legacy blocking `ipc_recv` in the VFS control-plane roundtrip flow.
+  - `crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs` now includes a source-level canary test that rejects regressions back to legacy blocking `ipc_recv` in the VFS control-plane roundtrip flow.
 - Compatibility validation checkpoint:
   - pass-2 and pass-3 VFS timed-recv path tests remain green alongside the new deprecation guardrail.
 
@@ -156,7 +156,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 ## Phase 6 artifacts (pass 6)
 
 - Supervisor receive-loop migration:
-  - `src/services/control_plane/supervisor/service.rs` now drains control/fault queues via a budget-aware helper (`recv_with_budget`) that probes nonblocking first and then uses timed receive where capability context allows.
+  - `crates/yarm-control-plane-servers/src/control_plane/supervisor/service.rs` now drains control/fault queues via a budget-aware helper (`recv_with_budget`) that probes nonblocking first and then uses timed receive where capability context allows.
 - Supervisor migration guardrail:
   - added source-level canary requiring supervisor loop code to keep try/budgeted receive paths and reject regression to legacy blocking `ipc_recv`.
 - Exit-gate re-evaluation:
@@ -165,7 +165,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 ## Phase 6 artifacts (pass 7)
 
 - Cross-service migration guardrail:
-  - `src/services/control_plane/mod.rs` now includes a control-plane-wide canary that rejects legacy blocking `kernel.ipc_recv` calls in migrated VFS and supervisor service sources.
+  - `crates/yarm-control-plane-servers/src/control_plane/mod.rs` now includes a control-plane-wide canary that rejects legacy blocking `kernel.ipc_recv` calls in migrated VFS and supervisor service sources.
 - Gate reinforcement:
   - pass-7 guardrail complements per-service guard tests by asserting migration invariants at the control-plane module boundary.
 
@@ -218,36 +218,36 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 ## Phase 6 artifacts (pass 9)
 
 - PR-6.2 guardrail expansion slice:
-  - `src/services/control_plane/mod.rs` now extends the control-plane source guardrail to include `init` and `process_manager` service sources in addition to VFS + supervisor.
+  - `crates/yarm-control-plane-servers/src/control_plane/mod.rs` now extends the control-plane source guardrail to include `init` and `process_manager` service sources in addition to VFS + supervisor.
   - the guardrail rejects regressions to legacy blocking `kernel.ipc_recv` usage across all current core control-plane service modules.
 
 ## Phase 6 artifacts (pass 10)
 
 - PR-6.2 receive-loop migration slice:
-  - `src/services/control_plane/process_manager/service.rs` now includes a kernel-IPC roundtrip loop (`run_request_loop_over_kernel_ipc`) that uses timed receive (`ipc_recv_with_deadline`) with explicit receive budget.
+  - `crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs` now includes a kernel-IPC roundtrip loop (`run_request_loop_over_kernel_ipc`) that uses timed receive (`ipc_recv_with_deadline`) with explicit receive budget.
   - migration coverage now includes a dedicated process-manager kernel-IPC request-loop test to keep timed-recv path behavior under regression guard.
 
 ## Phase 6 artifacts (pass 11)
 
 - PR-6.2 guardrail hardening for migrated process-manager path:
-  - `src/services/control_plane/process_manager/service.rs` now includes a source-level canary requiring budgeted roundtrip helper usage and timed receive (`ipc_recv_with_deadline`) call-sites in the migrated kernel-IPC loop.
+  - `crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs` now includes a source-level canary requiring budgeted roundtrip helper usage and timed receive (`ipc_recv_with_deadline`) call-sites in the migrated kernel-IPC loop.
 
 ## Phase 6 artifacts (pass 13)
 
 - PR-6.3 call/reply migration slice (process-manager):
-  - `src/services/control_plane/process_manager/service.rs` kernel-IPC roundtrip path now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) instead of ad-hoc dedicated server-send endpoint replies.
+  - `crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs` kernel-IPC roundtrip path now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) instead of ad-hoc dedicated server-send endpoint replies.
   - source-level guardrail now asserts presence of budgeted helper + timed receive + reply-cap reply path in migrated process-manager loop.
 
 ## Phase 6 artifacts (pass 14)
 
 - PR-6.3 call/reply migration slice (VFS):
-  - `src/services/control_plane/vfs/service.rs` kernel-IPC roundtrip path now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) in place of ad-hoc dedicated server-send endpoint replies.
+  - `crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs` kernel-IPC roundtrip path now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) in place of ad-hoc dedicated server-send endpoint replies.
   - timed receive budget behavior (`ipc_recv_with_deadline`) remains in place for both server request receive and caller reply receive.
 
 ## Phase 6 artifacts (pass 15)
 
 - PR-6.5 exit-gate bootstrap:
-  - `src/services/control_plane/mod.rs` now includes a phase-6 exit-gate bundle canary that asserts current migration invariants across core control-plane services:
+  - `crates/yarm-control-plane-servers/src/control_plane/mod.rs` now includes a phase-6 exit-gate bundle canary that asserts current migration invariants across core control-plane services:
     - VFS: timed receive + reply-cap call/reply presence,
     - Supervisor: budgeted receive helper presence,
     - Process Manager: timed receive + reply-cap call/reply presence.
@@ -264,12 +264,12 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 ## Phase 6 artifacts (pass 17)
 
 - Supervisor call/reply compatibility slice:
-  - `src/services/control_plane/supervisor/service.rs` status-query reply path now supports replying through transferred reply-cap (`ipc_reply`) when present, with fallback to existing init-alert send path when no reply-cap is attached.
+  - `crates/yarm-control-plane-servers/src/control_plane/supervisor/service.rs` status-query reply path now supports replying through transferred reply-cap (`ipc_reply`) when present, with fallback to existing init-alert send path when no reply-cap is attached.
 
 ## Phase 6 artifacts (pass 18)
 
 - Supervisor call/reply helper + guardrail slice:
-  - `src/services/control_plane/supervisor/service.rs` now exposes `query_status_via_call_reply(...)` and `query_status_via_call_reply_with_default_timeout(...)` helper entrypoints for reply-cap query-status choreography.
+  - `crates/yarm-control-plane-servers/src/control_plane/supervisor/service.rs` now exposes `query_status_via_call_reply(...)` and `query_status_via_call_reply_with_default_timeout(...)` helper entrypoints for reply-cap query-status choreography.
   - added supervisor source-level canary requiring query-status reply-cap compatibility path markers (`request.transferred_cap()` + `kernel.ipc_reply(...)`).
 
 ## Phase 6 artifacts (pass 19)
@@ -345,4 +345,4 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Cross-task misuse expansion:
   - added regression for duplicated stale reply-cap rejection after caller restart (task-local duplicate in non-caller task cannot be replayed).
 - Choreography-retirement guard:
-  - `src/services/control_plane/mod.rs` now includes source-level canary asserting migrated VFS/process-manager paths avoid ad-hoc `ipc_send(server_send_cap, ...)` reply hops.
+  - `crates/yarm-control-plane-servers/src/control_plane/mod.rs` now includes source-level canary asserting migrated VFS/process-manager paths avoid ad-hoc `ipc_send(server_send_cap, ...)` reply hops.

@@ -23,13 +23,13 @@ This report tracks the closure criteria for **Phase 6 — Service migration and 
 ## Current dated waivers
 
 1. **Supervisor call/reply choreography waiver (temporary)**
-   - Scope: `src/services/control_plane/supervisor/service.rs`
+   - Scope: `crates/yarm-control-plane-servers/src/control_plane/supervisor/service.rs`
    - Reason: service currently prioritizes budgeted event-loop receives; explicit reply-cap choreography migration is pending deeper flow segmentation.
    - Owner: control-plane
    - Target closure: September 30, 2026
 
 2. **Init orchestration-path waiver (temporary)**
-   - Scope: `src/services/control_plane/init/service.rs`
+   - Scope: `crates/yarm-control-plane-servers/src/control_plane/init/service.rs`
    - Reason: module orchestrates service startup and does not currently operate as a dedicated kernel-IPC request loop; final migration guide must document non-applicability vs required call/reply migration paths.
    - Owner: init/runtime
    - Target closure: September 30, 2026
