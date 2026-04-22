@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::vfs::{VfsBackend, VfsError};
+use super::super::common::vfs_ipc::{VfsBackend, VfsError};
 
 pub const INITRAMFS_BOOT_MARKER_PATH_PTR: u64 = 0x494E_4954_424F_4F54;
 pub const INITRAMFS_INIT_PATH_PTR: u64 = 0x494E_4954_524F_4F54;

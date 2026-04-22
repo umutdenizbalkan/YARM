@@ -2,8 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::ipc::Message;
-use yarm::kernel::vfs::VfsError;
-use yarm::kernel::vfs::{
+use super::super::common::vfs_ipc::VfsError;
+use super::super::common::vfs_ipc::{
     OpenAtRequest, ReadWriteRequest, openat_message, statx_message, write_message,
 };
 use super::super::common::service::FsService;
@@ -58,13 +58,13 @@ fn scripted_bootstrap_io(console_fd: u64, null_fd: u64) -> Result<[Message; 4], 
             buf_ptr: 0,
             len: 12,
         })?,
-        statx_message(yarm::kernel::vfs::StatxRequest {
+        statx_message(super::super::common::vfs_ipc::StatxRequest {
             dirfd: 0,
             path_ptr: DEV_CONSOLE_PATH_PTR,
             flags: 0,
             mask_or_buf: 0,
         })?,
-        statx_message(yarm::kernel::vfs::StatxRequest {
+        statx_message(super::super::common::vfs_ipc::StatxRequest {
             dirfd: 0,
             path_ptr: DEV_NULL_PATH_PTR,
             flags: 0,
@@ -114,7 +114,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::kernel::vfs::{
+    use super::super::super::common::vfs_ipc::{
         CloseRequest, MountNamespacePolicy, MountRouter, StatxRequest, close_message,
         openat_message, statx_message, write_message,
     };

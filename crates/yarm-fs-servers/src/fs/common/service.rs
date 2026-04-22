@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::ipc::Message;
-use yarm::kernel::vfs::{VfsBackend, VfsError};
+use super::vfs_ipc::{VfsBackend, VfsError};
 use super::vfs_service::VfsService;
 use yarm_srv_common::service_loop::RequestResponseService;
 
@@ -54,7 +54,7 @@ impl<B: VfsBackend> RequestResponseService<Message, Message> for FsService<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::kernel::vfs::{InMemoryBackend, OpenAtRequest, openat_message};
+    use super::super::vfs_ipc::{InMemoryBackend, OpenAtRequest, openat_message};
     use yarm_srv_common::service_loop::run_typed_request_loop;
 
     #[test]

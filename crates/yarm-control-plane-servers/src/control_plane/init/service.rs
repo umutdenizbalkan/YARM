@@ -3,7 +3,7 @@
 
 use yarm::kernel::boot::{KernelError, KernelState};
 use yarm::kernel::process::ProcessService;
-use yarm::kernel::vfs::InMemoryBackend;
+use yarm::yarm_fs_servers::common::vfs_ipc::InMemoryBackend;
 use yarm::yarm_fs_servers::common::service::FsService;
 use super::super::process_manager::service::run_request_loop as run_process_manager_request_loop;
 use super::super::supervisor::SupervisorService;

@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::fs::FatBackend;
-use yarm::kernel::vfs::{
+use super::super::common::vfs_ipc::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
 use super::super::common::service::FsService;

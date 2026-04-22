@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::ipc::Message;
-use yarm::kernel::vfs::{FilesystemService, VfsError};
+use yarm::yarm_fs_servers::common::vfs_ipc::{FilesystemService, VfsError};
 
 use super::device::{
     VirtQueue, VirtioBlkDevice, VirtioBlkReqFrame, VirtioBlkRequest, VirtioBlkRespFrame,

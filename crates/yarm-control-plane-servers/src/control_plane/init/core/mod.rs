@@ -9,7 +9,7 @@ use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use yarm::kernel::capabilities::{CapId, CapRights};
 use yarm::kernel::task::TaskClass;
 use yarm::kernel::task::TaskStatus;
-use yarm::kernel::vfs::{
+use yarm::yarm_fs_servers::common::vfs_ipc::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
 use yarm::kernel::vm::Asid;
@@ -854,7 +854,7 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
     Ok(())
 }
 
-fn run_rw_mount_cycle<B: yarm::kernel::vfs::VfsBackend>(
+fn run_rw_mount_cycle<B: yarm::yarm_fs_servers::common::vfs_ipc::VfsBackend>(
     service: &mut yarm::yarm_fs_servers::common::service::FsService<B>,
     path_ptr: u64,
     write_len: u64,

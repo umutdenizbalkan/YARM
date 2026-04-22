@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::fs::Ext4Backend;
-use yarm::kernel::vfs::{
+use super::super::common::vfs_ipc::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
 use super::super::common::service::FsService;
@@ -58,7 +58,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::kernel::vfs::{VfsBackend, VfsError};
+    use super::super::super::common::vfs_ipc::{VfsBackend, VfsError};
 
     #[test]
     fn ext4_service_supports_write_stat() {

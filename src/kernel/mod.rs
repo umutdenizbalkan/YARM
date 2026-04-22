@@ -19,7 +19,6 @@ pub mod time;
 pub mod topology;
 pub mod trap;
 pub mod trapframe;
-pub mod vfs;
 pub mod vm;
 
 pub use boot::{Bootstrap, KernelState};

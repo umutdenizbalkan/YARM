@@ -3,8 +3,8 @@
 
 use yarm::kernel::boot::KernelState;
 use yarm::kernel::capabilities::CapId;
-use yarm::kernel::vfs::VfsError;
-use yarm::kernel::vfs::{
+use yarm::yarm_fs_servers::common::vfs_ipc::VfsError;
+use yarm::yarm_fs_servers::common::vfs_ipc::{
     InMemoryBackend, OpenAtRequest, ReadWriteRequest, StatxRequest, VfsBackend, close_message,
     dup_message, epoll_create1_message, epoll_ctl_message, epoll_pwait_message, fcntl_message,
     ioctl_message, openat_message, poll_message, read_message, sendfile_message, statx_message,
@@ -83,11 +83,11 @@ pub fn run_request_loop(
             epoll_ctl_message(epoll_fd, 1, fd, 0xA000).map_err(|_| VfsError::Malformed)?,
             epoll_pwait_message(epoll_fd, 0xB000, 4, 10).map_err(|_| VfsError::Malformed)?,
             sendfile_message(fd, dup_fd, 0xC000, 99).map_err(|_| VfsError::Malformed)?,
-            close_message(yarm::kernel::vfs::CloseRequest { fd: dup_fd })
+            close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: dup_fd })
                 .map_err(|_| VfsError::Malformed)?,
-            close_message(yarm::kernel::vfs::CloseRequest { fd })
+            close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd })
                 .map_err(|_| VfsError::Malformed)?,
-            close_message(yarm::kernel::vfs::CloseRequest { fd: epoll_fd })
+            close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: epoll_fd })
                 .map_err(|_| VfsError::Malformed)?,
         ],
     )?;
@@ -248,10 +248,10 @@ pub fn run_request_loop_over_kernel_ipc(
         epoll_ctl_message(epoll_fd, 1, fd, 0xA000).map_err(|_| VfsError::Malformed)?,
         epoll_pwait_message(epoll_fd, 0xB000, 4, 10).map_err(|_| VfsError::Malformed)?,
         sendfile_message(fd, dup_fd, 0xC000, 99).map_err(|_| VfsError::Malformed)?,
-        close_message(yarm::kernel::vfs::CloseRequest { fd: dup_fd })
+        close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: dup_fd })
             .map_err(|_| VfsError::Malformed)?,
-        close_message(yarm::kernel::vfs::CloseRequest { fd }).map_err(|_| VfsError::Malformed)?,
-        close_message(yarm::kernel::vfs::CloseRequest { fd: epoll_fd })
+        close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd }).map_err(|_| VfsError::Malformed)?,
+        close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: epoll_fd })
             .map_err(|_| VfsError::Malformed)?,
     ];
     for request in requests {

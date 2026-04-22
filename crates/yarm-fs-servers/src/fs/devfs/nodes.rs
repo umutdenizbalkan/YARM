@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::vfs::{VfsBackend, VfsError};
+use super::super::common::vfs_ipc::{VfsBackend, VfsError};
 
 pub const DEV_CONSOLE_PATH_PTR: u64 = 0x434F_4E53_4F4C_4500;
 pub const DEV_NULL_PATH_PTR: u64 = 0x4445_564E_554C_4C00;

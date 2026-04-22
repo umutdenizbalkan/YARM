@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::ipc::Message;
-use yarm::kernel::vfs::{
+use super::vfs_ipc::{
     InMemoryBackend, MountNamespacePolicy, MountRecord, VfsBackend, VfsError, VfsRequest,
 };
 use yarm_ipc_abi::vfs_abi::{

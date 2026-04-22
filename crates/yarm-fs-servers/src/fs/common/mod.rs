@@ -4,3 +4,4 @@
 pub mod fs;
 pub mod service;
 pub mod vfs_service;
+pub mod vfs_ipc;

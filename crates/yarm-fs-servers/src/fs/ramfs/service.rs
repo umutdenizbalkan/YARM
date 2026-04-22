@@ -2,8 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::ipc::Message;
-use yarm::kernel::vfs::VfsError;
-use yarm::kernel::vfs::{
+use super::super::common::vfs_ipc::VfsError;
+use super::super::common::vfs_ipc::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, read_message, statx_message,
     write_message,
 };
@@ -108,7 +108,7 @@ pub fn run() {
 mod tests {
     use super::*;
     use yarm::kernel::ipc::Message;
-    use yarm::kernel::vfs::{
+    use super::super::super::common::vfs_ipc::{
         CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_message,
         statx_message,
     };

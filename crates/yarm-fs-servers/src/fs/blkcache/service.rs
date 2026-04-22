@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::ipc::Message;
-use yarm::kernel::vfs::{FilesystemService, VfsError};
+use super::super::common::vfs_ipc::{FilesystemService, VfsError};
 
 const MAX_CACHE_LINES: usize = 16;
 

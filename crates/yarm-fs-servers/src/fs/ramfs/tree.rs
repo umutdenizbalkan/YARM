@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::vfs::{VfsBackend, VfsError};
+use super::super::common::vfs_ipc::{VfsBackend, VfsError};
 use super::super::common::fs::{
     FdRecord, InodeRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend, find_inode_index,
 };

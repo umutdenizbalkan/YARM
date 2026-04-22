@@ -8,7 +8,7 @@ use yarm::kernel::ipc::Message;
 use yarm::kernel::process_abi::PROC_OP_SPAWN_V2;
 use yarm_ipc_abi::supervisor_abi::{DEP_PROCESS_MANAGER, DEP_VFS, RegisterDriverRequest};
 use yarm::kernel::task::TaskClass;
-use yarm::kernel::vfs::{
+use yarm::yarm_fs_servers::common::vfs_ipc::{
     MountNamespacePolicy, MountRouter, OpenAtRequest, VfsError, openat_message,
 };
 use yarm::kernel::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
