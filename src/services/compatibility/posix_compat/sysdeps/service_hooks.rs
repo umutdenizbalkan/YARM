@@ -7,9 +7,9 @@ use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
 use crate::kernel::ipc::Message;
 use crate::services::compatibility::posix_compat::{
-    LINUX_NR_CLOSE, LINUX_NR_EXIT, LINUX_NR_GETPID, LINUX_NR_GETPPID, LINUX_NR_OPENAT,
-    LINUX_NR_READ, LINUX_NR_SOCKET, LINUX_NR_WRITE, POSIX_COMPAT_ABI_VERSION, PosixErrno,
-    PosixServiceBindings, dispatch,
+    LINUX_NR_CLOSE, LINUX_NR_CONNECT, LINUX_NR_EXIT, LINUX_NR_GETPID, LINUX_NR_GETPPID,
+    LINUX_NR_OPENAT, LINUX_NR_READ, LINUX_NR_SOCKET, LINUX_NR_WRITE, POSIX_COMPAT_ABI_VERSION,
+    PosixErrno, PosixServiceBindings, dispatch,
 };
 
 /// Runtime-facing sysdeps client that speaks to process/vfs managers through
@@ -135,6 +135,19 @@ impl<'a> PosixSysdepsContext<'a> {
         i32::try_from(fd).map_err(|_| PosixErrno::Inval)
     }
 
+    pub fn connect_hook(
+        &mut self,
+        fd: i32,
+        addr_ptr: usize,
+        addr_len: usize,
+    ) -> Result<(), PosixErrno> {
+        self.run_syscall(
+            LINUX_NR_CONNECT,
+            [fd as usize, addr_ptr, addr_len, 0, 0, 0],
+        )
+        .map(|_| ())
+    }
+
     pub fn read_hook(
         &mut self,
         fd: i32,
@@ -171,7 +184,7 @@ mod tests {
     use crate::kernel::boot::Bootstrap;
     use crate::std::thread;
     use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
-    use yarm_ipc_abi::socket_abi::SOCKET_OP_SOCKET;
+    use yarm_ipc_abi::socket_abi::{ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SOCKET};
     use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_WRITE};
 
     fn run_with_large_stack<F>(f: F)
@@ -336,6 +349,25 @@ mod tests {
                 .expect("recv socket req")
                 .expect("socket req");
             assert_eq!(socket_req.opcode, SOCKET_OP_SOCKET);
+
+            ctx.kernel
+                .ipc_send(
+                    socket_rep_send,
+                    Message::with_header(0, SOCKET_OP_CONNECT, 0, None, &0u64.to_le_bytes())
+                        .expect("connect reply"),
+                )
+                .expect("seed connect reply");
+            ctx.connect_hook(1001, 0xCAFE, 16).expect("connect");
+            let connect_req = ctx
+                .kernel
+                .ipc_recv(socket_req_recv)
+                .expect("recv connect req")
+                .expect("connect req");
+            assert_eq!(connect_req.opcode, SOCKET_OP_CONNECT);
+            let args = ConnectArgs::decode(connect_req.as_slice()).expect("decode connect args");
+            assert_eq!(args.fd, 1001);
+            assert_eq!(args.addr_ptr, 0xCAFE);
+            assert_eq!(args.addr_len, 16);
         });
     }
 }

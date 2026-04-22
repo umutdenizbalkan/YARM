@@ -12,7 +12,7 @@ use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_WAITPID_V2, PROC_SERVER_ABI_VERSION,
     SpawnV2Args, WaitPidV2Args,
 };
-use yarm_ipc_abi::socket_abi::{SOCKET_OP_SOCKET, SocketArgs};
+use yarm_ipc_abi::socket_abi::{ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SOCKET, SocketArgs};
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, VFS_CODEC_V1_VERSION};
 use yarm_ipc_abi::vfs_abi::{
@@ -28,7 +28,7 @@ pub mod sysdeps;
 // RISC-V/AArch64 style ABIs in this prototype compatibility personality.
 
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
-pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 21;
+pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 22;
 pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = PROC_SERVER_ABI_VERSION;
 pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = VFS_SERVER_ABI_VERSION;
 pub const POSIX_COMPAT_ABI_VERSION: u16 = LINUX_COMPAT_ABI_VERSION;
@@ -57,6 +57,7 @@ pub const LINUX_NR_EPOLL_PWAIT: usize = 22;
 pub const LINUX_NR_SENDFILE: usize = 71;
 pub const LINUX_NR_STATX: usize = 291;
 pub const LINUX_NR_SOCKET: usize = 198;
+pub const LINUX_NR_CONNECT: usize = 203;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -336,6 +337,7 @@ pub enum PosixCompatSyscall {
     Sendfile = LINUX_NR_SENDFILE,
     Statx = LINUX_NR_STATX,
     Socket = LINUX_NR_SOCKET,
+    Connect = LINUX_NR_CONNECT,
     Brk = LINUX_NR_BRK,
     Munmap = LINUX_NR_MUNMAP,
     Mmap = LINUX_NR_MMAP,
@@ -361,6 +363,7 @@ impl PosixCompatSyscall {
         LINUX_NR_SENDFILE,
         LINUX_NR_STATX,
         LINUX_NR_SOCKET,
+        LINUX_NR_CONNECT,
         LINUX_NR_BRK,
         LINUX_NR_MUNMAP,
         LINUX_NR_MMAP,
@@ -390,6 +393,7 @@ impl PosixCompatSyscall {
             LINUX_NR_SENDFILE => Ok(Self::Sendfile),
             LINUX_NR_STATX => Ok(Self::Statx),
             LINUX_NR_SOCKET => Ok(Self::Socket),
+            LINUX_NR_CONNECT => Ok(Self::Connect),
             LINUX_NR_BRK => Ok(Self::Brk),
             LINUX_NR_MUNMAP => Ok(Self::Munmap),
             LINUX_NR_MMAP => Ok(Self::Mmap),
@@ -934,6 +938,22 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
                     .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
+            PosixCompatSyscall::Connect => {
+                let payload = ConnectArgs::new(
+                    frame.arg(LINUX_ARG0) as u64,
+                    frame.arg(LINUX_ARG1) as u64,
+                    frame.arg(LINUX_ARG2) as u64,
+                )
+                .encode();
+                bindings
+                    .send_socket_request(kernel, SOCKET_OP_CONNECT, &payload)
+                    .map_err(PosixErrno::from)?;
+                let reply = bindings
+                    .recv_socket_reply(kernel)
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
             PosixCompatSyscall::Brk => {
                 let requested = frame.arg(LINUX_ARG0);
                 let tid = kernel.current_tid().ok_or(PosixErrno::NoSys)?;
@@ -1064,7 +1084,7 @@ mod tests {
     #[test]
     fn posix_compat_abi_contract_is_frozen() {
         assert_eq!(LINUX_COMPAT_ABI_VERSION, 1);
-        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 21);
+        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 22);
         assert_eq!(LINUX_PROC_SERVER_ABI_VERSION, 1);
         assert_eq!(LINUX_VFS_SERVER_ABI_VERSION, 1);
         assert_eq!(PROC_CODEC_V2_VERSION, 2);
@@ -1143,6 +1163,10 @@ mod tests {
         assert_eq!(
             PosixCompatSyscall::decode(LINUX_NR_SOCKET),
             Ok(PosixCompatSyscall::Socket)
+        );
+        assert_eq!(
+            PosixCompatSyscall::decode(LINUX_NR_CONNECT),
+            Ok(PosixCompatSyscall::Connect)
         );
         assert_eq!(
             PosixCompatSyscall::decode(LINUX_NR_BRK),
@@ -1474,6 +1498,26 @@ mod tests {
             assert_eq!(args.domain, 2);
             assert_eq!(args.sock_type, 1);
             assert_eq!(args.protocol, 0);
+
+            state
+                .ipc_send(
+                    rep_send,
+                    Message::with_header(0, SOCKET_OP_CONNECT, 0, None, &0u64.to_le_bytes())
+                        .expect("connect reply"),
+                )
+                .expect("seed connect reply");
+
+            let mut connect = TrapFrame::new(LINUX_NR_CONNECT, [1001, 0xCAFE, 16, 0, 0, 0]);
+            dispatch(&mut state, &bindings, &mut connect);
+            assert_eq!(connect.error_code(), None);
+            assert_eq!(connect.ret0(), 0);
+
+            let connect_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+            assert_eq!(connect_req.opcode, SOCKET_OP_CONNECT);
+            let connect_args = ConnectArgs::decode(connect_req.as_slice()).expect("decode args");
+            assert_eq!(connect_args.fd, 1001);
+            assert_eq!(connect_args.addr_ptr, 0xCAFE);
+            assert_eq!(connect_args.addr_len, 16);
         });
     }
 
@@ -1772,6 +1816,7 @@ mod tests {
             LINUX_NR_SENDFILE,
             LINUX_NR_STATX,
             LINUX_NR_SOCKET,
+            LINUX_NR_CONNECT,
             LINUX_NR_BRK,
             LINUX_NR_MUNMAP,
             LINUX_NR_MMAP,
