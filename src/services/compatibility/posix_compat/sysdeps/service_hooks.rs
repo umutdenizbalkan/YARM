@@ -211,7 +211,7 @@ mod tests {
     use crate::std::thread;
     use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
     use yarm_ipc_abi::socket_abi::{
-        ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SENDTO, SOCKET_OP_SOCKET, SendToArgs,
+        ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SENDTO, SOCKET_OP_SOCKET, SendToArgs, SocketArgs,
     };
     use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_WRITE};
 
@@ -498,6 +498,41 @@ mod tests {
             assert_eq!(connect_args.fd, 1001);
             assert_eq!(connect_args.addr_ptr, 0xCAFE);
             assert_eq!(connect_args.addr_len, 16);
+        });
+    }
+
+    #[test]
+    fn socket_hook_propagates_negative_errno_from_socket_reply() {
+        run_with_large_stack(|| {
+            let mut kernel = Bootstrap::init().expect("init");
+            let (_, socket_req_send, socket_req_recv) = kernel.create_endpoint(8).expect("socket req");
+            let (_, socket_rep_send, socket_rep_recv) = kernel.create_endpoint(8).expect("socket rep");
+            let mut ctx = PosixSysdepsContext::new(&mut kernel);
+            ctx.register_socket_manager(socket_req_send, socket_rep_recv)
+                .expect("bind socket");
+
+            let errno = crate::services::compatibility::posix_compat::EINVAL as i64;
+            ctx.kernel
+                .ipc_send(
+                    socket_rep_send,
+                    Message::with_header(0, SOCKET_OP_SOCKET, 0, None, &(-errno).to_le_bytes())
+                        .expect("socket error reply"),
+                )
+                .expect("seed socket error reply");
+
+            let err = ctx.socket_hook(2, 1, 0).expect_err("socket should fail");
+            assert_eq!(err, PosixErrno::Inval);
+
+            let socket_req = ctx
+                .kernel
+                .ipc_recv(socket_req_recv)
+                .expect("recv socket req")
+                .expect("socket req");
+            assert_eq!(socket_req.opcode, SOCKET_OP_SOCKET);
+            let socket_args = SocketArgs::decode(socket_req.as_slice()).expect("decode socket");
+            assert_eq!(socket_args.domain, 2);
+            assert_eq!(socket_args.sock_type, 1);
+            assert_eq!(socket_args.protocol, 0);
         });
     }
 }

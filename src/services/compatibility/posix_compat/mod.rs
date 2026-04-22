@@ -1649,6 +1649,40 @@ mod tests {
     }
 
     #[test]
+    fn posix_dispatch_socket_negative_errno_maps_to_trapframe_error() {
+        run_with_large_stack(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let mut bindings = PosixServiceBindings::default();
+            let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("socket req ep");
+            let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("socket rep ep");
+            bindings
+                .register_socket_manager(&state, req_send, rep_recv)
+                .expect("register socket");
+
+            let errno = EINVAL as i64;
+            state
+                .ipc_send(
+                    rep_send,
+                    Message::with_header(0, SOCKET_OP_SOCKET, 0, None, &(-errno).to_le_bytes())
+                        .expect("socket reply"),
+                )
+                .expect("seed socket reply");
+
+            let mut socket = TrapFrame::new(LINUX_NR_SOCKET, [2, 1, 0, 0, 0, 0]);
+            dispatch(&mut state, &bindings, &mut socket);
+            assert_eq!(socket.error_code(), Some(EINVAL as usize));
+            assert_eq!(socket.ret0(), 0);
+
+            let socket_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+            assert_eq!(socket_req.opcode, SOCKET_OP_SOCKET);
+            let socket_args = SocketArgs::decode(socket_req.as_slice()).expect("decode args");
+            assert_eq!(socket_args.domain, 2);
+            assert_eq!(socket_args.sock_type, 1);
+            assert_eq!(socket_args.protocol, 0);
+        });
+    }
+
+    #[test]
     fn posix_dispatch_maps_eintr_and_timeout_errno_at_shim_boundary() {
         let mut state = Bootstrap::init().expect("init");
         let mut bindings = PosixServiceBindings::default();
