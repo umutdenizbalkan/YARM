@@ -5,14 +5,14 @@ mod launch;
 mod mount;
 mod policy;
 
-use crate::kernel::boot::{KernelError, KernelState, UserImageSpec};
-use crate::kernel::capabilities::{CapId, CapRights};
-use crate::kernel::task::TaskClass;
-use crate::kernel::task::TaskStatus;
-use crate::kernel::vfs::{
+use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
+use yarm::kernel::capabilities::{CapId, CapRights};
+use yarm::kernel::task::TaskClass;
+use yarm::kernel::task::TaskStatus;
+use yarm::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
-use crate::kernel::vm::Asid;
+use yarm::kernel::vm::Asid;
 use crate::yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
 use crate::yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
 use crate::yarm_fs_servers::ext4::{Ext4Backend, Ext4Service};
@@ -67,8 +67,8 @@ impl InitService {
     fn register_core_service_message(
         sender_tid: u64,
         request: RegisterCoreServiceRequest,
-    ) -> Result<crate::kernel::ipc::Message, ()> {
-        crate::kernel::ipc::Message::with_header(
+    ) -> Result<yarm::kernel::ipc::Message, ()> {
+        yarm::kernel::ipc::Message::with_header(
             sender_tid,
             SUPERVISOR_OP_REGISTER_CORE_SERVICE,
             0,
@@ -81,8 +81,8 @@ impl InitService {
     fn register_driver_message(
         sender_tid: u64,
         request: RegisterDriverRequest,
-    ) -> Result<crate::kernel::ipc::Message, ()> {
-        crate::kernel::ipc::Message::with_header(
+    ) -> Result<yarm::kernel::ipc::Message, ()> {
+        yarm::kernel::ipc::Message::with_header(
             sender_tid,
             SUPERVISOR_OP_REGISTER_DRIVER,
             0,
@@ -854,8 +854,8 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
     Ok(())
 }
 
-fn run_rw_mount_cycle<B: crate::kernel::vfs::VfsBackend>(
-    service: &mut crate::service_common::service::FsService<B>,
+fn run_rw_mount_cycle<B: yarm::kernel::vfs::VfsBackend>(
+    service: &mut yarm::service_common::service::FsService<B>,
     path_ptr: u64,
     write_len: u64,
 ) -> Result<(), KernelError> {
@@ -893,7 +893,7 @@ fn run_rw_mount_cycle<B: crate::kernel::vfs::VfsBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::boot::Bootstrap;
+    use yarm::kernel::boot::Bootstrap;
 
     #[test]
     fn init_server_requires_minimum_startup_caps() {
@@ -1175,7 +1175,7 @@ mod tests {
         );
         assert_eq!(
             state.task_status(4),
-            Some(crate::kernel::task::TaskStatus::Runnable)
+            Some(yarm::kernel::task::TaskStatus::Runnable)
         );
     }
 
@@ -1213,7 +1213,7 @@ mod tests {
         );
         assert_eq!(
             state.task_status(2),
-            Some(crate::kernel::task::TaskStatus::Runnable)
+            Some(yarm::kernel::task::TaskStatus::Runnable)
         );
     }
 
@@ -1252,7 +1252,7 @@ mod tests {
         );
         assert_eq!(
             state.task_status(3),
-            Some(crate::kernel::task::TaskStatus::Runnable)
+            Some(yarm::kernel::task::TaskStatus::Runnable)
         );
     }
 
@@ -1334,7 +1334,7 @@ mod tests {
         init.seed_supervisor_registrations(&mut state)
             .expect("seed");
         state
-            .register_task_with_class(20, crate::kernel::task::TaskClass::Driver)
+            .register_task_with_class(20, yarm::kernel::task::TaskClass::Driver)
             .expect("task");
         state.register_driver(20).expect("driver");
         let (_id, mem) = state.alloc_anonymous_memory_object().expect("mem");
@@ -1351,8 +1351,8 @@ mod tests {
                 mem_cap: mem.0,
                 iova_cap: iova.0,
                 iova_base: 0x4000,
-                dma_len: crate::kernel::vm::PAGE_SIZE as u64,
-                iova_len: crate::kernel::vm::PAGE_SIZE as u64,
+                dma_len: yarm::kernel::vm::PAGE_SIZE as u64,
+                iova_len: yarm::kernel::vm::PAGE_SIZE as u64,
             },
         )
         .expect("driver register");

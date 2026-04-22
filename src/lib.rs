@@ -21,7 +21,7 @@ pub mod runtime;
 pub mod service_common;
 #[path = "services/compatibility/mod.rs"]
 pub mod compatibility;
-#[path = "services/init/mod.rs"]
+#[path = "../crates/yarm-control-plane-servers/src/control_plane/init/core/mod.rs"]
 pub mod init;
 #[path = "../crates/yarm-control-plane-servers/src/control_plane/mod.rs"]
 pub mod yarm_control_plane_servers;
