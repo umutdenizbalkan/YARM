@@ -30,7 +30,7 @@ pub fn run_driver_manager_demo() {
     use yarm::kernel::boot::Bootstrap;
     use yarm::kernel::driver_abi::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};
     use yarm::kernel::ipc::Message;
-    use yarm::std::boxed::Box;
+    use alloc::boxed::Box;
 
     let mut kernel = Box::new(Bootstrap::init().expect("init"));
     kernel.register_task(2).expect("task");
