@@ -928,31 +928,74 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy supervisor integration path overflows in hosted-dev unit-test harness"]
     fn restart_window_and_backoff_are_enforced() {
-        let (mut kernel, _init, _handoff, mut supervisor) = setup_supervisor();
-        supervisor.run_until_idle(&mut kernel).expect("loop");
-        let token = kernel.exit_task(2, 9).expect("exit");
-        let decision = supervisor
-            .handle_task_exit(
-                &mut kernel,
-                TaskExitedEvent {
+        run_with_large_stack(|| {
+            let mut kernel = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
+            let (_, _supervisor_fault_send_cap, supervisor_fault_recv_cap) =
+                kernel.create_endpoint(8).expect("fault endpoint");
+            let (_, supervisor_control_send_cap, supervisor_control_recv_cap) =
+                kernel.create_endpoint(8).expect("control endpoint");
+            let (_, init_alert_send_cap, init_alert_recv_cap) =
+                kernel.create_endpoint(8).expect("init alert endpoint");
+            let handoff = InitFaultHandoff::new(
+                1,
+                supervisor_fault_recv_cap,
+                supervisor_control_send_cap,
+                supervisor_control_recv_cap,
+                init_alert_send_cap,
+                init_alert_recv_cap,
+                20,
+            );
+            let mut supervisor = yarm::std::boxed::Box::new(SupervisorService::new(
+                1,
+                handoff,
+                CoreServicePolicyTable::baseline(),
+            ));
+
+            kernel.register_task(2).expect("task");
+            let register_proc = Message::with_header(
+                1,
+                SUPERVISOR_OP_REGISTER_CORE_SERVICE,
+                0,
+                None,
+                &RegisterCoreServiceRequest {
                     tid: 2,
-                    exit_code: 9,
-                    restart_token: token,
-                },
+                    kind: CoreServiceRegistrationKind::ProcessManager,
+                    max_restarts: 3,
+                    restart_group: 1,
+                    dependency_mask: 0,
+                    backoff_ticks: 10,
+                }
+                .encode(),
             )
-            .expect("decision");
-        match decision {
-            SupervisorDecision::ScheduledRestart { due_tick, .. } => {
-                assert_eq!(due_tick, TickInstant(10));
+            .expect("proc registration");
+            kernel
+                .ipc_send(supervisor_control_send_cap, register_proc)
+                .expect("send registration");
+            supervisor.run_until_idle(&mut kernel).expect("loop");
+
+            let token = kernel.exit_task(2, 9).expect("exit");
+            let decision = supervisor
+                .handle_task_exit(
+                    &mut kernel,
+                    TaskExitedEvent {
+                        tid: 2,
+                        exit_code: 9,
+                        restart_token: token,
+                    },
+                )
+                .expect("decision");
+            match decision {
+                SupervisorDecision::ScheduledRestart { due_tick, .. } => {
+                    assert_eq!(due_tick, TickInstant(10));
+                }
+                _ => panic!("expected scheduled restart"),
             }
-            _ => panic!("expected scheduled restart"),
-        }
-        assert_eq!(kernel.task_status(2), Some(TaskStatus::Exited(9)));
-        supervisor.run_until_idle(&mut kernel).expect("idle");
-        assert_eq!(supervisor.current_tick(), TickInstant(10));
-        assert_eq!(kernel.task_status(2), Some(TaskStatus::Runnable));
+            assert_eq!(kernel.task_status(2), Some(TaskStatus::Exited(9)));
+            supervisor.run_until_idle(&mut kernel).expect("idle");
+            assert_eq!(supervisor.current_tick(), TickInstant(10));
+            assert_eq!(kernel.task_status(2), Some(TaskStatus::Runnable));
+        });
     }
 
     #[test]

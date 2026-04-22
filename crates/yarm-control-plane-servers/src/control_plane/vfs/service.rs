@@ -552,52 +552,52 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy vfs integration path overflows in hosted-dev unit-test harness"]
     fn backend_semantics_matrix_roundtrips_over_kernel_ipc() {
-        let mut kernel = Bootstrap::init().expect("kernel init");
-        let (client_send, server_recv, server_send, client_recv) = setup_ipc_caps(&mut kernel);
+        run_with_large_stack(|| {
+            let mut kernel = Bootstrap::init().expect("kernel init");
+            let (client_send, server_recv, server_send, client_recv) = setup_ipc_caps(&mut kernel);
 
-        // DevFS: null reads as 0 and console writes echo length.
-        let mut devfs = FsService::with_backend(DevFsBackend::default());
-        let dev_null_fd = decode_fd_reply(
-            roundtrip_ipc(
+            // DevFS: null reads as 0 and console writes echo length.
+            let mut devfs = FsService::with_backend(DevFsBackend::default());
+            let dev_null_fd = decode_fd_reply(
+                roundtrip_ipc(
+                    &mut kernel,
+                    &mut devfs,
+                    client_send,
+                    server_recv,
+                    server_send,
+                    client_recv,
+                    openat_message(OpenAtRequest {
+                        dirfd: 0,
+                        path_ptr: DEV_NULL_PATH_PTR,
+                        flags: 0,
+                        mode: 0,
+                    })
+                    .expect("open null"),
+                )
+                .expect("open null reply"),
+            )
+            .expect("decode fd");
+            let dev_null_read = roundtrip_ipc(
                 &mut kernel,
                 &mut devfs,
                 client_send,
                 server_recv,
                 server_send,
                 client_recv,
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: DEV_NULL_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
+                read_message(ReadWriteRequest {
+                    fd: dev_null_fd,
+                    buf_ptr: 0,
+                    len: 128,
                 })
-                .expect("open null"),
+                .expect("read null"),
             )
-            .expect("open null reply"),
-        )
-        .expect("decode fd");
-        let dev_null_read = roundtrip_ipc(
-            &mut kernel,
-            &mut devfs,
-            client_send,
-            server_recv,
-            server_send,
-            client_recv,
-            read_message(ReadWriteRequest {
-                fd: dev_null_fd,
-                buf_ptr: 0,
-                len: 128,
-            })
-            .expect("read null"),
-        )
-        .expect("read null reply");
-        assert_eq!(
-            VfsReply::from_opcode_payload_checked(dev_null_read.opcode, dev_null_read.as_slice())
-                .expect("decode"),
-            VfsReply::ReadLen(0)
-        );
+            .expect("read null reply");
+            assert_eq!(
+                VfsReply::from_opcode_payload_checked(dev_null_read.opcode, dev_null_read.as_slice())
+                    .expect("decode"),
+                VfsReply::ReadLen(0)
+            );
 
         let dev_console_fd = decode_fd_reply(
             roundtrip_ipc(
@@ -742,7 +742,7 @@ mod tests {
                 .expect("decode"),
             VfsReply::ReadLen(4096)
         );
-        let init_write = roundtrip_ipc(
+            let init_write = roundtrip_ipc(
             &mut kernel,
             &mut initramfs,
             client_send,
@@ -756,6 +756,7 @@ mod tests {
             })
             .expect("write init"),
         );
-        assert_eq!(init_write, Err(VfsError::Unsupported));
+            assert_eq!(init_write, Err(VfsError::Unsupported));
+        });
     }
 }
