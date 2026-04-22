@@ -197,6 +197,17 @@ const AP_STUB: [u8; 16] = [
 static AP_READY_FLAGS: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
     [const { AtomicBool::new(false) }; crate::arch::platform_constants::MAX_CPUS];
 
+struct TrampolineScratch(core::cell::UnsafeCell<[u8; AP_TRAMPOLINE_SIZE]>);
+
+unsafe impl Sync for TrampolineScratch {}
+
+static TRAMPOLINE_SCRATCH: TrampolineScratch =
+    TrampolineScratch(core::cell::UnsafeCell::new([0; AP_TRAMPOLINE_SIZE]));
+
+fn with_trampoline_scratch<R>(f: impl FnOnce(&mut [u8; AP_TRAMPOLINE_SIZE]) -> R) -> R {
+    unsafe { f(&mut *TRAMPOLINE_SCRATCH.0.get()) }
+}
+
 fn encode_handoff(page: &mut [u8; AP_TRAMPOLINE_SIZE], handoff: ApHandoff) {
     page.fill(0);
     #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -386,7 +397,6 @@ fn ap_stack_top(cpu: CpuId) -> u64 {
 fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
     #[cfg(all(not(test), not(feature = "hosted-dev")))]
     let _ = kernel;
-    let mut page = [0u8; AP_TRAMPOLINE_SIZE];
     AP_READY_FLAGS[cpu.0 as usize].store(false, Ordering::Release);
     let ap_stack_phys_end = AP_STACK_PHYS_BASE.saturating_add(
         (crate::arch::platform_constants::MAX_CPUS as u64).saturating_mul(AP_STACK_BYTES as u64),
@@ -420,8 +430,10 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
         handoff.ready_flag_ptr,
         AP_TRAMPOLINE_PHYS
     );
-    encode_handoff(&mut page, handoff);
-    write_trampoline_page(&page);
+    with_trampoline_scratch(|page| {
+        encode_handoff(page, handoff);
+        write_trampoline_page(page);
+    });
 }
 
 pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelError> {
@@ -498,8 +510,8 @@ mod tests {
 
     #[test]
     fn trampoline_handoff_encoding_contains_cpu_stack_and_kernel_state() {
-        let mut kernel = crate::kernel::boot::Bootstrap::init().expect("init");
-        prepare_trampoline_for_cpu(&kernel, CpuId(2));
+        let kernel = crate::kernel::boot::Bootstrap::init_static().expect("init");
+        prepare_trampoline_for_cpu(kernel, CpuId(2));
 
         let page = trampoline_page_snapshot_for_test();
         let handoff = read_handoff(&page);
@@ -508,18 +520,28 @@ mod tests {
         assert_eq!(handoff.stack_top, ap_stack_top(CpuId(2)));
         assert_eq!(
             handoff.kernel_state_ptr,
-            (&mut kernel as *mut KernelState as usize) as u64
+            (kernel as *mut KernelState as usize) as u64
         );
         assert_ne!(handoff.ready_flag_ptr, 0);
     }
 
     #[test]
     fn secondary_cpu_startup_updates_online_cpu_accounting() {
-        let mut kernel = crate::kernel::boot::Bootstrap::init().expect("init");
+        std::thread::Builder::new()
+            .name("secondary_cpu_startup_updates_online_cpu_accounting".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_secondary_cpu_startup_updates_online_cpu_accounting)
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    fn run_secondary_cpu_startup_updates_online_cpu_accounting() {
+        let kernel = crate::kernel::boot::Bootstrap::init_static().expect("init");
         let mut lapic_regs = [0u32; 256];
         set_lapic_mmio_base_for_test(lapic_regs.as_mut_ptr() as usize);
 
-        let started = start_secondary_cpus(&mut kernel).expect("smp startup");
+        let started = start_secondary_cpus(kernel).expect("smp startup");
         assert_eq!(started, kernel.present_cpu_count().saturating_sub(1));
         assert_eq!(kernel.online_cpu_count(), kernel.present_cpu_count());
     }
