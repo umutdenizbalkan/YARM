@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::boot::{KernelError, TrapHandleError};
 #[cfg(test)]
 use yarm::kernel::boot::KernelState;
+#[cfg(test)]
+use yarm::kernel::boot::{KernelError, TrapHandleError};
 #[cfg(test)]
 use yarm::kernel::capabilities::CapId;
 use yarm::kernel::ipc::Message;
 use yarm::kernel::process::{ProcessId, ProcessManager, ProcessManagerError};
+#[cfg(test)]
 use yarm::kernel::syscall::SyscallError;
 use yarm::kernel::task::TaskClass;
 #[cfg(test)]
@@ -401,10 +403,12 @@ pub struct ProcessManagerLoopSummary {
     pub handled: usize,
 }
 
+#[cfg(test)]
 fn map_kernel_ipc_err<T>(result: Result<T, KernelError>) -> Result<T, ProcessManagerError> {
     result.map_err(map_kernel_ipc_error)
 }
 
+#[cfg(test)]
 fn map_kernel_ipc_error(err: KernelError) -> ProcessManagerError {
     match err {
         KernelError::MissingRight => ProcessManagerError::PermissionDenied,
@@ -426,6 +430,7 @@ fn map_kernel_ipc_error(err: KernelError) -> ProcessManagerError {
     }
 }
 
+#[cfg(test)]
 fn map_trap_ipc_error(err: TrapHandleError) -> ProcessManagerError {
     match err {
         TrapHandleError::Syscall(syscall_err) => map_syscall_error(syscall_err),
@@ -433,6 +438,7 @@ fn map_trap_ipc_error(err: TrapHandleError) -> ProcessManagerError {
     }
 }
 
+#[cfg(test)]
 fn map_syscall_error(err: SyscallError) -> ProcessManagerError {
     match err {
         SyscallError::MissingRight => ProcessManagerError::PermissionDenied,
@@ -774,6 +780,7 @@ fn synthetic_roundtrip_call_reply_with_budget(
     )
 }
 
+#[cfg(test)]
 fn spawn_request_message(
     parent_pid: u64,
     image_id: u64,
