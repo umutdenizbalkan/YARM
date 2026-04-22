@@ -934,9 +934,18 @@ mod tests {
     use super::*;
     use yarm::kernel::boot::Bootstrap;
 
+    fn run_with_kernel_bootstrap_stack(test: impl FnOnce() + Send + 'static) {
+        yarm::std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
     #[test]
     fn init_server_requires_minimum_startup_caps() {
-        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut state = Bootstrap::init_boxed().expect("init");
         let mut init = InitService::new();
         init.set_startup_caps(StartupCapSet {
             endpoint_factory: false,
@@ -958,42 +967,44 @@ mod tests {
 
     #[test]
     fn init_server_launch_flow_registers_launches_and_enters_running() {
-        let mut state = Box::new(Bootstrap::init().expect("init"));
-        let mut init = InitService::new();
-        let graph = CoreServiceGraph {
-            init_tid: 1,
-            process_manager_tid: 2,
-            vfs_tid: 3,
-            supervisor_tid: 4,
-        };
+        run_with_kernel_bootstrap_stack(|| {
+            let mut state = Bootstrap::init_boxed().expect("init");
+            let mut init = InitService::new();
+            let graph = CoreServiceGraph {
+                init_tid: 1,
+                process_manager_tid: 2,
+                vfs_tid: 3,
+                supervisor_tid: 4,
+            };
 
-        init.register_core_graph(&mut state, graph)
-            .expect("register");
-        assert_eq!(init.phase(), InitBootPhase::CoreServicesRegistered);
+            init.register_core_graph(&mut state, graph)
+                .expect("register");
+            assert_eq!(init.phase(), InitBootPhase::CoreServicesRegistered);
 
-        let report = init
-            .launch_core_services(
-                &mut state,
-                CoreServiceImagePlan {
-                    process_manager_entry: 0x8000,
-                    vfs_entry: 0x9000,
-                    supervisor_entry: 0xA000,
-                },
-            )
-            .expect("launch");
-        assert!(report.process_manager_spawned);
-        assert!(report.vfs_spawned);
-        assert!(report.supervisor_spawned);
+            let report = init
+                .launch_core_services(
+                    &mut state,
+                    CoreServiceImagePlan {
+                        process_manager_entry: 0x8000,
+                        vfs_entry: 0x9000,
+                        supervisor_entry: 0xA000,
+                    },
+                )
+                .expect("launch");
+            assert!(report.process_manager_spawned);
+            assert!(report.vfs_spawned);
+            assert!(report.supervisor_spawned);
 
-        let handoff = init.install_fault_handoff(&mut state, 50).expect("handoff");
-        assert_eq!(handoff.supervisor_tid, 4);
-        init.begin_running(&state).expect("running");
-        assert_eq!(init.phase(), InitBootPhase::Running);
+            let handoff = init.install_fault_handoff(&mut state, 50).expect("handoff");
+            assert_eq!(handoff.supervisor_tid, 4);
+            init.begin_running(&state).expect("running");
+            assert_eq!(init.phase(), InitBootPhase::Running);
+        });
     }
 
     #[test]
     fn launch_order_is_deterministic() {
-        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut state = Bootstrap::init_boxed().expect("init");
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1025,7 +1036,7 @@ mod tests {
 
     #[test]
     fn launch_order_can_prioritize_supervisor() {
-        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut state = Bootstrap::init_boxed().expect("init");
         let mut init = InitService::new();
         init.set_launch_strategy(CoreLaunchStrategy::SupervisorFirst);
         let graph = CoreServiceGraph {
@@ -1058,7 +1069,7 @@ mod tests {
 
     #[test]
     fn launch_sets_mount_status() {
-        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut state = Bootstrap::init_boxed().expect("init");
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1137,7 +1148,7 @@ mod tests {
 
     #[test]
     fn supervisor_handoff_binds_kernel_endpoint() {
-        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut state = Bootstrap::init_boxed().expect("init");
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1173,7 +1184,7 @@ mod tests {
 
     #[test]
     fn init_recovers_supervisor_failure_within_budget() {
-        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut state = Bootstrap::init_boxed().expect("init");
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1221,7 +1232,7 @@ mod tests {
     }
 
     fn run_init_recovers_proc_mgr_failure_within_budget() {
-        let mut state = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
+        let mut state = Bootstrap::init_boxed().expect("init");
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1259,7 +1270,7 @@ mod tests {
 
     #[test]
     fn init_recovers_vfs_failure_with_generic_core_helper() {
-        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut state = Bootstrap::init_boxed().expect("init");
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1298,7 +1309,7 @@ mod tests {
 
     #[test]
     fn recovering_supervisor_reseeds_control_plane_requests() {
-        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut state = Bootstrap::init_boxed().expect("init");
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1349,7 +1360,7 @@ mod tests {
 
     #[test]
     fn recovering_supervisor_replays_driver_registrations_too() {
-        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut state = Bootstrap::init_boxed().expect("init");
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
