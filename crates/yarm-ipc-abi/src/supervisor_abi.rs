@@ -105,6 +105,35 @@ impl TransferRevokedEvent {
     }
 }
 
+
+
+pub const fn encode_task_exited_event(
+    tid: u64,
+    exit_code: u64,
+    restart_token: u64,
+) -> [u8; TaskExitedEvent::ENCODED_LEN] {
+    TaskExitedEvent {
+        tid,
+        exit_code,
+        restart_token,
+    }
+    .encode()
+}
+
+pub const fn encode_transfer_revoked_event(
+    owner_pid: u64,
+    cap: u64,
+    base: u64,
+    len: u64,
+) -> [u8; TransferRevokedEvent::ENCODED_LEN] {
+    TransferRevokedEvent {
+        owner_pid,
+        cap,
+        base,
+        len,
+    }
+    .encode()
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitAlertKind {
     RedelegationRequired = 1,

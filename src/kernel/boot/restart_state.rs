@@ -5,8 +5,8 @@ use super::{KernelError, KernelState};
 use crate::kernel::ipc::Message;
 use crate::kernel::task::{RestartToken, TaskStatus, ThreadDetachState};
 use yarm_ipc_abi::supervisor_abi::{
-    SUPERVISOR_OP_TASK_EXITED, SUPERVISOR_OP_TRANSFER_REVOKED, TaskExitedEvent,
-    TransferRevokedEvent,
+    SUPERVISOR_OP_TASK_EXITED, SUPERVISOR_OP_TRANSFER_REVOKED, encode_task_exited_event,
+    encode_transfer_revoked_event,
 };
 
 impl KernelState {
@@ -24,12 +24,7 @@ impl KernelState {
             SUPERVISOR_OP_TASK_EXITED,
             0,
             None,
-            &TaskExitedEvent {
-                tid,
-                exit_code: code,
-                restart_token,
-            }
-            .encode(),
+            &encode_task_exited_event(tid, code, restart_token),
         )
         .map_err(|_| KernelError::WrongObject)?;
         let endpoint = self
@@ -60,13 +55,7 @@ impl KernelState {
             SUPERVISOR_OP_TRANSFER_REVOKED,
             0,
             None,
-            &TransferRevokedEvent {
-                owner_pid,
-                cap,
-                base,
-                len,
-            }
-            .encode(),
+            &encode_transfer_revoked_event(owner_pid, cap, base, len),
         )
         .map_err(|_| KernelError::WrongObject)?;
         let endpoint = self
