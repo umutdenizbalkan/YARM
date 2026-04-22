@@ -12,6 +12,7 @@ use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_WAITPID_V2, PROC_SERVER_ABI_VERSION,
     SpawnV2Args, WaitPidV2Args,
 };
+use yarm_ipc_abi::socket_abi::{SOCKET_OP_SOCKET, SocketArgs};
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, VFS_CODEC_V1_VERSION};
 use yarm_ipc_abi::vfs_abi::{
@@ -74,7 +75,6 @@ const LINUX_ARG0: usize = 0;
 const LINUX_ARG1: usize = 1;
 const LINUX_ARG2: usize = 2;
 const LINUX_ARG3: usize = 3;
-const POSIX_SOCKET_OP_SOCKET: u16 = 1;
 
 /// Userspace-owned bindings for POSIX compatibility personality servers.
 ///
@@ -919,14 +919,14 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Socket => {
-                let payload = pack_vfs4(
-                    frame.arg(LINUX_ARG0),
-                    frame.arg(LINUX_ARG1),
-                    frame.arg(LINUX_ARG2),
-                    0,
-                );
+                let payload = SocketArgs::new(
+                    frame.arg(LINUX_ARG0) as u64,
+                    frame.arg(LINUX_ARG1) as u64,
+                    frame.arg(LINUX_ARG2) as u64,
+                )
+                .encode();
                 bindings
-                    .send_socket_request(kernel, POSIX_SOCKET_OP_SOCKET, &payload)
+                    .send_socket_request(kernel, SOCKET_OP_SOCKET, &payload)
                     .map_err(PosixErrno::from)?;
                 let reply = bindings
                     .recv_socket_reply(kernel)
@@ -1071,6 +1071,11 @@ mod tests {
         assert_eq!(ProcV2Args::VERSION, PROC_CODEC_V2_VERSION);
         assert_eq!(VFS_CODEC_V1_VERSION, 1);
         assert_eq!(VfsV1Args::VERSION, VFS_CODEC_V1_VERSION);
+        assert_eq!(
+            SocketArgs::VERSION,
+            yarm_ipc_abi::socket_abi::SOCKET_CODEC_V1_VERSION
+        );
+        assert_eq!(SOCKET_OP_SOCKET, 1);
         assert_eq!(
             PosixCompatSyscall::decode(LINUX_NR_EXIT),
             Ok(PosixCompatSyscall::Exit)
@@ -1449,7 +1454,7 @@ mod tests {
                     rep_send,
                     Message::with_header(
                         0,
-                        POSIX_SOCKET_OP_SOCKET,
+                        SOCKET_OP_SOCKET,
                         0,
                         None,
                         &socket_fd.to_le_bytes(),
@@ -1464,11 +1469,11 @@ mod tests {
             assert_eq!(socket.ret0(), socket_fd as usize);
 
             let req = state.ipc_recv(req_recv).expect("req").expect("msg");
-            assert_eq!(req.opcode, POSIX_SOCKET_OP_SOCKET);
-            let args = VfsV1Args::decode(req.as_slice()).expect("decode args");
-            assert_eq!(args.arg0, 2);
-            assert_eq!(args.arg1, 1);
-            assert_eq!(args.arg2, 0);
+            assert_eq!(req.opcode, SOCKET_OP_SOCKET);
+            let args = SocketArgs::decode(req.as_slice()).expect("decode args");
+            assert_eq!(args.domain, 2);
+            assert_eq!(args.sock_type, 1);
+            assert_eq!(args.protocol, 0);
         });
     }
 

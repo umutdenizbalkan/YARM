@@ -42,6 +42,10 @@ mod tests {
             "posix service hooks should route socket compatibility through syscall dispatch boundary"
         );
         assert!(
+            src.contains("SOCKET_OP_SOCKET"),
+            "posix service hooks should consume shared socket ABI opcode contract"
+        );
+        assert!(
             !src.contains("Err(PosixErrno::NoSys)"),
             "socket hook should no longer be a NoSys placeholder in service hooks"
         );

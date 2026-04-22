@@ -171,6 +171,7 @@ mod tests {
     use crate::kernel::boot::Bootstrap;
     use crate::std::thread;
     use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
+    use yarm_ipc_abi::socket_abi::SOCKET_OP_SOCKET;
     use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_WRITE};
 
     fn run_with_large_stack<F>(f: F)
@@ -324,7 +325,7 @@ mod tests {
             ctx.kernel
                 .ipc_send(
                     socket_rep_send,
-                    Message::with_header(0, 1, 0, None, &1001u64.to_le_bytes())
+                    Message::with_header(0, SOCKET_OP_SOCKET, 0, None, &1001u64.to_le_bytes())
                         .expect("socket reply"),
                 )
                 .expect("seed socket reply");
@@ -334,7 +335,7 @@ mod tests {
                 .ipc_recv(socket_req_recv)
                 .expect("recv socket req")
                 .expect("socket req");
-            assert_eq!(socket_req.opcode, 1);
+            assert_eq!(socket_req.opcode, SOCKET_OP_SOCKET);
         });
     }
 }
