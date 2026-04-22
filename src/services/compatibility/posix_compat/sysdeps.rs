@@ -37,5 +37,13 @@ mod tests {
             src.contains("dispatch("),
             "posix service hooks should route requests through syscall dispatch boundary"
         );
+        assert!(
+            src.contains("LINUX_NR_SOCKET"),
+            "posix service hooks should route socket compatibility through syscall dispatch boundary"
+        );
+        assert!(
+            !src.contains("Err(PosixErrno::NoSys)"),
+            "socket hook should no longer be a NoSys placeholder in service hooks"
+        );
     }
 }

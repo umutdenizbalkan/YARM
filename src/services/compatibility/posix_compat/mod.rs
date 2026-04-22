@@ -27,7 +27,7 @@ pub mod sysdeps;
 // RISC-V/AArch64 style ABIs in this prototype compatibility personality.
 
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
-pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 20;
+pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 21;
 pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = PROC_SERVER_ABI_VERSION;
 pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = VFS_SERVER_ABI_VERSION;
 pub const POSIX_COMPAT_ABI_VERSION: u16 = LINUX_COMPAT_ABI_VERSION;
@@ -55,6 +55,7 @@ pub const LINUX_NR_EPOLL_CTL: usize = 21;
 pub const LINUX_NR_EPOLL_PWAIT: usize = 22;
 pub const LINUX_NR_SENDFILE: usize = 71;
 pub const LINUX_NR_STATX: usize = 291;
+pub const LINUX_NR_SOCKET: usize = 198;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -73,6 +74,7 @@ const LINUX_ARG0: usize = 0;
 const LINUX_ARG1: usize = 1;
 const LINUX_ARG2: usize = 2;
 const LINUX_ARG3: usize = 3;
+const POSIX_SOCKET_OP_SOCKET: u16 = 1;
 
 /// Userspace-owned bindings for POSIX compatibility personality servers.
 ///
@@ -83,6 +85,8 @@ pub struct PosixServiceBindings {
     proc_mgr_reply_recv: Option<CapId>,
     vfs_request_send: Option<CapId>,
     vfs_reply_recv: Option<CapId>,
+    socket_request_send: Option<CapId>,
+    socket_reply_recv: Option<CapId>,
 }
 
 impl PosixServiceBindings {
@@ -139,6 +143,34 @@ impl PosixServiceBindings {
         }
         self.vfs_request_send = Some(request_send_cap);
         self.vfs_reply_recv = Some(reply_recv_cap);
+        Ok(())
+    }
+
+    pub fn register_socket_manager(
+        &mut self,
+        kernel: &KernelState,
+        request_send_cap: CapId,
+        reply_recv_cap: CapId,
+    ) -> Result<(), KernelError> {
+        let cnode = kernel
+            .current_task_cnode()
+            .ok_or(KernelError::TaskMissing)?;
+        if !kernel.cnode_capability_has_right(
+            cnode,
+            request_send_cap,
+            crate::kernel::capabilities::CapRights::SEND,
+        ) {
+            return Err(KernelError::MissingRight);
+        }
+        if !kernel.cnode_capability_has_right(
+            cnode,
+            reply_recv_cap,
+            crate::kernel::capabilities::CapRights::RECEIVE,
+        ) {
+            return Err(KernelError::MissingRight);
+        }
+        self.socket_request_send = Some(request_send_cap);
+        self.socket_reply_recv = Some(reply_recv_cap);
         Ok(())
     }
 
@@ -199,6 +231,27 @@ impl PosixServiceBindings {
 
     fn recv_vfs_reply(&self, kernel: &mut KernelState) -> Result<Option<Message>, KernelError> {
         let recv_cap = self.vfs_reply_recv.ok_or(KernelError::InvalidCapability)?;
+        kernel.ipc_recv(recv_cap)
+    }
+
+    fn send_socket_request(
+        &self,
+        kernel: &mut KernelState,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<(), KernelError> {
+        let send_cap = self
+            .socket_request_send
+            .ok_or(KernelError::InvalidCapability)?;
+        let msg = Message::with_header(0, opcode, 0, None, payload)
+            .map_err(|_| KernelError::WrongObject)?;
+        kernel.ipc_send(send_cap, msg)
+    }
+
+    fn recv_socket_reply(&self, kernel: &mut KernelState) -> Result<Option<Message>, KernelError> {
+        let recv_cap = self
+            .socket_reply_recv
+            .ok_or(KernelError::InvalidCapability)?;
         kernel.ipc_recv(recv_cap)
     }
 }
@@ -282,6 +335,7 @@ pub enum PosixCompatSyscall {
     EpollPwait = LINUX_NR_EPOLL_PWAIT,
     Sendfile = LINUX_NR_SENDFILE,
     Statx = LINUX_NR_STATX,
+    Socket = LINUX_NR_SOCKET,
     Brk = LINUX_NR_BRK,
     Munmap = LINUX_NR_MUNMAP,
     Mmap = LINUX_NR_MMAP,
@@ -306,6 +360,7 @@ impl PosixCompatSyscall {
         LINUX_NR_EPOLL_PWAIT,
         LINUX_NR_SENDFILE,
         LINUX_NR_STATX,
+        LINUX_NR_SOCKET,
         LINUX_NR_BRK,
         LINUX_NR_MUNMAP,
         LINUX_NR_MMAP,
@@ -334,6 +389,7 @@ impl PosixCompatSyscall {
             LINUX_NR_EPOLL_PWAIT => Ok(Self::EpollPwait),
             LINUX_NR_SENDFILE => Ok(Self::Sendfile),
             LINUX_NR_STATX => Ok(Self::Statx),
+            LINUX_NR_SOCKET => Ok(Self::Socket),
             LINUX_NR_BRK => Ok(Self::Brk),
             LINUX_NR_MUNMAP => Ok(Self::Munmap),
             LINUX_NR_MMAP => Ok(Self::Mmap),
@@ -862,6 +918,22 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
                     .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
+            PosixCompatSyscall::Socket => {
+                let payload = pack_vfs4(
+                    frame.arg(LINUX_ARG0),
+                    frame.arg(LINUX_ARG1),
+                    frame.arg(LINUX_ARG2),
+                    0,
+                );
+                bindings
+                    .send_socket_request(kernel, POSIX_SOCKET_OP_SOCKET, &payload)
+                    .map_err(PosixErrno::from)?;
+                let reply = bindings
+                    .recv_socket_reply(kernel)
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
             PosixCompatSyscall::Brk => {
                 let requested = frame.arg(LINUX_ARG0);
                 let tid = kernel.current_tid().ok_or(PosixErrno::NoSys)?;
@@ -880,6 +952,18 @@ mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::Message;
+    use crate::std::thread;
+
+    fn run_with_large_stack<F>(f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let handle = thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large-stack test thread");
+        handle.join().expect("join large-stack test thread");
+    }
 
     #[test]
     fn proc_v2_args_codec_roundtrip() {
@@ -980,7 +1064,7 @@ mod tests {
     #[test]
     fn posix_compat_abi_contract_is_frozen() {
         assert_eq!(LINUX_COMPAT_ABI_VERSION, 1);
-        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 20);
+        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 21);
         assert_eq!(LINUX_PROC_SERVER_ABI_VERSION, 1);
         assert_eq!(LINUX_VFS_SERVER_ABI_VERSION, 1);
         assert_eq!(PROC_CODEC_V2_VERSION, 2);
@@ -1050,6 +1134,10 @@ mod tests {
         assert_eq!(
             PosixCompatSyscall::decode(LINUX_NR_STATX),
             Ok(PosixCompatSyscall::Statx)
+        );
+        assert_eq!(
+            PosixCompatSyscall::decode(LINUX_NR_SOCKET),
+            Ok(PosixCompatSyscall::Socket)
         );
         assert_eq!(
             PosixCompatSyscall::decode(LINUX_NR_BRK),
@@ -1342,6 +1430,46 @@ mod tests {
         assert_eq!(statx_req.opcode, VFS_OP_STATX);
         assert_eq!(statx_req.as_slice().len(), 32);
         assert_eq!(&statx_req.as_slice()[8..16], &(0xD000u64).to_le_bytes());
+    }
+
+    #[test]
+    fn posix_dispatch_socket_syscall_routes_to_socket_ipc_binding() {
+        run_with_large_stack(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let mut bindings = PosixServiceBindings::default();
+            let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("socket req ep");
+            let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(4).expect("socket rep ep");
+            bindings
+                .register_socket_manager(&state, req_send, rep_recv)
+                .expect("register socket");
+
+            let socket_fd: u64 = 1001;
+            state
+                .ipc_send(
+                    rep_send,
+                    Message::with_header(
+                        0,
+                        POSIX_SOCKET_OP_SOCKET,
+                        0,
+                        None,
+                        &socket_fd.to_le_bytes(),
+                    )
+                    .expect("reply"),
+                )
+                .expect("seed reply");
+
+            let mut socket = TrapFrame::new(LINUX_NR_SOCKET, [2, 1, 0, 0, 0, 0]);
+            dispatch(&mut state, &bindings, &mut socket);
+            assert_eq!(socket.error_code(), None);
+            assert_eq!(socket.ret0(), socket_fd as usize);
+
+            let req = state.ipc_recv(req_recv).expect("req").expect("msg");
+            assert_eq!(req.opcode, POSIX_SOCKET_OP_SOCKET);
+            let args = VfsV1Args::decode(req.as_slice()).expect("decode args");
+            assert_eq!(args.arg0, 2);
+            assert_eq!(args.arg1, 1);
+            assert_eq!(args.arg2, 0);
+        });
     }
 
     #[test]
@@ -1638,6 +1766,7 @@ mod tests {
             LINUX_NR_EPOLL_PWAIT,
             LINUX_NR_SENDFILE,
             LINUX_NR_STATX,
+            LINUX_NR_SOCKET,
             LINUX_NR_BRK,
             LINUX_NR_MUNMAP,
             LINUX_NR_MMAP,

@@ -8,7 +8,7 @@ use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::ipc::Message;
 use crate::services::compatibility::posix_compat::{
     LINUX_NR_CLOSE, LINUX_NR_EXIT, LINUX_NR_GETPID, LINUX_NR_GETPPID, LINUX_NR_OPENAT,
-    LINUX_NR_READ, LINUX_NR_WRITE, POSIX_COMPAT_ABI_VERSION, PosixErrno,
+    LINUX_NR_READ, LINUX_NR_SOCKET, LINUX_NR_WRITE, POSIX_COMPAT_ABI_VERSION, PosixErrno,
     PosixServiceBindings, dispatch,
 };
 
@@ -47,6 +47,16 @@ impl<'a> PosixSysdepsContext<'a> {
     ) -> Result<(), PosixErrno> {
         self.bindings
             .register_vfs_manager(self.kernel, request_send_cap, reply_recv_cap)
+            .map_err(PosixErrno::from)
+    }
+
+    pub fn register_socket_manager(
+        &mut self,
+        request_send_cap: CapId,
+        reply_recv_cap: CapId,
+    ) -> Result<(), PosixErrno> {
+        self.bindings
+            .register_socket_manager(self.kernel, request_send_cap, reply_recv_cap)
             .map_err(PosixErrno::from)
     }
 
@@ -112,15 +122,17 @@ impl<'a> PosixSysdepsContext<'a> {
         i32::try_from(fd).map_err(|_| PosixErrno::Inval)
     }
 
-    /// Temporary adapter: socket domain routing is not yet surfaced via the
-    /// POSIX syscall dispatch table and remains unsupported here.
     pub fn socket_hook(
         &mut self,
-        _domain: i32,
-        _sock_type: i32,
-        _protocol: i32,
+        domain: i32,
+        sock_type: i32,
+        protocol: i32,
     ) -> Result<i32, PosixErrno> {
-        Err(PosixErrno::NoSys)
+        let fd = self.run_syscall(
+            LINUX_NR_SOCKET,
+            [domain as usize, sock_type as usize, protocol as usize, 0, 0, 0],
+        )?;
+        i32::try_from(fd).map_err(|_| PosixErrno::Inval)
     }
 
     pub fn read_hook(
@@ -299,11 +311,30 @@ mod tests {
     }
 
     #[test]
-    fn socket_hook_is_explicitly_nosys_until_ipc_route_exists() {
+    fn socket_hook_routes_via_socket_binding_dispatch() {
         run_with_large_stack(|| {
             let mut kernel = Bootstrap::init().expect("init");
+            let (_, socket_req_send, socket_req_recv) =
+                kernel.create_endpoint(8).expect("socket req");
+            let (_, socket_rep_send, socket_rep_recv) =
+                kernel.create_endpoint(8).expect("socket rep");
             let mut ctx = PosixSysdepsContext::new(&mut kernel);
-            assert_eq!(ctx.socket_hook(2, 1, 0), Err(PosixErrno::NoSys));
+            ctx.register_socket_manager(socket_req_send, socket_rep_recv)
+                .expect("bind socket");
+            ctx.kernel
+                .ipc_send(
+                    socket_rep_send,
+                    Message::with_header(0, 1, 0, None, &1001u64.to_le_bytes())
+                        .expect("socket reply"),
+                )
+                .expect("seed socket reply");
+            assert_eq!(ctx.socket_hook(2, 1, 0).expect("socket"), 1001);
+            let socket_req = ctx
+                .kernel
+                .ipc_recv(socket_req_recv)
+                .expect("recv socket req")
+                .expect("socket req");
+            assert_eq!(socket_req.opcode, 1);
         });
     }
 }
