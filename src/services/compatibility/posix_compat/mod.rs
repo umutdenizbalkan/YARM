@@ -1683,6 +1683,91 @@ mod tests {
     }
 
     #[test]
+    fn posix_dispatch_socket_errno_propagation_is_uniform_across_routed_socket_syscalls() {
+        #[derive(Clone, Copy)]
+        struct Case {
+            name: &'static str,
+            nr: usize,
+            opcode: u16,
+            args: [usize; 6],
+        }
+
+        let cases = [
+            Case {
+                name: "socket",
+                nr: LINUX_NR_SOCKET,
+                opcode: SOCKET_OP_SOCKET,
+                args: [2, 1, 0, 0, 0, 0],
+            },
+            Case {
+                name: "connect",
+                nr: LINUX_NR_CONNECT,
+                opcode: SOCKET_OP_CONNECT,
+                args: [1001, 0xCAFE, 16, 0, 0, 0],
+            },
+            Case {
+                name: "sendto",
+                nr: LINUX_NR_SENDTO,
+                opcode: SOCKET_OP_SENDTO,
+                args: [1001, 0xBEEF, 7, 0, 0xD00D, 16],
+            },
+        ];
+
+        run_with_large_stack(move || {
+            let mut state = Bootstrap::init().expect("init");
+            let mut bindings = PosixServiceBindings::default();
+            let (_req_ep, req_send, req_recv) = state.create_endpoint(8).expect("socket req ep");
+            let (_rep_ep, rep_send, rep_recv) = state.create_endpoint(8).expect("socket rep ep");
+            bindings
+                .register_socket_manager(&state, req_send, rep_recv)
+                .expect("register socket");
+
+            for case in cases {
+                let errno = EINVAL as i64;
+                state
+                    .ipc_send(
+                        rep_send,
+                        Message::with_header(0, case.opcode, 0, None, &(-errno).to_le_bytes())
+                            .expect("reply"),
+                    )
+                    .expect("seed errno reply");
+
+                let mut frame = TrapFrame::new(case.nr, case.args);
+                dispatch(&mut state, &bindings, &mut frame);
+                assert_eq!(frame.error_code(), Some(EINVAL as usize), "{}", case.name);
+                assert_eq!(frame.ret0(), 0, "{}", case.name);
+
+                let req = state.ipc_recv(req_recv).expect("req").expect("msg");
+                assert_eq!(req.opcode, case.opcode, "{}", case.name);
+                match case.name {
+                    "socket" => {
+                        let decoded = SocketArgs::decode(req.as_slice()).expect("decode socket");
+                        assert_eq!(decoded.domain, 2);
+                        assert_eq!(decoded.sock_type, 1);
+                        assert_eq!(decoded.protocol, 0);
+                    }
+                    "connect" => {
+                        let decoded = ConnectArgs::decode(req.as_slice()).expect("decode connect");
+                        assert_eq!(decoded.fd, 1001);
+                        assert_eq!(decoded.addr_ptr, 0xCAFE);
+                        assert_eq!(decoded.addr_len, 16);
+                    }
+                    "sendto" => {
+                        let decoded = SendToArgs::decode(req.as_slice()).expect("decode sendto");
+                        assert_eq!(decoded.fd, 1001);
+                        assert_eq!(decoded.buf_ptr, 0xBEEF);
+                        assert_eq!(decoded.len, 7);
+                        assert_eq!(decoded.flags, 0);
+                        assert_eq!(decoded.dest_addr_ptr, 0xD00D);
+                        assert_eq!(decoded.addrlen, 16);
+                    }
+                    _ => panic!("unknown case"),
+                }
+            }
+        });
+    }
+
+    #[test]
     fn posix_dispatch_maps_eintr_and_timeout_errno_at_shim_boundary() {
         let mut state = Bootstrap::init().expect("init");
         let mut bindings = PosixServiceBindings::default();
