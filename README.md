@@ -179,6 +179,12 @@ Commercial licensing and support arrangements available for safety-critical inte
 
 YARM is a solo project in early development. Contributions, issues, and design feedback are welcome. Please read `CONTRIBUTING.md` before submitting patches. A Contributor License Agreement will be required — this is intentional and in service of the long-term commercialization and certification strategy.
 
+Pre-push boundary checks:
+
+- `scripts/phase5-boundary-gates.sh --fs-runtime-entrypoint`
+- `scripts/phase5-boundary-gates.sh --driver-runtime-entrypoint`
+- `scripts/phase5-boundary-gates.sh --network-runtime-entrypoint`
+
 Before pushing FS service/runtime changes, run:
 
 ```bash
