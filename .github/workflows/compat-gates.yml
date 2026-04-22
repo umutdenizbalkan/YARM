@@ -55,6 +55,14 @@ jobs:
       - name: enforce driver runtime-entrypoint parity + bins buildability
         run: scripts/phase5-boundary-gates.sh --driver-runtime-entrypoint
 
+  network-runtime-entrypoint-boundary-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: enforce network runtime-entrypoint parity + bins buildability
+        run: scripts/phase5-boundary-gates.sh --network-runtime-entrypoint
+
   phase5-boundary-gates:
     runs-on: ubuntu-latest
     steps:
