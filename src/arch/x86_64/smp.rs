@@ -273,13 +273,12 @@ fn write_trampoline_page(page: &[u8; AP_TRAMPOLINE_SIZE]) {
 }
 
 #[cfg(test)]
-fn trampoline_page_snapshot_for_test() -> [u8; AP_TRAMPOLINE_SIZE] {
-    let mut out = [0u8; AP_TRAMPOLINE_SIZE];
+fn trampoline_handoff_snapshot_for_test() -> ApHandoff {
     unsafe {
-        let ptr = TEST_TRAMPOLINE_PAGE.0.get() as *const u8;
-        copy_nonoverlapping(ptr, out.as_mut_ptr(), AP_TRAMPOLINE_SIZE);
+        let base = TEST_TRAMPOLINE_PAGE.0.get() as *const u8;
+        let ptr = base.add(AP_HANDOFF_OFFSET).cast::<ApHandoff>();
+        core::ptr::read_unaligned(ptr)
     }
-    out
 }
 
 #[cfg(test)]
@@ -501,20 +500,22 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
 mod tests {
     use super::*;
 
-    fn read_handoff(page: &[u8; AP_TRAMPOLINE_SIZE]) -> ApHandoff {
-        unsafe {
-            let ptr = page[AP_HANDOFF_OFFSET..].as_ptr().cast::<ApHandoff>();
-            core::ptr::read_unaligned(ptr)
-        }
-    }
-
     #[test]
     fn trampoline_handoff_encoding_contains_cpu_stack_and_kernel_state() {
+        std::thread::Builder::new()
+            .name("trampoline_handoff_encoding_contains_cpu_stack_and_kernel_state".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_trampoline_handoff_encoding_contains_cpu_stack_and_kernel_state)
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    fn run_trampoline_handoff_encoding_contains_cpu_stack_and_kernel_state() {
         let kernel = crate::kernel::boot::Bootstrap::init_static().expect("init");
         prepare_trampoline_for_cpu(kernel, CpuId(2));
 
-        let page = trampoline_page_snapshot_for_test();
-        let handoff = read_handoff(&page);
+        let handoff = trampoline_handoff_snapshot_for_test();
         assert_eq!(handoff.magic, AP_HANDOFF_MAGIC);
         assert_eq!(handoff.cpu_id, 2);
         assert_eq!(handoff.stack_top, ap_stack_top(CpuId(2)));
