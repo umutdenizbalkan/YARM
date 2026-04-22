@@ -3,7 +3,6 @@
 
 #![no_std]
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
-#![cfg_attr(not(feature = "hosted-dev"), feature(alloc_error_handler))]
 
 #[cfg(not(feature = "hosted-dev"))]
 yarm_freestanding_alloc::install!(

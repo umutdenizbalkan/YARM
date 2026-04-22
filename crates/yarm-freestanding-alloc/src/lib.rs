@@ -51,8 +51,8 @@ macro_rules! install {
         #[global_allocator]
         static RUNTIME_GLOBAL_ALLOCATOR: RuntimeBumpAllocator = RuntimeBumpAllocator;
 
-        #[alloc_error_handler]
-        fn alloc_error(_layout: Layout) -> ! {
+        #[unsafe(no_mangle)]
+        extern "C" fn __rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
             panic!($oom_message)
         }
     };
