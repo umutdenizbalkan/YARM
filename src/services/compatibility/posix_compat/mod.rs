@@ -1602,18 +1602,10 @@ mod tests {
 
             let mut sendto = TrapFrame::new(LINUX_NR_SENDTO, [1001, 0xBEEF, 7, 0, 0xD00D, 16]);
             dispatch(&mut state, &bindings, &mut sendto);
-            assert_eq!(sendto.error_code(), Some(EINVAL as usize));
-            assert_eq!(sendto.ret0(), 0);
+            assert_errno_trapframe(&sendto, SocketErrnoCase::Sendto, EINVAL as usize);
 
             let sendto_req = state.ipc_recv(req_recv).expect("req").expect("msg");
-            assert_eq!(sendto_req.opcode, SOCKET_OP_SENDTO);
-            let sendto_args = SendToArgs::decode(sendto_req.as_slice()).expect("decode args");
-            assert_eq!(sendto_args.fd, 1001);
-            assert_eq!(sendto_args.buf_ptr, 0xBEEF);
-            assert_eq!(sendto_args.len, 7);
-            assert_eq!(sendto_args.flags, 0);
-            assert_eq!(sendto_args.dest_addr_ptr, 0xD00D);
-            assert_eq!(sendto_args.addrlen, 16);
+            assert_socket_request_shape(sendto_req.opcode, sendto_req.as_slice(), SocketErrnoCase::Sendto);
         });
     }
 
@@ -1639,15 +1631,10 @@ mod tests {
 
             let mut connect = TrapFrame::new(LINUX_NR_CONNECT, [1001, 0xCAFE, 16, 0, 0, 0]);
             dispatch(&mut state, &bindings, &mut connect);
-            assert_eq!(connect.error_code(), Some(EINVAL as usize));
-            assert_eq!(connect.ret0(), 0);
+            assert_errno_trapframe(&connect, SocketErrnoCase::Connect, EINVAL as usize);
 
             let connect_req = state.ipc_recv(req_recv).expect("req").expect("msg");
-            assert_eq!(connect_req.opcode, SOCKET_OP_CONNECT);
-            let connect_args = ConnectArgs::decode(connect_req.as_slice()).expect("decode args");
-            assert_eq!(connect_args.fd, 1001);
-            assert_eq!(connect_args.addr_ptr, 0xCAFE);
-            assert_eq!(connect_args.addr_len, 16);
+            assert_socket_request_shape(connect_req.opcode, connect_req.as_slice(), SocketErrnoCase::Connect);
         });
     }
 
@@ -1673,15 +1660,10 @@ mod tests {
 
             let mut socket = TrapFrame::new(LINUX_NR_SOCKET, [2, 1, 0, 0, 0, 0]);
             dispatch(&mut state, &bindings, &mut socket);
-            assert_eq!(socket.error_code(), Some(EINVAL as usize));
-            assert_eq!(socket.ret0(), 0);
+            assert_errno_trapframe(&socket, SocketErrnoCase::Socket, EINVAL as usize);
 
             let socket_req = state.ipc_recv(req_recv).expect("req").expect("msg");
-            assert_eq!(socket_req.opcode, SOCKET_OP_SOCKET);
-            let socket_args = SocketArgs::decode(socket_req.as_slice()).expect("decode args");
-            assert_eq!(socket_args.domain, 2);
-            assert_eq!(socket_args.sock_type, 1);
-            assert_eq!(socket_args.protocol, 0);
+            assert_socket_request_shape(socket_req.opcode, socket_req.as_slice(), SocketErrnoCase::Socket);
         });
     }
 

@@ -214,7 +214,7 @@ mod tests {
     use crate::std::thread;
     use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
     use yarm_ipc_abi::socket_abi::{
-        ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SENDTO, SOCKET_OP_SOCKET, SendToArgs, SocketArgs,
+        ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SENDTO, SOCKET_OP_SOCKET, SendToArgs,
     };
     use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_WRITE};
 
@@ -446,24 +446,15 @@ mod tests {
                 )
                 .expect("seed sendto error reply");
 
-            let err = ctx
-                .sendto_hook(1001, 0xBEEF, 7, 0, 0xD00D, 16)
-                .expect_err("sendto should fail");
-            assert_eq!(err, PosixErrno::Inval);
+            let err = ctx.sendto_hook(1001, 0xBEEF, 7, 0, 0xD00D, 16);
+            assert_errno_hook_result(err, SocketErrnoCase::Sendto);
 
             let sendto_req = ctx
                 .kernel
                 .ipc_recv(socket_req_recv)
                 .expect("recv sendto req")
                 .expect("sendto req");
-            assert_eq!(sendto_req.opcode, SOCKET_OP_SENDTO);
-            let sendto_args = SendToArgs::decode(sendto_req.as_slice()).expect("decode sendto");
-            assert_eq!(sendto_args.fd, 1001);
-            assert_eq!(sendto_args.buf_ptr, 0xBEEF);
-            assert_eq!(sendto_args.len, 7);
-            assert_eq!(sendto_args.flags, 0);
-            assert_eq!(sendto_args.dest_addr_ptr, 0xD00D);
-            assert_eq!(sendto_args.addrlen, 16);
+            assert_socket_request_shape(sendto_req.opcode, sendto_req.as_slice(), SocketErrnoCase::Sendto);
         });
     }
 
@@ -486,21 +477,15 @@ mod tests {
                 )
                 .expect("seed connect error reply");
 
-            let err = ctx
-                .connect_hook(1001, 0xCAFE, 16)
-                .expect_err("connect should fail");
-            assert_eq!(err, PosixErrno::Inval);
+            let err = ctx.connect_hook(1001, 0xCAFE, 16);
+            assert_errno_hook_result(err, SocketErrnoCase::Connect);
 
             let connect_req = ctx
                 .kernel
                 .ipc_recv(socket_req_recv)
                 .expect("recv connect req")
                 .expect("connect req");
-            assert_eq!(connect_req.opcode, SOCKET_OP_CONNECT);
-            let connect_args = ConnectArgs::decode(connect_req.as_slice()).expect("decode connect");
-            assert_eq!(connect_args.fd, 1001);
-            assert_eq!(connect_args.addr_ptr, 0xCAFE);
-            assert_eq!(connect_args.addr_len, 16);
+            assert_socket_request_shape(connect_req.opcode, connect_req.as_slice(), SocketErrnoCase::Connect);
         });
     }
 
@@ -523,19 +508,15 @@ mod tests {
                 )
                 .expect("seed socket error reply");
 
-            let err = ctx.socket_hook(2, 1, 0).expect_err("socket should fail");
-            assert_eq!(err, PosixErrno::Inval);
+            let err = ctx.socket_hook(2, 1, 0);
+            assert_errno_hook_result(err, SocketErrnoCase::Socket);
 
             let socket_req = ctx
                 .kernel
                 .ipc_recv(socket_req_recv)
                 .expect("recv socket req")
                 .expect("socket req");
-            assert_eq!(socket_req.opcode, SOCKET_OP_SOCKET);
-            let socket_args = SocketArgs::decode(socket_req.as_slice()).expect("decode socket");
-            assert_eq!(socket_args.domain, 2);
-            assert_eq!(socket_args.sock_type, 1);
-            assert_eq!(socket_args.protocol, 0);
+            assert_socket_request_shape(socket_req.opcode, socket_req.as_slice(), SocketErrnoCase::Socket);
         });
     }
 
