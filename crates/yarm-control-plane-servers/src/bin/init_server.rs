@@ -4,6 +4,9 @@
 #![no_std]
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
+#[cfg(not(feature = "hosted-dev"))]
+mod freestanding_alloc;
+
 #[inline]
 fn run() {
     yarm_control_plane_servers::run_init_server();
