@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm_server_runtime::network::run_socket();
+    yarm_network_servers::run_socket();
 }

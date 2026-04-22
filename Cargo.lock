@@ -58,7 +58,7 @@ version = "0.1.0"
 name = "yarm-network-servers"
 version = "0.1.0"
 dependencies = [
- "yarm-server-runtime",
+ "yarm",
 ]
 
 [[package]]
@@ -76,6 +76,7 @@ dependencies = [
  "yarm-control-plane-servers",
  "yarm-driver-servers",
  "yarm-fs-servers",
+ "yarm-network-servers",
 ]
 
 [[package]]

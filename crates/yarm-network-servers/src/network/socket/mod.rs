@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-#![no_std]
+pub mod service;
 
-fn main() {
-    yarm_network_servers::run_tcpip();
-}
+pub use service::run;

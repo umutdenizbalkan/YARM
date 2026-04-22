@@ -4,5 +4,5 @@
 #![no_std]
 
 fn main() {
-    yarm_server_runtime::network::run_netmgr();
+    yarm_network_servers::run_netmgr();
 }

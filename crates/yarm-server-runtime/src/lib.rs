@@ -84,23 +84,23 @@ pub mod drivers {
 
 pub mod network {
     pub fn run_dhcp() {
-        yarm::services::network::dhcp::run();
+        yarm_network_servers::run_dhcp();
     }
 
     pub fn run_dns() {
-        yarm::services::network::dns::run();
+        yarm_network_servers::run_dns();
     }
 
     pub fn run_netmgr() {
-        yarm::services::network::netmgr::run();
+        yarm_network_servers::run_netmgr();
     }
 
     pub fn run_socket() {
-        yarm::services::network::socket::run();
+        yarm_network_servers::run_socket();
     }
 
     pub fn run_tcpip() {
-        yarm::services::network::tcpip::run();
+        yarm_network_servers::run_tcpip();
     }
 }
 
@@ -131,6 +131,7 @@ mod tests {
         let legacy_cp = ["yarm", "::services::", "control_plane::"].concat();
         let legacy_drivers = ["yarm", "::services::", "drivers::"].concat();
         let legacy_fs = ["yarm", "::services::", "fs::"].concat();
+        let legacy_network = ["yarm", "::services::", "network::"].concat();
         assert!(
             !src.contains(legacy_cp.as_str()),
             "server-runtime control-plane dispatch must route via workspace server crate"
@@ -144,6 +145,10 @@ mod tests {
             "server-runtime fs dispatch must route via workspace server crate"
         );
         assert!(
+            !src.contains(legacy_network.as_str()),
+            "server-runtime network dispatch must route via workspace server crate"
+        );
+        assert!(
             src.contains("yarm_control_plane_servers::"),
             "server-runtime must depend on control-plane workspace crate dispatch"
         );
@@ -154,6 +159,10 @@ mod tests {
         assert!(
             src.contains("yarm_driver_servers::"),
             "server-runtime must depend on driver workspace crate dispatch"
+        );
+        assert!(
+            src.contains("yarm_network_servers::"),
+            "server-runtime must depend on network workspace crate dispatch"
         );
     }
 }
