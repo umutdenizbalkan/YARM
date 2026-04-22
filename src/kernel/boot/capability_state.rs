@@ -39,11 +39,13 @@ impl KernelState {
         let capability = self.resolve_capability_for_task(source_tid, source_cap)?;
         let dest_cnode = self.task_cnode(dest_tid).ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self.mint_capability_in_cnode(dest_cnode, capability)?;
-        self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap)?;
+        if source_tid != dest_tid {
+            self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap)?;
+        }
         Ok(delegated_cap)
     }
 
-    pub(crate) fn grant_capability_task_to_task_with_rights(
+    pub fn grant_capability_task_to_task_with_rights(
         &mut self,
         source_tid: u64,
         source_cap: CapId,
@@ -56,7 +58,9 @@ impl KernelState {
             .map_err(|_| KernelError::MissingRight)?;
         let dest_cnode = self.task_cnode(dest_tid).ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self.mint_capability_in_cnode(dest_cnode, attenuated)?;
-        self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap)?;
+        if source_tid != dest_tid {
+            self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap)?;
+        }
         Ok(delegated_cap)
     }
 

@@ -5,14 +5,6 @@ mod launch;
 mod mount;
 mod policy;
 
-use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
-use yarm::kernel::capabilities::{CapId, CapRights};
-use yarm::kernel::task::TaskClass;
-use yarm::kernel::task::TaskStatus;
-use yarm::yarm_fs_servers::common::vfs_ipc::{
-    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
-};
-use yarm::kernel::vm::Asid;
 use crate::yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
 use crate::yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
 use crate::yarm_fs_servers::ext4::{Ext4Backend, Ext4Service};
@@ -20,6 +12,15 @@ use crate::yarm_fs_servers::fat::{FatBackend, FatService};
 use crate::yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
 use crate::yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
 use crate::yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
+use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
+use yarm::kernel::capabilities::{CapId, CapRights};
+use yarm::kernel::task::TaskClass;
+use yarm::kernel::task::TaskStatus;
+use yarm::kernel::vm::Asid;
+use crate::yarm_fs_servers::common::service::FsService;
+use crate::yarm_fs_servers::common::vfs_ipc::{
+    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
+};
 use yarm_ipc_abi::supervisor_abi::{
     InitAlert, InitAlertKind, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, TaskExitedEvent,
@@ -421,8 +422,7 @@ impl InitService {
         let source_tid = kernel.current_tid();
         let has_right_for = |tid: u64, cap: CapId, right: CapRights| {
             kernel
-                .capability_service()
-                .resolve_task_capability(tid, cap)
+                .task_capability(tid, cap)
                 .map(|capability| capability.has_right(right))
                 .unwrap_or(false)
         };
@@ -806,56 +806,64 @@ impl InitService {
 
 fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
     match kind {
-        MountServiceKind::Initramfs => {
-            let mut service = InitramfsService::with_backend(InitramfsBackend::new(4096));
-            let summary =
-                run_initramfs_request_loop(&mut service).map_err(|_| KernelError::WrongObject)?;
-            if summary.write_allowed {
-                return Err(KernelError::WrongObject);
-            }
-        }
-        MountServiceKind::RamFs => {
-            let mut service = RamFsService::with_backend(RamFsBackend::new());
-            run_rw_mount_cycle(&mut service, 0xA100, 64)?;
-        }
-        MountServiceKind::DevFs => {
-            let mut service = DevFsService::with_backend(DevFsBackend::default());
-            let _ = run_devfs_request_loop(&mut service).map_err(|_| KernelError::WrongObject)?;
-        }
-        MountServiceKind::Ext4 => {
-            let mut service = Ext4Service::with_backend(Ext4Backend::new());
-            run_rw_mount_cycle(&mut service, 0x4040, 4096)?;
-        }
-        MountServiceKind::Fat => {
-            let mut service = FatService::with_backend(FatBackend::new());
-            let open = openat_message(OpenAtRequest {
-                dirfd: 0,
-                path_ptr: 0x5050,
-                flags: 0,
-                mode: 0,
-            })
-            .map_err(|_| KernelError::WrongObject)?;
-            let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
-            let fd =
-                VfsReply::from_opcode_payload_checked(open_reply.opcode, open_reply.as_slice())
-                    .map_err(|_| KernelError::WrongObject)?
-                    .as_u64();
-            let write = write_message(ReadWriteRequest {
-                fd,
-                buf_ptr: 0,
-                len: 33,
-            })
-            .map_err(|_| KernelError::WrongObject)?;
-            service
-                .handle(write)
-                .map_err(|_| KernelError::WrongObject)?;
-        }
+        MountServiceKind::Initramfs => run_mount_initramfs(),
+        MountServiceKind::RamFs => run_mount_ramfs(),
+        MountServiceKind::DevFs => run_mount_devfs(),
+        MountServiceKind::Ext4 => run_mount_ext4(),
+        MountServiceKind::Fat => run_mount_fat(),
+    }
+}
+
+fn run_mount_initramfs() -> Result<(), KernelError> {
+    let mut service = InitramfsService::with_backend(InitramfsBackend::new(4096));
+    let summary = run_initramfs_request_loop(&mut service).map_err(|_| KernelError::WrongObject)?;
+    if summary.write_allowed {
+        return Err(KernelError::WrongObject);
     }
     Ok(())
 }
 
-fn run_rw_mount_cycle<B: yarm::yarm_fs_servers::common::vfs_ipc::VfsBackend>(
-    service: &mut yarm::yarm_fs_servers::common::service::FsService<B>,
+fn run_mount_ramfs() -> Result<(), KernelError> {
+    let mut service = RamFsService::with_backend(RamFsBackend::new());
+    run_rw_mount_cycle(&mut service, 0xA100, 64)
+}
+
+fn run_mount_devfs() -> Result<(), KernelError> {
+    let mut service = DevFsService::with_backend(DevFsBackend::default());
+    let _ = run_devfs_request_loop(&mut service).map_err(|_| KernelError::WrongObject)?;
+    Ok(())
+}
+
+fn run_mount_ext4() -> Result<(), KernelError> {
+    let mut service = Ext4Service::with_backend(Ext4Backend::new());
+    run_rw_mount_cycle(&mut service, 0x4040, 4096)
+}
+
+fn run_mount_fat() -> Result<(), KernelError> {
+    let mut service = FatService::with_backend(FatBackend::new());
+    let open = openat_message(OpenAtRequest {
+        dirfd: 0,
+        path_ptr: 0x5050,
+        flags: 0,
+        mode: 0,
+    })
+    .map_err(|_| KernelError::WrongObject)?;
+    let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
+    let fd = VfsReply::from_opcode_payload_checked(open_reply.opcode, open_reply.as_slice())
+        .map_err(|_| KernelError::WrongObject)?
+        .as_u64();
+    let write = write_message(ReadWriteRequest {
+        fd,
+        buf_ptr: 0,
+        len: 33,
+    })
+    .map_err(|_| KernelError::WrongObject)?;
+    service.handle(write).map_err(|_| KernelError::WrongObject)?;
+    Ok(())
+}
+
+fn run_rw_mount_cycle<B: crate::yarm_fs_servers::common::vfs_ipc::VfsBackend>(
+    service: &mut FsService<B>,
     path_ptr: u64,
     write_len: u64,
 ) -> Result<(), KernelError> {
@@ -1180,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn init_recovers_process_manager_failure_within_budget() {
+    fn init_recovers_proc_mgr_failure_within_budget() {
         let mut state = Bootstrap::init().expect("init");
         let mut init = InitService::new();
         let graph = CoreServiceGraph {

@@ -26,10 +26,6 @@ impl CapabilityService<'_> {
         self.kernel.current_task_capability(cap)
     }
 
-    pub(crate) fn resolve_task_capability(&self, tid: u64, cap: CapId) -> Option<Capability> {
-        self.kernel.task_capability(tid, cap)
-    }
-
     #[cfg(test)]
     pub(crate) fn current_task_capability_has_right(&self, cap: CapId, right: CapRights) -> bool {
         self.resolve_current_task_capability(cap)
