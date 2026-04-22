@@ -3,7 +3,6 @@
 
 pub mod boot;
 pub mod capabilities;
-pub mod driver_manager;
 pub mod frame_allocator;
 pub mod global_allocator;
 pub mod ipc;

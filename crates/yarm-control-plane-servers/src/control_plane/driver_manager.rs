@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::boot::{KernelError, KernelState};
-use super::capabilities::CapId;
-use super::driver_abi::{
+use yarm::kernel::boot::{KernelError, KernelState};
+use yarm::kernel::capabilities::CapId;
+use yarm::kernel::driver_abi::{
     DRIVER_OP_GRANT_DMA, DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, DRIVER_OP_RESTARTED,
 };
-use super::ipc::Message;
+use yarm::kernel::ipc::Message;
 
 fn read_u64(payload: &[u8], offset: usize) -> Result<u64, KernelError> {
     let end = offset.checked_add(8).ok_or(KernelError::WrongObject)?;
@@ -103,7 +103,7 @@ pub fn handle_request(kernel: &mut KernelState, request: Message) -> Result<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::boot::Bootstrap;
+    use yarm::kernel::boot::Bootstrap;
     use yarm_ipc_abi::driver_abi::{DRIVER_OP_GRANT_IRQ, pack_driver_pair};
 
     #[test]
