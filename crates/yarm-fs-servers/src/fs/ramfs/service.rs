@@ -7,7 +7,7 @@ use yarm::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, read_message, statx_message,
     write_message,
 };
-use yarm::services::common::service::{FsService, run_typed_request_loop};
+use yarm::service_common::service::{FsService, run_typed_request_loop};
 use super::tree::{RamFsBackend, RamFsMetrics};
 use yarm_srv_common::vfs_reply::VfsReply;
 
@@ -111,7 +111,7 @@ mod tests {
         CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_message,
         statx_message,
     };
-    use yarm::services::common::vfs_service::VfsService;
+    use yarm::service_common::vfs_service::VfsService;
     use super::super::super::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
     use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT};
 

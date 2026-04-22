@@ -10,7 +10,7 @@ use yarm::kernel::vfs::{
     ioctl_message, openat_message, poll_message, read_message, sendfile_message, statx_message,
     write_message,
 };
-use yarm::services::common::service::{FsService, run_typed_request_loop};
+use yarm::service_common::service::{FsService, run_typed_request_loop};
 use yarm_srv_common::vfs_reply::VfsReply;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

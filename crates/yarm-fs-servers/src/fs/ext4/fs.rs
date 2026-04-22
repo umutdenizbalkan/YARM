@@ -2,12 +2,12 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::vfs::{VfsBackend, VfsError};
-use yarm::services::common::fs::{FdRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend};
+use yarm::service_common::fs::{FdRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend};
 
 use super::dir::find_inode_index;
 use super::file::checked_append;
 use super::inode::Ext4Inode;
-use yarm::services::fs::blkcache::BlockCache;
+use yarm::yarm_fs_servers::blkcache::BlockCache;
 
 #[derive(Debug)]
 pub struct Ext4Backend {
@@ -143,7 +143,7 @@ impl VfsBackend for Ext4Backend {
 
 #[cfg(test)]
 mod framing_tests {
-    use yarm::services::drivers::virtio_blk::device::{
+    use yarm::yarm_driver_servers::virtio_blk::device::{
         VIRTIO_BLK_OP_READ, VirtioBlkReqFrame, VirtioBlkRespFrame,
     };
 

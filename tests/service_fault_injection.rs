@@ -7,15 +7,15 @@ use yarm::kernel::ipc::Message;
 use yarm::kernel::process::ProcessManagerError;
 use yarm::kernel::process::ProcessService;
 use yarm::kernel::process_abi::{PROC_OP_WAITPID_V2, WaitPidV2Args};
-use yarm::services::drivers::virtio_gpu::service::VirtioGpuService;
-use yarm::services::fs::initramfs::service::{
+use yarm::yarm_driver_servers::virtio_gpu::service::VirtioGpuService;
+use yarm::yarm_fs_servers::initramfs::service::{
     InitramfsService, run_request_loop as run_initramfs_request_loop,
 };
-use yarm::services::network::{
+use yarm::yarm_network_servers::{
     dhcp::service::DhcpService, dns::service::DnsService, netmgr::service::NetmgrService,
     tcpip::service::TcpIpService,
 };
-use yarm::services::ui::display::service::{DisplayService, DisplayStats};
+use yarm::yarm_ui_servers::display::service::{DisplayService, DisplayStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ServiceFaultSummary {
@@ -41,7 +41,7 @@ fn run_service_fault_injection_matrix() -> ServiceFaultSummary {
     let control_plane_unknown_wait = proc.handle(wait_unknown).expect_err("unknown target");
 
     let mut initramfs =
-        InitramfsService::with_backend(yarm::services::fs::initramfs::InitramfsBackend::new(4096));
+        InitramfsService::with_backend(yarm::yarm_fs_servers::initramfs::InitramfsBackend::new(4096));
     let fs_read_only = !run_initramfs_request_loop(&mut initramfs)
         .expect("initramfs request loop")
         .write_allowed;
@@ -116,7 +116,7 @@ fn ui_display_fault_path_rejects_present_before_modeset() {
 #[test]
 fn initramfs_fault_path_stays_read_only() {
     let mut initramfs =
-        InitramfsService::with_backend(yarm::services::fs::initramfs::InitramfsBackend::new(2048));
+        InitramfsService::with_backend(yarm::yarm_fs_servers::initramfs::InitramfsBackend::new(2048));
     let summary = run_initramfs_request_loop(&mut initramfs).expect("loop");
     assert_eq!(summary.write_allowed, false);
     // initramfs bootstrap loop performs: open + read + statx.

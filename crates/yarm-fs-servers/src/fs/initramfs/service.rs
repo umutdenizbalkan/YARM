@@ -6,7 +6,7 @@ use yarm::kernel::vfs::VfsError;
 use yarm::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, openat_message, read_message, statx_message, write_message,
 };
-use yarm::services::common::service::{FsService, run_typed_request_loop};
+use yarm::service_common::service::{FsService, run_typed_request_loop};
 use super::archive::{
     INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend, InitramfsMetrics,
 };
@@ -112,7 +112,7 @@ mod tests {
         CloseRequest, MountNamespacePolicy, MountRouter, StatxRequest, close_message,
         openat_message, read_message, statx_message,
     };
-    use yarm::services::common::vfs_service::VfsService;
+    use yarm::service_common::vfs_service::VfsService;
     use super::super::super::devfs::{DEV_CONSOLE_PATH_PTR, DevFsBackend};
     use super::super::INITRAMFS_INIT_PATH_PTR;
     use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_READ};

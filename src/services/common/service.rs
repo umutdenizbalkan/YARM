@@ -3,7 +3,7 @@
 
 use crate::kernel::ipc::Message;
 use crate::kernel::vfs::{VfsBackend, VfsError};
-use crate::services::common::vfs_service::VfsService;
+use crate::service_common::vfs_service::VfsService;
 
 pub trait RequestResponseService {
     type Error;

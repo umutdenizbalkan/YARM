@@ -5,7 +5,7 @@ use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 use yarm::kernel::capabilities::{CapId, CapRights};
 use yarm::kernel::ipc::{Message, ThreadId};
 use yarm::kernel::time::{TickDuration, TickInstant};
-use yarm::services::init::{
+use yarm::init::{
     CoreServiceKind, CoreServicePolicyTable, InitFaultHandoff, RestartOwner, ServiceRestartPolicy,
 };
 use yarm_ipc_abi::supervisor_abi::{
@@ -755,8 +755,8 @@ pub fn query_status_via_call_reply_with_default_timeout(
 
 pub fn run() {
     let mut kernel = yarm::kernel::boot::Bootstrap::init().expect("init");
-    let mut init = yarm::services::init::InitService::new();
-    let graph = yarm::services::init::CoreServiceGraph {
+    let mut init = yarm::init::InitService::new();
+    let graph = yarm::init::CoreServiceGraph {
         init_tid: 1,
         process_manager_tid: 2,
         vfs_tid: 3,
@@ -765,7 +765,7 @@ pub fn run() {
     init.register_core_graph(&mut kernel, graph).expect("graph");
     init.launch_core_services(
         &mut kernel,
-        yarm::services::init::CoreServiceImagePlan {
+        yarm::init::CoreServiceImagePlan {
             process_manager_entry: 0x8000,
             vfs_entry: 0x9000,
             supervisor_entry: 0xA000,
@@ -796,7 +796,7 @@ mod tests {
         use yarm::kernel::boot::Bootstrap;
     use yarm::kernel::task::{TaskClass, TaskStatus};
     use yarm::kernel::vm::PAGE_SIZE;
-    use yarm::services::init::{CoreServiceGraph, CoreServiceImagePlan, InitService};
+    use yarm::init::{CoreServiceGraph, CoreServiceImagePlan, InitService};
     use yarm_ipc_abi::supervisor_abi::{
         CoreServiceRegistrationKind, InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
         SupervisorStatusRequest, TransferRevokedEvent,

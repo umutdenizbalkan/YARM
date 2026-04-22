@@ -13,13 +13,13 @@ use crate::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
 use crate::kernel::vm::Asid;
-use crate::services::fs::devfs::service::run_request_loop as run_devfs_request_loop;
-use crate::services::fs::devfs::{DevFsBackend, DevFsService};
-use crate::services::fs::ext4::{Ext4Backend, Ext4Service};
-use crate::services::fs::fat::{FatBackend, FatService};
-use crate::services::fs::initramfs::service::run_request_loop as run_initramfs_request_loop;
-use crate::services::fs::initramfs::{InitramfsBackend, InitramfsService};
-use crate::services::fs::ramfs::{RamFsBackend, RamFsService};
+use crate::yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
+use crate::yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
+use crate::yarm_fs_servers::ext4::{Ext4Backend, Ext4Service};
+use crate::yarm_fs_servers::fat::{FatBackend, FatService};
+use crate::yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
+use crate::yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
+use crate::yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
 use yarm_ipc_abi::supervisor_abi::{
     InitAlert, InitAlertKind, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, TaskExitedEvent,
@@ -855,7 +855,7 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
 }
 
 fn run_rw_mount_cycle<B: crate::kernel::vfs::VfsBackend>(
-    service: &mut crate::services::common::service::FsService<B>,
+    service: &mut crate::service_common::service::FsService<B>,
     path_ptr: u64,
     write_len: u64,
 ) -> Result<(), KernelError> {

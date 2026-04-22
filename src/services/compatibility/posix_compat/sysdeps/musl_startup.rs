@@ -4,7 +4,7 @@
 use super::clone_thread_hook;
 use crate::kernel::boot::KernelState;
 use crate::kernel::task::ThreadGroupId;
-use crate::services::compatibility::posix_compat::{
+use crate::compatibility::posix_compat::{
     LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, PosixErrno,
 };
 
@@ -652,7 +652,7 @@ mod tests {
             },
         )
         .expect("thread");
-        crate::services::compatibility::posix_compat::sysdeps::set_tls_hook(
+        crate::compatibility::posix_compat::sysdeps::set_tls_hook(
             &mut kernel,
             state.tid,
             0x3000_0100,

@@ -5,7 +5,7 @@ use super::fs::Ext4Backend;
 use yarm::kernel::vfs::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
-use yarm::services::common::service::FsService;
+use yarm::service_common::service::FsService;
 use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type Ext4Service = FsService<Ext4Backend>;

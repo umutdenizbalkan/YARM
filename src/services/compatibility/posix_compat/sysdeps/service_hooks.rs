@@ -6,7 +6,7 @@ use crate::kernel::capabilities::CapId;
 use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
 use crate::kernel::ipc::Message;
-use crate::services::compatibility::posix_compat::{
+use crate::compatibility::posix_compat::{
     LINUX_NR_CLOSE, LINUX_NR_CONNECT, LINUX_NR_EXIT, LINUX_NR_GETPID, LINUX_NR_GETPPID,
     LINUX_NR_OPENAT, LINUX_NR_READ, LINUX_NR_SENDTO, LINUX_NR_SOCKET, LINUX_NR_WRITE,
     POSIX_COMPAT_ABI_VERSION, PosixErrno, PosixServiceBindings, dispatch,
@@ -208,7 +208,7 @@ impl<'a> PosixSysdepsContext<'a> {
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
-    use crate::services::compatibility::posix_compat::socket_errno_test_helpers::{
+    use crate::compatibility::posix_compat::socket_errno_test_helpers::{
         assert_errno_hook_result, assert_socket_request_shape, setup_socket_ipc_fixture,
         SocketErrnoCase,
     };
@@ -438,7 +438,7 @@ mod tests {
             ctx.register_socket_manager(socket_req_send, socket_rep_recv)
                 .expect("bind socket");
 
-            let errno = crate::services::compatibility::posix_compat::EINVAL as i64;
+            let errno = crate::compatibility::posix_compat::EINVAL as i64;
             ctx.kernel
                 .ipc_send(
                     socket_rep_send,
@@ -469,7 +469,7 @@ mod tests {
             ctx.register_socket_manager(socket_req_send, socket_rep_recv)
                 .expect("bind socket");
 
-            let errno = crate::services::compatibility::posix_compat::EINVAL as i64;
+            let errno = crate::compatibility::posix_compat::EINVAL as i64;
             ctx.kernel
                 .ipc_send(
                     socket_rep_send,
@@ -500,7 +500,7 @@ mod tests {
             ctx.register_socket_manager(socket_req_send, socket_rep_recv)
                 .expect("bind socket");
 
-            let errno = crate::services::compatibility::posix_compat::EINVAL as i64;
+            let errno = crate::compatibility::posix_compat::EINVAL as i64;
             ctx.kernel
                 .ipc_send(
                     socket_rep_send,
@@ -538,7 +538,7 @@ mod tests {
                 .expect("bind socket");
 
             for case in cases {
-                let errno = crate::services::compatibility::posix_compat::EINVAL as i64;
+                let errno = crate::compatibility::posix_compat::EINVAL as i64;
                 ctx.kernel
                     .ipc_send(
                         socket_rep_send,

@@ -8,7 +8,7 @@ use super::process_abi::{
     WaitPidV2Reply,
 };
 use super::task::{TaskClass, ThreadGroupId};
-use crate::services::common::service::RequestResponseService;
+use crate::service_common::service::RequestResponseService;
 
 const MAX_PROCESSES: usize = 64;
 const MAX_THREADS: usize = 128;

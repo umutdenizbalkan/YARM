@@ -120,7 +120,7 @@ pub mod ui {
 
 #[cfg(feature = "posix-compat")]
 pub fn run_posix_compat_server() {
-    yarm::services::compatibility::posix_compat::run();
+    yarm::compatibility::posix_compat::run();
 }
 
 #[cfg(test)]

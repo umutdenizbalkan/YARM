@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::vfs::{VfsBackend, VfsError};
-use yarm::services::fs::blkcache::BlockCache;
+use yarm::yarm_fs_servers::blkcache::BlockCache;
 
 const MAX_FAT_FILES: usize = 8;
 const MAX_OPEN_FDS: usize = 8;

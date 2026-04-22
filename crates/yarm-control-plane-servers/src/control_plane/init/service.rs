@@ -4,7 +4,7 @@
 use yarm::kernel::boot::{KernelError, KernelState};
 use yarm::kernel::process::ProcessService;
 use yarm::kernel::vfs::InMemoryBackend;
-use yarm::services::common::service::FsService;
+use yarm::service_common::service::FsService;
 use super::super::process_manager::service::run_request_loop as run_process_manager_request_loop;
 use super::super::supervisor::SupervisorService;
 use super::super::vfs::service::run_request_loop_over_kernel_ipc as run_vfs_request_loop;
@@ -13,7 +13,7 @@ use crate::yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
 use crate::yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
 use crate::yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
 use crate::yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
-use yarm::services::init::{
+use yarm::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitService,
 };
 use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
@@ -64,9 +64,9 @@ impl Default for InitRuntimeBootConfig<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitRuntimeSummary {
     pub phase: InitBootPhase,
-    pub handles: yarm::services::init::CoreServiceHandles,
+    pub handles: yarm::init::CoreServiceHandles,
     pub seeded_registrations: usize,
-    pub mount_report: yarm::services::init::MountRecoveryReport,
+    pub mount_report: yarm::init::MountRecoveryReport,
     pub present_cpus: usize,
     pub present_cpu_bitmap: u64,
     pub online_cpus: usize,
@@ -128,7 +128,7 @@ pub struct MinimumRunnableProfileSummary {
     pub devfs_handled: usize,
     pub initramfs_read_opcode: u16,
     pub initramfs_handled: usize,
-    pub mount_report: yarm::services::init::MountRecoveryReport,
+    pub mount_report: yarm::init::MountRecoveryReport,
     pub recovered_core_services: usize,
 }
 
