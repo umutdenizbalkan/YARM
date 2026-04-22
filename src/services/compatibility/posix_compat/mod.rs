@@ -1000,6 +1000,9 @@ mod tests {
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::Message;
     use crate::std::thread;
+    use crate::services::compatibility::posix_compat::socket_errno_test_helpers::{
+        assert_errno_trapframe, assert_socket_request_shape, SocketErrnoCase,
+    };
 
     fn run_with_large_stack<F>(f: F)
     where
@@ -1734,35 +1737,16 @@ mod tests {
 
                 let mut frame = TrapFrame::new(case.nr, case.args);
                 dispatch(&mut state, &bindings, &mut frame);
-                assert_eq!(frame.error_code(), Some(EINVAL as usize), "{}", case.name);
-                assert_eq!(frame.ret0(), 0, "{}", case.name);
+                let helper_case = match case.name {
+                    "socket" => SocketErrnoCase::Socket,
+                    "connect" => SocketErrnoCase::Connect,
+                    "sendto" => SocketErrnoCase::Sendto,
+                    _ => panic!("unknown case"),
+                };
+                assert_errno_trapframe(&frame, helper_case, EINVAL as usize);
 
                 let req = state.ipc_recv(req_recv).expect("req").expect("msg");
-                assert_eq!(req.opcode, case.opcode, "{}", case.name);
-                match case.name {
-                    "socket" => {
-                        let decoded = SocketArgs::decode(req.as_slice()).expect("decode socket");
-                        assert_eq!(decoded.domain, 2);
-                        assert_eq!(decoded.sock_type, 1);
-                        assert_eq!(decoded.protocol, 0);
-                    }
-                    "connect" => {
-                        let decoded = ConnectArgs::decode(req.as_slice()).expect("decode connect");
-                        assert_eq!(decoded.fd, 1001);
-                        assert_eq!(decoded.addr_ptr, 0xCAFE);
-                        assert_eq!(decoded.addr_len, 16);
-                    }
-                    "sendto" => {
-                        let decoded = SendToArgs::decode(req.as_slice()).expect("decode sendto");
-                        assert_eq!(decoded.fd, 1001);
-                        assert_eq!(decoded.buf_ptr, 0xBEEF);
-                        assert_eq!(decoded.len, 7);
-                        assert_eq!(decoded.flags, 0);
-                        assert_eq!(decoded.dest_addr_ptr, 0xD00D);
-                        assert_eq!(decoded.addrlen, 16);
-                    }
-                    _ => panic!("unknown case"),
-                }
+                assert_socket_request_shape(req.opcode, req.as_slice(), helper_case);
             }
         });
     }
@@ -2071,6 +2055,80 @@ mod tests {
         ];
         assert_eq!(PosixCompatSyscall::DISPATCH_TABLE, expected);
         assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, expected.len());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod socket_errno_test_helpers {
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::services::compatibility::posix_compat::PosixErrno;
+    use yarm_ipc_abi::socket_abi::{
+        ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SENDTO, SOCKET_OP_SOCKET, SendToArgs, SocketArgs,
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SocketErrnoCase {
+        Socket,
+        Connect,
+        Sendto,
+    }
+
+    impl SocketErrnoCase {
+        pub const fn label(self) -> &'static str {
+            match self {
+                Self::Socket => "socket",
+                Self::Connect => "connect",
+                Self::Sendto => "sendto",
+            }
+        }
+
+        pub const fn expected_opcode(self) -> u16 {
+            match self {
+                Self::Socket => SOCKET_OP_SOCKET,
+                Self::Connect => SOCKET_OP_CONNECT,
+                Self::Sendto => SOCKET_OP_SENDTO,
+            }
+        }
+    }
+
+    pub fn assert_errno_trapframe(frame: &TrapFrame, case: SocketErrnoCase, errno: usize) {
+        assert_eq!(frame.error_code(), Some(errno), "{}", case.label());
+        assert_eq!(frame.ret0(), 0, "{}", case.label());
+    }
+
+    pub fn assert_errno_hook_result<T: core::fmt::Debug>(
+        result: Result<T, PosixErrno>,
+        case: SocketErrnoCase,
+    ) {
+        let err = result.expect_err(case.label());
+        assert_eq!(err, PosixErrno::Inval, "{}", case.label());
+    }
+
+    pub fn assert_socket_request_shape(opcode: u16, payload: &[u8], case: SocketErrnoCase) {
+        assert_eq!(opcode, case.expected_opcode(), "{}", case.label());
+        match case {
+            SocketErrnoCase::Socket => {
+                let decoded = SocketArgs::decode(payload).expect("decode socket");
+                assert_eq!(decoded.domain, 2);
+                assert_eq!(decoded.sock_type, 1);
+                assert_eq!(decoded.protocol, 0);
+            }
+            SocketErrnoCase::Connect => {
+                let decoded = ConnectArgs::decode(payload).expect("decode connect");
+                assert_eq!(decoded.fd, 1001);
+                assert_eq!(decoded.addr_ptr, 0xCAFE);
+                assert_eq!(decoded.addr_len, 16);
+            }
+            SocketErrnoCase::Sendto => {
+                let decoded = SendToArgs::decode(payload).expect("decode sendto");
+                assert_eq!(decoded.fd, 1001);
+                assert_eq!(decoded.buf_ptr, 0xBEEF);
+                assert_eq!(decoded.len, 7);
+                assert_eq!(decoded.flags, 0);
+                assert_eq!(decoded.dest_addr_ptr, 0xD00D);
+                assert_eq!(decoded.addrlen, 16);
+            }
+        }
     }
 }
 

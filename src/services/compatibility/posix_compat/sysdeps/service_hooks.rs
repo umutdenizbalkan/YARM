@@ -208,6 +208,9 @@ impl<'a> PosixSysdepsContext<'a> {
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
+    use crate::services::compatibility::posix_compat::socket_errno_test_helpers::{
+        assert_errno_hook_result, assert_socket_request_shape, SocketErrnoCase,
+    };
     use crate::std::thread;
     use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
     use yarm_ipc_abi::socket_abi::{
@@ -538,25 +541,10 @@ mod tests {
 
     #[test]
     fn socket_hooks_errno_propagation_is_uniform_across_routed_socket_syscalls() {
-        #[derive(Clone, Copy)]
-        struct Case {
-            name: &'static str,
-            opcode: u16,
-        }
-
         let cases = [
-            Case {
-                name: "socket_hook",
-                opcode: SOCKET_OP_SOCKET,
-            },
-            Case {
-                name: "connect_hook",
-                opcode: SOCKET_OP_CONNECT,
-            },
-            Case {
-                name: "sendto_hook",
-                opcode: SOCKET_OP_SENDTO,
-            },
+            SocketErrnoCase::Socket,
+            SocketErrnoCase::Connect,
+            SocketErrnoCase::Sendto,
         ];
 
         run_with_large_stack(move || {
@@ -572,29 +560,27 @@ mod tests {
                 ctx.kernel
                     .ipc_send(
                         socket_rep_send,
-                        Message::with_header(0, case.opcode, 0, None, &(-errno).to_le_bytes())
+                        Message::with_header(
+                            0,
+                            case.expected_opcode(),
+                            0,
+                            None,
+                            &(-errno).to_le_bytes(),
+                        )
                             .expect("error reply"),
                     )
                     .expect("seed error reply");
 
-                match case.name {
-                    "socket_hook" => {
-                        let err = ctx.socket_hook(2, 1, 0).expect_err("socket should fail");
-                        assert_eq!(err, PosixErrno::Inval);
+                match case {
+                    SocketErrnoCase::Socket => {
+                        assert_errno_hook_result(ctx.socket_hook(2, 1, 0), case);
                     }
-                    "connect_hook" => {
-                        let err = ctx
-                            .connect_hook(1001, 0xCAFE, 16)
-                            .expect_err("connect should fail");
-                        assert_eq!(err, PosixErrno::Inval);
+                    SocketErrnoCase::Connect => {
+                        assert_errno_hook_result(ctx.connect_hook(1001, 0xCAFE, 16), case);
                     }
-                    "sendto_hook" => {
-                        let err = ctx
-                            .sendto_hook(1001, 0xBEEF, 7, 0, 0xD00D, 16)
-                            .expect_err("sendto should fail");
-                        assert_eq!(err, PosixErrno::Inval);
+                    SocketErrnoCase::Sendto => {
+                        assert_errno_hook_result(ctx.sendto_hook(1001, 0xBEEF, 7, 0, 0xD00D, 16), case);
                     }
-                    _ => panic!("unknown case"),
                 }
 
                 let req = ctx
@@ -602,31 +588,7 @@ mod tests {
                     .ipc_recv(socket_req_recv)
                     .expect("recv socket req")
                     .expect("socket req");
-                assert_eq!(req.opcode, case.opcode, "{}", case.name);
-                match case.name {
-                    "socket_hook" => {
-                        let decoded = SocketArgs::decode(req.as_slice()).expect("decode socket");
-                        assert_eq!(decoded.domain, 2);
-                        assert_eq!(decoded.sock_type, 1);
-                        assert_eq!(decoded.protocol, 0);
-                    }
-                    "connect_hook" => {
-                        let decoded = ConnectArgs::decode(req.as_slice()).expect("decode connect");
-                        assert_eq!(decoded.fd, 1001);
-                        assert_eq!(decoded.addr_ptr, 0xCAFE);
-                        assert_eq!(decoded.addr_len, 16);
-                    }
-                    "sendto_hook" => {
-                        let decoded = SendToArgs::decode(req.as_slice()).expect("decode sendto");
-                        assert_eq!(decoded.fd, 1001);
-                        assert_eq!(decoded.buf_ptr, 0xBEEF);
-                        assert_eq!(decoded.len, 7);
-                        assert_eq!(decoded.flags, 0);
-                        assert_eq!(decoded.dest_addr_ptr, 0xD00D);
-                        assert_eq!(decoded.addrlen, 16);
-                    }
-                    _ => panic!("unknown case"),
-                }
+                assert_socket_request_shape(req.opcode, req.as_slice(), case);
             }
         });
     }
