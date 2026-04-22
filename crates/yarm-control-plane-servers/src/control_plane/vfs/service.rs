@@ -529,44 +529,46 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "stack-heavy vfs integration path overflows in hosted-dev unit-test harness"]
     fn initramfs_write_rejection_roundtrips_over_kernel_ipc() {
-        let mut kernel = Bootstrap::init().expect("kernel init");
-        let (client_send, server_recv, server_send, client_recv) = setup_ipc_caps(&mut kernel);
-
-        let mut initramfs = FsService::with_backend(InitramfsBackend::new(4096));
-        let open = roundtrip_ipc(
-            &mut kernel,
-            &mut initramfs,
-            client_send,
-            server_recv,
-            server_send,
-            client_recv,
-            openat_message(OpenAtRequest {
-                dirfd: 0,
-                path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-                flags: 0,
-                mode: 0,
-            })
-            .expect("open msg"),
-        )
-        .expect("open initramfs");
-        let fd = decode_fd_reply(open).expect("fd");
-        let write = roundtrip_ipc(
-            &mut kernel,
-            &mut initramfs,
-            client_send,
-            server_recv,
-            server_send,
-            client_recv,
-            write_message(ReadWriteRequest {
-                fd,
-                buf_ptr: 0,
-                len: 1,
-            })
-            .expect("write msg"),
-        );
-        assert_eq!(write, Err(VfsError::Unsupported));
+        run_with_large_stack(|| {
+            with_kernel_roundtrip(
+                InitramfsBackend::new(4096),
+                |kernel, initramfs, client_send, server_recv, server_send, client_recv| {
+                    let open = roundtrip_ipc(
+                        kernel,
+                        initramfs,
+                        client_send,
+                        server_recv,
+                        server_send,
+                        client_recv,
+                        openat_message(OpenAtRequest {
+                            dirfd: 0,
+                            path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
+                            flags: 0,
+                            mode: 0,
+                        })
+                        .expect("open msg"),
+                    )
+                    .expect("open initramfs");
+                    let fd = decode_fd_reply(open).expect("fd");
+                    let write = roundtrip_ipc(
+                        kernel,
+                        initramfs,
+                        client_send,
+                        server_recv,
+                        server_send,
+                        client_recv,
+                        write_message(ReadWriteRequest {
+                            fd,
+                            buf_ptr: 0,
+                            len: 1,
+                        })
+                        .expect("write msg"),
+                    );
+                    assert_eq!(write, Err(VfsError::Unsupported));
+                },
+            );
+        });
     }
 
     #[test]
