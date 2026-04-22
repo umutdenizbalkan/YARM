@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::boot::{KernelError, KernelState};
-use yarm::kernel::process::ProcessService;
-use yarm::yarm_fs_servers::common::vfs_ipc::InMemoryBackend;
-use yarm::yarm_fs_servers::common::service::FsService;
+use super::super::process_manager::service::ProcessService;
 use super::super::process_manager::service::run_request_loop as run_process_manager_request_loop;
 use super::super::supervisor::SupervisorService;
 use super::super::vfs::service::run_request_loop_over_kernel_ipc as run_vfs_request_loop;
@@ -16,6 +13,9 @@ use crate::yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
 use yarm::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitService,
 };
+use yarm::kernel::boot::{KernelError, KernelState};
+use yarm::yarm_fs_servers::common::service::FsService;
+use yarm::yarm_fs_servers::common::vfs_ipc::InMemoryBackend;
 use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,7 +299,10 @@ mod tests {
         assert_eq!(baseline.graph.vfs_tid, 3);
         assert_eq!(baseline.graph.supervisor_tid, 4);
         assert_eq!(baseline.restart_window_ticks, 100);
-        assert_eq!(baseline.launch_strategy, CoreLaunchStrategy::SupervisorFirst);
+        assert_eq!(
+            baseline.launch_strategy,
+            CoreLaunchStrategy::SupervisorFirst
+        );
     }
 
     #[test]

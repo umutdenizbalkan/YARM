@@ -4,16 +4,17 @@
 use yarm::kernel::boot::{KernelError, KernelState, TrapHandleError};
 use yarm::kernel::capabilities::CapId;
 use yarm::kernel::ipc::Message;
-use yarm::kernel::process::ProcessManagerError;
-use yarm::kernel::process::{ProcessService, SpawnV2Result, WaitPidV2Result};
+use yarm::kernel::process::{ProcessId, ProcessManager, ProcessManagerError};
 use yarm::kernel::syscall::SyscallError;
 use yarm::kernel::task::TaskClass;
 use yarm::runtime::SharedKernel;
-use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_ipc_abi::process_abi::{
-    PROC_OP_EXIT, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4, PROC_OP_WAITPID_V2,
-    SpawnV2Args, SpawnV3Args, SpawnV4Args, WaitPidV2Args,
+    PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
+    PROC_OP_SPAWN_V4, PROC_OP_WAITPID_V2, SpawnV2Args, SpawnV3Args, SpawnV4Args, WaitPidV2Args,
 };
+use yarm_srv_common::elf::ElfImageInfo;
+use yarm_srv_common::service_loop::RequestResponseService;
+use yarm_srv_common::service_loop::run_typed_request_loop;
 
 const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 const MAX_EXEC_LOAD_SEGMENTS: usize = 8;
@@ -28,6 +29,93 @@ const AUXV_AT_PAGESZ: u64 = 6;
 const AUXV_AT_ENTRY: u64 = 9;
 const ELF64_PHDR_SIZE: usize = 56;
 const PT_LOAD: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnV2Request {
+    pub parent_pid: ProcessId,
+    pub image_id: u64,
+    pub requested_cnode_slots: Option<usize>,
+    pub requested_task_class: Option<TaskClass>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitPidV2Request {
+    pub caller_pid: ProcessId,
+    pub target_pid: ProcessId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnV2Result {
+    pub pid: ProcessId,
+}
+
+impl SpawnV2Result {
+    pub const fn encode(self) -> [u8; 8] {
+        self.pid.0.to_le_bytes()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcessManagerError> {
+        if payload.len() < 8 {
+            return Err(ProcessManagerError::Malformed);
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&payload[..8]);
+        Ok(Self {
+            pid: ProcessId(u64::from_le_bytes(bytes)),
+        })
+    }
+}
+
+pub struct WaitPidV2Result {
+    pub waited_pid: ProcessId,
+    pub exit_code: u64,
+}
+
+impl WaitPidV2Result {
+    pub const fn encode(self) -> [u8; 16] {
+        yarm_ipc_abi::process_abi::WaitPidV2Reply::new(self.waited_pid.0, self.exit_code).encode()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcessManagerError> {
+        let args = yarm_ipc_abi::process_abi::WaitPidV2Reply::decode(payload)
+            .map_err(|_| ProcessManagerError::Malformed)?;
+        Ok(Self {
+            waited_pid: ProcessId(args.waited_pid),
+            exit_code: args.exit_code,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessRequest {
+    GetPid { caller_tid: u64 },
+    GetPpid { caller_tid: u64 },
+    Exit { caller_tid: u64, code: u64 },
+    SpawnV2(SpawnV2Request),
+    WaitPidV2(WaitPidV2Request),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessSpawnPolicyRecord {
+    pid: ProcessId,
+    image_id: u64,
+    entry: u64,
+    requested_cnode_slots: Option<usize>,
+    requested_task_class: Option<TaskClass>,
+}
+
+#[derive(Debug)]
+pub struct ProcessService {
+    manager: ProcessManager,
+    policy_records: [Option<ProcessSpawnPolicyRecord>; 64],
+    handled: usize,
+}
+
+impl Default for ProcessService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecLoadSegment {
@@ -262,7 +350,7 @@ pub fn load_exec_image(
     argv: &[&[u8]],
     envp: &[&[u8]],
 ) -> Result<ExecLaunchImage, ProcessManagerError> {
-    let info = yarm::kernel::process::ElfImageInfo::parse(image_id, image)?;
+    let info = ElfImageInfo::parse(image_id, image).map_err(map_elf_error)?;
     let (phdr_addr, phdr_entry_size, phdr_count, load_segments, load_segment_count) =
         parse_exec_load_segments(image)?;
     let initial_stack = build_exec_initial_stack(
@@ -351,6 +439,290 @@ fn map_syscall_error(err: SyscallError) -> ProcessManagerError {
         | SyscallError::WrongObject
         | SyscallError::PageFault => ProcessManagerError::Malformed,
     }
+}
+
+impl ProcessService {
+    pub const fn new() -> Self {
+        Self {
+            manager: ProcessManager::new(),
+            policy_records: [None; 64],
+            handled: 0,
+        }
+    }
+
+    pub const fn handled_count(&self) -> usize {
+        self.handled
+    }
+
+    fn read_u64(payload: &[u8]) -> Result<u64, ProcessManagerError> {
+        if payload.len() < 8 {
+            return Err(ProcessManagerError::Malformed);
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&payload[..8]);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    pub fn parse_request(msg: Message) -> Result<ProcessRequest, ProcessManagerError> {
+        if msg.transferred_cap().is_some() || (msg.flags & Message::FLAG_CAP_TRANSFER) != 0 {
+            return Err(ProcessManagerError::InvalidTransport);
+        }
+        match msg.opcode {
+            PROC_OP_GETPID => Ok(ProcessRequest::GetPid {
+                caller_tid: Self::read_u64(msg.as_slice())?,
+            }),
+            PROC_OP_GETPPID => Ok(ProcessRequest::GetPpid {
+                caller_tid: Self::read_u64(msg.as_slice())?,
+            }),
+            PROC_OP_EXIT => Ok(ProcessRequest::Exit {
+                caller_tid: msg.sender_tid.0,
+                code: Self::read_u64(msg.as_slice())?,
+            }),
+            PROC_OP_SPAWN_V2 => {
+                let args = SpawnV2Args::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                Ok(ProcessRequest::SpawnV2(SpawnV2Request {
+                    parent_pid: ProcessId(args.parent_pid),
+                    image_id: args.image_id,
+                    requested_cnode_slots: None,
+                    requested_task_class: None,
+                }))
+            }
+            PROC_OP_SPAWN_V3 => {
+                let args = SpawnV3Args::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                let requested_cnode_slots = usize::try_from(args.requested_cnode_slots)
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                Ok(ProcessRequest::SpawnV2(SpawnV2Request {
+                    parent_pid: ProcessId(args.parent_pid),
+                    image_id: args.image_id,
+                    requested_cnode_slots: Some(requested_cnode_slots),
+                    requested_task_class: None,
+                }))
+            }
+            PROC_OP_SPAWN_V4 => {
+                let args = SpawnV4Args::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                let requested_cnode_slots = usize::try_from(args.requested_cnode_slots)
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                let requested_task_class = match args.task_class_hint {
+                    0 => TaskClass::App,
+                    1 => TaskClass::Driver,
+                    2 => TaskClass::SystemServer,
+                    _ => return Err(ProcessManagerError::Malformed),
+                };
+                Ok(ProcessRequest::SpawnV2(SpawnV2Request {
+                    parent_pid: ProcessId(args.parent_pid),
+                    image_id: args.image_id,
+                    requested_cnode_slots: Some(requested_cnode_slots),
+                    requested_task_class: Some(requested_task_class),
+                }))
+            }
+            PROC_OP_WAITPID_V2 => {
+                let args = WaitPidV2Args::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                Ok(ProcessRequest::WaitPidV2(WaitPidV2Request {
+                    caller_pid: ProcessId(args.caller_pid),
+                    target_pid: ProcessId(args.target_pid),
+                }))
+            }
+            _ => Err(ProcessManagerError::Unsupported),
+        }
+    }
+
+    fn u64_reply(opcode: u16, value: u64) -> Result<Message, ProcessManagerError> {
+        Message::with_header(0, opcode, 0, None, &value.to_le_bytes())
+            .map_err(|_| ProcessManagerError::Malformed)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn record_spawn_policy(
+        &mut self,
+        pid: ProcessId,
+        image_id: u64,
+        entry: u64,
+        requested_cnode_slots: Option<usize>,
+        requested_task_class: Option<TaskClass>,
+    ) -> Result<(), ProcessManagerError> {
+        if let Some(record) = self
+            .policy_records
+            .iter_mut()
+            .flatten()
+            .find(|record| record.pid == pid)
+        {
+            *record = ProcessSpawnPolicyRecord {
+                pid,
+                image_id,
+                entry,
+                requested_cnode_slots,
+                requested_task_class,
+            };
+            return Ok(());
+        }
+        let slot = self
+            .policy_records
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(ProcessManagerError::TableFull)?;
+        *slot = Some(ProcessSpawnPolicyRecord {
+            pid,
+            image_id,
+            entry,
+            requested_cnode_slots,
+            requested_task_class,
+        });
+        Ok(())
+    }
+
+    pub fn requested_cnode_slots_for_process(&self, pid: u64) -> Option<Option<usize>> {
+        self.policy_records
+            .iter()
+            .flatten()
+            .find(|record| record.pid == ProcessId(pid))
+            .map(|record| record.requested_cnode_slots)
+    }
+
+    pub fn requested_task_class_for_process(&self, pid: u64) -> Option<Option<TaskClass>> {
+        self.policy_records
+            .iter()
+            .flatten()
+            .find(|record| record.pid == ProcessId(pid))
+            .map(|record| record.requested_task_class)
+    }
+
+    pub fn process_image_info(&self, pid: ProcessId) -> Option<ElfImageInfo> {
+        self.policy_records
+            .iter()
+            .flatten()
+            .find(|record| record.pid == pid)
+            .map(|record| ElfImageInfo {
+                image_id: record.image_id,
+                entry: record.entry,
+            })
+    }
+
+    pub fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessManagerError> {
+        self.manager.mark_exit(pid, code)
+    }
+
+    pub fn handle(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
+        let reply = self.handle_request(request)?;
+        self.handled = self.handled.saturating_add(1);
+        Ok(reply)
+    }
+
+    fn handle_request(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
+        match Self::parse_request(request)? {
+            ProcessRequest::GetPid { caller_tid } => Self::u64_reply(
+                PROC_OP_GETPID,
+                self.manager.process_id_for_tid(caller_tid).0,
+            ),
+            ProcessRequest::GetPpid { caller_tid } => {
+                let pid = self.manager.process_id_for_tid(caller_tid);
+                Self::u64_reply(
+                    PROC_OP_GETPPID,
+                    self.manager
+                        .parent_of(pid)
+                        .unwrap_or(ProcessId(pid.0.saturating_sub(1)))
+                        .0,
+                )
+            }
+            ProcessRequest::Exit { caller_tid, code } => {
+                self.manager
+                    .insert_synthetic_exit_for_tid(caller_tid, code)?;
+                Self::u64_reply(PROC_OP_EXIT, 0)
+            }
+            ProcessRequest::SpawnV2(req) => {
+                #[cfg(test)]
+                {
+                    let image = synthetic_elf_image(req.image_id);
+                    let info = ElfImageInfo::parse(req.image_id, &image).map_err(map_elf_error)?;
+                    let pid = self.manager.allocate_process(req.parent_pid)?;
+                    self.record_spawn_policy(
+                        pid,
+                        req.image_id,
+                        info.entry,
+                        req.requested_cnode_slots,
+                        req.requested_task_class,
+                    )?;
+                    let result = SpawnV2Result { pid };
+                    return Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
+                        .map_err(|_| ProcessManagerError::Malformed);
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = req;
+                    Err(ProcessManagerError::Unsupported)
+                }
+            }
+            ProcessRequest::WaitPidV2(req) => {
+                if req.caller_pid != req.target_pid {
+                    let Some(parent) = self.manager.parent_of(req.target_pid) else {
+                        return Err(ProcessManagerError::PermissionDenied);
+                    };
+                    if parent != req.caller_pid {
+                        return Err(ProcessManagerError::PermissionDenied);
+                    }
+                }
+                let waited = self.manager.wait_exited(req.target_pid)?;
+                let result = WaitPidV2Result {
+                    waited_pid: waited.waited_pid,
+                    exit_code: waited.exit_code,
+                };
+                Message::with_header(0, PROC_OP_WAITPID_V2, 0, None, &result.encode())
+                    .map_err(|_| ProcessManagerError::Malformed)
+            }
+        }
+    }
+}
+
+impl RequestResponseService<Message, Message> for ProcessService {
+    type Error = ProcessManagerError;
+
+    fn service_name(&self) -> &'static str {
+        "process_manager"
+    }
+
+    fn handle(&mut self, request: Message) -> Result<Message, Self::Error> {
+        ProcessService::handle(self, request)
+    }
+}
+
+fn map_elf_error(err: yarm_srv_common::elf::ElfParseError) -> ProcessManagerError {
+    match err {
+        yarm_srv_common::elf::ElfParseError::Malformed => ProcessManagerError::Malformed,
+        yarm_srv_common::elf::ElfParseError::Unsupported => ProcessManagerError::Unsupported,
+    }
+}
+
+#[cfg(test)]
+fn synthetic_elf_image(image_id: u64) -> [u8; 128] {
+    let mut image = [0u8; 128];
+    image[..4].copy_from_slice(b"\x7FELF");
+    image[4] = 2; // ELFCLASS64
+    image[5] = 1; // little-endian
+    image[6] = 1; // version
+    image[7] = 0; // SYSV ABI
+    image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    image[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+    image[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+    let entry = 0x400000u64.saturating_add(image_id.saturating_mul(0x1000));
+    image[24..32].copy_from_slice(&entry.to_le_bytes());
+    image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    image[52..54].copy_from_slice(&(64u16).to_le_bytes()); // e_ehsize
+    image[54..56].copy_from_slice(&(56u16).to_le_bytes()); // e_phentsize
+    image[56..58].copy_from_slice(&(1u16).to_le_bytes()); // e_phnum
+    let ph = 64usize;
+    image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    image[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // RX
+    image[ph + 8..ph + 16].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+    image[ph + 16..ph + 24].copy_from_slice(&(entry & !0xFFF).to_le_bytes()); // p_vaddr
+    image[ph + 24..ph + 32].copy_from_slice(&0u64.to_le_bytes()); // p_paddr
+    image[ph + 32..ph + 40].copy_from_slice(&8u64.to_le_bytes()); // p_filesz
+    image[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes()); // p_memsz
+    image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+    image[120..128].copy_from_slice(&[0x90; 8]);
+    image
 }
 
 fn roundtrip_ipc(

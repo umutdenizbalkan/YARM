@@ -4,7 +4,8 @@
 #![no_std]
 
 pub mod decode;
-pub mod vfs_reply;
-pub mod vfs_core;
+pub mod elf;
 pub mod log;
 pub mod service_loop;
+pub mod vfs_core;
+pub mod vfs_reply;

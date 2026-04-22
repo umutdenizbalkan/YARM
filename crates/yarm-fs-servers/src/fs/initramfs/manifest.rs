@@ -5,7 +5,7 @@ use super::archive::{
     INITRAMFS_INIT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR, INITRAMFS_SUPERVISOR_PATH_PTR,
     INITRAMFS_VFS_PATH_PTR,
 };
-use yarm::kernel::process::ElfImageInfo;
+use yarm_srv_common::elf::ElfImageInfo;
 
 const MANIFEST_MAGIC: u32 = 0x5941_524D;
 const MANIFEST_VERSION_V1: u16 = 1;
