@@ -21,6 +21,7 @@ use yarm::kernel::capabilities::{CapId, CapRights};
 use yarm::kernel::task::TaskClass;
 use yarm::kernel::task::TaskStatus;
 use yarm::kernel::vm::Asid;
+use yarm::std::boxed::Box;
 use yarm_ipc_abi::supervisor_abi::{
     InitAlert, InitAlertKind, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, TaskExitedEvent,
@@ -813,13 +814,18 @@ impl InitService {
         Ok(())
     }
 
-    pub fn begin_running(&mut self, kernel: &KernelState) -> Result<(), KernelError> {
+    fn validate_begin_running_preconditions(&self) -> Result<(), KernelError> {
         if self.phase != InitBootPhase::LaunchingCore
             || self.fault_handoff.is_none()
             || self.mount_status.is_none()
         {
             return Err(KernelError::WrongObject);
         }
+        Ok(())
+    }
+
+    pub fn begin_running(&mut self, kernel: &KernelState) -> Result<(), KernelError> {
+        self.validate_begin_running_preconditions()?;
         self.validate_boot_contract(kernel)?;
         self.phase = InitBootPhase::Running;
         Ok(())
@@ -837,8 +843,9 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
 }
 
 fn run_mount_initramfs() -> Result<(), KernelError> {
-    let mut service = InitramfsService::with_backend(InitramfsBackend::new(4096));
-    let summary = run_initramfs_request_loop(&mut service).map_err(|_| KernelError::WrongObject)?;
+    let mut service = Box::new(InitramfsService::with_backend(InitramfsBackend::new(4096)));
+    let summary =
+        run_initramfs_request_loop(service.as_mut()).map_err(|_| KernelError::WrongObject)?;
     if summary.write_allowed {
         return Err(KernelError::WrongObject);
     }
@@ -846,23 +853,23 @@ fn run_mount_initramfs() -> Result<(), KernelError> {
 }
 
 fn run_mount_ramfs() -> Result<(), KernelError> {
-    let mut service = RamFsService::with_backend(RamFsBackend::new());
-    run_rw_mount_cycle(&mut service, 0xA100, 64)
+    let mut service = Box::new(RamFsService::with_backend(RamFsBackend::new()));
+    run_rw_mount_cycle(service.as_mut(), 0xA100, 64)
 }
 
 fn run_mount_devfs() -> Result<(), KernelError> {
-    let mut service = DevFsService::with_backend(DevFsBackend::default());
-    let _ = run_devfs_request_loop(&mut service).map_err(|_| KernelError::WrongObject)?;
+    let mut service = Box::new(DevFsService::with_backend(DevFsBackend::default()));
+    let _ = run_devfs_request_loop(service.as_mut()).map_err(|_| KernelError::WrongObject)?;
     Ok(())
 }
 
 fn run_mount_ext4() -> Result<(), KernelError> {
-    let mut service = Ext4Service::with_backend(Ext4Backend::new());
-    run_rw_mount_cycle(&mut service, 0x4040, 4096)
+    let mut service = Box::new(Ext4Service::with_backend(Ext4Backend::new()));
+    run_rw_mount_cycle(service.as_mut(), 0x4040, 4096)
 }
 
 fn run_mount_fat() -> Result<(), KernelError> {
-    let mut service = FatService::with_backend(FatBackend::new());
+    let mut service = Box::new(FatService::with_backend(FatBackend::new()));
     let open = openat_message(OpenAtRequest {
         dirfd: 0,
         path_ptr: 0x5050,
@@ -929,7 +936,7 @@ mod tests {
 
     #[test]
     fn init_server_requires_minimum_startup_caps() {
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         init.set_startup_caps(StartupCapSet {
             endpoint_factory: false,
@@ -951,7 +958,7 @@ mod tests {
 
     #[test]
     fn init_server_launch_flow_registers_launches_and_enters_running() {
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -986,7 +993,7 @@ mod tests {
 
     #[test]
     fn launch_order_is_deterministic() {
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1018,7 +1025,7 @@ mod tests {
 
     #[test]
     fn launch_order_can_prioritize_supervisor() {
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         init.set_launch_strategy(CoreLaunchStrategy::SupervisorFirst);
         let graph = CoreServiceGraph {
@@ -1051,7 +1058,7 @@ mod tests {
 
     #[test]
     fn launch_sets_mount_status() {
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1075,26 +1082,17 @@ mod tests {
 
     #[test]
     fn begin_running_requires_fault_handoff() {
-        let mut state = Bootstrap::init().expect("init");
         let mut init = InitService::new();
-        let graph = CoreServiceGraph {
-            init_tid: 1,
-            process_manager_tid: 2,
-            vfs_tid: 3,
-            supervisor_tid: 4,
-        };
-        init.register_core_graph(&mut state, graph)
-            .expect("register");
-        init.launch_core_services(
-            &mut state,
-            CoreServiceImagePlan {
-                process_manager_entry: 0x8000,
-                vfs_entry: 0x9000,
-                supervisor_entry: 0xA000,
-            },
-        )
-        .expect("launch");
-        assert_eq!(init.begin_running(&state), Err(KernelError::WrongObject));
+        init.phase = InitBootPhase::LaunchingCore;
+        init.mount_status = Some(MountRecoveryReport {
+            mounted_count: init.mount_plan.count,
+            recovered_with_fat: false,
+        });
+
+        assert_eq!(
+            init.validate_begin_running_preconditions(),
+            Err(KernelError::WrongObject)
+        );
     }
 
     #[test]
@@ -1139,7 +1137,7 @@ mod tests {
 
     #[test]
     fn supervisor_handoff_binds_kernel_endpoint() {
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1175,7 +1173,7 @@ mod tests {
 
     #[test]
     fn init_recovers_supervisor_failure_within_budget() {
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1261,7 +1259,7 @@ mod tests {
 
     #[test]
     fn init_recovers_vfs_failure_with_generic_core_helper() {
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1300,7 +1298,7 @@ mod tests {
 
     #[test]
     fn recovering_supervisor_reseeds_control_plane_requests() {
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
@@ -1351,7 +1349,7 @@ mod tests {
 
     #[test]
     fn recovering_supervisor_replays_driver_registrations_too() {
-        let mut state = Bootstrap::init().expect("init");
+        let mut state = Box::new(Bootstrap::init().expect("init"));
         let mut init = InitService::new();
         let graph = CoreServiceGraph {
             init_tid: 1,
