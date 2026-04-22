@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 #![no_std]
+#![cfg_attr(not(feature = "hosted-dev"), feature(alloc_error_handler))]
 
 #[cfg(not(feature = "hosted-dev"))]
 yarm_freestanding_alloc::install!(2 * 1024 * 1024, "yarm-server-runtime freestanding allocator OOM");
