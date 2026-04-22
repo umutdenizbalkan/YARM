@@ -46,12 +46,20 @@ mod tests {
             "posix service hooks should route connect compatibility through syscall dispatch boundary"
         );
         assert!(
+            src.contains("LINUX_NR_SENDTO"),
+            "posix service hooks should route sendto compatibility through syscall dispatch boundary"
+        );
+        assert!(
             src.contains("SOCKET_OP_SOCKET"),
             "posix service hooks should consume shared socket ABI opcode contract"
         );
         assert!(
             src.contains("SOCKET_OP_CONNECT"),
             "posix service hooks should consume shared connect ABI opcode contract"
+        );
+        assert!(
+            src.contains("SOCKET_OP_SENDTO"),
+            "posix service hooks should consume shared sendto ABI opcode contract"
         );
         assert!(
             !src.contains("Err(PosixErrno::NoSys)"),

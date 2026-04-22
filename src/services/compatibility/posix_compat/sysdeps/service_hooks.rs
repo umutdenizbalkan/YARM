@@ -8,8 +8,8 @@ use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::ipc::Message;
 use crate::services::compatibility::posix_compat::{
     LINUX_NR_CLOSE, LINUX_NR_CONNECT, LINUX_NR_EXIT, LINUX_NR_GETPID, LINUX_NR_GETPPID,
-    LINUX_NR_OPENAT, LINUX_NR_READ, LINUX_NR_SOCKET, LINUX_NR_WRITE, POSIX_COMPAT_ABI_VERSION,
-    PosixErrno, PosixServiceBindings, dispatch,
+    LINUX_NR_OPENAT, LINUX_NR_READ, LINUX_NR_SENDTO, LINUX_NR_SOCKET, LINUX_NR_WRITE,
+    POSIX_COMPAT_ABI_VERSION, PosixErrno, PosixServiceBindings, dispatch,
 };
 
 /// Runtime-facing sysdeps client that speaks to process/vfs managers through
@@ -148,6 +148,28 @@ impl<'a> PosixSysdepsContext<'a> {
         .map(|_| ())
     }
 
+    pub fn sendto_hook(
+        &mut self,
+        fd: i32,
+        buf_ptr: usize,
+        len: usize,
+        flags: i32,
+        dest_addr_ptr: usize,
+        addrlen: usize,
+    ) -> Result<usize, PosixErrno> {
+        self.run_syscall(
+            LINUX_NR_SENDTO,
+            [
+                fd as usize,
+                buf_ptr,
+                len,
+                flags as usize,
+                dest_addr_ptr,
+                addrlen,
+            ],
+        )
+    }
+
     pub fn read_hook(
         &mut self,
         fd: i32,
@@ -184,7 +206,9 @@ mod tests {
     use crate::kernel::boot::Bootstrap;
     use crate::std::thread;
     use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
-    use yarm_ipc_abi::socket_abi::{ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SOCKET};
+    use yarm_ipc_abi::socket_abi::{
+        ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SENDTO, SOCKET_OP_SOCKET, SendToArgs,
+    };
     use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_WRITE};
 
     fn run_with_large_stack<F>(f: F)
@@ -368,6 +392,31 @@ mod tests {
             assert_eq!(args.fd, 1001);
             assert_eq!(args.addr_ptr, 0xCAFE);
             assert_eq!(args.addr_len, 16);
+
+            ctx.kernel
+                .ipc_send(
+                    socket_rep_send,
+                    Message::with_header(0, SOCKET_OP_SENDTO, 0, None, &7u64.to_le_bytes())
+                        .expect("sendto reply"),
+                )
+                .expect("seed sendto reply");
+            let sent = ctx
+                .sendto_hook(1001, 0xBEEF, 7, 0, 0xD00D, 16)
+                .expect("sendto");
+            assert_eq!(sent, 7);
+            let sendto_req = ctx
+                .kernel
+                .ipc_recv(socket_req_recv)
+                .expect("recv sendto req")
+                .expect("sendto req");
+            assert_eq!(sendto_req.opcode, SOCKET_OP_SENDTO);
+            let sendto_args = SendToArgs::decode(sendto_req.as_slice()).expect("decode sendto");
+            assert_eq!(sendto_args.fd, 1001);
+            assert_eq!(sendto_args.buf_ptr, 0xBEEF);
+            assert_eq!(sendto_args.len, 7);
+            assert_eq!(sendto_args.flags, 0);
+            assert_eq!(sendto_args.dest_addr_ptr, 0xD00D);
+            assert_eq!(sendto_args.addrlen, 16);
         });
     }
 }

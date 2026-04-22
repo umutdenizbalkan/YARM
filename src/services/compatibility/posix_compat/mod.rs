@@ -12,7 +12,9 @@ use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_WAITPID_V2, PROC_SERVER_ABI_VERSION,
     SpawnV2Args, WaitPidV2Args,
 };
-use yarm_ipc_abi::socket_abi::{ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SOCKET, SocketArgs};
+use yarm_ipc_abi::socket_abi::{
+    ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SENDTO, SOCKET_OP_SOCKET, SendToArgs, SocketArgs,
+};
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, VFS_CODEC_V1_VERSION};
 use yarm_ipc_abi::vfs_abi::{
@@ -28,7 +30,7 @@ pub mod sysdeps;
 // RISC-V/AArch64 style ABIs in this prototype compatibility personality.
 
 pub const LINUX_COMPAT_ABI_VERSION: u16 = 1;
-pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 22;
+pub const LINUX_COMPAT_SYSCALL_COUNT: usize = 23;
 pub const LINUX_PROC_SERVER_ABI_VERSION: u16 = PROC_SERVER_ABI_VERSION;
 pub const LINUX_VFS_SERVER_ABI_VERSION: u16 = VFS_SERVER_ABI_VERSION;
 pub const POSIX_COMPAT_ABI_VERSION: u16 = LINUX_COMPAT_ABI_VERSION;
@@ -58,6 +60,7 @@ pub const LINUX_NR_SENDFILE: usize = 71;
 pub const LINUX_NR_STATX: usize = 291;
 pub const LINUX_NR_SOCKET: usize = 198;
 pub const LINUX_NR_CONNECT: usize = 203;
+pub const LINUX_NR_SENDTO: usize = 206;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -76,6 +79,8 @@ const LINUX_ARG0: usize = 0;
 const LINUX_ARG1: usize = 1;
 const LINUX_ARG2: usize = 2;
 const LINUX_ARG3: usize = 3;
+const LINUX_ARG4: usize = 4;
+const LINUX_ARG5: usize = 5;
 
 /// Userspace-owned bindings for POSIX compatibility personality servers.
 ///
@@ -338,6 +343,7 @@ pub enum PosixCompatSyscall {
     Statx = LINUX_NR_STATX,
     Socket = LINUX_NR_SOCKET,
     Connect = LINUX_NR_CONNECT,
+    Sendto = LINUX_NR_SENDTO,
     Brk = LINUX_NR_BRK,
     Munmap = LINUX_NR_MUNMAP,
     Mmap = LINUX_NR_MMAP,
@@ -364,6 +370,7 @@ impl PosixCompatSyscall {
         LINUX_NR_STATX,
         LINUX_NR_SOCKET,
         LINUX_NR_CONNECT,
+        LINUX_NR_SENDTO,
         LINUX_NR_BRK,
         LINUX_NR_MUNMAP,
         LINUX_NR_MMAP,
@@ -394,6 +401,7 @@ impl PosixCompatSyscall {
             LINUX_NR_STATX => Ok(Self::Statx),
             LINUX_NR_SOCKET => Ok(Self::Socket),
             LINUX_NR_CONNECT => Ok(Self::Connect),
+            LINUX_NR_SENDTO => Ok(Self::Sendto),
             LINUX_NR_BRK => Ok(Self::Brk),
             LINUX_NR_MUNMAP => Ok(Self::Munmap),
             LINUX_NR_MMAP => Ok(Self::Mmap),
@@ -954,6 +962,25 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
                     .ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
+            PosixCompatSyscall::Sendto => {
+                let payload = SendToArgs::new(
+                    frame.arg(LINUX_ARG0) as u64,
+                    frame.arg(LINUX_ARG1) as u64,
+                    frame.arg(LINUX_ARG2) as u64,
+                    frame.arg(LINUX_ARG3) as u64,
+                    frame.arg(LINUX_ARG4) as u64,
+                    frame.arg(LINUX_ARG5) as u64,
+                )
+                .encode();
+                bindings
+                    .send_socket_request(kernel, SOCKET_OP_SENDTO, &payload)
+                    .map_err(PosixErrno::from)?;
+                let reply = bindings
+                    .recv_socket_reply(kernel)
+                    .map_err(PosixErrno::from)?
+                    .ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
             PosixCompatSyscall::Brk => {
                 let requested = frame.arg(LINUX_ARG0);
                 let tid = kernel.current_tid().ok_or(PosixErrno::NoSys)?;
@@ -1084,7 +1111,7 @@ mod tests {
     #[test]
     fn posix_compat_abi_contract_is_frozen() {
         assert_eq!(LINUX_COMPAT_ABI_VERSION, 1);
-        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 22);
+        assert_eq!(LINUX_COMPAT_SYSCALL_COUNT, 23);
         assert_eq!(LINUX_PROC_SERVER_ABI_VERSION, 1);
         assert_eq!(LINUX_VFS_SERVER_ABI_VERSION, 1);
         assert_eq!(PROC_CODEC_V2_VERSION, 2);
@@ -1096,6 +1123,7 @@ mod tests {
             yarm_ipc_abi::socket_abi::SOCKET_CODEC_V1_VERSION
         );
         assert_eq!(SOCKET_OP_SOCKET, 1);
+        assert_eq!(SOCKET_OP_SENDTO, 3);
         assert_eq!(
             PosixCompatSyscall::decode(LINUX_NR_EXIT),
             Ok(PosixCompatSyscall::Exit)
@@ -1167,6 +1195,10 @@ mod tests {
         assert_eq!(
             PosixCompatSyscall::decode(LINUX_NR_CONNECT),
             Ok(PosixCompatSyscall::Connect)
+        );
+        assert_eq!(
+            PosixCompatSyscall::decode(LINUX_NR_SENDTO),
+            Ok(PosixCompatSyscall::Sendto)
         );
         assert_eq!(
             PosixCompatSyscall::decode(LINUX_NR_BRK),
@@ -1518,6 +1550,30 @@ mod tests {
             assert_eq!(connect_args.fd, 1001);
             assert_eq!(connect_args.addr_ptr, 0xCAFE);
             assert_eq!(connect_args.addr_len, 16);
+
+            state
+                .ipc_send(
+                    rep_send,
+                    Message::with_header(0, SOCKET_OP_SENDTO, 0, None, &12u64.to_le_bytes())
+                        .expect("sendto reply"),
+                )
+                .expect("seed sendto reply");
+
+            let mut sendto =
+                TrapFrame::new(LINUX_NR_SENDTO, [1001, 0xBEEF, 12, 0, 0xD00D, 16]);
+            dispatch(&mut state, &bindings, &mut sendto);
+            assert_eq!(sendto.error_code(), None);
+            assert_eq!(sendto.ret0(), 12);
+
+            let sendto_req = state.ipc_recv(req_recv).expect("req").expect("msg");
+            assert_eq!(sendto_req.opcode, SOCKET_OP_SENDTO);
+            let sendto_args = SendToArgs::decode(sendto_req.as_slice()).expect("decode args");
+            assert_eq!(sendto_args.fd, 1001);
+            assert_eq!(sendto_args.buf_ptr, 0xBEEF);
+            assert_eq!(sendto_args.len, 12);
+            assert_eq!(sendto_args.flags, 0);
+            assert_eq!(sendto_args.dest_addr_ptr, 0xD00D);
+            assert_eq!(sendto_args.addrlen, 16);
         });
     }
 
@@ -1817,6 +1873,7 @@ mod tests {
             LINUX_NR_STATX,
             LINUX_NR_SOCKET,
             LINUX_NR_CONNECT,
+            LINUX_NR_SENDTO,
             LINUX_NR_BRK,
             LINUX_NR_MUNMAP,
             LINUX_NR_MMAP,
