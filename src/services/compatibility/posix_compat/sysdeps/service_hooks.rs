@@ -463,4 +463,41 @@ mod tests {
             assert_eq!(sendto_args.addrlen, 16);
         });
     }
+
+    #[test]
+    fn connect_hook_propagates_negative_errno_from_socket_reply() {
+        run_with_large_stack(|| {
+            let mut kernel = Bootstrap::init().expect("init");
+            let (_, socket_req_send, socket_req_recv) = kernel.create_endpoint(8).expect("socket req");
+            let (_, socket_rep_send, socket_rep_recv) = kernel.create_endpoint(8).expect("socket rep");
+            let mut ctx = PosixSysdepsContext::new(&mut kernel);
+            ctx.register_socket_manager(socket_req_send, socket_rep_recv)
+                .expect("bind socket");
+
+            let errno = crate::services::compatibility::posix_compat::EINVAL as i64;
+            ctx.kernel
+                .ipc_send(
+                    socket_rep_send,
+                    Message::with_header(0, SOCKET_OP_CONNECT, 0, None, &(-errno).to_le_bytes())
+                        .expect("connect error reply"),
+                )
+                .expect("seed connect error reply");
+
+            let err = ctx
+                .connect_hook(1001, 0xCAFE, 16)
+                .expect_err("connect should fail");
+            assert_eq!(err, PosixErrno::Inval);
+
+            let connect_req = ctx
+                .kernel
+                .ipc_recv(socket_req_recv)
+                .expect("recv connect req")
+                .expect("connect req");
+            assert_eq!(connect_req.opcode, SOCKET_OP_CONNECT);
+            let connect_args = ConnectArgs::decode(connect_req.as_slice()).expect("decode connect");
+            assert_eq!(connect_args.fd, 1001);
+            assert_eq!(connect_args.addr_ptr, 0xCAFE);
+            assert_eq!(connect_args.addr_len, 16);
+        });
+    }
 }
