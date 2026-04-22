@@ -16,3 +16,4 @@ yarm-control-plane-servers = { path = "../yarm-control-plane-servers", default-f
 yarm-network-servers = { path = "../yarm-network-servers", default-features = false }
 yarm-fs-servers = { path = "../yarm-fs-servers", default-features = false }
 yarm-driver-servers = { path = "../yarm-driver-servers", default-features = false }
+yarm-ui-servers = { path = "../yarm-ui-servers", default-features = false }

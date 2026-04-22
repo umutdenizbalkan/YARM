@@ -27,6 +27,13 @@ if [[ "${1:-}" == "--network-runtime-entrypoint" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "--ui-runtime-entrypoint" ]]; then
+  cargo test -q -p yarm-ui-servers ui_server_bin_parity_guard_covers_expected_entrypoints
+  cargo check -q -p yarm-ui-servers --bins
+  echo "[ok] ui runtime-entrypoint boundary checks passed"
+  exit 0
+fi
+
 python3 scripts/check-crate-graph-boundary.py
 bash scripts/check-service-arch-boundary.sh
 bash scripts/check-boundary-milestone-freeze.sh

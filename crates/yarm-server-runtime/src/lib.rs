@@ -106,15 +106,15 @@ pub mod network {
 
 pub mod ui {
     pub fn run_compositor() {
-        yarm::services::ui::compositor::run();
+        yarm_ui_servers::run_compositor();
     }
 
     pub fn run_display() {
-        yarm::services::ui::display::run();
+        yarm_ui_servers::run_display();
     }
 
     pub fn run_shell() {
-        yarm::services::ui::shell::run();
+        yarm_ui_servers::run_shell();
     }
 }
 
@@ -132,6 +132,7 @@ mod tests {
         let legacy_drivers = ["yarm", "::services::", "drivers::"].concat();
         let legacy_fs = ["yarm", "::services::", "fs::"].concat();
         let legacy_network = ["yarm", "::services::", "network::"].concat();
+        let legacy_ui = ["yarm", "::services::", "ui::"].concat();
         assert!(
             !src.contains(legacy_cp.as_str()),
             "server-runtime control-plane dispatch must route via workspace server crate"
@@ -149,6 +150,10 @@ mod tests {
             "server-runtime network dispatch must route via workspace server crate"
         );
         assert!(
+            !src.contains(legacy_ui.as_str()),
+            "server-runtime ui dispatch must route via workspace server crate"
+        );
+        assert!(
             src.contains("yarm_control_plane_servers::"),
             "server-runtime must depend on control-plane workspace crate dispatch"
         );
@@ -163,6 +168,10 @@ mod tests {
         assert!(
             src.contains("yarm_network_servers::"),
             "server-runtime must depend on network workspace crate dispatch"
+        );
+        assert!(
+            src.contains("yarm_ui_servers::"),
+            "server-runtime must depend on ui workspace crate dispatch"
         );
     }
 }
