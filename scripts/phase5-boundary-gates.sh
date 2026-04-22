@@ -13,6 +13,13 @@ if [[ "${1:-}" == "--fs-runtime-entrypoint" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "--driver-runtime-entrypoint" ]]; then
+  cargo test -q -p yarm-driver-servers driver_server_bin_parity_guard_covers_expected_entrypoints
+  cargo check -q -p yarm-driver-servers --bins
+  echo "[ok] driver runtime-entrypoint boundary checks passed"
+  exit 0
+fi
+
 python3 scripts/check-crate-graph-boundary.py
 bash scripts/check-service-arch-boundary.sh
 bash scripts/check-boundary-milestone-freeze.sh
