@@ -1000,7 +1000,7 @@ mod tests {
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::Message;
     use crate::std::thread;
-    use crate::compatibility::posix_compat::socket_errno_test_helpers::{
+    use crate::yarm_compat_servers::socket_errno_test_helpers::{
         assert_errno_trapframe, assert_socket_request_shape, setup_socket_ipc_fixture,
         SocketErrnoCase,
     };
@@ -2041,7 +2041,7 @@ pub(crate) mod socket_errno_test_helpers {
     use crate::kernel::boot::KernelState;
     use crate::kernel::capabilities::CapId;
     use crate::kernel::trapframe::TrapFrame;
-    use crate::compatibility::posix_compat::PosixErrno;
+    use crate::yarm_compat_servers::PosixErrno;
     use yarm_ipc_abi::socket_abi::{
         ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SENDTO, SOCKET_OP_SOCKET, SendToArgs, SocketArgs,
     };

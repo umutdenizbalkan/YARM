@@ -17,8 +17,9 @@ pub extern crate std;
 pub mod arch;
 pub mod kernel;
 pub mod runtime;
-#[path = "services/compatibility/mod.rs"]
-pub mod compatibility;
+#[cfg(feature = "posix-compat")]
+#[path = "../crates/yarm-compat-servers/src/posix_compat/mod.rs"]
+pub mod yarm_compat_servers;
 #[path = "../crates/yarm-control-plane-servers/src/control_plane/init/core/mod.rs"]
 pub mod init;
 #[path = "../crates/yarm-control-plane-servers/src/control_plane/mod.rs"]
@@ -33,7 +34,7 @@ pub mod yarm_network_servers;
 pub mod yarm_ui_servers;
 
 #[cfg(feature = "posix-compat")]
-pub use compatibility::posix_compat;
+pub use yarm_compat_servers as posix_compat;
 
 #[macro_export]
 macro_rules! yarm_log {

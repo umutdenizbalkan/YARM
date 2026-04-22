@@ -4,7 +4,7 @@
 use crate::kernel::boot::KernelState;
 use crate::kernel::capabilities::CapId;
 use crate::kernel::vm::PAGE_SIZE;
-use crate::compatibility::posix_compat::PosixErrno;
+use crate::yarm_compat_servers::PosixErrno;
 
 pub fn mmap_hook(
     kernel: &mut KernelState,
