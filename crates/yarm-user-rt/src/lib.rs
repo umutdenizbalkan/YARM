@@ -131,3 +131,8 @@ pub mod vm {
 
     pub const PAGE_SIZE: usize = 4096;
 }
+
+pub mod process {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct ProcessId(pub u64);
+}
