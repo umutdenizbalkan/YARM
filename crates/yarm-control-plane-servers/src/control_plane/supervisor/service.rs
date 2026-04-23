@@ -162,6 +162,31 @@ pub struct SupervisorService {
     test_disable_budgeted_receive_for_tracked_tid: Option<u64>,
 }
 
+pub trait SupervisorOutboundMessageOps {
+    fn ipc_send(&mut self, cap: CapId, msg: Message) -> Result<(), KernelError>;
+    fn ipc_reply(&mut self, cap: CapId, msg: Message) -> Result<(), KernelError>;
+}
+
+struct KernelSupervisorOutboundMessageOps<'a> {
+    kernel: &'a mut KernelState,
+}
+
+impl<'a> KernelSupervisorOutboundMessageOps<'a> {
+    fn new(kernel: &'a mut KernelState) -> Self {
+        Self { kernel }
+    }
+}
+
+impl SupervisorOutboundMessageOps for KernelSupervisorOutboundMessageOps<'_> {
+    fn ipc_send(&mut self, cap: CapId, msg: Message) -> Result<(), KernelError> {
+        self.kernel.ipc_send(cap, msg)
+    }
+
+    fn ipc_reply(&mut self, cap: CapId, msg: Message) -> Result<(), KernelError> {
+        self.kernel.ipc_reply(cap, msg)
+    }
+}
+
 impl SupervisorService {
     pub const fn new(
         init_tid: u64,
@@ -194,33 +219,33 @@ impl SupervisorService {
 
     fn send_init_message(
         &mut self,
-        kernel: &mut KernelState,
+        outbound_ops: &mut impl SupervisorOutboundMessageOps,
         msg: Message,
     ) -> Result<(), KernelError> {
-        kernel.ipc_send(self.handoff.init_alert_send_cap, msg)
+        outbound_ops.ipc_send(self.handoff.init_alert_send_cap, msg)
     }
 
     fn send_init_alert(
         &mut self,
-        kernel: &mut KernelState,
+        outbound_ops: &mut impl SupervisorOutboundMessageOps,
         alert: InitAlert,
     ) -> Result<(), KernelError> {
         let msg = init_alert_message(self.init_tid, alert).map_err(|_| KernelError::WrongObject)?;
-        self.send_init_message(kernel, msg)
+        self.send_init_message(outbound_ops, msg)
     }
 
     fn send_status_reply(
         &mut self,
-        kernel: &mut KernelState,
+        outbound_ops: &mut impl SupervisorOutboundMessageOps,
         reply: SupervisorStatusReply,
         reply_cap: Option<CapId>,
     ) -> Result<(), KernelError> {
         let msg =
             status_reply_message(self.init_tid, reply).map_err(|_| KernelError::WrongObject)?;
         if let Some(reply_cap) = reply_cap {
-            kernel.ipc_reply(reply_cap, msg)
+            outbound_ops.ipc_reply(reply_cap, msg)
         } else {
-            self.send_init_message(kernel, msg)
+            self.send_init_message(outbound_ops, msg)
         }
     }
 
@@ -427,7 +452,8 @@ impl SupervisorService {
                     .ok_or(KernelError::WrongObject)?;
                 let record = self.find_record(req.tid).ok_or(KernelError::TaskMissing)?;
                 let reply_cap = request.transferred_cap().map(|cap| CapId(cap.0));
-                self.send_status_reply(kernel, self.status_reply(record), reply_cap)?;
+                let mut outbound_ops = KernelSupervisorOutboundMessageOps::new(kernel);
+                self.send_status_reply(&mut outbound_ops, self.status_reply(record), reply_cap)?;
             }
             SUPERVISOR_OP_ACK_REDELEGATION => {
                 let req = RedelegationAckRequest::decode(request.as_slice())
@@ -477,8 +503,9 @@ impl SupervisorService {
                     record.pending_redelegation = false;
                 } else {
                     record.pending_redelegation = true;
+                    let mut outbound_ops = KernelSupervisorOutboundMessageOps::new(kernel);
                     self.send_init_alert(
-                        kernel,
+                        &mut outbound_ops,
                         InitAlert {
                             tid: record.tid,
                             kind: InitAlertKind::RedelegationRequired,
@@ -633,7 +660,7 @@ impl SupervisorService {
         if matches!(snapshot.kind, ManagedServiceKind::Core(kind) if CoreServicePolicyTable::restart_owner_for(kind) == RestartOwner::Init)
         {
             self.send_init_alert(
-                kernel,
+                &mut KernelSupervisorOutboundMessageOps::new(kernel),
                 InitAlert {
                     tid: event.tid,
                     kind: InitAlertKind::SupervisorRestarted,
@@ -666,7 +693,7 @@ impl SupervisorService {
             kernel.mark_task_dead(event.tid)?;
             self.degraded = true;
             self.send_init_alert(
-                kernel,
+                &mut KernelSupervisorOutboundMessageOps::new(kernel),
                 InitAlert {
                     tid: event.tid,
                     kind: InitAlertKind::ServiceDegraded,
