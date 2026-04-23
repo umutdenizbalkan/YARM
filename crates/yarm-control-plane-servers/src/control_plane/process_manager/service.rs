@@ -879,14 +879,14 @@ fn synthetic_elf_image(image_id: u64) -> [u8; 128] {
 
 #[cfg(test)]
 fn roundtrip_ipc(
-    runtime: &impl RuntimeStateAccess<KernelState>,
+    runtime: &impl ProcessServiceKernelIpcRuntime,
     service: &mut ProcessService,
     client_send_cap: CapId,
     server_recv_cap: CapId,
     client_recv_cap: CapId,
     request: Message,
 ) -> Result<Message, ProcessManagerError> {
-    runtime.with_state(|kernel| {
+    runtime.with_kernel_state(|kernel| {
         synthetic_roundtrip_call_reply_with_budget(
             kernel,
             service,
@@ -897,6 +897,27 @@ fn roundtrip_ipc(
             PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS,
         )
     })
+}
+
+#[cfg(test)]
+pub trait ProcessServiceKernelIpcRuntime {
+    fn with_kernel_state<T>(
+        &self,
+        f: impl FnOnce(&mut KernelState) -> Result<T, ProcessManagerError>,
+    ) -> Result<T, ProcessManagerError>;
+}
+
+#[cfg(test)]
+impl<T> ProcessServiceKernelIpcRuntime for T
+where
+    T: RuntimeStateAccess<KernelState>,
+{
+    fn with_kernel_state<U>(
+        &self,
+        f: impl FnOnce(&mut KernelState) -> Result<U, ProcessManagerError>,
+    ) -> Result<U, ProcessManagerError> {
+        self.with_state(f)
+    }
 }
 
 #[cfg(test)]
@@ -1022,7 +1043,7 @@ pub fn run_request_loop(
 
 #[cfg(test)]
 pub fn run_request_loop_over_kernel_ipc(
-    runtime: &impl RuntimeStateAccess<KernelState>,
+    runtime: &impl ProcessServiceKernelIpcRuntime,
     service: &mut ProcessService,
     parent_pid: u64,
     image_id: u64,
@@ -1035,7 +1056,7 @@ pub fn run_request_loop_over_kernel_ipc(
 
 #[cfg(test)]
 fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
-    runtime: &impl RuntimeStateAccess<KernelState>,
+    runtime: &impl ProcessServiceKernelIpcRuntime,
     service: &mut ProcessService,
     parent_pid: u64,
     image_id: u64,
@@ -1043,9 +1064,9 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
     requested_cnode_slots: Option<usize>,
 ) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
     let (_, client_send_cap, server_recv_cap) =
-        runtime.with_state(|kernel| map_kernel_ipc_err(kernel.create_endpoint(8)))?;
+        runtime.with_kernel_state(|kernel| map_kernel_ipc_err(kernel.create_endpoint(8)))?;
     let (_, _, client_recv_cap) =
-        runtime.with_state(|kernel| map_kernel_ipc_err(kernel.create_endpoint(8)))?;
+        runtime.with_kernel_state(|kernel| map_kernel_ipc_err(kernel.create_endpoint(8)))?;
 
     let spawn_reply = roundtrip_ipc(
         runtime,
@@ -1070,7 +1091,7 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
         return Err(ProcessManagerError::Malformed);
     }
     if let Some(requested_slots) = recorded_requested_slots.or(requested_cnode_slots) {
-        runtime.with_state(|kernel| {
+        runtime.with_kernel_state(|kernel| {
             kernel
                 .control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)
                 .map_err(|err| map_trap_ipc_error(from_kernel_trap_ipc_error(err)))
@@ -1120,7 +1141,7 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
 
 #[cfg(test)]
 pub fn run_request_loop_over_runtime_state_with_cnode_resize(
-    runtime: &impl RuntimeStateAccess<KernelState>,
+    runtime: &impl ProcessServiceKernelIpcRuntime,
     service: &mut ProcessService,
     parent_pid: u64,
     image_id: u64,
