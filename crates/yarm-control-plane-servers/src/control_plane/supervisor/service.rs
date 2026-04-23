@@ -167,6 +167,15 @@ pub trait SupervisorOutboundMessageOps {
     fn ipc_reply(&mut self, cap: CapId, msg: Message) -> Result<(), KernelError>;
 }
 
+trait SupervisorRestartRedelegationOps: SupervisorOutboundMessageOps {
+    fn restart_task(&mut self, tid: u64, restart_token: u64) -> Result<(), KernelError>;
+    fn delegate_driver_bundle(
+        &mut self,
+        server_tid: u64,
+        plan: DriverRecoveryPlan,
+    ) -> Result<(), KernelError>;
+}
+
 struct KernelSupervisorOutboundMessageOps<'a> {
     kernel: &'a mut KernelState,
 }
@@ -184,6 +193,29 @@ impl SupervisorOutboundMessageOps for KernelSupervisorOutboundMessageOps<'_> {
 
     fn ipc_reply(&mut self, cap: CapId, msg: Message) -> Result<(), KernelError> {
         self.kernel.ipc_reply(cap, msg)
+    }
+}
+
+impl SupervisorRestartRedelegationOps for KernelSupervisorOutboundMessageOps<'_> {
+    fn restart_task(&mut self, tid: u64, restart_token: u64) -> Result<(), KernelError> {
+        self.kernel.restart_task(tid, restart_token)
+    }
+
+    fn delegate_driver_bundle(
+        &mut self,
+        server_tid: u64,
+        plan: DriverRecoveryPlan,
+    ) -> Result<(), KernelError> {
+        let _ = self.kernel.delegate_driver_bundle(DriverBundlePlan {
+            server_tid: ThreadId(server_tid),
+            irq_line: plan.irq_line,
+            mem_cap: plan.mem_cap,
+            dma_len: plan.dma_len,
+            iova_cap: plan.iova_cap,
+            iova_base: plan.iova_base,
+            iova_len: plan.iova_len,
+        })?;
+        Ok(())
     }
 }
 
@@ -464,7 +496,10 @@ impl SupervisorService {
         Ok(())
     }
 
-    fn execute_due_restarts(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
+    fn execute_due_restarts(
+        &mut self,
+        restart_ops: &mut impl SupervisorRestartRedelegationOps,
+    ) -> Result<usize, KernelError> {
         let mut restarted = 0usize;
         let mut idx = 0usize;
         while idx < self.managed.len() {
@@ -483,28 +518,19 @@ impl SupervisorService {
             let restart_token = record
                 .pending_restart_token
                 .ok_or(KernelError::WrongObject)?;
-            kernel.restart_task(record.tid, restart_token)?;
+            restart_ops.restart_task(record.tid, restart_token)?;
             record.last_restart_tick = self.current_tick;
             record.pending_restart_due = None;
             record.pending_restart_token = None;
             if matches!(record.kind, ManagedServiceKind::Driver) {
                 let plan = record.driver_plan;
                 if let Some(plan) = plan {
-                    let _ = kernel.delegate_driver_bundle(DriverBundlePlan {
-                        server_tid: ThreadId(record.tid),
-                        irq_line: plan.irq_line,
-                        mem_cap: plan.mem_cap,
-                        dma_len: plan.dma_len,
-                        iova_cap: plan.iova_cap,
-                        iova_base: plan.iova_base,
-                        iova_len: plan.iova_len,
-                    })?;
+                    restart_ops.delegate_driver_bundle(record.tid, plan)?;
                     record.pending_redelegation = false;
                 } else {
                     record.pending_redelegation = true;
-                    let mut outbound_ops = KernelSupervisorOutboundMessageOps::new(kernel);
                     self.send_init_alert(
-                        &mut outbound_ops,
+                        restart_ops,
                         InitAlert {
                             tid: record.tid,
                             kind: InitAlertKind::RedelegationRequired,
@@ -572,7 +598,8 @@ impl SupervisorService {
     pub fn service_step(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
         let mut changed = 0usize;
         if self.has_due_restart_ready() {
-            changed += self.execute_due_restarts(kernel)?;
+            let mut restart_ops = KernelSupervisorOutboundMessageOps::new(kernel);
+            changed += self.execute_due_restarts(&mut restart_ops)?;
             if changed > 0 {
                 return Ok(changed);
             }
@@ -604,7 +631,8 @@ impl SupervisorService {
             }
             changed += 1;
         }
-        changed += self.execute_due_restarts(kernel)?;
+        let mut restart_ops = KernelSupervisorOutboundMessageOps::new(kernel);
+        changed += self.execute_due_restarts(&mut restart_ops)?;
         Ok(changed)
     }
 
