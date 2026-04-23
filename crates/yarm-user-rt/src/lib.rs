@@ -11,14 +11,12 @@ macro_rules! user_log {
 }
 
 pub mod ipc {
-    pub use yarm_kernel::ipc::{IpcError, Message, SharedMemoryRegion, ThreadId, TransferCapId};
     pub use yarm_ipc_abi::vfs_abi::{
         OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
         VFS_OP_WRITE,
     };
+    pub use yarm_kernel::ipc::{IpcError, Message, SharedMemoryRegion, ThreadId, TransferCapId};
 }
-
-
 
 pub mod capability {
     pub use yarm_kernel::capability::{CapId, CapRights};
@@ -145,5 +143,24 @@ pub mod process {
         InvalidTransport,
         PermissionDenied,
         WouldBlock,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WaitResult {
+        pub waited_pid: ProcessId,
+        pub exit_code: u64,
+    }
+
+    pub trait ProcessManagerOps {
+        fn process_id_for_tid(&self, tid: u64) -> ProcessId;
+        fn parent_of(&self, pid: ProcessId) -> Option<ProcessId>;
+        fn allocate_process(&mut self, parent_pid: ProcessId) -> Result<ProcessId, ProcessError>;
+        fn insert_synthetic_exit_for_tid(
+            &mut self,
+            tid: u64,
+            code: u64,
+        ) -> Result<(), ProcessError>;
+        fn wait_exited(&mut self, pid: ProcessId) -> Result<WaitResult, ProcessError>;
+        fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessError>;
     }
 }

@@ -5,16 +5,9 @@
 use yarm::kernel::boot::KernelState;
 #[cfg(test)]
 use yarm::kernel::boot::{KernelError, TrapHandleError};
-#[cfg(test)]
-use yarm_user_rt::capability::CapId;
-use yarm_user_rt::ipc::Message;
 use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcessManagerError};
-use yarm_user_rt::process::{ProcessError as ProcessManagerError, ProcessId};
 #[cfg(test)]
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
-#[cfg(test)]
-use yarm_user_rt::syscall::SyscallError;
-use yarm_user_rt::task::TaskClass;
 #[cfg(test)]
 use yarm::runtime::SharedKernel;
 use yarm_ipc_abi::process_abi::{
@@ -24,6 +17,15 @@ use yarm_ipc_abi::process_abi::{
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
+#[cfg(test)]
+use yarm_user_rt::capability::CapId;
+use yarm_user_rt::ipc::Message;
+use yarm_user_rt::process::{
+    ProcessError as ProcessManagerError, ProcessId, ProcessManagerOps, WaitResult,
+};
+#[cfg(test)]
+use yarm_user_rt::syscall::SyscallError;
+use yarm_user_rt::task::TaskClass;
 
 #[cfg(test)]
 const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
@@ -115,8 +117,71 @@ struct ProcessSpawnPolicyRecord {
 }
 
 #[derive(Debug)]
+struct KernelProcessManagerAdapter {
+    inner: ProcessManager,
+}
+
+impl KernelProcessManagerAdapter {
+    const fn new() -> Self {
+        Self {
+            inner: ProcessManager::new(),
+        }
+    }
+}
+
+impl ProcessManagerOps for KernelProcessManagerAdapter {
+    fn process_id_for_tid(&self, tid: u64) -> ProcessId {
+        from_kernel_process_id(self.inner.process_id_for_tid(tid))
+    }
+
+    fn parent_of(&self, pid: ProcessId) -> Option<ProcessId> {
+        self.inner
+            .parent_of(to_kernel_process_id(pid))
+            .map(from_kernel_process_id)
+    }
+
+    fn allocate_process(
+        &mut self,
+        parent_pid: ProcessId,
+    ) -> Result<ProcessId, ProcessManagerError> {
+        self.inner
+            .allocate_process(to_kernel_process_id(parent_pid))
+            .map(from_kernel_process_id)
+            .map_err(map_kernel_process_error)
+    }
+
+    fn insert_synthetic_exit_for_tid(
+        &mut self,
+        tid: u64,
+        code: u64,
+    ) -> Result<(), ProcessManagerError> {
+        self.inner
+            .insert_synthetic_exit_for_tid(tid, code)
+            .map(|_| ())
+            .map_err(map_kernel_process_error)
+    }
+
+    fn wait_exited(&mut self, pid: ProcessId) -> Result<WaitResult, ProcessManagerError> {
+        let waited = self
+            .inner
+            .wait_exited(to_kernel_process_id(pid))
+            .map_err(map_kernel_process_error)?;
+        Ok(WaitResult {
+            waited_pid: from_kernel_process_id(waited.waited_pid),
+            exit_code: waited.exit_code,
+        })
+    }
+
+    fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessManagerError> {
+        self.inner
+            .mark_exit(to_kernel_process_id(pid), code)
+            .map_err(map_kernel_process_error)
+    }
+}
+
+#[derive(Debug)]
 pub struct ProcessService {
-    manager: ProcessManager,
+    manager: KernelProcessManagerAdapter,
     policy_records: [Option<ProcessSpawnPolicyRecord>; 64],
     handled: usize,
 }
@@ -459,7 +524,9 @@ fn map_kernel_ipc_error(err: KernelError) -> ProcessManagerError {
 #[cfg(test)]
 fn map_trap_ipc_error(err: TrapHandleError) -> ProcessManagerError {
     match err {
-        TrapHandleError::Syscall(syscall_err) => map_syscall_error(map_kernel_syscall_error(syscall_err)),
+        TrapHandleError::Syscall(syscall_err) => {
+            map_syscall_error(map_kernel_syscall_error(syscall_err))
+        }
         TrapHandleError::MissingTrapFrame => ProcessManagerError::InvalidTransport,
     }
 }
@@ -497,7 +564,7 @@ fn map_syscall_error(err: SyscallError) -> ProcessManagerError {
 impl ProcessService {
     pub const fn new() -> Self {
         Self {
-            manager: ProcessManager::new(),
+            manager: KernelProcessManagerAdapter::new(),
             policy_records: [None; 64],
             handled: 0,
         }
@@ -655,9 +722,7 @@ impl ProcessService {
     }
 
     pub fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessManagerError> {
-        self.manager
-            .mark_exit(to_kernel_process_id(pid), code)
-            .map_err(map_kernel_process_error)
+        self.manager.mark_exit(pid, code)
     }
 
     pub fn handle(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
@@ -678,15 +743,13 @@ impl ProcessService {
                     PROC_OP_GETPPID,
                     self.manager
                         .parent_of(pid)
-                        .map(from_kernel_process_id)
                         .unwrap_or(ProcessId(pid.0.saturating_sub(1)))
                         .0,
                 )
             }
             ProcessRequest::Exit { caller_tid, code } => {
                 self.manager
-                    .insert_synthetic_exit_for_tid(caller_tid, code)
-                    .map_err(map_kernel_process_error)?;
+                    .insert_synthetic_exit_for_tid(caller_tid, code)?;
                 Self::u64_reply(PROC_OP_EXIT, 0)
             }
             ProcessRequest::SpawnV2(req) => {
@@ -694,11 +757,7 @@ impl ProcessService {
                 {
                     let image = synthetic_elf_image(req.image_id);
                     let info = ElfImageInfo::parse(req.image_id, &image).map_err(map_elf_error)?;
-                    let pid = self
-                        .manager
-                        .allocate_process(to_kernel_process_id(req.parent_pid))
-                        .map_err(map_kernel_process_error)?;
-                    let pid = from_kernel_process_id(pid);
+                    let pid = self.manager.allocate_process(req.parent_pid)?;
                     self.record_spawn_policy(
                         pid,
                         req.image_id,
@@ -718,19 +777,16 @@ impl ProcessService {
             }
             ProcessRequest::WaitPidV2(req) => {
                 if req.caller_pid != req.target_pid {
-                    let Some(parent) = self.manager.parent_of(to_kernel_process_id(req.target_pid)) else {
+                    let Some(parent) = self.manager.parent_of(req.target_pid) else {
                         return Err(ProcessManagerError::PermissionDenied);
                     };
-                    if from_kernel_process_id(parent) != req.caller_pid {
+                    if parent != req.caller_pid {
                         return Err(ProcessManagerError::PermissionDenied);
                     }
                 }
-                let waited = self
-                    .manager
-                    .wait_exited(to_kernel_process_id(req.target_pid))
-                    .map_err(map_kernel_process_error)?;
+                let waited = self.manager.wait_exited(req.target_pid)?;
                 let result = WaitPidV2Result {
-                    waited_pid: from_kernel_process_id(waited.waited_pid),
+                    waited_pid: waited.waited_pid,
                     exit_code: waited.exit_code,
                 };
                 Message::with_header(0, PROC_OP_WAITPID_V2, 0, None, &result.encode())
