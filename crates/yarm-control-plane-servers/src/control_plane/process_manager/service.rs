@@ -6,7 +6,7 @@ use yarm::kernel::boot::KernelState;
 #[cfg(test)]
 use yarm::kernel::boot::{KernelError, TrapHandleError};
 #[cfg(test)]
-use yarm::kernel::capabilities::CapId;
+use yarm_user_rt::capability::CapId;
 use yarm_user_rt::ipc::Message;
 use yarm::kernel::process::{ProcessId, ProcessManager, ProcessManagerError};
 #[cfg(test)]

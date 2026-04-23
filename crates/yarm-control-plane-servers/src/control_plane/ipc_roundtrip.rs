@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::boot::{KernelError, KernelState};
-use yarm::kernel::capabilities::CapId;
+use yarm_user_rt::capability::CapId;
 use yarm_user_rt::ipc::{Message, ThreadId};
 use yarm_srv_common::service_loop::RequestResponseService;
 

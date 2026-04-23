@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::capabilities::CapId;
+use yarm_user_rt::capability::CapId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitBootPhase {

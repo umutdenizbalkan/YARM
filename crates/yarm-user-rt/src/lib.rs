@@ -18,6 +18,12 @@ pub mod ipc {
     };
 }
 
+
+
+pub mod capability {
+    pub use yarm_kernel::capability::{CapId, CapRights};
+}
+
 pub mod syscall {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(usize)]

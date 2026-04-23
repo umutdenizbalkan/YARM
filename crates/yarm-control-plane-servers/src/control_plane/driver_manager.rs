@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::boot::{KernelError, KernelState};
-use yarm::kernel::capabilities::CapId;
+use yarm_user_rt::capability::CapId;
 use yarm::kernel::driver_abi::{
     DRIVER_OP_GRANT_DMA, DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, DRIVER_OP_RESTARTED,
 };

@@ -4,7 +4,7 @@
 #[cfg(test)]
 use yarm::kernel::boot::KernelState;
 #[cfg(test)]
-use yarm::kernel::capabilities::CapId;
+use yarm_user_rt::capability::CapId;
 use yarm_fs_servers::common::vfs_ipc::VfsError;
 use yarm_fs_servers::common::vfs_ipc::{
     InMemoryBackend, OpenAtRequest, ReadWriteRequest, StatxRequest, close_message,

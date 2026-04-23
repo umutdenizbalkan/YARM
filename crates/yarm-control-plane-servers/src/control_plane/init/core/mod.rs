@@ -17,7 +17,7 @@ use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_reque
 use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
 use yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
 use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
-use yarm::kernel::capabilities::{CapId, CapRights};
+use yarm_user_rt::capability::{CapId, CapRights};
 use yarm::kernel::task::TaskClass;
 use yarm::kernel::task::TaskStatus;
 use yarm::kernel::vm::Asid;
