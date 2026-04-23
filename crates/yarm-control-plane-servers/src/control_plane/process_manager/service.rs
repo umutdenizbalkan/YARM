@@ -127,17 +127,40 @@ impl KernelProcessManagerAdapter {
             inner: ProcessManager::new(),
         }
     }
+
+    #[inline]
+    fn to_kernel_process_id(pid: ProcessId) -> yarm::kernel::process::ProcessId {
+        yarm::kernel::process::ProcessId(pid.0)
+    }
+
+    #[inline]
+    fn from_kernel_process_id(pid: yarm::kernel::process::ProcessId) -> ProcessId {
+        ProcessId(pid.0)
+    }
+
+    #[inline]
+    fn map_kernel_process_error(err: KernelProcessManagerError) -> ProcessManagerError {
+        match err {
+            KernelProcessManagerError::Malformed => ProcessManagerError::Malformed,
+            KernelProcessManagerError::Unsupported => ProcessManagerError::Unsupported,
+            KernelProcessManagerError::TableFull => ProcessManagerError::TableFull,
+            KernelProcessManagerError::UnknownProcess => ProcessManagerError::UnknownProcess,
+            KernelProcessManagerError::InvalidTransport => ProcessManagerError::InvalidTransport,
+            KernelProcessManagerError::PermissionDenied => ProcessManagerError::PermissionDenied,
+            KernelProcessManagerError::WouldBlock => ProcessManagerError::WouldBlock,
+        }
+    }
 }
 
 impl ProcessManagerOps for KernelProcessManagerAdapter {
     fn process_id_for_tid(&self, tid: u64) -> ProcessId {
-        from_kernel_process_id(self.inner.process_id_for_tid(tid))
+        Self::from_kernel_process_id(self.inner.process_id_for_tid(tid))
     }
 
     fn parent_of(&self, pid: ProcessId) -> Option<ProcessId> {
         self.inner
-            .parent_of(to_kernel_process_id(pid))
-            .map(from_kernel_process_id)
+            .parent_of(Self::to_kernel_process_id(pid))
+            .map(Self::from_kernel_process_id)
     }
 
     fn allocate_process(
@@ -145,9 +168,9 @@ impl ProcessManagerOps for KernelProcessManagerAdapter {
         parent_pid: ProcessId,
     ) -> Result<ProcessId, ProcessManagerError> {
         self.inner
-            .allocate_process(to_kernel_process_id(parent_pid))
-            .map(from_kernel_process_id)
-            .map_err(map_kernel_process_error)
+            .allocate_process(Self::to_kernel_process_id(parent_pid))
+            .map(Self::from_kernel_process_id)
+            .map_err(Self::map_kernel_process_error)
     }
 
     fn insert_synthetic_exit_for_tid(
@@ -158,24 +181,24 @@ impl ProcessManagerOps for KernelProcessManagerAdapter {
         self.inner
             .insert_synthetic_exit_for_tid(tid, code)
             .map(|_| ())
-            .map_err(map_kernel_process_error)
+            .map_err(Self::map_kernel_process_error)
     }
 
     fn wait_exited(&mut self, pid: ProcessId) -> Result<WaitResult, ProcessManagerError> {
         let waited = self
             .inner
-            .wait_exited(to_kernel_process_id(pid))
-            .map_err(map_kernel_process_error)?;
+            .wait_exited(Self::to_kernel_process_id(pid))
+            .map_err(Self::map_kernel_process_error)?;
         Ok(WaitResult {
-            waited_pid: from_kernel_process_id(waited.waited_pid),
+            waited_pid: Self::from_kernel_process_id(waited.waited_pid),
             exit_code: waited.exit_code,
         })
     }
 
     fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessManagerError> {
         self.inner
-            .mark_exit(to_kernel_process_id(pid), code)
-            .map_err(map_kernel_process_error)
+            .mark_exit(Self::to_kernel_process_id(pid), code)
+            .map_err(Self::map_kernel_process_error)
     }
 }
 
@@ -469,29 +492,6 @@ pub struct ProcessManagerLoopSummary {
     pub waited_pid: u64,
     pub waited_exit: u64,
     pub handled: usize,
-}
-
-#[inline]
-fn to_kernel_process_id(pid: ProcessId) -> yarm::kernel::process::ProcessId {
-    yarm::kernel::process::ProcessId(pid.0)
-}
-
-#[inline]
-fn from_kernel_process_id(pid: yarm::kernel::process::ProcessId) -> ProcessId {
-    ProcessId(pid.0)
-}
-
-#[inline]
-fn map_kernel_process_error(err: KernelProcessManagerError) -> ProcessManagerError {
-    match err {
-        KernelProcessManagerError::Malformed => ProcessManagerError::Malformed,
-        KernelProcessManagerError::Unsupported => ProcessManagerError::Unsupported,
-        KernelProcessManagerError::TableFull => ProcessManagerError::TableFull,
-        KernelProcessManagerError::UnknownProcess => ProcessManagerError::UnknownProcess,
-        KernelProcessManagerError::InvalidTransport => ProcessManagerError::InvalidTransport,
-        KernelProcessManagerError::PermissionDenied => ProcessManagerError::PermissionDenied,
-        KernelProcessManagerError::WouldBlock => ProcessManagerError::WouldBlock,
-    }
 }
 
 #[cfg(test)]
