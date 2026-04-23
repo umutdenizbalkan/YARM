@@ -13,7 +13,7 @@ use yarm::kernel::process::{ProcessId, ProcessManager, ProcessManagerError};
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 #[cfg(test)]
 use yarm_user_rt::syscall::SyscallError;
-use yarm::kernel::task::TaskClass;
+use yarm_user_rt::task::TaskClass;
 #[cfg(test)]
 use yarm::runtime::SharedKernel;
 use yarm_ipc_abi::process_abi::{

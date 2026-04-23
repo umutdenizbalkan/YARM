@@ -5,7 +5,7 @@ use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 use yarm_user_rt::capability::{CapId, CapRights};
 use yarm_user_rt::ipc::{Message, ThreadId};
 #[cfg(test)]
-use yarm_user_rt::task::TaskStatus;
+use yarm_user_rt::task::{TaskClass, TaskStatus};
 use yarm_user_rt::time::{TickDuration, TickInstant};
 use crate::control_plane::init::{
     CoreServiceKind, CoreServicePolicyTable, InitFaultHandoff, RestartOwner, ServiceRestartPolicy,
@@ -33,6 +33,24 @@ fn map_task_status(status: yarm::kernel::task::TaskStatus) -> TaskStatus {
         yarm::kernel::task::TaskStatus::Faulted => TaskStatus::Faulted,
         yarm::kernel::task::TaskStatus::Exited(code) => TaskStatus::Exited(code),
         yarm::kernel::task::TaskStatus::Dead => TaskStatus::Dead,
+    }
+}
+
+#[cfg(test)]
+fn map_task_class(class: yarm::kernel::task::TaskClass) -> TaskClass {
+    match class {
+        yarm::kernel::task::TaskClass::App => TaskClass::App,
+        yarm::kernel::task::TaskClass::Driver => TaskClass::Driver,
+        yarm::kernel::task::TaskClass::SystemServer => TaskClass::SystemServer,
+    }
+}
+
+#[cfg(test)]
+fn to_kernel_task_class(class: TaskClass) -> yarm::kernel::task::TaskClass {
+    match class {
+        TaskClass::App => yarm::kernel::task::TaskClass::App,
+        TaskClass::Driver => yarm::kernel::task::TaskClass::Driver,
+        TaskClass::SystemServer => yarm::kernel::task::TaskClass::SystemServer,
     }
 }
 
@@ -808,7 +826,6 @@ mod tests {
     use super::*;
     use yarm::std::thread;
         use yarm::kernel::boot::Bootstrap;
-    use yarm::kernel::task::TaskClass;
     use yarm::kernel::vm::PAGE_SIZE;
     use crate::control_plane::init::{CoreServiceGraph, CoreServiceImagePlan, InitService};
     use yarm_ipc_abi::supervisor_abi::{
@@ -867,7 +884,7 @@ mod tests {
     ) -> (u64, u64) {
         if kernel.task_status(owner_tid).is_none() {
             kernel
-                .register_task_with_class(owner_tid, TaskClass::SystemServer)
+                .register_task_with_class(owner_tid, to_kernel_task_class(TaskClass::SystemServer))
                 .expect("register delegation owner");
         }
         switch_to_current_task(kernel, owner_tid);
@@ -1240,13 +1257,13 @@ mod tests {
                 .handle_control_request(&mut kernel, register_vfs)
                 .expect("register vfs");
             kernel
-                .register_task_with_class(3, TaskClass::SystemServer)
+                .register_task_with_class(3, to_kernel_task_class(TaskClass::SystemServer))
                 .expect("task 3");
             supervisor
                 .handle_control_request(&mut kernel, register_driver)
                 .expect("register driver");
             kernel
-                .register_task_with_class(20, TaskClass::Driver)
+                .register_task_with_class(20, to_kernel_task_class(TaskClass::Driver))
                 .expect("task 20");
             kernel.register_driver(20).expect("driver");
             restore_delegation_owner_context(&mut kernel, owner_tid);
@@ -1266,7 +1283,7 @@ mod tests {
                 kernel.task_status(20).map(map_task_status),
                 Some(TaskStatus::Exited(11))
             );
-            assert_eq!(kernel.task_class(20), Some(TaskClass::Driver));
+            assert_eq!(kernel.task_class(20).map(map_task_class), Some(TaskClass::Driver));
             restore_delegation_owner_context(&mut kernel, owner_tid);
             let handled =
                 run_until_idle_with_progress_guard(
@@ -1383,7 +1400,7 @@ mod tests {
                 .ipc_send(supervisor_control_send_cap, register_proc)
                 .expect("send proc registration");
             kernel
-                .register_task_with_class(2, TaskClass::SystemServer)
+                .register_task_with_class(2, to_kernel_task_class(TaskClass::SystemServer))
                 .expect("task 2");
             supervisor.run_until_idle(&mut kernel).expect("loop");
 
@@ -1499,7 +1516,7 @@ mod tests {
                 .handle_control_request(&mut kernel, register_driver)
                 .expect("register driver");
             kernel
-                .register_task_with_class(20, TaskClass::Driver)
+                .register_task_with_class(20, to_kernel_task_class(TaskClass::Driver))
                 .expect("task 20");
             kernel.register_driver(20).expect("driver");
             restore_delegation_owner_context(&mut kernel, owner_tid);

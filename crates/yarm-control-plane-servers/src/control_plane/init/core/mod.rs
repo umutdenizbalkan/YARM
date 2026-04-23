@@ -18,8 +18,7 @@ use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
 use yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
 use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use yarm_user_rt::capability::{CapId, CapRights};
-use yarm::kernel::task::TaskClass;
-use yarm_user_rt::task::TaskStatus;
+use yarm_user_rt::task::{TaskClass, TaskStatus};
 use yarm::kernel::vm::Asid;
 use alloc::boxed::Box;
 use yarm_ipc_abi::supervisor_abi::{
@@ -43,6 +42,14 @@ fn map_task_status(status: yarm::kernel::task::TaskStatus) -> TaskStatus {
         yarm::kernel::task::TaskStatus::Faulted => TaskStatus::Faulted,
         yarm::kernel::task::TaskStatus::Exited(code) => TaskStatus::Exited(code),
         yarm::kernel::task::TaskStatus::Dead => TaskStatus::Dead,
+    }
+}
+
+fn to_kernel_task_class(class: TaskClass) -> yarm::kernel::task::TaskClass {
+    match class {
+        TaskClass::App => yarm::kernel::task::TaskClass::App,
+        TaskClass::Driver => yarm::kernel::task::TaskClass::Driver,
+        TaskClass::SystemServer => yarm::kernel::task::TaskClass::SystemServer,
     }
 }
 
@@ -211,7 +218,7 @@ impl InitService {
             tid,
             entry,
             asid: Some(asid),
-            class: TaskClass::SystemServer,
+            class: to_kernel_task_class(TaskClass::SystemServer),
         })?;
         Ok(())
     }
@@ -1390,7 +1397,7 @@ mod tests {
         init.seed_supervisor_registrations(&mut state)
             .expect("seed");
         state
-            .register_task_with_class(20, yarm::kernel::task::TaskClass::Driver)
+            .register_task_with_class(20, to_kernel_task_class(TaskClass::Driver))
             .expect("task");
         state.register_driver(20).expect("driver");
         let (_id, mem) = state.alloc_anonymous_memory_object().expect("mem");

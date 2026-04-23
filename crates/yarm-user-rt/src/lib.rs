@@ -108,6 +108,13 @@ pub mod time {
 
 pub mod task {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TaskClass {
+        App,
+        Driver,
+        SystemServer,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TaskStatus {
         Runnable,
         Running,
