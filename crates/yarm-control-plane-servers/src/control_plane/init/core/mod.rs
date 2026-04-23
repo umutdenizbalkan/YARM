@@ -19,7 +19,7 @@ use yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
 use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use yarm_user_rt::capability::{CapId, CapRights};
 use yarm::kernel::task::TaskClass;
-use yarm::kernel::task::TaskStatus;
+use yarm_user_rt::task::TaskStatus;
 use yarm::kernel::vm::Asid;
 use alloc::boxed::Box;
 use yarm_ipc_abi::supervisor_abi::{
@@ -34,6 +34,17 @@ pub use policy::{
     CoreLaunchStrategy, CoreServiceKind, CoreServicePolicyTable, InitBootPhase, InitFaultHandoff,
     RestartOwner, ServiceRestartPolicy, StartupCap, StartupCapSet,
 };
+
+fn map_task_status(status: yarm::kernel::task::TaskStatus) -> TaskStatus {
+    match status {
+        yarm::kernel::task::TaskStatus::Runnable => TaskStatus::Runnable,
+        yarm::kernel::task::TaskStatus::Running => TaskStatus::Running,
+        yarm::kernel::task::TaskStatus::Blocked(_) => TaskStatus::Blocked,
+        yarm::kernel::task::TaskStatus::Faulted => TaskStatus::Faulted,
+        yarm::kernel::task::TaskStatus::Exited(code) => TaskStatus::Exited(code),
+        yarm::kernel::task::TaskStatus::Dead => TaskStatus::Dead,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitService {
@@ -753,7 +764,10 @@ impl InitService {
         kernel: &mut KernelState,
         tid: u64,
     ) -> Result<bool, KernelError> {
-        if !matches!(kernel.task_status(tid), Some(TaskStatus::Exited(_))) {
+        if !matches!(
+            kernel.task_status(tid).map(map_task_status),
+            Some(TaskStatus::Exited(_))
+        ) {
             return Ok(false);
         }
         let token = kernel
@@ -1214,10 +1228,7 @@ mod tests {
             init.recover_supervisor_failure(&mut state, token)
                 .expect("recover")
         );
-        assert_eq!(
-            state.task_status(4),
-            Some(yarm::kernel::task::TaskStatus::Runnable)
-        );
+        assert_eq!(state.task_status(4).map(map_task_status), Some(TaskStatus::Runnable));
     }
 
     #[test]
@@ -1262,10 +1273,7 @@ mod tests {
             init.recover_core_service_failure(&mut state, CoreServiceKind::ProcessManager, token)
                 .expect("recover")
         );
-        assert_eq!(
-            state.task_status(2),
-            Some(yarm::kernel::task::TaskStatus::Runnable)
-        );
+        assert_eq!(state.task_status(2).map(map_task_status), Some(TaskStatus::Runnable));
     }
 
     #[test]
@@ -1301,10 +1309,7 @@ mod tests {
             init.recover_core_service_failure(&mut state, CoreServiceKind::Vfs, token)
                 .expect("recover")
         );
-        assert_eq!(
-            state.task_status(3),
-            Some(yarm::kernel::task::TaskStatus::Runnable)
-        );
+        assert_eq!(state.task_status(3).map(map_task_status), Some(TaskStatus::Runnable));
     }
 
     #[test]

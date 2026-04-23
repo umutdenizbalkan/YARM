@@ -4,6 +4,8 @@
 use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 use yarm_user_rt::capability::{CapId, CapRights};
 use yarm_user_rt::ipc::{Message, ThreadId};
+#[cfg(test)]
+use yarm_user_rt::task::TaskStatus;
 use yarm_user_rt::time::{TickDuration, TickInstant};
 use crate::control_plane::init::{
     CoreServiceKind, CoreServicePolicyTable, InitFaultHandoff, RestartOwner, ServiceRestartPolicy,
@@ -21,6 +23,18 @@ const MAX_MANAGED_SERVICES: usize = 8;
 const MAX_DEPENDENTS: usize = 8;
 const SUPERVISOR_RECV_BUDGET_TICKS: u64 = 1;
 const SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS: u64 = 1;
+
+#[cfg(test)]
+fn map_task_status(status: yarm::kernel::task::TaskStatus) -> TaskStatus {
+    match status {
+        yarm::kernel::task::TaskStatus::Runnable => TaskStatus::Runnable,
+        yarm::kernel::task::TaskStatus::Running => TaskStatus::Running,
+        yarm::kernel::task::TaskStatus::Blocked(_) => TaskStatus::Blocked,
+        yarm::kernel::task::TaskStatus::Faulted => TaskStatus::Faulted,
+        yarm::kernel::task::TaskStatus::Exited(code) => TaskStatus::Exited(code),
+        yarm::kernel::task::TaskStatus::Dead => TaskStatus::Dead,
+    }
+}
 
 fn init_alert_message(sender_tid: u64, alert: InitAlert) -> Result<Message, ()> {
     Message::with_header(
@@ -794,7 +808,7 @@ mod tests {
     use super::*;
     use yarm::std::thread;
         use yarm::kernel::boot::Bootstrap;
-    use yarm::kernel::task::{TaskClass, TaskStatus};
+    use yarm::kernel::task::TaskClass;
     use yarm::kernel::vm::PAGE_SIZE;
     use crate::control_plane::init::{CoreServiceGraph, CoreServiceImagePlan, InitService};
     use yarm_ipc_abi::supervisor_abi::{
@@ -913,7 +927,7 @@ mod tests {
             if supervisor
                 .status_for(tracked_tid)
                 .is_some_and(|status| status.pending_restart_due == 0 && !status.pending_redelegation)
-                && kernel.task_status(tracked_tid) == Some(TaskStatus::Runnable)
+                && kernel.task_status(tracked_tid).map(map_task_status) == Some(TaskStatus::Runnable)
             {
                 supervisor.test_set_disable_budgeted_receive_for_tracked_tid(None);
                 return total_changed;
@@ -1078,10 +1092,10 @@ mod tests {
             }
             _ => panic!("expected scheduled restart"),
         }
-        assert_eq!(kernel.task_status(2), Some(TaskStatus::Exited(9)));
+        assert_eq!(kernel.task_status(2).map(map_task_status), Some(TaskStatus::Exited(9)));
         supervisor.run_until_idle(&mut kernel).expect("idle");
         assert_eq!(supervisor.current_tick(), TickInstant(10));
-        assert_eq!(kernel.task_status(2), Some(TaskStatus::Runnable));
+        assert_eq!(kernel.task_status(2).map(map_task_status), Some(TaskStatus::Runnable));
     }
 
     #[test]
@@ -1248,7 +1262,10 @@ mod tests {
                     },
                 )
                 .expect("schedule");
-            assert_eq!(kernel.task_status(20), Some(TaskStatus::Exited(11)));
+            assert_eq!(
+                kernel.task_status(20).map(map_task_status),
+                Some(TaskStatus::Exited(11))
+            );
             assert_eq!(kernel.task_class(20), Some(TaskClass::Driver));
             restore_delegation_owner_context(&mut kernel, owner_tid);
             let handled =
@@ -1264,7 +1281,10 @@ mod tests {
                 );
             assert!(handled >= 1);
             assert!(!supervisor.pending_redelegation(20));
-            assert_eq!(kernel.task_status(20), Some(TaskStatus::Runnable));
+            assert_eq!(
+                kernel.task_status(20).map(map_task_status),
+                Some(TaskStatus::Runnable)
+            );
         });
     }
 
@@ -1405,7 +1425,7 @@ mod tests {
             .run_live_for_ticks(&mut kernel, 10)
             .expect("live");
         assert!(handled >= 1);
-        assert_eq!(kernel.task_status(2), Some(TaskStatus::Runnable));
+        assert_eq!(kernel.task_status(2).map(map_task_status), Some(TaskStatus::Runnable));
     }
 
     #[test]

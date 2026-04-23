@@ -105,3 +105,15 @@ pub mod time {
         }
     }
 }
+
+pub mod task {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TaskStatus {
+        Runnable,
+        Running,
+        Blocked,
+        Faulted,
+        Exited(u64),
+        Dead,
+    }
+}
