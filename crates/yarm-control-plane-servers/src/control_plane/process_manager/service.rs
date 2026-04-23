@@ -22,7 +22,7 @@ use yarm_user_rt::process::{
     ProcessError as ProcessManagerError, ProcessId, ProcessManagerOps, WaitResult,
 };
 #[cfg(test)]
-use yarm_user_rt::runtime::RuntimeStateAccess;
+use yarm_user_rt::runtime::{KernelIpcError, RuntimeStateAccess};
 #[cfg(test)]
 use yarm_user_rt::syscall::SyscallError;
 use yarm_user_rt::task::TaskClass;
@@ -496,28 +496,52 @@ pub struct ProcessManagerLoopSummary {
 
 #[cfg(test)]
 fn map_kernel_ipc_err<T>(result: Result<T, KernelError>) -> Result<T, ProcessManagerError> {
-    result.map_err(map_kernel_ipc_error)
+    result.map_err(|err| map_kernel_ipc_error(from_kernel_ipc_error(err)))
 }
 
 #[cfg(test)]
-fn map_kernel_ipc_error(err: KernelError) -> ProcessManagerError {
+fn from_kernel_ipc_error(err: KernelError) -> KernelIpcError {
     match err {
-        KernelError::MissingRight => ProcessManagerError::PermissionDenied,
-        KernelError::WouldBlock => ProcessManagerError::WouldBlock,
+        KernelError::MissingRight => KernelIpcError::MissingRight,
+        KernelError::WouldBlock => KernelIpcError::WouldBlock,
         KernelError::CapabilityFull
-        | KernelError::EndpointFull
-        | KernelError::EndpointQueueFull
-        | KernelError::TaskTableFull
-        | KernelError::MemoryObjectFull
-        | KernelError::SchedulerFull
-        | KernelError::VmFull => ProcessManagerError::TableFull,
+            => KernelIpcError::CapabilityFull,
+        KernelError::EndpointFull => KernelIpcError::EndpointFull,
+        KernelError::EndpointQueueFull => KernelIpcError::EndpointQueueFull,
+        KernelError::TaskTableFull => KernelIpcError::TaskTableFull,
+        KernelError::MemoryObjectFull => KernelIpcError::MemoryObjectFull,
+        KernelError::SchedulerFull => KernelIpcError::SchedulerFull,
+        KernelError::VmFull => KernelIpcError::VmFull,
         KernelError::InvalidCapability
-        | KernelError::WrongObject
-        | KernelError::StaleCapability
-        | KernelError::UserMemoryFault
-        | KernelError::TaskMissing
-        | KernelError::MemoryObjectMissing
-        | KernelError::Vm(_) => ProcessManagerError::Malformed,
+            => KernelIpcError::InvalidCapability,
+        KernelError::WrongObject => KernelIpcError::WrongObject,
+        KernelError::StaleCapability => KernelIpcError::StaleCapability,
+        KernelError::UserMemoryFault => KernelIpcError::UserMemoryFault,
+        KernelError::TaskMissing => KernelIpcError::TaskMissing,
+        KernelError::MemoryObjectMissing => KernelIpcError::MemoryObjectMissing,
+        KernelError::Vm(_) => KernelIpcError::VmFault,
+    }
+}
+
+#[cfg(test)]
+fn map_kernel_ipc_error(err: KernelIpcError) -> ProcessManagerError {
+    match err {
+        KernelIpcError::MissingRight => ProcessManagerError::PermissionDenied,
+        KernelIpcError::WouldBlock => ProcessManagerError::WouldBlock,
+        KernelIpcError::CapabilityFull
+        | KernelIpcError::EndpointFull
+        | KernelIpcError::EndpointQueueFull
+        | KernelIpcError::TaskTableFull
+        | KernelIpcError::MemoryObjectFull
+        | KernelIpcError::SchedulerFull
+        | KernelIpcError::VmFull => ProcessManagerError::TableFull,
+        KernelIpcError::InvalidCapability
+        | KernelIpcError::WrongObject
+        | KernelIpcError::StaleCapability
+        | KernelIpcError::UserMemoryFault
+        | KernelIpcError::TaskMissing
+        | KernelIpcError::MemoryObjectMissing
+        | KernelIpcError::VmFault => ProcessManagerError::Malformed,
     }
 }
 
@@ -883,7 +907,7 @@ fn synthetic_roundtrip_call_reply_with_budget(
         client_recv_cap,
         request,
         recv_timeout_ticks,
-        map_kernel_ipc_error,
+        |err| map_kernel_ipc_error(from_kernel_ipc_error(err)),
         || ProcessManagerError::Malformed,
         || ProcessManagerError::Malformed,
     )
@@ -1195,11 +1219,11 @@ mod tests {
     #[test]
     fn process_manager_ipc_error_mapping_covers_policy_budget_and_transport_paths() {
         assert_eq!(
-            map_kernel_ipc_error(KernelError::MissingRight),
+            map_kernel_ipc_error(KernelIpcError::MissingRight),
             ProcessManagerError::PermissionDenied
         );
         assert_eq!(
-            map_kernel_ipc_error(KernelError::CapabilityFull),
+            map_kernel_ipc_error(KernelIpcError::CapabilityFull),
             ProcessManagerError::TableFull
         );
         assert_eq!(

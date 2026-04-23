@@ -57,6 +57,26 @@ pub mod runtime {
         pub task_id: u64,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum KernelIpcError {
+        MissingRight,
+        WouldBlock,
+        CapabilityFull,
+        EndpointFull,
+        EndpointQueueFull,
+        TaskTableFull,
+        MemoryObjectFull,
+        SchedulerFull,
+        VmFull,
+        InvalidCapability,
+        WrongObject,
+        StaleCapability,
+        UserMemoryFault,
+        TaskMissing,
+        MemoryObjectMissing,
+        VmFault,
+    }
+
     pub trait RuntimeStateAccess<State> {
         fn with_state<R, F>(&self, f: F) -> R
         where
