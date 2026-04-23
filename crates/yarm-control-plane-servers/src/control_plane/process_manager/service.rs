@@ -10,7 +10,9 @@ use yarm::kernel::capabilities::CapId;
 use yarm_user_rt::ipc::Message;
 use yarm::kernel::process::{ProcessId, ProcessManager, ProcessManagerError};
 #[cfg(test)]
-use yarm::kernel::syscall::SyscallError;
+use yarm::kernel::syscall::SyscallError as KernelSyscallError;
+#[cfg(test)]
+use yarm_user_rt::syscall::SyscallError;
 use yarm::kernel::task::TaskClass;
 #[cfg(test)]
 use yarm::runtime::SharedKernel;
@@ -433,8 +435,24 @@ fn map_kernel_ipc_error(err: KernelError) -> ProcessManagerError {
 #[cfg(test)]
 fn map_trap_ipc_error(err: TrapHandleError) -> ProcessManagerError {
     match err {
-        TrapHandleError::Syscall(syscall_err) => map_syscall_error(syscall_err),
+        TrapHandleError::Syscall(syscall_err) => map_syscall_error(map_kernel_syscall_error(syscall_err)),
         TrapHandleError::MissingTrapFrame => ProcessManagerError::InvalidTransport,
+    }
+}
+
+#[cfg(test)]
+fn map_kernel_syscall_error(err: KernelSyscallError) -> SyscallError {
+    match err {
+        KernelSyscallError::InvalidNumber => SyscallError::InvalidNumber,
+        KernelSyscallError::InvalidArgs => SyscallError::InvalidArgs,
+        KernelSyscallError::InvalidCapability => SyscallError::InvalidCapability,
+        KernelSyscallError::MissingRight => SyscallError::MissingRight,
+        KernelSyscallError::WrongObject => SyscallError::WrongObject,
+        KernelSyscallError::QueueFull => SyscallError::QueueFull,
+        KernelSyscallError::WouldBlock => SyscallError::WouldBlock,
+        KernelSyscallError::PageFault => SyscallError::PageFault,
+        KernelSyscallError::TimedOut => SyscallError::TimedOut,
+        KernelSyscallError::Internal => SyscallError::Internal,
     }
 }
 
@@ -1098,11 +1116,11 @@ mod tests {
             ProcessManagerError::InvalidTransport
         );
         assert_eq!(
-            map_trap_ipc_error(TrapHandleError::Syscall(SyscallError::InvalidArgs)),
+            map_trap_ipc_error(TrapHandleError::Syscall(KernelSyscallError::InvalidArgs)),
             ProcessManagerError::Malformed
         );
         assert_eq!(
-            map_trap_ipc_error(TrapHandleError::Syscall(SyscallError::Internal)),
+            map_trap_ipc_error(TrapHandleError::Syscall(KernelSyscallError::Internal)),
             ProcessManagerError::TableFull
         );
     }

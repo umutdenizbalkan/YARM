@@ -20,6 +20,21 @@ pub mod ipc {
 
 pub mod syscall {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(usize)]
+    pub enum SyscallError {
+        InvalidNumber = 1,
+        InvalidArgs = 2,
+        InvalidCapability = 3,
+        MissingRight = 4,
+        WrongObject = 5,
+        QueueFull = 6,
+        WouldBlock = 7,
+        PageFault = 8,
+        TimedOut = 9,
+        Internal = 255,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Error {
         Unsupported,
     }
