@@ -11,6 +11,7 @@ macro_rules! user_log {
 }
 
 pub mod ipc {
+    pub use yarm_kernel::ipc::{IpcError, Message, SharedMemoryRegion, ThreadId, TransferCapId};
     pub use yarm_ipc_abi::vfs_abi::{
         OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
         VFS_OP_WRITE,

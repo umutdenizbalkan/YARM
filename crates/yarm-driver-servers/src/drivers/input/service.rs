@@ -52,7 +52,7 @@ pub fn run() {
     let mut s = InputService::new();
     s.push_event(true);
     let stats = s.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "input.srv online: events={}, dropped_events={}",
         stats.events,
         stats.dropped_events

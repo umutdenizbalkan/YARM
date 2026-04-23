@@ -3,6 +3,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod fs;
 pub use fs::{blkcache, common, devfs, ext4, fat, initramfs, ramfs};
 

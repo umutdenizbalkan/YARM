@@ -7,3 +7,4 @@ edition = "2024"
 
 [dependencies]
 yarm-ipc-abi = { path = "../yarm-ipc-abi" }
+yarm-kernel = { path = "../yarm-kernel" }

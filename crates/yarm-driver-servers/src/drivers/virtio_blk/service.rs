@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::ipc::Message;
+use yarm_user_rt::ipc::Message;
 use yarm_fs_servers::common::vfs_ipc::{FilesystemService, VfsError};
 
 use super::device::{
@@ -94,7 +94,7 @@ pub fn run() {
     let _ = svc.dispatch(read_msg).expect("read rep");
     let _ = svc.dispatch(write_msg).expect("write rep");
     let (reads, writes) = svc.stats();
-    yarm::yarm_log!("virtio_blk.srv demo: reads={}, writes={}", reads, writes);
+    yarm_user_rt::user_log!("virtio_blk.srv demo: reads={}, writes={}", reads, writes);
 }
 
 #[cfg(test)]

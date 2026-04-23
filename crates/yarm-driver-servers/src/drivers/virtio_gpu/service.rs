@@ -49,7 +49,7 @@ pub fn run() {
     s.mode_set();
     s.commit_frame();
     let stats = s.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "virtio_gpu.srv online: frame_commits={}, mode_sets={}, rejected_commits={}",
         stats.frame_commits,
         stats.mode_sets,

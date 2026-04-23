@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::ipc::Message;
+use yarm_user_rt::ipc::Message;
 use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
     OpenAtRequest, ReadWriteRequest, openat_message, read_message, statx_message, write_message,
@@ -92,7 +92,7 @@ pub fn run() {
     let mut svc = InitramfsService::with_backend(InitramfsBackend::new(8192));
     let summary = run_request_loop(&mut svc).expect("initramfs loop");
 
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "initramfs.srv request-loop ready: fd={}, read_len={}, statx={}, write_allowed={}, handled={}, opens={}, reads={}, statx_calls={}, errors={}",
         summary.fd,
         summary.read_len,

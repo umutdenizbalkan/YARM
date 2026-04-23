@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::ipc::Message;
+use yarm_user_rt::ipc::Message;
 use super::super::common::vfs_ipc::{FilesystemService, VfsError};
 
 const MAX_CACHE_LINES: usize = 16;
@@ -234,7 +234,7 @@ pub fn run() {
     let _ = svc.dispatch(get).expect("get rep");
     let _ = svc.dispatch(flush).expect("flush rep");
     let (puts, gets, evictions) = svc.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "blkcache.srv demo: puts={}, gets={}, evictions={}",
         puts,
         gets,

@@ -34,8 +34,8 @@ dependencies = [
 name = "yarm-driver-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
  "yarm-fs-servers",
+ "yarm-user-rt",
 ]
 
 [[package]]
@@ -46,9 +46,9 @@ version = "0.1.0"
 name = "yarm-fs-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
  "yarm-ipc-abi",
  "yarm-srv-common",
+ "yarm-user-rt",
 ]
 
 [[package]]
@@ -105,4 +105,5 @@ name = "yarm-user-rt"
 version = "0.1.0"
 dependencies = [
  "yarm-ipc-abi",
+ "yarm-kernel",
 ]

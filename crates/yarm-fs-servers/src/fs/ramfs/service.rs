@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::ipc::Message;
+use yarm_user_rt::ipc::Message;
 use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, read_message, statx_message,
@@ -89,7 +89,7 @@ pub fn run() {
     let mut svc = RamFsService::with_backend(RamFsBackend::new());
     let summary = run_request_loop(&mut svc).expect("ramfs loop");
 
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "ramfs.srv request-loop ready: fd={}, read_len={}, statx={}, handled={}, opens={}, reads={}, writes={}, bytes_read={}, bytes_written={}, errors={}",
         summary.fd,
         summary.read_len,
@@ -107,7 +107,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::kernel::ipc::Message;
+    use yarm_user_rt::ipc::Message;
     use super::super::super::common::vfs_ipc::{
         CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_message,
         statx_message,

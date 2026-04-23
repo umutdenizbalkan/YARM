@@ -72,7 +72,7 @@ pub fn run() {
     let mut svc = IrqMuxService::new();
     let _ = svc.route_irq(1, true);
     let s = svc.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "irqmux.srv online: routed_irqs={}, dropped_irqs={}, masked_irqs={}",
         s.routed_irqs,
         s.dropped_irqs,

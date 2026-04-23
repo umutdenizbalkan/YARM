@@ -55,7 +55,7 @@ pub fn run() {
     let mut svc = UartService::new();
     svc.write(4);
     let s = svc.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "uart.srv online: tx_bytes={}, rx_bytes={}, dropped_tx_bytes={}",
         s.tx_bytes,
         s.rx_bytes,

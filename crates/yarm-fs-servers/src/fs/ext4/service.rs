@@ -47,7 +47,7 @@ pub fn run() {
         .expect("decode stat")
         .as_u64();
 
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "ext4.srv demo: fd={}, file_len={}, handled={}",
         fd,
         file_len,

@@ -43,7 +43,7 @@ pub fn run() {
     let len = VfsReply::from_opcode_payload_checked(stat_rep.opcode, stat_rep.as_slice())
         .expect("decode stat")
         .as_u64();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "fat.srv demo: fd={}, len={}, handled={}",
         fd,
         len,

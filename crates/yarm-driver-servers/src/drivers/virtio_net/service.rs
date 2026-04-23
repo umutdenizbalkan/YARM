@@ -57,7 +57,7 @@ pub fn run() {
     let mut s = VirtioNetService::new();
     s.enqueue_tx(1);
     let stats = s.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "virtio_net.srv online: tx_packets={}, rx_packets={}, dropped_tx_packets={}",
         stats.tx_packets,
         stats.rx_packets,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::ipc::Message;
+use yarm_user_rt::ipc::Message;
 use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
     OpenAtRequest, ReadWriteRequest, openat_message, statx_message, write_message,
@@ -99,7 +99,7 @@ pub fn run() {
     let mut svc = DevFsService::with_backend(DevFsBackend::default());
     let summary = run_request_loop(&mut svc).expect("devfs loop");
 
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "devfs.srv request-loop ready: console_fd={}, null_fd={}, handled={}, opens={}, writes={}, statx={}, errors={}",
         summary.console_fd,
         summary.null_fd,

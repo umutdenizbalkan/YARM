@@ -311,7 +311,7 @@ pub fn build_core_service_elf_launch_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::std::vec::Vec;
+    use alloc::vec::Vec;
 
     fn encode_manifest(entries: &[ManifestEntryWire]) -> Vec<u8> {
         let mut out =
