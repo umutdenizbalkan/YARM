@@ -392,7 +392,7 @@ impl SupervisorService {
 
     fn handle_control_request(
         &mut self,
-        kernel: &mut KernelState,
+        outbound_ops: &mut impl SupervisorOutboundMessageOps,
         request: Message,
     ) -> Result<(), KernelError> {
         match request.opcode {
@@ -452,8 +452,7 @@ impl SupervisorService {
                     .ok_or(KernelError::WrongObject)?;
                 let record = self.find_record(req.tid).ok_or(KernelError::TaskMissing)?;
                 let reply_cap = request.transferred_cap().map(|cap| CapId(cap.0));
-                let mut outbound_ops = KernelSupervisorOutboundMessageOps::new(kernel);
-                self.send_status_reply(&mut outbound_ops, self.status_reply(record), reply_cap)?;
+                self.send_status_reply(outbound_ops, self.status_reply(record), reply_cap)?;
             }
             SUPERVISOR_OP_ACK_REDELEGATION => {
                 let req = RedelegationAckRequest::decode(request.as_slice())
@@ -584,7 +583,8 @@ impl SupervisorService {
         while let Some(request) =
             self.recv_with_budget(kernel, self.handoff.supervisor_control_recv_cap)?
         {
-            self.handle_control_request(kernel, request)?;
+            let mut outbound_ops = KernelSupervisorOutboundMessageOps::new(kernel);
+            self.handle_control_request(&mut outbound_ops, request)?;
             changed += 1;
         }
         while let Some(message) =
@@ -1325,14 +1325,16 @@ mod tests {
                 .encode(),
             )
             .expect("driver registration");
+            let mut outbound_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
             supervisor
-                .handle_control_request(&mut kernel, register_vfs)
+                .handle_control_request(&mut outbound_ops, register_vfs)
                 .expect("register vfs");
             kernel
                 .register_task_with_class(3, to_kernel_task_class(TaskClass::SystemServer))
                 .expect("task 3");
+            let mut outbound_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
             supervisor
-                .handle_control_request(&mut kernel, register_driver)
+                .handle_control_request(&mut outbound_ops, register_driver)
                 .expect("register driver");
             kernel
                 .register_task_with_class(20, to_kernel_task_class(TaskClass::Driver))
@@ -1580,12 +1582,14 @@ mod tests {
                 .encode(),
             )
             .expect("driver registration");
+            let mut outbound_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
             supervisor
-                .handle_control_request(&mut kernel, register_vfs)
+                .handle_control_request(&mut outbound_ops, register_vfs)
                 .expect("register vfs");
             kernel.register_task(3).expect("task 3");
+            let mut outbound_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
             supervisor
-                .handle_control_request(&mut kernel, register_driver)
+                .handle_control_request(&mut outbound_ops, register_driver)
                 .expect("register driver");
             kernel
                 .register_task_with_class(20, to_kernel_task_class(TaskClass::Driver))
