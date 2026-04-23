@@ -43,3 +43,44 @@ pub mod runtime {
         StartupContext { task_id: 0 }
     }
 }
+
+pub mod time {
+    use core::ops::{Add, Sub};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct TickInstant(pub u64);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct TickDuration(pub u64);
+
+    impl Add<TickDuration> for TickInstant {
+        type Output = TickInstant;
+
+        fn add(self, rhs: TickDuration) -> Self::Output {
+            TickInstant(self.0.wrapping_add(rhs.0))
+        }
+    }
+
+    impl Sub for TickInstant {
+        type Output = TickDuration;
+
+        fn sub(self, rhs: Self) -> Self::Output {
+            TickDuration(self.0.wrapping_sub(rhs.0))
+        }
+    }
+
+    impl Add for TickDuration {
+        type Output = TickDuration;
+
+        fn add(self, rhs: Self) -> Self::Output {
+            TickDuration(self.0.wrapping_add(rhs.0))
+        }
+    }
+
+    impl TickDuration {
+        #[inline]
+        pub const fn has_elapsed_since(self, start: TickInstant, now: TickInstant) -> bool {
+            now.0.wrapping_sub(start.0) >= self.0
+        }
+    }
+}
