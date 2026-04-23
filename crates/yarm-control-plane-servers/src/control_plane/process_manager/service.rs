@@ -879,22 +879,24 @@ fn synthetic_elf_image(image_id: u64) -> [u8; 128] {
 
 #[cfg(test)]
 fn roundtrip_ipc(
-    kernel: &mut KernelState,
+    runtime: &impl RuntimeStateAccess<KernelState>,
     service: &mut ProcessService,
     client_send_cap: CapId,
     server_recv_cap: CapId,
     client_recv_cap: CapId,
     request: Message,
 ) -> Result<Message, ProcessManagerError> {
-    synthetic_roundtrip_call_reply_with_budget(
-        kernel,
-        service,
-        client_send_cap,
-        server_recv_cap,
-        client_recv_cap,
-        request,
-        PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS,
-    )
+    runtime.with_state(|kernel| {
+        synthetic_roundtrip_call_reply_with_budget(
+            kernel,
+            service,
+            client_send_cap,
+            server_recv_cap,
+            client_recv_cap,
+            request,
+            PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1020,31 +1022,33 @@ pub fn run_request_loop(
 
 #[cfg(test)]
 pub fn run_request_loop_over_kernel_ipc(
-    kernel: &mut KernelState,
+    runtime: &impl RuntimeStateAccess<KernelState>,
     service: &mut ProcessService,
     parent_pid: u64,
     image_id: u64,
     exit_code: u64,
 ) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
     run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
-        kernel, service, parent_pid, image_id, exit_code, None,
+        runtime, service, parent_pid, image_id, exit_code, None,
     )
 }
 
 #[cfg(test)]
 fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
-    kernel: &mut KernelState,
+    runtime: &impl RuntimeStateAccess<KernelState>,
     service: &mut ProcessService,
     parent_pid: u64,
     image_id: u64,
     exit_code: u64,
     requested_cnode_slots: Option<usize>,
 ) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
-    let (_, client_send_cap, server_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(8))?;
-    let (_, _, client_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(8))?;
+    let (_, client_send_cap, server_recv_cap) =
+        runtime.with_state(|kernel| map_kernel_ipc_err(kernel.create_endpoint(8)))?;
+    let (_, _, client_recv_cap) =
+        runtime.with_state(|kernel| map_kernel_ipc_err(kernel.create_endpoint(8)))?;
 
     let spawn_reply = roundtrip_ipc(
-        kernel,
+        runtime,
         service,
         client_send_cap,
         server_recv_cap,
@@ -1066,13 +1070,15 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
         return Err(ProcessManagerError::Malformed);
     }
     if let Some(requested_slots) = recorded_requested_slots.or(requested_cnode_slots) {
-        kernel
-            .control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)
-            .map_err(|err| map_trap_ipc_error(from_kernel_trap_ipc_error(err)))?;
+        runtime.with_state(|kernel| {
+            kernel
+                .control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)
+                .map_err(|err| map_trap_ipc_error(from_kernel_trap_ipc_error(err)))
+        })?;
     }
 
     let _ = roundtrip_ipc(
-        kernel,
+        runtime,
         service,
         client_send_cap,
         server_recv_cap,
@@ -1088,7 +1094,7 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
     )?;
 
     let wait_reply = roundtrip_ipc(
-        kernel,
+        runtime,
         service,
         client_send_cap,
         server_recv_cap,
@@ -1121,16 +1127,14 @@ pub fn run_request_loop_over_runtime_state_with_cnode_resize(
     exit_code: u64,
     requested_cnode_slots: usize,
 ) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
-    runtime.with_state(|state| {
-        run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
-            state,
-            service,
-            parent_pid,
-            image_id,
-            exit_code,
-            Some(requested_cnode_slots),
-        )
-    })
+    run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
+        runtime,
+        service,
+        parent_pid,
+        image_id,
+        exit_code,
+        Some(requested_cnode_slots),
+    )
 }
 
 pub fn run() {
