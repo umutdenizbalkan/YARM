@@ -24,6 +24,8 @@ use yarm_user_rt::process::{
     ProcessError as ProcessManagerError, ProcessId, ProcessManagerOps, WaitResult,
 };
 #[cfg(test)]
+use yarm_user_rt::runtime::RuntimeStateAccess;
+#[cfg(test)]
 use yarm_user_rt::syscall::SyscallError;
 use yarm_user_rt::task::TaskClass;
 
@@ -1081,15 +1083,37 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
 }
 
 #[cfg(test)]
-pub fn run_request_loop_over_shared_kernel_with_cnode_resize(
-    kernel: &SharedKernel,
+struct SharedKernelStateAccess<'a> {
+    kernel: &'a SharedKernel,
+}
+
+#[cfg(test)]
+impl<'a> SharedKernelStateAccess<'a> {
+    const fn new(kernel: &'a SharedKernel) -> Self {
+        Self { kernel }
+    }
+}
+
+#[cfg(test)]
+impl RuntimeStateAccess<KernelState> for SharedKernelStateAccess<'_> {
+    fn with_state<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut KernelState) -> R,
+    {
+        self.kernel.with(f)
+    }
+}
+
+#[cfg(test)]
+pub fn run_request_loop_over_runtime_state_with_cnode_resize(
+    runtime: &impl RuntimeStateAccess<KernelState>,
     service: &mut ProcessService,
     parent_pid: u64,
     image_id: u64,
     exit_code: u64,
     requested_cnode_slots: usize,
 ) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
-    kernel.with(|state| {
+    runtime.with_state(|state| {
         run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
             state,
             service,
@@ -1099,6 +1123,25 @@ pub fn run_request_loop_over_shared_kernel_with_cnode_resize(
             Some(requested_cnode_slots),
         )
     })
+}
+
+#[cfg(test)]
+pub fn run_request_loop_over_shared_kernel_with_cnode_resize(
+    kernel: &SharedKernel,
+    service: &mut ProcessService,
+    parent_pid: u64,
+    image_id: u64,
+    exit_code: u64,
+    requested_cnode_slots: usize,
+) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
+    run_request_loop_over_runtime_state_with_cnode_resize(
+        &SharedKernelStateAccess::new(kernel),
+        service,
+        parent_pid,
+        image_id,
+        exit_code,
+        requested_cnode_slots,
+    )
 }
 
 pub fn run() {

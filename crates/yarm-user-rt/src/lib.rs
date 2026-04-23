@@ -57,6 +57,12 @@ pub mod runtime {
         pub task_id: u64,
     }
 
+    pub trait RuntimeStateAccess<State> {
+        fn with_state<R, F>(&self, f: F) -> R
+        where
+            F: FnOnce(&mut State) -> R;
+    }
+
     #[inline]
     pub fn startup_context() -> StartupContext {
         StartupContext { task_id: 0 }
