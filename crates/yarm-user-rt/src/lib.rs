@@ -52,6 +52,8 @@ pub mod syscall {
 }
 
 pub mod runtime {
+    use crate::syscall::SyscallError;
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct StartupContext {
         pub task_id: u64,
@@ -75,6 +77,12 @@ pub mod runtime {
         TaskMissing,
         MemoryObjectMissing,
         VmFault,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TrapIpcError {
+        Syscall(SyscallError),
+        MissingTrapFrame,
     }
 
     pub trait RuntimeStateAccess<State> {

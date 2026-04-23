@@ -22,7 +22,7 @@ use yarm_user_rt::process::{
     ProcessError as ProcessManagerError, ProcessId, ProcessManagerOps, WaitResult,
 };
 #[cfg(test)]
-use yarm_user_rt::runtime::{KernelIpcError, RuntimeStateAccess};
+use yarm_user_rt::runtime::{KernelIpcError, RuntimeStateAccess, TrapIpcError};
 #[cfg(test)]
 use yarm_user_rt::syscall::SyscallError;
 use yarm_user_rt::task::TaskClass;
@@ -546,12 +546,20 @@ fn map_kernel_ipc_error(err: KernelIpcError) -> ProcessManagerError {
 }
 
 #[cfg(test)]
-fn map_trap_ipc_error(err: TrapHandleError) -> ProcessManagerError {
+fn from_kernel_trap_ipc_error(err: TrapHandleError) -> TrapIpcError {
     match err {
         TrapHandleError::Syscall(syscall_err) => {
-            map_syscall_error(map_kernel_syscall_error(syscall_err))
+            TrapIpcError::Syscall(map_kernel_syscall_error(syscall_err))
         }
-        TrapHandleError::MissingTrapFrame => ProcessManagerError::InvalidTransport,
+        TrapHandleError::MissingTrapFrame => TrapIpcError::MissingTrapFrame,
+    }
+}
+
+#[cfg(test)]
+fn map_trap_ipc_error(err: TrapIpcError) -> ProcessManagerError {
+    match err {
+        TrapIpcError::Syscall(syscall_err) => map_syscall_error(syscall_err),
+        TrapIpcError::MissingTrapFrame => ProcessManagerError::InvalidTransport,
     }
 }
 
@@ -1060,7 +1068,7 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
     if let Some(requested_slots) = recorded_requested_slots.or(requested_cnode_slots) {
         kernel
             .control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)
-            .map_err(map_trap_ipc_error)?;
+            .map_err(|err| map_trap_ipc_error(from_kernel_trap_ipc_error(err)))?;
     }
 
     let _ = roundtrip_ipc(
@@ -1227,15 +1235,19 @@ mod tests {
             ProcessManagerError::TableFull
         );
         assert_eq!(
-            map_trap_ipc_error(TrapHandleError::MissingTrapFrame),
+            map_trap_ipc_error(TrapIpcError::MissingTrapFrame),
             ProcessManagerError::InvalidTransport
         );
         assert_eq!(
-            map_trap_ipc_error(TrapHandleError::Syscall(KernelSyscallError::InvalidArgs)),
+            map_trap_ipc_error(from_kernel_trap_ipc_error(TrapHandleError::Syscall(
+                KernelSyscallError::InvalidArgs,
+            ))),
             ProcessManagerError::Malformed
         );
         assert_eq!(
-            map_trap_ipc_error(TrapHandleError::Syscall(KernelSyscallError::Internal)),
+            map_trap_ipc_error(from_kernel_trap_ipc_error(TrapHandleError::Syscall(
+                KernelSyscallError::Internal,
+            ))),
             ProcessManagerError::TableFull
         );
     }
