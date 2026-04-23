@@ -99,3 +99,10 @@ version = "0.1.0"
 dependencies = [
  "yarm",
 ]
+
+[[package]]
+name = "yarm-user-rt"
+version = "0.1.0"
+dependencies = [
+ "yarm-ipc-abi",
+]

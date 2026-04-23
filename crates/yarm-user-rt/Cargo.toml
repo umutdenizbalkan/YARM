@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "yarm-user-rt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+yarm-ipc-abi = { path = "../yarm-ipc-abi" }

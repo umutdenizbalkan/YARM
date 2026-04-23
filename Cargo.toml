@@ -21,6 +21,7 @@ members = [
     "crates/yarm-runtime-tools",
     "crates/yarm-server-runtime",
     "crates/yarm-freestanding-alloc",
+    "crates/yarm-user-rt",
 ]
 resolver = "2"
 
