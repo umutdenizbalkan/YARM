@@ -176,6 +176,11 @@ trait SupervisorRestartRedelegationOps: SupervisorOutboundMessageOps {
     ) -> Result<(), KernelError>;
 }
 
+pub trait SupervisorTaskExitOps: SupervisorOutboundMessageOps {
+    fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError>;
+    fn task_restart_token(&self, tid: u64) -> Option<u64>;
+}
+
 struct KernelSupervisorOutboundMessageOps<'a> {
     kernel: &'a mut KernelState,
 }
@@ -216,6 +221,16 @@ impl SupervisorRestartRedelegationOps for KernelSupervisorOutboundMessageOps<'_>
             iova_len: plan.iova_len,
         })?;
         Ok(())
+    }
+}
+
+impl SupervisorTaskExitOps for KernelSupervisorOutboundMessageOps<'_> {
+    fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError> {
+        self.kernel.mark_task_dead(tid)
+    }
+
+    fn task_restart_token(&self, tid: u64) -> Option<u64> {
+        self.kernel.task_restart_token(tid)
     }
 }
 
@@ -621,7 +636,8 @@ impl SupervisorService {
                 SUPERVISOR_OP_TASK_EXITED => {
                     let event = TaskExitedEvent::decode(message.as_slice())
                         .ok_or(KernelError::WrongObject)?;
-                    let _ = self.handle_task_exit(kernel, event)?;
+                    let mut task_exit_ops = KernelSupervisorOutboundMessageOps::new(kernel);
+                    let _ = self.handle_task_exit(&mut task_exit_ops, event)?;
                 }
                 SUPERVISOR_OP_TRANSFER_REVOKED => {
                     let _ = TransferRevokedEvent::decode(message.as_slice())
@@ -679,7 +695,7 @@ impl SupervisorService {
 
     pub fn handle_task_exit(
         &mut self,
-        kernel: &mut KernelState,
+        task_exit_ops: &mut impl SupervisorTaskExitOps,
         event: TaskExitedEvent,
     ) -> Result<SupervisorDecision, KernelError> {
         let Some(snapshot) = self.find_record(event.tid) else {
@@ -688,7 +704,7 @@ impl SupervisorService {
         if matches!(snapshot.kind, ManagedServiceKind::Core(kind) if CoreServicePolicyTable::restart_owner_for(kind) == RestartOwner::Init)
         {
             self.send_init_alert(
-                &mut KernelSupervisorOutboundMessageOps::new(kernel),
+                task_exit_ops,
                 InitAlert {
                     tid: event.tid,
                     kind: InitAlertKind::SupervisorRestarted,
@@ -718,10 +734,10 @@ impl SupervisorService {
             exhausted
         };
         if within_window_exhausted {
-            kernel.mark_task_dead(event.tid)?;
+            task_exit_ops.mark_task_dead(event.tid)?;
             self.degraded = true;
             self.send_init_alert(
-                &mut KernelSupervisorOutboundMessageOps::new(kernel),
+                task_exit_ops,
                 InitAlert {
                     tid: event.tid,
                     kind: InitAlertKind::ServiceDegraded,
@@ -735,7 +751,7 @@ impl SupervisorService {
 
         let due_tick = self.schedule_restart(event.tid, event.restart_token)?;
         for dependent_tid in self.dependent_tids(snapshot).into_iter().flatten() {
-            let token = kernel
+            let token = task_exit_ops
                 .task_restart_token(dependent_tid)
                 .unwrap_or(event.restart_token);
             let _ = self.schedule_restart(dependent_tid, token);
@@ -1193,9 +1209,10 @@ mod tests {
         let (mut kernel, _init, _handoff, mut supervisor) = setup_supervisor();
         supervisor.run_until_idle(&mut kernel).expect("loop");
         let token = kernel.exit_task(2, 9).expect("exit");
+        let mut task_exit_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
         let decision = supervisor
             .handle_task_exit(
-                &mut kernel,
+                &mut task_exit_ops,
                 TaskExitedEvent {
                     tid: 2,
                     exit_code: 9,
@@ -1222,9 +1239,10 @@ mod tests {
         supervisor.run_until_idle(&mut kernel).expect("loop");
         let token_vfs = kernel.exit_task(3, 1).expect("vfs exit");
         let token_proc = kernel.exit_task(2, 2).expect("proc exit");
+        let mut task_exit_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
         let _ = supervisor
             .handle_task_exit(
-                &mut kernel,
+                &mut task_exit_ops,
                 TaskExitedEvent {
                     tid: 3,
                     exit_code: 1,
@@ -1371,9 +1389,10 @@ mod tests {
             restore_delegation_owner_context(&mut kernel, owner_tid);
 
             let token = kernel.exit_task(20, 11).expect("exit");
+            let mut task_exit_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
             let _ = supervisor
                 .handle_task_exit(
-                    &mut kernel,
+                    &mut task_exit_ops,
                     TaskExitedEvent {
                         tid: 20,
                         exit_code: 11,
@@ -1414,9 +1433,10 @@ mod tests {
         supervisor.run_until_idle(&mut kernel).expect("loop");
         supervisor.policies.process_manager.max_restarts = 0;
         let token = kernel.exit_task(2, 9).expect("exit");
+        let mut task_exit_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
         let decision = supervisor
             .handle_task_exit(
-                &mut kernel,
+                &mut task_exit_ops,
                 TaskExitedEvent {
                     tid: 2,
                     exit_code: 9,
@@ -1507,9 +1527,10 @@ mod tests {
             supervisor.run_until_idle(&mut kernel).expect("loop");
 
             let token = kernel.exit_task(2, 44).expect("exit");
+            let mut task_exit_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
             let _ = supervisor
                 .handle_task_exit(
-                    &mut kernel,
+                    &mut task_exit_ops,
                     TaskExitedEvent {
                         tid: 2,
                         exit_code: 44,
@@ -1530,9 +1551,10 @@ mod tests {
         let (mut kernel, _init, _handoff, mut supervisor) = setup_supervisor();
         supervisor.run_until_idle(&mut kernel).expect("loop");
         let token = kernel.exit_task(2, 1).expect("exit");
+        let mut task_exit_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
         let _ = supervisor
             .handle_task_exit(
-                &mut kernel,
+                &mut task_exit_ops,
                 TaskExitedEvent {
                     tid: 2,
                     exit_code: 1,
@@ -1626,9 +1648,10 @@ mod tests {
             restore_delegation_owner_context(&mut kernel, owner_tid);
 
             let vfs_token = kernel.exit_task(3, 7).expect("vfs exit");
+            let mut task_exit_ops = KernelSupervisorOutboundMessageOps::new(&mut kernel);
             let _ = supervisor
                 .handle_task_exit(
-                    &mut kernel,
+                    &mut task_exit_ops,
                     TaskExitedEvent {
                         tid: 3,
                         exit_code: 7,
