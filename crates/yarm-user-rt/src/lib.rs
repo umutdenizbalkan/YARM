@@ -124,3 +124,10 @@ pub mod task {
         Dead,
     }
 }
+
+pub mod vm {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Asid(pub u16);
+
+    pub const PAGE_SIZE: usize = 4096;
+}

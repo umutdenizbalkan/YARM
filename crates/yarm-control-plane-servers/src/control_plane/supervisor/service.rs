@@ -825,8 +825,8 @@ pub fn run() {
 mod tests {
     use super::*;
     use yarm::std::thread;
-        use yarm::kernel::boot::Bootstrap;
-    use yarm::kernel::vm::PAGE_SIZE;
+    use yarm::kernel::boot::Bootstrap;
+    use yarm_user_rt::vm::PAGE_SIZE;
     use crate::control_plane::init::{CoreServiceGraph, CoreServiceImagePlan, InitService};
     use yarm_ipc_abi::supervisor_abi::{
         CoreServiceRegistrationKind, InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,

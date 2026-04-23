@@ -19,7 +19,9 @@ use yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
 use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use yarm_user_rt::capability::{CapId, CapRights};
 use yarm_user_rt::task::{TaskClass, TaskStatus};
-use yarm::kernel::vm::Asid;
+use yarm_user_rt::vm::Asid;
+#[cfg(test)]
+use yarm_user_rt::vm::PAGE_SIZE;
 use alloc::boxed::Box;
 use yarm_ipc_abi::supervisor_abi::{
     InitAlert, InitAlertKind, RegisterCoreServiceRequest, RegisterDriverRequest,
@@ -51,6 +53,14 @@ fn to_kernel_task_class(class: TaskClass) -> yarm::kernel::task::TaskClass {
         TaskClass::Driver => yarm::kernel::task::TaskClass::Driver,
         TaskClass::SystemServer => yarm::kernel::task::TaskClass::SystemServer,
     }
+}
+
+fn map_kernel_asid(asid: yarm::kernel::vm::Asid) -> Asid {
+    Asid(asid.0)
+}
+
+fn to_kernel_asid(asid: Asid) -> yarm::kernel::vm::Asid {
+    yarm::kernel::vm::Asid(asid.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,7 +227,7 @@ impl InitService {
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid,
             entry,
-            asid: Some(asid),
+            asid: Some(to_kernel_asid(asid)),
             class: to_kernel_task_class(TaskClass::SystemServer),
         })?;
         Ok(())
@@ -229,7 +239,11 @@ impl InitService {
         let (proc_asid, _proc_aspace_cap) = kernel.create_user_address_space()?;
         let (vfs_asid, _vfs_aspace_cap) = kernel.create_user_address_space()?;
         let (supervisor_asid, _supervisor_aspace_cap) = kernel.create_user_address_space()?;
-        Ok((proc_asid, vfs_asid, supervisor_asid))
+        Ok((
+            map_kernel_asid(proc_asid),
+            map_kernel_asid(vfs_asid),
+            map_kernel_asid(supervisor_asid),
+        ))
     }
 
     pub fn execute_mount_plan_with_fail_at(
@@ -1414,8 +1428,8 @@ mod tests {
                 mem_cap: mem.0,
                 iova_cap: iova.0,
                 iova_base: 0x4000,
-                dma_len: yarm::kernel::vm::PAGE_SIZE as u64,
-                iova_len: yarm::kernel::vm::PAGE_SIZE as u64,
+                dma_len: PAGE_SIZE as u64,
+                iova_len: PAGE_SIZE as u64,
             },
         )
         .expect("driver register");

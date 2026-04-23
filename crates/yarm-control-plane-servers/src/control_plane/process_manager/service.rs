@@ -322,7 +322,7 @@ fn build_exec_initial_stack(
     push_u64(&mut image, &mut cursor, 0)?;
     for (key, value) in [
         (AUXV_AT_ENTRY, entry),
-        (AUXV_AT_PAGESZ, yarm::kernel::vm::PAGE_SIZE as u64),
+        (AUXV_AT_PAGESZ, yarm_user_rt::vm::PAGE_SIZE as u64),
         (AUXV_AT_PHNUM, phdr_count as u64),
         (AUXV_AT_PHENT, phdr_entry_size as u64),
         (AUXV_AT_PHDR, phdr_addr),
