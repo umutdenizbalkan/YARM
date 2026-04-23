@@ -741,42 +741,87 @@ impl SupervisorService {
 }
 
 pub fn query_status_via_call_reply(
-    kernel: &mut KernelState,
+    supervisor_query_ops: &mut impl SupervisorStatusQueryOps,
     supervisor_control_send_cap: CapId,
     caller_reply_recv_cap: CapId,
     requester_tid: u64,
     queried_tid: u64,
     recv_timeout_ticks: u64,
 ) -> Result<SupervisorStatusReply, KernelError> {
-    let request = query_status_message(requester_tid, SupervisorStatusRequest { tid: queried_tid })
-        .map_err(|_| KernelError::WrongObject)?;
-    let caller_tid = ThreadId(kernel.current_tid().ok_or(KernelError::TaskMissing)?);
-    let reply_cap = kernel.create_reply_cap_for_caller(caller_tid, caller_reply_recv_cap, None)?;
-    let request_with_reply_cap = Message::with_header(
-        request.sender_tid.0,
-        request.opcode,
-        request.flags | Message::FLAG_CAP_TRANSFER,
-        Some(reply_cap.0),
-        request.as_slice(),
+    supervisor_query_ops.query_status_via_call_reply(
+        supervisor_control_send_cap,
+        caller_reply_recv_cap,
+        requester_tid,
+        queried_tid,
+        recv_timeout_ticks,
     )
-    .map_err(|_| KernelError::WrongObject)?;
+}
 
-    kernel.ipc_send(supervisor_control_send_cap, request_with_reply_cap)?;
-    let reply = kernel
-        .ipc_recv_with_deadline(caller_reply_recv_cap, recv_timeout_ticks)?
-        .ok_or(KernelError::WrongObject)?;
-    SupervisorStatusReply::decode(reply.as_slice()).ok_or(KernelError::WrongObject)
+pub trait SupervisorStatusQueryOps {
+    fn query_status_via_call_reply(
+        &mut self,
+        supervisor_control_send_cap: CapId,
+        caller_reply_recv_cap: CapId,
+        requester_tid: u64,
+        queried_tid: u64,
+        recv_timeout_ticks: u64,
+    ) -> Result<SupervisorStatusReply, KernelError>;
+}
+
+pub struct KernelSupervisorStatusQueryOps<'a> {
+    kernel: &'a mut KernelState,
+}
+
+impl<'a> KernelSupervisorStatusQueryOps<'a> {
+    pub fn new(kernel: &'a mut KernelState) -> Self {
+        Self { kernel }
+    }
+}
+
+impl SupervisorStatusQueryOps for KernelSupervisorStatusQueryOps<'_> {
+    fn query_status_via_call_reply(
+        &mut self,
+        supervisor_control_send_cap: CapId,
+        caller_reply_recv_cap: CapId,
+        requester_tid: u64,
+        queried_tid: u64,
+        recv_timeout_ticks: u64,
+    ) -> Result<SupervisorStatusReply, KernelError> {
+        let request =
+            query_status_message(requester_tid, SupervisorStatusRequest { tid: queried_tid })
+                .map_err(|_| KernelError::WrongObject)?;
+        let caller_tid = ThreadId(self.kernel.current_tid().ok_or(KernelError::TaskMissing)?);
+        let reply_cap =
+            self.kernel
+                .create_reply_cap_for_caller(caller_tid, caller_reply_recv_cap, None)?;
+        let request_with_reply_cap = Message::with_header(
+            request.sender_tid.0,
+            request.opcode,
+            request.flags | Message::FLAG_CAP_TRANSFER,
+            Some(reply_cap.0),
+            request.as_slice(),
+        )
+        .map_err(|_| KernelError::WrongObject)?;
+
+        self.kernel
+            .ipc_send(supervisor_control_send_cap, request_with_reply_cap)?;
+        let reply = self
+            .kernel
+            .ipc_recv_with_deadline(caller_reply_recv_cap, recv_timeout_ticks)?
+            .ok_or(KernelError::WrongObject)?;
+        SupervisorStatusReply::decode(reply.as_slice()).ok_or(KernelError::WrongObject)
+    }
 }
 
 pub fn query_status_via_call_reply_with_default_timeout(
-    kernel: &mut KernelState,
+    supervisor_query_ops: &mut impl SupervisorStatusQueryOps,
     supervisor_control_send_cap: CapId,
     caller_reply_recv_cap: CapId,
     requester_tid: u64,
     queried_tid: u64,
 ) -> Result<SupervisorStatusReply, KernelError> {
     query_status_via_call_reply(
-        kernel,
+        supervisor_query_ops,
         supervisor_control_send_cap,
         caller_reply_recv_cap,
         requester_tid,
