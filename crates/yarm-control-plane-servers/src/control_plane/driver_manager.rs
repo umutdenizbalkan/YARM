@@ -3,7 +3,7 @@
 
 use yarm::kernel::boot::{KernelError, KernelState};
 use yarm_user_rt::capability::CapId;
-use yarm::kernel::driver_abi::{
+use yarm_ipc_abi::driver_abi::{
     DRIVER_OP_GRANT_DMA, DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, DRIVER_OP_RESTARTED,
 };
 use yarm_user_rt::ipc::Message;

@@ -26,7 +26,7 @@ pub fn run_supervisor_server() {
 pub fn run_driver_manager_demo() {
     use crate::control_plane::driver_manager::DriverService;
     use yarm::kernel::boot::Bootstrap;
-    use yarm::kernel::driver_abi::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};
+    use yarm_ipc_abi::driver_abi::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};
     use yarm_user_rt::ipc::Message;
     use alloc::boxed::Box;
 
