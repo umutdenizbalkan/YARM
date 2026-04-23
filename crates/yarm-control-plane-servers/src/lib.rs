@@ -24,7 +24,7 @@ pub fn run_supervisor_server() {
 }
 
 pub fn run_driver_manager_demo() {
-    use crate::control_plane::driver_manager::DriverService;
+    use crate::control_plane::driver_manager::{DriverService, KernelDriverControl};
     use yarm::kernel::boot::Bootstrap;
     use yarm_ipc_abi::driver_abi::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};
     use yarm_user_rt::ipc::Message;
@@ -39,8 +39,9 @@ pub fn run_driver_manager_demo() {
         .expect("grant msg");
 
     let mut service = DriverService::new();
+    let mut runtime = KernelDriverControl::new(&mut kernel);
     let handled = service
-        .handle_batch(&mut kernel, [register, grant])
+        .handle_batch(&mut runtime, [register, grant])
         .expect("batch");
 
     yarm_user_rt::user_log!("driver-manager demo ready: handled={}", handled);

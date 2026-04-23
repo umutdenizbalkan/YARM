@@ -52,6 +52,7 @@ pub mod syscall {
 }
 
 pub mod runtime {
+    use crate::capability::CapId;
     use crate::syscall::SyscallError;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,20 @@ pub mod runtime {
         fn with_state<R, F>(&self, f: F) -> R
         where
             F: FnOnce(&mut State) -> R;
+    }
+
+    pub trait DriverControlOps {
+        fn register_driver(&mut self, tid: u64) -> Result<(), KernelIpcError>;
+        fn mint_irq_cap(&mut self, line: u16) -> Result<CapId, KernelIpcError>;
+        fn grant_driver_irq(&mut self, tid: u64, cap: CapId) -> Result<(), KernelIpcError>;
+        fn mint_dma_region_cap(
+            &mut self,
+            mem_cap: CapId,
+            offset: usize,
+            len: usize,
+        ) -> Result<CapId, KernelIpcError>;
+        fn grant_driver_dma(&mut self, tid: u64, cap: CapId) -> Result<(), KernelIpcError>;
+        fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelIpcError>;
     }
 
     #[inline]
