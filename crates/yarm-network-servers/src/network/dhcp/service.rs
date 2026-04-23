@@ -39,7 +39,7 @@ pub fn run() {
     let mut svc = DhcpService::new();
     svc.grant_lease(false);
     let s = svc.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "dhcp.srv online: leases_granted={}, lease_renewals={}",
         s.leases_granted,
         s.lease_renewals

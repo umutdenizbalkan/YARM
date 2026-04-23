@@ -39,7 +39,7 @@ pub fn run() {
     let mut svc = DnsService::new();
     svc.resolve(false);
     let s = svc.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "dns.srv online: cache_hits={}, upstream_queries={}",
         s.cache_hits,
         s.upstream_queries

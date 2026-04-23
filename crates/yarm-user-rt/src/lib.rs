@@ -3,6 +3,13 @@
 
 #![no_std]
 
+#[macro_export]
+macro_rules! user_log {
+    ($($arg:tt)*) => {{
+        let _ = core::format_args!($($arg)*);
+    }};
+}
+
 pub mod ipc {
     pub use yarm_ipc_abi::vfs_abi::{
         OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,

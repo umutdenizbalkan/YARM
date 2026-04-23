@@ -39,7 +39,7 @@ pub fn run() {
     let mut svc = TcpIpService::new();
     svc.route_packet(true);
     let s = svc.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "tcpip.srv online: routed_packets={}, dropped_packets={}",
         s.routed_packets,
         s.dropped_packets

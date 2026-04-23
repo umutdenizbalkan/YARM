@@ -39,7 +39,7 @@ pub fn run() {
     let mut svc = NetmgrService::new();
     svc.mark_link(true);
     let s = svc.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "netmgr.srv online: links_up={}, links_down={}",
         s.links_up,
         s.links_down

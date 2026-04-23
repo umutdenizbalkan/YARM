@@ -30,7 +30,7 @@ impl CompositorService {
 pub fn run() {
     let mut svc = CompositorService::new();
     svc.compose();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "compositor.srv online: composed_frames={}",
         svc.stats().composed_frames
     );

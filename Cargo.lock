@@ -63,7 +63,7 @@ version = "0.1.0"
 name = "yarm-network-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
+ "yarm-user-rt",
 ]
 
 [[package]]
@@ -97,7 +97,7 @@ dependencies = [
 name = "yarm-ui-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
+ "yarm-user-rt",
 ]
 
 [[package]]

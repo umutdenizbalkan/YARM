@@ -51,8 +51,8 @@ pub fn run() {
     svc.mode_set();
     svc.present();
     let s = svc.stats();
-    yarm::yarm_log!("{}", BOOT_TO_SHELL_MARKER);
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!("{}", BOOT_TO_SHELL_MARKER);
+    yarm_user_rt::user_log!(
         "display.srv online: mode_sets={}, frame_presents={}, rejected_presents={}",
         s.mode_sets,
         s.frame_presents,

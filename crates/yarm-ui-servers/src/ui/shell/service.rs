@@ -32,7 +32,7 @@ impl ShellService {
 pub fn run() {
     let mut s = ShellService::new();
     s.start_session();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "shell.srv online: sessions_started={}",
         s.stats().sessions_started
     );

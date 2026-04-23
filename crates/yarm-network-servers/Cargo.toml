@@ -8,10 +8,10 @@ autobins = false
 
 [features]
 default = ["hosted-dev"]
-hosted-dev = ["yarm/hosted-dev"]
+hosted-dev = []
 
 [dependencies]
-yarm = { path = "../..", default-features = false }
+yarm-user-rt = { path = "../yarm-user-rt" }
 
 [lib]
 path = "src/lib.rs"

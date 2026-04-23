@@ -89,7 +89,7 @@ pub fn run() {
     let mut svc = SocketAdapterService::new();
     let fd = svc.open(2, 1, 0).expect("socket open");
     let s = svc.stats();
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "socket.srv online: fd={}, opens={}, closes={}",
         fd,
         s.opens,
