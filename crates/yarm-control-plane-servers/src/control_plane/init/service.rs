@@ -5,17 +5,17 @@ use super::super::process_manager::service::ProcessService;
 use super::super::process_manager::service::run_request_loop as run_process_manager_request_loop;
 use super::super::supervisor::SupervisorService;
 use super::super::vfs::service::run_request_loop as run_vfs_request_loop;
-use crate::yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
-use crate::yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
-use crate::yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
-use crate::yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
-use crate::yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
-use yarm::init::{
+use yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
+use yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
+use yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
+use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
+use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
+use crate::control_plane::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitService,
 };
 use yarm::kernel::boot::{KernelError, KernelState};
-use yarm::yarm_fs_servers::common::service::FsService;
-use yarm::yarm_fs_servers::common::vfs_ipc::InMemoryBackend;
+use yarm_fs_servers::common::service::FsService;
+use yarm_fs_servers::common::vfs_ipc::InMemoryBackend;
 use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +64,9 @@ impl Default for InitRuntimeBootConfig<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitRuntimeSummary {
     pub phase: InitBootPhase,
-    pub handles: yarm::init::CoreServiceHandles,
+    pub handles: crate::control_plane::init::CoreServiceHandles,
     pub seeded_registrations: usize,
-    pub mount_report: yarm::init::MountRecoveryReport,
+    pub mount_report: crate::control_plane::init::MountRecoveryReport,
     pub present_cpus: usize,
     pub present_cpu_bitmap: u64,
     pub online_cpus: usize,
@@ -128,7 +128,7 @@ pub struct MinimumRunnableProfileSummary {
     pub devfs_handled: usize,
     pub initramfs_read_opcode: u16,
     pub initramfs_handled: usize,
-    pub mount_report: yarm::init::MountRecoveryReport,
+    pub mount_report: crate::control_plane::init::MountRecoveryReport,
     pub recovered_core_services: usize,
 }
 
@@ -238,8 +238,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::yarm_fs_servers::initramfs::ManifestEntryWire;
-    use crate::yarm_fs_servers::initramfs::{
+    use yarm_fs_servers::initramfs::ManifestEntryWire;
+    use yarm_fs_servers::initramfs::{
         INITRAMFS_INIT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR, INITRAMFS_SUPERVISOR_PATH_PTR,
         INITRAMFS_VFS_PATH_PTR,
     };

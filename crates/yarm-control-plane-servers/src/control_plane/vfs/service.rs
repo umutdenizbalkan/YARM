@@ -5,16 +5,16 @@
 use yarm::kernel::boot::KernelState;
 #[cfg(test)]
 use yarm::kernel::capabilities::CapId;
-use yarm::yarm_fs_servers::common::vfs_ipc::VfsError;
-use yarm::yarm_fs_servers::common::vfs_ipc::{
+use yarm_fs_servers::common::vfs_ipc::VfsError;
+use yarm_fs_servers::common::vfs_ipc::{
     InMemoryBackend, OpenAtRequest, ReadWriteRequest, StatxRequest, close_message,
     dup_message, epoll_create1_message, epoll_ctl_message, epoll_pwait_message, fcntl_message,
     ioctl_message, openat_message, poll_message, read_message, sendfile_message, statx_message,
     write_message,
 };
 #[cfg(test)]
-use yarm::yarm_fs_servers::common::vfs_ipc::VfsBackend;
-use yarm::yarm_fs_servers::common::service::FsService;
+use yarm_fs_servers::common::vfs_ipc::VfsBackend;
+use yarm_fs_servers::common::service::FsService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_srv_common::vfs_reply::VfsReply;
 
@@ -88,11 +88,11 @@ pub fn run_request_loop(
             epoll_ctl_message(epoll_fd, 1, fd, 0xA000).map_err(|_| VfsError::Malformed)?,
             epoll_pwait_message(epoll_fd, 0xB000, 4, 10).map_err(|_| VfsError::Malformed)?,
             sendfile_message(fd, dup_fd, 0xC000, 99).map_err(|_| VfsError::Malformed)?,
-            close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: dup_fd })
+            close_message(yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: dup_fd })
                 .map_err(|_| VfsError::Malformed)?,
-            close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd })
+            close_message(yarm_fs_servers::common::vfs_ipc::CloseRequest { fd })
                 .map_err(|_| VfsError::Malformed)?,
-            close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: epoll_fd })
+            close_message(yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: epoll_fd })
                 .map_err(|_| VfsError::Malformed)?,
         ],
     )?;
@@ -259,10 +259,10 @@ pub fn run_request_loop_over_kernel_ipc(
         epoll_ctl_message(epoll_fd, 1, fd, 0xA000).map_err(|_| VfsError::Malformed)?,
         epoll_pwait_message(epoll_fd, 0xB000, 4, 10).map_err(|_| VfsError::Malformed)?,
         sendfile_message(fd, dup_fd, 0xC000, 99).map_err(|_| VfsError::Malformed)?,
-        close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: dup_fd })
+        close_message(yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: dup_fd })
             .map_err(|_| VfsError::Malformed)?,
-        close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd }).map_err(|_| VfsError::Malformed)?,
-        close_message(yarm::yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: epoll_fd })
+        close_message(yarm_fs_servers::common::vfs_ipc::CloseRequest { fd }).map_err(|_| VfsError::Malformed)?,
+        close_message(yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: epoll_fd })
             .map_err(|_| VfsError::Malformed)?,
     ];
     for request in requests {
@@ -312,9 +312,9 @@ mod tests {
     use super::*;
     use yarm::std::thread;
     use yarm::kernel::boot::Bootstrap;
-    use crate::yarm_fs_servers::devfs::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
-    use crate::yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
-    use crate::yarm_fs_servers::ramfs::RamFsBackend;
+    use yarm_fs_servers::devfs::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
+    use yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
+    use yarm_fs_servers::ramfs::RamFsBackend;
 
     fn setup_ipc_caps(kernel: &mut KernelState) -> (CapId, CapId, CapId, CapId) {
         let (_, client_send_cap, server_recv_cap) =

@@ -5,17 +5,17 @@ mod launch;
 mod mount;
 mod policy;
 
-use crate::yarm_fs_servers::common::service::FsService;
-use crate::yarm_fs_servers::common::vfs_ipc::{
+use yarm_fs_servers::common::service::FsService;
+use yarm_fs_servers::common::vfs_ipc::{
     OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
 };
-use crate::yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
-use crate::yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
-use crate::yarm_fs_servers::ext4::{Ext4Backend, Ext4Service};
-use crate::yarm_fs_servers::fat::{FatBackend, FatService};
-use crate::yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
-use crate::yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
-use crate::yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
+use yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
+use yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
+use yarm_fs_servers::ext4::{Ext4Backend, Ext4Service};
+use yarm_fs_servers::fat::{FatBackend, FatService};
+use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
+use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
+use yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
 use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use yarm::kernel::capabilities::{CapId, CapRights};
 use yarm::kernel::task::TaskClass;
@@ -893,7 +893,7 @@ fn run_mount_fat() -> Result<(), KernelError> {
     Ok(())
 }
 
-fn run_rw_mount_cycle<B: crate::yarm_fs_servers::common::vfs_ipc::VfsBackend>(
+fn run_rw_mount_cycle<B: yarm_fs_servers::common::vfs_ipc::VfsBackend>(
     service: &mut FsService<B>,
     path_ptr: u64,
     write_len: u64,

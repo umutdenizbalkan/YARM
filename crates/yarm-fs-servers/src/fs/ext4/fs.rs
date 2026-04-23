@@ -7,7 +7,7 @@ use super::super::common::fs::{FdRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, Se
 use super::dir::find_inode_index;
 use super::file::checked_append;
 use super::inode::Ext4Inode;
-use yarm::yarm_fs_servers::blkcache::BlockCache;
+use crate::blkcache::BlockCache;
 
 #[derive(Debug)]
 pub struct Ext4Backend {
@@ -143,9 +143,80 @@ impl VfsBackend for Ext4Backend {
 
 #[cfg(test)]
 mod framing_tests {
-    use yarm::yarm_driver_servers::virtio_blk::device::{
-        VIRTIO_BLK_OP_READ, VirtioBlkReqFrame, VirtioBlkRespFrame,
-    };
+    const VIRTIO_BLK_OP_READ: u16 = 1;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct VirtioBlkReqFrame {
+        op: u16,
+        _reserved: u16,
+        sector: u64,
+        len: u32,
+        tag: u32,
+    }
+
+    impl VirtioBlkReqFrame {
+        fn encode(self) -> [u8; 20] {
+            let mut out = [0u8; 20];
+            out[0..2].copy_from_slice(&self.op.to_le_bytes());
+            out[2..4].copy_from_slice(&self._reserved.to_le_bytes());
+            out[4..12].copy_from_slice(&self.sector.to_le_bytes());
+            out[12..16].copy_from_slice(&self.len.to_le_bytes());
+            out[16..20].copy_from_slice(&self.tag.to_le_bytes());
+            out
+        }
+
+        fn decode(bytes: &[u8; 20]) -> Self {
+            let mut op = [0u8; 2];
+            op.copy_from_slice(&bytes[0..2]);
+            let mut reserved = [0u8; 2];
+            reserved.copy_from_slice(&bytes[2..4]);
+            let mut sector = [0u8; 8];
+            sector.copy_from_slice(&bytes[4..12]);
+            let mut len = [0u8; 4];
+            len.copy_from_slice(&bytes[12..16]);
+            let mut tag = [0u8; 4];
+            tag.copy_from_slice(&bytes[16..20]);
+            Self {
+                op: u16::from_le_bytes(op),
+                _reserved: u16::from_le_bytes(reserved),
+                sector: u64::from_le_bytes(sector),
+                len: u32::from_le_bytes(len),
+                tag: u32::from_le_bytes(tag),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct VirtioBlkRespFrame {
+        status: u8,
+        _pad: [u8; 3],
+        done_len: u32,
+        tag: u32,
+    }
+
+    impl VirtioBlkRespFrame {
+        fn encode(self) -> [u8; 12] {
+            let mut out = [0u8; 12];
+            out[0] = self.status;
+            out[1..4].copy_from_slice(&self._pad);
+            out[4..8].copy_from_slice(&self.done_len.to_le_bytes());
+            out[8..12].copy_from_slice(&self.tag.to_le_bytes());
+            out
+        }
+
+        fn decode(bytes: &[u8; 12]) -> Self {
+            let mut done_len = [0u8; 4];
+            done_len.copy_from_slice(&bytes[4..8]);
+            let mut tag = [0u8; 4];
+            tag.copy_from_slice(&bytes[8..12]);
+            Self {
+                status: bytes[0],
+                _pad: [bytes[1], bytes[2], bytes[3]],
+                done_len: u32::from_le_bytes(done_len),
+                tag: u32::from_le_bytes(tag),
+            }
+        }
+    }
 
     #[test]
     fn ext4_request_frame_golden_vector_matches_contract() {
@@ -158,7 +229,7 @@ mod framing_tests {
         };
         let expected: [u8; 20] = [1, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 7, 0, 0, 0];
         assert_eq!(req.encode(), expected);
-        assert_eq!(VirtioBlkReqFrame::decode(&expected).expect("decode"), req);
+        assert_eq!(VirtioBlkReqFrame::decode(&expected), req);
     }
 
     #[test]
@@ -171,6 +242,6 @@ mod framing_tests {
         };
         let expected: [u8; 12] = [0, 0, 0, 0, 0, 16, 0, 0, 7, 0, 0, 0];
         assert_eq!(resp.encode(), expected);
-        assert_eq!(VirtioBlkRespFrame::decode(&expected).expect("decode"), resp);
+        assert_eq!(VirtioBlkRespFrame::decode(&expected), resp);
     }
 }
