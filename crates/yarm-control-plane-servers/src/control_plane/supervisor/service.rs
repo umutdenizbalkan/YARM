@@ -781,7 +781,7 @@ pub fn run() {
     let handled = supervisor
         .run_live_for_ticks(&mut kernel, 64)
         .expect("loop");
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "supervisor.srv online: handled={}, degraded={}, tick={}",
         handled,
         supervisor.degraded(),

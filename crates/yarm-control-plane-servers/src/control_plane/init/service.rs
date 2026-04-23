@@ -230,7 +230,7 @@ fn resolve_core_image_plan(
 }
 
 pub fn run() {
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "init.srv requires kernel-provided bootstrap handoff; standalone Bootstrap::init path disabled"
     );
 }

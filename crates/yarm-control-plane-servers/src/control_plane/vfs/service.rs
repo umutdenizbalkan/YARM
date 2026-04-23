@@ -298,7 +298,7 @@ pub fn run() {
     let mut vfs = FsService::with_backend(InMemoryBackend::new());
     let summary = run_request_loop(&mut vfs, 0x1000).expect("vfs loop");
 
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "vfs request-loop ready: fd={}, dup_fd={}, epoll_fd={}, handled={}",
         summary.fd,
         summary.dup_fd,

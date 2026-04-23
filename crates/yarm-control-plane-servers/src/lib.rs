@@ -43,7 +43,7 @@ pub fn run_driver_manager_demo() {
         .handle_batch(&mut kernel, [register, grant])
         .expect("batch");
 
-    yarm::yarm_log!("driver-manager demo ready: handled={}", handled);
+    yarm_user_rt::user_log!("driver-manager demo ready: handled={}", handled);
 }
 
 #[cfg(test)]

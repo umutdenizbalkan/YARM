@@ -996,7 +996,7 @@ pub fn run() {
     let mut service = ProcessService::new();
     let summary = run_request_loop(&mut service, 1, 42, 0).expect("process-manager loop");
 
-    yarm::yarm_log!(
+    yarm_user_rt::user_log!(
         "process-manager request-loop ready: pid={}, exit_code={}, handled={}",
         summary.waited_pid,
         summary.waited_exit,

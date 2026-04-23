@@ -28,6 +28,7 @@ dependencies = [
  "yarm-fs-servers",
  "yarm-ipc-abi",
  "yarm-srv-common",
+ "yarm-user-rt",
 ]
 
 [[package]]
