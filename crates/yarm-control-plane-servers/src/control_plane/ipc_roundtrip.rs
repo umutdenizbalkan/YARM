@@ -3,7 +3,7 @@
 
 use yarm::kernel::boot::{KernelError, KernelState};
 use yarm::kernel::capabilities::CapId;
-use yarm::kernel::ipc::{Message, ThreadId};
+use yarm_user_rt::ipc::{Message, ThreadId};
 use yarm_srv_common::service_loop::RequestResponseService;
 
 /// Executes a synthetic client/server IPC roundtrip inside the same kernel-owned

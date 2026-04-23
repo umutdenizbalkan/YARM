@@ -3,7 +3,7 @@
 
 use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 use yarm::kernel::capabilities::{CapId, CapRights};
-use yarm::kernel::ipc::{Message, ThreadId};
+use yarm_user_rt::ipc::{Message, ThreadId};
 use yarm::kernel::time::{TickDuration, TickInstant};
 use crate::control_plane::init::{
     CoreServiceKind, CoreServicePolicyTable, InitFaultHandoff, RestartOwner, ServiceRestartPolicy,

@@ -6,7 +6,7 @@ use yarm::kernel::capabilities::CapId;
 use yarm::kernel::driver_abi::{
     DRIVER_OP_GRANT_DMA, DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, DRIVER_OP_RESTARTED,
 };
-use yarm::kernel::ipc::Message;
+use yarm_user_rt::ipc::Message;
 
 fn read_u64(payload: &[u8], offset: usize) -> Result<u64, KernelError> {
     let end = offset.checked_add(8).ok_or(KernelError::WrongObject)?;

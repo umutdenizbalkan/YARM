@@ -69,8 +69,8 @@ impl InitService {
     fn register_core_service_message(
         sender_tid: u64,
         request: RegisterCoreServiceRequest,
-    ) -> Result<yarm::kernel::ipc::Message, ()> {
-        yarm::kernel::ipc::Message::with_header(
+    ) -> Result<yarm_user_rt::ipc::Message, ()> {
+        yarm_user_rt::ipc::Message::with_header(
             sender_tid,
             SUPERVISOR_OP_REGISTER_CORE_SERVICE,
             0,
@@ -83,8 +83,8 @@ impl InitService {
     fn register_driver_message(
         sender_tid: u64,
         request: RegisterDriverRequest,
-    ) -> Result<yarm::kernel::ipc::Message, ()> {
-        yarm::kernel::ipc::Message::with_header(
+    ) -> Result<yarm_user_rt::ipc::Message, ()> {
+        yarm_user_rt::ipc::Message::with_header(
             sender_tid,
             SUPERVISOR_OP_REGISTER_DRIVER,
             0,

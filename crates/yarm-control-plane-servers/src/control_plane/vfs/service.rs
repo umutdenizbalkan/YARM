@@ -29,7 +29,7 @@ pub struct VfsLoopSummary {
 #[cfg(test)]
 const VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 
-fn decode_fd_reply(reply: yarm::kernel::ipc::Message) -> Result<u64, VfsError> {
+fn decode_fd_reply(reply: yarm_user_rt::ipc::Message) -> Result<u64, VfsError> {
     VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
         .map_err(|_| VfsError::Malformed)?
         .expect_fd(reply.opcode)
@@ -124,8 +124,8 @@ fn roundtrip_ipc<B: VfsBackend>(
     server_recv_cap: CapId,
     server_send_cap: CapId,
     client_recv_cap: CapId,
-    request: yarm::kernel::ipc::Message,
-) -> Result<yarm::kernel::ipc::Message, VfsError> {
+    request: yarm_user_rt::ipc::Message,
+) -> Result<yarm_user_rt::ipc::Message, VfsError> {
     synthetic_roundtrip_call_reply_with_budget(
         kernel,
         vfs,
@@ -146,9 +146,9 @@ fn synthetic_roundtrip_call_reply_with_budget<B: VfsBackend>(
     server_recv_cap: CapId,
     _server_send_cap: CapId,
     client_recv_cap: CapId,
-    request: yarm::kernel::ipc::Message,
+    request: yarm_user_rt::ipc::Message,
     recv_timeout_ticks: u64,
-) -> Result<yarm::kernel::ipc::Message, VfsError> {
+) -> Result<yarm_user_rt::ipc::Message, VfsError> {
     super::super::ipc_roundtrip::synthetic_roundtrip_call_reply_with_budget(
         kernel,
         vfs,
@@ -172,9 +172,9 @@ fn roundtrip_ipc_with_budget<B: VfsBackend>(
     server_recv_cap: CapId,
     server_send_cap: CapId,
     client_recv_cap: CapId,
-    request: yarm::kernel::ipc::Message,
+    request: yarm_user_rt::ipc::Message,
     recv_timeout_ticks: u64,
-) -> Result<yarm::kernel::ipc::Message, VfsError> {
+) -> Result<yarm_user_rt::ipc::Message, VfsError> {
     synthetic_roundtrip_call_reply_with_budget(
         kernel,
         vfs,
