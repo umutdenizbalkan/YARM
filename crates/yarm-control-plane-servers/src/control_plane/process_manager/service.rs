@@ -886,25 +886,38 @@ fn roundtrip_ipc(
     client_recv_cap: CapId,
     request: Message,
 ) -> Result<Message, ProcessManagerError> {
-    runtime.with_kernel_state(|kernel| {
-        synthetic_roundtrip_call_reply_with_budget(
-            kernel,
-            service,
-            client_send_cap,
-            server_recv_cap,
-            client_recv_cap,
-            request,
-            PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS,
-        )
-    })
+    runtime.synthetic_roundtrip_call_reply_with_budget(
+        service,
+        client_send_cap,
+        server_recv_cap,
+        client_recv_cap,
+        request,
+        PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS,
+    )
 }
 
 #[cfg(test)]
 pub trait ProcessServiceKernelIpcRuntime {
-    fn with_kernel_state<T>(
+    fn create_endpoint(
         &self,
-        f: impl FnOnce(&mut KernelState) -> Result<T, ProcessManagerError>,
-    ) -> Result<T, ProcessManagerError>;
+        depth: usize,
+    ) -> Result<(usize, CapId, CapId), ProcessManagerError>;
+
+    fn control_plane_set_process_cnode_slots_via_syscall(
+        &self,
+        pid: u64,
+        requested_slots: usize,
+    ) -> Result<(), ProcessManagerError>;
+
+    fn synthetic_roundtrip_call_reply_with_budget(
+        &self,
+        service: &mut ProcessService,
+        client_send_cap: CapId,
+        server_recv_cap: CapId,
+        client_recv_cap: CapId,
+        request: Message,
+        recv_timeout_ticks: u64,
+    ) -> Result<Message, ProcessManagerError>;
 }
 
 #[cfg(test)]
@@ -912,36 +925,49 @@ impl<T> ProcessServiceKernelIpcRuntime for T
 where
     T: RuntimeStateAccess<KernelState>,
 {
-    fn with_kernel_state<U>(
+    fn create_endpoint(
         &self,
-        f: impl FnOnce(&mut KernelState) -> Result<U, ProcessManagerError>,
-    ) -> Result<U, ProcessManagerError> {
-        self.with_state(f)
+        depth: usize,
+    ) -> Result<(usize, CapId, CapId), ProcessManagerError> {
+        self.with_state(|kernel| map_kernel_ipc_err(kernel.create_endpoint(depth)))
     }
-}
 
-#[cfg(test)]
-fn synthetic_roundtrip_call_reply_with_budget(
-    kernel: &mut KernelState,
-    service: &mut ProcessService,
-    client_send_cap: CapId,
-    server_recv_cap: CapId,
-    client_recv_cap: CapId,
-    request: Message,
-    recv_timeout_ticks: u64,
-) -> Result<Message, ProcessManagerError> {
-    super::super::ipc_roundtrip::synthetic_roundtrip_call_reply_with_budget(
-        kernel,
-        service,
-        client_send_cap,
-        server_recv_cap,
-        client_recv_cap,
-        request,
-        recv_timeout_ticks,
-        |err| map_kernel_ipc_error(from_kernel_ipc_error(err)),
-        || ProcessManagerError::Malformed,
-        || ProcessManagerError::Malformed,
-    )
+    fn control_plane_set_process_cnode_slots_via_syscall(
+        &self,
+        pid: u64,
+        requested_slots: usize,
+    ) -> Result<(), ProcessManagerError> {
+        self.with_state(|kernel| {
+            kernel
+                .control_plane_set_process_cnode_slots_via_syscall(pid, requested_slots)
+                .map_err(|err| map_trap_ipc_error(from_kernel_trap_ipc_error(err)))
+        })
+    }
+
+    fn synthetic_roundtrip_call_reply_with_budget(
+        &self,
+        service: &mut ProcessService,
+        client_send_cap: CapId,
+        server_recv_cap: CapId,
+        client_recv_cap: CapId,
+        request: Message,
+        recv_timeout_ticks: u64,
+    ) -> Result<Message, ProcessManagerError> {
+        self.with_state(|kernel| {
+            super::super::ipc_roundtrip::synthetic_roundtrip_call_reply_with_budget(
+                kernel,
+                service,
+                client_send_cap,
+                server_recv_cap,
+                client_recv_cap,
+                request,
+                recv_timeout_ticks,
+                |err| map_kernel_ipc_error(from_kernel_ipc_error(err)),
+                || ProcessManagerError::Malformed,
+                || ProcessManagerError::Malformed,
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1063,10 +1089,8 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
     exit_code: u64,
     requested_cnode_slots: Option<usize>,
 ) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
-    let (_, client_send_cap, server_recv_cap) =
-        runtime.with_kernel_state(|kernel| map_kernel_ipc_err(kernel.create_endpoint(8)))?;
-    let (_, _, client_recv_cap) =
-        runtime.with_kernel_state(|kernel| map_kernel_ipc_err(kernel.create_endpoint(8)))?;
+    let (_, client_send_cap, server_recv_cap) = runtime.create_endpoint(8)?;
+    let (_, _, client_recv_cap) = runtime.create_endpoint(8)?;
 
     let spawn_reply = roundtrip_ipc(
         runtime,
@@ -1091,11 +1115,7 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
         return Err(ProcessManagerError::Malformed);
     }
     if let Some(requested_slots) = recorded_requested_slots.or(requested_cnode_slots) {
-        runtime.with_kernel_state(|kernel| {
-            kernel
-                .control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)
-                .map_err(|err| map_trap_ipc_error(from_kernel_trap_ipc_error(err)))
-        })?;
+        runtime.control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)?;
     }
 
     let _ = roundtrip_ipc(
