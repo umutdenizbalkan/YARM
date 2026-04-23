@@ -118,7 +118,7 @@ fn map_kernel_ipc_error(_: yarm::kernel::boot::KernelError) -> VfsError {
 
 #[cfg(test)]
 fn roundtrip_ipc<B: VfsBackend>(
-    kernel: &mut KernelState,
+    runtime: &mut impl VfsKernelIpcRuntime,
     vfs: &mut FsService<B>,
     client_send_cap: CapId,
     server_recv_cap: CapId,
@@ -126,8 +126,7 @@ fn roundtrip_ipc<B: VfsBackend>(
     client_recv_cap: CapId,
     request: yarm_user_rt::ipc::Message,
 ) -> Result<yarm_user_rt::ipc::Message, VfsError> {
-    synthetic_roundtrip_call_reply_with_budget(
-        kernel,
+    runtime.synthetic_roundtrip_call_reply_with_budget(
         vfs,
         client_send_cap,
         server_recv_cap,
@@ -139,34 +138,56 @@ fn roundtrip_ipc<B: VfsBackend>(
 }
 
 #[cfg(test)]
-fn synthetic_roundtrip_call_reply_with_budget<B: VfsBackend>(
-    kernel: &mut KernelState,
-    vfs: &mut FsService<B>,
-    client_send_cap: CapId,
-    server_recv_cap: CapId,
-    _server_send_cap: CapId,
-    client_recv_cap: CapId,
-    request: yarm_user_rt::ipc::Message,
-    recv_timeout_ticks: u64,
-) -> Result<yarm_user_rt::ipc::Message, VfsError> {
-    super::super::ipc_roundtrip::synthetic_roundtrip_call_reply_with_budget(
-        kernel,
-        vfs,
-        client_send_cap,
-        server_recv_cap,
-        client_recv_cap,
-        request,
-        recv_timeout_ticks,
-        map_kernel_ipc_error,
-        || VfsError::Malformed,
-        || VfsError::Unsupported,
-    )
+pub trait VfsKernelIpcRuntime {
+    fn create_endpoint(&mut self, depth: usize) -> Result<(usize, CapId, CapId), VfsError>;
+
+    fn synthetic_roundtrip_call_reply_with_budget<B: VfsBackend>(
+        &mut self,
+        vfs: &mut FsService<B>,
+        client_send_cap: CapId,
+        server_recv_cap: CapId,
+        _server_send_cap: CapId,
+        client_recv_cap: CapId,
+        request: yarm_user_rt::ipc::Message,
+        recv_timeout_ticks: u64,
+    ) -> Result<yarm_user_rt::ipc::Message, VfsError>;
+}
+
+#[cfg(test)]
+impl VfsKernelIpcRuntime for KernelState {
+    fn create_endpoint(&mut self, depth: usize) -> Result<(usize, CapId, CapId), VfsError> {
+        map_kernel_ipc_err(self.create_endpoint(depth))
+    }
+
+    fn synthetic_roundtrip_call_reply_with_budget<B: VfsBackend>(
+        &mut self,
+        vfs: &mut FsService<B>,
+        client_send_cap: CapId,
+        server_recv_cap: CapId,
+        _server_send_cap: CapId,
+        client_recv_cap: CapId,
+        request: yarm_user_rt::ipc::Message,
+        recv_timeout_ticks: u64,
+    ) -> Result<yarm_user_rt::ipc::Message, VfsError> {
+        super::super::ipc_roundtrip::synthetic_roundtrip_call_reply_with_budget(
+            self,
+            vfs,
+            client_send_cap,
+            server_recv_cap,
+            client_recv_cap,
+            request,
+            recv_timeout_ticks,
+            map_kernel_ipc_error,
+            || VfsError::Malformed,
+            || VfsError::Unsupported,
+        )
+    }
 }
 
 #[allow(dead_code)]
 #[cfg(test)]
 fn roundtrip_ipc_with_budget<B: VfsBackend>(
-    kernel: &mut KernelState,
+    runtime: &mut impl VfsKernelIpcRuntime,
     vfs: &mut FsService<B>,
     client_send_cap: CapId,
     server_recv_cap: CapId,
@@ -175,8 +196,7 @@ fn roundtrip_ipc_with_budget<B: VfsBackend>(
     request: yarm_user_rt::ipc::Message,
     recv_timeout_ticks: u64,
 ) -> Result<yarm_user_rt::ipc::Message, VfsError> {
-    synthetic_roundtrip_call_reply_with_budget(
-        kernel,
+    runtime.synthetic_roundtrip_call_reply_with_budget(
         vfs,
         client_send_cap,
         server_recv_cap,
@@ -189,15 +209,15 @@ fn roundtrip_ipc_with_budget<B: VfsBackend>(
 
 #[cfg(test)]
 pub fn run_request_loop_over_kernel_ipc(
-    kernel: &mut KernelState,
+    runtime: &mut impl VfsKernelIpcRuntime,
     vfs: &mut FsService<impl VfsBackend>,
     path_ptr: u64,
 ) -> Result<VfsLoopSummary, VfsError> {
-    let (_, client_send_cap, server_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(16))?;
-    let (_, server_send_cap, client_recv_cap) = map_kernel_ipc_err(kernel.create_endpoint(16))?;
+    let (_, client_send_cap, server_recv_cap) = runtime.create_endpoint(16)?;
+    let (_, server_send_cap, client_recv_cap) = runtime.create_endpoint(16)?;
 
     let open_reply = roundtrip_ipc(
-        kernel,
+        runtime,
         vfs,
         client_send_cap,
         server_recv_cap,
@@ -214,7 +234,7 @@ pub fn run_request_loop_over_kernel_ipc(
     let fd = decode_fd_reply(open_reply)?;
 
     let dup_fd = decode_fd_reply(roundtrip_ipc(
-        kernel,
+        runtime,
         vfs,
         client_send_cap,
         server_recv_cap,
@@ -224,7 +244,7 @@ pub fn run_request_loop_over_kernel_ipc(
     )?)?;
 
     let epoll_fd = decode_fd_reply(roundtrip_ipc(
-        kernel,
+        runtime,
         vfs,
         client_send_cap,
         server_recv_cap,
@@ -267,7 +287,7 @@ pub fn run_request_loop_over_kernel_ipc(
     ];
     for request in requests {
         let _ = roundtrip_ipc(
-            kernel,
+            runtime,
             vfs,
             client_send_cap,
             server_recv_cap,
@@ -287,11 +307,11 @@ pub fn run_request_loop_over_kernel_ipc(
 
 #[cfg(test)]
 pub fn run_with_kernel_ipc(
-    kernel: &mut KernelState,
+    runtime: &mut impl VfsKernelIpcRuntime,
     path_ptr: u64,
 ) -> Result<VfsLoopSummary, VfsError> {
     let mut vfs = FsService::with_backend(InMemoryBackend::new());
-    run_request_loop_over_kernel_ipc(kernel, &mut vfs, path_ptr)
+    run_request_loop_over_kernel_ipc(runtime, &mut vfs, path_ptr)
 }
 
 pub fn run() {
