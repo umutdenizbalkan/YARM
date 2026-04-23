@@ -135,4 +135,15 @@ pub mod vm {
 pub mod process {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct ProcessId(pub u64);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProcessError {
+        Malformed,
+        Unsupported,
+        TableFull,
+        UnknownProcess,
+        InvalidTransport,
+        PermissionDenied,
+        WouldBlock,
+    }
 }

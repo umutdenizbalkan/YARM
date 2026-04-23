@@ -8,8 +8,8 @@ use yarm::kernel::boot::{KernelError, TrapHandleError};
 #[cfg(test)]
 use yarm_user_rt::capability::CapId;
 use yarm_user_rt::ipc::Message;
-use yarm::kernel::process::{ProcessManager, ProcessManagerError};
-use yarm_user_rt::process::ProcessId;
+use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcessManagerError};
+use yarm_user_rt::process::{ProcessError as ProcessManagerError, ProcessId};
 #[cfg(test)]
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 #[cfg(test)]
@@ -416,6 +416,19 @@ fn from_kernel_process_id(pid: yarm::kernel::process::ProcessId) -> ProcessId {
     ProcessId(pid.0)
 }
 
+#[inline]
+fn map_kernel_process_error(err: KernelProcessManagerError) -> ProcessManagerError {
+    match err {
+        KernelProcessManagerError::Malformed => ProcessManagerError::Malformed,
+        KernelProcessManagerError::Unsupported => ProcessManagerError::Unsupported,
+        KernelProcessManagerError::TableFull => ProcessManagerError::TableFull,
+        KernelProcessManagerError::UnknownProcess => ProcessManagerError::UnknownProcess,
+        KernelProcessManagerError::InvalidTransport => ProcessManagerError::InvalidTransport,
+        KernelProcessManagerError::PermissionDenied => ProcessManagerError::PermissionDenied,
+        KernelProcessManagerError::WouldBlock => ProcessManagerError::WouldBlock,
+    }
+}
+
 #[cfg(test)]
 fn map_kernel_ipc_err<T>(result: Result<T, KernelError>) -> Result<T, ProcessManagerError> {
     result.map_err(map_kernel_ipc_error)
@@ -642,7 +655,9 @@ impl ProcessService {
     }
 
     pub fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessManagerError> {
-        self.manager.mark_exit(to_kernel_process_id(pid), code)
+        self.manager
+            .mark_exit(to_kernel_process_id(pid), code)
+            .map_err(map_kernel_process_error)
     }
 
     pub fn handle(&mut self, request: Message) -> Result<Message, ProcessManagerError> {
@@ -670,7 +685,8 @@ impl ProcessService {
             }
             ProcessRequest::Exit { caller_tid, code } => {
                 self.manager
-                    .insert_synthetic_exit_for_tid(caller_tid, code)?;
+                    .insert_synthetic_exit_for_tid(caller_tid, code)
+                    .map_err(map_kernel_process_error)?;
                 Self::u64_reply(PROC_OP_EXIT, 0)
             }
             ProcessRequest::SpawnV2(req) => {
@@ -680,7 +696,8 @@ impl ProcessService {
                     let info = ElfImageInfo::parse(req.image_id, &image).map_err(map_elf_error)?;
                     let pid = self
                         .manager
-                        .allocate_process(to_kernel_process_id(req.parent_pid))?;
+                        .allocate_process(to_kernel_process_id(req.parent_pid))
+                        .map_err(map_kernel_process_error)?;
                     let pid = from_kernel_process_id(pid);
                     self.record_spawn_policy(
                         pid,
@@ -708,7 +725,10 @@ impl ProcessService {
                         return Err(ProcessManagerError::PermissionDenied);
                     }
                 }
-                let waited = self.manager.wait_exited(to_kernel_process_id(req.target_pid))?;
+                let waited = self
+                    .manager
+                    .wait_exited(to_kernel_process_id(req.target_pid))
+                    .map_err(map_kernel_process_error)?;
                 let result = WaitPidV2Result {
                     waited_pid: from_kernel_process_id(waited.waited_pid),
                     exit_code: waited.exit_code,
