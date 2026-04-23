@@ -8,8 +8,6 @@ use yarm::kernel::boot::{KernelError, TrapHandleError};
 use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcessManagerError};
 #[cfg(test)]
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
-#[cfg(test)]
-use yarm::runtime::SharedKernel;
 use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
     PROC_OP_SPAWN_V4, PROC_OP_WAITPID_V2, SpawnV2Args, SpawnV3Args, SpawnV4Args, WaitPidV2Args,
@@ -1083,28 +1081,6 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
 }
 
 #[cfg(test)]
-struct SharedKernelStateAccess<'a> {
-    kernel: &'a SharedKernel,
-}
-
-#[cfg(test)]
-impl<'a> SharedKernelStateAccess<'a> {
-    const fn new(kernel: &'a SharedKernel) -> Self {
-        Self { kernel }
-    }
-}
-
-#[cfg(test)]
-impl RuntimeStateAccess<KernelState> for SharedKernelStateAccess<'_> {
-    fn with_state<R, F>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut KernelState) -> R,
-    {
-        self.kernel.with(f)
-    }
-}
-
-#[cfg(test)]
 pub fn run_request_loop_over_runtime_state_with_cnode_resize(
     runtime: &impl RuntimeStateAccess<KernelState>,
     service: &mut ProcessService,
@@ -1123,25 +1099,6 @@ pub fn run_request_loop_over_runtime_state_with_cnode_resize(
             Some(requested_cnode_slots),
         )
     })
-}
-
-#[cfg(test)]
-pub fn run_request_loop_over_shared_kernel_with_cnode_resize(
-    kernel: &SharedKernel,
-    service: &mut ProcessService,
-    parent_pid: u64,
-    image_id: u64,
-    exit_code: u64,
-    requested_cnode_slots: usize,
-) -> Result<ProcessManagerLoopSummary, ProcessManagerError> {
-    run_request_loop_over_runtime_state_with_cnode_resize(
-        &SharedKernelStateAccess::new(kernel),
-        service,
-        parent_pid,
-        image_id,
-        exit_code,
-        requested_cnode_slots,
-    )
 }
 
 pub fn run() {
@@ -1217,8 +1174,8 @@ mod tests {
     fn process_manager_shared_kernel_path_can_resize_spawned_process_cnode() {
         let src = include_str!("service.rs");
         assert!(
-            src.contains("run_request_loop_over_shared_kernel_with_cnode_resize"),
-            "process-manager migration should keep shared-kernel cnode-resize path"
+            src.contains("run_request_loop_over_runtime_state_with_cnode_resize"),
+            "process-manager migration should keep runtime-state cnode-resize path"
         );
         assert!(
             src.contains("PROC_OP_SPAWN_V3"),
