@@ -23,7 +23,6 @@ dependencies = [
 name = "yarm-control-plane-servers"
 version = "0.1.0"
 dependencies = [
- "yarm-freestanding-alloc",
  "yarm-fs-servers",
  "yarm-ipc-abi",
  "yarm-server-runtime",

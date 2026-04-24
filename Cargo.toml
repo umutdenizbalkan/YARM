@@ -41,6 +41,9 @@ yarm-srv-common = { path = "crates/yarm-srv-common" }
 name = "kernel_boot"
 path = "src/bin/kernel_boot.rs"
 
+[profile.dev]
+panic = "abort"
+
 [profile.x86-none]
 inherits = "release"
 panic = "abort"
