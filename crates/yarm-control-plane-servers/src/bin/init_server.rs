@@ -22,7 +22,16 @@ fn main() {
 
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(
+    startup_task_id: u64,
+    startup_proc_mgr_request_send_cap: u64,
+    startup_proc_mgr_reply_recv_cap: u64,
+) -> ! {
+    yarm_server_runtime::install_startup_arg_slots([
+        startup_task_id,
+        startup_proc_mgr_request_send_cap,
+        startup_proc_mgr_reply_recv_cap,
+    ]);
     run();
     loop {}
 }
