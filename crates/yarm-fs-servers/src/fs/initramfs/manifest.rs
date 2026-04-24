@@ -2,8 +2,10 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::archive::{
-    INITRAMFS_INIT_PATH_PTR, INITRAMFS_POSIX_COMPAT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR,
-    INITRAMFS_SUPERVISOR_PATH_PTR, INITRAMFS_VFS_PATH_PTR,
+    INITRAMFS_INIT_PATH, INITRAMFS_INIT_PATH_PTR, INITRAMFS_POSIX_COMPAT_PATH,
+    INITRAMFS_POSIX_COMPAT_PATH_PTR, INITRAMFS_PROC_MGR_PATH, INITRAMFS_PROC_MGR_PATH_PTR,
+    INITRAMFS_SUPERVISOR_PATH, INITRAMFS_SUPERVISOR_PATH_PTR, INITRAMFS_VFS_PATH,
+    INITRAMFS_VFS_PATH_PTR,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 
@@ -80,6 +82,17 @@ pub enum InitramfsManifestError {
     TooManyLoadSegments,
 }
 
+fn manifest_path_from_ptr(path_ptr: u64) -> Option<&'static [u8]> {
+    match path_ptr {
+        INITRAMFS_INIT_PATH_PTR => Some(INITRAMFS_INIT_PATH),
+        INITRAMFS_PROC_MGR_PATH_PTR => Some(INITRAMFS_PROC_MGR_PATH),
+        INITRAMFS_VFS_PATH_PTR => Some(INITRAMFS_VFS_PATH),
+        INITRAMFS_SUPERVISOR_PATH_PTR => Some(INITRAMFS_SUPERVISOR_PATH),
+        INITRAMFS_POSIX_COMPAT_PATH_PTR => Some(INITRAMFS_POSIX_COMPAT_PATH),
+        _ => None,
+    }
+}
+
 pub fn parse_core_service_manifest(
     bytes: &[u8],
 ) -> Result<CoreServiceImageManifest, InitramfsManifestError> {
@@ -127,12 +140,14 @@ pub fn parse_core_service_manifest(
             return Err(InitramfsManifestError::ZeroEntryAddress);
         }
 
-        let slot = match entry.path_ptr {
-            INITRAMFS_INIT_PATH_PTR => &mut init,
-            INITRAMFS_PROC_MGR_PATH_PTR => &mut process_manager,
-            INITRAMFS_VFS_PATH_PTR => &mut vfs,
-            INITRAMFS_SUPERVISOR_PATH_PTR => &mut supervisor,
-            INITRAMFS_POSIX_COMPAT_PATH_PTR => &mut posix_compat,
+        let manifest_path =
+            manifest_path_from_ptr(entry.path_ptr).ok_or(InitramfsManifestError::DuplicatePath)?;
+        let slot = match manifest_path {
+            INITRAMFS_INIT_PATH => &mut init,
+            INITRAMFS_PROC_MGR_PATH => &mut process_manager,
+            INITRAMFS_VFS_PATH => &mut vfs,
+            INITRAMFS_SUPERVISOR_PATH => &mut supervisor,
+            INITRAMFS_POSIX_COMPAT_PATH => &mut posix_compat,
             _ => return Err(InitramfsManifestError::DuplicatePath),
         };
         if slot.is_some() {
@@ -261,12 +276,12 @@ fn parse_load_segments(image: &[u8]) -> Result<ServiceElfLaunchPlan, InitramfsMa
 }
 
 fn resolve_manifest_image<'a>(
-    images: &'a [(u64, &'a [u8])],
-    path_ptr: u64,
+    images: &'a [(&'a [u8], &'a [u8])],
+    path: &[u8],
 ) -> Result<&'a [u8], InitramfsManifestError> {
     images
         .iter()
-        .find(|(path, _)| *path == path_ptr)
+        .find(|(image_path, _)| *image_path == path)
         .map(|(_, image)| *image)
         .ok_or(InitramfsManifestError::MissingImagePayload)
 }
@@ -291,30 +306,34 @@ fn build_service_launch_plan(
 
 pub fn build_core_service_elf_launch_plan(
     manifest_bytes: &[u8],
-    images: &[(u64, &[u8])],
+    images: &[(&[u8], &[u8])],
 ) -> Result<CoreServiceElfLaunchPlan, InitramfsManifestError> {
     let manifest = parse_core_service_manifest(manifest_bytes)?;
+    let init_path =
+        manifest_path_from_ptr(manifest.init.path_ptr).ok_or(InitramfsManifestError::MissingImagePayload)?;
+    let proc_mgr_path = manifest_path_from_ptr(manifest.process_manager.path_ptr)
+        .ok_or(InitramfsManifestError::MissingImagePayload)?;
+    let vfs_path =
+        manifest_path_from_ptr(manifest.vfs.path_ptr).ok_or(InitramfsManifestError::MissingImagePayload)?;
+    let supervisor_path = manifest_path_from_ptr(manifest.supervisor.path_ptr)
+        .ok_or(InitramfsManifestError::MissingImagePayload)?;
     Ok(CoreServiceElfLaunchPlan {
-        init: build_service_launch_plan(
-            manifest.init,
-            resolve_manifest_image(images, manifest.init.path_ptr)?,
-        )?,
+        init: build_service_launch_plan(manifest.init, resolve_manifest_image(images, init_path)?)?,
         process_manager: build_service_launch_plan(
             manifest.process_manager,
-            resolve_manifest_image(images, manifest.process_manager.path_ptr)?,
+            resolve_manifest_image(images, proc_mgr_path)?,
         )?,
-        vfs: build_service_launch_plan(
-            manifest.vfs,
-            resolve_manifest_image(images, manifest.vfs.path_ptr)?,
-        )?,
+        vfs: build_service_launch_plan(manifest.vfs, resolve_manifest_image(images, vfs_path)?)?,
         supervisor: build_service_launch_plan(
             manifest.supervisor,
-            resolve_manifest_image(images, manifest.supervisor.path_ptr)?,
+            resolve_manifest_image(images, supervisor_path)?,
         )?,
         posix_compat: manifest
             .posix_compat
             .map(|entry| {
-                let image = resolve_manifest_image(images, entry.path_ptr)?;
+                let path =
+                    manifest_path_from_ptr(entry.path_ptr).ok_or(InitramfsManifestError::MissingImagePayload)?;
+                let image = resolve_manifest_image(images, path)?;
                 build_service_launch_plan(entry, image)
             })
             .transpose()?,
@@ -484,10 +503,10 @@ mod tests {
             },
         ]);
         let images = [
-            (INITRAMFS_INIT_PATH_PTR, init.as_slice()),
-            (INITRAMFS_PROC_MGR_PATH_PTR, proc.as_slice()),
-            (INITRAMFS_VFS_PATH_PTR, vfs.as_slice()),
-            (INITRAMFS_SUPERVISOR_PATH_PTR, supervisor.as_slice()),
+            (INITRAMFS_INIT_PATH, init.as_slice()),
+            (INITRAMFS_PROC_MGR_PATH, proc.as_slice()),
+            (INITRAMFS_VFS_PATH, vfs.as_slice()),
+            (INITRAMFS_SUPERVISOR_PATH, supervisor.as_slice()),
         ];
 
         let plan = build_core_service_elf_launch_plan(&manifest_bytes, &images).expect("plan");
@@ -514,7 +533,7 @@ mod tests {
             entries[2],
             entries[3],
         ]);
-        let images = [(INITRAMFS_INIT_PATH_PTR, init.as_slice())];
+        let images = [(INITRAMFS_INIT_PATH, init.as_slice())];
         assert_eq!(
             build_core_service_elf_launch_plan(&manifest_bytes, &images),
             Err(InitramfsManifestError::EntryAddressMismatch)
