@@ -1,37 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::boot::Bootstrap;
-use crate::kernel::ipc::Message;
-use crate::kernel::trapframe::TrapFrame;
-use yarm_ipc_abi::process_abi::PROC_OP_GETPID;
+use yarm_user_rt::runtime::StartupContext;
+use yarm_user_rt::syscall::{IpcTransport, SyscallIpcTransport};
 
-use super::{LINUX_NR_GETPID, PosixServiceBindings, dispatch};
+/// Minimal runtime handoff for normal userspace startup.
+///
+/// This intentionally avoids any kernel-internal bootstrap/state usage and can
+/// be replaced with real boot/runtime arguments when those are wired through
+/// server startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PosixRuntimeHandoff {
+    proc_mgr_request_send: Option<u32>,
+    proc_mgr_reply_recv: Option<u32>,
+}
+
+impl PosixRuntimeHandoff {
+    #[inline]
+    fn from_startup_context(_ctx: StartupContext) -> Self {
+        // No runtime-provided endpoint caps are plumbed yet.
+        Self::default()
+    }
+}
 
 pub fn run() {
-    let mut kernel = Bootstrap::init().expect("init");
-    let mut bindings = PosixServiceBindings::default();
+    let startup = yarm_user_rt::runtime::startup_context();
+    let handoff = PosixRuntimeHandoff::from_startup_context(startup);
+    let mut transport = SyscallIpcTransport;
 
-    let (_proc_req_ep, proc_req_send, proc_req_recv) = kernel.create_endpoint(8).expect("proc req");
-    let (_proc_rep_ep, proc_rep_send, proc_rep_recv) = kernel.create_endpoint(8).expect("proc rep");
-    bindings
-        .register_process_manager(&kernel, proc_req_send, proc_rep_recv)
-        .expect("bind proc");
+    // If/when startup provides endpoint caps, probe the reply channel using the
+    // userspace syscall IPC transport. Until then, startup remains a no-kernel
+    // runtime handoff stub.
+    let routed_reply = handoff
+        .proc_mgr_reply_recv
+        .and_then(|recv_cap| transport.recv(recv_cap).ok())
+        .flatten()
+        .is_some();
 
-    kernel
-        .ipc_send(
-            proc_rep_send,
-            Message::with_header(0, PROC_OP_GETPID, 0, None, &42u64.to_le_bytes()).expect("reply"),
-        )
-        .expect("seed reply");
-
-    let mut frame = TrapFrame::new(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0]);
-    dispatch(&mut kernel, &bindings, &mut frame);
-
-    let routed = kernel.ipc_recv(proc_req_recv).expect("recv").is_some();
     crate::yarm_log!(
-        "posix-compat server demo: translated getpid -> ret={}, routed_request={}",
-        frame.ret0(),
-        routed
+        "posix-compat server startup: task_id={}, proc_req_cap_present={}, routed_reply={}",
+        startup.task_id,
+        handoff.proc_mgr_request_send.is_some(),
+        routed_reply
     );
 }
