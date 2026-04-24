@@ -16,6 +16,7 @@ use yarm_fs_servers::fat::{FatBackend, FatService};
 use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
 use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
 use yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
+#[cfg(test)]
 use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use yarm_user_rt::capability::{CapId, CapRights};
 use yarm_user_rt::task::{TaskClass, TaskStatus};
