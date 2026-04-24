@@ -54,6 +54,28 @@ pub mod syscall {
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
 
+    pub trait IpcTransport {
+        fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError>;
+        fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError>;
+    }
+
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub struct SyscallIpcTransport;
+
+    impl IpcTransport for SyscallIpcTransport {
+        #[inline]
+        fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError> {
+            // SAFETY: forwards directly to syscall wrapper.
+            unsafe { ipc_send(ep_cap, msg) }
+        }
+
+        #[inline]
+        fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError> {
+            // SAFETY: forwards directly to syscall wrapper.
+            unsafe { ipc_recv(ep_cap) }
+        }
+    }
+
     #[inline]
     const fn decode_syscall_error(code: usize) -> SyscallError {
         match code {
