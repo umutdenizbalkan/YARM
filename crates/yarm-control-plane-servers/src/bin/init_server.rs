@@ -5,7 +5,7 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 #[cfg(not(feature = "hosted-dev"))]
-yarm_freestanding_alloc::install!(
+yarm::install_freestanding_allocator!(
     2 * 1024 * 1024,
     "control-plane server freestanding allocator OOM"
 );
