@@ -3,20 +3,23 @@
 
 #[cfg(test)]
 use yarm::kernel::boot::KernelState;
-#[cfg(test)]
-use yarm_user_rt::capability::CapId;
-use yarm_fs_servers::common::vfs_ipc::VfsError;
-use yarm_fs_servers::common::vfs_ipc::{
-    InMemoryBackend, OpenAtRequest, ReadWriteRequest, StatxRequest, close_message,
-    dup_message, epoll_create1_message, epoll_ctl_message, epoll_pwait_message, fcntl_message,
-    ioctl_message, openat_message, poll_message, read_message, sendfile_message, statx_message,
-    write_message,
-};
+use yarm_fs_servers::common::service::FsService;
 #[cfg(test)]
 use yarm_fs_servers::common::vfs_ipc::VfsBackend;
-use yarm_fs_servers::common::service::FsService;
+use yarm_fs_servers::common::vfs_ipc::VfsError;
+use yarm_fs_servers::common::vfs_ipc::{
+    InMemoryBackend, ReadWriteRequest, close_message, dup_message, epoll_create1_message,
+    epoll_ctl_message, epoll_pwait_message, fcntl_message, ioctl_message, openat_inline_message,
+    poll_message, read_message, sendfile_message, statx_inline_message, write_message,
+};
+#[cfg(test)]
+use yarm_fs_servers::common::vfs_ipc::{
+    OpenAtRequest, StatxRequest, openat_message, statx_message,
+};
 use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_srv_common::vfs_reply::VfsReply;
+#[cfg(test)]
+use yarm_user_rt::capability::CapId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfsLoopSummary {
@@ -38,17 +41,11 @@ fn decode_fd_reply(reply: yarm_user_rt::ipc::Message) -> Result<u64, VfsError> {
 
 pub fn run_request_loop(
     vfs: &mut FsService<InMemoryBackend>,
-    path_ptr: u64,
+    path: &[u8],
 ) -> Result<VfsLoopSummary, VfsError> {
     let reply = run_typed_request_loop(
         vfs,
-        [openat_message(OpenAtRequest {
-            dirfd: 0,
-            path_ptr,
-            flags: 0,
-            mode: 0,
-        })
-        .map_err(|_| VfsError::Malformed)?],
+        [openat_inline_message(0, path, 0, 0).map_err(|_| VfsError::Malformed)?],
     )?[0];
     let fd = decode_fd_reply(reply)?;
     let dup_fd = decode_fd_reply(
@@ -75,13 +72,7 @@ pub fn run_request_loop(
                 len: 32,
             })
             .map_err(|_| VfsError::Malformed)?,
-            statx_message(StatxRequest {
-                dirfd: 0,
-                path_ptr,
-                flags: 0,
-                mask_or_buf: 0,
-            })
-            .map_err(|_| VfsError::Malformed)?,
+            statx_inline_message(0, path, 0, 0).map_err(|_| VfsError::Malformed)?,
             ioctl_message(fd, 0x1234, 0x55).map_err(|_| VfsError::Malformed)?,
             fcntl_message(fd, 3, 9).map_err(|_| VfsError::Malformed)?,
             poll_message(0x9000, 2, 10).map_err(|_| VfsError::Malformed)?,
@@ -281,7 +272,8 @@ pub fn run_request_loop_over_kernel_ipc(
         sendfile_message(fd, dup_fd, 0xC000, 99).map_err(|_| VfsError::Malformed)?,
         close_message(yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: dup_fd })
             .map_err(|_| VfsError::Malformed)?,
-        close_message(yarm_fs_servers::common::vfs_ipc::CloseRequest { fd }).map_err(|_| VfsError::Malformed)?,
+        close_message(yarm_fs_servers::common::vfs_ipc::CloseRequest { fd })
+            .map_err(|_| VfsError::Malformed)?,
         close_message(yarm_fs_servers::common::vfs_ipc::CloseRequest { fd: epoll_fd })
             .map_err(|_| VfsError::Malformed)?,
     ];
@@ -316,7 +308,7 @@ pub fn run_with_kernel_ipc(
 
 pub fn run() {
     let mut vfs = FsService::with_backend(InMemoryBackend::new());
-    let summary = run_request_loop(&mut vfs, 0x1000).expect("vfs loop");
+    let summary = run_request_loop(&mut vfs, b"/control-plane/vfs-probe").expect("vfs loop");
 
     yarm_user_rt::user_log!(
         "vfs request-loop ready: fd={}, dup_fd={}, epoll_fd={}, handled={}",
@@ -330,8 +322,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::std::thread;
     use yarm::kernel::boot::Bootstrap;
+    use yarm::std::thread;
     use yarm_fs_servers::devfs::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend};
     use yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
     use yarm_fs_servers::ramfs::RamFsBackend;
@@ -608,150 +600,159 @@ mod tests {
     fn backend_semantics_matrix_roundtrips_over_kernel_ipc() {
         run_with_large_stack(|| {
             // DevFS: null reads as 0 and console writes echo length.
-            with_kernel_roundtrip(DevFsBackend::default(), |kernel, devfs, client_send, server_recv, server_send, client_recv| {
-                let dev_null_fd = decode_fd_reply(
-                    roundtrip_ipc(
+            with_kernel_roundtrip(
+                DevFsBackend::default(),
+                |kernel, devfs, client_send, server_recv, server_send, client_recv| {
+                    let dev_null_fd = decode_fd_reply(
+                        roundtrip_ipc(
+                            kernel,
+                            devfs,
+                            client_send,
+                            server_recv,
+                            server_send,
+                            client_recv,
+                            openat_message(OpenAtRequest {
+                                dirfd: 0,
+                                path_ptr: DEV_NULL_PATH_PTR,
+                                flags: 0,
+                                mode: 0,
+                            })
+                            .expect("open null"),
+                        )
+                        .expect("open null reply"),
+                    )
+                    .expect("decode fd");
+                    let dev_null_read = roundtrip_ipc(
                         kernel,
                         devfs,
                         client_send,
                         server_recv,
                         server_send,
                         client_recv,
-                        openat_message(OpenAtRequest {
-                            dirfd: 0,
-                            path_ptr: DEV_NULL_PATH_PTR,
-                            flags: 0,
-                            mode: 0,
+                        read_message(ReadWriteRequest {
+                            fd: dev_null_fd,
+                            buf_ptr: 0,
+                            len: 128,
                         })
-                        .expect("open null"),
+                        .expect("read null"),
                     )
-                    .expect("open null reply"),
-                )
-                .expect("decode fd");
-                let dev_null_read = roundtrip_ipc(
-                    kernel,
-                    devfs,
-                    client_send,
-                    server_recv,
-                    server_send,
-                    client_recv,
-                    read_message(ReadWriteRequest {
-                        fd: dev_null_fd,
-                        buf_ptr: 0,
-                        len: 128,
-                    })
-                    .expect("read null"),
-                )
-                .expect("read null reply");
-                assert_eq!(
-                    VfsReply::from_opcode_payload_checked(dev_null_read.opcode, dev_null_read.as_slice())
+                    .expect("read null reply");
+                    assert_eq!(
+                        VfsReply::from_opcode_payload_checked(
+                            dev_null_read.opcode,
+                            dev_null_read.as_slice()
+                        )
                         .expect("decode"),
-                    VfsReply::ReadLen(0)
-                );
+                        VfsReply::ReadLen(0)
+                    );
 
-                let dev_console_fd = decode_fd_reply(
-                    roundtrip_ipc(
+                    let dev_console_fd = decode_fd_reply(
+                        roundtrip_ipc(
+                            kernel,
+                            devfs,
+                            client_send,
+                            server_recv,
+                            server_send,
+                            client_recv,
+                            openat_message(OpenAtRequest {
+                                dirfd: 0,
+                                path_ptr: DEV_CONSOLE_PATH_PTR,
+                                flags: 0,
+                                mode: 0,
+                            })
+                            .expect("open console"),
+                        )
+                        .expect("open console reply"),
+                    )
+                    .expect("decode fd");
+                    let dev_console_write = roundtrip_ipc(
                         kernel,
                         devfs,
                         client_send,
                         server_recv,
                         server_send,
                         client_recv,
-                        openat_message(OpenAtRequest {
-                            dirfd: 0,
-                            path_ptr: DEV_CONSOLE_PATH_PTR,
-                            flags: 0,
-                            mode: 0,
+                        write_message(ReadWriteRequest {
+                            fd: dev_console_fd,
+                            buf_ptr: 0,
+                            len: 17,
                         })
-                        .expect("open console"),
+                        .expect("write console"),
                     )
-                    .expect("open console reply"),
-                )
-                .expect("decode fd");
-                let dev_console_write = roundtrip_ipc(
-                    kernel,
-                    devfs,
-                    client_send,
-                    server_recv,
-                    server_send,
-                    client_recv,
-                    write_message(ReadWriteRequest {
-                        fd: dev_console_fd,
-                        buf_ptr: 0,
-                        len: 17,
-                    })
-                    .expect("write console"),
-                )
-                .expect("write console reply");
-                assert_eq!(
-                    VfsReply::from_opcode_payload_checked(
-                        dev_console_write.opcode,
-                        dev_console_write.as_slice(),
-                    )
-                    .expect("decode"),
-                    VfsReply::WriteLen(17)
-                );
-            });
+                    .expect("write console reply");
+                    assert_eq!(
+                        VfsReply::from_opcode_payload_checked(
+                            dev_console_write.opcode,
+                            dev_console_write.as_slice(),
+                        )
+                        .expect("decode"),
+                        VfsReply::WriteLen(17)
+                    );
+                },
+            );
 
             // RamFS: write then statx reflects non-zero encoded metadata.
-            with_kernel_roundtrip(RamFsBackend::new(), |kernel, ramfs, client_send, server_recv, server_send, client_recv| {
-                let ram_fd = decode_fd_reply(
-                    roundtrip_ipc(
+            with_kernel_roundtrip(
+                RamFsBackend::new(),
+                |kernel, ramfs, client_send, server_recv, server_send, client_recv| {
+                    let ram_fd = decode_fd_reply(
+                        roundtrip_ipc(
+                            kernel,
+                            ramfs,
+                            client_send,
+                            server_recv,
+                            server_send,
+                            client_recv,
+                            openat_message(OpenAtRequest {
+                                dirfd: 0,
+                                path_ptr: 0xCAFE,
+                                flags: 0,
+                                mode: 0,
+                            })
+                            .expect("open ramfs"),
+                        )
+                        .expect("open ramfs reply"),
+                    )
+                    .expect("decode fd");
+                    let _ = roundtrip_ipc(
                         kernel,
                         ramfs,
                         client_send,
                         server_recv,
                         server_send,
                         client_recv,
-                        openat_message(OpenAtRequest {
+                        write_message(ReadWriteRequest {
+                            fd: ram_fd,
+                            buf_ptr: 0,
+                            len: 64,
+                        })
+                        .expect("write ramfs"),
+                    )
+                    .expect("write ramfs reply");
+                    let ram_stat = roundtrip_ipc(
+                        kernel,
+                        ramfs,
+                        client_send,
+                        server_recv,
+                        server_send,
+                        client_recv,
+                        statx_message(StatxRequest {
                             dirfd: 0,
                             path_ptr: 0xCAFE,
                             flags: 0,
-                            mode: 0,
+                            mask_or_buf: 0,
                         })
-                        .expect("open ramfs"),
+                        .expect("stat ramfs"),
                     )
-                    .expect("open ramfs reply"),
-                )
-                .expect("decode fd");
-                let _ = roundtrip_ipc(
-                    kernel,
-                    ramfs,
-                    client_send,
-                    server_recv,
-                    server_send,
-                    client_recv,
-                    write_message(ReadWriteRequest {
-                        fd: ram_fd,
-                        buf_ptr: 0,
-                        len: 64,
-                    })
-                    .expect("write ramfs"),
-                )
-                .expect("write ramfs reply");
-                let ram_stat = roundtrip_ipc(
-                    kernel,
-                    ramfs,
-                    client_send,
-                    server_recv,
-                    server_send,
-                    client_recv,
-                    statx_message(StatxRequest {
-                        dirfd: 0,
-                        path_ptr: 0xCAFE,
-                        flags: 0,
-                        mask_or_buf: 0,
-                    })
-                    .expect("stat ramfs"),
-                )
-                .expect("stat ramfs reply");
-                assert!(
-                    VfsReply::from_opcode_payload_checked(ram_stat.opcode, ram_stat.as_slice())
-                        .expect("decode")
-                        .as_u64()
-                        > 0
-                );
-            });
+                    .expect("stat ramfs reply");
+                    assert!(
+                        VfsReply::from_opcode_payload_checked(ram_stat.opcode, ram_stat.as_slice())
+                            .expect("decode")
+                            .as_u64()
+                            > 0
+                    );
+                },
+            );
 
             // Initramfs: read succeeds (bounded by file length) and write is rejected.
             with_kernel_roundtrip(
@@ -792,8 +793,11 @@ mod tests {
                     )
                     .expect("read init reply");
                     assert_eq!(
-                        VfsReply::from_opcode_payload_checked(init_read.opcode, init_read.as_slice())
-                            .expect("decode"),
+                        VfsReply::from_opcode_payload_checked(
+                            init_read.opcode,
+                            init_read.as_slice()
+                        )
+                        .expect("decode"),
                         VfsReply::ReadLen(4096)
                     );
                     let init_write = roundtrip_ipc(

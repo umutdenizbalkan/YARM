@@ -5,37 +5,37 @@ mod launch;
 mod mount;
 mod policy;
 
+use alloc::boxed::Box;
+#[cfg(test)]
+use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
 use yarm_fs_servers::common::service::FsService;
 use yarm_fs_servers::common::vfs_ipc::{
-    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
+    ReadWriteRequest, openat_inline_message, statx_inline_message, write_message,
 };
 use yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
 use yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
-use yarm_fs_servers::ext4::{Ext4Backend, Ext4Service};
+use yarm_fs_servers::ext4::{EXT4_DEMO_PATH, Ext4Backend, Ext4Service};
 use yarm_fs_servers::fat::{FatBackend, FatService};
 use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
 use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
-use yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
-#[cfg(test)]
-use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
-#[cfg(not(test))]
-use yarm_user_rt::runtime::KernelIpcError as KernelError;
-use yarm_user_rt::capability::CapId;
-#[cfg(test)]
-use yarm_user_rt::capability::CapRights;
-#[cfg(test)]
-use yarm_user_rt::task::{TaskClass, TaskStatus};
-#[cfg(test)]
-use yarm_user_rt::vm::Asid;
-#[cfg(test)]
-use yarm_user_rt::vm::PAGE_SIZE;
-use alloc::boxed::Box;
+use yarm_fs_servers::ramfs::{RAMFS_BOOT_PATH, RamFsBackend, RamFsService};
 #[cfg(test)]
 use yarm_ipc_abi::supervisor_abi::{
     InitAlert, InitAlertKind, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, TaskExitedEvent,
 };
 use yarm_srv_common::vfs_reply::VfsReply;
+use yarm_user_rt::capability::CapId;
+#[cfg(test)]
+use yarm_user_rt::capability::CapRights;
+#[cfg(not(test))]
+use yarm_user_rt::runtime::KernelIpcError as KernelError;
+#[cfg(test)]
+use yarm_user_rt::task::{TaskClass, TaskStatus};
+#[cfg(test)]
+use yarm_user_rt::vm::Asid;
+#[cfg(test)]
+use yarm_user_rt::vm::PAGE_SIZE;
 
 pub use launch::{CoreLaunchReport, CoreServiceGraph, CoreServiceHandles, CoreServiceImagePlan};
 pub use mount::{MountPlan, MountRecoveryReport, MountServiceKind};
@@ -555,11 +555,8 @@ impl InitService {
 
         if let (Some(tid), Some(entry)) = (posix_compat_tid, posix_compat_entry) {
             let (compat_asid, _compat_aspace_cap) = kernel.create_user_address_space()?;
-            let compat_startup_args = Self::delegate_process_manager_startup_caps_for_compat(
-                kernel,
-                proc_tid,
-                tid,
-            )?;
+            let compat_startup_args =
+                Self::delegate_process_manager_startup_caps_for_compat(kernel, proc_tid, tid)?;
             kernel.spawn_user_task_from_image(UserImageSpec {
                 tid,
                 entry,
@@ -1092,7 +1089,7 @@ fn run_mount_initramfs() -> Result<(), KernelError> {
 
 fn run_mount_ramfs() -> Result<(), KernelError> {
     let mut service = Box::new(RamFsService::with_backend(RamFsBackend::new()));
-    run_rw_mount_cycle(service.as_mut(), 0xA100, 64)
+    run_rw_mount_cycle(service.as_mut(), RAMFS_BOOT_PATH, 64)
 }
 
 fn run_mount_devfs() -> Result<(), KernelError> {
@@ -1103,18 +1100,13 @@ fn run_mount_devfs() -> Result<(), KernelError> {
 
 fn run_mount_ext4() -> Result<(), KernelError> {
     let mut service = Box::new(Ext4Service::with_backend(Ext4Backend::new()));
-    run_rw_mount_cycle(service.as_mut(), 0x4040, 4096)
+    run_rw_mount_cycle(service.as_mut(), EXT4_DEMO_PATH, 4096)
 }
 
 fn run_mount_fat() -> Result<(), KernelError> {
     let mut service = Box::new(FatService::with_backend(FatBackend::new()));
-    let open = openat_message(OpenAtRequest {
-        dirfd: 0,
-        path_ptr: 0x5050,
-        flags: 0,
-        mode: 0,
-    })
-    .map_err(|_| KernelError::WrongObject)?;
+    let open =
+        openat_inline_message(0, b"/hello.txt", 0, 0).map_err(|_| KernelError::WrongObject)?;
     let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
     let fd = VfsReply::from_opcode_payload_checked(open_reply.opcode, open_reply.as_slice())
         .map_err(|_| KernelError::WrongObject)?
@@ -1133,16 +1125,10 @@ fn run_mount_fat() -> Result<(), KernelError> {
 
 fn run_rw_mount_cycle<B: yarm_fs_servers::common::vfs_ipc::VfsBackend>(
     service: &mut FsService<B>,
-    path_ptr: u64,
+    path: &[u8],
     write_len: u64,
 ) -> Result<(), KernelError> {
-    let open = openat_message(OpenAtRequest {
-        dirfd: 0,
-        path_ptr,
-        flags: 0,
-        mode: 0,
-    })
-    .map_err(|_| KernelError::WrongObject)?;
+    let open = openat_inline_message(0, path, 0, 0).map_err(|_| KernelError::WrongObject)?;
     let open_reply = service.handle(open).map_err(|_| KernelError::WrongObject)?;
     let fd = VfsReply::from_opcode_payload_checked(open_reply.opcode, open_reply.as_slice())
         .map_err(|_| KernelError::WrongObject)?
@@ -1156,13 +1142,7 @@ fn run_rw_mount_cycle<B: yarm_fs_servers::common::vfs_ipc::VfsBackend>(
     service
         .handle(write)
         .map_err(|_| KernelError::WrongObject)?;
-    let stat = statx_message(StatxRequest {
-        dirfd: 0,
-        path_ptr,
-        flags: 0,
-        mask_or_buf: 0,
-    })
-    .map_err(|_| KernelError::WrongObject)?;
+    let stat = statx_inline_message(0, path, 0, 0).map_err(|_| KernelError::WrongObject)?;
     service.handle(stat).map_err(|_| KernelError::WrongObject)?;
     Ok(())
 }
@@ -1452,7 +1432,10 @@ mod tests {
             init.recover_supervisor_failure(&mut state, token)
                 .expect("recover")
         );
-        assert_eq!(state.task_status(4).map(map_task_status), Some(TaskStatus::Runnable));
+        assert_eq!(
+            state.task_status(4).map(map_task_status),
+            Some(TaskStatus::Runnable)
+        );
     }
 
     #[test]
@@ -1497,7 +1480,10 @@ mod tests {
             init.recover_core_service_failure(&mut state, CoreServiceKind::ProcessManager, token)
                 .expect("recover")
         );
-        assert_eq!(state.task_status(2).map(map_task_status), Some(TaskStatus::Runnable));
+        assert_eq!(
+            state.task_status(2).map(map_task_status),
+            Some(TaskStatus::Runnable)
+        );
     }
 
     #[test]
@@ -1533,7 +1519,10 @@ mod tests {
             init.recover_core_service_failure(&mut state, CoreServiceKind::Vfs, token)
                 .expect("recover")
         );
-        assert_eq!(state.task_status(3).map(map_task_status), Some(TaskStatus::Runnable));
+        assert_eq!(
+            state.task_status(3).map(map_task_status),
+            Some(TaskStatus::Runnable)
+        );
     }
 
     #[test]
