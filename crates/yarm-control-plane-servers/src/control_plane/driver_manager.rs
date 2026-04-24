@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm::kernel::boot::{KernelError, KernelState};
 use yarm_ipc_abi::driver_abi::{
     DRIVER_OP_GRANT_DMA, DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, DRIVER_OP_RESTARTED,
 };
+#[cfg(test)]
+use yarm::kernel::boot::{KernelError, KernelState};
 use yarm_user_rt::capability::CapId;
 use yarm_user_rt::ipc::Message;
 use yarm_user_rt::runtime::{DriverControlOps, KernelIpcError};
@@ -32,16 +33,19 @@ fn ok_reply(
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub struct KernelDriverControl<'a> {
     kernel: &'a mut KernelState,
 }
 
+#[cfg(test)]
 impl<'a> KernelDriverControl<'a> {
     pub const fn new(kernel: &'a mut KernelState) -> Self {
         Self { kernel }
     }
 }
 
+#[cfg(test)]
 impl DriverControlOps for KernelDriverControl<'_> {
     fn register_driver(&mut self, tid: u64) -> Result<(), KernelIpcError> {
         self.kernel.register_driver(tid).map_err(map_kernel_ipc_error)
@@ -83,6 +87,7 @@ impl DriverControlOps for KernelDriverControl<'_> {
     }
 }
 
+#[cfg(test)]
 fn map_kernel_ipc_error(err: KernelError) -> KernelIpcError {
     match err {
         KernelError::MissingRight => KernelIpcError::MissingRight,
