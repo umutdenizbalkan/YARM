@@ -3,18 +3,25 @@
 
 use super::super::common::vfs_ipc::{VfsBackend, VfsError};
 
+/// Compatibility-only legacy path identifier; prefer `INITRAMFS_BOOT_MARKER_PATH`.
 pub const INITRAMFS_BOOT_MARKER_PATH_PTR: u64 = 0x494E_4954_424F_4F54;
 pub const INITRAMFS_BOOT_MARKER_PATH: &[u8] = b"/initramfs/boot-marker";
+/// Compatibility-only legacy path identifier; prefer `INITRAMFS_INIT_PATH`.
 pub const INITRAMFS_INIT_PATH_PTR: u64 = 0x494E_4954_524F_4F54;
 pub const INITRAMFS_INIT_PATH: &[u8] = b"/initramfs/init";
+/// Compatibility-only legacy path identifier; prefer `INITRAMFS_ETC_HOSTS_PATH`.
 pub const INITRAMFS_ETC_HOSTS_PATH_PTR: u64 = 0x494E_4954_484F_5354;
 pub const INITRAMFS_ETC_HOSTS_PATH: &[u8] = b"/initramfs/etc/hosts";
+/// Compatibility-only legacy path identifier; prefer `INITRAMFS_PROC_MGR_PATH`.
 pub const INITRAMFS_PROC_MGR_PATH_PTR: u64 = 0x494E_4954_5052_4F43;
 pub const INITRAMFS_PROC_MGR_PATH: &[u8] = b"/initramfs/process_manager";
+/// Compatibility-only legacy path identifier; prefer `INITRAMFS_VFS_PATH`.
 pub const INITRAMFS_VFS_PATH_PTR: u64 = 0x494E_4954_5F56_4653;
 pub const INITRAMFS_VFS_PATH: &[u8] = b"/initramfs/vfs";
+/// Compatibility-only legacy path identifier; prefer `INITRAMFS_SUPERVISOR_PATH`.
 pub const INITRAMFS_SUPERVISOR_PATH_PTR: u64 = 0x494E_4954_5355_5056;
 pub const INITRAMFS_SUPERVISOR_PATH: &[u8] = b"/initramfs/supervisor";
+/// Compatibility-only legacy path identifier; prefer `INITRAMFS_POSIX_COMPAT_PATH`.
 pub const INITRAMFS_POSIX_COMPAT_PATH_PTR: u64 = 0x494E_4954_5058_434D;
 pub const INITRAMFS_POSIX_COMPAT_PATH: &[u8] = b"/initramfs/posix_compat";
 
@@ -25,7 +32,7 @@ const INITRAMFS_MODE_OWNER_READ: u64 = 0o400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InitramfsInode {
-    path_ptr: u64,
+    path: &'static [u8],
     file_len: u64,
 }
 
@@ -67,31 +74,31 @@ impl InitramfsBackend {
             handles: [None; MAX_INITRAMFS_HANDLES],
             inodes: [
                 Some(InitramfsInode {
-                    path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
+                    path: INITRAMFS_BOOT_MARKER_PATH,
                     file_len: boot_file_len,
                 }),
                 Some(InitramfsInode {
-                    path_ptr: INITRAMFS_INIT_PATH_PTR,
+                    path: INITRAMFS_INIT_PATH,
                     file_len: 1024,
                 }),
                 Some(InitramfsInode {
-                    path_ptr: INITRAMFS_ETC_HOSTS_PATH_PTR,
+                    path: INITRAMFS_ETC_HOSTS_PATH,
                     file_len: 256,
                 }),
                 Some(InitramfsInode {
-                    path_ptr: INITRAMFS_PROC_MGR_PATH_PTR,
+                    path: INITRAMFS_PROC_MGR_PATH,
                     file_len: 1536,
                 }),
                 Some(InitramfsInode {
-                    path_ptr: INITRAMFS_VFS_PATH_PTR,
+                    path: INITRAMFS_VFS_PATH,
                     file_len: 1536,
                 }),
                 Some(InitramfsInode {
-                    path_ptr: INITRAMFS_SUPERVISOR_PATH_PTR,
+                    path: INITRAMFS_SUPERVISOR_PATH,
                     file_len: 1536,
                 }),
                 Some(InitramfsInode {
-                    path_ptr: INITRAMFS_POSIX_COMPAT_PATH_PTR,
+                    path: INITRAMFS_POSIX_COMPAT_PATH,
                     file_len: 1536,
                 }),
                 None,
@@ -112,15 +119,24 @@ impl InitramfsBackend {
         self.metrics
     }
 
-    fn inode_idx_for_path(&self, path_ptr: u64) -> Result<usize, VfsError> {
+    fn legacy_path_from_ptr(path_ptr: u64) -> Option<&'static [u8]> {
+        match path_ptr {
+            INITRAMFS_BOOT_MARKER_PATH_PTR => Some(INITRAMFS_BOOT_MARKER_PATH),
+            INITRAMFS_INIT_PATH_PTR => Some(INITRAMFS_INIT_PATH),
+            INITRAMFS_ETC_HOSTS_PATH_PTR => Some(INITRAMFS_ETC_HOSTS_PATH),
+            INITRAMFS_PROC_MGR_PATH_PTR => Some(INITRAMFS_PROC_MGR_PATH),
+            INITRAMFS_VFS_PATH_PTR => Some(INITRAMFS_VFS_PATH),
+            INITRAMFS_SUPERVISOR_PATH_PTR => Some(INITRAMFS_SUPERVISOR_PATH),
+            INITRAMFS_POSIX_COMPAT_PATH_PTR => Some(INITRAMFS_POSIX_COMPAT_PATH),
+            _ => None,
+        }
+    }
+
+    fn lookup_by_path(&self, path: &[u8]) -> Result<usize, VfsError> {
         self.inodes
             .iter()
-            .position(|entry| {
-                entry
-                    .map(|inode| inode.path_ptr == path_ptr)
-                    .unwrap_or(false)
-            })
-            .ok_or(VfsError::BadFd)
+            .position(|entry| entry.map(|inode| inode.path == path).unwrap_or(false))
+            .ok_or(VfsError::InvalidPath)
     }
 
     fn inode_for_fd(&self, fd: u64) -> Result<InitramfsInode, VfsError> {
@@ -158,14 +174,25 @@ impl InitramfsBackend {
     fn statx_value(file_len: u64) -> u64 {
         INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (file_len << 16)
     }
+
+    fn metadata_by_path(&self, path: &[u8]) -> Result<u64, VfsError> {
+        let inode_idx = self.lookup_by_path(path)?;
+        let inode = self.inodes[inode_idx].ok_or(VfsError::BadFd)?;
+        Ok(Self::statx_value(inode.file_len))
+    }
 }
 
 impl VfsBackend for InitramfsBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        match self
-            .inode_idx_for_path(path_ptr)
-            .and_then(|inode_idx| self.alloc_handle(inode_idx))
-        {
+        let Some(path) = Self::legacy_path_from_ptr(path_ptr) else {
+            self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+            return Err(VfsError::BadFd);
+        };
+        self.openat_path(path)
+    }
+
+    fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        match self.lookup_by_path(path).and_then(|inode_idx| self.alloc_handle(inode_idx)) {
             Ok(fd) => {
                 self.metrics.open_count = self.metrics.open_count.saturating_add(1);
                 Ok(fd)
@@ -175,20 +202,6 @@ impl VfsBackend for InitramfsBackend {
                 Err(err)
             }
         }
-    }
-
-    fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
-        let path_ptr = match path {
-            INITRAMFS_BOOT_MARKER_PATH => INITRAMFS_BOOT_MARKER_PATH_PTR,
-            INITRAMFS_INIT_PATH => INITRAMFS_INIT_PATH_PTR,
-            INITRAMFS_ETC_HOSTS_PATH => INITRAMFS_ETC_HOSTS_PATH_PTR,
-            INITRAMFS_PROC_MGR_PATH => INITRAMFS_PROC_MGR_PATH_PTR,
-            INITRAMFS_VFS_PATH => INITRAMFS_VFS_PATH_PTR,
-            INITRAMFS_SUPERVISOR_PATH => INITRAMFS_SUPERVISOR_PATH_PTR,
-            INITRAMFS_POSIX_COMPAT_PATH => INITRAMFS_POSIX_COMPAT_PATH_PTR,
-            _ => return Err(VfsError::InvalidPath),
-        };
-        self.openat(path_ptr)
     }
 
     fn close(&mut self, fd: u64) -> Result<u64, VfsError> {
@@ -230,33 +243,24 @@ impl VfsBackend for InitramfsBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        match self
-            .inode_idx_for_path(path_ptr)
-            .and_then(|inode_idx| self.inodes[inode_idx].ok_or(VfsError::BadFd))
-        {
-            Ok(inode) => {
+        let Some(path) = Self::legacy_path_from_ptr(path_ptr) else {
+            self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+            return Err(VfsError::BadFd);
+        };
+        self.statx_path(path)
+    }
+
+    fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        match self.metadata_by_path(path) {
+            Ok(stat) => {
                 self.metrics.statx_count = self.metrics.statx_count.saturating_add(1);
-                Ok(Self::statx_value(inode.file_len))
+                Ok(stat)
             }
             Err(err) => {
                 self.metrics.error_count = self.metrics.error_count.saturating_add(1);
                 Err(err)
             }
         }
-    }
-
-    fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
-        let path_ptr = match path {
-            INITRAMFS_BOOT_MARKER_PATH => INITRAMFS_BOOT_MARKER_PATH_PTR,
-            INITRAMFS_INIT_PATH => INITRAMFS_INIT_PATH_PTR,
-            INITRAMFS_ETC_HOSTS_PATH => INITRAMFS_ETC_HOSTS_PATH_PTR,
-            INITRAMFS_PROC_MGR_PATH => INITRAMFS_PROC_MGR_PATH_PTR,
-            INITRAMFS_VFS_PATH => INITRAMFS_VFS_PATH_PTR,
-            INITRAMFS_SUPERVISOR_PATH => INITRAMFS_SUPERVISOR_PATH_PTR,
-            INITRAMFS_POSIX_COMPAT_PATH => INITRAMFS_POSIX_COMPAT_PATH_PTR,
-            _ => return Err(VfsError::InvalidPath),
-        };
-        self.statx(path_ptr)
     }
 }
 
@@ -347,5 +351,24 @@ mod tests {
         assert_eq!(proc_stat, expected);
         assert_eq!(vfs_stat, expected);
         assert_eq!(supervisor_stat, expected);
+    }
+
+    #[test]
+    fn initramfs_legacy_path_ptr_adapter_maps_to_byte_paths() {
+        let mut fs = InitramfsBackend::new(4096);
+        let fd = fs.openat(INITRAMFS_BOOT_MARKER_PATH_PTR).expect("open ptr");
+        let stat = fs.statx(INITRAMFS_BOOT_MARKER_PATH_PTR).expect("stat ptr");
+        assert_eq!(fd, 10);
+        assert_eq!(
+            stat,
+            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (4096 << 16)
+        );
+    }
+
+    #[test]
+    fn initramfs_legacy_path_ptr_adapter_rejects_unknown_ids() {
+        let mut fs = InitramfsBackend::new(4096);
+        assert_eq!(fs.openat(0xDEAD_BEEF), Err(VfsError::BadFd));
+        assert_eq!(fs.statx(0xDEAD_BEEF), Err(VfsError::BadFd));
     }
 }
