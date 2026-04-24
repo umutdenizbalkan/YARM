@@ -22,6 +22,7 @@ use yarm_ipc_abi::vfs_abi::{
     VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ,
     VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
 };
+use yarm_user_rt::syscall::{IpcTransport, SyscallError};
 
 pub mod sim;
 pub mod sysdeps;
@@ -182,83 +183,92 @@ impl PosixServiceBindings {
 
     fn send_proc_request(
         &self,
-        kernel: &mut KernelState,
+        transport: &mut impl IpcTransport,
         opcode: u16,
         arg0: u64,
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), PosixErrno> {
         let send_cap = self
             .proc_mgr_request_send
-            .ok_or(KernelError::InvalidCapability)?;
-        let msg = Message::with_header(0, opcode, 0, None, &arg0.to_le_bytes())
-            .map_err(|_| KernelError::WrongObject)?;
-        kernel.ipc_send(send_cap, msg)
+            .ok_or(PosixErrno::Inval)?;
+        let msg = yarm_user_rt::ipc::Message::with_header(0, opcode, 0, None, &arg0.to_le_bytes())
+            .map_err(|_| PosixErrno::Inval)?;
+        transport.send(send_cap.0 as u32, &msg).map_err(PosixErrno::from)
     }
 
     #[allow(dead_code)]
     fn send_proc_request2(
         &self,
-        kernel: &mut KernelState,
+        transport: &mut impl IpcTransport,
         opcode: u16,
         arg0: u64,
         arg1: u64,
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), PosixErrno> {
         let send_cap = self
             .proc_mgr_request_send
-            .ok_or(KernelError::InvalidCapability)?;
+            .ok_or(PosixErrno::Inval)?;
         let payload = match opcode {
             PROC_OP_WAITPID_V2 => WaitPidV2Args::new(arg0, arg1).encode(),
             _ => SpawnV2Args::new(arg0, arg1).encode(),
         };
-        let msg = Message::with_header(0, opcode, 0, None, &payload)
-            .map_err(|_| KernelError::WrongObject)?;
-        kernel.ipc_send(send_cap, msg)
+        let msg =
+            yarm_user_rt::ipc::Message::with_header(0, opcode, 0, None, &payload).map_err(|_| PosixErrno::Inval)?;
+        transport.send(send_cap.0 as u32, &msg).map_err(PosixErrno::from)
     }
 
-    fn recv_proc_reply(&self, kernel: &mut KernelState) -> Result<Option<Message>, KernelError> {
+    fn recv_proc_reply(
+        &self,
+        transport: &mut impl IpcTransport,
+    ) -> Result<Option<yarm_user_rt::ipc::Message>, PosixErrno> {
         let recv_cap = self
             .proc_mgr_reply_recv
-            .ok_or(KernelError::InvalidCapability)?;
-        kernel.ipc_recv(recv_cap)
+            .ok_or(PosixErrno::Inval)?;
+        transport.recv(recv_cap.0 as u32).map_err(PosixErrno::from)
     }
 
     fn send_vfs_request(
         &self,
-        kernel: &mut KernelState,
+        transport: &mut impl IpcTransport,
         opcode: u16,
         payload: &[u8],
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), PosixErrno> {
         let send_cap = self
             .vfs_request_send
-            .ok_or(KernelError::InvalidCapability)?;
-        let msg = Message::with_header(0, opcode, 0, None, payload)
-            .map_err(|_| KernelError::WrongObject)?;
-        kernel.ipc_send(send_cap, msg)
+            .ok_or(PosixErrno::Inval)?;
+        let msg = yarm_user_rt::ipc::Message::with_header(0, opcode, 0, None, payload)
+            .map_err(|_| PosixErrno::Inval)?;
+        transport.send(send_cap.0 as u32, &msg).map_err(PosixErrno::from)
     }
 
-    fn recv_vfs_reply(&self, kernel: &mut KernelState) -> Result<Option<Message>, KernelError> {
-        let recv_cap = self.vfs_reply_recv.ok_or(KernelError::InvalidCapability)?;
-        kernel.ipc_recv(recv_cap)
+    fn recv_vfs_reply(
+        &self,
+        transport: &mut impl IpcTransport,
+    ) -> Result<Option<yarm_user_rt::ipc::Message>, PosixErrno> {
+        let recv_cap = self.vfs_reply_recv.ok_or(PosixErrno::Inval)?;
+        transport.recv(recv_cap.0 as u32).map_err(PosixErrno::from)
     }
 
     fn send_socket_request(
         &self,
-        kernel: &mut KernelState,
+        transport: &mut impl IpcTransport,
         opcode: u16,
         payload: &[u8],
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), PosixErrno> {
         let send_cap = self
             .socket_request_send
-            .ok_or(KernelError::InvalidCapability)?;
-        let msg = Message::with_header(0, opcode, 0, None, payload)
-            .map_err(|_| KernelError::WrongObject)?;
-        kernel.ipc_send(send_cap, msg)
+            .ok_or(PosixErrno::Inval)?;
+        let msg = yarm_user_rt::ipc::Message::with_header(0, opcode, 0, None, payload)
+            .map_err(|_| PosixErrno::Inval)?;
+        transport.send(send_cap.0 as u32, &msg).map_err(PosixErrno::from)
     }
 
-    fn recv_socket_reply(&self, kernel: &mut KernelState) -> Result<Option<Message>, KernelError> {
+    fn recv_socket_reply(
+        &self,
+        transport: &mut impl IpcTransport,
+    ) -> Result<Option<yarm_user_rt::ipc::Message>, PosixErrno> {
         let recv_cap = self
             .socket_reply_recv
-            .ok_or(KernelError::InvalidCapability)?;
-        kernel.ipc_recv(recv_cap)
+            .ok_or(PosixErrno::Inval)?;
+        transport.recv(recv_cap.0 as u32).map_err(PosixErrno::from)
     }
 }
 
@@ -319,6 +329,90 @@ impl From<KernelError> for PosixErrno {
             | KernelError::UserMemoryFault => Self::Inval,
             _ => Self::NoSys,
         }
+    }
+}
+
+impl From<SyscallError> for PosixErrno {
+    fn from(value: SyscallError) -> Self {
+        match value {
+            SyscallError::MissingRight => Self::Perm,
+            SyscallError::WouldBlock => Self::Intr,
+            SyscallError::QueueFull | SyscallError::Internal => Self::NoMem,
+            SyscallError::TimedOut => Self::TimedOut,
+            SyscallError::InvalidNumber
+            | SyscallError::InvalidArgs
+            | SyscallError::InvalidCapability
+            | SyscallError::WrongObject
+            | SyscallError::PageFault => Self::Inval,
+        }
+    }
+}
+
+struct KernelStateIpcTransport<'a> {
+    kernel: &'a mut KernelState,
+}
+
+impl IpcTransport for KernelStateIpcTransport<'_> {
+    fn send(&mut self, ep_cap: u32, msg: &yarm_user_rt::ipc::Message) -> Result<(), SyscallError> {
+        let cap = CapId(ep_cap as u64);
+        let transfer_cap = msg.transferred_cap().map(|cap| cap.0);
+        let kernel_msg = Message::with_header(
+            msg.sender_tid.0,
+            msg.opcode,
+            msg.flags,
+            transfer_cap,
+            msg.as_slice(),
+        )
+        .map_err(|_| SyscallError::InvalidArgs)?;
+        self.kernel.ipc_send(cap, kernel_msg).map_err(map_kernel_error_to_syscall)
+    }
+
+    fn recv(&mut self, ep_cap: u32) -> Result<Option<yarm_user_rt::ipc::Message>, SyscallError> {
+        let cap = CapId(ep_cap as u64);
+        let msg = self.kernel.ipc_recv(cap).map_err(map_kernel_error_to_syscall)?;
+        msg.map(|msg| {
+            yarm_user_rt::ipc::Message::with_header(
+                msg.sender_tid.0,
+                msg.opcode,
+                msg.flags,
+                msg.transferred_cap().map(|cap| cap.0),
+                msg.as_slice(),
+            )
+            .map_err(|_| SyscallError::InvalidArgs)
+        })
+        .transpose()
+    }
+}
+
+fn map_kernel_error_to_syscall(err: KernelError) -> SyscallError {
+    match err {
+        KernelError::InvalidCapability => SyscallError::InvalidCapability,
+        KernelError::MissingRight => SyscallError::MissingRight,
+        KernelError::WrongObject | KernelError::StaleCapability => SyscallError::WrongObject,
+        KernelError::EndpointQueueFull => SyscallError::QueueFull,
+        KernelError::WouldBlock => SyscallError::WouldBlock,
+        KernelError::UserMemoryFault => SyscallError::PageFault,
+        KernelError::VmFull
+        | KernelError::SchedulerFull
+        | KernelError::CapabilityFull
+        | KernelError::EndpointFull
+        | KernelError::TaskTableFull
+        | KernelError::TaskMissing
+        | KernelError::MemoryObjectFull
+        | KernelError::MemoryObjectMissing
+        | KernelError::Vm(_) => SyscallError::Internal,
+    }
+}
+
+impl IpcTransport for KernelState {
+    fn send(&mut self, ep_cap: u32, msg: &yarm_user_rt::ipc::Message) -> Result<(), SyscallError> {
+        let mut transport = KernelStateIpcTransport { kernel: self };
+        transport.send(ep_cap, msg)
+    }
+
+    fn recv(&mut self, ep_cap: u32) -> Result<Option<yarm_user_rt::ipc::Message>, SyscallError> {
+        let mut transport = KernelStateIpcTransport { kernel: self };
+        transport.recv(ep_cap)
     }
 }
 
@@ -690,107 +784,78 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
     let result: Result<usize, PosixErrno> =
         (|| match PosixCompatSyscall::decode(frame.syscall_num())? {
             PosixCompatSyscall::Exit => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let code = frame.arg(LINUX_ARG0) as u64;
-                bindings
-                    .send_proc_request(kernel, PROC_OP_EXIT, code)
-                    .map_err(PosixErrno::from)?;
+                bindings.send_proc_request(&mut ipc, PROC_OP_EXIT, code)?;
                 Ok(0)
             }
             PosixCompatSyscall::Getpid => {
                 let tid = kernel.current_tid().ok_or(PosixErrno::NoSys)?;
-                bindings
-                    .send_proc_request(kernel, PROC_OP_GETPID, tid)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_proc_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                let mut ipc = KernelStateIpcTransport { kernel };
+                bindings.send_proc_request(&mut ipc, PROC_OP_GETPID, tid)?;
+                let reply = bindings.recv_proc_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Getppid => {
                 let tid = kernel.current_tid().ok_or(PosixErrno::NoSys)?;
-                bindings
-                    .send_proc_request(kernel, PROC_OP_GETPPID, tid)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_proc_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                let mut ipc = KernelStateIpcTransport { kernel };
+                bindings.send_proc_request(&mut ipc, PROC_OP_GETPPID, tid)?;
+                let reply = bindings.recv_proc_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Openat => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
                     frame.arg(LINUX_ARG2),
                     frame.arg(LINUX_ARG3),
                 );
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_OPENAT, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_OPENAT, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Close => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_CLOSE, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_CLOSE, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Read => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
                     frame.arg(LINUX_ARG2),
                     0,
                 );
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_READ, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_READ, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Write => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
                     frame.arg(LINUX_ARG2),
                     0,
                 );
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_WRITE, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_WRITE, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Ioctl => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
                     frame.arg(LINUX_ARG2),
                     frame.arg(LINUX_ARG3),
                 );
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_IOCTL, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_IOCTL, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Mmap => {
@@ -813,156 +878,117 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
                 Ok(0)
             }
             PosixCompatSyscall::Dup => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_DUP, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_DUP, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Fcntl => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
                     frame.arg(LINUX_ARG2),
                     0,
                 );
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_FCNTL, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_FCNTL, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Poll => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
                     frame.arg(LINUX_ARG2),
                     0,
                 );
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_POLL, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_POLL, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::EpollCreate1 => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_EPOLL_CREATE1, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_EPOLL_CREATE1, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::EpollCtl => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_epoll_ctl(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
                     frame.arg(LINUX_ARG2),
                     frame.arg(LINUX_ARG3),
                 );
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_EPOLL_CTL, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_EPOLL_CTL, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::EpollPwait => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_vfs4(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
                     frame.arg(LINUX_ARG2),
                     frame.arg(LINUX_ARG3),
                 );
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_EPOLL_PWAIT, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_EPOLL_PWAIT, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Sendfile => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_sendfile(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
                     frame.arg(LINUX_ARG2),
                     frame.arg(LINUX_ARG3),
                 );
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_SENDFILE, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_SENDFILE, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Statx => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = pack_statx(
                     frame.arg(LINUX_ARG0),
                     frame.arg(LINUX_ARG1),
                     frame.arg(LINUX_ARG2),
                     frame.arg(LINUX_ARG3),
                 );
-                bindings
-                    .send_vfs_request(kernel, VFS_OP_STATX, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_vfs_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_STATX, &payload)?;
+                let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Socket => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = SocketArgs::new(
                     frame.arg(LINUX_ARG0) as u64,
                     frame.arg(LINUX_ARG1) as u64,
                     frame.arg(LINUX_ARG2) as u64,
                 )
                 .encode();
-                bindings
-                    .send_socket_request(kernel, SOCKET_OP_SOCKET, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_socket_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_socket_request(&mut ipc, SOCKET_OP_SOCKET, &payload)?;
+                let reply = bindings.recv_socket_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Connect => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = ConnectArgs::new(
                     frame.arg(LINUX_ARG0) as u64,
                     frame.arg(LINUX_ARG1) as u64,
                     frame.arg(LINUX_ARG2) as u64,
                 )
                 .encode();
-                bindings
-                    .send_socket_request(kernel, SOCKET_OP_CONNECT, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_socket_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_socket_request(&mut ipc, SOCKET_OP_CONNECT, &payload)?;
+                let reply = bindings.recv_socket_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Sendto => {
+                let mut ipc = KernelStateIpcTransport { kernel };
                 let payload = SendToArgs::new(
                     frame.arg(LINUX_ARG0) as u64,
                     frame.arg(LINUX_ARG1) as u64,
@@ -972,13 +998,8 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
                     frame.arg(LINUX_ARG5) as u64,
                 )
                 .encode();
-                bindings
-                    .send_socket_request(kernel, SOCKET_OP_SENDTO, &payload)
-                    .map_err(PosixErrno::from)?;
-                let reply = bindings
-                    .recv_socket_reply(kernel)
-                    .map_err(PosixErrno::from)?
-                    .ok_or(PosixErrno::NoSys)?;
+                bindings.send_socket_request(&mut ipc, SOCKET_OP_SENDTO, &payload)?;
+                let reply = bindings.recv_socket_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
             PosixCompatSyscall::Brk => {
