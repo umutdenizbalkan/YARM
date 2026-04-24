@@ -18,6 +18,8 @@ use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
 use yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
 #[cfg(test)]
 use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
+#[cfg(not(test))]
+use yarm_user_rt::runtime::KernelIpcError as KernelError;
 use yarm_user_rt::capability::{CapId, CapRights};
 use yarm_user_rt::task::{TaskClass, TaskStatus};
 use yarm_user_rt::vm::Asid;
