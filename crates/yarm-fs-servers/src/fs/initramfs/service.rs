@@ -4,12 +4,12 @@
 use yarm_user_rt::ipc::Message;
 use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
-    OpenAtRequest, ReadWriteRequest, openat_message, read_message, statx_message, write_message,
+    ReadWriteRequest, openat_inline_message, read_message, statx_inline_message, write_message,
 };
 use super::super::common::service::FsService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
 use super::archive::{
-    INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend, InitramfsMetrics,
+    INITRAMFS_BOOT_MARKER_PATH, InitramfsBackend, InitramfsMetrics,
 };
 use yarm_srv_common::vfs_reply::VfsReply;
 
@@ -32,12 +32,7 @@ fn decode_reply_u64(reply: Message) -> u64 {
 }
 
 fn scripted_bootstrap_requests() -> Result<[Message; 1], VfsError> {
-    Ok([openat_message(OpenAtRequest {
-        dirfd: 0,
-        path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-        flags: 0,
-        mode: 0,
-    })?])
+    Ok([openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0)?])
 }
 
 fn scripted_bootstrap_io(fd: u64) -> Result<[Message; 2], VfsError> {
@@ -47,12 +42,7 @@ fn scripted_bootstrap_io(fd: u64) -> Result<[Message; 2], VfsError> {
             buf_ptr: 0,
             len: 512,
         })?,
-        statx_message(super::super::common::vfs_ipc::StatxRequest {
-            dirfd: 0,
-            path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-            flags: 0,
-            mask_or_buf: 0,
-        })?,
+        statx_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0)?,
     ])
 }
 
@@ -109,9 +99,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::archive::INITRAMFS_BOOT_MARKER_PATH;
+    use super::super::archive::{INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_BOOT_MARKER_PATH_PTR};
     use super::super::super::common::vfs_ipc::{
-        CloseRequest, MountNamespacePolicy, MountRouter, StatxRequest, close_message,
+        CloseRequest, MountNamespacePolicy, MountRouter, OpenAtRequest, StatxRequest, close_message,
         openat_message, read_message, statx_inline_message, statx_message,
     };
     use super::super::super::common::vfs_service::VfsService;

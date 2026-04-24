@@ -31,6 +31,7 @@ struct FdEntry {
 pub enum VfsRequest {
     OpenAt {
         _dirfd: u64,
+        /// Legacy pointer-path argument; prefer `path_inline`.
         path_ptr: u64,
         path_inline: Option<PathBytes>,
         _flags: u64,
@@ -51,6 +52,7 @@ pub enum VfsRequest {
     },
     Statx {
         _dirfd: u64,
+        /// Legacy pointer-path argument; prefer `path_inline`.
         path_ptr: u64,
         path_inline: Option<PathBytes>,
         _flags: u64,
@@ -98,6 +100,7 @@ pub enum VfsRequest {
 }
 
 pub trait VfsBackend {
+    /// Legacy pointer-path open; prefer `openat_path`.
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError>;
     fn openat_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
         Err(VfsError::InvalidPath)
@@ -105,6 +108,7 @@ pub trait VfsBackend {
     fn close(&mut self, fd: u64) -> Result<u64, VfsError>;
     fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
     fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
+    /// Legacy pointer-path statx; prefer `statx_path`.
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError>;
     fn statx_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
         Err(VfsError::InvalidPath)
@@ -496,6 +500,7 @@ pub struct Stat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAtRequest {
     pub dirfd: u64,
+    /// Legacy pointer-path argument; prefer inline byte-path requests.
     pub path_ptr: u64,
     pub flags: u64,
     pub mode: u64,
@@ -516,6 +521,7 @@ pub struct ReadWriteRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatxRequest {
     pub dirfd: u64,
+    /// Legacy pointer-path argument; prefer inline byte-path requests.
     pub path_ptr: u64,
     pub flags: u64,
     pub mask_or_buf: u64,

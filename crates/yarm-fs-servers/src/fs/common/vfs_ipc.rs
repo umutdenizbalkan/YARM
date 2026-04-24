@@ -10,6 +10,7 @@ use yarm_ipc_abi::vfs_abi::{
 
 pub use yarm_srv_common::vfs_core::*;
 
+/// Legacy pointer-path OPENAT message helper; prefer `openat_inline_message`.
 pub fn openat_message(req: OpenAtRequest) -> Result<Message, VfsError> {
     Message::with_header(
         0,
@@ -71,6 +72,7 @@ pub fn write_message(req: ReadWriteRequest) -> Result<Message, VfsError> {
     .map_err(|_| VfsError::Malformed)
 }
 
+/// Legacy pointer-path STATX message helper; prefer `statx_inline_message`.
 pub fn statx_message(req: StatxRequest) -> Result<Message, VfsError> {
     Message::with_header(
         0,
