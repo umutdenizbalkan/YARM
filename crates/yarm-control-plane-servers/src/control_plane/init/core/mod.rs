@@ -217,6 +217,7 @@ impl InitService {
         self.launch_strategy = strategy;
     }
 
+    #[cfg(test)]
     fn record_launch(
         &mut self,
         kernel: &mut KernelState,
@@ -236,6 +237,7 @@ impl InitService {
         Ok(())
     }
 
+    #[cfg(test)]
     fn allocate_core_service_asids(
         kernel: &mut KernelState,
     ) -> Result<(Asid, Asid, Asid), KernelError> {
@@ -291,6 +293,7 @@ impl InitService {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn register_core_graph(
         &mut self,
         kernel: &mut KernelState,
@@ -310,6 +313,7 @@ impl InitService {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn launch_core_services(
         &mut self,
         kernel: &mut KernelState,
@@ -318,6 +322,7 @@ impl InitService {
         self.launch_core_services_with_mount_fail_at(kernel, plan, None)
     }
 
+    #[cfg(test)]
     pub fn launch_core_services_with_mount_fail_at(
         &mut self,
         kernel: &mut KernelState,
@@ -404,6 +409,7 @@ impl InitService {
         })
     }
 
+    #[cfg(test)]
     pub fn install_fault_handoff(
         &mut self,
         kernel: &mut KernelState,
@@ -474,6 +480,7 @@ impl InitService {
             .map(|handoff| handoff.supervisor_fault_recv_cap)
     }
 
+    #[cfg(test)]
     pub fn validate_delegation_edges(&self, kernel: &KernelState) -> Result<(), KernelError> {
         let handoff = self.fault_handoff.ok_or(KernelError::WrongObject)?;
         let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
@@ -529,6 +536,7 @@ impl InitService {
         Err(KernelError::TaskTableFull)
     }
 
+    #[cfg(test)]
     fn send_supervisor_replay_entry(
         &self,
         kernel: &mut KernelState,
@@ -549,6 +557,7 @@ impl InitService {
         kernel.ipc_send(handoff.supervisor_control_send_cap, msg)
     }
 
+    #[cfg(test)]
     pub fn seed_supervisor_registrations(
         &mut self,
         kernel: &mut KernelState,
@@ -602,6 +611,7 @@ impl InitService {
         Ok(replayed)
     }
 
+    #[cfg(test)]
     pub fn register_driver_with_supervisor(
         &mut self,
         kernel: &mut KernelState,
@@ -612,6 +622,7 @@ impl InitService {
         self.send_supervisor_replay_entry(kernel, entry)
     }
 
+    #[cfg(test)]
     pub fn restore_supervisor_control_plane(
         &self,
         kernel: &mut KernelState,
@@ -624,6 +635,7 @@ impl InitService {
         Ok(replayed)
     }
 
+    #[cfg(test)]
     fn clear_supervisor_control_queue(&self, kernel: &mut KernelState) -> Result<(), KernelError> {
         let handoff = self.fault_handoff.ok_or(KernelError::WrongObject)?;
         while kernel
@@ -633,6 +645,7 @@ impl InitService {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn poll_init_alert(
         &self,
         kernel: &mut KernelState,
@@ -646,6 +659,7 @@ impl InitService {
             .map(Some)
     }
 
+    #[cfg(test)]
     pub fn monitor_supervisor(&mut self, kernel: &mut KernelState) -> Result<bool, KernelError> {
         let supervisor_tid = self
             .handles
@@ -654,6 +668,7 @@ impl InitService {
         self.monitor_core_service(kernel, supervisor_tid)
     }
 
+    #[cfg(test)]
     pub fn recover_supervisor_failure(
         &mut self,
         kernel: &mut KernelState,
@@ -709,6 +724,7 @@ impl InitService {
         }
     }
 
+    #[cfg(test)]
     pub fn recover_core_service_failure(
         &mut self,
         kernel: &mut KernelState,
@@ -751,6 +767,7 @@ impl InitService {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub fn recover_core_service_failure_by_tid(
         &mut self,
         kernel: &mut KernelState,
@@ -763,6 +780,7 @@ impl InitService {
         self.recover_core_service_failure(kernel, kind, restart_token)
     }
 
+    #[cfg(test)]
     pub fn handle_init_alert(
         &mut self,
         kernel: &mut KernelState,
@@ -783,6 +801,7 @@ impl InitService {
         }
     }
 
+    #[cfg(test)]
     pub fn monitor_core_service(
         &mut self,
         kernel: &mut KernelState,
@@ -800,6 +819,7 @@ impl InitService {
         self.recover_core_service_failure_by_tid(kernel, tid, token)
     }
 
+    #[cfg(test)]
     pub fn monitor_core_failures(
         &mut self,
         kernel: &mut KernelState,
@@ -828,6 +848,7 @@ impl InitService {
         Ok(recovered)
     }
 
+    #[cfg(test)]
     pub fn validate_boot_contract(&self, kernel: &KernelState) -> Result<(), KernelError> {
         let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
         let process_manager_tid = self
@@ -862,6 +883,7 @@ impl InitService {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn begin_running(&mut self, kernel: &KernelState) -> Result<(), KernelError> {
         self.validate_begin_running_preconditions()?;
         self.validate_boot_contract(kernel)?;
