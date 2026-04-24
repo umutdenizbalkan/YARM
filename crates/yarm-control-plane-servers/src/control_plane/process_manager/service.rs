@@ -5,6 +5,7 @@
 use yarm::kernel::boot::KernelState;
 #[cfg(test)]
 use yarm::kernel::boot::{KernelError, TrapHandleError};
+#[cfg(test)]
 use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcessManagerError};
 #[cfg(test)]
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
@@ -117,10 +118,16 @@ struct ProcessSpawnPolicyRecord {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct KernelProcessManagerAdapter {
     inner: ProcessManager,
 }
 
+#[derive(Debug, Default)]
+#[cfg(not(test))]
+struct KernelProcessManagerAdapter;
+
+#[cfg(test)]
 impl KernelProcessManagerAdapter {
     const fn new() -> Self {
         Self {
@@ -152,6 +159,14 @@ impl KernelProcessManagerAdapter {
     }
 }
 
+#[cfg(not(test))]
+impl KernelProcessManagerAdapter {
+    const fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(test)]
 impl ProcessManagerOps for KernelProcessManagerAdapter {
     fn process_id_for_tid(&self, tid: u64) -> ProcessId {
         Self::from_kernel_process_id(self.inner.process_id_for_tid(tid))
@@ -199,6 +214,40 @@ impl ProcessManagerOps for KernelProcessManagerAdapter {
         self.inner
             .mark_exit(Self::to_kernel_process_id(pid), code)
             .map_err(Self::map_kernel_process_error)
+    }
+}
+
+#[cfg(not(test))]
+impl ProcessManagerOps for KernelProcessManagerAdapter {
+    fn process_id_for_tid(&self, tid: u64) -> ProcessId {
+        ProcessId(tid)
+    }
+
+    fn parent_of(&self, _pid: ProcessId) -> Option<ProcessId> {
+        None
+    }
+
+    fn allocate_process(
+        &mut self,
+        _parent_pid: ProcessId,
+    ) -> Result<ProcessId, ProcessManagerError> {
+        Err(ProcessManagerError::Unsupported)
+    }
+
+    fn insert_synthetic_exit_for_tid(
+        &mut self,
+        _tid: u64,
+        _code: u64,
+    ) -> Result<(), ProcessManagerError> {
+        Ok(())
+    }
+
+    fn wait_exited(&mut self, _pid: ProcessId) -> Result<WaitResult, ProcessManagerError> {
+        Err(ProcessManagerError::WouldBlock)
+    }
+
+    fn mark_exit(&mut self, _pid: ProcessId, _code: u64) -> Result<(), ProcessManagerError> {
+        Ok(())
     }
 }
 
