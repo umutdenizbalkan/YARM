@@ -10,6 +10,16 @@ const MAX_PATH_LEN: usize = 32;
 const FAT_ENTRIES: usize = 128;
 const FAT_EOC: u16 = 0xFFFF;
 
+/// Compatibility-only legacy path identifier; prefer `FAT_HELLO_PATH`.
+pub const FAT_HELLO_PATH_PTR: u64 = 0x5050;
+pub const FAT_HELLO_PATH: &[u8] = b"/hello.txt";
+/// Compatibility-only legacy path identifier; prefer `FAT_ETC_CONFIG_PATH`.
+pub const FAT_ETC_CONFIG_PATH_PTR: u64 = 0x6060;
+pub const FAT_ETC_CONFIG_PATH: &[u8] = b"/etc/config";
+/// Compatibility-only legacy path identifier; prefer `FAT_EXT4_BRIDGE_PATH`.
+pub const FAT_EXT4_BRIDGE_PATH_PTR: u64 = 0x4040;
+pub const FAT_EXT4_BRIDGE_PATH: &[u8] = b"/ext4/file.bin";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FatPath {
     pub len: u8,
@@ -21,10 +31,12 @@ impl FatPath {
         Self { len, bytes }
     }
 
-    pub fn from_abi_path(path_ptr: u64) -> Result<Self, VfsError> {
-        let src = abi_path_bytes(path_ptr).ok_or(VfsError::BadFd)?;
+    pub fn from_path_bytes(src: &[u8]) -> Result<Self, VfsError> {
+        if src.is_empty() {
+            return Err(VfsError::InvalidPath);
+        }
         if src.len() > MAX_PATH_LEN {
-            return Err(VfsError::Malformed);
+            return Err(VfsError::NameTooLong);
         }
         let mut bytes = [0u8; MAX_PATH_LEN];
         bytes[..src.len()].copy_from_slice(src);
@@ -33,15 +45,24 @@ impl FatPath {
             bytes,
         })
     }
+
+    pub fn from_abi_path(path_ptr: u64) -> Result<Self, VfsError> {
+        let src = legacy_path_from_ptr(path_ptr).ok_or(VfsError::BadFd)?;
+        Self::from_path_bytes(src)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
 }
 
 const ABI_PATH_TABLE: &[(u64, &[u8])] = &[
-    (0x5050, b"/hello.txt"),
-    (0x6060, b"/etc/config"),
-    (0x4040, b"/ext4/file.bin"),
+    (FAT_HELLO_PATH_PTR, FAT_HELLO_PATH),
+    (FAT_ETC_CONFIG_PATH_PTR, FAT_ETC_CONFIG_PATH),
+    (FAT_EXT4_BRIDGE_PATH_PTR, FAT_EXT4_BRIDGE_PATH),
 ];
 
-fn abi_path_bytes(path_ptr: u64) -> Option<&'static [u8]> {
+fn legacy_path_from_ptr(path_ptr: u64) -> Option<&'static [u8]> {
     ABI_PATH_TABLE
         .iter()
         .find(|(ptr, _)| *ptr == path_ptr)
@@ -303,12 +324,30 @@ impl FatBackend {
 
     pub fn cluster_chain_head_for_path(&self, path_ptr: u64) -> Option<FatCluster> {
         let path = FatPath::from_abi_path(path_ptr).ok()?;
+        self.cluster_chain_head_for_path_bytes(path.as_bytes())
+    }
+
+    pub fn cluster_chain_head_for_path_bytes(&self, path: &[u8]) -> Option<FatCluster> {
+        let path = FatPath::from_path_bytes(path).ok()?;
         let idx = self.find_file_idx(path)?;
         let entry = self.files[idx]?;
         Some(FatCluster {
             id: entry.start_cluster,
             next: self.fat.next_cluster(entry.start_cluster),
         })
+    }
+
+    fn lookup_by_path(&self, path: &[u8]) -> Result<FatPath, VfsError> {
+        if !ABI_PATH_TABLE.iter().any(|(_, known)| *known == path) {
+            return Err(VfsError::InvalidPath);
+        }
+        FatPath::from_path_bytes(path)
+    }
+
+    fn metadata_by_path(&self, path: &[u8]) -> Result<u64, VfsError> {
+        let path = self.lookup_by_path(path)?;
+        let idx = self.find_file_idx(path).ok_or(VfsError::BadFd)?;
+        Ok(self.files[idx].ok_or(VfsError::BadFd)?.file_len)
     }
 }
 
@@ -318,6 +357,11 @@ impl VfsBackend for FatBackend {
             return Err(VfsError::BadFd);
         }
         let path = FatPath::from_abi_path(path_ptr)?;
+        self.openat_path(path.as_bytes())
+    }
+
+    fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        let path = self.lookup_by_path(path)?;
         let file_idx = self.alloc_file(path)?;
         self.alloc_fd(file_idx)
     }
@@ -345,9 +389,14 @@ impl VfsBackend for FatBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let path = FatPath::from_abi_path(path_ptr)?;
-        let idx = self.find_file_idx(path).ok_or(VfsError::BadFd)?;
-        Ok(self.files[idx].ok_or(VfsError::BadFd)?.file_len)
+        let Some(path) = legacy_path_from_ptr(path_ptr) else {
+            return Err(VfsError::BadFd);
+        };
+        self.statx_path(path)
+    }
+
+    fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        self.metadata_by_path(path)
     }
 }
 
@@ -387,18 +436,42 @@ mod tests {
     #[test]
     fn fat_chain_grows_as_file_expands() {
         let mut fs = FatBackend::new();
-        let fd = fs.openat(0x5050).expect("open");
+        let fd = fs.openat(FAT_HELLO_PATH_PTR).expect("open");
         let cluster_size = fs.cluster_size_bytes();
         let _ = fs.write(fd, cluster_size * 2 + 1).expect("write");
-        let head = fs.cluster_chain_head_for_path(0x5050).expect("head");
+        let head = fs.cluster_chain_head_for_path_bytes(FAT_HELLO_PATH).expect("head");
         assert!(head.next.is_some());
     }
 
     #[test]
     fn typed_pathname_layer_uses_abi_buffers() {
         let mut fs = FatBackend::new();
-        let fd = fs.openat(0x5050).expect("open");
+        let fd = fs.openat(FAT_HELLO_PATH_PTR).expect("open");
         let _ = fs.write(fd, 11).expect("write");
-        assert_eq!(fs.statx(0x5050).expect("stat"), 11);
+        assert_eq!(fs.statx(FAT_HELLO_PATH_PTR).expect("stat"), 11);
+    }
+
+    #[test]
+    fn byte_path_open_and_statx_work_for_known_paths() {
+        let mut fs = FatBackend::new();
+        let fd = fs.openat_path(FAT_HELLO_PATH).expect("open path");
+        let _ = fs.write(fd, 9).expect("write");
+        assert_eq!(fs.statx_path(FAT_HELLO_PATH).expect("statx path"), 9);
+    }
+
+    #[test]
+    fn byte_path_lookup_rejects_unknown_paths() {
+        let mut fs = FatBackend::new();
+        assert_eq!(fs.openat_path(b"/unknown"), Err(VfsError::InvalidPath));
+        assert_eq!(fs.statx_path(b"/unknown"), Err(VfsError::InvalidPath));
+    }
+
+    #[test]
+    fn legacy_pointer_adapter_still_works() {
+        let mut fs = FatBackend::new();
+        let fd = fs.openat(FAT_HELLO_PATH_PTR).expect("open ptr");
+        let _ = fs.write(fd, 5).expect("write");
+        assert_eq!(fs.statx(FAT_HELLO_PATH_PTR).expect("stat ptr"), 5);
+        assert_eq!(fs.statx(0xDEAD), Err(VfsError::BadFd));
     }
 }

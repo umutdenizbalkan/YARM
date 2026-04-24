@@ -3,22 +3,17 @@
 
 use super::fs::FatBackend;
 use super::super::common::vfs_ipc::{
-    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, statx_message, write_message,
+    ReadWriteRequest, openat_inline_message, statx_inline_message, write_message,
 };
 use super::super::common::service::FsService;
 use yarm_srv_common::vfs_reply::VfsReply;
+use super::fs::FAT_HELLO_PATH;
 
 pub type FatService = FsService<FatBackend>;
 
 pub fn run() {
     let mut svc = FatService::with_backend(FatBackend::new());
-    let open = openat_message(OpenAtRequest {
-        dirfd: 0,
-        path_ptr: 0x5050,
-        flags: 0,
-        mode: 0,
-    })
-    .expect("open");
+    let open = openat_inline_message(0, FAT_HELLO_PATH, 0, 0).expect("open");
     let rep = svc.handle(open).expect("open rep");
     let fd = VfsReply::from_opcode_payload_checked(rep.opcode, rep.as_slice())
         .expect("decode open")
@@ -32,13 +27,7 @@ pub fn run() {
     .expect("write");
     let _ = svc.handle(write).expect("write rep");
 
-    let stat = statx_message(StatxRequest {
-        dirfd: 0,
-        path_ptr: 0x5050,
-        flags: 0,
-        mask_or_buf: 0,
-    })
-    .expect("stat");
+    let stat = statx_inline_message(0, FAT_HELLO_PATH, 0, 0).expect("stat");
     let stat_rep = svc.handle(stat).expect("stat rep");
     let len = VfsReply::from_opcode_payload_checked(stat_rep.opcode, stat_rep.as_slice())
         .expect("decode stat")
