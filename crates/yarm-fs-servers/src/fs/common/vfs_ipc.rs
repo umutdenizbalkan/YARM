@@ -3,7 +3,7 @@
 
 use yarm_user_rt::ipc::Message;
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1,
+    OpenAtArgs, OpenAtInlinePath, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1,
     VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL,
     VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
 };
@@ -19,6 +19,23 @@ pub fn openat_message(req: OpenAtRequest) -> Result<Message, VfsError> {
         &OpenAtArgs::new(req.dirfd, req.path_ptr, req.flags, req.mode).encode(),
     )
     .map_err(|_| VfsError::Malformed)
+}
+
+pub fn openat_inline_message(
+    dirfd: u64,
+    path: &[u8],
+    flags: u64,
+    mode: u64,
+) -> Result<Message, VfsError> {
+    let (payload, len) = OpenAtInlinePath {
+        dirfd,
+        flags,
+        mode,
+        path,
+    }
+    .encode()
+    .ok_or(VfsError::NameTooLong)?;
+    Message::with_header(0, VFS_OP_OPENAT, 0, None, &payload[..len]).map_err(|_| VfsError::Malformed)
 }
 
 pub fn close_message(req: CloseRequest) -> Result<Message, VfsError> {

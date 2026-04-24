@@ -4,12 +4,19 @@
 use super::super::common::vfs_ipc::{VfsBackend, VfsError};
 
 pub const INITRAMFS_BOOT_MARKER_PATH_PTR: u64 = 0x494E_4954_424F_4F54;
+pub const INITRAMFS_BOOT_MARKER_PATH: &[u8] = b"/initramfs/boot-marker";
 pub const INITRAMFS_INIT_PATH_PTR: u64 = 0x494E_4954_524F_4F54;
+pub const INITRAMFS_INIT_PATH: &[u8] = b"/initramfs/init";
 pub const INITRAMFS_ETC_HOSTS_PATH_PTR: u64 = 0x494E_4954_484F_5354;
+pub const INITRAMFS_ETC_HOSTS_PATH: &[u8] = b"/initramfs/etc/hosts";
 pub const INITRAMFS_PROC_MGR_PATH_PTR: u64 = 0x494E_4954_5052_4F43;
+pub const INITRAMFS_PROC_MGR_PATH: &[u8] = b"/initramfs/process_manager";
 pub const INITRAMFS_VFS_PATH_PTR: u64 = 0x494E_4954_5F56_4653;
+pub const INITRAMFS_VFS_PATH: &[u8] = b"/initramfs/vfs";
 pub const INITRAMFS_SUPERVISOR_PATH_PTR: u64 = 0x494E_4954_5355_5056;
+pub const INITRAMFS_SUPERVISOR_PATH: &[u8] = b"/initramfs/supervisor";
 pub const INITRAMFS_POSIX_COMPAT_PATH_PTR: u64 = 0x494E_4954_5058_434D;
+pub const INITRAMFS_POSIX_COMPAT_PATH: &[u8] = b"/initramfs/posix_compat";
 
 const MAX_INITRAMFS_HANDLES: usize = 16;
 const MAX_INITRAMFS_INODES: usize = 8;
@@ -170,6 +177,20 @@ impl VfsBackend for InitramfsBackend {
         }
     }
 
+    fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        let path_ptr = match path {
+            INITRAMFS_BOOT_MARKER_PATH => INITRAMFS_BOOT_MARKER_PATH_PTR,
+            INITRAMFS_INIT_PATH => INITRAMFS_INIT_PATH_PTR,
+            INITRAMFS_ETC_HOSTS_PATH => INITRAMFS_ETC_HOSTS_PATH_PTR,
+            INITRAMFS_PROC_MGR_PATH => INITRAMFS_PROC_MGR_PATH_PTR,
+            INITRAMFS_VFS_PATH => INITRAMFS_VFS_PATH_PTR,
+            INITRAMFS_SUPERVISOR_PATH => INITRAMFS_SUPERVISOR_PATH_PTR,
+            INITRAMFS_POSIX_COMPAT_PATH => INITRAMFS_POSIX_COMPAT_PATH_PTR,
+            _ => return Err(VfsError::InvalidPath),
+        };
+        self.openat(path_ptr)
+    }
+
     fn close(&mut self, fd: u64) -> Result<u64, VfsError> {
         match self.close_handle(fd) {
             Ok(()) => {
@@ -238,6 +259,13 @@ mod tests {
         assert_eq!(fd0, 10);
         assert_eq!(fd1, 11);
         assert_eq!(fd2, 12);
+    }
+
+    #[test]
+    fn initramfs_openat_path_accepts_real_bytes() {
+        let mut fs = InitramfsBackend::new(4096);
+        let fd = fs.openat_path(INITRAMFS_BOOT_MARKER_PATH).expect("open path");
+        assert_eq!(fd, 10);
     }
 
     #[test]

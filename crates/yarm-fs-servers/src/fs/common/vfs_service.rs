@@ -6,7 +6,7 @@ use super::vfs_ipc::{
     InMemoryBackend, MountNamespacePolicy, MountRecord, VfsBackend, VfsError, VfsRequest,
 };
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1,
+    OpenAtArgs, OpenAtInlinePath, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1,
     VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL,
     VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
 };
@@ -231,11 +231,24 @@ impl<B: VfsBackend> VfsService<B> {
     pub fn parse_request(request: Message) -> Result<VfsRequest, VfsError> {
         match request.opcode {
             VFS_OP_OPENAT => {
+                if let Some(inline) = OpenAtInlinePath::decode(request.as_slice()) {
+                    return Ok(VfsRequest::OpenAt {
+                        _dirfd: inline.dirfd,
+                        path_ptr: 0,
+                        path_inline: Some(
+                            super::vfs_ipc::PathBytes::from_slice(inline.path)
+                                .map_err(|_| VfsError::Malformed)?,
+                        ),
+                        _flags: inline.flags,
+                        _mode: inline.mode,
+                    });
+                }
                 let args =
                     OpenAtArgs::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
                 Ok(VfsRequest::OpenAt {
                     _dirfd: args.dirfd,
                     path_ptr: args.path_ptr,
+                    path_inline: None,
                     _flags: args.flags,
                     _mode: args.mode,
                 })
@@ -347,11 +360,22 @@ impl<B: VfsBackend> VfsService<B> {
     pub fn handle_request(&mut self, request: Message) -> Result<Message, VfsError> {
         let parsed = Self::parse_request(request)?;
         let reply = match parsed {
-            VfsRequest::OpenAt { path_ptr, .. } => {
-                if !self.policy.allows_path(path_ptr) {
-                    return Err(VfsError::PermissionDenied);
+            VfsRequest::OpenAt {
+                path_ptr,
+                path_inline,
+                ..
+            } => {
+                if let Some(path) = path_inline {
+                    if !self.policy.allows_path_bytes(path.as_slice()) {
+                        return Err(VfsError::PermissionDenied);
+                    }
+                    VfsReply::OpenAtFd(self.backend.openat_path(path.as_slice())?)
+                } else {
+                    if !self.policy.allows_path(path_ptr) {
+                        return Err(VfsError::PermissionDenied);
+                    }
+                    VfsReply::OpenAtFd(self.backend.openat(path_ptr)?)
                 }
-                VfsReply::OpenAtFd(self.backend.openat(path_ptr)?)
             }
             VfsRequest::Close { fd } => VfsReply::CloseResult(self.backend.close(fd)?),
             VfsRequest::Read { fd, len, .. } => VfsReply::ReadLen(self.backend.read(fd, len)?),

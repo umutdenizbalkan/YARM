@@ -10,6 +10,8 @@ const MAX_POLICY_RANGES: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsError {
     Malformed,
+    InvalidPath,
+    NameTooLong,
     NoFd,
     BadFd,
     Unsupported,
@@ -30,6 +32,7 @@ pub enum VfsRequest {
     OpenAt {
         _dirfd: u64,
         path_ptr: u64,
+        path_inline: Option<PathBytes>,
         _flags: u64,
         _mode: u64,
     },
@@ -95,6 +98,9 @@ pub enum VfsRequest {
 
 pub trait VfsBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError>;
+    fn openat_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
+        Err(VfsError::InvalidPath)
+    }
     fn close(&mut self, fd: u64) -> Result<u64, VfsError>;
     fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
     fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
@@ -225,6 +231,14 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
         }
     }
 
+    fn route_by_path_bytes(&mut self, path: &[u8]) -> &mut dyn VfsBackend {
+        if path.starts_with(b"/initramfs/") {
+            &mut self.high
+        } else {
+            &mut self.low
+        }
+    }
+
     fn route_by_fd(&mut self, fd: u64) -> &mut dyn VfsBackend {
         if fd < self.split_at {
             &mut self.low
@@ -237,6 +251,10 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
 impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         self.route_by_path(path_ptr).openat(path_ptr)
+    }
+
+    fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        self.route_by_path_bytes(path).openat_path(path)
     }
 
     fn close(&mut self, fd: u64) -> Result<u64, VfsError> {
@@ -305,6 +323,17 @@ impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
 impl VfsBackend for InMemoryBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         self.alloc_fd(path_ptr)
+    }
+
+    fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        if path.is_empty() {
+            return Err(VfsError::InvalidPath);
+        }
+        let mut inode = 0u64;
+        for &byte in path {
+            inode = inode.wrapping_mul(131).wrapping_add(byte as u64);
+        }
+        self.alloc_fd(inode)
     }
 
     fn close(&mut self, fd: u64) -> Result<u64, VfsError> {
@@ -553,6 +582,42 @@ impl MountNamespacePolicy {
             idx += 1;
         }
         false
+    }
+
+    pub fn allows_path_bytes(self, path: &[u8]) -> bool {
+        if self.allow_all {
+            return true;
+        }
+        !path.is_empty() && path.starts_with(b"/")
+    }
+}
+
+pub const INLINE_PATH_MAX: usize = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathBytes {
+    len: u8,
+    bytes: [u8; INLINE_PATH_MAX],
+}
+
+impl PathBytes {
+    pub fn from_slice(path: &[u8]) -> Result<Self, VfsError> {
+        if path.is_empty() {
+            return Err(VfsError::InvalidPath);
+        }
+        if path.len() > INLINE_PATH_MAX {
+            return Err(VfsError::NameTooLong);
+        }
+        let mut bytes = [0u8; INLINE_PATH_MAX];
+        bytes[..path.len()].copy_from_slice(path);
+        Ok(Self {
+            len: path.len() as u8,
+            bytes,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
     }
 }
 
