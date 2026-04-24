@@ -169,6 +169,27 @@ pub mod runtime {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct StartupContext {
         pub task_id: u64,
+        /// Optional process-manager request endpoint send capability.
+        ///
+        /// This remains `None` until the startup ABI wires concrete cap slots.
+        pub process_manager_request_send_cap: Option<u32>,
+        /// Optional process-manager reply endpoint receive capability.
+        ///
+        /// This remains `None` until the startup ABI wires concrete cap slots.
+        pub process_manager_reply_recv_cap: Option<u32>,
+    }
+
+    impl StartupContext {
+        #[inline]
+        pub const fn process_manager_caps(self) -> Option<(u32, u32)> {
+            match (
+                self.process_manager_request_send_cap,
+                self.process_manager_reply_recv_cap,
+            ) {
+                (Some(request_send), Some(reply_recv)) => Some((request_send, reply_recv)),
+                _ => None,
+            }
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,7 +240,13 @@ pub mod runtime {
 
     #[inline]
     pub fn startup_context() -> StartupContext {
-        StartupContext { task_id: 0 }
+        // Startup register/arg mapping for endpoint caps is not available yet in
+        // this runtime surface, so expose typed optional caps as `None`.
+        StartupContext {
+            task_id: 0,
+            process_manager_request_send_cap: None,
+            process_manager_reply_recv_cap: None,
+        }
     }
 }
 
