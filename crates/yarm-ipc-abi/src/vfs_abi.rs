@@ -26,6 +26,10 @@ pub const VFS_OPENAT_INLINE_PATH_MAX: usize = 96;
 pub const VFS_OPENAT_INLINE_PATH_HEADER_BYTES: usize = 25;
 pub const VFS_OPENAT_INLINE_PATH_MAX_BYTES: usize =
     VFS_OPENAT_INLINE_PATH_HEADER_BYTES + VFS_OPENAT_INLINE_PATH_MAX;
+pub const VFS_STATX_INLINE_PATH_MAX: usize = 96;
+pub const VFS_STATX_INLINE_PATH_HEADER_BYTES: usize = 25;
+pub const VFS_STATX_INLINE_PATH_MAX_BYTES: usize =
+    VFS_STATX_INLINE_PATH_HEADER_BYTES + VFS_STATX_INLINE_PATH_MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAtArgs {
@@ -63,6 +67,55 @@ pub struct OpenAtInlinePath<'a> {
     pub flags: u64,
     pub mode: u64,
     pub path: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatxInlinePath<'a> {
+    pub dirfd: u64,
+    pub flags: u64,
+    pub mask_or_buf: u64,
+    pub path: &'a [u8],
+}
+
+impl<'a> StatxInlinePath<'a> {
+    pub fn encode(self) -> Option<([u8; VFS_STATX_INLINE_PATH_MAX_BYTES], usize)> {
+        if self.path.is_empty() || self.path.len() > VFS_STATX_INLINE_PATH_MAX {
+            return None;
+        }
+        let mut out = [0u8; VFS_STATX_INLINE_PATH_MAX_BYTES];
+        out[0..8].copy_from_slice(&self.dirfd.to_le_bytes());
+        out[8..16].copy_from_slice(&self.flags.to_le_bytes());
+        out[16..24].copy_from_slice(&self.mask_or_buf.to_le_bytes());
+        out[24] = self.path.len() as u8;
+        out[25..25 + self.path.len()].copy_from_slice(self.path);
+        Some((out, VFS_STATX_INLINE_PATH_HEADER_BYTES + self.path.len()))
+    }
+
+    pub fn decode(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.len() < VFS_STATX_INLINE_PATH_HEADER_BYTES {
+            return None;
+        }
+        let path_len = bytes[24] as usize;
+        if path_len == 0 || path_len > VFS_STATX_INLINE_PATH_MAX {
+            return None;
+        }
+        let total = VFS_STATX_INLINE_PATH_HEADER_BYTES + path_len;
+        if bytes.len() < total {
+            return None;
+        }
+        let mut dirfd = [0u8; 8];
+        let mut flags = [0u8; 8];
+        let mut mask_or_buf = [0u8; 8];
+        dirfd.copy_from_slice(&bytes[0..8]);
+        flags.copy_from_slice(&bytes[8..16]);
+        mask_or_buf.copy_from_slice(&bytes[16..24]);
+        Some(Self {
+            dirfd: u64::from_le_bytes(dirfd),
+            flags: u64::from_le_bytes(flags),
+            mask_or_buf: u64::from_le_bytes(mask_or_buf),
+            path: &bytes[25..25 + path_len],
+        })
+    }
 }
 
 impl<'a> OpenAtInlinePath<'a> {
@@ -275,6 +328,23 @@ mod tests {
         assert_eq!(decoded.flags, 2);
         assert_eq!(decoded.mode, 3);
         assert_eq!(decoded.path, b"/initramfs/boot-marker");
+    }
+
+    #[test]
+    fn statx_inline_path_roundtrip() {
+        let (encoded, len) = StatxInlinePath {
+            dirfd: 4,
+            flags: 5,
+            mask_or_buf: 6,
+            path: b"/initramfs/vfs",
+        }
+        .encode()
+        .expect("encode");
+        let decoded = StatxInlinePath::decode(&encoded[..len]).expect("decode");
+        assert_eq!(decoded.dirfd, 4);
+        assert_eq!(decoded.flags, 5);
+        assert_eq!(decoded.mask_or_buf, 6);
+        assert_eq!(decoded.path, b"/initramfs/vfs");
     }
 
     #[test]
