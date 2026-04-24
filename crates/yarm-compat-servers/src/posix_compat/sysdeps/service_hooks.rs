@@ -10,6 +10,14 @@ use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
 use crate::kernel::ipc::Message;
 use crate::yarm_compat_servers::{POSIX_COMPAT_ABI_VERSION, PosixErrno};
+#[cfg(not(test))]
+use yarm_ipc_abi::process_abi::PROC_OP_GETPID;
+#[cfg(not(test))]
+use yarm_user_rt::ipc::Message;
+#[cfg(not(test))]
+use yarm_user_rt::runtime::startup_context;
+#[cfg(not(test))]
+use yarm_user_rt::syscall::IpcTransport;
 #[cfg(test)]
 use crate::yarm_compat_servers::{
     LINUX_NR_CLOSE, LINUX_NR_CONNECT, LINUX_NR_EXIT, LINUX_NR_GETPID, LINUX_NR_GETPPID,
@@ -26,7 +34,13 @@ pub struct PosixSysdepsContext<'a> {
     #[cfg(test)]
     pub kernel: &'a mut KernelState,
     #[cfg(not(test))]
-    _marker: core::marker::PhantomData<&'a mut ()>,
+    runtime_transport: &'a mut dyn IpcTransport,
+    #[cfg(not(test))]
+    process_manager_request_send_cap: Option<u32>,
+    #[cfg(not(test))]
+    process_manager_reply_recv_cap: Option<u32>,
+    #[cfg(not(test))]
+    startup_tid: u64,
     #[cfg(test)]
     bindings: PosixServiceBindings,
 }
@@ -41,9 +55,13 @@ impl<'a> PosixSysdepsContext<'a> {
     }
 
     #[cfg(not(test))]
-    pub fn new(_runtime_transport: &'a mut impl yarm_user_rt::syscall::IpcTransport) -> Self {
+    pub fn new(runtime_transport: &'a mut impl IpcTransport) -> Self {
+        let startup = startup_context();
         Self {
-            _marker: core::marker::PhantomData,
+            runtime_transport,
+            process_manager_request_send_cap: None,
+            process_manager_reply_recv_cap: None,
+            startup_tid: startup.task_id,
         }
     }
 
@@ -61,10 +79,15 @@ impl<'a> PosixSysdepsContext<'a> {
     #[cfg(not(test))]
     pub fn register_process_manager(
         &mut self,
-        _request_send_cap: u32,
-        _reply_recv_cap: u32,
+        request_send_cap: u32,
+        reply_recv_cap: u32,
     ) -> Result<(), PosixErrno> {
-        Err(PosixErrno::NoSys)
+        if request_send_cap == 0 || reply_recv_cap == 0 {
+            return Err(PosixErrno::Inval);
+        }
+        self.process_manager_request_send_cap = Some(request_send_cap);
+        self.process_manager_reply_recv_cap = Some(reply_recv_cap);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -167,7 +190,39 @@ impl<'a> PosixSysdepsContext<'a> {
 
     #[cfg(not(test))]
     pub fn getpid_hook(&mut self) -> Result<u64, PosixErrno> {
-        Err(PosixErrno::NoSys)
+        let request_cap = self
+            .process_manager_request_send_cap
+            .ok_or(PosixErrno::NoSys)?;
+        let reply_cap = self
+            .process_manager_reply_recv_cap
+            .ok_or(PosixErrno::NoSys)?;
+        let request_payload = self.startup_tid.to_le_bytes();
+        let request = Message::with_header(
+            self.startup_tid,
+            PROC_OP_GETPID,
+            0,
+            None,
+            &request_payload,
+        )
+        .map_err(|_| PosixErrno::Inval)?;
+        self.runtime_transport
+            .send(request_cap, &request)
+            .map_err(PosixErrno::from)?;
+        let reply = self
+            .runtime_transport
+            .recv(reply_cap)
+            .map_err(PosixErrno::from)?
+            .ok_or(PosixErrno::NoSys)?;
+        if reply.opcode != PROC_OP_GETPID {
+            return Err(PosixErrno::NoSys);
+        }
+        let payload = reply.as_slice();
+        if payload.len() < 8 {
+            return Err(PosixErrno::NoSys);
+        }
+        let mut pid_bytes = [0u8; 8];
+        pid_bytes.copy_from_slice(&payload[..8]);
+        Ok(u64::from_le_bytes(pid_bytes))
     }
 
     #[cfg(test)]
