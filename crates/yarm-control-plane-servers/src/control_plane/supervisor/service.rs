@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+#[cfg(test)]
 use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
+#[cfg(not(test))]
+use yarm_user_rt::runtime::KernelIpcError as KernelError;
 use yarm_user_rt::capability::{CapId, CapRights};
 use yarm_user_rt::ipc::{Message, ThreadId};
 #[cfg(test)]
@@ -181,16 +184,19 @@ pub trait SupervisorTaskExitOps: SupervisorOutboundMessageOps {
     fn task_restart_token(&self, tid: u64) -> Option<u64>;
 }
 
+#[cfg(test)]
 struct KernelSupervisorOutboundMessageOps<'a> {
     kernel: &'a mut KernelState,
 }
 
+#[cfg(test)]
 impl<'a> KernelSupervisorOutboundMessageOps<'a> {
     fn new(kernel: &'a mut KernelState) -> Self {
         Self { kernel }
     }
 }
 
+#[cfg(test)]
 impl SupervisorOutboundMessageOps for KernelSupervisorOutboundMessageOps<'_> {
     fn ipc_send(&mut self, cap: CapId, msg: Message) -> Result<(), KernelError> {
         self.kernel.ipc_send(cap, msg)
@@ -201,6 +207,7 @@ impl SupervisorOutboundMessageOps for KernelSupervisorOutboundMessageOps<'_> {
     }
 }
 
+#[cfg(test)]
 impl SupervisorRestartRedelegationOps for KernelSupervisorOutboundMessageOps<'_> {
     fn restart_task(&mut self, tid: u64, restart_token: u64) -> Result<(), KernelError> {
         self.kernel.restart_task(tid, restart_token)
@@ -224,6 +231,7 @@ impl SupervisorRestartRedelegationOps for KernelSupervisorOutboundMessageOps<'_>
     }
 }
 
+#[cfg(test)]
 impl SupervisorTaskExitOps for KernelSupervisorOutboundMessageOps<'_> {
     fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError> {
         self.kernel.mark_task_dead(tid)
@@ -575,6 +583,7 @@ impl SupervisorService {
             .any(|record| record.pending_restart_due.is_some_and(|due| due.0 <= self.current_tick.0))
     }
 
+    #[cfg(test)]
     fn recv_with_budget(
         &self,
         kernel: &mut KernelState,
@@ -610,6 +619,7 @@ impl SupervisorService {
         }
     }
 
+    #[cfg(test)]
     pub fn service_step(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
         let mut changed = 0usize;
         if self.has_due_restart_ready() {
@@ -658,6 +668,7 @@ impl SupervisorService {
     }
 
 
+    #[cfg(test)]
     pub fn run_until_idle(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
         let mut progress = 0usize;
         loop {
@@ -674,6 +685,7 @@ impl SupervisorService {
         Ok(progress)
     }
 
+    #[cfg(test)]
     pub fn run_live_for_ticks(
         &mut self,
         kernel: &mut KernelState,
@@ -839,16 +851,19 @@ pub trait SupervisorStatusQueryOps {
     ) -> Result<SupervisorStatusReply, KernelError>;
 }
 
+#[cfg(test)]
 pub struct KernelSupervisorStatusQueryOps<'a> {
     kernel: &'a mut KernelState,
 }
 
+#[cfg(test)]
 impl<'a> KernelSupervisorStatusQueryOps<'a> {
     pub fn new(kernel: &'a mut KernelState) -> Self {
         Self { kernel }
     }
 }
 
+#[cfg(test)]
 impl SupervisorStatusQueryOps for KernelSupervisorStatusQueryOps<'_> {
     fn query_status_via_call_reply(
         &mut self,
@@ -901,6 +916,7 @@ pub fn query_status_via_call_reply_with_default_timeout(
     )
 }
 
+#[cfg(test)]
 pub fn run() {
     let mut kernel = yarm::kernel::boot::Bootstrap::init().expect("init");
     let mut init = crate::control_plane::init::InitService::new();
@@ -934,6 +950,13 @@ pub fn run() {
         handled,
         supervisor.degraded(),
         supervisor.current_tick().0
+    );
+}
+
+#[cfg(not(test))]
+pub fn run() {
+    yarm_user_rt::user_log!(
+        "supervisor.srv requires kernel-provided bootstrap handoff; standalone Bootstrap::init path disabled"
     );
 }
 
