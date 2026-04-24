@@ -165,6 +165,15 @@ pub mod syscall {
 pub mod runtime {
     use crate::capability::CapId;
     use crate::syscall::SyscallError;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    pub const STARTUP_SLOT_TASK_ID: usize = 0;
+    pub const STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP: usize = 1;
+    pub const STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP: usize = 2;
+    const STARTUP_SLOT_COUNT: usize = 3;
+
+    static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] =
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct StartupContext {
@@ -189,6 +198,32 @@ pub mod runtime {
                 (Some(request_send), Some(reply_recv)) => Some((request_send, reply_recv)),
                 _ => None,
             }
+        }
+    }
+
+    #[inline]
+    const fn cap_from_slot(raw: u64) -> Option<u32> {
+        if raw == 0 || raw > (u32::MAX as u64) {
+            None
+        } else {
+            Some(raw as u32)
+        }
+    }
+
+    /// Install raw startup ABI slot values captured by runtime entry code.
+    ///
+    /// Slot mapping:
+    /// - `STARTUP_SLOT_TASK_ID`
+    /// - `STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP`
+    /// - `STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP`
+    ///
+    /// Missing/unset slots should be provided as `0`.
+    #[inline]
+    pub fn install_startup_arg_slots(slots: [u64; STARTUP_SLOT_COUNT]) {
+        let mut index = 0usize;
+        while index < STARTUP_SLOT_COUNT {
+            STARTUP_ARG_SLOTS[index].store(slots[index], Ordering::Relaxed);
+            index += 1;
         }
     }
 
@@ -240,12 +275,19 @@ pub mod runtime {
 
     #[inline]
     pub fn startup_context() -> StartupContext {
-        // Startup register/arg mapping for endpoint caps is not available yet in
-        // this runtime surface, so expose typed optional caps as `None`.
+        // Reads runtime-provided startup ABI slots. Zero/missing values map to
+        // `None` for optional endpoint caps.
+        let task_id = STARTUP_ARG_SLOTS[STARTUP_SLOT_TASK_ID].load(Ordering::Relaxed);
+        let process_manager_request_send_cap = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP].load(Ordering::Relaxed),
+        );
+        let process_manager_reply_recv_cap = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP].load(Ordering::Relaxed),
+        );
         StartupContext {
-            task_id: 0,
-            process_manager_request_send_cap: None,
-            process_manager_reply_recv_cap: None,
+            task_id,
+            process_manager_request_send_cap,
+            process_manager_reply_recv_cap,
         }
     }
 }
