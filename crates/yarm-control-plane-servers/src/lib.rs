@@ -24,14 +24,49 @@ pub fn run_supervisor_server() {
 }
 
 pub fn run_driver_manager_demo() {
-    use crate::control_plane::driver_manager::{DriverService, KernelDriverControl};
-    use yarm::kernel::boot::Bootstrap;
+    use crate::control_plane::driver_manager::DriverService;
     use yarm_ipc_abi::driver_abi::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};
+    use yarm_user_rt::capability::CapId;
     use yarm_user_rt::ipc::Message;
-    use alloc::boxed::Box;
+    use yarm_user_rt::runtime::{DriverControlOps, KernelIpcError};
 
-    let mut kernel = Box::new(Bootstrap::init().expect("init"));
-    kernel.register_task(2).expect("task");
+    struct DemoDriverControl;
+
+    impl DriverControlOps for DemoDriverControl {
+        fn register_driver(&mut self, _tid: u64) -> Result<(), KernelIpcError> {
+            Ok(())
+        }
+
+        fn mint_irq_cap(&mut self, line: u16) -> Result<CapId, KernelIpcError> {
+            Ok(CapId(0x1000 + line as u64))
+        }
+
+        fn grant_driver_irq(&mut self, _tid: u64, _cap: CapId) -> Result<(), KernelIpcError> {
+            Ok(())
+        }
+
+        fn mint_dma_region_cap(
+            &mut self,
+            mem_cap: CapId,
+            offset: usize,
+            len: usize,
+        ) -> Result<CapId, KernelIpcError> {
+            Ok(CapId(
+                mem_cap
+                    .0
+                    .saturating_add(offset as u64)
+                    .saturating_add(len as u64),
+            ))
+        }
+
+        fn grant_driver_dma(&mut self, _tid: u64, _cap: CapId) -> Result<(), KernelIpcError> {
+            Ok(())
+        }
+
+        fn restart_task(&mut self, _tid: u64, _token: u64) -> Result<(), KernelIpcError> {
+            Ok(())
+        }
+    }
 
     let register = Message::with_header(0, DRIVER_OP_REGISTER, 0, None, &2u64.to_le_bytes())
         .expect("register msg");
@@ -39,7 +74,7 @@ pub fn run_driver_manager_demo() {
         .expect("grant msg");
 
     let mut service = DriverService::new();
-    let mut runtime = KernelDriverControl::new(&mut kernel);
+    let mut runtime = DemoDriverControl;
     let handled = service
         .handle_batch(&mut runtime, [register, grant])
         .expect("batch");
