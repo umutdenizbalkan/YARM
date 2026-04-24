@@ -4,7 +4,9 @@
 #[cfg(test)]
 use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 #[cfg(not(test))]
-use yarm_user_rt::runtime::KernelIpcError as KernelError;
+use yarm_user_rt::runtime::{KernelIpcError as KernelError, StartupContext, startup_context};
+#[cfg(not(test))]
+use yarm_user_rt::syscall::SyscallIpcTransport;
 use yarm_user_rt::capability::CapId;
 #[cfg(test)]
 use yarm_user_rt::capability::CapRights;
@@ -34,6 +36,69 @@ const MAX_DEPENDENTS: usize = 8;
 #[cfg(test)]
 const SUPERVISOR_RECV_BUDGET_TICKS: u64 = 1;
 const SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS: u64 = 1;
+#[cfg(not(test))]
+const SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS: u64 = 100;
+
+#[cfg(not(test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SupervisorRuntimeHandoff {
+    pub supervisor_tid: Option<u64>,
+    pub init_tid: Option<u64>,
+    pub supervisor_fault_recv_ep: Option<u32>,
+    pub supervisor_control_send_ep: Option<u32>,
+    pub supervisor_control_recv_ep: Option<u32>,
+    pub init_alert_send_ep: Option<u32>,
+    pub init_alert_recv_ep: Option<u32>,
+    pub restart_window_ticks: u64,
+}
+
+#[cfg(not(test))]
+impl SupervisorRuntimeHandoff {
+    pub fn from_startup_context(ctx: StartupContext) -> Self {
+        Self {
+            supervisor_tid: Some(ctx.task_id),
+            init_tid: Some(ctx.task_id),
+            supervisor_fault_recv_ep: None,
+            supervisor_control_send_ep: None,
+            supervisor_control_recv_ep: None,
+            init_alert_send_ep: None,
+            init_alert_recv_ep: None,
+            restart_window_ticks: SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS,
+        }
+    }
+
+    fn into_fault_handoff(self) -> Result<(u64, InitFaultHandoff), KernelError> {
+        let supervisor_tid = self.supervisor_tid.ok_or(KernelError::InvalidCapability)?;
+        let init_tid = self.init_tid.ok_or(KernelError::InvalidCapability)?;
+        let fault_recv = self
+            .supervisor_fault_recv_ep
+            .ok_or(KernelError::InvalidCapability)?;
+        let control_send = self
+            .supervisor_control_send_ep
+            .ok_or(KernelError::InvalidCapability)?;
+        let control_recv = self
+            .supervisor_control_recv_ep
+            .ok_or(KernelError::InvalidCapability)?;
+        let init_alert_send = self
+            .init_alert_send_ep
+            .ok_or(KernelError::InvalidCapability)?;
+        let init_alert_recv = self
+            .init_alert_recv_ep
+            .ok_or(KernelError::InvalidCapability)?;
+        Ok((
+            init_tid,
+            InitFaultHandoff::new(
+                supervisor_tid,
+                CapId(fault_recv as u64),
+                CapId(control_send as u64),
+                CapId(control_recv as u64),
+                CapId(init_alert_send as u64),
+                CapId(init_alert_recv as u64),
+                self.restart_window_ticks,
+            ),
+        ))
+    }
+}
 
 #[cfg(test)]
 fn map_task_status(status: yarm::kernel::task::TaskStatus) -> TaskStatus {
@@ -269,6 +334,14 @@ impl SupervisorService {
             #[cfg(test)]
             test_disable_budgeted_receive_for_tracked_tid: None,
         }
+    }
+
+    #[cfg(not(test))]
+    pub fn new_from_runtime_handoff(
+        runtime_handoff: SupervisorRuntimeHandoff,
+    ) -> Result<Self, KernelError> {
+        let (init_tid, handoff) = runtime_handoff.into_fault_handoff()?;
+        Ok(Self::new(init_tid, handoff, CoreServicePolicyTable::baseline()))
     }
 
     pub const fn degraded(&self) -> bool {
@@ -972,9 +1045,34 @@ pub fn run() {
 
 #[cfg(not(test))]
 pub fn run() {
-    yarm_user_rt::user_log!(
-        "supervisor.srv requires kernel-provided bootstrap handoff; standalone Bootstrap::init path disabled"
-    );
+    let startup = startup_context();
+    let runtime_handoff = SupervisorRuntimeHandoff::from_startup_context(startup);
+    let mut transport = SyscallIpcTransport;
+
+    let service = SupervisorService::new_from_runtime_handoff(runtime_handoff);
+    match service {
+        Ok(supervisor) => {
+            let _ = &mut transport;
+            yarm_user_rt::user_log!(
+                "supervisor.srv runtime handoff ready: init_tid={}, supervisor_tid={}, control_recv_ep={}, control_send_ep={}, fault_recv_ep={}, init_alert_send_ep={}, init_alert_recv_ep={}, degraded={}; TODO: wire blocking runtime event loop",
+                supervisor.init_tid,
+                supervisor.handoff.supervisor_tid,
+                supervisor.handoff.supervisor_control_recv_cap.0,
+                supervisor.handoff.supervisor_control_send_cap.0,
+                supervisor.handoff.supervisor_fault_recv_cap.0,
+                supervisor.handoff.init_alert_send_cap.0,
+                supervisor.handoff.init_alert_recv_cap.0,
+                supervisor.degraded(),
+            );
+        }
+        Err(err) => {
+            yarm_user_rt::user_log!(
+                "supervisor.srv runtime handoff incomplete: startup_task_id={}, err={:?}; TODO: provide endpoint caps via startup BootInfo/runtime args",
+                startup.task_id,
+                err
+            );
+        }
+    }
 }
 
 #[cfg(test)]
