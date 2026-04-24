@@ -7,5 +7,8 @@ pub mod fs;
 pub mod inode;
 pub mod service;
 
-pub use fs::Ext4Backend;
+pub use fs::{
+    EXT4_DEMO_PATH, EXT4_DEMO_PATH_PTR, EXT4_OVERSIZE_PATH, EXT4_OVERSIZE_PATH_PTR,
+    EXT4_SERVICE_PATH, EXT4_SERVICE_PATH_PTR, Ext4Backend,
+};
 pub use service::{Ext4Service, run};
