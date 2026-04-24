@@ -254,6 +254,49 @@ impl InitService {
     }
 
     #[cfg(test)]
+    fn delegate_process_manager_startup_caps_for_compat(
+        kernel: &mut KernelState,
+        process_manager_tid: u64,
+        compat_tid: u64,
+    ) -> Result<[u64; 3], KernelError> {
+        // Startup ABI slots for compat server:
+        //   arg0 => compat task id
+        //   arg1 => process-manager request SEND cap in compat task
+        //   arg2 => process-manager reply RECEIVE cap in compat task
+        let source_tid = 0;
+
+        let (_, request_send_root, request_recv_root) = kernel.create_endpoint(16)?;
+        let request_send_compat = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            request_send_root,
+            compat_tid,
+            CapRights::SEND,
+        )?;
+        let _request_recv_process_manager = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            request_recv_root,
+            process_manager_tid,
+            CapRights::RECEIVE,
+        )?;
+
+        let (_, reply_send_root, reply_recv_root) = kernel.create_endpoint(16)?;
+        let _reply_send_process_manager = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            reply_send_root,
+            process_manager_tid,
+            CapRights::SEND,
+        )?;
+        let reply_recv_compat = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            reply_recv_root,
+            compat_tid,
+            CapRights::RECEIVE,
+        )?;
+
+        Ok([compat_tid, request_send_compat.0, reply_recv_compat.0])
+    }
+
+    #[cfg(test)]
     fn allocate_core_service_asids(
         kernel: &mut KernelState,
     ) -> Result<(Asid, Asid, Asid), KernelError> {
@@ -424,12 +467,17 @@ impl InitService {
 
         if let (Some(tid), Some(entry)) = (posix_compat_tid, posix_compat_entry) {
             let (compat_asid, _compat_aspace_cap) = kernel.create_user_address_space()?;
+            let compat_startup_args = Self::delegate_process_manager_startup_caps_for_compat(
+                kernel,
+                proc_tid,
+                tid,
+            )?;
             kernel.spawn_user_task_from_image(UserImageSpec {
                 tid,
                 entry,
                 asid: Some(to_kernel_asid(compat_asid)),
                 class: to_kernel_task_class(TaskClass::SystemServer),
-                startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+                startup_args: compat_startup_args,
             })?;
             posix_compat_spawned = true;
         }
