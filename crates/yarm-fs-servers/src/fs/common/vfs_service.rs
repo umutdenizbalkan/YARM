@@ -6,9 +6,9 @@ use super::vfs_ipc::{
     InMemoryBackend, MountNamespacePolicy, MountRecord, VfsBackend, VfsError, VfsRequest,
 };
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtArgs, OpenAtInlinePath, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1,
-    VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL,
-    VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
+    OpenAtArgs, OpenAtInlinePath, ReadWriteArgs, StatxArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_DUP,
+    VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL,
+    VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
 };
 
 const MAX_MOUNTS: usize = 8;
@@ -277,11 +277,24 @@ impl<B: VfsBackend> VfsService<B> {
                 })
             }
             VFS_OP_STATX => {
+                if let Some(inline) = StatxInlinePath::decode(request.as_slice()) {
+                    return Ok(VfsRequest::Statx {
+                        _dirfd: inline.dirfd,
+                        path_ptr: 0,
+                        path_inline: Some(
+                            super::vfs_ipc::PathBytes::from_slice(inline.path)
+                                .map_err(|_| VfsError::Malformed)?,
+                        ),
+                        _flags: inline.flags,
+                        _mask_or_buf: inline.mask_or_buf,
+                    });
+                }
                 let args =
                     StatxArgs::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
                 Ok(VfsRequest::Statx {
                     _dirfd: args.dirfd,
                     path_ptr: args.path_ptr,
+                    path_inline: None,
                     _flags: args.flags,
                     _mask_or_buf: args.mask_or_buf,
                 })
@@ -380,11 +393,22 @@ impl<B: VfsBackend> VfsService<B> {
             VfsRequest::Close { fd } => VfsReply::CloseResult(self.backend.close(fd)?),
             VfsRequest::Read { fd, len, .. } => VfsReply::ReadLen(self.backend.read(fd, len)?),
             VfsRequest::Write { fd, len, .. } => VfsReply::WriteLen(self.backend.write(fd, len)?),
-            VfsRequest::Statx { path_ptr, .. } => {
-                if !self.policy.allows_path(path_ptr) {
-                    return Err(VfsError::PermissionDenied);
+            VfsRequest::Statx {
+                path_ptr,
+                path_inline,
+                ..
+            } => {
+                if let Some(path) = path_inline {
+                    if !self.policy.allows_path_bytes(path.as_slice()) {
+                        return Err(VfsError::PermissionDenied);
+                    }
+                    VfsReply::StatxValue(self.backend.statx_path(path.as_slice())?)
+                } else {
+                    if !self.policy.allows_path(path_ptr) {
+                        return Err(VfsError::PermissionDenied);
+                    }
+                    VfsReply::StatxValue(self.backend.statx(path_ptr)?)
                 }
-                VfsReply::StatxValue(self.backend.statx(path_ptr)?)
             }
             VfsRequest::Ioctl { fd, request, arg } => {
                 VfsReply::IoctlResult(self.backend.ioctl(fd, request, arg)?)

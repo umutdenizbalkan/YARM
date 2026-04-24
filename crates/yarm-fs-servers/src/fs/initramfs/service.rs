@@ -109,9 +109,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::archive::INITRAMFS_BOOT_MARKER_PATH;
     use super::super::super::common::vfs_ipc::{
         CloseRequest, MountNamespacePolicy, MountRouter, StatxRequest, close_message,
-        openat_message, read_message, statx_message,
+        openat_message, read_message, statx_inline_message, statx_message,
     };
     use super::super::super::common::vfs_service::VfsService;
     use super::super::super::devfs::{DEV_CONSOLE_PATH_PTR, DevFsBackend};
@@ -211,6 +212,29 @@ mod tests {
             .expect("open"),
         );
         assert_eq!(denied, Err(VfsError::PermissionDenied));
+    }
+
+    #[test]
+    fn inline_statx_routes_to_initramfs_by_real_path_bytes() {
+        let router = MountRouter::new(
+            0x4800_0000_0000_0000,
+            DevFsBackend::default(),
+            InitramfsBackend::new(4096),
+        );
+        let mut svc = VfsService::with_backend(router);
+        svc.set_policy(MountNamespacePolicy::deny_all());
+
+        let reply = svc
+            .handle_request(
+                statx_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0).expect("statx inline"),
+            )
+            .expect("statx reply");
+
+        assert_eq!(reply.opcode, yarm_ipc_abi::vfs_abi::VFS_OP_STATX);
+        assert_eq!(
+            decode_reply_u64(reply),
+            0x1000_0000_0000_0000 | 0o400 | (4096 << 16)
+        );
     }
 
     #[test]

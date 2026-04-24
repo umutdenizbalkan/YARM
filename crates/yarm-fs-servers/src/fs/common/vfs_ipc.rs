@@ -3,9 +3,9 @@
 
 use yarm_user_rt::ipc::Message;
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtArgs, OpenAtInlinePath, ReadWriteArgs, StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1,
-    VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL,
-    VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
+    OpenAtArgs, OpenAtInlinePath, ReadWriteArgs, StatxArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_DUP,
+    VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL,
+    VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
 };
 
 pub use yarm_srv_common::vfs_core::*;
@@ -80,6 +80,23 @@ pub fn statx_message(req: StatxRequest) -> Result<Message, VfsError> {
         &StatxArgs::new(req.dirfd, req.path_ptr, req.flags, req.mask_or_buf).encode(),
     )
     .map_err(|_| VfsError::Malformed)
+}
+
+pub fn statx_inline_message(
+    dirfd: u64,
+    path: &[u8],
+    flags: u64,
+    mask_or_buf: u64,
+) -> Result<Message, VfsError> {
+    let (payload, len) = StatxInlinePath {
+        dirfd,
+        flags,
+        mask_or_buf,
+        path,
+    }
+    .encode()
+    .ok_or(VfsError::NameTooLong)?;
+    Message::with_header(0, VFS_OP_STATX, 0, None, &payload[..len]).map_err(|_| VfsError::Malformed)
 }
 
 pub fn ioctl_message(fd: u64, request: u64, arg: u64) -> Result<Message, VfsError> {

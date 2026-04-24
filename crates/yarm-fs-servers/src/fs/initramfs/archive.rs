@@ -244,6 +244,20 @@ impl VfsBackend for InitramfsBackend {
             }
         }
     }
+
+    fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        let path_ptr = match path {
+            INITRAMFS_BOOT_MARKER_PATH => INITRAMFS_BOOT_MARKER_PATH_PTR,
+            INITRAMFS_INIT_PATH => INITRAMFS_INIT_PATH_PTR,
+            INITRAMFS_ETC_HOSTS_PATH => INITRAMFS_ETC_HOSTS_PATH_PTR,
+            INITRAMFS_PROC_MGR_PATH => INITRAMFS_PROC_MGR_PATH_PTR,
+            INITRAMFS_VFS_PATH => INITRAMFS_VFS_PATH_PTR,
+            INITRAMFS_SUPERVISOR_PATH => INITRAMFS_SUPERVISOR_PATH_PTR,
+            INITRAMFS_POSIX_COMPAT_PATH => INITRAMFS_POSIX_COMPAT_PATH_PTR,
+            _ => return Err(VfsError::InvalidPath),
+        };
+        self.statx(path_ptr)
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +304,16 @@ mod tests {
         assert_eq!(
             hosts_stat,
             INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (256 << 16)
+        );
+    }
+
+    #[test]
+    fn initramfs_statx_path_accepts_real_bytes() {
+        let mut fs = InitramfsBackend::new(4096);
+        let stat = fs.statx_path(INITRAMFS_VFS_PATH).expect("statx path");
+        assert_eq!(
+            stat,
+            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (1536 << 16)
         );
     }
 

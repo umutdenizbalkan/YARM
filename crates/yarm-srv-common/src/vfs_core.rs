@@ -52,6 +52,7 @@ pub enum VfsRequest {
     Statx {
         _dirfd: u64,
         path_ptr: u64,
+        path_inline: Option<PathBytes>,
         _flags: u64,
         _mask_or_buf: u64,
     },
@@ -105,6 +106,9 @@ pub trait VfsBackend {
     fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
     fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError>;
+    fn statx_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
+        Err(VfsError::InvalidPath)
+    }
     fn ioctl(&mut self, _fd: u64, _request: u64, _arg: u64) -> Result<u64, VfsError> {
         Err(VfsError::Unsupported)
     }
@@ -273,6 +277,10 @@ impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
         self.route_by_path(path_ptr).statx(path_ptr)
     }
 
+    fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        self.route_by_path_bytes(path).statx_path(path)
+    }
+
     fn ioctl(&mut self, fd: u64, request: u64, arg: u64) -> Result<u64, VfsError> {
         self.route_by_fd(fd).ioctl(fd, request, arg)
     }
@@ -357,6 +365,17 @@ impl VfsBackend for InMemoryBackend {
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         Ok(path_ptr)
+    }
+
+    fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        if path.is_empty() {
+            return Err(VfsError::InvalidPath);
+        }
+        let mut stat = 0u64;
+        for &byte in path {
+            stat = stat.wrapping_mul(167).wrapping_add(byte as u64);
+        }
+        Ok(stat)
     }
 
     fn ioctl(&mut self, fd: u64, request: u64, arg: u64) -> Result<u64, VfsError> {
