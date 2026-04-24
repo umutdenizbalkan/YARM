@@ -5,9 +5,14 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 #[inline]
+#[cfg(not(test))]
 fn run() {
     yarm_server_runtime::run_posix_compat_server();
 }
+
+#[inline]
+#[cfg(test)]
+fn run() {}
 
 #[cfg(feature = "hosted-dev")]
 fn main() {
