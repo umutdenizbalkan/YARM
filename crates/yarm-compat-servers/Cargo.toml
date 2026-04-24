@@ -15,11 +15,6 @@ posix-compat = ["yarm-server-runtime/posix-compat"]
 yarm-server-runtime = { path = "../yarm-server-runtime", default-features = false, features = ["hosted-dev"] }
 
 [[bin]]
-name = "supervisor_srv"
-path = "src/bin/supervisor_srv.rs"
-required-features = ["hosted-dev"]
-
-[[bin]]
 name = "posix_compat_srv"
 path = "src/bin/posix_compat_srv.rs"
 required-features = ["hosted-dev", "posix-compat"]
