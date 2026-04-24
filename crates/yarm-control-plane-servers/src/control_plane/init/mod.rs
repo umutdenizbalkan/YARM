@@ -10,7 +10,6 @@ pub use core::{
     InitService, MountPlan, MountRecoveryReport, MountServiceKind, RestartOwner,
     ServiceRestartPolicy, StartupCap, StartupCapSet,
 };
-pub use service::{
-    InitRuntimeBootConfig, InitRuntimeSummary, MinimumRunnableProfileSummary, run,
-    run_minimum_profile_with_kernel, run_with_kernel,
-};
+pub use service::{InitRuntimeBootConfig, InitRuntimeSummary, run};
+#[cfg(test)]
+pub use service::{MinimumRunnableProfileSummary, run_minimum_profile_with_kernel, run_with_kernel};

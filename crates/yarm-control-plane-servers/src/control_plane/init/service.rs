@@ -13,6 +13,7 @@ use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
 use crate::control_plane::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitService,
 };
+#[cfg(test)]
 use yarm::kernel::boot::{KernelError, KernelState};
 use yarm_fs_servers::common::service::FsService;
 use yarm_fs_servers::common::vfs_ipc::InMemoryBackend;
@@ -81,6 +82,7 @@ pub struct CoreServiceIsolationReport {
     pub supervisor_asid: u16,
 }
 
+#[cfg(test)]
 fn boot_init_runtime(
     kernel: &mut KernelState,
     config: InitRuntimeBootConfig<'_>,
@@ -96,6 +98,7 @@ fn boot_init_runtime(
     Ok((init, seeded_registrations, isolation))
 }
 
+#[cfg(test)]
 pub fn run_with_kernel(
     kernel: &mut KernelState,
     config: InitRuntimeBootConfig<'_>,
@@ -116,6 +119,7 @@ pub fn run_with_kernel(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub struct MinimumRunnableProfileSummary {
     pub init_phase: InitBootPhase,
     pub seeded_registrations: usize,
@@ -132,6 +136,7 @@ pub struct MinimumRunnableProfileSummary {
     pub recovered_core_services: usize,
 }
 
+#[cfg(test)]
 pub fn run_minimum_profile_with_kernel(
     kernel: &mut KernelState,
     config: InitRuntimeBootConfig<'_>,
@@ -184,6 +189,7 @@ pub fn run_minimum_profile_with_kernel(
     })
 }
 
+#[cfg(test)]
 fn validate_core_service_isolation(
     kernel: &KernelState,
     init: &InitService,
@@ -209,6 +215,7 @@ fn validate_core_service_isolation(
     })
 }
 
+#[cfg(test)]
 fn resolve_core_image_plan(
     source: InitCoreImageSource<'_>,
 ) -> Result<CoreServiceImagePlan, KernelError> {
