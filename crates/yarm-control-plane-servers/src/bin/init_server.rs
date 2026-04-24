@@ -55,7 +55,7 @@ pub extern "C" fn _start(
             index += 1;
         }
     }
-    yarm_server_runtime::install_startup_arg_slots(slots);
+    yarm::install_startup_arg_slots(slots);
     run();
     loop {}
 }
