@@ -247,6 +247,7 @@ impl InitService {
             entry,
             asid: Some(to_kernel_asid(asid)),
             class: to_kernel_task_class(TaskClass::SystemServer),
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
         })?;
         Ok(())
     }

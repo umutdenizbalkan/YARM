@@ -518,6 +518,7 @@ impl KernelState {
                 stack_ptr: crate::kernel::vm::VirtAddr(user_stack_top as u64),
                 arg0: 0,
                 arg1: 0,
+                arg2: 0,
             };
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
@@ -565,6 +566,7 @@ impl KernelState {
             child.user_stack_top = parent.user_stack_top;
             child.user_context = parent.user_context;
             child.user_context.arg0 = 0;
+            child.user_context.arg2 = 0;
             child.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;

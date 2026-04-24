@@ -39,6 +39,29 @@ pub struct UserImageSpec {
     pub entry: usize,
     pub asid: Option<Asid>,
     pub class: TaskClass,
+    /// Startup entry ABI arguments passed to userspace `_start`.
+    ///
+    /// Slot contract:
+    /// - arg0 => task_id / tid
+    /// - arg1 => process-manager request-send cap
+    /// - arg2 => process-manager reply-recv cap
+    pub startup_args: [u64; 3],
+}
+
+impl UserImageSpec {
+    pub const DEFAULT_STARTUP_ARGS: [u64; 3] = [0, 0, 0];
+}
+
+impl Default for UserImageSpec {
+    fn default() -> Self {
+        Self {
+            tid: 0,
+            entry: 0,
+            asid: None,
+            class: TaskClass::App,
+            startup_args: Self::DEFAULT_STARTUP_ARGS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

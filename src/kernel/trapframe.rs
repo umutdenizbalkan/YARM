@@ -144,6 +144,7 @@ impl TrapFrame {
             stack_ptr: VirtAddr(self.saved_sp as u64),
             arg0: self.args[0],
             arg1: self.args[1],
+            arg2: self.args[2],
         }
     }
 
@@ -152,6 +153,7 @@ impl TrapFrame {
         self.saved_sp = context.stack_ptr.0 as usize;
         self.args[0] = context.arg0;
         self.args[1] = context.arg1;
+        self.args[2] = context.arg2;
     }
 
     pub const fn error_code(&self) -> Option<usize> {
@@ -193,7 +195,7 @@ mod tests {
 
     #[test]
     fn capture_and_apply_user_context_roundtrip() {
-        let mut frame = TrapFrame::new(0, [5, 6, 0, 0, 0, 0]);
+        let mut frame = TrapFrame::new(0, [5, 6, 9, 0, 0, 0]);
         frame.set_saved_pc(0x4000);
         frame.set_saved_sp(0x8000);
         let ctx = frame.capture_user_context();
@@ -201,17 +203,20 @@ mod tests {
         assert_eq!(ctx.stack_ptr, VirtAddr(0x8000));
         assert_eq!(ctx.arg0, 5);
         assert_eq!(ctx.arg1, 6);
+        assert_eq!(ctx.arg2, 9);
 
         frame.apply_user_context(UserRegisterContext {
             instruction_ptr: VirtAddr(0x5000),
             stack_ptr: VirtAddr(0x9000),
             arg0: 7,
             arg1: 8,
+            arg2: 10,
         });
         assert_eq!(frame.saved_pc(), 0x5000);
         assert_eq!(frame.saved_sp(), 0x9000);
         assert_eq!(frame.arg(0), 7);
         assert_eq!(frame.arg(1), 8);
+        assert_eq!(frame.arg(2), 10);
     }
 
     #[test]

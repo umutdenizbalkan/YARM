@@ -670,6 +670,7 @@ fn spawn_user_task_from_image_registers_asid_and_class() {
             entry: 0x8000,
             asid: Some(asid),
             class: TaskClass::SystemServer,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
         })
         .expect("spawn");
     assert_eq!(spawned.tid, 55);
@@ -704,6 +705,7 @@ fn spawn_user_task_from_image_requires_valid_asid() {
             entry: 0x9000,
             asid: None,
             class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
         })
         .expect_err("missing asid should fail");
     assert_eq!(err, KernelError::UserMemoryFault);
@@ -3993,6 +3995,7 @@ fn spawn_user_thread_inherits_group_and_asid_and_sets_tls() {
             entry: 0x4000,
             asid: Some(asid),
             class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
         })
         .expect("parent");
 
@@ -4035,6 +4038,7 @@ fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
             entry: 0x7000,
             asid: Some(asid),
             class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
         })
         .expect("leader");
     let tid = state
@@ -4065,6 +4069,7 @@ fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
             stack_ptr: VirtAddr(0x9900_0000),
             arg0: 33,
             arg1: 44,
+            arg2: 0,
         })
     );
 }
@@ -4170,6 +4175,7 @@ fn join_blocks_until_target_exits_and_detached_threads_reap_on_exit() {
             entry: 0x4000,
             asid: Some(asid),
             class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
         })
         .expect("leader");
     let joiner = state

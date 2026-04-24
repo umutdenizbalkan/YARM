@@ -380,8 +380,13 @@ impl KernelState {
             tcb.user_context = UserRegisterContext {
                 instruction_ptr: VirtAddr(spec.entry as u64),
                 stack_ptr: stack_top,
-                arg0: 0,
-                arg1: 0,
+                // Startup entry ABI args:
+                //   arg0 => task_id / tid
+                //   arg1 => process-manager request-send cap
+                //   arg2 => process-manager reply-recv cap
+                arg0: spec.startup_args[0] as usize,
+                arg1: spec.startup_args[1] as usize,
+                arg2: spec.startup_args[2] as usize,
             };
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())

@@ -435,6 +435,7 @@ pub fn bootstrap_first_user_task(
         entry,
         asid: Some(asid),
         class: TaskClass::SystemServer,
+        startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
     }) {
         Ok(_) => crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation"),
         Err(err) => {

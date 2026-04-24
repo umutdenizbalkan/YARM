@@ -89,6 +89,7 @@ pub fn bootstrap_first_user_task(
         entry,
         asid: Some(asid),
         class: TaskClass::SystemServer,
+        startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
     })?;
     crate::yarm_log!(
         "YARM_INIT_DONE arch=riscv64 phase=kernel_static_init_elf image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",

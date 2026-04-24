@@ -58,6 +58,7 @@ pub struct UserRegisterContext {
     pub stack_ptr: VirtAddr,
     pub arg0: usize,
     pub arg1: usize,
+    pub arg2: usize,
 }
 
 impl Default for UserRegisterContext {
@@ -67,6 +68,7 @@ impl Default for UserRegisterContext {
             stack_ptr: VirtAddr(0),
             arg0: 0,
             arg1: 0,
+            arg2: 0,
         }
     }
 }
@@ -202,6 +204,7 @@ mod tests {
             stack_ptr: VirtAddr(0x8000),
             arg0: 1,
             arg1: 2,
+            arg2: 3,
         };
         tcb.fault_policy_override = Some(FaultPolicy::KillTask);
         tcb.restart = RestartState {
