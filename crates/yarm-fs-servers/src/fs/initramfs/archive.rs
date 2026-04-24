@@ -9,6 +9,7 @@ pub const INITRAMFS_ETC_HOSTS_PATH_PTR: u64 = 0x494E_4954_484F_5354;
 pub const INITRAMFS_PROC_MGR_PATH_PTR: u64 = 0x494E_4954_5052_4F43;
 pub const INITRAMFS_VFS_PATH_PTR: u64 = 0x494E_4954_5F56_4653;
 pub const INITRAMFS_SUPERVISOR_PATH_PTR: u64 = 0x494E_4954_5355_5056;
+pub const INITRAMFS_POSIX_COMPAT_PATH_PTR: u64 = 0x494E_4954_5058_434D;
 
 const MAX_INITRAMFS_HANDLES: usize = 16;
 const MAX_INITRAMFS_INODES: usize = 8;
@@ -82,7 +83,10 @@ impl InitramfsBackend {
                     path_ptr: INITRAMFS_SUPERVISOR_PATH_PTR,
                     file_len: 1536,
                 }),
-                None,
+                Some(InitramfsInode {
+                    path_ptr: INITRAMFS_POSIX_COMPAT_PATH_PTR,
+                    file_len: 1536,
+                }),
                 None,
             ],
             metrics: InitramfsMetrics {

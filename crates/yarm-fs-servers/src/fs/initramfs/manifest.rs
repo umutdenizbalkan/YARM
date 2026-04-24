@@ -2,8 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::archive::{
-    INITRAMFS_INIT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR, INITRAMFS_SUPERVISOR_PATH_PTR,
-    INITRAMFS_VFS_PATH_PTR,
+    INITRAMFS_INIT_PATH_PTR, INITRAMFS_POSIX_COMPAT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR,
+    INITRAMFS_SUPERVISOR_PATH_PTR, INITRAMFS_VFS_PATH_PTR,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 
@@ -11,7 +11,8 @@ const MANIFEST_MAGIC: u32 = 0x5941_524D;
 const MANIFEST_VERSION_V1: u16 = 1;
 const MANIFEST_HEADER_BYTES: usize = 8;
 const MANIFEST_ENTRY_BYTES: usize = 28;
-const MANIFEST_EXPECTED_ENTRIES: usize = 4;
+const MANIFEST_CORE_REQUIRED_ENTRIES: usize = 4;
+const MANIFEST_MAX_ENTRIES: usize = 5;
 const MAX_LOAD_SEGMENTS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub struct CoreServiceImageManifest {
     pub process_manager: ManifestEntryWire,
     pub vfs: ManifestEntryWire,
     pub supervisor: ManifestEntryWire,
+    pub posix_compat: Option<ManifestEntryWire>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +56,7 @@ pub struct CoreServiceElfLaunchPlan {
     pub process_manager: ServiceElfLaunchPlan,
     pub vfs: ServiceElfLaunchPlan,
     pub supervisor: ServiceElfLaunchPlan,
+    pub posix_compat: Option<ServiceElfLaunchPlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +95,7 @@ pub fn parse_core_service_manifest(
         return Err(InitramfsManifestError::UnsupportedVersion);
     }
     let entry_count = u16::from_le_bytes(bytes[6..8].try_into().expect("count")) as usize;
-    if entry_count != MANIFEST_EXPECTED_ENTRIES {
+    if !(MANIFEST_CORE_REQUIRED_ENTRIES..=MANIFEST_MAX_ENTRIES).contains(&entry_count) {
         return Err(InitramfsManifestError::UnexpectedEntryCount);
     }
 
@@ -105,6 +108,7 @@ pub fn parse_core_service_manifest(
     let mut process_manager = None;
     let mut vfs = None;
     let mut supervisor = None;
+    let mut posix_compat = None;
 
     for index in 0..entry_count {
         let base = MANIFEST_HEADER_BYTES + index * MANIFEST_ENTRY_BYTES;
@@ -128,6 +132,7 @@ pub fn parse_core_service_manifest(
             INITRAMFS_PROC_MGR_PATH_PTR => &mut process_manager,
             INITRAMFS_VFS_PATH_PTR => &mut vfs,
             INITRAMFS_SUPERVISOR_PATH_PTR => &mut supervisor,
+            INITRAMFS_POSIX_COMPAT_PATH_PTR => &mut posix_compat,
             _ => return Err(InitramfsManifestError::DuplicatePath),
         };
         if slot.is_some() {
@@ -141,6 +146,7 @@ pub fn parse_core_service_manifest(
         process_manager: process_manager.ok_or(InitramfsManifestError::MissingProcessManager)?,
         vfs: vfs.ok_or(InitramfsManifestError::MissingVfs)?,
         supervisor: supervisor.ok_or(InitramfsManifestError::MissingSupervisor)?,
+        posix_compat,
     })
 }
 
@@ -305,6 +311,13 @@ pub fn build_core_service_elf_launch_plan(
             manifest.supervisor,
             resolve_manifest_image(images, manifest.supervisor.path_ptr)?,
         )?,
+        posix_compat: manifest
+            .posix_compat
+            .map(|entry| {
+                let image = resolve_manifest_image(images, entry.path_ptr)?;
+                build_service_launch_plan(entry, image)
+            })
+            .transpose()?,
     })
 }
 

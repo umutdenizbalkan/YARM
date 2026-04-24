@@ -146,6 +146,7 @@ impl InitService {
                 process_manager_tid: None,
                 vfs_tid: None,
                 supervisor_tid: None,
+                posix_compat_tid: None,
             },
             startup_caps: StartupCapSet::core_required_minimum(),
             fault_handoff: None,
@@ -319,11 +320,15 @@ impl InitService {
         kernel.register_task(graph.process_manager_tid)?;
         kernel.register_task(graph.vfs_tid)?;
         kernel.register_task(graph.supervisor_tid)?;
+        if let Some(posix_tid) = graph.posix_compat_tid {
+            kernel.register_task(posix_tid)?;
+        }
 
         self.handles.init_tid = Some(graph.init_tid);
         self.handles.process_manager_tid = Some(graph.process_manager_tid);
         self.handles.vfs_tid = Some(graph.vfs_tid);
         self.handles.supervisor_tid = Some(graph.supervisor_tid);
+        self.handles.posix_compat_tid = graph.posix_compat_tid;
         self.phase = InitBootPhase::CoreServicesRegistered;
         Ok(())
     }
@@ -364,6 +369,9 @@ impl InitService {
             .handles
             .supervisor_tid
             .ok_or(KernelError::WrongObject)?;
+        let posix_compat_tid = self.handles.posix_compat_tid;
+        let posix_compat_entry = plan.posix_compat_entry;
+        let mut posix_compat_spawned = false;
 
         match self.launch_strategy {
             CoreLaunchStrategy::ProcessManagerFirst => {
@@ -414,6 +422,18 @@ impl InitService {
             }
         }
 
+        if let (Some(tid), Some(entry)) = (posix_compat_tid, posix_compat_entry) {
+            let (compat_asid, _compat_aspace_cap) = kernel.create_user_address_space()?;
+            kernel.spawn_user_task_from_image(UserImageSpec {
+                tid,
+                entry,
+                asid: Some(to_kernel_asid(compat_asid)),
+                class: to_kernel_task_class(TaskClass::SystemServer),
+                startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            })?;
+            posix_compat_spawned = true;
+        }
+
         let mount_status = self.execute_mount_plan_with_fail_at(fail_at)?;
         self.mount_status = Some(mount_status);
 
@@ -421,6 +441,7 @@ impl InitService {
             process_manager_spawned: true,
             vfs_spawned: true,
             supervisor_spawned: true,
+            posix_compat_spawned,
         })
     }
 

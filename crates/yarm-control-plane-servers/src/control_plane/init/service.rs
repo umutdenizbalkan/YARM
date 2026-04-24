@@ -59,11 +59,13 @@ impl InitRuntimeBootConfig<'_> {
                 process_manager_tid: 2,
                 vfs_tid: 3,
                 supervisor_tid: 4,
+                posix_compat_tid: None,
             },
             image_source: InitCoreImageSource::Fixed(CoreServiceImagePlan {
                 process_manager_entry: 0x8000,
                 vfs_entry: 0x9000,
                 supervisor_entry: 0xA000,
+                posix_compat_entry: None,
             }),
             restart_window_ticks: 100,
         }
@@ -245,6 +247,7 @@ fn resolve_core_image_plan(
                 process_manager_entry: launch.process_manager.validated_entry as usize,
                 vfs_entry: launch.vfs.validated_entry as usize,
                 supervisor_entry: launch.supervisor.validated_entry as usize,
+                posix_compat_entry: launch.posix_compat.map(|plan| plan.validated_entry as usize),
             })
         }
     }
