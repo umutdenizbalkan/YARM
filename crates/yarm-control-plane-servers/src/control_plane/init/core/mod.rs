@@ -239,7 +239,6 @@ impl InitService {
         tid: u64,
         entry: usize,
         asid: Asid,
-        startup_args: [u64; 3],
     ) -> Result<(), KernelError> {
         self.launch_order[self.launch_count] = Some(kind);
         self.launch_count += 1;
@@ -248,61 +247,9 @@ impl InitService {
             entry,
             asid: Some(to_kernel_asid(asid)),
             class: to_kernel_task_class(TaskClass::SystemServer),
-            startup_args,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
         })?;
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn delegate_process_manager_startup_caps_for_service(
-        &self,
-        kernel: &mut KernelState,
-        target_tid: u64,
-    ) -> Result<[u64; 3], KernelError> {
-        let process_manager_tid = self
-            .handles
-            .process_manager_tid
-            .ok_or(KernelError::WrongObject)?;
-
-        // Startup ABI slot handoff for process-manager RPC bootstrap:
-        //   arg0 => launched task id
-        //   arg1 => process-manager request endpoint send cap (delegated to target)
-        //   arg2 => process-manager reply endpoint recv cap (delegated to target)
-        let source_tid = 0;
-
-        let (_, proc_req_send_root, proc_req_recv_root) = kernel.create_endpoint(16)?;
-        let proc_req_send_target = kernel.grant_capability_task_to_task_with_rights(
-            source_tid,
-            proc_req_send_root,
-            target_tid,
-            CapRights::SEND,
-        )?;
-        let _proc_req_recv_pm = kernel.grant_capability_task_to_task_with_rights(
-            source_tid,
-            proc_req_recv_root,
-            process_manager_tid,
-            CapRights::RECEIVE,
-        )?;
-
-        let (_, proc_rep_send_root, proc_rep_recv_root) = kernel.create_endpoint(16)?;
-        let _proc_rep_send_pm = kernel.grant_capability_task_to_task_with_rights(
-            source_tid,
-            proc_rep_send_root,
-            process_manager_tid,
-            CapRights::SEND,
-        )?;
-        let proc_rep_recv_target = kernel.grant_capability_task_to_task_with_rights(
-            source_tid,
-            proc_rep_recv_root,
-            target_tid,
-            CapRights::RECEIVE,
-        )?;
-
-        Ok([
-            target_tid,
-            proc_req_send_target.0,
-            proc_rep_recv_target.0,
-        ])
     }
 
     #[cfg(test)]
@@ -417,8 +364,6 @@ impl InitService {
             .handles
             .supervisor_tid
             .ok_or(KernelError::WrongObject)?;
-        let supervisor_startup_args =
-            self.delegate_process_manager_startup_caps_for_service(kernel, supervisor_tid)?;
 
         match self.launch_strategy {
             CoreLaunchStrategy::ProcessManagerFirst => {
@@ -428,7 +373,6 @@ impl InitService {
                     proc_tid,
                     plan.process_manager_entry,
                     proc_asid,
-                    UserImageSpec::DEFAULT_STARTUP_ARGS,
                 )?;
                 self.record_launch(
                     kernel,
@@ -436,7 +380,6 @@ impl InitService {
                     vfs_tid,
                     plan.vfs_entry,
                     vfs_asid,
-                    UserImageSpec::DEFAULT_STARTUP_ARGS,
                 )?;
                 self.record_launch(
                     kernel,
@@ -444,7 +387,6 @@ impl InitService {
                     supervisor_tid,
                     plan.supervisor_entry,
                     supervisor_asid,
-                    supervisor_startup_args,
                 )?;
             }
             CoreLaunchStrategy::SupervisorFirst => {
@@ -454,7 +396,6 @@ impl InitService {
                     supervisor_tid,
                     plan.supervisor_entry,
                     supervisor_asid,
-                    supervisor_startup_args,
                 )?;
                 self.record_launch(
                     kernel,
@@ -462,7 +403,6 @@ impl InitService {
                     proc_tid,
                     plan.process_manager_entry,
                     proc_asid,
-                    UserImageSpec::DEFAULT_STARTUP_ARGS,
                 )?;
                 self.record_launch(
                     kernel,
@@ -470,7 +410,6 @@ impl InitService {
                     vfs_tid,
                     plan.vfs_entry,
                     vfs_asid,
-                    UserImageSpec::DEFAULT_STARTUP_ARGS,
                 )?;
             }
         }
