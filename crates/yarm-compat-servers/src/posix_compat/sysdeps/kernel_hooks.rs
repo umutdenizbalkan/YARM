@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::boot::KernelState;
-use crate::kernel::capabilities::CapId;
-use crate::kernel::vm::PAGE_SIZE;
 use crate::yarm_compat_servers::PosixErrno;
 
+#[cfg(test)]
+use crate::kernel::boot::KernelState;
+#[cfg(test)]
+use crate::kernel::capabilities::CapId;
+#[cfg(test)]
+use crate::kernel::vm::PAGE_SIZE;
+
+#[cfg(test)]
 pub fn mmap_hook(
     kernel: &mut KernelState,
     aspace_cap: CapId,
@@ -18,6 +23,12 @@ pub fn mmap_hook(
         .map_err(Into::into)
 }
 
+#[cfg(not(test))]
+pub fn mmap_hook(_aspace_cap: u32, _addr: usize, _len: usize, _prot: usize) -> Result<usize, PosixErrno> {
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub fn munmap_hook(
     kernel: &mut KernelState,
     aspace_cap: CapId,
@@ -29,6 +40,12 @@ pub fn munmap_hook(
         .map_err(Into::into)
 }
 
+#[cfg(not(test))]
+pub fn munmap_hook(_aspace_cap: u32, _addr: usize, _len: usize) -> Result<(), PosixErrno> {
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub fn mprotect_hook(
     kernel: &mut KernelState,
     aspace_cap: CapId,
@@ -41,6 +58,17 @@ pub fn mprotect_hook(
         .map_err(Into::into)
 }
 
+#[cfg(not(test))]
+pub fn mprotect_hook(
+    _aspace_cap: u32,
+    _addr: usize,
+    _len: usize,
+    _prot: usize,
+) -> Result<(), PosixErrno> {
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub fn brk_hook(
     kernel: &mut KernelState,
     tid: u64,
@@ -53,6 +81,17 @@ pub fn brk_hook(
         .map_err(Into::into)
 }
 
+#[cfg(not(test))]
+pub fn brk_hook(
+    _tid: u64,
+    _aspace_cap: u32,
+    _requested: usize,
+    _prot: usize,
+) -> Result<usize, PosixErrno> {
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub fn clone_thread_hook(
     kernel: &mut KernelState,
     parent_tid: u64,
@@ -65,16 +104,39 @@ pub fn clone_thread_hook(
         .map_err(Into::into)
 }
 
+#[cfg(not(test))]
+pub fn clone_thread_hook(
+    _parent_tid: u64,
+    _tls_base: usize,
+    _user_stack_top: usize,
+    _user_entry: usize,
+) -> Result<u64, PosixErrno> {
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub fn fork_process_hook(kernel: &mut KernelState, parent_tid: u64) -> Result<u64, PosixErrno> {
     kernel.fork_user_process_cow(parent_tid).map_err(Into::into)
 }
 
+#[cfg(not(test))]
+pub fn fork_process_hook(_parent_tid: u64) -> Result<u64, PosixErrno> {
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub fn set_tls_hook(kernel: &mut KernelState, tid: u64, tls_base: usize) -> Result<(), PosixErrno> {
     kernel
         .set_thread_tls_base(tid, tls_base)
         .map_err(Into::into)
 }
 
+#[cfg(not(test))]
+pub fn set_tls_hook(_tid: u64, _tls_base: usize) -> Result<(), PosixErrno> {
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub fn get_tls_hook(kernel: &KernelState, tid: u64) -> Result<Option<usize>, PosixErrno> {
     if tid == 0 {
         return Err(PosixErrno::Inval);
@@ -82,6 +144,12 @@ pub fn get_tls_hook(kernel: &KernelState, tid: u64) -> Result<Option<usize>, Pos
     Ok(kernel.thread_tls_base(tid))
 }
 
+#[cfg(not(test))]
+pub fn get_tls_hook(_tid: u64) -> Result<Option<usize>, PosixErrno> {
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub fn futex_wait_hook(
     kernel: &mut KernelState,
     addr: usize,
@@ -93,6 +161,12 @@ pub fn futex_wait_hook(
         .map_err(PosixErrno::from)
 }
 
+#[cfg(not(test))]
+pub fn futex_wait_hook(_addr: usize, _expected: u32, _observed: u32) -> Result<bool, PosixErrno> {
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub fn futex_wake_hook(
     kernel: &mut KernelState,
     addr: usize,
@@ -101,8 +175,19 @@ pub fn futex_wake_hook(
     kernel.futex_wake(addr, max_wake).map_err(PosixErrno::from)
 }
 
+#[cfg(not(test))]
+pub fn futex_wake_hook(_addr: usize, _max_wake: u32) -> Result<u32, PosixErrno> {
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub const fn default_mmap_len() -> usize {
     PAGE_SIZE
+}
+
+#[cfg(not(test))]
+pub const fn default_mmap_len() -> usize {
+    4096
 }
 
 #[cfg(test)]

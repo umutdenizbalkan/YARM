@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+#[cfg(test)]
 use crate::kernel::boot::KernelState;
+#[cfg(test)]
 use crate::kernel::capabilities::CapId;
+#[cfg(test)]
 use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
 use crate::kernel::ipc::Message;
+use crate::yarm_compat_servers::{POSIX_COMPAT_ABI_VERSION, PosixErrno};
+#[cfg(test)]
 use crate::yarm_compat_servers::{
     LINUX_NR_CLOSE, LINUX_NR_CONNECT, LINUX_NR_EXIT, LINUX_NR_GETPID, LINUX_NR_GETPPID,
     LINUX_NR_OPENAT, LINUX_NR_READ, LINUX_NR_SENDTO, LINUX_NR_SOCKET, LINUX_NR_WRITE,
-    POSIX_COMPAT_ABI_VERSION, PosixErrno, PosixServiceBindings, dispatch,
+    PosixServiceBindings, dispatch,
 };
 
 /// Runtime-facing sysdeps client that speaks to process/vfs managers through
@@ -18,11 +23,16 @@ use crate::yarm_compat_servers::{
 /// Deprecated in-process service ownership has been intentionally removed.
 #[derive(Debug)]
 pub struct PosixSysdepsContext<'a> {
+    #[cfg(test)]
     pub kernel: &'a mut KernelState,
+    #[cfg(not(test))]
+    _marker: core::marker::PhantomData<&'a mut ()>,
+    #[cfg(test)]
     bindings: PosixServiceBindings,
 }
 
 impl<'a> PosixSysdepsContext<'a> {
+    #[cfg(test)]
     pub fn new(kernel: &'a mut KernelState) -> Self {
         Self {
             kernel,
@@ -30,6 +40,14 @@ impl<'a> PosixSysdepsContext<'a> {
         }
     }
 
+    #[cfg(not(test))]
+    pub fn new(_runtime_transport: &'a mut impl yarm_user_rt::syscall::IpcTransport) -> Self {
+        Self {
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    #[cfg(test)]
     pub fn register_process_manager(
         &mut self,
         request_send_cap: CapId,
@@ -40,6 +58,16 @@ impl<'a> PosixSysdepsContext<'a> {
             .map_err(PosixErrno::from)
     }
 
+    #[cfg(not(test))]
+    pub fn register_process_manager(
+        &mut self,
+        _request_send_cap: u32,
+        _reply_recv_cap: u32,
+    ) -> Result<(), PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn register_vfs_manager(
         &mut self,
         request_send_cap: CapId,
@@ -50,6 +78,16 @@ impl<'a> PosixSysdepsContext<'a> {
             .map_err(PosixErrno::from)
     }
 
+    #[cfg(not(test))]
+    pub fn register_vfs_manager(
+        &mut self,
+        _request_send_cap: u32,
+        _reply_recv_cap: u32,
+    ) -> Result<(), PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn register_socket_manager(
         &mut self,
         request_send_cap: CapId,
@@ -60,10 +98,20 @@ impl<'a> PosixSysdepsContext<'a> {
             .map_err(PosixErrno::from)
     }
 
+    #[cfg(not(test))]
+    pub fn register_socket_manager(
+        &mut self,
+        _request_send_cap: u32,
+        _reply_recv_cap: u32,
+    ) -> Result<(), PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
     pub const fn abi_version(&self) -> u16 {
         POSIX_COMPAT_ABI_VERSION
     }
 
+    #[cfg(test)]
     fn decode_ret(ret: usize) -> Result<usize, PosixErrno> {
         let signed = ret as isize;
         if signed < 0 {
@@ -73,6 +121,7 @@ impl<'a> PosixSysdepsContext<'a> {
         Ok(ret)
     }
 
+    #[cfg(test)]
     fn run_syscall(&mut self, nr: usize, args: [usize; 6]) -> Result<usize, PosixErrno> {
         let mut frame = TrapFrame::new(nr, args);
         dispatch(self.kernel, &self.bindings, &mut frame);
@@ -83,10 +132,17 @@ impl<'a> PosixSysdepsContext<'a> {
         Self::decode_ret(frame.ret0())
     }
 
+    #[cfg(test)]
     pub fn clock_gettime_hook(&mut self) -> Result<u64, PosixErrno> {
         Ok(self.kernel.scheduler_tick_now().saturating_mul(1_000_000))
     }
 
+    #[cfg(not(test))]
+    pub fn clock_gettime_hook(&mut self) -> Result<u64, PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn nanosleep_hook(&mut self, nanos: u64) -> Result<(), PosixErrno> {
         if nanos == 0 {
             return Ok(());
@@ -98,21 +154,45 @@ impl<'a> PosixSysdepsContext<'a> {
         Ok(())
     }
 
+    #[cfg(not(test))]
+    pub fn nanosleep_hook(&mut self, _nanos: u64) -> Result<(), PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn getpid_hook(&mut self) -> Result<u64, PosixErrno> {
         let pid = self.run_syscall(LINUX_NR_GETPID, [0, 0, 0, 0, 0, 0])?;
         u64::try_from(pid).map_err(|_| PosixErrno::Inval)
     }
 
+    #[cfg(not(test))]
+    pub fn getpid_hook(&mut self) -> Result<u64, PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn getppid_hook(&mut self) -> Result<u64, PosixErrno> {
         let ppid = self.run_syscall(LINUX_NR_GETPPID, [0, 0, 0, 0, 0, 0])?;
         u64::try_from(ppid).map_err(|_| PosixErrno::Inval)
     }
 
+    #[cfg(not(test))]
+    pub fn getppid_hook(&mut self) -> Result<u64, PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn exit_hook(&mut self, code: u64) -> Result<(), PosixErrno> {
         self.run_syscall(LINUX_NR_EXIT, [code as usize, 0, 0, 0, 0, 0])
             .map(|_| ())
     }
 
+    #[cfg(not(test))]
+    pub fn exit_hook(&mut self, _code: u64) -> Result<(), PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn openat_hook(
         &mut self,
         path_ptr: usize,
@@ -126,6 +206,12 @@ impl<'a> PosixSysdepsContext<'a> {
         i32::try_from(fd).map_err(|_| PosixErrno::Inval)
     }
 
+    #[cfg(not(test))]
+    pub fn openat_hook(&mut self, _path_ptr: usize, _flags: u32, _mode: u32) -> Result<i32, PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn socket_hook(
         &mut self,
         domain: i32,
@@ -139,6 +225,12 @@ impl<'a> PosixSysdepsContext<'a> {
         i32::try_from(fd).map_err(|_| PosixErrno::Inval)
     }
 
+    #[cfg(not(test))]
+    pub fn socket_hook(&mut self, _domain: i32, _sock_type: i32, _protocol: i32) -> Result<i32, PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn connect_hook(
         &mut self,
         fd: i32,
@@ -152,6 +244,12 @@ impl<'a> PosixSysdepsContext<'a> {
         .map(|_| ())
     }
 
+    #[cfg(not(test))]
+    pub fn connect_hook(&mut self, _fd: i32, _addr_ptr: usize, _addr_len: usize) -> Result<(), PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn sendto_hook(
         &mut self,
         fd: i32,
@@ -174,6 +272,20 @@ impl<'a> PosixSysdepsContext<'a> {
         )
     }
 
+    #[cfg(not(test))]
+    pub fn sendto_hook(
+        &mut self,
+        _fd: i32,
+        _buf_ptr: usize,
+        _len: usize,
+        _flags: i32,
+        _dest_addr_ptr: usize,
+        _addrlen: usize,
+    ) -> Result<usize, PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn read_hook(
         &mut self,
         fd: i32,
@@ -186,6 +298,12 @@ impl<'a> PosixSysdepsContext<'a> {
         )
     }
 
+    #[cfg(not(test))]
+    pub fn read_hook(&mut self, _fd: i32, _buf_ptr: usize, _buf_len: usize) -> Result<usize, PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn write_hook(
         &mut self,
         fd: i32,
@@ -198,9 +316,20 @@ impl<'a> PosixSysdepsContext<'a> {
         )
     }
 
+    #[cfg(not(test))]
+    pub fn write_hook(&mut self, _fd: i32, _buf_ptr: usize, _buf_len: usize) -> Result<usize, PosixErrno> {
+        Err(PosixErrno::NoSys)
+    }
+
+    #[cfg(test)]
     pub fn close_hook(&mut self, fd: i32) -> Result<(), PosixErrno> {
         self.run_syscall(LINUX_NR_CLOSE, [fd as usize, 0, 0, 0, 0, 0])
             .map(|_| ())
+    }
+
+    #[cfg(not(test))]
+    pub fn close_hook(&mut self, _fd: i32) -> Result<(), PosixErrno> {
+        Err(PosixErrno::NoSys)
     }
 }
 

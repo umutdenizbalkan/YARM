@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+#[cfg(test)]
 use super::clone_thread_hook;
-use crate::kernel::boot::KernelState;
-use crate::kernel::task::ThreadGroupId;
 use crate::yarm_compat_servers::{
     LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, PosixErrno,
 };
+#[cfg(test)]
+use crate::kernel::boot::KernelState;
+#[cfg(test)]
+use crate::kernel::task::ThreadGroupId as MuslThreadGroupId;
+
+#[cfg(not(test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuslThreadGroupId(pub u64);
 
 /// Minimal sysdeps status used while porting musl to x86_64-unknown-none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +121,7 @@ pub struct MuslThreadState {
     pub thread_pointer: usize,
     pub stack_top: usize,
     pub entry: usize,
-    pub thread_group_id: ThreadGroupId,
+    pub thread_group_id: MuslThreadGroupId,
     pub tls_restore_pending: bool,
 }
 
@@ -130,6 +137,7 @@ pub fn validate_musl_thread_spec(spec: MuslThreadSpec) -> Result<MuslThreadSpec,
     Ok(spec)
 }
 
+#[cfg(test)]
 pub fn validate_musl_thread_state(
     kernel: &KernelState,
     parent_tid: u64,
@@ -167,6 +175,17 @@ pub fn validate_musl_thread_state(
     })
 }
 
+#[cfg(not(test))]
+pub fn validate_musl_thread_state(
+    parent_tid: u64,
+    tid: u64,
+    spec: MuslThreadSpec,
+) -> Result<MuslThreadState, PosixErrno> {
+    let _ = (parent_tid, tid, validate_musl_thread_spec(spec)?);
+    Err(PosixErrno::NoSys)
+}
+
+#[cfg(test)]
 pub fn spawn_musl_thread(
     kernel: &mut KernelState,
     parent_tid: u64,
@@ -181,6 +200,12 @@ pub fn spawn_musl_thread(
         spec.entry,
     )?;
     validate_musl_thread_state(kernel, parent_tid, tid, spec)
+}
+
+#[cfg(not(test))]
+pub fn spawn_musl_thread(parent_tid: u64, spec: MuslThreadSpec) -> Result<MuslThreadState, PosixErrno> {
+    let _ = (parent_tid, validate_musl_thread_spec(spec)?);
+    Err(PosixErrno::NoSys)
 }
 
 fn word_size() -> usize {
