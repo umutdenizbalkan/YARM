@@ -519,6 +519,9 @@ impl KernelState {
                 arg0: 0,
                 arg1: 0,
                 arg2: 0,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
             };
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
@@ -567,6 +570,9 @@ impl KernelState {
             child.user_context = parent.user_context;
             child.user_context.arg0 = 0;
             child.user_context.arg2 = 0;
+            child.user_context.arg3 = 0;
+            child.user_context.arg4 = 0;
+            child.user_context.arg5 = 0;
             child.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;

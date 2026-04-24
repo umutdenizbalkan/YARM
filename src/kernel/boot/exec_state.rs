@@ -364,6 +364,21 @@ impl KernelState {
             crate::yarm_log!("BOOTSTRAP_STAGE: before entry setup");
             crate::yarm_log!("USER_ENTRY rip=0x{:x}", spec.entry);
         }
+        let startup_slots_len = spec.startup_args.len();
+        let startup_slots_bytes_len = startup_slots_len * core::mem::size_of::<u64>();
+        let startup_slots_start = (stack_top.0 as usize)
+            .saturating_sub(startup_slots_bytes_len)
+            & !0x7usize;
+        let startup_stack_ptr = startup_slots_start & !0xFusize;
+        let startup_slots_ptr = VirtAddr(startup_slots_start as u64);
+        let mut startup_slots_bytes = [0u8; core::mem::size_of::<u64>() * 11];
+        for (index, slot) in spec.startup_args.iter().copied().enumerate() {
+            let begin = index * core::mem::size_of::<u64>();
+            startup_slots_bytes[begin..begin + core::mem::size_of::<u64>()]
+                .copy_from_slice(&slot.to_le_bytes());
+        }
+        self.copy_to_user(asid, startup_slots_ptr, &startup_slots_bytes[..startup_slots_bytes_len])?;
+
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
@@ -379,7 +394,7 @@ impl KernelState {
             tcb.user_stack_top = Some(stack_top);
             tcb.user_context = UserRegisterContext {
                 instruction_ptr: VirtAddr(spec.entry as u64),
-                stack_ptr: stack_top,
+                stack_ptr: VirtAddr(startup_stack_ptr as u64),
                 // Startup entry ABI args:
                 //   arg0 => task_id / tid
                 //   arg1 => process-manager request-send cap
@@ -387,6 +402,13 @@ impl KernelState {
                 arg0: spec.startup_args[0] as usize,
                 arg1: spec.startup_args[1] as usize,
                 arg2: spec.startup_args[2] as usize,
+                // Extended startup delivery ABI:
+                //   arg3 => pointer to [u64; 11] startup slot block in userspace memory
+                //   arg4 => startup slot count
+                //   arg5 => reserved (0)
+                arg3: startup_slots_start,
+                arg4: startup_slots_len,
+                arg5: 0,
             };
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())

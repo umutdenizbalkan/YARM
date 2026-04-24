@@ -4070,6 +4070,9 @@ fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
             arg0: 33,
             arg1: 44,
             arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
         })
     );
 }

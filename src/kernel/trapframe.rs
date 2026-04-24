@@ -145,6 +145,9 @@ impl TrapFrame {
             arg0: self.args[0],
             arg1: self.args[1],
             arg2: self.args[2],
+            arg3: self.args[3],
+            arg4: self.args[4],
+            arg5: self.args[5],
         }
     }
 
@@ -154,6 +157,9 @@ impl TrapFrame {
         self.args[0] = context.arg0;
         self.args[1] = context.arg1;
         self.args[2] = context.arg2;
+        self.args[3] = context.arg3;
+        self.args[4] = context.arg4;
+        self.args[5] = context.arg5;
     }
 
     pub const fn error_code(&self) -> Option<usize> {
@@ -204,6 +210,9 @@ mod tests {
         assert_eq!(ctx.arg0, 5);
         assert_eq!(ctx.arg1, 6);
         assert_eq!(ctx.arg2, 9);
+        assert_eq!(ctx.arg3, 0);
+        assert_eq!(ctx.arg4, 0);
+        assert_eq!(ctx.arg5, 0);
 
         frame.apply_user_context(UserRegisterContext {
             instruction_ptr: VirtAddr(0x5000),
@@ -211,12 +220,18 @@ mod tests {
             arg0: 7,
             arg1: 8,
             arg2: 10,
+            arg3: 11,
+            arg4: 12,
+            arg5: 13,
         });
         assert_eq!(frame.saved_pc(), 0x5000);
         assert_eq!(frame.saved_sp(), 0x9000);
         assert_eq!(frame.arg(0), 7);
         assert_eq!(frame.arg(1), 8);
         assert_eq!(frame.arg(2), 10);
+        assert_eq!(frame.arg(3), 11);
+        assert_eq!(frame.arg(4), 12);
+        assert_eq!(frame.arg(5), 13);
     }
 
     #[test]

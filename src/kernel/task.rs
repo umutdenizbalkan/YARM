@@ -59,6 +59,9 @@ pub struct UserRegisterContext {
     pub arg0: usize,
     pub arg1: usize,
     pub arg2: usize,
+    pub arg3: usize,
+    pub arg4: usize,
+    pub arg5: usize,
 }
 
 impl Default for UserRegisterContext {
@@ -69,6 +72,9 @@ impl Default for UserRegisterContext {
             arg0: 0,
             arg1: 0,
             arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
         }
     }
 }
@@ -205,6 +211,9 @@ mod tests {
             arg0: 1,
             arg1: 2,
             arg2: 3,
+            arg3: 4,
+            arg4: 5,
+            arg5: 6,
         };
         tcb.fault_policy_override = Some(FaultPolicy::KillTask);
         tcb.restart = RestartState {
