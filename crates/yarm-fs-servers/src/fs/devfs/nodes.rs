@@ -3,8 +3,12 @@
 
 use super::super::common::vfs_ipc::{VfsBackend, VfsError};
 
+/// Compatibility-only legacy path identifier; prefer `DEV_CONSOLE_PATH`.
 pub const DEV_CONSOLE_PATH_PTR: u64 = 0x434F_4E53_4F4C_4500;
+pub const DEV_CONSOLE_PATH: &[u8] = b"/dev/console";
+/// Compatibility-only legacy path identifier; prefer `DEV_NULL_PATH`.
 pub const DEV_NULL_PATH_PTR: u64 = 0x4445_564E_554C_4C00;
+pub const DEV_NULL_PATH: &[u8] = b"/dev/null";
 
 const MAX_OPEN_HANDLES: usize = 16;
 const DEVFS_STATX_TYPE_CHAR_DEVICE: u64 = 0x2000_0000_0000_0000;
@@ -70,14 +74,27 @@ impl DevFsBackend {
         self.metrics
     }
 
-    fn resolve_node(path_ptr: u64) -> Result<DevNode, VfsError> {
-        if path_ptr == DEV_CONSOLE_PATH_PTR {
+    fn lookup_by_path(path: &[u8]) -> Result<DevNode, VfsError> {
+        if path == DEV_CONSOLE_PATH {
             return Ok(DevNode::Console);
         }
-        if path_ptr == DEV_NULL_PATH_PTR {
+        if path == DEV_NULL_PATH {
             return Ok(DevNode::Null);
         }
-        Err(VfsError::BadFd)
+        Err(VfsError::InvalidPath)
+    }
+
+    fn metadata_by_path(path: &[u8]) -> Result<u64, VfsError> {
+        let node = Self::lookup_by_path(path)?;
+        Ok(Self::statx_for_node(node))
+    }
+
+    fn legacy_path_from_ptr(path_ptr: u64) -> Option<&'static [u8]> {
+        match path_ptr {
+            DEV_CONSOLE_PATH_PTR => Some(DEV_CONSOLE_PATH),
+            DEV_NULL_PATH_PTR => Some(DEV_NULL_PATH),
+            _ => None,
+        }
     }
 
     fn alloc_handle(&mut self, node: DevNode) -> Result<u64, VfsError> {
@@ -123,7 +140,15 @@ impl DevFsBackend {
 
 impl VfsBackend for DevFsBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        match Self::resolve_node(path_ptr).and_then(|node| self.alloc_handle(node)) {
+        let Some(path) = Self::legacy_path_from_ptr(path_ptr) else {
+            self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+            return Err(VfsError::BadFd);
+        };
+        self.openat_path(path)
+    }
+
+    fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        match Self::lookup_by_path(path).and_then(|node| self.alloc_handle(node)) {
             Ok(fd) => {
                 self.metrics.open_count = self.metrics.open_count.saturating_add(1);
                 Ok(fd)
@@ -188,10 +213,18 @@ impl VfsBackend for DevFsBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        match Self::resolve_node(path_ptr) {
-            Ok(node) => {
+        let Some(path) = Self::legacy_path_from_ptr(path_ptr) else {
+            self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+            return Err(VfsError::BadFd);
+        };
+        self.statx_path(path)
+    }
+
+    fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        match Self::metadata_by_path(path) {
+            Ok(stat) => {
                 self.metrics.statx_count = self.metrics.statx_count.saturating_add(1);
-                Ok(Self::statx_for_node(node))
+                Ok(stat)
             }
             Err(err) => {
                 self.metrics.error_count = self.metrics.error_count.saturating_add(1);
@@ -267,5 +300,33 @@ mod tests {
         assert_eq!(metrics.console_bytes_written, 8);
         assert_eq!(metrics.null_bytes_written, 5);
         assert_eq!(metrics.error_count, 2);
+    }
+
+    #[test]
+    fn byte_path_open_and_statx_work_for_known_nodes() {
+        let mut backend = DevFsBackend::new();
+        let console_fd = backend.openat_path(DEV_CONSOLE_PATH).expect("console open");
+        let null_stat = backend.statx_path(DEV_NULL_PATH).expect("null stat");
+        assert_eq!(console_fd, 3);
+        assert_eq!(
+            null_stat,
+            DEVFS_STATX_TYPE_CHAR_DEVICE | DEVFS_MODE_OWNER_READ | DEVFS_MODE_OWNER_WRITE
+        );
+    }
+
+    #[test]
+    fn byte_path_lookup_rejects_unknown_paths() {
+        let mut backend = DevFsBackend::new();
+        assert_eq!(backend.openat_path(b"/dev/unknown"), Err(VfsError::InvalidPath));
+        assert_eq!(backend.statx_path(b"/dev/unknown"), Err(VfsError::InvalidPath));
+    }
+
+    #[test]
+    fn legacy_pointer_adapter_still_works() {
+        let mut backend = DevFsBackend::new();
+        assert!(backend.openat(DEV_CONSOLE_PATH_PTR).is_ok());
+        assert!(backend.statx(DEV_NULL_PATH_PTR).is_ok());
+        assert_eq!(backend.openat(0xDEAD_BEEF), Err(VfsError::BadFd));
+        assert_eq!(backend.statx(0xDEAD_BEEF), Err(VfsError::BadFd));
     }
 }

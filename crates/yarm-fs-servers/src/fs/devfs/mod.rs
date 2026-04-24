@@ -4,5 +4,7 @@
 pub mod nodes;
 pub mod service;
 
-pub use nodes::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend, DevFsMetrics};
+pub use nodes::{
+    DEV_CONSOLE_PATH, DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH, DEV_NULL_PATH_PTR, DevFsBackend, DevFsMetrics,
+};
 pub use service::{DevFsService, run};
