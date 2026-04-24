@@ -10,14 +10,11 @@ use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
 use crate::kernel::ipc::Message;
 use crate::yarm_compat_servers::{POSIX_COMPAT_ABI_VERSION, PosixErrno};
-#[cfg(not(test))]
 use yarm_ipc_abi::process_abi::PROC_OP_GETPID;
-#[cfg(not(test))]
-use yarm_user_rt::ipc::Message;
+use yarm_user_rt::syscall::IpcTransport;
+use yarm_user_rt::ipc::Message as RuntimeMessage;
 #[cfg(not(test))]
 use yarm_user_rt::runtime::startup_context;
-#[cfg(not(test))]
-use yarm_user_rt::syscall::IpcTransport;
 #[cfg(test)]
 use crate::yarm_compat_servers::{
     LINUX_NR_CLOSE, LINUX_NR_CONNECT, LINUX_NR_EXIT, LINUX_NR_GETPID, LINUX_NR_GETPPID,
@@ -196,33 +193,15 @@ impl<'a> PosixSysdepsContext<'a> {
         let reply_cap = self
             .process_manager_reply_recv_cap
             .ok_or(PosixErrno::NoSys)?;
-        let request_payload = self.startup_tid.to_le_bytes();
-        let request = Message::with_header(
-            self.startup_tid,
-            PROC_OP_GETPID,
-            0,
-            None,
-            &request_payload,
-        )
-        .map_err(|_| PosixErrno::Inval)?;
-        self.runtime_transport
-            .send(request_cap, &request)
-            .map_err(PosixErrno::from)?;
-        let reply = self
-            .runtime_transport
-            .recv(reply_cap)
-            .map_err(PosixErrno::from)?
-            .ok_or(PosixErrno::NoSys)?;
-        if reply.opcode != PROC_OP_GETPID {
-            return Err(PosixErrno::NoSys);
-        }
-        let payload = reply.as_slice();
-        if payload.len() < 8 {
-            return Err(PosixErrno::NoSys);
-        }
-        let mut pid_bytes = [0u8; 8];
-        pid_bytes.copy_from_slice(&payload[..8]);
-        Ok(u64::from_le_bytes(pid_bytes))
+        getpid_via_process_manager_ipc(self.runtime_transport, self.startup_tid, request_cap, reply_cap)
+            .map_err(|err| {
+                crate::yarm_log!(
+                    "posix-compat getpid IPC failed: task_id={} err={:?}",
+                    self.startup_tid,
+                    err
+                );
+                map_getpid_ipc_error(err)
+            })
     }
 
     #[cfg(test)]
@@ -388,6 +367,64 @@ impl<'a> PosixSysdepsContext<'a> {
     }
 }
 
+const PROC_GETPID_REPLY_REQUIRED_BYTES: usize = 8;
+const PROC_GETPID_PROTO_FLAGS: u16 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetPidIpcError {
+    MissingBindings,
+    Transport,
+    MissingReply,
+    ProtocolMismatch,
+}
+
+fn map_getpid_ipc_error(err: GetPidIpcError) -> PosixErrno {
+    match err {
+        GetPidIpcError::MissingBindings => PosixErrno::NoSys,
+        GetPidIpcError::Transport => PosixErrno::Intr,
+        GetPidIpcError::MissingReply => PosixErrno::TimedOut,
+        GetPidIpcError::ProtocolMismatch => PosixErrno::Inval,
+    }
+}
+
+fn decode_getpid_reply(reply: &RuntimeMessage) -> Result<u64, GetPidIpcError> {
+    if reply.opcode != PROC_OP_GETPID {
+        return Err(GetPidIpcError::ProtocolMismatch);
+    }
+    if reply.flags != PROC_GETPID_PROTO_FLAGS {
+        return Err(GetPidIpcError::ProtocolMismatch);
+    }
+    let payload = reply.as_slice();
+    if payload.len() < PROC_GETPID_REPLY_REQUIRED_BYTES {
+        return Err(GetPidIpcError::ProtocolMismatch);
+    }
+    let mut pid_bytes = [0u8; PROC_GETPID_REPLY_REQUIRED_BYTES];
+    pid_bytes.copy_from_slice(&payload[..PROC_GETPID_REPLY_REQUIRED_BYTES]);
+    Ok(u64::from_le_bytes(pid_bytes))
+}
+
+fn getpid_via_process_manager_ipc(
+    transport: &mut dyn IpcTransport,
+    startup_tid: u64,
+    request_cap: u32,
+    reply_cap: u32,
+) -> Result<u64, GetPidIpcError> {
+    if request_cap == 0 || reply_cap == 0 {
+        return Err(GetPidIpcError::MissingBindings);
+    }
+    let request_payload = startup_tid.to_le_bytes();
+    let request = RuntimeMessage::with_header(startup_tid, PROC_OP_GETPID, 0, None, &request_payload)
+        .map_err(|_| GetPidIpcError::ProtocolMismatch)?;
+    transport
+        .send(request_cap, &request)
+        .map_err(|_| GetPidIpcError::Transport)?;
+    let reply = transport
+        .recv(reply_cap)
+        .map_err(|_| GetPidIpcError::Transport)?
+        .ok_or(GetPidIpcError::MissingReply)?;
+    decode_getpid_reply(&reply)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +439,7 @@ mod tests {
         ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SENDTO, SOCKET_OP_SOCKET, SendToArgs,
     };
     use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_WRITE};
+    use yarm_user_rt::syscall::SyscallError;
 
     fn run_with_large_stack<F>(f: F)
     where
@@ -414,6 +452,25 @@ mod tests {
         handle.join().expect("join large-stack test thread");
     }
 
+    #[derive(Debug)]
+    struct StubTransport {
+        reply: Option<RuntimeMessage>,
+    }
+
+    impl IpcTransport for StubTransport {
+        fn send(
+            &mut self,
+            _ep_cap: u32,
+            _msg: &RuntimeMessage,
+        ) -> Result<(), SyscallError> {
+            Ok(())
+        }
+
+        fn recv(&mut self, _ep_cap: u32) -> Result<Option<RuntimeMessage>, SyscallError> {
+            Ok(self.reply.take())
+        }
+    }
+
     #[test]
     fn service_backed_clock_hooks_use_kernel_timer() {
         run_with_large_stack(|| {
@@ -424,6 +481,17 @@ mod tests {
             ctx.nanosleep_hook(2_500_000).expect("sleep");
             assert_eq!(ctx.clock_gettime_hook().expect("after"), 3_000_000);
         });
+    }
+
+    #[test]
+    fn getpid_ipc_rejects_malformed_reply_payload() {
+        let malformed = RuntimeMessage::with_header(0, PROC_OP_GETPID, 0, None, &[1, 2, 3])
+            .expect("malformed reply shape");
+        let mut transport = StubTransport {
+            reply: Some(malformed),
+        };
+        let result = getpid_via_process_manager_ipc(&mut transport, 7, 1, 2);
+        assert_eq!(result, Err(GetPidIpcError::ProtocolMismatch));
     }
 
     #[test]
