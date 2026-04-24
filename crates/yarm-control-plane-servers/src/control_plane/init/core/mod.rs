@@ -37,31 +37,31 @@ pub use policy::{
     RestartOwner, ServiceRestartPolicy, StartupCap, StartupCapSet,
 };
 
-fn map_task_status(status: yarm::kernel::task::TaskStatus) -> TaskStatus {
+fn map_task_status(status: TaskStatus) -> TaskStatus {
     match status {
-        yarm::kernel::task::TaskStatus::Runnable => TaskStatus::Runnable,
-        yarm::kernel::task::TaskStatus::Running => TaskStatus::Running,
-        yarm::kernel::task::TaskStatus::Blocked(_) => TaskStatus::Blocked,
-        yarm::kernel::task::TaskStatus::Faulted => TaskStatus::Faulted,
-        yarm::kernel::task::TaskStatus::Exited(code) => TaskStatus::Exited(code),
-        yarm::kernel::task::TaskStatus::Dead => TaskStatus::Dead,
+        TaskStatus::Runnable => TaskStatus::Runnable,
+        TaskStatus::Running => TaskStatus::Running,
+        TaskStatus::Blocked => TaskStatus::Blocked,
+        TaskStatus::Faulted => TaskStatus::Faulted,
+        TaskStatus::Exited(code) => TaskStatus::Exited(code),
+        TaskStatus::Dead => TaskStatus::Dead,
     }
 }
 
-fn to_kernel_task_class(class: TaskClass) -> yarm::kernel::task::TaskClass {
+fn to_kernel_task_class(class: TaskClass) -> TaskClass {
     match class {
-        TaskClass::App => yarm::kernel::task::TaskClass::App,
-        TaskClass::Driver => yarm::kernel::task::TaskClass::Driver,
-        TaskClass::SystemServer => yarm::kernel::task::TaskClass::SystemServer,
+        TaskClass::App => TaskClass::App,
+        TaskClass::Driver => TaskClass::Driver,
+        TaskClass::SystemServer => TaskClass::SystemServer,
     }
 }
 
-fn map_kernel_asid(asid: yarm::kernel::vm::Asid) -> Asid {
+fn map_kernel_asid(asid: Asid) -> Asid {
     Asid(asid.0)
 }
 
-fn to_kernel_asid(asid: Asid) -> yarm::kernel::vm::Asid {
-    yarm::kernel::vm::Asid(asid.0)
+fn to_kernel_asid(asid: Asid) -> Asid {
+    Asid(asid.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
