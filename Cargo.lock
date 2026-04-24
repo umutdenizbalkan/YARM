@@ -23,10 +23,10 @@ dependencies = [
 name = "yarm-control-plane-servers"
 version = "0.1.0"
 dependencies = [
- "yarm",
  "yarm-freestanding-alloc",
  "yarm-fs-servers",
  "yarm-ipc-abi",
+ "yarm-server-runtime",
  "yarm-srv-common",
  "yarm-user-rt",
 ]
@@ -36,6 +36,7 @@ name = "yarm-driver-servers"
 version = "0.1.0"
 dependencies = [
  "yarm-fs-servers",
+ "yarm-server-runtime",
  "yarm-user-rt",
 ]
 
@@ -48,6 +49,7 @@ name = "yarm-fs-servers"
 version = "0.1.0"
 dependencies = [
  "yarm-ipc-abi",
+ "yarm-server-runtime",
  "yarm-srv-common",
  "yarm-user-rt",
 ]
@@ -64,6 +66,7 @@ version = "0.1.0"
 name = "yarm-network-servers"
 version = "0.1.0"
 dependencies = [
+ "yarm-server-runtime",
  "yarm-user-rt",
 ]
 
@@ -78,13 +81,9 @@ dependencies = [
 name = "yarm-server-runtime"
 version = "0.1.0"
 dependencies = [
- "yarm",
- "yarm-control-plane-servers",
- "yarm-driver-servers",
  "yarm-freestanding-alloc",
- "yarm-fs-servers",
- "yarm-network-servers",
- "yarm-ui-servers",
+ "yarm-ipc-abi",
+ "yarm-user-rt",
 ]
 
 [[package]]
@@ -98,6 +97,7 @@ dependencies = [
 name = "yarm-ui-servers"
 version = "0.1.0"
 dependencies = [
+ "yarm-server-runtime",
  "yarm-user-rt",
 ]
 

@@ -7,9 +7,10 @@ edition = "2024"
 
 [features]
 default = ["hosted-dev"]
-hosted-dev = ["yarm/hosted-dev"]
-posix-compat = ["yarm/posix-compat"]
+hosted-dev = []
+posix-compat = []
 
 [dependencies]
-yarm = { path = "../..", default-features = false }
 yarm-freestanding-alloc = { path = "../yarm-freestanding-alloc" }
+yarm-ipc-abi = { path = "../yarm-ipc-abi" }
+yarm-user-rt = { path = "../yarm-user-rt" }

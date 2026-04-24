@@ -3,6 +3,8 @@
 # Copyright 2026 Umut Deniz Balkan
 
 import json
+import pathlib
+import re
 import subprocess
 import sys
 
@@ -51,8 +53,14 @@ def main() -> int:
             bad = True
 
     bridge_deps = {dep["name"] for dep in packages[RUNTIME_BRIDGE]["dependencies"]}
-    if ROOT_CRATE not in bridge_deps:
-        print(f"[fail] {RUNTIME_BRIDGE} must depend on {ROOT_CRATE}")
+    if ROOT_CRATE in bridge_deps:
+        print(f"[fail] {RUNTIME_BRIDGE} must not depend on {ROOT_CRATE}")
+        bad = True
+
+    runtime_lib_path = pathlib.Path("crates") / "yarm-server-runtime" / "src" / "lib.rs"
+    runtime_lib_src = runtime_lib_path.read_text(encoding="utf-8")
+    if re.search(r"^\s*pub\s+use\s+yarm\s*::\s*\*\s*;", runtime_lib_src, flags=re.MULTILINE):
+        print(f"[fail] {runtime_lib_path} must not glob re-export root {ROOT_CRATE}")
         bad = True
 
     root_deps = {dep["name"] for dep in packages[ROOT_CRATE]["dependencies"]}
