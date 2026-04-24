@@ -170,10 +170,30 @@ pub mod runtime {
     pub const STARTUP_SLOT_TASK_ID: usize = 0;
     pub const STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP: usize = 1;
     pub const STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP: usize = 2;
-    const STARTUP_SLOT_COUNT: usize = 3;
+    pub const STARTUP_SLOT_SUPERVISOR_FAULT_RECV_EP: usize = 3;
+    pub const STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP: usize = 4;
+    pub const STARTUP_SLOT_SUPERVISOR_CONTROL_RECV_EP: usize = 5;
+    pub const STARTUP_SLOT_INIT_ALERT_SEND_EP: usize = 6;
+    pub const STARTUP_SLOT_INIT_ALERT_RECV_EP: usize = 7;
+    pub const STARTUP_SLOT_OPTIONAL_INIT_TID: usize = 8;
+    pub const STARTUP_SLOT_OPTIONAL_SUPERVISOR_TID: usize = 9;
+    pub const STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS: usize = 10;
+    const STARTUP_SLOT_COUNT: usize = 11;
 
     static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] =
-        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        [
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+        ];
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct StartupContext {
@@ -186,6 +206,22 @@ pub mod runtime {
         ///
         /// This remains `None` until the startup ABI wires concrete cap slots.
         pub process_manager_reply_recv_cap: Option<u32>,
+        /// Optional supervisor fault receive endpoint cap.
+        pub supervisor_fault_recv_ep: Option<u32>,
+        /// Optional supervisor control send endpoint cap.
+        pub supervisor_control_send_ep: Option<u32>,
+        /// Optional supervisor control receive endpoint cap.
+        pub supervisor_control_recv_ep: Option<u32>,
+        /// Optional init alert send endpoint cap.
+        pub init_alert_send_ep: Option<u32>,
+        /// Optional init alert receive endpoint cap.
+        pub init_alert_recv_ep: Option<u32>,
+        /// Optional init task id conveyed during runtime handoff.
+        pub init_tid: Option<u64>,
+        /// Optional supervisor task id conveyed during runtime handoff.
+        pub supervisor_tid: Option<u64>,
+        /// Optional supervisor restart window ticks.
+        pub supervisor_restart_window_ticks: Option<u64>,
     }
 
     impl StartupContext {
@@ -210,12 +246,25 @@ pub mod runtime {
         }
     }
 
+    #[inline]
+    const fn optional_tid_from_slot(raw: u64) -> Option<u64> {
+        if raw == 0 { None } else { Some(raw) }
+    }
+
     /// Install raw startup ABI slot values captured by runtime entry code.
     ///
     /// Slot mapping:
     /// - `STARTUP_SLOT_TASK_ID`
     /// - `STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP`
     /// - `STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP`
+    /// - `STARTUP_SLOT_SUPERVISOR_FAULT_RECV_EP`
+    /// - `STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP`
+    /// - `STARTUP_SLOT_SUPERVISOR_CONTROL_RECV_EP`
+    /// - `STARTUP_SLOT_INIT_ALERT_SEND_EP`
+    /// - `STARTUP_SLOT_INIT_ALERT_RECV_EP`
+    /// - `STARTUP_SLOT_OPTIONAL_INIT_TID`
+    /// - `STARTUP_SLOT_OPTIONAL_SUPERVISOR_TID`
+    /// - `STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS`
     ///
     /// Missing/unset slots should be provided as `0`.
     #[inline]
@@ -284,10 +333,42 @@ pub mod runtime {
         let process_manager_reply_recv_cap = cap_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP].load(Ordering::Relaxed),
         );
+        let supervisor_fault_recv_ep = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_SUPERVISOR_FAULT_RECV_EP].load(Ordering::Relaxed),
+        );
+        let supervisor_control_send_ep = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP].load(Ordering::Relaxed),
+        );
+        let supervisor_control_recv_ep = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_SUPERVISOR_CONTROL_RECV_EP].load(Ordering::Relaxed),
+        );
+        let init_alert_send_ep = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_INIT_ALERT_SEND_EP].load(Ordering::Relaxed),
+        );
+        let init_alert_recv_ep = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_INIT_ALERT_RECV_EP].load(Ordering::Relaxed),
+        );
+        let init_tid = optional_tid_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_OPTIONAL_INIT_TID].load(Ordering::Relaxed),
+        );
+        let supervisor_tid = optional_tid_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_OPTIONAL_SUPERVISOR_TID].load(Ordering::Relaxed),
+        );
+        let supervisor_restart_window_ticks = optional_tid_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS].load(Ordering::Relaxed),
+        );
         StartupContext {
             task_id,
             process_manager_request_send_cap,
             process_manager_reply_recv_cap,
+            supervisor_fault_recv_ep,
+            supervisor_control_send_ep,
+            supervisor_control_recv_ep,
+            init_alert_send_ep,
+            init_alert_recv_ep,
+            init_tid,
+            supervisor_tid,
+            supervisor_restart_window_ticks,
         }
     }
 }
@@ -402,13 +483,13 @@ mod tests {
     fn startup_process_manager_caps_require_both_slots() {
         let original = startup_context();
 
-        install_startup_arg_slots([42, 11, 12]);
+        install_startup_arg_slots([42, 11, 12, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), Some((11, 12)));
 
-        install_startup_arg_slots([42, 0, 12]);
+        install_startup_arg_slots([42, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), None);
 
-        install_startup_arg_slots([42, 11, 0]);
+        install_startup_arg_slots([42, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), None);
 
         install_startup_arg_slots([
@@ -421,6 +502,20 @@ mod tests {
                 .process_manager_reply_recv_cap
                 .map(u64::from)
                 .unwrap_or(0),
+            original.supervisor_fault_recv_ep.map(u64::from).unwrap_or(0),
+            original
+                .supervisor_control_send_ep
+                .map(u64::from)
+                .unwrap_or(0),
+            original
+                .supervisor_control_recv_ep
+                .map(u64::from)
+                .unwrap_or(0),
+            original.init_alert_send_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_tid.unwrap_or(0),
+            original.supervisor_tid.unwrap_or(0),
+            original.supervisor_restart_window_ticks.unwrap_or(0),
         ]);
     }
 }

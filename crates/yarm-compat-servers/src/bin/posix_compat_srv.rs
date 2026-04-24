@@ -34,6 +34,14 @@ pub extern "C" fn _start(
         startup_task_id,
         startup_proc_mgr_request_send_cap,
         startup_proc_mgr_reply_recv_cap,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     ]);
     run();
     loop {}

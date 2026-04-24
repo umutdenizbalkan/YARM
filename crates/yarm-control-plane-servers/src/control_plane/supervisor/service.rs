@@ -56,14 +56,16 @@ pub struct SupervisorRuntimeHandoff {
 impl SupervisorRuntimeHandoff {
     pub fn from_startup_context(ctx: StartupContext) -> Self {
         Self {
-            supervisor_tid: Some(ctx.task_id),
-            init_tid: Some(ctx.task_id),
-            supervisor_fault_recv_ep: None,
-            supervisor_control_send_ep: None,
-            supervisor_control_recv_ep: None,
-            init_alert_send_ep: None,
-            init_alert_recv_ep: None,
-            restart_window_ticks: SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS,
+            supervisor_tid: ctx.supervisor_tid.or(Some(ctx.task_id)),
+            init_tid: ctx.init_tid,
+            supervisor_fault_recv_ep: ctx.supervisor_fault_recv_ep,
+            supervisor_control_send_ep: ctx.supervisor_control_send_ep,
+            supervisor_control_recv_ep: ctx.supervisor_control_recv_ep,
+            init_alert_send_ep: ctx.init_alert_send_ep,
+            init_alert_recv_ep: ctx.init_alert_recv_ep,
+            restart_window_ticks: ctx
+                .supervisor_restart_window_ticks
+                .unwrap_or(SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS),
         }
     }
 

@@ -240,6 +240,7 @@ impl InitService {
         tid: u64,
         entry: usize,
         asid: Asid,
+        startup_args: [u64; 11],
     ) -> Result<(), KernelError> {
         self.launch_order[self.launch_count] = Some(kind);
         self.launch_count += 1;
@@ -248,7 +249,7 @@ impl InitService {
             entry,
             asid: Some(to_kernel_asid(asid)),
             class: to_kernel_task_class(TaskClass::SystemServer),
-            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            startup_args,
         })?;
         Ok(())
     }
@@ -258,7 +259,7 @@ impl InitService {
         kernel: &mut KernelState,
         process_manager_tid: u64,
         compat_tid: u64,
-    ) -> Result<[u64; 3], KernelError> {
+    ) -> Result<[u64; 11], KernelError> {
         // Startup ABI slots for compat server:
         //   arg0 => compat task id
         //   arg1 => process-manager request SEND cap in compat task
@@ -293,7 +294,79 @@ impl InitService {
             CapRights::RECEIVE,
         )?;
 
-        Ok([compat_tid, request_send_compat.0, reply_recv_compat.0])
+        let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+        startup_args[0] = compat_tid;
+        startup_args[1] = request_send_compat.0;
+        startup_args[2] = reply_recv_compat.0;
+        Ok(startup_args)
+    }
+
+    #[cfg(test)]
+    fn delegate_supervisor_startup_handoff_caps(
+        kernel: &mut KernelState,
+        init_tid: u64,
+        supervisor_tid: u64,
+        restart_window_ticks: u64,
+    ) -> Result<([u64; 11], InitFaultHandoff), KernelError> {
+        let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
+
+        let (_, _fault_send_root, fault_recv_root) = kernel.create_endpoint(16)?;
+        let supervisor_fault_recv_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            fault_recv_root,
+            supervisor_tid,
+            CapRights::RECEIVE,
+        )?;
+
+        let (_, control_send_root, control_recv_root) = kernel.create_endpoint(16)?;
+        let supervisor_control_send_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            control_send_root,
+            supervisor_tid,
+            CapRights::SEND,
+        )?;
+        let supervisor_control_recv_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            control_recv_root,
+            supervisor_tid,
+            CapRights::RECEIVE,
+        )?;
+
+        let (_, init_alert_send_root, init_alert_recv_root) = kernel.create_endpoint(16)?;
+        let init_alert_send_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            init_alert_send_root,
+            supervisor_tid,
+            CapRights::SEND,
+        )?;
+        let init_alert_recv_cap = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            init_alert_recv_root,
+            supervisor_tid,
+            CapRights::RECEIVE,
+        )?;
+
+        let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+        startup_args[0] = supervisor_tid;
+        startup_args[3] = supervisor_fault_recv_cap.0;
+        startup_args[4] = supervisor_control_send_cap.0;
+        startup_args[5] = supervisor_control_recv_cap.0;
+        startup_args[6] = init_alert_send_cap.0;
+        startup_args[7] = init_alert_recv_cap.0;
+        startup_args[8] = init_tid;
+        startup_args[9] = supervisor_tid;
+        startup_args[10] = restart_window_ticks;
+
+        let handoff = InitFaultHandoff::new(
+            supervisor_tid,
+            supervisor_fault_recv_cap,
+            supervisor_control_send_cap,
+            supervisor_control_recv_cap,
+            init_alert_send_cap,
+            init_alert_recv_cap,
+            restart_window_ticks,
+        );
+        Ok((startup_args, handoff))
     }
 
     #[cfg(test)]
@@ -412,9 +485,18 @@ impl InitService {
             .handles
             .supervisor_tid
             .ok_or(KernelError::WrongObject)?;
+        let init_tid = self.handles.init_tid.ok_or(KernelError::WrongObject)?;
         let posix_compat_tid = self.handles.posix_compat_tid;
         let posix_compat_entry = plan.posix_compat_entry;
         let mut posix_compat_spawned = false;
+        let (supervisor_startup_args, supervisor_handoff) =
+            Self::delegate_supervisor_startup_handoff_caps(
+                kernel,
+                init_tid,
+                supervisor_tid,
+                self.restart_policies.supervisor.restart_window.0,
+            )?;
+        self.fault_handoff = Some(supervisor_handoff);
 
         match self.launch_strategy {
             CoreLaunchStrategy::ProcessManagerFirst => {
@@ -424,6 +506,7 @@ impl InitService {
                     proc_tid,
                     plan.process_manager_entry,
                     proc_asid,
+                    UserImageSpec::DEFAULT_STARTUP_ARGS,
                 )?;
                 self.record_launch(
                     kernel,
@@ -431,6 +514,7 @@ impl InitService {
                     vfs_tid,
                     plan.vfs_entry,
                     vfs_asid,
+                    UserImageSpec::DEFAULT_STARTUP_ARGS,
                 )?;
                 self.record_launch(
                     kernel,
@@ -438,6 +522,7 @@ impl InitService {
                     supervisor_tid,
                     plan.supervisor_entry,
                     supervisor_asid,
+                    supervisor_startup_args,
                 )?;
             }
             CoreLaunchStrategy::SupervisorFirst => {
@@ -447,6 +532,7 @@ impl InitService {
                     supervisor_tid,
                     plan.supervisor_entry,
                     supervisor_asid,
+                    supervisor_startup_args,
                 )?;
                 self.record_launch(
                     kernel,
@@ -454,6 +540,7 @@ impl InitService {
                     proc_tid,
                     plan.process_manager_entry,
                     proc_asid,
+                    UserImageSpec::DEFAULT_STARTUP_ARGS,
                 )?;
                 self.record_launch(
                     kernel,
@@ -461,6 +548,7 @@ impl InitService {
                     vfs_tid,
                     plan.vfs_entry,
                     vfs_asid,
+                    UserImageSpec::DEFAULT_STARTUP_ARGS,
                 )?;
             }
         }

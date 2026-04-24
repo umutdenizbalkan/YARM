@@ -45,11 +45,14 @@ pub struct UserImageSpec {
     /// - arg0 => task_id / tid
     /// - arg1 => process-manager request-send cap
     /// - arg2 => process-manager reply-recv cap
-    pub startup_args: [u64; 3],
+    ///
+    /// Additional slots may be populated by launchers for server-specific
+    /// runtime handoff metadata (for example supervisor endpoint caps).
+    pub startup_args: [u64; 11],
 }
 
 impl UserImageSpec {
-    pub const DEFAULT_STARTUP_ARGS: [u64; 3] = [0, 0, 0];
+    pub const DEFAULT_STARTUP_ARGS: [u64; 11] = [0; 11];
 }
 
 impl Default for UserImageSpec {
