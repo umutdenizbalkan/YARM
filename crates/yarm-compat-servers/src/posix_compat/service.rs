@@ -11,6 +11,12 @@ pub fn run() {
     let registration_result = startup
         .process_manager_caps()
         .map(|(request_send, reply_recv)| {
+            crate::yarm_log!(
+                "POSIX_COMPAT_PM_CAPS_READY task_id={} req={} reply={}",
+                startup.task_id,
+                request_send,
+                reply_recv
+            );
             sysdeps.register_process_manager(request_send, reply_recv)
         });
     let getpid_ipc_ready = matches!(registration_result, Some(Ok(())));
@@ -29,6 +35,7 @@ pub fn run() {
             err
         );
     } else if !getpid_ipc_ready {
+        crate::yarm_log!("POSIX_COMPAT_PM_CAPS_MISSING task_id={}", startup.task_id);
         crate::yarm_log!(
             "posix-compat startup: process-manager caps missing from startup_context; getpid remains graceful NoSys"
         );

@@ -393,3 +393,34 @@ pub mod process {
         fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessError>;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::{install_startup_arg_slots, startup_context};
+
+    #[test]
+    fn startup_process_manager_caps_require_both_slots() {
+        let original = startup_context();
+
+        install_startup_arg_slots([42, 11, 12]);
+        assert_eq!(startup_context().process_manager_caps(), Some((11, 12)));
+
+        install_startup_arg_slots([42, 0, 12]);
+        assert_eq!(startup_context().process_manager_caps(), None);
+
+        install_startup_arg_slots([42, 11, 0]);
+        assert_eq!(startup_context().process_manager_caps(), None);
+
+        install_startup_arg_slots([
+            original.task_id,
+            original
+                .process_manager_request_send_cap
+                .map(u64::from)
+                .unwrap_or(0),
+            original
+                .process_manager_reply_recv_cap
+                .map(u64::from)
+                .unwrap_or(0),
+        ]);
+    }
+}
