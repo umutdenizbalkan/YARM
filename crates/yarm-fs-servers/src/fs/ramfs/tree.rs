@@ -6,9 +6,21 @@ use super::super::common::fs::{
     FdRecord, InodeRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend, find_inode_index,
 };
 
+/// Compatibility-only legacy path identifier; prefer `RAMFS_BOOT_PATH`.
+pub const RAMFS_BOOT_PATH_PTR: u64 = 0xA000;
+pub const RAMFS_BOOT_PATH: &[u8] = b"/ramfs/boot";
+
 const RAMFS_STATX_TYPE_REGULAR: u64 = 0x1000_0000_0000_0000;
 const RAMFS_MODE_OWNER_READ: u64 = 0o400;
 const RAMFS_MODE_OWNER_WRITE: u64 = 0o200;
+const RAMFS_INLINE_PATH_MAX: usize = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PathRecord {
+    inode: u64,
+    len: u8,
+    bytes: [u8; RAMFS_INLINE_PATH_MAX],
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RamFsMetrics {
@@ -27,6 +39,7 @@ pub struct RamFsBackend {
     next_fd: u64,
     fds: [Option<FdRecord>; MAX_SERVICE_FDS],
     inodes: [Option<InodeRecord>; MAX_SERVICE_INODES],
+    paths: [Option<PathRecord>; MAX_SERVICE_INODES],
     metrics: RamFsMetrics,
 }
 
@@ -37,11 +50,12 @@ impl Default for RamFsBackend {
 }
 
 impl RamFsBackend {
-    pub const fn new() -> Self {
-        Self {
+    pub fn new() -> Self {
+        let mut backend = Self {
             next_fd: 100,
             fds: [None; MAX_SERVICE_FDS],
             inodes: [None; MAX_SERVICE_INODES],
+            paths: [None; MAX_SERVICE_INODES],
             metrics: RamFsMetrics {
                 open_count: 0,
                 close_count: 0,
@@ -52,7 +66,19 @@ impl RamFsBackend {
                 bytes_read: 0,
                 error_count: 0,
             },
-        }
+        };
+        backend.inodes[0] = Some(InodeRecord {
+            path_ptr: RAMFS_BOOT_PATH_PTR,
+            file_len: 0,
+        });
+        let mut bytes = [0u8; RAMFS_INLINE_PATH_MAX];
+        bytes[..RAMFS_BOOT_PATH.len()].copy_from_slice(RAMFS_BOOT_PATH);
+        backend.paths[0] = Some(PathRecord {
+            inode: RAMFS_BOOT_PATH_PTR,
+            len: RAMFS_BOOT_PATH.len() as u8,
+            bytes,
+        });
+        backend
     }
 
     pub const fn metrics(&self) -> RamFsMetrics {
@@ -70,7 +96,7 @@ impl RamFsBackend {
         }
     }
 
-    fn open_inode(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
+    fn open_inode_legacy_ptr(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
         if let Some(inode) = self
             .inodes
             .iter()
@@ -88,6 +114,27 @@ impl RamFsBackend {
             return self.alloc_fd(path_ptr);
         }
         Err(VfsError::NoFd)
+    }
+
+    fn legacy_path_from_ptr(path_ptr: u64) -> Option<&'static [u8]> {
+        match path_ptr {
+            RAMFS_BOOT_PATH_PTR => Some(RAMFS_BOOT_PATH),
+            _ => None,
+        }
+    }
+
+    fn lookup_by_path(&self, path: &[u8]) -> Result<u64, VfsError> {
+        self.paths
+            .iter()
+            .flatten()
+            .find(|entry| &entry.bytes[..entry.len as usize] == path)
+            .map(|entry| entry.inode)
+            .ok_or(VfsError::InvalidPath)
+    }
+
+    fn open_inode_by_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        let inode = self.lookup_by_path(path)?;
+        self.alloc_fd(inode)
     }
 
     fn close_fd(&mut self, fd: u64) -> Result<(), VfsError> {
@@ -114,6 +161,13 @@ impl RamFsBackend {
     fn statx_value(file_len: u64) -> u64 {
         RAMFS_STATX_TYPE_REGULAR | RAMFS_MODE_OWNER_READ | RAMFS_MODE_OWNER_WRITE | (file_len << 16)
     }
+
+    fn metadata_by_path(&self, path: &[u8]) -> Result<u64, VfsError> {
+        let inode = self.lookup_by_path(path)?;
+        let idx = find_inode_index(&self.inodes, inode).ok_or(VfsError::BadFd)?;
+        let file_len = self.inodes[idx].ok_or(VfsError::BadFd)?.file_len;
+        Ok(Self::statx_value(file_len))
+    }
 }
 
 impl ServiceFsBackend for RamFsBackend {
@@ -128,7 +182,25 @@ impl ServiceFsBackend for RamFsBackend {
 
 impl VfsBackend for RamFsBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        match self.open_inode(path_ptr) {
+        let result = if let Some(path) = Self::legacy_path_from_ptr(path_ptr) {
+            self.openat_path(path)
+        } else {
+            self.open_inode_legacy_ptr(path_ptr)
+        };
+        match result {
+            Ok(fd) => {
+                self.metrics.open_count = self.metrics.open_count.saturating_add(1);
+                Ok(fd)
+            }
+            Err(err) => {
+                self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+                Err(err)
+            }
+        }
+    }
+
+    fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        match self.open_inode_by_path(path) {
             Ok(fd) => {
                 self.metrics.open_count = self.metrics.open_count.saturating_add(1);
                 Ok(fd)
@@ -190,16 +262,34 @@ impl VfsBackend for RamFsBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let idx = match find_inode_index(&self.inodes, path_ptr) {
-            Some(idx) => idx,
-            None => {
-                self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-                return Err(VfsError::BadFd);
-            }
+        let result = if let Some(path) = Self::legacy_path_from_ptr(path_ptr) {
+            self.statx_path(path)
+        } else {
+            let idx = match find_inode_index(&self.inodes, path_ptr) {
+                Some(idx) => idx,
+                None => {
+                    self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+                    return Err(VfsError::BadFd);
+                }
+            };
+            let file_len = self.inodes[idx].ok_or(VfsError::BadFd)?.file_len;
+            self.metrics.statx_count = self.metrics.statx_count.saturating_add(1);
+            Ok(Self::statx_value(file_len))
         };
-        let file_len = self.inodes[idx].ok_or(VfsError::BadFd)?.file_len;
-        self.metrics.statx_count = self.metrics.statx_count.saturating_add(1);
-        Ok(Self::statx_value(file_len))
+        result
+    }
+
+    fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        match self.metadata_by_path(path) {
+            Ok(stat) => {
+                self.metrics.statx_count = self.metrics.statx_count.saturating_add(1);
+                Ok(stat)
+            }
+            Err(err) => {
+                self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+                Err(err)
+            }
+        }
     }
 }
 
@@ -246,5 +336,34 @@ mod tests {
         assert_eq!(metrics.bytes_written, 64);
         assert_eq!(metrics.bytes_read, 32);
         assert_eq!(metrics.error_count, 1);
+    }
+
+    #[test]
+    fn ramfs_byte_path_open_and_statx_work() {
+        let mut fs = RamFsBackend::new();
+        let fd = fs.openat_path(RAMFS_BOOT_PATH).expect("open path");
+        let _ = fs.write(fd, 64).expect("write");
+        assert_eq!(
+            fs.statx_path(RAMFS_BOOT_PATH).expect("stat path"),
+            RAMFS_STATX_TYPE_REGULAR | RAMFS_MODE_OWNER_READ | RAMFS_MODE_OWNER_WRITE | (64 << 16)
+        );
+    }
+
+    #[test]
+    fn ramfs_byte_path_rejects_unknown_path() {
+        let mut fs = RamFsBackend::new();
+        assert_eq!(fs.openat_path(b"/ramfs/missing"), Err(VfsError::InvalidPath));
+        assert_eq!(fs.statx_path(b"/ramfs/missing"), Err(VfsError::InvalidPath));
+    }
+
+    #[test]
+    fn ramfs_legacy_pointer_adapter_still_works() {
+        let mut fs = RamFsBackend::new();
+        let fd = fs.openat(RAMFS_BOOT_PATH_PTR).expect("open ptr");
+        let _ = fs.write(fd, 16).expect("write");
+        assert_eq!(
+            fs.statx(RAMFS_BOOT_PATH_PTR).expect("stat ptr"),
+            RAMFS_STATX_TYPE_REGULAR | RAMFS_MODE_OWNER_READ | RAMFS_MODE_OWNER_WRITE | (16 << 16)
+        );
     }
 }

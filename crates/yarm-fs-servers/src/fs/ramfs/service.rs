@@ -4,17 +4,14 @@
 use yarm_user_rt::ipc::Message;
 use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
-    OpenAtRequest, ReadWriteRequest, StatxRequest, openat_message, read_message, statx_message,
-    write_message,
+    ReadWriteRequest, openat_inline_message, read_message, statx_inline_message, write_message,
 };
 use super::super::common::service::FsService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
-use super::tree::{RamFsBackend, RamFsMetrics};
+use super::tree::{RAMFS_BOOT_PATH, RamFsBackend, RamFsMetrics};
 use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type RamFsService = FsService<RamFsBackend>;
-
-const RAMFS_BOOT_PATH_PTR: u64 = 0xA000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RamFsLoopSummary {
@@ -32,12 +29,7 @@ fn decode_reply_u64(reply: Message) -> u64 {
 }
 
 fn scripted_bootstrap_requests() -> Result<[Message; 1], VfsError> {
-    Ok([openat_message(OpenAtRequest {
-        dirfd: 0,
-        path_ptr: RAMFS_BOOT_PATH_PTR,
-        flags: 0,
-        mode: 0,
-    })?])
+    Ok([openat_inline_message(0, RAMFS_BOOT_PATH, 0, 0)?])
 }
 
 fn scripted_bootstrap_io(fd: u64) -> Result<[Message; 3], VfsError> {
@@ -52,12 +44,7 @@ fn scripted_bootstrap_io(fd: u64) -> Result<[Message; 3], VfsError> {
             buf_ptr: 0,
             len: 32,
         })?,
-        statx_message(StatxRequest {
-            dirfd: 0,
-            path_ptr: RAMFS_BOOT_PATH_PTR,
-            flags: 0,
-            mask_or_buf: 0,
-        })?,
+        statx_inline_message(0, RAMFS_BOOT_PATH, 0, 0)?,
     ])
 }
 
@@ -109,11 +96,12 @@ mod tests {
     use super::*;
     use yarm_user_rt::ipc::Message;
     use super::super::super::common::vfs_ipc::{
-        CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_message,
-        statx_message,
+        CloseRequest, MountNamespacePolicy, MountRouter, OpenAtRequest, StatxRequest, close_message,
+        openat_message, statx_message,
     };
     use super::super::super::common::vfs_service::VfsService;
     use super::super::super::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
+    use super::super::tree::RAMFS_BOOT_PATH_PTR;
     use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT};
 
     #[test]
