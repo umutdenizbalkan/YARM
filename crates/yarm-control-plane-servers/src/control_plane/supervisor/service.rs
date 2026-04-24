@@ -5,8 +5,12 @@
 use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 #[cfg(not(test))]
 use yarm_user_rt::runtime::KernelIpcError as KernelError;
-use yarm_user_rt::capability::{CapId, CapRights};
-use yarm_user_rt::ipc::{Message, ThreadId};
+use yarm_user_rt::capability::CapId;
+#[cfg(test)]
+use yarm_user_rt::capability::CapRights;
+use yarm_user_rt::ipc::Message;
+#[cfg(test)]
+use yarm_user_rt::ipc::ThreadId;
 #[cfg(test)]
 use yarm_user_rt::task::{TaskClass, TaskStatus};
 use yarm_user_rt::time::{TickDuration, TickInstant};
@@ -14,16 +18,20 @@ use crate::control_plane::init::{
     CoreServiceKind, CoreServicePolicyTable, InitFaultHandoff, RestartOwner, ServiceRestartPolicy,
 };
 use yarm_ipc_abi::supervisor_abi::{
-    CoreServiceRegistrationKind, DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert,
-    InitAlertKind, RedelegationAckRequest, RegisterCoreServiceRequest, RegisterDriverRequest,
-    SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
+    DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert, InitAlertKind, SupervisorStatusReply,
+    TaskExitedEvent,
+};
+#[cfg(test)]
+use yarm_ipc_abi::supervisor_abi::{
+    CoreServiceRegistrationKind, RedelegationAckRequest, RegisterCoreServiceRequest,
+    RegisterDriverRequest, SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, SUPERVISOR_OP_TASK_EXITED,
-    SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusReply, SupervisorStatusRequest,
-    TaskExitedEvent, TransferRevokedEvent,
+    SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusRequest, TransferRevokedEvent,
 };
 
 const MAX_MANAGED_SERVICES: usize = 8;
 const MAX_DEPENDENTS: usize = 8;
+#[cfg(test)]
 const SUPERVISOR_RECV_BUDGET_TICKS: u64 = 1;
 const SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS: u64 = 1;
 
@@ -68,6 +76,7 @@ fn init_alert_message(sender_tid: u64, alert: InitAlert) -> Result<Message, ()> 
     .map_err(|_| ())
 }
 
+#[cfg(test)]
 fn status_reply_message(sender_tid: u64, reply: SupervisorStatusReply) -> Result<Message, ()> {
     Message::with_header(
         sender_tid,
@@ -79,6 +88,7 @@ fn status_reply_message(sender_tid: u64, reply: SupervisorStatusReply) -> Result
     .map_err(|_| ())
 }
 
+#[cfg(test)]
 fn query_status_message(sender_tid: u64, request: SupervisorStatusRequest) -> Result<Message, ()> {
     Message::with_header(
         sender_tid,
@@ -170,6 +180,7 @@ pub trait SupervisorOutboundMessageOps {
     fn ipc_reply(&mut self, cap: CapId, msg: Message) -> Result<(), KernelError>;
 }
 
+#[cfg(test)]
 trait SupervisorRestartRedelegationOps: SupervisorOutboundMessageOps {
     fn restart_task(&mut self, tid: u64, restart_token: u64) -> Result<(), KernelError>;
     fn delegate_driver_bundle(
@@ -289,6 +300,7 @@ impl SupervisorService {
         self.send_init_message(outbound_ops, msg)
     }
 
+    #[cfg(test)]
     fn send_status_reply(
         &mut self,
         outbound_ops: &mut impl SupervisorOutboundMessageOps,
@@ -344,6 +356,7 @@ impl SupervisorService {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn register_driver(
         &mut self,
         tid: u64,
@@ -445,6 +458,7 @@ impl SupervisorService {
         Ok(record.pending_restart_due.expect("due set"))
     }
 
+    #[cfg(test)]
     fn handle_control_request(
         &mut self,
         outbound_ops: &mut impl SupervisorOutboundMessageOps,
@@ -519,6 +533,7 @@ impl SupervisorService {
         Ok(())
     }
 
+    #[cfg(test)]
     fn execute_due_restarts(
         &mut self,
         restart_ops: &mut impl SupervisorRestartRedelegationOps,
@@ -568,6 +583,7 @@ impl SupervisorService {
         Ok(restarted)
     }
 
+    #[cfg(test)]
     fn next_due_tick(&self) -> Option<TickInstant> {
         self.managed
             .iter()
@@ -576,6 +592,7 @@ impl SupervisorService {
             .min_by_key(|tick| tick.0)
     }
 
+    #[cfg(test)]
     fn has_due_restart_ready(&self) -> bool {
         self.managed
             .iter()

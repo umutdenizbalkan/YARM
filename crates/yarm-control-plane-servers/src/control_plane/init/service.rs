@@ -1,22 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::super::process_manager::service::ProcessService;
-use super::super::process_manager::service::run_request_loop as run_process_manager_request_loop;
-use super::super::supervisor::SupervisorService;
-use super::super::vfs::service::run_request_loop as run_vfs_request_loop;
-use yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
-use yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
-use yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
-use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
-use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
 use crate::control_plane::init::{
-    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase, InitService,
+    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase,
 };
 #[cfg(test)]
+use super::super::process_manager::service::ProcessService;
+#[cfg(test)]
+use super::super::process_manager::service::run_request_loop as run_process_manager_request_loop;
+#[cfg(test)]
+use super::super::supervisor::SupervisorService;
+#[cfg(test)]
+use super::super::vfs::service::run_request_loop as run_vfs_request_loop;
+#[cfg(test)]
+use crate::control_plane::init::InitService;
+#[cfg(test)]
 use yarm::kernel::boot::{KernelError, KernelState};
+#[cfg(test)]
 use yarm_fs_servers::common::service::FsService;
+#[cfg(test)]
 use yarm_fs_servers::common::vfs_ipc::InMemoryBackend;
+#[cfg(test)]
+use yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
+#[cfg(test)]
+use yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
+#[cfg(test)]
+use yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
+#[cfg(test)]
+use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
+#[cfg(test)]
+use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
+#[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

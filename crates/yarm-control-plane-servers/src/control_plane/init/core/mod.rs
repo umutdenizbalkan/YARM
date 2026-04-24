@@ -20,12 +20,17 @@ use yarm_fs_servers::ramfs::{RamFsBackend, RamFsService};
 use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
 #[cfg(not(test))]
 use yarm_user_rt::runtime::KernelIpcError as KernelError;
-use yarm_user_rt::capability::{CapId, CapRights};
+use yarm_user_rt::capability::CapId;
+#[cfg(test)]
+use yarm_user_rt::capability::CapRights;
+#[cfg(test)]
 use yarm_user_rt::task::{TaskClass, TaskStatus};
+#[cfg(test)]
 use yarm_user_rt::vm::Asid;
 #[cfg(test)]
 use yarm_user_rt::vm::PAGE_SIZE;
 use alloc::boxed::Box;
+#[cfg(test)]
 use yarm_ipc_abi::supervisor_abi::{
     InitAlert, InitAlertKind, RegisterCoreServiceRequest, RegisterDriverRequest,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, TaskExitedEvent,
@@ -39,6 +44,7 @@ pub use policy::{
     RestartOwner, ServiceRestartPolicy, StartupCap, StartupCapSet,
 };
 
+#[cfg(test)]
 fn map_task_status(status: TaskStatus) -> TaskStatus {
     match status {
         TaskStatus::Runnable => TaskStatus::Runnable,
@@ -50,6 +56,7 @@ fn map_task_status(status: TaskStatus) -> TaskStatus {
     }
 }
 
+#[cfg(test)]
 fn to_kernel_task_class(class: TaskClass) -> TaskClass {
     match class {
         TaskClass::App => TaskClass::App,
@@ -58,10 +65,12 @@ fn to_kernel_task_class(class: TaskClass) -> TaskClass {
     }
 }
 
+#[cfg(test)]
 fn map_kernel_asid(asid: Asid) -> Asid {
     Asid(asid.0)
 }
 
+#[cfg(test)]
 fn to_kernel_asid(asid: Asid) -> Asid {
     Asid(asid.0)
 }
@@ -81,9 +90,11 @@ pub struct InitService {
     process_manager_restart_count: u8,
     vfs_restart_count: u8,
     supervisor_restart_count: u8,
+    #[cfg(test)]
     supervisor_replay_log: [Option<SupervisorReplayEntry>; 16],
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupervisorReplayEntry {
     Core(RegisterCoreServiceRequest),
@@ -97,6 +108,7 @@ impl Default for InitService {
 }
 
 impl InitService {
+    #[cfg(test)]
     fn register_core_service_message(
         sender_tid: u64,
         request: RegisterCoreServiceRequest,
@@ -111,6 +123,7 @@ impl InitService {
         .map_err(|_| ())
     }
 
+    #[cfg(test)]
     fn register_driver_message(
         sender_tid: u64,
         request: RegisterDriverRequest,
@@ -145,6 +158,7 @@ impl InitService {
             process_manager_restart_count: 0,
             vfs_restart_count: 0,
             supervisor_restart_count: 0,
+            #[cfg(test)]
             supervisor_replay_log: [None; 16],
         }
     }
@@ -508,6 +522,7 @@ impl InitService {
         Ok(())
     }
 
+    #[cfg(test)]
     fn remember_supervisor_replay_entry(
         &mut self,
         entry: SupervisorReplayEntry,
@@ -681,6 +696,7 @@ impl InitService {
         self.phase = InitBootPhase::Failed;
     }
 
+    #[cfg(test)]
     fn core_service_kind_for_tid(&self, tid: u64) -> Option<CoreServiceKind> {
         if self.handles.process_manager_tid == Some(tid) {
             Some(CoreServiceKind::ProcessManager)
@@ -693,6 +709,7 @@ impl InitService {
         }
     }
 
+    #[cfg(test)]
     fn core_service_tid(&self, kind: CoreServiceKind) -> Option<u64> {
         match kind {
             CoreServiceKind::ProcessManager => self.handles.process_manager_tid,
@@ -701,6 +718,7 @@ impl InitService {
         }
     }
 
+    #[cfg(test)]
     fn restart_count_for(&self, kind: CoreServiceKind) -> u8 {
         match kind {
             CoreServiceKind::ProcessManager => self.process_manager_restart_count,
@@ -709,6 +727,7 @@ impl InitService {
         }
     }
 
+    #[cfg(test)]
     fn increment_restart_count(&mut self, kind: CoreServiceKind) {
         match kind {
             CoreServiceKind::ProcessManager => {
@@ -873,6 +892,7 @@ impl InitService {
         Ok(())
     }
 
+    #[cfg(test)]
     fn validate_begin_running_preconditions(&self) -> Result<(), KernelError> {
         if self.phase != InitBootPhase::LaunchingCore
             || self.fault_handoff.is_none()
