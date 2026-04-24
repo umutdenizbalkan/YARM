@@ -21,6 +21,10 @@ pub extern "C" fn _start(
     startup_proc_mgr_request_send_cap: u64,
     startup_proc_mgr_reply_recv_cap: u64,
 ) -> ! {
+    // Startup ABI slot contract:
+    //   0 => task_id / tid
+    //   1 => process-manager request send cap
+    //   2 => process-manager reply recv cap
     yarm_server_runtime::install_startup_arg_slots([
         startup_task_id,
         startup_proc_mgr_request_send_cap,
