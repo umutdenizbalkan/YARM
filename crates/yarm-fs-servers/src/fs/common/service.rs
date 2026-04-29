@@ -54,7 +54,7 @@ impl<B: VfsBackend> RequestResponseService<Message, Message> for FsService<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::vfs_ipc::{InMemoryBackend, OpenAtRequest, openat_message};
+    use super::super::vfs_ipc::{InMemoryBackend, openat_inline_message};
     use yarm_srv_common::service_loop::run_typed_request_loop;
 
     #[test]
@@ -63,19 +63,9 @@ mod tests {
         let replies = run_typed_request_loop(
             &mut svc,
             [
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: 0x1000,
-                    flags: 0,
-                    mode: 0,
-                })
+                openat_inline_message(0, b"/dev/console", 0, 0)
                 .expect("open"),
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: 0x2000,
-                    flags: 0,
-                    mode: 0,
-                })
+                openat_inline_message(0, b"/dev/null", 0, 0)
                 .expect("open"),
             ],
         )
