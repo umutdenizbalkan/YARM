@@ -23,6 +23,10 @@ use yarm_ipc_abi::supervisor_abi::{
     DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert, InitAlertKind, SupervisorStatusReply,
     TaskExitedEvent,
 };
+#[cfg(not(test))]
+use yarm_ipc_abi::process_abi::{
+    PROC_OP_TASK_RESTART_TOKEN, TaskRestartTokenReply, TaskRestartTokenRequest,
+};
 #[cfg(test)]
 use yarm_ipc_abi::supervisor_abi::{
     CoreServiceRegistrationKind, RedelegationAckRequest, RegisterCoreServiceRequest,
@@ -1115,6 +1119,7 @@ pub fn run() {
 #[cfg(not(test))]
 pub fn run() {
     let startup = startup_context();
+    let process_manager_caps = startup.process_manager_caps();
     let runtime_handoff = SupervisorRuntimeHandoff::from_startup_context(startup);
     let mut transport = SyscallIpcTransport;
 
@@ -1154,12 +1159,28 @@ pub fn run() {
                         if msg.opcode == SUPERVISOR_OP_FAULT_REPORT_WIRE {
                             match SupervisorFaultReportWire::decode(msg.as_slice()) {
                                 Some(fault) => {
-                                    yarm_user_rt::user_log!(
-                                        "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={}; restart-token IPC not yet implemented in userspace runtime",
+                                    match query_restart_token_via_process_manager(
+                                        &mut transport,
+                                        process_manager_caps,
                                         fault.tid,
-                                        fault.fault_addr,
-                                        fault.access
-                                    );
+                                    ) {
+                                        Ok(Some(restart_token)) => yarm_user_rt::user_log!(
+                                            "supervisor.srv fault restart token resolved: tid={}, token={}",
+                                            fault.tid,
+                                            restart_token
+                                        ),
+                                        Ok(None) => yarm_user_rt::user_log!(
+                                            "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={}; restart-token lookup unsupported/unavailable in runtime path",
+                                            fault.tid,
+                                            fault.fault_addr,
+                                            fault.access
+                                        ),
+                                        Err(err) => yarm_user_rt::user_log!(
+                                            "supervisor.srv restart-token lookup failed: tid={}, err={:?}",
+                                            fault.tid,
+                                            err
+                                        ),
+                                    }
                                 }
                                 None => {
                                     yarm_user_rt::user_log!(
@@ -1193,6 +1214,30 @@ pub fn run() {
             );
         }
     }
+}
+
+#[cfg(not(test))]
+fn query_restart_token_via_process_manager(
+    transport: &mut impl IpcTransport,
+    process_manager_caps: Option<(u32, u32)>,
+    tid: u64,
+) -> Result<Option<u64>, KernelError> {
+    let Some((req_cap, rep_cap)) = process_manager_caps else { return Ok(None) };
+    let req = TaskRestartTokenRequest::new(tid);
+    let msg = Message::with_header(0, PROC_OP_TASK_RESTART_TOKEN, 0, None, &req.encode())
+        .map_err(|_| KernelError::WrongObject)?;
+    transport
+        .send(req_cap, &msg)
+        .map_err(|_| KernelError::WrongObject)?;
+    let Some(reply_msg) = transport
+        .recv(rep_cap)
+        .map_err(|_| KernelError::WrongObject)?
+    else {
+        return Ok(None);
+    };
+    let reply = TaskRestartTokenReply::decode(reply_msg.as_slice())
+        .map_err(|_| KernelError::WrongObject)?;
+    Ok(reply.found_token())
 }
 
 #[cfg(test)]

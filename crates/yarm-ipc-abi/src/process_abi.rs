@@ -18,6 +18,66 @@ pub const PROC_OP_SPAWN_V2: u16 = 4;
 pub const PROC_OP_WAITPID_V2: u16 = 5;
 pub const PROC_OP_SPAWN_V3: u16 = 6;
 pub const PROC_OP_SPAWN_V4: u16 = 7;
+pub const PROC_OP_TASK_RESTART_TOKEN: u16 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskRestartTokenRequest {
+    pub tid: u64,
+}
+
+impl TaskRestartTokenRequest {
+    pub const fn new(tid: u64) -> Self {
+        Self { tid }
+    }
+    pub const fn encode(self) -> [u8; 8] {
+        self.tid.to_le_bytes()
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() < 8 {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut tid = [0u8; 8];
+        tid.copy_from_slice(&payload[..8]);
+        Ok(Self::new(u64::from_le_bytes(tid)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskRestartTokenReply {
+    pub found: u8,
+    pub token: u64,
+}
+
+impl TaskRestartTokenReply {
+    pub const fn new(found: bool, token: u64) -> Self {
+        Self { found: found as u8, token }
+    }
+    pub const fn encode(self) -> [u8; 9] {
+        let mut out = [0u8; 9];
+        out[0] = self.found;
+        let bytes = self.token.to_le_bytes();
+        out[1] = bytes[0];
+        out[2] = bytes[1];
+        out[3] = bytes[2];
+        out[4] = bytes[3];
+        out[5] = bytes[4];
+        out[6] = bytes[5];
+        out[7] = bytes[6];
+        out[8] = bytes[7];
+        out
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() < 9 {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut token = [0u8; 8];
+        token.copy_from_slice(&payload[1..9]);
+        Ok(Self { found: payload[0], token: u64::from_le_bytes(token) })
+    }
+    pub const fn found_token(self) -> Option<u64> {
+        if self.found == 1 { Some(self.token) } else { None }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnV2Args {
