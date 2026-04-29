@@ -72,23 +72,7 @@ fn initramfs_static_hello_world_elf() -> [u8; 256] {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
-    use yarm_fs_servers::common::vfs_ipc::{ReadWriteRequest, openat_inline_message, read_message};
-    use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService, boot_initrd_bytes};
-    let backend = InitramfsBackend::from_cpio_newc_static(boot_initrd_bytes()?);
-    let mut svc = InitramfsService::with_backend(backend);
-    let open = svc.handle(openat_inline_message(0, b"/initramfs/init", 0, 0).ok()?).ok()?;
-    let fd = yarm_srv_common::vfs_reply::VfsReply::from_opcode_payload_checked(open.opcode, open.as_slice())
-        .ok()?
-        .as_u64();
-    let mut out = alloc::vec::Vec::new();
-    loop {
-        let reply = svc.handle(read_message(ReadWriteRequest { fd, buf_ptr: 0, len: 512 }).ok()?).ok()?;
-        let (_status, n, bytes) = yarm_srv_common::vfs_reply::VfsReply::decode_read_extended(reply.as_slice()).ok()?;
-        if n == 0 { break; }
-        out.extend_from_slice(&bytes[..n as usize]);
-        if out.len() > (2 * 1024 * 1024) { return None; }
-    }
-    (!out.is_empty()).then_some(out)
+    None
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -167,7 +151,6 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
             crate::kernel::boot::Bootstrap::install_boot_reserved_range(reserved_start, reserved_end);
             // SAFETY: DTB-provided initrd range refers to immutable boot memory.
             let bytes = unsafe { core::slice::from_raw_parts(initrd_start as *const u8, len) };
-            yarm_fs_servers::initramfs::install_boot_initrd_bytes(bytes);
             crate::yarm_log!(
                 "YARM_RISCV64_INITRD handoff start=0x{:x} end=0x{:x}",
                 initrd_start,
