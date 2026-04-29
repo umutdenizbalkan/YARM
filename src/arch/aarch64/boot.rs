@@ -656,7 +656,13 @@ fn initramfs_static_hello_world_elf() -> [u8; 256] {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
-    None
+    let bytes = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?;
+    let entry = yarm_srv_common::cpio::CpioArchive::new(bytes)
+        .find("/init")
+        .ok()
+        .flatten()
+        .or_else(|| yarm_srv_common::cpio::CpioArchive::new(bytes).find("init").ok().flatten())?;
+    Some(alloc::vec::Vec::from(entry.file_data()))
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -1116,6 +1122,7 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                             let bytes = unsafe {
                                 core::slice::from_raw_parts(initrd_start as *const u8, initrd_len)
                             };
+                            crate::kernel::boot::Bootstrap::install_boot_initrd_bytes(bytes);
                         }
                         reserved[reserved_len] = (
                             initrd_start & !(page - 1),

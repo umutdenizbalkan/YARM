@@ -13,6 +13,8 @@ static mut BOOTSTRAP_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
     core::mem::MaybeUninit::uninit();
 static BOOT_RESERVED_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BOOT_RESERVED_END: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BOOT_INITRD_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static BOOT_INITRD_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl Bootstrap {
     #[inline(never)]
@@ -69,6 +71,20 @@ impl Bootstrap {
     pub fn install_boot_reserved_range(start: u64, end: u64) {
         BOOT_RESERVED_START.store(start, core::sync::atomic::Ordering::Release);
         BOOT_RESERVED_END.store(end, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn install_boot_initrd_bytes(bytes: &'static [u8]) {
+        BOOT_INITRD_LEN.store(bytes.len(), core::sync::atomic::Ordering::Release);
+        BOOT_INITRD_PTR.store(bytes.as_ptr() as usize, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn boot_initrd_bytes() -> Option<&'static [u8]> {
+        let ptr = BOOT_INITRD_PTR.load(core::sync::atomic::Ordering::Acquire);
+        let len = BOOT_INITRD_LEN.load(core::sync::atomic::Ordering::Acquire);
+        if ptr == 0 || len == 0 {
+            return None;
+        }
+        Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
     }
 
     fn push_region(
