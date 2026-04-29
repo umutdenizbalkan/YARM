@@ -34,6 +34,25 @@ use yarm_ipc_abi::supervisor_abi::{
 #[cfg(test)]
 const SUPERVISOR_FAULT_REPORT_WIRE_LEN: usize = 17;
 #[cfg(test)]
+const SUPERVISOR_FAULT_REPORT_TID_START: usize = 0;
+#[cfg(test)]
+const SUPERVISOR_FAULT_REPORT_TID_END: usize = 8;
+#[cfg(test)]
+const SUPERVISOR_FAULT_REPORT_ADDR_START: usize = 8;
+#[cfg(test)]
+const SUPERVISOR_FAULT_REPORT_ADDR_END: usize = 16;
+#[cfg(test)]
+const SUPERVISOR_FAULT_REPORT_ACCESS_INDEX: usize = 16;
+#[cfg(test)]
+const SUPERVISOR_FAULT_EXIT_CODE_TAG: u64 = 0xF000_0000_0000_0000u64;
+#[cfg(test)]
+const SUPERVISOR_FAULT_EXIT_CODE_ACCESS_SHIFT: u64 = 56;
+#[cfg(test)]
+const SUPERVISOR_FAULT_EXIT_CODE_ADDR_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+/// Kernel-originated supervisor fault-report notification opcode.
+///
+/// The kernel fault path uses `Message::new(0, payload)` for the 17-byte fault report wire payload.
+#[cfg(test)]
 const SUPERVISOR_OP_FAULT_REPORT_WIRE: u16 = 0;
 
 #[cfg(test)]
@@ -52,9 +71,11 @@ impl SupervisorFaultReportWire {
         }
         let mut tid = [0u8; 8];
         let mut fault_addr = [0u8; 8];
-        tid.copy_from_slice(&bytes[..8]);
-        fault_addr.copy_from_slice(&bytes[8..16]);
-        let access = bytes[16];
+        tid.copy_from_slice(&bytes[SUPERVISOR_FAULT_REPORT_TID_START..SUPERVISOR_FAULT_REPORT_TID_END]);
+        fault_addr.copy_from_slice(
+            &bytes[SUPERVISOR_FAULT_REPORT_ADDR_START..SUPERVISOR_FAULT_REPORT_ADDR_END],
+        );
+        let access = bytes[SUPERVISOR_FAULT_REPORT_ACCESS_INDEX];
         if access > 2 {
             return None;
         }
@@ -68,7 +89,9 @@ impl SupervisorFaultReportWire {
     fn synthetic_exit_code(self) -> u64 {
         // Preserve existing supervisor restart flow by translating fault reports into
         // a stable synthetic exit code domain.
-        0xF000_0000_0000_0000u64 | ((self.access as u64) << 56) | (self.fault_addr & 0x00FF_FFFF_FFFF_FFFF)
+        SUPERVISOR_FAULT_EXIT_CODE_TAG
+            | ((self.access as u64) << SUPERVISOR_FAULT_EXIT_CODE_ACCESS_SHIFT)
+            | (self.fault_addr & SUPERVISOR_FAULT_EXIT_CODE_ADDR_MASK)
     }
 }
 
@@ -1377,6 +1400,79 @@ mod tests {
             assert!(supervisor.status_for(2).is_some());
             assert!(supervisor.status_for(3).is_some());
             assert!(supervisor.status_for(4).is_some());
+        });
+    }
+
+    #[test]
+    fn fault_wire_opcode_zero_is_decoded_and_routed_to_restart_path() {
+        run_with_large_stack(|| {
+            let mut kernel = yarm::std::boxed::Box::new(Bootstrap::init().expect("init"));
+            let (_fault_eid, fault_send_cap, fault_recv_cap) =
+                kernel.create_endpoint(8).expect("fault endpoint");
+            let (_control_eid, control_send_cap, control_recv_cap) =
+                kernel.create_endpoint(8).expect("control endpoint");
+            let (_alert_eid, init_alert_send_cap, init_alert_recv_cap) =
+                kernel.create_endpoint(8).expect("init alert endpoint");
+            let handoff = InitFaultHandoff::new(
+                1,
+                fault_recv_cap,
+                control_send_cap,
+                control_recv_cap,
+                init_alert_send_cap,
+                init_alert_recv_cap,
+                20,
+            );
+            let mut supervisor = yarm::std::boxed::Box::new(SupervisorService::new(
+                1,
+                handoff,
+                CoreServicePolicyTable::baseline(),
+            ));
+
+            let register_proc = Message::with_header(
+                1,
+                SUPERVISOR_OP_REGISTER_CORE_SERVICE,
+                0,
+                None,
+                &RegisterCoreServiceRequest {
+                    tid: 2,
+                    kind: CoreServiceRegistrationKind::ProcessManager,
+                    max_restarts: 3,
+                    restart_group: 1,
+                    dependency_mask: 0,
+                    backoff_ticks: 10,
+                }
+                .encode(),
+            )
+            .expect("registration");
+            kernel
+                .ipc_send(control_send_cap, register_proc)
+                .expect("send registration");
+            supervisor.run_until_idle(&mut kernel).expect("seed loop");
+
+            let token = kernel.exit_task(2, 7).expect("exit for restart token");
+            let _ = kernel
+                .try_ipc_recv(fault_recv_cap)
+                .expect("drain exit event")
+                .expect("exit event");
+
+            let mut payload = [0u8; SUPERVISOR_FAULT_REPORT_WIRE_LEN];
+            payload[SUPERVISOR_FAULT_REPORT_TID_START..SUPERVISOR_FAULT_REPORT_TID_END]
+                .copy_from_slice(&2u64.to_le_bytes());
+            payload[SUPERVISOR_FAULT_REPORT_ADDR_START..SUPERVISOR_FAULT_REPORT_ADDR_END]
+                .copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+            payload[SUPERVISOR_FAULT_REPORT_ACCESS_INDEX] = 1;
+            kernel
+                .ipc_send(
+                    fault_send_cap,
+                    Message::with_header(0, SUPERVISOR_OP_FAULT_REPORT_WIRE, 0, None, &payload)
+                        .expect("fault wire msg"),
+                )
+                .expect("send fault wire");
+
+            supervisor.run_until_idle(&mut kernel).expect("process fault wire");
+            let status = supervisor.status_for(2).expect("status");
+            assert_eq!(status.restart_attempts, 1);
+            assert_eq!(kernel.task_restart_token(2), Some(token));
         });
     }
 
