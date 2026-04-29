@@ -300,6 +300,7 @@ pub mod runtime {
     /// - `STARTUP_SLOT_OPTIONAL_INIT_TID`
     /// - `STARTUP_SLOT_OPTIONAL_SUPERVISOR_TID`
     /// - `STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS`
+    /// - `STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP`
     ///
     /// Missing/unset slots should be provided as `0`.
     #[inline]
