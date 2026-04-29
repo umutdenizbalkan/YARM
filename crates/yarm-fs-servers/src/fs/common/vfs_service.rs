@@ -365,7 +365,20 @@ impl<B: VfsBackend> VfsService<B> {
                 }
             }
             VfsRequest::Close { fd } => VfsReply::CloseResult(self.backend.close(fd)?),
-            VfsRequest::Read { fd, len, .. } => VfsReply::ReadLen(self.backend.read(fd, len)?),
+            VfsRequest::Read { fd, len, .. } => {
+                let mut inline = [0u8; Message::MAX_PAYLOAD - 16];
+                let (read_len, inline_len) = self.backend.read_into(fd, len, &mut inline)?;
+                if inline_len == 0 {
+                    VfsReply::ReadLen(read_len)
+                } else {
+                    let mut payload = [0u8; Message::MAX_PAYLOAD];
+                    payload[..8].copy_from_slice(&read_len.to_le_bytes());
+                    payload[8..16].copy_from_slice(&0u64.to_le_bytes());
+                    payload[16..16 + inline_len].copy_from_slice(&inline[..inline_len]);
+                    return Message::with_header(0, VFS_OP_READ, 0, None, &payload[..16 + inline_len])
+                        .map_err(|_| VfsError::Malformed);
+                }
+            }
             VfsRequest::Write { fd, len, .. } => VfsReply::WriteLen(self.backend.write(fd, len)?),
             VfsRequest::Statx { path_inline, .. } => {
                 if let Some(path) = path_inline {

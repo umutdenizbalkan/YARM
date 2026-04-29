@@ -101,6 +101,9 @@ pub trait VfsBackend {
     }
     fn close(&mut self, fd: u64) -> Result<u64, VfsError>;
     fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
+    fn read_into(&mut self, fd: u64, len: u64, _out: &mut [u8]) -> Result<(u64, usize), VfsError> {
+        Ok((self.read(fd, len)?, 0))
+    }
     fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
     fn statx_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
         Err(VfsError::InvalidPath)

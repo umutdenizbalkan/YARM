@@ -41,6 +41,7 @@ struct InitramfsInode {
 struct OpenHandle {
     fd: u64,
     inode_idx: usize,
+    cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,6 +61,7 @@ pub struct InitramfsBackend {
     handles: [Option<OpenHandle>; MAX_INITRAMFS_HANDLES],
     inodes: [Option<InitramfsInode>; MAX_INITRAMFS_INODES],
     metrics: InitramfsMetrics,
+    cpio: Option<&'static [u8]>,
 }
 
 impl Default for InitramfsBackend {
@@ -113,6 +115,7 @@ impl InitramfsBackend {
                 bytes_read: 0,
                 error_count: 0,
             },
+            cpio: None,
         }
     }
 
@@ -145,6 +148,12 @@ impl InitramfsBackend {
         backend
     }
 
+    pub fn from_cpio_newc_static(cpio: &'static [u8]) -> Self {
+        let mut backend = Self::from_cpio_newc(cpio);
+        backend.cpio = Some(cpio);
+        backend
+    }
+
     fn lookup_slot(&self, path: &[u8]) -> Option<usize> {
         self.inodes
             .iter()
@@ -169,7 +178,11 @@ impl InitramfsBackend {
         let fd = self.next_fd;
         self.next_fd = self.next_fd.saturating_add(1);
         if let Some(slot) = self.handles.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(OpenHandle { fd, inode_idx });
+            *slot = Some(OpenHandle {
+                fd,
+                inode_idx,
+                cursor: 0,
+            });
             return Ok(fd);
         }
         Err(VfsError::NoFd)
@@ -238,6 +251,35 @@ impl VfsBackend for InitramfsBackend {
                 Err(err)
             }
         }
+    }
+
+    fn read_into(&mut self, fd: u64, len: u64, out: &mut [u8]) -> Result<(u64, usize), VfsError> {
+        let inode = self.inode_for_fd(fd)?;
+        let cpio = match self.cpio {
+            Some(c) => c,
+            None => return Ok((self.read(fd, len)?, 0)),
+        };
+        let name = inode.path.strip_prefix(b"/initramfs/").unwrap_or(inode.path);
+        let Some(entry) = yarm_srv_common::cpio::CpioArchive::new(cpio).find(core::str::from_utf8(name).unwrap_or("")).ok().flatten() else {
+            return Ok((0, 0));
+        };
+        let handle = self
+            .handles
+            .iter_mut()
+            .flatten()
+            .find(|h| h.fd == fd)
+            .ok_or(VfsError::BadFd)?;
+        let data = entry.file_data();
+        if handle.cursor >= data.len() {
+            return Ok((0, 0));
+        }
+        let want = core::cmp::min(len as usize, out.len());
+        let n = core::cmp::min(want, data.len() - handle.cursor);
+        out[..n].copy_from_slice(&data[handle.cursor..handle.cursor + n]);
+        handle.cursor += n;
+        self.metrics.read_count = self.metrics.read_count.saturating_add(1);
+        self.metrics.bytes_read = self.metrics.bytes_read.saturating_add(n as u64);
+        Ok((n as u64, n))
     }
 
     fn write(&mut self, fd: u64, _len: u64) -> Result<u64, VfsError> {

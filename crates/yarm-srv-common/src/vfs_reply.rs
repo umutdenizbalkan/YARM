@@ -81,6 +81,15 @@ impl VfsReply {
             _ => Err(VfsReplyDecodeError::UnexpectedReplyKind { opcode }),
         }
     }
+
+    pub fn decode_read_extended(payload: &[u8]) -> Result<(u64, u64, &[u8]), VfsReplyDecodeError> {
+        let bytes_read = decode_u64_le(payload).map_err(VfsReplyDecodeError::Payload)?;
+        if payload.len() < 16 {
+            return Ok((0, bytes_read, &[]));
+        }
+        let status = decode_u64_le(&payload[8..]).map_err(VfsReplyDecodeError::Payload)?;
+        Ok((status, bytes_read, &payload[16..]))
+    }
 }
 
 #[cfg(test)]

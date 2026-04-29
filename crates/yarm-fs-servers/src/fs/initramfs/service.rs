@@ -99,6 +99,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
+    use alloc::format;
+    use alloc::vec::Vec;
     use super::super::archive::{INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_BOOT_MARKER_PATH_PTR};
     use super::super::super::common::vfs_ipc::{
         CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_inline_message,
@@ -107,6 +110,22 @@ mod tests {
     use super::super::super::common::vfs_service::VfsService;
     use super::super::super::devfs::{DEV_CONSOLE_PATH_PTR, DevFsBackend};
     use yarm_ipc_abi::vfs_abi::{OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_READ};
+    use yarm_srv_common::vfs_reply::VfsReply as DecodedReply;
+
+    fn push_entry(out: &mut Vec<u8>, name: &str, mode: u32, data: &[u8]) {
+        let namesz = name.len() + 1;
+        let mut h = [0u8; 110];
+        h[0..6].copy_from_slice(b"070701");
+        h[14..22].copy_from_slice(format!("{mode:08x}").as_bytes());
+        h[54..62].copy_from_slice(format!("{:08x}", data.len()).as_bytes());
+        h[94..102].copy_from_slice(format!("{namesz:08x}").as_bytes());
+        out.extend_from_slice(&h);
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        while out.len() % 4 != 0 { out.push(0); }
+        out.extend_from_slice(data);
+        while out.len() % 4 != 0 { out.push(0); }
+    }
 
     #[test]
     fn initramfs_is_read_only_with_metrics() {
@@ -276,5 +295,22 @@ mod tests {
             ),
             Err(VfsError::BadFd)
         );
+    }
+
+    #[test]
+    fn initramfs_read_returns_init_bytes_when_cpio_backed() {
+        let mut cpio = Vec::new();
+        push_entry(&mut cpio, "init", 0o100755, b"\x7fELFinit-binary");
+        push_entry(&mut cpio, "TRAILER!!!", 0, &[]);
+        let leaked: &'static [u8] = Box::leak(cpio.into_boxed_slice());
+        let mut svc = InitramfsService::with_backend(InitramfsBackend::from_cpio_newc_static(leaked));
+        let fd = decode_reply_u64(
+            svc.handle(openat_inline_message(0, b"/initramfs/init", 0, 0).expect("open")).expect("open r")
+        );
+        let reply = svc.handle(read_message(ReadWriteRequest { fd, buf_ptr: 0, len: 64 }).expect("read")).expect("read r");
+        let (status, n, bytes) = DecodedReply::decode_read_extended(reply.as_slice()).expect("decode");
+        assert_eq!(status, 0);
+        assert_eq!(n, 15);
+        assert_eq!(&bytes[..n as usize], b"\x7fELFinit-binary");
     }
 }
