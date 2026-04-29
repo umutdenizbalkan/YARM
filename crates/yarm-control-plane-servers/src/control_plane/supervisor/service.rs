@@ -21,17 +21,18 @@ use crate::control_plane::init::{
 };
 use yarm_ipc_abi::supervisor_abi::{
     DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert, InitAlertKind, SupervisorStatusReply,
-    TaskExitedEvent,
+    TaskExitedEvent, SUPERVISOR_OP_TASK_EXITED,
 };
 #[cfg(not(test))]
 use yarm_ipc_abi::process_abi::{
-    PROC_OP_TASK_RESTART_TOKEN, TaskRestartTokenReply, TaskRestartTokenRequest,
+    PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_TASK_RESTART_TOKEN, RegisterSupervisedTask,
+    TaskRestartTokenReply, TaskRestartTokenRequest,
 };
 #[cfg(test)]
 use yarm_ipc_abi::supervisor_abi::{
     CoreServiceRegistrationKind, RedelegationAckRequest, RegisterCoreServiceRequest,
     RegisterDriverRequest, SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
-    SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER, SUPERVISOR_OP_TASK_EXITED,
+    SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER,
     SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusRequest, TransferRevokedEvent,
 };
 
@@ -1159,8 +1160,8 @@ pub fn run() {
                 match transport.recv(supervisor.handoff.supervisor_fault_recv_cap.0 as u32) {
                     Ok(Some(msg)) => {
                         made_progress = true;
-                        if msg.opcode == SUPERVISOR_OP_FAULT_REPORT_WIRE {
-                            match SupervisorFaultReportWire::decode(msg.as_slice()) {
+                        match msg.opcode {
+                            SUPERVISOR_OP_FAULT_REPORT_WIRE => match SupervisorFaultReportWire::decode(msg.as_slice()) {
                                 Some(fault) => {
                                     match query_restart_token_via_process_manager(
                                         &mut transport,
@@ -1191,7 +1192,25 @@ pub fn run() {
                                         msg.as_slice().len()
                                     );
                                 }
+                            },
+                            SUPERVISOR_OP_TASK_EXITED => {
+                                if let Some(event) = TaskExitedEvent::decode(msg.as_slice()) {
+                                    match register_supervised_task_with_process_manager(
+                                        &mut transport,
+                                        process_manager_caps,
+                                        event.tid,
+                                        event.restart_token,
+                                    ) {
+                                        Ok(()) => {}
+                                        Err(err) => yarm_user_rt::user_log!(
+                                            "supervisor.srv failed to register supervised task restart-token: tid={}, err={:?}",
+                                            event.tid,
+                                            err
+                                        ),
+                                    }
+                                }
                             }
+                            _ => {}
                         }
                     }
                     Ok(None) => {}
@@ -1241,6 +1260,28 @@ fn query_restart_token_via_process_manager(
     let reply = TaskRestartTokenReply::decode(reply_msg.as_slice())
         .map_err(|_| KernelError::WrongObject)?;
     Ok(reply.found_token())
+}
+
+#[cfg(not(test))]
+fn register_supervised_task_with_process_manager(
+    transport: &mut impl IpcTransport,
+    process_manager_caps: Option<(u32, u32)>,
+    tid: u64,
+    restart_token: u64,
+) -> Result<(), KernelError> {
+    let Some((req_cap, rep_cap)) = process_manager_caps else {
+        return Ok(());
+    };
+    let req = RegisterSupervisedTask::new(tid, restart_token);
+    let msg = Message::with_header(0, PROC_OP_REGISTER_SUPERVISED_TASK, 0, None, &req.encode())
+        .map_err(|_| KernelError::WrongObject)?;
+    transport
+        .send(req_cap, &msg)
+        .map_err(|_| KernelError::WrongObject)?;
+    let _ = transport
+        .recv(rep_cap)
+        .map_err(|_| KernelError::WrongObject)?;
+    Ok(())
 }
 
 #[cfg(test)]
