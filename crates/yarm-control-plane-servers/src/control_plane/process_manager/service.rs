@@ -12,7 +12,7 @@ use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
     PROC_OP_SPAWN_V4, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2, SpawnV2Args, SpawnV3Args,
-    SpawnV4Args, WaitPidV2Args,
+    SpawnV4Args, TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
@@ -107,6 +107,7 @@ pub enum ProcessRequest {
     Exit { caller_tid: u64, code: u64 },
     SpawnV2(SpawnV2Request),
     WaitPidV2(WaitPidV2Request),
+    TaskRestartToken { tid: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,9 +737,11 @@ impl ProcessService {
                     target_pid: ProcessId(args.target_pid),
                 }))
             }
-            // Guarded ABI skeleton:
-            // authoritative restart-token lookup is not yet available in runtime process-manager path.
-            PROC_OP_TASK_RESTART_TOKEN => Err(ProcessManagerError::Unsupported),
+            PROC_OP_TASK_RESTART_TOKEN => {
+                let args = TaskRestartTokenRequest::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                Ok(ProcessRequest::TaskRestartToken { tid: args.tid })
+            }
             _ => Err(ProcessManagerError::Unsupported),
         }
     }
@@ -912,6 +915,14 @@ impl ProcessService {
                     exit_code: waited.exit_code,
                 };
                 Message::with_header(0, PROC_OP_WAITPID_V2, 0, None, &result.encode())
+                    .map_err(|_| ProcessManagerError::Malformed)
+            }
+            ProcessRequest::TaskRestartToken { tid } => {
+                let reply = TaskRestartTokenReply::new(
+                    self.restart_token_for_tid(tid).is_some(),
+                    self.restart_token_for_tid(tid).unwrap_or(0),
+                );
+                Message::with_header(0, PROC_OP_TASK_RESTART_TOKEN, 0, None, &reply.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
             }
         }
@@ -1469,5 +1480,40 @@ mod tests {
         .expect("exec image");
         assert_eq!(exec.entry, 0x402000);
         assert_eq!(exec.load_segment_count, 1);
+    }
+
+    #[test]
+    fn task_restart_token_lookup_returns_found_token_when_recorded() {
+        let mut service = ProcessService::new();
+        service
+            .record_restart_token(17, 0xAA55)
+            .expect("record token");
+        let request = Message::with_header(
+            0,
+            PROC_OP_TASK_RESTART_TOKEN,
+            0,
+            None,
+            &TaskRestartTokenRequest::new(17).encode(),
+        )
+        .expect("request");
+        let reply_msg = service.handle(request).expect("reply");
+        let reply = TaskRestartTokenReply::decode(reply_msg.as_slice()).expect("decode");
+        assert_eq!(reply.found_token(), Some(0xAA55));
+    }
+
+    #[test]
+    fn task_restart_token_lookup_returns_not_found_for_unknown_tid() {
+        let mut service = ProcessService::new();
+        let request = Message::with_header(
+            0,
+            PROC_OP_TASK_RESTART_TOKEN,
+            0,
+            None,
+            &TaskRestartTokenRequest::new(404).encode(),
+        )
+        .expect("request");
+        let reply_msg = service.handle(request).expect("reply");
+        let reply = TaskRestartTokenReply::decode(reply_msg.as_slice()).expect("decode");
+        assert_eq!(reply.found_token(), None);
     }
 }
