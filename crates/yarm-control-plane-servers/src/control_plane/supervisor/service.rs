@@ -31,6 +31,47 @@ use yarm_ipc_abi::supervisor_abi::{
     SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusRequest, TransferRevokedEvent,
 };
 
+#[cfg(test)]
+const SUPERVISOR_FAULT_REPORT_WIRE_LEN: usize = 17;
+#[cfg(test)]
+const SUPERVISOR_OP_FAULT_REPORT_WIRE: u16 = 0;
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupervisorFaultReportWire {
+    tid: u64,
+    fault_addr: u64,
+    access: u8,
+}
+
+#[cfg(test)]
+impl SupervisorFaultReportWire {
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != SUPERVISOR_FAULT_REPORT_WIRE_LEN {
+            return None;
+        }
+        let mut tid = [0u8; 8];
+        let mut fault_addr = [0u8; 8];
+        tid.copy_from_slice(&bytes[..8]);
+        fault_addr.copy_from_slice(&bytes[8..16]);
+        let access = bytes[16];
+        if access > 2 {
+            return None;
+        }
+        Some(Self {
+            tid: u64::from_le_bytes(tid),
+            fault_addr: u64::from_le_bytes(fault_addr),
+            access,
+        })
+    }
+
+    fn synthetic_exit_code(self) -> u64 {
+        // Preserve existing supervisor restart flow by translating fault reports into
+        // a stable synthetic exit code domain.
+        0xF000_0000_0000_0000u64 | ((self.access as u64) << 56) | (self.fault_addr & 0x00FF_FFFF_FFFF_FFFF)
+    }
+}
+
 const MAX_MANAGED_SERVICES: usize = 8;
 const MAX_DEPENDENTS: usize = 8;
 #[cfg(test)]
@@ -735,6 +776,19 @@ impl SupervisorService {
             self.recv_with_budget(kernel, self.handoff.supervisor_fault_recv_cap)?
         {
             match message.opcode {
+                SUPERVISOR_OP_FAULT_REPORT_WIRE => {
+                    let fault = SupervisorFaultReportWire::decode(message.as_slice())
+                        .ok_or(KernelError::WrongObject)?;
+                    let mut task_exit_ops = KernelSupervisorOutboundMessageOps::new(kernel);
+                    if let Some(restart_token) = task_exit_ops.task_restart_token(fault.tid) {
+                        let event = TaskExitedEvent {
+                            tid: fault.tid,
+                            exit_code: fault.synthetic_exit_code(),
+                            restart_token,
+                        };
+                        let _ = self.handle_task_exit(&mut task_exit_ops, event)?;
+                    }
+                }
                 SUPERVISOR_OP_TASK_EXITED => {
                     let event = TaskExitedEvent::decode(message.as_slice())
                         .ok_or(KernelError::WrongObject)?;
