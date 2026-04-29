@@ -1138,6 +1138,9 @@ pub fn run() {
                 supervisor.handoff.init_alert_recv_cap.0,
                 supervisor.degraded(),
             );
+            yarm_user_rt::user_log!(
+                "supervisor.srv restart-token registration sender not wired in production: missing authoritative lifecycle handoff source for (tid, restart_token)"
+            );
             loop {
                 let mut made_progress = false;
                 match transport.recv(supervisor.handoff.supervisor_control_recv_cap.0 as u32) {

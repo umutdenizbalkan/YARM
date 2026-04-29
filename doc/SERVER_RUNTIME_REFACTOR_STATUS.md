@@ -92,6 +92,9 @@ Current gap detail:
 
 - Process-manager spawn handling currently allocates/stores process-level metadata (pid/image/policy), but does not receive authoritative `(tid, restart_token)` data in that path yet.
 - Supervised-task registration/restart-policy handoff is the missing lifecycle source that must supply `(tid, restart_token)` to process-manager before truthful population can occur.
+- Production sender status:
+  - `PROC_OP_REGISTER_SUPERVISED_TASK` ABI exists and process-manager can store tokens from it.
+  - No production control-plane component currently emits this message yet because no runtime lifecycle stage currently surfaces authoritative `(tid, restart_token)` pairs into userspace server code.
 
 ## Remaining blockers / future work
 
