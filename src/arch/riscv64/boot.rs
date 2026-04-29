@@ -71,6 +71,27 @@ fn initramfs_static_hello_world_elf() -> [u8; 256] {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
+    use yarm_fs_servers::common::vfs_ipc::{ReadWriteRequest, openat_inline_message, read_message};
+    use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService, boot_initrd_bytes};
+    let backend = InitramfsBackend::from_cpio_newc_static(boot_initrd_bytes()?);
+    let mut svc = InitramfsService::with_backend(backend);
+    let open = svc.handle(openat_inline_message(0, b"/initramfs/init", 0, 0).ok()?).ok()?;
+    let fd = yarm_srv_common::vfs_reply::VfsReply::from_opcode_payload_checked(open.opcode, open.as_slice())
+        .ok()?
+        .as_u64();
+    let mut out = alloc::vec::Vec::new();
+    loop {
+        let reply = svc.handle(read_message(ReadWriteRequest { fd, buf_ptr: 0, len: 512 }).ok()?).ok()?;
+        let (_status, n, bytes) = yarm_srv_common::vfs_reply::VfsReply::decode_read_extended(reply.as_slice()).ok()?;
+        if n == 0 { break; }
+        out.extend_from_slice(&bytes[..n as usize]);
+        if out.len() > (2 * 1024 * 1024) { return None; }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn bootstrap_first_user_task(
     kernel: &mut crate::kernel::boot::KernelState,
 ) -> Result<(), crate::kernel::boot::KernelError> {
@@ -82,8 +103,10 @@ pub fn bootstrap_first_user_task(
     }
 
     let (asid, _aspace_cap) = kernel.create_user_address_space()?;
-    let image = initramfs_static_hello_world_elf();
-    let entry = kernel.load_elf_pt_load_segments(asid, &image)?;
+    let image = load_init_elf_from_initramfs_vfs();
+    let fallback = initramfs_static_hello_world_elf();
+    let image_bytes: &[u8] = image.as_deref().unwrap_or(&fallback);
+    let entry = kernel.load_elf_pt_load_segments(asid, image_bytes)?;
     kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
         entry,
