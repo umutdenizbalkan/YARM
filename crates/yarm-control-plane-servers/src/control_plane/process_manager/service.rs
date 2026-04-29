@@ -268,6 +268,7 @@ pub struct ProcessService {
     manager: KernelProcessManagerAdapter,
     policy_records: [Option<ProcessSpawnPolicyRecord>; 64],
     restart_token_records: [Option<RestartTokenRecord>; 64],
+    restart_control_send_cap: Option<u32>,
     handled: usize,
 }
 
@@ -656,11 +657,13 @@ fn map_syscall_error(err: SyscallError) -> ProcessManagerError {
 }
 
 impl ProcessService {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             manager: KernelProcessManagerAdapter::new(),
             policy_records: [None; 64],
             restart_token_records: [None; 64],
+            restart_control_send_cap: yarm_user_rt::runtime::startup_context()
+                .process_manager_restart_control_send_cap,
             handled: 0,
         }
     }
@@ -958,13 +961,37 @@ impl ProcessService {
                 let status = match self.restart_token_for_tid(tid) {
                     None => ExecuteRestartReply::STATUS_NOT_FOUND,
                     Some(token) if token != restart_token => ExecuteRestartReply::STATUS_TOKEN_MISMATCH,
-                    Some(_) => ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED,
+                    Some(_) => self.execute_restart_via_kernel_cap(tid, restart_token),
                 };
                 let reply = ExecuteRestartReply::new(status);
                 Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &reply.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
             }
         }
+    }
+
+    fn execute_restart_via_kernel_cap(&self, tid: u64, restart_token: u64) -> u8 {
+        let Some(send_cap) = self.restart_control_send_cap else {
+            return ExecuteRestartReply::STATUS_PERMISSION_DENIED;
+        };
+        let request = ExecuteRestartRequest::new(tid, restart_token);
+        let msg = match Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &request.encode()) {
+            Ok(msg) => msg,
+            Err(_) => return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED,
+        };
+        let reply_cap = yarm_user_rt::runtime::startup_context().process_manager_reply_recv_cap.unwrap_or(0);
+        // SAFETY: process-manager owns both caps via startup handoff.
+        let call = unsafe { yarm_user_rt::syscall::ipc_call(send_cap, reply_cap, &msg) };
+        if call.is_err() {
+            return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED;
+        }
+        // SAFETY: paired with ipc_call above.
+        let Some(reply) = (unsafe { yarm_user_rt::syscall::ipc_recv(reply_cap) }).ok().flatten() else {
+            return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED;
+        };
+        ExecuteRestartReply::decode(reply.as_slice())
+            .map(|r| r.status)
+            .unwrap_or(ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED)
     }
 }
 

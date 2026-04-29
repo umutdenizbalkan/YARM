@@ -28,6 +28,8 @@ use yarm_srv_common::vfs_reply::VfsReply;
 use yarm_user_rt::capability::CapId;
 #[cfg(test)]
 use yarm_user_rt::capability::CapRights;
+#[cfg(test)]
+use yarm::kernel::capabilities::{CapObject, Capability};
 #[cfg(not(test))]
 use yarm_user_rt::runtime::KernelIpcError as KernelError;
 #[cfg(test)]
@@ -240,7 +242,7 @@ impl InitService {
         tid: u64,
         entry: usize,
         asid: Asid,
-        startup_args: [u64; 11],
+        startup_args: [u64; 12],
     ) -> Result<(), KernelError> {
         self.launch_order[self.launch_count] = Some(kind);
         self.launch_count += 1;
@@ -259,7 +261,7 @@ impl InitService {
         kernel: &mut KernelState,
         process_manager_tid: u64,
         compat_tid: u64,
-    ) -> Result<[u64; 11], KernelError> {
+    ) -> Result<[u64; 12], KernelError> {
         // Startup ABI slots for compat server:
         //   arg0 => compat task id
         //   arg1 => process-manager request SEND cap in compat task
@@ -307,7 +309,7 @@ impl InitService {
         init_tid: u64,
         supervisor_tid: u64,
         restart_window_ticks: u64,
-    ) -> Result<([u64; 11], InitFaultHandoff), KernelError> {
+    ) -> Result<([u64; 12], InitFaultHandoff), KernelError> {
         let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
 
         let (_, _fault_send_root, fault_recv_root) = kernel.create_endpoint(16)?;
@@ -367,6 +369,27 @@ impl InitService {
             restart_window_ticks,
         );
         Ok((startup_args, handoff))
+    }
+
+    #[cfg(test)]
+    fn delegate_process_manager_restart_control_cap(
+        kernel: &mut KernelState,
+        process_manager_tid: u64,
+    ) -> Result<[u64; 12], KernelError> {
+        let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
+        let root = kernel.mint_capability_for_current_context(Capability::new(
+            CapObject::Kernel,
+            CapRights::SEND,
+        ))?;
+        let delegated = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            root,
+            process_manager_tid,
+            CapRights::SEND,
+        )?;
+        let mut args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+        args[11] = delegated.0;
+        Ok(args)
     }
 
     #[cfg(test)]
@@ -498,6 +521,8 @@ impl InitService {
             )?;
         self.fault_handoff = Some(supervisor_handoff);
 
+        let process_manager_startup_args =
+            Self::delegate_process_manager_restart_control_cap(kernel, proc_tid)?;
         match self.launch_strategy {
             CoreLaunchStrategy::ProcessManagerFirst => {
                 self.record_launch(
@@ -506,7 +531,7 @@ impl InitService {
                     proc_tid,
                     plan.process_manager_entry,
                     proc_asid,
-                    UserImageSpec::DEFAULT_STARTUP_ARGS,
+                    process_manager_startup_args,
                 )?;
                 self.record_launch(
                     kernel,
@@ -514,7 +539,7 @@ impl InitService {
                     vfs_tid,
                     plan.vfs_entry,
                     vfs_asid,
-                    UserImageSpec::DEFAULT_STARTUP_ARGS,
+                    process_manager_startup_args,
                 )?;
                 self.record_launch(
                     kernel,

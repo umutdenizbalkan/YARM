@@ -8,6 +8,7 @@ use super::{
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
 use crate::kernel::task::{TaskStatus, WaitReason};
+use yarm_ipc_abi::process_abi::{ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART};
 
 impl KernelState {
     pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
@@ -606,6 +607,9 @@ impl KernelState {
         if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
         }
+        if capability.object == CapObject::Kernel {
+            return self.handle_restart_control_kernel_ipc(msg);
+        }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
 
@@ -667,6 +671,24 @@ impl KernelState {
         self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
+    }
+
+    fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {
+        if msg.opcode != PROC_OP_EXECUTE_RESTART {
+            return Err(KernelError::WrongObject);
+        }
+        let args = ExecuteRestartRequest::decode(msg.as_slice()).map_err(|_| KernelError::UserMemoryFault)?;
+        let status = match self.restart_task(args.tid, args.restart_token) {
+            Ok(()) => ExecuteRestartReply::STATUS_OK,
+            Err(KernelError::TaskMissing) => ExecuteRestartReply::STATUS_NOT_FOUND,
+            Err(KernelError::WrongObject) => ExecuteRestartReply::STATUS_TOKEN_MISMATCH,
+            Err(KernelError::MissingRight) => ExecuteRestartReply::STATUS_PERMISSION_DENIED,
+            Err(_) => ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED,
+        };
+        let reply_cap = msg.transferred_cap().ok_or(KernelError::MissingRight)?;
+        let reply = Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &ExecuteRestartReply::new(status).encode())
+            .map_err(|_| KernelError::UserMemoryFault)?;
+        self.ipc_reply(CapId(reply_cap.0), reply)
     }
 
     pub fn ipc_send_fastpath(

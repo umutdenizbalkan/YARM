@@ -51,6 +51,7 @@ pub mod syscall {
 
     const SYSCALL_IPC_SEND_NR: usize = 1;
     const SYSCALL_IPC_RECV_NR: usize = 2;
+    const SYSCALL_IPC_CALL_NR: usize = 4;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
 
@@ -157,6 +158,36 @@ pub mod syscall {
     }
 
     #[inline]
+    pub unsafe fn ipc_call(
+        ep_cap: u32,
+        reply_recv_cap: u32,
+        msg: &Message,
+    ) -> core::result::Result<(), SyscallError> {
+        let transfer_cap = msg
+            .transferred_cap()
+            .map(|cap| cap.0 as usize)
+            .unwrap_or(SYSCALL_NO_TRANSFER_CAP as usize);
+        let args = [
+            ep_cap as usize,
+            msg.payload.as_ptr() as usize,
+            msg.len as usize,
+            reply_recv_cap as usize,
+            0,
+            transfer_cap,
+        ];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_CALL_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
+    }
+
+    #[inline]
     pub fn yield_now() -> Result<()> {
         Err(Error::Unsupported)
     }
@@ -178,10 +209,12 @@ pub mod runtime {
     pub const STARTUP_SLOT_OPTIONAL_INIT_TID: usize = 8;
     pub const STARTUP_SLOT_OPTIONAL_SUPERVISOR_TID: usize = 9;
     pub const STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS: usize = 10;
-    const STARTUP_SLOT_COUNT: usize = 11;
+    pub const STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP: usize = 11;
+    const STARTUP_SLOT_COUNT: usize = 12;
 
     static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] =
         [
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -222,6 +255,8 @@ pub mod runtime {
         pub supervisor_tid: Option<u64>,
         /// Optional supervisor restart window ticks.
         pub supervisor_restart_window_ticks: Option<u64>,
+        /// Optional process-manager restart-control SEND cap.
+        pub process_manager_restart_control_send_cap: Option<u32>,
     }
 
     impl StartupContext {
@@ -357,6 +392,9 @@ pub mod runtime {
         let supervisor_restart_window_ticks = optional_tid_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS].load(Ordering::Relaxed),
         );
+        let process_manager_restart_control_send_cap = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP].load(Ordering::Relaxed),
+        );
         StartupContext {
             task_id,
             process_manager_request_send_cap,
@@ -369,6 +407,7 @@ pub mod runtime {
             init_tid,
             supervisor_tid,
             supervisor_restart_window_ticks,
+            process_manager_restart_control_send_cap,
         }
     }
 }
@@ -483,13 +522,13 @@ mod tests {
     fn startup_process_manager_caps_require_both_slots() {
         let original = startup_context();
 
-        install_startup_arg_slots([42, 11, 12, 0, 0, 0, 0, 0, 0, 0, 0]);
+        install_startup_arg_slots([42, 11, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), Some((11, 12)));
 
-        install_startup_arg_slots([42, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0]);
+        install_startup_arg_slots([42, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), None);
 
-        install_startup_arg_slots([42, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        install_startup_arg_slots([42, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), None);
 
         install_startup_arg_slots([
@@ -516,6 +555,7 @@ mod tests {
             original.init_tid.unwrap_or(0),
             original.supervisor_tid.unwrap_or(0),
             original.supervisor_restart_window_ticks.unwrap_or(0),
+            original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
         ]);
     }
 }
