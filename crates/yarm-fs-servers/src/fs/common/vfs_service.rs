@@ -386,17 +386,7 @@ impl<B: VfsBackend> VfsService<B> {
                     }
                     VfsReply::OpenAtFd(self.backend.openat_path(path.as_slice())?)
                 } else {
-                    #[cfg(test)]
-                    {
-                        if !self.policy.allows_path(path_ptr) {
-                            return Err(VfsError::PermissionDenied);
-                        }
-                        VfsReply::OpenAtFd(self.backend.openat(path_ptr)?)
-                    }
-                    #[cfg(not(test))]
-                    {
-                        return Err(VfsError::Malformed);
-                    }
+                    return Err(VfsError::Malformed);
                 }
             }
             VfsRequest::Close { fd } => VfsReply::CloseResult(self.backend.close(fd)?),
@@ -414,17 +404,7 @@ impl<B: VfsBackend> VfsService<B> {
                     }
                     VfsReply::StatxValue(self.backend.statx_path(path.as_slice())?)
                 } else {
-                    #[cfg(test)]
-                    {
-                        if !self.policy.allows_path(path_ptr) {
-                            return Err(VfsError::PermissionDenied);
-                        }
-                        VfsReply::StatxValue(self.backend.statx(path_ptr)?)
-                    }
-                    #[cfg(not(test))]
-                    {
-                        return Err(VfsError::Malformed);
-                    }
+                    return Err(VfsError::Malformed);
                 }
             }
             VfsRequest::Ioctl { fd, request, arg } => {

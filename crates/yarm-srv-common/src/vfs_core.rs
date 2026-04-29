@@ -231,15 +231,6 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
         }
     }
 
-    /// Legacy numeric-path router kept for compatibility-only pointer ABI callers.
-    fn route_by_path(&mut self, path_ptr: u64) -> &mut dyn VfsBackend {
-        if path_ptr < self.split_at {
-            &mut self.low
-        } else {
-            &mut self.high
-        }
-    }
-
     /// Primary router for OPENAT/STATX runtime traffic.
     fn route_by_path_bytes(&mut self, path: &[u8]) -> &mut dyn VfsBackend {
         if path.starts_with(b"/initramfs/") {
@@ -260,7 +251,8 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
 
 impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        self.route_by_path(path_ptr).openat(path_ptr)
+        let _ = path_ptr;
+        Err(VfsError::InvalidPath)
     }
 
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -280,7 +272,8 @@ impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        self.route_by_path(path_ptr).statx(path_ptr)
+        let _ = path_ptr;
+        Err(VfsError::InvalidPath)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
