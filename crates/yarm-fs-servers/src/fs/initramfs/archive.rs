@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::super::common::vfs_ipc::{VfsBackend, VfsError};
+use yarm_srv_common::cpio::CpioArchive;
 
 /// Compatibility-only legacy path identifier; prefer `INITRAMFS_BOOT_MARKER_PATH`.
 pub const INITRAMFS_BOOT_MARKER_PATH_PTR: u64 = 0x494E_4954_424F_4F54;
@@ -119,11 +120,39 @@ impl InitramfsBackend {
         self.metrics
     }
 
-    fn lookup_by_path(&self, path: &[u8]) -> Result<usize, VfsError> {
+    pub fn from_cpio_newc(cpio: &[u8]) -> Self {
+        let mut backend = Self::new(0);
+        for entry in CpioArchive::new(cpio).entries().flatten() {
+            if !entry.is_regular_file() {
+                continue;
+            }
+            let path = match entry.name {
+                b"init" => INITRAMFS_INIT_PATH,
+                b"etc/hosts" => INITRAMFS_ETC_HOSTS_PATH,
+                b"process_manager" => INITRAMFS_PROC_MGR_PATH,
+                b"vfs" => INITRAMFS_VFS_PATH,
+                b"supervisor" => INITRAMFS_SUPERVISOR_PATH,
+                b"posix_compat" => INITRAMFS_POSIX_COMPAT_PATH,
+                _ => continue,
+            };
+            if let Some(idx) = backend.lookup_slot(path) {
+                backend.inodes[idx] = Some(InitramfsInode {
+                    path,
+                    file_len: entry.file_data().len() as u64,
+                });
+            }
+        }
+        backend
+    }
+
+    fn lookup_slot(&self, path: &[u8]) -> Option<usize> {
         self.inodes
             .iter()
             .position(|entry| entry.map(|inode| inode.path == path).unwrap_or(false))
-            .ok_or(VfsError::InvalidPath)
+    }
+
+    fn lookup_by_path(&self, path: &[u8]) -> Result<usize, VfsError> {
+        self.lookup_slot(path).ok_or(VfsError::InvalidPath)
     }
 
     fn inode_for_fd(&self, fd: u64) -> Result<InitramfsInode, VfsError> {
@@ -238,6 +267,27 @@ impl VfsBackend for InitramfsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
+    use alloc::vec::Vec;
+
+    fn push_entry(out: &mut Vec<u8>, name: &str, mode: u32, data: &[u8]) {
+        let namesz = name.len() + 1;
+        let mut h = [0u8; 110];
+        h[0..6].copy_from_slice(b"070701");
+        h[14..22].copy_from_slice(format!("{mode:08x}").as_bytes());
+        h[54..62].copy_from_slice(format!("{:08x}", data.len()).as_bytes());
+        h[94..102].copy_from_slice(format!("{namesz:08x}").as_bytes());
+        out.extend_from_slice(&h);
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(data);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
 
     #[test]
     fn initramfs_multi_open_allocates_unique_fds() {
@@ -322,6 +372,25 @@ mod tests {
         assert_eq!(proc_stat, expected);
         assert_eq!(vfs_stat, expected);
         assert_eq!(supervisor_stat, expected);
+    }
+
+    #[test]
+    fn initramfs_cpio_updates_known_file_sizes() {
+        let mut cpio = Vec::new();
+        push_entry(&mut cpio, "init", 0o100755, &[0u8; 77]);
+        push_entry(&mut cpio, "vfs", 0o100755, &[0u8; 222]);
+        push_entry(&mut cpio, "TRAILER!!!", 0, &[]);
+        let mut fs = InitramfsBackend::from_cpio_newc(&cpio);
+        let init_stat = fs.statx_path(INITRAMFS_INIT_PATH).expect("init stat");
+        let vfs_stat = fs.statx_path(INITRAMFS_VFS_PATH).expect("vfs stat");
+        assert_eq!(
+            init_stat,
+            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (77 << 16)
+        );
+        assert_eq!(
+            vfs_stat,
+            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (222 << 16)
+        );
     }
 
 }
