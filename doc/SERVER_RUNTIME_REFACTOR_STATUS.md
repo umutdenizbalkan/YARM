@@ -82,10 +82,11 @@ Delivery convention:
   - Production process-manager currently returns `Unsupported` for `PROC_OP_TASK_RESTART_TOKEN`, because no authoritative runtime restart-token state source is wired yet.
   - Therefore production restart from fault reports is **not** currently enabled; only receive/decode + guarded lookup attempt is active.
 - Future work needed for real production restart:
-  1. Wire an authoritative restart-token state source into the runtime process-manager/control-plane service.
-  2. Implement `PROC_OP_TASK_RESTART_TOKEN` server handling to return real `(found, token)` results.
-  3. Use successful lookup to construct `TaskExitedEvent { tid, synthetic_exit_code, restart_token }` in production path and route it through existing supervisor restart policy handling.
-  4. Add end-to-end runtime tests validating fault report -> token lookup -> restart scheduling behavior.
+  1. Treat process-manager as authoritative owner of restart-token state (task lifecycle owner).
+  2. Populate process-manager restart-token table on authoritative lifecycle points (spawn/register/restart-policy handoff paths).
+  3. Implement `PROC_OP_TASK_RESTART_TOKEN` server handling to return real `(found, token)` results from process-manager-owned state.
+  4. Use successful lookup to construct `TaskExitedEvent { tid, synthetic_exit_code, restart_token }` in production path and route it through existing supervisor restart policy handling.
+  5. Add end-to-end runtime tests validating fault report -> token lookup -> restart scheduling behavior.
 
 ## Remaining blockers / future work
 

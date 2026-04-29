@@ -118,6 +118,12 @@ struct ProcessSpawnPolicyRecord {
     requested_task_class: Option<TaskClass>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestartTokenRecord {
+    tid: u64,
+    token: u64,
+}
+
 #[derive(Debug)]
 #[cfg(test)]
 struct KernelProcessManagerAdapter {
@@ -256,6 +262,7 @@ impl ProcessManagerOps for KernelProcessManagerAdapter {
 pub struct ProcessService {
     manager: KernelProcessManagerAdapter,
     policy_records: [Option<ProcessSpawnPolicyRecord>; 64],
+    restart_token_records: [Option<RestartTokenRecord>; 64],
     handled: usize,
 }
 
@@ -648,6 +655,7 @@ impl ProcessService {
         Self {
             manager: KernelProcessManagerAdapter::new(),
             policy_records: [None; 64],
+            restart_token_records: [None; 64],
             handled: 0,
         }
     }
@@ -804,6 +812,35 @@ impl ProcessService {
                 image_id: record.image_id,
                 entry: record.entry,
             })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn record_restart_token(&mut self, tid: u64, token: u64) -> Result<(), ProcessManagerError> {
+        if let Some(record) = self
+            .restart_token_records
+            .iter_mut()
+            .flatten()
+            .find(|record| record.tid == tid)
+        {
+            *record = RestartTokenRecord { tid, token };
+            return Ok(());
+        }
+        let slot = self
+            .restart_token_records
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(ProcessManagerError::TableFull)?;
+        *slot = Some(RestartTokenRecord { tid, token });
+        Ok(())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn restart_token_for_tid(&self, tid: u64) -> Option<u64> {
+        self.restart_token_records
+            .iter()
+            .flatten()
+            .find(|record| record.tid == tid)
+            .map(|record| record.token)
     }
 
     pub fn mark_exit(&mut self, pid: ProcessId, code: u64) -> Result<(), ProcessManagerError> {
