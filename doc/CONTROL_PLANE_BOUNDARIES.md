@@ -80,3 +80,7 @@ Do **not**:
   intentionally redesigned end-to-end).
 
 Absent such redesign decisions, this document is the authoritative stopping-point boundary summary.
+
+## Related status document
+
+- See `doc/SERVER_RUNTIME_REFACTOR_STATUS.md` for current server-runtime / POSIX / VFS refactor completion state and known blockers.
