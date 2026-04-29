@@ -138,6 +138,10 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
     {
         let len = initrd_end.saturating_sub(initrd_start) as usize;
         if len > 0 {
+            let page = crate::kernel::vm::PAGE_SIZE as u64;
+            let reserved_start = initrd_start & !(page - 1);
+            let reserved_end = (initrd_end + (page - 1)) & !(page - 1);
+            crate::kernel::boot::Bootstrap::install_boot_reserved_range(reserved_start, reserved_end);
             // SAFETY: DTB-provided initrd range refers to immutable boot memory.
             let bytes = unsafe { core::slice::from_raw_parts(initrd_start as *const u8, len) };
             yarm_fs_servers::initramfs::install_boot_initrd_bytes(bytes);

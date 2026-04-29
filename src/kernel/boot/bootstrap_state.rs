@@ -11,6 +11,8 @@ unsafe extern "C" {
 
 static mut BOOTSTRAP_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
     core::mem::MaybeUninit::uninit();
+static BOOT_RESERVED_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BOOT_RESERVED_END: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 impl Bootstrap {
     #[inline(never)]
@@ -37,14 +39,18 @@ impl Bootstrap {
         (fallback, 1)
     }
 
-    fn default_reserved_ranges() -> [(u64, u64); 1] {
+    fn default_reserved_ranges() -> [(u64, u64); 2] {
+        let extra = (
+            BOOT_RESERVED_START.load(core::sync::atomic::Ordering::Acquire),
+            BOOT_RESERVED_END.load(core::sync::atomic::Ordering::Acquire),
+        );
         #[cfg(not(feature = "hosted-dev"))]
         {
             let page = crate::kernel::vm::PAGE_SIZE as u64;
             let kernel_start = (core::ptr::addr_of!(__kernel_start) as u64) & !(page - 1);
             let kernel_end_raw = core::ptr::addr_of!(__kernel_end) as u64;
             let kernel_end = (kernel_end_raw + (page - 1)) & !(page - 1);
-            return [(kernel_start, kernel_end)];
+            return [(kernel_start, kernel_end), extra];
         }
 
         #[cfg(feature = "hosted-dev")]
@@ -52,12 +58,17 @@ impl Bootstrap {
             let kernel_start = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE;
             let kernel_end = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE
                 + crate::kernel::vm::PAGE_SIZE as u64;
-            [(kernel_start, kernel_end)]
+            [(kernel_start, kernel_end), extra]
         }
     }
 
-    pub fn default_reserved_ranges_for_arch_boot() -> [(u64, u64); 1] {
+    pub fn default_reserved_ranges_for_arch_boot() -> [(u64, u64); 2] {
         Self::default_reserved_ranges()
+    }
+
+    pub fn install_boot_reserved_range(start: u64, end: u64) {
+        BOOT_RESERVED_START.store(start, core::sync::atomic::Ordering::Release);
+        BOOT_RESERVED_END.store(end, core::sync::atomic::Ordering::Release);
     }
 
     fn push_region(
