@@ -101,13 +101,12 @@ mod tests {
     use super::*;
     use super::super::archive::{INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_BOOT_MARKER_PATH_PTR};
     use super::super::super::common::vfs_ipc::{
-        CloseRequest, MountNamespacePolicy, MountRouter, OpenAtRequest, StatxRequest, close_message,
-        openat_message, read_message, statx_inline_message, statx_message,
+        CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_inline_message,
+        read_message, statx_inline_message,
     };
     use super::super::super::common::vfs_service::VfsService;
     use super::super::super::devfs::{DEV_CONSOLE_PATH_PTR, DevFsBackend};
-    use super::super::INITRAMFS_INIT_PATH_PTR;
-    use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_READ};
+    use yarm_ipc_abi::vfs_abi::{OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_READ};
 
     #[test]
     fn initramfs_is_read_only_with_metrics() {
@@ -124,18 +123,11 @@ mod tests {
 
     #[test]
     fn initramfs_protocol_vectors_match_frozen_vfs_codec() {
-        let open = openat_message(OpenAtRequest {
-            dirfd: 0,
-            path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-            flags: 0,
-            mode: 0,
-        })
+        let open = openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0)
         .expect("open");
         assert_eq!(open.opcode, VFS_OP_OPENAT);
-        assert_eq!(
-            open.as_slice(),
-            &OpenAtArgs::new(0, INITRAMFS_BOOT_MARKER_PATH_PTR, 0, 0).encode()
-        );
+        let decoded_open = OpenAtInlinePath::decode(open.as_slice()).expect("decode open");
+        assert_eq!(decoded_open.path, INITRAMFS_BOOT_MARKER_PATH);
 
         let read = read_message(ReadWriteRequest {
             fd: 10,
@@ -146,17 +138,10 @@ mod tests {
         assert_eq!(read.opcode, VFS_OP_READ);
         assert_eq!(read.as_slice(), &ReadWriteArgs::new(10, 0, 32).encode());
 
-        let statx = statx_message(StatxRequest {
-            dirfd: 0,
-            path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-            flags: 0,
-            mask_or_buf: 0,
-        })
+        let statx = statx_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0)
         .expect("statx");
-        assert_eq!(
-            statx.as_slice(),
-            &StatxArgs::new(0, INITRAMFS_BOOT_MARKER_PATH_PTR, 0, 0).encode()
-        );
+        let decoded_statx = StatxInlinePath::decode(statx.as_slice()).expect("decode statx");
+        assert_eq!(decoded_statx.path, INITRAMFS_BOOT_MARKER_PATH);
     }
 
     #[test]
@@ -180,27 +165,11 @@ mod tests {
         );
 
         let open_init = svc
-            .handle_request(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
-                })
-                .expect("open"),
-            )
+            .handle_request(openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0).expect("open"))
             .expect("initramfs open");
         assert_eq!(open_init.opcode, VFS_OP_OPENAT);
 
-        let denied = svc.handle_request(
-            openat_message(OpenAtRequest {
-                dirfd: 0,
-                path_ptr: INITRAMFS_INIT_PATH_PTR,
-                flags: 0,
-                mode: 0,
-            })
-            .expect("open"),
-        );
+        let denied = svc.handle_request(openat_inline_message(0, b"denied", 0, 0).expect("open"));
         assert_eq!(denied, Err(VfsError::PermissionDenied));
     }
 
@@ -234,12 +203,7 @@ mod tests {
 
         let open = svc
             .handle_request(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
-                })
+                openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0)
                 .expect("open"),
             )
             .expect("open reply");
@@ -276,12 +240,7 @@ mod tests {
         svc.mount(INITRAMFS_BOOT_MARKER_PATH_PTR, 2).expect("mount");
         let open = svc
             .handle_request(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
-                })
+                openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0)
                 .expect("open"),
             )
             .expect("open reply");
