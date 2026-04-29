@@ -51,20 +51,14 @@ mod tests {
         EXT4_OVERSIZE_PATH_PTR, EXT4_SERVICE_PATH, EXT4_SERVICE_PATH_PTR,
     };
     use super::super::super::common::vfs_ipc::{VfsBackend, VfsError};
-    use super::super::super::common::vfs_ipc::{
-        OpenAtRequest, StatxRequest, openat_message, statx_message,
-    };
+    use yarm_ipc_abi::vfs_abi::{OpenAtInlinePath, StatxInlinePath};
 
     #[test]
     fn ext4_service_supports_write_stat() {
         let mut svc = Ext4Service::with_backend(Ext4Backend::new());
-        let open = openat_message(OpenAtRequest {
-            dirfd: 0,
-            path_ptr: EXT4_SERVICE_PATH_PTR,
-            flags: 0,
-            mode: 0,
-        })
-        .expect("open");
+        let open = openat_inline_message(0, EXT4_SERVICE_PATH, 0, 0).expect("open");
+        let decoded_open = OpenAtInlinePath::decode(open.as_slice()).expect("decode open");
+        assert_eq!(decoded_open.path, EXT4_SERVICE_PATH);
         let open_rep = svc.handle(open).expect("open rep");
         let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
             .expect("decode open")
@@ -78,13 +72,9 @@ mod tests {
         .expect("write");
         let _ = svc.handle(write).expect("write rep");
 
-        let stat = statx_message(StatxRequest {
-            dirfd: 0,
-            path_ptr: EXT4_SERVICE_PATH_PTR,
-            flags: 0,
-            mask_or_buf: 0,
-        })
-        .expect("stat");
+        let stat = statx_inline_message(0, EXT4_SERVICE_PATH, 0, 0).expect("stat");
+        let decoded_stat = StatxInlinePath::decode(stat.as_slice()).expect("decode stat");
+        assert_eq!(decoded_stat.path, EXT4_SERVICE_PATH);
         let stat_rep = svc.handle(stat).expect("stat rep");
         assert_eq!(
             VfsReply::from_opcode_payload_checked(stat_rep.opcode, stat_rep.as_slice())
