@@ -49,9 +49,20 @@ impl Bootstrap {
         #[cfg(not(feature = "hosted-dev"))]
         {
             let page = crate::kernel::vm::PAGE_SIZE as u64;
-            let kernel_start = (core::ptr::addr_of!(__kernel_start) as u64) & !(page - 1);
-            let kernel_end_raw = core::ptr::addr_of!(__kernel_end) as u64;
-            let kernel_end = (kernel_end_raw + (page - 1)) & !(page - 1);
+            // The linker places the kernel image at a high VA (see                                                                                                          
+            // KERNEL_LINK_VIRT_BASE). Subtract the link base to recover                                                                                                     
+            // the physical extent the frame allocator needs to mark                                                                                                         
+            // reserved. On targets that link the kernel at PA = VMA
+            // (aarch64, riscv64) KERNEL_LINK_VIRT_BASE is 0 and this
+            // becomes a no-op subtraction.
+            let link_base = platform_constants::KERNEL_LINK_VIRT_BASE;
+            let kernel_start_virt = core::ptr::addr_of!(__kernel_start) as u64;
+            let kernel_end_virt = core::ptr::addr_of!(__kernel_end) as u64;
+            let kernel_start_phys = kernel_start_virt.saturating_sub(link_base);
+            let kernel_end_phys = kernel_end_virt.saturating_sub(link_base);
+            let kernel_start = kernel_start_phys & !(page - 1);
+            let kernel_end = (kernel_end_phys + (page - 1)) & !(page - 1);
+            //return [(kernel_start, kernel_end)];
             return [(kernel_start, kernel_end), extra];
         }
 
