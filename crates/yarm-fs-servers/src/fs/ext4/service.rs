@@ -107,10 +107,4 @@ mod tests {
         assert_eq!(backend.statx_path(b"/ext4/missing"), Err(VfsError::InvalidPath));
     }
 
-    #[test]
-    fn ext4_pointer_entrypoints_are_rejected_for_runtime_paths() {
-        let mut backend = Ext4Backend::new();
-        assert_eq!(backend.openat(0x3030), Err(VfsError::InvalidPath));
-        assert_eq!(backend.statx(0x3030), Err(VfsError::InvalidPath));
-    }
 }

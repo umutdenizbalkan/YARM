@@ -148,11 +148,6 @@ impl ServiceFsBackend for Ext4Backend {
 }
 
 impl VfsBackend for Ext4Backend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        Err(VfsError::InvalidPath)
-    }
-
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         self.open_inode_by_path(path)
     }
@@ -181,11 +176,6 @@ impl VfsBackend for Ext4Backend {
         self.journal_seq = self.journal_seq.saturating_add(1);
         self.cache.put(fd, inode_slot.file_len);
         Ok(len)
-    }
-
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        Err(VfsError::InvalidPath)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {

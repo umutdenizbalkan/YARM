@@ -325,11 +325,6 @@ impl FatBackend {
 }
 
 impl VfsBackend for FatBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        Err(VfsError::InvalidPath)
-    }
-
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         let path = self.lookup_by_path(path)?;
         let file_idx = self.alloc_file(path)?;
@@ -356,11 +351,6 @@ impl VfsBackend for FatBackend {
         self.files[opened.file_idx] = Some(file);
         self.cache.put(fd, file.file_len);
         Ok(len)
-    }
-
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        Err(VfsError::InvalidPath)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -434,10 +424,4 @@ mod tests {
         assert_eq!(fs.statx_path(b"/unknown"), Err(VfsError::InvalidPath));
     }
 
-    #[test]
-    fn pointer_entrypoints_are_rejected_for_runtime_paths() {
-        let mut fs = FatBackend::new();
-        assert_eq!(fs.openat(0x5050), Err(VfsError::InvalidPath));
-        assert_eq!(fs.statx(0x5050), Err(VfsError::InvalidPath));
-    }
 }

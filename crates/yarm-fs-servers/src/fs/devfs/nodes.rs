@@ -131,12 +131,6 @@ impl DevFsBackend {
 }
 
 impl VfsBackend for DevFsBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-        Err(VfsError::InvalidPath)
-    }
-
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         match Self::lookup_by_path(path).and_then(|node| self.alloc_handle(node)) {
             Ok(fd) => {
@@ -200,12 +194,6 @@ impl VfsBackend for DevFsBackend {
                 Err(err)
             }
         }
-    }
-
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-        Err(VfsError::InvalidPath)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -309,10 +297,4 @@ mod tests {
         assert_eq!(backend.statx_path(b"/dev/unknown"), Err(VfsError::InvalidPath));
     }
 
-    #[test]
-    fn pointer_entrypoints_are_rejected_for_runtime_paths() {
-        let mut backend = DevFsBackend::new();
-        assert_eq!(backend.openat(DEV_CONSOLE_PATH_PTR), Err(VfsError::InvalidPath));
-        assert_eq!(backend.statx(DEV_NULL_PATH_PTR), Err(VfsError::InvalidPath));
-    }
 }

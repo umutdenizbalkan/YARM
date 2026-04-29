@@ -170,12 +170,6 @@ impl InitramfsBackend {
 }
 
 impl VfsBackend for InitramfsBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-        Err(VfsError::InvalidPath)
-    }
-
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         match self.lookup_by_path(path).and_then(|inode_idx| self.alloc_handle(inode_idx)) {
             Ok(fd) => {
@@ -225,12 +219,6 @@ impl VfsBackend for InitramfsBackend {
         self.metrics.write_count = self.metrics.write_count.saturating_add(1);
         self.metrics.error_count = self.metrics.error_count.saturating_add(1);
         Err(VfsError::Unsupported)
-    }
-
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-        Err(VfsError::InvalidPath)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -336,10 +324,4 @@ mod tests {
         assert_eq!(supervisor_stat, expected);
     }
 
-    #[test]
-    fn initramfs_pointer_entrypoints_are_rejected_for_runtime_paths() {
-        let mut fs = InitramfsBackend::new(4096);
-        assert_eq!(fs.openat(INITRAMFS_BOOT_MARKER_PATH_PTR), Err(VfsError::InvalidPath));
-        assert_eq!(fs.statx(INITRAMFS_BOOT_MARKER_PATH_PTR), Err(VfsError::InvalidPath));
-    }
 }

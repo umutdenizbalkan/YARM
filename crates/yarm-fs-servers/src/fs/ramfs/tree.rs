@@ -154,12 +154,6 @@ impl ServiceFsBackend for RamFsBackend {
 }
 
 impl VfsBackend for RamFsBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-        Err(VfsError::InvalidPath)
-    }
-
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         match self.open_inode_by_path(path) {
             Ok(fd) => {
@@ -220,12 +214,6 @@ impl VfsBackend for RamFsBackend {
         self.metrics.write_count = self.metrics.write_count.saturating_add(1);
         self.metrics.bytes_written = self.metrics.bytes_written.saturating_add(len);
         Ok(len)
-    }
-
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-        Err(VfsError::InvalidPath)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -305,10 +293,4 @@ mod tests {
         assert_eq!(fs.statx_path(b"/ramfs/missing"), Err(VfsError::InvalidPath));
     }
 
-    #[test]
-    fn ramfs_pointer_entrypoints_are_rejected_for_runtime_paths() {
-        let mut fs = RamFsBackend::new();
-        assert_eq!(fs.openat(RAMFS_BOOT_PATH_PTR), Err(VfsError::InvalidPath));
-        assert_eq!(fs.statx(RAMFS_BOOT_PATH_PTR), Err(VfsError::InvalidPath));
-    }
 }

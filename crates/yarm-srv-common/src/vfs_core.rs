@@ -100,16 +100,12 @@ pub enum VfsRequest {
 }
 
 pub trait VfsBackend {
-    /// Legacy pointer-path open; prefer `openat_path`.
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError>;
     fn openat_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
         Err(VfsError::InvalidPath)
     }
     fn close(&mut self, fd: u64) -> Result<u64, VfsError>;
     fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
     fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
-    /// Legacy pointer-path statx; prefer `statx_path`.
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError>;
     fn statx_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
         Err(VfsError::InvalidPath)
     }
@@ -250,10 +246,6 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
 }
 
 impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        Err(VfsError::InvalidPath)
-    }
 
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         self.route_by_path_bytes(path).openat_path(path)
@@ -271,10 +263,6 @@ impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
         self.route_by_fd(fd).write(fd, len)
     }
 
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let _ = path_ptr;
-        Err(VfsError::InvalidPath)
-    }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         self.route_by_path_bytes(path).statx_path(path)
@@ -328,9 +316,6 @@ impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
 }
 
 impl VfsBackend for InMemoryBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        self.alloc_fd(path_ptr)
-    }
 
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         if path.is_empty() {
@@ -362,9 +347,6 @@ impl VfsBackend for InMemoryBackend {
         Ok(len)
     }
 
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        Ok(path_ptr)
-    }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         if path.is_empty() {
