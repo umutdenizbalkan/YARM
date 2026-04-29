@@ -18,7 +18,7 @@ use yarm_ipc_abi::socket_abi::{
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, VFS_CODEC_V1_VERSION};
 use yarm_ipc_abi::vfs_abi::{
-    StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL,
+    OpenAtInlinePath, StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL,
     VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ,
     VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
 };
@@ -555,6 +555,30 @@ fn pack_statx(dirfd: usize, path_ptr: usize, flags: usize, mask: usize) -> [u8; 
     StatxArgs::new(dirfd as u64, path_ptr as u64, flags as u64, mask as u64).encode()
 }
 
+const POSIX_OPENAT_PATH_MAX: usize = 256;
+
+fn read_user_cstr_path(kernel: &KernelState, user_ptr: usize) -> Result<[u8; POSIX_OPENAT_PATH_MAX], PosixErrno> {
+    let tid = kernel.current_tid().ok_or(PosixErrno::NoSys)?;
+    let mut out = [0u8; POSIX_OPENAT_PATH_MAX];
+    for (idx, slot) in out.iter_mut().enumerate() {
+        let bytes = kernel
+            .read_user_memory(tid, user_ptr + idx, 1)
+            .map_err(|_| PosixErrno::Inval)?;
+        let ch = bytes[0];
+        if ch == 0 {
+            return Ok(out);
+        }
+        *slot = ch;
+    }
+    Err(PosixErrno::Inval)
+}
+
+fn find_nul(path: &[u8; POSIX_OPENAT_PATH_MAX]) -> Result<usize, PosixErrno> {
+    path.iter()
+        .position(|b| *b == 0)
+        .ok_or(PosixErrno::Inval)
+}
+
 impl KernelState {
     fn current_posix_asid(&self) -> Result<Asid, PosixErrno> {
         let tid = self.current_tid().ok_or(PosixErrno::NoSys)?;
@@ -805,13 +829,18 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
             }
             PosixCompatSyscall::Openat => {
                 let mut ipc = KernelStateIpcTransport { kernel };
-                let payload = pack_vfs4(
-                    frame.arg(LINUX_ARG0),
-                    frame.arg(LINUX_ARG1),
-                    frame.arg(LINUX_ARG2),
-                    frame.arg(LINUX_ARG3),
-                );
-                bindings.send_vfs_request(&mut ipc, VFS_OP_OPENAT, &payload)?;
+                let path_buf = read_user_cstr_path(kernel, frame.arg(LINUX_ARG1))?;
+                let path_len = find_nul(&path_buf)?;
+                let path = &path_buf[..path_len];
+                let (payload, payload_len) = OpenAtInlinePath {
+                    dirfd: frame.arg(LINUX_ARG0) as u64,
+                    flags: frame.arg(LINUX_ARG2) as u64,
+                    mode: frame.arg(LINUX_ARG3) as u64,
+                    path,
+                }
+                .encode()
+                .ok_or(PosixErrno::Inval)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_OPENAT, &payload[..payload_len])?;
                 let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
@@ -1426,12 +1455,18 @@ mod tests {
                 .expect("seed reply");
         }
 
+        state
+            .write_user_memory(0, 0x2000, b"/dev/console\0")
+            .expect("seed openat path");
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [3, 0x2000, 0x10, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut openat);
         assert_eq!(openat.error_code(), None);
         assert_eq!(openat.ret0(), 42);
         let open_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(open_req.opcode, VFS_OP_OPENAT);
+        let decoded_open = OpenAtInlinePath::decode(open_req.as_slice()).expect("decode inline");
+        assert_eq!(decoded_open.dirfd, 3);
+        assert_eq!(decoded_open.path, b"/dev/console");
 
         let mut close = TrapFrame::new(LINUX_NR_CLOSE, [42, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut close);
@@ -1883,6 +1918,9 @@ mod tests {
         assert_eq!(getpid.error_code(), None);
         assert_eq!(getpid.ret0(), 42);
 
+        state
+            .write_user_memory(0, 0x2000, b"/tmp/demo\0")
+            .expect("seed openat path");
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x2000, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut openat);
         assert_eq!(openat.error_code(), None);
@@ -2012,6 +2050,9 @@ mod tests {
             .handle_trap_event(crate::kernel::trap::TrapEvent::ExternalInterrupt(9), None)
             .expect("irq");
 
+        state
+            .write_user_memory(0, 0x1234, b"/var/log/boot\0")
+            .expect("seed openat path");
         let mut openat = TrapFrame::new(LINUX_NR_OPENAT, [0, 0x1234, 0, 0, 0, 0]);
         dispatch(&mut state, &bindings, &mut openat);
         assert_eq!(openat.ret0(), 11);
