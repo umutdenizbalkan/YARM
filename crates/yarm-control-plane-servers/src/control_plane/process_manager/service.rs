@@ -11,7 +11,8 @@ use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcess
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
-    PROC_OP_SPAWN_V4, PROC_OP_WAITPID_V2, SpawnV2Args, SpawnV3Args, SpawnV4Args, WaitPidV2Args,
+    PROC_OP_SPAWN_V4, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2, SpawnV2Args, SpawnV3Args,
+    SpawnV4Args, WaitPidV2Args,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
@@ -727,6 +728,9 @@ impl ProcessService {
                     target_pid: ProcessId(args.target_pid),
                 }))
             }
+            // Guarded ABI skeleton:
+            // authoritative restart-token lookup is not yet available in runtime process-manager path.
+            PROC_OP_TASK_RESTART_TOKEN => Err(ProcessManagerError::Unsupported),
             _ => Err(ProcessManagerError::Unsupported),
         }
     }

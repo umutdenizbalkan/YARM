@@ -416,6 +416,21 @@ mod tests {
         assert_eq!(ProcV4Args::ENCODED_LEN, 32);
         assert_eq!(SpawnV4Args::VERSION, PROC_CODEC_V4_VERSION);
         assert_eq!(PROC_OP_SPAWN_V4, 7);
+        assert_eq!(PROC_OP_TASK_RESTART_TOKEN, 8);
+    }
+
+    #[test]
+    fn task_restart_token_codec_roundtrip() {
+        let req = TaskRestartTokenRequest::new(42);
+        assert_eq!(TaskRestartTokenRequest::decode(&req.encode()), Ok(req));
+
+        let found = TaskRestartTokenReply::new(true, 0xAA55);
+        assert_eq!(TaskRestartTokenReply::decode(&found.encode()), Ok(found));
+        assert_eq!(found.found_token(), Some(0xAA55));
+
+        let missing = TaskRestartTokenReply::new(false, 0);
+        assert_eq!(TaskRestartTokenReply::decode(&missing.encode()), Ok(missing));
+        assert_eq!(missing.found_token(), None);
     }
 
     #[test]
