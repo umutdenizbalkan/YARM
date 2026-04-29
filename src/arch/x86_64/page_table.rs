@@ -411,6 +411,11 @@ fn bootstrap_higher_half_alias(addr: u64) -> Option<u64> {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), not(test)))]
+#[allow(dead_code)]
+// Kept for diagnostic / debugging use. Active call sites were removed when
+// the kernel transitioned to the higher-half PML4[511] direct map; mutating
+// PML4[0] of a user ASID at switch time was racy and is no longer needed
+// because PML4[511] is already cloned into every user root.
 fn clone_low_alias_page_from_live_root(
     state: &mut PageTableState,
     live_root_phys: u64,
@@ -771,139 +776,59 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             target_gdt_ok,
             target_tss_ok
         );
-        if (!target_rip_raw_ok
-            || !target_rsp_raw_ok
-            || !target_idt_ok
-            || !target_gdt_ok
-            || !target_tss_ok)
-            && target_rip_hi_ok
-            && target_rsp_hi_ok
-        {
-            let mut state = PAGE_TABLE_STATE.lock();
-            let target_root_phys = state
-                .asid_root_phys(asid)
-                .ok_or(PageTableError::InvalidAddress)?;
+        // The kernel image runs at the higher-half alias (PML4[511] direct
+        // map) which is cloned into every user ASID via
+        // clone_kernel_pml4_half_into_root. Once the BSP has transitioned out
+        // of the linker-identity PML4[0] window during long_mode_entry, RIP,
+        // RSP, IDT, GDT and TSS are ALL within PML4[511] and survive the CR3
+        // switch unmodified.
+        //
+        // The `clone_low_alias_page_from_live_root` patching that previously
+        // lived here was a workaround for the kernel running at low VAs; it
+        // mutated PML4[0] of the user ASID at switch time, racing with other
+        // CPUs and risking inconsistent kernel mappings. We now keep it as a
+        // diagnostic-only fallback that engages ONLY when the kernel is
+        // detected to be running at a non-canonical-high RIP - i.e. the boot
+        // transition is somehow incomplete - and we error out instead of
+        // silently scribbling into the user PML4[0].
+        let running_higher_half = (rip & (1u64 << 63)) != 0;
+        if !running_higher_half {
             crate::yarm_log!(
-                "ASID_SWITCH_MIN_LOW_ALIAS_BEGIN asid={} live_root=0x{:x} target_root=0x{:x}",
+                "ASID_SWITCH_LOW_HALF_KERNEL_DETECTED asid={} rip=0x{:x}",
                 asid.0,
-                live_root,
-                target_root_phys
+                rip
             );
-            clone_low_alias_page_from_live_root(
-                &mut state,
-                live_root,
-                target_root_phys,
-                VirtAddr(rip),
-            )?;
-            clone_low_alias_page_from_live_root(
-                &mut state,
-                live_root,
-                target_root_phys,
-                VirtAddr(rsp_probe),
-            )?;
-            clone_low_alias_page_from_live_root(
-                &mut state,
-                live_root,
-                target_root_phys,
-                VirtAddr(rsp),
-            )?;
-            if idt_base != 0 {
-                clone_low_alias_page_from_live_root(
-                    &mut state,
-                    live_root,
-                    target_root_phys,
-                    VirtAddr(idt_base),
-                )?;
-            }
-            if gdt_base != 0 {
-                clone_low_alias_page_from_live_root(
-                    &mut state,
-                    live_root,
-                    target_root_phys,
-                    VirtAddr(gdt_base),
-                )?;
-            }
-            if tss_base != 0 {
-                clone_low_alias_page_from_live_root(
-                    &mut state,
-                    live_root,
-                    target_root_phys,
-                    VirtAddr(tss_base),
-                )?;
-            }
-            drop(state);
-            let target_rip_raw_after = resolve_page(asid, VirtAddr(rip)).is_some();
-            let target_rsp_raw_after = resolve_page(asid, VirtAddr(rsp_probe)).is_some();
-            let target_idt_after =
-                idt_base != 0 && resolve_page(asid, VirtAddr(idt_base)).is_some();
-            let target_gdt_after =
-                gdt_base != 0 && resolve_page(asid, VirtAddr(gdt_base)).is_some();
-            let target_tss_after =
-                tss_base != 0 && resolve_page(asid, VirtAddr(tss_base)).is_some();
-            crate::yarm_log!(
-                "ASID_SWITCH_MIN_LOW_ALIAS_DONE asid={} target_raw_after[rip={},rsp={}] desc_after[idt={},gdt={},tss={}]",
-                asid.0,
-                target_rip_raw_after,
-                target_rsp_raw_after,
-                target_idt_after,
-                target_gdt_after,
-                target_tss_after
-            );
-            log_root_chain(target_root_phys, "target_rip_after", VirtAddr(rip));
-            log_root_chain(target_root_phys, "target_rsp_after", VirtAddr(rsp_probe));
-            if idt_base != 0 {
-                log_root_chain(target_root_phys, "target_idt_after", VirtAddr(idt_base));
-            }
-            if gdt_base != 0 {
-                log_root_chain(target_root_phys, "target_gdt_after", VirtAddr(gdt_base));
-            }
-            if tss_base != 0 {
-                log_root_chain(target_root_phys, "target_tss_after", VirtAddr(tss_base));
-            }
+            return Err(PageTableError::InvalidAddress);
         }
-        let mut rip_at_switch: u64 = 0;
-        unsafe {
-            core::arch::asm!("lea {}, [rip + 0]", out(reg) rip_at_switch, options(nostack, preserves_flags));
-        }
-        let rip_at_switch_ok = resolve_page(asid, VirtAddr(rip_at_switch)).is_some();
+
+        // Use the AUTHORITATIVE CR3 walk (resolve_page_in_root) for the
+        // mapping-presence check, NOT the kernel-state walker
+        // (resolve_page). Reasoning:
+        //
+        //   - The static boot page tables (boot_pml4, boot_pdpt_direct,
+        //     boot_pd, boot_pt0, boot_pd_hi) are declared in asm and live
+        //     at fixed PAs decided by the linker. They are NOT registered
+        //     with PageTableState, which only tracks kernel-allocated PT
+        //     pages.
+        //   - Every user ASID's PML4 has its [256..512] entries cloned
+        //     from the canonical kernel root, so its kernel-half walks
+        //     reuse the static boot tables. resolve_page therefore finds
+        //     no entry for any kernel-half VA in a user ASID and returns
+        //     None -- a false negative.
+        //   - resolve_page_in_root walks the actual page-table tree at
+        //     the given root_phys via bootstrap_higher_half_alias reads,
+        //     so it correctly resolves through the static boot tables.
+        let rip_ok = target_rip_raw_ok;
+        let rsp_ok = target_rsp_raw_ok;
         crate::yarm_log!(
-            "ASID_SWITCH_EXEC_RIP asid={} rip_at_switch=0x{:x} ok={}",
-            asid.0,
-            rip_at_switch,
-            rip_at_switch_ok
-        );
-        if !rip_at_switch_ok {
-            let mut state = PAGE_TABLE_STATE.lock();
-            let target_root_phys = state
-                .asid_root_phys(asid)
-                .ok_or(PageTableError::InvalidAddress)?;
-            clone_low_alias_page_from_live_root(
-                &mut state,
-                live_root,
-                target_root_phys,
-                VirtAddr(rip_at_switch),
-            )?;
-            drop(state);
-            log_root_chain(
-                target_root_phys,
-                "target_rip_switch_after",
-                VirtAddr(rip_at_switch),
-            );
-        }
-        let rip_ok = resolve_page(asid, VirtAddr(rip)).is_some();
-        let rsp_ok = resolve_page(asid, VirtAddr(rsp_probe)).is_some();
-        let rip_switch_ok = resolve_page(asid, VirtAddr(rip_at_switch)).is_some();
-        crate::yarm_log!(
-            "ASID_SWITCH_PRECHECK asid={} rip=0x{:x} rip_ok={} rsp=0x{:x} rsp_ok={} rip_switch=0x{:x} rip_switch_ok={}",
+            "ASID_SWITCH_PRECHECK asid={} rip=0x{:x} rip_ok={} rsp=0x{:x} rsp_ok={}",
             asid.0,
             rip,
             rip_ok,
             rsp,
-            rsp_ok,
-            rip_at_switch,
-            rip_switch_ok
+            rsp_ok
         );
-        if !rip_ok || !rsp_ok || !rip_switch_ok {
+        if !rip_ok || !rsp_ok {
             crate::yarm_log!(
                 "ASID_SWITCH_ABORT asid={} reason=kernel_mapping_missing",
                 asid.0
