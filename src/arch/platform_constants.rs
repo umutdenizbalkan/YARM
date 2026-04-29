@@ -16,4 +16,5 @@ pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 =
 
 pub const KERNEL_BOOTSTRAP_VIRT_BASE: u64 = super::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
 pub const KERNEL_BOOTSTRAP_PHYS_BASE: u64 = super::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
+pub const KERNEL_LINK_VIRT_BASE: u64 = super::platform_layout::KERNEL_LINK_VIRT_BASE;
 pub const NEXT_ANON_PHYS_BASE: u64 = super::platform_layout::NEXT_ANON_PHYS_BASE;
