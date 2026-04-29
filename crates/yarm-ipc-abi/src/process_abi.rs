@@ -20,6 +20,61 @@ pub const PROC_OP_SPAWN_V3: u16 = 6;
 pub const PROC_OP_SPAWN_V4: u16 = 7;
 pub const PROC_OP_TASK_RESTART_TOKEN: u16 = 8;
 pub const PROC_OP_REGISTER_SUPERVISED_TASK: u16 = 9;
+pub const PROC_OP_EXECUTE_RESTART: u16 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecuteRestartRequest {
+    pub tid: u64,
+    pub restart_token: u64,
+}
+
+impl ExecuteRestartRequest {
+    pub const fn new(tid: u64, restart_token: u64) -> Self {
+        Self { tid, restart_token }
+    }
+    pub fn encode(self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.tid.to_le_bytes());
+        out[8..16].copy_from_slice(&self.restart_token.to_le_bytes());
+        out
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() < 16 {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut tid = [0u8; 8];
+        let mut token = [0u8; 8];
+        tid.copy_from_slice(&payload[..8]);
+        token.copy_from_slice(&payload[8..16]);
+        Ok(Self::new(u64::from_le_bytes(tid), u64::from_le_bytes(token)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecuteRestartReply {
+    pub status: u8,
+}
+
+impl ExecuteRestartReply {
+    pub const STATUS_OK: u8 = 0;
+    pub const STATUS_NOT_FOUND: u8 = 1;
+    pub const STATUS_TOKEN_MISMATCH: u8 = 2;
+    pub const STATUS_PERMISSION_DENIED: u8 = 3;
+    pub const STATUS_INTERNAL_UNSUPPORTED: u8 = 255;
+
+    pub const fn new(status: u8) -> Self {
+        Self { status }
+    }
+    pub const fn encode(self) -> [u8; 1] {
+        [self.status]
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.is_empty() {
+            return Err(ProcCodecError::Malformed);
+        }
+        Ok(Self::new(payload[0]))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegisterSupervisedTask {
@@ -449,6 +504,7 @@ mod tests {
         assert_eq!(PROC_OP_SPAWN_V4, 7);
         assert_eq!(PROC_OP_TASK_RESTART_TOKEN, 8);
         assert_eq!(PROC_OP_REGISTER_SUPERVISED_TASK, 9);
+        assert_eq!(PROC_OP_EXECUTE_RESTART, 10);
     }
 
     #[test]
@@ -469,6 +525,14 @@ mod tests {
     fn register_supervised_task_codec_roundtrip() {
         let reg = RegisterSupervisedTask::new(7, 99);
         assert_eq!(RegisterSupervisedTask::decode(&reg.encode()), Ok(reg));
+    }
+
+    #[test]
+    fn execute_restart_codec_roundtrip() {
+        let req = ExecuteRestartRequest::new(9, 44);
+        assert_eq!(ExecuteRestartRequest::decode(&req.encode()), Ok(req));
+        let rep = ExecuteRestartReply::new(ExecuteRestartReply::STATUS_NOT_FOUND);
+        assert_eq!(ExecuteRestartReply::decode(&rep.encode()), Ok(rep));
     }
 
     #[test]

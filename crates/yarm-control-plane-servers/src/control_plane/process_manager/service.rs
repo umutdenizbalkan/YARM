@@ -11,6 +11,7 @@ use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcess
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
+    ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART,
     PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V4, PROC_OP_TASK_RESTART_TOKEN,
     PROC_OP_WAITPID_V2, RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args,
     TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args,
@@ -110,6 +111,7 @@ pub enum ProcessRequest {
     WaitPidV2(WaitPidV2Request),
     TaskRestartToken { tid: u64 },
     RegisterSupervisedTask { tid: u64, restart_token: u64 },
+    ExecuteRestart { tid: u64, restart_token: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,6 +754,14 @@ impl ProcessService {
                     restart_token: args.restart_token,
                 })
             }
+            PROC_OP_EXECUTE_RESTART => {
+                let args = ExecuteRestartRequest::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                Ok(ProcessRequest::ExecuteRestart {
+                    tid: args.tid,
+                    restart_token: args.restart_token,
+                })
+            }
             _ => Err(ProcessManagerError::Unsupported),
         }
     }
@@ -943,6 +953,16 @@ impl ProcessService {
             ProcessRequest::RegisterSupervisedTask { tid, restart_token } => {
                 self.record_restart_token(tid, restart_token)?;
                 Self::u64_reply(PROC_OP_REGISTER_SUPERVISED_TASK, 0)
+            }
+            ProcessRequest::ExecuteRestart { tid, restart_token } => {
+                let status = match self.restart_token_for_tid(tid) {
+                    None => ExecuteRestartReply::STATUS_NOT_FOUND,
+                    Some(token) if token != restart_token => ExecuteRestartReply::STATUS_TOKEN_MISMATCH,
+                    Some(_) => ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED,
+                };
+                let reply = ExecuteRestartReply::new(status);
+                Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &reply.encode())
+                    .map_err(|_| ProcessManagerError::Malformed)
             }
         }
     }
@@ -1560,5 +1580,45 @@ mod tests {
         let reply_msg = service.handle(lookup).expect("lookup reply");
         let reply = TaskRestartTokenReply::decode(reply_msg.as_slice()).expect("decode");
         assert_eq!(reply.found_token(), Some(0xDEAD));
+    }
+
+    #[test]
+    fn execute_restart_returns_truthful_statuses_and_unsupported_backend() {
+        let mut service = ProcessService::new();
+        let call = |service: &mut ProcessService, tid: u64, token: u64| {
+            let req = Message::with_header(
+                0,
+                PROC_OP_EXECUTE_RESTART,
+                0,
+                None,
+                &ExecuteRestartRequest::new(tid, token).encode(),
+            )
+            .expect("request");
+            let reply_msg = service.handle(req).expect("reply");
+            ExecuteRestartReply::decode(reply_msg.as_slice())
+                .expect("decode")
+                .status
+        };
+
+        assert_eq!(call(&mut service, 9, 1), ExecuteRestartReply::STATUS_NOT_FOUND);
+
+        let register = Message::with_header(
+            0,
+            PROC_OP_REGISTER_SUPERVISED_TASK,
+            0,
+            None,
+            &RegisterSupervisedTask::new(9, 77).encode(),
+        )
+        .expect("register");
+        let _ = service.handle(register).expect("register reply");
+
+        assert_eq!(
+            call(&mut service, 9, 12),
+            ExecuteRestartReply::STATUS_TOKEN_MISMATCH
+        );
+        assert_eq!(
+            call(&mut service, 9, 77),
+            ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED
+        );
     }
 }

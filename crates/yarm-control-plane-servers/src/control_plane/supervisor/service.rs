@@ -25,6 +25,7 @@ use yarm_ipc_abi::supervisor_abi::{
 };
 #[cfg(not(test))]
 use yarm_ipc_abi::process_abi::{
+    ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART,
     PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_TASK_RESTART_TOKEN, RegisterSupervisedTask,
     TaskRestartTokenReply, TaskRestartTokenRequest,
 };
@@ -1180,11 +1181,24 @@ pub fn run() {
                                             };
                                             match supervisor.handle_task_exit(&mut ops, event) {
                                                 Ok(SupervisorDecision::ScheduledRestart { tid, due_tick, .. }) => {
-                                                    yarm_user_rt::user_log!(
-                                                        "supervisor.srv restart scheduled but runtime execution path is unsupported: tid={}, due_tick={}",
+                                                    match execute_restart_via_process_manager(
+                                                        &mut transport,
+                                                        process_manager_caps,
                                                         tid,
-                                                        due_tick.0
-                                                    );
+                                                        restart_token,
+                                                    ) {
+                                                        Ok(status) => yarm_user_rt::user_log!(
+                                                            "supervisor.srv execute-restart reply: tid={}, due_tick={}, status={}",
+                                                            tid,
+                                                            due_tick.0,
+                                                            status
+                                                        ),
+                                                        Err(err) => yarm_user_rt::user_log!(
+                                                            "supervisor.srv execute-restart request failed: tid={}, err={:?}",
+                                                            tid,
+                                                            err
+                                                        ),
+                                                    }
                                                 }
                                                 Ok(_) => {}
                                                 Err(err) => yarm_user_rt::user_log!(
@@ -1303,6 +1317,33 @@ fn register_supervised_task_with_process_manager(
         .recv(rep_cap)
         .map_err(|_| KernelError::WrongObject)?;
     Ok(())
+}
+
+#[cfg(not(test))]
+fn execute_restart_via_process_manager(
+    transport: &mut impl IpcTransport,
+    process_manager_caps: Option<(u32, u32)>,
+    tid: u64,
+    restart_token: u64,
+) -> Result<u8, KernelError> {
+    let Some((req_cap, rep_cap)) = process_manager_caps else {
+        return Ok(ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED);
+    };
+    let req = ExecuteRestartRequest::new(tid, restart_token);
+    let msg = Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &req.encode())
+        .map_err(|_| KernelError::WrongObject)?;
+    transport
+        .send(req_cap, &msg)
+        .map_err(|_| KernelError::WrongObject)?;
+    let Some(reply_msg) = transport
+        .recv(rep_cap)
+        .map_err(|_| KernelError::WrongObject)?
+    else {
+        return Ok(ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED);
+    };
+    let reply = ExecuteRestartReply::decode(reply_msg.as_slice())
+        .map_err(|_| KernelError::WrongObject)?;
+    Ok(reply.status)
 }
 
 #[cfg(not(test))]
