@@ -27,7 +27,7 @@ const AP_TRAMPOLINE_SIZE: usize = crate::kernel::vm::PAGE_SIZE;
 const AP_HANDOFF_OFFSET: usize = 0x100;
 const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 const AP_STACK_BYTES: usize = 16 * 1024;
-const AP_STACK_PHYS_BASE: u64 = 0x0180_0000; // 24 MiB, safely inside low RAM.
+const AP_STACK_PHYS_BASE: u64 = 0x0200_0000; // 32 MiB; kept in sync with boot.rs.
 const BOOTSTRAP_LOW_IDENTITY_BYTES: u64 = 64 * 1024 * 1024;
 // APs switch to paging before loading RSP from handoff. Use the higher-half
 // direct-map VA for AP stacks instead of a low identity VA (e.g. 0x2000_0000),
@@ -71,11 +71,29 @@ yarm_ap_trampoline_start:
     mov ss, ax
     mov sp, 0x6ff0
 
+    // Diagnostic: AP reached real mode, write 'a' to UART (uses no
+    // segments other than implicit string default; out instruction
+    // doesn't depend on memory layout).
+    mov dx, 0x3F8
+    mov al, 'a'
+    out dx, al
+
     call 1f
 1:
     pop si
     sub si, AP_OFF_REAL_L1
-    lgdt [si + AP_OFF_GDTR]
+    // Real-mode default segment for [si+disp] is DS, but DS is zeroed
+    // above so DS:(si+disp) = (0+0+AP_OFF_GDTR) reads garbage at PA
+    // 0x19 instead of the GDTR descriptor at PA 0x7000+AP_OFF_GDTR.
+    // Force the segment override to CS, which the SIPI vector left
+    // at 0x0700 (base 0x7000), so the operand resolves to the real
+    // location of the descriptor.
+    cs lgdt [si + AP_OFF_GDTR]
+
+    // Diagnostic: AP loaded GDTR.
+    mov dx, 0x3F8
+    mov al, 'b'
+    out dx, al
 
     mov eax, cr0
     or eax, 1
@@ -94,6 +112,11 @@ yarm_ap_trampoline_start:
     mov ds, ax
     mov es, ax
     mov ss, ax
+
+    // Diagnostic: AP entered 32-bit pmode.
+    mov dx, 0x3F8
+    mov al, 'c'
+    out dx, al
 
     call 5f
 5:
@@ -115,6 +138,13 @@ yarm_ap_trampoline_start:
     mov eax, cr0
     or eax, 0x80000000
     mov cr0, eax
+
+    // Diagnostic: AP enabled paging+long mode (still 32-bit instruction
+    // semantics until the next far jump).
+    mov dx, 0x3F8
+    mov al, 'd'
+    out dx, al
+
     .byte 0xEA
         .long AP_TRAMPOLINE_BASE + (6f - yarm_ap_trampoline_start)
     .word 0x10
@@ -125,6 +155,13 @@ yarm_ap_trampoline_start:
     mov ds, ax
     mov es, ax
     mov ss, ax
+
+    // Diagnostic: AP in 64-bit mode at low VA (RIP still =0x70xx since
+    // the far jump used a low offset).  Out is fine here since CR3 maps
+    // PML4[0] for low identity.
+    mov dx, 0x3F8
+    mov al, 'e'
+    out dx, al
 
     lea rbx, [rip + yarm_ap_trampoline_start]
     mov rsp, [rbx + AP_OFF_HANDOFF + 8]
