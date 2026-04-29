@@ -674,6 +674,14 @@ fn log_pvh_boot_metadata(start_info_ptr: usize) {
     }
     write_line("PVH: magic OK");
     if let Some(summary) = read_pvh_module_summary(start_info_ptr) {
+        if let Some(window) = summary.initramfs {
+            let len = window.end.saturating_sub(window.start) as usize;
+            if len > 0 {
+                // SAFETY: PVH module window is immutable boot-provided memory.
+                let bytes = unsafe { core::slice::from_raw_parts(window.start as *const u8, len) };
+                yarm_fs_servers::initramfs::install_boot_initrd_bytes(bytes);
+            }
+        }
         crate::yarm_log!(
             "YARM_BOOT_PVH_MODULES total={} initramfs_start=0x{:x} initramfs_end=0x{:x}",
             summary.module_count,

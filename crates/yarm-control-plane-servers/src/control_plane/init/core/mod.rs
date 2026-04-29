@@ -17,7 +17,7 @@ use yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
 use yarm_fs_servers::ext4::{EXT4_DEMO_PATH, Ext4Backend, Ext4Service};
 use yarm_fs_servers::fat::{FatBackend, FatService};
 use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
-use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
+use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService, boot_initrd_bytes};
 use yarm_fs_servers::ramfs::{RAMFS_BOOT_PATH, RamFsBackend, RamFsService};
 #[cfg(test)]
 use yarm_ipc_abi::supervisor_abi::{
@@ -1103,7 +1103,12 @@ fn run_mount_service(kind: MountServiceKind) -> Result<(), KernelError> {
 }
 
 fn run_mount_initramfs() -> Result<(), KernelError> {
-    let mut service = Box::new(InitramfsService::with_backend(InitramfsBackend::new(4096)));
+    let backend = if let Some(bytes) = boot_initrd_bytes() {
+        InitramfsBackend::from_cpio_newc_static(bytes)
+    } else {
+        InitramfsBackend::new(4096)
+    };
+    let mut service = Box::new(InitramfsService::with_backend(backend));
     let summary =
         run_initramfs_request_loop(service.as_mut()).map_err(|_| KernelError::WrongObject)?;
     if summary.write_allowed {

@@ -1103,6 +1103,14 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                         && initrd_end > initrd_start
                         && reserved_len < reserved.len()
                     {
+                        let initrd_len = initrd_end.saturating_sub(initrd_start) as usize;
+                        if initrd_len > 0 {
+                            // SAFETY: DTB-provided initrd physical window is immutable boot memory.
+                            let bytes = unsafe {
+                                core::slice::from_raw_parts(initrd_start as *const u8, initrd_len)
+                            };
+                            yarm_fs_servers::initramfs::install_boot_initrd_bytes(bytes);
+                        }
                         reserved[reserved_len] = (
                             initrd_start & !(page - 1),
                             align_up_u64(initrd_end, page).unwrap_or(initrd_start),

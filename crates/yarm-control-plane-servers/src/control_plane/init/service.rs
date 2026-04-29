@@ -29,7 +29,7 @@ use yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
 #[cfg(test)]
 use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
 #[cfg(test)]
-use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService};
+use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService, boot_initrd_bytes};
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 
@@ -178,7 +178,12 @@ pub fn run_minimum_profile_with_kernel(
     let devfs_summary = run_devfs_request_loop(&mut devfs).map_err(|_| KernelError::WrongObject)?;
     let devfs_open_opcode = VFS_OP_OPENAT;
 
-    let mut initramfs = InitramfsService::with_backend(InitramfsBackend::new(4096));
+    let initramfs_backend = if let Some(bytes) = boot_initrd_bytes() {
+        InitramfsBackend::from_cpio_newc_static(bytes)
+    } else {
+        InitramfsBackend::new(4096)
+    };
+    let mut initramfs = InitramfsService::with_backend(initramfs_backend);
     let initramfs_summary =
         run_initramfs_request_loop(&mut initramfs).map_err(|_| KernelError::WrongObject)?;
     let initramfs_read_opcode = VFS_OP_READ;
