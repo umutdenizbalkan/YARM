@@ -18,7 +18,7 @@ use yarm_ipc_abi::socket_abi::{
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, VFS_CODEC_V1_VERSION};
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtInlinePath, StatxArgs, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL,
+    OpenAtInlinePath, StatxArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL,
     VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ,
     VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VFS_SERVER_ABI_VERSION, VfsV1Args,
 };
@@ -982,13 +982,18 @@ pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame
             }
             PosixCompatSyscall::Statx => {
                 let mut ipc = KernelStateIpcTransport { kernel };
-                let payload = pack_statx(
-                    frame.arg(LINUX_ARG0),
-                    frame.arg(LINUX_ARG1),
-                    frame.arg(LINUX_ARG2),
-                    frame.arg(LINUX_ARG3),
-                );
-                bindings.send_vfs_request(&mut ipc, VFS_OP_STATX, &payload)?;
+                let path_buf = read_user_cstr_path(kernel, frame.arg(LINUX_ARG1))?;
+                let path_len = find_nul(&path_buf)?;
+                let path = &path_buf[..path_len];
+                let (payload, payload_len) = StatxInlinePath {
+                    dirfd: frame.arg(LINUX_ARG0) as u64,
+                    flags: frame.arg(LINUX_ARG2) as u64,
+                    mask_or_buf: frame.arg(LINUX_ARG3) as u64,
+                    path,
+                }
+                .encode()
+                .ok_or(PosixErrno::Inval)?;
+                bindings.send_vfs_request(&mut ipc, VFS_OP_STATX, &payload[..payload_len])?;
                 let reply = bindings.recv_vfs_reply(&mut ipc)?.ok_or(PosixErrno::NoSys)?;
                 decode_u64_reply(reply.as_slice())
             }
@@ -1544,13 +1549,19 @@ mod tests {
         assert_eq!(sendfile_req.as_slice().len(), 32);
         assert_eq!(&sendfile_req.as_slice()[24..32], &(99u64).to_le_bytes());
 
+        state
+            .write_user_memory(0, 0xD000, b"/etc/hosts ")
+            .expect("seed statx path");
         let mut statx = TrapFrame::new(LINUX_NR_STATX, [3, 0xD000, 0, 0xE000, 0, 0]);
         dispatch(&mut state, &bindings, &mut statx);
         assert_eq!(statx.error_code(), None);
         let statx_req = state.ipc_recv(req_recv).expect("req").expect("msg");
         assert_eq!(statx_req.opcode, VFS_OP_STATX);
-        assert_eq!(statx_req.as_slice().len(), 32);
-        assert_eq!(&statx_req.as_slice()[8..16], &(0xD000u64).to_le_bytes());
+        let decoded_statx = StatxInlinePath::decode(statx_req.as_slice()).expect("decode inline");
+        assert_eq!(decoded_statx.dirfd, 3);
+        assert_eq!(decoded_statx.flags, 0);
+        assert_eq!(decoded_statx.mask_or_buf, 0xE000);
+        assert_eq!(decoded_statx.path, b"/etc/hosts");
     }
 
     #[test]
@@ -2064,6 +2075,26 @@ mod tests {
         assert_eq!(proc_req.opcode, PROC_OP_GETPID);
         assert_eq!(vfs_req.opcode, VFS_OP_OPENAT);
         assert_eq!(notif.opcode, 9);
+    }
+
+
+    #[test]
+    fn posix_dispatch_statx_rejects_unterminated_path() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut bindings = PosixServiceBindings::default();
+        let (_req_ep, req_send, req_recv) = state.create_endpoint(4).expect("vfs req ep");
+        let (_rep_ep, _rep_send, rep_recv) = state.create_endpoint(4).expect("vfs rep ep");
+        bindings
+            .register_vfs_manager(&state, req_send, rep_recv)
+            .expect("register vfs");
+
+        state
+            .write_user_memory(0, 0x5000, &[b'a'; POSIX_OPENAT_PATH_MAX])
+            .expect("seed unterminated path");
+        let mut statx = TrapFrame::new(LINUX_NR_STATX, [0, 0x5000, 0, 0, 0, 0]);
+        dispatch(&mut state, &bindings, &mut statx);
+        assert_eq!(statx.error_code(), Some(EINVAL));
+        assert!(state.ipc_recv(req_recv).expect("recv").is_none());
     }
 
     #[test]
