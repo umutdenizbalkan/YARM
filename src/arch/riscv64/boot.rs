@@ -124,6 +124,50 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     run(&mut kernel);
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn prepare_arch_boot(start_info_ptr: usize) {
+    let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) else {
+        return;
+    };
+    let Some(parsed) = crate::arch::aarch64::dtb::parse_boot_dtb(dtb) else {
+        return;
+    };
+    if let (Some(initrd_start), Some(initrd_end)) = (parsed.initrd_start, parsed.initrd_end)
+        && initrd_start != 0
+        && initrd_end > initrd_start
+    {
+        let len = initrd_end.saturating_sub(initrd_start) as usize;
+        if len > 0 {
+            // SAFETY: DTB-provided initrd range refers to immutable boot memory.
+            let bytes = unsafe { core::slice::from_raw_parts(initrd_start as *const u8, len) };
+            yarm_fs_servers::initramfs::install_boot_initrd_bytes(bytes);
+            crate::yarm_log!(
+                "YARM_RISCV64_INITRD handoff start=0x{:x} end=0x{:x}",
+                initrd_start,
+                initrd_end
+            );
+        }
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn dtb_slice_from_start_info(start_info_ptr: usize) -> Option<&'static [u8]> {
+    if start_info_ptr == 0 {
+        return None;
+    }
+    let magic_be = unsafe { core::ptr::read_unaligned(start_info_ptr as *const u32) };
+    if u32::from_be(magic_be) != 0xd00dfeed {
+        return None;
+    }
+    let total_size_be = unsafe { core::ptr::read_unaligned((start_info_ptr + 4) as *const u32) };
+    let total_size = u32::from_be(total_size_be) as usize;
+    if !(40..=2 * 1024 * 1024).contains(&total_size) {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(start_info_ptr as *const u8, total_size) })
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "riscv64")))]
 pub fn prepare_arch_boot(_start_info_ptr: usize) {}
 
 pub fn emit_panic(_info: &core::panic::PanicInfo<'_>) {}
