@@ -88,6 +88,11 @@ Delivery convention:
   4. Use successful lookup to construct `TaskExitedEvent { tid, synthetic_exit_code, restart_token }` in production path and route it through existing supervisor restart policy handling.
   5. Add end-to-end runtime tests validating fault report -> token lookup -> restart scheduling behavior.
 
+Current gap detail:
+
+- Process-manager spawn handling currently allocates/stores process-level metadata (pid/image/policy), but does not receive authoritative `(tid, restart_token)` data in that path yet.
+- Supervised-task registration/restart-policy handoff is the missing lifecycle source that must supply `(tid, restart_token)` to process-manager before truthful population can occur.
+
 ## Remaining blockers / future work
 
 1. Replace production `NoSys` POSIX branches with explicit runtime abstractions.

@@ -883,6 +883,11 @@ impl ProcessService {
                     let image = synthetic_elf_image(req.image_id);
                     let info = ElfImageInfo::parse(req.image_id, &image).map_err(map_elf_error)?;
                     let pid = self.manager.allocate_process(req.parent_pid)?;
+                    // NOTE: we intentionally do not call `record_restart_token(...)` here.
+                    // At this point this path has authoritative process metadata only (pid/image/policy),
+                    // but does not yet have an authoritative `(tid, restart_token)` lifecycle source.
+                    // Restart-token population must be wired from a later lifecycle handoff where token data
+                    // is actually created/owned and tied to a concrete tid.
                     self.record_spawn_policy(
                         pid,
                         req.image_id,
