@@ -4,13 +4,13 @@
 use yarm_user_rt::ipc::Message;
 use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
-    OpenAtRequest, ReadWriteRequest, openat_message, statx_message, write_message,
+    ReadWriteRequest, openat_inline_message, statx_inline_message, write_message,
 };
 use super::super::common::service::FsService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
-use super::nodes::{
-    DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR, DevFsBackend, DevFsMetrics,
-};
+use super::nodes::{DEV_CONSOLE_PATH, DEV_NULL_PATH, DevFsBackend, DevFsMetrics};
+#[cfg(test)]
+use super::nodes::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR};
 use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type DevFsService = FsService<DevFsBackend>;
@@ -31,18 +31,8 @@ fn decode_reply_u64(reply: Message) -> u64 {
 
 fn scripted_bootstrap_requests() -> Result<[Message; 2], VfsError> {
     Ok([
-        openat_message(OpenAtRequest {
-            dirfd: 0,
-            path_ptr: DEV_CONSOLE_PATH_PTR,
-            flags: 0,
-            mode: 0,
-        })?,
-        openat_message(OpenAtRequest {
-            dirfd: 0,
-            path_ptr: DEV_NULL_PATH_PTR,
-            flags: 0,
-            mode: 0,
-        })?,
+        openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0)?,
+        openat_inline_message(0, DEV_NULL_PATH, 0, 0)?,
     ])
 }
 
@@ -58,18 +48,8 @@ fn scripted_bootstrap_io(console_fd: u64, null_fd: u64) -> Result<[Message; 4], 
             buf_ptr: 0,
             len: 12,
         })?,
-        statx_message(super::super::common::vfs_ipc::StatxRequest {
-            dirfd: 0,
-            path_ptr: DEV_CONSOLE_PATH_PTR,
-            flags: 0,
-            mask_or_buf: 0,
-        })?,
-        statx_message(super::super::common::vfs_ipc::StatxRequest {
-            dirfd: 0,
-            path_ptr: DEV_NULL_PATH_PTR,
-            flags: 0,
-            mask_or_buf: 0,
-        })?,
+        statx_inline_message(0, DEV_CONSOLE_PATH, 0, 0)?,
+        statx_inline_message(0, DEV_NULL_PATH, 0, 0)?,
     ])
 }
 
@@ -115,14 +95,12 @@ pub fn run() {
 mod tests {
     use super::*;
     use super::super::super::common::vfs_ipc::{
-        CloseRequest, MountNamespacePolicy, MountRouter, StatxRequest, close_message,
-        openat_message, statx_message, write_message,
+        CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_inline_message,
+        statx_inline_message, write_message,
     };
     use super::super::super::common::vfs_service::VfsService;
     use super::super::super::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
-    use yarm_ipc_abi::vfs_abi::{
-        OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT, VFS_OP_STATX, VFS_OP_WRITE,
-    };
+    use yarm_ipc_abi::vfs_abi::{OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_STATX, VFS_OP_WRITE};
 
     #[test]
     fn devfs_service_supports_console_and_null() {
@@ -138,18 +116,11 @@ mod tests {
 
     #[test]
     fn devfs_protocol_vectors_match_frozen_vfs_codec() {
-        let open_console = openat_message(OpenAtRequest {
-            dirfd: 0,
-            path_ptr: DEV_CONSOLE_PATH_PTR,
-            flags: 0,
-            mode: 0,
-        })
+        let open_console = openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0)
         .expect("open console");
         assert_eq!(open_console.opcode, VFS_OP_OPENAT);
-        assert_eq!(
-            open_console.as_slice(),
-            &OpenAtArgs::new(0, DEV_CONSOLE_PATH_PTR, 0, 0).encode()
-        );
+        let decoded_open = OpenAtInlinePath::decode(open_console.as_slice()).expect("decode open");
+        assert_eq!(decoded_open.path, DEV_CONSOLE_PATH);
 
         let write_console = write_message(ReadWriteRequest {
             fd: 3,
@@ -163,18 +134,11 @@ mod tests {
             &ReadWriteArgs::new(3, 0, 12).encode()
         );
 
-        let stat_null = statx_message(StatxRequest {
-            dirfd: 0,
-            path_ptr: DEV_NULL_PATH_PTR,
-            flags: 0,
-            mask_or_buf: 0,
-        })
+        let stat_null = statx_inline_message(0, DEV_NULL_PATH, 0, 0)
         .expect("stat");
         assert_eq!(stat_null.opcode, VFS_OP_STATX);
-        assert_eq!(
-            stat_null.as_slice(),
-            &StatxArgs::new(0, DEV_NULL_PATH_PTR, 0, 0).encode()
-        );
+        let decoded_stat = StatxInlinePath::decode(stat_null.as_slice()).expect("decode stat");
+        assert_eq!(decoded_stat.path, DEV_NULL_PATH);
     }
 
     #[test]
@@ -199,37 +163,20 @@ mod tests {
 
         let open_dev = svc
             .handle_request(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: DEV_CONSOLE_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
-                })
-                .expect("open dev"),
+                openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0).expect("open dev"),
             )
             .expect("dev open reply");
         assert_eq!(open_dev.opcode, VFS_OP_OPENAT);
 
         let open_initramfs = svc
             .handle_request(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
-                })
-                .expect("open initramfs"),
+                openat_inline_message(0, b"/initramfs/boot-marker", 0, 0).expect("open initramfs"),
             )
             .expect("initramfs open reply");
         assert_eq!(open_initramfs.opcode, VFS_OP_OPENAT);
 
         let denied = svc.handle_request(
-            openat_message(OpenAtRequest {
-                dirfd: 0,
-                path_ptr: 0xDEAD,
-                flags: 0,
-                mode: 0,
-            })
+            openat_inline_message(0, b"denied", 0, 0)
             .expect("denied request"),
         );
         assert_eq!(denied, Err(VfsError::PermissionDenied));
@@ -254,13 +201,7 @@ mod tests {
 
         let open_console = svc
             .handle_request(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: DEV_CONSOLE_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
-                })
-                .expect("open"),
+                openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0).expect("open"),
             )
             .expect("open reply");
         let console_fd =
@@ -294,13 +235,7 @@ mod tests {
         svc.mount(DEV_CONSOLE_PATH_PTR, 1).expect("mount");
         let open_console = svc
             .handle_request(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: DEV_CONSOLE_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
-                })
-                .expect("open"),
+                openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0).expect("open"),
             )
             .expect("open reply");
         let console_fd = decode_reply_u64(open_console);
