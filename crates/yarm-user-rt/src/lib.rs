@@ -52,6 +52,7 @@ pub mod syscall {
     const SYSCALL_IPC_SEND_NR: usize = 1;
     const SYSCALL_IPC_RECV_NR: usize = 2;
     const SYSCALL_IPC_CALL_NR: usize = 4;
+    const SYSCALL_YIELD_NR: usize = 0;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
 
@@ -189,7 +190,17 @@ pub mod syscall {
 
     #[inline]
     pub fn yield_now() -> Result<()> {
-        Err(Error::Unsupported)
+        // SAFETY: Uses architecture syscall ABI to enter kernel.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_YIELD_NR, [0; 6]) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(Error::Unsupported);
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
     }
 }
 
