@@ -2305,6 +2305,7 @@ fn set_fault_handler_requires_receive_capability() {
 #[test]
 fn page_fault_emits_report_to_fault_handler_endpoint() {
     use super::super::syscall::SyscallError;
+    use super::fault_state::SupervisorFaultReportWire;
 
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
@@ -2355,7 +2356,9 @@ fn page_fault_emits_report_to_fault_handler_endpoint() {
         .expect("handler recv")
         .expect("fault report");
     assert_eq!(report.sender_tid.0, 0);
-    assert_eq!(report.as_slice()[16], 1);
+    let decoded = SupervisorFaultReportWire::decode(report.as_slice()).expect("decode fault wire");
+    assert_eq!(decoded.faulting_tid, 0);
+    assert_eq!(decoded.access, super::super::trap::FaultAccess::Write);
 }
 
 #[test]
@@ -2367,6 +2370,7 @@ fn fault_policy_defaults_to_kill_task() {
 #[test]
 fn page_fault_with_notify_and_continue_keeps_current_task_running() {
     use super::super::syscall::SyscallError;
+    use super::fault_state::SupervisorFaultReportWire;
 
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
@@ -2415,6 +2419,8 @@ fn page_fault_with_notify_and_continue_keeps_current_task_running() {
         .expect("handler recv")
         .expect("fault report");
     assert_eq!(report.sender_tid.0, 0);
+    let decoded = SupervisorFaultReportWire::decode(report.as_slice()).expect("decode fault wire");
+    assert_eq!(decoded.faulting_tid, 0);
 }
 
 #[test]

@@ -12,6 +12,56 @@ use crate::kernel::trapframe::TrapFrame;
 
 const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
 const DEMAND_STACK_GROWTH_WINDOW: u64 = 8 * 1024 * 1024;
+/// Supervisor fault notification wire ABI payload length.
+///
+/// Layout (little-endian):
+/// - bytes [0..8): faulting tid (u64)
+/// - bytes [8..16): fault address (u64)
+/// - byte [16]: access kind (0=Read, 1=Write, 2=Execute)
+pub(crate) const SUPERVISOR_FAULT_REPORT_WIRE_LEN: usize = 17;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SupervisorFaultReportWire {
+    pub(crate) faulting_tid: u64,
+    pub(crate) fault_addr: u64,
+    pub(crate) access: FaultAccess,
+}
+
+impl SupervisorFaultReportWire {
+    pub(crate) fn encode(self) -> [u8; SUPERVISOR_FAULT_REPORT_WIRE_LEN] {
+        let mut payload = [0u8; SUPERVISOR_FAULT_REPORT_WIRE_LEN];
+        payload[..8].copy_from_slice(&self.faulting_tid.to_le_bytes());
+        payload[8..16].copy_from_slice(&self.fault_addr.to_le_bytes());
+        payload[16] = match self.access {
+            FaultAccess::Read => 0,
+            FaultAccess::Write => 1,
+            FaultAccess::Execute => 2,
+        };
+        payload
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != SUPERVISOR_FAULT_REPORT_WIRE_LEN {
+            return None;
+        }
+        let mut tid = [0u8; 8];
+        let mut addr = [0u8; 8];
+        tid.copy_from_slice(&bytes[..8]);
+        addr.copy_from_slice(&bytes[8..16]);
+        let access = match bytes[16] {
+            0 => FaultAccess::Read,
+            1 => FaultAccess::Write,
+            2 => FaultAccess::Execute,
+            _ => return None,
+        };
+        Some(Self {
+            faulting_tid: u64::from_le_bytes(tid),
+            fault_addr: u64::from_le_bytes(addr),
+            access,
+        })
+    }
+}
 
 impl KernelState {
     fn fault_addr_in_demand_backed_region(&self, tid: u64, fault_addr: u64) -> bool {
@@ -85,15 +135,12 @@ impl KernelState {
             return;
         };
 
-        let mut payload = [0u8; 17];
-        payload[..8].copy_from_slice(&faulted_tid.to_le_bytes());
-        let addr_bytes = fault.addr.0.to_le_bytes();
-        payload[8..16].copy_from_slice(&addr_bytes);
-        payload[16] = match fault.access {
-            FaultAccess::Read => 0,
-            FaultAccess::Write => 1,
-            FaultAccess::Execute => 2,
-        };
+        let payload = SupervisorFaultReportWire {
+            faulting_tid: faulted_tid,
+            fault_addr: fault.addr.0,
+            access: fault.access,
+        }
+        .encode();
 
         let msg = match Message::new(0, &payload) {
             Ok(msg) => msg,
