@@ -77,26 +77,6 @@ impl Ext4Backend {
         }
     }
 
-    fn open_inode(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        if let Some(inode) = self
-            .inodes
-            .iter()
-            .flatten()
-            .find(|inode| inode.path_ptr == path_ptr)
-            .map(|inode| inode.path_ptr)
-        {
-            return self.alloc_fd(inode);
-        }
-        if let Some(slot) = self.inodes.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(Ext4Inode {
-                path_ptr,
-                file_len: 0,
-            });
-            return self.alloc_fd(path_ptr);
-        }
-        Err(VfsError::NoFd)
-    }
-
     fn seed_path(&mut self, inode: u64, path: &[u8]) {
         let mut bytes = [0u8; EXT4_INLINE_PATH_MAX];
         bytes[..path.len()].copy_from_slice(path);
@@ -112,15 +92,6 @@ impl Ext4Backend {
                 path_ptr: inode,
                 file_len: 0,
             });
-        }
-    }
-
-    fn legacy_path_from_ptr(path_ptr: u64) -> Option<&'static [u8]> {
-        match path_ptr {
-            EXT4_DEMO_PATH_PTR => Some(EXT4_DEMO_PATH),
-            EXT4_SERVICE_PATH_PTR => Some(EXT4_SERVICE_PATH),
-            EXT4_OVERSIZE_PATH_PTR => Some(EXT4_OVERSIZE_PATH),
-            _ => None,
         }
     }
 
@@ -142,10 +113,6 @@ impl Ext4Backend {
     fn open_inode_by_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         let inode = self.lookup_by_path(path)?;
         self.alloc_fd(inode)
-    }
-
-    fn open_inode_legacy_ptr(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        self.open_inode(path_ptr)
     }
 
     fn close_fd(&mut self, fd: u64) -> Result<(), VfsError> {
@@ -182,11 +149,8 @@ impl ServiceFsBackend for Ext4Backend {
 
 impl VfsBackend for Ext4Backend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        if let Some(path) = Self::legacy_path_from_ptr(path_ptr) {
-            self.openat_path(path)
-        } else {
-            self.open_inode_legacy_ptr(path_ptr)
-        }
+        let _ = path_ptr;
+        Err(VfsError::InvalidPath)
     }
 
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -220,12 +184,8 @@ impl VfsBackend for Ext4Backend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        if let Some(path) = Self::legacy_path_from_ptr(path_ptr) {
-            self.statx_path(path)
-        } else {
-            let idx = find_inode_index(&self.inodes, path_ptr).ok_or(VfsError::BadFd)?;
-            Ok(self.inodes[idx].ok_or(VfsError::BadFd)?.file_len)
-        }
+        let _ = path_ptr;
+        Err(VfsError::InvalidPath)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
