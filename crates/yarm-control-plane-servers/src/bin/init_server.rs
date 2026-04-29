@@ -42,10 +42,11 @@ pub extern "C" fn _start(
         0,
         0,
         0,
+        0,
     ];
     if startup_slots_ptr != 0 && startup_slots_len >= slots.len() {
         // SAFETY: kernel provides user entry args; when pointer/len is valid for
-        // the startup block contract we copy exactly 11 u64 entries.
+        // the startup block contract we copy exactly 12 u64 entries.
         let src = startup_slots_ptr as *const u64;
         let mut index = 0usize;
         while index < slots.len() {
