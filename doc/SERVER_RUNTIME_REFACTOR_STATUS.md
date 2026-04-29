@@ -32,6 +32,7 @@ Current startup slot map:
 - slot 8 = init tid
 - slot 9 = supervisor tid
 - slot 10 = restart window ticks
+- slot 11 = process-manager restart-control send cap
 
 Delivery convention:
 
@@ -97,7 +98,7 @@ Current gap detail:
   - No production control-plane component currently emits this message yet because no runtime lifecycle stage currently surfaces authoritative `(tid, restart_token)` pairs into userspace server code.
 - Restart execution status:
   - Production fault path can now reach restart-policy decisioning when token lookup succeeds.
-  - Actual restart execution remains unsupported in production runtime because `execute_due_restarts(...)` and `restart_task(...)` execution ops are currently kernel/test-only and no userspace runtime IPC restart operation is wired yet.
+  - Process-manager can execute restarts via a privileged kernel restart-control capability IPC path (`PROC_OP_EXECUTE_RESTART`) and return kernel-mapped statuses.
 
 ## Remaining blockers / future work
 

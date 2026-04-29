@@ -539,7 +539,7 @@ impl InitService {
                     vfs_tid,
                     plan.vfs_entry,
                     vfs_asid,
-                    process_manager_startup_args,
+                    UserImageSpec::DEFAULT_STARTUP_ARGS,
                 )?;
                 self.record_launch(
                     kernel,
