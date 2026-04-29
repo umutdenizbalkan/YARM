@@ -84,3 +84,19 @@ Absent such redesign decisions, this document is the authoritative stopping-poin
 ## Related status document
 
 - See `doc/SERVER_RUNTIME_REFACTOR_STATUS.md` for current server-runtime / POSIX / VFS refactor completion state and known blockers.
+
+## Capability-based restart boundary (current)
+
+This repository now uses a capability-based privileged restart boundary:
+
+- Userspace servers never receive `KernelState` or other kernel-internal objects.
+- Process-manager alone may receive a restricted startup capability that can **SEND** to the kernel
+  restart-control endpoint path.
+- That capability is not a general kernel object API; it is constrained by kernel-side opcode
+  checks and message decoding.
+
+Security invariant:
+
+- The privilege crossing is represented as a narrow IPC message contract on a restricted SEND cap.
+- Kernel mechanism remains in kernel space (`KernelState::restart_task(...)`), while userspace
+  holds only a capability handle and serialized request/reply ABI.

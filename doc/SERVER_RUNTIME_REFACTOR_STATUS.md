@@ -100,6 +100,49 @@ Current gap detail:
   - Production fault path can now reach restart-policy decisioning when token lookup succeeds.
   - Process-manager can execute restarts via a privileged kernel restart-control capability IPC path (`PROC_OP_EXECUTE_RESTART`) and return kernel-mapped statuses.
 
+### 7) Completed capability-based restart path
+
+Startup slot 11 meaning:
+
+- slot 11 carries the process-manager restart-control **SEND** capability.
+- This slot is intentionally process-manager-specific and is not a general-purpose control-plane
+  cap slot.
+
+Why only process-manager receives this cap:
+
+- Process-manager is the authority for restart-token records and performs pre-kernel token checks.
+- Restricting cap distribution to process-manager keeps the privileged restart execution boundary
+  small and auditable.
+
+Full fault-to-restart flow:
+
+1. Kernel emits fixed-size fault wire (`opcode 0`) to supervisor fault endpoint.
+2. Supervisor decodes the 17-byte `SupervisorFaultReportWire`.
+3. Supervisor queries process-manager for restart token (`PROC_OP_TASK_RESTART_TOKEN`).
+4. If policy schedules restart, supervisor asks process-manager to execute (`PROC_OP_EXECUTE_RESTART`).
+5. Process-manager validates token against its record.
+6. On token match, process-manager sends privileged restart IPC via slot-11 SEND cap.
+7. Kernel validates opcode and payload, invokes `restart_task(tid, restart_token)`, and replies.
+8. Process-manager returns the kernel status in `ExecuteRestartReply`.
+
+`PROC_OP_EXECUTE_RESTART` status mapping:
+
+- `0` => ok
+- `1` => not_found
+- `2` => token_mismatch
+- `3` => permission_denied
+- `255` => internal
+
+Security invariant:
+
+- Userspace never receives `KernelState`.
+- Userspace receives only a restricted SEND capability and can cross privilege solely through the
+  typed restart IPC contract.
+
+Fault wire compatibility:
+
+- Fault wire format remains unchanged and fixed at 17 bytes.
+
 ## Remaining blockers / future work
 
 1. Replace production `NoSys` POSIX branches with explicit runtime abstractions.
