@@ -10,14 +10,8 @@ const MAX_PATH_LEN: usize = 32;
 const FAT_ENTRIES: usize = 128;
 const FAT_EOC: u16 = 0xFFFF;
 
-/// Compatibility-only legacy path identifier; prefer `FAT_HELLO_PATH`.
-pub const FAT_HELLO_PATH_PTR: u64 = 0x5050;
 pub const FAT_HELLO_PATH: &[u8] = b"/hello.txt";
-/// Compatibility-only legacy path identifier; prefer `FAT_ETC_CONFIG_PATH`.
-pub const FAT_ETC_CONFIG_PATH_PTR: u64 = 0x6060;
 pub const FAT_ETC_CONFIG_PATH: &[u8] = b"/etc/config";
-/// Compatibility-only legacy path identifier; prefer `FAT_EXT4_BRIDGE_PATH`.
-pub const FAT_EXT4_BRIDGE_PATH_PTR: u64 = 0x4040;
 pub const FAT_EXT4_BRIDGE_PATH: &[u8] = b"/ext4/file.bin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,27 +40,10 @@ impl FatPath {
         })
     }
 
-    pub fn from_abi_path(path_ptr: u64) -> Result<Self, VfsError> {
-        let src = legacy_path_from_ptr(path_ptr).ok_or(VfsError::BadFd)?;
-        Self::from_path_bytes(src)
-    }
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
     }
-}
-
-const ABI_PATH_TABLE: &[(u64, &[u8])] = &[
-    (FAT_HELLO_PATH_PTR, FAT_HELLO_PATH),
-    (FAT_ETC_CONFIG_PATH_PTR, FAT_ETC_CONFIG_PATH),
-    (FAT_EXT4_BRIDGE_PATH_PTR, FAT_EXT4_BRIDGE_PATH),
-];
-
-fn legacy_path_from_ptr(path_ptr: u64) -> Option<&'static [u8]> {
-    ABI_PATH_TABLE
-        .iter()
-        .find(|(ptr, _)| *ptr == path_ptr)
-        .map(|(_, bytes)| *bytes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,10 +299,6 @@ impl FatBackend {
         Ok(())
     }
 
-    pub fn cluster_chain_head_for_path(&self, path_ptr: u64) -> Option<FatCluster> {
-        let path = FatPath::from_abi_path(path_ptr).ok()?;
-        self.cluster_chain_head_for_path_bytes(path.as_bytes())
-    }
 
     pub fn cluster_chain_head_for_path_bytes(&self, path: &[u8]) -> Option<FatCluster> {
         let path = FatPath::from_path_bytes(path).ok()?;
@@ -338,7 +311,7 @@ impl FatBackend {
     }
 
     fn lookup_by_path(&self, path: &[u8]) -> Result<FatPath, VfsError> {
-        if !ABI_PATH_TABLE.iter().any(|(_, known)| *known == path) {
+        if path != FAT_HELLO_PATH && path != FAT_ETC_CONFIG_PATH && path != FAT_EXT4_BRIDGE_PATH {
             return Err(VfsError::InvalidPath);
         }
         FatPath::from_path_bytes(path)
@@ -353,11 +326,8 @@ impl FatBackend {
 
 impl VfsBackend for FatBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        if path_ptr == 0 {
-            return Err(VfsError::BadFd);
-        }
-        let path = FatPath::from_abi_path(path_ptr)?;
-        self.openat_path(path.as_bytes())
+        let _ = path_ptr;
+        Err(VfsError::InvalidPath)
     }
 
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -389,10 +359,8 @@ impl VfsBackend for FatBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let Some(path) = legacy_path_from_ptr(path_ptr) else {
-            return Err(VfsError::BadFd);
-        };
-        self.statx_path(path)
+        let _ = path_ptr;
+        Err(VfsError::InvalidPath)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -436,7 +404,7 @@ mod tests {
     #[test]
     fn fat_chain_grows_as_file_expands() {
         let mut fs = FatBackend::new();
-        let fd = fs.openat(FAT_HELLO_PATH_PTR).expect("open");
+        let fd = fs.openat_path(FAT_HELLO_PATH).expect("open");
         let cluster_size = fs.cluster_size_bytes();
         let _ = fs.write(fd, cluster_size * 2 + 1).expect("write");
         let head = fs.cluster_chain_head_for_path_bytes(FAT_HELLO_PATH).expect("head");
@@ -444,11 +412,11 @@ mod tests {
     }
 
     #[test]
-    fn typed_pathname_layer_uses_abi_buffers() {
+    fn typed_pathname_layer_uses_byte_paths() {
         let mut fs = FatBackend::new();
-        let fd = fs.openat(FAT_HELLO_PATH_PTR).expect("open");
+        let fd = fs.openat_path(FAT_HELLO_PATH).expect("open");
         let _ = fs.write(fd, 11).expect("write");
-        assert_eq!(fs.statx(FAT_HELLO_PATH_PTR).expect("stat"), 11);
+        assert_eq!(fs.statx_path(FAT_HELLO_PATH).expect("stat"), 11);
     }
 
     #[test]
@@ -467,11 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_pointer_adapter_still_works() {
+    fn pointer_entrypoints_are_rejected_for_runtime_paths() {
         let mut fs = FatBackend::new();
-        let fd = fs.openat(FAT_HELLO_PATH_PTR).expect("open ptr");
-        let _ = fs.write(fd, 5).expect("write");
-        assert_eq!(fs.statx(FAT_HELLO_PATH_PTR).expect("stat ptr"), 5);
-        assert_eq!(fs.statx(0xDEAD), Err(VfsError::BadFd));
+        assert_eq!(fs.openat(0x5050), Err(VfsError::InvalidPath));
+        assert_eq!(fs.statx(0x5050), Err(VfsError::InvalidPath));
     }
 }
