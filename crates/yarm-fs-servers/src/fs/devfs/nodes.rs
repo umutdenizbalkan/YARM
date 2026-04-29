@@ -89,14 +89,6 @@ impl DevFsBackend {
         Ok(Self::statx_for_node(node))
     }
 
-    fn legacy_path_from_ptr(path_ptr: u64) -> Option<&'static [u8]> {
-        match path_ptr {
-            DEV_CONSOLE_PATH_PTR => Some(DEV_CONSOLE_PATH),
-            DEV_NULL_PATH_PTR => Some(DEV_NULL_PATH),
-            _ => None,
-        }
-    }
-
     fn alloc_handle(&mut self, node: DevNode) -> Result<u64, VfsError> {
         let fd = self.next_fd;
         self.next_fd = self.next_fd.saturating_add(1);
@@ -140,11 +132,9 @@ impl DevFsBackend {
 
 impl VfsBackend for DevFsBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let Some(path) = Self::legacy_path_from_ptr(path_ptr) else {
-            self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-            return Err(VfsError::BadFd);
-        };
-        self.openat_path(path)
+        let _ = path_ptr;
+        self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+        Err(VfsError::InvalidPath)
     }
 
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -213,11 +203,9 @@ impl VfsBackend for DevFsBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let Some(path) = Self::legacy_path_from_ptr(path_ptr) else {
-            self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-            return Err(VfsError::BadFd);
-        };
-        self.statx_path(path)
+        let _ = path_ptr;
+        self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+        Err(VfsError::InvalidPath)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -241,9 +229,9 @@ mod tests {
     #[test]
     fn multi_open_allocates_unique_handles() {
         let mut backend = DevFsBackend::new();
-        let fd0 = backend.openat(DEV_CONSOLE_PATH_PTR).expect("console open");
-        let fd1 = backend.openat(DEV_CONSOLE_PATH_PTR).expect("console open");
-        let fd2 = backend.openat(DEV_NULL_PATH_PTR).expect("null open");
+        let fd0 = backend.openat_path(DEV_CONSOLE_PATH).expect("console open");
+        let fd1 = backend.openat_path(DEV_CONSOLE_PATH).expect("console open");
+        let fd2 = backend.openat_path(DEV_NULL_PATH).expect("null open");
         assert_ne!(fd0, fd1);
         assert_ne!(fd1, fd2);
         assert_eq!(fd0, 3);
@@ -254,8 +242,8 @@ mod tests {
     #[test]
     fn node_specific_read_write_semantics_are_enforced() {
         let mut backend = DevFsBackend::new();
-        let console_fd = backend.openat(DEV_CONSOLE_PATH_PTR).expect("console");
-        let null_fd = backend.openat(DEV_NULL_PATH_PTR).expect("null");
+        let console_fd = backend.openat_path(DEV_CONSOLE_PATH).expect("console");
+        let null_fd = backend.openat_path(DEV_NULL_PATH).expect("null");
         assert_eq!(backend.write(console_fd, 11), Ok(11));
         assert_eq!(backend.write(null_fd, 7), Ok(7));
         assert_eq!(backend.read(null_fd, 64), Ok(0));
@@ -265,8 +253,8 @@ mod tests {
     #[test]
     fn statx_contract_returns_node_specific_metadata() {
         let mut backend = DevFsBackend::new();
-        let console = backend.statx(DEV_CONSOLE_PATH_PTR).expect("console stat");
-        let null = backend.statx(DEV_NULL_PATH_PTR).expect("null stat");
+        let console = backend.statx_path(DEV_CONSOLE_PATH).expect("console stat");
+        let null = backend.statx_path(DEV_NULL_PATH).expect("null stat");
         assert_eq!(
             console,
             DEVFS_STATX_TYPE_CHAR_DEVICE | DEVFS_MODE_OWNER_WRITE
@@ -280,8 +268,8 @@ mod tests {
     #[test]
     fn metrics_track_success_and_error_paths() {
         let mut backend = DevFsBackend::new();
-        let console_fd = backend.openat(DEV_CONSOLE_PATH_PTR).expect("console");
-        let null_fd = backend.openat(DEV_NULL_PATH_PTR).expect("null");
+        let console_fd = backend.openat_path(DEV_CONSOLE_PATH).expect("console");
+        let null_fd = backend.openat_path(DEV_NULL_PATH).expect("null");
         let _ = backend.write(console_fd, 8).expect("console write");
         let _ = backend.write(null_fd, 5).expect("null write");
         let _ = backend
@@ -322,11 +310,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_pointer_adapter_still_works() {
+    fn pointer_entrypoints_are_rejected_for_runtime_paths() {
         let mut backend = DevFsBackend::new();
-        assert!(backend.openat(DEV_CONSOLE_PATH_PTR).is_ok());
-        assert!(backend.statx(DEV_NULL_PATH_PTR).is_ok());
-        assert_eq!(backend.openat(0xDEAD_BEEF), Err(VfsError::BadFd));
-        assert_eq!(backend.statx(0xDEAD_BEEF), Err(VfsError::BadFd));
+        assert_eq!(backend.openat(DEV_CONSOLE_PATH_PTR), Err(VfsError::InvalidPath));
+        assert_eq!(backend.statx(DEV_NULL_PATH_PTR), Err(VfsError::InvalidPath));
     }
 }
