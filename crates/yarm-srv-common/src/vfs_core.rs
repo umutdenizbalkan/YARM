@@ -31,8 +31,6 @@ struct FdEntry {
 pub enum VfsRequest {
     OpenAt {
         _dirfd: u64,
-        /// Legacy pointer-path argument; prefer `path_inline`.
-        path_ptr: u64,
         path_inline: Option<PathBytes>,
         _flags: u64,
         _mode: u64,
@@ -52,8 +50,6 @@ pub enum VfsRequest {
     },
     Statx {
         _dirfd: u64,
-        /// Legacy pointer-path argument; prefer `path_inline`.
-        path_ptr: u64,
         path_inline: Option<PathBytes>,
         _flags: u64,
         _mask_or_buf: u64,

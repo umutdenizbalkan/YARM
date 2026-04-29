@@ -5,7 +5,7 @@ use super::vfs_ipc::{
     InMemoryBackend, MountNamespacePolicy, MountRecord, VfsBackend, VfsError, VfsRequest,
 };
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtArgs, OpenAtInlinePath, ReadWriteArgs, StatxArgs, StatxInlinePath, VFS_OP_CLOSE,
+    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE,
     VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL,
     VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX,
     VFS_OP_WRITE, VfsV1Args,
@@ -232,26 +232,16 @@ impl<B: VfsBackend> VfsService<B> {
     pub fn parse_request(request: Message) -> Result<VfsRequest, VfsError> {
         match request.opcode {
             VFS_OP_OPENAT => {
-                if let Some(inline) = OpenAtInlinePath::decode(request.as_slice()) {
-                    return Ok(VfsRequest::OpenAt {
-                        _dirfd: inline.dirfd,
-                        path_ptr: 0,
-                        path_inline: Some(
-                            super::vfs_ipc::PathBytes::from_slice(inline.path)
-                                .map_err(|_| VfsError::Malformed)?,
-                        ),
-                        _flags: inline.flags,
-                        _mode: inline.mode,
-                    });
-                }
-                let args =
-                    OpenAtArgs::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
+                let inline =
+                    OpenAtInlinePath::decode(request.as_slice()).ok_or(VfsError::Malformed)?;
                 Ok(VfsRequest::OpenAt {
-                    _dirfd: args.dirfd,
-                    path_ptr: args.path_ptr,
-                    path_inline: None,
-                    _flags: args.flags,
-                    _mode: args.mode,
+                    _dirfd: inline.dirfd,
+                    path_inline: Some(
+                        super::vfs_ipc::PathBytes::from_slice(inline.path)
+                            .map_err(|_| VfsError::Malformed)?,
+                    ),
+                    _flags: inline.flags,
+                    _mode: inline.mode,
                 })
             }
             VFS_OP_CLOSE => {
@@ -278,26 +268,16 @@ impl<B: VfsBackend> VfsService<B> {
                 })
             }
             VFS_OP_STATX => {
-                if let Some(inline) = StatxInlinePath::decode(request.as_slice()) {
-                    return Ok(VfsRequest::Statx {
-                        _dirfd: inline.dirfd,
-                        path_ptr: 0,
-                        path_inline: Some(
-                            super::vfs_ipc::PathBytes::from_slice(inline.path)
-                                .map_err(|_| VfsError::Malformed)?,
-                        ),
-                        _flags: inline.flags,
-                        _mask_or_buf: inline.mask_or_buf,
-                    });
-                }
-                let args =
-                    StatxArgs::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
+                let inline =
+                    StatxInlinePath::decode(request.as_slice()).ok_or(VfsError::Malformed)?;
                 Ok(VfsRequest::Statx {
-                    _dirfd: args.dirfd,
-                    path_ptr: args.path_ptr,
-                    path_inline: None,
-                    _flags: args.flags,
-                    _mask_or_buf: args.mask_or_buf,
+                    _dirfd: inline.dirfd,
+                    path_inline: Some(
+                        super::vfs_ipc::PathBytes::from_slice(inline.path)
+                            .map_err(|_| VfsError::Malformed)?,
+                    ),
+                    _flags: inline.flags,
+                    _mask_or_buf: inline.mask_or_buf,
                 })
             }
             VFS_OP_IOCTL => {
@@ -374,12 +354,7 @@ impl<B: VfsBackend> VfsService<B> {
     pub fn handle_request(&mut self, request: Message) -> Result<Message, VfsError> {
         let parsed = Self::parse_request(request)?;
         let reply = match parsed {
-            VfsRequest::OpenAt {
-                path_ptr,
-                path_inline,
-                ..
-            } => {
-                let _ = path_ptr;
+            VfsRequest::OpenAt { path_inline, .. } => {
                 if let Some(path) = path_inline {
                     if !self.policy.allows_path_bytes(path.as_slice()) {
                         return Err(VfsError::PermissionDenied);
@@ -392,12 +367,7 @@ impl<B: VfsBackend> VfsService<B> {
             VfsRequest::Close { fd } => VfsReply::CloseResult(self.backend.close(fd)?),
             VfsRequest::Read { fd, len, .. } => VfsReply::ReadLen(self.backend.read(fd, len)?),
             VfsRequest::Write { fd, len, .. } => VfsReply::WriteLen(self.backend.write(fd, len)?),
-            VfsRequest::Statx {
-                path_ptr,
-                path_inline,
-                ..
-            } => {
-                let _ = path_ptr;
+            VfsRequest::Statx { path_inline, .. } => {
                 if let Some(path) = path_inline {
                     if !self.policy.allows_path_bytes(path.as_slice()) {
                         return Err(VfsError::PermissionDenied);

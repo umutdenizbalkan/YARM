@@ -3,24 +3,12 @@
 
 use yarm_user_rt::ipc::Message;
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtArgs, OpenAtInlinePath, ReadWriteArgs, StatxArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_DUP,
+    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_DUP,
     VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL,
     VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
 };
 
 pub use yarm_srv_common::vfs_core::*;
-
-/// Legacy pointer-path OPENAT message helper; prefer `openat_inline_message`.
-pub fn openat_message(req: OpenAtRequest) -> Result<Message, VfsError> {
-    Message::with_header(
-        0,
-        VFS_OP_OPENAT,
-        0,
-        None,
-        &OpenAtArgs::new(req.dirfd, req.path_ptr, req.flags, req.mode).encode(),
-    )
-    .map_err(|_| VfsError::Malformed)
-}
 
 pub fn openat_inline_message(
     dirfd: u64,
@@ -68,18 +56,6 @@ pub fn write_message(req: ReadWriteRequest) -> Result<Message, VfsError> {
         0,
         None,
         &ReadWriteArgs::new(req.fd, req.buf_ptr, req.len).encode(),
-    )
-    .map_err(|_| VfsError::Malformed)
-}
-
-/// Legacy pointer-path STATX message helper; prefer `statx_inline_message`.
-pub fn statx_message(req: StatxRequest) -> Result<Message, VfsError> {
-    Message::with_header(
-        0,
-        VFS_OP_STATX,
-        0,
-        None,
-        &StatxArgs::new(req.dirfd, req.path_ptr, req.flags, req.mask_or_buf).encode(),
     )
     .map_err(|_| VfsError::Malformed)
 }
