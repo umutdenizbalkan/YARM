@@ -95,6 +95,9 @@ Current gap detail:
 - Production sender status:
   - `PROC_OP_REGISTER_SUPERVISED_TASK` ABI exists and process-manager can store tokens from it.
   - No production control-plane component currently emits this message yet because no runtime lifecycle stage currently surfaces authoritative `(tid, restart_token)` pairs into userspace server code.
+- Restart execution status:
+  - Production fault path can now reach restart-policy decisioning when token lookup succeeds.
+  - Actual restart execution remains unsupported in production runtime because `execute_due_restarts(...)` and `restart_task(...)` execution ops are currently kernel/test-only and no userspace runtime IPC restart operation is wired yet.
 
 ## Remaining blockers / future work
 

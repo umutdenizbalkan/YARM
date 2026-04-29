@@ -1178,7 +1178,21 @@ pub fn run() {
                                                 token_tid: fault.tid,
                                                 token: restart_token,
                                             };
-                                            let _ = supervisor.handle_task_exit(&mut ops, event);
+                                            match supervisor.handle_task_exit(&mut ops, event) {
+                                                Ok(SupervisorDecision::ScheduledRestart { tid, due_tick, .. }) => {
+                                                    yarm_user_rt::user_log!(
+                                                        "supervisor.srv restart scheduled but runtime execution path is unsupported: tid={}, due_tick={}",
+                                                        tid,
+                                                        due_tick.0
+                                                    );
+                                                }
+                                                Ok(_) => {}
+                                                Err(err) => yarm_user_rt::user_log!(
+                                                    "supervisor.srv failed to apply restart policy decision: tid={}, err={:?}",
+                                                    fault.tid,
+                                                    err
+                                                ),
+                                            }
                                         }
                                         Ok(None) => yarm_user_rt::user_log!(
                                             "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={}; restart-token lookup unsupported/unavailable in runtime path",
