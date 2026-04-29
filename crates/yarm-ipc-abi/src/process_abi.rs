@@ -19,6 +19,37 @@ pub const PROC_OP_WAITPID_V2: u16 = 5;
 pub const PROC_OP_SPAWN_V3: u16 = 6;
 pub const PROC_OP_SPAWN_V4: u16 = 7;
 pub const PROC_OP_TASK_RESTART_TOKEN: u16 = 8;
+pub const PROC_OP_REGISTER_SUPERVISED_TASK: u16 = 9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterSupervisedTask {
+    pub tid: u64,
+    pub restart_token: u64,
+}
+
+impl RegisterSupervisedTask {
+    pub const fn new(tid: u64, restart_token: u64) -> Self {
+        Self { tid, restart_token }
+    }
+    pub fn encode(self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        let tid = self.tid.to_le_bytes();
+        let tok = self.restart_token.to_le_bytes();
+        out[..8].copy_from_slice(&tid);
+        out[8..16].copy_from_slice(&tok);
+        out
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() < 16 {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut tid = [0u8; 8];
+        let mut tok = [0u8; 8];
+        tid.copy_from_slice(&payload[..8]);
+        tok.copy_from_slice(&payload[8..16]);
+        Ok(Self::new(u64::from_le_bytes(tid), u64::from_le_bytes(tok)))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskRestartTokenRequest {
@@ -417,6 +448,7 @@ mod tests {
         assert_eq!(SpawnV4Args::VERSION, PROC_CODEC_V4_VERSION);
         assert_eq!(PROC_OP_SPAWN_V4, 7);
         assert_eq!(PROC_OP_TASK_RESTART_TOKEN, 8);
+        assert_eq!(PROC_OP_REGISTER_SUPERVISED_TASK, 9);
     }
 
     #[test]
@@ -431,6 +463,12 @@ mod tests {
         let missing = TaskRestartTokenReply::new(false, 0);
         assert_eq!(TaskRestartTokenReply::decode(&missing.encode()), Ok(missing));
         assert_eq!(missing.found_token(), None);
+    }
+
+    #[test]
+    fn register_supervised_task_codec_roundtrip() {
+        let reg = RegisterSupervisedTask::new(7, 99);
+        assert_eq!(RegisterSupervisedTask::decode(&reg.encode()), Ok(reg));
     }
 
     #[test]

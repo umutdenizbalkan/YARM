@@ -11,8 +11,9 @@ use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcess
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use yarm_ipc_abi::process_abi::{
     PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
-    PROC_OP_SPAWN_V4, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2, SpawnV2Args, SpawnV3Args,
-    SpawnV4Args, TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args,
+    PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V4, PROC_OP_TASK_RESTART_TOKEN,
+    PROC_OP_WAITPID_V2, RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args,
+    TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
@@ -108,6 +109,7 @@ pub enum ProcessRequest {
     SpawnV2(SpawnV2Request),
     WaitPidV2(WaitPidV2Request),
     TaskRestartToken { tid: u64 },
+    RegisterSupervisedTask { tid: u64, restart_token: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -742,6 +744,14 @@ impl ProcessService {
                     .map_err(|_| ProcessManagerError::Malformed)?;
                 Ok(ProcessRequest::TaskRestartToken { tid: args.tid })
             }
+            PROC_OP_REGISTER_SUPERVISED_TASK => {
+                let args = RegisterSupervisedTask::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                Ok(ProcessRequest::RegisterSupervisedTask {
+                    tid: args.tid,
+                    restart_token: args.restart_token,
+                })
+            }
             _ => Err(ProcessManagerError::Unsupported),
         }
     }
@@ -929,6 +939,10 @@ impl ProcessService {
                 );
                 Message::with_header(0, PROC_OP_TASK_RESTART_TOKEN, 0, None, &reply.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
+            }
+            ProcessRequest::RegisterSupervisedTask { tid, restart_token } => {
+                self.record_restart_token(tid, restart_token)?;
+                Self::u64_reply(PROC_OP_REGISTER_SUPERVISED_TASK, 0)
             }
         }
     }
@@ -1520,5 +1534,31 @@ mod tests {
         let reply_msg = service.handle(request).expect("reply");
         let reply = TaskRestartTokenReply::decode(reply_msg.as_slice()).expect("decode");
         assert_eq!(reply.found_token(), None);
+    }
+
+    #[test]
+    fn register_supervised_task_records_restart_token_for_lookup() {
+        let mut service = ProcessService::new();
+        let register = Message::with_header(
+            0,
+            PROC_OP_REGISTER_SUPERVISED_TASK,
+            0,
+            None,
+            &RegisterSupervisedTask::new(55, 0xDEAD).encode(),
+        )
+        .expect("register");
+        let _ = service.handle(register).expect("register reply");
+
+        let lookup = Message::with_header(
+            0,
+            PROC_OP_TASK_RESTART_TOKEN,
+            0,
+            None,
+            &TaskRestartTokenRequest::new(55).encode(),
+        )
+        .expect("lookup");
+        let reply_msg = service.handle(lookup).expect("lookup reply");
+        let reply = TaskRestartTokenReply::decode(reply_msg.as_slice()).expect("decode");
+        assert_eq!(reply.found_token(), Some(0xDEAD));
     }
 }
