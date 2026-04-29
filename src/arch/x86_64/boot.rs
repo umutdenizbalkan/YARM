@@ -16,22 +16,22 @@ global_asm!(
     .align 4
     .long pvh_start32
 
-    .section .bss.bootstack,"aw",@nobits
-    .align 16
-boot_stack:
-    // Early bootstrap stack used until Rust runtime/state setup completes.
-    // Keep this inside the bootstrap identity-map footprint.
-    .skip 0x01000000
-boot_stack_end:
+    // ===========================================================
+    // Low-VA boot data: page tables, GDT64 + descriptor, and a
+    // tiny dedicated 4 KiB stack used while running in 32-bit
+    // protected mode.  All these symbols are referenced by 32-bit
+    // immediate operands in pvh_start32 below, so they MUST stay
+    // in the low-VA prefix declared by the linker script.
+    // ===========================================================
 
     .section .data.boot,"aw",@progbits
     .align 4096
 boot_pml4:
-    // PML4[0]   → boot_pdpt_low   : identity map for first 4GiB.
+    // PML4[0]   -> boot_pdpt_low   : low identity for first 4 GiB.
     .quad boot_pdpt_low + 0x3
-    // PML4[1..510] → null.
+    // PML4[1..510] -> null.
     .zero 4080
-    // PML4[511] → canonical upper-half direct physical map.
+    // PML4[511] -> boot_pdpt_direct : higher-half kernel window.
     .quad boot_pdpt_direct + 0x3
 
     .align 4096
@@ -43,11 +43,16 @@ boot_pdpt_low:
 
     .align 4096
 boot_pdpt_direct:
-    // Higher-half direct physical mapping for KERNEL_BOOTSTRAP_VIRT_BASE.
-    // Keep the top canonical 2GiB window wired to bootstrap PDs:
-    // - PDPT[510] -> boot_pd    (low identity/kernel image window)
-    // - PDPT[511] -> boot_pd_hi (3GiB..4GiB high aliases)
-    // so linked high-half symbols remain valid during bootstrap.
+    // Higher-half mapping rooted at PML4[511] = 0xFFFF_FF80_0000_0000:
+    //   PDPT[0..509] -> 1 GiB direct identity huge pages
+    //                   (PA 0..510 GiB at VA 0xFFFF_FF80_0000_0000+).
+    //                   Used as the bootstrap PA->VA direct map.
+    //   PDPT[510] -> boot_pd      : low identity 0..64 MiB at
+    //                                VA 0xFFFF_FFFF_8000_0000+.
+    //                                THIS WINDOW HOSTS THE KERNEL IMAGE.
+    //   PDPT[511] -> boot_pd_hi   : 3..4 GiB at
+    //                                VA 0xFFFF_FFFF_C000_0000+ (PCD set,
+    //                                covers LAPIC/IOAPIC MMIO).
     .set direct_map_page_flags, 0x83
     .set direct_map_index, 0
     .rept 510
@@ -59,11 +64,9 @@ boot_pdpt_direct:
 
     .align 4096
 boot_pd:
-    // Bootstrap identity map:
-    // - first 2MiB via 4KiB PTEs for early transition flexibility
-    // - 2MiB..64MiB via 2MiB executable pages to tolerate firmware/kernel placement
-    // NOTE: W^X hardening is completed later once the final kernel page tables
-    // are installed and CR3 is switched away from this bootstrap map.
+    // Bootstrap identity map for first 64 MiB.
+    // - first 2 MiB via 4 KiB PTEs (boot_pt0)
+    // - 2..64 MiB via 2 MiB executable pages
     .set page_flags_pt, 0x03
     .set page_flags_exec, 0x83
     .quad boot_pt0 + page_flags_pt
@@ -77,7 +80,6 @@ boot_pd:
     .align 4096
 boot_pt0:
     .set pte_flags_exec, 0x003
-    // Keep the first 2MiB executable until long-mode handoff is complete.
     .set pte_index, 0
     .rept 512
     .quad (pte_index * 0x1000) | pte_flags_exec
@@ -86,10 +88,9 @@ boot_pt0:
 
     .align 4096
 boot_pd_hi:
-    // Bootstrap identity map for the 3GiB..4GiB window (PDPT[3]).
-    // This keeps early stack/data accesses valid even when linker placement
-    // pushes boot sections near the top of low 32-bit virtual space.
-    // Includes PCD (bit 4) so LAPIC/IOAPIC MMIO in this range is uncacheable.
+    // Bootstrap identity map for the 3..4 GiB window with PCD (uncached)
+    // so LAPIC/IOAPIC MMIO at 0xFE??_???? is reachable as
+    // 0xFFFF_FFFF_FE??_???? without needing a separate fixmap.
     .set hi_page_flags_exec, 0x93
     .set hi_page_index, 0
     .rept 512
@@ -109,14 +110,31 @@ gdt64_ptr:
     .long gdt64
     .long 0
 
+    // 4 KiB stack used only while running in 32-bit protected mode
+    // (until the long-mode handoff sets RSP to the high alias of
+    // boot_stack).  Keeping this in .data.boot means its symbol value
+    // fits in a 32-bit immediate, which is required for `mov esp, ...`.
     .align 16
-boot_idt:
-    .zero 4096
-boot_idt_end:
+pmode_boot_stack:
+    .skip 0x1000
+pmode_boot_stack_end:
 
-boot_idt_ptr:
-    .word boot_idt_end - boot_idt - 1
-    .quad boot_idt
+    // ===========================================================
+    // Low-VA boot stack.  Lives in .bss.bootstack which the linker
+    // script keeps in the low-VA prefix.  Referenced from the
+    // long-mode entry by `movabs rsp, offset boot_stack_end` and
+    // OR'd with KERNEL_VIRT_BASE to obtain the high alias.
+    // ===========================================================
+
+    .section .bss.bootstack,"aw",@nobits
+    .align 16
+boot_stack:
+    .skip 0x01000000
+boot_stack_end:
+
+    // ===========================================================
+    // pvh_start32 — runs in 32-bit protected mode at LOW VA.
+    // ===========================================================
 
     .section .text.boot32,"ax",@progbits
     .code32
@@ -144,24 +162,21 @@ pvh_start32:
     mov al, 0xFF
     out 0x21, al
     out 0xA1, al
+    // Preserve PVH start_info ptr.
     mov esi, ebx
 
-    // Zero .bss/.common for static mut / atomics expected to start at 0.
-    mov edi, offset __bss_start
-    mov ecx, offset __bss_end
-    sub ecx, edi
-    xor eax, eax
-    mov edx, ecx
-    shr ecx, 2
-    rep stosd
-    mov ecx, edx
-    and ecx, 3
-    rep stosb
+    // BSS zeroing is deferred to long_mode_entry where 64-bit
+    // immediates are available; __bss_start / __bss_end live in
+    // the high-VA suffix and won't fit in a 32-bit immediate here.
 
-    mov esp, offset boot_stack_end
+    mov esp, offset pmode_boot_stack_end
 
-    // FIXUP: Materialize bootstrap page-table *pointer* entries from low
-    // runtime offsets so CR3 walks never see relocated virtual pointers.
+    // FIXUP: rebuild boot_pml4 / boot_pdpt_* pointer entries from
+    // their actual runtime addresses (the assembler-time .quad
+    // forms above use symbol values that are correct for the LMA
+    // we are loaded at, but writing them again with `or 0x3` makes
+    // the present + RW + user flags explicit and keeps the entries
+    // robust against minor relocations of .data.boot).
     mov eax, offset boot_pdpt_low
     or eax, 0x3
     mov dword ptr [boot_pml4 + 0], eax
@@ -197,15 +212,11 @@ pvh_start32:
     mov cr3, eax
     mov bl, 'B'
     call uart_putc32
+
     mov eax, cr4
-    // Enable baseline long-mode prerequisites and SSE support:
-    // - CR4.PAE (bit 5)
-    // - CR4.OSFXSR (bit 9)
-    // - CR4.OSXMMEXCPT (bit 10)
+    // CR4.PAE (bit 5), CR4.OSFXSR (bit 9), CR4.OSXMMEXCPT (bit 10)
     or eax, 0x620
-    // Conditionally enable supervisor protections when CPUID advertises them:
-    // - CR4.SMEP (bit 20) => CPUID.(EAX=7,ECX=0):EBX[7]
-    // - CR4.SMAP (bit 21) => CPUID.(EAX=7,ECX=0):EBX[20]
+    // Conditionally enable CR4.SMEP and CR4.SMAP when CPUID advertises them.
     push eax
     mov eax, 7
     xor ecx, ecx
@@ -220,13 +231,12 @@ pvh_start32:
     or eax, 0x200000
 4:
     mov cr4, eax
+
     mov ecx, 0xC0000080
     rdmsr
-    // Enable SYSCALL:
-    // - EFER.SCE (bit 8)
+    // EFER.SCE (bit 8) — enable SYSCALL/SYSRET.
     or eax, 0x100
-    // Conditionally enable EFER.NXE (bit 11) when supported:
-    // CPUID.(EAX=0x80000001):EDX[20]
+    // Conditionally enable EFER.NXE (bit 11).
     mov edi, eax
     mov eax, 0x80000000
     cpuid
@@ -241,17 +251,22 @@ pvh_start32:
     mov ecx, 0xC0000080
     mov eax, edi
     wrmsr
+
     mov bl, 'C'
     call uart_putc32
+
     lgdt [gdt64_ptr]
     mov eax, cr0
-    // Enable paging/protected mode, set CR0.MP, and clear CR0.EM so
-    // x87/SSE instructions (e.g. xorps/movups emitted by Rust) are valid.
+    // Clear CR0.EM, set CR0.PE | CR0.MP | CR0.PG.
     and eax, 0xFFFFFFFB
     or eax, 0x80000003
     mov cr0, eax
+
+    // Far-return into the LOW-VA 64-bit thunk.  long_mode_low_thunk's
+    // symbol value fits in a 32-bit immediate because it lives in
+    // the .text.boot64_thunk low-VA section.
     push 0x08
-    mov eax, offset long_mode_entry
+    mov eax, offset long_mode_low_thunk
     push eax
     retf
 
@@ -274,15 +289,74 @@ uart_putc32:
     pop eax
     ret
 
+    // ===========================================================
+    // .text.boot64_thunk — 64-bit code at LOW VA.
+    //
+    // pvh_start32 far-returns here in long mode.  The thunk uses
+    // a 64-bit movabs to load the high-VA absolute address of
+    // long_mode_entry and jumps to it.  After this jump every
+    // RIP-relative call resolves through PML4[511]/PDPT[510] (the
+    // high alias of the kernel image), so subsequent CR3 switches
+    // that drop PML4[0] do not strand the kernel.
+    // ===========================================================
+
+    .section .text.boot64_thunk,"ax",@progbits
+    .code64
+    .global long_mode_low_thunk
+    .type long_mode_low_thunk,@function
+long_mode_low_thunk:
+    cli
+    // Diagnostic 'D': blast a single byte to the UART without waiting
+    // for the line-status register.  At QEMU speeds the previous 'C'
+    // byte has already drained, so this almost always lands.
+    mov dx, 0x3F8
+    mov al, 'D'
+    out dx, al
+
+    movabs rax, offset long_mode_entry
+    jmp rax
+
+    // ===========================================================
+    // .text.boot — 64-bit code at HIGH VA.  Reached only via the
+    // thunk above.  All RIP-relative references from here resolve
+    // to high-VA symbols.
+    // ===========================================================
+
     .section .text.boot,"ax",@progbits
     .code64
 
     .weak _start
     .type _start,@function
 _start:
+    .global long_mode_entry
+    .type long_mode_entry,@function
 long_mode_entry:
     cli
-    // Populate a minimal catch-all IDT in-memory: all 256 gates -> emergency_idt_stub.
+
+    // Establish a high-VA stack.  boot_stack_end lives at LOW VA in
+    // .bss.bootstack; OR with KERNEL_VIRT_BASE = 0xFFFF_FFFF_8000_0000
+    // to obtain the high alias mapped via PML4[511]/PDPT[510]/boot_pd.
+    movabs rsp, offset boot_stack_end
+    movabs rax, 0xFFFFFFFF80000000
+    or rsp, rax
+
+    // Zero kernel BSS now that we have a stack and 64-bit immediates
+    // are available.  __bss_start / __bss_end are linker symbols in
+    // the high-VA suffix.
+    movabs rdi, offset __bss_start
+    movabs rcx, offset __bss_end
+    sub rcx, rdi
+    xor eax, eax
+    rep stosb
+
+    // Re-establish a stack pointer because the rep stosb above does
+    // not touch RSP, but be conservative and ensure stack is still
+    // aligned for the upcoming call.
+    and rsp, -16
+
+    // Build a minimal catch-all IDT in memory: all 256 gates point at
+    // emergency_idt_stub.  boot_idt and boot_idt_ptr live in the
+    // high-VA .data section, so RIP-relative LEA from high RIP works.
     lea r8, [rip + emergency_idt_stub]
     lea rdi, [rip + boot_idt]
     mov ecx, 256
@@ -302,21 +376,21 @@ long_mode_entry:
     dec ecx
     jnz 0b
     lidt [rip + boot_idt_ptr]
-    // Materialize stack in long mode, then force a low canonical alias so the
-    // bootstrap path does not depend on higher-half stack mappings.
-    lea rsp, [rip + boot_stack_end]
-    mov esp, esp
+
     xor rbp, rbp
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov ss, ax
+
     mov dil, 'E'
     call uart_putc64
     mov dil, 'F'
     call uart_putc64
-    // FIX: move start-info pointer into rdi (first argument) *after* the
-    // last uart_putc64 call that uses dil, so we don't clobber its low byte.
+
+    // Move PVH start_info pointer into rdi (first argument).  esi
+    // holds the low-PA pointer (always < 4 GiB), so a 32-bit move
+    // is sufficient and zero-extends the high half.
     mov edi, esi
     .weak yarm_kernel_main
     call yarm_kernel_main
@@ -326,6 +400,13 @@ long_mode_entry:
     hlt
     jmp 1b
 
+    // ===========================================================
+    // Default high-linked .text and .data: utility helpers and
+    // statics referenced from long_mode_entry.
+    // ===========================================================
+
+    .text
+    .code64
 uart_wait64:
     mov dx, 0x3FD
 3:
@@ -350,15 +431,26 @@ emergency_idt_stub:
 1:
     hlt
     jmp 1b
+
+    .data
+    .align 16
+boot_idt:
+    .zero 4096
+boot_idt_end:
+
+boot_idt_ptr:
+    .word boot_idt_end - boot_idt - 1
+    .quad boot_idt
     "#
 );
+
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const RING3_INIT_SERVER_TID: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const INITRAMFS_HELLO_WORLD_IMAGE_ID: u64 = 0x494E_4954_5848_454C; // "INITXHEL"
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-const AP_STACK_PHYS_BASE: u64 = 0x0180_0000;
+const AP_STACK_PHYS_BASE: u64 = 0x0200_0000; // 32 MiB, above kernel image+BSS, below 64 MiB identity limit.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const AP_STACK_BYTES: u64 = 16 * 1024;
 
