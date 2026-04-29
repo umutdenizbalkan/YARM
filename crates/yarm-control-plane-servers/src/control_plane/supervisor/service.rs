@@ -1168,11 +1168,18 @@ pub fn run() {
                                         process_manager_caps,
                                         fault.tid,
                                     ) {
-                                        Ok(Some(restart_token)) => yarm_user_rt::user_log!(
-                                            "supervisor.srv fault restart token resolved: tid={}, token={}",
-                                            fault.tid,
-                                            restart_token
-                                        ),
+                                        Ok(Some(restart_token)) => {
+                                            let event = TaskExitedEvent {
+                                                tid: fault.tid,
+                                                exit_code: fault.synthetic_exit_code(),
+                                                restart_token,
+                                            };
+                                            let mut ops = RuntimeSupervisorTaskExitOps {
+                                                token_tid: fault.tid,
+                                                token: restart_token,
+                                            };
+                                            let _ = supervisor.handle_task_exit(&mut ops, event);
+                                        }
                                         Ok(None) => yarm_user_rt::user_log!(
                                             "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={}; restart-token lookup unsupported/unavailable in runtime path",
                                             fault.tid,
@@ -1282,6 +1289,32 @@ fn register_supervised_task_with_process_manager(
         .recv(rep_cap)
         .map_err(|_| KernelError::WrongObject)?;
     Ok(())
+}
+
+#[cfg(not(test))]
+struct RuntimeSupervisorTaskExitOps {
+    token_tid: u64,
+    token: u64,
+}
+
+#[cfg(not(test))]
+impl SupervisorOutboundMessageOps for RuntimeSupervisorTaskExitOps {
+    fn ipc_send(&mut self, _cap: CapId, _msg: Message) -> Result<(), KernelError> {
+        Ok(())
+    }
+    fn ipc_reply(&mut self, _cap: CapId, _msg: Message) -> Result<(), KernelError> {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+impl SupervisorTaskExitOps for RuntimeSupervisorTaskExitOps {
+    fn mark_task_dead(&mut self, _tid: u64) -> Result<(), KernelError> {
+        Ok(())
+    }
+    fn task_restart_token(&self, tid: u64) -> Option<u64> {
+        (tid == self.token_tid).then_some(self.token)
+    }
 }
 
 #[cfg(test)]
