@@ -4,6 +4,7 @@
 // AArch64 prototype platform layout constants.
 pub const KERNEL_BOOTSTRAP_VIRT_BASE: u64 = 0x4008_0000;
 pub const KERNEL_BOOTSTRAP_PHYS_BASE: u64 = 0x4008_0000;
+pub const KERNEL_LINK_VIRT_BASE: u64 = 0x0;
 pub const NEXT_ANON_PHYS_BASE: u64 = 0x5000_0000;
 pub const KERNEL_PHYS_DIRECT_MAP_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 
