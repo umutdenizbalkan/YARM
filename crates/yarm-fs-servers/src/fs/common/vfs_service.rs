@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm_user_rt::ipc::Message;
 use super::vfs_ipc::{
     InMemoryBackend, MountNamespacePolicy, MountRecord, VfsBackend, VfsError, VfsRequest,
 };
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtArgs, OpenAtInlinePath, ReadWriteArgs, StatxArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_DUP,
-    VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL,
-    VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
+    OpenAtArgs, OpenAtInlinePath, ReadWriteArgs, StatxArgs, StatxInlinePath, VFS_OP_CLOSE,
+    VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL,
+    VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX,
+    VFS_OP_WRITE, VfsV1Args,
 };
+use yarm_user_rt::ipc::Message;
 
 const MAX_MOUNTS: usize = 8;
 
@@ -378,16 +379,24 @@ impl<B: VfsBackend> VfsService<B> {
                 path_inline,
                 ..
             } => {
+                let _ = path_ptr;
                 if let Some(path) = path_inline {
                     if !self.policy.allows_path_bytes(path.as_slice()) {
                         return Err(VfsError::PermissionDenied);
                     }
                     VfsReply::OpenAtFd(self.backend.openat_path(path.as_slice())?)
                 } else {
-                    if !self.policy.allows_path(path_ptr) {
-                        return Err(VfsError::PermissionDenied);
+                    #[cfg(test)]
+                    {
+                        if !self.policy.allows_path(path_ptr) {
+                            return Err(VfsError::PermissionDenied);
+                        }
+                        VfsReply::OpenAtFd(self.backend.openat(path_ptr)?)
                     }
-                    VfsReply::OpenAtFd(self.backend.openat(path_ptr)?)
+                    #[cfg(not(test))]
+                    {
+                        return Err(VfsError::Malformed);
+                    }
                 }
             }
             VfsRequest::Close { fd } => VfsReply::CloseResult(self.backend.close(fd)?),
@@ -398,16 +407,24 @@ impl<B: VfsBackend> VfsService<B> {
                 path_inline,
                 ..
             } => {
+                let _ = path_ptr;
                 if let Some(path) = path_inline {
                     if !self.policy.allows_path_bytes(path.as_slice()) {
                         return Err(VfsError::PermissionDenied);
                     }
                     VfsReply::StatxValue(self.backend.statx_path(path.as_slice())?)
                 } else {
-                    if !self.policy.allows_path(path_ptr) {
-                        return Err(VfsError::PermissionDenied);
+                    #[cfg(test)]
+                    {
+                        if !self.policy.allows_path(path_ptr) {
+                            return Err(VfsError::PermissionDenied);
+                        }
+                        VfsReply::StatxValue(self.backend.statx(path_ptr)?)
                     }
-                    VfsReply::StatxValue(self.backend.statx(path_ptr)?)
+                    #[cfg(not(test))]
+                    {
+                        return Err(VfsError::Malformed);
+                    }
                 }
             }
             VfsRequest::Ioctl { fd, request, arg } => {

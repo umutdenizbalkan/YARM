@@ -231,6 +231,7 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
         }
     }
 
+    /// Legacy numeric-path router kept for compatibility-only pointer ABI callers.
     fn route_by_path(&mut self, path_ptr: u64) -> &mut dyn VfsBackend {
         if path_ptr < self.split_at {
             &mut self.low
@@ -239,6 +240,7 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
         }
     }
 
+    /// Primary router for OPENAT/STATX runtime traffic.
     fn route_by_path_bytes(&mut self, path: &[u8]) -> &mut dyn VfsBackend {
         if path.starts_with(b"/initramfs/") {
             &mut self.high
@@ -593,6 +595,7 @@ impl MountNamespacePolicy {
         self
     }
 
+    /// Legacy numeric-path policy check kept for compatibility-only pointer ABI callers.
     pub const fn allows_path(self, path_ptr: u64) -> bool {
         if self.allow_all {
             return true;
@@ -609,11 +612,18 @@ impl MountNamespacePolicy {
         false
     }
 
+    /// Primary policy check for OPENAT/STATX runtime traffic.
     pub fn allows_path_bytes(self, path: &[u8]) -> bool {
         if self.allow_all {
             return true;
         }
-        !path.is_empty() && path.starts_with(b"/")
+        if path.is_empty() || !path.starts_with(b"/") {
+            return false;
+        }
+        if path.starts_with(b"/initramfs/") || path.starts_with(b"/dev/") || path.starts_with(b"/ramfs/") {
+            return true;
+        }
+        path == b"/etc/hosts"
     }
 }
 
