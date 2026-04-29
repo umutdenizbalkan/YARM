@@ -5,6 +5,7 @@ use super::vfs_ipc::{VfsBackend, VfsError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InodeRecord {
+    /// Stable internal path identifier (not a user pointer ABI path).
     pub path_ptr: u64,
     pub file_len: u64,
 }
@@ -18,9 +19,9 @@ pub struct FdRecord {
     pub inode: u64,
 }
 
-pub fn find_inode_index(inodes: &[Option<InodeRecord>], path_ptr: u64) -> Option<usize> {
+pub fn find_inode_index(inodes: &[Option<InodeRecord>], path_id: u64) -> Option<usize> {
     inodes.iter().position(|slot| {
-        slot.map(|inode| inode.path_ptr == path_ptr)
+        slot.map(|inode| inode.path_ptr == path_id)
             .unwrap_or(false)
     })
 }

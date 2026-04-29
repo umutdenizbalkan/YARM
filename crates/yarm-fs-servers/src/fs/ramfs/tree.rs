@@ -6,7 +6,7 @@ use super::super::common::fs::{
     FdRecord, InodeRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend, find_inode_index,
 };
 
-/// Compatibility-only legacy path identifier; prefer `RAMFS_BOOT_PATH`.
+/// Compatibility path-id constant used by mount/policy/interop tests.
 pub const RAMFS_BOOT_PATH_PTR: u64 = 0xA000;
 pub const RAMFS_BOOT_PATH: &[u8] = b"/ramfs/boot";
 
@@ -96,33 +96,6 @@ impl RamFsBackend {
         }
     }
 
-    fn open_inode_legacy_ptr(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        if let Some(inode) = self
-            .inodes
-            .iter()
-            .flatten()
-            .find(|inode| inode.path_ptr == path_ptr)
-            .map(|inode| inode.path_ptr)
-        {
-            return self.alloc_fd(inode);
-        }
-        if let Some(slot) = self.inodes.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(InodeRecord {
-                path_ptr,
-                file_len: 0,
-            });
-            return self.alloc_fd(path_ptr);
-        }
-        Err(VfsError::NoFd)
-    }
-
-    fn legacy_path_from_ptr(path_ptr: u64) -> Option<&'static [u8]> {
-        match path_ptr {
-            RAMFS_BOOT_PATH_PTR => Some(RAMFS_BOOT_PATH),
-            _ => None,
-        }
-    }
-
     fn lookup_by_path(&self, path: &[u8]) -> Result<u64, VfsError> {
         self.paths
             .iter()
@@ -181,24 +154,6 @@ impl ServiceFsBackend for RamFsBackend {
 }
 
 impl VfsBackend for RamFsBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let result = if let Some(path) = Self::legacy_path_from_ptr(path_ptr) {
-            self.openat_path(path)
-        } else {
-            self.open_inode_legacy_ptr(path_ptr)
-        };
-        match result {
-            Ok(fd) => {
-                self.metrics.open_count = self.metrics.open_count.saturating_add(1);
-                Ok(fd)
-            }
-            Err(err) => {
-                self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-                Err(err)
-            }
-        }
-    }
-
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         match self.open_inode_by_path(path) {
             Ok(fd) => {
@@ -261,24 +216,6 @@ impl VfsBackend for RamFsBackend {
         Ok(len)
     }
 
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let result = if let Some(path) = Self::legacy_path_from_ptr(path_ptr) {
-            self.statx_path(path)
-        } else {
-            let idx = match find_inode_index(&self.inodes, path_ptr) {
-                Some(idx) => idx,
-                None => {
-                    self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-                    return Err(VfsError::BadFd);
-                }
-            };
-            let file_len = self.inodes[idx].ok_or(VfsError::BadFd)?.file_len;
-            self.metrics.statx_count = self.metrics.statx_count.saturating_add(1);
-            Ok(Self::statx_value(file_len))
-        };
-        result
-    }
-
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         match self.metadata_by_path(path) {
             Ok(stat) => {
@@ -300,9 +237,9 @@ mod tests {
     #[test]
     fn ramfs_multi_open_allocates_unique_handles() {
         let mut fs = RamFsBackend::new();
-        let fd0 = fs.openat(0x1010).expect("open");
-        let fd1 = fs.openat(0x1010).expect("open");
-        let fd2 = fs.openat(0x2020).expect("open");
+        let fd0 = fs.openat_path(RAMFS_BOOT_PATH).expect("open");
+        let fd1 = fs.openat_path(RAMFS_BOOT_PATH).expect("open");
+        let fd2 = fs.openat_path(RAMFS_BOOT_PATH).expect("open");
         assert_eq!(fd0, 100);
         assert_eq!(fd1, 101);
         assert_eq!(fd2, 102);
@@ -311,10 +248,10 @@ mod tests {
     #[test]
     fn ramfs_statx_contract_encodes_type_mode_and_size() {
         let mut fs = RamFsBackend::new();
-        let fd = fs.openat(0x1010).expect("open");
+        let fd = fs.openat_path(RAMFS_BOOT_PATH).expect("open");
         let _ = fs.write(fd, 128).expect("write");
         assert_eq!(
-            fs.statx(0x1010).expect("stat"),
+            fs.statx_path(RAMFS_BOOT_PATH).expect("stat"),
             RAMFS_STATX_TYPE_REGULAR | RAMFS_MODE_OWNER_READ | RAMFS_MODE_OWNER_WRITE | (128 << 16)
         );
     }
@@ -322,7 +259,7 @@ mod tests {
     #[test]
     fn ramfs_metrics_account_reads_writes_and_errors() {
         let mut fs = RamFsBackend::new();
-        let fd = fs.openat(0x1010).expect("open");
+        let fd = fs.openat_path(RAMFS_BOOT_PATH).expect("open");
         let _ = fs.write(fd, 64).expect("write");
         let _ = fs.read(fd, 32).expect("read");
         let _ = fs.close(fd).expect("close");
@@ -356,14 +293,4 @@ mod tests {
         assert_eq!(fs.statx_path(b"/ramfs/missing"), Err(VfsError::InvalidPath));
     }
 
-    #[test]
-    fn ramfs_legacy_pointer_adapter_still_works() {
-        let mut fs = RamFsBackend::new();
-        let fd = fs.openat(RAMFS_BOOT_PATH_PTR).expect("open ptr");
-        let _ = fs.write(fd, 16).expect("write");
-        assert_eq!(
-            fs.statx(RAMFS_BOOT_PATH_PTR).expect("stat ptr"),
-            RAMFS_STATX_TYPE_REGULAR | RAMFS_MODE_OWNER_READ | RAMFS_MODE_OWNER_WRITE | (16 << 16)
-        );
-    }
 }

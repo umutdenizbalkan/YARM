@@ -12,10 +12,6 @@ use yarm_fs_servers::common::vfs_ipc::{
     epoll_ctl_message, epoll_pwait_message, fcntl_message, ioctl_message, openat_inline_message,
     poll_message, read_message, sendfile_message, statx_inline_message, write_message,
 };
-#[cfg(test)]
-use yarm_fs_servers::common::vfs_ipc::{
-    OpenAtRequest, StatxRequest, openat_message, statx_message,
-};
 use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_srv_common::vfs_reply::VfsReply;
 #[cfg(test)]
@@ -31,6 +27,18 @@ pub struct VfsLoopSummary {
 
 #[cfg(test)]
 const VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
+
+#[cfg(test)]
+fn path_bytes_from_id(path_id: u64) -> Option<&'static [u8]> {
+    use yarm_fs_servers::devfs::{DEV_CONSOLE_PATH, DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH, DEV_NULL_PATH_PTR};
+    use yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_BOOT_MARKER_PATH_PTR};
+    match path_id {
+        DEV_NULL_PATH_PTR => Some(DEV_NULL_PATH),
+        DEV_CONSOLE_PATH_PTR => Some(DEV_CONSOLE_PATH),
+        INITRAMFS_BOOT_MARKER_PATH_PTR => Some(INITRAMFS_BOOT_MARKER_PATH),
+        _ => None,
+    }
+}
 
 fn decode_fd_reply(reply: yarm_user_rt::ipc::Message) -> Result<u64, VfsError> {
     VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
@@ -202,8 +210,9 @@ fn roundtrip_ipc_with_budget<B: VfsBackend>(
 pub fn run_request_loop_over_kernel_ipc(
     runtime: &mut impl VfsKernelIpcRuntime,
     vfs: &mut FsService<impl VfsBackend>,
-    path_ptr: u64,
+    path_id: u64,
 ) -> Result<VfsLoopSummary, VfsError> {
+    let path = path_bytes_from_id(path_id).ok_or(VfsError::InvalidPath)?;
     let (_, client_send_cap, server_recv_cap) = runtime.create_endpoint(16)?;
     let (_, server_send_cap, client_recv_cap) = runtime.create_endpoint(16)?;
 
@@ -214,12 +223,7 @@ pub fn run_request_loop_over_kernel_ipc(
         server_recv_cap,
         server_send_cap,
         client_recv_cap,
-        openat_message(OpenAtRequest {
-            dirfd: 0,
-            path_ptr,
-            flags: 0,
-            mode: 0,
-        })
+        openat_inline_message(0, path, 0, 0)
         .map_err(|_| VfsError::Malformed)?,
     )?;
     let fd = decode_fd_reply(open_reply)?;
@@ -257,12 +261,7 @@ pub fn run_request_loop_over_kernel_ipc(
             len: 32,
         })
         .map_err(|_| VfsError::Malformed)?,
-        statx_message(StatxRequest {
-            dirfd: 0,
-            path_ptr,
-            flags: 0,
-            mask_or_buf: 0,
-        })
+        statx_inline_message(0, path, 0, 0)
         .map_err(|_| VfsError::Malformed)?,
         ioctl_message(fd, 0x1234, 0x55).map_err(|_| VfsError::Malformed)?,
         fcntl_message(fd, 3, 9).map_err(|_| VfsError::Malformed)?,
@@ -300,10 +299,10 @@ pub fn run_request_loop_over_kernel_ipc(
 #[cfg(test)]
 pub fn run_with_kernel_ipc(
     runtime: &mut impl VfsKernelIpcRuntime,
-    path_ptr: u64,
+    path_id: u64,
 ) -> Result<VfsLoopSummary, VfsError> {
     let mut vfs = FsService::with_backend(InMemoryBackend::new());
-    run_request_loop_over_kernel_ipc(runtime, &mut vfs, path_ptr)
+    run_request_loop_over_kernel_ipc(runtime, &mut vfs, path_id)
 }
 
 pub fn run() {
@@ -421,12 +420,7 @@ mod tests {
             server_recv,
             server_send,
             client_recv,
-            openat_message(OpenAtRequest {
-                dirfd: 0,
-                path_ptr: 0x4444,
-                flags: 0,
-                mode: 0,
-            })
+            openat_inline_message(0, path_bytes_from_id(0x4444).unwrap_or(b"/invalid"), 0, 0)
             .expect("open"),
             0,
         )
@@ -482,12 +476,7 @@ mod tests {
             server_recv,
             server_send,
             client_recv,
-            openat_message(OpenAtRequest {
-                dirfd: 0,
-                path_ptr: DEV_NULL_PATH_PTR,
-                flags: 0,
-                mode: 0,
-            })
+            openat_inline_message(0, path_bytes_from_id(DEV_NULL_PATH_PTR).unwrap_or(b"/invalid"), 0, 0)
             .expect("open msg"),
         )
         .expect("open devfs");
@@ -521,12 +510,7 @@ mod tests {
             server_recv,
             server_send,
             client_recv,
-            openat_message(OpenAtRequest {
-                dirfd: 0,
-                path_ptr: 0xABCD,
-                flags: 0,
-                mode: 0,
-            })
+            openat_inline_message(0, path_bytes_from_id(0xABCD).unwrap_or(b"/invalid"), 0, 0)
             .expect("open msg"),
         )
         .expect("open ramfs");
@@ -566,12 +550,7 @@ mod tests {
                         server_recv,
                         server_send,
                         client_recv,
-                        openat_message(OpenAtRequest {
-                            dirfd: 0,
-                            path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-                            flags: 0,
-                            mode: 0,
-                        })
+                        openat_inline_message(0, path_bytes_from_id(INITRAMFS_BOOT_MARKER_PATH_PTR).unwrap_or(b"/invalid"), 0, 0)
                         .expect("open msg"),
                     )
                     .expect("open initramfs");
@@ -611,12 +590,7 @@ mod tests {
                             server_recv,
                             server_send,
                             client_recv,
-                            openat_message(OpenAtRequest {
-                                dirfd: 0,
-                                path_ptr: DEV_NULL_PATH_PTR,
-                                flags: 0,
-                                mode: 0,
-                            })
+                            openat_inline_message(0, path_bytes_from_id(DEV_NULL_PATH_PTR).unwrap_or(b"/invalid"), 0, 0)
                             .expect("open null"),
                         )
                         .expect("open null reply"),
@@ -654,12 +628,7 @@ mod tests {
                             server_recv,
                             server_send,
                             client_recv,
-                            openat_message(OpenAtRequest {
-                                dirfd: 0,
-                                path_ptr: DEV_CONSOLE_PATH_PTR,
-                                flags: 0,
-                                mode: 0,
-                            })
+                            openat_inline_message(0, path_bytes_from_id(DEV_CONSOLE_PATH_PTR).unwrap_or(b"/invalid"), 0, 0)
                             .expect("open console"),
                         )
                         .expect("open console reply"),
@@ -703,12 +672,7 @@ mod tests {
                             server_recv,
                             server_send,
                             client_recv,
-                            openat_message(OpenAtRequest {
-                                dirfd: 0,
-                                path_ptr: 0xCAFE,
-                                flags: 0,
-                                mode: 0,
-                            })
+                            openat_inline_message(0, path_bytes_from_id(0xCAFE).unwrap_or(b"/invalid"), 0, 0)
                             .expect("open ramfs"),
                         )
                         .expect("open ramfs reply"),
@@ -736,12 +700,7 @@ mod tests {
                         server_recv,
                         server_send,
                         client_recv,
-                        statx_message(StatxRequest {
-                            dirfd: 0,
-                            path_ptr: 0xCAFE,
-                            flags: 0,
-                            mask_or_buf: 0,
-                        })
+                        statx_inline_message(0, path_bytes_from_id(0xCAFE).unwrap_or(b"/invalid"), 0, 0)
                         .expect("stat ramfs"),
                     )
                     .expect("stat ramfs reply");
@@ -766,12 +725,7 @@ mod tests {
                             server_recv,
                             server_send,
                             client_recv,
-                            openat_message(OpenAtRequest {
-                                dirfd: 0,
-                                path_ptr: INITRAMFS_BOOT_MARKER_PATH_PTR,
-                                flags: 0,
-                                mode: 0,
-                            })
+                            openat_inline_message(0, path_bytes_from_id(INITRAMFS_BOOT_MARKER_PATH_PTR).unwrap_or(b"/invalid"), 0, 0)
                             .expect("open init"),
                         )
                         .expect("open init reply"),

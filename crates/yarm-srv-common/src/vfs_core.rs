@@ -31,8 +31,6 @@ struct FdEntry {
 pub enum VfsRequest {
     OpenAt {
         _dirfd: u64,
-        /// Legacy pointer-path argument; prefer `path_inline`.
-        path_ptr: u64,
         path_inline: Option<PathBytes>,
         _flags: u64,
         _mode: u64,
@@ -52,8 +50,6 @@ pub enum VfsRequest {
     },
     Statx {
         _dirfd: u64,
-        /// Legacy pointer-path argument; prefer `path_inline`.
-        path_ptr: u64,
         path_inline: Option<PathBytes>,
         _flags: u64,
         _mask_or_buf: u64,
@@ -100,16 +96,12 @@ pub enum VfsRequest {
 }
 
 pub trait VfsBackend {
-    /// Legacy pointer-path open; prefer `openat_path`.
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError>;
     fn openat_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
         Err(VfsError::InvalidPath)
     }
     fn close(&mut self, fd: u64) -> Result<u64, VfsError>;
     fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
     fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
-    /// Legacy pointer-path statx; prefer `statx_path`.
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError>;
     fn statx_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
         Err(VfsError::InvalidPath)
     }
@@ -231,14 +223,7 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
         }
     }
 
-    fn route_by_path(&mut self, path_ptr: u64) -> &mut dyn VfsBackend {
-        if path_ptr < self.split_at {
-            &mut self.low
-        } else {
-            &mut self.high
-        }
-    }
-
+    /// Primary router for OPENAT/STATX runtime traffic.
     fn route_by_path_bytes(&mut self, path: &[u8]) -> &mut dyn VfsBackend {
         if path.starts_with(b"/initramfs/") {
             &mut self.high
@@ -257,9 +242,6 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
 }
 
 impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        self.route_by_path(path_ptr).openat(path_ptr)
-    }
 
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         self.route_by_path_bytes(path).openat_path(path)
@@ -277,9 +259,6 @@ impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
         self.route_by_fd(fd).write(fd, len)
     }
 
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        self.route_by_path(path_ptr).statx(path_ptr)
-    }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         self.route_by_path_bytes(path).statx_path(path)
@@ -333,9 +312,6 @@ impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
 }
 
 impl VfsBackend for InMemoryBackend {
-    fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        self.alloc_fd(path_ptr)
-    }
 
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         if path.is_empty() {
@@ -367,9 +343,6 @@ impl VfsBackend for InMemoryBackend {
         Ok(len)
     }
 
-    fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        Ok(path_ptr)
-    }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         if path.is_empty() {
@@ -593,6 +566,7 @@ impl MountNamespacePolicy {
         self
     }
 
+    /// Legacy numeric-path policy check kept for compatibility-only pointer ABI callers.
     pub const fn allows_path(self, path_ptr: u64) -> bool {
         if self.allow_all {
             return true;
@@ -609,11 +583,18 @@ impl MountNamespacePolicy {
         false
     }
 
+    /// Primary policy check for OPENAT/STATX runtime traffic.
     pub fn allows_path_bytes(self, path: &[u8]) -> bool {
         if self.allow_all {
             return true;
         }
-        !path.is_empty() && path.starts_with(b"/")
+        if path.is_empty() || !path.starts_with(b"/") {
+            return false;
+        }
+        if path.starts_with(b"/initramfs/") || path.starts_with(b"/dev/") || path.starts_with(b"/ramfs/") {
+            return true;
+        }
+        path == b"/etc/hosts"
     }
 }
 

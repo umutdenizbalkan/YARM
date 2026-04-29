@@ -96,13 +96,13 @@ mod tests {
     use super::*;
     use yarm_user_rt::ipc::Message;
     use super::super::super::common::vfs_ipc::{
-        CloseRequest, MountNamespacePolicy, MountRouter, OpenAtRequest, StatxRequest, close_message,
-        openat_message, statx_message,
+        CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_inline_message,
+        statx_inline_message,
     };
     use super::super::super::common::vfs_service::VfsService;
     use super::super::super::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
     use super::super::tree::RAMFS_BOOT_PATH_PTR;
-    use yarm_ipc_abi::vfs_abi::{OpenAtArgs, ReadWriteArgs, StatxArgs, VFS_OP_OPENAT};
+    use yarm_ipc_abi::vfs_abi::{OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_OPENAT};
 
     #[test]
     fn ramfs_service_supports_write_read_and_stat_with_metrics() {
@@ -119,18 +119,11 @@ mod tests {
 
     #[test]
     fn ramfs_protocol_vectors_match_frozen_vfs_codec() {
-        let open = openat_message(OpenAtRequest {
-            dirfd: 0,
-            path_ptr: RAMFS_BOOT_PATH_PTR,
-            flags: 0,
-            mode: 0,
-        })
+        let open = openat_inline_message(0, RAMFS_BOOT_PATH, 0, 0)
         .expect("open");
         assert_eq!(open.opcode, VFS_OP_OPENAT);
-        assert_eq!(
-            open.as_slice(),
-            &OpenAtArgs::new(0, RAMFS_BOOT_PATH_PTR, 0, 0).encode()
-        );
+        let decoded_open = OpenAtInlinePath::decode(open.as_slice()).expect("decode open");
+        assert_eq!(decoded_open.path, RAMFS_BOOT_PATH);
 
         let write = write_message(ReadWriteRequest {
             fd: 100,
@@ -140,17 +133,10 @@ mod tests {
         .expect("write");
         assert_eq!(write.as_slice(), &ReadWriteArgs::new(100, 0, 8).encode());
 
-        let stat = statx_message(StatxRequest {
-            dirfd: 0,
-            path_ptr: RAMFS_BOOT_PATH_PTR,
-            flags: 0,
-            mask_or_buf: 0,
-        })
+        let stat = statx_inline_message(0, RAMFS_BOOT_PATH, 0, 0)
         .expect("stat");
-        assert_eq!(
-            stat.as_slice(),
-            &StatxArgs::new(0, RAMFS_BOOT_PATH_PTR, 0, 0).encode()
-        );
+        let decoded_stat = StatxInlinePath::decode(stat.as_slice()).expect("decode stat");
+        assert_eq!(decoded_stat.path, RAMFS_BOOT_PATH);
     }
 
     #[test]
@@ -178,24 +164,13 @@ mod tests {
 
         let open_ramfs = svc
             .handle_request(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: RAMFS_BOOT_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
-                })
-                .expect("open"),
+                openat_inline_message(0, RAMFS_BOOT_PATH, 0, 0).expect("open"),
             )
             .expect("ramfs open");
         assert_eq!(open_ramfs.opcode, VFS_OP_OPENAT);
 
         let denied = svc.handle_request(
-            openat_message(OpenAtRequest {
-                dirfd: 0,
-                path_ptr: 0xA100,
-                flags: 0,
-                mode: 0,
-            })
+            openat_inline_message(0, b"denied", 0, 0)
             .expect("open"),
         );
         assert_eq!(denied, Err(VfsError::PermissionDenied));
@@ -207,13 +182,7 @@ mod tests {
         svc.mount(RAMFS_BOOT_PATH_PTR, 1).expect("mount");
         let open = svc
             .handle_request(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: RAMFS_BOOT_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
-                })
-                .expect("open"),
+                openat_inline_message(0, RAMFS_BOOT_PATH, 0, 0).expect("open"),
             )
             .expect("open reply");
         let fd = decode_reply_u64(open);
@@ -245,13 +214,7 @@ mod tests {
         svc.mount(RAMFS_BOOT_PATH_PTR, 1).expect("mount");
         let open = svc
             .handle_request(
-                openat_message(OpenAtRequest {
-                    dirfd: 0,
-                    path_ptr: RAMFS_BOOT_PATH_PTR,
-                    flags: 0,
-                    mode: 0,
-                })
-                .expect("open"),
+                openat_inline_message(0, RAMFS_BOOT_PATH, 0, 0).expect("open"),
             )
             .expect("open reply");
         let fd = decode_reply_u64(open);
