@@ -6,7 +6,7 @@ use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 #[cfg(not(test))]
 use yarm_user_rt::runtime::{KernelIpcError as KernelError, StartupContext, startup_context};
 #[cfg(not(test))]
-use yarm_user_rt::syscall::SyscallIpcTransport;
+use yarm_user_rt::syscall::{IpcTransport, SyscallIpcTransport, yield_now};
 use yarm_user_rt::capability::CapId;
 #[cfg(test)]
 use yarm_user_rt::capability::CapRights;
@@ -31,31 +31,20 @@ use yarm_ipc_abi::supervisor_abi::{
     SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusRequest, TransferRevokedEvent,
 };
 
-#[cfg(test)]
 const SUPERVISOR_FAULT_REPORT_WIRE_LEN: usize = 17;
-#[cfg(test)]
 const SUPERVISOR_FAULT_REPORT_TID_START: usize = 0;
-#[cfg(test)]
 const SUPERVISOR_FAULT_REPORT_TID_END: usize = 8;
-#[cfg(test)]
 const SUPERVISOR_FAULT_REPORT_ADDR_START: usize = 8;
-#[cfg(test)]
 const SUPERVISOR_FAULT_REPORT_ADDR_END: usize = 16;
-#[cfg(test)]
 const SUPERVISOR_FAULT_REPORT_ACCESS_INDEX: usize = 16;
-#[cfg(test)]
 const SUPERVISOR_FAULT_EXIT_CODE_TAG: u64 = 0xF000_0000_0000_0000u64;
-#[cfg(test)]
 const SUPERVISOR_FAULT_EXIT_CODE_ACCESS_SHIFT: u64 = 56;
-#[cfg(test)]
 const SUPERVISOR_FAULT_EXIT_CODE_ADDR_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 /// Kernel-originated supervisor fault-report notification opcode.
 ///
 /// The kernel fault path uses `Message::new(0, payload)` for the 17-byte fault report wire payload.
-#[cfg(test)]
 const SUPERVISOR_OP_FAULT_REPORT_WIRE: u16 = 0;
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SupervisorFaultReportWire {
     tid: u64,
@@ -63,7 +52,6 @@ struct SupervisorFaultReportWire {
     access: u8,
 }
 
-#[cfg(test)]
 impl SupervisorFaultReportWire {
     fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != SUPERVISOR_FAULT_REPORT_WIRE_LEN {
@@ -102,6 +90,8 @@ const SUPERVISOR_RECV_BUDGET_TICKS: u64 = 1;
 const SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS: u64 = 1;
 #[cfg(not(test))]
 const SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS: u64 = 100;
+#[cfg(not(test))]
+const SUPERVISOR_RUNTIME_IDLE_YIELD_TICKS: usize = 1;
 
 #[cfg(not(test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1131,9 +1121,9 @@ pub fn run() {
     let service = SupervisorService::new_from_runtime_handoff(runtime_handoff);
     match service {
         Ok(supervisor) => {
-            let _ = &mut transport;
+            let mut supervisor = supervisor;
             yarm_user_rt::user_log!(
-                "supervisor.srv runtime handoff ready: init_tid={}, supervisor_tid={}, control_recv_ep={}, control_send_ep={}, fault_recv_ep={}, init_alert_send_ep={}, init_alert_recv_ep={}, degraded={}; TODO: wire blocking runtime event loop",
+                "supervisor.srv runtime handoff ready: init_tid={}, supervisor_tid={}, control_recv_ep={}, control_send_ep={}, fault_recv_ep={}, init_alert_send_ep={}, init_alert_recv_ep={}, degraded={}; runtime receive loop enabled",
                 supervisor.init_tid,
                 supervisor.handoff.supervisor_tid,
                 supervisor.handoff.supervisor_control_recv_cap.0,
@@ -1143,6 +1133,57 @@ pub fn run() {
                 supervisor.handoff.init_alert_recv_cap.0,
                 supervisor.degraded(),
             );
+            loop {
+                let mut made_progress = false;
+                match transport.recv(supervisor.handoff.supervisor_control_recv_cap.0 as u32) {
+                    Ok(Some(_msg)) => {
+                        made_progress = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        yarm_user_rt::user_log!(
+                            "supervisor.srv control recv error: {:?}",
+                            err
+                        );
+                    }
+                }
+
+                match transport.recv(supervisor.handoff.supervisor_fault_recv_cap.0 as u32) {
+                    Ok(Some(msg)) => {
+                        made_progress = true;
+                        if msg.opcode == SUPERVISOR_OP_FAULT_REPORT_WIRE {
+                            match SupervisorFaultReportWire::decode(msg.as_slice()) {
+                                Some(fault) => {
+                                    yarm_user_rt::user_log!(
+                                        "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={}; restart-token IPC not yet implemented in userspace runtime",
+                                        fault.tid,
+                                        fault.fault_addr,
+                                        fault.access
+                                    );
+                                }
+                                None => {
+                                    yarm_user_rt::user_log!(
+                                        "supervisor.srv fault report decode failed: len={}",
+                                        msg.as_slice().len()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        yarm_user_rt::user_log!("supervisor.srv fault recv error: {:?}", err);
+                    }
+                }
+
+                if !made_progress {
+                    for _ in 0..SUPERVISOR_RUNTIME_IDLE_YIELD_TICKS {
+                        let _ = yield_now();
+                    }
+                } else {
+                    let _ = supervisor.degraded();
+                }
+            }
         }
         Err(err) => {
             yarm_user_rt::user_log!(
