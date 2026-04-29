@@ -119,19 +119,6 @@ impl InitramfsBackend {
         self.metrics
     }
 
-    fn legacy_path_from_ptr(path_ptr: u64) -> Option<&'static [u8]> {
-        match path_ptr {
-            INITRAMFS_BOOT_MARKER_PATH_PTR => Some(INITRAMFS_BOOT_MARKER_PATH),
-            INITRAMFS_INIT_PATH_PTR => Some(INITRAMFS_INIT_PATH),
-            INITRAMFS_ETC_HOSTS_PATH_PTR => Some(INITRAMFS_ETC_HOSTS_PATH),
-            INITRAMFS_PROC_MGR_PATH_PTR => Some(INITRAMFS_PROC_MGR_PATH),
-            INITRAMFS_VFS_PATH_PTR => Some(INITRAMFS_VFS_PATH),
-            INITRAMFS_SUPERVISOR_PATH_PTR => Some(INITRAMFS_SUPERVISOR_PATH),
-            INITRAMFS_POSIX_COMPAT_PATH_PTR => Some(INITRAMFS_POSIX_COMPAT_PATH),
-            _ => None,
-        }
-    }
-
     fn lookup_by_path(&self, path: &[u8]) -> Result<usize, VfsError> {
         self.inodes
             .iter()
@@ -184,11 +171,9 @@ impl InitramfsBackend {
 
 impl VfsBackend for InitramfsBackend {
     fn openat(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let Some(path) = Self::legacy_path_from_ptr(path_ptr) else {
-            self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-            return Err(VfsError::BadFd);
-        };
-        self.openat_path(path)
+        let _ = path_ptr;
+        self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+        Err(VfsError::InvalidPath)
     }
 
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -243,11 +228,9 @@ impl VfsBackend for InitramfsBackend {
     }
 
     fn statx(&mut self, path_ptr: u64) -> Result<u64, VfsError> {
-        let Some(path) = Self::legacy_path_from_ptr(path_ptr) else {
-            self.metrics.error_count = self.metrics.error_count.saturating_add(1);
-            return Err(VfsError::BadFd);
-        };
-        self.statx_path(path)
+        let _ = path_ptr;
+        self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+        Err(VfsError::InvalidPath)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -271,9 +254,9 @@ mod tests {
     #[test]
     fn initramfs_multi_open_allocates_unique_fds() {
         let mut fs = InitramfsBackend::new(4096);
-        let fd0 = fs.openat(INITRAMFS_BOOT_MARKER_PATH_PTR).expect("open");
-        let fd1 = fs.openat(INITRAMFS_BOOT_MARKER_PATH_PTR).expect("open");
-        let fd2 = fs.openat(INITRAMFS_INIT_PATH_PTR).expect("open");
+        let fd0 = fs.openat_path(INITRAMFS_BOOT_MARKER_PATH).expect("open");
+        let fd1 = fs.openat_path(INITRAMFS_BOOT_MARKER_PATH).expect("open");
+        let fd2 = fs.openat_path(INITRAMFS_INIT_PATH).expect("open");
         assert_eq!(fd0, 10);
         assert_eq!(fd1, 11);
         assert_eq!(fd2, 12);
@@ -289,8 +272,8 @@ mod tests {
     #[test]
     fn initramfs_paths_have_stable_read_only_semantics() {
         let mut fs = InitramfsBackend::new(4096);
-        let boot_fd = fs.openat(INITRAMFS_BOOT_MARKER_PATH_PTR).expect("open");
-        let init_fd = fs.openat(INITRAMFS_INIT_PATH_PTR).expect("open");
+        let boot_fd = fs.openat_path(INITRAMFS_BOOT_MARKER_PATH).expect("open");
+        let init_fd = fs.openat_path(INITRAMFS_INIT_PATH).expect("open");
         assert_eq!(fs.read(boot_fd, 8192), Ok(4096));
         assert_eq!(fs.read(init_fd, 8192), Ok(1024));
         assert_eq!(fs.write(boot_fd, 1), Err(VfsError::Unsupported));
@@ -299,8 +282,8 @@ mod tests {
     #[test]
     fn initramfs_statx_contract_encodes_type_mode_and_size() {
         let mut fs = InitramfsBackend::new(4096);
-        let boot_stat = fs.statx(INITRAMFS_BOOT_MARKER_PATH_PTR).expect("stat");
-        let hosts_stat = fs.statx(INITRAMFS_ETC_HOSTS_PATH_PTR).expect("stat");
+        let boot_stat = fs.statx_path(INITRAMFS_BOOT_MARKER_PATH).expect("stat");
+        let hosts_stat = fs.statx_path(INITRAMFS_ETC_HOSTS_PATH).expect("stat");
         assert_eq!(
             boot_stat,
             INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (4096 << 16)
@@ -324,7 +307,7 @@ mod tests {
     #[test]
     fn initramfs_metrics_account_reads_and_errors() {
         let mut fs = InitramfsBackend::new(4096);
-        let boot_fd = fs.openat(INITRAMFS_BOOT_MARKER_PATH_PTR).expect("open");
+        let boot_fd = fs.openat_path(INITRAMFS_BOOT_MARKER_PATH).expect("open");
         let _ = fs.read(boot_fd, 64).expect("read");
         let _ = fs.write(boot_fd, 64).expect_err("write unsupported");
         let _ = fs.close(boot_fd).expect("close");
@@ -342,10 +325,10 @@ mod tests {
     #[test]
     fn initramfs_core_service_paths_exist_with_stable_statx_sizes() {
         let mut fs = InitramfsBackend::new(4096);
-        let proc_stat = fs.statx(INITRAMFS_PROC_MGR_PATH_PTR).expect("proc stat");
-        let vfs_stat = fs.statx(INITRAMFS_VFS_PATH_PTR).expect("vfs stat");
+        let proc_stat = fs.statx_path(INITRAMFS_PROC_MGR_PATH).expect("proc stat");
+        let vfs_stat = fs.statx_path(INITRAMFS_VFS_PATH).expect("vfs stat");
         let supervisor_stat = fs
-            .statx(INITRAMFS_SUPERVISOR_PATH_PTR)
+            .statx_path(INITRAMFS_SUPERVISOR_PATH)
             .expect("supervisor stat");
         let expected = INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (1536 << 16);
         assert_eq!(proc_stat, expected);
@@ -354,21 +337,9 @@ mod tests {
     }
 
     #[test]
-    fn initramfs_legacy_path_ptr_adapter_maps_to_byte_paths() {
+    fn initramfs_pointer_entrypoints_are_rejected_for_runtime_paths() {
         let mut fs = InitramfsBackend::new(4096);
-        let fd = fs.openat(INITRAMFS_BOOT_MARKER_PATH_PTR).expect("open ptr");
-        let stat = fs.statx(INITRAMFS_BOOT_MARKER_PATH_PTR).expect("stat ptr");
-        assert_eq!(fd, 10);
-        assert_eq!(
-            stat,
-            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (4096 << 16)
-        );
-    }
-
-    #[test]
-    fn initramfs_legacy_path_ptr_adapter_rejects_unknown_ids() {
-        let mut fs = InitramfsBackend::new(4096);
-        assert_eq!(fs.openat(0xDEAD_BEEF), Err(VfsError::BadFd));
-        assert_eq!(fs.statx(0xDEAD_BEEF), Err(VfsError::BadFd));
+        assert_eq!(fs.openat(INITRAMFS_BOOT_MARKER_PATH_PTR), Err(VfsError::InvalidPath));
+        assert_eq!(fs.statx(INITRAMFS_BOOT_MARKER_PATH_PTR), Err(VfsError::InvalidPath));
     }
 }
