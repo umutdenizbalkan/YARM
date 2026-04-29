@@ -800,7 +800,99 @@ impl KernelState {
     }
 }
 
-pub fn dispatch(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame: &mut TrapFrame) {
+pub fn dispatch(ipc: &mut impl IpcTransport, bindings: &PosixServiceBindings, frame: &mut TrapFrame) {
+    let result: Result<usize, PosixErrno> =
+        (|| match PosixCompatSyscall::decode(frame.syscall_num())? {
+            PosixCompatSyscall::Close => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
+                bindings.send_vfs_request(ipc, VFS_OP_CLOSE, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::Read => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), frame.arg(LINUX_ARG1), frame.arg(LINUX_ARG2), 0);
+                bindings.send_vfs_request(ipc, VFS_OP_READ, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::Write => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), frame.arg(LINUX_ARG1), frame.arg(LINUX_ARG2), 0);
+                bindings.send_vfs_request(ipc, VFS_OP_WRITE, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::Ioctl => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), frame.arg(LINUX_ARG1), frame.arg(LINUX_ARG2), frame.arg(LINUX_ARG3));
+                bindings.send_vfs_request(ipc, VFS_OP_IOCTL, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::Dup => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
+                bindings.send_vfs_request(ipc, VFS_OP_DUP, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::Fcntl => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), frame.arg(LINUX_ARG1), frame.arg(LINUX_ARG2), 0);
+                bindings.send_vfs_request(ipc, VFS_OP_FCNTL, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::Poll => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), frame.arg(LINUX_ARG1), frame.arg(LINUX_ARG2), 0);
+                bindings.send_vfs_request(ipc, VFS_OP_POLL, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::EpollCreate1 => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), 0, 0, 0);
+                bindings.send_vfs_request(ipc, VFS_OP_EPOLL_CREATE1, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::EpollCtl => {
+                let payload = pack_epoll_ctl(frame.arg(LINUX_ARG0), frame.arg(LINUX_ARG1), frame.arg(LINUX_ARG2), frame.arg(LINUX_ARG3));
+                bindings.send_vfs_request(ipc, VFS_OP_EPOLL_CTL, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::EpollPwait => {
+                let payload = pack_vfs4(frame.arg(LINUX_ARG0), frame.arg(LINUX_ARG1), frame.arg(LINUX_ARG2), frame.arg(LINUX_ARG3));
+                bindings.send_vfs_request(ipc, VFS_OP_EPOLL_PWAIT, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::Sendfile => {
+                let payload = pack_sendfile(frame.arg(LINUX_ARG0), frame.arg(LINUX_ARG1), frame.arg(LINUX_ARG2), frame.arg(LINUX_ARG3));
+                bindings.send_vfs_request(ipc, VFS_OP_SENDFILE, &payload)?;
+                let reply = bindings.recv_vfs_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::Socket => {
+                let payload = SocketArgs::new(frame.arg(LINUX_ARG0) as u64, frame.arg(LINUX_ARG1) as u64, frame.arg(LINUX_ARG2) as u64).encode();
+                bindings.send_socket_request(ipc, SOCKET_OP_SOCKET, &payload)?;
+                let reply = bindings.recv_socket_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::Connect => {
+                let payload = ConnectArgs::new(frame.arg(LINUX_ARG0) as u64, frame.arg(LINUX_ARG1) as u64, frame.arg(LINUX_ARG2) as u64).encode();
+                bindings.send_socket_request(ipc, SOCKET_OP_CONNECT, &payload)?;
+                let reply = bindings.recv_socket_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            PosixCompatSyscall::Sendto => {
+                let payload = SendToArgs::new(frame.arg(LINUX_ARG0) as u64, frame.arg(LINUX_ARG1) as u64, frame.arg(LINUX_ARG2) as u64, frame.arg(LINUX_ARG3) as u64, frame.arg(LINUX_ARG4) as u64, frame.arg(LINUX_ARG5) as u64).encode();
+                bindings.send_socket_request(ipc, SOCKET_OP_SENDTO, &payload)?;
+                let reply = bindings.recv_socket_reply(ipc)?.ok_or(PosixErrno::NoSys)?;
+                decode_u64_reply(reply.as_slice())
+            }
+            _ => Err(PosixErrno::NoSys),
+        })();
+    frame.set_syscall_result(result);
+}
+
+pub fn dispatch_with_kernel(kernel: &mut KernelState, bindings: &PosixServiceBindings, frame: &mut TrapFrame) {
     // Linux ABI compatibility note:
     // - mmap/munmap/mprotect consume Linux argument order directly (addr/len/prot/...).
     // - Capability-targeted VM mapping is exposed via kernel-native `sys_vm_map`.
