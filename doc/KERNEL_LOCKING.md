@@ -104,6 +104,28 @@ handled via a dedicated helper with clear lock-contract comments.
   - `KernelState::debug_lock_order_note(...)` (debug-only, non-enforcing hook),
   - plus lock-order note calls in `with_ipc_state` / `with_ipc_state_mut`.
 
+### Stage 1.5: subsystem hook coverage (current)
+
+- `debug_lock_order_note(...)` hook coverage is now present at all
+  `SpinLockIrq` helper entry points for domains:
+  - scheduler
+  - task
+  - ipc
+  - capability
+  - vm
+  - memory
+  - driver
+  - fault
+  - restart
+  - telemetry
+  - boot_config
+- Multi-lock helper acquisition order is explicitly documented inline and kept
+  aligned with this document:
+  - `with_task_then_capability`: task -> capability
+  - `with_scheduler_then_ipc`: scheduler -> ipc
+- Hooks remain debug-only/non-enforcing scaffolding; no runtime locking behavior
+  change is introduced at this stage.
+
 ### Stage 2: split high-traffic subsystem lock domains
 
 - Prioritize decomposition across scheduler/task/ipc/vm hot paths.
