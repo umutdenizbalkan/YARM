@@ -291,6 +291,14 @@ handled via a dedicated helper with clear lock-contract comments.
 - Future Stage 2I intent: special-case recv-timeout syscall at this shared seam before entering global-lock mutation path.
 - No behavior change in Stage 2H.
 
+### Stage 2I seam-callsite status
+
+- Production caller audited: `KernelState::handle_selected_arch_trap_entry(...)` in `src/kernel/boot/fault_state.rs` currently calls `arch::trap_entry::handle_trap_entry(self, ...)`.
+- Blocker: this caller only has `&mut KernelState`; it does not have a `&SharedKernel` handle to call `arch::trap_entry::handle_trap_entry_shared(...)`.
+- Under current constraints (no trap ownership refactor in this slice), no production callsite migration was performed.
+- Stage 2H shared seam remains staged for the future boundary where `SharedKernel` is available before borrowing `&mut KernelState`.
+- No behavior change in Stage 2I.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
