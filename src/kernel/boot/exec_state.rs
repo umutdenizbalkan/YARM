@@ -117,7 +117,7 @@ impl KernelState {
             if p_type != PT_LOAD {
                 continue;
             }
-            let p_flags = read_u32_le(image, base + 4)?;
+            let _p_flags = read_u32_le(image, base + 4)?;
             let p_offset = read_u64_le(image, base + 8)? as usize;
             let p_vaddr = read_u64_le(image, base + 16)?;
             let p_filesz = read_u64_le(image, base + 32)? as usize;

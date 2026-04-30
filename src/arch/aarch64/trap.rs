@@ -147,7 +147,7 @@ pub fn handle_trap_entry(
             export_syscall_result_to_user_gprs(trapframe);
         }
     }
-    restore_arch_thread_state(kernel, cpu, frame)?;
+    restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())?;
     if matches!(event, TrapEvent::Syscall) {
         let exiting_tid = kernel.current_tid();
         if entering_tid == exiting_tid
