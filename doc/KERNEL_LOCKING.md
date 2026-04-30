@@ -196,6 +196,14 @@ handled via a dedicated helper with clear lock-contract comments.
 - Current status: bridge added; syscall recv-timeout path is not yet migrated in this slice because it currently operates on `&mut KernelState` directly.
 - TODO: migrate recv-timeout syscall dispatch to call `SharedKernel::ipc_recv_with_deadline_split_bridge` when syscall/trap plumbing is explicitly moved to a `SharedKernel` entry path.
 
+### Stage 2E status: recv-timeout syscall bridge migration blocked (current call graph)
+
+- Target path inspected: `SYSCALL_IPC_RECV_TIMEOUT_NR` / `handle_ipc_recv_timeout`.
+- Blocker: syscall dispatch currently enters `handle_ipc_recv_timeout` with `&mut KernelState` from `KernelState::handle_trap(...)`, not through a `SharedKernel` entry that can call `ipc_recv_with_deadline_split_bridge`.
+- Minimal migration is therefore not possible in this slice without widening trap/syscall signatures beyond the allowed narrow scope.
+- `ipc_recv_with_deadline_split_bridge` remains bridge-only staged for this caller.
+- No behavior change in Stage 2E.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
