@@ -177,6 +177,10 @@ TODO (future design direction):
 3. Optional cleanup: continue narrowing stale `path_ptr` terminology where wire-compatible.
 4. Optional cleanup: isolate test-only kernel harness paths into clearer harness modules.
 5. Wire authoritative runtime restart-token lookup service and enable production fault-triggered restart path.
+6. Supervisor test-layering follow-up:
+   - keep kernel-backed `Bootstrap::init()` integration tests for end-to-end restart/handoff validation;
+   - add more logic/unit tests over mock `SupervisorOutboundMessageOps` / transport seams to isolate supervisor state-machine regressions from kernel bootstrap behavior;
+   - maintain a clear split between fast logic tests and heavier kernel-backed integration coverage.
 
 ## Notes
 

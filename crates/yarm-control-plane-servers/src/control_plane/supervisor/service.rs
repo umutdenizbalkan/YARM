@@ -1387,6 +1387,7 @@ impl SupervisorTaskExitOps for RuntimeSupervisorTaskExitOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yarm::std::vec::Vec;
     use yarm::std::thread;
     use yarm::kernel::boot::Bootstrap;
     use yarm_user_rt::vm::PAGE_SIZE;
@@ -1395,6 +1396,24 @@ mod tests {
         CoreServiceRegistrationKind, InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
         SupervisorStatusRequest, TransferRevokedEvent,
     };
+
+    #[derive(Default)]
+    struct MockOutboundOps {
+        sends: Vec<(CapId, Message)>,
+        replies: Vec<(CapId, Message)>,
+    }
+
+    impl SupervisorOutboundMessageOps for MockOutboundOps {
+        fn ipc_send(&mut self, cap: CapId, msg: Message) -> Result<(), KernelError> {
+            self.sends.push((cap, msg));
+            Ok(())
+        }
+
+        fn ipc_reply(&mut self, cap: CapId, msg: Message) -> Result<(), KernelError> {
+            self.replies.push((cap, msg));
+            Ok(())
+        }
+    }
 
     fn setup_supervisor() -> (
         yarm::std::boxed::Box<KernelState>,
@@ -1541,6 +1560,47 @@ mod tests {
         assert!(src.contains("try_ipc_recv("));
         assert!(src.contains("ipc_recv_with_deadline("));
         assert!(!src.contains(legacy_call.as_str()));
+    }
+
+    #[test]
+    fn control_request_status_query_roundtrip_works_with_mock_outbound_ops() {
+        let handoff = InitFaultHandoff::new(1, CapId(10), CapId(11), CapId(12), CapId(13), CapId(14), 20);
+        let mut supervisor = SupervisorService::new(1, handoff, CoreServicePolicyTable::baseline());
+        let mut outbound = MockOutboundOps::default();
+
+        let register = Message::with_header(
+            1,
+            SUPERVISOR_OP_REGISTER_CORE_SERVICE,
+            0,
+            None,
+            &RegisterCoreServiceRequest {
+                tid: 2,
+                kind: CoreServiceRegistrationKind::ProcessManager,
+                max_restarts: 3,
+                restart_group: 1,
+                dependency_mask: 0,
+                backoff_ticks: 10,
+            }
+            .encode(),
+        )
+        .expect("registration");
+        supervisor
+            .handle_control_request(&mut outbound, register)
+            .expect("register service");
+
+        let query = query_status_message(1, SupervisorStatusRequest { tid: 2 }).expect("query");
+        supervisor
+            .handle_control_request(&mut outbound, query)
+            .expect("query status");
+
+        assert_eq!(outbound.replies.len(), 0);
+        assert_eq!(outbound.sends.len(), 1);
+        let (sent_cap, sent_msg) = &outbound.sends[0];
+        assert_eq!(*sent_cap, handoff.init_alert_send_cap);
+        assert_eq!(sent_msg.opcode, SUPERVISOR_OP_QUERY_STATUS);
+        let status = SupervisorStatusReply::decode(sent_msg.as_slice()).expect("status");
+        assert_eq!(status.tid, 2);
+        assert_eq!(status.max_restarts, 3);
     }
 
     #[test]
