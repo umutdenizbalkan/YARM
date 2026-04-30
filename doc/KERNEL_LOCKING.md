@@ -375,6 +375,16 @@ handled via a dedicated helper with clear lock-contract comments.
 - Behavior remains unchanged because shared seam forwards through existing `SharedKernel::with_cpu(...)` / `KernelState` trap handling flow.
 - Per-ISA status: aarch64 migrated; x86_64 remains staged; riscv64 not applicable yet under current ownership shape.
 
+
+#### Stage 2N AArch64 activation status
+
+- `trap_shared_kernel()` returned `None` in validation runs because the aarch64 bootstrap path installs only `trap_kernel_state_mut` (`&mut KernelState`) from `Bootstrap::init_static()` and does not currently materialize a long-lived `SharedKernel` instance at that same point.
+- `install_trap_shared_kernel(...)` is present as a seam, but there is no safe same-point `SharedKernel` object to install yet without changing ownership/lifetime of the boot kernel object.
+- Therefore Stage 2N remains fallback-active on aarch64 for now: shared-dispatch branch is attempted first, then fallback `trap_kernel_state_mut()` path is used when shared pointer is absent.
+- Marker behavior remains correct:
+  - shared marker on shared-path use
+  - fallback marker only when fallback is actually used.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
