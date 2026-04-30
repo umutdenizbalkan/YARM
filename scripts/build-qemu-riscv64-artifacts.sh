@@ -7,15 +7,17 @@ source "$(dirname "$0")/lib/build-qemu-artifacts-common.sh"
 
 OUT_DIR=${OUT_DIR:-build-riscv64}
 ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
-RUST_TARGET=${RUST_TARGET:-riscv64gc-unknown-none-elf}
-RUST_TARGET_DIR=${RUST_TARGET_DIR:-riscv64gc-unknown-none-elf}
+KERNEL_RUST_TARGET=${KERNEL_RUST_TARGET:-riscv64gc-unknown-none-elf}
+KERNEL_RUST_TARGET_DIR=${KERNEL_RUST_TARGET_DIR:-riscv64gc-unknown-none-elf}
+SERVER_RUST_TARGET=${SERVER_RUST_TARGET:-targets/riscv64-yarm-user-none.json}
+SERVER_RUST_TARGET_DIR=${SERVER_RUST_TARGET_DIR:-riscv64-yarm-user-none}
 SERVER_BIN=${SERVER_BIN:-init_server}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
 KERNEL_PACKAGE=${KERNEL_PACKAGE:-yarm}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-release}
-SERVER_ELF=${SERVER_ELF:-target/${RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
-KERNEL_ELF=${KERNEL_ELF:-target/${RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
+SERVER_ELF=${SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
+KERNEL_ELF=${KERNEL_ELF:-target/${KERNEL_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-riscv64.bin}
 ARTIFACTS_STRICT=${ARTIFACTS_STRICT:-0}
@@ -28,13 +30,14 @@ common_prepare_rootfs_dirs
 CARGO_Z_ARGS=()
 if cargo -V 2>/dev/null | rg -q "nightly"; then
   CARGO_Z_ARGS=(-Z "build-std=${BUILD_STD_COMPONENTS}")
+  [[ "$SERVER_RUST_TARGET" == *.json || "$KERNEL_RUST_TARGET" == *.json ]] && CARGO_Z_ARGS+=(-Z "json-target-spec")
 fi
 
-echo "[info] building ${KERNEL_PACKAGE}/${KERNEL_BIN} and ${SERVER_PACKAGE}/${SERVER_BIN} for ${RUST_TARGET}"
+echo "[info] building ${KERNEL_PACKAGE}/${KERNEL_BIN} for ${KERNEL_RUST_TARGET} and ${SERVER_PACKAGE}/${SERVER_BIN} for ${SERVER_RUST_TARGET}"
 set +e
-cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$KERNEL_PACKAGE" --bin "$KERNEL_BIN" "${CARGO_Z_ARGS[@]}"
+cargo build --target "$KERNEL_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$KERNEL_PACKAGE" --bin "$KERNEL_BIN" "${CARGO_Z_ARGS[@]}"
 KERNEL_BUILD_STATUS=$?
-cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$SERVER_BIN" "${CARGO_Z_ARGS[@]}"
+cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$SERVER_BIN" "${CARGO_Z_ARGS[@]}"
 SERVER_BUILD_STATUS=$?
 set -e
 [[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 ]] && common_exit_if_strict_mode

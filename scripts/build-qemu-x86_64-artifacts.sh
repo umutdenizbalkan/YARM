@@ -7,13 +7,14 @@ source "$(dirname "$0")/lib/build-qemu-artifacts-common.sh"
 
 OUT_DIR=${OUT_DIR:-build-x86_64}
 ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
-RUST_TARGET=${RUST_TARGET:-targets/x86_64-yarm-none.json}
+KERNEL_RUST_TARGET=${KERNEL_RUST_TARGET:-targets/x86_64-yarm-none.json}
+SERVER_RUST_TARGET=${SERVER_RUST_TARGET:-targets/x86_64-yarm-user-none.json}
 SERVER_BIN=${SERVER_BIN:-init_server}
 SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 KERNEL_PACKAGE=${KERNEL_PACKAGE:-yarm}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-x86-none}
-SERVER_ELF=${SERVER_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
+SERVER_ELF=${SERVER_ELF:-target/x86_64-yarm-user-none/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
 KERNEL_RAW_ELF=${KERNEL_RAW_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 KERNEL_BOOTABLE_IMAGE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
@@ -110,7 +111,7 @@ if [[ -z "$RUST_SYSROOT" || ! -d "$RUST_SRC_DIR" ]]; then
   [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
 fi
 
-echo "[info] building server + kernel bins for target ${RUST_TARGET} (toolchain=${TOOLCHAIN}, build-std=${BUILD_STD_COMPONENTS})"
+echo "[info] building server + kernel bins for targets server=${SERVER_RUST_TARGET} kernel=${KERNEL_RUST_TARGET} (toolchain=${TOOLCHAIN}, build-std=${BUILD_STD_COMPONENTS})"
 BUILD_OK=1
 SERVER_BUILD_OK=1
 KERNEL_BUILD_OK=1
@@ -119,7 +120,7 @@ CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
 cargo +"${TOOLCHAIN}" build \
   -Z build-std=${BUILD_STD_COMPONENTS} \
   -Z json-target-spec \
-  --target "$RUST_TARGET" \
+  --target "$SERVER_RUST_TARGET" \
   --profile "$SERVER_BUILD_PROFILE" \
   ${BOOTSTRAP_FEATURE_ARGS} \
   -p "$SERVER_PACKAGE" \
@@ -129,7 +130,7 @@ CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
 cargo +"${TOOLCHAIN}" build \
   -Z build-std=${BUILD_STD_COMPONENTS} \
   -Z json-target-spec \
-  --target "$RUST_TARGET" \
+  --target "$KERNEL_RUST_TARGET" \
   --profile "$SERVER_BUILD_PROFILE" \
   ${BOOTSTRAP_FEATURE_ARGS} \
   -p "$KERNEL_PACKAGE" \
