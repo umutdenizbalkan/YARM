@@ -5,6 +5,19 @@
 This document records the current kernel locking shape and a staged plan to
 remove implicit global-lock coupling from syscall/trap paths.
 
+## Current status
+
+- `SharedKernel` global lock (`SpinLock<KernelState>`) still exists and remains
+  the top-level serialization boundary where that runtime path is used.
+- Runtime lock behavior has **not** been decomposed yet; stages so far are
+  scaffolding/documentation-only.
+- Debug lock-order tracking is hosted-dev + debug-assertions only and is
+  non-fatal/report-only (`YARM_LOCK_ORDER_WARN ...`).
+- Non-hosted `no_std` lock-rank tracking is currently placeholder-only until a
+  safe per-CPU/per-thread debug-local slot is introduced.
+- Next future step should be a **single narrow behavior-changing Stage 2 split**
+  (not broad decomposition in one pass).
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:
@@ -143,6 +156,10 @@ handled via a dedicated helper with clear lock-contract comments.
 
 - Prioritize decomposition across scheduler/task/ipc/vm hot paths.
 - Minimize cross-subsystem lock hold durations.
+- Suggested narrow candidates (pick one slice first):
+  - scheduler/task split
+  - IPC endpoint split
+  - VM/memory split
 
 ### Stage 3: remove global lock from syscall fast path
 
