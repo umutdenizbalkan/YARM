@@ -257,6 +257,31 @@ handled via a dedicated helper with clear lock-contract comments.
 - Migrating one of those sites to `SharedKernel::handle_trap_with_cpu(...)` would require changing ownership/type at the callsite from `KernelState` to `SharedKernel`, which exceeds this narrow Stage 2G.1 scope.
 - No behavior change in Stage 2G.1.
 
+### Stage 2G.2 boundary audit: trap entry ownership handoff
+
+- Audited files/functions (current ownership handoff):
+  - `src/runtime.rs`: `SharedKernel::with_cpu(...)` and new seam `SharedKernel::handle_trap_with_cpu(...)`.
+  - `src/kernel/boot/fault_state.rs`: `KernelState::handle_selected_arch_trap_entry(...)` forwards into arch trap entry with `&mut KernelState`.
+  - `src/arch/trap_entry.rs`: target-ISA shims all accept `&mut KernelState` and call ISA-specific `handle_trap_entry`.
+  - `src/arch/{x86_64,aarch64,riscv64}/trap.rs`: `handle_trap_entry(kernel: &mut KernelState, ...)` invokes `kernel.handle_trap_event(...)`.
+
+- Earliest viable `SharedKernel` boundary:
+  - The earliest stable boundary is immediately before `KernelState::handle_selected_arch_trap_entry(...)` is invoked by higher-level runtime/arch dispatch code, i.e. where CPU id + trap frame are known but `&mut KernelState` has not yet been borrowed.
+
+- Minimal future signature change for Stage 2H (single trap path first):
+  1. Add one new alternate entry function (do not remove existing one), for example:
+     - `handle_selected_arch_trap_entry_shared(shared: &SharedKernel, cpu, context, frame)`
+  2. In that alternate path, decode trap event as today, then route one selected trap/syscall path through `shared.handle_trap_with_cpu(...)`.
+  3. Keep existing `&mut KernelState` entry functions and all non-selected paths unchanged.
+
+- Risks to manage:
+  - Re-entrant global lock risk if any caller already holds `SharedKernel::with(...)` before calling the new alternate entry.
+  - Lifetime/borrow coupling for mutable trap-frame references when passed through shared wrapper boundaries.
+  - Lock-order visibility: split-read stages must remain read-only before entering global-lock mutation path.
+  - CPU-local context correctness: `set_current_cpu` behavior must remain exactly equivalent to current `with_cpu` entry semantics.
+
+- No behavior change in this Stage 2G.2 audit note.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
