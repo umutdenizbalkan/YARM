@@ -22,7 +22,6 @@ fn main() {
 
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
-#[used]
 pub extern "C" fn yarm_user_entry() {
     let _ = yarm::user_rt::syscall::yield_now();
     run();
