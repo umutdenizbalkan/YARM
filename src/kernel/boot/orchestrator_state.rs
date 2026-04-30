@@ -3,21 +3,65 @@
 
 use super::*;
 use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(debug_assertions, feature = "hosted-dev"))]
+use std::cell::Cell;
+#[cfg(all(debug_assertions, feature = "hosted-dev"))]
+use std::thread_local;
 
 static WITH_TCBS_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(all(debug_assertions, feature = "hosted-dev"))]
+thread_local! {
+    static LOCK_ORDER_LAST_RANK: Cell<u8> = const { Cell::new(0) };
+}
 
 pub(crate) fn set_with_tcbs_probe(active: bool) {
     WITH_TCBS_PROBE_ACTIVE.store(active, Ordering::Release);
 }
 
 impl KernelState {
+    fn lock_domain_rank(domain: &'static str) -> u8 {
+        match domain {
+            "scheduler" => 1,
+            "task" => 2,
+            "ipc" => 3,
+            "capability" => 4,
+            "vm" => 5,
+            "memory" => 6,
+            "driver" => 7,
+            "fault" => 8,
+            "restart" => 9,
+            "telemetry" => 10,
+            "boot_config" => 11,
+            _ => 0,
+        }
+    }
+
     #[inline]
     fn debug_lock_order_note(_domain: &'static str) {
         #[cfg(debug_assertions)]
         {
-            // Stage-1 scaffolding only: keep this as a low-risk instrumentation hook
-            // for future lock-order assertions without changing runtime behavior.
-            let _ = _domain;
+            let current = Self::lock_domain_rank(_domain);
+            #[cfg(feature = "hosted-dev")]
+            LOCK_ORDER_LAST_RANK.with(|last| {
+                let previous = last.get();
+                if previous != 0 && current != 0 && current < previous {
+                    crate::yarm_log!(
+                        "YARM_LOCK_ORDER_WARN current={} previous={}",
+                        _domain,
+                        previous
+                    );
+                }
+                if current != 0 {
+                    last.set(current);
+                }
+            });
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                // Stage-1.6 placeholder on non-hosted no_std builds: we do not yet
+                // have a safe generic per-CPU/per-thread debug-local slot for lock
+                // rank tracking without affecting runtime behavior.
+                let _ = current;
+            }
         }
     }
 

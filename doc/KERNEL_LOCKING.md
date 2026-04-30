@@ -126,6 +126,19 @@ handled via a dedicated helper with clear lock-contract comments.
 - Hooks remain debug-only/non-enforcing scaffolding; no runtime locking behavior
   change is introduced at this stage.
 
+### Stage 1.6: debug-only rank tracking (current)
+
+- `debug_lock_order_note(domain)` now maps lock domains to rank values based on
+  the mandatory order in this document.
+- In `debug_assertions + hosted-dev`, rank state is tracked in thread-local
+  storage (`LOCK_ORDER_LAST_RANK`) and emits:
+  - `YARM_LOCK_ORDER_WARN current=... previous=...`
+  when a lower-rank domain is observed after a higher-rank domain.
+- This remains non-fatal/report-only instrumentation (no panic/assert).
+- On non-hosted `no_std` builds, this stage is currently a documented
+  placeholder because a safe generic per-CPU/per-thread debug-local slot is not
+  yet wired without behavior-impact risk.
+
 ### Stage 2: split high-traffic subsystem lock domains
 
 - Prioritize decomposition across scheduler/task/ipc/vm hot paths.
