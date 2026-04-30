@@ -794,6 +794,13 @@ fn log_pvh_boot_metadata(start_info_ptr: usize) {
         if let Some(window) = summary.initramfs {
             let len = window.end.saturating_sub(window.start) as usize;
             if len > 0 {
+                let page = crate::kernel::vm::PAGE_SIZE as u64;
+                let reserved_start = window.start & !(page - 1);
+                let reserved_end = (window.end + (page - 1)) & !(page - 1);
+                crate::kernel::boot::Bootstrap::install_boot_reserved_range(
+                    reserved_start,
+                    reserved_end,
+                );
                 // SAFETY: PVH module window is immutable boot-provided memory.
                 let bytes = unsafe { core::slice::from_raw_parts(window.start as *const u8, len) };
                 crate::kernel::boot::Bootstrap::install_boot_initrd_bytes(bytes);
