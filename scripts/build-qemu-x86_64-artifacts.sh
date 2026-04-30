@@ -3,6 +3,8 @@
 
 set -euo pipefail
 
+source "$(dirname "$0")/lib/build-qemu-artifacts-common.sh"
+
 OUT_DIR=${OUT_DIR:-build-x86_64}
 ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
 RUST_TARGET=${RUST_TARGET:-targets/x86_64-yarm-none.json}
@@ -92,9 +94,8 @@ explain_nonbootable_kernel_source() {
 }
 
 
-mkdir -p "$OUT_DIR" "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
-mkdir -p "$(dirname "$INITRAMFS_IMAGE")"
-INITRAMFS_IMAGE_ABS="$(cd "$(dirname "$INITRAMFS_IMAGE")" && pwd)/$(basename "$INITRAMFS_IMAGE")"
+mkdir -p "$OUT_DIR"
+common_prepare_rootfs_dirs
 
 if ! rustup toolchain list | rg -q "^${TOOLCHAIN}"; then
   echo "[warn] toolchain '${TOOLCHAIN}' is not installed"
@@ -144,11 +145,11 @@ if [[ "$KERNEL_BUILD_STATUS" -ne 0 ]]; then
   BUILD_OK=0
 fi
 
-if [[ "$SERVER_BUILD_OK" -eq 1 && -f "$SERVER_ELF" ]]; then
-  cp "$SERVER_ELF" "$ROOTFS_DIR/sbin/${SERVER_BIN}"
+if [[ "$SERVER_BUILD_OK" -eq 1 ]]; then
+  common_stage_server_init_elf || true
 else
-  echo "[warn] compile for ${SERVER_BIN} (${SERVER_PACKAGE}) failed or output missing (${SERVER_ELF})"
-  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+  echo "[warn] compile for ${SERVER_BIN} (${SERVER_PACKAGE}) failed"
+  common_exit_if_strict_mode
 fi
 
 if [[ "$KERNEL_BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
@@ -157,27 +158,7 @@ if [[ "$KERNEL_BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
   echo "[info] x86_64 bootstrap invariant script removed; skipping legacy invariant check stage"
 fi
 
-cat > "$ROOTFS_DIR/init" <<'SH'
-#!/bin/sh
-echo "YARM_INIT_START"
-if [ -x /sbin/init_server ]; then
-  /sbin/init_server || true
-fi
-echo "YARM_INIT_DONE"
-while true; do
-  :
-done
-SH
-chmod +x "$ROOTFS_DIR/init"
-echo "[info] staged minimal initramfs marker flow (/init -> init_server) while primary x86 goal remains kernel serial markers"
-
-if command -v cpio >/dev/null 2>&1; then
-  ( cd "$ROOTFS_DIR" && find . -print0 | cpio --null -ov --format=newc > "$INITRAMFS_IMAGE_ABS" ) >/dev/null
-else
-  echo "[warn] cpio not found; creating placeholder initramfs archive file"
-  : > "$INITRAMFS_IMAGE_ABS"
-  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
-fi
+common_create_initramfs_newc
 
 BOOTABLE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-}
 if [[ -z "$BOOTABLE_SOURCE" && -f "$KERNEL_IMAGE" ]]; then
