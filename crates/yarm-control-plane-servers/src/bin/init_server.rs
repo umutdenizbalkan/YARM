@@ -22,14 +22,10 @@ fn main() {
 
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
+#[used]
 pub extern "C" fn yarm_user_entry() {
+    let _ = yarm::user_rt::syscall::yield_now();
     run();
-}
-
-#[cfg(not(feature = "hosted-dev"))]
-#[inline]
-fn yarm_user_entry_rust() {
-    yarm_user_entry();
 }
 
 #[cfg(not(feature = "hosted-dev"))]
@@ -48,7 +44,7 @@ pub extern "C" fn _start(
         startup_proc_mgr_reply_recv_cap,
         startup_slots_ptr,
         startup_slots_len,
-        yarm_user_entry_rust,
+        yarm_user_entry,
     )
 }
 
