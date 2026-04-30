@@ -114,6 +114,8 @@ pub use types::*;
 
 #[derive(Debug)]
 pub struct KernelState {
+    // Lock ordering is documented in doc/KERNEL_LOCKING.md.
+    // Any new SpinLockIrq field or multi-lock path must update that document.
     pub kernel_aspace: AddressSpace,
     hal: crate::arch::hal::SelectedIsaHal,
     pub user_spaces: KernelStorage<AddressSpaceManager>,
