@@ -194,6 +194,7 @@ handled via a dedicated helper with clear lock-contract comments.
 - Why safe: only the timeout deadline tick read is split (`scheduler_tick_now_split_read`); all IPC capability checks, waiter updates, queue mutation, blocking, and dispatch still happen under `SharedKernel::with(...)`.
 - What remains under global lock: all IPC mutation/state transitions and the existing syscall path logic.
 - Current status: bridge added; syscall recv-timeout path is not yet migrated in this slice because it currently operates on `&mut KernelState` directly.
+- TODO: migrate recv-timeout syscall dispatch to call `SharedKernel::ipc_recv_with_deadline_split_bridge` when syscall/trap plumbing is explicitly moved to a `SharedKernel` entry path.
 
 ### Stage 3: remove global lock from syscall fast path
 
