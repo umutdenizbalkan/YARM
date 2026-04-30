@@ -333,6 +333,10 @@ yarm_aarch64_vector_dispatch:
     msr elr_el1, x9
     ldr x9, [sp, #264]
     msr spsr_el1, x9
+    ldr x0, [sp, #256]
+    ldr x1, [sp, #264]
+    mov x2, sp
+    bl yarm_aarch64_final_eret_marker
     ldr x30, [sp, #240]
     ldp x28, x29, [sp, #224]
     ldp x26, x27, [sp, #208]
@@ -349,7 +353,7 @@ yarm_aarch64_vector_dispatch:
     ldp x4, x5, [sp, #32]
     ldp x2, x3, [sp, #16]
     ldp x0, x1, [sp, #0]
-    add sp, sp, #816
+    add sp, sp, #800
     eret
     "#
 );
@@ -396,6 +400,18 @@ extern "C" fn yarm_aarch64_user_entry_marker_0() {
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_user_entry_marker_1() {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_USER_ENTRY U1");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_final_eret_marker(elr: u64, spsr: u64, sp: u64) {
+    crate::yarm_log!("AARCH64_RETURN_TO_USER_SPSR value=0x{:x}", spsr);
+    crate::yarm_log!(
+        "AARCH64_FINAL_ERET elr=0x{:x} spsr=0x{:x} sp=0x{:x}",
+        elr,
+        spsr,
+        sp
+    );
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
