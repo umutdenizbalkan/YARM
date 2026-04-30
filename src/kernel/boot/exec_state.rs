@@ -49,6 +49,38 @@ const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
 static DISPATCH_CONTEXT_LOAD_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl KernelState {
+    fn load_page_requires_execute(
+        image: &[u8],
+        phoff: usize,
+        phentsize: usize,
+        phnum: usize,
+        page_start: u64,
+        page_end: u64,
+    ) -> Result<bool, KernelError> {
+        for idx in 0..phnum {
+            let base = phoff
+                .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
+                .ok_or(KernelError::WrongObject)?;
+            let p_type = read_u32_le(image, base)?;
+            if p_type != PT_LOAD {
+                continue;
+            }
+            let p_flags = read_u32_le(image, base + 4)?;
+            if (p_flags & PF_X) == 0 {
+                continue;
+            }
+            let p_vaddr = read_u64_le(image, base + 16)?;
+            let p_memsz = read_u64_le(image, base + 40)?;
+            let seg_end = p_vaddr
+                .checked_add(p_memsz)
+                .ok_or(KernelError::WrongObject)?;
+            if p_memsz != 0 && p_vaddr < page_end && seg_end > page_start {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Minimal ELF64 loader for PT_LOAD segments:
     /// validates headers, maps pages for each load segment, copies file bytes,
     /// and zero-fills the BSS tail.
@@ -107,28 +139,40 @@ impl KernelState {
                 .ok_or(KernelError::WrongObject)?;
             let page_start = seg_start & !(page_size - 1);
             let page_end = (seg_end + page_size - 1) & !(page_size - 1);
-            let flags = PageFlags {
-                // Loader maps writable/readable so copy_to_user can materialize
-                // PT_LOAD bytes; tightening to final RX/RW permissions can be
-                // layered later once per-segment reprotect is wired.
-                read: true,
-                write: true,
-                execute: (p_flags & PF_X) != 0,
-                user: true,
-                cache_policy: CachePolicy::WriteBack,
-            };
             let mut va = page_start;
             while va < page_end {
-                let phys = alloc_pt_frame().map_err(|_| KernelError::MemoryObjectFull)?;
+                let execute = Self::load_page_requires_execute(
+                    image,
+                    phoff,
+                    phentsize,
+                    phnum,
+                    va,
+                    va + page_size,
+                )?;
+                let flags = PageFlags {
+                    read: true,
+                    write: true,
+                    execute,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                };
+                let existing = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
+                let phys = if let Some(entry) = existing {
+                    entry.addr()
+                } else {
+                    alloc_pt_frame().map_err(|_| KernelError::MemoryObjectFull)?
+                };
                 if cfg!(not(feature = "hosted-dev")) {
                     crate::yarm_log!(
-                        "ELF_MAP_PAGE_BEGIN asid={} seg_vbase=0x{:x} page_va=0x{:x} phys=0x{:x} memsz={} filesz={}",
+                        "ELF_MAP_PAGE_BEGIN asid={} seg_vbase=0x{:x} page_va=0x{:x} phys=0x{:x} memsz={} filesz={} overlap={} req_x={}",
                         asid.0,
                         p_vaddr,
                         va,
                         phys,
                         p_memsz,
-                        p_filesz
+                        p_filesz,
+                        existing.is_some(),
+                        execute
                     );
                 }
                 self.map_user_page_in_asid_raw(
@@ -144,11 +188,26 @@ impl KernelState {
                         .is_some();
                 if cfg!(not(feature = "hosted-dev")) {
                     crate::yarm_log!(
-                        "ELF_MAP_PAGE_DONE asid={} page_va=0x{:x} post_resolve={}",
+                        "ELF_MAP_PAGE_DONE asid={} page_va=0x{:x} post_resolve={} final_r={} final_w={} final_x={} final_u={}",
                         asid.0,
                         va,
-                        post_map_present
+                        post_map_present,
+                        flags.read,
+                        flags.write,
+                        flags.execute,
+                        flags.user
                     );
+                    if va == 0x0040_0000 {
+                        crate::yarm_log!(
+                            "ELF_MAP_PAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
+                            asid.0,
+                            va,
+                            flags.read,
+                            flags.write,
+                            flags.execute,
+                            flags.user
+                        );
+                    }
                 }
                 if !post_map_present {
                     if cfg!(not(feature = "hosted-dev")) {
