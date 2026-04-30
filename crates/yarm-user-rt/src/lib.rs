@@ -42,13 +42,6 @@ pub mod syscall {
         Internal = 255,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Error {
-        Unsupported,
-    }
-
-    pub type Result<T> = core::result::Result<T, Error>;
-
     const SYSCALL_IPC_SEND_NR: usize = 1;
     const SYSCALL_IPC_RECV_NR: usize = 2;
     const SYSCALL_IPC_CALL_NR: usize = 4;
@@ -189,16 +182,16 @@ pub mod syscall {
     }
 
     #[inline]
-    pub fn yield_now() -> Result<()> {
+    pub fn yield_now() -> core::result::Result<(), SyscallError> {
         // SAFETY: Uses architecture syscall ABI to enter kernel.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_YIELD_NR, [0; 6]) };
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
-            return Err(Error::Unsupported);
+            return Err(decode_syscall_error(ret.error));
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         if ret.ret0 != 0 {
-            return Err(Error::Unsupported);
+            return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
     }
