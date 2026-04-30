@@ -366,6 +366,15 @@ handled via a dedicated helper with clear lock-contract comments.
   - `trap_shared_kernel() -> Option<&'static SharedKernel>`
 - `riscv64`: parity not applicable yet. Current trap entry takes `&mut KernelState` from caller and does not maintain a local trap-global kernel-state accessor slot in the same style as `aarch64`/`x86_64`.
 
+### Stage 2N: aarch64 trap entry migrated to shared seam
+
+- Migrated aarch64 vector handoff trap path to prefer `trap_shared_kernel()` when available.
+- Shared path now routes through `arch::trap_entry::dispatch_trap_entry_with_shared_kernel(...)`.
+- Added marker: `YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry`.
+- Fallback behavior preserved: if `trap_shared_kernel()` is `None`, code falls back to existing `trap_kernel_state_mut()` + ISA `handle_trap_entry(...)` path.
+- Behavior remains unchanged because shared seam forwards through existing `SharedKernel::with_cpu(...)` / `KernelState` trap handling flow.
+- Per-ISA status: aarch64 migrated; x86_64 remains staged; riscv64 not applicable yet under current ownership shape.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.

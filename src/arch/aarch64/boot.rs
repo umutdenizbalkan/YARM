@@ -653,9 +653,41 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         crate::arch::aarch64::console::write_line(msg);
     }
     let is_irq_kind = matches!(kind, 2 | 6 | 10 | 14);
-    if let Some(kernel) = trap_kernel_state_mut() {
-        let trap_cpu =
-            crate::kernel::scheduler::CpuId((crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8);
+    let trap_cpu =
+        crate::kernel::scheduler::CpuId((crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8);
+    if let Some(shared) = trap_shared_kernel() {
+        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry");
+        let mut trap_frame = crate::kernel::trapframe::TrapFrame::zeroed();
+        trap_frame.set_saved_pc(frame.elr_el1 as usize);
+        trap_frame.set_saved_sp(frame.sp_el0 as usize);
+        for idx in 0..31 {
+            trap_frame.set_user_gpr(idx, frame.gprs[idx] as usize);
+        }
+        let context = crate::arch::aarch64::trap::Aarch64TrapContext {
+            esr_el1: frame.esr_el1 as u32,
+            far_el1: frame.far_el1,
+            irq_line: None,
+            is_timer_irq: is_irq_kind,
+        };
+        if crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
+            shared,
+            trap_cpu,
+            context,
+            Some(&mut trap_frame),
+        )
+        .is_ok()
+        {
+            write_trapframe_back_to_vector_frame(frame, &trap_frame);
+        } else {
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE failed");
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE halting");
+            loop {
+                unsafe {
+                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+                }
+            }
+        }
+    } else if let Some(kernel) = trap_kernel_state_mut() {
         let current_tid = kernel.current_tid();
         if current_tid == Some(1) {
             crate::yarm_log!(
