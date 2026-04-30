@@ -133,7 +133,7 @@ pub fn handle_trap_entry(
 ) -> Result<(), TrapHandleError> {
     let event = decode_trap_context(context);
     let entering_tid = kernel.current_tid();
-    let raw_vector_return_pc = frame.as_ref().map(|f| f.saved_pc());
+    let raw_vector_return_pc = crate::arch::aarch64::boot::last_vector_raw_elr() as usize;
     if matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
             import_syscall_abi_from_user_gprs(trapframe);
@@ -147,21 +147,19 @@ pub fn handle_trap_entry(
             export_syscall_result_to_user_gprs(trapframe);
         }
     }
-    if matches!(event, TrapEvent::Syscall)
-        && let Some(raw_pc) = raw_vector_return_pc
-    {
+    if matches!(event, TrapEvent::Syscall) {
         crate::yarm_log!(
             "AARCH64_SYSCALL_RAW_RETURN_PC value=0x{:016x}",
-            raw_pc as u64
+            raw_vector_return_pc as u64
         );
     }
     restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())?;
     if matches!(event, TrapEvent::Syscall) {
         let exiting_tid = kernel.current_tid();
         if entering_tid == exiting_tid
-            && let (Some(raw_pc), Some(trapframe)) = (raw_vector_return_pc, frame.as_deref_mut())
+            && let Some(trapframe) = frame.as_deref_mut()
         {
-            trapframe.set_saved_pc(raw_pc);
+            trapframe.set_saved_pc(raw_vector_return_pc);
         }
     }
     Ok(())

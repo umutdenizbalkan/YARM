@@ -466,7 +466,13 @@ extern "C" fn yarm_aarch64_vector_first_marker() {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_vector_elr_marker(elr: u64) {
+    LAST_VECTOR_RAW_ELR.store(elr, Ordering::Relaxed);
     crate::yarm_log!("YARM_AARCH64_VECTOR_ELR_RAW elr=0x{:016x}", elr);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub(crate) fn last_vector_raw_elr() -> u64 {
+    LAST_VECTOR_RAW_ELR.load(Ordering::Relaxed)
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -506,6 +512,8 @@ static SECONDARY_ONLINE_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
 static SECONDARY_READY_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static SECONDARY_JOINED_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static LAST_VECTOR_RAW_ELR: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
