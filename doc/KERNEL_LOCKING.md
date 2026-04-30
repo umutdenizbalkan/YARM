@@ -161,6 +161,14 @@ handled via a dedicated helper with clear lock-contract comments.
   - IPC endpoint split
   - VM/memory split
 
+
+### Stage 2A status (helper-only migration started)
+
+- Helper-only migration for scheduler/task access has started.
+- Several direct task-table reads were migrated to helper accessors (for example, `with_tcbs(...)`).
+- `tcb_mut` remains intentionally direct for now because it returns a mutable reference whose lifetime escapes the helper closure pattern; this is tracked as focused follow-up work.
+- `SharedKernel` global lock remains intact in this stage.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.

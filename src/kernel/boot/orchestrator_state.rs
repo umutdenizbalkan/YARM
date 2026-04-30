@@ -103,32 +103,29 @@ impl KernelState {
 
     #[cfg(test)]
     pub(crate) fn set_timer_for_test(&mut self, timer: Timer) {
-        let mut sched = self.scheduler_state.lock();
-        sched.timer = timer;
+        self.with_scheduler_state_mut(|sched| {
+            sched.timer = timer;
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn runnable_count_on_for_test(&self, cpu: CpuId) -> usize {
-        let sched = self.scheduler_state.lock();
-        kernel_ref(&sched.scheduler).runnable_count_on(cpu)
+        self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn timer_ticks_for_test(&self) -> u64 {
-        let sched = self.scheduler_state.lock();
-        sched.timer.current_ticks().0
+        self.with_scheduler_state(|sched| sched.timer.current_ticks().0)
     }
 
     pub(crate) fn scheduler_tick_now(&self) -> u64 {
-        let sched = self.scheduler_state.lock();
-        sched.timer.current_ticks().0
+        self.with_scheduler_state(|sched| sched.timer.current_ticks().0)
     }
 
     #[cfg(feature = "posix-compat")]
     pub(crate) fn scheduler_tick_advance(&mut self) -> u64 {
-        let mut sched = self.scheduler_state.lock();
-        sched.timer.tick_and_check().0.0
+        self.with_scheduler_state_mut(|sched| sched.timer.tick_and_check().0.0)
     }
 
     pub(crate) fn with_ipc_state<R>(&self, f: impl FnOnce(&IpcSubsystem) -> R) -> R {
