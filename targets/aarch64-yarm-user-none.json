@@ -1,0 +1,22 @@
+{
+  "llvm-target": "aarch64-unknown-none",
+  "arch": "aarch64",
+  "vendor": "yarm",
+  "os": "none",
+  "env": "",
+  "target-endian": "little",
+  "target-pointer-width": 64,
+  "target-c-int-width": 32,
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
+  "executables": true,
+  "disable-redzone": true,
+  "panic-strategy": "abort",
+  "relocation-model": "static",
+  "code-model": "small",
+  "features": "+v8a,+strict-align,+neon,-lse",
+  "linker-flavor": "gnu-lld",
+  "linker": "rust-lld",
+  "pre-link-args": {
+    "gnu-lld": ["-Ttargets/aarch64-yarm-user-none.ld"]
+  }
+}

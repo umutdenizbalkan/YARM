@@ -7,15 +7,17 @@ source "$(dirname "$0")/lib/build-qemu-artifacts-common.sh"
 
 OUT_DIR=${OUT_DIR:-build-aarch64}
 ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
-RUST_TARGET=${RUST_TARGET:-aarch64-yarm-none}
-RUST_TARGET_DIR=${RUST_TARGET_DIR:-aarch64-yarm-none}
+KERNEL_RUST_TARGET=${KERNEL_RUST_TARGET:-aarch64-yarm-none}
+KERNEL_RUST_TARGET_DIR=${KERNEL_RUST_TARGET_DIR:-aarch64-yarm-none}
+SERVER_RUST_TARGET=${SERVER_RUST_TARGET:-targets/aarch64-yarm-user-none.json}
+SERVER_RUST_TARGET_DIR=${SERVER_RUST_TARGET_DIR:-aarch64-yarm-user-none}
 SERVER_BIN=${SERVER_BIN:-init_server}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
 KERNEL_PACKAGE=${KERNEL_PACKAGE:-yarm}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-aarch64-none}
-SERVER_ELF=${SERVER_ELF:-target/${RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
-KERNEL_ELF=${KERNEL_ELF:-target/${RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
+SERVER_ELF=${SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
+KERNEL_ELF=${KERNEL_ELF:-target/${KERNEL_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-aarch64.elf}
 KERNEL_BIN_IMAGE=${KERNEL_BIN_IMAGE:-$OUT_DIR/yarm-aarch64.bin}
@@ -28,21 +30,26 @@ mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
 
 CARGO_Z_ARGS=()
+USE_NIGHTLY=0
 if cargo -V 2>/dev/null | rg -q "nightly"; then
+  USE_NIGHTLY=1
   CARGO_Z_ARGS=(-Z "build-std=${BUILD_STD_COMPONENTS}")
-  [[ "$RUST_TARGET" == *.json ]] && CARGO_Z_ARGS+=(-Z "json-target-spec")
+  [[ "$KERNEL_RUST_TARGET" == *.json || "$SERVER_RUST_TARGET" == *.json ]] && CARGO_Z_ARGS+=(-Z "json-target-spec")
 fi
 
-if [[ "$RUST_TARGET" != *.json && -f "targets/${RUST_TARGET}.json" ]]; then
-  RUST_TARGET="targets/${RUST_TARGET}.json"
-  [[ " ${CARGO_Z_ARGS[*]} " != *" json-target-spec "* ]] && CARGO_Z_ARGS+=(-Z "json-target-spec")
+if [[ "$KERNEL_RUST_TARGET" != *.json && -f "targets/${KERNEL_RUST_TARGET}.json" ]]; then
+  KERNEL_RUST_TARGET="targets/${KERNEL_RUST_TARGET}.json"
+  if [[ "$USE_NIGHTLY" == "1" && " ${CARGO_Z_ARGS[*]} " != *" json-target-spec "* ]]; then
+    CARGO_Z_ARGS+=(-Z "json-target-spec")
+  fi
 fi
 
-echo "[info] building ${KERNEL_PACKAGE}/${KERNEL_BIN} and ${SERVER_PACKAGE}/${SERVER_BIN} for ${RUST_TARGET}"
+echo "[info] building ${KERNEL_PACKAGE}/${KERNEL_BIN} for ${KERNEL_RUST_TARGET}"
 set +e
-cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$KERNEL_PACKAGE" --bin "$KERNEL_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee "$BUILD_LOG"
+cargo build --target "$KERNEL_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$KERNEL_PACKAGE" --bin "$KERNEL_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee "$BUILD_LOG"
 KERNEL_BUILD_STATUS=$?
-cargo build --target "$RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
+echo "[info] building ${SERVER_PACKAGE}/${SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
+cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
 SERVER_BUILD_STATUS=$?
 set -e
 
