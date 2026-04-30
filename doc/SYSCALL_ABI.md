@@ -155,3 +155,14 @@
 
 - Trap/syscall argument lane count and IPC inline register-lane width are sourced from `crate::arch::syscall_abi` (`TRAPFRAME_ARG_REGS`, `IPC_REGISTER_WORDS`).
 - `src/kernel/syscall.rs` and `src/kernel/trapframe.rs` include compile-time assertions to keep ABI lane mapping synchronized with the selected ISA profile.
+
+## TODO / design note: inline IPC register payload expansion
+
+- `IPC_REGISTER_WORDS` remains **2** for the current ABI generation.
+- Raising inline register payload width to **8 words** (64 bytes on 64-bit targets) is **not** blocked by `Message::MAX_PAYLOAD`; that limit is currently **128** bytes.
+- The real blocker is syscall/register ABI plumbing:
+  - current syscall ABI provides **6** argument lanes and they are already allocated (`cap`, `ptr`, `len`, two inline lanes, transfer-cap lane);
+  - `inline_payload_from_frame` currently extracts exactly **2** inline lanes from the trap frame.
+- Moving to 8 inline words therefore requires either:
+  - a syscall ABI v2 with expanded argument/register mapping, or
+  - an alternate payload path that preserves existing syscall argument ABI compatibility.
