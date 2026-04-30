@@ -202,6 +202,8 @@ handled via a dedicated helper with clear lock-contract comments.
 - Blocker: syscall dispatch currently enters `handle_ipc_recv_timeout` with `&mut KernelState` from `KernelState::handle_trap(...)`, not through a `SharedKernel` entry that can call `ipc_recv_with_deadline_split_bridge`.
 - Minimal migration is therefore not possible in this slice without widening trap/syscall signatures beyond the allowed narrow scope.
 - `ipc_recv_with_deadline_split_bridge` remains bridge-only staged for this caller.
+- Additional Stage 2E attempt outcome: a narrow `SharedKernel` recv-timeout syscall wrapper cannot be wired into the real trap/syscall dispatch without introducing a new top-level SharedKernel-owned syscall entry callsite (or widening current `KernelState::handle_trap` signatures).
+- Under current constraints (no broad trap/syscall refactor), Stage 2E remains blocked in production dispatch shape.
 - No behavior change in Stage 2E.
 
 ### Stage 2F design: SharedKernel-aware syscall entry (recv-timeout only)
