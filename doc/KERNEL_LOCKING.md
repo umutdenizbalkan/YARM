@@ -187,6 +187,14 @@ handled via a dedicated helper with clear lock-contract comments.
 - Migrating those reads requires explicitly allowing IPC deadline path work in a future Stage 2D slice.
 - No behavior change was made for Stage 2C.
 
+### Stage 2D: IPC deadline tick read split
+
+- Exact bridge added: `SharedKernel::ipc_recv_with_deadline_split_bridge`.
+- Exact IPC function touched: `KernelState::ipc_recv_until_deadline` (new narrow helper) and existing `ipc_recv_with_deadline` remains unchanged in behavior.
+- Why safe: only the timeout deadline tick read is split (`scheduler_tick_now_split_read`); all IPC capability checks, waiter updates, queue mutation, blocking, and dispatch still happen under `SharedKernel::with(...)`.
+- What remains under global lock: all IPC mutation/state transitions and the existing syscall path logic.
+- Current status: bridge added; syscall recv-timeout path is not yet migrated in this slice because it currently operates on `&mut KernelState` directly.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.

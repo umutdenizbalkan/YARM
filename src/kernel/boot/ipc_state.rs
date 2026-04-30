@@ -847,6 +847,14 @@ impl KernelState {
         self.ipc_recv_with_optional_deadline(recv_cap, deadline)
     }
 
+    pub fn ipc_recv_until_deadline(
+        &mut self,
+        recv_cap: CapId,
+        deadline_tick: u64,
+    ) -> Result<Option<Message>, KernelError> {
+        self.ipc_recv_with_optional_deadline(recv_cap, Some(deadline_tick))
+    }
+
     fn ipc_recv_with_optional_deadline(
         &mut self,
         recv_cap: CapId,

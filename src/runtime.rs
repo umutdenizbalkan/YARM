@@ -2,6 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::kernel::boot::{KernelError, KernelState, TrapHandleError};
+use crate::kernel::capabilities::CapId;
+use crate::kernel::ipc::Message;
 use crate::kernel::lock::{SpinLock, SpinLockIrq};
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
@@ -53,6 +55,21 @@ impl SharedKernel {
         let scheduler_state = unsafe { &*self.scheduler_state };
         let sched = scheduler_state.lock();
         sched.timer.current_ticks().0
+    }
+
+
+    pub fn ipc_recv_with_deadline_split_bridge(
+        &self,
+        recv_cap: CapId,
+        timeout_ticks: u64,
+    ) -> Result<Option<Message>, KernelError> {
+        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2D path=ipc_recv_timeout_deadline_bridge");
+        if timeout_ticks == 0 {
+            return self.with(|state| state.try_ipc_recv(recv_cap));
+        }
+        let now = self.scheduler_tick_now_split_read();
+        let deadline = now.wrapping_add(timeout_ticks);
+        self.with(|state| state.ipc_recv_until_deadline(recv_cap, deadline))
     }
 
     pub fn control_plane_set_process_cnode_slots_via_syscall(
