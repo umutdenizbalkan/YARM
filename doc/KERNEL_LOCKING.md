@@ -366,7 +366,7 @@ handled via a dedicated helper with clear lock-contract comments.
   - `trap_shared_kernel() -> Option<&'static SharedKernel>`
 - `riscv64`: parity not applicable yet. Current trap entry takes `&mut KernelState` from caller and does not maintain a local trap-global kernel-state accessor slot in the same style as `aarch64`/`x86_64`.
 
-### Stage 2N: aarch64 trap entry migrated to shared seam
+### Stage 2N: aarch64 trap entry shared-seam attempt with fallback
 
 - Migrated aarch64 vector handoff trap path to prefer `trap_shared_kernel()` when available.
 - Shared path now routes through `arch::trap_entry::dispatch_trap_entry_with_shared_kernel(...)`.
