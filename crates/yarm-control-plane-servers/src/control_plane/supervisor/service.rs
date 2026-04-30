@@ -1255,9 +1255,7 @@ pub fn run() {
                 }
 
                 if !made_progress {
-                    for _ in 0..SUPERVISOR_RUNTIME_IDLE_YIELD_TICKS {
-                        let _ = yield_now();
-                    }
+                    supervisor_idle_wait();
                 } else {
                     let _ = supervisor.degraded();
                 }
@@ -1270,6 +1268,20 @@ pub fn run() {
                 err
             );
         }
+    }
+}
+
+/// Cooperative idle path for the production supervisor loop.
+///
+/// This is intentionally not a blocking sleep. The userspace runtime transport
+/// currently exposes non-blocking recv polling in this path, and no recv-timeout
+/// syscall wrapper is wired here yet. Yielding reduces hot spinning while still
+/// allowing the loop to continue polling multiple endpoints.
+#[cfg(not(test))]
+#[inline]
+fn supervisor_idle_wait() {
+    for _ in 0..SUPERVISOR_RUNTIME_IDLE_YIELD_TICKS {
+        let _ = yield_now();
     }
 }
 
