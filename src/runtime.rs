@@ -8,6 +8,8 @@ use crate::kernel::lock::{SpinLock, SpinLockIrq};
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
 use crate::kernel::boot::SchedulerState;
+use crate::kernel::trap::Trap;
+use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::scheduler::CpuId;
 
 #[derive(Debug)]
@@ -70,6 +72,19 @@ impl SharedKernel {
         let now = self.scheduler_tick_now_split_read();
         let deadline = now.wrapping_add(timeout_ticks);
         self.with(|state| state.ipc_recv_until_deadline(recv_cap, deadline))
+    }
+
+
+    pub fn handle_trap_with_cpu(
+        &self,
+        cpu: CpuId,
+        trap: Trap,
+        frame: Option<&mut TrapFrame>,
+    ) -> Result<(), TrapHandleError> {
+        let result = self
+            .with_cpu(cpu, |kernel| kernel.handle_trap(trap, frame))
+            .map_err(|err| TrapHandleError::Syscall(err.into()))?;
+        result
     }
 
     pub fn control_plane_set_process_cnode_slots_via_syscall(

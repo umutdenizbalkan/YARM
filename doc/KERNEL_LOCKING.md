@@ -242,6 +242,14 @@ handled via a dedicated helper with clear lock-contract comments.
 
 - No behavior change in this Stage 2F design note.
 
+### Stage 2G: SharedKernel syscall-entry seam
+
+- Added seam: `SharedKernel::handle_trap_with_cpu(cpu, trap, frame)`.
+- Current behavior: wrapper-only; it forwards to existing behavior via `with_cpu(... -> KernelState::handle_trap(...))`.
+- No syscall behavior change in Stage 2G.
+- Future Stage 2H intent: special-case recv-timeout syscall at this seam before entering the global-lock mutation path.
+- Intended first caller: selected arch trap-entry/runtime dispatch site that currently calls `KernelState::handle_trap(...)` after CPU selection.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
