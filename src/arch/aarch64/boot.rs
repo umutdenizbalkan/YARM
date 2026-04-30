@@ -134,11 +134,15 @@ yarm_aarch64_enter_user_mode_eret:
     ldp x11, x12, [sp, #16]
     ldr x13, [sp, #32]
     add sp, sp, #48
+    bl yarm_aarch64_user_entry_marker_before_sp_el0
     msr sp_el0, x10
+    bl yarm_aarch64_user_entry_marker_before_elr
     msr tpidr_el0, x13
     msr elr_el1, x9
     msr spsr_el1, xzr
     bl yarm_aarch64_user_entry_marker_1
+    bl yarm_aarch64_user_entry_marker_before_eret
+    isb
     mov x0, x11
     mov x1, x12
     eret
@@ -308,6 +312,7 @@ yarm_aarch64_vector_dispatch:
     stp q26, q27, [sp, #704]
     stp q28, q29, [sp, #736]
     stp q30, q31, [sp, #768]
+    bl yarm_aarch64_vector_first_marker
     msr daifset, #0xf
     mov x1, sp
     bl yarm_aarch64_vector_entry
@@ -396,6 +401,30 @@ extern "C" fn yarm_aarch64_user_entry_marker_0() {
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_user_entry_marker_1() {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_USER_ENTRY U1");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_user_entry_marker_before_sp_el0() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_USER_ENTRY U_SP");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_user_entry_marker_before_elr() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_USER_ENTRY U_ELR");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_user_entry_marker_before_eret() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_USER_ENTRY U_ERET");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_vector_first_marker() {
+    crate::arch::aarch64::console::write_line("YARM_AARCH64_VECTOR_FIRST");
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
