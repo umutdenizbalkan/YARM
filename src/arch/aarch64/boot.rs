@@ -789,7 +789,9 @@ fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
         .ok()
         .flatten()
         .or_else(|| yarm_srv_common::cpio::CpioArchive::new(bytes).find("init").ok().flatten())?;
-    Some(alloc::vec::Vec::from(entry.file_data()))
+    let file_data = entry.file_data();
+    crate::yarm_log!("YARM_INITRD_INIT_FOUND len={}", file_data.len());
+    Some(alloc::vec::Vec::from(file_data))
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -806,8 +808,20 @@ pub fn bootstrap_first_user_task(
     let (asid, _aspace_cap) = kernel.create_user_address_space()?;
     let image = load_init_elf_from_initramfs_vfs();
     let fallback = initramfs_static_hello_world_elf();
-    let image_bytes: &[u8] = image.as_deref().unwrap_or(&fallback);
+    let (image_bytes, source): (&[u8], &str) = match image.as_deref() {
+        Some(initrd_image) => (initrd_image, "initrd"),
+        None => (&fallback, "synthetic"),
+    };
     let entry = kernel.load_elf_pt_load_segments(asid, image_bytes)?;
+    match source {
+        "initrd" => crate::yarm_log!("YARM_INITRD_INIT_ELF_SELECTED entry=0x{:x}", entry),
+        _ => crate::yarm_log!("YARM_SYNTHETIC_INIT_ELF_SELECTED entry=0x{:x}", entry),
+    }
+    crate::yarm_log!(
+        "YARM_FIRST_USER_IMAGE_SOURCE source={} len={}",
+        source,
+        image_bytes.len()
+    );
     kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
         entry,
@@ -816,7 +830,12 @@ pub fn bootstrap_first_user_task(
         startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
     })?;
     crate::yarm_log!(
-        "YARM_INIT_DONE arch=aarch64 phase=kernel_static_init_elf image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
+        "YARM_INIT_DONE arch=aarch64 phase={} image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
+        if source == "initrd" {
+            "initrd_init_elf"
+        } else {
+            "kernel_static_init_elf"
+        },
         INITRAMFS_HELLO_WORLD_IMAGE_ID
     );
     Ok(())
