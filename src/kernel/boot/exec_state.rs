@@ -724,11 +724,14 @@ impl KernelState {
     }
 
     pub fn yield_current(&mut self) -> Result<(), KernelError> {
+        let outgoing_tid = self.current_tid();
+        if cfg!(not(feature = "hosted-dev")) {
+            crate::yarm_log!("YARM_YIELD_BEGIN tid={:?}", outgoing_tid);
+        }
         self.with_ipc_state_mut(|ipc| {
             ipc.telemetry.scheduler_yield_calls =
                 ipc.telemetry.scheduler_yield_calls.saturating_add(1);
         });
-        let outgoing_tid = self.current_tid();
         if let Some(tid) = outgoing_tid {
             self.with_tcbs_mut(|tcbs| {
                 let tcb = tcbs
@@ -763,6 +766,28 @@ impl KernelState {
                 tcb.status = TaskStatus::Running;
                 Ok::<_, KernelError>(())
             })?;
+            if cfg!(not(feature = "hosted-dev")) {
+                let status = if outgoing_tid == Some(tid) {
+                    "same-task"
+                } else {
+                    "switched"
+                };
+                crate::yarm_log!("YARM_YIELD_END status={} tid={}", status, tid);
+            }
+        } else {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!("YARM_YIELD_NO_OTHER_RUNNABLE");
+            }
+            if let Some(tid) = outgoing_tid {
+                let _ = self.enqueue_current_cpu(tid);
+                let redispatched = self.dispatch_next_task()?;
+                if redispatched == Some(tid) {
+                    if cfg!(not(feature = "hosted-dev")) {
+                        crate::yarm_log!("YARM_YIELD_RETURN_SAME_TASK tid={}", tid);
+                        crate::yarm_log!("YARM_YIELD_END status=same-task tid={}", tid);
+                    }
+                }
+            }
         }
         Ok(())
     }
