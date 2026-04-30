@@ -5,7 +5,7 @@
 //! Kernel-facing message wrappers should live outside this crate.
 
 const MAX_FDS: usize = 16;
-const MAX_POLICY_RANGES: usize = 4;
+const MAX_POLICY_PREFIXES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsError {
@@ -504,86 +504,52 @@ pub struct StatxRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PathPolicyRange {
-    pub start: u64,
-    pub end: u64,
-}
-
-impl PathPolicyRange {
-    pub const fn contains(self, path_ptr: u64) -> bool {
-        path_ptr >= self.start && path_ptr <= self.end
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MountNamespacePolicy {
     allow_all: bool,
-    ranges: [Option<PathPolicyRange>; MAX_POLICY_RANGES],
+    prefixes: [Option<&'static [u8]>; MAX_POLICY_PREFIXES],
 }
 
 impl MountNamespacePolicy {
     pub const fn baseline() -> Self {
         Self {
             allow_all: true,
-            ranges: [None; MAX_POLICY_RANGES],
+            prefixes: [None; MAX_POLICY_PREFIXES],
         }
     }
 
     pub const fn deny_all() -> Self {
         Self {
             allow_all: false,
-            ranges: [None; MAX_POLICY_RANGES],
+            prefixes: [None; MAX_POLICY_PREFIXES],
         }
     }
 
     pub const fn boot_profile() -> Self {
         Self {
             allow_all: false,
-            ranges: [
-                Some(PathPolicyRange {
-                    start: 0x1000,
-                    end: 0x1FFF,
-                }),
-                Some(PathPolicyRange {
-                    start: 0x4000,
-                    end: 0x4FFF,
-                }),
-                Some(PathPolicyRange {
-                    start: 0xA000,
-                    end: 0xAFFF,
-                }),
+            prefixes: [
+                Some(b"/initramfs"),
+                Some(b"/dev"),
+                Some(b"/ramfs"),
+                Some(b"/etc/hosts"),
+                None,
+                None,
+                None,
                 None,
             ],
         }
     }
 
-    pub const fn with_range(mut self, start: u64, end: u64) -> Self {
+    pub const fn with_prefix(mut self, prefix: &'static [u8]) -> Self {
         let mut idx = 0;
-        while idx < MAX_POLICY_RANGES {
-            if self.ranges[idx].is_none() {
-                self.ranges[idx] = Some(PathPolicyRange { start, end });
+        while idx < MAX_POLICY_PREFIXES {
+            if self.prefixes[idx].is_none() {
+                self.prefixes[idx] = Some(prefix);
                 break;
             }
             idx += 1;
         }
         self
-    }
-
-    /// Legacy numeric-path policy check kept for compatibility-only pointer ABI callers.
-    pub const fn allows_path(self, path_ptr: u64) -> bool {
-        if self.allow_all {
-            return true;
-        }
-        let mut idx = 0;
-        while idx < MAX_POLICY_RANGES {
-            if let Some(range) = self.ranges[idx] {
-                if range.contains(path_ptr) {
-                    return true;
-                }
-            }
-            idx += 1;
-        }
-        false
     }
 
     /// Primary policy check for OPENAT/STATX runtime traffic.
@@ -594,11 +560,27 @@ impl MountNamespacePolicy {
         if path.is_empty() || !path.starts_with(b"/") {
             return false;
         }
-        if path.starts_with(b"/initramfs/") || path.starts_with(b"/dev/") || path.starts_with(b"/ramfs/") {
-            return true;
+        let mut idx = 0;
+        while idx < MAX_POLICY_PREFIXES {
+            if let Some(prefix) = self.prefixes[idx]
+                && path_matches_prefix(path, prefix)
+            {
+                return true;
+            }
+            idx += 1;
         }
-        path == b"/etc/hosts"
+        false
     }
+}
+
+fn path_matches_prefix(path: &[u8], prefix: &[u8]) -> bool {
+    if prefix == b"/" {
+        return true;
+    }
+    if !path.starts_with(prefix) {
+        return false;
+    }
+    path.len() == prefix.len() || path.get(prefix.len()) == Some(&b'/')
 }
 
 pub const INLINE_PATH_MAX: usize = 96;
@@ -636,4 +618,34 @@ pub struct MountRecord {
     pub fs_tag: u64,
     pub active: bool,
     pub failed: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_allows_exact_prefix() {
+        let policy = MountNamespacePolicy::deny_all().with_prefix(b"/dev");
+        assert!(policy.allows_path_bytes(b"/dev"));
+    }
+
+    #[test]
+    fn policy_allows_child_path() {
+        let policy = MountNamespacePolicy::deny_all().with_prefix(b"/dev");
+        assert!(policy.allows_path_bytes(b"/dev/console"));
+    }
+
+    #[test]
+    fn policy_rejects_sibling_prefix_collision() {
+        let policy = MountNamespacePolicy::deny_all().with_prefix(b"/dev");
+        assert!(!policy.allows_path_bytes(b"/device"));
+    }
+
+    #[test]
+    fn root_prefix_allows_all_paths() {
+        let policy = MountNamespacePolicy::deny_all().with_prefix(b"/");
+        assert!(policy.allows_path_bytes(b"/"));
+        assert!(policy.allows_path_bytes(b"/any/path"));
+    }
 }

@@ -154,11 +154,8 @@ mod tests {
             .expect("mount initramfs");
         svc.set_policy(
             MountNamespacePolicy::deny_all()
-                .with_range(DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR)
-                .with_range(
-                    INITRAMFS_BOOT_MARKER_PATH_PTR,
-                    INITRAMFS_BOOT_MARKER_PATH_PTR,
-                ),
+                .with_prefix(b"/dev")
+                .with_prefix(b"/initramfs"),
         );
 
         let open_dev = svc

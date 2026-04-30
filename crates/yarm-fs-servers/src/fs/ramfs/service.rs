@@ -155,11 +155,8 @@ mod tests {
             .expect("mount initramfs");
         svc.set_policy(
             MountNamespacePolicy::deny_all()
-                .with_range(RAMFS_BOOT_PATH_PTR, RAMFS_BOOT_PATH_PTR)
-                .with_range(
-                    INITRAMFS_BOOT_MARKER_PATH_PTR,
-                    INITRAMFS_BOOT_MARKER_PATH_PTR,
-                ),
+                .with_prefix(b"/ramfs")
+                .with_prefix(b"/initramfs"),
         );
 
         let open_ramfs = svc
