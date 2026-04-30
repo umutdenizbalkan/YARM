@@ -787,6 +787,9 @@ fn initramfs_static_hello_world_elf() -> [u8; 256] {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const INITRD_INIT_ELF_MAX_SIZE: usize = 16 * 1024 * 1024;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
     let bytes = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?;
     let entry = yarm_srv_common::cpio::CpioArchive::new(bytes)
@@ -796,6 +799,14 @@ fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
         .or_else(|| yarm_srv_common::cpio::CpioArchive::new(bytes).find("init").ok().flatten())?;
     let file_data = entry.file_data();
     crate::yarm_log!("YARM_INITRD_INIT_FOUND len={}", file_data.len());
+    if file_data.len() > INITRD_INIT_ELF_MAX_SIZE {
+        crate::yarm_log!(
+            "YARM_INITRD_INIT_TOO_LARGE len={} cap={}",
+            file_data.len(),
+            INITRD_INIT_ELF_MAX_SIZE
+        );
+        return None;
+    }
     Some(alloc::vec::Vec::from(file_data))
 }
 
