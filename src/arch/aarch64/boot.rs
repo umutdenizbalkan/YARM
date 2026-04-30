@@ -348,18 +348,18 @@ yarm_aarch64_vector_dispatch:
     ldp q30, q31, [sp, #768]
     ldr x9, [sp, #248]
     msr sp_el0, x9
-    ldr x9, [sp, #256]
-    mov x0, x9
+    ldr x0, [sp, #256]
     bl yarm_aarch64_return_to_user_elr_marker
-    mov x0, x9
-    bl yarm_aarch64_write_return_elr_marker
+    ldr x9, [sp, #256]
     msr elr_el1, x9
+    mrs x0, elr_el1
+    bl yarm_aarch64_write_return_elr_marker
+    mrs x0, elr_el1
+    bl yarm_aarch64_final_elr_reg_marker
     ldr x9, [sp, #264]
     msr spsr_el1, x9
     ldr x0, [sp, #0]
     bl yarm_aarch64_return_to_user_x0_marker
-    mrs x0, elr_el1
-    bl yarm_aarch64_final_elr_reg_marker
     ldr x30, [sp, #240]
     ldp x28, x29, [sp, #224]
     ldp x26, x27, [sp, #208]
