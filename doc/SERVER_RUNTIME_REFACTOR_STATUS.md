@@ -143,6 +143,33 @@ Fault wire compatibility:
 
 - Fault wire format remains unchanged and fixed at 17 bytes.
 
+### 8) Initrd `/init` ELF size-cap status (current)
+
+Current behavior:
+
+- Boot initrd `/init` is read from CPIO and copied into a temporary `Vec<u8>`.
+- The kernel ELF loader then consumes that full in-memory image.
+- Boot path currently enforces `INITRD_INIT_ELF_MAX_SIZE = 16 * 1024 * 1024` (16 MiB) in ISA boot loaders.
+
+Why this is acceptable right now:
+
+- 16 MiB is sufficient for current `init_server` bring-up targets.
+- Existing fallback behavior is preserved when `/init` is missing or rejected by cap checks.
+- The cap prevents unbounded early-boot allocations from unexpectedly large initrd payloads.
+
+Known limitation:
+
+- Larger init/supervisor/musl binaries increase early-boot memory pressure because the full image
+  is held in a temporary `Vec<u8>`.
+- Full-copy loading is not a scalable long-term strategy.
+
+TODO (future design direction):
+
+1. Replace full-copy `/init` loading with streaming or page-backed ELF loading.
+2. Prefer mapping PT_LOAD segments directly from initrd/CPIO-backed storage (or page cache) where practical.
+3. Avoid retaining the whole ELF image in a temporary `Vec<u8>` during bring-up.
+4. Keep explicit max-size and validation policy even after a zero-copy/segment-mapped design.
+
 ## Remaining blockers / future work
 
 1. Replace production `NoSys` POSIX branches with explicit runtime abstractions.
