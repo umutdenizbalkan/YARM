@@ -349,6 +349,8 @@ yarm_aarch64_vector_dispatch:
     ldr x9, [sp, #248]
     msr sp_el0, x9
     ldr x9, [sp, #256]
+    mov x0, x9
+    bl yarm_aarch64_return_to_user_elr_marker
     msr elr_el1, x9
     ldr x9, [sp, #264]
     msr spsr_el1, x9
@@ -368,6 +370,10 @@ yarm_aarch64_vector_dispatch:
     ldp x4, x5, [sp, #32]
     ldp x2, x3, [sp, #16]
     ldp x0, x1, [sp, #0]
+    mov x19, x0
+    mov x0, x19
+    bl yarm_aarch64_return_to_user_x0_marker
+    mov x0, x19
     add sp, sp, #816
     eret
     "#
@@ -461,6 +467,18 @@ extern "C" fn yarm_aarch64_vector_first_marker() {
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_vector_elr_marker(elr: u64) {
     crate::yarm_log!("YARM_AARCH64_VECTOR_ELR_RAW elr=0x{:016x}", elr);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_return_to_user_elr_marker(elr: u64) {
+    crate::yarm_log!("AARCH64_RETURN_TO_USER_ELR value=0x{:016x}", elr);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_return_to_user_x0_marker(x0: u64) {
+    crate::yarm_log!("AARCH64_RETURN_TO_USER_X0 value=0x{:016x}", x0);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]

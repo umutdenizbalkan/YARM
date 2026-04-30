@@ -132,6 +132,8 @@ pub fn handle_trap_entry(
     mut frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
     let event = decode_trap_context(context);
+    let entering_tid = kernel.current_tid();
+    let original_saved_pc = frame.as_ref().map(|f| f.saved_pc());
     if matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
             import_syscall_abi_from_user_gprs(trapframe);
@@ -146,6 +148,14 @@ pub fn handle_trap_entry(
         }
     }
     restore_arch_thread_state(kernel, cpu, frame)?;
+    if matches!(event, TrapEvent::Syscall) {
+        let exiting_tid = kernel.current_tid();
+        if entering_tid == exiting_tid
+            && let (Some(saved_pc), Some(trapframe)) = (original_saved_pc, frame.as_deref_mut())
+        {
+            trapframe.set_saved_pc(saved_pc);
+        }
+    }
     Ok(())
 }
 
