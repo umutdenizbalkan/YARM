@@ -141,7 +141,12 @@ pub fn handle_trap_entry(
     }
     let _ = kernel.set_current_cpu(cpu);
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
-    kernel.handle_trap_event(event, frame.as_deref_mut())?;
+    if let Err(err) = kernel.handle_trap_event(event, frame.as_deref_mut()) {
+        crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT err={:?}", err);
+        crate::yarm_log!("AARCH64_TRAP_FAIL_REASON handle_trap_event");
+        return Err(err);
+    }
+    crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT ok");
     if matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
             export_syscall_result_to_user_gprs(trapframe);
@@ -153,7 +158,11 @@ pub fn handle_trap_entry(
             raw_vector_return_pc as u64
         );
     }
-    restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())?;
+    if let Err(err) = restore_arch_thread_state(kernel, cpu, frame.as_deref_mut()) {
+        crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT err={:?}", err);
+        crate::yarm_log!("AARCH64_TRAP_FAIL_REASON restore_arch_thread_state");
+        return Err(err);
+    }
     if matches!(event, TrapEvent::Syscall) {
         let exiting_tid = kernel.current_tid();
         if entering_tid == exiting_tid

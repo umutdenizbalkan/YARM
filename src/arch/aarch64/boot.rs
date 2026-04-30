@@ -628,7 +628,10 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     let _ = write!(
         writer,
         "YARM_AARCH64_EXCEPTION_REGS esr_el1=0x{:016x} far_el1=0x{:016x} elr_el1=0x{:016x} spsr_el1=0x{:016x}",
-        frame.esr_el1, frame.far_el1, frame.elr_el1, frame.spsr_el1
+        frame.esr_el1,
+        frame.far_el1,
+        crate::arch::aarch64::boot::last_vector_raw_elr(),
+        frame.spsr_el1
     );
     let line_len = writer.len;
     if let Ok(msg) = core::str::from_utf8(&line[..line_len]) {
@@ -645,7 +648,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
                 trap_cpu.0,
                 current_tid.unwrap_or(0),
                 frame.esr_el1,
-                frame.elr_el1,
+                crate::arch::aarch64::boot::last_vector_raw_elr(),
                 frame.far_el1,
                 frame.spsr_el1
             );
@@ -673,6 +676,12 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
             write_trapframe_back_to_vector_frame(frame, &trap_frame);
         } else {
             crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE failed");
+            crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE halting");
+            loop {
+                unsafe {
+                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+                }
+            }
         }
     } else {
         crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE no_kernel_state");
