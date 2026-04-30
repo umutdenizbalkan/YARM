@@ -323,6 +323,63 @@ pub mod runtime {
         }
     }
 
+    #[inline]
+    fn install_startup_args_from_abi(
+        startup_task_id: u64,
+        startup_proc_mgr_request_send_cap: u64,
+        startup_proc_mgr_reply_recv_cap: u64,
+        startup_slots_ptr: usize,
+        startup_slots_len: usize,
+    ) {
+        let mut slots = [
+            startup_task_id,
+            startup_proc_mgr_request_send_cap,
+            startup_proc_mgr_reply_recv_cap,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        if startup_slots_ptr != 0 && startup_slots_len >= slots.len() {
+            let src = startup_slots_ptr as *const u64;
+            let mut index = 0usize;
+            while index < slots.len() {
+                // SAFETY: bounded by `slots.len()` and guarded by non-zero pointer
+                // + contract length check above.
+                slots[index] = unsafe { core::ptr::read(src.add(index)) };
+                index += 1;
+            }
+        }
+        install_startup_arg_slots(slots);
+    }
+
+    #[inline]
+    pub fn enter_user_entrypoint(
+        startup_task_id: u64,
+        startup_proc_mgr_request_send_cap: u64,
+        startup_proc_mgr_reply_recv_cap: u64,
+        startup_slots_ptr: usize,
+        startup_slots_len: usize,
+        user_entry: fn(),
+    ) -> ! {
+        install_startup_args_from_abi(
+            startup_task_id,
+            startup_proc_mgr_request_send_cap,
+            startup_proc_mgr_reply_recv_cap,
+            startup_slots_ptr,
+            startup_slots_len,
+        );
+        user_entry();
+        loop {
+            let _ = crate::syscall::yield_now();
+        }
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum KernelIpcError {
         MissingRight,

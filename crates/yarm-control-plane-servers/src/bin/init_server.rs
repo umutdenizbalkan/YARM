@@ -22,6 +22,12 @@ fn main() {
 
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
+pub extern "C" fn yarm_user_entry() {
+    run();
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start(
     startup_task_id: u64,
     startup_proc_mgr_request_send_cap: u64,
@@ -30,35 +36,14 @@ pub extern "C" fn _start(
     startup_slots_len: usize,
     _startup_slots_reserved: usize,
 ) -> ! {
-    let mut slots = [
+    yarm::user_rt::runtime::enter_user_entrypoint(
         startup_task_id,
         startup_proc_mgr_request_send_cap,
         startup_proc_mgr_reply_recv_cap,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ];
-    if startup_slots_ptr != 0 && startup_slots_len >= slots.len() {
-        // SAFETY: kernel provides user entry args; when pointer/len is valid for
-        // the startup block contract we copy exactly 12 u64 entries.
-        let src = startup_slots_ptr as *const u64;
-        let mut index = 0usize;
-        while index < slots.len() {
-            // SAFETY: bounded by `slots.len()` and guarded by non-zero pointer
-            // + contract length check above.
-            slots[index] = unsafe { core::ptr::read(src.add(index)) };
-            index += 1;
-        }
-    }
-    yarm::install_startup_arg_slots(slots);
-    run();
-    loop {}
+        startup_slots_ptr,
+        startup_slots_len,
+        yarm_user_entry,
+    )
 }
 
 #[cfg(not(feature = "hosted-dev"))]
