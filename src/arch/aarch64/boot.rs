@@ -688,6 +688,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
             }
         }
     } else if let Some(kernel) = trap_kernel_state_mut() {
+        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry fallback=1");
         let current_tid = kernel.current_tid();
         if current_tid == Some(1) {
             crate::yarm_log!(
