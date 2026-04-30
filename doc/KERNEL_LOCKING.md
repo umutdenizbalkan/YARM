@@ -329,6 +329,24 @@ handled via a dedicated helper with clear lock-contract comments.
 - Future Stage 2L intent: special-case recv-timeout syscall at this shared seam before entering global-lock mutation path.
 - No behavior change in Stage 2K.
 
+### Stage 2L seam-callsite migration status
+
+- Callsites audited (production + seam-related):
+  - `src/arch/aarch64/boot.rs`: vector handoff path calls `aarch64::trap::handle_trap_entry(kernel, ...)` after obtaining `kernel: &mut KernelState` from `trap_kernel_state_mut()`.
+  - `src/arch/x86_64/descriptor_tables.rs`: trap stub dispatch paths call `x86_64::trap::handle_trap_entry(kernel, ...)` on `&mut KernelState`.
+  - `src/arch/*/trap.rs`: ISA trap handlers accept `&mut KernelState` and call `kernel.handle_trap_event(...)`.
+  - `src/kernel/boot/fault_state.rs`: `handle_selected_arch_trap_entry(...)` forwards `&mut KernelState` into `arch::trap_entry::handle_trap_entry(...)`.
+
+- Exact blocker for Stage 2L migration:
+  - First production trap-entry callers currently materialize `&mut KernelState` before dispatch; they do not retain `&SharedKernel`.
+  - Specifically, `aarch64` vector handoff uses `trap_kernel_state_mut() -> Option<&mut KernelState>` and therefore cannot call `dispatch_trap_entry_with_shared_kernel(...)` without changing the kernel-state handoff type.
+
+- Next type/function that must change for future migration:
+  - Introduce a shared-kernel accessor at trap entry (for example `trap_shared_kernel()`), or equivalent ownership change where `trap_kernel_state_mut` callsites can obtain `&SharedKernel` first.
+
+- Stage 2L status: staged-only; no production callsite migrated in this slice.
+- No behavior change in Stage 2L.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
