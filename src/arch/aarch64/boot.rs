@@ -289,6 +289,10 @@ yarm_aarch64_vector_dispatch:
     mrs x9, sp_el0
     str x9, [sp, #248]
     mrs x9, elr_el1
+    mov x10, x9
+    mov x0, x10
+    bl yarm_aarch64_vector_elr_marker
+    mov x9, x10
     str x9, [sp, #256]
     mrs x9, spsr_el1
     str x9, [sp, #264]
@@ -429,6 +433,12 @@ extern "C" fn yarm_aarch64_vector_first_marker() {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_vector_elr_marker(elr: u64) {
+    crate::yarm_log!("YARM_AARCH64_VECTOR_ELR_RAW elr=0x{:016x}", elr);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_enable_fp_simd() {
     unsafe {
         let mut cpacr_el1: u64;
@@ -490,6 +500,19 @@ struct Aarch64VectorFrame {
     far_el1: u64,
     neon: [[u8; 16]; 32],
 }
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(core::mem::size_of::<Aarch64VectorFrame>() == 800);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, sp_el0) == 248);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, elr_el1) == 256);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, spsr_el1) == 264);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, esr_el1) == 272);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, far_el1) == 280);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn write_trapframe_back_to_vector_frame(
