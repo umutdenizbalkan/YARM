@@ -385,6 +385,18 @@ handled via a dedicated helper with clear lock-contract comments.
   - shared marker on shared-path use
   - fallback marker only when fallback is actually used.
 
+
+#### Stage 2N final status (current)
+
+- Stage 2N seam callsite migration is in place, but aarch64 remains **fallback-active** in normal boot flow (not fully active shared-path).
+- `trap_shared_kernel()` is `None` because bootstrap currently owns/exposes `&mut KernelState` from `Bootstrap::init_static()` rather than a canonical long-lived `SharedKernel` at trap entry installation time.
+- Recv-timeout special-casing remains blocked until `SharedKernel` becomes canonical at trap entry boundary.
+
+#### Future Stage 3 design note
+
+- Introduce a canonical boot-owned `SharedKernel` instance and derive `KernelState` access through it.
+- Once canonical, route trap/syscall entry through shared seams first, then apply targeted recv-timeout split-read special-casing without altering global-lock mutation semantics.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
