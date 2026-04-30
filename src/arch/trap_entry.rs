@@ -67,6 +67,15 @@ pub fn handle_trap_entry_shared(
     result
 }
 
+pub fn dispatch_trap_entry_with_shared_kernel(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    context: ArchTrapContext,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    handle_trap_entry_shared(shared, cpu, context, frame)
+}
+
 #[cfg(not(any(
     target_arch = "riscv64",
     target_arch = "x86_64",
