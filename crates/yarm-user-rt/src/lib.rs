@@ -365,7 +365,7 @@ pub mod runtime {
         startup_proc_mgr_reply_recv_cap: u64,
         startup_slots_ptr: usize,
         startup_slots_len: usize,
-        user_entry: extern "C" fn(),
+        user_entry: extern "C" fn() -> !,
     ) -> ! {
         install_startup_args_from_abi(
             startup_task_id,
@@ -376,10 +376,7 @@ pub mod runtime {
         );
         // SAFETY: reading a function pointer from its local storage is valid.
         let entry = unsafe { core::ptr::read_volatile(&user_entry) };
-        entry();
-        loop {
-            let _ = crate::syscall::yield_now();
-        }
+        entry()
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
