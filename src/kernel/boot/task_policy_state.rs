@@ -121,10 +121,12 @@ impl KernelState {
     }
 
     pub fn task_class(&self, tid: u64) -> Option<TaskClass> {
-        self.tcbs.iter().enumerate().find_map(|(idx, slot)| {
-            slot.as_ref()
-                .filter(|tcb| tcb.tid.0 == tid)
-                .and(self.task_classes[idx])
+        self.with_tcbs(|tcbs| {
+            tcbs.iter().enumerate().find_map(|(idx, slot)| {
+                slot.as_ref()
+                    .filter(|tcb| tcb.tid.0 == tid)
+                    .and(self.task_classes[idx])
+            })
         })
     }
 

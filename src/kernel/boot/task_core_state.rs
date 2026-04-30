@@ -21,19 +21,21 @@ impl KernelState {
     }
 
     pub fn task_status(&self, tid: u64) -> Option<TaskStatus> {
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .map(|tcb| tcb.status)
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.status)
+        })
     }
 
     pub fn task_restart_token(&self, tid: u64) -> Option<u64> {
-        self.tcbs
-            .iter()
-            .flatten()
-            .find(|tcb| tcb.tid.0 == tid)
-            .and_then(|tcb| tcb.restart.token.map(|token| token.0))
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.restart.token.map(|token| token.0))
+        })
     }
 
     #[cfg(test)]
