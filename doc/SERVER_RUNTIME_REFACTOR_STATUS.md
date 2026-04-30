@@ -58,6 +58,10 @@ Delivery convention:
 - OPENAT/STATX decode path is inline byte-path only.
 - FS backends are byte-path-primary (`openat_path`/`statx_path`).
 - Remaining `path_ptr` naming primarily reflects manifest/wire compatibility and numeric path-id policy semantics, not runtime user-pointer OPENAT/STATX ABI.
+- Mount namespace policy model is now **path-prefix based** (not numeric pointer-range based):
+  - legacy numeric `path_ptr` range semantics were removed for namespace allow/deny decisions;
+  - policy checks now operate on byte-path prefixes with path-boundary safety;
+  - `/` matches all paths, `/dev` matches `/dev` and `/dev/...`, and `/dev` does **not** match `/device`.
 
 ### 6) Fault-report and restart pipeline state (current)
 
