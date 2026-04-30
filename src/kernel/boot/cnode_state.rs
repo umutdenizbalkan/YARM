@@ -73,11 +73,11 @@ impl KernelState {
             removed_process_record: bool,
         }
 
-        let has_live_threads = self
-            .tcbs
-            .iter()
-            .flatten()
-            .any(|tcb| tcb.thread_group_id.0 == pid && tcb.status != TaskStatus::Dead);
+        let has_live_threads = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .any(|tcb| tcb.thread_group_id.0 == pid && tcb.status != TaskStatus::Dead)
+        });
         if has_live_threads {
             return;
         }
