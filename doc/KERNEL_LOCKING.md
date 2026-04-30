@@ -347,6 +347,14 @@ handled via a dedicated helper with clear lock-contract comments.
 - Stage 2L status: staged-only; no production callsite migrated in this slice.
 - No behavior change in Stage 2L.
 
+### Stage 2M: shared-kernel trap accessor seam
+
+- Added sibling accessor at trap-entry state storage boundary (aarch64): `trap_shared_kernel() -> Option<&'static SharedKernel>`.
+- Companion installer helper added: `install_trap_shared_kernel(...)` (staged seam only; existing trap path remains unchanged).
+- Existing production trap handling still uses `trap_kernel_state_mut() -> &mut KernelState` and then ISA `handle_trap_entry(...)`.
+- Future Stage 2N intent: migrate one trap-entry callsite to `dispatch_trap_entry_with_shared_kernel(...)` using this accessor seam.
+- No behavior change in Stage 2M.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.

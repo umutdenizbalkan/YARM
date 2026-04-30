@@ -521,6 +521,8 @@ extern "C" fn yarm_aarch64_enable_fp_simd() {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static TRAP_KERNEL_STATE_PTR: core::sync::atomic::AtomicPtr<crate::kernel::boot::KernelState> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+static TRAP_SHARED_KERNEL_PTR: core::sync::atomic::AtomicPtr<crate::runtime::SharedKernel> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static BSP_RELEASED_SECONDARIES: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -550,6 +552,10 @@ fn install_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState) {
     TRAP_KERNEL_STATE_PTR.store(kernel as *mut _, core::sync::atomic::Ordering::SeqCst);
 }
 
+fn install_trap_shared_kernel(shared: &'static crate::runtime::SharedKernel) {
+    TRAP_SHARED_KERNEL_PTR.store(shared as *const _ as *mut _, core::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelState> {
     let ptr = TRAP_KERNEL_STATE_PTR.load(core::sync::atomic::Ordering::SeqCst);
@@ -557,6 +563,15 @@ fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelSta
         None
     } else {
         Some(unsafe { &mut *ptr })
+    }
+}
+
+fn trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
+    let ptr = TRAP_SHARED_KERNEL_PTR.load(core::sync::atomic::Ordering::SeqCst);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
     }
 }
 
