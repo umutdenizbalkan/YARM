@@ -59,7 +59,7 @@ use crate::kernel::lock::SpinLockIrq;
 use alloc::collections::BTreeMap;
 use tid_allocation_policy::{TidAllocationCursor, TidAllocationPolicy};
 
-const MAX_ENDPOINTS: usize = 64;
+const MAX_ENDPOINTS: usize = 256;
 
 #[cfg(feature = "hosted-dev")]
 const MAX_ENDPOINT_SENDER_WAITERS: usize = 8;
@@ -68,7 +68,7 @@ const MAX_ENDPOINT_SENDER_WAITERS: usize = 4;
 
 // Keep task capacity consistent across hosted-dev and freestanding builds so
 // capacity-sensitive tests match deployed behavior.
-const MAX_TASKS: usize = 128;
+const MAX_TASKS: usize = 512;
 
 const MAX_MEMORY_OBJECTS: usize = 512;
 const MAX_BOOT_MEMORY_REGIONS: usize = 64;

@@ -24,9 +24,9 @@ and `#[cfg(not(feature = "hosted-dev"))]`.
 
 | Constant | hosted-dev | non-hosted |
 |---|---:|---:|
-| `MAX_ENDPOINTS` | 64 | 32 |
+| `MAX_ENDPOINTS` | 256 | 256 |
 | `MAX_ENDPOINT_SENDER_WAITERS` | 8 | 4 |
-| `MAX_TASKS` | 64 | 128 |
+| `MAX_TASKS` | 512 | 512 |
 | `MAX_MEMORY_OBJECTS` | 1024 | 256 |
 | `MAX_NOTIFICATIONS` | 64 | 32 |
 | `MAX_DRIVERS` | 64 | 32 |
