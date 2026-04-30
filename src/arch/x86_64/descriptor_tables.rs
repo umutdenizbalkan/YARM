@@ -415,6 +415,7 @@ pub fn install_trap_kernel_state(
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[allow(dead_code)]
 fn install_trap_shared_kernel(shared: &'static crate::runtime::SharedKernel) {
     TRAP_SHARED_KERNEL_PTR.store(shared as *const _ as *mut _, Ordering::SeqCst);
 }
@@ -431,6 +432,7 @@ fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelSta
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[allow(dead_code)]
 fn trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
     let ptr = TRAP_SHARED_KERNEL_PTR.load(Ordering::SeqCst);
     if ptr.is_null() {

@@ -397,6 +397,32 @@ handled via a dedicated helper with clear lock-contract comments.
 - Introduce a canonical boot-owned `SharedKernel` instance and derive `KernelState` access through it.
 - Once canonical, route trap/syscall entry through shared seams first, then apply targeted recv-timeout split-read special-casing without altering global-lock mutation semantics.
 
+### Staged SharedKernel seam inventory (Stage 2B–2N audit)
+
+- `SharedKernel::scheduler_tick_now_split_read` (`src/runtime.rs`)
+  - Status: **keep (staged)**
+  - Reason: required building block for future recv-timeout split-read once canonical shared ownership exists.
+
+- `SharedKernel::ipc_recv_with_deadline_split_bridge` (`src/runtime.rs`)
+  - Status: **keep (staged)**
+  - Reason: bridges pre-read tick/deadline into existing IPC mutation path without changing semantics.
+
+- `SharedKernel::handle_trap_with_cpu` (`src/runtime.rs`)
+  - Status: **keep (staged)**
+  - Reason: core forwarding seam for SharedKernel-owned trap entry migration.
+
+- `arch::trap_entry::handle_trap_entry_shared` and
+  `arch::trap_entry::dispatch_trap_entry_with_shared_kernel` (`src/arch/trap_entry.rs`)
+  - Status: **keep (staged)**
+  - Reason: top-level shared dispatch seam used for controlled migration of trap entry ownership.
+
+- `install_trap_shared_kernel` / `trap_shared_kernel` (`src/arch/aarch64/boot.rs`, `src/arch/x86_64/descriptor_tables.rs`)
+  - Status: **gate/debug-only staged seam**
+  - Reason: ownership bridge is incomplete until canonical boot-owned `SharedKernel` is introduced; retain seam and fallback path.
+  - Hygiene: `#[allow(dead_code)]` applied to avoid misleading unused-function warnings while staged.
+
+- No staged API removed in this audit; all retained seams are still relevant to planned canonical SharedKernel ownership transition.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
