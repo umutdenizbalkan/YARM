@@ -477,6 +477,11 @@ pub(crate) fn last_vector_raw_elr() -> u64 {
     LAST_VECTOR_RAW_ELR.load(Ordering::Relaxed)
 }
 
+#[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
+pub(crate) fn last_vector_raw_elr() -> u64 {
+    0
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_return_to_user_elr_marker(elr: u64) {
