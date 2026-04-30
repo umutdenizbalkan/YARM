@@ -134,17 +134,27 @@ yarm_aarch64_enter_user_mode_eret:
     ldp x11, x12, [sp, #16]
     ldr x13, [sp, #32]
     add sp, sp, #48
+    mov x19, x9
+    mov x20, x10
+    mov x21, x11
+    mov x22, x12
+    mov x23, x13
     bl yarm_aarch64_user_entry_marker_before_sp_el0
-    msr sp_el0, x10
+    msr sp_el0, x20
     bl yarm_aarch64_user_entry_marker_before_elr
-    msr tpidr_el0, x13
-    msr elr_el1, x9
+    mov x0, x19
+    bl yarm_aarch64_write_elr_marker
+    msr tpidr_el0, x23
+    msr elr_el1, x19
     msr spsr_el1, xzr
     bl yarm_aarch64_user_entry_marker_1
+    mov x0, x19
+    mov x1, x20
+    bl yarm_aarch64_before_eret_marker
     bl yarm_aarch64_user_entry_marker_before_eret
     isb
-    mov x0, x11
-    mov x1, x12
+    mov x0, x21
+    mov x1, x22
     eret
     "#
 );
@@ -423,6 +433,22 @@ extern "C" fn yarm_aarch64_user_entry_marker_before_elr() {
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_user_entry_marker_before_eret() {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_USER_ENTRY U_ERET");
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_write_elr_marker(elr: u64) {
+    crate::yarm_log!("YARM_AARCH64_WRITE_ELR value=0x{:016x}", elr);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_before_eret_marker(elr: u64, sp: u64) {
+    crate::yarm_log!(
+        "YARM_AARCH64_BEFORE_ERET elr=0x{:016x} sp=0x{:016x}",
+        elr,
+        sp
+    );
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
