@@ -177,6 +177,16 @@ handled via a dedicated helper with clear lock-contract comments.
 - What remains under global lock: all mutation paths and the rest of syscall/dispatch/control-plane state transitions still use `SharedKernel::with(...)` (global lock intact).
 - TODO (next call-site migration): switch the runtime trap/dispatch timeout read path to call `SharedKernel::scheduler_tick_now_split_read` instead of reading ticks only through `SharedKernel::with(...)` wrappers.
 
+
+### Stage 2C status: blocked / no-op under current constraints
+
+- `scheduler_tick_now_split_read` exists as the Stage 2B staged API.
+- Stage 2C attempted first caller migration.
+- No safe non-IPC/non-VM caller exists yet.
+- Current scheduler tick reads that need migration are inside `KernelState` IPC deadline paths.
+- Migrating those reads requires explicitly allowing IPC deadline path work in a future Stage 2D slice.
+- No behavior change was made for Stage 2C.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
