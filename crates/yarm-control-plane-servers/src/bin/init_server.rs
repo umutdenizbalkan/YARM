@@ -27,6 +27,12 @@ pub extern "C" fn yarm_user_entry() {
 }
 
 #[cfg(not(feature = "hosted-dev"))]
+#[inline]
+fn yarm_user_entry_rust() {
+    yarm_user_entry();
+}
+
+#[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(
     startup_task_id: u64,
@@ -42,7 +48,7 @@ pub extern "C" fn _start(
         startup_proc_mgr_reply_recv_cap,
         startup_slots_ptr,
         startup_slots_len,
-        yarm_user_entry,
+        yarm_user_entry_rust,
     )
 }
 
