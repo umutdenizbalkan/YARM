@@ -282,6 +282,15 @@ handled via a dedicated helper with clear lock-contract comments.
 
 - No behavior change in this Stage 2G.2 audit note.
 
+### Stage 2H: shared trap-entry seam (alternate entry only)
+
+- Added alternate entry seam: `arch::trap_entry::handle_trap_entry_shared(shared, cpu, context, frame)`.
+- Current behavior: forwarding-only; it enters via `SharedKernel::with_cpu(...)` and calls the existing `handle_trap_entry(...)` path unchanged.
+- No production caller migration in Stage 2H (staged only).
+- Intended future caller: selected runtime/arch trap dispatch boundary identified in Stage 2G.2 before borrowing `&mut KernelState`.
+- Future Stage 2I intent: special-case recv-timeout syscall at this shared seam before entering global-lock mutation path.
+- No behavior change in Stage 2H.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.

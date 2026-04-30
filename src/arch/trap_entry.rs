@@ -54,6 +54,19 @@ pub fn handle_trap_entry(
     super::aarch64::trap::handle_trap_entry(kernel, cpu, context, frame)
 }
 
+
+pub fn handle_trap_entry_shared(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    context: ArchTrapContext,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    let result = shared
+        .with_cpu(cpu, |kernel| handle_trap_entry(kernel, cpu, context, frame))
+        .map_err(|err| TrapHandleError::Syscall(err.into()))?;
+    result
+}
+
 #[cfg(not(any(
     target_arch = "riscv64",
     target_arch = "x86_64",
