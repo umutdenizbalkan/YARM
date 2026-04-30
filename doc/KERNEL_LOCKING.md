@@ -355,6 +355,17 @@ handled via a dedicated helper with clear lock-contract comments.
 - Future Stage 2N intent: migrate one trap-entry callsite to `dispatch_trap_entry_with_shared_kernel(...)` using this accessor seam.
 - No behavior change in Stage 2M.
 
+
+#### Stage 2M per-ISA parity status
+
+- `aarch64`: parity available (staged accessors exist):
+  - `trap_kernel_state_mut() -> Option<&'static mut KernelState>`
+  - `trap_shared_kernel() -> Option<&'static SharedKernel>`
+- `x86_64`: parity available (staged accessors added):
+  - `trap_kernel_state_mut() -> Option<&'static mut KernelState>`
+  - `trap_shared_kernel() -> Option<&'static SharedKernel>`
+- `riscv64`: parity not applicable yet. Current trap entry takes `&mut KernelState` from caller and does not maintain a local trap-global kernel-state accessor slot in the same style as `aarch64`/`x86_64`.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
