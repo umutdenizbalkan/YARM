@@ -204,6 +204,42 @@ handled via a dedicated helper with clear lock-contract comments.
 - `ipc_recv_with_deadline_split_bridge` remains bridge-only staged for this caller.
 - No behavior change in Stage 2E.
 
+### Stage 2F design: SharedKernel-aware syscall entry (recv-timeout only)
+
+- Audited flow:
+  - `src/runtime.rs`: `SharedKernel::with(...)` / `with_cpu(...)` are the global-lock entry points.
+  - `src/kernel/boot/fault_state.rs`: `KernelState::handle_trap(...)` dispatches syscall on `&mut KernelState`.
+  - `src/kernel/syscall.rs`: `dispatch(...)` routes `SYSCALL_IPC_RECV_TIMEOUT_NR` to `handle_ipc_recv_timeout(...)`, both on `&mut KernelState`.
+  - `src/kernel/syscall.rs`: `handle_ipc_recv_timeout(...)` currently reads/uses timeout only via `KernelState` APIs.
+
+- Proposed minimal API (design only, not implemented):
+  - Add a narrow optional entry wrapper on `SharedKernel` for syscall dispatch:
+    - `SharedKernel::dispatch_syscall_with_split_reads(cpu, frame)`
+  - Keep existing `KernelState::handle_trap(...)` + `syscall::dispatch(...)` unchanged for all existing paths.
+  - Inside the wrapper, special-case recv-timeout only:
+    1. decode syscall number from frame;
+    2. if `SYSCALL_IPC_RECV_TIMEOUT_NR` and `timeout_ticks != 0`, call `ipc_recv_with_deadline_split_bridge(...)`;
+    3. otherwise fall back to existing `with_cpu(... -> KernelState::handle_trap(...))`.
+
+- Why this avoids re-entrant global locking:
+  - Do the split read (`scheduler_tick_now_split_read`) before entering `with(...)`.
+  - Ensure the bridge mutation call is the single `with(...)` boundary (no nested `with` while already holding global lock).
+  - Keep current `KernelState`-based dispatch path unchanged for non-target syscalls.
+
+- Risks to manage in implementation:
+  - Re-entrant global locking if wrapper is called from a path already holding `SharedKernel::state`.
+  - Lifetime/borrow pitfalls when combining mutable frame handling with wrapper closures.
+  - Lock-order visibility (scheduler split-read then global lock) must remain documented and consistent.
+  - CPU-local context correctness (`set_current_cpu`) must be preserved exactly as today.
+
+- Future implementation steps (recv-timeout only):
+  1. Add the wrapper method and route exactly one selected entry call site to it.
+  2. Emit Stage 2E marker from wrapper path only: `YARM_LOCK_SPLIT_STAGE2E path=recv_timeout_syscall_bridge`.
+  3. Keep `ipc_recv` and send-timeout paths unchanged.
+  4. Add focused regression tests for timeout outcomes (`TimedOut` vs `WouldBlock`) to prove behavioral parity.
+
+- No behavior change in this Stage 2F design note.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
