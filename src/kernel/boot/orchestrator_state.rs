@@ -11,9 +11,30 @@ pub(crate) fn set_with_tcbs_probe(active: bool) {
 }
 
 impl KernelState {
+    #[inline]
+    fn debug_lock_order_note(_lock_name: &'static str) {
+        #[cfg(debug_assertions)]
+        {
+            // Stage-1 scaffolding only: keep this as a low-risk instrumentation hook
+            // for future lock-order assertions without changing runtime behavior.
+            let _ = _lock_name;
+        }
+    }
+
+    /// Stage-1 alias for scheduler lock access.
+    ///
+    /// This intentionally forwards to existing behavior while giving callers a
+    /// stable helper name for future lock-discipline migration.
+    #[allow(dead_code)]
+    pub(crate) fn with_scheduler<R>(&self, f: impl FnOnce(&SchedulerState) -> R) -> R {
+        Self::debug_lock_order_note("scheduler_state_lock");
+        self.with_scheduler_state(f)
+    }
+
     pub(crate) fn scheduler_state(
         &self,
     ) -> crate::kernel::lock::SpinLockIrqGuard<'_, SchedulerState> {
+        Self::debug_lock_order_note("scheduler_state_lock");
         self.scheduler_state.lock()
     }
 
@@ -61,13 +82,28 @@ impl KernelState {
     }
 
     pub(crate) fn with_ipc_state<R>(&self, f: impl FnOnce(&IpcSubsystem) -> R) -> R {
+        Self::debug_lock_order_note("ipc_state_lock");
         let _ipc_guard = self.ipc_state_lock.lock();
         f(kernel_ref(&self.ipc))
     }
 
     pub(crate) fn with_ipc_state_mut<R>(&mut self, f: impl FnOnce(&mut IpcSubsystem) -> R) -> R {
+        Self::debug_lock_order_note("ipc_state_lock");
         let _ipc_guard = self.ipc_state_lock.lock();
         f(kernel_mut(&mut self.ipc))
+    }
+
+    /// Stage-1 alias for task-state lock access.
+    ///
+    /// This intentionally forwards to existing behavior while giving callers a
+    /// stable helper name for future lock-discipline migration.
+    #[allow(dead_code)]
+    pub(crate) fn with_task_state<R>(
+        &self,
+        f: impl FnOnce(&[Option<ThreadControlBlock>; MAX_TASKS]) -> R,
+    ) -> R {
+        Self::debug_lock_order_note("task_state_lock");
+        self.with_tcbs(f)
     }
 
     pub(crate) fn with_driver_state<R>(&self, f: impl FnOnce(&DriverSubsystem) -> R) -> R {

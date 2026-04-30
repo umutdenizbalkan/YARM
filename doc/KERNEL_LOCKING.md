@@ -98,6 +98,11 @@ handled via a dedicated helper with clear lock-contract comments.
 
 - Introduce small no-nesting or lock-level assertions where possible.
 - Ensure multi-lock helpers encode intended order centrally.
+- Initial helper scaffolding now exists in `src/kernel/boot/orchestrator_state.rs`:
+  - `KernelState::with_scheduler(...)` (alias over scheduler-state access),
+  - `KernelState::with_task_state(...)` (alias over task-state/TCB access),
+  - `KernelState::debug_lock_order_note(...)` (debug-only, non-enforcing hook),
+  - plus lock-order note calls in `with_ipc_state` / `with_ipc_state_mut`.
 
 ### Stage 2: split high-traffic subsystem lock domains
 
