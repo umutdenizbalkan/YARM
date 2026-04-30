@@ -2,20 +2,24 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::kernel::boot::{KernelError, KernelState, TrapHandleError};
-use crate::kernel::lock::SpinLock;
+use crate::kernel::lock::{SpinLock, SpinLockIrq};
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
+use crate::kernel::boot::SchedulerState;
 use crate::kernel::scheduler::CpuId;
 
 #[derive(Debug)]
 pub struct SharedKernel {
     state: SpinLock<KernelState>,
+    scheduler_state: *const SpinLockIrq<SchedulerState>,
 }
 
 impl SharedKernel {
-    pub const fn new(state: KernelState) -> Self {
+    pub fn new(state: KernelState) -> Self {
+        let scheduler_state = state.scheduler_state_lock_ptr();
         Self {
             state: SpinLock::new(state),
+            scheduler_state,
         }
     }
 
@@ -37,6 +41,18 @@ impl SharedKernel {
         let mut guard = self.state.lock();
         guard.set_current_cpu(cpu)?;
         Ok(f(&mut guard))
+    }
+
+
+    pub fn scheduler_tick_now_split_read(&self) -> u64 {
+        // Stage 2B split: read scheduler tick directly under scheduler lock.
+        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read");
+        // SAFETY: `scheduler_state` points at the scheduler lock embedded in the
+        // same `KernelState` owned by `self.state`; the storage is stable for
+        // the `SharedKernel` lifetime.
+        let scheduler_state = unsafe { &*self.scheduler_state };
+        let sched = scheduler_state.lock();
+        sched.timer.current_ticks().0
     }
 
     pub fn control_plane_set_process_cnode_slots_via_syscall(

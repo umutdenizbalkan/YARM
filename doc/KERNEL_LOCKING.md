@@ -169,6 +169,13 @@ handled via a dedicated helper with clear lock-contract comments.
 - `tcb_mut` remains intentionally direct for now because it returns a mutable reference whose lifetime escapes the helper closure pattern; this is tracked as focused follow-up work.
 - `SharedKernel` global lock remains intact in this stage.
 
+
+### Stage 2B: first partial scheduler read-path split
+
+- Split path: `SharedKernel::scheduler_tick_now_split_read` now reads scheduler ticks by taking `scheduler_state` (`SpinLockIrq`) directly, without going through `SharedKernel::with(...)` for that read-only portion.
+- Why safe: this path is strictly read-only (`timer.current_ticks()`), uses the existing scheduler lock domain, and does not mutate scheduler/task state.
+- What remains under global lock: all mutation paths and the rest of syscall/dispatch/control-plane state transitions still use `SharedKernel::with(...)` (global lock intact).
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.

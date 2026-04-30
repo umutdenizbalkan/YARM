@@ -84,6 +84,10 @@ impl KernelState {
         self.scheduler_state.lock()
     }
 
+    pub(crate) fn scheduler_state_lock_ptr(&self) -> *const crate::kernel::lock::SpinLockIrq<SchedulerState> {
+        &self.scheduler_state as *const _
+    }
+
     pub(crate) fn with_scheduler_state<R>(&self, f: impl FnOnce(&SchedulerState) -> R) -> R {
         // Lock-order domain: scheduler
         Self::debug_lock_order_note("scheduler");
