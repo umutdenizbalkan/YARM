@@ -299,6 +299,27 @@ handled via a dedicated helper with clear lock-contract comments.
 - Stage 2H shared seam remains staged for the future boundary where `SharedKernel` is available before borrowing `&mut KernelState`.
 - No behavior change in Stage 2I.
 
+### Stage 2J design audit: caller ownership for `handle_selected_arch_trap_entry`
+
+- Exact callers found for `KernelState::handle_selected_arch_trap_entry(...)`:
+  - `src/kernel/boot/tests.rs` test-only callsites (multiple arch trap-entry smoke tests).
+  - No production runtime/arch callsite currently invokes this wrapper directly.
+
+- Current production routing shape:
+  - ISA trap entry functions in `src/arch/{x86_64,aarch64,riscv64}/trap.rs` accept `&mut KernelState` and call `kernel.handle_trap_event(...)` directly.
+  - Therefore, production flow bypasses `KernelState::handle_selected_arch_trap_entry(...)` and reaches kernel trap handling with `&mut KernelState` already borrowed.
+
+- Earliest `SharedKernel`-owned routing point for future Stage 2K:
+  - The runtime/arch boundary immediately before ISA trap handlers are invoked, where CPU id + frame/context are known but mutable kernel borrow has not yet been materialized.
+
+- Minimal future patch plan (Stage 2K, design only):
+  1. Add one alternate top-level runtime/arch dispatch entry that accepts `&SharedKernel` instead of `&mut KernelState` for one selected trap path.
+  2. Route that selected path through `arch::trap_entry::handle_trap_entry_shared(shared, cpu, context, frame)`.
+  3. Keep existing `&mut KernelState` trap entry path intact for all other callers until parity is proven.
+  4. After routing seam is in place, keep behavior identical and defer recv-timeout special-casing to later stage.
+
+- No behavior change in Stage 2J.
+
 ### Stage 3: remove global lock from syscall fast path
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
