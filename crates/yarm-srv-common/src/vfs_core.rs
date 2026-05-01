@@ -457,6 +457,7 @@ impl OpenFlags {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LookupRequest {
     pub dir: VNodeId,
+    #[deprecated(note = "legacy path_ptr API; use path strings/path-prefix policy instead")]
     pub path_ptr: u64,
 }
 
@@ -477,6 +478,7 @@ pub struct Stat {
 pub struct OpenAtRequest {
     pub dirfd: u64,
     /// Legacy pointer-path argument; prefer inline byte-path requests.
+    #[deprecated(note = "legacy path_ptr API; use path strings/path-prefix policy instead")]
     pub path_ptr: u64,
     pub flags: u64,
     pub mode: u64,
@@ -498,6 +500,7 @@ pub struct ReadWriteRequest {
 pub struct StatxRequest {
     pub dirfd: u64,
     /// Legacy pointer-path argument; prefer inline byte-path requests.
+    #[deprecated(note = "legacy path_ptr API; use path strings/path-prefix policy instead")]
     pub path_ptr: u64,
     pub flags: u64,
     pub mask_or_buf: u64,
@@ -647,5 +650,11 @@ mod tests {
         let policy = MountNamespacePolicy::deny_all().with_prefix(b"/");
         assert!(policy.allows_path_bytes(b"/"));
         assert!(policy.allows_path_bytes(b"/any/path"));
+    }
+
+    #[test]
+    fn policy_rejects_path_outside_allowed_prefixes() {
+        let policy = MountNamespacePolicy::deny_all().with_prefix(b"/srv");
+        assert!(!policy.allows_path_bytes(b"/tmp/file"));
     }
 }
