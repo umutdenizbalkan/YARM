@@ -486,7 +486,8 @@ impl KernelState {
         user_stack_top: usize,
         user_entry: usize,
     ) -> Result<u64, KernelError> {
-        if tls_base == 0 || user_stack_top == 0 || user_entry == 0 {
+        if tls_base == 0 || user_stack_top == 0 || user_entry == 0 || (user_stack_top & 0xF) != 0
+        {
             return Err(KernelError::WrongObject);
         }
         let parent = self
@@ -567,15 +568,25 @@ impl KernelState {
             child.tls_ptr = parent.tls_ptr;
             child.user_entry = parent.user_entry;
             child.user_stack_top = parent.user_stack_top;
+            // Fork child resumes with the same user register context as parent;
+            // only the return register differs (`0` in the child).
             child.user_context = parent.user_context;
             child.user_context.arg0 = 0;
-            child.user_context.arg2 = 0;
-            child.user_context.arg3 = 0;
-            child.user_context.arg4 = 0;
-            child.user_context.arg5 = 0;
             child.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
+        if parent.tls_ptr.is_some()
+            && let Some(slot) = self.tls_restore_pending.iter_mut().find(|slot| {
+                slot.is_some_and(|pending_tid| pending_tid.0 == child_tid) || slot.is_none()
+            })
+        {
+            *slot = Some(ThreadId(child_tid));
+        }
+        for slot in self.robust_futex.iter_mut() {
+            if slot.is_some_and(|entry| entry.tid.0 == child_tid) {
+                *slot = None;
+            }
+        }
         let _ = self.enqueue_task(child_tid)?;
         Ok(child_tid)
     }

@@ -13,6 +13,8 @@ const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
 
 fn read_u16_le(image: &[u8], offset: usize) -> Result<u16, KernelError> {
     let end = offset.checked_add(2).ok_or(KernelError::WrongObject)?;
@@ -49,14 +51,34 @@ const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
 static DISPATCH_CONTEXT_LOAD_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl KernelState {
-    fn load_page_requires_execute(
+    fn page_flags_from_elf_pflags(p_flags: u32) -> Result<PageFlags, KernelError> {
+        let mut read = (p_flags & PF_R) != 0;
+        let write = (p_flags & PF_W) != 0;
+        let execute = (p_flags & PF_X) != 0;
+        if write && execute {
+            return Err(KernelError::WrongObject);
+        }
+        if write || execute {
+            read = true;
+        }
+        Ok(PageFlags {
+            read,
+            write,
+            execute,
+            user: true,
+            cache_policy: CachePolicy::WriteBack,
+        })
+    }
+
+    fn load_page_elf_pflags(
         image: &[u8],
         phoff: usize,
         phentsize: usize,
         phnum: usize,
         page_start: u64,
         page_end: u64,
-    ) -> Result<bool, KernelError> {
+    ) -> Result<u32, KernelError> {
+        let mut combined_pflags = 0u32;
         for idx in 0..phnum {
             let base = phoff
                 .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
@@ -66,19 +88,16 @@ impl KernelState {
                 continue;
             }
             let p_flags = read_u32_le(image, base + 4)?;
-            if (p_flags & PF_X) == 0 {
-                continue;
-            }
             let p_vaddr = read_u64_le(image, base + 16)?;
             let p_memsz = read_u64_le(image, base + 40)?;
             let seg_end = p_vaddr
                 .checked_add(p_memsz)
                 .ok_or(KernelError::WrongObject)?;
             if p_memsz != 0 && p_vaddr < page_end && seg_end > page_start {
-                return Ok(true);
+                combined_pflags |= p_flags & (PF_R | PF_W | PF_X);
             }
         }
-        Ok(false)
+        Ok(combined_pflags)
     }
 
     /// Minimal ELF64 loader for PT_LOAD segments:
@@ -141,7 +160,7 @@ impl KernelState {
             let page_end = (seg_end + page_size - 1) & !(page_size - 1);
             let mut va = page_start;
             while va < page_end {
-                let execute = Self::load_page_requires_execute(
+                let combined_pflags = Self::load_page_elf_pflags(
                     image,
                     phoff,
                     phentsize,
@@ -149,13 +168,7 @@ impl KernelState {
                     va,
                     va + page_size,
                 )?;
-                let flags = PageFlags {
-                    read: true,
-                    write: true,
-                    execute,
-                    user: true,
-                    cache_policy: CachePolicy::WriteBack,
-                };
+                let flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
                 let existing = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
                 let phys = if let Some(entry) = existing {
                     entry.addr()
@@ -164,7 +177,7 @@ impl KernelState {
                 };
                 if cfg!(not(feature = "hosted-dev")) {
                     crate::yarm_log!(
-                        "ELF_MAP_PAGE_BEGIN asid={} seg_vbase=0x{:x} page_va=0x{:x} phys=0x{:x} memsz={} filesz={} overlap={} req_x={}",
+                        "ELF_MAP_PAGE_BEGIN asid={} seg_vbase=0x{:x} page_va=0x{:x} phys=0x{:x} memsz={} filesz={} overlap={} pflags=0x{:x}",
                         asid.0,
                         p_vaddr,
                         va,
@@ -172,7 +185,7 @@ impl KernelState {
                         p_memsz,
                         p_filesz,
                         existing.is_some(),
-                        execute
+                        combined_pflags
                     );
                 }
                 self.map_user_page_in_asid_raw(
@@ -308,9 +321,7 @@ impl KernelState {
         expected: u32,
         observed: u32,
     ) -> Result<bool, KernelError> {
-        if addr == 0 {
-            return Err(KernelError::WrongObject);
-        }
+        self.validate_current_user_futex_word(addr)?;
         if expected != observed {
             return Ok(false);
         }
@@ -330,9 +341,7 @@ impl KernelState {
     }
 
     pub fn futex_wake(&mut self, addr: usize, max_wake: u32) -> Result<u32, KernelError> {
-        if addr == 0 {
-            return Err(KernelError::WrongObject);
-        }
+        self.validate_current_user_futex_word(addr)?;
         if max_wake == 0 {
             return Ok(0);
         }
@@ -356,6 +365,20 @@ impl KernelState {
             self.enqueue_task(*wake_tid)?;
         }
         Ok(wake_count as u32)
+    }
+
+    fn validate_current_user_futex_word(&self, addr: usize) -> Result<(), KernelError> {
+        if addr == 0 {
+            return Err(KernelError::WrongObject);
+        }
+        let end = addr.checked_add(core::mem::size_of::<u32>() - 1);
+        if end.is_none_or(|end| end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE) {
+            return Err(KernelError::UserMemoryFault);
+        }
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        let _ = self.copy_from_user(asid, VirtAddr(addr as u64), core::mem::size_of::<u32>())?;
+        Ok(())
     }
 
     pub fn spawn_user_task_from_image(
@@ -790,5 +813,46 @@ impl KernelState {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elf_pflags_map_to_expected_page_flags() {
+        let rx = KernelState::page_flags_from_elf_pflags(PF_R | PF_X).expect("rx");
+        assert!(rx.read);
+        assert!(!rx.write);
+        assert!(rx.execute);
+
+        let rw = KernelState::page_flags_from_elf_pflags(PF_R | PF_W).expect("rw");
+        assert!(rw.read);
+        assert!(rw.write);
+        assert!(!rw.execute);
+
+        let ro = KernelState::page_flags_from_elf_pflags(PF_R).expect("ro");
+        assert!(ro.read);
+        assert!(!ro.write);
+        assert!(!ro.execute);
+
+        let write_only = KernelState::page_flags_from_elf_pflags(PF_W).expect("w");
+        assert!(write_only.read);
+        assert!(write_only.write);
+        assert!(!write_only.execute);
+
+        let exec_only = KernelState::page_flags_from_elf_pflags(PF_X).expect("x");
+        assert!(exec_only.read);
+        assert!(!exec_only.write);
+        assert!(exec_only.execute);
+    }
+
+    #[test]
+    fn elf_pflags_reject_wx() {
+        assert_eq!(
+            KernelState::page_flags_from_elf_pflags(PF_W | PF_X),
+            Err(KernelError::WrongObject)
+        );
     }
 }

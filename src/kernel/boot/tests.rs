@@ -4017,12 +4017,53 @@ fn spawn_user_thread_inherits_group_and_asid_and_sets_tls() {
 }
 
 #[test]
+fn spawn_user_thread_rejects_misaligned_stack_top() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 8,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+
+    assert_eq!(
+        state.spawn_user_thread(8, 0xDEAD_BEEF, 0x8000_0008, 0x4010),
+        Err(KernelError::WrongObject)
+    );
+}
+
+#[test]
 fn futex_wait_blocks_current_and_wake_requeues_waiter() {
     let mut state = Bootstrap::init().expect("init");
-    state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
-    state.yield_current().expect("switch");
+    let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 1,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("task1");
+    let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_with_caps(
+            aspace_cap,
+            mem_cap,
+            VirtAddr(0x1000),
+            PageFlags {
+                read: true,
+                write: true,
+                execute: false,
+                user: true,
+                cache_policy: CachePolicy::WriteBack,
+            },
+        )
+        .expect("map");
     assert_eq!(state.current_tid(), Some(1));
 
     assert!(state.futex_wait_current(0x1000, 3, 3).expect("wait"));
@@ -4032,6 +4073,168 @@ fn futex_wait_blocks_current_and_wake_requeues_waiter() {
     );
     assert_eq!(state.futex_wake(0x1000, 1).expect("wake"), 1);
     assert_eq!(state.task_status(1), Some(TaskStatus::Runnable));
+}
+
+#[test]
+fn futex_wait_and_wake_reject_kernel_space_address() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 2,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("task2");
+    let kernel_addr = crate::kernel::vm::KERNEL_SPACE_BASE as usize;
+    assert_eq!(
+        state
+            .futex_wait_current(kernel_addr, 1, 1)
+            .expect_err("kernel va rejected"),
+        KernelError::UserMemoryFault
+    );
+    assert_eq!(
+        state
+            .futex_wake(kernel_addr, 1)
+            .expect_err("kernel va rejected"),
+        KernelError::UserMemoryFault
+    );
+}
+
+#[test]
+fn fork_child_preserves_parent_registers_except_arg0() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 33,
+            entry: 0x8000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+    let parent_ctx = UserRegisterContext {
+        instruction_ptr: VirtAddr(0x8123),
+        stack_ptr: VirtAddr(0x8FFF_0000),
+        arg0: 0xAAAA,
+        arg1: 0x1111,
+        arg2: 0x2222,
+        arg3: 0x3333,
+        arg4: 0x4444,
+        arg5: 0x5555,
+    };
+    state
+        .set_thread_user_context(33, parent_ctx)
+        .expect("set parent ctx");
+
+    let child_tid = state.fork_user_process_cow(33).expect("fork");
+    let child_ctx = state
+        .thread_user_context(child_tid)
+        .expect("child user context");
+
+    assert_eq!(child_ctx.instruction_ptr, parent_ctx.instruction_ptr);
+    assert_eq!(child_ctx.stack_ptr, parent_ctx.stack_ptr);
+    assert_eq!(child_ctx.arg0, 0);
+    assert_eq!(child_ctx.arg1, parent_ctx.arg1);
+    assert_eq!(child_ctx.arg2, parent_ctx.arg2);
+    assert_eq!(child_ctx.arg3, parent_ctx.arg3);
+    assert_eq!(child_ctx.arg4, parent_ctx.arg4);
+    assert_eq!(child_ctx.arg5, parent_ctx.arg5);
+}
+
+#[test]
+fn fork_child_sets_tls_restore_pending_when_tls_present() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 34,
+            entry: 0x8200,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+    state
+        .set_thread_tls_base(34, 0xABCD_0000)
+        .expect("set parent tls");
+
+    let child_tid = state.fork_user_process_cow(34).expect("fork");
+    assert_eq!(state.thread_tls_base(child_tid), Some(0xABCD_0000));
+    assert_eq!(state.tls_restore_pending(child_tid), Some(true));
+}
+
+#[test]
+fn fork_child_starts_with_empty_robust_futex_state() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 35,
+            entry: 0x8300,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+    state
+        .set_robust_futex_head(35, 0x5000, 8)
+        .expect("parent robust futex");
+
+    let child_tid = state.fork_user_process_cow(35).expect("fork");
+    assert!(state.robust_futex_state(35).is_some());
+    assert_eq!(state.robust_futex_state(child_tid), None);
+}
+
+#[test]
+fn clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion() {
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 36,
+            entry: 0x8400,
+            asid: Some(parent_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+
+    let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    let writable_pages = (super::MAX_COW_PAGES / 2) + 1;
+    for page in 0..writable_pages {
+        let va = VirtAddr(0x20_0000 + (page * PAGE_SIZE) as u64);
+        state
+            .map_user_page_in_asid_raw(
+                parent_asid,
+                va,
+                Mapping {
+                    phys,
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map parent page");
+    }
+
+    assert_eq!(
+        state.clone_user_address_space_cow(parent_asid),
+        Err(KernelError::MemoryObjectFull)
+    );
+
+    let lingering_child_cow = state.with_memory_state(|memory| {
+        memory
+            .cow_pages
+            .iter()
+            .flatten()
+            .any(|entry| entry.asid != parent_asid)
+    });
+    assert!(!lingering_child_cow);
 }
 
 #[test]
