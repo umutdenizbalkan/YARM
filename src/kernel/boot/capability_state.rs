@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::*;
+use alloc::vec::Vec;
 
 impl KernelState {
     pub fn current_task_capability(&self, cap: CapId) -> Option<Capability> {
@@ -89,5 +90,30 @@ impl KernelState {
         self.capability_for_cnode(cnode, cap)
             .map(|capability| capability.has_right(right))
             .unwrap_or(false)
+    }
+
+    pub(crate) fn snapshot_live_capabilities_for_task(
+        &self,
+        tid: u64,
+    ) -> Result<Vec<(CapId, Capability)>, KernelError> {
+        let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
+        let local_ids = self.with_capability_state(|capability_state| {
+            capability_state
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .map(|space| kernel_ref(&space.cspace).live_cap_ids().collect::<Vec<_>>())
+        });
+        let Some(local_ids) = local_ids else {
+            return Err(KernelError::TaskMissing);
+        };
+        let mut snapshot = Vec::new();
+        for cap in local_ids {
+            if let Some(capability) = self.capability_for_cnode(cnode, cap) {
+                snapshot.push((cap, capability));
+            }
+        }
+        Ok(snapshot)
     }
 }

@@ -746,6 +746,55 @@ fn delegated_endpoint_caps_are_init_local_and_resolvable() {
 }
 
 #[test]
+fn capability_snapshot_for_task_returns_empty_for_fresh_cnode() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(90).expect("task");
+    let caps = state
+        .snapshot_live_capabilities_for_task(90)
+        .expect("snapshot");
+    assert!(caps.is_empty());
+}
+
+#[test]
+fn capability_snapshot_for_task_includes_live_endpoint_caps() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(91).expect("task");
+    let (_eid, send_root, recv_root) = state.create_endpoint(2).expect("endpoint");
+    let send_child = state
+        .grant_capability_task_to_task_with_rights(0, send_root, 91, CapRights::SEND)
+        .expect("grant send");
+    let recv_child = state
+        .grant_capability_task_to_task_with_rights(0, recv_root, 91, CapRights::RECEIVE)
+        .expect("grant recv");
+
+    let caps = state
+        .snapshot_live_capabilities_for_task(91)
+        .expect("snapshot");
+    assert!(caps.iter().any(|(id, cap)| {
+        *id == send_child && matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::SEND)
+    }));
+    assert!(caps.iter().any(|(id, cap)| {
+        *id == recv_child && matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::RECEIVE)
+    }));
+}
+
+#[test]
+fn capability_snapshot_for_task_skips_stale_endpoint_caps() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(92).expect("task");
+    let (eid, _send_root, recv_root) = state.create_endpoint(2).expect("endpoint");
+    let recv_child = state
+        .grant_capability_task_to_task_with_rights(0, recv_root, 92, CapRights::RECEIVE)
+        .expect("grant recv");
+    state.destroy_endpoint(eid).expect("destroy");
+
+    let caps = state
+        .snapshot_live_capabilities_for_task(92)
+        .expect("snapshot");
+    assert!(!caps.iter().any(|(id, _)| *id == recv_child));
+}
+
+#[test]
 fn supervisor_fault_slot_cap_can_register_supervisor_endpoint() {
     let mut state = Bootstrap::init().expect("init");
     state
