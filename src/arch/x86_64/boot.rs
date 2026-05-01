@@ -518,8 +518,8 @@ pub fn enter_dispatched_user_task_if_available(
                 options(nostack, preserves_flags)
             );
         }
-        let cs: u16 = 0x1b;
-        let ss: u16 = 0x23;
+        let cs: u16 = 0x23;
+        let ss: u16 = 0x1b;
         let rflags: u64 = 0x202;
         crate::yarm_log!(
             "ENTER_USER asid={} rip=0x{:x} rsp=0x{:x}",
