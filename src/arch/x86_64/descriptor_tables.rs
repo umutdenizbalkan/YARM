@@ -262,6 +262,9 @@ unsafe impl Sync for TrapKernelStateCell {}
 static TRAP_KERNEL_STATE: TrapKernelStateCell =
     TrapKernelStateCell(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static TRAP_SHARED_KERNEL_PTR: core::sync::atomic::AtomicPtr<crate::runtime::SharedKernel> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_DATA_PORT: u16 = 0x3F8;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_LINE_STATUS_PORT: u16 = 0x3FD;
