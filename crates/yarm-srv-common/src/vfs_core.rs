@@ -96,9 +96,7 @@ pub enum VfsRequest {
 }
 
 pub trait VfsBackend {
-    fn openat_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
-        Err(VfsError::InvalidPath)
-    }
+    fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError>;
     fn close(&mut self, fd: u64) -> Result<u64, VfsError>;
     fn read(&mut self, fd: u64, len: u64) -> Result<u64, VfsError>;
     fn read_into(&mut self, fd: u64, len: u64, _out: &mut [u8]) -> Result<(u64, usize), VfsError> {
