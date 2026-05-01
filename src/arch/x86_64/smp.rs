@@ -65,9 +65,10 @@ global_asm!(
 
 yarm_ap_trampoline_start:
     cli
-    xor ax, ax
+    mov ax, cs
     mov ds, ax
     mov es, ax
+    xor ax, ax
     mov ss, ax
     mov sp, 0x6ff0
 
