@@ -469,6 +469,14 @@ mod tests {
         fn recv(&mut self, _ep_cap: u32) -> Result<Option<RuntimeMessage>, SyscallError> {
             Ok(self.reply.take())
         }
+
+        fn recv_with_deadline(
+            &mut self,
+            _ep_cap: u32,
+            _timeout_ticks: u64,
+        ) -> Result<Option<RuntimeMessage>, SyscallError> {
+            Ok(self.reply.take())
+        }
     }
 
     #[test]

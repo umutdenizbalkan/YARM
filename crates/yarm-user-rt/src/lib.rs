@@ -44,6 +44,7 @@ pub mod syscall {
 
     const SYSCALL_IPC_SEND_NR: usize = 1;
     const SYSCALL_IPC_RECV_NR: usize = 2;
+    const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
     const SYSCALL_IPC_CALL_NR: usize = 4;
     const SYSCALL_YIELD_NR: usize = 0;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
@@ -52,6 +53,11 @@ pub mod syscall {
     pub trait IpcTransport {
         fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError>;
         fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError>;
+        fn recv_with_deadline(
+            &mut self,
+            ep_cap: u32,
+            timeout_ticks: u64,
+        ) -> core::result::Result<Option<Message>, SyscallError>;
     }
 
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +74,16 @@ pub mod syscall {
         fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError> {
             // SAFETY: forwards directly to syscall wrapper.
             unsafe { ipc_recv(ep_cap) }
+        }
+
+        #[inline]
+        fn recv_with_deadline(
+            &mut self,
+            ep_cap: u32,
+            timeout_ticks: u64,
+        ) -> core::result::Result<Option<Message>, SyscallError> {
+            // SAFETY: forwards directly to syscall wrapper.
+            unsafe { ipc_recv_with_deadline(ep_cap, timeout_ticks) }
         }
     }
 
@@ -136,6 +152,53 @@ pub mod syscall {
         if ret.ret1 == args[1] && ret.ret2 == args[2] {
             let err = decode_syscall_error(ret.ret0);
             return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
+        }
+        let len = ret.ret1;
+        if len > Message::MAX_PAYLOAD {
+            return Err(SyscallError::Internal);
+        }
+        let transfer_cap = if (ret.ret2 as u64) == SYSCALL_NO_TRANSFER_CAP {
+            None
+        } else {
+            Some(ret.ret2 as u64)
+        };
+        let msg = Message::with_header(ret.ret0 as u64, 0, 0, transfer_cap, &payload[..len])
+            .map_err(|_| SyscallError::InvalidArgs)?;
+        Ok(Some(msg))
+    }
+
+    #[inline]
+    pub unsafe fn ipc_recv_with_deadline(
+        ep_cap: u32,
+        timeout_ticks: u64,
+    ) -> core::result::Result<Option<Message>, SyscallError> {
+        let mut payload = [0u8; Message::MAX_PAYLOAD];
+        let args = [
+            ep_cap as usize,
+            payload.as_mut_ptr() as usize,
+            Message::MAX_PAYLOAD,
+            timeout_ticks as usize,
+            SYSCALL_RECV_MAP_INTENT_DEFAULT,
+            SYSCALL_NO_TRANSFER_CAP as usize,
+        ];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_TIMEOUT_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            let err = decode_syscall_error(ret.error);
+            return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) {
+                Ok(None)
+            } else {
+                Err(err)
+            };
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret1 == args[1] && ret.ret2 == args[2] {
+            let err = decode_syscall_error(ret.ret0);
+            return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) {
+                Ok(None)
+            } else {
+                Err(err)
+            };
         }
         let len = ret.ret1;
         if len > Message::MAX_PAYLOAD {

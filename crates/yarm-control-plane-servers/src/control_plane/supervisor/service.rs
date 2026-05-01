@@ -6,7 +6,7 @@ use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 #[cfg(not(test))]
 use yarm_user_rt::runtime::{KernelIpcError as KernelError, StartupContext, startup_context};
 #[cfg(not(test))]
-use yarm_user_rt::syscall::{IpcTransport, SyscallIpcTransport, yield_now};
+use yarm_user_rt::syscall::{IpcTransport, SyscallIpcTransport};
 use yarm_user_rt::capability::CapId;
 #[cfg(test)]
 use yarm_user_rt::capability::CapRights;
@@ -97,7 +97,7 @@ const SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS: u64 = 1;
 #[cfg(not(test))]
 const SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS: u64 = 100;
 #[cfg(not(test))]
-const SUPERVISOR_RUNTIME_IDLE_YIELD_TICKS: usize = 1;
+const SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 10_000;
 
 #[cfg(not(test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1255,7 +1255,17 @@ pub fn run() {
                 }
 
                 if !made_progress {
-                    supervisor_idle_wait();
+                    match supervisor_idle_wait(
+                        &mut transport,
+                        supervisor.handoff.supervisor_control_recv_cap.0 as u32,
+                    ) {
+                        Ok(true) => made_progress = true,
+                        Ok(false) => {}
+                        Err(err) => yarm_user_rt::user_log!(
+                            "supervisor.srv idle wait error: {:?}",
+                            err
+                        ),
+                    }
                 } else {
                     let _ = supervisor.degraded();
                 }
@@ -1273,15 +1283,20 @@ pub fn run() {
 
 /// Cooperative idle path for the production supervisor loop.
 ///
-/// This is intentionally not a blocking sleep. The userspace runtime transport
-/// currently exposes non-blocking recv polling in this path, and no recv-timeout
-/// syscall wrapper is wired here yet. Yielding reduces hot spinning while still
-/// allowing the loop to continue polling multiple endpoints.
+/// Uses a bounded recv-timeout budget instead of aggressive yield polling.
+/// Control-channel messages are advisory in this staged path, so an arrived
+/// message is consumed to wake the loop and then normal polling resumes.
 #[cfg(not(test))]
 #[inline]
-fn supervisor_idle_wait() {
-    for _ in 0..SUPERVISOR_RUNTIME_IDLE_YIELD_TICKS {
-        let _ = yield_now();
+fn supervisor_idle_wait(
+    transport: &mut impl IpcTransport,
+    control_recv_cap: u32,
+) -> Result<bool, KernelError> {
+    match transport.recv_with_deadline(control_recv_cap, SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS)
+    {
+        Ok(Some(_msg)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(_err) => Ok(false),
     }
 }
 
