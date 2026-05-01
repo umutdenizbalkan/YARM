@@ -4019,10 +4019,31 @@ fn spawn_user_thread_inherits_group_and_asid_and_sets_tls() {
 #[test]
 fn futex_wait_blocks_current_and_wake_requeues_waiter() {
     let mut state = Bootstrap::init().expect("init");
-    state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
-    state.yield_current().expect("switch");
+    let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 1,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("task1");
+    let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_with_caps(
+            aspace_cap,
+            mem_cap,
+            VirtAddr(0x1000),
+            PageFlags {
+                read: true,
+                write: true,
+                execute: false,
+                user: true,
+                cache_policy: CachePolicy::WriteBack,
+            },
+        )
+        .expect("map");
     assert_eq!(state.current_tid(), Some(1));
 
     assert!(state.futex_wait_current(0x1000, 3, 3).expect("wait"));
@@ -4032,6 +4053,34 @@ fn futex_wait_blocks_current_and_wake_requeues_waiter() {
     );
     assert_eq!(state.futex_wake(0x1000, 1).expect("wake"), 1);
     assert_eq!(state.task_status(1), Some(TaskStatus::Runnable));
+}
+
+#[test]
+fn futex_wait_and_wake_reject_kernel_space_address() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 2,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("task2");
+    let kernel_addr = crate::kernel::vm::KERNEL_SPACE_BASE as usize;
+    assert_eq!(
+        state
+            .futex_wait_current(kernel_addr, 1, 1)
+            .expect_err("kernel va rejected"),
+        KernelError::UserMemoryFault
+    );
+    assert_eq!(
+        state
+            .futex_wake(kernel_addr, 1)
+            .expect_err("kernel va rejected"),
+        KernelError::UserMemoryFault
+    );
 }
 
 #[test]

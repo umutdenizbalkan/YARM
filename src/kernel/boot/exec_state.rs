@@ -308,9 +308,7 @@ impl KernelState {
         expected: u32,
         observed: u32,
     ) -> Result<bool, KernelError> {
-        if addr == 0 {
-            return Err(KernelError::WrongObject);
-        }
+        self.validate_current_user_futex_word(addr)?;
         if expected != observed {
             return Ok(false);
         }
@@ -330,9 +328,7 @@ impl KernelState {
     }
 
     pub fn futex_wake(&mut self, addr: usize, max_wake: u32) -> Result<u32, KernelError> {
-        if addr == 0 {
-            return Err(KernelError::WrongObject);
-        }
+        self.validate_current_user_futex_word(addr)?;
         if max_wake == 0 {
             return Ok(0);
         }
@@ -356,6 +352,20 @@ impl KernelState {
             self.enqueue_task(*wake_tid)?;
         }
         Ok(wake_count as u32)
+    }
+
+    fn validate_current_user_futex_word(&self, addr: usize) -> Result<(), KernelError> {
+        if addr == 0 {
+            return Err(KernelError::WrongObject);
+        }
+        let end = addr.checked_add(core::mem::size_of::<u32>() - 1);
+        if end.is_none_or(|end| end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE) {
+            return Err(KernelError::UserMemoryFault);
+        }
+        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        let _ = self.copy_from_user(asid, VirtAddr(addr as u64), core::mem::size_of::<u32>())?;
+        Ok(())
     }
 
     pub fn spawn_user_task_from_image(
