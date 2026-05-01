@@ -917,10 +917,10 @@ pub fn bootstrap_first_user_task(
     // - arg2: process-manager reply RECEIVE cap id (init-local)
     // - arg3: supervisor fault RECEIVE endpoint cap id (init-local)
     startup_args[0] = RING3_INIT_SERVER_TID;
-    startup_args[1] = pm_request_send_init as u64;
-    startup_args[2] = pm_reply_recv_init as u64;
+    startup_args[1] = pm_request_send_init.0;
+    startup_args[2] = pm_reply_recv_init.0;
     if startup_args.len() > 3 {
-        startup_args[3] = supervisor_fault_recv_init as u64;
+        startup_args[3] = supervisor_fault_recv_init.0;
     }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
