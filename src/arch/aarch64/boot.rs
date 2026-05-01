@@ -889,16 +889,45 @@ pub fn bootstrap_first_user_task(
         image_bytes.len()
     );
     let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
-    // Staged startup ABI handoff:
-    // - arg0: task id / tid (always available)
-    // - arg1..arg2: process-manager endpoint caps (not yet provisioned here)
+    kernel.register_task_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)?;
+    let (_pm_eid, pm_send_cap_root, pm_recv_cap_root) = kernel.create_endpoint(8)?;
+    let pm_request_send_init = kernel.grant_capability_task_to_task_with_rights(
+        0,
+        pm_send_cap_root,
+        RING3_INIT_SERVER_TID,
+        crate::kernel::capabilities::CapRights::SEND,
+    )?;
+    let pm_reply_recv_init = kernel.grant_capability_task_to_task_with_rights(
+        0,
+        pm_recv_cap_root,
+        RING3_INIT_SERVER_TID,
+        crate::kernel::capabilities::CapRights::RECEIVE,
+    )?;
+    let (_self_eid, _self_send_root, self_recv_root) = kernel.create_endpoint(8)?;
+    let self_recv_init = kernel.grant_capability_task_to_task_with_rights(
+        0,
+        self_recv_root,
+        RING3_INIT_SERVER_TID,
+        crate::kernel::capabilities::CapRights::RECEIVE,
+    )?;
+    // Startup ABI handoff:
+    // - arg0: task id / tid
+    // - arg1: process-manager request SEND cap id (init-local)
+    // - arg2: process-manager reply RECEIVE cap id (init-local)
+    // - arg3: init self-endpoint RECEIVE cap id (init-local)
     startup_args[0] = RING3_INIT_SERVER_TID;
+    startup_args[1] = pm_request_send_init as u64;
+    startup_args[2] = pm_reply_recv_init as u64;
+    if startup_args.len() > 3 {
+        startup_args[3] = self_recv_init as u64;
+    }
     crate::yarm_log!(
-        "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={}",
+        "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,
         startup_args[0],
         startup_args[1],
-        startup_args[2]
+        startup_args[2],
+        startup_args[3]
     );
     kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,

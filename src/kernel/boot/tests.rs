@@ -720,6 +720,32 @@ fn spawn_user_task_from_image_copies_startup_args_into_user_context() {
 }
 
 #[test]
+fn delegated_endpoint_caps_are_init_local_and_resolvable() {
+    let mut state = Bootstrap::init().expect("init");
+    state
+        .register_task_with_class(1, TaskClass::SystemServer)
+        .expect("register init");
+    let (_eid, send_root, recv_root) = state.create_endpoint(4).expect("endpoint");
+    let send_init = state
+        .grant_capability_task_to_task_with_rights(0, send_root, 1, CapRights::SEND)
+        .expect("grant send");
+    let recv_init = state
+        .grant_capability_task_to_task_with_rights(0, recv_root, 1, CapRights::RECEIVE)
+        .expect("grant recv");
+    assert_ne!(send_init, send_root);
+    assert_ne!(recv_init, recv_root);
+    let init_cnode = state.task_cnode(1).expect("init cnode");
+    let send_cap = state
+        .capability_for_cnode(init_cnode, send_init)
+        .expect("init send cap");
+    let recv_cap = state
+        .capability_for_cnode(init_cnode, recv_init)
+        .expect("init recv cap");
+    assert!(send_cap.has_right(CapRights::SEND));
+    assert!(recv_cap.has_right(CapRights::RECEIVE));
+}
+
+#[test]
 fn spawn_user_task_from_image_requires_valid_asid() {
     let mut state = Bootstrap::init().expect("init");
     let err = state
