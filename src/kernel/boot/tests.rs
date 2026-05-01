@@ -746,6 +746,26 @@ fn delegated_endpoint_caps_are_init_local_and_resolvable() {
 }
 
 #[test]
+fn supervisor_fault_slot_cap_can_register_supervisor_endpoint() {
+    let mut state = Bootstrap::init().expect("init");
+    state
+        .register_task_with_class(1, TaskClass::SystemServer)
+        .expect("register init");
+    let (_eid, _send_root, recv_root) = state.create_endpoint(4).expect("endpoint");
+    let recv_init = state
+        .grant_capability_task_to_task_with_rights(0, recv_root, 1, CapRights::RECEIVE)
+        .expect("grant recv");
+    state
+        .set_supervisor_endpoint_for_task(1, recv_init)
+        .expect("set supervisor endpoint");
+    state
+        .report_task_exit_to_supervisor(1, 7, 9)
+        .expect("report");
+    let msg = state.ipc_recv(recv_root).expect("recv").expect("msg");
+    assert_eq!(msg.opcode, yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TASK_EXITED);
+}
+
+#[test]
 fn spawn_user_task_from_image_requires_valid_asid() {
     let mut state = Bootstrap::init().expect("init");
     let err = state

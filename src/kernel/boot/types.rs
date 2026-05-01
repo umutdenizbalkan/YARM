@@ -45,8 +45,8 @@ pub struct UserImageSpec {
     /// - arg0 => task_id / tid
     /// - arg1 => process-manager request-send cap
     /// - arg2 => process-manager reply-recv cap
-    /// - arg3 => init self-endpoint recv cap
-    /// - arg4 => reserved (supervisor/staged, currently 0)
+    /// - arg3 => supervisor fault receive endpoint cap
+    /// - arg4 => reserved/staged (currently 0)
     ///
     /// Additional slots may be populated by launchers for server-specific
     /// runtime handoff metadata (for example supervisor endpoint caps).
