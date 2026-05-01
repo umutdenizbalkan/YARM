@@ -878,7 +878,11 @@ pub fn bootstrap_first_user_task(
         Some(initrd_image) => (initrd_image, "initrd"),
         None => (&fallback, "synthetic"),
     };
-    let (entry, heap_base) = kernel.load_elf_pt_load_segments(asid, image_bytes)?;
+    crate::yarm_log!("YARM_FIRST_USER_ELF_LOAD_BEGIN asid={}", asid.0);
+    let (entry, heap_base) = kernel.load_elf_pt_load_segments(asid, image_bytes).map_err(|err| {
+        crate::yarm_log!("YARM_FIRST_USER_FAIL step=load_elf_pt_load_segments err={:?}", err);
+        err
+    })?;
     match source {
         "initrd" => crate::yarm_log!("YARM_INITRD_INIT_ELF_SELECTED entry=0x{:x}", entry),
         _ => crate::yarm_log!("YARM_SYNTHETIC_INIT_ELF_SELECTED entry=0x{:x}", entry),
@@ -889,28 +893,57 @@ pub fn bootstrap_first_user_task(
         image_bytes.len()
     );
     let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
-    kernel.register_task_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)?;
-    let (_pm_eid, pm_send_cap_root, pm_recv_cap_root) = kernel.create_endpoint(8)?;
+    kernel
+        .register_task_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)
+        .map_err(|err| {
+            crate::yarm_log!("YARM_FIRST_USER_FAIL step=register_task err={:?}", err);
+            err
+        })?;
+    let (_pm_eid, pm_send_cap_root, pm_recv_cap_root) = kernel.create_endpoint(8).map_err(|err| {
+        crate::yarm_log!("YARM_FIRST_USER_FAIL step=create_pm_endpoint err={:?}", err);
+        err
+    })?;
     let pm_request_send_init = kernel.grant_capability_task_to_task_with_rights(
         0,
         pm_send_cap_root,
         RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::SEND,
-    )?;
+    )
+    .map_err(|err| {
+        crate::yarm_log!("YARM_FIRST_USER_FAIL step=grant_pm_request_send err={:?}", err);
+        err
+    })?;
     let pm_reply_recv_init = kernel.grant_capability_task_to_task_with_rights(
         0,
         pm_recv_cap_root,
         RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::RECEIVE,
-    )?;
-    let (_sup_eid, _sup_send_root, sup_fault_recv_root) = kernel.create_endpoint(8)?;
+    )
+    .map_err(|err| {
+        crate::yarm_log!("YARM_FIRST_USER_FAIL step=grant_pm_reply_recv err={:?}", err);
+        err
+    })?;
+    let (_sup_eid, _sup_send_root, sup_fault_recv_root) =
+        kernel.create_endpoint(8).map_err(|err| {
+            crate::yarm_log!("YARM_FIRST_USER_FAIL step=create_sup_endpoint err={:?}", err);
+            err
+        })?;
     let supervisor_fault_recv_init = kernel.grant_capability_task_to_task_with_rights(
         0,
         sup_fault_recv_root,
         RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::RECEIVE,
-    )?;
-    kernel.set_supervisor_endpoint_for_task(RING3_INIT_SERVER_TID, supervisor_fault_recv_init)?;
+    )
+    .map_err(|err| {
+        crate::yarm_log!("YARM_FIRST_USER_FAIL step=grant_supervisor_fault_recv err={:?}", err);
+        err
+    })?;
+    kernel
+        .set_supervisor_endpoint_for_task(RING3_INIT_SERVER_TID, supervisor_fault_recv_init)
+        .map_err(|err| {
+            crate::yarm_log!("YARM_FIRST_USER_FAIL step=set_supervisor_endpoint err={:?}", err);
+            err
+        })?;
     // Startup ABI handoff:
     // - arg0: task id / tid
     // - arg1: process-manager request SEND cap id (init-local)
@@ -930,14 +963,24 @@ pub fn bootstrap_first_user_task(
         startup_args[2],
         startup_args[3]
     );
+    crate::yarm_log!("YARM_FIRST_USER_SPAWN_BEGIN tid={}", RING3_INIT_SERVER_TID);
     kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
         entry,
         asid: Some(asid),
         class: TaskClass::SystemServer,
         startup_args,
+    })
+    .map_err(|err| {
+        crate::yarm_log!("YARM_FIRST_USER_FAIL step=spawn_user_task err={:?}", err);
+        err
     })?;
-    kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, heap_base, heap_base)?;
+    kernel
+        .set_task_brk_bounds(RING3_INIT_SERVER_TID, heap_base, heap_base)
+        .map_err(|err| {
+            crate::yarm_log!("YARM_FIRST_USER_FAIL step=set_task_brk_bounds err={:?}", err);
+            err
+        })?;
     crate::yarm_log!(
         "YARM_INIT_DONE arch=aarch64 phase={} image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
         if source == "initrd" {

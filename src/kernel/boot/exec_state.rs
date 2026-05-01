@@ -56,6 +56,9 @@ impl KernelState {
         let write = (p_flags & PF_W) != 0;
         let execute = (p_flags & PF_X) != 0;
         if write && execute {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!("ELF_REJECT_WX_SEGMENT p_flags=0x{:x}", p_flags);
+            }
             return Err(KernelError::WrongObject);
         }
         if write || execute {
@@ -109,6 +112,14 @@ impl KernelState {
         image: &[u8],
     ) -> Result<(usize, usize), KernelError> {
         if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!(
+                    "ELF_REJECT_HEADER len={} magic_ok={} class={}",
+                    image.len(),
+                    image.get(..4) == Some(b"\x7FELF"),
+                    image.get(4).copied().unwrap_or(0)
+                );
+            }
             return Err(KernelError::WrongObject);
         }
         let entry = read_u64_le(image, 24)?;
@@ -116,6 +127,13 @@ impl KernelState {
         let phentsize = read_u16_le(image, 54)? as usize;
         let phnum = read_u16_le(image, 56)? as usize;
         if phnum == 0 || phentsize < ELF64_PHDR_SIZE {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!(
+                    "ELF_REJECT_PH_TABLE phnum={} phentsize={}",
+                    phnum,
+                    phentsize
+                );
+            }
             return Err(KernelError::WrongObject);
         }
         let table_size = phnum
@@ -125,6 +143,14 @@ impl KernelState {
             .checked_add(table_size)
             .ok_or(KernelError::WrongObject)?;
         if phend > image.len() {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!(
+                    "ELF_REJECT_PH_BOUNDS phoff={} phend={} len={}",
+                    phoff,
+                    phend,
+                    image.len()
+                );
+            }
             return Err(KernelError::WrongObject);
         }
 
@@ -151,12 +177,30 @@ impl KernelState {
                 max_loaded_end = seg_end;
             }
             if p_filesz > p_memsz {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!(
+                        "ELF_REJECT_SEG_SIZE idx={} filesz={} memsz={}",
+                        idx,
+                        p_filesz,
+                        p_memsz
+                    );
+                }
                 return Err(KernelError::WrongObject);
             }
             let file_end = p_offset
                 .checked_add(p_filesz)
                 .ok_or(KernelError::WrongObject)?;
             if file_end > image.len() {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!(
+                        "ELF_REJECT_FILE_BOUNDS idx={} offset={} filesz={} end={} len={}",
+                        idx,
+                        p_offset,
+                        p_filesz,
+                        file_end,
+                        image.len()
+                    );
+                }
                 return Err(KernelError::WrongObject);
             }
 
@@ -260,6 +304,9 @@ impl KernelState {
             }
         }
         if !saw_pt_load {
+            if cfg!(not(feature = "hosted-dev")) {
+                crate::yarm_log!("ELF_REJECT_NO_PT_LOAD");
+            }
             return Err(KernelError::WrongObject);
         }
         let page_size = PAGE_SIZE as u64;
