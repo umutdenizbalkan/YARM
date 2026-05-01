@@ -4126,6 +4126,50 @@ fn fork_child_preserves_parent_registers_except_arg0() {
 }
 
 #[test]
+fn fork_child_sets_tls_restore_pending_when_tls_present() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 34,
+            entry: 0x8200,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+    state
+        .set_thread_tls_base(34, 0xABCD_0000)
+        .expect("set parent tls");
+
+    let child_tid = state.fork_user_process_cow(34).expect("fork");
+    assert_eq!(state.thread_tls_base(child_tid), Some(0xABCD_0000));
+    assert_eq!(state.tls_restore_pending(child_tid), Some(true));
+}
+
+#[test]
+fn fork_child_starts_with_empty_robust_futex_state() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 35,
+            entry: 0x8300,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+    state
+        .set_robust_futex_head(35, 0x5000, 8)
+        .expect("parent robust futex");
+
+    let child_tid = state.fork_user_process_cow(35).expect("fork");
+    assert!(state.robust_futex_state(35).is_some());
+    assert_eq!(state.robust_futex_state(child_tid), None);
+}
+
+#[test]
 fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");

@@ -574,6 +574,18 @@ impl KernelState {
             child.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
+        if parent.tls_ptr.is_some()
+            && let Some(slot) = self.tls_restore_pending.iter_mut().find(|slot| {
+                slot.is_some_and(|pending_tid| pending_tid.0 == child_tid) || slot.is_none()
+            })
+        {
+            *slot = Some(ThreadId(child_tid));
+        }
+        for slot in self.robust_futex.iter_mut() {
+            if slot.is_some_and(|entry| entry.tid.0 == child_tid) {
+                *slot = None;
+            }
+        }
         let _ = self.enqueue_task(child_tid)?;
         Ok(child_tid)
     }
