@@ -23,6 +23,38 @@
 - `13`: `VmAnonMap` (reserved; currently returns `InvalidArgs`)
 - `14`: `VmBrk` (reserved; currently returns `InvalidArgs`)
 
+## Syscalls `9..14` status
+
+- `9` `FutexWait`: exposed and wired.
+- `10` `FutexWake`: exposed and wired.
+- `11` `SpawnThread`: exposed and wired.
+- `12` `Fork`: exposed and wired.
+- `13` `VmAnonMap`: reserved syscall number; current implementation is a stub returning `InvalidArgs`.
+- `14` `VmBrk`: reserved syscall number; current implementation is a stub returning `InvalidArgs`.
+
+## Futex safety contract
+
+- `FutexWait`/`FutexWake` validate the futex address as a userspace `u32` word (4 bytes) before acting.
+- Kernel/high-half, non-user, and unmapped addresses are rejected with user-memory fault/error mapping rather than being treated as trusted kernel pointers.
+
+## Fork contract (current behavior)
+
+- Child is created via CoW address-space clone and resumes from copied parent user context.
+- Child return register (`arg0` / arch return register, e.g. `x0`) is set to `0`.
+- Child preserves parent `arg1..arg5`.
+- Parent `Fork` syscall return is child TID (`ret0`).
+- If child inherits a TLS pointer, TLS-restore pending is enqueued for child.
+- Child robust-futex state is initialized empty (no inherited robust-futex head/list record).
+
+## CoW staged limitation and exhaustion behavior
+
+- CoW tracking is fixed-size and staged:
+  - `hosted-dev`: `MAX_COW_PAGES = 1024`
+  - freestanding (`not(feature = "hosted-dev")`): `MAX_COW_PAGES = 256`
+- CoW table exhaustion returns `MemoryObjectFull`.
+- Failed CoW clone/fork now cleans up partial child clone state by destroying the in-progress child ASID/mappings and clearing child CoW records before returning error.
+- Dynamic or physical-frame-bounded CoW tracking remains future work.
+
 ## Argument register layout (`args[0..]`)
 
 - `args[0]`: endpoint capability id
