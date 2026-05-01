@@ -1105,9 +1105,17 @@ fn handle_vm_anon_map(
 }
 
 fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let tid = current_tid(_kernel)?;
+    let leader_tid = _kernel
+        .thread_group_id(tid)
+        .map(|group| group.0)
+        .ok_or(SyscallError::InvalidArgs)?;
+    if tid != leader_tid {
+        return Err(SyscallError::InvalidArgs);
+    }
+
     let requested = _frame.arg(SYSCALL_ARG_CAP);
     if requested == 0 {
-        let tid = current_tid(_kernel)?;
         let current_end = _kernel
             .task_brk_bounds(tid)
             .map(|(_, end)| end)
@@ -1117,7 +1125,6 @@ fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<()
     }
 
     validate_user_region(requested as u64, 1)?;
-    let tid = current_tid(_kernel)?;
     let (base, current_end) = _kernel.task_brk_bounds(tid).ok_or(SyscallError::InvalidArgs)?;
     if requested < base {
         return Err(SyscallError::InvalidArgs);
@@ -1333,6 +1340,31 @@ mod tests {
         let kernel_addr = crate::kernel::vm::KERNEL_SPACE_BASE as usize;
         let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [kernel_addr, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &mut frame).expect_err("vm brk kernel addr rejected");
+    }
+
+    #[test]
+    fn syscall_vm_brk_rejects_non_leader_thread() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state
+            .spawn_user_task_from_image(crate::kernel::boot::UserImageSpec {
+                tid: 41,
+                entry: 0x4000,
+                asid: Some(asid),
+                class: crate::kernel::task::TaskClass::App,
+                startup_args: crate::kernel::boot::UserImageSpec::DEFAULT_STARTUP_ARGS,
+            })
+            .expect("leader");
+        state
+            .set_task_brk_bounds(41, 0x4000, 0x8000)
+            .expect("brk bounds");
+        let child_tid = state
+            .spawn_user_thread(41, 0xABCD_0000, 0x8800_0000, 0x4010)
+            .expect("thread");
+        state.yield_current().expect("switch");
+        assert_eq!(state.current_tid(), Some(child_tid));
+        let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [0x9000, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut frame).expect_err("non-leader rejected");
     }
 
     #[test]

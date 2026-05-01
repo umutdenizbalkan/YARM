@@ -4190,6 +4190,48 @@ fn fork_child_starts_with_empty_robust_futex_state() {
 }
 
 #[test]
+fn fork_child_inherits_brk_bounds() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 37,
+            entry: 0x8400,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+    state
+        .set_task_brk_bounds(37, 0x5000, 0x9000)
+        .expect("set parent brk");
+    let child_tid = state.fork_user_process_cow(37).expect("fork");
+    assert_eq!(state.task_brk_bounds(child_tid), Some((0x5000, 0x9000)));
+}
+
+#[test]
+fn spawn_thread_does_not_get_independent_brk_bounds() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 38,
+            entry: 0x8500,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("leader");
+    state
+        .set_task_brk_bounds(38, 0x6000, 0xA000)
+        .expect("leader brk");
+    let thread_tid = state
+        .spawn_user_thread(38, 0xABCD_0000, 0x8800_0000, 0x8510)
+        .expect("thread");
+    assert_eq!(state.task_brk_bounds(thread_tid), None);
+}
+
+#[test]
 fn clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion() {
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _aspace_cap) = state.create_user_address_space().expect("asid");

@@ -501,6 +501,8 @@ impl KernelState {
         let parent_class = self
             .task_class(parent_tid)
             .ok_or(KernelError::TaskMissing)?;
+        // Staged brk ownership policy: brk bounds remain leader-owned and
+        // per-task keyed; spawned threads do not get independent copied bounds.
         let tid = self.allocate_thread_id()?;
         self.register_task_with_class_in_process(tid, parent_class, parent.thread_group_id.0)?;
         self.with_tcbs_mut(|tcbs| {
@@ -586,6 +588,9 @@ impl KernelState {
             if slot.is_some_and(|entry| entry.tid.0 == child_tid) {
                 *slot = None;
             }
+        }
+        if let Some((base, end)) = self.task_brk_bounds(parent_tid) {
+            self.set_task_brk_bounds(child_tid, base, end)?;
         }
         let _ = self.enqueue_task(child_tid)?;
         Ok(child_tid)

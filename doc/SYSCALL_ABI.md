@@ -58,6 +58,7 @@
 ## `VmBrk` staged contract (syscall `14`)
 
 - Current implementation is intentionally minimal and **per-task**.
+- Staged ownership gate: only thread-group leader may issue `VmBrk`; non-leader threads are rejected.
 - `args[0] == 0`: query current break.
   - Returns current `brk_end` when bounds exist for current tid.
   - Returns `0` when no brk bounds are set yet.
@@ -70,6 +71,9 @@
   - `heap_base = page_align_up(max(PT_LOAD.p_vaddr + PT_LOAD.p_memsz))`
   - `set_task_brk_bounds(leader_tid, heap_base, heap_base)`
 - Growth currently relies on existing demand-page-fault behavior in `[brk_base, brk_end)` to allocate/map heap pages lazily when touched.
+- Fork staging rule: child process leader copies parent leader brk bounds (base/end).
+- Spawn-thread staging rule: spawned threads do not receive independent copied brk bounds.
+- Future work: move from tid-keyed staging toward process-wide brk ownership/model.
 
 ## Argument register layout (`args[0..]`)
 
