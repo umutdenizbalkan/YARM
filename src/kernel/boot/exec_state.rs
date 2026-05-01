@@ -107,7 +107,7 @@ impl KernelState {
         &mut self,
         asid: Asid,
         image: &[u8],
-    ) -> Result<usize, KernelError> {
+    ) -> Result<(usize, usize), KernelError> {
         if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
             return Err(KernelError::WrongObject);
         }
@@ -128,6 +128,8 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
 
+        let mut max_loaded_end = 0u64;
+        let mut saw_pt_load = false;
         for idx in 0..phnum {
             let base = phoff
                 .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
@@ -141,6 +143,13 @@ impl KernelState {
             let p_vaddr = read_u64_le(image, base + 16)?;
             let p_filesz = read_u64_le(image, base + 32)? as usize;
             let p_memsz = read_u64_le(image, base + 40)? as usize;
+            saw_pt_load = true;
+            let seg_end = p_vaddr
+                .checked_add(p_memsz as u64)
+                .ok_or(KernelError::WrongObject)?;
+            if seg_end > max_loaded_end {
+                max_loaded_end = seg_end;
+            }
             if p_filesz > p_memsz {
                 return Err(KernelError::WrongObject);
             }
@@ -250,7 +259,15 @@ impl KernelState {
                 }
             }
         }
-        Ok(entry as usize)
+        if !saw_pt_load {
+            return Err(KernelError::WrongObject);
+        }
+        let page_size = PAGE_SIZE as u64;
+        let heap_base = max_loaded_end
+            .checked_add(page_size - 1)
+            .ok_or(KernelError::WrongObject)?
+            & !(page_size - 1);
+        Ok((entry as usize, heap_base as usize))
     }
 
     fn maybe_switch_kernel_context(
@@ -819,6 +836,7 @@ impl KernelState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
 
     #[test]
     fn elf_pflags_map_to_expected_page_flags() {
@@ -854,5 +872,40 @@ mod tests {
             KernelState::page_flags_from_elf_pflags(PF_W | PF_X),
             Err(KernelError::WrongObject)
         );
+    }
+
+    #[test]
+    fn load_elf_returns_heap_base_aligned_to_max_pt_load_end() {
+        let mut image = vec![0u8; 64 + 56];
+        image[0..4].copy_from_slice(b"\x7FELF");
+        image[4] = 2; // ELFCLASS64
+        image[5] = 1; // little-endian
+        image[6] = 1; // version
+        image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        image[18..20].copy_from_slice(&183u16.to_le_bytes()); // AArch64
+        image[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+        image[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // e_entry
+        image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        image[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        image[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        image[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+        let ph = 64usize;
+        image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        image[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+        image[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+        image[ph + 16..ph + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_vaddr
+        image[ph + 24..ph + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_paddr
+        image[ph + 32..ph + 40].copy_from_slice(&0u64.to_le_bytes()); // p_filesz
+        image[ph + 40..ph + 48].copy_from_slice(&0x1234u64.to_le_bytes()); // p_memsz
+        image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+        let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
+        let (asid, _map) = state.create_user_address_space().expect("asid");
+        let (entry, heap_base) = state
+            .load_elf_pt_load_segments(asid, &image)
+            .expect("load elf");
+        assert_eq!(entry, 0x0040_0000usize);
+        assert_eq!(heap_base, 0x0040_2000usize);
     }
 }

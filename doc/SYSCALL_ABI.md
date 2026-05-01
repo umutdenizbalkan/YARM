@@ -66,6 +66,9 @@
   - If no bounds exist yet, grow is rejected (`InvalidArgs`) to avoid creating an empty `[base,end)` heap window.
   - If bounds exist, only grows (`requested >= current_end`), and rejects requests below `base`.
   - Shrink (`requested < current_end`) is currently unsupported and rejected.
+- Initial bounds are installed for the first user task at ELF boot/startup using:
+  - `heap_base = page_align_up(max(PT_LOAD.p_vaddr + PT_LOAD.p_memsz))`
+  - `set_task_brk_bounds(leader_tid, heap_base, heap_base)`
 - Growth currently relies on existing demand-page-fault behavior in `[brk_base, brk_end)` to allocate/map heap pages lazily when touched.
 
 ## Argument register layout (`args[0..]`)

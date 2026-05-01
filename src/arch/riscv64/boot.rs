@@ -108,7 +108,7 @@ pub fn bootstrap_first_user_task(
     let image = load_init_elf_from_initramfs_vfs();
     let fallback = initramfs_static_hello_world_elf();
     let image_bytes: &[u8] = image.as_deref().unwrap_or(&fallback);
-    let entry = kernel.load_elf_pt_load_segments(asid, image_bytes)?;
+    let (entry, heap_base) = kernel.load_elf_pt_load_segments(asid, image_bytes)?;
     kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
         entry,
@@ -116,6 +116,7 @@ pub fn bootstrap_first_user_task(
         class: TaskClass::SystemServer,
         startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
     })?;
+    kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, heap_base, heap_base)?;
     crate::yarm_log!(
         "YARM_INIT_DONE arch=riscv64 phase=kernel_static_init_elf image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
         INITRAMFS_HELLO_WORLD_IMAGE_ID

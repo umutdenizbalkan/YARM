@@ -878,7 +878,7 @@ pub fn bootstrap_first_user_task(
         Some(initrd_image) => (initrd_image, "initrd"),
         None => (&fallback, "synthetic"),
     };
-    let entry = kernel.load_elf_pt_load_segments(asid, image_bytes)?;
+    let (entry, heap_base) = kernel.load_elf_pt_load_segments(asid, image_bytes)?;
     match source {
         "initrd" => crate::yarm_log!("YARM_INITRD_INIT_ELF_SELECTED entry=0x{:x}", entry),
         _ => crate::yarm_log!("YARM_SYNTHETIC_INIT_ELF_SELECTED entry=0x{:x}", entry),
@@ -895,6 +895,7 @@ pub fn bootstrap_first_user_task(
         class: TaskClass::SystemServer,
         startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
     })?;
+    kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, heap_base, heap_base)?;
     crate::yarm_log!(
         "YARM_INIT_DONE arch=aarch64 phase={} image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
         if source == "initrd" {

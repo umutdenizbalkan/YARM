@@ -535,11 +535,11 @@ pub fn bootstrap_first_user_task(
     let image = load_init_elf_from_initramfs_vfs();
     let fallback = initramfs_static_hello_world_elf();
     let image_bytes: &[u8] = image.as_deref().unwrap_or(&fallback);
-    let entry = match kernel.load_elf_pt_load_segments(asid, image_bytes) {
-        Ok(entry) => {
+    let (entry, heap_base) = match kernel.load_elf_pt_load_segments(asid, image_bytes) {
+        Ok(result) => {
             crate::yarm_log!("BOOTSTRAP_STAGE: after ELF load");
             crate::yarm_log!("BOOTSTRAP_STAGE: after copy_to_user");
-            entry
+            result
         }
         Err(err) => {
             crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
@@ -560,6 +560,7 @@ pub fn bootstrap_first_user_task(
             return Err(err);
         }
     }
+    kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, heap_base, heap_base)?;
     crate::yarm_log!(
         "YARM_INIT_DONE arch=x86_64 phase=kernel_static_init_elf image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
         INITRAMFS_HELLO_WORLD_IMAGE_ID
