@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::{KernelError, KernelState};
+use crate::kernel::capabilities::CapObject;
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{
     KernelExecutionContext, RobustFutexState, TaskStatus, ThreadDetachState, ThreadGroupId,
@@ -26,6 +27,51 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
 }
 
 impl KernelState {
+    fn fork_should_inherit_capability(object: CapObject) -> bool {
+        match object {
+            // Conservative fork inheritance policy: keep ordinary userspace IPC/memory-object caps.
+            CapObject::Endpoint { .. }
+            | CapObject::Notification { .. }
+            | CapObject::Reply { .. }
+            | CapObject::MemoryObject { .. } => true,
+            // Skip privileged/global capability classes by default.
+            CapObject::Kernel
+            | CapObject::Irq { .. }
+            | CapObject::IovaSpace { .. }
+            | CapObject::DmaRegion { .. }
+            | CapObject::AddressSpace { .. } => false,
+        }
+    }
+
+    fn inherit_parent_capabilities_for_fork(
+        &mut self,
+        parent_tid: u64,
+        child_tid: u64,
+    ) -> Result<(), KernelError> {
+        let parent_caps = self.snapshot_live_capabilities_for_task(parent_tid)?;
+        let mut minted_child_caps = alloc::vec::Vec::new();
+        for (parent_cap_id, capability) in parent_caps {
+            if !Self::fork_should_inherit_capability(capability.object) {
+                continue;
+            }
+            match self.grant_capability_task_to_task_with_rights(
+                parent_tid,
+                parent_cap_id,
+                child_tid,
+                capability.rights(),
+            ) {
+                Ok(child_cap_id) => minted_child_caps.push(child_cap_id),
+                Err(err) => {
+                    for cap in minted_child_caps {
+                        self.revoke_capability_direct_in_process_cnode(child_tid, cap);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn thread_group_id(&self, tid: u64) -> Option<ThreadGroupId> {
         self.with_tcbs(|tcbs| {
             tcbs.iter()
@@ -559,6 +605,7 @@ impl KernelState {
         self.register_task_with_class(child_tid, parent_class)?;
         let child_cnode = self.task_cnode(child_tid).ok_or(KernelError::TaskMissing)?;
         self.set_process_cnode_for_pid(child_tid, child_cnode)?;
+        self.inherit_parent_capabilities_for_fork(parent_tid, child_tid)?;
         self.with_tcbs_mut(|tcbs| {
             let child = tcbs
                 .iter_mut()

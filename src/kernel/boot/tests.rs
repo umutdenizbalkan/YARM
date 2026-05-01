@@ -4328,6 +4328,84 @@ fn fork_child_inherits_brk_bounds() {
 }
 
 #[test]
+fn fork_child_inherits_parent_endpoint_caps_with_same_rights() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 39,
+            entry: 0x8600,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+    let (_eid, send_root, recv_root) = state.create_endpoint(2).expect("endpoint");
+    let send_parent = state
+        .grant_capability_task_to_task_with_rights(0, send_root, 39, CapRights::SEND)
+        .expect("grant send");
+    let recv_parent = state
+        .grant_capability_task_to_task_with_rights(0, recv_root, 39, CapRights::RECEIVE)
+        .expect("grant recv");
+
+    let child_tid = state.fork_user_process_cow(39).expect("fork");
+    let child_caps = state
+        .snapshot_live_capabilities_for_task(child_tid)
+        .expect("child caps");
+    assert!(child_caps.iter().any(|(_id, cap)| {
+        matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::SEND)
+    }));
+    assert!(child_caps.iter().any(|(_id, cap)| {
+        matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::RECEIVE)
+    }));
+    let child_cnode = state.task_cnode(child_tid).expect("child cnode");
+    let inherited_send = child_caps
+        .iter()
+        .find(|(_id, cap)| matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::SEND))
+        .map(|(id, _)| *id)
+        .expect("send cap");
+    let inherited_recv = child_caps
+        .iter()
+        .find(|(_id, cap)| matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::RECEIVE))
+        .map(|(id, _)| *id)
+        .expect("recv cap");
+    assert!(state.capability_for_cnode(child_cnode, inherited_send).is_some());
+    assert!(state.capability_for_cnode(child_cnode, inherited_recv).is_some());
+    let parent_cnode = state.task_cnode(39).expect("parent cnode");
+    assert!(state.capability_for_cnode(parent_cnode, send_parent).is_some());
+    assert!(state.capability_for_cnode(parent_cnode, recv_parent).is_some());
+}
+
+#[test]
+fn fork_child_does_not_inherit_kernel_caps() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 40,
+            entry: 0x8700,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+    let parent_cnode = state.task_cnode(40).expect("parent cnode");
+    let kernel_cap = state
+        .mint_capability_in_cnode(parent_cnode, Capability::new(CapObject::Kernel, CapRights::READ))
+        .expect("mint kernel cap");
+
+    let child_tid = state.fork_user_process_cow(40).expect("fork");
+    let child_caps = state
+        .snapshot_live_capabilities_for_task(child_tid)
+        .expect("child caps");
+    assert!(!child_caps
+        .iter()
+        .any(|(_id, cap)| matches!(cap.object, CapObject::Kernel)));
+    let child_cnode = state.task_cnode(child_tid).expect("child cnode");
+    assert!(state.capability_for_cnode(child_cnode, kernel_cap).is_none());
+}
+
+#[test]
 fn spawn_thread_does_not_get_independent_brk_bounds() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
