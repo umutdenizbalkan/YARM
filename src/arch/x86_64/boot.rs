@@ -571,10 +571,10 @@ pub fn bootstrap_first_user_task(
     kernel.set_supervisor_endpoint_for_task(RING3_INIT_SERVER_TID, supervisor_fault_recv_init)?;
     let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
     startup_args[0] = RING3_INIT_SERVER_TID;
-    startup_args[1] = pm_request_send_init as u64;
-    startup_args[2] = pm_reply_recv_init as u64;
+    startup_args[1] = pm_request_send_init.0;
+    startup_args[2] = pm_reply_recv_init.0;
     if startup_args.len() > 3 {
-        startup_args[3] = supervisor_fault_recv_init as u64;
+        startup_args[3] = supervisor_fault_recv_init.0;
     }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
