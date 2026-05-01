@@ -13,10 +13,12 @@
   "panic-strategy": "abort",
   "relocation-model": "static",
   "code-model": "kernel",
-  "features": "-mmx,-sse,+soft-float",
+  "features": "-mmx,-sse",
   "linker-flavor": "gnu-lld",
   "linker": "rust-lld",
   "pre-link-args": {
-    "gnu-lld": ["-Ttargets/x86_64-yarm-user-none.ld"]
+    "gnu-lld": [
+      "-Ttargets/x86_64-yarm-user-none.ld"
+    ]
   }
 }
