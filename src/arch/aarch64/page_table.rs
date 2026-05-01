@@ -442,6 +442,20 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     );
     #[cfg(not(feature = "hosted-dev"))]
     unsafe {
+        let mut current_ttbr0: u64 = 0;
+        core::arch::asm!(
+            "mrs {value}, ttbr0_el1",
+            value = out(reg) current_ttbr0,
+            options(nostack, preserves_flags)
+        );
+        if current_ttbr0 == ttbr0 {
+            crate::yarm_log!(
+                "ADDRESS_SPACE_SWITCH_SKIPPED_SAME_ASID asid={} ttbr0=0x{:x}",
+                asid.0,
+                ttbr0
+            );
+            return Ok(ttbr0);
+        }
         let sp: u64;
         core::arch::asm!("mov {0}, sp", out(reg) sp, options(nostack, preserves_flags));
         let pc_sym = activate_asid as *const () as usize as u64;
