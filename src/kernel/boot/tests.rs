@@ -690,9 +690,11 @@ fn spawn_user_task_from_image_registers_asid_and_class() {
         aspace.resolve(stack_base).is_some(),
         "stack page should be mapped"
     );
-    assert!(
-        aspace.resolve(guard).is_none(),
-        "guard page below stack must stay unmapped"
+    let guard_mapping = aspace.resolve(guard).expect("guard page should be mapped");
+    assert_eq!(
+        guard_mapping.flags,
+        crate::kernel::vm::PageFlags::GUARD,
+        "guard page below stack must be mapped as no-access guard"
     );
 }
 

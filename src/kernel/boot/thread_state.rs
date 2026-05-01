@@ -500,6 +500,17 @@ impl KernelState {
                 },
             )?;
         }
+        let (_guard_mem_id, guard_mem_cap) = self.alloc_anonymous_memory_object()?;
+        let guard_phys =
+            self.resolve_memory_object_phys(guard_mem_cap, crate::kernel::vm::PageFlags::GUARD)?;
+        self.map_user_page_in_asid_raw(
+            asid,
+            crate::kernel::vm::VirtAddr(guard),
+            crate::kernel::vm::Mapping {
+                phys: guard_phys,
+                flags: crate::kernel::vm::PageFlags::GUARD,
+            },
+        )?;
         if cfg!(not(feature = "hosted-dev")) {
             crate::yarm_log!(
                 "USER_STACK asid={} base=0x{:x} top=0x{:x}",
