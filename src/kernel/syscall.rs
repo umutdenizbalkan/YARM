@@ -21,8 +21,14 @@ pub const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
 pub const SYSCALL_IPC_CALL_NR: usize = 6;
 pub const SYSCALL_IPC_REPLY_NR: usize = 7;
 pub const SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR: usize = 8;
-pub const SYSCALL_COUNT: usize = 9;
-const _: [(); SYSCALL_COUNT] = [(); 9];
+pub const SYSCALL_FUTEX_WAIT_NR: usize = 9;
+pub const SYSCALL_FUTEX_WAKE_NR: usize = 10;
+pub const SYSCALL_SPAWN_THREAD_NR: usize = 11;
+pub const SYSCALL_FORK_NR: usize = 12;
+pub const SYSCALL_VM_ANON_MAP_NR: usize = 13;
+pub const SYSCALL_VM_BRK_NR: usize = 14;
+pub const SYSCALL_COUNT: usize = 15;
+const _: [(); SYSCALL_COUNT] = [(); 15];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -56,10 +62,16 @@ pub enum Syscall {
     IpcCall = SYSCALL_IPC_CALL_NR,
     IpcReply = SYSCALL_IPC_REPLY_NR,
     ControlPlaneSetCnodeSlots = SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR,
+    FutexWait = SYSCALL_FUTEX_WAIT_NR,
+    FutexWake = SYSCALL_FUTEX_WAKE_NR,
+    SpawnThread = SYSCALL_SPAWN_THREAD_NR,
+    Fork = SYSCALL_FORK_NR,
+    VmAnonMap = SYSCALL_VM_ANON_MAP_NR,
+    VmBrk = SYSCALL_VM_BRK_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 9;
+    pub const VARIANT_COUNT: usize = 15;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -75,6 +87,12 @@ impl Syscall {
             SYSCALL_IPC_CALL_NR => Ok(Self::IpcCall),
             SYSCALL_IPC_REPLY_NR => Ok(Self::IpcReply),
             SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR => Ok(Self::ControlPlaneSetCnodeSlots),
+            SYSCALL_FUTEX_WAIT_NR => Ok(Self::FutexWait),
+            SYSCALL_FUTEX_WAKE_NR => Ok(Self::FutexWake),
+            SYSCALL_SPAWN_THREAD_NR => Ok(Self::SpawnThread),
+            SYSCALL_FORK_NR => Ok(Self::Fork),
+            SYSCALL_VM_ANON_MAP_NR => Ok(Self::VmAnonMap),
+            SYSCALL_VM_BRK_NR => Ok(Self::VmBrk),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -1032,6 +1050,64 @@ fn handle_control_plane_set_cnode_slots(
     Ok(())
 }
 
+fn handle_futex_wait(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let addr = frame.arg(SYSCALL_ARG_CAP);
+    let expected = u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
+    let observed = u32::try_from(frame.arg(SYSCALL_ARG_LEN)).map_err(|_| SyscallError::InvalidArgs)?;
+    let blocked = kernel
+        .futex_wait_current(addr, expected, observed)
+        .map_err(SyscallError::from)?;
+    frame.set_ok(usize::from(blocked), 0, 0);
+    Ok(())
+}
+
+fn handle_futex_wake(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let addr = frame.arg(SYSCALL_ARG_CAP);
+    let max_wake = u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
+    let woke = kernel.futex_wake(addr, max_wake).map_err(SyscallError::from)?;
+    frame.set_ok(woke as usize, 0, 0);
+    Ok(())
+}
+
+fn handle_spawn_thread(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    let parent_tid = current_tid(kernel)?;
+    let tls_base = frame.arg(SYSCALL_ARG_CAP);
+    let user_stack_top = frame.arg(SYSCALL_ARG_PTR);
+    let user_entry = frame.arg(SYSCALL_ARG_LEN);
+    let tid = kernel
+        .spawn_user_thread(parent_tid, tls_base, user_stack_top, user_entry)
+        .map_err(SyscallError::from)?;
+    frame.set_ok(usize::try_from(tid).map_err(|_| SyscallError::Internal)?, 0, 0);
+    Ok(())
+}
+
+fn handle_fork(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let parent_tid = current_tid(kernel)?;
+    let child_tid = kernel
+        .fork_user_process_cow(parent_tid)
+        .map_err(SyscallError::from)?;
+    frame.set_ok(
+        usize::try_from(child_tid).map_err(|_| SyscallError::Internal)?,
+        0,
+        0,
+    );
+    Ok(())
+}
+
+fn handle_vm_anon_map(
+    _kernel: &mut KernelState,
+    _frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    Err(SyscallError::InvalidArgs)
+}
+
+fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    Err(SyscallError::InvalidArgs)
+}
+
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if frame.syscall_num() == SYSCALL_YIELD_NR {
@@ -1061,6 +1137,12 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::ControlPlaneSetCnodeSlots => handle_control_plane_set_cnode_slots(kernel, frame),
         Syscall::VmMap => handle_vm_map(kernel, frame),
         Syscall::TransferRelease => handle_transfer_release(kernel, frame),
+        Syscall::FutexWait => handle_futex_wait(kernel, frame),
+        Syscall::FutexWake => handle_futex_wake(kernel, frame),
+        Syscall::SpawnThread => handle_spawn_thread(kernel, frame),
+        Syscall::Fork => handle_fork(kernel, frame),
+        Syscall::VmAnonMap => handle_vm_anon_map(kernel, frame),
+        Syscall::VmBrk => handle_vm_brk(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_blocked = caller_tid.is_some_and(|tid| {
@@ -1123,6 +1205,13 @@ mod tests {
         assert_eq!(SYSCALL_IPC_CALL_NR, 6);
         assert_eq!(SYSCALL_IPC_REPLY_NR, 7);
         assert_eq!(SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR, 8);
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_SPAWN_THREAD_NR, 11);
+        assert_eq!(SYSCALL_FORK_NR, 12);
+        assert_eq!(SYSCALL_VM_ANON_MAP_NR, 13);
+        assert_eq!(SYSCALL_VM_BRK_NR, 14);
+        assert_eq!(SYSCALL_COUNT, 15);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 

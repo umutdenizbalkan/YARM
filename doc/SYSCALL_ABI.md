@@ -3,7 +3,7 @@
 # YARM Syscall ABI v10 (Frozen Contract)
 
 - ABI Version: `10`
-- Syscall count: `9`
+- Syscall count: `15`
 
 ## Syscall numbers
 
@@ -16,6 +16,12 @@
 - `6`: `IpcCall` (send with kernel-minted ephemeral reply-cap transfer)
 - `7`: `IpcReply` (consume reply-cap and send reply to bound caller endpoint)
 - `8`: `ControlPlaneSetCnodeSlots` (control-plane cnode slot-capacity resize by target process id)
+- `9`: `FutexWait` (`arg0=addr`, `arg1=expected`, `arg2=observed`)
+- `10`: `FutexWake` (`arg0=addr`, `arg1=max_wake`)
+- `11`: `SpawnThread` (`arg0=tls_base`, `arg1=user_stack_top`, `arg2=user_entry`)
+- `12`: `Fork` (fork current process with CoW; return child tid in parent)
+- `13`: `VmAnonMap` (reserved; currently returns `InvalidArgs`)
+- `14`: `VmBrk` (reserved; currently returns `InvalidArgs`)
 
 ## Argument register layout (`args[0..]`)
 
