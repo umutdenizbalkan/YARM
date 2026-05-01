@@ -4170,6 +4170,54 @@ fn fork_child_starts_with_empty_robust_futex_state() {
 }
 
 #[test]
+fn clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion() {
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 36,
+            entry: 0x8400,
+            asid: Some(parent_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+
+    let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    let writable_pages = (super::MAX_COW_PAGES / 2) + 1;
+    for page in 0..writable_pages {
+        let va = VirtAddr(0x20_0000 + (page * PAGE_SIZE) as u64);
+        state
+            .map_user_page_in_asid_raw(
+                parent_asid,
+                va,
+                Mapping {
+                    phys,
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map parent page");
+    }
+
+    assert_eq!(
+        state.clone_user_address_space_cow(parent_asid),
+        Err(KernelError::MemoryObjectFull)
+    );
+
+    let lingering_child_cow = state.with_memory_state(|memory| {
+        memory
+            .cow_pages
+            .iter()
+            .flatten()
+            .any(|entry| entry.asid != parent_asid)
+    });
+    assert!(!lingering_child_cow);
+}
+
+#[test]
 fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");

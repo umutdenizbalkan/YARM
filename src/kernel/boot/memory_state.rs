@@ -243,6 +243,10 @@ impl KernelState {
             .with_user_spaces_mut(|spaces| spaces.create_user_space())
             .map_err(KernelError::Vm)?;
 
+        let cleanup_failed_child_clone = |state: &mut Self| {
+            let _ = state.destroy_user_address_space_by_asid(child_asid);
+        };
+
         let mut index = 0usize;
         while let Some(MappingEntry { virt, mapping }) = self.with_user_spaces(|spaces| {
             spaces
@@ -253,25 +257,38 @@ impl KernelState {
             if mapping.flags.write {
                 shared_flags.write = false;
             }
-            self.map_user_page_in_asid_raw(
+            if let Err(err) = self.map_user_page_in_asid_raw(
                 child_asid,
                 virt,
                 Mapping {
                     phys: mapping.phys,
                     flags: shared_flags,
                 },
-            )?;
+            )
+            {
+                cleanup_failed_child_clone(self);
+                return Err(err);
+            }
             if mapping.flags.write {
-                self.map_user_page_in_asid_raw(
+                if let Err(err) = self.map_user_page_in_asid_raw(
                     parent_asid,
                     virt,
                     Mapping {
                         phys: mapping.phys,
                         flags: shared_flags,
                     },
-                )?;
-                self.mark_cow_page(parent_asid, virt)?;
-                self.mark_cow_page(child_asid, virt)?;
+                ) {
+                    cleanup_failed_child_clone(self);
+                    return Err(err);
+                }
+                if let Err(err) = self.mark_cow_page(parent_asid, virt) {
+                    cleanup_failed_child_clone(self);
+                    return Err(err);
+                }
+                if let Err(err) = self.mark_cow_page(child_asid, virt) {
+                    cleanup_failed_child_clone(self);
+                    return Err(err);
+                }
             }
             #[cfg(feature = "hosted-dev")]
             self.with_memory_state_mut(|memory| {
