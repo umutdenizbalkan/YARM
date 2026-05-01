@@ -29,8 +29,44 @@ common_stage_server_init_elf() {
   chmod +x "$ROOTFS_DIR/sbin/init_server"
 
   if command -v readelf >/dev/null 2>&1; then
-    if readelf -W -l "$SERVER_ELF" | rg -q 'LOAD\s+.*RWE'; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$SERVER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
       echo "[error] server ELF has forbidden RWE PT_LOAD segment: $SERVER_ELF"
+      return 1
+    fi
+    if ! printf '%s\n' "$readelf_out" | awk '
+      BEGIN { page = 4096; exec_n = 0; write_n = 0; }
+      $1 == "LOAD" {
+        vaddr = strtonum("0x" $3);
+        memsz = strtonum("0x" $6);
+        flg = $7;
+        start = int(vaddr / page);
+        end = int((vaddr + memsz - 1) / page);
+        if (memsz == 0) next;
+        if (index(flg, "E") > 0) {
+          exec_start[exec_n] = start;
+          exec_end[exec_n] = end;
+          exec_n++;
+        }
+        if (index(flg, "W") > 0) {
+          write_start[write_n] = start;
+          write_end[write_n] = end;
+          write_n++;
+        }
+      }
+      END {
+        for (i = 0; i < exec_n; i++) {
+          for (j = 0; j < write_n; j++) {
+            if (!(exec_end[i] < write_start[j] || write_end[j] < exec_start[i])) {
+              exit 1;
+            }
+          }
+        }
+        exit 0;
+      }
+    '; then
+      echo "[error] server ELF has executable/writable PT_LOAD page overlap: $SERVER_ELF"
       return 1
     fi
   else

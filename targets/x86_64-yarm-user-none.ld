@@ -15,6 +15,7 @@ SECTIONS {
 
   .text : ALIGN(16) { *(.text*) } :text
   .rodata : ALIGN(16) { *(.rodata*) } :text
+  . = ALIGN(0x1000);
   .data : ALIGN(4096) { *(.data*) } :data
   .bss (NOLOAD) : ALIGN(16) { *(.bss*) *(COMMON) } :data
 
