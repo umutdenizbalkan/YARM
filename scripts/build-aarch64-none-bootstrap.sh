@@ -5,6 +5,7 @@
 set -euo pipefail
 
 RUST_TARGET=${RUST_TARGET:-aarch64-yarm-none}
+USER_RUST_TARGET=${USER_RUST_TARGET:-targets/aarch64-yarm-user-none.json}
 PROFILE=${PROFILE:-aarch64-none}
 TOOLCHAIN=${TOOLCHAIN:-nightly}
 RUSTUP_DISABLED=${RUSTUP_DISABLED:-0}
@@ -14,6 +15,9 @@ CARGO_Z_ARGS=()
 
 if [[ "$RUST_TARGET" != *.json && -f "targets/${RUST_TARGET}.json" ]]; then
   RUST_TARGET="targets/${RUST_TARGET}.json"
+fi
+if [[ "$USER_RUST_TARGET" != *.json && -f "targets/${USER_RUST_TARGET}.json" ]]; then
+  USER_RUST_TARGET="targets/${USER_RUST_TARGET}.json"
 fi
 
 if [[ "$RUSTUP_DISABLED" == "0" ]] && ! command -v rustup >/dev/null 2>&1; then
@@ -55,10 +59,10 @@ echo "[info] building kernel_boot for ${RUST_TARGET} profile=${PROFILE} toolchai
   -p yarm \
   --bin kernel_boot
 
-echo "[info] building init_server for ${RUST_TARGET} profile=${PROFILE}"
+echo "[info] building init_server for ${USER_RUST_TARGET} profile=${PROFILE}"
 "${CARGO_CMD[@]}" build \
   "${CARGO_Z_ARGS[@]}" \
-  --target "$RUST_TARGET" \
+  --target "$USER_RUST_TARGET" \
   --profile "$PROFILE" \
   ${BOOTSTRAP_FEATURE_ARGS} \
   -p yarm-control-plane-servers \

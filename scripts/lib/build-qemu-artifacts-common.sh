@@ -28,6 +28,15 @@ common_stage_server_init_elf() {
   cp "$SERVER_ELF" "$ROOTFS_DIR/sbin/init_server"
   chmod +x "$ROOTFS_DIR/sbin/init_server"
 
+  if command -v readelf >/dev/null 2>&1; then
+    if readelf -W -l "$SERVER_ELF" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] server ELF has forbidden RWE PT_LOAD segment: $SERVER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $SERVER_ELF"
+  fi
+
   echo "[ok] staged server ELF as /init and /sbin/init_server"
 }
 
