@@ -4084,6 +4084,48 @@ fn futex_wait_and_wake_reject_kernel_space_address() {
 }
 
 #[test]
+fn fork_child_preserves_parent_registers_except_arg0() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 33,
+            entry: 0x8000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+    let parent_ctx = UserRegisterContext {
+        instruction_ptr: VirtAddr(0x8123),
+        stack_ptr: VirtAddr(0x8FFF_0000),
+        arg0: 0xAAAA,
+        arg1: 0x1111,
+        arg2: 0x2222,
+        arg3: 0x3333,
+        arg4: 0x4444,
+        arg5: 0x5555,
+    };
+    state
+        .set_thread_user_context(33, parent_ctx)
+        .expect("set parent ctx");
+
+    let child_tid = state.fork_user_process_cow(33).expect("fork");
+    let child_ctx = state
+        .thread_user_context(child_tid)
+        .expect("child user context");
+
+    assert_eq!(child_ctx.instruction_ptr, parent_ctx.instruction_ptr);
+    assert_eq!(child_ctx.stack_ptr, parent_ctx.stack_ptr);
+    assert_eq!(child_ctx.arg0, 0);
+    assert_eq!(child_ctx.arg1, parent_ctx.arg1);
+    assert_eq!(child_ctx.arg2, parent_ctx.arg2);
+    assert_eq!(child_ctx.arg3, parent_ctx.arg3);
+    assert_eq!(child_ctx.arg4, parent_ctx.arg4);
+    assert_eq!(child_ctx.arg5, parent_ctx.arg5);
+}
+
+#[test]
 fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");

@@ -567,12 +567,10 @@ impl KernelState {
             child.tls_ptr = parent.tls_ptr;
             child.user_entry = parent.user_entry;
             child.user_stack_top = parent.user_stack_top;
+            // Fork child resumes with the same user register context as parent;
+            // only the return register differs (`0` in the child).
             child.user_context = parent.user_context;
             child.user_context.arg0 = 0;
-            child.user_context.arg2 = 0;
-            child.user_context.arg3 = 0;
-            child.user_context.arg4 = 0;
-            child.user_context.arg5 = 0;
             child.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
