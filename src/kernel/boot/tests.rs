@@ -4017,6 +4017,26 @@ fn spawn_user_thread_inherits_group_and_asid_and_sets_tls() {
 }
 
 #[test]
+fn spawn_user_thread_rejects_misaligned_stack_top() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 8,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        })
+        .expect("parent");
+
+    assert_eq!(
+        state.spawn_user_thread(8, 0xDEAD_BEEF, 0x8000_0008, 0x4010),
+        Err(KernelError::WrongObject)
+    );
+}
+
+#[test]
 fn futex_wait_blocks_current_and_wake_requeues_waiter() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, aspace_cap) = state.create_user_address_space().expect("asid");

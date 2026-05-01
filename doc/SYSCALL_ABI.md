@@ -103,6 +103,22 @@
 - `args[4]`: reserved (must be `0`)
 - `args[5]`: reserved (must be `0`)
 
+### `SpawnThread` argument layout and runtime contract
+
+- Syscall number: `11`
+- `args[0]`: `tls_base`
+- `args[1]`: `user_stack_top` (**must be 16-byte aligned**)
+- `args[2]`: `user_entry`
+- `args[3..5]`: reserved (must be `0`)
+
+`SpawnThread` semantics:
+
+- Parent/current thread id is derived by the kernel (not passed by userspace).
+- New thread starts at `user_entry` with initial SP=`user_stack_top`.
+- Initial user arg register lanes (`arg0..arg5`) are zeroed.
+- TLS base is installed and TLS restore is marked pending for first resume/application.
+- Returning from `user_entry` is currently undefined/unsupported unless userspace takes an explicit exit path.
+
 ### `TransferRelease` argument layout
 
 - `args[0]`: receiver-local transferred capability id (`CapId`)

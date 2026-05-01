@@ -486,7 +486,8 @@ impl KernelState {
         user_stack_top: usize,
         user_entry: usize,
     ) -> Result<u64, KernelError> {
-        if tls_base == 0 || user_stack_top == 0 || user_entry == 0 {
+        if tls_base == 0 || user_stack_top == 0 || user_entry == 0 || (user_stack_top & 0xF) != 0
+        {
             return Err(KernelError::WrongObject);
         }
         let parent = self
