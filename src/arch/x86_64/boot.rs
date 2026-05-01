@@ -547,12 +547,14 @@ pub fn bootstrap_first_user_task(
         }
     };
     crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
+    let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+    startup_args[0] = RING3_INIT_SERVER_TID;
     match kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
         entry,
         asid: Some(asid),
         class: TaskClass::SystemServer,
-        startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        startup_args,
     }) {
         Ok(_) => crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation"),
         Err(err) => {

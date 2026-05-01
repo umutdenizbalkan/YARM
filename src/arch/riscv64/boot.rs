@@ -109,12 +109,14 @@ pub fn bootstrap_first_user_task(
     let fallback = initramfs_static_hello_world_elf();
     let image_bytes: &[u8] = image.as_deref().unwrap_or(&fallback);
     let (entry, heap_base) = kernel.load_elf_pt_load_segments(asid, image_bytes)?;
+    let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+    startup_args[0] = RING3_INIT_SERVER_TID;
     kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
         entry,
         asid: Some(asid),
         class: TaskClass::SystemServer,
-        startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        startup_args,
     })?;
     kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, heap_base, heap_base)?;
     crate::yarm_log!(

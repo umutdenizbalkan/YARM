@@ -697,6 +697,29 @@ fn spawn_user_task_from_image_registers_asid_and_class() {
 }
 
 #[test]
+fn spawn_user_task_from_image_copies_startup_args_into_user_context() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+    startup_args[0] = 77;
+    startup_args[1] = 0x1234;
+    startup_args[2] = 0x5678;
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 77,
+            entry: 0x8000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args,
+        })
+        .expect("spawn");
+    let ctx = state.thread_user_context(77).expect("ctx");
+    assert_eq!(ctx.arg0, 77);
+    assert_eq!(ctx.arg1, 0x1234);
+    assert_eq!(ctx.arg2, 0x5678);
+}
+
+#[test]
 fn spawn_user_task_from_image_requires_valid_asid() {
     let mut state = Bootstrap::init().expect("init");
     let err = state

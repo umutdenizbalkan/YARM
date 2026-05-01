@@ -888,12 +888,24 @@ pub fn bootstrap_first_user_task(
         source,
         image_bytes.len()
     );
+    let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+    // Staged startup ABI handoff:
+    // - arg0: task id / tid (always available)
+    // - arg1..arg2: process-manager endpoint caps (not yet provisioned here)
+    startup_args[0] = RING3_INIT_SERVER_TID;
+    crate::yarm_log!(
+        "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={}",
+        RING3_INIT_SERVER_TID,
+        startup_args[0],
+        startup_args[1],
+        startup_args[2]
+    );
     kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
         entry,
         asid: Some(asid),
         class: TaskClass::SystemServer,
-        startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+        startup_args,
     })?;
     kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, heap_base, heap_base)?;
     crate::yarm_log!(
