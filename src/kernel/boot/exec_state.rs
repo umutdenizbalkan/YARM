@@ -73,6 +73,16 @@ impl KernelState {
         })
     }
 
+    fn staging_page_flags_from_final(final_flags: PageFlags) -> PageFlags {
+        PageFlags {
+            read: true,
+            write: true,
+            execute: false,
+            user: final_flags.user,
+            cache_policy: final_flags.cache_policy,
+        }
+    }
+
     fn load_page_elf_pflags(
         image: &[u8],
         phoff: usize,
@@ -241,12 +251,24 @@ impl KernelState {
                         combined_pflags
                     );
                 }
+                let stage_flags = Self::staging_page_flags_from_final(flags);
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!(
+                        "ELF_MAP_PAGE_STAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
+                        asid.0,
+                        va,
+                        stage_flags.read,
+                        stage_flags.write,
+                        stage_flags.execute,
+                        stage_flags.user
+                    );
+                }
                 self.map_user_page_in_asid_raw(
                     asid,
                     VirtAddr(va),
                     Mapping {
                         phys: PhysAddr(phys),
-                        flags,
+                        flags: stage_flags,
                     },
                 )?;
                 let post_map_present =
@@ -308,6 +330,58 @@ impl KernelState {
                 crate::yarm_log!("ELF_REJECT_NO_PT_LOAD");
             }
             return Err(KernelError::WrongObject);
+        }
+        for idx in 0..phnum {
+            let base = phoff
+                .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
+                .ok_or(KernelError::WrongObject)?;
+            let p_type = read_u32_le(image, base)?;
+            if p_type != PT_LOAD {
+                continue;
+            }
+            let p_vaddr = read_u64_le(image, base + 16)?;
+            let p_memsz = read_u64_le(image, base + 40)? as usize;
+            let page_size = PAGE_SIZE as u64;
+            let seg_end = p_vaddr
+                .checked_add(p_memsz as u64)
+                .ok_or(KernelError::WrongObject)?;
+            let page_start = p_vaddr & !(page_size - 1);
+            let page_end = (seg_end + page_size - 1) & !(page_size - 1);
+            let mut va = page_start;
+            while va < page_end {
+                let combined_pflags = Self::load_page_elf_pflags(
+                    image,
+                    phoff,
+                    phentsize,
+                    phnum,
+                    va,
+                    va + page_size,
+                )?;
+                let final_flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
+                let phys = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
+                    .ok_or(KernelError::UserMemoryFault)?
+                    .addr();
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!(
+                        "ELF_FINALIZE_PAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
+                        asid.0,
+                        va,
+                        final_flags.read,
+                        final_flags.write,
+                        final_flags.execute,
+                        final_flags.user
+                    );
+                }
+                self.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr(va),
+                    Mapping {
+                        phys: PhysAddr(phys),
+                        flags: final_flags,
+                    },
+                )?;
+                va += page_size;
+            }
         }
         let page_size = PAGE_SIZE as u64;
         let heap_base = max_loaded_end
@@ -954,5 +1028,47 @@ mod tests {
             .expect("load elf");
         assert_eq!(entry, 0x0040_0000usize);
         assert_eq!(heap_base, 0x0040_2000usize);
+    }
+
+    #[test]
+    fn load_elf_copies_into_staging_then_finalizes_rx_permissions() {
+        let mut image = vec![0u8; 64 + 56 + 4];
+        image[0..4].copy_from_slice(b"\x7FELF");
+        image[4] = 2;
+        image[5] = 1;
+        image[6] = 1;
+        image[16..18].copy_from_slice(&2u16.to_le_bytes());
+        image[18..20].copy_from_slice(&183u16.to_le_bytes());
+        image[20..24].copy_from_slice(&1u32.to_le_bytes());
+        image[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+        image[32..40].copy_from_slice(&64u64.to_le_bytes());
+        image[52..54].copy_from_slice(&64u16.to_le_bytes());
+        image[54..56].copy_from_slice(&56u16.to_le_bytes());
+        image[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+        let ph = 64usize;
+        image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+        image[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+        image[ph + 8..ph + 16].copy_from_slice(&(64u64 + 56u64).to_le_bytes());
+        image[ph + 16..ph + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+        image[ph + 24..ph + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+        image[ph + 32..ph + 40].copy_from_slice(&4u64.to_le_bytes());
+        image[ph + 40..ph + 48].copy_from_slice(&4u64.to_le_bytes());
+        image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        image[64 + 56..64 + 60].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
+        let (asid, _map) = state.create_user_address_space().expect("asid");
+        state
+            .load_elf_pt_load_segments(asid, &image)
+            .expect("load elf");
+        let mapping = state
+            .user_spaces
+            .get(asid)
+            .and_then(|aspace| aspace.resolve(VirtAddr(0x0040_0000)))
+            .expect("resolved mapping");
+        assert!(mapping.flags.read);
+        assert!(!mapping.flags.write);
+        assert!(mapping.flags.execute);
     }
 }
