@@ -1221,13 +1221,13 @@ yarm_x86_enter_ring3:
     mov r9, rsi
     mov rdi, rdx
     mov rsi, rcx
-    mov ax, 0x23
+    mov ax, 0x1b
     mov ds, ax
     mov es, ax
-    push 0x23
+    push 0x1b
     push r9
     push 0x202
-    push 0x1b
+    push 0x23
     push r8
     iretq
 "#
