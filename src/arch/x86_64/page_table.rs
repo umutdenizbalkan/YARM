@@ -20,6 +20,10 @@ const INTERMEDIATE_PT_PAGES_PER_MAPPING: usize = 4;
 const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES
     * (1 + vm_layout::MAX_MAPPINGS * INTERMEDIATE_PT_PAGES_PER_MAPPING);
 const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const DEBUG_ASID_SWITCH: bool = false;
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+const DEBUG_ASID_SWITCH: bool = false;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageTableEntry(pub u64);
@@ -492,6 +496,9 @@ fn clone_low_alias_page_from_live_root(
 
 #[cfg(all(not(feature = "hosted-dev"), not(test)))]
 fn log_root_chain(root_phys: u64, label: &str, virt: VirtAddr) {
+    if !DEBUG_ASID_SWITCH {
+        return;
+    }
     let l4 = pml4_index(virt.0);
     let l3 = pdpt_index(virt.0);
     let l2 = pd_index(virt.0);
@@ -657,25 +664,29 @@ pub fn cr3_for_asid(asid: Asid) -> Option<u64> {
         // per-ASID PCID assignment so simultaneously-live ASIDs never alias.
         let pcid = state.asid_pcid(asid)? as u64;
         let cr3 = (root_phys & PAGE_MASK) | pcid;
-        crate::yarm_log!(
-            "ASID_CR3_PREP asid={} root=0x{:x} pcide=true kernel_half_present={} cr3=0x{:x}",
-            asid.0,
-            root_phys,
-            kernel_half_present,
-            cr3
-        );
+        if DEBUG_ASID_SWITCH {
+            crate::yarm_log!(
+                "ASID_CR3_PREP asid={} root=0x{:x} pcide=true kernel_half_present={} cr3=0x{:x}",
+                asid.0,
+                root_phys,
+                kernel_half_present,
+                cr3
+            );
+        }
         Some(cr3)
     } else {
         // CR4.PCIDE is not enabled; CR3 low bits must remain clear (except
         // legacy PWT/PCD), so do not encode software ASID in CR3.
         let cr3 = root_phys & PAGE_MASK;
-        crate::yarm_log!(
-            "ASID_CR3_PREP asid={} root=0x{:x} pcide=false kernel_half_present={} cr3=0x{:x}",
-            asid.0,
-            root_phys,
-            kernel_half_present,
-            cr3
-        );
+        if DEBUG_ASID_SWITCH {
+            crate::yarm_log!(
+                "ASID_CR3_PREP asid={} root=0x{:x} pcide=false kernel_half_present={} cr3=0x{:x}",
+                asid.0,
+                root_phys,
+                kernel_half_present,
+                cr3
+            );
+        }
         Some(cr3)
     }
 }
@@ -696,25 +707,27 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         let (idt_base, gdt_base, tss_base) = read_descriptor_bases();
         let rip_higher = bootstrap_higher_half_alias(rip);
         let rsp_higher = bootstrap_higher_half_alias(rsp_probe);
-        crate::yarm_log!(
-            "ASID_SWITCH_ADDR asid={} live_root=0x{:x} target_root=0x{:x} rip_raw=0x{:x} rip_canonical=0x{:x} rip_higher={:#x?} rsp_raw=0x{:x} rsp_probe=0x{:x} rsp_canonical=0x{:x} rsp_higher={:#x?}",
-            asid.0,
-            live_root,
-            target_root,
-            rip,
-            canonicalize_virt_addr(rip),
-            rip_higher,
-            rsp,
-            rsp_probe,
-            canonicalize_virt_addr(rsp_probe),
-            rsp_higher
-        );
-        crate::yarm_log!(
-            "ASID_DESC idt_base=0x{:x} gdt_base=0x{:x} tss_base=0x{:x}",
-            idt_base,
-            gdt_base,
-            tss_base
-        );
+        if DEBUG_ASID_SWITCH {
+            crate::yarm_log!(
+                "ASID_SWITCH_ADDR asid={} live_root=0x{:x} target_root=0x{:x} rip_raw=0x{:x} rip_canonical=0x{:x} rip_higher={:#x?} rsp_raw=0x{:x} rsp_probe=0x{:x} rsp_canonical=0x{:x} rsp_higher={:#x?}",
+                asid.0,
+                live_root,
+                target_root,
+                rip,
+                canonicalize_virt_addr(rip),
+                rip_higher,
+                rsp,
+                rsp_probe,
+                canonicalize_virt_addr(rsp_probe),
+                rsp_higher
+            );
+            crate::yarm_log!(
+                "ASID_DESC idt_base=0x{:x} gdt_base=0x{:x} tss_base=0x{:x}",
+                idt_base,
+                gdt_base,
+                tss_base
+            );
+        }
         log_root_chain(live_root, "live_rip", VirtAddr(rip));
         log_root_chain(target_root, "target_rip_before", VirtAddr(rip));
         log_root_chain(live_root, "live_rsp", VirtAddr(rsp_probe));
@@ -755,27 +768,29 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             rip_higher.is_some_and(|a| resolve_page_in_root(target_root, VirtAddr(a)).is_some());
         let target_rsp_hi_ok =
             rsp_higher.is_some_and(|a| resolve_page_in_root(target_root, VirtAddr(a)).is_some());
-        crate::yarm_log!(
-            "ASID_SWITCH_MAPCMP asid={} live_raw[rip={},rsp={}] target_raw[rip={},rsp={}] live_hi[rip={},rsp={}] target_hi[rip={},rsp={}]",
-            asid.0,
-            live_rip_raw_ok,
-            live_rsp_raw_ok,
-            target_rip_raw_ok,
-            target_rsp_raw_ok,
-            live_rip_hi_ok,
-            live_rsp_hi_ok,
-            target_rip_hi_ok,
-            target_rsp_hi_ok
-        );
-        crate::yarm_log!(
-            "ASID_DESC_MAP live[idt={},gdt={},tss={}] target[idt={},gdt={},tss={}]",
-            live_idt_ok,
-            live_gdt_ok,
-            live_tss_ok,
-            target_idt_ok,
-            target_gdt_ok,
-            target_tss_ok
-        );
+        if DEBUG_ASID_SWITCH {
+            crate::yarm_log!(
+                "ASID_SWITCH_MAPCMP asid={} live_raw[rip={},rsp={}] target_raw[rip={},rsp={}] live_hi[rip={},rsp={}] target_hi[rip={},rsp={}]",
+                asid.0,
+                live_rip_raw_ok,
+                live_rsp_raw_ok,
+                target_rip_raw_ok,
+                target_rsp_raw_ok,
+                live_rip_hi_ok,
+                live_rsp_hi_ok,
+                target_rip_hi_ok,
+                target_rsp_hi_ok
+            );
+            crate::yarm_log!(
+                "ASID_DESC_MAP live[idt={},gdt={},tss={}] target[idt={},gdt={},tss={}]",
+                live_idt_ok,
+                live_gdt_ok,
+                live_tss_ok,
+                target_idt_ok,
+                target_gdt_ok,
+                target_tss_ok
+            );
+        }
         // The kernel image runs at the higher-half alias (PML4[511] direct
         // map) which is cloned into every user ASID via
         // clone_kernel_pml4_half_into_root. Once the BSP has transitioned out
@@ -820,14 +835,16 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         //     so it correctly resolves through the static boot tables.
         let rip_ok = target_rip_raw_ok;
         let rsp_ok = target_rsp_raw_ok;
-        crate::yarm_log!(
-            "ASID_SWITCH_PRECHECK asid={} rip=0x{:x} rip_ok={} rsp=0x{:x} rsp_ok={}",
-            asid.0,
-            rip,
-            rip_ok,
-            rsp,
-            rsp_ok
-        );
+        if DEBUG_ASID_SWITCH {
+            crate::yarm_log!(
+                "ASID_SWITCH_PRECHECK asid={} rip=0x{:x} rip_ok={} rsp=0x{:x} rsp_ok={}",
+                asid.0,
+                rip,
+                rip_ok,
+                rsp,
+                rsp_ok
+            );
+        }
         if !rip_ok || !rsp_ok {
             crate::yarm_log!(
                 "ASID_SWITCH_ABORT asid={} reason=kernel_mapping_missing",
@@ -837,11 +854,13 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         }
     }
     #[cfg(not(feature = "hosted-dev"))]
-    crate::yarm_log!(
-        "ASID_SWITCH_WRITE_CR3_BEGIN asid={} cr3=0x{:x}",
-        asid.0,
-        cr3
-    );
+    if DEBUG_ASID_SWITCH {
+        crate::yarm_log!(
+            "ASID_SWITCH_WRITE_CR3_BEGIN asid={} cr3=0x{:x}",
+            asid.0,
+            cr3
+        );
+    }
     #[cfg(not(feature = "hosted-dev"))]
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
@@ -864,7 +883,7 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         );
     }
     #[cfg(not(feature = "hosted-dev"))]
-    {
+    if DEBUG_ASID_SWITCH {
         let mut active_cr3: u64 = 0;
         unsafe {
             core::arch::asm!(

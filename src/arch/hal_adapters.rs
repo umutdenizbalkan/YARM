@@ -6,6 +6,7 @@ use crate::kernel::vm::Asid;
 
 pub type AdapterTrapContext = crate::arch::trap_entry::ArchTrapContext;
 pub type AdapterTrapEvent = crate::arch::trap::TrapEvent;
+const DEBUG_ASID_SWITCH: bool = false;
 
 #[inline]
 pub fn switch_address_space(asid: Asid) {
@@ -31,20 +32,24 @@ pub fn switch_address_space(asid: Asid) {
                         options(nostack, preserves_flags)
                     );
                 }
-                crate::yarm_log!(
-                    "ADDRESS_SPACE_SWITCH_OK asid={} target_root=0x{:x} before=0x{:x} after=0x{:x}",
-                    asid.0,
-                    target_root,
-                    cr3_before,
-                    cr3_after
-                );
+                if DEBUG_ASID_SWITCH {
+                    crate::yarm_log!(
+                        "ADDRESS_SPACE_SWITCH_OK asid={} target_root=0x{:x} before=0x{:x} after=0x{:x}",
+                        asid.0,
+                        target_root,
+                        cr3_before,
+                        cr3_after
+                    );
+                }
             }
             #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
-            crate::yarm_log!(
-                "ADDRESS_SPACE_SWITCH_OK asid={} target_root=0x{:x}",
-                asid.0,
-                target_root
-            );
+            if DEBUG_ASID_SWITCH {
+                crate::yarm_log!(
+                    "ADDRESS_SPACE_SWITCH_OK asid={} target_root=0x{:x}",
+                    asid.0,
+                    target_root
+                );
+            }
         }
         Err(err) => {
             crate::yarm_log!("ADDRESS_SPACE_SWITCH_FAIL asid={} err={:?}", asid.0, err);

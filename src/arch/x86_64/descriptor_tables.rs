@@ -486,6 +486,44 @@ const fn should_halt_without_kernel_state(vector: usize) -> bool {
     vector < 32 && vector != VEC_SYSCALL
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn log_decoded_fatal_trap(
+    kernel: Option<&crate::kernel::boot::KernelState>,
+    vector: u64,
+    error_code: u64,
+    frame: &X86InterruptStackFrame,
+    fault_addr: u64,
+) {
+    let mut active_cr3 = 0u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nostack, preserves_flags));
+    }
+    let current_tid = kernel.and_then(|k| k.current_tid()).unwrap_or(0);
+    let current_asid = kernel
+        .and_then(|k| k.task_asid(current_tid))
+        .map(|asid| asid.0)
+        .unwrap_or(0);
+    crate::pr_err!(
+        "X86_FATAL_TRAP vector={} error=0x{:x} rip=0x{:016x} cs=0x{:x} rflags=0x{:x} rsp=0x{:016x} ss=0x{:x} cr2=0x{:016x} cr3=0x{:016x} tid={} asid={} cpl={}",
+        vector,
+        error_code,
+        frame.rip,
+        frame.cs,
+        frame.rflags,
+        frame.rsp,
+        frame.ss,
+        fault_addr,
+        active_cr3,
+        current_tid,
+        current_asid,
+        if (frame.cs & 0x3) == 0x3 {
+            "user"
+        } else {
+            "kernel"
+        }
+    );
+}
+
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 unsafe fn build_trap_frame_from_saved_regs(
     regs: *const X86SavedRegs,
@@ -610,10 +648,12 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         error_code,
         fault_addr,
     };
+    let frame = unsafe { &*interrupt_frame };
 
     let Some(kernel) = trap_kernel_state_mut() else {
         if should_halt_without_kernel_state(vector as usize) {
-            let fault_rip = unsafe { (*(interrupt_frame as *const X86InterruptStackFrameHeader)).rip };
+            let fault_rip = frame.rip;
+            log_decoded_fatal_trap(None, vector, error_code, frame, fault_addr);
             debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, fault_rip, cpu_apic);
             TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
             halt_forever();
@@ -621,7 +661,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
         return;
     };
-    let fault_rip = unsafe { (*(interrupt_frame as *const X86InterruptStackFrameHeader)).rip };
+    let fault_rip = frame.rip;
     let mut trap_frame = unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
     if let Err(err) = crate::arch::x86_64::trap::handle_trap_entry(
         kernel,
@@ -636,6 +676,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             fault_rip,
             err
         );
+        log_decoded_fatal_trap(Some(kernel), vector, error_code, frame, fault_addr);
         debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
         halt_forever();
     }
@@ -1109,12 +1150,11 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
         // the previous `& 0xFFFF_FFFF` truncations would have stripped the
         // canonical high bits and produced bogus IST/TSS pointers, so they
         // are removed here.
-        let ist_nmi_top =
-            core::ptr::addr_of!(IST_NMI.0) as u64 + IST_NMI_STACK_BYTES as u64;
-        let ist_df_top = core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64
-            + IST_DOUBLE_FAULT_STACK_BYTES as u64;
-        let ist_pf_top = core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64
-            + IST_PAGE_FAULT_STACK_BYTES as u64;
+        let ist_nmi_top = core::ptr::addr_of!(IST_NMI.0) as u64 + IST_NMI_STACK_BYTES as u64;
+        let ist_df_top =
+            core::ptr::addr_of!(IST_DOUBLE_FAULT.0) as u64 + IST_DOUBLE_FAULT_STACK_BYTES as u64;
+        let ist_pf_top =
+            core::ptr::addr_of!(IST_PAGE_FAULT.0) as u64 + IST_PAGE_FAULT_STACK_BYTES as u64;
         BOOT_TSS.rsp0 = rsp0;
         BOOT_TSS.ist1 = ist_nmi_top;
         BOOT_TSS.ist2 = ist_df_top;

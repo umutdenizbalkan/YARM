@@ -48,6 +48,7 @@ fn task_missing_with_site(site: &'static str, cpu: u8) -> KernelError {
 }
 
 const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
+const DEBUG_YIELD_LOG: bool = false;
 static DISPATCH_CONTEXT_LOAD_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl KernelState {
@@ -223,16 +224,11 @@ impl KernelState {
             let page_end = (seg_end + page_size - 1) & !(page_size - 1);
             let mut va = page_start;
             while va < page_end {
-                let combined_pflags = Self::load_page_elf_pflags(
-                    image,
-                    phoff,
-                    phentsize,
-                    phnum,
-                    va,
-                    va + page_size,
-                )?;
+                let combined_pflags =
+                    Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
                 let flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
-                let existing = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
+                let existing =
+                    crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
                 let phys = if let Some(entry) = existing {
                     entry.addr()
                 } else {
@@ -349,14 +345,8 @@ impl KernelState {
             let page_end = (seg_end + page_size - 1) & !(page_size - 1);
             let mut va = page_start;
             while va < page_end {
-                let combined_pflags = Self::load_page_elf_pflags(
-                    image,
-                    phoff,
-                    phentsize,
-                    phnum,
-                    va,
-                    va + page_size,
-                )?;
+                let combined_pflags =
+                    Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
                 let final_flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
                 let phys = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
                     .ok_or(KernelError::UserMemoryFault)?
@@ -586,9 +576,8 @@ impl KernelState {
         }
         let startup_slots_len = spec.startup_args.len();
         let startup_slots_bytes_len = startup_slots_len * core::mem::size_of::<u64>();
-        let startup_slots_start = (stack_top.0 as usize)
-            .saturating_sub(startup_slots_bytes_len)
-            & !0x7usize;
+        let startup_slots_start =
+            (stack_top.0 as usize).saturating_sub(startup_slots_bytes_len) & !0x7usize;
         let startup_stack_ptr = startup_slots_start & !0xFusize;
         let startup_slots_ptr = VirtAddr(startup_slots_start as u64);
         let mut startup_slots_bytes = [0u8; core::mem::size_of::<u64>() * 12];
@@ -597,7 +586,11 @@ impl KernelState {
             startup_slots_bytes[begin..begin + core::mem::size_of::<u64>()]
                 .copy_from_slice(&slot.to_le_bytes());
         }
-        self.copy_to_user(asid, startup_slots_ptr, &startup_slots_bytes[..startup_slots_bytes_len])?;
+        self.copy_to_user(
+            asid,
+            startup_slots_ptr,
+            &startup_slots_bytes[..startup_slots_bytes_len],
+        )?;
 
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
@@ -745,27 +738,31 @@ impl KernelState {
                     );
                     crate::kernel::boot::orchestrator_state::set_with_tcbs_probe(true);
                 }
-                let (task_ptr, kernel_context_ptr, frame_ptr, kernel_stack_top) = self.with_tcbs(|tcbs| {
-                    if lctx_bsp_tid1 {
-                        crate::yarm_log!("WX1 at first line inside with_tcbs closure entry tid={}", tid);
-                        crate::yarm_log!("LCTX1B after with_tcbs entry tid={}", tid);
-                    }
-                    tcbs.iter()
-                        .flatten()
-                        .find(|tcb| tcb.tid.0 == tid)
-                        .map(|tcb| {
-                            if lctx_bsp_tid1 {
-                                crate::yarm_log!("LCTX1C after slot lookup tid={}", tid);
-                            }
-                            (
-                                tcb as *const _ as usize,
-                                &tcb.kernel_context as *const _ as usize,
-                                &tcb.kernel_context.frame as *const _ as usize,
-                                tcb.kernel_context.stack_top.map(|top| top.0).unwrap_or(0),
-                            )
-                        })
-                        .unwrap_or((0, 0, 0, 0))
-                });
+                let (task_ptr, kernel_context_ptr, frame_ptr, kernel_stack_top) =
+                    self.with_tcbs(|tcbs| {
+                        if lctx_bsp_tid1 {
+                            crate::yarm_log!(
+                                "WX1 at first line inside with_tcbs closure entry tid={}",
+                                tid
+                            );
+                            crate::yarm_log!("LCTX1B after with_tcbs entry tid={}", tid);
+                        }
+                        tcbs.iter()
+                            .flatten()
+                            .find(|tcb| tcb.tid.0 == tid)
+                            .map(|tcb| {
+                                if lctx_bsp_tid1 {
+                                    crate::yarm_log!("LCTX1C after slot lookup tid={}", tid);
+                                }
+                                (
+                                    tcb as *const _ as usize,
+                                    &tcb.kernel_context as *const _ as usize,
+                                    &tcb.kernel_context.frame as *const _ as usize,
+                                    tcb.kernel_context.stack_top.map(|top| top.0).unwrap_or(0),
+                                )
+                            })
+                            .unwrap_or((0, 0, 0, 0))
+                    });
                 if lctx_bsp_tid1 {
                     crate::kernel::boot::orchestrator_state::set_with_tcbs_probe(false);
                 }
@@ -886,7 +883,7 @@ impl KernelState {
 
     pub fn yield_current(&mut self) -> Result<(), KernelError> {
         let outgoing_tid = self.current_tid();
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_YIELD_LOG {
             crate::yarm_log!("YARM_YIELD_BEGIN tid={:?}", outgoing_tid);
         }
         self.with_ipc_state_mut(|ipc| {
@@ -927,7 +924,7 @@ impl KernelState {
                 tcb.status = TaskStatus::Running;
                 Ok::<_, KernelError>(())
             })?;
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_YIELD_LOG {
                 let status = if outgoing_tid == Some(tid) {
                     "same-task"
                 } else {
@@ -936,14 +933,14 @@ impl KernelState {
                 crate::yarm_log!("YARM_YIELD_END status={} tid={}", status, tid);
             }
         } else {
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_YIELD_LOG {
                 crate::yarm_log!("YARM_YIELD_NO_OTHER_RUNNABLE");
             }
             if let Some(tid) = outgoing_tid {
                 let _ = self.enqueue_current_cpu(tid);
                 let redispatched = self.dispatch_next_task()?;
                 if redispatched == Some(tid) {
-                    if cfg!(not(feature = "hosted-dev")) {
+                    if cfg!(not(feature = "hosted-dev")) && DEBUG_YIELD_LOG {
                         crate::yarm_log!("YARM_YIELD_RETURN_SAME_TASK tid={}", tid);
                         crate::yarm_log!("YARM_YIELD_END status=same-task tid={}", tid);
                     }
