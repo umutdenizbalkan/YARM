@@ -651,6 +651,18 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     regs: *mut X86SavedRegs,
     interrupt_frame: *const X86InterruptStackFrame,
 ) {
+    let mut call_rsp = 0u64;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) call_rsp, options(nomem, preserves_flags));
+    }
+    if (call_rsp & 0xF) != 8 {
+        debug_uart_putc(b'!');
+        debug_uart_putc(b'A');
+        debug_uart_putc(b'L');
+        debug_uart_hex_u64(call_rsp);
+        debug_uart_putc(b'\n');
+        halt_forever();
+    }
     let cpu_apic = raw_current_apic_id() as u64;
     let previous_depth = TRAP_DISPATCH_DEPTH.fetch_add(1, Ordering::AcqRel);
     let frame = unsafe { &*interrupt_frame };
@@ -750,9 +762,10 @@ yarm_x86_common_trap_entry:
     mov rsi, qword ptr [rsp + 16 * 8]
     mov rdx, rsp
     lea rcx, [rsp + 17 * 8]
-    sub rsp, 8
+    mov r11, rsp
+    and rsp, -16
     call yarm_x86_dispatch_trap_from_stub
-    add rsp, 8
+    mov rsp, r11
 
     pop r15
     pop r14
@@ -823,9 +836,10 @@ yarm_x86_lstar_entry:
     xor rsi, rsi
     mov rdx, rsp
     lea rcx, [rsp + 120]
-    sub rsp, 8
+    mov r11, rsp
+    and rsp, -16
     call yarm_x86_dispatch_trap_from_stub
-    add rsp, 8
+    mov rsp, r11
 
     pop r15
     pop r14
