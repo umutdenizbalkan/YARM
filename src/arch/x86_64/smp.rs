@@ -39,6 +39,9 @@ const AP_STACK_TOP_BASE: u64 =
 const AP_READY_POLL_ITERS: usize = 2_000_000;
 const ICR_IDLE_POLL_ITERS: usize = 100_000;
 const AP_TRACE_OFFSET: usize = 0x80;
+#[allow(dead_code)]
+const AP_BREADCRUMB_MAP: &str =
+    "a=entry,b=post-lgdt,f=pre-PE,g=post-PE,h=post-pmode-jmp,c=pmode,i/j=pre/post-cr3,k/l=pre/post-PAE,m/n=pre/post-LME,o/p=pre/post-PG,q=post-lmode-jmp,e=pre-ap-entry-call";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -100,10 +103,14 @@ yarm_ap_trampoline_start:
     mov dx, 0x3F8
     mov al, 'b'
     out dx, al
+    mov al, 'f' // before CR0.PE write
+    out dx, al
 
     mov eax, cr0
     or eax, 1
     mov cr0, eax
+    mov al, 'g' // after CR0.PE write
+    out dx, al
     .byte 0xEA
         .word AP_TRAMPOLINE_BASE + (3f - yarm_ap_trampoline_start)
     .word 0x08
@@ -116,6 +123,9 @@ yarm_ap_trampoline_start:
 
     .code32
 3:
+    mov dx, 0x3F8
+    mov al, 'h' // immediately after pmode far jump
+    out dx, al
     mov ax, 0x18
     mov ds, ax
     mov es, ax
@@ -131,21 +141,38 @@ yarm_ap_trampoline_start:
     pop ebx
     sub ebx, AP_OFF_PM_L5
 
+    mov dx, 0x3F8
+    mov al, 'i' // before CR3 load
+    out dx, al
     mov eax, [ebx + AP_OFF_HANDOFF + 16]
     mov cr3, eax
+    mov al, 'j' // after CR3 load
+    out dx, al
 
+    mov al, 'k' // before CR4.PAE
+    out dx, al
     mov eax, cr4
     or eax, (1 << 5)
     mov cr4, eax
+    mov al, 'l' // after CR4.PAE
+    out dx, al
 
+    mov al, 'm' // before EFER.LME
+    out dx, al
     mov ecx, 0xC0000080
     rdmsr
     or eax, (1 << 8)
     wrmsr
+    mov al, 'n' // after EFER.LME
+    out dx, al
 
+    mov al, 'o' // before CR0.PG
+    out dx, al
     mov eax, cr0
     or eax, 0x80000000
     mov cr0, eax
+    mov al, 'p' // after CR0.PG
+    out dx, al
 
     // Diagnostic: AP enabled paging+long mode (still 32-bit instruction
     // semantics until the next far jump).
@@ -160,6 +187,9 @@ yarm_ap_trampoline_start:
 
     .code64
 6:
+    mov dx, 0x3F8
+    mov al, 'q' // immediately after long-mode far jump
+    out dx, al
     mov ax, 0x18
     mov ds, ax
     mov es, ax
@@ -209,6 +239,7 @@ unsafe extern "C" {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> ! {
+    crate::yarm_log!("YARM_SMP_AP_TRACE_MAP {}", AP_BREADCRUMB_MAP);
     let handoff = unsafe { &*handoff_ptr };
     crate::yarm_log!(
         "YARM_SMP_AP_ENTRY cpu={} magic=0x{:08x} stack_top=0x{:x} ready_ptr=0x{:x}",
