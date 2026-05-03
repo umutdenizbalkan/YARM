@@ -695,6 +695,30 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
         handoff.ready_flag_ptr,
         AP_TRAMPOLINE_PHYS
     );
+    #[cfg(all(not(test), not(feature = "hosted-dev")))]
+    {
+        let root = handoff.kernel_state_ptr & !0xfffu64;
+        let low_ok = crate::arch::x86_64::page_table::debug_root_maps_virt(
+            root,
+            crate::kernel::vm::VirtAddr(AP_TRAMPOLINE_PHYS as u64),
+        );
+        let stack_ok = crate::arch::x86_64::page_table::debug_root_maps_virt(
+            root,
+            crate::kernel::vm::VirtAddr(handoff.stack_top.saturating_sub(8)),
+        );
+        let entry_ok = crate::arch::x86_64::page_table::debug_root_maps_virt(
+            root,
+            crate::kernel::vm::VirtAddr(yarm_x86_64_ap_entry as usize as u64),
+        );
+        crate::yarm_log!(
+            "YARM_SMP_AP_CR3_MAP_CHECK cpu={} cr3=0x{:x} low7000={} ap_stack={} ap_entry={}",
+            cpu.0,
+            handoff.kernel_state_ptr,
+            low_ok as u8,
+            stack_ok as u8,
+            entry_ok as u8
+        );
+    }
     #[cfg(not(test))]
     crate::yarm_log!("YARM_SMP_AP_TRACE_MAP {}", AP_BREADCRUMB_MAP);
     with_trampoline_scratch(|page| {

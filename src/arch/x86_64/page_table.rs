@@ -406,6 +406,16 @@ fn resolve_page_in_root(root_phys: u64, virt: VirtAddr) -> Option<PageTableEntry
     entry.is_present().then_some(entry)
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn debug_root_maps_virt(root_phys: u64, virt: VirtAddr) -> bool {
+    resolve_page_in_root(root_phys & PAGE_MASK, virt).is_some()
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+pub fn debug_root_maps_virt(_root_phys: u64, _virt: VirtAddr) -> bool {
+    false
+}
+
 #[cfg(all(not(feature = "hosted-dev"), not(test)))]
 fn bootstrap_higher_half_alias(addr: u64) -> Option<u64> {
     if addr >= platform_layout::KERNEL_PHYS_DIRECT_MAP_BYTES {
