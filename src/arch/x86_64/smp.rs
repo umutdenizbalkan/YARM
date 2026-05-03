@@ -108,9 +108,11 @@ yarm_ap_trampoline_start:
         .word AP_TRAMPOLINE_BASE + (3f - yarm_ap_trampoline_start)
     .word 0x08
 
+    .set AP_GDT_BASE, AP_TRAMPOLINE_BASE + (ap_gdt - yarm_ap_trampoline_start)
+    .set AP_GDT_LIMIT, (ap_gdt_end - ap_gdt) - 1
 2:
-    .word 4f - 1
-    .long AP_TRAMPOLINE_BASE + (4f - yarm_ap_trampoline_start)
+    .word AP_GDT_LIMIT
+    .long AP_GDT_BASE
 
     .code32
 3:
@@ -151,8 +153,9 @@ yarm_ap_trampoline_start:
     mov al, 'd'
     out dx, al
 
+    .set AP_LM_ENTRY, AP_TRAMPOLINE_BASE + (6f - yarm_ap_trampoline_start)
     .byte 0xEA
-        .long AP_TRAMPOLINE_BASE + (6f - yarm_ap_trampoline_start)
+        .long AP_LM_ENTRY
     .word 0x10
 
     .code64
@@ -180,11 +183,12 @@ yarm_ap_trampoline_start:
     jmp 7b
 
     .align 8
-4:
+ap_gdt:
     .quad 0x0000000000000000
     .quad 0x00cf9a000000ffff
     .quad 0x00af9a000000ffff
     .quad 0x00cf92000000ffff
+ap_gdt_end:
 
     .align 8
 yarm_ap_trampoline_handoff:
