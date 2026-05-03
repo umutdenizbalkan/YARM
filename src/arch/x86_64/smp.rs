@@ -41,7 +41,7 @@ const ICR_IDLE_POLL_ITERS: usize = 100_000;
 const AP_TRACE_OFFSET: usize = 0x80;
 #[allow(dead_code)]
 const AP_BREADCRUMB_MAP: &str =
-    "a=entry,u=pre-lgdt,b=post-lgdt,f=pre-PE,g=post-PE,r=pre-ljmp,h=post-pmode-jmp,c=pmode,i/j=pre/post-cr3,k/l=pre/post-PAE,m/n=pre/post-LME,o/p=pre/post-PG,q=post-lmode-jmp,e=pre-ap-entry-call";
+    "a=entry,u=pre-lgdt,b/L=post-lgdt,f=pre-PE,g=post-PE,r=pre-ljmp,h=post-pmode-jmp,c=pmode,i/j=pre/post-cr3,k/l=pre/post-PAE,m/n=pre/post-LME,o/p=pre/post-PG,q=post-lmode-jmp,e=pre-ap-entry-call";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -104,6 +104,8 @@ yarm_ap_trampoline_start:
     // Diagnostic: AP loaded GDTR.
     mov dx, 0x3F8
     mov al, 'b'
+    out dx, al
+    mov al, 'L'
     out dx, al
     mov al, 'f' // before CR0.PE write
     out dx, al
@@ -435,6 +437,14 @@ fn log_trampoline_layout(page: &[u8; AP_TRAMPOLINE_SIZE]) {
                     base,
                     gdt_off,
                     &page[gdt_off..gdt_off + 32]
+                );
+                let g = &page[gdt_off..gdt_off + 32];
+                crate::yarm_log!(
+                    "YARM_SMP_TRAMPOLINE_GDT32 bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                    g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+                    g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15],
+                    g[16], g[17], g[18], g[19], g[20], g[21], g[22], g[23],
+                    g[24], g[25], g[26], g[27], g[28], g[29], g[30], g[31]
                 );
             }
         }
