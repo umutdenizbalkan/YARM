@@ -401,6 +401,52 @@ fn log_trampoline_head_bytes() {
     );
 }
 
+#[cfg(not(test))]
+fn log_trampoline_layout(page: &[u8; AP_TRAMPOLINE_SIZE]) {
+    let first_80 = &page[..0x80];
+    crate::yarm_log!(
+        "YARM_SMP_TRAMPOLINE_7000_7080 bytes={:02x?}",
+        first_80
+    );
+    if let Some(far_off) = page
+        .windows(5)
+        .position(|w| w[0] == 0xEA && w[3] == 0x08 && w[4] == 0x00)
+    {
+        let gdtr_off = far_off + 5;
+        if gdtr_off + 6 <= page.len() {
+            let limit = u16::from_le_bytes([page[gdtr_off], page[gdtr_off + 1]]);
+            let base = u32::from_le_bytes([
+                page[gdtr_off + 2],
+                page[gdtr_off + 3],
+                page[gdtr_off + 4],
+                page[gdtr_off + 5],
+            ]);
+            crate::yarm_log!(
+                "YARM_SMP_TRAMPOLINE_GDTR off=0x{:x} limit=0x{:x} base=0x{:x} bytes={:02x?}",
+                gdtr_off,
+                limit,
+                base,
+                &page[gdtr_off..gdtr_off + 6]
+            );
+            let gdt_off = (base as usize).saturating_sub(AP_TRAMPOLINE_PHYS);
+            if gdt_off + 32 <= page.len() {
+                crate::yarm_log!(
+                    "YARM_SMP_TRAMPOLINE_GDT base=0x{:x} off=0x{:x} bytes={:02x?}",
+                    base,
+                    gdt_off,
+                    &page[gdt_off..gdt_off + 32]
+                );
+            }
+        }
+        let end = core::cmp::min(far_off + 8, page.len());
+        crate::yarm_log!(
+            "YARM_SMP_TRAMPOLINE_FARJMP off=0x{:x} bytes={:02x?}",
+            far_off,
+            &page[far_off..end]
+        );
+    }
+}
+
 #[cfg(test)]
 struct TestTrampolinePage(core::cell::UnsafeCell<[u8; AP_TRAMPOLINE_SIZE]>);
 
@@ -578,6 +624,8 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
     );
     with_trampoline_scratch(|page| {
         encode_handoff(page, handoff);
+        #[cfg(not(test))]
+        log_trampoline_layout(page);
         #[cfg(not(test))]
         crate::yarm_log!(
             "YARM_SMP_TRAMPOLINE_SRC len={} first8={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
