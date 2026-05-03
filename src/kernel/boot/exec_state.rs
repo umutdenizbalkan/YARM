@@ -41,7 +41,7 @@ fn read_u64_le(image: &[u8], offset: usize) -> Result<u64, KernelError> {
 }
 
 fn task_missing_with_site(site: &'static str, cpu: u8) -> KernelError {
-    if cfg!(not(feature = "hosted-dev")) {
+    if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
         crate::yarm_log!("TASK_MISSING site={} cpu={}", site, cpu);
     }
     KernelError::TaskMissing
@@ -49,6 +49,7 @@ fn task_missing_with_site(site: &'static str, cpu: u8) -> KernelError {
 
 const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
 const DEBUG_YIELD_LOG: bool = false;
+const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
 static DISPATCH_CONTEXT_LOAD_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl KernelState {
@@ -57,7 +58,7 @@ impl KernelState {
         let write = (p_flags & PF_W) != 0;
         let execute = (p_flags & PF_X) != 0;
         if write && execute {
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("ELF_REJECT_WX_SEGMENT p_flags=0x{:x}", p_flags);
             }
             return Err(KernelError::WrongObject);
@@ -123,7 +124,7 @@ impl KernelState {
         image: &[u8],
     ) -> Result<(usize, usize), KernelError> {
         if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!(
                     "ELF_REJECT_HEADER len={} magic_ok={} class={}",
                     image.len(),
@@ -138,7 +139,7 @@ impl KernelState {
         let phentsize = read_u16_le(image, 54)? as usize;
         let phnum = read_u16_le(image, 56)? as usize;
         if phnum == 0 || phentsize < ELF64_PHDR_SIZE {
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!(
                     "ELF_REJECT_PH_TABLE phnum={} phentsize={}",
                     phnum,
@@ -154,7 +155,7 @@ impl KernelState {
             .checked_add(table_size)
             .ok_or(KernelError::WrongObject)?;
         if phend > image.len() {
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!(
                     "ELF_REJECT_PH_BOUNDS phoff={} phend={} len={}",
                     phoff,
@@ -188,7 +189,7 @@ impl KernelState {
                 max_loaded_end = seg_end;
             }
             if p_filesz > p_memsz {
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!(
                         "ELF_REJECT_SEG_SIZE idx={} filesz={} memsz={}",
                         idx,
@@ -202,7 +203,7 @@ impl KernelState {
                 .checked_add(p_filesz)
                 .ok_or(KernelError::WrongObject)?;
             if file_end > image.len() {
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!(
                         "ELF_REJECT_FILE_BOUNDS idx={} offset={} filesz={} end={} len={}",
                         idx,
@@ -234,7 +235,7 @@ impl KernelState {
                 } else {
                     alloc_pt_frame().map_err(|_| KernelError::MemoryObjectFull)?
                 };
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!(
                         "ELF_MAP_PAGE_BEGIN asid={} seg_vbase=0x{:x} page_va=0x{:x} phys=0x{:x} memsz={} filesz={} overlap={} pflags=0x{:x}",
                         asid.0,
@@ -248,7 +249,7 @@ impl KernelState {
                     );
                 }
                 let stage_flags = Self::staging_page_flags_from_final(flags);
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!(
                         "ELF_MAP_PAGE_STAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
                         asid.0,
@@ -270,7 +271,7 @@ impl KernelState {
                 let post_map_present =
                     crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
                         .is_some();
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!(
                         "ELF_MAP_PAGE_DONE asid={} page_va=0x{:x} post_resolve={} final_r={} final_w={} final_x={} final_u={}",
                         asid.0,
@@ -294,7 +295,7 @@ impl KernelState {
                     }
                 }
                 if !post_map_present {
-                    if cfg!(not(feature = "hosted-dev")) {
+                    if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                         crate::yarm_log!(
                             "ELF_MAP_PAGE_INVARIANT_FAIL asid={} page_va=0x{:x} phys=0x{:x}",
                             asid.0,
@@ -322,7 +323,7 @@ impl KernelState {
             }
         }
         if !saw_pt_load {
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("ELF_REJECT_NO_PT_LOAD");
             }
             return Err(KernelError::WrongObject);
@@ -351,7 +352,7 @@ impl KernelState {
                 let phys = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
                     .ok_or(KernelError::UserMemoryFault)?
                     .addr();
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!(
                         "ELF_FINALIZE_PAGE_PERMS asid={} page_va=0x{:x} r={} w={} x={} u={}",
                         asid.0,
@@ -522,7 +523,7 @@ impl KernelState {
             return Err(KernelError::UserMemoryFault);
         }
 
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "FIRST_USER_CREATE_BEGIN cpu={} tid={} asid={} entry=0x{:x}",
                 cpu.0,
@@ -536,7 +537,7 @@ impl KernelState {
             "spawn_user_task_from_image/task_cnode",
             cpu.0,
         ))?;
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "FIRST_USER_LOOKUP cpu={} tid={} cnode={} status=found",
                 cpu.0,
@@ -557,19 +558,19 @@ impl KernelState {
             tcb.asid = Some(asid);
             Ok::<_, KernelError>(())
         })?;
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
         }
         let stack_top = match self.allocate_user_stack_with_guard(spec.tid, 64) {
             Ok(top) => top,
             Err(err) => {
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
                 }
                 return Err(err);
             }
         };
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation");
             crate::yarm_log!("BOOTSTRAP_STAGE: before entry setup");
             crate::yarm_log!("USER_ENTRY rip=0x{:x}", spec.entry);
@@ -628,7 +629,7 @@ impl KernelState {
         })?;
         let bootstrap_cpu = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
         let should_pin = spec.tid == BOOTSTRAP_FIRST_USER_TID;
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "FIRST_USER_ENQUEUE_DECISION cpu={} tid={} chosen_cpu={} reason={}",
                 cpu.0,
@@ -644,7 +645,7 @@ impl KernelState {
 
         let enqueued_cpu = if should_pin {
             let chosen_cpu = bootstrap_cpu;
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!(
                     "FINAL_FIRST_USER_ENQUEUE_SITE cpu={} tid={} chosen_cpu={} bootstrap_pin={}",
                     cpu.0,
@@ -654,7 +655,7 @@ impl KernelState {
                 );
             }
             if chosen_cpu != bootstrap_cpu {
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!(
                         "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
                         cpu.0,
@@ -669,7 +670,7 @@ impl KernelState {
         } else {
             self.enqueue_task(spec.tid)?
         };
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "FIRST_USER_ENQUEUE cpu={} tid={} target_cpu={} status=ok",
                 cpu.0,
@@ -686,7 +687,7 @@ impl KernelState {
     }
 
     pub(crate) fn dispatch_next_task(&mut self) -> Result<Option<u64>, KernelError> {
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("DISPATCH: begin");
         }
         self.with_ipc_state_mut(|ipc| {
@@ -696,7 +697,7 @@ impl KernelState {
         let outgoing_tid = self.current_tid();
         let next = self.dispatch_next_current_cpu();
         if let Some(tid) = next {
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("DISPATCH: selected_tid={}", tid);
             }
             let incoming_asid = self.task_asid(tid);
@@ -706,18 +707,18 @@ impl KernelState {
                 {
                     crate::yarm_log!("BSP_BEFORE_ASPACE_SWITCH tid={}", tid);
                 }
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!("DISPATCH: before switch_address_space asid={}", asid.0);
                 }
                 self.hal.switch_address_space(asid);
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!("DISPATCH: after switch_address_space asid={}", asid.0);
                     if self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
                         crate::yarm_log!("BSP_AFTER_ASPACE_SWITCH tid={}", tid);
                     }
                 }
             }
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 let lctx_bsp_tid1 = tid == BOOTSTRAP_FIRST_USER_TID
                     && self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
                 if lctx_bsp_tid1 {
@@ -799,7 +800,7 @@ impl KernelState {
             if tid == BOOTSTRAP_FIRST_USER_TID
                 && current_cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID
             {
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!(
                         "TASK_CPU_OWNERSHIP_VIOLATION cpu={} tid={}",
                         current_cpu.0,
@@ -868,10 +869,10 @@ impl KernelState {
                 tcb.status = TaskStatus::Running;
                 Ok::<_, KernelError>(())
             })?;
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("DISPATCH: task_running tid={}", tid);
             }
-        } else if cfg!(not(feature = "hosted-dev")) {
+        } else if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("DISPATCH: no_runnable_task");
         }
         Ok(next)

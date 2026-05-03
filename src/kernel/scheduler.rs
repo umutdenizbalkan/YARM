@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
 use crate::arch::{platform_constants, topology};
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::topology::CpuTopology;
@@ -386,7 +387,7 @@ impl SmpScheduler {
         priority: TaskPriority,
     ) -> Result<(), SchedulerError> {
         let idx = self.check_online_cpu(cpu)?;
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "ENQUEUE_QUEUE_INDEX tid={} requested_cpu={} queue_index={}",
                 tid.0,
@@ -397,7 +398,7 @@ impl SmpScheduler {
         self.schedulers[idx]
             .enqueue_with_priority(tid, priority)
             .map(|_| {
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!("ENQUEUE_COMMIT tid={} queue_cpu={}", tid.0, cpu.0);
                 }
             })
@@ -423,7 +424,7 @@ impl SmpScheduler {
         let idx = self.check_online_cpu(cpu).ok()?;
         let idle_tid = self.schedulers[idx].current_tid().unwrap_or(ThreadId(0));
         let runq_len = self.schedulers[idx].runnable_count();
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "SCHED cpu={} idle_tid={} runq_len={}",
                 cpu.0,
@@ -432,7 +433,7 @@ impl SmpScheduler {
             );
         }
         let final_tid = self.schedulers[idx].dispatch_next();
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("SCHED cpu={} final_tid={:?}", cpu.0, final_tid);
         }
         final_tid

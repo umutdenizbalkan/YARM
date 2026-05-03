@@ -38,6 +38,7 @@ const AP_STACK_TOP_BASE: u64 =
     crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE + AP_STACK_PHYS_BASE;
 const AP_READY_POLL_ITERS: usize = 2_000_000;
 const ICR_IDLE_POLL_ITERS: usize = 100_000;
+const AP_TRACE_OFFSET: usize = 0x80;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -62,9 +63,11 @@ global_asm!(
     .set AP_OFF_GDTR, 2f - yarm_ap_trampoline_start
     .set AP_OFF_PM_L5, 5f - yarm_ap_trampoline_start
     .set AP_OFF_HANDOFF, yarm_ap_trampoline_handoff - yarm_ap_trampoline_start
+    .set AP_OFF_TRACE, 0x80
 
 yarm_ap_trampoline_start:
     cli
+    mov dword ptr cs:[AP_OFF_TRACE], 0x31504159 // "YAP1"
     mov ax, cs
     mov ds, ax
     mov es, ax
@@ -78,6 +81,7 @@ yarm_ap_trampoline_start:
     mov dx, 0x3F8
     mov al, 'a'
     out dx, al
+    mov dword ptr cs:[AP_OFF_TRACE], 0x32504159 // "YAP2"
 
     call 1f
 1:
@@ -90,6 +94,7 @@ yarm_ap_trampoline_start:
     // at 0x0700 (base 0x7000), so the operand resolves to the real
     // location of the descriptor.
     cs lgdt [si + AP_OFF_GDTR]
+    mov dword ptr cs:[AP_OFF_TRACE], 0x33504159 // "YAP3"
 
     // Diagnostic: AP loaded GDTR.
     mov dx, 0x3F8
@@ -299,6 +304,11 @@ fn write_trampoline_page(page: &[u8; AP_TRAMPOLINE_SIZE]) {
             AP_TRAMPOLINE_SIZE,
         );
     }
+}
+
+#[cfg(not(test))]
+fn trampoline_trace_word() -> u32 {
+    unsafe { read_volatile((AP_TRAMPOLINE_PHYS + AP_TRACE_OFFSET) as *const u32) }
 }
 
 #[cfg(test)]
@@ -533,9 +543,10 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             }
         } else {
             crate::yarm_log!(
-                "YARM_SMP_AP_TIMEOUT cpu={} trampoline=0x{:x}",
+                "YARM_SMP_AP_TIMEOUT cpu={} trampoline=0x{:x} trace=0x{:08x}",
                 cpu.0,
-                AP_TRAMPOLINE_PHYS
+                AP_TRAMPOLINE_PHYS,
+                trampoline_trace_word()
             );
         }
     }

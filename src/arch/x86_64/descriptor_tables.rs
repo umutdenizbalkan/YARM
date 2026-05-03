@@ -522,6 +522,21 @@ fn log_decoded_fatal_trap(
             "kernel"
         }
     );
+    crate::yarm_log!(
+        "X86_FATAL_TRAP vector={} error=0x{:x} rip=0x{:016x} cs=0x{:x} rflags=0x{:x} rsp=0x{:016x} ss=0x{:x} cr2=0x{:016x} cr3=0x{:016x} tid={} asid={} cpl={}",
+        vector,
+        error_code,
+        frame.rip,
+        frame.cs,
+        frame.rflags,
+        frame.rsp,
+        frame.ss,
+        fault_addr,
+        active_cr3,
+        current_tid,
+        current_asid,
+        if (frame.cs & 0x3) == 0x3 { "user" } else { "kernel" }
+    );
 }
 
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]

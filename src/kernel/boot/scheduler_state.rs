@@ -18,6 +18,7 @@ fn map_smp_error(err: SmpError) -> KernelError {
 }
 
 const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
+const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
 
 impl KernelState {
     pub fn bring_up_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
@@ -76,7 +77,7 @@ impl KernelState {
         let next = kernel_mut(&mut sched.scheduler)
             .dispatch_next_on(cpu)
             .map(|tid| tid.0);
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("DISPATCH_NEXT cpu={} result_tid={:?}", cpu.0, next);
         }
         next
@@ -182,7 +183,7 @@ impl KernelState {
             kernel_mut(&mut sched.scheduler)
                 .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
                 .map_err(map_scheduler_error)?;
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
             }
             Ok(cpu)
@@ -190,7 +191,7 @@ impl KernelState {
             let cpu = kernel_mut(&mut sched.scheduler)
                 .enqueue_balanced(ThreadId(tid), priority)
                 .map_err(map_scheduler_error)?;
-            if cfg!(not(feature = "hosted-dev")) {
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
             }
             Ok(cpu)
@@ -200,7 +201,7 @@ impl KernelState {
     pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
         let priority = self.task_priority(tid)?;
         let current_cpu = self.current_cpu();
-        if cfg!(not(feature = "hosted-dev")) {
+        if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "ENQUEUE_CALL cpu_current={} cpu_target={} tid={}",
                 current_cpu.0,
