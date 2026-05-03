@@ -750,10 +750,10 @@ yarm_x86_common_trap_entry:
     mov rsi, qword ptr [rsp + 16 * 8]
     mov rdx, rsp
     lea rcx, [rsp + 17 * 8]
-    mov r11, rsp
+    mov r12, rsp
     and rsp, -16
     call yarm_x86_dispatch_trap_from_stub
-    mov rsp, r11
+    mov rsp, r12
 
     pop r15
     pop r14
@@ -824,10 +824,10 @@ yarm_x86_lstar_entry:
     xor rsi, rsi
     mov rdx, rsp
     lea rcx, [rsp + 120]
-    mov r11, rsp
+    mov r12, rsp
     and rsp, -16
     call yarm_x86_dispatch_trap_from_stub
-    mov rsp, r11
+    mov rsp, r12
 
     pop r15
     pop r14
