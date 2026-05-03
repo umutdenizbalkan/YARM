@@ -77,6 +77,10 @@ yarm_ap_trampoline_start:
     xor ax, ax
     mov ss, ax
     mov sp, 0x7c00
+    mov dx, 0x3F8
+    mov al, 's' // stack initialized
+    out dx, al
+    mov word ptr cs:[AP_OFF_TRACE + 4], sp
 
     // Diagnostic: AP reached real mode, write 'a' to UART (uses no
     // segments other than implicit string default; out instruction
@@ -411,11 +415,15 @@ fn log_trampoline_layout(page: &[u8; AP_TRAMPOLINE_SIZE]) {
         "YARM_SMP_TRAMPOLINE_7000_7080 bytes={:02x?}",
         first_80
     );
-    if let Some(far_off) = page
+    let far16 = page
         .windows(5)
-        .position(|w| w[0] == 0xEA && w[3] == 0x08 && w[4] == 0x00)
-    {
-        let gdtr_off = far_off + 5;
+        .position(|w| w[0] == 0xEA && w[3] == 0x08 && w[4] == 0x00);
+    let far32 = page
+        .windows(8)
+        .position(|w| w[0] == 0x66 && w[1] == 0xEA && w[6] == 0x08 && w[7] == 0x00);
+    if let Some(far_off) = far16.or(far32) {
+        let is_32 = far32 == Some(far_off);
+        let gdtr_off = if is_32 { far_off + 8 } else { far_off + 5 };
         if gdtr_off + 6 <= page.len() {
             let limit = u16::from_le_bytes([page[gdtr_off], page[gdtr_off + 1]]);
             let base = u32::from_le_bytes([
@@ -455,13 +463,17 @@ fn log_trampoline_layout(page: &[u8; AP_TRAMPOLINE_SIZE]) {
             far_off,
             &page[far_off..end]
         );
-        if end >= far_off + 8 {
-            let pm_entry_off = u32::from_le_bytes([
+        let pm_entry_off = if is_32 {
+            u32::from_le_bytes([
                 page[far_off + 2],
                 page[far_off + 3],
                 page[far_off + 4],
                 page[far_off + 5],
-            ]) as usize;
+            ]) as usize
+        } else {
+            u16::from_le_bytes([page[far_off + 1], page[far_off + 2]]) as usize
+        };
+        if pm_entry_off + 16 <= page.len() {
             if pm_entry_off + 16 <= page.len() {
                 crate::yarm_log!(
                     "YARM_SMP_TRAMPOLINE_PM_ENTRY off=0x{:x} bytes={:02x?}",
@@ -470,6 +482,8 @@ fn log_trampoline_layout(page: &[u8; AP_TRAMPOLINE_SIZE]) {
                 );
             }
         }
+    } else {
+        crate::yarm_log!("YARM_SMP_TRAMPOLINE_FARJMP off=<none> bytes=<none>");
     }
 }
 
