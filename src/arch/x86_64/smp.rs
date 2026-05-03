@@ -91,8 +91,8 @@ yarm_ap_trampoline_start:
 
     mov al, 'u' // before lgdt
     out dx, al
-    .set AP_GDTR_RUNTIME, AP_TRAMPOLINE_BASE + (ap_gdtr - yarm_ap_trampoline_start)
-    lgdt cs:[AP_GDTR_RUNTIME]
+    .set AP_GDTR_OFF, ap_gdtr - yarm_ap_trampoline_start
+    lgdt cs:[AP_GDTR_OFF]
     mov dword ptr cs:[AP_OFF_TRACE], 0x33504159 // "YAP3"
 
     // Diagnostic: AP loaded GDTR.
