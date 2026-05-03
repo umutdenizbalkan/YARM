@@ -38,7 +38,7 @@ const AP_STACK_TOP_BASE: u64 =
     crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE + AP_STACK_PHYS_BASE;
 const AP_READY_POLL_ITERS: usize = 2_000_000;
 const ICR_IDLE_POLL_ITERS: usize = 100_000;
-const AP_TRACE_OFFSET: usize = 0x80;
+const AP_TRACE_OFFSET: usize = 0x200;
 #[allow(dead_code)]
 const AP_BREADCRUMB_MAP: &str =
     "a=entry,u=pre-lgdt,b/L=post-lgdt,f=pre-PE,g=post-PE,r=pre-ljmp,h=post-pmode-jmp,c=pmode,i/j=pre/post-cr3,k/l=pre/post-PAE,m/n=pre/post-LME,o/p=pre/post-PG,q=post-lmode-jmp,e=pre-ap-entry-call";
@@ -62,8 +62,7 @@ global_asm!(
     .global yarm_ap_trampoline_handoff
     .code16
     .set AP_TRAMPOLINE_BASE, 0x7000
-    .set AP_OFF_REAL_L1, 1f - yarm_ap_trampoline_start
-    .set AP_OFF_GDTR, 2f - yarm_ap_trampoline_start
+    .set AP_OFF_GDTR, ap_gdtr - yarm_ap_trampoline_start
     .set AP_OFF_PM_L5, 5f - yarm_ap_trampoline_start
     .set AP_OFF_HANDOFF, yarm_ap_trampoline_handoff - yarm_ap_trampoline_start
     .set AP_OFF_TRACE, 0x80
@@ -89,13 +88,10 @@ yarm_ap_trampoline_start:
     out dx, al
     mov dword ptr cs:[AP_OFF_TRACE], 0x32504159 // "YAP2"
 
-    call 1f
-1:
-    pop si
-    sub si, AP_OFF_REAL_L1
     mov al, 'u' // before lgdt
     out dx, al
-    lgdt [si + AP_OFF_GDTR]
+    .set AP_GDTR_RUNTIME, AP_TRAMPOLINE_BASE + (ap_gdtr - yarm_ap_trampoline_start)
+    lgdt cs:[AP_GDTR_RUNTIME]
     mov dword ptr cs:[AP_OFF_TRACE], 0x33504159 // "YAP3"
 
     // Diagnostic: AP loaded GDTR.
@@ -122,7 +118,7 @@ yarm_ap_trampoline_start:
 
     .set AP_GDT_BASE, AP_TRAMPOLINE_BASE + (ap_gdt - yarm_ap_trampoline_start)
     .set AP_GDT_LIMIT, (ap_gdt_end - ap_gdt) - 1
-2:
+ap_gdtr:
     .word AP_GDT_LIMIT
     .long AP_GDT_BASE
 
