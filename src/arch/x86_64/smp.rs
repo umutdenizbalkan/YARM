@@ -42,7 +42,7 @@ const ICR_IDLE_POLL_ITERS: usize = 100_000;
 const AP_TRACE_OFFSET: usize = 0x200;
 #[allow(dead_code)]
 const AP_BREADCRUMB_MAP: &str =
-    "s=stack-init,a=entry,u=pre-lgdt,b/L=post-lgdt,f=pre-PE,g=post-PE,r=pre-ljmp,h=post-pmode-jmp,c=pmode,i/j=pre/post-cr3,k/l=pre/post-PAE,m/n=pre/post-LME,o/p=pre/post-PG,q=post-lmode-jmp,v=pre-handoff-read,w=post-rsp-load,e=pre-ap-entry-call,z=ap-entry-first-instr";
+    "s=stack-init,a=entry,u=pre-lgdt,b/L=post-lgdt,f=pre-PE,g=post-PE,r=pre-ljmp,h=post-pmode-jmp,c=pmode,i/j=pre/post-cr3,k/l=pre/post-PAE,m=pre-LME,n=post-LME,o=pre-PG,p=post-PG,x=pre-lmode-jmp,q=post-lmode-jmp,v=pre-handoff-read,w=post-rsp-load,e=pre-ap-entry-call,z=ap-entry-first-instr";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -148,14 +148,18 @@ ap_gdtr:
     out dx, al
     mov eax, [ebx + AP_OFF_HANDOFF + 16]
     mov cr3, eax
+    mov dword ptr [ebx + AP_OFF_TRACE + 8], eax
     mov al, 'j' // after CR3 load
     out dx, al
 
     mov al, 'k' // before CR4.PAE
     out dx, al
     mov eax, cr4
+    mov dword ptr [ebx + AP_OFF_TRACE + 12], eax
     or eax, (1 << 5)
     mov cr4, eax
+    mov eax, cr4
+    mov dword ptr [ebx + AP_OFF_TRACE + 16], eax
     mov al, 'l' // after CR4.PAE
     out dx, al
 
@@ -163,8 +167,13 @@ ap_gdtr:
     out dx, al
     mov ecx, 0xC0000080
     rdmsr
+    mov dword ptr [ebx + AP_OFF_TRACE + 20], eax
+    mov dword ptr [ebx + AP_OFF_TRACE + 24], edx
     or eax, (1 << 8)
     wrmsr
+    rdmsr
+    mov dword ptr [ebx + AP_OFF_TRACE + 28], eax
+    mov dword ptr [ebx + AP_OFF_TRACE + 32], edx
     mov al, 'n' // after EFER.LME
     out dx, al
 
@@ -183,6 +192,8 @@ ap_gdtr:
     out dx, al
 
     .set AP_LM_ENTRY, AP_TRAMPOLINE_BASE + (6f - yarm_ap_trampoline_start)
+    mov al, 'x' // immediately before long-mode far jump
+    out dx, al
     .byte 0xEA
         .long AP_LM_ENTRY
     .word 0x18
@@ -398,6 +409,14 @@ fn trampoline_trace_word() -> u32 {
 }
 
 #[cfg(not(test))]
+fn trampoline_trace_dword(offset: usize) -> u32 {
+    let trampoline_virt =
+        (crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE + AP_TRAMPOLINE_PHYS as u64)
+            as usize;
+    unsafe { read_volatile((trampoline_virt + AP_TRACE_OFFSET + offset) as *const u32) }
+}
+
+#[cfg(not(test))]
 fn log_trampoline_head_bytes() {
     let mut b = [0u8; 16];
     for (i, slot) in b.iter_mut().enumerate() {
@@ -488,6 +507,16 @@ fn log_trampoline_layout(page: &[u8; AP_TRAMPOLINE_SIZE]) {
         }
     } else {
         crate::yarm_log!("YARM_SMP_TRAMPOLINE_FARJMP off=<none> bytes=<none>");
+    }
+    if let Some(lm_off) = page
+        .windows(7)
+        .position(|w| w[0] == 0xEA && w[5] == 0x18 && w[6] == 0x00)
+    {
+        crate::yarm_log!(
+            "YARM_SMP_TRAMPOLINE_LM_FARJMP off=0x{:x} sel=0x0018 bytes={:02x?}",
+            lm_off,
+            &page[lm_off..core::cmp::min(lm_off + 8, page.len())]
+        );
     }
 }
 
@@ -735,10 +764,17 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             }
         } else {
             crate::yarm_log!(
-                "YARM_SMP_AP_TIMEOUT cpu={} trampoline=0x{:x} trace=0x{:08x}",
+                "YARM_SMP_AP_TIMEOUT cpu={} trampoline=0x{:x} trace=0x{:08x} cr3=0x{:08x} cr4_pre=0x{:08x} cr4_post=0x{:08x} efer_lo_pre=0x{:08x} efer_hi_pre=0x{:08x} efer_lo_post=0x{:08x} efer_hi_post=0x{:08x}",
                 cpu.0,
                 AP_TRAMPOLINE_PHYS,
-                trampoline_trace_word()
+                trampoline_trace_word(),
+                trampoline_trace_dword(8),
+                trampoline_trace_dword(12),
+                trampoline_trace_dword(16),
+                trampoline_trace_dword(20),
+                trampoline_trace_dword(24),
+                trampoline_trace_dword(28),
+                trampoline_trace_dword(32)
             );
         }
     }
