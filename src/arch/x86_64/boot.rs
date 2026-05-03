@@ -789,7 +789,7 @@ struct PvhStartInfo {
 #[derive(Clone, Copy)]
 struct PvhModule {
     paddr_start: u64,
-    paddr_end: u64,
+    size: u64,
     cmdline_paddr: u64,
     _reserved: u64,
 }
@@ -824,6 +824,16 @@ fn read_pvh_module_summary(start_info_ptr: usize) -> Option<PvhModuleSummary> {
         return None;
     }
     let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+    crate::yarm_log!(
+        "YARM_BOOT_PVH_START_INFO ptr=0x{:x} magic=0x{:x} version={} flags=0x{:x} nr_modules={} modlist_paddr=0x{:x} cmdline_paddr=0x{:x}",
+        start_info_ptr,
+        start_info._magic,
+        start_info._version,
+        start_info._flags,
+        start_info.nr_modules,
+        start_info.modlist_paddr,
+        start_info.cmdline_paddr
+    );
     if start_info._magic != PVH_MAGIC {
         return None;
     }
@@ -841,13 +851,40 @@ fn read_pvh_module_summary(start_info_ptr: usize) -> Option<PvhModuleSummary> {
     for idx in 0..module_count {
         let module_ptr = modlist_ptr.wrapping_add(idx);
         let module = unsafe { core::ptr::read_unaligned(module_ptr) };
-        if module.paddr_start == 0 || module.paddr_end <= module.paddr_start {
+        crate::yarm_log!(
+            "YARM_BOOT_PVH_MODULE idx={} start=0x{:x} size=0x{:x} end=0x{:x} cmdline_paddr=0x{:x}",
+            idx,
+            module.paddr_start,
+            module.size,
+            module.paddr_start.saturating_add(module.size),
+            module.cmdline_paddr
+        );
+        if module.cmdline_paddr != 0 {
+            let cmdline_ptr = (crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE
+                .saturating_add(module.cmdline_paddr)) as *const u8;
+            let mut len = 0usize;
+            while len < 96 {
+                let b = unsafe { core::ptr::read_volatile(cmdline_ptr.add(len)) };
+                if b == 0 {
+                    break;
+                }
+                len += 1;
+            }
+            if len > 0 {
+                let raw = unsafe { core::slice::from_raw_parts(cmdline_ptr, len) };
+                if let Ok(text) = core::str::from_utf8(raw) {
+                    crate::yarm_log!("YARM_BOOT_PVH_MODULE_CMDLINE idx={} text={}", idx, text);
+                }
+            }
+        }
+        if module.paddr_start == 0 || module.size == 0 {
             continue;
         }
+        let module_end = module.paddr_start.saturating_add(module.size);
         if initramfs.is_none() {
             initramfs = Some(PvhModuleWindow {
                 start: module.paddr_start,
-                end: module.paddr_end,
+                end: module_end,
             });
         }
     }
