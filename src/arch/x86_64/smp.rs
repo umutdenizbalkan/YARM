@@ -41,7 +41,7 @@ const ICR_IDLE_POLL_ITERS: usize = 100_000;
 const AP_TRACE_OFFSET: usize = 0x80;
 #[allow(dead_code)]
 const AP_BREADCRUMB_MAP: &str =
-    "a=entry,b=post-lgdt,f=pre-PE,g=post-PE,h=post-pmode-jmp,c=pmode,i/j=pre/post-cr3,k/l=pre/post-PAE,m/n=pre/post-LME,o/p=pre/post-PG,q=post-lmode-jmp,e=pre-ap-entry-call";
+    "a=entry,u=pre-lgdt,b=post-lgdt,f=pre-PE,g=post-PE,r=pre-ljmp,h=post-pmode-jmp,c=pmode,i/j=pre/post-cr3,k/l=pre/post-PAE,m/n=pre/post-LME,o/p=pre/post-PG,q=post-lmode-jmp,e=pre-ap-entry-call";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -76,7 +76,7 @@ yarm_ap_trampoline_start:
     mov es, ax
     xor ax, ax
     mov ss, ax
-    mov sp, 0x6ff0
+    mov sp, 0x7c00
 
     // Diagnostic: AP reached real mode, write 'a' to UART (uses no
     // segments other than implicit string default; out instruction
@@ -96,6 +96,8 @@ yarm_ap_trampoline_start:
     // Force the segment override to CS, which the SIPI vector left
     // at 0x0700 (base 0x7000), so the operand resolves to the real
     // location of the descriptor.
+    mov al, 'u' // before lgdt
+    out dx, al
     cs lgdt [si + AP_OFF_GDTR]
     mov dword ptr cs:[AP_OFF_TRACE], 0x33504159 // "YAP3"
 
@@ -111,9 +113,10 @@ yarm_ap_trampoline_start:
     mov cr0, eax
     mov al, 'g' // after CR0.PE write
     out dx, al
-    .byte 0xEA
-        .word AP_TRAMPOLINE_BASE + (3f - yarm_ap_trampoline_start)
-    .word 0x08
+    mov al, 'r' // immediately before far jump to pmode
+    out dx, al
+    .set AP_PM_ENTRY, AP_TRAMPOLINE_BASE + (3f - yarm_ap_trampoline_start)
+    ljmp $0x08, $AP_PM_ENTRY
 
     .set AP_GDT_BASE, AP_TRAMPOLINE_BASE + (ap_gdt - yarm_ap_trampoline_start)
     .set AP_GDT_LIMIT, (ap_gdt_end - ap_gdt) - 1
