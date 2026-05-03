@@ -53,7 +53,7 @@ struct ApHandoff {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 global_asm!(
     r#"
-    .section .text.ap_trampoline_src,"ax",@progbits
+    .section .text.ap_trampoline,"ax",@progbits
     .global yarm_ap_trampoline_start
     .global yarm_ap_trampoline_end
     .global yarm_ap_trampoline_handoff
@@ -264,9 +264,18 @@ fn encode_handoff(page: &mut [u8; AP_TRAMPOLINE_SIZE], handoff: ApHandoff) {
     page.fill(0);
     #[cfg(all(not(test), not(feature = "hosted-dev")))]
     unsafe {
-        let start = &yarm_ap_trampoline_start as *const u8;
-        let end = &yarm_ap_trampoline_end as *const u8;
-        let handoff_ptr = &yarm_ap_trampoline_handoff as *const u8;
+        let mut start = &yarm_ap_trampoline_start as *const u8 as usize;
+        let mut end = &yarm_ap_trampoline_end as *const u8 as usize;
+        let mut handoff_ptr = &yarm_ap_trampoline_handoff as *const u8 as usize;
+        if start < crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE as usize {
+            let base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE as usize;
+            start = start.saturating_add(base);
+            end = end.saturating_add(base);
+            handoff_ptr = handoff_ptr.saturating_add(base);
+        }
+        let start = start as *const u8;
+        let end = end as *const u8;
+        let handoff_ptr = handoff_ptr as *const u8;
         let len = end.offset_from(start) as usize;
         #[cfg(not(test))]
         crate::yarm_log!(
