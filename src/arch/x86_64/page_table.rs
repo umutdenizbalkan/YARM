@@ -866,23 +866,6 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
     }
     #[cfg(not(feature = "hosted-dev"))]
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3f8",
-            "mov al, {ch}",
-            "out dx, al",
-            ch = const b'C',
-            options(nomem, nostack, preserves_flags)
-        );
-        core::arch::asm!(
-            "mov dx, 0x3f8",
-            "mov al, {ch}",
-            "out dx, al",
-            ch = const b'D',
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    #[cfg(not(feature = "hosted-dev"))]
     if DEBUG_ASID_SWITCH {
         let mut active_cr3: u64 = 0;
         unsafe {

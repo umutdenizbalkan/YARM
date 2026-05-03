@@ -703,6 +703,7 @@ impl KernelState {
             let incoming_asid = self.task_asid(tid);
             if let Some(asid) = incoming_asid {
                 if cfg!(not(feature = "hosted-dev"))
+                    && DEBUG_DISPATCH_CONTEXT_LOG
                     && self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
                 {
                     crate::yarm_log!("BSP_BEFORE_ASPACE_SWITCH tid={}", tid);
@@ -790,7 +791,10 @@ impl KernelState {
                     crate::yarm_log!("BCTX0 after loading context log tid={}", tid);
                 }
             }
-            if cfg!(not(feature = "hosted-dev")) && tid == BOOTSTRAP_FIRST_USER_TID {
+            if cfg!(not(feature = "hosted-dev"))
+                && DEBUG_DISPATCH_CONTEXT_LOG
+                && tid == BOOTSTRAP_FIRST_USER_TID
+            {
                 crate::yarm_log!(
                     "BCTX1 before cpu-ownership/context-restore gate tid={}",
                     tid
@@ -813,6 +817,7 @@ impl KernelState {
                 );
             }
             if cfg!(not(feature = "hosted-dev"))
+                && DEBUG_DISPATCH_CONTEXT_LOG
                 && current_cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
             {
                 let (ctx_ptr, user_pc, user_sp, user_x0, user_x1) = self.with_tcbs(|tcbs| {
@@ -842,6 +847,7 @@ impl KernelState {
                 );
             }
             if cfg!(not(feature = "hosted-dev"))
+                && DEBUG_DISPATCH_CONTEXT_LOG
                 && tid == BOOTSTRAP_FIRST_USER_TID
                 && current_cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
             {
@@ -849,6 +855,7 @@ impl KernelState {
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
             if cfg!(not(feature = "hosted-dev"))
+                && DEBUG_DISPATCH_CONTEXT_LOG
                 && tid == BOOTSTRAP_FIRST_USER_TID
                 && current_cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
             {

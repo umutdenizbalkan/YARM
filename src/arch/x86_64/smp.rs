@@ -311,6 +311,19 @@ fn trampoline_trace_word() -> u32 {
     unsafe { read_volatile((AP_TRAMPOLINE_PHYS + AP_TRACE_OFFSET) as *const u32) }
 }
 
+#[cfg(not(test))]
+fn log_trampoline_head_bytes() {
+    let mut b = [0u8; 16];
+    for (i, slot) in b.iter_mut().enumerate() {
+        *slot = unsafe { read_volatile((AP_TRAMPOLINE_PHYS + i) as *const u8) };
+    }
+    crate::yarm_log!(
+        "YARM_SMP_TRAMPOLINE_HEAD phys=0x{:x} bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+        AP_TRAMPOLINE_PHYS,
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    );
+}
+
 #[cfg(test)]
 struct TestTrampolinePage(core::cell::UnsafeCell<[u8; AP_TRAMPOLINE_SIZE]>);
 
@@ -490,6 +503,8 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
         encode_handoff(page, handoff);
         write_trampoline_page(page);
     });
+    #[cfg(not(test))]
+    log_trampoline_head_bytes();
 }
 
 pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelError> {

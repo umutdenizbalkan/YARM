@@ -673,7 +673,7 @@ pub fn enter_dispatched_user_task_if_available(
             return;
         }
         crate::yarm_log!("BOOTSTRAP_STAGE: before enter_user_mode");
-        let Ok(cr3) = super::page_table::activate_asid(asid) else {
+        let Ok(intended_cr3) = super::page_table::activate_asid(asid) else {
             return;
         };
         let mut active_cr3: u64 = 0;
@@ -694,18 +694,18 @@ pub fn enter_dispatched_user_task_if_available(
             context.stack_ptr.0
         );
         crate::yarm_log!(
-            "ENTER_USER_CTX cr3=0x{:x} active_cr3=0x{:x} cs=0x{:x} ss=0x{:x} rflags=0x{:x}",
-            cr3,
+            "ENTER_USER_CTX intended_cr3=0x{:x} active_cr3=0x{:x} cs=0x{:x} ss=0x{:x} rflags=0x{:x}",
+            intended_cr3,
             active_cr3,
             cs,
             ss,
             rflags
         );
         crate::yarm_log!(
-            "YARM_RING3_INIT_TASK tid={} asid={} cr3=0x{:x} entry=0x{:x} stack_top=0x{:x}",
+            "YARM_RING3_INIT_TASK tid={} asid={} intended_cr3=0x{:x} entry=0x{:x} stack_top=0x{:x}",
             tid,
             asid.0,
-            cr3,
+            intended_cr3,
             context.instruction_ptr.0,
             context.stack_ptr.0
         );
