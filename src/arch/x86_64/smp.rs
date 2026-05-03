@@ -53,7 +53,7 @@ struct ApHandoff {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 global_asm!(
     r#"
-    .section .text.ap_trampoline,"ax",@progbits
+    .section .text.ap_trampoline_src,"ax",@progbits
     .global yarm_ap_trampoline_start
     .global yarm_ap_trampoline_end
     .global yarm_ap_trampoline_handoff
@@ -110,7 +110,7 @@ yarm_ap_trampoline_start:
 
 2:
     .word 4f - 1
-    .long 4f
+    .long AP_TRAMPOLINE_BASE + (4f - yarm_ap_trampoline_start)
 
     .code32
 3:
@@ -214,11 +214,7 @@ extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> ! {
         handoff.ready_flag_ptr
     );
     if handoff.magic == AP_HANDOFF_MAGIC {
-        let mut ready_addr = handoff.ready_flag_ptr;
-        if ready_addr >= crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE {
-            ready_addr = ready_addr
-                .saturating_sub(crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE);
-        }
+        let ready_addr = handoff.ready_flag_ptr;
         let ready_ptr = ready_addr as usize as *const AtomicBool;
         unsafe { (*ready_ptr).store(true, Ordering::Release) };
         crate::yarm_log!(
@@ -284,6 +280,14 @@ fn encode_handoff(page: &mut [u8; AP_TRAMPOLINE_SIZE], handoff: ApHandoff) {
             end as usize,
             len
         );
+        let dest_alias = (crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE
+            + AP_TRAMPOLINE_PHYS as u64) as usize;
+        if start as usize == dest_alias {
+            crate::yarm_log!(
+                "YARM_SMP_TRAMPOLINE_SOURCE_INVALID reason=self_referential start=0x{:x}",
+                start as usize
+            );
+        }
         debug_assert!(len > 0, "AP trampoline source length must be > 0");
         if len <= AP_TRAMPOLINE_SIZE {
             copy_nonoverlapping(start, page.as_mut_ptr(), len);
