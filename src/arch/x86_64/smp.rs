@@ -116,7 +116,9 @@ yarm_ap_trampoline_start:
     mov al, 'r' // immediately before far jump to pmode
     out dx, al
     .set AP_PM_ENTRY, AP_TRAMPOLINE_BASE + (3f - yarm_ap_trampoline_start)
-    ljmp $0x08, $AP_PM_ENTRY
+    .byte 0xEA
+        .word AP_PM_ENTRY
+    .word 0x0008
 
     .set AP_GDT_BASE, AP_TRAMPOLINE_BASE + (ap_gdt - yarm_ap_trampoline_start)
     .set AP_GDT_LIMIT, (ap_gdt_end - ap_gdt) - 1
