@@ -297,10 +297,12 @@ fn encode_handoff(page: &mut [u8; AP_TRAMPOLINE_SIZE], handoff: ApHandoff) {
 
 #[cfg(not(test))]
 fn write_trampoline_page(page: &[u8; AP_TRAMPOLINE_SIZE]) {
+    let trampoline_virt = (crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE
+        + AP_TRAMPOLINE_PHYS as u64) as usize;
     unsafe {
         copy_nonoverlapping(
             page.as_ptr(),
-            AP_TRAMPOLINE_PHYS as *mut u8,
+            trampoline_virt as *mut u8,
             AP_TRAMPOLINE_SIZE,
         );
     }
@@ -308,14 +310,20 @@ fn write_trampoline_page(page: &[u8; AP_TRAMPOLINE_SIZE]) {
 
 #[cfg(not(test))]
 fn trampoline_trace_word() -> u32 {
-    unsafe { read_volatile((AP_TRAMPOLINE_PHYS + AP_TRACE_OFFSET) as *const u32) }
+    let trampoline_virt =
+        (crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE + AP_TRAMPOLINE_PHYS as u64)
+            as usize;
+    unsafe { read_volatile((trampoline_virt + AP_TRACE_OFFSET) as *const u32) }
 }
 
 #[cfg(not(test))]
 fn log_trampoline_head_bytes() {
     let mut b = [0u8; 16];
     for (i, slot) in b.iter_mut().enumerate() {
-        *slot = unsafe { read_volatile((AP_TRAMPOLINE_PHYS + i) as *const u8) };
+        let trampoline_virt =
+            (crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE + AP_TRAMPOLINE_PHYS as u64)
+                as usize;
+        *slot = unsafe { read_volatile((trampoline_virt + i) as *const u8) };
     }
     crate::yarm_log!(
         "YARM_SMP_TRAMPOLINE_HEAD phys=0x{:x} bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
@@ -501,6 +509,12 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
     );
     with_trampoline_scratch(|page| {
         encode_handoff(page, handoff);
+        #[cfg(not(test))]
+        crate::yarm_log!(
+            "YARM_SMP_TRAMPOLINE_SRC len={} first8={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            AP_TRAMPOLINE_SIZE,
+            page[0], page[1], page[2], page[3], page[4], page[5], page[6], page[7]
+        );
         write_trampoline_page(page);
     });
     #[cfg(not(test))]

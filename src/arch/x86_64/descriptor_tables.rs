@@ -648,22 +648,23 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
 ) {
     let cpu_apic = raw_current_apic_id() as u64;
     let previous_depth = TRAP_DISPATCH_DEPTH.fetch_add(1, Ordering::AcqRel);
-    if previous_depth != 0 {
-        debug_uart_trap_breadcrumb(b'N', vector, error_code, 0, 0, cpu_apic);
-        halt_forever();
-    }
+    let frame = unsafe { &*interrupt_frame };
     let mut fault_addr = 0u64;
     if vector as usize == VEC_PAGE_FAULT {
         unsafe {
             core::arch::asm!("mov {}, cr2", out(reg) fault_addr, options(nomem, preserves_flags));
         }
     }
+    if previous_depth != 0 {
+        log_decoded_fatal_trap(None, vector, error_code, frame, fault_addr);
+        debug_uart_trap_breadcrumb(b'N', vector, error_code, fault_addr, frame.rip, cpu_apic);
+        halt_forever();
+    }
     let context = crate::arch::x86_64::trap::X86TrapContext {
         vector: vector as u8,
         error_code,
         fault_addr,
     };
-    let frame = unsafe { &*interrupt_frame };
 
     let Some(kernel) = trap_kernel_state_mut() else {
         if should_halt_without_kernel_state(vector as usize) {
