@@ -42,7 +42,7 @@ const ICR_IDLE_POLL_ITERS: usize = 100_000;
 const AP_TRACE_OFFSET: usize = 0x200;
 #[allow(dead_code)]
 const AP_BREADCRUMB_MAP: &str =
-    "a=entry,u=pre-lgdt,b/L=post-lgdt,f=pre-PE,g=post-PE,r=pre-ljmp,h=post-pmode-jmp,c=pmode,i/j=pre/post-cr3,k/l=pre/post-PAE,m/n=pre/post-LME,o/p=pre/post-PG,q=post-lmode-jmp,e=pre-ap-entry-call";
+    "s=stack-init,a=entry,u=pre-lgdt,b/L=post-lgdt,f=pre-PE,g=post-PE,r=pre-ljmp,h=post-pmode-jmp,c=pmode,i/j=pre/post-cr3,k/l=pre/post-PAE,m/n=pre/post-LME,o/p=pre/post-PG,q=post-lmode-jmp,v=pre-handoff-read,w=post-rsp-load,e=pre-ap-entry-call,z=ap-entry-first-instr";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -204,9 +204,15 @@ ap_gdtr:
     mov al, 'e'
     out dx, al
 
-    lea rbx, [rip + yarm_ap_trampoline_start]
+    mov al, 'v' // before reading handoff struct in low runtime page
+    out dx, al
+    mov rbx, AP_TRAMPOLINE_BASE
     mov rsp, [rbx + AP_OFF_HANDOFF + 8]
+    mov al, 'w' // after loading rsp from handoff
+    out dx, al
     lea rdi, [rbx + AP_OFF_HANDOFF]
+    mov al, 'e'
+    out dx, al
     movabs rax, yarm_x86_64_ap_entry
     call rax
 
@@ -242,6 +248,14 @@ unsafe extern "C" {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov dx, 0x3F8",
+            "mov al, 'z'",
+            "out dx, al",
+            options(nostack, nomem, preserves_flags)
+        );
+    }
     crate::yarm_log!("YARM_SMP_AP_TRACE_MAP {}", AP_BREADCRUMB_MAP);
     let handoff = unsafe { &*handoff_ptr };
     crate::yarm_log!(
@@ -652,6 +666,8 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) {
         handoff.ready_flag_ptr,
         AP_TRAMPOLINE_PHYS
     );
+    #[cfg(not(test))]
+    crate::yarm_log!("YARM_SMP_AP_TRACE_MAP {}", AP_BREADCRUMB_MAP);
     with_trampoline_scratch(|page| {
         encode_handoff(page, handoff);
         #[cfg(not(test))]
