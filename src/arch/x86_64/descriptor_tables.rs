@@ -242,6 +242,8 @@ struct X86InterruptStackFrameHeader {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static FATAL_LOG_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const UNMAPPED_CPU: usize = usize::MAX;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static APIC_TO_CPU_ID: [AtomicUsize; 256] = [const { AtomicUsize::new(UNMAPPED_CPU) }; 256];
@@ -494,6 +496,16 @@ fn log_decoded_fatal_trap(
     frame: &X86InterruptStackFrame,
     fault_addr: u64,
 ) {
+    if FATAL_LOG_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        debug_uart_putc(b'!');
+        debug_uart_putc(b'F');
+        debug_uart_putc(b'R');
+        debug_uart_putc(b'\n');
+        halt_forever();
+    }
     let mut active_cr3 = 0u64;
     unsafe {
         core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nostack, preserves_flags));
@@ -503,40 +515,33 @@ fn log_decoded_fatal_trap(
         .and_then(|k| k.task_asid(current_tid))
         .map(|asid| asid.0)
         .unwrap_or(0);
-    crate::pr_err!(
-        "X86_FATAL_TRAP vector={} error=0x{:x} rip=0x{:016x} cs=0x{:x} rflags=0x{:x} rsp=0x{:016x} ss=0x{:x} cr2=0x{:016x} cr3=0x{:016x} tid={} asid={} cpl={}",
-        vector,
-        error_code,
-        frame.rip,
-        frame.cs,
-        frame.rflags,
-        frame.rsp,
-        frame.ss,
-        fault_addr,
-        active_cr3,
-        current_tid,
-        current_asid,
-        if (frame.cs & 0x3) == 0x3 {
-            "user"
-        } else {
-            "kernel"
-        }
-    );
-    crate::yarm_log!(
-        "X86_FATAL_TRAP vector={} error=0x{:x} rip=0x{:016x} cs=0x{:x} rflags=0x{:x} rsp=0x{:016x} ss=0x{:x} cr2=0x{:016x} cr3=0x{:016x} tid={} asid={} cpl={}",
-        vector,
-        error_code,
-        frame.rip,
-        frame.cs,
-        frame.rflags,
-        frame.rsp,
-        frame.ss,
-        fault_addr,
-        active_cr3,
-        current_tid,
-        current_asid,
-        if (frame.cs & 0x3) == 0x3 { "user" } else { "kernel" }
-    );
+    debug_uart_putc(b'!');
+    debug_uart_putc(b'F');
+    debug_uart_putc(b'v');
+    debug_uart_hex_u64(vector);
+    debug_uart_putc(b'e');
+    debug_uart_hex_u64(error_code);
+    debug_uart_putc(b'i');
+    debug_uart_hex_u64(frame.rip);
+    debug_uart_putc(b's');
+    debug_uart_hex_u64(frame.cs);
+    debug_uart_putc(b'f');
+    debug_uart_hex_u64(frame.rflags);
+    debug_uart_putc(b'p');
+    debug_uart_hex_u64(frame.rsp);
+    debug_uart_putc(b'S');
+    debug_uart_hex_u64(frame.ss);
+    debug_uart_putc(b'2');
+    debug_uart_hex_u64(fault_addr);
+    debug_uart_putc(b'3');
+    debug_uart_hex_u64(active_cr3);
+    debug_uart_putc(b't');
+    debug_uart_hex_u64(current_tid);
+    debug_uart_putc(b'a');
+    debug_uart_hex_u64(current_asid);
+    debug_uart_putc(b'c');
+    debug_uart_hex_u64(frame.cs & 0x3);
+    debug_uart_putc(b'\n');
 }
 
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
