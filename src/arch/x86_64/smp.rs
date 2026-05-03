@@ -71,10 +71,9 @@ global_asm!(
 yarm_ap_trampoline_start:
     cli
     mov dword ptr cs:[AP_OFF_TRACE], 0x31504159 // "YAP1"
-    mov ax, cs
+    xor ax, ax
     mov ds, ax
     mov es, ax
-    xor ax, ax
     mov ss, ax
     mov sp, 0x7c00
     mov dx, 0x3F8
@@ -94,15 +93,9 @@ yarm_ap_trampoline_start:
 1:
     pop si
     sub si, AP_OFF_REAL_L1
-    // Real-mode default segment for [si+disp] is DS, but DS is zeroed
-    // above so DS:(si+disp) = (0+0+AP_OFF_GDTR) reads garbage at PA
-    // 0x19 instead of the GDTR descriptor at PA 0x7000+AP_OFF_GDTR.
-    // Force the segment override to CS, which the SIPI vector left
-    // at 0x0700 (base 0x7000), so the operand resolves to the real
-    // location of the descriptor.
     mov al, 'u' // before lgdt
     out dx, al
-    cs lgdt [si + AP_OFF_GDTR]
+    lgdt [si + AP_OFF_GDTR]
     mov dword ptr cs:[AP_OFF_TRACE], 0x33504159 // "YAP3"
 
     // Diagnostic: AP loaded GDTR.
@@ -138,7 +131,7 @@ yarm_ap_trampoline_start:
     mov dx, 0x3F8
     mov al, 'h' // immediately after pmode far jump
     out dx, al
-    mov ax, 0x18
+    mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov ss, ax
@@ -195,14 +188,14 @@ yarm_ap_trampoline_start:
     .set AP_LM_ENTRY, AP_TRAMPOLINE_BASE + (6f - yarm_ap_trampoline_start)
     .byte 0xEA
         .long AP_LM_ENTRY
-    .word 0x10
+    .word 0x18
 
     .code64
 6:
     mov dx, 0x3F8
     mov al, 'q' // immediately after long-mode far jump
     out dx, al
-    mov ax, 0x18
+    mov ax, 0x20
     mov ds, ax
     mov es, ax
     mov ss, ax
@@ -228,8 +221,9 @@ yarm_ap_trampoline_start:
 ap_gdt:
     .quad 0x0000000000000000
     .quad 0x00cf9a000000ffff
-    .quad 0x00af9a000000ffff
     .quad 0x00cf92000000ffff
+    .quad 0x00af9a000000ffff
+    .quad 0x00af92000000ffff
 ap_gdt_end:
 
     .align 8
