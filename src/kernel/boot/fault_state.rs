@@ -12,6 +12,8 @@ use crate::kernel::trapframe::TrapFrame;
 
 const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
 const DEMAND_STACK_GROWTH_WINDOW: u64 = 8 * 1024 * 1024;
+#[allow(dead_code)]
+const DEBUG_TIMER_LOG: bool = false;
 /// Supervisor fault notification wire ABI payload length.
 ///
 /// Layout (little-endian):
@@ -232,25 +234,28 @@ impl KernelState {
             Trap::TimerInterrupt => {
                 self.hal.acknowledge_interrupt(self.current_cpu(), 0);
                 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-                crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);
+                if DEBUG_TIMER_LOG {
+                    crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);
+                }
                 let (_tick, should_preempt) = self.tick_scheduler_timer();
                 let _ = self
                     .process_ipc_timeout_deadlines(_tick.0)
                     .map_err(SyscallError::from)
                     .map_err(TrapHandleError::Syscall)?;
                 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-                crate::yarm_log!(
-                    "YARM_SCHED_TICK cpu={} tick={} preempt={}",
-                    self.current_cpu().0,
-                    _tick.0,
-                    should_preempt as u8
-                );
-                #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-                crate::yarm_log!(
-                    "YARM_TIMER_IRQ_DELIVERED cpu={} tick={}",
-                    self.current_cpu().0,
-                    _tick.0
-                );
+                if DEBUG_TIMER_LOG {
+                    crate::yarm_log!(
+                        "YARM_SCHED_TICK cpu={} tick={} preempt={}",
+                        self.current_cpu().0,
+                        _tick.0,
+                        should_preempt as u8
+                    );
+                    crate::yarm_log!(
+                        "YARM_TIMER_IRQ_DELIVERED cpu={} tick={}",
+                        self.current_cpu().0,
+                        _tick.0
+                    );
+                }
                 if should_preempt {
                     self.yield_current()
                         .map_err(SyscallError::from)
