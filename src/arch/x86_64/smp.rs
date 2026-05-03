@@ -53,7 +53,7 @@ struct ApHandoff {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 global_asm!(
     r#"
-    .section .text.ap_trampoline,"ax",@progbits
+    .section .text.ap_trampoline_src,"ax",@progbits
     .global yarm_ap_trampoline_start
     .global yarm_ap_trampoline_end
     .global yarm_ap_trampoline_handoff
@@ -268,6 +268,14 @@ fn encode_handoff(page: &mut [u8; AP_TRAMPOLINE_SIZE], handoff: ApHandoff) {
         let end = &yarm_ap_trampoline_end as *const u8;
         let handoff_ptr = &yarm_ap_trampoline_handoff as *const u8;
         let len = end.offset_from(start) as usize;
+        #[cfg(not(test))]
+        crate::yarm_log!(
+            "YARM_SMP_TRAMPOLINE_SOURCE_RANGE start=0x{:x} end=0x{:x} len={}",
+            start as usize,
+            end as usize,
+            len
+        );
+        debug_assert!(len > 0, "AP trampoline source length must be > 0");
         if len <= AP_TRAMPOLINE_SIZE {
             copy_nonoverlapping(start, page.as_mut_ptr(), len);
             let handoff_off = handoff_ptr.offset_from(start) as usize;
@@ -276,6 +284,14 @@ fn encode_handoff(page: &mut [u8; AP_TRAMPOLINE_SIZE], handoff: ApHandoff) {
                 core::mem::size_of::<ApHandoff>(),
             );
             page[handoff_off..handoff_off + handoff_bytes.len()].copy_from_slice(handoff_bytes);
+        }
+        #[cfg(not(test))]
+        if len > AP_TRAMPOLINE_SIZE {
+            crate::yarm_log!(
+                "YARM_SMP_TRAMPOLINE_SOURCE_OVERSIZE len={} max={}",
+                len,
+                AP_TRAMPOLINE_SIZE
+            );
         }
         return;
     }
