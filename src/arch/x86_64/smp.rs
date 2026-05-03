@@ -38,6 +38,7 @@ const AP_STACK_TOP_BASE: u64 =
     crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE + AP_STACK_PHYS_BASE;
 const AP_READY_POLL_ITERS: usize = 2_000_000;
 const ICR_IDLE_POLL_ITERS: usize = 100_000;
+// Keep in sync with AP_OFF_TRACE in the trampoline assembly below.
 const AP_TRACE_OFFSET: usize = 0x200;
 #[allow(dead_code)]
 const AP_BREADCRUMB_MAP: &str =
@@ -65,7 +66,7 @@ global_asm!(
     .set AP_OFF_GDTR, ap_gdtr - yarm_ap_trampoline_start
     .set AP_OFF_PM_L5, 5f - yarm_ap_trampoline_start
     .set AP_OFF_HANDOFF, yarm_ap_trampoline_handoff - yarm_ap_trampoline_start
-    .set AP_OFF_TRACE, 0x80
+    .set AP_OFF_TRACE, 0x200
 
 yarm_ap_trampoline_start:
     cli
@@ -453,7 +454,7 @@ fn log_trampoline_layout(page: &[u8; AP_TRAMPOLINE_SIZE]) {
             far_off,
             &page[far_off..end]
         );
-        let pm_entry_off = if is_32 {
+        let pm_entry_linear = if is_32 {
             u32::from_le_bytes([
                 page[far_off + 2],
                 page[far_off + 3],
@@ -463,14 +464,13 @@ fn log_trampoline_layout(page: &[u8; AP_TRAMPOLINE_SIZE]) {
         } else {
             u16::from_le_bytes([page[far_off + 1], page[far_off + 2]]) as usize
         };
+        let pm_entry_off = pm_entry_linear.saturating_sub(AP_TRAMPOLINE_PHYS);
         if pm_entry_off + 16 <= page.len() {
-            if pm_entry_off + 16 <= page.len() {
                 crate::yarm_log!(
                     "YARM_SMP_TRAMPOLINE_PM_ENTRY off=0x{:x} bytes={:02x?}",
                     pm_entry_off,
                     &page[pm_entry_off..pm_entry_off + 16]
                 );
-            }
         }
     } else {
         crate::yarm_log!("YARM_SMP_TRAMPOLINE_FARJMP off=<none> bytes=<none>");
