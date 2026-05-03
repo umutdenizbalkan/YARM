@@ -619,21 +619,32 @@ pub fn enter_dispatched_user_task_if_available(
     kernel: &crate::kernel::boot::KernelState,
     dispatched_tid: Option<u64>,
 ) {
+    const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
     let Some(tid) = dispatched_tid else {
-        crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid=<none>");
+        if DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid=<none>");
+        }
         return;
     };
-    crate::yarm_log!("ENTER_USER_LOOKUP tid={}", tid);
+    if DEBUG_DISPATCH_CONTEXT_LOG {
+        crate::yarm_log!("ENTER_USER_LOOKUP tid={}", tid);
+    }
     if tid == 0 {
-        crate::yarm_log!("ENTER_USER_REJECT_IDLE tid={}", tid);
+        if DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!("ENTER_USER_REJECT_IDLE tid={}", tid);
+        }
         return;
     }
     let Some(asid) = kernel.task_asid(tid) else {
-        crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid={} reason=missing_asid", tid);
+        if DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid={} reason=missing_asid", tid);
+        }
         return;
     };
     let Some(context) = kernel.thread_user_context(tid) else {
-        crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid={} reason=missing_context", tid);
+        if DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid={} reason=missing_context", tid);
+        }
         return;
     };
     if context.instruction_ptr.0 != 0 && context.stack_ptr.0 != 0 {
@@ -698,7 +709,9 @@ pub fn enter_dispatched_user_task_if_available(
             context.instruction_ptr.0,
             context.stack_ptr.0
         );
-        crate::yarm_log!("USER_ENTRY rip=0x{:x}", context.instruction_ptr.0);
+        if DEBUG_DISPATCH_CONTEXT_LOG {
+            crate::yarm_log!("USER_ENTRY rip=0x{:x}", context.instruction_ptr.0);
+        }
         #[allow(unreachable_code)]
         {
             super::descriptor_tables::enter_user_mode_iret(

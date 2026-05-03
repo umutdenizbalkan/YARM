@@ -209,9 +209,18 @@ extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> ! {
         handoff.ready_flag_ptr
     );
     if handoff.magic == AP_HANDOFF_MAGIC {
-        let ready_ptr = handoff.ready_flag_ptr as usize as *const AtomicBool;
+        let mut ready_addr = handoff.ready_flag_ptr;
+        if ready_addr >= crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE {
+            ready_addr = ready_addr
+                .saturating_sub(crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE);
+        }
+        let ready_ptr = ready_addr as usize as *const AtomicBool;
         unsafe { (*ready_ptr).store(true, Ordering::Release) };
-        crate::yarm_log!("YARM_SMP_AP_READY_SET cpu={}", handoff.cpu_id);
+        crate::yarm_log!(
+            "YARM_SMP_AP_READY_SET cpu={} ready_addr=0x{:x}",
+            handoff.cpu_id,
+            ready_addr
+        );
     } else {
         crate::yarm_log!(
             "YARM_SMP_AP_BAD_HANDOFF cpu={} expected_magic=0x{:08x}",
