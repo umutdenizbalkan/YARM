@@ -121,7 +121,7 @@ yarm_ap_trampoline_start:
     out dx, al
     mov al, 'r' // immediately before far jump to pmode
     out dx, al
-    .set AP_PM_ENTRY, (3f - yarm_ap_trampoline_start)
+    .set AP_PM_ENTRY, AP_TRAMPOLINE_BASE + (3f - yarm_ap_trampoline_start)
     .byte 0x66
     .byte 0xEA
         .long AP_PM_ENTRY
@@ -227,7 +227,7 @@ yarm_ap_trampoline_start:
     .align 8
 ap_gdt:
     .quad 0x0000000000000000
-    .quad 0x00409a007000ffff
+    .quad 0x00cf9a000000ffff
     .quad 0x00af9a000000ffff
     .quad 0x00cf92000000ffff
 ap_gdt_end:
