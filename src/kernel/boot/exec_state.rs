@@ -592,6 +592,11 @@ impl KernelState {
             startup_slots_ptr,
             &startup_slots_bytes[..startup_slots_bytes_len],
         )?;
+        crate::yarm_log!(
+            "YARM_FIRST_USER_STARTUP_BLOCK va=0x{:x} count={} mapped=true",
+            startup_slots_start,
+            startup_slots_len
+        );
 
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs

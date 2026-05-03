@@ -748,6 +748,10 @@ pub fn enter_dispatched_user_task_if_available(
                 context.stack_ptr.0,
                 context.arg0 as u64,
                 context.arg1 as u64,
+                context.arg2 as u64,
+                context.arg3 as u64,
+                context.arg4 as u64,
+                context.arg5 as u64,
             );
             crate::yarm_log!("RETURNED_FROM_USER");
         }

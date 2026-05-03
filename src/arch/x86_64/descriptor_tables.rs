@@ -1265,12 +1265,30 @@ pub fn refresh_boot_tss_rsp0(_rsp0: u64) {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 unsafe extern "C" {
-    fn yarm_x86_enter_ring3(entry: u64, stack_top: u64, arg0: u64, arg1: u64) -> !;
+    fn yarm_x86_enter_ring3(
+        entry: u64,
+        stack_top: u64,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+        arg3: u64,
+        arg4: u64,
+        arg5: u64,
+    ) -> !;
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-pub fn enter_user_mode_iret(entry: u64, stack_top: u64, arg0: u64, arg1: u64) -> ! {
-    unsafe { yarm_x86_enter_ring3(entry, stack_top, arg0, arg1) }
+pub fn enter_user_mode_iret(
+    entry: u64,
+    stack_top: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+) -> ! {
+    unsafe { yarm_x86_enter_ring3(entry, stack_top, arg0, arg1, arg2, arg3, arg4, arg5) }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -1280,24 +1298,37 @@ core::arch::global_asm!(
     .global yarm_x86_enter_ring3
     .type yarm_x86_enter_ring3, @function
 yarm_x86_enter_ring3:
-    mov r8, rdi
-    mov r9, rsi
+    mov r10, rdi
+    mov r11, rsi
     mov rdi, rdx
     mov rsi, rcx
+    mov rdx, r8
+    mov rcx, r9
+    mov r8, qword ptr [rsp + 8]
+    mov r9, qword ptr [rsp + 16]
     mov ax, 0x1b
     mov ds, ax
     mov es, ax
     push 0x1b
-    push r9
+    push r11
     push 0x202
     push 0x23
-    push r8
+    push r10
     iretq
 "#
 );
 
 #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
-pub fn enter_user_mode_iret(_entry: u64, _stack_top: u64, _arg0: u64, _arg1: u64) -> ! {
+pub fn enter_user_mode_iret(
+    _entry: u64,
+    _stack_top: u64,
+    _arg0: u64,
+    _arg1: u64,
+    _arg2: u64,
+    _arg3: u64,
+    _arg4: u64,
+    _arg5: u64,
+) -> ! {
     panic!("x86_64 ring-3 iret entry is unavailable on this build target")
 }
 
