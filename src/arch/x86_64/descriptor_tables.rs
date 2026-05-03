@@ -538,7 +538,7 @@ fn log_decoded_fatal_trap(
     debug_uart_putc(b't');
     debug_uart_hex_u64(current_tid);
     debug_uart_putc(b'a');
-    debug_uart_hex_u64(current_asid);
+    debug_uart_hex_u64(current_asid as u64);
     debug_uart_putc(b'c');
     debug_uart_hex_u64(frame.cs & 0x3);
     debug_uart_putc(b'\n');
