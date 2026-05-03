@@ -502,6 +502,7 @@ fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
         .flatten()
         .or_else(|| yarm_srv_common::cpio::CpioArchive::new(bytes).find("init").ok().flatten())?;
     let file_data = entry.file_data();
+    crate::yarm_log!("YARM_INITRD_INIT_FOUND len={}", file_data.len());
     if file_data.len() > INITRD_INIT_ELF_MAX_SIZE {
         crate::yarm_log!(
             "YARM_INITRD_INIT_TOO_LARGE len={} cap={}",
@@ -534,7 +535,11 @@ pub fn bootstrap_first_user_task(
     };
     let image = load_init_elf_from_initramfs_vfs();
     let fallback = initramfs_static_hello_world_elf();
-    let image_bytes: &[u8] = image.as_deref().unwrap_or(&fallback);
+    let (image_bytes, source, fallback_reason): (&[u8], &str, Option<&str>) =
+        match image.as_deref() {
+            Some(initrd_image) => (initrd_image, "initrd", None),
+            None => (&fallback, "synthetic", Some("missing_or_invalid_initrd_init")),
+        };
     let (entry, heap_base) = match kernel.load_elf_pt_load_segments(asid, image_bytes) {
         Ok(result) => {
             crate::yarm_log!("BOOTSTRAP_STAGE: after ELF load");
@@ -546,6 +551,24 @@ pub fn bootstrap_first_user_task(
             return Err(err);
         }
     };
+    match source {
+        "initrd" => crate::yarm_log!("YARM_INITRD_INIT_ELF_SELECTED entry=0x{:x}", entry),
+        _ => crate::yarm_log!("YARM_SYNTHETIC_INIT_ELF_SELECTED entry=0x{:x}", entry),
+    }
+    if let Some(reason) = fallback_reason {
+        crate::yarm_log!(
+            "YARM_FIRST_USER_IMAGE_SOURCE source={} len={} reason={}",
+            source,
+            image_bytes.len(),
+            reason
+        );
+    } else {
+        crate::yarm_log!(
+            "YARM_FIRST_USER_IMAGE_SOURCE source={} len={}",
+            source,
+            image_bytes.len()
+        );
+    }
     crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
     kernel.register_task_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)?;
     let (_pm_eid, pm_send_cap_root, pm_recv_cap_root) = kernel.create_endpoint(8)?;
@@ -598,9 +621,15 @@ pub fn bootstrap_first_user_task(
         }
     }
     kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, heap_base, heap_base)?;
+    let (phase, image_id) = if source == "initrd" {
+        ("initrd_init_elf", 0x494e495448454c4fu64)
+    } else {
+        ("kernel_static_init_elf", INITRAMFS_HELLO_WORLD_IMAGE_ID)
+    };
     crate::yarm_log!(
-        "YARM_INIT_DONE arch=x86_64 phase=kernel_static_init_elf image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
-        INITRAMFS_HELLO_WORLD_IMAGE_ID
+        "YARM_INIT_DONE arch=x86_64 phase={} image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
+        phase,
+        image_id
     );
     Ok(())
 }
@@ -807,8 +836,10 @@ fn read_pvh_module_summary(start_info_ptr: usize) -> Option<PvhModuleSummary> {
 
     let module_count = core::cmp::min(start_info.nr_modules as usize, MAX_PVH_MODULES);
     let mut initramfs = None;
+    let modlist_ptr = (crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE
+        .saturating_add(start_info.modlist_paddr)) as *const PvhModule;
     for idx in 0..module_count {
-        let module_ptr = (start_info.modlist_paddr as *const PvhModule).wrapping_add(idx);
+        let module_ptr = modlist_ptr.wrapping_add(idx);
         let module = unsafe { core::ptr::read_unaligned(module_ptr) };
         if module.paddr_start == 0 || module.paddr_end <= module.paddr_start {
             continue;
@@ -853,7 +884,9 @@ fn log_pvh_boot_metadata(start_info_ptr: usize) {
                     reserved_end,
                 );
                 // SAFETY: PVH module window is immutable boot-provided memory.
-                let bytes = unsafe { core::slice::from_raw_parts(window.start as *const u8, len) };
+                let initrd_ptr = (crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE
+                    .saturating_add(window.start)) as *const u8;
+                let bytes = unsafe { core::slice::from_raw_parts(initrd_ptr, len) };
                 crate::kernel::boot::Bootstrap::install_boot_initrd_bytes(bytes);
             }
         }
