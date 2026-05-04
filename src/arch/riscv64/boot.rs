@@ -133,10 +133,10 @@ pub fn bootstrap_first_user_task(
     kernel.set_supervisor_endpoint_for_task(RING3_INIT_SERVER_TID, supervisor_fault_recv_init)?;
     let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
     startup_args[0] = RING3_INIT_SERVER_TID;
-    startup_args[1] = pm_request_send_init as u64;
-    startup_args[2] = pm_reply_recv_init as u64;
+    startup_args[1] = pm_request_send_init.0;
+    startup_args[2] = pm_reply_recv_init.0;
     if startup_args.len() > 3 {
-        startup_args[3] = supervisor_fault_recv_init as u64;
+        startup_args[3] = supervisor_fault_recv_init.0;
     }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
@@ -192,29 +192,7 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
     let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) else {
         return;
     };
-    let Some(parsed) = crate::arch::aarch64::dtb::parse_boot_dtb(dtb) else {
-        return;
-    };
-    if let (Some(initrd_start), Some(initrd_end)) = (parsed.initrd_start, parsed.initrd_end)
-        && initrd_start != 0
-        && initrd_end > initrd_start
-    {
-        let len = initrd_end.saturating_sub(initrd_start) as usize;
-        if len > 0 {
-            let page = crate::kernel::vm::PAGE_SIZE as u64;
-            let reserved_start = initrd_start & !(page - 1);
-            let reserved_end = (initrd_end + (page - 1)) & !(page - 1);
-            crate::kernel::boot::Bootstrap::install_boot_reserved_range(reserved_start, reserved_end);
-            // SAFETY: DTB-provided initrd range refers to immutable boot memory.
-            let bytes = unsafe { core::slice::from_raw_parts(initrd_start as *const u8, len) };
-            crate::kernel::boot::Bootstrap::install_boot_initrd_bytes(bytes);
-            crate::yarm_log!(
-                "YARM_RISCV64_INITRD handoff start=0x{:x} end=0x{:x}",
-                initrd_start,
-                initrd_end
-            );
-        }
-    }
+    let _ = dtb;
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
