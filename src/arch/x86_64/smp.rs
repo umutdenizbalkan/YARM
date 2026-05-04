@@ -163,14 +163,24 @@ ap_gdtr:
     mov al, 'l' // after CR4.PAE
     out dx, al
 
-    mov al, 'm' // before EFER.LME
+    mov al, 'm' // before EFER.LME block
+    out dx, al
+    mov al, 'M' // before mov ecx, IA32_EFER
     out dx, al
     mov ecx, 0xC0000080
+    mov al, 'R' // immediately before rdmsr
+    out dx, al
     rdmsr
+    mov al, 'S' // immediately after rdmsr
+    out dx, al
     mov dword ptr [ebx + AP_OFF_TRACE + 20], eax
     mov dword ptr [ebx + AP_OFF_TRACE + 24], edx
     or eax, (1 << 8)
+    mov al, 'W' // immediately before wrmsr
+    out dx, al
     wrmsr
+    mov al, 'N' // immediately after wrmsr
+    out dx, al
     rdmsr
     mov dword ptr [ebx + AP_OFF_TRACE + 28], eax
     mov dword ptr [ebx + AP_OFF_TRACE + 32], edx
@@ -516,6 +526,17 @@ fn log_trampoline_layout(page: &[u8; AP_TRAMPOLINE_SIZE]) {
             "YARM_SMP_TRAMPOLINE_LM_FARJMP off=0x{:x} sel=0x0018 bytes={:02x?}",
             lm_off,
             &page[lm_off..core::cmp::min(lm_off + 8, page.len())]
+        );
+    }
+    if let Some(msr_off) = page
+        .windows(5)
+        .position(|w| w == [0xB9, 0x80, 0x00, 0x00, 0xC0])
+    {
+        let end = core::cmp::min(msr_off + 24, page.len());
+        crate::yarm_log!(
+            "YARM_SMP_TRAMPOLINE_EFER_BLOCK off=0x{:x} bytes={:02x?}",
+            msr_off,
+            &page[msr_off..end]
         );
     }
 }
