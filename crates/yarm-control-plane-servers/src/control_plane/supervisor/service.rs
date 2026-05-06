@@ -21,8 +21,10 @@ use crate::control_plane::init::{
 };
 use yarm_ipc_abi::supervisor_abi::{
     DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert, InitAlertKind, SupervisorStatusReply,
-    TaskExitedEvent, SUPERVISOR_OP_TASK_EXITED,
+    TaskExitedEvent,
 };
+#[cfg(test)]
+use yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TASK_EXITED;
 #[cfg(not(test))]
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, RegisterSupervisedTask, TaskRestartTokenReply,
@@ -48,6 +50,7 @@ const SUPERVISOR_FAULT_EXIT_CODE_ADDR_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 /// Kernel-originated supervisor fault-report notification opcode.
 ///
 /// The kernel fault path uses `Message::new(0, payload)` for the 17-byte fault report wire payload.
+#[cfg(test)]
 const SUPERVISOR_OP_FAULT_REPORT_WIRE: u16 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1144,7 +1147,7 @@ pub fn run() {
             );
             loop {
                 let mut made_progress = false;
-                match transport.recv(supervisor.handoff.supervisor_control_recv_cap.0 as u32) {
+                match transport.recv_v2(supervisor.handoff.supervisor_control_recv_cap.0 as u32) {
                     Ok(Some(_msg)) => {
                         made_progress = true;
                     }
@@ -1157,78 +1160,13 @@ pub fn run() {
                     }
                 }
 
-                match transport.recv(supervisor.handoff.supervisor_fault_recv_cap.0 as u32) {
+                match transport.recv_v2(supervisor.handoff.supervisor_fault_recv_cap.0 as u32) {
                     Ok(Some(msg)) => {
                         made_progress = true;
-                        match msg.opcode {
-                            SUPERVISOR_OP_FAULT_REPORT_WIRE => match SupervisorFaultReportWire::decode(msg.as_slice()) {
-                                Some(fault) => {
-                                    match query_restart_token_via_process_manager(
-                                        &mut transport,
-                                        process_manager_caps,
-                                        fault.tid,
-                                    ) {
-                                        Ok(Some(restart_token)) => {
-                                            let event = TaskExitedEvent {
-                                                tid: fault.tid,
-                                                exit_code: fault.synthetic_exit_code(),
-                                                restart_token,
-                                            };
-                                            let mut ops = RuntimeSupervisorTaskExitOps {
-                                                token_tid: fault.tid,
-                                                token: restart_token,
-                                            };
-                                            match supervisor.handle_task_exit(&mut ops, event) {
-                                                Ok(SupervisorDecision::ScheduledRestart { tid, due_tick, .. }) => {
-                                                    match execute_restart_via_process_manager(
-                                                        &mut transport,
-                                                        process_manager_caps,
-                                                        tid,
-                                                        restart_token,
-                                                    ) {
-                                                        Ok(status) => yarm_user_rt::user_log!(
-                                                            "supervisor.srv execute-restart reply: tid={}, due_tick={}, status={}",
-                                                            tid,
-                                                            due_tick.0,
-                                                            status
-                                                        ),
-                                                        Err(err) => yarm_user_rt::user_log!(
-                                                            "supervisor.srv execute-restart request failed: tid={}, err={:?}",
-                                                            tid,
-                                                            err
-                                                        ),
-                                                    }
-                                                }
-                                                Ok(_) => {}
-                                                Err(err) => yarm_user_rt::user_log!(
-                                                    "supervisor.srv failed to apply restart policy decision: tid={}, err={:?}",
-                                                    fault.tid,
-                                                    err
-                                                ),
-                                            }
-                                        }
-                                        Ok(None) => yarm_user_rt::user_log!(
-                                            "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={}; restart-token lookup unsupported/unavailable in runtime path",
-                                            fault.tid,
-                                            fault.fault_addr,
-                                            fault.access
-                                        ),
-                                        Err(err) => yarm_user_rt::user_log!(
-                                            "supervisor.srv restart-token lookup failed: tid={}, err={:?}",
-                                            fault.tid,
-                                            err
-                                        ),
-                                    }
-                                }
-                                None => {
-                                    yarm_user_rt::user_log!(
-                                        "supervisor.srv fault report decode failed: len={}",
-                                        msg.as_slice().len()
-                                    );
-                                }
-                            },
-                            SUPERVISOR_OP_TASK_EXITED => {
-                                if let Some(event) = TaskExitedEvent::decode(msg.as_slice()) {
+                        let payload = &msg.payload[..msg.len];
+                        match SupervisorFaultReportWire::decode(payload) {
+                            None => {
+                                if let Some(event) = TaskExitedEvent::decode(payload) {
                                     match register_supervised_task_with_process_manager(
                                         &mut transport,
                                         process_manager_caps,
@@ -1242,10 +1180,72 @@ pub fn run() {
                                             err
                                         ),
                                     }
+                                } else {
+                                    yarm_user_rt::user_log!(
+                                        "supervisor.srv fault/control wire decode failed: len={}",
+                                        payload.len()
+                                    );
                                 }
                             }
-                            _ => {}
-                        }
+                            Some(fault) => {
+                                match query_restart_token_via_process_manager(
+                                    &mut transport,
+                                    process_manager_caps,
+                                    fault.tid,
+                                ) {
+                                    Ok(Some(restart_token)) => {
+                                        let event = TaskExitedEvent {
+                                            tid: fault.tid,
+                                            exit_code: fault.synthetic_exit_code(),
+                                            restart_token,
+                                        };
+                                        let mut ops = RuntimeSupervisorTaskExitOps {
+                                            token_tid: fault.tid,
+                                            token: restart_token,
+                                        };
+                                        match supervisor.handle_task_exit(&mut ops, event) {
+                                            Ok(SupervisorDecision::ScheduledRestart { tid, due_tick, .. }) => {
+                                                match execute_restart_via_process_manager(
+                                                    &mut transport,
+                                                    process_manager_caps,
+                                                    tid,
+                                                    restart_token,
+                                                ) {
+                                                    Ok(status) => yarm_user_rt::user_log!(
+                                                        "supervisor.srv execute-restart reply: tid={}, due_tick={}, status={}",
+                                                        tid,
+                                                        due_tick.0,
+                                                        status
+                                                    ),
+                                                    Err(err) => yarm_user_rt::user_log!(
+                                                        "supervisor.srv execute-restart request failed: tid={}, err={:?}",
+                                                        tid,
+                                                        err
+                                                    ),
+                                                }
+                                            }
+                                            Ok(_) => {}
+                                            Err(err) => yarm_user_rt::user_log!(
+                                                "supervisor.srv failed to apply restart policy decision: tid={}, err={:?}",
+                                                fault.tid,
+                                                err
+                                            ),
+                                        }
+                                    }
+                                    Ok(None) => yarm_user_rt::user_log!(
+                                        "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={}; restart-token lookup unsupported/unavailable in runtime path",
+                                        fault.tid,
+                                        fault.fault_addr,
+                                        fault.access
+                                    ),
+                                    Err(err) => yarm_user_rt::user_log!(
+                                        "supervisor.srv restart-token lookup failed: tid={}, err={:?}",
+                                        fault.tid,
+                                        err
+                                    ),
+                                }
+                            }
+                        };
                     }
                     Ok(None) => {}
                     Err(err) => {
