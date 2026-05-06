@@ -2426,6 +2426,9 @@ fn set_fault_handler_requires_receive_capability() {
 fn page_fault_emits_report_to_fault_handler_endpoint() {
     use super::super::syscall::SyscallError;
     use super::fault_state::SupervisorFaultReportWire;
+    use yarm_ipc_abi::supervisor_abi::{
+        SUPERVISOR_OP_FAULT_REPORT_WIRE, decode_supervisor_envelope,
+    };
 
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
@@ -2476,7 +2479,9 @@ fn page_fault_emits_report_to_fault_handler_endpoint() {
         .expect("handler recv")
         .expect("fault report");
     assert_eq!(report.sender_tid.0, 0);
-    let decoded = SupervisorFaultReportWire::decode(report.as_slice()).expect("decode fault wire");
+    let (opcode, body) = decode_supervisor_envelope(report.as_slice()).expect("decode envelope");
+    assert_eq!(opcode, SUPERVISOR_OP_FAULT_REPORT_WIRE);
+    let decoded = SupervisorFaultReportWire::decode(body).expect("decode fault wire");
     assert_eq!(decoded.faulting_tid, 0);
     assert_eq!(decoded.access, super::super::trap::FaultAccess::Write);
 }
@@ -2491,6 +2496,9 @@ fn fault_policy_defaults_to_kill_task() {
 fn page_fault_with_notify_and_continue_keeps_current_task_running() {
     use super::super::syscall::SyscallError;
     use super::fault_state::SupervisorFaultReportWire;
+    use yarm_ipc_abi::supervisor_abi::{
+        SUPERVISOR_OP_FAULT_REPORT_WIRE, decode_supervisor_envelope,
+    };
 
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
@@ -2539,7 +2547,9 @@ fn page_fault_with_notify_and_continue_keeps_current_task_running() {
         .expect("handler recv")
         .expect("fault report");
     assert_eq!(report.sender_tid.0, 0);
-    let decoded = SupervisorFaultReportWire::decode(report.as_slice()).expect("decode fault wire");
+    let (opcode, body) = decode_supervisor_envelope(report.as_slice()).expect("decode envelope");
+    assert_eq!(opcode, SUPERVISOR_OP_FAULT_REPORT_WIRE);
+    let decoded = SupervisorFaultReportWire::decode(body).expect("decode fault wire");
     assert_eq!(decoded.faulting_tid, 0);
 }
 
@@ -3402,9 +3412,12 @@ fn supervisor_receives_task_exit_report() {
 
     let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
     assert_eq!(msg.opcode, 0xEE);
-    assert_eq!(msg.as_slice().len(), 24);
+    assert_eq!(msg.as_slice().len(), 26);
+    let (opcode, body) =
+        yarm_ipc_abi::supervisor_abi::decode_supervisor_envelope(msg.as_slice()).expect("envelope");
+    assert_eq!(opcode, 0xEE);
     let event =
-        yarm_ipc_abi::supervisor_abi::TaskExitedEvent::decode(msg.as_slice()).expect("event");
+        yarm_ipc_abi::supervisor_abi::TaskExitedEvent::decode(body).expect("event");
     assert_eq!(event.tid, 7);
     assert_eq!(event.exit_code, 99);
     assert_eq!(event.restart_token, 55);
@@ -3432,9 +3445,12 @@ fn supervisor_receives_transfer_revoke_report() {
         msg.opcode,
         yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TRANSFER_REVOKED
     );
-    assert_eq!(msg.as_slice().len(), 32);
+    assert_eq!(msg.as_slice().len(), 34);
+    let (opcode, body) =
+        yarm_ipc_abi::supervisor_abi::decode_supervisor_envelope(msg.as_slice()).expect("envelope");
+    assert_eq!(opcode, yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TRANSFER_REVOKED);
     let event =
-        yarm_ipc_abi::supervisor_abi::TransferRevokedEvent::decode(msg.as_slice()).expect("event");
+        yarm_ipc_abi::supervisor_abi::TransferRevokedEvent::decode(body).expect("event");
     assert_eq!(event.owner_pid, 7);
     assert_eq!(event.cap, 12);
     assert_eq!(event.base, 0xA000);

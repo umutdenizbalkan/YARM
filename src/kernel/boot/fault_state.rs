@@ -9,6 +9,9 @@ use crate::kernel::task::FaultPolicy;
 use crate::kernel::task::TaskStatus;
 use crate::kernel::trap::{FaultAccess, Trap, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
+use yarm_ipc_abi::supervisor_abi::{
+    SUPERVISOR_OP_FAULT_REPORT_WIRE, encode_supervisor_envelope_into,
+};
 
 const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
 const DEMAND_STACK_GROWTH_WINDOW: u64 = 8 * 1024 * 1024;
@@ -144,7 +147,14 @@ impl KernelState {
         }
         .encode();
 
-        let msg = match Message::new(0, &payload) {
+        let mut wire = [0u8; SUPERVISOR_FAULT_REPORT_WIRE_LEN + 2];
+        let Some(enveloped) =
+            encode_supervisor_envelope_into(SUPERVISOR_OP_FAULT_REPORT_WIRE, &payload, &mut wire)
+        else {
+            return;
+        };
+
+        let msg = match Message::new(0, enveloped) {
             Ok(msg) => msg,
             Err(_) => return,
         };

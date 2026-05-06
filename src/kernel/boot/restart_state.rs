@@ -5,8 +5,8 @@ use super::{KernelError, KernelState};
 use crate::kernel::ipc::Message;
 use crate::kernel::task::{RestartToken, TaskStatus, ThreadDetachState};
 use yarm_ipc_abi::supervisor_abi::{
-    SUPERVISOR_OP_TASK_EXITED, SUPERVISOR_OP_TRANSFER_REVOKED, encode_task_exited_event,
-    encode_transfer_revoked_event,
+    SUPERVISOR_OP_TASK_EXITED, SUPERVISOR_OP_TRANSFER_REVOKED, encode_supervisor_envelope_into,
+    encode_task_exited_event, encode_transfer_revoked_event,
 };
 
 impl KernelState {
@@ -19,12 +19,20 @@ impl KernelState {
         let Some(endpoint_idx) = self.with_fault_state(|faults| faults.supervisor_endpoint) else {
             return Ok(());
         };
+        let payload = encode_task_exited_event(tid, code, restart_token);
+        let mut enveloped = [0u8; 2 + 24];
+        let payload = encode_supervisor_envelope_into(
+            SUPERVISOR_OP_TASK_EXITED,
+            &payload,
+            &mut enveloped,
+        )
+        .ok_or(KernelError::WrongObject)?;
         let msg = Message::with_header(
             0,
             SUPERVISOR_OP_TASK_EXITED,
             0,
             None,
-            &encode_task_exited_event(tid, code, restart_token),
+            payload,
         )
         .map_err(|_| KernelError::WrongObject)?;
         let endpoint = self
@@ -50,12 +58,20 @@ impl KernelState {
         let Some(endpoint_idx) = self.with_fault_state(|faults| faults.supervisor_endpoint) else {
             return Ok(());
         };
+        let payload = encode_transfer_revoked_event(owner_pid, cap, base, len);
+        let mut enveloped = [0u8; 2 + 32];
+        let payload = encode_supervisor_envelope_into(
+            SUPERVISOR_OP_TRANSFER_REVOKED,
+            &payload,
+            &mut enveloped,
+        )
+        .ok_or(KernelError::WrongObject)?;
         let msg = Message::with_header(
             0,
             SUPERVISOR_OP_TRANSFER_REVOKED,
             0,
             None,
-            &encode_transfer_revoked_event(owner_pid, cap, base, len),
+            payload,
         )
         .map_err(|_| KernelError::WrongObject)?;
         let endpoint = self

@@ -284,7 +284,11 @@
 - Supervisor idle timeout wait path now uses v2 `IPC_RECV_V2` deadline receive (`recv_v2_with_deadline`); budgeted kernel-side control/fault polling remains unchanged.
 - Supervisor runtime fault/control `recv_v2` path preserves explicit opcode-based routing (fault-report, task-exited, transfer-revoked, unknown-op ignore/log).
 - Supervisor runtime v2 fault/control wire format is opcode-prefixed envelope (`u16 opcode` + payload) for explicit dispatch.
-- Legacy 17-byte raw fault-report wire fallback is retained as **transitional compatibility only**; it is intended to be removed once all supervisor fault/control producers emit opcode-prefixed envelopes.
+- Supervisor fault/control producers now emit opcode-prefixed payload envelopes:
+  - fault report: `[opcode=FAULT_REPORT][17-byte fault wire]`
+  - task exited: `[opcode=TASK_EXITED][TaskExitedEvent bytes]`
+  - transfer revoked: `[opcode=TRANSFER_REVOKED][TransferRevokedEvent bytes]`
+- Legacy 17-byte raw fault-report fallback is still retained as **transitional compatibility only** for one cleanup pass before strict-envelope enforcement.
 - Unknown-op behavior intentionally differs by path:
   - runtime loop logs/ignores unknown opcodes to keep supervisor progress/liveness;
   - `service_step`/test path returns `WrongObject` for stricter validation.

@@ -98,7 +98,6 @@ const SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS: u64 = 100;
 #[cfg(not(test))]
 const SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 10_000;
 
-#[cfg(not(test))]
 fn decode_runtime_fault_opcode_and_payload(payload: &[u8]) -> Option<(u16, &[u8])> {
     if payload.len() == SUPERVISOR_FAULT_REPORT_WIRE_LEN {
         return Some((SUPERVISOR_OP_FAULT_REPORT_WIRE, payload));
@@ -1624,6 +1623,62 @@ mod tests {
     }
 
     #[test]
+    fn runtime_fault_decoder_accepts_envelope_opcodes_and_legacy_fault_wire() {
+        let fault_wire = SupervisorFaultReportWire {
+            tid: 7,
+            fault_addr: 0xAA55,
+            access: 1,
+        }
+        .encode();
+        let (fault_opcode, fault_body) =
+            decode_runtime_fault_opcode_and_payload(&fault_wire).expect("fault wire");
+        assert_eq!(fault_opcode, SUPERVISOR_OP_FAULT_REPORT_WIRE);
+        assert_eq!(fault_body, &fault_wire);
+
+        let task_payload = TaskExitedEvent {
+            tid: 2,
+            exit_code: 3,
+            restart_token: 4,
+        }
+        .encode();
+        let mut task_env = [0u8; 2 + TaskExitedEvent::ENCODED_LEN];
+        let task_msg = yarm_ipc_abi::supervisor_abi::encode_supervisor_envelope_into(
+            SUPERVISOR_OP_TASK_EXITED,
+            &task_payload,
+            &mut task_env,
+        )
+        .expect("task envelope");
+        let (task_opcode, task_body) =
+            decode_runtime_fault_opcode_and_payload(task_msg).expect("task decode");
+        assert_eq!(task_opcode, SUPERVISOR_OP_TASK_EXITED);
+        assert_eq!(TaskExitedEvent::decode(task_body).expect("task event").tid, 2);
+
+        let revoked_payload = TransferRevokedEvent {
+            owner_pid: 9,
+            cap: 8,
+            base: 7,
+            len: 6,
+        }
+        .encode();
+        let mut revoked_env = [0u8; 2 + TransferRevokedEvent::ENCODED_LEN];
+        let revoked_msg = yarm_ipc_abi::supervisor_abi::encode_supervisor_envelope_into(
+            SUPERVISOR_OP_TRANSFER_REVOKED,
+            &revoked_payload,
+            &mut revoked_env,
+        )
+        .expect("revoked envelope");
+        let (revoked_opcode, revoked_body) =
+            decode_runtime_fault_opcode_and_payload(revoked_msg).expect("revoked decode");
+        assert_eq!(revoked_opcode, SUPERVISOR_OP_TRANSFER_REVOKED);
+        assert_eq!(
+            TransferRevokedEvent::decode(revoked_body)
+                .expect("revoked event")
+                .owner_pid,
+            9
+        );
+    }
+
+    #[test]
     fn control_request_status_query_roundtrip_works_with_mock_outbound_ops() {
         let handoff = InitFaultHandoff::new(1, CapId(10), CapId(11), CapId(12), CapId(13), CapId(14), 20);
         let mut supervisor = SupervisorService::new(1, handoff, CoreServicePolicyTable::baseline());
@@ -1837,7 +1892,11 @@ mod tests {
             .try_ipc_recv(handoff.supervisor_fault_recv_cap)
             .expect("recv")
             .expect("msg");
-        let event = TaskExitedEvent::decode(raw.as_slice()).expect("event");
+        let (opcode, body) =
+            yarm_ipc_abi::supervisor_abi::decode_supervisor_envelope(raw.as_slice())
+                .expect("envelope");
+        assert_eq!(opcode, SUPERVISOR_OP_TASK_EXITED);
+        let event = TaskExitedEvent::decode(body).expect("event");
         assert_eq!(event.restart_token, token);
         kernel
             .ipc_send(handoff.supervisor_fault_recv_cap, raw)

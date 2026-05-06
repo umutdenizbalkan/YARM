@@ -4,6 +4,7 @@
 pub const SUPERVISOR_OP_TASK_EXITED: u16 = 0xEE;
 pub const SUPERVISOR_OP_INIT_ALERT: u16 = 0xEF;
 pub const SUPERVISOR_OP_TRANSFER_REVOKED: u16 = 0xF0;
+pub const SUPERVISOR_OP_FAULT_REPORT_WIRE: u16 = 0;
 pub const SUPERVISOR_OP_REGISTER_CORE_SERVICE: u16 = 0x40;
 pub const SUPERVISOR_OP_REGISTER_DRIVER: u16 = 0x41;
 pub const SUPERVISOR_OP_QUERY_STATUS: u16 = 0x42;
@@ -12,6 +13,29 @@ pub const SUPERVISOR_OP_ACK_REDELEGATION: u16 = 0x43;
 pub const DEP_PROCESS_MANAGER: u8 = 1 << 0;
 pub const DEP_VFS: u8 = 1 << 1;
 pub const DEP_SUPERVISOR: u8 = 1 << 2;
+pub const SUPERVISOR_ENVELOPE_OPCODE_LEN: usize = 2;
+
+pub fn encode_supervisor_envelope_into<'a>(
+    opcode: u16,
+    payload: &[u8],
+    out: &'a mut [u8],
+) -> Option<&'a [u8]> {
+    let total_len = SUPERVISOR_ENVELOPE_OPCODE_LEN.checked_add(payload.len())?;
+    if out.len() < total_len {
+        return None;
+    }
+    out[..2].copy_from_slice(&opcode.to_le_bytes());
+    out[2..total_len].copy_from_slice(payload);
+    Some(&out[..total_len])
+}
+
+pub fn decode_supervisor_envelope(payload: &[u8]) -> Option<(u16, &[u8])> {
+    if payload.len() < SUPERVISOR_ENVELOPE_OPCODE_LEN {
+        return None;
+    }
+    let opcode = u16::from_le_bytes([payload[0], payload[1]]);
+    Some((opcode, &payload[2..]))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskExitedEvent {
@@ -445,5 +469,41 @@ impl SupervisorStatusReply {
             pending_restart_due: u64::from_le_bytes(pending_restart_due),
             last_restart_tick: u64::from_le_bytes(last_restart_tick),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_envelope_roundtrip_task_exited() {
+        let payload = encode_task_exited_event(7, 9, 11);
+        let mut out = [0u8; SUPERVISOR_ENVELOPE_OPCODE_LEN + TaskExitedEvent::ENCODED_LEN];
+        let encoded =
+            encode_supervisor_envelope_into(SUPERVISOR_OP_TASK_EXITED, &payload, &mut out)
+                .expect("encode");
+        let (opcode, body) = decode_supervisor_envelope(encoded).expect("decode");
+        assert_eq!(opcode, SUPERVISOR_OP_TASK_EXITED);
+        let event = TaskExitedEvent::decode(body).expect("event");
+        assert_eq!(event.tid, 7);
+        assert_eq!(event.exit_code, 9);
+        assert_eq!(event.restart_token, 11);
+    }
+
+    #[test]
+    fn supervisor_envelope_roundtrip_transfer_revoked() {
+        let payload = encode_transfer_revoked_event(1, 2, 3, 4);
+        let mut out = [0u8; SUPERVISOR_ENVELOPE_OPCODE_LEN + TransferRevokedEvent::ENCODED_LEN];
+        let encoded =
+            encode_supervisor_envelope_into(SUPERVISOR_OP_TRANSFER_REVOKED, &payload, &mut out)
+                .expect("encode");
+        let (opcode, body) = decode_supervisor_envelope(encoded).expect("decode");
+        assert_eq!(opcode, SUPERVISOR_OP_TRANSFER_REVOKED);
+        let event = TransferRevokedEvent::decode(body).expect("event");
+        assert_eq!(event.owner_pid, 1);
+        assert_eq!(event.cap, 2);
+        assert_eq!(event.base, 3);
+        assert_eq!(event.len, 4);
     }
 }
