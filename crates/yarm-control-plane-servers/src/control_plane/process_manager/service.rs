@@ -10,11 +10,11 @@ use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcess
 #[cfg(test)]
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use yarm_ipc_abi::process_abi::{
-    PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
-    ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART,
-    PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V4, PROC_OP_TASK_RESTART_TOKEN,
-    PROC_OP_WAITPID_V2, RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args,
-    TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args,
+    ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT,
+    PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2,
+    PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2,
+    RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args, TaskRestartTokenReply,
+    TaskRestartTokenRequest, WaitPidV2Args,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
@@ -567,16 +567,14 @@ fn from_kernel_ipc_error(err: KernelError) -> KernelIpcError {
     match err {
         KernelError::MissingRight => KernelIpcError::MissingRight,
         KernelError::WouldBlock => KernelIpcError::WouldBlock,
-        KernelError::CapabilityFull
-            => KernelIpcError::CapabilityFull,
+        KernelError::CapabilityFull => KernelIpcError::CapabilityFull,
         KernelError::EndpointFull => KernelIpcError::EndpointFull,
         KernelError::EndpointQueueFull => KernelIpcError::EndpointQueueFull,
         KernelError::TaskTableFull => KernelIpcError::TaskTableFull,
         KernelError::MemoryObjectFull => KernelIpcError::MemoryObjectFull,
         KernelError::SchedulerFull => KernelIpcError::SchedulerFull,
         KernelError::VmFull => KernelIpcError::VmFull,
-        KernelError::InvalidCapability
-            => KernelIpcError::InvalidCapability,
+        KernelError::InvalidCapability => KernelIpcError::InvalidCapability,
         KernelError::WrongObject => KernelIpcError::WrongObject,
         KernelError::StaleCapability => KernelIpcError::StaleCapability,
         KernelError::UserMemoryFault => KernelIpcError::UserMemoryFault,
@@ -960,7 +958,9 @@ impl ProcessService {
             ProcessRequest::ExecuteRestart { tid, restart_token } => {
                 let status = match self.restart_token_for_tid(tid) {
                     None => ExecuteRestartReply::STATUS_NOT_FOUND,
-                    Some(token) if token != restart_token => ExecuteRestartReply::STATUS_TOKEN_MISMATCH,
+                    Some(token) if token != restart_token => {
+                        ExecuteRestartReply::STATUS_TOKEN_MISMATCH
+                    }
                     Some(_) => self.execute_restart_via_kernel_cap(tid, restart_token),
                 };
                 let reply = ExecuteRestartReply::new(status);
@@ -975,21 +975,17 @@ impl ProcessService {
             return ExecuteRestartReply::STATUS_PERMISSION_DENIED;
         };
         let request = ExecuteRestartRequest::new(tid, restart_token);
-        let msg = match Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &request.encode()) {
-            Ok(msg) => msg,
+        let reply_cap = yarm_user_rt::runtime::startup_context()
+            .process_manager_reply_recv_cap
+            .unwrap_or(0);
+        // SAFETY: process-manager owns both caps via startup handoff.
+        let response = match unsafe {
+            yarm_user_rt::syscall::ipc_call_v2(send_cap, reply_cap, &request.encode())
+        } {
+            Ok(response) => response,
             Err(_) => return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED,
         };
-        let reply_cap = yarm_user_rt::runtime::startup_context().process_manager_reply_recv_cap.unwrap_or(0);
-        // SAFETY: process-manager owns both caps via startup handoff.
-        let call = unsafe { yarm_user_rt::syscall::ipc_call(send_cap, reply_cap, &msg) };
-        if call.is_err() {
-            return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED;
-        }
-        // SAFETY: paired with ipc_call above.
-        let Some(reply) = (unsafe { yarm_user_rt::syscall::ipc_recv(reply_cap) }).ok().flatten() else {
-            return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED;
-        };
-        ExecuteRestartReply::decode(reply.as_slice())
+        ExecuteRestartReply::decode(&response.payload[..response.len])
             .map(|r| r.status)
             .unwrap_or(ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED)
     }
@@ -1065,10 +1061,7 @@ fn roundtrip_ipc(
 
 #[cfg(test)]
 pub trait ProcessServiceKernelIpcRuntime {
-    fn create_endpoint(
-        &self,
-        depth: usize,
-    ) -> Result<(usize, CapId, CapId), ProcessManagerError>;
+    fn create_endpoint(&self, depth: usize) -> Result<(usize, CapId, CapId), ProcessManagerError>;
 
     fn control_plane_set_process_cnode_slots_via_syscall(
         &self,
@@ -1092,10 +1085,7 @@ impl<T> ProcessServiceKernelIpcRuntime for T
 where
     T: RuntimeStateAccess<KernelState>,
 {
-    fn create_endpoint(
-        &self,
-        depth: usize,
-    ) -> Result<(usize, CapId, CapId), ProcessManagerError> {
+    fn create_endpoint(&self, depth: usize) -> Result<(usize, CapId, CapId), ProcessManagerError> {
         self.with_state(|kernel| map_kernel_ipc_err(kernel.create_endpoint(depth)))
     }
 
@@ -1282,7 +1272,8 @@ fn run_request_loop_over_kernel_ipc_with_requested_cnode_slots(
         return Err(ProcessManagerError::Malformed);
     }
     if let Some(requested_slots) = recorded_requested_slots.or(requested_cnode_slots) {
-        runtime.control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)?;
+        runtime
+            .control_plane_set_process_cnode_slots_via_syscall(spawned.pid.0, requested_slots)?;
     }
 
     let _ = roundtrip_ipc(
@@ -1627,7 +1618,10 @@ mod tests {
                 .status
         };
 
-        assert_eq!(call(&mut service, 9, 1), ExecuteRestartReply::STATUS_NOT_FOUND);
+        assert_eq!(
+            call(&mut service, 9, 1),
+            ExecuteRestartReply::STATUS_NOT_FOUND
+        );
 
         let register = Message::with_header(
             0,
