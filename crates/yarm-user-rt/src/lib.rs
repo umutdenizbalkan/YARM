@@ -26,6 +26,11 @@ pub mod capability {
 
 pub mod syscall {
     use crate::ipc::Message;
+    use yarm_ipc_abi::ipc_v2::{
+        IpcRegisterBlockV2, IPC_ABI_V2_BLOCK_SIZE, IPC_V2_FLAG_INLINE_PAYLOAD,
+        IPC_V2_FLAG_TRANSFER_CAP, IPC_V2_NO_TRANSFER_CAP, IPC_V2_OP_CALL, IPC_V2_OP_RECV,
+        IPC_V2_OP_REPLY, IPC_V2_OP_SEND,
+    };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(usize)]
@@ -46,6 +51,10 @@ pub mod syscall {
     const SYSCALL_IPC_RECV_NR: usize = 2;
     const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
     const SYSCALL_IPC_CALL_NR: usize = 4;
+    const SYSCALL_IPC_SEND_V2_NR: usize = 15;
+    const SYSCALL_IPC_RECV_V2_NR: usize = 16;
+    const SYSCALL_IPC_CALL_V2_NR: usize = 17;
+    const SYSCALL_IPC_REPLY_V2_NR: usize = 18;
     const SYSCALL_YIELD_NR: usize = 0;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
@@ -242,6 +251,152 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
+    }
+
+
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct IpcV2Response {
+        pub status: u64,
+        pub len: usize,
+        pub transfer_cap: Option<u64>,
+        pub payload: [u8; Message::MAX_PAYLOAD],
+    }
+
+    pub(crate) fn fill_v2_payload_block(block: &mut IpcRegisterBlockV2, payload: &[u8]) -> core::result::Result<(), SyscallError> {
+        if payload.len() > Message::MAX_PAYLOAD {
+            return Err(SyscallError::InvalidArgs);
+        }
+        block.len = payload.len() as u64;
+        if payload.len() <= 64 {
+            block.flags |= IPC_V2_FLAG_INLINE_PAYLOAD;
+            block.inline_words = [0; 8];
+            for (idx, chunk) in payload.chunks(8).enumerate() {
+                let mut lane = [0u8; 8];
+                lane[..chunk.len()].copy_from_slice(chunk);
+                block.inline_words[idx] = u64::from_le_bytes(lane);
+            }
+        } else {
+            block.ptr_or_offset = payload.as_ptr() as u64;
+            block.flags &= !IPC_V2_FLAG_INLINE_PAYLOAD;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn decode_v2_response(block: &IpcRegisterBlockV2) -> core::result::Result<IpcV2Response, SyscallError> {
+        let len = usize::try_from(block.ret_len).map_err(|_| SyscallError::Internal)?;
+        if len > Message::MAX_PAYLOAD || len > 64 {
+            return Err(SyscallError::Internal);
+        }
+        let mut payload = [0u8; Message::MAX_PAYLOAD];
+        if (block.flags & IPC_V2_FLAG_INLINE_PAYLOAD) != 0 {
+            for (idx, word) in block.inline_words.iter().enumerate() {
+                let start = idx * 8;
+                if start >= len {
+                    break;
+                }
+                let bytes = word.to_le_bytes();
+                let take = core::cmp::min(8, len - start);
+                payload[start..start + take].copy_from_slice(&bytes[..take]);
+            }
+        }
+        let transfer_cap = if block.ret_transfer_cap == IPC_V2_NO_TRANSFER_CAP {
+            None
+        } else {
+            Some(block.ret_transfer_cap)
+        };
+        Ok(IpcV2Response {
+            status: block.ret_status,
+            len,
+            transfer_cap,
+            payload,
+        })
+    }
+
+    #[inline]
+    pub unsafe fn ipc_send_v2(
+        endpoint_cap: u32,
+        payload: &[u8],
+        transfer_cap: Option<u64>,
+    ) -> core::result::Result<(), SyscallError> {
+        let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        block.endpoint_cap = endpoint_cap as u64;
+        fill_v2_payload_block(&mut block, payload)?;
+        if let Some(cap) = transfer_cap {
+            block.flags |= IPC_V2_FLAG_TRANSFER_CAP;
+            block.transfer_cap = cap;
+        }
+        let args = [
+            (&mut block as *mut IpcRegisterBlockV2) as usize,
+            IPC_ABI_V2_BLOCK_SIZE,
+            0,0,0,0
+        ];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_SEND_V2_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 { return Err(decode_syscall_error(ret.error)); }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 { return Err(decode_syscall_error(ret.ret0)); }
+        Ok(())
+    }
+
+    #[inline]
+    pub unsafe fn ipc_recv_v2(recv_cap: u32) -> core::result::Result<Option<IpcV2Response>, SyscallError> {
+        let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
+        block.endpoint_cap = recv_cap as u64;
+        let args = [(&mut block as *mut IpcRegisterBlockV2) as usize, IPC_ABI_V2_BLOCK_SIZE, 0,0,0,0];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_V2_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            let err = decode_syscall_error(ret.error);
+            return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            let err = decode_syscall_error(ret.ret0);
+            return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
+        }
+        Ok(Some(decode_v2_response(&block)?))
+    }
+
+    #[inline]
+    pub unsafe fn ipc_reply_v2(
+        reply_cap: u32,
+        payload: &[u8],
+        transfer_cap: Option<u64>,
+    ) -> core::result::Result<(), SyscallError> {
+        let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        block.endpoint_cap = reply_cap as u64;
+        fill_v2_payload_block(&mut block, payload)?;
+        if let Some(cap) = transfer_cap {
+            block.flags |= IPC_V2_FLAG_TRANSFER_CAP;
+            block.transfer_cap = cap;
+        }
+        let args = [(&mut block as *mut IpcRegisterBlockV2) as usize, IPC_ABI_V2_BLOCK_SIZE, 0,0,0,0];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_REPLY_V2_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 { return Err(decode_syscall_error(ret.error)); }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 { return Err(decode_syscall_error(ret.ret0)); }
+        Ok(())
+    }
+
+    #[inline]
+    pub unsafe fn ipc_call_v2(
+        send_cap: u32,
+        reply_recv_cap: u32,
+        payload: &[u8],
+    ) -> core::result::Result<IpcV2Response, SyscallError> {
+        let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        block.endpoint_cap = send_cap as u64;
+        block.aux0 = reply_recv_cap as u64;
+        fill_v2_payload_block(&mut block, payload)?;
+        let args = [(&mut block as *mut IpcRegisterBlockV2) as usize, IPC_ABI_V2_BLOCK_SIZE, 0,0,0,0];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_CALL_V2_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 { return Err(decode_syscall_error(ret.error)); }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 { return Err(decode_syscall_error(ret.ret0)); }
+        decode_v2_response(&block)
     }
 
     #[inline]
@@ -641,6 +796,25 @@ pub mod process {
 #[cfg(test)]
 mod tests {
     use crate::runtime::{install_startup_arg_slots, startup_context};
+
+    #[test]
+    fn ipc_v2_inline_encoder_roundtrip() {
+        let mut block = yarm_ipc_abi::ipc_v2::IpcRegisterBlockV2::new_v2(yarm_ipc_abi::ipc_v2::IPC_V2_OP_SEND);
+        super::syscall::fill_v2_payload_block(&mut block, b"hello").expect("encode");
+        assert_ne!(block.flags & yarm_ipc_abi::ipc_v2::IPC_V2_FLAG_INLINE_PAYLOAD, 0);
+        block.ret_len = 5;
+        let decoded = super::syscall::decode_v2_response(&block).expect("decode");
+        assert_eq!(&decoded.payload[..5], b"hello");
+    }
+
+    #[test]
+    fn ipc_v2_large_payload_uses_pointer_mode() {
+        let payload = [7u8; 80];
+        let mut block = yarm_ipc_abi::ipc_v2::IpcRegisterBlockV2::new_v2(yarm_ipc_abi::ipc_v2::IPC_V2_OP_SEND);
+        super::syscall::fill_v2_payload_block(&mut block, &payload).expect("encode");
+        assert_eq!(block.flags & yarm_ipc_abi::ipc_v2::IPC_V2_FLAG_INLINE_PAYLOAD, 0);
+        assert_ne!(block.ptr_or_offset, 0);
+    }
 
     #[test]
     fn startup_process_manager_caps_require_both_slots() {

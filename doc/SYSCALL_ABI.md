@@ -263,3 +263,6 @@
   - `arg1`: block size (eventually must equal `IPC_ABI_V2_BLOCK_SIZE`)
   - `arg2..arg5`: reserved, currently ignored by stubs
 - v1 IPC syscalls remain the active behavior path.
+
+
+- `yarm-user-rt` now exposes additive experimental wrappers `ipc_send_v2`, `ipc_recv_v2`, `ipc_call_v2`, and `ipc_reply_v2`; v1 wrappers remain unchanged/default.
