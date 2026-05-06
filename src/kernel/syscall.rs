@@ -1368,6 +1368,106 @@ mod tests {
     }
 
     #[test]
+    fn syscall_recv_v2_inline_fastpath_exact_64_bytes() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let send_ptr = 0x7220usize;
+        let recv_ptr = 0x7230usize;
+
+        let payload = [0xABu8; 64];
+        state.copy_to_current_user(0x9000, &payload).expect("user write");
+        let mut send_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        send_block.endpoint_cap = send_cap.0;
+        send_block.ptr_or_offset = 0x9000;
+        send_block.len = payload.len() as u64;
+        write_v2_block_to_user_for_test(&mut state, send_ptr, &send_block);
+        let mut send_frame = TrapFrame::new(SYSCALL_IPC_SEND_V2_NR, [send_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut send_frame).expect("send");
+
+        let mut recv_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
+        recv_block.endpoint_cap = recv_cap.0;
+        write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
+        let mut recv_frame = TrapFrame::new(SYSCALL_IPC_RECV_V2_NR, [recv_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut recv_frame).expect("recv");
+
+        let mut bytes = [0u8; IPC_ABI_V2_BLOCK_SIZE];
+        read_user_bytes_exact(&state, recv_ptr, &mut bytes).expect("read");
+        let out = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const IpcRegisterBlockV2) };
+        assert_eq!(out.ret_len, 64);
+        assert_ne!(out.flags & IPC_V2_FLAG_INLINE_PAYLOAD, 0);
+    }
+
+    #[test]
+    fn syscall_recv_v2_large_reply_requires_copyout_flag() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let send_ptr = 0x7240usize;
+        let recv_ptr = 0x7250usize;
+        let payload = [0xCDu8; 65];
+        state.copy_to_current_user(0x9100, &payload).expect("user write");
+        let mut send_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        send_block.endpoint_cap = send_cap.0;
+        send_block.ptr_or_offset = 0x9100;
+        send_block.len = payload.len() as u64;
+        write_v2_block_to_user_for_test(&mut state, send_ptr, &send_block);
+        let mut send_frame = TrapFrame::new(SYSCALL_IPC_SEND_V2_NR, [send_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut send_frame).expect("send");
+
+        let mut recv_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
+        recv_block.endpoint_cap = recv_cap.0;
+        write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
+        let mut recv_frame = TrapFrame::new(SYSCALL_IPC_RECV_V2_NR, [recv_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut state, &mut recv_frame), Err(SyscallError::InvalidArgs));
+    }
+
+    #[test]
+    fn syscall_recv_v2_large_reply_copyout_success_and_small_capacity_error() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let send_ptr = 0x7260usize;
+        let recv_ptr = 0x7270usize;
+        let payload = [0xEEu8; 65];
+
+        // Success case.
+        state.copy_to_current_user(0x9200, &payload).expect("user write payload");
+        let mut send_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        send_block.endpoint_cap = send_cap.0;
+        send_block.ptr_or_offset = 0x9200;
+        send_block.len = payload.len() as u64;
+        write_v2_block_to_user_for_test(&mut state, send_ptr, &send_block);
+        let mut send_frame = TrapFrame::new(SYSCALL_IPC_SEND_V2_NR, [send_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut send_frame).expect("send");
+
+        let mut recv_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
+        recv_block.endpoint_cap = recv_cap.0;
+        recv_block.flags = IPC_V2_FLAG_RECV_COPYOUT;
+        recv_block.aux1 = 0x9300;
+        recv_block.len = 65;
+        write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
+        let mut recv_frame = TrapFrame::new(SYSCALL_IPC_RECV_V2_NR, [recv_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut recv_frame).expect("recv copyout");
+        let copied = state.copy_from_current_user(0x9300, 65).expect("copied");
+        assert_eq!(&copied[..], &payload);
+        let mut bytes = [0u8; IPC_ABI_V2_BLOCK_SIZE];
+        read_user_bytes_exact(&state, recv_ptr, &mut bytes).expect("read");
+        let out = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const IpcRegisterBlockV2) };
+        assert_eq!(out.ret_len, 65);
+        assert_ne!(out.flags & IPC_V2_FLAG_RET_COPYOUT, 0);
+        assert_eq!(out.inline_words, [0; 8]);
+
+        // Small-capacity case (current behavior: InvalidArgs and block is not written back).
+        state.copy_to_current_user(0x9400, &payload).expect("user write payload2");
+        send_block.ptr_or_offset = 0x9400;
+        write_v2_block_to_user_for_test(&mut state, send_ptr, &send_block);
+        let mut send_frame2 = TrapFrame::new(SYSCALL_IPC_SEND_V2_NR, [send_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut send_frame2).expect("send2");
+        recv_block.len = 64;
+        write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
+        let mut recv_frame2 = TrapFrame::new(SYSCALL_IPC_RECV_V2_NR, [recv_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut state, &mut recv_frame2), Err(SyscallError::InvalidArgs));
+    }
+
+    #[test]
     fn syscall_ipc_reply_v2_inline_routes_and_consumes_reply_cap() {
         let mut state = Bootstrap::init().expect("kernel");
         let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
@@ -1594,6 +1694,61 @@ mod tests {
             dispatch(&mut state, &mut frame),
             Err(SyscallError::InvalidArgs)
         );
+    }
+
+    #[test]
+    fn syscall_ipc_call_v2_large_reply_copyout_and_no_copyout_error() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let req_ptr = 0xA000usize;
+        let reply_ptr = 0xA100usize;
+        let call_ptr = 0xA200usize;
+        let reply_bytes = [0x5Au8; 65];
+
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD | IPC_V2_FLAG_RECV_COPYOUT;
+        call_block.len = 65;
+        call_block.aux0 = recv_cap.0;
+        call_block.aux1 = 0xA300;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"rqst0000");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(SYSCALL_IPC_CALL_V2_NR, [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        let _ = dispatch(&mut state, &mut call_frame);
+        let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        let reply_cap = received.transferred_cap().expect("reply cap");
+        state.copy_to_current_user(req_ptr, &reply_bytes).expect("user write");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = req_ptr as u64;
+        reply_block.len = 65;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr, &reply_block);
+        let mut reply_frame = TrapFrame::new(SYSCALL_IPC_REPLY_V2_NR, [reply_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut reply_frame).expect("reply");
+        let out_block = state.copy_from_current_user(call_ptr, IPC_ABI_V2_BLOCK_SIZE).expect("read call");
+        let out = unsafe { core::ptr::read_unaligned(out_block.as_ptr() as *const IpcRegisterBlockV2) };
+        assert_eq!(out.ret_len, 65);
+        assert_ne!(out.flags & IPC_V2_FLAG_RET_COPYOUT, 0);
+        let copied = state.copy_from_current_user(0xA300, 65).expect("copied");
+        assert_eq!(&copied[..], &reply_bytes);
+
+        // Same reply size without copyout flag should fail.
+        let mut no_copy_call = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        no_copy_call.endpoint_cap = send_cap.0;
+        no_copy_call.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        no_copy_call.len = 8;
+        no_copy_call.aux0 = recv_cap.0;
+        no_copy_call.inline_words[0] = u64::from_le_bytes(*b"rqst0001");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &no_copy_call);
+        let mut no_copy_frame = TrapFrame::new(SYSCALL_IPC_CALL_V2_NR, [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        let _ = dispatch(&mut state, &mut no_copy_frame);
+        let received2 = state.ipc_recv(recv_cap).expect("recv2").expect("msg2");
+        let reply_cap2 = received2.transferred_cap().expect("reply cap2");
+        reply_block.endpoint_cap = reply_cap2.0;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr, &reply_block);
+        let mut reply_frame2 = TrapFrame::new(SYSCALL_IPC_REPLY_V2_NR, [reply_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut reply_frame2).expect("reply2");
+        assert_eq!(dispatch(&mut state, &mut no_copy_frame), Err(SyscallError::InvalidArgs));
     }
     #[test]
     fn syscall_abi_numbers_are_frozen() {

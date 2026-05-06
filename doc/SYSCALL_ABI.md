@@ -264,8 +264,14 @@
 
 ### Current reply-size limitation
 
-- Current kernel `IPC_CALL_V2` return path supports inline replies up to **64 bytes** only.
-- Reply payloads larger than 64 bytes are currently rejected in the call-v2 return path.
+- Inline fastpath remains unchanged: replies up to **64 bytes** are returned inline via `inline_words`.
+- Stage 1 large-reply copyout support for `IPC_RECV_V2` and `IPC_CALL_V2`:
+  - callers set `IPC_V2_FLAG_RECV_COPYOUT` to request copyout mode;
+  - `aux1` is the userspace reply buffer pointer;
+  - `len` is reply buffer capacity in bytes;
+  - on success, kernel sets `IPC_V2_FLAG_RET_COPYOUT`, writes payload bytes to `aux1`, and reports actual reply size in `ret_len`;
+  - no truncation is performed;
+  - if `actual_reply_len > len` (capacity), current behavior returns `InvalidArgs` (temporary behavior; future `BufferTooSmall` mapping is planned).
 
 - `yarm-user-rt` exposes additive wrappers `ipc_send_v2`, `ipc_recv_v2`, `ipc_call_v2`, and `ipc_reply_v2`; v1 wrappers remain unchanged/default.
 - `IPC_RECV_V2` timeout contract: `aux0 = timeout_ticks`, `aux1 = 0` (reserved and must be zero).

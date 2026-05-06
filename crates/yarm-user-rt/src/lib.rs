@@ -940,4 +940,15 @@ mod tests {
         .expect("typed reply");
         assert_eq!(decoded, 7);
     }
+
+    #[test]
+    fn decode_v2_response_accepts_ret_copyout_mode() {
+        let mut block = yarm_ipc_abi::ipc_v2::IpcRegisterBlockV2::new_v2(
+            yarm_ipc_abi::ipc_v2::IPC_V2_OP_RECV,
+        );
+        block.flags = yarm_ipc_abi::ipc_v2::IPC_V2_FLAG_RET_COPYOUT;
+        block.ret_len = 65;
+        let decoded = super::syscall::decode_v2_response(&block).expect("decode");
+        assert_eq!(decoded.len, 65);
+    }
 }
