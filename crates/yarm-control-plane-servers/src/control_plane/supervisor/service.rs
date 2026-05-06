@@ -99,18 +99,12 @@ const SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS: u64 = 100;
 const SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 10_000;
 
 fn decode_runtime_fault_opcode_and_payload(payload: &[u8]) -> Option<(u16, &[u8])> {
-    if payload.len() == SUPERVISOR_FAULT_REPORT_WIRE_LEN {
-        return Some((SUPERVISOR_OP_FAULT_REPORT_WIRE, payload));
-    }
-    if payload.len() < 2 {
-        return None;
-    }
-    let opcode = u16::from_le_bytes([payload[0], payload[1]]);
+    let (opcode, body) = yarm_ipc_abi::supervisor_abi::decode_supervisor_envelope(payload)?;
     if opcode == SUPERVISOR_OP_FAULT_REPORT_WIRE
         || opcode == SUPERVISOR_OP_TASK_EXITED
         || opcode == SUPERVISOR_OP_TRANSFER_REVOKED
     {
-        Some((opcode, &payload[2..]))
+        Some((opcode, body))
     } else {
         None
     }
@@ -1623,15 +1617,24 @@ mod tests {
     }
 
     #[test]
-    fn runtime_fault_decoder_accepts_envelope_opcodes_and_legacy_fault_wire() {
-        let fault_wire = SupervisorFaultReportWire {
-            tid: 7,
-            fault_addr: 0xAA55,
-            access: 1,
-        }
-        .encode();
+    fn runtime_fault_decoder_accepts_envelope_opcodes_and_rejects_legacy_fault_wire() {
+        let mut fault_wire = [0u8; SUPERVISOR_FAULT_REPORT_WIRE_LEN];
+        fault_wire[SUPERVISOR_FAULT_REPORT_TID_START..SUPERVISOR_FAULT_REPORT_TID_END]
+            .copy_from_slice(&7u64.to_le_bytes());
+        fault_wire[SUPERVISOR_FAULT_REPORT_ADDR_START..SUPERVISOR_FAULT_REPORT_ADDR_END]
+            .copy_from_slice(&0xAA55u64.to_le_bytes());
+        fault_wire[SUPERVISOR_FAULT_REPORT_ACCESS_INDEX] = 1;
+        assert!(decode_runtime_fault_opcode_and_payload(&fault_wire).is_none());
+
+        let mut fault_env = [0u8; 2 + SUPERVISOR_FAULT_REPORT_WIRE_LEN];
+        let fault_msg = yarm_ipc_abi::supervisor_abi::encode_supervisor_envelope_into(
+            SUPERVISOR_OP_FAULT_REPORT_WIRE,
+            &fault_wire,
+            &mut fault_env,
+        )
+        .expect("fault envelope");
         let (fault_opcode, fault_body) =
-            decode_runtime_fault_opcode_and_payload(&fault_wire).expect("fault wire");
+            decode_runtime_fault_opcode_and_payload(fault_msg).expect("fault decode");
         assert_eq!(fault_opcode, SUPERVISOR_OP_FAULT_REPORT_WIRE);
         assert_eq!(fault_body, &fault_wire);
 

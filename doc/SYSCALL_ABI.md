@@ -288,7 +288,8 @@
   - fault report: `[opcode=FAULT_REPORT][17-byte fault wire]`
   - task exited: `[opcode=TASK_EXITED][TaskExitedEvent bytes]`
   - transfer revoked: `[opcode=TRANSFER_REVOKED][TransferRevokedEvent bytes]`
-- Legacy 17-byte raw fault-report fallback is still retained as **transitional compatibility only** for one cleanup pass before strict-envelope enforcement.
+- Envelope format is now mandatory for supervisor runtime fault/control `recv_v2` dispatch.
+- Legacy raw 17-byte fault payloads are no longer accepted by runtime decoder.
 - Unknown-op behavior intentionally differs by path:
   - runtime loop logs/ignores unknown opcodes to keep supervisor progress/liveness;
   - `service_step`/test path returns `WrongObject` for stricter validation.
