@@ -21,10 +21,8 @@ use crate::control_plane::init::{
 };
 use yarm_ipc_abi::supervisor_abi::{
     DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert, InitAlertKind, SupervisorStatusReply,
-    TaskExitedEvent,
+    TaskExitedEvent, TransferRevokedEvent, SUPERVISOR_OP_TASK_EXITED, SUPERVISOR_OP_TRANSFER_REVOKED,
 };
-#[cfg(test)]
-use yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TASK_EXITED;
 #[cfg(not(test))]
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, RegisterSupervisedTask, TaskRestartTokenReply,
@@ -35,7 +33,7 @@ use yarm_ipc_abi::supervisor_abi::{
     CoreServiceRegistrationKind, RedelegationAckRequest, RegisterCoreServiceRequest,
     RegisterDriverRequest, SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER,
-    SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusRequest, TransferRevokedEvent,
+    SupervisorStatusRequest,
 };
 
 const SUPERVISOR_FAULT_REPORT_WIRE_LEN: usize = 17;
@@ -50,7 +48,6 @@ const SUPERVISOR_FAULT_EXIT_CODE_ADDR_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 /// Kernel-originated supervisor fault-report notification opcode.
 ///
 /// The kernel fault path uses `Message::new(0, payload)` for the 17-byte fault report wire payload.
-#[cfg(test)]
 const SUPERVISOR_OP_FAULT_REPORT_WIRE: u16 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +97,25 @@ const SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS: u64 = 1;
 const SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS: u64 = 100;
 #[cfg(not(test))]
 const SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 10_000;
+
+#[cfg(not(test))]
+fn decode_runtime_fault_opcode_and_payload(payload: &[u8]) -> Option<(u16, &[u8])> {
+    if payload.len() == SUPERVISOR_FAULT_REPORT_WIRE_LEN {
+        return Some((SUPERVISOR_OP_FAULT_REPORT_WIRE, payload));
+    }
+    if payload.len() < 2 {
+        return None;
+    }
+    let opcode = u16::from_le_bytes([payload[0], payload[1]]);
+    if opcode == SUPERVISOR_OP_FAULT_REPORT_WIRE
+        || opcode == SUPERVISOR_OP_TASK_EXITED
+        || opcode == SUPERVISOR_OP_TRANSFER_REVOKED
+    {
+        Some((opcode, &payload[2..]))
+    } else {
+        None
+    }
+}
 
 #[cfg(not(test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1164,30 +1180,22 @@ pub fn run() {
                     Ok(Some(msg)) => {
                         made_progress = true;
                         let payload = &msg.payload[..msg.len];
-                        match SupervisorFaultReportWire::decode(payload) {
-                            None => {
-                                if let Some(event) = TaskExitedEvent::decode(payload) {
-                                    match register_supervised_task_with_process_manager(
-                                        &mut transport,
-                                        process_manager_caps,
-                                        event.tid,
-                                        event.restart_token,
-                                    ) {
-                                        Ok(()) => {}
-                                        Err(err) => yarm_user_rt::user_log!(
-                                            "supervisor.srv failed to register supervised task restart-token: tid={}, err={:?}",
-                                            event.tid,
-                                            err
-                                        ),
-                                    }
-                                } else {
+                        let Some((opcode, body)) = decode_runtime_fault_opcode_and_payload(payload) else {
+                            yarm_user_rt::user_log!(
+                                "supervisor.srv fault/control wire decode failed: len={}",
+                                payload.len()
+                            );
+                            continue;
+                        };
+                        match opcode {
+                            SUPERVISOR_OP_FAULT_REPORT_WIRE => {
+                                let Some(fault) = SupervisorFaultReportWire::decode(body) else {
                                     yarm_user_rt::user_log!(
-                                        "supervisor.srv fault/control wire decode failed: len={}",
-                                        payload.len()
+                                        "supervisor.srv fault report decode failed: len={}",
+                                        body.len()
                                     );
-                                }
-                            }
-                            Some(fault) => {
+                                    continue;
+                                };
                                 match query_restart_token_via_process_manager(
                                     &mut transport,
                                     process_manager_caps,
@@ -1245,7 +1253,42 @@ pub fn run() {
                                     ),
                                 }
                             }
-                        };
+                            SUPERVISOR_OP_TASK_EXITED => {
+                                let Some(event) = TaskExitedEvent::decode(body) else {
+                                    yarm_user_rt::user_log!(
+                                        "supervisor.srv task-exited decode failed: len={}",
+                                        body.len()
+                                    );
+                                    continue;
+                                };
+                                match register_supervised_task_with_process_manager(
+                                    &mut transport,
+                                    process_manager_caps,
+                                    event.tid,
+                                    event.restart_token,
+                                ) {
+                                    Ok(()) => {}
+                                    Err(err) => yarm_user_rt::user_log!(
+                                        "supervisor.srv failed to register supervised task restart-token: tid={}, err={:?}",
+                                        event.tid,
+                                        err
+                                    ),
+                                }
+                            }
+                            SUPERVISOR_OP_TRANSFER_REVOKED => {
+                                if TransferRevokedEvent::decode(body).is_none() {
+                                    yarm_user_rt::user_log!(
+                                        "supervisor.srv transfer-revoked decode failed: len={}",
+                                        body.len()
+                                    );
+                                }
+                            }
+                            other => yarm_user_rt::user_log!(
+                                "supervisor.srv ignored unsupported fault/control opcode={} len={}",
+                                other,
+                                body.len()
+                            ),
+                        }
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -1567,6 +1610,17 @@ mod tests {
         assert!(src.contains("fn register_supervised_task_with_process_manager(\n    transport: &mut impl IpcTransportV2,"));
         assert!(src.contains("fn execute_restart_via_process_manager(\n    transport: &mut impl IpcTransportV2,"));
         assert!(src.contains("request_reply_v2(req_cap, rep_cap"));
+    }
+
+    #[test]
+    fn supervisor_runtime_fault_recv_v2_routes_by_explicit_opcode() {
+        let src = include_str!("service.rs");
+        assert!(src.contains("decode_runtime_fault_opcode_and_payload(payload)"));
+        assert!(src.contains("match opcode {"));
+        assert!(src.contains("SUPERVISOR_OP_FAULT_REPORT_WIRE =>"));
+        assert!(src.contains("SUPERVISOR_OP_TASK_EXITED =>"));
+        assert!(src.contains("SUPERVISOR_OP_TRANSFER_REVOKED =>"));
+        assert!(!src.contains("if let Some(event) = TaskExitedEvent::decode(payload)"));
     }
 
     #[test]

@@ -274,7 +274,7 @@
   - no truncation is performed;
   - if `actual_reply_len > len` (capacity), returns `BufferTooSmall`.
 
-- `yarm-user-rt` exposes additive wrappers `ipc_send_v2`, `ipc_recv_v2`, `ipc_call_v2`, and `ipc_reply_v2`; v1 wrappers remain unchanged/default.
+- `yarm-user-rt` exposes additive wrappers `ipc_send_v2`, `ipc_recv_v2`, `ipc_call_v2`, and `ipc_reply_v2`.
 - `IPC_RECV_V2` timeout contract: `aux0 = timeout_ticks`, `aux1 = 0` (reserved and must be zero).
 - `IPC_RECV_V2` with `aux0 == 0` performs a nonblocking probe; `aux0 > 0` performs deadline receive using kernel timeout machinery.
 - `yarm-user-rt::ipc_recv_v2_with_deadline` maps both `WouldBlock` and `TimedOut` to `Ok(None)` (matching v1 timeout wrapper behavior).
@@ -282,6 +282,7 @@
 - Migration state: user-runtime IPC v1 API surface (`IpcTransport`, `ipc_send`, `ipc_recv`, `ipc_recv_with_deadline`, `ipc_call`) has been removed; v2 transport/wrappers are the default userspace IPC API.
 - Supervisor runtime process-manager helper RPCs (restart-token query, supervised-task registration, execute-restart) now use `IpcTransportV2` + `request_reply_v2(...)`.
 - Supervisor idle timeout wait path now uses v2 `IPC_RECV_V2` deadline receive (`recv_v2_with_deadline`); budgeted kernel-side control/fault polling remains unchanged.
+- Supervisor runtime fault/control `recv_v2` path preserves explicit opcode-based routing (fault-report, task-exited, transfer-revoked, unknown-op ignore/log).
 - POSIX-compat runtime `getpid` process-manager IPC path now uses `IpcTransportV2` request/reply (`request_reply_v2(...)`) rather than v1 transport send/recv choreography.
 - Default user-runtime IPC path is v2 (`IpcTransportV2` and `ipc_*_v2` wrappers); legacy compatibility now exists only at kernel syscall ABI layer.
 - Kernel v1 IPC syscall numbers are intentionally kept as reserved holes for ABI numbering stability; dispatch now returns deterministic legacy-removed errors for slots `1/2/5/6/7`.
