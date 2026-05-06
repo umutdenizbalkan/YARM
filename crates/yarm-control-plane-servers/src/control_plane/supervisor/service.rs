@@ -1288,11 +1288,13 @@ pub fn run() {
 #[cfg(not(test))]
 #[inline]
 fn supervisor_idle_wait(
-    transport: &mut impl IpcTransport,
+    transport: &mut impl IpcTransportV2,
     control_recv_cap: u32,
 ) -> Result<bool, KernelError> {
-    match transport.recv_with_deadline(control_recv_cap, SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS)
-    {
+    match transport.recv_v2_with_deadline(
+        control_recv_cap,
+        SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS,
+    ) {
         Ok(Some(_msg)) => Ok(true),
         Ok(None) => Ok(false),
         Err(_err) => Ok(false),
@@ -1553,6 +1555,8 @@ mod tests {
         let legacy_call = ["kernel", ".ipc_recv", "("].concat();
         assert!(src.contains("try_ipc_recv("));
         assert!(src.contains("ipc_recv_with_deadline("));
+        assert!(src.contains("transport.recv_v2_with_deadline("));
+        assert!(!src.contains("transport.recv_with_deadline("));
         assert!(!src.contains(legacy_call.as_str()));
     }
 
