@@ -12,6 +12,8 @@ pub const IPC_V2_OP_REPLY: u16 = 4;
 
 pub const IPC_V2_FLAG_INLINE_PAYLOAD: u32 = 1 << 0;
 pub const IPC_V2_FLAG_TRANSFER_CAP: u32 = 1 << 1;
+pub const IPC_V2_FLAG_RECV_COPYOUT: u32 = 1 << 2;
+pub const IPC_V2_FLAG_RET_COPYOUT: u32 = 1 << 3;
 
 pub const IPC_V2_NO_TRANSFER_CAP: u64 = u64::MAX;
 

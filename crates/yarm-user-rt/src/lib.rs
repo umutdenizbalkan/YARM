@@ -28,8 +28,8 @@ pub mod syscall {
     use crate::ipc::Message;
     use yarm_ipc_abi::ipc_v2::{
         IpcRegisterBlockV2, IPC_ABI_V2_BLOCK_SIZE, IPC_V2_FLAG_INLINE_PAYLOAD,
-        IPC_V2_FLAG_TRANSFER_CAP, IPC_V2_NO_TRANSFER_CAP, IPC_V2_OP_CALL, IPC_V2_OP_RECV,
-        IPC_V2_OP_REPLY, IPC_V2_OP_SEND,
+        IPC_V2_FLAG_RECV_COPYOUT, IPC_V2_FLAG_RET_COPYOUT, IPC_V2_FLAG_TRANSFER_CAP,
+        IPC_V2_NO_TRANSFER_CAP, IPC_V2_OP_CALL, IPC_V2_OP_RECV, IPC_V2_OP_REPLY, IPC_V2_OP_SEND,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,11 +214,14 @@ pub mod syscall {
 
     pub(crate) fn decode_v2_response(block: &IpcRegisterBlockV2) -> core::result::Result<IpcV2Response, SyscallError> {
         let len = usize::try_from(block.ret_len).map_err(|_| SyscallError::Internal)?;
-        if len > Message::MAX_PAYLOAD || len > 64 {
+        if len > Message::MAX_PAYLOAD {
             return Err(SyscallError::Internal);
         }
         let mut payload = [0u8; Message::MAX_PAYLOAD];
         if (block.flags & IPC_V2_FLAG_INLINE_PAYLOAD) != 0 {
+            if len > 64 {
+                return Err(SyscallError::Internal);
+            }
             for (idx, word) in block.inline_words.iter().enumerate() {
                 let start = idx * 8;
                 if start >= len {
@@ -228,6 +231,8 @@ pub mod syscall {
                 let take = core::cmp::min(8, len - start);
                 payload[start..start + take].copy_from_slice(&bytes[..take]);
             }
+        } else if (block.flags & IPC_V2_FLAG_RET_COPYOUT) != 0 {
+            // Payload bytes are already copied to caller-provided output buffer.
         }
         let transfer_cap = if block.ret_transfer_cap == IPC_V2_NO_TRANSFER_CAP {
             None
@@ -336,6 +341,76 @@ pub mod syscall {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         if ret.ret0 != 0 { return Err(decode_syscall_error(ret.ret0)); }
         decode_v2_response(&block)
+    }
+
+    #[inline]
+    pub unsafe fn ipc_recv_v2_into(
+        recv_cap: u32,
+        timeout_ticks: u64,
+        out: &mut [u8],
+    ) -> core::result::Result<Option<(u64, usize, Option<u64>)>, SyscallError> {
+        let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
+        block.endpoint_cap = recv_cap as u64;
+        block.aux0 = timeout_ticks;
+        block.aux1 = out.as_mut_ptr() as u64;
+        block.len = out.len() as u64;
+        block.flags = IPC_V2_FLAG_RECV_COPYOUT;
+        let args = [(&mut block as *mut IpcRegisterBlockV2) as usize, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_V2_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            let err = decode_syscall_error(ret.error);
+            return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) { Ok(None) } else { Err(err) };
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            let err = decode_syscall_error(ret.ret0);
+            return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) { Ok(None) } else { Err(err) };
+        }
+        let len = usize::try_from(block.ret_len).map_err(|_| SyscallError::Internal)?;
+        let transfer_cap = if block.ret_transfer_cap == IPC_V2_NO_TRANSFER_CAP {
+            None
+        } else {
+            Some(block.ret_transfer_cap)
+        };
+        Ok(Some((block.ret_status, len, transfer_cap)))
+    }
+
+    #[inline]
+    pub unsafe fn ipc_call_v2_into(
+        send_cap: u32,
+        reply_recv_cap: u32,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> core::result::Result<(u64, usize, Option<u64>), SyscallError> {
+        if payload.len() > 64 {
+            return Err(SyscallError::InvalidArgs);
+        }
+        let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        block.endpoint_cap = send_cap as u64;
+        block.aux0 = reply_recv_cap as u64;
+        block.aux1 = out.as_mut_ptr() as u64;
+        block.len = out.len() as u64;
+        block.flags = IPC_V2_FLAG_RECV_COPYOUT | IPC_V2_FLAG_INLINE_PAYLOAD;
+        block.inline_words = [0; 8];
+        for (idx, chunk) in payload.chunks(8).enumerate() {
+            let mut lane = [0u8; 8];
+            lane[..chunk.len()].copy_from_slice(chunk);
+            block.inline_words[idx] = u64::from_le_bytes(lane);
+        }
+        let args = [(&mut block as *mut IpcRegisterBlockV2) as usize, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_CALL_V2_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 { return Err(decode_syscall_error(ret.error)); }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 { return Err(decode_syscall_error(ret.ret0)); }
+        let len = usize::try_from(block.ret_len).map_err(|_| SyscallError::Internal)?;
+        let transfer_cap = if block.ret_transfer_cap == IPC_V2_NO_TRANSFER_CAP {
+            None
+        } else {
+            Some(block.ret_transfer_cap)
+        };
+        Ok((block.ret_status, len, transfer_cap))
     }
 
     #[inline]

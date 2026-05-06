@@ -14,8 +14,9 @@ use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
 use yarm_ipc_abi::ipc_v2::{
     IPC_ABI_V2_BLOCK_SIZE, IPC_ABI_V2_VERSION, IPC_V2_FLAG_INLINE_PAYLOAD,
-    IPC_V2_FLAG_TRANSFER_CAP, IPC_V2_NO_TRANSFER_CAP, IPC_V2_OP_CALL, IPC_V2_OP_RECV,
-    IPC_V2_OP_REPLY, IPC_V2_OP_SEND, IpcRegisterBlockV2,
+    IPC_V2_FLAG_RECV_COPYOUT, IPC_V2_FLAG_RET_COPYOUT, IPC_V2_FLAG_TRANSFER_CAP,
+    IPC_V2_NO_TRANSFER_CAP, IPC_V2_OP_CALL, IPC_V2_OP_RECV, IPC_V2_OP_REPLY, IPC_V2_OP_SEND,
+    IpcRegisterBlockV2,
 };
 
 pub const SYSCALL_ABI_VERSION: u16 = 10;
@@ -571,7 +572,10 @@ fn read_ipc_v2_block_from_user(
     if block.abi_version != IPC_ABI_V2_VERSION || block.op != expected_op {
         return Err(SyscallError::InvalidArgs);
     }
-    let allowed_flags = IPC_V2_FLAG_INLINE_PAYLOAD | IPC_V2_FLAG_TRANSFER_CAP;
+    let allowed_flags = IPC_V2_FLAG_INLINE_PAYLOAD
+        | IPC_V2_FLAG_TRANSFER_CAP
+        | IPC_V2_FLAG_RECV_COPYOUT
+        | IPC_V2_FLAG_RET_COPYOUT;
     if (block.flags & !allowed_flags) != 0 {
         return Err(SyscallError::InvalidArgs);
     }
@@ -580,6 +584,9 @@ fn read_ipc_v2_block_from_user(
             return Err(SyscallError::InvalidArgs);
         }
     } else if block.inline_words.iter().any(|w| *w != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if (block.flags & IPC_V2_FLAG_RET_COPYOUT) != 0 {
         return Err(SyscallError::InvalidArgs);
     }
     Ok(block)
@@ -694,7 +701,14 @@ fn handle_ipc_recv_v2_stub(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let mut block = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_RECV)?;
-    if block.aux1 != 0 {
+    if (block.flags & IPC_V2_FLAG_INLINE_PAYLOAD) != 0
+        || (block.flags & IPC_V2_FLAG_TRANSFER_CAP) != 0
+        || (block.flags & IPC_V2_FLAG_RET_COPYOUT) != 0
+    {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let recv_copyout = (block.flags & IPC_V2_FLAG_RECV_COPYOUT) != 0;
+    if !recv_copyout && block.aux1 != 0 {
         return Err(SyscallError::InvalidArgs);
     }
 
@@ -723,15 +737,16 @@ fn handle_ipc_recv_v2_stub(
         });
     };
 
-    let len = msg.len as usize;
-    if len > 64 {
-        return Err(SyscallError::InvalidArgs);
-    }
+    let actual_len = msg.len as usize;
 
-    block.flags &= !(IPC_V2_FLAG_INLINE_PAYLOAD | IPC_V2_FLAG_TRANSFER_CAP);
-    block.flags |= IPC_V2_FLAG_INLINE_PAYLOAD;
+    block.flags &= !(
+        IPC_V2_FLAG_INLINE_PAYLOAD
+            | IPC_V2_FLAG_TRANSFER_CAP
+            | IPC_V2_FLAG_RECV_COPYOUT
+            | IPC_V2_FLAG_RET_COPYOUT
+    );
     block.ret_status = msg.sender_tid.0;
-    block.ret_len = len as u64;
+    block.ret_len = actual_len as u64;
     block.ret_transfer_cap = msg
         .transferred_cap()
         .map(|cap| cap.0)
@@ -739,12 +754,34 @@ fn handle_ipc_recv_v2_stub(
     if msg.transferred_cap().is_some() {
         block.flags |= IPC_V2_FLAG_TRANSFER_CAP;
     }
-    block.len = len as u64;
-    block.inline_words = [0; 8];
-    for (idx, chunk) in msg.as_slice().chunks(8).enumerate() {
-        let mut lane = [0u8; 8];
-        lane[..chunk.len()].copy_from_slice(chunk);
-        block.inline_words[idx] = u64::from_le_bytes(lane);
+
+    if actual_len <= 64 && !recv_copyout {
+        block.flags |= IPC_V2_FLAG_INLINE_PAYLOAD;
+        block.len = actual_len as u64;
+        block.inline_words = [0; 8];
+        for (idx, chunk) in msg.as_slice().chunks(8).enumerate() {
+            let mut lane = [0u8; 8];
+            lane[..chunk.len()].copy_from_slice(chunk);
+            block.inline_words[idx] = u64::from_le_bytes(lane);
+        }
+    } else {
+        if !recv_copyout {
+            // TODO: return BufferTooSmall once syscall error enum grows a dedicated variant.
+            return Err(SyscallError::InvalidArgs);
+        }
+        let capacity = usize::try_from(block.len).map_err(|_| SyscallError::InvalidArgs)?;
+        if actual_len > capacity {
+            // TODO: return BufferTooSmall once syscall error enum grows a dedicated variant.
+            return Err(SyscallError::InvalidArgs);
+        }
+        if block.aux1 == 0 {
+            return Err(SyscallError::InvalidArgs);
+        }
+        validate_user_region(block.aux1, actual_len as u64)?;
+        write_user_bytes_exact(kernel, block.aux1 as usize, msg.as_slice())?;
+        block.flags |= IPC_V2_FLAG_RET_COPYOUT;
+        block.len = capacity as u64;
+        block.inline_words = [0; 8];
     }
 
     write_ipc_v2_block_to_user(kernel, frame, &block)?;
@@ -757,9 +794,10 @@ fn handle_ipc_call_v2_stub(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let mut block = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_CALL)?;
-    if block.aux1 != 0 {
+    if (block.flags & IPC_V2_FLAG_RET_COPYOUT) != 0 {
         return Err(SyscallError::InvalidArgs);
     }
+    let recv_copyout = (block.flags & IPC_V2_FLAG_RECV_COPYOUT) != 0;
 
     let cap = CapId(block.endpoint_cap);
     validate_endpoint_right(kernel, cap, CapRights::SEND)?;
@@ -839,12 +877,14 @@ fn handle_ipc_call_v2_stub(
         return Err(SyscallError::WouldBlock);
     };
     let reply_len = reply.len as usize;
-    if reply_len > 64 {
-        return Err(SyscallError::InvalidArgs);
-    }
-
-    block.flags &= !(IPC_V2_FLAG_INLINE_PAYLOAD | IPC_V2_FLAG_TRANSFER_CAP);
-    block.flags |= IPC_V2_FLAG_INLINE_PAYLOAD;
+    let reply_copyout_ptr = block.aux1;
+    let reply_copyout_capacity = usize::try_from(block.len).map_err(|_| SyscallError::InvalidArgs)?;
+    block.flags &= !(
+        IPC_V2_FLAG_INLINE_PAYLOAD
+            | IPC_V2_FLAG_TRANSFER_CAP
+            | IPC_V2_FLAG_RECV_COPYOUT
+            | IPC_V2_FLAG_RET_COPYOUT
+    );
     block.ret_status = reply.sender_tid.0;
     block.ret_len = reply_len as u64;
     block.ret_transfer_cap = reply
@@ -854,12 +894,32 @@ fn handle_ipc_call_v2_stub(
     if reply.transferred_cap().is_some() {
         block.flags |= IPC_V2_FLAG_TRANSFER_CAP;
     }
-    block.len = reply_len as u64;
-    block.inline_words = [0; 8];
-    for (idx, chunk) in reply.as_slice().chunks(8).enumerate() {
-        let mut lane = [0u8; 8];
-        lane[..chunk.len()].copy_from_slice(chunk);
-        block.inline_words[idx] = u64::from_le_bytes(lane);
+    if reply_len <= 64 && !recv_copyout {
+        block.flags |= IPC_V2_FLAG_INLINE_PAYLOAD;
+        block.len = reply_len as u64;
+        block.inline_words = [0; 8];
+        for (idx, chunk) in reply.as_slice().chunks(8).enumerate() {
+            let mut lane = [0u8; 8];
+            lane[..chunk.len()].copy_from_slice(chunk);
+            block.inline_words[idx] = u64::from_le_bytes(lane);
+        }
+    } else {
+        if !recv_copyout {
+            // TODO: return BufferTooSmall once syscall error enum grows a dedicated variant.
+            return Err(SyscallError::InvalidArgs);
+        }
+        if reply_copyout_ptr == 0 {
+            return Err(SyscallError::InvalidArgs);
+        }
+        if reply_len > reply_copyout_capacity {
+            // TODO: return BufferTooSmall once syscall error enum grows a dedicated variant.
+            return Err(SyscallError::InvalidArgs);
+        }
+        validate_user_region(reply_copyout_ptr, reply_len as u64)?;
+        write_user_bytes_exact(kernel, reply_copyout_ptr as usize, reply.as_slice())?;
+        block.flags |= IPC_V2_FLAG_RET_COPYOUT;
+        block.len = reply_copyout_capacity as u64;
+        block.inline_words = [0; 8];
     }
 
     write_ipc_v2_block_to_user(kernel, frame, &block)?;
