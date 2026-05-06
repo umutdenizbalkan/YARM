@@ -1676,6 +1676,14 @@ mod tests {
         {
             panic!("not used");
         }
+        fn recv_v2_with_deadline(
+            &mut self,
+            _recv_cap: u32,
+            _timeout_ticks: u64,
+        ) -> Result<Option<yarm_user_rt::syscall::IpcV2Response>, yarm_user_rt::syscall::SyscallError>
+        {
+            panic!("not used");
+        }
         fn reply_v2(
             &mut self,
             _reply_cap: u32,

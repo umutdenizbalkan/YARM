@@ -1351,15 +1351,33 @@ fn handle_ipc_recv_v2_stub(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let mut block = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_RECV)?;
-    if block.aux0 != 0 || block.aux1 != 0 {
+    if block.aux1 != 0 {
         return Err(SyscallError::InvalidArgs);
     }
 
     let cap = CapId(block.endpoint_cap);
     validate_endpoint_right(kernel, cap, CapRights::RECEIVE)?;
-    let received = kernel.ipc_recv(cap).map_err(SyscallError::from)?;
+    let timeout_ticks = block.aux0;
+    let waiter_tid = current_tid(kernel)?;
+    let received = if timeout_ticks == 0 {
+        kernel.try_ipc_recv(cap).map_err(SyscallError::from)?
+    } else {
+        kernel
+            .ipc_recv_with_deadline(cap, timeout_ticks)
+            .map_err(SyscallError::from)?
+    };
     let Some(msg) = received else {
-        return Err(SyscallError::WouldBlock);
+        if timeout_ticks == 0 {
+            return Err(SyscallError::WouldBlock);
+        }
+        let fired = kernel
+            .consume_ipc_timeout_fired_for_tid(waiter_tid)
+            .map_err(SyscallError::from)?;
+        return Err(if fired {
+            SyscallError::TimedOut
+        } else {
+            SyscallError::WouldBlock
+        });
     };
 
     let len = msg.len as usize;
@@ -1897,6 +1915,14 @@ mod tests {
             Err(SyscallError::WouldBlock)
         );
 
+        recv_block.aux0 = 1;
+        write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
+        let mut timed = TrapFrame::new(
+            SYSCALL_IPC_RECV_V2_NR,
+            [recv_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        assert_eq!(dispatch(&mut state, &mut timed), Err(SyscallError::TimedOut));
+
         recv_block.aux1 = 1;
         write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
         let mut bad_aux = TrapFrame::new(
@@ -1907,6 +1933,38 @@ mod tests {
             dispatch(&mut state, &mut bad_aux),
             Err(SyscallError::InvalidArgs)
         );
+    }
+
+    #[test]
+    fn syscall_recv_v2_with_timeout_aux0_receives_available_message() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let send_ptr = 0x7210usize;
+        let recv_ptr = 0x7220usize;
+
+        let mut send_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        send_block.endpoint_cap = send_cap.0;
+        send_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        send_block.len = 4;
+        let mut lane = [0u8; 8];
+        lane[..4].copy_from_slice(b"pong");
+        send_block.inline_words[0] = u64::from_le_bytes(lane);
+        write_v2_block_to_user_for_test(&mut state, send_ptr, &send_block);
+        let mut send_frame = TrapFrame::new(
+            SYSCALL_IPC_SEND_V2_NR,
+            [send_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send v2");
+
+        let mut recv_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
+        recv_block.endpoint_cap = recv_cap.0;
+        recv_block.aux0 = 5;
+        write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
+        let mut recv_frame = TrapFrame::new(
+            SYSCALL_IPC_RECV_V2_NR,
+            [recv_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut recv_frame).expect("recv v2 timed");
     }
 
     #[test]

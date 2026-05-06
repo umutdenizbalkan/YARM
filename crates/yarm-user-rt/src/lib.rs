@@ -79,6 +79,11 @@ pub mod syscall {
             &mut self,
             recv_cap: u32,
         ) -> core::result::Result<Option<IpcV2Response>, SyscallError>;
+        fn recv_v2_with_deadline(
+            &mut self,
+            recv_cap: u32,
+            timeout_ticks: u64,
+        ) -> core::result::Result<Option<IpcV2Response>, SyscallError>;
         fn reply_v2(
             &mut self,
             reply_cap: u32,
@@ -146,6 +151,15 @@ pub mod syscall {
         ) -> core::result::Result<Option<IpcV2Response>, SyscallError> {
             // SAFETY: forwards directly to syscall wrapper.
             unsafe { ipc_recv_v2(recv_cap) }
+        }
+        #[inline]
+        fn recv_v2_with_deadline(
+            &mut self,
+            recv_cap: u32,
+            timeout_ticks: u64,
+        ) -> core::result::Result<Option<IpcV2Response>, SyscallError> {
+            // SAFETY: forwards directly to syscall wrapper.
+            unsafe { ipc_recv_v2_with_deadline(recv_cap, timeout_ticks) }
         }
 
         #[inline]
@@ -439,19 +453,29 @@ pub mod syscall {
 
     #[inline]
     pub unsafe fn ipc_recv_v2(recv_cap: u32) -> core::result::Result<Option<IpcV2Response>, SyscallError> {
+        // SAFETY: delegate to deadline variant with nonblocking timeout.
+        unsafe { ipc_recv_v2_with_deadline(recv_cap, 0) }
+    }
+
+    #[inline]
+    pub unsafe fn ipc_recv_v2_with_deadline(
+        recv_cap: u32,
+        timeout_ticks: u64,
+    ) -> core::result::Result<Option<IpcV2Response>, SyscallError> {
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
         block.endpoint_cap = recv_cap as u64;
+        block.aux0 = timeout_ticks;
         let args = [(&mut block as *mut IpcRegisterBlockV2) as usize, IPC_ABI_V2_BLOCK_SIZE, 0,0,0,0];
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_V2_NR, args) };
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
             let err = decode_syscall_error(ret.error);
-            return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
+            return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) { Ok(None) } else { Err(err) };
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         if ret.ret0 != 0 {
             let err = decode_syscall_error(ret.ret0);
-            return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
+            return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) { Ok(None) } else { Err(err) };
         }
         Ok(Some(decode_v2_response(&block)?))
     }
@@ -970,6 +994,13 @@ mod tests {
             panic!("not used");
         }
         fn recv_v2(&mut self, _recv_cap: u32) -> Result<Option<IpcV2Response>, SyscallError> {
+            panic!("not used");
+        }
+        fn recv_v2_with_deadline(
+            &mut self,
+            _recv_cap: u32,
+            _timeout_ticks: u64,
+        ) -> Result<Option<IpcV2Response>, SyscallError> {
             panic!("not used");
         }
         fn reply_v2(

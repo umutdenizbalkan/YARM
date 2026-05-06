@@ -268,6 +268,9 @@
 - Reply payloads larger than 64 bytes are currently rejected in the call-v2 return path.
 
 - `yarm-user-rt` exposes additive wrappers `ipc_send_v2`, `ipc_recv_v2`, `ipc_call_v2`, and `ipc_reply_v2`; v1 wrappers remain unchanged/default.
+- `IPC_RECV_V2` timeout contract: `aux0 = timeout_ticks`, `aux1 = 0` (reserved and must be zero).
+- `IPC_RECV_V2` with `aux0 == 0` performs a nonblocking probe; `aux0 > 0` performs deadline receive using kernel timeout machinery.
+- `yarm-user-rt::ipc_recv_v2_with_deadline` maps both `WouldBlock` and `TimedOut` to `Ok(None)` (matching v1 timeout wrapper behavior).
 - `yarm-user-rt` additionally exposes additive transport scaffolding via `IpcTransportV2` + `SyscallIpcTransport` adapter and a `request_reply_v2(...)` helper for small typed control-plane call/reply decoding.
 - Migration state: additive/gradual only in this phase; existing `IpcTransport` (v1) and v1 syscall wrappers remain active and compatibility is unchanged.
 - Supervisor runtime process-manager helper RPCs (restart-token query, supervised-task registration, execute-restart) now use `IpcTransportV2` + `request_reply_v2(...)`.
