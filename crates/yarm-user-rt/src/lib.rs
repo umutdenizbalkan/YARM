@@ -37,6 +37,7 @@ pub mod syscall {
     pub enum SyscallError {
         InvalidNumber = 1,
         InvalidArgs = 2,
+        BufferTooSmall = 10,
         InvalidCapability = 3,
         MissingRight = 4,
         WrongObject = 5,
@@ -173,6 +174,7 @@ pub mod syscall {
         match code {
             1 => SyscallError::InvalidNumber,
             2 => SyscallError::InvalidArgs,
+            10 => SyscallError::BufferTooSmall,
             3 => SyscallError::InvalidCapability,
             4 => SyscallError::MissingRight,
             5 => SyscallError::WrongObject,

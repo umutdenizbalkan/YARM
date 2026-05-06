@@ -223,6 +223,7 @@
 - `7`: `WouldBlock`
 - `8`: `PageFault`
 - `9`: `TimedOut`
+- `10`: `BufferTooSmall`
 - `255`: `Internal`
 
 ## Per-ISA shape source of truth
@@ -271,7 +272,7 @@
   - `len` is reply buffer capacity in bytes;
   - on success, kernel sets `IPC_V2_FLAG_RET_COPYOUT`, writes payload bytes to `aux1`, and reports actual reply size in `ret_len`;
   - no truncation is performed;
-  - if `actual_reply_len > len` (capacity), current behavior returns `InvalidArgs` (temporary behavior; future `BufferTooSmall` mapping is planned).
+  - if `actual_reply_len > len` (capacity), returns `BufferTooSmall`.
 
 - `yarm-user-rt` exposes additive wrappers `ipc_send_v2`, `ipc_recv_v2`, `ipc_call_v2`, and `ipc_reply_v2`; v1 wrappers remain unchanged/default.
 - `IPC_RECV_V2` timeout contract: `aux0 = timeout_ticks`, `aux1 = 0` (reserved and must be zero).

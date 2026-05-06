@@ -630,6 +630,7 @@ fn map_kernel_syscall_error(err: KernelSyscallError) -> SyscallError {
     match err {
         KernelSyscallError::InvalidNumber => SyscallError::InvalidNumber,
         KernelSyscallError::InvalidArgs => SyscallError::InvalidArgs,
+        KernelSyscallError::BufferTooSmall => SyscallError::BufferTooSmall,
         KernelSyscallError::InvalidCapability => SyscallError::InvalidCapability,
         KernelSyscallError::MissingRight => SyscallError::MissingRight,
         KernelSyscallError::WrongObject => SyscallError::WrongObject,
@@ -649,6 +650,7 @@ fn map_syscall_error(err: SyscallError) -> ProcessManagerError {
         SyscallError::QueueFull | SyscallError::Internal => ProcessManagerError::TableFull,
         SyscallError::InvalidNumber
         | SyscallError::InvalidArgs
+        | SyscallError::BufferTooSmall
         | SyscallError::InvalidCapability
         | SyscallError::WrongObject
         | SyscallError::PageFault => ProcessManagerError::Malformed,

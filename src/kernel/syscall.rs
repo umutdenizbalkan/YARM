@@ -128,6 +128,7 @@ const _: () = assert!(syscall_abi::TRAPFRAME_ARG_REGS > SYSCALL_ARG_INLINE_PAYLO
 pub enum SyscallError {
     InvalidNumber = 1,
     InvalidArgs = 2,
+    BufferTooSmall = 10,
     InvalidCapability = 3,
     MissingRight = 4,
     WrongObject = 5,
@@ -766,13 +767,11 @@ fn handle_ipc_recv_v2_stub(
         }
     } else {
         if !recv_copyout {
-            // TODO: return BufferTooSmall once syscall error enum grows a dedicated variant.
-            return Err(SyscallError::InvalidArgs);
+            return Err(SyscallError::BufferTooSmall);
         }
         let capacity = usize::try_from(block.len).map_err(|_| SyscallError::InvalidArgs)?;
         if actual_len > capacity {
-            // TODO: return BufferTooSmall once syscall error enum grows a dedicated variant.
-            return Err(SyscallError::InvalidArgs);
+            return Err(SyscallError::BufferTooSmall);
         }
         if block.aux1 == 0 {
             return Err(SyscallError::InvalidArgs);
@@ -905,15 +904,13 @@ fn handle_ipc_call_v2_stub(
         }
     } else {
         if !recv_copyout {
-            // TODO: return BufferTooSmall once syscall error enum grows a dedicated variant.
-            return Err(SyscallError::InvalidArgs);
+            return Err(SyscallError::BufferTooSmall);
         }
         if reply_copyout_ptr == 0 {
             return Err(SyscallError::InvalidArgs);
         }
         if reply_len > reply_copyout_capacity {
-            // TODO: return BufferTooSmall once syscall error enum grows a dedicated variant.
-            return Err(SyscallError::InvalidArgs);
+            return Err(SyscallError::BufferTooSmall);
         }
         validate_user_region(reply_copyout_ptr, reply_len as u64)?;
         write_user_bytes_exact(kernel, reply_copyout_ptr as usize, reply.as_slice())?;
@@ -1455,7 +1452,7 @@ mod tests {
         assert_ne!(out.flags & IPC_V2_FLAG_RET_COPYOUT, 0);
         assert_eq!(out.inline_words, [0; 8]);
 
-        // Small-capacity case (current behavior: InvalidArgs and block is not written back).
+        // Small-capacity case (current behavior: BufferTooSmall and block is not written back).
         state.copy_to_current_user(0x9400, &payload).expect("user write payload2");
         send_block.ptr_or_offset = 0x9400;
         write_v2_block_to_user_for_test(&mut state, send_ptr, &send_block);
@@ -1464,7 +1461,7 @@ mod tests {
         recv_block.len = 64;
         write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
         let mut recv_frame2 = TrapFrame::new(SYSCALL_IPC_RECV_V2_NR, [recv_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
-        assert_eq!(dispatch(&mut state, &mut recv_frame2), Err(SyscallError::InvalidArgs));
+        assert_eq!(dispatch(&mut state, &mut recv_frame2), Err(SyscallError::BufferTooSmall));
     }
 
     #[test]
@@ -1731,6 +1728,25 @@ mod tests {
         assert_ne!(out.flags & IPC_V2_FLAG_RET_COPYOUT, 0);
         let copied = state.copy_from_current_user(0xA300, 65).expect("copied");
         assert_eq!(&copied[..], &reply_bytes);
+
+        // Copyout requested but capacity too small should fail with BufferTooSmall.
+        let mut small_copy_call = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        small_copy_call.endpoint_cap = send_cap.0;
+        small_copy_call.flags = IPC_V2_FLAG_INLINE_PAYLOAD | IPC_V2_FLAG_RECV_COPYOUT;
+        small_copy_call.len = 64;
+        small_copy_call.aux0 = recv_cap.0;
+        small_copy_call.aux1 = 0xA400;
+        small_copy_call.inline_words[0] = u64::from_le_bytes(*b"rqst0002");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &small_copy_call);
+        let mut small_copy_frame = TrapFrame::new(SYSCALL_IPC_CALL_V2_NR, [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        let _ = dispatch(&mut state, &mut small_copy_frame);
+        let received_small = state.ipc_recv(recv_cap).expect("recv small").expect("msg small");
+        let reply_cap_small = received_small.transferred_cap().expect("reply cap small");
+        reply_block.endpoint_cap = reply_cap_small.0;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr, &reply_block);
+        let mut reply_frame_small = TrapFrame::new(SYSCALL_IPC_REPLY_V2_NR, [reply_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut reply_frame_small).expect("reply small");
+        assert_eq!(dispatch(&mut state, &mut small_copy_frame), Err(SyscallError::BufferTooSmall));
 
         // Same reply size without copyout flag should fail.
         let mut no_copy_call = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
@@ -2326,6 +2342,7 @@ mod tests {
     fn syscall_error_codes_are_stable() {
         assert_eq!(SyscallError::InvalidNumber.code(), 1);
         assert_eq!(SyscallError::InvalidArgs.code(), 2);
+        assert_eq!(SyscallError::BufferTooSmall.code(), 10);
         assert_eq!(SyscallError::InvalidCapability.code(), 3);
         assert_eq!(SyscallError::MissingRight.code(), 4);
         assert_eq!(SyscallError::WrongObject.code(), 5);
