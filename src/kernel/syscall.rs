@@ -10,6 +10,10 @@ use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
+use yarm_ipc_abi::ipc_v2::{
+    IpcRegisterBlockV2, IPC_ABI_V2_BLOCK_SIZE, IPC_ABI_V2_VERSION, IPC_V2_FLAG_INLINE_PAYLOAD,
+    IPC_V2_FLAG_TRANSFER_CAP, IPC_V2_OP_CALL, IPC_V2_OP_RECV, IPC_V2_OP_REPLY, IPC_V2_OP_SEND,
+};
 
 pub const SYSCALL_ABI_VERSION: u16 = 10;
 pub const SYSCALL_YIELD_NR: usize = 0;
@@ -1157,19 +1161,97 @@ fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<()
 }
 
 
-fn handle_ipc_send_v2_stub(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
+
+
+fn read_user_bytes_exact(kernel: &KernelState, user_ptr: usize, out: &mut [u8]) -> Result<(), SyscallError> {
+    if out.is_empty() {
+        return Ok(());
+    }
+    let mut offset = 0usize;
+    while offset < out.len() {
+        let chunk_len = core::cmp::min(Message::MAX_PAYLOAD, out.len() - offset);
+        let chunk = kernel
+            .copy_from_current_user(user_ptr + offset, chunk_len)
+            .map_err(SyscallError::from)?;
+        out[offset..offset + chunk_len].copy_from_slice(&chunk[..chunk_len]);
+        offset += chunk_len;
+    }
+    Ok(())
+}
+
+fn write_user_bytes_exact(kernel: &mut KernelState, user_ptr: usize, bytes: &[u8]) -> Result<(), SyscallError> {
+    kernel.copy_to_current_user(user_ptr, bytes).map_err(SyscallError::from)
+}
+
+fn read_ipc_v2_block_from_user(
+    kernel: &KernelState,
+    frame: &TrapFrame,
+    expected_op: u16,
+) -> Result<IpcRegisterBlockV2, SyscallError> {
+    let user_ptr = frame.arg(SYSCALL_ARG_CAP);
+    let block_size = frame.arg(SYSCALL_ARG_PTR);
+    let reserved = [frame.arg(SYSCALL_ARG_LEN), frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0), frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1), frame.arg(SYSCALL_ARG_TRANSFER_CAP)];
+
+    if user_ptr == 0 || block_size != IPC_ABI_V2_BLOCK_SIZE || reserved.iter().any(|v| *v != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    validate_user_region(user_ptr as u64, block_size as u64)?;
+
+    let mut raw = [0u8; IPC_ABI_V2_BLOCK_SIZE];
+    read_user_bytes_exact(kernel, user_ptr, &mut raw)?;
+    let block = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const IpcRegisterBlockV2) };
+
+    if block.abi_version != IPC_ABI_V2_VERSION || block.op != expected_op {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let allowed_flags = IPC_V2_FLAG_INLINE_PAYLOAD | IPC_V2_FLAG_TRANSFER_CAP;
+    if (block.flags & !allowed_flags) != 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if (block.flags & IPC_V2_FLAG_INLINE_PAYLOAD) != 0 {
+        if block.len > 64 {
+            return Err(SyscallError::InvalidArgs);
+        }
+    } else if block.inline_words.iter().any(|w| *w != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    Ok(block)
+}
+
+fn write_ipc_v2_block_to_user(
+    kernel: &mut KernelState,
+    frame: &TrapFrame,
+    block: &IpcRegisterBlockV2,
+) -> Result<(), SyscallError> {
+    let user_ptr = frame.arg(SYSCALL_ARG_CAP);
+    let block_size = frame.arg(SYSCALL_ARG_PTR);
+    if user_ptr == 0 || block_size != IPC_ABI_V2_BLOCK_SIZE {
+        return Err(SyscallError::InvalidArgs);
+    }
+    validate_user_region(user_ptr as u64, block_size as u64)?;
+    let bytes = unsafe {
+        core::slice::from_raw_parts((block as *const IpcRegisterBlockV2).cast::<u8>(), IPC_ABI_V2_BLOCK_SIZE)
+    };
+    write_user_bytes_exact(kernel, user_ptr, bytes)
+}
+fn handle_ipc_send_v2_stub(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let _ = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_SEND)?;
     Err(SyscallError::InvalidArgs)
 }
 
-fn handle_ipc_recv_v2_stub(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
+fn handle_ipc_recv_v2_stub(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let block = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_RECV)?;
+    write_ipc_v2_block_to_user(kernel, frame, &block)?;
     Err(SyscallError::InvalidArgs)
 }
 
-fn handle_ipc_call_v2_stub(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
+fn handle_ipc_call_v2_stub(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let _ = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_CALL)?;
     Err(SyscallError::InvalidArgs)
 }
 
-fn handle_ipc_reply_v2_stub(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
+fn handle_ipc_reply_v2_stub(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let _ = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_REPLY)?;
     Err(SyscallError::InvalidArgs)
 }
 
@@ -1256,6 +1338,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
     result
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1263,6 +1346,65 @@ mod tests {
     use crate::kernel::ipc::{EndpointMode, IPC_REGISTER_WORDS};
     use crate::kernel::scheduler_timer::Timer;
     use crate::kernel::trapframe::TrapFrame;
+
+
+    fn write_v2_block_to_user_for_test(state: &mut KernelState, ptr: usize, block: &IpcRegisterBlockV2) {
+        let bytes = unsafe {
+            core::slice::from_raw_parts((block as *const IpcRegisterBlockV2).cast::<u8>(), IPC_ABI_V2_BLOCK_SIZE)
+        };
+        state.copy_to_current_user(ptr, bytes).expect("write v2 block");
+    }
+
+    #[test]
+    fn syscall_ipc_v2_validation_accepts_valid_send_block() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let ptr = 0x2000usize;
+        let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        block.len = 64;
+        write_v2_block_to_user_for_test(&mut state, ptr, &block);
+        let frame = TrapFrame::new(SYSCALL_IPC_SEND_V2_NR, [ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        assert!(read_ipc_v2_block_from_user(&state, &frame, IPC_V2_OP_SEND).is_ok());
+    }
+
+    #[test]
+    fn syscall_ipc_v2_validation_rejects_wrong_size_version_op_reserved_flags_and_len() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let ptr = 0x3000usize;
+        let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        write_v2_block_to_user_for_test(&mut state, ptr, &block);
+
+        let bad_size = TrapFrame::new(SYSCALL_IPC_SEND_V2_NR, [ptr, IPC_ABI_V2_BLOCK_SIZE - 1, 0, 0, 0, 0]);
+        assert_eq!(read_ipc_v2_block_from_user(&state, &bad_size, IPC_V2_OP_SEND), Err(SyscallError::InvalidArgs));
+
+        block.abi_version = 9;
+        write_v2_block_to_user_for_test(&mut state, ptr, &block);
+        let ok_frame = TrapFrame::new(SYSCALL_IPC_SEND_V2_NR, [ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        assert_eq!(read_ipc_v2_block_from_user(&state, &ok_frame, IPC_V2_OP_SEND), Err(SyscallError::InvalidArgs));
+
+        block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
+        write_v2_block_to_user_for_test(&mut state, ptr, &block);
+        assert_eq!(read_ipc_v2_block_from_user(&state, &ok_frame, IPC_V2_OP_SEND), Err(SyscallError::InvalidArgs));
+
+        let reserved = TrapFrame::new(SYSCALL_IPC_SEND_V2_NR, [ptr, IPC_ABI_V2_BLOCK_SIZE, 1, 0, 0, 0]);
+        assert_eq!(read_ipc_v2_block_from_user(&state, &reserved, IPC_V2_OP_SEND), Err(SyscallError::InvalidArgs));
+
+        block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        block.flags = 1 << 31;
+        write_v2_block_to_user_for_test(&mut state, ptr, &block);
+        assert_eq!(read_ipc_v2_block_from_user(&state, &ok_frame, IPC_V2_OP_SEND), Err(SyscallError::InvalidArgs));
+
+        block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        block.len = 65;
+        write_v2_block_to_user_for_test(&mut state, ptr, &block);
+        assert_eq!(read_ipc_v2_block_from_user(&state, &ok_frame, IPC_V2_OP_SEND), Err(SyscallError::InvalidArgs));
+
+        block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        block.inline_words[0] = 1;
+        write_v2_block_to_user_for_test(&mut state, ptr, &block);
+        assert_eq!(read_ipc_v2_block_from_user(&state, &ok_frame, IPC_V2_OP_SEND), Err(SyscallError::InvalidArgs));
+    }
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
