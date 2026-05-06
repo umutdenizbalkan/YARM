@@ -198,8 +198,8 @@ handled via a dedicated helper with clear lock-contract comments.
 
 ### Stage 2E status: recv-timeout syscall bridge migration blocked (current call graph)
 
-- Target path inspected: `SYSCALL_IPC_RECV_TIMEOUT_NR` / `handle_ipc_recv_timeout`.
-- Blocker: syscall dispatch currently enters `handle_ipc_recv_timeout` with `&mut KernelState` from `KernelState::handle_trap(...)`, not through a `SharedKernel` entry that can call `ipc_recv_with_deadline_split_bridge`.
+- Target path inspected: legacy reserved syscall slot `SYSCALL_IPC_RECV_TIMEOUT_NR` (v1 recv-timeout).
+- Blocker: v1 recv-timeout dispatch no longer has an active handler path; the syscall number is now a reserved ABI hole that returns `InvalidNumber`.
 - Minimal migration is therefore not possible in this slice without widening trap/syscall signatures beyond the allowed narrow scope.
 - `ipc_recv_with_deadline_split_bridge` remains bridge-only staged for this caller.
 - Additional Stage 2E attempt outcome: a narrow `SharedKernel` recv-timeout syscall wrapper cannot be wired into the real trap/syscall dispatch without introducing a new top-level SharedKernel-owned syscall entry callsite (or widening current `KernelState::handle_trap` signatures).
@@ -211,8 +211,8 @@ handled via a dedicated helper with clear lock-contract comments.
 - Audited flow:
   - `src/runtime.rs`: `SharedKernel::with(...)` / `with_cpu(...)` are the global-lock entry points.
   - `src/kernel/boot/fault_state.rs`: `KernelState::handle_trap(...)` dispatches syscall on `&mut KernelState`.
-  - `src/kernel/syscall.rs`: `dispatch(...)` routes `SYSCALL_IPC_RECV_TIMEOUT_NR` to `handle_ipc_recv_timeout(...)`, both on `&mut KernelState`.
-  - `src/kernel/syscall.rs`: `handle_ipc_recv_timeout(...)` currently reads/uses timeout only via `KernelState` APIs.
+  - `src/kernel/syscall.rs`: `dispatch(...)` treats `SYSCALL_IPC_RECV_TIMEOUT_NR` as a reserved legacy number and returns `InvalidNumber`.
+  - `src/kernel/syscall.rs`: active IPC paths are v2 register-block handlers (`handle_ipc_recv_v2_stub`, etc.), not v1 timeout handlers.
 
 - Proposed minimal API (design only, not implemented):
   - Add a narrow optional entry wrapper on `SharedKernel` for syscall dispatch:

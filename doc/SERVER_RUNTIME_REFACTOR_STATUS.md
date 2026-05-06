@@ -12,9 +12,9 @@ Last updated: 2026-04-29
 
 ### 2) Userspace runtime
 
-- `yarm-user-rt` provides userspace IPC entry points (`ipc_send` / `ipc_recv`).
+- `yarm-user-rt` provides userspace IPC v2 entry points (`ipc_send_v2` / `ipc_recv_v2` plus `ipc_call_v2` / `ipc_reply_v2`).
 - Architecture-specific asm/runtime glue is split under `crates/yarm-user-rt/src/arch`.
-- `IpcTransport` and `SyscallIpcTransport` are available as transport abstractions.
+- `IpcTransportV2` and `SyscallIpcTransport` are available as transport abstractions.
 - Startup context and startup-slot accessors are present for userspace bootstrap.
 
 ### 3) Startup slot ABI
@@ -43,7 +43,7 @@ Delivery convention:
 
 ### 4) POSIX compat dispatch boundary
 
-- Production dispatch now accepts `&mut impl IpcTransport` (transport boundary), not `&mut KernelState`.
+- Production dispatch now accepts `&mut impl IpcTransportV2` (transport boundary), not `&mut KernelState`.
 - Kernel-backed `dispatch_with_kernel(...)` exists for kernel-dependent behavior/harness paths.
 - `getpid` is IPC-backed in the kernel-backed dispatch path.
 - `openat` / `statx` use inline byte-path VFS IPC where kernel-backed user-memory path decoding is available.
