@@ -248,3 +248,18 @@
 - v2 target inline capacity is **8 words** (`64` bytes) via `inline_words: [u64; 8]`.
 - v2 block constants are defined (`IPC_ABI_V2_VERSION = 2`, `IPC_ABI_V2_INLINE_WORDS = 8`, `IPC_ABI_V2_BLOCK_SIZE`).
 - No v2 syscall numbers/dispatch wiring are introduced yet; runtime behavior is unchanged.
+
+
+## Reserved IPC ABI v2 syscall numbers (stubbed)
+
+- Reserved syscall numbers:
+  - `SYSCALL_IPC_SEND_V2_NR = 15`
+  - `SYSCALL_IPC_RECV_V2_NR = 16`
+  - `SYSCALL_IPC_CALL_V2_NR = 17`
+  - `SYSCALL_IPC_REPLY_V2_NR = 18`
+- Current status: decode+dispatch stubs exist and return `InvalidArgs`; no runtime IPC v2 behavior is implemented yet.
+- Planned lane contract for these reserved syscalls:
+  - `arg0`: user pointer to `IpcRegisterBlockV2`
+  - `arg1`: block size (eventually must equal `IPC_ABI_V2_BLOCK_SIZE`)
+  - `arg2..arg5`: reserved, currently ignored by stubs
+- v1 IPC syscalls remain the active behavior path.

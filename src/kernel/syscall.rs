@@ -27,8 +27,12 @@ pub const SYSCALL_SPAWN_THREAD_NR: usize = 11;
 pub const SYSCALL_FORK_NR: usize = 12;
 pub const SYSCALL_VM_ANON_MAP_NR: usize = 13;
 pub const SYSCALL_VM_BRK_NR: usize = 14;
-pub const SYSCALL_COUNT: usize = 15;
-const _: [(); SYSCALL_COUNT] = [(); 15];
+pub const SYSCALL_IPC_SEND_V2_NR: usize = 15;
+pub const SYSCALL_IPC_RECV_V2_NR: usize = 16;
+pub const SYSCALL_IPC_CALL_V2_NR: usize = 17;
+pub const SYSCALL_IPC_REPLY_V2_NR: usize = 18;
+pub const SYSCALL_COUNT: usize = 19;
+const _: [(); SYSCALL_COUNT] = [(); 19];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -68,10 +72,14 @@ pub enum Syscall {
     Fork = SYSCALL_FORK_NR,
     VmAnonMap = SYSCALL_VM_ANON_MAP_NR,
     VmBrk = SYSCALL_VM_BRK_NR,
+    IpcSendV2 = SYSCALL_IPC_SEND_V2_NR,
+    IpcRecvV2 = SYSCALL_IPC_RECV_V2_NR,
+    IpcCallV2 = SYSCALL_IPC_CALL_V2_NR,
+    IpcReplyV2 = SYSCALL_IPC_REPLY_V2_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 15;
+    pub const VARIANT_COUNT: usize = 19;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -93,6 +101,10 @@ impl Syscall {
             SYSCALL_FORK_NR => Ok(Self::Fork),
             SYSCALL_VM_ANON_MAP_NR => Ok(Self::VmAnonMap),
             SYSCALL_VM_BRK_NR => Ok(Self::VmBrk),
+            SYSCALL_IPC_SEND_V2_NR => Ok(Self::IpcSendV2),
+            SYSCALL_IPC_RECV_V2_NR => Ok(Self::IpcRecvV2),
+            SYSCALL_IPC_CALL_V2_NR => Ok(Self::IpcCallV2),
+            SYSCALL_IPC_REPLY_V2_NR => Ok(Self::IpcReplyV2),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -1144,6 +1156,23 @@ fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<()
     Ok(())
 }
 
+
+fn handle_ipc_send_v2_stub(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    Err(SyscallError::InvalidArgs)
+}
+
+fn handle_ipc_recv_v2_stub(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    Err(SyscallError::InvalidArgs)
+}
+
+fn handle_ipc_call_v2_stub(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    Err(SyscallError::InvalidArgs)
+}
+
+fn handle_ipc_reply_v2_stub(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    Err(SyscallError::InvalidArgs)
+}
+
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if frame.syscall_num() == SYSCALL_YIELD_NR {
@@ -1179,6 +1208,10 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::Fork => handle_fork(kernel, frame),
         Syscall::VmAnonMap => handle_vm_anon_map(kernel, frame),
         Syscall::VmBrk => handle_vm_brk(kernel, frame),
+        Syscall::IpcSendV2 => handle_ipc_send_v2_stub(kernel, frame),
+        Syscall::IpcRecvV2 => handle_ipc_recv_v2_stub(kernel, frame),
+        Syscall::IpcCallV2 => handle_ipc_call_v2_stub(kernel, frame),
+        Syscall::IpcReplyV2 => handle_ipc_reply_v2_stub(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_blocked = caller_tid.is_some_and(|tid| {
@@ -1247,7 +1280,11 @@ mod tests {
         assert_eq!(SYSCALL_FORK_NR, 12);
         assert_eq!(SYSCALL_VM_ANON_MAP_NR, 13);
         assert_eq!(SYSCALL_VM_BRK_NR, 14);
-        assert_eq!(SYSCALL_COUNT, 15);
+        assert_eq!(SYSCALL_IPC_SEND_V2_NR, 15);
+        assert_eq!(SYSCALL_IPC_RECV_V2_NR, 16);
+        assert_eq!(SYSCALL_IPC_CALL_V2_NR, 17);
+        assert_eq!(SYSCALL_IPC_REPLY_V2_NR, 18);
+        assert_eq!(SYSCALL_COUNT, 19);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
@@ -1284,6 +1321,23 @@ mod tests {
     }
 
     #[test]
+    fn syscall_ipc_v2_decode_is_stable() {
+        assert_eq!(Syscall::decode(SYSCALL_IPC_SEND_V2_NR).expect("decode"), Syscall::IpcSendV2);
+        assert_eq!(Syscall::decode(SYSCALL_IPC_RECV_V2_NR).expect("decode"), Syscall::IpcRecvV2);
+        assert_eq!(Syscall::decode(SYSCALL_IPC_CALL_V2_NR).expect("decode"), Syscall::IpcCallV2);
+        assert_eq!(Syscall::decode(SYSCALL_IPC_REPLY_V2_NR).expect("decode"), Syscall::IpcReplyV2);
+    }
+
+    #[test]
+    fn syscall_ipc_v2_stubs_return_invalid_args() {
+        let mut state = Bootstrap::init().expect("kernel");
+        for nr in [SYSCALL_IPC_SEND_V2_NR, SYSCALL_IPC_RECV_V2_NR, SYSCALL_IPC_CALL_V2_NR, SYSCALL_IPC_REPLY_V2_NR] {
+            let mut frame = TrapFrame::new(nr, [0, 0, 0, 0, 0, 0]);
+            let err = dispatch(&mut state, &mut frame).expect_err("v2 stub error");
+            assert_eq!(err, SyscallError::InvalidArgs);
+        }
+    }
+
     fn syscall_vm_brk_query_unset_returns_zero() {
         let mut state = Bootstrap::init().expect("kernel");
         let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [0, 0, 0, 0, 0, 0]);
