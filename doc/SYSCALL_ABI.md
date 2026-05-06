@@ -241,28 +241,30 @@
   - a syscall ABI v2 with expanded argument/register mapping, or
   - an alternate payload path that preserves existing syscall argument ABI compatibility.
 
-## IPC ABI v2 scaffolding status
+## IPC ABI v2 status and semantics
 
 - v1 remains unchanged: `IPC_REGISTER_WORDS = 2` in syscall argument lanes.
-- A shared `IpcRegisterBlockV2` type now exists in `yarm-ipc-abi` for future pointer+size transport.
-- v2 target inline capacity is **8 words** (`64` bytes) via `inline_words: [u64; 8]`.
-- v2 block constants are defined (`IPC_ABI_V2_VERSION = 2`, `IPC_ABI_V2_INLINE_WORDS = 8`, `IPC_ABI_V2_BLOCK_SIZE`).
-- No v2 syscall numbers/dispatch wiring are introduced yet; runtime behavior is unchanged.
-
-
-## Reserved IPC ABI v2 syscall numbers (stubbed)
-
-- Reserved syscall numbers:
+- `IpcRegisterBlockV2` is active for v2 IPC syscalls and uses `inline_words: [u64; 8]` (up to 64-byte inline payloads).
+- Active v2 syscall numbers:
   - `SYSCALL_IPC_SEND_V2_NR = 15`
   - `SYSCALL_IPC_RECV_V2_NR = 16`
   - `SYSCALL_IPC_CALL_V2_NR = 17`
   - `SYSCALL_IPC_REPLY_V2_NR = 18`
-- Current status: decode+dispatch stubs exist and return `InvalidArgs`; no runtime IPC v2 behavior is implemented yet.
-- Planned lane contract for these reserved syscalls:
+- Lane contract for v2 syscalls:
   - `arg0`: user pointer to `IpcRegisterBlockV2`
-  - `arg1`: block size (eventually must equal `IPC_ABI_V2_BLOCK_SIZE`)
-  - `arg2..arg5`: reserved, currently ignored by stubs
-- v1 IPC syscalls remain the active behavior path.
+  - `arg1`: block size (`IPC_ABI_V2_BLOCK_SIZE`)
+  - `arg2..arg5`: reserved for ABI compatibility
 
+### `IPC_CALL_V2` behavior
 
-- `yarm-user-rt` now exposes additive experimental wrappers `ipc_send_v2`, `ipc_recv_v2`, `ipc_call_v2`, and `ipc_reply_v2`; v1 wrappers remain unchanged/default.
+- `IPC_CALL_V2` is a combined operation: **send request + wait for reply** in one syscall.
+- Userspace must pass reply receive endpoint cap in `IpcRegisterBlockV2.aux0`.
+- On success, the reply is returned through `ret_*` fields and inline payload lanes in the same `IpcRegisterBlockV2` written back to userspace.
+- Do **not** call `IPC_RECV_V2` after a successful `IPC_CALL_V2` for the same request; the reply has already been consumed by `IPC_CALL_V2`.
+
+### Current reply-size limitation
+
+- Current kernel `IPC_CALL_V2` return path supports inline replies up to **64 bytes** only.
+- Reply payloads larger than 64 bytes are currently rejected in the call-v2 return path.
+
+- `yarm-user-rt` exposes additive wrappers `ipc_send_v2`, `ipc_recv_v2`, `ipc_call_v2`, and `ipc_reply_v2`; v1 wrappers remain unchanged/default.
