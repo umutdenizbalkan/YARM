@@ -275,3 +275,4 @@
 - Migration state: additive/gradual only in this phase; existing `IpcTransport` (v1) and v1 syscall wrappers remain active and compatibility is unchanged.
 - Supervisor runtime process-manager helper RPCs (restart-token query, supervised-task registration, execute-restart) now use `IpcTransportV2` + `request_reply_v2(...)`.
 - Supervisor idle timeout wait path now uses v2 `IPC_RECV_V2` deadline receive (`recv_v2_with_deadline`); budgeted kernel-side control/fault polling remains unchanged.
+- POSIX-compat runtime `getpid` process-manager IPC path now uses `IpcTransportV2` request/reply (`request_reply_v2(...)`) rather than v1 transport send/recv choreography.

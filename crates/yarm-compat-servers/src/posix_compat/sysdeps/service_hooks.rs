@@ -11,7 +11,7 @@ use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::ipc::Message;
 use crate::yarm_compat_servers::{POSIX_COMPAT_ABI_VERSION, PosixErrno};
 use yarm_ipc_abi::process_abi::PROC_OP_GETPID;
-use yarm_user_rt::syscall::IpcTransport;
+use yarm_user_rt::syscall::{request_reply_v2, IpcTransport, IpcTransportV2};
 use yarm_user_rt::ipc::Message as RuntimeMessage;
 #[cfg(not(test))]
 use yarm_user_rt::runtime::startup_context;
@@ -31,7 +31,7 @@ pub struct PosixSysdepsContext<'a> {
     #[cfg(test)]
     pub kernel: &'a mut KernelState,
     #[cfg(not(test))]
-    runtime_transport: &'a mut dyn IpcTransport,
+    runtime_transport: &'a mut dyn IpcTransportV2,
     #[cfg(not(test))]
     process_manager_request_send_cap: Option<u32>,
     #[cfg(not(test))]
@@ -52,7 +52,7 @@ impl<'a> PosixSysdepsContext<'a> {
     }
 
     #[cfg(not(test))]
-    pub fn new(runtime_transport: &'a mut impl IpcTransport) -> Self {
+    pub fn new(runtime_transport: &'a mut impl IpcTransportV2) -> Self {
         let startup = startup_context();
         Self {
             runtime_transport,
@@ -404,7 +404,7 @@ fn decode_getpid_reply(reply: &RuntimeMessage) -> Result<u64, GetPidIpcError> {
 }
 
 fn getpid_via_process_manager_ipc(
-    transport: &mut dyn IpcTransport,
+    transport: &mut dyn IpcTransportV2,
     startup_tid: u64,
     request_cap: u32,
     reply_cap: u32,
@@ -413,16 +413,16 @@ fn getpid_via_process_manager_ipc(
         return Err(GetPidIpcError::MissingBindings);
     }
     let request_payload = startup_tid.to_le_bytes();
-    let request = RuntimeMessage::with_header(startup_tid, PROC_OP_GETPID, 0, None, &request_payload)
-        .map_err(|_| GetPidIpcError::ProtocolMismatch)?;
-    transport
-        .send(request_cap, &request)
-        .map_err(|_| GetPidIpcError::Transport)?;
-    let reply = transport
-        .recv(reply_cap)
-        .map_err(|_| GetPidIpcError::Transport)?
-        .ok_or(GetPidIpcError::MissingReply)?;
-    decode_getpid_reply(&reply)
+    let typed = request_reply_v2(transport, request_cap, reply_cap, &request_payload, |payload| {
+        RuntimeMessage::with_header(0, PROC_OP_GETPID, 0, None, payload).ok()
+    });
+    match typed {
+        Ok(reply) => decode_getpid_reply(&reply),
+        Err(yarm_user_rt::syscall::SyscallError::WouldBlock | yarm_user_rt::syscall::SyscallError::TimedOut) => {
+            Err(GetPidIpcError::MissingReply)
+        }
+        Err(_) => Err(GetPidIpcError::Transport),
+    }
 }
 
 #[cfg(test)]
@@ -476,6 +476,62 @@ mod tests {
             _timeout_ticks: u64,
         ) -> Result<Option<RuntimeMessage>, SyscallError> {
             Ok(self.reply.take())
+        }
+    }
+    impl IpcTransportV2 for StubTransport {
+        fn send_v2(
+            &mut self,
+            _endpoint_cap: u32,
+            _payload: &[u8],
+            _transfer_cap: Option<u64>,
+        ) -> Result<(), SyscallError> {
+            Ok(())
+        }
+        fn recv_v2(&mut self, _recv_cap: u32) -> Result<Option<yarm_user_rt::syscall::IpcV2Response>, SyscallError> {
+            Ok(None)
+        }
+        fn recv_v2_with_deadline(
+            &mut self,
+            _recv_cap: u32,
+            _timeout_ticks: u64,
+        ) -> Result<Option<yarm_user_rt::syscall::IpcV2Response>, SyscallError> {
+            Ok(None)
+        }
+        fn reply_v2(
+            &mut self,
+            _reply_cap: u32,
+            _payload: &[u8],
+            _transfer_cap: Option<u64>,
+        ) -> Result<(), SyscallError> {
+            Ok(())
+        }
+        fn call_v2(
+            &mut self,
+            _send_cap: u32,
+            _reply_recv_cap: u32,
+            _payload: &[u8],
+        ) -> Result<yarm_user_rt::syscall::IpcV2Response, SyscallError> {
+            let Some(reply) = self.reply.take() else {
+                return Err(SyscallError::WouldBlock);
+            };
+            let mut payload = [0u8; RuntimeMessage::MAX_PAYLOAD];
+            let bytes = reply.as_slice();
+            payload[..bytes.len()].copy_from_slice(bytes);
+            Ok(yarm_user_rt::syscall::IpcV2Response {
+                status: reply.header,
+                len: bytes.len(),
+                transfer_cap: None,
+                payload,
+            })
+        }
+        fn request_reply_v2<T>(
+            &mut self,
+            send_cap: u32,
+            reply_recv_cap: u32,
+            payload: &[u8],
+            decode_reply: impl FnOnce(&[u8]) -> Option<T>,
+        ) -> Result<T, SyscallError> {
+            request_reply_v2(self, send_cap, reply_recv_cap, payload, decode_reply)
         }
     }
 
