@@ -3,6 +3,7 @@
 
 #![no_std]
 
+pub mod ipc_v2;
 pub mod driver_abi;
 pub mod process_abi;
 pub mod socket_abi;

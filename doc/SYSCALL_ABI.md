@@ -240,3 +240,11 @@
 - Moving to 8 inline words therefore requires either:
   - a syscall ABI v2 with expanded argument/register mapping, or
   - an alternate payload path that preserves existing syscall argument ABI compatibility.
+
+## IPC ABI v2 scaffolding status
+
+- v1 remains unchanged: `IPC_REGISTER_WORDS = 2` in syscall argument lanes.
+- A shared `IpcRegisterBlockV2` type now exists in `yarm-ipc-abi` for future pointer+size transport.
+- v2 target inline capacity is **8 words** (`64` bytes) via `inline_words: [u64; 8]`.
+- v2 block constants are defined (`IPC_ABI_V2_VERSION = 2`, `IPC_ABI_V2_INLINE_WORDS = 8`, `IPC_ABI_V2_BLOCK_SIZE`).
+- No v2 syscall numbers/dispatch wiring are introduced yet; runtime behavior is unchanged.
