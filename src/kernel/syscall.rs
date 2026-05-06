@@ -1599,11 +1599,12 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
             frame.set_ok(0, 0, 0);
             Ok(())
         }
-        Syscall::IpcSend => handle_ipc_send(kernel, frame),
-        Syscall::IpcRecv => handle_ipc_recv(kernel, frame),
-        Syscall::IpcRecvTimeout => handle_ipc_recv_timeout(kernel, frame),
-        Syscall::IpcCall => handle_ipc_call(kernel, frame),
-        Syscall::IpcReply => handle_ipc_reply(kernel, frame),
+        // Legacy IPC v1 syscall slots are intentionally reserved for ABI stability.
+        Syscall::IpcSend
+        | Syscall::IpcRecv
+        | Syscall::IpcRecvTimeout
+        | Syscall::IpcCall
+        | Syscall::IpcReply => Err(SyscallError::InvalidNumber),
         Syscall::ControlPlaneSetCnodeSlots => handle_control_plane_set_cnode_slots(kernel, frame),
         Syscall::VmMap => handle_vm_map(kernel, frame),
         Syscall::TransferRelease => handle_transfer_release(kernel, frame),
@@ -1628,11 +1629,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
                 ))
             )
         });
-        let blocking_syscall = match syscall {
-            Syscall::IpcRecv | Syscall::IpcCall => true,
-            Syscall::IpcSend => decode_ipc_send_timeout_ticks(frame) == 0,
-            _ => false,
-        };
+        let blocking_syscall = false;
         if blocking_syscall && caller_blocked {
             return Ok(());
         }
@@ -2241,6 +2238,24 @@ mod tests {
             Syscall::decode(SYSCALL_IPC_REPLY_NR).expect("decode"),
             Syscall::IpcReply
         );
+    }
+
+    #[test]
+    fn legacy_ipc_v1_syscall_slots_return_invalid_number() {
+        let mut state = Bootstrap::init().expect("kernel");
+        for syscall_num in [
+            SYSCALL_IPC_SEND_NR,
+            SYSCALL_IPC_RECV_NR,
+            SYSCALL_IPC_RECV_TIMEOUT_NR,
+            SYSCALL_IPC_CALL_NR,
+            SYSCALL_IPC_REPLY_NR,
+        ] {
+            let mut frame = TrapFrame::new(syscall_num, [0; 6]);
+            assert_eq!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidNumber)
+            );
+        }
     }
 
     #[test]

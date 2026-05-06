@@ -8,13 +8,13 @@
 ## Syscall numbers
 
 - `0`: `Yield`
-- `1`: `IpcSend`
-- `2`: `IpcRecv`
+- `1`: **Reserved (legacy `IpcSend`, removed from active dispatch)**
+- `2`: **Reserved (legacy `IpcRecv`, removed from active dispatch)**
 - `3`: `VmMap` (YARM-native VM map syscall, capability-targeted)
 - `4`: `TransferRelease` (release a recv auto-mapped shared-memory transfer)
-- `5`: `IpcRecvTimeout` (bounded non-blocking receive with scheduler-yield retry budget)
-- `6`: `IpcCall` (send with kernel-minted ephemeral reply-cap transfer)
-- `7`: `IpcReply` (consume reply-cap and send reply to bound caller endpoint)
+- `5`: **Reserved (legacy `IpcRecvTimeout`, removed from active dispatch)**
+- `6`: **Reserved (legacy `IpcCall`, removed from active dispatch)**
+- `7`: **Reserved (legacy `IpcReply`, removed from active dispatch)**
 - `8`: `ControlPlaneSetCnodeSlots` (control-plane cnode slot-capacity resize by target process id)
 - `9`: `FutexWait` (`arg0=addr`, `arg1=expected`, `arg2=observed`)
 - `10`: `FutexWake` (`arg0=addr`, `arg1=max_wake`)
@@ -277,4 +277,4 @@
 - Supervisor idle timeout wait path now uses v2 `IPC_RECV_V2` deadline receive (`recv_v2_with_deadline`); budgeted kernel-side control/fault polling remains unchanged.
 - POSIX-compat runtime `getpid` process-manager IPC path now uses `IpcTransportV2` request/reply (`request_reply_v2(...)`) rather than v1 transport send/recv choreography.
 - Default user-runtime IPC path is v2 (`IpcTransportV2` and `ipc_*_v2` wrappers); legacy compatibility now exists only at kernel syscall ABI layer.
-- Kernel v1 syscall ABI (`IpcSend`, `IpcRecv`, `IpcCall`, legacy timeout receive) is intentionally retained temporarily for compatibility and will be removed in a later dedicated kernel ABI deletion pass.
+- Kernel v1 IPC syscall numbers are intentionally kept as reserved holes for ABI numbering stability; dispatch now returns deterministic legacy-removed errors for slots `1/2/5/6/7`.
