@@ -1311,9 +1311,45 @@ fn handle_ipc_send_v2_stub(kernel: &mut KernelState, frame: &mut TrapFrame) -> R
 }
 
 fn handle_ipc_recv_v2_stub(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let block = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_RECV)?;
+    let mut block = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_RECV)?;
+    if block.aux0 != 0 || block.aux1 != 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    let cap = CapId(block.endpoint_cap);
+    validate_endpoint_right(kernel, cap, CapRights::RECEIVE)?;
+    let received = kernel.ipc_recv(cap).map_err(SyscallError::from)?;
+    let Some(msg) = received else {
+        return Err(SyscallError::WouldBlock);
+    };
+
+    let len = msg.len as usize;
+    if len > 64 {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    block.flags &= !(IPC_V2_FLAG_INLINE_PAYLOAD | IPC_V2_FLAG_TRANSFER_CAP);
+    block.flags |= IPC_V2_FLAG_INLINE_PAYLOAD;
+    block.ret_status = msg.sender_tid.0;
+    block.ret_len = len as u64;
+    block.ret_transfer_cap = msg
+        .transferred_cap()
+        .map(|cap| cap.0)
+        .unwrap_or(IPC_V2_NO_TRANSFER_CAP);
+    if msg.transferred_cap().is_some() {
+        block.flags |= IPC_V2_FLAG_TRANSFER_CAP;
+    }
+    block.len = len as u64;
+    block.inline_words = [0; 8];
+    for (idx, chunk) in msg.as_slice().chunks(8).enumerate() {
+        let mut lane = [0u8; 8];
+        lane[..chunk.len()].copy_from_slice(chunk);
+        block.inline_words[idx] = u64::from_le_bytes(lane);
+    }
+
     write_ipc_v2_block_to_user(kernel, frame, &block)?;
-    Err(SyscallError::InvalidArgs)
+    frame.set_ok(0, 0, 0);
+    Ok(())
 }
 
 fn handle_ipc_call_v2_stub(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
@@ -1527,6 +1563,61 @@ mod tests {
         block.aux0 = 1;
         write_v2_block_to_user_for_test(&mut state, ptr, &block);
         let mut bad_aux = TrapFrame::new(SYSCALL_IPC_SEND_V2_NR, [ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut state, &mut bad_aux), Err(SyscallError::InvalidArgs));
+    }
+
+
+    #[test]
+    fn syscall_ipc_send_v2_then_recv_v2_roundtrip_inline() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+        let send_ptr = 0x7000usize;
+        let recv_ptr = 0x7100usize;
+
+        let mut send_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
+        send_block.endpoint_cap = send_cap.0;
+        send_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        send_block.len = 6;
+        let mut lane = [0u8; 8];
+        lane[..6].copy_from_slice(b"recvv2");
+        send_block.inline_words[0] = u64::from_le_bytes(lane);
+        write_v2_block_to_user_for_test(&mut state, send_ptr, &send_block);
+        let mut send_frame = TrapFrame::new(SYSCALL_IPC_SEND_V2_NR, [send_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut send_frame).expect("send v2");
+
+        let mut recv_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
+        recv_block.endpoint_cap = recv_cap.0;
+        write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
+        let mut recv_frame = TrapFrame::new(SYSCALL_IPC_RECV_V2_NR, [recv_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut recv_frame).expect("recv v2");
+
+        let mut bytes = [0u8; IPC_ABI_V2_BLOCK_SIZE];
+        read_user_bytes_exact(&state, recv_ptr, &mut bytes).expect("read recv block");
+        let out = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const IpcRegisterBlockV2) };
+        assert_eq!(out.ret_len, 6);
+        assert_eq!(out.ret_status, 0);
+        assert_eq!(out.ret_transfer_cap, IPC_V2_NO_TRANSFER_CAP);
+        assert_ne!(out.flags & IPC_V2_FLAG_INLINE_PAYLOAD, 0);
+        let lane0 = out.inline_words[0].to_le_bytes();
+        assert_eq!(&lane0[..6], b"recvv2");
+    }
+
+    #[test]
+    fn syscall_recv_v2_empty_endpoint_would_block_and_aux_validation() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let recv_ptr = 0x7200usize;
+
+        let mut recv_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
+        recv_block.endpoint_cap = recv_cap.0;
+        write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
+        let mut recv_frame = TrapFrame::new(SYSCALL_IPC_RECV_V2_NR, [recv_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut state, &mut recv_frame), Err(SyscallError::WouldBlock));
+
+        recv_block.aux1 = 1;
+        write_v2_block_to_user_for_test(&mut state, recv_ptr, &recv_block);
+        let mut bad_aux = TrapFrame::new(SYSCALL_IPC_RECV_V2_NR, [recv_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0]);
         assert_eq!(dispatch(&mut state, &mut bad_aux), Err(SyscallError::InvalidArgs));
     }
     #[test]
