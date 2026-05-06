@@ -268,3 +268,5 @@
 - Reply payloads larger than 64 bytes are currently rejected in the call-v2 return path.
 
 - `yarm-user-rt` exposes additive wrappers `ipc_send_v2`, `ipc_recv_v2`, `ipc_call_v2`, and `ipc_reply_v2`; v1 wrappers remain unchanged/default.
+- `yarm-user-rt` additionally exposes additive transport scaffolding via `IpcTransportV2` + `SyscallIpcTransport` adapter and a `request_reply_v2(...)` helper for small typed control-plane call/reply decoding.
+- Migration state: additive/gradual only in this phase; existing `IpcTransport` (v1) and v1 syscall wrappers remain active and compatibility is unchanged.

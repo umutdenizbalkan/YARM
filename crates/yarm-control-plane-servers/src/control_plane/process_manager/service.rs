@@ -29,6 +29,7 @@ use yarm_user_rt::process::{
 use yarm_user_rt::runtime::{KernelIpcError, RuntimeStateAccess, TrapIpcError};
 #[cfg(test)]
 use yarm_user_rt::syscall::SyscallError;
+use yarm_user_rt::syscall::{IpcTransportV2, SyscallIpcTransport};
 use yarm_user_rt::task::TaskClass;
 
 #[cfg(test)]
@@ -971,6 +972,16 @@ impl ProcessService {
     }
 
     fn execute_restart_via_kernel_cap(&self, tid: u64, restart_token: u64) -> u8 {
+        let mut transport = SyscallIpcTransport;
+        self.execute_restart_via_transport(&mut transport, tid, restart_token)
+    }
+
+    fn execute_restart_via_transport(
+        &self,
+        transport: &mut impl IpcTransportV2,
+        tid: u64,
+        restart_token: u64,
+    ) -> u8 {
         let Some(send_cap) = self.restart_control_send_cap else {
             return ExecuteRestartReply::STATUS_PERMISSION_DENIED;
         };
@@ -978,16 +989,15 @@ impl ProcessService {
         let reply_cap = yarm_user_rt::runtime::startup_context()
             .process_manager_reply_recv_cap
             .unwrap_or(0);
-        // SAFETY: process-manager owns both caps via startup handoff.
-        let response = match unsafe {
-            yarm_user_rt::syscall::ipc_call_v2(send_cap, reply_cap, &request.encode())
-        } {
-            Ok(response) => response,
+        match transport.request_reply_v2(
+            send_cap,
+            reply_cap,
+            &request.encode(),
+            |payload| ExecuteRestartReply::decode(payload).ok().map(|reply| reply.status),
+        ) {
+            Ok(status) => status,
             Err(_) => return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED,
-        };
-        ExecuteRestartReply::decode(&response.payload[..response.len])
-            .map(|r| r.status)
-            .unwrap_or(ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED)
+        }
     }
 }
 
@@ -1640,6 +1650,90 @@ mod tests {
         assert_eq!(
             call(&mut service, 9, 77),
             ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED
+        );
+    }
+
+    struct StubV2Transport {
+        expected_send_cap: u32,
+        expected_reply_cap: u32,
+        expected_payload: [u8; 16],
+        reply_status: u8,
+    }
+
+    impl yarm_user_rt::syscall::IpcTransportV2 for StubV2Transport {
+        fn send_v2(
+            &mut self,
+            _endpoint_cap: u32,
+            _payload: &[u8],
+            _transfer_cap: Option<u64>,
+        ) -> Result<(), yarm_user_rt::syscall::SyscallError> {
+            panic!("not used");
+        }
+        fn recv_v2(
+            &mut self,
+            _recv_cap: u32,
+        ) -> Result<Option<yarm_user_rt::syscall::IpcV2Response>, yarm_user_rt::syscall::SyscallError>
+        {
+            panic!("not used");
+        }
+        fn reply_v2(
+            &mut self,
+            _reply_cap: u32,
+            _payload: &[u8],
+            _transfer_cap: Option<u64>,
+        ) -> Result<(), yarm_user_rt::syscall::SyscallError> {
+            panic!("not used");
+        }
+        fn call_v2(
+            &mut self,
+            send_cap: u32,
+            reply_recv_cap: u32,
+            payload: &[u8],
+        ) -> Result<yarm_user_rt::syscall::IpcV2Response, yarm_user_rt::syscall::SyscallError> {
+            assert_eq!(send_cap, self.expected_send_cap);
+            assert_eq!(reply_recv_cap, self.expected_reply_cap);
+            assert_eq!(payload, self.expected_payload);
+            let reply = ExecuteRestartReply::new(self.reply_status).encode();
+            let mut payload_buf = [0u8; Message::MAX_PAYLOAD];
+            payload_buf[..reply.len()].copy_from_slice(&reply);
+            Ok(yarm_user_rt::syscall::IpcV2Response {
+                status: 0,
+                len: reply.len(),
+                transfer_cap: None,
+                payload: payload_buf,
+            })
+        }
+        fn request_reply_v2<T>(
+            &mut self,
+            send_cap: u32,
+            reply_recv_cap: u32,
+            payload: &[u8],
+            decode_reply: impl FnOnce(&[u8]) -> Option<T>,
+        ) -> Result<T, yarm_user_rt::syscall::SyscallError> {
+            yarm_user_rt::syscall::request_reply_v2(
+                self,
+                send_cap,
+                reply_recv_cap,
+                payload,
+                decode_reply,
+            )
+        }
+    }
+
+    #[test]
+    fn execute_restart_uses_v2_transport_adapter_path() {
+        let mut service = ProcessService::new();
+        service.restart_control_send_cap = Some(77);
+        let request = ExecuteRestartRequest::new(9, 0xBEEF);
+        let mut transport = StubV2Transport {
+            expected_send_cap: 77,
+            expected_reply_cap: 0,
+            expected_payload: request.encode(),
+            reply_status: ExecuteRestartReply::STATUS_OK,
+        };
+        assert_eq!(
+            service.execute_restart_via_transport(&mut transport, 9, 0xBEEF),
+            ExecuteRestartReply::STATUS_OK
         );
     }
 }

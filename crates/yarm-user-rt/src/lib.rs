@@ -68,6 +68,37 @@ pub mod syscall {
             timeout_ticks: u64,
         ) -> core::result::Result<Option<Message>, SyscallError>;
     }
+    pub trait IpcTransportV2 {
+        fn send_v2(
+            &mut self,
+            endpoint_cap: u32,
+            payload: &[u8],
+            transfer_cap: Option<u64>,
+        ) -> core::result::Result<(), SyscallError>;
+        fn recv_v2(
+            &mut self,
+            recv_cap: u32,
+        ) -> core::result::Result<Option<IpcV2Response>, SyscallError>;
+        fn reply_v2(
+            &mut self,
+            reply_cap: u32,
+            payload: &[u8],
+            transfer_cap: Option<u64>,
+        ) -> core::result::Result<(), SyscallError>;
+        fn call_v2(
+            &mut self,
+            send_cap: u32,
+            reply_recv_cap: u32,
+            payload: &[u8],
+        ) -> core::result::Result<IpcV2Response, SyscallError>;
+        fn request_reply_v2<T>(
+            &mut self,
+            send_cap: u32,
+            reply_recv_cap: u32,
+            payload: &[u8],
+            decode_reply: impl FnOnce(&[u8]) -> Option<T>,
+        ) -> core::result::Result<T, SyscallError>;
+    }
 
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     pub struct SyscallIpcTransport;
@@ -94,6 +125,73 @@ pub mod syscall {
             // SAFETY: forwards directly to syscall wrapper.
             unsafe { ipc_recv_with_deadline(ep_cap, timeout_ticks) }
         }
+    }
+
+    impl IpcTransportV2 for SyscallIpcTransport {
+        #[inline]
+        fn send_v2(
+            &mut self,
+            endpoint_cap: u32,
+            payload: &[u8],
+            transfer_cap: Option<u64>,
+        ) -> core::result::Result<(), SyscallError> {
+            // SAFETY: forwards directly to syscall wrapper.
+            unsafe { ipc_send_v2(endpoint_cap, payload, transfer_cap) }
+        }
+
+        #[inline]
+        fn recv_v2(
+            &mut self,
+            recv_cap: u32,
+        ) -> core::result::Result<Option<IpcV2Response>, SyscallError> {
+            // SAFETY: forwards directly to syscall wrapper.
+            unsafe { ipc_recv_v2(recv_cap) }
+        }
+
+        #[inline]
+        fn reply_v2(
+            &mut self,
+            reply_cap: u32,
+            payload: &[u8],
+            transfer_cap: Option<u64>,
+        ) -> core::result::Result<(), SyscallError> {
+            // SAFETY: forwards directly to syscall wrapper.
+            unsafe { ipc_reply_v2(reply_cap, payload, transfer_cap) }
+        }
+
+        #[inline]
+        fn call_v2(
+            &mut self,
+            send_cap: u32,
+            reply_recv_cap: u32,
+            payload: &[u8],
+        ) -> core::result::Result<IpcV2Response, SyscallError> {
+            // SAFETY: forwards directly to syscall wrapper.
+            unsafe { ipc_call_v2(send_cap, reply_recv_cap, payload) }
+        }
+
+        #[inline]
+        fn request_reply_v2<T>(
+            &mut self,
+            send_cap: u32,
+            reply_recv_cap: u32,
+            payload: &[u8],
+            decode_reply: impl FnOnce(&[u8]) -> Option<T>,
+        ) -> core::result::Result<T, SyscallError> {
+            request_reply_v2(self, send_cap, reply_recv_cap, payload, decode_reply)
+        }
+    }
+
+    #[inline]
+    pub fn request_reply_v2<T>(
+        transport: &mut impl IpcTransportV2,
+        send_cap: u32,
+        reply_recv_cap: u32,
+        payload: &[u8],
+        decode_reply: impl FnOnce(&[u8]) -> Option<T>,
+    ) -> core::result::Result<T, SyscallError> {
+        let response = transport.call_v2(send_cap, reply_recv_cap, payload)?;
+        decode_reply(&response.payload[..response.len]).ok_or(SyscallError::InvalidArgs)
     }
 
     #[inline]
@@ -796,6 +894,7 @@ pub mod process {
 #[cfg(test)]
 mod tests {
     use crate::runtime::{install_startup_arg_slots, startup_context};
+    use crate::syscall::{IpcTransportV2, IpcV2Response, SyscallError};
 
     #[test]
     fn ipc_v2_inline_encoder_roundtrip() {
@@ -855,5 +954,67 @@ mod tests {
             original.supervisor_restart_window_ticks.unwrap_or(0),
             original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
         ]);
+    }
+
+    struct MockTransportV2 {
+        response_payload: [u8; 4],
+    }
+
+    impl IpcTransportV2 for MockTransportV2 {
+        fn send_v2(
+            &mut self,
+            _endpoint_cap: u32,
+            _payload: &[u8],
+            _transfer_cap: Option<u64>,
+        ) -> Result<(), SyscallError> {
+            panic!("not used");
+        }
+        fn recv_v2(&mut self, _recv_cap: u32) -> Result<Option<IpcV2Response>, SyscallError> {
+            panic!("not used");
+        }
+        fn reply_v2(
+            &mut self,
+            _reply_cap: u32,
+            _payload: &[u8],
+            _transfer_cap: Option<u64>,
+        ) -> Result<(), SyscallError> {
+            panic!("not used");
+        }
+        fn call_v2(
+            &mut self,
+            _send_cap: u32,
+            _reply_recv_cap: u32,
+            _payload: &[u8],
+        ) -> Result<IpcV2Response, SyscallError> {
+            let mut payload = [0u8; crate::ipc::Message::MAX_PAYLOAD];
+            payload[..4].copy_from_slice(&self.response_payload);
+            Ok(IpcV2Response {
+                status: 0,
+                len: 4,
+                transfer_cap: None,
+                payload,
+            })
+        }
+        fn request_reply_v2<T>(
+            &mut self,
+            send_cap: u32,
+            reply_recv_cap: u32,
+            payload: &[u8],
+            decode_reply: impl FnOnce(&[u8]) -> Option<T>,
+        ) -> Result<T, SyscallError> {
+            crate::syscall::request_reply_v2(self, send_cap, reply_recv_cap, payload, decode_reply)
+        }
+    }
+
+    #[test]
+    fn request_reply_v2_decodes_typed_reply() {
+        let mut transport = MockTransportV2 {
+            response_payload: *b"pong",
+        };
+        let decoded = crate::syscall::request_reply_v2(&mut transport, 1, 2, b"ping", |reply| {
+            (reply == b"pong").then_some(7u8)
+        })
+        .expect("typed reply");
+        assert_eq!(decoded, 7);
     }
 }
