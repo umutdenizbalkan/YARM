@@ -6,7 +6,7 @@ use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 #[cfg(not(test))]
 use yarm_user_rt::runtime::{KernelIpcError as KernelError, StartupContext, startup_context};
 #[cfg(not(test))]
-use yarm_user_rt::syscall::{IpcTransport, SyscallIpcTransport};
+use yarm_user_rt::syscall::{IpcTransportV2, SyscallIpcTransport};
 use yarm_user_rt::capability::CapId;
 #[cfg(test)]
 use yarm_user_rt::capability::CapRights;
@@ -25,9 +25,8 @@ use yarm_ipc_abi::supervisor_abi::{
 };
 #[cfg(not(test))]
 use yarm_ipc_abi::process_abi::{
-    ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART,
-    PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_TASK_RESTART_TOKEN, RegisterSupervisedTask,
-    TaskRestartTokenReply, TaskRestartTokenRequest,
+    ExecuteRestartReply, ExecuteRestartRequest, RegisterSupervisedTask, TaskRestartTokenReply,
+    TaskRestartTokenRequest,
 };
 #[cfg(test)]
 use yarm_ipc_abi::supervisor_abi::{
@@ -1289,11 +1288,13 @@ pub fn run() {
 #[cfg(not(test))]
 #[inline]
 fn supervisor_idle_wait(
-    transport: &mut impl IpcTransport,
+    transport: &mut impl IpcTransportV2,
     control_recv_cap: u32,
 ) -> Result<bool, KernelError> {
-    match transport.recv_with_deadline(control_recv_cap, SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS)
-    {
+    match transport.recv_v2_with_deadline(
+        control_recv_cap,
+        SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS,
+    ) {
         Ok(Some(_msg)) => Ok(true),
         Ok(None) => Ok(false),
         Err(_err) => Ok(false),
@@ -1302,31 +1303,25 @@ fn supervisor_idle_wait(
 
 #[cfg(not(test))]
 fn query_restart_token_via_process_manager(
-    transport: &mut impl IpcTransport,
+    transport: &mut impl IpcTransportV2,
     process_manager_caps: Option<(u32, u32)>,
     tid: u64,
 ) -> Result<Option<u64>, KernelError> {
     let Some((req_cap, rep_cap)) = process_manager_caps else { return Ok(None) };
     let req = TaskRestartTokenRequest::new(tid);
-    let msg = Message::with_header(0, PROC_OP_TASK_RESTART_TOKEN, 0, None, &req.encode())
-        .map_err(|_| KernelError::WrongObject)?;
     transport
-        .send(req_cap, &msg)
-        .map_err(|_| KernelError::WrongObject)?;
-    let Some(reply_msg) = transport
-        .recv(rep_cap)
-        .map_err(|_| KernelError::WrongObject)?
-    else {
-        return Ok(None);
-    };
-    let reply = TaskRestartTokenReply::decode(reply_msg.as_slice())
-        .map_err(|_| KernelError::WrongObject)?;
-    Ok(reply.found_token())
+        .request_reply_v2(req_cap, rep_cap, &req.encode(), |payload| {
+            TaskRestartTokenReply::decode(payload)
+                .ok()
+                .and_then(|reply| reply.found_token())
+        })
+        .map(Some)
+        .or(Ok(None))
 }
 
 #[cfg(not(test))]
 fn register_supervised_task_with_process_manager(
-    transport: &mut impl IpcTransport,
+    transport: &mut impl IpcTransportV2,
     process_manager_caps: Option<(u32, u32)>,
     tid: u64,
     restart_token: u64,
@@ -1335,20 +1330,15 @@ fn register_supervised_task_with_process_manager(
         return Ok(());
     };
     let req = RegisterSupervisedTask::new(tid, restart_token);
-    let msg = Message::with_header(0, PROC_OP_REGISTER_SUPERVISED_TASK, 0, None, &req.encode())
-        .map_err(|_| KernelError::WrongObject)?;
-    transport
-        .send(req_cap, &msg)
-        .map_err(|_| KernelError::WrongObject)?;
     let _ = transport
-        .recv(rep_cap)
+        .request_reply_v2(req_cap, rep_cap, &req.encode(), |_payload| Some(()))
         .map_err(|_| KernelError::WrongObject)?;
     Ok(())
 }
 
 #[cfg(not(test))]
 fn execute_restart_via_process_manager(
-    transport: &mut impl IpcTransport,
+    transport: &mut impl IpcTransportV2,
     process_manager_caps: Option<(u32, u32)>,
     tid: u64,
     restart_token: u64,
@@ -1357,20 +1347,11 @@ fn execute_restart_via_process_manager(
         return Ok(ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED);
     };
     let req = ExecuteRestartRequest::new(tid, restart_token);
-    let msg = Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &req.encode())
-        .map_err(|_| KernelError::WrongObject)?;
     transport
-        .send(req_cap, &msg)
-        .map_err(|_| KernelError::WrongObject)?;
-    let Some(reply_msg) = transport
-        .recv(rep_cap)
-        .map_err(|_| KernelError::WrongObject)?
-    else {
-        return Ok(ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED);
-    };
-    let reply = ExecuteRestartReply::decode(reply_msg.as_slice())
-        .map_err(|_| KernelError::WrongObject)?;
-    Ok(reply.status)
+        .request_reply_v2(req_cap, rep_cap, &req.encode(), |payload| {
+            ExecuteRestartReply::decode(payload).ok().map(|reply| reply.status)
+        })
+        .or(Ok(ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED))
 }
 
 #[cfg(not(test))]
@@ -1574,7 +1555,18 @@ mod tests {
         let legacy_call = ["kernel", ".ipc_recv", "("].concat();
         assert!(src.contains("try_ipc_recv("));
         assert!(src.contains("ipc_recv_with_deadline("));
+        assert!(src.contains("transport.recv_v2_with_deadline("));
+        assert!(!src.contains("transport.recv_with_deadline("));
         assert!(!src.contains(legacy_call.as_str()));
+    }
+
+    #[test]
+    fn supervisor_pm_helpers_use_v2_request_reply_transport() {
+        let src = include_str!("service.rs");
+        assert!(src.contains("fn query_restart_token_via_process_manager(\n    transport: &mut impl IpcTransportV2,"));
+        assert!(src.contains("fn register_supervised_task_with_process_manager(\n    transport: &mut impl IpcTransportV2,"));
+        assert!(src.contains("fn execute_restart_via_process_manager(\n    transport: &mut impl IpcTransportV2,"));
+        assert!(src.contains("request_reply_v2(req_cap, rep_cap"));
     }
 
     #[test]
