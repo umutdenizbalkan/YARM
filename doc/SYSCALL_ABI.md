@@ -283,6 +283,11 @@
 - Supervisor runtime process-manager helper RPCs (restart-token query, supervised-task registration, execute-restart) now use `IpcTransportV2` + `request_reply_v2(...)`.
 - Supervisor idle timeout wait path now uses v2 `IPC_RECV_V2` deadline receive (`recv_v2_with_deadline`); budgeted kernel-side control/fault polling remains unchanged.
 - Supervisor runtime fault/control `recv_v2` path preserves explicit opcode-based routing (fault-report, task-exited, transfer-revoked, unknown-op ignore/log).
+- Supervisor runtime v2 fault/control wire format is opcode-prefixed envelope (`u16 opcode` + payload) for explicit dispatch.
+- Legacy 17-byte raw fault-report wire fallback is retained as **transitional compatibility only**; it is intended to be removed once all supervisor fault/control producers emit opcode-prefixed envelopes.
+- Unknown-op behavior intentionally differs by path:
+  - runtime loop logs/ignores unknown opcodes to keep supervisor progress/liveness;
+  - `service_step`/test path returns `WrongObject` for stricter validation.
 - POSIX-compat runtime `getpid` process-manager IPC path now uses `IpcTransportV2` request/reply (`request_reply_v2(...)`) rather than v1 transport send/recv choreography.
 - Default user-runtime IPC path is v2 (`IpcTransportV2` and `ipc_*_v2` wrappers); legacy compatibility now exists only at kernel syscall ABI layer.
 - Kernel v1 IPC syscall numbers are intentionally kept as reserved holes for ABI numbering stability; dispatch now returns deterministic legacy-removed errors for slots `1/2/5/6/7`.
