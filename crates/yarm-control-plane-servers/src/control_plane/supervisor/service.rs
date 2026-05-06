@@ -6,7 +6,7 @@ use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 #[cfg(not(test))]
 use yarm_user_rt::runtime::{KernelIpcError as KernelError, StartupContext, startup_context};
 #[cfg(not(test))]
-use yarm_user_rt::syscall::{IpcTransport, IpcTransportV2, SyscallIpcTransport};
+use yarm_user_rt::syscall::{IpcTransportV2, SyscallIpcTransport};
 use yarm_user_rt::capability::CapId;
 #[cfg(test)]
 use yarm_user_rt::capability::CapRights;

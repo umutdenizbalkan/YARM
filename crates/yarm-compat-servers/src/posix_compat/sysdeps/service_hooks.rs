@@ -11,7 +11,7 @@ use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::ipc::Message;
 use crate::yarm_compat_servers::{POSIX_COMPAT_ABI_VERSION, PosixErrno};
 use yarm_ipc_abi::process_abi::PROC_OP_GETPID;
-use yarm_user_rt::syscall::{request_reply_v2, IpcTransport, IpcTransportV2};
+use yarm_user_rt::syscall::{request_reply_v2, IpcTransportV2};
 use yarm_user_rt::ipc::Message as RuntimeMessage;
 #[cfg(not(test))]
 use yarm_user_rt::runtime::startup_context;
@@ -457,27 +457,6 @@ mod tests {
         reply: Option<RuntimeMessage>,
     }
 
-    impl IpcTransport for StubTransport {
-        fn send(
-            &mut self,
-            _ep_cap: u32,
-            _msg: &RuntimeMessage,
-        ) -> Result<(), SyscallError> {
-            Ok(())
-        }
-
-        fn recv(&mut self, _ep_cap: u32) -> Result<Option<RuntimeMessage>, SyscallError> {
-            Ok(self.reply.take())
-        }
-
-        fn recv_with_deadline(
-            &mut self,
-            _ep_cap: u32,
-            _timeout_ticks: u64,
-        ) -> Result<Option<RuntimeMessage>, SyscallError> {
-            Ok(self.reply.take())
-        }
-    }
     impl IpcTransportV2 for StubTransport {
         fn send_v2(
             &mut self,

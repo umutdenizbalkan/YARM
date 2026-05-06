@@ -272,8 +272,9 @@
 - `IPC_RECV_V2` with `aux0 == 0` performs a nonblocking probe; `aux0 > 0` performs deadline receive using kernel timeout machinery.
 - `yarm-user-rt::ipc_recv_v2_with_deadline` maps both `WouldBlock` and `TimedOut` to `Ok(None)` (matching v1 timeout wrapper behavior).
 - `yarm-user-rt` additionally exposes additive transport scaffolding via `IpcTransportV2` + `SyscallIpcTransport` adapter and a `request_reply_v2(...)` helper for small typed control-plane call/reply decoding.
-- Migration state: additive/gradual only in this phase; existing `IpcTransport` (v1) and v1 syscall wrappers remain active for compatibility/testing but are now deprecated in user-runtime API surface.
+- Migration state: user-runtime IPC v1 API surface (`IpcTransport`, `ipc_send`, `ipc_recv`, `ipc_recv_with_deadline`, `ipc_call`) has been removed; v2 transport/wrappers are the default userspace IPC API.
 - Supervisor runtime process-manager helper RPCs (restart-token query, supervised-task registration, execute-restart) now use `IpcTransportV2` + `request_reply_v2(...)`.
 - Supervisor idle timeout wait path now uses v2 `IPC_RECV_V2` deadline receive (`recv_v2_with_deadline`); budgeted kernel-side control/fault polling remains unchanged.
 - POSIX-compat runtime `getpid` process-manager IPC path now uses `IpcTransportV2` request/reply (`request_reply_v2(...)`) rather than v1 transport send/recv choreography.
-- Default user-runtime IPC path is v2 (`IpcTransportV2` and `ipc_*_v2` wrappers); v1 removal is planned after remaining test/mock compatibility cleanup.
+- Default user-runtime IPC path is v2 (`IpcTransportV2` and `ipc_*_v2` wrappers); legacy compatibility now exists only at kernel syscall ABI layer.
+- Kernel v1 syscall ABI (`IpcSend`, `IpcRecv`, `IpcCall`, legacy timeout receive) is intentionally retained temporarily for compatibility and will be removed in a later dedicated kernel ABI deletion pass.

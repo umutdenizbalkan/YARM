@@ -47,30 +47,11 @@ pub mod syscall {
         Internal = 255,
     }
 
-    const SYSCALL_IPC_SEND_NR: usize = 1;
-    const SYSCALL_IPC_RECV_NR: usize = 2;
-    const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
-    const SYSCALL_IPC_CALL_NR: usize = 4;
     const SYSCALL_IPC_SEND_V2_NR: usize = 15;
     const SYSCALL_IPC_RECV_V2_NR: usize = 16;
     const SYSCALL_IPC_CALL_V2_NR: usize = 17;
     const SYSCALL_IPC_REPLY_V2_NR: usize = 18;
     const SYSCALL_YIELD_NR: usize = 0;
-    const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
-    const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
-
-    #[deprecated(
-        note = "IPC v1 register-lane ABI is deprecated; use IpcTransportV2 / ipc_*_v2 instead."
-    )]
-    pub trait IpcTransport {
-        fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError>;
-        fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError>;
-        fn recv_with_deadline(
-            &mut self,
-            ep_cap: u32,
-            timeout_ticks: u64,
-        ) -> core::result::Result<Option<Message>, SyscallError>;
-    }
     pub trait IpcTransportV2 {
         fn send_v2(
             &mut self,
@@ -110,31 +91,6 @@ pub mod syscall {
 
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     pub struct SyscallIpcTransport;
-
-    #[allow(deprecated)]
-    impl IpcTransport for SyscallIpcTransport {
-        #[inline]
-        fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError> {
-            // SAFETY: forwards directly to syscall wrapper.
-            unsafe { ipc_send(ep_cap, msg) }
-        }
-
-        #[inline]
-        fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError> {
-            // SAFETY: forwards directly to syscall wrapper.
-            unsafe { ipc_recv(ep_cap) }
-        }
-
-        #[inline]
-        fn recv_with_deadline(
-            &mut self,
-            ep_cap: u32,
-            timeout_ticks: u64,
-        ) -> core::result::Result<Option<Message>, SyscallError> {
-            // SAFETY: forwards directly to syscall wrapper.
-            unsafe { ipc_recv_with_deadline(ep_cap, timeout_ticks) }
-        }
-    }
 
     impl IpcTransportV2 for SyscallIpcTransport {
         #[inline]
@@ -227,161 +183,6 @@ pub mod syscall {
             _ => SyscallError::Internal,
         }
     }
-
-    #[inline]
-    #[deprecated(
-        note = "IPC v1 register-lane ABI is deprecated; use IpcTransportV2 / ipc_*_v2 instead."
-    )]
-    pub unsafe fn ipc_send(ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError> {
-        let transfer_cap = msg
-            .transferred_cap()
-            .map(|cap| cap.0 as usize)
-            .unwrap_or(SYSCALL_NO_TRANSFER_CAP as usize);
-        let args = [
-            ep_cap as usize,
-            msg.payload.as_ptr() as usize,
-            msg.len as usize,
-            0,
-            0,
-            transfer_cap,
-        ];
-        // SAFETY: Uses architecture syscall ABI to enter kernel.
-        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_SEND_NR, args) };
-        #[cfg(target_arch = "x86_64")]
-        if ret.error != 0 {
-            return Err(decode_syscall_error(ret.error));
-        }
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret0 != 0 {
-            return Err(decode_syscall_error(ret.ret0));
-        }
-        Ok(())
-    }
-
-    #[inline]
-    #[deprecated(
-        note = "IPC v1 register-lane ABI is deprecated; use IpcTransportV2 / ipc_*_v2 instead."
-    )]
-    pub unsafe fn ipc_recv(ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError> {
-        let mut payload = [0u8; Message::MAX_PAYLOAD];
-        let args = [
-            ep_cap as usize,
-            payload.as_mut_ptr() as usize,
-            Message::MAX_PAYLOAD,
-            0,
-            SYSCALL_RECV_MAP_INTENT_DEFAULT,
-            SYSCALL_NO_TRANSFER_CAP as usize,
-        ];
-        // SAFETY: Uses architecture syscall ABI to enter kernel.
-        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_NR, args) };
-        #[cfg(target_arch = "x86_64")]
-        if ret.error != 0 {
-            let err = decode_syscall_error(ret.error);
-            return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
-        }
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret1 == args[1] && ret.ret2 == args[2] {
-            let err = decode_syscall_error(ret.ret0);
-            return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
-        }
-        let len = ret.ret1;
-        if len > Message::MAX_PAYLOAD {
-            return Err(SyscallError::Internal);
-        }
-        let transfer_cap = if (ret.ret2 as u64) == SYSCALL_NO_TRANSFER_CAP {
-            None
-        } else {
-            Some(ret.ret2 as u64)
-        };
-        let msg = Message::with_header(ret.ret0 as u64, 0, 0, transfer_cap, &payload[..len])
-            .map_err(|_| SyscallError::InvalidArgs)?;
-        Ok(Some(msg))
-    }
-
-    #[inline]
-    #[deprecated(
-        note = "IPC v1 register-lane ABI is deprecated; use IpcTransportV2 / ipc_*_v2 instead."
-    )]
-    pub unsafe fn ipc_recv_with_deadline(
-        ep_cap: u32,
-        timeout_ticks: u64,
-    ) -> core::result::Result<Option<Message>, SyscallError> {
-        let mut payload = [0u8; Message::MAX_PAYLOAD];
-        let args = [
-            ep_cap as usize,
-            payload.as_mut_ptr() as usize,
-            Message::MAX_PAYLOAD,
-            timeout_ticks as usize,
-            SYSCALL_RECV_MAP_INTENT_DEFAULT,
-            SYSCALL_NO_TRANSFER_CAP as usize,
-        ];
-        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_TIMEOUT_NR, args) };
-        #[cfg(target_arch = "x86_64")]
-        if ret.error != 0 {
-            let err = decode_syscall_error(ret.error);
-            return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) {
-                Ok(None)
-            } else {
-                Err(err)
-            };
-        }
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret1 == args[1] && ret.ret2 == args[2] {
-            let err = decode_syscall_error(ret.ret0);
-            return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) {
-                Ok(None)
-            } else {
-                Err(err)
-            };
-        }
-        let len = ret.ret1;
-        if len > Message::MAX_PAYLOAD {
-            return Err(SyscallError::Internal);
-        }
-        let transfer_cap = if (ret.ret2 as u64) == SYSCALL_NO_TRANSFER_CAP {
-            None
-        } else {
-            Some(ret.ret2 as u64)
-        };
-        let msg = Message::with_header(ret.ret0 as u64, 0, 0, transfer_cap, &payload[..len])
-            .map_err(|_| SyscallError::InvalidArgs)?;
-        Ok(Some(msg))
-    }
-
-    #[inline]
-    #[deprecated(
-        note = "IPC v1 register-lane ABI is deprecated; use IpcTransportV2 / ipc_*_v2 instead."
-    )]
-    pub unsafe fn ipc_call(
-        ep_cap: u32,
-        reply_recv_cap: u32,
-        msg: &Message,
-    ) -> core::result::Result<(), SyscallError> {
-        let transfer_cap = msg
-            .transferred_cap()
-            .map(|cap| cap.0 as usize)
-            .unwrap_or(SYSCALL_NO_TRANSFER_CAP as usize);
-        let args = [
-            ep_cap as usize,
-            msg.payload.as_ptr() as usize,
-            msg.len as usize,
-            reply_recv_cap as usize,
-            0,
-            transfer_cap,
-        ];
-        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_CALL_NR, args) };
-        #[cfg(target_arch = "x86_64")]
-        if ret.error != 0 {
-            return Err(decode_syscall_error(ret.error));
-        }
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret0 != 0 {
-            return Err(decode_syscall_error(ret.ret0));
-        }
-        Ok(())
-    }
-
-
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct IpcV2Response {
