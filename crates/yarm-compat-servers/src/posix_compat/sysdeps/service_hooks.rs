@@ -559,6 +559,14 @@ mod tests {
     }
 
     #[test]
+    fn runtime_getpid_path_guardrail_avoids_v1_transport_send_recv_calls() {
+        let src = include_str!("service_hooks.rs");
+        assert!(src.contains("request_reply_v2(transport, request_cap, reply_cap"));
+        assert!(!src.contains("transport\n        .send(request_cap"));
+        assert!(!src.contains("transport\n        .recv(reply_cap"));
+    }
+
+    #[test]
     fn proc_and_vfs_hooks_route_via_ipc_bindings() {
         run_with_large_stack(|| {
             let mut kernel = Bootstrap::init().expect("init");

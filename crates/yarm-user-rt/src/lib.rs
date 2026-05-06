@@ -59,6 +59,9 @@ pub mod syscall {
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
 
+    #[deprecated(
+        note = "IPC v1 register-lane ABI is deprecated; use IpcTransportV2 / ipc_*_v2 instead."
+    )]
     pub trait IpcTransport {
         fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError>;
         fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError>;
@@ -108,6 +111,7 @@ pub mod syscall {
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
     pub struct SyscallIpcTransport;
 
+    #[allow(deprecated)]
     impl IpcTransport for SyscallIpcTransport {
         #[inline]
         fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError> {
@@ -225,6 +229,9 @@ pub mod syscall {
     }
 
     #[inline]
+    #[deprecated(
+        note = "IPC v1 register-lane ABI is deprecated; use IpcTransportV2 / ipc_*_v2 instead."
+    )]
     pub unsafe fn ipc_send(ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError> {
         let transfer_cap = msg
             .transferred_cap()
@@ -252,6 +259,9 @@ pub mod syscall {
     }
 
     #[inline]
+    #[deprecated(
+        note = "IPC v1 register-lane ABI is deprecated; use IpcTransportV2 / ipc_*_v2 instead."
+    )]
     pub unsafe fn ipc_recv(ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError> {
         let mut payload = [0u8; Message::MAX_PAYLOAD];
         let args = [
@@ -289,6 +299,9 @@ pub mod syscall {
     }
 
     #[inline]
+    #[deprecated(
+        note = "IPC v1 register-lane ABI is deprecated; use IpcTransportV2 / ipc_*_v2 instead."
+    )]
     pub unsafe fn ipc_recv_with_deadline(
         ep_cap: u32,
         timeout_ticks: u64,
@@ -336,6 +349,9 @@ pub mod syscall {
     }
 
     #[inline]
+    #[deprecated(
+        note = "IPC v1 register-lane ABI is deprecated; use IpcTransportV2 / ipc_*_v2 instead."
+    )]
     pub unsafe fn ipc_call(
         ep_cap: u32,
         reply_recv_cap: u32,
