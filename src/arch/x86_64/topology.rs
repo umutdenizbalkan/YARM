@@ -77,6 +77,27 @@ pub fn discover_present_cpu_bitmap(madt_or_apic: &[u8]) -> u64 {
     }
 }
 
+
+pub fn discover_cpu_apic_ids(madt_or_apic: &[u8]) -> [Option<u8>; crate::kernel::scheduler::MAX_CPUS] {
+    let text = core::str::from_utf8(madt_or_apic).unwrap_or("");
+    let mut out = [None; crate::kernel::scheduler::MAX_CPUS];
+    let mut next_logical = 1u8;
+    out[crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize] =
+        Some(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+    for line in text.lines() {
+        let line = line.trim();
+        if !(line.contains("LAPIC") || line.contains("APIC")) || line.contains("enabled=0") { continue; }
+        let apic = line.split_whitespace().find(|p| p.starts_with("apic_id=") || p.starts_with("cpu=")).and_then(|p| p.split('=').nth(1)).and_then(|v| v.parse::<u8>().ok());
+        let is_bsp = line.contains("bsp=1") || apic == Some(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+        if let Some(apic_id) = apic {
+            let logical = if is_bsp { crate::arch::platform_constants::BOOTSTRAP_CPU_ID } else { let l=next_logical; next_logical = next_logical.saturating_add(1); l };
+            if (logical as usize) < out.len() { out[logical as usize] = Some(apic_id); }
+            crate::yarm_log!("YARM_CPU_ENUM logical={} apic_id={} bsp={} enabled=1", logical, apic_id, if is_bsp {1} else {0});
+        }
+    }
+    out
+}
+
 pub fn discover_irq_controller_description(madt_or_apic: &[u8], out: &mut [u8]) -> Option<usize> {
     let base = crate::arch::irq_description::parse_usize_token(madt_or_apic, "lapic_mmio_base")
         .or_else(|| crate::arch::irq_description::parse_usize_token(madt_or_apic, "lapic_base"))

@@ -144,6 +144,7 @@ pub struct KernelState {
     boot_config: KernelStorage<BootConfigSubsystem>,
     faults: KernelStorage<FaultSubsystem>,
     restart: KernelStorage<RestartSubsystem>,
+    cpu_apic_ids: [Option<u8>; platform_constants::MAX_CPUS],
 }
 
 pub struct Bootstrap;

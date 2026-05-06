@@ -771,6 +771,8 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             continue;
         }
 
+        let Some(apic_id) = kernel.cpu_apic_id(cpu) else { crate::yarm_log!("SMP_NO_APIC_ID cpu={}", cpu.0); continue; };
+        crate::yarm_log!("YARM_SMP_APIC_ID cpu={} apic_id={}", cpu.0, apic_id);
         prepare_trampoline_for_cpu(kernel, cpu);
         #[cfg(not(test))]
         crate::yarm_log!(
@@ -778,7 +780,7 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             cpu.0,
             AP_READY_POLL_ITERS
         );
-        send_init_sipi_sipi(cpu.0);
+        send_init_sipi_sipi(apic_id);
 
         let mut ready = false;
         #[cfg(not(test))]

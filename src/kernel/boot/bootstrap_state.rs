@@ -287,6 +287,9 @@ impl Bootstrap {
         let present_cpu_bitmap =
             crate::arch::boot_entry::take_staged_present_cpu_bitmap_for_bootstrap()
                 .unwrap_or_else(topology::default_present_cpu_bitmap);
+        let mut cpu_apic_ids = crate::arch::boot_entry::take_staged_cpu_apic_ids_for_bootstrap();
+        cpu_apic_ids[platform_constants::BOOTSTRAP_CPU_ID as usize] =
+            Some(platform_constants::BOOTSTRAP_CPU_ID);
         scheduler.set_present_cpu_bitmap(present_cpu_bitmap);
         scheduler
             .enqueue_on(
@@ -313,6 +316,7 @@ impl Bootstrap {
             core::ptr::addr_of_mut!((*state_ptr).driver_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).fault_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).restart_state_lock).write(SpinLockIrq::new(()));
+            core::ptr::addr_of_mut!((*state_ptr).cpu_apic_ids).write(cpu_apic_ids);
             core::ptr::addr_of_mut!((*state_ptr).capability_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).telemetry_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).boot_config_state_lock)

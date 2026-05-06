@@ -12,6 +12,7 @@ static FIRMWARE_BLOB_PROVIDER_PTR: AtomicUsize = AtomicUsize::new(0);
 static STAGED_BOOT_RAM_REGIONS_LEN: AtomicUsize = AtomicUsize::new(0);
 static STAGED_BOOT_RAM_REGIONS_LOCK: AtomicBool = AtomicBool::new(false);
 static STAGED_PRESENT_CPU_BITMAP: AtomicU64 = AtomicU64::new(0);
+static mut STAGED_CPU_APIC_IDS: [u8; crate::kernel::scheduler::MAX_CPUS] = [0xff; crate::kernel::scheduler::MAX_CPUS];
 static mut STAGED_BOOT_RAM_REGIONS: [crate::kernel::frame_allocator::MemoryRegion;
     MAX_STAGED_BOOT_RAM_REGIONS] = [crate::kernel::frame_allocator::MemoryRegion {
     start: 0,
@@ -172,6 +173,34 @@ pub fn take_staged_present_cpu_bitmap_for_bootstrap() -> Option<u64> {
     if bitmap == 0 { None } else { Some(bitmap) }
 }
 
+pub fn stage_cpu_apic_ids_for_bootstrap(apic_ids: &[Option<u8>; crate::kernel::scheduler::MAX_CPUS]) {
+    unsafe {
+        let base = core::ptr::addr_of_mut!(STAGED_CPU_APIC_IDS).cast::<u8>();
+        let mut idx = 0usize;
+        while idx < crate::kernel::scheduler::MAX_CPUS {
+            core::ptr::write(base.add(idx), apic_ids[idx].unwrap_or(0xff));
+            idx += 1;
+        }
+    }
+}
+
+pub fn take_staged_cpu_apic_ids_for_bootstrap() -> [Option<u8>; crate::kernel::scheduler::MAX_CPUS] {
+    let mut out = [None; crate::kernel::scheduler::MAX_CPUS];
+    unsafe {
+        let base = core::ptr::addr_of_mut!(STAGED_CPU_APIC_IDS).cast::<u8>();
+        let mut idx = 0usize;
+        while idx < crate::kernel::scheduler::MAX_CPUS {
+            let raw = core::ptr::read(base.add(idx));
+            if raw != 0xff {
+                out[idx] = Some(raw);
+            }
+            core::ptr::write(base.add(idx), 0xff);
+            idx += 1;
+        }
+    }
+    out
+}
+
 pub fn set_firmware_blob_provider_for_boot(provider: fn(&mut [u8]) -> usize) {
     FIRMWARE_BLOB_PROVIDER_PTR.store(provider as usize, Ordering::Release);
 }
@@ -179,6 +208,9 @@ pub fn set_firmware_blob_provider_for_boot(provider: fn(&mut [u8]) -> usize) {
 #[inline]
 pub fn run_kernel_boot_with_firmware_blob(run: fn(), firmware_blob: Option<&[u8]>) {
     if let Some(blob) = firmware_blob {
+        let present = crate::arch::topology::discover_present_cpu_bitmap(blob);
+        let _ = stage_present_cpu_bitmap_for_bootstrap(present);
+        stage_cpu_apic_ids_for_bootstrap(&crate::arch::topology::discover_cpu_apic_ids(blob));
         let mut canonical = [0u8; MAX_IRQ_DESCRIPTION_BYTES];
         if let Some(canonical_len) =
             crate::arch::topology::discover_irq_controller_description(blob, &mut canonical)

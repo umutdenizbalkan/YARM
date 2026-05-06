@@ -38,6 +38,12 @@ pub fn discover_present_cpu_bitmap(dtb: &[u8]) -> u64 {
     }
 }
 
+pub fn discover_cpu_apic_ids(_blob: &[u8]) -> [Option<u8>; crate::kernel::scheduler::MAX_CPUS] {
+    let mut out = [None; crate::kernel::scheduler::MAX_CPUS];
+    out[crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize] = Some(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+    out
+}
+
 pub fn discover_irq_controller_description(dtb: &[u8], out: &mut [u8]) -> Option<usize> {
     let base = crate::arch::irq_description::parse_usize_token(dtb, "plic_mmio_base")
         .or_else(|| crate::arch::irq_description::parse_usize_token(dtb, "plic_base"))

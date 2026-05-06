@@ -122,6 +122,11 @@ impl KernelState {
         kernel_ref(&sched.scheduler).online_cpu_bitmap()
     }
 
+
+    pub fn cpu_apic_id(&self, cpu: CpuId) -> Option<u8> {
+        self.cpu_apic_ids.get(cpu.0 as usize).copied().flatten()
+    }
+
     pub fn program_timer_deadline_current_cpu(&mut self, ticks_from_now: u64) {
         let cpu = self.current_cpu();
         self.hal.program_timer_deadline(cpu, ticks_from_now);
