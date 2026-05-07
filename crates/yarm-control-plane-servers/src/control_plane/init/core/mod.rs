@@ -395,10 +395,17 @@ impl InitService {
     #[cfg(test)]
     fn delegate_initramfs_request_recv_cap(
         kernel: &mut KernelState,
+        init_tid: u64,
         initramfs_tid: u64,
     ) -> Result<[u64; 16], KernelError> {
         let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
-        let (_, _request_send_root, request_recv_root) = kernel.create_endpoint(16)?;
+        let (_, request_send_root, request_recv_root) = kernel.create_endpoint(16)?;
+        let delegated_send = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            request_send_root,
+            init_tid,
+            CapRights::SEND,
+        )?;
         let delegated_recv = kernel.grant_capability_task_to_task_with_rights(
             source_tid,
             request_recv_root,
@@ -406,9 +413,10 @@ impl InitService {
             CapRights::RECEIVE,
         )?;
         let mut args = UserImageSpec::DEFAULT_STARTUP_ARGS;
-        // STAGED(slot11): initramfs server-only reuse of slot 11 as request RECV cap.
-        // Primary slot meaning remains process-manager restart-control send cap.
-        args[11] = delegated_recv.0;
+        args[12] = 1; // InitOrchestrationCapsV1::VERSION
+        args[13] = delegated_send.0;
+        args[14] = delegated_recv.0;
+        args[15] = 0;
         Ok(args)
     }
 
@@ -544,7 +552,7 @@ impl InitService {
         let process_manager_startup_args =
             Self::delegate_process_manager_restart_control_cap(kernel, proc_tid)?;
         let initramfs_startup_args =
-            Self::delegate_initramfs_request_recv_cap(kernel, vfs_tid)?;
+            Self::delegate_initramfs_request_recv_cap(kernel, init_tid, vfs_tid)?;
         match self.launch_strategy {
             CoreLaunchStrategy::ProcessManagerFirst => {
                 self.record_launch(
@@ -1338,12 +1346,17 @@ mod tests {
     }
 
     #[test]
-    fn initramfs_startup_args_stage_slot11_with_request_recv_cap() {
+    fn initramfs_startup_args_install_init_orchestration_caps_payload() {
         let mut state = Bootstrap::init_boxed().expect("init");
+        state.register_task(1).expect("init task");
         state.register_task(3).expect("vfs task");
-        let args = InitService::delegate_initramfs_request_recv_cap(&mut state, 3)
+        let args = InitService::delegate_initramfs_request_recv_cap(&mut state, 1, 3)
             .expect("delegate recv cap");
-        assert_ne!(args[11], 0, "slot11 should carry staged initramfs recv cap");
+        assert_eq!(args[11], 0, "slot11 remains untouched");
+        assert_eq!(args[12], 1, "InitOrchestrationCapsV1 version");
+        assert_ne!(args[13], 0, "init orchestration send cap");
+        assert_ne!(args[14], 0, "initramfs child recv cap");
+        assert_ne!(args[13], args[14], "send/recv caps should differ");
         assert_eq!(args[0], 0);
         assert_eq!(args[1], 0);
         assert_eq!(args[2], 0);
