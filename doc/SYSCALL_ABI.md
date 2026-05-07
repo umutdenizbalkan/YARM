@@ -258,6 +258,23 @@
 
 ### `IPC_CALL_V2` behavior
 
+### IPC v2 stage-1 shared-reply metadata convention (scaffolding)
+
+- This is an ABI **convention** layer on top of existing `IPC_REPLY_V2` capability-transfer behavior.
+- Server path:
+  - reply using `IPC_REPLY_V2`;
+  - set `IPC_V2_FLAG_TRANSFER_CAP`;
+  - transfer-cap should be a MemoryObject-cap-like object suitable for explicit later mapping by the caller;
+  - reply payload should carry `IpcV2SharedReplyMeta` bytes.
+- Caller path:
+  - receives `ret_transfer_cap` as the receiver-local transferred capability id;
+  - decodes `IpcV2SharedReplyMeta` from reply payload;
+  - maps transferred capability explicitly via VM/map syscalls later.
+- Stage-1 intentionally has **no automatic mapping** in IPC syscall handling.
+- Safety caveats:
+  - mutability depends on transferred-cap rights and aliasing policy (`READ_ONLY` vs writable intent);
+  - revocation/lifetime races remain possible and must be handled by caller map/use failure paths.
+
 - `IPC_CALL_V2` is a combined operation: **send request + wait for reply** in one syscall.
 - Userspace must pass reply receive endpoint cap in `IpcRegisterBlockV2.aux0`.
 - On success, the reply is returned through `ret_*` fields and inline payload lanes in the same `IpcRegisterBlockV2` written back to userspace.
