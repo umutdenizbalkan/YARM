@@ -143,3 +143,37 @@ common_create_initramfs_newc() {
     common_exit_if_strict_mode
   fi
 }
+
+common_verify_initramfs_stage_paths() {
+  if [[ ! -f "$INITRAMFS_IMAGE_ABS" ]]; then
+    echo "[error] initramfs image missing for staging verification: $INITRAMFS_IMAGE_ABS"
+    return 1
+  fi
+  if ! command -v cpio >/dev/null 2>&1; then
+    echo "[warn] cpio not found; skipping initramfs staged-path verification"
+    return 0
+  fi
+
+  local listing
+  if ! listing="$(cpio -it < "$INITRAMFS_IMAGE_ABS" 2>/dev/null)"; then
+    echo "[error] failed to list initramfs image with cpio: $INITRAMFS_IMAGE_ABS"
+    return 1
+  fi
+
+  local missing=0
+  for expected in "init" "sbin/init_server" "sbin/initramfs_srv"; do
+    if ! printf '%s\n' "$listing" | rg -q "^${expected}$"; then
+      echo "[error] initramfs staged path missing: /${expected}"
+      missing=1
+    fi
+  done
+  if [[ "$missing" -ne 0 ]]; then
+    return 1
+  fi
+
+  echo "[ok] initramfs staged path verified: /init"
+  echo "[ok] initramfs staged path verified: /sbin/init_server"
+  echo "[ok] initramfs staged path verified: /sbin/initramfs_srv"
+  echo "[info] /init identity remains ${SERVER_BIN:-init_server}"
+  echo "[info] /sbin/initramfs_srv identity is ${INITRAMFS_SERVER_BIN:-initramfs_srv}"
+}

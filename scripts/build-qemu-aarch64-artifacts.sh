@@ -70,6 +70,7 @@ fi
 common_stage_server_init_elf || true
 common_stage_aux_server_elf "$INITRAMFS_SERVER_ELF" "initramfs server" "sbin/initramfs_srv" || true
 common_create_initramfs_newc
+common_verify_initramfs_stage_paths
 
 [[ -f "$KERNEL_ELF" ]] && cp "$KERNEL_ELF" "$KERNEL_IMAGE"
 if [[ -f "$KERNEL_ELF" ]]; then

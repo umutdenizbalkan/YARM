@@ -187,6 +187,7 @@ if [[ "$KERNEL_BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
 fi
 
 common_create_initramfs_newc
+common_verify_initramfs_stage_paths
 
 BOOTABLE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-}
 if [[ -z "$BOOTABLE_SOURCE" && -f "$KERNEL_IMAGE" ]]; then

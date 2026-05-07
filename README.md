@@ -47,6 +47,7 @@ YARM is a `no_std` microkernel root crate plus a workspace of extracted server c
 - `initramfs_srv` is a separate filesystem server binary and is staged into initramfs as `/sbin/initramfs_srv` (launchable artifact only).
 - `/init` remains `init_server`; `initramfs_srv` is **not launched yet** by current runtime orchestration.
 - Future work for active initramfs IPC boot path is still: `init_server` orchestration + spawn/startup-cap passing.
+- Artifact scripts verify initramfs includes `/init`, `/sbin/init_server`, and `/sbin/initramfs_srv` after CPIO creation.
 - `yarm_user_rt::user_log!` is currently a no-op formatting macro and is not serial-visible by itself.
 
 ## Boundary model (current)
