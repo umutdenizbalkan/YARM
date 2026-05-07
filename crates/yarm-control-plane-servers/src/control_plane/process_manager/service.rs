@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+extern crate alloc;
+
+use alloc::boxed::Box;
+
 #[cfg(test)]
 use yarm::kernel::boot::KernelState;
 #[cfg(test)]
@@ -13,7 +17,7 @@ use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT,
     PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2,
     PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2,
-    RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args, TaskRestartTokenReply,
+    RegisterSupervisedTask, ServiceStartupCapsV1, SpawnV2Args, SpawnV3Args, SpawnV4Args, TaskRestartTokenReply,
     TaskRestartTokenRequest, WaitPidV2Args,
 };
 #[cfg(not(test))]
@@ -269,13 +273,41 @@ impl ProcessManagerOps for KernelProcessManagerAdapter {
     }
 }
 
-#[derive(Debug)]
 pub struct ProcessService {
     manager: KernelProcessManagerAdapter,
     policy_records: [Option<ProcessSpawnPolicyRecord>; 64],
     restart_token_records: [Option<RestartTokenRecord>; 64],
     restart_control_send_cap: Option<u32>,
     handled: usize,
+    spawn_backend: Box<dyn ProcessSpawnBackend>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeSpawnPlan {
+    image_id: u64,
+    entry: u64,
+    task_class: TaskClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeSpawnRequest {
+    tid: u64,
+    entry: usize,
+    task_class: TaskClass,
+    startup_args: [u64; 12],
+}
+
+trait ProcessSpawnBackend {
+    fn spawn(&self, req: RuntimeSpawnRequest) -> Result<ProcessId, ProcessManagerError>;
+}
+
+#[derive(Debug, Default)]
+struct UnsupportedProcessSpawnBackend;
+
+impl ProcessSpawnBackend for UnsupportedProcessSpawnBackend {
+    fn spawn(&self, _req: RuntimeSpawnRequest) -> Result<ProcessId, ProcessManagerError> {
+        Err(ProcessManagerError::Unsupported)
+    }
 }
 
 impl Default for ProcessService {
@@ -664,6 +696,10 @@ fn map_syscall_error(err: SyscallError) -> ProcessManagerError {
 
 impl ProcessService {
     pub fn new() -> Self {
+        Self::new_with_backend(Box::new(UnsupportedProcessSpawnBackend))
+    }
+
+    pub fn new_with_backend(spawn_backend: Box<dyn ProcessSpawnBackend>) -> Self {
         Self {
             manager: KernelProcessManagerAdapter::new(),
             policy_records: [None; 64],
@@ -671,6 +707,7 @@ impl ProcessService {
             restart_control_send_cap: yarm_user_rt::runtime::startup_context()
                 .process_manager_restart_control_send_cap,
             handled: 0,
+            spawn_backend,
         }
     }
 
