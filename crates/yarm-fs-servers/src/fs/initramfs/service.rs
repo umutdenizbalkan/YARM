@@ -12,8 +12,14 @@ use super::archive::{
     INITRAMFS_BOOT_MARKER_PATH, InitramfsBackend, InitramfsMetrics,
 };
 use yarm_srv_common::vfs_reply::VfsReply;
+use yarm_user_rt::runtime::startup_context;
+use yarm_user_rt::syscall::{
+    IpcV2Response, SyscallError, cap_release, ipc_recv_v2, ipc_reply_v2_msg, vm_unmap, yield_now,
+};
+use super::super::common::service::ServiceCleanup;
 
 pub type InitramfsService = FsService<InitramfsBackend>;
+const INITRAMFS_REAL_IPC_LOOP_STAGED: bool = true;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitramfsLoopSummary {
@@ -84,6 +90,11 @@ pub fn run_request_loop(service: &mut InitramfsService) -> Result<InitramfsLoopS
 
 pub fn run() {
     let mut svc = InitramfsService::with_backend(InitramfsBackend::new(8192));
+    if INITRAMFS_REAL_IPC_LOOP_STAGED {
+        if let Some(recv_cap) = startup_context().initramfs_request_recv_cap_from_slot11() {
+            run_ipc_loop(&mut svc, &mut RuntimeIpcOps, recv_cap);
+        }
+    }
     let summary = run_request_loop(&mut svc).expect("initramfs loop");
 
     yarm_user_rt::user_log!(
@@ -98,6 +109,106 @@ pub fn run() {
         summary.metrics.statx_count,
         summary.metrics.error_count
     );
+}
+
+trait InitramfsIpcOps {
+    fn recv_v2(&mut self, recv_cap: u32) -> Result<Option<IpcV2Response>, SyscallError>;
+    fn reply_v2_msg(
+        &mut self,
+        reply_cap: u32,
+        opcode: u16,
+        payload: &[u8],
+        transfer_cap: Option<u64>,
+    ) -> Result<(), SyscallError>;
+    fn yield_now(&mut self) -> Result<(), SyscallError>;
+}
+
+struct RuntimeIpcOps;
+
+impl InitramfsIpcOps for RuntimeIpcOps {
+    fn recv_v2(&mut self, recv_cap: u32) -> Result<Option<IpcV2Response>, SyscallError> {
+        // SAFETY: syscall wrapper.
+        unsafe { ipc_recv_v2(recv_cap) }
+    }
+    fn reply_v2_msg(
+        &mut self,
+        reply_cap: u32,
+        opcode: u16,
+        payload: &[u8],
+        transfer_cap: Option<u64>,
+    ) -> Result<(), SyscallError> {
+        // SAFETY: syscall wrapper.
+        unsafe { ipc_reply_v2_msg(reply_cap, opcode, payload, transfer_cap) }
+    }
+    fn yield_now(&mut self) -> Result<(), SyscallError> {
+        yield_now()
+    }
+}
+
+fn run_cleanup(cleanup: ServiceCleanup) {
+    match cleanup {
+        ServiceCleanup::VmAnonMapProducer { base, len, mem_cap } => {
+            // SAFETY: syscall wrappers, best-effort cleanup.
+            let _ = unsafe { vm_unmap(base, len) };
+            // SAFETY: syscall wrappers, best-effort cleanup.
+            let _ = unsafe { cap_release(mem_cap) };
+        }
+    }
+}
+
+fn handle_one_ipc_request(
+    service: &mut InitramfsService,
+    ops: &mut impl InitramfsIpcOps,
+    req: IpcV2Response,
+) {
+    let Some(reply_cap) = req.transfer_cap else {
+        return;
+    };
+    let request = match Message::with_header(
+        0,
+        req.opcode(),
+        if req.transfer_cap.is_some() {
+            Message::FLAG_CAP_TRANSFER
+        } else {
+            0
+        },
+        req.transfer_cap,
+        &req.payload[..req.len],
+    ) {
+        Ok(msg) => msg,
+        Err(_) => return,
+    };
+    let Ok(response) = service.handle_response(request) else {
+        return;
+    };
+    let reply_msg = response.message;
+    if ops
+        .reply_v2_msg(
+            reply_cap as u32,
+            reply_msg.opcode,
+            reply_msg.as_slice(),
+            reply_msg.transferred_cap().map(|cap| cap.0),
+        )
+        .is_ok()
+    {
+        if let Some(cleanup) = response.cleanup {
+            run_cleanup(cleanup);
+        }
+    }
+}
+
+fn run_ipc_loop(service: &mut InitramfsService, ops: &mut impl InitramfsIpcOps, recv_cap: u32) -> ! {
+    loop {
+        match ops.recv_v2(recv_cap) {
+            Ok(Some(req)) => handle_one_ipc_request(service, ops, req),
+            Ok(None) => {
+                let _ = ops.yield_now();
+            }
+            Err(_) => {
+                let _ = ops.yield_now();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
