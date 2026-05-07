@@ -242,6 +242,20 @@ fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), Syscall
     Ok(())
 }
 
+fn validate_shared_reply_transfer_cap_kind(
+    kernel: &KernelState,
+    cap: CapId,
+) -> Result<(), SyscallError> {
+    let transfer = kernel
+        .capability_service()
+        .resolve_current_task_capability(cap)
+        .ok_or(SyscallError::InvalidCapability)?;
+    if !matches!(transfer.object, CapObject::MemoryObject { .. }) {
+        return Err(SyscallError::WrongObject);
+    }
+    Ok(())
+}
+
 
 fn stash_transfer_handle(
     kernel: &mut KernelState,
@@ -963,6 +977,9 @@ fn handle_ipc_reply_v2_stub(
         }
         let cap = CapId(block.transfer_cap);
         validate_transfer_cap(kernel, cap)?;
+        if yarm_ipc_abi::ipc_v2::decode_shared_reply_meta(&payload[..len]).is_ok() {
+            validate_shared_reply_transfer_cap_kind(kernel, cap)?;
+        }
         (Message::FLAG_CAP_TRANSFER, Some(block.transfer_cap))
     } else {
         (0, None)
@@ -1826,7 +1843,7 @@ mod tests {
     }
 
     #[test]
-    fn syscall_ipc_reply_v2_transfer_cap_permissive_non_memory_object_baseline() {
+    fn syscall_ipc_reply_v2_shared_meta_transfer_cap_rejects_non_memory_object() {
         let mut state = Bootstrap::init().expect("kernel");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
 
@@ -1846,16 +1863,67 @@ mod tests {
         let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
         let reply_cap = req.transferred_cap().expect("reply cap");
 
-        // Baseline: kernel currently validates transfer-cap existence only, not object kind.
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0x1000,
+            len: 0x2000,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        let reply_payload_ptr = 0xB260usize;
+        state
+            .copy_to_current_user(reply_payload_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_payload_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = send_cap.0; // endpoint cap (non-MemoryObject)
+        let reply_ptr = 0xB280usize;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            dispatch(&mut state, &mut reply_frame),
+            Err(SyscallError::WrongObject)
+        );
+    }
+
+    #[test]
+    fn syscall_ipc_reply_v2_non_shared_payload_preserves_generic_transfer_cap_behavior() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+
+        let call_ptr = 0xB220usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"pong\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        // Non-shared payload: transfer-kind policy should remain generic.
         let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
         reply_block.endpoint_cap = reply_cap.0;
         reply_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD | IPC_V2_FLAG_TRANSFER_CAP;
-        reply_block.transfer_cap = send_cap.0; // endpoint cap (non-MemoryObject)
+        reply_block.transfer_cap = send_cap.0; // endpoint cap
         reply_block.len = 2;
         let mut lane = [0u8; 8];
         lane[..2].copy_from_slice(b"ok");
         reply_block.inline_words[0] = u64::from_le_bytes(lane);
-        let reply_ptr = 0xB280usize;
+        let reply_ptr = 0xB2A0usize;
         write_v2_block_to_user_for_test(&mut state, reply_ptr, &reply_block);
         let mut reply_frame = TrapFrame::new(
             SYSCALL_IPC_REPLY_V2_NR,
