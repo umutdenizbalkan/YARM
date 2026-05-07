@@ -12,11 +12,14 @@ KERNEL_RUST_TARGET_DIR=${KERNEL_RUST_TARGET_DIR:-riscv64gc-unknown-none-elf}
 SERVER_RUST_TARGET=${SERVER_RUST_TARGET:-targets/riscv64-yarm-user-none.json}
 SERVER_RUST_TARGET_DIR=${SERVER_RUST_TARGET_DIR:-riscv64-yarm-user-none}
 SERVER_BIN=${SERVER_BIN:-init_server}
+INITRAMFS_SERVER_BIN=${INITRAMFS_SERVER_BIN:-initramfs_srv}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
+INITRAMFS_SERVER_PACKAGE=${INITRAMFS_SERVER_PACKAGE:-yarm-fs-servers}
 KERNEL_PACKAGE=${KERNEL_PACKAGE:-yarm}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-release}
 SERVER_ELF=${SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
+INITRAMFS_SERVER_ELF=${INITRAMFS_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${INITRAMFS_SERVER_BIN}}
 KERNEL_ELF=${KERNEL_ELF:-target/${KERNEL_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-riscv64.bin}
@@ -28,6 +31,8 @@ mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
 echo "[info] /init build identity package=${SERVER_PACKAGE} bin=${SERVER_BIN} target=${SERVER_RUST_TARGET} profile=${SERVER_BUILD_PROFILE}"
 echo "[info] /init build identity server_elf=${SERVER_ELF}"
+echo "[info] initramfs server build identity package=${INITRAMFS_SERVER_PACKAGE} bin=${INITRAMFS_SERVER_BIN} target=${SERVER_RUST_TARGET} profile=${SERVER_BUILD_PROFILE}"
+echo "[info] initramfs server build identity server_elf=${INITRAMFS_SERVER_ELF}"
 
 CARGO_Z_ARGS=()
 if cargo -V 2>/dev/null | rg -q "nightly"; then
@@ -41,11 +46,15 @@ cargo build --target "$KERNEL_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${B
 KERNEL_BUILD_STATUS=$?
 cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$SERVER_BIN" "${CARGO_Z_ARGS[@]}"
 SERVER_BUILD_STATUS=$?
+cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$INITRAMFS_SERVER_PACKAGE" --bin "$INITRAMFS_SERVER_BIN" "${CARGO_Z_ARGS[@]}"
+INITRAMFS_SERVER_BUILD_STATUS=$?
 set -e
-[[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 ]] && common_exit_if_strict_mode
+[[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 || "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 ]] && common_exit_if_strict_mode
 
 common_stage_server_init_elf || true
+common_stage_aux_server_elf "$INITRAMFS_SERVER_ELF" "initramfs server" "sbin/initramfs_srv" || true
 common_create_initramfs_newc
+common_verify_initramfs_stage_paths
 
 if [[ -f "$KERNEL_ELF" ]]; then
   if command -v llvm-objcopy >/dev/null 2>&1; then

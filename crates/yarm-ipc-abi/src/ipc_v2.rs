@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-pub const IPC_ABI_V1_REGISTER_WORDS: usize = 2;
 pub const IPC_ABI_V2_INLINE_WORDS: usize = 8;
 pub const IPC_ABI_V2_VERSION: u16 = 2;
 

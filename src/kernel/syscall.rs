@@ -5,9 +5,7 @@ use super::boot::{KernelError, KernelState, TransferSharedRegion};
 use super::capabilities::{CapId, CapObject, CapRights};
 use super::ipc::Message;
 #[cfg(test)]
-use super::ipc::{
-    IPC_REGISTER_BYTES, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
-};
+use super::ipc::SharedMemoryRegion;
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
@@ -1225,7 +1223,7 @@ mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::capabilities::Capability;
-    use crate::kernel::ipc::{EndpointMode, IPC_REGISTER_WORDS};
+    use crate::kernel::ipc::EndpointMode;
     use crate::kernel::scheduler_timer::Timer;
     use crate::kernel::trapframe::TrapFrame;
     use yarm_ipc_abi::process_abi::{ExecuteRestartReply, ExecuteRestartRequest};
@@ -1244,6 +1242,16 @@ mod tests {
         state
             .copy_to_current_user(ptr, bytes)
             .expect("write v2 block");
+    }
+
+    fn legacy_inline_payload_from_recv_frame(frame: &TrapFrame, len: usize) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        let lane0 = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0).to_le_bytes();
+        let lane1 = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1).to_le_bytes();
+        out[..8].copy_from_slice(&lane0);
+        out[8..16].copy_from_slice(&lane1);
+        let _ = len;
+        out
     }
 
     fn memory_object_len_for_cap(state: &KernelState, cap: CapId) -> u64 {
@@ -1377,14 +1385,7 @@ mod tests {
         );
         dispatch(&mut state, &mut recv_frame).expect("recv");
         assert_eq!(recv_frame.ret1(), 5);
-        let got = unpack_register_payload(
-            [
-                recv_frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
-                recv_frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
-            ],
-            5,
-        )
-        .expect("unpack");
+        let got = legacy_inline_payload_from_recv_frame(&recv_frame, 5);
         assert_eq!(&got[..5], b"hello");
     }
 
@@ -1414,14 +1415,7 @@ mod tests {
             [recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 0, 0, 0],
         );
         dispatch(&mut state, &mut recv_frame).expect("recv");
-        let got = unpack_register_payload(
-            [
-                recv_frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
-                recv_frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
-            ],
-            5,
-        )
-        .expect("unpack");
+        let got = legacy_inline_payload_from_recv_frame(&recv_frame, 5);
         assert_eq!(&got[..5], b"world");
 
         block.aux1 = 1;
@@ -2352,7 +2346,6 @@ mod tests {
         assert_eq!(SYSCALL_VM_UNMAP_NR, 19);
         assert_eq!(SYSCALL_CAP_RELEASE_NR, 20);
         assert_eq!(SYSCALL_COUNT, 21);
-        assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
     #[test]
@@ -2753,14 +2746,7 @@ mod tests {
         dispatch(&mut state, &mut recv).expect("recv syscall");
 
         assert_eq!(recv.ret1(), 8);
-        let bytes = unpack_register_payload(
-            [
-                recv.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
-                recv.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
-            ],
-            recv.ret1(),
-        )
-        .expect("payload");
+        let bytes = legacy_inline_payload_from_recv_frame(&recv, recv.ret1());
         assert_eq!(&bytes[..8], b"call0000");
         assert_ne!(recv.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
     }
@@ -2828,14 +2814,7 @@ mod tests {
             [recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 0, 0, 0],
         );
         dispatch(&mut state, &mut recv).expect("recv syscall");
-        let bytes = unpack_register_payload(
-            [
-                recv.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
-                recv.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
-            ],
-            recv.ret1(),
-        )
-        .expect("payload");
+        let bytes = legacy_inline_payload_from_recv_frame(&recv, recv.ret1());
         assert_eq!(&bytes[..8], b"reply000");
 
         let mut replay = TrapFrame::new(
@@ -4175,7 +4154,7 @@ mod tests {
             [
                 send_cap.0 as usize,
                 0x1200,
-                IPC_REGISTER_BYTES + 1,
+                17,
                 0,
                 0,
                 mem_cap.0 as usize,
@@ -4189,7 +4168,7 @@ mod tests {
         assert!(msg.flags & Message::FLAG_CAP_TRANSFER != 0);
         let region = SharedMemoryRegion::decode(msg.as_slice()).expect("region");
         assert_eq!(region.offset, 0x1200);
-        assert_eq!(region.len as usize, IPC_REGISTER_BYTES + 1);
+        assert_eq!(region.len as usize, 17);
     }
 
     #[test]

@@ -1,52 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::arch::syscall_abi;
 pub use yarm_kernel::ipc::{IpcError, Message, SharedMemoryRegion, ThreadId, TransferCapId};
-
-pub const IPC_REGISTER_WORDS: usize = syscall_abi::IPC_REGISTER_WORDS;
-pub const IPC_REGISTER_BYTES: usize = IPC_REGISTER_WORDS * core::mem::size_of::<usize>();
-
-/// Returns all `IPC_REGISTER_BYTES` unpacked bytes from the register lanes.
-///
-/// Only the first `len` bytes are semantically meaningful to the caller; any
-/// remaining bytes are valid unpacked register contents but are considered
-/// unused payload. In other words, `len` is a validity bound, not a trim hint.
-pub fn unpack_register_payload(
-    words: [usize; IPC_REGISTER_WORDS],
-    len: usize,
-) -> Option<[u8; IPC_REGISTER_BYTES]> {
-    if len > IPC_REGISTER_BYTES {
-        return None;
-    }
-
-    let mut out = [0u8; IPC_REGISTER_BYTES];
-    for (i, word) in words.iter().enumerate() {
-        let bytes = (*word).to_le_bytes();
-        let start = i * core::mem::size_of::<usize>();
-        let end = start + core::mem::size_of::<usize>();
-        out[start..end].copy_from_slice(&bytes);
-    }
-    Some(out)
-}
-
-pub fn pack_register_payload(payload: &[u8]) -> Result<[usize; IPC_REGISTER_WORDS], IpcError> {
-    if payload.len() > IPC_REGISTER_BYTES {
-        return Err(IpcError::PayloadTooLarge);
-    }
-    let mut words = [0usize; IPC_REGISTER_WORDS];
-    for (i, slot) in words.iter_mut().enumerate() {
-        let start = i * core::mem::size_of::<usize>();
-        let end = start + core::mem::size_of::<usize>();
-        let mut lane = [0u8; core::mem::size_of::<usize>()];
-        if start < payload.len() {
-            let copy_end = core::cmp::min(end, payload.len());
-            lane[..copy_end - start].copy_from_slice(&payload[start..copy_end]);
-        }
-        *slot = usize::from_le_bytes(lane);
-    }
-    Ok(words)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointMode {
@@ -166,14 +121,6 @@ mod tests {
             Message::with_header(1, 0, Message::FLAG_CAP_TRANSFER, None, b"x"),
             Err(IpcError::InconsistentCapTransferFlag)
         );
-    }
-
-    #[test]
-    fn register_payload_roundtrip() {
-        let source = [0xAAu8; IPC_REGISTER_BYTES];
-        let words = pack_register_payload(&source).expect("pack");
-        let decoded = unpack_register_payload(words, IPC_REGISTER_BYTES).expect("decode");
-        assert_eq!(decoded, source);
     }
 
     #[test]

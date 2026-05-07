@@ -44,9 +44,13 @@ YARM is a `no_std` microkernel root crate plus a workspace of extracted server c
 
 - Current QEMU artifact scripts stage **`yarm-control-plane-servers` / `init_server`** as `/init`.
 - The kernel loads `/init` from initramfs as the first user task.
-- `initramfs_srv` is a separate filesystem server binary and is **not** currently staged as `/init`.
-- Therefore `INITRAMFS_*` markers in initramfs service code will not appear at boot until `initramfs_srv` is actually launched as a task.
+- `initramfs_srv` is a separate filesystem server binary and is staged into initramfs as `/sbin/initramfs_srv` (launchable artifact only).
+- `/init` remains `init_server`; `initramfs_srv` is **not launched yet** by current runtime orchestration.
+- Future work for active initramfs IPC boot path is still: `init_server` orchestration + spawn/startup-cap passing.
+- Artifact scripts verify initramfs includes `/init`, `/sbin/init_server`, and `/sbin/initramfs_srv` after CPIO creation.
 - `yarm_user_rt::user_log!` is currently a no-op formatting macro and is not serial-visible by itself.
+- Process-manager runtime spawn is still staged: non-test spawn now performs real boot-initrd image lookup + ELF parse validation at the runtime seam, then returns truthful `Unsupported` until kernel-backed task launch + startup-cap installation are connected.
+- Startup-cap transport is transitioning away from slot-overload assumptions via explicit structured service startup-cap ABI (`ServiceStartupCapsV1`), while slot 11 remains compatibility-only debt.
 
 ## Boundary model (current)
 

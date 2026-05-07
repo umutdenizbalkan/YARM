@@ -10,6 +10,7 @@ pub const PROC_SERVER_ABI_VERSION: u16 = 1;
 pub const PROC_CODEC_V2_VERSION: u16 = 2;
 pub const PROC_CODEC_V3_VERSION: u16 = 3;
 pub const PROC_CODEC_V4_VERSION: u16 = 4;
+pub const PROC_CODEC_V5_VERSION: u16 = 5;
 
 pub const PROC_OP_GETPID: u16 = 1;
 pub const PROC_OP_EXIT: u16 = 2;
@@ -21,6 +22,7 @@ pub const PROC_OP_SPAWN_V4: u16 = 7;
 pub const PROC_OP_TASK_RESTART_TOKEN: u16 = 8;
 pub const PROC_OP_REGISTER_SUPERVISED_TASK: u16 = 9;
 pub const PROC_OP_EXECUTE_RESTART: u16 = 10;
+pub const PROC_OP_SPAWN_V5: u16 = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecuteRestartRequest {
@@ -206,6 +208,88 @@ pub struct SpawnV4Args {
     pub task_class_hint: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnV5Args {
+    pub parent_pid: u64,
+    pub image_id: u64,
+    pub requested_cnode_slots: u64,
+    pub task_class_hint: u64,
+    pub startup_caps: ServiceStartupCapsV1,
+}
+
+/// Structured startup-cap contract for service/task launches.
+///
+/// This is intentionally decoupled from legacy startup slot overloading so
+/// orchestration layers can pass startup capabilities explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceStartupCapsV1 {
+    pub version: u16,
+    pub role: u16,
+    pub request_recv_cap: u64,
+    pub control_send_cap: u64,
+    pub control_recv_cap: u64,
+    pub reserved0: u64,
+}
+
+impl ServiceStartupCapsV1 {
+    pub const VERSION: u16 = 1;
+    pub const ENCODED_LEN: usize = 40;
+
+    pub const fn new(role: u16, request_recv_cap: u64) -> Self {
+        Self {
+            version: Self::VERSION,
+            role,
+            request_recv_cap,
+            control_send_cap: 0,
+            control_recv_cap: 0,
+            reserved0: 0,
+        }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        let version = self.version.to_le_bytes();
+        let role = self.role.to_le_bytes();
+        let req = self.request_recv_cap.to_le_bytes();
+        let csend = self.control_send_cap.to_le_bytes();
+        let crecv = self.control_recv_cap.to_le_bytes();
+        let r0 = self.reserved0.to_le_bytes();
+        out[0] = version[0];
+        out[1] = version[1];
+        out[2] = role[0];
+        out[3] = role[1];
+        out[8..16].copy_from_slice(&req);
+        out[16..24].copy_from_slice(&csend);
+        out[24..32].copy_from_slice(&crecv);
+        out[32..40].copy_from_slice(&r0);
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() != Self::ENCODED_LEN {
+            return Err(ProcCodecError::Malformed);
+        }
+        let version = u16::from_le_bytes([payload[0], payload[1]]);
+        let role = u16::from_le_bytes([payload[2], payload[3]]);
+        let mut req = [0u8; 8];
+        req.copy_from_slice(&payload[8..16]);
+        let mut csend = [0u8; 8];
+        csend.copy_from_slice(&payload[16..24]);
+        let mut crecv = [0u8; 8];
+        crecv.copy_from_slice(&payload[24..32]);
+        let mut r0 = [0u8; 8];
+        r0.copy_from_slice(&payload[32..40]);
+        Ok(Self {
+            version,
+            role,
+            request_recv_cap: u64::from_le_bytes(req),
+            control_send_cap: u64::from_le_bytes(csend),
+            control_recv_cap: u64::from_le_bytes(crecv),
+            reserved0: u64::from_le_bytes(r0),
+        })
+    }
+}
+
 impl SpawnV4Args {
     pub const VERSION: u16 = PROC_CODEC_V4_VERSION;
 
@@ -236,6 +320,44 @@ impl SpawnV4Args {
     pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
         let args = ProcV4Args::decode(payload)?;
         Ok(Self::new(args.arg0, args.arg1, args.arg2, args.arg3))
+    }
+}
+
+impl SpawnV5Args {
+    pub const VERSION: u16 = PROC_CODEC_V5_VERSION;
+    pub const ENCODED_LEN: usize = ProcV4Args::ENCODED_LEN + ServiceStartupCapsV1::ENCODED_LEN;
+
+    pub const fn new(
+        parent_pid: u64,
+        image_id: u64,
+        requested_cnode_slots: u64,
+        task_class_hint: u64,
+        startup_caps: ServiceStartupCapsV1,
+    ) -> Self {
+        Self { parent_pid, image_id, requested_cnode_slots, task_class_hint, startup_caps }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        let base = SpawnV4Args::new(
+            self.parent_pid,
+            self.image_id,
+            self.requested_cnode_slots,
+            self.task_class_hint,
+        )
+        .encode();
+        out[..ProcV4Args::ENCODED_LEN].copy_from_slice(&base);
+        out[ProcV4Args::ENCODED_LEN..].copy_from_slice(&self.startup_caps.encode());
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() != Self::ENCODED_LEN {
+            return Err(ProcCodecError::Malformed);
+        }
+        let v4 = SpawnV4Args::decode(&payload[..ProcV4Args::ENCODED_LEN])?;
+        let startup_caps = ServiceStartupCapsV1::decode(&payload[ProcV4Args::ENCODED_LEN..])?;
+        Ok(Self::new(v4.parent_pid, v4.image_id, v4.requested_cnode_slots, v4.task_class_hint, startup_caps))
     }
 }
 
@@ -536,6 +658,23 @@ mod tests {
     }
 
     #[test]
+    fn service_startup_caps_v1_roundtrip() {
+        let caps = ServiceStartupCapsV1 {
+            version: ServiceStartupCapsV1::VERSION,
+            role: 2,
+            request_recv_cap: 11,
+            control_send_cap: 22,
+            control_recv_cap: 33,
+            reserved0: 0,
+        };
+        let encoded = caps.encode();
+        assert_eq!(
+            ServiceStartupCapsV1::decode(&encoded).expect("decode"),
+            caps
+        );
+    }
+
+    #[test]
     fn typed_proc_v2_wrappers_roundtrip_via_frozen_codec() {
         let spawn = SpawnV2Args::new(7, 9);
         assert_eq!(SpawnV2Args::decode(&spawn.encode()), Ok(spawn));
@@ -596,5 +735,14 @@ mod tests {
         ];
         assert_eq!(args.encode(), expected);
         assert_eq!(ProcV4Args::decode(&expected), Ok(args));
+    }
+
+    #[test]
+    fn spawn_v5_args_roundtrip() {
+        let caps = ServiceStartupCapsV1::new(3, 11);
+        let args = SpawnV5Args::new(9, 7, 64, 2, caps);
+        let encoded = args.encode();
+        let decoded = SpawnV5Args::decode(&encoded).expect("decode");
+        assert_eq!(decoded, args);
     }
 }

@@ -11,10 +11,13 @@ KERNEL_RUST_TARGET=${KERNEL_RUST_TARGET:-targets/x86_64-yarm-none.json}
 SERVER_RUST_TARGET=${SERVER_RUST_TARGET:-targets/x86_64-yarm-user-none.json}
 SERVER_BIN=${SERVER_BIN:-init_server}
 SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
+INITRAMFS_SERVER_BIN=${INITRAMFS_SERVER_BIN:-initramfs_srv}
+INITRAMFS_SERVER_PACKAGE=${INITRAMFS_SERVER_PACKAGE:-yarm-fs-servers}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 KERNEL_PACKAGE=${KERNEL_PACKAGE:-yarm}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-x86-none}
 SERVER_ELF=${SERVER_ELF:-target/x86_64-yarm-user-none/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
+INITRAMFS_SERVER_ELF=${INITRAMFS_SERVER_ELF:-target/x86_64-yarm-user-none/${SERVER_BUILD_PROFILE}/${INITRAMFS_SERVER_BIN}}
 KERNEL_RAW_ELF=${KERNEL_RAW_ELF:-target/x86_64-yarm-none/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 KERNEL_BOOTABLE_IMAGE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
@@ -99,6 +102,8 @@ mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
 echo "[info] /init build identity package=${SERVER_PACKAGE} bin=${SERVER_BIN} target=${SERVER_RUST_TARGET} profile=${SERVER_BUILD_PROFILE}"
 echo "[info] /init build identity server_elf=${SERVER_ELF}"
+echo "[info] initramfs server build identity package=${INITRAMFS_SERVER_PACKAGE} bin=${INITRAMFS_SERVER_BIN} target=${SERVER_RUST_TARGET} profile=${SERVER_BUILD_PROFILE}"
+echo "[info] initramfs server build identity server_elf=${INITRAMFS_SERVER_ELF}"
 
 if ! rustup toolchain list | rg -q "^${TOOLCHAIN}"; then
   echo "[warn] toolchain '${TOOLCHAIN}' is not installed"
@@ -132,6 +137,16 @@ CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
 cargo +"${TOOLCHAIN}" build \
   -Z build-std=${BUILD_STD_COMPONENTS} \
   -Z json-target-spec \
+  --target "$SERVER_RUST_TARGET" \
+  --profile "$SERVER_BUILD_PROFILE" \
+  ${BOOTSTRAP_FEATURE_ARGS} \
+  -p "$INITRAMFS_SERVER_PACKAGE" \
+  --bin "$INITRAMFS_SERVER_BIN"
+INITRAMFS_SERVER_BUILD_STATUS=$?
+CARGO_PROFILE_X86_NONE_DEBUG="$X86_NONE_DEBUGINFO" \
+cargo +"${TOOLCHAIN}" build \
+  -Z build-std=${BUILD_STD_COMPONENTS} \
+  -Z json-target-spec \
   --target "$KERNEL_RUST_TARGET" \
   --profile "$SERVER_BUILD_PROFILE" \
   ${BOOTSTRAP_FEATURE_ARGS} \
@@ -141,6 +156,9 @@ KERNEL_BUILD_STATUS=$?
 set -e
 if [[ "$SERVER_BUILD_STATUS" -ne 0 ]]; then
   SERVER_BUILD_OK=0
+  BUILD_OK=0
+fi
+if [[ "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 ]]; then
   BUILD_OK=0
 fi
 if [[ "$KERNEL_BUILD_STATUS" -ne 0 ]]; then
@@ -155,6 +173,13 @@ else
   common_exit_if_strict_mode
 fi
 
+if [[ "$INITRAMFS_SERVER_BUILD_STATUS" -eq 0 ]]; then
+  common_stage_aux_server_elf "$INITRAMFS_SERVER_ELF" "initramfs server" "sbin/initramfs_srv" || true
+else
+  echo "[warn] compile for ${INITRAMFS_SERVER_BIN} (${INITRAMFS_SERVER_PACKAGE}) failed"
+  common_exit_if_strict_mode
+fi
+
 if [[ "$KERNEL_BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
   cp "$KERNEL_RAW_ELF" "$KERNEL_DEBUG_ELF"
   echo "[info] yarm freestanding kernel ELF (debug-only): $KERNEL_DEBUG_ELF"
@@ -162,6 +187,7 @@ if [[ "$KERNEL_BUILD_OK" -eq 1 && -f "$KERNEL_RAW_ELF" ]]; then
 fi
 
 common_create_initramfs_newc
+common_verify_initramfs_stage_paths
 
 BOOTABLE_SOURCE=${KERNEL_BOOTABLE_IMAGE_SOURCE:-}
 if [[ -z "$BOOTABLE_SOURCE" && -f "$KERNEL_IMAGE" ]]; then

@@ -12,6 +12,46 @@ use crate::kernel::trap::Trap;
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::scheduler::CpuId;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnRuntimeError {
+    MissingRight,
+    TaskTableFull,
+    MemoryObjectFull,
+    SchedulerFull,
+    InvalidCapability,
+    WrongObject,
+    StaleCapability,
+    UserMemoryFault,
+    TaskMissing,
+    MemoryObjectMissing,
+    VmFull,
+    VmFault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnUserImageSpec {
+    pub tid: u64,
+    pub entry: usize,
+    pub asid_raw: u16,
+    pub task_class: crate::kernel::task::TaskClass,
+    pub startup_args: [u64; 12],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnedUserTaskInfo {
+    pub tid: u64,
+    pub entry: usize,
+    pub asid_raw: u16,
+}
+
+pub trait ProcessSpawnBackend {
+    fn create_user_address_space_raw(&self) -> Result<u16, SpawnRuntimeError>;
+    fn spawn_user_image(
+        &self,
+        spec: SpawnUserImageSpec,
+    ) -> Result<SpawnedUserTaskInfo, SpawnRuntimeError>;
+}
+
 #[derive(Debug)]
 pub struct SharedKernel {
     state: SpinLock<KernelState>,
@@ -94,6 +134,59 @@ impl SharedKernel {
     ) -> Result<(), TrapHandleError> {
         self.with(|state| {
             state.control_plane_set_process_cnode_slots_via_syscall(target_pid, slot_capacity)
+        })
+    }
+}
+
+fn map_kernel_ipc_error(err: KernelError) -> SpawnRuntimeError {
+    match err {
+        KernelError::MissingRight => SpawnRuntimeError::MissingRight,
+        KernelError::TaskTableFull => SpawnRuntimeError::TaskTableFull,
+        KernelError::MemoryObjectFull => SpawnRuntimeError::MemoryObjectFull,
+        KernelError::SchedulerFull => SpawnRuntimeError::SchedulerFull,
+        KernelError::InvalidCapability => SpawnRuntimeError::InvalidCapability,
+        KernelError::WrongObject => SpawnRuntimeError::WrongObject,
+        KernelError::StaleCapability => SpawnRuntimeError::StaleCapability,
+        KernelError::UserMemoryFault => SpawnRuntimeError::UserMemoryFault,
+        KernelError::TaskMissing => SpawnRuntimeError::TaskMissing,
+        KernelError::MemoryObjectMissing => SpawnRuntimeError::MemoryObjectMissing,
+        KernelError::Vm(err) => match err {
+            crate::kernel::vm::VmError::Full => SpawnRuntimeError::VmFull,
+            _ => SpawnRuntimeError::VmFault,
+        },
+        _ => SpawnRuntimeError::WrongObject,
+    }
+}
+
+impl ProcessSpawnBackend for SharedKernel {
+    fn create_user_address_space_raw(&self) -> Result<u16, SpawnRuntimeError> {
+        self.with(|state| {
+            state
+                .create_user_address_space()
+                .map(|(asid, _)| asid.0)
+                .map_err(map_kernel_ipc_error)
+        })
+    }
+
+    fn spawn_user_image(
+        &self,
+        spec: SpawnUserImageSpec,
+    ) -> Result<SpawnedUserTaskInfo, SpawnRuntimeError> {
+        self.with(|state| {
+            state
+                .spawn_user_task_from_image(crate::kernel::boot::UserImageSpec {
+                    tid: spec.tid,
+                    entry: spec.entry,
+                    asid: Some(crate::kernel::vm::Asid(spec.asid_raw)),
+                    class: spec.task_class,
+                    startup_args: spec.startup_args,
+                })
+                .map(|spawned| SpawnedUserTaskInfo {
+                    tid: spawned.tid,
+                    entry: spawned.entry,
+                    asid_raw: spawned.asid.map(|a| a.0).unwrap_or(0),
+                })
+                .map_err(map_kernel_ipc_error)
         })
     }
 }

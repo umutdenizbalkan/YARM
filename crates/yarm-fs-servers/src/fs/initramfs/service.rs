@@ -91,7 +91,8 @@ pub fn run_request_loop(service: &mut InitramfsService) -> Result<InitramfsLoopS
 pub fn run() {
     let mut svc = InitramfsService::with_backend(InitramfsBackend::new(8192));
     if INITRAMFS_REAL_IPC_LOOP_STAGED {
-        if let Some(recv_cap) = startup_context().initramfs_request_recv_cap_from_slot11() {
+        let startup = startup_context();
+        if let Some(recv_cap) = resolve_initramfs_recv_cap(startup) {
             yarm_user_rt::user_log!(
                 "INITRAMFS_RUNTIME_MODE mode=real_ipc recv_cap={}",
                 recv_cap
@@ -99,8 +100,9 @@ pub fn run() {
             run_ipc_loop(&mut svc, &mut RuntimeIpcOps, recv_cap);
         } else {
             yarm_user_rt::user_log!(
-                "INITRAMFS_RUNTIME_MODE mode=scripted_fallback reason=no_recv_cap"
+                "INITRAMFS_RUNTIME_MODE mode=no_loop reason=no_recv_cap"
             );
+            return;
         }
     }
     let summary = run_request_loop(&mut svc).expect("initramfs loop");
@@ -117,6 +119,21 @@ pub fn run() {
         summary.metrics.statx_count,
         summary.metrics.error_count
     );
+}
+
+fn resolve_initramfs_recv_cap(ctx: yarm_user_rt::runtime::StartupContext) -> Option<u32> {
+    ctx.initramfs_startup_caps_v1_from_startup_args()
+        .and_then(|caps| {
+            if caps.version == yarm_ipc_abi::process_abi::ServiceStartupCapsV1::VERSION
+                && caps.request_recv_cap <= (u32::MAX as u64)
+                && caps.request_recv_cap != 0
+            {
+                Some(caps.request_recv_cap as u32)
+            } else {
+                None
+            }
+        })
+        .or_else(|| ctx.initramfs_request_recv_cap_from_slot11())
 }
 
 trait InitramfsIpcOps {
@@ -251,6 +268,7 @@ fn run_ipc_loop(service: &mut InitramfsService, ops: &mut impl InitramfsIpcOps, 
 
 #[cfg(test)]
 mod tests {
+    use yarm_user_rt::runtime::{install_startup_arg_slots, startup_context};
     use super::*;
     use alloc::boxed::Box;
     use alloc::format;
@@ -565,5 +583,23 @@ mod tests {
         assert_eq!(status, 0);
         assert_eq!(n, 15);
         assert_eq!(&bytes[..n as usize], b"\x7fELFinit-binary");
+    }
+
+    #[test]
+    fn structured_startup_caps_are_preferred_over_slot11_fallback() {
+        install_startup_arg_slots([((1u64) << 48) | ((9u64) << 32) | 0x5354_4350, 123, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77]);
+        assert_eq!(resolve_initramfs_recv_cap(startup_context()), Some(123));
+    }
+
+    #[test]
+    fn slot11_fallback_still_works_as_compatibility_path() {
+        install_startup_arg_slots([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77]);
+        assert_eq!(resolve_initramfs_recv_cap(startup_context()), Some(77));
+    }
+
+    #[test]
+    fn missing_structured_and_legacy_caps_yields_no_loop_cap() {
+        install_startup_arg_slots([0; 12]);
+        assert_eq!(resolve_initramfs_recv_cap(startup_context()), None);
     }
 }

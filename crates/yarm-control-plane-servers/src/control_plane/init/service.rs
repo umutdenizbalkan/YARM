@@ -6,6 +6,7 @@ use crate::control_plane::init::{
 };
 #[cfg(test)]
 use super::super::process_manager::service::ProcessService;
+use super::super::process_manager::service::SpawnV2Result;
 #[cfg(test)]
 use super::super::process_manager::service::run_request_loop as run_process_manager_request_loop;
 #[cfg(test)]
@@ -28,6 +29,10 @@ use yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
 use yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
 #[cfg(test)]
 use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
+use yarm_ipc_abi::process_abi::{ServiceStartupCapsV1, SpawnV5Args, PROC_OP_SPAWN_V5};
+use yarm_user_rt::ipc::Message;
+use yarm_user_rt::process::ProcessError as ProcessManagerError;
+use yarm_user_rt::syscall::{IpcTransportV2, SyscallIpcTransport};
 #[cfg(test)]
 use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService, boot_initrd_bytes};
 #[cfg(test)]
@@ -259,9 +264,51 @@ fn resolve_core_image_plan(
 }
 
 pub fn run() {
+    let _ = attempt_spawn_initramfs_srv_via_process_manager();
     yarm_user_rt::user_log!(
         "init.srv requires kernel-provided bootstrap handoff; standalone Bootstrap::init path disabled"
     );
+}
+
+fn build_initramfs_spawn_v5_message(
+    parent_pid: u64,
+    image_id: u64,
+    request_recv_cap: u32,
+) -> Result<Message, ProcessManagerError> {
+    let startup_caps = ServiceStartupCapsV1::new(1, request_recv_cap as u64);
+    let args = SpawnV5Args::new(parent_pid, image_id, 64, 2, startup_caps);
+    Message::with_header(0, PROC_OP_SPAWN_V5, 0, None, &args.encode())
+        .map_err(|_| ProcessManagerError::Malformed)
+}
+
+fn attempt_spawn_initramfs_srv_via_process_manager() -> Result<(), ProcessManagerError> {
+    let mut transport = SyscallIpcTransport;
+    attempt_spawn_initramfs_srv_via_process_manager_with_transport(&mut transport)
+}
+
+fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
+    transport: &mut impl IpcTransportV2,
+) -> Result<(), ProcessManagerError> {
+    let ctx = yarm_user_rt::runtime::startup_context();
+    let (proc_send_cap, proc_reply_cap) = ctx
+        .process_manager_caps()
+        .ok_or(ProcessManagerError::PermissionDenied)?;
+    let request_recv_cap = ctx
+        .initramfs_startup_caps_v1_from_startup_args()
+        .and_then(|caps| u32::try_from(caps.request_recv_cap).ok())
+        .filter(|cap| *cap != 0)
+        .ok_or(ProcessManagerError::Unsupported)?;
+    let request = build_initramfs_spawn_v5_message(1, 0x494E_4954_4653_5352, request_recv_cap)?;
+    let spawned = transport
+        .request_reply_v2(
+            proc_send_cap,
+            proc_reply_cap,
+            request.as_slice(),
+            |payload| SpawnV2Result::decode(payload).ok(),
+        )
+        .map_err(|_| ProcessManagerError::Unsupported)?;
+    yarm_user_rt::user_log!("INITRAMFS_SPAWN_ATTEMPT status=ok pid={}", spawned.pid.0);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -290,6 +337,56 @@ mod tests {
             out.extend_from_slice(&entry.flags.to_le_bytes());
         }
         out
+    }
+
+    #[test]
+    fn init_server_builds_spawn_v5_for_initramfs_srv() {
+        let msg = build_initramfs_spawn_v5_message(2, 0x494E_4954_4653_5352, 77).expect("msg");
+        assert_eq!(msg.opcode, PROC_OP_SPAWN_V5);
+        let args = SpawnV5Args::decode(msg.as_slice()).expect("decode");
+        assert_eq!(args.startup_caps.request_recv_cap, 77);
+        assert_eq!(args.startup_caps.control_send_cap, 0);
+        assert_eq!(args.startup_caps.control_recv_cap, 0);
+    }
+
+    #[test]
+    fn init_server_spawn_attempt_is_truthful_when_endpoint_provisioning_missing() {
+        assert_eq!(
+            attempt_spawn_initramfs_srv_via_process_manager(),
+            Err(ProcessManagerError::Unsupported)
+        );
+    }
+
+    struct StubTransport {
+        status: Result<SpawnV2Result, yarm_user_rt::syscall::SyscallError>,
+        saw_send_cap: Option<u32>,
+        saw_reply_cap: Option<u32>,
+    }
+    impl IpcTransportV2 for StubTransport {
+        fn send_v2(&mut self, _: u32, _: &[u8], _: Option<u64>) -> Result<(), yarm_user_rt::syscall::SyscallError> { unreachable!() }
+        fn recv_v2(&mut self, _: u32) -> Result<Option<yarm_user_rt::syscall::IpcV2Response>, yarm_user_rt::syscall::SyscallError> { unreachable!() }
+        fn recv_v2_with_deadline(&mut self, _: u32, _: u64) -> Result<Option<yarm_user_rt::syscall::IpcV2Response>, yarm_user_rt::syscall::SyscallError> { unreachable!() }
+        fn reply_v2(&mut self, _: u32, _: &[u8], _: Option<u64>) -> Result<(), yarm_user_rt::syscall::SyscallError> { unreachable!() }
+        fn call_v2(&mut self, _: u32, _: u32, _: &[u8]) -> Result<yarm_user_rt::syscall::IpcV2Response, yarm_user_rt::syscall::SyscallError> { unreachable!() }
+        fn request_reply_v2<T>(&mut self, send_cap: u32, reply_recv_cap: u32, _: &[u8], decode_reply: impl FnOnce(&[u8]) -> Option<T>) -> Result<T, yarm_user_rt::syscall::SyscallError> {
+            self.saw_send_cap = Some(send_cap);
+            self.saw_reply_cap = Some(reply_recv_cap);
+            let res = self.status.map(|r| r.encode());
+            match res {
+                Ok(payload) => decode_reply(&payload).ok_or(yarm_user_rt::syscall::SyscallError::InvalidArgs),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    #[test]
+    fn init_server_spawn_attempt_uses_ipc_when_caps_present() {
+        yarm_user_rt::runtime::install_startup_arg_slots([((1u64) << 48) | ((1u64) << 32) | 0x5354_4350, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut t = StubTransport { status: Ok(SpawnV2Result { pid: yarm_user_rt::process::ProcessId(55) }), saw_send_cap: None, saw_reply_cap: None };
+        let res = attempt_spawn_initramfs_srv_via_process_manager_with_transport(&mut t);
+        assert_eq!(res, Ok(()));
+        assert_eq!(t.saw_send_cap, Some(9));
+        assert_eq!(t.saw_reply_cap, Some(10));
     }
 
     fn synthetic_elf_image(entry: u64) -> [u8; 192] {
