@@ -638,10 +638,12 @@ pub mod runtime {
     pub const STARTUP_SLOT_INITRAMFS_REQUEST_SEND_CAP: usize = 13;
     pub const STARTUP_SLOT_INITRAMFS_REQUEST_RECV_CAP_FOR_CHILD: usize = 14;
     pub const STARTUP_SLOT_INIT_ORCH_CONTROL0: usize = 15;
-    const STARTUP_SLOT_COUNT: usize = 16;
+    pub const STARTUP_SLOT_INIT_ORCH_CONTROL1: usize = 16;
+    const STARTUP_SLOT_COUNT: usize = 17;
 
     static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] =
         [
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -750,7 +752,7 @@ pub mod runtime {
                 initramfs_request_send_cap: STARTUP_ARG_SLOTS[STARTUP_SLOT_INITRAMFS_REQUEST_SEND_CAP].load(Ordering::Relaxed),
                 initramfs_request_recv_cap_for_child: STARTUP_ARG_SLOTS[STARTUP_SLOT_INITRAMFS_REQUEST_RECV_CAP_FOR_CHILD].load(Ordering::Relaxed),
                 control0: STARTUP_ARG_SLOTS[STARTUP_SLOT_INIT_ORCH_CONTROL0].load(Ordering::Relaxed),
-                control1: 0,
+                control1: STARTUP_ARG_SLOTS[STARTUP_SLOT_INIT_ORCH_CONTROL1].load(Ordering::Relaxed),
             })
         }
     }

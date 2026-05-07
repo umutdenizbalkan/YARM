@@ -30,6 +30,7 @@ use yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
 #[cfg(test)]
 use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
 use yarm_ipc_abi::process_abi::{ServiceStartupCapsV1, SpawnV5Args, PROC_OP_SPAWN_V5};
+use yarm_ipc_abi::process_abi::{InitramfsReadyV1, INITRAMFS_READY_V1_MAGIC};
 use yarm_user_rt::ipc::Message;
 use yarm_user_rt::process::ProcessError as ProcessManagerError;
 use yarm_user_rt::syscall::{IpcTransportV2, SyscallIpcTransport};
@@ -275,7 +276,9 @@ fn build_initramfs_spawn_v5_message(
     image_id: u64,
     request_recv_cap: u32,
 ) -> Result<Message, ProcessManagerError> {
-    let startup_caps = ServiceStartupCapsV1::new(1, request_recv_cap as u64);
+    let mut startup_caps = ServiceStartupCapsV1::new(1, request_recv_cap as u64);
+    let orch = yarm_user_rt::runtime::startup_context().init_orchestration_caps_v1();
+    startup_caps.control_send_cap = orch.map(|c| c.control1).unwrap_or(0);
     let args = SpawnV5Args::new(parent_pid, image_id, 64, 2, startup_caps);
     Message::with_header(0, PROC_OP_SPAWN_V5, 0, None, &args.encode())
         .map_err(|_| ProcessManagerError::Malformed)
@@ -308,6 +311,19 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
         )
         .map_err(|_| ProcessManagerError::Unsupported)?;
     yarm_user_rt::user_log!("INITRAMFS_SPAWN_ATTEMPT status=ok pid={}", spawned.pid.0);
+    let ready_recv_cap = ctx
+        .init_orchestration_caps_v1()
+        .and_then(|caps| u32::try_from(caps.control0).ok())
+        .filter(|cap| *cap != 0)
+        .ok_or(ProcessManagerError::Unsupported)?;
+    let ready = transport
+        .recv_v2_with_deadline(ready_recv_cap, 10)
+        .map_err(|_| ProcessManagerError::Unsupported)?
+        .and_then(|resp| InitramfsReadyV1::decode(&resp.payload[..resp.len]).ok())
+        .is_some_and(|msg| msg.version == InitramfsReadyV1::VERSION && msg.status == InitramfsReadyV1::STATUS_READY && msg.magic == INITRAMFS_READY_V1_MAGIC);
+    if !ready {
+        return Err(ProcessManagerError::WouldBlock);
+    }
     Ok(())
 }
 

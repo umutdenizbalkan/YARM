@@ -23,6 +23,30 @@ pub const PROC_OP_TASK_RESTART_TOKEN: u16 = 8;
 pub const PROC_OP_REGISTER_SUPERVISED_TASK: u16 = 9;
 pub const PROC_OP_EXECUTE_RESTART: u16 = 10;
 pub const PROC_OP_SPAWN_V5: u16 = 11;
+pub const INITRAMFS_READY_V1_MAGIC: u32 = 0x5941_524D;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitramfsReadyV1 {
+    pub version: u16,
+    pub status: u16,
+    pub magic: u32,
+}
+
+impl InitramfsReadyV1 {
+    pub const VERSION: u16 = 1;
+    pub const STATUS_READY: u16 = 1;
+    pub fn encode(self) -> [u8; 8] {
+        let mut out=[0u8;8];
+        out[0..2].copy_from_slice(&self.version.to_le_bytes());
+        out[2..4].copy_from_slice(&self.status.to_le_bytes());
+        out[4..8].copy_from_slice(&self.magic.to_le_bytes());
+        out
+    }
+    pub fn decode(payload:&[u8])->Result<Self,ProcCodecError>{
+        if payload.len()<8{return Err(ProcCodecError::Malformed);}
+        Ok(Self{version:u16::from_le_bytes([payload[0],payload[1]]),status:u16::from_le_bytes([payload[2],payload[3]]),magic:u32::from_le_bytes([payload[4],payload[5],payload[6],payload[7]])})
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecuteRestartRequest {

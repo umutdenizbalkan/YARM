@@ -13,6 +13,8 @@ use super::archive::{
 };
 use yarm_srv_common::vfs_reply::VfsReply;
 use yarm_user_rt::runtime::startup_context;
+use yarm_user_rt::syscall::{IpcTransportV2, SyscallIpcTransport};
+use yarm_ipc_abi::process_abi::{InitramfsReadyV1, INITRAMFS_READY_V1_MAGIC};
 use yarm_user_rt::syscall::{
     IpcV2Response, SyscallError, cap_release, ipc_recv_v2, ipc_reply_v2_msg, vm_unmap, yield_now,
 };
@@ -97,6 +99,15 @@ pub fn run() {
                 "INITRAMFS_RUNTIME_MODE mode=real_ipc recv_cap={}",
                 recv_cap
             );
+            if let Some(caps) = startup.initramfs_startup_caps_v1_from_startup_args() {
+                if let Ok(send_cap) = u32::try_from(caps.control_send_cap) {
+                    if send_cap != 0 {
+                        let mut tx = SyscallIpcTransport;
+                        let ready = InitramfsReadyV1 { version: InitramfsReadyV1::VERSION, status: InitramfsReadyV1::STATUS_READY, magic: INITRAMFS_READY_V1_MAGIC };
+                        let _ = tx.send_v2(send_cap, &ready.encode(), None);
+                    }
+                }
+            }
             run_ipc_loop(&mut svc, &mut RuntimeIpcOps, recv_cap);
         } else {
             yarm_user_rt::user_log!(

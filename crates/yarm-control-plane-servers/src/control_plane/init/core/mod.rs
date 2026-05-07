@@ -412,11 +412,25 @@ impl InitService {
             initramfs_tid,
             CapRights::RECEIVE,
         )?;
+        let (_, readiness_send_root, readiness_recv_root) = kernel.create_endpoint(16)?;
+        let delegated_readiness_send = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            readiness_send_root,
+            initramfs_tid,
+            CapRights::SEND,
+        )?;
+        let delegated_readiness_recv = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            readiness_recv_root,
+            init_tid,
+            CapRights::RECEIVE,
+        )?;
         let mut args = UserImageSpec::DEFAULT_STARTUP_ARGS;
         args[12] = 1; // InitOrchestrationCapsV1::VERSION
         args[13] = delegated_send.0;
         args[14] = delegated_recv.0;
-        args[15] = 0;
+        args[15] = delegated_readiness_recv.0;
+        args[16] = delegated_readiness_send.0;
         Ok(args)
     }
 
