@@ -208,11 +208,19 @@ pub mod syscall {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct SharedReplyResponse {
+        /// Compatibility field retained from pre-opcode-carriage naming.
+        /// In IPC v2 receive/call responses this carries message opcode.
         pub status: u64,
         pub transfer_cap: u64,
         pub offset: u64,
         pub len: u64,
         pub flags: u16,
+    }
+    impl SharedReplyResponse {
+        #[inline]
+        pub const fn opcode(&self) -> u16 {
+            self.status as u16
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,6 +530,7 @@ pub mod syscall {
         timeout_ticks: u64,
         out: &mut [u8],
     ) -> core::result::Result<Option<(u64, usize, Option<u64>)>, SyscallError> {
+        // Return tuple: (opcode, payload_len, transfer_cap).
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
         block.endpoint_cap = recv_cap as u64;
         block.aux0 = timeout_ticks;
@@ -556,6 +565,7 @@ pub mod syscall {
         payload: &[u8],
         out: &mut [u8],
     ) -> core::result::Result<(u64, usize, Option<u64>), SyscallError> {
+        // Return tuple: (reply_opcode, payload_len, transfer_cap).
         if payload.len() > 64 {
             return Err(SyscallError::InvalidArgs);
         }
@@ -1089,7 +1099,7 @@ mod tests {
             let mut payload = [0u8; crate::ipc::Message::MAX_PAYLOAD];
             payload[..4].copy_from_slice(&self.response_payload);
             Ok(IpcV2Response {
-                status: 0,
+                status: 0xCAFE,
                 len: 4,
                 transfer_cap: None,
                 payload,
@@ -1115,6 +1125,7 @@ mod tests {
             (reply == b"pong").then_some(7u8)
         })
         .expect("typed reply");
+        // request_reply_v2 decodes payload only; it must not depend on opcode/status lane.
         assert_eq!(decoded, 7);
     }
 
@@ -1149,6 +1160,7 @@ mod tests {
         };
         let decoded = crate::syscall::decode_shared_reply_response(&response).expect("decode");
         assert_eq!(decoded.status, 99);
+        assert_eq!(decoded.opcode(), 99);
         assert_eq!(decoded.transfer_cap, 55);
         assert_eq!(decoded.offset, 0x3000);
         assert_eq!(decoded.len, 0x1000);

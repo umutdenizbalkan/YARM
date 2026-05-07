@@ -1707,7 +1707,7 @@ mod tests {
             let mut payload_buf = [0u8; Message::MAX_PAYLOAD];
             payload_buf[..reply.len()].copy_from_slice(&reply);
             Ok(yarm_user_rt::syscall::IpcV2Response {
-                status: 0,
+                status: PROC_OP_EXECUTE_RESTART as u64,
                 len: reply.len(),
                 transfer_cap: None,
                 payload: payload_buf,
