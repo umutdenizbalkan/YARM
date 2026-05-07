@@ -3,7 +3,7 @@
 # YARM Syscall ABI v10 (Frozen Contract)
 
 - ABI Version: `10`
-- Syscall count: `15`
+- Syscall count: `21`
 
 ## Syscall numbers
 
@@ -22,6 +22,8 @@
 - `12`: `Fork` (fork current process with CoW; return child tid in parent)
 - `13`: `VmAnonMap` (staged anonymous MemoryObject allocation+mapping for service buffers)
 - `14`: `VmBrk` (staged: query + grow supported, shrink unsupported)
+- `19`: `VmUnmap` (staged producer-local anonymous mapping cleanup for current task/ASID)
+- `20`: `CapRelease` (staged producer-local capability revoke/drop in current task cnode)
 
 ## Syscalls `9..14` status
 
@@ -142,6 +144,29 @@
   - `ret0 = mapped_base_va`
   - `ret1 = mapped_len_rounded_to_page`
   - `ret2 = memory_object_cap_id` (caller-local cap, suitable for IPC transfer).
+
+### `VmUnmap` argument layout
+
+- `args[0]`: target user virtual base address (non-zero, page-aligned)
+- `args[1]`: unmap length in bytes (`>0`, rounded up to page size)
+- `args[2..5]`: reserved (must be `0`)
+
+`VmUnmap` semantics (staged):
+
+- unmaps each page in `[base, base+rounded_len)` from current task's current ASID;
+- returns `InvalidArgs` if any page in the requested range is already unmapped;
+- producer-local lifecycle primitive for cleanup after staged `VmAnonMap` usage.
+
+### `CapRelease` argument layout
+
+- `args[0]`: capability id in current task cnode
+- `args[1..5]`: reserved (must be `0`)
+
+`CapRelease` semantics (staged):
+
+- revokes/drops the specified cap in the current task cnode;
+- invalid/stale/non-present cap returns `InvalidCapability`;
+- producer-local lifecycle primitive; distinct from receiver-side `TransferRelease`.
 
 ### `SpawnThread` argument layout and runtime contract
 

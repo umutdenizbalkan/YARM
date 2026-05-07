@@ -39,8 +39,10 @@ pub const SYSCALL_IPC_SEND_V2_NR: usize = 15;
 pub const SYSCALL_IPC_RECV_V2_NR: usize = 16;
 pub const SYSCALL_IPC_CALL_V2_NR: usize = 17;
 pub const SYSCALL_IPC_REPLY_V2_NR: usize = 18;
-pub const SYSCALL_COUNT: usize = 19;
-const _: [(); SYSCALL_COUNT] = [(); 19];
+pub const SYSCALL_VM_UNMAP_NR: usize = 19;
+pub const SYSCALL_CAP_RELEASE_NR: usize = 20;
+pub const SYSCALL_COUNT: usize = 21;
+const _: [(); SYSCALL_COUNT] = [(); 21];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -84,10 +86,12 @@ pub enum Syscall {
     IpcRecvV2 = SYSCALL_IPC_RECV_V2_NR,
     IpcCallV2 = SYSCALL_IPC_CALL_V2_NR,
     IpcReplyV2 = SYSCALL_IPC_REPLY_V2_NR,
+    VmUnmap = SYSCALL_VM_UNMAP_NR,
+    CapRelease = SYSCALL_CAP_RELEASE_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 19;
+    pub const VARIANT_COUNT: usize = 21;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -113,6 +117,8 @@ impl Syscall {
             SYSCALL_IPC_RECV_V2_NR => Ok(Self::IpcRecvV2),
             SYSCALL_IPC_CALL_V2_NR => Ok(Self::IpcCallV2),
             SYSCALL_IPC_REPLY_V2_NR => Ok(Self::IpcReplyV2),
+            SYSCALL_VM_UNMAP_NR => Ok(Self::VmUnmap),
+            SYSCALL_CAP_RELEASE_NR => Ok(Self::CapRelease),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -609,6 +615,58 @@ fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<()
         .set_task_brk_bounds(tid, base, requested)
         .map_err(SyscallError::from)?;
     _frame.set_ok(requested, 0, 0);
+    Ok(())
+}
+
+fn handle_vm_unmap(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let base = frame.arg(SYSCALL_ARG_CAP);
+    let len = frame.arg(SYSCALL_ARG_PTR);
+    let reserved = [
+        frame.arg(SYSCALL_ARG_LEN),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+        frame.arg(SYSCALL_ARG_TRANSFER_CAP),
+    ];
+    if reserved.iter().any(|v| *v != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if base == 0 || len == 0 || !base.is_multiple_of(PAGE_SIZE) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    validate_user_region(base as u64, len as u64)?;
+    let map_len = round_up_page(len)?;
+    let end = base.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
+    let mut va = base;
+    while va < end {
+        let unmapped = kernel
+            .unmap_user_page_in_current_asid(VirtAddr(va as u64))
+            .map_err(SyscallError::from)?;
+        if unmapped.is_none() {
+            return Err(SyscallError::InvalidArgs);
+        }
+        va += PAGE_SIZE;
+    }
+    frame.set_ok(0, 0, 0);
+    Ok(())
+}
+
+fn handle_cap_release(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let reserved = [
+        frame.arg(SYSCALL_ARG_PTR),
+        frame.arg(SYSCALL_ARG_LEN),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+        frame.arg(SYSCALL_ARG_TRANSFER_CAP),
+    ];
+    if reserved.iter().any(|v| *v != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let cnode = kernel.current_task_cnode().ok_or(SyscallError::Internal)?;
+    kernel
+        .revoke_capability_in_cnode(cnode, cap)
+        .map_err(SyscallError::from)?;
+    frame.set_ok(0, 0, 0);
     Ok(())
 }
 
@@ -1113,6 +1171,8 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::Fork => handle_fork(kernel, frame),
         Syscall::VmAnonMap => handle_vm_anon_map(kernel, frame),
         Syscall::VmBrk => handle_vm_brk(kernel, frame),
+        Syscall::VmUnmap => handle_vm_unmap(kernel, frame),
+        Syscall::CapRelease => handle_cap_release(kernel, frame),
         Syscall::IpcSendV2 => handle_ipc_send_v2_stub(kernel, frame),
         Syscall::IpcRecvV2 => handle_ipc_recv_v2_stub(kernel, frame),
         Syscall::IpcCallV2 => handle_ipc_call_v2_stub(kernel, frame),
@@ -1161,6 +1221,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::Capability;
     use crate::kernel::ipc::{EndpointMode, IPC_REGISTER_WORDS};
     use crate::kernel::scheduler_timer::Timer;
     use crate::kernel::trapframe::TrapFrame;
@@ -2279,7 +2340,9 @@ mod tests {
         assert_eq!(SYSCALL_IPC_RECV_V2_NR, 16);
         assert_eq!(SYSCALL_IPC_CALL_V2_NR, 17);
         assert_eq!(SYSCALL_IPC_REPLY_V2_NR, 18);
-        assert_eq!(SYSCALL_COUNT, 19);
+        assert_eq!(SYSCALL_VM_UNMAP_NR, 19);
+        assert_eq!(SYSCALL_CAP_RELEASE_NR, 20);
+        assert_eq!(SYSCALL_COUNT, 21);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
@@ -2914,6 +2977,86 @@ mod tests {
         assert_eq!(err, SyscallError::WrongObject);
         let mem_after = state.with_memory_state(|memory| memory.memory_objects.iter().flatten().count());
         assert_eq!(mem_before, mem_after, "overlap reject must happen before allocation");
+    }
+
+    #[test]
+    fn vm_unmap_after_vm_anon_map_allows_reuse_of_same_base() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let mut map = TrapFrame::new(
+            Syscall::VmAnonMap as usize,
+            [
+                0x20000,
+                PAGE_SIZE,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut map).expect("map");
+        let mut unmap = TrapFrame::new(
+            Syscall::VmUnmap as usize,
+            [0x20000, PAGE_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut unmap).expect("unmap");
+        let mut map_again = TrapFrame::new(
+            Syscall::VmAnonMap as usize,
+            [
+                0x20000,
+                PAGE_SIZE,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut map_again).expect("map again");
+    }
+
+    #[test]
+    fn vm_unmap_rejects_invalid_args() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let cases = [
+            [0, PAGE_SIZE, 0, 0, 0, 0],
+            [0x20001, PAGE_SIZE, 0, 0, 0, 0],
+            [0x21000, 0, 0, 0, 0, 0],
+            [0x22000, PAGE_SIZE, 1, 0, 0, 0],
+        ];
+        for args in cases {
+            let mut frame = TrapFrame::new(Syscall::VmUnmap as usize, args);
+            let err = dispatch(&mut state, &mut frame).expect_err("invalid");
+            assert_eq!(err, SyscallError::InvalidArgs);
+        }
+    }
+
+    #[test]
+    fn cap_release_revokes_current_task_cap() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let cap = state
+            .mint_capability_for_current_context(Capability::new(CapObject::Kernel, CapRights::READ))
+            .expect("mint");
+        let resolved_before = state
+            .capability_service()
+            .resolve_current_task_capability(cap);
+        assert!(resolved_before.is_some());
+        let mut frame = TrapFrame::new(Syscall::CapRelease as usize, [cap.0 as usize, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut frame).expect("cap_release");
+        let resolved_after = state
+            .capability_service()
+            .resolve_current_task_capability(cap);
+        assert!(resolved_after.is_none());
+    }
+
+    #[test]
+    fn cap_release_invalid_cap_returns_invalid_capability() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let mut frame = TrapFrame::new(Syscall::CapRelease as usize, [99999, 0, 0, 0, 0, 0]);
+        let err = dispatch(&mut state, &mut frame).expect_err("invalid");
+        assert_eq!(err, SyscallError::InvalidCapability);
     }
 
     #[test]
