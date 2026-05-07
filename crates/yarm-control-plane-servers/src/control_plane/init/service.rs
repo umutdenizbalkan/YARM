@@ -28,6 +28,9 @@ use yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
 use yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
 #[cfg(test)]
 use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
+use yarm_ipc_abi::process_abi::{ServiceStartupCapsV1, SpawnV5Args, PROC_OP_SPAWN_V5};
+use yarm_user_rt::ipc::Message;
+use yarm_user_rt::process::ProcessError as ProcessManagerError;
 #[cfg(test)]
 use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService, boot_initrd_bytes};
 #[cfg(test)]
@@ -259,9 +262,27 @@ fn resolve_core_image_plan(
 }
 
 pub fn run() {
+    let _ = attempt_spawn_initramfs_srv_via_process_manager();
     yarm_user_rt::user_log!(
         "init.srv requires kernel-provided bootstrap handoff; standalone Bootstrap::init path disabled"
     );
+}
+
+fn build_initramfs_spawn_v5_message(
+    parent_pid: u64,
+    image_id: u64,
+    request_recv_cap: u32,
+) -> Result<Message, ProcessManagerError> {
+    let startup_caps = ServiceStartupCapsV1::new(1, request_recv_cap as u64);
+    let args = SpawnV5Args::new(parent_pid, image_id, 64, 2, startup_caps);
+    Message::with_header(0, PROC_OP_SPAWN_V5, 0, None, &args.encode())
+        .map_err(|_| ProcessManagerError::Malformed)
+}
+
+fn attempt_spawn_initramfs_srv_via_process_manager() -> Result<(), ProcessManagerError> {
+    let _ctx = yarm_user_rt::runtime::startup_context();
+    yarm_user_rt::user_log!("INITRAMFS_SPAWN_ATTEMPT status=unsupported reason=no_endpoint_provisioning_primitive");
+    Err(ProcessManagerError::Unsupported)
 }
 
 #[cfg(test)]
@@ -290,6 +311,24 @@ mod tests {
             out.extend_from_slice(&entry.flags.to_le_bytes());
         }
         out
+    }
+
+    #[test]
+    fn init_server_builds_spawn_v5_for_initramfs_srv() {
+        let msg = build_initramfs_spawn_v5_message(2, 0x494E_4954_4653_5352, 77).expect("msg");
+        assert_eq!(msg.opcode, PROC_OP_SPAWN_V5);
+        let args = SpawnV5Args::decode(msg.as_slice()).expect("decode");
+        assert_eq!(args.startup_caps.request_recv_cap, 77);
+        assert_eq!(args.startup_caps.control_send_cap, 0);
+        assert_eq!(args.startup_caps.control_recv_cap, 0);
+    }
+
+    #[test]
+    fn init_server_spawn_attempt_is_truthful_when_endpoint_provisioning_missing() {
+        assert_eq!(
+            attempt_spawn_initramfs_srv_via_process_manager(),
+            Err(ProcessManagerError::Unsupported)
+        );
     }
 
     fn synthetic_elf_image(entry: u64) -> [u8; 192] {
