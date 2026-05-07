@@ -16,6 +16,11 @@ use yarm_ipc_abi::process_abi::{
     RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args, TaskRestartTokenReply,
     TaskRestartTokenRequest, WaitPidV2Args,
 };
+#[cfg(not(test))]
+use yarm_fs_servers::initramfs::{
+    INITRAMFS_INIT_PATH_PTR, INITRAMFS_POSIX_COMPAT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR,
+    INITRAMFS_SUPERVISOR_PATH_PTR, INITRAMFS_VFS_PATH_PTR, boot_initrd_bytes,
+};
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
@@ -977,7 +982,14 @@ impl ProcessService {
         &mut self,
         req: SpawnV2Request,
     ) -> Result<Message, ProcessManagerError> {
-        let _ = req;
+        let image = resolve_spawn_image_from_boot_initrd(req.image_id)?;
+        let info = ElfImageInfo::parse(req.image_id, image).map_err(map_elf_error)?;
+        let _ = (
+            req.parent_pid,
+            req.requested_cnode_slots,
+            req.requested_task_class,
+            info,
+        );
         // Runtime spawn is intentionally wired as an explicit seam.
         // A follow-up pass must connect this to kernel-backed image load +
         // task launch primitives and startup-cap installation.
@@ -1013,6 +1025,26 @@ impl ProcessService {
             Err(_) => return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED,
         }
     }
+}
+
+#[cfg(not(test))]
+fn resolve_spawn_image_from_boot_initrd(
+    image_id: u64,
+) -> Result<&'static [u8], ProcessManagerError> {
+    let path = match image_id {
+        INITRAMFS_INIT_PATH_PTR => "init",
+        INITRAMFS_PROC_MGR_PATH_PTR => "process_manager",
+        INITRAMFS_VFS_PATH_PTR => "vfs",
+        INITRAMFS_SUPERVISOR_PATH_PTR => "supervisor",
+        INITRAMFS_POSIX_COMPAT_PATH_PTR => "posix_compat",
+        _ => return Err(ProcessManagerError::UnknownProcess),
+    };
+    let initrd = boot_initrd_bytes().ok_or(ProcessManagerError::Unsupported)?;
+    yarm_srv_common::cpio::CpioArchive::new(initrd)
+        .find(path)
+        .map_err(|_| ProcessManagerError::Malformed)?
+        .map(|entry| entry.file_data())
+        .ok_or(ProcessManagerError::UnknownProcess)
 }
 
 impl RequestResponseService<Message, Message> for ProcessService {
