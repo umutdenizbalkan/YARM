@@ -393,6 +393,26 @@ impl InitService {
     }
 
     #[cfg(test)]
+    fn delegate_initramfs_request_recv_cap(
+        kernel: &mut KernelState,
+        initramfs_tid: u64,
+    ) -> Result<[u64; 12], KernelError> {
+        let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
+        let (_, _request_send_root, request_recv_root) = kernel.create_endpoint(16)?;
+        let delegated_recv = kernel.grant_capability_task_to_task_with_rights(
+            source_tid,
+            request_recv_root,
+            initramfs_tid,
+            CapRights::RECEIVE,
+        )?;
+        let mut args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+        // STAGED(slot11): initramfs server-only reuse of slot 11 as request RECV cap.
+        // Primary slot meaning remains process-manager restart-control send cap.
+        args[11] = delegated_recv.0;
+        Ok(args)
+    }
+
+    #[cfg(test)]
     fn allocate_core_service_asids(
         kernel: &mut KernelState,
     ) -> Result<(Asid, Asid, Asid), KernelError> {
@@ -523,6 +543,8 @@ impl InitService {
 
         let process_manager_startup_args =
             Self::delegate_process_manager_restart_control_cap(kernel, proc_tid)?;
+        let initramfs_startup_args =
+            Self::delegate_initramfs_request_recv_cap(kernel, vfs_tid)?;
         match self.launch_strategy {
             CoreLaunchStrategy::ProcessManagerFirst => {
                 self.record_launch(
@@ -539,7 +561,7 @@ impl InitService {
                     vfs_tid,
                     plan.vfs_entry,
                     vfs_asid,
-                    UserImageSpec::DEFAULT_STARTUP_ARGS,
+                    initramfs_startup_args,
                 )?;
                 self.record_launch(
                     kernel,
@@ -573,7 +595,7 @@ impl InitService {
                     vfs_tid,
                     plan.vfs_entry,
                     vfs_asid,
-                    UserImageSpec::DEFAULT_STARTUP_ARGS,
+                    initramfs_startup_args,
                 )?;
             }
         }
@@ -1313,6 +1335,27 @@ mod tests {
                 Some(CoreServiceKind::Vfs),
             ]
         );
+    }
+
+    #[test]
+    fn initramfs_startup_args_stage_slot11_with_request_recv_cap() {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        state.register_task(3).expect("vfs task");
+        let args = InitService::delegate_initramfs_request_recv_cap(&mut state, 3)
+            .expect("delegate recv cap");
+        assert_ne!(args[11], 0, "slot11 should carry staged initramfs recv cap");
+        assert_eq!(args[0], 0);
+        assert_eq!(args[1], 0);
+        assert_eq!(args[2], 0);
+    }
+
+    #[test]
+    fn process_manager_restart_control_slot11_mapping_remains_unchanged() {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        state.register_task(2).expect("proc task");
+        let args = InitService::delegate_process_manager_restart_control_cap(&mut state, 2)
+            .expect("delegate restart control");
+        assert_ne!(args[11], 0, "slot11 should still carry process-manager restart-control cap");
     }
 
     #[test]

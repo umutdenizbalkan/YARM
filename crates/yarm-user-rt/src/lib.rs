@@ -628,6 +628,10 @@ pub mod runtime {
     pub const STARTUP_SLOT_OPTIONAL_INIT_TID: usize = 8;
     pub const STARTUP_SLOT_OPTIONAL_SUPERVISOR_TID: usize = 9;
     pub const STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS: usize = 10;
+    /// Primary meaning: process-manager restart-control SEND cap.
+    ///
+    /// Staged/service-conditional meaning: initramfs server request RECV cap
+    /// during FS IPC-loop bring-up (slot count/layout unchanged).
     pub const STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP: usize = 11;
     const STARTUP_SLOT_COUNT: usize = 12;
 
@@ -688,6 +692,18 @@ pub mod runtime {
                 (Some(request_send), Some(reply_recv)) => Some((request_send, reply_recv)),
                 _ => None,
             }
+        }
+
+        /// Staged, service-scoped interpretation for initramfs FS server startup.
+        ///
+        /// This reuses startup slot 11 (`process_manager_restart_control_send_cap`)
+        /// as a request receive endpoint capability *only* for initramfs server
+        /// launch wiring during the staged FS IPC-loop rollout.
+        /// Other services must continue to interpret slot 11 by its primary
+        /// process-manager restart-control meaning.
+        #[inline]
+        pub const fn initramfs_request_recv_cap_from_slot11(self) -> Option<u32> {
+            self.process_manager_restart_control_send_cap
         }
     }
 
@@ -1030,6 +1046,42 @@ mod tests {
 
         install_startup_arg_slots([42, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), None);
+
+        install_startup_arg_slots([
+            original.task_id,
+            original
+                .process_manager_request_send_cap
+                .map(u64::from)
+                .unwrap_or(0),
+            original
+                .process_manager_reply_recv_cap
+                .map(u64::from)
+                .unwrap_or(0),
+            original.supervisor_fault_recv_ep.map(u64::from).unwrap_or(0),
+            original
+                .supervisor_control_send_ep
+                .map(u64::from)
+                .unwrap_or(0),
+            original
+                .supervisor_control_recv_ep
+                .map(u64::from)
+                .unwrap_or(0),
+            original.init_alert_send_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_tid.unwrap_or(0),
+            original.supervisor_tid.unwrap_or(0),
+            original.supervisor_restart_window_ticks.unwrap_or(0),
+            original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
+        ]);
+    }
+
+    #[test]
+    fn startup_initramfs_recv_cap_uses_slot11_staged_mapping() {
+        let original = startup_context();
+        install_startup_arg_slots([42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77]);
+        let ctx = startup_context();
+        assert_eq!(ctx.process_manager_restart_control_send_cap, Some(77));
+        assert_eq!(ctx.initramfs_request_recv_cap_from_slot11(), Some(77));
 
         install_startup_arg_slots([
             original.task_id,

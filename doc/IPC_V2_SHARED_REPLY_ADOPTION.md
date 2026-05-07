@@ -94,3 +94,4 @@ Prefer regular inline/copyout reply when response is small and latency/complexit
 - VFS shared-read feature gate remains disabled; no shared path enablement is introduced in pass 2c.
 - Real FS IPC recv/reply loop integration (and post-send cleanup execution) remains pending for a later pass.
 - IPC v2 message-opcode carriage now uses register-block aux/ret fields; shared-reply metadata payload bytes are unchanged by opcode transport.
+- Staged initramfs-only startup plumbing may reuse startup slot 11 as request-receive endpoint cap for real FS IPC loop bring-up; this is service-conditional debt and does not change startup block size.
