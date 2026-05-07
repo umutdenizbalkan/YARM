@@ -15,7 +15,7 @@ use yarm_ipc_abi::ipc_v2::{
     IpcV2SharedReplyMeta, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY, IPC_V2_SHARED_REPLY_META_VERSION,
     encode_shared_reply_meta,
 };
-use yarm_user_rt::syscall::{AnonMapResult, cap_release, vm_anon_map, vm_unmap};
+use yarm_user_rt::syscall::{AnonMapResult, vm_anon_map, vm_unmap};
 
 const MAX_MOUNTS: usize = 8;
 const VFS_READ_SHARED_REPLY_ENABLED: bool = false;
@@ -160,7 +160,6 @@ impl<B: VfsBackend> VfsService<B> {
                 // SAFETY: producer-local cleanup syscall wrappers.
                 unsafe {
                     vm_unmap(map.base, map.len)?;
-                    cap_release(map.mem_cap)?;
                 }
                 Ok(())
             },
@@ -212,6 +211,9 @@ impl<B: VfsBackend> VfsService<B> {
             &payload,
         )
         .map_err(|_| VfsError::Malformed)?;
+        // NOTE(stage2): intentionally retain local mem_cap here. Releasing
+        // before IPC handoff/materialization can invalidate transfer lifetime.
+        // Deferred until post-handoff policy or kernel-side transfer pinning.
         if cleanup(&map).is_err() {
             return Ok(None);
         }
@@ -615,7 +617,7 @@ mod tests {
         .expect("some");
         assert_eq!(out.opcode, VFS_OP_READ);
         assert_eq!(out.transferred_cap().map(|cap| cap.0), Some(77));
-        assert!(cleaned, "successful shared path must cleanup local producer resources");
+        assert!(cleaned, "successful shared path must cleanup local producer mapping");
     }
 
     #[test]
@@ -640,4 +642,5 @@ mod tests {
         .expect("fallback");
         assert!(out.is_none(), "cleanup failure must fallback to inline path");
     }
+
 }
