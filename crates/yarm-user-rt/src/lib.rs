@@ -27,9 +27,10 @@ pub mod capability {
 pub mod syscall {
     use crate::ipc::Message;
     use yarm_ipc_abi::ipc_v2::{
-        IpcRegisterBlockV2, IPC_ABI_V2_BLOCK_SIZE, IPC_V2_FLAG_INLINE_PAYLOAD,
-        IPC_V2_FLAG_RECV_COPYOUT, IPC_V2_FLAG_RET_COPYOUT, IPC_V2_FLAG_TRANSFER_CAP,
-        IPC_V2_NO_TRANSFER_CAP, IPC_V2_OP_CALL, IPC_V2_OP_RECV, IPC_V2_OP_REPLY, IPC_V2_OP_SEND,
+        IpcRegisterBlockV2, IpcV2SharedReplyMeta, IPC_ABI_V2_BLOCK_SIZE,
+        IPC_V2_FLAG_INLINE_PAYLOAD, IPC_V2_FLAG_RECV_COPYOUT, IPC_V2_FLAG_RET_COPYOUT,
+        IPC_V2_FLAG_TRANSFER_CAP, IPC_V2_NO_TRANSFER_CAP, IPC_V2_OP_CALL, IPC_V2_OP_RECV,
+        IPC_V2_OP_REPLY, IPC_V2_OP_SEND, decode_shared_reply_meta, encode_shared_reply_meta,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +195,31 @@ pub mod syscall {
         pub payload: [u8; Message::MAX_PAYLOAD],
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SharedReplyResponse {
+        pub status: u64,
+        pub transfer_cap: u64,
+        pub offset: u64,
+        pub len: u64,
+        pub flags: u16,
+    }
+
+    #[inline]
+    pub fn decode_shared_reply_response(
+        response: &IpcV2Response,
+    ) -> core::result::Result<SharedReplyResponse, SyscallError> {
+        let transfer_cap = response.transfer_cap.ok_or(SyscallError::InvalidArgs)?;
+        let meta = decode_shared_reply_meta(&response.payload[..response.len])
+            .map_err(|_| SyscallError::InvalidArgs)?;
+        Ok(SharedReplyResponse {
+            status: response.status,
+            transfer_cap,
+            offset: meta.offset,
+            len: meta.len,
+            flags: meta.flags,
+        })
+    }
+
     pub(crate) fn fill_v2_payload_block(block: &mut IpcRegisterBlockV2, payload: &[u8]) -> core::result::Result<(), SyscallError> {
         if payload.len() > Message::MAX_PAYLOAD {
             return Err(SyscallError::InvalidArgs);
@@ -326,6 +352,30 @@ pub mod syscall {
         Ok(())
     }
 
+    /// Convenience helper for stage-1 shared replies.
+    ///
+    /// This helper only sends metadata + transfer cap via existing `IPC_REPLY_V2`.
+    /// It does not map memory automatically.
+    #[inline]
+    pub unsafe fn ipc_reply_v2_shared(
+        reply_cap: u32,
+        mem_cap: u64,
+        offset: u64,
+        len: u64,
+        flags: u16,
+    ) -> core::result::Result<(), SyscallError> {
+        let meta = IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags,
+            reserved: 0,
+            offset,
+            len,
+        };
+        let payload = encode_shared_reply_meta(meta).map_err(|_| SyscallError::InvalidArgs)?;
+        // SAFETY: wrapper over existing reply syscall path.
+        unsafe { ipc_reply_v2(reply_cap, &payload, Some(mem_cap)) }
+    }
+
     #[inline]
     pub unsafe fn ipc_call_v2(
         send_cap: u32,
@@ -343,6 +393,20 @@ pub mod syscall {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         if ret.ret0 != 0 { return Err(decode_syscall_error(ret.ret0)); }
         decode_v2_response(&block)
+    }
+
+    /// Convenience helper that expects shared-reply metadata in the response payload.
+    ///
+    /// This helper does not map transferred memory automatically.
+    #[inline]
+    pub unsafe fn ipc_call_v2_expect_shared(
+        send_cap: u32,
+        reply_recv_cap: u32,
+        payload: &[u8],
+    ) -> core::result::Result<SharedReplyResponse, SyscallError> {
+        // SAFETY: wrapper over existing call syscall path.
+        let response = unsafe { ipc_call_v2(send_cap, reply_recv_cap, payload) }?;
+        decode_shared_reply_response(&response)
     }
 
     #[inline]
@@ -813,6 +877,10 @@ pub mod process {
 mod tests {
     use crate::runtime::{install_startup_arg_slots, startup_context};
     use crate::syscall::{IpcTransportV2, IpcV2Response, SyscallError};
+    use yarm_ipc_abi::ipc_v2::{
+        IpcV2SharedReplyMeta, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+        IPC_V2_SHARED_REPLY_META_VERSION, encode_shared_reply_meta,
+    };
 
     #[test]
     fn ipc_v2_inline_encoder_roundtrip() {
@@ -952,5 +1020,77 @@ mod tests {
         block.ret_len = 65;
         let decoded = super::syscall::decode_v2_response(&block).expect("decode");
         assert_eq!(decoded.len, 65);
+    }
+
+    #[test]
+    fn decode_shared_reply_response_succeeds_with_transfer_cap_and_valid_meta() {
+        let meta = IpcV2SharedReplyMeta {
+            version: IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0x3000,
+            len: 0x1000,
+        };
+        let meta_bytes = encode_shared_reply_meta(meta).expect("encode");
+        let mut payload = [0u8; crate::ipc::Message::MAX_PAYLOAD];
+        payload[..meta_bytes.len()].copy_from_slice(&meta_bytes);
+        let response = IpcV2Response {
+            status: 99,
+            len: meta_bytes.len(),
+            transfer_cap: Some(55),
+            payload,
+        };
+        let decoded = crate::syscall::decode_shared_reply_response(&response).expect("decode");
+        assert_eq!(decoded.status, 99);
+        assert_eq!(decoded.transfer_cap, 55);
+        assert_eq!(decoded.offset, 0x3000);
+        assert_eq!(decoded.len, 0x1000);
+        assert_eq!(decoded.flags, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY);
+    }
+
+    #[test]
+    fn decode_shared_reply_response_fails_without_transfer_cap() {
+        let mut payload = [0u8; crate::ipc::Message::MAX_PAYLOAD];
+        payload[0] = 1;
+        let response = IpcV2Response {
+            status: 0,
+            len: 24,
+            transfer_cap: None,
+            payload,
+        };
+        assert_eq!(
+            crate::syscall::decode_shared_reply_response(&response),
+            Err(SyscallError::InvalidArgs)
+        );
+    }
+
+    #[test]
+    fn decode_shared_reply_response_fails_on_bad_metadata() {
+        let mut payload = [0u8; crate::ipc::Message::MAX_PAYLOAD];
+        let bad_version = (IPC_V2_SHARED_REPLY_META_VERSION + 1).to_le_bytes();
+        payload[0..2].copy_from_slice(&bad_version);
+        payload[16..24].copy_from_slice(&1u64.to_le_bytes());
+        let response = IpcV2Response {
+            status: 0,
+            len: 24,
+            transfer_cap: Some(7),
+            payload,
+        };
+        assert_eq!(
+            crate::syscall::decode_shared_reply_response(&response),
+            Err(SyscallError::InvalidArgs)
+        );
+    }
+
+    #[test]
+    fn shared_helpers_are_metadata_only_and_do_not_map() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("ipc_reply_v2_shared")
+                && src.contains("ipc_call_v2_expect_shared")
+                && src.contains("unsafe { ipc_reply_v2(reply_cap, &payload, Some(mem_cap)) }")
+                && src.contains("decode_shared_reply_response(&response)"),
+            "shared reply helpers must remain metadata/transfer-cap wrappers without automatic mapping",
+        );
     }
 }
