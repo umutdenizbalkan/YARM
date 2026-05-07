@@ -343,6 +343,69 @@ fn shared_transfer_pins_memory_object_until_materialized() {
 }
 
 #[test]
+fn generic_memory_object_transfer_pins_until_materialized() {
+    let mut state = Bootstrap::init().expect("init");
+    let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+    let endpoint = state
+        .current_task_capability(send_cap)
+        .expect("send cap")
+        .object;
+
+    let handle = state
+        .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
+        .expect("stash");
+    let slot = state.memory_object_slot_by_id(mem_id).expect("slot");
+    let pinned = state.memory.memory_objects[slot].expect("object");
+    assert_eq!(pinned.pin_refcount, 1);
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, mem_cap)
+        .expect("revoke");
+    assert!(
+        state.memory_object_slot_by_id(mem_id).is_some(),
+        "pinned object must remain alive after cap revoke"
+    );
+
+    let _ = state
+        .take_transfer_envelope(handle, endpoint, ThreadId(0))
+        .expect("materialize");
+    state.reclaim_memory_object_if_unreferenced(CapObject::MemoryObject { id: mem_id });
+    assert!(
+        state.memory_object_slot_by_id(mem_id).is_none(),
+        "object should reclaim after unpin + no cap/map refs"
+    );
+}
+
+#[test]
+fn shared_region_memory_object_transfer_is_pinned_once() {
+    let mut state = Bootstrap::init().expect("init");
+    let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+    let endpoint = state
+        .current_task_capability(send_cap)
+        .expect("send cap")
+        .object;
+
+    let _handle = state
+        .stash_transfer_envelope(
+            ThreadId(0),
+            mem_cap,
+            endpoint,
+            None,
+            Some(TransferSharedRegion {
+                offset: 0,
+                len: PAGE_SIZE as u64,
+            }),
+        )
+        .expect("stash");
+    let slot = state.memory_object_slot_by_id(mem_id).expect("slot");
+    let pinned = state.memory.memory_objects[slot].expect("object");
+    assert_eq!(pinned.pin_refcount, 1, "shared-region path must not double-pin");
+}
+
+#[test]
 fn process_cleanup_purges_transfer_envelopes_and_unpins_memory() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");

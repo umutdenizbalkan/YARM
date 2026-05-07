@@ -82,7 +82,7 @@ Prefer regular inline/copyout reply when response is small and latency/complexit
 - No automatic mapping in kernel/runtime.
 - No request-side CALL transfer-cap channel for shared-reply request payloads.
 - No zero-copy DMA policy integration yet.
-- Generic non-shared cap transfer remains a separate behavior path.
+- Generic `MemoryObject` cap-transfer envelopes are pinned until materialized/purged to preserve transfer lifetime.
 - VFS pass 2 provisions real `MemoryObject` producer caps for staged shared-read replies when explicitly enabled.
 - VFS pass 2 currently retains local producer `mem_cap` intentionally to avoid pre-handoff lifetime invalidation.
 - Consumer shared-reply decode/map migration is deferred to pass 3.
