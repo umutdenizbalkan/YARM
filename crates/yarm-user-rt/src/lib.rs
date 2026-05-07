@@ -613,6 +613,7 @@ pub mod syscall {
 }
 
 pub mod runtime {
+    use yarm_ipc_abi::process_abi::ServiceStartupCapsV1;
     use crate::capability::CapId;
     use crate::syscall::SyscallError;
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -704,6 +705,28 @@ pub mod runtime {
         #[inline]
         pub const fn initramfs_request_recv_cap_from_slot11(self) -> Option<u32> {
             self.process_manager_restart_control_send_cap
+        }
+
+        #[inline]
+        pub fn initramfs_startup_caps_v1_from_startup_args(self) -> Option<ServiceStartupCapsV1> {
+            let sig = STARTUP_ARG_SLOTS[0].load(Ordering::Relaxed);
+            if (sig & 0xFFFF_FFFF) != 0x5354_4350 {
+                return None;
+            }
+            let version = ((sig >> 48) & 0xFFFF) as u16;
+            let role = ((sig >> 32) & 0xFFFF) as u16;
+            let request_recv_cap = STARTUP_ARG_SLOTS[1].load(Ordering::Relaxed);
+            let control_send_cap = STARTUP_ARG_SLOTS[2].load(Ordering::Relaxed);
+            let control_recv_cap = STARTUP_ARG_SLOTS[3].load(Ordering::Relaxed);
+            let reserved0 = STARTUP_ARG_SLOTS[4].load(Ordering::Relaxed);
+            Some(ServiceStartupCapsV1 {
+                version,
+                role,
+                request_recv_cap,
+                control_send_cap,
+                control_recv_cap,
+                reserved0,
+            })
         }
     }
 
@@ -1014,6 +1037,7 @@ mod tests {
         IpcV2SharedReplyMeta, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
         IPC_V2_SHARED_REPLY_META_VERSION, encode_shared_reply_meta,
     };
+    use yarm_ipc_abi::process_abi::ServiceStartupCapsV1;
 
     #[test]
     fn ipc_v2_inline_encoder_roundtrip() {
@@ -1278,5 +1302,18 @@ mod tests {
                 && src.contains("pub unsafe fn cap_release("),
             "user runtime must expose staged vm_anon_map/vm_unmap/cap_release wrappers and result type",
         );
+    }
+
+    #[test]
+    fn startup_args_structured_caps_decode_roundtrip() {
+        install_startup_arg_slots([((1u64) << 48) | ((2u64) << 32) | 0x5354_4350, 41, 42, 43, 44, 0, 0, 0, 0, 0, 0, 0]);
+        let caps = startup_context().initramfs_startup_caps_v1_from_startup_args().expect("caps");
+        assert_eq!(caps, ServiceStartupCapsV1 { version: 1, role: 2, request_recv_cap: 41, control_send_cap: 42, control_recv_cap: 43, reserved0: 44 });
+    }
+
+    #[test]
+    fn startup_args_structured_caps_malformed_signature_rejected() {
+        install_startup_arg_slots([0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(startup_context().initramfs_startup_caps_v1_from_startup_args(), None);
     }
 }
