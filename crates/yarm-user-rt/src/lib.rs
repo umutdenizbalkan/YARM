@@ -57,6 +57,7 @@ pub mod syscall {
     const SYSCALL_VM_UNMAP_NR: usize = 19;
     const SYSCALL_CAP_RELEASE_NR: usize = 20;
     const SYSCALL_YIELD_NR: usize = 0;
+    pub const IPC_V2_DEFAULT_OPCODE: u16 = 0;
     pub trait IpcTransportV2 {
         fn send_v2(
             &mut self,
@@ -192,10 +193,17 @@ pub mod syscall {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct IpcV2Response {
+        /// For `RECV_V2`/`CALL_V2`, this carries received message opcode.
         pub status: u64,
         pub len: usize,
         pub transfer_cap: Option<u64>,
         pub payload: [u8; Message::MAX_PAYLOAD],
+    }
+    impl IpcV2Response {
+        #[inline]
+        pub const fn opcode(&self) -> u16 {
+            self.status as u16
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,8 +352,20 @@ pub mod syscall {
         payload: &[u8],
         transfer_cap: Option<u64>,
     ) -> core::result::Result<(), SyscallError> {
+        // SAFETY: delegates to opcode-aware wrapper with default opcode.
+        unsafe { ipc_send_v2_msg(endpoint_cap, IPC_V2_DEFAULT_OPCODE, payload, transfer_cap) }
+    }
+
+    #[inline]
+    pub unsafe fn ipc_send_v2_msg(
+        endpoint_cap: u32,
+        opcode: u16,
+        payload: &[u8],
+        transfer_cap: Option<u64>,
+    ) -> core::result::Result<(), SyscallError> {
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
         block.endpoint_cap = endpoint_cap as u64;
+        block.aux0 = opcode as u64;
         fill_v2_payload_block(&mut block, payload)?;
         if let Some(cap) = transfer_cap {
             block.flags |= IPC_V2_FLAG_TRANSFER_CAP;
@@ -399,8 +419,20 @@ pub mod syscall {
         payload: &[u8],
         transfer_cap: Option<u64>,
     ) -> core::result::Result<(), SyscallError> {
+        // SAFETY: delegates to opcode-aware wrapper with default opcode.
+        unsafe { ipc_reply_v2_msg(reply_cap, IPC_V2_DEFAULT_OPCODE, payload, transfer_cap) }
+    }
+
+    #[inline]
+    pub unsafe fn ipc_reply_v2_msg(
+        reply_cap: u32,
+        opcode: u16,
+        payload: &[u8],
+        transfer_cap: Option<u64>,
+    ) -> core::result::Result<(), SyscallError> {
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
         block.endpoint_cap = reply_cap as u64;
+        block.aux0 = opcode as u64;
         fill_v2_payload_block(&mut block, payload)?;
         if let Some(cap) = transfer_cap {
             block.flags |= IPC_V2_FLAG_TRANSFER_CAP;
@@ -436,7 +468,7 @@ pub mod syscall {
         };
         let payload = encode_shared_reply_meta(meta).map_err(|_| SyscallError::InvalidArgs)?;
         // SAFETY: wrapper over existing reply syscall path.
-        unsafe { ipc_reply_v2(reply_cap, &payload, Some(mem_cap)) }
+        unsafe { ipc_reply_v2_msg(reply_cap, IPC_V2_DEFAULT_OPCODE, &payload, Some(mem_cap)) }
     }
 
     #[inline]
@@ -445,9 +477,21 @@ pub mod syscall {
         reply_recv_cap: u32,
         payload: &[u8],
     ) -> core::result::Result<IpcV2Response, SyscallError> {
+        // SAFETY: delegates to opcode-aware wrapper with default opcode.
+        unsafe { ipc_call_v2_msg(send_cap, reply_recv_cap, IPC_V2_DEFAULT_OPCODE, payload) }
+    }
+
+    #[inline]
+    pub unsafe fn ipc_call_v2_msg(
+        send_cap: u32,
+        reply_recv_cap: u32,
+        opcode: u16,
+        payload: &[u8],
+    ) -> core::result::Result<IpcV2Response, SyscallError> {
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
         block.endpoint_cap = send_cap as u64;
         block.aux0 = reply_recv_cap as u64;
+        block.aux1 = opcode as u64;
         fill_v2_payload_block(&mut block, payload)?;
         let args = [(&mut block as *mut IpcRegisterBlockV2) as usize, IPC_ABI_V2_BLOCK_SIZE, 0,0,0,0];
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_CALL_V2_NR, args) };
@@ -1151,7 +1195,7 @@ mod tests {
         assert!(
             src.contains("ipc_reply_v2_shared")
                 && src.contains("ipc_call_v2_expect_shared")
-                && src.contains("unsafe { ipc_reply_v2(reply_cap, &payload, Some(mem_cap)) }")
+                && src.contains("unsafe { ipc_reply_v2_msg(reply_cap, IPC_V2_DEFAULT_OPCODE, &payload, Some(mem_cap)) }")
                 && src.contains("decode_shared_reply_response(&response)"),
             "shared reply helpers must remain metadata/transfer-cap wrappers without automatic mapping",
         );

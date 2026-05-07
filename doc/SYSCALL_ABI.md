@@ -305,6 +305,12 @@
   - `arg0`: user pointer to `IpcRegisterBlockV2`
   - `arg1`: block size (`IPC_ABI_V2_BLOCK_SIZE`)
   - `arg2..arg5`: reserved for ABI compatibility
+- Message opcode carriage contract (no block layout changes):
+  - `IPC_SEND_V2`: request opcode is carried in `aux0` (`aux1` must be `0`).
+  - `IPC_REPLY_V2`: reply opcode is carried in `aux0` (`aux1` must be `0`).
+  - `IPC_CALL_V2`: request opcode is carried in `aux1`; `aux0` remains reply-receive endpoint cap.
+  - `IPC_RECV_V2` success return: `ret_status` carries received `Message.opcode`.
+  - `IPC_CALL_V2` success return: `ret_status` carries reply `Message.opcode`.
 
 ### `IPC_CALL_V2` behavior
 

@@ -93,3 +93,4 @@ Prefer regular inline/copyout reply when response is small and latency/complexit
 - Cleanup execution is intentionally **not** performed by the current scripted/in-memory request loops because those loops do not represent successful kernel IPC handoff.
 - VFS shared-read feature gate remains disabled; no shared path enablement is introduced in pass 2c.
 - Real FS IPC recv/reply loop integration (and post-send cleanup execution) remains pending for a later pass.
+- IPC v2 message-opcode carriage now uses register-block aux/ret fields; shared-reply metadata payload bytes are unchanged by opcode transport.

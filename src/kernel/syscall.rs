@@ -789,9 +789,10 @@ fn handle_ipc_send_v2_stub(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let block = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_SEND)?;
-    if block.aux0 != 0 || block.aux1 != 0 {
+    if block.aux1 != 0 {
         return Err(SyscallError::InvalidArgs);
     }
+    let opcode = u16::try_from(block.aux0).map_err(|_| SyscallError::InvalidArgs)?;
 
     let cap = CapId(block.endpoint_cap);
     validate_endpoint_right(kernel, cap, CapRights::SEND)?;
@@ -838,7 +839,7 @@ fn handle_ipc_send_v2_stub(
     let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
     let msg = Message::with_header(
         sender_tid,
-        OPCODE_INLINE,
+        opcode,
         transfer_flag_bits(transfer_cap),
         transfer_handle,
         &payload[..len],
@@ -899,7 +900,7 @@ fn handle_ipc_recv_v2_stub(
             | IPC_V2_FLAG_RECV_COPYOUT
             | IPC_V2_FLAG_RET_COPYOUT
     );
-    block.ret_status = msg.sender_tid.0;
+    block.ret_status = msg.opcode as u64;
     block.ret_len = actual_len as u64;
     block.ret_transfer_cap = msg
         .transferred_cap()
@@ -960,6 +961,7 @@ fn handle_ipc_call_v2_stub(
         .object;
 
     let reply_recv_cap = CapId(block.aux0);
+    let request_opcode = u16::try_from(block.aux1).map_err(|_| SyscallError::InvalidArgs)?;
     validate_endpoint_right(kernel, reply_recv_cap, CapRights::RECEIVE)?;
     let responder_tid = kernel
         .endpoint_waiter_tid(endpoint)
@@ -1004,7 +1006,7 @@ fn handle_ipc_call_v2_stub(
     let transfer_handle = stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
     let msg = Message::with_header(
         sender_tid,
-        OPCODE_INLINE,
+        request_opcode,
         Message::FLAG_CAP_TRANSFER,
         transfer_handle,
         &payload[..len],
@@ -1037,7 +1039,7 @@ fn handle_ipc_call_v2_stub(
             | IPC_V2_FLAG_RECV_COPYOUT
             | IPC_V2_FLAG_RET_COPYOUT
     );
-    block.ret_status = reply.sender_tid.0;
+    block.ret_status = reply.opcode as u64;
     block.ret_len = reply_len as u64;
     block.ret_transfer_cap = reply
         .transferred_cap()
@@ -1082,9 +1084,10 @@ fn handle_ipc_reply_v2_stub(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let block = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_REPLY)?;
-    if block.aux0 != 0 || block.aux1 != 0 {
+    if block.aux1 != 0 {
         return Err(SyscallError::InvalidArgs);
     }
+    let opcode = u16::try_from(block.aux0).map_err(|_| SyscallError::InvalidArgs)?;
 
     let reply_cap = CapId(block.endpoint_cap);
     let len = usize::try_from(block.len).map_err(|_| SyscallError::InvalidArgs)?;
@@ -1126,7 +1129,7 @@ fn handle_ipc_reply_v2_stub(
     };
 
     let sender_tid = current_tid(kernel)?;
-    let msg = Message::with_header(sender_tid, 0, flags, transfer_cap, &payload[..len])
+    let msg = Message::with_header(sender_tid, opcode, flags, transfer_cap, &payload[..len])
         .map_err(|_| SyscallError::InvalidArgs)?;
     kernel
         .ipc_reply(reply_cap, msg)
@@ -1421,7 +1424,7 @@ mod tests {
         .expect("unpack");
         assert_eq!(&got[..5], b"world");
 
-        block.aux0 = 1;
+        block.aux1 = 1;
         write_v2_block_to_user_for_test(&mut state, ptr, &block);
         let mut bad_aux = TrapFrame::new(
             SYSCALL_IPC_SEND_V2_NR,
@@ -1443,6 +1446,7 @@ mod tests {
 
         let mut send_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
         send_block.endpoint_cap = send_cap.0;
+        send_block.aux0 = 0x44;
         send_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
         send_block.len = 6;
         let mut lane = [0u8; 8];
@@ -1468,7 +1472,7 @@ mod tests {
         read_user_bytes_exact(&state, recv_ptr, &mut bytes).expect("read recv block");
         let out = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const IpcRegisterBlockV2) };
         assert_eq!(out.ret_len, 6);
-        assert_eq!(out.ret_status, 0);
+        assert_eq!(out.ret_status, 0x44);
         assert_eq!(out.ret_transfer_cap, IPC_V2_NO_TRANSFER_CAP);
         assert_ne!(out.flags & IPC_V2_FLAG_INLINE_PAYLOAD, 0);
         let lane0 = out.inline_words[0].to_le_bytes();
@@ -1656,6 +1660,7 @@ mod tests {
         let ptr = 0x7300usize;
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
         block.endpoint_cap = reply_cap.0;
+        block.aux0 = 0x55;
         block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
         block.len = 5;
         let mut lane = [0u8; 8];
@@ -1671,6 +1676,7 @@ mod tests {
 
         let received = state.ipc_recv(recv_cap).expect("recv").expect("message");
         assert_eq!(received.as_slice(), b"reply");
+        assert_eq!(received.opcode, 0x55);
     }
 
     #[test]
@@ -1699,7 +1705,7 @@ mod tests {
         let received = state.ipc_recv(recv_cap).expect("recv").expect("message");
         assert_eq!(received.as_slice(), b"ptrok");
 
-        block.aux0 = 1;
+        block.aux1 = 1;
         write_v2_block_to_user_for_test(&mut state, ptr, &block);
         let mut bad = TrapFrame::new(
             SYSCALL_IPC_REPLY_V2_NR,
@@ -1724,6 +1730,7 @@ mod tests {
         call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
         call_block.len = 4;
         call_block.aux0 = recv_cap.0;
+        call_block.aux1 = 0x66;
         let mut req_lane = [0u8; 8];
         req_lane[..4].copy_from_slice(b"call");
         call_block.inline_words[0] = u64::from_le_bytes(req_lane);
@@ -1750,10 +1757,12 @@ mod tests {
         let _ = dispatch(&mut state, &mut call_frame);
 
         let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(received.opcode, 0x66);
         let reply_cap = received.transferred_cap().expect("reply cap");
 
         let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
         reply_block.endpoint_cap = reply_cap.0;
+        reply_block.aux0 = 0x77;
         reply_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
         reply_block.len = 2;
         let mut lane = [0u8; 8];
