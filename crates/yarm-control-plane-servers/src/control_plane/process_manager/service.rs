@@ -16,8 +16,8 @@ use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT,
     PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2,
-    PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2,
-    RegisterSupervisedTask, ServiceStartupCapsV1, SpawnV2Args, SpawnV3Args, SpawnV4Args, TaskRestartTokenReply,
+    PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4, PROC_OP_SPAWN_V5, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2,
+    RegisterSupervisedTask, ServiceStartupCapsV1, SpawnV2Args, SpawnV3Args, SpawnV4Args, SpawnV5Args, TaskRestartTokenReply,
     TaskRestartTokenRequest, WaitPidV2Args,
 };
 #[cfg(not(test))]
@@ -63,6 +63,7 @@ pub struct SpawnV2Request {
     pub image_id: u64,
     pub requested_cnode_slots: Option<usize>,
     pub requested_task_class: Option<TaskClass>,
+    pub startup_caps: Option<ServiceStartupCapsV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -748,6 +749,7 @@ impl ProcessService {
                     image_id: args.image_id,
                     requested_cnode_slots: None,
                     requested_task_class: None,
+                    startup_caps: None,
                 }))
             }
             PROC_OP_SPAWN_V3 => {
@@ -760,6 +762,7 @@ impl ProcessService {
                     image_id: args.image_id,
                     requested_cnode_slots: Some(requested_cnode_slots),
                     requested_task_class: None,
+                    startup_caps: None,
                 }))
             }
             PROC_OP_SPAWN_V4 => {
@@ -778,6 +781,26 @@ impl ProcessService {
                     image_id: args.image_id,
                     requested_cnode_slots: Some(requested_cnode_slots),
                     requested_task_class: Some(requested_task_class),
+                    startup_caps: None,
+                }))
+            }
+            PROC_OP_SPAWN_V5 => {
+                let args = SpawnV5Args::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                let requested_cnode_slots = usize::try_from(args.requested_cnode_slots)
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                let requested_task_class = match args.task_class_hint {
+                    0 => TaskClass::App,
+                    1 => TaskClass::Driver,
+                    2 => TaskClass::SystemServer,
+                    _ => return Err(ProcessManagerError::Malformed),
+                };
+                Ok(ProcessRequest::SpawnV2(SpawnV2Request {
+                    parent_pid: ProcessId(args.parent_pid),
+                    image_id: args.image_id,
+                    requested_cnode_slots: Some(requested_cnode_slots),
+                    requested_task_class: Some(requested_task_class),
+                    startup_caps: Some(args.startup_caps),
                 }))
             }
             PROC_OP_WAITPID_V2 => {
@@ -1064,12 +1087,14 @@ impl ProcessService {
 
     fn startup_cap_safety_gate(
         &self,
-        _req: SpawnV2Request,
+        req: SpawnV2Request,
         plan: RuntimeSpawnPlan,
     ) -> Result<(), ProcessManagerError> {
         if plan.image_id == INITRAMFS_SRV_PATH_PTR {
-            let _ = ServiceStartupCapsV1::VERSION;
-            return Err(ProcessManagerError::PermissionDenied);
+            let caps = req.startup_caps.ok_or(ProcessManagerError::PermissionDenied)?;
+            if caps.version != ServiceStartupCapsV1::VERSION {
+                return Err(ProcessManagerError::Malformed);
+            }
         }
         Ok(())
     }
@@ -1079,6 +1104,9 @@ impl ProcessService {
         req: SpawnV2Request,
         plan: RuntimeSpawnPlan,
     ) -> Result<ProcessId, ProcessManagerError> {
+        if plan.image_id == INITRAMFS_SRV_PATH_PTR {
+            return Err(ProcessManagerError::Unsupported);
+        }
         self.spawn_backend.spawn(RuntimeSpawnRequest {
             tid: req.parent_pid.0,
             entry: usize::try_from(plan.entry).map_err(|_| ProcessManagerError::Malformed)?,
@@ -1892,37 +1920,52 @@ mod tests {
             self.result
         }
     }
-    fn runtime_req(image_id: u64) -> SpawnV2Request {
-        SpawnV2Request { parent_pid: ProcessId(7), image_id, requested_cnode_slots: None, requested_task_class: Some(TaskClass::SystemServer) }
+    fn runtime_req(image_id: u64, startup_caps: Option<ServiceStartupCapsV1>) -> SpawnV2Request {
+        SpawnV2Request { parent_pid: ProcessId(7), image_id, requested_cnode_slots: None, requested_task_class: Some(TaskClass::SystemServer), startup_caps }
     }
     #[test]
     fn runtime_spawn_unknown_image_fails_before_backend_call() {
         let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Ok(ProcessId(1)), calls: Cell::new(0) }));
-        let err = service.handle_spawn_v2_runtime(runtime_req(0xDEAD_BEEF)).expect_err("unknown");
+        let err = service.handle_spawn_v2_runtime(runtime_req(0xDEAD_BEEF, None)).expect_err("unknown");
         assert_eq!(err, ProcessManagerError::UnknownProcess);
     }
     #[test]
     fn runtime_spawn_missing_or_malformed_image_fails_before_backend_call() {
         let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Ok(ProcessId(1)), calls: Cell::new(0) }));
-        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_VFS_PATH_PTR)).expect_err("malformed");
+        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_VFS_PATH_PTR, None)).expect_err("malformed");
         assert_eq!(err, ProcessManagerError::Malformed);
     }
     #[test]
     fn runtime_spawn_initramfs_srv_without_structured_caps_blocks_before_backend_call() {
         let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Ok(ProcessId(1)), calls: Cell::new(0) }));
-        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_SRV_PATH_PTR)).expect_err("blocked");
+        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_SRV_PATH_PTR, None)).expect_err("blocked");
         assert_eq!(err, ProcessManagerError::PermissionDenied);
+    }
+    #[test]
+    fn runtime_spawn_initramfs_srv_with_malformed_structured_caps_blocks() {
+        let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Ok(ProcessId(1)), calls: Cell::new(0) }));
+        let mut caps = ServiceStartupCapsV1::new(1, 33);
+        caps.version = 99;
+        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_SRV_PATH_PTR, Some(caps))).expect_err("malformed caps");
+        assert_eq!(err, ProcessManagerError::Malformed);
+    }
+    #[test]
+    fn runtime_spawn_initramfs_srv_with_valid_structured_caps_passes_safety_gate_but_dispatch_remains_blocked() {
+        let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Ok(ProcessId(1)), calls: Cell::new(0) }));
+        let caps = ServiceStartupCapsV1::new(1, 33);
+        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_SRV_PATH_PTR, Some(caps))).expect_err("blocked until install");
+        assert_eq!(err, ProcessManagerError::Unsupported);
     }
     #[test]
     fn runtime_spawn_backend_error_propagates() {
         let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Err(ProcessManagerError::Unsupported), calls: Cell::new(0) }));
-        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_PROC_MGR_PATH_PTR)).expect_err("backend");
+        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_PROC_MGR_PATH_PTR, None)).expect_err("backend");
         assert_eq!(err, ProcessManagerError::Unsupported);
     }
     #[test]
     fn runtime_spawn_backend_success_after_safety_gate_passes() {
         let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Ok(ProcessId(4242)), calls: Cell::new(0) }));
-        let msg = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_PROC_MGR_PATH_PTR)).expect("spawn");
+        let msg = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_PROC_MGR_PATH_PTR, None)).expect("spawn");
         let out = SpawnV2Result::decode(msg.as_slice()).expect("decode");
         assert_eq!(out.pid, ProcessId(4242));
     }
