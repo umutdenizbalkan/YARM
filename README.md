@@ -49,6 +49,8 @@ YARM is a `no_std` microkernel root crate plus a workspace of extracted server c
 - Future work for active initramfs IPC boot path is still: `init_server` orchestration + spawn/startup-cap passing.
 - Artifact scripts verify initramfs includes `/init`, `/sbin/init_server`, and `/sbin/initramfs_srv` after CPIO creation.
 - `yarm_user_rt::user_log!` is currently a no-op formatting macro and is not serial-visible by itself.
+- Process-manager runtime spawn is still staged: non-test spawn path exposes an explicit runtime seam and returns truthful `Unsupported` until kernel-backed image launch + startup-cap installation are connected.
+- Startup-cap transport is transitioning away from slot-overload assumptions via explicit structured service startup-cap ABI (`ServiceStartupCapsV1`), while slot 11 remains compatibility-only debt.
 
 ## Boundary model (current)
 

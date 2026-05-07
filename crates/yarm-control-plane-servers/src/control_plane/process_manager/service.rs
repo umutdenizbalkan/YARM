@@ -925,8 +925,7 @@ impl ProcessService {
                 }
                 #[cfg(not(test))]
                 {
-                    let _ = req;
-                    Err(ProcessManagerError::Unsupported)
+                    self.handle_spawn_v2_runtime(req)
                 }
             }
             ProcessRequest::WaitPidV2(req) => {
@@ -971,6 +970,19 @@ impl ProcessService {
                     .map_err(|_| ProcessManagerError::Malformed)
             }
         }
+    }
+
+    #[cfg(not(test))]
+    fn handle_spawn_v2_runtime(
+        &mut self,
+        req: SpawnV2Request,
+    ) -> Result<Message, ProcessManagerError> {
+        let _ = req;
+        // Runtime spawn is intentionally wired as an explicit seam.
+        // A follow-up pass must connect this to kernel-backed image load +
+        // task launch primitives and startup-cap installation.
+        // Returning Unsupported here is truthful and avoids fake success.
+        Err(ProcessManagerError::Unsupported)
     }
 
     fn execute_restart_via_kernel_cap(&self, tid: u64, restart_token: u64) -> u8 {

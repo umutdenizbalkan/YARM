@@ -206,6 +206,79 @@ pub struct SpawnV4Args {
     pub task_class_hint: u64,
 }
 
+/// Structured startup-cap contract for service/task launches.
+///
+/// This is intentionally decoupled from legacy startup slot overloading so
+/// orchestration layers can pass startup capabilities explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceStartupCapsV1 {
+    pub version: u16,
+    pub role: u16,
+    pub request_recv_cap: u64,
+    pub control_send_cap: u64,
+    pub control_recv_cap: u64,
+    pub reserved0: u64,
+}
+
+impl ServiceStartupCapsV1 {
+    pub const VERSION: u16 = 1;
+    pub const ENCODED_LEN: usize = 40;
+
+    pub const fn new(role: u16, request_recv_cap: u64) -> Self {
+        Self {
+            version: Self::VERSION,
+            role,
+            request_recv_cap,
+            control_send_cap: 0,
+            control_recv_cap: 0,
+            reserved0: 0,
+        }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        let version = self.version.to_le_bytes();
+        let role = self.role.to_le_bytes();
+        let req = self.request_recv_cap.to_le_bytes();
+        let csend = self.control_send_cap.to_le_bytes();
+        let crecv = self.control_recv_cap.to_le_bytes();
+        let r0 = self.reserved0.to_le_bytes();
+        out[0] = version[0];
+        out[1] = version[1];
+        out[2] = role[0];
+        out[3] = role[1];
+        out[8..16].copy_from_slice(&req);
+        out[16..24].copy_from_slice(&csend);
+        out[24..32].copy_from_slice(&crecv);
+        out[32..40].copy_from_slice(&r0);
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() != Self::ENCODED_LEN {
+            return Err(ProcCodecError::Malformed);
+        }
+        let version = u16::from_le_bytes([payload[0], payload[1]]);
+        let role = u16::from_le_bytes([payload[2], payload[3]]);
+        let mut req = [0u8; 8];
+        req.copy_from_slice(&payload[8..16]);
+        let mut csend = [0u8; 8];
+        csend.copy_from_slice(&payload[16..24]);
+        let mut crecv = [0u8; 8];
+        crecv.copy_from_slice(&payload[24..32]);
+        let mut r0 = [0u8; 8];
+        r0.copy_from_slice(&payload[32..40]);
+        Ok(Self {
+            version,
+            role,
+            request_recv_cap: u64::from_le_bytes(req),
+            control_send_cap: u64::from_le_bytes(csend),
+            control_recv_cap: u64::from_le_bytes(crecv),
+            reserved0: u64::from_le_bytes(r0),
+        })
+    }
+}
+
 impl SpawnV4Args {
     pub const VERSION: u16 = PROC_CODEC_V4_VERSION;
 
@@ -533,6 +606,23 @@ mod tests {
         assert_eq!(ExecuteRestartRequest::decode(&req.encode()), Ok(req));
         let rep = ExecuteRestartReply::new(ExecuteRestartReply::STATUS_NOT_FOUND);
         assert_eq!(ExecuteRestartReply::decode(&rep.encode()), Ok(rep));
+    }
+
+    #[test]
+    fn service_startup_caps_v1_roundtrip() {
+        let caps = ServiceStartupCapsV1 {
+            version: ServiceStartupCapsV1::VERSION,
+            role: 2,
+            request_recv_cap: 11,
+            control_send_cap: 22,
+            control_recv_cap: 33,
+            reserved0: 0,
+        };
+        let encoded = caps.encode();
+        assert_eq!(
+            ServiceStartupCapsV1::decode(&encoded).expect("decode"),
+            caps
+        );
     }
 
     #[test]
