@@ -1766,6 +1766,175 @@ mod tests {
         dispatch(&mut state, &mut reply_frame2).expect("reply2");
         assert_eq!(dispatch(&mut state, &mut no_copy_frame), Err(SyscallError::InvalidArgs));
     }
+
+    #[test]
+    fn syscall_ipc_reply_v2_transfer_cap_memory_object_sets_ret_transfer_cap_baseline() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        let call_ptr = 0xB000usize;
+        let reply_ptr = 0xB100usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"ping\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0x1000,
+            len: 0x2000,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        state
+            .copy_to_current_user(reply_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = mem_cap.0;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr + 0x80, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_ptr + 0x80, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut reply_frame).expect("reply");
+
+        dispatch(&mut state, &mut call_frame).expect("call completion");
+        let out_block = state
+            .copy_from_current_user(call_ptr, IPC_ABI_V2_BLOCK_SIZE)
+            .expect("call out");
+        let out = unsafe {
+            core::ptr::read_unaligned(out_block.as_ptr() as *const IpcRegisterBlockV2)
+        };
+        assert_eq!(out.ret_transfer_cap, mem_cap.0);
+        assert_ne!(out.flags & IPC_V2_FLAG_TRANSFER_CAP, 0);
+    }
+
+    #[test]
+    fn syscall_ipc_reply_v2_transfer_cap_permissive_non_memory_object_baseline() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+
+        let call_ptr = 0xB200usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"ping\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        // Baseline: kernel currently validates transfer-cap existence only, not object kind.
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD | IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = send_cap.0; // endpoint cap (non-MemoryObject)
+        reply_block.len = 2;
+        let mut lane = [0u8; 8];
+        lane[..2].copy_from_slice(b"ok");
+        reply_block.inline_words[0] = u64::from_le_bytes(lane);
+        let reply_ptr = 0xB280usize;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut reply_frame).expect("reply");
+
+        dispatch(&mut state, &mut call_frame).expect("call completion");
+        let out_block = state
+            .copy_from_current_user(call_ptr, IPC_ABI_V2_BLOCK_SIZE)
+            .expect("call out");
+        let out = unsafe {
+            core::ptr::read_unaligned(out_block.as_ptr() as *const IpcRegisterBlockV2)
+        };
+        assert_eq!(out.ret_transfer_cap, send_cap.0);
+        assert_ne!(out.flags & IPC_V2_FLAG_TRANSFER_CAP, 0);
+    }
+
+    #[test]
+    fn syscall_ipc_call_v2_reply_transfer_with_shared_reply_meta_payload_baseline() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let call_ptr = 0xB300usize;
+        let reply_ptr = 0xB380usize;
+
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"meta\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0x4000,
+            len: 0x1000,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        state
+            .copy_to_current_user(reply_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = mem_cap.0;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr + 0x80, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_ptr + 0x80, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut reply_frame).expect("reply");
+
+        dispatch(&mut state, &mut call_frame).expect("call completion");
+        let out_block = state
+            .copy_from_current_user(call_ptr, IPC_ABI_V2_BLOCK_SIZE)
+            .expect("call out");
+        let out = unsafe {
+            core::ptr::read_unaligned(out_block.as_ptr() as *const IpcRegisterBlockV2)
+        };
+        assert_eq!(out.ret_transfer_cap, mem_cap.0);
+        let decoded_meta = yarm_ipc_abi::ipc_v2::decode_shared_reply_meta(&payload)
+            .expect("decode shared meta");
+        assert_eq!(out.ret_transfer_cap, mem_cap.0);
+        assert_eq!(decoded_meta.offset, 0x4000);
+        assert_eq!(decoded_meta.len, 0x1000);
+    }
     #[test]
     fn syscall_abi_numbers_are_frozen() {
         assert_eq!(SYSCALL_ABI_VERSION, 10);

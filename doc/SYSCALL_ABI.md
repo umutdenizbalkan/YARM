@@ -274,6 +274,11 @@
 - Safety caveats:
   - mutability depends on transferred-cap rights and aliasing policy (`READ_ONLY` vs writable intent);
   - revocation/lifetime races remain possible and must be handled by caller map/use failure paths.
+- Current kernel-policy baseline (documented, pre-hardening):
+  - `REPLY_V2` transfer-cap validation currently checks capability existence, not MemoryObject-only kind enforcement;
+  - services adopting shared replies should transfer MemoryObject-like caps only by policy;
+  - `IpcV2SharedReplyMeta.offset/len` is convention payload and must be validated by receiver/protocol decoder before map/use;
+  - read-only shared-reply behavior requires rights attenuation at cap creation/delegation time.
 
 - `IPC_CALL_V2` is a combined operation: **send request + wait for reply** in one syscall.
 - Userspace must pass reply receive endpoint cap in `IpcRegisterBlockV2.aux0`.
