@@ -136,6 +136,7 @@
 `VmAnonMap` semantics (staged):
 
 - allocates an anonymous `MemoryObject` sized to the rounded mapping length;
+- rejects overlap: every page in `[base, base+rounded_len)` must be currently unmapped in the caller ASID;
 - maps it into the caller's current user ASID at the provided base;
 - returns mapping + transfer-cap tuple in return registers:
   - `ret0 = mapped_base_va`

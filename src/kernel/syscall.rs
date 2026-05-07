@@ -532,6 +532,16 @@ fn handle_vm_anon_map(
     if !flags.read || !flags.write || flags.execute {
         return Err(SyscallError::InvalidArgs);
     }
+    let mut check_va = base;
+    while check_va < end {
+        if kernel
+            .is_user_page_mapped_in_current_asid(VirtAddr(check_va as u64))
+            .map_err(SyscallError::from)?
+        {
+            return Err(SyscallError::WrongObject);
+        }
+        check_va += PAGE_SIZE;
+    }
 
     let (_mem_id, mem_cap) = kernel
         .alloc_anonymous_memory_object_with_len(map_len)
@@ -547,9 +557,10 @@ fn handle_vm_anon_map(
                 let _ = kernel.unmap_user_page_in_current_asid(VirtAddr(rollback_va as u64));
                 rollback_va += PAGE_SIZE;
             }
-            if let Some(cnode) = kernel.current_task_cnode() {
-                let _ = kernel.revoke_capability_in_cnode(cnode, mem_cap);
-            }
+            let cnode = kernel.current_task_cnode().ok_or(SyscallError::Internal)?;
+            kernel
+                .revoke_capability_in_cnode(cnode, mem_cap)
+                .map_err(SyscallError::from)?;
             return Err(SyscallError::from(err));
         }
         va += PAGE_SIZE;
@@ -2867,6 +2878,42 @@ mod tests {
             let err = dispatch(&mut state, &mut frame).expect_err("invalid");
             assert_eq!(err, SyscallError::InvalidArgs);
         }
+    }
+
+    #[test]
+    fn vm_anon_map_rejects_overlap_before_allocation() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let mut occupy = TrapFrame::new(
+            Syscall::VmMap as usize,
+            [
+                aspace_map_cap.0 as usize,
+                0xD000,
+                PAGE_SIZE,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut occupy).expect("occupy");
+        let mem_before = state.with_memory_state(|memory| memory.memory_objects.iter().flatten().count());
+
+        let mut frame = TrapFrame::new(
+            Syscall::VmAnonMap as usize,
+            [
+                0xD000,
+                PAGE_SIZE * 2,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+                0,
+            ],
+        );
+        let err = dispatch(&mut state, &mut frame).expect_err("overlap");
+        assert_eq!(err, SyscallError::WrongObject);
+        let mem_after = state.with_memory_state(|memory| memory.memory_objects.iter().flatten().count());
+        assert_eq!(mem_before, mem_after, "overlap reject must happen before allocation");
     }
 
     #[test]
