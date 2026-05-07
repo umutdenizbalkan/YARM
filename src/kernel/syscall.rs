@@ -245,12 +245,37 @@ fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), Syscall
 fn validate_shared_reply_transfer_cap_kind(
     kernel: &KernelState,
     cap: CapId,
-) -> Result<(), SyscallError> {
+) -> Result<u64, SyscallError> {
     let transfer = kernel
         .capability_service()
         .resolve_current_task_capability(cap)
         .ok_or(SyscallError::InvalidCapability)?;
-    if !matches!(transfer.object, CapObject::MemoryObject { .. }) {
+    let CapObject::MemoryObject { id } = transfer.object else {
+        return Err(SyscallError::WrongObject);
+    };
+    let mem = kernel
+        .with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|entry| entry.id == id)
+                .copied()
+        })
+        .ok_or(SyscallError::WrongObject)?;
+    let len = u64::try_from(mem.len).map_err(|_| SyscallError::WrongObject)?;
+    Ok(len)
+}
+
+fn validate_shared_reply_meta_bounds(
+    meta: yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta,
+    object_len: u64,
+) -> Result<(), SyscallError> {
+    let end = meta
+        .offset
+        .checked_add(meta.len)
+        .ok_or(SyscallError::WrongObject)?;
+    if end > object_len {
         return Err(SyscallError::WrongObject);
     }
     Ok(())
@@ -977,8 +1002,9 @@ fn handle_ipc_reply_v2_stub(
         }
         let cap = CapId(block.transfer_cap);
         validate_transfer_cap(kernel, cap)?;
-        if yarm_ipc_abi::ipc_v2::decode_shared_reply_meta(&payload[..len]).is_ok() {
-            validate_shared_reply_transfer_cap_kind(kernel, cap)?;
+        if let Ok(meta) = yarm_ipc_abi::ipc_v2::decode_shared_reply_meta(&payload[..len]) {
+            let object_len = validate_shared_reply_transfer_cap_kind(kernel, cap)?;
+            validate_shared_reply_meta_bounds(meta, object_len)?;
         }
         (Message::FLAG_CAP_TRANSFER, Some(block.transfer_cap))
     } else {
@@ -1098,6 +1124,27 @@ mod tests {
         state
             .copy_to_current_user(ptr, bytes)
             .expect("write v2 block");
+    }
+
+    fn memory_object_len_for_cap(state: &KernelState, cap: CapId) -> u64 {
+        let obj = state
+            .capability_service()
+            .resolve_current_task_capability(cap)
+            .expect("cap")
+            .object;
+        let CapObject::MemoryObject { id } = obj else {
+            panic!("expected memory object cap");
+        };
+        state
+            .with_memory_state(|memory| {
+                memory
+                    .memory_objects
+                    .iter()
+                    .flatten()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| entry.len as u64)
+            })
+            .expect("memory object len")
     }
 
     #[test]
@@ -1886,6 +1933,159 @@ mod tests {
         let mut reply_frame = TrapFrame::new(
             SYSCALL_IPC_REPLY_V2_NR,
             [reply_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            dispatch(&mut state, &mut reply_frame),
+            Err(SyscallError::WrongObject)
+        );
+    }
+
+    #[test]
+    fn syscall_ipc_reply_v2_shared_meta_exact_object_len_succeeds() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let obj_len = memory_object_len_for_cap(&state, mem_cap);
+
+        let call_ptr = 0xB2C0usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"size\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0,
+            len: obj_len,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        let reply_payload_ptr = 0xB2E0usize;
+        state
+            .copy_to_current_user(reply_payload_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_payload_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = mem_cap.0;
+        write_v2_block_to_user_for_test(&mut state, reply_payload_ptr + 0x80, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_payload_ptr + 0x80, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut reply_frame).expect("reply");
+    }
+
+    #[test]
+    fn syscall_ipc_reply_v2_shared_meta_over_object_len_rejects_wrong_object() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let obj_len = memory_object_len_for_cap(&state, mem_cap);
+
+        let call_ptr = 0xB300usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"obnd\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: obj_len - 1,
+            len: 2,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        let reply_payload_ptr = 0xB320usize;
+        state
+            .copy_to_current_user(reply_payload_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_payload_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = mem_cap.0;
+        write_v2_block_to_user_for_test(&mut state, reply_payload_ptr + 0x80, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_payload_ptr + 0x80, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            dispatch(&mut state, &mut reply_frame),
+            Err(SyscallError::WrongObject)
+        );
+    }
+
+    #[test]
+    fn syscall_ipc_reply_v2_shared_meta_offset_beyond_object_len_rejects_wrong_object() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let obj_len = memory_object_len_for_cap(&state, mem_cap);
+
+        let call_ptr = 0xB340usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"ofst\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: obj_len + 1,
+            len: 1,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        let reply_payload_ptr = 0xB360usize;
+        state
+            .copy_to_current_user(reply_payload_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_payload_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = mem_cap.0;
+        write_v2_block_to_user_for_test(&mut state, reply_payload_ptr + 0x80, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_payload_ptr + 0x80, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
         );
         assert_eq!(
             dispatch(&mut state, &mut reply_frame),

@@ -276,9 +276,10 @@
   - revocation/lifetime races remain possible and must be handled by caller map/use failure paths.
 - Current kernel-policy baseline:
   - `REPLY_V2` enforces MemoryObject-only transfer-cap kind **when** reply payload decodes as `IpcV2SharedReplyMeta`;
+  - `REPLY_V2` enforces `IpcV2SharedReplyMeta.offset + len <= MemoryObject.len` for valid shared-reply metadata payloads;
   - non-shared payloads preserve generic transfer-cap behavior (existing capability-existence validation);
   - services adopting shared replies should transfer MemoryObject-like caps only by policy;
-  - `IpcV2SharedReplyMeta.offset/len` is convention payload and must be validated by receiver/protocol decoder before map/use;
+  - map-time checks are still required for liveness/rights/revocation at use time;
   - read-only shared-reply behavior requires rights attenuation at cap creation/delegation time.
 
 - `IPC_CALL_V2` is a combined operation: **send request + wait for reply** in one syscall.
