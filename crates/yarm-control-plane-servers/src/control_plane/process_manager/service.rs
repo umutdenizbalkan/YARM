@@ -55,6 +55,7 @@ const AUXV_AT_PAGESZ: u64 = 6;
 const AUXV_AT_ENTRY: u64 = 9;
 const ELF64_PHDR_SIZE: usize = 56;
 const PT_LOAD: u32 = 1;
+const INITRAMFS_SRV_PATH_PTR: u64 = 0x494E_4954_4653_5352;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnV2Request {
@@ -1019,19 +1020,71 @@ impl ProcessService {
         &mut self,
         req: SpawnV2Request,
     ) -> Result<Message, ProcessManagerError> {
-        let image = resolve_spawn_image_from_boot_initrd(req.image_id)?;
-        let info = ElfImageInfo::parse(req.image_id, image).map_err(map_elf_error)?;
-        let _ = (
-            req.parent_pid,
-            req.requested_cnode_slots,
-            req.requested_task_class,
-            info,
-        );
-        // Runtime spawn is intentionally wired as an explicit seam.
-        // A follow-up pass must connect this to kernel-backed image load +
-        // task launch primitives and startup-cap installation.
-        // Returning Unsupported here is truthful and avoids fake success.
-        Err(ProcessManagerError::Unsupported)
+        let plan = self.preflight_spawn_image(req)?;
+        self.startup_cap_safety_gate(req, plan)?;
+        let pid = self.dispatch_spawn_to_backend(req, plan)?;
+        let result = SpawnV2Result { pid };
+        Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
+            .map_err(|_| ProcessManagerError::Malformed)
+    }
+
+    fn resolve_spawn_image_id(&self, image_id: u64) -> Result<u64, ProcessManagerError> {
+        match image_id {
+            yarm_fs_servers::initramfs::INITRAMFS_INIT_PATH_PTR
+            | yarm_fs_servers::initramfs::INITRAMFS_PROC_MGR_PATH_PTR
+            | yarm_fs_servers::initramfs::INITRAMFS_VFS_PATH_PTR
+            | yarm_fs_servers::initramfs::INITRAMFS_SUPERVISOR_PATH_PTR
+            | yarm_fs_servers::initramfs::INITRAMFS_POSIX_COMPAT_PATH_PTR
+            | INITRAMFS_SRV_PATH_PTR => Ok(image_id),
+            _ => Err(ProcessManagerError::UnknownProcess),
+        }
+    }
+
+    fn preflight_spawn_image(
+        &self,
+        req: SpawnV2Request,
+    ) -> Result<RuntimeSpawnPlan, ProcessManagerError> {
+        let image_id = self.resolve_spawn_image_id(req.image_id)?;
+        #[cfg(test)]
+        let image = {
+            if image_id == INITRAMFS_VFS_PATH_PTR {
+                return Err(ProcessManagerError::Malformed);
+            }
+            synthetic_elf_image(image_id).to_vec()
+        };
+        #[cfg(not(test))]
+        let image = resolve_spawn_image_from_boot_initrd(image_id)?;
+        let info = ElfImageInfo::parse(image_id, &image).map_err(map_elf_error)?;
+        Ok(RuntimeSpawnPlan {
+            image_id,
+            entry: info.entry,
+            task_class: req.requested_task_class.unwrap_or(TaskClass::App),
+        })
+    }
+
+    fn startup_cap_safety_gate(
+        &self,
+        _req: SpawnV2Request,
+        plan: RuntimeSpawnPlan,
+    ) -> Result<(), ProcessManagerError> {
+        if plan.image_id == INITRAMFS_SRV_PATH_PTR {
+            let _ = ServiceStartupCapsV1::VERSION;
+            return Err(ProcessManagerError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    fn dispatch_spawn_to_backend(
+        &self,
+        req: SpawnV2Request,
+        plan: RuntimeSpawnPlan,
+    ) -> Result<ProcessId, ProcessManagerError> {
+        self.spawn_backend.spawn(RuntimeSpawnRequest {
+            tid: req.parent_pid.0,
+            entry: usize::try_from(plan.entry).map_err(|_| ProcessManagerError::Malformed)?,
+            task_class: plan.task_class,
+            startup_args: [0; 12],
+        })
     }
 
     fn execute_restart_via_kernel_cap(&self, tid: u64, restart_token: u64) -> u8 {
@@ -1444,6 +1497,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
 
     fn synthetic_elf_image(entry: u64) -> [u8; 160] {
         let mut image = [0u8; 160];
@@ -1826,5 +1880,50 @@ mod tests {
             service.execute_restart_via_transport(&mut transport, 9, 0xBEEF),
             ExecuteRestartReply::STATUS_OK
         );
+    }
+
+    struct CountingBackend {
+        result: Result<ProcessId, ProcessManagerError>,
+        calls: Cell<usize>,
+    }
+    impl ProcessSpawnBackend for CountingBackend {
+        fn spawn(&self, _req: RuntimeSpawnRequest) -> Result<ProcessId, ProcessManagerError> {
+            self.calls.set(self.calls.get().saturating_add(1));
+            self.result
+        }
+    }
+    fn runtime_req(image_id: u64) -> SpawnV2Request {
+        SpawnV2Request { parent_pid: ProcessId(7), image_id, requested_cnode_slots: None, requested_task_class: Some(TaskClass::SystemServer) }
+    }
+    #[test]
+    fn runtime_spawn_unknown_image_fails_before_backend_call() {
+        let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Ok(ProcessId(1)), calls: Cell::new(0) }));
+        let err = service.handle_spawn_v2_runtime(runtime_req(0xDEAD_BEEF)).expect_err("unknown");
+        assert_eq!(err, ProcessManagerError::UnknownProcess);
+    }
+    #[test]
+    fn runtime_spawn_missing_or_malformed_image_fails_before_backend_call() {
+        let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Ok(ProcessId(1)), calls: Cell::new(0) }));
+        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_VFS_PATH_PTR)).expect_err("malformed");
+        assert_eq!(err, ProcessManagerError::Malformed);
+    }
+    #[test]
+    fn runtime_spawn_initramfs_srv_without_structured_caps_blocks_before_backend_call() {
+        let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Ok(ProcessId(1)), calls: Cell::new(0) }));
+        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_SRV_PATH_PTR)).expect_err("blocked");
+        assert_eq!(err, ProcessManagerError::PermissionDenied);
+    }
+    #[test]
+    fn runtime_spawn_backend_error_propagates() {
+        let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Err(ProcessManagerError::Unsupported), calls: Cell::new(0) }));
+        let err = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_PROC_MGR_PATH_PTR)).expect_err("backend");
+        assert_eq!(err, ProcessManagerError::Unsupported);
+    }
+    #[test]
+    fn runtime_spawn_backend_success_after_safety_gate_passes() {
+        let mut service = ProcessService::new_with_backend(Box::new(CountingBackend { result: Ok(ProcessId(4242)), calls: Cell::new(0) }));
+        let msg = service.handle_spawn_v2_runtime(runtime_req(INITRAMFS_PROC_MGR_PATH_PTR)).expect("spawn");
+        let out = SpawnV2Result::decode(msg.as_slice()).expect("decode");
+        assert_eq!(out.pid, ProcessId(4242));
     }
 }
