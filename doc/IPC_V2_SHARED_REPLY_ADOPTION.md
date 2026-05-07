@@ -21,7 +21,7 @@ This checklist is for services adopting the **IPC v2 shared-reply convention**:
   - transfer cap must be `MemoryObject` when payload is valid shared-reply metadata;
   - metadata bounds (`offset + len`) must fit the transferred `MemoryObject` length.
 - First service adoption target selected: **VFS `READ` reply path**.
-- Pass 2 status: VFS producer wiring uses staged `VmAnonMap` + shared metadata/cap transfer path, but default remains inline/copyout fallback (gate disabled).
+- Pass 2 status: VFS producer wiring uses staged `VmAnonMap` + shared metadata/cap transfer path with producer-local cleanup (`VmUnmap`/`CapRelease`), but default remains inline/copyout fallback (gate disabled).
 
 ---
 

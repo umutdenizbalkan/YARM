@@ -15,7 +15,7 @@ use yarm_ipc_abi::ipc_v2::{
     IpcV2SharedReplyMeta, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY, IPC_V2_SHARED_REPLY_META_VERSION,
     encode_shared_reply_meta,
 };
-use yarm_user_rt::syscall::{AnonMapResult, vm_anon_map};
+use yarm_user_rt::syscall::{AnonMapResult, cap_release, vm_anon_map, vm_unmap};
 
 const MAX_MOUNTS: usize = 8;
 const VFS_READ_SHARED_REPLY_ENABLED: bool = false;
@@ -156,18 +156,28 @@ impl<B: VfsBackend> VfsService<B> {
                     )
                 }
             },
+            |map| {
+                // SAFETY: producer-local cleanup syscall wrappers.
+                unsafe {
+                    vm_unmap(map.base, map.len)?;
+                    cap_release(map.mem_cap)?;
+                }
+                Ok(())
+            },
         )
     }
 
-    fn try_build_shared_read_reply_with_policy_and_allocator<F>(
+    fn try_build_shared_read_reply_with_policy_and_allocator<F, C>(
         enabled: bool,
         read_len: u64,
         inline_len: usize,
         inline_bytes: &[u8],
         mut alloc: F,
+        mut cleanup: C,
     ) -> Result<Option<Message>, VfsError>
     where
         F: FnMut() -> Result<AnonMapResult, yarm_user_rt::syscall::SyscallError>,
+        C: FnMut(&AnonMapResult) -> Result<(), yarm_user_rt::syscall::SyscallError>,
     {
         if !enabled {
             return Ok(None);
@@ -202,6 +212,9 @@ impl<B: VfsBackend> VfsService<B> {
             &payload,
         )
         .map_err(|_| VfsError::Malformed)?;
+        if cleanup(&map).is_err() {
+            return Ok(None);
+        }
         Ok(Some(msg))
     }
 
@@ -569,6 +582,7 @@ mod tests {
             5,
             b"hello",
             || Err(yarm_user_rt::syscall::SyscallError::InvalidArgs),
+            |_| Ok(()),
         )
         .expect("fallback");
         assert!(out.is_none());
@@ -576,6 +590,36 @@ mod tests {
 
     #[test]
     fn read_shared_reply_helper_emits_shared_meta_when_forced_enabled() {
+        let data = [0xABu8; 256];
+        let mut mapped = [0u8; 4096];
+        let base = mapped.as_mut_ptr() as usize;
+        let mut cleaned = false;
+        let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply_with_policy_and_allocator(
+            true,
+            256,
+            data.len(),
+            &data,
+            || {
+                Ok(AnonMapResult {
+                    base,
+                    len: 4096,
+                    mem_cap: 77,
+                })
+            },
+            |_| {
+                cleaned = true;
+                Ok(())
+            },
+        )
+        .expect("shared")
+        .expect("some");
+        assert_eq!(out.opcode, VFS_OP_READ);
+        assert_eq!(out.transferred_cap().map(|cap| cap.0), Some(77));
+        assert!(cleaned, "successful shared path must cleanup local producer resources");
+    }
+
+    #[test]
+    fn read_shared_reply_helper_cleanup_failure_falls_back() {
         let data = [0xABu8; 256];
         let mut mapped = [0u8; 4096];
         let base = mapped.as_mut_ptr() as usize;
@@ -591,10 +635,9 @@ mod tests {
                     mem_cap: 77,
                 })
             },
+            |_| Err(yarm_user_rt::syscall::SyscallError::InvalidArgs),
         )
-        .expect("shared")
-        .expect("some");
-        assert_eq!(out.opcode, VFS_OP_READ);
-        assert_eq!(out.transferred_cap().map(|cap| cap.0), Some(77));
+        .expect("fallback");
+        assert!(out.is_none(), "cleanup failure must fallback to inline path");
     }
 }
