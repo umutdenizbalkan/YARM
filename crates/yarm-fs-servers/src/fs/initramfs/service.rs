@@ -92,7 +92,15 @@ pub fn run() {
     let mut svc = InitramfsService::with_backend(InitramfsBackend::new(8192));
     if INITRAMFS_REAL_IPC_LOOP_STAGED {
         if let Some(recv_cap) = startup_context().initramfs_request_recv_cap_from_slot11() {
+            yarm_user_rt::user_log!(
+                "INITRAMFS_RUNTIME_MODE mode=real_ipc recv_cap={}",
+                recv_cap
+            );
             run_ipc_loop(&mut svc, &mut RuntimeIpcOps, recv_cap);
+        } else {
+            yarm_user_rt::user_log!(
+                "INITRAMFS_RUNTIME_MODE mode=scripted_fallback reason=no_recv_cap"
+            );
         }
     }
     let summary = run_request_loop(&mut svc).expect("initramfs loop");
@@ -227,6 +235,7 @@ fn handle_one_ipc_request(
 }
 
 fn run_ipc_loop(service: &mut InitramfsService, ops: &mut impl InitramfsIpcOps, recv_cap: u32) -> ! {
+    yarm_user_rt::user_log!("INITRAMFS_IPC_LOOP_READY recv_cap={}", recv_cap);
     loop {
         match ops.recv_v2(recv_cap) {
             Ok(Some(req)) => handle_one_ipc_request(service, ops, req),
