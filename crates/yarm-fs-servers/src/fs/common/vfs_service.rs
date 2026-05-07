@@ -11,8 +11,13 @@ use yarm_ipc_abi::vfs_abi::{
     VFS_OP_WRITE, VfsV1Args,
 };
 use yarm_user_rt::ipc::Message;
+use yarm_ipc_abi::ipc_v2::{
+    IpcV2SharedReplyMeta, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY, IPC_V2_SHARED_REPLY_META_VERSION,
+    encode_shared_reply_meta,
+};
 
 const MAX_MOUNTS: usize = 8;
+const VFS_READ_SHARED_REPLY_ENABLED: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsReply {
@@ -126,6 +131,49 @@ impl VfsService<InMemoryBackend> {
 }
 
 impl<B: VfsBackend> VfsService<B> {
+    fn try_build_shared_read_reply(
+        read_len: u64,
+        inline_len: usize,
+    ) -> Result<Option<Message>, VfsError> {
+        Self::try_build_shared_read_reply_with_policy(
+            VFS_READ_SHARED_REPLY_ENABLED,
+            read_len,
+            inline_len,
+            None,
+        )
+    }
+
+    fn try_build_shared_read_reply_with_policy(
+        enabled: bool,
+        read_len: u64,
+        inline_len: usize,
+        transfer_cap: Option<u64>,
+    ) -> Result<Option<Message>, VfsError> {
+        if !enabled {
+            return Ok(None);
+        }
+        let transfer_cap = transfer_cap.ok_or(VfsError::Unsupported)?;
+        // TODO(stage2): plumb real MemoryObject producer support into this service layer.
+        // PASS 1 is producer scaffolding only; do not fake transfer-cap provisioning.
+        let meta = IpcV2SharedReplyMeta {
+            version: IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0,
+            len: read_len.max(inline_len as u64),
+        };
+        let payload = encode_shared_reply_meta(meta).map_err(|_| VfsError::Malformed)?;
+        let msg = Message::with_header(
+            0,
+            VFS_OP_READ,
+            Message::FLAG_CAP_TRANSFER,
+            Some(transfer_cap),
+            &payload,
+        )
+        .map_err(|_| VfsError::Malformed)?;
+        Ok(Some(msg))
+    }
+
     pub const fn with_backend(backend: B) -> Self {
         Self {
             backend,
@@ -368,6 +416,9 @@ impl<B: VfsBackend> VfsService<B> {
             VfsRequest::Read { fd, len, .. } => {
                 let mut inline = [0u8; Message::MAX_PAYLOAD - 16];
                 let (read_len, inline_len) = self.backend.read_into(fd, len, &mut inline)?;
+                if let Some(shared_reply) = Self::try_build_shared_read_reply(read_len, inline_len)? {
+                    return Ok(shared_reply);
+                }
                 if inline_len == 0 {
                     VfsReply::ReadLen(read_len)
                 } else {
@@ -429,5 +480,63 @@ impl<B: VfsBackend> VfsService<B> {
         };
         self.op_sequence = self.op_sequence.saturating_add(1);
         reply.to_message()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct InlineReadBackend;
+
+    impl VfsBackend for InlineReadBackend {
+        fn openat_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> { Ok(7) }
+        fn close(&mut self, _fd: u64) -> Result<u64, VfsError> { Ok(0) }
+        fn read(&mut self, _fd: u64, len: u64) -> Result<u64, VfsError> { Ok(len) }
+        fn read_into(&mut self, _fd: u64, _len: u64, out: &mut [u8]) -> Result<(u64, usize), VfsError> {
+            let bytes = b"hello";
+            out[..bytes.len()].copy_from_slice(bytes);
+            Ok((bytes.len() as u64, bytes.len()))
+        }
+        fn write(&mut self, _fd: u64, len: u64) -> Result<u64, VfsError> { Ok(len) }
+    }
+
+    #[test]
+    fn read_reply_default_path_stays_inline_extended() {
+        let mut svc = VfsService::with_backend(InlineReadBackend);
+        let req = Message::with_header(
+            0,
+            VFS_OP_READ,
+            0,
+            None,
+            &ReadWriteArgs::new(7, 0x1000, 64).encode(),
+        )
+        .expect("request");
+        let reply = svc.handle_request(req).expect("reply");
+        assert_eq!(reply.opcode, VFS_OP_READ);
+        assert_eq!(reply.transferred_cap(), None);
+        assert_eq!(reply.as_slice().len(), 21);
+        assert_eq!(&reply.as_slice()[16..21], b"hello");
+    }
+
+    #[test]
+    fn read_shared_reply_branch_not_taken_when_disabled() {
+        assert!(!VFS_READ_SHARED_REPLY_ENABLED, "pass1 default must stay disabled");
+        let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply(5, 5)
+            .expect("decision");
+        assert!(out.is_none(), "shared-reply branch must stay off by default");
+    }
+
+    #[test]
+    fn read_shared_reply_helper_rejects_missing_transfer_cap_when_forced_enabled() {
+        let err = VfsService::<InlineReadBackend>::try_build_shared_read_reply_with_policy(
+            true,
+            4096,
+            0,
+            None,
+        )
+        .expect_err("missing memcap must reject");
+        assert_eq!(err, VfsError::Unsupported);
     }
 }

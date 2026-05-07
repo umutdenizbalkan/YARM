@@ -20,6 +20,8 @@ This checklist is for services adopting the **IPC v2 shared-reply convention**:
 - Shared-reply Stage 1 is implemented and hardened:
   - transfer cap must be `MemoryObject` when payload is valid shared-reply metadata;
   - metadata bounds (`offset + len`) must fit the transferred `MemoryObject` length.
+- First service adoption target selected: **VFS `READ` reply path**.
+- Pass 1 status: producer-side scaffolding only; default remains inline/copyout fallback.
 
 ---
 
@@ -81,3 +83,5 @@ Prefer regular inline/copyout reply when response is small and latency/complexit
 - No request-side CALL transfer-cap channel for shared-reply request payloads.
 - No zero-copy DMA policy integration yet.
 - Generic non-shared cap transfer remains a separate behavior path.
+- VFS pass 1 does not yet provision real `MemoryObject` producer caps in the service layer.
+- Consumer shared-reply decode/map migration is deferred to pass 2.
