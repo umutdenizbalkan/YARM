@@ -28,6 +28,8 @@ BUILD_LOG=${BUILD_LOG:-$OUT_DIR/aarch64-build.log}
 
 mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
+echo "[info] /init build identity package=${SERVER_PACKAGE} bin=${SERVER_BIN} target=${SERVER_RUST_TARGET} profile=${SERVER_BUILD_PROFILE}"
+echo "[info] /init build identity server_elf=${SERVER_ELF}"
 
 CARGO_Z_ARGS=()
 USE_NIGHTLY=0

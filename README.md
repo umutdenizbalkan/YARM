@@ -40,6 +40,14 @@ YARM is a `no_std` microkernel root crate plus a workspace of extracted server c
 
 `src/services/` has been removed; services are workspace-owned.
 
+## `/init` identity (current boot flow)
+
+- Current QEMU artifact scripts stage **`yarm-control-plane-servers` / `init_server`** as `/init`.
+- The kernel loads `/init` from initramfs as the first user task.
+- `initramfs_srv` is a separate filesystem server binary and is **not** currently staged as `/init`.
+- Therefore `INITRAMFS_*` markers in initramfs service code will not appear at boot until `initramfs_srv` is actually launched as a task.
+- `yarm_user_rt::user_log!` is currently a no-op formatting macro and is not serial-visible by itself.
+
 ## Boundary model (current)
 
 - **Kernel = mechanism**

@@ -73,6 +73,18 @@ common_stage_server_init_elf() {
     echo "[warn] readelf not found; skipping PT_LOAD RWE check for $SERVER_ELF"
   fi
 
+  echo "[info] /init staging source: ${SERVER_ELF}"
+  echo "[info] /init identity: ${SERVER_BIN:-<unknown-bin>} (expected first user task binary)"
+  if command -v readelf >/dev/null 2>&1; then
+    local elf_type
+    elf_type="$(readelf -h "$SERVER_ELF" 2>/dev/null | awk -F: '/Type:/{gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+    [[ -n "${elf_type:-}" ]] && echo "[info] /init ELF header type: ${elf_type}"
+  fi
+  if command -v strings >/dev/null 2>&1; then
+    if strings "$SERVER_ELF" | rg -q "run_init_server|init_server"; then
+      echo "[info] /init identity hint: control-plane init_server symbols detected"
+    fi
+  fi
   echo "[ok] staged server ELF as /init and /sbin/init_server"
 }
 

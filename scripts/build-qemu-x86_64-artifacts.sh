@@ -97,6 +97,8 @@ explain_nonbootable_kernel_source() {
 
 mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
+echo "[info] /init build identity package=${SERVER_PACKAGE} bin=${SERVER_BIN} target=${SERVER_RUST_TARGET} profile=${SERVER_BUILD_PROFILE}"
+echo "[info] /init build identity server_elf=${SERVER_ELF}"
 
 if ! rustup toolchain list | rg -q "^${TOOLCHAIN}"; then
   echo "[warn] toolchain '${TOOLCHAIN}' is not installed"

@@ -26,6 +26,8 @@ BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_
 
 mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
+echo "[info] /init build identity package=${SERVER_PACKAGE} bin=${SERVER_BIN} target=${SERVER_RUST_TARGET} profile=${SERVER_BUILD_PROFILE}"
+echo "[info] /init build identity server_elf=${SERVER_ELF}"
 
 CARGO_Z_ARGS=()
 if cargo -V 2>/dev/null | rg -q "nightly"; then
