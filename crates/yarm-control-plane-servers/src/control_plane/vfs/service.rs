@@ -54,16 +54,19 @@ pub fn run_request_loop(
     let reply = run_typed_request_loop(
         vfs,
         [openat_inline_message(0, path, 0, 0).map_err(|_| VfsError::Malformed)?],
-    )?[0];
+    )?[0]
+        .message;
     let fd = decode_fd_reply(reply)?;
     let dup_fd = decode_fd_reply(
-        run_typed_request_loop(vfs, [dup_message(fd).map_err(|_| VfsError::Malformed)?])?[0],
+        run_typed_request_loop(vfs, [dup_message(fd).map_err(|_| VfsError::Malformed)?])?[0]
+            .message,
     )?;
     let epoll_fd = decode_fd_reply(
         run_typed_request_loop(
             vfs,
             [epoll_create1_message(0).map_err(|_| VfsError::Malformed)?],
-        )?[0],
+        )?[0]
+            .message,
     )?;
     let _ = run_typed_request_loop(
         vfs,
