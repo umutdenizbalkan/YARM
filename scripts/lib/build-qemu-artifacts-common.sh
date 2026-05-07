@@ -88,6 +88,41 @@ common_stage_server_init_elf() {
   echo "[ok] staged server ELF as /init and /sbin/init_server"
 }
 
+common_stage_aux_server_elf() {
+  local aux_elf="$1"
+  local aux_label="$2"
+  local aux_dest_rel="$3"
+  local aux_dest_abs="$ROOTFS_DIR/$aux_dest_rel"
+
+  if [[ ! -f "$aux_elf" ]]; then
+    echo "[warn] ${aux_label} ELF missing: $aux_elf"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$aux_dest_abs")"
+  cp "$aux_elf" "$aux_dest_abs"
+  chmod +x "$aux_dest_abs"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local aux_type
+    aux_type="$(readelf -h "$aux_elf" 2>/dev/null | awk -F: '/Type:/{gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+    [[ -n "${aux_type:-}" ]] && echo "[info] ${aux_label} ELF header type: ${aux_type}"
+  else
+    echo "[warn] readelf not found; skipping ${aux_label} identity hint"
+  fi
+
+  if command -v strings >/dev/null 2>&1; then
+    if strings "$aux_elf" | rg -q "run_initramfs|initramfs_srv"; then
+      echo "[info] ${aux_label} identity hint: initramfs symbols detected"
+    fi
+  else
+    echo "[warn] strings not found; skipping ${aux_label} symbol hint"
+  fi
+
+  echo "[ok] staged ${aux_label} ELF as /${aux_dest_rel}"
+}
+
 common_create_initramfs_newc() {
   if ! command -v cpio >/dev/null 2>&1; then
     echo "[warn] cpio not found; creating placeholder initramfs archive file"

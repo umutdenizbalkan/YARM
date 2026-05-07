@@ -12,11 +12,14 @@ KERNEL_RUST_TARGET_DIR=${KERNEL_RUST_TARGET_DIR:-aarch64-yarm-none}
 SERVER_RUST_TARGET=${SERVER_RUST_TARGET:-targets/aarch64-yarm-user-none.json}
 SERVER_RUST_TARGET_DIR=${SERVER_RUST_TARGET_DIR:-aarch64-yarm-user-none}
 SERVER_BIN=${SERVER_BIN:-init_server}
+INITRAMFS_SERVER_BIN=${INITRAMFS_SERVER_BIN:-initramfs_srv}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
+INITRAMFS_SERVER_PACKAGE=${INITRAMFS_SERVER_PACKAGE:-yarm-fs-servers}
 KERNEL_PACKAGE=${KERNEL_PACKAGE:-yarm}
 SERVER_BUILD_PROFILE=${SERVER_BUILD_PROFILE:-aarch64-none}
 SERVER_ELF=${SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${SERVER_BIN}}
+INITRAMFS_SERVER_ELF=${INITRAMFS_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${INITRAMFS_SERVER_BIN}}
 KERNEL_ELF=${KERNEL_ELF:-target/${KERNEL_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-aarch64.elf}
@@ -30,6 +33,8 @@ mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
 echo "[info] /init build identity package=${SERVER_PACKAGE} bin=${SERVER_BIN} target=${SERVER_RUST_TARGET} profile=${SERVER_BUILD_PROFILE}"
 echo "[info] /init build identity server_elf=${SERVER_ELF}"
+echo "[info] initramfs server build identity package=${INITRAMFS_SERVER_PACKAGE} bin=${INITRAMFS_SERVER_BIN} target=${SERVER_RUST_TARGET} profile=${SERVER_BUILD_PROFILE}"
+echo "[info] initramfs server build identity server_elf=${INITRAMFS_SERVER_ELF}"
 
 CARGO_Z_ARGS=()
 USE_NIGHTLY=0
@@ -53,13 +58,17 @@ KERNEL_BUILD_STATUS=$?
 echo "[info] building ${SERVER_PACKAGE}/${SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
 cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
 SERVER_BUILD_STATUS=$?
+echo "[info] building ${INITRAMFS_SERVER_PACKAGE}/${INITRAMFS_SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
+cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$INITRAMFS_SERVER_PACKAGE" --bin "$INITRAMFS_SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
+INITRAMFS_SERVER_BUILD_STATUS=$?
 set -e
 
-if [[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 ]]; then
+if [[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 || "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 ]]; then
   common_exit_if_strict_mode
 fi
 
 common_stage_server_init_elf || true
+common_stage_aux_server_elf "$INITRAMFS_SERVER_ELF" "initramfs server" "sbin/initramfs_srv" || true
 common_create_initramfs_newc
 
 [[ -f "$KERNEL_ELF" ]] && cp "$KERNEL_ELF" "$KERNEL_IMAGE"
