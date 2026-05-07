@@ -86,3 +86,10 @@ Prefer regular inline/copyout reply when response is small and latency/complexit
 - VFS pass 2 provisions real `MemoryObject` producer caps for staged shared-read replies when explicitly enabled.
 - VFS pass 2 currently retains local producer `mem_cap` intentionally to avoid pre-handoff lifetime invalidation.
 - Consumer shared-reply decode/map migration is deferred to pass 3.
+
+## Pass 2c runtime wrapper status
+
+- Added runtime-only `ServiceResponse { message, cleanup }` scaffolding in FS service layers so deferred producer cleanup tokens can be carried to a future real IPC send/reply boundary.
+- Cleanup execution is intentionally **not** performed by the current scripted/in-memory request loops because those loops do not represent successful kernel IPC handoff.
+- VFS shared-read feature gate remains disabled; no shared path enablement is introduced in pass 2c.
+- Real FS IPC recv/reply loop integration (and post-send cleanup execution) remains pending for a later pass.

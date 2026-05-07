@@ -4,6 +4,7 @@
 use super::vfs_ipc::{
     InMemoryBackend, MountNamespacePolicy, MountRecord, VfsBackend, VfsError, VfsRequest,
 };
+use super::service::{ServiceCleanup, ServiceResponse};
 use yarm_ipc_abi::vfs_abi::{
     OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE,
     VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL,
@@ -15,7 +16,7 @@ use yarm_ipc_abi::ipc_v2::{
     IpcV2SharedReplyMeta, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY, IPC_V2_SHARED_REPLY_META_VERSION,
     encode_shared_reply_meta,
 };
-use yarm_user_rt::syscall::{AnonMapResult, vm_anon_map, vm_unmap};
+use yarm_user_rt::syscall::{AnonMapResult, vm_anon_map};
 
 const MAX_MOUNTS: usize = 8;
 const VFS_READ_SHARED_REPLY_ENABLED: bool = false;
@@ -140,7 +141,7 @@ impl<B: VfsBackend> VfsService<B> {
         read_len: u64,
         inline_len: usize,
         inline_bytes: &[u8],
-    ) -> Result<Option<Message>, VfsError> {
+    ) -> Result<Option<ServiceResponse>, VfsError> {
         Self::try_build_shared_read_reply_with_policy_and_allocator(
             VFS_READ_SHARED_REPLY_ENABLED,
             read_len,
@@ -156,27 +157,18 @@ impl<B: VfsBackend> VfsService<B> {
                     )
                 }
             },
-            |map| {
-                // SAFETY: producer-local cleanup syscall wrappers.
-                unsafe {
-                    vm_unmap(map.base, map.len)?;
-                }
-                Ok(())
-            },
         )
     }
 
-    fn try_build_shared_read_reply_with_policy_and_allocator<F, C>(
+    fn try_build_shared_read_reply_with_policy_and_allocator<F>(
         enabled: bool,
         read_len: u64,
         inline_len: usize,
         inline_bytes: &[u8],
         mut alloc: F,
-        mut cleanup: C,
-    ) -> Result<Option<Message>, VfsError>
+    ) -> Result<Option<ServiceResponse>, VfsError>
     where
         F: FnMut() -> Result<AnonMapResult, yarm_user_rt::syscall::SyscallError>,
-        C: FnMut(&AnonMapResult) -> Result<(), yarm_user_rt::syscall::SyscallError>,
     {
         if !enabled {
             return Ok(None);
@@ -211,13 +203,14 @@ impl<B: VfsBackend> VfsService<B> {
             &payload,
         )
         .map_err(|_| VfsError::Malformed)?;
-        // NOTE(stage2): intentionally retain local mem_cap here. Releasing
-        // before IPC handoff/materialization can invalidate transfer lifetime.
-        // Deferred until post-handoff policy or kernel-side transfer pinning.
-        if cleanup(&map).is_err() {
-            return Ok(None);
-        }
-        Ok(Some(msg))
+        // NOTE(stage2): cleanup must run only after a successful IPC reply/send
+        // syscall at the transport boundary (not in this pre-send constructor).
+        let cleanup = ServiceCleanup::VmAnonMapProducer {
+            base: map.base,
+            len: map.len,
+            mem_cap: map.mem_cap,
+        };
+        Ok(Some(ServiceResponse::with_cleanup(msg, cleanup)))
     }
 
     pub const fn with_backend(backend: B) -> Self {
@@ -445,7 +438,7 @@ impl<B: VfsBackend> VfsService<B> {
         }
     }
 
-    pub fn handle_request(&mut self, request: Message) -> Result<Message, VfsError> {
+    pub fn handle_request(&mut self, request: Message) -> Result<ServiceResponse, VfsError> {
         let parsed = Self::parse_request(request)?;
         let reply = match parsed {
             VfsRequest::OpenAt { path_inline, .. } => {
@@ -474,8 +467,9 @@ impl<B: VfsBackend> VfsService<B> {
                     payload[..8].copy_from_slice(&read_len.to_le_bytes());
                     payload[8..16].copy_from_slice(&0u64.to_le_bytes());
                     payload[16..16 + inline_len].copy_from_slice(&inline[..inline_len]);
-                    return Message::with_header(0, VFS_OP_READ, 0, None, &payload[..16 + inline_len])
-                        .map_err(|_| VfsError::Malformed);
+                    let msg = Message::with_header(0, VFS_OP_READ, 0, None, &payload[..16 + inline_len])
+                        .map_err(|_| VfsError::Malformed)?;
+                    return Ok(ServiceResponse::message(msg));
                 }
             }
             VfsRequest::Write { fd, len, .. } => VfsReply::WriteLen(self.backend.write(fd, len)?),
@@ -527,7 +521,7 @@ impl<B: VfsBackend> VfsService<B> {
             } => VfsReply::SendfileLen(self.backend.sendfile(out_fd, in_fd, offset_ptr, count)?),
         };
         self.op_sequence = self.op_sequence.saturating_add(1);
-        reply.to_message()
+        Ok(ServiceResponse::message(reply.to_message()?))
     }
 }
 
@@ -562,10 +556,11 @@ mod tests {
         )
         .expect("request");
         let reply = svc.handle_request(req).expect("reply");
-        assert_eq!(reply.opcode, VFS_OP_READ);
-        assert_eq!(reply.transferred_cap(), None);
-        assert_eq!(reply.as_slice().len(), 21);
-        assert_eq!(&reply.as_slice()[16..21], b"hello");
+        assert!(reply.cleanup.is_none());
+        assert_eq!(reply.message.opcode, VFS_OP_READ);
+        assert_eq!(reply.message.transferred_cap(), None);
+        assert_eq!(reply.message.as_slice().len(), 21);
+        assert_eq!(&reply.message.as_slice()[16..21], b"hello");
     }
 
     #[test]
@@ -584,7 +579,6 @@ mod tests {
             5,
             b"hello",
             || Err(yarm_user_rt::syscall::SyscallError::InvalidArgs),
-            |_| Ok(()),
         )
         .expect("fallback");
         assert!(out.is_none());
@@ -595,7 +589,6 @@ mod tests {
         let data = [0xABu8; 256];
         let mut mapped = [0u8; 4096];
         let base = mapped.as_mut_ptr() as usize;
-        let mut cleaned = false;
         let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply_with_policy_and_allocator(
             true,
             256,
@@ -608,20 +601,23 @@ mod tests {
                     mem_cap: 77,
                 })
             },
-            |_| {
-                cleaned = true;
-                Ok(())
-            },
         )
         .expect("shared")
         .expect("some");
-        assert_eq!(out.opcode, VFS_OP_READ);
-        assert_eq!(out.transferred_cap().map(|cap| cap.0), Some(77));
-        assert!(cleaned, "successful shared path must cleanup local producer mapping");
+        assert_eq!(out.message.opcode, VFS_OP_READ);
+        assert_eq!(out.message.transferred_cap().map(|cap| cap.0), Some(77));
+        assert_eq!(
+            out.cleanup,
+            Some(ServiceCleanup::VmAnonMapProducer {
+                base,
+                len: 4096,
+                mem_cap: 77,
+            })
+        );
     }
 
     #[test]
-    fn read_shared_reply_helper_cleanup_failure_falls_back() {
+    fn read_shared_reply_helper_returns_cleanup_token_without_running_cleanup() {
         let data = [0xABu8; 256];
         let mut mapped = [0u8; 4096];
         let base = mapped.as_mut_ptr() as usize;
@@ -637,10 +633,17 @@ mod tests {
                     mem_cap: 77,
                 })
             },
-            |_| Err(yarm_user_rt::syscall::SyscallError::InvalidArgs),
         )
-        .expect("fallback");
-        assert!(out.is_none(), "cleanup failure must fallback to inline path");
+        .expect("response")
+        .expect("some");
+        assert_eq!(
+            out.cleanup,
+            Some(ServiceCleanup::VmAnonMapProducer {
+                base,
+                len: 4096,
+                mem_cap: 77,
+            })
+        );
     }
 
 }

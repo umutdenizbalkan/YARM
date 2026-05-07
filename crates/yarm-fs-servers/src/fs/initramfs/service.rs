@@ -6,7 +6,7 @@ use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
     ReadWriteRequest, openat_inline_message, read_message, statx_inline_message, write_message,
 };
-use super::super::common::service::FsService;
+use super::super::common::service::{FsService, ServiceResponse};
 use yarm_srv_common::service_loop::run_typed_request_loop;
 use super::archive::{
     INITRAMFS_BOOT_MARKER_PATH, InitramfsBackend, InitramfsMetrics,
@@ -25,7 +25,8 @@ pub struct InitramfsLoopSummary {
     pub metrics: InitramfsMetrics,
 }
 
-fn decode_reply_u64(reply: Message) -> u64 {
+fn decode_reply_u64(reply: impl Into<Message>) -> u64 {
+    let reply = reply.into();
     VfsReply::from_opcode_payload_checked(reply.opcode, reply.as_slice())
         .expect("decode vfs reply")
         .as_u64()
@@ -50,7 +51,10 @@ pub fn run_request_batch<const N: usize>(
     service: &mut InitramfsService,
     requests: [Message; N],
 ) -> Result<[Message; N], VfsError> {
-    run_typed_request_loop(service, requests)
+    let responses: [ServiceResponse; N] = run_typed_request_loop(service, requests)?;
+    // NOTE: scripted/in-memory loop only. Do not run deferred cleanup here;
+    // cleanup must execute only after a successful IPC reply/send syscall.
+    Ok(responses.map(|response| response.message))
 }
 
 pub fn run_request_loop(service: &mut InitramfsService) -> Result<InitramfsLoopSummary, VfsError> {
