@@ -83,6 +83,8 @@ scripts/phase3-4-strict-runtime-gate.sh
 scripts/phase7-shared-ipc-gates.sh
 ```
 
+For a broader pre-push sweep, run `scripts/phase5-boundary-gates.sh` first, then the phase-specific gate scripts relevant to the crates you changed.
+
 ## Status
 
 YARM is active development software with extracted workspace-owned service domains and crate-graph boundary enforcement.
