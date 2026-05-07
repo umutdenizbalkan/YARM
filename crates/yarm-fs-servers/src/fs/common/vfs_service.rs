@@ -15,9 +15,14 @@ use yarm_ipc_abi::ipc_v2::{
     IpcV2SharedReplyMeta, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY, IPC_V2_SHARED_REPLY_META_VERSION,
     encode_shared_reply_meta,
 };
+use yarm_user_rt::syscall::{AnonMapResult, vm_anon_map};
 
 const MAX_MOUNTS: usize = 8;
 const VFS_READ_SHARED_REPLY_ENABLED: bool = false;
+const VFS_READ_SHARED_REPLY_THRESHOLD: u64 = 64;
+const VFS_SHARED_STAGE_BASE: usize = 0x4000_0000;
+const VM_MAP_PROT_READ: u64 = 0x1;
+const VM_MAP_PROT_WRITE: u64 = 0x2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsReply {
@@ -134,40 +139,66 @@ impl<B: VfsBackend> VfsService<B> {
     fn try_build_shared_read_reply(
         read_len: u64,
         inline_len: usize,
+        inline_bytes: &[u8],
     ) -> Result<Option<Message>, VfsError> {
-        Self::try_build_shared_read_reply_with_policy(
+        Self::try_build_shared_read_reply_with_policy_and_allocator(
             VFS_READ_SHARED_REPLY_ENABLED,
             read_len,
             inline_len,
-            None,
+            inline_bytes,
+            || {
+                // SAFETY: VM_ANON_MAP is explicit userspace syscall surface.
+                unsafe {
+                    vm_anon_map(
+                        VFS_SHARED_STAGE_BASE,
+                        read_len as usize,
+                        VM_MAP_PROT_READ | VM_MAP_PROT_WRITE,
+                    )
+                }
+            },
         )
     }
 
-    fn try_build_shared_read_reply_with_policy(
+    fn try_build_shared_read_reply_with_policy_and_allocator<F>(
         enabled: bool,
         read_len: u64,
         inline_len: usize,
-        transfer_cap: Option<u64>,
-    ) -> Result<Option<Message>, VfsError> {
+        inline_bytes: &[u8],
+        mut alloc: F,
+    ) -> Result<Option<Message>, VfsError>
+    where
+        F: FnMut() -> Result<AnonMapResult, yarm_user_rt::syscall::SyscallError>,
+    {
         if !enabled {
             return Ok(None);
         }
-        let transfer_cap = transfer_cap.ok_or(VfsError::Unsupported)?;
-        // TODO(stage2): plumb real MemoryObject producer support into this service layer.
-        // PASS 1 is producer scaffolding only; do not fake transfer-cap provisioning.
+        if read_len <= VFS_READ_SHARED_REPLY_THRESHOLD || inline_len == 0 || inline_len as u64 != read_len {
+            return Ok(None);
+        }
+        let map = match alloc() {
+            Ok(map) => map,
+            Err(_) => return Ok(None),
+        };
+        let write_len = core::cmp::min(inline_len, map.len);
+        if write_len == 0 {
+            return Ok(None);
+        }
+        // SAFETY: VM_ANON_MAP returned a mapped writable userspace region.
+        let dst = unsafe { core::slice::from_raw_parts_mut(map.base as *mut u8, write_len) };
+        dst.copy_from_slice(&inline_bytes[..write_len]);
         let meta = IpcV2SharedReplyMeta {
             version: IPC_V2_SHARED_REPLY_META_VERSION,
             flags: IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
             reserved: 0,
             offset: 0,
-            len: read_len.max(inline_len as u64),
+            len: write_len as u64,
         };
         let payload = encode_shared_reply_meta(meta).map_err(|_| VfsError::Malformed)?;
         let msg = Message::with_header(
             0,
             VFS_OP_READ,
             Message::FLAG_CAP_TRANSFER,
-            Some(transfer_cap),
+            Some(map.mem_cap),
             &payload,
         )
         .map_err(|_| VfsError::Malformed)?;
@@ -416,7 +447,9 @@ impl<B: VfsBackend> VfsService<B> {
             VfsRequest::Read { fd, len, .. } => {
                 let mut inline = [0u8; Message::MAX_PAYLOAD - 16];
                 let (read_len, inline_len) = self.backend.read_into(fd, len, &mut inline)?;
-                if let Some(shared_reply) = Self::try_build_shared_read_reply(read_len, inline_len)? {
+                if let Some(shared_reply) =
+                    Self::try_build_shared_read_reply(read_len, inline_len, &inline[..inline_len])?
+                {
                     return Ok(shared_reply);
                 }
                 if inline_len == 0 {
@@ -523,20 +556,45 @@ mod tests {
     #[test]
     fn read_shared_reply_branch_not_taken_when_disabled() {
         assert!(!VFS_READ_SHARED_REPLY_ENABLED, "pass1 default must stay disabled");
-        let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply(5, 5)
+        let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply(5, 5, b"hello")
             .expect("decision");
         assert!(out.is_none(), "shared-reply branch must stay off by default");
     }
 
     #[test]
-    fn read_shared_reply_helper_rejects_missing_transfer_cap_when_forced_enabled() {
-        let err = VfsService::<InlineReadBackend>::try_build_shared_read_reply_with_policy(
+    fn read_shared_reply_helper_falls_back_when_allocator_fails() {
+        let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply_with_policy_and_allocator(
             true,
             4096,
-            0,
-            None,
+            5,
+            b"hello",
+            || Err(yarm_user_rt::syscall::SyscallError::InvalidArgs),
         )
-        .expect_err("missing memcap must reject");
-        assert_eq!(err, VfsError::Unsupported);
+        .expect("fallback");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn read_shared_reply_helper_emits_shared_meta_when_forced_enabled() {
+        let data = [0xABu8; 256];
+        let mut mapped = [0u8; 4096];
+        let base = mapped.as_mut_ptr() as usize;
+        let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply_with_policy_and_allocator(
+            true,
+            256,
+            data.len(),
+            &data,
+            || {
+                Ok(AnonMapResult {
+                    base,
+                    len: 4096,
+                    mem_cap: 77,
+                })
+            },
+        )
+        .expect("shared")
+        .expect("some");
+        assert_eq!(out.opcode, VFS_OP_READ);
+        assert_eq!(out.transferred_cap().map(|cap| cap.0), Some(77));
     }
 }
