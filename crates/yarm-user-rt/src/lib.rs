@@ -20,6 +20,12 @@ pub mod ipc {
     pub use yarm_kernel::ipc::{IpcError, Message, SharedMemoryRegion, ThreadId, TransferCapId};
 }
 
+#[inline]
+pub fn serial_marker_line(message: &str) {
+    crate::arch::serial_write_bytes(message.as_bytes());
+    crate::arch::serial_write_bytes(b"\n");
+}
+
 pub mod capability {
     pub use yarm_kernel::capability::{CapId, CapRights};
 }

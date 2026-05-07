@@ -104,7 +104,9 @@ pub fn run() {
                     if send_cap != 0 {
                         let mut tx = SyscallIpcTransport;
                         let ready = InitramfsReadyV1 { version: InitramfsReadyV1::VERSION, status: InitramfsReadyV1::STATUS_READY, magic: INITRAMFS_READY_V1_MAGIC };
-                        let _ = tx.send_v2(send_cap, &ready.encode(), None);
+                        if tx.send_v2(send_cap, &ready.encode(), None).is_ok() {
+                            yarm_user_rt::serial_marker_line("INITRAMFS_READY_SEND");
+                        }
                     }
                 }
             }

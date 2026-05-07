@@ -33,3 +33,18 @@ pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
         error,
     }
 }
+
+#[inline]
+pub(crate) fn serial_write_bytes(bytes: &[u8]) {
+    for &b in bytes {
+        // SAFETY: fixed COM1 I/O port write on x86_64 debug path.
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x3f8u16,
+                in("al") b,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+}
