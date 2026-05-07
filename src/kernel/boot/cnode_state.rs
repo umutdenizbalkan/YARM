@@ -215,7 +215,7 @@ impl KernelState {
             if !source_matches && !receiver_matches {
                 continue;
             }
-            if envelope.shared_region.is_some() {
+            if matches!(envelope.source_object, CapObject::MemoryObject { .. }) {
                 self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
             }
             self.with_ipc_state_mut(|ipc| ipc.transfer_envelopes[idx] = None);

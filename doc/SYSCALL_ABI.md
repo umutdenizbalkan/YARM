@@ -3,7 +3,7 @@
 # YARM Syscall ABI v10 (Frozen Contract)
 
 - ABI Version: `10`
-- Syscall count: `15`
+- Syscall count: `21`
 
 ## Syscall numbers
 
@@ -20,8 +20,10 @@
 - `10`: `FutexWake` (`arg0=addr`, `arg1=max_wake`)
 - `11`: `SpawnThread` (`arg0=tls_base`, `arg1=user_stack_top`, `arg2=user_entry`)
 - `12`: `Fork` (fork current process with CoW; return child tid in parent)
-- `13`: `VmAnonMap` (reserved; currently returns `InvalidArgs`)
+- `13`: `VmAnonMap` (staged anonymous MemoryObject allocation+mapping for service buffers)
 - `14`: `VmBrk` (staged: query + grow supported, shrink unsupported)
+- `19`: `VmUnmap` (staged producer-local anonymous mapping cleanup for current task/ASID)
+- `20`: `CapRelease` (staged producer-local capability revoke/drop in current task cnode)
 
 ## Syscalls `9..14` status
 
@@ -29,7 +31,7 @@
 - `10` `FutexWake`: exposed and wired.
 - `11` `SpawnThread`: exposed and wired.
 - `12` `Fork`: exposed and wired.
-- `13` `VmAnonMap`: reserved syscall number; current implementation is a stub returning `InvalidArgs`.
+- `13` `VmAnonMap`: staged syscall; caller-specified non-zero page-aligned VA, READ|WRITE anonymous map, returns mapped base/rounded length/MemoryObject cap.
 - `14` `VmBrk`: staged syscall; query and grow are supported, shrink is currently unsupported.
 
 ## Futex safety contract
@@ -122,6 +124,49 @@
 - `args[3]`: protection flags bitmask (`READ=0x1`, `WRITE=0x2`, `EXEC=0x4`)
 - `args[4]`: reserved (must be `0`)
 - `args[5]`: reserved (must be `0`)
+
+### `VmAnonMap` argument layout
+
+- `args[0]`: target user virtual address (must be non-zero and page-aligned)
+- `args[1]`: requested mapping length in bytes (`>0`, rounded up to page size)
+- `args[2]`: protection flags bitmask (`READ=0x1`, `WRITE=0x2`, `EXEC=0x4`)
+  - staged policy: requires `READ|WRITE`; `EXEC` is rejected
+- `args[3]`: reserved (must be `0`)
+- `args[4]`: reserved (must be `0`)
+- `args[5]`: reserved (must be `0`)
+
+`VmAnonMap` semantics (staged):
+
+- allocates an anonymous `MemoryObject` sized to the rounded mapping length;
+- rejects overlap: every page in `[base, base+rounded_len)` must be currently unmapped in the caller ASID;
+- maps it into the caller's current user ASID at the provided base;
+- returns mapping + transfer-cap tuple in return registers:
+  - `ret0 = mapped_base_va`
+  - `ret1 = mapped_len_rounded_to_page`
+  - `ret2 = memory_object_cap_id` (caller-local cap, suitable for IPC transfer).
+
+### `VmUnmap` argument layout
+
+- `args[0]`: target user virtual base address (non-zero, page-aligned)
+- `args[1]`: unmap length in bytes (`>0`, rounded up to page size)
+- `args[2..5]`: reserved (must be `0`)
+
+`VmUnmap` semantics (staged):
+
+- unmaps each page in `[base, base+rounded_len)` from current task's current ASID;
+- returns `InvalidArgs` if any page in the requested range is already unmapped;
+- producer-local lifecycle primitive for cleanup after staged `VmAnonMap` usage.
+
+### `CapRelease` argument layout
+
+- `args[0]`: capability id in current task cnode
+- `args[1..5]`: reserved (must be `0`)
+
+`CapRelease` semantics (staged):
+
+- revokes/drops the specified cap in the current task cnode;
+- invalid/stale/non-present cap returns `InvalidCapability`;
+- producer-local lifecycle primitive; distinct from receiver-side `TransferRelease`.
 
 ### `SpawnThread` argument layout and runtime contract
 
@@ -242,6 +287,11 @@
   - a syscall ABI v2 with expanded argument/register mapping, or
   - an alternate payload path that preserves existing syscall argument ABI compatibility.
 
+
+## Shared-reply adoption checklist
+
+- See `doc/IPC_V2_SHARED_REPLY_ADOPTION.md` for service migration/adoption guidance and rollout checks.
+
 ## IPC ABI v2 status and semantics
 
 - v1 remains unchanged: `IPC_REGISTER_WORDS = 2` in syscall argument lanes.
@@ -255,8 +305,38 @@
   - `arg0`: user pointer to `IpcRegisterBlockV2`
   - `arg1`: block size (`IPC_ABI_V2_BLOCK_SIZE`)
   - `arg2..arg5`: reserved for ABI compatibility
+- Message opcode carriage contract (no block layout changes):
+  - `IPC_SEND_V2`: request opcode is carried in `aux0` (`aux1` must be `0`).
+  - `IPC_REPLY_V2`: reply opcode is carried in `aux0` (`aux1` must be `0`).
+  - `IPC_CALL_V2`: request opcode is carried in `aux1`; `aux0` remains reply-receive endpoint cap.
+  - `IPC_RECV_V2` success return: `ret_status` carries received `Message.opcode`.
+  - `IPC_CALL_V2` success return: `ret_status` carries reply `Message.opcode`.
 
 ### `IPC_CALL_V2` behavior
+
+### IPC v2 stage-1 shared-reply metadata convention (scaffolding)
+
+- This is an ABI **convention** layer on top of existing `IPC_REPLY_V2` capability-transfer behavior.
+- Server path:
+  - reply using `IPC_REPLY_V2`;
+  - set `IPC_V2_FLAG_TRANSFER_CAP`;
+  - transfer-cap should be a MemoryObject-cap-like object suitable for explicit later mapping by the caller;
+  - reply payload should carry `IpcV2SharedReplyMeta` bytes.
+- Caller path:
+  - receives `ret_transfer_cap` as the receiver-local transferred capability id;
+  - decodes `IpcV2SharedReplyMeta` from reply payload;
+  - maps transferred capability explicitly via VM/map syscalls later.
+- Stage-1 intentionally has **no automatic mapping** in IPC syscall handling.
+- Safety caveats:
+  - mutability depends on transferred-cap rights and aliasing policy (`READ_ONLY` vs writable intent);
+  - revocation/lifetime races remain possible and must be handled by caller map/use failure paths.
+- Current kernel-policy baseline:
+  - `REPLY_V2` enforces MemoryObject-only transfer-cap kind **when** reply payload decodes as `IpcV2SharedReplyMeta`;
+  - `REPLY_V2` enforces `IpcV2SharedReplyMeta.offset + len <= MemoryObject.len` for valid shared-reply metadata payloads;
+  - non-shared payloads preserve generic transfer-cap behavior (existing capability-existence validation);
+  - services adopting shared replies should transfer MemoryObject-like caps only by policy;
+  - map-time checks are still required for liveness/rights/revocation at use time;
+  - read-only shared-reply behavior requires rights attenuation at cap creation/delegation time.
 
 - `IPC_CALL_V2` is a combined operation: **send request + wait for reply** in one syscall.
 - Userspace must pass reply receive endpoint cap in `IpcRegisterBlockV2.aux0`.

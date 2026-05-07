@@ -497,7 +497,7 @@ mod tests {
             let bytes = reply.as_slice();
             payload[..bytes.len()].copy_from_slice(bytes);
             Ok(yarm_user_rt::syscall::IpcV2Response {
-                status: reply.header,
+                status: reply.opcode as u64,
                 len: bytes.len(),
                 transfer_cap: None,
                 payload,

@@ -4,6 +4,7 @@
 use super::vfs_ipc::{
     InMemoryBackend, MountNamespacePolicy, MountRecord, VfsBackend, VfsError, VfsRequest,
 };
+use super::service::{ServiceCleanup, ServiceResponse};
 use yarm_ipc_abi::vfs_abi::{
     OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE,
     VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL,
@@ -11,8 +12,18 @@ use yarm_ipc_abi::vfs_abi::{
     VFS_OP_WRITE, VfsV1Args,
 };
 use yarm_user_rt::ipc::Message;
+use yarm_ipc_abi::ipc_v2::{
+    IpcV2SharedReplyMeta, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY, IPC_V2_SHARED_REPLY_META_VERSION,
+    encode_shared_reply_meta,
+};
+use yarm_user_rt::syscall::{AnonMapResult, vm_anon_map};
 
 const MAX_MOUNTS: usize = 8;
+const VFS_READ_SHARED_REPLY_ENABLED: bool = false;
+const VFS_READ_SHARED_REPLY_THRESHOLD: u64 = 64;
+const VFS_SHARED_STAGE_BASE: usize = 0x4000_0000;
+const VM_MAP_PROT_READ: u64 = 0x1;
+const VM_MAP_PROT_WRITE: u64 = 0x2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsReply {
@@ -126,6 +137,82 @@ impl VfsService<InMemoryBackend> {
 }
 
 impl<B: VfsBackend> VfsService<B> {
+    fn try_build_shared_read_reply(
+        read_len: u64,
+        inline_len: usize,
+        inline_bytes: &[u8],
+    ) -> Result<Option<ServiceResponse>, VfsError> {
+        Self::try_build_shared_read_reply_with_policy_and_allocator(
+            VFS_READ_SHARED_REPLY_ENABLED,
+            read_len,
+            inline_len,
+            inline_bytes,
+            || {
+                // SAFETY: VM_ANON_MAP is explicit userspace syscall surface.
+                unsafe {
+                    vm_anon_map(
+                        VFS_SHARED_STAGE_BASE,
+                        read_len as usize,
+                        VM_MAP_PROT_READ | VM_MAP_PROT_WRITE,
+                    )
+                }
+            },
+        )
+    }
+
+    fn try_build_shared_read_reply_with_policy_and_allocator<F>(
+        enabled: bool,
+        read_len: u64,
+        inline_len: usize,
+        inline_bytes: &[u8],
+        mut alloc: F,
+    ) -> Result<Option<ServiceResponse>, VfsError>
+    where
+        F: FnMut() -> Result<AnonMapResult, yarm_user_rt::syscall::SyscallError>,
+    {
+        if !enabled {
+            return Ok(None);
+        }
+        if read_len <= VFS_READ_SHARED_REPLY_THRESHOLD || inline_len == 0 || inline_len as u64 != read_len {
+            return Ok(None);
+        }
+        let map = match alloc() {
+            Ok(map) => map,
+            Err(_) => return Ok(None),
+        };
+        let write_len = core::cmp::min(inline_len, map.len);
+        if write_len == 0 {
+            return Ok(None);
+        }
+        // SAFETY: VM_ANON_MAP returned a mapped writable userspace region.
+        let dst = unsafe { core::slice::from_raw_parts_mut(map.base as *mut u8, write_len) };
+        dst.copy_from_slice(&inline_bytes[..write_len]);
+        let meta = IpcV2SharedReplyMeta {
+            version: IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0,
+            len: write_len as u64,
+        };
+        let payload = encode_shared_reply_meta(meta).map_err(|_| VfsError::Malformed)?;
+        let msg = Message::with_header(
+            0,
+            VFS_OP_READ,
+            Message::FLAG_CAP_TRANSFER,
+            Some(map.mem_cap),
+            &payload,
+        )
+        .map_err(|_| VfsError::Malformed)?;
+        // NOTE(stage2): cleanup must run only after a successful IPC reply/send
+        // syscall at the transport boundary (not in this pre-send constructor).
+        let cleanup = ServiceCleanup::VmAnonMapProducer {
+            base: map.base,
+            len: map.len,
+            mem_cap: map.mem_cap,
+        };
+        Ok(Some(ServiceResponse::with_cleanup(msg, cleanup)))
+    }
+
     pub const fn with_backend(backend: B) -> Self {
         Self {
             backend,
@@ -351,7 +438,7 @@ impl<B: VfsBackend> VfsService<B> {
         }
     }
 
-    pub fn handle_request(&mut self, request: Message) -> Result<Message, VfsError> {
+    pub fn handle_request(&mut self, request: Message) -> Result<ServiceResponse, VfsError> {
         let parsed = Self::parse_request(request)?;
         let reply = match parsed {
             VfsRequest::OpenAt { path_inline, .. } => {
@@ -368,6 +455,11 @@ impl<B: VfsBackend> VfsService<B> {
             VfsRequest::Read { fd, len, .. } => {
                 let mut inline = [0u8; Message::MAX_PAYLOAD - 16];
                 let (read_len, inline_len) = self.backend.read_into(fd, len, &mut inline)?;
+                if let Some(shared_reply) =
+                    Self::try_build_shared_read_reply(read_len, inline_len, &inline[..inline_len])?
+                {
+                    return Ok(shared_reply);
+                }
                 if inline_len == 0 {
                     VfsReply::ReadLen(read_len)
                 } else {
@@ -375,8 +467,9 @@ impl<B: VfsBackend> VfsService<B> {
                     payload[..8].copy_from_slice(&read_len.to_le_bytes());
                     payload[8..16].copy_from_slice(&0u64.to_le_bytes());
                     payload[16..16 + inline_len].copy_from_slice(&inline[..inline_len]);
-                    return Message::with_header(0, VFS_OP_READ, 0, None, &payload[..16 + inline_len])
-                        .map_err(|_| VfsError::Malformed);
+                    let msg = Message::with_header(0, VFS_OP_READ, 0, None, &payload[..16 + inline_len])
+                        .map_err(|_| VfsError::Malformed)?;
+                    return Ok(ServiceResponse::message(msg));
                 }
             }
             VfsRequest::Write { fd, len, .. } => VfsReply::WriteLen(self.backend.write(fd, len)?),
@@ -428,6 +521,129 @@ impl<B: VfsBackend> VfsService<B> {
             } => VfsReply::SendfileLen(self.backend.sendfile(out_fd, in_fd, offset_ptr, count)?),
         };
         self.op_sequence = self.op_sequence.saturating_add(1);
-        reply.to_message()
+        Ok(ServiceResponse::message(reply.to_message()?))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct InlineReadBackend;
+
+    impl VfsBackend for InlineReadBackend {
+        fn openat_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> { Ok(7) }
+        fn close(&mut self, _fd: u64) -> Result<u64, VfsError> { Ok(0) }
+        fn read(&mut self, _fd: u64, len: u64) -> Result<u64, VfsError> { Ok(len) }
+        fn read_into(&mut self, _fd: u64, _len: u64, out: &mut [u8]) -> Result<(u64, usize), VfsError> {
+            let bytes = b"hello";
+            out[..bytes.len()].copy_from_slice(bytes);
+            Ok((bytes.len() as u64, bytes.len()))
+        }
+        fn write(&mut self, _fd: u64, len: u64) -> Result<u64, VfsError> { Ok(len) }
+    }
+
+    #[test]
+    fn read_reply_default_path_stays_inline_extended() {
+        let mut svc = VfsService::with_backend(InlineReadBackend);
+        let req = Message::with_header(
+            0,
+            VFS_OP_READ,
+            0,
+            None,
+            &ReadWriteArgs::new(7, 0x1000, 64).encode(),
+        )
+        .expect("request");
+        let reply = svc.handle_request(req).expect("reply");
+        assert!(reply.cleanup.is_none());
+        assert_eq!(reply.message.opcode, VFS_OP_READ);
+        assert_eq!(reply.message.transferred_cap(), None);
+        assert_eq!(reply.message.as_slice().len(), 21);
+        assert_eq!(&reply.message.as_slice()[16..21], b"hello");
+    }
+
+    #[test]
+    fn read_shared_reply_branch_not_taken_when_disabled() {
+        assert!(!VFS_READ_SHARED_REPLY_ENABLED, "pass1 default must stay disabled");
+        let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply(5, 5, b"hello")
+            .expect("decision");
+        assert!(out.is_none(), "shared-reply branch must stay off by default");
+    }
+
+    #[test]
+    fn read_shared_reply_helper_falls_back_when_allocator_fails() {
+        let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply_with_policy_and_allocator(
+            true,
+            4096,
+            5,
+            b"hello",
+            || Err(yarm_user_rt::syscall::SyscallError::InvalidArgs),
+        )
+        .expect("fallback");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn read_shared_reply_helper_emits_shared_meta_when_forced_enabled() {
+        let data = [0xABu8; 256];
+        let mut mapped = [0u8; 4096];
+        let base = mapped.as_mut_ptr() as usize;
+        let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply_with_policy_and_allocator(
+            true,
+            256,
+            data.len(),
+            &data,
+            || {
+                Ok(AnonMapResult {
+                    base,
+                    len: 4096,
+                    mem_cap: 77,
+                })
+            },
+        )
+        .expect("shared")
+        .expect("some");
+        assert_eq!(out.message.opcode, VFS_OP_READ);
+        assert_eq!(out.message.transferred_cap().map(|cap| cap.0), Some(77));
+        assert_eq!(
+            out.cleanup,
+            Some(ServiceCleanup::VmAnonMapProducer {
+                base,
+                len: 4096,
+                mem_cap: 77,
+            })
+        );
+    }
+
+    #[test]
+    fn read_shared_reply_helper_returns_cleanup_token_without_running_cleanup() {
+        let data = [0xABu8; 256];
+        let mut mapped = [0u8; 4096];
+        let base = mapped.as_mut_ptr() as usize;
+        let out = VfsService::<InlineReadBackend>::try_build_shared_read_reply_with_policy_and_allocator(
+            true,
+            256,
+            data.len(),
+            &data,
+            || {
+                Ok(AnonMapResult {
+                    base,
+                    len: 4096,
+                    mem_cap: 77,
+                })
+            },
+        )
+        .expect("response")
+        .expect("some");
+        assert_eq!(
+            out.cleanup,
+            Some(ServiceCleanup::VmAnonMapProducer {
+                base,
+                len: 4096,
+                mem_cap: 77,
+            })
+        );
+    }
+
 }

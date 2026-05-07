@@ -39,8 +39,10 @@ pub const SYSCALL_IPC_SEND_V2_NR: usize = 15;
 pub const SYSCALL_IPC_RECV_V2_NR: usize = 16;
 pub const SYSCALL_IPC_CALL_V2_NR: usize = 17;
 pub const SYSCALL_IPC_REPLY_V2_NR: usize = 18;
-pub const SYSCALL_COUNT: usize = 19;
-const _: [(); SYSCALL_COUNT] = [(); 19];
+pub const SYSCALL_VM_UNMAP_NR: usize = 19;
+pub const SYSCALL_CAP_RELEASE_NR: usize = 20;
+pub const SYSCALL_COUNT: usize = 21;
+const _: [(); SYSCALL_COUNT] = [(); 21];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -84,10 +86,12 @@ pub enum Syscall {
     IpcRecvV2 = SYSCALL_IPC_RECV_V2_NR,
     IpcCallV2 = SYSCALL_IPC_CALL_V2_NR,
     IpcReplyV2 = SYSCALL_IPC_REPLY_V2_NR,
+    VmUnmap = SYSCALL_VM_UNMAP_NR,
+    CapRelease = SYSCALL_CAP_RELEASE_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 19;
+    pub const VARIANT_COUNT: usize = 21;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -113,6 +117,8 @@ impl Syscall {
             SYSCALL_IPC_RECV_V2_NR => Ok(Self::IpcRecvV2),
             SYSCALL_IPC_CALL_V2_NR => Ok(Self::IpcCallV2),
             SYSCALL_IPC_REPLY_V2_NR => Ok(Self::IpcReplyV2),
+            SYSCALL_VM_UNMAP_NR => Ok(Self::VmUnmap),
+            SYSCALL_CAP_RELEASE_NR => Ok(Self::CapRelease),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -238,6 +244,45 @@ fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), Syscall
         .is_none()
     {
         return Err(SyscallError::InvalidCapability);
+    }
+    Ok(())
+}
+
+fn validate_shared_reply_transfer_cap_kind(
+    kernel: &KernelState,
+    cap: CapId,
+) -> Result<u64, SyscallError> {
+    let transfer = kernel
+        .capability_service()
+        .resolve_current_task_capability(cap)
+        .ok_or(SyscallError::InvalidCapability)?;
+    let CapObject::MemoryObject { id } = transfer.object else {
+        return Err(SyscallError::WrongObject);
+    };
+    let mem = kernel
+        .with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|entry| entry.id == id)
+                .copied()
+        })
+        .ok_or(SyscallError::WrongObject)?;
+    let len = u64::try_from(mem.len).map_err(|_| SyscallError::WrongObject)?;
+    Ok(len)
+}
+
+fn validate_shared_reply_meta_bounds(
+    meta: yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta,
+    object_len: u64,
+) -> Result<(), SyscallError> {
+    let end = meta
+        .offset
+        .checked_add(meta.len)
+        .ok_or(SyscallError::WrongObject)?;
+    if end > object_len {
+        return Err(SyscallError::WrongObject);
     }
     Ok(())
 }
@@ -469,10 +514,66 @@ fn handle_fork(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), Sy
 }
 
 fn handle_vm_anon_map(
-    _kernel: &mut KernelState,
-    _frame: &mut TrapFrame,
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    Err(SyscallError::InvalidArgs)
+    let base = frame.arg(SYSCALL_ARG_CAP);
+    let len = frame.arg(SYSCALL_ARG_PTR);
+    let prot = frame.arg(SYSCALL_ARG_LEN);
+    let reserved = [
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+        frame.arg(SYSCALL_ARG_TRANSFER_CAP),
+    ];
+    if reserved.iter().any(|v| *v != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if base == 0 || len == 0 || !base.is_multiple_of(PAGE_SIZE) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    validate_user_region(base as u64, len as u64)?;
+    let map_len = round_up_page(len)?;
+    let end = base.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
+    let flags = vm_map_page_flags(prot)?;
+    if !flags.read || !flags.write || flags.execute {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let mut check_va = base;
+    while check_va < end {
+        if kernel
+            .is_user_page_mapped_in_current_asid(VirtAddr(check_va as u64))
+            .map_err(SyscallError::from)?
+        {
+            return Err(SyscallError::WrongObject);
+        }
+        check_va += PAGE_SIZE;
+    }
+
+    let (_mem_id, mem_cap) = kernel
+        .alloc_anonymous_memory_object_with_len(map_len)
+        .map_err(SyscallError::from)?;
+
+    let mut va = base;
+    while va < end {
+        if let Err(err) =
+            kernel.map_user_page_in_current_asid_with_caps(mem_cap, VirtAddr(va as u64), flags)
+        {
+            let mut rollback_va = base;
+            while rollback_va < va {
+                let _ = kernel.unmap_user_page_in_current_asid(VirtAddr(rollback_va as u64));
+                rollback_va += PAGE_SIZE;
+            }
+            let cnode = kernel.current_task_cnode().ok_or(SyscallError::Internal)?;
+            kernel
+                .revoke_capability_in_cnode(cnode, mem_cap)
+                .map_err(SyscallError::from)?;
+            return Err(SyscallError::from(err));
+        }
+        va += PAGE_SIZE;
+    }
+
+    frame.set_ok(base, map_len, mem_cap.0 as usize);
+    Ok(())
 }
 
 fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
@@ -514,6 +615,58 @@ fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<()
         .set_task_brk_bounds(tid, base, requested)
         .map_err(SyscallError::from)?;
     _frame.set_ok(requested, 0, 0);
+    Ok(())
+}
+
+fn handle_vm_unmap(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let base = frame.arg(SYSCALL_ARG_CAP);
+    let len = frame.arg(SYSCALL_ARG_PTR);
+    let reserved = [
+        frame.arg(SYSCALL_ARG_LEN),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+        frame.arg(SYSCALL_ARG_TRANSFER_CAP),
+    ];
+    if reserved.iter().any(|v| *v != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if base == 0 || len == 0 || !base.is_multiple_of(PAGE_SIZE) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    validate_user_region(base as u64, len as u64)?;
+    let map_len = round_up_page(len)?;
+    let end = base.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
+    let mut va = base;
+    while va < end {
+        let unmapped = kernel
+            .unmap_user_page_in_current_asid(VirtAddr(va as u64))
+            .map_err(SyscallError::from)?;
+        if unmapped.is_none() {
+            return Err(SyscallError::InvalidArgs);
+        }
+        va += PAGE_SIZE;
+    }
+    frame.set_ok(0, 0, 0);
+    Ok(())
+}
+
+fn handle_cap_release(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let reserved = [
+        frame.arg(SYSCALL_ARG_PTR),
+        frame.arg(SYSCALL_ARG_LEN),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+        frame.arg(SYSCALL_ARG_TRANSFER_CAP),
+    ];
+    if reserved.iter().any(|v| *v != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let cnode = kernel.current_task_cnode().ok_or(SyscallError::Internal)?;
+    kernel
+        .revoke_capability_in_cnode(cnode, cap)
+        .map_err(SyscallError::from)?;
+    frame.set_ok(0, 0, 0);
     Ok(())
 }
 
@@ -636,9 +789,10 @@ fn handle_ipc_send_v2_stub(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let block = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_SEND)?;
-    if block.aux0 != 0 || block.aux1 != 0 {
+    if block.aux1 != 0 {
         return Err(SyscallError::InvalidArgs);
     }
+    let opcode = u16::try_from(block.aux0).map_err(|_| SyscallError::InvalidArgs)?;
 
     let cap = CapId(block.endpoint_cap);
     validate_endpoint_right(kernel, cap, CapRights::SEND)?;
@@ -685,7 +839,7 @@ fn handle_ipc_send_v2_stub(
     let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
     let msg = Message::with_header(
         sender_tid,
-        OPCODE_INLINE,
+        opcode,
         transfer_flag_bits(transfer_cap),
         transfer_handle,
         &payload[..len],
@@ -746,7 +900,7 @@ fn handle_ipc_recv_v2_stub(
             | IPC_V2_FLAG_RECV_COPYOUT
             | IPC_V2_FLAG_RET_COPYOUT
     );
-    block.ret_status = msg.sender_tid.0;
+    block.ret_status = msg.opcode as u64;
     block.ret_len = actual_len as u64;
     block.ret_transfer_cap = msg
         .transferred_cap()
@@ -807,6 +961,7 @@ fn handle_ipc_call_v2_stub(
         .object;
 
     let reply_recv_cap = CapId(block.aux0);
+    let request_opcode = u16::try_from(block.aux1).map_err(|_| SyscallError::InvalidArgs)?;
     validate_endpoint_right(kernel, reply_recv_cap, CapRights::RECEIVE)?;
     let responder_tid = kernel
         .endpoint_waiter_tid(endpoint)
@@ -851,7 +1006,7 @@ fn handle_ipc_call_v2_stub(
     let transfer_handle = stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
     let msg = Message::with_header(
         sender_tid,
-        OPCODE_INLINE,
+        request_opcode,
         Message::FLAG_CAP_TRANSFER,
         transfer_handle,
         &payload[..len],
@@ -884,7 +1039,7 @@ fn handle_ipc_call_v2_stub(
             | IPC_V2_FLAG_RECV_COPYOUT
             | IPC_V2_FLAG_RET_COPYOUT
     );
-    block.ret_status = reply.sender_tid.0;
+    block.ret_status = reply.opcode as u64;
     block.ret_len = reply_len as u64;
     block.ret_transfer_cap = reply
         .transferred_cap()
@@ -929,9 +1084,10 @@ fn handle_ipc_reply_v2_stub(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let block = read_ipc_v2_block_from_user(kernel, frame, IPC_V2_OP_REPLY)?;
-    if block.aux0 != 0 || block.aux1 != 0 {
+    if block.aux1 != 0 {
         return Err(SyscallError::InvalidArgs);
     }
+    let opcode = u16::try_from(block.aux0).map_err(|_| SyscallError::InvalidArgs)?;
 
     let reply_cap = CapId(block.endpoint_cap);
     let len = usize::try_from(block.len).map_err(|_| SyscallError::InvalidArgs)?;
@@ -963,13 +1119,17 @@ fn handle_ipc_reply_v2_stub(
         }
         let cap = CapId(block.transfer_cap);
         validate_transfer_cap(kernel, cap)?;
+        if let Ok(meta) = yarm_ipc_abi::ipc_v2::decode_shared_reply_meta(&payload[..len]) {
+            let object_len = validate_shared_reply_transfer_cap_kind(kernel, cap)?;
+            validate_shared_reply_meta_bounds(meta, object_len)?;
+        }
         (Message::FLAG_CAP_TRANSFER, Some(block.transfer_cap))
     } else {
         (0, None)
     };
 
     let sender_tid = current_tid(kernel)?;
-    let msg = Message::with_header(sender_tid, 0, flags, transfer_cap, &payload[..len])
+    let msg = Message::with_header(sender_tid, opcode, flags, transfer_cap, &payload[..len])
         .map_err(|_| SyscallError::InvalidArgs)?;
     kernel
         .ipc_reply(reply_cap, msg)
@@ -1014,6 +1174,8 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::Fork => handle_fork(kernel, frame),
         Syscall::VmAnonMap => handle_vm_anon_map(kernel, frame),
         Syscall::VmBrk => handle_vm_brk(kernel, frame),
+        Syscall::VmUnmap => handle_vm_unmap(kernel, frame),
+        Syscall::CapRelease => handle_cap_release(kernel, frame),
         Syscall::IpcSendV2 => handle_ipc_send_v2_stub(kernel, frame),
         Syscall::IpcRecvV2 => handle_ipc_recv_v2_stub(kernel, frame),
         Syscall::IpcCallV2 => handle_ipc_call_v2_stub(kernel, frame),
@@ -1062,6 +1224,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::Capability;
     use crate::kernel::ipc::{EndpointMode, IPC_REGISTER_WORDS};
     use crate::kernel::scheduler_timer::Timer;
     use crate::kernel::trapframe::TrapFrame;
@@ -1081,6 +1244,27 @@ mod tests {
         state
             .copy_to_current_user(ptr, bytes)
             .expect("write v2 block");
+    }
+
+    fn memory_object_len_for_cap(state: &KernelState, cap: CapId) -> u64 {
+        let obj = state
+            .capability_service()
+            .resolve_current_task_capability(cap)
+            .expect("cap")
+            .object;
+        let CapObject::MemoryObject { id } = obj else {
+            panic!("expected memory object cap");
+        };
+        state
+            .with_memory_state(|memory| {
+                memory
+                    .memory_objects
+                    .iter()
+                    .flatten()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| entry.len as u64)
+            })
+            .expect("memory object len")
     }
 
     #[test]
@@ -1240,7 +1424,7 @@ mod tests {
         .expect("unpack");
         assert_eq!(&got[..5], b"world");
 
-        block.aux0 = 1;
+        block.aux1 = 1;
         write_v2_block_to_user_for_test(&mut state, ptr, &block);
         let mut bad_aux = TrapFrame::new(
             SYSCALL_IPC_SEND_V2_NR,
@@ -1262,6 +1446,7 @@ mod tests {
 
         let mut send_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
         send_block.endpoint_cap = send_cap.0;
+        send_block.aux0 = 0x44;
         send_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
         send_block.len = 6;
         let mut lane = [0u8; 8];
@@ -1287,7 +1472,7 @@ mod tests {
         read_user_bytes_exact(&state, recv_ptr, &mut bytes).expect("read recv block");
         let out = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const IpcRegisterBlockV2) };
         assert_eq!(out.ret_len, 6);
-        assert_eq!(out.ret_status, 0);
+        assert_eq!(out.ret_status, 0x44);
         assert_eq!(out.ret_transfer_cap, IPC_V2_NO_TRANSFER_CAP);
         assert_ne!(out.flags & IPC_V2_FLAG_INLINE_PAYLOAD, 0);
         let lane0 = out.inline_words[0].to_le_bytes();
@@ -1475,6 +1660,7 @@ mod tests {
         let ptr = 0x7300usize;
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
         block.endpoint_cap = reply_cap.0;
+        block.aux0 = 0x55;
         block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
         block.len = 5;
         let mut lane = [0u8; 8];
@@ -1490,6 +1676,7 @@ mod tests {
 
         let received = state.ipc_recv(recv_cap).expect("recv").expect("message");
         assert_eq!(received.as_slice(), b"reply");
+        assert_eq!(received.opcode, 0x55);
     }
 
     #[test]
@@ -1518,7 +1705,7 @@ mod tests {
         let received = state.ipc_recv(recv_cap).expect("recv").expect("message");
         assert_eq!(received.as_slice(), b"ptrok");
 
-        block.aux0 = 1;
+        block.aux1 = 1;
         write_v2_block_to_user_for_test(&mut state, ptr, &block);
         let mut bad = TrapFrame::new(
             SYSCALL_IPC_REPLY_V2_NR,
@@ -1543,6 +1730,7 @@ mod tests {
         call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
         call_block.len = 4;
         call_block.aux0 = recv_cap.0;
+        call_block.aux1 = 0x66;
         let mut req_lane = [0u8; 8];
         req_lane[..4].copy_from_slice(b"call");
         call_block.inline_words[0] = u64::from_le_bytes(req_lane);
@@ -1569,10 +1757,12 @@ mod tests {
         let _ = dispatch(&mut state, &mut call_frame);
 
         let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(received.opcode, 0x66);
         let reply_cap = received.transferred_cap().expect("reply cap");
 
         let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
         reply_block.endpoint_cap = reply_cap.0;
+        reply_block.aux0 = 0x77;
         reply_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
         reply_block.len = 2;
         let mut lane = [0u8; 8];
@@ -1766,6 +1956,379 @@ mod tests {
         dispatch(&mut state, &mut reply_frame2).expect("reply2");
         assert_eq!(dispatch(&mut state, &mut no_copy_frame), Err(SyscallError::InvalidArgs));
     }
+
+    #[test]
+    fn syscall_ipc_reply_v2_transfer_cap_memory_object_sets_ret_transfer_cap_baseline() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+        let call_ptr = 0xB000usize;
+        let reply_ptr = 0xB100usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"ping\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0x1000,
+            len: 0x2000,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        state
+            .copy_to_current_user(reply_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = mem_cap.0;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr + 0x80, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_ptr + 0x80, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut reply_frame).expect("reply");
+
+        dispatch(&mut state, &mut call_frame).expect("call completion");
+        let out_block = state
+            .copy_from_current_user(call_ptr, IPC_ABI_V2_BLOCK_SIZE)
+            .expect("call out");
+        let out = unsafe {
+            core::ptr::read_unaligned(out_block.as_ptr() as *const IpcRegisterBlockV2)
+        };
+        assert_eq!(out.ret_transfer_cap, mem_cap.0);
+        assert_ne!(out.flags & IPC_V2_FLAG_TRANSFER_CAP, 0);
+    }
+
+    #[test]
+    fn syscall_ipc_reply_v2_shared_meta_transfer_cap_rejects_non_memory_object() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+
+        let call_ptr = 0xB200usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"ping\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0x1000,
+            len: 0x2000,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        let reply_payload_ptr = 0xB260usize;
+        state
+            .copy_to_current_user(reply_payload_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_payload_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = send_cap.0; // endpoint cap (non-MemoryObject)
+        let reply_ptr = 0xB280usize;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            dispatch(&mut state, &mut reply_frame),
+            Err(SyscallError::WrongObject)
+        );
+    }
+
+    #[test]
+    fn syscall_ipc_reply_v2_shared_meta_exact_object_len_succeeds() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let obj_len = memory_object_len_for_cap(&state, mem_cap);
+
+        let call_ptr = 0xB2C0usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"size\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0,
+            len: obj_len,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        let reply_payload_ptr = 0xB2E0usize;
+        state
+            .copy_to_current_user(reply_payload_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_payload_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = mem_cap.0;
+        write_v2_block_to_user_for_test(&mut state, reply_payload_ptr + 0x80, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_payload_ptr + 0x80, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut reply_frame).expect("reply");
+    }
+
+    #[test]
+    fn syscall_ipc_reply_v2_shared_meta_over_object_len_rejects_wrong_object() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let obj_len = memory_object_len_for_cap(&state, mem_cap);
+
+        let call_ptr = 0xB300usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"obnd\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: obj_len - 1,
+            len: 2,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        let reply_payload_ptr = 0xB320usize;
+        state
+            .copy_to_current_user(reply_payload_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_payload_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = mem_cap.0;
+        write_v2_block_to_user_for_test(&mut state, reply_payload_ptr + 0x80, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_payload_ptr + 0x80, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            dispatch(&mut state, &mut reply_frame),
+            Err(SyscallError::WrongObject)
+        );
+    }
+
+    #[test]
+    fn syscall_ipc_reply_v2_shared_meta_offset_beyond_object_len_rejects_wrong_object() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let obj_len = memory_object_len_for_cap(&state, mem_cap);
+
+        let call_ptr = 0xB340usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"ofst\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: obj_len + 1,
+            len: 1,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        let reply_payload_ptr = 0xB360usize;
+        state
+            .copy_to_current_user(reply_payload_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_payload_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = mem_cap.0;
+        write_v2_block_to_user_for_test(&mut state, reply_payload_ptr + 0x80, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_payload_ptr + 0x80, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            dispatch(&mut state, &mut reply_frame),
+            Err(SyscallError::WrongObject)
+        );
+    }
+
+    #[test]
+    fn syscall_ipc_reply_v2_non_shared_payload_preserves_generic_transfer_cap_behavior() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+
+        let call_ptr = 0xB220usize;
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"pong\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        // Non-shared payload: transfer-kind policy should remain generic.
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD | IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = send_cap.0; // endpoint cap
+        reply_block.len = 2;
+        let mut lane = [0u8; 8];
+        lane[..2].copy_from_slice(b"ok");
+        reply_block.inline_words[0] = u64::from_le_bytes(lane);
+        let reply_ptr = 0xB2A0usize;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut reply_frame).expect("reply");
+
+        dispatch(&mut state, &mut call_frame).expect("call completion");
+        let out_block = state
+            .copy_from_current_user(call_ptr, IPC_ABI_V2_BLOCK_SIZE)
+            .expect("call out");
+        let out = unsafe {
+            core::ptr::read_unaligned(out_block.as_ptr() as *const IpcRegisterBlockV2)
+        };
+        assert_eq!(out.ret_transfer_cap, send_cap.0);
+        assert_ne!(out.flags & IPC_V2_FLAG_TRANSFER_CAP, 0);
+    }
+
+    #[test]
+    fn syscall_ipc_call_v2_reply_transfer_with_shared_reply_meta_payload_baseline() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let call_ptr = 0xB300usize;
+        let reply_ptr = 0xB380usize;
+
+        let mut call_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
+        call_block.endpoint_cap = send_cap.0;
+        call_block.flags = IPC_V2_FLAG_INLINE_PAYLOAD;
+        call_block.len = 4;
+        call_block.aux0 = recv_cap.0;
+        call_block.inline_words[0] = u64::from_le_bytes(*b"meta\0\0\0\0");
+        write_v2_block_to_user_for_test(&mut state, call_ptr, &call_block);
+        let mut call_frame = TrapFrame::new(
+            SYSCALL_IPC_CALL_V2_NR,
+            [call_ptr, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        let _ = dispatch(&mut state, &mut call_frame);
+        let req = state.ipc_recv(recv_cap).expect("recv").expect("req");
+        let reply_cap = req.transferred_cap().expect("reply cap");
+
+        let meta = yarm_ipc_abi::ipc_v2::IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0x4000,
+            len: 0x1000,
+        };
+        let payload = yarm_ipc_abi::ipc_v2::encode_shared_reply_meta(meta).expect("meta");
+        state
+            .copy_to_current_user(reply_ptr, &payload)
+            .expect("meta bytes");
+        let mut reply_block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
+        reply_block.endpoint_cap = reply_cap.0;
+        reply_block.ptr_or_offset = reply_ptr as u64;
+        reply_block.len = payload.len() as u64;
+        reply_block.flags = IPC_V2_FLAG_TRANSFER_CAP;
+        reply_block.transfer_cap = mem_cap.0;
+        write_v2_block_to_user_for_test(&mut state, reply_ptr + 0x80, &reply_block);
+        let mut reply_frame = TrapFrame::new(
+            SYSCALL_IPC_REPLY_V2_NR,
+            [reply_ptr + 0x80, IPC_ABI_V2_BLOCK_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut reply_frame).expect("reply");
+
+        dispatch(&mut state, &mut call_frame).expect("call completion");
+        let out_block = state
+            .copy_from_current_user(call_ptr, IPC_ABI_V2_BLOCK_SIZE)
+            .expect("call out");
+        let out = unsafe {
+            core::ptr::read_unaligned(out_block.as_ptr() as *const IpcRegisterBlockV2)
+        };
+        assert_eq!(out.ret_transfer_cap, mem_cap.0);
+        let decoded_meta = yarm_ipc_abi::ipc_v2::decode_shared_reply_meta(&payload)
+            .expect("decode shared meta");
+        assert_eq!(out.ret_transfer_cap, mem_cap.0);
+        assert_eq!(decoded_meta.offset, 0x4000);
+        assert_eq!(decoded_meta.len, 0x1000);
+    }
     #[test]
     fn syscall_abi_numbers_are_frozen() {
         assert_eq!(SYSCALL_ABI_VERSION, 10);
@@ -1786,7 +2349,9 @@ mod tests {
         assert_eq!(SYSCALL_IPC_RECV_V2_NR, 16);
         assert_eq!(SYSCALL_IPC_CALL_V2_NR, 17);
         assert_eq!(SYSCALL_IPC_REPLY_V2_NR, 18);
-        assert_eq!(SYSCALL_COUNT, 19);
+        assert_eq!(SYSCALL_VM_UNMAP_NR, 19);
+        assert_eq!(SYSCALL_CAP_RELEASE_NR, 20);
+        assert_eq!(SYSCALL_COUNT, 21);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
@@ -2336,6 +2901,171 @@ mod tests {
         );
         let err = dispatch(&mut state, &mut second).expect_err("guard conflict");
         assert_eq!(err, SyscallError::InvalidArgs);
+    }
+
+    #[test]
+    fn vm_anon_map_syscall_maps_region_and_returns_memory_object_cap() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let mut frame = TrapFrame::new(
+            Syscall::VmAnonMap as usize,
+            [
+                0x8000,
+                PAGE_SIZE + 1,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut frame).expect("vm_anon_map");
+        assert_eq!(frame.error_code(), None);
+        assert_eq!(frame.ret0(), 0x8000);
+        assert_eq!(frame.ret1(), PAGE_SIZE * 2);
+        let cap = CapId(frame.ret2() as u64);
+        let resolved = state
+            .capability_service()
+            .resolve_current_task_capability(cap)
+            .expect("resolved cap");
+        assert!(matches!(resolved.object, CapObject::MemoryObject { .. }));
+    }
+
+    #[test]
+    fn vm_anon_map_rejects_invalid_args() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+
+        let cases = [
+            [0, PAGE_SIZE, SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE, 0, 0, 0],
+            [0x8101, PAGE_SIZE, SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE, 0, 0, 0],
+            [0x9000, 0, SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE, 0, 0, 0],
+            [0xA000, PAGE_SIZE, SYSCALL_VM_MAP_PROT_READ, 0, 0, 0],
+            [0xB000, PAGE_SIZE, SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE | SYSCALL_VM_MAP_PROT_EXEC, 0, 0, 0],
+            [0xC000, PAGE_SIZE, SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE, 1, 0, 0],
+        ];
+        for args in cases {
+            let mut frame = TrapFrame::new(Syscall::VmAnonMap as usize, args);
+            let err = dispatch(&mut state, &mut frame).expect_err("invalid");
+            assert_eq!(err, SyscallError::InvalidArgs);
+        }
+    }
+
+    #[test]
+    fn vm_anon_map_rejects_overlap_before_allocation() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let mut occupy = TrapFrame::new(
+            Syscall::VmMap as usize,
+            [
+                aspace_map_cap.0 as usize,
+                0xD000,
+                PAGE_SIZE,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut occupy).expect("occupy");
+        let mem_before = state.with_memory_state(|memory| memory.memory_objects.iter().flatten().count());
+
+        let mut frame = TrapFrame::new(
+            Syscall::VmAnonMap as usize,
+            [
+                0xD000,
+                PAGE_SIZE * 2,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+                0,
+            ],
+        );
+        let err = dispatch(&mut state, &mut frame).expect_err("overlap");
+        assert_eq!(err, SyscallError::WrongObject);
+        let mem_after = state.with_memory_state(|memory| memory.memory_objects.iter().flatten().count());
+        assert_eq!(mem_before, mem_after, "overlap reject must happen before allocation");
+    }
+
+    #[test]
+    fn vm_unmap_after_vm_anon_map_allows_reuse_of_same_base() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let mut map = TrapFrame::new(
+            Syscall::VmAnonMap as usize,
+            [
+                0x20000,
+                PAGE_SIZE,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut map).expect("map");
+        let mut unmap = TrapFrame::new(
+            Syscall::VmUnmap as usize,
+            [0x20000, PAGE_SIZE, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut unmap).expect("unmap");
+        let mut map_again = TrapFrame::new(
+            Syscall::VmAnonMap as usize,
+            [
+                0x20000,
+                PAGE_SIZE,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut map_again).expect("map again");
+    }
+
+    #[test]
+    fn vm_unmap_rejects_invalid_args() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let cases = [
+            [0, PAGE_SIZE, 0, 0, 0, 0],
+            [0x20001, PAGE_SIZE, 0, 0, 0, 0],
+            [0x21000, 0, 0, 0, 0, 0],
+            [0x22000, PAGE_SIZE, 1, 0, 0, 0],
+        ];
+        for args in cases {
+            let mut frame = TrapFrame::new(Syscall::VmUnmap as usize, args);
+            let err = dispatch(&mut state, &mut frame).expect_err("invalid");
+            assert_eq!(err, SyscallError::InvalidArgs);
+        }
+    }
+
+    #[test]
+    fn cap_release_revokes_current_task_cap() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let cap = state
+            .mint_capability_for_current_context(Capability::new(CapObject::Kernel, CapRights::READ))
+            .expect("mint");
+        let resolved_before = state
+            .capability_service()
+            .resolve_current_task_capability(cap);
+        assert!(resolved_before.is_some());
+        let mut frame = TrapFrame::new(Syscall::CapRelease as usize, [cap.0 as usize, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut frame).expect("cap_release");
+        let resolved_after = state
+            .capability_service()
+            .resolve_current_task_capability(cap);
+        assert!(resolved_after.is_none());
+    }
+
+    #[test]
+    fn cap_release_invalid_cap_returns_invalid_capability() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let mut frame = TrapFrame::new(Syscall::CapRelease as usize, [99999, 0, 0, 0, 0, 0]);
+        let err = dispatch(&mut state, &mut frame).expect_err("invalid");
+        assert_eq!(err, SyscallError::InvalidCapability);
     }
 
     #[test]

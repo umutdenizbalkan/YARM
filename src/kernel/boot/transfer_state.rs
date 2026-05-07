@@ -4,6 +4,11 @@
 use super::*;
 
 impl KernelState {
+    #[inline]
+    fn transfer_envelope_pins_memory_object(source_object: CapObject) -> bool {
+        matches!(source_object, CapObject::MemoryObject { .. })
+    }
+
     pub(crate) fn stash_transfer_envelope(
         &mut self,
         source_tid: ThreadId,
@@ -36,7 +41,7 @@ impl KernelState {
                 .resolve_capability_for_task(source_tid.0, source_cap)
                 .ok()?
                 .object;
-            if shared_region.is_some() {
+            if Self::transfer_envelope_pins_memory_object(source_object) {
                 self.adjust_memory_object_pin_refcount(source_object, 1);
             }
             self.with_ipc_state_mut(|ipc| {
@@ -86,7 +91,7 @@ impl KernelState {
             }
         }
         envelope = envelope.transition(TransferState::Released)?;
-        if envelope.shared_region.is_some() {
+        if Self::transfer_envelope_pins_memory_object(envelope.source_object) {
             self.adjust_memory_object_pin_refcount(envelope.source_object, -1);
         }
         self.with_ipc_state_mut(|ipc| {

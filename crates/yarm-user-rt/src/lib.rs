@@ -27,9 +27,10 @@ pub mod capability {
 pub mod syscall {
     use crate::ipc::Message;
     use yarm_ipc_abi::ipc_v2::{
-        IpcRegisterBlockV2, IPC_ABI_V2_BLOCK_SIZE, IPC_V2_FLAG_INLINE_PAYLOAD,
-        IPC_V2_FLAG_RECV_COPYOUT, IPC_V2_FLAG_RET_COPYOUT, IPC_V2_FLAG_TRANSFER_CAP,
-        IPC_V2_NO_TRANSFER_CAP, IPC_V2_OP_CALL, IPC_V2_OP_RECV, IPC_V2_OP_REPLY, IPC_V2_OP_SEND,
+        IpcRegisterBlockV2, IpcV2SharedReplyMeta, IPC_ABI_V2_BLOCK_SIZE,
+        IPC_V2_FLAG_INLINE_PAYLOAD, IPC_V2_FLAG_RECV_COPYOUT, IPC_V2_FLAG_RET_COPYOUT,
+        IPC_V2_FLAG_TRANSFER_CAP, IPC_V2_NO_TRANSFER_CAP, IPC_V2_OP_CALL, IPC_V2_OP_RECV,
+        IPC_V2_OP_REPLY, IPC_V2_OP_SEND, decode_shared_reply_meta, encode_shared_reply_meta,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +53,11 @@ pub mod syscall {
     const SYSCALL_IPC_RECV_V2_NR: usize = 16;
     const SYSCALL_IPC_CALL_V2_NR: usize = 17;
     const SYSCALL_IPC_REPLY_V2_NR: usize = 18;
+    const SYSCALL_VM_ANON_MAP_NR: usize = 13;
+    const SYSCALL_VM_UNMAP_NR: usize = 19;
+    const SYSCALL_CAP_RELEASE_NR: usize = 20;
     const SYSCALL_YIELD_NR: usize = 0;
+    pub const IPC_V2_DEFAULT_OPCODE: u16 = 0;
     pub trait IpcTransportV2 {
         fn send_v2(
             &mut self,
@@ -188,10 +193,110 @@ pub mod syscall {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct IpcV2Response {
+        /// For `RECV_V2`/`CALL_V2`, this carries received message opcode.
         pub status: u64,
         pub len: usize,
         pub transfer_cap: Option<u64>,
         pub payload: [u8; Message::MAX_PAYLOAD],
+    }
+    impl IpcV2Response {
+        #[inline]
+        pub const fn opcode(&self) -> u16 {
+            self.status as u16
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SharedReplyResponse {
+        /// Compatibility field retained from pre-opcode-carriage naming.
+        /// In IPC v2 receive/call responses this carries message opcode.
+        pub status: u64,
+        pub transfer_cap: u64,
+        pub offset: u64,
+        pub len: u64,
+        pub flags: u16,
+    }
+    impl SharedReplyResponse {
+        #[inline]
+        pub const fn opcode(&self) -> u16 {
+            self.status as u16
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AnonMapResult {
+        pub base: usize,
+        pub len: usize,
+        pub mem_cap: u64,
+    }
+
+    #[inline]
+    pub fn decode_shared_reply_response(
+        response: &IpcV2Response,
+    ) -> core::result::Result<SharedReplyResponse, SyscallError> {
+        let transfer_cap = response.transfer_cap.ok_or(SyscallError::InvalidArgs)?;
+        let meta = decode_shared_reply_meta(&response.payload[..response.len])
+            .map_err(|_| SyscallError::InvalidArgs)?;
+        Ok(SharedReplyResponse {
+            status: response.status,
+            transfer_cap,
+            offset: meta.offset,
+            len: meta.len,
+            flags: meta.flags,
+        })
+    }
+
+    #[inline]
+    pub unsafe fn vm_anon_map(
+        base: usize,
+        len: usize,
+        prot: u64,
+    ) -> core::result::Result<AnonMapResult, SyscallError> {
+        let args = [base, len, prot as usize, 0, 0, 0];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_VM_ANON_MAP_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(AnonMapResult {
+            base: ret.ret0,
+            len: ret.ret1,
+            mem_cap: ret.ret2 as u64,
+        })
+    }
+
+    #[inline]
+    pub unsafe fn vm_unmap(base: usize, len: usize) -> core::result::Result<(), SyscallError> {
+        let args = [base, len, 0, 0, 0, 0];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_VM_UNMAP_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub unsafe fn cap_release(cap: u64) -> core::result::Result<(), SyscallError> {
+        let args = [cap as usize, 0, 0, 0, 0, 0];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_CAP_RELEASE_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
     }
 
     pub(crate) fn fill_v2_payload_block(block: &mut IpcRegisterBlockV2, payload: &[u8]) -> core::result::Result<(), SyscallError> {
@@ -255,8 +360,20 @@ pub mod syscall {
         payload: &[u8],
         transfer_cap: Option<u64>,
     ) -> core::result::Result<(), SyscallError> {
+        // SAFETY: delegates to opcode-aware wrapper with default opcode.
+        unsafe { ipc_send_v2_msg(endpoint_cap, IPC_V2_DEFAULT_OPCODE, payload, transfer_cap) }
+    }
+
+    #[inline]
+    pub unsafe fn ipc_send_v2_msg(
+        endpoint_cap: u32,
+        opcode: u16,
+        payload: &[u8],
+        transfer_cap: Option<u64>,
+    ) -> core::result::Result<(), SyscallError> {
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_SEND);
         block.endpoint_cap = endpoint_cap as u64;
+        block.aux0 = opcode as u64;
         fill_v2_payload_block(&mut block, payload)?;
         if let Some(cap) = transfer_cap {
             block.flags |= IPC_V2_FLAG_TRANSFER_CAP;
@@ -310,8 +427,20 @@ pub mod syscall {
         payload: &[u8],
         transfer_cap: Option<u64>,
     ) -> core::result::Result<(), SyscallError> {
+        // SAFETY: delegates to opcode-aware wrapper with default opcode.
+        unsafe { ipc_reply_v2_msg(reply_cap, IPC_V2_DEFAULT_OPCODE, payload, transfer_cap) }
+    }
+
+    #[inline]
+    pub unsafe fn ipc_reply_v2_msg(
+        reply_cap: u32,
+        opcode: u16,
+        payload: &[u8],
+        transfer_cap: Option<u64>,
+    ) -> core::result::Result<(), SyscallError> {
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_REPLY);
         block.endpoint_cap = reply_cap as u64;
+        block.aux0 = opcode as u64;
         fill_v2_payload_block(&mut block, payload)?;
         if let Some(cap) = transfer_cap {
             block.flags |= IPC_V2_FLAG_TRANSFER_CAP;
@@ -326,15 +455,51 @@ pub mod syscall {
         Ok(())
     }
 
+    /// Convenience helper for stage-1 shared replies.
+    ///
+    /// This helper only sends metadata + transfer cap via existing `IPC_REPLY_V2`.
+    /// It does not map memory automatically.
+    #[inline]
+    pub unsafe fn ipc_reply_v2_shared(
+        reply_cap: u32,
+        mem_cap: u64,
+        offset: u64,
+        len: u64,
+        flags: u16,
+    ) -> core::result::Result<(), SyscallError> {
+        let meta = IpcV2SharedReplyMeta {
+            version: yarm_ipc_abi::ipc_v2::IPC_V2_SHARED_REPLY_META_VERSION,
+            flags,
+            reserved: 0,
+            offset,
+            len,
+        };
+        let payload = encode_shared_reply_meta(meta).map_err(|_| SyscallError::InvalidArgs)?;
+        // SAFETY: wrapper over existing reply syscall path.
+        unsafe { ipc_reply_v2_msg(reply_cap, IPC_V2_DEFAULT_OPCODE, &payload, Some(mem_cap)) }
+    }
+
     #[inline]
     pub unsafe fn ipc_call_v2(
         send_cap: u32,
         reply_recv_cap: u32,
         payload: &[u8],
     ) -> core::result::Result<IpcV2Response, SyscallError> {
+        // SAFETY: delegates to opcode-aware wrapper with default opcode.
+        unsafe { ipc_call_v2_msg(send_cap, reply_recv_cap, IPC_V2_DEFAULT_OPCODE, payload) }
+    }
+
+    #[inline]
+    pub unsafe fn ipc_call_v2_msg(
+        send_cap: u32,
+        reply_recv_cap: u32,
+        opcode: u16,
+        payload: &[u8],
+    ) -> core::result::Result<IpcV2Response, SyscallError> {
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_CALL);
         block.endpoint_cap = send_cap as u64;
         block.aux0 = reply_recv_cap as u64;
+        block.aux1 = opcode as u64;
         fill_v2_payload_block(&mut block, payload)?;
         let args = [(&mut block as *mut IpcRegisterBlockV2) as usize, IPC_ABI_V2_BLOCK_SIZE, 0,0,0,0];
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_CALL_V2_NR, args) };
@@ -345,12 +510,27 @@ pub mod syscall {
         decode_v2_response(&block)
     }
 
+    /// Convenience helper that expects shared-reply metadata in the response payload.
+    ///
+    /// This helper does not map transferred memory automatically.
+    #[inline]
+    pub unsafe fn ipc_call_v2_expect_shared(
+        send_cap: u32,
+        reply_recv_cap: u32,
+        payload: &[u8],
+    ) -> core::result::Result<SharedReplyResponse, SyscallError> {
+        // SAFETY: wrapper over existing call syscall path.
+        let response = unsafe { ipc_call_v2(send_cap, reply_recv_cap, payload) }?;
+        decode_shared_reply_response(&response)
+    }
+
     #[inline]
     pub unsafe fn ipc_recv_v2_into(
         recv_cap: u32,
         timeout_ticks: u64,
         out: &mut [u8],
     ) -> core::result::Result<Option<(u64, usize, Option<u64>)>, SyscallError> {
+        // Return tuple: (opcode, payload_len, transfer_cap).
         let mut block = IpcRegisterBlockV2::new_v2(IPC_V2_OP_RECV);
         block.endpoint_cap = recv_cap as u64;
         block.aux0 = timeout_ticks;
@@ -385,6 +565,7 @@ pub mod syscall {
         payload: &[u8],
         out: &mut [u8],
     ) -> core::result::Result<(u64, usize, Option<u64>), SyscallError> {
+        // Return tuple: (reply_opcode, payload_len, transfer_cap).
         if payload.len() > 64 {
             return Err(SyscallError::InvalidArgs);
         }
@@ -447,6 +628,10 @@ pub mod runtime {
     pub const STARTUP_SLOT_OPTIONAL_INIT_TID: usize = 8;
     pub const STARTUP_SLOT_OPTIONAL_SUPERVISOR_TID: usize = 9;
     pub const STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS: usize = 10;
+    /// Primary meaning: process-manager restart-control SEND cap.
+    ///
+    /// Staged/service-conditional meaning: initramfs server request RECV cap
+    /// during FS IPC-loop bring-up (slot count/layout unchanged).
     pub const STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP: usize = 11;
     const STARTUP_SLOT_COUNT: usize = 12;
 
@@ -507,6 +692,18 @@ pub mod runtime {
                 (Some(request_send), Some(reply_recv)) => Some((request_send, reply_recv)),
                 _ => None,
             }
+        }
+
+        /// Staged, service-scoped interpretation for initramfs FS server startup.
+        ///
+        /// This reuses startup slot 11 (`process_manager_restart_control_send_cap`)
+        /// as a request receive endpoint capability *only* for initramfs server
+        /// launch wiring during the staged FS IPC-loop rollout.
+        /// Other services must continue to interpret slot 11 by its primary
+        /// process-manager restart-control meaning.
+        #[inline]
+        pub const fn initramfs_request_recv_cap_from_slot11(self) -> Option<u32> {
+            self.process_manager_restart_control_send_cap
         }
     }
 
@@ -813,6 +1010,10 @@ pub mod process {
 mod tests {
     use crate::runtime::{install_startup_arg_slots, startup_context};
     use crate::syscall::{IpcTransportV2, IpcV2Response, SyscallError};
+    use yarm_ipc_abi::ipc_v2::{
+        IpcV2SharedReplyMeta, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+        IPC_V2_SHARED_REPLY_META_VERSION, encode_shared_reply_meta,
+    };
 
     #[test]
     fn ipc_v2_inline_encoder_roundtrip() {
@@ -845,6 +1046,42 @@ mod tests {
 
         install_startup_arg_slots([42, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), None);
+
+        install_startup_arg_slots([
+            original.task_id,
+            original
+                .process_manager_request_send_cap
+                .map(u64::from)
+                .unwrap_or(0),
+            original
+                .process_manager_reply_recv_cap
+                .map(u64::from)
+                .unwrap_or(0),
+            original.supervisor_fault_recv_ep.map(u64::from).unwrap_or(0),
+            original
+                .supervisor_control_send_ep
+                .map(u64::from)
+                .unwrap_or(0),
+            original
+                .supervisor_control_recv_ep
+                .map(u64::from)
+                .unwrap_or(0),
+            original.init_alert_send_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_tid.unwrap_or(0),
+            original.supervisor_tid.unwrap_or(0),
+            original.supervisor_restart_window_ticks.unwrap_or(0),
+            original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
+        ]);
+    }
+
+    #[test]
+    fn startup_initramfs_recv_cap_uses_slot11_staged_mapping() {
+        let original = startup_context();
+        install_startup_arg_slots([42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77]);
+        let ctx = startup_context();
+        assert_eq!(ctx.process_manager_restart_control_send_cap, Some(77));
+        assert_eq!(ctx.initramfs_request_recv_cap_from_slot11(), Some(77));
 
         install_startup_arg_slots([
             original.task_id,
@@ -914,7 +1151,7 @@ mod tests {
             let mut payload = [0u8; crate::ipc::Message::MAX_PAYLOAD];
             payload[..4].copy_from_slice(&self.response_payload);
             Ok(IpcV2Response {
-                status: 0,
+                status: 0xCAFE,
                 len: 4,
                 transfer_cap: None,
                 payload,
@@ -940,6 +1177,7 @@ mod tests {
             (reply == b"pong").then_some(7u8)
         })
         .expect("typed reply");
+        // request_reply_v2 decodes payload only; it must not depend on opcode/status lane.
         assert_eq!(decoded, 7);
     }
 
@@ -952,5 +1190,93 @@ mod tests {
         block.ret_len = 65;
         let decoded = super::syscall::decode_v2_response(&block).expect("decode");
         assert_eq!(decoded.len, 65);
+    }
+
+    #[test]
+    fn decode_shared_reply_response_succeeds_with_transfer_cap_and_valid_meta() {
+        let meta = IpcV2SharedReplyMeta {
+            version: IPC_V2_SHARED_REPLY_META_VERSION,
+            flags: IPC_V2_SHARED_REPLY_FLAG_READ_ONLY,
+            reserved: 0,
+            offset: 0x3000,
+            len: 0x1000,
+        };
+        let meta_bytes = encode_shared_reply_meta(meta).expect("encode");
+        let mut payload = [0u8; crate::ipc::Message::MAX_PAYLOAD];
+        payload[..meta_bytes.len()].copy_from_slice(&meta_bytes);
+        let response = IpcV2Response {
+            status: 99,
+            len: meta_bytes.len(),
+            transfer_cap: Some(55),
+            payload,
+        };
+        let decoded = crate::syscall::decode_shared_reply_response(&response).expect("decode");
+        assert_eq!(decoded.status, 99);
+        assert_eq!(decoded.opcode(), 99);
+        assert_eq!(decoded.transfer_cap, 55);
+        assert_eq!(decoded.offset, 0x3000);
+        assert_eq!(decoded.len, 0x1000);
+        assert_eq!(decoded.flags, IPC_V2_SHARED_REPLY_FLAG_READ_ONLY);
+    }
+
+    #[test]
+    fn decode_shared_reply_response_fails_without_transfer_cap() {
+        let mut payload = [0u8; crate::ipc::Message::MAX_PAYLOAD];
+        payload[0] = 1;
+        let response = IpcV2Response {
+            status: 0,
+            len: 24,
+            transfer_cap: None,
+            payload,
+        };
+        assert_eq!(
+            crate::syscall::decode_shared_reply_response(&response),
+            Err(SyscallError::InvalidArgs)
+        );
+    }
+
+    #[test]
+    fn decode_shared_reply_response_fails_on_bad_metadata() {
+        let mut payload = [0u8; crate::ipc::Message::MAX_PAYLOAD];
+        let bad_version = (IPC_V2_SHARED_REPLY_META_VERSION + 1).to_le_bytes();
+        payload[0..2].copy_from_slice(&bad_version);
+        payload[16..24].copy_from_slice(&1u64.to_le_bytes());
+        let response = IpcV2Response {
+            status: 0,
+            len: 24,
+            transfer_cap: Some(7),
+            payload,
+        };
+        assert_eq!(
+            crate::syscall::decode_shared_reply_response(&response),
+            Err(SyscallError::InvalidArgs)
+        );
+    }
+
+    #[test]
+    fn shared_helpers_are_metadata_only_and_do_not_map() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("ipc_reply_v2_shared")
+                && src.contains("ipc_call_v2_expect_shared")
+                && src.contains("unsafe { ipc_reply_v2_msg(reply_cap, IPC_V2_DEFAULT_OPCODE, &payload, Some(mem_cap)) }")
+                && src.contains("decode_shared_reply_response(&response)"),
+            "shared reply helpers must remain metadata/transfer-cap wrappers without automatic mapping",
+        );
+    }
+
+    #[test]
+    fn vm_anon_map_wrapper_is_exposed_with_expected_syscall_number() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("const SYSCALL_VM_ANON_MAP_NR: usize = 13;")
+                && src.contains("const SYSCALL_VM_UNMAP_NR: usize = 19;")
+                && src.contains("const SYSCALL_CAP_RELEASE_NR: usize = 20;")
+                && src.contains("pub struct AnonMapResult")
+                && src.contains("pub unsafe fn vm_anon_map(")
+                && src.contains("pub unsafe fn vm_unmap(")
+                && src.contains("pub unsafe fn cap_release("),
+            "user runtime must expose staged vm_anon_map/vm_unmap/cap_release wrappers and result type",
+        );
     }
 }
