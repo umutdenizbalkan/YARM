@@ -242,7 +242,7 @@ impl InitService {
         tid: u64,
         entry: usize,
         asid: Asid,
-        startup_args: [u64; 12],
+        startup_args: [u64; 16],
     ) -> Result<(), KernelError> {
         self.launch_order[self.launch_count] = Some(kind);
         self.launch_count += 1;
@@ -261,7 +261,7 @@ impl InitService {
         kernel: &mut KernelState,
         process_manager_tid: u64,
         compat_tid: u64,
-    ) -> Result<[u64; 12], KernelError> {
+    ) -> Result<[u64; 16], KernelError> {
         // Startup ABI slots for compat server:
         //   arg0 => compat task id
         //   arg1 => process-manager request SEND cap in compat task
@@ -309,7 +309,7 @@ impl InitService {
         init_tid: u64,
         supervisor_tid: u64,
         restart_window_ticks: u64,
-    ) -> Result<([u64; 12], InitFaultHandoff), KernelError> {
+    ) -> Result<([u64; 16], InitFaultHandoff), KernelError> {
         let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
 
         let (_, _fault_send_root, fault_recv_root) = kernel.create_endpoint(16)?;
@@ -375,7 +375,7 @@ impl InitService {
     fn delegate_process_manager_restart_control_cap(
         kernel: &mut KernelState,
         process_manager_tid: u64,
-    ) -> Result<[u64; 12], KernelError> {
+    ) -> Result<[u64; 16], KernelError> {
         let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
         let root = kernel.mint_capability_for_current_context(Capability::new(
             CapObject::Kernel,
@@ -396,7 +396,7 @@ impl InitService {
     fn delegate_initramfs_request_recv_cap(
         kernel: &mut KernelState,
         initramfs_tid: u64,
-    ) -> Result<[u64; 12], KernelError> {
+    ) -> Result<[u64; 16], KernelError> {
         let source_tid = kernel.current_tid().ok_or(KernelError::TaskMissing)?;
         let (_, _request_send_root, request_recv_root) = kernel.create_endpoint(16)?;
         let delegated_recv = kernel.grant_capability_task_to_task_with_rights(

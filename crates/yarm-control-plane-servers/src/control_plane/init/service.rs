@@ -294,8 +294,8 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
         .process_manager_caps()
         .ok_or(ProcessManagerError::PermissionDenied)?;
     let request_recv_cap = ctx
-        .initramfs_startup_caps_v1_from_startup_args()
-        .and_then(|caps| u32::try_from(caps.request_recv_cap).ok())
+        .init_orchestration_caps_v1()
+        .and_then(|caps| u32::try_from(caps.initramfs_request_recv_cap_for_child).ok())
         .filter(|cap| *cap != 0)
         .ok_or(ProcessManagerError::Unsupported)?;
     let request = build_initramfs_spawn_v5_message(1, 0x494E_4954_4653_5352, request_recv_cap)?;
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn init_server_spawn_attempt_uses_ipc_when_caps_present() {
-        yarm_user_rt::runtime::install_startup_arg_slots([((1u64) << 48) | ((1u64) << 32) | 0x5354_4350, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        yarm_user_rt::runtime::install_startup_arg_slots([1, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 88, 77, 0]);
         let mut t = StubTransport { status: Ok(SpawnV2Result { pid: yarm_user_rt::process::ProcessId(55) }), saw_send_cap: None, saw_reply_cap: None };
         let res = attempt_spawn_initramfs_srv_via_process_manager_with_transport(&mut t);
         assert_eq!(res, Ok(()));

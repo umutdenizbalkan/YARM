@@ -231,6 +231,20 @@ pub struct ServiceStartupCapsV1 {
     pub reserved0: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitOrchestrationCapsV1 {
+    pub version: u16,
+    pub reserved: u16,
+    pub initramfs_request_send_cap: u64,
+    pub initramfs_request_recv_cap_for_child: u64,
+    pub control0: u64,
+    pub control1: u64,
+}
+
+impl InitOrchestrationCapsV1 {
+    pub const VERSION: u16 = 1;
+}
+
 impl ServiceStartupCapsV1 {
     pub const VERSION: u16 = 1;
     pub const ENCODED_LEN: usize = 40;

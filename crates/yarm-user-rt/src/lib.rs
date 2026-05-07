@@ -634,10 +634,18 @@ pub mod runtime {
     /// Staged/service-conditional meaning: initramfs server request RECV cap
     /// during FS IPC-loop bring-up (slot count/layout unchanged).
     pub const STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP: usize = 11;
-    const STARTUP_SLOT_COUNT: usize = 12;
+    pub const STARTUP_SLOT_INIT_ORCH_VERSION_AND_RESERVED: usize = 12;
+    pub const STARTUP_SLOT_INITRAMFS_REQUEST_SEND_CAP: usize = 13;
+    pub const STARTUP_SLOT_INITRAMFS_REQUEST_RECV_CAP_FOR_CHILD: usize = 14;
+    pub const STARTUP_SLOT_INIT_ORCH_CONTROL0: usize = 15;
+    const STARTUP_SLOT_COUNT: usize = 16;
 
     static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] =
         [
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -728,6 +736,23 @@ pub mod runtime {
                 reserved0,
             })
         }
+
+        #[inline]
+        pub fn init_orchestration_caps_v1(self) -> Option<yarm_ipc_abi::process_abi::InitOrchestrationCapsV1> {
+            let hdr = STARTUP_ARG_SLOTS[STARTUP_SLOT_INIT_ORCH_VERSION_AND_RESERVED].load(Ordering::Relaxed);
+            let version = (hdr & 0xFFFF) as u16;
+            if version != yarm_ipc_abi::process_abi::InitOrchestrationCapsV1::VERSION {
+                return None;
+            }
+            Some(yarm_ipc_abi::process_abi::InitOrchestrationCapsV1 {
+                version,
+                reserved: ((hdr >> 16) & 0xFFFF) as u16,
+                initramfs_request_send_cap: STARTUP_ARG_SLOTS[STARTUP_SLOT_INITRAMFS_REQUEST_SEND_CAP].load(Ordering::Relaxed),
+                initramfs_request_recv_cap_for_child: STARTUP_ARG_SLOTS[STARTUP_SLOT_INITRAMFS_REQUEST_RECV_CAP_FOR_CHILD].load(Ordering::Relaxed),
+                control0: STARTUP_ARG_SLOTS[STARTUP_SLOT_INIT_ORCH_CONTROL0].load(Ordering::Relaxed),
+                control1: 0,
+            })
+        }
     }
 
     #[inline]
@@ -762,10 +787,11 @@ pub mod runtime {
     ///
     /// Missing/unset slots should be provided as `0`.
     #[inline]
-    pub fn install_startup_arg_slots(slots: [u64; STARTUP_SLOT_COUNT]) {
+    pub fn install_startup_arg_slots<const N: usize>(slots: [u64; N]) {
         let mut index = 0usize;
         while index < STARTUP_SLOT_COUNT {
-            STARTUP_ARG_SLOTS[index].store(slots[index], Ordering::Relaxed);
+            let value = if index < N { slots[index] } else { 0 };
+            STARTUP_ARG_SLOTS[index].store(value, Ordering::Relaxed);
             index += 1;
         }
     }
