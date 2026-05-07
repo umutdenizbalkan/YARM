@@ -20,7 +20,7 @@
 - `10`: `FutexWake` (`arg0=addr`, `arg1=max_wake`)
 - `11`: `SpawnThread` (`arg0=tls_base`, `arg1=user_stack_top`, `arg2=user_entry`)
 - `12`: `Fork` (fork current process with CoW; return child tid in parent)
-- `13`: `VmAnonMap` (reserved; currently returns `InvalidArgs`)
+- `13`: `VmAnonMap` (staged anonymous MemoryObject allocation+mapping for service buffers)
 - `14`: `VmBrk` (staged: query + grow supported, shrink unsupported)
 
 ## Syscalls `9..14` status
@@ -29,7 +29,7 @@
 - `10` `FutexWake`: exposed and wired.
 - `11` `SpawnThread`: exposed and wired.
 - `12` `Fork`: exposed and wired.
-- `13` `VmAnonMap`: reserved syscall number; current implementation is a stub returning `InvalidArgs`.
+- `13` `VmAnonMap`: staged syscall; caller-specified non-zero page-aligned VA, READ|WRITE anonymous map, returns mapped base/rounded length/MemoryObject cap.
 - `14` `VmBrk`: staged syscall; query and grow are supported, shrink is currently unsupported.
 
 ## Futex safety contract
@@ -122,6 +122,25 @@
 - `args[3]`: protection flags bitmask (`READ=0x1`, `WRITE=0x2`, `EXEC=0x4`)
 - `args[4]`: reserved (must be `0`)
 - `args[5]`: reserved (must be `0`)
+
+### `VmAnonMap` argument layout
+
+- `args[0]`: target user virtual address (must be non-zero and page-aligned)
+- `args[1]`: requested mapping length in bytes (`>0`, rounded up to page size)
+- `args[2]`: protection flags bitmask (`READ=0x1`, `WRITE=0x2`, `EXEC=0x4`)
+  - staged policy: requires `READ|WRITE`; `EXEC` is rejected
+- `args[3]`: reserved (must be `0`)
+- `args[4]`: reserved (must be `0`)
+- `args[5]`: reserved (must be `0`)
+
+`VmAnonMap` semantics (staged):
+
+- allocates an anonymous `MemoryObject` sized to the rounded mapping length;
+- maps it into the caller's current user ASID at the provided base;
+- returns mapping + transfer-cap tuple in return registers:
+  - `ret0 = mapped_base_va`
+  - `ret1 = mapped_len_rounded_to_page`
+  - `ret2 = memory_object_cap_id` (caller-local cap, suitable for IPC transfer).
 
 ### `SpawnThread` argument layout and runtime contract
 

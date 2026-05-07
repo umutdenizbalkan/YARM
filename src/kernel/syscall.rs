@@ -508,10 +508,55 @@ fn handle_fork(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), Sy
 }
 
 fn handle_vm_anon_map(
-    _kernel: &mut KernelState,
-    _frame: &mut TrapFrame,
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    Err(SyscallError::InvalidArgs)
+    let base = frame.arg(SYSCALL_ARG_CAP);
+    let len = frame.arg(SYSCALL_ARG_PTR);
+    let prot = frame.arg(SYSCALL_ARG_LEN);
+    let reserved = [
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+        frame.arg(SYSCALL_ARG_TRANSFER_CAP),
+    ];
+    if reserved.iter().any(|v| *v != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if base == 0 || len == 0 || !base.is_multiple_of(PAGE_SIZE) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    validate_user_region(base as u64, len as u64)?;
+    let map_len = round_up_page(len)?;
+    let end = base.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
+    let flags = vm_map_page_flags(prot)?;
+    if !flags.read || !flags.write || flags.execute {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    let (_mem_id, mem_cap) = kernel
+        .alloc_anonymous_memory_object_with_len(map_len)
+        .map_err(SyscallError::from)?;
+
+    let mut va = base;
+    while va < end {
+        if let Err(err) =
+            kernel.map_user_page_in_current_asid_with_caps(mem_cap, VirtAddr(va as u64), flags)
+        {
+            let mut rollback_va = base;
+            while rollback_va < va {
+                let _ = kernel.unmap_user_page_in_current_asid(VirtAddr(rollback_va as u64));
+                rollback_va += PAGE_SIZE;
+            }
+            if let Some(cnode) = kernel.current_task_cnode() {
+                let _ = kernel.revoke_capability_in_cnode(cnode, mem_cap);
+            }
+            return Err(SyscallError::from(err));
+        }
+        va += PAGE_SIZE;
+    }
+
+    frame.set_ok(base, map_len, mem_cap.0 as usize);
+    Ok(())
 }
 
 fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
@@ -2773,6 +2818,55 @@ mod tests {
         );
         let err = dispatch(&mut state, &mut second).expect_err("guard conflict");
         assert_eq!(err, SyscallError::InvalidArgs);
+    }
+
+    #[test]
+    fn vm_anon_map_syscall_maps_region_and_returns_memory_object_cap() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let mut frame = TrapFrame::new(
+            Syscall::VmAnonMap as usize,
+            [
+                0x8000,
+                PAGE_SIZE + 1,
+                SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(&mut state, &mut frame).expect("vm_anon_map");
+        assert_eq!(frame.error_code(), None);
+        assert_eq!(frame.ret0(), 0x8000);
+        assert_eq!(frame.ret1(), PAGE_SIZE * 2);
+        let cap = CapId(frame.ret2() as u64);
+        let resolved = state
+            .capability_service()
+            .resolve_current_task_capability(cap)
+            .expect("resolved cap");
+        assert!(matches!(resolved.object, CapObject::MemoryObject { .. }));
+    }
+
+    #[test]
+    fn vm_anon_map_rejects_invalid_args() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (asid, _aspace_map_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+
+        let cases = [
+            [0, PAGE_SIZE, SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE, 0, 0, 0],
+            [0x8101, PAGE_SIZE, SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE, 0, 0, 0],
+            [0x9000, 0, SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE, 0, 0, 0],
+            [0xA000, PAGE_SIZE, SYSCALL_VM_MAP_PROT_READ, 0, 0, 0],
+            [0xB000, PAGE_SIZE, SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE | SYSCALL_VM_MAP_PROT_EXEC, 0, 0, 0],
+            [0xC000, PAGE_SIZE, SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE, 1, 0, 0],
+        ];
+        for args in cases {
+            let mut frame = TrapFrame::new(Syscall::VmAnonMap as usize, args);
+            let err = dispatch(&mut state, &mut frame).expect_err("invalid");
+            assert_eq!(err, SyscallError::InvalidArgs);
+        }
     }
 
     #[test]

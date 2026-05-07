@@ -53,6 +53,7 @@ pub mod syscall {
     const SYSCALL_IPC_RECV_V2_NR: usize = 16;
     const SYSCALL_IPC_CALL_V2_NR: usize = 17;
     const SYSCALL_IPC_REPLY_V2_NR: usize = 18;
+    const SYSCALL_VM_ANON_MAP_NR: usize = 13;
     const SYSCALL_YIELD_NR: usize = 0;
     pub trait IpcTransportV2 {
         fn send_v2(
@@ -204,6 +205,13 @@ pub mod syscall {
         pub flags: u16,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AnonMapResult {
+        pub base: usize,
+        pub len: usize,
+        pub mem_cap: u64,
+    }
+
     #[inline]
     pub fn decode_shared_reply_response(
         response: &IpcV2Response,
@@ -217,6 +225,29 @@ pub mod syscall {
             offset: meta.offset,
             len: meta.len,
             flags: meta.flags,
+        })
+    }
+
+    #[inline]
+    pub unsafe fn vm_anon_map(
+        base: usize,
+        len: usize,
+        prot: u64,
+    ) -> core::result::Result<AnonMapResult, SyscallError> {
+        let args = [base, len, prot as usize, 0, 0, 0];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_VM_ANON_MAP_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(AnonMapResult {
+            base: ret.ret0,
+            len: ret.ret1,
+            mem_cap: ret.ret2 as u64,
         })
     }
 
@@ -1091,6 +1122,17 @@ mod tests {
                 && src.contains("unsafe { ipc_reply_v2(reply_cap, &payload, Some(mem_cap)) }")
                 && src.contains("decode_shared_reply_response(&response)"),
             "shared reply helpers must remain metadata/transfer-cap wrappers without automatic mapping",
+        );
+    }
+
+    #[test]
+    fn vm_anon_map_wrapper_is_exposed_with_expected_syscall_number() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("const SYSCALL_VM_ANON_MAP_NR: usize = 13;")
+                && src.contains("pub struct AnonMapResult")
+                && src.contains("pub unsafe fn vm_anon_map("),
+            "user runtime must expose staged vm_anon_map wrapper and result type",
         );
     }
 }
