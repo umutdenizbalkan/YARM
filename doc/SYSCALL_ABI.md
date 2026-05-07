@@ -242,6 +242,11 @@
   - a syscall ABI v2 with expanded argument/register mapping, or
   - an alternate payload path that preserves existing syscall argument ABI compatibility.
 
+
+## Shared-reply adoption checklist
+
+- See `doc/IPC_V2_SHARED_REPLY_ADOPTION.md` for service migration/adoption guidance and rollout checks.
+
 ## IPC ABI v2 status and semantics
 
 - v1 remains unchanged: `IPC_REGISTER_WORDS = 2` in syscall argument lanes.
