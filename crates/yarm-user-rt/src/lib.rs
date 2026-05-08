@@ -831,6 +831,11 @@ pub mod runtime {
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
+            0,
         ];
         debug_assert_eq!(STARTUP_ARGS_BYTES, slots.len() * core::mem::size_of::<u64>());
         if startup_slots_ptr != 0 && startup_slots_len >= slots.len() {
@@ -1137,6 +1142,39 @@ mod tests {
             original.supervisor_tid.unwrap_or(0),
             original.supervisor_restart_window_ticks.unwrap_or(0),
             original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
+        ]);
+    }
+
+    #[test]
+    fn startup_canonical_17_slot_layout_preserves_pm_caps_slots() {
+        let original = startup_context();
+        install_startup_arg_slots([42, 5001, 5002, 9, 10, 11, 12, 13, 14, 15, 16, 17, 0, 18, 19, 20, 21]);
+        assert_eq!(startup_context().process_manager_caps(), Some((5001, 5002)));
+        assert_eq!(startup_context().init_orchestration_caps_v1(), None);
+        install_startup_arg_slots([
+            original.task_id,
+            original.process_manager_request_send_cap.map(u64::from).unwrap_or(0),
+            original.process_manager_reply_recv_cap.map(u64::from).unwrap_or(0),
+            original.supervisor_fault_recv_ep.map(u64::from).unwrap_or(0),
+            original.supervisor_control_send_ep.map(u64::from).unwrap_or(0),
+            original.supervisor_control_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_send_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_tid.unwrap_or(0),
+            original.supervisor_tid.unwrap_or(0),
+            original.supervisor_restart_window_ticks.unwrap_or(0),
+            original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
+            original
+                .init_orchestration_caps_v1()
+                .map(|c| ((c.version as u64) << 48) | ((c.reserved as u64) << 32))
+                .unwrap_or(0),
+            original.init_orchestration_caps_v1().map(|c| c.initramfs_request_send_cap).unwrap_or(0),
+            original
+                .init_orchestration_caps_v1()
+                .map(|c| c.initramfs_request_recv_cap_for_child)
+                .unwrap_or(0),
+            original.init_orchestration_caps_v1().map(|c| c.control0).unwrap_or(0),
+            original.init_orchestration_caps_v1().map(|c| c.control1).unwrap_or(0),
         ]);
     }
 

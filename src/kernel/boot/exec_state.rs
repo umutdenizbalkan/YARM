@@ -605,6 +605,13 @@ impl KernelState {
             16usize,
             (UserImageSpec::STARTUP_SLOT_COUNT > 16) as u8
         );
+        for slot in [0usize, 1, 2, 3, 4, 12, 13, 14, 15, 16] {
+            crate::yarm_log!(
+                "YARM_FIRST_USER_STARTUP_SLOT slot={} value={}",
+                slot,
+                spec.startup_args[slot]
+            );
+        }
 
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs

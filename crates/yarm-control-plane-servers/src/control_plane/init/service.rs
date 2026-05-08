@@ -311,6 +311,36 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
 ) -> Result<(), ProcessManagerError> {
     yarm_user_rt::serial_marker_line("INIT_STARTUP_CONTEXT_DECODE_BEGIN");
     let ctx = yarm_user_rt::runtime::startup_context();
+    {
+        let mut msg = [0u8; 128];
+        let (slot1, slot2) = (
+            ctx.process_manager_request_send_cap.map(u64::from).unwrap_or(0),
+            ctx.process_manager_reply_recv_cap.map(u64::from).unwrap_or(0),
+        );
+        let rendered = {
+            use core::fmt::Write;
+            struct Buf<'a> {
+                data: &'a mut [u8],
+                len: usize,
+            }
+            impl Write for Buf<'_> {
+                fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                    let bytes = s.as_bytes();
+                    let n = core::cmp::min(bytes.len(), self.data.len().saturating_sub(self.len));
+                    self.data[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+                    self.len += n;
+                    Ok(())
+                }
+            }
+            let mut b = Buf { data: &mut msg, len: 0 };
+            let _ = write!(&mut b, "INIT_PM_CAPS_RAW slot1={} slot2={}", slot1, slot2);
+            b.len
+        };
+        if rendered != 0 {
+            let marker = unsafe { core::str::from_utf8_unchecked(&msg[..rendered]) };
+            yarm_user_rt::serial_marker_line(marker);
+        }
+    }
     yarm_user_rt::serial_marker_line("INIT_PM_CAPS_CHECK_BEGIN");
     let (proc_send_cap, proc_reply_cap) = ctx
         .process_manager_caps()

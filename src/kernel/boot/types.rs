@@ -39,17 +39,19 @@ pub struct UserImageSpec {
     pub entry: usize,
     pub asid: Option<Asid>,
     pub class: TaskClass,
-    /// Startup entry ABI arguments passed to userspace `_start`.
+    /// Canonical startup slot block copied to userspace.
     ///
     /// Slot contract:
-    /// - arg0 => task_id / tid
-    /// - arg1 => process-manager request-send cap
-    /// - arg2 => process-manager reply-recv cap
-    /// - arg3 => supervisor fault receive endpoint cap
-    /// - arg4 => reserved/staged (currently 0)
+    /// - slot0 => task_id / tid
+    /// - slot1 => process-manager request-send cap
+    /// - slot2 => process-manager reply-recv cap
+    /// - slot3.. => extended startup metadata/caps
     ///
-    /// Additional slots may be populated by launchers for server-specific
-    /// runtime handoff metadata (for example supervisor endpoint caps).
+    /// Startup register ABI derives from these slots:
+    /// - arg0/arg1/arg2 mirror slot0/slot1/slot2.
+    /// - arg3 carries startup-slot-block userspace pointer.
+    /// - arg4 carries startup-slot count.
+    /// - arg5 is reserved (0).
     pub startup_args: [u64; Self::STARTUP_SLOT_COUNT],
 }
 
