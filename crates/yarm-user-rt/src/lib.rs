@@ -22,8 +22,12 @@ pub mod ipc {
 
 #[inline]
 pub fn serial_marker_line(message: &str) {
-    crate::arch::serial_write_bytes(message.as_bytes());
-    crate::arch::serial_write_bytes(b"\n");
+    let bytes = message.as_bytes();
+    let mut line = [0u8; 257];
+    let len = core::cmp::min(bytes.len(), 256);
+    line[..len].copy_from_slice(&bytes[..len]);
+    line[len] = b'\n';
+    crate::arch::serial_write_bytes(&line[..len + 1]);
 }
 
 pub mod capability {
@@ -1338,6 +1342,22 @@ mod tests {
                 && src.contains("pub unsafe fn vm_unmap(")
                 && src.contains("pub unsafe fn cap_release("),
             "user runtime must expose staged vm_anon_map/vm_unmap/cap_release wrappers and result type",
+        );
+    }
+
+    #[test]
+    fn serial_marker_line_uses_single_buffered_syscall_path() {
+        let arch_src = include_str!("arch/mod.rs");
+        let lib_src = include_str!("lib.rs");
+        assert!(
+            arch_src.contains("const SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR: usize = 22;")
+                && arch_src.contains("raw_syscall(\n                    SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR,")
+                && !arch_src.contains("[byte as usize, 0, 0, 0, 0, 0]"),
+            "marker transport must use buffered debug syscall rather than per-byte loops",
+        );
+        assert!(
+            lib_src.contains("crate::arch::serial_write_bytes(&line[..len + 1]);"),
+            "serial_marker_line must submit the full marker line in one buffered call",
         );
     }
 

@@ -40,8 +40,10 @@ pub const SYSCALL_IPC_REPLY_V2_NR: usize = 18;
 pub const SYSCALL_VM_UNMAP_NR: usize = 19;
 pub const SYSCALL_CAP_RELEASE_NR: usize = 20;
 pub const SYSCALL_DEBUG_SERIAL_WRITE_NR: usize = 21;
-pub const SYSCALL_COUNT: usize = 22;
-const _: [(); SYSCALL_COUNT] = [(); 22];
+pub const SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR: usize = 22;
+pub const SYSCALL_COUNT: usize = 23;
+const _: [(); SYSCALL_COUNT] = [(); 23];
+pub const DEBUG_SERIAL_WRITE_BUF_MAX_LEN: usize = 256;
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -88,10 +90,11 @@ pub enum Syscall {
     VmUnmap = SYSCALL_VM_UNMAP_NR,
     CapRelease = SYSCALL_CAP_RELEASE_NR,
     DebugSerialWrite = SYSCALL_DEBUG_SERIAL_WRITE_NR,
+    DebugSerialWriteBuf = SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 22;
+    pub const VARIANT_COUNT: usize = 23;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -120,6 +123,7 @@ impl Syscall {
             SYSCALL_VM_UNMAP_NR => Ok(Self::VmUnmap),
             SYSCALL_CAP_RELEASE_NR => Ok(Self::CapRelease),
             SYSCALL_DEBUG_SERIAL_WRITE_NR => Ok(Self::DebugSerialWrite),
+            SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR => Ok(Self::DebugSerialWriteBuf),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -1155,6 +1159,30 @@ fn handle_debug_serial_write(frame: &mut TrapFrame) -> Result<(), SyscallError> 
     Ok(())
 }
 
+fn handle_debug_serial_write_buf(
+    kernel: &KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    let user_ptr = frame.arg(0);
+    let len = frame.arg(1);
+    let reserved = [frame.arg(2), frame.arg(3), frame.arg(4), frame.arg(5)];
+    if reserved.iter().any(|value| *value != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if user_ptr == 0 || len == 0 || len > DEBUG_SERIAL_WRITE_BUF_MAX_LEN {
+        return Err(SyscallError::InvalidArgs);
+    }
+    validate_user_region(user_ptr as u64, len as u64)?;
+    let mut buf = [0u8; DEBUG_SERIAL_WRITE_BUF_MAX_LEN];
+    read_user_bytes_exact(kernel, user_ptr, &mut buf[..len])?;
+    let mut emitted = 0usize;
+    if DEBUG_SERIAL_SYSCALL_ENABLED && crate::arch::console::try_write_bytes(&buf[..len]) {
+        emitted = 1;
+    }
+    frame.set_ok(emitted, 0, 0);
+    Ok(())
+}
+
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if frame.syscall_num() == SYSCALL_YIELD_NR {
@@ -1198,6 +1226,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::IpcCallV2 => handle_ipc_call_v2_stub(kernel, frame),
         Syscall::IpcReplyV2 => handle_ipc_reply_v2_stub(kernel, frame),
         Syscall::DebugSerialWrite => handle_debug_serial_write(frame),
+        Syscall::DebugSerialWriteBuf => handle_debug_serial_write_buf(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_blocked = caller_tid.is_some_and(|tid| {
@@ -2366,7 +2395,8 @@ mod tests {
         assert_eq!(SYSCALL_VM_UNMAP_NR, 19);
         assert_eq!(SYSCALL_CAP_RELEASE_NR, 20);
         assert_eq!(SYSCALL_DEBUG_SERIAL_WRITE_NR, 21);
-        assert_eq!(SYSCALL_COUNT, 22);
+        assert_eq!(SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR, 22);
+        assert_eq!(SYSCALL_COUNT, 23);
     }
 
     #[test]
@@ -2441,6 +2471,10 @@ mod tests {
             Syscall::decode(SYSCALL_DEBUG_SERIAL_WRITE_NR).expect("decode"),
             Syscall::DebugSerialWrite
         );
+        assert_eq!(
+            Syscall::decode(SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR).expect("decode"),
+            Syscall::DebugSerialWriteBuf
+        );
     }
 
     #[test]
@@ -2472,6 +2506,54 @@ mod tests {
         dispatch(&mut state, &mut frame).expect("no-op success");
         assert_eq!(frame.error_code(), None);
         assert_eq!(frame.ret0(), 0);
+    }
+
+    #[test]
+    fn syscall_debug_serial_buf_rejects_nonzero_reserved_args() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let mut frame = TrapFrame::new(SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR, [0x6000, 2, 1, 0, 0, 0]);
+        assert_eq!(dispatch(&mut state, &mut frame), Err(SyscallError::InvalidArgs));
+    }
+
+    #[test]
+    fn syscall_debug_serial_buf_rejects_zero_len() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let mut frame = TrapFrame::new(SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR, [0x6000, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut state, &mut frame), Err(SyscallError::InvalidArgs));
+    }
+
+    #[test]
+    fn syscall_debug_serial_buf_rejects_oversize_len() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let mut frame = TrapFrame::new(
+            SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR,
+            [0x6000, DEBUG_SERIAL_WRITE_BUF_MAX_LEN + 1, 0, 0, 0, 0],
+        );
+        assert_eq!(dispatch(&mut state, &mut frame), Err(SyscallError::InvalidArgs));
+    }
+
+    #[test]
+    fn syscall_debug_serial_buf_rejects_invalid_user_pointer() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let kernel_ptr = crate::arch::vm_layout::KERNEL_SPACE_BASE as usize;
+        let mut frame = TrapFrame::new(SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR, [kernel_ptr, 1, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut state, &mut frame), Err(SyscallError::InvalidArgs));
+    }
+
+    #[test]
+    fn syscall_debug_serial_buf_accepts_valid_user_buffer() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state
+            .copy_to_current_user(0x6500, b"ok")
+            .expect("write user bytes");
+        let mut frame = TrapFrame::new(SYSCALL_DEBUG_SERIAL_WRITE_BUF_NR, [0x6500, 2, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut frame).expect("buffer write");
+        assert_eq!(frame.error_code(), None);
+        if DEBUG_SERIAL_SYSCALL_ENABLED {
+            assert_eq!(frame.ret0(), 1);
+        } else {
+            assert_eq!(frame.ret0(), 0);
+        }
     }
 
     #[test]

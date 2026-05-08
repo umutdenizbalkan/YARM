@@ -186,6 +186,25 @@
 - In non-debug kernel builds, syscall 21 remains present and returns success as a no-op.
 - Performs no userspace pointer dereference and does not read/write userspace memory.
 
+### `DebugSerialWriteBuf` argument layout (diagnostic-only)
+
+- Syscall number: `22`
+- `args[0]`: userspace pointer to marker bytes
+- `args[1]`: marker byte length (`1..=256`)
+- `args[2..5]`: reserved (must be `0`)
+
+`DebugSerialWriteBuf` semantics:
+
+- Validates user pointer range as userspace-accessible.
+- Copies bytes from userspace into a fixed kernel buffer (max 256 bytes).
+- Emits the full copied buffer through the active architecture debug console backend.
+- Returns success with status in `ret0`:
+  - `ret0=1`: buffer emitted/submitted
+  - `ret0=0`: debug serial disabled or backend unavailable (non-fatal no-op)
+  - `ret1=0`, `ret2=0`
+- Returns `InvalidArgs` when pointer is null, length is zero/oversize, reserved arguments are non-zero, or pointer range is invalid.
+- Diagnostic-only ABI, not a general logging/data plane syscall.
+
 Temporary gating policy:
 
 - Byte emission is enabled only in debug kernel builds (`cfg(debug_assertions)`).
