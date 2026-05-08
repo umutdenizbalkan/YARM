@@ -278,7 +278,7 @@ pub fn run() {
             yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=orch_caps_missing");
         }
         Err(ProcessManagerError::WouldBlock) => {
-            yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=spawn_ipc_would_block");
+            yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=pm_endpoint_no_receiver");
         }
         Err(_) => yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=spawn_error"),
     }
@@ -375,7 +375,7 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
         .map_err(|err| {
             if err == yarm_user_rt::syscall::SyscallError::WouldBlock {
                 yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_CALL_WOULD_BLOCK");
-                yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_REPLY_FAIL reason=spawn_ipc_would_block");
+                yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_REPLY_FAIL reason=pm_endpoint_no_receiver");
                 ProcessManagerError::WouldBlock
             } else {
                 yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_REPLY_FAIL reason=spawn_ipc_error");

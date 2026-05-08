@@ -977,9 +977,15 @@ fn handle_ipc_call_v2_stub(
     let reply_recv_cap = CapId(block.aux0);
     let request_opcode = u16::try_from(block.aux1).map_err(|_| SyscallError::InvalidArgs)?;
     validate_endpoint_right(kernel, reply_recv_cap, CapRights::RECEIVE)?;
-    let responder_tid = kernel
-        .endpoint_waiter_tid(endpoint)
-        .ok_or(SyscallError::WouldBlock)?;
+    let Some(responder_tid) = kernel.endpoint_waiter_tid(endpoint) else {
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+        crate::yarm_log!(
+            "IPC_CALL_V2_WOULD_BLOCK cap={} endpoint={} reason=no_receiver_or_no_reply",
+            cap.0,
+            endpoint.id
+        );
+        return Err(SyscallError::WouldBlock);
+    };
 
     if (block.flags & IPC_V2_FLAG_TRANSFER_CAP) != 0 {
         return Err(SyscallError::InvalidArgs);

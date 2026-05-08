@@ -110,7 +110,7 @@ pub fn bootstrap_first_user_task(
     let image_bytes: &[u8] = image.as_deref().unwrap_or(&fallback);
     let (entry, heap_base) = kernel.load_elf_pt_load_segments(asid, image_bytes)?;
     kernel.register_task_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)?;
-    let (_pm_eid, pm_send_cap_root, pm_recv_cap_root) = kernel.create_endpoint(8)?;
+    let (pm_eid, pm_send_cap_root, pm_recv_cap_root) = kernel.create_endpoint(8)?;
     let pm_request_send_init = kernel.grant_capability_task_to_task_with_rights(
         0,
         pm_send_cap_root,
@@ -131,6 +131,13 @@ pub fn bootstrap_first_user_task(
         crate::kernel::capabilities::CapRights::RECEIVE,
     )?;
     kernel.set_supervisor_endpoint_for_task(RING3_INIT_SERVER_TID, supervisor_fault_recv_init)?;
+    crate::yarm_log!(
+        "PM_BOOT_CAPS slot1={} slot2={} request_endpoint={} reply_endpoint={} receiver_tid=none",
+        pm_request_send_init.0,
+        pm_reply_recv_init.0,
+        pm_eid,
+        pm_eid
+    );
     let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
     startup_args[0] = RING3_INIT_SERVER_TID;
     startup_args[1] = pm_request_send_init.0;

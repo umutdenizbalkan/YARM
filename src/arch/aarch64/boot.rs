@@ -923,7 +923,7 @@ pub fn bootstrap_first_user_task(
             crate::yarm_log!("YARM_FIRST_USER_FAIL step=register_task err={:?}", err);
             err
         })?;
-    let (_pm_eid, pm_send_cap_root, pm_recv_cap_root) = kernel.create_endpoint(8).map_err(|err| {
+    let (pm_eid, pm_send_cap_root, pm_recv_cap_root) = kernel.create_endpoint(8).map_err(|err| {
         crate::yarm_log!("YARM_FIRST_USER_FAIL step=create_pm_endpoint err={:?}", err);
         err
     })?;
@@ -968,6 +968,13 @@ pub fn bootstrap_first_user_task(
             crate::yarm_log!("YARM_FIRST_USER_FAIL step=set_supervisor_endpoint err={:?}", err);
             err
         })?;
+    crate::yarm_log!(
+        "PM_BOOT_CAPS slot1={} slot2={} request_endpoint={} reply_endpoint={} receiver_tid=none",
+        pm_request_send_init.0,
+        pm_reply_recv_init.0,
+        pm_eid,
+        pm_eid
+    );
     // Startup ABI handoff:
     // - arg0: task id / tid
     // - arg1: process-manager request SEND cap id (init-local)
