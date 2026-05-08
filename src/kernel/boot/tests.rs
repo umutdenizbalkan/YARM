@@ -785,6 +785,39 @@ fn spawn_user_task_from_image_copies_startup_args_into_user_context() {
 }
 
 #[test]
+fn first_user_orchestration_writer_populates_slots_12_to_16_without_touching_pm_slots() {
+    let mut state = Bootstrap::init().expect("init");
+    state
+        .register_task_with_class(1, TaskClass::SystemServer)
+        .expect("register init");
+    let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+    startup_args[1] = 65536;
+    startup_args[2] = 65537;
+    install_init_orchestration_caps_for_first_user(&mut state, 1, &mut startup_args)
+        .expect("install orchestration caps");
+    assert_eq!(startup_args[12], yarm_ipc_abi::process_abi::InitOrchestrationCapsV1::VERSION as u64);
+    assert_ne!(startup_args[13], 0);
+    assert_ne!(startup_args[14], 0);
+    assert_ne!(startup_args[15], 0);
+    assert_ne!(startup_args[16], 0);
+    assert_eq!(startup_args[1], 65536);
+    assert_eq!(startup_args[2], 65537);
+}
+
+#[test]
+fn first_user_orchestration_writer_skips_truthfully_when_init_task_missing() {
+    let mut state = Bootstrap::init().expect("init");
+    let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+    let result = install_init_orchestration_caps_for_first_user(&mut state, 1, &mut startup_args);
+    assert!(result.is_err());
+    assert_eq!(startup_args[12], 0);
+    assert_eq!(startup_args[13], 0);
+    assert_eq!(startup_args[14], 0);
+    assert_eq!(startup_args[15], 0);
+    assert_eq!(startup_args[16], 0);
+}
+
+#[test]
 fn delegated_endpoint_caps_are_init_local_and_resolvable() {
     let mut state = Bootstrap::init().expect("init");
     state

@@ -979,6 +979,11 @@ pub fn bootstrap_first_user_task(
     if startup_args.len() > 3 {
         startup_args[3] = supervisor_fault_recv_init.0;
     }
+    crate::kernel::boot::install_init_orchestration_caps_for_first_user(
+        kernel,
+        RING3_INIT_SERVER_TID,
+        &mut startup_args,
+    )?;
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

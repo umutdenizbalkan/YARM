@@ -149,5 +149,84 @@ pub struct KernelState {
 
 pub struct Bootstrap;
 
+pub fn install_init_orchestration_caps_for_first_user(
+    kernel: &mut KernelState,
+    init_tid: u64,
+    startup_args: &mut [u64; UserImageSpec::STARTUP_SLOT_COUNT],
+) -> Result<(), KernelError> {
+    crate::yarm_log!("INIT_ORCH_WRITER_BEGIN init_tid={}", init_tid);
+    if init_tid == 0 {
+        crate::yarm_log!("INIT_ORCH_WRITER_SKIPPED reason=invalid_init_tid");
+        return Err(KernelError::TaskMissing);
+    }
+    let (_, request_send_root, request_recv_root) = match kernel.create_endpoint(16) {
+        Ok(v) => v,
+        Err(err) => {
+            crate::yarm_log!("INIT_ORCH_WRITER_SKIPPED reason=create_request_endpoint_failed err={:?}", err);
+            return Err(err);
+        }
+    };
+    let request_send = kernel.grant_capability_task_to_task_with_rights(
+        0,
+        request_send_root,
+        init_tid,
+        CapRights::SEND,
+    )
+    .map_err(|err| {
+        crate::yarm_log!("INIT_ORCH_WRITER_SKIPPED reason=grant_request_send_failed err={:?}", err);
+        err
+    })?;
+    let request_recv = kernel.grant_capability_task_to_task_with_rights(
+        0,
+        request_recv_root,
+        init_tid,
+        CapRights::RECEIVE,
+    )
+    .map_err(|err| {
+        crate::yarm_log!("INIT_ORCH_WRITER_SKIPPED reason=grant_request_recv_failed err={:?}", err);
+        err
+    })?;
+    let (_, readiness_send_root, readiness_recv_root) = match kernel.create_endpoint(16) {
+        Ok(v) => v,
+        Err(err) => {
+            crate::yarm_log!("INIT_ORCH_WRITER_SKIPPED reason=create_readiness_endpoint_failed err={:?}", err);
+            return Err(err);
+        }
+    };
+    let readiness_send = kernel.grant_capability_task_to_task_with_rights(
+        0,
+        readiness_send_root,
+        init_tid,
+        CapRights::SEND,
+    )
+    .map_err(|err| {
+        crate::yarm_log!("INIT_ORCH_WRITER_SKIPPED reason=grant_readiness_send_failed err={:?}", err);
+        err
+    })?;
+    let readiness_recv = kernel.grant_capability_task_to_task_with_rights(
+        0,
+        readiness_recv_root,
+        init_tid,
+        CapRights::RECEIVE,
+    )
+    .map_err(|err| {
+        crate::yarm_log!("INIT_ORCH_WRITER_SKIPPED reason=grant_readiness_recv_failed err={:?}", err);
+        err
+    })?;
+    startup_args[12] = yarm_ipc_abi::process_abi::InitOrchestrationCapsV1::VERSION as u64;
+    startup_args[13] = request_send.0;
+    startup_args[14] = request_recv.0;
+    startup_args[15] = readiness_recv.0;
+    startup_args[16] = readiness_send.0;
+    crate::yarm_log!(
+        "INIT_ORCH_WRITER_DONE slot13={} slot14={} slot15={} slot16={}",
+        startup_args[13],
+        startup_args[14],
+        startup_args[15],
+        startup_args[16]
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
