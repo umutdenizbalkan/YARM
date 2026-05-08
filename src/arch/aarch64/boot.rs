@@ -528,6 +528,18 @@ static BSP_RELEASED_SECONDARIES: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static BSP_RELEASE_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static KDBG_SERIAL_WRITEBYTE_TEST_EMITTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn emit_kdbg_serial_writebyte_test_once() {
+    if KDBG_SERIAL_WRITEBYTE_TEST_EMITTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    for &byte in b"KDBG_SERIAL_WRITEBYTE_TEST\n" {
+        crate::arch::console::write_byte(byte);
+    }
+}
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static SECONDARY_ONLINE_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static SECONDARY_READY_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
@@ -1665,6 +1677,7 @@ fn setup_bootstrap_mmu() {
     }
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M2");
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=mmu_enabled");
+    emit_kdbg_serial_writebyte_test_once();
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]

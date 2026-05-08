@@ -26,6 +26,10 @@ static UART_LOG_LOCK: SpinLockIrq<()> = SpinLockIrq::new(());
 pub fn write_line(_msg: &str) {}
 #[cfg(feature = "hosted-dev")]
 pub fn write_byte(_byte: u8) {}
+#[cfg(feature = "hosted-dev")]
+pub fn try_write_byte(_byte: u8) -> bool {
+    false
+}
 
 #[cfg(not(feature = "hosted-dev"))]
 pub fn init_early_mmio_base(base: usize) {
@@ -58,7 +62,15 @@ fn write_byte_impl(byte: u8) {
 
 #[cfg(not(feature = "hosted-dev"))]
 pub fn write_byte(byte: u8) {
+    let _guard = UART_LOG_LOCK.lock();
     write_byte_impl(byte);
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+pub fn try_write_byte(byte: u8) -> bool {
+    // Reuse the same PL011 backend and lock as visible kernel boot logs.
+    write_byte(byte);
+    true
 }
 
 #[cfg(not(feature = "hosted-dev"))]

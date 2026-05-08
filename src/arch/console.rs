@@ -8,3 +8,7 @@ pub fn write_line(msg: &str) {
 pub fn write_byte(byte: u8) {
     crate::arch::selected_isa::console::write_byte(byte);
 }
+
+pub fn try_write_byte(byte: u8) -> bool {
+    crate::arch::selected_isa::console::try_write_byte(byte)
+}

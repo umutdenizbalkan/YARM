@@ -1148,8 +1148,7 @@ fn handle_debug_serial_write(frame: &mut TrapFrame) -> Result<(), SyscallError> 
     }
     let byte = (frame.arg(0) & 0xff) as u8;
     let mut emitted = 0usize;
-    if DEBUG_SERIAL_SYSCALL_ENABLED {
-        crate::arch::console::write_byte(byte);
+    if DEBUG_SERIAL_SYSCALL_ENABLED && crate::arch::console::try_write_byte(byte) {
         emitted = 1;
     }
     frame.set_ok(emitted, 0, 0);

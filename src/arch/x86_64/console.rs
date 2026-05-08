@@ -12,6 +12,10 @@ const LINE_STATUS_THR_EMPTY: u8 = 1 << 5;
 pub fn write_line(_msg: &str) {}
 #[cfg(feature = "hosted-dev")]
 pub fn write_byte(_byte: u8) {}
+#[cfg(feature = "hosted-dev")]
+pub fn try_write_byte(_byte: u8) -> bool {
+    false
+}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn write_line(msg: &str) {
@@ -49,6 +53,12 @@ pub fn write_byte_public(byte: u8) {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn try_write_byte(byte: u8) -> bool {
+    write_byte_public(byte);
+    true
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn outb(port: u16, value: u8) {
     unsafe {
         core::arch::asm!(
@@ -78,6 +88,10 @@ fn inb(port: u16) -> u8 {
 pub fn write_line(_msg: &str) {}
 #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "x86_64")))]
 pub fn write_byte(_byte: u8) {}
+#[cfg(all(not(feature = "hosted-dev"), not(target_arch = "x86_64")))]
+pub fn try_write_byte(_byte: u8) -> bool {
+    false
+}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub use write_byte_public as write_byte;
