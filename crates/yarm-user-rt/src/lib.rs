@@ -858,6 +858,39 @@ pub mod runtime {
         }
     }
 
+
+    #[inline]
+    fn emit_startup_install_arg_marker(label: &str, value: usize) {
+        let mut line = [0u8; 128];
+        let mut len = 0usize;
+        let bytes = label.as_bytes();
+        let copy = core::cmp::min(bytes.len(), line.len());
+        line[..copy].copy_from_slice(&bytes[..copy]);
+        len += copy;
+        append_u64_decimal(&mut line, &mut len, value as u64);
+        let msg = unsafe { core::str::from_utf8_unchecked(&line[..len]) };
+        crate::serial_marker_line(msg);
+    }
+
+    #[inline]
+    fn emit_startup_install_slots_marker(label: &str, slot1: u64, slot2: u64) {
+        let mut line = [0u8; 160];
+        let mut len = 0usize;
+        let prefix = label.as_bytes();
+        let copy = core::cmp::min(prefix.len(), line.len());
+        line[..copy].copy_from_slice(&prefix[..copy]);
+        len += copy;
+        append_u64_decimal(&mut line, &mut len, slot1);
+        if len < line.len() { line[len]=b' '; len += 1; }
+        const SLOT2: &[u8] = b"slot2=";
+        let copy2 = core::cmp::min(SLOT2.len(), line.len().saturating_sub(len));
+        line[len..len+copy2].copy_from_slice(&SLOT2[..copy2]);
+        len += copy2;
+        append_u64_decimal(&mut line, &mut len, slot2);
+        let msg = unsafe { core::str::from_utf8_unchecked(&line[..len]) };
+        crate::serial_marker_line(msg);
+    }
+
     #[inline]
     fn install_startup_args_from_abi(
         startup_task_id: u64,
@@ -866,6 +899,11 @@ pub mod runtime {
         startup_slots_ptr: usize,
         startup_slots_len: usize,
     ) {
+        emit_startup_install_arg_marker("STARTUP_INSTALL_ARG0 value=", startup_task_id as usize);
+        emit_startup_install_arg_marker("STARTUP_INSTALL_ARG1 value=", startup_proc_mgr_request_send_cap as usize);
+        emit_startup_install_arg_marker("STARTUP_INSTALL_ARG2 value=", startup_proc_mgr_reply_recv_cap as usize);
+        emit_startup_install_arg_marker("STARTUP_INSTALL_ARG3 value=", startup_slots_ptr);
+        emit_startup_install_arg_marker("STARTUP_INSTALL_ARG4 value=", startup_slots_len);
         let mut slots = [
             startup_task_id,
             startup_proc_mgr_request_send_cap,
@@ -886,6 +924,7 @@ pub mod runtime {
             0,
         ];
         debug_assert_eq!(STARTUP_ARGS_BYTES, slots.len() * core::mem::size_of::<u64>());
+        emit_startup_install_slots_marker("STARTUP_INSTALL_AFTER_DIRECT slot1=", slots[1], slots[2]);
         if startup_slots_ptr != 0 && startup_slots_len >= slots.len() {
             let src = startup_slots_ptr as *const u64;
             let mut index = 0usize;
@@ -895,7 +934,9 @@ pub mod runtime {
                 slots[index] = unsafe { core::ptr::read(src.add(index)) };
                 index += 1;
             }
+            emit_startup_install_slots_marker("STARTUP_INSTALL_AFTER_BLOCK slot1=", slots[1], slots[2]);
         }
+        emit_startup_install_slots_marker("STARTUP_INSTALL_FINAL slot1=", slots[1], slots[2]);
         install_startup_arg_slots(slots);
     }
 
@@ -1512,6 +1553,32 @@ mod tests {
             lib_src.contains("crate::arch::serial_write_bytes(&line[..len + 1]);"),
             "serial_marker_line must submit the full marker line in one buffered call",
         );
+    }
+
+    #[test]
+    fn startup_abi_install_preserves_slot2_with_valid_block() {
+        let mut slots = [0u64; 17];
+        slots[0] = 1;
+        slots[1] = 65536;
+        slots[2] = 65537;
+        super::runtime::install_startup_args_from_abi_for_test(1, 65536, 65537, slots.as_ptr() as usize, 17);
+        assert_eq!(startup_context().process_manager_caps(), Some((65536, 65537)));
+    }
+
+    #[test]
+    fn startup_abi_direct_args_only_preserve_slot2() {
+        super::runtime::install_startup_args_from_abi_for_test(1, 65536, 65537, 0, 0);
+        assert_eq!(startup_context().process_manager_caps(), Some((65536, 65537)));
+    }
+
+    #[test]
+    fn startup_abi_block_path_wins_but_keeps_pm_reply_cap() {
+        let mut slots = [0u64; 17];
+        slots[0] = 7;
+        slots[1] = 65536;
+        slots[2] = 65537;
+        super::runtime::install_startup_args_from_abi_for_test(1, 2, 3, slots.as_ptr() as usize, 17);
+        assert_eq!(startup_context().process_manager_caps(), Some((65536, 65537)));
     }
 
     #[test]

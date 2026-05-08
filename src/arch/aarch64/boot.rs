@@ -125,26 +125,34 @@ global_asm!(
     .global yarm_aarch64_enter_user_mode_eret
     .type yarm_aarch64_enter_user_mode_eret,%function
 yarm_aarch64_enter_user_mode_eret:
-    sub sp, sp, #48
+    sub sp, sp, #80
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
-    str x4, [sp, #32]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    str x8, [sp, #64]
     bl yarm_aarch64_user_entry_marker_0
     ldp x9, x10, [sp, #0]
     ldp x11, x12, [sp, #16]
-    ldr x13, [sp, #32]
-    add sp, sp, #48
+    ldp x13, x14, [sp, #32]
+    ldp x15, x16, [sp, #48]
+    ldr x17, [sp, #64]
+    add sp, sp, #80
     mov x19, x9
     mov x20, x10
     mov x21, x11
     mov x22, x12
     mov x23, x13
+    mov x24, x14
+    mov x25, x15
+    mov x26, x16
+    mov x27, x17
     bl yarm_aarch64_user_entry_marker_before_sp_el0
     msr sp_el0, x20
     bl yarm_aarch64_user_entry_marker_before_elr
     mov x0, x19
     bl yarm_aarch64_write_elr_marker
-    msr tpidr_el0, x23
+    msr tpidr_el0, x27
     msr elr_el1, x19
     msr spsr_el1, xzr
     bl yarm_aarch64_user_entry_marker_1
@@ -155,6 +163,10 @@ yarm_aarch64_enter_user_mode_eret:
     isb
     mov x0, x21
     mov x1, x22
+    mov x2, x23
+    mov x3, x24
+    mov x4, x25
+    mov x5, x26
     eret
     "#
 );
@@ -1067,14 +1079,18 @@ pub fn enter_dispatched_user_task_if_available(
                 tid
             );
             crate::yarm_log!(
-                "BSP_CONTEXT_RESTORE_DUMP tid={} elr=0x{:x} sp=0x{:x} spsr=0x{:x} ttbr0=0x{:x} arg0=0x{:x} arg1=0x{:x}",
+                "BSP_CONTEXT_RESTORE_DUMP tid={} elr=0x{:x} sp=0x{:x} spsr=0x{:x} ttbr0=0x{:x} arg0=0x{:x} arg1=0x{:x} arg2=0x{:x} arg3=0x{:x} arg4=0x{:x} arg5=0x{:x}",
                 tid,
                 context.instruction_ptr.0,
                 context.stack_ptr.0,
                 0u64,
                 ttbr0_el1,
                 context.arg0 as u64,
-                context.arg1 as u64
+                context.arg1 as u64,
+                context.arg2 as u64,
+                context.arg3 as u64,
+                context.arg4 as u64,
+                context.arg5 as u64
             );
         }
         unsafe {
@@ -1084,6 +1100,10 @@ pub fn enter_dispatched_user_task_if_available(
                     stack_top: u64,
                     arg0: u64,
                     arg1: u64,
+                    arg2: u64,
+                    arg3: u64,
+                    arg4: u64,
+                    arg5: u64,
                     tls: u64,
                 ) -> !;
             }
@@ -1092,6 +1112,10 @@ pub fn enter_dispatched_user_task_if_available(
                 context.stack_ptr.0,
                 context.arg0 as u64,
                 context.arg1 as u64,
+                context.arg2 as u64,
+                context.arg3 as u64,
+                context.arg4 as u64,
+                context.arg5 as u64,
                 tls,
             );
         }
