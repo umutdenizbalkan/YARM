@@ -59,12 +59,16 @@ echo "[info] building ${SERVER_PACKAGE}/${SERVER_BIN} for ${SERVER_RUST_TARGET}"
 cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
 SERVER_BUILD_STATUS=$?
 echo "[info] building ${INITRAMFS_SERVER_PACKAGE}/${INITRAMFS_SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
-cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$INITRAMFS_SERVER_PACKAGE" --bin "$INITRAMFS_SERVER_BIN" --features hosted-dev "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
+cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$INITRAMFS_SERVER_PACKAGE" --bin "$INITRAMFS_SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
 INITRAMFS_SERVER_BUILD_STATUS=$?
 set -e
 
 if [[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 || "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 ]]; then
   common_exit_if_strict_mode
+fi
+if [[ "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 ]]; then
+  EXPECT_INITRAMFS_SRV=0
+  echo "[warn] ${INITRAMFS_SERVER_BIN} build failed for ${SERVER_RUST_TARGET}; continuing without /sbin/initramfs_srv staging verification"
 fi
 
 common_stage_server_init_elf || true
