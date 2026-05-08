@@ -96,6 +96,11 @@ scripts/phase7-shared-ipc-gates.sh
 ```
 
 For a broader pre-push sweep, run `scripts/phase5-boundary-gates.sh` first, then the phase-specific gate scripts relevant to the crates you changed.
+If you touch CI definitions or project automation policies, also run:
+
+```bash
+scripts/check-ci-workflow-enforcement.sh
+```
 
 ## Status
 
