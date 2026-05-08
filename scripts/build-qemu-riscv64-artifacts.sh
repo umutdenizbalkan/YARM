@@ -50,11 +50,6 @@ cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${B
 INITRAMFS_SERVER_BUILD_STATUS=$?
 set -e
 [[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 || "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 ]] && common_exit_if_strict_mode
-if [[ "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 ]]; then
-  EXPECT_INITRAMFS_SRV=0
-  echo "[warn] ${INITRAMFS_SERVER_BIN} build failed for ${SERVER_RUST_TARGET}; continuing without /sbin/initramfs_srv staging verification"
-fi
-
 common_stage_server_init_elf || true
 common_stage_aux_server_elf "$INITRAMFS_SERVER_ELF" "initramfs server" "sbin/initramfs_srv" || true
 common_create_initramfs_newc

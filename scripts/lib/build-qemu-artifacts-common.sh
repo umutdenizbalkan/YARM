@@ -160,13 +160,8 @@ common_verify_initramfs_stage_paths() {
     return 1
   fi
 
-  local expected_paths=("init" "sbin/init_server")
-  if [[ "${EXPECT_INITRAMFS_SRV:-1}" == "1" ]]; then
-    expected_paths+=("sbin/initramfs_srv")
-  fi
-
   local missing=0
-  for expected in "${expected_paths[@]}"; do
+  for expected in "init" "sbin/init_server" "sbin/initramfs_srv"; do
     if ! printf '%s\n' "$listing" | rg -q "^${expected}$"; then
       echo "[error] initramfs staged path missing: /${expected}"
       missing=1
@@ -178,11 +173,7 @@ common_verify_initramfs_stage_paths() {
 
   echo "[ok] initramfs staged path verified: /init"
   echo "[ok] initramfs staged path verified: /sbin/init_server"
-  if [[ "${EXPECT_INITRAMFS_SRV:-1}" == "1" ]]; then
-    echo "[ok] initramfs staged path verified: /sbin/initramfs_srv"
-  else
-    echo "[warn] skipped /sbin/initramfs_srv staged-path verification (initramfs_srv build unavailable for selected target/features)"
-  fi
+  echo "[ok] initramfs staged path verified: /sbin/initramfs_srv"
   echo "[info] /init identity remains ${SERVER_BIN:-init_server}"
   echo "[info] /sbin/initramfs_srv identity is ${INITRAMFS_SERVER_BIN:-initramfs_srv}"
 }

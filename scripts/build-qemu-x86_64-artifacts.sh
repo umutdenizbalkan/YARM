@@ -160,8 +160,6 @@ if [[ "$SERVER_BUILD_STATUS" -ne 0 ]]; then
 fi
 if [[ "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 ]]; then
   BUILD_OK=0
-  EXPECT_INITRAMFS_SRV=0
-  echo "[warn] ${INITRAMFS_SERVER_BIN} build failed for ${SERVER_RUST_TARGET}; continuing without /sbin/initramfs_srv staging verification"
 fi
 if [[ "$KERNEL_BUILD_STATUS" -ne 0 ]]; then
   KERNEL_BUILD_OK=0
