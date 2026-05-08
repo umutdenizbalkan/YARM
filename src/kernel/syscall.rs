@@ -1141,15 +1141,14 @@ fn handle_ipc_reply_v2_stub(
 }
 
 fn handle_debug_serial_write(frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    if !DEBUG_SERIAL_SYSCALL_ENABLED {
-        return Err(SyscallError::InvalidNumber);
-    }
     let reserved = [frame.arg(1), frame.arg(2), frame.arg(3), frame.arg(4), frame.arg(5)];
     if reserved.iter().any(|value| *value != 0) {
         return Err(SyscallError::InvalidArgs);
     }
     let byte = (frame.arg(0) & 0xff) as u8;
-    crate::arch::console::write_byte(byte);
+    if DEBUG_SERIAL_SYSCALL_ENABLED {
+        crate::arch::console::write_byte(byte);
+    }
     frame.set_ok(0, 0, 0);
     Ok(())
 }
@@ -2462,13 +2461,15 @@ mod tests {
     }
 
     #[test]
-    fn syscall_debug_serial_is_disabled_outside_debug_builds() {
+    fn syscall_debug_serial_is_noop_success_outside_debug_builds() {
         if DEBUG_SERIAL_SYSCALL_ENABLED {
             return;
         }
         let mut state = Bootstrap::init().expect("kernel");
         let mut frame = TrapFrame::new(SYSCALL_DEBUG_SERIAL_WRITE_NR, [b'A' as usize, 0, 0, 0, 0, 0]);
-        assert_eq!(dispatch(&mut state, &mut frame), Err(SyscallError::InvalidNumber));
+        dispatch(&mut state, &mut frame).expect("no-op success");
+        assert_eq!(frame.error_code(), None);
+        assert_eq!(frame.ret0(), 0);
     }
 
     #[test]

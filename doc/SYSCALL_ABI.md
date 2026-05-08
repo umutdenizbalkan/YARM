@@ -180,13 +180,13 @@
 - Writes exactly one byte to the architecture serial debug console path.
 - Returns success (`ret0=0, ret1=0, ret2=0`) on accepted input.
 - Returns `InvalidArgs` when any reserved argument is non-zero.
-- Returns `InvalidNumber` when the syscall is gated off (currently non-debug kernel builds).
+- In non-debug kernel builds, syscall 21 remains present and returns success as a no-op.
 - Performs no userspace pointer dereference and does not read/write userspace memory.
 
 Temporary gating policy:
 
-- The syscall is enabled only in debug kernel builds (`cfg(debug_assertions)`).
-- This keeps marker infrastructure available for boot/orchestration bring-up while reducing risk of accidental production logging-policy bypass.
+- Byte emission is enabled only in debug kernel builds (`cfg(debug_assertions)`).
+- In non-debug builds it is intentionally a no-op-success path so diagnostic marker calls never become a fatal dependency.
 
 ### `SpawnThread` argument layout and runtime contract
 
