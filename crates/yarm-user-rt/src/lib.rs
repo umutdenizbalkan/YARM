@@ -907,11 +907,6 @@ pub mod runtime {
         startup_slots_ptr: usize,
         startup_slots_len: usize,
     ) {
-        emit_startup_install_arg_marker("STARTUP_INSTALL_ARG0 value=", startup_task_id as usize);
-        emit_startup_install_arg_marker("STARTUP_INSTALL_ARG1 value=", startup_proc_mgr_request_send_cap as usize);
-        emit_startup_install_arg_marker("STARTUP_INSTALL_ARG2 value=", startup_proc_mgr_reply_recv_cap as usize);
-        emit_startup_install_arg_marker("STARTUP_INSTALL_ARG3 value=", startup_slots_ptr);
-        emit_startup_install_arg_marker("STARTUP_INSTALL_ARG4 value=", startup_slots_len);
         let mut slots = [
             startup_task_id,
             startup_proc_mgr_request_send_cap,
