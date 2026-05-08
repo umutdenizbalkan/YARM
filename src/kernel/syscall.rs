@@ -1146,10 +1146,12 @@ fn handle_debug_serial_write(frame: &mut TrapFrame) -> Result<(), SyscallError> 
         return Err(SyscallError::InvalidArgs);
     }
     let byte = (frame.arg(0) & 0xff) as u8;
+    let mut emitted = 0usize;
     if DEBUG_SERIAL_SYSCALL_ENABLED {
         crate::arch::console::write_byte(byte);
+        emitted = 1;
     }
-    frame.set_ok(0, 0, 0);
+    frame.set_ok(emitted, 0, 0);
     Ok(())
 }
 
@@ -2457,7 +2459,7 @@ mod tests {
         let mut frame = TrapFrame::new(SYSCALL_DEBUG_SERIAL_WRITE_NR, [0x1ff, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &mut frame).expect("debug serial write");
         assert_eq!(frame.error_code(), None);
-        assert_eq!(frame.ret0(), 0);
+        assert_eq!(frame.ret0(), 1);
     }
 
     #[test]

@@ -10,9 +10,29 @@ pub(crate) struct SyscallReturn {
 }
 
 const SYSCALL_DEBUG_SERIAL_WRITE_NR: usize = 21;
+use core::sync::atomic::{AtomicI8, Ordering};
+static DEBUG_SERIAL_AVAILABLE: AtomicI8 = AtomicI8::new(-1);
+
+#[inline]
+fn debug_serial_is_available() -> bool {
+    match DEBUG_SERIAL_AVAILABLE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            // SAFETY: fixed debug-serial syscall ABI; probe uses zero byte and reserved args.
+            let probe = unsafe { raw_syscall(SYSCALL_DEBUG_SERIAL_WRITE_NR, [0, 0, 0, 0, 0, 0]) };
+            let available = (probe.error == 0) && (probe.ret0 != 0);
+            DEBUG_SERIAL_AVAILABLE.store(if available { 1 } else { 0 }, Ordering::Relaxed);
+            available
+        }
+    }
+}
 
 #[inline]
 pub(crate) fn serial_write_bytes_via_syscall(bytes: &[u8]) {
+    if !debug_serial_is_available() {
+        return;
+    }
     for &byte in bytes {
         // SAFETY: fixed debug-serial syscall ABI; one-byte payload in arg0.
         let _ = unsafe { raw_syscall(SYSCALL_DEBUG_SERIAL_WRITE_NR, [byte as usize, 0, 0, 0, 0, 0]) };
