@@ -1185,15 +1185,18 @@ fn handle_debug_serial_write_buf(
 
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    if frame.syscall_num() == SYSCALL_YIELD_NR {
+    {
         let tid = kernel.current_tid().unwrap_or(0);
         crate::yarm_log!(
-            "YARM_SYSCALL0_ENTER tid={} nr={} x0={} x1={} x2={}",
+            "YARM_SYSCALL_ENTER tid={} nr={} x0={} x1={} x2={} x3={} x4={} x5={}",
             tid,
             frame.syscall_num(),
             frame.arg(0),
             frame.arg(1),
-            frame.arg(2)
+            frame.arg(2),
+            frame.arg(3),
+            frame.arg(4),
+            frame.arg(5)
         );
     }
     let syscall = Syscall::decode(frame.syscall_num())?;
@@ -1244,18 +1247,18 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         }
     }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    if frame.syscall_num() == SYSCALL_YIELD_NR {
+    {
         let tid = kernel.current_tid().unwrap_or(0);
         if let Some(code) = frame.error_code() {
             crate::yarm_log!(
-                "YARM_SYSCALL0_EXIT tid={} nr={} result=err code={}",
+                "YARM_SYSCALL_EXIT tid={} nr={} result=err code={}",
                 tid,
                 frame.syscall_num(),
                 code
             );
         } else {
             crate::yarm_log!(
-                "YARM_SYSCALL0_EXIT tid={} nr={} result=ok r0={} r1={} r2={}",
+                "YARM_SYSCALL_EXIT tid={} nr={} result=ok r0={} r1={} r2={}",
                 tid,
                 frame.syscall_num(),
                 frame.ret0(),

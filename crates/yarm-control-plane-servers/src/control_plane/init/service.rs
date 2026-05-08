@@ -266,6 +266,7 @@ fn resolve_core_image_plan(
 
 pub fn run() {
     yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_BEGIN");
+    yarm_user_rt::serial_marker_line("INIT_SPAWN_ATTEMPT_BEGIN");
     match attempt_spawn_initramfs_srv_via_process_manager() {
         Ok(()) => yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=ok"),
         Err(ProcessManagerError::PermissionDenied) => {
@@ -308,15 +309,29 @@ fn attempt_spawn_initramfs_srv_via_process_manager() -> Result<(), ProcessManage
 fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
     transport: &mut impl IpcTransportV2,
 ) -> Result<(), ProcessManagerError> {
+    yarm_user_rt::serial_marker_line("INIT_STARTUP_CONTEXT_DECODE_BEGIN");
     let ctx = yarm_user_rt::runtime::startup_context();
+    yarm_user_rt::serial_marker_line("INIT_PM_CAPS_CHECK_BEGIN");
     let (proc_send_cap, proc_reply_cap) = ctx
         .process_manager_caps()
-        .ok_or(ProcessManagerError::PermissionDenied)?;
+        .ok_or_else(|| {
+            yarm_user_rt::serial_marker_line("INIT_PM_CAPS_MISSING");
+            ProcessManagerError::PermissionDenied
+        })?;
+    yarm_user_rt::serial_marker_line("INIT_PM_CAPS_OK");
+    yarm_user_rt::serial_marker_line("INIT_ORCH_CAPS_CHECK_BEGIN");
     let request_recv_cap = ctx
         .init_orchestration_caps_v1()
-        .and_then(|caps| u32::try_from(caps.initramfs_request_recv_cap_for_child).ok())
+        .and_then(|caps| {
+            yarm_user_rt::serial_marker_line("INIT_ORCH_CAPS_OK");
+            u32::try_from(caps.initramfs_request_recv_cap_for_child).ok()
+        })
         .filter(|cap| *cap != 0)
-        .ok_or(ProcessManagerError::Unsupported)?;
+        .ok_or_else(|| {
+            yarm_user_rt::serial_marker_line("INIT_ORCH_CAPS_DECODE_BAD");
+            yarm_user_rt::serial_marker_line("INIT_ORCH_CAPS_MISSING");
+            ProcessManagerError::Unsupported
+        })?;
     let request = build_initramfs_spawn_v5_message(1, 0x494E_4954_4653_5352, request_recv_cap)?;
     yarm_user_rt::serial_marker_line("INIT_ORCH_CAPS_INSTALLED");
     yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_SEND");

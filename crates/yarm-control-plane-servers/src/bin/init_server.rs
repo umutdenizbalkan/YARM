@@ -55,6 +55,36 @@ pub extern "C" fn _start(
 
 #[cfg(not(feature = "hosted-dev"))]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    yarm::user_rt::serial_marker_line("INIT_SERVER_PANIC");
+    if let Some(location) = info.location() {
+        let mut line = [0u8; 256];
+        let mut len = 0usize;
+        const PREFIX: &[u8] = b"INIT_SERVER_PANIC_LOC line=";
+        let prefix_len = core::cmp::min(PREFIX.len(), line.len());
+        line[..prefix_len].copy_from_slice(&PREFIX[..prefix_len]);
+        len += prefix_len;
+        let mut n = location.line();
+        let mut digits = [0u8; 10];
+        let mut dlen = 0usize;
+        if n == 0 {
+            digits[0] = b'0';
+            dlen = 1;
+        } else {
+            while n != 0 && dlen < digits.len() {
+                digits[dlen] = b'0' + (n % 10) as u8;
+                n /= 10;
+                dlen += 1;
+            }
+            digits[..dlen].reverse();
+        }
+        let copy_len = core::cmp::min(dlen, line.len().saturating_sub(len));
+        line[len..len + copy_len].copy_from_slice(&digits[..copy_len]);
+        len += copy_len;
+        if len != 0 {
+            let msg = unsafe { core::str::from_utf8_unchecked(&line[..len]) };
+            yarm::user_rt::serial_marker_line(msg);
+        }
+    }
     loop {}
 }
