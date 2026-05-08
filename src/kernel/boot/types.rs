@@ -50,11 +50,13 @@ pub struct UserImageSpec {
     ///
     /// Additional slots may be populated by launchers for server-specific
     /// runtime handoff metadata (for example supervisor endpoint caps).
-    pub startup_args: [u64; 17],
+    pub startup_args: [u64; Self::STARTUP_SLOT_COUNT],
 }
 
 impl UserImageSpec {
-    pub const DEFAULT_STARTUP_ARGS: [u64; 17] = [0; 17];
+    pub const STARTUP_SLOT_COUNT: usize = 17;
+    pub const STARTUP_ARGS_BYTES: usize = Self::STARTUP_SLOT_COUNT * core::mem::size_of::<u64>();
+    pub const DEFAULT_STARTUP_ARGS: [u64; Self::STARTUP_SLOT_COUNT] = [0; Self::STARTUP_SLOT_COUNT];
 }
 
 impl Default for UserImageSpec {

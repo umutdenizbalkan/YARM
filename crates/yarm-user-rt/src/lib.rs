@@ -646,6 +646,8 @@ pub mod runtime {
     pub const STARTUP_SLOT_INIT_ORCH_CONTROL0: usize = 15;
     pub const STARTUP_SLOT_INIT_ORCH_CONTROL1: usize = 16;
     const STARTUP_SLOT_COUNT: usize = 17;
+    const _: () = assert!(STARTUP_SLOT_INIT_ORCH_CONTROL1 < STARTUP_SLOT_COUNT);
+    const STARTUP_ARGS_BYTES: usize = STARTUP_SLOT_COUNT * core::mem::size_of::<u64>();
 
     static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] =
         [
@@ -826,6 +828,7 @@ pub mod runtime {
             0,
             0,
         ];
+        debug_assert_eq!(STARTUP_ARGS_BYTES, slots.len() * core::mem::size_of::<u64>());
         if startup_slots_ptr != 0 && startup_slots_len >= slots.len() {
             let src = startup_slots_ptr as *const u64;
             let mut index = 0usize;

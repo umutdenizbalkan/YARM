@@ -242,7 +242,7 @@ impl InitService {
         tid: u64,
         entry: usize,
         asid: Asid,
-        startup_args: [u64; 16],
+        startup_args: [u64; yarm_kernel::boot::UserImageSpec::STARTUP_SLOT_COUNT],
     ) -> Result<(), KernelError> {
         self.launch_order[self.launch_count] = Some(kind);
         self.launch_count += 1;
@@ -1361,6 +1361,10 @@ mod tests {
 
     #[test]
     fn initramfs_startup_args_install_init_orchestration_caps_payload() {
+        assert!(
+            yarm_kernel::boot::UserImageSpec::STARTUP_SLOT_COUNT > 16,
+            "startup args must include readiness send-cap slot"
+        );
         let mut state = Bootstrap::init_boxed().expect("init");
         state.register_task(1).expect("init task");
         state.register_task(3).expect("vfs task");

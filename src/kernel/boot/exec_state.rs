@@ -581,7 +581,8 @@ impl KernelState {
             (stack_top.0 as usize).saturating_sub(startup_slots_bytes_len) & !0x7usize;
         let startup_stack_ptr = startup_slots_start & !0xFusize;
         let startup_slots_ptr = VirtAddr(startup_slots_start as u64);
-        let mut startup_slots_bytes = [0u8; core::mem::size_of::<u64>() * 12];
+        let mut startup_slots_bytes = [0u8; UserImageSpec::STARTUP_ARGS_BYTES];
+        debug_assert_eq!(startup_slots_bytes.len(), startup_slots_bytes_len);
         for (index, slot) in spec.startup_args.iter().copied().enumerate() {
             let begin = index * core::mem::size_of::<u64>();
             startup_slots_bytes[begin..begin + core::mem::size_of::<u64>()]
@@ -596,6 +597,13 @@ impl KernelState {
             "YARM_FIRST_USER_STARTUP_BLOCK va=0x{:x} count={} mapped=true",
             startup_slots_start,
             startup_slots_len
+        );
+        crate::yarm_log!(
+            "YARM_FIRST_USER_STARTUP_LAYOUT slots={} bytes={} highest_init_orch_slot={} readiness_send_cap_included={}",
+            UserImageSpec::STARTUP_SLOT_COUNT,
+            UserImageSpec::STARTUP_ARGS_BYTES,
+            16usize,
+            (UserImageSpec::STARTUP_SLOT_COUNT > 16) as u8
         );
 
         self.with_tcbs_mut(|tcbs| {
@@ -622,7 +630,7 @@ impl KernelState {
                 arg1: spec.startup_args[1] as usize,
                 arg2: spec.startup_args[2] as usize,
                 // Extended startup delivery ABI:
-                //   arg3 => pointer to [u64; 12] startup slot block in userspace memory
+                //   arg3 => pointer to startup slot block in userspace memory
                 //   arg4 => startup slot count
                 //   arg5 => reserved (0)
                 arg3: startup_slots_start,
@@ -971,6 +979,14 @@ mod tests {
 
     #[test]
     fn elf_pflags_map_to_expected_page_flags() {
+        assert_eq!(
+            UserImageSpec::STARTUP_ARGS_BYTES,
+            UserImageSpec::STARTUP_SLOT_COUNT * core::mem::size_of::<u64>()
+        );
+        assert!(
+            UserImageSpec::STARTUP_SLOT_COUNT > 16,
+            "startup slots must include readiness send-cap slot"
+        );
         let rx = KernelState::page_flags_from_elf_pflags(PF_R | PF_X).expect("rx");
         assert!(rx.read);
         assert!(!rx.write);
