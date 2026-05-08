@@ -856,6 +856,14 @@ pub mod runtime {
             STARTUP_ARG_SLOTS[index].store(value, Ordering::Relaxed);
             index += 1;
         }
+        emit_startup_install_arg_marker(
+            "STARTUP_CONTEXT_GLOBAL_SLOT1 value=",
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP].load(Ordering::Relaxed) as usize,
+        );
+        emit_startup_install_arg_marker(
+            "STARTUP_CONTEXT_GLOBAL_SLOT2 value=",
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP].load(Ordering::Relaxed) as usize,
+        );
     }
 
 
@@ -1029,12 +1037,12 @@ pub mod runtime {
         // Reads runtime-provided startup ABI slots. Zero/missing values map to
         // `None` for optional endpoint caps.
         let task_id = STARTUP_ARG_SLOTS[STARTUP_SLOT_TASK_ID].load(Ordering::Relaxed);
-        let process_manager_request_send_cap = cap_from_slot(
-            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP].load(Ordering::Relaxed),
-        );
-        let process_manager_reply_recv_cap = cap_from_slot(
-            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP].load(Ordering::Relaxed),
-        );
+        let pm_slot1_raw = STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP].load(Ordering::Relaxed);
+        let pm_slot2_raw = STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP].load(Ordering::Relaxed);
+        emit_startup_install_arg_marker("STARTUP_CONTEXT_ACCESS_SLOT1 value=", pm_slot1_raw as usize);
+        emit_startup_install_arg_marker("STARTUP_CONTEXT_ACCESS_SLOT2 value=", pm_slot2_raw as usize);
+        let process_manager_request_send_cap = cap_from_slot(pm_slot1_raw);
+        let process_manager_reply_recv_cap = cap_from_slot(pm_slot2_raw);
         let supervisor_fault_recv_ep = cap_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_SUPERVISOR_FAULT_RECV_EP].load(Ordering::Relaxed),
         );
