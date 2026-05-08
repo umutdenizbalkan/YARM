@@ -52,6 +52,35 @@ YARM is a `no_std` microkernel root crate plus a workspace of extracted server c
 - Process-manager runtime spawn is still staged: non-test spawn now performs real boot-initrd image lookup + ELF parse validation at the runtime seam, then returns truthful `Unsupported` until kernel-backed task launch + startup-cap installation are connected.
 - Startup-cap transport is transitioning away from slot-overload assumptions via explicit structured service startup-cap ABI (`ServiceStartupCapsV1`), while slot 11 remains compatibility-only debt.
 
+## Initramfs orchestration/runtime truth (current)
+
+- `SpawnV5` exists and carries structured `ServiceStartupCapsV1` payloads.
+- `InitOrchestrationCapsV1` exists and uses dedicated startup slots (not slot-11 overload) for orchestration control channels.
+- `init_server` sends `SpawnV5` over real IPC when process-manager caps and orchestration caps are present.
+- `initramfs_srv` consumes structured startup caps and sends `INITRAMFS_READY` readiness signals.
+- Readiness is health-gated: spawn success by itself is not sufficient.
+- Boot marker validation script exists: `scripts/check-initramfs-ready-boot.sh`.
+- Real QEMU boot validation is still pending when QEMU/artifacts are unavailable in the current environment.
+- `VFS_READ_SHARED_REPLY_ENABLED` remains `false`.
+- VFS routing for this path is **not enabled yet**.
+
+### How to validate
+
+```bash
+scripts/build-qemu-x86_64-artifacts.sh
+scripts/check-initramfs-ready-boot.sh
+scripts/check-initramfs-ready-boot.sh --check-log scripts/testdata/initramfs-ready-pass.log
+scripts/test-check-initramfs-ready-boot.sh
+```
+
+### Remaining blockers before VFS routing
+
+- real boot marker validation in QEMU with staged artifacts
+- service readiness stability under repeated boot/orchestration runs
+- VFS routing table wiring / endpoint registration for the initramfs service path
+- consumer-side shared-reply support rollout
+- only after the above: enable `VFS_READ_SHARED_REPLY_ENABLED`
+
 ## Boundary model (current)
 
 - **Kernel = mechanism**
