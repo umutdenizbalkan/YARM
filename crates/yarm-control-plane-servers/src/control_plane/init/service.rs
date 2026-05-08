@@ -278,8 +278,7 @@ pub fn run() {
             yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=orch_caps_missing");
         }
         Err(ProcessManagerError::WouldBlock) => {
-            yarm_user_rt::serial_marker_line("INIT_READY_BAD");
-            yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=ready_wait_failed");
+            yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=spawn_ipc_would_block");
         }
         Err(_) => yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=spawn_error"),
     }
@@ -365,6 +364,7 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
     let request = build_initramfs_spawn_v5_message(1, 0x494E_4954_4653_5352, request_recv_cap)?;
     yarm_user_rt::serial_marker_line("INIT_ORCH_CAPS_INSTALLED");
     yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_SEND");
+    yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_CALL_BEGIN");
     let spawned = transport
         .request_reply_v2(
             proc_send_cap,
@@ -372,9 +372,15 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
             request.as_slice(),
             |payload| SpawnV2Result::decode(payload).ok(),
         )
-        .map_err(|_| {
-            yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_REPLY_FAIL");
-            ProcessManagerError::Unsupported
+        .map_err(|err| {
+            if err == yarm_user_rt::syscall::SyscallError::WouldBlock {
+                yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_CALL_WOULD_BLOCK");
+                yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_REPLY_FAIL reason=spawn_ipc_would_block");
+                ProcessManagerError::WouldBlock
+            } else {
+                yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_REPLY_FAIL reason=spawn_ipc_error");
+                ProcessManagerError::Unsupported
+            }
         })?;
     yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_REPLY_OK");
     yarm_user_rt::user_log!("INITRAMFS_SPAWN_ATTEMPT status=ok pid={}", spawned.pid.0);
@@ -480,6 +486,20 @@ mod tests {
         let mut t = StubTransport { status: Ok(SpawnV2Result { pid: yarm_user_rt::process::ProcessId(55) }), saw_send_cap: None, saw_reply_cap: None };
         let res = attempt_spawn_initramfs_srv_via_process_manager_with_transport(&mut t);
         assert_eq!(res, Ok(()));
+        assert_eq!(t.saw_send_cap, Some(9));
+        assert_eq!(t.saw_reply_cap, Some(10));
+    }
+
+    #[test]
+    fn init_server_spawn_attempt_returns_would_block_when_pm_not_ready() {
+        yarm_user_rt::runtime::install_startup_arg_slots([1, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 88, 77, 0]);
+        let mut t = StubTransport {
+            status: Err(yarm_user_rt::syscall::SyscallError::WouldBlock),
+            saw_send_cap: None,
+            saw_reply_cap: None,
+        };
+        let res = attempt_spawn_initramfs_srv_via_process_manager_with_transport(&mut t);
+        assert_eq!(res, Err(ProcessManagerError::WouldBlock));
         assert_eq!(t.saw_send_cap, Some(9));
         assert_eq!(t.saw_reply_cap, Some(10));
     }
