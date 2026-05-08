@@ -3,7 +3,7 @@
 # YARM Syscall ABI v10 (Frozen Contract)
 
 - ABI Version: `10`
-- Syscall count: `21`
+- Syscall count: `22`
 
 ## Syscall numbers
 
@@ -24,6 +24,7 @@
 - `14`: `VmBrk` (staged: query + grow supported, shrink unsupported)
 - `19`: `VmUnmap` (staged producer-local anonymous mapping cleanup for current task/ASID)
 - `20`: `CapRelease` (staged producer-local capability revoke/drop in current task cnode)
+- `21`: `DebugSerialWrite` (**diagnostic-only**, writes one raw serial byte)
 
 ## Syscalls `9..14` status
 
@@ -167,6 +168,25 @@
 - revokes/drops the specified cap in the current task cnode;
 - invalid/stale/non-present cap returns `InvalidCapability`;
 - producer-local lifecycle primitive; distinct from receiver-side `TransferRelease`.
+
+### `DebugSerialWrite` argument layout (diagnostic-only)
+
+- Syscall number: `21`
+- `args[0]`: byte lane; kernel writes `args[0] & 0xff` as exactly one serial byte
+- `args[1..5]`: reserved (must be `0`)
+
+`DebugSerialWrite` semantics:
+
+- Writes exactly one byte to the architecture serial debug console path.
+- Returns success (`ret0=0, ret1=0, ret2=0`) on accepted input.
+- Returns `InvalidArgs` when any reserved argument is non-zero.
+- Returns `InvalidNumber` when the syscall is gated off (currently non-debug kernel builds).
+- Performs no userspace pointer dereference and does not read/write userspace memory.
+
+Temporary gating policy:
+
+- The syscall is enabled only in debug kernel builds (`cfg(debug_assertions)`).
+- This keeps marker infrastructure available for boot/orchestration bring-up while reducing risk of accidental production logging-policy bypass.
 
 ### `SpawnThread` argument layout and runtime contract
 

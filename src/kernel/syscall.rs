@@ -129,6 +129,7 @@ const _: () = assert!(SYSCALL_COUNT == Syscall::VARIANT_COUNT);
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
 const _: () = assert!(SYSCALL_ARG_TRANSFER_CAP < syscall_abi::TRAPFRAME_ARG_REGS);
 const _: () = assert!(syscall_abi::TRAPFRAME_ARG_REGS > SYSCALL_ARG_INLINE_PAYLOAD1);
+const DEBUG_SERIAL_SYSCALL_ENABLED: bool = cfg!(debug_assertions);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -1140,7 +1141,14 @@ fn handle_ipc_reply_v2_stub(
 }
 
 fn handle_debug_serial_write(frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let byte = u8::try_from(frame.arg(0)).map_err(|_| SyscallError::InvalidArgs)?;
+    if !DEBUG_SERIAL_SYSCALL_ENABLED {
+        return Err(SyscallError::InvalidNumber);
+    }
+    let reserved = [frame.arg(1), frame.arg(2), frame.arg(3), frame.arg(4), frame.arg(5)];
+    if reserved.iter().any(|value| *value != 0) {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let byte = (frame.arg(0) & 0xff) as u8;
     crate::arch::console::write_byte(byte);
     frame.set_ok(0, 0, 0);
     Ok(())
@@ -2356,7 +2364,8 @@ mod tests {
         assert_eq!(SYSCALL_IPC_REPLY_V2_NR, 18);
         assert_eq!(SYSCALL_VM_UNMAP_NR, 19);
         assert_eq!(SYSCALL_CAP_RELEASE_NR, 20);
-        assert_eq!(SYSCALL_COUNT, 21);
+        assert_eq!(SYSCALL_DEBUG_SERIAL_WRITE_NR, 21);
+        assert_eq!(SYSCALL_COUNT, 22);
     }
 
     #[test]
@@ -2427,6 +2436,39 @@ mod tests {
             Syscall::decode(SYSCALL_IPC_REPLY_V2_NR).expect("decode"),
             Syscall::IpcReplyV2
         );
+        assert_eq!(
+            Syscall::decode(SYSCALL_DEBUG_SERIAL_WRITE_NR).expect("decode"),
+            Syscall::DebugSerialWrite
+        );
+    }
+
+    #[test]
+    fn syscall_debug_serial_rejects_nonzero_reserved_args() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let mut frame = TrapFrame::new(SYSCALL_DEBUG_SERIAL_WRITE_NR, [b'A' as usize, 1, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut state, &mut frame), Err(SyscallError::InvalidArgs));
+    }
+
+    #[test]
+    fn syscall_debug_serial_truncates_arg0_to_low_byte_when_enabled() {
+        if !DEBUG_SERIAL_SYSCALL_ENABLED {
+            return;
+        }
+        let mut state = Bootstrap::init().expect("kernel");
+        let mut frame = TrapFrame::new(SYSCALL_DEBUG_SERIAL_WRITE_NR, [0x1ff, 0, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut frame).expect("debug serial write");
+        assert_eq!(frame.error_code(), None);
+        assert_eq!(frame.ret0(), 0);
+    }
+
+    #[test]
+    fn syscall_debug_serial_is_disabled_outside_debug_builds() {
+        if DEBUG_SERIAL_SYSCALL_ENABLED {
+            return;
+        }
+        let mut state = Bootstrap::init().expect("kernel");
+        let mut frame = TrapFrame::new(SYSCALL_DEBUG_SERIAL_WRITE_NR, [b'A' as usize, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut state, &mut frame), Err(SyscallError::InvalidNumber));
     }
 
     #[test]
