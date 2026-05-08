@@ -9,6 +9,16 @@ pub(crate) struct SyscallReturn {
     pub(crate) error: usize,
 }
 
+const SYSCALL_DEBUG_SERIAL_WRITE_NR: usize = 21;
+
+#[inline]
+pub(crate) fn serial_write_bytes_via_syscall(bytes: &[u8]) {
+    for &byte in bytes {
+        // SAFETY: fixed debug-serial syscall ABI; one-byte payload in arg0.
+        let _ = unsafe { raw_syscall(SYSCALL_DEBUG_SERIAL_WRITE_NR, [byte as usize, 0, 0, 0, 0, 0]) };
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]

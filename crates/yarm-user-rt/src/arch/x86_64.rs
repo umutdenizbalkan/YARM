@@ -36,19 +36,8 @@ pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
 
 #[inline]
 pub(crate) fn serial_write_bytes(bytes: &[u8]) {
-    // x86_64 keeps direct COM1 port writes for marker continuity with existing
-    // early-boot bring-up breadcrumbs. AArch64/RISC-V use the debug-serial
-    // syscall path because userspace UART MMIO mappings are not guaranteed.
-    // We can converge x86_64 to the syscall path later if consistent policy is desired.
-    for &b in bytes {
-        // SAFETY: fixed COM1 I/O port write on x86_64 debug path.
-        unsafe {
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") 0x3f8u16,
-                in("al") b,
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-    }
+    // Userspace marker output is syscall-backed on all supported ISAs.
+    // In non-debug kernel builds the syscall is gated and returns InvalidNumber;
+    // marker emission intentionally degrades silently for diagnostic-only paths.
+    super::serial_write_bytes_via_syscall(bytes);
 }

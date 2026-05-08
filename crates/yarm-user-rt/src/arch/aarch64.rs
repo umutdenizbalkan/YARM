@@ -2,7 +2,6 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::SyscallReturn;
-const SYSCALL_DEBUG_SERIAL_WRITE_NR: usize = 21;
 
 #[inline]
 pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
@@ -40,8 +39,5 @@ pub(crate) fn serial_write_bytes(bytes: &[u8]) {
     // Kernel boot logs use QEMU virt PL011 at 0x0900_0000, but that MMIO page is
     // not guaranteed to be mapped into every userspace task. Route markers via a
     // narrow syscall instead of blind userspace MMIO writes.
-    for &byte in bytes {
-        // SAFETY: fixed debug-serial syscall ABI; argument is a single byte lane.
-        let _ = unsafe { raw_syscall(SYSCALL_DEBUG_SERIAL_WRITE_NR, [byte as usize, 0, 0, 0, 0, 0]) };
-    }
+    super::serial_write_bytes_via_syscall(bytes);
 }
