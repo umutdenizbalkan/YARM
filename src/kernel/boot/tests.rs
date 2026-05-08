@@ -2048,6 +2048,21 @@ fn control_plane_cnode_resize_syscall_wrapper_rejects_zero_target_pid() {
 }
 
 #[test]
+fn syscall_invalid_number_sets_user_error_and_does_not_fail_trap_dispatch() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task_with_class(901, TaskClass::App).expect("task");
+    state.enqueue_current_cpu(901).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch");
+    let mut frame = TrapFrame::new(usize::MAX, [0, 0, 0, 0, 0, 0]);
+    let res = state.handle_trap(Trap::Syscall, Some(&mut frame));
+    assert_eq!(res, Ok(()));
+    assert_eq!(
+        frame.error_code(),
+        Some(crate::kernel::syscall::SyscallError::InvalidNumber.code())
+    );
+}
+
+#[test]
 fn user_address_space_mapping_enforces_split_and_alignment() {
     let mut state = Bootstrap::init().expect("init");
     let (_asid, aspace_map_cap) = state.create_user_address_space().expect("asid");

@@ -13,6 +13,22 @@ use yarm_ipc_abi::supervisor_abi::{
     SUPERVISOR_OP_FAULT_REPORT_WIRE, encode_supervisor_envelope_into,
 };
 
+fn syscall_error_from_code(code: usize) -> SyscallError {
+    match code {
+        x if x == SyscallError::InvalidNumber.code() => SyscallError::InvalidNumber,
+        x if x == SyscallError::InvalidArgs.code() => SyscallError::InvalidArgs,
+        x if x == SyscallError::InvalidCapability.code() => SyscallError::InvalidCapability,
+        x if x == SyscallError::MissingRight.code() => SyscallError::MissingRight,
+        x if x == SyscallError::WrongObject.code() => SyscallError::WrongObject,
+        x if x == SyscallError::QueueFull.code() => SyscallError::QueueFull,
+        x if x == SyscallError::WouldBlock.code() => SyscallError::WouldBlock,
+        x if x == SyscallError::PageFault.code() => SyscallError::PageFault,
+        x if x == SyscallError::TimedOut.code() => SyscallError::TimedOut,
+        x if x == SyscallError::BufferTooSmall.code() => SyscallError::BufferTooSmall,
+        _ => SyscallError::Internal,
+    }
+}
+
 const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
 const DEMAND_STACK_GROWTH_WINDOW: u64 = 8 * 1024 * 1024;
 #[allow(dead_code)]
@@ -233,7 +249,15 @@ impl KernelState {
                 self.clear_last_fault();
                 let trapframe = frame.ok_or(TrapHandleError::MissingTrapFrame)?;
                 let _ = self.sync_current_thread_from_frame(trapframe);
-                dispatch_syscall(self, trapframe).map_err(TrapHandleError::Syscall)?;
+                if let Err(err) = dispatch_syscall(self, trapframe) {
+                    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+                    crate::yarm_log!(
+                        "AARCH64_SYSCALL_USER_ERROR_RETURN nr={} err={:?}",
+                        trapframe.syscall_num(),
+                        err
+                    );
+                    trapframe.set_err(err.code());
+                }
                 if trapframe.error_code() == Some(SyscallError::PageFault.code()) {
                     self.fault_current_task()
                         .map_err(SyscallError::from)
@@ -293,7 +317,11 @@ impl KernelState {
             Syscall::ControlPlaneSetCnodeSlots as usize,
             [target_pid_arg, slot_capacity, 0, 0, 0, 0],
         );
-        self.handle_trap(Trap::Syscall, Some(&mut frame))
+        self.handle_trap(Trap::Syscall, Some(&mut frame))?;
+        if let Some(code) = frame.error_code() {
+            return Err(TrapHandleError::Syscall(syscall_error_from_code(code)));
+        }
+        Ok(())
     }
 
     pub fn handle_selected_arch_trap_entry(
