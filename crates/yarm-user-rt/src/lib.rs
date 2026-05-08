@@ -707,13 +707,41 @@ pub mod runtime {
 
     impl StartupContext {
         #[inline]
-        pub const fn process_manager_caps(self) -> Option<(u32, u32)> {
-            match (
-                self.process_manager_request_send_cap,
-                self.process_manager_reply_recv_cap,
-            ) {
-                (Some(request_send), Some(reply_recv)) => Some((request_send, reply_recv)),
-                _ => None,
+        pub fn process_manager_caps(self) -> Option<(u32, u32)> {
+            let slot1_raw = STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP]
+                .load(Ordering::Relaxed);
+            let slot2_raw = STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP]
+                .load(Ordering::Relaxed);
+            let mut msg = [0u8; 96];
+            let mut len = 0usize;
+            fn append(msg: &mut [u8], len: &mut usize, text: &str) {
+                let bytes = text.as_bytes();
+                let n = core::cmp::min(bytes.len(), msg.len().saturating_sub(*len));
+                msg[*len..*len + n].copy_from_slice(&bytes[..n]);
+                *len += n;
+            }
+            append(&mut msg, &mut len, "STARTUP_PM_CAPS_SLOT1 value=");
+            append_u64_decimal(&mut msg, &mut len, slot1_raw);
+            if len != 0 {
+                let marker = unsafe { core::str::from_utf8_unchecked(&msg[..len]) };
+                crate::serial_marker_line(marker);
+            }
+            len = 0;
+            append(&mut msg, &mut len, "STARTUP_PM_CAPS_SLOT2 value=");
+            append_u64_decimal(&mut msg, &mut len, slot2_raw);
+            if len != 0 {
+                let marker = unsafe { core::str::from_utf8_unchecked(&msg[..len]) };
+                crate::serial_marker_line(marker);
+            }
+            match (self.process_manager_request_send_cap, self.process_manager_reply_recv_cap) {
+                (Some(request_send), Some(reply_recv)) => {
+                    crate::serial_marker_line("STARTUP_PM_CAPS_VALID");
+                    Some((request_send, reply_recv))
+                }
+                _ => {
+                    crate::serial_marker_line("STARTUP_PM_CAPS_INVALID reason=slot_zero_or_out_of_range");
+                    None
+                }
             }
         }
 
@@ -783,6 +811,26 @@ pub mod runtime {
         if raw == 0 { None } else { Some(raw) }
     }
 
+    #[inline]
+    fn append_u64_decimal(buf: &mut [u8], len: &mut usize, mut value: u64) {
+        let mut digits = [0u8; 20];
+        let mut dlen = 0usize;
+        if value == 0 {
+            digits[0] = b'0';
+            dlen = 1;
+        } else {
+            while value != 0 && dlen < digits.len() {
+                digits[dlen] = b'0' + (value % 10) as u8;
+                value /= 10;
+                dlen += 1;
+            }
+            digits[..dlen].reverse();
+        }
+        let copy = core::cmp::min(dlen, buf.len().saturating_sub(*len));
+        buf[*len..*len + copy].copy_from_slice(&digits[..copy]);
+        *len += copy;
+    }
+
     /// Install raw startup ABI slot values captured by runtime entry code.
     ///
     /// Slot mapping:
@@ -849,6 +897,23 @@ pub mod runtime {
             }
         }
         install_startup_arg_slots(slots);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_startup_args_from_abi_for_test(
+        startup_task_id: u64,
+        startup_proc_mgr_request_send_cap: u64,
+        startup_proc_mgr_reply_recv_cap: u64,
+        startup_slots_ptr: usize,
+        startup_slots_len: usize,
+    ) {
+        install_startup_args_from_abi(
+            startup_task_id,
+            startup_proc_mgr_request_send_cap,
+            startup_proc_mgr_reply_recv_cap,
+            startup_slots_ptr,
+            startup_slots_len,
+        );
     }
 
     #[inline(never)]
@@ -1175,6 +1240,56 @@ mod tests {
                 .unwrap_or(0),
             original.init_orchestration_caps_v1().map(|c| c.control0).unwrap_or(0),
             original.init_orchestration_caps_v1().map(|c| c.control1).unwrap_or(0),
+        ]);
+    }
+
+    #[test]
+    fn startup_process_manager_caps_accept_dynamic_cap_ids() {
+        let original = startup_context();
+        install_startup_arg_slots([1, 65536, 65537, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(startup_context().process_manager_caps(), Some((65536, 65537)));
+        install_startup_arg_slots([
+            original.task_id,
+            original.process_manager_request_send_cap.map(u64::from).unwrap_or(0),
+            original.process_manager_reply_recv_cap.map(u64::from).unwrap_or(0),
+            original.supervisor_fault_recv_ep.map(u64::from).unwrap_or(0),
+            original.supervisor_control_send_ep.map(u64::from).unwrap_or(0),
+            original.supervisor_control_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_send_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_tid.unwrap_or(0),
+            original.supervisor_tid.unwrap_or(0),
+            original.supervisor_restart_window_ticks.unwrap_or(0),
+            original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
+            0,0,0,0,0,
+        ]);
+    }
+
+    #[test]
+    fn startup_abi_direct_args_and_block_path_match_for_pm_caps() {
+        let original = startup_context();
+        let mut slots = [0u64; 17];
+        slots[0] = 99;
+        slots[1] = 65536;
+        slots[2] = 65537;
+        super::runtime::install_startup_args_from_abi_for_test(99, 65536, 65537, slots.as_ptr() as usize, slots.len());
+        assert_eq!(startup_context().process_manager_caps(), Some((65536, 65537)));
+        super::runtime::install_startup_args_from_abi_for_test(99, 65536, 65537, 0, 0);
+        assert_eq!(startup_context().process_manager_caps(), Some((65536, 65537)));
+        install_startup_arg_slots([
+            original.task_id,
+            original.process_manager_request_send_cap.map(u64::from).unwrap_or(0),
+            original.process_manager_reply_recv_cap.map(u64::from).unwrap_or(0),
+            original.supervisor_fault_recv_ep.map(u64::from).unwrap_or(0),
+            original.supervisor_control_send_ep.map(u64::from).unwrap_or(0),
+            original.supervisor_control_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_send_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_tid.unwrap_or(0),
+            original.supervisor_tid.unwrap_or(0),
+            original.supervisor_restart_window_ticks.unwrap_or(0),
+            original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
+            0,0,0,0,0,
         ]);
     }
 
