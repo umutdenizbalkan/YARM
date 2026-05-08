@@ -34,7 +34,7 @@ pub struct SpawnUserImageSpec {
     pub entry: usize,
     pub asid_raw: u16,
     pub task_class: crate::kernel::task::TaskClass,
-    pub startup_args: [u64; 12],
+    pub startup_args: [u64; 17],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

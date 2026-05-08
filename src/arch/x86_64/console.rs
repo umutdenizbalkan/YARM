@@ -17,12 +17,12 @@ pub fn write_byte(_byte: u8) {}
 pub fn write_line(msg: &str) {
     for &byte in msg.as_bytes() {
         if byte == b'\n' {
-            write_byte(b'\r');
+            write_byte_impl(b'\r');
         }
-        write_byte(byte);
+        write_byte_impl(byte);
     }
-    write_byte(b'\r');
-    write_byte(b'\n');
+    write_byte_impl(b'\r');
+    write_byte_impl(b'\n');
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -38,14 +38,14 @@ pub fn write_breadcrumb(byte: u8) {
 pub fn write_breadcrumb(_byte: u8) {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn write_byte(byte: u8) {
+fn write_byte_impl(byte: u8) {
     while (inb(COM1_LINE_STATUS) & LINE_STATUS_THR_EMPTY) == 0 {}
     outb(COM1_PORT, byte);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn write_byte_public(byte: u8) {
-    write_byte(byte);
+    write_byte_impl(byte);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]

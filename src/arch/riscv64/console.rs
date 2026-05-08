@@ -10,16 +10,16 @@ pub fn write_byte(_byte: u8) {}
 pub fn write_line(msg: &str) {
     for &byte in msg.as_bytes() {
         if byte == b'\n' {
-            write_byte(b'\r');
+            write_byte_impl(b'\r');
         }
-        write_byte(byte);
+        write_byte_impl(byte);
     }
-    write_byte(b'\r');
-    write_byte(b'\n');
+    write_byte_impl(b'\r');
+    write_byte_impl(b'\n');
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn write_byte(byte: u8) {
+fn write_byte_impl(byte: u8) {
     // Legacy SBI console_putchar (a7=1, a0=char, ecall).
     unsafe {
         core::arch::asm!(
@@ -33,7 +33,7 @@ fn write_byte(byte: u8) {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn write_byte_public(byte: u8) {
-    write_byte(byte);
+    write_byte_impl(byte);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "riscv64")))]

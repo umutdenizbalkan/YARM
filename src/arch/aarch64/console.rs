@@ -41,24 +41,24 @@ pub fn write_line(msg: &str) {
     let _guard = UART_LOG_LOCK.lock();
     for &byte in msg.as_bytes() {
         if byte == b'\n' {
-            write_byte(b'\r');
+            write_byte_impl(b'\r');
         }
-        write_byte(byte);
+        write_byte_impl(byte);
     }
-    write_byte(b'\r');
-    write_byte(b'\n');
+    write_byte_impl(b'\r');
+    write_byte_impl(b'\n');
 }
 
 #[cfg(not(feature = "hosted-dev"))]
-fn write_byte(byte: u8) {
+fn write_byte_impl(byte: u8) {
     let base = UART_BASE.load(Ordering::Relaxed);
     while (mmio_read32(base + PL011_FR) & PL011_FR_TXFF) != 0 {}
     mmio_write32(base + PL011_DR, byte as u32);
 }
 
 #[cfg(not(feature = "hosted-dev"))]
-pub fn write_byte_public(byte: u8) {
-    write_byte(byte);
+pub fn write_byte(byte: u8) {
+    write_byte_impl(byte);
 }
 
 #[cfg(not(feature = "hosted-dev"))]
@@ -70,9 +70,6 @@ fn mmio_read32(addr: usize) -> u32 {
 fn mmio_write32(addr: usize, value: u32) {
     unsafe { write_volatile(addr as *mut u32, value) }
 }
-
-#[cfg(not(feature = "hosted-dev"))]
-pub use write_byte_public as write_byte;
 
 #[cfg(test)]
 mod tests {
