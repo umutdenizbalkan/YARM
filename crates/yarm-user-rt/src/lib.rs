@@ -712,6 +712,8 @@ pub mod runtime {
                 .load(Ordering::Relaxed);
             let slot2_raw = STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP]
                 .load(Ordering::Relaxed);
+            let slot1 = cap_from_slot(slot1_raw);
+            let slot2 = cap_from_slot(slot2_raw);
             let mut msg = [0u8; 96];
             let mut len = 0usize;
             fn append(msg: &mut [u8], len: &mut usize, text: &str) {
@@ -733,7 +735,7 @@ pub mod runtime {
                 let marker = unsafe { core::str::from_utf8_unchecked(&msg[..len]) };
                 crate::serial_marker_line(marker);
             }
-            match (self.process_manager_request_send_cap, self.process_manager_reply_recv_cap) {
+            match (slot1, slot2) {
                 (Some(request_send), Some(reply_recv)) => {
                     crate::serial_marker_line("STARTUP_PM_CAPS_VALID");
                     Some((request_send, reply_recv))
@@ -1307,6 +1309,14 @@ mod tests {
             original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
             0,0,0,0,0,
         ]);
+    }
+
+    #[test]
+    fn startup_process_manager_caps_uses_current_global_slots() {
+        install_startup_arg_slots([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let stale = startup_context();
+        install_startup_arg_slots([1, 65536, 65537, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(stale.process_manager_caps(), Some((65536, 65537)));
     }
 
     #[test]
