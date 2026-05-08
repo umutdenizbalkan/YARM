@@ -129,7 +129,8 @@ const _: () = assert!(SYSCALL_COUNT == Syscall::VARIANT_COUNT);
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
 const _: () = assert!(SYSCALL_ARG_TRANSFER_CAP < syscall_abi::TRAPFRAME_ARG_REGS);
 const _: () = assert!(syscall_abi::TRAPFRAME_ARG_REGS > SYSCALL_ARG_INLINE_PAYLOAD1);
-const DEBUG_SERIAL_SYSCALL_ENABLED: bool = cfg!(debug_assertions);
+const DEBUG_SERIAL_SYSCALL_ENABLED: bool =
+    cfg!(debug_assertions) || cfg!(all(not(feature = "hosted-dev"), target_arch = "aarch64"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]

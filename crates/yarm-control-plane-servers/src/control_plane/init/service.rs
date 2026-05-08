@@ -265,8 +265,23 @@ fn resolve_core_image_plan(
 }
 
 pub fn run() {
-    yarm_user_rt::serial_marker_line("INIT_ORCH_CAPS_INSTALLED");
-    let _ = attempt_spawn_initramfs_srv_via_process_manager();
+    yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_BEGIN");
+    match attempt_spawn_initramfs_srv_via_process_manager() {
+        Ok(()) => yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=ok"),
+        Err(ProcessManagerError::PermissionDenied) => {
+            yarm_user_rt::serial_marker_line("INIT_PM_CAPS_MISSING");
+            yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=pm_caps_missing");
+        }
+        Err(ProcessManagerError::Unsupported) => {
+            yarm_user_rt::serial_marker_line("INIT_ORCH_CAPS_MISSING");
+            yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=orch_caps_missing");
+        }
+        Err(ProcessManagerError::WouldBlock) => {
+            yarm_user_rt::serial_marker_line("INIT_READY_BAD");
+            yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=ready_wait_failed");
+        }
+        Err(_) => yarm_user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED reason=spawn_error"),
+    }
     yarm_user_rt::user_log!(
         "init.srv requires kernel-provided bootstrap handoff; standalone Bootstrap::init path disabled"
     );
@@ -303,6 +318,7 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
         .filter(|cap| *cap != 0)
         .ok_or(ProcessManagerError::Unsupported)?;
     let request = build_initramfs_spawn_v5_message(1, 0x494E_4954_4653_5352, request_recv_cap)?;
+    yarm_user_rt::serial_marker_line("INIT_ORCH_CAPS_INSTALLED");
     yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_SEND");
     let spawned = transport
         .request_reply_v2(
@@ -322,13 +338,19 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
         .and_then(|caps| u32::try_from(caps.control0).ok())
         .filter(|cap| *cap != 0)
         .ok_or_else(|| {
-            yarm_user_rt::serial_marker_line("INITRAMFS_READY_RECV_TIMEOUT");
+            yarm_user_rt::serial_marker_line("INIT_READY_TIMEOUT");
             ProcessManagerError::Unsupported
         })?;
-    let ready = transport
+    yarm_user_rt::serial_marker_line("INIT_READY_WAIT_BEGIN");
+    let ready_msg = transport
         .recv_v2_with_deadline(ready_recv_cap, 10)
         .map_err(|_| ProcessManagerError::Unsupported)?
-        .and_then(|resp| InitramfsReadyV1::decode(&resp.payload[..resp.len]).ok())
+        .ok_or_else(|| {
+            yarm_user_rt::serial_marker_line("INIT_READY_TIMEOUT");
+            ProcessManagerError::WouldBlock
+        })?;
+    let ready = InitramfsReadyV1::decode(&ready_msg.payload[..ready_msg.len])
+        .ok()
         .is_some_and(|msg| msg.version == InitramfsReadyV1::VERSION && msg.status == InitramfsReadyV1::STATUS_READY && msg.magic == INITRAMFS_READY_V1_MAGIC);
     if !ready {
         yarm_user_rt::serial_marker_line("INITRAMFS_READY_RECV_BAD");
