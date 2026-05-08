@@ -265,7 +265,7 @@ fn resolve_core_image_plan(
 }
 
 pub fn run() {
-    yarm_user_rt::user_log!("INIT_ORCH_CAPS_INSTALLED");
+    yarm_user_rt::serial_marker_line("INIT_ORCH_CAPS_INSTALLED");
     let _ = attempt_spawn_initramfs_srv_via_process_manager();
     yarm_user_rt::user_log!(
         "init.srv requires kernel-provided bootstrap handoff; standalone Bootstrap::init path disabled"
@@ -303,7 +303,7 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
         .filter(|cap| *cap != 0)
         .ok_or(ProcessManagerError::Unsupported)?;
     let request = build_initramfs_spawn_v5_message(1, 0x494E_4954_4653_5352, request_recv_cap)?;
-    yarm_user_rt::user_log!("INIT_SPAWN_V5_SEND");
+    yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_SEND");
     let spawned = transport
         .request_reply_v2(
             proc_send_cap,
@@ -312,17 +312,17 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
             |payload| SpawnV2Result::decode(payload).ok(),
         )
         .map_err(|_| {
-            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_FAIL");
+            yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_REPLY_FAIL");
             ProcessManagerError::Unsupported
         })?;
-    yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_OK");
+    yarm_user_rt::serial_marker_line("INIT_SPAWN_V5_REPLY_OK");
     yarm_user_rt::user_log!("INITRAMFS_SPAWN_ATTEMPT status=ok pid={}", spawned.pid.0);
     let ready_recv_cap = ctx
         .init_orchestration_caps_v1()
         .and_then(|caps| u32::try_from(caps.control0).ok())
         .filter(|cap| *cap != 0)
         .ok_or_else(|| {
-            yarm_user_rt::user_log!("INITRAMFS_READY_RECV_TIMEOUT");
+            yarm_user_rt::serial_marker_line("INITRAMFS_READY_RECV_TIMEOUT");
             ProcessManagerError::Unsupported
         })?;
     let ready = transport
@@ -331,11 +331,11 @@ fn attempt_spawn_initramfs_srv_via_process_manager_with_transport(
         .and_then(|resp| InitramfsReadyV1::decode(&resp.payload[..resp.len]).ok())
         .is_some_and(|msg| msg.version == InitramfsReadyV1::VERSION && msg.status == InitramfsReadyV1::STATUS_READY && msg.magic == INITRAMFS_READY_V1_MAGIC);
     if !ready {
-        yarm_user_rt::user_log!("INITRAMFS_READY_RECV_BAD");
+        yarm_user_rt::serial_marker_line("INITRAMFS_READY_RECV_BAD");
         return Err(ProcessManagerError::WouldBlock);
     }
-    yarm_user_rt::user_log!("INITRAMFS_READY_RECV_OK");
-    yarm_user_rt::user_log!("INITRAMFS_SERVICE_READY");
+    yarm_user_rt::serial_marker_line("INITRAMFS_READY_RECV_OK");
+    yarm_user_rt::serial_marker_line("INITRAMFS_SERVICE_READY");
     Ok(())
 }
 

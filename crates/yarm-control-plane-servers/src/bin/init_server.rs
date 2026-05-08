@@ -23,8 +23,11 @@ fn main() {
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_user_entry() -> ! {
-    let _ = yarm::user_rt::syscall::yield_now();
+    yarm::user_rt::serial_marker_line("INIT_USER_ENTRY_BEGIN");
+    yarm::user_rt::serial_marker_line("INIT_USER_ENTRY_AFTER_RUNTIME_STARTUP");
+    yarm::user_rt::serial_marker_line("INIT_SERVER_RUN_BEGIN");
     run();
+    yarm::user_rt::serial_marker_line("INIT_SERVER_RUN_RETURNED");
     loop {
         let _ = yarm::user_rt::syscall::yield_now();
     }
