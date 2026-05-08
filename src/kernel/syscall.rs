@@ -39,8 +39,9 @@ pub const SYSCALL_IPC_CALL_V2_NR: usize = 17;
 pub const SYSCALL_IPC_REPLY_V2_NR: usize = 18;
 pub const SYSCALL_VM_UNMAP_NR: usize = 19;
 pub const SYSCALL_CAP_RELEASE_NR: usize = 20;
-pub const SYSCALL_COUNT: usize = 21;
-const _: [(); SYSCALL_COUNT] = [(); 21];
+pub const SYSCALL_DEBUG_SERIAL_WRITE_NR: usize = 21;
+pub const SYSCALL_COUNT: usize = 22;
+const _: [(); SYSCALL_COUNT] = [(); 22];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -86,10 +87,11 @@ pub enum Syscall {
     IpcReplyV2 = SYSCALL_IPC_REPLY_V2_NR,
     VmUnmap = SYSCALL_VM_UNMAP_NR,
     CapRelease = SYSCALL_CAP_RELEASE_NR,
+    DebugSerialWrite = SYSCALL_DEBUG_SERIAL_WRITE_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 21;
+    pub const VARIANT_COUNT: usize = 22;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -117,6 +119,7 @@ impl Syscall {
             SYSCALL_IPC_REPLY_V2_NR => Ok(Self::IpcReplyV2),
             SYSCALL_VM_UNMAP_NR => Ok(Self::VmUnmap),
             SYSCALL_CAP_RELEASE_NR => Ok(Self::CapRelease),
+            SYSCALL_DEBUG_SERIAL_WRITE_NR => Ok(Self::DebugSerialWrite),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -1136,6 +1139,13 @@ fn handle_ipc_reply_v2_stub(
     Ok(())
 }
 
+fn handle_debug_serial_write(frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let byte = u8::try_from(frame.arg(0)).map_err(|_| SyscallError::InvalidArgs)?;
+    crate::arch::console::write_byte(byte);
+    frame.set_ok(0, 0, 0);
+    Ok(())
+}
+
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if frame.syscall_num() == SYSCALL_YIELD_NR {
@@ -1178,6 +1188,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::IpcRecvV2 => handle_ipc_recv_v2_stub(kernel, frame),
         Syscall::IpcCallV2 => handle_ipc_call_v2_stub(kernel, frame),
         Syscall::IpcReplyV2 => handle_ipc_reply_v2_stub(kernel, frame),
+        Syscall::DebugSerialWrite => handle_debug_serial_write(frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_blocked = caller_tid.is_some_and(|tid| {

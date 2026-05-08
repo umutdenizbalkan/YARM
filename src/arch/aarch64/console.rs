@@ -24,6 +24,8 @@ static UART_LOG_LOCK: SpinLockIrq<()> = SpinLockIrq::new(());
 
 #[cfg(feature = "hosted-dev")]
 pub fn write_line(_msg: &str) {}
+#[cfg(feature = "hosted-dev")]
+pub fn write_byte(_byte: u8) {}
 
 #[cfg(not(feature = "hosted-dev"))]
 pub fn init_early_mmio_base(base: usize) {
@@ -55,6 +57,11 @@ fn write_byte(byte: u8) {
 }
 
 #[cfg(not(feature = "hosted-dev"))]
+pub fn write_byte_public(byte: u8) {
+    write_byte(byte);
+}
+
+#[cfg(not(feature = "hosted-dev"))]
 fn mmio_read32(addr: usize) -> u32 {
     unsafe { read_volatile(addr as *const u32) }
 }
@@ -63,6 +70,9 @@ fn mmio_read32(addr: usize) -> u32 {
 fn mmio_write32(addr: usize, value: u32) {
     unsafe { write_volatile(addr as *mut u32, value) }
 }
+
+#[cfg(not(feature = "hosted-dev"))]
+pub use write_byte_public as write_byte;
 
 #[cfg(test)]
 mod tests {

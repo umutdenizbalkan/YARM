@@ -3,6 +3,8 @@
 
 #[cfg(feature = "hosted-dev")]
 pub fn write_line(_msg: &str) {}
+#[cfg(feature = "hosted-dev")]
+pub fn write_byte(_byte: u8) {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn write_line(msg: &str) {
@@ -29,8 +31,18 @@ fn write_byte(byte: u8) {
     }
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn write_byte_public(byte: u8) {
+    write_byte(byte);
+}
+
 #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "riscv64")))]
 pub fn write_line(_msg: &str) {}
+#[cfg(all(not(feature = "hosted-dev"), not(target_arch = "riscv64")))]
+pub fn write_byte(_byte: u8) {}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub use write_byte_public as write_byte;
 
 #[cfg(test)]
 mod tests {

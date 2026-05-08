@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::SyscallReturn;
+const SYSCALL_DEBUG_SERIAL_WRITE_NR: usize = 21;
 
 #[inline]
 pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
@@ -31,5 +32,15 @@ pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
         ret1: a1,
         ret2: a2,
         error: 0,
+    }
+}
+
+#[inline]
+pub(crate) fn serial_write_bytes(bytes: &[u8]) {
+    // Kernel-side RISC-V console path currently emits through SBI rather than a
+    // userspace-mapped UART MMIO window; use syscall bridge for serial markers.
+    for &byte in bytes {
+        // SAFETY: fixed debug-serial syscall ABI; argument is a single byte lane.
+        let _ = unsafe { raw_syscall(SYSCALL_DEBUG_SERIAL_WRITE_NR, [byte as usize, 0, 0, 0, 0, 0]) };
     }
 }

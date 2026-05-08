@@ -17,16 +17,12 @@ pub(crate) use x86_64::{raw_syscall, serial_write_bytes};
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
-pub(crate) use aarch64::raw_syscall;
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn serial_write_bytes(_bytes: &[u8]) {}
+pub(crate) use aarch64::{raw_syscall, serial_write_bytes};
 
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
 #[cfg(target_arch = "riscv64")]
-pub(crate) use riscv64::raw_syscall;
-#[cfg(target_arch = "riscv64")]
-pub(crate) fn serial_write_bytes(_bytes: &[u8]) {}
+pub(crate) use riscv64::{raw_syscall, serial_write_bytes};
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
 mod unsupported;
