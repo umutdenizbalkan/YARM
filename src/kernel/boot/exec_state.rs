@@ -581,7 +581,7 @@ impl KernelState {
             (stack_top.0 as usize).saturating_sub(startup_slots_bytes_len) & !0x7usize;
         let startup_stack_ptr = startup_slots_start & !0xFusize;
         let startup_slots_ptr = VirtAddr(startup_slots_start as u64);
-        let mut startup_slots_bytes = [0u8; core::mem::size_of::<u64>() * 13];
+        let mut startup_slots_bytes = [0u8; core::mem::size_of::<u64>() * 18];
         for (index, slot) in spec.startup_args.iter().copied().enumerate() {
             let begin = index * core::mem::size_of::<u64>();
             startup_slots_bytes[begin..begin + core::mem::size_of::<u64>()]
@@ -622,7 +622,7 @@ impl KernelState {
                 arg1: spec.startup_args[1] as usize,
                 arg2: spec.startup_args[2] as usize,
                 // Extended startup delivery ABI:
-                //   arg3 => pointer to [u64; 13] startup slot block in userspace memory
+                //   arg3 => pointer to [u64; 18] startup slot block in userspace memory
                 //   arg4 => startup slot count
                 //   arg5 => reserved (0)
                 arg3: startup_slots_start,

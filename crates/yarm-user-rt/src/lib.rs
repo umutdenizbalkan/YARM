@@ -329,10 +329,16 @@ pub mod runtime {
     pub const STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS: usize = 10;
     pub const STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP: usize = 11;
     pub const STARTUP_SLOT_PROCESS_MANAGER_SERVICE_RECV_EP: usize = 12;
-    const STARTUP_SLOT_COUNT: usize = 13;
+    pub const STARTUP_SLOT_PM_REQUEST_RECV_CAP: usize = 17;
+    const STARTUP_SLOT_COUNT: usize = 18;
 
     static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] =
         [
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -381,6 +387,10 @@ pub mod runtime {
         ///
         /// Passed to process_manager (TID 2) so it knows which endpoint to recv on.
         pub process_manager_service_recv_ep: Option<u32>,
+        /// Optional process-manager inbound request receive cap (slot 17).
+        ///
+        /// Passed to the PM server (TID 3) so it knows which endpoint to block on.
+        pub pm_request_recv_cap: Option<u32>,
     }
 
     impl StartupContext {
@@ -448,6 +458,11 @@ pub mod runtime {
             startup_task_id,
             startup_proc_mgr_request_send_cap,
             startup_proc_mgr_reply_recv_cap,
+            0,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -580,6 +595,9 @@ pub mod runtime {
         let process_manager_service_recv_ep = cap_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_SERVICE_RECV_EP].load(Ordering::Relaxed),
         );
+        let pm_request_recv_cap = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_PM_REQUEST_RECV_CAP].load(Ordering::Relaxed),
+        );
         StartupContext {
             task_id,
             process_manager_request_send_cap,
@@ -594,6 +612,7 @@ pub mod runtime {
             supervisor_restart_window_ticks,
             process_manager_restart_control_send_cap,
             process_manager_service_recv_ep,
+            pm_request_recv_cap,
         }
     }
 }
@@ -708,13 +727,13 @@ mod tests {
     fn startup_process_manager_caps_require_both_slots() {
         let original = startup_context();
 
-        install_startup_arg_slots([42, 11, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        install_startup_arg_slots([42, 11, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), Some((11, 12)));
 
-        install_startup_arg_slots([42, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        install_startup_arg_slots([42, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), None);
 
-        install_startup_arg_slots([42, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        install_startup_arg_slots([42, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), None);
 
         install_startup_arg_slots([
@@ -743,6 +762,11 @@ mod tests {
             original.supervisor_restart_window_ticks.unwrap_or(0),
             original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
             original.process_manager_service_recv_ep.map(u64::from).unwrap_or(0),
+            0,
+            0,
+            0,
+            0,
+            original.pm_request_recv_cap.map(u64::from).unwrap_or(0),
         ]);
     }
 }

@@ -50,11 +50,11 @@ pub struct UserImageSpec {
     ///
     /// Additional slots may be populated by launchers for server-specific
     /// runtime handoff metadata (for example supervisor endpoint caps).
-    pub startup_args: [u64; 13],
+    pub startup_args: [u64; 18],
 }
 
 impl UserImageSpec {
-    pub const DEFAULT_STARTUP_ARGS: [u64; 13] = [0; 13];
+    pub const DEFAULT_STARTUP_ARGS: [u64; 18] = [0; 18];
 }
 
 impl Default for UserImageSpec {
