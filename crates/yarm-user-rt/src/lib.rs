@@ -46,6 +46,7 @@ pub mod syscall {
     const SYSCALL_IPC_RECV_NR: usize = 2;
     const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
     const SYSCALL_IPC_CALL_NR: usize = 4;
+    const SYSCALL_IPC_REPLY_NR: usize = 7;
     const SYSCALL_YIELD_NR: usize = 0;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
@@ -58,6 +59,26 @@ pub mod syscall {
             ep_cap: u32,
             timeout_ticks: u64,
         ) -> core::result::Result<Option<Message>, SyscallError>;
+        fn recv_v2(
+            &mut self,
+            ep_cap: u32,
+        ) -> core::result::Result<Option<(Message, Option<u32>)>, SyscallError> {
+            match self.recv(ep_cap) {
+                Ok(Some(msg)) => {
+                    let reply_cap = msg.transferred_cap().map(|c| c.0 as u32);
+                    Ok(Some((msg, reply_cap)))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+        fn ipc_reply_v2(
+            &mut self,
+            reply_cap: u32,
+            msg: &Message,
+        ) -> core::result::Result<(), SyscallError> {
+            unsafe { ipc_reply(reply_cap, msg) }
+        }
     }
 
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +266,36 @@ pub mod syscall {
     }
 
     #[inline]
+    pub unsafe fn ipc_reply(
+        reply_cap: u32,
+        msg: &Message,
+    ) -> core::result::Result<(), SyscallError> {
+        let transfer_cap = msg
+            .transferred_cap()
+            .map(|cap| cap.0 as usize)
+            .unwrap_or(SYSCALL_NO_TRANSFER_CAP as usize);
+        let args = [
+            reply_cap as usize,
+            msg.payload.as_ptr() as usize,
+            msg.len as usize,
+            0,
+            0,
+            transfer_cap,
+        ];
+        // SAFETY: Uses architecture syscall ABI to enter kernel.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_REPLY_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
+    }
+
+    #[inline]
     pub fn yield_now() -> core::result::Result<(), SyscallError> {
         // SAFETY: Uses architecture syscall ABI to enter kernel.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_YIELD_NR, [0; 6]) };
@@ -277,10 +328,12 @@ pub mod runtime {
     pub const STARTUP_SLOT_OPTIONAL_SUPERVISOR_TID: usize = 9;
     pub const STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS: usize = 10;
     pub const STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP: usize = 11;
-    const STARTUP_SLOT_COUNT: usize = 12;
+    pub const STARTUP_SLOT_PROCESS_MANAGER_SERVICE_RECV_EP: usize = 12;
+    const STARTUP_SLOT_COUNT: usize = 13;
 
     static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] =
         [
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -324,6 +377,10 @@ pub mod runtime {
         pub supervisor_restart_window_ticks: Option<u64>,
         /// Optional process-manager restart-control SEND cap.
         pub process_manager_restart_control_send_cap: Option<u32>,
+        /// Optional process-manager service receive endpoint cap.
+        ///
+        /// Passed to process_manager (TID 2) so it knows which endpoint to recv on.
+        pub process_manager_service_recv_ep: Option<u32>,
     }
 
     impl StartupContext {
@@ -391,6 +448,7 @@ pub mod runtime {
             startup_task_id,
             startup_proc_mgr_request_send_cap,
             startup_proc_mgr_reply_recv_cap,
+            0,
             0,
             0,
             0,
@@ -519,6 +577,9 @@ pub mod runtime {
         let process_manager_restart_control_send_cap = cap_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP].load(Ordering::Relaxed),
         );
+        let process_manager_service_recv_ep = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_SERVICE_RECV_EP].load(Ordering::Relaxed),
+        );
         StartupContext {
             task_id,
             process_manager_request_send_cap,
@@ -532,6 +593,7 @@ pub mod runtime {
             supervisor_tid,
             supervisor_restart_window_ticks,
             process_manager_restart_control_send_cap,
+            process_manager_service_recv_ep,
         }
     }
 }
@@ -646,13 +708,13 @@ mod tests {
     fn startup_process_manager_caps_require_both_slots() {
         let original = startup_context();
 
-        install_startup_arg_slots([42, 11, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        install_startup_arg_slots([42, 11, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), Some((11, 12)));
 
-        install_startup_arg_slots([42, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        install_startup_arg_slots([42, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), None);
 
-        install_startup_arg_slots([42, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        install_startup_arg_slots([42, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(startup_context().process_manager_caps(), None);
 
         install_startup_arg_slots([
@@ -680,6 +742,7 @@ mod tests {
             original.supervisor_tid.unwrap_or(0),
             original.supervisor_restart_window_ticks.unwrap_or(0),
             original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
+            original.process_manager_service_recv_ep.map(u64::from).unwrap_or(0),
         ]);
     }
 }
