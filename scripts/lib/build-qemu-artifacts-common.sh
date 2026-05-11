@@ -76,6 +76,80 @@ common_stage_server_init_elf() {
   echo "[ok] staged server ELF as /init and /sbin/init_server"
 }
 
+common_stage_aux_server_elf() {
+  if [[ ! -f "$PM_ELF" ]]; then
+    echo "[warn] aux server ELF missing: $PM_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$PM_ELF" "$ROOTFS_DIR/sbin/process_manager"
+  chmod +x "$ROOTFS_DIR/sbin/process_manager"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$PM_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] aux server ELF has forbidden RWE PT_LOAD segment: $PM_ELF"
+      return 1
+    fi
+    if ! printf '%s\n' "$readelf_out" | awk '
+      BEGIN { page = 4096; exec_n = 0; write_n = 0; }
+      $1 == "LOAD" {
+        vaddr = strtonum("0x" $3);
+        memsz = strtonum("0x" $6);
+        flg = $7;
+        start = int(vaddr / page);
+        end = int((vaddr + memsz - 1) / page);
+        if (memsz == 0) next;
+        if (index(flg, "E") > 0) {
+          exec_start[exec_n] = start;
+          exec_end[exec_n] = end;
+          exec_n++;
+        }
+        if (index(flg, "W") > 0) {
+          write_start[write_n] = start;
+          write_end[write_n] = end;
+          write_n++;
+        }
+      }
+      END {
+        for (i = 0; i < exec_n; i++) {
+          for (j = 0; j < write_n; j++) {
+            if (!(exec_end[i] < write_start[j] || write_end[j] < exec_start[i])) {
+              exit 1;
+            }
+          }
+        }
+        exit 0;
+      }
+    '; then
+      echo "[error] aux server ELF has executable/writable PT_LOAD page overlap: $PM_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $PM_ELF"
+  fi
+
+  echo "[ok] staged aux server ELF as /sbin/process_manager"
+}
+
+common_verify_initramfs_stage_paths() {
+  local missing=0
+  for path in "init" "sbin/init_server" "sbin/process_manager"; do
+    if [[ ! -f "$ROOTFS_DIR/$path" ]]; then
+      echo "[error] expected initramfs path missing: $ROOTFS_DIR/$path"
+      missing=1
+    fi
+  done
+  if [[ "$missing" -ne 0 ]]; then
+    echo "[error] initramfs staging incomplete"
+    common_exit_if_strict_mode
+    return 1
+  fi
+  echo "[ok] all required initramfs stage paths present"
+}
+
 common_create_initramfs_newc() {
   if ! command -v cpio >/dev/null 2>&1; then
     echo "[warn] cpio not found; creating placeholder initramfs archive file"
