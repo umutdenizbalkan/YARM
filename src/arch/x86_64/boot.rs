@@ -448,6 +448,10 @@ boot_idt_ptr:
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const RING3_INIT_SERVER_TID: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RING3_SUPERVISOR_TID: u64 = 2;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const RING3_PM_SERVER_TID: u64 = 3;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const INITRAMFS_HELLO_WORLD_IMAGE_ID: u64 = 0x494E_4954_5848_454C; // "INITXHEL"
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const AP_STACK_PHYS_BASE: u64 = 0x0200_0000; // 32 MiB, above kernel image+BSS, below 64 MiB identity limit.
@@ -515,6 +519,46 @@ fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn load_supervisor_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
+    let bytes = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?;
+    let entry = yarm_srv_common::cpio::CpioArchive::new(bytes)
+        .find("/sbin/supervisor")
+        .ok()
+        .flatten()
+        .or_else(|| {
+            yarm_srv_common::cpio::CpioArchive::new(bytes)
+                .find("sbin/supervisor")
+                .ok()
+                .flatten()
+        })?;
+    let file_data = entry.file_data();
+    if file_data.len() > INITRD_INIT_ELF_MAX_SIZE {
+        return None;
+    }
+    Some(alloc::vec::Vec::from(file_data))
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn load_pm_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
+    let bytes = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?;
+    let entry = yarm_srv_common::cpio::CpioArchive::new(bytes)
+        .find("/sbin/process_manager")
+        .ok()
+        .flatten()
+        .or_else(|| {
+            yarm_srv_common::cpio::CpioArchive::new(bytes)
+                .find("sbin/process_manager")
+                .ok()
+                .flatten()
+        })?;
+    let file_data = entry.file_data();
+    if file_data.len() > INITRD_INIT_ELF_MAX_SIZE {
+        return None;
+    }
+    Some(alloc::vec::Vec::from(file_data))
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn bootstrap_first_user_task(
     kernel: &mut crate::kernel::boot::KernelState,
 ) -> Result<(), crate::kernel::boot::KernelError> {
@@ -526,110 +570,204 @@ pub fn bootstrap_first_user_task(
         return Ok(());
     }
 
-    let (asid, _aspace_cap) = match kernel.create_user_address_space() {
-        Ok(value) => value,
-        Err(err) => {
-            crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
-            return Err(err);
-        }
+    let (init_asid, _) = kernel.create_user_address_space().map_err(|e| {
+        crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e);
+        e
+    })?;
+    let init_image = load_init_elf_from_initramfs_vfs();
+    let init_fallback = initramfs_static_hello_world_elf();
+    let (init_bytes, init_source): (&[u8], &str) = match init_image.as_deref() {
+        Some(img) => (img, "initrd"),
+        None => (&init_fallback, "synthetic"),
     };
-    let image = load_init_elf_from_initramfs_vfs();
-    let fallback = initramfs_static_hello_world_elf();
-    let (image_bytes, source, fallback_reason): (&[u8], &str, Option<&str>) =
-        match image.as_deref() {
-            Some(initrd_image) => (initrd_image, "initrd", None),
-            None => (&fallback, "synthetic", Some("missing_or_invalid_initrd_init")),
-        };
-    let (entry, heap_base) = match kernel.load_elf_pt_load_segments(asid, image_bytes) {
-        Ok(result) => {
-            crate::yarm_log!("BOOTSTRAP_STAGE: after ELF load");
-            crate::yarm_log!("BOOTSTRAP_STAGE: after copy_to_user");
-            result
-        }
-        Err(err) => {
-            crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
-            return Err(err);
-        }
-    };
-    match source {
-        "initrd" => crate::yarm_log!("YARM_INITRD_INIT_ELF_SELECTED entry=0x{:x}", entry),
-        _ => crate::yarm_log!("YARM_SYNTHETIC_INIT_ELF_SELECTED entry=0x{:x}", entry),
-    }
-    if let Some(reason) = fallback_reason {
-        crate::yarm_log!(
-            "YARM_FIRST_USER_IMAGE_SOURCE source={} len={} reason={}",
-            source,
-            image_bytes.len(),
-            reason
-        );
+    let (init_entry, init_heap) = kernel
+        .load_elf_pt_load_segments(init_asid, init_bytes)
+        .map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e); e })?;
+
+    let supervisor_image = load_supervisor_elf_from_initramfs_vfs();
+    let supervisor_aei: Option<(_, usize, usize)> = if let Some(ref sup_bytes) = supervisor_image {
+        let (sup_asid, _) = kernel.create_user_address_space().map_err(|e| {
+            crate::yarm_log!("YARM_FIRST_USER_FAIL step=create_supervisor_asid err={:?}", e);
+            e
+        })?;
+        let (sup_entry, sup_heap) = kernel
+            .load_elf_pt_load_segments(sup_asid, sup_bytes)
+            .map_err(|e| {
+                crate::yarm_log!("YARM_FIRST_USER_FAIL step=load_supervisor_elf err={:?}", e);
+                e
+            })?;
+        Some((sup_asid, sup_entry, sup_heap))
     } else {
-        crate::yarm_log!(
-            "YARM_FIRST_USER_IMAGE_SOURCE source={} len={}",
-            source,
-            image_bytes.len()
-        );
+        crate::yarm_log!("YARM_SUPERVISOR_ELF_MISSING path=sbin/supervisor");
+        None
+    };
+
+    let pm_image = load_pm_elf_from_initramfs_vfs();
+    let pm_aei: Option<(_, usize, usize)> = if let Some(ref pm_bytes) = pm_image {
+        let (pm_asid, _) = kernel.create_user_address_space().map_err(|e| {
+            crate::yarm_log!("YARM_FIRST_USER_FAIL step=create_pm_asid err={:?}", e);
+            e
+        })?;
+        let (pm_entry, pm_heap) = kernel
+            .load_elf_pt_load_segments(pm_asid, pm_bytes)
+            .map_err(|e| {
+                crate::yarm_log!("YARM_FIRST_USER_FAIL step=load_pm_elf err={:?}", e);
+                e
+            })?;
+        Some((pm_asid, pm_entry, pm_heap))
+    } else {
+        crate::yarm_log!("YARM_PM_ELF_MISSING path=sbin/process_manager");
+        None
+    };
+
+    if supervisor_aei.is_some() {
+        kernel.register_task_with_class(RING3_SUPERVISOR_TID, TaskClass::SystemServer)?;
     }
-    crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
+    if pm_aei.is_some() {
+        kernel.register_task_with_class(RING3_PM_SERVER_TID, TaskClass::SystemServer)?;
+    }
     kernel.register_task_with_class(RING3_INIT_SERVER_TID, TaskClass::SystemServer)?;
-    let (_pm_eid, pm_send_cap_root, pm_recv_cap_root) = kernel.create_endpoint(8)?;
-    let pm_request_send_init = kernel.grant_capability_task_to_task_with_rights(
-        0,
-        pm_send_cap_root,
-        RING3_INIT_SERVER_TID,
+
+    let (_, pm_inbound_send_root, pm_inbound_recv_root) = kernel.create_endpoint(16)?;
+    let pm_inbound_send_init = kernel.grant_capability_task_to_task_with_rights(
+        0, pm_inbound_send_root, RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::SEND,
     )?;
-    let pm_reply_recv_init = kernel.grant_capability_task_to_task_with_rights(
-        0,
-        pm_recv_cap_root,
-        RING3_INIT_SERVER_TID,
+    let pm_inbound_recv_pm = if pm_aei.is_some() {
+        Some(kernel.grant_capability_task_to_task_with_rights(
+            0, pm_inbound_recv_root, RING3_PM_SERVER_TID,
+            crate::kernel::capabilities::CapRights::RECEIVE,
+        )?)
+    } else { None };
+
+    let (_, _, init_reply_recv_root) = kernel.create_endpoint(8)?;
+    let init_reply_recv_init = kernel.grant_capability_task_to_task_with_rights(
+        0, init_reply_recv_root, RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::RECEIVE,
     )?;
-    let (_sup_eid, _sup_send_root, sup_fault_recv_root) = kernel.create_endpoint(8)?;
-    let supervisor_fault_recv_init = kernel.grant_capability_task_to_task_with_rights(
-        0,
-        sup_fault_recv_root,
-        RING3_INIT_SERVER_TID,
+
+    let (_, _, sup_fault_recv_root) = kernel.create_endpoint(8)?;
+    let sup_fault_recv_sup = if supervisor_aei.is_some() {
+        Some(kernel.grant_capability_task_to_task_with_rights(
+            0, sup_fault_recv_root, RING3_SUPERVISOR_TID,
+            crate::kernel::capabilities::CapRights::RECEIVE,
+        )?)
+    } else { None };
+
+    let (_, ctrl_c_send_root, ctrl_c_recv_root) = kernel.create_endpoint(8)?;
+    let ctrl_c_send_init = kernel.grant_capability_task_to_task_with_rights(
+        0, ctrl_c_send_root, RING3_INIT_SERVER_TID,
+        crate::kernel::capabilities::CapRights::SEND,
+    )?;
+    let ctrl_c_recv_sup = if supervisor_aei.is_some() {
+        Some(kernel.grant_capability_task_to_task_with_rights(
+            0, ctrl_c_recv_root, RING3_SUPERVISOR_TID,
+            crate::kernel::capabilities::CapRights::RECEIVE,
+        )?)
+    } else { None };
+
+    let (_, ctrl_d_send_root, ctrl_d_recv_root) = kernel.create_endpoint(8)?;
+    let ctrl_d_send_sup = if supervisor_aei.is_some() {
+        Some(kernel.grant_capability_task_to_task_with_rights(
+            0, ctrl_d_send_root, RING3_SUPERVISOR_TID,
+            crate::kernel::capabilities::CapRights::SEND,
+        )?)
+    } else { None };
+    let ctrl_d_recv_init = kernel.grant_capability_task_to_task_with_rights(
+        0, ctrl_d_recv_root, RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::RECEIVE,
     )?;
-    kernel.set_supervisor_endpoint_for_task(RING3_INIT_SERVER_TID, supervisor_fault_recv_init)?;
-    let mut startup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
-    startup_args[0] = RING3_INIT_SERVER_TID;
-    startup_args[1] = pm_request_send_init.0;
-    startup_args[2] = pm_reply_recv_init.0;
-    if startup_args.len() > 3 {
-        startup_args[3] = supervisor_fault_recv_init.0;
+
+    let (_, alert_e_send_root, alert_e_recv_root) = kernel.create_endpoint(8)?;
+    let alert_e_send_init = kernel.grant_capability_task_to_task_with_rights(
+        0, alert_e_send_root, RING3_INIT_SERVER_TID,
+        crate::kernel::capabilities::CapRights::SEND,
+    )?;
+    let alert_e_recv_sup = if supervisor_aei.is_some() {
+        Some(kernel.grant_capability_task_to_task_with_rights(
+            0, alert_e_recv_root, RING3_SUPERVISOR_TID,
+            crate::kernel::capabilities::CapRights::RECEIVE,
+        )?)
+    } else { None };
+
+    let (_, alert_f_send_root, alert_f_recv_root) = kernel.create_endpoint(8)?;
+    let alert_f_send_sup = if supervisor_aei.is_some() {
+        Some(kernel.grant_capability_task_to_task_with_rights(
+            0, alert_f_send_root, RING3_SUPERVISOR_TID,
+            crate::kernel::capabilities::CapRights::SEND,
+        )?)
+    } else { None };
+    let alert_f_recv_init = kernel.grant_capability_task_to_task_with_rights(
+        0, alert_f_recv_root, RING3_INIT_SERVER_TID,
+        crate::kernel::capabilities::CapRights::RECEIVE,
+    )?;
+
+    if let Some(fault_cap) = sup_fault_recv_sup {
+        kernel.set_supervisor_endpoint_for_task(RING3_SUPERVISOR_TID, fault_cap)?;
     }
+
+    if let Some((sup_asid, sup_entry, sup_heap)) = supervisor_aei {
+        let mut sup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+        sup_args[0] = RING3_SUPERVISOR_TID;
+        if let Some(c) = sup_fault_recv_sup { sup_args[3] = c.0; }
+        if let Some(c) = ctrl_d_send_sup   { sup_args[4] = c.0; }
+        if let Some(c) = ctrl_c_recv_sup   { sup_args[5] = c.0; }
+        if let Some(c) = alert_f_send_sup  { sup_args[6] = c.0; }
+        if let Some(c) = alert_e_recv_sup  { sup_args[7] = c.0; }
+        sup_args[8] = RING3_INIT_SERVER_TID;
+        kernel.spawn_user_task_from_image(UserImageSpec {
+            tid: RING3_SUPERVISOR_TID,
+            entry: sup_entry,
+            asid: Some(sup_asid),
+            class: TaskClass::SystemServer,
+            startup_args: sup_args,
+        })?;
+        kernel.set_task_brk_bounds(RING3_SUPERVISOR_TID, sup_heap, sup_heap)?;
+        crate::yarm_log!("YARM_SUPERVISOR_TID2_SPAWNED tid={}", RING3_SUPERVISOR_TID);
+    }
+
+    if let Some((pm_asid, pm_entry, pm_heap)) = pm_aei {
+        let mut pm_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+        pm_args[0] = RING3_PM_SERVER_TID;
+        if let Some(c) = pm_inbound_recv_pm { pm_args[17] = c.0; }
+        kernel.spawn_user_task_from_image(UserImageSpec {
+            tid: RING3_PM_SERVER_TID,
+            entry: pm_entry,
+            asid: Some(pm_asid),
+            class: TaskClass::SystemServer,
+            startup_args: pm_args,
+        })?;
+        kernel.set_task_brk_bounds(RING3_PM_SERVER_TID, pm_heap, pm_heap)?;
+        crate::yarm_log!("YARM_PM_TID3_SPAWNED tid={}", RING3_PM_SERVER_TID);
+    }
+
+    let mut init_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
+    init_args[0] = RING3_INIT_SERVER_TID;
+    init_args[1] = pm_inbound_send_init.0;
+    init_args[2] = init_reply_recv_init.0;
+    init_args[4] = ctrl_c_send_init.0;
+    init_args[5] = ctrl_d_recv_init.0;
+    init_args[6] = alert_e_send_init.0;
+    init_args[7] = alert_f_recv_init.0;
+    init_args[9] = RING3_SUPERVISOR_TID;
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,
-        startup_args[0],
-        startup_args[1],
-        startup_args[2],
-        startup_args[3]
+        init_args[0], init_args[1], init_args[2], init_args[3]
     );
-    match kernel.spawn_user_task_from_image(UserImageSpec {
+    kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
-        entry,
-        asid: Some(asid),
+        entry: init_entry,
+        asid: Some(init_asid),
         class: TaskClass::SystemServer,
-        startup_args,
-    }) {
-        Ok(_) => crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation"),
-        Err(err) => {
-            crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
-            return Err(err);
-        }
-    }
-    kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, heap_base, heap_base)?;
-    let (phase, image_id) = if source == "initrd" {
-        ("initrd_init_elf", 0x494e495448454c4fu64)
-    } else {
-        ("kernel_static_init_elf", INITRAMFS_HELLO_WORLD_IMAGE_ID)
-    };
+        startup_args: init_args,
+    }).map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e); e })?;
+    crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation");
+    kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, init_heap, init_heap)?;
     crate::yarm_log!(
         "YARM_INIT_DONE arch=x86_64 phase={} image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
-        phase,
-        image_id
+        if init_source == "initrd" { "initrd_init_elf" } else { "kernel_static_init_elf" },
+        INITRAMFS_HELLO_WORLD_IMAGE_ID
     );
     Ok(())
 }
