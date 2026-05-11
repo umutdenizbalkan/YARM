@@ -10,7 +10,7 @@ pub use yarm_ipc_abi as ipc_abi;
 pub use yarm_user_rt as user_rt;
 
 #[inline]
-pub fn install_startup_arg_slots(slots: [u64; 12]) {
+pub fn install_startup_arg_slots(slots: [u64; 13]) {
     user_rt::runtime::install_startup_arg_slots(slots);
 }
 

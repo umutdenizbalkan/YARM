@@ -45,6 +45,8 @@ pub extern "C" fn _start(
         0,
         0,
         0,
+        0,
+        0,
     ];
     if startup_slots_ptr != 0 && startup_slots_len >= slots.len() {
         // SAFETY: kernel contract provides startup block pointer + count.
