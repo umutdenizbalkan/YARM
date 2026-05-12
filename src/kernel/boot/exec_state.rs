@@ -637,7 +637,12 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         let bootstrap_cpu = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
-        let should_pin = spec.tid == BOOTSTRAP_FIRST_USER_TID;
+        // Pin all SystemServer tasks (supervisor, PM, init) to CPU 0 so the
+        // scheduler queue on the bootstrap CPU has them in spawn order:
+        //   [idle/TID0, supervisor/TID2, PM/TID3, init/TID1]
+        // This guarantees supervisor and PM reach their recv() before init runs.
+        let should_pin = matches!(spec.class, crate::kernel::task::TaskClass::SystemServer)
+            || spec.tid == BOOTSTRAP_FIRST_USER_TID;
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "FIRST_USER_ENQUEUE_DECISION cpu={} tid={} chosen_cpu={} reason={}",

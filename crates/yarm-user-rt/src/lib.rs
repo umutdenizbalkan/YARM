@@ -503,6 +503,49 @@ pub mod runtime {
         install_startup_arg_slots(slots);
     }
 
+    // AArch64 bare-metal only: a non-inlined extern "C" shim so the naked asm
+    // can reach install_startup_args_from_abi via a stable bl target symbol.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    #[inline(never)]
+    extern "C" fn aarch64_install_shim(a: u64, b: u64, c: u64, d: usize, e: usize) {
+        install_startup_args_from_abi(a, b, c, d, e);
+    }
+
+    // AArch64 bare-metal: naked function that saves the user-entry fn ptr in the
+    // callee-saved register x19 before calling the install shim.
+    //
+    // Broken pattern avoided:
+    //   stp x30, x5, [sp, #-16]!       ← saves fn ptr on stack
+    //   bl  install_startup_args_from_abi
+    //   ldr x8, [sp, #8]               ← restores into x8 (syscall-number scratch!)
+    //   blr x8
+    //
+    // Correct pattern used here:
+    //   mov x19, x5   ← fn ptr in callee-saved x19; install preserves x19 (ABI)
+    //   bl  {install}
+    //   br  x19       ← branch to fn ptr; x19 guaranteed valid after bl returns
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    #[unsafe(naked)]
+    pub extern "C" fn enter_user_entrypoint(
+        _startup_task_id: u64,
+        _startup_proc_mgr_request_send_cap: u64,
+        _startup_proc_mgr_reply_recv_cap: u64,
+        _startup_slots_ptr: usize,
+        _startup_slots_len: usize,
+        _user_entry: extern "C" fn() -> !,
+    ) -> ! {
+        // x0-x4 = startup args (passed straight through to install shim)
+        // x5    = user_entry fn ptr
+        core::arch::naked_asm!(
+            "mov x19, x5",      // save fn ptr; install preserves callee-saved x19
+            "bl {install}",     // install_startup_args_from_abi(x0..x4)
+            "br x19",           // jump to user entry — never returns
+            install = sym aarch64_install_shim,
+        )
+    }
+
+    // All other targets (hosted-dev on any arch, or bare-metal non-AArch64).
+    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "aarch64")))]
     #[inline(never)]
     pub fn enter_user_entrypoint(
         startup_task_id: u64,
