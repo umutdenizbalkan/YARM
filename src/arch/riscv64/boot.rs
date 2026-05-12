@@ -175,6 +175,12 @@ pub fn bootstrap_first_user_task(
         0, pm_inbound_send_root, RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::SEND,
     )?;
+    let pm_inbound_send_sup = if supervisor_aei.is_some() {
+        Some(kernel.grant_capability_task_to_task_with_rights(
+            0, pm_inbound_send_root, RING3_SUPERVISOR_TID,
+            crate::kernel::capabilities::CapRights::SEND,
+        )?)
+    } else { None };
     let pm_inbound_recv_pm = if pm_aei.is_some() {
         Some(kernel.grant_capability_task_to_task_with_rights(
             0, pm_inbound_recv_root, RING3_PM_SERVER_TID,
@@ -211,6 +217,15 @@ pub fn bootstrap_first_user_task(
         )?)
     } else { None };
 
+    // EP5: Supervisor PM reply — supervisor gets RECV (slot 2); distinct from init's EP2.
+    let (_, _, sup_pm_reply_recv_root) = kernel.create_endpoint(8)?;
+    let sup_pm_reply_recv_sup = if supervisor_aei.is_some() {
+        Some(kernel.grant_capability_task_to_task_with_rights(
+            0, sup_pm_reply_recv_root, RING3_SUPERVISOR_TID,
+            crate::kernel::capabilities::CapRights::RECEIVE,
+        )?)
+    } else { None };
+
     if let Some(fault_cap) = sup_fault_recv_sup {
         kernel.set_supervisor_endpoint_for_task(RING3_SUPERVISOR_TID, fault_cap)?;
     }
@@ -218,9 +233,11 @@ pub fn bootstrap_first_user_task(
     if let Some((sup_asid, sup_entry, sup_heap)) = supervisor_aei {
         let mut sup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
         sup_args[0] = RING3_SUPERVISOR_TID;
-        if let Some(c) = sup_fault_recv_sup { sup_args[3] = c.0; }
-        if let Some(c) = sup_ctrl_send_sup  { sup_args[4] = c.0; }
-        if let Some(c) = sup_ctrl_recv_sup  { sup_args[5] = c.0; }
+        if let Some(c) = pm_inbound_send_sup   { sup_args[1] = c.0; }
+        if let Some(c) = sup_pm_reply_recv_sup { sup_args[2] = c.0; }
+        if let Some(c) = sup_fault_recv_sup    { sup_args[3] = c.0; }
+        if let Some(c) = sup_ctrl_send_sup     { sup_args[4] = c.0; }
+        if let Some(c) = sup_ctrl_recv_sup     { sup_args[5] = c.0; }
         sup_args[8] = RING3_INIT_SERVER_TID;
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid: RING3_SUPERVISOR_TID,
