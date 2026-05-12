@@ -101,7 +101,7 @@ fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
 fn load_supervisor_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
     let bytes = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?;
     let entry = yarm_srv_common::cpio::CpioArchive::new(bytes)
-        .find("supervisor")
+        .find("sbin/supervisor")
         .ok()
         .flatten()?;
     let file_data = entry.file_data();
@@ -115,7 +115,7 @@ fn load_supervisor_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
 fn load_pm_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
     let bytes = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?;
     let entry = yarm_srv_common::cpio::CpioArchive::new(bytes)
-        .find("process_manager")
+        .find("sbin/process_manager")
         .ok()
         .flatten()?;
     let file_data = entry.file_data();
@@ -139,8 +139,16 @@ pub fn bootstrap_first_user_task(
     let (init_asid, _) = kernel.create_user_address_space()?;
     let init_image = load_init_elf_from_initramfs_vfs();
     let init_fallback = initramfs_static_hello_world_elf();
-    let init_bytes: &[u8] = init_image.as_deref().unwrap_or(&init_fallback);
+    let (init_bytes, init_source): (&[u8], &str) = match init_image.as_deref() {
+        Some(img) => (img, "initrd"),
+        None => (&init_fallback, "synthetic"),
+    };
     let (init_entry, init_heap) = kernel.load_elf_pt_load_segments(init_asid, init_bytes)?;
+    crate::yarm_log!(
+        "YARM_INITRD_INIT_ELF_SELECTED entry={:#x} source={}",
+        init_entry,
+        init_source
+    );
 
     let supervisor_image = load_supervisor_elf_from_initramfs_vfs();
     let supervisor_aei: Option<(_, usize, usize)> = if let Some(ref sup_bytes) = supervisor_image {
@@ -148,8 +156,8 @@ pub fn bootstrap_first_user_task(
         let (sup_entry, sup_heap) = kernel.load_elf_pt_load_segments(sup_asid, sup_bytes)?;
         Some((sup_asid, sup_entry, sup_heap))
     } else {
-        crate::yarm_log!("YARM_SUPERVISOR_ELF_MISSING path=supervisor");
-        None
+        crate::yarm_log!("YARM_SUPERVISOR_ELF_MISSING path=sbin/supervisor");
+        return Err(crate::kernel::boot::KernelError::MemoryObjectMissing);
     };
 
     let pm_image = load_pm_elf_from_initramfs_vfs();
@@ -158,8 +166,8 @@ pub fn bootstrap_first_user_task(
         let (pm_entry, pm_heap) = kernel.load_elf_pt_load_segments(pm_asid, pm_bytes)?;
         Some((pm_asid, pm_entry, pm_heap))
     } else {
-        crate::yarm_log!("YARM_PM_ELF_MISSING path=process_manager");
-        None
+        crate::yarm_log!("YARM_PM_ELF_MISSING path=sbin/process_manager");
+        return Err(crate::kernel::boot::KernelError::MemoryObjectMissing);
     };
 
     if supervisor_aei.is_some() {
