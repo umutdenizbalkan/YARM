@@ -141,12 +141,8 @@ impl SupervisorRuntimeHandoff {
         let control_recv = self
             .supervisor_control_recv_ep
             .ok_or(KernelError::InvalidCapability)?;
-        let init_alert_send = self
-            .init_alert_send_ep
-            .ok_or(KernelError::InvalidCapability)?;
-        let init_alert_recv = self
-            .init_alert_recv_ep
-            .ok_or(KernelError::InvalidCapability)?;
+        let init_alert_send = self.init_alert_send_ep.unwrap_or(0);
+        let init_alert_recv = self.init_alert_recv_ep.unwrap_or(0);
         Ok((
             init_tid,
             InitFaultHandoff::new(
@@ -1146,8 +1142,11 @@ pub fn run() {
             loop {
                 let mut made_progress = false;
                 match transport.recv(supervisor.handoff.supervisor_control_recv_cap.0 as u32) {
-                    Ok(Some(_msg)) => {
+                    Ok(Some(msg)) => {
                         made_progress = true;
+                        yarm_user_rt::user_log!(
+                            "supervisor.srv control msg: opcode={}", msg.opcode
+                        );
                     }
                     Ok(None) => {}
                     Err(err) => {
