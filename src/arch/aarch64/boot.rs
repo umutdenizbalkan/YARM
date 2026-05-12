@@ -1040,17 +1040,22 @@ pub fn bootstrap_first_user_task(
         0, pm_inbound_send_root, RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::SEND,
     ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=pm_inbound_send_init err={:?}", e); e })?;
+    crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=1 cap={} rights=SEND result=ok", RING3_INIT_SERVER_TID, pm_inbound_send_init.0);
     let pm_inbound_send_sup = if supervisor_aei.is_some() {
-        Some(kernel.grant_capability_task_to_task_with_rights(
+        let c = kernel.grant_capability_task_to_task_with_rights(
             0, pm_inbound_send_root, RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::SEND,
-        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=pm_inbound_send_sup err={:?}", e); e })?)
+        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=pm_inbound_send_sup err={:?}", e); e })?;
+        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=1 cap={} rights=SEND result=ok", RING3_SUPERVISOR_TID, c.0);
+        Some(c)
     } else { None };
     let pm_inbound_recv_pm = if pm_aei.is_some() {
-        Some(kernel.grant_capability_task_to_task_with_rights(
+        let c = kernel.grant_capability_task_to_task_with_rights(
             0, pm_inbound_recv_root, RING3_PM_SERVER_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
-        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=pm_inbound_recv_pm err={:?}", e); e })?)
+        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=pm_inbound_recv_pm err={:?}", e); e })?;
+        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=17 cap={} rights=RECEIVE result=ok", RING3_PM_SERVER_TID, c.0);
+        Some(c)
     } else { None };
 
     // EP2: Init-reply — init gets RECV (slot 2).
@@ -1062,6 +1067,7 @@ pub fn bootstrap_first_user_task(
         0, init_reply_recv_root, RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::RECEIVE,
     ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=init_reply_recv_init err={:?}", e); e })?;
+    crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok", RING3_INIT_SERVER_TID, init_reply_recv_init.0);
 
     // EP3: Supervisor fault — supervisor gets RECV (slot 3).
     let (_, _, sup_fault_recv_root) = kernel.create_endpoint(8).map_err(|e| {
@@ -1069,10 +1075,12 @@ pub fn bootstrap_first_user_task(
         e
     })?;
     let sup_fault_recv_sup = if supervisor_aei.is_some() {
-        Some(kernel.grant_capability_task_to_task_with_rights(
+        let c = kernel.grant_capability_task_to_task_with_rights(
             0, sup_fault_recv_root, RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
-        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=sup_fault_recv_sup err={:?}", e); e })?)
+        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=sup_fault_recv_sup err={:?}", e); e })?;
+        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=3 cap={} rights=RECEIVE result=ok", RING3_SUPERVISOR_TID, c.0);
+        Some(c)
     } else { None };
 
     // EP4: Supervisor control — supervisor SEND (slot 4), supervisor RECV (slot 5).
@@ -1081,16 +1089,20 @@ pub fn bootstrap_first_user_task(
         e
     })?;
     let sup_ctrl_send_sup = if supervisor_aei.is_some() {
-        Some(kernel.grant_capability_task_to_task_with_rights(
+        let c = kernel.grant_capability_task_to_task_with_rights(
             0, sup_ctrl_send_root, RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::SEND,
-        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=sup_ctrl_send_sup err={:?}", e); e })?)
+        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=sup_ctrl_send_sup err={:?}", e); e })?;
+        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=4 cap={} rights=SEND result=ok", RING3_SUPERVISOR_TID, c.0);
+        Some(c)
     } else { None };
     let sup_ctrl_recv_sup = if supervisor_aei.is_some() {
-        Some(kernel.grant_capability_task_to_task_with_rights(
+        let c = kernel.grant_capability_task_to_task_with_rights(
             0, sup_ctrl_recv_root, RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
-        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=sup_ctrl_recv_sup err={:?}", e); e })?)
+        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=sup_ctrl_recv_sup err={:?}", e); e })?;
+        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=5 cap={} rights=RECEIVE result=ok", RING3_SUPERVISOR_TID, c.0);
+        Some(c)
     } else { None };
 
     // EP5: Supervisor PM reply — supervisor gets RECV (slot 2); distinct from init's EP2.
@@ -1099,10 +1111,12 @@ pub fn bootstrap_first_user_task(
         e
     })?;
     let sup_pm_reply_recv_sup = if supervisor_aei.is_some() {
-        Some(kernel.grant_capability_task_to_task_with_rights(
+        let c = kernel.grant_capability_task_to_task_with_rights(
             0, sup_pm_reply_recv_root, RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
-        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=sup_pm_reply_recv_sup err={:?}", e); e })?)
+        ).map_err(|e| { crate::yarm_log!("YARM_GRANT_FAIL cap=sup_pm_reply_recv_sup err={:?}", e); e })?;
+        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok", RING3_SUPERVISOR_TID, c.0);
+        Some(c)
     } else { None };
 
     // Register supervisor as the kernel fault handler for its own TID.

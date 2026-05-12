@@ -247,10 +247,23 @@ fn validate_endpoint_right(
     cap: CapId,
     right: CapRights,
 ) -> Result<(), SyscallError> {
-    let endpoint_cap = kernel
-        .capability_service()
-        .resolve_current_task_capability(cap)
-        .ok_or(SyscallError::InvalidCapability)?;
+    let tid = kernel.current_tid().unwrap_or(0);
+    let cnode = kernel.current_task_cnode();
+    let slot_result = cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, cap));
+    let live_result = slot_result.and_then(|c| {
+        kernel.capability_object_live(c.object).map(|_| c)
+    });
+    crate::yarm_log!(
+        "CAP_LOOKUP tid={} cap={} cnode={} slot_found={} object_live={} type={:?} rights={:?}",
+        tid,
+        cap.0,
+        cnode.map(|c| c.0).unwrap_or(u64::MAX),
+        slot_result.is_some(),
+        live_result.is_some(),
+        live_result.map(|c| c.object),
+        live_result.map(|c| c.rights()),
+    );
+    let endpoint_cap = live_result.ok_or(SyscallError::InvalidCapability)?;
     if !matches!(endpoint_cap.object, CapObject::Endpoint { .. }) {
         return Err(SyscallError::WrongObject);
     }
