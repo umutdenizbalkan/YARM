@@ -101,15 +101,9 @@ fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
 fn load_supervisor_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
     let bytes = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?;
     let entry = yarm_srv_common::cpio::CpioArchive::new(bytes)
-        .find("/sbin/supervisor")
+        .find("supervisor")
         .ok()
-        .flatten()
-        .or_else(|| {
-            yarm_srv_common::cpio::CpioArchive::new(bytes)
-                .find("sbin/supervisor")
-                .ok()
-                .flatten()
-        })?;
+        .flatten()?;
     let file_data = entry.file_data();
     if file_data.len() > INITRD_INIT_ELF_MAX_SIZE {
         return None;
@@ -121,15 +115,9 @@ fn load_supervisor_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
 fn load_pm_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
     let bytes = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?;
     let entry = yarm_srv_common::cpio::CpioArchive::new(bytes)
-        .find("/sbin/process_manager")
+        .find("process_manager")
         .ok()
-        .flatten()
-        .or_else(|| {
-            yarm_srv_common::cpio::CpioArchive::new(bytes)
-                .find("sbin/process_manager")
-                .ok()
-                .flatten()
-        })?;
+        .flatten()?;
     let file_data = entry.file_data();
     if file_data.len() > INITRD_INIT_ELF_MAX_SIZE {
         return None;
@@ -160,7 +148,7 @@ pub fn bootstrap_first_user_task(
         let (sup_entry, sup_heap) = kernel.load_elf_pt_load_segments(sup_asid, sup_bytes)?;
         Some((sup_asid, sup_entry, sup_heap))
     } else {
-        crate::yarm_log!("YARM_SUPERVISOR_ELF_MISSING path=sbin/supervisor");
+        crate::yarm_log!("YARM_SUPERVISOR_ELF_MISSING path=supervisor");
         None
     };
 
@@ -170,7 +158,7 @@ pub fn bootstrap_first_user_task(
         let (pm_entry, pm_heap) = kernel.load_elf_pt_load_segments(pm_asid, pm_bytes)?;
         Some((pm_asid, pm_entry, pm_heap))
     } else {
-        crate::yarm_log!("YARM_PM_ELF_MISSING path=sbin/process_manager");
+        crate::yarm_log!("YARM_PM_ELF_MISSING path=process_manager");
         None
     };
 
@@ -208,53 +196,20 @@ pub fn bootstrap_first_user_task(
         )?)
     } else { None };
 
-    let (_, ctrl_c_send_root, ctrl_c_recv_root) = kernel.create_endpoint(8)?;
-    let ctrl_c_send_init = kernel.grant_capability_task_to_task_with_rights(
-        0, ctrl_c_send_root, RING3_INIT_SERVER_TID,
-        crate::kernel::capabilities::CapRights::SEND,
-    )?;
-    let ctrl_c_recv_sup = if supervisor_aei.is_some() {
+    // EP4: Supervisor control — supervisor SEND (slot 4), supervisor RECV (slot 5).
+    let (_, sup_ctrl_send_root, sup_ctrl_recv_root) = kernel.create_endpoint(8)?;
+    let sup_ctrl_send_sup = if supervisor_aei.is_some() {
         Some(kernel.grant_capability_task_to_task_with_rights(
-            0, ctrl_c_recv_root, RING3_SUPERVISOR_TID,
-            crate::kernel::capabilities::CapRights::RECEIVE,
-        )?)
-    } else { None };
-
-    let (_, ctrl_d_send_root, ctrl_d_recv_root) = kernel.create_endpoint(8)?;
-    let ctrl_d_send_sup = if supervisor_aei.is_some() {
-        Some(kernel.grant_capability_task_to_task_with_rights(
-            0, ctrl_d_send_root, RING3_SUPERVISOR_TID,
+            0, sup_ctrl_send_root, RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::SEND,
         )?)
     } else { None };
-    let ctrl_d_recv_init = kernel.grant_capability_task_to_task_with_rights(
-        0, ctrl_d_recv_root, RING3_INIT_SERVER_TID,
-        crate::kernel::capabilities::CapRights::RECEIVE,
-    )?;
-
-    let (_, alert_e_send_root, alert_e_recv_root) = kernel.create_endpoint(8)?;
-    let alert_e_send_init = kernel.grant_capability_task_to_task_with_rights(
-        0, alert_e_send_root, RING3_INIT_SERVER_TID,
-        crate::kernel::capabilities::CapRights::SEND,
-    )?;
-    let alert_e_recv_sup = if supervisor_aei.is_some() {
+    let sup_ctrl_recv_sup = if supervisor_aei.is_some() {
         Some(kernel.grant_capability_task_to_task_with_rights(
-            0, alert_e_recv_root, RING3_SUPERVISOR_TID,
+            0, sup_ctrl_recv_root, RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?)
     } else { None };
-
-    let (_, alert_f_send_root, alert_f_recv_root) = kernel.create_endpoint(8)?;
-    let alert_f_send_sup = if supervisor_aei.is_some() {
-        Some(kernel.grant_capability_task_to_task_with_rights(
-            0, alert_f_send_root, RING3_SUPERVISOR_TID,
-            crate::kernel::capabilities::CapRights::SEND,
-        )?)
-    } else { None };
-    let alert_f_recv_init = kernel.grant_capability_task_to_task_with_rights(
-        0, alert_f_recv_root, RING3_INIT_SERVER_TID,
-        crate::kernel::capabilities::CapRights::RECEIVE,
-    )?;
 
     if let Some(fault_cap) = sup_fault_recv_sup {
         kernel.set_supervisor_endpoint_for_task(RING3_SUPERVISOR_TID, fault_cap)?;
@@ -264,10 +219,8 @@ pub fn bootstrap_first_user_task(
         let mut sup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
         sup_args[0] = RING3_SUPERVISOR_TID;
         if let Some(c) = sup_fault_recv_sup { sup_args[3] = c.0; }
-        if let Some(c) = ctrl_d_send_sup   { sup_args[4] = c.0; }
-        if let Some(c) = ctrl_c_recv_sup   { sup_args[5] = c.0; }
-        if let Some(c) = alert_f_send_sup  { sup_args[6] = c.0; }
-        if let Some(c) = alert_e_recv_sup  { sup_args[7] = c.0; }
+        if let Some(c) = sup_ctrl_send_sup  { sup_args[4] = c.0; }
+        if let Some(c) = sup_ctrl_recv_sup  { sup_args[5] = c.0; }
         sup_args[8] = RING3_INIT_SERVER_TID;
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid: RING3_SUPERVISOR_TID,
@@ -299,10 +252,6 @@ pub fn bootstrap_first_user_task(
     init_args[0] = RING3_INIT_SERVER_TID;
     init_args[1] = pm_inbound_send_init.0;
     init_args[2] = init_reply_recv_init.0;
-    init_args[4] = ctrl_c_send_init.0;
-    init_args[5] = ctrl_d_recv_init.0;
-    init_args[6] = alert_e_send_init.0;
-    init_args[7] = alert_f_recv_init.0;
     init_args[9] = RING3_SUPERVISOR_TID;
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
