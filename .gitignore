@@ -4,3 +4,4 @@
 /build-aarch64/
 /build-riscv64/
 /build-x86_64/
+/rustc-ice-*.txt
