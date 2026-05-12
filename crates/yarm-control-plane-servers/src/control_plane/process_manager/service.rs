@@ -1346,15 +1346,28 @@ pub fn run_request_loop_over_runtime_state_with_cnode_resize(
 }
 
 pub fn run() {
+    let ctx = yarm_user_rt::runtime::startup_context();
+    let Some(recv_cap) = ctx.pm_request_recv_cap else {
+        yarm_user_rt::user_log!("YARM_PM_NO_RECV_CAP");
+        return;
+    };
+    yarm_user_rt::user_log!("YARM_PM_RECV_LOOP_START cap={}", recv_cap);
+    use yarm_user_rt::syscall::IpcTransport;
+    let mut transport = yarm_user_rt::syscall::SyscallIpcTransport;
     let mut service = ProcessService::new();
-    let summary = run_request_loop(&mut service, 1, 42, 0).expect("process-manager loop");
-
-    yarm_user_rt::user_log!(
-        "process-manager request-loop ready: pid={}, exit_code={}, handled={}",
-        summary.waited_pid,
-        summary.waited_exit,
-        summary.handled
-    );
+    loop {
+        match transport.recv_v2(recv_cap) {
+            Ok(Some((msg, reply_cap))) => {
+                if let Ok(reply) = service.handle(msg) {
+                    if let Some(cap) = reply_cap {
+                        let _ = transport.ipc_reply_v2(cap, &reply);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return,
+        }
+    }
 }
 
 #[cfg(test)]
