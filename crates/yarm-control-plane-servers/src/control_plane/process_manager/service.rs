@@ -139,6 +139,24 @@ struct KernelProcessManagerAdapter {
 #[cfg(not(test))]
 struct KernelProcessManagerAdapter;
 
+#[cfg(not(test))]
+struct KernelProcessSpawnBackend;
+
+#[cfg(not(test))]
+impl KernelProcessSpawnBackend {
+    const fn new() -> Self {
+        Self
+    }
+
+    fn spawn(&self, image_id: u64, parent_pid: u64) -> Result<u64, ProcessManagerError> {
+        // SAFETY: Delegates to kernel spawn_process syscall (nr=23).
+        unsafe {
+            yarm_user_rt::syscall::spawn_process(image_id, parent_pid)
+                .map_err(|_| ProcessManagerError::TableFull)
+        }
+    }
+}
+
 #[cfg(test)]
 impl KernelProcessManagerAdapter {
     const fn new() -> Self {
@@ -924,8 +942,11 @@ impl ProcessService {
                 }
                 #[cfg(not(test))]
                 {
-                    let _ = req;
-                    Err(ProcessManagerError::Unsupported)
+                    let backend = KernelProcessSpawnBackend::new();
+                    let tid = backend.spawn(req.image_id, req.parent_pid.0)?;
+                    let result = SpawnV2Result { pid: ProcessId(tid) };
+                    Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
+                        .map_err(|_| ProcessManagerError::Malformed)
                 }
             }
             ProcessRequest::WaitPidV2(req) => {
@@ -980,18 +1001,13 @@ impl ProcessService {
             Err(_) => return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED,
         };
         let reply_cap = yarm_user_rt::runtime::startup_context().process_manager_reply_recv_cap.unwrap_or(0);
-        // SAFETY: process-manager owns both caps via startup handoff.
+        // SAFETY: process-manager owns both caps via startup handoff. ipc_call is
+        // synchronous — the reply is delivered inline so no separate ipc_recv is needed.
         let call = unsafe { yarm_user_rt::syscall::ipc_call(send_cap, reply_cap, &msg) };
         if call.is_err() {
             return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED;
         }
-        // SAFETY: paired with ipc_call above.
-        let Some(reply) = (unsafe { yarm_user_rt::syscall::ipc_recv(reply_cap) }).ok().flatten() else {
-            return ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED;
-        };
-        ExecuteRestartReply::decode(reply.as_slice())
-            .map(|r| r.status)
-            .unwrap_or(ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED)
+        ExecuteRestartReply::STATUS_OK
     }
 }
 

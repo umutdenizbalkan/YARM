@@ -45,9 +45,10 @@ pub mod syscall {
     const SYSCALL_IPC_SEND_NR: usize = 1;
     const SYSCALL_IPC_RECV_NR: usize = 2;
     const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
-    const SYSCALL_IPC_CALL_NR: usize = 4;
+    const SYSCALL_IPC_CALL_NR: usize = 6;
     const SYSCALL_IPC_REPLY_NR: usize = 7;
     const SYSCALL_YIELD_NR: usize = 0;
+    pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
 
@@ -241,17 +242,13 @@ pub mod syscall {
         reply_recv_cap: u32,
         msg: &Message,
     ) -> core::result::Result<(), SyscallError> {
-        let transfer_cap = msg
-            .transferred_cap()
-            .map(|cap| cap.0 as usize)
-            .unwrap_or(SYSCALL_NO_TRANSFER_CAP as usize);
         let args = [
             ep_cap as usize,
             msg.payload.as_ptr() as usize,
             msg.len as usize,
-            reply_recv_cap as usize,
             0,
-            transfer_cap,
+            0,
+            reply_recv_cap as usize,
         ];
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_CALL_NR, args) };
         #[cfg(target_arch = "x86_64")]
@@ -263,6 +260,25 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
+    }
+
+    #[inline]
+    pub unsafe fn spawn_process(
+        image_id: u64,
+        parent_pid: u64,
+    ) -> core::result::Result<u64, SyscallError> {
+        let args = [image_id as usize, parent_pid as usize, 0, 0, 0, 0];
+        // SAFETY: Uses architecture syscall ABI to enter kernel.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_PROCESS_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(ret.ret1 as u64)
     }
 
     #[inline]

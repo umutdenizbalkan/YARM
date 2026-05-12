@@ -259,9 +259,30 @@ fn resolve_core_image_plan(
 }
 
 pub fn run() {
-    yarm_user_rt::user_log!(
-        "init.srv requires kernel-provided bootstrap handoff; standalone Bootstrap::init path disabled"
-    );
+    let ctx = yarm_user_rt::runtime::startup_context();
+    let (Some(pm_send), Some(pm_recv)) = (
+        ctx.process_manager_request_send_cap,
+        ctx.process_manager_reply_recv_cap,
+    ) else {
+        yarm_user_rt::user_log!("INIT_NO_PM_CAPS");
+        return;
+    };
+    let args = yarm_ipc_abi::process_abi::SpawnV2Args::new(0, 1);
+    let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        yarm_ipc_abi::process_abi::PROC_OP_SPAWN_V2,
+        0,
+        None,
+        &args.encode(),
+    ) else {
+        return;
+    };
+    yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_BEGIN");
+    // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call.
+    let result = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
+    if result.is_ok() {
+        yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_OK");
+    }
 }
 
 #[cfg(test)]

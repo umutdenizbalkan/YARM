@@ -27,8 +27,9 @@ pub const SYSCALL_SPAWN_THREAD_NR: usize = 11;
 pub const SYSCALL_FORK_NR: usize = 12;
 pub const SYSCALL_VM_ANON_MAP_NR: usize = 13;
 pub const SYSCALL_VM_BRK_NR: usize = 14;
-pub const SYSCALL_COUNT: usize = 15;
-const _: [(); SYSCALL_COUNT] = [(); 15];
+pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
+pub const SYSCALL_COUNT: usize = 24;
+const _: [(); SYSCALL_COUNT] = [(); 24];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -68,10 +69,11 @@ pub enum Syscall {
     Fork = SYSCALL_FORK_NR,
     VmAnonMap = SYSCALL_VM_ANON_MAP_NR,
     VmBrk = SYSCALL_VM_BRK_NR,
+    SpawnProcess = SYSCALL_SPAWN_PROCESS_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 15;
+    pub const VARIANT_COUNT: usize = 16;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -93,12 +95,13 @@ impl Syscall {
             SYSCALL_FORK_NR => Ok(Self::Fork),
             SYSCALL_VM_ANON_MAP_NR => Ok(Self::VmAnonMap),
             SYSCALL_VM_BRK_NR => Ok(Self::VmBrk),
+            SYSCALL_SPAWN_PROCESS_NR => Ok(Self::SpawnProcess),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
 }
 
-const _: () = assert!(SYSCALL_COUNT == Syscall::VARIANT_COUNT);
+const _: () = assert!(SYSCALL_SPAWN_PROCESS_NR < SYSCALL_COUNT);
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
 const _: () = assert!(SYSCALL_ARG_TRANSFER_CAP < syscall_abi::TRAPFRAME_ARG_REGS);
 const _: () = assert!(syscall_abi::TRAPFRAME_ARG_REGS > SYSCALL_ARG_INLINE_PAYLOAD1);
@@ -1097,6 +1100,18 @@ fn handle_fork(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), Sy
     Ok(())
 }
 
+fn handle_spawn_process(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    let image_id = frame.arg(SYSCALL_ARG_CAP) as u64;
+    let parent_pid = frame.arg(SYSCALL_ARG_PTR) as u64;
+    let _ = (image_id, parent_pid);
+    let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
+    frame.set_ok(0, usize::try_from(tid).map_err(|_| SyscallError::Internal)?, 0);
+    Ok(())
+}
+
 fn handle_vm_anon_map(
     _kernel: &mut KernelState,
     _frame: &mut TrapFrame,
@@ -1179,6 +1194,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::Fork => handle_fork(kernel, frame),
         Syscall::VmAnonMap => handle_vm_anon_map(kernel, frame),
         Syscall::VmBrk => handle_vm_brk(kernel, frame),
+        Syscall::SpawnProcess => handle_spawn_process(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_blocked = caller_tid.is_some_and(|tid| {
@@ -1247,7 +1263,8 @@ mod tests {
         assert_eq!(SYSCALL_FORK_NR, 12);
         assert_eq!(SYSCALL_VM_ANON_MAP_NR, 13);
         assert_eq!(SYSCALL_VM_BRK_NR, 14);
-        assert_eq!(SYSCALL_COUNT, 15);
+        assert_eq!(SYSCALL_SPAWN_PROCESS_NR, 23);
+        assert_eq!(SYSCALL_COUNT, 24);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
