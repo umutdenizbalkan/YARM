@@ -27,7 +27,10 @@ path = "src/bin/init_server.rs"
 [[bin]]
 name = "process_manager"
 path = "src/bin/process_manager.rs"
-required-features = ["hosted-dev"]
+
+[[bin]]
+name = "supervisor"
+path = "src/bin/supervisor.rs"
 
 [[bin]]
 name = "driver_manager"
