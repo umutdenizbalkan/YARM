@@ -134,6 +134,9 @@ pub fn handle_trap_entry(
     let event = decode_trap_context(context);
     let entering_tid = kernel.current_tid();
     let raw_vector_return_pc = crate::arch::aarch64::boot::last_vector_raw_elr() as usize;
+
+    crate::yarm_log!("AARCH64_TRAP_ORIGINAL_TID tid={}", entering_tid.unwrap_or(0));
+
     if matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
             import_syscall_abi_from_user_gprs(trapframe);
@@ -147,30 +150,73 @@ pub fn handle_trap_entry(
         return Err(err);
     }
     crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT ok");
+
     if matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
             export_syscall_result_to_user_gprs(trapframe);
         }
     }
+
     if matches!(event, TrapEvent::Syscall) {
         crate::yarm_log!(
             "AARCH64_SYSCALL_RAW_RETURN_PC value=0x{:016x}",
             raw_vector_return_pc as u64
         );
     }
+
+    let exiting_tid = kernel.current_tid();
+    // A context switch occurred if the current task changed during the syscall handler.
+    let task_switched = matches!(event, TrapEvent::Syscall) && entering_tid != exiting_tid;
+
+    if task_switched {
+        // Save the original task's post-syscall resume PC to its TCB.
+        // sync_current_thread_from_frame already ran (before yield), but we also
+        // fix the frame's saved_pc here and re-save so the original task resumes at
+        // the correct ELR (SVC return address) when next dispatched.
+        if let Some(trapframe) = frame.as_deref_mut() {
+            trapframe.set_saved_pc(raw_vector_return_pc);
+            if let Some(orig_tid) = entering_tid {
+                let ctx = trapframe.capture_user_context();
+                let _ = kernel.set_thread_user_context(orig_tid, ctx);
+            }
+        }
+        crate::yarm_log!(
+            "AARCH64_SYSCALL_RETURN_SAVE tid={} elr=0x{:016x}",
+            entering_tid.unwrap_or(0),
+            raw_vector_return_pc as u64
+        );
+        crate::yarm_log!("AARCH64_DISPATCH_NEXT_TID tid={}", exiting_tid.unwrap_or(0));
+    }
+
     if let Err(err) = restore_arch_thread_state(kernel, cpu, frame.as_deref_mut()) {
         crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT err={:?}", err);
         crate::yarm_log!("AARCH64_TRAP_FAIL_REASON restore_arch_thread_state");
         return Err(err);
     }
-    if matches!(event, TrapEvent::Syscall) {
-        let exiting_tid = kernel.current_tid();
-        if entering_tid == exiting_tid
-            && let Some(trapframe) = frame.as_deref_mut()
-        {
+
+    if task_switched {
+        // restore_arch_thread_state loaded the new task's saved_pc and saved_sp via
+        // apply_user_context, but apply_user_context writes to args[] not user_gprs[].
+        // Copy the new task's startup args (arg0..5) into actual GPR slots (x0..x5) so
+        // the ERET delivers the correct startup arguments to the dispatched task.
+        if let Some(trapframe) = frame.as_deref_mut() {
+            for i in 0..6 {
+                let val = trapframe.arg(i);
+                trapframe.set_user_gpr(i, val);
+            }
+            crate::yarm_log!(
+                "AARCH64_RETURNING_SAVED_CONTEXT tid={} elr=0x{:016x}",
+                exiting_tid.unwrap_or(0),
+                trapframe.saved_pc() as u64
+            );
+        }
+    } else if matches!(event, TrapEvent::Syscall) {
+        // Same task continues: set the return ELR to the instruction after the SVC.
+        if let Some(trapframe) = frame.as_deref_mut() {
             trapframe.set_saved_pc(raw_vector_return_pc);
         }
     }
+
     Ok(())
 }
 

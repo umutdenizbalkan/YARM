@@ -1217,18 +1217,21 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
     }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if frame.syscall_num() == SYSCALL_YIELD_NR {
-        let tid = kernel.current_tid().unwrap_or(0);
+        let trapped_tid = caller_tid.unwrap_or(0);
+        let next_tid = kernel.current_tid().unwrap_or(0);
         if let Some(code) = frame.error_code() {
             crate::yarm_log!(
-                "YARM_SYSCALL0_EXIT tid={} nr={} result=err code={}",
-                tid,
+                "YARM_SYSCALL0_EXIT trapped_tid={} next_tid={} nr={} result=err code={}",
+                trapped_tid,
+                next_tid,
                 frame.syscall_num(),
                 code
             );
         } else {
             crate::yarm_log!(
-                "YARM_SYSCALL0_EXIT tid={} nr={} result=ok r0={} r1={} r2={}",
-                tid,
+                "YARM_SYSCALL0_EXIT trapped_tid={} next_tid={} nr={} result=ok r0={} r1={} r2={}",
+                trapped_tid,
+                next_tid,
                 frame.syscall_num(),
                 frame.ret0(),
                 frame.ret1(),
