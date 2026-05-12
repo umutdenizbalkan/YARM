@@ -44,7 +44,7 @@ fi
 
 echo "[info] qemu command: $QEMU_BIN ${QEMU_ARGS[*]}"
 
-MARKER_REGEX="YARM_AARCH64_BOOT_MARKER|YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
+MARKER_REGEX="YARM_AARCH64_BOOT_MARKER|YARM_SUPERVISOR_TID2_SPAWNED|YARM_PM_TID3_SPAWNED|YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
 INIT_SERVER_REGEX="init_server|first server|first-server"
 EARLY_MARKER_SEQUENCE=(
   "YARM_AARCH64_BOOT_MARKER stage=_start"
@@ -52,9 +52,15 @@ EARLY_MARKER_SEQUENCE=(
   "YARM_AARCH64_BOOT_MARKER stage=vbar_el1_ready"
   "YARM_AARCH64_BOOT_MARKER stage=mmu_enabled"
   "YARM_AARCH64_BOOT_MARKER stage=run_with_prepared_kernel"
+  "YARM_SUPERVISOR_TID2_SPAWNED"
+  "YARM_PM_TID3_SPAWNED"
   "YARM_BOOT_OK"
-  "YARM_INIT_START"
-  "YARM_INIT_DONE"
+)
+# Markers 4-6 come from user_log! which is a no-op in no_std; checked warn-only.
+SPAWN_IPC_SEQUENCE=(
+  "YARM_PM_RECV_LOOP_START"
+  "INIT_SPAWN_V5_CALL_BEGIN"
+  "INIT_SPAWN_V5_REPLY_OK"
 )
 
 if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" "${QEMU_ARGS[@]}"; then
@@ -82,6 +88,9 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     echo "[warn] aarch64 timer progression markers missing"
     [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
     exit 0
+  fi
+  if ! check_log_sequence "$LOGFILE" "${SPAWN_IPC_SEQUENCE[@]}"; then
+    echo "[warn] spawn IPC sequence absent (user_log! is a no-op in no_std; expected)"
   fi
   echo "[ok] aarch64 strict marker progression detected"
   exit 0

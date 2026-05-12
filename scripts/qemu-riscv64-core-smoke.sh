@@ -44,10 +44,28 @@ else
   QEMU_STATUS=$?
 fi
 
-MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
+MARKER_REGEX="YARM_SUPERVISOR_TID2_SPAWNED|YARM_PM_TID3_SPAWNED|YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
 INIT_SERVER_REGEX="init_server|first server|first-server"
+SPAWN_SEQUENCE=(
+  "YARM_SUPERVISOR_TID2_SPAWNED"
+  "YARM_PM_TID3_SPAWNED"
+  "YARM_BOOT_OK"
+)
+# Markers 4-6 come from user_log! which is a no-op in no_std; checked warn-only.
+SPAWN_IPC_SEQUENCE=(
+  "YARM_PM_RECV_LOOP_START"
+  "INIT_SPAWN_V5_CALL_BEGIN"
+  "INIT_SPAWN_V5_REPLY_OK"
+)
 
 if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then
+  if ! check_log_sequence "$LOGFILE" "${SPAWN_SEQUENCE[@]}"; then
+    echo "[warn] riscv64 spawn marker sequence missing or out of order"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+  fi
+  if ! check_log_sequence "$LOGFILE" "${SPAWN_IPC_SEQUENCE[@]}"; then
+    echo "[warn] spawn IPC sequence absent (user_log! is a no-op in no_std; expected)"
+  fi
   exit 0
 fi
 

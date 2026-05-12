@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
+source "$(dirname "$0")/qemu-smoke-common.sh"
 
 SMOKE_LOG=${SMOKE_LOG:-smoke.log}
 : >"$SMOKE_LOG"
@@ -134,7 +135,18 @@ else
   )
 fi
 
-MARKER_REGEX="YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|ABCDEFG|ABCDEF|ABCD"
+MARKER_REGEX="YARM_SUPERVISOR_TID2_SPAWNED|YARM_PM_TID3_SPAWNED|YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|ABCDEFG|ABCDEF|ABCD"
+SPAWN_SEQUENCE=(
+  "YARM_SUPERVISOR_TID2_SPAWNED"
+  "YARM_PM_TID3_SPAWNED"
+  "YARM_BOOT_OK"
+)
+# Markers 4-6 come from user_log! which is a no-op in no_std; checked warn-only.
+SPAWN_IPC_SEQUENCE=(
+  "YARM_PM_RECV_LOOP_START"
+  "INIT_SPAWN_V5_CALL_BEGIN"
+  "INIT_SPAWN_V5_REPLY_OK"
+)
 FIRMWARE_FALLBACK_REGEX="SeaBIOS|iPXE|Booting from ROM"
 
 echo "[info] qemu command: ${QEMU_CMD[*]}"
@@ -158,6 +170,14 @@ fi
 set -e
 
 if log_has_pattern "$MARKER_REGEX"; then
+  if ! check_log_sequence "$LOGFILE" "${SPAWN_SEQUENCE[@]}"; then
+    echo "[warn] x86_64 spawn marker sequence missing or out of order"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+  fi
+  if ! check_log_sequence "$LOGFILE" "${SPAWN_IPC_SEQUENCE[@]}"; then
+    echo "[warn] spawn IPC sequence absent (user_log! is a no-op in no_std; expected)"
+  fi
+
   if [[ "$QEMU_SMOKE_STRICT" != "1" ]]; then
     echo "[ok] boot markers detected"
     exit 0
