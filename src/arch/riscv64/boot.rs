@@ -277,6 +277,9 @@ pub fn bootstrap_first_user_task(
         if let Some(c) = sup_ctrl_send_sup     { sup_args[4] = c.0; }
         if let Some(c) = sup_ctrl_recv_sup     { sup_args[5] = c.0; }
         sup_args[8] = RING3_INIT_SERVER_TID;
+        for n in 0..10usize {
+            crate::yarm_log!("SUP_STARTUP_SLOT slot={} value={}", n, sup_args[n]);
+        }
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid: RING3_SUPERVISOR_TID,
             entry: sup_entry,

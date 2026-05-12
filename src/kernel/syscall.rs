@@ -614,7 +614,12 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 
 fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
-    validate_endpoint_right(kernel, cap, CapRights::RECEIVE)?;
+    let recv_tid = kernel.current_tid().unwrap_or(0);
+    crate::yarm_log!("IPC_RECV_INVALID_CAP tid={} cap={}", recv_tid, cap.0);
+    if let Err(e) = validate_endpoint_right(kernel, cap, CapRights::RECEIVE) {
+        crate::yarm_log!("IPC_RECV_CAP_LOOKUP_FAIL tid={} cap={} reason={:?}", recv_tid, cap.0, e);
+        return Err(e);
+    }
     let endpoint = kernel
         .capability_service()
         .resolve_current_task_capability(cap)

@@ -115,6 +115,18 @@ pub struct SupervisorRuntimeHandoff {
 #[cfg(not(test))]
 impl SupervisorRuntimeHandoff {
     pub fn from_startup_context(ctx: StartupContext) -> Self {
+        yarm_user_rt::user_log!(
+            "SUP_HANDOFF_FAULT_RECV cap={:?}",
+            ctx.supervisor_fault_recv_ep
+        );
+        yarm_user_rt::user_log!(
+            "SUP_HANDOFF_CONTROL_SEND cap={:?}",
+            ctx.supervisor_control_send_ep
+        );
+        yarm_user_rt::user_log!(
+            "SUP_HANDOFF_CONTROL_RECV cap={:?}",
+            ctx.supervisor_control_recv_ep
+        );
         Self {
             supervisor_tid: ctx.supervisor_tid.or(Some(ctx.task_id)),
             init_tid: ctx.init_tid,

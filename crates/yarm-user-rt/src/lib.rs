@@ -500,6 +500,10 @@ pub mod runtime {
                 index += 1;
             }
         }
+        user_log!(
+            "STARTUP_INSTALL_FINAL slot3={} slot4={} slot5={}",
+            slots[3], slots[4], slots[5]
+        );
         install_startup_arg_slots(slots);
     }
 
