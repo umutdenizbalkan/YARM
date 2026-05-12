@@ -122,7 +122,7 @@ impl KernelState {
         &mut self,
         asid: Asid,
         image: &[u8],
-    ) -> Result<(usize, usize), KernelError> {
+    ) -> Result<(usize, usize, usize), KernelError> {
         if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!(
@@ -167,6 +167,7 @@ impl KernelState {
         }
 
         let mut max_loaded_end = 0u64;
+        let mut first_pt_load_vaddr = 0u64;
         let mut saw_pt_load = false;
         for idx in 0..phnum {
             let base = phoff
@@ -181,6 +182,9 @@ impl KernelState {
             let p_vaddr = read_u64_le(image, base + 16)?;
             let p_filesz = read_u64_le(image, base + 32)? as usize;
             let p_memsz = read_u64_le(image, base + 40)? as usize;
+            if !saw_pt_load {
+                first_pt_load_vaddr = p_vaddr;
+            }
             saw_pt_load = true;
             let seg_end = p_vaddr
                 .checked_add(p_memsz as u64)
@@ -379,7 +383,7 @@ impl KernelState {
             .checked_add(page_size - 1)
             .ok_or(KernelError::WrongObject)?
             & !(page_size - 1);
-        Ok((entry as usize, heap_base as usize))
+        Ok((entry as usize, first_pt_load_vaddr as usize, heap_base as usize))
     }
 
     fn maybe_switch_kernel_context(
@@ -1033,7 +1037,7 @@ mod tests {
 
         let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
         let (asid, _map) = state.create_user_address_space().expect("asid");
-        let (entry, heap_base) = state
+        let (entry, _first_pt_load, heap_base) = state
             .load_elf_pt_load_segments(asid, &image)
             .expect("load elf");
         assert_eq!(entry, 0x0040_0000usize);

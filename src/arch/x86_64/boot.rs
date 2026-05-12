@@ -568,9 +568,18 @@ pub fn bootstrap_first_user_task(
         Some(img) => (img, "initrd"),
         None => (&init_fallback, "synthetic"),
     };
-    let (init_entry, init_heap) = kernel
+    let init_elf_info = yarm_srv_common::elf::ElfImageInfo::parse(0, init_bytes)
+        .map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR parse_init_elf_header: {:?}", e); crate::kernel::boot::KernelError::WrongObject })?;
+    let (_, init_first_pt_load, init_heap) = kernel
         .load_elf_pt_load_segments(init_asid, init_bytes)
         .map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e); e })?;
+    let init_entry = init_elf_info.entry as usize;
+    crate::yarm_log!("INIT_ELF_HEADER_ENTRY value={:#x}", init_elf_info.entry);
+    crate::yarm_log!("INIT_FIRST_PT_LOAD_VADDR value={:#x}", init_first_pt_load);
+    crate::yarm_log!("INIT_SELECTED_ENTRY value={:#x}", init_entry);
+    if init_entry == init_first_pt_load {
+        crate::yarm_log!("INIT_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong");
+    }
     crate::yarm_log!(
         "YARM_INITRD_INIT_ELF_SELECTED entry={:#x} source={}",
         init_entry,
@@ -579,16 +588,25 @@ pub fn bootstrap_first_user_task(
 
     let supervisor_image = load_supervisor_elf_from_initramfs_vfs();
     let supervisor_aei: Option<(_, usize, usize)> = if let Some(ref sup_bytes) = supervisor_image {
+        let sup_elf_info = yarm_srv_common::elf::ElfImageInfo::parse(1, sup_bytes)
+            .map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR parse_supervisor_elf_header: {:?}", e); crate::kernel::boot::KernelError::WrongObject })?;
         let (sup_asid, _) = kernel.create_user_address_space().map_err(|e| {
             crate::yarm_log!("YARM_FIRST_USER_FAIL step=create_supervisor_asid err={:?}", e);
             e
         })?;
-        let (sup_entry, sup_heap) = kernel
+        let (_, sup_first_pt_load, sup_heap) = kernel
             .load_elf_pt_load_segments(sup_asid, sup_bytes)
             .map_err(|e| {
                 crate::yarm_log!("YARM_FIRST_USER_FAIL step=load_supervisor_elf err={:?}", e);
                 e
             })?;
+        let sup_entry = sup_elf_info.entry as usize;
+        crate::yarm_log!("SUPERVISOR_ELF_HEADER_ENTRY value={:#x}", sup_elf_info.entry);
+        crate::yarm_log!("SUPERVISOR_FIRST_PT_LOAD_VADDR value={:#x}", sup_first_pt_load);
+        crate::yarm_log!("SUPERVISOR_SELECTED_ENTRY value={:#x}", sup_entry);
+        if sup_entry == sup_first_pt_load {
+            crate::yarm_log!("SUPERVISOR_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong");
+        }
         Some((sup_asid, sup_entry, sup_heap))
     } else {
         crate::yarm_log!("YARM_SUPERVISOR_ELF_MISSING path=sbin/supervisor");
@@ -597,16 +615,25 @@ pub fn bootstrap_first_user_task(
 
     let pm_image = load_pm_elf_from_initramfs_vfs();
     let pm_aei: Option<(_, usize, usize)> = if let Some(ref pm_bytes) = pm_image {
+        let pm_elf_info = yarm_srv_common::elf::ElfImageInfo::parse(2, pm_bytes)
+            .map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR parse_pm_elf_header: {:?}", e); crate::kernel::boot::KernelError::WrongObject })?;
         let (pm_asid, _) = kernel.create_user_address_space().map_err(|e| {
             crate::yarm_log!("YARM_FIRST_USER_FAIL step=create_pm_asid err={:?}", e);
             e
         })?;
-        let (pm_entry, pm_heap) = kernel
+        let (_, pm_first_pt_load, pm_heap) = kernel
             .load_elf_pt_load_segments(pm_asid, pm_bytes)
             .map_err(|e| {
                 crate::yarm_log!("YARM_FIRST_USER_FAIL step=load_pm_elf err={:?}", e);
                 e
             })?;
+        let pm_entry = pm_elf_info.entry as usize;
+        crate::yarm_log!("PM_ELF_HEADER_ENTRY value={:#x}", pm_elf_info.entry);
+        crate::yarm_log!("PM_FIRST_PT_LOAD_VADDR value={:#x}", pm_first_pt_load);
+        crate::yarm_log!("PM_SELECTED_ENTRY value={:#x}", pm_entry);
+        if pm_entry == pm_first_pt_load {
+            crate::yarm_log!("PM_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong");
+        }
         Some((pm_asid, pm_entry, pm_heap))
     } else {
         crate::yarm_log!("YARM_PM_ELF_MISSING path=sbin/process_manager");
