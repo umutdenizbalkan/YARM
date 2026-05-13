@@ -179,6 +179,7 @@ pub fn handle_trap_entry(
     let exiting_tid = kernel.current_tid();
     // A context switch occurred if the current task changed during the syscall handler.
     let task_switched = matches!(event, TrapEvent::Syscall) && entering_tid != exiting_tid;
+    let syscall_resume_pc = raw_vector_return_pc.wrapping_add(4);
 
     if task_switched {
         // Save the original task's post-syscall resume PC to its TCB.
@@ -186,16 +187,22 @@ pub fn handle_trap_entry(
         // fix the frame's saved_pc here and re-save so the original task resumes at
         // the correct ELR (SVC return address) when next dispatched.
         if let Some(trapframe) = frame.as_deref_mut() {
-            trapframe.set_saved_pc(raw_vector_return_pc);
+            trapframe.set_saved_pc(syscall_resume_pc);
             if let Some(orig_tid) = entering_tid {
                 let ctx = trapframe.capture_user_context();
                 let _ = kernel.set_thread_user_context(orig_tid, ctx);
+                crate::yarm_log!(
+                    "AARCH64_SYSCALL_BLOCK_SAVE tid={} raw_elr=0x{:016x} resume_elr=0x{:016x}",
+                    orig_tid,
+                    raw_vector_return_pc as u64,
+                    syscall_resume_pc as u64
+                );
             }
         }
         crate::yarm_log!(
             "AARCH64_SYSCALL_RETURN_SAVE tid={} elr=0x{:016x}",
             entering_tid.unwrap_or(0),
-            raw_vector_return_pc as u64
+            syscall_resume_pc as u64
         );
         crate::yarm_log!("AARCH64_DISPATCH_NEXT_TID tid={}", exiting_tid.unwrap_or(0));
     }
@@ -236,7 +243,7 @@ pub fn handle_trap_entry(
                     trapframe.arg(4)
                 );
             }
-            trapframe.set_saved_pc(raw_vector_return_pc);
+            trapframe.set_saved_pc(syscall_resume_pc);
         }
     }
 
