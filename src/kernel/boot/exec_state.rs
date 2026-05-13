@@ -637,6 +637,11 @@ impl KernelState {
                 arg4: startup_slots_len,
                 arg5: 0,
             };
+            if matches!(spec.class, crate::kernel::task::TaskClass::SystemServer)
+                || spec.tid == BOOTSTRAP_FIRST_USER_TID
+            {
+                tcb.cpu_affinity = Some(CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID));
+            }
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
