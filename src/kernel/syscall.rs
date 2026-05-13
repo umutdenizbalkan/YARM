@@ -1262,21 +1262,18 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::SpawnProcess => handle_spawn_process(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
-        let caller_blocked = caller_tid.is_some_and(|tid| {
-            matches!(
-                kernel.task_status(tid),
-                Some(crate::kernel::task::TaskStatus::Blocked(
-                    crate::kernel::task::WaitReason::EndpointSend(_)
-                        | crate::kernel::task::WaitReason::EndpointReceive(_)
-                ))
-            )
-        });
         let blocking_syscall = match syscall {
             Syscall::IpcRecv | Syscall::IpcCall => true,
             Syscall::IpcSend => decode_ipc_send_timeout_ticks(frame) == 0,
             _ => false,
         };
-        if blocking_syscall && caller_blocked {
+        if blocking_syscall {
+            crate::yarm_log!(
+                "AARCH64_SYSCALL_BLOCKED_OK tid={} nr={}",
+                caller_tid.unwrap_or(0),
+                frame.syscall_num()
+            );
+            crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT blocked");
             return Ok(());
         }
     }
