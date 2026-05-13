@@ -66,6 +66,14 @@ fn restore_arch_thread_state(
         crate::arch::aarch64::syscall_abi::REG_X18_TLS,
         tls.unwrap_or(0),
     );
+    crate::yarm_log!(
+        "AARCH64_CONTEXT_RESTORE_FULL tid={} elr=0x{:016x} sp=0x{:016x} x29=0x{:016x} x30=0x{:016x}",
+        current_tid,
+        frame.saved_pc() as u64,
+        frame.saved_sp() as u64,
+        frame.user_gpr(29) as u64,
+        frame.user_gpr(30) as u64
+    );
     #[cfg(test)]
     {
         let idx = cpu.0 as usize;
@@ -189,6 +197,14 @@ pub fn handle_trap_entry(
         if let Some(trapframe) = frame.as_deref_mut() {
             trapframe.set_saved_pc(syscall_resume_pc);
             if let Some(orig_tid) = entering_tid {
+                crate::yarm_log!(
+                    "AARCH64_CONTEXT_SAVE_FULL tid={} elr=0x{:016x} sp=0x{:016x} x29=0x{:016x} x30=0x{:016x}",
+                    orig_tid,
+                    trapframe.saved_pc() as u64,
+                    trapframe.saved_sp() as u64,
+                    trapframe.user_gpr(29) as u64,
+                    trapframe.user_gpr(30) as u64
+                );
                 let ctx = trapframe.capture_user_context();
                 let _ = kernel.set_thread_user_context(orig_tid, ctx);
                 crate::yarm_log!(
@@ -214,15 +230,12 @@ pub fn handle_trap_entry(
     }
 
     if task_switched {
-        // restore_arch_thread_state loaded the new task's saved_pc and saved_sp via
-        // apply_user_context, but apply_user_context writes to args[] not user_gprs[].
-        // Copy the new task's startup args (arg0..5) into actual GPR slots (x0..x5) so
-        // the ERET delivers the correct startup arguments to the dispatched task.
+        // Returning to a different thread: registers are sourced from saved user context.
         if let Some(trapframe) = frame.as_deref_mut() {
-            for i in 0..6 {
-                let val = trapframe.arg(i);
-                trapframe.set_user_gpr(i, val);
-            }
+            crate::yarm_log!(
+                "AARCH64_RETURN_CONTEXT_SOURCE tid={} source=saved_context",
+                exiting_tid.unwrap_or(0)
+            );
             crate::yarm_log!(
                 "AARCH64_RETURNING_SAVED_CONTEXT tid={} elr=0x{:016x}",
                 exiting_tid.unwrap_or(0),
@@ -243,6 +256,10 @@ pub fn handle_trap_entry(
                     trapframe.arg(4)
                 );
             }
+            crate::yarm_log!(
+                "AARCH64_RETURN_CONTEXT_SOURCE tid={} source=trapframe",
+                kernel.current_tid().unwrap_or(0)
+            );
             trapframe.set_saved_pc(syscall_resume_pc);
         }
     }

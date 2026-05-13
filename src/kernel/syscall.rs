@@ -1273,6 +1273,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
                 caller_tid.unwrap_or(0),
                 frame.syscall_num()
             );
+            crate::yarm_log!(
+                "AARCH64_BLOCKED_SYSCALL_STAYS_BLOCKED tid={} nr={}",
+                caller_tid.unwrap_or(0),
+                frame.syscall_num()
+            );
             crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT blocked");
             return Ok(());
         }
