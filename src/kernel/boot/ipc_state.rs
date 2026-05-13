@@ -679,6 +679,13 @@ impl KernelState {
                 endpoint
                     .send(msg)
                     .map_err(|_| KernelError::EndpointQueueFull)?;
+                crate::yarm_log!(
+                    "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
+                    waiter_tid.0,
+                    endpoint_idx,
+                    msg.len,
+                    msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
+                );
                 self.ipc.telemetry.rendezvous_handoffs =
                     self.ipc.telemetry.rendezvous_handoffs.saturating_add(1);
                 self.wake_waiter_for_endpoint(endpoint_idx)?;
@@ -719,6 +726,15 @@ impl KernelState {
         }
 
         self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
+        if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+            crate::yarm_log!(
+                "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
+                waiter_tid.0,
+                endpoint_idx,
+                msg.len,
+                msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
+            );
+        }
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
     }
@@ -975,7 +991,36 @@ impl KernelState {
             return Ok(Some(waiter.msg));
         }
 
-        let _ = self.block_current_on_receive_with_deadline(endpoint_idx, recv_cap, deadline)?;
+        let blocked_tid =
+            self.block_current_on_receive_with_deadline(endpoint_idx, recv_cap, deadline)?;
+        let timed_out = self.consume_ipc_timeout_fired_for_tid(blocked_tid.0)?;
+        if timed_out {
+            return Ok(None);
+        }
+        let after_wake = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?
+            .recv();
+        if let Some(msg) = after_wake {
+            if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
+                self.ipc
+                    .endpoints
+                    .get_mut(endpoint_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(KernelError::WrongObject)?
+                    .send(waiter.msg)
+                    .map_err(|_| KernelError::EndpointQueueFull)?;
+                self.wake_sender_waiter(waiter.tid)?;
+            }
+            return Ok(Some(msg));
+        }
+        if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
+            self.wake_sender_waiter(waiter.tid)?;
+            return Ok(Some(waiter.msg));
+        }
         Ok(None)
     }
 }

@@ -957,8 +957,22 @@ fn handle_ipc_recv_result_with_empty_error(
                     return Err(SyscallError::InvalidArgs);
                 }
                 match kernel.copy_to_current_user(user_ptr, msg.as_slice()) {
-                    Ok(()) => frame.set_ok(sender, msg.len as usize, frame.ret2()),
+                    Ok(()) => {
+                        crate::yarm_log!(
+                            "IPC_RECV_COPY_TO_USER tid={} dst=0x{:x} len={} result=ok",
+                            receiver_tid,
+                            user_ptr,
+                            msg.len
+                        );
+                        frame.set_ok(sender, msg.len as usize, frame.ret2());
+                    }
                     Err(KernelError::UserMemoryFault) => {
+                        crate::yarm_log!(
+                            "IPC_RECV_COPY_TO_USER tid={} dst=0x{:x} len={} result=err",
+                            receiver_tid,
+                            user_ptr,
+                            msg.len
+                        );
                         record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
                         return Ok(());
                     }
@@ -966,6 +980,13 @@ fn handle_ipc_recv_result_with_empty_error(
                 };
             } else {
                 frame.set_ok(sender, msg.len as usize, frame.ret2());
+                crate::yarm_log!(
+                    "IPC_RECV_WAKE_RETURN_REGS tid={} x0={} x1={} x2={} elr=na",
+                    receiver_tid,
+                    sender,
+                    msg.len,
+                    frame.ret2()
+                );
                 let words =
                     pack_register_payload(msg.as_slice()).map_err(|_| SyscallError::InvalidArgs)?;
                 frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, words[0]);
