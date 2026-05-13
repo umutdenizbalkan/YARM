@@ -714,6 +714,14 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     let responder_tid = kernel
         .endpoint_waiter_tid(endpoint)
         .ok_or(SyscallError::WouldBlock)?;
+    let endpoint_idx = kernel
+        .resolve_endpoint_index(endpoint)
+        .map_err(SyscallError::from)?;
+    crate::yarm_log!(
+        "IPC_CALL_WAKE_RECEIVER endpoint={} tid={}",
+        endpoint_idx,
+        responder_tid.0
+    );
 
     let sender_tid = current_tid(kernel)?;
     let reply_cap = kernel

@@ -3,7 +3,7 @@
 
 use super::{
     IpcFastpathResult, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
-    NotificationObject, ReplyCapRecord, SenderWaiter, map_ipc_error,
+    NotificationObject, ReplyCapRecord, SenderWaiter, kernel_ref, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
@@ -13,6 +13,44 @@ use yarm_ipc_abi::process_abi::{
 };
 
 impl KernelState {
+    fn wake_tid_to_runnable(&mut self, tid: ThreadId) -> Result<(), KernelError> {
+        let old_status = self.task_status(tid.0).ok_or(KernelError::TaskMissing)?;
+        crate::yarm_log!("SCHED_WAKE_BEGIN tid={} old_status={:?}", tid.0, old_status);
+        if matches!(old_status, TaskStatus::Runnable | TaskStatus::Running) {
+            crate::yarm_log!("SCHED_WAKE_ALREADY_RUNNABLE tid={}", tid.0);
+            return Ok(());
+        }
+        if !matches!(old_status, TaskStatus::Blocked(_)) {
+            crate::yarm_log!(
+                "SCHED_WAKE_FAIL tid={} reason=unexpected_status:{:?}",
+                tid.0,
+                old_status
+            );
+            return Err(KernelError::WouldBlock);
+        }
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid.0)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Runnable;
+            Ok::<_, KernelError>(())
+        })?;
+        crate::yarm_log!("SCHED_WAKE_SET_RUNNABLE tid={} new_status=Runnable", tid.0);
+        self.clear_ipc_timeout_for_tid(tid.0)?;
+        let cpu = self.enqueue_task(tid.0)?;
+        let queue_len =
+            self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu));
+        crate::yarm_log!(
+            "SCHED_WAKE_ENQUEUE tid={} cpu={} queue_len={}",
+            tid.0,
+            cpu.0,
+            queue_len
+        );
+        Ok(())
+    }
+
     pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
@@ -128,6 +166,11 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         self.ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_REGISTER endpoint={} tid={}",
+            endpoint_idx,
+            blocked_tid
+        );
         let _ = self.dispatch_next_task()?;
         Ok(ThreadId(blocked_tid))
     }
@@ -169,34 +212,14 @@ impl KernelState {
     ) -> Result<(), KernelError> {
         if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx].take() {
             crate::yarm_log!("SCHED_WAKE tid={}", waiter_tid.0);
-            self.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
-                    .ok_or(KernelError::TaskMissing)?;
-                tcb.status = TaskStatus::Runnable;
-                Ok::<_, KernelError>(())
-            })?;
-            self.clear_ipc_timeout_for_tid(waiter_tid.0)?;
-            self.enqueue_task(waiter_tid.0)?;
+            self.wake_tid_to_runnable(waiter_tid)?;
         }
         Ok(())
     }
 
     fn wake_sender_waiter(&mut self, sender_tid: ThreadId) -> Result<(), KernelError> {
         crate::yarm_log!("SCHED_WAKE tid={}", sender_tid.0);
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == sender_tid.0)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Runnable;
-            Ok::<_, KernelError>(())
-        })?;
-        self.clear_ipc_timeout_for_tid(sender_tid.0)?;
-        self.enqueue_task(sender_tid.0).map(|_| ())
+        self.wake_tid_to_runnable(sender_tid)
     }
 
     pub(crate) fn process_ipc_timeout_deadlines(
