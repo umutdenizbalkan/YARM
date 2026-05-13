@@ -1407,7 +1407,11 @@ pub fn run() {
             Ok(None) => {
                 yarm_user_rt::user_log!("PM_RECV_CALL_RETURN ok=false x0=0 x1=0 x2=0");
             }
-            Err(_) => return,
+            Err(_) => {
+                // Keep serving even when recv wrapper reports a transient/fatal decode path;
+                // returning here exits run() and drops into yarm_user_entry's post-run yield loop.
+                continue;
+            }
         }
     }
 }

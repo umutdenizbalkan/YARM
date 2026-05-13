@@ -225,6 +225,17 @@ pub fn handle_trap_entry(
     } else if matches!(event, TrapEvent::Syscall) {
         // Same task continues: set the return ELR to the instruction after the SVC.
         if let Some(trapframe) = frame.as_deref_mut() {
+            if let Some(tid) = kernel.current_tid() {
+                crate::yarm_log!(
+                    "IPC_RECV_WAKE_RETURN_REGS tid={} x0={} x1={} x2={} x3={} x4={}",
+                    tid,
+                    trapframe.ret0(),
+                    trapframe.ret1(),
+                    trapframe.ret2(),
+                    trapframe.arg(3),
+                    trapframe.arg(4)
+                );
+            }
             trapframe.set_saved_pc(raw_vector_return_pc);
         }
     }
