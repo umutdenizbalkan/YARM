@@ -16,11 +16,10 @@ impl KernelState {
     fn wake_tid_to_runnable(&mut self, tid: ThreadId) -> Result<(), KernelError> {
         let old_status = self.task_status(tid.0).ok_or(KernelError::TaskMissing)?;
         crate::yarm_log!("SCHED_WAKE_BEGIN tid={} old_status={:?}", tid.0, old_status);
-        if matches!(old_status, TaskStatus::Runnable | TaskStatus::Running) {
-            crate::yarm_log!("SCHED_WAKE_ALREADY_RUNNABLE tid={}", tid.0);
-            return Ok(());
-        }
-        if !matches!(old_status, TaskStatus::Blocked(_)) {
+        if !matches!(
+            old_status,
+            TaskStatus::Blocked(_) | TaskStatus::Runnable | TaskStatus::Running
+        ) {
             crate::yarm_log!(
                 "SCHED_WAKE_FAIL tid={} reason=unexpected_status:{:?}",
                 tid.0,
@@ -28,26 +27,32 @@ impl KernelState {
             );
             return Err(KernelError::WouldBlock);
         }
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid.0)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Runnable;
-            Ok::<_, KernelError>(())
-        })?;
+        if !matches!(old_status, TaskStatus::Runnable) {
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid.0)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Runnable;
+                Ok::<_, KernelError>(())
+            })?;
+        }
         crate::yarm_log!("SCHED_WAKE_SET_RUNNABLE tid={} new_status=Runnable", tid.0);
         self.clear_ipc_timeout_for_tid(tid.0)?;
-        let cpu = self.enqueue_task(tid.0)?;
-        let queue_len =
-            self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu));
-        crate::yarm_log!(
-            "SCHED_WAKE_ENQUEUE tid={} cpu={} queue_len={}",
-            tid.0,
-            cpu.0,
-            queue_len
-        );
+        if self.current_tid() == Some(tid.0) && matches!(old_status, TaskStatus::Running) {
+            crate::yarm_log!("SCHED_WAKE_ALREADY_RUNNABLE tid={}", tid.0);
+        } else {
+            let cpu = self.enqueue_task(tid.0)?;
+            let queue_len = self
+                .with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu));
+            crate::yarm_log!(
+                "SCHED_WAKE_ENQUEUE tid={} cpu={} queue_len={}",
+                tid.0,
+                cpu.0,
+                queue_len
+            );
+        }
         Ok(())
     }
 
