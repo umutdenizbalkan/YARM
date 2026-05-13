@@ -250,9 +250,7 @@ fn validate_endpoint_right(
     let tid = kernel.current_tid().unwrap_or(0);
     let cnode = kernel.current_task_cnode();
     let slot_result = cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, cap));
-    let live_result = slot_result.and_then(|c| {
-        kernel.capability_object_live(c.object).map(|_| c)
-    });
+    let live_result = slot_result.and_then(|c| kernel.capability_object_live(c.object).map(|_| c));
     crate::yarm_log!(
         "CAP_LOOKUP tid={} cap={} cnode={} slot_found={} object_live={} type={:?} rights={:?}",
         tid,
@@ -628,9 +626,14 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let recv_tid = kernel.current_tid().unwrap_or(0);
-    crate::yarm_log!("IPC_RECV_INVALID_CAP tid={} cap={}", recv_tid, cap.0);
+    crate::yarm_log!("IPC_RECV_ENTER tid={} cap={}", recv_tid, cap.0);
     if let Err(e) = validate_endpoint_right(kernel, cap, CapRights::RECEIVE) {
-        crate::yarm_log!("IPC_RECV_CAP_LOOKUP_FAIL tid={} cap={} reason={:?}", recv_tid, cap.0, e);
+        crate::yarm_log!(
+            "IPC_RECV_CAP_LOOKUP_FAIL tid={} cap={} reason={:?}",
+            recv_tid,
+            cap.0,
+            e
+        );
         return Err(e);
     }
     let endpoint = kernel
@@ -1073,8 +1076,10 @@ fn handle_control_plane_set_cnode_slots(
 
 fn handle_futex_wait(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let addr = frame.arg(SYSCALL_ARG_CAP);
-    let expected = u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
-    let observed = u32::try_from(frame.arg(SYSCALL_ARG_LEN)).map_err(|_| SyscallError::InvalidArgs)?;
+    let expected =
+        u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
+    let observed =
+        u32::try_from(frame.arg(SYSCALL_ARG_LEN)).map_err(|_| SyscallError::InvalidArgs)?;
     let blocked = kernel
         .futex_wait_current(addr, expected, observed)
         .map_err(SyscallError::from)?;
@@ -1084,8 +1089,11 @@ fn handle_futex_wait(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<
 
 fn handle_futex_wake(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let addr = frame.arg(SYSCALL_ARG_CAP);
-    let max_wake = u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
-    let woke = kernel.futex_wake(addr, max_wake).map_err(SyscallError::from)?;
+    let max_wake =
+        u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
+    let woke = kernel
+        .futex_wake(addr, max_wake)
+        .map_err(SyscallError::from)?;
     frame.set_ok(woke as usize, 0, 0);
     Ok(())
 }
@@ -1101,7 +1109,11 @@ fn handle_spawn_thread(
     let tid = kernel
         .spawn_user_thread(parent_tid, tls_base, user_stack_top, user_entry)
         .map_err(SyscallError::from)?;
-    frame.set_ok(usize::try_from(tid).map_err(|_| SyscallError::Internal)?, 0, 0);
+    frame.set_ok(
+        usize::try_from(tid).map_err(|_| SyscallError::Internal)?,
+        0,
+        0,
+    );
     Ok(())
 }
 
@@ -1126,7 +1138,11 @@ fn handle_spawn_process(
     let parent_pid = frame.arg(SYSCALL_ARG_PTR) as u64;
     let _ = (image_id, parent_pid);
     let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
-    frame.set_ok(0, usize::try_from(tid).map_err(|_| SyscallError::Internal)?, 0);
+    frame.set_ok(
+        0,
+        usize::try_from(tid).map_err(|_| SyscallError::Internal)?,
+        0,
+    );
     Ok(())
 }
 
@@ -1158,7 +1174,9 @@ fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<()
     }
 
     validate_user_region(requested as u64, 1)?;
-    let (base, current_end) = _kernel.task_brk_bounds(tid).ok_or(SyscallError::InvalidArgs)?;
+    let (base, current_end) = _kernel
+        .task_brk_bounds(tid)
+        .ok_or(SyscallError::InvalidArgs)?;
     if requested < base {
         return Err(SyscallError::InvalidArgs);
     }

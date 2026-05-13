@@ -49,6 +49,15 @@ fn restore_arch_thread_state(
     let Some(frame) = frame else {
         return Ok(());
     };
+    let Some(current_tid) = kernel.current_tid() else {
+        crate::yarm_log!("SCHED_NO_RUNNABLE_USER_TASK");
+        crate::yarm_log!("SCHED_ENTER_IDLE");
+        return Ok(());
+    };
+    if current_tid == 0 || kernel.task_asid(current_tid).is_none() {
+        crate::yarm_log!("SCHED_ENTER_IDLE");
+        return Ok(());
+    }
     let tls = kernel
         .resume_current_thread_with_frame(frame)
         .map_err(crate::kernel::syscall::SyscallError::from)
@@ -135,7 +144,10 @@ pub fn handle_trap_entry(
     let entering_tid = kernel.current_tid();
     let raw_vector_return_pc = crate::arch::aarch64::boot::last_vector_raw_elr() as usize;
 
-    crate::yarm_log!("AARCH64_TRAP_ORIGINAL_TID tid={}", entering_tid.unwrap_or(0));
+    crate::yarm_log!(
+        "AARCH64_TRAP_ORIGINAL_TID tid={}",
+        entering_tid.unwrap_or(0)
+    );
 
     if matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
