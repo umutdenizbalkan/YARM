@@ -379,6 +379,8 @@ impl KernelState {
     }
 
     pub fn ipc_reply(&mut self, reply_cap: CapId, msg: Message) -> Result<(), KernelError> {
+        let current_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        crate::yarm_log!("IPC_REPLY_ENTER tid={}", current_tid);
         let capability = self.resolve_send_cap_task_local(reply_cap)?;
         if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
@@ -408,6 +410,9 @@ impl KernelState {
         endpoint
             .send(msg)
             .map_err(|_| KernelError::EndpointQueueFull)?;
+        if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+            crate::yarm_log!("IPC_REPLY_WAKE_CALLER tid={}", waiter_tid.0);
+        }
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
     }
