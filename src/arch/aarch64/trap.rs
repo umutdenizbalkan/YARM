@@ -67,12 +67,15 @@ fn restore_arch_thread_state(
         tls.unwrap_or(0),
     );
     crate::yarm_log!(
-        "AARCH64_CONTEXT_RESTORE_FULL tid={} elr=0x{:016x} sp=0x{:016x} x29=0x{:016x} x30=0x{:016x}",
+        "AARCH64_CONTEXT_RESTORE_FULL tid={} elr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x29=0x{:016x} x30=0x{:016x} ctx_ptr=0x{:x}",
         current_tid,
         frame.saved_pc() as u64,
         frame.saved_sp() as u64,
+        frame.user_gpr(0) as u64,
+        frame.user_gpr(1) as u64,
         frame.user_gpr(29) as u64,
-        frame.user_gpr(30) as u64
+        frame.user_gpr(30) as u64,
+        frame as *const _ as usize
     );
     #[cfg(test)]
     {
@@ -198,12 +201,15 @@ pub fn handle_trap_entry(
             trapframe.set_saved_pc(syscall_resume_pc);
             if let Some(orig_tid) = entering_tid {
                 crate::yarm_log!(
-                    "AARCH64_CONTEXT_SAVE_FULL tid={} elr=0x{:016x} sp=0x{:016x} x29=0x{:016x} x30=0x{:016x}",
+                    "AARCH64_CONTEXT_SAVE_FULL tid={} elr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x29=0x{:016x} x30=0x{:016x} ctx_ptr=0x{:x}",
                     orig_tid,
                     trapframe.saved_pc() as u64,
                     trapframe.saved_sp() as u64,
+                    trapframe.user_gpr(0) as u64,
+                    trapframe.user_gpr(1) as u64,
                     trapframe.user_gpr(29) as u64,
-                    trapframe.user_gpr(30) as u64
+                    trapframe.user_gpr(30) as u64,
+                    trapframe as *const _ as usize
                 );
                 let ctx = trapframe.capture_user_context();
                 let _ = kernel.set_thread_user_context(orig_tid, ctx);

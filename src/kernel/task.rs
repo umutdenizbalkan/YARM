@@ -56,6 +56,7 @@ pub enum ThreadDetachState {
 pub struct UserRegisterContext {
     pub instruction_ptr: VirtAddr,
     pub stack_ptr: VirtAddr,
+    pub user_gprs: [usize; 32],
     pub arg0: usize,
     pub arg1: usize,
     pub arg2: usize,
@@ -69,6 +70,7 @@ impl Default for UserRegisterContext {
         Self {
             instruction_ptr: VirtAddr(0),
             stack_ptr: VirtAddr(0),
+            user_gprs: [0; 32],
             arg0: 0,
             arg1: 0,
             arg2: 0,
