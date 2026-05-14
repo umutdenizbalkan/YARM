@@ -3,14 +3,60 @@
 
 use super::{
     IpcFastpathResult, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
-    NotificationObject, ReplyCapRecord, SenderWaiter, map_ipc_error,
+    NotificationObject, ReplyCapRecord, SenderWaiter, kernel_ref, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
 use crate::kernel::task::{TaskStatus, WaitReason};
-use yarm_ipc_abi::process_abi::{ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART};
+use yarm_ipc_abi::process_abi::{
+    ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART,
+};
 
 impl KernelState {
+    fn wake_tid_to_runnable(&mut self, tid: ThreadId) -> Result<(), KernelError> {
+        let old_status = self.task_status(tid.0).ok_or(KernelError::TaskMissing)?;
+        crate::yarm_log!("SCHED_WAKE_BEGIN tid={} old_status={:?}", tid.0, old_status);
+        if !matches!(
+            old_status,
+            TaskStatus::Blocked(_) | TaskStatus::Runnable | TaskStatus::Running
+        ) {
+            crate::yarm_log!(
+                "SCHED_WAKE_FAIL tid={} reason=unexpected_status:{:?}",
+                tid.0,
+                old_status
+            );
+            return Err(KernelError::WouldBlock);
+        }
+        if !matches!(old_status, TaskStatus::Runnable) {
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid.0)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Runnable;
+                Ok::<_, KernelError>(())
+            })?;
+        }
+        crate::yarm_log!("SCHED_WAKE_SET_RUNNABLE tid={} new_status=Runnable", tid.0);
+        self.clear_ipc_timeout_for_tid(tid.0)?;
+        if self.current_tid() == Some(tid.0) && matches!(old_status, TaskStatus::Running) {
+            crate::yarm_log!("SCHED_WAKE_ALREADY_RUNNABLE tid={}", tid.0);
+        } else {
+            let (cpu, reason) = self.enqueue_woken_task(tid.0)?;
+            let queue_len = self
+                .with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu));
+            crate::yarm_log!(
+                "SCHED_WAKE_ENQUEUE tid={} cpu={} queue_len={} reason={}",
+                tid.0,
+                cpu.0,
+                queue_len,
+                reason
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
@@ -113,6 +159,7 @@ impl KernelState {
         deadline: Option<u64>,
     ) -> Result<ThreadId, KernelError> {
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
+        crate::yarm_log!("SCHED_BLOCK tid={}", blocked_tid);
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
@@ -125,6 +172,11 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         self.ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
+        crate::yarm_log!(
+            "IPC_RECV_BLOCK_REGISTER endpoint={} tid={}",
+            endpoint_idx,
+            blocked_tid
+        );
         let _ = self.dispatch_next_task()?;
         Ok(ThreadId(blocked_tid))
     }
@@ -137,6 +189,7 @@ impl KernelState {
         deadline: Option<u64>,
     ) -> Result<ThreadId, KernelError> {
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
+        crate::yarm_log!("SCHED_BLOCK tid={}", blocked_tid);
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
@@ -164,33 +217,15 @@ impl KernelState {
         endpoint_idx: usize,
     ) -> Result<(), KernelError> {
         if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx].take() {
-            self.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
-                    .ok_or(KernelError::TaskMissing)?;
-                tcb.status = TaskStatus::Runnable;
-                Ok::<_, KernelError>(())
-            })?;
-            self.clear_ipc_timeout_for_tid(waiter_tid.0)?;
-            self.enqueue_task(waiter_tid.0)?;
+            crate::yarm_log!("SCHED_WAKE tid={}", waiter_tid.0);
+            self.wake_tid_to_runnable(waiter_tid)?;
         }
         Ok(())
     }
 
     fn wake_sender_waiter(&mut self, sender_tid: ThreadId) -> Result<(), KernelError> {
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == sender_tid.0)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Runnable;
-            Ok::<_, KernelError>(())
-        })?;
-        self.clear_ipc_timeout_for_tid(sender_tid.0)?;
-        self.enqueue_task(sender_tid.0).map(|_| ())
+        crate::yarm_log!("SCHED_WAKE tid={}", sender_tid.0);
+        self.wake_tid_to_runnable(sender_tid)
     }
 
     pub(crate) fn process_ipc_timeout_deadlines(
@@ -344,6 +379,8 @@ impl KernelState {
     }
 
     pub fn ipc_reply(&mut self, reply_cap: CapId, msg: Message) -> Result<(), KernelError> {
+        let current_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+        crate::yarm_log!("IPC_REPLY_ENTER tid={}", current_tid);
         let capability = self.resolve_send_cap_task_local(reply_cap)?;
         if !capability.has_right(CapRights::SEND) {
             return Err(KernelError::MissingRight);
@@ -373,6 +410,9 @@ impl KernelState {
         endpoint
             .send(msg)
             .map_err(|_| KernelError::EndpointQueueFull)?;
+        if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+            crate::yarm_log!("IPC_REPLY_WAKE_CALLER tid={}", waiter_tid.0);
+        }
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
     }
@@ -623,6 +663,11 @@ impl KernelState {
 
         if endpoint_mode == EndpointMode::Synchronous {
             if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+                crate::yarm_log!(
+                    "IPC_SEND_SYNC_WAITER endpoint={} waiter_tid={}",
+                    endpoint_idx,
+                    waiter_tid.0
+                );
                 self.ipc.telemetry.fastpath_attempts =
                     self.ipc.telemetry.fastpath_attempts.saturating_add(1);
                 let endpoint = self
@@ -634,10 +679,19 @@ impl KernelState {
                 endpoint
                     .send(msg)
                     .map_err(|_| KernelError::EndpointQueueFull)?;
+                crate::yarm_log!(
+                    "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
+                    waiter_tid.0,
+                    endpoint_idx,
+                    msg.len,
+                    msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
+                );
                 self.ipc.telemetry.rendezvous_handoffs =
                     self.ipc.telemetry.rendezvous_handoffs.saturating_add(1);
                 self.wake_waiter_for_endpoint(endpoint_idx)?;
-                if self.switch_to_runnable_tid(waiter_tid)? {
+                crate::yarm_log!("IPC_SEND_SYNC_WAKE_DONE waiter_tid={}", waiter_tid.0);
+                let switched = self.switch_to_runnable_tid(waiter_tid)?;
+                if switched {
                     self.ipc.telemetry.fastpath_switches =
                         self.ipc.telemetry.fastpath_switches.saturating_add(1);
                     self.ipc.telemetry.scheduler_fastpath_handoffs = self
@@ -646,9 +700,11 @@ impl KernelState {
                         .scheduler_fastpath_handoffs
                         .saturating_add(1);
                 }
+                crate::yarm_log!("IPC_SEND_SYNC_SWITCH_DONE waiter_tid={}", waiter_tid.0);
                 return Ok(());
             }
 
+            crate::yarm_log!("IPC_SEND_SYNC_NO_WAITER endpoint={}", endpoint_idx);
             let _ =
                 self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
             self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
@@ -662,6 +718,7 @@ impl KernelState {
             .and_then(Option::as_mut)
             .ok_or(KernelError::WrongObject)?;
         if endpoint.send(msg).is_err() {
+            crate::yarm_log!("IPC_SEND_SYNC_NO_WAITER endpoint={}", endpoint_idx);
             let _ =
                 self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
             self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
@@ -669,6 +726,15 @@ impl KernelState {
         }
 
         self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
+        if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+            crate::yarm_log!(
+                "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
+                waiter_tid.0,
+                endpoint_idx,
+                msg.len,
+                msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
+            );
+        }
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
     }
@@ -677,7 +743,8 @@ impl KernelState {
         if msg.opcode != PROC_OP_EXECUTE_RESTART {
             return Err(KernelError::WrongObject);
         }
-        let args = ExecuteRestartRequest::decode(msg.as_slice()).map_err(|_| KernelError::UserMemoryFault)?;
+        let args = ExecuteRestartRequest::decode(msg.as_slice())
+            .map_err(|_| KernelError::UserMemoryFault)?;
         let status = match self.restart_task(args.tid, args.restart_token) {
             Ok(()) => ExecuteRestartReply::STATUS_OK,
             Err(KernelError::TaskMissing) => ExecuteRestartReply::STATUS_NOT_FOUND,
@@ -686,8 +753,14 @@ impl KernelState {
             Err(_) => ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED,
         };
         let reply_cap = msg.transferred_cap().ok_or(KernelError::MissingRight)?;
-        let reply = Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &ExecuteRestartReply::new(status).encode())
-            .map_err(|_| KernelError::UserMemoryFault)?;
+        let reply = Message::with_header(
+            0,
+            PROC_OP_EXECUTE_RESTART,
+            0,
+            None,
+            &ExecuteRestartReply::new(status).encode(),
+        )
+        .map_err(|_| KernelError::UserMemoryFault)?;
         self.ipc_reply(CapId(reply_cap.0), reply)
     }
 
@@ -918,7 +991,36 @@ impl KernelState {
             return Ok(Some(waiter.msg));
         }
 
-        let _ = self.block_current_on_receive_with_deadline(endpoint_idx, recv_cap, deadline)?;
+        let blocked_tid =
+            self.block_current_on_receive_with_deadline(endpoint_idx, recv_cap, deadline)?;
+        let timed_out = self.consume_ipc_timeout_fired_for_tid(blocked_tid.0)?;
+        if timed_out {
+            return Ok(None);
+        }
+        let after_wake = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?
+            .recv();
+        if let Some(msg) = after_wake {
+            if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
+                self.ipc
+                    .endpoints
+                    .get_mut(endpoint_idx)
+                    .and_then(Option::as_mut)
+                    .ok_or(KernelError::WrongObject)?
+                    .send(waiter.msg)
+                    .map_err(|_| KernelError::EndpointQueueFull)?;
+                self.wake_sender_waiter(waiter.tid)?;
+            }
+            return Ok(Some(msg));
+        }
+        if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
+            self.wake_sender_waiter(waiter.tid)?;
+            return Ok(Some(waiter.msg));
+        }
         Ok(None)
     }
 }

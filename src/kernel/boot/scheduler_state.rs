@@ -198,6 +198,19 @@ impl KernelState {
         }
     }
 
+    pub(crate) fn enqueue_woken_task(
+        &mut self,
+        tid: u64,
+    ) -> Result<(CpuId, &'static str), KernelError> {
+        if let Some(cpu) = self.task_cpu_affinity(tid)? {
+            self.enqueue_on_cpu(cpu, tid)?;
+            return Ok((cpu, "pinned"));
+        }
+        let cpu = self.current_cpu();
+        self.enqueue_on_cpu(cpu, tid)?;
+        Ok((cpu, "current_cpu"))
+    }
+
     pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
         let priority = self.task_priority(tid)?;
         let current_cpu = self.current_cpu();

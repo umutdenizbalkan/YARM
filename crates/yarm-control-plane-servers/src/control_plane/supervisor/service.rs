@@ -1,28 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-#[cfg(test)]
-use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
-#[cfg(not(test))]
-use yarm_user_rt::runtime::{KernelIpcError as KernelError, StartupContext, startup_context};
-#[cfg(not(test))]
-use yarm_user_rt::syscall::{IpcTransport, SyscallIpcTransport};
-use yarm_user_rt::capability::CapId;
-#[cfg(test)]
-use yarm_user_rt::capability::CapRights;
-use yarm_user_rt::ipc::Message;
-#[cfg(test)]
-use yarm_user_rt::ipc::ThreadId;
-#[cfg(test)]
-use yarm_user_rt::task::{TaskClass, TaskStatus};
-use yarm_user_rt::time::{TickDuration, TickInstant};
 use crate::control_plane::init::{
     CoreServiceKind, CoreServicePolicyTable, InitFaultHandoff, RestartOwner, ServiceRestartPolicy,
 };
-use yarm_ipc_abi::supervisor_abi::{
-    DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert, InitAlertKind, SupervisorStatusReply,
-    TaskExitedEvent, SUPERVISOR_OP_TASK_EXITED,
-};
+#[cfg(test)]
+use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 #[cfg(not(test))]
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART,
@@ -36,6 +19,23 @@ use yarm_ipc_abi::supervisor_abi::{
     SUPERVISOR_OP_REGISTER_CORE_SERVICE, SUPERVISOR_OP_REGISTER_DRIVER,
     SUPERVISOR_OP_TRANSFER_REVOKED, SupervisorStatusRequest, TransferRevokedEvent,
 };
+use yarm_ipc_abi::supervisor_abi::{
+    DEP_PROCESS_MANAGER, DEP_SUPERVISOR, DEP_VFS, InitAlert, InitAlertKind,
+    SUPERVISOR_OP_TASK_EXITED, SupervisorStatusReply, TaskExitedEvent,
+};
+use yarm_user_rt::capability::CapId;
+#[cfg(test)]
+use yarm_user_rt::capability::CapRights;
+use yarm_user_rt::ipc::Message;
+#[cfg(test)]
+use yarm_user_rt::ipc::ThreadId;
+#[cfg(not(test))]
+use yarm_user_rt::runtime::{KernelIpcError as KernelError, StartupContext, startup_context};
+#[cfg(not(test))]
+use yarm_user_rt::syscall::{IpcTransport, SyscallIpcTransport};
+#[cfg(test)]
+use yarm_user_rt::task::{TaskClass, TaskStatus};
+use yarm_user_rt::time::{TickDuration, TickInstant};
 
 const SUPERVISOR_FAULT_REPORT_WIRE_LEN: usize = 17;
 const SUPERVISOR_FAULT_REPORT_TID_START: usize = 0;
@@ -65,7 +65,9 @@ impl SupervisorFaultReportWire {
         }
         let mut tid = [0u8; 8];
         let mut fault_addr = [0u8; 8];
-        tid.copy_from_slice(&bytes[SUPERVISOR_FAULT_REPORT_TID_START..SUPERVISOR_FAULT_REPORT_TID_END]);
+        tid.copy_from_slice(
+            &bytes[SUPERVISOR_FAULT_REPORT_TID_START..SUPERVISOR_FAULT_REPORT_TID_END],
+        );
         fault_addr.copy_from_slice(
             &bytes[SUPERVISOR_FAULT_REPORT_ADDR_START..SUPERVISOR_FAULT_REPORT_ADDR_END],
         );
@@ -411,7 +413,11 @@ impl SupervisorService {
         runtime_handoff: SupervisorRuntimeHandoff,
     ) -> Result<Self, KernelError> {
         let (init_tid, handoff) = runtime_handoff.into_fault_handoff()?;
-        Ok(Self::new(init_tid, handoff, CoreServicePolicyTable::baseline()))
+        Ok(Self::new(
+            init_tid,
+            handoff,
+            CoreServicePolicyTable::baseline(),
+        ))
     }
 
     pub const fn degraded(&self) -> bool {
@@ -737,10 +743,11 @@ impl SupervisorService {
 
     #[cfg(test)]
     fn has_due_restart_ready(&self) -> bool {
-        self.managed
-            .iter()
-            .flatten()
-            .any(|record| record.pending_restart_due.is_some_and(|due| due.0 <= self.current_tick.0))
+        self.managed.iter().flatten().any(|record| {
+            record
+                .pending_restart_due
+                .is_some_and(|due| due.0 <= self.current_tick.0)
+        })
     }
 
     #[cfg(test)]
@@ -764,7 +771,10 @@ impl SupervisorService {
         {
             if self
                 .test_disable_budgeted_receive_for_tracked_tid
-                .is_some_and(|tid| self.find_record(tid).is_some_and(|record| record.pending_restart_due.is_some()))
+                .is_some_and(|tid| {
+                    self.find_record(tid)
+                        .is_some_and(|record| record.pending_restart_due.is_some())
+                })
             {
                 return Ok(None);
             }
@@ -839,7 +849,6 @@ impl SupervisorService {
     fn test_set_disable_budgeted_receive_for_tracked_tid(&mut self, tid: Option<u64>) {
         self.test_disable_budgeted_receive_for_tracked_tid = tid;
     }
-
 
     #[cfg(test)]
     pub fn run_until_idle(&mut self, kernel: &mut KernelState) -> Result<usize, KernelError> {
@@ -1157,15 +1166,13 @@ pub fn run() {
                     Ok(Some(msg)) => {
                         made_progress = true;
                         yarm_user_rt::user_log!(
-                            "supervisor.srv control msg: opcode={}", msg.opcode
+                            "supervisor.srv control msg: opcode={}",
+                            msg.opcode
                         );
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        yarm_user_rt::user_log!(
-                            "supervisor.srv control recv error: {:?}",
-                            err
-                        );
+                        yarm_user_rt::user_log!("supervisor.srv control recv error: {:?}", err);
                     }
                 }
 
@@ -1173,72 +1180,78 @@ pub fn run() {
                     Ok(Some(msg)) => {
                         made_progress = true;
                         match msg.opcode {
-                            SUPERVISOR_OP_FAULT_REPORT_WIRE => match SupervisorFaultReportWire::decode(msg.as_slice()) {
-                                Some(fault) => {
-                                    match query_restart_token_via_process_manager(
-                                        &mut transport,
-                                        process_manager_caps,
-                                        fault.tid,
-                                    ) {
-                                        Ok(Some(restart_token)) => {
-                                            let event = TaskExitedEvent {
-                                                tid: fault.tid,
-                                                exit_code: fault.synthetic_exit_code(),
-                                                restart_token,
-                                            };
-                                            let mut ops = RuntimeSupervisorTaskExitOps {
-                                                token_tid: fault.tid,
-                                                token: restart_token,
-                                            };
-                                            match supervisor.handle_task_exit(&mut ops, event) {
-                                                Ok(SupervisorDecision::ScheduledRestart { tid, due_tick, .. }) => {
-                                                    match execute_restart_via_process_manager(
-                                                        &mut transport,
-                                                        process_manager_caps,
+                            SUPERVISOR_OP_FAULT_REPORT_WIRE => {
+                                match SupervisorFaultReportWire::decode(msg.as_slice()) {
+                                    Some(fault) => {
+                                        match query_restart_token_via_process_manager(
+                                            &mut transport,
+                                            process_manager_caps,
+                                            fault.tid,
+                                        ) {
+                                            Ok(Some(restart_token)) => {
+                                                let event = TaskExitedEvent {
+                                                    tid: fault.tid,
+                                                    exit_code: fault.synthetic_exit_code(),
+                                                    restart_token,
+                                                };
+                                                let mut ops = RuntimeSupervisorTaskExitOps {
+                                                    token_tid: fault.tid,
+                                                    token: restart_token,
+                                                };
+                                                match supervisor.handle_task_exit(&mut ops, event) {
+                                                    Ok(SupervisorDecision::ScheduledRestart {
                                                         tid,
-                                                        restart_token,
-                                                    ) {
-                                                        Ok(status) => yarm_user_rt::user_log!(
-                                                            "supervisor.srv execute-restart reply: tid={}, due_tick={}, status={}",
+                                                        due_tick,
+                                                        ..
+                                                    }) => {
+                                                        match execute_restart_via_process_manager(
+                                                            &mut transport,
+                                                            process_manager_caps,
                                                             tid,
-                                                            due_tick.0,
-                                                            status
-                                                        ),
-                                                        Err(err) => yarm_user_rt::user_log!(
-                                                            "supervisor.srv execute-restart request failed: tid={}, err={:?}",
-                                                            tid,
-                                                            err
-                                                        ),
+                                                            restart_token,
+                                                        ) {
+                                                            Ok(status) => yarm_user_rt::user_log!(
+                                                                "supervisor.srv execute-restart reply: tid={}, due_tick={}, status={}",
+                                                                tid,
+                                                                due_tick.0,
+                                                                status
+                                                            ),
+                                                            Err(err) => yarm_user_rt::user_log!(
+                                                                "supervisor.srv execute-restart request failed: tid={}, err={:?}",
+                                                                tid,
+                                                                err
+                                                            ),
+                                                        }
                                                     }
+                                                    Ok(_) => {}
+                                                    Err(err) => yarm_user_rt::user_log!(
+                                                        "supervisor.srv failed to apply restart policy decision: tid={}, err={:?}",
+                                                        fault.tid,
+                                                        err
+                                                    ),
                                                 }
-                                                Ok(_) => {}
-                                                Err(err) => yarm_user_rt::user_log!(
-                                                    "supervisor.srv failed to apply restart policy decision: tid={}, err={:?}",
-                                                    fault.tid,
-                                                    err
-                                                ),
                                             }
+                                            Ok(None) => yarm_user_rt::user_log!(
+                                                "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={}; restart-token lookup unsupported/unavailable in runtime path",
+                                                fault.tid,
+                                                fault.fault_addr,
+                                                fault.access
+                                            ),
+                                            Err(err) => yarm_user_rt::user_log!(
+                                                "supervisor.srv restart-token lookup failed: tid={}, err={:?}",
+                                                fault.tid,
+                                                err
+                                            ),
                                         }
-                                        Ok(None) => yarm_user_rt::user_log!(
-                                            "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={}; restart-token lookup unsupported/unavailable in runtime path",
-                                            fault.tid,
-                                            fault.fault_addr,
-                                            fault.access
-                                        ),
-                                        Err(err) => yarm_user_rt::user_log!(
-                                            "supervisor.srv restart-token lookup failed: tid={}, err={:?}",
-                                            fault.tid,
-                                            err
-                                        ),
+                                    }
+                                    None => {
+                                        yarm_user_rt::user_log!(
+                                            "supervisor.srv fault report decode failed: len={}",
+                                            msg.as_slice().len()
+                                        );
                                     }
                                 }
-                                None => {
-                                    yarm_user_rt::user_log!(
-                                        "supervisor.srv fault report decode failed: len={}",
-                                        msg.as_slice().len()
-                                    );
-                                }
-                            },
+                            }
                             SUPERVISOR_OP_TASK_EXITED => {
                                 if let Some(event) = TaskExitedEvent::decode(msg.as_slice()) {
                                     match register_supervised_task_with_process_manager(
@@ -1272,10 +1285,9 @@ pub fn run() {
                     ) {
                         Ok(true) => made_progress = true,
                         Ok(false) => {}
-                        Err(err) => yarm_user_rt::user_log!(
-                            "supervisor.srv idle wait error: {:?}",
-                            err
-                        ),
+                        Err(err) => {
+                            yarm_user_rt::user_log!("supervisor.srv idle wait error: {:?}", err)
+                        }
                     }
                 } else {
                     let _ = supervisor.degraded();
@@ -1288,6 +1300,9 @@ pub fn run() {
                 startup.task_id,
                 err
             );
+            loop {
+                let _ = yarm_user_rt::syscall::yield_now();
+            }
         }
     }
 }
@@ -1317,7 +1332,9 @@ fn query_restart_token_via_process_manager(
     process_manager_caps: Option<(u32, u32)>,
     tid: u64,
 ) -> Result<Option<u64>, KernelError> {
-    let Some((req_cap, rep_cap)) = process_manager_caps else { return Ok(None) };
+    let Some((req_cap, rep_cap)) = process_manager_caps else {
+        return Ok(None);
+    };
     let req = TaskRestartTokenRequest::new(tid);
     let msg = Message::with_header(0, PROC_OP_TASK_RESTART_TOKEN, 0, None, &req.encode())
         .map_err(|_| KernelError::WrongObject)?;
@@ -1379,8 +1396,8 @@ fn execute_restart_via_process_manager(
     else {
         return Ok(ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED);
     };
-    let reply = ExecuteRestartReply::decode(reply_msg.as_slice())
-        .map_err(|_| KernelError::WrongObject)?;
+    let reply =
+        ExecuteRestartReply::decode(reply_msg.as_slice()).map_err(|_| KernelError::WrongObject)?;
     Ok(reply.status)
 }
 
@@ -1413,15 +1430,16 @@ impl SupervisorTaskExitOps for RuntimeSupervisorTaskExitOps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm::std::vec::Vec;
-    use yarm::std::thread;
-    use yarm::kernel::boot::Bootstrap;
-    use yarm_user_rt::vm::PAGE_SIZE;
     use crate::control_plane::init::{CoreServiceGraph, CoreServiceImagePlan, InitService};
+    use yarm::kernel::boot::Bootstrap;
+    use yarm::std::thread;
+    use yarm::std::vec::Vec;
     use yarm_ipc_abi::supervisor_abi::{
-        CoreServiceRegistrationKind, InitAlertKind, RegisterDriverRequest, SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS,
-        SupervisorStatusRequest, TransferRevokedEvent,
+        CoreServiceRegistrationKind, InitAlertKind, RegisterDriverRequest,
+        SUPERVISOR_OP_INIT_ALERT, SUPERVISOR_OP_QUERY_STATUS, SupervisorStatusRequest,
+        TransferRevokedEvent,
     };
+    use yarm_user_rt::vm::PAGE_SIZE;
 
     #[derive(Default)]
     struct MockOutboundOps {
@@ -1486,10 +1504,7 @@ mod tests {
         handle.join().expect("join large-stack test thread");
     }
 
-    fn enter_delegation_owner_context(
-        kernel: &mut KernelState,
-        owner_tid: u64,
-    ) -> (u64, u64) {
+    fn enter_delegation_owner_context(kernel: &mut KernelState, owner_tid: u64) -> (u64, u64) {
         if kernel.task_status(owner_tid).is_none() {
             kernel
                 .register_task_with_class(owner_tid, to_kernel_task_class(TaskClass::SystemServer))
@@ -1549,19 +1564,19 @@ mod tests {
                 }
             };
             total_changed += changed;
-            if supervisor
-                .status_for(tracked_tid)
-                .is_some_and(|status| status.pending_restart_due == 0 && !status.pending_redelegation)
-                && kernel.task_status(tracked_tid).map(map_task_status) == Some(TaskStatus::Runnable)
+            if supervisor.status_for(tracked_tid).is_some_and(|status| {
+                status.pending_restart_due == 0 && !status.pending_redelegation
+            }) && kernel.task_status(tracked_tid).map(map_task_status)
+                == Some(TaskStatus::Runnable)
             {
                 supervisor.test_set_disable_budgeted_receive_for_tracked_tid(None);
                 return total_changed;
             }
             if changed == 0 {
-                if let Some(next_due) = supervisor
-                    .status_for(tracked_tid)
-                    .and_then(|status| (status.pending_restart_due > 0).then_some(TickInstant(status.pending_restart_due)))
-                {
+                if let Some(next_due) = supervisor.status_for(tracked_tid).and_then(|status| {
+                    (status.pending_restart_due > 0)
+                        .then_some(TickInstant(status.pending_restart_due))
+                }) {
                     supervisor.current_tick = next_due;
                     step += 1;
                     continue;
@@ -1590,7 +1605,8 @@ mod tests {
 
     #[test]
     fn control_request_status_query_roundtrip_works_with_mock_outbound_ops() {
-        let handoff = InitFaultHandoff::new(1, CapId(10), CapId(11), CapId(12), CapId(13), CapId(14), 20);
+        let handoff =
+            InitFaultHandoff::new(1, CapId(10), CapId(11), CapId(12), CapId(13), CapId(14), 20);
         let mut supervisor = SupervisorService::new(1, handoff, CoreServicePolicyTable::baseline());
         let mut outbound = MockOutboundOps::default();
 
@@ -1785,7 +1801,9 @@ mod tests {
                 )
                 .expect("send fault wire");
 
-            supervisor.run_until_idle(&mut kernel).expect("process fault wire");
+            supervisor
+                .run_until_idle(&mut kernel)
+                .expect("process fault wire");
             let status = supervisor.status_for(2).expect("status");
             assert_eq!(status.restart_attempts, 1);
             assert_eq!(kernel.task_restart_token(2), Some(token));
@@ -1832,10 +1850,16 @@ mod tests {
             }
             _ => panic!("expected scheduled restart"),
         }
-        assert_eq!(kernel.task_status(2).map(map_task_status), Some(TaskStatus::Exited(9)));
+        assert_eq!(
+            kernel.task_status(2).map(map_task_status),
+            Some(TaskStatus::Exited(9))
+        );
         supervisor.run_until_idle(&mut kernel).expect("idle");
         assert_eq!(supervisor.current_tick(), TickInstant(10));
-        assert_eq!(kernel.task_status(2).map(map_task_status), Some(TaskStatus::Runnable));
+        assert_eq!(
+            kernel.task_status(2).map(map_task_status),
+            Some(TaskStatus::Runnable)
+        );
     }
 
     #[test]
@@ -2010,19 +2034,21 @@ mod tests {
                 kernel.task_status(20).map(map_task_status),
                 Some(TaskStatus::Exited(11))
             );
-            assert_eq!(kernel.task_class(20).map(map_task_class), Some(TaskClass::Driver));
+            assert_eq!(
+                kernel.task_class(20).map(map_task_class),
+                Some(TaskClass::Driver)
+            );
             restore_delegation_owner_context(&mut kernel, owner_tid);
-            let handled =
-                run_until_idle_with_progress_guard(
-                    &mut supervisor,
-                    &mut kernel,
-                    20,
-                    owner_tid,
-                    mem_cap,
-                    iova_cap,
-                    true,
-                    64,
-                );
+            let handled = run_until_idle_with_progress_guard(
+                &mut supervisor,
+                &mut kernel,
+                20,
+                owner_tid,
+                mem_cap,
+                iova_cap,
+                true,
+                64,
+            );
             assert!(handled >= 1);
             assert!(!supervisor.pending_redelegation(20));
             assert_eq!(
@@ -2172,7 +2198,10 @@ mod tests {
             .run_live_for_ticks(&mut kernel, 10)
             .expect("live");
         assert!(handled >= 1);
-        assert_eq!(kernel.task_status(2).map(map_task_status), Some(TaskStatus::Runnable));
+        assert_eq!(
+            kernel.task_status(2).map(map_task_status),
+            Some(TaskStatus::Runnable)
+        );
     }
 
     #[test]

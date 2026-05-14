@@ -37,7 +37,8 @@ pub const SYSCALL_ARG_LEN: usize = 2;
 pub const SYSCALL_ARG_INLINE_PAYLOAD0: usize = 3;
 /// Second inline IPC payload register lane in the stable cross-arch syscall ABI.
 pub const SYSCALL_ARG_INLINE_PAYLOAD1: usize = 4;
-/// Transfer-cap send requires a known waiting receiver; otherwise send returns `WouldBlock`.
+/// Transfer-cap send may bind to a known waiting receiver when available, otherwise
+/// envelope materialization is validated at receive time against endpoint and receiver.
 pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;
 pub const SYSCALL_RET_STATUS: usize = 0;
 pub const SYSCALL_RET_AUX: usize = 1;
@@ -250,9 +251,7 @@ fn validate_endpoint_right(
     let tid = kernel.current_tid().unwrap_or(0);
     let cnode = kernel.current_task_cnode();
     let slot_result = cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, cap));
-    let live_result = slot_result.and_then(|c| {
-        kernel.capability_object_live(c.object).map(|_| c)
-    });
+    let live_result = slot_result.and_then(|c| kernel.capability_object_live(c.object).map(|_| c));
     crate::yarm_log!(
         "CAP_LOOKUP tid={} cap={} cnode={} slot_found={} object_live={} type={:?} rights={:?}",
         tid,
@@ -306,16 +305,14 @@ fn stash_transfer_handle(
     let _ = kernel
         .resolve_capability_for_task(sender_tid, source_cap_id)
         .map_err(SyscallError::from)?;
-    let receiver_tid = kernel
-        .endpoint_waiter_tid(endpoint)
-        .ok_or(SyscallError::WouldBlock)?;
+    let receiver_tid = kernel.endpoint_waiter_tid(endpoint);
     Ok(Some(
         kernel
             .stash_transfer_envelope(
                 crate::kernel::ipc::ThreadId(sender_tid),
                 source_cap_id,
                 endpoint,
-                Some(receiver_tid),
+                receiver_tid,
                 shared_region,
             )
             .ok_or(SyscallError::QueueFull)?,
@@ -628,9 +625,14 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let recv_tid = kernel.current_tid().unwrap_or(0);
-    crate::yarm_log!("IPC_RECV_INVALID_CAP tid={} cap={}", recv_tid, cap.0);
+    crate::yarm_log!("IPC_RECV_ENTER tid={} cap={}", recv_tid, cap.0);
     if let Err(e) = validate_endpoint_right(kernel, cap, CapRights::RECEIVE) {
-        crate::yarm_log!("IPC_RECV_CAP_LOOKUP_FAIL tid={} cap={} reason={:?}", recv_tid, cap.0, e);
+        crate::yarm_log!(
+            "IPC_RECV_CAP_LOOKUP_FAIL tid={} cap={} reason={:?}",
+            recv_tid,
+            cap.0,
+            e
+        );
         return Err(e);
     }
     let endpoint = kernel
@@ -708,16 +710,30 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 
     let reply_recv_cap = CapId(frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64);
     validate_endpoint_right(kernel, reply_recv_cap, CapRights::RECEIVE)?;
-    let responder_tid = kernel
-        .endpoint_waiter_tid(endpoint)
-        .ok_or(SyscallError::WouldBlock)?;
-
     let sender_tid = current_tid(kernel)?;
+    crate::yarm_log!(
+        "IPC_CALL_BEGIN tid={} send_cap={} reply_cap={}",
+        sender_tid,
+        cap.0,
+        reply_recv_cap.0
+    );
+    let responder_tid = kernel.endpoint_waiter_tid(endpoint);
+    let endpoint_idx = kernel
+        .resolve_endpoint_index(endpoint)
+        .map_err(SyscallError::from)?;
+    if let Some(waiter_tid) = responder_tid {
+        crate::yarm_log!(
+            "IPC_CALL_WAKE_RECEIVER endpoint={} tid={}",
+            endpoint_idx,
+            waiter_tid.0
+        );
+    }
+
     let reply_cap = kernel
         .create_reply_cap_for_caller(
             crate::kernel::ipc::ThreadId(sender_tid),
             reply_recv_cap,
-            Some(responder_tid),
+            responder_tid,
         )
         .map_err(SyscallError::from)?;
 
@@ -768,6 +784,11 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         }
         return Err(SyscallError::from(err));
     }
+    crate::yarm_log!(
+        "IPC_CALL_SENT_OR_QUEUED tid={} endpoint={}",
+        sender_tid,
+        endpoint_idx
+    );
     let received = kernel
         .ipc_recv(reply_recv_cap)
         .map_err(SyscallError::from)?;
@@ -780,6 +801,11 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
         encode_transfer_cap_ret(frame, None)?;
     } else {
+        crate::yarm_log!(
+            "IPC_CALL_BLOCK_ON_REPLY tid={} reply_endpoint={} saved_elr=na",
+            sender_tid,
+            reply_recv_cap.0
+        );
         return Err(SyscallError::WouldBlock);
     }
     Ok(())
@@ -946,8 +972,22 @@ fn handle_ipc_recv_result_with_empty_error(
                     return Err(SyscallError::InvalidArgs);
                 }
                 match kernel.copy_to_current_user(user_ptr, msg.as_slice()) {
-                    Ok(()) => frame.set_ok(sender, msg.len as usize, frame.ret2()),
+                    Ok(()) => {
+                        crate::yarm_log!(
+                            "IPC_RECV_COPY_TO_USER tid={} dst=0x{:x} len={} result=ok",
+                            receiver_tid,
+                            user_ptr,
+                            msg.len
+                        );
+                        frame.set_ok(sender, msg.len as usize, frame.ret2());
+                    }
                     Err(KernelError::UserMemoryFault) => {
+                        crate::yarm_log!(
+                            "IPC_RECV_COPY_TO_USER tid={} dst=0x{:x} len={} result=err",
+                            receiver_tid,
+                            user_ptr,
+                            msg.len
+                        );
                         record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
                         return Ok(());
                     }
@@ -955,6 +995,13 @@ fn handle_ipc_recv_result_with_empty_error(
                 };
             } else {
                 frame.set_ok(sender, msg.len as usize, frame.ret2());
+                crate::yarm_log!(
+                    "IPC_RECV_WAKE_RETURN_REGS tid={} x0={} x1={} x2={} elr=na",
+                    receiver_tid,
+                    sender,
+                    msg.len,
+                    frame.ret2()
+                );
                 let words =
                     pack_register_payload(msg.as_slice()).map_err(|_| SyscallError::InvalidArgs)?;
                 frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, words[0]);
@@ -1073,8 +1120,10 @@ fn handle_control_plane_set_cnode_slots(
 
 fn handle_futex_wait(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let addr = frame.arg(SYSCALL_ARG_CAP);
-    let expected = u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
-    let observed = u32::try_from(frame.arg(SYSCALL_ARG_LEN)).map_err(|_| SyscallError::InvalidArgs)?;
+    let expected =
+        u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
+    let observed =
+        u32::try_from(frame.arg(SYSCALL_ARG_LEN)).map_err(|_| SyscallError::InvalidArgs)?;
     let blocked = kernel
         .futex_wait_current(addr, expected, observed)
         .map_err(SyscallError::from)?;
@@ -1084,8 +1133,11 @@ fn handle_futex_wait(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<
 
 fn handle_futex_wake(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let addr = frame.arg(SYSCALL_ARG_CAP);
-    let max_wake = u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
-    let woke = kernel.futex_wake(addr, max_wake).map_err(SyscallError::from)?;
+    let max_wake =
+        u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
+    let woke = kernel
+        .futex_wake(addr, max_wake)
+        .map_err(SyscallError::from)?;
     frame.set_ok(woke as usize, 0, 0);
     Ok(())
 }
@@ -1101,7 +1153,11 @@ fn handle_spawn_thread(
     let tid = kernel
         .spawn_user_thread(parent_tid, tls_base, user_stack_top, user_entry)
         .map_err(SyscallError::from)?;
-    frame.set_ok(usize::try_from(tid).map_err(|_| SyscallError::Internal)?, 0, 0);
+    frame.set_ok(
+        usize::try_from(tid).map_err(|_| SyscallError::Internal)?,
+        0,
+        0,
+    );
     Ok(())
 }
 
@@ -1126,7 +1182,11 @@ fn handle_spawn_process(
     let parent_pid = frame.arg(SYSCALL_ARG_PTR) as u64;
     let _ = (image_id, parent_pid);
     let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
-    frame.set_ok(0, usize::try_from(tid).map_err(|_| SyscallError::Internal)?, 0);
+    frame.set_ok(
+        0,
+        usize::try_from(tid).map_err(|_| SyscallError::Internal)?,
+        0,
+    );
     Ok(())
 }
 
@@ -1158,7 +1218,9 @@ fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<()
     }
 
     validate_user_region(requested as u64, 1)?;
-    let (base, current_end) = _kernel.task_brk_bounds(tid).ok_or(SyscallError::InvalidArgs)?;
+    let (base, current_end) = _kernel
+        .task_brk_bounds(tid)
+        .ok_or(SyscallError::InvalidArgs)?;
     if requested < base {
         return Err(SyscallError::InvalidArgs);
     }
@@ -1215,23 +1277,59 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::SpawnProcess => handle_spawn_process(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
-        let caller_blocked = caller_tid.is_some_and(|tid| {
-            matches!(
-                kernel.task_status(tid),
-                Some(crate::kernel::task::TaskStatus::Blocked(
-                    crate::kernel::task::WaitReason::EndpointSend(_)
-                        | crate::kernel::task::WaitReason::EndpointReceive(_)
-                ))
-            )
-        });
+        let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
+        let caller_blocked = matches!(
+            caller_status,
+            Some(crate::kernel::task::TaskStatus::Blocked(
+                crate::kernel::task::WaitReason::EndpointSend(_)
+                    | crate::kernel::task::WaitReason::EndpointReceive(_)
+            ))
+        );
         let blocking_syscall = match syscall {
             Syscall::IpcRecv | Syscall::IpcCall => true,
             Syscall::IpcSend => decode_ipc_send_timeout_ticks(frame) == 0,
             _ => false,
         };
+        crate::yarm_log!(
+            "BLOCKED_WOULDBLOCK_CLASSIFY tid={} nr={} status={:?} nonfatal={}",
+            caller_tid.unwrap_or(0),
+            frame.syscall_num(),
+            caller_status,
+            blocking_syscall && caller_blocked
+        );
         if blocking_syscall && caller_blocked {
+            if kernel.current_tid() == caller_tid {
+                let _ = kernel.dispatch_next_task().map_err(SyscallError::from)?;
+            }
+            crate::yarm_log!(
+                "AARCH64_BLOCKED_RETURN_DISPATCH trapped_tid={} next_tid={}",
+                caller_tid.unwrap_or(0),
+                kernel.current_tid().unwrap_or(0)
+            );
+            crate::yarm_log!(
+                "AARCH64_SYSCALL_BLOCKED_OK tid={} nr={}",
+                caller_tid.unwrap_or(0),
+                frame.syscall_num()
+            );
+            crate::yarm_log!(
+                "AARCH64_BLOCKED_SYSCALL_STAYS_BLOCKED tid={} nr={}",
+                caller_tid.unwrap_or(0),
+                frame.syscall_num()
+            );
+            crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT blocked");
             return Ok(());
         }
+        crate::yarm_log!(
+            "BLOCKED_WOULDBLOCK_FATAL tid={} nr={} status={:?} reason={}",
+            caller_tid.unwrap_or(0),
+            frame.syscall_num(),
+            caller_status,
+            if !blocking_syscall {
+                "non_blocking_syscall"
+            } else {
+                "caller_not_blocked"
+            }
+        );
     }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if frame.syscall_num() == SYSCALL_YIELD_NR {

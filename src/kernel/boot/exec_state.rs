@@ -383,7 +383,11 @@ impl KernelState {
             .checked_add(page_size - 1)
             .ok_or(KernelError::WrongObject)?
             & !(page_size - 1);
-        Ok((entry as usize, first_pt_load_vaddr as usize, heap_base as usize))
+        Ok((
+            entry as usize,
+            first_pt_load_vaddr as usize,
+            heap_base as usize,
+        ))
     }
 
     fn maybe_switch_kernel_context(
@@ -618,6 +622,7 @@ impl KernelState {
             tcb.user_context = UserRegisterContext {
                 instruction_ptr: VirtAddr(spec.entry as u64),
                 stack_ptr: VirtAddr(startup_stack_ptr as u64),
+                user_gprs: [0; 32],
                 // Startup entry ABI args:
                 //   arg0 => task_id / tid
                 //   arg1 => process-manager request-send cap
@@ -633,6 +638,22 @@ impl KernelState {
                 arg4: startup_slots_len,
                 arg5: 0,
             };
+            crate::yarm_log!(
+                "AARCH64_INITIAL_CONTEXT tid={} elr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x29=0x{:016x} x30=0x{:016x} ctx_ptr=0x{:x}",
+                spec.tid,
+                tcb.user_context.instruction_ptr.0,
+                tcb.user_context.stack_ptr.0,
+                tcb.user_context.arg0 as u64,
+                tcb.user_context.arg1 as u64,
+                tcb.user_context.user_gprs[29] as u64,
+                tcb.user_context.user_gprs[30] as u64,
+                &tcb.user_context as *const _ as usize
+            );
+            if matches!(spec.class, crate::kernel::task::TaskClass::SystemServer)
+                || spec.tid == BOOTSTRAP_FIRST_USER_TID
+            {
+                tcb.cpu_affinity = Some(CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID));
+            }
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
@@ -711,6 +732,7 @@ impl KernelState {
         let outgoing_tid = self.current_tid();
         let next = self.dispatch_next_current_cpu();
         if let Some(tid) = next {
+            crate::yarm_log!("SCHED_DISPATCH_NEXT chosen_tid={}", tid);
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("DISPATCH: selected_tid={}", tid);
             }
@@ -893,8 +915,12 @@ impl KernelState {
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("DISPATCH: task_running tid={}", tid);
             }
-        } else if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
-            crate::yarm_log!("DISPATCH: no_runnable_task");
+        } else {
+            crate::yarm_log!("SCHED_NO_RUNNABLE_USER_TASK");
+            crate::yarm_log!("SCHED_ENTER_IDLE");
+            if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
+                crate::yarm_log!("DISPATCH: no_runnable_task");
+            }
         }
         Ok(next)
     }

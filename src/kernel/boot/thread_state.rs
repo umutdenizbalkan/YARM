@@ -543,8 +543,7 @@ impl KernelState {
         user_stack_top: usize,
         user_entry: usize,
     ) -> Result<u64, KernelError> {
-        if tls_base == 0 || user_stack_top == 0 || user_entry == 0 || (user_stack_top & 0xF) != 0
-        {
+        if tls_base == 0 || user_stack_top == 0 || user_entry == 0 || (user_stack_top & 0xF) != 0 {
             return Err(KernelError::WrongObject);
         }
         let parent = self
@@ -576,6 +575,7 @@ impl KernelState {
             tcb.user_context = UserRegisterContext {
                 instruction_ptr: crate::kernel::vm::VirtAddr(user_entry as u64),
                 stack_ptr: crate::kernel::vm::VirtAddr(user_stack_top as u64),
+                user_gprs: [0; 32],
                 arg0: 0,
                 arg1: 0,
                 arg2: 0,
