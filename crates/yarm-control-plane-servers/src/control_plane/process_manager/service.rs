@@ -1364,8 +1364,9 @@ pub fn run_request_loop_over_runtime_state_with_cnode_resize(
 pub fn run() {
     let ctx = yarm_user_rt::runtime::startup_context();
     let Some(recv_cap) = ctx.pm_request_recv_cap else {
-        yarm_user_rt::user_log!("YARM_PM_NO_RECV_CAP");
-        return;
+        loop {
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
     };
     yarm_user_rt::user_log!("PM_RECV_LOOP_START cap={}", recv_cap);
     use yarm_user_rt::syscall::IpcTransport;
@@ -1407,11 +1408,7 @@ pub fn run() {
             Ok(None) => {
                 yarm_user_rt::user_log!("PM_RECV_CALL_RETURN ok=false x0=0 x1=0 x2=0");
             }
-            Err(_) => {
-                // Keep serving even when recv wrapper reports a transient/fatal decode path;
-                // returning here exits run() and drops into yarm_user_entry's post-run yield loop.
-                continue;
-            }
+            Err(_) => continue,
         }
     }
 }
