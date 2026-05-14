@@ -102,10 +102,10 @@ fn import_syscall_abi_from_user_gprs(frame: &mut TrapFrame) {
 }
 
 fn is_svc_instruction(kernel: &KernelState, tid: u64, pc: usize) -> bool {
-    let Some(asid) = kernel.task_asid(tid) else {
+    if kernel.task_asid(tid).is_none() {
         return false;
-    };
-    let Ok(bytes) = kernel.read_user_memory(asid.0, pc, 4) else {
+    }
+    let Ok(bytes) = kernel.read_user_memory(tid, pc, 4) else {
         return false;
     };
     if bytes.len() != 4 {
