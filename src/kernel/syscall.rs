@@ -711,24 +711,30 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 
     let reply_recv_cap = CapId(frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64);
     validate_endpoint_right(kernel, reply_recv_cap, CapRights::RECEIVE)?;
-    let responder_tid = kernel
-        .endpoint_waiter_tid(endpoint)
-        .ok_or(SyscallError::WouldBlock)?;
+    let sender_tid = current_tid(kernel)?;
+    crate::yarm_log!(
+        "IPC_CALL_BEGIN tid={} send_cap={} reply_cap={}",
+        sender_tid,
+        cap.0,
+        reply_recv_cap.0
+    );
+    let responder_tid = kernel.endpoint_waiter_tid(endpoint);
     let endpoint_idx = kernel
         .resolve_endpoint_index(endpoint)
         .map_err(SyscallError::from)?;
-    crate::yarm_log!(
-        "IPC_CALL_WAKE_RECEIVER endpoint={} tid={}",
-        endpoint_idx,
-        responder_tid.0
-    );
+    if let Some(waiter_tid) = responder_tid {
+        crate::yarm_log!(
+            "IPC_CALL_WAKE_RECEIVER endpoint={} tid={}",
+            endpoint_idx,
+            waiter_tid.0
+        );
+    }
 
-    let sender_tid = current_tid(kernel)?;
     let reply_cap = kernel
         .create_reply_cap_for_caller(
             crate::kernel::ipc::ThreadId(sender_tid),
             reply_recv_cap,
-            Some(responder_tid),
+            responder_tid,
         )
         .map_err(SyscallError::from)?;
 
@@ -779,6 +785,11 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         }
         return Err(SyscallError::from(err));
     }
+    crate::yarm_log!(
+        "IPC_CALL_SENT_OR_QUEUED tid={} endpoint={}",
+        sender_tid,
+        endpoint_idx
+    );
     let received = kernel
         .ipc_recv(reply_recv_cap)
         .map_err(SyscallError::from)?;
@@ -791,6 +802,11 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
         encode_transfer_cap_ret(frame, None)?;
     } else {
+        crate::yarm_log!(
+            "IPC_CALL_BLOCK_ON_REPLY tid={} reply_endpoint={} saved_elr=na",
+            sender_tid,
+            reply_recv_cap.0
+        );
         return Err(SyscallError::WouldBlock);
     }
     Ok(())
@@ -1262,24 +1278,35 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::SpawnProcess => handle_spawn_process(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
-        let caller_blocked = caller_tid.is_some_and(|tid| {
-            matches!(
-                kernel.task_status(tid),
-                Some(crate::kernel::task::TaskStatus::Blocked(
-                    crate::kernel::task::WaitReason::EndpointSend(_)
-                        | crate::kernel::task::WaitReason::EndpointReceive(_)
-                ))
-            )
-        });
+        let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
+        let caller_blocked = matches!(
+            caller_status,
+            Some(crate::kernel::task::TaskStatus::Blocked(
+                crate::kernel::task::WaitReason::EndpointSend(_)
+                    | crate::kernel::task::WaitReason::EndpointReceive(_)
+            ))
+        );
         let blocking_syscall = match syscall {
             Syscall::IpcRecv | Syscall::IpcCall => true,
             Syscall::IpcSend => decode_ipc_send_timeout_ticks(frame) == 0,
             _ => false,
         };
+        crate::yarm_log!(
+            "BLOCKED_WOULDBLOCK_CLASSIFY tid={} nr={} status={:?} nonfatal={}",
+            caller_tid.unwrap_or(0),
+            frame.syscall_num(),
+            caller_status,
+            blocking_syscall && caller_blocked
+        );
         if blocking_syscall && caller_blocked {
             if kernel.current_tid() == caller_tid {
                 let _ = kernel.dispatch_next_task().map_err(SyscallError::from)?;
             }
+            crate::yarm_log!(
+                "AARCH64_BLOCKED_RETURN_DISPATCH trapped_tid={} next_tid={}",
+                caller_tid.unwrap_or(0),
+                kernel.current_tid().unwrap_or(0)
+            );
             crate::yarm_log!(
                 "AARCH64_SYSCALL_BLOCKED_OK tid={} nr={}",
                 caller_tid.unwrap_or(0),
@@ -1293,6 +1320,17 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
             crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT blocked");
             return Ok(());
         }
+        crate::yarm_log!(
+            "BLOCKED_WOULDBLOCK_FATAL tid={} nr={} status={:?} reason={}",
+            caller_tid.unwrap_or(0),
+            frame.syscall_num(),
+            caller_status,
+            if !blocking_syscall {
+                "non_blocking_syscall"
+            } else {
+                "caller_not_blocked"
+            }
+        );
     }
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if frame.syscall_num() == SYSCALL_YIELD_NR {
