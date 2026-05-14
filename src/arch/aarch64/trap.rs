@@ -101,18 +101,17 @@ fn import_syscall_abi_from_user_gprs(frame: &mut TrapFrame) {
     frame.set_arg(5, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X5));
 }
 
-fn is_svc_instruction(kernel: &KernelState, tid: u64, pc: usize) -> bool {
+fn read_user_insn_u32(kernel: &KernelState, tid: u64, pc: usize) -> Option<u32> {
     if kernel.task_asid(tid).is_none() {
-        return false;
+        return None;
     }
     let Ok(bytes) = kernel.read_user_memory(tid, pc, 4) else {
-        return false;
+        return None;
     };
     if bytes.len() != 4 {
-        return false;
+        return None;
     }
-    let insn = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    (insn & AARCH64_SVC_MASK) == AARCH64_SVC_PATTERN
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn export_syscall_result_to_user_gprs(frame: &mut TrapFrame) {
@@ -208,12 +207,29 @@ pub fn handle_trap_entry(
     let task_switched = matches!(event, TrapEvent::Syscall) && entering_tid != exiting_tid;
     let syscall_resume_pc = if matches!(event, TrapEvent::Syscall) {
         let tid = entering_tid.unwrap_or(0);
-        let is_svc = entering_tid
-            .map(|id| is_svc_instruction(kernel, id, raw_vector_return_pc))
-            .unwrap_or(false);
+        let (insn, is_svc, reason) = if let Some(id) = entering_tid {
+            let at_pc = read_user_insn_u32(kernel, id, raw_vector_return_pc);
+            let at_prev = raw_vector_return_pc
+                .checked_sub(4)
+                .and_then(|pc| read_user_insn_u32(kernel, id, pc));
+            let svc_at_pc =
+                at_pc.is_some_and(|insn| (insn & AARCH64_SVC_MASK) == AARCH64_SVC_PATTERN);
+            let svc_at_prev =
+                at_prev.is_some_and(|insn| (insn & AARCH64_SVC_MASK) == AARCH64_SVC_PATTERN);
+            if svc_at_pc {
+                (at_pc.unwrap_or(0), true, "svc_pc")
+            } else if svc_at_prev {
+                (at_pc.unwrap_or(0), false, "post_svc_elr")
+            } else {
+                (at_pc.unwrap_or(0), false, "post_svc_elr")
+            }
+        } else {
+            (0, false, "post_svc_elr")
+        };
         crate::yarm_log!(
-            "AARCH64_SVC_DECODE pc=0x{:016x} is_svc={}",
+            "AARCH64_SVC_DECODE pc=0x{:016x} insn=0x{:08x} is_svc={} source=user_copy",
             raw_vector_return_pc as u64,
+            insn,
             is_svc
         );
         let final_pc = if is_svc {
@@ -227,7 +243,7 @@ pub fn handle_trap_entry(
             frame.as_ref().map(|f| f.syscall_num()).unwrap_or(0),
             raw_vector_return_pc as u64,
             final_pc as u64,
-            if is_svc { "svc_pc" } else { "post_svc_elr" }
+            reason
         );
         final_pc
     } else {
@@ -277,6 +293,10 @@ pub fn handle_trap_entry(
     }
 
     if task_switched {
+        if exiting_tid == Some(0) {
+            crate::yarm_log!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
+            return Ok(());
+        }
         // Returning to a different thread: registers are sourced from saved user context.
         if let Some(trapframe) = frame.as_deref_mut() {
             crate::yarm_log!(
@@ -292,6 +312,10 @@ pub fn handle_trap_entry(
     } else if matches!(event, TrapEvent::Syscall) {
         // Same task continues: set the return ELR to the instruction after the SVC.
         if let Some(trapframe) = frame.as_deref_mut() {
+            if kernel.current_tid() == Some(0) {
+                crate::yarm_log!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
+                return Ok(());
+            }
             if trapframe.syscall_num() == crate::kernel::syscall::Syscall::IpcRecv as usize
                 && let Some(tid) = kernel.current_tid()
             {
