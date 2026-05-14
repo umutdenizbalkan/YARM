@@ -52,10 +52,12 @@ fn restore_arch_thread_state(
     let Some(current_tid) = kernel.current_tid() else {
         crate::yarm_log!("SCHED_NO_RUNNABLE_USER_TASK");
         crate::yarm_log!("SCHED_ENTER_IDLE");
+        crate::yarm_log!("AARCH64_NO_USER_TASK_IDLE no_return_to_user=true");
         return Ok(());
     };
     if current_tid == 0 || kernel.task_asid(current_tid).is_none() {
         crate::yarm_log!("SCHED_ENTER_IDLE");
+        crate::yarm_log!("AARCH64_NO_USER_TASK_IDLE no_return_to_user=true");
         return Ok(());
     }
     let tls = kernel
@@ -190,7 +192,10 @@ pub fn handle_trap_entry(
     let exiting_tid = kernel.current_tid();
     // A context switch occurred if the current task changed during the syscall handler.
     let task_switched = matches!(event, TrapEvent::Syscall) && entering_tid != exiting_tid;
-    let syscall_resume_pc = raw_vector_return_pc.wrapping_add(4);
+    // AARCH64_SYSCALL_RETURN_PC_POLICY:
+    // On AArch64, ELR_EL1 is already post-SVC (points to instruction after SVC).
+    // Do NOT add +4. Use raw_vector_return_pc directly as the resume PC.
+    let syscall_resume_pc = raw_vector_return_pc;
 
     if task_switched {
         // Save the original task's post-syscall resume PC to its TCB.
@@ -214,7 +219,7 @@ pub fn handle_trap_entry(
                 let ctx = trapframe.capture_user_context();
                 let _ = kernel.set_thread_user_context(orig_tid, ctx);
                 crate::yarm_log!(
-                    "AARCH64_SYSCALL_BLOCK_SAVE tid={} raw_elr=0x{:016x} resume_elr=0x{:016x}",
+                    "AARCH64_SYSCALL_BLOCK_SAVE tid={} raw_elr=0x{:016x} saved_elr=0x{:016x} policy=elr_already_post_svc",
                     orig_tid,
                     raw_vector_return_pc as u64,
                     syscall_resume_pc as u64
@@ -243,6 +248,13 @@ pub fn handle_trap_entry(
                 exiting_tid.unwrap_or(0)
             );
             crate::yarm_log!(
+                "IPC_RECV_RETABI_WRITE_TARGET tid={} target=saved_context x0=0x{:016x} x1=0x{:016x} x2=0x{:016x}",
+                exiting_tid.unwrap_or(0),
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0) as u64,
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1) as u64,
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2) as u64,
+            );
+            crate::yarm_log!(
                 "AARCH64_RETURNING_SAVED_CONTEXT tid={} elr=0x{:016x}",
                 exiting_tid.unwrap_or(0),
                 trapframe.saved_pc() as u64
@@ -269,7 +281,32 @@ pub fn handle_trap_entry(
                 kernel.current_tid().unwrap_or(0)
             );
             trapframe.set_saved_pc(syscall_resume_pc);
+            
+            // CRITICAL FIX: For same-task syscall return, we must RE-EXPORT user_gprs
+            // AFTER the syscall handler has finalized all return registers.
+            // This ensures IPC_RECV return values (ret0/ret1/ret2) are actually visible
+            // to the ERET instruction, not stale values from entry.
+            export_syscall_result_to_user_gprs(trapframe);
+            
+            crate::yarm_log!(
+                "IPC_RECV_RETABI_WRITE_TARGET tid={} target=trapframe x0=0x{:016x} x1=0x{:016x} x2=0x{:016x}",
+                kernel.current_tid().unwrap_or(0),
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0) as u64,
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1) as u64,
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2) as u64,
+            );
         }
+    }
+
+    if let Some(trapframe) = frame.as_deref() {
+        crate::yarm_log!(
+            "AARCH64_FINAL_RETURN_REGS tid={} elr=0x{:016x} x0=0x{:016x} x1=0x{:016x} x2=0x{:016x}",
+            kernel.current_tid().unwrap_or(0),
+            trapframe.saved_pc() as u64,
+            trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0) as u64,
+            trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1) as u64,
+            trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2) as u64,
+        );
     }
 
     Ok(())
