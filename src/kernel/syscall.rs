@@ -37,7 +37,8 @@ pub const SYSCALL_ARG_LEN: usize = 2;
 pub const SYSCALL_ARG_INLINE_PAYLOAD0: usize = 3;
 /// Second inline IPC payload register lane in the stable cross-arch syscall ABI.
 pub const SYSCALL_ARG_INLINE_PAYLOAD1: usize = 4;
-/// Transfer-cap send requires a known waiting receiver; otherwise send returns `WouldBlock`.
+/// Transfer-cap send may bind to a known waiting receiver when available, otherwise
+/// envelope materialization is validated at receive time against endpoint and receiver.
 pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;
 pub const SYSCALL_RET_STATUS: usize = 0;
 pub const SYSCALL_RET_AUX: usize = 1;
@@ -304,16 +305,14 @@ fn stash_transfer_handle(
     let _ = kernel
         .resolve_capability_for_task(sender_tid, source_cap_id)
         .map_err(SyscallError::from)?;
-    let receiver_tid = kernel
-        .endpoint_waiter_tid(endpoint)
-        .ok_or(SyscallError::WouldBlock)?;
+    let receiver_tid = kernel.endpoint_waiter_tid(endpoint);
     Ok(Some(
         kernel
             .stash_transfer_envelope(
                 crate::kernel::ipc::ThreadId(sender_tid),
                 source_cap_id,
                 endpoint,
-                Some(receiver_tid),
+                receiver_tid,
                 shared_region,
             )
             .ok_or(SyscallError::QueueFull)?,
