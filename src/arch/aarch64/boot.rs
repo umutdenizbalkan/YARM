@@ -454,7 +454,7 @@ extern "C" fn yarm_aarch64_user_entry_marker_before_eret() {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_write_elr_marker(elr: u64) {
-    crate::yarm_log!("YARM_AARCH64_WRITE_ELR value=0x{:016x}", elr);
+    crate::yarm_log!("AARCH64_MSR_ELR_ACTUAL value=0x{:016x}", elr);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]

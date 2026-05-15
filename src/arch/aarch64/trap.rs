@@ -226,6 +226,12 @@ pub fn handle_trap_entry(
         raw_vector_return_pc
     };
 
+    if !task_switched && matches!(event, TrapEvent::Syscall) {
+        if let Some(trapframe) = frame.as_deref_mut() {
+            trapframe.set_saved_pc(syscall_resume_pc);
+        }
+    }
+
     if matches!(exiting_tid, None | Some(0)) {
         crate::yarm_log!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
         idle_no_eret_loop();
@@ -310,7 +316,6 @@ pub fn handle_trap_entry(
                 "AARCH64_RETURN_CONTEXT_SOURCE tid={} source=trapframe",
                 kernel.current_tid().unwrap_or(0)
             );
-            trapframe.set_saved_pc(syscall_resume_pc);
         }
     }
 
