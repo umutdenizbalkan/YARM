@@ -165,7 +165,7 @@ pub mod syscall {
         ];
         // SAFETY: Uses architecture syscall ABI to enter kernel.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_NR, args) };
-        crate::user_log!("USER_RT_RECV_RAW x0={} x1={} x2={} x3={}", ret.ret0, ret.ret1, ret.ret2, ret.ret3);
+        crate::user_log!("USER_RT_RECV_RAW x0={} x1={} x2={} x3={}", ret.ret0, ret.ret1, ret.ret2, args[3]);
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
             let err = decode_syscall_error(ret.error);
@@ -217,7 +217,7 @@ pub mod syscall {
             SYSCALL_NO_TRANSFER_CAP as usize,
         ];
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_TIMEOUT_NR, args) };
-        crate::user_log!("USER_RT_RECV_RAW x0={} x1={} x2={} x3={}", ret.ret0, ret.ret1, ret.ret2, ret.ret3);
+        crate::user_log!("USER_RT_RECV_RAW x0={} x1={} x2={} x3={}", ret.ret0, ret.ret1, ret.ret2, args[3]);
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
             let err = decode_syscall_error(ret.error);
