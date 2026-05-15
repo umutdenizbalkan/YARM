@@ -188,21 +188,33 @@ pub fn handle_trap_entry(
     }
 
     let exiting_tid = kernel.current_tid();
-    let hardware_elr = frame
-        .as_ref()
-        .map(|f| f.saved_pc())
-        .unwrap_or(raw_vector_return_pc);
     // A context switch occurred if the current task changed during the syscall handler.
     let task_switched = matches!(event, TrapEvent::Syscall) && entering_tid != exiting_tid;
     let syscall_resume_pc = if matches!(event, TrapEvent::Syscall) {
         let tid = entering_tid.unwrap_or(0);
-        let final_pc = hardware_elr;
+        let syscall_nr = frame.as_ref().map(|f| f.syscall_num()).unwrap_or(0);
+        let same_task = entering_tid == exiting_tid;
+        let recv_success_same_task = frame.as_ref().is_some_and(|f| {
+            same_task
+                && syscall_nr == crate::kernel::syscall::Syscall::IpcRecv as usize
+                && !f.is_error()
+        });
+        let final_pc = if recv_success_same_task {
+            raw_vector_return_pc.wrapping_add(4)
+        } else {
+            raw_vector_return_pc
+        };
         crate::yarm_log!(
-            "AARCH64_ELR_POLICY tid={} nr={} raw=0x{:016x} final=0x{:016x} reason=hardware_elr",
+            "AARCH64_ELR_POLICY tid={} nr={} raw=0x{:016x} final=0x{:016x} reason={}",
             tid,
-            frame.as_ref().map(|f| f.syscall_num()).unwrap_or(0),
+            syscall_nr,
             raw_vector_return_pc as u64,
-            final_pc as u64
+            final_pc as u64,
+            if recv_success_same_task {
+                "ipc_recv_same_task_success_plus4"
+            } else {
+                "raw_vector_return_pc"
+            }
         );
         final_pc
     } else {
