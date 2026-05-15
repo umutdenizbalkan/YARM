@@ -52,6 +52,15 @@ pub mod syscall {
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
 
+    #[used]
+    #[unsafe(link_section = ".rodata")]
+    static USER_RT_RECV_BEFORE_SYSCALL_MARKER: [u8; 28] = *b"USER_RT_RECV_BEFORE_SYSCALL\0";
+
+    #[used]
+    #[unsafe(link_section = ".rodata")]
+    static USER_RT_RECV_AFTER_SYSCALL_MARKER: [u8; 27] = *b"USER_RT_RECV_AFTER_SYSCALL\0";
+
+
     pub trait IpcTransport {
         fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError>;
         fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError>;
