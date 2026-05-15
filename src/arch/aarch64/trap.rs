@@ -327,6 +327,9 @@ pub fn handle_trap_entry(
             && !trapframe.is_error()
         {
             trapframe.set_saved_pc(syscall_resume_pc);
+            if let Some(tid) = kernel.current_tid() {
+                let _ = kernel.set_thread_user_context(tid, trapframe.capture_user_context());
+            }
         }
         if kernel.current_tid().unwrap_or(0) != 0 && trapframe.saved_pc() < 0x400000 {
             crate::yarm_log!(
