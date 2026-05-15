@@ -184,7 +184,12 @@ pub mod syscall {
         } else {
             Some(ret.ret2 as u64)
         };
-        let msg = Message::with_header(ret.ret0 as u64, 0, 0, transfer_cap, &payload[..len])
+        let flags = if transfer_cap.is_some() {
+            Message::FLAG_CAP_TRANSFER
+        } else {
+            0
+        };
+        let msg = Message::with_header(ret.ret0 as u64, 0, flags, transfer_cap, &payload[..len])
             .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some(msg))
     }
@@ -231,7 +236,12 @@ pub mod syscall {
         } else {
             Some(ret.ret2 as u64)
         };
-        let msg = Message::with_header(ret.ret0 as u64, 0, 0, transfer_cap, &payload[..len])
+        let flags = if transfer_cap.is_some() {
+            Message::FLAG_CAP_TRANSFER
+        } else {
+            0
+        };
+        let msg = Message::with_header(ret.ret0 as u64, 0, flags, transfer_cap, &payload[..len])
             .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some(msg))
     }
