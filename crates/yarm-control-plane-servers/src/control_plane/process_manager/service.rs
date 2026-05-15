@@ -1376,16 +1376,30 @@ pub fn run() {
         yarm_user_rt::user_log!("PM_RECV_CALL_BEGIN cap={}", recv_cap);
         match transport.recv_v2(recv_cap) {
             Ok(Some((msg, reply_cap))) => {
+                let first_u64 = if msg.len >= 8 {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&msg.payload[..8]);
+                    u64::from_le_bytes(b)
+                } else {
+                    0
+                };
+                let second_u64 = if msg.len >= 16 {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&msg.payload[8..16]);
+                    u64::from_le_bytes(b)
+                } else {
+                    0
+                };
                 yarm_user_rt::user_log!(
-                    "PM_RECV_CALL_RETURN ok=true x0={} x1={} x2={}",
+                    "PM_RECV_RESULT raw_status={} len={} reply_cap={}",
                     msg.sender_tid.0,
                     msg.len,
-                    msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
+                    reply_cap.unwrap_or(u32::MAX)
                 );
                 yarm_user_rt::user_log!(
-                    "PM_RECV_GOT_MESSAGE opcode={} len={}",
-                    msg.opcode,
-                    msg.len
+                    "PM_RECV_BUFFER_HEAD first_u64={} second_u64={}",
+                    first_u64,
+                    second_u64
                 );
                 yarm_user_rt::user_log!("PM_HANDLE_BEGIN opcode={}", msg.opcode);
                 if let Ok(reply) = service.handle(msg) {
