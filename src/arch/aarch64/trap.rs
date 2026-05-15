@@ -314,6 +314,16 @@ pub fn handle_trap_entry(
         }
     }
 
+
+    if let Some(trapframe) = frame.as_deref_mut() {
+        crate::yarm_log!(
+            "AARCH64_ERET_ACTUAL tid={} elr=0x{:016x} x0=0x{:016x}",
+            kernel.current_tid().unwrap_or(0),
+            trapframe.saved_pc() as u64,
+            trapframe.user_gpr(0) as u64
+        );
+    }
+
     Ok(())
 }
 
