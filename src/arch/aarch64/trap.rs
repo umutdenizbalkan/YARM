@@ -193,11 +193,8 @@ pub fn handle_trap_entry(
     let syscall_resume_pc = if matches!(event, TrapEvent::Syscall) {
         let tid = entering_tid.unwrap_or(0);
         let syscall_nr = frame.as_ref().map(|f| f.syscall_num()).unwrap_or(0);
-        let same_task = entering_tid == exiting_tid;
         let recv_success_same_task = frame.as_ref().is_some_and(|f| {
-            same_task
-                && syscall_nr == crate::kernel::syscall::Syscall::IpcRecv as usize
-                && !f.is_error()
+            syscall_nr == crate::kernel::syscall::Syscall::IpcRecv as usize && !f.is_error()
         });
         let final_pc = if recv_success_same_task {
             raw_vector_return_pc.wrapping_add(4)
