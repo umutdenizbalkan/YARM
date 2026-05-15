@@ -17,6 +17,14 @@ const ESR_EC_DABT_CUR: u32 = 0x25;
 const ESR_EC_MASK: u32 = 0x3F;
 const ARCH_TIMER_PPI_IRQ: u16 = 30;
 
+
+#[inline(always)]
+fn idle_no_eret_loop() -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Aarch64TrapContext {
     pub esr_el1: u32,
@@ -220,7 +228,7 @@ pub fn handle_trap_entry(
 
     if matches!(exiting_tid, None | Some(0)) {
         crate::yarm_log!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
-        return Ok(());
+        idle_no_eret_loop();
     }
 
     if task_switched {
@@ -283,7 +291,7 @@ pub fn handle_trap_entry(
         if let Some(trapframe) = frame.as_deref_mut() {
             if kernel.current_tid() == Some(0) {
                 crate::yarm_log!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
-                return Ok(());
+                idle_no_eret_loop();
             }
             if trapframe.syscall_num() == crate::kernel::syscall::Syscall::IpcRecv as usize
                 && let Some(tid) = kernel.current_tid()
