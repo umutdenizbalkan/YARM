@@ -1373,9 +1373,15 @@ pub fn run() {
     let mut transport = yarm_user_rt::syscall::SyscallIpcTransport;
     let mut service = ProcessService::new();
     loop {
-        yarm_user_rt::user_log!("PM_RECV_CALL_BEGIN cap={}", recv_cap);
+        yarm_user_rt::user_log!("PM_BEFORE_RECV cap={}", recv_cap);
         match transport.recv_v2(recv_cap) {
             Ok(Some((msg, reply_cap))) => {
+                yarm_user_rt::user_log!(
+                    "PM_AFTER_RECV_OK sender={} len={} reply_cap={}",
+                    msg.sender_tid.0,
+                    msg.len,
+                    reply_cap.unwrap_or(u32::MAX)
+                );
                 let first_u64 = if msg.len >= 8 {
                     let mut b = [0u8; 8];
                     b.copy_from_slice(&msg.payload[..8]);
@@ -1401,6 +1407,7 @@ pub fn run() {
                     first_u64,
                     second_u64
                 );
+                yarm_user_rt::user_log!("PM_BEFORE_HANDLE opcode={}", msg.opcode);
                 yarm_user_rt::user_log!("PM_HANDLE_BEGIN opcode={}", msg.opcode);
                 if let Ok(reply) = service.handle(msg) {
                     if let Some(cap) = reply_cap {
@@ -1420,9 +1427,13 @@ pub fn run() {
                 }
             }
             Ok(None) => {
+                yarm_user_rt::user_log!("PM_AFTER_RECV_NONE");
                 yarm_user_rt::user_log!("PM_RECV_CALL_RETURN ok=false x0=0 x1=0 x2=0");
             }
-            Err(_) => continue,
+            Err(_) => {
+                yarm_user_rt::user_log!("PM_AFTER_RECV_ERR");
+                continue;
+            }
         }
     }
 }
