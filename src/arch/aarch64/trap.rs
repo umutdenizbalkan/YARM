@@ -235,22 +235,19 @@ pub fn handle_trap_entry(
 
     if !task_switched && matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
-            let reason = if trapframe.syscall_num() == crate::kernel::syscall::Syscall::IpcRecv as usize
+            let saved_pc_final = if trapframe.syscall_num()
+                == crate::kernel::syscall::Syscall::IpcRecv as usize
                 && !trapframe.is_error()
             {
-                "ipc_recv_same_task_success_plus4"
+                raw_vector_return_pc.wrapping_add(4)
             } else {
-                "raw_vector_return_pc"
+                syscall_resume_pc
             };
-            trapframe.set_saved_pc(syscall_resume_pc);
-            crate::yarm_log!(
-                "AARCH64_SET_SAVED_PC value=0x{:016x} reason={}",
-                syscall_resume_pc as u64,
-                reason
-            );
+            trapframe.set_saved_pc(saved_pc_final);
+            crate::yarm_log!("AARCH64_SET_SAVED_PC_FINAL value=0x{:016x}", saved_pc_final as u64);
             if let Some(tid) = kernel.current_tid() {
                 let mut ctx = trapframe.capture_user_context();
-                ctx.instruction_ptr = crate::kernel::vm::VirtAddr(syscall_resume_pc as u64);
+                ctx.instruction_ptr = crate::kernel::vm::VirtAddr(saved_pc_final as u64);
                 let _ = kernel.set_thread_user_context(tid, ctx);
             }
         }
@@ -358,7 +355,15 @@ pub fn handle_trap_entry(
 
     if let Some(trapframe) = frame.as_deref_mut() {
         if !task_switched && matches!(event, TrapEvent::Syscall) {
-            trapframe.set_saved_pc(syscall_resume_pc);
+            let saved_pc_final = if trapframe.syscall_num()
+                == crate::kernel::syscall::Syscall::IpcRecv as usize
+                && !trapframe.is_error()
+            {
+                raw_vector_return_pc.wrapping_add(4)
+            } else {
+                syscall_resume_pc
+            };
+            trapframe.set_saved_pc(saved_pc_final);
         }
 
         let actual_elr = trapframe.saved_pc();
