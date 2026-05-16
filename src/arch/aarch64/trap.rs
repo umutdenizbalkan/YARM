@@ -183,12 +183,6 @@ pub fn handle_trap_entry(
     crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT ok");
 
     if matches!(event, TrapEvent::Syscall) {
-        if let Some(trapframe) = frame.as_deref_mut() {
-            export_syscall_result_to_user_gprs(trapframe);
-        }
-    }
-
-    if matches!(event, TrapEvent::Syscall) {
         crate::yarm_log!(
             "AARCH64_SYSCALL_RAW_RETURN_PC value=0x{:016x}",
             raw_vector_return_pc as u64
@@ -277,6 +271,19 @@ pub fn handle_trap_entry(
         crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT err={:?}", err);
         crate::yarm_log!("AARCH64_TRAP_FAIL_REASON restore_arch_thread_state");
         return Err(err);
+    }
+
+    if !task_switched && matches!(event, TrapEvent::Syscall) {
+        if let Some(trapframe) = frame.as_deref_mut() {
+            export_syscall_result_to_user_gprs(trapframe);
+            crate::yarm_log!(
+                "AARCH64_POST_RESTORE_EXPORT tid={} x0={} x1={} x2={}",
+                kernel.current_tid().unwrap_or(0),
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1),
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2)
+            );
+        }
     }
 
     if task_switched {
@@ -606,4 +613,3 @@ mod tests {
         assert_eq!(last_restored_tls_base(CpuId(0)), Some(0xBBB0_0000));
     }
 }
-
