@@ -286,8 +286,12 @@ pub fn run() {
     if result.is_err() {
         return;
     }
+    let Some(alert_recv) = ctx.init_alert_recv_ep else {
+        return;
+    };
     loop {
-        let _ = yarm_user_rt::syscall::yield_now();
+        // SAFETY: init owns this startup-provided alert receive endpoint.
+        let _ = unsafe { yarm_user_rt::syscall::ipc_recv(alert_recv) };
     }
 }
 
