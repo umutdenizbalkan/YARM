@@ -139,10 +139,6 @@ impl TrapFrame {
     }
 
     pub fn capture_user_context(&self) -> UserRegisterContext {
-        crate::yarm_log!(
-            "AARCH64_CONTEXT_CAPTURE_ELR value=0x{:016x}",
-            self.saved_pc as u64
-        );
         UserRegisterContext {
             instruction_ptr: VirtAddr(self.saved_pc as u64),
             stack_ptr: VirtAddr(self.saved_sp as u64),
@@ -157,10 +153,6 @@ impl TrapFrame {
     }
 
     pub fn apply_user_context(&mut self, context: UserRegisterContext) {
-        crate::yarm_log!(
-            "AARCH64_CONTEXT_APPLY_ELR value=0x{:016x}",
-            context.instruction_ptr.0
-        );
         self.saved_pc = context.instruction_ptr.0 as usize;
         self.saved_sp = context.stack_ptr.0 as usize;
         self.user_gprs = context.user_gprs;

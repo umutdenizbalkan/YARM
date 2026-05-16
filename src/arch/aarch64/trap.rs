@@ -197,16 +197,6 @@ pub fn handle_trap_entry(
         let (syscall_nr, recv_success_same_task) = if let Some(f) = frame.as_ref() {
             let nr = f.syscall_num();
             let recv_ok = nr == crate::kernel::syscall::Syscall::IpcRecv as usize && !f.is_error();
-            if nr == crate::kernel::syscall::Syscall::IpcRecv as usize {
-                crate::yarm_log!(
-                    "AARCH64_RECV_SUCCESS_PRED nr={} is_error={} ret0={} ret1={} ret2={}",
-                    nr,
-                    f.is_error(),
-                    f.ret0(),
-                    f.ret1(),
-                    f.ret2()
-                );
-            }
             (nr, recv_ok)
         } else {
             (0, false)
@@ -236,12 +226,7 @@ pub fn handle_trap_entry(
     if !task_switched && matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
             let saved_pc_final = syscall_resume_pc;
-            crate::yarm_log!(
-                "AARCH64_WRITE_SAVED_PC site=pre_restore_same_task value=0x{:016x}",
-                saved_pc_final as u64
-            );
             trapframe.set_saved_pc(saved_pc_final);
-            crate::yarm_log!("AARCH64_SET_SAVED_PC_FINAL value=0x{:016x}", saved_pc_final as u64);
             if let Some(tid) = kernel.current_tid() {
                 let mut ctx = trapframe.capture_user_context();
                 ctx.instruction_ptr = crate::kernel::vm::VirtAddr(saved_pc_final as u64);
@@ -261,10 +246,6 @@ pub fn handle_trap_entry(
         // fix the frame's saved_pc here and re-save so the original task resumes at
         // the correct ELR (SVC return address) when next dispatched.
         if let Some(trapframe) = frame.as_deref_mut() {
-            crate::yarm_log!(
-                "AARCH64_WRITE_SAVED_PC site=task_switch_save value=0x{:016x}",
-                syscall_resume_pc as u64
-            );
             trapframe.set_saved_pc(syscall_resume_pc);
             if let Some(orig_tid) = entering_tid {
                 crate::yarm_log!(
@@ -357,10 +338,6 @@ pub fn handle_trap_entry(
     if let Some(trapframe) = frame.as_deref_mut() {
         if !task_switched && matches!(event, TrapEvent::Syscall) {
             let saved_pc_final = syscall_resume_pc;
-            crate::yarm_log!(
-                "AARCH64_WRITE_SAVED_PC site=final_pre_eret value=0x{:016x}",
-                saved_pc_final as u64
-            );
             trapframe.set_saved_pc(saved_pc_final);
         }
 
