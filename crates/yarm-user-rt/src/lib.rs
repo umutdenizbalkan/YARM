@@ -363,7 +363,7 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.error));
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret0 != 0 {
+        if ret.ret1 == args[1] && ret.ret2 == args[2] {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
