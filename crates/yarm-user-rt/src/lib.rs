@@ -52,7 +52,6 @@ pub mod syscall {
     const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
     const SYSCALL_IPC_CALL_NR: usize = 6;
     const SYSCALL_IPC_REPLY_NR: usize = 7;
-    const SYSCALL_DEBUG_LOG_NR: usize = 24;
     const SYSCALL_YIELD_NR: usize = 0;
     pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
@@ -126,31 +125,9 @@ pub mod syscall {
 
     #[inline]
     pub fn debug_log(args: core::fmt::Arguments<'_>) {
-        struct Buf {
-            bytes: [u8; 192],
-            len: usize,
-        }
-        impl core::fmt::Write for Buf {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                let rem = self.bytes.len().saturating_sub(self.len);
-                let take = core::cmp::min(rem, s.len());
-                self.bytes[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
-                self.len += take;
-                Ok(())
-            }
-        }
-        let mut buf = Buf {
-            bytes: [0; 192],
-            len: 0,
-        };
-        let _ = core::fmt::write(&mut buf, args);
-        // SAFETY: best-effort debug logging syscall; failures are intentionally ignored.
-        unsafe {
-            let _ = crate::arch::raw_syscall(
-                SYSCALL_DEBUG_LOG_NR,
-                [buf.bytes.as_ptr() as usize, buf.len, 0, 0, 0, 0],
-            );
-        }
+        // Best-effort logging: intentionally a no-op until a kernel-side
+        // debug-log syscall is available in all boot/runtime environments.
+        let _ = args;
     }
 
     #[inline]
