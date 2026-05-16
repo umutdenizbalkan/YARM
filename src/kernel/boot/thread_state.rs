@@ -382,6 +382,10 @@ impl KernelState {
         let context = self
             .thread_user_context(tid)
             .ok_or(KernelError::TaskMissing)?;
+        crate::yarm_log!(
+            "AARCH64_RESTORE_SAVED_PC value=0x{:016x}",
+            context.instruction_ptr.0
+        );
         frame.apply_user_context(context);
         Ok(())
     }

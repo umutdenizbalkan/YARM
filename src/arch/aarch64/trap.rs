@@ -223,6 +223,15 @@ pub fn handle_trap_entry(
     if !task_switched && matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
             trapframe.set_saved_pc(syscall_resume_pc);
+            crate::yarm_log!(
+                "AARCH64_SET_SAVED_PC value=0x{:016x}",
+                syscall_resume_pc as u64
+            );
+            if let Some(tid) = kernel.current_tid() {
+                let mut ctx = trapframe.capture_user_context();
+                ctx.instruction_ptr = crate::kernel::vm::VirtAddr(syscall_resume_pc as u64);
+                let _ = kernel.set_thread_user_context(tid, ctx);
+            }
         }
     }
 
