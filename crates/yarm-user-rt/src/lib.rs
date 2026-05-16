@@ -121,6 +121,15 @@ pub mod syscall {
             // SAFETY: forwards directly to syscall wrapper.
             unsafe { ipc_recv_with_deadline(ep_cap, timeout_ticks) }
         }
+
+        #[inline]
+        fn recv_v2(
+            &mut self,
+            ep_cap: u32,
+        ) -> core::result::Result<Option<(Message, Option<u32>)>, SyscallError> {
+            // SAFETY: forwards directly to syscall wrapper.
+            unsafe { ipc_recv_v2(ep_cap) }
+        }
     }
 
     #[inline]
@@ -175,6 +184,16 @@ pub mod syscall {
 
     #[inline]
     pub unsafe fn ipc_recv(ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError> {
+        match unsafe { ipc_recv_v2(ep_cap) }? {
+            Some((msg, _reply_cap)) => Ok(Some(msg)),
+            None => Ok(None),
+        }
+    }
+
+    #[inline]
+    pub unsafe fn ipc_recv_v2(
+        ep_cap: u32,
+    ) -> core::result::Result<Option<(Message, Option<u32>)>, SyscallError> {
         let mut payload = [0u8; Message::MAX_PAYLOAD];
         let args = [
             ep_cap as usize,
@@ -224,6 +243,11 @@ pub mod syscall {
             0
         };
         crate::user_log!(
+            "USER_RT_RECV_DECODED len={} reply_cap={}",
+            len,
+            transfer_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP)
+        );
+        crate::user_log!(
             "USER_RT_RECV_DECODE status={} len={} reply_cap={} ok={}",
             ret.ret0,
             len,
@@ -232,7 +256,12 @@ pub mod syscall {
         );
         let msg = Message::with_header(ret.ret0 as u64, 0, flags, transfer_cap, &payload[..len])
             .map_err(|_| SyscallError::InvalidArgs)?;
-        Ok(Some(msg))
+        let reply_cap = if ret.ret2 == SYSCALL_NO_TRANSFER_CAP as usize {
+            None
+        } else {
+            Some(ret.ret2 as u32)
+        };
+        Ok(Some((msg, reply_cap)))
     }
 
     #[inline]
