@@ -283,6 +283,12 @@ pub fn run() {
     if result.is_ok() {
         yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_OK");
     }
+    if result.is_err() {
+        return;
+    }
+    loop {
+        let _ = yarm_user_rt::syscall::yield_now();
+    }
 }
 
 #[cfg(test)]
