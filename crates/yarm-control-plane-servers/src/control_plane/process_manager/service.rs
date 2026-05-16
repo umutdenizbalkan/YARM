@@ -1387,6 +1387,10 @@ pub fn run() {
         match transport.recv_v2(recv_cap) {
             Ok(Some((msg, reply_cap))) => {
                 yarm_user_rt::user_log!(
+                    "USER_RT_REPLY_CAP_STAGE stage=pm_handler_entry value={}",
+                    reply_cap.unwrap_or(u32::MAX)
+                );
+                yarm_user_rt::user_log!(
                     "PM_AFTER_RECV_OK sender={} len={} reply_cap={}",
                     msg.sender_tid.0,
                     msg.len,
@@ -1421,6 +1425,10 @@ pub fn run() {
                 yarm_user_rt::user_log!("PM_HANDLE_BEGIN opcode={}", msg.opcode);
                 if let Ok(reply) = service.handle(msg) {
                     if let Some(cap) = reply_cap {
+                        yarm_user_rt::user_log!(
+                            "USER_RT_REPLY_CAP_STAGE stage=before_ipc_reply value={}",
+                            cap
+                        );
                         yarm_user_rt::user_log!("PM_HANDLE_REPLY_BEGIN");
                         let _ = transport.ipc_reply_v2(cap, &reply);
                         yarm_user_rt::user_log!("PM_HANDLE_REPLY_DONE");
@@ -1430,6 +1438,10 @@ pub fn run() {
                     if let Ok(err_reply) =
                         Message::with_header(0, msg.opcode, 0, None, &err_payload)
                     {
+                        yarm_user_rt::user_log!(
+                            "USER_RT_REPLY_CAP_STAGE stage=before_ipc_reply value={}",
+                            cap
+                        );
                         yarm_user_rt::user_log!("PM_HANDLE_REPLY_BEGIN");
                         let _ = transport.ipc_reply_v2(cap, &err_reply);
                         yarm_user_rt::user_log!("PM_HANDLE_REPLY_DONE");

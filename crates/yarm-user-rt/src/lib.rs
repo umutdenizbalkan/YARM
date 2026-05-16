@@ -81,6 +81,10 @@ pub mod syscall {
             match self.recv(ep_cap) {
                 Ok(Some(msg)) => {
                     let reply_cap = msg.transferred_cap().map(|c| c.0 as u32);
+                    crate::user_log!(
+                        "USER_RT_REPLY_CAP_STAGE stage=recv_v2_default value={}",
+                        reply_cap.unwrap_or(u32::MAX)
+                    );
                     Ok(Some((msg, reply_cap)))
                 }
                 Ok(None) => Ok(None),
@@ -261,6 +265,14 @@ pub mod syscall {
         } else {
             Some(ret.ret2 as u32)
         };
+        crate::user_log!(
+            "USER_RT_REPLY_CAP_STAGE stage=raw_decode value={}",
+            reply_cap.unwrap_or(u32::MAX)
+        );
+        crate::user_log!(
+            "USER_RT_REPLY_CAP_STAGE stage=recv_v2_return value={}",
+            reply_cap.unwrap_or(u32::MAX)
+        );
         Ok(Some((msg, reply_cap)))
     }
 
