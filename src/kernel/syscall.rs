@@ -815,10 +815,29 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
     let reply_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
+    let sender_tid = current_tid(kernel)?;
+    crate::yarm_log!(
+        "IPC_REPLY_ENTER tid={} reply_cap={} len={}",
+        sender_tid,
+        reply_cap.0,
+        len
+    );
+    let cnode = kernel.current_task_cnode();
+    let slot_result = cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, reply_cap));
+    let live_result = slot_result.and_then(|c| kernel.capability_object_live(c.object).map(|_| c));
+    crate::yarm_log!(
+        "IPC_REPLY_CAP_PROBE tid={} cap={} cnode={} slot_found={} object_live={} object={:?} rights={:?}",
+        sender_tid,
+        reply_cap.0,
+        cnode.map(|c| c.0).unwrap_or(u64::MAX),
+        slot_result.is_some(),
+        live_result.is_some(),
+        live_result.map(|c| c.object),
+        live_result.map(|c| c.rights()),
+    );
     if len > Message::MAX_PAYLOAD {
         return Err(SyscallError::InvalidArgs);
     }
-    let sender_tid = current_tid(kernel)?;
     let msg = if current_task_has_user_asid(kernel)? {
         let payload = match kernel.copy_from_current_user(user_ptr, len) {
             Ok(payload) => payload,
@@ -833,9 +852,16 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
         let payload = inline_payload_from_frame(frame, len)?;
         Message::new(sender_tid, &payload[..len]).map_err(|_| SyscallError::InvalidArgs)?
     };
-    kernel
-        .ipc_reply(reply_cap, msg)
-        .map_err(SyscallError::from)?;
+    if let Err(err) = kernel.ipc_reply(reply_cap, msg) {
+        let mapped = SyscallError::from(err);
+        crate::yarm_log!(
+            "IPC_REPLY_FAIL tid={} reply_cap={} err={:?}",
+            sender_tid,
+            reply_cap.0,
+            mapped
+        );
+        return Err(mapped);
+    }
     frame.set_ok(0, 0, 0);
     encode_transfer_cap_ret(frame, None)?;
     Ok(())
