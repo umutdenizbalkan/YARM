@@ -194,10 +194,23 @@ pub fn handle_trap_entry(
     let task_switched = matches!(event, TrapEvent::Syscall) && entering_tid != exiting_tid;
     let syscall_resume_pc = if matches!(event, TrapEvent::Syscall) {
         let tid = entering_tid.unwrap_or(0);
-        let syscall_nr = frame.as_ref().map(|f| f.syscall_num()).unwrap_or(0);
-        let recv_success_same_task = frame.as_ref().is_some_and(|f| {
-            syscall_nr == crate::kernel::syscall::Syscall::IpcRecv as usize && !f.is_error()
-        });
+        let (syscall_nr, recv_success_same_task) = if let Some(f) = frame.as_ref() {
+            let nr = f.syscall_num();
+            let recv_ok = nr == crate::kernel::syscall::Syscall::IpcRecv as usize && !f.is_error();
+            if nr == crate::kernel::syscall::Syscall::IpcRecv as usize {
+                crate::yarm_log!(
+                    "AARCH64_RECV_SUCCESS_PRED nr={} is_error={} ret0={} ret1={} ret2={}",
+                    nr,
+                    f.is_error(),
+                    f.ret0(),
+                    f.ret1(),
+                    f.ret2()
+                );
+            }
+            (nr, recv_ok)
+        } else {
+            (0, false)
+        };
         let final_pc = if recv_success_same_task {
             raw_vector_return_pc.wrapping_add(4)
         } else {
@@ -222,10 +235,18 @@ pub fn handle_trap_entry(
 
     if !task_switched && matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
+            let reason = if trapframe.syscall_num() == crate::kernel::syscall::Syscall::IpcRecv as usize
+                && !trapframe.is_error()
+            {
+                "ipc_recv_same_task_success_plus4"
+            } else {
+                "raw_vector_return_pc"
+            };
             trapframe.set_saved_pc(syscall_resume_pc);
             crate::yarm_log!(
-                "AARCH64_SET_SAVED_PC value=0x{:016x}",
-                syscall_resume_pc as u64
+                "AARCH64_SET_SAVED_PC value=0x{:016x} reason={}",
+                syscall_resume_pc as u64,
+                reason
             );
             if let Some(tid) = kernel.current_tid() {
                 let mut ctx = trapframe.capture_user_context();
