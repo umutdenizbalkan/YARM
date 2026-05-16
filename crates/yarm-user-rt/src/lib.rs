@@ -205,7 +205,7 @@ pub mod syscall {
             return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret1 == args[1] && ret.ret2 == args[2] {
+        if ret.ret1 == args[1] && ret.ret2 == args[2] && (1..=9).contains(&ret.ret0) {
             let err = decode_syscall_error(ret.ret0);
             return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
         }
@@ -273,7 +273,7 @@ pub mod syscall {
             };
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret1 == args[1] && ret.ret2 == args[2] {
+        if ret.ret1 == args[1] && ret.ret2 == args[2] && (1..=9).contains(&ret.ret0) {
             let err = decode_syscall_error(ret.ret0);
             return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) {
                 Ok(None)
