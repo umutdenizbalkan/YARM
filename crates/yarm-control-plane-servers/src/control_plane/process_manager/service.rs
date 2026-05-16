@@ -45,6 +45,16 @@ const AUXV_AT_PAGESZ: u64 = 6;
 const AUXV_AT_ENTRY: u64 = 9;
 const ELF64_PHDR_SIZE: usize = 56;
 const PT_LOAD: u32 = 1;
+#[used]
+static PM_MARKER_BEFORE_RECV: &[u8] = b"PM_BEFORE_RECV\0";
+#[used]
+static PM_MARKER_AFTER_RECV_OK: &[u8] = b"PM_AFTER_RECV_OK\0";
+#[used]
+static PM_MARKER_AFTER_RECV_ERR: &[u8] = b"PM_AFTER_RECV_ERR\0";
+#[used]
+static PM_MARKER_BEFORE_HANDLE: &[u8] = b"PM_BEFORE_HANDLE\0";
+#[used]
+static PM_MARKER_HANDLE_BEGIN: &[u8] = b"PM_HANDLE_BEGIN\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnV2Request {
