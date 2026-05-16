@@ -241,11 +241,6 @@ pub mod syscall {
         } else {
             Some(ret.ret2 as u64)
         };
-        let flags = if transfer_cap.is_some() {
-            Message::FLAG_CAP_TRANSFER
-        } else {
-            0
-        };
         crate::user_log!(
             "USER_RT_RECV_DECODED len={} reply_cap={}",
             len,
@@ -258,7 +253,7 @@ pub mod syscall {
             transfer_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
             true
         );
-        let msg = Message::with_header(ret.ret0 as u64, 0, flags, transfer_cap, &payload[..len])
+        let msg = Message::with_header(ret.ret0 as u64, 0, 0, None, &payload[..len])
             .map_err(|_| SyscallError::InvalidArgs)?;
         let reply_cap = if ret.ret2 == SYSCALL_NO_TRANSFER_CAP as usize {
             None
