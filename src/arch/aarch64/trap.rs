@@ -319,30 +319,27 @@ pub fn handle_trap_entry(
         }
     }
 
-
     if let Some(trapframe) = frame.as_deref_mut() {
-        if !task_switched
-            && matches!(event, TrapEvent::Syscall)
-            && trapframe.syscall_num() == crate::kernel::syscall::Syscall::IpcRecv as usize
-            && !trapframe.is_error()
-        {
+        if !task_switched && matches!(event, TrapEvent::Syscall) {
             trapframe.set_saved_pc(syscall_resume_pc);
-            if let Some(tid) = kernel.current_tid() {
-                let _ = kernel.set_thread_user_context(tid, trapframe.capture_user_context());
-            }
         }
-        if kernel.current_tid().unwrap_or(0) != 0 && trapframe.saved_pc() < 0x400000 {
+
+        let actual_elr = trapframe.saved_pc();
+        crate::yarm_log!("AARCH64_MSR_ELR_ACTUAL value=0x{:016x}", actual_elr as u64);
+
+        if kernel.current_tid().unwrap_or(0) != 0 && actual_elr < 0x400000 {
             crate::yarm_log!(
                 "AARCH64_BAD_USER_ELR tid={} elr=0x{:016x}",
                 kernel.current_tid().unwrap_or(0),
-                trapframe.saved_pc() as u64
+                actual_elr as u64
             );
             panic!("AARCH64_BAD_USER_ELR");
         }
+
         crate::yarm_log!(
             "AARCH64_ERET_ACTUAL tid={} elr=0x{:016x} x0=0x{:016x}",
             kernel.current_tid().unwrap_or(0),
-            trapframe.saved_pc() as u64,
+            actual_elr as u64,
             trapframe.user_gpr(0) as u64
         );
     }
@@ -609,3 +606,4 @@ mod tests {
         assert_eq!(last_restored_tls_base(CpuId(0)), Some(0xBBB0_0000));
     }
 }
+
