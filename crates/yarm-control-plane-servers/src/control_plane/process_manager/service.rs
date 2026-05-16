@@ -1379,12 +1379,11 @@ pub fn run() {
         }
     };
     yarm_user_rt::user_log!("PM_RECV_LOOP_START cap={}", recv_cap);
-    use yarm_user_rt::syscall::IpcTransport;
-    let mut transport = yarm_user_rt::syscall::SyscallIpcTransport;
     let mut service = ProcessService::new();
     loop {
         yarm_user_rt::user_log!("PM_BEFORE_RECV cap={}", recv_cap);
-        match transport.recv_v2(recv_cap) {
+        // SAFETY: direct syscall wrapper call; PM owns its recv endpoint capability.
+        match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
             Ok(Some((msg, reply_cap))) => {
                 yarm_user_rt::user_log!(
                     "USER_RT_REPLY_CAP_STAGE stage=pm_handler_entry value={}",
@@ -1430,7 +1429,8 @@ pub fn run() {
                             cap
                         );
                         yarm_user_rt::user_log!("PM_HANDLE_REPLY_BEGIN");
-                        let _ = transport.ipc_reply_v2(cap, &reply);
+                        // SAFETY: kernel validates reply capability rights/object.
+                        let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
                         yarm_user_rt::user_log!("PM_HANDLE_REPLY_DONE");
                     }
                 } else if let Some(cap) = reply_cap {
@@ -1443,7 +1443,8 @@ pub fn run() {
                             cap
                         );
                         yarm_user_rt::user_log!("PM_HANDLE_REPLY_BEGIN");
-                        let _ = transport.ipc_reply_v2(cap, &err_reply);
+                        // SAFETY: kernel validates reply capability rights/object.
+                        let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &err_reply) };
                         yarm_user_rt::user_log!("PM_HANDLE_REPLY_DONE");
                     }
                 }
