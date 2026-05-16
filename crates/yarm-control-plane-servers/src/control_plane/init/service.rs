@@ -277,18 +277,15 @@ pub fn run() {
     ) else {
         return;
     };
-    yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_BEGIN");
     // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call.
     let result = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
-    if result.is_ok() {
-        yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_OK");
-    }
     if result.is_err() {
         return;
     }
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;
     };
+    yarm_user_rt::user_log!("INIT_ALERT_WAIT_BEGIN cap={}", alert_recv);
     loop {
         // SAFETY: init owns this startup-provided alert receive endpoint.
         let _ = unsafe { yarm_user_rt::syscall::ipc_recv(alert_recv) };

@@ -1378,83 +1378,28 @@ pub fn run() {
             let _ = yarm_user_rt::syscall::yield_now();
         }
     };
-    yarm_user_rt::user_log!("PM_RECV_LOOP_START cap={}", recv_cap);
     let mut service = ProcessService::new();
     loop {
-        yarm_user_rt::user_log!("PM_BEFORE_RECV cap={}", recv_cap);
         // SAFETY: direct syscall wrapper call; PM owns its recv endpoint capability.
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
             Ok(Some((msg, reply_cap))) => {
-                yarm_user_rt::user_log!(
-                    "USER_RT_REPLY_CAP_STAGE stage=pm_handler_entry value={}",
-                    reply_cap.unwrap_or(u32::MAX)
-                );
-                yarm_user_rt::user_log!(
-                    "PM_AFTER_RECV_OK sender={} len={} reply_cap={}",
-                    msg.sender_tid.0,
-                    msg.len,
-                    reply_cap.unwrap_or(u32::MAX)
-                );
-                let first_u64 = if msg.len >= 8 {
-                    let mut b = [0u8; 8];
-                    b.copy_from_slice(&msg.payload[..8]);
-                    u64::from_le_bytes(b)
-                } else {
-                    0
-                };
-                let second_u64 = if msg.len >= 16 {
-                    let mut b = [0u8; 8];
-                    b.copy_from_slice(&msg.payload[8..16]);
-                    u64::from_le_bytes(b)
-                } else {
-                    0
-                };
-                yarm_user_rt::user_log!(
-                    "PM_RECV_RESULT raw_status={} len={} reply_cap={}",
-                    msg.sender_tid.0,
-                    msg.len,
-                    reply_cap.unwrap_or(u32::MAX)
-                );
-                yarm_user_rt::user_log!(
-                    "PM_RECV_BUFFER_HEAD first_u64={} second_u64={}",
-                    first_u64,
-                    second_u64
-                );
-                yarm_user_rt::user_log!("PM_BEFORE_HANDLE opcode={}", msg.opcode);
-                yarm_user_rt::user_log!("PM_HANDLE_BEGIN opcode={}", msg.opcode);
                 if let Ok(reply) = service.handle(msg) {
                     if let Some(cap) = reply_cap {
-                        yarm_user_rt::user_log!(
-                            "USER_RT_REPLY_CAP_STAGE stage=before_ipc_reply value={}",
-                            cap
-                        );
-                        yarm_user_rt::user_log!("PM_HANDLE_REPLY_BEGIN");
                         // SAFETY: kernel validates reply capability rights/object.
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
-                        yarm_user_rt::user_log!("PM_HANDLE_REPLY_DONE");
                     }
                 } else if let Some(cap) = reply_cap {
                     let err_payload = 1u64.to_le_bytes();
                     if let Ok(err_reply) =
                         Message::with_header(0, msg.opcode, 0, None, &err_payload)
                     {
-                        yarm_user_rt::user_log!(
-                            "USER_RT_REPLY_CAP_STAGE stage=before_ipc_reply value={}",
-                            cap
-                        );
-                        yarm_user_rt::user_log!("PM_HANDLE_REPLY_BEGIN");
                         // SAFETY: kernel validates reply capability rights/object.
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &err_reply) };
-                        yarm_user_rt::user_log!("PM_HANDLE_REPLY_DONE");
                     }
                 }
             }
-            Ok(None) => {
-                yarm_user_rt::user_log!("PM_AFTER_RECV_NONE");
-                yarm_user_rt::user_log!("PM_RECV_CALL_RETURN ok=false x0=0 x1=0 x2=0");
-            }
+            Ok(None) => {}
             Err(_) => {
-                yarm_user_rt::user_log!("PM_AFTER_RECV_ERR");
                 continue;
             }
         }
