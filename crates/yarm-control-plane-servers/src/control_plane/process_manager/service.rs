@@ -1572,7 +1572,7 @@ mod tests {
         let exec = load_exec_image_from_reader(
             91,
             0x8100_0000,
-            &[b"/sbin/proc_mgr"],
+            &[b"/sbin/process_manager"],
             &[b"HOME=/"],
             |id| {
                 if id == 91 {
