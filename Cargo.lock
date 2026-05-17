@@ -47,6 +47,7 @@ version = "0.1.0"
 name = "yarm-fs-servers"
 version = "0.1.0"
 dependencies = [
+ "yarm",
  "yarm-ipc-abi",
  "yarm-server-runtime",
  "yarm-srv-common",
