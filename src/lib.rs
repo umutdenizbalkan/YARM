@@ -21,11 +21,11 @@ pub mod runtime;
 #[macro_export]
 macro_rules! yarm_log {
     ($($arg:tt)*) => {{
-        #[cfg(feature = "hosted-dev")]
+        #[cfg(all(feature = "hosted-dev", not(target_os = "none")))]
         {
             $crate::std::println!($($arg)*);
         }
-        #[cfg(not(feature = "hosted-dev"))]
+        #[cfg(not(all(feature = "hosted-dev", not(target_os = "none"))))]
         {
             $crate::pr_info!($($arg)*);
             let _ = $crate::kernel::printk::printk_flush();
