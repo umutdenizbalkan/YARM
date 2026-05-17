@@ -11,7 +11,6 @@ default = ["hosted-dev"]
 hosted-dev = []
 
 [dependencies]
-yarm = { path = "../.." }
 yarm-server-runtime = { path = "../yarm-server-runtime", default-features = false }
 yarm-user-rt = { path = "../yarm-user-rt" }
 yarm-ipc-abi = { path = "../yarm-ipc-abi" }

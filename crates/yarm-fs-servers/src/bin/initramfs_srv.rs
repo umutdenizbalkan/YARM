@@ -5,7 +5,7 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 #[cfg(not(feature = "hosted-dev"))]
-yarm::install_freestanding_allocator!(
+yarm_server_runtime::install_freestanding_allocator!(
     2 * 1024 * 1024,
     "initramfs server freestanding allocator OOM"
 );
@@ -23,10 +23,10 @@ fn main() {
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_user_entry() -> ! {
-    let _ = yarm::user_rt::syscall::yield_now();
+    let _ = yarm_server_runtime::user_rt::syscall::yield_now();
     run();
     loop {
-        let _ = yarm::user_rt::syscall::yield_now();
+        let _ = yarm_server_runtime::user_rt::syscall::yield_now();
     }
 }
 
@@ -40,7 +40,7 @@ pub extern "C" fn _start(
     startup_slots_len: usize,
     _startup_slots_reserved: usize,
 ) -> ! {
-    yarm::user_rt::runtime::enter_user_entrypoint(
+    yarm_server_runtime::user_rt::runtime::enter_user_entrypoint(
         startup_task_id,
         startup_proc_mgr_request_send_cap,
         startup_proc_mgr_reply_recv_cap,

@@ -276,14 +276,14 @@ pub fn run_kernel_boot(run: fn()) {
         return run_kernel_boot_with_firmware_blob(run, Some(blob));
     }
 
-    #[cfg(feature = "hosted-dev")]
+    #[cfg(all(feature = "hosted-dev", not(target_os = "none")))]
     let irq_description = crate::std::env::var("YARM_IRQ_CONTROLLER_DESCRIPTION").ok();
-    #[cfg(feature = "hosted-dev")]
+    #[cfg(all(feature = "hosted-dev", not(target_os = "none")))]
     if let Some(irq_description) = irq_description {
         return run_kernel_boot_with_irq_description(run, Some(irq_description.as_bytes()));
     }
 
-    #[cfg(feature = "hosted-dev")]
+    #[cfg(all(feature = "hosted-dev", not(target_os = "none")))]
     if let Ok(firmware_blob) = crate::std::env::var("YARM_IRQ_FIRMWARE_BLOB") {
         return run_kernel_boot_with_firmware_blob(run, Some(firmware_blob.as_bytes()));
     }
