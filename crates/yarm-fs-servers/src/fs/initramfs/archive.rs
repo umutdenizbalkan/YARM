@@ -132,9 +132,9 @@ impl InitramfsBackend {
             let path = match entry.name {
                 b"init" => INITRAMFS_INIT_PATH,
                 b"etc/hosts" => INITRAMFS_ETC_HOSTS_PATH,
-                b"process_manager" => INITRAMFS_PROC_MGR_PATH,
+                b"sbin/process_manager" => INITRAMFS_PROC_MGR_PATH,
                 b"vfs" => INITRAMFS_VFS_PATH,
-                b"supervisor" => INITRAMFS_SUPERVISOR_PATH,
+                b"sbin/supervisor" => INITRAMFS_SUPERVISOR_PATH,
                 b"posix_compat" => INITRAMFS_POSIX_COMPAT_PATH,
                 _ => continue,
             };
@@ -420,14 +420,28 @@ mod tests {
     fn initramfs_cpio_updates_known_file_sizes() {
         let mut cpio = Vec::new();
         push_entry(&mut cpio, "init", 0o100755, &[0u8; 77]);
+        push_entry(&mut cpio, "sbin/process_manager", 0o100755, &[0u8; 111]);
+        push_entry(&mut cpio, "sbin/supervisor", 0o100755, &[0u8; 135]);
         push_entry(&mut cpio, "vfs", 0o100755, &[0u8; 222]);
         push_entry(&mut cpio, "TRAILER!!!", 0, &[]);
         let mut fs = InitramfsBackend::from_cpio_newc(&cpio);
         let init_stat = fs.statx_path(INITRAMFS_INIT_PATH).expect("init stat");
+        let proc_stat = fs.statx_path(INITRAMFS_PROC_MGR_PATH).expect("proc stat");
+        let sup_stat = fs
+            .statx_path(INITRAMFS_SUPERVISOR_PATH)
+            .expect("supervisor stat");
         let vfs_stat = fs.statx_path(INITRAMFS_VFS_PATH).expect("vfs stat");
         assert_eq!(
             init_stat,
             INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (77 << 16)
+        );
+        assert_eq!(
+            proc_stat,
+            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (111 << 16)
+        );
+        assert_eq!(
+            sup_stat,
+            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (135 << 16)
         );
         assert_eq!(
             vfs_stat,
