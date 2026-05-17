@@ -192,9 +192,33 @@ common_stage_supervisor_elf() {
   echo "[ok] staged supervisor ELF as /sbin/supervisor"
 }
 
+common_stage_initramfs_server_elf() {
+  if [[ ! -f "$INITRAMFS_SERVER_ELF" ]]; then
+    echo "[warn] initramfs server ELF missing: $INITRAMFS_SERVER_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$INITRAMFS_SERVER_ELF" "$ROOTFS_DIR/sbin/initramfs_srv"
+  chmod +x "$ROOTFS_DIR/sbin/initramfs_srv"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$INITRAMFS_SERVER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] initramfs server ELF has forbidden RWE PT_LOAD segment: $INITRAMFS_SERVER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $INITRAMFS_SERVER_ELF"
+  fi
+
+  echo "[ok] staged initramfs server ELF as /sbin/initramfs_srv"
+}
+
 common_verify_initramfs_stage_paths() {
   local missing=0
-  for path in "init" "sbin/init_server" "sbin/process_manager" "sbin/supervisor"; do
+  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/process_manager" "sbin/supervisor"; do
     if [[ ! -f "$ROOTFS_DIR/$path" ]]; then
       echo "[error] expected initramfs path missing: $ROOTFS_DIR/$path"
       missing=1
