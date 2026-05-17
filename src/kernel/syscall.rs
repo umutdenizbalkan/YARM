@@ -10,6 +10,9 @@ use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
+use crate::kernel::boot::UserImageSpec;
+use crate::kernel::task::TaskClass;
+use yarm_srv_common::{cpio::CpioArchive, elf::ElfImageInfo};
 
 pub const SYSCALL_ABI_VERSION: u16 = 10;
 pub const SYSCALL_YIELD_NR: usize = 0;
@@ -1206,14 +1209,97 @@ fn handle_spawn_process(
 ) -> Result<(), SyscallError> {
     let image_id = frame.arg(SYSCALL_ARG_CAP) as u64;
     let parent_pid = frame.arg(SYSCALL_ARG_PTR) as u64;
-    let _ = (image_id, parent_pid);
-    let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
+    let startup_args_ptr = frame.arg(SYSCALL_ARG_LEN);
+    let startup_args_count = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
+    crate::yarm_log!(
+        "KSPAWN_ENTER image_id={} parent_pid={} args_count={}",
+        image_id,
+        parent_pid,
+        startup_args_count
+    );
+    let startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
+    crate::yarm_log!("KSPAWN_PATH path={}", image_path);
+    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
+    let entry = CpioArchive::new(initrd)
+        .find(image_path)
+        .map_err(|_| SyscallError::InvalidArgs)?
+        .ok_or(SyscallError::InvalidArgs)?;
+    let elf_bytes = entry.file_data();
+    crate::yarm_log!("KSPAWN_ELF_FOUND size={}", elf_bytes.len());
+    let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
+    crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
+    let tid = kernel.allocate_thread_id().map_err(|err| {
+        crate::yarm_log!("KSPAWN_FAIL phase=allocate_tid err={:?}", err);
+        SyscallError::from(err)
+    })?;
+    let (asid, _aspace_cap) = kernel.create_user_address_space().map_err(|err| {
+        crate::yarm_log!("KSPAWN_FAIL phase=create_asid err={:?}", err);
+        SyscallError::from(err)
+    })?;
+    crate::yarm_log!("KSPAWN_ASID_OK tid={} asid={}", tid, asid.0);
+    kernel.load_elf_pt_load_segments(asid, elf_bytes).map_err(|err| {
+        crate::yarm_log!("KSPAWN_FAIL phase=load_elf err={:?}", err);
+        SyscallError::from(err)
+    })?;
+    crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
+    let spawned = kernel
+        .spawn_user_task_from_image(UserImageSpec {
+            tid,
+            entry: elf.entry as usize,
+            asid: Some(asid),
+            class: TaskClass::SystemServer,
+            startup_args,
+        })
+        .map_err(|err| {
+            crate::yarm_log!("KSPAWN_FAIL phase=spawn_task err={:?}", err);
+            SyscallError::from(err)
+        })?;
+    crate::yarm_log!("KSPAWN_TASK_READY tid={}", spawned.tid);
     frame.set_ok(
         0,
-        usize::try_from(tid).map_err(|_| SyscallError::Internal)?,
+        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
         0,
     );
     Ok(())
+}
+
+fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
+    match image_id {
+        0 => Some("init"),
+        1 => Some("sbin/supervisor"),
+        2 => Some("sbin/process_manager"),
+        3 => Some("sbin/init_server"),
+        4 => Some("sbin/initramfs_srv"),
+        _ => None,
+    }
+}
+
+fn copy_spawn_startup_args(
+    kernel: &KernelState,
+    startup_args_ptr: usize,
+    startup_args_count: usize,
+) -> Result<[u64; UserImageSpec::DEFAULT_STARTUP_ARGS.len()], SyscallError> {
+    let mut out = UserImageSpec::DEFAULT_STARTUP_ARGS;
+    if startup_args_count == 0 {
+        return Ok(out);
+    }
+    if startup_args_count > out.len() || startup_args_ptr == 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let byte_len = startup_args_count
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(SyscallError::InvalidArgs)?;
+    validate_user_region(startup_args_ptr as u64, byte_len as u64)?;
+    let payload = kernel
+        .copy_from_current_user(startup_args_ptr, byte_len)
+        .map_err(SyscallError::from)?;
+    for (idx, chunk) in payload[..byte_len].chunks_exact(core::mem::size_of::<u64>()).enumerate() {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        out[idx] = u64::from_le_bytes(word);
+    }
+    Ok(out)
 }
 
 fn handle_vm_anon_map(
@@ -1387,10 +1473,57 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::{boxed::Box, format, vec::Vec};
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::{EndpointMode, IPC_REGISTER_WORDS};
     use crate::kernel::scheduler_timer::Timer;
     use crate::kernel::trapframe::TrapFrame;
+
+    fn push_cpio_entry(out: &mut Vec<u8>, name: &str, mode: u32, data: &[u8]) {
+        let namesz = name.len() + 1;
+        let mut h = [0u8; 110];
+        h[0..6].copy_from_slice(b"070701");
+        h[14..22].copy_from_slice(format!("{mode:08x}").as_bytes());
+        h[54..62].copy_from_slice(format!("{:08x}", data.len()).as_bytes());
+        h[94..102].copy_from_slice(format!("{namesz:08x}").as_bytes());
+        out.extend_from_slice(&h);
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(data);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+
+    fn synthetic_elf_image(image_id: u64) -> [u8; 128] {
+        let mut image = [0u8; 128];
+        image[..4].copy_from_slice(b"\x7FELF");
+        image[4] = 2;
+        image[5] = 1;
+        image[6] = 1;
+        image[16..18].copy_from_slice(&2u16.to_le_bytes());
+        image[18..20].copy_from_slice(&0x3Eu16.to_le_bytes());
+        image[20..24].copy_from_slice(&1u32.to_le_bytes());
+        let entry = 0x400000u64.saturating_add(image_id.saturating_mul(0x1000));
+        image[24..32].copy_from_slice(&entry.to_le_bytes());
+        image[32..40].copy_from_slice(&64u64.to_le_bytes());
+        image[52..54].copy_from_slice(&(64u16).to_le_bytes());
+        image[54..56].copy_from_slice(&(56u16).to_le_bytes());
+        image[56..58].copy_from_slice(&(1u16).to_le_bytes());
+        let ph = 64usize;
+        image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+        image[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes());
+        image[ph + 8..ph + 16].copy_from_slice(&120u64.to_le_bytes());
+        image[ph + 16..ph + 24].copy_from_slice(&(entry & !0xFFF).to_le_bytes());
+        image[ph + 32..ph + 40].copy_from_slice(&8u64.to_le_bytes());
+        image[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes());
+        image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        image[120..128].copy_from_slice(&[0x90; 8]);
+        image
+    }
 
     #[test]
     fn syscall_abi_numbers_are_frozen() {
@@ -1435,6 +1568,28 @@ mod tests {
             Syscall::decode(SYSCALL_IPC_REPLY_NR).expect("decode"),
             Syscall::IpcReply
         );
+    }
+
+    #[test]
+    fn spawn_process_rejects_startup_arg_count_overflow() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let mut frame = TrapFrame::new(
+            Syscall::SpawnProcess as usize,
+            [4, 1, 0, UserImageSpec::DEFAULT_STARTUP_ARGS.len() + 1, 0, 0],
+        );
+        dispatch(&mut state, &mut frame).expect_err("reject overflow count");
+    }
+
+    #[test]
+    fn spawn_process_rejects_missing_cpio_image() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let mut cpio = Vec::new();
+        push_cpio_entry(&mut cpio, "init", 0o100755, &synthetic_elf_image(0));
+        push_cpio_entry(&mut cpio, "TRAILER!!!", 0, &[]);
+        let bytes: &'static [u8] = Box::leak(cpio.into_boxed_slice());
+        crate::kernel::boot::Bootstrap::install_boot_initrd_bytes(bytes);
+        let mut frame = TrapFrame::new(Syscall::SpawnProcess as usize, [4, 1, 0, 0, 0, 0]);
+        dispatch(&mut state, &mut frame).expect_err("missing image path");
     }
 
     #[test]
