@@ -214,11 +214,12 @@ pub fn handle_trap_entry(
         let tid = entering_tid.unwrap_or(0);
         let (syscall_nr, needs_plus4) = if let Some(f) = frame.as_ref() {
             let nr = f.syscall_num();
-            // IpcRecv with no error (immediate receive or wakeup) requires
-            // PC+4 because the kernel resets saved_pc to the SVC address
-            // during receive setup. All other syscalls inherit ELR_EL1 which
-            // ARM sets to SVC+4 (preferred return address), so no adjustment
-            // is needed.
+            // AArch64 ELR_EL1 for SVC holds the SVC instruction address itself.
+            // We add +4 to advance to the next instruction for IpcRecv when it
+            // completes successfully (immediate receive). When IpcRecv blocks, the
+            // syscall handler sets frame.error = WouldBlock so is_error() is true,
+            // causing needs_plus4 = false and saved_pc = SVC. The task then retries
+            // the SVC on wakeup when the message is in the queue.
             let ipc_recv_ok = nr == crate::kernel::syscall::Syscall::IpcRecv as usize
                 && !f.is_error();
             (nr, ipc_recv_ok)
