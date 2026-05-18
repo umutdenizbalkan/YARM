@@ -149,11 +149,14 @@ impl KernelProcessSpawnBackend {
     }
 
     fn spawn(&self, image_id: u64, parent_pid: u64) -> Result<u64, ProcessManagerError> {
+        yarm_user_rt::user_log!("PM_HANDLE_SPAWN_V5_BEGIN image_id={} parent_pid={}", image_id, parent_pid);
         // SAFETY: Delegates to kernel spawn_process syscall (nr=23).
-        unsafe {
+        let result = unsafe {
             yarm_user_rt::syscall::spawn_process(image_id, parent_pid)
                 .map_err(|_| ProcessManagerError::TableFull)
-        }
+        };
+        yarm_user_rt::user_log!("PM_HANDLE_SPAWN_V5_RESULT ok={}", result.is_ok() as u8);
+        result
     }
 }
 
@@ -1375,23 +1378,39 @@ pub fn run() {
         // SAFETY: direct syscall wrapper call; PM owns its recv endpoint capability.
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
             Ok(Some((msg, reply_cap))) => {
+                yarm_user_rt::user_log!(
+                    "PM_RECV_GOT_MSG opcode={} len={} reply_cap={}",
+                    msg.opcode,
+                    msg.len,
+                    reply_cap.unwrap_or(u32::MAX)
+                );
                 if let Ok(reply) = service.handle(msg) {
                     if let Some(cap) = reply_cap {
                         // SAFETY: kernel validates reply capability rights/object.
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
                     }
-                } else if let Some(cap) = reply_cap {
-                    let err_payload = 1u64.to_le_bytes();
-                    if let Ok(err_reply) =
-                        Message::with_header(0, msg.opcode, 0, None, &err_payload)
-                    {
-                        // SAFETY: kernel validates reply capability rights/object.
-                        let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &err_reply) };
+                } else {
+                    yarm_user_rt::user_log!(
+                        "PM_RECV_DECODE_FAIL opcode={} reply_cap={}",
+                        msg.opcode,
+                        reply_cap.unwrap_or(u32::MAX)
+                    );
+                    if let Some(cap) = reply_cap {
+                        let err_payload = 1u64.to_le_bytes();
+                        if let Ok(err_reply) =
+                            Message::with_header(0, msg.opcode, 0, None, &err_payload)
+                        {
+                            // SAFETY: kernel validates reply capability rights/object.
+                            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &err_reply) };
+                        }
                     }
                 }
             }
-            Ok(None) => {}
-            Err(_) => {
+            Ok(None) => {
+                yarm_user_rt::user_log!("PM_RECV_RAW_RESULT none");
+            }
+            Err(e) => {
+                yarm_user_rt::user_log!("PM_RECV_RAW_RESULT err={:?}", e);
                 continue;
             }
         }
