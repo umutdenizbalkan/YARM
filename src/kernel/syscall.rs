@@ -30,6 +30,7 @@ pub const SYSCALL_SPAWN_THREAD_NR: usize = 11;
 pub const SYSCALL_FORK_NR: usize = 12;
 pub const SYSCALL_VM_ANON_MAP_NR: usize = 13;
 pub const SYSCALL_VM_BRK_NR: usize = 14;
+pub const SYSCALL_DEBUG_LOG_NR: usize = 15;
 pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
 pub const SYSCALL_COUNT: usize = 24;
 const _: [(); SYSCALL_COUNT] = [(); 24];
@@ -73,11 +74,12 @@ pub enum Syscall {
     Fork = SYSCALL_FORK_NR,
     VmAnonMap = SYSCALL_VM_ANON_MAP_NR,
     VmBrk = SYSCALL_VM_BRK_NR,
+    DebugLog = SYSCALL_DEBUG_LOG_NR,
     SpawnProcess = SYSCALL_SPAWN_PROCESS_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 16;
+    pub const VARIANT_COUNT: usize = 17;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -99,6 +101,7 @@ impl Syscall {
             SYSCALL_FORK_NR => Ok(Self::Fork),
             SYSCALL_VM_ANON_MAP_NR => Ok(Self::VmAnonMap),
             SYSCALL_VM_BRK_NR => Ok(Self::VmBrk),
+            SYSCALL_DEBUG_LOG_NR => Ok(Self::DebugLog),
             SYSCALL_SPAWN_PROCESS_NR => Ok(Self::SpawnProcess),
             _ => Err(SyscallError::InvalidNumber),
         }
@@ -1351,6 +1354,27 @@ fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<()
     Ok(())
 }
 
+fn handle_debug_log(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let user_ptr = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN).min(Message::MAX_PAYLOAD);
+    if user_ptr == 0 || len == 0 {
+        frame.set_ok(0, 0, 0);
+        return Ok(());
+    }
+    let tid = kernel.current_tid().unwrap_or(0);
+    let payload = match kernel.copy_from_current_user(user_ptr, len) {
+        Ok(data) => data,
+        Err(_) => {
+            frame.set_ok(0, 0, 0);
+            return Ok(());
+        }
+    };
+    let msg_str = core::str::from_utf8(&payload[..len]).unwrap_or("<utf8_err>");
+    crate::yarm_log!("USER_LOG tid={} msg={}", tid, msg_str);
+    frame.set_ok(0, 0, 0);
+    Ok(())
+}
+
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if frame.syscall_num() == SYSCALL_YIELD_NR {
@@ -1386,6 +1410,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::Fork => handle_fork(kernel, frame),
         Syscall::VmAnonMap => handle_vm_anon_map(kernel, frame),
         Syscall::VmBrk => handle_vm_brk(kernel, frame),
+        Syscall::DebugLog => handle_debug_log(kernel, frame),
         Syscall::SpawnProcess => handle_spawn_process(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {

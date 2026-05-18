@@ -281,6 +281,7 @@ pub fn run() {
     yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_BEGIN");
     // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call.
     let result = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
+    yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_RETURN ok={}", result.is_ok() as u8);
     if result.is_err() {
         return;
     }

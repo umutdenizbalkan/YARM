@@ -134,9 +134,40 @@ pub mod syscall {
 
     #[inline]
     pub fn debug_log(args: core::fmt::Arguments<'_>) {
-        // Best-effort logging: intentionally a no-op until a kernel-side
-        // debug-log syscall is available in all boot/runtime environments.
-        let _ = args;
+        #[cfg(target_os = "none")]
+        {
+            const SYSCALL_DEBUG_LOG_NR: usize = 15;
+            const MAX_LOG_LEN: usize = 128;
+            struct LogBuf {
+                buf: [u8; MAX_LOG_LEN],
+                len: usize,
+            }
+            impl core::fmt::Write for LogBuf {
+                fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                    let bytes = s.as_bytes();
+                    let available = MAX_LOG_LEN - self.len;
+                    let to_copy = bytes.len().min(available);
+                    self.buf[self.len..self.len + to_copy]
+                        .copy_from_slice(&bytes[..to_copy]);
+                    self.len += to_copy;
+                    Ok(())
+                }
+            }
+            let mut buf = LogBuf {
+                buf: [0u8; MAX_LOG_LEN],
+                len: 0,
+            };
+            let _ = core::fmt::write(&mut buf, args);
+            if buf.len > 0 {
+                let sysargs = [buf.buf.as_ptr() as usize, buf.len, 0, 0, 0, 0];
+                // SAFETY: kernel validates ptr/len from current user task's memory.
+                unsafe { crate::arch::raw_syscall(SYSCALL_DEBUG_LOG_NR, sysargs) };
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = args;
+        }
     }
 
     #[inline]
