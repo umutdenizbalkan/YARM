@@ -194,17 +194,30 @@ pub fn handle_trap_entry(
     let task_switched = matches!(event, TrapEvent::Syscall) && entering_tid != exiting_tid;
     let syscall_resume_pc = if matches!(event, TrapEvent::Syscall) {
         let tid = entering_tid.unwrap_or(0);
-        let syscall_nr = if let Some(f) = frame.as_ref() {
-            f.syscall_num()
+        let (syscall_nr, needs_plus4) = if let Some(f) = frame.as_ref() {
+            let nr = f.syscall_num();
+            // IpcRecv with no error (immediate receive or wakeup) requires
+            // PC+4 because the kernel resets saved_pc to the SVC address
+            // during receive setup. All other syscalls inherit ELR_EL1 which
+            // ARM sets to SVC+4 (preferred return address), so no adjustment
+            // is needed.
+            let ipc_recv_ok = nr == crate::kernel::syscall::Syscall::IpcRecv as usize
+                && !f.is_error();
+            (nr, ipc_recv_ok)
         } else {
-            0
+            (0, false)
         };
-        // AArch64 ELR_EL1 = SVC instruction address; always advance past SVC.
-        let final_pc = raw_vector_return_pc.wrapping_add(4);
-        let reason = if syscall_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR {
-            "debug_log_plus4"
+        let final_pc = if needs_plus4 {
+            raw_vector_return_pc.wrapping_add(4)
         } else {
-            "plus4"
+            raw_vector_return_pc
+        };
+        let reason = if needs_plus4 {
+            "ipc_recv_plus4"
+        } else if syscall_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR {
+            "debug_log_raw"
+        } else {
+            "raw"
         };
         crate::yarm_log!(
             "AARCH64_ELR_POLICY tid={} nr={} raw=0x{:016x} final=0x{:016x} reason={}",
