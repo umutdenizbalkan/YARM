@@ -24,7 +24,7 @@ fn main() {
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_user_entry() -> ! {
     yarm_user_rt::user_log!("PM_BIN_ENTRY_START");
-    yarm_user_rt::user_log!("PM_BIN_BEFORE_RUN");
+    yarm_user_rt::user_log!("PM_BEFORE_RUN");
     run();
     yarm_user_rt::user_log!("PM_BIN_AFTER_RUN");
     loop {
