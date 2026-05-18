@@ -258,9 +258,16 @@ pub mod syscall {
             return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret1 == args[1] && ret.ret2 == args[2] && (1..=9).contains(&ret.ret0) {
-            let err = decode_syscall_error(ret.ret0);
-            return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
+        {
+            // x0 in 1..=9 is an error code when x1==0 && x2==0 (set_err zeroes all ret
+            // fields; export_syscall_result_to_user_gprs then sets x0=code, x1=0, x2=0).
+            // Also detect the pre-retry stale case: x1==buf_ptr && x2==FRAMED_MAX.
+            let is_exported_error = ret.ret1 == 0 && ret.ret2 == 0 && (1..=9).contains(&ret.ret0);
+            let is_stale_blocking = ret.ret1 == args[1] && ret.ret2 == args[2] && (1..=9).contains(&ret.ret0);
+            if is_exported_error || is_stale_blocking {
+                let err = decode_syscall_error(ret.ret0);
+                return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
+            }
         }
         let len = ret.ret1;
         // Must have at least the 2-byte opcode prefix.
@@ -270,31 +277,21 @@ pub mod syscall {
         // Extract application-level opcode from the first 2 bytes of the frame.
         let opcode = u16::from_le_bytes([payload[0], payload[1]]);
         let data_len = len - 2;
-        let transfer_cap = if (ret.ret2 as u64) == SYSCALL_NO_TRANSFER_CAP {
-            None
-        } else {
-            Some(ret.ret2 as u64)
-        };
-        crate::user_log!(
-            "USER_RT_RECV_DECODED opcode={} data_len={} reply_cap={}",
-            opcode,
-            data_len,
-            transfer_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP)
-        );
-        crate::user_log!(
-            "USER_RT_RECV_DECODE status={} len={} reply_cap={} ok={}",
-            ret.ret0,
-            len,
-            transfer_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
-            true
-        );
-        let msg = Message::with_header(ret.ret0 as u64, opcode, 0, None, &payload[2..len])
-            .map_err(|_| SyscallError::InvalidArgs)?;
         let reply_cap = if ret.ret2 == SYSCALL_NO_TRANSFER_CAP as usize {
             None
         } else {
             Some(ret.ret2 as u32)
         };
+        crate::user_log!(
+            "USER_RT_RECV_DECODE_OK status={} len={} opcode={} payload_len={} reply_cap={}",
+            ret.ret0,
+            len,
+            opcode,
+            data_len,
+            reply_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP)
+        );
+        let msg = Message::with_header(ret.ret0 as u64, opcode, 0, None, &payload[2..len])
+            .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some((msg, reply_cap)))
     }
 
