@@ -1356,19 +1356,23 @@ fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<()
 
 fn handle_debug_log(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
-    let len = frame.arg(SYSCALL_ARG_LEN).min(Message::MAX_PAYLOAD);
+    let raw_len = frame.arg(SYSCALL_ARG_LEN);
+    let len = raw_len.min(Message::MAX_PAYLOAD);
+    let tid = kernel.current_tid().unwrap_or(0);
+    crate::yarm_log!("DEBUG_LOG_ENTER tid={} ptr=0x{:x} len={}", tid, user_ptr, raw_len);
     if user_ptr == 0 || len == 0 {
         frame.set_ok(0, 0, 0);
         return Ok(());
     }
-    let tid = kernel.current_tid().unwrap_or(0);
     let payload = match kernel.copy_from_current_user(user_ptr, len) {
         Ok(data) => data,
-        Err(_) => {
+        Err(e) => {
+            crate::yarm_log!("DEBUG_LOG_COPY_FAIL tid={} err={:?}", tid, e);
             frame.set_ok(0, 0, 0);
             return Ok(());
         }
     };
+    crate::yarm_log!("DEBUG_LOG_COPY_OK tid={} len={}", tid, len);
     let msg_str = core::str::from_utf8(&payload[..len]).unwrap_or("<utf8_err>");
     crate::yarm_log!("USER_LOG tid={} msg={}", tid, msg_str);
     frame.set_ok(0, 0, 0);
