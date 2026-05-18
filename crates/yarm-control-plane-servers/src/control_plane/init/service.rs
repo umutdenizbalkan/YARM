@@ -268,6 +268,7 @@ pub fn run() {
         yarm_user_rt::user_log!("INIT_NO_PM_CAPS");
         return;
     };
+    yarm_user_rt::user_log!("INIT_PM_CAPS send={} reply={}", pm_send, pm_recv);
     let args = yarm_ipc_abi::process_abi::SpawnV2Args::new(0, 1);
     let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
         0,

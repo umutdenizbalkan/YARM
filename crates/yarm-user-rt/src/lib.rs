@@ -625,10 +625,23 @@ pub mod runtime {
                 slots[index] = unsafe { core::ptr::read(src.add(index)) };
                 index += 1;
             }
+            // Slots 0-2 are authoritatively provided via registers (x0/x1/x2).
+            // If the slot block left them as zero (e.g. not yet committed to user
+            // virtual memory), restore the register-supplied values so the PM caps
+            // are never silently lost.
+            if slots[0] == 0 {
+                slots[0] = startup_task_id;
+            }
+            if slots[1] == 0 {
+                slots[1] = startup_proc_mgr_request_send_cap;
+            }
+            if slots[2] == 0 {
+                slots[2] = startup_proc_mgr_reply_recv_cap;
+            }
         }
         user_log!(
-            "STARTUP_INSTALL_FINAL slot3={} slot4={} slot5={}",
-            slots[3], slots[4], slots[5]
+            "STARTUP_INSTALL_FINAL task_id={} pm_send={} pm_reply={} slots_len={}",
+            slots[0], slots[1], slots[2], startup_slots_len
         );
         install_startup_arg_slots(slots);
     }
