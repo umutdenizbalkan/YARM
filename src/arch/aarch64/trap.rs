@@ -194,17 +194,17 @@ pub fn handle_trap_entry(
     let task_switched = matches!(event, TrapEvent::Syscall) && entering_tid != exiting_tid;
     let syscall_resume_pc = if matches!(event, TrapEvent::Syscall) {
         let tid = entering_tid.unwrap_or(0);
-        let (syscall_nr, recv_success_same_task) = if let Some(f) = frame.as_ref() {
-            let nr = f.syscall_num();
-            let recv_ok = nr == crate::kernel::syscall::Syscall::IpcRecv as usize && !f.is_error();
-            (nr, recv_ok)
+        let syscall_nr = if let Some(f) = frame.as_ref() {
+            f.syscall_num()
         } else {
-            (0, false)
+            0
         };
-        let final_pc = if recv_success_same_task {
-            raw_vector_return_pc.wrapping_add(4)
+        // AArch64 ELR_EL1 = SVC instruction address; always advance past SVC.
+        let final_pc = raw_vector_return_pc.wrapping_add(4);
+        let reason = if syscall_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR {
+            "debug_log_plus4"
         } else {
-            raw_vector_return_pc
+            "plus4"
         };
         crate::yarm_log!(
             "AARCH64_ELR_POLICY tid={} nr={} raw=0x{:016x} final=0x{:016x} reason={}",
@@ -212,11 +212,7 @@ pub fn handle_trap_entry(
             syscall_nr,
             raw_vector_return_pc as u64,
             final_pc as u64,
-            if recv_success_same_task {
-                "ipc_recv_same_task_success_plus4"
-            } else {
-                "raw_vector_return_pc"
-            }
+            reason
         );
         final_pc
     } else {
