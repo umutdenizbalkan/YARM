@@ -74,6 +74,24 @@ fn restore_arch_thread_state(
         crate::arch::aarch64::syscall_abi::REG_X18_TLS,
         tls.unwrap_or(0),
     );
+    // apply_user_context restores user_gprs[] from the saved context but
+    // does not mirror arg0..arg5 back into user_gprs[REG_X0..REG_X5].
+    // For a freshly created task the saved user_gprs are [0; 32] while
+    // arg0..arg5 hold the startup ABI values.  For a resumed task
+    // capture_user_context already wrote user_gprs[i] into arg_i, so
+    // this assignment is idempotent.
+    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.arg(0));
+    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, frame.arg(1));
+    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, frame.arg(2));
+    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X3, frame.arg(3));
+    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X4, frame.arg(4));
+    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X5, frame.arg(5));
+    crate::yarm_log!(
+        "AARCH64_FIRST_ENTRY_ARGS tid={} x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x} x4=0x{:x} x5=0x{:x}",
+        current_tid,
+        frame.arg(0), frame.arg(1), frame.arg(2),
+        frame.arg(3), frame.arg(4), frame.arg(5)
+    );
     crate::yarm_log!(
         "AARCH64_CONTEXT_RESTORE_FULL tid={} elr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x29=0x{:016x} x30=0x{:016x} ctx_ptr=0x{:x}",
         current_tid,
