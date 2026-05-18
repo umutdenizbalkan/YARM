@@ -225,11 +225,14 @@ pub mod syscall {
     pub unsafe fn ipc_recv_v2(
         ep_cap: u32,
     ) -> core::result::Result<Option<(Message, Option<u32>)>, SyscallError> {
-        let mut payload = [0u8; Message::MAX_PAYLOAD];
+        // Buffer is 2 bytes larger than MAX_PAYLOAD to accommodate the opcode prefix
+        // that ipc_call prepends. The kernel receives [opcode_lo, opcode_hi, ...data].
+        const FRAMED_MAX: usize = 2 + Message::MAX_PAYLOAD;
+        let mut payload = [0u8; FRAMED_MAX];
         let args = [
             ep_cap as usize,
             payload.as_mut_ptr() as usize,
-            Message::MAX_PAYLOAD,
+            FRAMED_MAX,
             0,
             SYSCALL_RECV_MAP_INTENT_DEFAULT,
             SYSCALL_NO_TRANSFER_CAP as usize,
@@ -260,17 +263,22 @@ pub mod syscall {
             return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
         }
         let len = ret.ret1;
-        if len > Message::MAX_PAYLOAD {
+        // Must have at least the 2-byte opcode prefix.
+        if len < 2 || len > FRAMED_MAX {
             return Err(SyscallError::Internal);
         }
+        // Extract application-level opcode from the first 2 bytes of the frame.
+        let opcode = u16::from_le_bytes([payload[0], payload[1]]);
+        let data_len = len - 2;
         let transfer_cap = if (ret.ret2 as u64) == SYSCALL_NO_TRANSFER_CAP {
             None
         } else {
             Some(ret.ret2 as u64)
         };
         crate::user_log!(
-            "USER_RT_RECV_DECODED len={} reply_cap={}",
-            len,
+            "USER_RT_RECV_DECODED opcode={} data_len={} reply_cap={}",
+            opcode,
+            data_len,
             transfer_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP)
         );
         crate::user_log!(
@@ -280,7 +288,7 @@ pub mod syscall {
             transfer_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
             true
         );
-        let msg = Message::with_header(ret.ret0 as u64, 0, 0, None, &payload[..len])
+        let msg = Message::with_header(ret.ret0 as u64, opcode, 0, None, &payload[2..len])
             .map_err(|_| SyscallError::InvalidArgs)?;
         let reply_cap = if ret.ret2 == SYSCALL_NO_TRANSFER_CAP as usize {
             None
@@ -368,10 +376,18 @@ pub mod syscall {
         reply_recv_cap: u32,
         msg: &Message,
     ) -> core::result::Result<(), SyscallError> {
+        // Prepend the 2-byte opcode (LE) before the payload bytes so the receiver
+        // can reconstruct the application-level opcode. The kernel ABI only passes
+        // raw bytes; msg.opcode is not carried in return registers.
+        let payload_len = msg.len as usize;
+        let frame_len = 2 + payload_len;
+        let mut frame = [0u8; 2 + Message::MAX_PAYLOAD];
+        frame[0..2].copy_from_slice(&msg.opcode.to_le_bytes());
+        frame[2..frame_len].copy_from_slice(&msg.payload[..payload_len]);
         let args = [
             ep_cap as usize,
-            msg.payload.as_ptr() as usize,
-            msg.len as usize,
+            frame.as_ptr() as usize,
+            frame_len,
             0,
             0,
             reply_recv_cap as usize,
