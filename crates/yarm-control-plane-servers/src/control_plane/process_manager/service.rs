@@ -1362,12 +1362,14 @@ pub fn run_request_loop_over_runtime_state_with_cnode_resize(
 }
 
 pub fn run() {
+    yarm_user_rt::user_log!("PM_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
     let Some(recv_cap) = ctx.pm_request_recv_cap else {
         loop {
             let _ = yarm_user_rt::syscall::yield_now();
         }
     };
+    yarm_user_rt::user_log!("PM_RECV_LOOP_START recv_cap={}", recv_cap);
     let mut service = ProcessService::new();
     loop {
         // SAFETY: direct syscall wrapper call; PM owns its recv endpoint capability.

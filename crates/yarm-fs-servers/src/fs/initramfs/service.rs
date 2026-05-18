@@ -79,6 +79,7 @@ pub fn run_request_loop(service: &mut InitramfsService) -> Result<InitramfsLoopS
 }
 
 pub fn run() {
+    yarm_user_rt::user_log!("INITRAMFS_SRV_ENTRY");
     let mut svc = InitramfsService::with_backend(InitramfsBackend::new(8192));
     let summary = run_request_loop(&mut svc).expect("initramfs loop");
 

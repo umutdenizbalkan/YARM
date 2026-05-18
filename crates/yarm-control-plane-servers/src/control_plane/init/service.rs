@@ -259,6 +259,7 @@ fn resolve_core_image_plan(
 }
 
 pub fn run() {
+    yarm_user_rt::user_log!("INIT_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
     let (Some(pm_send), Some(pm_recv)) = (
         ctx.process_manager_request_send_cap,
@@ -277,6 +278,7 @@ pub fn run() {
     ) else {
         return;
     };
+    yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_BEGIN");
     // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call.
     let result = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
     if result.is_err() {
