@@ -23,8 +23,10 @@ fn main() {
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_user_entry() -> ! {
-    let _ = yarm_server_runtime::user_rt::syscall::yield_now();
+    yarm_user_rt::user_log!("INITRAMFS_BIN_ENTRY_START");
+    yarm_user_rt::user_log!("INITRAMFS_BIN_BEFORE_RUN");
     run();
+    yarm_user_rt::user_log!("INITRAMFS_BIN_AFTER_RUN");
     loop {
         let _ = yarm_server_runtime::user_rt::syscall::yield_now();
     }

@@ -93,6 +93,13 @@ pub fn handle_trap_entry(
     let _ = kernel.set_current_cpu(cpu);
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
     kernel.handle_trap_event(decode_trap_context(context), frame.as_deref_mut())?;
+    // RISC-V ecall does not advance SEPC automatically; advance by 4 so sret
+    // resumes at the instruction after the ecall instead of re-executing it.
+    if context.scause == EXC_USER_ECALL {
+        if let Some(f) = frame.as_deref_mut() {
+            f.saved_pc = f.saved_pc.wrapping_add(4);
+        }
+    }
     restore_arch_thread_state(kernel, cpu, frame)?;
     Ok(())
 }

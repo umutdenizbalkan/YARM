@@ -1137,6 +1137,7 @@ pub fn run() {
 
 #[cfg(not(test))]
 pub fn run() {
+    yarm_user_rt::user_log!("SUP_RUN_ENTER");
     let startup = startup_context();
     let process_manager_caps = startup.process_manager_caps();
     let runtime_handoff = SupervisorRuntimeHandoff::from_startup_context(startup);
