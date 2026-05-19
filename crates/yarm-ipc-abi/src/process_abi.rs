@@ -21,6 +21,7 @@ pub const PROC_OP_SPAWN_V4: u16 = 7;
 pub const PROC_OP_TASK_RESTART_TOKEN: u16 = 8;
 pub const PROC_OP_REGISTER_SUPERVISED_TASK: u16 = 9;
 pub const PROC_OP_EXECUTE_RESTART: u16 = 10;
+pub const PROC_OP_SPAWN_V5_CAP: u16 = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecuteRestartRequest {
@@ -236,6 +237,82 @@ impl SpawnV4Args {
     pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
         let args = ProcV4Args::decode(payload)?;
         Ok(Self::new(args.arg0, args.arg1, args.arg2, args.arg3))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnV5CapArgs {
+    pub parent_pid: u64,
+    pub image_id: u64,
+    pub service_caps: [u64; 4],
+}
+
+impl SpawnV5CapArgs {
+    pub const ENCODED_LEN: usize = 48;
+
+    pub const fn new(parent_pid: u64, image_id: u64, service_caps: [u64; 4]) -> Self {
+        Self { parent_pid, image_id, service_caps }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[..8].copy_from_slice(&self.parent_pid.to_le_bytes());
+        out[8..16].copy_from_slice(&self.image_id.to_le_bytes());
+        out[16..24].copy_from_slice(&self.service_caps[0].to_le_bytes());
+        out[24..32].copy_from_slice(&self.service_caps[1].to_le_bytes());
+        out[32..40].copy_from_slice(&self.service_caps[2].to_le_bytes());
+        out[40..48].copy_from_slice(&self.service_caps[3].to_le_bytes());
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() != Self::ENCODED_LEN {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&payload[..8]);
+        let parent_pid = u64::from_le_bytes(a);
+        a.copy_from_slice(&payload[8..16]);
+        let image_id = u64::from_le_bytes(a);
+        let mut caps = [0u64; 4];
+        for i in 0..4 {
+            a.copy_from_slice(&payload[16 + i * 8..24 + i * 8]);
+            caps[i] = u64::from_le_bytes(a);
+        }
+        Ok(Self { parent_pid, image_id, service_caps: caps })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnV5CapResult {
+    pub pid: u64,
+    pub service_send_cap: u64,
+}
+
+impl SpawnV5CapResult {
+    pub const ENCODED_LEN: usize = 16;
+
+    pub const fn new(pid: u64, service_send_cap: u64) -> Self {
+        Self { pid, service_send_cap }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[..8].copy_from_slice(&self.pid.to_le_bytes());
+        out[8..16].copy_from_slice(&self.service_send_cap.to_le_bytes());
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() < Self::ENCODED_LEN {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&payload[..8]);
+        let pid = u64::from_le_bytes(a);
+        a.copy_from_slice(&payload[8..16]);
+        let service_send_cap = u64::from_le_bytes(a);
+        Ok(Self { pid, service_send_cap })
     }
 }
 

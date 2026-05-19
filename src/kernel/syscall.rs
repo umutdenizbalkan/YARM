@@ -1226,7 +1226,13 @@ fn handle_spawn_process(
         parent_pid,
         startup_args_count
     );
-    let startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
+    startup_args[12] = 0;
+    startup_args[13] = 0;
+    startup_args[14] = 0;
+    startup_args[15] = 0;
+    startup_args[16] = 0;
     let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
     crate::yarm_log!("KSPAWN_PATH path={}", image_path);
     let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
@@ -1252,6 +1258,22 @@ fn handle_spawn_process(
         SyscallError::from(err)
     })?;
     crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
+
+    let spawner_tid = current_tid(kernel).unwrap_or(0);
+    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
+        Ok((_, send_cap, recv_cap)) => {
+            crate::yarm_log!(
+                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
+                spawner_tid, send_cap.0, recv_cap.0
+            );
+            (send_cap.0, recv_cap.0)
+        }
+        Err(e) => {
+            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
+            (0u64, 0u64)
+        }
+    };
+
     crate::yarm_log!(
         "KSPAWN_BEFORE_SPAWN_TASK tid={} asid={} entry=0x{:x} parent_pid={} args_count={}",
         tid,
@@ -1267,6 +1289,9 @@ fn handle_spawn_process(
             asid: Some(asid),
             class: TaskClass::SystemServer,
             startup_args,
+            spawner_tid,
+            service_recv_cap,
+            extra_send_caps,
         })
         .map_err(|err| {
             crate::yarm_log!(
@@ -1281,7 +1306,7 @@ fn handle_spawn_process(
     frame.set_ok(
         0,
         usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        0,
+        service_send_cap as usize,
     );
     Ok(())
 }
@@ -1315,13 +1340,27 @@ fn copy_spawn_startup_args(
         .checked_mul(core::mem::size_of::<u64>())
         .ok_or(SyscallError::InvalidArgs)?;
     validate_user_region(startup_args_ptr as u64, byte_len as u64)?;
-    let payload = kernel
-        .copy_from_current_user(startup_args_ptr, byte_len)
-        .map_err(SyscallError::from)?;
-    for (idx, chunk) in payload[..byte_len].chunks_exact(core::mem::size_of::<u64>()).enumerate() {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(chunk);
-        out[idx] = u64::from_le_bytes(word);
+    // copy_from_current_user is limited to Message::MAX_PAYLOAD (128 bytes) per call.
+    // Read in chunks so that larger startup_args arrays (e.g. 18 * 8 = 144 bytes) work.
+    let mut slot_idx = 0usize;
+    let mut bytes_remaining = byte_len;
+    let mut ptr = startup_args_ptr;
+    while bytes_remaining > 0 {
+        let chunk_bytes = bytes_remaining.min(crate::kernel::ipc::Message::MAX_PAYLOAD);
+        let payload = kernel
+            .copy_from_current_user(ptr, chunk_bytes)
+            .map_err(SyscallError::from)?;
+        for chunk in payload[..chunk_bytes].chunks_exact(core::mem::size_of::<u64>()) {
+            if slot_idx >= out.len() {
+                break;
+            }
+            let mut word = [0u8; 8];
+            word.copy_from_slice(chunk);
+            out[slot_idx] = u64::from_le_bytes(word);
+            slot_idx += 1;
+        }
+        ptr = ptr.checked_add(chunk_bytes).ok_or(SyscallError::InvalidArgs)?;
+        bytes_remaining -= chunk_bytes;
     }
     Ok(out)
 }
@@ -1738,6 +1777,7 @@ mod tests {
                 asid: Some(asid),
                 class: crate::kernel::task::TaskClass::App,
                 startup_args: crate::kernel::boot::UserImageSpec::DEFAULT_STARTUP_ARGS,
+                ..Default::default()
             })
             .expect("leader");
         state

@@ -12,9 +12,10 @@ use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT,
     PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2,
-    PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2,
-    RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args, TaskRestartTokenReply,
-    TaskRestartTokenRequest, WaitPidV2Args,
+    PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4, PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN,
+    PROC_OP_WAITPID_V2, RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args,
+    SpawnV5CapArgs, SpawnV5CapResult, TaskRestartTokenReply, TaskRestartTokenRequest,
+    WaitPidV2Args,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
@@ -52,6 +53,13 @@ pub struct SpawnV2Request {
     pub image_id: u64,
     pub requested_cnode_slots: Option<usize>,
     pub requested_task_class: Option<TaskClass>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnV5CapRequest {
+    pub parent_pid: ProcessId,
+    pub image_id: u64,
+    pub service_caps: [u64; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +116,7 @@ pub enum ProcessRequest {
     GetPpid { caller_tid: u64 },
     Exit { caller_tid: u64, code: u64 },
     SpawnV2(SpawnV2Request),
+    SpawnV5Cap(SpawnV5CapRequest),
     WaitPidV2(WaitPidV2Request),
     TaskRestartToken { tid: u64 },
     RegisterSupervisedTask { tid: u64, restart_token: u64 },
@@ -156,6 +165,26 @@ impl KernelProcessSpawnBackend {
                 .map_err(|_| ProcessManagerError::TableFull)
         };
         yarm_user_rt::user_log!("PM_HANDLE_SPAWN_V5_RESULT ok={}", result.is_ok() as u8);
+        result
+    }
+
+    fn spawn_with_caps(&self, image_id: u64, parent_pid: u64, service_caps: [u64; 4]) -> Result<(u64, u32), ProcessManagerError> {
+        yarm_user_rt::user_log!(
+            "PM_SPAWN_CAP_BEGIN image_id={} parent_pid={} caps=[{},{},{},{}]",
+            image_id, parent_pid,
+            service_caps[0], service_caps[1], service_caps[2], service_caps[3]
+        );
+        let mut startup_args = [0u64; 18];
+        startup_args[13] = service_caps[0];
+        startup_args[14] = service_caps[1];
+        startup_args[15] = service_caps[2];
+        startup_args[16] = service_caps[3];
+        // SAFETY: Delegates to kernel spawn_process syscall with startup_args.
+        let result = unsafe {
+            yarm_user_rt::syscall::spawn_process_with_startup_caps(image_id, parent_pid, &startup_args)
+                .map_err(|_| ProcessManagerError::TableFull)
+        };
+        yarm_user_rt::user_log!("PM_SPAWN_CAP_RESULT ok={}", result.is_ok() as u8);
         result
     }
 }
@@ -760,6 +789,20 @@ impl ProcessService {
                     requested_task_class: Some(requested_task_class),
                 }))
             }
+            PROC_OP_SPAWN_V5_CAP => {
+                let args = SpawnV5CapArgs::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                yarm_user_rt::user_log!(
+                    "PM_SPAWN_V5_CAP_DECODE image_id={} parent_pid={} cap0={} cap1={}",
+                    args.image_id, args.parent_pid,
+                    args.service_caps[0], args.service_caps[1]
+                );
+                Ok(ProcessRequest::SpawnV5Cap(SpawnV5CapRequest {
+                    parent_pid: ProcessId(args.parent_pid),
+                    image_id: args.image_id,
+                    service_caps: args.service_caps,
+                }))
+            }
             PROC_OP_WAITPID_V2 => {
                 let args = WaitPidV2Args::decode(msg.as_slice())
                     .map_err(|_| ProcessManagerError::Malformed)?;
@@ -960,6 +1003,35 @@ impl ProcessService {
                         encoded.len()
                     );
                     Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &encoded)
+                        .map_err(|_| ProcessManagerError::Malformed)
+                }
+            }
+            ProcessRequest::SpawnV5Cap(req) => {
+                #[cfg(not(test))]
+                {
+                    let backend = KernelProcessSpawnBackend::new();
+                    let (tid, service_send_cap) = backend.spawn_with_caps(
+                        req.image_id,
+                        req.parent_pid.0,
+                        req.service_caps,
+                    )?;
+                    let result = SpawnV5CapResult::new(tid, service_send_cap as u64);
+                    let encoded = result.encode();
+                    yarm_user_rt::user_log!(
+                        "PM_SPAWN_V5_CAP_REPLY tid={} service_send_cap={} len={}",
+                        tid, service_send_cap, encoded.len()
+                    );
+                    Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &encoded)
+                        .map_err(|_| ProcessManagerError::Malformed)
+                }
+                #[cfg(test)]
+                {
+                    let image = synthetic_elf_image(req.image_id);
+                    let info = ElfImageInfo::parse(req.image_id, &image).map_err(map_elf_error)?;
+                    let pid = self.manager.allocate_process(req.parent_pid)?;
+                    self.record_spawn_policy(pid, req.image_id, info.entry, None, None)?;
+                    let result = SpawnV5CapResult::new(pid.0, 0);
+                    Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &result.encode())
                         .map_err(|_| ProcessManagerError::Malformed)
                 }
             }

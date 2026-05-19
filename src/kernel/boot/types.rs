@@ -40,17 +40,13 @@ pub struct UserImageSpec {
     pub asid: Option<Asid>,
     pub class: TaskClass,
     /// Startup entry ABI arguments passed to userspace `_start`.
-    ///
-    /// Slot contract:
-    /// - arg0 => task_id / tid
-    /// - arg1 => process-manager request-send cap
-    /// - arg2 => process-manager reply-recv cap
-    /// - arg3 => supervisor fault receive endpoint cap
-    /// - arg4 => reserved/staged (currently 0)
-    ///
-    /// Additional slots may be populated by launchers for server-specific
-    /// runtime handoff metadata (for example supervisor endpoint caps).
     pub startup_args: [u64; 18],
+    /// TID of the spawning task (0 = no cap delegation needed).
+    pub spawner_tid: u64,
+    /// Recv cap ID in the spawner's cnode to delegate into startup slot 12.
+    pub service_recv_cap: u64,
+    /// Up to 4 send cap IDs in the spawner's cnode to delegate into slots 13-16.
+    pub extra_send_caps: [u64; 4],
 }
 
 impl UserImageSpec {
@@ -65,6 +61,9 @@ impl Default for UserImageSpec {
             asid: None,
             class: TaskClass::App,
             startup_args: Self::DEFAULT_STARTUP_ARGS,
+            spawner_tid: 0,
+            service_recv_cap: 0,
+            extra_send_caps: [0; 4],
         }
     }
 }

@@ -271,6 +271,7 @@ mod tests {
                 asid: Some(asid),
                 class: TaskClass::App,
                 startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+                ..Default::default()
             })
             .expect("leader");
         let tid = state
@@ -309,6 +310,7 @@ mod tests {
                 asid: Some(asid),
                 class: TaskClass::App,
                 startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+                ..Default::default()
             })
             .expect("leader");
         let tid_a = state

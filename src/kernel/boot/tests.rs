@@ -671,6 +671,7 @@ fn spawn_user_task_from_image_registers_asid_and_class() {
             asid: Some(asid),
             class: TaskClass::SystemServer,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("spawn");
     assert_eq!(spawned.tid, 55);
@@ -713,6 +714,7 @@ fn spawn_user_task_from_image_copies_startup_args_into_user_context() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args,
+            ..Default::default()
         })
         .expect("spawn");
     let ctx = state.thread_user_context(77).expect("ctx");
@@ -826,6 +828,7 @@ fn spawn_user_task_from_image_requires_valid_asid() {
             asid: None,
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect_err("missing asid should fail");
     assert_eq!(err, KernelError::UserMemoryFault);
@@ -4122,6 +4125,7 @@ fn spawn_user_thread_inherits_group_and_asid_and_sets_tls() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("parent");
 
@@ -4147,6 +4151,7 @@ fn spawn_user_thread_rejects_misaligned_stack_top() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("parent");
 
@@ -4167,6 +4172,7 @@ fn futex_wait_blocks_current_and_wake_requeues_waiter() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("task1");
     let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
@@ -4206,6 +4212,7 @@ fn futex_wait_and_wake_reject_kernel_space_address() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("task2");
     let kernel_addr = crate::kernel::vm::KERNEL_SPACE_BASE as usize;
@@ -4234,6 +4241,7 @@ fn fork_child_preserves_parent_registers_except_arg0() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("parent");
     let parent_ctx = UserRegisterContext {
@@ -4276,6 +4284,7 @@ fn fork_child_sets_tls_restore_pending_when_tls_present() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("parent");
     state
@@ -4298,6 +4307,7 @@ fn fork_child_starts_with_empty_robust_futex_state() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("parent");
     state
@@ -4320,6 +4330,7 @@ fn fork_child_inherits_brk_bounds() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("parent");
     state
@@ -4340,6 +4351,7 @@ fn fork_child_inherits_parent_endpoint_caps_with_same_rights() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("parent");
     let (_eid, send_root, recv_root) = state.create_endpoint(2).expect("endpoint");
@@ -4389,6 +4401,7 @@ fn fork_child_does_not_inherit_kernel_caps() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("parent");
     let parent_cnode = state.task_cnode(40).expect("parent cnode");
@@ -4418,6 +4431,7 @@ fn spawn_thread_does_not_get_independent_brk_bounds() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("leader");
     state
@@ -4440,6 +4454,7 @@ fn clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion() 
             asid: Some(parent_asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("parent");
 
@@ -4488,6 +4503,7 @@ fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("leader");
     let tid = state
@@ -4628,6 +4644,7 @@ fn join_blocks_until_target_exits_and_detached_threads_reap_on_exit() {
             asid: Some(asid),
             class: TaskClass::App,
             startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
         })
         .expect("leader");
     let joiner = state
