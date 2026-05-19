@@ -531,6 +531,12 @@ impl KernelState {
             return Err(KernelError::UserMemoryFault);
         }
 
+        crate::yarm_log!(
+            "SPAWN_TASK_ENTER tid={} asid={} entry=0x{:x}",
+            spec.tid,
+            asid.0,
+            spec.entry
+        );
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "FIRST_USER_CREATE_BEGIN cpu={} tid={} asid={} entry=0x{:x}",
@@ -541,10 +547,15 @@ impl KernelState {
             );
         }
         self.register_task_with_class(spec.tid, spec.class)?;
+        crate::yarm_log!("SPAWN_TASK_REGISTER_OK tid={}", spec.tid);
         let cnode = self.task_cnode(spec.tid).ok_or(task_missing_with_site(
             "spawn_user_task_from_image/task_cnode",
             cpu.0,
         ))?;
+        crate::yarm_log!(
+            "SPAWN_TASK_CAP_CHECK name=task_cnode cap={} object=cnode result=ok",
+            cnode.0
+        );
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "FIRST_USER_LOOKUP cpu={} tid={} cnode={} status=found",
@@ -572,12 +583,23 @@ impl KernelState {
         let stack_top = match self.allocate_user_stack_with_guard(spec.tid, 64) {
             Ok(top) => top,
             Err(err) => {
+                crate::yarm_log!(
+                    "SPAWN_TASK_STACK_FAIL tid={} asid={} err={:?}",
+                    spec.tid,
+                    asid.0,
+                    err
+                );
                 if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", err);
                 }
                 return Err(err);
             }
         };
+        crate::yarm_log!(
+            "SPAWN_TASK_STACK_OK tid={} stack_top=0x{:x}",
+            spec.tid,
+            stack_top.0
+        );
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation");
             crate::yarm_log!("BOOTSTRAP_STAGE: before entry setup");
@@ -657,6 +679,7 @@ impl KernelState {
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
+        crate::yarm_log!("SPAWN_TASK_CONTEXT_OK tid={}", spec.tid);
         let bootstrap_cpu = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
         // Pin all SystemServer tasks (supervisor, PM, init) to CPU 0 so the
         // scheduler queue on the bootstrap CPU has them in spawn order:

@@ -465,8 +465,16 @@ impl KernelState {
             .checked_mul(crate::kernel::vm::PAGE_SIZE as u64)
             .ok_or(KernelError::WrongObject)?;
         let stride = USER_STACK_STRIDE_BYTES.max(stack_bytes + crate::kernel::vm::PAGE_SIZE as u64);
+        // USER_STACK_TOP_BASE may be small on architectures with a narrow user
+        // VA range (e.g. AArch64 prototype: 1 GB).  Dynamic TIDs (>= 10000) can
+        // exceed the available slots if we multiply directly, causing checked_sub
+        // to return None.  Wrap tid into the available slot count instead; the
+        // per-address-space overlap check below catches any actual VA conflicts
+        // within the same process.
+        let max_slots = (USER_STACK_TOP_BASE / stride).max(1);
+        let slot = tid % max_slots;
         let top = USER_STACK_TOP_BASE
-            .checked_sub(tid.saturating_mul(stride))
+            .checked_sub(slot.saturating_mul(stride))
             .ok_or(KernelError::WrongObject)?;
         let base = top
             .checked_sub(stack_bytes)
