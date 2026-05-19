@@ -354,20 +354,26 @@ yarm_aarch64_vector_dispatch:
     ldp q26, q27, [sp, #704]
     ldp q28, q29, [sp, #736]
     ldp q30, q31, [sp, #768]
+    // Set all system registers before any debug marker calls.
     ldr x9, [sp, #248]
     msr sp_el0, x9
-    ldr x0, [sp, #256]
-    bl yarm_aarch64_return_to_user_elr_marker
     ldr x9, [sp, #256]
     msr elr_el1, x9
+    ldr x9, [sp, #264]
+    msr spsr_el1, x9
+    // All debug marker calls happen here, before any user GPR is restored.
+    // Every bl clobbers x0..x18 and x30 (caller-saved per AAPCS), but the
+    // vector frame memory at [sp+0..sp+247] is not touched by callees since
+    // they allocate their own frames below sp.
+    ldr x0, [sp, #256]
+    bl yarm_aarch64_return_to_user_elr_marker
     mrs x0, elr_el1
     bl yarm_aarch64_write_return_elr_marker
     mrs x0, elr_el1
     bl yarm_aarch64_final_elr_reg_marker
-    ldr x9, [sp, #264]
-    msr spsr_el1, x9
     ldr x0, [sp, #0]
     bl yarm_aarch64_return_to_user_x0_marker
+    // Restore user GPRs.  No function calls after this point.
     ldr x30, [sp, #240]
     ldp x28, x29, [sp, #224]
     ldp x26, x27, [sp, #208]
