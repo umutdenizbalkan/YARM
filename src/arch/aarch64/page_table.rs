@@ -220,7 +220,24 @@ fn current_ttbr0_root_phys() -> u64 {
     unsafe {
         core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nostack, preserves_flags));
     }
-    ttbr0 & PAGE_MASK
+    // TTBR0_EL1 layout (4KB granule, 48-bit PA):
+    //   [63:48] ASID (when TCR_EL1.AS=1) or reserved
+    //   [47:1]  base address of the translation table (BADDR)
+    //   [0]     CnP
+    // PAGE_MASK only clears [11:0], leaving ASID bits in [63:48] in place,
+    // which corrupts any pointer derived from the result.  Use PTE_ADDR_MASK
+    // (0x0000_ffff_ffff_f000) which strips both the CnP/offset low bits and
+    // the ASID high bits.
+    let base = ttbr0 & PTE_ADDR_MASK;
+    let asid = (ttbr0 >> 48) & 0xffff;
+    crate::yarm_log!(
+        "AARCH64_TTBR0_DECODE raw=0x{:016x} base=0x{:016x} asid={}",
+        ttbr0,
+        base,
+        asid
+    );
+    debug_assert_eq!(base & !PTE_ADDR_MASK, 0, "TTBR0 base has unexpected bits");
+    base
 }
 
 #[cfg(any(feature = "hosted-dev", test, not(target_arch = "aarch64")))]
