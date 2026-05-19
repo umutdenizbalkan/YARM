@@ -4,7 +4,7 @@
 set -euo pipefail
 source "$(dirname "$0")/qemu-smoke-common.sh"
 
-KERNEL_IMAGE=${KERNEL_IMAGE:-build-aarch64/yarm-aarch64.elf}
+KERNEL_IMAGE=${KERNEL_IMAGE:-build-aarch64/yarm-aarch64.bin}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build-aarch64/initramfs-core.cpio}
 TIMEOUT_SECS=${TIMEOUT_SECS:-30}
 QEMU_SMOKE_STRICT=${QEMU_SMOKE_STRICT:-0}

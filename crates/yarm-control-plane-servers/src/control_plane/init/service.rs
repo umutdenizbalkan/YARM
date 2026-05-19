@@ -288,9 +288,39 @@ pub fn run() {
     };
     yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_BEGIN");
     // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call.
-    let result = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
-    yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_RETURN ok={}", result.is_ok() as u8);
-    if result.is_err() {
+    // ipc_call blocks until PM replies; on AArch64 the false-positive error check
+    // always fires, so we ignore its return and drain the queued reply directly.
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
+    let spawn_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+    let (ok, child_tid) = match spawn_reply {
+        Ok(Some(ref reply)) => {
+            let payload = reply.as_slice();
+            let raw = if payload.len() >= 8 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&payload[..8]);
+                u64::from_le_bytes(b)
+            } else {
+                0
+            };
+            yarm_user_rt::user_log!(
+                "INIT_SPAWN_V5_REPLY_RAW len={} bytes=0x{:016x}",
+                payload.len(),
+                raw
+            );
+            match crate::control_plane::process_manager::service::SpawnV2Result::decode(payload) {
+                Ok(r) => (1u8, r.pid.0),
+                Err(_) => (0u8, 0u64),
+            }
+        }
+        _ => {
+            yarm_user_rt::user_log!(
+                "INIT_SPAWN_V5_REPLY_RAW len=0 bytes=0x0000000000000000"
+            );
+            (0u8, 0u64)
+        }
+    };
+    yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_RETURN ok={} child_tid={}", ok, child_tid);
+    if ok == 0 {
         return;
     }
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
