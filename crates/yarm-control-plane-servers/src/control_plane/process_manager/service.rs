@@ -718,6 +718,11 @@ impl ProcessService {
             PROC_OP_SPAWN_V2 => {
                 let args = SpawnV2Args::decode(msg.as_slice())
                     .map_err(|_| ProcessManagerError::Malformed)?;
+                yarm_user_rt::user_log!(
+                    "PM_SPAWN_V5_DECODE image_id={} parent_pid={} startup_caps_version=2",
+                    args.image_id,
+                    args.parent_pid
+                );
                 Ok(ProcessRequest::SpawnV2(SpawnV2Request {
                     parent_pid: ProcessId(args.parent_pid),
                     image_id: args.image_id,
