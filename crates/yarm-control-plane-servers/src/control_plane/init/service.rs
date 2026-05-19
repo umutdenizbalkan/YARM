@@ -269,13 +269,20 @@ pub fn run() {
         return;
     };
     yarm_user_rt::user_log!("INIT_PM_CAPS send={} reply={}", pm_send, pm_recv);
-    let args = yarm_ipc_abi::process_abi::SpawnV2Args::new(0, 1);
+    let args = yarm_ipc_abi::process_abi::SpawnV2Args::new(0, 4);
+    let encoded = args.encode();
+    yarm_user_rt::user_log!(
+        "INIT_SPAWN_V5_BUILD image_id={} parent_pid={} payload_len={}",
+        args.image_id,
+        args.parent_pid,
+        encoded.len()
+    );
     let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
         0,
         yarm_ipc_abi::process_abi::PROC_OP_SPAWN_V2,
         0,
         None,
-        &args.encode(),
+        &encoded,
     ) else {
         return;
     };
