@@ -306,6 +306,7 @@ pub fn run_with_kernel_ipc(
 }
 
 pub fn run() {
+    yarm_user_rt::user_log!("VFS_SRV_ENTRY");
     let mut vfs = FsService::with_backend(InMemoryBackend::new());
     let summary = run_request_loop(&mut vfs, b"/control-plane/vfs-probe").expect("vfs loop");
 
@@ -316,6 +317,21 @@ pub fn run() {
         summary.epoll_fd,
         summary.handled
     );
+
+    yarm_user_rt::user_log!("VFS_SRV_RESIDENT_WAIT_BEGIN");
+    let ctx = yarm_user_rt::runtime::startup_context();
+    if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
+        yarm_user_rt::user_log!("VFS_SRV_RECV_CAP cap={}", recv_cap);
+        loop {
+            // SAFETY: recv_cap is a kernel-provided startup receive endpoint.
+            let _ = unsafe { yarm_user_rt::syscall::ipc_recv(recv_cap) };
+        }
+    } else {
+        yarm_user_rt::user_log!("VFS_SRV_NO_RECV_CAP_RESIDENT_YIELD");
+        loop {
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+    }
 }
 
 #[cfg(test)]
