@@ -1293,6 +1293,7 @@ fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
         2 => Some("sbin/process_manager"),
         3 => Some("sbin/init_server"),
         4 => Some("sbin/initramfs_srv"),
+        5 => Some("sbin/devfs_srv"),
         _ => None,
     }
 }
