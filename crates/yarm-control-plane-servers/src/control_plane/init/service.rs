@@ -323,6 +323,65 @@ pub fn run() {
     if ok == 0 {
         return;
     }
+
+    // --- Spawn devfs (image_id=5) ---
+    let devfs_args = yarm_ipc_abi::process_abi::SpawnV2Args::new(0, 5);
+    let devfs_encoded = devfs_args.encode();
+    yarm_user_rt::user_log!(
+        "INIT_DEVFS_SPAWN_V5_BUILD image_id={} parent_pid={} payload_len={}",
+        devfs_args.image_id,
+        devfs_args.parent_pid,
+        devfs_encoded.len()
+    );
+    let Ok(devfs_msg) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        yarm_ipc_abi::process_abi::PROC_OP_SPAWN_V2,
+        0,
+        None,
+        &devfs_encoded,
+    ) else {
+        return;
+    };
+    yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_V5_CALL_BEGIN");
+    // SAFETY: Same AArch64 blocking-path pattern as initramfs_srv spawn.
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &devfs_msg) };
+    let devfs_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+    let (devfs_ok, devfs_child_tid) = match devfs_reply {
+        Ok(Some(ref reply)) => {
+            let payload = reply.as_slice();
+            let raw = if payload.len() >= 8 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&payload[..8]);
+                u64::from_le_bytes(b)
+            } else {
+                0
+            };
+            yarm_user_rt::user_log!(
+                "INIT_DEVFS_SPAWN_V5_REPLY_RAW len={} bytes=0x{:016x}",
+                payload.len(),
+                raw
+            );
+            match crate::control_plane::process_manager::service::SpawnV2Result::decode(payload) {
+                Ok(r) => (1u8, r.pid.0),
+                Err(_) => (0u8, 0u64),
+            }
+        }
+        _ => {
+            yarm_user_rt::user_log!(
+                "INIT_DEVFS_SPAWN_V5_REPLY_RAW len=0 bytes=0x0000000000000000"
+            );
+            (0u8, 0u64)
+        }
+    };
+    yarm_user_rt::user_log!(
+        "INIT_DEVFS_SPAWN_V5_CALL_RETURN ok={} child_tid={}",
+        devfs_ok,
+        devfs_child_tid
+    );
+    if devfs_ok == 0 {
+        return;
+    }
+
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;
     };
