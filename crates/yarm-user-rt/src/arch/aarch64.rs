@@ -11,27 +11,40 @@ pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
     let mut x3 = args[3];
     let mut x4 = args[4];
     let mut x5 = args[5];
+    let mut r0: usize;
+    let mut r1: usize;
+    let mut r2: usize;
     // SAFETY: Follows kernel aarch64 trap ABI with `svc #0`.
-    // x0..x5 are both inputs (syscall args) and outputs (return values),
-    // so inout is required.  Using lateout while also writing the registers
-    // inside the template is invalid — the compiler may reason about them
-    // as output-only and substitute the pre-svc input value.
+    //
+    // The svc instruction uses x0..x5 as in/out and x8 as the syscall
+    // number.  Immediately after svc, the post-svc register values are
+    // copied into compiler-allocated scratch registers (r0/r1/r2) via
+    // explicit mov instructions inside the same asm block.  This prevents
+    // the compiler from reading x0/x1/x2 directly and substituting a
+    // pre-svc cached value — a hazard that bit all previous approaches
+    // (lateout, inout without moves).
     unsafe {
         core::arch::asm!(
             "svc #0",
-            inout("x0") x0,
-            inout("x1") x1,
-            inout("x2") x2,
-            inout("x3") x3,
-            inout("x4") x4,
-            inout("x5") x5,
+            "mov {r0}, x0",
+            "mov {r1}, x1",
+            "mov {r2}, x2",
+            r0 = lateout(reg) r0,
+            r1 = lateout(reg) r1,
+            r2 = lateout(reg) r2,
+            inout("x0") x0 => _,
+            inout("x1") x1 => _,
+            inout("x2") x2 => _,
+            inout("x3") x3 => _,
+            inout("x4") x4 => _,
+            inout("x5") x5 => _,
             in("x8") no,
         );
     }
     SyscallReturn {
-        ret0: x0,
-        ret1: x1,
-        ret2: x2,
+        ret0: r0,
+        ret1: r1,
+        ret2: r2,
         error: 0,
     }
 }
