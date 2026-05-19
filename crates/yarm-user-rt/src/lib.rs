@@ -246,11 +246,12 @@ pub mod syscall {
         // SAFETY: Uses architecture syscall ABI to enter kernel.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_NR, args) };
         crate::user_log!(
-            "USER_RT_RECV_AFTER_SYSCALL x0={} x1={} x2={} x3={}",
+            "USER_RT_RECV_RAW ret0={} ret1={} ret2={} buf_ptr=0x{:x} buf_len={}",
             ret.ret0,
             ret.ret1,
             ret.ret2,
-            args[3]
+            args[1],
+            args[2]
         );
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
