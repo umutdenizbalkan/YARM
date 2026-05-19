@@ -953,7 +953,13 @@ impl ProcessService {
                     let result = SpawnV2Result {
                         pid: ProcessId(tid),
                     };
-                    Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &result.encode())
+                    let encoded = result.encode();
+                    yarm_user_rt::user_log!(
+                        "PM_SPAWN_V5_REPLY ok=1 child_tid={} len={}",
+                        tid,
+                        encoded.len()
+                    );
+                    Message::with_header(0, PROC_OP_SPAWN_V2, 0, None, &encoded)
                         .map_err(|_| ProcessManagerError::Malformed)
                 }
             }
