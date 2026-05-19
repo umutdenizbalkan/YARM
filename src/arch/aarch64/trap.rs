@@ -53,6 +53,7 @@ fn restore_arch_thread_state(
     kernel: &mut KernelState,
     cpu: CpuId,
     frame: Option<&mut TrapFrame>,
+    syscall_return: bool,
 ) -> Result<(), TrapHandleError> {
     let Some(frame) = frame else {
         return Ok(());
@@ -74,18 +75,23 @@ fn restore_arch_thread_state(
         crate::arch::aarch64::syscall_abi::REG_X18_TLS,
         tls.unwrap_or(0),
     );
-    // apply_user_context restores user_gprs[] from the saved context but
-    // does not mirror arg0..arg5 back into user_gprs[REG_X0..REG_X5].
     // For a freshly created task the saved user_gprs are [0; 32] while
-    // arg0..arg5 hold the startup ABI values.  For a resumed task
-    // capture_user_context already wrote user_gprs[i] into arg_i, so
-    // this assignment is idempotent.
-    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.arg(0));
-    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, frame.arg(1));
-    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, frame.arg(2));
-    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X3, frame.arg(3));
-    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X4, frame.arg(4));
-    frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X5, frame.arg(5));
+    // arg0..arg5 hold the startup ABI values, so we mirror args into user_gprs.
+    // For a resumed task capture_user_context already wrote user_gprs[i] into
+    // arg_i, so the assignment is idempotent.
+    //
+    // Skip the mirror on a direct syscall return (!task_switched && Syscall):
+    // export_syscall_result_to_user_gprs runs immediately after and sets
+    // user_gprs[x0..x2] from the syscall return values.  Mirroring here would
+    // overwrite those correct values with the original syscall input args.
+    if !syscall_return {
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.arg(0));
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, frame.arg(1));
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, frame.arg(2));
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X3, frame.arg(3));
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X4, frame.arg(4));
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X5, frame.arg(5));
+    }
     crate::yarm_log!(
         "AARCH64_FIRST_ENTRY_ARGS tid={} x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x} x4=0x{:x} x5=0x{:x}",
         current_tid,
@@ -304,7 +310,8 @@ pub fn handle_trap_entry(
         crate::yarm_log!("AARCH64_DISPATCH_NEXT_TID tid={}", exiting_tid.unwrap_or(0));
     }
 
-    if let Err(err) = restore_arch_thread_state(kernel, cpu, frame.as_deref_mut()) {
+    let syscall_return = !task_switched && matches!(event, TrapEvent::Syscall);
+    if let Err(err) = restore_arch_thread_state(kernel, cpu, frame.as_deref_mut(), syscall_return) {
         crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT err={:?}", err);
         crate::yarm_log!("AARCH64_TRAP_FAIL_REASON restore_arch_thread_state");
         return Err(err);
@@ -386,6 +393,13 @@ pub fn handle_trap_entry(
             kernel.current_tid().unwrap_or(0),
             actual_elr as u64,
             trapframe.user_gpr(0) as u64
+        );
+        crate::yarm_log!(
+            "AARCH64_FINAL_USER_GPRS tid={} x0={} x1={} x2={}",
+            kernel.current_tid().unwrap_or(0),
+            trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),
+            trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1),
+            trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2),
         );
     }
 
