@@ -389,10 +389,12 @@ pub fn handle_trap_entry(
         }
 
         crate::yarm_log!(
-            "AARCH64_ERET_ACTUAL tid={} elr=0x{:016x} x0=0x{:016x}",
+            "AARCH64_ERET_ACTUAL tid={} elr=0x{:016x} x0={} x1={} x2={}",
             kernel.current_tid().unwrap_or(0),
             actual_elr as u64,
-            trapframe.user_gpr(0) as u64
+            trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),
+            trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1),
+            trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2),
         );
         crate::yarm_log!(
             "AARCH64_FINAL_USER_GPRS tid={} x0={} x1={} x2={}",
