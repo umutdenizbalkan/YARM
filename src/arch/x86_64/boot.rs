@@ -740,6 +740,7 @@ pub fn bootstrap_first_user_task(
             asid: Some(sup_asid),
             class: TaskClass::SystemServer,
             startup_args: sup_args,
+            ..Default::default()
         })?;
         kernel.set_task_brk_bounds(RING3_SUPERVISOR_TID, sup_heap, sup_heap)?;
         crate::yarm_log!("YARM_SUPERVISOR_TID2_SPAWNED tid={}", RING3_SUPERVISOR_TID);
@@ -755,6 +756,7 @@ pub fn bootstrap_first_user_task(
             asid: Some(pm_asid),
             class: TaskClass::SystemServer,
             startup_args: pm_args,
+            ..Default::default()
         })?;
         kernel.set_task_brk_bounds(RING3_PM_SERVER_TID, pm_heap, pm_heap)?;
         crate::yarm_log!("YARM_PM_TID3_SPAWNED tid={}", RING3_PM_SERVER_TID);
@@ -776,6 +778,7 @@ pub fn bootstrap_first_user_task(
         asid: Some(init_asid),
         class: TaskClass::SystemServer,
         startup_args: init_args,
+        ..Default::default()
     }).map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e); e })?;
     crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation");
     kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, init_heap, init_heap)?;

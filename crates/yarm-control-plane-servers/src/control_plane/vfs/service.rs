@@ -320,6 +320,12 @@ pub fn run() {
 
     yarm_user_rt::user_log!("VFS_SRV_RESIDENT_WAIT_BEGIN");
     let ctx = yarm_user_rt::runtime::startup_context();
+    let initramfs_send = ctx.service_extra_cap_0.unwrap_or(0);
+    let devfs_send = ctx.service_extra_cap_1.unwrap_or(0);
+    yarm_user_rt::user_log!(
+        "VFS_ROUTE_INIT initramfs_send={} devfs_send={}",
+        initramfs_send, devfs_send
+    );
     if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
         yarm_user_rt::user_log!("VFS_SRV_RECV_CAP cap={}", recv_cap);
         loop {

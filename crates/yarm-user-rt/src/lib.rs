@@ -422,6 +422,33 @@ pub mod syscall {
     }
 
     #[inline]
+    pub unsafe fn spawn_process_with_startup_caps(
+        image_id: u64,
+        parent_pid: u64,
+        startup_args: &[u64; 18],
+    ) -> core::result::Result<(u64, u32), SyscallError> {
+        let args = [
+            image_id as usize,
+            parent_pid as usize,
+            startup_args.as_ptr() as usize,
+            18usize,
+            0,
+            0,
+        ];
+        // SAFETY: Uses architecture syscall ABI; startup_args lifetime covers the call.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_PROCESS_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok((ret.ret1 as u64, ret.ret2 as u32))
+    }
+
+    #[inline]
     pub unsafe fn ipc_reply(
         reply_cap: u32,
         msg: &Message,
@@ -485,6 +512,8 @@ pub mod runtime {
     pub const STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS: usize = 10;
     pub const STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP: usize = 11;
     pub const STARTUP_SLOT_PROCESS_MANAGER_SERVICE_RECV_EP: usize = 12;
+    pub const STARTUP_SLOT_SERVICE_EXTRA_CAP_0: usize = 13;
+    pub const STARTUP_SLOT_SERVICE_EXTRA_CAP_1: usize = 14;
     pub const STARTUP_SLOT_PM_REQUEST_RECV_CAP: usize = 17;
     const STARTUP_SLOT_COUNT: usize = 18;
 
@@ -543,6 +572,10 @@ pub mod runtime {
         ///
         /// Passed to process_manager (TID 2) so it knows which endpoint to recv on.
         pub process_manager_service_recv_ep: Option<u32>,
+        /// Optional extra service send cap 0 (slot 13).
+        pub service_extra_cap_0: Option<u32>,
+        /// Optional extra service send cap 1 (slot 14).
+        pub service_extra_cap_1: Option<u32>,
         /// Optional process-manager inbound request receive cap (slot 17).
         ///
         /// Passed to the PM server (TID 3) so it knows which endpoint to block on.
@@ -811,6 +844,12 @@ pub mod runtime {
         let process_manager_service_recv_ep = cap_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_SERVICE_RECV_EP].load(Ordering::Relaxed),
         );
+        let service_extra_cap_0 = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_SERVICE_EXTRA_CAP_0].load(Ordering::Relaxed),
+        );
+        let service_extra_cap_1 = cap_from_slot(
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_SERVICE_EXTRA_CAP_1].load(Ordering::Relaxed),
+        );
         let pm_request_recv_cap = cap_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_PM_REQUEST_RECV_CAP].load(Ordering::Relaxed),
         );
@@ -828,6 +867,8 @@ pub mod runtime {
             supervisor_restart_window_ticks,
             process_manager_restart_control_send_cap,
             process_manager_service_recv_ep,
+            service_extra_cap_0,
+            service_extra_cap_1,
             pm_request_recv_cap,
         }
     }

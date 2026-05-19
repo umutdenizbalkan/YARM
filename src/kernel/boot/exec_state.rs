@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::{KernelError, KernelState, SpawnedUserTask, UserImageSpec};
+use crate::kernel::capabilities::{CapId, CapRights};
 use crate::arch::hal::Hal;
 use crate::kernel::frame_allocator::alloc_pt_frame;
 use crate::kernel::scheduler::CpuId;
@@ -520,7 +521,7 @@ impl KernelState {
 
     pub fn spawn_user_task_from_image(
         &mut self,
-        spec: UserImageSpec,
+        mut spec: UserImageSpec,
     ) -> Result<SpawnedUserTask, KernelError> {
         let cpu = self.current_cpu();
         if spec.entry == 0 {
@@ -548,6 +549,42 @@ impl KernelState {
         }
         self.register_task_with_class(spec.tid, spec.class)?;
         crate::yarm_log!("SPAWN_TASK_REGISTER_OK tid={}", spec.tid);
+
+        if spec.spawner_tid != 0 && spec.service_recv_cap != 0 {
+            match self.grant_capability_task_to_task_with_rights(
+                spec.spawner_tid,
+                CapId(spec.service_recv_cap),
+                spec.tid,
+                CapRights::RECEIVE,
+            ) {
+                Ok(local_cap) => {
+                    spec.startup_args[12] = local_cap.0;
+                    crate::yarm_log!("KSPAWN_RECV_CAP_DELEGATED tid={} local_cap={}", spec.tid, local_cap.0);
+                }
+                Err(e) => {
+                    crate::yarm_log!("KSPAWN_RECV_CAP_DELEGATE_FAIL tid={} err={:?}", spec.tid, e);
+                }
+            }
+        }
+        for (i, &raw_cap) in spec.extra_send_caps.iter().enumerate() {
+            if raw_cap != 0 && spec.spawner_tid != 0 {
+                match self.grant_capability_task_to_task_with_rights(
+                    spec.spawner_tid,
+                    CapId(raw_cap),
+                    spec.tid,
+                    CapRights::SEND,
+                ) {
+                    Ok(local_cap) => {
+                        spec.startup_args[13 + i] = local_cap.0;
+                        crate::yarm_log!("KSPAWN_EXTRA_CAP_DELEGATED tid={} slot={} local_cap={}", spec.tid, 13 + i, local_cap.0);
+                    }
+                    Err(e) => {
+                        crate::yarm_log!("KSPAWN_EXTRA_CAP_DELEGATE_FAIL tid={} slot={} err={:?}", spec.tid, 13 + i, e);
+                    }
+                }
+            }
+        }
+
         let cnode = self.task_cnode(spec.tid).ok_or(task_missing_with_site(
             "spawn_user_task_from_image/task_cnode",
             cpu.0,

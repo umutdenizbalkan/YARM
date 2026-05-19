@@ -258,6 +258,39 @@ fn resolve_core_image_plan(
     }
 }
 
+fn spawn_v5_cap(
+    pm_send: u32,
+    pm_recv: u32,
+    image_id: u64,
+    service_caps: [u64; 4],
+) -> Option<(u64, u64)> {
+    use yarm_ipc_abi::process_abi::{PROC_OP_SPAWN_V5_CAP, SpawnV5CapArgs, SpawnV5CapResult};
+    let args = SpawnV5CapArgs::new(0, image_id, service_caps);
+    let encoded = args.encode();
+    let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        PROC_OP_SPAWN_V5_CAP,
+        0,
+        None,
+        &encoded,
+    ) else {
+        return None;
+    };
+    // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call.
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
+    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+    match reply {
+        Ok(Some(ref r)) => {
+            let payload = r.as_slice();
+            match SpawnV5CapResult::decode(payload) {
+                Ok(result) => Some((result.pid, result.service_send_cap)),
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("INIT_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
@@ -269,176 +302,39 @@ pub fn run() {
         return;
     };
     yarm_user_rt::user_log!("INIT_PM_CAPS send={} reply={}", pm_send, pm_recv);
-    let args = yarm_ipc_abi::process_abi::SpawnV2Args::new(0, 4);
-    let encoded = args.encode();
-    yarm_user_rt::user_log!(
-        "INIT_SPAWN_V5_BUILD image_id={} parent_pid={} payload_len={}",
-        args.image_id,
-        args.parent_pid,
-        encoded.len()
-    );
-    let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
-        0,
-        yarm_ipc_abi::process_abi::PROC_OP_SPAWN_V2,
-        0,
-        None,
-        &encoded,
-    ) else {
-        return;
-    };
+
+    // --- Spawn initramfs_srv (image_id=4) ---
     yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_BEGIN");
-    // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call.
-    // ipc_call blocks until PM replies; on AArch64 the false-positive error check
-    // always fires, so we ignore its return and drain the queued reply directly.
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
-    let spawn_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
-    let (ok, child_tid) = match spawn_reply {
-        Ok(Some(ref reply)) => {
-            let payload = reply.as_slice();
-            let raw = if payload.len() >= 8 {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&payload[..8]);
-                u64::from_le_bytes(b)
-            } else {
-                0
-            };
-            yarm_user_rt::user_log!(
-                "INIT_SPAWN_V5_REPLY_RAW len={} bytes=0x{:016x}",
-                payload.len(),
-                raw
-            );
-            match crate::control_plane::process_manager::service::SpawnV2Result::decode(payload) {
-                Ok(r) => (1u8, r.pid.0),
-                Err(_) => (0u8, 0u64),
-            }
-        }
-        _ => {
-            yarm_user_rt::user_log!(
-                "INIT_SPAWN_V5_REPLY_RAW len=0 bytes=0x0000000000000000"
-            );
-            (0u8, 0u64)
-        }
-    };
-    yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_RETURN ok={} child_tid={}", ok, child_tid);
-    if ok == 0 {
+    let Some((child_tid, initramfs_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 4, [0, 0, 0, 0]) else {
+        yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
-    }
+    };
+    yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_RETURN ok=1 child_tid={}", child_tid);
+    yarm_user_rt::user_log!("INIT_INITRAMFS_SPAWN_CAPS recv_cap={}", initramfs_send_cap);
 
-    // --- Spawn devfs (image_id=5) ---
-    let devfs_args = yarm_ipc_abi::process_abi::SpawnV2Args::new(0, 5);
-    let devfs_encoded = devfs_args.encode();
-    yarm_user_rt::user_log!(
-        "INIT_DEVFS_SPAWN_V5_BUILD image_id={} parent_pid={} payload_len={}",
-        devfs_args.image_id,
-        devfs_args.parent_pid,
-        devfs_encoded.len()
-    );
-    let Ok(devfs_msg) = yarm_user_rt::ipc::Message::with_header(
-        0,
-        yarm_ipc_abi::process_abi::PROC_OP_SPAWN_V2,
-        0,
-        None,
-        &devfs_encoded,
-    ) else {
-        return;
-    };
+    // --- Spawn devfs_srv (image_id=5) ---
     yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_V5_CALL_BEGIN");
-    // SAFETY: Same AArch64 blocking-path pattern as initramfs_srv spawn.
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &devfs_msg) };
-    let devfs_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
-    let (devfs_ok, devfs_child_tid) = match devfs_reply {
-        Ok(Some(ref reply)) => {
-            let payload = reply.as_slice();
-            let raw = if payload.len() >= 8 {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&payload[..8]);
-                u64::from_le_bytes(b)
-            } else {
-                0
-            };
-            yarm_user_rt::user_log!(
-                "INIT_DEVFS_SPAWN_V5_REPLY_RAW len={} bytes=0x{:016x}",
-                payload.len(),
-                raw
-            );
-            match crate::control_plane::process_manager::service::SpawnV2Result::decode(payload) {
-                Ok(r) => (1u8, r.pid.0),
-                Err(_) => (0u8, 0u64),
-            }
-        }
-        _ => {
-            yarm_user_rt::user_log!(
-                "INIT_DEVFS_SPAWN_V5_REPLY_RAW len=0 bytes=0x0000000000000000"
-            );
-            (0u8, 0u64)
-        }
-    };
-    yarm_user_rt::user_log!(
-        "INIT_DEVFS_SPAWN_V5_CALL_RETURN ok={} child_tid={}",
-        devfs_ok,
-        devfs_child_tid
-    );
-    if devfs_ok == 0 {
+    let Some((devfs_child_tid, devfs_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 5, [0, 0, 0, 0]) else {
+        yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
-    }
+    };
+    yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_V5_CALL_RETURN ok=1 child_tid={}", devfs_child_tid);
+    yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_CAPS recv_cap={}", devfs_send_cap);
 
-    // --- Spawn vfs_server (image_id=6) ---
-    let vfs_args = yarm_ipc_abi::process_abi::SpawnV2Args::new(0, 6);
-    let vfs_encoded = vfs_args.encode();
-    yarm_user_rt::user_log!(
-        "INIT_VFS_SPAWN_V5_BUILD image_id={} parent_pid={} payload_len={}",
-        vfs_args.image_id,
-        vfs_args.parent_pid,
-        vfs_encoded.len()
-    );
-    let Ok(vfs_msg) = yarm_user_rt::ipc::Message::with_header(
-        0,
-        yarm_ipc_abi::process_abi::PROC_OP_SPAWN_V2,
-        0,
-        None,
-        &vfs_encoded,
-    ) else {
-        return;
-    };
+    // --- Spawn vfs_server (image_id=6) passing initramfs and devfs send caps ---
     yarm_user_rt::user_log!("INIT_VFS_SPAWN_V5_CALL_BEGIN");
-    // SAFETY: Same AArch64 blocking-path pattern as initramfs_srv/devfs_srv spawn.
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &vfs_msg) };
-    let vfs_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
-    let (vfs_ok, vfs_child_tid) = match vfs_reply {
-        Ok(Some(ref reply)) => {
-            let payload = reply.as_slice();
-            let raw = if payload.len() >= 8 {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&payload[..8]);
-                u64::from_le_bytes(b)
-            } else {
-                0
-            };
-            yarm_user_rt::user_log!(
-                "INIT_VFS_SPAWN_V5_REPLY_RAW len={} bytes=0x{:016x}",
-                payload.len(),
-                raw
-            );
-            match crate::control_plane::process_manager::service::SpawnV2Result::decode(payload) {
-                Ok(r) => (1u8, r.pid.0),
-                Err(_) => (0u8, 0u64),
-            }
-        }
-        _ => {
-            yarm_user_rt::user_log!(
-                "INIT_VFS_SPAWN_V5_REPLY_RAW len=0 bytes=0x0000000000000000"
-            );
-            (0u8, 0u64)
-        }
-    };
-    yarm_user_rt::user_log!(
-        "INIT_VFS_SPAWN_V5_CALL_RETURN ok={} child_tid={}",
-        vfs_ok,
-        vfs_child_tid
-    );
-    if vfs_ok == 0 {
+    let Some((vfs_child_tid, vfs_recv_cap)) = spawn_v5_cap(
+        pm_send, pm_recv, 6,
+        [initramfs_send_cap, devfs_send_cap, 0, 0],
+    ) else {
+        yarm_user_rt::user_log!("INIT_VFS_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
-    }
+    };
+    yarm_user_rt::user_log!("INIT_VFS_SPAWN_V5_CALL_RETURN ok=1 child_tid={}", vfs_child_tid);
+    yarm_user_rt::user_log!(
+        "INIT_VFS_SPAWN_CAPS recv_cap={} initramfs_send={} devfs_send={}",
+        vfs_recv_cap, initramfs_send_cap, devfs_send_cap
+    );
 
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;

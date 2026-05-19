@@ -1170,6 +1170,7 @@ pub fn bootstrap_first_user_task(
                 asid: Some(sup_asid),
                 class: TaskClass::SystemServer,
                 startup_args: sup_args,
+                ..Default::default()
             })
             .map_err(|e| {
                 crate::yarm_log!("YARM_FIRST_USER_FAIL step=spawn_supervisor err={:?}", e);
@@ -1194,6 +1195,7 @@ pub fn bootstrap_first_user_task(
                 asid: Some(pm_asid),
                 class: TaskClass::SystemServer,
                 startup_args: pm_args,
+                ..Default::default()
             })
             .map_err(|e| {
                 crate::yarm_log!("YARM_FIRST_USER_FAIL step=spawn_pm err={:?}", e);
@@ -1225,6 +1227,7 @@ pub fn bootstrap_first_user_task(
             asid: Some(init_asid),
             class: TaskClass::SystemServer,
             startup_args: init_args,
+            ..Default::default()
         })
         .map_err(|e| {
             crate::yarm_log!("YARM_FIRST_USER_FAIL step=spawn_init err={:?}", e);
