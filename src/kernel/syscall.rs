@@ -1252,6 +1252,14 @@ fn handle_spawn_process(
         SyscallError::from(err)
     })?;
     crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
+    crate::yarm_log!(
+        "KSPAWN_BEFORE_SPAWN_TASK tid={} asid={} entry=0x{:x} parent_pid={} args_count={}",
+        tid,
+        asid.0,
+        elf.entry,
+        parent_pid,
+        startup_args_count
+    );
     let spawned = kernel
         .spawn_user_task_from_image(UserImageSpec {
             tid,
@@ -1261,7 +1269,12 @@ fn handle_spawn_process(
             startup_args,
         })
         .map_err(|err| {
-            crate::yarm_log!("KSPAWN_FAIL phase=spawn_task err={:?}", err);
+            crate::yarm_log!(
+                "KSPAWN_SPAWN_TASK_FAIL tid={} asid={} err={:?}",
+                tid,
+                asid.0,
+                err
+            );
             SyscallError::from(err)
         })?;
     crate::yarm_log!("KSPAWN_TASK_READY tid={}", spawned.tid);
