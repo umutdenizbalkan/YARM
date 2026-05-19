@@ -382,6 +382,64 @@ pub fn run() {
         return;
     }
 
+    // --- Spawn vfs_server (image_id=6) ---
+    let vfs_args = yarm_ipc_abi::process_abi::SpawnV2Args::new(0, 6);
+    let vfs_encoded = vfs_args.encode();
+    yarm_user_rt::user_log!(
+        "INIT_VFS_SPAWN_V5_BUILD image_id={} parent_pid={} payload_len={}",
+        vfs_args.image_id,
+        vfs_args.parent_pid,
+        vfs_encoded.len()
+    );
+    let Ok(vfs_msg) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        yarm_ipc_abi::process_abi::PROC_OP_SPAWN_V2,
+        0,
+        None,
+        &vfs_encoded,
+    ) else {
+        return;
+    };
+    yarm_user_rt::user_log!("INIT_VFS_SPAWN_V5_CALL_BEGIN");
+    // SAFETY: Same AArch64 blocking-path pattern as initramfs_srv/devfs_srv spawn.
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &vfs_msg) };
+    let vfs_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+    let (vfs_ok, vfs_child_tid) = match vfs_reply {
+        Ok(Some(ref reply)) => {
+            let payload = reply.as_slice();
+            let raw = if payload.len() >= 8 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&payload[..8]);
+                u64::from_le_bytes(b)
+            } else {
+                0
+            };
+            yarm_user_rt::user_log!(
+                "INIT_VFS_SPAWN_V5_REPLY_RAW len={} bytes=0x{:016x}",
+                payload.len(),
+                raw
+            );
+            match crate::control_plane::process_manager::service::SpawnV2Result::decode(payload) {
+                Ok(r) => (1u8, r.pid.0),
+                Err(_) => (0u8, 0u64),
+            }
+        }
+        _ => {
+            yarm_user_rt::user_log!(
+                "INIT_VFS_SPAWN_V5_REPLY_RAW len=0 bytes=0x0000000000000000"
+            );
+            (0u8, 0u64)
+        }
+    };
+    yarm_user_rt::user_log!(
+        "INIT_VFS_SPAWN_V5_CALL_RETURN ok={} child_tid={}",
+        vfs_ok,
+        vfs_child_tid
+    );
+    if vfs_ok == 0 {
+        return;
+    }
+
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;
     };

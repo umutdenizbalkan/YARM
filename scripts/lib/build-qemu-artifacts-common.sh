@@ -240,9 +240,33 @@ common_stage_devfs_server_elf() {
   echo "[ok] staged devfs server ELF as /sbin/devfs_srv"
 }
 
+common_stage_vfs_server_elf() {
+  if [[ ! -f "$VFS_SERVER_ELF" ]]; then
+    echo "[warn] vfs server ELF missing: $VFS_SERVER_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$VFS_SERVER_ELF" "$ROOTFS_DIR/sbin/vfs_server"
+  chmod +x "$ROOTFS_DIR/sbin/vfs_server"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$VFS_SERVER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] vfs server ELF has forbidden RWE PT_LOAD segment: $VFS_SERVER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $VFS_SERVER_ELF"
+  fi
+
+  echo "[ok] staged vfs server ELF as /sbin/vfs_server"
+}
+
 common_verify_initramfs_stage_paths() {
   local missing=0
-  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/process_manager" "sbin/supervisor"; do
+  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/process_manager" "sbin/supervisor"; do
     if [[ ! -f "$ROOTFS_DIR/$path" ]]; then
       echo "[error] expected initramfs path missing: $ROOTFS_DIR/$path"
       missing=1
