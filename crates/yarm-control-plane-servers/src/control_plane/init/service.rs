@@ -342,100 +342,33 @@ pub fn run() {
 
     // --- VFS smoke: one real statx request through the routing stack ---
     {
-        use yarm_ipc_abi::vfs_abi::{StatxInlinePath, VFS_OP_STATX};
-        const SMOKE_PATH: &[u8] = b"/initramfs/boot-marker";
         yarm_user_rt::user_log!("INIT_VFS_SMOKE_BEGIN path=/initramfs/boot-marker");
-        // vfs_recv_cap is actually the SEND cap that reaches vfs_server's recv endpoint.
         let vfs_send = vfs_recv_cap as u32;
-        if let Some((payload_bytes, payload_len)) = (StatxInlinePath {
-            dirfd: 0,
-            flags: 0,
-            mask_or_buf: 0,
-            path: SMOKE_PATH,
-        })
-        .encode()
-        {
-            if let Ok(statx_msg) = yarm_user_rt::ipc::Message::with_header(
-                0,
-                VFS_OP_STATX,
-                0,
-                None,
-                &payload_bytes[..payload_len],
-            ) {
-                yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_BEGIN");
-                // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
-                let _ = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send, pm_recv, &statx_msg) };
-                let reply =
-                    unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
-                match reply {
-                    Ok(Some(ref r)) => {
-                        let payload = r.as_slice();
-                        let status = if payload.len() >= 8 {
-                            let mut b = [0u8; 8];
-                            b.copy_from_slice(&payload[..8]);
-                            u64::from_le_bytes(b)
-                        } else {
-                            0
-                        };
-                        yarm_user_rt::user_log!(
-                            "INIT_VFS_SMOKE_CALL_RETURN ok=1 status={}",
-                            status
-                        );
-                    }
-                    _ => {
-                        yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_RETURN ok=0 status=0");
-                    }
-                }
+        yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_BEGIN");
+        // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
+        match unsafe {
+            yarm_user_rt::vfs_client::vfs_statx(vfs_send, pm_recv, b"/initramfs/boot-marker")
+        } {
+            Ok(status) => {
+                yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_RETURN ok=1 status={}", status)
             }
+            Err(_) => yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_RETURN ok=0 status=0"),
         }
     }
 
     // --- /dev smoke: prove VFS routing to devfs_srv ---
     {
-        use yarm_ipc_abi::vfs_abi::{StatxInlinePath, VFS_OP_STATX};
-        const DEV_SMOKE_PATH: &[u8] = b"/dev/null";
         yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_BEGIN path=/dev/null");
         let vfs_send = vfs_recv_cap as u32;
-        if let Some((payload_bytes, payload_len)) = (StatxInlinePath {
-            dirfd: 0,
-            flags: 0,
-            mask_or_buf: 0,
-            path: DEV_SMOKE_PATH,
-        })
-        .encode()
-        {
-            if let Ok(statx_msg) = yarm_user_rt::ipc::Message::with_header(
-                0,
-                VFS_OP_STATX,
-                0,
-                None,
-                &payload_bytes[..payload_len],
-            ) {
-                yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_BEGIN");
-                // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
-                let _ = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send, pm_recv, &statx_msg) };
-                let reply =
-                    unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
-                match reply {
-                    Ok(Some(ref r)) => {
-                        let payload = r.as_slice();
-                        let status = if payload.len() >= 8 {
-                            let mut b = [0u8; 8];
-                            b.copy_from_slice(&payload[..8]);
-                            u64::from_le_bytes(b)
-                        } else {
-                            0
-                        };
-                        yarm_user_rt::user_log!(
-                            "INIT_VFS_DEV_SMOKE_CALL_RETURN ok=1 status={}",
-                            status
-                        );
-                    }
-                    _ => {
-                        yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_RETURN ok=0 status=0");
-                    }
-                }
+        yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_BEGIN");
+        // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
+        match unsafe {
+            yarm_user_rt::vfs_client::vfs_statx(vfs_send, pm_recv, b"/dev/null")
+        } {
+            Ok(status) => {
+                yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_RETURN ok=1 status={}", status)
             }
+            Err(_) => yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_RETURN ok=0 status=0"),
         }
     }
 
