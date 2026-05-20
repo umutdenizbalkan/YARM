@@ -336,6 +336,8 @@ pub fn run() {
     }
     yarm_user_rt::user_log!("VFS_MOUNT_TABLE_READY entries={}", mount_table.len());
 
+    let mut fd_table = super::fd_table::VfsFdTable::new();
+
     let Some(recv_cap) = ctx.process_manager_service_recv_ep else {
         yarm_user_rt::user_log!("VFS_SRV_NO_RECV_CAP_RESIDENT_YIELD");
         loop {
@@ -361,10 +363,11 @@ pub fn run() {
             msg.opcode, client_reply_cap
         );
 
-        // Route by path prefix using the mount table.
+        // Route by path prefix (STATX/OPENAT) or fd table (READ).
         let route = {
             use yarm_ipc_abi::vfs_abi::{
-                OpenAtInlinePath, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_STATX,
+                OpenAtInlinePath, ReadWriteArgs, StatxInlinePath,
+                VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
             };
             let path: &[u8] = match msg.opcode {
                 VFS_OP_STATX => StatxInlinePath::decode(msg.as_slice())
@@ -375,13 +378,31 @@ pub fn run() {
                     .unwrap_or(b""),
                 _ => b"",
             };
-            let path_str = core::str::from_utf8(path).unwrap_or("?");
-            if let Some((send_cap, target_name)) = mount_table.route(path) {
-                yarm_user_rt::user_log!(
-                    "VFS_ROUTE_LOOKUP path={} target={}",
-                    path_str, target_name
-                );
-                Some((send_cap, target_name))
+            if !path.is_empty() {
+                let path_str = core::str::from_utf8(path).unwrap_or("?");
+                if let Some((send_cap, target_name)) = mount_table.route(path) {
+                    yarm_user_rt::user_log!(
+                        "VFS_ROUTE_LOOKUP path={} target={}",
+                        path_str, target_name
+                    );
+                    Some((send_cap, target_name))
+                } else {
+                    None
+                }
+            } else if msg.opcode == VFS_OP_READ {
+                if let Ok(args) = ReadWriteArgs::decode(msg.as_slice()) {
+                    if let Some((send_cap, target_name)) = fd_table.lookup(args.fd) {
+                        yarm_user_rt::user_log!(
+                            "VFS_ROUTE_FD_LOOKUP fd={} target={}",
+                            args.fd, target_name
+                        );
+                        Some((send_cap, target_name))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -410,6 +431,21 @@ pub fn run() {
 
         match backend_reply {
             Ok(Some(ref response)) => {
+                use yarm_ipc_abi::vfs_abi::VFS_OP_OPENAT;
+                if msg.opcode == VFS_OP_OPENAT {
+                    let payload = response.as_slice();
+                    if payload.len() >= 8 {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&payload[..8]);
+                        let fd = u64::from_le_bytes(b);
+                        if fd_table.insert(fd, backend_send_cap, target_name) {
+                            yarm_user_rt::user_log!(
+                                "VFS_FD_TRACK fd={} backend={}",
+                                fd, backend_send_cap
+                            );
+                        }
+                    }
+                }
                 yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=0");
                 let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, response) };
             }
