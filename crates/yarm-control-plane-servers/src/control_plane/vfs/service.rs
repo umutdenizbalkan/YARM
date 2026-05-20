@@ -326,16 +326,92 @@ pub fn run() {
         "VFS_ROUTE_INIT initramfs_send={} devfs_send={}",
         initramfs_send, devfs_send
     );
-    if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
-        yarm_user_rt::user_log!("VFS_SRV_RECV_CAP cap={}", recv_cap);
-        loop {
-            // SAFETY: recv_cap is a kernel-provided startup receive endpoint.
-            let _ = unsafe { yarm_user_rt::syscall::ipc_recv(recv_cap) };
-        }
-    } else {
+    let Some(recv_cap) = ctx.process_manager_service_recv_ep else {
         yarm_user_rt::user_log!("VFS_SRV_NO_RECV_CAP_RESIDENT_YIELD");
         loop {
             let _ = yarm_user_rt::syscall::yield_now();
+        }
+    };
+    yarm_user_rt::user_log!("VFS_SRV_RECV_CAP cap={}", recv_cap);
+
+    loop {
+        // Receive client request; ipc_recv_v2 strips the 2-byte opcode prefix from
+        // messages sent via ipc_call so we get the correct opcode and reply_cap.
+        let (msg, client_reply_cap) =
+            match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
+                Ok(Some((msg, Some(reply_cap)))) => (msg, reply_cap),
+                _ => {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                    continue;
+                }
+            };
+
+        yarm_user_rt::user_log!(
+            "VFS_RECV_GOT_MSG opcode={} reply_cap={}",
+            msg.opcode, client_reply_cap
+        );
+
+        // Route by path prefix extracted from opcode-specific payload.
+        let route = {
+            use yarm_ipc_abi::vfs_abi::{
+                OpenAtInlinePath, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_STATX,
+            };
+            let path: &[u8] = match msg.opcode {
+                VFS_OP_STATX => StatxInlinePath::decode(msg.as_slice())
+                    .map(|s| s.path)
+                    .unwrap_or(b""),
+                VFS_OP_OPENAT => OpenAtInlinePath::decode(msg.as_slice())
+                    .map(|s| s.path)
+                    .unwrap_or(b""),
+                _ => b"",
+            };
+            if path.starts_with(b"/initramfs/") && initramfs_send != 0 {
+                let path_str = core::str::from_utf8(path).unwrap_or("?");
+                yarm_user_rt::user_log!(
+                    "VFS_ROUTE_LOOKUP path={} target=initramfs",
+                    path_str
+                );
+                Some((initramfs_send, "initramfs"))
+            } else if path.starts_with(b"/dev/") && devfs_send != 0 {
+                let path_str = core::str::from_utf8(path).unwrap_or("?");
+                yarm_user_rt::user_log!("VFS_ROUTE_LOOKUP path={} target=devfs", path_str);
+                Some((devfs_send, "devfs"))
+            } else {
+                None
+            }
+        };
+
+        let Some((backend_send_cap, target_name)) = route else {
+            // No route: reply with error status, keep serving.
+            yarm_user_rt::user_log!("VFS_ROUTE_LOOKUP path=? target=none");
+            let err = yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg");
+            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
+            continue;
+        };
+
+        yarm_user_rt::user_log!(
+            "VFS_ROUTE_FORWARD target={} send_cap={}",
+            target_name, backend_send_cap
+        );
+
+        // Forward request to backend; pass our own recv_cap as the reply endpoint so
+        // the backend's ipc_reply delivers the response back to this endpoint.
+        let _ = unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, recv_cap, &msg) };
+
+        // Wait for backend reply (satisfies phase-6 timed-receive guardrail).
+        let backend_reply =
+            unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(recv_cap, 0) };
+
+        match backend_reply {
+            Ok(Some(ref response)) => {
+                yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=0");
+                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, response) };
+            }
+            _ => {
+                yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=1");
+                let err = yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg");
+                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
+            }
         }
     }
 }

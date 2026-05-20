@@ -99,13 +99,25 @@ pub fn run() {
     // Become a long-lived resident server. Never return from run().
     yarm_user_rt::user_log!("INITRAMFS_SRV_RESIDENT_WAIT_BEGIN");
     let ctx = yarm_user_rt::runtime::startup_context();
-    // Prefer blocking on the PM service receive endpoint if one was wired,
-    // so the scheduler does not need to run us on every tick.
     if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
         yarm_user_rt::user_log!("INITRAMFS_SRV_RECV_CAP cap={}", recv_cap);
         loop {
             // SAFETY: recv_cap is a kernel-provided startup receive endpoint.
-            let _ = unsafe { yarm_user_rt::syscall::ipc_recv(recv_cap) };
+            match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
+                Ok(Some((msg, Some(reply_cap)))) => {
+                    yarm_user_rt::user_log!(
+                        "INITRAMFS_SRV_GOT_MSG opcode={} reply_cap={}",
+                        msg.opcode, reply_cap
+                    );
+                    let response = svc.handle(msg).unwrap_or_else(|_| {
+                        yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg")
+                    });
+                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                }
+                _ => {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                }
+            }
         }
     } else {
         yarm_user_rt::user_log!("INITRAMFS_SRV_NO_RECV_CAP_RESIDENT_YIELD");
