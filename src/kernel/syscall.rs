@@ -1333,10 +1333,18 @@ fn handle_spawn_process(
             SyscallError::from(err)
         })?;
     crate::yarm_log!("KSPAWN_TASK_READY tid={}", spawned.tid);
+    // When parent delegation occurred, pack both the spawner's own send cap (high
+    // 32 bits) and the parent-delegated cap (low 32 bits) into ret2 so the
+    // spawner can use its own copy while forwarding the parent's copy.
+    let packed_ret2 = if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
+        ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
+    } else {
+        caller_send_cap as u64
+    };
     frame.set_ok(
         0,
         usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        caller_send_cap as usize,
+        packed_ret2 as usize,
     );
     Ok(())
 }

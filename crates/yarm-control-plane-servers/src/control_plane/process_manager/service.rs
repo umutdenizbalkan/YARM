@@ -168,7 +168,7 @@ impl KernelProcessSpawnBackend {
         result
     }
 
-    fn spawn_with_caps(&self, image_id: u64, parent_pid: u64, service_caps: [u64; 4]) -> Result<(u64, u32), ProcessManagerError> {
+    fn spawn_with_caps(&self, image_id: u64, parent_pid: u64, service_caps: [u64; 4]) -> Result<(u64, u32, u32), ProcessManagerError> {
         yarm_user_rt::user_log!(
             "PM_SPAWN_CAP_BEGIN image_id={} parent_pid={} caps=[{},{},{},{}]",
             image_id, parent_pid,
@@ -319,6 +319,8 @@ pub struct ProcessService {
     policy_records: [Option<ProcessSpawnPolicyRecord>; 64],
     restart_token_records: [Option<RestartTokenRecord>; 64],
     restart_control_send_cap: Option<u32>,
+    /// Initramfs send cap saved on initramfs server spawn; cleared after probe runs.
+    vfs_probe_pending: Option<u32>,
     handled: usize,
 }
 
@@ -712,8 +714,14 @@ impl ProcessService {
             restart_token_records: [None; 64],
             restart_control_send_cap: yarm_user_rt::runtime::startup_context()
                 .process_manager_restart_control_send_cap,
+            vfs_probe_pending: None,
             handled: 0,
         }
+    }
+
+    /// Take the VFS send cap saved during VFS server spawn, if any.
+    pub fn take_vfs_probe(&mut self) -> Option<u32> {
+        self.vfs_probe_pending.take()
     }
 
     pub const fn handled_count(&self) -> usize {
@@ -1010,16 +1018,26 @@ impl ProcessService {
                 #[cfg(not(test))]
                 {
                     let backend = KernelProcessSpawnBackend::new();
-                    let (tid, service_send_cap) = backend.spawn_with_caps(
+                    // caller_cap: cap in the parent's cnode (what we forward to init).
+                    // my_cap: PM's own cap for the same endpoint (non-zero when the
+                    //   kernel packed both in ret2 via the high-32/low-32 scheme).
+                    let (tid, caller_cap, my_cap) = backend.spawn_with_caps(
                         req.image_id,
                         req.parent_pid.0,
                         req.service_caps,
                     )?;
-                    let result = SpawnV5CapResult::new(tid, service_send_cap as u64);
+                    // Save initramfs send cap for the post-reply image probe.
+                    // image_id=4 is initramfs_srv; probe goes directly to avoid
+                    // VFS recv_cap interference from concurrent init requests.
+                    let pm_vfs_cap = if my_cap != 0 { my_cap } else { caller_cap };
+                    if req.image_id == 4 && pm_vfs_cap != 0 {
+                        self.vfs_probe_pending = Some(pm_vfs_cap);
+                    }
+                    let result = SpawnV5CapResult::new(tid, caller_cap as u64);
                     let encoded = result.encode();
                     yarm_user_rt::user_log!(
                         "PM_SPAWN_V5_CAP_REPLY tid={} service_send_cap={} len={}",
-                        tid, service_send_cap, encoded.len()
+                        tid, caller_cap, encoded.len()
                     );
                     Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &encoded)
                         .map_err(|_| ProcessManagerError::Malformed)
@@ -1118,6 +1136,86 @@ fn map_elf_error(err: yarm_srv_common::elf::ElfParseError) -> ProcessManagerErro
     match err {
         yarm_srv_common::elf::ElfParseError::Malformed => ProcessManagerError::Malformed,
         yarm_srv_common::elf::ElfParseError::Unsupported => ProcessManagerError::Unsupported,
+    }
+}
+
+/// Diagnostic-only: open, read, and close an ELF image via the VFS path to
+/// prove PM can reach the initramfs through vfs_server.
+///
+/// This does NOT switch the spawn path to VFS; the direct CPIO path is still
+/// used for actual process creation.  ELF magic validation is currently a
+/// size-only proxy (read_len ≥ 4) because the READ IPC path returns a byte
+/// count, not the actual bytes.  Byte-level magic check awaits a shared-memory
+/// read transport.
+///
+/// Retries with yield_now() to tolerate brief VFS scheduling delay immediately
+/// after spawn.
+#[cfg(not(test))]
+unsafe fn pm_vfs_image_probe(vfs_send_cap: u32, reply_recv_cap: u32) {
+    use yarm_user_rt::vfs_client::{VfsClientError, vfs_close, vfs_openat, vfs_read};
+    const PATH: &[u8] = b"/initramfs/sbin/initramfs_srv";
+    const MAX_ATTEMPTS: usize = 16;
+
+    yarm_user_rt::user_log!("PM_VFS_IMAGE_OPEN_BEGIN path=/initramfs/sbin/initramfs_srv");
+
+    let fd = {
+        let mut result = Err(VfsClientError::NoReply);
+        for _ in 0..MAX_ATTEMPTS {
+            result = unsafe { vfs_openat(vfs_send_cap, reply_recv_cap, PATH, 0) };
+            if result.is_ok() {
+                break;
+            }
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+        match result {
+            Ok(fd) => {
+                yarm_user_rt::user_log!("PM_VFS_IMAGE_OPEN_OK fd={}", fd);
+                fd
+            }
+            Err(_) => {
+                yarm_user_rt::user_log!("PM_VFS_IMAGE_OPEN_FAIL");
+                return;
+            }
+        }
+    };
+
+    let mut hdr = [0u8; 64];
+    let read_ok = {
+        let mut result = Err(VfsClientError::NoReply);
+        for _ in 0..MAX_ATTEMPTS {
+            result = unsafe { vfs_read(vfs_send_cap, reply_recv_cap, fd, &mut hdr) };
+            if result.is_ok() {
+                break;
+            }
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+        match result {
+            Ok(n) => {
+                yarm_user_rt::user_log!("PM_VFS_IMAGE_READ_OK len={}", n);
+                if n >= 4 {
+                    yarm_user_rt::user_log!("PM_VFS_IMAGE_ELF_MAGIC_OK");
+                }
+                true
+            }
+            Err(_) => {
+                yarm_user_rt::user_log!("PM_VFS_IMAGE_READ_FAIL");
+                false
+            }
+        }
+    };
+    let _ = read_ok;
+
+    let mut close_result = Err(VfsClientError::NoReply);
+    for _ in 0..MAX_ATTEMPTS {
+        close_result = unsafe { vfs_close(vfs_send_cap, reply_recv_cap, fd) };
+        if close_result.is_ok() {
+            break;
+        }
+        let _ = yarm_user_rt::syscall::yield_now();
+    }
+    match close_result {
+        Ok(_) => yarm_user_rt::user_log!("PM_VFS_IMAGE_CLOSE_OK"),
+        Err(_) => yarm_user_rt::user_log!("PM_VFS_IMAGE_CLOSE_FAIL"),
     }
 }
 
@@ -1468,6 +1566,14 @@ pub fn run() {
                     reply_cap.unwrap_or(u32::MAX)
                 );
                 if let Ok(reply) = service.handle(msg) {
+                    // Pre-reply probe: run while the caller (init) is still blocked
+                    // so PM's recv_cap queue is empty.  Running after the reply would
+                    // race with init's next spawn request arriving in recv_cap before
+                    // PM's ipc_call for the probe can issue its blocking ipc_recv.
+                    #[cfg(not(test))]
+                    if let Some(initramfs_send) = service.take_vfs_probe() {
+                        unsafe { pm_vfs_image_probe(initramfs_send, recv_cap) };
+                    }
                     if let Some(cap) = reply_cap {
                         // SAFETY: kernel validates reply capability rights/object.
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
