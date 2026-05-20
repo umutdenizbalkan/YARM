@@ -326,6 +326,16 @@ pub fn run() {
         "VFS_ROUTE_INIT initramfs_send={} devfs_send={}",
         initramfs_send, devfs_send
     );
+
+    let mut mount_table = super::mount_table::VfsMountTable::new();
+    if initramfs_send != 0 {
+        mount_table.register(b"/initramfs/", "initramfs", initramfs_send);
+    }
+    if devfs_send != 0 {
+        mount_table.register(b"/dev/", "devfs", devfs_send);
+    }
+    yarm_user_rt::user_log!("VFS_MOUNT_TABLE_READY entries={}", mount_table.len());
+
     let Some(recv_cap) = ctx.process_manager_service_recv_ep else {
         yarm_user_rt::user_log!("VFS_SRV_NO_RECV_CAP_RESIDENT_YIELD");
         loop {
@@ -351,7 +361,7 @@ pub fn run() {
             msg.opcode, client_reply_cap
         );
 
-        // Route by path prefix extracted from opcode-specific payload.
+        // Route by path prefix using the mount table.
         let route = {
             use yarm_ipc_abi::vfs_abi::{
                 OpenAtInlinePath, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_STATX,
@@ -365,17 +375,13 @@ pub fn run() {
                     .unwrap_or(b""),
                 _ => b"",
             };
-            if path.starts_with(b"/initramfs/") && initramfs_send != 0 {
-                let path_str = core::str::from_utf8(path).unwrap_or("?");
+            let path_str = core::str::from_utf8(path).unwrap_or("?");
+            if let Some((send_cap, target_name)) = mount_table.route(path) {
                 yarm_user_rt::user_log!(
-                    "VFS_ROUTE_LOOKUP path={} target=initramfs",
-                    path_str
+                    "VFS_ROUTE_LOOKUP path={} target={}",
+                    path_str, target_name
                 );
-                Some((initramfs_send, "initramfs"))
-            } else if path.starts_with(b"/dev/") && devfs_send != 0 {
-                let path_str = core::str::from_utf8(path).unwrap_or("?");
-                yarm_user_rt::user_log!("VFS_ROUTE_LOOKUP path={} target=devfs", path_str);
-                Some((devfs_send, "devfs"))
+                Some((send_cap, target_name))
             } else {
                 None
             }
