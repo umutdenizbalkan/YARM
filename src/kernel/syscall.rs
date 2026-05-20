@@ -32,8 +32,11 @@ pub const SYSCALL_VM_ANON_MAP_NR: usize = 13;
 pub const SYSCALL_VM_BRK_NR: usize = 14;
 pub const SYSCALL_DEBUG_LOG_NR: usize = 15;
 pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
-pub const SYSCALL_COUNT: usize = 24;
-const _: [(); SYSCALL_COUNT] = [(); 24];
+pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
+pub const SYSCALL_READ_INITRAMFS_FILE_NR: usize = 25;
+pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
+pub const SYSCALL_COUNT: usize = 27;
+const _: [(); SYSCALL_COUNT] = [(); 27];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -76,10 +79,13 @@ pub enum Syscall {
     VmBrk = SYSCALL_VM_BRK_NR,
     DebugLog = SYSCALL_DEBUG_LOG_NR,
     SpawnProcess = SYSCALL_SPAWN_PROCESS_NR,
+    SpawnProcessFromUserBuf = SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR,
+    ReadInitramfsFile = SYSCALL_READ_INITRAMFS_FILE_NR,
+    SpawnFromInitramfsFile = SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 17;
+    pub const VARIANT_COUNT: usize = 20;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -103,6 +109,9 @@ impl Syscall {
             SYSCALL_VM_BRK_NR => Ok(Self::VmBrk),
             SYSCALL_DEBUG_LOG_NR => Ok(Self::DebugLog),
             SYSCALL_SPAWN_PROCESS_NR => Ok(Self::SpawnProcess),
+            SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR => Ok(Self::SpawnProcessFromUserBuf),
+            SYSCALL_READ_INITRAMFS_FILE_NR => Ok(Self::ReadInitramfsFile),
+            SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR => Ok(Self::SpawnFromInitramfsFile),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -1349,6 +1358,322 @@ fn handle_spawn_process(
     Ok(())
 }
 
+/// Kernel-side staging buffer for ELF images supplied via SpawnProcessFromUserBuf.
+///
+/// Access is serialised in practice: only PM calls this syscall, and only once
+/// during early startup.  A proper per-call allocation would require a kernel
+/// heap; the static buffer avoids that dependency at the cost of exclusivity.
+static mut VFS_ELF_STAGING: [u8; 128 * 1024] = [0u8; 128 * 1024];
+
+fn handle_spawn_process_from_user_buf(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    let image_id = frame.arg(0) as u64;
+    let elf_user_ptr = frame.arg(1);
+    let elf_len = frame.arg(2);
+    let parent_pid = frame.arg(3) as u64;
+    let startup_args_ptr = frame.arg(4);
+    let startup_args_count = frame.arg(5);
+    crate::yarm_log!(
+        "KSPAWN_ENTER image_id={} parent_pid={} args_count={}",
+        image_id,
+        parent_pid,
+        startup_args_count
+    );
+    if elf_len == 0 || elf_len > 128 * 1024 || elf_user_ptr == 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    validate_user_region(elf_user_ptr as u64, elf_len as u64)?;
+    // SAFETY: single-caller invariant (see buffer comment above); raw pointer avoids
+    // the static_mut_refs lint while keeping the same semantics.
+    let staging_ptr = &raw mut VFS_ELF_STAGING;
+    let staging = unsafe { &mut *staging_ptr };
+    kernel
+        .copy_from_current_user_into_slice(elf_user_ptr, elf_len, staging)
+        .map_err(SyscallError::from)?;
+    let elf_bytes = &staging[..elf_len];
+    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
+    crate::yarm_log!("KSPAWN_PATH path={}", image_path);
+    let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
+    crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
+    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
+    startup_args[12] = 0;
+    startup_args[13] = 0;
+    startup_args[14] = 0;
+    startup_args[15] = 0;
+    startup_args[16] = 0;
+    let tid = kernel.allocate_thread_id().map_err(|err| {
+        crate::yarm_log!("KSPAWN_FAIL phase=allocate_tid err={:?}", err);
+        SyscallError::from(err)
+    })?;
+    let (asid, _aspace_cap) = kernel.create_user_address_space().map_err(|err| {
+        crate::yarm_log!("KSPAWN_FAIL phase=create_asid err={:?}", err);
+        SyscallError::from(err)
+    })?;
+    crate::yarm_log!("KSPAWN_ASID_OK tid={} asid={}", tid, asid.0);
+    kernel.load_elf_pt_load_segments(asid, elf_bytes).map_err(|err| {
+        crate::yarm_log!("KSPAWN_FAIL phase=load_elf err={:?}", err);
+        SyscallError::from(err)
+    })?;
+    crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
+    let spawner_tid = current_tid(kernel).unwrap_or(0);
+    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
+        Ok((_, send_cap, recv_cap)) => {
+            crate::yarm_log!(
+                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
+                spawner_tid,
+                send_cap.0,
+                recv_cap.0
+            );
+            (send_cap.0, recv_cap.0)
+        }
+        Err(e) => {
+            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
+            (0u64, 0u64)
+        }
+    };
+    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
+        match kernel.grant_capability_task_to_task_with_rights(
+            spawner_tid,
+            CapId(service_send_cap),
+            parent_pid,
+            CapRights::SEND,
+        ) {
+            Ok(cap) => {
+                crate::yarm_log!(
+                    "KSPAWN_PARENT_SEND_DELEGATED parent_tid={} cap={}",
+                    parent_pid,
+                    cap.0
+                );
+                cap.0
+            }
+            Err(e) => {
+                crate::yarm_log!(
+                    "KSPAWN_PARENT_SEND_DELEGATE_FAIL parent_tid={} err={:?}",
+                    parent_pid,
+                    e
+                );
+                service_send_cap
+            }
+        }
+    } else {
+        service_send_cap
+    };
+    crate::yarm_log!(
+        "KSPAWN_BEFORE_SPAWN_TASK tid={} asid={} entry=0x{:x} parent_pid={} args_count={}",
+        tid,
+        asid.0,
+        elf.entry,
+        parent_pid,
+        startup_args_count
+    );
+    let spawned = kernel
+        .spawn_user_task_from_image(UserImageSpec {
+            tid,
+            entry: elf.entry as usize,
+            asid: Some(asid),
+            class: TaskClass::SystemServer,
+            startup_args,
+            spawner_tid,
+            service_recv_cap,
+            extra_send_caps,
+        })
+        .map_err(|err| {
+            crate::yarm_log!(
+                "KSPAWN_SPAWN_TASK_FAIL tid={} asid={} err={:?}",
+                tid,
+                asid.0,
+                err
+            );
+            SyscallError::from(err)
+        })?;
+    crate::yarm_log!("KSPAWN_TASK_READY tid={}", spawned.tid);
+    let packed_ret2 =
+        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
+            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
+        } else {
+            caller_send_cap as u64
+        };
+    frame.set_ok(
+        0,
+        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
+        packed_ret2 as usize,
+    );
+    Ok(())
+}
+
+/// Spawn a process directly from a named file in the boot initramfs CPIO.
+///
+/// ABI: arg0=image_id, arg1=name_ptr, arg2=name_len, arg3=parent_pid,
+///      arg4=startup_args_ptr, arg5=startup_args_count
+///
+/// Reads the ELF into the kernel-side staging buffer (no user-space buffer),
+/// then spawns exactly like `SpawnProcessFromUserBuf`.
+fn handle_spawn_from_initramfs_file(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    let image_id         = frame.arg(0) as u64;
+    let name_ptr         = frame.arg(1);
+    let name_len         = frame.arg(2);
+    let parent_pid       = frame.arg(3) as u64;
+    let startup_args_ptr = frame.arg(4);
+    let startup_args_count = frame.arg(5);
+
+    if name_len == 0 || name_len > 128 {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    let name_buf = kernel
+        .copy_from_current_user(name_ptr, name_len)
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    let name = core::str::from_utf8(&name_buf[..name_len])
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    let name = name.strip_prefix('/').unwrap_or(name);
+
+    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()
+        .ok_or(SyscallError::InvalidArgs)?;
+    let entry = CpioArchive::new(initrd)
+        .find(name)
+        .map_err(|_| SyscallError::InvalidArgs)?
+        .ok_or(SyscallError::InvalidArgs)?;
+    let data = entry.file_data();
+
+    crate::yarm_log!(
+        "KSPAWN_FROM_CPIO image_id={} name={} file_size={}",
+        image_id,
+        name,
+        data.len()
+    );
+
+    let staging_ptr = &raw mut VFS_ELF_STAGING;
+    let staging = unsafe { &mut *staging_ptr };
+    let elf_len = data.len();
+    if elf_len == 0 || elf_len > staging.len() {
+        return Err(SyscallError::InvalidArgs);
+    }
+    staging[..elf_len].copy_from_slice(data);
+    let elf_bytes = &staging[..elf_len];
+
+    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
+    crate::yarm_log!("KSPAWN_FROM_CPIO path={}", image_path);
+    let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
+    crate::yarm_log!("KSPAWN_FROM_CPIO entry=0x{:x}", elf.entry);
+
+    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
+    startup_args[12] = 0;
+    startup_args[13] = 0;
+    startup_args[14] = 0;
+    startup_args[15] = 0;
+    startup_args[16] = 0;
+
+    let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
+    let (asid, _aspace_cap) = kernel.create_user_address_space().map_err(SyscallError::from)?;
+    crate::yarm_log!("KSPAWN_FROM_CPIO tid={} asid={}", tid, asid.0);
+
+    kernel.load_elf_pt_load_segments(asid, elf_bytes).map_err(SyscallError::from)?;
+
+    let spawner_tid = current_tid(kernel).unwrap_or(0);
+    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
+        Ok((_, send_cap, recv_cap)) => (send_cap.0, recv_cap.0),
+        Err(_) => (0u64, 0u64),
+    };
+    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
+        match kernel.grant_capability_task_to_task_with_rights(
+            spawner_tid,
+            CapId(service_send_cap),
+            parent_pid,
+            CapRights::SEND,
+        ) {
+            Ok(cap) => cap.0,
+            Err(_) => service_send_cap,
+        }
+    } else {
+        service_send_cap
+    };
+
+    let spawned = kernel
+        .spawn_user_task_from_image(UserImageSpec {
+            tid,
+            entry: elf.entry as usize,
+            asid: Some(asid),
+            class: TaskClass::SystemServer,
+            startup_args,
+            spawner_tid,
+            service_recv_cap,
+            extra_send_caps,
+        })
+        .map_err(SyscallError::from)?;
+
+    crate::yarm_log!("KSPAWN_FROM_CPIO spawned_tid={}", spawned.tid);
+
+    let packed_ret2 =
+        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
+            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
+        } else {
+            caller_send_cap as u64
+        };
+    frame.set_ok(
+        0,
+        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
+        packed_ret2 as usize,
+    );
+    Ok(())
+}
+
+fn handle_read_initramfs_file(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    // ABI: arg0=name_ptr, arg1=name_len, arg2=file_offset, arg3=out_ptr, arg4=out_len
+    let name_ptr = frame.arg(0);
+    let name_len = frame.arg(1);
+    let offset   = frame.arg(2);
+    let out_ptr  = frame.arg(3);
+    let out_len  = frame.arg(4);
+
+    if name_len == 0 || name_len > 128 || out_ptr == 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if out_len == 0 {
+        frame.set_ok(0, 0, 0);  // ret0=ok, ret1=0 bytes
+        return Ok(());
+    }
+
+    let name_buf = kernel
+        .copy_from_current_user(name_ptr, name_len)
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    let name = core::str::from_utf8(&name_buf[..name_len])
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    let name = name.strip_prefix('/').unwrap_or(name);
+
+    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()
+        .ok_or(SyscallError::InvalidArgs)?;
+    let entry = CpioArchive::new(initrd)
+        .find(name)
+        .map_err(|_| SyscallError::InvalidArgs)?
+        .ok_or(SyscallError::InvalidArgs)?;
+
+    let data = entry.file_data();
+    if offset >= data.len() {
+        frame.set_ok(0, 0, 0);
+        return Ok(());
+    }
+
+    let available = data.len() - offset;
+    let n = out_len.min(available);
+
+    kernel
+        .copy_to_current_user_from_slice(out_ptr, &data[offset..offset + n])
+        .map_err(|_| SyscallError::PageFault)?;
+
+    frame.set_ok(0, n, 0);
+    Ok(())
+}
+
 fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
     match image_id {
         0 => Some("init"),
@@ -1519,6 +1844,9 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::VmBrk => handle_vm_brk(kernel, frame),
         Syscall::DebugLog => handle_debug_log(kernel, frame),
         Syscall::SpawnProcess => handle_spawn_process(kernel, frame),
+        Syscall::SpawnProcessFromUserBuf => handle_spawn_process_from_user_buf(kernel, frame),
+        Syscall::ReadInitramfsFile => handle_read_initramfs_file(kernel, frame),
+        Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
@@ -1687,7 +2015,7 @@ mod tests {
         assert_eq!(SYSCALL_VM_ANON_MAP_NR, 13);
         assert_eq!(SYSCALL_VM_BRK_NR, 14);
         assert_eq!(SYSCALL_SPAWN_PROCESS_NR, 23);
-        assert_eq!(SYSCALL_COUNT, 24);
+        assert_eq!(SYSCALL_COUNT, 27);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
