@@ -1645,7 +1645,15 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     if kernel_end > kernel_start {
                         reserved[reserved_len] = (kernel_start, kernel_end);
                         reserved_len += 1;
+                        crate::yarm_log!(
+                            "PMEM_RESERVE_KERNEL start=0x{:x} end=0x{:x}",
+                            kernel_start,
+                            kernel_end
+                        );
                     }
+                    // extra_reserved_start marks the first non-kernel range; we store these
+                    // in the Bootstrap statics so init_static() can include them.
+                    let extra_reserved_start = reserved_len;
                     let l1_start = (core::ptr::addr_of!(BOOT_L1_TABLE) as u64) & !(page - 1);
                     let l1_end_raw = (core::ptr::addr_of!(BOOT_L1_TABLE) as u64)
                         .checked_add(core::mem::size_of::<AlignedL1>() as u64);
@@ -1669,9 +1677,15 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     let dtb_start = dtb.as_ptr() as u64;
                     let dtb_end = dtb_start.checked_add(dtb.len() as u64).unwrap_or(dtb_start);
                     if dtb_end > dtb_start {
+                        let dtb_pa_start = dtb_start & !(page - 1);
                         let dtb_reserved_end = align_up_u64(dtb_end, page).unwrap_or(dtb_start);
-                        reserved[reserved_len] = (dtb_start & !(page - 1), dtb_reserved_end);
+                        reserved[reserved_len] = (dtb_pa_start, dtb_reserved_end);
                         reserved_len += 1;
+                        crate::yarm_log!(
+                            "PMEM_RESERVE_DTB start=0x{:x} end=0x{:x}",
+                            dtb_pa_start,
+                            dtb_reserved_end
+                        );
                     }
                     if let (Some(initrd_start), Some(initrd_end)) =
                         (parsed.initrd_start, parsed.initrd_end)
@@ -1686,12 +1700,23 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                             };
                             crate::kernel::boot::Bootstrap::install_boot_initrd_bytes(bytes);
                         }
-                        reserved[reserved_len] = (
-                            initrd_start & !(page - 1),
-                            align_up_u64(initrd_end, page).unwrap_or(initrd_start),
-                        );
+                        let initrd_pa_start = initrd_start & !(page - 1);
+                        let initrd_pa_end =
+                            align_up_u64(initrd_end, page).unwrap_or(initrd_start);
+                        reserved[reserved_len] = (initrd_pa_start, initrd_pa_end);
                         reserved_len += 1;
+                        crate::yarm_log!(
+                            "PMEM_RESERVE_INITRD start=0x{:x} end=0x{:x}",
+                            initrd_pa_start,
+                            initrd_pa_end
+                        );
                     }
+                    // Persist all non-kernel reserved ranges so Bootstrap::init_static()
+                    // (called later from run_with_prepared_kernel) includes them when
+                    // building the main frame allocator's exclusion set.
+                    crate::kernel::boot::Bootstrap::install_boot_extra_reserved_ranges(
+                        &reserved[extra_reserved_start..reserved_len],
+                    );
                     let (alloc_regions, alloc_regions_len) = build_allocator_regions_from_ram(
                         start,
                         len,

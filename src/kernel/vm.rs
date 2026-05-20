@@ -337,6 +337,19 @@ impl AddressSpace {
             return Err(VmError::PrivilegeViolation);
         }
 
+        #[cfg(not(feature = "hosted-dev"))]
+        if self.kind == AddressSpaceKind::User {
+            let pa = mapping.phys.0;
+            let reserved = crate::kernel::frame_allocator::is_pa_reserved(pa).is_some();
+            crate::yarm_log!(
+                "USER_MAP_PA_CHECK asid={} va=0x{:x} pa=0x{:x} reserved={}",
+                self.asid.map(|a| a.0).unwrap_or(0),
+                virt.0,
+                pa,
+                reserved
+            );
+        }
+
         match self.find_entry_index(virt) {
             Ok(i) => {
                 let entry = self.entries[i].as_mut().expect("entry");
