@@ -363,11 +363,11 @@ pub fn run() {
             msg.opcode, client_reply_cap
         );
 
-        // Route by path prefix (STATX/OPENAT) or fd table (READ).
+        // Route by path prefix (STATX/OPENAT) or fd table (READ/CLOSE).
         let route = {
             use yarm_ipc_abi::vfs_abi::{
                 OpenAtInlinePath, ReadWriteArgs, StatxInlinePath,
-                VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
+                VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
             };
             let path: &[u8] = match msg.opcode {
                 VFS_OP_STATX => StatxInlinePath::decode(msg.as_slice())
@@ -389,7 +389,7 @@ pub fn run() {
                 } else {
                     None
                 }
-            } else if msg.opcode == VFS_OP_READ {
+            } else if msg.opcode == VFS_OP_READ || msg.opcode == VFS_OP_CLOSE {
                 if let Ok(args) = ReadWriteArgs::decode(msg.as_slice()) {
                     if let Some((send_cap, target_name)) = fd_table.lookup(args.fd) {
                         yarm_user_rt::user_log!(
@@ -431,7 +431,7 @@ pub fn run() {
 
         match backend_reply {
             Ok(Some(ref response)) => {
-                use yarm_ipc_abi::vfs_abi::VFS_OP_OPENAT;
+                use yarm_ipc_abi::vfs_abi::{ReadWriteArgs, VFS_OP_CLOSE, VFS_OP_OPENAT};
                 if msg.opcode == VFS_OP_OPENAT {
                     let payload = response.as_slice();
                     if payload.len() >= 8 {
@@ -445,6 +445,28 @@ pub fn run() {
                             );
                         }
                     }
+                } else if msg.opcode == VFS_OP_CLOSE {
+                    // Extract status from reply; remove fd from table on success.
+                    let status = {
+                        let payload = response.as_slice();
+                        if payload.len() >= 8 {
+                            let mut b = [0u8; 8];
+                            b.copy_from_slice(&payload[..8]);
+                            u64::from_le_bytes(b)
+                        } else {
+                            1
+                        }
+                    };
+                    let closed_fd = ReadWriteArgs::decode(msg.as_slice())
+                        .map(|a| a.fd)
+                        .unwrap_or(u64::MAX);
+                    if status == 0 {
+                        fd_table.remove(closed_fd);
+                    }
+                    yarm_user_rt::user_log!(
+                        "VFS_FD_CLOSE fd={} target={} status={}",
+                        closed_fd, target_name, status
+                    );
                 }
                 yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=0");
                 let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, response) };
