@@ -372,6 +372,33 @@ pub fn run() {
         }
     }
 
+    // --- VFS open/read smoke ---
+    {
+        yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_BEGIN path=/initramfs/boot-marker");
+        let vfs_send = vfs_recv_cap as u32;
+        let mut read_buf = [0u8; 64];
+        // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
+        match unsafe {
+            yarm_user_rt::vfs_client::vfs_openat(vfs_send, pm_recv, b"/initramfs/boot-marker", 0)
+        } {
+            Ok(fd) => {
+                yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_CALL_RETURN ok=1 fd={}", fd);
+                yarm_user_rt::user_log!("INIT_VFS_READ_SMOKE_BEGIN fd={}", fd);
+                match unsafe {
+                    yarm_user_rt::vfs_client::vfs_read(vfs_send, pm_recv, fd, &mut read_buf)
+                } {
+                    Ok(n) => {
+                        yarm_user_rt::user_log!("INIT_VFS_READ_SMOKE_CALL_RETURN ok=1 len={}", n)
+                    }
+                    Err(_) => {
+                        yarm_user_rt::user_log!("INIT_VFS_READ_SMOKE_CALL_RETURN ok=0 len=0")
+                    }
+                }
+            }
+            Err(_) => yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_CALL_RETURN ok=0 fd=0"),
+        }
+    }
+
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;
     };
