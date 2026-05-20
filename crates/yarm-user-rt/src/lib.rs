@@ -976,6 +976,8 @@ pub mod process {
     }
 }
 
+pub mod vfs_client;
+
 #[cfg(test)]
 mod tests {
     use crate::runtime::{install_startup_arg_slots, startup_context};
