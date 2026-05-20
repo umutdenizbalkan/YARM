@@ -1273,6 +1273,36 @@ fn handle_spawn_process(
             (0u64, 0u64)
         }
     };
+    // If the caller supplied a parent_pid, grant a SEND copy of the new endpoint
+    // into the parent's cnode and return that local cap so the parent can use it
+    // directly without going through the spawner.
+    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
+        match kernel.grant_capability_task_to_task_with_rights(
+            spawner_tid,
+            CapId(service_send_cap),
+            parent_pid,
+            CapRights::SEND,
+        ) {
+            Ok(cap) => {
+                crate::yarm_log!(
+                    "KSPAWN_PARENT_SEND_DELEGATED parent_tid={} cap={}",
+                    parent_pid,
+                    cap.0
+                );
+                cap.0
+            }
+            Err(e) => {
+                crate::yarm_log!(
+                    "KSPAWN_PARENT_SEND_DELEGATE_FAIL parent_tid={} err={:?}",
+                    parent_pid,
+                    e
+                );
+                service_send_cap
+            }
+        }
+    } else {
+        service_send_cap
+    };
 
     crate::yarm_log!(
         "KSPAWN_BEFORE_SPAWN_TASK tid={} asid={} entry=0x{:x} parent_pid={} args_count={}",
@@ -1306,7 +1336,7 @@ fn handle_spawn_process(
     frame.set_ok(
         0,
         usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        service_send_cap as usize,
+        caller_send_cap as usize,
     );
     Ok(())
 }

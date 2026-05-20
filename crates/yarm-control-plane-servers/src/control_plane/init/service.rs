@@ -263,9 +263,10 @@ fn spawn_v5_cap(
     pm_recv: u32,
     image_id: u64,
     service_caps: [u64; 4],
+    parent_pid: u64,
 ) -> Option<(u64, u64)> {
     use yarm_ipc_abi::process_abi::{PROC_OP_SPAWN_V5_CAP, SpawnV5CapArgs, SpawnV5CapResult};
-    let args = SpawnV5CapArgs::new(0, image_id, service_caps);
+    let args = SpawnV5CapArgs::new(parent_pid, image_id, service_caps);
     let encoded = args.encode();
     let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
         0,
@@ -305,7 +306,7 @@ pub fn run() {
 
     // --- Spawn initramfs_srv (image_id=4) ---
     yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_BEGIN");
-    let Some((child_tid, initramfs_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 4, [0, 0, 0, 0]) else {
+    let Some((child_tid, initramfs_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 4, [0, 0, 0, 0], 0) else {
         yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
     };
@@ -314,7 +315,7 @@ pub fn run() {
 
     // --- Spawn devfs_srv (image_id=5) ---
     yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_V5_CALL_BEGIN");
-    let Some((devfs_child_tid, devfs_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 5, [0, 0, 0, 0]) else {
+    let Some((devfs_child_tid, devfs_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 5, [0, 0, 0, 0], 0) else {
         yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
     };
@@ -322,10 +323,13 @@ pub fn run() {
     yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_CAPS recv_cap={}", devfs_send_cap);
 
     // --- Spawn vfs_server (image_id=6) passing initramfs and devfs send caps ---
+    // parent_pid=1 so the kernel delegates the vfs send cap into init's own cnode,
+    // allowing init to send directly to vfs_server without going through PM.
     yarm_user_rt::user_log!("INIT_VFS_SPAWN_V5_CALL_BEGIN");
     let Some((vfs_child_tid, vfs_recv_cap)) = spawn_v5_cap(
         pm_send, pm_recv, 6,
         [initramfs_send_cap, devfs_send_cap, 0, 0],
+        1,
     ) else {
         yarm_user_rt::user_log!("INIT_VFS_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
@@ -335,6 +339,56 @@ pub fn run() {
         "INIT_VFS_SPAWN_CAPS recv_cap={} initramfs_send={} devfs_send={}",
         vfs_recv_cap, initramfs_send_cap, devfs_send_cap
     );
+
+    // --- VFS smoke: one real statx request through the routing stack ---
+    {
+        use yarm_ipc_abi::vfs_abi::{StatxInlinePath, VFS_OP_STATX};
+        const SMOKE_PATH: &[u8] = b"/initramfs/boot-marker";
+        yarm_user_rt::user_log!("INIT_VFS_SMOKE_BEGIN path=/initramfs/boot-marker");
+        // vfs_recv_cap is actually the SEND cap that reaches vfs_server's recv endpoint.
+        let vfs_send = vfs_recv_cap as u32;
+        if let Some((payload_bytes, payload_len)) = (StatxInlinePath {
+            dirfd: 0,
+            flags: 0,
+            mask_or_buf: 0,
+            path: SMOKE_PATH,
+        })
+        .encode()
+        {
+            if let Ok(statx_msg) = yarm_user_rt::ipc::Message::with_header(
+                0,
+                VFS_OP_STATX,
+                0,
+                None,
+                &payload_bytes[..payload_len],
+            ) {
+                yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_BEGIN");
+                // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
+                let _ = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send, pm_recv, &statx_msg) };
+                let reply =
+                    unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+                match reply {
+                    Ok(Some(ref r)) => {
+                        let payload = r.as_slice();
+                        let status = if payload.len() >= 8 {
+                            let mut b = [0u8; 8];
+                            b.copy_from_slice(&payload[..8]);
+                            u64::from_le_bytes(b)
+                        } else {
+                            0
+                        };
+                        yarm_user_rt::user_log!(
+                            "INIT_VFS_SMOKE_CALL_RETURN ok=1 status={}",
+                            status
+                        );
+                    }
+                    _ => {
+                        yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_RETURN ok=0 status=0");
+                    }
+                }
+            }
+        }
+    }
 
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;
