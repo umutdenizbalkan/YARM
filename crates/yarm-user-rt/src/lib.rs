@@ -426,7 +426,7 @@ pub mod syscall {
         image_id: u64,
         parent_pid: u64,
         startup_args: &[u64; 18],
-    ) -> core::result::Result<(u64, u32), SyscallError> {
+    ) -> core::result::Result<(u64, u32, u32), SyscallError> {
         let args = [
             image_id as usize,
             parent_pid as usize,
@@ -445,7 +445,12 @@ pub mod syscall {
         if ret.ret0 != 0 {
             return Err(decode_syscall_error(ret.ret0));
         }
-        Ok((ret.ret1 as u64, ret.ret2 as u32))
+        // ret2 may pack two 32-bit cap IDs: spawner's own cap in the high 32 bits
+        // and the parent-delegated cap in the low 32 bits (set by the kernel when
+        // parent_pid != 0 and delegation occurred).
+        let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
+        let spawner_cap = (ret.ret2 >> 32) as u32;
+        Ok((ret.ret1 as u64, caller_cap, spawner_cap))
     }
 
     #[inline]

@@ -25,6 +25,9 @@ pub const INITRAMFS_SUPERVISOR_PATH: &[u8] = b"/initramfs/supervisor";
 /// Compatibility-only legacy path identifier; prefer `INITRAMFS_POSIX_COMPAT_PATH`.
 pub const INITRAMFS_POSIX_COMPAT_PATH_PTR: u64 = 0x494E_4954_5058_434D;
 pub const INITRAMFS_POSIX_COMPAT_PATH: &[u8] = b"/initramfs/posix_compat";
+/// Compatibility-only legacy path identifier; prefer `INITRAMFS_SRV_PATH`.
+pub const INITRAMFS_SRV_PATH_PTR: u64 = 0x494E_4954_5352_5653;
+pub const INITRAMFS_SRV_PATH: &[u8] = b"/initramfs/sbin/initramfs_srv";
 
 const MAX_INITRAMFS_HANDLES: usize = 16;
 const MAX_INITRAMFS_INODES: usize = 8;
@@ -104,7 +107,10 @@ impl InitramfsBackend {
                     path: INITRAMFS_POSIX_COMPAT_PATH,
                     file_len: 1536,
                 }),
-                None,
+                Some(InitramfsInode {
+                    path: INITRAMFS_SRV_PATH,
+                    file_len: 1536,
+                }),
             ],
             metrics: InitramfsMetrics {
                 open_count: 0,
@@ -136,6 +142,7 @@ impl InitramfsBackend {
                 b"vfs" => INITRAMFS_VFS_PATH,
                 b"sbin/supervisor" => INITRAMFS_SUPERVISOR_PATH,
                 b"posix_compat" => INITRAMFS_POSIX_COMPAT_PATH,
+                b"sbin/initramfs_srv" => INITRAMFS_SRV_PATH,
                 _ => continue,
             };
             if let Some(idx) = backend.lookup_slot(path) {
