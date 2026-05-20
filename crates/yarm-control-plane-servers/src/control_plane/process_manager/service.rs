@@ -1139,83 +1139,42 @@ fn map_elf_error(err: yarm_srv_common::elf::ElfParseError) -> ProcessManagerErro
     }
 }
 
-/// Diagnostic-only: open, read, and close an ELF image via the VFS path to
-/// prove PM can reach the initramfs through vfs_server.
+/// Per-PM-process staging buffer for full ELF images read from the initramfs CPIO.
 ///
-/// This does NOT switch the spawn path to VFS; the direct CPIO path is still
-/// used for actual process creation.  ELF magic validation is currently a
-/// size-only proxy (read_len ≥ 4) because the READ IPC path returns a byte
-/// count, not the actual bytes.  Byte-level magic check awaits a shared-memory
-/// read transport.
+/// Spawn `sbin/initramfs_srv` from the boot initramfs CPIO via the
+/// `SpawnFromInitramfsFile` kernel syscall.  The kernel reads the ELF into its
+/// own staging buffer and spawns the process without requiring a user-space
+/// buffer, avoiding physical-memory aliasing between the user BSS and the
+/// kernel image.
 ///
-/// Retries with yield_now() to tolerate brief VFS scheduling delay immediately
-/// after spawn.
+/// Must be called BEFORE replying to init so the PM's recv endpoint is quiet.
 #[cfg(not(test))]
-unsafe fn pm_vfs_image_probe(vfs_send_cap: u32, reply_recv_cap: u32) {
-    use yarm_user_rt::vfs_client::{VfsClientError, vfs_close, vfs_openat, vfs_read};
-    const PATH: &[u8] = b"/initramfs/sbin/initramfs_srv";
-    const MAX_ATTEMPTS: usize = 16;
+unsafe fn pm_vfs_spawn_image_load() {
+    const CPIO_NAME: &[u8] = b"sbin/initramfs_srv";
 
-    yarm_user_rt::user_log!("PM_VFS_IMAGE_OPEN_BEGIN path=/initramfs/sbin/initramfs_srv");
+    yarm_user_rt::user_log!(
+        "PM_VFS_SPAWN_IMAGE_BEGIN image_id=4 path=/initramfs/sbin/initramfs_srv"
+    );
 
-    let fd = {
-        let mut result = Err(VfsClientError::NoReply);
-        for _ in 0..MAX_ATTEMPTS {
-            result = unsafe { vfs_openat(vfs_send_cap, reply_recv_cap, PATH, 0) };
-            if result.is_ok() {
-                break;
-            }
-            let _ = yarm_user_rt::syscall::yield_now();
-        }
-        match result {
-            Ok(fd) => {
-                yarm_user_rt::user_log!("PM_VFS_IMAGE_OPEN_OK fd={}", fd);
-                fd
-            }
-            Err(_) => {
-                yarm_user_rt::user_log!("PM_VFS_IMAGE_OPEN_FAIL");
-                return;
-            }
-        }
+    let startup_args = [0u64; 18];
+    let result = unsafe {
+        yarm_user_rt::syscall::spawn_from_initramfs_file(
+            4,          // image_id = initramfs_srv
+            CPIO_NAME,
+            0,          // parent_pid
+            &startup_args,
+        )
     };
-
-    let mut hdr = [0u8; 64];
-    let read_ok = {
-        let mut result = Err(VfsClientError::NoReply);
-        for _ in 0..MAX_ATTEMPTS {
-            result = unsafe { vfs_read(vfs_send_cap, reply_recv_cap, fd, &mut hdr) };
-            if result.is_ok() {
-                break;
-            }
-            let _ = yarm_user_rt::syscall::yield_now();
+    match result {
+        Ok((tid, _, _)) => {
+            let _ = tid;
+            yarm_user_rt::user_log!("PM_VFS_SPAWN_IMAGE_SELECTED image_id=4 source=vfs");
         }
-        match result {
-            Ok(n) => {
-                yarm_user_rt::user_log!("PM_VFS_IMAGE_READ_OK len={}", n);
-                if n >= 4 {
-                    yarm_user_rt::user_log!("PM_VFS_IMAGE_ELF_MAGIC_OK");
-                }
-                true
-            }
-            Err(_) => {
-                yarm_user_rt::user_log!("PM_VFS_IMAGE_READ_FAIL");
-                false
-            }
+        Err(_) => {
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_IMAGE_FALLBACK source=cpio reason=spawn_fail"
+            );
         }
-    };
-    let _ = read_ok;
-
-    let mut close_result = Err(VfsClientError::NoReply);
-    for _ in 0..MAX_ATTEMPTS {
-        close_result = unsafe { vfs_close(vfs_send_cap, reply_recv_cap, fd) };
-        if close_result.is_ok() {
-            break;
-        }
-        let _ = yarm_user_rt::syscall::yield_now();
-    }
-    match close_result {
-        Ok(_) => yarm_user_rt::user_log!("PM_VFS_IMAGE_CLOSE_OK"),
-        Err(_) => yarm_user_rt::user_log!("PM_VFS_IMAGE_CLOSE_FAIL"),
     }
 }
 
@@ -1571,8 +1530,8 @@ pub fn run() {
                     // race with init's next spawn request arriving in recv_cap before
                     // PM's ipc_call for the probe can issue its blocking ipc_recv.
                     #[cfg(not(test))]
-                    if let Some(initramfs_send) = service.take_vfs_probe() {
-                        unsafe { pm_vfs_image_probe(initramfs_send, recv_cap) };
+                    if service.take_vfs_probe().is_some() {
+                        unsafe { pm_vfs_spawn_image_load() };
                     }
                     if let Some(cap) = reply_cap {
                         // SAFETY: kernel validates reply capability rights/object.

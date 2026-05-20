@@ -54,6 +54,9 @@ pub mod syscall {
     const SYSCALL_IPC_REPLY_NR: usize = 7;
     const SYSCALL_YIELD_NR: usize = 0;
     pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
+    pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
+    pub const SYSCALL_READ_INITRAMFS_FILE_NR: usize = 25;
+    pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
 
@@ -448,6 +451,109 @@ pub mod syscall {
         // ret2 may pack two 32-bit cap IDs: spawner's own cap in the high 32 bits
         // and the parent-delegated cap in the low 32 bits (set by the kernel when
         // parent_pid != 0 and delegation occurred).
+        let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
+        let spawner_cap = (ret.ret2 >> 32) as u32;
+        Ok((ret.ret1 as u64, caller_cap, spawner_cap))
+    }
+
+    /// Spawn a new process from an ELF image already loaded into a userspace buffer.
+    ///
+    /// The kernel copies the ELF bytes from the caller's address space into an
+    /// internal staging buffer before parsing and loading them, so the caller's
+    /// buffer may be reused immediately after this call returns.
+    ///
+    /// Returns `(child_tid, caller_cap, spawner_cap)` on success.
+    #[inline]
+    pub unsafe fn spawn_process_from_user_buf(
+        image_id: u64,
+        elf_ptr: *const u8,
+        elf_len: usize,
+        parent_pid: u64,
+        startup_args: &[u64; 18],
+    ) -> core::result::Result<(u64, u32, u32), SyscallError> {
+        let args = [
+            image_id as usize,                // arg0 = image_id
+            elf_ptr as usize,                 // arg1 = elf_user_ptr
+            elf_len,                          // arg2 = elf_len
+            parent_pid as usize,             // arg3 = parent_pid
+            startup_args.as_ptr() as usize,  // arg4 = startup_args_ptr
+            startup_args.len(),              // arg5 = startup_args_count
+        ];
+        // SAFETY: Uses architecture syscall ABI; elf_ptr lifetime covers the call.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
+        let spawner_cap = (ret.ret2 >> 32) as u32;
+        Ok((ret.ret1 as u64, caller_cap, spawner_cap))
+    }
+
+    /// Read bytes from a named file inside the boot initramfs CPIO.
+    ///
+    /// `name` is the CPIO entry name (e.g. `b"sbin/initramfs_srv"`).
+    /// `offset` is the byte offset within the file.
+    /// `out_buf` receives the bytes; returns the number of bytes actually copied.
+    /// Returns 0 when `offset >= file_size` (EOF).
+    pub unsafe fn read_initramfs_file(
+        name: &[u8],
+        offset: usize,
+        out_buf: &mut [u8],
+    ) -> core::result::Result<usize, SyscallError> {
+        if name.is_empty() || out_buf.is_empty() {
+            return Ok(0);
+        }
+        let args = [
+            name.as_ptr() as usize,     // arg0 = name_ptr
+            name.len(),                  // arg1 = name_len
+            offset,                      // arg2 = file_offset
+            out_buf.as_mut_ptr() as usize, // arg3 = out_ptr
+            out_buf.len(),               // arg4 = out_len
+            0,
+        ];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_READ_INITRAMFS_FILE_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(ret.ret1)
+    }
+
+    /// Spawn a process directly from a named file inside the boot initramfs CPIO.
+    ///
+    /// The kernel reads the ELF into an internal staging buffer (no user-space
+    /// buffer required) and spawns the process, returning `(tid, caller_cap, spawner_cap)`.
+    pub unsafe fn spawn_from_initramfs_file(
+        image_id: u64,
+        name: &[u8],
+        parent_pid: u64,
+        startup_args: &[u64; 18],
+    ) -> core::result::Result<(u64, u32, u32), SyscallError> {
+        if name.is_empty() {
+            return Err(SyscallError::InvalidArgs);
+        }
+        let args = [
+            image_id as usize,               // arg0 = image_id
+            name.as_ptr() as usize,          // arg1 = name_ptr
+            name.len(),                      // arg2 = name_len
+            parent_pid as usize,             // arg3 = parent_pid
+            startup_args.as_ptr() as usize,  // arg4 = startup_args_ptr
+            startup_args.len(),              // arg5 = startup_args_count
+        ];
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR, args) };
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
         let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
         let spawner_cap = (ret.ret2 >> 32) as u32;
         Ok((ret.ret1 as u64, caller_cap, spawner_cap))
