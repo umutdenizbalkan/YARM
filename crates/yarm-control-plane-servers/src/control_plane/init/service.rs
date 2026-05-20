@@ -394,6 +394,17 @@ pub fn run() {
                         yarm_user_rt::user_log!("INIT_VFS_READ_SMOKE_CALL_RETURN ok=0 len=0")
                     }
                 }
+                yarm_user_rt::user_log!("INIT_VFS_CLOSE_SMOKE_BEGIN fd={}", fd);
+                // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
+                match unsafe { yarm_user_rt::vfs_client::vfs_close(vfs_send, pm_recv, fd) } {
+                    Ok(status) => yarm_user_rt::user_log!(
+                        "INIT_VFS_CLOSE_SMOKE_CALL_RETURN ok=1 status={}",
+                        status
+                    ),
+                    Err(_) => {
+                        yarm_user_rt::user_log!("INIT_VFS_CLOSE_SMOKE_CALL_RETURN ok=0 status=1")
+                    }
+                }
             }
             Err(_) => yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_CALL_RETURN ok=0 fd=0"),
         }

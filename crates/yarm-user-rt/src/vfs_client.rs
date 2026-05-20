@@ -15,7 +15,8 @@
 
 use crate::ipc::Message;
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
+    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VfsV1Args, VFS_OP_CLOSE, VFS_OP_OPENAT,
+    VFS_OP_READ, VFS_OP_STATX,
 };
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -76,6 +77,13 @@ pub fn build_openat_message(path: &[u8], flags: u64) -> Result<Message, VfsClien
 pub fn build_read_message(fd: u64, len: usize) -> Result<Message, VfsClientError> {
     let encoded = ReadWriteArgs::new(fd, 0, len as u64).encode();
     Message::with_header(0, VFS_OP_READ, 0, None, &encoded)
+        .map_err(|_| VfsClientError::MessageFailed)
+}
+
+/// Build a `VFS_OP_CLOSE` [`Message`] for `fd`.
+pub fn build_close_message(fd: u64) -> Result<Message, VfsClientError> {
+    let encoded = VfsV1Args::new(fd, 0, 0, 0).encode();
+    Message::with_header(0, VFS_OP_CLOSE, 0, None, &encoded)
         .map_err(|_| VfsClientError::MessageFailed)
 }
 
@@ -157,6 +165,25 @@ pub unsafe fn vfs_read(
     let _ = unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
     match unsafe { crate::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) } {
         Ok(Some(ref r)) => Ok(decode_reply_u64(r)? as usize),
+        _ => Err(VfsClientError::NoReply),
+    }
+}
+
+/// Send a `VFS_OP_CLOSE` request for `fd` to `vfs_send_cap` and return the
+/// reply status (0 = success).  Uses a zero-tick deadline.
+///
+/// # Safety
+/// Same as [`vfs_statx`].
+pub unsafe fn vfs_close(
+    vfs_send_cap: u32,
+    reply_recv_cap: u32,
+    fd: u64,
+) -> Result<u64, VfsClientError> {
+    let msg = build_close_message(fd)?;
+    // SAFETY: Caller guarantees both caps are valid for this task.
+    let _ = unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+    match unsafe { crate::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) } {
+        Ok(Some(ref r)) => decode_reply_u64(r),
         _ => Err(VfsClientError::NoReply),
     }
 }
@@ -303,6 +330,37 @@ mod tests {
         assert_eq!(msg.as_slice(), &expected);
     }
 
+    // ── build_close_message ──────────────────────────────────────────────────
+
+    #[test]
+    fn build_close_sets_opcode_and_fd() {
+        use yarm_ipc_abi::vfs_abi::{VfsV1Args, VFS_OP_CLOSE};
+        let msg = build_close_message(9).expect("build");
+        assert_eq!(msg.opcode, VFS_OP_CLOSE);
+        let args = VfsV1Args::decode(msg.as_slice()).expect("decode");
+        assert_eq!(args.arg0, 9); // fd
+        assert_eq!(args.arg1, 0);
+        assert_eq!(args.arg2, 0);
+        assert_eq!(args.arg3, 0);
+    }
+
+    #[test]
+    fn build_close_fd_zero_encodes() {
+        use yarm_ipc_abi::vfs_abi::{VfsV1Args, VFS_OP_CLOSE};
+        let msg = build_close_message(0).expect("build");
+        assert_eq!(msg.opcode, VFS_OP_CLOSE);
+        let args = VfsV1Args::decode(msg.as_slice()).expect("decode");
+        assert_eq!(args.arg0, 0);
+    }
+
+    #[test]
+    fn build_close_payload_matches_vfs_v1_args_golden() {
+        use yarm_ipc_abi::vfs_abi::VfsV1Args;
+        let msg = build_close_message(42).expect("build");
+        let expected = VfsV1Args::new(42, 0, 0, 0).encode();
+        assert_eq!(msg.as_slice(), &expected);
+    }
+
     // ── Cross-operation checks ───────────────────────────────────────────────
 
     #[test]
@@ -326,5 +384,21 @@ mod tests {
         assert_ne!(statx.opcode, openat.opcode);
         assert_ne!(statx.opcode, read.opcode);
         assert_ne!(openat.opcode, read.opcode);
+    }
+
+    #[test]
+    fn all_four_opcodes_are_distinct() {
+        use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX};
+        let statx = build_statx_message(b"/x").expect("statx");
+        let openat = build_openat_message(b"/x", 0).expect("openat");
+        let read = build_read_message(3, 64).expect("read");
+        let close = build_close_message(3).expect("close");
+        assert_eq!(statx.opcode, VFS_OP_STATX);
+        assert_eq!(openat.opcode, VFS_OP_OPENAT);
+        assert_eq!(read.opcode, VFS_OP_READ);
+        assert_eq!(close.opcode, VFS_OP_CLOSE);
+        assert_ne!(close.opcode, statx.opcode);
+        assert_ne!(close.opcode, openat.opcode);
+        assert_ne!(close.opcode, read.opcode);
     }
 }
