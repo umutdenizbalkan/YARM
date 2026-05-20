@@ -150,6 +150,18 @@ impl PhysicalFrameAllocator {
         self.free_frames = self.free_frames.saturating_sub(1);
         self.update_hints_after_allocation(idx, old_pages, new_pages);
         self.track_new_frame_ref(alloc_phys)?;
+        #[cfg(not(feature = "hosted-dev"))]
+        if let Some((rs, re)) = GLOBAL_RESERVED_RANGES.lock().find_overlap(alloc_phys) {
+            crate::yarm_log!(
+                "PMEM_ALLOC_RESERVED_BUG pa=0x{:x} range=0x{:x}..0x{:x}",
+                alloc_phys,
+                rs,
+                re
+            );
+            panic!("PMEM_ALLOC_RESERVED_BUG: allocated frame overlaps reserved range");
+        }
+        #[cfg(not(feature = "hosted-dev"))]
+        crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user", alloc_phys);
         Ok(alloc_phys)
     }
 
@@ -497,6 +509,56 @@ impl PhysicalFrameAllocator {
 }
 
 static PT_FRAME_ALLOCATOR: SpinLockIrq<Option<PhysicalFrameAllocator>> = SpinLockIrq::new(None);
+
+const MAX_GLOBAL_RESERVED: usize = 12;
+
+#[derive(Copy, Clone)]
+struct GlobalReservedRanges {
+    starts: [u64; MAX_GLOBAL_RESERVED],
+    ends: [u64; MAX_GLOBAL_RESERVED],
+    count: usize,
+}
+
+impl GlobalReservedRanges {
+    const fn new() -> Self {
+        Self {
+            starts: [0u64; MAX_GLOBAL_RESERVED],
+            ends: [0u64; MAX_GLOBAL_RESERVED],
+            count: 0,
+        }
+    }
+
+    fn add(&mut self, start: u64, end: u64) {
+        if end > start && self.count < MAX_GLOBAL_RESERVED {
+            self.starts[self.count] = start;
+            self.ends[self.count] = end;
+            self.count += 1;
+        }
+    }
+
+    fn find_overlap(&self, pa: u64) -> Option<(u64, u64)> {
+        for i in 0..self.count {
+            if pa >= self.starts[i] && pa < self.ends[i] {
+                return Some((self.starts[i], self.ends[i]));
+            }
+        }
+        None
+    }
+}
+
+static GLOBAL_RESERVED_RANGES: SpinLockIrq<GlobalReservedRanges> =
+    SpinLockIrq::new(GlobalReservedRanges::new());
+
+pub fn register_reserved_range(start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    GLOBAL_RESERVED_RANGES.lock().add(start, end);
+}
+
+pub fn is_pa_reserved(pa: u64) -> Option<(u64, u64)> {
+    GLOBAL_RESERVED_RANGES.lock().find_overlap(pa)
+}
 
 fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
     #[cfg(feature = "hosted-dev")]

@@ -11,8 +11,13 @@ unsafe extern "C" {
 
 static mut BOOTSTRAP_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
     core::mem::MaybeUninit::uninit();
-static BOOT_RESERVED_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static BOOT_RESERVED_END: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const MAX_BOOT_EXTRA_RESERVED: usize = 8;
+static BOOT_EXTRA_RESERVED_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static BOOT_EXTRA_RESERVED_STARTS: [core::sync::atomic::AtomicU64; MAX_BOOT_EXTRA_RESERVED] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_BOOT_EXTRA_RESERVED];
+static BOOT_EXTRA_RESERVED_ENDS: [core::sync::atomic::AtomicU64; MAX_BOOT_EXTRA_RESERVED] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_BOOT_EXTRA_RESERVED];
 static BOOT_INITRD_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static BOOT_INITRD_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -41,17 +46,15 @@ impl Bootstrap {
         (fallback, 1)
     }
 
-    fn default_reserved_ranges() -> [(u64, u64); 2] {
-        let extra = (
-            BOOT_RESERVED_START.load(core::sync::atomic::Ordering::Acquire),
-            BOOT_RESERVED_END.load(core::sync::atomic::Ordering::Acquire),
-        );
+    fn default_reserved_ranges() -> [(u64, u64); 10] {
+        let mut result = [(0u64, 0u64); 10];
+        // slot 0: kernel image range (computed from linker symbols)
         #[cfg(not(feature = "hosted-dev"))]
         {
             let page = crate::kernel::vm::PAGE_SIZE as u64;
-            // The linker places the kernel image at a high VA (see                                                                                                          
-            // KERNEL_LINK_VIRT_BASE). Subtract the link base to recover                                                                                                     
-            // the physical extent the frame allocator needs to mark                                                                                                         
+            // The linker places the kernel image at a high VA (see
+            // KERNEL_LINK_VIRT_BASE). Subtract the link base to recover
+            // the physical extent the frame allocator needs to mark
             // reserved. On targets that link the kernel at PA = VMA
             // (aarch64, riscv64) KERNEL_LINK_VIRT_BASE is 0 and this
             // becomes a no-op subtraction.
@@ -62,26 +65,48 @@ impl Bootstrap {
             let kernel_end_phys = kernel_end_virt.saturating_sub(link_base);
             let kernel_start = kernel_start_phys & !(page - 1);
             let kernel_end = (kernel_end_phys + (page - 1)) & !(page - 1);
-            //return [(kernel_start, kernel_end)];
-            return [(kernel_start, kernel_end), extra];
+            result[0] = (kernel_start, kernel_end);
         }
-
         #[cfg(feature = "hosted-dev")]
         {
             let kernel_start = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE;
             let kernel_end = platform_constants::KERNEL_BOOTSTRAP_PHYS_BASE
                 + crate::kernel::vm::PAGE_SIZE as u64;
-            [(kernel_start, kernel_end), extra]
+            result[0] = (kernel_start, kernel_end);
         }
+        // slots 1..=8: extra boot-reserved ranges (initrd, DTB, page tables, ...)
+        let count = BOOT_EXTRA_RESERVED_COUNT
+            .load(core::sync::atomic::Ordering::Acquire)
+            .min(MAX_BOOT_EXTRA_RESERVED);
+        for i in 0..count {
+            let s = BOOT_EXTRA_RESERVED_STARTS[i].load(core::sync::atomic::Ordering::Acquire);
+            let e = BOOT_EXTRA_RESERVED_ENDS[i].load(core::sync::atomic::Ordering::Acquire);
+            result[1 + i] = (s, e);
+        }
+        result
     }
 
-    pub fn default_reserved_ranges_for_arch_boot() -> [(u64, u64); 2] {
+    pub fn default_reserved_ranges_for_arch_boot() -> [(u64, u64); 10] {
         Self::default_reserved_ranges()
     }
 
     pub fn install_boot_reserved_range(start: u64, end: u64) {
-        BOOT_RESERVED_START.store(start, core::sync::atomic::Ordering::Release);
-        BOOT_RESERVED_END.store(end, core::sync::atomic::Ordering::Release);
+        if end <= start {
+            return;
+        }
+        let idx =
+            BOOT_EXTRA_RESERVED_COUNT.load(core::sync::atomic::Ordering::Acquire);
+        if idx < MAX_BOOT_EXTRA_RESERVED {
+            BOOT_EXTRA_RESERVED_STARTS[idx].store(start, core::sync::atomic::Ordering::Release);
+            BOOT_EXTRA_RESERVED_ENDS[idx].store(end, core::sync::atomic::Ordering::Release);
+            BOOT_EXTRA_RESERVED_COUNT.store(idx + 1, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    pub fn install_boot_extra_reserved_ranges(ranges: &[(u64, u64)]) {
+        for &(start, end) in ranges {
+            Self::install_boot_reserved_range(start, end);
+        }
     }
 
     pub fn install_boot_initrd_bytes(bytes: &'static [u8]) {
@@ -260,6 +285,20 @@ impl Bootstrap {
         boot_regions: &[MemoryRegion],
         reserved_ranges: &[(u64, u64)],
     ) -> Result<&'static mut KernelState, KernelError> {
+        // Register all reserved ranges in the global frame allocator guard and emit
+        // PMEM_RESERVE_* diagnostics so boot logs show the full reserved map.
+        for &(start, end) in reserved_ranges {
+            if end <= start {
+                continue;
+            }
+            crate::kernel::frame_allocator::register_reserved_range(start, end);
+            crate::yarm_log!(
+                "PMEM_RESERVE_RANGE start=0x{:x} end=0x{:x}",
+                start,
+                end
+            );
+        }
+
         let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
         let (sanitized, sanitized_len) = Self::apply_reserved_ranges(boot_regions, reserved_ranges);
         let sanitized = &sanitized[..sanitized_len];
