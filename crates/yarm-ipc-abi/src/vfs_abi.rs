@@ -9,6 +9,7 @@ pub enum VfsCodecError {
 pub const VFS_SERVER_ABI_VERSION: u16 = 1;
 pub const VFS_CODEC_V1_VERSION: u16 = 1;
 
+pub const VFS_OP_STATX: u16 = 22;
 pub const VFS_OP_OPENAT: u16 = 10;
 pub const VFS_OP_CLOSE: u16 = 11;
 pub const VFS_OP_READ: u16 = 12;
@@ -21,7 +22,7 @@ pub const VFS_OP_EPOLL_CREATE1: u16 = 18;
 pub const VFS_OP_EPOLL_CTL: u16 = 19;
 pub const VFS_OP_EPOLL_PWAIT: u16 = 20;
 pub const VFS_OP_SENDFILE: u16 = 21;
-pub const VFS_OP_STATX: u16 = 22;
+pub const VFS_OP_MOUNT_REGISTER: u16 = 23;
 pub const VFS_OPENAT_INLINE_PATH_MAX: usize = 96;
 pub const VFS_OPENAT_INLINE_PATH_HEADER_BYTES: usize = 25;
 pub const VFS_OPENAT_INLINE_PATH_MAX_BYTES: usize =
@@ -126,6 +127,80 @@ impl<'a> OpenAtInlinePath<'a> {
             flags: u64::from_le_bytes(flags),
             mode: u64::from_le_bytes(mode),
             path: &bytes[25..25 + path_len],
+        })
+    }
+}
+
+// ── VFS_OP_MOUNT_REGISTER ────────────────────────────────────────────────────
+
+/// Maximum byte length of a mount-register prefix in the wire payload.
+/// Matches `VFS_INLINE_PATH_MAX`; the server normalizes and appends `/`.
+pub const VFS_MOUNT_REGISTER_PREFIX_MAX: usize = 96;
+
+/// Byte offset at which the inline prefix starts in the request payload.
+pub const VFS_MOUNT_REGISTER_HEADER_BYTES: usize = 17; // 8 + 8 + 1
+
+/// Maximum total byte length of a `MountRegisterArgs` payload.
+pub const VFS_MOUNT_REGISTER_MAX_BYTES: usize =
+    VFS_MOUNT_REGISTER_HEADER_BYTES + VFS_MOUNT_REGISTER_PREFIX_MAX;
+
+// Reply status codes embedded in the 4-byte LE payload of the reply message.
+pub const VFS_MOUNT_STATUS_OK: u32 = 0;
+pub const VFS_MOUNT_STATUS_ERR_DUPLICATE: u32 = 1;
+pub const VFS_MOUNT_STATUS_ERR_FULL: u32 = 2;
+pub const VFS_MOUNT_STATUS_ERR_INVALID_CAP: u32 = 3;
+pub const VFS_MOUNT_STATUS_ERR_INVALID_PREFIX: u32 = 4;
+
+/// Wire layout of a `VFS_OP_MOUNT_REGISTER` request payload.
+///
+/// ```text
+/// offset  size  field
+/// ------  ----  -----
+///      0     8  backend_send_cap   LE u64 — capability to backend service
+///      8     8  flags              LE u64 — mount flags (0 = none)
+///     16     1  prefix_len         byte count of the inline prefix (1..=96)
+///     17     N  prefix             raw path bytes, N = prefix_len
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountRegisterArgs<'a> {
+    pub backend_send_cap: u64,
+    pub flags: u64,
+    pub prefix: &'a [u8],
+}
+
+impl<'a> MountRegisterArgs<'a> {
+    pub fn encode(self) -> Option<([u8; VFS_MOUNT_REGISTER_MAX_BYTES], usize)> {
+        if self.prefix.is_empty() || self.prefix.len() > VFS_MOUNT_REGISTER_PREFIX_MAX {
+            return None;
+        }
+        let mut out = [0u8; VFS_MOUNT_REGISTER_MAX_BYTES];
+        out[0..8].copy_from_slice(&self.backend_send_cap.to_le_bytes());
+        out[8..16].copy_from_slice(&self.flags.to_le_bytes());
+        out[16] = self.prefix.len() as u8;
+        out[17..17 + self.prefix.len()].copy_from_slice(self.prefix);
+        Some((out, VFS_MOUNT_REGISTER_HEADER_BYTES + self.prefix.len()))
+    }
+
+    pub fn decode(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.len() < VFS_MOUNT_REGISTER_HEADER_BYTES {
+            return None;
+        }
+        let prefix_len = bytes[16] as usize;
+        if prefix_len == 0 || prefix_len > VFS_MOUNT_REGISTER_PREFIX_MAX {
+            return None;
+        }
+        let total = VFS_MOUNT_REGISTER_HEADER_BYTES + prefix_len;
+        if bytes.len() < total {
+            return None;
+        }
+        let mut cap_bytes = [0u8; 8];
+        let mut flags_bytes = [0u8; 8];
+        cap_bytes.copy_from_slice(&bytes[0..8]);
+        flags_bytes.copy_from_slice(&bytes[8..16]);
+        Some(Self {
+            backend_send_cap: u64::from_le_bytes(cap_bytes),
+            flags: u64::from_le_bytes(flags_bytes),
+            prefix: &bytes[17..17 + prefix_len],
         })
     }
 }
@@ -299,5 +374,89 @@ mod tests {
         ];
         assert_eq!(args.encode(), expected);
         assert_eq!(VfsV1Args::decode(&expected), Ok(args));
+    }
+
+    #[test]
+    fn mount_register_args_roundtrip() {
+        let args = MountRegisterArgs {
+            backend_send_cap: 0xDEAD_BEEF_0000_0001,
+            flags: 0,
+            prefix: b"/initramfs/",
+        };
+        let (encoded, len) = args.encode().expect("encode");
+        let decoded = MountRegisterArgs::decode(&encoded[..len]).expect("decode");
+        assert_eq!(decoded.backend_send_cap, args.backend_send_cap);
+        assert_eq!(decoded.flags, 0);
+        assert_eq!(decoded.prefix, b"/initramfs/");
+    }
+
+    #[test]
+    fn mount_register_args_golden_vector_is_stable() {
+        // cap=0x0102030405060708, flags=0, prefix=b"/dev/"
+        let args = MountRegisterArgs {
+            backend_send_cap: 0x0102_0304_0506_0708,
+            flags: 0,
+            prefix: b"/dev/",
+        };
+        let (encoded, len) = args.encode().expect("encode");
+        assert_eq!(len, 22); // 17 header + 5 prefix bytes
+        // bytes 0-7: cap LE
+        assert_eq!(&encoded[0..8], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        // bytes 8-15: flags LE (zero)
+        assert_eq!(&encoded[8..16], &[0u8; 8]);
+        // byte 16: prefix_len = 5
+        assert_eq!(encoded[16], 5);
+        // bytes 17-21: b"/dev/"
+        assert_eq!(&encoded[17..22], b"/dev/");
+    }
+
+    #[test]
+    fn mount_register_args_rejects_empty_prefix() {
+        let args = MountRegisterArgs {
+            backend_send_cap: 1,
+            flags: 0,
+            prefix: b"",
+        };
+        assert!(args.encode().is_none());
+    }
+
+    #[test]
+    fn mount_register_args_rejects_oversized_prefix() {
+        let long_prefix = [b'a'; VFS_MOUNT_REGISTER_PREFIX_MAX + 1];
+        let args = MountRegisterArgs {
+            backend_send_cap: 1,
+            flags: 0,
+            prefix: &long_prefix,
+        };
+        assert!(args.encode().is_none());
+    }
+
+    #[test]
+    fn mount_register_args_decode_rejects_short_payload() {
+        let short = [0u8; VFS_MOUNT_REGISTER_HEADER_BYTES - 1];
+        assert!(MountRegisterArgs::decode(&short).is_none());
+    }
+
+    #[test]
+    fn mount_register_args_decode_rejects_truncated_prefix() {
+        // Build a valid encoding, then trim it
+        let args = MountRegisterArgs {
+            backend_send_cap: 1,
+            flags: 0,
+            prefix: b"/initramfs/",
+        };
+        let (encoded, len) = args.encode().expect("encode");
+        // Remove 3 bytes from the end — prefix is now truncated
+        assert!(MountRegisterArgs::decode(&encoded[..len - 3]).is_none());
+    }
+
+    #[test]
+    fn mount_register_opcode_and_status_constants_are_stable() {
+        assert_eq!(VFS_OP_MOUNT_REGISTER, 23);
+        assert_eq!(VFS_MOUNT_STATUS_OK, 0);
+        assert_eq!(VFS_MOUNT_STATUS_ERR_DUPLICATE, 1);
+        assert_eq!(VFS_MOUNT_STATUS_ERR_FULL, 2);
+        assert_eq!(VFS_MOUNT_STATUS_ERR_INVALID_CAP, 3);
+        assert_eq!(VFS_MOUNT_STATUS_ERR_INVALID_PREFIX, 4);
     }
 }

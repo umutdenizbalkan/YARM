@@ -363,8 +363,67 @@ pub fn run() {
             msg.opcode, client_reply_cap
         );
 
-        // Route by path prefix (STATX/OPENAT) or fd table (READ/CLOSE).
+        // ── VFS_OP_MOUNT_REGISTER — handled locally, never forwarded ────────
+        if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_MOUNT_REGISTER {
+            use yarm_ipc_abi::vfs_abi::{
+                MountRegisterArgs, VFS_MOUNT_STATUS_ERR_DUPLICATE, VFS_MOUNT_STATUS_ERR_FULL,
+                VFS_MOUNT_STATUS_ERR_INVALID_CAP, VFS_MOUNT_STATUS_ERR_INVALID_PREFIX,
+                VFS_MOUNT_STATUS_OK,
+            };
+            use super::mount_table::MountRegisterError;
+
+            let status: u32 = match MountRegisterArgs::decode(msg.as_slice()) {
+                None => {
+                    yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_DECODE_ERR");
+                    VFS_MOUNT_STATUS_ERR_INVALID_PREFIX
+                }
+                Some(args) => {
+                    yarm_user_rt::user_log!(
+                        "VFS_MOUNT_REGISTER_REQUEST cap={} flags={}",
+                        args.backend_send_cap, args.flags
+                    );
+                    let cap32 = args.backend_send_cap as u32;
+                    match mount_table.insert_dynamic(args.prefix, cap32, args.flags as u32) {
+                        Ok(()) => {
+                            yarm_user_rt::user_log!(
+                                "VFS_MOUNT_REGISTER_OK entries={}",
+                                mount_table.len()
+                            );
+                            VFS_MOUNT_STATUS_OK
+                        }
+                        Err(MountRegisterError::DuplicatePrefix) => {
+                            yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_ERR reason=duplicate");
+                            VFS_MOUNT_STATUS_ERR_DUPLICATE
+                        }
+                        Err(MountRegisterError::TableFull) => {
+                            yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_ERR reason=full");
+                            VFS_MOUNT_STATUS_ERR_FULL
+                        }
+                        Err(MountRegisterError::InvalidSendCap) => {
+                            yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_ERR reason=invalid-cap");
+                            VFS_MOUNT_STATUS_ERR_INVALID_CAP
+                        }
+                        Err(MountRegisterError::PrefixTooLong)
+                        | Err(MountRegisterError::InvalidPrefix) => {
+                            yarm_user_rt::user_log!(
+                                "VFS_MOUNT_REGISTER_ERR reason=invalid-prefix"
+                            );
+                            VFS_MOUNT_STATUS_ERR_INVALID_PREFIX
+                        }
+                    }
+                }
+            };
+            let reply_opcode: u64 = if status == VFS_MOUNT_STATUS_OK { 0 } else { 1 };
+            let reply = yarm_user_rt::ipc::Message::new(reply_opcode, &status.to_le_bytes())
+                .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"));
+            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &reply) };
+            continue;
+        }
+
+        // ── Route by path prefix (STATX/OPENAT) or fd table (READ/CLOSE) ───
         // Path-based ops are normalized before mount lookup.
+        // `route()` and `lookup()` return owned `MountLabel` copies so that
+        // callers may freely mutate the tables afterward (e.g. fd_table.remove).
         let route = 'route: {
             use yarm_ipc_abi::vfs_abi::{
                 OpenAtInlinePath, ReadWriteArgs, StatxInlinePath,
@@ -389,23 +448,23 @@ pub fn run() {
                 };
                 let path = norm.as_bytes();
                 let path_str = core::str::from_utf8(path).unwrap_or("?");
-                if let Some((send_cap, target_name)) = mount_table.route(path) {
+                if let Some((send_cap, label)) = mount_table.route(path) {
                     yarm_user_rt::user_log!(
                         "VFS_ROUTE_LOOKUP path={} target={}",
-                        path_str, target_name
+                        path_str, label.as_str()
                     );
-                    Some((send_cap, target_name))
+                    Some((send_cap, label))
                 } else {
                     None
                 }
             } else if msg.opcode == VFS_OP_READ || msg.opcode == VFS_OP_CLOSE {
                 if let Ok(args) = ReadWriteArgs::decode(msg.as_slice()) {
-                    if let Some((send_cap, target_name)) = fd_table.lookup(args.fd) {
+                    if let Some((send_cap, label)) = fd_table.lookup(args.fd) {
                         yarm_user_rt::user_log!(
                             "VFS_ROUTE_FD_LOOKUP fd={} target={}",
-                            args.fd, target_name
+                            args.fd, label.as_str()
                         );
-                        Some((send_cap, target_name))
+                        Some((send_cap, label))
                     } else {
                         None
                     }
@@ -417,7 +476,7 @@ pub fn run() {
             }
         };
 
-        let Some((backend_send_cap, target_name)) = route else {
+        let Some((backend_send_cap, target_label)) = route else {
             // No route: reply with error status, keep serving.
             yarm_user_rt::user_log!("VFS_ROUTE_LOOKUP path=? target=none");
             let err = yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg");
@@ -427,7 +486,7 @@ pub fn run() {
 
         yarm_user_rt::user_log!(
             "VFS_ROUTE_FORWARD target={} send_cap={}",
-            target_name, backend_send_cap
+            target_label.as_str(), backend_send_cap
         );
 
         // Forward request to backend; pass our own recv_cap as the reply endpoint so
@@ -447,7 +506,8 @@ pub fn run() {
                         let mut b = [0u8; 8];
                         b.copy_from_slice(&payload[..8]);
                         let fd = u64::from_le_bytes(b);
-                        if fd_table.insert(fd, backend_send_cap, target_name) {
+                        // target_label is owned (Copy), no borrow conflict.
+                        if fd_table.insert(fd, backend_send_cap, target_label.as_str()) {
                             yarm_user_rt::user_log!(
                                 "VFS_FD_TRACK fd={} backend={}",
                                 fd, backend_send_cap
@@ -469,13 +529,14 @@ pub fn run() {
                     let closed_fd = ReadWriteArgs::decode(msg.as_slice())
                         .map(|a| a.fd)
                         .unwrap_or(u64::MAX);
+                    // Log before remove; target_label is owned so no borrow conflict.
+                    yarm_user_rt::user_log!(
+                        "VFS_FD_CLOSE fd={} target={} status={}",
+                        closed_fd, target_label.as_str(), status
+                    );
                     if status == 0 {
                         fd_table.remove(closed_fd);
                     }
-                    yarm_user_rt::user_log!(
-                        "VFS_FD_CLOSE fd={} target={} status={}",
-                        closed_fd, target_name, status
-                    );
                 }
                 yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=0");
                 let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, response) };
