@@ -418,6 +418,14 @@ impl KernelState {
                 .map_err(|_| KernelError::MemoryObjectFull)
         })?;
         #[cfg(not(feature = "hosted-dev"))]
+        if let Some((rs, re)) = crate::kernel::frame_allocator::is_pa_in_pt_pool(pa) {
+            crate::yarm_log!(
+                "PMEM_ALLOC_PT_POOL_BUG pa=0x{:x} pt_range=0x{:x}..0x{:x}",
+                pa, rs, re
+            );
+            panic!("PMEM_ALLOC_PT_POOL_BUG: main frame allocator returned a PT-pool PA");
+        }
+        #[cfg(not(feature = "hosted-dev"))]
         crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user", pa);
         Ok(pa)
     }
@@ -439,6 +447,16 @@ impl KernelState {
                     _ => KernelError::Vm(VmError::Full),
                 })
         })?);
+        #[cfg(not(feature = "hosted-dev"))]
+        if let Some((rs, re)) = crate::kernel::frame_allocator::is_pa_in_pt_pool(phys.0) {
+            crate::yarm_log!(
+                "PMEM_ALLOC_PT_POOL_BUG_CONTIG pa=0x{:x} pt_range=0x{:x}..0x{:x} pages={}",
+                phys.0, rs, re, pages
+            );
+            panic!("PMEM_ALLOC_PT_POOL_BUG_CONTIG: main contiguous allocator returned a PT-pool PA");
+        }
+        #[cfg(not(feature = "hosted-dev"))]
+        crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user_contig pages={}", phys.0, pages);
         self.create_memory_object_with_len(phys, total_len)
     }
 
