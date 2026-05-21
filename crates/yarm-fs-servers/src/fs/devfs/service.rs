@@ -8,7 +8,7 @@ use super::super::common::vfs_ipc::{
 };
 use super::super::common::service::FsService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
-use super::nodes::{DEV_CONSOLE_PATH, DEV_NULL_PATH, DevFsBackend, DevFsMetrics};
+use super::nodes::{DEV_CONSOLE_PATH, DEV_NULL_PATH, DevFsBackend, DevFsMetrics, DevNodeRegisterError};
 #[cfg(test)]
 use super::nodes::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR};
 use yarm_srv_common::vfs_reply::VfsReply;
@@ -104,6 +104,47 @@ pub fn run() {
                         "DEVFS_SRV_GOT_MSG opcode={} reply_cap={}",
                         msg.opcode, reply_cap
                     );
+
+                    // ── DEVFS_OP_REGISTER_NODE — handled locally ─────────
+                    if msg.opcode == yarm_ipc_abi::devfs_abi::DEVFS_OP_REGISTER_NODE {
+                        use yarm_ipc_abi::devfs_abi::{
+                            NodeRegistrationArgs,
+                            DEVFS_REGISTER_STATUS_OK,
+                            DEVFS_REGISTER_STATUS_ERR_DUPLICATE,
+                            DEVFS_REGISTER_STATUS_ERR_FULL,
+                            DEVFS_REGISTER_STATUS_ERR_INVALID_KIND,
+                            DEVFS_REGISTER_STATUS_ERR_INVALID_PATH,
+                        };
+                        let status: u32 = match NodeRegistrationArgs::decode(msg.as_slice()) {
+                            None => DEVFS_REGISTER_STATUS_ERR_INVALID_PATH,
+                            Some(args) => {
+                                match svc.backend_mut().register_dynamic_node(
+                                    args.name,
+                                    args.kind,
+                                    args.flags,
+                                    args.backend_cap,
+                                ) {
+                                    Ok(()) => {
+                                        yarm_user_rt::user_log!(
+                                            "DEVFS_SRV_NODE_REGISTERED kind={} cap={}",
+                                            args.kind, args.backend_cap
+                                        );
+                                        DEVFS_REGISTER_STATUS_OK
+                                    }
+                                    Err(DevNodeRegisterError::Duplicate) => DEVFS_REGISTER_STATUS_ERR_DUPLICATE,
+                                    Err(DevNodeRegisterError::TableFull) => DEVFS_REGISTER_STATUS_ERR_FULL,
+                                    Err(DevNodeRegisterError::InvalidKind) => DEVFS_REGISTER_STATUS_ERR_INVALID_KIND,
+                                    Err(_) => DEVFS_REGISTER_STATUS_ERR_INVALID_PATH,
+                                }
+                            }
+                        };
+                        let reply_opcode: u64 = if status == DEVFS_REGISTER_STATUS_OK { 0 } else { 1 };
+                        let reply = yarm_user_rt::ipc::Message::new(reply_opcode, &status.to_le_bytes())
+                            .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"));
+                        let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
+                        continue;
+                    }
+
                     let response = svc.handle(msg).unwrap_or_else(|_| {
                         yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg")
                     });
