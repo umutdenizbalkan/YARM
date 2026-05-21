@@ -1166,11 +1166,7 @@ pub fn run() {
                 "SUPERVISOR_LIFECYCLE_QUERY tid={}",
                 supervisor_tid
             );
-            match query_lifecycle_via_process_manager(
-                &mut transport,
-                process_manager_caps,
-                supervisor_tid,
-            ) {
+            match query_lifecycle_via_process_manager(process_manager_caps, supervisor_tid) {
                 Ok(Some(reply)) if reply.is_found() => {
                     yarm_user_rt::user_log!(
                         "SUPERVISOR_LIFECYCLE_FOUND tid={} image_id={} restart_supported=0",
@@ -1411,11 +1407,14 @@ fn register_supervised_task_with_process_manager(
 
 /// Query PM's lifecycle table for `tid`.
 ///
-/// Returns `Ok(Some(reply))` when PM responded, `Ok(None)` when PM caps are
-/// unavailable or PM did not reply, `Err` on IPC encoding failure.
+/// Uses the same `ipc_call` + `ipc_recv_with_deadline` pattern as
+/// init → PM SpawnV5 calls, so the kernel delivers a reply-cap to PM
+/// alongside the message and PM can reply to it.
+///
+/// Returns `Ok(Some(reply))` on success, `Ok(None)` when PM caps are
+/// unavailable or no reply arrived, `Err` on IPC encoding failure.
 #[cfg(not(test))]
 fn query_lifecycle_via_process_manager(
-    transport: &mut impl IpcTransport,
     process_manager_caps: Option<(u32, u32)>,
     tid: u64,
 ) -> Result<Option<LifecycleQueryReply>, KernelError> {
@@ -1425,13 +1424,11 @@ fn query_lifecycle_via_process_manager(
     let req = LifecycleQueryRequest::new(tid);
     let msg = Message::with_header(0, PROC_OP_LIFECYCLE_QUERY, 0, None, &req.encode())
         .map_err(|_| KernelError::WrongObject)?;
-    transport
-        .send(req_cap, &msg)
-        .map_err(|_| KernelError::WrongObject)?;
-    let Some(reply_msg) = transport
-        .recv(rep_cap)
-        .map_err(|_| KernelError::WrongObject)?
-    else {
+    // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call,
+    // identical to the init → PM SpawnV5 pattern in init/service.rs.
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(req_cap, rep_cap, &msg) };
+    let reply_result = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, 0) };
+    let Some(reply_msg) = reply_result.map_err(|_| KernelError::WrongObject)? else {
         return Ok(None);
     };
     let reply = LifecycleQueryReply::decode(reply_msg.as_slice())
