@@ -225,6 +225,90 @@ impl Bootstrap {
         (out, out_len)
     }
 
+    /// Number of physical pages reserved exclusively for page-table frames.
+    /// These pages form the PT_FRAME_ALLOCATOR's pool; the rest of sanitized
+    /// memory goes to the main KernelState frame allocator.  The two pools
+    /// are strictly disjoint — no physical page can appear in both.
+    const PT_POOL_PAGES: usize = 256; // 1 MiB — enough for all page-table nodes
+
+    /// Split `regions` (already sanitized, reserved ranges removed) into two
+    /// disjoint sub-pools sorted by physical address:
+    ///   - first PT_POOL_PAGES pages  → returned as (pt_out, pt_len)
+    ///   - everything remaining       → returned as (main_out, main_len)
+    fn split_sanitized_for_pt_pool(
+        regions: &[MemoryRegion],
+        pt_pages: usize,
+    ) -> (
+        [MemoryRegion; MAX_BOOT_MEMORY_REGIONS],
+        usize,
+        [MemoryRegion; MAX_BOOT_MEMORY_REGIONS],
+        usize,
+    ) {
+        const PAGE: u64 = crate::kernel::vm::PAGE_SIZE as u64;
+
+        // Normalise to page-aligned extents and collect.
+        let mut sorted = [(0u64, 0u64); MAX_BOOT_MEMORY_REGIONS];
+        let mut nsorted = 0usize;
+        for region in regions {
+            if !region.usable || region.len == 0 {
+                continue;
+            }
+            let start = region.start.wrapping_add(PAGE - 1) & !(PAGE - 1);
+            let end = region.start.saturating_add(region.len) & !(PAGE - 1);
+            if end > start && nsorted < MAX_BOOT_MEMORY_REGIONS {
+                sorted[nsorted] = (start, end - start);
+                nsorted += 1;
+            }
+        }
+        // Insertion sort by start address (N is small, no heap needed).
+        for i in 1..nsorted {
+            let key = sorted[i];
+            let mut j = i;
+            while j > 0 && sorted[j - 1].0 > key.0 {
+                sorted[j] = sorted[j - 1];
+                j -= 1;
+            }
+            sorted[j] = key;
+        }
+
+        let mut pt_out = [MemoryRegion { start: 0, len: 0, usable: false }; MAX_BOOT_MEMORY_REGIONS];
+        let mut main_out = [MemoryRegion { start: 0, len: 0, usable: false }; MAX_BOOT_MEMORY_REGIONS];
+        let mut pt_len = 0usize;
+        let mut main_len = 0usize;
+        let mut remaining_pt = (pt_pages as u64) * PAGE;
+
+        for i in 0..nsorted {
+            let (start, len) = sorted[i];
+            if remaining_pt == 0 {
+                if main_len < MAX_BOOT_MEMORY_REGIONS {
+                    main_out[main_len] = MemoryRegion { start, len, usable: true };
+                    main_len += 1;
+                }
+            } else if len <= remaining_pt {
+                if pt_len < MAX_BOOT_MEMORY_REGIONS {
+                    pt_out[pt_len] = MemoryRegion { start, len, usable: true };
+                    pt_len += 1;
+                }
+                remaining_pt -= len;
+            } else {
+                // Split: first `remaining_pt` bytes → PT pool, remainder → main.
+                if pt_len < MAX_BOOT_MEMORY_REGIONS {
+                    pt_out[pt_len] = MemoryRegion { start, len: remaining_pt, usable: true };
+                    pt_len += 1;
+                }
+                let main_start = start + remaining_pt;
+                let main_region_len = len - remaining_pt;
+                if main_region_len > 0 && main_len < MAX_BOOT_MEMORY_REGIONS {
+                    main_out[main_len] = MemoryRegion { start: main_start, len: main_region_len, usable: true };
+                    main_len += 1;
+                }
+                remaining_pt = 0;
+            }
+        }
+
+        (pt_out, pt_len, main_out, main_len)
+    }
+
     pub const fn default_capacity_profile() -> KernelCapacityProfile {
         KernelCapacityProfile::HostedDefault
     }
@@ -302,10 +386,35 @@ impl Bootstrap {
         let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
         let (sanitized, sanitized_len) = Self::apply_reserved_ranges(boot_regions, reserved_ranges);
         let sanitized = &sanitized[..sanitized_len];
+
+        // Split sanitized into two strictly disjoint pools (sorted by PA):
+        //   [0 .. PT_POOL_PAGES)  → PT_FRAME_ALLOCATOR (page-table nodes)
+        //   [PT_POOL_PAGES .. end) → KernelState frame_allocator (user data/stacks)
+        // This prevents the previous bug where both allocators were seeded from
+        // the identical sanitized range and handed out the same physical page.
+        let (pt_regs, pt_regs_len, main_regs, main_regs_len) =
+            Self::split_sanitized_for_pt_pool(sanitized, Self::PT_POOL_PAGES);
+        let pt_slice = &pt_regs[..pt_regs_len];
+        let main_slice = &main_regs[..main_regs_len];
+
+        // Register PT pool ranges in GLOBAL_RESERVED_RANGES so the main allocator
+        // fires PMEM_ALLOC_RESERVED_BUG if it ever (incorrectly) returns a PT-pool PA.
+        for r in pt_slice {
+            if r.usable && r.len > 0 {
+                crate::kernel::frame_allocator::register_reserved_range(r.start, r.start + r.len);
+                crate::yarm_log!(
+                    "PT_POOL_RANGE start=0x{:x} end=0x{:x} pages={}",
+                    r.start,
+                    r.start + r.len,
+                    r.len / crate::kernel::vm::PAGE_SIZE as u64
+                );
+            }
+        }
+
+        init_pt_frame_allocator(pt_slice).map_err(|_| KernelError::MemoryObjectFull)?;
         frame_allocator
-            .init_from_memory_map(sanitized)
+            .init_from_memory_map(main_slice)
             .map_err(|_| KernelError::MemoryObjectFull)?;
-        init_pt_frame_allocator(sanitized).map_err(|_| KernelError::MemoryObjectFull)?;
         crate::arch::selected_isa::page_table::reset_state();
 
         let mut kernel_aspace = AddressSpace::new_kernel();

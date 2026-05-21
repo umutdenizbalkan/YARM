@@ -412,11 +412,14 @@ impl KernelState {
     }
 
     pub(crate) fn alloc_user_data_frame(&mut self) -> Result<u64, KernelError> {
-        self.with_memory_state_mut(|memory| {
+        let pa = self.with_memory_state_mut(|memory| {
             kernel_mut(&mut memory.frame_allocator)
                 .alloc_frame()
                 .map_err(|_| KernelError::MemoryObjectFull)
-        })
+        })?;
+        #[cfg(not(feature = "hosted-dev"))]
+        crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user", pa);
+        Ok(pa)
     }
 
     pub fn alloc_anonymous_memory_object_with_len(
