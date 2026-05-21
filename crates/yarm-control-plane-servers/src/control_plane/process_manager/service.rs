@@ -10,12 +10,13 @@ use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcess
 #[cfg(test)]
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use yarm_ipc_abi::process_abi::{
-    ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT,
-    PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2,
-    PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4, PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN,
-    PROC_OP_WAITPID_V2, RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args,
-    SpawnV5CapArgs, SpawnV5CapResult, TaskRestartTokenReply, TaskRestartTokenRequest,
-    WaitPidV2Args,
+    ExecuteRestartReply, ExecuteRestartRequest, LIFECYCLE_STATE_SPAWNED,
+    LifecycleQueryReply, LifecycleQueryRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT,
+    PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_LIFECYCLE_QUERY,
+    PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4,
+    PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2, RegisterSupervisedTask,
+    SpawnV2Args, SpawnV3Args, SpawnV4Args, SpawnV5CapArgs, SpawnV5CapResult,
+    TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
@@ -126,6 +127,7 @@ pub enum ProcessRequest {
     TaskRestartToken { tid: u64 },
     RegisterSupervisedTask { tid: u64, restart_token: u64 },
     ExecuteRestart { tid: u64, restart_token: u64 },
+    LifecycleQuery { tid: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -930,6 +932,11 @@ impl ProcessService {
                     restart_token: args.restart_token,
                 })
             }
+            PROC_OP_LIFECYCLE_QUERY => {
+                let args = LifecycleQueryRequest::decode(msg.as_slice())
+                    .map_err(|_| ProcessManagerError::Malformed)?;
+                Ok(ProcessRequest::LifecycleQuery { tid: args.tid })
+            }
             _ => Err(ProcessManagerError::Unsupported),
         }
     }
@@ -1230,6 +1237,25 @@ impl ProcessService {
                 };
                 let reply = ExecuteRestartReply::new(status);
                 Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &reply.encode())
+                    .map_err(|_| ProcessManagerError::Malformed)
+            }
+            ProcessRequest::LifecycleQuery { tid } => {
+                let reply = match self.lifecycle_table.get_by_tid(tid) {
+                    Some(rec) => {
+                        let state = match rec.state {
+                            ServiceState::Spawned => LIFECYCLE_STATE_SPAWNED,
+                        };
+                        LifecycleQueryReply::found(rec.tid, rec.image_id, state)
+                    }
+                    None => LifecycleQueryReply::not_found(),
+                };
+                yarm_user_rt::user_log!(
+                    "PM_LIFECYCLE_QUERY_REPLY tid={} found={} image_id={}",
+                    tid,
+                    reply.found,
+                    reply.image_id
+                );
+                Message::with_header(0, PROC_OP_LIFECYCLE_QUERY, 0, None, &reply.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
             }
         }

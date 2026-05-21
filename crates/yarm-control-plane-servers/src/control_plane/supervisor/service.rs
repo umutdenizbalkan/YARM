@@ -8,9 +8,10 @@ use crate::control_plane::init::{
 use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 #[cfg(not(test))]
 use yarm_ipc_abi::process_abi::{
-    ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART,
-    PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_TASK_RESTART_TOKEN, RegisterSupervisedTask,
-    TaskRestartTokenReply, TaskRestartTokenRequest,
+    ExecuteRestartReply, ExecuteRestartRequest, LifecycleQueryReply, LifecycleQueryRequest,
+    PROC_OP_EXECUTE_RESTART, PROC_OP_LIFECYCLE_QUERY, PROC_OP_REGISTER_SUPERVISED_TASK,
+    PROC_OP_TASK_RESTART_TOKEN, RegisterSupervisedTask, TaskRestartTokenReply,
+    TaskRestartTokenRequest,
 };
 #[cfg(test)]
 use yarm_ipc_abi::supervisor_abi::{
@@ -1158,9 +1159,42 @@ pub fn run() {
                 supervisor.handoff.init_alert_recv_cap.0,
                 supervisor.degraded(),
             );
+            // Query PM lifecycle table for the supervisor's own TID to establish
+            // truthful supervision metadata before entering the event loop.
+            let supervisor_tid = startup.task_id;
             yarm_user_rt::user_log!(
-                "supervisor.srv restart-token registration sender not wired in production: missing authoritative lifecycle handoff source for (tid, restart_token)"
+                "SUPERVISOR_LIFECYCLE_QUERY tid={}",
+                supervisor_tid
             );
+            match query_lifecycle_via_process_manager(
+                &mut transport,
+                process_manager_caps,
+                supervisor_tid,
+            ) {
+                Ok(Some(reply)) if reply.is_found() => {
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_LIFECYCLE_FOUND tid={} image_id={} restart_supported=0",
+                        reply.tid,
+                        reply.image_id
+                    );
+                    yarm_user_rt::user_log!(
+                        "restart unsupported: PM lifecycle record found but no restart token source wired"
+                    );
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_LIFECYCLE_MISSING tid={}",
+                        supervisor_tid
+                    );
+                }
+                Err(err) => {
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_LIFECYCLE_QUERY_ERR tid={} err={:?}",
+                        supervisor_tid,
+                        err
+                    );
+                }
+            }
             loop {
                 let mut made_progress = false;
                 match transport.recv(supervisor.handoff.supervisor_control_recv_cap.0 as u32) {
@@ -1373,6 +1407,36 @@ fn register_supervised_task_with_process_manager(
         .recv(rep_cap)
         .map_err(|_| KernelError::WrongObject)?;
     Ok(())
+}
+
+/// Query PM's lifecycle table for `tid`.
+///
+/// Returns `Ok(Some(reply))` when PM responded, `Ok(None)` when PM caps are
+/// unavailable or PM did not reply, `Err` on IPC encoding failure.
+#[cfg(not(test))]
+fn query_lifecycle_via_process_manager(
+    transport: &mut impl IpcTransport,
+    process_manager_caps: Option<(u32, u32)>,
+    tid: u64,
+) -> Result<Option<LifecycleQueryReply>, KernelError> {
+    let Some((req_cap, rep_cap)) = process_manager_caps else {
+        return Ok(None);
+    };
+    let req = LifecycleQueryRequest::new(tid);
+    let msg = Message::with_header(0, PROC_OP_LIFECYCLE_QUERY, 0, None, &req.encode())
+        .map_err(|_| KernelError::WrongObject)?;
+    transport
+        .send(req_cap, &msg)
+        .map_err(|_| KernelError::WrongObject)?;
+    let Some(reply_msg) = transport
+        .recv(rep_cap)
+        .map_err(|_| KernelError::WrongObject)?
+    else {
+        return Ok(None);
+    };
+    let reply = LifecycleQueryReply::decode(reply_msg.as_slice())
+        .map_err(|_| KernelError::WrongObject)?;
+    Ok(Some(reply))
 }
 
 #[cfg(not(test))]

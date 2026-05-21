@@ -172,6 +172,42 @@ sponsorship cap or collapsed them.
 full (len == 32) it returns `false` and the spawn still succeeds — the record is
 simply not tracked. This is logged via `PM_LIFECYCLE_RECORD ... recorded=0`.
 
+### Lifecycle Query Opcode (`PROC_OP_LIFECYCLE_QUERY = 12`)
+
+Any task holding PM send/recv caps may query the lifecycle table by TID:
+
+- **Request**: `LifecycleQueryRequest` — 8 bytes (tid: u64 LE)
+- **Reply**: `LifecycleQueryReply` — 19 bytes
+
+| Offset | Size | Field              | Description                                    |
+|--------|------|--------------------|------------------------------------------------|
+| 0      | 1    | `found`            | 1 = record present, 0 = TID unknown to PM      |
+| 1      | 8    | `tid`              | u64 LE; echoes queried TID when found=1        |
+| 9      | 8    | `image_id`         | u64 LE; the image_id at spawn time             |
+| 17     | 1    | `state`            | `LIFECYCLE_STATE_SPAWNED` (0) — only state now |
+| 18     | 1    | `restart_supported`| always 0; restart not yet wired                |
+
+PM logs `PM_LIFECYCLE_QUERY_REPLY tid=… found=… image_id=…` on every query.
+
+**PM lifecycle table is the authoritative source for supervision metadata.**
+Callers must not fabricate lifecycle records or treat `found=0` as an error —
+it simply means PM was not the spawner for that TID (e.g., bootstrap services
+spawned before PM existed are not in the table).
+
+### Supervisor lifecycle registration contract
+
+The supervisor calls `PROC_OP_LIFECYCLE_QUERY` for its own TID during startup
+handoff. Because bootstrap services (image_ids 1–3) are spawned before PM
+records them, the query typically returns `found=0` for the supervisor itself:
+
+- `found=1`: logs `SUPERVISOR_LIFECYCLE_FOUND tid=… image_id=… restart_supported=0` then logs `"restart unsupported: PM lifecycle record found but no restart token source wired"`
+- `found=0`: logs `SUPERVISOR_LIFECYCLE_MISSING tid=…`
+
+**Restart is intentionally unsupported** until real restart-token population
+(via `PROC_OP_REGISTER_SUPERVISED_TASK`) is wired to an authoritative source.
+The supervisor must not fabricate tokens or silently treat missing records as
+success.
+
 ---
 
 ## Sequential Spawn Ordering
@@ -192,16 +228,21 @@ can be given valid initramfs and devfs caps at spawn time).
 
 ## Log Markers
 
-| Marker                          | Emitted by       | Description                                     |
-|---------------------------------|------------------|-------------------------------------------------|
-| `PM_VFS_SPAWN_IMAGE_BEGIN`      | PM               | before `SpawnFromInitramfsFile` syscall         |
-| `PM_VFS_SPAWN_RESULT`           | PM               | raw kernel spawn result (tid, caller_cap, spawner_cap) |
-| `PM_VFS_SPAWN_IMAGE_SELECTED`   | PM               | confirms VFS-backed path selected for image_id  |
-| `PM_VFS_SPAWN_IMAGE_UNKNOWN`    | PM               | image_id has no CPIO mapping; returns Unsupported |
-| `PM_VFS_SPAWN_FAIL`             | PM               | spawn syscall returned an error; returns TableFull |
-| `PM_LIFECYCLE_RECORD`           | PM               | per-spawn record: image_id, tid, pm_service_send_cap, parent_tid, state, recorded flag |
-| `INIT_*_SPAWN_V5_CALL_BEGIN`    | init_server      | before each PROC_OP_SPAWN_V5_CAP call           |
-| `INIT_*_SPAWN_V5_CALL_RETURN`   | init_server      | after reply: ok=1 child_tid=N or ok=0           |
+| Marker                           | Emitted by       | Description                                     |
+|----------------------------------|------------------|-------------------------------------------------|
+| `PM_VFS_SPAWN_IMAGE_BEGIN`       | PM               | before `SpawnFromInitramfsFile` syscall         |
+| `PM_VFS_SPAWN_RESULT`            | PM               | raw kernel spawn result (tid, caller_cap, spawner_cap) |
+| `PM_VFS_SPAWN_IMAGE_SELECTED`    | PM               | confirms VFS-backed path selected for image_id  |
+| `PM_VFS_SPAWN_IMAGE_UNKNOWN`     | PM               | image_id has no CPIO mapping; returns Unsupported |
+| `PM_VFS_SPAWN_FAIL`              | PM               | spawn syscall returned an error; returns TableFull |
+| `PM_LIFECYCLE_RECORD`            | PM               | per-spawn record: image_id, tid, pm_service_send_cap, parent_tid, state, recorded flag |
+| `PM_LIFECYCLE_QUERY_REPLY`       | PM               | response to PROC_OP_LIFECYCLE_QUERY: tid, found, image_id |
+| `SUPERVISOR_LIFECYCLE_QUERY`     | supervisor       | before querying PM lifecycle table during handoff |
+| `SUPERVISOR_LIFECYCLE_FOUND`     | supervisor       | PM replied found=1; tid, image_id, restart_supported=0 |
+| `SUPERVISOR_LIFECYCLE_MISSING`   | supervisor       | PM replied found=0; TID not in lifecycle table  |
+| `SUPERVISOR_LIFECYCLE_QUERY_ERR` | supervisor       | IPC error during PM lifecycle query             |
+| `INIT_*_SPAWN_V5_CALL_BEGIN`     | init_server      | before each PROC_OP_SPAWN_V5_CAP call           |
+| `INIT_*_SPAWN_V5_CALL_RETURN`    | init_server      | after reply: ok=1 child_tid=N or ok=0           |
 
 ---
 
@@ -238,3 +279,12 @@ because no real capability is minted.
 - **Skipping lifecycle recording**: every `SpawnV5Cap` that reaches the
   `lifecycle_table.record()` call — both in non-test and test paths — must
   record the spawned service. Gaps in the lifecycle table are a bug.
+- **Fabricating lifecycle data in supervisor**: supervisor must not generate
+  synthetic lifecycle records. `PROC_OP_LIFECYCLE_QUERY` is the only path to
+  obtain supervision metadata. `found=0` is a truthful answer, not an error.
+- **Treating `found=0` as restart success**: a missing PM lifecycle record means
+  restart is unsupported for that TID. The supervisor must log
+  `SUPERVISOR_LIFECYCLE_MISSING` and proceed without fake token registration.
+- **Fabricating restart tokens**: restart tokens must come from kernel or PM,
+  never from arbitrary values. Until `PROC_OP_REGISTER_SUPERVISED_TASK` is
+  wired to an authoritative source, `restart_supported=0` is the contract.
