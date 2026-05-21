@@ -313,12 +313,100 @@ impl ProcessManagerOps for KernelProcessManagerAdapter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    Spawned,
+}
+
+/// One entry in the PM lifecycle table. Tracks the kernel-level identity of
+/// each service spawned through PM so that caps can be re-granted downstream
+/// and the service state can be queried.
+#[derive(Debug, Clone, Copy)]
+pub struct ServiceLifecycleRecord {
+    pub tid: u64,
+    pub image_id: u64,
+    /// TID of the task that requested the spawn (0 = no requester / direct).
+    pub parent_tid: u64,
+    /// PM's own send cap for this service's IPC endpoint (valid in PM's CNode).
+    ///
+    /// Startup slot layout recap (indices into the 18-element startup_args array):
+    ///  Slot 0  — task id
+    ///  Slot 1  — PM request send cap (to reach PM for new requests)
+    ///  Slot 2  — PM reply recv cap  (for PM replies)
+    ///  Slot 12 — service recv ep    (child's own inbound endpoint; this is what
+    ///            each spawned service reads as `ctx.process_manager_service_recv_ep`)
+    ///  Slot 13 — service_extra_cap_0 (e.g. initramfs send cap passed to vfs_server)
+    ///  Slot 14 — service_extra_cap_1 (e.g. devfs send cap passed to vfs_server)
+    ///  Slot 15/16 — reserved extra caps
+    ///  Slot 17 — PM inbound recv cap (only wired for PM itself)
+    ///
+    /// `pm_service_send_cap` is the spawner's (PM's) side of the endpoint created
+    /// at slot 12.  When `parent_pid != 0` the kernel also delegates a copy into
+    /// the parent's CNode; `pm_service_send_cap` always refers to the copy that
+    /// stays in PM's CNode.
+    pub pm_service_send_cap: u32,
+    pub state: ServiceState,
+}
+
+const MAX_LIFECYCLE_ENTRIES: usize = 32;
+
+/// Fixed-capacity lifecycle table for spawned services.  Uses a flat array so
+/// it is compatible with `no_std` and `const` initialisation.
+#[derive(Debug)]
+pub struct LifecycleTable {
+    entries: [Option<ServiceLifecycleRecord>; MAX_LIFECYCLE_ENTRIES],
+    len: usize,
+}
+
+impl LifecycleTable {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_LIFECYCLE_ENTRIES],
+            len: 0,
+        }
+    }
+
+    /// Append a new record.  Returns `false` if the table is full.
+    pub fn record(&mut self, rec: ServiceLifecycleRecord) -> bool {
+        if self.len >= MAX_LIFECYCLE_ENTRIES {
+            return false;
+        }
+        self.entries[self.len] = Some(rec);
+        self.len += 1;
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get_by_tid(&self, tid: u64) -> Option<&ServiceLifecycleRecord> {
+        self.entries[..self.len]
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .find(|r| r.tid == tid)
+    }
+
+    pub fn get_by_image_id(&self, image_id: u64) -> Option<&ServiceLifecycleRecord> {
+        self.entries[..self.len]
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .find(|r| r.image_id == image_id)
+    }
+}
+
 #[derive(Debug)]
 pub struct ProcessService {
     manager: KernelProcessManagerAdapter,
     policy_records: [Option<ProcessSpawnPolicyRecord>; 64],
     restart_token_records: [Option<RestartTokenRecord>; 64],
     restart_control_send_cap: Option<u32>,
+    /// Lifecycle table: one entry per successfully spawned service.
+    lifecycle_table: LifecycleTable,
     handled: usize,
 }
 
@@ -712,8 +800,13 @@ impl ProcessService {
             restart_token_records: [None; 64],
             restart_control_send_cap: yarm_user_rt::runtime::startup_context()
                 .process_manager_restart_control_send_cap,
+            lifecycle_table: LifecycleTable::new(),
             handled: 0,
         }
+    }
+
+    pub fn lifecycle_table(&self) -> &LifecycleTable {
+        &self.lifecycle_table
     }
 
     pub const fn handled_count(&self) -> usize {
@@ -1009,7 +1102,14 @@ impl ProcessService {
             ProcessRequest::SpawnV5Cap(req) => {
                 #[cfg(not(test))]
                 {
-                    let (tid, caller_cap) =
+                    // Capture all three return values from every spawn path.
+                    //
+                    // caller_cap:   cap returned to the requester (init) — may be in
+                    //               init's CNode when parent_pid != 0, otherwise in PM's.
+                    // spawner_cap:  non-zero only when parent_pid != 0; this is PM's own
+                    //               copy of the service send cap (high 32 bits of ret2).
+                    // pm_send_cap:  whichever of the above lives in PM's own CNode.
+                    let (tid, caller_cap, spawner_cap) =
                         if req.image_id == 4
                         || req.image_id == 5
                         || req.image_id == 6
@@ -1017,8 +1117,7 @@ impl ProcessService {
                     {
                             // VFS-backed path: read ELF from initramfs CPIO via the
                             // SpawnFromInitramfsFile kernel syscall (nr=26).  This is the
-                            // sole spawn for these image_ids; the old spawn_with_caps path
-                            // is bypassed to avoid creating a duplicate process.
+                            // sole spawn for these image_ids.
                             let mut startup_args = [0u64; 18];
                             startup_args[13] = req.service_caps[0];
                             startup_args[14] = req.service_caps[1];
@@ -1031,23 +1130,40 @@ impl ProcessService {
                                     &startup_args,
                                 )
                             } {
-                                Some((t, c, _)) => (t, c as u64),
+                                Some((t, c, s)) => (t, c as u64, s),
                                 None => return Err(ProcessManagerError::TableFull),
                             }
                         } else {
                             let backend = KernelProcessSpawnBackend::new();
-                            let (t, c, _) = backend.spawn_with_caps(
+                            let (t, c, s) = backend.spawn_with_caps(
                                 req.image_id,
                                 req.parent_pid.0,
                                 req.service_caps,
                             )?;
-                            (t, c as u64)
+                            (t, c as u64, s)
                         };
+                    // PM's own send cap: prefer spawner_cap (set when parent got a
+                    // delegated copy); fall back to caller_cap when parent_pid == 0.
+                    let pm_send_cap =
+                        if spawner_cap != 0 { spawner_cap } else { caller_cap as u32 };
+                    // Record in lifecycle table regardless of image_id so PM always
+                    // has a complete view of spawned services.
+                    let recorded = self.lifecycle_table.record(ServiceLifecycleRecord {
+                        tid,
+                        image_id: req.image_id,
+                        parent_tid: req.parent_pid.0,
+                        pm_service_send_cap: pm_send_cap,
+                        state: ServiceState::Spawned,
+                    });
+                    yarm_user_rt::user_log!(
+                        "PM_LIFECYCLE_RECORD image_id={} tid={} pm_service_send_cap={} parent_tid={} state=spawned recorded={}",
+                        req.image_id, tid, pm_send_cap, req.parent_pid.0, recorded as u8
+                    );
                     let result = SpawnV5CapResult::new(tid, caller_cap);
                     let encoded = result.encode();
                     yarm_user_rt::user_log!(
-                        "PM_SPAWN_V5_CAP_REPLY tid={} service_send_cap={} len={}",
-                        tid, caller_cap, encoded.len()
+                        "PM_SPAWN_V5_CAP_REPLY tid={} caller_cap={} pm_send_cap={} len={}",
+                        tid, caller_cap, pm_send_cap, encoded.len()
                     );
                     Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &encoded)
                         .map_err(|_| ProcessManagerError::Malformed)
@@ -1877,5 +1993,72 @@ mod tests {
             call(&mut service, 9, 77),
             ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED
         );
+    }
+
+    #[test]
+    fn lifecycle_table_records_one_entry_per_service() {
+        let mut table = LifecycleTable::new();
+        assert!(table.is_empty());
+
+        let ok = table.record(ServiceLifecycleRecord {
+            tid: 100,
+            image_id: 4,
+            parent_tid: 0,
+            pm_service_send_cap: 42,
+            state: ServiceState::Spawned,
+        });
+        assert!(ok);
+        assert_eq!(table.len(), 1);
+
+        let rec = table.get_by_tid(100).expect("get by tid");
+        assert_eq!(rec.image_id, 4);
+        assert_eq!(rec.pm_service_send_cap, 42);
+        assert!(matches!(rec.state, ServiceState::Spawned));
+    }
+
+    #[test]
+    fn lifecycle_table_get_by_image_id_returns_first_match() {
+        let mut table = LifecycleTable::new();
+        table.record(ServiceLifecycleRecord {
+            tid: 10,
+            image_id: 5,
+            parent_tid: 0,
+            pm_service_send_cap: 7,
+            state: ServiceState::Spawned,
+        });
+        table.record(ServiceLifecycleRecord {
+            tid: 11,
+            image_id: 6,
+            parent_tid: 1,
+            pm_service_send_cap: 9,
+            state: ServiceState::Spawned,
+        });
+
+        assert_eq!(table.get_by_image_id(5).unwrap().tid, 10);
+        assert_eq!(table.get_by_image_id(6).unwrap().tid, 11);
+        assert!(table.get_by_image_id(99).is_none());
+    }
+
+    #[test]
+    fn lifecycle_table_capacity_is_enforced() {
+        let mut table = LifecycleTable::new();
+        for i in 0..MAX_LIFECYCLE_ENTRIES {
+            assert!(table.record(ServiceLifecycleRecord {
+                tid: i as u64,
+                image_id: 0,
+                parent_tid: 0,
+                pm_service_send_cap: 0,
+                state: ServiceState::Spawned,
+            }));
+        }
+        assert_eq!(table.len(), MAX_LIFECYCLE_ENTRIES);
+        // One more should fail
+        assert!(!table.record(ServiceLifecycleRecord {
+            tid: 9999,
+            image_id: 0,
+            parent_tid: 0,
+            pm_service_send_cap: 0,
+            state: ServiceState::Spawned,
+        }));
     }
 }
