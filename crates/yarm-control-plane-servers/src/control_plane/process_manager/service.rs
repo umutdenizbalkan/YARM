@@ -319,8 +319,8 @@ pub struct ProcessService {
     policy_records: [Option<ProcessSpawnPolicyRecord>; 64],
     restart_token_records: [Option<RestartTokenRecord>; 64],
     restart_control_send_cap: Option<u32>,
-    /// Initramfs send cap saved on initramfs server spawn; cleared after probe runs.
-    vfs_probe_pending: Option<u32>,
+    /// Image id of the pending VFS-backed spawn; cleared after the spawn runs.
+    vfs_probe_pending: Option<u64>,
     handled: usize,
 }
 
@@ -720,7 +720,7 @@ impl ProcessService {
     }
 
     /// Take the VFS send cap saved during VFS server spawn, if any.
-    pub fn take_vfs_probe(&mut self) -> Option<u32> {
+    pub fn take_vfs_probe(&mut self) -> Option<u64> {
         self.vfs_probe_pending.take()
     }
 
@@ -1030,8 +1030,8 @@ impl ProcessService {
                     // image_id=4 is initramfs_srv; probe goes directly to avoid
                     // VFS recv_cap interference from concurrent init requests.
                     let pm_vfs_cap = if my_cap != 0 { my_cap } else { caller_cap };
-                    if req.image_id == 4 && pm_vfs_cap != 0 {
-                        self.vfs_probe_pending = Some(pm_vfs_cap);
+                    if (req.image_id == 4 || req.image_id == 5) && pm_vfs_cap != 0 {
+                        self.vfs_probe_pending = Some(req.image_id);
                     }
                     let result = SpawnV5CapResult::new(tid, caller_cap as u64);
                     let encoded = result.encode();
@@ -1139,40 +1139,50 @@ fn map_elf_error(err: yarm_srv_common::elf::ElfParseError) -> ProcessManagerErro
     }
 }
 
-/// Per-PM-process staging buffer for full ELF images read from the initramfs CPIO.
-///
-/// Spawn `sbin/initramfs_srv` from the boot initramfs CPIO via the
-/// `SpawnFromInitramfsFile` kernel syscall.  The kernel reads the ELF into its
-/// own staging buffer and spawns the process without requiring a user-space
-/// buffer, avoiding physical-memory aliasing between the user BSS and the
-/// kernel image.
+/// Spawn `image_id` from the boot initramfs CPIO via the `SpawnFromInitramfsFile`
+/// kernel syscall.  The kernel reads the ELF into its own staging buffer and
+/// spawns the process without requiring a user-space buffer, avoiding
+/// physical-memory aliasing between the user BSS and the kernel image.
 ///
 /// Must be called BEFORE replying to init so the PM's recv endpoint is quiet.
 #[cfg(not(test))]
-unsafe fn pm_vfs_spawn_image_load() {
-    const CPIO_NAME: &[u8] = b"sbin/initramfs_srv";
+unsafe fn pm_vfs_spawn_image_load(image_id: u64) {
+    let (cpio_name, path_label): (&[u8], &str) = match image_id {
+        4 => (b"sbin/initramfs_srv", "/initramfs/sbin/initramfs_srv"),
+        5 => (b"sbin/devfs_srv",     "/initramfs/sbin/devfs_srv"),
+        _ => return,
+    };
 
     yarm_user_rt::user_log!(
-        "PM_VFS_SPAWN_IMAGE_BEGIN image_id=4 path=/initramfs/sbin/initramfs_srv"
+        "PM_VFS_SPAWN_IMAGE_BEGIN image_id={} path={}",
+        image_id,
+        path_label
     );
 
     let startup_args = [0u64; 18];
     let result = unsafe {
         yarm_user_rt::syscall::spawn_from_initramfs_file(
-            4,          // image_id = initramfs_srv
-            CPIO_NAME,
-            0,          // parent_pid
+            image_id,
+            cpio_name,
+            0,
             &startup_args,
         )
     };
     match result {
-        Ok((tid, _, _)) => {
-            let _ = tid;
-            yarm_user_rt::user_log!("PM_VFS_SPAWN_IMAGE_SELECTED image_id=4 source=vfs");
-        }
-        Err(_) => {
+        Ok((tid, caller_cap, spawner_cap)) => {
             yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_IMAGE_FALLBACK source=cpio reason=spawn_fail"
+                "PM_VFS_SPAWN_RESULT tid={} caller_cap={} spawner_cap={}",
+                tid, caller_cap, spawner_cap
+            );
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_IMAGE_SELECTED image_id={} source=vfs",
+                image_id
+            );
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_IMAGE_FALLBACK image_id={} err={:?} source=cpio reason=spawn_fail",
+                image_id, e
             );
         }
     }
@@ -1516,6 +1526,8 @@ pub fn run() {
     let mut service = ProcessService::new();
     loop {
         // SAFETY: direct syscall wrapper call; PM owns its recv endpoint capability.
+        #[cfg(not(test))]
+        yarm_user_rt::user_log!("PM_RECV_LOOP_BEFORE_RECV recv_cap={}", recv_cap);
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
             Ok(Some((msg, reply_cap))) => {
                 yarm_user_rt::user_log!(
@@ -1525,17 +1537,16 @@ pub fn run() {
                     reply_cap.unwrap_or(u32::MAX)
                 );
                 if let Ok(reply) = service.handle(msg) {
-                    // Pre-reply probe: run while the caller (init) is still blocked
-                    // so PM's recv_cap queue is empty.  Running after the reply would
-                    // race with init's next spawn request arriving in recv_cap before
-                    // PM's ipc_call for the probe can issue its blocking ipc_recv.
-                    #[cfg(not(test))]
-                    if service.take_vfs_probe().is_some() {
-                        unsafe { pm_vfs_spawn_image_load() };
-                    }
                     if let Some(cap) = reply_cap {
                         // SAFETY: kernel validates reply capability rights/object.
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
+                    }
+                    // Post-reply VFS-backed spawn: SpawnFromInitramfsFile is a direct
+                    // kernel syscall with no IPC interaction, so there is no race with
+                    // init's next request arriving on PM's recv endpoint.
+                    #[cfg(not(test))]
+                    if let Some(probe_image_id) = service.take_vfs_probe() {
+                        unsafe { pm_vfs_spawn_image_load(probe_image_id) };
                     }
                 } else {
                     yarm_user_rt::user_log!(

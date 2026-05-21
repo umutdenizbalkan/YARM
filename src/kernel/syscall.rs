@@ -1578,8 +1578,17 @@ fn handle_spawn_from_initramfs_file(
 
     let spawner_tid = current_tid(kernel).unwrap_or(0);
     let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
-        Ok((_, send_cap, recv_cap)) => (send_cap.0, recv_cap.0),
-        Err(_) => (0u64, 0u64),
+        Ok((_, send_cap, recv_cap)) => {
+            crate::yarm_log!(
+                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
+                spawner_tid, send_cap.0, recv_cap.0
+            );
+            (send_cap.0, recv_cap.0)
+        }
+        Err(e) => {
+            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
+            (0u64, 0u64)
+        }
     };
     let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
         match kernel.grant_capability_task_to_task_with_rights(
