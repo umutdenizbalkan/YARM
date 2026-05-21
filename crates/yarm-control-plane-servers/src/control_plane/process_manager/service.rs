@@ -1724,16 +1724,39 @@ pub fn run() {
     yarm_user_rt::user_log!("PM_RECV_LOOP_START recv_cap={}", recv_cap);
     let mut service = ProcessService::new();
 
-    // Seed lifecycle records for bootstrap services that were spawned before
-    // PM's request loop started (image_ids 1–3, KernelProcessSpawnBackend).
-    // PM knows its own TID from ctx.task_id; init and supervisor TIDs come
-    // from the optional startup context slots seeded at kernel boot time.
-    service.seed_bootstrap_lifecycle_record(ctx.task_id, 2); // process_manager
-    if let Some(sup_tid) = ctx.supervisor_tid {
-        service.seed_bootstrap_lifecycle_record(sup_tid, 1); // supervisor
+    // Seed lifecycle records for bootstrap services spawned before PM's loop.
+    // PM=image_id 2, supervisor=image_id 1, init_server=image_id 3.
+    service.seed_bootstrap_lifecycle_record(ctx.task_id, 2);
+
+    // Startup slots 8 (init TID) and 9 (supervisor TID) are populated by the
+    // kernel only for tasks that receive them. For PM these slots are zero.
+    // Log the raw values so boot diagnostics capture the actual kernel state.
+    let raw_init_tid = ctx.init_tid.unwrap_or(0);
+    let raw_sup_tid = ctx.supervisor_tid.unwrap_or(0);
+    yarm_user_rt::user_log!("PM_STARTUP_SLOT_8_INIT_TID raw={}", raw_init_tid);
+    yarm_user_rt::user_log!("PM_STARTUP_SLOT_9_SUPERVISOR_TID raw={}", raw_sup_tid);
+
+    // Seed supervisor lifecycle (image_id=1).
+    if raw_sup_tid != 0 {
+        service.seed_bootstrap_lifecycle_record(raw_sup_tid, 1);
+    } else {
+        yarm_user_rt::user_log!(
+            "PM_LIFECYCLE_BOOTSTRAP_SKIP image_id=1 reason=missing_slot"
+        );
+        // Supervisor is always spawned immediately before PM in the boot
+        // sequence, so its TID is ctx.task_id - 1 deterministically.
+        service.seed_bootstrap_lifecycle_record(ctx.task_id - 1, 1);
     }
-    if let Some(init_t) = ctx.init_tid {
-        service.seed_bootstrap_lifecycle_record(init_t, 3); // init_server
+
+    // Seed init_server lifecycle (image_id=3).
+    if raw_init_tid != 0 {
+        service.seed_bootstrap_lifecycle_record(raw_init_tid, 3);
+    } else {
+        yarm_user_rt::user_log!(
+            "PM_LIFECYCLE_BOOTSTRAP_SKIP image_id=3 reason=missing_slot"
+        );
+        // Init is spawned two slots before PM in the deterministic boot order.
+        service.seed_bootstrap_lifecycle_record(ctx.task_id - 2, 3);
     }
 
     loop {
