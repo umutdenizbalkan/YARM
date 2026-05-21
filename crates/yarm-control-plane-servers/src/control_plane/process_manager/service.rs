@@ -1030,7 +1030,7 @@ impl ProcessService {
                     // image_id=4 is initramfs_srv; probe goes directly to avoid
                     // VFS recv_cap interference from concurrent init requests.
                     let pm_vfs_cap = if my_cap != 0 { my_cap } else { caller_cap };
-                    if (req.image_id == 4 || req.image_id == 5) && pm_vfs_cap != 0 {
+                    if (req.image_id == 4 || req.image_id == 5 || req.image_id == 6) && pm_vfs_cap != 0 {
                         self.vfs_probe_pending = Some(req.image_id);
                     }
                     let result = SpawnV5CapResult::new(tid, caller_cap as u64);
@@ -1150,6 +1150,7 @@ unsafe fn pm_vfs_spawn_image_load(image_id: u64, recv_cap_debug: u32) {
     let (cpio_name, path_label): (&[u8], &str) = match image_id {
         4 => (b"sbin/initramfs_srv", "/initramfs/sbin/initramfs_srv"),
         5 => (b"sbin/devfs_srv",     "/initramfs/sbin/devfs_srv"),
+        6 => (b"sbin/vfs_server",    "/initramfs/sbin/vfs_server"),
         _ => return,
     };
 
@@ -1227,8 +1228,8 @@ unsafe fn pm_vfs_spawn_image_load(image_id: u64, recv_cap_debug: u32) {
     match result {
         Ok((tid, caller_cap, spawner_cap)) => {
             yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_RESULT tid={} caller_cap={} spawner_cap={}",
-                tid, caller_cap, spawner_cap
+                "PM_VFS_SPAWN_RESULT image_id={} tid={} caller_cap={} spawner_cap={}",
+                image_id, tid, caller_cap, spawner_cap
             );
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_IMAGE_SELECTED image_id={} source=vfs",

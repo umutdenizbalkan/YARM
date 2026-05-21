@@ -425,7 +425,7 @@ impl KernelState {
             );
             panic!("PMEM_ALLOC_PT_POOL_BUG: main frame allocator returned a PT-pool PA");
         }
-        #[cfg(not(feature = "hosted-dev"))]
+        #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
         crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user", pa);
         Ok(pa)
     }
@@ -455,7 +455,7 @@ impl KernelState {
             );
             panic!("PMEM_ALLOC_PT_POOL_BUG_CONTIG: main contiguous allocator returned a PT-pool PA");
         }
-        #[cfg(not(feature = "hosted-dev"))]
+        #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
         crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user_contig pages={}", phys.0, pages);
         self.create_memory_object_with_len(phys, total_len)
     }

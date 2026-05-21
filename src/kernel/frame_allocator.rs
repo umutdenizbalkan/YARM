@@ -175,7 +175,7 @@ impl PhysicalFrameAllocator {
             .fast_path_extent_index(pages)
             .or_else(|| self.find_extent_index(pages))
         {
-            #[cfg(not(feature = "hosted-dev"))]
+            #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
             if let Some(ext) = self.extents[idx] {
                 crate::yarm_log!(
                     "CONTIG_ALLOC_CANDIDATE start=0x{:x} pages={}",
@@ -186,7 +186,7 @@ impl PhysicalFrameAllocator {
             let (alloc_phys, _, _) = self.split_extent_for_allocation(idx, pages)?;
             self.free_frames = self.free_frames.saturating_sub(pages);
             self.refresh_run_metadata();
-            #[cfg(not(feature = "hosted-dev"))]
+            #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
             crate::yarm_log!("CONTIG_ALLOC_COMMIT start=0x{:x} pages={}", alloc_phys, pages);
             for page in 0..pages {
                 let phys = alloc_phys.saturating_add((page as u64).saturating_mul(PAGE_SIZE_U64));
@@ -659,7 +659,7 @@ pub fn alloc_pt_frame() -> Result<u64, FrameAllocError> {
         .as_mut()
         .ok_or(FrameAllocError::Uninitialized)?
         .alloc_frame()?;
-    #[cfg(not(feature = "hosted-dev"))]
+    #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
     crate::yarm_log!("PT_ALLOC_FRAME pa=0x{:x}", pa);
     Ok(pa)
 }

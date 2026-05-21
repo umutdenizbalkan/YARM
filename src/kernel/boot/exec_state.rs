@@ -272,7 +272,7 @@ impl KernelState {
                         flags: stage_flags,
                     },
                 )?;
-                #[cfg(not(feature = "hosted-dev"))]
+                #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
                 crate::yarm_log!(
                     "KSPAWN_NEW_TASK_MAP_RANGE asid={} va=0x{:x} pa=0x{:x}",
                     asid.0,
