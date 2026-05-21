@@ -410,6 +410,19 @@ pub fn run() {
         }
     }
 
+    // --- Spawn driver_manager (image_id=7) ---
+    // No service caps required at spawn time; driver_manager blocks on its own
+    // recv endpoint waiting for driver registration requests.
+    yarm_user_rt::user_log!("INIT_DRIVER_MANAGER_SPAWN_V5_CALL_BEGIN");
+    let Some((dm_child_tid, _dm_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 7, [0, 0, 0, 0], 0) else {
+        yarm_user_rt::user_log!("INIT_DRIVER_MANAGER_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
+        return;
+    };
+    yarm_user_rt::user_log!(
+        "INIT_DRIVER_MANAGER_SPAWN_V5_CALL_RETURN ok=1 child_tid={}",
+        dm_child_tid
+    );
+
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;
     };

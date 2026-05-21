@@ -23,6 +23,10 @@ pub fn run_supervisor_server() {
     control_plane::supervisor::run();
 }
 
+pub fn run_driver_manager() {
+    control_plane::driver_manager::run();
+}
+
 pub fn run_driver_manager_demo() {
     use crate::control_plane::driver_manager::DriverService;
     use yarm_ipc_abi::driver_abi::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};
@@ -90,9 +94,10 @@ mod tests {
         let proc_src = include_str!("control_plane/process_manager/service.rs");
         let sup_src = include_str!("control_plane/supervisor/service.rs");
         let vfs_src = include_str!("control_plane/vfs/service.rs");
+        let dm_src = include_str!("control_plane/driver_manager/service.rs");
         let legacy_cp = ["yarm", "::services::", "control_plane::"].concat();
         let legacy_fs = ["yarm", "::services::", "fs::"].concat();
-        for src in [init_src, proc_src, sup_src, vfs_src] {
+        for src in [init_src, proc_src, sup_src, vfs_src, dm_src] {
             assert!(
                 !src.contains(legacy_cp.as_str()),
                 "workspace control-plane impl must not delegate to legacy control_plane namespace"

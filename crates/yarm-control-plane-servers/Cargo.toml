@@ -35,7 +35,6 @@ path = "src/bin/supervisor.rs"
 [[bin]]
 name = "driver_manager"
 path = "src/bin/driver_manager.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "vfs_server"
