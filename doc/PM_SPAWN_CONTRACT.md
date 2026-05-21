@@ -9,11 +9,28 @@ spawning, capability delivery, and lifecycle tracking as implemented in
 
 ---
 
+## Bootstrap Boundary
+
+The spawn path is divided at the compile-time constants:
+
+```rust
+const BOOTSTRAP_IMAGE_ID_MIN: u64 = 1;
+const BOOTSTRAP_IMAGE_ID_MAX: u64 = 3;
+```
+
+- **image_id 0** — kernel-internal; PM returns `Err(Unsupported)` immediately.
+- **image_ids 1–3** (`BOOTSTRAP_IMAGE_ID_MIN..=BOOTSTRAP_IMAGE_ID_MAX`) — bootstrap-critical. These must be available before VFS exists and are spawned via `KernelProcessSpawnBackend::spawn_with_caps()`.
+- **image_id ≥ 4** — all non-bootstrap images. PM unconditionally routes through `pm_vfs_spawn_inline()`. An unknown `image_id` in this range returns `Err(Unsupported)`; a kernel syscall failure returns `Err(TableFull)`.
+
+**New image IDs should be added to `pm_vfs_spawn_inline`'s match table and go through the VFS-backed path by default. The bootstrap range (`1..=3`) must remain frozen.**
+
+---
+
 ## Image ID → Binary Path Table
 
 | image_id | CPIO path               | Spawn backend            |
 |----------|-------------------------|--------------------------|
-| 0        | (init, kernel-internal) | kernel direct            |
+| 0        | (init, kernel-internal) | rejected (`Unsupported`) |
 | 1        | `sbin/supervisor`       | `KernelProcessSpawnBackend` |
 | 2        | `sbin/process_manager`  | `KernelProcessSpawnBackend` |
 | 3        | `sbin/init_server`      | `KernelProcessSpawnBackend` |
@@ -21,10 +38,11 @@ spawning, capability delivery, and lifecycle tracking as implemented in
 | 5        | `sbin/devfs_srv`        | `pm_vfs_spawn_inline`    |
 | 6        | `sbin/vfs_server`       | `pm_vfs_spawn_inline`    |
 | 7        | `sbin/driver_manager`   | `pm_vfs_spawn_inline`    |
+| ≥ 8      | (future)                | `pm_vfs_spawn_inline`    |
 
-image_ids 4–7 use `SpawnFromInitramfsFile` (syscall nr=26) via
+image_ids ≥ 4 use `SpawnFromInitramfsFile` (syscall nr=26) via
 `pm_vfs_spawn_inline`. image_ids 1–3 use the direct kernel spawn backend.
-image_id=0 is never spawned by PM.
+image_id=0 is rejected by PM — it is never spawned from userspace.
 
 ---
 
@@ -176,19 +194,36 @@ can be given valid initramfs and devfs caps at spawn time).
 
 | Marker                          | Emitted by       | Description                                     |
 |---------------------------------|------------------|-------------------------------------------------|
+| `PM_VFS_SPAWN_IMAGE_BEGIN`      | PM               | before `SpawnFromInitramfsFile` syscall         |
 | `PM_VFS_SPAWN_RESULT`           | PM               | raw kernel spawn result (tid, caller_cap, spawner_cap) |
 | `PM_VFS_SPAWN_IMAGE_SELECTED`   | PM               | confirms VFS-backed path selected for image_id  |
-| `PM_VFS_SPAWN_ERROR`            | PM               | spawn syscall returned an error                 |
+| `PM_VFS_SPAWN_IMAGE_UNKNOWN`    | PM               | image_id has no CPIO mapping; returns Unsupported |
+| `PM_VFS_SPAWN_FAIL`             | PM               | spawn syscall returned an error; returns TableFull |
 | `PM_LIFECYCLE_RECORD`           | PM               | per-spawn record: image_id, tid, pm_service_send_cap, parent_tid, state, recorded flag |
 | `INIT_*_SPAWN_V5_CALL_BEGIN`    | init_server      | before each PROC_OP_SPAWN_V5_CAP call           |
 | `INIT_*_SPAWN_V5_CALL_RETURN`   | init_server      | after reply: ok=1 child_tid=N or ok=0           |
 
 ---
 
+## Lifecycle Table in Tests
+
+In `#[cfg(test)]` builds, the non-test spawn syscall is unavailable. The test
+path uses `synthetic_elf_image()` and `manager.allocate_process()`. It **must**
+call `lifecycle_table.record()` with a `ServiceLifecycleRecord` so that test
+assertions on lifecycle state are valid. `pm_service_send_cap` is 0 in tests
+because no real capability is minted.
+
+`image_id=0` is rejected in the test path just as in non-test: returns
+`Err(Unsupported)` before any allocation.
+
+---
+
 ## Forbidden Patterns
 
+- **Routing non-bootstrap images through `KernelProcessSpawnBackend`**: image_ids ≥ 4 must always use `pm_vfs_spawn_inline`. Never widen the bootstrap range without also ensuring VFS is available at that point in the boot sequence.
+- **Adding to the bootstrap range**: `BOOTSTRAP_IMAGE_ID_MIN..=BOOTSTRAP_IMAGE_ID_MAX` (`1..=3`) is frozen. New services are VFS-backed by default.
 - **Duplicate spawns**: `pm_vfs_spawn_inline` must be called exactly once per
-  `SpawnV5Cap` request for image_ids 4–7. The old two-phase pattern
+  `SpawnV5Cap` request for image_ids ≥ 4. The old two-phase pattern
   (`spawn_with_caps` + post-reply `vfs_probe_pending` probe) is retired and
   must not be re-introduced.
 - **`vfs_probe_pending` field**: removed; any re-introduction breaks the
@@ -196,10 +231,10 @@ can be given valid initramfs and devfs caps at spawn time).
 - **Discarding `spawner_cap`**: the third return value of `pm_vfs_spawn_inline`
   must not be ignored. Discarding it loses PM's own cap to the service when
   parent delegation is in play.
-- **Fake success**: a spawn returning `Err` must propagate
-  `ProcessManagerError::TableFull` (or appropriate variant) to the caller
-  rather than replying with a zero TID.
-- **Spawning image_ids 4–7 via `KernelProcessSpawnBackend`**: these must always
-  go through `pm_vfs_spawn_inline` (ELF loaded from CPIO via
-  `SpawnFromInitramfsFile`). The legacy direct-spawn backend does not load from
-  the initramfs image.
+- **Fake success**: a spawn returning `Err` must propagate the error to the
+  caller rather than replying with a zero TID. `pm_vfs_spawn_inline` returns
+  `Err(Unsupported)` for unknown image_ids and `Err(TableFull)` on syscall
+  failure — both propagate via `?` in the dispatch block.
+- **Skipping lifecycle recording**: every `SpawnV5Cap` that reaches the
+  `lifecycle_table.record()` call — both in non-test and test paths — must
+  record the spawned service. Gaps in the lifecycle table are a bug.

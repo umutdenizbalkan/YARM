@@ -34,6 +34,11 @@ use yarm_user_rt::task::TaskClass;
 
 #[cfg(test)]
 const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
+/// Image IDs in this inclusive range are bootstrap-critical: they must be
+/// spawned via the direct kernel path before VFS is available.
+const BOOTSTRAP_IMAGE_ID_MIN: u64 = 1;
+const BOOTSTRAP_IMAGE_ID_MAX: u64 = 3;
+
 const MAX_EXEC_LOAD_SEGMENTS: usize = 8;
 const MAX_EXEC_STACK_BYTES: usize = 4096;
 const MAX_EXEC_ARGV: usize = 16;
@@ -1109,31 +1114,11 @@ impl ProcessService {
                     // spawner_cap:  non-zero only when parent_pid != 0; this is PM's own
                     //               copy of the service send cap (high 32 bits of ret2).
                     // pm_send_cap:  whichever of the above lives in PM's own CNode.
-                    let (tid, caller_cap, spawner_cap) =
-                        if req.image_id == 4
-                        || req.image_id == 5
-                        || req.image_id == 6
-                        || req.image_id == 7
-                    {
-                            // VFS-backed path: read ELF from initramfs CPIO via the
-                            // SpawnFromInitramfsFile kernel syscall (nr=26).  This is the
-                            // sole spawn for these image_ids.
-                            let mut startup_args = [0u64; 18];
-                            startup_args[13] = req.service_caps[0];
-                            startup_args[14] = req.service_caps[1];
-                            startup_args[15] = req.service_caps[2];
-                            startup_args[16] = req.service_caps[3];
-                            match unsafe {
-                                pm_vfs_spawn_inline(
-                                    req.image_id,
-                                    req.parent_pid.0,
-                                    &startup_args,
-                                )
-                            } {
-                                Some((t, c, s)) => (t, c as u64, s),
-                                None => return Err(ProcessManagerError::TableFull),
-                            }
-                        } else {
+                    let (tid, caller_cap, spawner_cap) = match req.image_id {
+                        // image_id 0 is kernel-internal; PM must never spawn it.
+                        0 => return Err(ProcessManagerError::Unsupported),
+                        // Bootstrap-critical images must reach the kernel before VFS exists.
+                        BOOTSTRAP_IMAGE_ID_MIN..=BOOTSTRAP_IMAGE_ID_MAX => {
                             let backend = KernelProcessSpawnBackend::new();
                             let (t, c, s) = backend.spawn_with_caps(
                                 req.image_id,
@@ -1141,7 +1126,24 @@ impl ProcessService {
                                 req.service_caps,
                             )?;
                             (t, c as u64, s)
-                        };
+                        }
+                        // All other image IDs use the VFS-backed spawn path.
+                        _ => {
+                            let mut startup_args = [0u64; 18];
+                            startup_args[13] = req.service_caps[0];
+                            startup_args[14] = req.service_caps[1];
+                            startup_args[15] = req.service_caps[2];
+                            startup_args[16] = req.service_caps[3];
+                            let (t, c, s) = unsafe {
+                                pm_vfs_spawn_inline(
+                                    req.image_id,
+                                    req.parent_pid.0,
+                                    &startup_args,
+                                )
+                            }?;
+                            (t, c as u64, s)
+                        }
+                    };
                     // PM's own send cap: prefer spawner_cap (set when parent got a
                     // delegated copy); fall back to caller_cap when parent_pid == 0.
                     let pm_send_cap =
@@ -1170,10 +1172,20 @@ impl ProcessService {
                 }
                 #[cfg(test)]
                 {
+                    if req.image_id == 0 {
+                        return Err(ProcessManagerError::Unsupported);
+                    }
                     let image = synthetic_elf_image(req.image_id);
                     let info = ElfImageInfo::parse(req.image_id, &image).map_err(map_elf_error)?;
                     let pid = self.manager.allocate_process(req.parent_pid)?;
                     self.record_spawn_policy(pid, req.image_id, info.entry, None, None)?;
+                    self.lifecycle_table.record(ServiceLifecycleRecord {
+                        tid: pid.0,
+                        image_id: req.image_id,
+                        parent_tid: req.parent_pid.0,
+                        pm_service_send_cap: 0,
+                        state: ServiceState::Spawned,
+                    });
                     let result = SpawnV5CapResult::new(pid.0, 0);
                     Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &result.encode())
                         .map_err(|_| ProcessManagerError::Malformed)
@@ -1269,7 +1281,9 @@ fn map_elf_error(err: yarm_srv_common::elf::ElfParseError) -> ProcessManagerErro
 /// kernel syscall (nr=26).  The kernel reads the ELF into its own staging buffer
 /// and spawns the process without requiring a user-space buffer.
 ///
-/// Returns `Some((tid, caller_cap, spawner_cap))` on success, `None` on failure.
+/// Returns `Ok((tid, caller_cap, spawner_cap))` on success.
+/// Returns `Err(Unsupported)` if `image_id` has no known CPIO mapping.
+/// Returns `Err(TableFull)` if the kernel spawn syscall fails.
 /// `startup_args` must have service caps at indices 13-16 (same layout as
 /// `spawn_process_with_startup_caps`).
 #[cfg(not(test))]
@@ -1277,13 +1291,19 @@ unsafe fn pm_vfs_spawn_inline(
     image_id: u64,
     parent_pid: u64,
     startup_args: &[u64; 18],
-) -> Option<(u64, u32, u32)> {
+) -> Result<(u64, u32, u32), ProcessManagerError> {
     let (cpio_name, path_label): (&[u8], &str) = match image_id {
-        4 => (b"sbin/initramfs_srv", "/initramfs/sbin/initramfs_srv"),
-        5 => (b"sbin/devfs_srv",     "/initramfs/sbin/devfs_srv"),
+        4 => (b"sbin/initramfs_srv",  "/initramfs/sbin/initramfs_srv"),
+        5 => (b"sbin/devfs_srv",      "/initramfs/sbin/devfs_srv"),
         6 => (b"sbin/vfs_server",     "/initramfs/sbin/vfs_server"),
         7 => (b"sbin/driver_manager", "/initramfs/sbin/driver_manager"),
-        _ => return None,
+        _ => {
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_IMAGE_UNKNOWN image_id={}",
+                image_id
+            );
+            return Err(ProcessManagerError::Unsupported);
+        }
     };
     yarm_user_rt::user_log!(
         "PM_VFS_SPAWN_IMAGE_BEGIN image_id={} path={} parent_pid={}",
@@ -1307,14 +1327,14 @@ unsafe fn pm_vfs_spawn_inline(
                 "PM_VFS_SPAWN_IMAGE_SELECTED image_id={} source=vfs",
                 image_id
             );
-            Some((tid, caller_cap, spawner_cap))
+            Ok((tid, caller_cap, spawner_cap))
         }
         Err(e) => {
             yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_IMAGE_FALLBACK image_id={} err={:?} source=cpio reason=spawn_fail",
+                "PM_VFS_SPAWN_FAIL image_id={} err={:?}",
                 image_id, e
             );
-            None
+            Err(ProcessManagerError::TableFull)
         }
     }
 }
