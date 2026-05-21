@@ -305,6 +305,11 @@ pub fn run_with_kernel_ipc(
     run_request_loop_over_kernel_ipc(runtime, &mut vfs, path_id)
 }
 
+fn vfs_error_reply(status: u32) -> yarm_user_rt::ipc::Message {
+    yarm_user_rt::ipc::Message::new(1u64, &status.to_le_bytes())
+        .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1u64, &[]).expect("err msg"))
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("VFS_SRV_ENTRY");
     let mut vfs = FsService::with_backend(InMemoryBackend::new());
@@ -424,64 +429,85 @@ pub fn run() {
         // Path-based ops are normalized before mount lookup.
         // `route()` and `lookup()` return owned `MountLabel` copies so that
         // callers may freely mutate the tables afterward (e.g. fd_table.remove).
-        let route = 'route: {
+        // Error variants carry a canonical VFS_STATUS_ERR_* code.
+        let route: Result<(u32, super::mount_table::MountLabel), u32> = 'route: {
             use yarm_ipc_abi::vfs_abi::{
                 OpenAtInlinePath, ReadWriteArgs, StatxInlinePath,
                 VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
+                VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC,
+                VFS_STATUS_ERR_INVALID_PATH, VFS_STATUS_ERR_NO_MOUNT,
+                VFS_STATUS_ERR_UNKNOWN_OP,
             };
-            let raw_path: &[u8] = match msg.opcode {
-                VFS_OP_STATX => StatxInlinePath::decode(msg.as_slice())
-                    .map(|s| s.path)
-                    .unwrap_or(b""),
-                VFS_OP_OPENAT => OpenAtInlinePath::decode(msg.as_slice())
-                    .map(|s| s.path)
-                    .unwrap_or(b""),
-                _ => b"",
-            };
-            if !raw_path.is_empty() {
-                let norm = match super::path::normalize(raw_path) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        yarm_user_rt::user_log!("VFS_PATH_NORM_REJECT reason={}", e.as_str());
-                        break 'route None;
-                    }
-                };
-                let path = norm.as_bytes();
-                let path_str = core::str::from_utf8(path).unwrap_or("?");
-                if let Some((send_cap, label)) = mount_table.route(path) {
-                    yarm_user_rt::user_log!(
-                        "VFS_ROUTE_LOOKUP path={} target={}",
-                        path_str, label.as_str()
-                    );
-                    Some((send_cap, label))
-                } else {
-                    None
-                }
-            } else if msg.opcode == VFS_OP_READ || msg.opcode == VFS_OP_CLOSE {
-                if let Ok(args) = ReadWriteArgs::decode(msg.as_slice()) {
-                    if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_reply_cap as u64) {
-                        yarm_user_rt::user_log!(
-                            "VFS_ROUTE_FD_LOOKUP fd={} target={}",
-                            args.fd, label.as_str()
-                        );
-                        Some((send_cap, label))
+            match msg.opcode {
+                VFS_OP_STATX | VFS_OP_OPENAT => {
+                    let raw_path: Option<&[u8]> = if msg.opcode == VFS_OP_STATX {
+                        StatxInlinePath::decode(msg.as_slice()).map(|s| s.path)
                     } else {
-                        None
+                        OpenAtInlinePath::decode(msg.as_slice()).map(|s| s.path)
+                    };
+                    let raw_path = match raw_path {
+                        Some(p) => p,
+                        None => break 'route Err(VFS_STATUS_ERR_INVALID_PATH),
+                    };
+                    let norm = match super::path::normalize(raw_path) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            yarm_user_rt::user_log!(
+                                "VFS_PATH_NORM_REJECT reason={}", e.as_str()
+                            );
+                            break 'route Err(VFS_STATUS_ERR_INVALID_PATH);
+                        }
+                    };
+                    let path = norm.as_bytes();
+                    let path_str = core::str::from_utf8(path).unwrap_or("?");
+                    if let Some((send_cap, label)) = mount_table.route(path) {
+                        yarm_user_rt::user_log!(
+                            "VFS_ROUTE_LOOKUP path={} target={}",
+                            path_str, label.as_str()
+                        );
+                        Ok((send_cap, label))
+                    } else {
+                        yarm_user_rt::user_log!("VFS_ROUTE_NO_MOUNT path={}", path_str);
+                        Err(VFS_STATUS_ERR_NO_MOUNT)
                     }
-                } else {
-                    None
                 }
-            } else {
-                None
+                VFS_OP_READ | VFS_OP_CLOSE => {
+                    match ReadWriteArgs::decode(msg.as_slice()) {
+                        Ok(args) => {
+                            if let Some((send_cap, label)) =
+                                fd_table.lookup(args.fd, client_reply_cap as u64)
+                            {
+                                yarm_user_rt::user_log!(
+                                    "VFS_ROUTE_FD_LOOKUP fd={} target={}",
+                                    args.fd, label.as_str()
+                                );
+                                Ok((send_cap, label))
+                            } else {
+                                yarm_user_rt::user_log!("VFS_ROUTE_BAD_FD fd={}", args.fd);
+                                Err(VFS_STATUS_ERR_BAD_FD)
+                            }
+                        }
+                        Err(_) => {
+                            yarm_user_rt::user_log!("VFS_ROUTE_CODEC_ERR");
+                            Err(VFS_STATUS_ERR_CODEC)
+                        }
+                    }
+                }
+                op => {
+                    yarm_user_rt::user_log!("VFS_ROUTE_UNKNOWN_OP op={}", op);
+                    Err(VFS_STATUS_ERR_UNKNOWN_OP)
+                }
             }
         };
 
-        let Some((backend_send_cap, target_label)) = route else {
-            // No route: reply with error status, keep serving.
-            yarm_user_rt::user_log!("VFS_ROUTE_LOOKUP path=? target=none");
-            let err = yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg");
-            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
-            continue;
+        let (backend_send_cap, target_label) = match route {
+            Ok(pair) => pair,
+            Err(status) => {
+                yarm_user_rt::user_log!("VFS_ROUTE_ERR status={}", status);
+                let err = vfs_error_reply(status);
+                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
+                continue;
+            }
         };
 
         yarm_user_rt::user_log!(
@@ -543,7 +569,7 @@ pub fn run() {
             }
             _ => {
                 yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=1");
-                let err = yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg");
+                let err = vfs_error_reply(yarm_ipc_abi::vfs_abi::VFS_STATUS_ERR_BACKEND);
                 let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
             }
         }

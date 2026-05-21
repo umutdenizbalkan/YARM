@@ -7,6 +7,42 @@ pub enum VfsCodecError {
 }
 
 pub const VFS_SERVER_ABI_VERSION: u16 = 1;
+
+// ── VFS control-plane reply status codes ────────────────────────────────────
+//
+// Locally-generated error replies from the VFS router carry a 4-byte LE u32
+// status in the reply payload (opcode=1 on error, opcode=0 on success).
+// Backend success replies are forwarded verbatim and carry opcode=0.
+
+pub const VFS_STATUS_OK: u32 = 0;
+/// Opcode not handled by the VFS router (not STATX/OPENAT/READ/CLOSE).
+pub const VFS_STATUS_ERR_UNKNOWN_OP: u32 = 1;
+/// Path payload malformed, or path fails normalization (empty/non-abs/too-long).
+pub const VFS_STATUS_ERR_INVALID_PATH: u32 = 2;
+/// Normalized path matches no mount-table prefix.
+pub const VFS_STATUS_ERR_NO_MOUNT: u32 = 3;
+/// Fd absent from the table, or table entry belongs to a different client.
+pub const VFS_STATUS_ERR_BAD_FD: u32 = 4;
+/// Backend IPC timed out or returned no reply.
+pub const VFS_STATUS_ERR_BACKEND: u32 = 5;
+/// READ/CLOSE payload could not be decoded.
+pub const VFS_STATUS_ERR_CODEC: u32 = 6;
+
+/// Encode a VFS control-plane status as a 4-byte little-endian payload.
+pub fn encode_vfs_status(status: u32) -> [u8; 4] {
+    status.to_le_bytes()
+}
+
+/// Decode the leading 4-byte LE status from a reply payload.
+/// Returns `None` if `payload` is shorter than 4 bytes.
+pub fn decode_vfs_status(payload: &[u8]) -> Option<u32> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&payload[..4]);
+    Some(u32::from_le_bytes(b))
+}
 pub const VFS_CODEC_V1_VERSION: u16 = 1;
 
 pub const VFS_OP_STATX: u16 = 22;
@@ -458,5 +494,104 @@ mod tests {
         assert_eq!(VFS_MOUNT_STATUS_ERR_FULL, 2);
         assert_eq!(VFS_MOUNT_STATUS_ERR_INVALID_CAP, 3);
         assert_eq!(VFS_MOUNT_STATUS_ERR_INVALID_PREFIX, 4);
+    }
+
+    // ── VFS router status code tests ─────────────────────────────────────────
+
+    #[test]
+    fn vfs_status_constants_are_frozen() {
+        assert_eq!(VFS_STATUS_OK, 0);
+        assert_eq!(VFS_STATUS_ERR_UNKNOWN_OP, 1);
+        assert_eq!(VFS_STATUS_ERR_INVALID_PATH, 2);
+        assert_eq!(VFS_STATUS_ERR_NO_MOUNT, 3);
+        assert_eq!(VFS_STATUS_ERR_BAD_FD, 4);
+        assert_eq!(VFS_STATUS_ERR_BACKEND, 5);
+        assert_eq!(VFS_STATUS_ERR_CODEC, 6);
+    }
+
+    #[test]
+    fn encode_decode_vfs_status_roundtrips_all_codes() {
+        let codes = [
+            VFS_STATUS_OK,
+            VFS_STATUS_ERR_UNKNOWN_OP,
+            VFS_STATUS_ERR_INVALID_PATH,
+            VFS_STATUS_ERR_NO_MOUNT,
+            VFS_STATUS_ERR_BAD_FD,
+            VFS_STATUS_ERR_BACKEND,
+            VFS_STATUS_ERR_CODEC,
+        ];
+        for &status in &codes {
+            let encoded = encode_vfs_status(status);
+            assert_eq!(
+                decode_vfs_status(&encoded),
+                Some(status),
+                "roundtrip failed for status={status}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_vfs_status_rejects_short_payload() {
+        assert_eq!(decode_vfs_status(&[]), None);
+        assert_eq!(decode_vfs_status(&[0u8; 1]), None);
+        assert_eq!(decode_vfs_status(&[0u8; 3]), None);
+        // Exactly 4 bytes succeeds.
+        assert_eq!(decode_vfs_status(&[0u8; 4]), Some(0));
+    }
+
+    #[test]
+    fn decode_vfs_status_reads_first_four_bytes_ignores_trailing() {
+        // VFS_STATUS_ERR_BAD_FD=4 in LE, followed by noise.
+        let payload = [4u8, 0, 0, 0, 0xFF, 0xFF, 0xFF];
+        assert_eq!(decode_vfs_status(&payload), Some(VFS_STATUS_ERR_BAD_FD));
+    }
+
+    #[test]
+    fn encode_vfs_status_is_little_endian() {
+        // VFS_STATUS_ERR_INVALID_PATH = 2 → [0x02, 0x00, 0x00, 0x00]
+        assert_eq!(encode_vfs_status(VFS_STATUS_ERR_INVALID_PATH), [2, 0, 0, 0]);
+        // VFS_STATUS_ERR_NO_MOUNT = 3 → [0x03, 0x00, 0x00, 0x00]
+        assert_eq!(encode_vfs_status(VFS_STATUS_ERR_NO_MOUNT), [3, 0, 0, 0]);
+        // VFS_STATUS_ERR_BAD_FD = 4 → [0x04, 0x00, 0x00, 0x00]
+        assert_eq!(encode_vfs_status(VFS_STATUS_ERR_BAD_FD), [4, 0, 0, 0]);
+    }
+
+    #[test]
+    fn vfs_error_path_mapping_invariants() {
+        // Path normalization / decode failures → INVALID_PATH (not NO_MOUNT)
+        assert_ne!(VFS_STATUS_ERR_INVALID_PATH, VFS_STATUS_ERR_NO_MOUNT);
+        // Mount miss → NO_MOUNT (not BAD_FD, the path was valid)
+        assert_ne!(VFS_STATUS_ERR_NO_MOUNT, VFS_STATUS_ERR_BAD_FD);
+        // Fd miss / wrong client → BAD_FD (not BACKEND)
+        assert_ne!(VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_BACKEND);
+        // Codec failure on fd-op → CODEC (distinct from BAD_FD)
+        assert_ne!(VFS_STATUS_ERR_CODEC, VFS_STATUS_ERR_BAD_FD);
+        // All error codes are non-zero (distinct from OK)
+        for &code in &[
+            VFS_STATUS_ERR_UNKNOWN_OP,
+            VFS_STATUS_ERR_INVALID_PATH,
+            VFS_STATUS_ERR_NO_MOUNT,
+            VFS_STATUS_ERR_BAD_FD,
+            VFS_STATUS_ERR_BACKEND,
+            VFS_STATUS_ERR_CODEC,
+        ] {
+            assert_ne!(code, VFS_STATUS_OK, "error code {code} must not equal OK");
+        }
+    }
+
+    #[test]
+    fn vfs_status_golden_vectors_for_each_error_path() {
+        // Unknown opcode → status=1, LE [01 00 00 00]
+        assert_eq!(encode_vfs_status(VFS_STATUS_ERR_UNKNOWN_OP), [1, 0, 0, 0]);
+        // Invalid path  → status=2
+        assert_eq!(encode_vfs_status(VFS_STATUS_ERR_INVALID_PATH), [2, 0, 0, 0]);
+        // No mount      → status=3
+        assert_eq!(encode_vfs_status(VFS_STATUS_ERR_NO_MOUNT), [3, 0, 0, 0]);
+        // Bad fd        → status=4
+        assert_eq!(encode_vfs_status(VFS_STATUS_ERR_BAD_FD), [4, 0, 0, 0]);
+        // Backend error → status=5
+        assert_eq!(encode_vfs_status(VFS_STATUS_ERR_BACKEND), [5, 0, 0, 0]);
+        // Codec error   → status=6
+        assert_eq!(encode_vfs_status(VFS_STATUS_ERR_CODEC), [6, 0, 0, 0]);
     }
 }
