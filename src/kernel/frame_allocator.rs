@@ -905,6 +905,183 @@ mod tests {
         assert_eq!(alloc.free_frames(), initial_free);
     }
 
+    // ── PT/main pool split regression tests ─────────────────────────────────
+    //
+    // These tests exercise the is_pa_in_pt_pool / is_pa_reserved query helpers
+    // and verify that allocators seeded from disjoint ranges never return
+    // frames from the wrong pool.  They use PA ranges in the 0xE/0xF_0000_0000
+    // space to avoid colliding with the earlier single-allocator tests.
+
+    #[test]
+    fn pt_pool_registration_and_query() {
+        // Registering a PT pool range makes is_pa_in_pt_pool return Some for
+        // addresses inside it and None for addresses strictly outside.
+        let pt_start: u64 = 0xE000_0000;
+        let pt_end: u64 = pt_start + 256 * 0x1000;
+        register_pt_pool_range(pt_start, pt_end);
+
+        // First and last pages of the registered range must be found.
+        assert!(
+            is_pa_in_pt_pool(pt_start).is_some(),
+            "start of PT pool must be found"
+        );
+        assert!(
+            is_pa_in_pt_pool(pt_end - 0x1000).is_some(),
+            "last page of PT pool must be found"
+        );
+        // Addresses outside the range must not be found.
+        assert!(
+            is_pa_in_pt_pool(pt_end).is_none(),
+            "exclusive end must not be in PT pool"
+        );
+        assert!(
+            is_pa_in_pt_pool(pt_start.wrapping_sub(0x1000)).is_none(),
+            "address before PT pool must not be found"
+        );
+    }
+
+    #[test]
+    fn alloc_from_pt_seeded_range_stays_in_pt_pool() {
+        // Every frame returned by an allocator seeded from a PT-pool range must
+        // lie within that range.
+        let pt_start: u64 = 0xE100_0000;
+        let pt_end: u64 = pt_start + 8 * 0x1000;
+        let mut pt_alloc = PhysicalFrameAllocator::new_uninit();
+        pt_alloc
+            .init_from_memory_map(&[MemoryRegion {
+                start: pt_start,
+                len: pt_end - pt_start,
+                usable: true,
+            }])
+            .expect("init pt alloc");
+        while pt_alloc.free_frames() > 0 {
+            let pa = pt_alloc.alloc_frame().expect("alloc");
+            assert!(
+                pa >= pt_start && pa < pt_end,
+                "PT frame {:#x} outside PT pool [{:#x}..{:#x})",
+                pa,
+                pt_start,
+                pt_end
+            );
+        }
+    }
+
+    #[test]
+    fn alloc_from_main_seeded_range_stays_in_main_pool() {
+        // Every frame returned by a main allocator seeded from a main-pool range
+        // must lie within that range.
+        let main_start: u64 = 0xE200_0000;
+        let main_end: u64 = main_start + 8 * 0x1000;
+        let mut main_alloc = PhysicalFrameAllocator::new_uninit();
+        main_alloc
+            .init_from_memory_map(&[MemoryRegion {
+                start: main_start,
+                len: main_end - main_start,
+                usable: true,
+            }])
+            .expect("init main alloc");
+        while main_alloc.free_frames() > 0 {
+            let pa = main_alloc.alloc_frame().expect("alloc");
+            assert!(
+                pa >= main_start && pa < main_end,
+                "main frame {:#x} outside main pool [{:#x}..{:#x})",
+                pa,
+                main_start,
+                main_end
+            );
+        }
+    }
+
+    #[test]
+    fn main_allocator_never_returns_frame_inside_pt_pool_range() {
+        // Set up two strictly disjoint ranges: PT pool immediately before main
+        // pool.  Exhaust the main allocator and verify none of its frames fall
+        // in the PT pool range (as reported by is_pa_in_pt_pool).
+        let pt_start: u64 = 0xE300_0000;
+        let pt_end: u64 = pt_start + 16 * 0x1000;
+        let main_start: u64 = pt_end; // immediately after PT pool, no gap
+        let main_end: u64 = main_start + 16 * 0x1000;
+
+        register_pt_pool_range(pt_start, pt_end);
+
+        let mut main_alloc = PhysicalFrameAllocator::new_uninit();
+        main_alloc
+            .init_from_memory_map(&[MemoryRegion {
+                start: main_start,
+                len: main_end - main_start,
+                usable: true,
+            }])
+            .expect("init");
+
+        while main_alloc.free_frames() > 0 {
+            let pa = main_alloc.alloc_frame().expect("alloc");
+            assert!(
+                is_pa_in_pt_pool(pa).is_none(),
+                "main allocator returned PT-pool address {:#x} (PT pool [{:#x}..{:#x}))",
+                pa,
+                pt_start,
+                pt_end
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_range_registration_and_query() {
+        // Registering a reserved range makes is_pa_reserved return Some for
+        // addresses within it and None for addresses outside.
+        let res_start: u64 = 0xE400_0000;
+        let res_end: u64 = res_start + 4 * 0x1000;
+        register_reserved_range(res_start, res_end);
+
+        assert!(
+            is_pa_reserved(res_start).is_some(),
+            "start of reserved range must be found"
+        );
+        assert!(
+            is_pa_reserved(res_end - 0x1000).is_some(),
+            "last page of reserved range must be found"
+        );
+        assert!(
+            is_pa_reserved(res_end).is_none(),
+            "exclusive end must not be reserved"
+        );
+        assert!(
+            is_pa_reserved(res_start.wrapping_sub(0x1000)).is_none(),
+            "address before reserved range must not be found"
+        );
+    }
+
+    #[test]
+    fn allocator_seeded_below_reserved_range_does_not_touch_reserved() {
+        // Allocator seeded strictly below a reserved range must never return
+        // an address the reserved-range query considers reserved.
+        let usable_start: u64 = 0xE500_0000;
+        let usable_end: u64 = usable_start + 8 * 0x1000;
+        let reserved_start: u64 = usable_end; // reserved range starts right after usable
+        let reserved_end: u64 = reserved_start + 8 * 0x1000;
+        register_reserved_range(reserved_start, reserved_end);
+
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc
+            .init_from_memory_map(&[MemoryRegion {
+                start: usable_start,
+                len: usable_end - usable_start,
+                usable: true,
+            }])
+            .expect("init");
+
+        while alloc.free_frames() > 0 {
+            let pa = alloc.alloc_frame().expect("alloc");
+            assert!(
+                is_pa_reserved(pa).is_none(),
+                "allocator returned reserved address {:#x} (reserved [{:#x}..{:#x}))",
+                pa,
+                reserved_start,
+                reserved_end
+            );
+        }
+    }
+
     #[test]
     #[cfg(feature = "hosted-dev")]
     fn hosted_profile_uses_conservative_allocator_knobs() {
