@@ -1240,6 +1240,7 @@ impl ProcessService {
                     .map_err(|_| ProcessManagerError::Malformed)
             }
             ProcessRequest::LifecycleQuery { tid } => {
+                yarm_user_rt::user_log!("PM_LIFECYCLE_QUERY_RECV tid={}", tid);
                 let reply = match self.lifecycle_table.get_by_tid(tid) {
                     Some(rec) => {
                         let state = match rec.state {
