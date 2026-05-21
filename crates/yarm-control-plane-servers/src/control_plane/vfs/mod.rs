@@ -3,6 +3,7 @@
 
 pub mod fd_table;
 pub mod mount_table;
+pub mod path;
 pub mod service;
 
 pub use fd_table::VfsFdTable;

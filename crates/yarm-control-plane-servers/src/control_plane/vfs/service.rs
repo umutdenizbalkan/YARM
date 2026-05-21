@@ -364,12 +364,13 @@ pub fn run() {
         );
 
         // Route by path prefix (STATX/OPENAT) or fd table (READ/CLOSE).
-        let route = {
+        // Path-based ops are normalized before mount lookup.
+        let route = 'route: {
             use yarm_ipc_abi::vfs_abi::{
                 OpenAtInlinePath, ReadWriteArgs, StatxInlinePath,
                 VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
             };
-            let path: &[u8] = match msg.opcode {
+            let raw_path: &[u8] = match msg.opcode {
                 VFS_OP_STATX => StatxInlinePath::decode(msg.as_slice())
                     .map(|s| s.path)
                     .unwrap_or(b""),
@@ -378,7 +379,15 @@ pub fn run() {
                     .unwrap_or(b""),
                 _ => b"",
             };
-            if !path.is_empty() {
+            if !raw_path.is_empty() {
+                let norm = match super::path::normalize(raw_path) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        yarm_user_rt::user_log!("VFS_PATH_NORM_REJECT reason={}", e.as_str());
+                        break 'route None;
+                    }
+                };
+                let path = norm.as_bytes();
                 let path_str = core::str::from_utf8(path).unwrap_or("?");
                 if let Some((send_cap, target_name)) = mount_table.route(path) {
                     yarm_user_rt::user_log!(
