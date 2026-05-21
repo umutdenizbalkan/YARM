@@ -459,7 +459,7 @@ pub fn run() {
                 }
             } else if msg.opcode == VFS_OP_READ || msg.opcode == VFS_OP_CLOSE {
                 if let Ok(args) = ReadWriteArgs::decode(msg.as_slice()) {
-                    if let Some((send_cap, label)) = fd_table.lookup(args.fd) {
+                    if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_reply_cap as u64) {
                         yarm_user_rt::user_log!(
                             "VFS_ROUTE_FD_LOOKUP fd={} target={}",
                             args.fd, label.as_str()
@@ -507,7 +507,7 @@ pub fn run() {
                         b.copy_from_slice(&payload[..8]);
                         let fd = u64::from_le_bytes(b);
                         // target_label is owned (Copy), no borrow conflict.
-                        if fd_table.insert(fd, backend_send_cap, target_label.as_str()) {
+                        if fd_table.insert(fd, backend_send_cap, target_label.as_str(), client_reply_cap as u64) {
                             yarm_user_rt::user_log!(
                                 "VFS_FD_TRACK fd={} backend={}",
                                 fd, backend_send_cap
@@ -535,7 +535,7 @@ pub fn run() {
                         closed_fd, target_label.as_str(), status
                     );
                     if status == 0 {
-                        fd_table.remove(closed_fd);
+                        fd_table.remove(closed_fd, client_reply_cap as u64);
                     }
                 }
                 yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=0");
