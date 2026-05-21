@@ -4,8 +4,8 @@
 # VFS Request-Loop ABI
 
 This document defines the authoritative contract for the VFS server's two-phase
-startup, capability requirements, mount table, fd table, opcode encoding, and
-routing rules as implemented in
+startup, capability requirements, mount table, fd table, opcode encoding, routing
+rules, and reply status codes as implemented in
 `crates/yarm-control-plane-servers/src/control_plane/vfs/service.rs`.
 
 ---
@@ -71,14 +71,14 @@ becomes reachable for client requests.
 The mount table maps path prefixes to backend send caps. Registration happens
 during Phase 1 startup:
 
-| Prefix          | Backend       | Slot source |
-|-----------------|---------------|-------------|
-| `/initramfs/`   | `initramfs_srv` | slot 13   |
-| `/dev/`         | `devfs_srv`   | slot 14     |
+| Prefix          | Backend         | Slot source |
+|-----------------|-----------------|-------------|
+| `/initramfs/`   | `initramfs_srv` | slot 13     |
+| `/dev/`         | `devfs_srv`     | slot 14     |
 
 Rules:
 - Prefix matching is longest-prefix first.
-- A path that matches no prefix is rejected with `VFS_ERR_NO_MOUNT`.
+- A path that matches no prefix is rejected with `VFS_STATUS_ERR_NO_MOUNT`.
 - The mount table is static for the lifetime of the VFS server process; no
   dynamic mount/unmount is supported in this revision.
 
@@ -86,15 +86,23 @@ Rules:
 
 ## FD Table Contract
 
-The fd table maps numeric file descriptors to backend send caps for post-open
-operations. An fd entry is created by `VFS_OP_OPENAT` on success and removed by
-`VFS_OP_CLOSE`.
+The fd table maps `(fd, client_id)` pairs to backend send caps for post-open
+operations. `client_id` is the reply-cap value delivered alongside each IPC
+request; in this microkernel's IPC model that value encodes the calling thread's
+identity and remains stable across calls from the same thread.
 
-- FD values are assigned sequentially from 0.
-- A read (`VFS_OP_READ`) or close (`VFS_OP_CLOSE`) for an unknown fd returns
-  `VFS_ERR_BAD_FD`.
-- The fd table capacity is bounded by the VFS server's static allocation; no
-  dynamic growth.
+An fd entry is created by `VFS_OP_OPENAT` on success and removed by
+`VFS_OP_CLOSE` from the owning client.
+
+- FD values are assigned by the backend and are unique within a client session.
+- The same numeric fd may be held by different clients simultaneously without
+  conflict — each is tracked as a separate `(fd, client_id)` entry.
+- A `VFS_OP_READ` or `VFS_OP_CLOSE` for an fd not owned by the calling client
+  returns `VFS_STATUS_ERR_BAD_FD`, whether the fd is absent entirely or belongs
+  to a different client.
+- `VFS_OP_CLOSE` only evicts the calling client's own entry; another client's
+  entry for the same fd number is left untouched.
+- The fd table capacity is bounded by `MAX_FD_ENTRIES = 32`.
 
 ---
 
@@ -122,7 +130,7 @@ Request message body layout — total header = 25 bytes, then inline path:
 | 25     | N    | `path`       | UTF-8 path, max `VFS_STATX_INLINE_PATH_MAX = 96` bytes |
 
 `path_len` must be ≤ 96. Paths longer than 96 bytes cannot be expressed in a
-single message and are rejected.
+single message and are rejected with `VFS_STATUS_ERR_INVALID_PATH`.
 
 ### OPENAT (`VFS_OP_OPENAT = 10`)
 
@@ -150,27 +158,71 @@ Reply: 8-byte LE status (0 = ok).
 
 ---
 
+## Reply Status Codes
+
+All error replies generated locally by the VFS router (not forwarded from
+backends) carry a 4-byte little-endian `u32` status in the reply message payload.
+The reply message opcode is `1` for any locally generated error; `0` for a
+forwarded backend success reply.
+
+Source: `crates/yarm-ipc-abi/src/vfs_abi.rs`
+
+| Constant                      | Value | Trigger                                                  |
+|-------------------------------|-------|----------------------------------------------------------|
+| `VFS_STATUS_OK`               | 0     | Success (backend reply forwarded verbatim)               |
+| `VFS_STATUS_ERR_UNKNOWN_OP`   | 1     | Opcode not handled by the VFS router                     |
+| `VFS_STATUS_ERR_INVALID_PATH` | 2     | Path payload malformed, or normalization rejection       |
+| `VFS_STATUS_ERR_NO_MOUNT`     | 3     | Normalized path matches no mount-table prefix            |
+| `VFS_STATUS_ERR_BAD_FD`       | 4     | Fd absent from table, or owned by a different client     |
+| `VFS_STATUS_ERR_BACKEND`      | 5     | Backend IPC timed out or returned no reply               |
+| `VFS_STATUS_ERR_CODEC`        | 6     | READ/CLOSE payload could not be decoded                  |
+
+### Error Path Mapping
+
+| Condition                                          | Status code                      |
+|----------------------------------------------------|----------------------------------|
+| Opcode not STATX/OPENAT/READ/CLOSE                 | `VFS_STATUS_ERR_UNKNOWN_OP`      |
+| STATX/OPENAT path payload malformed (decode fails) | `VFS_STATUS_ERR_INVALID_PATH`    |
+| Path empty, non-absolute, or exceeds 96 bytes      | `VFS_STATUS_ERR_INVALID_PATH`    |
+| Path contains `..` escaping root                   | `VFS_STATUS_ERR_INVALID_PATH`    |
+| Normalized path matches no mount prefix            | `VFS_STATUS_ERR_NO_MOUNT`        |
+| READ/CLOSE payload decode failure (malformed args) | `VFS_STATUS_ERR_CODEC`           |
+| Fd not present in table                            | `VFS_STATUS_ERR_BAD_FD`          |
+| Fd present but owned by a different client         | `VFS_STATUS_ERR_BAD_FD`          |
+| Backend IPC timed out or no reply                  | `VFS_STATUS_ERR_BACKEND`         |
+
+The helper `encode_vfs_status(status: u32) -> [u8; 4]` and
+`decode_vfs_status(payload: &[u8]) -> Option<u32>` in `vfs_abi.rs` provide
+the canonical encode/decode for these 4-byte payloads.
+
+---
+
 ## Routing Rules
 
 1. **STATX and OPENAT** — path-based routing:
-   - Extract the inline path from the message body.
-   - Look up the longest matching prefix in the mount table.
+   - Decode the inline path from the message body.  Malformed payload →
+     `VFS_STATUS_ERR_INVALID_PATH`.
+   - Normalize the path (collapse `//`, resolve `.`, reject `..` above root).
+     Normalization failure → `VFS_STATUS_ERR_INVALID_PATH`.
+   - Look up the longest matching prefix in the mount table.  No match →
+     `VFS_STATUS_ERR_NO_MOUNT`.
    - Forward the message to the corresponding backend send cap.
    - Return the backend's reply verbatim.
 
 2. **READ and CLOSE** — fd-based routing:
-   - Extract the fd from the message body.
-   - Look up the fd in the fd table to find the backend send cap.
-   - Forward to that backend.
-   - On CLOSE, remove the fd entry after the backend confirms.
+   - Decode the fd from the message body.  Malformed payload →
+     `VFS_STATUS_ERR_CODEC`.
+   - Look up `(fd, client_id)` in the fd table.  Miss or wrong client →
+     `VFS_STATUS_ERR_BAD_FD`.
+   - Forward to the backend send cap recorded at OPENAT time.
+   - On CLOSE, remove the calling client's fd entry after the backend confirms
+     success.
 
-3. **Unknown opcode** — reply with `VFS_ERR_UNKNOWN_OP` immediately; do not
+3. **Unknown opcode** — reply `VFS_STATUS_ERR_UNKNOWN_OP` immediately; do not
    forward.
 
-4. **No matching mount** (STATX/OPENAT) — reply `VFS_ERR_NO_MOUNT` without
-   forwarding.
-
-5. **Unknown fd** (READ/CLOSE) — reply `VFS_ERR_BAD_FD` without forwarding.
+4. **Backend timeout** — if `ipc_recv_with_deadline` returns no reply after
+   forwarding, reply `VFS_STATUS_ERR_BACKEND` to the client.
 
 ---
 
@@ -200,20 +252,31 @@ is unreachable for any client request. This condition indicates a PM spawn bug
   consult the mount table; hard-coded backend cap selection is forbidden.
 - **Serving clients before Phase 1 completes**: the resident loop must not start
   before the setup probe acknowledges VFS readiness.
+- **Generic empty error payloads**: locally generated error replies must encode
+  the canonical `VFS_STATUS_ERR_*` status as a 4-byte LE u32 payload; empty
+  payloads `&[]` are forbidden for error replies.
 
 ---
 
 ## Log Markers
 
-| Marker                                  | Phase   | Description                                     |
-|-----------------------------------------|---------|-------------------------------------------------|
-| `VFS_SRV_ENTRY`                         | startup | VFS server binary entry                         |
-| `VFS_SRV_RECV_CAP cap=N`               | startup | slot 12 cap value read from startup context     |
-| `VFS_SRV_INITRAMFS_SEND_CAP cap=N`     | startup | slot 13 cap value (initramfs backend)           |
-| `VFS_SRV_DEVFS_SEND_CAP cap=N`         | startup | slot 14 cap value (devfs backend)               |
-| `VFS_SRV_NO_RECV_CAP_RESIDENT_YIELD`   | startup | slot 12 absent; entering yield fallback         |
-| `VFS_SRV_MOUNT_REGISTERED prefix=...`  | setup   | mount table entry confirmed                     |
-| `VFS_SRV_RESIDENT_LOOP_ENTER`          | loop    | Phase 2 resident loop starting                  |
-| `VFS_SRV_RECV_MSG op=N`               | loop    | message received with opcode N                  |
-| `VFS_SRV_ROUTE_PATH prefix=...`        | loop    | path routing decision                           |
-| `VFS_SRV_ROUTE_FD fd=N`               | loop    | fd routing decision                             |
+| Marker                                   | Phase   | Description                                          |
+|------------------------------------------|---------|------------------------------------------------------|
+| `VFS_SRV_ENTRY`                          | startup | VFS server binary entry                              |
+| `VFS_SRV_RECV_CAP cap=N`                | startup | slot 12 cap value read from startup context          |
+| `VFS_SRV_INITRAMFS_SEND_CAP cap=N`      | startup | slot 13 cap value (initramfs backend)                |
+| `VFS_SRV_DEVFS_SEND_CAP cap=N`          | startup | slot 14 cap value (devfs backend)                    |
+| `VFS_SRV_NO_RECV_CAP_RESIDENT_YIELD`    | startup | slot 12 absent; entering yield fallback              |
+| `VFS_SRV_MOUNT_REGISTERED prefix=...`   | setup   | mount table entry confirmed                          |
+| `VFS_SRV_RESIDENT_LOOP_ENTER`           | loop    | Phase 2 resident loop starting                       |
+| `VFS_SRV_RECV_MSG op=N`                | loop    | message received with opcode N                       |
+| `VFS_PATH_NORM_REJECT reason=...`       | loop    | path normalization failed; replies ERR_INVALID_PATH  |
+| `VFS_ROUTE_LOOKUP path=... target=...`  | loop    | path routed to named backend                         |
+| `VFS_ROUTE_NO_MOUNT path=...`           | loop    | path valid but no mount prefix matches               |
+| `VFS_ROUTE_FD_LOOKUP fd=N target=...`  | loop    | fd routed to named backend                           |
+| `VFS_ROUTE_BAD_FD fd=N`               | loop    | fd not found or belongs to different client          |
+| `VFS_ROUTE_CODEC_ERR`                  | loop    | READ/CLOSE payload decode failure                    |
+| `VFS_ROUTE_UNKNOWN_OP op=N`            | loop    | opcode not handled by router                         |
+| `VFS_ROUTE_ERR status=N`              | loop    | local error reply sent with status code N            |
+| `VFS_ROUTE_REPLY status=0`             | loop    | backend reply forwarded to client                    |
+| `VFS_ROUTE_REPLY status=1`             | loop    | backend timeout; ERR_BACKEND reply sent              |
