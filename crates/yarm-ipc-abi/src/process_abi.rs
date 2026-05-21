@@ -22,6 +22,102 @@ pub const PROC_OP_TASK_RESTART_TOKEN: u16 = 8;
 pub const PROC_OP_REGISTER_SUPERVISED_TASK: u16 = 9;
 pub const PROC_OP_EXECUTE_RESTART: u16 = 10;
 pub const PROC_OP_SPAWN_V5_CAP: u16 = 11;
+/// Query the PM lifecycle table for a given TID.
+///
+/// Request: [`LifecycleQueryRequest`] (8 bytes).
+/// Reply:   [`LifecycleQueryReply`] (19 bytes).
+/// PM looks up its `LifecycleTable` and replies found=1 with real metadata, or
+/// found=0 if the TID is unknown.  `restart_supported` is always 0 until real
+/// restart-token population is wired.
+pub const PROC_OP_LIFECYCLE_QUERY: u16 = 12;
+
+/// `state` value for a service that was spawned and is running.
+pub const LIFECYCLE_STATE_SPAWNED: u8 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleQueryRequest {
+    pub tid: u64,
+}
+
+impl LifecycleQueryRequest {
+    pub const fn new(tid: u64) -> Self {
+        Self { tid }
+    }
+    pub const fn encode(self) -> [u8; 8] {
+        self.tid.to_le_bytes()
+    }
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() < 8 {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&payload[..8]);
+        Ok(Self::new(u64::from_le_bytes(a)))
+    }
+}
+
+/// Wire reply for [`PROC_OP_LIFECYCLE_QUERY`].
+///
+/// Wire layout (19 bytes LE):
+/// ```text
+/// [0]      found:             1 = record present, 0 = not in lifecycle table
+/// [1..9]   tid:               u64 LE (0 when found=0)
+/// [9..17]  image_id:          u64 LE (0 when found=0)
+/// [17]     state:             LIFECYCLE_STATE_* constant
+/// [18]     restart_supported: always 0 (restart not yet wired)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleQueryReply {
+    pub found: u8,
+    pub tid: u64,
+    pub image_id: u64,
+    pub state: u8,
+    pub restart_supported: u8,
+}
+
+impl LifecycleQueryReply {
+    pub const ENCODED_LEN: usize = 19;
+
+    pub const fn not_found() -> Self {
+        Self { found: 0, tid: 0, image_id: 0, state: 0, restart_supported: 0 }
+    }
+
+    pub const fn found(tid: u64, image_id: u64, state: u8) -> Self {
+        Self { found: 1, tid, image_id, state, restart_supported: 0 }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0] = self.found;
+        out[1..9].copy_from_slice(&self.tid.to_le_bytes());
+        out[9..17].copy_from_slice(&self.image_id.to_le_bytes());
+        out[17] = self.state;
+        out[18] = self.restart_supported;
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() < Self::ENCODED_LEN {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&payload[1..9]);
+        let tid = u64::from_le_bytes(a);
+        a.copy_from_slice(&payload[9..17]);
+        let image_id = u64::from_le_bytes(a);
+        Ok(Self {
+            found: payload[0],
+            tid,
+            image_id,
+            state: payload[17],
+            restart_supported: payload[18],
+        })
+    }
+
+    pub const fn is_found(self) -> bool {
+        self.found == 1
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecuteRestartRequest {
@@ -582,6 +678,9 @@ mod tests {
         assert_eq!(PROC_OP_TASK_RESTART_TOKEN, 8);
         assert_eq!(PROC_OP_REGISTER_SUPERVISED_TASK, 9);
         assert_eq!(PROC_OP_EXECUTE_RESTART, 10);
+        assert_eq!(PROC_OP_LIFECYCLE_QUERY, 12);
+        assert_eq!(LIFECYCLE_STATE_SPAWNED, 0);
+        assert_eq!(LifecycleQueryReply::ENCODED_LEN, 19);
     }
 
     #[test]
@@ -673,5 +772,32 @@ mod tests {
         ];
         assert_eq!(args.encode(), expected);
         assert_eq!(ProcV4Args::decode(&expected), Ok(args));
+    }
+
+    #[test]
+    fn lifecycle_query_codec_roundtrip() {
+        let req = LifecycleQueryRequest::new(42);
+        assert_eq!(LifecycleQueryRequest::decode(&req.encode()), Ok(req));
+
+        let found = LifecycleQueryReply::found(42, 6, LIFECYCLE_STATE_SPAWNED);
+        assert_eq!(found.is_found(), true);
+        assert_eq!(found.restart_supported, 0);
+        let dec = LifecycleQueryReply::decode(&found.encode()).unwrap();
+        assert_eq!(dec.found, 1);
+        assert_eq!(dec.tid, 42);
+        assert_eq!(dec.image_id, 6);
+        assert_eq!(dec.state, LIFECYCLE_STATE_SPAWNED);
+        assert_eq!(dec.restart_supported, 0);
+
+        let not = LifecycleQueryReply::not_found();
+        assert_eq!(not.is_found(), false);
+        let dec2 = LifecycleQueryReply::decode(&not.encode()).unwrap();
+        assert_eq!(dec2.found, 0);
+    }
+
+    #[test]
+    fn lifecycle_query_reply_rejects_short_payload() {
+        let short = [0u8; LifecycleQueryReply::ENCODED_LEN - 1];
+        assert_eq!(LifecycleQueryReply::decode(&short), Err(ProcCodecError::Malformed));
     }
 }
