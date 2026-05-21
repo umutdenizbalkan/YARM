@@ -397,13 +397,30 @@ impl Bootstrap {
         let pt_slice = &pt_regs[..pt_regs_len];
         let main_slice = &main_regs[..main_regs_len];
 
-        // Register PT pool ranges in GLOBAL_RESERVED_RANGES so the main allocator
-        // fires PMEM_ALLOC_RESERVED_BUG if it ever (incorrectly) returns a PT-pool PA.
+        // Register PT pool in PT_POOL_RANGES (NOT GLOBAL_RESERVED_RANGES) so the main
+        // allocator can detect cross-contamination without triggering false positives
+        // when the PT allocator itself legitimately allocates from its own pool.
         for r in pt_slice {
             if r.usable && r.len > 0 {
-                crate::kernel::frame_allocator::register_reserved_range(r.start, r.start + r.len);
+                crate::kernel::frame_allocator::register_pt_pool_range(r.start, r.start + r.len);
                 crate::yarm_log!(
                     "PT_POOL_RANGE start=0x{:x} end=0x{:x} pages={}",
+                    r.start,
+                    r.start + r.len,
+                    r.len / crate::kernel::vm::PAGE_SIZE as u64
+                );
+            }
+        }
+        for r in main_slice {
+            if r.usable && r.len > 0 {
+                crate::yarm_log!(
+                    "MAIN_POOL_RANGE start=0x{:x} end=0x{:x} pages={}",
+                    r.start,
+                    r.start + r.len,
+                    r.len / crate::kernel::vm::PAGE_SIZE as u64
+                );
+                crate::yarm_log!(
+                    "FRAME_ALLOC_INIT_RANGE start=0x{:x} end=0x{:x} pages={}",
                     r.start,
                     r.start + r.len,
                     r.len / crate::kernel::vm::PAGE_SIZE as u64

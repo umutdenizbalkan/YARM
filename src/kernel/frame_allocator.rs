@@ -175,9 +175,19 @@ impl PhysicalFrameAllocator {
             .fast_path_extent_index(pages)
             .or_else(|| self.find_extent_index(pages))
         {
+            #[cfg(not(feature = "hosted-dev"))]
+            if let Some(ext) = self.extents[idx] {
+                crate::yarm_log!(
+                    "CONTIG_ALLOC_CANDIDATE start=0x{:x} pages={}",
+                    ext.start_phys,
+                    pages
+                );
+            }
             let (alloc_phys, _, _) = self.split_extent_for_allocation(idx, pages)?;
             self.free_frames = self.free_frames.saturating_sub(pages);
             self.refresh_run_metadata();
+            #[cfg(not(feature = "hosted-dev"))]
+            crate::yarm_log!("CONTIG_ALLOC_COMMIT start=0x{:x} pages={}", alloc_phys, pages);
             for page in 0..pages {
                 let phys = alloc_phys.saturating_add((page as u64).saturating_mul(PAGE_SIZE_U64));
                 self.track_new_frame_ref(phys)?;
@@ -189,8 +199,6 @@ impl PhysicalFrameAllocator {
                     );
                     panic!("PMEM_ALLOC_RESERVED_BUG_CONTIG: allocated contiguous frame overlaps reserved range");
                 }
-                #[cfg(not(feature = "hosted-dev"))]
-                crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user_contig pages={}", phys, pages);
             }
             return Ok(alloc_phys);
         }
@@ -557,6 +565,12 @@ impl GlobalReservedRanges {
 static GLOBAL_RESERVED_RANGES: SpinLockIrq<GlobalReservedRanges> =
     SpinLockIrq::new(GlobalReservedRanges::new());
 
+/// Tracks the physical address ranges given exclusively to PT_FRAME_ALLOCATOR.
+/// Checked only by main-allocator entry points to detect cross-contamination.
+/// NOT added to GLOBAL_RESERVED_RANGES — PT allocator uses these pages legitimately.
+static PT_POOL_RANGES: SpinLockIrq<GlobalReservedRanges> =
+    SpinLockIrq::new(GlobalReservedRanges::new());
+
 pub fn register_reserved_range(start: u64, end: u64) {
     if end <= start {
         return;
@@ -564,8 +578,19 @@ pub fn register_reserved_range(start: u64, end: u64) {
     GLOBAL_RESERVED_RANGES.lock().add(start, end);
 }
 
+pub fn register_pt_pool_range(start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    PT_POOL_RANGES.lock().add(start, end);
+}
+
 pub fn is_pa_reserved(pa: u64) -> Option<(u64, u64)> {
     GLOBAL_RESERVED_RANGES.lock().find_overlap(pa)
+}
+
+pub fn is_pa_in_pt_pool(pa: u64) -> Option<(u64, u64)> {
+    PT_POOL_RANGES.lock().find_overlap(pa)
 }
 
 fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
