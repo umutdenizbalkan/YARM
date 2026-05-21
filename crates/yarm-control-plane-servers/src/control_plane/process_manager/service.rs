@@ -816,6 +816,27 @@ impl ProcessService {
         &self.lifecycle_table
     }
 
+    /// Record a lifecycle entry for a bootstrap service spawned before PM's
+    /// request loop started.  Unlike the SpawnV5Cap path, pm_service_send_cap
+    /// is 0 (PM holds no cap to these services from a spawn syscall) and
+    /// parent_tid is 0 (spawned at kernel boot, no PM-tracked requester).
+    pub fn seed_bootstrap_lifecycle_record(&mut self, tid: u64, image_id: u64) -> bool {
+        let recorded = self.lifecycle_table.record(ServiceLifecycleRecord {
+            tid,
+            image_id,
+            parent_tid: 0,
+            pm_service_send_cap: 0,
+            state: ServiceState::Spawned,
+        });
+        yarm_user_rt::user_log!(
+            "PM_LIFECYCLE_BOOTSTRAP tid={} image_id={} recorded={}",
+            tid,
+            image_id,
+            recorded as u8
+        );
+        recorded
+    }
+
     pub const fn handled_count(&self) -> usize {
         self.handled
     }
@@ -1702,6 +1723,19 @@ pub fn run() {
     };
     yarm_user_rt::user_log!("PM_RECV_LOOP_START recv_cap={}", recv_cap);
     let mut service = ProcessService::new();
+
+    // Seed lifecycle records for bootstrap services that were spawned before
+    // PM's request loop started (image_ids 1–3, KernelProcessSpawnBackend).
+    // PM knows its own TID from ctx.task_id; init and supervisor TIDs come
+    // from the optional startup context slots seeded at kernel boot time.
+    service.seed_bootstrap_lifecycle_record(ctx.task_id, 2); // process_manager
+    if let Some(sup_tid) = ctx.supervisor_tid {
+        service.seed_bootstrap_lifecycle_record(sup_tid, 1); // supervisor
+    }
+    if let Some(init_t) = ctx.init_tid {
+        service.seed_bootstrap_lifecycle_record(init_t, 3); // init_server
+    }
+
     loop {
         // SAFETY: direct syscall wrapper call; PM owns its recv endpoint capability.
         #[cfg(not(test))]
