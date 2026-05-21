@@ -411,6 +411,14 @@ impl KernelState {
         self.alloc_anonymous_memory_object_with_len(crate::kernel::vm::PAGE_SIZE)
     }
 
+    pub(crate) fn alloc_user_data_frame(&mut self) -> Result<u64, KernelError> {
+        self.with_memory_state_mut(|memory| {
+            kernel_mut(&mut memory.frame_allocator)
+                .alloc_frame()
+                .map_err(|_| KernelError::MemoryObjectFull)
+        })
+    }
+
     pub fn alloc_anonymous_memory_object_with_len(
         &mut self,
         len: usize,

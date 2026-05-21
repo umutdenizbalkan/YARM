@@ -4,7 +4,6 @@
 use super::{KernelError, KernelState, SpawnedUserTask, UserImageSpec};
 use crate::kernel::capabilities::{CapId, CapRights};
 use crate::arch::hal::Hal;
-use crate::kernel::frame_allocator::alloc_pt_frame;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext, WaitReason};
 use crate::kernel::vm::{Asid, CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
@@ -238,7 +237,7 @@ impl KernelState {
                 let phys = if let Some(entry) = existing {
                     entry.addr()
                 } else {
-                    alloc_pt_frame().map_err(|_| KernelError::MemoryObjectFull)?
+                    self.alloc_user_data_frame()?
                 };
                 if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!(
@@ -273,6 +272,13 @@ impl KernelState {
                         flags: stage_flags,
                     },
                 )?;
+                #[cfg(not(feature = "hosted-dev"))]
+                crate::yarm_log!(
+                    "KSPAWN_NEW_TASK_MAP_RANGE asid={} va=0x{:x} pa=0x{:x}",
+                    asid.0,
+                    va,
+                    phys
+                );
                 let post_map_present =
                     crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
                         .is_some();

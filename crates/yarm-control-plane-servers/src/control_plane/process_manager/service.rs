@@ -1160,6 +1160,33 @@ unsafe fn pm_vfs_spawn_image_load(image_id: u64, recv_cap_debug: u32) {
     );
 
     let startup_args = [0u64; 18];
+    #[cfg(all(target_arch = "aarch64", not(test)))]
+    {
+        let lr: usize;
+        let sp: usize;
+        let fp: usize;
+        let saved_lr: usize;
+        unsafe {
+            core::arch::asm!(
+                "mov {lr}, x30",
+                "mov {sp}, sp",
+                "mov {fp}, x29",
+                "ldr {slr}, [x29, #8]",
+                lr = out(reg) lr,
+                sp = out(reg) sp,
+                fp = out(reg) fp,
+                slr = out(reg) saved_lr,
+                options(nostack, readonly),
+            );
+        }
+        yarm_user_rt::user_log!(
+            "PM_SPAWN_SYSCALL26_LR_BEFORE lr=0x{:x}", lr
+        );
+        yarm_user_rt::user_log!(
+            "PM_SPAWN_STACK_PROBE_BEFORE sp=0x{:x} fp=0x{:x} saved_lr=0x{:x}",
+            sp, fp, saved_lr
+        );
+    }
     yarm_user_rt::user_log!("PM_SPAWN_SYSCALL26_BEFORE recv_cap={}", recv_cap_debug);
     let result = unsafe {
         yarm_user_rt::syscall::spawn_from_initramfs_file(
@@ -1170,6 +1197,33 @@ unsafe fn pm_vfs_spawn_image_load(image_id: u64, recv_cap_debug: u32) {
         )
     };
     yarm_user_rt::user_log!("PM_SPAWN_SYSCALL26_AFTER recv_cap={}", recv_cap_debug);
+    #[cfg(all(target_arch = "aarch64", not(test)))]
+    {
+        let lr: usize;
+        let sp: usize;
+        let fp: usize;
+        let saved_lr: usize;
+        unsafe {
+            core::arch::asm!(
+                "mov {lr}, x30",
+                "mov {sp}, sp",
+                "mov {fp}, x29",
+                "ldr {slr}, [x29, #8]",
+                lr = out(reg) lr,
+                sp = out(reg) sp,
+                fp = out(reg) fp,
+                slr = out(reg) saved_lr,
+                options(nostack, readonly),
+            );
+        }
+        yarm_user_rt::user_log!(
+            "PM_SPAWN_SYSCALL26_LR_AFTER lr=0x{:x}", lr
+        );
+        yarm_user_rt::user_log!(
+            "PM_SPAWN_STACK_PROBE_AFTER sp=0x{:x} fp=0x{:x} saved_lr=0x{:x}",
+            sp, fp, saved_lr
+        );
+    }
     match result {
         Ok((tid, caller_cap, spawner_cap)) => {
             yarm_user_rt::user_log!(

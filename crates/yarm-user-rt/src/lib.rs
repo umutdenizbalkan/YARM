@@ -549,12 +549,59 @@ pub mod syscall {
             startup_args.as_ptr() as usize,  // arg4 = startup_args_ptr
             startup_args.len(),              // arg5 = startup_args_count
         ];
+        #[cfg(all(target_arch = "aarch64", not(test)))]
+        {
+            let lr: usize;
+            let sp: usize;
+            let fp: usize;
+            let saved_lr: usize;
+            unsafe {
+                core::arch::asm!(
+                    "mov {lr}, x30",
+                    "mov {sp}, sp",
+                    "mov {fp}, x29",
+                    "ldr {slr}, [x29, #8]",
+                    lr = out(reg) lr,
+                    sp = out(reg) sp,
+                    fp = out(reg) fp,
+                    slr = out(reg) saved_lr,
+                    options(nostack, readonly),
+                );
+            }
+            crate::user_log!(
+                "SPAWN26_RTLIB_STACK_BEFORE sp=0x{:x} fp=0x{:x} lr=0x{:x} saved_lr=0x{:x}",
+                sp, fp, lr, saved_lr
+            );
+        }
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR, args) };
         #[cfg(all(target_arch = "aarch64", not(test)))]
-        crate::user_log!(
-            "AARCH64_SYSCALL26_RETURN x0={} x1={} x2={} x3={} x4={} x5={}",
-            ret.ret0, ret.ret1, ret.ret2, ret.ret3, ret.ret4, ret.ret5
-        );
+        {
+            let lr: usize;
+            let sp: usize;
+            let fp: usize;
+            let saved_lr: usize;
+            unsafe {
+                core::arch::asm!(
+                    "mov {lr}, x30",
+                    "mov {sp}, sp",
+                    "mov {fp}, x29",
+                    "ldr {slr}, [x29, #8]",
+                    lr = out(reg) lr,
+                    sp = out(reg) sp,
+                    fp = out(reg) fp,
+                    slr = out(reg) saved_lr,
+                    options(nostack, readonly),
+                );
+            }
+            crate::user_log!(
+                "SPAWN26_RTLIB_STACK_AFTER sp=0x{:x} fp=0x{:x} lr=0x{:x} saved_lr=0x{:x}",
+                sp, fp, lr, saved_lr
+            );
+            crate::user_log!(
+                "AARCH64_SYSCALL26_RETURN x0={} x1={} x2={} x3={} x4={} x5={}",
+                ret.ret0, ret.ret1, ret.ret2, ret.ret3, ret.ret4, ret.ret5
+            );
+        }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         if ret.ret0 != 0 {
             return Err(decode_syscall_error(ret.ret0));

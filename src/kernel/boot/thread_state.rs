@@ -507,6 +507,16 @@ impl KernelState {
                     flags: crate::kernel::vm::PageFlags::USER_RW,
                 },
             )?;
+            #[cfg(not(feature = "hosted-dev"))]
+            crate::yarm_log!(
+                "KSPAWN_NEW_TASK_STACK tid={} asid={} stack_va=0x{:x} pa=0x{:x} stack_base=0x{:x} stack_top=0x{:x}",
+                tid,
+                asid.0,
+                page,
+                phys.0,
+                base,
+                top
+            );
         }
         let (_guard_mem_id, guard_mem_cap) = self.alloc_anonymous_memory_object()?;
         let guard_phys =
