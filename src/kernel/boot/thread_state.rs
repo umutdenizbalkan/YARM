@@ -496,9 +496,7 @@ impl KernelState {
             }
         }
         for page in (base..top).step_by(crate::kernel::vm::PAGE_SIZE) {
-            let (_mem_id, mem_cap) = self.alloc_anonymous_memory_object()?;
-            let phys =
-                self.resolve_memory_object_phys(mem_cap, crate::kernel::vm::PageFlags::USER_RW)?;
+            let phys = crate::kernel::vm::PhysAddr(self.alloc_user_data_frame()?);
             self.map_user_page_in_asid_raw(
                 asid,
                 crate::kernel::vm::VirtAddr(page),
@@ -518,9 +516,7 @@ impl KernelState {
                 top
             );
         }
-        let (_guard_mem_id, guard_mem_cap) = self.alloc_anonymous_memory_object()?;
-        let guard_phys =
-            self.resolve_memory_object_phys(guard_mem_cap, crate::kernel::vm::PageFlags::GUARD)?;
+        let guard_phys = crate::kernel::vm::PhysAddr(self.alloc_user_data_frame()?);
         self.map_user_page_in_asid_raw(
             asid,
             crate::kernel::vm::VirtAddr(guard),
