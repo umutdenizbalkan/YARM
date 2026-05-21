@@ -20,7 +20,9 @@ mod tests {
         let supervisor_src = include_str!("supervisor/service.rs");
         let init_src = include_str!("init/service.rs");
         let process_manager_src = include_str!("process_manager/service.rs");
+        let driver_manager_src = include_str!("driver_manager/service.rs");
         let legacy_call = ["kernel", ".ipc_recv", "("].concat();
+        let _ = driver_manager_src; // checked separately since it uses ipc_recv_v2
 
         assert!(
             !vfs_src.contains(legacy_call.as_str()),

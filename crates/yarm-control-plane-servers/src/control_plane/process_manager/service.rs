@@ -1010,7 +1010,11 @@ impl ProcessService {
                 #[cfg(not(test))]
                 {
                     let (tid, caller_cap) =
-                        if req.image_id == 4 || req.image_id == 5 || req.image_id == 6 {
+                        if req.image_id == 4
+                        || req.image_id == 5
+                        || req.image_id == 6
+                        || req.image_id == 7
+                    {
                             // VFS-backed path: read ELF from initramfs CPIO via the
                             // SpawnFromInitramfsFile kernel syscall (nr=26).  This is the
                             // sole spawn for these image_ids; the old spawn_with_caps path
@@ -1161,7 +1165,8 @@ unsafe fn pm_vfs_spawn_inline(
     let (cpio_name, path_label): (&[u8], &str) = match image_id {
         4 => (b"sbin/initramfs_srv", "/initramfs/sbin/initramfs_srv"),
         5 => (b"sbin/devfs_srv",     "/initramfs/sbin/devfs_srv"),
-        6 => (b"sbin/vfs_server",    "/initramfs/sbin/vfs_server"),
+        6 => (b"sbin/vfs_server",     "/initramfs/sbin/vfs_server"),
+        7 => (b"sbin/driver_manager", "/initramfs/sbin/driver_manager"),
         _ => return None,
     };
     yarm_user_rt::user_log!(

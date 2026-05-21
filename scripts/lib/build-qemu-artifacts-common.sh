@@ -264,9 +264,33 @@ common_stage_vfs_server_elf() {
   echo "[ok] staged vfs server ELF as /sbin/vfs_server"
 }
 
+common_stage_driver_manager_elf() {
+  if [[ ! -f "$DRIVER_MANAGER_ELF" ]]; then
+    echo "[warn] driver manager ELF missing: $DRIVER_MANAGER_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$DRIVER_MANAGER_ELF" "$ROOTFS_DIR/sbin/driver_manager"
+  chmod +x "$ROOTFS_DIR/sbin/driver_manager"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$DRIVER_MANAGER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] driver manager ELF has forbidden RWE PT_LOAD segment: $DRIVER_MANAGER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $DRIVER_MANAGER_ELF"
+  fi
+
+  echo "[ok] staged driver manager ELF as /sbin/driver_manager"
+}
+
 common_verify_initramfs_stage_paths() {
   local missing=0
-  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/process_manager" "sbin/supervisor"; do
+  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/process_manager" "sbin/supervisor"; do
     if [[ ! -f "$ROOTFS_DIR/$path" ]]; then
       echo "[error] expected initramfs path missing: $ROOTFS_DIR/$path"
       missing=1
