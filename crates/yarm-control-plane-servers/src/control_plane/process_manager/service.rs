@@ -319,8 +319,6 @@ pub struct ProcessService {
     policy_records: [Option<ProcessSpawnPolicyRecord>; 64],
     restart_token_records: [Option<RestartTokenRecord>; 64],
     restart_control_send_cap: Option<u32>,
-    /// Image id of the pending VFS-backed spawn; cleared after the spawn runs.
-    vfs_probe_pending: Option<u64>,
     handled: usize,
 }
 
@@ -714,14 +712,8 @@ impl ProcessService {
             restart_token_records: [None; 64],
             restart_control_send_cap: yarm_user_rt::runtime::startup_context()
                 .process_manager_restart_control_send_cap,
-            vfs_probe_pending: None,
             handled: 0,
         }
-    }
-
-    /// Take the VFS send cap saved during VFS server spawn, if any.
-    pub fn take_vfs_probe(&mut self) -> Option<u64> {
-        self.vfs_probe_pending.take()
     }
 
     pub const fn handled_count(&self) -> usize {
@@ -1017,23 +1009,37 @@ impl ProcessService {
             ProcessRequest::SpawnV5Cap(req) => {
                 #[cfg(not(test))]
                 {
-                    let backend = KernelProcessSpawnBackend::new();
-                    // caller_cap: cap in the parent's cnode (what we forward to init).
-                    // my_cap: PM's own cap for the same endpoint (non-zero when the
-                    //   kernel packed both in ret2 via the high-32/low-32 scheme).
-                    let (tid, caller_cap, my_cap) = backend.spawn_with_caps(
-                        req.image_id,
-                        req.parent_pid.0,
-                        req.service_caps,
-                    )?;
-                    // Save initramfs send cap for the post-reply image probe.
-                    // image_id=4 is initramfs_srv; probe goes directly to avoid
-                    // VFS recv_cap interference from concurrent init requests.
-                    let pm_vfs_cap = if my_cap != 0 { my_cap } else { caller_cap };
-                    if (req.image_id == 4 || req.image_id == 5 || req.image_id == 6) && pm_vfs_cap != 0 {
-                        self.vfs_probe_pending = Some(req.image_id);
-                    }
-                    let result = SpawnV5CapResult::new(tid, caller_cap as u64);
+                    let (tid, caller_cap) =
+                        if req.image_id == 4 || req.image_id == 5 || req.image_id == 6 {
+                            // VFS-backed path: read ELF from initramfs CPIO via the
+                            // SpawnFromInitramfsFile kernel syscall (nr=26).  This is the
+                            // sole spawn for these image_ids; the old spawn_with_caps path
+                            // is bypassed to avoid creating a duplicate process.
+                            let mut startup_args = [0u64; 18];
+                            startup_args[13] = req.service_caps[0];
+                            startup_args[14] = req.service_caps[1];
+                            startup_args[15] = req.service_caps[2];
+                            startup_args[16] = req.service_caps[3];
+                            match unsafe {
+                                pm_vfs_spawn_inline(
+                                    req.image_id,
+                                    req.parent_pid.0,
+                                    &startup_args,
+                                )
+                            } {
+                                Some((t, c, _)) => (t, c as u64),
+                                None => return Err(ProcessManagerError::TableFull),
+                            }
+                        } else {
+                            let backend = KernelProcessSpawnBackend::new();
+                            let (t, c, _) = backend.spawn_with_caps(
+                                req.image_id,
+                                req.parent_pid.0,
+                                req.service_caps,
+                            )?;
+                            (t, c as u64)
+                        };
+                    let result = SpawnV5CapResult::new(tid, caller_cap);
                     let encoded = result.encode();
                     yarm_user_rt::user_log!(
                         "PM_SPAWN_V5_CAP_REPLY tid={} service_send_cap={} len={}",
@@ -1140,91 +1146,36 @@ fn map_elf_error(err: yarm_srv_common::elf::ElfParseError) -> ProcessManagerErro
 }
 
 /// Spawn `image_id` from the boot initramfs CPIO via the `SpawnFromInitramfsFile`
-/// kernel syscall.  The kernel reads the ELF into its own staging buffer and
-/// spawns the process without requiring a user-space buffer, avoiding
-/// physical-memory aliasing between the user BSS and the kernel image.
+/// kernel syscall (nr=26).  The kernel reads the ELF into its own staging buffer
+/// and spawns the process without requiring a user-space buffer.
 ///
-/// Must be called BEFORE replying to init so the PM's recv endpoint is quiet.
+/// Returns `Some((tid, caller_cap, spawner_cap))` on success, `None` on failure.
+/// `startup_args` must have service caps at indices 13-16 (same layout as
+/// `spawn_process_with_startup_caps`).
 #[cfg(not(test))]
-unsafe fn pm_vfs_spawn_image_load(image_id: u64, recv_cap_debug: u32) {
+unsafe fn pm_vfs_spawn_inline(
+    image_id: u64,
+    parent_pid: u64,
+    startup_args: &[u64; 18],
+) -> Option<(u64, u32, u32)> {
     let (cpio_name, path_label): (&[u8], &str) = match image_id {
         4 => (b"sbin/initramfs_srv", "/initramfs/sbin/initramfs_srv"),
         5 => (b"sbin/devfs_srv",     "/initramfs/sbin/devfs_srv"),
         6 => (b"sbin/vfs_server",    "/initramfs/sbin/vfs_server"),
-        _ => return,
+        _ => return None,
     };
-
     yarm_user_rt::user_log!(
-        "PM_VFS_SPAWN_IMAGE_BEGIN image_id={} path={}",
-        image_id,
-        path_label
+        "PM_VFS_SPAWN_IMAGE_BEGIN image_id={} path={} parent_pid={}",
+        image_id, path_label, parent_pid
     );
-
-    let startup_args = [0u64; 18];
-    #[cfg(all(target_arch = "aarch64", not(test)))]
-    {
-        let lr: usize;
-        let sp: usize;
-        let fp: usize;
-        let saved_lr: usize;
-        unsafe {
-            core::arch::asm!(
-                "mov {lr}, x30",
-                "mov {sp}, sp",
-                "mov {fp}, x29",
-                "ldr {slr}, [x29, #8]",
-                lr = out(reg) lr,
-                sp = out(reg) sp,
-                fp = out(reg) fp,
-                slr = out(reg) saved_lr,
-                options(nostack, readonly),
-            );
-        }
-        yarm_user_rt::user_log!(
-            "PM_SPAWN_SYSCALL26_LR_BEFORE lr=0x{:x}", lr
-        );
-        yarm_user_rt::user_log!(
-            "PM_SPAWN_STACK_PROBE_BEFORE sp=0x{:x} fp=0x{:x} saved_lr=0x{:x}",
-            sp, fp, saved_lr
-        );
-    }
-    yarm_user_rt::user_log!("PM_SPAWN_SYSCALL26_BEFORE recv_cap={}", recv_cap_debug);
     let result = unsafe {
         yarm_user_rt::syscall::spawn_from_initramfs_file(
             image_id,
             cpio_name,
-            0,
-            &startup_args,
+            parent_pid,
+            startup_args,
         )
     };
-    yarm_user_rt::user_log!("PM_SPAWN_SYSCALL26_AFTER recv_cap={}", recv_cap_debug);
-    #[cfg(all(target_arch = "aarch64", not(test)))]
-    {
-        let lr: usize;
-        let sp: usize;
-        let fp: usize;
-        let saved_lr: usize;
-        unsafe {
-            core::arch::asm!(
-                "mov {lr}, x30",
-                "mov {sp}, sp",
-                "mov {fp}, x29",
-                "ldr {slr}, [x29, #8]",
-                lr = out(reg) lr,
-                sp = out(reg) sp,
-                fp = out(reg) fp,
-                slr = out(reg) saved_lr,
-                options(nostack, readonly),
-            );
-        }
-        yarm_user_rt::user_log!(
-            "PM_SPAWN_SYSCALL26_LR_AFTER lr=0x{:x}", lr
-        );
-        yarm_user_rt::user_log!(
-            "PM_SPAWN_STACK_PROBE_AFTER sp=0x{:x} fp=0x{:x} saved_lr=0x{:x}",
-            sp, fp, saved_lr
-        );
-    }
     match result {
         Ok((tid, caller_cap, spawner_cap)) => {
             yarm_user_rt::user_log!(
@@ -1235,12 +1186,14 @@ unsafe fn pm_vfs_spawn_image_load(image_id: u64, recv_cap_debug: u32) {
                 "PM_VFS_SPAWN_IMAGE_SELECTED image_id={} source=vfs",
                 image_id
             );
+            Some((tid, caller_cap, spawner_cap))
         }
         Err(e) => {
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_IMAGE_FALLBACK image_id={} err={:?} source=cpio reason=spawn_fail",
                 image_id, e
             );
+            None
         }
     }
 }
@@ -1597,30 +1550,6 @@ pub fn run() {
                     if let Some(cap) = reply_cap {
                         // SAFETY: kernel validates reply capability rights/object.
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
-                    }
-                    // Post-reply VFS-backed spawn: SpawnFromInitramfsFile is a direct
-                    // kernel syscall with no IPC interaction, so there is no race with
-                    // init's next request arriving on PM's recv endpoint.
-                    #[cfg(not(test))]
-                    if let Some(probe_image_id) = service.take_vfs_probe() {
-                        let cap_before = recv_cap;
-                        yarm_user_rt::user_log!(
-                            "PM_RECV_CAP_ADDR value_before={} image_id={}",
-                            cap_before, probe_image_id
-                        );
-                        unsafe { pm_vfs_spawn_image_load(probe_image_id, recv_cap) };
-                        // Reload from startup context: the svc #0 in spawn may corrupt
-                        // caller-saved state if the kernel's register-restore path has
-                        // a bug (e.g., physical page aliasing with PM's trap frame).
-                        let reloaded = yarm_user_rt::runtime::startup_context()
-                            .pm_request_recv_cap
-                            .unwrap_or(recv_cap);
-                        yarm_user_rt::user_log!(
-                            "PM_RECV_CAP_ADDR value_after_spawn={} reloaded={}",
-                            recv_cap, reloaded
-                        );
-                        recv_cap = reloaded;
-                        yarm_user_rt::user_log!("PM_RECV_CAP_RELOAD recv_cap={}", recv_cap);
                     }
                 } else {
                     yarm_user_rt::user_log!(
