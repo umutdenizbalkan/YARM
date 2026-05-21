@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use super::mount_table::MountLabel;
+
 /// Maximum number of simultaneously tracked open file descriptors.
 pub const MAX_FD_ENTRIES: usize = 32;
 
@@ -8,7 +10,7 @@ pub const MAX_FD_ENTRIES: usize = 32;
 struct FdEntry {
     fd: u64,
     backend_cap: u32,
-    name: &'static str,
+    label: MountLabel,
 }
 
 /// Per-session fd → backend routing table for vfs_server.
@@ -26,7 +28,7 @@ impl VfsFdTable {
     const EMPTY: FdEntry = FdEntry {
         fd: u64::MAX,
         backend_cap: 0,
-        name: "",
+        label: MountLabel::EMPTY,
     };
 
     pub const fn new() -> Self {
@@ -40,24 +42,24 @@ impl VfsFdTable {
     ///
     /// Returns `false` if the table is full.  Duplicate fds are not
     /// deduplicated; callers should close before re-opening the same fd.
-    pub fn insert(&mut self, fd: u64, backend_cap: u32, name: &'static str) -> bool {
+    pub fn insert(&mut self, fd: u64, backend_cap: u32, name: &str) -> bool {
         if self.count >= MAX_FD_ENTRIES {
             return false;
         }
         self.entries[self.count] = FdEntry {
             fd,
             backend_cap,
-            name,
+            label: MountLabel::from_str(name),
         };
         self.count += 1;
         true
     }
 
-    /// Return `(backend_cap, name)` for the first entry matching `fd`.
-    pub fn lookup(&self, fd: u64) -> Option<(u32, &'static str)> {
+    /// Return a copy of `(backend_cap, label)` for the first entry matching `fd`.
+    pub fn lookup(&self, fd: u64) -> Option<(u32, MountLabel)> {
         for entry in &self.entries[..self.count] {
             if entry.fd == fd {
-                return Some((entry.backend_cap, entry.name));
+                return Some((entry.backend_cap, entry.label));
             }
         }
         None
@@ -95,13 +97,13 @@ mod tests {
         assert!(t.insert(4, 20, "devfs"));
         assert_eq!(t.len(), 2);
 
-        let (cap, name) = t.lookup(3).unwrap();
+        let (cap, label) = t.lookup(3).unwrap();
         assert_eq!(cap, 10);
-        assert_eq!(name, "initramfs");
+        assert_eq!(label.as_str(), "initramfs");
 
-        let (cap, name) = t.lookup(4).unwrap();
+        let (cap, label) = t.lookup(4).unwrap();
         assert_eq!(cap, 20);
-        assert_eq!(name, "devfs");
+        assert_eq!(label.as_str(), "devfs");
     }
 
     #[test]
@@ -158,5 +160,23 @@ mod tests {
         assert_eq!(t.len(), 1);
         let (cap, _) = t.lookup(3).unwrap();
         assert_eq!(cap, 20);
+    }
+
+    #[test]
+    fn fd_table_label_is_stored_and_retrieved() {
+        let mut t = VfsFdTable::new();
+        t.insert(7, 99, "initramfs");
+        let (_, label) = t.lookup(7).unwrap();
+        assert_eq!(label.as_str(), "initramfs");
+    }
+
+    #[test]
+    fn fd_table_label_truncates_beyond_max() {
+        // Names longer than 32 bytes are silently truncated.
+        let long_name = "a".repeat(64);
+        let mut t = VfsFdTable::new();
+        t.insert(1, 1, &long_name);
+        let (_, label) = t.lookup(1).unwrap();
+        assert_eq!(label.as_str().len(), 32);
     }
 }
