@@ -160,8 +160,6 @@ impl PhysicalFrameAllocator {
             );
             panic!("PMEM_ALLOC_RESERVED_BUG: allocated frame overlaps reserved range");
         }
-        #[cfg(not(feature = "hosted-dev"))]
-        crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user", alloc_phys);
         Ok(alloc_phys)
     }
 
@@ -632,10 +630,13 @@ pub fn init_pt_frame_allocator(regions: &[MemoryRegion]) -> Result<(), FrameAllo
 pub fn alloc_pt_frame() -> Result<u64, FrameAllocError> {
     ensure_pt_allocator_initialized()?;
     let mut guard = PT_FRAME_ALLOCATOR.lock();
-    guard
+    let pa = guard
         .as_mut()
         .ok_or(FrameAllocError::Uninitialized)?
-        .alloc_frame()
+        .alloc_frame()?;
+    #[cfg(not(feature = "hosted-dev"))]
+    crate::yarm_log!("PT_ALLOC_FRAME pa=0x{:x}", pa);
+    Ok(pa)
 }
 
 pub fn alloc_pt_contiguous_frames(pages: usize) -> Result<u64, FrameAllocError> {
