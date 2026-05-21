@@ -1146,7 +1146,7 @@ fn map_elf_error(err: yarm_srv_common::elf::ElfParseError) -> ProcessManagerErro
 ///
 /// Must be called BEFORE replying to init so the PM's recv endpoint is quiet.
 #[cfg(not(test))]
-unsafe fn pm_vfs_spawn_image_load(image_id: u64) {
+unsafe fn pm_vfs_spawn_image_load(image_id: u64, recv_cap_debug: u32) {
     let (cpio_name, path_label): (&[u8], &str) = match image_id {
         4 => (b"sbin/initramfs_srv", "/initramfs/sbin/initramfs_srv"),
         5 => (b"sbin/devfs_srv",     "/initramfs/sbin/devfs_srv"),
@@ -1160,6 +1160,7 @@ unsafe fn pm_vfs_spawn_image_load(image_id: u64) {
     );
 
     let startup_args = [0u64; 18];
+    yarm_user_rt::user_log!("PM_SPAWN_SYSCALL26_BEFORE recv_cap={}", recv_cap_debug);
     let result = unsafe {
         yarm_user_rt::syscall::spawn_from_initramfs_file(
             image_id,
@@ -1168,6 +1169,7 @@ unsafe fn pm_vfs_spawn_image_load(image_id: u64) {
             &startup_args,
         )
     };
+    yarm_user_rt::user_log!("PM_SPAWN_SYSCALL26_AFTER recv_cap={}", recv_cap_debug);
     match result {
         Ok((tid, caller_cap, spawner_cap)) => {
             yarm_user_rt::user_log!(
@@ -1517,7 +1519,7 @@ pub fn run_request_loop_over_runtime_state_with_cnode_resize(
 pub fn run() {
     yarm_user_rt::user_log!("PM_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
-    let Some(recv_cap) = ctx.pm_request_recv_cap else {
+    let Some(mut recv_cap) = ctx.pm_request_recv_cap else {
         loop {
             let _ = yarm_user_rt::syscall::yield_now();
         }
@@ -1546,7 +1548,24 @@ pub fn run() {
                     // init's next request arriving on PM's recv endpoint.
                     #[cfg(not(test))]
                     if let Some(probe_image_id) = service.take_vfs_probe() {
-                        unsafe { pm_vfs_spawn_image_load(probe_image_id) };
+                        let cap_before = recv_cap;
+                        yarm_user_rt::user_log!(
+                            "PM_RECV_CAP_ADDR value_before={} image_id={}",
+                            cap_before, probe_image_id
+                        );
+                        unsafe { pm_vfs_spawn_image_load(probe_image_id, recv_cap) };
+                        // Reload from startup context: the svc #0 in spawn may corrupt
+                        // caller-saved state if the kernel's register-restore path has
+                        // a bug (e.g., physical page aliasing with PM's trap frame).
+                        let reloaded = yarm_user_rt::runtime::startup_context()
+                            .pm_request_recv_cap
+                            .unwrap_or(recv_cap);
+                        yarm_user_rt::user_log!(
+                            "PM_RECV_CAP_ADDR value_after_spawn={} reloaded={}",
+                            recv_cap, reloaded
+                        );
+                        recv_cap = reloaded;
+                        yarm_user_rt::user_log!("PM_RECV_CAP_RELOAD recv_cap={}", recv_cap);
                     }
                 } else {
                     yarm_user_rt::user_log!(

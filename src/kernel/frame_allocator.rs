@@ -183,6 +183,16 @@ impl PhysicalFrameAllocator {
             for page in 0..pages {
                 let phys = alloc_phys.saturating_add((page as u64).saturating_mul(PAGE_SIZE_U64));
                 self.track_new_frame_ref(phys)?;
+                #[cfg(not(feature = "hosted-dev"))]
+                if let Some((rs, re)) = GLOBAL_RESERVED_RANGES.lock().find_overlap(phys) {
+                    crate::yarm_log!(
+                        "PMEM_ALLOC_RESERVED_BUG_CONTIG pa=0x{:x} range=0x{:x}..0x{:x} pages={}",
+                        phys, rs, re, pages
+                    );
+                    panic!("PMEM_ALLOC_RESERVED_BUG_CONTIG: allocated contiguous frame overlaps reserved range");
+                }
+                #[cfg(not(feature = "hosted-dev"))]
+                crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user_contig pages={}", phys, pages);
             }
             return Ok(alloc_phys);
         }

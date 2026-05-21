@@ -550,6 +550,11 @@ pub mod syscall {
             startup_args.len(),              // arg5 = startup_args_count
         ];
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR, args) };
+        #[cfg(all(target_arch = "aarch64", not(test)))]
+        crate::user_log!(
+            "AARCH64_SYSCALL26_RETURN x0={} x1={} x2={} x3={} x4={} x5={}",
+            ret.ret0, ret.ret1, ret.ret2, ret.ret3, ret.ret4, ret.ret5
+        );
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         if ret.ret0 != 0 {
             return Err(decode_syscall_error(ret.ret0));

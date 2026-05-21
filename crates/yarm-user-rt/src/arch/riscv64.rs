@@ -30,6 +30,9 @@ pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
         ret0: a0,
         ret1: a1,
         ret2: a2,
+        ret3: 0,
+        ret4: 0,
+        ret5: 0,
         error: 0,
     }
 }

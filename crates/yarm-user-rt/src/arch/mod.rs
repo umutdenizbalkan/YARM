@@ -6,6 +6,12 @@ pub(crate) struct SyscallReturn {
     pub(crate) ret0: usize,
     pub(crate) ret1: usize,
     pub(crate) ret2: usize,
+    /// Post-svc value of arg3 register (x3/a3 etc.) — used for diagnostics.
+    pub(crate) ret3: usize,
+    /// Post-svc value of arg4 register (x4/a4 etc.) — used for diagnostics.
+    pub(crate) ret4: usize,
+    /// Post-svc value of arg5 register (x5/a5 etc.) — used for diagnostics.
+    pub(crate) ret5: usize,
     pub(crate) error: usize,
 }
 
