@@ -2,6 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm_ipc_abi::blkcache_abi::*;
+use yarm_ipc_abi::block_backend_abi::{
+    BlkBackendQueryRequest, BlkBackendResponse, BLK_BACKEND_OP_QUERY_STATE,
+};
 use yarm_user_rt::ipc::Message;
 
 #[derive(Clone, Copy)]
@@ -21,6 +24,38 @@ impl BackendRecord {
 }
 
 const MAX_BACKENDS: usize = 8;
+
+
+fn probe_backend_query_state(backend_id: u64, backend_send_cap: u64, reply_recv_cap: u32) {
+    yarm_user_rt::user_log!(
+        "BLKCACHE_BACKEND_QUERY_STATE_BEGIN backend_id={}",
+        backend_id
+    );
+    let req = BlkBackendQueryRequest {
+        req_id: 0xB10C,
+        flags: 0,
+        device_id: backend_id,
+    };
+    let payload = req.encode();
+    let Ok(msg) = Message::with_header(0, BLK_BACKEND_OP_QUERY_STATE, 0, None, &payload) else {
+        return;
+    };
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap as u32, reply_recv_cap, &msg) };
+    match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) } {
+        Ok(Some(reply_msg)) => {
+            if let Some(resp) = BlkBackendResponse::decode(reply_msg.as_slice()) {
+                yarm_user_rt::user_log!(
+                    "BLKCACHE_BACKEND_QUERY_STATE_RETURN backend_id={} status={} logical_block_size={} physical_block_size={}",
+                    backend_id,
+                    resp.status,
+                    resp.logical_block_size,
+                    resp.physical_block_size
+                );
+            }
+        }
+        _ => {}
+    }
+}
 
 fn register_backend(table: &mut [BackendRecord; MAX_BACKENDS], args: RegisterBackendArgs) -> u32 {
     if args.backend_id == 0 || args.backend_send_cap == 0 || args.block_size == 0 {
@@ -55,6 +90,7 @@ fn register_backend(table: &mut [BackendRecord; MAX_BACKENDS], args: RegisterBac
 pub fn run() {
     yarm_user_rt::user_log!("BLKCACHE_SRV_ENTRY");
     let ctx = yarm_user_rt::runtime::startup_context();
+    let pm_reply_recv_cap = ctx.process_manager_reply_recv_cap;
     let Some(recv_cap) = ctx.process_manager_service_recv_ep else {
         yarm_user_rt::user_log!("BLKCACHE_NO_RECV_CAP");
         loop { let _ = yarm_user_rt::syscall::yield_now(); }
@@ -72,7 +108,15 @@ pub fn run() {
                         match RegisterBackendArgs::decode(msg.as_slice()) {
                             Some(args) => {
                                 yarm_user_rt::user_log!("BLKCACHE_OP_REGISTER_BACKEND backend_id={}", args.backend_id);
-                                (0, register_backend(&mut backends, args))
+                                {
+                                    let status = register_backend(&mut backends, args);
+                                    if status == BLKCACHE_STATUS_OK {
+                                        if let Some(reply_cap) = pm_reply_recv_cap {
+                                            probe_backend_query_state(args.backend_id, args.backend_send_cap, reply_cap);
+                                        }
+                                    }
+                                    (0, status)
+                                }
                             }
                             None => (0, BLKCACHE_STATUS_ERR_BAD_REQUEST),
                         }

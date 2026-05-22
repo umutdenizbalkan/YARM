@@ -4,9 +4,6 @@
 use crate::control_plane::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase,
 };
-use yarm_ipc_abi::block_backend_abi::{
-    BlkBackendQueryRequest, BlkBackendResponse, BLK_BACKEND_OP_QUERY_STATE, BLK_BACKEND_STATUS_EAGAIN,
-};
 use yarm_ipc_abi::blkcache_abi::{
     BlkCacheResponse, GetStatsRequest, RegisterBackendArgs, BLKCACHE_OP_GET_STATS,
     BLKCACHE_OP_REGISTER_BACKEND, BLKCACHE_STATUS_ERR_UNSUPPORTED, BLKCACHE_STATUS_OK,
@@ -501,42 +498,6 @@ pub fn run() {
         ),
     };
 
-
-    let query_req = BlkBackendQueryRequest {
-        req_id: 1,
-        flags: 0,
-        device_id: 1,
-    };
-    let query_payload = query_req.encode();
-    let Ok(query_msg) = yarm_user_rt::ipc::Message::with_header(0, BLK_BACKEND_OP_QUERY_STATE, 0, None, &query_payload) else {
-        yarm_user_rt::user_log!("INIT_VIRTIO_BLK_QUERY_STATE_SMOKE_RETURN ok=0 status=-22 logical_block_size=0");
-        return;
-    };
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(init_virtio_blk_send_cap as u32, pm_recv, &query_msg) };
-    let query_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
-    match query_reply {
-        Ok(Some(reply_msg)) => {
-            yarm_user_rt::user_log!("INIT_VIRTIO_BLK_QUERY_STATE_REPLY_RAW len={}", reply_msg.as_slice().len());
-            match BlkBackendResponse::decode(reply_msg.as_slice()) {
-            Some(resp) if resp.status == BLK_BACKEND_STATUS_EAGAIN && resp.logical_block_size == 512 => {
-                yarm_user_rt::user_log!(
-                    "INIT_VIRTIO_BLK_QUERY_STATE_SMOKE_RETURN ok=1 status={} logical_block_size={}",
-                    resp.status,
-                    resp.logical_block_size
-                );
-            }
-            Some(resp) => {
-                yarm_user_rt::user_log!(
-                    "INIT_VIRTIO_BLK_QUERY_STATE_SMOKE_RETURN ok=0 status={} logical_block_size={}",
-                    resp.status,
-                    resp.logical_block_size
-                );
-            }
-            None => yarm_user_rt::user_log!("INIT_VIRTIO_BLK_QUERY_STATE_SMOKE_RETURN ok=0 status=-22 logical_block_size=0"),
-            }
-        }
-        _ => yarm_user_rt::user_log!("INIT_VIRTIO_BLK_QUERY_STATE_SMOKE_RETURN ok=0 status=-22 logical_block_size=0"),
-    }
 
     let get_stats_req = GetStatsRequest {
         request_id: 1,
