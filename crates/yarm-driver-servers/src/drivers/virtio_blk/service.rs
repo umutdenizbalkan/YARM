@@ -4,7 +4,11 @@
 use yarm_ipc_abi::block_backend_abi::*;
 use yarm_user_rt::ipc::Message;
 
-fn decode_request(msg: &Message) -> Result<BlkBackendRequest, i32> {
+fn decode_query_request(msg: &Message) -> Result<BlkBackendQueryRequest, i32> {
+    BlkBackendQueryRequest::decode(msg.as_slice()).ok_or(BLK_BACKEND_STATUS_EINVAL)
+}
+
+fn decode_io_request(msg: &Message) -> Result<BlkBackendRequest, i32> {
     let req = BlkBackendRequest::decode(msg.as_slice()).ok_or(BLK_BACKEND_STATUS_EINVAL)?;
     if !req.is_valid_for_opcode(msg.opcode) {
         return Err(BLK_BACKEND_STATUS_EINVAL);
@@ -34,23 +38,23 @@ pub fn run() {
                 let (req_id, status) = match msg.opcode {
                     BLK_BACKEND_OP_QUERY_STATE => {
                         yarm_user_rt::user_log!("VIRTIO_BLK_OP_QUERY_STATE");
-                        match decode_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_EAGAIN), Err(e) => (0, e) }
+                        match decode_query_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_EAGAIN), Err(e) => (0, e) }
                     }
                     BLK_BACKEND_OP_READ => {
                         yarm_user_rt::user_log!("VIRTIO_BLK_OP_READ");
-                        match decode_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_ENOSYS), Err(e) => (0, e) }
+                        match decode_io_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_ENOSYS), Err(e) => (0, e) }
                     }
                     BLK_BACKEND_OP_WRITE => {
                         yarm_user_rt::user_log!("VIRTIO_BLK_OP_WRITE");
-                        match decode_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_ENOSYS), Err(e) => (0, e) }
+                        match decode_io_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_ENOSYS), Err(e) => (0, e) }
                     }
                     BLK_BACKEND_OP_FLUSH => {
                         yarm_user_rt::user_log!("VIRTIO_BLK_OP_FLUSH");
-                        match decode_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_ENOSYS), Err(e) => (0, e) }
+                        match decode_io_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_ENOSYS), Err(e) => (0, e) }
                     }
                     BLK_BACKEND_OP_GET_GEOM => {
                         yarm_user_rt::user_log!("VIRTIO_BLK_OP_GET_GEOM");
-                        match decode_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_EAGAIN), Err(e) => (0, e) }
+                        match decode_query_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_EAGAIN), Err(e) => (0, e) }
                     }
                     _ => (0, BLK_BACKEND_STATUS_EINVAL),
                 };

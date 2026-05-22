@@ -5,7 +5,7 @@ use crate::control_plane::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase,
 };
 use yarm_ipc_abi::block_backend_abi::{
-    BlkBackendRequest, BlkBackendResponse, BLK_BACKEND_OP_QUERY_STATE, BLK_BACKEND_STATUS_EAGAIN,
+    BlkBackendQueryRequest, BlkBackendResponse, BLK_BACKEND_OP_QUERY_STATE, BLK_BACKEND_STATUS_EAGAIN,
 };
 use yarm_ipc_abi::blkcache_abi::{
     BlkCacheResponse, GetStatsRequest, RegisterBackendArgs, BLKCACHE_OP_GET_STATS,
@@ -502,14 +502,10 @@ pub fn run() {
     };
 
 
-    let query_req = BlkBackendRequest {
+    let query_req = BlkBackendQueryRequest {
         req_id: 1,
         flags: 0,
         device_id: 1,
-        sector_start: 0,
-        sector_count: 0,
-        sg_count: 0,
-        sg_list: [yarm_ipc_abi::block_backend_abi::BlkSgEntry { mem_cap: 0, offset: 0, length: 0, flags: 0 }; 4],
     };
     let query_payload = query_req.encode();
     let Ok(query_msg) = yarm_user_rt::ipc::Message::with_header(0, BLK_BACKEND_OP_QUERY_STATE, 0, None, &query_payload) else {
