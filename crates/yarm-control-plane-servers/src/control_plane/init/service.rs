@@ -464,8 +464,8 @@ pub fn run() {
     let Ok(register_backend_msg) = yarm_user_rt::ipc::Message::with_header(
         0,
         BLKCACHE_OP_REGISTER_BACKEND,
-        0,
-        None,
+        yarm_user_rt::ipc::Message::FLAG_CAP_TRANSFER,
+        Some(init_virtio_blk_send_cap),
         &register_backend_payload,
     ) else {
         yarm_user_rt::user_log!("INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status=2 backend_id=1");

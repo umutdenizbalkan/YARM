@@ -25,6 +25,13 @@ impl BackendRecord {
 
 const MAX_BACKENDS: usize = 8;
 
+fn return_reply(reply_cap: u32, opcode: u16, request_id: u64, status: u32) {
+    let response = BlkCacheResponse { request_id, status, bytes_moved: 0, flags: 0 };
+    if let Ok(reply) = Message::with_header(0, opcode, 0, None, &response.encode()) {
+        let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
+    }
+}
+
 fn find_backend(table: &[BackendRecord; MAX_BACKENDS], backend_id: u64) -> Option<BackendRecord> {
     table.iter().copied().find(|r| r.registered && r.backend_id == backend_id)
 }
@@ -80,8 +87,12 @@ fn probe_backend_query_state(backend_id: u64, backend_send_cap: u64, reply_recv_
     }
 }
 
-fn register_backend(table: &mut [BackendRecord; MAX_BACKENDS], args: RegisterBackendArgs) -> u32 {
-    if args.backend_id == 0 || args.backend_send_cap == 0 || args.block_size == 0 {
+fn register_backend(
+    table: &mut [BackendRecord; MAX_BACKENDS],
+    args: RegisterBackendArgs,
+    transferred_backend_send_cap: u64,
+) -> u32 {
+    if args.backend_id == 0 || transferred_backend_send_cap == 0 || args.block_size == 0 {
         return BLKCACHE_STATUS_ERR_BAD_REQUEST;
     }
     for rec in table.iter() {
@@ -93,7 +104,7 @@ fn register_backend(table: &mut [BackendRecord; MAX_BACKENDS], args: RegisterBac
         if !rec.registered {
             *rec = BackendRecord {
                 backend_id: args.backend_id,
-                backend_send_cap: args.backend_send_cap,
+                backend_send_cap: transferred_backend_send_cap,
                 block_size: args.block_size,
                 flags: args.flags,
                 block_count: args.block_count,
@@ -103,6 +114,11 @@ fn register_backend(table: &mut [BackendRecord; MAX_BACKENDS], args: RegisterBac
                 "BLKCACHE_BACKEND_REGISTERED backend_id={} block_size={}",
                 args.backend_id,
                 args.block_size
+            );
+            yarm_user_rt::user_log!(
+                "BLKCACHE_BACKEND_REGISTER_CAP_TRANSFER backend_id={} cap={}",
+                args.backend_id,
+                transferred_backend_send_cap
             );
             return BLKCACHE_STATUS_OK;
         }
@@ -134,8 +150,17 @@ pub fn run() {
                         match RegisterBackendArgs::decode(msg.as_slice()) {
                             Some(args) => {
                                 yarm_user_rt::user_log!("BLKCACHE_OP_REGISTER_BACKEND backend_id={}", args.backend_id);
+                                let Some(tx_cap) = msg.transferred_cap().map(|c| c.0) else {
+                                    yarm_user_rt::user_log!(
+                                        "BLKCACHE_BACKEND_QUERY_STATE_ERR backend_id={} err=MissingTransferredCap",
+                                        args.backend_id
+                                    );
+                                    let status = BLKCACHE_STATUS_ERR_PERMISSION;
+                                    return_reply(reply_cap, msg.opcode, 0, status);
+                                    continue;
+                                };
                                 {
-                                    let status = register_backend(&mut backends, args);
+                                    let status = register_backend(&mut backends, args, tx_cap);
                                     if status == BLKCACHE_STATUS_OK {
                                         yarm_user_rt::user_log!(
                                             "BLKCACHE_BACKEND_PROBE_AFTER_REGISTER backend_id={}",
@@ -173,10 +198,7 @@ pub fn run() {
                     BLKCACHE_OP_CANCEL => { yarm_user_rt::user_log!("BLKCACHE_OP_CANCEL"); CancelRequest::decode(msg.as_slice()).map(|a|(a.request_id,BLKCACHE_STATUS_ERR_UNSUPPORTED)).unwrap_or((0,BLKCACHE_STATUS_ERR_BAD_REQUEST)) }
                     _ => (0, BLKCACHE_STATUS_ERR_BAD_REQUEST),
                 };
-                let response = BlkCacheResponse { request_id, status, bytes_moved: 0, flags: 0 };
-                if let Ok(reply) = Message::with_header(0, msg.opcode, 0, None, &response.encode()) {
-                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
-                }
+                return_reply(reply_cap, msg.opcode, request_id, status);
             }
             Ok(Some((_msg, None))) => {}
             Ok(None) => {}
@@ -190,23 +212,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn register_backend_happy_and_duplicate() {
+fn register_backend_happy_and_duplicate() {
         let mut t = [BackendRecord::empty(); MAX_BACKENDS];
         let a = RegisterBackendArgs { backend_id: 1, backend_send_cap: 9, block_size: 512, flags: 0, block_count: 1 };
-        assert_eq!(register_backend(&mut t, a), BLKCACHE_STATUS_OK);
-        assert_eq!(register_backend(&mut t, a), BLKCACHE_STATUS_ERR_BUSY);
+        assert_eq!(register_backend(&mut t, a, 9), BLKCACHE_STATUS_OK);
+        assert_eq!(register_backend(&mut t, a, 9), BLKCACHE_STATUS_ERR_BUSY);
     }
 
     #[test]
     fn register_backend_invalid_and_capacity() {
         let mut t = [BackendRecord::empty(); MAX_BACKENDS];
         let bad = RegisterBackendArgs { backend_id: 0, backend_send_cap: 1, block_size: 512, flags: 0, block_count: 1 };
-        assert_eq!(register_backend(&mut t, bad), BLKCACHE_STATUS_ERR_BAD_REQUEST);
+        assert_eq!(register_backend(&mut t, bad, 1), BLKCACHE_STATUS_ERR_BAD_REQUEST);
         for i in 0..MAX_BACKENDS {
             let ok = RegisterBackendArgs { backend_id: (i+1) as u64, backend_send_cap: (i+2) as u64, block_size: 512, flags: 0, block_count: 1 };
-            assert_eq!(register_backend(&mut t, ok), BLKCACHE_STATUS_OK);
+            assert_eq!(register_backend(&mut t, ok, (i+2) as u64), BLKCACHE_STATUS_OK);
         }
         let extra = RegisterBackendArgs { backend_id: 99, backend_send_cap: 77, block_size: 512, flags: 0, block_count: 1 };
-        assert_eq!(register_backend(&mut t, extra), BLKCACHE_STATUS_ERR_NO_MEMORY);
+        assert_eq!(register_backend(&mut t, extra, 77), BLKCACHE_STATUS_ERR_NO_MEMORY);
     }
 }
