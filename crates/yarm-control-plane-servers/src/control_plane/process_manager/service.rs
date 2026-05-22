@@ -1766,7 +1766,9 @@ pub fn run() {
     loop {
         // SAFETY: direct syscall wrapper call; PM owns its recv endpoint capability.
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
-            Ok(Some((msg, reply_cap))) => {
+            Ok(Some(received)) => {
+                let msg = received.message;
+                let reply_cap = received.reply_cap;
                 yarm_user_rt::user_log!(
                     "PM_RECV_GOT_MSG opcode={} len={} reply_cap={}",
                     msg.opcode,

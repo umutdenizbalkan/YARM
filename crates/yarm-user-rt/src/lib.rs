@@ -69,6 +69,14 @@ pub mod syscall {
     static USER_RT_RECV_AFTER_SYSCALL_MARKER: [u8; 27] = *b"USER_RT_RECV_AFTER_SYSCALL\0";
 
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ReceivedMessage {
+        pub message: Message,
+        pub reply_cap: Option<u32>,
+        pub transferred_cap: Option<u32>,
+        pub sender_tid: u64,
+    }
+
     pub trait IpcTransport {
         fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError>;
         fn recv(&mut self, ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError>;
@@ -80,11 +88,10 @@ pub mod syscall {
         fn recv_v2(
             &mut self,
             ep_cap: u32,
-        ) -> core::result::Result<Option<(Message, Option<u32>)>, SyscallError> {
+         ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
             match self.recv(ep_cap) {
                 Ok(Some(msg)) => {
-                    let reply_cap = msg.transferred_cap().map(|c| c.0 as u32);
-                    Ok(Some((msg, reply_cap)))
+                    Ok(Some(ReceivedMessage { message: msg, reply_cap: None, transferred_cap: msg.transferred_cap().map(|c| c.0 as u32), sender_tid: msg.sender_tid.0 }))
                 }
                 Ok(None) => Ok(None),
                 Err(e) => Err(e),
@@ -129,7 +136,7 @@ pub mod syscall {
         fn recv_v2(
             &mut self,
             ep_cap: u32,
-        ) -> core::result::Result<Option<(Message, Option<u32>)>, SyscallError> {
+         ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
             // SAFETY: forwards directly to syscall wrapper.
             unsafe { ipc_recv_v2(ep_cap) }
         }
@@ -219,7 +226,7 @@ pub mod syscall {
     #[inline]
     pub unsafe fn ipc_recv(ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError> {
         match unsafe { ipc_recv_v2(ep_cap) }? {
-            Some((msg, _reply_cap)) => Ok(Some(msg)),
+            Some(received) => Ok(Some(received.message)),
             None => Ok(None),
         }
     }
@@ -228,7 +235,7 @@ pub mod syscall {
     #[inline]
     pub unsafe fn ipc_recv_v2(
         ep_cap: u32,
-    ) -> core::result::Result<Option<(Message, Option<u32>)>, SyscallError> {
+     ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
         // Buffer is 2 bytes larger than MAX_PAYLOAD to accommodate the opcode prefix
         // that ipc_call prepends. The kernel receives [opcode_lo, opcode_hi, ...data].
         const FRAMED_MAX: usize = 2 + Message::MAX_PAYLOAD;
@@ -283,7 +290,7 @@ pub mod syscall {
         let opcode = u16::from_le_bytes([payload[0], payload[1]]);
         let msg_payload = &payload[2..len];
         let data_len = msg_payload.len();
-        let reply_cap = if ret.ret2 == SYSCALL_NO_TRANSFER_CAP as usize {
+        let returned_cap = if ret.ret2 == SYSCALL_NO_TRANSFER_CAP as usize {
             None
         } else {
             Some(ret.ret2 as u32)
@@ -294,20 +301,27 @@ pub mod syscall {
             len,
             opcode,
             data_len,
-            reply_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP)
+            returned_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP)
         );
         let preview_len = core::cmp::min(data_len, 32);
         crate::user_log!(
             "USER_RT_RECV_DECODE_META opcode={} flags={} transferred_cap={} payload_len={} payload_prefix={:02x?}",
             opcode,
-            if reply_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 },
-            reply_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP),
+            if returned_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 },
+            returned_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP),
             data_len,
             &msg_payload[..preview_len]
         );
-        let msg = Message::with_header(ret.ret0 as u64, opcode, 0, None, msg_payload)
+        let (reply_cap, transferred_cap, flags) = if (opcode == OPCODE_INLINE) && returned_cap.is_some() {
+            (returned_cap, None, Message::FLAG_REPLY_CAP)
+        } else if returned_cap.is_some() {
+            (None, returned_cap, Message::FLAG_CAP_TRANSFER)
+        } else {
+            (None, None, 0)
+        };
+        let msg = Message::with_header(ret.ret0 as u64, opcode, flags, transferred_cap.map(|c| c as u64), msg_payload)
             .map_err(|_| SyscallError::InvalidArgs)?;
-        Ok(Some((msg, reply_cap)))
+        Ok(Some(ReceivedMessage { message: msg, reply_cap, transferred_cap, sender_tid: ret.ret0 as u64 }))
     }
 
     #[inline]

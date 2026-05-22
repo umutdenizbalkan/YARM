@@ -144,21 +144,20 @@ pub fn run() {
 
     loop {
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
-            Ok(Some((msg, reply_cap))) => {
+            Ok(Some(received)) => {
+                let msg = received.message;
+                let reply_cap = received.reply_cap;
                 yarm_user_rt::user_log!(
                     "BLKCACHE_RECV_CAPS reply_cap={:?} transferred_cap={:?}",
                     reply_cap,
-                    msg.transferred_cap().map(|c| c.0)
+                    received.transferred_cap
                 );
                 let (request_id, status) = match msg.opcode {
                     BLKCACHE_OP_REGISTER_BACKEND => {
                         match RegisterBackendArgs::decode(msg.as_slice()) {
                             Some(args) => {
                                 yarm_user_rt::user_log!("BLKCACHE_OP_REGISTER_BACKEND backend_id={}", args.backend_id);
-                                let tx_cap = msg
-                                    .transferred_cap()
-                                    .map(|c| c.0)
-                                    .or(reply_cap.map(|c| c as u64));
+                                let tx_cap = received.transferred_cap.map(|c| c as u64);
                                 yarm_user_rt::user_log!(
                                     "BLKCACHE_BACKEND_REGISTER_RECV transferred_cap={:?}",
                                     tx_cap

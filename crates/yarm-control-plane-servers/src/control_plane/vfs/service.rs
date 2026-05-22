@@ -357,7 +357,10 @@ pub fn run() {
         // messages sent via ipc_call so we get the correct opcode and reply_cap.
         let (msg, client_reply_cap) =
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
-                Ok(Some((msg, Some(reply_cap)))) => (msg, reply_cap),
+                Ok(Some(received)) => {
+                    let Some(reply_cap) = received.reply_cap else { continue; };
+                    (received.message, reply_cap)
+                },
                 _ => {
                     let _ = yarm_user_rt::syscall::yield_now();
                     continue;

@@ -240,3 +240,5 @@
 - Moving to 8 inline words therefore requires either:
   - a syscall ABI v2 with expanded argument/register mapping, or
   - an alternate payload path that preserves existing syscall argument ABI compatibility.
+
+- IPC receive metadata now distinguishes `reply_cap` (for `ipc_reply`) from `transferred_cap` (application-transferred object capability).

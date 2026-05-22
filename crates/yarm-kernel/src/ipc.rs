@@ -89,6 +89,7 @@ const _: () = assert!(Message::MAX_PAYLOAD <= (u8::MAX as usize));
 impl Message {
     pub const MAX_PAYLOAD: usize = 128;
     pub const FLAG_CAP_TRANSFER: u16 = 1 << 0;
+    pub const FLAG_REPLY_CAP: u16 = 1 << 1;
     pub const NO_TRANSFER_CAP: u64 = u64::MAX;
 
     pub fn new(sender_tid: u64, bytes: &[u8]) -> Result<Self, IpcError> {
@@ -109,10 +110,11 @@ impl Message {
         let has_cap = transferred_cap.is_some();
         let flag_set = (flags & Self::FLAG_CAP_TRANSFER) != 0;
 
-        if has_cap && !flag_set {
+        let reply_flag_set = (flags & Self::FLAG_REPLY_CAP) != 0;
+        if has_cap && !(flag_set || reply_flag_set) {
             return Err(IpcError::MissingCapTransferFlag);
         }
-        if !has_cap && flag_set {
+        if !has_cap && (flag_set || reply_flag_set) {
             return Err(IpcError::InconsistentCapTransferFlag);
         }
 

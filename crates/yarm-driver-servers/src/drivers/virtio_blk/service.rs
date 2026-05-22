@@ -34,7 +34,9 @@ pub fn run() {
     };
     loop {
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
-            Ok(Some((msg, Some(reply_cap)))) => {
+            Ok(Some(received)) => {
+                    let msg = received.message;
+                    let Some(reply_cap) = received.reply_cap else { continue; };
                 let (req_id, status) = match msg.opcode {
                     BLK_BACKEND_OP_QUERY_STATE => {
                         yarm_user_rt::user_log!("VIRTIO_BLK_OP_QUERY_STATE");

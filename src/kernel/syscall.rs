@@ -777,7 +777,7 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         Message::with_header(
             sender_tid,
             OPCODE_INLINE,
-            Message::FLAG_CAP_TRANSFER,
+            Message::FLAG_REPLY_CAP,
             transfer_handle,
             &payload[..len],
         )
@@ -788,7 +788,7 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         Message::with_header(
             sender_tid,
             OPCODE_INLINE,
-            Message::FLAG_CAP_TRANSFER,
+            Message::FLAG_REPLY_CAP,
             transfer_handle,
             &payload[..len],
         )

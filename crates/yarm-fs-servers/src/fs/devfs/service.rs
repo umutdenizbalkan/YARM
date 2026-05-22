@@ -100,7 +100,9 @@ pub fn run() {
         loop {
             // SAFETY: recv_cap is a kernel-provided startup receive endpoint.
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
-                Ok(Some((msg, Some(reply_cap)))) => {
+                Ok(Some(received)) => {
+                    let msg = received.message;
+                    let Some(reply_cap) = received.reply_cap else { continue; };
                     yarm_user_rt::user_log!(
                         "DEVFS_SRV_GOT_MSG opcode={} reply_cap={}",
                         msg.opcode, reply_cap

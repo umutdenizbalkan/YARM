@@ -347,7 +347,9 @@ pub fn run() {
         loop {
             // SAFETY: driver_manager owns its startup-provided service recv endpoint.
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
-                Ok(Some((msg, reply_cap))) => {
+                Ok(Some(received)) => {
+                let msg = received.message;
+                let reply_cap = received.reply_cap;
                     yarm_user_rt::user_log!(
                         "DRIVER_MANAGER_GOT_MSG opcode={} reply_cap={}",
                         msg.opcode,
