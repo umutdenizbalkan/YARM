@@ -294,6 +294,15 @@ pub mod syscall {
             data_len,
             reply_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP)
         );
+        let preview_len = core::cmp::min(data_len, 32);
+        crate::user_log!(
+            "USER_RT_RECV_DECODE_META opcode={} flags={} transferred_cap={} payload_len={} payload_prefix={:02x?}",
+            opcode,
+            if reply_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 },
+            reply_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP),
+            data_len,
+            &payload[2..(2 + preview_len)]
+        );
         let msg = Message::with_header(ret.ret0 as u64, opcode, 0, None, &payload[2..len])
             .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some((msg, reply_cap)))

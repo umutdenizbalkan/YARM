@@ -465,6 +465,15 @@ pub fn run() {
         block_count: 1,
     };
     let register_backend_payload = register_backend_req.encode();
+    yarm_user_rt::user_log!(
+        "INIT_BLKCACHE_REGISTER_BACKEND_SEND_META opcode={} flags={} transferred_cap={} payload_len={} backend_id={} block_size={}",
+        BLKCACHE_OP_REGISTER_BACKEND,
+        yarm_user_rt::ipc::Message::FLAG_CAP_TRANSFER,
+        init_virtio_blk_send_cap,
+        register_backend_payload.len(),
+        register_backend_req.backend_id,
+        register_backend_req.block_size
+    );
     let Ok(register_backend_msg) = yarm_user_rt::ipc::Message::with_header(
         0,
         BLKCACHE_OP_REGISTER_BACKEND,
