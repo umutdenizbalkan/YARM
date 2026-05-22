@@ -240,3 +240,18 @@
 - Moving to 8 inline words therefore requires either:
   - a syscall ABI v2 with expanded argument/register mapping, or
   - an alternate payload path that preserves existing syscall argument ABI compatibility.
+
+## AArch64 syscall return capture and current `ipc_call` runtime behavior
+
+- On AArch64, userspace `raw_syscall` must copy post-`svc` `x0/x1/x2` into scratch outputs *inside the same inline-asm block* (explicit `mov` right after `svc`).
+- Prior attempts that relied on naive `lateout`/`inlateout` constraints without immediate copies were observed to read stale pre-`svc` values for `x1/x2` under optimization.
+- Current contract for `IpcRecv` / `ipc_recv_v2` decode on AArch64 and RISC-V:
+  - exported error shape: `x1==0 && x2==0 && x0 in 1..=9`;
+  - stale-blocking retry shape: `x1==arg1(buf_ptr) && x2==arg2(buf_len) && x0 in 1..=9`.
+- Blocking-receive wakeup and returned registers are coupled: wake success is interpreted from the post-wakeup register triple, so stale register reads would misclassify wake/error paths.
+- Current `ipc_call` user/runtime flow remains call-then-recv/drain in higher-level clients; this is intentionally preserved for now as a stable compatibility path.
+- Future cleaner blocking-call wakeup ABI would require a kernel+userspace contract that unambiguously distinguishes:
+  1. syscall-dispatch errors,
+  2. blocking wake-success with reply metadata,
+  3. timeout/would-block paths,
+  without relying on architecture-specific stale-shape heuristics.

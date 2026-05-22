@@ -190,6 +190,47 @@ pub mod syscall {
     }
 
     #[inline]
+    pub(crate) fn arch_error_from_ret(ret0: usize, ret1: usize, ret2: usize) -> Option<SyscallError> {
+        let is_exported_error = ret1 == 0 && ret2 == 0 && ret0 >= 1 && ret0 <= 9;
+        if is_exported_error {
+            Some(decode_syscall_error(ret0))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn arch_stale_blocking_error_from_ret(
+        ret0: usize,
+        ret1: usize,
+        ret2: usize,
+        arg1: usize,
+        arg2: usize,
+    ) -> Option<SyscallError> {
+        let is_stale_blocking = ret1 == arg1 && ret2 == arg2 && ret0 >= 1 && ret0 <= 9;
+        if is_stale_blocking {
+            Some(decode_syscall_error(ret0))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn build_ipc_call_frame(msg: &Message) -> Result<([u8; 2 + Message::MAX_PAYLOAD], usize), SyscallError> {
+        let payload_len = msg.len as usize;
+        if payload_len > Message::MAX_PAYLOAD {
+            return Err(SyscallError::InvalidArgs);
+        }
+        let frame_len = 2 + payload_len;
+        let mut frame = [0u8; 2 + Message::MAX_PAYLOAD];
+        frame[0..2].copy_from_slice(&msg.opcode.to_le_bytes());
+        frame[2..frame_len].copy_from_slice(&msg.payload[..payload_len]);
+        Ok((frame, frame_len))
+    }
+
+
+
+    #[inline]
     pub unsafe fn ipc_send(ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError> {
         let transfer_cap = msg
             .transferred_cap()
@@ -266,10 +307,9 @@ pub mod syscall {
             // x0 in 1..=9 is an error code when x1==0 && x2==0 (set_err zeroes all ret
             // fields; export_syscall_result_to_user_gprs then sets x0=code, x1=0, x2=0).
             // Also detect the pre-retry stale case: x1==buf_ptr && x2==FRAMED_MAX.
-            let is_exported_error = ret.ret1 == 0 && ret.ret2 == 0 && (1..=9).contains(&ret.ret0);
-            let is_stale_blocking = ret.ret1 == args[1] && ret.ret2 == args[2] && (1..=9).contains(&ret.ret0);
-            if is_exported_error || is_stale_blocking {
-                let err = decode_syscall_error(ret.ret0);
+            if let Some(err) = arch_error_from_ret(ret.ret0, ret.ret1, ret.ret2)
+                .or_else(|| arch_stale_blocking_error_from_ret(ret.ret0, ret.ret1, ret.ret2, args[1], args[2]))
+            {
                 return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
             }
         }
@@ -337,8 +377,7 @@ pub mod syscall {
             };
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret1 == args[1] && ret.ret2 == args[2] && (1..=9).contains(&ret.ret0) {
-            let err = decode_syscall_error(ret.ret0);
+        if let Some(err) = arch_stale_blocking_error_from_ret(ret.ret0, ret.ret1, ret.ret2, args[1], args[2]) {
             return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) {
                 Ok(None)
             } else {
@@ -380,11 +419,7 @@ pub mod syscall {
         // Prepend the 2-byte opcode (LE) before the payload bytes so the receiver
         // can reconstruct the application-level opcode. The kernel ABI only passes
         // raw bytes; msg.opcode is not carried in return registers.
-        let payload_len = msg.len as usize;
-        let frame_len = 2 + payload_len;
-        let mut frame = [0u8; 2 + Message::MAX_PAYLOAD];
-        frame[0..2].copy_from_slice(&msg.opcode.to_le_bytes());
-        frame[2..frame_len].copy_from_slice(&msg.payload[..payload_len]);
+        let (frame, frame_len) = build_ipc_call_frame(msg)?;
         let args = [
             ep_cap as usize,
             frame.as_ptr() as usize,
@@ -1191,4 +1226,37 @@ mod tests {
             original.pm_request_recv_cap.map(u64::from).unwrap_or(0),
         ]);
     }
+    #[test]
+    fn arch_error_decode_classifies_exported_and_stale_shapes() {
+        use crate::syscall::{arch_error_from_ret, arch_stale_blocking_error_from_ret, SyscallError};
+
+        assert_eq!(
+            arch_error_from_ret(7, 0, 0),
+            Some(SyscallError::WouldBlock)
+        );
+        assert_eq!(arch_error_from_ret(0, 0, 0), None);
+
+        assert_eq!(
+            arch_stale_blocking_error_from_ret(9, 0x1000, 258, 0x1000, 258),
+            Some(SyscallError::TimedOut)
+        );
+        assert_eq!(
+            arch_stale_blocking_error_from_ret(9, 0x1001, 258, 0x1000, 258),
+            None
+        );
+    }
+
+    #[test]
+    fn ipc_call_frame_carries_opcode_prefix_and_payload() {
+        use crate::ipc::Message;
+        use crate::syscall::build_ipc_call_frame;
+
+        let msg = Message::with_header(11, 0x3456, 0, None, &[1, 2, 3, 4]).expect("msg");
+        let (frame, frame_len) = build_ipc_call_frame(&msg).expect("frame");
+
+        assert_eq!(frame_len, 6);
+        assert_eq!(&frame[..2], &0x3456u16.to_le_bytes());
+        assert_eq!(&frame[2..frame_len], &[1, 2, 3, 4]);
+    }
+
 }
