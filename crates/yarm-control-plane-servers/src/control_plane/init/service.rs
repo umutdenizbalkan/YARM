@@ -428,7 +428,10 @@ pub fn run() {
 
     // --- Spawn blkcache_srv (image_id=8) ---
     yarm_user_rt::user_log!("INIT_BLKCACHE_SPAWN_V5_CALL_BEGIN");
-    let Some((blkcache_child_tid, blkcache_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 8, [0, 0, 0, 0], 0) else {
+    // parent_pid=1 so PM delegates the blkcache service send cap into init's
+    // CNode (caller-local namespace). PM lifecycle `pm_service_send_cap` stays
+    // PM-local and must not be used by init for IPC.
+    let Some((blkcache_child_tid, init_blkcache_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 8, [0, 0, 0, 0], 1) else {
         yarm_user_rt::user_log!("INIT_BLKCACHE_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
     };
@@ -453,8 +456,8 @@ pub fn run() {
         yarm_user_rt::user_log!("INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 msg=build_failed");
         return;
     };
-    // SAFETY: blkcache_send_cap and pm_recv are startup-provided caps for synchronous IPC.
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(blkcache_send_cap as u32, pm_recv, &get_stats_msg) };
+    // SAFETY: init_blkcache_send_cap is the caller-local delegated send cap.
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(init_blkcache_send_cap as u32, pm_recv, &get_stats_msg) };
     // SAFETY: pm_recv is init's startup-provided reply endpoint.
     let get_stats_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
     match get_stats_reply {
