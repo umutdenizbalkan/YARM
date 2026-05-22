@@ -249,7 +249,7 @@
   - exported error shape: `x1==0 && x2==0 && x0 in 1..=9`;
   - stale-blocking retry shape: `x1==arg1(buf_ptr) && x2==arg2(buf_len) && x0 in 1..=9`.
 - Blocking-receive wakeup and returned registers are coupled: wake success is interpreted from the post-wakeup register triple, so stale register reads would misclassify wake/error paths.
-- Current `ipc_call` user/runtime flow remains call-then-recv/drain in higher-level clients; this is intentionally preserved for now as a stable compatibility path.
+- `ipc_call` now returns the reply inline to userspace (decoded from syscall return registers), so userspace must consume the returned message and must not perform a follow-up zero-timeout drain recv on the same reply cap after a successful call.
 - Future cleaner blocking-call wakeup ABI would require a kernel+userspace contract that unambiguously distinguishes:
   1. syscall-dispatch errors,
   2. blocking wake-success with reply metadata,
