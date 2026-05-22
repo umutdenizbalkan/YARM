@@ -225,23 +225,47 @@ pub mod syscall {
     }
 
     #[inline]
-    pub(crate) fn decode_recv_payload<'a>(
-        opcode: u16,
+    fn is_known_app_opcode(op: u16) -> bool {
+        matches!(op,
+            // process/control plane ops
+            1..=12 |
+            // vfs ops
+            10..=23
+        )
+    }
+
+    pub(crate) fn decode_message_opcode_and_payload<'a>(
+        ret_opcode: u16,
         payload: &'a [u8],
         len: usize,
-    ) -> core::result::Result<&'a [u8], SyscallError> {
+    ) -> core::result::Result<(u16, &'a [u8]), SyscallError> {
         if len > payload.len() {
             return Err(SyscallError::Internal);
         }
-        // Legacy framed path: payload starts with opcode prefix added by ipc_call.
+        let raw = &payload[..len];
         if len >= 2 {
-            let framed_opcode = u16::from_le_bytes([payload[0], payload[1]]);
-            if framed_opcode == opcode {
-                return Ok(&payload[2..len]);
+            let prefixed_opcode = u16::from_le_bytes([payload[0], payload[1]]);
+            let prefix_is_known = is_known_app_opcode(prefixed_opcode);
+            let ret_is_known = is_known_app_opcode(ret_opcode);
+            // Legacy ipc_call framing path: kernel ret_opcode is syscall status-like,
+            // while application opcode is in payload prefix.
+            if prefix_is_known && (ret_opcode == 2 || !ret_is_known) {
+                return Ok((prefixed_opcode, &payload[2..len]));
+            }
+            // Ambiguous contradictory metadata vs prefix; fail closed so callers can
+            // log and avoid silently corrupting decoding.
+            if prefix_is_known && ret_is_known && ret_opcode != prefixed_opcode && ret_opcode != 2 {
+                crate::user_log!(
+                    "USER_RT_RECV_DECODE_AMBIGUOUS ret_opcode={} prefix_opcode={} len={}",
+                    ret_opcode,
+                    prefixed_opcode,
+                    len
+                );
+                return Err(SyscallError::InvalidArgs);
             }
         }
-        // Metadata-opcode path: payload is raw bytes without opcode prefix.
-        Ok(&payload[..len])
+        // Metadata-opcode path (ipc_send/no-reply): payload is raw bytes.
+        Ok((ret_opcode, raw))
     }
 
     #[inline]
@@ -296,8 +320,7 @@ pub mod syscall {
         if len > FRAMED_MAX {
             return Err(SyscallError::Internal);
         }
-        let opcode = ret.ret0 as u16;
-        let msg_payload = decode_recv_payload(opcode, &payload, len)?;
+        let (opcode, msg_payload) = decode_message_opcode_and_payload(ret.ret0 as u16, &payload, len)?;
         let data_len = msg_payload.len();
         let reply_cap = if ret.ret2 == SYSCALL_NO_TRANSFER_CAP as usize {
             None
@@ -1191,7 +1214,7 @@ pub mod vfs_client;
 mod tests {
     use crate::ipc::Message;
     use crate::runtime::{install_startup_arg_slots, startup_context};
-    use crate::syscall::{decode_recv_payload, ipc_call_prepare};
+    use crate::syscall::{decode_message_opcode_and_payload, ipc_call_prepare};
 
     #[test]
     fn startup_process_manager_caps_require_both_slots() {
@@ -1271,14 +1294,44 @@ mod tests {
     #[test]
     fn decode_recv_payload_accepts_metadata_opcode_raw_payload() {
         let payload = [0xAAu8, 0x55, 0, 0, 0, 0, 0, 0];
-        let decoded = decode_recv_payload(1, &payload, payload.len()).unwrap();
+        let (opcode, decoded) = decode_message_opcode_and_payload(1, &payload, payload.len()).unwrap();
+        assert_eq!(opcode, 1);
         assert_eq!(decoded, &payload);
     }
 
     #[test]
     fn decode_recv_payload_strips_legacy_prefixed_opcode_once() {
         let payload = [0x01u8, 0x00, 0xAA, 0xBB, 0xCC];
-        let decoded = decode_recv_payload(1, &payload, payload.len()).unwrap();
+        let (opcode, decoded) = decode_message_opcode_and_payload(2, &payload, payload.len()).unwrap();
+        assert_eq!(opcode, 1);
         assert_eq!(decoded, &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn decode_prefers_payload_prefix_for_lifecycle_query_when_ret_opcode_is_2() {
+        let payload = [12u8, 0x00, 0x11, 0x22];
+        let (opcode, decoded) = decode_message_opcode_and_payload(2, &payload, payload.len()).unwrap();
+        assert_eq!(opcode, 12);
+        assert_eq!(decoded, &[0x11, 0x22]);
+    }
+
+    #[test]
+    fn decode_prefers_payload_prefix_for_spawn_v5_when_ret_opcode_is_2() {
+        let payload = [11u8, 0x00, 0x33, 0x44];
+        let (opcode, decoded) = decode_message_opcode_and_payload(2, &payload, payload.len()).unwrap();
+        assert_eq!(opcode, 11);
+        assert_eq!(decoded, &[0x33, 0x44]);
+    }
+
+    #[test]
+    fn decode_keeps_register_backend_payload_intact_on_metadata_send_path() {
+        let mut payload = [0u8; 32];
+        payload[0] = 1; // backend_id LE
+        payload[8] = 0x00;
+        payload[9] = 0x02; // block_size=512 LE starts at offset 16 in real struct; this just asserts non-strip
+        let (opcode, decoded) = decode_message_opcode_and_payload(1, &payload, payload.len()).unwrap();
+        assert_eq!(opcode, 1);
+        assert_eq!(decoded.len(), 32);
+        assert_eq!(decoded[0], 1);
     }
 }
