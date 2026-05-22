@@ -42,6 +42,10 @@ fn probe_backend_query_state(backend_id: u64, backend_send_cap: u64, reply_recv_
     };
     let payload = req.encode();
     let Ok(msg) = Message::with_header(0, BLK_BACKEND_OP_QUERY_STATE, 0, None, &payload) else {
+        yarm_user_rt::user_log!(
+            "BLKCACHE_BACKEND_QUERY_STATE_ERR backend_id={} err=BuildMessageFailed",
+            backend_id
+        );
         return;
     };
     match unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap as u32, reply_recv_cap, &msg) } {
@@ -130,10 +134,24 @@ pub fn run() {
                                 {
                                     let status = register_backend(&mut backends, args);
                                     if status == BLKCACHE_STATUS_OK {
+                                        yarm_user_rt::user_log!(
+                                            "BLKCACHE_BACKEND_PROBE_AFTER_REGISTER backend_id={}",
+                                            args.backend_id
+                                        );
                                         if let Some(reply_cap) = pm_reply_recv_cap {
                                             if let Some(rec) = find_backend(&backends, args.backend_id) {
                                                 probe_backend_query_state(rec.backend_id, rec.backend_send_cap, reply_cap);
+                                            } else {
+                                                yarm_user_rt::user_log!(
+                                                    "BLKCACHE_BACKEND_QUERY_STATE_SKIP backend_id={} reason=BackendNotFoundAfterRegister",
+                                                    args.backend_id
+                                                );
                                             }
+                                        } else {
+                                            yarm_user_rt::user_log!(
+                                                "BLKCACHE_BACKEND_QUERY_STATE_SKIP backend_id={} reason=NoReplyRecvCap",
+                                                args.backend_id
+                                            );
                                         }
                                     }
                                     (0, status)
