@@ -2,7 +2,14 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::super::common::vfs_ipc::{VfsBackend, VfsError};
-use crate::blkcache::BlockCache;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockCache;
+
+impl BlockCache {
+    const fn new() -> Self { Self }
+    fn get(&self, _fd: u64) -> Option<u64> { None }
+    fn put(&mut self, _fd: u64, _len: u64) {}
+}
 
 const MAX_FAT_FILES: usize = 8;
 const MAX_OPEN_FDS: usize = 8;

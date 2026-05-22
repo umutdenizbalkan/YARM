@@ -7,7 +7,14 @@ use super::super::common::fs::{FdRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, Se
 use super::dir::find_inode_index;
 use super::file::checked_append;
 use super::inode::Ext4Inode;
-use crate::blkcache::BlockCache;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockCache;
+
+impl BlockCache {
+    const fn new() -> Self { Self }
+    fn get(&self, _fd: u64) -> Option<u64> { None }
+    fn put(&mut self, _fd: u64, _len: u64) {}
+}
 
 /// Compatibility path-id constant used by mount/policy/interop tests.
 pub const EXT4_DEMO_PATH_PTR: u64 = 0x4040;

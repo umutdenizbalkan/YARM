@@ -6,7 +6,7 @@
 extern crate alloc;
 
 pub mod fs;
-pub use fs::{blkcache, common, devfs, ext4, fat, initramfs, ramfs};
+pub use fs::{common, devfs, ext4, fat, initramfs, ramfs};
 
 pub fn run_devfs() {
     fs::devfs::run();
@@ -28,15 +28,11 @@ pub fn run_fat() {
     fs::fat::run();
 }
 
-pub fn run_blkcache() {
-    fs::blkcache::run();
-}
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn scoped_fs_impl_does_not_delegate_back_to_legacy_fs_namespace() {
-        let blkcache_src = include_str!("fs/blkcache/service.rs");
         let devfs_src = include_str!("fs/devfs/service.rs");
         let initramfs_src = include_str!("fs/initramfs/service.rs");
         let ramfs_src = include_str!("fs/ramfs/service.rs");
@@ -44,7 +40,6 @@ mod tests {
         let fat_src = include_str!("fs/fat/service.rs");
         let legacy_fs = ["yarm", "::services::", "fs::"].concat();
         for src in [
-            blkcache_src,
             devfs_src,
             initramfs_src,
             ramfs_src,
@@ -97,13 +92,6 @@ mod tests {
                 "bin/fat_srv.rs",
                 "run_fat",
             ),
-            (
-                "blkcache_srv",
-                "name = \"blkcache_srv\"",
-                "path = \"src/bin/blkcache_srv.rs\"",
-                "bin/blkcache_srv.rs",
-                "run_blkcache",
-            ),
         ];
 
         for (bin_name, name_entry, path_entry, bin_path, run_fn) in expected_bins {
@@ -122,7 +110,6 @@ mod tests {
                 "bin/initramfs_srv.rs" => include_str!("bin/initramfs_srv.rs"),
                 "bin/ext4_srv.rs" => include_str!("bin/ext4_srv.rs"),
                 "bin/fat_srv.rs" => include_str!("bin/fat_srv.rs"),
-                "bin/blkcache_srv.rs" => include_str!("bin/blkcache_srv.rs"),
                 _ => panic!("unexpected bin path in parity table: {bin_path}"),
             };
 
