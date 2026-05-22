@@ -46,7 +46,6 @@ required-features = ["hosted-dev"]
 [[bin]]
 name = "virtio_blk_srv"
 path = "src/bin/virtio_blk_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "virtio_gpu_srv"
