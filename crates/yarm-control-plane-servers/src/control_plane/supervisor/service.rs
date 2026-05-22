@@ -1426,8 +1426,9 @@ fn query_lifecycle_via_process_manager(
         .map_err(|_| KernelError::WrongObject)?;
     // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call,
     // identical to the init → PM SpawnV5 pattern in init/service.rs.
-    let Some(reply_msg) = unsafe { yarm_user_rt::syscall::ipc_call(req_cap, rep_cap, &msg) }
-        .map_err(|_| KernelError::WrongObject)? else {
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(req_cap, rep_cap, &msg) };
+    let reply_result = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, 0) };
+    let Some(reply_msg) = reply_result.map_err(|_| KernelError::WrongObject)? else {
         return Ok(None);
     };
     let reply = LifecycleQueryReply::decode(reply_msg.as_slice())

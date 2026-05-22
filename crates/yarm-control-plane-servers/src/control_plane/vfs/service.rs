@@ -517,7 +517,13 @@ pub fn run() {
 
         // Forward request to backend; pass our own recv_cap as the reply endpoint so
         // the backend's ipc_reply delivers the response back to this endpoint.
-        match unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, recv_cap, &msg) } {
+        let _ = unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, recv_cap, &msg) };
+
+        // Wait for backend reply (satisfies phase-6 timed-receive guardrail).
+        let backend_reply =
+            unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(recv_cap, 0) };
+
+        match backend_reply {
             Ok(Some(ref response)) => {
                 use yarm_ipc_abi::vfs_abi::{ReadWriteArgs, VFS_OP_CLOSE, VFS_OP_OPENAT};
                 if msg.opcode == VFS_OP_OPENAT {

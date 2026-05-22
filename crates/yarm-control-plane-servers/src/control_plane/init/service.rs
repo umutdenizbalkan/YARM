@@ -278,7 +278,9 @@ fn spawn_v5_cap(
         return None;
     };
     // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call.
-    match unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) } {
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
+    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+    match reply {
         Ok(Some(ref r)) => {
             let payload = r.as_slice();
             match SpawnV5CapResult::decode(payload) {

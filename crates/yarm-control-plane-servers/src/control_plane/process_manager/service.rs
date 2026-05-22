@@ -1774,6 +1774,12 @@ pub fn run() {
                 if let Ok(reply) = service.handle(msg) {
                     if let Some(cap) = reply_cap {
                         // SAFETY: kernel validates reply capability rights/object.
+                        yarm_user_rt::user_log!(
+                            "PM_IPC_REPLY_SEND cap={} opcode={} len={}",
+                            cap,
+                            reply.opcode,
+                            reply.len
+                        );
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
                     }
                 } else {
@@ -1788,6 +1794,12 @@ pub fn run() {
                             Message::with_header(0, msg.opcode, 0, None, &err_payload)
                         {
                             // SAFETY: kernel validates reply capability rights/object.
+                            yarm_user_rt::user_log!(
+                                "PM_IPC_REPLY_SEND cap={} opcode={} len={}",
+                                cap,
+                                err_reply.opcode,
+                                err_reply.len
+                            );
                             let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &err_reply) };
                         }
                     }

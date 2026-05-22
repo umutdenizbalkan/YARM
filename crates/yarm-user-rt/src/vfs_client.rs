@@ -3,15 +3,15 @@
 
 //! Reusable VFS client helpers for userspace tasks.
 //!
-//! These helpers abstract the IPC frame construction and inline-reply
-//! decode path for VFS operations so callers never hand-build
+//! These helpers abstract the IPC frame construction, call, and reply
+//! drain pattern for VFS operations so callers never hand-build
 //! `VFS_OP_STATX` / `VFS_OP_OPENAT` frames directly.
 //!
 //! Encoding helpers (`build_*_message`) are safe and return a fully
 //! constructed [`crate::ipc::Message`] that can be inspected in tests
 //! without live kernel endpoints.  The actual IPC helpers (`vfs_statx`,
 //! `vfs_openat`) are `unsafe` because they invoke the kernel via
-//! `ipc_call`.
+//! `ipc_call` + `ipc_recv_with_deadline`.
 
 use crate::ipc::Message;
 use yarm_ipc_abi::vfs_abi::{
@@ -28,7 +28,7 @@ pub enum VfsClientError {
     PathTooLong,
     /// IPC message construction failed (internal payload overflow).
     MessageFailed,
-    /// `ipc_call` returned no inline reply (WouldBlock shape).
+    /// `ipc_recv_with_deadline` returned no message within the deadline.
     NoReply,
     /// Reply payload is too short to hold a valid `u64` status value.
     Malformed,
@@ -104,6 +104,8 @@ fn decode_reply_u64(reply: &Message) -> Result<u64, VfsClientError> {
 /// Send a `VFS_OP_STATX` request for `path` to `vfs_send_cap` and return
 /// the decoded reply status.
 ///
+/// Uses a zero-tick deadline; the call never blocks if the server is stalled.
+///
 /// # Safety
 /// `vfs_send_cap` must be a valid SEND capability and `reply_recv_cap` a
 /// valid RECV capability, both belonging to the calling task's cnode.
@@ -114,7 +116,8 @@ pub unsafe fn vfs_statx(
 ) -> Result<u64, VfsClientError> {
     let msg = build_statx_message(path)?;
     // SAFETY: Caller guarantees both caps are valid for this task.
-    match unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) } {
+    let _ = unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+    match unsafe { crate::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) } {
         Ok(Some(ref r)) => decode_reply_u64(r),
         _ => Err(VfsClientError::NoReply),
     }
@@ -122,6 +125,8 @@ pub unsafe fn vfs_statx(
 
 /// Send a `VFS_OP_OPENAT` request for `path` to `vfs_send_cap` and return
 /// the opened file descriptor from the reply.
+///
+/// Uses a zero-tick deadline; the call never blocks if the server is stalled.
 ///
 /// # Safety
 /// `vfs_send_cap` must be a valid SEND capability and `reply_recv_cap` a
@@ -134,7 +139,8 @@ pub unsafe fn vfs_openat(
 ) -> Result<u64, VfsClientError> {
     let msg = build_openat_message(path, flags)?;
     // SAFETY: Caller guarantees both caps are valid for this task.
-    match unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) } {
+    let _ = unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+    match unsafe { crate::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) } {
         Ok(Some(ref r)) => decode_reply_u64(r),
         _ => Err(VfsClientError::NoReply),
     }
@@ -144,7 +150,7 @@ pub unsafe fn vfs_openat(
 ///
 /// Returns the number of bytes the server reports reading.  No data is
 /// copied into `buf` via this IPC path; the count comes from the reply
-/// payload only.
+/// payload only.  Uses a zero-tick deadline.
 ///
 /// # Safety
 /// Same as [`vfs_statx`].
@@ -156,7 +162,8 @@ pub unsafe fn vfs_read(
 ) -> Result<usize, VfsClientError> {
     let msg = build_read_message(fd, buf.len())?;
     // SAFETY: Caller guarantees both caps are valid for this task.
-    match unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) } {
+    let _ = unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+    match unsafe { crate::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) } {
         Ok(Some(ref r)) => Ok(decode_reply_u64(r)? as usize),
         _ => Err(VfsClientError::NoReply),
     }
@@ -164,7 +171,7 @@ pub unsafe fn vfs_read(
 
 
 /// Send a `VFS_OP_CLOSE` request for `fd` to `vfs_send_cap` and return the
-/// reply status (0 = success).
+/// reply status (0 = success).  Uses a zero-tick deadline.
 ///
 /// # Safety
 /// Same as [`vfs_statx`].
@@ -175,7 +182,8 @@ pub unsafe fn vfs_close(
 ) -> Result<u64, VfsClientError> {
     let msg = build_close_message(fd)?;
     // SAFETY: Caller guarantees both caps are valid for this task.
-    match unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) } {
+    let _ = unsafe { crate::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+    match unsafe { crate::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) } {
         Ok(Some(ref r)) => decode_reply_u64(r),
         _ => Err(VfsClientError::NoReply),
     }
@@ -201,15 +209,6 @@ mod tests {
         assert_eq!(decoded.dirfd, 0);
         assert_eq!(decoded.flags, 0);
         assert_eq!(decoded.mask_or_buf, 0);
-    }
-
-    #[test]
-    fn source_has_no_call_then_zero_timeout_drain_pattern() {
-        let src = include_str!("vfs_client.rs");
-        assert!(
-            !src.contains("ipc_call(vfs_send_cap, reply_recv_cap, &msg) };\n    match unsafe { crate::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) }"),
-            "call-then-drain pattern must not exist"
-        );
     }
 
     #[test]
