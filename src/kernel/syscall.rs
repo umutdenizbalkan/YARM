@@ -50,7 +50,10 @@ pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;
 pub const SYSCALL_RET_STATUS: usize = 0;
 pub const SYSCALL_RET_AUX: usize = 1;
 pub const SYSCALL_RET_TRANSFER_CAP: usize = 2;
+pub const SYSCALL_RET_RECV_META_FLAGS: usize = 3;
 pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
+pub const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
+pub const SYSCALL_RECV_META_TRANSFERRED_CAP: usize = 1 << 1;
 pub const SYSCALL_VM_MAP_PROT_READ: usize = 0x1;
 pub const SYSCALL_VM_MAP_PROT_WRITE: usize = 0x2;
 pub const SYSCALL_VM_MAP_PROT_EXEC: usize = 0x4;
@@ -916,8 +919,16 @@ fn handle_ipc_recv_result_with_empty_error(
     received: Option<Message>,
     empty_error: SyscallError,
 ) -> Result<(), SyscallError> {
+    frame.set_arg(SYSCALL_RET_RECV_META_FLAGS, 0);
     match received {
         Some(msg) => {
+            let recv_meta_flags = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+                SYSCALL_RECV_META_REPLY_CAP
+            } else if (msg.flags & Message::FLAG_CAP_TRANSFER) != 0 {
+                SYSCALL_RECV_META_TRANSFERRED_CAP
+            } else {
+                0
+            };
             let sender = sender_tid_to_ret(msg.sender_tid.0)?;
             let receiver_tid = current_tid(kernel)?;
             let recv_local_transfer = materialize_received_transfer_cap(
@@ -927,6 +938,7 @@ fn handle_ipc_recv_result_with_empty_error(
                 receiver_tid,
             )?;
             encode_transfer_cap_ret(frame, recv_local_transfer)?;
+            frame.set_arg(SYSCALL_RET_RECV_META_FLAGS, recv_meta_flags);
 
             if current_task_has_user_asid(kernel)? {
                 if msg.opcode == OPCODE_SHARED_MEM {

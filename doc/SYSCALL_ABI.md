@@ -244,3 +244,5 @@
 - IPC receive metadata now distinguishes `reply_cap` (for `ipc_reply`) from `transferred_cap` (application-transferred object capability).
 
 - Current limitation: `ipc_call` carries a kernel reply capability; simultaneous application cap transfer in the same call message is not yet supported by syscall ABI v2.
+
+- Recv metadata flags (ret3): RECV_META_REPLY_CAP=1<<0, RECV_META_TRANSFERRED_CAP=1<<1; cap-kind decode must use flags, not opcode heuristics.

@@ -59,6 +59,8 @@ pub mod syscall {
     pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
+    const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
+    const SYSCALL_RECV_META_TRANSFERRED_CAP: usize = 1 << 1;
 
     #[used]
     #[unsafe(link_section = ".rodata")]
@@ -305,13 +307,25 @@ pub mod syscall {
         );
         let preview_len = core::cmp::min(data_len, 32);
         let _ = preview_len;
-        let (reply_cap, transferred_cap, flags) = if (opcode == OPCODE_INLINE) && returned_cap.is_some() {
-            (returned_cap, None, Message::FLAG_REPLY_CAP)
-        } else if returned_cap.is_some() {
-            (None, returned_cap, Message::FLAG_CAP_TRANSFER)
+        let recv_meta_flags = ret.ret3;
+        let reply_cap = if (recv_meta_flags & SYSCALL_RECV_META_REPLY_CAP) != 0 {
+            returned_cap
         } else {
-            (None, None, 0)
+            None
         };
+        let transferred_cap = if (recv_meta_flags & SYSCALL_RECV_META_TRANSFERRED_CAP) != 0 {
+            returned_cap
+        } else {
+            None
+        };
+        let flags = (if reply_cap.is_some() { Message::FLAG_REPLY_CAP } else { 0 })
+            | (if transferred_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 });
+        crate::user_log!(
+            "RECV_META reply_cap={:?} transferred_cap={:?} flags={}",
+            reply_cap,
+            transferred_cap,
+            flags
+        );
         let msg = Message::with_header(ret.ret0 as u64, opcode, flags, transferred_cap.map(|c| c as u64), msg_payload)
             .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some(ReceivedMessage { message: msg, reply_cap, transferred_cap, sender_tid: ret.ret0 as u64 }))
