@@ -150,6 +150,10 @@ pub fn run() {
                         match RegisterBackendArgs::decode(msg.as_slice()) {
                             Some(args) => {
                                 yarm_user_rt::user_log!("BLKCACHE_OP_REGISTER_BACKEND backend_id={}", args.backend_id);
+                                yarm_user_rt::user_log!(
+                                    "BLKCACHE_BACKEND_REGISTER_RECV transferred_cap={:?}",
+                                    msg.transferred_cap().map(|c| c.0)
+                                );
                                 let Some(tx_cap) = msg.transferred_cap().map(|c| c.0) else {
                                     yarm_user_rt::user_log!(
                                         "BLKCACHE_BACKEND_QUERY_STATE_ERR backend_id={} err=MissingTransferredCap",

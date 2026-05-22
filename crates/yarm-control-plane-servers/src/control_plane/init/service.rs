@@ -453,6 +453,10 @@ pub fn run() {
     );
 
     yarm_user_rt::user_log!("INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_BEGIN");
+    yarm_user_rt::user_log!(
+        "INIT_BLKCACHE_REGISTER_BACKEND_CAP_TRANSFER cap={}",
+        init_virtio_blk_send_cap
+    );
     let register_backend_req = RegisterBackendArgs {
         backend_id: 1,
         backend_send_cap: init_virtio_blk_send_cap,

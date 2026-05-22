@@ -372,6 +372,23 @@ pub mod syscall {
     }
 
     #[inline]
+    pub(crate) fn ipc_call_prepare(
+        msg: &Message,
+    ) -> ([u8; 2 + Message::MAX_PAYLOAD], usize, Option<u32>, u16) {
+        let payload_len = msg.len as usize;
+        let frame_len = 2 + payload_len;
+        let mut frame = [0u8; 2 + Message::MAX_PAYLOAD];
+        frame[0..2].copy_from_slice(&msg.opcode.to_le_bytes());
+        frame[2..frame_len].copy_from_slice(&msg.payload[..payload_len]);
+        (
+            frame,
+            frame_len,
+            msg.transferred_cap().map(|c| c.0 as u32),
+            msg.flags,
+        )
+    }
+
+    #[inline]
     pub unsafe fn ipc_call(
         ep_cap: u32,
         reply_recv_cap: u32,
@@ -380,11 +397,33 @@ pub mod syscall {
         // Prepend the 2-byte opcode (LE) before the payload bytes so the receiver
         // can reconstruct the application-level opcode. The kernel ABI only passes
         // raw bytes; msg.opcode is not carried in return registers.
-        let payload_len = msg.len as usize;
-        let frame_len = 2 + payload_len;
-        let mut frame = [0u8; 2 + Message::MAX_PAYLOAD];
-        frame[0..2].copy_from_slice(&msg.opcode.to_le_bytes());
-        frame[2..frame_len].copy_from_slice(&msg.payload[..payload_len]);
+        let (frame, frame_len, tx_cap, msg_flags) = ipc_call_prepare(msg);
+        if let Some(tx_cap) = tx_cap {
+            crate::user_log!(
+                "USER_RT_IPC_CALL_CAP_TRANSFER cap={} flags={}",
+                tx_cap,
+                msg_flags
+            );
+            let send_args = [
+                ep_cap as usize,
+                frame.as_ptr() as usize,
+                frame_len,
+                0,
+                0,
+                tx_cap as usize,
+            ];
+            // SAFETY: Uses architecture syscall ABI to enter kernel.
+            let send_ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_SEND_NR, send_args) };
+            #[cfg(target_arch = "x86_64")]
+            if send_ret.error != 0 {
+                return Err(decode_syscall_error(send_ret.error));
+            }
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            if send_ret.ret0 != 0 {
+                return Err(decode_syscall_error(send_ret.ret0));
+            }
+            return Ok(());
+        }
         let args = [
             ep_cap as usize,
             frame.as_ptr() as usize,
@@ -1143,7 +1182,9 @@ pub mod vfs_client;
 
 #[cfg(test)]
 mod tests {
+    use crate::ipc::Message;
     use crate::runtime::{install_startup_arg_slots, startup_context};
+    use crate::syscall::ipc_call_prepare;
 
     #[test]
     fn startup_process_manager_caps_require_both_slots() {
@@ -1190,5 +1231,33 @@ mod tests {
             0,
             original.pm_request_recv_cap.map(u64::from).unwrap_or(0),
         ]);
+    }
+
+    #[test]
+    fn ipc_call_prepare_prefixes_opcode_and_payload() {
+        let payload = [0xAA, 0xBB, 0xCC];
+        let msg = Message::with_header(0, 0x1234, 0, None, &payload).unwrap();
+        let (frame, frame_len, tx_cap, flags) = ipc_call_prepare(&msg);
+        assert_eq!(frame_len, 5);
+        assert_eq!(frame[0], 0x34);
+        assert_eq!(frame[1], 0x12);
+        assert_eq!(&frame[2..5], &payload);
+        assert_eq!(tx_cap, None);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn ipc_call_prepare_preserves_cap_transfer_fields() {
+        let msg = Message::with_header(
+            0,
+            7,
+            Message::FLAG_CAP_TRANSFER,
+            Some(65551),
+            &[1, 2],
+        )
+        .unwrap();
+        let (_frame, _len, tx_cap, flags) = ipc_call_prepare(&msg);
+        assert_eq!(tx_cap, Some(65551));
+        assert_ne!(flags & Message::FLAG_CAP_TRANSFER, 0);
     }
 }
