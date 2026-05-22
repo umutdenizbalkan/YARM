@@ -39,6 +39,7 @@ const BOOTSTRAP_IMAGE_ID_MAX: u64 = 3;
 | 6        | `sbin/vfs_server`       | `pm_vfs_spawn_inline`    |
 | 7        | `sbin/driver_manager`   | `pm_vfs_spawn_inline`    |
 | 8        | `sbin/blkcache_srv`     | `pm_vfs_spawn_inline`    |
+| 9        | `sbin/virtio_blk_srv`   | `pm_vfs_spawn_inline`    |
 | ≥ 8      | (future)                | `pm_vfs_spawn_inline`    |
 
 image_ids ≥ 4 use `SpawnFromInitramfsFile` (syscall nr=26) via

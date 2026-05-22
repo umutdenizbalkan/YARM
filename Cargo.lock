@@ -35,6 +35,7 @@ name = "yarm-driver-servers"
 version = "0.1.0"
 dependencies = [
  "yarm-fs-servers",
+ "yarm-ipc-abi",
  "yarm-server-runtime",
  "yarm-user-rt",
 ]

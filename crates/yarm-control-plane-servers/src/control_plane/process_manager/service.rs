@@ -1346,6 +1346,7 @@ unsafe fn pm_vfs_spawn_inline(
         6 => (b"sbin/vfs_server",     "/initramfs/sbin/vfs_server"),
         7 => (b"sbin/driver_manager", "/initramfs/sbin/driver_manager"),
         8 => (b"sbin/blkcache_srv",   "/initramfs/sbin/blkcache_srv"),
+        9 => (b"sbin/virtio_blk_srv", "/initramfs/sbin/virtio_blk_srv"),
         _ => {
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_IMAGE_UNKNOWN image_id={}",

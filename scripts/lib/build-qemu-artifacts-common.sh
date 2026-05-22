@@ -312,9 +312,34 @@ common_stage_blkcache_server_elf() {
   echo "[ok] staged blkcache server ELF as /sbin/blkcache_srv"
 }
 
+
+common_stage_virtio_blk_server_elf() {
+  if [[ ! -f "$VIRTIO_BLK_SERVER_ELF" ]]; then
+    echo "[warn] virtio blk server ELF missing: $VIRTIO_BLK_SERVER_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$VIRTIO_BLK_SERVER_ELF" "$ROOTFS_DIR/sbin/virtio_blk_srv"
+  chmod +x "$ROOTFS_DIR/sbin/virtio_blk_srv"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$VIRTIO_BLK_SERVER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] virtio blk server ELF has forbidden RWE PT_LOAD segment: $VIRTIO_BLK_SERVER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $VIRTIO_BLK_SERVER_ELF"
+  fi
+
+  echo "[ok] staged virtio blk server ELF as /sbin/virtio_blk_srv"
+}
+
 common_verify_initramfs_stage_paths() {
   local missing=0
-  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/process_manager" "sbin/supervisor"; do
+  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor"; do
     if [[ ! -f "$ROOTFS_DIR/$path" ]]; then
       echo "[error] expected initramfs path missing: $ROOTFS_DIR/$path"
       missing=1

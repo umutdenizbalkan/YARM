@@ -5,7 +5,8 @@ use crate::control_plane::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase,
 };
 use yarm_ipc_abi::blkcache_abi::{
-    BlkCacheResponse, GetStatsRequest, BLKCACHE_OP_GET_STATS, BLKCACHE_STATUS_ERR_UNSUPPORTED,
+    BlkCacheResponse, GetStatsRequest, RegisterBackendArgs, BLKCACHE_OP_GET_STATS,
+    BLKCACHE_OP_REGISTER_BACKEND, BLKCACHE_STATUS_ERR_UNSUPPORTED, BLKCACHE_STATUS_OK,
 };
 #[cfg(test)]
 use super::super::process_manager::service::ProcessService;
@@ -439,6 +440,63 @@ pub fn run() {
         "INIT_BLKCACHE_SPAWN_V5_CALL_RETURN ok=1 child_tid={}",
         blkcache_child_tid
     );
+
+    // --- Spawn virtio_blk_srv (image_id=9) ---
+    yarm_user_rt::user_log!("INIT_VIRTIO_BLK_SPAWN_V5_CALL_BEGIN");
+    let Some((virtio_blk_child_tid, init_virtio_blk_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 9, [0, 0, 0, 0], 1) else {
+        yarm_user_rt::user_log!("INIT_VIRTIO_BLK_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
+        return;
+    };
+    yarm_user_rt::user_log!(
+        "INIT_VIRTIO_BLK_SPAWN_V5_CALL_RETURN ok=1 child_tid={}",
+        virtio_blk_child_tid
+    );
+
+    yarm_user_rt::user_log!("INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_BEGIN");
+    let register_backend_req = RegisterBackendArgs {
+        backend_id: 1,
+        backend_send_cap: init_virtio_blk_send_cap,
+        block_size: 512,
+        flags: 0,
+        block_count: 1,
+    };
+    let register_backend_payload = register_backend_req.encode();
+    let Ok(register_backend_msg) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        BLKCACHE_OP_REGISTER_BACKEND,
+        0,
+        None,
+        &register_backend_payload,
+    ) else {
+        yarm_user_rt::user_log!("INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status=2 backend_id=1");
+        return;
+    };
+    let _ = unsafe {
+        yarm_user_rt::syscall::ipc_call(init_blkcache_send_cap as u32, pm_recv, &register_backend_msg)
+    };
+    let register_backend_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+    match register_backend_reply {
+        Ok(Some(reply_msg)) => match BlkCacheResponse::decode(reply_msg.as_slice()) {
+            Some(resp) if resp.status == BLKCACHE_STATUS_OK => {
+                yarm_user_rt::user_log!(
+                    "INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=1 status={} backend_id=1",
+                    resp.status
+                );
+            }
+            Some(resp) => {
+                yarm_user_rt::user_log!(
+                    "INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status={} backend_id=1",
+                    resp.status
+                );
+            }
+            None => yarm_user_rt::user_log!(
+                "INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status=2 backend_id=1"
+            ),
+        },
+        _ => yarm_user_rt::user_log!(
+            "INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status=2 backend_id=1"
+        ),
+    };
 
     let get_stats_req = GetStatsRequest {
         request_id: 1,
