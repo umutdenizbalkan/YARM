@@ -14,6 +14,7 @@ hosted-dev = []
 yarm-server-runtime = { path = "../yarm-server-runtime", default-features = false }
 yarm-user-rt = { path = "../yarm-user-rt" }
 yarm-fs-servers = { path = "../yarm-fs-servers", default-features = false }
+yarm-ipc-abi = { path = "../yarm-ipc-abi" }
 
 [lib]
 path = "src/lib.rs"

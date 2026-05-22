@@ -3,6 +3,7 @@
 
 #![no_std]
 
+pub mod blkcache_abi;
 pub mod devfs_abi;
 pub mod driver_abi;
 pub mod process_abi;
