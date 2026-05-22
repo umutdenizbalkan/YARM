@@ -5,4 +5,4 @@ pub mod device;
 pub mod service;
 
 pub use device::VirtioBlkDevice;
-pub use service::{run, VirtioBlkService};
+pub use service::run;

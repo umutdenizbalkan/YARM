@@ -1,121 +1,67 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use yarm_ipc_abi::block_backend_abi::*;
 use yarm_user_rt::ipc::Message;
-use yarm_fs_servers::common::vfs_ipc::{FilesystemService, VfsError};
 
-use super::device::{
-    VirtQueue, VirtioBlkDevice, VirtioBlkReqFrame, VirtioBlkRequest, VirtioBlkRespFrame,
-    VirtqChain, VIRTIO_BLK_OP_READ, VIRTIO_BLK_OP_WRITE,
-};
-
-#[derive(Debug)]
-pub struct VirtioBlkService {
-    dev: VirtioBlkDevice,
-    queue: VirtQueue,
+fn decode_request(msg: &Message) -> Result<BlkBackendRequest, i32> {
+    let req = BlkBackendRequest::decode(msg.as_slice()).ok_or(BLK_BACKEND_STATUS_EINVAL)?;
+    if !req.is_valid_for_opcode(msg.opcode) {
+        return Err(BLK_BACKEND_STATUS_EINVAL);
+    }
+    Ok(req)
 }
 
-impl Default for VirtioBlkService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl VirtioBlkService {
-    pub const fn new() -> Self {
-        Self {
-            dev: VirtioBlkDevice::new(4096, 512),
-            queue: VirtQueue::new(),
-        }
-    }
-
-    pub const fn stats(&self) -> (u64, u64) {
-        (self.dev.reads, self.dev.writes)
-    }
-
-    fn process_once(&mut self) -> Result<VirtioBlkRespFrame, VfsError> {
-        let chain = self.queue.pop_next_chain().ok_or(VfsError::Unsupported)?;
-        let req = chain.request;
-        let io = VirtioBlkRequest {
-            sector: req.sector,
-            len: req.len,
-        };
-        let result = match req.op {
-            VIRTIO_BLK_OP_READ => self.dev.read(io),
-            VIRTIO_BLK_OP_WRITE => self.dev.write(io),
-            _ => Err(()),
-        }
-        .map_err(|_| VfsError::BadFd)?;
-
-        let resp = VirtioBlkRespFrame {
-            status: 0,
-            _pad: [0; 3],
-            done_len: result,
-            tag: req.tag,
-        };
-        self.queue.push_used(resp);
-        self.queue.take_last_used().ok_or(VfsError::Unsupported)
-    }
-}
-
-impl FilesystemService for VirtioBlkService {
-    fn service_name(&self) -> &'static str {
-        "virtio_blk"
-    }
-
-    fn dispatch(&mut self, request: Message) -> Result<Message, VfsError> {
-        let req = VirtioBlkReqFrame::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
-        let chain = VirtqChain::from_request(req);
-        self.queue.push_chain(chain).map_err(|_| VfsError::NoFd)?;
-        let resp = self.process_once()?;
-        Message::with_header(0, request.opcode, 0, None, &resp.encode())
-            .map_err(|_| VfsError::Malformed)
+fn build_resp(req_id: u32, status: i32) -> BlkBackendResponse {
+    BlkBackendResponse {
+        req_id,
+        status,
+        actual_bytes: 0,
+        backend_generation: 0,
+        logical_block_size: 512,
+        physical_block_size: 512,
     }
 }
 
 pub fn run() {
-    let mut svc = VirtioBlkService::new();
-    let read = VirtioBlkReqFrame {
-        op: VIRTIO_BLK_OP_READ,
-        _reserved: 0,
-        sector: 1,
-        len: 512,
-        tag: 11,
+    let ctx = yarm_user_rt::runtime::startup_context();
+    let Some(recv_cap) = ctx.process_manager_service_recv_ep else {
+        return;
     };
-    let write = VirtioBlkReqFrame {
-        op: VIRTIO_BLK_OP_WRITE,
-        _reserved: 0,
-        sector: 1,
-        len: 512,
-        tag: 12,
-    };
-    let read_msg = Message::with_header(0, 1, 0, None, &read.encode()).expect("read");
-    let write_msg = Message::with_header(0, 2, 0, None, &write.encode()).expect("write");
-    let _ = svc.dispatch(read_msg).expect("read rep");
-    let _ = svc.dispatch(write_msg).expect("write rep");
-    let (reads, writes) = svc.stats();
-    yarm_user_rt::user_log!("virtio_blk.srv demo: reads={}, writes={}", reads, writes);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn service_roundtrips_frame_contract() {
-        let mut svc = VirtioBlkService::new();
-        let req = VirtioBlkReqFrame {
-            op: VIRTIO_BLK_OP_READ,
-            _reserved: 0,
-            sector: 2,
-            len: 128,
-            tag: 77,
-        };
-        let msg = Message::with_header(0, 1, 0, None, &req.encode()).expect("msg");
-        let rep = svc.dispatch(msg).expect("dispatch");
-        let resp = VirtioBlkRespFrame::decode(rep.as_slice()).expect("decode");
-        assert_eq!(resp.status, 0);
-        assert_eq!(resp.done_len, 128);
-        assert_eq!(resp.tag, 77);
+    loop {
+        match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
+            Ok(Some((msg, Some(reply_cap)))) => {
+                let (req_id, status) = match msg.opcode {
+                    BLK_BACKEND_OP_QUERY_STATE => {
+                        yarm_user_rt::user_log!("VIRTIO_BLK_OP_QUERY_STATE");
+                        match decode_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_EAGAIN), Err(e) => (0, e) }
+                    }
+                    BLK_BACKEND_OP_READ => {
+                        yarm_user_rt::user_log!("VIRTIO_BLK_OP_READ");
+                        match decode_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_ENOSYS), Err(e) => (0, e) }
+                    }
+                    BLK_BACKEND_OP_WRITE => {
+                        yarm_user_rt::user_log!("VIRTIO_BLK_OP_WRITE");
+                        match decode_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_ENOSYS), Err(e) => (0, e) }
+                    }
+                    BLK_BACKEND_OP_FLUSH => {
+                        yarm_user_rt::user_log!("VIRTIO_BLK_OP_FLUSH");
+                        match decode_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_ENOSYS), Err(e) => (0, e) }
+                    }
+                    BLK_BACKEND_OP_GET_GEOM => {
+                        yarm_user_rt::user_log!("VIRTIO_BLK_OP_GET_GEOM");
+                        match decode_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_EAGAIN), Err(e) => (0, e) }
+                    }
+                    _ => (0, BLK_BACKEND_STATUS_EINVAL),
+                };
+                let resp = build_resp(req_id, status);
+                if let Ok(reply) = Message::with_header(0, msg.opcode, 0, None, &resp.encode()) {
+                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
+                }
+            }
+            Ok(Some((_msg, None))) => {}
+            Ok(None) => {}
+            Err(_) => { let _ = yarm_user_rt::syscall::yield_now(); }
+        }
     }
 }
