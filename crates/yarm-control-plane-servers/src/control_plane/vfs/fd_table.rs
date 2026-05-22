@@ -9,9 +9,8 @@ pub const MAX_FD_ENTRIES: usize = 32;
 #[derive(Clone, Copy)]
 struct FdEntry {
     fd: u64,
-    /// Identity of the owning client (source TID encoded as the reply-cap
-    /// number minted by the kernel for the OPENAT call).  Only the client
-    /// whose `client_id` matches may look up or close this entry.
+    /// Identity of the owning client (stable caller task/thread identity).
+    /// Only the client whose `client_id` matches may look up or close this entry.
     client_id: u64,
     backend_cap: u32,
     label: MountLabel,
@@ -21,10 +20,7 @@ struct FdEntry {
 ///
 /// Each entry is scoped to a `(fd, client_id)` pair so that two different
 /// clients can hold the same numeric fd without interfering with each other.
-/// `client_id` is the reply-cap value the kernel delivered alongside the
-/// OPENAT request; in this microkernel's IPC model that number encodes the
-/// calling thread's identity and remains stable across calls from the same
-/// thread.
+/// `client_id` is a stable per-caller identity (currently caller sender tid).
 ///
 /// When vfs_server forwards a `VFS_OP_OPENAT` to a backend and receives
 /// the reply fd, it inserts `(fd, client_id, backend_cap, label)` here.
@@ -295,5 +291,21 @@ mod tests {
         t.remove(0, CLIENT_A);
         assert_eq!(t.len(), MAX_FD_ENTRIES - 1);
         assert!(t.insert(999, 3, "new", CLIENT_A));
+    }
+
+    #[test]
+    fn stable_client_identity_works_across_transient_reply_caps() {
+        let mut t = VfsFdTable::new();
+        let stable_client_id = 42u64;
+        let open_reply_cap = 1001u64;
+        let read_reply_cap = 1002u64;
+        let close_reply_cap = 1003u64;
+        assert_ne!(open_reply_cap, read_reply_cap);
+        assert_ne!(read_reply_cap, close_reply_cap);
+
+        assert!(t.insert(11, 77, "initramfs", stable_client_id));
+        assert!(t.lookup(11, stable_client_id).is_some());
+        t.remove(11, stable_client_id);
+        assert!(t.lookup(11, stable_client_id).is_none());
     }
 }

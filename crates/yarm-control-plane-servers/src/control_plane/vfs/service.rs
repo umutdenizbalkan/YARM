@@ -367,6 +367,7 @@ pub fn run() {
             "VFS_RECV_GOT_MSG opcode={} reply_cap={}",
             msg.opcode, client_reply_cap
         );
+        let client_id = msg.sender_tid.0;
 
         // ── VFS_OP_MOUNT_REGISTER — handled locally, never forwarded ────────
         if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_MOUNT_REGISTER {
@@ -474,8 +475,7 @@ pub fn run() {
                 VFS_OP_READ | VFS_OP_CLOSE => {
                     match ReadWriteArgs::decode(msg.as_slice()) {
                         Ok(args) => {
-                            if let Some((send_cap, label)) =
-                                fd_table.lookup(args.fd, client_reply_cap as u64)
+                            if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_id)
                             {
                                 yarm_user_rt::user_log!(
                                     "VFS_ROUTE_FD_LOOKUP fd={} target={}",
@@ -533,7 +533,7 @@ pub fn run() {
                         b.copy_from_slice(&payload[..8]);
                         let fd = u64::from_le_bytes(b);
                         // target_label is owned (Copy), no borrow conflict.
-                        if fd_table.insert(fd, backend_send_cap, target_label.as_str(), client_reply_cap as u64) {
+                        if fd_table.insert(fd, backend_send_cap, target_label.as_str(), client_id) {
                             yarm_user_rt::user_log!(
                                 "VFS_FD_TRACK fd={} backend={}",
                                 fd, backend_send_cap
@@ -561,7 +561,7 @@ pub fn run() {
                         closed_fd, target_label.as_str(), status
                     );
                     if status == 0 {
-                        fd_table.remove(closed_fd, client_reply_cap as u64);
+                        fd_table.remove(closed_fd, client_id);
                     }
                 }
                 yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=0");
