@@ -225,11 +225,30 @@ pub mod syscall {
     }
 
     #[inline]
+    pub(crate) fn decode_recv_payload<'a>(
+        opcode: u16,
+        payload: &'a [u8],
+        len: usize,
+    ) -> core::result::Result<&'a [u8], SyscallError> {
+        if len > payload.len() {
+            return Err(SyscallError::Internal);
+        }
+        // Legacy framed path: payload starts with opcode prefix added by ipc_call.
+        if len >= 2 {
+            let framed_opcode = u16::from_le_bytes([payload[0], payload[1]]);
+            if framed_opcode == opcode {
+                return Ok(&payload[2..len]);
+            }
+        }
+        // Metadata-opcode path: payload is raw bytes without opcode prefix.
+        Ok(&payload[..len])
+    }
+
+    #[inline]
     pub unsafe fn ipc_recv_v2(
         ep_cap: u32,
     ) -> core::result::Result<Option<(Message, Option<u32>)>, SyscallError> {
-        // Buffer is 2 bytes larger than MAX_PAYLOAD to accommodate the opcode prefix
-        // that ipc_call prepends. The kernel receives [opcode_lo, opcode_hi, ...data].
+        // Buffer is 2 bytes larger to tolerate legacy opcode-prefixed frames.
         const FRAMED_MAX: usize = 2 + Message::MAX_PAYLOAD;
         let mut payload = [0u8; FRAMED_MAX];
         let args = [
@@ -274,13 +293,12 @@ pub mod syscall {
             }
         }
         let len = ret.ret1;
-        // Must have at least the 2-byte opcode prefix.
-        if len < 2 || len > FRAMED_MAX {
+        if len > FRAMED_MAX {
             return Err(SyscallError::Internal);
         }
-        // Extract application-level opcode from the first 2 bytes of the frame.
-        let opcode = u16::from_le_bytes([payload[0], payload[1]]);
-        let data_len = len - 2;
+        let opcode = ret.ret0 as u16;
+        let msg_payload = decode_recv_payload(opcode, &payload, len)?;
+        let data_len = msg_payload.len();
         let reply_cap = if ret.ret2 == SYSCALL_NO_TRANSFER_CAP as usize {
             None
         } else {
@@ -301,9 +319,15 @@ pub mod syscall {
             if reply_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 },
             reply_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP),
             data_len,
-            &payload[2..(2 + preview_len)]
+            &msg_payload[..preview_len]
         );
-        let msg = Message::with_header(ret.ret0 as u64, opcode, 0, None, &payload[2..len])
+        let flags = if reply_cap.is_some() {
+            Message::FLAG_CAP_TRANSFER
+        } else {
+            0
+        };
+        let transfer_cap = reply_cap.map(|c| c as u64);
+        let msg = Message::with_header(ret.ret0 as u64, opcode, flags, transfer_cap, msg_payload)
             .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some((msg, reply_cap)))
     }
@@ -1167,7 +1191,7 @@ pub mod vfs_client;
 mod tests {
     use crate::ipc::Message;
     use crate::runtime::{install_startup_arg_slots, startup_context};
-    use crate::syscall::ipc_call_prepare;
+    use crate::syscall::{decode_recv_payload, ipc_call_prepare};
 
     #[test]
     fn startup_process_manager_caps_require_both_slots() {
@@ -1242,5 +1266,19 @@ mod tests {
         let (_frame, _len, tx_cap, flags) = ipc_call_prepare(&msg);
         assert_eq!(tx_cap, Some(65551));
         assert_ne!(flags & Message::FLAG_CAP_TRANSFER, 0);
+    }
+
+    #[test]
+    fn decode_recv_payload_accepts_metadata_opcode_raw_payload() {
+        let payload = [0xAAu8, 0x55, 0, 0, 0, 0, 0, 0];
+        let decoded = decode_recv_payload(1, &payload, payload.len()).unwrap();
+        assert_eq!(decoded, &payload);
+    }
+
+    #[test]
+    fn decode_recv_payload_strips_legacy_prefixed_opcode_once() {
+        let payload = [0x01u8, 0x00, 0xAA, 0xBB, 0xCC];
+        let decoded = decode_recv_payload(1, &payload, payload.len()).unwrap();
+        assert_eq!(decoded, &[0xAA, 0xBB, 0xCC]);
     }
 }
