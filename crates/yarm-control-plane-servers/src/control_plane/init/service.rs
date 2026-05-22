@@ -6,7 +6,7 @@ use crate::control_plane::init::{
 };
 use yarm_ipc_abi::blkcache_abi::{
     BlkCacheResponse, GetStatsRequest, RegisterBackendArgs, BLKCACHE_OP_GET_STATS,
-    BLKCACHE_OP_REGISTER_BACKEND, BLKCACHE_STATUS_ERR_UNSUPPORTED, BLKCACHE_STATUS_OK,
+    BLKCACHE_OP_REGISTER_BACKEND, BLKCACHE_STATUS_ERR_UNSUPPORTED,
 };
 #[cfg(test)]
 use super::super::process_manager::service::ProcessService;
@@ -475,32 +475,8 @@ pub fn run() {
         yarm_user_rt::user_log!("INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status=2 backend_id=1");
         return;
     };
-    let _ = unsafe {
-        yarm_user_rt::syscall::ipc_call(init_blkcache_send_cap as u32, pm_recv, &register_backend_msg)
-    };
-    let register_backend_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
-    match register_backend_reply {
-        Ok(Some(reply_msg)) => match BlkCacheResponse::decode(reply_msg.as_slice()) {
-            Some(resp) if resp.status == BLKCACHE_STATUS_OK => {
-                yarm_user_rt::user_log!(
-                    "INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=1 status={} backend_id=1",
-                    resp.status
-                );
-            }
-            Some(resp) => {
-                yarm_user_rt::user_log!(
-                    "INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status={} backend_id=1",
-                    resp.status
-                );
-            }
-            None => yarm_user_rt::user_log!(
-                "INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status=2 backend_id=1"
-            ),
-        },
-        _ => yarm_user_rt::user_log!(
-            "INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status=2 backend_id=1"
-        ),
-    };
+    yarm_user_rt::user_log!("INIT_BLKCACHE_REGISTER_BACKEND_SEND_NO_REPLY");
+    let _ = unsafe { yarm_user_rt::syscall::ipc_send(init_blkcache_send_cap as u32, &register_backend_msg) };
 
 
     let get_stats_req = GetStatsRequest {

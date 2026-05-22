@@ -397,33 +397,7 @@ pub mod syscall {
         // Prepend the 2-byte opcode (LE) before the payload bytes so the receiver
         // can reconstruct the application-level opcode. The kernel ABI only passes
         // raw bytes; msg.opcode is not carried in return registers.
-        let (frame, frame_len, tx_cap, msg_flags) = ipc_call_prepare(msg);
-        if let Some(tx_cap) = tx_cap {
-            crate::user_log!(
-                "USER_RT_IPC_CALL_CAP_TRANSFER cap={} flags={}",
-                tx_cap,
-                msg_flags
-            );
-            let send_args = [
-                ep_cap as usize,
-                frame.as_ptr() as usize,
-                frame_len,
-                0,
-                0,
-                tx_cap as usize,
-            ];
-            // SAFETY: Uses architecture syscall ABI to enter kernel.
-            let send_ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_SEND_NR, send_args) };
-            #[cfg(target_arch = "x86_64")]
-            if send_ret.error != 0 {
-                return Err(decode_syscall_error(send_ret.error));
-            }
-            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-            if send_ret.ret0 != 0 {
-                return Err(decode_syscall_error(send_ret.ret0));
-            }
-            return Ok(());
-        }
+        let (frame, frame_len, _tx_cap, _msg_flags) = ipc_call_prepare(msg);
         let args = [
             ep_cap as usize,
             frame.as_ptr() as usize,

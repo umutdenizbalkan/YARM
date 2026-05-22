@@ -144,7 +144,7 @@ pub fn run() {
 
     loop {
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
-            Ok(Some((msg, Some(reply_cap)))) => {
+            Ok(Some((msg, reply_cap))) => {
                 let (request_id, status) = match msg.opcode {
                     BLKCACHE_OP_REGISTER_BACKEND => {
                         match RegisterBackendArgs::decode(msg.as_slice()) {
@@ -160,7 +160,9 @@ pub fn run() {
                                         args.backend_id
                                     );
                                     let status = BLKCACHE_STATUS_ERR_PERMISSION;
-                                    return_reply(reply_cap, msg.opcode, 0, status);
+                                    if let Some(reply_cap) = reply_cap {
+                                        return_reply(reply_cap, msg.opcode, 0, status);
+                                    }
                                     continue;
                                 };
                                 {
@@ -186,10 +188,20 @@ pub fn run() {
                                             );
                                         }
                                     }
-                                    (0, status)
+                                    if reply_cap.is_some() {
+                                        (0, status)
+                                    } else {
+                                        continue;
+                                    }
                                 }
                             }
-                            None => (0, BLKCACHE_STATUS_ERR_BAD_REQUEST),
+                            None => {
+                                if reply_cap.is_some() {
+                                    (0, BLKCACHE_STATUS_ERR_BAD_REQUEST)
+                                } else {
+                                    continue;
+                                }
+                            }
                         }
                     }
                     BLKCACHE_OP_REGISTER_BUFFER => { yarm_user_rt::user_log!("BLKCACHE_OP_REGISTER_BUFFER"); RegisterBufferArgs::decode(msg.as_slice()).map(|a|(a.buffer_id,BLKCACHE_STATUS_ERR_UNSUPPORTED)).unwrap_or((0,BLKCACHE_STATUS_ERR_BAD_REQUEST)) }
@@ -202,9 +214,10 @@ pub fn run() {
                     BLKCACHE_OP_CANCEL => { yarm_user_rt::user_log!("BLKCACHE_OP_CANCEL"); CancelRequest::decode(msg.as_slice()).map(|a|(a.request_id,BLKCACHE_STATUS_ERR_UNSUPPORTED)).unwrap_or((0,BLKCACHE_STATUS_ERR_BAD_REQUEST)) }
                     _ => (0, BLKCACHE_STATUS_ERR_BAD_REQUEST),
                 };
-                return_reply(reply_cap, msg.opcode, request_id, status);
+                if let Some(reply_cap) = reply_cap {
+                    return_reply(reply_cap, msg.opcode, request_id, status);
+                }
             }
-            Ok(Some((_msg, None))) => {}
             Ok(None) => {}
             Err(_e) => { let _ = yarm_user_rt::syscall::yield_now(); }
         }
