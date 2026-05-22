@@ -304,14 +304,7 @@ pub mod syscall {
             returned_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP)
         );
         let preview_len = core::cmp::min(data_len, 32);
-        crate::user_log!(
-            "USER_RT_RECV_DECODE_META opcode={} flags={} transferred_cap={} payload_len={} payload_prefix={:02x?}",
-            opcode,
-            if returned_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 },
-            returned_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP),
-            data_len,
-            &msg_payload[..preview_len]
-        );
+        let _ = preview_len;
         let (reply_cap, transferred_cap, flags) = if (opcode == OPCODE_INLINE) && returned_cap.is_some() {
             (returned_cap, None, Message::FLAG_REPLY_CAP)
         } else if returned_cap.is_some() {
