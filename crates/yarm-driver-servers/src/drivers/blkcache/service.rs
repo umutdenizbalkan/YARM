@@ -145,24 +145,29 @@ pub fn run() {
     loop {
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
             Ok(Some((msg, reply_cap))) => {
+                yarm_user_rt::user_log!(
+                    "BLKCACHE_RECV_CAPS reply_cap={:?} transferred_cap={:?}",
+                    reply_cap,
+                    msg.transferred_cap().map(|c| c.0)
+                );
                 let (request_id, status) = match msg.opcode {
                     BLKCACHE_OP_REGISTER_BACKEND => {
                         match RegisterBackendArgs::decode(msg.as_slice()) {
                             Some(args) => {
                                 yarm_user_rt::user_log!("BLKCACHE_OP_REGISTER_BACKEND backend_id={}", args.backend_id);
+                                let tx_cap = msg
+                                    .transferred_cap()
+                                    .map(|c| c.0)
+                                    .or(reply_cap.map(|c| c as u64));
                                 yarm_user_rt::user_log!(
                                     "BLKCACHE_BACKEND_REGISTER_RECV transferred_cap={:?}",
-                                    msg.transferred_cap().map(|c| c.0)
+                                    tx_cap
                                 );
-                                let Some(tx_cap) = msg.transferred_cap().map(|c| c.0) else {
+                                let Some(tx_cap) = tx_cap else {
                                     yarm_user_rt::user_log!(
                                         "BLKCACHE_BACKEND_QUERY_STATE_ERR backend_id={} err=MissingTransferredCap",
                                         args.backend_id
                                     );
-                                    let status = BLKCACHE_STATUS_ERR_PERMISSION;
-                                    if let Some(reply_cap) = reply_cap {
-                                        return_reply(reply_cap, msg.opcode, 0, status);
-                                    }
                                     continue;
                                 };
                                 {
@@ -188,19 +193,17 @@ pub fn run() {
                                             );
                                         }
                                     }
-                                    if reply_cap.is_some() {
-                                        (0, status)
-                                    } else {
-                                        continue;
-                                    }
+                                    yarm_user_rt::user_log!(
+                                        "BLKCACHE_REGISTER_NO_REPLY_PATH backend_id={} status={}",
+                                        args.backend_id,
+                                        status
+                                    );
+                                    continue;
                                 }
                             }
                             None => {
-                                if reply_cap.is_some() {
-                                    (0, BLKCACHE_STATUS_ERR_BAD_REQUEST)
-                                } else {
-                                    continue;
-                                }
+                                yarm_user_rt::user_log!("BLKCACHE_REGISTER_NO_REPLY_PATH backend_id=0 status={}", BLKCACHE_STATUS_ERR_BAD_REQUEST);
+                                continue;
                             }
                         }
                     }
