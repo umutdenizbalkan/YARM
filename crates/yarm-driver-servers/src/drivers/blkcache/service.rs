@@ -114,6 +114,9 @@ pub fn run() {
     yarm_user_rt::user_log!("BLKCACHE_SRV_ENTRY");
     let ctx = yarm_user_rt::runtime::startup_context();
     let pm_reply_recv_cap = ctx.process_manager_reply_recv_cap;
+    if let Some(cap) = pm_reply_recv_cap {
+        yarm_user_rt::user_log!("BLKCACHE_BACKEND_REPLY_RECV_CAP cap={}", cap);
+    }
     let Some(recv_cap) = ctx.process_manager_service_recv_ep else {
         yarm_user_rt::user_log!("BLKCACHE_NO_RECV_CAP");
         loop { let _ = yarm_user_rt::syscall::yield_now(); }

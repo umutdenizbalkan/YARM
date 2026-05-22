@@ -45,6 +45,9 @@ pub struct UserImageSpec {
     pub spawner_tid: u64,
     /// Recv cap ID in the spawner's cnode to delegate into startup slot 12.
     pub service_recv_cap: u64,
+    /// Recv cap ID in the spawner's cnode to delegate into startup slot 2
+    /// (service-local reply recv endpoint for outbound ipc_call replies).
+    pub service_reply_recv_cap: u64,
     /// Up to 4 send cap IDs in the spawner's cnode to delegate into slots 13-16.
     pub extra_send_caps: [u64; 4],
 }
@@ -63,6 +66,7 @@ impl Default for UserImageSpec {
             startup_args: Self::DEFAULT_STARTUP_ARGS,
             spawner_tid: 0,
             service_recv_cap: 0,
+            service_reply_recv_cap: 0,
             extra_send_caps: [0; 4],
         }
     }

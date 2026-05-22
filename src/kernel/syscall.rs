@@ -1282,6 +1282,13 @@ fn handle_spawn_process(
             (0u64, 0u64)
         }
     };
+    let service_reply_recv_cap = match kernel.create_endpoint(8) {
+        Ok((_, _, recv_cap)) => recv_cap.0,
+        Err(e) => {
+            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
+            0u64
+        }
+    };
     // If the caller supplied a parent_pid, grant a SEND copy of the new endpoint
     // into the parent's cnode and return that local cap so the parent can use it
     // directly without going through the spawner.
@@ -1330,6 +1337,7 @@ fn handle_spawn_process(
             startup_args,
             spawner_tid,
             service_recv_cap,
+            service_reply_recv_cap,
             extra_send_caps,
         })
         .map_err(|err| {
@@ -1434,6 +1442,13 @@ fn handle_spawn_process_from_user_buf(
             (0u64, 0u64)
         }
     };
+    let service_reply_recv_cap = match kernel.create_endpoint(8) {
+        Ok((_, _, recv_cap)) => recv_cap.0,
+        Err(e) => {
+            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
+            0u64
+        }
+    };
     let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
         match kernel.grant_capability_task_to_task_with_rights(
             spawner_tid,
@@ -1478,6 +1493,7 @@ fn handle_spawn_process_from_user_buf(
             startup_args,
             spawner_tid,
             service_recv_cap,
+            service_reply_recv_cap,
             extra_send_caps,
         })
         .map_err(|err| {
@@ -1590,6 +1606,13 @@ fn handle_spawn_from_initramfs_file(
             (0u64, 0u64)
         }
     };
+    let service_reply_recv_cap = match kernel.create_endpoint(8) {
+        Ok((_, _, recv_cap)) => recv_cap.0,
+        Err(e) => {
+            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
+            0u64
+        }
+    };
     let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
         match kernel.grant_capability_task_to_task_with_rights(
             spawner_tid,
@@ -1613,6 +1636,7 @@ fn handle_spawn_from_initramfs_file(
             startup_args,
             spawner_tid,
             service_recv_cap,
+            service_reply_recv_cap,
             extra_send_caps,
         })
         .map_err(SyscallError::from)?;

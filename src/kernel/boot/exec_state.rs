@@ -572,6 +572,30 @@ impl KernelState {
                 }
             }
         }
+        if spec.spawner_tid != 0 && spec.service_reply_recv_cap != 0 {
+            match self.grant_capability_task_to_task_with_rights(
+                spec.spawner_tid,
+                CapId(spec.service_reply_recv_cap),
+                spec.tid,
+                CapRights::RECEIVE,
+            ) {
+                Ok(local_cap) => {
+                    spec.startup_args[2] = local_cap.0;
+                    crate::yarm_log!(
+                        "KSPAWN_REPLY_RECV_CAP_DELEGATED tid={} local_cap={}",
+                        spec.tid,
+                        local_cap.0
+                    );
+                }
+                Err(e) => {
+                    crate::yarm_log!(
+                        "KSPAWN_REPLY_RECV_CAP_DELEGATE_FAIL tid={} err={:?}",
+                        spec.tid,
+                        e
+                    );
+                }
+            }
+        }
         for (i, &raw_cap) in spec.extra_send_caps.iter().enumerate() {
             if raw_cap != 0 && spec.spawner_tid != 0 {
                 match self.grant_capability_task_to_task_with_rights(
