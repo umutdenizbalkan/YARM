@@ -4,6 +4,9 @@
 use crate::control_plane::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase,
 };
+use yarm_ipc_abi::blkcache_abi::{
+    BlkCacheResponse, GetStatsRequest, BLKCACHE_OP_GET_STATS, BLKCACHE_STATUS_ERR_UNSUPPORTED,
+};
 #[cfg(test)]
 use super::super::process_manager::service::ProcessService;
 #[cfg(test)]
@@ -425,7 +428,7 @@ pub fn run() {
 
     // --- Spawn blkcache_srv (image_id=8) ---
     yarm_user_rt::user_log!("INIT_BLKCACHE_SPAWN_V5_CALL_BEGIN");
-    let Some((blkcache_child_tid, _blkcache_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 8, [0, 0, 0, 0], 0) else {
+    let Some((blkcache_child_tid, blkcache_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 8, [0, 0, 0, 0], 0) else {
         yarm_user_rt::user_log!("INIT_BLKCACHE_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
     };
@@ -433,6 +436,64 @@ pub fn run() {
         "INIT_BLKCACHE_SPAWN_V5_CALL_RETURN ok=1 child_tid={}",
         blkcache_child_tid
     );
+
+    let get_stats_req = GetStatsRequest {
+        request_id: 1,
+        backend_id: 0,
+        flags: 0,
+    };
+    let get_stats_payload = get_stats_req.encode();
+    let Ok(get_stats_msg) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        BLKCACHE_OP_GET_STATS,
+        0,
+        None,
+        &get_stats_payload,
+    ) else {
+        yarm_user_rt::user_log!("INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 msg=build_failed");
+        return;
+    };
+    // SAFETY: blkcache_send_cap and pm_recv are startup-provided caps for synchronous IPC.
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(blkcache_send_cap as u32, pm_recv, &get_stats_msg) };
+    // SAFETY: pm_recv is init's startup-provided reply endpoint.
+    let get_stats_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+    match get_stats_reply {
+        Ok(Some(reply_msg)) => match BlkCacheResponse::decode(reply_msg.as_slice()) {
+            Some(resp)
+                if resp.request_id == 1
+                    && resp.status == BLKCACHE_STATUS_ERR_UNSUPPORTED
+                    && resp.bytes_moved == 0
+                    && resp.flags == 0 =>
+            {
+                yarm_user_rt::user_log!(
+                    "INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=1 status={} request_id={} bytes_moved={}",
+                    resp.status,
+                    resp.request_id,
+                    resp.bytes_moved
+                );
+            }
+            Some(resp) => {
+                yarm_user_rt::user_log!(
+                    "INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 status={} request_id={} bytes_moved={}",
+                    resp.status,
+                    resp.request_id,
+                    resp.bytes_moved
+                );
+            }
+            None => {
+                yarm_user_rt::user_log!("INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 decode=0");
+            }
+        },
+        Ok(None) => {
+            yarm_user_rt::user_log!("INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 recv=none");
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!(
+                "INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 recv_err={:?}",
+                e
+            );
+        }
+    }
 
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;
