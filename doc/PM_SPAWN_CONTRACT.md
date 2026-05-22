@@ -77,6 +77,12 @@ Slot 12 carries the service's own receive endpoint capability. This is the cap
 the service blocks on in its resident IPC loop. It is distinct from the PM's own
 recv cap (slot 2 of the PM's own startup context).
 
+`init_server` is intentionally different from long-lived request services:
+it is currently a one-shot boot orchestrator. After spawning core services and
+running VFS smokes, it idles on `init_alert_recv_ep` (slot 7) when present; if
+that alert recv cap is absent, an explicit `INIT_NO_RECV_CAP_EXPECTED_ONE_SHOT_IDLE`
+log marker is expected and is not treated as a service failure.
+
 Slots 13–16 carry optional extra capabilities passed by the spawn initiator via
 `SpawnV5CapArgs.service_caps[0..4]`. For image_id=6 (vfs_server), the init
 server places the initramfs send cap in slot 13 and the devfs send cap in slot

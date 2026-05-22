@@ -33,7 +33,7 @@ pub extern "C" fn yarm_user_entry() -> ! {
             let _ = unsafe { yarm::user_rt::syscall::ipc_recv_v2(recv_cap) };
         }
     }
-    yarm_user_rt::user_log!("INIT_NO_RECV_CAP");
+    yarm_user_rt::user_log!("INIT_NO_RECV_CAP_EXPECTED_ONE_SHOT_IDLE");
     loop {
         let _ = yarm::user_rt::syscall::yield_now();
     }
