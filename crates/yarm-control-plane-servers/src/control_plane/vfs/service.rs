@@ -350,6 +350,7 @@ pub fn run() {
         }
     };
     yarm_user_rt::user_log!("VFS_SRV_RECV_CAP cap={}", recv_cap);
+    yarm_user_rt::user_log!("VFS_SRV_BLOCKING_RECV_LOOP");
 
     loop {
         // Receive client request; ipc_recv_v2 strips the 2-byte opcode prefix from

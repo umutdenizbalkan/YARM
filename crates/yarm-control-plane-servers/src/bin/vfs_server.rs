@@ -26,7 +26,14 @@ pub extern "C" fn yarm_user_entry() -> ! {
     yarm_user_rt::user_log!("VFS_BIN_ENTRY_START");
     yarm_user_rt::user_log!("VFS_BIN_BEFORE_RUN");
     run();
-    yarm_user_rt::user_log!("VFS_BIN_AFTER_RUN");
+    let ctx = yarm_user_rt::runtime::startup_context();
+    if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
+        yarm_user_rt::user_log!("VFS_BLOCKING_RECV_LOOP cap={}", recv_cap);
+        loop {
+            let _ = unsafe { yarm::user_rt::syscall::ipc_recv_v2(recv_cap) };
+        }
+    }
+    yarm_user_rt::user_log!("VFS_NO_RECV_CAP_RESIDENT_YIELD");
     loop {
         let _ = yarm::user_rt::syscall::yield_now();
     }

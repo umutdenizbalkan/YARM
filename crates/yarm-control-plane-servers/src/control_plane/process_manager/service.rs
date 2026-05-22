@@ -1717,11 +1717,13 @@ pub fn run() {
     yarm_user_rt::user_log!("PM_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
     let Some(mut recv_cap) = ctx.pm_request_recv_cap else {
+        yarm_user_rt::user_log!("PM_NO_RECV_CAP");
         loop {
             let _ = yarm_user_rt::syscall::yield_now();
         }
     };
     yarm_user_rt::user_log!("PM_RECV_LOOP_START recv_cap={}", recv_cap);
+    yarm_user_rt::user_log!("PM_BLOCKING_RECV_LOOP");
     let mut service = ProcessService::new();
 
     // Seed lifecycle records for bootstrap services spawned before PM's loop.

@@ -339,6 +339,7 @@ pub fn run() {
             }
         };
         yarm_user_rt::user_log!("DRIVER_MANAGER_RECV_CAP cap={}", recv_cap);
+        yarm_user_rt::user_log!("DRIVER_MANAGER_BLOCKING_RECV_LOOP");
 
         let mut service = DriverService::new();
         let mut runtime = NoopDriverControl;

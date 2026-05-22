@@ -101,6 +101,7 @@ pub fn run() {
     let ctx = yarm_user_rt::runtime::startup_context();
     if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
         yarm_user_rt::user_log!("INITRAMFS_SRV_RECV_CAP cap={}", recv_cap);
+        yarm_user_rt::user_log!("INITRAMFS_SRV_BLOCKING_RECV_LOOP");
         loop {
             // SAFETY: recv_cap is a kernel-provided startup receive endpoint.
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
