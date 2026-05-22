@@ -4,7 +4,7 @@
 #![no_std]
 
 pub mod drivers;
-pub use drivers::{input, irqmux, uart, virtio_blk, virtio_gpu, virtio_net};
+pub use drivers::{blkcache, input, irqmux, uart, virtio_blk, virtio_gpu, virtio_net};
 
 pub fn run_input() {
     drivers::input::run();
@@ -30,6 +30,10 @@ pub fn run_virtio_net() {
     drivers::virtio_net::run();
 }
 
+pub fn run_blkcache_srv() {
+    drivers::blkcache::run();
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -38,6 +42,7 @@ mod tests {
         let irqmux_src = include_str!("drivers/irqmux/service.rs");
         let uart_src = include_str!("drivers/uart/service.rs");
         let virtio_blk_src = include_str!("drivers/virtio_blk/service.rs");
+        let blkcache_src = include_str!("drivers/blkcache/service.rs");
         let virtio_gpu_src = include_str!("drivers/virtio_gpu/service.rs");
         let virtio_net_src = include_str!("drivers/virtio_net/service.rs");
         let legacy_drivers = ["yarm", "::services::", "drivers::"].concat();
@@ -47,6 +52,7 @@ mod tests {
             irqmux_src,
             uart_src,
             virtio_blk_src,
+            blkcache_src,
             virtio_gpu_src,
             virtio_net_src,
         ] {
@@ -61,6 +67,13 @@ mod tests {
     fn driver_server_bin_parity_guard_covers_expected_entrypoints() {
         let cargo_toml = include_str!("../Cargo.toml");
         let expected_bins = [
+            (
+                "blkcache_srv",
+                "name = \"blkcache_srv\"",
+                "path = \"src/bin/blkcache_srv.rs\"",
+                "bin/blkcache_srv.rs",
+                "run_blkcache_srv",
+            ),
             (
                 "input_srv",
                 "name = \"input_srv\"",
@@ -117,6 +130,7 @@ mod tests {
 
             let src = match bin_path {
                 "bin/input_srv.rs" => include_str!("bin/input_srv.rs"),
+                "bin/blkcache_srv.rs" => include_str!("bin/blkcache_srv.rs"),
                 "bin/irqmux_srv.rs" => include_str!("bin/irqmux_srv.rs"),
                 "bin/uart_srv.rs" => include_str!("bin/uart_srv.rs"),
                 "bin/virtio_blk_srv.rs" => include_str!("bin/virtio_blk_srv.rs"),

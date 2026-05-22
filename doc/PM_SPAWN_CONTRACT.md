@@ -38,6 +38,7 @@ const BOOTSTRAP_IMAGE_ID_MAX: u64 = 3;
 | 5        | `sbin/devfs_srv`        | `pm_vfs_spawn_inline`    |
 | 6        | `sbin/vfs_server`       | `pm_vfs_spawn_inline`    |
 | 7        | `sbin/driver_manager`   | `pm_vfs_spawn_inline`    |
+| 8        | `sbin/blkcache_srv`     | `pm_vfs_spawn_inline`    |
 | ≥ 8      | (future)                | `pm_vfs_spawn_inline`    |
 
 image_ids ≥ 4 use `SpawnFromInitramfsFile` (syscall nr=26) via
@@ -299,11 +300,18 @@ The init server spawns services in strict order:
 2. `image_id=5` — `devfs_srv`
 3. `image_id=6` — `vfs_server` (receives initramfs and devfs send caps in slots 13/14)
 4. `image_id=7` — `driver_manager`
+5. `image_id=8` — `blkcache_srv`
 
 Each spawn is a synchronous `PROC_OP_SPAWN_V5_CAP` call-reply. The init server
 does not proceed to the next spawn until it receives the reply from PM. This
 guarantees that service endpoints exist in the order they are needed (e.g. VFS
 can be given valid initramfs and devfs caps at spawn time).
+
+`blkcache_srv` is spawned by init through PM's VFS-backed spawn path and is
+not owned/spawned by `driver_manager`. `driver_manager` remains responsible
+for hardware-driver lifecycle and resource grants only. `blkcache_srv` is
+storage middleware that will consume block-driver services later; real caching,
+shared-memory, and zero-copy integration are future work.
 
 ---
 

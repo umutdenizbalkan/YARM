@@ -423,6 +423,17 @@ pub fn run() {
         dm_child_tid
     );
 
+    // --- Spawn blkcache_srv (image_id=8) ---
+    yarm_user_rt::user_log!("INIT_BLKCACHE_SPAWN_V5_CALL_BEGIN");
+    let Some((blkcache_child_tid, _blkcache_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 8, [0, 0, 0, 0], 0) else {
+        yarm_user_rt::user_log!("INIT_BLKCACHE_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
+        return;
+    };
+    yarm_user_rt::user_log!(
+        "INIT_BLKCACHE_SPAWN_V5_CALL_RETURN ok=1 child_tid={}",
+        blkcache_child_tid
+    );
+
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;
     };

@@ -1693,6 +1693,7 @@ fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
         5 => Some("sbin/devfs_srv"),
         6 => Some("sbin/vfs_server"),
         7 => Some("sbin/driver_manager"),
+        8 => Some("sbin/blkcache_srv"),
         _ => None,
     }
 }
