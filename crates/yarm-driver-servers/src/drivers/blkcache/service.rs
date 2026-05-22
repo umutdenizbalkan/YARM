@@ -25,6 +25,10 @@ impl BackendRecord {
 
 const MAX_BACKENDS: usize = 8;
 
+fn find_backend(table: &[BackendRecord; MAX_BACKENDS], backend_id: u64) -> Option<BackendRecord> {
+    table.iter().copied().find(|r| r.registered && r.backend_id == backend_id)
+}
+
 
 fn probe_backend_query_state(backend_id: u64, backend_send_cap: u64, reply_recv_cap: u32) {
     yarm_user_rt::user_log!(
@@ -40,7 +44,17 @@ fn probe_backend_query_state(backend_id: u64, backend_send_cap: u64, reply_recv_
     let Ok(msg) = Message::with_header(0, BLK_BACKEND_OP_QUERY_STATE, 0, None, &payload) else {
         return;
     };
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap as u32, reply_recv_cap, &msg) };
+    match unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap as u32, reply_recv_cap, &msg) } {
+        Ok(()) => {}
+        Err(e) => {
+            yarm_user_rt::user_log!(
+                "BLKCACHE_BACKEND_QUERY_STATE_ERR backend_id={} err={:?}",
+                backend_id,
+                e
+            );
+            return;
+        }
+    }
     match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) } {
         Ok(Some(reply_msg)) => {
             if let Some(resp) = BlkBackendResponse::decode(reply_msg.as_slice()) {
@@ -53,7 +67,12 @@ fn probe_backend_query_state(backend_id: u64, backend_send_cap: u64, reply_recv_
                 );
             }
         }
-        _ => {}
+        Ok(None) => {
+            yarm_user_rt::user_log!("BLKCACHE_BACKEND_QUERY_STATE_ERR backend_id={} err=NoReply", backend_id);
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("BLKCACHE_BACKEND_QUERY_STATE_ERR backend_id={} err={:?}", backend_id, e);
+        }
     }
 }
 
@@ -112,7 +131,9 @@ pub fn run() {
                                     let status = register_backend(&mut backends, args);
                                     if status == BLKCACHE_STATUS_OK {
                                         if let Some(reply_cap) = pm_reply_recv_cap {
-                                            probe_backend_query_state(args.backend_id, args.backend_send_cap, reply_cap);
+                                            if let Some(rec) = find_backend(&backends, args.backend_id) {
+                                                probe_backend_query_state(rec.backend_id, rec.backend_send_cap, reply_cap);
+                                            }
                                         }
                                     }
                                     (0, status)
