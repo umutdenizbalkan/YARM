@@ -582,9 +582,14 @@ impl KernelState {
                 Ok(local_cap) => {
                     spec.startup_args[2] = local_cap.0;
                     crate::yarm_log!(
-                        "KSPAWN_REPLY_RECV_CAP_DELEGATED tid={} local_cap={}",
+                        "SPAWN_SERVICE_REPLY_RECV_CAP_CHILD child_tid={} cap={} rights=RECEIVE",
                         spec.tid,
                         local_cap.0
+                    );
+                    crate::yarm_log!(
+                        "SPAWN_STARTUP_SLOT_2_REPLY_RECV child_tid={} value={}",
+                        spec.tid,
+                        spec.startup_args[2]
                     );
                 }
                 Err(e) => {

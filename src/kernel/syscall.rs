@@ -1236,6 +1236,7 @@ fn handle_spawn_process(
         startup_args_count
     );
     let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    startup_args[2] = 0;
     let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
     startup_args[12] = 0;
     startup_args[13] = 0;
@@ -1283,7 +1284,14 @@ fn handle_spawn_process(
         }
     };
     let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((_, _, recv_cap)) => recv_cap.0,
+        Ok((eid, _, recv_cap)) => {
+            crate::yarm_log!(
+                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
+                eid,
+                recv_cap.0
+            );
+            recv_cap.0
+        }
         Err(e) => {
             crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
             0u64
@@ -1406,6 +1414,7 @@ fn handle_spawn_process_from_user_buf(
     let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
     crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
     let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    startup_args[2] = 0;
     let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
     startup_args[12] = 0;
     startup_args[13] = 0;
@@ -1443,7 +1452,14 @@ fn handle_spawn_process_from_user_buf(
         }
     };
     let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((_, _, recv_cap)) => recv_cap.0,
+        Ok((eid, _, recv_cap)) => {
+            crate::yarm_log!(
+                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
+                eid,
+                recv_cap.0
+            );
+            recv_cap.0
+        }
         Err(e) => {
             crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
             0u64
@@ -1579,6 +1595,7 @@ fn handle_spawn_from_initramfs_file(
     crate::yarm_log!("KSPAWN_FROM_CPIO entry=0x{:x}", elf.entry);
 
     let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    startup_args[2] = 0;
     let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
     startup_args[12] = 0;
     startup_args[13] = 0;
@@ -1607,7 +1624,14 @@ fn handle_spawn_from_initramfs_file(
         }
     };
     let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((_, _, recv_cap)) => recv_cap.0,
+        Ok((eid, _, recv_cap)) => {
+            crate::yarm_log!(
+                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
+                eid,
+                recv_cap.0
+            );
+            recv_cap.0
+        }
         Err(e) => {
             crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
             0u64
