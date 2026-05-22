@@ -515,7 +515,9 @@ pub fn run() {
     let _ = unsafe { yarm_user_rt::syscall::ipc_call(init_virtio_blk_send_cap as u32, pm_recv, &query_msg) };
     let query_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
     match query_reply {
-        Ok(Some(reply_msg)) => match BlkBackendResponse::decode(reply_msg.as_slice()) {
+        Ok(Some(reply_msg)) => {
+            yarm_user_rt::user_log!("INIT_VIRTIO_BLK_QUERY_STATE_REPLY_RAW len={}", reply_msg.as_slice().len());
+            match BlkBackendResponse::decode(reply_msg.as_slice()) {
             Some(resp) if resp.status == BLK_BACKEND_STATUS_EAGAIN && resp.logical_block_size == 512 => {
                 yarm_user_rt::user_log!(
                     "INIT_VIRTIO_BLK_QUERY_STATE_SMOKE_RETURN ok=1 status={} logical_block_size={}",
@@ -531,7 +533,8 @@ pub fn run() {
                 );
             }
             None => yarm_user_rt::user_log!("INIT_VIRTIO_BLK_QUERY_STATE_SMOKE_RETURN ok=0 status=-22 logical_block_size=0"),
-        },
+            }
+        }
         _ => yarm_user_rt::user_log!("INIT_VIRTIO_BLK_QUERY_STATE_SMOKE_RETURN ok=0 status=-22 logical_block_size=0"),
     }
 

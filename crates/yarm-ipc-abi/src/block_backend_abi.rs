@@ -171,4 +171,16 @@ mod tests {
     #[test] fn short_rejected(){assert!(BlkSgEntry::decode(&[0;23]).is_none());assert!(BlkBackendQueryRequest::decode(&[0;15]).is_none());assert!(BlkBackendRequest::decode(&[0;127]).is_none());assert!(BlkBackendResponse::decode(&[0;31]).is_none());}
     #[test] fn read_write_require_sg(){let r=BlkBackendRequest{req_id:1,flags:0,device_id:0,sector_start:0,sector_count:1,sg_count:0,sg_list:[BlkSgEntry{mem_cap:0,offset:0,length:0,flags:0};4]};assert!(!r.is_valid_for_opcode(BLK_BACKEND_OP_READ));assert!(!r.is_valid_for_opcode(BLK_BACKEND_OP_WRITE));}
     #[test] fn query_allows_zero_sg(){let r=BlkBackendRequest{req_id:1,flags:0,device_id:0,sector_start:0,sector_count:0,sg_count:0,sg_list:[BlkSgEntry{mem_cap:0,offset:0,length:0,flags:0};4]};assert!(r.is_valid_for_opcode(BLK_BACKEND_OP_QUERY_STATE));}
+
+    #[test] fn response_golden_vector(){
+        let r=BlkBackendResponse{req_id:1,status:BLK_BACKEND_STATUS_EAGAIN,actual_bytes:0,backend_generation:0,logical_block_size:512,physical_block_size:512};
+        let b=r.encode();
+        let mut exp=[0u8;BlkBackendResponse::ENCODED_LEN];
+        exp[0..4].copy_from_slice(&1u32.to_le_bytes());
+        exp[4..8].copy_from_slice(&(-11i32).to_le_bytes());
+        exp[24..28].copy_from_slice(&512u32.to_le_bytes());
+        exp[28..32].copy_from_slice(&512u32.to_le_bytes());
+        assert_eq!(b,exp);
+        assert_eq!(BlkBackendResponse::decode(&exp),Some(r));
+    }
 }

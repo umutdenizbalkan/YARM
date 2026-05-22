@@ -59,6 +59,15 @@ pub fn run() {
                     _ => (0, BLK_BACKEND_STATUS_EINVAL),
                 };
                 let resp = build_resp(req_id, status);
+                if msg.opcode == BLK_BACKEND_OP_QUERY_STATE {
+                    yarm_user_rt::user_log!(
+                        "VIRTIO_BLK_QUERY_STATE_REPLY status={} logical_block_size={} physical_block_size={} len={}",
+                        resp.status,
+                        resp.logical_block_size,
+                        resp.physical_block_size,
+                        BlkBackendResponse::ENCODED_LEN
+                    );
+                }
                 if let Ok(reply) = Message::with_header(0, msg.opcode, 0, None, &resp.encode()) {
                     let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
                 }
