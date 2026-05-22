@@ -394,16 +394,6 @@ pub mod syscall {
             reply_recv_cap as usize,
         ];
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_CALL_NR, args) };
-        crate::user_log!(
-            "USER_RT_IPC_CALL_RET send_cap={} reply_cap={} ret0={} ret1={} ret2={} ret3={} ret4={}",
-            ep_cap,
-            reply_recv_cap,
-            ret.ret0,
-            ret.ret1,
-            ret.ret2,
-            ret.ret3,
-            ret.ret4
-        );
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
             return Err(decode_syscall_error(ret.error));

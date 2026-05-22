@@ -1763,8 +1763,6 @@ pub fn run() {
 
     loop {
         // SAFETY: direct syscall wrapper call; PM owns its recv endpoint capability.
-        #[cfg(not(test))]
-        yarm_user_rt::user_log!("PM_RECV_LOOP_BEFORE_RECV recv_cap={}", recv_cap);
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
             Ok(Some((msg, reply_cap))) => {
                 yarm_user_rt::user_log!(
@@ -1776,12 +1774,6 @@ pub fn run() {
                 if let Ok(reply) = service.handle(msg) {
                     if let Some(cap) = reply_cap {
                         // SAFETY: kernel validates reply capability rights/object.
-                        yarm_user_rt::user_log!(
-                            "PM_IPC_REPLY_SEND cap={} opcode={} len={}",
-                            cap,
-                            reply.opcode,
-                            reply.len
-                        );
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
                     }
                 } else {
@@ -1796,24 +1788,13 @@ pub fn run() {
                             Message::with_header(0, msg.opcode, 0, None, &err_payload)
                         {
                             // SAFETY: kernel validates reply capability rights/object.
-                            yarm_user_rt::user_log!(
-                                "PM_IPC_REPLY_SEND cap={} opcode={} len={}",
-                                cap,
-                                err_reply.opcode,
-                                err_reply.len
-                            );
                             let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &err_reply) };
                         }
                     }
                 }
             }
-            Ok(None) => {
-                yarm_user_rt::user_log!("PM_RECV_RAW_RESULT none");
-            }
-            Err(e) => {
-                yarm_user_rt::user_log!("PM_RECV_RAW_RESULT err={:?}", e);
-                continue;
-            }
+            Ok(None) => {}
+            Err(_e) => continue,
         }
     }
 }

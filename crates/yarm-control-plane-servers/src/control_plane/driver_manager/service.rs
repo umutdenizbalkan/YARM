@@ -345,7 +345,6 @@ pub fn run() {
         let mut runtime = NoopDriverControl;
 
         loop {
-            yarm_user_rt::user_log!("DRIVER_MANAGER_RECV_LOOP_BEFORE_RECV cap={}", recv_cap);
             // SAFETY: driver_manager owns its startup-provided service recv endpoint.
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
                 Ok(Some((msg, reply_cap))) => {
