@@ -655,4 +655,59 @@ mod tests {
         let policy = MountNamespacePolicy::deny_all().with_prefix(b"/srv");
         assert!(!policy.allows_path_bytes(b"/tmp/file"));
     }
+
+    #[test]
+    fn path_repeated_slashes_are_rejected_without_normalization() {
+        let policy = MountNamespacePolicy::deny_all().with_prefix(b"/foo/bar");
+        assert!(policy.allows_path_bytes(b"/foo/bar"));
+        assert!(!policy.allows_path_bytes(b"/foo//bar"));
+    }
+
+    #[test]
+    fn path_dot_and_dotdot_do_not_escape_root_policy() {
+        let policy = MountNamespacePolicy::deny_all().with_prefix(b"/");
+        assert!(policy.allows_path_bytes(b"/foo/./bar"));
+        assert!(policy.allows_path_bytes(b"/foo/baz/../bar"));
+        assert!(policy.allows_path_bytes(b"/../../x"));
+    }
+
+    #[test]
+    fn mount_longest_prefix_behavior_is_stable() {
+        let policy = MountNamespacePolicy::deny_all()
+            .with_prefix(b"/dev")
+            .with_prefix(b"/dev/pts");
+        assert!(policy.allows_path_bytes(b"/dev/null"));
+        assert!(policy.allows_path_bytes(b"/dev/pts/0"));
+        assert!(!policy.allows_path_bytes(b"/de"));
+    }
+
+    #[test]
+    fn fd_bad_read_and_double_close_are_deterministic() {
+        let mut backend = InMemoryBackend::new();
+        let fd = backend.openat_path(b"/initramfs/x").expect("open");
+        assert_eq!(backend.read(9999, 8), Err(VfsError::BadFd));
+        assert_eq!(backend.close(fd), Ok(0));
+        assert_eq!(backend.close(fd), Err(VfsError::BadFd));
+    }
+
+    #[test]
+    fn unsupported_operation_maps_to_stable_error() {
+        struct StubBackend;
+        impl VfsBackend for StubBackend {
+            fn openat_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
+                Err(VfsError::Unsupported)
+            }
+            fn close(&mut self, _fd: u64) -> Result<u64, VfsError> {
+                Err(VfsError::Unsupported)
+            }
+            fn read(&mut self, _fd: u64, _len: u64) -> Result<u64, VfsError> {
+                Err(VfsError::Unsupported)
+            }
+            fn write(&mut self, _fd: u64, _len: u64) -> Result<u64, VfsError> {
+                Err(VfsError::Unsupported)
+            }
+        }
+        let mut backend = StubBackend;
+        assert_eq!(backend.poll(0, 0, 0), Err(VfsError::Unsupported));
+    }
 }
