@@ -395,10 +395,16 @@ pub mod syscall {
         if len > Message::MAX_PAYLOAD {
             return Err(SyscallError::Internal);
         }
-        let transfer_cap = if meta.cap_id == SYSCALL_NO_TRANSFER_CAP {
+        let returned_cap = if meta.cap_id == SYSCALL_NO_TRANSFER_CAP {
             None
         } else {
             Some(meta.cap_id)
+        };
+        let recv_meta_flags = meta.recv_meta_flags as usize;
+        let transfer_cap = if (recv_meta_flags & SYSCALL_RECV_META_TRANSFERRED_CAP) != 0 {
+            returned_cap
+        } else {
+            None
         };
         let flags = if transfer_cap.is_some() {
             Message::FLAG_CAP_TRANSFER
@@ -406,11 +412,18 @@ pub mod syscall {
             0
         };
         crate::user_log!(
-            "USER_RT_RECV_DECODE status={} len={} reply_cap={} ok={}",
+            "USER_RT_RECV_DEADLINE_META_FROM_MEM status={} opcode={} payload_len={} cap_id={} flags={} sender_tid={}",
             meta.status,
+            meta.opcode,
             len,
-            transfer_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
-            true
+            returned_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
+            meta.recv_meta_flags,
+            meta.sender_tid
+        );
+        let preview_len = core::cmp::min(len, 32);
+        crate::user_log!(
+            "USER_RT_RECV_DEADLINE_PAYLOAD_PREFIX {:02x?}",
+            &payload[..preview_len]
         );
         let msg = Message::with_header(meta.sender_tid, meta.opcode, flags, transfer_cap, &payload[..len])
             .map_err(|_| SyscallError::InvalidArgs)?;
