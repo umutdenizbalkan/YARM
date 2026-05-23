@@ -939,6 +939,16 @@ fn handle_ipc_recv_result_with_empty_error(
             )?;
             encode_transfer_cap_ret(frame, recv_local_transfer)?;
             frame.set_arg(SYSCALL_RET_RECV_META_FLAGS, recv_meta_flags);
+            crate::yarm_log!(
+                "IPC_RECV_RETURN_META tid={} cap={} ret0={} ret1={} ret2={} ret3={} flags={}",
+                receiver_tid,
+                frame.arg(SYSCALL_ARG_CAP),
+                sender,
+                msg.len as usize,
+                frame.ret2(),
+                frame.arg(SYSCALL_RET_RECV_META_FLAGS),
+                recv_meta_flags
+            );
 
             if current_task_has_user_asid(kernel)? {
                 if msg.opcode == OPCODE_SHARED_MEM {

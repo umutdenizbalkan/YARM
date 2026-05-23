@@ -136,10 +136,12 @@ fn export_syscall_result_to_user_gprs(frame: &mut TrapFrame) {
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, error);
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, 0);
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, 0);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X3, 0);
     } else {
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.ret0());
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, frame.ret1());
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, frame.ret2());
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X3, frame.arg(3));
     }
 }
 
@@ -389,12 +391,13 @@ pub fn handle_trap_entry(
         }
 
         crate::yarm_log!(
-            "AARCH64_ERET_ACTUAL tid={} elr=0x{:016x} x0={} x1={} x2={}",
+            "AARCH64_ERET_ACTUAL tid={} elr=0x{:016x} x0={} x1={} x2={} x3={}",
             kernel.current_tid().unwrap_or(0),
             actual_elr as u64,
             trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),
             trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1),
             trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2),
+            trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X3),
         );
         crate::yarm_log!(
             "AARCH64_FINAL_USER_GPRS tid={} x0={} x1={} x2={}",
