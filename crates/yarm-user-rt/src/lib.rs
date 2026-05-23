@@ -265,6 +265,10 @@ pub mod syscall {
             SYSCALL_RECV_MAP_INTENT_DEFAULT,
         ];
         crate::user_log!(
+            "USER_RT_IPC_RECV_V2_ARGS cap={} buf=0x{:x} len={} meta_ptr=0x{:x} meta_len={} flags={}",
+            args[0], args[1], args[2], args[3], args[4], args[5]
+        );
+        crate::user_log!(
             "USER_RT_RECV_BEFORE_SYSCALL cap={} buf=0x{:x} len={}",
             args[0],
             args[1],
@@ -343,14 +347,17 @@ pub mod syscall {
         ep_cap: u32,
         timeout_ticks: u64,
     ) -> core::result::Result<Option<Message>, SyscallError> {
-        let mut payload = [0u8; Message::MAX_PAYLOAD];
+        let mut payload = [0u8; 2 + Message::MAX_PAYLOAD];
+        let mut meta = IpcRecvMetaV2 {
+            status: u64::MAX, opcode: 0, flags: 0, payload_len: 0, cap_id: SYSCALL_NO_TRANSFER_CAP, recv_meta_flags: 0, sender_tid: 0
+        };
         let args = [
             ep_cap as usize,
             payload.as_mut_ptr() as usize,
-            Message::MAX_PAYLOAD,
+            payload.len(),
             timeout_ticks as usize,
-            SYSCALL_RECV_MAP_INTENT_DEFAULT,
-            SYSCALL_NO_TRANSFER_CAP as usize,
+            (&mut meta as *mut IpcRecvMetaV2) as usize,
+            core::mem::size_of::<IpcRecvMetaV2>(),
         ];
         crate::user_log!(
             "USER_RT_RECV_BEFORE_SYSCALL cap={} buf=0x{:x} len={}",
@@ -376,7 +383,7 @@ pub mod syscall {
             };
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret1 == args[1] && ret.ret2 == args[2] && (1..=9).contains(&ret.ret0) {
+        if ret.ret0 != 0 && meta.status == u64::MAX {
             let err = decode_syscall_error(ret.ret0);
             return if matches!(err, SyscallError::WouldBlock | SyscallError::TimedOut) {
                 Ok(None)
@@ -384,14 +391,14 @@ pub mod syscall {
                 Err(err)
             };
         }
-        let len = ret.ret1;
+        let len = meta.payload_len as usize;
         if len > Message::MAX_PAYLOAD {
             return Err(SyscallError::Internal);
         }
-        let transfer_cap = if (ret.ret2 as u64) == SYSCALL_NO_TRANSFER_CAP {
+        let transfer_cap = if meta.cap_id == SYSCALL_NO_TRANSFER_CAP {
             None
         } else {
-            Some(ret.ret2 as u64)
+            Some(meta.cap_id)
         };
         let flags = if transfer_cap.is_some() {
             Message::FLAG_CAP_TRANSFER
@@ -400,12 +407,12 @@ pub mod syscall {
         };
         crate::user_log!(
             "USER_RT_RECV_DECODE status={} len={} reply_cap={} ok={}",
-            ret.ret0,
+            meta.status,
             len,
             transfer_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
             true
         );
-        let msg = Message::with_header(ret.ret0 as u64, 0, flags, transfer_cap, &payload[..len])
+        let msg = Message::with_header(meta.sender_tid, meta.opcode, flags, transfer_cap, &payload[..len])
             .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some(msg))
     }

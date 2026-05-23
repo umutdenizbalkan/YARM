@@ -959,6 +959,13 @@ fn handle_ipc_recv_result_with_empty_error(
                     (msg.opcode, raw_payload, 0usize)
                 };
             if meta_ptr == 0 || meta_len < IPC_RECV_META_V2_ENCODED_LEN {
+                crate::yarm_log!(
+                    "IPC_RECV_INVALID_ARGS reason={} meta_ptr=0x{:x} meta_len={} need={}",
+                    if meta_ptr == 0 { "bad_meta_ptr" } else { "bad_meta_len" },
+                    meta_ptr,
+                    meta_len,
+                    IPC_RECV_META_V2_ENCODED_LEN
+                );
                 return Err(SyscallError::InvalidArgs);
             }
             let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
