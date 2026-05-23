@@ -19,6 +19,15 @@ const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 8;
 const EARLY_UART_MMIO_VA: u64 = 0x0900_0000;
 const EARLY_UART_MMIO_PA: u64 = 0x0900_0000;
 
+const AARCH64_ASID_TRACE: bool = false;
+macro_rules! asid_trace {
+    ($($arg:tt)*) => {
+        if AARCH64_ASID_TRACE {
+            crate::yarm_log!($($arg)*);
+        }
+    };
+}
+
 #[cfg(test)]
 static LAST_INVALIDATED_ASID: SpinLock<Option<Asid>> = SpinLock::new(None);
 
