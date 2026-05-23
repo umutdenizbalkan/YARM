@@ -245,7 +245,9 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
 impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
 
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
-        self.route_by_path_bytes(path).openat_path(path)
+        let normalized = normalize_path(path)?;
+        self.route_by_path_bytes(normalized.as_slice())
+            .openat_path(normalized.as_slice())
     }
 
     fn close(&mut self, fd: u64) -> Result<u64, VfsError> {
@@ -262,7 +264,9 @@ impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
 
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
-        self.route_by_path_bytes(path).statx_path(path)
+        let normalized = normalize_path(path)?;
+        self.route_by_path_bytes(normalized.as_slice())
+            .statx_path(normalized.as_slice())
     }
 
     fn ioctl(&mut self, fd: u64, request: u64, arg: u64) -> Result<u64, VfsError> {
@@ -558,9 +562,10 @@ impl MountNamespacePolicy {
         if self.allow_all {
             return true;
         }
-        if path.is_empty() || !path.starts_with(b"/") {
+        let Ok(path) = normalize_path(path) else {
             return false;
-        }
+        };
+        let path = path.as_slice();
         let mut idx = 0;
         while idx < MAX_POLICY_PREFIXES {
             if let Some(prefix) = self.prefixes[idx]
@@ -585,6 +590,66 @@ fn path_matches_prefix(path: &[u8], prefix: &[u8]) -> bool {
 }
 
 pub const INLINE_PATH_MAX: usize = 96;
+
+pub fn normalize_path(path: &[u8]) -> Result<PathBytes, VfsError> {
+    if path.is_empty() {
+        return Err(VfsError::InvalidPath);
+    }
+    if !path.starts_with(b"/") {
+        return Err(VfsError::Malformed);
+    }
+
+    let mut out = [0u8; INLINE_PATH_MAX];
+    let mut out_len = 1usize;
+    out[0] = b'/';
+    let mut stack: [usize; INLINE_PATH_MAX] = [0; INLINE_PATH_MAX];
+    let mut depth = 0usize;
+    let mut i = 0usize;
+
+    while i < path.len() {
+        while i < path.len() && path[i] == b'/' {
+            i += 1;
+        }
+        if i >= path.len() {
+            break;
+        }
+        let start = i;
+        while i < path.len() && path[i] != b'/' {
+            i += 1;
+        }
+        let comp = &path[start..i];
+        if comp == b"." {
+            continue;
+        }
+        if comp == b".." {
+            if depth > 0 {
+                depth -= 1;
+                out_len = stack[depth];
+            }
+            continue;
+        }
+        let restore_len = out_len;
+        if out_len > 1 {
+            if out_len >= INLINE_PATH_MAX {
+                return Err(VfsError::NameTooLong);
+            }
+            out[out_len] = b'/';
+            out_len += 1;
+        }
+        if out_len + comp.len() > INLINE_PATH_MAX {
+            return Err(VfsError::NameTooLong);
+        }
+        stack[depth] = restore_len;
+        depth += 1;
+        out[out_len..out_len + comp.len()].copy_from_slice(comp);
+        out_len += comp.len();
+    }
+
+    Ok(PathBytes {
+        len: out_len as u8,
+        bytes: out,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathBytes {
@@ -657,10 +722,10 @@ mod tests {
     }
 
     #[test]
-    fn path_repeated_slashes_are_rejected_without_normalization() {
+    fn path_repeated_slashes_normalize_before_policy_match() {
         let policy = MountNamespacePolicy::deny_all().with_prefix(b"/foo/bar");
         assert!(policy.allows_path_bytes(b"/foo/bar"));
-        assert!(!policy.allows_path_bytes(b"/foo//bar"));
+        assert!(policy.allows_path_bytes(b"/foo//bar"));
     }
 
     #[test]
@@ -669,6 +734,55 @@ mod tests {
         assert!(policy.allows_path_bytes(b"/foo/./bar"));
         assert!(policy.allows_path_bytes(b"/foo/baz/../bar"));
         assert!(policy.allows_path_bytes(b"/../../x"));
+    }
+
+    #[test]
+    fn path_normalization_rejects_relative_path() {
+        assert_eq!(normalize_path(b"foo/bar"), Err(VfsError::Malformed));
+    }
+
+    #[test]
+    fn path_normalization_root_is_stable() {
+        assert_eq!(normalize_path(b"/").unwrap().as_slice(), b"/");
+    }
+
+    #[test]
+    fn mount_router_dispatches_normalized_paths_to_backend() {
+        #[derive(Default)]
+        struct SpyBackend {
+            last_open: Option<PathBytes>,
+            last_statx: Option<PathBytes>,
+        }
+        impl VfsBackend for SpyBackend {
+            fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+                self.last_open = Some(PathBytes::from_slice(path)?);
+                Ok(3)
+            }
+            fn close(&mut self, _fd: u64) -> Result<u64, VfsError> {
+                Ok(0)
+            }
+            fn read(&mut self, _fd: u64, _len: u64) -> Result<u64, VfsError> {
+                Ok(0)
+            }
+            fn write(&mut self, _fd: u64, _len: u64) -> Result<u64, VfsError> {
+                Ok(0)
+            }
+            fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+                self.last_statx = Some(PathBytes::from_slice(path)?);
+                Ok(1)
+            }
+        }
+
+        let mut low = SpyBackend::default();
+        let high = SpyBackend::default();
+        let mut router = MountRouter::new(100, low, high);
+        assert_eq!(router.openat_path(b"/foo//./baz/../bar").unwrap(), 3);
+        assert_eq!(router.statx_path(b"/foo//./baz/../bar").unwrap(), 1);
+        // Recover low backend by re-destructuring router internals through routing side effects.
+        // open/stat on non-initramfs paths route to low backend.
+        low = router.low;
+        assert_eq!(low.last_open.unwrap().as_slice(), b"/foo/bar");
+        assert_eq!(low.last_statx.unwrap().as_slice(), b"/foo/bar");
     }
 
     #[test]
