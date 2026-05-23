@@ -20,24 +20,26 @@ global_asm!(
     .type yarm_aarch64_raw_syscall_frame,%function
 yarm_aarch64_raw_syscall_frame:
     // x0 = frame ptr, x1 = syscall number
-    mov x12, x0
+    stp x19, x30, [sp, #-16]!
+    mov x19, x0
     mov x8, x1
 
-    ldr x0, [x12, #0]
-    ldr x1, [x12, #8]
-    ldr x2, [x12, #16]
-    ldr x3, [x12, #24]
-    ldr x4, [x12, #32]
-    ldr x5, [x12, #40]
+    ldr x0, [x19, #0]
+    ldr x1, [x19, #8]
+    ldr x2, [x19, #16]
+    ldr x3, [x19, #24]
+    ldr x4, [x19, #32]
+    ldr x5, [x19, #40]
 
     svc #0
 
-    str x0, [x12, #48]
-    str x1, [x12, #56]
-    str x2, [x12, #64]
-    str x3, [x12, #72]
-    str x4, [x12, #80]
-    str x5, [x12, #88]
+    str x0, [x19, #48]
+    str x1, [x19, #56]
+    str x2, [x19, #64]
+    str x3, [x19, #72]
+    str x4, [x19, #80]
+    str x5, [x19, #88]
+    ldp x19, x30, [sp], #16
     ret
     "#
 );
