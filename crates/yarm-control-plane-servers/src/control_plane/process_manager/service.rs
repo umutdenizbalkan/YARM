@@ -1192,6 +1192,11 @@ impl ProcessService {
                     let result = SpawnV5CapResult::new(tid, caller_cap);
                     let encoded = result.encode();
                     yarm_user_rt::user_log!(
+                        "PM_SPAWN_V5_REPLY_BYTES len={} bytes={:x?}",
+                        encoded.len(),
+                        &encoded
+                    );
+                    yarm_user_rt::user_log!(
                         "PM_SPAWN_V5_CAP_REPLY tid={} caller_cap={} pm_send_cap={} len={}",
                         tid, caller_cap, pm_send_cap, encoded.len()
                     );

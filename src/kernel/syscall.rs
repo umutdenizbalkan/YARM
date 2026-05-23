@@ -870,6 +870,12 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
         let payload = inline_payload_from_frame(frame, len)?;
         Message::new(sender_tid, &payload[..len]).map_err(|_| SyscallError::InvalidArgs)?
     };
+    crate::yarm_log!(
+        "IPC_REPLY_DELIVER len={} opcode={} flags={}",
+        msg.len,
+        msg.opcode,
+        msg.flags
+    );
     if let Err(err) = kernel.ipc_reply(reply_cap, msg) {
         let mapped = SyscallError::from(err);
         crate::yarm_log!(

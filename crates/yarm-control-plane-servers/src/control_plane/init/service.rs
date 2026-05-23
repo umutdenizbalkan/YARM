@@ -281,18 +281,37 @@ fn spawn_v5_cap(
     ) else {
         return None;
     };
-    // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call.
+    // SAFETY: Uses kernel-provided startup caps for PM IPC request.
     let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
-    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(pm_recv) };
     match reply {
-        Ok(Some(ref r)) => {
-            let payload = r.as_slice();
-            match SpawnV5CapResult::decode(payload) {
-                Ok(result) => Some((result.pid, result.service_send_cap)),
-                Err(_) => None,
+        Ok(Some(received)) => {
+            let r = received.message;
+            yarm_user_rt::user_log!(
+                "INIT_SPAWN_V5_REPLY_RECV len={} opcode={} flags={} bytes={:x?}",
+                r.len,
+                r.opcode,
+                r.flags,
+                r.as_slice()
+            );
+            match SpawnV5CapResult::decode(r.as_slice()) {
+                Ok(result) => {
+                    yarm_user_rt::user_log!(
+                        "INIT_SPAWN_V5_REPLY_DECODE ok=1 child_tid={}",
+                        result.pid
+                    );
+                    Some((result.pid, result.service_send_cap))
+                }
+                Err(_) => {
+                    yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
+                    None
+                }
             }
         }
-        _ => None,
+        _ => {
+            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
+            None
+        }
     }
 }
 
