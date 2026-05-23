@@ -50,7 +50,7 @@ pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;
 pub const SYSCALL_RET_STATUS: usize = 0;
 pub const SYSCALL_RET_AUX: usize = 1;
 pub const SYSCALL_RET_TRANSFER_CAP: usize = 2;
-pub const SYSCALL_RET_RECV_META_FLAGS: usize = 3;
+pub const SYSCALL_RET_RECV_META_FLAGS: usize = 5;
 pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
 pub const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
 pub const SYSCALL_RECV_META_TRANSFERRED_CAP: usize = 1 << 1;
@@ -940,7 +940,7 @@ fn handle_ipc_recv_result_with_empty_error(
             encode_transfer_cap_ret(frame, recv_local_transfer)?;
             frame.set_arg(SYSCALL_RET_RECV_META_FLAGS, recv_meta_flags);
             crate::yarm_log!(
-                "IPC_RECV_RETURN_META tid={} cap={} ret0={} ret1={} ret2={} ret3={} flags={}",
+                "IPC_RECV_RETURN_META tid={} cap={} ret0={} ret1={} ret2={} ret5={} flags={}",
                 receiver_tid,
                 frame.arg(SYSCALL_ARG_CAP),
                 sender,

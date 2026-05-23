@@ -137,11 +137,15 @@ fn export_syscall_result_to_user_gprs(frame: &mut TrapFrame) {
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, 0);
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, 0);
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X3, 0);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X4, 0);
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X5, 0);
     } else {
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.ret0());
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, frame.ret1());
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, frame.ret2());
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X3, frame.arg(3));
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X4, frame.arg(4));
+        frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X5, frame.arg(5));
     }
 }
 
@@ -486,17 +490,26 @@ mod tests {
     #[test]
     fn syscall_abi_exports_return_registers() {
         let mut frame = TrapFrame::new(0, [0; 6]);
+        frame.set_arg(3, 10);
+        frame.set_arg(4, 11);
+        frame.set_arg(5, 12);
         frame.set_ok(7, 8, 9);
         export_syscall_result_to_user_gprs(&mut frame);
         assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0), 7);
         assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1), 8);
         assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2), 9);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X3), 10);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X4), 11);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X5), 12);
 
         frame.set_err(5);
         export_syscall_result_to_user_gprs(&mut frame);
         assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0), 5);
         assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1), 0);
         assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2), 0);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X3), 0);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X4), 0);
+        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X5), 0);
     }
 
     #[test]
