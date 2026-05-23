@@ -949,7 +949,10 @@ fn handle_ipc_recv_result_with_empty_error(
             encode_transfer_cap_ret(frame, recv_local_transfer)?;
             let raw_payload = msg.as_slice();
             let (app_opcode, app_payload, stripped_prefix) =
-                if msg.opcode == OPCODE_INLINE && raw_payload.len() >= 2 {
+                if msg.opcode == OPCODE_INLINE
+                    && (msg.flags & Message::FLAG_REPLY_CAP) != 0
+                    && raw_payload.len() >= 2
+                {
                     (
                         u16::from_le_bytes([raw_payload[0], raw_payload[1]]),
                         &raw_payload[2..],
