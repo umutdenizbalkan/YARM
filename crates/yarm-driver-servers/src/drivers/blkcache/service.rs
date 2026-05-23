@@ -167,6 +167,11 @@ pub fn run() {
                 let msg = received.message;
                 let reply_cap = received.reply_cap;
                 yarm_user_rt::user_log!(
+                    "BLKCACHE_RECV_MSG opcode={} len={}",
+                    msg.opcode,
+                    msg.as_slice().len()
+                );
+                yarm_user_rt::user_log!(
                     "BLKCACHE_RECV_CAPS reply_cap={:?} transferred_cap={:?}",
                     reply_cap,
                     received.transferred_cap
@@ -241,7 +246,11 @@ pub fn run() {
                     BLKCACHE_OP_REGISTER_BACKEND => {
                         match RegisterBackendArgs::decode(msg.as_slice()) {
                             Some(args) => {
-                                yarm_user_rt::user_log!("BLKCACHE_OP_REGISTER_BACKEND backend_id={}", args.backend_id);
+                                yarm_user_rt::user_log!(
+                                    "BLKCACHE_OP_REGISTER_BACKEND backend_id={} payload_len={}",
+                                    args.backend_id,
+                                    msg.as_slice().len()
+                                );
                                 let tx_cap = received.transferred_cap.map(|c| c as u64);
                                 yarm_user_rt::user_log!(
                                     "BLKCACHE_BACKEND_REGISTER_RECV transferred_cap={:?}",
@@ -249,7 +258,7 @@ pub fn run() {
                                 );
                                 let Some(tx_cap) = tx_cap else {
                                     yarm_user_rt::user_log!(
-                                        "BLKCACHE_BACKEND_QUERY_STATE_ERR backend_id={} err=MissingTransferredCap",
+                                        "BLKCACHE_BACKEND_REGISTER_REJECT backend_id={} reason=MissingTransferredCap",
                                         args.backend_id
                                     );
                                     continue;
@@ -286,7 +295,10 @@ pub fn run() {
                                 }
                             }
                             None => {
-                                yarm_user_rt::user_log!("BLKCACHE_REGISTER_NO_REPLY_PATH backend_id=0 status={}", BLKCACHE_STATUS_ERR_BAD_REQUEST);
+                                yarm_user_rt::user_log!(
+                                    "BLKCACHE_BACKEND_REGISTER_REJECT backend_id=0 reason=DecodeFailed payload_len={}",
+                                    msg.as_slice().len()
+                                );
                                 continue;
                             }
                         }
