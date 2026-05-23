@@ -203,14 +203,15 @@ pub mod syscall {
 
     #[inline]
     pub unsafe fn ipc_send(ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError> {
+        let (frame, frame_len, _tx_cap, _msg_flags) = ipc_call_prepare(msg);
         let transfer_cap = msg
             .transferred_cap()
             .map(|cap| cap.0 as usize)
             .unwrap_or(SYSCALL_NO_TRANSFER_CAP as usize);
         let args = [
             ep_cap as usize,
-            msg.payload.as_ptr() as usize,
-            msg.len as usize,
+            frame.as_ptr() as usize,
+            frame_len,
             0,
             0,
             transfer_cap,
