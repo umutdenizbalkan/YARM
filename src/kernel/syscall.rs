@@ -962,13 +962,14 @@ fn handle_ipc_recv_result_with_empty_error(
                 .copy_to_current_user(meta_ptr, &meta)
                 .map_err(SyscallError::from)?;
             crate::yarm_log!(
-                "IPC_RECV_RETURN_META tid={} cap={} ret0={} ret1={} ret2={} flags={}",
+                "IPC_RECV_OUT_META_WRITE tid={} opcode={} payload_len={} cap_id={} flags={} sender_tid={}",
                 receiver_tid,
-                frame.arg(SYSCALL_ARG_CAP),
-                sender,
+                msg.opcode,
                 msg.len as usize,
                 frame.ret2(),
                 recv_meta_flags
+                ,
+                msg.sender_tid.0
             );
 
             if current_task_has_user_asid(kernel)? {
@@ -1052,7 +1053,8 @@ fn handle_ipc_recv_result_with_empty_error(
                             SyscallError::from(e)
                         })?;
                     kernel.note_shared_mem_mapped(mapped_len);
-                    frame.set_ok(sender, mapped_len, frame.ret2());
+                    frame.set_ok(0, mapped_len, frame.ret2());
+                    crate::yarm_log!("IPC_RECV_RETURN_SUCCESS tid={} x0=0", receiver_tid);
                     frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, mapped_va);
                     frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, region_len);
                     return Ok(());
@@ -1069,7 +1071,8 @@ fn handle_ipc_recv_result_with_empty_error(
                             user_ptr,
                             msg.len
                         );
-                        frame.set_ok(sender, msg.len as usize, frame.ret2());
+                        frame.set_ok(0, msg.len as usize, frame.ret2());
+                        crate::yarm_log!("IPC_RECV_RETURN_SUCCESS tid={} x0=0", receiver_tid);
                     }
                     Err(KernelError::UserMemoryFault) => {
                         crate::yarm_log!(
@@ -1084,7 +1087,8 @@ fn handle_ipc_recv_result_with_empty_error(
                     Err(other) => return Err(SyscallError::from(other)),
                 };
             } else {
-                frame.set_ok(sender, msg.len as usize, frame.ret2());
+                frame.set_ok(0, msg.len as usize, frame.ret2());
+                crate::yarm_log!("IPC_RECV_RETURN_SUCCESS tid={} x0=0", receiver_tid);
                 crate::yarm_log!(
                     "IPC_RECV_WAKE_RETURN_REGS tid={} x0={} x1={} x2={} elr=na",
                     receiver_tid,
