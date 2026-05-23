@@ -242,7 +242,12 @@
   - an alternate payload path that preserves existing syscall argument ABI compatibility.
 
 - IPC receive metadata now distinguishes `reply_cap` (for `ipc_reply`) from `transferred_cap` (application-transferred object capability).
-
+- **IPC_RECV_V2 metadata is returned only via the out-meta pointer** (`IpcRecvMetaV2` memory write).
+- `x0` is only syscall success/error for recv; metadata is not returned via `x0/x1/x2/x5`.
+- Recv metadata flags in `IpcRecvMetaV2.recv_meta_flags`:
+  - `RECV_META_REPLY_CAP = 1<<0`
+  - `RECV_META_TRANSFERRED_CAP = 1<<1`
+- Cap-kind decode must use `recv_meta_flags`; no opcode/payload heuristic inference is valid.
+- Reply payloads are never opcode-prefix stripped.
+- Legacy 2-byte opcode-prefix stripping applies only to inline request-framed messages (`OPCODE_INLINE` request path), exactly once.
 - Current limitation: `ipc_call` carries a kernel reply capability; simultaneous application cap transfer in the same call message is not yet supported by syscall ABI v2.
-
-- Recv metadata flags (ret5): RECV_META_REPLY_CAP=1<<0, RECV_META_TRANSFERRED_CAP=1<<1; cap-kind decode must use flags, not opcode heuristics.

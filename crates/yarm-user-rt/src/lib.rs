@@ -62,15 +62,6 @@ pub mod syscall {
     const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
     const SYSCALL_RECV_META_TRANSFERRED_CAP: usize = 1 << 1;
 
-    #[used]
-    #[unsafe(link_section = ".rodata")]
-    static USER_RT_RECV_BEFORE_SYSCALL_MARKER: [u8; 28] = *b"USER_RT_RECV_BEFORE_SYSCALL\0";
-
-    #[used]
-    #[unsafe(link_section = ".rodata")]
-    static USER_RT_RECV_AFTER_SYSCALL_MARKER: [u8; 27] = *b"USER_RT_RECV_AFTER_SYSCALL\0";
-
-
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReceivedMessage {
         pub message: Message,
@@ -89,6 +80,7 @@ pub mod syscall {
         recv_meta_flags: u64,
         sender_tid: u64,
     }
+    const _: () = assert!(core::mem::size_of::<IpcRecvMetaV2>() == 40);
 
     pub trait IpcTransport {
         fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError>;
@@ -264,28 +256,8 @@ pub mod syscall {
             core::mem::size_of::<IpcRecvMetaV2>(),
             SYSCALL_RECV_MAP_INTENT_DEFAULT,
         ];
-        crate::user_log!(
-            "USER_RT_IPC_RECV_V2_ARGS cap={} buf=0x{:x} len={} meta_ptr=0x{:x} meta_len={} flags={}",
-            args[0], args[1], args[2], args[3], args[4], args[5]
-        );
-        crate::user_log!(
-            "USER_RT_RECV_BEFORE_SYSCALL cap={} buf=0x{:x} len={}",
-            args[0],
-            args[1],
-            args[2]
-        );
         // SAFETY: Uses architecture syscall ABI to enter kernel.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_NR, args) };
-        crate::user_log!(
-            "USER_RT_RECV_RAW ret0={} ret1={} ret2={} ret3={} ret5={} buf_ptr=0x{:x} buf_len={}",
-            ret.ret0,
-            ret.ret1,
-            ret.ret2,
-            ret.ret3,
-            ret.ret5,
-            args[1],
-            args[2]
-        );
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
             let err = decode_syscall_error(ret.error);
@@ -308,15 +280,6 @@ pub mod syscall {
         } else {
             Some(meta.cap_id as u32)
         };
-        crate::user_log!(
-            "USER_RT_RECV_META_FROM_MEM status={} opcode={} payload_len={} cap_id={} flags={} sender_tid={}",
-            meta.status,
-            opcode,
-            data_len,
-            returned_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP),
-            meta.recv_meta_flags,
-            meta.sender_tid,
-        );
         let preview_len = core::cmp::min(data_len, 32);
         let _ = preview_len;
         let recv_meta_flags = meta.recv_meta_flags as usize;
@@ -359,12 +322,6 @@ pub mod syscall {
             (&mut meta as *mut IpcRecvMetaV2) as usize,
             core::mem::size_of::<IpcRecvMetaV2>(),
         ];
-        crate::user_log!(
-            "USER_RT_RECV_BEFORE_SYSCALL cap={} buf=0x{:x} len={}",
-            args[0],
-            args[1],
-            args[2]
-        );
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_TIMEOUT_NR, args) };
         crate::user_log!(
             "USER_RT_RECV_AFTER_SYSCALL x0={} x1={} x2={} x3={}",
@@ -411,20 +368,6 @@ pub mod syscall {
         } else {
             0
         };
-        crate::user_log!(
-            "USER_RT_RECV_DEADLINE_META_FROM_MEM status={} opcode={} payload_len={} cap_id={} flags={} sender_tid={}",
-            meta.status,
-            meta.opcode,
-            len,
-            returned_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
-            meta.recv_meta_flags,
-            meta.sender_tid
-        );
-        let preview_len = core::cmp::min(len, 32);
-        crate::user_log!(
-            "USER_RT_RECV_DEADLINE_PAYLOAD_PREFIX {:02x?}",
-            &payload[..preview_len]
-        );
         let msg = Message::with_header(meta.sender_tid, meta.opcode, flags, transfer_cap, &payload[..len])
             .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some(msg))
@@ -621,10 +564,6 @@ pub mod syscall {
             startup_args.as_ptr() as usize,  // arg4 = startup_args_ptr
             startup_args.len(),              // arg5 = startup_args_count
         ];
-        crate::user_log!(
-            "USER_RT_SPAWN_FROM_INITRAMFS_ARGS path_ptr=0x{:x} path_len={} parent_pid={} cap0={} cap1={}",
-            args[1], args[2], parent_pid, startup_args[13], startup_args[14]
-        );
         #[cfg(all(target_arch = "aarch64", not(test)))]
         {
             let lr: usize;
@@ -650,10 +589,6 @@ pub mod syscall {
             );
         }
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR, args) };
-        crate::user_log!(
-            "USER_RT_SPAWN_FROM_INITRAMFS_RET ret0={} ret1={} ret2={}",
-            ret.ret0, ret.ret1, ret.ret2
-        );
         #[cfg(all(target_arch = "aarch64", not(test)))]
         {
             let lr: usize;
