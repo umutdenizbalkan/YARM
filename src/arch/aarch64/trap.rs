@@ -103,13 +103,13 @@ fn restore_arch_thread_state(
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X4, frame.arg(4));
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X5, frame.arg(5));
     }
-    crate::yarm_log!(
+    trap_trace!(
         "AARCH64_FIRST_ENTRY_ARGS tid={} x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x} x4=0x{:x} x5=0x{:x}",
         current_tid,
         frame.arg(0), frame.arg(1), frame.arg(2),
         frame.arg(3), frame.arg(4), frame.arg(5)
     );
-    crate::yarm_log!(
+    trap_trace!(
         "AARCH64_CONTEXT_RESTORE_FULL tid={} elr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x29=0x{:016x} x30=0x{:016x} ctx_ptr=0x{:x}",
         current_tid,
         frame.saved_pc() as u64,
@@ -337,7 +337,7 @@ pub fn handle_trap_entry(
     if !task_switched && matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
             export_syscall_result_to_user_gprs(trapframe);
-            crate::yarm_log!(
+            trap_trace!(
                 "AARCH64_POST_RESTORE_EXPORT tid={} x0={} x1={} x2={}",
                 kernel.current_tid().unwrap_or(0),
                 trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),
@@ -350,11 +350,11 @@ pub fn handle_trap_entry(
     if task_switched {
         // Returning to a different thread: registers are sourced from saved user context.
         if let Some(trapframe) = frame.as_deref_mut() {
-            crate::yarm_log!(
+            trap_trace!(
                 "AARCH64_RETURN_CONTEXT_SOURCE tid={} source=saved_context",
                 exiting_tid.unwrap_or(0)
             );
-            crate::yarm_log!(
+            trap_trace!(
                 "AARCH64_RETURNING_SAVED_CONTEXT tid={} elr=0x{:016x}",
                 exiting_tid.unwrap_or(0),
                 trapframe.saved_pc() as u64
@@ -380,7 +380,7 @@ pub fn handle_trap_entry(
                     trapframe.arg(4)
                 );
             }
-            crate::yarm_log!(
+            trap_trace!(
                 "AARCH64_RETURN_CONTEXT_SOURCE tid={} source=trapframe",
                 kernel.current_tid().unwrap_or(0)
             );

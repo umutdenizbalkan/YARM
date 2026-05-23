@@ -659,22 +659,24 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
             Ok(())
         }
     }
-    let mut line = [0u8; 160];
-    let mut writer = FixedBufWriter {
-        buf: &mut line,
-        len: 0,
-    };
-    let _ = write!(
-        writer,
-        "YARM_AARCH64_EXCEPTION_REGS esr_el1=0x{:016x} far_el1=0x{:016x} elr_el1=0x{:016x} spsr_el1=0x{:016x}",
-        frame.esr_el1,
-        frame.far_el1,
-        crate::arch::aarch64::boot::last_vector_raw_elr(),
-        frame.spsr_el1
-    );
-    let line_len = writer.len;
-    if let Ok(msg) = core::str::from_utf8(&line[..line_len]) {
-        crate::arch::aarch64::console::write_line(msg);
+    if AARCH64_TRAP_TRACE {
+        let mut line = [0u8; 160];
+        let mut writer = FixedBufWriter {
+            buf: &mut line,
+            len: 0,
+        };
+        let _ = write!(
+            writer,
+            "YARM_AARCH64_EXCEPTION_REGS esr_el1=0x{:016x} far_el1=0x{:016x} elr_el1=0x{:016x} spsr_el1=0x{:016x}",
+            frame.esr_el1,
+            frame.far_el1,
+            crate::arch::aarch64::boot::last_vector_raw_elr(),
+            frame.spsr_el1
+        );
+        let line_len = writer.len;
+        if let Ok(msg) = core::str::from_utf8(&line[..line_len]) {
+            crate::arch::aarch64::console::write_line(msg);
+        }
     }
     let is_irq_kind = matches!(kind, 2 | 6 | 10 | 14);
     let trap_cpu =
@@ -703,7 +705,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         {
             write_trapframe_back_to_vector_frame(frame, &trap_frame);
             let log_tid = shared.with(|k| k.current_tid()).unwrap_or(0);
-            crate::yarm_log!(
+            boot_trace!(
                 "AARCH64_VECTOR_FRAME_FINAL tid={} x0={} x1={} x2={}",
                 log_tid,
                 frame.gprs[0],
@@ -723,7 +725,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry fallback=1");
         let current_tid = kernel.current_tid();
         if current_tid == Some(1) {
-            crate::yarm_log!(
+            boot_trace!(
                 "AARCH64_HANDOFF_TRAP cpu={} tid={} ESR_EL1=0x{:016x} ELR_EL1=0x{:016x} FAR_EL1=0x{:016x} SPSR_EL1=0x{:016x}",
                 trap_cpu.0,
                 current_tid.unwrap_or(0),
@@ -754,7 +756,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         .is_ok()
         {
             write_trapframe_back_to_vector_frame(frame, &trap_frame);
-            crate::yarm_log!(
+            boot_trace!(
                 "AARCH64_VECTOR_FRAME_FINAL tid={} x0={} x1={} x2={}",
                 kernel.current_tid().unwrap_or(0),
                 frame.gprs[0],

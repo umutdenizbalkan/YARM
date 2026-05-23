@@ -1905,11 +1905,11 @@ fn handle_debug_log(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
     let a1 = frame.arg(1);
     let a2 = frame.arg(2);
     let tid = kernel.current_tid().unwrap_or(0);
-    crate::yarm_log!("DEBUG_LOG_ARGS tid={} a0=0x{:x} a1=0x{:x} a2=0x{:x}", tid, a0, a1, a2);
+    syscall_trace!("DEBUG_LOG_ARGS tid={} a0=0x{:x} a1=0x{:x} a2=0x{:x}", tid, a0, a1, a2);
     let user_ptr = a0;
     let raw_len = a1;
     let len = raw_len.min(Message::MAX_PAYLOAD);
-    crate::yarm_log!("DEBUG_LOG_ENTER tid={} ptr=0x{:x} len={}", tid, user_ptr, raw_len);
+    syscall_trace!("DEBUG_LOG_ENTER tid={} ptr=0x{:x} len={}", tid, user_ptr, raw_len);
     if user_ptr == 0 || len == 0 {
         frame.set_ok(0, 0, 0);
         return Ok(());
@@ -1917,12 +1917,12 @@ fn handle_debug_log(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
     let payload = match kernel.copy_from_current_user(user_ptr, len) {
         Ok(data) => data,
         Err(e) => {
-            crate::yarm_log!("DEBUG_LOG_COPY_FAIL tid={} err={:?}", tid, e);
+            syscall_trace!("DEBUG_LOG_COPY_FAIL tid={} err={:?}", tid, e);
             frame.set_ok(0, 0, 0);
             return Ok(());
         }
     };
-    crate::yarm_log!("DEBUG_LOG_COPY_OK tid={} len={}", tid, len);
+    syscall_trace!("DEBUG_LOG_COPY_OK tid={} len={}", tid, len);
     let msg_str = core::str::from_utf8(&payload[..len]).unwrap_or("<utf8_err>");
     crate::yarm_log!("USER_LOG tid={} msg={}", tid, msg_str);
     frame.set_ok(0, 0, 0);
