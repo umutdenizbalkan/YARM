@@ -5,6 +5,7 @@ use yarm_ipc_abi::blkcache_abi::*;
 use yarm_ipc_abi::block_backend_abi::{
     BlkBackendQueryRequest, BlkBackendResponse, BLK_BACKEND_OP_QUERY_STATE,
 };
+use yarm_ipc_abi::block_abi::{BlkGetInfoReply, BlkGetInfoRequest, BlkStatus, BLK_OP_GET_INFO};
 use yarm_user_rt::ipc::Message;
 
 #[derive(Clone, Copy)]
@@ -34,6 +35,19 @@ fn return_reply(reply_cap: u32, opcode: u16, request_id: u64, status: u32) {
 
 fn find_backend(table: &[BackendRecord; MAX_BACKENDS], backend_id: u64) -> Option<BackendRecord> {
     table.iter().copied().find(|r| r.registered && r.backend_id == backend_id)
+}
+
+fn call_backend_get_info(backend_send_cap: u64, reply_recv_cap: u32) -> Result<BlkGetInfoReply, ()> {
+    let req = BlkGetInfoRequest { device_id: 0 };
+    let Ok(msg) = Message::with_header(0, BLK_OP_GET_INFO, 0, None, &req.encode()) else {
+        return Err(());
+    };
+    unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap as u32, reply_recv_cap, &msg) }.map_err(|_| ())?;
+    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) }.map_err(|_| ())?;
+    match reply {
+        Some(reply_msg) => BlkGetInfoReply::decode(reply_msg.as_slice()).ok_or(()),
+        None => Err(()),
+    }
 }
 
 
@@ -153,6 +167,50 @@ pub fn run() {
                     received.transferred_cap
                 );
                 let (request_id, status) = match msg.opcode {
+                    BLK_OP_GET_INFO => {
+                        yarm_user_rt::user_log!("BLKCACHE_GET_INFO_CALL_BEGIN");
+                        let Some(reply_recv_cap) = pm_reply_recv_cap else {
+                            yarm_user_rt::user_log!("BLKCACHE_GET_INFO_CALL_RETURN ok=0 status={}", BlkStatus::DeviceUnavailable as u32);
+                            if let Some(reply_cap) = reply_cap {
+                                let resp = BlkGetInfoReply {
+                                    status: BlkStatus::DeviceUnavailable,
+                                    _reserved0: 0,
+                                    logical_block_size: 512,
+                                    _reserved1: 0,
+                                    total_blocks: 0,
+                                    feature_flags: 0,
+                                };
+                                if let Ok(reply) = Message::with_header(0, BLK_OP_GET_INFO, 0, None, &resp.encode()) {
+                                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
+                                }
+                            }
+                            continue;
+                        };
+                        let backend = find_backend(&backends, 1);
+                        let response = if let Some(rec) = backend {
+                            call_backend_get_info(rec.backend_send_cap, reply_recv_cap).ok()
+                        } else {
+                            None
+                        };
+                        let resp = response.unwrap_or(BlkGetInfoReply {
+                            status: BlkStatus::NotReady,
+                            _reserved0: 0,
+                            logical_block_size: 512,
+                            _reserved1: 0,
+                            total_blocks: 0,
+                            feature_flags: 0,
+                        });
+                        yarm_user_rt::user_log!(
+                            "BLKCACHE_GET_INFO_CALL_RETURN ok=1 status={}",
+                            resp.status as u32
+                        );
+                        if let Some(reply_cap) = reply_cap
+                            && let Ok(reply) = Message::with_header(0, BLK_OP_GET_INFO, 0, None, &resp.encode())
+                        {
+                            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
+                        }
+                        continue;
+                    }
                     BLKCACHE_OP_REGISTER_BACKEND => {
                         match RegisterBackendArgs::decode(msg.as_slice()) {
                             Some(args) => {

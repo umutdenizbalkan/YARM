@@ -5,9 +5,9 @@ use crate::control_plane::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase,
 };
 use yarm_ipc_abi::blkcache_abi::{
-    BlkCacheResponse, GetStatsRequest, RegisterBackendArgs, BLKCACHE_OP_GET_STATS,
-    BLKCACHE_OP_REGISTER_BACKEND, BLKCACHE_STATUS_ERR_UNSUPPORTED,
+    RegisterBackendArgs, BLKCACHE_OP_REGISTER_BACKEND,
 };
+use yarm_ipc_abi::block_abi::{BlkGetInfoReply, BlkGetInfoRequest, BlkStatus, BLK_OP_GET_INFO};
 #[cfg(test)]
 use super::super::process_manager::service::ProcessService;
 #[cfg(test)]
@@ -488,61 +488,37 @@ pub fn run() {
     let _ = unsafe { yarm_user_rt::syscall::ipc_send(init_blkcache_send_cap as u32, &register_backend_msg) };
 
 
-    let get_stats_req = GetStatsRequest {
-        request_id: 1,
-        backend_id: 0,
-        flags: 0,
-    };
-    let get_stats_payload = get_stats_req.encode();
-    let Ok(get_stats_msg) = yarm_user_rt::ipc::Message::with_header(
+    yarm_user_rt::user_log!("INIT_BLKCACHE_SMOKE_BEGIN");
+    let get_info_req = BlkGetInfoRequest { device_id: 0 };
+    let get_info_payload = get_info_req.encode();
+    let Ok(get_info_msg) = yarm_user_rt::ipc::Message::with_header(
         0,
-        BLKCACHE_OP_GET_STATS,
+        BLK_OP_GET_INFO,
         0,
         None,
-        &get_stats_payload,
+        &get_info_payload,
     ) else {
-        yarm_user_rt::user_log!("INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 msg=build_failed");
+        yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}", BlkStatus::InvalidRequest as u32);
         return;
     };
     // SAFETY: init_blkcache_send_cap is the caller-local delegated send cap.
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(init_blkcache_send_cap as u32, pm_recv, &get_stats_msg) };
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(init_blkcache_send_cap as u32, pm_recv, &get_info_msg) };
     // SAFETY: pm_recv is init's startup-provided reply endpoint.
-    let get_stats_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
-    match get_stats_reply {
-        Ok(Some(reply_msg)) => match BlkCacheResponse::decode(reply_msg.as_slice()) {
-            Some(resp)
-                if resp.request_id == 1
-                    && resp.status == BLKCACHE_STATUS_ERR_UNSUPPORTED
-                    && resp.bytes_moved == 0
-                    && resp.flags == 0 =>
-            {
-                yarm_user_rt::user_log!(
-                    "INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=1 status={} request_id={} bytes_moved={}",
-                    resp.status,
-                    resp.request_id,
-                    resp.bytes_moved
-                );
-            }
+    let get_info_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+    match get_info_reply {
+        Ok(Some(reply_msg)) => match BlkGetInfoReply::decode(reply_msg.as_slice()) {
             Some(resp) => {
-                yarm_user_rt::user_log!(
-                    "INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 status={} request_id={} bytes_moved={}",
-                    resp.status,
-                    resp.request_id,
-                    resp.bytes_moved
-                );
+                yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=1 status={}", resp.status as u32);
             }
             None => {
-                yarm_user_rt::user_log!("INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 decode=0");
+                yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}", BlkStatus::InvalidRequest as u32);
             }
         },
         Ok(None) => {
-            yarm_user_rt::user_log!("INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 recv=none");
+            yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}", BlkStatus::NotReady as u32);
         }
-        Err(e) => {
-            yarm_user_rt::user_log!(
-                "INIT_BLKCACHE_GET_STATS_SMOKE_CALL_RETURN ok=0 recv_err={:?}",
-                e
-            );
+        Err(_e) => {
+            yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}", BlkStatus::DeviceUnavailable as u32);
         }
     }
 

@@ -7,8 +7,8 @@ use core::mem::{align_of, size_of};
 pub const IPC_INLINE_PAYLOAD_MAX_BYTES: usize = 128;
 pub const BLK_SECTOR_SIZE: u32 = 512;
 
-pub const BLK_OP_GET_INFO: u16 = 1;
-pub const BLK_OP_READ: u16 = 2;
+pub const BLK_OP_GET_INFO: u16 = 0x0201;
+pub const BLK_OP_READ: u16 = 0x0202;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
@@ -32,6 +32,18 @@ pub const BLK_IPC_MAX_DATA_BYTES: usize =
 pub struct BlkGetInfoRequest {
     pub device_id: u64,
 }
+impl BlkGetInfoRequest {
+    pub const ENCODED_LEN: usize = 8;
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        self.device_id.to_le_bytes()
+    }
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        Some(Self { device_id: u64::from_le_bytes(b.try_into().ok()?) })
+    }
+}
 
 #[repr(C, align(8))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -42,6 +54,42 @@ pub struct BlkGetInfoReply {
     pub _reserved1: u32,
     pub total_blocks: u64,
     pub feature_flags: u64,
+}
+impl BlkGetInfoReply {
+    pub const ENCODED_LEN: usize = 32;
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0..4].copy_from_slice(&(self.status as u32).to_le_bytes());
+        out[4..8].copy_from_slice(&self._reserved0.to_le_bytes());
+        out[8..12].copy_from_slice(&self.logical_block_size.to_le_bytes());
+        out[12..16].copy_from_slice(&self._reserved1.to_le_bytes());
+        out[16..24].copy_from_slice(&self.total_blocks.to_le_bytes());
+        out[24..32].copy_from_slice(&self.feature_flags.to_le_bytes());
+        out
+    }
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        let status = match u32::from_le_bytes(b[0..4].try_into().ok()?) {
+            0 => BlkStatus::Success,
+            1 => BlkStatus::InvalidAlignment,
+            2 => BlkStatus::OversizedRequest,
+            3 => BlkStatus::DeviceUnavailable,
+            4 => BlkStatus::NotReady,
+            5 => BlkStatus::IOError,
+            6 => BlkStatus::InvalidRequest,
+            _ => return None,
+        };
+        Some(Self {
+            status,
+            _reserved0: u32::from_le_bytes(b[4..8].try_into().ok()?),
+            logical_block_size: u32::from_le_bytes(b[8..12].try_into().ok()?),
+            _reserved1: u32::from_le_bytes(b[12..16].try_into().ok()?),
+            total_blocks: u64::from_le_bytes(b[16..24].try_into().ok()?),
+            feature_flags: u64::from_le_bytes(b[24..32].try_into().ok()?),
+        })
+    }
 }
 
 #[repr(C, align(8))]

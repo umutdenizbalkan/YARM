@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm_ipc_abi::block_backend_abi::*;
+use yarm_ipc_abi::block_abi::{BlkGetInfoReply, BlkGetInfoRequest, BlkStatus, BLK_OP_GET_INFO};
 use yarm_user_rt::ipc::Message;
 
 fn decode_query_request(msg: &Message) -> Result<BlkBackendQueryRequest, i32> {
@@ -38,6 +39,26 @@ pub fn run() {
                     let msg = received.message;
                     let Some(reply_cap) = received.reply_cap else { continue; };
                 let (req_id, status) = match msg.opcode {
+                    BLK_OP_GET_INFO => {
+                        yarm_user_rt::user_log!("VIRTIO_BLK_GET_INFO_REQUEST");
+                        let status = match BlkGetInfoRequest::decode(msg.as_slice()) {
+                            Some(_) => BlkStatus::NotReady,
+                            None => BlkStatus::InvalidRequest,
+                        };
+                        let reply = BlkGetInfoReply {
+                            status,
+                            _reserved0: 0,
+                            logical_block_size: 512,
+                            _reserved1: 0,
+                            total_blocks: 0,
+                            feature_flags: 0,
+                        };
+                        yarm_user_rt::user_log!("VIRTIO_BLK_GET_INFO_REPLY status={}", status as u32);
+                        if let Ok(msg) = Message::with_header(0, BLK_OP_GET_INFO, 0, None, &reply.encode()) {
+                            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &msg) };
+                        }
+                        continue;
+                    }
                     BLK_BACKEND_OP_QUERY_STATE => {
                         yarm_user_rt::user_log!("VIRTIO_BLK_OP_QUERY_STATE");
                         match decode_query_request(&msg) { Ok(req) => (req.req_id, BLK_BACKEND_STATUS_EAGAIN), Err(e) => (0, e) }
