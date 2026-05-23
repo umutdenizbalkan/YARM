@@ -259,7 +259,20 @@ pub mod syscall {
             SYSCALL_RECV_MAP_INTENT_DEFAULT,
         ];
         // SAFETY: Uses architecture syscall ABI to enter kernel.
-        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_NR, args) };
+        let mut ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_NR, args) };
+        if ret.ret0 == ep_cap as usize && meta.status == u64::MAX {
+            crate::user_log!(
+                "USER_RT_RECV_V2_INTERNAL_REASON reason=legacy_ret0_cap_retry ret0={} status={} opcode={} flags={} len={}",
+                ret.ret0,
+                meta.status,
+                meta.opcode,
+                meta.flags,
+                meta.payload_len
+            );
+            // SAFETY: bounded single retry to handle stale return-lane resumes where
+            // x0 still carries recv cap and out-meta was not written.
+            ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_NR, args) };
+        }
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
             let err = decode_syscall_error(ret.error);
