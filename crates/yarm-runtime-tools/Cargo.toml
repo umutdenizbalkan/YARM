@@ -9,6 +9,7 @@ autobins = false
 [features]
 default = ["hosted-dev"]
 hosted-dev = []
+legacy-tests = []
 
 [dependencies]
 yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
@@ -16,4 +17,4 @@ yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
 [[bin]]
 name = "core_profile_smoke"
 path = "src/bin/core_profile_smoke.rs"
-required-features = ["hosted-dev"]
+required-features = ["hosted-dev", "legacy-tests"]

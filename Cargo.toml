@@ -32,6 +32,7 @@ posix-compat = []
 linux-compat = ["posix-compat"]
 trace_boot_vm = []
 trace_frame_alloc = []
+legacy-tests = []
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }
