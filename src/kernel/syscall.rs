@@ -820,25 +820,12 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         sender_tid,
         endpoint_idx
     );
-    let received = kernel
-        .ipc_recv(reply_recv_cap)
-        .map_err(SyscallError::from)?;
-    if let Some(reply) = received {
-        let reply_sender = sender_tid_to_ret(reply.sender_tid.0)?;
-        frame.set_ok(reply_sender, reply.len as usize, 0);
-        let words =
-            pack_register_payload(reply.as_slice()).map_err(|_| SyscallError::InvalidArgs)?;
-        frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, words[0]);
-        frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
-        encode_transfer_cap_ret(frame, None)?;
-    } else {
-        crate::yarm_log!(
-            "IPC_CALL_BLOCK_ON_REPLY tid={} reply_endpoint={} saved_elr=na",
-            sender_tid,
-            reply_recv_cap.0
-        );
-        return Err(SyscallError::WouldBlock);
-    }
+    // IPC_CALL is request-send only in the current userspace contract. The caller
+    // receives replies via an explicit recv on reply_recv_cap (ipc_recv_v2 /
+    // ipc_recv_with_deadline), so the call syscall must not consume/decode reply
+    // payload bytes here.
+    frame.set_ok(0, 0, 0);
+    encode_transfer_cap_ret(frame, None)?;
     Ok(())
 }
 
@@ -2563,6 +2550,50 @@ mod tests {
             ))
         );
         assert_ne!(state.current_tid(), Some(0));
+    }
+
+    #[test]
+    fn ipc_call_does_not_fail_after_delivery_when_reply_endpoint_has_large_reply() {
+        let mut state = Bootstrap::init().expect("kernel");
+        state.register_task(1).expect("server");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+
+        let (_call_eid, call_send_cap, call_recv_cap_global) =
+            state.create_endpoint(4).expect("call ep");
+        let call_recv_cap = state
+            .grant_capability_task_to_task(0, call_recv_cap_global, 1)
+            .expect("dup recv cap");
+        let (_reply_eid, reply_send_cap, reply_recv_cap) = state.create_endpoint(4).expect("reply ep");
+
+        // Seed reply endpoint with a payload larger than register lanes.
+        let big_reply = Message::new(1, &[0u8; 24]).expect("reply");
+        state
+            .ipc_send(reply_send_cap, big_reply)
+            .expect("seed reply queue");
+
+        state.yield_current().expect("switch receiver");
+        let mut block_recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [call_recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut block_recv).expect("block recv");
+        assert_eq!(state.current_tid(), Some(0));
+
+        let payload_word = usize::from_le_bytes(*b"call0000");
+        let mut call = TrapFrame::new(
+            Syscall::IpcCall as usize,
+            [
+                call_send_cap.0 as usize,
+                0,
+                8,
+                payload_word,
+                0,
+                reply_recv_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut call).expect("ipc call should not fail");
+        assert_eq!(call.error_code(), None);
     }
 
     #[test]
