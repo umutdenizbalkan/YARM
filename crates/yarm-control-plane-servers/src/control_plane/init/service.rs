@@ -406,76 +406,6 @@ pub fn run() {
         vfs_recv_cap, initramfs_send_cap, devfs_send_cap
     );
 
-    // --- VFS smoke: one real statx request through the routing stack ---
-    {
-        yarm_user_rt::user_log!("INIT_VFS_SMOKE_BEGIN path=/initramfs/boot-marker");
-        let vfs_send = vfs_recv_cap as u32;
-        yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_BEGIN");
-        // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
-        match unsafe {
-            yarm_user_rt::vfs_client::vfs_statx(vfs_send, pm_recv, b"/initramfs/boot-marker")
-        } {
-            Ok(status) => {
-                yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_RETURN ok=1 status={}", status)
-            }
-            Err(_) => yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_RETURN ok=0 status=0"),
-        }
-    }
-
-    // --- /dev smoke: prove VFS routing to devfs_srv ---
-    {
-        yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_BEGIN path=/dev/null");
-        let vfs_send = vfs_recv_cap as u32;
-        yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_BEGIN");
-        // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
-        match unsafe {
-            yarm_user_rt::vfs_client::vfs_statx(vfs_send, pm_recv, b"/dev/null")
-        } {
-            Ok(status) => {
-                yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_RETURN ok=1 status={}", status)
-            }
-            Err(_) => yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_RETURN ok=0 status=0"),
-        }
-    }
-
-    // --- VFS open/read smoke ---
-    {
-        yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_BEGIN path=/initramfs/boot-marker");
-        let vfs_send = vfs_recv_cap as u32;
-        let mut read_buf = [0u8; 64];
-        // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
-        match unsafe {
-            yarm_user_rt::vfs_client::vfs_openat(vfs_send, pm_recv, b"/initramfs/boot-marker", 0)
-        } {
-            Ok(fd) => {
-                yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_CALL_RETURN ok=1 fd={}", fd);
-                yarm_user_rt::user_log!("INIT_VFS_READ_SMOKE_BEGIN fd={}", fd);
-                match unsafe {
-                    yarm_user_rt::vfs_client::vfs_read(vfs_send, pm_recv, fd, &mut read_buf)
-                } {
-                    Ok(n) => {
-                        yarm_user_rt::user_log!("INIT_VFS_READ_SMOKE_CALL_RETURN ok=1 len={}", n)
-                    }
-                    Err(_) => {
-                        yarm_user_rt::user_log!("INIT_VFS_READ_SMOKE_CALL_RETURN ok=0 len=0")
-                    }
-                }
-                yarm_user_rt::user_log!("INIT_VFS_CLOSE_SMOKE_BEGIN fd={}", fd);
-                // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
-                match unsafe { yarm_user_rt::vfs_client::vfs_close(vfs_send, pm_recv, fd) } {
-                    Ok(status) => yarm_user_rt::user_log!(
-                        "INIT_VFS_CLOSE_SMOKE_CALL_RETURN ok=1 status={}",
-                        status
-                    ),
-                    Err(_) => {
-                        yarm_user_rt::user_log!("INIT_VFS_CLOSE_SMOKE_CALL_RETURN ok=0 status=1")
-                    }
-                }
-            }
-            Err(_) => yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_CALL_RETURN ok=0 fd=0"),
-        }
-    }
-
     // --- Spawn driver_manager (image_id=7) ---
     // No service caps required at spawn time; driver_manager blocks on its own
     // recv endpoint waiting for driver registration requests.
@@ -548,6 +478,81 @@ pub fn run() {
     };
     yarm_user_rt::user_log!("INIT_BLKCACHE_REGISTER_BACKEND_SEND_NO_REPLY");
     let _ = unsafe { yarm_user_rt::syscall::ipc_send(init_blkcache_send_cap as u32, &register_backend_msg) };
+
+    // NOTE: Keep SpawnV5/PM reply traffic isolated until the full service spawn
+    // chain is complete. Since ipc_call is now send-only and replies are consumed
+    // via explicit recv on pm_recv, interleaving VFS smoke calls here can enqueue
+    // non-PM replies on the same endpoint and contaminate SpawnV5 recv/decode.
+    // Run VFS smokes only after all SpawnV5 calls have completed.
+    // --- VFS smoke: one real statx request through the routing stack ---
+    {
+        yarm_user_rt::user_log!("INIT_VFS_SMOKE_BEGIN path=/initramfs/boot-marker");
+        let vfs_send = vfs_recv_cap as u32;
+        yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_BEGIN");
+        // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
+        match unsafe {
+            yarm_user_rt::vfs_client::vfs_statx(vfs_send, pm_recv, b"/initramfs/boot-marker")
+        } {
+            Ok(status) => {
+                yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_RETURN ok=1 status={}", status)
+            }
+            Err(_) => yarm_user_rt::user_log!("INIT_VFS_SMOKE_CALL_RETURN ok=0 status=0"),
+        }
+    }
+
+    // --- /dev smoke: prove VFS routing to devfs_srv ---
+    {
+        yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_BEGIN path=/dev/null");
+        let vfs_send = vfs_recv_cap as u32;
+        yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_BEGIN");
+        // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
+        match unsafe {
+            yarm_user_rt::vfs_client::vfs_statx(vfs_send, pm_recv, b"/dev/null")
+        } {
+            Ok(status) => {
+                yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_RETURN ok=1 status={}", status)
+            }
+            Err(_) => yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_RETURN ok=0 status=0"),
+        }
+    }
+
+    // --- VFS open/read smoke ---
+    {
+        yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_BEGIN path=/initramfs/boot-marker");
+        let vfs_send = vfs_recv_cap as u32;
+        let mut read_buf = [0u8; 64];
+        // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
+        match unsafe {
+            yarm_user_rt::vfs_client::vfs_openat(vfs_send, pm_recv, b"/initramfs/boot-marker", 0)
+        } {
+            Ok(fd) => {
+                yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_CALL_RETURN ok=1 fd={}", fd);
+                yarm_user_rt::user_log!("INIT_VFS_READ_SMOKE_BEGIN fd={}", fd);
+                match unsafe {
+                    yarm_user_rt::vfs_client::vfs_read(vfs_send, pm_recv, fd, &mut read_buf)
+                } {
+                    Ok(n) => {
+                        yarm_user_rt::user_log!("INIT_VFS_READ_SMOKE_CALL_RETURN ok=1 len={}", n)
+                    }
+                    Err(_) => {
+                        yarm_user_rt::user_log!("INIT_VFS_READ_SMOKE_CALL_RETURN ok=0 len=0")
+                    }
+                }
+                yarm_user_rt::user_log!("INIT_VFS_CLOSE_SMOKE_BEGIN fd={}", fd);
+                // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
+                match unsafe { yarm_user_rt::vfs_client::vfs_close(vfs_send, pm_recv, fd) } {
+                    Ok(status) => yarm_user_rt::user_log!(
+                        "INIT_VFS_CLOSE_SMOKE_CALL_RETURN ok=1 status={}",
+                        status
+                    ),
+                    Err(_) => {
+                        yarm_user_rt::user_log!("INIT_VFS_CLOSE_SMOKE_CALL_RETURN ok=0 status=1")
+                    }
+                }
+            }
+            Err(_) => yarm_user_rt::user_log!("INIT_VFS_OPEN_SMOKE_CALL_RETURN ok=0 fd=0"),
+        }
+    }
 
 
     yarm_user_rt::user_log!("INIT_BLKCACHE_SMOKE_BEGIN");
