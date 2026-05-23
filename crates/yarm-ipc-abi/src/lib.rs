@@ -11,3 +11,4 @@ pub mod socket_abi;
 pub mod supervisor_abi;
 pub mod vfs_abi;
 pub mod block_backend_abi;
+pub mod block_abi;
