@@ -400,7 +400,7 @@ impl SpawnV5CapResult {
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
-        if payload.len() < Self::ENCODED_LEN {
+        if payload.len() != Self::ENCODED_LEN {
             return Err(ProcCodecError::Malformed);
         }
         let mut a = [0u8; 8];
@@ -410,6 +410,16 @@ impl SpawnV5CapResult {
         let service_send_cap = u64::from_le_bytes(a);
         Ok(Self { pid, service_send_cap })
     }
+}
+
+#[inline]
+pub fn encode_spawn_v5_reply(child_tid: u64, service_send_cap: u64) -> [u8; SpawnV5CapResult::ENCODED_LEN] {
+    SpawnV5CapResult::new(child_tid, service_send_cap).encode()
+}
+
+#[inline]
+pub fn decode_spawn_v5_reply(payload: &[u8]) -> Result<SpawnV5CapResult, ProcCodecError> {
+    SpawnV5CapResult::decode(payload)
 }
 
 impl SpawnV3Args {
@@ -799,5 +809,26 @@ mod tests {
     fn lifecycle_query_reply_rejects_short_payload() {
         let short = [0u8; LifecycleQueryReply::ENCODED_LEN - 1];
         assert_eq!(LifecycleQueryReply::decode(&short), Err(ProcCodecError::Malformed));
+    }
+
+    #[test]
+    fn spawn_v5_reply_layout_is_stable_and_exact_len() {
+        assert_eq!(SpawnV5CapResult::ENCODED_LEN, 16);
+        let encoded = encode_spawn_v5_reply(10_000, 65_540);
+        assert_eq!(
+            encoded,
+            [0x10, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        let decoded = decode_spawn_v5_reply(&encoded).expect("decode");
+        assert_eq!(decoded.pid, 10_000);
+        assert_eq!(decoded.service_send_cap, 65_540);
+    }
+
+    #[test]
+    fn spawn_v5_reply_decode_rejects_non_exact_payload_len() {
+        let short = [0u8; SpawnV5CapResult::ENCODED_LEN - 1];
+        let long = [0u8; SpawnV5CapResult::ENCODED_LEN + 1];
+        assert_eq!(decode_spawn_v5_reply(&short), Err(ProcCodecError::Malformed));
+        assert_eq!(decode_spawn_v5_reply(&long), Err(ProcCodecError::Malformed));
     }
 }

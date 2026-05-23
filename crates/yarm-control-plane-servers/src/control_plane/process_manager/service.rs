@@ -17,6 +17,7 @@ use yarm_ipc_abi::process_abi::{
     PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2, RegisterSupervisedTask,
     SpawnV2Args, SpawnV3Args, SpawnV4Args, SpawnV5CapArgs, SpawnV5CapResult,
     TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args,
+    encode_spawn_v5_reply,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
@@ -1189,8 +1190,7 @@ impl ProcessService {
                         "PM_LIFECYCLE_RECORD image_id={} tid={} pm_service_send_cap={} parent_tid={} state=spawned recorded={}",
                         req.image_id, tid, pm_send_cap, req.parent_pid.0, recorded as u8
                     );
-                    let result = SpawnV5CapResult::new(tid, caller_cap);
-                    let encoded = result.encode();
+                    let encoded = encode_spawn_v5_reply(tid, caller_cap);
                     yarm_user_rt::user_log!(
                         "PM_SPAWN_V5_REPLY_BYTES len={} bytes={:x?}",
                         encoded.len(),

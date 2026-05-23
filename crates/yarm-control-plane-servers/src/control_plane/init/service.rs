@@ -269,7 +269,9 @@ fn spawn_v5_cap(
     service_caps: [u64; 4],
     parent_pid: u64,
 ) -> Option<(u64, u64)> {
-    use yarm_ipc_abi::process_abi::{PROC_OP_SPAWN_V5_CAP, SpawnV5CapArgs, SpawnV5CapResult};
+    use yarm_ipc_abi::process_abi::{
+        PROC_OP_SPAWN_V5_CAP, SpawnV5CapArgs, SpawnV5CapResult, decode_spawn_v5_reply,
+    };
     let args = SpawnV5CapArgs::new(parent_pid, image_id, service_caps);
     let encoded = args.encode();
     let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
@@ -294,7 +296,7 @@ fn spawn_v5_cap(
                 r.flags,
                 r.as_slice()
             );
-            match SpawnV5CapResult::decode(r.as_slice()) {
+            match decode_spawn_v5_reply(r.as_slice()) {
                 Ok(result) => {
                     yarm_user_rt::user_log!(
                         "INIT_SPAWN_V5_REPLY_DECODE ok=1 child_tid={}",
