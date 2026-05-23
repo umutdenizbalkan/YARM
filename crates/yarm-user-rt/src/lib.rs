@@ -288,25 +288,16 @@ pub mod syscall {
             return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        {
-            // x0 in 1..=9 is an error code when x1==0 && x2==0 (set_err zeroes all ret
-            // fields; export_syscall_result_to_user_gprs then sets x0=code, x1=0, x2=0).
-            // Also detect the pre-retry stale case: x1==buf_ptr && x2==FRAMED_MAX.
-            let is_exported_error = ret.ret1 == 0 && ret.ret2 == 0 && (1..=9).contains(&ret.ret0);
-            let is_stale_blocking = ret.ret1 == args[1] && ret.ret2 == args[2] && (1..=9).contains(&ret.ret0);
-            if is_exported_error || is_stale_blocking {
-                let err = decode_syscall_error(ret.ret0);
-                return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
-            }
+        if ret.ret0 != 0 {
+            let err = decode_syscall_error(ret.ret0);
+            return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
         }
-        let len = meta.payload_len as usize + 2;
-        // Must have at least the 2-byte opcode prefix.
-        if len < 2 || len > FRAMED_MAX {
+        let payload_len = meta.payload_len as usize;
+        if payload_len > Message::MAX_PAYLOAD || payload_len > FRAMED_MAX {
             return Err(SyscallError::Internal);
         }
-        // Extract application-level opcode from the first 2 bytes of the frame.
-        let opcode = u16::from_le_bytes([payload[0], payload[1]]);
-        let msg_payload = &payload[2..len];
+        let opcode = meta.opcode;
+        let msg_payload = &payload[..payload_len];
         let data_len = msg_payload.len();
         let returned_cap = if meta.cap_id == SYSCALL_NO_TRANSFER_CAP {
             None
@@ -314,12 +305,13 @@ pub mod syscall {
             Some(meta.cap_id as u32)
         };
         crate::user_log!(
-            "USER_RT_RECV_DECODE_OK status={} len={} opcode={} payload_len={} reply_cap={}",
-            ret.ret0,
-            len,
+            "USER_RT_RECV_META_FROM_MEM status={} opcode={} payload_len={} cap_id={} flags={} sender_tid={}",
+            meta.status,
             opcode,
             data_len,
-            returned_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP)
+            returned_cap.map(|c| c as u64).unwrap_or(SYSCALL_NO_TRANSFER_CAP),
+            meta.recv_meta_flags,
+            meta.sender_tid,
         );
         let preview_len = core::cmp::min(data_len, 32);
         let _ = preview_len;
