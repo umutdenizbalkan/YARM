@@ -1993,19 +1993,6 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
             blocking_syscall && caller_blocked
         );
         if blocking_syscall && caller_blocked {
-            // For IpcRecv/IpcRecvTimeout: mark the frame with WouldBlock so the
-            // ELR policy saves saved_pc = SVC (not SVC+4). When the task is woken
-            // it will re-execute the SVC, find the message in the queue, and receive
-            // the result correctly in x0/x1/x2. Without this, saved_pc = SVC+4 and
-            // the task resumes past the SVC with the original args still in registers.
-            if syscall == Syscall::IpcRecv {
-                frame.set_err(SyscallError::WouldBlock.code());
-                crate::yarm_log!(
-                    "IPC_RECV_BLOCKED_RETRY_SAVE tid={} nr={}",
-                    caller_tid.unwrap_or(0),
-                    frame.syscall_num()
-                );
-            }
             if kernel.current_tid() == caller_tid {
                 let _ = kernel.dispatch_next_task().map_err(SyscallError::from)?;
             }
