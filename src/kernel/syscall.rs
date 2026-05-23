@@ -50,10 +50,10 @@ pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;
 pub const SYSCALL_RET_STATUS: usize = 0;
 pub const SYSCALL_RET_AUX: usize = 1;
 pub const SYSCALL_RET_TRANSFER_CAP: usize = 2;
-pub const SYSCALL_RET_RECV_META_FLAGS: usize = 5;
 pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
 pub const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
 pub const SYSCALL_RECV_META_TRANSFERRED_CAP: usize = 1 << 1;
+const IPC_RECV_META_V2_ENCODED_LEN: usize = 40;
 pub const SYSCALL_VM_MAP_PROT_READ: usize = 0x1;
 pub const SYSCALL_VM_MAP_PROT_WRITE: usize = 0x2;
 pub const SYSCALL_VM_MAP_PROT_EXEC: usize = 0x4;
@@ -674,6 +674,8 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         endpoint,
         frame.arg(SYSCALL_ARG_PTR),
         frame.arg(SYSCALL_ARG_LEN),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
         received,
     )
 }
@@ -714,6 +716,8 @@ fn handle_ipc_recv_timeout(
         endpoint,
         user_ptr,
         user_len,
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+        frame.arg(SYSCALL_ARG_TRANSFER_CAP),
         received,
         if timed_out {
             SyscallError::TimedOut
@@ -897,6 +901,8 @@ fn handle_ipc_recv_result(
     endpoint: CapObject,
     user_ptr: usize,
     user_len: usize,
+    meta_ptr: usize,
+    meta_len: usize,
     received: Option<Message>,
 ) -> Result<(), SyscallError> {
     handle_ipc_recv_result_with_empty_error(
@@ -905,6 +911,8 @@ fn handle_ipc_recv_result(
         endpoint,
         user_ptr,
         user_len,
+        meta_ptr,
+        meta_len,
         received,
         SyscallError::WouldBlock,
     )
@@ -916,10 +924,11 @@ fn handle_ipc_recv_result_with_empty_error(
     endpoint: CapObject,
     user_ptr: usize,
     user_len: usize,
+    meta_ptr: usize,
+    meta_len: usize,
     received: Option<Message>,
     empty_error: SyscallError,
 ) -> Result<(), SyscallError> {
-    frame.set_arg(SYSCALL_RET_RECV_META_FLAGS, 0);
     match received {
         Some(msg) => {
             let recv_meta_flags = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
@@ -938,15 +947,27 @@ fn handle_ipc_recv_result_with_empty_error(
                 receiver_tid,
             )?;
             encode_transfer_cap_ret(frame, recv_local_transfer)?;
-            frame.set_arg(SYSCALL_RET_RECV_META_FLAGS, recv_meta_flags);
+            if meta_ptr == 0 || meta_len < IPC_RECV_META_V2_ENCODED_LEN {
+                return Err(SyscallError::InvalidArgs);
+            }
+            let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
+            meta[0..8].copy_from_slice(&(sender as u64).to_le_bytes());
+            meta[8..10].copy_from_slice(&msg.opcode.to_le_bytes());
+            meta[10..12].copy_from_slice(&msg.flags.to_le_bytes());
+            meta[12..16].copy_from_slice(&(msg.len as u32).to_le_bytes());
+            meta[16..24].copy_from_slice(&(frame.ret2() as u64).to_le_bytes());
+            meta[24..32].copy_from_slice(&(recv_meta_flags as u64).to_le_bytes());
+            meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
+            kernel
+                .copy_to_current_user(meta_ptr, &meta)
+                .map_err(SyscallError::from)?;
             crate::yarm_log!(
-                "IPC_RECV_RETURN_META tid={} cap={} ret0={} ret1={} ret2={} ret5={} flags={}",
+                "IPC_RECV_RETURN_META tid={} cap={} ret0={} ret1={} ret2={} flags={}",
                 receiver_tid,
                 frame.arg(SYSCALL_ARG_CAP),
                 sender,
                 msg.len as usize,
                 frame.ret2(),
-                frame.arg(SYSCALL_RET_RECV_META_FLAGS),
                 recv_meta_flags
             );
 

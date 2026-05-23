@@ -78,6 +78,17 @@ pub mod syscall {
         pub transferred_cap: Option<u32>,
         pub sender_tid: u64,
     }
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct IpcRecvMetaV2 {
+        status: u64,
+        opcode: u16,
+        flags: u16,
+        payload_len: u32,
+        cap_id: u64,
+        recv_meta_flags: u64,
+        sender_tid: u64,
+    }
 
     pub trait IpcTransport {
         fn send(&mut self, ep_cap: u32, msg: &Message) -> core::result::Result<(), SyscallError>;
@@ -242,13 +253,16 @@ pub mod syscall {
         // that ipc_call prepends. The kernel receives [opcode_lo, opcode_hi, ...data].
         const FRAMED_MAX: usize = 2 + Message::MAX_PAYLOAD;
         let mut payload = [0u8; FRAMED_MAX];
+        let mut meta = IpcRecvMetaV2 {
+            status: 0, opcode: 0, flags: 0, payload_len: 0, cap_id: SYSCALL_NO_TRANSFER_CAP, recv_meta_flags: 0, sender_tid: 0
+        };
         let args = [
             ep_cap as usize,
             payload.as_mut_ptr() as usize,
             FRAMED_MAX,
-            0,
+            (&mut meta as *mut IpcRecvMetaV2) as usize,
+            core::mem::size_of::<IpcRecvMetaV2>(),
             SYSCALL_RECV_MAP_INTENT_DEFAULT,
-            SYSCALL_NO_TRANSFER_CAP as usize,
         ];
         crate::user_log!(
             "USER_RT_RECV_BEFORE_SYSCALL cap={} buf=0x{:x} len={}",
@@ -285,7 +299,7 @@ pub mod syscall {
                 return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
             }
         }
-        let len = ret.ret1;
+        let len = meta.payload_len as usize + 2;
         // Must have at least the 2-byte opcode prefix.
         if len < 2 || len > FRAMED_MAX {
             return Err(SyscallError::Internal);
@@ -294,10 +308,10 @@ pub mod syscall {
         let opcode = u16::from_le_bytes([payload[0], payload[1]]);
         let msg_payload = &payload[2..len];
         let data_len = msg_payload.len();
-        let returned_cap = if ret.ret2 == SYSCALL_NO_TRANSFER_CAP as usize {
+        let returned_cap = if meta.cap_id == SYSCALL_NO_TRANSFER_CAP {
             None
         } else {
-            Some(ret.ret2 as u32)
+            Some(meta.cap_id as u32)
         };
         crate::user_log!(
             "USER_RT_RECV_DECODE_OK status={} len={} opcode={} payload_len={} reply_cap={}",
@@ -309,7 +323,7 @@ pub mod syscall {
         );
         let preview_len = core::cmp::min(data_len, 32);
         let _ = preview_len;
-        let recv_meta_flags = ret.ret5;
+        let recv_meta_flags = meta.recv_meta_flags as usize;
         let reply_cap = if (recv_meta_flags & SYSCALL_RECV_META_REPLY_CAP) != 0 {
             returned_cap
         } else {
@@ -328,9 +342,9 @@ pub mod syscall {
             transferred_cap,
             flags
         );
-        let msg = Message::with_header(ret.ret0 as u64, opcode, flags, transferred_cap.map(|c| c as u64), msg_payload)
+        let msg = Message::with_header(meta.sender_tid, opcode, flags, transferred_cap.map(|c| c as u64), msg_payload)
             .map_err(|_| SyscallError::InvalidArgs)?;
-        Ok(Some(ReceivedMessage { message: msg, reply_cap, transferred_cap, sender_tid: ret.ret0 as u64 }))
+        Ok(Some(ReceivedMessage { message: msg, reply_cap, transferred_cap, sender_tid: meta.sender_tid }))
     }
 
     #[inline]
