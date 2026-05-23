@@ -3,44 +3,51 @@
 
 use super::SyscallReturn;
 
+#[repr(C)]
+struct Aarch64SyscallFrame {
+    args: [usize; 6],
+    rets: [usize; 6],
+}
+
 #[inline]
 pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
-    let mut ret = [usize::MAX; 6];
-    let ret_ptr = ret.as_mut_ptr();
+    let mut frame = Aarch64SyscallFrame {
+        args,
+        rets: [usize::MAX; 6],
+    };
+    let mut frame_ptr = (&mut frame as *mut Aarch64SyscallFrame) as usize;
     // SAFETY: Follows kernel aarch64 trap ABI with `svc #0`.
     //
-    // We store x0..x5 directly to memory in the same asm block immediately
-    // after `svc`. This avoids LLVM register-allocation overlap hazards seen
-    // with inout/lateout patterns for higher return lanes (especially x5).
+    // Load x0..x5 from a single frame pointer pinned in x12, then store
+    // post-svc x0..x5 back into that same frame. This avoids input register
+    // write-order/overlap hazards from in("x0")..in("x5") constraints.
     unsafe {
         core::arch::asm!(
-            "mov x12, {ret_ptr}",
+            "ldr x0, [x12, #0]",
+            "ldr x1, [x12, #8]",
+            "ldr x2, [x12, #16]",
+            "ldr x3, [x12, #24]",
+            "ldr x4, [x12, #32]",
+            "ldr x5, [x12, #40]",
             "svc #0",
-            "str x0, [x12, #0]",
-            "str x1, [x12, #8]",
-            "str x2, [x12, #16]",
-            "str x3, [x12, #24]",
-            "str x4, [x12, #32]",
-            "str x5, [x12, #40]",
-            ret_ptr = in(reg) ret_ptr,
-            in("x0") args[0],
-            in("x1") args[1],
-            in("x2") args[2],
-            in("x3") args[3],
-            in("x4") args[4],
-            in("x5") args[5],
+            "str x0, [x12, #48]",
+            "str x1, [x12, #56]",
+            "str x2, [x12, #64]",
+            "str x3, [x12, #72]",
+            "str x4, [x12, #80]",
+            "str x5, [x12, #88]",
+            inout("x12") frame_ptr => _,
             in("x8") no,
-            lateout("x12") _,
             options(nostack),
         );
     }
     SyscallReturn {
-        ret0: ret[0],
-        ret1: ret[1],
-        ret2: ret[2],
-        ret3: ret[3],
-        ret4: ret[4],
-        ret5: ret[5],
+        ret0: frame.rets[0],
+        ret1: frame.rets[1],
+        ret2: frame.rets[2],
+        ret3: frame.rets[3],
+        ret4: frame.rets[4],
+        ret5: frame.rets[5],
         error: 0,
     }
 }
