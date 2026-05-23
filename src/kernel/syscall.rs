@@ -972,6 +972,14 @@ fn handle_ipc_recv_result_with_empty_error(
             meta[16..24].copy_from_slice(&(frame.ret2() as u64).to_le_bytes());
             meta[24..32].copy_from_slice(&(recv_meta_flags as u64).to_le_bytes());
             meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
+            crate::yarm_log!(
+                "IPC_RECV_OUT_META_REPLY status={} opcode={} len={} flags={} sender_tid={}",
+                sender,
+                app_opcode,
+                app_payload.len(),
+                msg.flags,
+                msg.sender_tid.0
+            );
             kernel
                 .copy_to_current_user(meta_ptr, &meta)
                 .map_err(SyscallError::from)?;
