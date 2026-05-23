@@ -289,14 +289,39 @@ fn spawn_v5_cap(
     match reply {
         Ok(Some(received)) => {
             let r = received.message;
+            let payload = r.as_slice();
+            yarm_user_rt::user_log!(
+                "INIT_SPAWN_V5_REPLY_RECV payload_len={} opcode={} flags={}",
+                payload.len(),
+                r.opcode,
+                r.flags
+            );
+            yarm_user_rt::user_log!(
+                "INIT_SPAWN_V5_REPLY_RECV_BYTES len={} bytes={:x?}",
+                payload.len(),
+                payload
+            );
+            yarm_user_rt::user_log!(
+                "INIT_SPAWN_V5_REPLY_DECODE_INPUT len={} bytes={:x?}",
+                payload.len(),
+                payload
+            );
+            if payload.len() != SpawnV5CapResult::ENCODED_LEN {
+                yarm_user_rt::user_log!(
+                    "INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0 reason=bad_len expected={} got={}",
+                    SpawnV5CapResult::ENCODED_LEN,
+                    payload.len()
+                );
+                return None;
+            }
             yarm_user_rt::user_log!(
                 "INIT_SPAWN_V5_REPLY_RECV len={} opcode={} flags={} bytes={:x?}",
                 r.len,
                 r.opcode,
                 r.flags,
-                r.as_slice()
+                payload
             );
-            match decode_spawn_v5_reply(r.as_slice()) {
+            match decode_spawn_v5_reply(payload) {
                 Ok(result) => {
                     yarm_user_rt::user_log!(
                         "INIT_SPAWN_V5_REPLY_DECODE ok=1 child_tid={}",
