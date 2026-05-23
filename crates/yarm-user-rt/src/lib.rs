@@ -254,7 +254,7 @@ pub mod syscall {
         const FRAMED_MAX: usize = 2 + Message::MAX_PAYLOAD;
         let mut payload = [0u8; FRAMED_MAX];
         let mut meta = IpcRecvMetaV2 {
-            status: 0, opcode: 0, flags: 0, payload_len: 0, cap_id: SYSCALL_NO_TRANSFER_CAP, recv_meta_flags: 0, sender_tid: 0
+            status: u64::MAX, opcode: 0, flags: 0, payload_len: 0, cap_id: SYSCALL_NO_TRANSFER_CAP, recv_meta_flags: 0, sender_tid: 0
         };
         let args = [
             ep_cap as usize,
@@ -288,7 +288,7 @@ pub mod syscall {
             return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret0 != 0 {
+        if ret.ret0 != 0 && meta.status == u64::MAX {
             let err = decode_syscall_error(ret.ret0);
             return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
         }
