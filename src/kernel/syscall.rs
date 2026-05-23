@@ -947,14 +947,25 @@ fn handle_ipc_recv_result_with_empty_error(
                 receiver_tid,
             )?;
             encode_transfer_cap_ret(frame, recv_local_transfer)?;
+            let raw_payload = msg.as_slice();
+            let (app_opcode, app_payload, stripped_prefix) =
+                if msg.opcode == OPCODE_INLINE && raw_payload.len() >= 2 {
+                    (
+                        u16::from_le_bytes([raw_payload[0], raw_payload[1]]),
+                        &raw_payload[2..],
+                        1usize,
+                    )
+                } else {
+                    (msg.opcode, raw_payload, 0usize)
+                };
             if meta_ptr == 0 || meta_len < IPC_RECV_META_V2_ENCODED_LEN {
                 return Err(SyscallError::InvalidArgs);
             }
             let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
             meta[0..8].copy_from_slice(&(sender as u64).to_le_bytes());
-            meta[8..10].copy_from_slice(&msg.opcode.to_le_bytes());
+            meta[8..10].copy_from_slice(&app_opcode.to_le_bytes());
             meta[10..12].copy_from_slice(&msg.flags.to_le_bytes());
-            meta[12..16].copy_from_slice(&(msg.len as u32).to_le_bytes());
+            meta[12..16].copy_from_slice(&((app_payload.len() as u32)).to_le_bytes());
             meta[16..24].copy_from_slice(&(frame.ret2() as u64).to_le_bytes());
             meta[24..32].copy_from_slice(&(recv_meta_flags as u64).to_le_bytes());
             meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
@@ -962,10 +973,12 @@ fn handle_ipc_recv_result_with_empty_error(
                 .copy_to_current_user(meta_ptr, &meta)
                 .map_err(SyscallError::from)?;
             crate::yarm_log!(
-                "IPC_RECV_OUT_META_WRITE tid={} opcode={} payload_len={} cap_id={} flags={} sender_tid={}",
+                "IPC_RECV_OUT_META_WRITE tid={} raw_len={} opcode={} payload_len={} stripped_prefix={} cap_id={} flags={} sender_tid={}",
                 receiver_tid,
-                msg.opcode,
-                msg.len as usize,
+                raw_payload.len(),
+                app_opcode,
+                app_payload.len(),
+                stripped_prefix,
                 frame.ret2(),
                 recv_meta_flags
                 ,
@@ -1060,18 +1073,18 @@ fn handle_ipc_recv_result_with_empty_error(
                     return Ok(());
                 }
 
-                if user_len < msg.len as usize {
+                if user_len < app_payload.len() {
                     return Err(SyscallError::InvalidArgs);
                 }
-                match kernel.copy_to_current_user(user_ptr, msg.as_slice()) {
+                match kernel.copy_to_current_user(user_ptr, app_payload) {
                     Ok(()) => {
                         crate::yarm_log!(
                             "IPC_RECV_COPY_TO_USER tid={} dst=0x{:x} len={} result=ok",
                             receiver_tid,
                             user_ptr,
-                            msg.len
+                            app_payload.len()
                         );
-                        frame.set_ok(0, msg.len as usize, frame.ret2());
+                        frame.set_ok(0, app_payload.len(), frame.ret2());
                         crate::yarm_log!("IPC_RECV_RETURN_SUCCESS tid={} x0=0", receiver_tid);
                     }
                     Err(KernelError::UserMemoryFault) => {
@@ -1079,7 +1092,7 @@ fn handle_ipc_recv_result_with_empty_error(
                             "IPC_RECV_COPY_TO_USER tid={} dst=0x{:x} len={} result=err",
                             receiver_tid,
                             user_ptr,
-                            msg.len
+                            app_payload.len()
                         );
                         record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
                         return Ok(());
@@ -1087,7 +1100,7 @@ fn handle_ipc_recv_result_with_empty_error(
                     Err(other) => return Err(SyscallError::from(other)),
                 };
             } else {
-                frame.set_ok(0, msg.len as usize, frame.ret2());
+                frame.set_ok(0, app_payload.len(), frame.ret2());
                 crate::yarm_log!("IPC_RECV_RETURN_SUCCESS tid={} x0=0", receiver_tid);
                 crate::yarm_log!(
                     "IPC_RECV_WAKE_RETURN_REGS tid={} x0={} x1={} x2={} elr=na",
