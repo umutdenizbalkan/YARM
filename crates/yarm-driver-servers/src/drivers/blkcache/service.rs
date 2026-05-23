@@ -37,12 +37,17 @@ fn find_backend(table: &[BackendRecord; MAX_BACKENDS], backend_id: u64) -> Optio
     table.iter().copied().find(|r| r.registered && r.backend_id == backend_id)
 }
 
+fn first_registered_backend(table: &[BackendRecord; MAX_BACKENDS]) -> Option<BackendRecord> {
+    table.iter().copied().find(|r| r.registered)
+}
+
 fn call_backend_get_info(backend_send_cap: u64, reply_recv_cap: u32) -> Result<BlkGetInfoReply, ()> {
     let req = BlkGetInfoRequest { device_id: 0 };
     let Ok(msg) = Message::with_header(0, BLK_OP_GET_INFO, 0, None, &req.encode()) else {
         return Err(());
     };
-    unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap as u32, reply_recv_cap, &msg) }.map_err(|_| ())?;
+    unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap as u32, reply_recv_cap, &msg) }
+        .map_err(|_| ())?;
     let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) }.map_err(|_| ())?;
     match reply {
         Some(reply_msg) => BlkGetInfoReply::decode(reply_msg.as_slice()).ok_or(()),
@@ -186,10 +191,32 @@ pub fn run() {
                             }
                             continue;
                         };
-                        let backend = find_backend(&backends, 1);
+                        let backend = find_backend(&backends, 1)
+                            .or_else(|| first_registered_backend(&backends));
                         let response = if let Some(rec) = backend {
-                            call_backend_get_info(rec.backend_send_cap, reply_recv_cap).ok()
+                            yarm_user_rt::user_log!(
+                                "BLKCACHE_FORWARD_GET_INFO backend_id={} send_cap={}",
+                                rec.backend_id,
+                                rec.backend_send_cap
+                            );
+                            match call_backend_get_info(rec.backend_send_cap, reply_recv_cap) {
+                                Ok(reply) => {
+                                    yarm_user_rt::user_log!(
+                                        "BLKCACHE_FORWARD_GET_INFO_REPLY ok=1 status={}",
+                                        reply.status as u32
+                                    );
+                                    Some(reply)
+                                }
+                                Err(()) => {
+                                    yarm_user_rt::user_log!(
+                                        "BLKCACHE_FORWARD_GET_INFO_REPLY ok=0 status={}",
+                                        BlkStatus::DeviceUnavailable as u32
+                                    );
+                                    None
+                                }
+                            }
                         } else {
+                            yarm_user_rt::user_log!("BLKCACHE_NO_BACKEND_REGISTERED");
                             None
                         };
                         let resp = response.unwrap_or(BlkGetInfoReply {
