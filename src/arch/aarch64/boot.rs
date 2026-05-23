@@ -188,6 +188,14 @@ const AARCH64_BLOCK_1G: u64 = 1024 * 1024 * 1024;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const AARCH64_UART_MMIO_BASE: u64 = 0x0900_0000;
 
+const AARCH64_TRAP_TRACE: bool = false;
+
+#[inline(always)]
+fn trap_trace_line(msg: &str) { if AARCH64_TRAP_TRACE { crate::arch::aarch64::console::write_line(msg); } }
+#[inline(always)]
+fn trap_trace_log(args: core::fmt::Arguments) { if AARCH64_TRAP_TRACE { crate::yarm_log!("{}", args); } }
+macro_rules! boot_trace { ($($arg:tt)*) => { trap_trace_log(format_args!($($arg)*)) }; }
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[repr(C, align(4096))]
 struct AlignedL2([u64; 512]);
@@ -476,14 +484,14 @@ extern "C" fn yarm_aarch64_before_eret_marker(elr: u64, sp: u64) {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_vector_first_marker() {
-    crate::arch::aarch64::console::write_line("YARM_AARCH64_VECTOR_FIRST");
+    trap_trace_line("YARM_AARCH64_VECTOR_FIRST");
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_vector_elr_marker(elr: u64) {
     LAST_VECTOR_RAW_ELR.store(elr, Ordering::Relaxed);
-    crate::yarm_log!("YARM_AARCH64_VECTOR_ELR_RAW elr=0x{:016x}", elr);
+    boot_trace!("YARM_AARCH64_VECTOR_ELR_RAW elr=0x{:016x}", elr);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -499,25 +507,25 @@ pub(crate) fn last_vector_raw_elr() -> u64 {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_return_to_user_elr_marker(elr: u64) {
-    crate::yarm_log!("AARCH64_RETURN_TO_USER_ELR value=0x{:016x}", elr);
+    boot_trace!("AARCH64_RETURN_TO_USER_ELR value=0x{:016x}", elr);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_return_to_user_x0_marker(x0: u64) {
-    crate::yarm_log!("AARCH64_RETURN_TO_USER_X0 value=0x{:016x}", x0);
+    boot_trace!("AARCH64_RETURN_TO_USER_X0 value=0x{:016x}", x0);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_write_return_elr_marker(elr: u64) {
-    crate::yarm_log!("AARCH64_WRITE_RETURN_ELR value=0x{:016x}", elr);
+    boot_trace!("AARCH64_WRITE_RETURN_ELR value=0x{:016x}", elr);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_final_elr_reg_marker(elr: u64) {
-    crate::yarm_log!("AARCH64_FINAL_ELR_REG value=0x{:016x}", elr);
+    boot_trace!("AARCH64_FINAL_ELR_REG value=0x{:016x}", elr);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -631,8 +639,8 @@ fn write_trapframe_back_to_vector_frame(
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFrame) {
-    crate::arch::aarch64::console::write_line("YARM_AARCH64_VECTOR_ENTRY");
-    crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=exception");
+    trap_trace_line("YARM_AARCH64_VECTOR_ENTRY");
+    trap_trace_line("YARM_AARCH64_BOOT_MARKER stage=exception");
     let Some(frame) = (unsafe { frame.as_mut() }) else {
         crate::arch::aarch64::console::write_line("YARM_AARCH64_EXCEPTION_FRAME missing");
         return;

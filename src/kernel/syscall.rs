@@ -62,6 +62,9 @@ pub const SYSCALL_RECV_MAP_INTENT_WRITE: usize = 0x2;
 pub const OPCODE_INLINE: u16 = 0;
 pub const OPCODE_SHARED_MEM: u16 = 1;
 
+const AARCH64_SYSCALL_TRACE: bool = false;
+macro_rules! syscall_trace { ($($arg:tt)*) => { if AARCH64_SYSCALL_TRACE { crate::yarm_log!($($arg)*); } }; }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Syscall {
@@ -2001,22 +2004,22 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
             if kernel.current_tid() == caller_tid {
                 let _ = kernel.dispatch_next_task().map_err(SyscallError::from)?;
             }
-            crate::yarm_log!(
+            syscall_trace!(
                 "AARCH64_BLOCKED_RETURN_DISPATCH trapped_tid={} next_tid={}",
                 caller_tid.unwrap_or(0),
                 kernel.current_tid().unwrap_or(0)
             );
-            crate::yarm_log!(
+            syscall_trace!(
                 "AARCH64_SYSCALL_BLOCKED_OK tid={} nr={}",
                 caller_tid.unwrap_or(0),
                 frame.syscall_num()
             );
-            crate::yarm_log!(
+            syscall_trace!(
                 "AARCH64_BLOCKED_SYSCALL_STAYS_BLOCKED tid={} nr={}",
                 caller_tid.unwrap_or(0),
                 frame.syscall_num()
             );
-            crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT blocked");
+            syscall_trace!("AARCH64_TRAP_DISPATCH_RESULT blocked");
             return Ok(());
         }
         crate::yarm_log!(
@@ -2036,7 +2039,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         let trapped_tid = caller_tid.unwrap_or(0);
         let next_tid = kernel.current_tid().unwrap_or(0);
         if let Some(code) = frame.error_code() {
-            crate::yarm_log!(
+            syscall_trace!(
                 "YARM_SYSCALL0_EXIT trapped_tid={} next_tid={} nr={} result=err code={}",
                 trapped_tid,
                 next_tid,
@@ -2044,7 +2047,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
                 code
             );
         } else {
-            crate::yarm_log!(
+            syscall_trace!(
                 "YARM_SYSCALL0_EXIT trapped_tid={} next_tid={} nr={} result=ok r0={} r1={} r2={}",
                 trapped_tid,
                 next_tid,

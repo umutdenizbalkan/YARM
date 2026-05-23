@@ -449,7 +449,7 @@ pub fn cr3_for_asid(asid: Asid) -> Option<u64> {
 
 pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     #[cfg(not(feature = "hosted-dev"))]
-    crate::yarm_log!("ASW0 before computing TTBR0 asid={}", asid.0);
+    asid_trace!("ASW0 before computing TTBR0 asid={}", asid.0);
     let ttbr0 = cr3_for_asid(asid).ok_or(PageTableError::OutOfMemory)?;
     #[cfg(not(feature = "hosted-dev"))]
     crate::yarm_log!(
@@ -466,7 +466,7 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             options(nostack, preserves_flags)
         );
         if current_ttbr0 == ttbr0 {
-            crate::yarm_log!(
+            asid_trace!(
                 "ADDRESS_SPACE_SWITCH_SKIPPED_SAME_ASID asid={} ttbr0=0x{:x}",
                 asid.0,
                 ttbr0

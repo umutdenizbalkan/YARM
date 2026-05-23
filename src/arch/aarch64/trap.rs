@@ -17,6 +17,17 @@ const ESR_EC_DABT_CUR: u32 = 0x25;
 const ESR_EC_MASK: u32 = 0x3F;
 const ARCH_TIMER_PPI_IRQ: u16 = 30;
 
+const AARCH64_TRAP_TRACE: bool = false;
+
+#[inline(always)]
+fn aarch64_trap_trace(args: core::fmt::Arguments) {
+    if AARCH64_TRAP_TRACE {
+        crate::yarm_log!("{}", args);
+    }
+}
+
+macro_rules! trap_trace { ($($arg:tt)*) => { aarch64_trap_trace(format_args!($($arg)*)) }; }
+
 
 #[inline(always)]
 fn idle_no_eret_loop() -> ! {
@@ -210,10 +221,10 @@ pub fn handle_trap_entry(
         crate::yarm_log!("AARCH64_TRAP_FAIL_REASON handle_trap_event");
         return Err(err);
     }
-    crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT ok");
+    trap_trace!("AARCH64_TRAP_DISPATCH_RESULT ok");
 
     if matches!(event, TrapEvent::Syscall) {
-        crate::yarm_log!(
+        trap_trace!(
             "AARCH64_SYSCALL_RAW_RETURN_PC value=0x{:016x}",
             raw_vector_return_pc as u64
         );
@@ -250,7 +261,7 @@ pub fn handle_trap_entry(
         } else {
             "raw"
         };
-        crate::yarm_log!(
+        trap_trace!(
             "AARCH64_ELR_POLICY tid={} nr={} raw=0x{:016x} final=0x{:016x} reason={}",
             tid,
             syscall_nr,
@@ -276,7 +287,7 @@ pub fn handle_trap_entry(
     }
 
     if matches!(exiting_tid, None | Some(0)) {
-        crate::yarm_log!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
+        trap_trace!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
         idle_no_eret_loop();
     }
 
@@ -308,12 +319,12 @@ pub fn handle_trap_entry(
                 );
             }
         }
-        crate::yarm_log!(
+        trap_trace!(
             "AARCH64_SYSCALL_RETURN_SAVE tid={} elr=0x{:016x}",
             entering_tid.unwrap_or(0),
             syscall_resume_pc as u64
         );
-        crate::yarm_log!("AARCH64_DISPATCH_NEXT_TID tid={}", exiting_tid.unwrap_or(0));
+        trap_trace!("AARCH64_DISPATCH_NEXT_TID tid={}", exiting_tid.unwrap_or(0));
     }
 
     let syscall_return = !task_switched && matches!(event, TrapEvent::Syscall);
@@ -353,7 +364,7 @@ pub fn handle_trap_entry(
         // Same task continues: set the return ELR to the instruction after the SVC.
         if let Some(trapframe) = frame.as_deref_mut() {
             if kernel.current_tid() == Some(0) {
-                crate::yarm_log!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
+                trap_trace!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
                 idle_no_eret_loop();
             }
             if trapframe.syscall_num() == crate::kernel::syscall::Syscall::IpcRecv as usize
@@ -383,7 +394,7 @@ pub fn handle_trap_entry(
         }
 
         let actual_elr = trapframe.saved_pc();
-        crate::yarm_log!("AARCH64_MSR_ELR_ACTUAL value=0x{:016x}", actual_elr as u64);
+        trap_trace!("AARCH64_MSR_ELR_ACTUAL value=0x{:016x}", actual_elr as u64);
 
         if kernel.current_tid().unwrap_or(0) != 0 && actual_elr < 0x400000 {
             crate::yarm_log!(
@@ -394,7 +405,7 @@ pub fn handle_trap_entry(
             panic!("AARCH64_BAD_USER_ELR");
         }
 
-        crate::yarm_log!(
+        trap_trace!(
             "AARCH64_ERET_ACTUAL tid={} elr=0x{:016x} x0={} x1={} x2={} x3={}",
             kernel.current_tid().unwrap_or(0),
             actual_elr as u64,
@@ -403,7 +414,7 @@ pub fn handle_trap_entry(
             trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2),
             trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X3),
         );
-        crate::yarm_log!(
+        trap_trace!(
             "AARCH64_FINAL_USER_GPRS tid={} x0={} x1={} x2={}",
             kernel.current_tid().unwrap_or(0),
             trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),
