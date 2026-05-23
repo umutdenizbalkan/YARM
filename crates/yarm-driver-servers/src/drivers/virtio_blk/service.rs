@@ -74,7 +74,6 @@ pub fn run() {
                     let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
                 }
             }
-            Ok(Some((_msg, None))) => {}
             Ok(None) => {}
             Err(_) => { let _ = yarm_user_rt::syscall::yield_now(); }
         }
