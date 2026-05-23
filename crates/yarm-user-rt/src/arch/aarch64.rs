@@ -14,13 +14,14 @@ pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
     // with inout/lateout patterns for higher return lanes (especially x5).
     unsafe {
         core::arch::asm!(
+            "mov x12, {ret_ptr}",
             "svc #0",
-            "str x0, [{ret_ptr}, #0]",
-            "str x1, [{ret_ptr}, #8]",
-            "str x2, [{ret_ptr}, #16]",
-            "str x3, [{ret_ptr}, #24]",
-            "str x4, [{ret_ptr}, #32]",
-            "str x5, [{ret_ptr}, #40]",
+            "str x0, [x12, #0]",
+            "str x1, [x12, #8]",
+            "str x2, [x12, #16]",
+            "str x3, [x12, #24]",
+            "str x4, [x12, #32]",
+            "str x5, [x12, #40]",
             ret_ptr = in(reg) ret_ptr,
             in("x0") args[0],
             in("x1") args[1],
@@ -29,6 +30,8 @@ pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
             in("x4") args[4],
             in("x5") args[5],
             in("x8") no,
+            lateout("x12") _,
+            options(nostack),
         );
     }
     SyscallReturn {
