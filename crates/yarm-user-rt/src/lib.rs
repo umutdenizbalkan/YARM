@@ -608,6 +608,10 @@ pub mod syscall {
             startup_args.as_ptr() as usize,  // arg4 = startup_args_ptr
             startup_args.len(),              // arg5 = startup_args_count
         ];
+        crate::user_log!(
+            "USER_RT_SPAWN_FROM_INITRAMFS_ARGS path_ptr=0x{:x} path_len={} parent_pid={} cap0={} cap1={}",
+            args[1], args[2], parent_pid, startup_args[13], startup_args[14]
+        );
         #[cfg(all(target_arch = "aarch64", not(test)))]
         {
             let lr: usize;
@@ -633,6 +637,10 @@ pub mod syscall {
             );
         }
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR, args) };
+        crate::user_log!(
+            "USER_RT_SPAWN_FROM_INITRAMFS_RET ret0={} ret1={} ret2={}",
+            ret.ret0, ret.ret1, ret.ret2
+        );
         #[cfg(all(target_arch = "aarch64", not(test)))]
         {
             let lr: usize;

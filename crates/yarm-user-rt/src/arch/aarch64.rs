@@ -2,69 +2,41 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::SyscallReturn;
-#[cfg(target_arch = "aarch64")]
-use core::arch::global_asm;
-
-#[repr(C)]
-struct Aarch64SyscallFrame {
-    args: [usize; 6],
-    rets: [usize; 6],
-}
-
-#[cfg(target_arch = "aarch64")]
-global_asm!(
-    r#"
-    .text
-    .align 2
-    .global yarm_aarch64_raw_syscall_frame
-    .type yarm_aarch64_raw_syscall_frame,%function
-yarm_aarch64_raw_syscall_frame:
-    // x0 = frame ptr, x1 = syscall number
-    stp x19, x30, [sp, #-16]!
-    mov x19, x0
-    mov x8, x1
-
-    ldr x0, [x19, #0]
-    ldr x1, [x19, #8]
-    ldr x2, [x19, #16]
-    ldr x3, [x19, #24]
-    ldr x4, [x19, #32]
-    ldr x5, [x19, #40]
-
-    svc #0
-
-    str x0, [x19, #48]
-    str x1, [x19, #56]
-    str x2, [x19, #64]
-    str x3, [x19, #72]
-    str x4, [x19, #80]
-    str x5, [x19, #88]
-    ldp x19, x30, [sp], #16
-    ret
-    "#
-);
-
-#[cfg(target_arch = "aarch64")]
-unsafe extern "C" {
-    fn yarm_aarch64_raw_syscall_frame(frame: *mut Aarch64SyscallFrame, no: usize);
-}
 
 #[inline]
 pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
-    let mut frame = Aarch64SyscallFrame {
-        args,
-        rets: [usize::MAX; 6],
-    };
-    // SAFETY: C-ABI shim fully controls syscall argument/return lanes and
-    // writes post-svc x0..x5 into `frame.rets`.
-    unsafe { yarm_aarch64_raw_syscall_frame(&mut frame as *mut Aarch64SyscallFrame, no) };
+    let mut x0 = args[0];
+    let mut x1 = args[1];
+    let mut x2 = args[2];
+    let mut x3 = args[3];
+    let mut x4 = args[4];
+    let mut x5 = args[5];
+    let (r0, r1, r2): (usize, usize, usize);
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            "mov {r0}, x0",
+            "mov {r1}, x1",
+            "mov {r2}, x2",
+            r0 = lateout(reg) r0,
+            r1 = lateout(reg) r1,
+            r2 = lateout(reg) r2,
+            inout("x0") x0 => _,
+            inout("x1") x1 => _,
+            inout("x2") x2 => _,
+            inout("x3") x3 => _,
+            inout("x4") x4 => _,
+            inout("x5") x5 => _,
+            in("x8") no,
+        );
+    }
     SyscallReturn {
-        ret0: frame.rets[0],
-        ret1: frame.rets[1],
-        ret2: frame.rets[2],
-        ret3: frame.rets[3],
-        ret4: frame.rets[4],
-        ret5: frame.rets[5],
+        ret0: r0,
+        ret1: r1,
+        ret2: r2,
+        ret3: 0,
+        ret4: 0,
+        ret5: 0,
         error: 0,
     }
 }
