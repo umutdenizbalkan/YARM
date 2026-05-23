@@ -353,8 +353,8 @@ pub fn run() {
     yarm_user_rt::user_log!("VFS_SRV_BLOCKING_RECV_LOOP");
 
     loop {
-        // Receive client request; ipc_recv_v2 strips the 2-byte opcode prefix from
-        // messages sent via ipc_call so we get the correct opcode and reply_cap.
+        // Receive client request; recv_v2 opcode/payload are sourced from kernel
+        // out-meta decode (no userspace raw-lane/opcode-prefix heuristics).
         let (msg, client_reply_cap) =
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
                 Ok(Some(received)) => {

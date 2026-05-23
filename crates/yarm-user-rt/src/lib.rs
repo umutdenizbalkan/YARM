@@ -241,8 +241,9 @@ pub mod syscall {
     pub unsafe fn ipc_recv_v2(
         ep_cap: u32,
      ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
-        // Buffer is 2 bytes larger than MAX_PAYLOAD to accommodate the opcode prefix
-        // that ipc_call prepends. The kernel receives [opcode_lo, opcode_hi, ...data].
+        // Receive buffer is sized for legacy inline-request framing cases where the
+        // kernel may strip a request prefix before exposing payload via out-meta.
+        // Userspace decodes payload/opcode exclusively from IpcRecvMetaV2.
         const FRAMED_MAX: usize = 2 + Message::MAX_PAYLOAD;
         let mut payload = [0u8; FRAMED_MAX];
         let mut meta = IpcRecvMetaV2 {
@@ -294,12 +295,6 @@ pub mod syscall {
             None
         };
         let flags = if transferred_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 };
-        crate::user_log!(
-            "RECV_META reply_cap={:?} transferred_cap={:?} flags={}",
-            reply_cap,
-            transferred_cap,
-            flags
-        );
         let msg = Message::with_header(meta.sender_tid, opcode, flags, transferred_cap.map(|c| c as u64), msg_payload)
             .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some(ReceivedMessage { message: msg, reply_cap, transferred_cap, sender_tid: meta.sender_tid }))
