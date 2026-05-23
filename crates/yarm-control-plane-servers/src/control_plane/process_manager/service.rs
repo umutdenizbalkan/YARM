@@ -1770,10 +1770,12 @@ pub fn run() {
                 let msg = received.message;
                 let reply_cap = received.reply_cap;
                 yarm_user_rt::user_log!(
-                    "PM_RECV_GOT_MSG opcode={} len={} reply_cap={}",
+                    "PM_RECV_GOT_MSG opcode={} len={} reply_cap={:?} transferred_cap={:?} sender_tid={}",
                     msg.opcode,
                     msg.len,
-                    reply_cap.unwrap_or(u32::MAX)
+                    reply_cap,
+                    received.transferred_cap,
+                    received.sender_tid
                 );
                 if let Ok(reply) = service.handle(msg) {
                     if let Some(cap) = reply_cap {

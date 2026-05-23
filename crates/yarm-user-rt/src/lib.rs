@@ -326,8 +326,7 @@ pub mod syscall {
         } else {
             None
         };
-        let flags = (if reply_cap.is_some() { Message::FLAG_REPLY_CAP } else { 0 })
-            | (if transferred_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 });
+        let flags = if transferred_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 };
         crate::user_log!(
             "RECV_META reply_cap={:?} transferred_cap={:?} flags={}",
             reply_cap,
