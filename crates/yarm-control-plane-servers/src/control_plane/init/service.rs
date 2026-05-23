@@ -285,13 +285,15 @@ fn spawn_v5_cap(
     };
     // SAFETY: Uses kernel-provided startup caps for PM IPC request.
     let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
+    yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_RECV_BEGIN cap={}", pm_recv);
     let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(pm_recv) };
     match reply {
         Ok(Some(received)) => {
             let r = received.message;
             let payload = r.as_slice();
             yarm_user_rt::user_log!(
-                "INIT_SPAWN_V5_REPLY_RECV payload_len={} opcode={} flags={}",
+                "INIT_SPAWN_V5_REPLY_RECV_OK status=na sender_tid={} payload_len={} opcode={} flags={}",
+                received.sender_tid,
                 payload.len(),
                 r.opcode,
                 r.flags
@@ -309,6 +311,11 @@ fn spawn_v5_cap(
             if payload.len() != SpawnV5CapResult::ENCODED_LEN {
                 yarm_user_rt::user_log!(
                     "INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0 reason=bad_len expected={} got={}",
+                    SpawnV5CapResult::ENCODED_LEN,
+                    payload.len()
+                );
+                yarm_user_rt::user_log!(
+                    "INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=bad_len expected={} got={}",
                     SpawnV5CapResult::ENCODED_LEN,
                     payload.len()
                 );
@@ -330,12 +337,21 @@ fn spawn_v5_cap(
                     Some((result.pid, result.service_send_cap))
                 }
                 Err(_) => {
+                    yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=decode_err");
                     yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
                     None
                 }
             }
         }
-        _ => {
+        Ok(None) => {
+            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_RECV_ERR err=WouldBlockOrNoMessage");
+            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=recv_none");
+            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
+            None
+        }
+        Err(err) => {
+            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_RECV_ERR err={:?}", err);
+            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=recv_err");
             yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
             None
         }
