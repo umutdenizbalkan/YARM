@@ -952,7 +952,7 @@ fn handle_ipc_recv_result_with_empty_error(
             encode_transfer_cap_ret(frame, recv_local_transfer)?;
             let raw_payload = msg.as_slice();
             let (app_opcode, app_payload, _stripped_prefix) =
-                if msg.opcode == OPCODE_INLINE && raw_payload.len() >= 2 {
+                if should_strip_inline_opcode_prefix(&msg) && raw_payload.len() >= 2 {
                     (
                         u16::from_le_bytes([raw_payload[0], raw_payload[1]]),
                         &raw_payload[2..],
@@ -1116,6 +1116,13 @@ fn handle_ipc_recv_result_with_empty_error(
         }
     }
     Ok(())
+}
+
+#[inline]
+fn should_strip_inline_opcode_prefix(msg: &Message) -> bool {
+    msg.opcode == OPCODE_INLINE
+        && ((msg.flags & Message::FLAG_REPLY_CAP) != 0
+            || (msg.flags & Message::FLAG_CAP_TRANSFER) != 0)
 }
 
 fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
@@ -3881,5 +3888,31 @@ mod tests {
         );
         let err = dispatch(&mut state, &mut send_frame).expect_err("receiver waiter required");
         assert_eq!(err, SyscallError::WouldBlock);
+    }
+
+    #[test]
+    fn inline_prefix_stripping_applies_to_call_and_transfer_requests_only() {
+        let call_msg = Message::with_header(
+            1,
+            OPCODE_INLINE,
+            Message::FLAG_REPLY_CAP,
+            None,
+            &[0x34, 0x12, 0xAA, 0xBB],
+        )
+        .expect("call msg");
+        assert!(should_strip_inline_opcode_prefix(&call_msg));
+
+        let transfer_msg = Message::with_header(
+            1,
+            OPCODE_INLINE,
+            Message::FLAG_CAP_TRANSFER,
+            Some(42),
+            &[0x34, 0x12, 0xAA, 0xBB],
+        )
+        .expect("transfer msg");
+        assert!(should_strip_inline_opcode_prefix(&transfer_msg));
+
+        let reply_msg = Message::new(1, &[0x34, 0x12, 0xAA, 0xBB]).expect("reply msg");
+        assert!(!should_strip_inline_opcode_prefix(&reply_msg));
     }
 }
