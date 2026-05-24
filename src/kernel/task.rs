@@ -22,6 +22,21 @@ pub enum WaitReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvAbiVariant {
+    RecvV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockedRecvState {
+    pub recv_cap: CapId,
+    pub payload_user_ptr: usize,
+    pub payload_user_len: usize,
+    pub meta_user_ptr: usize,
+    pub meta_user_len: usize,
+    pub recv_abi: RecvAbiVariant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskClass {
     App,
     Driver,
@@ -161,6 +176,8 @@ pub struct ThreadControlBlock {
     pub ipc_timeout_deadline: Option<u64>,
     /// Set when a blocked IPC wait is resumed due to timeout expiry.
     pub ipc_timeout_fired: bool,
+    /// Saved userspace recv buffers for blocked recv-v2 completion.
+    pub blocked_recv_state: Option<BlockedRecvState>,
 }
 
 impl ThreadControlBlock {
@@ -181,6 +198,7 @@ impl ThreadControlBlock {
             cpu_affinity: None,
             ipc_timeout_deadline: None,
             ipc_timeout_fired: false,
+            blocked_recv_state: None,
         }
     }
 }

@@ -11,7 +11,7 @@ use super::trapframe::TrapFrame;
 use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
 use crate::kernel::boot::UserImageSpec;
-use crate::kernel::task::TaskClass;
+use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskClass};
 use yarm_srv_common::{cpio::CpioArchive, elf::ElfImageInfo};
 
 pub const SYSCALL_ABI_VERSION: u16 = 10;
@@ -662,8 +662,40 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         .ok_or(SyscallError::InvalidCapability)?
         .object;
     let received = kernel.ipc_recv(cap).map_err(SyscallError::from)?;
+    let recv_v2_request = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) != 0
+        && frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) >= IPC_RECV_META_V2_ENCODED_LEN;
     if received.is_none() {
+        if recv_v2_request {
+            let state = BlockedRecvState {
+                recv_cap: cap,
+                payload_user_ptr: frame.arg(SYSCALL_ARG_PTR),
+                payload_user_len: frame.arg(SYSCALL_ARG_LEN),
+                meta_user_ptr: frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+                meta_user_len: frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+                recv_abi: RecvAbiVariant::RecvV2,
+            };
+            if let Some(tcb) = kernel.tcb_mut(recv_tid) {
+                tcb.blocked_recv_state = Some(state);
+            }
+            crate::yarm_log!(
+                "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={}",
+                recv_tid,
+                cap.0,
+                state.payload_user_ptr,
+                state.payload_user_len,
+                state.meta_user_ptr,
+                state.meta_user_len
+            );
+        }
         return Err(SyscallError::WouldBlock);
+    }
+    if let Some(tcb) = kernel.tcb_mut(recv_tid)
+        && tcb.blocked_recv_state.take().is_some()
+    {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=recv_complete",
+            recv_tid
+        );
     }
     crate::yarm_log!(
         "IPC_RECV_GOT_MSG tid={} cap={} transfer_cap={}",
