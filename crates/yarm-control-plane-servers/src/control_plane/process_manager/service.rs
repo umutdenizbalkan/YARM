@@ -1491,8 +1491,21 @@ unsafe fn pm_vfs_call_u64(
         op,
         reply_recv_cap
     );
-    match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, u64::MAX) } {
-        Ok(Some(reply)) => {
+    match unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) } {
+        Ok(Some(received)) => {
+            let reply = received.message;
+            let payload = reply.as_slice();
+            let preview_len = core::cmp::min(payload.len(), 32);
+            yarm_user_rt::user_log!(
+                "PM_VFS_REPLY_RAW op={} len={} opcode={} flags={} sender_tid={} transferred_cap={} bytes={:x?}",
+                op,
+                reply.len,
+                reply.opcode,
+                reply.flags,
+                received.sender_tid,
+                received.transferred_cap.unwrap_or(0),
+                &payload[..preview_len]
+            );
             yarm_user_rt::user_log!(
                 "PM_VFS_REPLY op={} status=ok len={} opcode={} flags={}",
                 op,
@@ -1535,8 +1548,22 @@ unsafe fn pm_read_all_via_vfs(
         core::str::from_utf8(path).unwrap_or("<path-bytes>")
     );
     let stat_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &stat_msg) }?;
-    yarm_user_rt::user_log!("PM_VFS_REPLY op=STATX status={}", decode_u64(stat_reply.as_slice()).unwrap_or(u64::MAX));
-    let file_len = decode_u64(stat_reply.as_slice()).ok_or(ProcessManagerError::Malformed)? as usize;
+    let stat_payload = stat_reply.as_slice();
+    if stat_payload.len() != 8 {
+        let preview_len = core::cmp::min(stat_payload.len(), 32);
+        yarm_user_rt::user_log!(
+            "PM_VFS_REPLY_DECODE_FAIL op=STATX reason=bad_len expected=8 actual={} bytes={:x?}",
+            stat_payload.len(),
+            &stat_payload[..preview_len]
+        );
+        return Err(ProcessManagerError::Malformed);
+    }
+    let file_len = decode_u64(stat_payload).ok_or(ProcessManagerError::Malformed)? as usize;
+    yarm_user_rt::user_log!(
+        "PM_VFS_REPLY_DECODE op=STATX expected_len=8 actual_len={} value={}",
+        stat_payload.len(),
+        file_len
+    );
 
     let open_msg = build_openat_message(path, 0).map_err(|_| ProcessManagerError::Malformed)?;
     yarm_user_rt::user_log!(
