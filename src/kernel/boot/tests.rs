@@ -1281,13 +1281,11 @@ fn run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
     state.ipc_send(send_cap_task2, msg).expect("send");
     state.yield_current().expect("switch receiver");
     assert_eq!(state.current_tid(), Some(1));
-    let mut payload = [0u8; 16];
-    let mut meta = [0u8; 40];
-    state
-        .copy_from_current_user_into_slice(payload_ptr, payload.len(), &mut payload)
+    let payload = state
+        .read_user_memory_for_asid(asid1, payload_ptr, 16)
         .expect("read payload");
-    state
-        .copy_from_current_user_into_slice(meta_ptr, meta.len(), &mut meta)
+    let meta = state
+        .read_user_memory_for_asid(asid1, meta_ptr, 40)
         .expect("read meta");
     assert_eq!(payload[..5], *b"hello");
     assert_eq!(

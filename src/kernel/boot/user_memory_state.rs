@@ -151,6 +151,16 @@ impl KernelState {
         self.copy_from_user(asid, VirtAddr(ptr as u64), len)
     }
 
+    #[cfg(test)]
+    pub fn read_user_memory_for_asid(
+        &self,
+        asid: Asid,
+        ptr: usize,
+        len: usize,
+    ) -> Result<[u8; Message::MAX_PAYLOAD], KernelError> {
+        self.copy_from_user(asid, VirtAddr(ptr as u64), len)
+    }
+
     #[cfg(any(
         feature = "hosted-dev",
         not(any(
