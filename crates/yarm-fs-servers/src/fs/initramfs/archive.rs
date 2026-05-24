@@ -28,9 +28,12 @@ pub const INITRAMFS_POSIX_COMPAT_PATH: &[u8] = b"/initramfs/posix_compat";
 /// Compatibility-only legacy path identifier; prefer `INITRAMFS_SRV_PATH`.
 pub const INITRAMFS_SRV_PATH_PTR: u64 = 0x494E_4954_5352_5653;
 pub const INITRAMFS_SRV_PATH: &[u8] = b"/initramfs/sbin/initramfs_srv";
+pub const INITRAMFS_DRIVER_MANAGER_PATH: &[u8] = b"/initramfs/sbin/driver_manager";
+pub const INITRAMFS_BLKCACHE_PATH: &[u8] = b"/initramfs/sbin/blkcache_srv";
+pub const INITRAMFS_VIRTIO_BLK_PATH: &[u8] = b"/initramfs/sbin/virtio_blk_srv";
 
 const MAX_INITRAMFS_HANDLES: usize = 16;
-const MAX_INITRAMFS_INODES: usize = 8;
+const MAX_INITRAMFS_INODES: usize = 11;
 const INITRAMFS_STATX_TYPE_REGULAR: u64 = 0x1000_0000_0000_0000;
 const INITRAMFS_MODE_OWNER_READ: u64 = 0o400;
 
@@ -111,6 +114,18 @@ impl InitramfsBackend {
                     path: INITRAMFS_SRV_PATH,
                     file_len: 1536,
                 }),
+                Some(InitramfsInode {
+                    path: INITRAMFS_DRIVER_MANAGER_PATH,
+                    file_len: 1536,
+                }),
+                Some(InitramfsInode {
+                    path: INITRAMFS_BLKCACHE_PATH,
+                    file_len: 1536,
+                }),
+                Some(InitramfsInode {
+                    path: INITRAMFS_VIRTIO_BLK_PATH,
+                    file_len: 1536,
+                }),
             ],
             metrics: InitramfsMetrics {
                 open_count: 0,
@@ -143,6 +158,9 @@ impl InitramfsBackend {
                 b"sbin/supervisor" => INITRAMFS_SUPERVISOR_PATH,
                 b"posix_compat" => INITRAMFS_POSIX_COMPAT_PATH,
                 b"sbin/initramfs_srv" => INITRAMFS_SRV_PATH,
+                b"sbin/driver_manager" => INITRAMFS_DRIVER_MANAGER_PATH,
+                b"sbin/blkcache_srv" => INITRAMFS_BLKCACHE_PATH,
+                b"sbin/virtio_blk_srv" => INITRAMFS_VIRTIO_BLK_PATH,
                 _ => continue,
             };
             if let Some(idx) = backend.lookup_slot(path) {
