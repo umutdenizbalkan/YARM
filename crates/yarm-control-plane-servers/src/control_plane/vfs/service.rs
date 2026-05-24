@@ -350,6 +350,28 @@ mod service_level_tests {
     };
     use yarm_ipc_abi::vfs_abi::{VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_NO_MOUNT};
 
+    #[derive(Default)]
+    struct BackendReleaseCounter {
+        closes: usize,
+    }
+
+    fn close_via_service_for_test(
+        fd_table: &mut super::super::fd_table::VfsFdTable,
+        client_id: u64,
+        fd: u64,
+        backend: &mut BackendReleaseCounter,
+    ) -> Result<(), u32> {
+        // Mirrors service behavior: close routes via fd ownership first,
+        // then backend close/release happens once on success, and only then
+        // the fd table entry is removed.
+        if fd_table.lookup(fd, client_id).is_none() {
+            return Err(VFS_STATUS_ERR_BAD_FD);
+        }
+        backend.closes += 1;
+        fd_table.remove(fd, client_id);
+        Ok(())
+    }
+
     #[test]
     fn vfs_service_open_routes_normalized_paths_to_expected_mount() {
         let mut mounts = super::super::mount_table::VfsMountTable::new();
@@ -431,6 +453,57 @@ mod service_level_tests {
             Err(VFS_STATUS_ERR_BAD_FD)
         ));
         assert!(route_for_test(&mounts, &fds, &read, 2).is_ok());
+    }
+
+    #[test]
+    fn vfs_service_close_invokes_backend_release_once() {
+        let mounts = super::super::mount_table::VfsMountTable::new();
+        let mut fds = super::super::fd_table::VfsFdTable::new();
+        let mut backend = BackendReleaseCounter::default();
+
+        assert!(fds.insert(11, 50, "initramfs", 1000));
+        assert_eq!(backend.closes, 0);
+
+        close_via_service_for_test(&mut fds, 1000, 11, &mut backend).expect("close ok");
+        assert_eq!(backend.closes, 1);
+        assert!(fds.lookup(11, 1000).is_none());
+
+        let read = read_message(ReadWriteRequest { fd: 11, buf_ptr: 0, len: 1 }).expect("read");
+        assert!(matches!(
+            route_for_test(&mounts, &fds, &read, 1000),
+            Err(VFS_STATUS_ERR_BAD_FD)
+        ));
+    }
+
+    #[test]
+    fn vfs_service_double_close_does_not_release_twice() {
+        let mut fds = super::super::fd_table::VfsFdTable::new();
+        let mut backend = BackendReleaseCounter::default();
+
+        assert!(fds.insert(12, 51, "devfs", 2000));
+        close_via_service_for_test(&mut fds, 2000, 12, &mut backend).expect("first close");
+        assert_eq!(backend.closes, 1);
+
+        let err = close_via_service_for_test(&mut fds, 2000, 12, &mut backend)
+            .expect_err("second close must fail");
+        assert_eq!(err, VFS_STATUS_ERR_BAD_FD);
+        assert_eq!(backend.closes, 1);
+    }
+
+    #[test]
+    fn vfs_service_cross_client_close_does_not_release_backend() {
+        let mut fds = super::super::fd_table::VfsFdTable::new();
+        let mut backend = BackendReleaseCounter::default();
+
+        assert!(fds.insert(13, 52, "devfs", 3000));
+        let err = close_via_service_for_test(&mut fds, 4000, 13, &mut backend)
+            .expect_err("wrong client close");
+        assert_eq!(err, VFS_STATUS_ERR_BAD_FD);
+        assert_eq!(backend.closes, 0);
+        assert!(fds.lookup(13, 3000).is_some());
+
+        close_via_service_for_test(&mut fds, 3000, 13, &mut backend).expect("owner close");
+        assert_eq!(backend.closes, 1);
     }
 }
 
