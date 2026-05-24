@@ -1258,6 +1258,13 @@ fn run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
     }
     let payload_ptr = 0x2000usize;
     let meta_ptr = 0x2080usize;
+    state
+        .copy_to_user(asid1, VirtAddr(payload_ptr as u64), b"pre")
+        .expect("pre copy_to_user");
+    let pre = state
+        .read_user_memory_for_asid(asid1, payload_ptr, 3)
+        .expect("pre copy_from_user");
+    assert_eq!(&pre[..3], b"pre");
     let mut recv_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [
@@ -1282,7 +1289,7 @@ fn run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
     state.yield_current().expect("switch receiver");
     assert_eq!(state.current_tid(), Some(1));
     let payload = state
-        .read_user_memory_for_asid(asid1, payload_ptr, 16)
+        .read_user_memory_for_asid(asid1, payload_ptr, 5)
         .expect("read payload");
     let meta = state
         .read_user_memory_for_asid(asid1, meta_ptr, 40)
@@ -1292,13 +1299,47 @@ fn run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
         u16::from_le_bytes(meta[10..12].try_into().expect("msg flags")),
         0
     );
-    assert_eq!(u64::from_le_bytes(meta[8..16].try_into().expect("opcode")), 0x1234);
-    assert_eq!(u64::from_le_bytes(meta[16..24].try_into().expect("flags")), 0);
+    assert_eq!(u16::from_le_bytes(meta[8..10].try_into().expect("opcode")), 0x1234);
+    assert_eq!(u64::from_le_bytes(meta[16..24].try_into().expect("cap")), u64::MAX);
     assert_eq!(u64::from_le_bytes(meta[32..40].try_into().expect("sender")), 7);
 
     state.yield_current().expect("switch sender");
     state.yield_current().expect("switch receiver");
     assert_eq!(state.ipc_recv(recv_cap).expect("recv queued"), None);
+}
+
+#[test]
+fn user_memory_copy_to_then_copy_from_same_asid_roundtrips() {
+    std::thread::Builder::new()
+        .name("user_memory_copy_to_then_copy_from_same_asid_roundtrips".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_user_memory_copy_to_then_copy_from_same_asid_roundtrips)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_user_memory_copy_to_then_copy_from_same_asid_roundtrips() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind");
+    state
+        .map_user_page(
+            aspace_map_cap,
+            VirtAddr(0x2000),
+            Mapping {
+                phys: PhysAddr(0x8000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map rw");
+    state
+        .copy_to_user(asid, VirtAddr(0x2000), b"abcd")
+        .expect("copy_to_user");
+    let out = state
+        .read_user_memory_for_asid(asid, 0x2000, 4)
+        .expect("copy_from_user");
+    assert_eq!(&out[..4], b"abcd");
 }
 
 #[test]
