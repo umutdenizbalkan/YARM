@@ -189,6 +189,10 @@ Intentionally left:
 - PM performs VFS-backed `7..=9` loads only when it is explicitly given a
   `vfs_server` request SEND cap (currently passed from init in SpawnV5 service
   caps slot 0). Missing cap is reported as a truthful spawn failure.
+- PM nested/outbound VFS calls use a **dedicated PM-owned reply RECEIVE cap**
+  in startup slot 2 (`process_manager_reply_recv_cap`). This cap is created as
+  a separate endpoint during boot wiring and must be distinct from PM's main
+  request receive endpoint (startup slot 17 / `pm_request_recv_cap`).
 - VFS errors are surfaced as spawn failures; PM does not silently mask failures
   by pretending VFS-based loads succeeded.
 - Spawn-source logging remains explicit to avoid duplicate-path ambiguity.

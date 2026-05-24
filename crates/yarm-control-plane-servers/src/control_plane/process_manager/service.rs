@@ -1862,6 +1862,12 @@ pub fn run_request_loop_over_runtime_state_with_cnode_resize(
 pub fn run() {
     yarm_user_rt::user_log!("PM_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
+    yarm_user_rt::user_log!(
+        "PM_STARTUP_CAPS request_send={} request_recv={} reply_recv={}",
+        ctx.process_manager_request_send_cap.unwrap_or(0),
+        ctx.pm_request_recv_cap.unwrap_or(0),
+        ctx.process_manager_reply_recv_cap.unwrap_or(0)
+    );
     let Some(recv_cap) = ctx.pm_request_recv_cap else {
         yarm_user_rt::user_log!("PM_NO_RECV_CAP");
         loop {

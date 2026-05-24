@@ -678,6 +678,17 @@ pub fn bootstrap_first_user_task(
     )?;
     crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok", RING3_INIT_SERVER_TID, init_reply_recv_init.0);
 
+    // Dedicated PM outbound reply endpoint: PM receives on startup slot 2.
+    let (_, _, pm_outbound_reply_recv_root) = kernel.create_endpoint(8)?;
+    let pm_outbound_reply_recv_pm = if pm_aei.is_some() {
+        let c = kernel.grant_capability_task_to_task_with_rights(
+            0, pm_outbound_reply_recv_root, RING3_PM_SERVER_TID,
+            crate::kernel::capabilities::CapRights::RECEIVE,
+        )?;
+        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok", RING3_PM_SERVER_TID, c.0);
+        Some(c)
+    } else { None };
+
     let (_, _, sup_fault_recv_root) = kernel.create_endpoint(8)?;
     let sup_fault_recv_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
@@ -749,6 +760,7 @@ pub fn bootstrap_first_user_task(
     if let Some((pm_asid, pm_entry, pm_heap)) = pm_aei {
         let mut pm_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
         pm_args[0] = RING3_PM_SERVER_TID;
+        if let Some(c) = pm_outbound_reply_recv_pm { pm_args[2] = c.0; }
         if let Some(c) = pm_inbound_recv_pm { pm_args[17] = c.0; }
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid: RING3_PM_SERVER_TID,
