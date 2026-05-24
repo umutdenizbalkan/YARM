@@ -459,6 +459,43 @@ impl KernelState {
                 endpoint_idx
             );
         }
+        if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+            crate::yarm_log!(
+                "IPC_REPLY_DELIVER_TO_WAITER tid={} endpoint={} len={}",
+                waiter_tid.0,
+                endpoint_idx,
+                msg.len
+            );
+            let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
+                    .and_then(|tcb| tcb.blocked_recv_state.as_ref())
+                    .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
+            });
+            if waiter_recv_v2_blocked {
+                match complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg) {
+                    Ok(()) => {
+                        crate::yarm_log!(
+                            "IPC_REPLY_DELIVER_TO_WAITER_CONSUMED tid={} endpoint={}",
+                            waiter_tid.0,
+                            endpoint_idx
+                        );
+                        self.wake_waiter_for_endpoint(endpoint_idx)?;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        crate::yarm_log!(
+                            "IPC_RECV_BLOCKED_COMPLETE_FAILED tid={} err={:?}",
+                            waiter_tid.0,
+                            err
+                        );
+                        return Err(KernelError::UserMemoryFault);
+                    }
+                }
+            }
+            crate::yarm_log!("IPC_REPLY_WAKE_CALLER tid={}", waiter_tid.0);
+        }
         let endpoint = self
             .ipc
             .endpoints
@@ -468,9 +505,6 @@ impl KernelState {
         endpoint
             .send(msg)
             .map_err(|_| KernelError::EndpointQueueFull)?;
-        if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
-            crate::yarm_log!("IPC_REPLY_WAKE_CALLER tid={}", waiter_tid.0);
-        }
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
     }
