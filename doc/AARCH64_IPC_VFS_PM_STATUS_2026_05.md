@@ -170,10 +170,22 @@ Intentionally left:
 2. Reduce remaining verbose IPC tracing further.
 3. Document finalized IPC model (`SYSCALL_ABI.md`, recv-v2 semantics, blocked completion lifecycle, portability boundaries, reply-cap semantics).
 4. Continue VFS bring-up (routing, path normalization, mount-registration cleanup, per-client fd lifecycle hardening).
-5. Add real initramfs-backed exec loading through VFS path.
-6. Enable `VFS_READ_SHARED_REPLY_ENABLED` only after VFS stabilization.
-7. Continue PM lifecycle work (supervised task table, restart-token wiring, service lifecycle bookkeeping, restart policy).
-8. Longer-term storage/platform goals (blkcache maturity, virtio-blk real I/O, driver-manager orchestration, PCI/DTB enumeration, DMA/MMIO grant flow, ext4/fat/ramfs expansion).
+5. Enable `VFS_READ_SHARED_REPLY_ENABLED` only after VFS stabilization.
+6. Continue PM lifecycle work (supervised task table, restart-token wiring, service lifecycle bookkeeping, restart policy).
+7. Longer-term storage/platform goals (blkcache maturity, virtio-blk real I/O, driver-manager orchestration, PCI/DTB enumeration, DMA/MMIO grant flow, ext4/fat/ramfs expansion).
+
+## PM exec-load source policy (current)
+
+- For service/image IDs `1..=3` (bootstrap-critical), PM keeps the direct
+  kernel spawn path because these services must be reachable before VFS is
+  guaranteed.
+- For initramfs-backed service/image IDs `4..=9`, PM now resolves canonical
+  initramfs paths and loads ELF bytes through VFS `STATX -> OPENAT -> READ* ->
+  CLOSE`, then spawns via `spawn_process_from_user_buf`.
+- VFS errors are surfaced as spawn failures; PM does not silently mask failures
+  by pretending VFS-based loads succeeded.
+- Spawn-source logging remains explicit to avoid duplicate-path ambiguity.
+- `VFS_READ_SHARED_REPLY_ENABLED` remains disabled in this phase.
 
 ## Architectural status
 

@@ -9,6 +9,7 @@ use yarm::kernel::boot::{KernelError, TrapHandleError};
 use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcessManagerError};
 #[cfg(test)]
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
+use alloc::vec::Vec;
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, LIFECYCLE_STATE_SPAWNED,
     LifecycleQueryReply, LifecycleQueryRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT,
@@ -25,6 +26,10 @@ use yarm_srv_common::service_loop::run_typed_request_loop;
 #[cfg(test)]
 use yarm_user_rt::capability::CapId;
 use yarm_user_rt::ipc::Message;
+#[cfg(not(test))]
+use yarm_user_rt::vfs_client::{
+    build_close_message, build_openat_message, build_read_message, build_statx_message,
+};
 use yarm_user_rt::process::{
     ProcessError as ProcessManagerError, ProcessId, ProcessManagerOps, WaitResult,
 };
@@ -1340,13 +1345,13 @@ unsafe fn pm_vfs_spawn_inline(
     parent_pid: u64,
     startup_args: &[u64; 18],
 ) -> Result<(u64, u32, u32), ProcessManagerError> {
-    let (cpio_name, path_label): (&[u8], &str) = match image_id {
-        4 => (b"sbin/initramfs_srv",  "/initramfs/sbin/initramfs_srv"),
-        5 => (b"sbin/devfs_srv",      "/initramfs/sbin/devfs_srv"),
-        6 => (b"sbin/vfs_server",     "/initramfs/sbin/vfs_server"),
-        7 => (b"sbin/driver_manager", "/initramfs/sbin/driver_manager"),
-        8 => (b"sbin/blkcache_srv",   "/initramfs/sbin/blkcache_srv"),
-        9 => (b"sbin/virtio_blk_srv", "/initramfs/sbin/virtio_blk_srv"),
+    let path_label: &[u8] = match image_id {
+        4 => b"/initramfs/sbin/initramfs_srv",
+        5 => b"/initramfs/sbin/devfs_srv",
+        6 => b"/initramfs/sbin/vfs_server",
+        7 => b"/initramfs/sbin/driver_manager",
+        8 => b"/initramfs/sbin/blkcache_srv",
+        9 => b"/initramfs/sbin/virtio_blk_srv",
         _ => {
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_IMAGE_UNKNOWN image_id={}",
@@ -1355,14 +1360,24 @@ unsafe fn pm_vfs_spawn_inline(
             return Err(ProcessManagerError::Unsupported);
         }
     };
+    let path_log = core::str::from_utf8(path_label).unwrap_or("<path-bytes>");
     yarm_user_rt::user_log!(
         "PM_VFS_SPAWN_IMAGE_BEGIN image_id={} path={} parent_pid={}",
-        image_id, path_label, parent_pid
+        image_id, path_log, parent_pid
     );
+    let ctx = yarm_user_rt::runtime::startup_context();
+    let vfs_send_cap = ctx.process_manager_request_send_cap.ok_or(ProcessManagerError::Unsupported)?;
+    let reply_recv_cap = ctx.process_manager_reply_recv_cap.ok_or(ProcessManagerError::Unsupported)?;
+    let image = unsafe { pm_read_all_via_vfs(vfs_send_cap, reply_recv_cap, path_label) }?;
+    if image.is_empty() {
+        yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err=empty-elf", image_id);
+        return Err(ProcessManagerError::Malformed);
+    }
     let result = unsafe {
-        yarm_user_rt::syscall::spawn_from_initramfs_file(
+        yarm_user_rt::syscall::spawn_process_from_user_buf(
             image_id,
-            cpio_name,
+            image.as_ptr(),
+            image.len(),
             parent_pid,
             startup_args,
         )
@@ -1387,6 +1402,65 @@ unsafe fn pm_vfs_spawn_inline(
             Err(ProcessManagerError::TableFull)
         }
     }
+}
+
+#[cfg(not(test))]
+unsafe fn pm_vfs_call_u64(
+    vfs_send_cap: u32,
+    reply_recv_cap: u32,
+    msg: &Message,
+) -> Result<Message, ProcessManagerError> {
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, msg) }
+        .map_err(|_| ProcessManagerError::Unsupported)?;
+    match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) } {
+        Ok(Some(reply)) => Ok(reply),
+        _ => Err(ProcessManagerError::WouldBlock),
+    }
+}
+
+#[cfg(not(test))]
+fn decode_u64(payload: &[u8]) -> Option<u64> {
+    if payload.len() < 8 {
+        return None;
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&payload[..8]);
+    Some(u64::from_le_bytes(b))
+}
+
+#[cfg(not(test))]
+unsafe fn pm_read_all_via_vfs(
+    vfs_send_cap: u32,
+    reply_recv_cap: u32,
+    path: &[u8],
+) -> Result<Vec<u8>, ProcessManagerError> {
+    let stat_msg = build_statx_message(path).map_err(|_| ProcessManagerError::Malformed)?;
+    let stat_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &stat_msg) }?;
+    let file_len = decode_u64(stat_reply.as_slice()).ok_or(ProcessManagerError::Malformed)? as usize;
+
+    let open_msg = build_openat_message(path, 0).map_err(|_| ProcessManagerError::Malformed)?;
+    let open_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &open_msg) }?;
+    let fd = decode_u64(open_reply.as_slice()).ok_or(ProcessManagerError::Malformed)?;
+    let mut out = Vec::with_capacity(file_len);
+    let mut eof = false;
+    while !eof && out.len() < file_len {
+        let to_read = core::cmp::min(512usize, file_len - out.len());
+        let read_msg = build_read_message(fd, to_read).map_err(|_| ProcessManagerError::Malformed)?;
+        let read_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &read_msg) }?;
+        let payload = read_reply.as_slice();
+        let read_len = decode_u64(payload).ok_or(ProcessManagerError::Malformed)? as usize;
+        let inline = payload.get(16..).unwrap_or(&[]);
+        let copy_len = core::cmp::min(read_len, inline.len());
+        if copy_len > 0 {
+            out.extend_from_slice(&inline[..copy_len]);
+        }
+        if read_len == 0 || copy_len == 0 {
+            eof = true;
+        }
+    }
+    let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+    let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+    Ok(out)
 }
 
 #[cfg(test)]
