@@ -1355,77 +1355,116 @@ fn ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
 
 fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
     let mut state = Bootstrap::init().expect("init");
+    // task1=requester, task2=receiver/replier
     state.register_task(1).expect("task1");
     state.register_task(2).expect("task2");
-    let (asid1, aspace_map_cap1) = state.create_user_address_space().expect("asid1");
-    state.bind_task_asid(1, asid1).expect("bind task1 asid");
+    let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+    let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+    state.bind_task_asid(1, asid1).expect("bind1");
+    state.bind_task_asid(2, asid2).expect("bind2");
     state
-        .map_user_page(
-            aspace_map_cap1,
-            VirtAddr(0x3000),
-            Mapping {
-                phys: PhysAddr(0x7000),
-                flags: PageFlags::USER_RW,
-            },
-        )
-        .expect("map task1 reply recv buffers");
-    let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
-    let recv_cap = state
-        .grant_capability_task_to_task(0, recv_cap_global, 1)
-        .expect("dup recv cap");
-    state.enqueue_current_cpu(2).expect("enqueue");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
-    while state.current_tid() != Some(0) {
-        state.yield_current().expect("switch to root");
-    }
-    let reply_cap = state
-        .create_reply_cap_for_caller(ThreadId(1), recv_cap_global, Some(ThreadId(2)))
-        .expect("reply cap");
-    let reply_cap_task2 = state
-        .grant_capability_task_to_task(0, reply_cap, 2)
-        .expect("dup reply cap");
+        .map_user_page(aspace1, VirtAddr(0x3000), Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW })
+        .expect("map req buffers");
+    state
+        .map_user_page(aspace2, VirtAddr(0x4000), Mapping { phys: PhysAddr(0xB000), flags: PageFlags::USER_RW })
+        .expect("map recv buffers");
 
+    let (_req_eid, req_send_cap_global, req_recv_cap_global) = state.create_endpoint(4).expect("req ep");
+    let req_send_cap_t1 = state
+        .grant_capability_task_to_task(0, req_send_cap_global, 1)
+        .expect("dup req send to requester");
+    let req_recv_cap_t2 = state
+        .grant_capability_task_to_task(0, req_recv_cap_global, 2)
+        .expect("dup req recv to receiver");
+    let (_reply_eid, _reply_send, reply_recv_cap_global) = state.create_endpoint(4).expect("reply ep");
+    let reply_recv_cap_t1 = state
+        .grant_capability_task_to_task(0, reply_recv_cap_global, 1)
+        .expect("dup reply recv to requester");
+    state.enqueue_current_cpu(2).expect("enqueue2");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+    state.dispatch_next_task().expect("dispatch");
     while state.current_tid() != Some(1) {
-        state.yield_current().expect("switch to task1");
+        state.yield_current().expect("switch to requester");
     }
-    let payload_ptr = 0x3000usize;
-    let meta_ptr = 0x3080usize;
-    let mut recv_frame = TrapFrame::new(
-        crate::kernel::syscall::Syscall::IpcRecv as usize,
-        [
-            recv_cap.0 as usize,
-            payload_ptr,
-            16,
-            meta_ptr,
-            40,
-            0,
-        ],
+    let mut call = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcCall as usize,
+        [req_send_cap_t1.0 as usize, 0, 0, 0, 0, reply_recv_cap_t1.0 as usize],
     );
     state
-        .handle_trap(Trap::Syscall, Some(&mut recv_frame))
-        .expect("recv blocks");
+        .handle_trap(Trap::Syscall, Some(&mut call))
+        .expect("requester ipc_call");
     while state.current_tid() != Some(2) {
-        state.yield_current().expect("switch replier");
+        state.yield_current().expect("switch to receiver");
     }
-    let reply = Message::with_header(0, 0x44, 0, None, b"rp").expect("reply");
-    state.ipc_reply(reply_cap_task2, reply).expect("reply");
+
+    // Receiver consumes request via recv-v2 and obtains receiver-local reply cap from out-meta.
+    let mut recv_req = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [req_recv_cap_t2.0 as usize, 0x4000, 8, 0x4080, 40, 0],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_req))
+        .expect("receiver recv-v2 request");
+    let req_meta = state
+        .read_user_memory_for_asid(asid2, 0x4080, 40)
+        .expect("read req meta");
+    let req_meta_flags = u64::from_le_bytes(req_meta[24..32].try_into().expect("flags"));
+    assert_ne!(req_meta_flags & (1u64 << 0), 0, "reply-cap flag expected");
+    let receiver_local_reply_cap = CapId(u64::from_le_bytes(
+        req_meta[16..24].try_into().expect("reply cap field"),
+    ));
+    let recv_local_cap = state
+        .capability_service()
+        .resolve_current_task_capability(receiver_local_reply_cap)
+        .expect("receiver must own materialized reply cap");
+    assert!(matches!(recv_local_cap.object, CapObject::Reply { .. }));
+
+    // Requester blocks in recv-v2 on reply endpoint with mapped user buffers.
     while state.current_tid() != Some(1) {
-        state.yield_current().expect("switch receiver");
+        state.yield_current().expect("switch to requester");
+    }
+    let mut recv_reply = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [reply_recv_cap_t1.0 as usize, 0x3000, 8, 0x3080, 40, 0],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_reply))
+        .expect("requester recv-v2 blocks");
+
+    while state.current_tid() != Some(2) {
+        state.yield_current().expect("switch back to receiver");
+    }
+    let reply = Message::with_header(2, 0x44, 0, None, b"rp").expect("reply");
+    state
+        .ipc_reply(receiver_local_reply_cap, reply)
+        .expect("ipc_reply should succeed with receiver-local cap");
+
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("switch to requester wake");
     }
     let payload = state
-        .read_user_memory_for_asid(asid1, payload_ptr, 2)
-        .expect("read payload");
-    let mut meta = [0u8; 40];
-    state
-        .copy_from_current_user_into_slice(meta_ptr, meta.len(), &mut meta)
-        .expect("read meta");
-    assert_eq!(payload[..2], *b"rp");
+        .read_user_memory_for_asid(asid1, 0x3000, 2)
+        .expect("read reply payload");
+    let meta = state
+        .read_user_memory_for_asid(asid1, 0x3080, 40)
+        .expect("read reply meta");
+    assert_eq!(&payload[..2], b"rp");
     assert_eq!(u16::from_le_bytes(meta[8..10].try_into().expect("opcode")), 0x44);
+    assert_eq!(u16::from_le_bytes(meta[10..12].try_into().expect("flags")), 0);
+    assert_eq!(u64::from_le_bytes(meta[16..24].try_into().expect("cap")), u64::MAX);
+    assert_eq!(u64::from_le_bytes(meta[32..40].try_into().expect("sender")), 2);
 
-    state.yield_current().expect("switch sender");
-    state.yield_current().expect("switch receiver");
-    assert_eq!(state.ipc_recv(recv_cap).expect("recv queued"), None);
+    // No duplicate reply queued.
+    assert_eq!(state.ipc_recv(reply_recv_cap_t1).expect("follow-up recv"), None);
+    // One-shot reply cap consumption.
+    let replay = Message::with_header(2, 0x44, 0, None, b"xx").expect("replay");
+    assert!(
+        matches!(
+            state.ipc_reply(receiver_local_reply_cap, replay),
+            Err(KernelError::WrongObject | KernelError::StaleCapability)
+        ),
+        "reusing one-shot reply cap must fail"
+    );
 }
 
 #[test]
