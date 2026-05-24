@@ -106,6 +106,12 @@
 - `args[3..4]`: inline payload lanes for kernel/no-ASID path
 - `args[5]`: caller reply-receive endpoint capability id (kernel mints and transfers ephemeral reply cap)
 
+`IpcCall` runtime semantics (current contract):
+
+- `IpcCall` performs request send/queue only.
+- Reply payload is **not** consumed from syscall return registers.
+- Caller must receive reply via explicit `IpcRecv`/`IpcRecvTimeout` (recv-v2 out-meta path).
+
 ### `IpcReply` argument layout
 
 - `args[0]`: reply capability id (`CapObject::Reply` with `SEND` right)
@@ -211,6 +217,36 @@
 - `ret1`: auxiliary value (message length)
 - `ret2`: transferred capability id (`u64::MAX` sentinel when none)
 - `error`: syscall error code (`0` means success)
+
+## `IpcRecv` / `IpcRecvTimeout` recv-v2 out-meta contract (current)
+
+- Return register success/error only:
+  - success: `ret0 == 0`
+  - error: syscall error code path
+- Recv metadata is returned only through `IpcRecvMetaV2` out pointer memory.
+- No recv metadata lanes in `ret0..ret2` (and no `ret5` dependency).
+- Reply payloads are delivered unchanged (no opcode-prefix stripping for replies).
+- Legacy inline request-prefix stripping applies only to request-framed inline messages.
+
+Blocked recv-v2 completion:
+
+- Portable `BlockedRecvState` is stored in task state when recv-v2 blocks.
+- Delivery-time completion copies payload into saved user receive buffer.
+- Delivery-time completion copies `IpcRecvMetaV2` into saved out-meta pointer.
+- Completion is used for both send-delivery and reply-delivery waiter paths.
+- Message is consumed exactly once (no enqueue duplication after waiter completion).
+- No syscall re-exec model and no userspace recv retry workaround.
+
+Received-cap materialization:
+
+- Reply/transfer capabilities are materialized into receiver-local cap IDs before writing meta.
+- Raw Reply object handles are not exposed directly to userspace.
+- One-shot Reply objects must be materialized once per delivered message.
+
+Portability boundary:
+
+- Generic kernel recv completion logic is ISA-neutral (no x0/rax/a0/ELR/SVC assumptions).
+- Architecture code maps abstract syscall success/error to ISA return registers and resume semantics only.
 
 ## Error codes
 

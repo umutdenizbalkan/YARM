@@ -384,52 +384,9 @@ fn materialize_received_message_cap(
     } else {
         ("none", None)
     };
-    let Some(raw_value) = value else {
-        crate::yarm_log!(
-            "IPC_RECV_CAP_MATERIALIZE kind={} receiver_tid={} sender_tid={} raw={} local={}",
-            kind,
-            receiver_tid,
-            sender_tid,
-            SYSCALL_NO_TRANSFER_CAP,
-            SYSCALL_NO_TRANSFER_CAP
-        );
-        return Ok(None);
-    };
+    let Some(raw_value) = value else { return Ok(None); };
     match materialize_received_transfer_cap(kernel, Some(raw_value), endpoint, receiver_tid) {
         Ok(local_cap) => {
-            let receiver_cnode = kernel.task_cnode(receiver_tid);
-            let local = local_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
-            let slot_cap =
-                receiver_cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, CapId(local)));
-            let live_cap =
-                slot_cap.and_then(|cap| kernel.capability_object_live(cap.object).map(|_| cap));
-            crate::yarm_log!(
-                "IPC_RECV_CAP_MATERIALIZE kind={} receiver_tid={} sender_tid={} raw={} local={}",
-                kind,
-                receiver_tid,
-                sender_tid,
-                raw_value,
-                local
-            );
-            crate::yarm_log!(
-                "IPC_RECV_CAP_MATERIALIZE_DETAIL kind={} receiver_tid={} raw={} local={} object={:?} rights={:?} cnode={}",
-                kind,
-                receiver_tid,
-                raw_value,
-                local,
-                slot_cap.map(|c| c.object),
-                slot_cap.map(|c| c.rights()),
-                receiver_cnode.map(|c| c.0).unwrap_or(u64::MAX)
-            );
-            crate::yarm_log!(
-                "IPC_RECV_CAP_MATERIALIZE_PROBE receiver_tid={} local={} slot_found={} object_live={} object={:?} rights={:?}",
-                receiver_tid,
-                local,
-                slot_cap.is_some(),
-                live_cap.is_some(),
-                slot_cap.map(|c| c.object),
-                slot_cap.map(|c| c.rights())
-            );
             Ok(local_cap)
         }
         Err(first_err) => {
@@ -450,38 +407,6 @@ fn materialize_received_message_cap(
                             Capability::new(reply_object, CapRights::SEND),
                         )
                         .map_err(SyscallError::from)?;
-                    let receiver_cnode = kernel.task_cnode(receiver_tid);
-                    let slot_cap =
-                        receiver_cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, minted));
-                    let live_cap =
-                        slot_cap.and_then(|cap| kernel.capability_object_live(cap.object).map(|_| cap));
-                    crate::yarm_log!(
-                        "IPC_RECV_CAP_MATERIALIZE kind={} receiver_tid={} sender_tid={} raw={} local={}",
-                        kind,
-                        receiver_tid,
-                        sender_tid,
-                        raw_value,
-                        minted.0
-                    );
-                    crate::yarm_log!(
-                        "IPC_RECV_CAP_MATERIALIZE_DETAIL kind={} receiver_tid={} raw={} local={} object={:?} rights={:?} cnode={}",
-                        kind,
-                        receiver_tid,
-                        raw_value,
-                        minted.0,
-                        slot_cap.map(|c| c.object),
-                        slot_cap.map(|c| c.rights()),
-                        receiver_cnode.map(|c| c.0).unwrap_or(u64::MAX)
-                    );
-                    crate::yarm_log!(
-                        "IPC_RECV_CAP_MATERIALIZE_PROBE receiver_tid={} local={} slot_found={} object_live={} object={:?} rights={:?}",
-                        receiver_tid,
-                        minted.0,
-                        slot_cap.is_some(),
-                        live_cap.is_some(),
-                        slot_cap.map(|c| c.object),
-                        slot_cap.map(|c| c.rights())
-                    );
                     return Ok(Some(minted.0));
                 }
             }
@@ -2329,55 +2254,6 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::ReadInitramfsFile => handle_read_initramfs_file(kernel, frame),
         Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame),
     };
-    if result == Err(SyscallError::InvalidCapability) {
-        let tid = caller_tid.unwrap_or(0);
-        let task_status = kernel.task_status(tid);
-        crate::yarm_log!(
-            "SYSCALL_INVALID_CAPABILITY tid={} nr={} a0={} a1={} a2={} a3={} a4={} a5={} status={:?}",
-            tid,
-            frame.syscall_num(),
-            frame.arg(0),
-            frame.arg(1),
-            frame.arg(2),
-            frame.arg(3),
-            frame.arg(4),
-            frame.arg(5),
-            task_status
-        );
-        match syscall {
-            Syscall::IpcSend => {
-                crate::yarm_log!(
-                    "SYSCALL_INVALID_CAPABILITY_IPC_SEND tid={} send_cap={} transfer_cap={}",
-                    tid,
-                    frame.arg(SYSCALL_ARG_CAP),
-                    frame.arg(SYSCALL_ARG_TRANSFER_CAP)
-                );
-            }
-            Syscall::IpcRecv | Syscall::IpcRecvTimeout => {
-                crate::yarm_log!(
-                    "SYSCALL_INVALID_CAPABILITY_IPC_RECV tid={} recv_cap={}",
-                    tid,
-                    frame.arg(SYSCALL_ARG_CAP)
-                );
-            }
-            Syscall::IpcCall => {
-                crate::yarm_log!(
-                    "SYSCALL_INVALID_CAPABILITY_IPC_CALL tid={} send_cap={} reply_cap={}",
-                    tid,
-                    frame.arg(SYSCALL_ARG_CAP),
-                    frame.arg(SYSCALL_ARG_TRANSFER_CAP)
-                );
-            }
-            Syscall::IpcReply => {
-                crate::yarm_log!(
-                    "SYSCALL_INVALID_CAPABILITY_IPC_REPLY tid={} reply_cap={}",
-                    tid,
-                    frame.arg(SYSCALL_ARG_CAP)
-                );
-            }
-            _ => {}
-        }
-    }
     if result == Err(SyscallError::WouldBlock) {
         let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
         let caller_blocked = matches!(

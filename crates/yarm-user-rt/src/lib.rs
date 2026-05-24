@@ -268,25 +268,10 @@ pub mod syscall {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         if ret.ret0 != 0 && meta.status == u64::MAX {
             let err = decode_syscall_error(ret.ret0);
-            crate::user_log!(
-                "USER_RT_RECV_V2_INTERNAL_REASON reason=ret0_nonzero_meta_unset ret0={} status={} opcode={} flags={} len={}",
-                ret.ret0,
-                meta.status,
-                meta.opcode,
-                meta.flags,
-                meta.payload_len
-            );
             return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
         }
         let payload_len = meta.payload_len as usize;
         if payload_len > Message::MAX_PAYLOAD || payload_len > FRAMED_MAX {
-            crate::user_log!(
-                "USER_RT_RECV_V2_INTERNAL_REASON reason=payload_len_oob status={} opcode={} flags={} len={}",
-                meta.status,
-                meta.opcode,
-                meta.flags,
-                meta.payload_len
-            );
             return Err(SyscallError::Internal);
         }
         let opcode = meta.opcode;
@@ -312,16 +297,7 @@ pub mod syscall {
         };
         let flags = if transferred_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 };
         let msg = Message::with_header(meta.sender_tid, opcode, flags, transferred_cap.map(|c| c as u64), msg_payload)
-            .map_err(|_| {
-                crate::user_log!(
-                    "USER_RT_RECV_V2_INTERNAL_REASON reason=message_with_header_failed status={} opcode={} flags={} len={}",
-                    meta.status,
-                    meta.opcode,
-                    meta.flags,
-                    meta.payload_len
-                );
-                SyscallError::InvalidArgs
-            })?;
+            .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some(ReceivedMessage { message: msg, reply_cap, transferred_cap, sender_tid: meta.sender_tid }))
     }
 

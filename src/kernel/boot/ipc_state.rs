@@ -384,30 +384,11 @@ impl KernelState {
         crate::yarm_log!("IPC_REPLY_ENTER tid={}", current_tid);
         let capability = self.resolve_send_cap_task_local(reply_cap)?;
         if !capability.has_right(CapRights::SEND) {
-            crate::yarm_log!(
-                "IPC_REPLY_WRONG_OBJECT_DETAIL tid={} cap={} looked_object={:?} rights={:?} reply_state=none reason=missing_send_right",
-                current_tid,
-                reply_cap.0,
-                Some(capability.object),
-                Some(capability.rights()),
-            );
             return Err(KernelError::MissingRight);
         }
         let slot = match self.resolve_reply_index(capability.object) {
             Ok(slot) => slot,
-            Err(err) => {
-                if err == KernelError::WrongObject || err == KernelError::StaleCapability {
-                    crate::yarm_log!(
-                        "IPC_REPLY_WRONG_OBJECT_DETAIL tid={} cap={} looked_object={:?} rights={:?} reply_state=resolve_reply_index_failed reason={:?}",
-                        current_tid,
-                        reply_cap.0,
-                        Some(capability.object),
-                        Some(capability.rights()),
-                        err
-                    );
-                }
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
         let replier_tid = ThreadId(self.current_tid().ok_or(KernelError::TaskMissing)?);
         let allowed = self.with_ipc_state(|ipc| {
@@ -415,14 +396,6 @@ impl KernelState {
             Ok::<_, KernelError>(rec.responder_tid.is_none_or(|tid| tid == replier_tid))
         })?;
         if !allowed {
-            crate::yarm_log!(
-                "IPC_REPLY_WRONG_OBJECT_DETAIL tid={} cap={} looked_object={:?} rights={:?} reply_state=slot={} reason=responder_tid_mismatch",
-                current_tid,
-                reply_cap.0,
-                Some(capability.object),
-                Some(capability.rights()),
-                slot
-            );
             return Err(KernelError::MissingRight);
         }
         let record = self.with_ipc_state_mut(|ipc| {
@@ -433,21 +406,7 @@ impl KernelState {
 
         let endpoint_idx = match self.resolve_endpoint_index(record.reply_endpoint) {
             Ok(idx) => idx,
-            Err(err) => {
-                if err == KernelError::WrongObject || err == KernelError::StaleCapability {
-                    crate::yarm_log!(
-                        "IPC_REPLY_WRONG_OBJECT_DETAIL tid={} cap={} looked_object={:?} rights={:?} reply_state=slot={} reason=reply_endpoint_invalid endpoint={:?} endpoint_err={:?}",
-                        current_tid,
-                        reply_cap.0,
-                        Some(capability.object),
-                        Some(capability.rights()),
-                        slot,
-                        record.reply_endpoint,
-                        err
-                    );
-                }
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
         if let CapObject::Reply { index, generation } = capability.object {
             crate::yarm_log!(
