@@ -246,6 +246,7 @@ fn arch_cr3_for_asid(_asid: Asid) -> Option<u64> {
 struct Entry {
     virt: VirtAddr,
     mapping: Mapping,
+    pages: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +286,34 @@ impl AddressSpace {
         } else {
             Err(lo)
         }
+    }
+
+    fn entry_end_virt(entry: &Entry) -> u64 {
+        entry.virt.0 + (entry.pages as u64 * PAGE_SIZE as u64)
+    }
+
+    fn find_entry_containing(&self, virt: VirtAddr) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + ((hi - lo) / 2);
+            let entry = self.entries[mid].expect("dense mapping table");
+            if Self::entry_end_virt(&entry) <= virt.0 {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < self.len {
+            let entry = self.entries[lo].expect("dense mapping table");
+            if entry.virt.0 <= virt.0 && virt.0 < Self::entry_end_virt(&entry) {
+                return Some(lo);
+            }
+        }
+        None
     }
 
     pub fn new_kernel() -> Self {
@@ -350,6 +379,9 @@ impl AddressSpace {
             );
         }
 
+        if self.find_entry_containing(virt).is_some() && self.find_entry_index(virt).is_err() {
+            return Err(VmError::PrivilegeViolation);
+        }
         match self.find_entry_index(virt) {
             Ok(i) => {
                 let entry = self.entries[i].as_mut().expect("entry");
@@ -370,10 +402,38 @@ impl AddressSpace {
                     return Err(VmError::Full);
                 }
                 arch_map_page(self.asid, virt, mapping)?;
+                let prev_merge = i > 0 && self.entries[i - 1].is_some_and(|prev| {
+                    prev.mapping.flags == mapping.flags
+                        && Self::entry_end_virt(&prev) == virt.0
+                        && prev.mapping.phys.0 + (prev.pages as u64 * PAGE_SIZE as u64) == mapping.phys.0
+                });
+                if prev_merge {
+                    let prev = self.entries[i - 1].as_mut().expect("prev");
+                    prev.pages += 1;
+                    return Ok(None);
+                }
+
+                let next_merge = i < self.len && self.entries[i].is_some_and(|next| {
+                    next.mapping.flags == mapping.flags
+                        && virt.0 + PAGE_SIZE as u64 == next.virt.0
+                        && mapping.phys.0 + PAGE_SIZE as u64 == next.mapping.phys.0
+                });
+                if next_merge {
+                    let next = self.entries[i].as_mut().expect("next");
+                    next.virt = virt;
+                    next.mapping = mapping;
+                    next.pages += 1;
+                    return Ok(None);
+                }
+
                 for shift_idx in (i..self.len).rev() {
                     self.entries[shift_idx + 1] = self.entries[shift_idx];
                 }
-                self.entries[i] = Some(Entry { virt, mapping });
+                self.entries[i] = Some(Entry {
+                    virt,
+                    mapping,
+                    pages: 1,
+                });
                 self.len += 1;
                 Ok(None)
             }
@@ -389,16 +449,55 @@ impl AddressSpace {
     }
 
     pub fn unmap_page(&mut self, virt: VirtAddr) -> Option<Mapping> {
-        let idx = self.find_entry_index(virt).ok()?;
-        let old = self.entries[idx]?.mapping;
+        let idx = self.find_entry_containing(virt)?;
+        let entry = self.entries[idx]?;
+        let page_offset = ((virt.0 - entry.virt.0) / PAGE_SIZE as u64) as usize;
+        let old = Mapping {
+            phys: PhysAddr(entry.mapping.phys.0 + (page_offset as u64 * PAGE_SIZE as u64)),
+            flags: entry.mapping.flags,
+        };
         arch_unmap_page(self.asid, virt);
-        for shift_idx in idx..self.len.saturating_sub(1) {
-            self.entries[shift_idx] = self.entries[shift_idx + 1];
-        }
-        if self.len > 0 {
+        if entry.pages == 1 {
+            for shift_idx in idx..self.len.saturating_sub(1) {
+                self.entries[shift_idx] = self.entries[shift_idx + 1];
+            }
             self.entries[self.len - 1] = None;
             self.len -= 1;
+            return Some(old);
         }
+        if page_offset == 0 {
+            let current = self.entries[idx].as_mut().expect("entry");
+            current.virt = VirtAddr(current.virt.0 + PAGE_SIZE as u64);
+            current.mapping.phys = PhysAddr(current.mapping.phys.0 + PAGE_SIZE as u64);
+            current.pages -= 1;
+            return Some(old);
+        }
+        if page_offset == entry.pages - 1 {
+            self.entries[idx].as_mut().expect("entry").pages -= 1;
+            return Some(old);
+        }
+        if self.len >= MAX_MAPPINGS {
+            return Some(old);
+        }
+        for shift_idx in (idx + 1..self.len).rev() {
+            self.entries[shift_idx + 1] = self.entries[shift_idx];
+        }
+        let left_pages = page_offset;
+        let right_pages = entry.pages - page_offset - 1;
+        self.entries[idx] = Some(Entry {
+            virt: entry.virt,
+            mapping: entry.mapping,
+            pages: left_pages,
+        });
+        self.entries[idx + 1] = Some(Entry {
+            virt: VirtAddr(virt.0 + PAGE_SIZE as u64),
+            mapping: Mapping {
+                phys: PhysAddr(old.phys.0 + PAGE_SIZE as u64),
+                flags: old.flags,
+            },
+            pages: right_pages,
+        });
+        self.len += 1;
         Some(old)
     }
 
@@ -406,8 +505,13 @@ impl AddressSpace {
     ///
     /// Complexity: O(log N) over the sorted fixed-size mapping table.
     pub fn resolve(&self, virt: VirtAddr) -> Option<Mapping> {
-        let idx = self.find_entry_index(virt).ok()?;
-        Some(self.entries[idx]?.mapping)
+        let idx = self.find_entry_containing(virt)?;
+        let entry = self.entries[idx]?;
+        let page_offset = (virt.0 - entry.virt.0) / PAGE_SIZE as u64;
+        Some(Mapping {
+            phys: PhysAddr(entry.mapping.phys.0 + page_offset * PAGE_SIZE as u64),
+            flags: entry.mapping.flags,
+        })
     }
 
     pub fn mappings(&self) -> usize {
@@ -837,6 +941,58 @@ mod tests {
             },
         );
         assert_eq!(bad_phys, Err(VmError::Misaligned));
+    }
+
+    #[test]
+    fn contiguous_user_stack_sized_mapping_coalesces() {
+        let mut aspace = AddressSpace::new_user();
+        let base = VirtAddr(0x3ff8_0000);
+        for i in 0..128usize {
+            let va = VirtAddr(base.0 + (i as u64 * PAGE_SIZE as u64));
+            let pa = PhysAddr(0x2000_0000 + (i as u64 * PAGE_SIZE as u64));
+            assert_eq!(
+                aspace.map_page(
+                    va,
+                    Mapping {
+                        phys: pa,
+                        flags: PageFlags::USER_RW
+                    }
+                ),
+                Ok(None)
+            );
+        }
+        assert_eq!(aspace.mappings(), 1);
+        assert!(aspace.resolve(base).is_some());
+        assert!(aspace
+            .resolve(VirtAddr(base.0 + (127 * PAGE_SIZE) as u64))
+            .is_some());
+        assert_eq!(aspace.resolve(VirtAddr(base.0 - PAGE_SIZE as u64)), None);
+    }
+
+    #[test]
+    fn adjacent_pages_with_different_permissions_do_not_coalesce() {
+        let mut aspace = AddressSpace::new_user();
+        assert_eq!(
+            aspace.map_page(
+                VirtAddr(0x2000),
+                Mapping {
+                    phys: PhysAddr(0x3000),
+                    flags: PageFlags::USER_RX
+                }
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            aspace.map_page(
+                VirtAddr(0x3000),
+                Mapping {
+                    phys: PhysAddr(0x4000),
+                    flags: PageFlags::USER_RW
+                }
+            ),
+            Ok(None)
+        );
+        assert_eq!(aspace.mappings(), 2);
     }
 
     #[test]
