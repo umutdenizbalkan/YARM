@@ -8,12 +8,30 @@ use super::super::common::vfs_ipc::{
 };
 use super::super::common::service::FsService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
+use yarm_srv_common::vfs_core::VfsBackend;
 use super::archive::{
-    INITRAMFS_BOOT_MARKER_PATH, InitramfsBackend, InitramfsMetrics,
+    INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_DRIVER_MANAGER_PATH, InitramfsBackend, InitramfsMetrics,
 };
+use super::boot_initrd_bytes;
 use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type InitramfsService = FsService<InitramfsBackend>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitramfsBackendSource {
+    Cpio,
+    Placeholder,
+}
+
+fn build_runtime_backend() -> (InitramfsBackend, InitramfsBackendSource) {
+    if let Some(cpio) = boot_initrd_bytes() {
+        return (
+            InitramfsBackend::from_cpio_newc_static(cpio),
+            InitramfsBackendSource::Cpio,
+        );
+    }
+    (InitramfsBackend::new(8192), InitramfsBackendSource::Placeholder)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitramfsLoopSummary {
@@ -80,7 +98,26 @@ pub fn run_request_loop(service: &mut InitramfsService) -> Result<InitramfsLoopS
 
 pub fn run() {
     yarm_user_rt::user_log!("INITRAMFS_SRV_ENTRY");
-    let mut svc = InitramfsService::with_backend(InitramfsBackend::new(8192));
+    let (backend, backend_source) = build_runtime_backend();
+    let mut svc = InitramfsService::with_backend(backend);
+    let driver_manager_size = svc
+        .backend_mut()
+        .statx_path(INITRAMFS_DRIVER_MANAGER_PATH)
+        .unwrap_or(0);
+    match backend_source {
+        InitramfsBackendSource::Cpio => {
+            yarm_user_rt::user_log!(
+                "INITRAMFS_BACKEND_SOURCE source=cpio driver_manager_size={}",
+                driver_manager_size
+            );
+        }
+        InitramfsBackendSource::Placeholder => {
+            yarm_user_rt::user_log!(
+                "INITRAMFS_BACKEND_SOURCE source=placeholder reason=missing_boot_initrd driver_manager_size={}",
+                driver_manager_size
+            );
+        }
+    }
     let summary = run_request_loop(&mut svc).expect("initramfs loop");
 
     yarm_user_rt::user_log!(
@@ -343,5 +380,11 @@ mod tests {
         assert_eq!(status, 0);
         assert_eq!(n, 15);
         assert_eq!(&bytes[..n as usize], b"\x7fELFinit-binary");
+    }
+
+    #[test]
+    fn build_runtime_backend_uses_placeholder_when_boot_initrd_missing() {
+        let (_backend, source) = build_runtime_backend();
+        assert_eq!(source, InitramfsBackendSource::Placeholder);
     }
 }
