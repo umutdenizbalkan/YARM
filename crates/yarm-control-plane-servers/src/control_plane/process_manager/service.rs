@@ -1187,11 +1187,22 @@ impl ProcessService {
                             startup_args[14] = req.service_caps[1];
                             startup_args[15] = req.service_caps[2];
                             startup_args[16] = req.service_caps[3];
+                            let vfs_send_cap = req.service_caps[0] as u32;
+                            if vfs_send_cap == 0 {
+                                yarm_user_rt::user_log!(
+                                    "PM_VFS_SPAWN_FAIL image_id={} err=missing_vfs_send_cap",
+                                    req.image_id
+                                );
+                                let encoded = encode_spawn_v5_reply(0, 0);
+                                return Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &encoded)
+                                    .map_err(|_| ProcessManagerError::Malformed);
+                            }
                             let (t, c, s) = unsafe {
                                 pm_vfs_spawn_inline(
                                     req.image_id,
                                     req.parent_pid.0,
                                     &startup_args,
+                                    vfs_send_cap,
                                 )
                             }?;
                             (t, c as u64, s)
@@ -1363,6 +1374,7 @@ unsafe fn pm_vfs_spawn_inline(
     image_id: u64,
     parent_pid: u64,
     startup_args: &[u64; 18],
+    vfs_send_cap: u32,
 ) -> Result<(u64, u32, u32), ProcessManagerError> {
     let path_label: &[u8] = match image_id {
         4 => b"/initramfs/sbin/initramfs_srv",
@@ -1385,7 +1397,11 @@ unsafe fn pm_vfs_spawn_inline(
         image_id, path_log, parent_pid
     );
     let ctx = yarm_user_rt::runtime::startup_context();
-    let vfs_send_cap = ctx.process_manager_request_send_cap.ok_or(ProcessManagerError::Unsupported)?;
+    yarm_user_rt::user_log!(
+        "PM_VFS_CAPS send_cap={} reply_cap={}",
+        vfs_send_cap, 
+        ctx.process_manager_reply_recv_cap.unwrap_or(0)
+    );
     let reply_recv_cap = ctx.process_manager_reply_recv_cap.ok_or(ProcessManagerError::Unsupported)?;
     let image = unsafe { pm_read_all_via_vfs(vfs_send_cap, reply_recv_cap, path_label) }?;
     if image.is_empty() {
@@ -1454,10 +1470,19 @@ unsafe fn pm_read_all_via_vfs(
     path: &[u8],
 ) -> Result<Vec<u8>, ProcessManagerError> {
     let stat_msg = build_statx_message(path).map_err(|_| ProcessManagerError::Malformed)?;
+    yarm_user_rt::user_log!(
+        "PM_VFS_CALL op=STATX path={}",
+        core::str::from_utf8(path).unwrap_or("<path-bytes>")
+    );
     let stat_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &stat_msg) }?;
+    yarm_user_rt::user_log!("PM_VFS_REPLY op=STATX status={}", decode_u64(stat_reply.as_slice()).unwrap_or(u64::MAX));
     let file_len = decode_u64(stat_reply.as_slice()).ok_or(ProcessManagerError::Malformed)? as usize;
 
     let open_msg = build_openat_message(path, 0).map_err(|_| ProcessManagerError::Malformed)?;
+    yarm_user_rt::user_log!(
+        "PM_VFS_CALL op=OPENAT path={}",
+        core::str::from_utf8(path).unwrap_or("<path-bytes>")
+    );
     let open_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &open_msg) }?;
     let fd = decode_u64(open_reply.as_slice()).ok_or(ProcessManagerError::Malformed)?;
     let mut out = Vec::with_capacity(file_len);
@@ -1465,6 +1490,7 @@ unsafe fn pm_read_all_via_vfs(
     while !eof && out.len() < file_len {
         let to_read = core::cmp::min(512usize, file_len - out.len());
         let read_msg = build_read_message(fd, to_read).map_err(|_| ProcessManagerError::Malformed)?;
+        yarm_user_rt::user_log!("PM_VFS_CALL op=READ fd={} len={}", fd, to_read);
         let read_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &read_msg) }?;
         let payload = read_reply.as_slice();
         let read_len = decode_u64(payload).ok_or(ProcessManagerError::Malformed)? as usize;
@@ -1478,6 +1504,7 @@ unsafe fn pm_read_all_via_vfs(
         }
     }
     let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+    yarm_user_rt::user_log!("PM_VFS_CALL op=CLOSE fd={}", fd);
     let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
     Ok(out)
 }

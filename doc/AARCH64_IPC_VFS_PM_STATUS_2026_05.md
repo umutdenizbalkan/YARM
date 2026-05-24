@@ -186,6 +186,9 @@ Intentionally left:
   (`driver_manager`, `blkcache_srv`, `virtio_blk_srv`) use canonical
   initramfs paths and VFS `STATX -> OPENAT -> READ* -> CLOSE`, then spawn via
   `spawn_process_from_user_buf`.
+- PM performs VFS-backed `7..=9` loads only when it is explicitly given a
+  `vfs_server` request SEND cap (currently passed from init in SpawnV5 service
+  caps slot 0). Missing cap is reported as a truthful spawn failure.
 - VFS errors are surfaced as spawn failures; PM does not silently mask failures
   by pretending VFS-based loads succeeded.
 - Spawn-source logging remains explicit to avoid duplicate-path ambiguity.
