@@ -78,9 +78,13 @@ during Phase 1 startup:
 
 Rules:
 - Prefix matching is longest-prefix first.
+- Exact mount-root matching is supported (e.g. `/dev` matches the `/dev/` mount).
 - A path that matches no prefix is rejected with `VFS_STATUS_ERR_NO_MOUNT`.
-- The mount table is static for the lifetime of the VFS server process; no
-  dynamic mount/unmount is supported in this revision.
+- Dynamic mount registration is supported via `VFS_OP_MOUNT_REGISTER`:
+  - prefix is normalized before insertion,
+  - duplicate normalized prefixes are rejected,
+  - zero send-cap and invalid/oversized prefixes are rejected,
+  - successful insertion participates in longest-prefix routing.
 
 ---
 
@@ -184,7 +188,7 @@ Source: `crates/yarm-ipc-abi/src/vfs_abi.rs`
 | Opcode not STATX/OPENAT/READ/CLOSE                 | `VFS_STATUS_ERR_UNKNOWN_OP`      |
 | STATX/OPENAT path payload malformed (decode fails) | `VFS_STATUS_ERR_INVALID_PATH`    |
 | Path empty, non-absolute, or exceeds 96 bytes      | `VFS_STATUS_ERR_INVALID_PATH`    |
-| Path contains `..` escaping root                   | `VFS_STATUS_ERR_INVALID_PATH`    |
+| `..` components at root                             | clamped to `/` (not an error)    |
 | Normalized path matches no mount prefix            | `VFS_STATUS_ERR_NO_MOUNT`        |
 | READ/CLOSE payload decode failure (malformed args) | `VFS_STATUS_ERR_CODEC`           |
 | Fd not present in table                            | `VFS_STATUS_ERR_BAD_FD`          |
@@ -202,7 +206,7 @@ the canonical encode/decode for these 4-byte payloads.
 1. **STATX and OPENAT** — path-based routing:
    - Decode the inline path from the message body.  Malformed payload →
      `VFS_STATUS_ERR_INVALID_PATH`.
-   - Normalize the path (collapse `//`, resolve `.`, reject `..` above root).
+   - Normalize the path (collapse `//`, resolve `.`, clamp `..` at `/`).
      Normalization failure → `VFS_STATUS_ERR_INVALID_PATH`.
    - Look up the longest matching prefix in the mount table.  No match →
      `VFS_STATUS_ERR_NO_MOUNT`.

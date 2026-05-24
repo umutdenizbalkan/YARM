@@ -184,14 +184,29 @@ impl VfsMountTable {
             if entry.prefix_len == 0 {
                 continue;
             }
-            if path.starts_with(&entry.prefix[..entry.prefix_len])
-                && entry.prefix_len > best_len
-            {
+            if Self::matches_entry(path, entry) && entry.prefix_len > best_len {
                 best_len = entry.prefix_len;
                 best = Some((entry.send_cap, entry.label));
             }
         }
         best
+    }
+
+    fn matches_entry(path: &[u8], entry: &MountEntry) -> bool {
+        let prefix = &entry.prefix[..entry.prefix_len];
+        // Root mount "/" covers all absolute paths.
+        if prefix == b"/" {
+            return path.starts_with(b"/");
+        }
+        // Stored non-root prefixes are normalized with trailing slash.
+        // They must match:
+        // - the exact mount root without trailing slash (e.g. "/dev"), or
+        // - any child path under that root (e.g. "/dev/null").
+        if let Some(base) = prefix.strip_suffix(b"/") {
+            path == base || path.starts_with(prefix)
+        } else {
+            path == prefix || path.starts_with(prefix)
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -224,6 +239,11 @@ mod tests {
         let (cap, label) = table.route(b"/dev/null").unwrap();
         assert_eq!(cap, 20);
         assert_eq!(label.as_str(), "devfs");
+
+        // Exact mount root (without trailing slash) must route too.
+        let (cap, label) = table.route(b"/dev").unwrap();
+        assert_eq!(cap, 20);
+        assert_eq!(label.as_str(), "devfs");
     }
 
     #[test]
@@ -249,6 +269,11 @@ mod tests {
         let (cap, label) = table.route(b"/dev/null").unwrap();
         assert_eq!(cap, 1);
         assert_eq!(label.as_str(), "devfs");
+
+        // Mount root exact-match remains stable under longest-prefix logic.
+        let (cap, label) = table.route(b"/dev").unwrap();
+        assert_eq!(cap, 1);
+        assert_eq!(label.as_str(), "devfs");
     }
 
     #[test]
@@ -257,6 +282,21 @@ mod tests {
         assert!(!table.register(b"/dev/", "devfs", 0));
         assert_eq!(table.len(), 0);
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn dynamic_mount_routes_exact_root_and_children() {
+        let mut table = VfsMountTable::new();
+        table
+            .insert_dynamic(b"/sys//", 77, 0)
+            .expect("insert dynamic");
+        let (cap_root, label_root) = table.route(b"/sys").expect("root route");
+        assert_eq!(cap_root, 77);
+        assert_eq!(label_root.as_str(), "/sys/");
+
+        let (cap_child, label_child) = table.route(b"/sys/kernel").expect("child route");
+        assert_eq!(cap_child, 77);
+        assert_eq!(label_child.as_str(), "/sys/");
     }
 
     #[test]
