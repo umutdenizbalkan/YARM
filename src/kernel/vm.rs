@@ -269,6 +269,43 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
+    fn isolate_page_entry_at(
+        &mut self,
+        idx: usize,
+        virt: VirtAddr,
+    ) -> Result<usize, VmError> {
+        let entry = self.entries[idx].expect("entry");
+        let page_offset = ((virt.0 - entry.virt.0) / PAGE_SIZE as u64) as usize;
+        if page_offset >= entry.pages {
+            return Err(VmError::PrivilegeViolation);
+        }
+        if page_offset == 0 {
+            return Ok(idx);
+        }
+        if self.len >= MAX_MAPPINGS {
+            return Err(VmError::Full);
+        }
+        for shift_idx in (idx + 1..self.len).rev() {
+            self.entries[shift_idx + 1] = self.entries[shift_idx];
+        }
+        let left_pages = page_offset;
+        let right_pages = entry.pages - page_offset;
+        self.entries[idx] = Some(Entry {
+            virt: entry.virt,
+            mapping: entry.mapping,
+            pages: left_pages,
+        });
+        self.entries[idx + 1] = Some(Entry {
+            virt,
+            mapping: Mapping {
+                phys: PhysAddr(entry.mapping.phys.0 + (page_offset as u64 * PAGE_SIZE as u64)),
+                flags: entry.mapping.flags,
+            },
+            pages: right_pages,
+        });
+        self.len += 1;
+        Ok(idx + 1)
+    }
     fn find_entry_index(&self, virt: VirtAddr) -> Result<usize, usize> {
         let mut lo = 0usize;
         let mut hi = self.len;
@@ -379,18 +416,26 @@ impl AddressSpace {
             );
         }
 
-        if self.find_entry_containing(virt).is_some() && self.find_entry_index(virt).is_err() {
-            return Err(VmError::PrivilegeViolation);
-        }
-        match self.find_entry_index(virt) {
-            Ok(i) => {
+        let exact_idx = match self.find_entry_index(virt) {
+            Ok(i) => Some(i),
+            Err(_) => None,
+        };
+        let containing_idx = self.find_entry_containing(virt);
+        let effective_exact_idx = match (exact_idx, containing_idx) {
+            (some @ Some(_), _) => some,
+            (None, Some(idx)) => Some(self.isolate_page_entry_at(idx, virt)?),
+            (None, None) => None,
+        };
+        match effective_exact_idx {
+            Some(i) => {
                 let entry = self.entries[i].as_mut().expect("entry");
                 let old = entry.mapping;
                 arch_map_page(self.asid, virt, mapping)?;
                 entry.mapping = mapping;
                 Ok(Some(old))
             }
-            Err(i) => {
+            None => {
+                let i = self.find_entry_index(virt).err().expect("insert idx");
                 if self.len >= MAX_MAPPINGS {
                     crate::yarm_log!(
                         "VM_FULL reason=mapping_bookkeeping_full asid={:?} len={} max_mappings={} va=0x{:x}",
@@ -797,7 +842,7 @@ mod tests {
     #[test]
     fn map_and_resolve_page() {
         let mut aspace = AddressSpace::new_kernel();
-        let va = VirtAddr(0x8000_1000);
+        let va = VirtAddr(KERNEL_SPACE_BASE + PAGE_SIZE as u64);
         let mapping = Mapping {
             phys: PhysAddr(0x2000),
             flags: PageFlags::KERNEL_RW,
@@ -805,6 +850,31 @@ mod tests {
 
         assert_eq!(aspace.map_page(va, mapping), Ok(None));
         assert_eq!(aspace.resolve(va), Some(mapping));
+    }
+
+    #[test]
+    fn resolve_contract_unmapped_and_mapped_addresses() {
+        let mut aspace = AddressSpace::new_user();
+        let va = VirtAddr(0x4000);
+        assert_eq!(aspace.resolve(va), None);
+        assert_eq!(
+            aspace.map_page(
+                va,
+                Mapping {
+                    phys: PhysAddr(0x9000),
+                    flags: PageFlags::USER_RW,
+                }
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            aspace.resolve(va),
+            Some(Mapping {
+                phys: PhysAddr(0x9000),
+                flags: PageFlags::USER_RW
+            })
+        );
+        assert_eq!(aspace.resolve(VirtAddr(0x5000)), None);
     }
 
     #[test]
