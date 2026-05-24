@@ -179,6 +179,90 @@ fn clear_blocked_recv_state(kernel: &mut KernelState, tid: u64, reason: &str) {
     }
 }
 
+fn complete_blocked_recv_for_waiter(
+    kernel: &mut KernelState,
+    waiter_tid: u64,
+    msg: &Message,
+) -> Result<(), SyscallError> {
+    let blocked_state = {
+        let tcb = kernel.tcb_mut(waiter_tid).ok_or(SyscallError::InvalidArgs)?;
+        tcb.blocked_recv_state
+            .take()
+            .ok_or(SyscallError::InvalidArgs)?
+    };
+    let waiter_asid = kernel.task_asid(waiter_tid).ok_or(SyscallError::InvalidArgs)?;
+    let payload = msg.as_slice();
+    let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2 {
+        (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
+    } else {
+        (msg.opcode, payload)
+    };
+    if blocked_state.payload_user_len < app_payload.len() {
+        return Err(SyscallError::InvalidArgs);
+    }
+    match kernel.copy_to_user(
+        waiter_asid,
+        VirtAddr(blocked_state.payload_user_ptr as u64),
+        app_payload,
+    ) {
+        Ok(()) => {
+            crate::yarm_log!(
+                "IPC_RECV_BLOCKED_COPY_PAYLOAD result=ok len={}",
+                app_payload.len()
+            );
+        }
+        Err(_) => {
+            crate::yarm_log!(
+                "IPC_RECV_BLOCKED_COPY_PAYLOAD result=err len={}",
+                app_payload.len()
+            );
+            return Err(SyscallError::InvalidArgs);
+        }
+    }
+    if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let recv_meta_flags = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+        SYSCALL_RECV_META_REPLY_CAP
+    } else if (msg.flags & Message::FLAG_CAP_TRANSFER) != 0 {
+        SYSCALL_RECV_META_TRANSFERRED_CAP
+    } else {
+        0
+    };
+    let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
+    let cap_id = msg
+        .transferred_cap()
+        .map(|c| c.0)
+        .unwrap_or(SYSCALL_NO_TRANSFER_CAP);
+    meta[0..8].copy_from_slice(&0u64.to_le_bytes());
+    meta[8..10].copy_from_slice(&app_opcode.to_le_bytes());
+    meta[10..12].copy_from_slice(&0u16.to_le_bytes());
+    meta[12..16].copy_from_slice(&(app_payload.len() as u32).to_le_bytes());
+    meta[16..24].copy_from_slice(&cap_id.to_le_bytes());
+    meta[24..32].copy_from_slice(&(recv_meta_flags as u64).to_le_bytes());
+    meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
+    match kernel.copy_to_user(
+        waiter_asid,
+        VirtAddr(blocked_state.meta_user_ptr as u64),
+        &meta,
+    ) {
+        Ok(()) => {
+            crate::yarm_log!("IPC_RECV_BLOCKED_COPY_META result=ok len=40");
+        }
+        Err(_) => {
+            crate::yarm_log!("IPC_RECV_BLOCKED_COPY_META result=err len=40");
+            return Err(SyscallError::InvalidArgs);
+        }
+    }
+    if let Some(tcb) = kernel.tcb_mut(waiter_tid) {
+        tcb.user_context.arg0 = 0;
+        tcb.user_context.user_gprs[0] = 0;
+    }
+    crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=complete", waiter_tid);
+    crate::yarm_log!("IPC_RECV_BLOCKED_COMPLETE tid={}", waiter_tid);
+    Ok(())
+}
+
 fn current_tid(kernel: &KernelState) -> Result<u64, SyscallError> {
     kernel.current_tid().ok_or(SyscallError::Internal)
 }
@@ -2306,6 +2390,15 @@ mod tests {
         assert_eq!(state.current_tid(), Some(child_tid));
         let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [0x9000, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &mut frame).expect_err("non-leader rejected");
+    }
+
+    #[test]
+    fn blocked_recv_completion_rejects_missing_state() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, _send, _recv) = state.create_endpoint(2).expect("endpoint");
+        let msg = Message::with_header(1, 7, 0, None, b"hello").expect("msg");
+        let err = complete_blocked_recv_for_waiter(&mut state, 0, &msg).expect_err("missing state");
+        assert_eq!(err, SyscallError::InvalidArgs);
     }
 
     #[test]
