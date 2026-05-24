@@ -547,6 +547,12 @@ pub fn run() {
         }
     };
     yarm_user_rt::user_log!("VFS_SRV_RECV_CAP cap={}", recv_cap);
+    let backend_reply_recv_cap = ctx.process_manager_reply_recv_cap.unwrap_or(recv_cap);
+    yarm_user_rt::user_log!(
+        "VFS_BACKEND_REPLY_CAP cap={} shared_with_main_recv={}",
+        backend_reply_recv_cap,
+        if backend_reply_recv_cap == recv_cap { 1 } else { 0 }
+    );
     yarm_user_rt::user_log!("VFS_SRV_BLOCKING_RECV_LOOP");
 
     loop {
@@ -712,20 +718,44 @@ pub fn run() {
         };
 
         yarm_user_rt::user_log!(
-            "VFS_ROUTE_FORWARD target={} send_cap={}",
-            target_label.as_str(), backend_send_cap
+            "VFS_FORWARD_CALL op={} target={} send_cap={} reply_cap={}",
+            msg.opcode,
+            target_label.as_str(),
+            backend_send_cap,
+            backend_reply_recv_cap
         );
+        match unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, backend_reply_recv_cap, &msg) } {
+            Ok(()) => {
+                yarm_user_rt::user_log!("VFS_FORWARD_CALL_SENT op={} status=ok", msg.opcode);
+            }
+            Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+                yarm_user_rt::user_log!("VFS_FORWARD_CALL_BLOCKED_NORMAL op={}", msg.opcode);
+            }
+            Err(err) => {
+                yarm_user_rt::user_log!("VFS_FORWARD_CALL_FAIL op={} err={:?}", msg.opcode, err);
+                let err = vfs_error_reply(yarm_ipc_abi::vfs_abi::VFS_STATUS_ERR_BACKEND);
+                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
+                continue;
+            }
+        }
 
-        // Forward request to backend; pass our own recv_cap as the reply endpoint so
-        // the backend's ipc_reply delivers the response back to this endpoint.
-        let _ = unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, recv_cap, &msg) };
-
-        // Wait for backend reply (satisfies phase-6 timed-receive guardrail).
+        yarm_user_rt::user_log!(
+            "VFS_BACKEND_REPLY_RECV_BEGIN op={} reply_cap={}",
+            msg.opcode,
+            backend_reply_recv_cap
+        );
         let backend_reply =
-            unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(recv_cap, 0) };
+            unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(backend_reply_recv_cap, u64::MAX) };
 
         match backend_reply {
             Ok(Some(ref response)) => {
+                yarm_user_rt::user_log!(
+                    "VFS_BACKEND_REPLY op={} status=ok len={} opcode={} flags={}",
+                    msg.opcode,
+                    response.len,
+                    response.opcode,
+                    response.flags
+                );
                 use yarm_ipc_abi::vfs_abi::{ReadWriteArgs, VFS_OP_CLOSE, VFS_OP_OPENAT};
                 if msg.opcode == VFS_OP_OPENAT {
                     let payload = response.as_slice();
@@ -765,11 +795,18 @@ pub fn run() {
                         fd_table.remove(closed_fd, client_id);
                     }
                 }
-                yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=0");
+                yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=0 len={}", response.len);
                 let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, response) };
             }
-            _ => {
-                yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=1");
+            Ok(None) => {
+                yarm_user_rt::user_log!("VFS_BACKEND_REPLY_RECV_FAIL op={} err=would_block_or_timeout", msg.opcode);
+                yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=1 len=4");
+                let err = vfs_error_reply(yarm_ipc_abi::vfs_abi::VFS_STATUS_ERR_BACKEND);
+                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
+            }
+            Err(err) => {
+                yarm_user_rt::user_log!("VFS_BACKEND_REPLY_RECV_FAIL op={} err={:?}", msg.opcode, err);
+                yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=1 len=4");
                 let err = vfs_error_reply(yarm_ipc_abi::vfs_abi::VFS_STATUS_ERR_BACKEND);
                 let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
             }
