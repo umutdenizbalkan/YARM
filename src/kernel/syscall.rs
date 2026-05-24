@@ -773,11 +773,27 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         );
         return Err(e);
     }
-    let endpoint = kernel
-        .capability_service()
-        .resolve_current_task_capability(cap)
-        .ok_or(SyscallError::InvalidCapability)?
-        .object;
+    let endpoint_cap = kernel
+        .current_task_cnode()
+        .and_then(|cnode| kernel.capability_for_cnode_local(cnode, cap))
+        .and_then(|capability| kernel.capability_object_live(capability.object).map(|_| capability));
+    let Some(endpoint_cap) = endpoint_cap else {
+        clear_blocked_recv_state(kernel, recv_tid, "error");
+        crate::yarm_log!(
+            "IPC_RECV_INVALID_CAP_SOURCE reason=post_validate_endpoint_lookup tid={} cap={} endpoint={}",
+            recv_tid,
+            cap.0,
+            u64::MAX
+        );
+        return Err(SyscallError::InvalidCapability);
+    };
+    let endpoint = endpoint_cap.object;
+    crate::yarm_log!(
+        "IPC_RECV_AFTER_CAP_OK tid={} cap={} endpoint={:?}",
+        recv_tid,
+        cap.0,
+        endpoint
+    );
     let received = kernel.ipc_recv(cap).map_err(SyscallError::from)?;
     let recv_v2_request = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) != 0
         && frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) >= IPC_RECV_META_V2_ENCODED_LEN;
@@ -830,12 +846,28 @@ fn handle_ipc_recv_timeout(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let recv_tid = kernel.current_tid().unwrap_or(0);
     validate_endpoint_right(kernel, cap, CapRights::RECEIVE)?;
-    let endpoint = kernel
-        .capability_service()
-        .resolve_current_task_capability(cap)
-        .ok_or(SyscallError::InvalidCapability)?
-        .object;
+    let endpoint_cap = kernel
+        .current_task_cnode()
+        .and_then(|cnode| kernel.capability_for_cnode_local(cnode, cap))
+        .and_then(|capability| kernel.capability_object_live(capability.object).map(|_| capability));
+    let Some(endpoint_cap) = endpoint_cap else {
+        crate::yarm_log!(
+            "IPC_RECV_INVALID_CAP_SOURCE reason=timeout_post_validate_endpoint_lookup tid={} cap={} endpoint={}",
+            recv_tid,
+            cap.0,
+            u64::MAX
+        );
+        return Err(SyscallError::InvalidCapability);
+    };
+    let endpoint = endpoint_cap.object;
+    crate::yarm_log!(
+        "IPC_RECV_AFTER_CAP_OK tid={} cap={} endpoint={:?}",
+        recv_tid,
+        cap.0,
+        endpoint
+    );
     let timeout_ticks = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) as u64;
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let user_len = frame.arg(SYSCALL_ARG_LEN);
