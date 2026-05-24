@@ -4,6 +4,13 @@
 
 This plan breaks the IPC hardening work into incremental, reviewable phases.
 
+> **Historical/staged planning note.**
+> For the authoritative current recv-v2/reply-cap ABI contract and semantics, see:
+> - `doc/SYSCALL_ABI.md`
+> - `doc/AARCH64_IPC_VFS_PM_STATUS_2026_05.md`
+>
+> Where this phase plan conflicts with those documents, treat this file as historical context and the above two documents as source of truth.
+
 ## Implementation status (current branch)
 
 - ✅ **Phase 0 — Baseline and rollback guardrails** (implemented in this pass).
@@ -62,6 +69,14 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 - Bind reply capability to caller + invocation context + single-use lifecycle.
 - Add reply syscall/path that consumes reply cap atomically.
 - Enforce revocation on caller death/timeout to avoid stale authority.
+
+Superseded/clarified by finalized ABI:
+
+- `IpcCall` is request send/queue only and does **not** consume replies inline.
+- Replies are consumed explicitly via `IpcRecv`/`IpcRecvTimeout` recv-v2 out-meta path.
+- recv-v2 metadata is out-meta only (not syscall return-lane metadata).
+- Blocked recv-v2 completion occurs at delivery time with no syscall replay model.
+- Reply/transfer capability materialization is receiver-local only; raw reply handles are not userspace-visible.
 
 **Exit criteria**
 - Confused-deputy regression tests demonstrate authority confinement.
