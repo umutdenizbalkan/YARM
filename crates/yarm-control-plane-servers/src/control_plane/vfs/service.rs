@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
+use alloc::vec::Vec;
 
 #[cfg(all(test, feature = "legacy-tests"))]
 use yarm::kernel::boot::KernelState;
@@ -717,14 +718,101 @@ pub fn run() {
             }
         };
 
+        let forwarded_msg = {
+            use yarm_ipc_abi::vfs_abi::{
+                OpenAtInlinePath, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_STATX,
+            };
+            // initramfs backend uses paths rooted at "/" within initramfs, not
+            // the VFS mount alias prefix "/initramfs". Re-map path bytes before
+            // forwarding so backend decode/lookup remains consistent.
+            if target_label.as_str() == "initramfs" && (msg.opcode == VFS_OP_STATX || msg.opcode == VFS_OP_OPENAT) {
+                let remapped_path: Option<Vec<u8>> = if msg.opcode == VFS_OP_STATX {
+                    StatxInlinePath::decode(msg.as_slice()).map(|inline| {
+                        if inline.path == b"/initramfs" {
+                            b"/".to_vec()
+                        } else if let Some(rest) = inline.path.strip_prefix(b"/initramfs") {
+                            if rest.is_empty() { b"/".to_vec() } else { rest.to_vec() }
+                        } else {
+                            inline.path.to_vec()
+                        }
+                    })
+                } else {
+                    OpenAtInlinePath::decode(msg.as_slice()).map(|inline| {
+                        if inline.path == b"/initramfs" {
+                            b"/".to_vec()
+                        } else if let Some(rest) = inline.path.strip_prefix(b"/initramfs") {
+                            if rest.is_empty() { b"/".to_vec() } else { rest.to_vec() }
+                        } else {
+                            inline.path.to_vec()
+                        }
+                    })
+                };
+
+                if let Some(path) = remapped_path {
+                    yarm_user_rt::user_log!(
+                        "VFS_FORWARD_PATH_REMAP target=initramfs from={} to={}",
+                        core::str::from_utf8(
+                            if msg.opcode == VFS_OP_STATX {
+                                StatxInlinePath::decode(msg.as_slice()).map(|i| i.path).unwrap_or(b"?")
+                            } else {
+                                OpenAtInlinePath::decode(msg.as_slice()).map(|i| i.path).unwrap_or(b"?")
+                            }
+                        ).unwrap_or("?"),
+                        core::str::from_utf8(&path).unwrap_or("?")
+                    );
+                    if msg.opcode == VFS_OP_STATX {
+                        if let Some(inline) = StatxInlinePath::decode(msg.as_slice()) {
+                            if let Some((payload, len)) = (StatxInlinePath {
+                                dirfd: inline.dirfd,
+                                flags: inline.flags,
+                                mask_or_buf: inline.mask_or_buf,
+                                path: &path,
+                            }).encode() {
+                                if let Ok(remapped) = yarm_user_rt::ipc::Message::with_header(
+                                    msg.sender_tid.0,
+                                    msg.opcode,
+                                    msg.flags,
+                                    msg.transferred_cap().map(|c| c.0),
+                                    &payload[..len],
+                                ) {
+                                    remapped
+                                } else { msg }
+                            } else { msg }
+                        } else { msg }
+                    } else {
+                        if let Some(inline) = OpenAtInlinePath::decode(msg.as_slice()) {
+                            if let Some((payload, len)) = (OpenAtInlinePath {
+                                dirfd: inline.dirfd,
+                                flags: inline.flags,
+                                mode: inline.mode,
+                                path: &path,
+                            }).encode() {
+                                if let Ok(remapped) = yarm_user_rt::ipc::Message::with_header(
+                                    msg.sender_tid.0,
+                                    msg.opcode,
+                                    msg.flags,
+                                    msg.transferred_cap().map(|c| c.0),
+                                    &payload[..len],
+                                ) {
+                                    remapped
+                                } else { msg }
+                            } else { msg }
+                        } else { msg }
+                    }
+                } else { msg }
+            } else {
+                msg
+            }
+        };
+
         yarm_user_rt::user_log!(
             "VFS_FORWARD_CALL op={} target={} send_cap={} reply_cap={}",
-            msg.opcode,
+            forwarded_msg.opcode,
             target_label.as_str(),
             backend_send_cap,
             backend_reply_recv_cap
         );
-        match unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, backend_reply_recv_cap, &msg) } {
+        match unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, backend_reply_recv_cap, &forwarded_msg) } {
             Ok(()) => {
                 yarm_user_rt::user_log!("VFS_FORWARD_CALL_SENT op={} status=ok", msg.opcode);
             }
