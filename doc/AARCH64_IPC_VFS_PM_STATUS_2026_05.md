@@ -91,6 +91,26 @@ Observed failures in this path are cleared:
 - receiver-local cap ids only.
 - reply/transfer caps materialized before meta write.
 - no raw reply handles exposed.
+- manually embedding raw cap-like values into message transfer fields is invalid; materialization requires legitimate call/send transfer flow.
+- one delivered message materializes at most one receiver-local cap; replay/rematerialization from that same message is not possible.
+- reply caps remain one-shot.
+
+## Regression coverage (May 2026 hardening batch)
+
+- `recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once`
+  - protects against blocked waiter replay/duplicate-enqueue regressions and validates delivery-time payload/meta copy to waiter user buffers.
+- `ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue`
+  - protects reply-path parity so `ipc_reply` completes blocked recv-v2 waiters directly without queue duplication or stale-cap reuse behavior.
+- `recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload`
+  - protects recv-v2 out-meta-only ABI (no metadata-in-register lanes) and plain-reply payload integrity (no prefix stripping/mutation).
+- `recv_v2_materializes_reply_cap_once_per_message`
+  - protects one-shot receiver-local cap materialization semantics: exactly one materialized cap per delivered message and no second receive/rematerialization.
+
+## Hosted-dev test harness note (non-ABI)
+
+- hosted-dev sparse user-memory backing guarantees readability only for bytes actually written by the kernel/user-memory path in these tests.
+- recv-v2 tests should read back the actual payload length written, not full receive-buffer capacity.
+- syscall/blocked-recv tests must pass mapped user virtual addresses as user pointers; host stack pointers are invalid for user copy paths.
 
 ## Portability boundary
 

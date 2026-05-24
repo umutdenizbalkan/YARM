@@ -110,7 +110,8 @@
 
 - `IpcCall` performs request send/queue only.
 - Reply payload is **not** consumed from syscall return registers.
-- Caller must receive reply via explicit `IpcRecv`/`IpcRecvTimeout` (recv-v2 out-meta path).
+- Caller must receive replies explicitly via `IpcRecv`/`IpcRecvTimeout` (recv-v2 out-meta path).
+- Old inline reply-consumption behavior is obsolete and must not be assumed.
 
 ### `IpcReply` argument layout
 
@@ -228,6 +229,19 @@
 - Reply payloads are delivered unchanged (no opcode-prefix stripping for replies).
 - Legacy inline request-prefix stripping applies only to request-framed inline messages.
 
+`IpcRecvMetaV2` encoded layout used by current tests/documented contract:
+
+- bytes `8..10`: opcode (`u16`, LE)
+- bytes `12..16`: payload length (`u32`, LE)
+- bytes `16..24`: cap field (receiver-local cap id when capability materialization applies; otherwise sentinel)
+- bytes `24..32`: recv-meta flags
+- bytes `32..40`: sender tid/status lane (where applicable)
+
+Notes:
+
+- metadata consumers must read opcode/flags/payload length/cap info from out-meta, not from return registers.
+- metadata bytes are ABI data; test-only hosted-dev memory notes are not part of this ABI.
+
 Blocked recv-v2 completion:
 
 - Portable `BlockedRecvState` is stored in task state when recv-v2 blocks.
@@ -242,6 +256,26 @@ Received-cap materialization:
 - Reply/transfer capabilities are materialized into receiver-local cap IDs before writing meta.
 - Raw Reply object handles are not exposed directly to userspace.
 - One-shot Reply objects must be materialized once per delivered message.
+- Manually embedding raw cap-like values in message transfer fields is invalid; materialization requires legitimate kernel transfer-handle flow from call/send.
+- The same delivered message cannot be received again to materialize a second capability.
+- Reply caps are one-shot when consumed through `IpcReply`.
+
+## recv-v2/reply-cap regression coverage
+
+- `recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once`
+  - blocks regressions to syscall replay/duplicate queueing after blocked delivery completion.
+- `ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue`
+  - blocks regressions where `IpcReply` fails to complete blocked waiters or leaves duplicate replies queued.
+- `recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload`
+  - blocks regressions that leak recv metadata into return lanes or mutate plain-reply payload bytes.
+- `recv_v2_materializes_reply_cap_once_per_message`
+  - blocks regressions that allow invalid transfer-handle use, duplicate materialization, or second-receive rematerialization.
+
+## Hosted-dev test harness note (non-ABI)
+
+- Sparse hosted-dev user-memory backing guarantees readback only for bytes actually written.
+- recv-v2 tests should read back actual payload length, not full receive-buffer capacity.
+- user copy-path tests must use mapped user virtual addresses; host stack pointers are invalid for syscall/blocked-recv user pointers.
 
 Portability boundary:
 
