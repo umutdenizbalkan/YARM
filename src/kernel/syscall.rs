@@ -397,13 +397,38 @@ fn materialize_received_message_cap(
     };
     match materialize_received_transfer_cap(kernel, Some(raw_value), endpoint, receiver_tid) {
         Ok(local_cap) => {
+            let receiver_cnode = kernel.task_cnode(receiver_tid);
+            let local = local_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
+            let slot_cap =
+                receiver_cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, CapId(local)));
+            let live_cap =
+                slot_cap.and_then(|cap| kernel.capability_object_live(cap.object).map(|_| cap));
             crate::yarm_log!(
                 "IPC_RECV_CAP_MATERIALIZE kind={} receiver_tid={} sender_tid={} raw={} local={}",
                 kind,
                 receiver_tid,
                 sender_tid,
                 raw_value,
-                local_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP)
+                local
+            );
+            crate::yarm_log!(
+                "IPC_RECV_CAP_MATERIALIZE_DETAIL kind={} receiver_tid={} raw={} local={} object={:?} rights={:?} cnode={}",
+                kind,
+                receiver_tid,
+                raw_value,
+                local,
+                slot_cap.map(|c| c.object),
+                slot_cap.map(|c| c.rights()),
+                receiver_cnode.map(|c| c.0).unwrap_or(u64::MAX)
+            );
+            crate::yarm_log!(
+                "IPC_RECV_CAP_MATERIALIZE_PROBE receiver_tid={} local={} slot_found={} object_live={} object={:?} rights={:?}",
+                receiver_tid,
+                local,
+                slot_cap.is_some(),
+                live_cap.is_some(),
+                slot_cap.map(|c| c.object),
+                slot_cap.map(|c| c.rights())
             );
             Ok(local_cap)
         }
@@ -425,6 +450,11 @@ fn materialize_received_message_cap(
                             Capability::new(reply_object, CapRights::SEND),
                         )
                         .map_err(SyscallError::from)?;
+                    let receiver_cnode = kernel.task_cnode(receiver_tid);
+                    let slot_cap =
+                        receiver_cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, minted));
+                    let live_cap =
+                        slot_cap.and_then(|cap| kernel.capability_object_live(cap.object).map(|_| cap));
                     crate::yarm_log!(
                         "IPC_RECV_CAP_MATERIALIZE kind={} receiver_tid={} sender_tid={} raw={} local={}",
                         kind,
@@ -432,6 +462,25 @@ fn materialize_received_message_cap(
                         sender_tid,
                         raw_value,
                         minted.0
+                    );
+                    crate::yarm_log!(
+                        "IPC_RECV_CAP_MATERIALIZE_DETAIL kind={} receiver_tid={} raw={} local={} object={:?} rights={:?} cnode={}",
+                        kind,
+                        receiver_tid,
+                        raw_value,
+                        minted.0,
+                        slot_cap.map(|c| c.object),
+                        slot_cap.map(|c| c.rights()),
+                        receiver_cnode.map(|c| c.0).unwrap_or(u64::MAX)
+                    );
+                    crate::yarm_log!(
+                        "IPC_RECV_CAP_MATERIALIZE_PROBE receiver_tid={} local={} slot_found={} object_live={} object={:?} rights={:?}",
+                        receiver_tid,
+                        minted.0,
+                        slot_cap.is_some(),
+                        live_cap.is_some(),
+                        slot_cap.map(|c| c.object),
+                        slot_cap.map(|c| c.rights())
                     );
                     return Ok(Some(minted.0));
                 }
@@ -1146,6 +1195,17 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
         msg.flags
     );
     if let Err(err) = kernel.ipc_reply(reply_cap, msg) {
+        if err == KernelError::WrongObject {
+            let cnode = kernel.current_task_cnode();
+            let slot_cap = cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, reply_cap));
+            crate::yarm_log!(
+                "IPC_REPLY_WRONG_OBJECT tid={} reply_cap={} object={:?} rights={:?}",
+                sender_tid,
+                reply_cap.0,
+                slot_cap.map(|c| c.object),
+                slot_cap.map(|c| c.rights())
+            );
+        }
         let mapped = SyscallError::from(err);
         crate::yarm_log!(
             "IPC_REPLY_FAIL tid={} reply_cap={} err={:?}",
