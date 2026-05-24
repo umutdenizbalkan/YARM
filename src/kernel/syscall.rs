@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::boot::{KernelError, KernelState, TransferSharedRegion};
-use super::capabilities::{CapId, CapObject, CapRights};
+use super::capabilities::{CapId, CapObject, CapRights, Capability};
 use super::ipc::{
     IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
 };
@@ -233,11 +233,12 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     } else {
         0
     };
-    let recv_local_transfer = materialize_received_transfer_cap(
+    let recv_local_transfer = materialize_received_message_cap(
         kernel,
-        msg.transferred_cap().map(|c| c.0),
         recv_endpoint,
         waiter_tid,
+        msg.sender_tid.0,
+        msg,
     )?;
     if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
         crate::yarm_log!(
@@ -366,6 +367,84 @@ fn materialize_received_transfer_cap(
         )
         .map_err(SyscallError::from)?;
     Ok(Some(derived.0))
+}
+
+fn materialize_received_message_cap(
+    kernel: &mut KernelState,
+    endpoint: CapObject,
+    receiver_tid: u64,
+    sender_tid: u64,
+    msg: &Message,
+) -> Result<Option<u64>, SyscallError> {
+    let raw = msg.transferred_cap().map(|c| c.0);
+    let (kind, value) = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+        ("reply", raw)
+    } else if (msg.flags & Message::FLAG_CAP_TRANSFER) != 0 {
+        ("transfer", raw)
+    } else {
+        ("none", None)
+    };
+    let Some(raw_value) = value else {
+        crate::yarm_log!(
+            "IPC_RECV_CAP_MATERIALIZE kind={} receiver_tid={} sender_tid={} raw={} local={}",
+            kind,
+            receiver_tid,
+            sender_tid,
+            SYSCALL_NO_TRANSFER_CAP,
+            SYSCALL_NO_TRANSFER_CAP
+        );
+        return Ok(None);
+    };
+    match materialize_received_transfer_cap(kernel, Some(raw_value), endpoint, receiver_tid) {
+        Ok(local_cap) => {
+            crate::yarm_log!(
+                "IPC_RECV_CAP_MATERIALIZE kind={} receiver_tid={} sender_tid={} raw={} local={}",
+                kind,
+                receiver_tid,
+                sender_tid,
+                raw_value,
+                local_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP)
+            );
+            Ok(local_cap)
+        }
+        Err(first_err) => {
+            if kind == "reply" {
+                let reply_index = usize::try_from(raw_value & 0xFFFF).map_err(|_| first_err)?;
+                let reply_generation = raw_value >> 16;
+                let reply_object = CapObject::Reply {
+                    index: reply_index,
+                    generation: reply_generation,
+                };
+                if reply_generation != 0 && kernel.capability_object_live(reply_object).is_some() {
+                    let dest_cnode = kernel
+                        .task_cnode(receiver_tid)
+                        .ok_or(SyscallError::InvalidCapability)?;
+                    let minted = kernel
+                        .mint_capability_in_cnode(
+                            dest_cnode,
+                            Capability::new(reply_object, CapRights::SEND),
+                        )
+                        .map_err(SyscallError::from)?;
+                    crate::yarm_log!(
+                        "IPC_RECV_CAP_MATERIALIZE kind={} receiver_tid={} sender_tid={} raw={} local={}",
+                        kind,
+                        receiver_tid,
+                        sender_tid,
+                        raw_value,
+                        minted.0
+                    );
+                    return Ok(Some(minted.0));
+                }
+            }
+            crate::yarm_log!(
+                "IPC_RECV_CAP_MATERIALIZE_FAILED kind={} raw={} err={:?}",
+                kind,
+                raw_value,
+                first_err
+            );
+            Err(first_err)
+        }
+    }
 }
 
 fn validate_user_region(offset: u64, len: u64) -> Result<(), SyscallError> {
@@ -1127,11 +1206,12 @@ fn handle_ipc_recv_result_with_empty_error(
             let sender = sender_tid_to_ret(msg.sender_tid.0)?;
             let receiver_tid = current_tid(kernel)?;
             let raw_transfer_cap = msg.transferred_cap().map(|c| c.0);
-            let recv_local_transfer = match materialize_received_transfer_cap(
+            let recv_local_transfer = match materialize_received_message_cap(
                 kernel,
-                raw_transfer_cap,
                 endpoint,
                 receiver_tid,
+                msg.sender_tid.0,
+                &msg,
             ) {
                 Ok(local_cap) => {
                     if let Some(raw) = raw_transfer_cap {
