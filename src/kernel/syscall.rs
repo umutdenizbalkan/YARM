@@ -373,7 +373,7 @@ fn materialize_received_message_cap(
     kernel: &mut KernelState,
     endpoint: CapObject,
     receiver_tid: u64,
-    sender_tid: u64,
+    _sender_tid: u64,
     msg: &Message,
 ) -> Result<Option<u64>, SyscallError> {
     let raw = msg.transferred_cap().map(|c| c.0);

@@ -238,7 +238,6 @@ pub mod syscall {
     }
 
     #[inline]
-    #[inline]
     pub unsafe fn ipc_recv_v2(
         ep_cap: u32,
      ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {

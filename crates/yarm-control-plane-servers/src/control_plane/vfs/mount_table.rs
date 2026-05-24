@@ -177,7 +177,7 @@ impl VfsMountTable {
     ///
     /// Returns a copy of `(send_cap, label)` for the entry whose prefix is the
     /// longest matching prefix of `path`, or `None` if no entry matches.
-    pub fn route(&self, path: &[u8]) -> Option<(u32, MountLabel)> {
+    pub(crate) fn route(&self, path: &[u8]) -> Option<(u32, MountLabel)> {
         let mut best_len = 0usize;
         let mut best: Option<(u32, MountLabel)> = None;
         for entry in &self.entries[..self.count] {

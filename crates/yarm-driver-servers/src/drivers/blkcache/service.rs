@@ -12,15 +12,15 @@ use yarm_user_rt::ipc::Message;
 struct BackendRecord {
     backend_id: u64,
     backend_send_cap: u64,
-    block_size: u32,
-    flags: u32,
-    block_count: u64,
+    _block_size: u32,
+    _flags: u32,
+    _block_count: u64,
     registered: bool,
 }
 
 impl BackendRecord {
     const fn empty() -> Self {
-        Self { backend_id: 0, backend_send_cap: 0, block_size: 0, flags: 0, block_count: 0, registered: false }
+        Self { backend_id: 0, backend_send_cap: 0, _block_size: 0, _flags: 0, _block_count: 0, registered: false }
     }
 }
 
@@ -124,9 +124,9 @@ fn register_backend(
             *rec = BackendRecord {
                 backend_id: args.backend_id,
                 backend_send_cap: transferred_backend_send_cap,
-                block_size: args.block_size,
-                flags: args.flags,
-                block_count: args.block_count,
+                _block_size: args.block_size,
+                _flags: args.flags,
+                _block_count: args.block_count,
                 registered: true,
             };
             yarm_user_rt::user_log!(

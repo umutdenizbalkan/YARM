@@ -15,7 +15,7 @@ use yarm_ipc_abi::process_abi::{
     PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_LIFECYCLE_QUERY,
     PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4,
     PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2, RegisterSupervisedTask,
-    SpawnV2Args, SpawnV3Args, SpawnV4Args, SpawnV5CapArgs, SpawnV5CapResult,
+    SpawnV2Args, SpawnV3Args, SpawnV4Args, SpawnV5CapArgs,
     TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args,
     encode_spawn_v5_reply,
 };
@@ -1718,7 +1718,7 @@ pub fn run_request_loop_over_runtime_state_with_cnode_resize(
 pub fn run() {
     yarm_user_rt::user_log!("PM_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
-    let Some(mut recv_cap) = ctx.pm_request_recv_cap else {
+    let Some(recv_cap) = ctx.pm_request_recv_cap else {
         yarm_user_rt::user_log!("PM_NO_RECV_CAP");
         loop {
             let _ = yarm_user_rt::syscall::yield_now();

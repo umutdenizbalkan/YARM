@@ -68,7 +68,7 @@ impl VfsFdTable {
     /// Return `(backend_cap, label)` for the entry whose `fd` **and**
     /// `client_id` both match.  Returns `None` if no such entry exists,
     /// including when another client holds the same fd number.
-    pub fn lookup(&self, fd: u64, client_id: u64) -> Option<(u32, MountLabel)> {
+    pub(crate) fn lookup(&self, fd: u64, client_id: u64) -> Option<(u32, MountLabel)> {
         for entry in &self.entries[..self.count] {
             if entry.fd == fd && entry.client_id == client_id {
                 return Some((entry.backend_cap, entry.label));
