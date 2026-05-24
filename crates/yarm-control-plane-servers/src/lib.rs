@@ -7,33 +7,44 @@ extern crate alloc;
 
 pub mod control_plane;
 
+#[cfg(any(not(test), feature = "legacy-tests"))]
 pub fn run_init_server() {
-    #[cfg(feature = "legacy-tests")]
     control_plane::init::run();
 }
 
+#[cfg(all(test, not(feature = "legacy-tests")))]
+pub fn run_init_server() {}
+
+#[cfg(any(not(test), feature = "legacy-tests"))]
 pub fn run_process_manager() {
-    #[cfg(feature = "legacy-tests")]
     control_plane::process_manager::run();
 }
+
+#[cfg(all(test, not(feature = "legacy-tests")))]
+pub fn run_process_manager() {}
 
 pub fn run_vfs_server() {
     control_plane::vfs::run();
 }
 
+#[cfg(any(not(test), feature = "legacy-tests"))]
 pub fn run_supervisor_server() {
-    #[cfg(feature = "legacy-tests")]
     control_plane::supervisor::run();
 }
 
+#[cfg(all(test, not(feature = "legacy-tests")))]
+pub fn run_supervisor_server() {}
+
+#[cfg(any(not(test), feature = "legacy-tests"))]
 pub fn run_driver_manager() {
-    #[cfg(feature = "legacy-tests")]
     control_plane::driver_manager::run();
 }
 
+#[cfg(all(test, not(feature = "legacy-tests")))]
+pub fn run_driver_manager() {}
+
+#[cfg(any(not(test), feature = "legacy-tests"))]
 pub fn run_driver_manager_demo() {
-    #[cfg(feature = "legacy-tests")]
-    {
     use crate::control_plane::driver_manager::DriverService;
     use yarm_ipc_abi::driver_abi::{DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, pack_driver_pair};
     use yarm_user_rt::capability::CapId;
@@ -90,8 +101,10 @@ pub fn run_driver_manager_demo() {
         .expect("batch");
 
     yarm_user_rt::user_log!("driver-manager demo ready: handled={}", handled);
-    }
 }
+
+#[cfg(all(test, not(feature = "legacy-tests")))]
+pub fn run_driver_manager_demo() {}
 
 #[cfg(test)]
 mod tests {
