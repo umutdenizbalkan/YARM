@@ -330,6 +330,15 @@ fn spawn_v5_cap(
             );
             match decode_spawn_v5_reply(payload) {
                 Ok(result) => {
+                    if result.pid == 0 {
+                        yarm_user_rt::user_log!(
+                            "INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0 reason=zero_pid"
+                        );
+                        yarm_user_rt::user_log!(
+                            "INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=zero_pid"
+                        );
+                        return None;
+                    }
                     yarm_user_rt::user_log!(
                         "INIT_SPAWN_V5_REPLY_DECODE ok=1 child_tid={}",
                         result.pid
@@ -608,6 +617,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yarm::ipc_abi::process_abi::{decode_spawn_v5_reply, encode_spawn_v5_reply};
     use yarm_fs_servers::initramfs::ManifestEntryWire;
     use yarm_fs_servers::initramfs::{
         INITRAMFS_INIT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR, INITRAMFS_SUPERVISOR_PATH_PTR,
@@ -673,6 +683,22 @@ mod tests {
             baseline.launch_strategy,
             CoreLaunchStrategy::SupervisorFirst
         );
+    }
+
+    #[test]
+    fn decode_spawn_v5_reply_all_zero_is_failure_shape() {
+        let payload = [0u8; 16];
+        let decoded = decode_spawn_v5_reply(&payload).expect("decode");
+        assert_eq!(decoded.pid, 0);
+        assert_eq!(decoded.service_send_cap, 0);
+    }
+
+    #[test]
+    fn decode_spawn_v5_reply_success_roundtrip() {
+        let payload = encode_spawn_v5_reply(42, 65552);
+        let decoded = decode_spawn_v5_reply(&payload).expect("decode");
+        assert_eq!(decoded.pid, 42);
+        assert_eq!(decoded.service_send_cap, 65552);
     }
 
     #[test]
