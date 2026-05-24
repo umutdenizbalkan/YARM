@@ -34,8 +34,6 @@ pub const INITRAMFS_VIRTIO_BLK_PATH: &[u8] = b"/initramfs/sbin/virtio_blk_srv";
 
 const MAX_INITRAMFS_HANDLES: usize = 16;
 const MAX_INITRAMFS_INODES: usize = 11;
-const INITRAMFS_STATX_TYPE_REGULAR: u64 = 0x1000_0000_0000_0000;
-const INITRAMFS_MODE_OWNER_READ: u64 = 0o400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InitramfsInode {
@@ -225,9 +223,7 @@ impl InitramfsBackend {
         Err(VfsError::BadFd)
     }
 
-    fn statx_value(file_len: u64) -> u64 {
-        INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (file_len << 16)
-    }
+    fn statx_value(file_len: u64) -> u64 { file_len }
 
     fn metadata_by_path(&self, path: &[u8]) -> Result<u64, VfsError> {
         let inode_idx = self.lookup_by_path(path)?;
@@ -385,28 +381,19 @@ mod tests {
     }
 
     #[test]
-    fn initramfs_statx_contract_encodes_type_mode_and_size() {
+    fn initramfs_statx_contract_returns_file_size() {
         let mut fs = InitramfsBackend::new(4096);
         let boot_stat = fs.statx_path(INITRAMFS_BOOT_MARKER_PATH).expect("stat");
         let hosts_stat = fs.statx_path(INITRAMFS_ETC_HOSTS_PATH).expect("stat");
-        assert_eq!(
-            boot_stat,
-            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (4096 << 16)
-        );
-        assert_eq!(
-            hosts_stat,
-            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (256 << 16)
-        );
+        assert_eq!(boot_stat, 4096);
+        assert_eq!(hosts_stat, 256);
     }
 
     #[test]
     fn initramfs_statx_path_accepts_real_bytes() {
         let mut fs = InitramfsBackend::new(4096);
         let stat = fs.statx_path(INITRAMFS_VFS_PATH).expect("statx path");
-        assert_eq!(
-            stat,
-            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (1536 << 16)
-        );
+        assert_eq!(stat, 1536);
     }
 
     #[test]
@@ -435,7 +422,7 @@ mod tests {
         let supervisor_stat = fs
             .statx_path(INITRAMFS_SUPERVISOR_PATH)
             .expect("supervisor stat");
-        let expected = INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (1536 << 16);
+        let expected = 1536;
         assert_eq!(proc_stat, expected);
         assert_eq!(vfs_stat, expected);
         assert_eq!(supervisor_stat, expected);
@@ -456,22 +443,10 @@ mod tests {
             .statx_path(INITRAMFS_SUPERVISOR_PATH)
             .expect("supervisor stat");
         let vfs_stat = fs.statx_path(INITRAMFS_VFS_PATH).expect("vfs stat");
-        assert_eq!(
-            init_stat,
-            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (77 << 16)
-        );
-        assert_eq!(
-            proc_stat,
-            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (111 << 16)
-        );
-        assert_eq!(
-            sup_stat,
-            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (135 << 16)
-        );
-        assert_eq!(
-            vfs_stat,
-            INITRAMFS_STATX_TYPE_REGULAR | INITRAMFS_MODE_OWNER_READ | (222 << 16)
-        );
+        assert_eq!(init_stat, 77);
+        assert_eq!(proc_stat, 111);
+        assert_eq!(sup_stat, 135);
+        assert_eq!(vfs_stat, 222);
     }
 
 }
