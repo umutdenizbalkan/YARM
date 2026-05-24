@@ -1230,6 +1230,18 @@ fn run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
     state.register_task(2).expect("task2");
+    let (asid1, aspace_map_cap1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind task1 asid");
+    state
+        .map_user_page(
+            aspace_map_cap1,
+            VirtAddr(0x2000),
+            Mapping {
+                phys: PhysAddr(0x6000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map task1 recv buffers");
     let (_eid, send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
     let recv_cap = state
         .grant_capability_task_to_task(0, recv_cap_global, 1)
@@ -1244,16 +1256,16 @@ fn run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
     while state.current_tid() != Some(1) {
         state.yield_current().expect("switch to task1");
     }
-    let mut payload = [0u8; 16];
-    let mut meta = [0u8; 40];
+    let payload_ptr = 0x2000usize;
+    let meta_ptr = 0x2080usize;
     let mut recv_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [
             recv_cap.0 as usize,
-            payload.as_mut_ptr() as usize,
-            payload.len(),
-            (&mut meta as *mut [u8; 40]) as usize,
-            meta.len(),
+            payload_ptr,
+            16,
+            meta_ptr,
+            40,
             0,
         ],
     );
@@ -1269,6 +1281,14 @@ fn run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
     state.ipc_send(send_cap_task2, msg).expect("send");
     state.yield_current().expect("switch receiver");
     assert_eq!(state.current_tid(), Some(1));
+    let mut payload = [0u8; 16];
+    let mut meta = [0u8; 40];
+    state
+        .copy_from_current_user_into_slice(payload_ptr, payload.len(), &mut payload)
+        .expect("read payload");
+    state
+        .copy_from_current_user_into_slice(meta_ptr, meta.len(), &mut meta)
+        .expect("read meta");
     assert_eq!(payload[..5], *b"hello");
     assert_eq!(
         u16::from_le_bytes(meta[10..12].try_into().expect("msg flags")),
@@ -1298,6 +1318,18 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
     state.register_task(2).expect("task2");
+    let (asid1, aspace_map_cap1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind task1 asid");
+    state
+        .map_user_page(
+            aspace_map_cap1,
+            VirtAddr(0x3000),
+            Mapping {
+                phys: PhysAddr(0x7000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map task1 reply recv buffers");
     let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
     let recv_cap = state
         .grant_capability_task_to_task(0, recv_cap_global, 1)
@@ -1313,16 +1345,16 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
         .expect("dup reply cap");
 
     state.yield_current().expect("switch to task1");
-    let mut payload = [0u8; 16];
-    let mut meta = [0u8; 40];
+    let payload_ptr = 0x3000usize;
+    let meta_ptr = 0x3080usize;
     let mut recv_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [
             recv_cap.0 as usize,
-            payload.as_mut_ptr() as usize,
-            payload.len(),
-            (&mut meta as *mut [u8; 40]) as usize,
-            meta.len(),
+            payload_ptr,
+            16,
+            meta_ptr,
+            40,
             0,
         ],
     );
@@ -1339,6 +1371,14 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
     let reply = Message::with_header(0, 0x44, 0, None, b"rp").expect("reply");
     state.ipc_reply(reply_cap_task2, reply).expect("reply");
     state.yield_current().expect("switch receiver");
+    let mut payload = [0u8; 16];
+    let mut meta = [0u8; 40];
+    state
+        .copy_from_current_user_into_slice(payload_ptr, payload.len(), &mut payload)
+        .expect("read payload");
+    state
+        .copy_from_current_user_into_slice(meta_ptr, meta.len(), &mut meta)
+        .expect("read meta");
     assert_eq!(payload[..2], *b"rp");
     assert_eq!(u64::from_le_bytes(meta[8..16].try_into().expect("opcode")), 0x44);
 
