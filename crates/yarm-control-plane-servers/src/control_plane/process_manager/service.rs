@@ -1469,11 +1469,47 @@ unsafe fn pm_vfs_call_u64(
     reply_recv_cap: u32,
     msg: &Message,
 ) -> Result<Message, ProcessManagerError> {
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, msg) }
-        .map_err(|_| ProcessManagerError::Unsupported)?;
-    match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) } {
-        Ok(Some(reply)) => Ok(reply),
-        _ => Err(ProcessManagerError::WouldBlock),
+    let op = msg.opcode;
+    match unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, msg) } {
+        Ok(()) => {
+            yarm_user_rt::user_log!("PM_VFS_CALL_SENT op={} status=ok", op);
+        }
+        Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+            // Finalized IPC contract: ipc_call is send/queue-only. A WouldBlock
+            // at this stage is treated as a normal blocking transition, then we
+            // explicitly receive the reply via the dedicated reply endpoint.
+            yarm_user_rt::user_log!("PM_VFS_CALL_BLOCKED_NORMAL op={}", op);
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("PM_VFS_CALL_FAIL op={} err={:?}", op, e);
+            return Err(ProcessManagerError::Unsupported);
+        }
+    }
+
+    yarm_user_rt::user_log!(
+        "PM_VFS_REPLY_RECV_BEGIN op={} reply_cap={}",
+        op,
+        reply_recv_cap
+    );
+    match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, u64::MAX) } {
+        Ok(Some(reply)) => {
+            yarm_user_rt::user_log!(
+                "PM_VFS_REPLY op={} status=ok len={} opcode={} flags={}",
+                op,
+                reply.len,
+                reply.opcode,
+                reply.flags
+            );
+            Ok(reply)
+        }
+        Ok(None) => {
+            yarm_user_rt::user_log!("PM_VFS_REPLY_RECV_FAIL op={} err=timed_out_or_would_block", op);
+            Err(ProcessManagerError::WouldBlock)
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("PM_VFS_REPLY_RECV_FAIL op={} err={:?}", op, e);
+            Err(ProcessManagerError::Unsupported)
+        }
     }
 }
 
