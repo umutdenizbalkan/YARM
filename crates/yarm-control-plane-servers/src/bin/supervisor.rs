@@ -6,7 +6,7 @@
 
 #[cfg(not(feature = "hosted-dev"))]
 yarm::install_freestanding_allocator!(
-    2 * 1024 * 1024,
+    256 * 1024,
     "supervisor freestanding allocator OOM"
 );
 
