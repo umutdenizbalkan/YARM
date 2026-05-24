@@ -728,22 +728,6 @@ impl KernelState {
                 );
                 self.ipc.telemetry.fastpath_attempts =
                     self.ipc.telemetry.fastpath_attempts.saturating_add(1);
-                let endpoint = self
-                    .ipc
-                    .endpoints
-                    .get_mut(endpoint_idx)
-                    .and_then(Option::as_mut)
-                    .ok_or(KernelError::WrongObject)?;
-                endpoint
-                    .send(msg)
-                    .map_err(|_| KernelError::EndpointQueueFull)?;
-                crate::yarm_log!(
-                    "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
-                    waiter_tid.0,
-                    endpoint_idx,
-                    msg.len,
-                    msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
-                );
                 let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
                     tcbs.iter()
                         .flatten()
@@ -751,15 +735,52 @@ impl KernelState {
                         .and_then(|tcb| tcb.blocked_recv_state.as_ref())
                         .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
                 });
-                if waiter_recv_v2_blocked
-                    && let Err(err) = complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)
-                {
+                if waiter_recv_v2_blocked {
                     crate::yarm_log!(
-                        "IPC_RECV_BLOCKED_COMPLETE_FAILED tid={} err={:?}",
+                        "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
                         waiter_tid.0,
-                        err
+                        endpoint_idx,
+                        msg.len,
+                        msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
                     );
-                    return Err(KernelError::UserMemoryFault);
+                    match complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg) {
+                        Ok(()) => {
+                            crate::yarm_log!(
+                                "IPC_RECV_DELIVER_TO_WAITER_CONSUMED tid={} endpoint={}",
+                                waiter_tid.0,
+                                endpoint_idx
+                            );
+                            crate::yarm_log!(
+                                "IPC_RECV_ENQUEUE_SKIPPED_WAITER_COMPLETED endpoint={}",
+                                endpoint_idx
+                            );
+                        }
+                        Err(err) => {
+                            crate::yarm_log!(
+                                "IPC_RECV_BLOCKED_COMPLETE_FAILED tid={} err={:?}",
+                                waiter_tid.0,
+                                err
+                            );
+                            return Err(KernelError::UserMemoryFault);
+                        }
+                    }
+                } else {
+                    let endpoint = self
+                        .ipc
+                        .endpoints
+                        .get_mut(endpoint_idx)
+                        .and_then(Option::as_mut)
+                        .ok_or(KernelError::WrongObject)?;
+                    endpoint
+                        .send(msg)
+                        .map_err(|_| KernelError::EndpointQueueFull)?;
+                    crate::yarm_log!(
+                        "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
+                        waiter_tid.0,
+                        endpoint_idx,
+                        msg.len,
+                        msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
+                    );
                 }
                 self.ipc.telemetry.rendezvous_handoffs =
                     self.ipc.telemetry.rendezvous_handoffs.saturating_add(1);
@@ -786,21 +807,6 @@ impl KernelState {
             return Err(KernelError::WouldBlock);
         }
 
-        let endpoint = self
-            .ipc
-            .endpoints
-            .get_mut(endpoint_idx)
-            .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?;
-        if endpoint.send(msg).is_err() {
-            crate::yarm_log!("IPC_SEND_SYNC_NO_WAITER endpoint={}", endpoint_idx);
-            let _ =
-                self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
-            self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
-            return Err(KernelError::WouldBlock);
-        }
-
-        self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
         if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
             crate::yarm_log!(
                 "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
@@ -816,17 +822,47 @@ impl KernelState {
                     .and_then(|tcb| tcb.blocked_recv_state.as_ref())
                     .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
             });
-            if waiter_recv_v2_blocked
-                && let Err(err) = complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)
-            {
-                crate::yarm_log!(
-                    "IPC_RECV_BLOCKED_COMPLETE_FAILED tid={} err={:?}",
-                    waiter_tid.0,
-                    err
-                );
-                return Err(KernelError::UserMemoryFault);
+            if waiter_recv_v2_blocked {
+                match complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg) {
+                    Ok(()) => {
+                        crate::yarm_log!(
+                            "IPC_RECV_DELIVER_TO_WAITER_CONSUMED tid={} endpoint={}",
+                            waiter_tid.0,
+                            endpoint_idx
+                        );
+                        crate::yarm_log!(
+                            "IPC_RECV_ENQUEUE_SKIPPED_WAITER_COMPLETED endpoint={}",
+                            endpoint_idx
+                        );
+                        self.wake_waiter_for_endpoint(endpoint_idx)?;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        crate::yarm_log!(
+                            "IPC_RECV_BLOCKED_COMPLETE_FAILED tid={} err={:?}",
+                            waiter_tid.0,
+                            err
+                        );
+                        return Err(KernelError::UserMemoryFault);
+                    }
+                }
             }
         }
+        let endpoint = self
+            .ipc
+            .endpoints
+            .get_mut(endpoint_idx)
+            .and_then(Option::as_mut)
+            .ok_or(KernelError::WrongObject)?;
+        if endpoint.send(msg).is_err() {
+            crate::yarm_log!("IPC_SEND_SYNC_NO_WAITER endpoint={}", endpoint_idx);
+            let _ =
+                self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
+            self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
+            return Err(KernelError::WouldBlock);
+        }
+
+        self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
     }
