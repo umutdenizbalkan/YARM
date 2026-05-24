@@ -1126,13 +1126,41 @@ fn handle_ipc_recv_result_with_empty_error(
             };
             let sender = sender_tid_to_ret(msg.sender_tid.0)?;
             let receiver_tid = current_tid(kernel)?;
-            let recv_local_transfer = materialize_received_transfer_cap(
+            let raw_transfer_cap = msg.transferred_cap().map(|c| c.0);
+            let recv_local_transfer = match materialize_received_transfer_cap(
                 kernel,
-                msg.transferred_cap().map(|c| c.0),
+                raw_transfer_cap,
                 endpoint,
                 receiver_tid,
-            )?;
+            ) {
+                Ok(local_cap) => {
+                    if let Some(raw) = raw_transfer_cap {
+                        crate::yarm_log!(
+                            "IPC_RECV_IMMEDIATE_TRANSFER_CAP_MINT tid={} local_cap={} raw={}",
+                            receiver_tid,
+                            local_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
+                            raw
+                        );
+                    }
+                    local_cap
+                }
+                Err(err) => {
+                    crate::yarm_log!(
+                        "IPC_RECV_IMMEDIATE_TRANSFER_CAP_MINT_FAILED tid={} raw={} err={:?}",
+                        receiver_tid,
+                        raw_transfer_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
+                        err
+                    );
+                    return Err(err);
+                }
+            };
             encode_transfer_cap_ret(frame, recv_local_transfer)?;
+            crate::yarm_log!(
+                "IPC_RECV_IMMEDIATE_META_CAP tid={} cap={} flags={}",
+                receiver_tid,
+                recv_local_transfer.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
+                recv_meta_flags
+            );
             let raw_payload = msg.as_slice();
             let (app_opcode, app_payload, _stripped_prefix) =
                 if should_strip_inline_opcode_prefix(&msg) && raw_payload.len() >= 2 {
