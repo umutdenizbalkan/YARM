@@ -179,7 +179,7 @@ fn clear_blocked_recv_state(kernel: &mut KernelState, tid: u64, reason: &str) {
     }
 }
 
-fn complete_blocked_recv_for_waiter(
+pub(crate) fn complete_blocked_recv_for_waiter(
     kernel: &mut KernelState,
     waiter_tid: u64,
     msg: &Message,

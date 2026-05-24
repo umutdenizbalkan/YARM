@@ -7,7 +7,8 @@ use super::{
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
-use crate::kernel::task::{TaskStatus, WaitReason};
+use crate::kernel::syscall::complete_blocked_recv_for_waiter;
+use crate::kernel::task::{RecvAbiVariant, TaskStatus, WaitReason};
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART,
 };
@@ -686,6 +687,23 @@ impl KernelState {
                     msg.len,
                     msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
                 );
+                let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
+                    tcbs.iter()
+                        .flatten()
+                        .find(|tcb| tcb.tid.0 == waiter_tid.0)
+                        .and_then(|tcb| tcb.blocked_recv_state.as_ref())
+                        .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
+                });
+                if waiter_recv_v2_blocked
+                    && let Err(err) = complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)
+                {
+                    crate::yarm_log!(
+                        "IPC_RECV_BLOCKED_COMPLETE_FAILED tid={} err={:?}",
+                        waiter_tid.0,
+                        err
+                    );
+                    return Err(KernelError::UserMemoryFault);
+                }
                 self.ipc.telemetry.rendezvous_handoffs =
                     self.ipc.telemetry.rendezvous_handoffs.saturating_add(1);
                 self.wake_waiter_for_endpoint(endpoint_idx)?;
@@ -734,6 +752,23 @@ impl KernelState {
                 msg.len,
                 msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
             );
+            let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
+                    .and_then(|tcb| tcb.blocked_recv_state.as_ref())
+                    .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
+            });
+            if waiter_recv_v2_blocked
+                && let Err(err) = complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)
+            {
+                crate::yarm_log!(
+                    "IPC_RECV_BLOCKED_COMPLETE_FAILED tid={} err={:?}",
+                    waiter_tid.0,
+                    err
+                );
+                return Err(KernelError::UserMemoryFault);
+            }
         }
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
