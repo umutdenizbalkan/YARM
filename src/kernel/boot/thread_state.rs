@@ -320,6 +320,9 @@ impl KernelState {
                 .flatten()
                 .find(|tcb| tcb.tid.0 == tid)
                 .ok_or(KernelError::TaskMissing)?;
+            if tcb.blocked_recv_state.take().is_some() {
+                crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=cancel", tid);
+            }
             tcb.status = TaskStatus::Dead;
             Ok::<_, KernelError>(())
         })?;

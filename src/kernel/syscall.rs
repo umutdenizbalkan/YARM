@@ -171,6 +171,14 @@ impl From<KernelError> for SyscallError {
     }
 }
 
+fn clear_blocked_recv_state(kernel: &mut KernelState, tid: u64, reason: &str) {
+    if let Some(tcb) = kernel.tcb_mut(tid)
+        && tcb.blocked_recv_state.take().is_some()
+    {
+        crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason={}", tid, reason);
+    }
+}
+
 fn current_tid(kernel: &KernelState) -> Result<u64, SyscallError> {
     kernel.current_tid().ok_or(SyscallError::Internal)
 }
@@ -648,6 +656,7 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     let recv_tid = kernel.current_tid().unwrap_or(0);
     crate::yarm_log!("IPC_RECV_ENTER tid={} cap={}", recv_tid, cap.0);
     if let Err(e) = validate_endpoint_right(kernel, cap, CapRights::RECEIVE) {
+        clear_blocked_recv_state(kernel, recv_tid, "error");
         crate::yarm_log!(
             "IPC_RECV_CAP_LOOKUP_FAIL tid={} cap={} reason={:?}",
             recv_tid,
@@ -689,14 +698,7 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         }
         return Err(SyscallError::WouldBlock);
     }
-    if let Some(tcb) = kernel.tcb_mut(recv_tid)
-        && tcb.blocked_recv_state.take().is_some()
-    {
-        crate::yarm_log!(
-            "IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=recv_complete",
-            recv_tid
-        );
-    }
+    clear_blocked_recv_state(kernel, recv_tid, "immediate_success");
     crate::yarm_log!(
         "IPC_RECV_GOT_MSG tid={} cap={} transfer_cap={}",
         recv_tid,
@@ -730,6 +732,7 @@ fn handle_ipc_recv_timeout(
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let user_len = frame.arg(SYSCALL_ARG_LEN);
     let waiter_tid = current_tid(kernel)?;
+    clear_blocked_recv_state(kernel, waiter_tid, "error");
     let received = if timeout_ticks == 0 {
         kernel.try_ipc_recv(cap).map_err(SyscallError::from)?
     } else {
@@ -745,6 +748,11 @@ fn handle_ipc_recv_timeout(
             .map_err(SyscallError::from)?;
         fired || received.is_none()
     };
+    if timed_out {
+        clear_blocked_recv_state(kernel, waiter_tid, "timeout");
+    } else if received.is_some() {
+        clear_blocked_recv_state(kernel, waiter_tid, "immediate_success");
+    }
     handle_ipc_recv_result_with_empty_error(
         kernel,
         frame,
