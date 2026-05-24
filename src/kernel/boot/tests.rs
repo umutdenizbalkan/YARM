@@ -1376,14 +1376,19 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
     state.enqueue_current_cpu(2).expect("enqueue");
     state.enqueue_current_cpu(1).expect("enqueue");
     state.dispatch_next_task().expect("dispatch");
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("switch to root");
+    }
     let reply_cap = state
-        .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+        .create_reply_cap_for_caller(ThreadId(1), recv_cap_global, Some(ThreadId(2)))
         .expect("reply cap");
     let reply_cap_task2 = state
         .grant_capability_task_to_task(0, reply_cap, 2)
         .expect("dup reply cap");
 
-    state.yield_current().expect("switch to task1");
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("switch to task1");
+    }
     let payload_ptr = 0x3000usize;
     let meta_ptr = 0x3080usize;
     let mut recv_frame = TrapFrame::new(
@@ -1400,26 +1405,23 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
     state
         .handle_trap(Trap::Syscall, Some(&mut recv_frame))
         .expect("recv blocks");
-    if state.current_tid() != Some(0) {
-        state.yield_current().expect("switch sender");
-    }
-
-    if state.current_tid() != Some(2) {
+    while state.current_tid() != Some(2) {
         state.yield_current().expect("switch replier");
     }
     let reply = Message::with_header(0, 0x44, 0, None, b"rp").expect("reply");
     state.ipc_reply(reply_cap_task2, reply).expect("reply");
-    state.yield_current().expect("switch receiver");
-    let mut payload = [0u8; 16];
-    let mut meta = [0u8; 40];
-    state
-        .copy_from_current_user_into_slice(payload_ptr, payload.len(), &mut payload)
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("switch receiver");
+    }
+    let payload = state
+        .read_user_memory_for_asid(asid1, payload_ptr, 2)
         .expect("read payload");
+    let mut meta = [0u8; 40];
     state
         .copy_from_current_user_into_slice(meta_ptr, meta.len(), &mut meta)
         .expect("read meta");
     assert_eq!(payload[..2], *b"rp");
-    assert_eq!(u64::from_le_bytes(meta[8..16].try_into().expect("opcode")), 0x44);
+    assert_eq!(u16::from_le_bytes(meta[8..10].try_into().expect("opcode")), 0x44);
 
     state.yield_current().expect("switch sender");
     state.yield_current().expect("switch receiver");
