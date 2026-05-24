@@ -330,7 +330,7 @@ fn spawn_v5_cap(
             );
             match decode_spawn_v5_reply(payload) {
                 Ok(result) => {
-                    if result.pid == 0 {
+                    if !spawn_v5_reply_is_success(result.pid, result.service_send_cap) {
                         yarm_user_rt::user_log!(
                             "INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0 reason=zero_pid"
                         );
@@ -365,6 +365,10 @@ fn spawn_v5_cap(
             None
         }
     }
+}
+
+fn spawn_v5_reply_is_success(pid: u64, _service_send_cap: u64) -> bool {
+    pid != 0
 }
 
 pub fn run() {
@@ -699,6 +703,26 @@ mod tests {
         let decoded = decode_spawn_v5_reply(&payload).expect("decode");
         assert_eq!(decoded.pid, 42);
         assert_eq!(decoded.service_send_cap, 65552);
+    }
+
+    #[test]
+    fn spawn_v5_zero_reply_is_not_success() {
+        let payload = [0u8; 16];
+        let decoded = decode_spawn_v5_reply(&payload).expect("decode");
+        assert!(!spawn_v5_reply_is_success(
+            decoded.pid,
+            decoded.service_send_cap
+        ));
+    }
+
+    #[test]
+    fn spawn_v5_success_reply_is_success() {
+        let payload = encode_spawn_v5_reply(7, 65541);
+        let decoded = decode_spawn_v5_reply(&payload).expect("decode");
+        assert!(spawn_v5_reply_is_success(
+            decoded.pid,
+            decoded.service_send_cap
+        ));
     }
 
     #[test]

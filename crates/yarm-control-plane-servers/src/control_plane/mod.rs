@@ -18,6 +18,40 @@ pub mod vfs;
 
 #[cfg(test)]
 mod tests {
+    use yarm_ipc_abi::process_abi::{decode_spawn_v5_reply, encode_spawn_v5_reply};
+
+    fn spawn_v5_reply_is_success(pid: u64, _service_send_cap: u64) -> bool {
+        pid != 0
+    }
+
+    #[test]
+    fn decode_spawn_v5_reply_all_zero_is_failure_shape() {
+        let payload = [0u8; 16];
+        let decoded = decode_spawn_v5_reply(&payload).expect("decode");
+        assert_eq!(decoded.pid, 0);
+        assert_eq!(decoded.service_send_cap, 0);
+    }
+
+    #[test]
+    fn spawn_v5_zero_reply_is_not_success() {
+        let payload = [0u8; 16];
+        let decoded = decode_spawn_v5_reply(&payload).expect("decode");
+        assert!(!spawn_v5_reply_is_success(
+            decoded.pid,
+            decoded.service_send_cap
+        ));
+    }
+
+    #[test]
+    fn spawn_v5_success_reply_is_success() {
+        let payload = encode_spawn_v5_reply(7, 65541);
+        let decoded = decode_spawn_v5_reply(&payload).expect("decode");
+        assert!(spawn_v5_reply_is_success(
+            decoded.pid,
+            decoded.service_send_cap
+        ));
+    }
+
     #[test]
     fn migrated_control_plane_services_avoid_legacy_blocking_ipc_recv_calls() {
         let vfs_src = include_str!("vfs/service.rs");
