@@ -1187,10 +1187,14 @@ impl ProcessService {
                             startup_args[14] = req.service_caps[1];
                             startup_args[15] = req.service_caps[2];
                             startup_args[16] = req.service_caps[3];
-                            let vfs_send_cap = req.service_caps[0] as u32;
+                            let vfs_send_cap = self
+                                .lifecycle_table
+                                .get_by_image_id(6)
+                                .map(|rec| rec.pm_service_send_cap)
+                                .unwrap_or(0);
                             if vfs_send_cap == 0 {
                                 yarm_user_rt::user_log!(
-                                    "PM_VFS_SPAWN_FAIL image_id={} err=missing_vfs_send_cap",
+                                    "PM_VFS_SPAWN_FAIL image_id={} err=missing_vfs_send_cap_pm_local",
                                     req.image_id
                                 );
                                 let encoded = encode_spawn_v5_reply(0, 0);
@@ -1397,12 +1401,15 @@ unsafe fn pm_vfs_spawn_inline(
         image_id, path_log, parent_pid
     );
     let ctx = yarm_user_rt::runtime::startup_context();
+    let reply_recv_cap = ctx
+        .process_manager_reply_recv_cap
+        .or(ctx.pm_request_recv_cap)
+        .ok_or(ProcessManagerError::Unsupported)?;
     yarm_user_rt::user_log!(
         "PM_VFS_CAPS send_cap={} reply_cap={}",
-        vfs_send_cap, 
-        ctx.process_manager_reply_recv_cap.unwrap_or(0)
+        vfs_send_cap,
+        reply_recv_cap
     );
-    let reply_recv_cap = ctx.process_manager_reply_recv_cap.ok_or(ProcessManagerError::Unsupported)?;
     let image = unsafe { pm_read_all_via_vfs(vfs_send_cap, reply_recv_cap, path_label) }?;
     if image.is_empty() {
         yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err=empty-elf", image_id);
