@@ -257,6 +257,45 @@ mod tests {
     }
 
     #[test]
+    fn vfs_fd_table_rejects_read_after_close() {
+        let mut t = VfsFdTable::new();
+        t.insert(7, 30, "initramfs", CLIENT_A);
+        assert!(t.lookup(7, CLIENT_A).is_some());
+        t.remove(7, CLIENT_A);
+        // Subsequent read/lookup through same (fd, client) is deterministically missing.
+        assert!(t.lookup(7, CLIENT_A).is_none());
+    }
+
+    #[test]
+    fn vfs_fd_table_double_close_is_deterministic() {
+        let mut t = VfsFdTable::new();
+        t.insert(9, 40, "devfs", CLIENT_A);
+        t.remove(9, CLIENT_A);
+        // Second close is a no-op in table terms; entry remains absent deterministically.
+        t.remove(9, CLIENT_A);
+        assert!(t.lookup(9, CLIENT_A).is_none());
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn vfs_fd_reuse_does_not_cross_client_leak() {
+        let mut t = VfsFdTable::new();
+        // Client A opens and closes fd=3.
+        t.insert(3, 10, "initramfs", CLIENT_A);
+        t.remove(3, CLIENT_A);
+        assert!(t.lookup(3, CLIENT_A).is_none());
+
+        // Client B reuses same numeric fd=3 later.
+        t.insert(3, 20, "devfs", CLIENT_B);
+
+        // A's old closed fd identity must not resolve to B's backend mapping.
+        assert!(t.lookup(3, CLIENT_A).is_none());
+        let (cap_b, label_b) = t.lookup(3, CLIENT_B).expect("client-b fd");
+        assert_eq!(cap_b, 20);
+        assert_eq!(label_b.as_str(), "devfs");
+    }
+
+    #[test]
     fn fd_isolation_multiple_fds_per_client_are_independent() {
         let mut t = VfsFdTable::new();
         t.insert(3, 10, "initramfs", CLIENT_A);

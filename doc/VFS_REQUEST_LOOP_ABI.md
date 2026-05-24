@@ -106,6 +106,13 @@ An fd entry is created by `VFS_OP_OPENAT` on success and removed by
   to a different client.
 - `VFS_OP_CLOSE` only evicts the calling client's own entry; another client's
   entry for the same fd number is left untouched.
+- Read-after-close is rejected deterministically as `VFS_STATUS_ERR_BAD_FD`.
+- Double-close is deterministic:
+  - first close succeeds when the caller owns the fd,
+  - second close returns `VFS_STATUS_ERR_BAD_FD` because the entry is already absent.
+- Numeric fd reuse can occur after close; ownership remains keyed by `(fd, client_id)`,
+  so a stale closed fd from client A cannot resolve to client B even if B later gets
+  the same fd number.
 - The fd table capacity is bounded by `MAX_FD_ENTRIES = 32`.
 
 ---
