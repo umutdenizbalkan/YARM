@@ -2929,7 +2929,29 @@ mod tests {
 
     #[test]
     fn recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload() {
+        std::thread::Builder::new()
+            .name("recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload)
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    fn run_recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload() {
         let mut state = Bootstrap::init().expect("kernel");
+        let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind");
+        state
+            .map_user_page(
+                aspace_map_cap,
+                crate::kernel::vm::VirtAddr(0x5000),
+                crate::kernel::vm::Mapping {
+                    phys: crate::kernel::vm::PhysAddr(0xC000),
+                    flags: crate::kernel::vm::PageFlags::USER_RW,
+                },
+            )
+            .expect("map recv-v2 test page");
         let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
         let reply_cap = state
             .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(0), recv_cap, None)
@@ -2937,32 +2959,60 @@ mod tests {
         let reply = Message::with_header(9, 0xBEEF, 0, None, b"xy").expect("reply");
         state.ipc_reply(reply_cap, reply).expect("reply send");
 
-        let mut payload = [0u8; 16];
-        let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
+        let payload_ptr = 0x5000usize;
+        let meta_ptr = 0x5080usize;
         let mut recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [
                 recv_cap.0 as usize,
-                payload.as_mut_ptr() as usize,
-                payload.len(),
-                meta.as_mut_ptr() as usize,
-                meta.len(),
+                payload_ptr,
+                8,
+                meta_ptr,
+                IPC_RECV_META_V2_ENCODED_LEN,
                 0,
             ],
         );
         dispatch(&mut state, &mut recv).expect("recv syscall");
+        let payload = state
+            .read_user_memory(0, payload_ptr, 2)
+            .expect("read payload");
+        let meta = state
+            .read_user_memory(0, meta_ptr, IPC_RECV_META_V2_ENCODED_LEN)
+            .expect("read meta");
         assert_eq!(recv.error_code(), None);
         assert_eq!(recv.ret0(), 0);
-        assert_eq!(recv.ret1(), 0);
         assert_eq!(recv.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
         assert_eq!(&payload[..2], b"xy");
-        assert_eq!(u64::from_le_bytes(meta[8..16].try_into().expect("opcode")), 0xBEEF);
+        assert_eq!(u16::from_le_bytes(meta[8..10].try_into().expect("opcode")), 0xBEEF);
+        assert_eq!(u32::from_le_bytes(meta[12..16].try_into().expect("payload len")), 2);
         assert_eq!(u64::from_le_bytes(meta[24..32].try_into().expect("meta flags")), 0);
     }
 
     #[test]
     fn recv_v2_materializes_reply_cap_once_per_message() {
+        std::thread::Builder::new()
+            .name("recv_v2_materializes_reply_cap_once_per_message".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_recv_v2_materializes_reply_cap_once_per_message)
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    fn run_recv_v2_materializes_reply_cap_once_per_message() {
         let mut state = Bootstrap::init().expect("kernel");
+        let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind");
+        state
+            .map_user_page(
+                aspace_map_cap,
+                crate::kernel::vm::VirtAddr(0x6000),
+                crate::kernel::vm::Mapping {
+                    phys: crate::kernel::vm::PhysAddr(0xD000),
+                    flags: crate::kernel::vm::PageFlags::USER_RW,
+                },
+            )
+            .expect("map recv-v2 page");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
         let reply_cap = state
             .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(0), recv_cap, None)
@@ -2971,23 +3021,24 @@ mod tests {
             .expect("msg");
         state.ipc_send(send_cap, msg).expect("send");
 
-        let mut p1 = [0u8; 8];
-        let mut m1 = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
+        let p1_ptr = 0x6000usize;
+        let m1_ptr = 0x6080usize;
         let mut recv1 = TrapFrame::new(
             Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, p1.as_mut_ptr() as usize, p1.len(), m1.as_mut_ptr() as usize, m1.len(), 0],
+            [recv_cap.0 as usize, p1_ptr, 8, m1_ptr, IPC_RECV_META_V2_ENCODED_LEN, 0],
         );
         dispatch(&mut state, &mut recv1).expect("recv1");
+        let m1 = state
+            .read_user_memory(0, m1_ptr, IPC_RECV_META_V2_ENCODED_LEN)
+            .expect("read meta1");
         let flags = u64::from_le_bytes(m1[24..32].try_into().expect("flags"));
         assert_eq!(flags & (SYSCALL_RECV_META_REPLY_CAP as u64), SYSCALL_RECV_META_REPLY_CAP as u64);
         let recv_local_cap = CapId(u64::from_le_bytes(m1[32..40].try_into().expect("cap")));
         assert_ne!(recv_local_cap.0, reply_cap.0, "must be receiver-local cap id");
 
-        let mut p2 = [0u8; 8];
-        let mut m2 = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
         let mut recv2 = TrapFrame::new(
             Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, p2.as_mut_ptr() as usize, p2.len(), m2.as_mut_ptr() as usize, m2.len(), 0],
+            [recv_cap.0 as usize, p1_ptr, 8, m1_ptr, IPC_RECV_META_V2_ENCODED_LEN, 0],
         );
         let err = dispatch(&mut state, &mut recv2).expect_err("no duplicate message or rematerialization");
         assert_eq!(err, SyscallError::WouldBlock);
