@@ -3001,6 +3001,15 @@ mod tests {
 
     fn run_recv_v2_materializes_reply_cap_once_per_message() {
         let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let (_reply_eid, _reply_send_cap, reply_recv_cap) = state.create_endpoint(4).expect("reply endpoint");
+        let payload_word = usize::from_le_bytes(*b"ok\0\0\0\0\0\0");
+        let mut call = TrapFrame::new(
+            Syscall::IpcCall as usize,
+            [send_cap.0 as usize, 0, 2, payload_word, 0, reply_recv_cap.0 as usize],
+        );
+        dispatch(&mut state, &mut call).expect("call");
+
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind");
         state
@@ -3013,13 +3022,6 @@ mod tests {
                 },
             )
             .expect("map recv-v2 page");
-        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
-        let reply_cap = state
-            .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(0), recv_cap, None)
-            .expect("reply cap");
-        let msg = Message::with_header(2, 0x33, Message::FLAG_REPLY_CAP, Some(reply_cap.0), b"ok")
-            .expect("msg");
-        state.ipc_send(send_cap, msg).expect("send");
 
         let p1_ptr = 0x6000usize;
         let m1_ptr = 0x6080usize;
@@ -3034,14 +3036,19 @@ mod tests {
         let flags = u64::from_le_bytes(m1[24..32].try_into().expect("flags"));
         assert_eq!(flags & (SYSCALL_RECV_META_REPLY_CAP as u64), SYSCALL_RECV_META_REPLY_CAP as u64);
         let recv_local_cap = CapId(u64::from_le_bytes(m1[32..40].try_into().expect("cap")));
-        assert_ne!(recv_local_cap.0, reply_cap.0, "must be receiver-local cap id");
+        assert_ne!(recv_local_cap.0, reply_recv_cap.0, "must be receiver-local cap id");
 
         let mut recv2 = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, p1_ptr, 8, m1_ptr, IPC_RECV_META_V2_ENCODED_LEN, 0],
         );
-        let err = dispatch(&mut state, &mut recv2).expect_err("no duplicate message or rematerialization");
-        assert_eq!(err, SyscallError::WouldBlock);
+        dispatch(&mut state, &mut recv2).expect("no duplicate message or rematerialization");
+        assert_eq!(
+            state.task_status(0),
+            Some(crate::kernel::task::TaskStatus::Blocked(
+                crate::kernel::task::WaitReason::EndpointReceive(recv_cap)
+            ))
+        );
     }
 
     #[test]
