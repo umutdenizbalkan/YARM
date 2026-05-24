@@ -2928,6 +2928,72 @@ mod tests {
     }
 
     #[test]
+    fn recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+        let reply = Message::with_header(9, 0xBEEF, 0, None, b"xy").expect("reply");
+        state.ipc_reply(reply_cap, reply).expect("reply send");
+
+        let mut payload = [0u8; 16];
+        let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [
+                recv_cap.0 as usize,
+                payload.as_mut_ptr() as usize,
+                payload.len(),
+                1,
+                meta.as_mut_ptr() as usize,
+                meta.len(),
+            ],
+        );
+        dispatch(&mut state, &mut recv).expect("recv syscall");
+        assert_eq!(recv.error_code(), None);
+        assert_eq!(recv.ret0(), 0);
+        assert_eq!(recv.ret1(), 0);
+        assert_eq!(recv.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
+        assert_eq!(&payload[..2], b"xy");
+        assert_eq!(u64::from_le_bytes(meta[8..16].try_into().expect("opcode")), 0xBEEF);
+        assert_eq!(u64::from_le_bytes(meta[24..32].try_into().expect("meta flags")), 0);
+    }
+
+    #[test]
+    fn recv_v2_materializes_reply_cap_once_per_message() {
+        let mut state = Bootstrap::init().expect("kernel");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+        let msg = Message::with_header(2, 0x33, Message::FLAG_REPLY_CAP, Some(reply_cap.0), b"ok")
+            .expect("msg");
+        state.ipc_send(send_cap, msg).expect("send");
+
+        let mut p1 = [0u8; 8];
+        let mut m1 = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
+        let mut recv1 = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, p1.as_mut_ptr() as usize, p1.len(), 1, m1.as_mut_ptr() as usize, m1.len()],
+        );
+        dispatch(&mut state, &mut recv1).expect("recv1");
+        let flags = u64::from_le_bytes(m1[24..32].try_into().expect("flags"));
+        assert_eq!(flags & (SYSCALL_RECV_META_REPLY_CAP as u64), SYSCALL_RECV_META_REPLY_CAP as u64);
+        let recv_local_cap = CapId(u64::from_le_bytes(m1[32..40].try_into().expect("cap")));
+        assert_ne!(recv_local_cap.0, reply_cap.0, "must be receiver-local cap id");
+
+        let mut p2 = [0u8; 8];
+        let mut m2 = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
+        let mut recv2 = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, p2.as_mut_ptr() as usize, p2.len(), 1, m2.as_mut_ptr() as usize, m2.len()],
+        );
+        let err = dispatch(&mut state, &mut recv2).expect_err("no duplicate message or rematerialization");
+        assert_eq!(err, SyscallError::WouldBlock);
+    }
+
+    #[test]
     fn vm_map_syscall_maps_aligned_region() {
         let mut state = Bootstrap::init().expect("kernel");
         let (asid, aspace_map_cap) = state.create_user_address_space().expect("aspace");

@@ -1214,6 +1214,95 @@ fn reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint() {
 }
 
 #[test]
+fn recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch");
+    let (_eid, send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+    let recv_cap = state
+        .grant_capability_task_to_task(0, recv_cap_global, 1)
+        .expect("dup recv cap");
+
+    state.yield_current().expect("switch to task1");
+    let mut payload = [0u8; 16];
+    let mut meta = [0u8; 40];
+    let mut recv_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [
+            recv_cap.0 as usize,
+            payload.as_mut_ptr() as usize,
+            payload.len(),
+            1,
+            (&mut meta as *mut [u8; 40]) as usize,
+            meta.len(),
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+        .expect("recv blocks");
+    assert_eq!(state.current_tid(), Some(0));
+
+    let msg = Message::with_header(7, 0x1234, 0, None, b"hello").expect("msg");
+    state.ipc_send(send_cap, msg).expect("send");
+    state.yield_current().expect("switch receiver");
+    assert_eq!(state.current_tid(), Some(1));
+    assert_eq!(payload[..5], *b"hello");
+    assert_eq!(u64::from_le_bytes(meta[0..8].try_into().expect("status")), 0);
+    assert_eq!(u64::from_le_bytes(meta[8..16].try_into().expect("opcode")), 0x1234);
+    assert_eq!(u64::from_le_bytes(meta[16..24].try_into().expect("flags")), 0);
+    assert_eq!(u64::from_le_bytes(meta[32..40].try_into().expect("sender")), 7);
+
+    state.yield_current().expect("switch sender");
+    state.yield_current().expect("switch receiver");
+    assert_eq!(state.ipc_recv(recv_cap).expect("recv queued"), None);
+}
+
+#[test]
+fn ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch");
+    let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+    let recv_cap = state
+        .grant_capability_task_to_task(0, recv_cap_global, 1)
+        .expect("dup recv cap");
+    let reply_cap = state
+        .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+        .expect("reply cap");
+
+    state.yield_current().expect("switch to task1");
+    let mut payload = [0u8; 16];
+    let mut meta = [0u8; 40];
+    let mut recv_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [
+            recv_cap.0 as usize,
+            payload.as_mut_ptr() as usize,
+            payload.len(),
+            1,
+            (&mut meta as *mut [u8; 40]) as usize,
+            meta.len(),
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+        .expect("recv blocks");
+    state.yield_current().expect("switch sender");
+
+    let reply = Message::with_header(0, 0x44, 0, None, b"rp").expect("reply");
+    state.ipc_reply(reply_cap, reply).expect("reply");
+    state.yield_current().expect("switch receiver");
+    assert_eq!(payload[..2], *b"rp");
+    assert_eq!(u64::from_le_bytes(meta[8..16].try_into().expect("opcode")), 0x44);
+
+    state.yield_current().expect("switch sender");
+    state.yield_current().expect("switch receiver");
+    assert_eq!(state.ipc_recv(recv_cap).expect("recv queued"), None);
+}
+
+#[test]
 fn reply_caps_are_revoked_when_caller_exits() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
