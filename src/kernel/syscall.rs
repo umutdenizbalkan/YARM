@@ -191,6 +191,10 @@ pub(crate) fn complete_blocked_recv_for_waiter(
             .ok_or(SyscallError::InvalidArgs)?
     };
     let waiter_asid = kernel.task_asid(waiter_tid).ok_or(SyscallError::InvalidArgs)?;
+    let recv_endpoint = kernel
+        .resolve_capability_for_task(waiter_tid, blocked_state.recv_cap)
+        .map_err(SyscallError::from)?
+        .object;
     let payload = msg.as_slice();
     let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2 {
         (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
@@ -229,11 +233,31 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     } else {
         0
     };
+    let recv_local_transfer = materialize_received_transfer_cap(
+        kernel,
+        msg.transferred_cap().map(|c| c.0),
+        recv_endpoint,
+        waiter_tid,
+    )?;
+    if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCKED_REPLY_CAP_MINT waiter_tid={} local_reply_cap={} reply_obj={}",
+            waiter_tid,
+            recv_local_transfer.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
+            msg.transferred_cap()
+                .map(|c| c.0)
+                .unwrap_or(SYSCALL_NO_TRANSFER_CAP)
+        );
+    }
     let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
-    let cap_id = msg
-        .transferred_cap()
-        .map(|c| c.0)
-        .unwrap_or(SYSCALL_NO_TRANSFER_CAP);
+    let cap_id = recv_local_transfer.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
+    if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+        crate::yarm_log!(
+            "IPC_RECV_BLOCKED_META_REPLY_CAP waiter_tid={} cap={}",
+            waiter_tid,
+            cap_id
+        );
+    }
     meta[0..8].copy_from_slice(&0u64.to_le_bytes());
     meta[8..10].copy_from_slice(&app_opcode.to_le_bytes());
     meta[10..12].copy_from_slice(&0u16.to_le_bytes());
@@ -891,6 +915,16 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             responder_tid,
         )
         .map_err(SyscallError::from)?;
+    let reply_obj = kernel
+        .resolve_capability_for_task(sender_tid, reply_cap)
+        .map(|cap| cap.object)
+        .ok();
+    crate::yarm_log!(
+        "IPC_CALL_REPLY_CAP_CREATE caller_tid={} waiter_tid={} reply_obj={:?}",
+        sender_tid,
+        responder_tid.map(|tid| tid.0).unwrap_or(u64::MAX),
+        reply_obj
+    );
 
     let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
