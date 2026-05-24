@@ -44,7 +44,25 @@ const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 /// Image IDs in this inclusive range are bootstrap-critical: they must be
 /// spawned via the direct kernel path before VFS is available.
 const BOOTSTRAP_IMAGE_ID_MIN: u64 = 1;
-const BOOTSTRAP_IMAGE_ID_MAX: u64 = 3;
+const BOOTSTRAP_SERVICE_IMAGE_ID_MAX: u64 = 6;
+const VFS_SERVICE_IMAGE_ID_MIN: u64 = 7;
+const VFS_SERVICE_IMAGE_ID_MAX: u64 = 9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnLoadSource {
+    DirectInitrd,
+    Vfs,
+}
+
+fn resolve_spawn_load_source(image_id: u64) -> Result<SpawnLoadSource, ProcessManagerError> {
+    if (BOOTSTRAP_IMAGE_ID_MIN..=BOOTSTRAP_SERVICE_IMAGE_ID_MAX).contains(&image_id) {
+        return Ok(SpawnLoadSource::DirectInitrd);
+    }
+    if (VFS_SERVICE_IMAGE_ID_MIN..=VFS_SERVICE_IMAGE_ID_MAX).contains(&image_id) {
+        return Ok(SpawnLoadSource::Vfs);
+    }
+    Err(ProcessManagerError::Unsupported)
+}
 
 const MAX_EXEC_LOAD_SEGMENTS: usize = 8;
 const MAX_EXEC_STACK_BYTES: usize = 4096;
@@ -1148,11 +1166,13 @@ impl ProcessService {
                     // spawner_cap:  non-zero only when parent_pid != 0; this is PM's own
                     //               copy of the service send cap (high 32 bits of ret2).
                     // pm_send_cap:  whichever of the above lives in PM's own CNode.
-                    let (tid, caller_cap, spawner_cap) = match req.image_id {
-                        // image_id 0 is kernel-internal; PM must never spawn it.
-                        0 => return Err(ProcessManagerError::Unsupported),
-                        // Bootstrap-critical images must reach the kernel before VFS exists.
-                        BOOTSTRAP_IMAGE_ID_MIN..=BOOTSTRAP_IMAGE_ID_MAX => {
+                    let source = resolve_spawn_load_source(req.image_id)?;
+                    let (tid, caller_cap, spawner_cap) = match source {
+                        SpawnLoadSource::DirectInitrd => {
+                            yarm_user_rt::user_log!(
+                                "PM_SPAWN_IMAGE_SELECTED image_id={} source=direct-initrd",
+                                req.image_id
+                            );
                             let backend = KernelProcessSpawnBackend::new();
                             let (t, c, s) = backend.spawn_with_caps(
                                 req.image_id,
@@ -1161,8 +1181,7 @@ impl ProcessService {
                             )?;
                             (t, c as u64, s)
                         }
-                        // All other image IDs use the VFS-backed spawn path.
-                        _ => {
+                        SpawnLoadSource::Vfs => {
                             let mut startup_args = [0u64; 18];
                             startup_args[13] = req.service_caps[0];
                             startup_args[14] = req.service_caps[1];
@@ -2216,6 +2235,26 @@ mod tests {
         assert_eq!(table.get_by_image_id(5).unwrap().tid, 10);
         assert_eq!(table.get_by_image_id(6).unwrap().tid, 11);
         assert!(table.get_by_image_id(99).is_none());
+    }
+
+    #[test]
+    fn spawn_source_policy_bootstrap_and_vfs_ranges() {
+        assert_eq!(
+            resolve_spawn_load_source(4).ok(),
+            Some(SpawnLoadSource::DirectInitrd)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(5).ok(),
+            Some(SpawnLoadSource::DirectInitrd)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(6).ok(),
+            Some(SpawnLoadSource::DirectInitrd)
+        );
+        assert_eq!(resolve_spawn_load_source(7).ok(), Some(SpawnLoadSource::Vfs));
+        assert_eq!(resolve_spawn_load_source(8).ok(), Some(SpawnLoadSource::Vfs));
+        assert_eq!(resolve_spawn_load_source(9).ok(), Some(SpawnLoadSource::Vfs));
+        assert_eq!(resolve_spawn_load_source(10), Err(ProcessManagerError::Unsupported));
     }
 
     #[test]

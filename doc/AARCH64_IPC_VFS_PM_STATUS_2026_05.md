@@ -179,9 +179,13 @@ Intentionally left:
 - For service/image IDs `1..=3` (bootstrap-critical), PM keeps the direct
   kernel spawn path because these services must be reachable before VFS is
   guaranteed.
-- For initramfs-backed service/image IDs `4..=9`, PM now resolves canonical
-  initramfs paths and loads ELF bytes through VFS `STATX -> OPENAT -> READ* ->
-  CLOSE`, then spawns via `spawn_process_from_user_buf`.
+- For service/image IDs `4..=6` (`initramfs_srv`, `devfs_srv`, `vfs_server`),
+  PM keeps direct-initrd/bootstrap spawn so those services can come up before
+  VFS-backed executable loading is available.
+- After the bootstrap VFS chain is live, service/image IDs `7..=9`
+  (`driver_manager`, `blkcache_srv`, `virtio_blk_srv`) use canonical
+  initramfs paths and VFS `STATX -> OPENAT -> READ* -> CLOSE`, then spawn via
+  `spawn_process_from_user_buf`.
 - VFS errors are surfaced as spawn failures; PM does not silently mask failures
   by pretending VFS-based loads succeeded.
 - Spawn-source logging remains explicit to avoid duplicate-path ambiguity.
