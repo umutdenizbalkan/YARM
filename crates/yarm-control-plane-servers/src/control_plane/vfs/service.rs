@@ -310,6 +310,130 @@ fn vfs_error_reply(status: u32) -> yarm_user_rt::ipc::Message {
         .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1u64, &[]).expect("err msg"))
 }
 
+#[cfg(test)]
+fn route_for_test(
+    mount_table: &super::mount_table::VfsMountTable,
+    fd_table: &super::fd_table::VfsFdTable,
+    msg: &yarm_user_rt::ipc::Message,
+    client_id: u64,
+) -> Result<(u32, super::mount_table::MountLabel), u32> {
+    use yarm_ipc_abi::vfs_abi::{
+        OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ,
+        VFS_OP_STATX, VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC, VFS_STATUS_ERR_INVALID_PATH,
+        VFS_STATUS_ERR_NO_MOUNT, VFS_STATUS_ERR_UNKNOWN_OP,
+    };
+    match msg.opcode {
+        VFS_OP_STATX | VFS_OP_OPENAT => {
+            let raw_path: Option<&[u8]> = if msg.opcode == VFS_OP_STATX {
+                StatxInlinePath::decode(msg.as_slice()).map(|s| s.path)
+            } else {
+                OpenAtInlinePath::decode(msg.as_slice()).map(|s| s.path)
+            };
+            let raw_path = raw_path.ok_or(VFS_STATUS_ERR_INVALID_PATH)?;
+            let norm = super::path::normalize(raw_path).map_err(|_| VFS_STATUS_ERR_INVALID_PATH)?;
+            let path = norm.as_bytes();
+            mount_table.route(path).ok_or(VFS_STATUS_ERR_NO_MOUNT)
+        }
+        VFS_OP_READ | VFS_OP_CLOSE => {
+            let args = ReadWriteArgs::decode(msg.as_slice()).map_err(|_| VFS_STATUS_ERR_CODEC)?;
+            fd_table.lookup(args.fd, client_id).ok_or(VFS_STATUS_ERR_BAD_FD)
+        }
+        _ => Err(VFS_STATUS_ERR_UNKNOWN_OP),
+    }
+}
+
+#[cfg(test)]
+mod service_level_tests {
+    use super::*;
+    use yarm_fs_servers::common::vfs_ipc::{
+        close_message, openat_inline_message, read_message, CloseRequest, ReadWriteRequest,
+    };
+    use yarm_ipc_abi::vfs_abi::{VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_NO_MOUNT};
+
+    #[test]
+    fn vfs_service_open_routes_normalized_paths_to_expected_mount() {
+        let mut mounts = super::super::mount_table::VfsMountTable::new();
+        assert!(mounts.register(b"/", "root", 1));
+        assert!(mounts.register(b"/dev/", "devfs", 2));
+        let fds = super::super::fd_table::VfsFdTable::new();
+
+        let m = openat_inline_message(0, b"//dev///null", 0, 0).expect("msg");
+        let (cap, _) = route_for_test(&mounts, &fds, &m, 10).expect("route");
+        assert_eq!(cap, 2);
+
+        let m = openat_inline_message(0, b"/dev", 0, 0).expect("msg");
+        let (cap, _) = route_for_test(&mounts, &fds, &m, 10).expect("route");
+        assert_eq!(cap, 2);
+
+        let m = openat_inline_message(0, b"/sbin/init", 0, 0).expect("msg");
+        let (cap, _) = route_for_test(&mounts, &fds, &m, 10).expect("route");
+        assert_eq!(cap, 1);
+
+        let m = openat_inline_message(0, b"/device", 0, 0).expect("msg");
+        let (cap, _) = route_for_test(&mounts, &fds, &m, 10).expect("route");
+        assert_eq!(cap, 1); // root mount catches non-/dev paths.
+
+        let mut mounts2 = super::super::mount_table::VfsMountTable::new();
+        assert!(mounts2.register(b"/dev/", "devfs", 2));
+        let m = openat_inline_message(0, b"/sbin/init", 0, 0).expect("msg");
+        assert!(matches!(
+            route_for_test(&mounts2, &fds, &m, 10),
+            Err(VFS_STATUS_ERR_NO_MOUNT)
+        ));
+    }
+
+    #[test]
+    fn vfs_service_rejects_cross_client_fd_read_and_close() {
+        let mounts = super::super::mount_table::VfsMountTable::new();
+        let mut fds = super::super::fd_table::VfsFdTable::new();
+        assert!(fds.insert(7, 11, "devfs", 100));
+        let read = read_message(ReadWriteRequest { fd: 7, buf_ptr: 0, len: 1 }).expect("read");
+        let close = close_message(CloseRequest { fd: 7 }).expect("close");
+        assert!(matches!(
+            route_for_test(&mounts, &fds, &read, 200),
+            Err(VFS_STATUS_ERR_BAD_FD)
+        ));
+        assert!(matches!(
+            route_for_test(&mounts, &fds, &close, 200),
+            Err(VFS_STATUS_ERR_BAD_FD)
+        ));
+        assert!(route_for_test(&mounts, &fds, &read, 100).is_ok());
+    }
+
+    #[test]
+    fn vfs_service_rejects_read_after_close_and_double_close() {
+        let mounts = super::super::mount_table::VfsMountTable::new();
+        let mut fds = super::super::fd_table::VfsFdTable::new();
+        assert!(fds.insert(9, 12, "root", 300));
+        fds.remove(9, 300);
+        let read = read_message(ReadWriteRequest { fd: 9, buf_ptr: 0, len: 1 }).expect("read");
+        let close = close_message(CloseRequest { fd: 9 }).expect("close");
+        assert!(matches!(
+            route_for_test(&mounts, &fds, &read, 300),
+            Err(VFS_STATUS_ERR_BAD_FD)
+        ));
+        assert!(matches!(
+            route_for_test(&mounts, &fds, &close, 300),
+            Err(VFS_STATUS_ERR_BAD_FD)
+        ));
+    }
+
+    #[test]
+    fn vfs_service_fd_reuse_does_not_cross_client_leak() {
+        let mounts = super::super::mount_table::VfsMountTable::new();
+        let mut fds = super::super::fd_table::VfsFdTable::new();
+        assert!(fds.insert(3, 10, "initramfs", 1));
+        fds.remove(3, 1);
+        assert!(fds.insert(3, 20, "devfs", 2));
+        let read = read_message(ReadWriteRequest { fd: 3, buf_ptr: 0, len: 1 }).expect("read");
+        assert!(matches!(
+            route_for_test(&mounts, &fds, &read, 1),
+            Err(VFS_STATUS_ERR_BAD_FD)
+        ));
+        assert!(route_for_test(&mounts, &fds, &read, 2).is_ok());
+    }
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("VFS_SRV_ENTRY");
     let mut vfs = FsService::with_backend(InMemoryBackend::new());

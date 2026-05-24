@@ -229,6 +229,13 @@ the canonical encode/decode for these 4-byte payloads.
    - On CLOSE, remove the calling client's fd entry after the backend confirms
      success.
 
+Backend close/release instrumentation note:
+
+- Current service-level default tests assert deterministic fd-table lifecycle and
+  routing ownership semantics.
+- They do not currently include backend-side close callback instrumentation in
+  default (non-legacy) test mode.
+
 3. **Unknown opcode** — reply `VFS_STATUS_ERR_UNKNOWN_OP` immediately; do not
    forward.
 
