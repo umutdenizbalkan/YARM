@@ -2129,6 +2129,55 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::ReadInitramfsFile => handle_read_initramfs_file(kernel, frame),
         Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame),
     };
+    if result == Err(SyscallError::InvalidCapability) {
+        let tid = caller_tid.unwrap_or(0);
+        let task_status = kernel.task_status(tid);
+        crate::yarm_log!(
+            "SYSCALL_INVALID_CAPABILITY tid={} nr={} a0={} a1={} a2={} a3={} a4={} a5={} status={:?}",
+            tid,
+            frame.syscall_num(),
+            frame.arg(0),
+            frame.arg(1),
+            frame.arg(2),
+            frame.arg(3),
+            frame.arg(4),
+            frame.arg(5),
+            task_status
+        );
+        match syscall {
+            Syscall::IpcSend => {
+                crate::yarm_log!(
+                    "SYSCALL_INVALID_CAPABILITY_IPC_SEND tid={} send_cap={} transfer_cap={}",
+                    tid,
+                    frame.arg(SYSCALL_ARG_CAP),
+                    frame.arg(SYSCALL_ARG_TRANSFER_CAP)
+                );
+            }
+            Syscall::IpcRecv | Syscall::IpcRecvTimeout => {
+                crate::yarm_log!(
+                    "SYSCALL_INVALID_CAPABILITY_IPC_RECV tid={} recv_cap={}",
+                    tid,
+                    frame.arg(SYSCALL_ARG_CAP)
+                );
+            }
+            Syscall::IpcCall => {
+                crate::yarm_log!(
+                    "SYSCALL_INVALID_CAPABILITY_IPC_CALL tid={} send_cap={} reply_cap={}",
+                    tid,
+                    frame.arg(SYSCALL_ARG_CAP),
+                    frame.arg(SYSCALL_ARG_TRANSFER_CAP)
+                );
+            }
+            Syscall::IpcReply => {
+                crate::yarm_log!(
+                    "SYSCALL_INVALID_CAPABILITY_IPC_REPLY tid={} reply_cap={}",
+                    tid,
+                    frame.arg(SYSCALL_ARG_CAP)
+                );
+            }
+            _ => {}
+        }
+    }
     if result == Err(SyscallError::WouldBlock) {
         let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
         let caller_blocked = matches!(
