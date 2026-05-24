@@ -1201,14 +1201,32 @@ impl ProcessService {
                                 return Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &encoded)
                                     .map_err(|_| ProcessManagerError::Malformed);
                             }
-                            let (t, c, s) = unsafe {
+                            let (t, c, s) = match unsafe {
                                 pm_vfs_spawn_inline(
                                     req.image_id,
                                     req.parent_pid.0,
                                     &startup_args,
                                     vfs_send_cap,
                                 )
-                            }?;
+                            } {
+                                Ok(values) => values,
+                                Err(err) => {
+                                    yarm_user_rt::user_log!(
+                                        "PM_VFS_SPAWN_FAIL image_id={} err={:?}",
+                                        req.image_id,
+                                        err
+                                    );
+                                    let encoded = encode_spawn_v5_reply(0, 0);
+                                    return Message::with_header(
+                                        0,
+                                        PROC_OP_SPAWN_V5_CAP,
+                                        0,
+                                        None,
+                                        &encoded,
+                                    )
+                                    .map_err(|_| ProcessManagerError::Malformed);
+                                }
+                            };
                             (t, c as u64, s)
                         }
                     };
@@ -1403,7 +1421,6 @@ unsafe fn pm_vfs_spawn_inline(
     let ctx = yarm_user_rt::runtime::startup_context();
     let reply_recv_cap = ctx
         .process_manager_reply_recv_cap
-        .or(ctx.pm_request_recv_cap)
         .ok_or(ProcessManagerError::Unsupported)?;
     yarm_user_rt::user_log!(
         "PM_VFS_CAPS send_cap={} reply_cap={}",
