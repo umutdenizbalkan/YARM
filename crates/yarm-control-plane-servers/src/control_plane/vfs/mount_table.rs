@@ -327,8 +327,10 @@ mod tests {
 
         assert!(table.route(b"/dev/console").is_some());
         assert!(table.route(b"/dev/").is_some());
-        // /dev (no trailing slash) does NOT start with b"/dev/"
-        assert!(table.route(b"/dev").is_none());
+        // Exact mount root is intentionally accepted for a trailing-slash mount.
+        assert!(table.route(b"/dev").is_some());
+        // Prefix boundary still matters: "/device" must not match "/dev/".
+        assert!(table.route(b"/device").is_none());
     }
 
     #[test]

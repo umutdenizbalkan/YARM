@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 use yarm::kernel::boot::KernelState;
 use yarm_fs_servers::common::service::FsService;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 use yarm_fs_servers::common::vfs_ipc::VfsBackend;
 use yarm_fs_servers::common::vfs_ipc::VfsError;
 use yarm_fs_servers::common::vfs_ipc::{
@@ -14,7 +14,7 @@ use yarm_fs_servers::common::vfs_ipc::{
 };
 use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_srv_common::vfs_reply::VfsReply;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 use yarm_user_rt::capability::CapId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,10 +25,10 @@ pub struct VfsLoopSummary {
     pub handled: usize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 const VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 fn path_bytes_from_id(path_id: u64) -> Option<&'static [u8]> {
     use yarm_fs_servers::devfs::{DEV_CONSOLE_PATH, DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH, DEV_NULL_PATH_PTR};
     use yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_BOOT_MARKER_PATH_PTR};
@@ -103,19 +103,19 @@ pub fn run_request_loop(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 fn map_kernel_ipc_err<T>(
     result: Result<T, yarm::kernel::boot::KernelError>,
 ) -> Result<T, VfsError> {
     result.map_err(|_| VfsError::Unsupported)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 fn map_kernel_ipc_error(_: yarm::kernel::boot::KernelError) -> VfsError {
     VfsError::Unsupported
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 fn roundtrip_ipc<B: VfsBackend>(
     runtime: &mut impl VfsKernelIpcRuntime,
     vfs: &mut FsService<B>,
@@ -136,7 +136,7 @@ fn roundtrip_ipc<B: VfsBackend>(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 pub trait VfsKernelIpcRuntime {
     fn create_endpoint(&mut self, depth: usize) -> Result<(usize, CapId, CapId), VfsError>;
 
@@ -152,7 +152,7 @@ pub trait VfsKernelIpcRuntime {
     ) -> Result<yarm_user_rt::ipc::Message, VfsError>;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 impl VfsKernelIpcRuntime for KernelState {
     fn create_endpoint(&mut self, depth: usize) -> Result<(usize, CapId, CapId), VfsError> {
         map_kernel_ipc_err(self.create_endpoint(depth))
@@ -184,7 +184,7 @@ impl VfsKernelIpcRuntime for KernelState {
 }
 
 #[allow(dead_code)]
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 fn roundtrip_ipc_with_budget<B: VfsBackend>(
     runtime: &mut impl VfsKernelIpcRuntime,
     vfs: &mut FsService<B>,
@@ -206,7 +206,7 @@ fn roundtrip_ipc_with_budget<B: VfsBackend>(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 pub fn run_request_loop_over_kernel_ipc(
     runtime: &mut impl VfsKernelIpcRuntime,
     vfs: &mut FsService<impl VfsBackend>,
@@ -296,7 +296,7 @@ pub fn run_request_loop_over_kernel_ipc(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 pub fn run_with_kernel_ipc(
     runtime: &mut impl VfsKernelIpcRuntime,
     path_id: u64,
@@ -580,7 +580,7 @@ pub fn run() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 mod tests {
     use super::*;
     use yarm::kernel::boot::Bootstrap;

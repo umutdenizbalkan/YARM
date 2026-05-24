@@ -4,11 +4,15 @@
 //! Deprecated legacy namespace.
 //! Workspace crates under `crates/` are the runtime dispatch entrypoints.
 
+#[cfg(feature = "legacy-tests")]
 pub mod driver_manager;
+#[cfg(feature = "legacy-tests")]
 pub mod init;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 pub(crate) mod ipc_roundtrip;
+#[cfg(feature = "legacy-tests")]
 pub mod process_manager;
+#[cfg(feature = "legacy-tests")]
 pub mod supervisor;
 pub mod vfs;
 
