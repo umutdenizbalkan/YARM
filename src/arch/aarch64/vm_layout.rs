@@ -13,10 +13,14 @@ pub const KERNEL_SPACE_BASE: u64 = 0x4000_0000;
 pub const USER_BRK_DEFAULT_BASE: usize = 0x4000_0000;
 pub const ASID_BITS: u8 = 16;
 
+// Mapping bookkeeping is per-ASID and currently tracks page mappings one entry
+// at a time. A 512 KiB user stack already needs 128 x 4 KiB entries, so
+// bootstrap userspace (ELF RX/RW/BSS + stack + startup mappings) requires
+// headroom above 128 to avoid early Vm(Full) failures.
 #[cfg(feature = "hosted-dev")]
-pub const MAX_MAPPINGS: usize = 128;
+pub const MAX_MAPPINGS: usize = 512;
 #[cfg(not(feature = "hosted-dev"))]
-pub const MAX_MAPPINGS: usize = 128;
+pub const MAX_MAPPINGS: usize = 512;
 
 #[cfg(feature = "hosted-dev")]
 pub const MAX_ADDRESS_SPACES: usize = 16;
