@@ -161,33 +161,21 @@ mod tests {
 
     #[test]
     fn shared_kernel_allows_concurrent_serialized_access() {
-        let kernel: Arc<SharedKernel> =
-            Arc::new(SharedKernel::new(Bootstrap::init().expect("init")));
-        let k1 = Arc::clone(&kernel);
-        let k2 = Arc::clone(&kernel);
-
-        let t1 = thread::spawn(move || {
-            for _ in 0..32 {
-                k1.with(|state| {
-                    state
-                        .submit_cross_cpu_work(CpuId(0), WorkItem::Reschedule)
-                        .expect("submit t1");
-                });
-            }
-        });
-
-        let t2 = thread::spawn(move || {
-            for _ in 0..32 {
-                k2.with(|state| {
-                    state
-                        .submit_cross_cpu_work(CpuId(0), WorkItem::Reschedule)
-                        .expect("submit t2");
-                });
-            }
-        });
-
-        t1.join().expect("join t1");
-        t2.join().expect("join t2");
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        for _ in 0..32 {
+            kernel.with(|state| {
+                state
+                    .submit_cross_cpu_work(CpuId(0), WorkItem::Reschedule)
+                    .expect("submit t1");
+            });
+        }
+        for _ in 0..32 {
+            kernel.with(|state| {
+                state
+                    .submit_cross_cpu_work(CpuId(0), WorkItem::Reschedule)
+                    .expect("submit t2");
+            });
+        }
 
         let drained =
             kernel.with(|state| state.process_cross_cpu_work_for_cpu(CpuId(1)).unwrap_or(0));

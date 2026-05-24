@@ -808,6 +808,7 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                 Err(err) => return Err(err),
             }
         } else {
+            #[cfg(not(test))]
             crate::yarm_log!(
                 "YARM_SMP_AP_TIMEOUT cpu={} trampoline=0x{:x} trace=0x{:08x} cr3=0x{:08x} cr4_pre=0x{:08x} cr4_post=0x{:08x} efer_lo_pre=0x{:08x} efer_hi_pre=0x{:08x} efer_lo_post=0x{:08x} efer_hi_post=0x{:08x}",
                 cpu.0,

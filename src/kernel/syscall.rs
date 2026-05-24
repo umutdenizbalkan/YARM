@@ -2945,9 +2945,9 @@ mod tests {
                 recv_cap.0 as usize,
                 payload.as_mut_ptr() as usize,
                 payload.len(),
-                1,
                 meta.as_mut_ptr() as usize,
                 meta.len(),
+                0,
             ],
         );
         dispatch(&mut state, &mut recv).expect("recv syscall");
@@ -2975,7 +2975,7 @@ mod tests {
         let mut m1 = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
         let mut recv1 = TrapFrame::new(
             Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, p1.as_mut_ptr() as usize, p1.len(), 1, m1.as_mut_ptr() as usize, m1.len()],
+            [recv_cap.0 as usize, p1.as_mut_ptr() as usize, p1.len(), m1.as_mut_ptr() as usize, m1.len(), 0],
         );
         dispatch(&mut state, &mut recv1).expect("recv1");
         let flags = u64::from_le_bytes(m1[24..32].try_into().expect("flags"));
@@ -2987,7 +2987,7 @@ mod tests {
         let mut m2 = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
         let mut recv2 = TrapFrame::new(
             Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, p2.as_mut_ptr() as usize, p2.len(), 1, m2.as_mut_ptr() as usize, m2.len()],
+            [recv_cap.0 as usize, p2.as_mut_ptr() as usize, p2.len(), m2.as_mut_ptr() as usize, m2.len(), 0],
         );
         let err = dispatch(&mut state, &mut recv2).expect_err("no duplicate message or rematerialization");
         assert_eq!(err, SyscallError::WouldBlock);

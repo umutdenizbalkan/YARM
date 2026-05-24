@@ -219,6 +219,7 @@ mod tests {
         frame.apply_user_context(UserRegisterContext {
             instruction_ptr: VirtAddr(0x5000),
             stack_ptr: VirtAddr(0x9000),
+            user_gprs: [0; 32],
             arg0: 7,
             arg1: 8,
             arg2: 10,

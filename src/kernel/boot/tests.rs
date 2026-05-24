@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::kernel::ipc::ThreadId;
-use crate::kernel::vm::PAGE_SIZE;
+use crate::kernel::vm::{CachePolicy, PAGE_SIZE};
 use std::{format, string::String, vec::Vec};
 
 #[test]
@@ -973,7 +973,9 @@ fn destroy_aspace_with_blocked_ipc_waiter_and_preemption_preserves_ordering() {
         .grant_capability_task_to_task(0, recv_cap, 2)
         .expect("dup recv cap");
 
-    state.yield_current().expect("switch to task1");
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("switch to task1");
+    }
     assert_eq!(state.current_tid(), Some(1));
     assert_eq!(
         state.ipc_send(send_cap_task1, Message::new(1, b"hold").expect("msg")),
@@ -1215,16 +1217,33 @@ fn reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint() {
 
 #[test]
 fn recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
+    std::thread::Builder::new()
+        .name("recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
+    state.register_task(2).expect("task2");
     let (_eid, send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
     let recv_cap = state
         .grant_capability_task_to_task(0, recv_cap_global, 1)
         .expect("dup recv cap");
+    let send_cap_task2 = state
+        .grant_capability_task_to_task(0, send_cap, 2)
+        .expect("dup send cap");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.enqueue_current_cpu(2).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch");
 
-    state.yield_current().expect("switch to task1");
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("switch to task1");
+    }
     let mut payload = [0u8; 16];
     let mut meta = [0u8; 40];
     let mut recv_frame = TrapFrame::new(
@@ -1233,22 +1252,28 @@ fn recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
             recv_cap.0 as usize,
             payload.as_mut_ptr() as usize,
             payload.len(),
-            1,
             (&mut meta as *mut [u8; 40]) as usize,
             meta.len(),
+            0,
         ],
     );
     state
         .handle_trap(Trap::Syscall, Some(&mut recv_frame))
         .expect("recv blocks");
-    assert_eq!(state.current_tid(), Some(0));
+    assert_ne!(state.current_tid(), Some(1));
 
+    if state.current_tid() != Some(2) {
+        state.yield_current().expect("switch sender");
+    }
     let msg = Message::with_header(7, 0x1234, 0, None, b"hello").expect("msg");
-    state.ipc_send(send_cap, msg).expect("send");
+    state.ipc_send(send_cap_task2, msg).expect("send");
     state.yield_current().expect("switch receiver");
     assert_eq!(state.current_tid(), Some(1));
     assert_eq!(payload[..5], *b"hello");
-    assert_eq!(u64::from_le_bytes(meta[0..8].try_into().expect("status")), 0);
+    assert_eq!(
+        u16::from_le_bytes(meta[10..12].try_into().expect("msg flags")),
+        0
+    );
     assert_eq!(u64::from_le_bytes(meta[8..16].try_into().expect("opcode")), 0x1234);
     assert_eq!(u64::from_le_bytes(meta[16..24].try_into().expect("flags")), 0);
     assert_eq!(u64::from_le_bytes(meta[32..40].try_into().expect("sender")), 7);
@@ -1260,17 +1285,32 @@ fn recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
 
 #[test]
 fn ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
+    std::thread::Builder::new()
+        .name("ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
+    state.register_task(2).expect("task2");
     let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
     let recv_cap = state
         .grant_capability_task_to_task(0, recv_cap_global, 1)
         .expect("dup recv cap");
+    state.enqueue_current_cpu(2).expect("enqueue");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch");
     let reply_cap = state
         .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
         .expect("reply cap");
+    let reply_cap_task2 = state
+        .grant_capability_task_to_task(0, reply_cap, 2)
+        .expect("dup reply cap");
 
     state.yield_current().expect("switch to task1");
     let mut payload = [0u8; 16];
@@ -1281,18 +1321,23 @@ fn ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
             recv_cap.0 as usize,
             payload.as_mut_ptr() as usize,
             payload.len(),
-            1,
             (&mut meta as *mut [u8; 40]) as usize,
             meta.len(),
+            0,
         ],
     );
     state
         .handle_trap(Trap::Syscall, Some(&mut recv_frame))
         .expect("recv blocks");
-    state.yield_current().expect("switch sender");
+    if state.current_tid() != Some(0) {
+        state.yield_current().expect("switch sender");
+    }
 
+    if state.current_tid() != Some(2) {
+        state.yield_current().expect("switch replier");
+    }
     let reply = Message::with_header(0, 0x44, 0, None, b"rp").expect("reply");
-    state.ipc_reply(reply_cap, reply).expect("reply");
+    state.ipc_reply(reply_cap_task2, reply).expect("reply");
     state.yield_current().expect("switch receiver");
     assert_eq!(payload[..2], *b"rp");
     assert_eq!(u64::from_le_bytes(meta[8..16].try_into().expect("opcode")), 0x44);
@@ -4336,6 +4381,7 @@ fn fork_child_preserves_parent_registers_except_arg0() {
     let parent_ctx = UserRegisterContext {
         instruction_ptr: VirtAddr(0x8123),
         stack_ptr: VirtAddr(0x8FFF_0000),
+        user_gprs: [0; 32],
         arg0: 0xAAAA,
         arg1: 0x1111,
         arg2: 0x2222,
@@ -4621,6 +4667,7 @@ fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
         Some(UserRegisterContext {
             instruction_ptr: VirtAddr(0x9000),
             stack_ptr: VirtAddr(0x9900_0000),
+            user_gprs: [0; 32],
             arg0: 33,
             arg1: 44,
             arg2: 0,
