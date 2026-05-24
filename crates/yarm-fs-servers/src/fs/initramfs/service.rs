@@ -116,6 +116,9 @@ pub fn run() {
                 "INITRAMFS_BACKEND_SOURCE source=placeholder reason=missing_boot_initrd driver_manager_size={}",
                 driver_manager_size
             );
+            yarm_user_rt::user_log!(
+                "INITRAMFS_RUNTIME_LIMITATION missing_real_cpio=true vfs_exec_unavailable=true"
+            );
         }
     }
     let summary = run_request_loop(&mut svc).expect("initramfs loop");

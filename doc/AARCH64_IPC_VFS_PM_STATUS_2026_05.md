@@ -201,6 +201,10 @@ Intentionally left:
   by pretending VFS-based loads succeeded.
 - Spawn-source logging remains explicit to avoid duplicate-path ambiguity.
 - `VFS_READ_SHARED_REPLY_ENABLED` remains disabled in this phase.
+- `initramfs_srv` must be backed by real boot CPIO bytes for VFS-backed `7..=9` exec to work.
+  In runtime placeholder mode (`INITRAMFS_BACKEND_SOURCE source=placeholder`), late exec paths
+  (`/initramfs/sbin/driver_manager`, `/initramfs/sbin/blkcache_srv`, `/initramfs/sbin/virtio_blk_srv`)
+  are rejected truthfully (`Unsupported`) and are **not** treated as successful stat/open/read sources.
 
 ## Architectural status
 

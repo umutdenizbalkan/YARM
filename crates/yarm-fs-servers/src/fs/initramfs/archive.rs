@@ -223,6 +223,25 @@ impl InitramfsBackend {
         Err(VfsError::BadFd)
     }
 
+
+    fn is_placeholder_mode(&self) -> bool {
+        self.cpio.is_none()
+    }
+
+    fn is_late_exec_path(path: &[u8]) -> bool {
+        matches!(
+            path,
+            INITRAMFS_DRIVER_MANAGER_PATH | INITRAMFS_BLKCACHE_PATH | INITRAMFS_VIRTIO_BLK_PATH
+        )
+    }
+
+    fn reject_placeholder_exec_path(&self, path: &[u8]) -> Result<(), VfsError> {
+        if self.is_placeholder_mode() && Self::is_late_exec_path(path) {
+            return Err(VfsError::Unsupported);
+        }
+        Ok(())
+    }
+
     fn statx_value(file_len: u64) -> u64 { file_len }
 
     fn metadata_by_path(&self, path: &[u8]) -> Result<u64, VfsError> {
@@ -234,6 +253,10 @@ impl InitramfsBackend {
 
 impl VfsBackend for InitramfsBackend {
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        if let Err(err) = self.reject_placeholder_exec_path(path) {
+            self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+            return Err(err);
+        }
         match self.lookup_by_path(path).and_then(|inode_idx| self.alloc_handle(inode_idx)) {
             Ok(fd) => {
                 self.metrics.open_count = self.metrics.open_count.saturating_add(1);
@@ -314,6 +337,10 @@ impl VfsBackend for InitramfsBackend {
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        if let Err(err) = self.reject_placeholder_exec_path(path) {
+            self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+            return Err(err);
+        }
         match self.metadata_by_path(path) {
             Ok(stat) => {
                 self.metrics.statx_count = self.metrics.statx_count.saturating_add(1);
@@ -331,6 +358,7 @@ impl VfsBackend for InitramfsBackend {
 mod tests {
     use super::*;
     use alloc::format;
+    use alloc::boxed::Box;
     use alloc::vec::Vec;
 
     fn push_entry(out: &mut Vec<u8>, name: &str, mode: u32, data: &[u8]) {
@@ -436,7 +464,8 @@ mod tests {
         push_entry(&mut cpio, "sbin/supervisor", 0o100755, &[0u8; 135]);
         push_entry(&mut cpio, "vfs", 0o100755, &[0u8; 222]);
         push_entry(&mut cpio, "TRAILER!!!", 0, &[]);
-        let mut fs = InitramfsBackend::from_cpio_newc(&cpio);
+        let leaked: &'static [u8] = Box::leak(cpio.into_boxed_slice());
+        let mut fs = InitramfsBackend::from_cpio_newc_static(leaked);
         let init_stat = fs.statx_path(INITRAMFS_INIT_PATH).expect("init stat");
         let proc_stat = fs.statx_path(INITRAMFS_PROC_MGR_PATH).expect("proc stat");
         let sup_stat = fs
@@ -447,6 +476,25 @@ mod tests {
         assert_eq!(proc_stat, 111);
         assert_eq!(sup_stat, 135);
         assert_eq!(vfs_stat, 222);
+    }
+
+    #[test]
+    fn initramfs_placeholder_rejects_late_exec_paths() {
+        let mut fs = InitramfsBackend::new(4096);
+        assert_eq!(fs.statx_path(INITRAMFS_DRIVER_MANAGER_PATH), Err(VfsError::Unsupported));
+        assert_eq!(fs.openat_path(INITRAMFS_DRIVER_MANAGER_PATH), Err(VfsError::Unsupported));
+    }
+
+    #[test]
+    fn initramfs_cpio_allows_late_exec_paths_and_returns_real_size() {
+        let mut cpio = Vec::new();
+        push_entry(&mut cpio, "sbin/driver_manager", 0o100755, b"ELFdriver");
+        push_entry(&mut cpio, "TRAILER!!!", 0, &[]);
+        let leaked: &'static [u8] = Box::leak(cpio.into_boxed_slice());
+        let mut fs = InitramfsBackend::from_cpio_newc_static(leaked);
+        assert_eq!(fs.statx_path(INITRAMFS_DRIVER_MANAGER_PATH).expect("stat"), 10);
+        let fd = fs.openat_path(INITRAMFS_DRIVER_MANAGER_PATH).expect("open");
+        assert!(fd >= 10);
     }
 
 }
