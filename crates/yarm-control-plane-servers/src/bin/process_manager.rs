@@ -4,9 +4,17 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_std)]
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
+// PM sequentially reads each ELF binary via VFS into a Vec<u8> before spawning.
+// The bump allocator does NOT reclaim freed Vecs, so the heap must hold the sum
+// of all ELF images loaded during the boot sequence:
+//   image_id=7 driver_manager   ≈ 85 KB
+//   image_id=8 blkcache_srv     ≈ 85 KB
+//   image_id=9 virtio_blk_srv   ≈ 83 KB
+// Total ≈ 253 KB.  Add 256 KB headroom for metadata, service lifecycle table,
+// delegation tracking, and future services → 1 MB total.
 #[cfg(not(feature = "hosted-dev"))]
 yarm::install_freestanding_allocator!(
-    256 * 1024,
+    1024 * 1024,
     "process manager freestanding allocator OOM"
 );
 
@@ -62,5 +70,9 @@ pub extern "C" fn _start(
 #[cfg(not(feature = "hosted-dev"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    // Best-effort diagnostic: log before entering the halt loop so OOM and other
+    // panics are visible in the QEMU trace.  user_log is a simple syscall and is
+    // safe to call even during allocation failures.
+    yarm_user_rt::user_log!("PM_PANIC");
     loop {}
 }
