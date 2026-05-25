@@ -456,52 +456,70 @@ impl KernelState {
             Ok::<_, KernelError>(rec)
         })?;
 
-        // Recycle the one-shot Reply cap slot in the replier's cnode.
+        // ── No-alloc reply-cap cleanup ─────────────────────────────────────────
+        // Replaces the previous revoke_capability_in_cnode() calls which allocated
+        // up to 81920 bytes (Box<[Option<DelegatedCapabilityLink>; 2048]>) inside
+        // collect_delegated_descendants() — causing a panic on freestanding AArch64
+        // when the kernel heap was exhausted.
         //
-        // Without this, each call/reply cycle permanently occupies one of the 512
-        // cnode slots in the replier (e.g. initramfs_srv).  After ~255 cycles the
-        // cnode fills up: mint_capability_in_cnode returns CapabilityFull, which
-        // surfaces as IPC_RECV_BLOCKED_COMPLETE_FAILED and kills the VFS exec path.
+        // The narrow fast-revoke path:
+        // - performs no heap allocation
+        // - does not traverse delegation trees (Reply caps are never delegated)
+        // - clears exactly one cnode slot and bumps the generation
+        // - returns bool for diagnostics only
         //
-        // reply_cap is the CapId in *the current (replier) task's* cnode — exactly
-        // what revoke_capability_in_cnode needs.  Failures are silently ignored: the
-        // global record is already consumed so the reply has been irrevocably sent;
-        // the worst case is a leaked cnode slot, not a safety violation.
-        if let Some(replier_cnode) = self.current_task_cnode() {
-            let _ = self.revoke_capability_in_cnode(replier_cnode, reply_cap);
+        // Failures are non-fatal: the global ReplyCapRecord is already consumed so
+        // the reply is irrevocably committed. The worst case of a false return is a
+        // leaked cnode slot, not a safety violation.
+        let reply_object = capability.object;
+
+        // Revoke the Reply cap from the replier's (current task's) cnode.
+        let replier_ok = if let Some(replier_cnode) = self.current_task_cnode() {
+            self.fast_revoke_reply_cap_in_cnode(replier_cnode, reply_cap, reply_object)
+        } else {
+            false
+        };
+        crate::yarm_log!(
+            "IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid={} replier_tid={} cap={} ok={}",
+            record.caller_tid.0,
+            replier_tid.0,
+            reply_cap.0,
+            replier_ok
+        );
+        if !replier_ok {
+            crate::yarm_log!(
+                "IPC_REPLY_FAST_REVOKE_FAIL reason=replier_cap_not_found_or_mismatch"
+            );
         }
 
-        // Recycle the Reply cap that create_reply_cap_for_caller minted into the
-        // CALLER's cnode.
-        //
-        // create_reply_cap_for_caller (called during ipc_call while current_task ==
-        // the caller) mints a Reply cap into the *caller's* cnode so that it can be
-        // stashed in a transfer envelope and forwarded to the replier.  That cap is
-        // one-shot: once the replier materialises its own local copy and delivers a
-        // reply, the original in the caller's cnode is dead weight.
-        //
-        // Without this revoke, each ipc_call cycle permanently occupies one cnode
-        // slot on the caller side (e.g. PM).  For PM reading driver_manager via VFS
-        // (~762 READ calls at 112 B/chunk), PM's 512-slot cnode fills up around
-        // cycle ~492, causing KernelError::CapabilityFull → SyscallError::Internal
-        // in the next create_reply_cap_for_caller call.  The same leak also affects
-        // VFS for its nested VFS→backend IPC calls.
-        //
-        // record.caller_cap_id == 0 is the sentinel for "not yet set" (can only
-        // happen if the Phase-3 update in create_reply_cap_for_caller was skipped,
-        // which should never occur in practice).
+        // Revoke the Reply cap that create_reply_cap_for_caller minted into the
+        // caller's cnode. record.caller_cap_id == 0 is the "not yet set" sentinel
+        // (should never occur in practice; Phase-3 of create_reply_cap_for_caller
+        // always updates it before returning to userspace).
         if record.caller_cap_id.0 != 0 {
-            if let Some(caller_cnode) = self.task_cnode(record.caller_tid.0) {
-                let result = self.revoke_capability_in_cnode(caller_cnode, record.caller_cap_id);
+            let caller_ok = if let Some(caller_cnode) = self.task_cnode(record.caller_tid.0) {
+                self.fast_revoke_reply_cap_in_cnode(
+                    caller_cnode,
+                    record.caller_cap_id,
+                    reply_object,
+                )
+            } else {
+                false
+            };
+            crate::yarm_log!(
+                "IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid={} cap={} ok={}",
+                record.caller_tid.0,
+                record.caller_cap_id.0,
+                caller_ok
+            );
+            if !caller_ok {
                 crate::yarm_log!(
-                    "IPC_REPLY_CALLER_CAP_REVOKE caller_tid={} cap={} ok={}",
-                    record.caller_tid.0,
-                    record.caller_cap_id.0,
-                    result.is_ok()
+                    "IPC_REPLY_FAST_REVOKE_FAIL reason=caller_cap_not_found_or_mismatch"
                 );
             }
         }
 
+        // ── Deliver the reply ──────────────────────────────────────────────────
         let endpoint_idx = match self.resolve_endpoint_index(record.reply_endpoint) {
             Ok(idx) => idx,
             Err(err) => return Err(err),

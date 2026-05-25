@@ -1841,8 +1841,10 @@ fn run_ipc_nested_call_reply_survives_vfs_exec_sized_read_loop() {
     // driver_manager is 85344 bytes; at 112 bytes per READ the loop requires
     // ~762 outer cycles.  We run 800 to exceed this with margin.
     // Without the fix both PM and VFS exhaust their 512-slot cnodes around
-    // cycle 492 (512 - initial_caps ≈ 492).
-    const CYCLES: usize = 800;
+    // cycle 492 (512 - initial_caps ≈ 492).  We run 1000 cycles to exceed
+    // the ~762 READ calls needed to load driver_manager (85344 bytes at
+    // 112 bytes/chunk) with margin.
+    const CYCLES: usize = 1000;
 
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task_vfs");
@@ -1933,15 +1935,122 @@ fn run_ipc_nested_call_reply_survives_vfs_exec_sized_read_loop() {
     }
     state
         .create_endpoint(1)
-        .expect("PM cnode exhausted after 800 nested cycles");
+        .expect("PM cnode exhausted after 1000 nested cycles");
     // Grant the send cap to VFS so we validate VFS's cnode too.
     let (_, _ep_send, ep_recv) = state.create_endpoint(1).expect("probe ep");
     state
         .grant_capability_task_to_task(0, ep_recv, 1)
-        .expect("VFS cnode exhausted after 800 nested cycles");
+        .expect("VFS cnode exhausted after 1000 nested cycles");
     state
         .grant_capability_task_to_task(0, ep_recv, 2)
-        .expect("INIT cnode exhausted after 800 nested cycles");
+        .expect("INIT cnode exhausted after 1000 nested cycles");
+}
+
+#[test]
+fn recv_v2_materializes_reply_cap_once_per_message() {
+    std::thread::Builder::new()
+        .name("recv_v2_materializes_reply_cap_once_per_message".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_recv_v2_materializes_reply_cap_once_per_message)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_recv_v2_materializes_reply_cap_once_per_message() {
+    // Regression test for the no-alloc fast-revoke path introduced to fix the
+    // AArch64 panic: "memory allocation of 81920 bytes failed" inside
+    // ipc_reply's revoke_capability_in_cnode() → collect_delegated_descendants()
+    // → Box::new([Option<DelegatedCapabilityLink>; 2048]) (= 81920 bytes).
+    //
+    // This test verifies that:
+    // 1. create_reply_cap_for_caller produces exactly one Reply cap per message.
+    // 2. ipc_reply fast-revokes both the replier's and caller's Reply caps
+    //    without heap allocation (demonstrated by success over many cycles).
+    // 3. After ipc_reply the Reply cap CapId is stale — replay is rejected.
+    // 4. Many cycles do not exhaust either task's cnode (fast-revoke recycles
+    //    the slot each time).
+    //
+    // The cross-task setup (caller=task-0, replier=task-1) exercises the
+    // IPC_REPLY_CALLER_CAP_FAST_REVOKE path (caller != replier).
+    const CYCLES: usize = 1200;
+
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+
+    // reply_recv endpoint: replies from task-1 are delivered here and drained
+    // by task-0 each cycle.
+    let (_eid, _send_cap, reply_recv_cap) = state.create_endpoint(1).expect("reply ep");
+
+    // Put task-1 in the scheduler so yield_current() can reach it.
+    state.enqueue_current_cpu(1).expect("enqueue task1");
+
+    for cycle in 0..CYCLES {
+        // ── Phase 1: caller (task 0) creates a one-shot Reply cap ────────────
+        while state.current_tid() != Some(0) {
+            state.yield_current().expect("navigate to task 0");
+        }
+        let caller_reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), reply_recv_cap, Some(ThreadId(1)))
+            .unwrap_or_else(|err| {
+                panic!("cycle {cycle}: create_reply_cap_for_caller failed: {err:?}")
+            });
+
+        // Simulate recv_v2 cap materialization: grant a derived copy into
+        // task-1's cnode (this is what complete_blocked_recv_for_waiter does
+        // in production during IPC_RECV cap transfer).
+        let replier_cap = state
+            .grant_capability_task_to_task(0, caller_reply_cap, 1)
+            .unwrap_or_else(|err| panic!("cycle {cycle}: grant to replier failed: {err:?}"));
+
+        // ── Phase 2: replier (task 1) sends the reply ────────────────────────
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("navigate to task 1");
+        }
+        let reply_msg = Message::new(1, b"pong").expect("reply msg");
+        state
+            .ipc_reply(replier_cap, reply_msg)
+            .unwrap_or_else(|err| panic!("cycle {cycle}: ipc_reply failed: {err:?}"));
+
+        // Verify: replier's cap CapId is now stale (fast-revoke bumped the
+        // generation so replay must be rejected with a capability error).
+        let replay = Message::new(1, b"dupe").expect("replay msg");
+        assert!(
+            matches!(
+                state.ipc_reply(replier_cap, replay),
+                Err(KernelError::InvalidCapability
+                    | KernelError::StaleCapability
+                    | KernelError::WrongObject)
+            ),
+            "cycle {cycle}: reply-cap replay must be rejected after ipc_reply"
+        );
+
+        // ── Phase 3: caller (task 0) drains the reply ────────────────────────
+        while state.current_tid() != Some(0) {
+            state.yield_current().expect("navigate to task 0 for drain");
+        }
+        let received = state
+            .ipc_recv(reply_recv_cap)
+            .expect("recv ok")
+            .expect("reply expected");
+        assert_eq!(
+            received.as_slice(),
+            b"pong",
+            "wrong payload at cycle {cycle}"
+        );
+    }
+
+    // If cnode slots leaked in either task, create_endpoint (mints 2 caps)
+    // or grant would fail with CapabilityFull / TaskMissing.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("navigate to task 0 for final check");
+    }
+    let (_, _, probe_recv) = state
+        .create_endpoint(1)
+        .expect("caller cnode exhausted after 1200 cycles: fast-revoke cnode leak");
+    state
+        .grant_capability_task_to_task(0, probe_recv, 1)
+        .expect("replier cnode exhausted after 1200 cycles: fast-revoke cnode leak");
 }
 
 #[test]

@@ -504,6 +504,48 @@ impl CapabilitySpace {
                     .map(|_| CapId::new(index, slot.generation))
             })
     }
+
+    /// Fast revoke a single Reply cap slot — **no heap allocation**.
+    ///
+    /// Removes the slot entry only if all of these conditions hold:
+    /// - `cap.index()` is within the space's capacity
+    /// - The slot's generation matches `cap.generation()` (the CapId is live)
+    /// - The entry contains a capability whose `object` equals `expected_object`
+    ///
+    /// When a match is found the entry is cleared and the slot generation is
+    /// bumped, invalidating any outstanding copies of this CapId.
+    ///
+    /// Returns `true` if the slot was cleared, `false` if it was already gone
+    /// (stale generation, empty, or wrong object).  The return value is
+    /// diagnostic only — callers must not abort work based on a `false` result.
+    ///
+    /// # No-alloc guarantee
+    /// This function allocates nothing on the heap.  It is safe to call from
+    /// the hot IPC reply path on freestanding kernel configurations.
+    pub fn fast_revoke_reply_slot(&mut self, cap: CapId, expected_object: CapObject) -> bool {
+        let index = cap.index();
+        if index >= self.capacity() {
+            return false;
+        }
+        let slot = match self.slots.get_mut(index) {
+            Some(s) => s,
+            None => return false,
+        };
+        if slot.generation != cap.generation() {
+            return false;
+        }
+        let entry = match slot.entry {
+            Some(e) => e,
+            None => return false,
+        };
+        if entry.capability.object != expected_object {
+            return false;
+        }
+        slot.entry = None;
+        let next = slot.generation.wrapping_add(1);
+        slot.generation = if next == 0 { 1 } else { next };
+        true
+    }
 }
 
 #[cfg(test)]
