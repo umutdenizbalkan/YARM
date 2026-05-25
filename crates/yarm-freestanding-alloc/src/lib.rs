@@ -20,7 +20,14 @@ macro_rules! install {
             next: *mut BlockHeader,
         }
 
+        #[repr(C)]
+        struct AllocHeader {
+            block_start: usize,
+            block_size: usize,
+        }
+
         const HEADER_SIZE: usize = size_of::<BlockHeader>();
+        const ALLOC_HEADER_SIZE: usize = size_of::<AllocHeader>();
         const MIN_SPLIT: usize = HEADER_SIZE + align_of::<usize>();
 
         struct RuntimeAllocator {
@@ -91,7 +98,7 @@ macro_rules! install {
                 while !cur.is_null() {
                     let block_start = cur as usize;
                     let payload_start = match block_start
-                        .checked_add(HEADER_SIZE)
+                        .checked_add(HEADER_SIZE + ALLOC_HEADER_SIZE)
                         .map(|v| align_up(v, request_align))
                     {
                         Some(v) => v,
@@ -107,6 +114,7 @@ macro_rules! install {
                     };
 
                     if payload_end <= block_end {
+                        let alloc_header_addr = payload_start - ALLOC_HEADER_SIZE;
                         let remaining = block_end - payload_end;
                         let next = (*cur).next;
 
@@ -126,6 +134,10 @@ macro_rules! install {
                             (*prev).next = next;
                         }
 
+                        let alloc_header = alloc_header_addr as *mut AllocHeader;
+                        (*alloc_header).block_start = block_start;
+                        (*alloc_header).block_size = payload_end - block_start;
+
                         return payload_start as *mut u8;
                     }
 
@@ -143,7 +155,10 @@ macro_rules! install {
 
                 self.ensure_initialized();
 
-                let block = (ptr as usize).saturating_sub(HEADER_SIZE) as *mut BlockHeader;
+                let alloc_header_addr = (ptr as usize).saturating_sub(ALLOC_HEADER_SIZE);
+                let alloc_header = alloc_header_addr as *const AllocHeader;
+                let block = (*alloc_header).block_start as *mut BlockHeader;
+                (*block).size = (*alloc_header).block_size;
                 let mut prev: *mut BlockHeader = null_mut();
                 let mut cur: *mut BlockHeader = *self.free.get();
 
@@ -214,7 +229,7 @@ macro_rules! install {
 mod tests {
     extern crate std;
 
-    use std::alloc::{alloc, dealloc, Layout};
+    use std::alloc::{Layout, alloc, dealloc};
 
     #[test]
     fn alloc_free_reuse_same_block() {
@@ -279,6 +294,66 @@ mod tests {
         unsafe { dealloc(p, big) };
     }
 
+    #[test]
+    fn high_alignment_alloc_dealloc_roundtrip() {
+        for (size, align) in [(100usize, 64usize), (4096usize, 4096usize)] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            let p = unsafe { alloc(layout) };
+            assert!(!p.is_null());
+            assert_eq!((p as usize) % align, 0);
+            unsafe { core::ptr::write_bytes(p, 0xA5, size) };
+            unsafe { dealloc(p, layout) };
+            let p2 = unsafe { alloc(layout) };
+            assert!(!p2.is_null());
+            assert_eq!((p2 as usize) % align, 0);
+            unsafe { dealloc(p2, layout) };
+        }
+    }
+
+    #[test]
+    fn interleaved_alignments_reuse_and_coalesce() {
+        let l1 = Layout::from_size_align(24, 8).unwrap();
+        let l2 = Layout::from_size_align(100, 64).unwrap();
+        let l3 = Layout::from_size_align(17, 16).unwrap();
+        let a = unsafe { alloc(l1) };
+        let b = unsafe { alloc(l2) };
+        let c = unsafe { alloc(l3) };
+        assert!(!a.is_null() && !b.is_null() && !c.is_null());
+        unsafe { dealloc(b, l2) };
+        let l2b = Layout::from_size_align(80, 64).unwrap();
+        let b2 = unsafe { alloc(l2b) };
+        assert!(!b2.is_null());
+        unsafe {
+            dealloc(a, l1);
+            dealloc(b2, l2b);
+            dealloc(c, l3);
+        }
+        let big = Layout::from_size_align(16 * 1024, 16).unwrap();
+        let p = unsafe { alloc(big) };
+        assert!(!p.is_null());
+        unsafe { dealloc(p, big) };
+    }
+
+    #[test]
+    fn vec_string_like_large_then_small_then_large() {
+        let large = Layout::from_size_align(80 * 1024, 16).unwrap();
+        let p1 = unsafe { alloc(large) };
+        assert!(!p1.is_null());
+        unsafe { dealloc(p1, large) };
+        let small = Layout::from_size_align(512, 8).unwrap();
+        let mut ptrs = std::vec::Vec::new();
+        for _ in 0..32 {
+            let p = unsafe { alloc(small) };
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        for p in ptrs {
+            unsafe { dealloc(p, small) };
+        }
+        let p2 = unsafe { alloc(large) };
+        assert!(!p2.is_null());
+        unsafe { dealloc(p2, large) };
+    }
     #[test]
     fn pm_like_large_temp_sequence() {
         for size in [85 * 1024, 95 * 1024, 84 * 1024] {
