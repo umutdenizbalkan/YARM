@@ -5,16 +5,10 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 // PM sequentially reads each ELF binary via VFS into a Vec<u8> before spawning.
-// The bump allocator does NOT reclaim freed Vecs, so the heap must hold the sum
-// of all ELF images loaded during the boot sequence:
-//   image_id=7 driver_manager   ≈ 85 KB
-//   image_id=8 blkcache_srv     ≈ 85 KB
-//   image_id=9 virtio_blk_srv   ≈ 83 KB
-// Total ≈ 253 KB.  Add 256 KB headroom for metadata, service lifecycle table,
-// delegation tracking, and future services → 1 MB total.
+// PM heap target is 256 KiB. Runtime ELF staging Vecs are reclaimed between spawns by the free-list allocator.
 #[cfg(not(feature = "hosted-dev"))]
 yarm::install_freestanding_allocator!(
-    1024 * 1024,
+    256 * 1024,
     "process manager freestanding allocator OOM"
 );
 
