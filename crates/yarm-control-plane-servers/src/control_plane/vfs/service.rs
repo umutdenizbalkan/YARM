@@ -806,7 +806,7 @@ pub fn run() {
                         fd_table.remove(closed_fd, client_id);
                     }
                 }
-                yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=0 len={}", response.len);
+                yarm_user_rt::user_log!("VFS_ROUTE_REPLY op={} status=0 len={}", msg.opcode, response.len);
                 let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &response) };
             }
             Ok(None) => {
