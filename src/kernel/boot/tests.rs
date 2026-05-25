@@ -1739,7 +1739,11 @@ fn run_ipc_call_reply_cap_materialization_survives_more_than_1024_cycles() {
     // NOTE: yield_current() uses the scheduler's on_preempt() which automatically
     // re-enqueues the outgoing task so explicit enqueue calls are NOT needed inside
     // the loop — only the initial pre-loop enqueue is required.
-    const CYCLES: usize = 1024;
+    //
+    // 1536 cycles exceed the old delegation-link overflow threshold (~1012 on
+    // AArch64 freestanding with MAX_DELEGATED_CAPABILITY_LINKS=2048). The
+    // direct-mint fix ensures no delegation links are created for Reply caps.
+    const CYCLES: usize = 1536;
 
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
@@ -1813,7 +1817,7 @@ fn run_ipc_call_reply_cap_materialization_survives_more_than_1024_cycles() {
     }
     state
         .create_endpoint(1)
-        .expect("new endpoint after 1024 cycles: caller cnode slot leak detected");
+        .expect("new endpoint after 1536 cycles: caller cnode slot leak detected");
 }
 
 #[test]
@@ -1841,10 +1845,12 @@ fn run_ipc_nested_call_reply_survives_vfs_exec_sized_read_loop() {
     // driver_manager is 85344 bytes; at 112 bytes per READ the loop requires
     // ~762 outer cycles.  We run 800 to exceed this with margin.
     // Without the fix both PM and VFS exhaust their 512-slot cnodes around
-    // cycle 492 (512 - initial_caps ≈ 492).  We run 1000 cycles to exceed
-    // the ~762 READ calls needed to load driver_manager (85344 bytes at
-    // 112 bytes/chunk) with margin.
-    const CYCLES: usize = 1000;
+    // cycle 492 (512 - initial_caps ≈ 492).  We run 1536 cycles to exceed
+    // the old delegation-link overflow threshold (~1012 on AArch64 freestanding
+    // with MAX_DELEGATED_CAPABILITY_LINKS=2048). The direct-mint fix for Reply
+    // caps ensures no delegation links are created for the PM→VFS Reply cap
+    // transfer, so the table stays stable across any number of cycles.
+    const CYCLES: usize = 1536;
 
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task_vfs");
@@ -1935,15 +1941,15 @@ fn run_ipc_nested_call_reply_survives_vfs_exec_sized_read_loop() {
     }
     state
         .create_endpoint(1)
-        .expect("PM cnode exhausted after 1000 nested cycles");
+        .expect("PM cnode exhausted after 1536 nested cycles");
     // Grant the send cap to VFS so we validate VFS's cnode too.
     let (_, _ep_send, ep_recv) = state.create_endpoint(1).expect("probe ep");
     state
         .grant_capability_task_to_task(0, ep_recv, 1)
-        .expect("VFS cnode exhausted after 1000 nested cycles");
+        .expect("VFS cnode exhausted after 1536 nested cycles");
     state
         .grant_capability_task_to_task(0, ep_recv, 2)
-        .expect("INIT cnode exhausted after 1000 nested cycles");
+        .expect("INIT cnode exhausted after 1536 nested cycles");
 }
 
 #[test]
@@ -1973,7 +1979,10 @@ fn run_recv_v2_materializes_reply_cap_once_per_message() {
     //
     // The cross-task setup (caller=task-0, replier=task-1) exercises the
     // IPC_REPLY_CALLER_CAP_FAST_REVOKE path (caller != replier).
-    const CYCLES: usize = 1200;
+    //
+    // 1536 cycles exceed the old delegation-link overflow threshold
+    // (~1012 on AArch64 freestanding, MAX_DELEGATED_CAPABILITY_LINKS=2048).
+    const CYCLES: usize = 1536;
 
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
@@ -2047,10 +2056,10 @@ fn run_recv_v2_materializes_reply_cap_once_per_message() {
     }
     let (_, _, probe_recv) = state
         .create_endpoint(1)
-        .expect("caller cnode exhausted after 1200 cycles: fast-revoke cnode leak");
+        .expect("caller cnode exhausted after 1536 cycles: fast-revoke cnode leak");
     state
         .grant_capability_task_to_task(0, probe_recv, 1)
-        .expect("replier cnode exhausted after 1200 cycles: fast-revoke cnode leak");
+        .expect("replier cnode exhausted after 1536 cycles: fast-revoke cnode leak");
 }
 
 #[test]
@@ -5602,4 +5611,253 @@ fn direct_legacy_global_cspace_access_patterns_are_forbidden() {
             offenders.join("\n")
         );
     }
+}
+
+#[test]
+fn ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
+    std::thread::Builder::new()
+        .name("ipc_reply_cap_direct_mint_path_survives_1536_cycles".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_reply_cap_direct_mint_path_survives_1536_cycles)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
+    // End-to-end regression for the Reply-cap direct-mint path introduced in
+    // materialize_received_message_cap to fix delegation-link table saturation.
+    //
+    // Bug (pre-fix): complete_blocked_recv_for_waiter → materialize_received_message_cap
+    // → materialize_received_transfer_cap → grant_task_to_task_with_rights →
+    // record_delegated_capability_link.  Each PM→VFS cycle added one delegation link.
+    // After ~1012 cycles (2048 limit − ~1036 boot-time links) the link table filled,
+    // record_delegated_capability_link returned CapabilityFull, but
+    // mint_capability_in_cnode had already succeeded → one Reply cap leaked in VFS's
+    // cnode each cycle.  After 512 leaks the 512-slot freestanding cnode was full:
+    //   IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw=... err=Internal
+    //   IPC_RECV_BLOCKED_COMPLETE_FAILED tid=10002 err=Internal
+    //
+    // Fix: materialize_received_message_cap now takes the transfer envelope, extracts
+    // the Reply object, and mints it DIRECTLY into the receiver's cnode without adding
+    // any delegation link.  The resulting CapId is stored in ReplyCapRecord.waiter_cap_id
+    // so ipc_reply can fast-revoke the exact slot.
+    //
+    // Unlike the earlier tests that call create_reply_cap_for_caller +
+    // grant_capability_task_to_task directly, this test exercises the PRODUCTION path:
+    //
+    //   task 1 (VFS role) → handle_trap(IpcRecv) → blocks on endpoint
+    //   task 0 (PM role)  → handle_trap(IpcCall) → complete_blocked_recv_for_waiter
+    //                                               → materialize_received_message_cap
+    //                                               → direct-mint Reply cap into task 1
+    //   task 1 (VFS role) reads waiter_cap_id from meta buffer → ipc_reply
+    //   task 0 (PM role)  → ipc_recv on reply endpoint → drains reply
+    //
+    // 1536 cycles > 1500 acceptance-criteria threshold and > the old overflow
+    // threshold (~1012 on AArch64 freestanding).
+    const CYCLES: usize = 1536;
+
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task_vfs");
+
+    // Task 1 (VFS) needs a user ASID and a mapped page so that
+    // complete_blocked_recv_for_waiter can write payload + meta via copy_to_user.
+    let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind asid1 to task1");
+    state
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x4000),
+            Mapping {
+                phys: PhysAddr(0xC000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map VFS user page");
+    // payload at 0x4000; meta at 0x4080 (both within the same mapped page).
+    let payload_ptr: usize = 0x4000;
+    let meta_ptr: usize = 0x4080;
+
+    // Main endpoint: task 0 (PM) sends requests, task 1 (VFS) receives.
+    let (_ep_eid, ep_send_cap, ep_recv_cap) =
+        state.create_endpoint(2).expect("ipc endpoint");
+    let ep_recv_cap_t1 = state
+        .grant_capability_task_to_task(0, ep_recv_cap, 1)
+        .expect("grant ep_recv_cap to VFS");
+
+    // Reply endpoint: task 0 (PM) holds the RECEIVE cap; ipc_reply queues the
+    // reply here and task 0 drains it each cycle.
+    let (_reply_eid, _reply_send, reply_recv_cap) =
+        state.create_endpoint(2).expect("reply endpoint");
+
+    // Prime the scheduler: task 1 must be in the run-queue so yield_current()
+    // can reach it during the "navigate to task 1" step.  After the first cycle,
+    // on_preempt auto-re-enqueues both tasks on every yield, so no further
+    // explicit enqueues are needed inside the loop.
+    state.enqueue_current_cpu(1).expect("initial enqueue task1");
+
+    // Baseline cnode occupancy for task 1 before any IPC cycles.
+    let t1_cnode = state.task_cnode(1).expect("task1 cnode");
+    let initial_t1_occupancy = state
+        .cnode_occupied_slots(t1_cnode)
+        .expect("task1 initial cnode occupancy");
+
+    for cycle in 0..CYCLES {
+        // ── Step 1: navigate to task 1 (VFS) ─────────────────────────────────
+        // yield_current from task 0 → on_preempt re-enqueues task 0 → task 1 dispatched.
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("switch to VFS");
+        }
+
+        // ── Step 2: task 1 issues IpcRecv → blocks (no message yet) ──────────
+        // meta_ptr must be non-zero and meta_len ≥ 40 for recv-v2 blocking state.
+        let mut recv_frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [
+                ep_recv_cap_t1.0 as usize, // SYSCALL_ARG_CAP
+                payload_ptr,               // SYSCALL_ARG_PTR
+                32,                        // SYSCALL_ARG_LEN (payload buf size)
+                meta_ptr,                  // SYSCALL_ARG_INLINE_PAYLOAD0 (non-zero → v2)
+                40,                        // SYSCALL_ARG_INLINE_PAYLOAD1 (meta buf size ≥ 40)
+                0,                         // SYSCALL_ARG_TRANSFER_CAP
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+            .unwrap_or_else(|err| {
+                panic!("cycle {cycle}: VFS IpcRecv handle_trap failed: {err:?}")
+            });
+        // After blocking, handle_trap calls dispatch_next_task which switches to task 0.
+        assert_ne!(
+            state.current_tid(),
+            Some(1),
+            "cycle {cycle}: task1 should be Blocked(EndpointReceive) after IpcRecv"
+        );
+
+        // ── Step 3: navigate to task 0 (PM) ──────────────────────────────────
+        // dispatch_next_task already switched to task 0 inside handle_trap above;
+        // the while-loop is a safety net in case of an unexpected intermediate task.
+        while state.current_tid() != Some(0) {
+            state.yield_current().expect("switch to PM");
+        }
+
+        // ── Step 4: task 0 issues IpcCall ─────────────────────────────────────
+        // IpcCall sends the message to the endpoint.  Because task 1 is blocked
+        // (Blocked(EndpointReceive)), ipc_send immediately calls
+        // complete_blocked_recv_for_waiter → materialize_received_message_cap:
+        //   • Takes the transfer envelope (Reply cap handle)
+        //   • Mints Reply cap DIRECTLY into task 1's cnode (no delegation link)
+        //   • Writes waiter_cap_id to ReplyCapRecord
+        //   • Writes cap_id + flags to task 1's meta buffer at meta_ptr
+        //
+        // IpcCall is request-send only in the current ABI (not blocking for reply).
+        // Task 0 remains the current task after the call returns.
+        let mut call_frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcCall as usize,
+            [
+                ep_send_cap.0 as usize,     // SYSCALL_ARG_CAP (endpoint send cap)
+                0,                           // SYSCALL_ARG_PTR (no user payload; len=0)
+                0,                           // SYSCALL_ARG_LEN (0-byte payload)
+                0,                           // SYSCALL_ARG_INLINE_PAYLOAD0
+                0,                           // SYSCALL_ARG_INLINE_PAYLOAD1
+                reply_recv_cap.0 as usize,  // SYSCALL_ARG_TRANSFER_CAP (PM reply recv)
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut call_frame))
+            .unwrap_or_else(|err| {
+                panic!("cycle {cycle}: PM IpcCall handle_trap failed: {err:?}")
+            });
+        assert_eq!(
+            state.current_tid(),
+            Some(0),
+            "cycle {cycle}: PM must remain current after IpcCall (request-send only ABI)"
+        );
+
+        // ── Step 5: navigate to task 1 (VFS) ─────────────────────────────────
+        // complete_blocked_recv_for_waiter unblocked task 1 (Runnable, enqueued).
+        // yield_current from task 0 → on_preempt re-enqueues task 0 → task 1 dispatched.
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("switch to VFS for reply");
+        }
+
+        // ── Step 6: read the direct-minted waiter_cap_id from VFS meta buffer ─
+        let meta_bytes = state
+            .read_user_memory_for_asid(asid1, meta_ptr, 40)
+            .unwrap_or_else(|err| panic!("cycle {cycle}: read VFS meta failed: {err:?}"));
+        let waiter_cap_raw =
+            u64::from_le_bytes(meta_bytes[16..24].try_into().expect("cap field"));
+        let meta_flags =
+            u64::from_le_bytes(meta_bytes[24..32].try_into().expect("flags field"));
+        assert_ne!(
+            waiter_cap_raw,
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+            "cycle {cycle}: waiter_cap_id must be set in VFS meta (got NO_TRANSFER_CAP)"
+        );
+        assert_ne!(
+            meta_flags & (crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64),
+            0,
+            "cycle {cycle}: VFS meta flags must have REPLY_CAP bit set"
+        );
+        let waiter_reply_cap = CapId(waiter_cap_raw);
+        // The direct-minted Reply cap must be live in task 1's cnode.
+        assert!(
+            state.task_capability(1, waiter_reply_cap).is_some(),
+            "cycle {cycle}: waiter_cap_id {waiter_cap_raw} must be live in VFS cnode \
+             immediately after direct-mint"
+        );
+
+        // ── Step 7: task 1 (VFS) replies via the kernel-materialized cap ──────
+        // ipc_reply fast-revokes the replier's (task 1) and caller's (task 0) slots.
+        // No heap allocation; no delegation traversal.
+        let reply_msg = Message::new(1, b"ok").expect("reply msg");
+        state
+            .ipc_reply(waiter_reply_cap, reply_msg)
+            .unwrap_or_else(|err| {
+                panic!("cycle {cycle}: VFS ipc_reply failed: {err:?}")
+            });
+
+        // ── Step 8: task 0 (PM) drains the reply ─────────────────────────────
+        // yield_current from task 1 → on_preempt re-enqueues task 1 → task 0 dispatched.
+        while state.current_tid() != Some(0) {
+            state.yield_current().expect("switch to PM for drain");
+        }
+        let received = state
+            .ipc_recv(reply_recv_cap)
+            .expect("PM ipc_recv must not error")
+            .expect("reply must be queued in PM reply endpoint");
+        assert_eq!(
+            received.as_slice(),
+            b"ok",
+            "cycle {cycle}: wrong reply payload"
+        );
+    }
+
+    // ── Final check: VFS cnode occupancy must equal the initial baseline ──────
+    // If direct-mint works correctly, ipc_reply fast-revokes the minted Reply cap
+    // each cycle → occupancy returns to baseline (no cumulative leak).
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("switch to VFS final occupancy check");
+    }
+    let final_t1_occupancy = state
+        .cnode_occupied_slots(t1_cnode)
+        .expect("task1 final cnode occupancy");
+    assert_eq!(
+        final_t1_occupancy, initial_t1_occupancy,
+        "VFS cnode occupancy grew from {initial_t1_occupancy} to {final_t1_occupancy} \
+         after {CYCLES} IPC cycles via handle_trap production path: Reply cap slots leaking"
+    );
+
+    // Also probe that both task 0 and task 1 still have headroom (not exhausted).
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("switch to PM final probe");
+    }
+    let (_, _, probe_recv) = state
+        .create_endpoint(1)
+        .expect("PM cnode exhausted after 1536 direct-mint cycles");
+    state
+        .grant_capability_task_to_task(0, probe_recv, 1)
+        .expect(
+            "VFS cnode exhausted after 1536 direct-mint cycles: Reply cap slot leak detected",
+        );
 }

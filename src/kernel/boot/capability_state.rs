@@ -60,7 +60,16 @@ impl KernelState {
         let dest_cnode = self.task_cnode(dest_tid).ok_or(KernelError::TaskMissing)?;
         let delegated_cap = self.mint_capability_in_cnode(dest_cnode, attenuated)?;
         if source_tid != dest_tid {
-            self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap)?;
+            if let Err(link_err) = self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap) {
+                // Delegation link table is full: roll back the already-minted cap to
+                // prevent a permanent slot leak in the destination cnode.
+                let _ = self.fast_revoke_reply_cap_in_cnode(dest_cnode, delegated_cap, attenuated.object);
+                crate::yarm_log!(
+                    "GRANT_CAP_LINK_FAIL_ROLLBACK src_tid={} src_cap={} dest_tid={} dest_cap={} err={:?}",
+                    source_tid, source_cap.0, dest_tid, delegated_cap.0, link_err
+                );
+                return Err(link_err);
+            }
         }
         Ok(delegated_cap)
     }
