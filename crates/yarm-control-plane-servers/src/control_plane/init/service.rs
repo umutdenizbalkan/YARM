@@ -420,11 +420,11 @@ pub fn run() {
     );
 
     // --- Spawn driver_manager (image_id=7) ---
-    // No service caps required at spawn time; driver_manager blocks on its own
-    // recv endpoint waiting for driver registration requests.
+    // No service caps required at spawn time. VFS-backed late services are
+    // wired post-spawn through explicit IPC registration flows.
     yarm_user_rt::user_log!("INIT_DRIVER_MANAGER_SPAWN_V5_CALL_BEGIN");
     let Some((dm_child_tid, _dm_send_cap)) =
-        spawn_v5_cap(pm_send, pm_recv, 7, [vfs_recv_cap, 0, 0, 0], 0)
+        spawn_v5_cap(pm_send, pm_recv, 7, [0, 0, 0, 0], 0)
     else {
         yarm_user_rt::user_log!("INIT_DRIVER_MANAGER_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
@@ -440,7 +440,7 @@ pub fn run() {
     // CNode (caller-local namespace). PM lifecycle `pm_service_send_cap` stays
     // PM-local and must not be used by init for IPC.
     let Some((blkcache_child_tid, init_blkcache_send_cap)) =
-        spawn_v5_cap(pm_send, pm_recv, 8, [vfs_recv_cap, 0, 0, 0], 1)
+        spawn_v5_cap(pm_send, pm_recv, 8, [0, 0, 0, 0], 1)
     else {
         yarm_user_rt::user_log!("INIT_BLKCACHE_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
@@ -453,7 +453,7 @@ pub fn run() {
     // --- Spawn virtio_blk_srv (image_id=9) ---
     yarm_user_rt::user_log!("INIT_VIRTIO_BLK_SPAWN_V5_CALL_BEGIN");
     let Some((virtio_blk_child_tid, init_virtio_blk_send_cap)) =
-        spawn_v5_cap(pm_send, pm_recv, 9, [vfs_recv_cap, 0, 0, 0], 1)
+        spawn_v5_cap(pm_send, pm_recv, 9, [0, 0, 0, 0], 1)
     else {
         yarm_user_rt::user_log!("INIT_VIRTIO_BLK_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
