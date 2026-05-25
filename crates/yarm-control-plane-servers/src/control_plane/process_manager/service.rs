@@ -1427,7 +1427,7 @@ unsafe fn pm_vfs_spawn_inline(
         vfs_send_cap,
         reply_recv_cap
     );
-    let image = unsafe { pm_read_all_via_vfs(vfs_send_cap, reply_recv_cap, path_label) }?;
+    let image = unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, path_label) }?;
     if image.is_empty() {
         yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err=empty-elf", image_id);
         return Err(ProcessManagerError::Malformed);
@@ -1539,7 +1539,7 @@ unsafe fn pm_vfs_call_u64(
     }
 }
 
-#[cfg(not(test))]
+// decode_u64: NOT gated by #[cfg(not(test))] so unit tests can call it directly.
 fn decode_u64(payload: &[u8]) -> Option<u64> {
     if payload.len() < 8 {
         return None;
@@ -1551,15 +1551,14 @@ fn decode_u64(payload: &[u8]) -> Option<u64> {
 
 #[cfg(not(test))]
 unsafe fn pm_read_all_via_vfs(
+    image_id: u64,
     vfs_send_cap: u32,
     reply_recv_cap: u32,
     path: &[u8],
 ) -> Result<Vec<u8>, ProcessManagerError> {
+    let path_str = core::str::from_utf8(path).unwrap_or("<path-bytes>");
     let stat_msg = build_statx_message(path).map_err(|_| ProcessManagerError::Malformed)?;
-    yarm_user_rt::user_log!(
-        "PM_VFS_CALL op=STATX path={}",
-        core::str::from_utf8(path).unwrap_or("<path-bytes>")
-    );
+    yarm_user_rt::user_log!("PM_VFS_CALL op=STATX path={}", path_str);
     let stat_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &stat_msg) }?;
     let stat_payload = stat_reply.as_slice();
     if stat_payload.len() != 8 {
@@ -1579,13 +1578,58 @@ unsafe fn pm_read_all_via_vfs(
     );
 
     let open_msg = build_openat_message(path, 0).map_err(|_| ProcessManagerError::Malformed)?;
-    yarm_user_rt::user_log!(
-        "PM_VFS_CALL op=OPENAT path={}",
-        core::str::from_utf8(path).unwrap_or("<path-bytes>")
-    );
-    let open_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &open_msg) }?;
-    let fd = decode_u64(open_reply.as_slice()).ok_or(ProcessManagerError::Malformed)?;
+    yarm_user_rt::user_log!("PM_VFS_CALL op=OPENAT path={}", path_str);
+
+    // Capture OPENAT result before propagating so we can log the exact failure.
+    let open_reply = match unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &open_msg) } {
+        Ok(reply) => {
+            yarm_user_rt::user_log!(
+                "PM_VFS_OPENAT_RETURN image_id={} path={} result=ok len={}",
+                image_id, path_str, reply.len
+            );
+            reply
+        }
+        Err(err) => {
+            yarm_user_rt::user_log!(
+                "PM_VFS_OPENAT_RETURN image_id={} path={} result=err err={:?}",
+                image_id, path_str, err
+            );
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL image_id={} stage=after-openat reason=openat_call_fail",
+                image_id
+            );
+            return Err(err);
+        }
+    };
+
+    // Decode fd from the 8-byte LE reply payload.
+    let fd = match decode_u64(open_reply.as_slice()) {
+        Some(v) => {
+            let slice = open_reply.as_slice();
+            let preview_len = core::cmp::min(slice.len(), 8);
+            yarm_user_rt::user_log!(
+                "PM_VFS_OPENAT_DECODE image_id={} path={} fd={} raw_len={} raw_bytes={:x?}",
+                image_id, path_str, v, open_reply.len, &slice[..preview_len]
+            );
+            v
+        }
+        None => {
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL image_id={} stage=after-openat reason=bad_fd_decode raw_len={}",
+                image_id, open_reply.len
+            );
+            return Err(ProcessManagerError::Malformed);
+        }
+    };
+
     let mut out = Vec::with_capacity(file_len);
+    // Log before entering the READ loop so any OOM or other failure between
+    // OPENAT-decode and first READ is bracketed by PM_VFS_READ_BEGIN.
+    yarm_user_rt::user_log!(
+        "PM_VFS_READ_BEGIN image_id={} path={} fd={} expected={} chunk={}",
+        image_id, path_str, fd, file_len, Message::MAX_PAYLOAD - 16
+    );
+
     // READ loop: accumulate file_len bytes in chunks.  Each iteration must make
     // forward progress; zero-length reads before reaching file_len are treated
     // as a fatal protocol error (premature EOF or format mismatch).
@@ -1596,7 +1640,16 @@ unsafe fn pm_read_all_via_vfs(
         // Requesting 512 caused the VFS reply payload (header + data) to exceed
         // Message::MAX_PAYLOAD (128), truncating the data silently.
         let to_read = core::cmp::min(Message::MAX_PAYLOAD - 16, file_len - out.len());
-        let read_msg = build_read_message(fd, to_read).map_err(|_| ProcessManagerError::Malformed)?;
+        let read_msg = match build_read_message(fd, to_read) {
+            Ok(msg) => msg,
+            Err(err) => {
+                yarm_user_rt::user_log!(
+                    "PM_VFS_SPAWN_FAIL image_id={} stage=after-openat reason=build_read_msg_fail fd={} err={:?}",
+                    image_id, fd, err
+                );
+                return Err(ProcessManagerError::Malformed);
+            }
+        };
         yarm_user_rt::user_log!("PM_VFS_CALL op=READ fd={} len={}", fd, to_read);
         let read_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &read_msg) }?;
         let payload = read_reply.as_slice();
@@ -1654,8 +1707,8 @@ unsafe fn pm_read_all_via_vfs(
     {
         let first4_end = core::cmp::min(out.len(), 4);
         yarm_user_rt::user_log!(
-            "PM_VFS_READ_DONE total={} first4={:x?}",
-            out.len(), &out[..first4_end]
+            "PM_VFS_READ_DONE image_id={} total={} first4={:x?}",
+            image_id, out.len(), &out[..first4_end]
         );
     }
 
@@ -2556,5 +2609,48 @@ mod tests {
         let replies = vec![make_extended_reply(&data)];
         let result = mock_read_all(112, &replies).expect("should succeed");
         assert_eq!(result, data);
+    }
+
+    // ── OPENAT reply decode unit tests ────────────────────────────────────────
+
+    #[test]
+    fn openat_reply_8_byte_le_fd13_decodes_correctly() {
+        // QEMU proof: VFS sends bytes=[d, 0, 0, 0, 0, 0, 0, 0] for fd=13.
+        let payload = [0x0du8, 0, 0, 0, 0, 0, 0, 0];
+        let result = decode_u64(&payload);
+        assert_eq!(result, Some(13), "fd=13 must decode from 8-byte LE payload");
+    }
+
+    #[test]
+    fn openat_reply_bad_length_returns_none() {
+        // A 7-byte payload is too short; decode_u64 must return None so the
+        // caller logs PM_VFS_SPAWN_FAIL stage=after-openat reason=bad_fd_decode.
+        let payload = [0x0du8, 0, 0, 0, 0, 0, 0];
+        let result = decode_u64(&payload);
+        assert_eq!(result, None, "7-byte payload must return None");
+    }
+
+    #[test]
+    fn openat_reply_empty_returns_none() {
+        let result = decode_u64(&[]);
+        assert_eq!(result, None, "empty payload must return None");
+    }
+
+    #[test]
+    fn openat_reply_fd_zero_decodes_to_zero() {
+        // fd=0 is a valid u64; the protocol layer may treat it as invalid but
+        // decode_u64 itself must not reject it — callers decide the contract.
+        let payload = [0u8; 8];
+        let result = decode_u64(&payload);
+        assert_eq!(result, Some(0), "fd=0 must decode to 0");
+    }
+
+    #[test]
+    fn openat_reply_extra_bytes_ignored_on_decode() {
+        // A longer-than-8-byte payload is accepted; only the first 8 bytes matter.
+        let mut payload = [0u8; 16];
+        payload[0] = 0x0d; // fd=13
+        let result = decode_u64(&payload);
+        assert_eq!(result, Some(13), "extra bytes beyond 8 must be ignored");
     }
 }
