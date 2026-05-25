@@ -191,6 +191,11 @@ pub(crate) struct ReplyCapRecord {
     pub(crate) caller_tid: ThreadId,
     pub(crate) reply_endpoint: CapObject,
     pub(crate) responder_tid: Option<ThreadId>,
+    /// CapId of the Reply cap that `create_reply_cap_for_caller` minted into the
+    /// **caller's** cnode.  Stored here so that `ipc_reply` (which runs in the
+    /// **replier's** context) can also revoke it from the caller's cnode, preventing
+    /// cnode slot exhaustion on the caller side over many repeated IPC cycles.
+    pub(crate) caller_cap_id: CapId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

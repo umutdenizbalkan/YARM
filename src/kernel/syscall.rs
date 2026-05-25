@@ -996,7 +996,15 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             reply_recv_cap,
             responder_tid,
         )
-        .map_err(SyscallError::from)?;
+        .map_err(|err| {
+            crate::yarm_log!(
+                "IPC_CALL_FAIL stage=reply_cap_alloc err={:?} caller_tid={} endpoint={}",
+                err,
+                sender_tid,
+                endpoint_idx
+            );
+            SyscallError::from(err)
+        })?;
     let reply_obj = kernel
         .resolve_capability_for_task(sender_tid, reply_cap)
         .map(|cap| cap.object)

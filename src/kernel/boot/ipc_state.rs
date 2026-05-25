@@ -351,32 +351,84 @@ impl KernelState {
             _ => return Err(KernelError::WrongObject),
         };
 
-        let (slot, generation) = self.with_ipc_state_mut(|ipc| {
-            for idx in 0..super::MAX_REPLY_CAPS {
-                if ipc.reply_caps[idx].is_none() {
-                    let mut next_generation = ipc.reply_cap_generations[idx].wrapping_add(1);
-                    if next_generation == 0 {
-                        next_generation = 1;
-                    }
-                    ipc.reply_cap_generations[idx] = next_generation;
-                    ipc.reply_caps[idx] = Some(ReplyCapRecord {
-                        caller_tid,
-                        reply_endpoint,
-                        responder_tid,
-                    });
-                    return Ok::<_, KernelError>((idx, next_generation));
-                }
-            }
-            Err(KernelError::CapabilityFull)
-        })?;
+        crate::yarm_log!(
+            "IPC_CALL_REPLY_CAP_ALLOC_BEGIN caller_tid={} responder={}",
+            caller_tid.0,
+            responder_tid.map(|t| t.0).unwrap_or(u64::MAX)
+        );
 
-        self.mint_capability_for_active_cnode(Capability::new(
+        // Phase 1: Reserve a global reply slot with a placeholder caller_cap_id.
+        // The real CapId is filled in after the mint succeeds (Phase 3).
+        let (slot, generation) = self
+            .with_ipc_state_mut(|ipc| {
+                for idx in 0..super::MAX_REPLY_CAPS {
+                    if ipc.reply_caps[idx].is_none() {
+                        let mut next_generation = ipc.reply_cap_generations[idx].wrapping_add(1);
+                        if next_generation == 0 {
+                            next_generation = 1;
+                        }
+                        ipc.reply_cap_generations[idx] = next_generation;
+                        ipc.reply_caps[idx] = Some(ReplyCapRecord {
+                            caller_tid,
+                            reply_endpoint,
+                            responder_tid,
+                            caller_cap_id: CapId(0), // placeholder; updated in Phase 3
+                        });
+                        return Ok::<_, KernelError>((idx, next_generation));
+                    }
+                }
+                Err(KernelError::CapabilityFull)
+            })
+            .map_err(|err| {
+                crate::yarm_log!(
+                    "IPC_CALL_REPLY_RECORD_ALLOC_FAIL caller_tid={} err={:?}",
+                    caller_tid.0,
+                    err
+                );
+                err
+            })?;
+
+        // Phase 2: Mint the Reply cap into the caller's (current) cnode.
+        let cap_id = match self.mint_capability_for_active_cnode(Capability::new(
             CapObject::Reply {
                 index: slot,
                 generation,
             },
             CapRights::SEND,
-        ))
+        )) {
+            Ok(id) => id,
+            Err(err) => {
+                let active_cnode = self.current_task_cnode().map(|c| c.0).unwrap_or(u64::MAX);
+                crate::yarm_log!(
+                    "IPC_CALL_MINT_REPLY_CAP_FAIL caller_tid={} slot={} cnode={} err={:?}",
+                    caller_tid.0,
+                    slot,
+                    active_cnode,
+                    err
+                );
+                // Rollback: free the slot reserved in Phase 1 so it can be reused.
+                self.with_ipc_state_mut(|ipc| {
+                    ipc.reply_caps[slot] = None;
+                });
+                return Err(err);
+            }
+        };
+
+        // Phase 3: Persist the minted CapId in the record so that ipc_reply can revoke
+        // it from the caller's cnode when the reply is eventually delivered.
+        self.with_ipc_state_mut(|ipc| {
+            if let Some(record) = &mut ipc.reply_caps[slot] {
+                record.caller_cap_id = cap_id;
+            }
+        });
+
+        crate::yarm_log!(
+            "IPC_CALL_REPLY_CAP_ALLOC_DONE caller_tid={} slot={} cap={}",
+            caller_tid.0,
+            slot,
+            cap_id.0
+        );
+        Ok(cap_id)
     }
 
     pub fn ipc_reply(&mut self, reply_cap: CapId, msg: Message) -> Result<(), KernelError> {
@@ -417,6 +469,37 @@ impl KernelState {
         // the worst case is a leaked cnode slot, not a safety violation.
         if let Some(replier_cnode) = self.current_task_cnode() {
             let _ = self.revoke_capability_in_cnode(replier_cnode, reply_cap);
+        }
+
+        // Recycle the Reply cap that create_reply_cap_for_caller minted into the
+        // CALLER's cnode.
+        //
+        // create_reply_cap_for_caller (called during ipc_call while current_task ==
+        // the caller) mints a Reply cap into the *caller's* cnode so that it can be
+        // stashed in a transfer envelope and forwarded to the replier.  That cap is
+        // one-shot: once the replier materialises its own local copy and delivers a
+        // reply, the original in the caller's cnode is dead weight.
+        //
+        // Without this revoke, each ipc_call cycle permanently occupies one cnode
+        // slot on the caller side (e.g. PM).  For PM reading driver_manager via VFS
+        // (~762 READ calls at 112 B/chunk), PM's 512-slot cnode fills up around
+        // cycle ~492, causing KernelError::CapabilityFull → SyscallError::Internal
+        // in the next create_reply_cap_for_caller call.  The same leak also affects
+        // VFS for its nested VFS→backend IPC calls.
+        //
+        // record.caller_cap_id == 0 is the sentinel for "not yet set" (can only
+        // happen if the Phase-3 update in create_reply_cap_for_caller was skipped,
+        // which should never occur in practice).
+        if record.caller_cap_id.0 != 0 {
+            if let Some(caller_cnode) = self.task_cnode(record.caller_tid.0) {
+                let result = self.revoke_capability_in_cnode(caller_cnode, record.caller_cap_id);
+                crate::yarm_log!(
+                    "IPC_REPLY_CALLER_CAP_REVOKE caller_tid={} cap={} ok={}",
+                    record.caller_tid.0,
+                    record.caller_cap_id.0,
+                    result.is_ok()
+                );
+            }
         }
 
         let endpoint_idx = match self.resolve_endpoint_index(record.reply_endpoint) {

@@ -1708,6 +1708,243 @@ fn run_ipc_call_reply_cap_materialization_survives_more_than_255_cycles() {
 }
 
 #[test]
+fn ipc_call_reply_cap_materialization_survives_more_than_1024_cycles() {
+    std::thread::Builder::new()
+        .name("ipc_call_reply_cap_materialization_survives_more_than_1024_cycles".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_call_reply_cap_materialization_survives_more_than_1024_cycles)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_call_reply_cap_materialization_survives_more_than_1024_cycles() {
+    // Regression test for CALLER-side cnode exhaustion in cross-task IPC.
+    //
+    // Bug: create_reply_cap_for_caller (called while current_task == CALLER) mints
+    // a Reply cap into the caller's cnode.  ipc_reply (called while current_task ==
+    // REPLIER) previously only revoked from the replier's cnode, not the caller's.
+    // Each cycle thus leaked one cap in the caller's cnode.  After ~492 cycles
+    // (512 - initial caps) the caller's cnode fills up:
+    //   KernelError::CapabilityFull → SyscallError::Internal
+    // This killed PM's VFS read loop while loading driver_manager (~762 READ calls).
+    //
+    // Fix: ipc_reply now also revokes record.caller_cap_id from record.caller_tid's
+    // cnode, which is recorded in ReplyCapRecord during create_reply_cap_for_caller.
+    //
+    // This test uses TWO distinct tasks (caller=task-0, replier=task-1) to cover the
+    // cross-task case that the earlier 350-cycle single-task test could not.
+    // It runs 1024 cycles, well past both the 255 and 492 thresholds.
+    //
+    // NOTE: yield_current() uses the scheduler's on_preempt() which automatically
+    // re-enqueues the outgoing task so explicit enqueue calls are NOT needed inside
+    // the loop — only the initial pre-loop enqueue is required.
+    const CYCLES: usize = 1024;
+
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+
+    // reply_recv endpoint: caller (task 0) holds the recv cap; reply messages are
+    // queued here by ipc_reply and drained via ipc_recv each cycle.
+    let (_eid, _send_cap, reply_recv_cap) = state.create_endpoint(1).expect("reply ep");
+
+    // Initial enqueue: put task 1 in the scheduler queue so yield_current() can
+    // reach it.  After cycle 0, on_preempt re-enqueues task 1 automatically on
+    // every yield_current(), so no further explicit enqueues are needed.
+    state.enqueue_current_cpu(1).expect("initial enqueue task1");
+
+    for cycle in 0..CYCLES {
+        // ── Phase 1: caller context (task 0) ─────────────────────────────────
+        // Ensure we are running as task 0; create_reply_cap_for_caller mints into
+        // the CURRENT task's cnode, so task 0 must be current here.
+        while state.current_tid() != Some(0) {
+            state.yield_current().expect("navigate to task 0");
+        }
+
+        // create_reply_cap_for_caller mints a Reply cap in task-0's cnode and
+        // records caller_cap_id in the ReplyCapRecord.
+        let caller_reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), reply_recv_cap, Some(ThreadId(1)))
+            .unwrap_or_else(|err| {
+                panic!("cycle {cycle}: create_reply_cap_for_caller failed: {err:?}")
+            });
+
+        // Simulate recv_v2 cap materialization: grant a derived copy of the Reply cap
+        // to task 1 (the replier).  In production this happens inside
+        // complete_blocked_recv_for_waiter → materialize_received_message_cap.
+        let replier_reply_cap = state
+            .grant_capability_task_to_task(0, caller_reply_cap, 1)
+            .unwrap_or_else(|err| panic!("cycle {cycle}: grant failed: {err:?}"));
+
+        // ── Phase 2: replier context (task 1) ────────────────────────────────
+        // yield_current() from task 0 → on_preempt re-enqueues task 0, dispatches
+        // task 1 (which is already Runnable in the queue).
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("navigate to task 1");
+        }
+
+        // ipc_reply must revoke from BOTH the replier's (task-1) and caller's
+        // (task-0) cnodes.  Without the fix, task-0's cnode accumulates one
+        // dead Reply cap per cycle and exhausts around cycle 492.
+        let msg = Message::new(1, b"ok").expect("reply msg");
+        state
+            .ipc_reply(replier_reply_cap, msg)
+            .unwrap_or_else(|err| panic!("cycle {cycle}: ipc_reply failed: {err:?}"));
+
+        // ── Phase 3: back to caller (task 0) ─────────────────────────────────
+        // yield_current() from task 1 → on_preempt re-enqueues task 1, dispatches
+        // task 0 (which is Runnable from Phase 2's yield chain).
+        while state.current_tid() != Some(0) {
+            state.yield_current().expect("navigate back to task 0");
+        }
+
+        // Drain the reply message so the endpoint does not back up.
+        let received = state
+            .ipc_recv(reply_recv_cap)
+            .expect("recv ok")
+            .expect("reply expected");
+        assert_eq!(received.as_slice(), b"ok", "wrong payload at cycle {cycle}");
+    }
+
+    // If cnode slots leaked in either task, create_endpoint (mints 2 caps) would
+    // fail with CapabilityFull / TaskMissing for the exhausted cnode.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("navigate to task0 for final check");
+    }
+    state
+        .create_endpoint(1)
+        .expect("new endpoint after 1024 cycles: caller cnode slot leak detected");
+}
+
+#[test]
+fn ipc_nested_call_reply_survives_vfs_exec_sized_read_loop() {
+    std::thread::Builder::new()
+        .name("ipc_nested_call_reply_survives_vfs_exec_sized_read_loop".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_nested_call_reply_survives_vfs_exec_sized_read_loop)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_nested_call_reply_survives_vfs_exec_sized_read_loop() {
+    // End-to-end regression for the PM→VFS→initramfs nested IPC chain that loads
+    // driver_manager.  Each outer iteration simulates one PM READ cycle:
+    //
+    //   1. PM   (task 0) creates reply cap → minted in PM's cnode
+    //   2. VFS  (task 1) materialises PM-reply cap (grant)
+    //   3. VFS  (task 1) creates reply cap → minted in VFS's cnode
+    //   4. INIT (task 2) materialises VFS-reply cap (grant)
+    //   5. INIT (task 2) calls ipc_reply → revokes from INIT + VFS (fix)
+    //   6. VFS  (task 1) calls ipc_reply → revokes from VFS  + PM  (fix)
+    //
+    // driver_manager is 85344 bytes; at 112 bytes per READ the loop requires
+    // ~762 outer cycles.  We run 800 to exceed this with margin.
+    // Without the fix both PM and VFS exhaust their 512-slot cnodes around
+    // cycle 492 (512 - initial_caps ≈ 492).
+    const CYCLES: usize = 800;
+
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task_vfs");
+    state.register_task(2).expect("task_init");
+
+    // pm_reply_ep: VFS delivers replies to PM here.
+    let (_pm_eid, _pm_send, pm_reply_recv) = state.create_endpoint(1).expect("pm reply ep");
+    // vfs_reply_ep: initramfs delivers replies to VFS here.
+    let (_vfs_eid, _vfs_send, vfs_reply_recv) = state.create_endpoint(1).expect("vfs reply ep");
+    // Grant vfs_reply_recv to task 1 (VFS).
+    let vfs_reply_recv_t1 = state
+        .grant_capability_task_to_task(0, vfs_reply_recv, 1)
+        .expect("grant vfs_reply_recv to VFS");
+
+    // Prime the scheduler with all three tasks.
+    state.enqueue_current_cpu(1).expect("enqueue vfs");
+    state.enqueue_current_cpu(2).expect("enqueue init");
+
+    for cycle in 0..CYCLES {
+        // ── Step 1: PM (task 0) creates its reply cap ────────────────────────
+        // NOTE: do NOT call enqueue_current_cpu inside this loop. on_preempt() in
+        // yield_current() automatically re-enqueues the outgoing task; an explicit
+        // enqueue would return SchedulerError::AlreadyQueued → KernelError::WouldBlock.
+        while state.current_tid() != Some(0) {
+            state.yield_current().expect("switch to PM");
+        }
+        let pm_caller_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), pm_reply_recv, Some(ThreadId(1)))
+            .unwrap_or_else(|err| panic!("cycle {cycle}: PM create_reply_cap failed: {err:?}"));
+        // Materialise into VFS's cnode (simulates recv_v2 cap transfer).
+        let vfs_pm_reply_cap = state
+            .grant_capability_task_to_task(0, pm_caller_cap, 1)
+            .unwrap_or_else(|err| panic!("cycle {cycle}: PM→VFS grant failed: {err:?}"));
+
+        // ── Step 2: VFS (task 1) creates its reply cap ───────────────────────
+        // Task 1 is already in the queue from on_preempt; no explicit enqueue needed.
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("switch to VFS");
+        }
+        let vfs_caller_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), vfs_reply_recv_t1, Some(ThreadId(2)))
+            .unwrap_or_else(|err| panic!("cycle {cycle}: VFS create_reply_cap failed: {err:?}"));
+        // Materialise into initramfs's cnode.
+        let init_vfs_reply_cap = state
+            .grant_capability_task_to_task(1, vfs_caller_cap, 2)
+            .unwrap_or_else(|err| panic!("cycle {cycle}: VFS→INIT grant failed: {err:?}"));
+
+        // ── Step 3: initramfs (task 2) replies to VFS ────────────────────────
+        // Task 2 is already in the queue from on_preempt; no explicit enqueue needed.
+        while state.current_tid() != Some(2) {
+            state.yield_current().expect("switch to INIT");
+        }
+        let init_msg = Message::new(2, b"block").expect("init reply msg");
+        state
+            .ipc_reply(init_vfs_reply_cap, init_msg)
+            .unwrap_or_else(|err| panic!("cycle {cycle}: INIT ipc_reply failed: {err:?}"));
+
+        // ── Step 4: VFS (task 1) drains initramfs reply, then replies to PM ──
+        // Task 1 is already in the queue from on_preempt; no explicit enqueue needed.
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("switch to VFS for reply");
+        }
+        // Drain the initramfs→VFS reply.
+        let _ = state.ipc_recv(vfs_reply_recv_t1).expect("VFS drain");
+        // VFS replies to PM.
+        let vfs_msg = Message::new(1, b"data").expect("vfs reply msg");
+        state
+            .ipc_reply(vfs_pm_reply_cap, vfs_msg)
+            .unwrap_or_else(|err| panic!("cycle {cycle}: VFS→PM ipc_reply failed: {err:?}"));
+
+        // ── Step 5: PM (task 0) drains VFS reply ─────────────────────────────
+        // Task 0 is already in the queue from on_preempt; no explicit enqueue needed.
+        while state.current_tid() != Some(0) {
+            state.yield_current().expect("switch to PM to drain");
+        }
+        let received = state
+            .ipc_recv(pm_reply_recv)
+            .expect("PM drain ok")
+            .expect("reply expected at PM");
+        assert_eq!(received.as_slice(), b"data", "wrong payload at cycle {cycle}");
+        // All three tasks remain in the queue via on_preempt auto-re-enqueue.
+        // Do NOT call enqueue_current_cpu here.
+    }
+
+    // Verify no cnode exhaustion on any of the three tasks.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("switch to PM final check");
+    }
+    state
+        .create_endpoint(1)
+        .expect("PM cnode exhausted after 800 nested cycles");
+    // Grant the send cap to VFS so we validate VFS's cnode too.
+    let (_, _ep_send, ep_recv) = state.create_endpoint(1).expect("probe ep");
+    state
+        .grant_capability_task_to_task(0, ep_recv, 1)
+        .expect("VFS cnode exhausted after 800 nested cycles");
+    state
+        .grant_capability_task_to_task(0, ep_recv, 2)
+        .expect("INIT cnode exhausted after 800 nested cycles");
+}
+
+#[test]
 fn normalized_page_fault_event_faults_current_task() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
