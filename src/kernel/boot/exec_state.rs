@@ -613,8 +613,20 @@ impl KernelState {
                         spec.startup_args[13 + i] = local_cap.0;
                         crate::yarm_log!("KSPAWN_EXTRA_CAP_DELEGATED tid={} slot={} local_cap={}", spec.tid, 13 + i, local_cap.0);
                     }
+                    Err(KernelError::MissingRight) => {
+                        crate::yarm_log!(
+                            "KSPAWN_EXTRA_CAP_OPTIONAL_SKIP tid={} slot={} reason=missing_right",
+                            spec.tid,
+                            13 + i
+                        );
+                    }
                     Err(e) => {
-                        crate::yarm_log!("KSPAWN_EXTRA_CAP_DELEGATE_FAIL tid={} slot={} err={:?}", spec.tid, 13 + i, e);
+                        crate::yarm_log!(
+                            "KSPAWN_EXTRA_CAP_DELEGATE_FAIL tid={} slot={} err={:?}",
+                            spec.tid,
+                            13 + i,
+                            e
+                        );
                     }
                 }
             }

@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm_user_rt::ipc::Message;
+use super::super::common::service::FsService;
 use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
     ReadWriteRequest, openat_inline_message, statx_inline_message, write_message,
 };
-use super::super::common::service::FsService;
-use yarm_srv_common::service_loop::run_typed_request_loop;
-use super::nodes::{DEV_CONSOLE_PATH, DEV_NULL_PATH, DevFsBackend, DevFsMetrics, DevNodeRegisterError};
+use super::nodes::{
+    DEV_CONSOLE_PATH, DEV_NULL_PATH, DevFsBackend, DevFsMetrics, DevNodeRegisterError,
+};
 #[cfg(test)]
 use super::nodes::{DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH_PTR};
+use yarm_ipc_abi::vfs_abi::{StatxInlinePath, VFS_OP_STATX};
+use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_srv_common::vfs_reply::VfsReply;
+use yarm_user_rt::ipc::Message;
 
 pub type DevFsService = FsService<DevFsBackend>;
 
@@ -102,21 +105,22 @@ pub fn run() {
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
                 Ok(Some(received)) => {
                     let msg = received.message;
-                    let Some(reply_cap) = received.reply_cap else { continue; };
+                    let Some(reply_cap) = received.reply_cap else {
+                        continue;
+                    };
                     yarm_user_rt::user_log!(
                         "DEVFS_SRV_GOT_MSG opcode={} reply_cap={}",
-                        msg.opcode, reply_cap
+                        msg.opcode,
+                        reply_cap
                     );
 
                     // ── DEVFS_OP_REGISTER_NODE — handled locally ─────────
                     if msg.opcode == yarm_ipc_abi::devfs_abi::DEVFS_OP_REGISTER_NODE {
                         use yarm_ipc_abi::devfs_abi::{
-                            NodeRegistrationArgs,
-                            DEVFS_REGISTER_STATUS_OK,
-                            DEVFS_REGISTER_STATUS_ERR_DUPLICATE,
-                            DEVFS_REGISTER_STATUS_ERR_FULL,
+                            DEVFS_REGISTER_STATUS_ERR_DUPLICATE, DEVFS_REGISTER_STATUS_ERR_FULL,
                             DEVFS_REGISTER_STATUS_ERR_INVALID_KIND,
-                            DEVFS_REGISTER_STATUS_ERR_INVALID_PATH,
+                            DEVFS_REGISTER_STATUS_ERR_INVALID_PATH, DEVFS_REGISTER_STATUS_OK,
+                            NodeRegistrationArgs,
                         };
                         let status: u32 = match NodeRegistrationArgs::decode(msg.as_slice()) {
                             None => DEVFS_REGISTER_STATUS_ERR_INVALID_PATH,
@@ -130,27 +134,68 @@ pub fn run() {
                                     Ok(()) => {
                                         yarm_user_rt::user_log!(
                                             "DEVFS_SRV_NODE_REGISTERED kind={} cap={}",
-                                            args.kind, args.backend_cap
+                                            args.kind,
+                                            args.backend_cap
                                         );
                                         DEVFS_REGISTER_STATUS_OK
                                     }
-                                    Err(DevNodeRegisterError::Duplicate) => DEVFS_REGISTER_STATUS_ERR_DUPLICATE,
-                                    Err(DevNodeRegisterError::TableFull) => DEVFS_REGISTER_STATUS_ERR_FULL,
-                                    Err(DevNodeRegisterError::InvalidKind) => DEVFS_REGISTER_STATUS_ERR_INVALID_KIND,
+                                    Err(DevNodeRegisterError::Duplicate) => {
+                                        DEVFS_REGISTER_STATUS_ERR_DUPLICATE
+                                    }
+                                    Err(DevNodeRegisterError::TableFull) => {
+                                        DEVFS_REGISTER_STATUS_ERR_FULL
+                                    }
+                                    Err(DevNodeRegisterError::InvalidKind) => {
+                                        DEVFS_REGISTER_STATUS_ERR_INVALID_KIND
+                                    }
                                     Err(_) => DEVFS_REGISTER_STATUS_ERR_INVALID_PATH,
                                 }
                             }
                         };
-                        let reply_opcode: u64 = if status == DEVFS_REGISTER_STATUS_OK { 0 } else { 1 };
-                        let reply = yarm_user_rt::ipc::Message::new(reply_opcode, &status.to_le_bytes())
-                            .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"));
+                        let reply_opcode: u64 = if status == DEVFS_REGISTER_STATUS_OK {
+                            0
+                        } else {
+                            1
+                        };
+                        let reply =
+                            yarm_user_rt::ipc::Message::new(reply_opcode, &status.to_le_bytes())
+                                .unwrap_or_else(|_| {
+                                    yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg")
+                                });
                         let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
                         continue;
+                    }
+
+                    if msg.opcode == VFS_OP_STATX {
+                        let payload = msg.as_slice();
+                        let decoded = StatxInlinePath::decode(payload);
+                        let path_len = decoded.map(|d| d.path.len()).unwrap_or(0);
+                        yarm_user_rt::user_log!(
+                            "DEVFS_STATX_BEGIN len={} path_len={} payload_len={}",
+                            msg.len,
+                            path_len,
+                            payload.len()
+                        );
+                        if let Some(d) = decoded {
+                            let path = core::str::from_utf8(d.path).unwrap_or("<non-utf8>");
+                            yarm_user_rt::user_log!(
+                                "DEVFS_STATX_PATH path={} path_len={}",
+                                path,
+                                d.path.len()
+                            );
+                        } else {
+                            yarm_user_rt::user_log!(
+                                "DEVFS_STATX_PATH path=<decode-failed> path_len=0"
+                            );
+                        }
                     }
 
                     let response = svc.handle(msg).unwrap_or_else(|_| {
                         yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg")
                     });
+                    if msg.opcode == VFS_OP_STATX {
+                        yarm_user_rt::user_log!("DEVFS_STATX_REPLY size={}", response.len);
+                    }
                     let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
                 }
                 _ => {
@@ -168,14 +213,16 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::common::vfs_ipc::{
         CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_inline_message,
         statx_inline_message, write_message,
     };
     use super::super::super::common::vfs_service::VfsService;
     use super::super::super::initramfs::{INITRAMFS_BOOT_MARKER_PATH_PTR, InitramfsBackend};
-    use yarm_ipc_abi::vfs_abi::{OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_STATX, VFS_OP_WRITE};
+    use super::*;
+    use yarm_ipc_abi::vfs_abi::{
+        OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_STATX, VFS_OP_WRITE,
+    };
 
     #[test]
     fn devfs_service_supports_console_and_null() {
@@ -191,8 +238,7 @@ mod tests {
 
     #[test]
     fn devfs_protocol_vectors_match_frozen_vfs_codec() {
-        let open_console = openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0)
-        .expect("open console");
+        let open_console = openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0).expect("open console");
         assert_eq!(open_console.opcode, VFS_OP_OPENAT);
         let decoded_open = OpenAtInlinePath::decode(open_console.as_slice()).expect("decode open");
         assert_eq!(decoded_open.path, DEV_CONSOLE_PATH);
@@ -209,8 +255,7 @@ mod tests {
             &ReadWriteArgs::new(3, 0, 12).encode()
         );
 
-        let stat_null = statx_inline_message(0, DEV_NULL_PATH, 0, 0)
-        .expect("stat");
+        let stat_null = statx_inline_message(0, DEV_NULL_PATH, 0, 0).expect("stat");
         assert_eq!(stat_null.opcode, VFS_OP_STATX);
         let decoded_stat = StatxInlinePath::decode(stat_null.as_slice()).expect("decode stat");
         assert_eq!(decoded_stat.path, DEV_NULL_PATH);
@@ -234,9 +279,7 @@ mod tests {
         );
 
         let open_dev = svc
-            .handle_request(
-                openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0).expect("open dev"),
-            )
+            .handle_request(openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0).expect("open dev"))
             .expect("dev open reply");
         assert_eq!(open_dev.opcode, VFS_OP_OPENAT);
 
@@ -247,10 +290,8 @@ mod tests {
             .expect("initramfs open reply");
         assert_eq!(open_initramfs.opcode, VFS_OP_OPENAT);
 
-        let denied = svc.handle_request(
-            openat_inline_message(0, b"denied", 0, 0)
-            .expect("denied request"),
-        );
+        let denied =
+            svc.handle_request(openat_inline_message(0, b"denied", 0, 0).expect("denied request"));
         assert_eq!(denied, Err(VfsError::PermissionDenied));
     }
 
@@ -272,9 +313,7 @@ mod tests {
         assert!(recovered.active);
 
         let open_console = svc
-            .handle_request(
-                openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0).expect("open"),
-            )
+            .handle_request(openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0).expect("open"))
             .expect("open reply");
         let console_fd =
             VfsReply::from_opcode_payload_checked(open_console.opcode, open_console.as_slice())
@@ -306,9 +345,7 @@ mod tests {
         let mut svc = VfsService::with_backend(DevFsBackend::default());
         svc.mount(DEV_CONSOLE_PATH_PTR, 1).expect("mount");
         let open_console = svc
-            .handle_request(
-                openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0).expect("open"),
-            )
+            .handle_request(openat_inline_message(0, DEV_CONSOLE_PATH, 0, 0).expect("open"))
             .expect("open reply");
         let console_fd = decode_reply_u64(open_console);
 

@@ -1445,15 +1445,22 @@ unsafe fn pm_vfs_spawn_inline(
         "PM_VFS_SPAWN_FROM_VFS_BYTES image_id={} len={} first4={:x?}",
         image_id, image.len(), &image[..4]
     );
+    let image_len = image.len();
     let result = unsafe {
         yarm_user_rt::syscall::spawn_process_from_user_buf(
             image_id,
             image.as_ptr(),
-            image.len(),
+            image_len,
             parent_pid,
             startup_args,
         )
     };
+    drop(image);
+    yarm_user_rt::user_log!(
+        "PM_VFS_EXEC_BUFFER_DROPPED image_id={} len={}",
+        image_id,
+        image_len
+    );
     match result {
         Ok((tid, caller_cap, spawner_cap)) => {
             yarm_user_rt::user_log!(
