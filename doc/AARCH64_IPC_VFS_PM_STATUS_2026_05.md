@@ -202,6 +202,8 @@ Intentionally left:
 - Spawn-source logging remains explicit to avoid duplicate-path ambiguity.
 - `VFS_READ_SHARED_REPLY_ENABLED` remains disabled in this phase.
 - `initramfs_srv` must be backed by real boot CPIO bytes for VFS-backed `7..=9` exec to work.
+- Transitional bridge: when direct boot-CPIO bytes are not mapped into `initramfs_srv`, it may import known initramfs files via syscall `ReadInitramfsFile` (nr=25) into a userspace-owned cache and serve VFS from that cache. This bridge is temporary and does not change PM policy (PM still uses VFS path for `7..=9`).
+- Long-term target remains capability-scoped read-only initrd memory-object/cap handoff to `initramfs_srv`; `ReadInitramfsFile` should not become the final architecture for routine service loading.
   In runtime placeholder mode (`INITRAMFS_BACKEND_SOURCE source=placeholder`), late exec paths
   (`/initramfs/sbin/driver_manager`, `/initramfs/sbin/blkcache_srv`, `/initramfs/sbin/virtio_blk_srv`)
   are rejected truthfully (`Unsupported`) and are **not** treated as successful stat/open/read sources.

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use yarm_user_rt::ipc::Message;
 use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
@@ -10,7 +12,7 @@ use super::super::common::service::FsService;
 use yarm_srv_common::service_loop::run_typed_request_loop;
 use yarm_srv_common::vfs_core::VfsBackend;
 use super::archive::{
-    INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_DRIVER_MANAGER_PATH, InitramfsBackend, InitramfsMetrics,
+    INITRAMFS_BLKCACHE_PATH, INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_DRIVER_MANAGER_PATH, INITRAMFS_INIT_PATH, INITRAMFS_PROC_MGR_PATH, INITRAMFS_SRV_PATH, INITRAMFS_SUPERVISOR_PATH, INITRAMFS_VFS_PATH, INITRAMFS_VIRTIO_BLK_PATH, InitramfsBackend, InitramfsMetrics,
 };
 use super::boot_initrd_bytes;
 use yarm_srv_common::vfs_reply::VfsReply;
@@ -20,17 +22,119 @@ pub type InitramfsService = FsService<InitramfsBackend>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitramfsBackendSource {
     Cpio,
+    SyscallCache,
     Placeholder,
 }
 
-fn build_runtime_backend() -> (InitramfsBackend, InitramfsBackendSource) {
+fn build_runtime_backend() -> (InitramfsBackend, InitramfsBackendSource, usize) {
     if let Some(cpio) = boot_initrd_bytes() {
         return (
             InitramfsBackend::from_cpio_newc_static(cpio),
             InitramfsBackendSource::Cpio,
+            0,
         );
     }
-    (InitramfsBackend::new(8192), InitramfsBackendSource::Placeholder)
+    if let Some((backend, entries)) = build_backend_from_syscall_cache() {
+        return (backend, InitramfsBackendSource::SyscallCache, entries);
+    }
+    (InitramfsBackend::new(8192), InitramfsBackendSource::Placeholder, 0)
+}
+
+
+const SYSCALL_CACHE_MAX_FILE_SIZE: usize = 2 * 1024 * 1024;
+const SYSCALL_CACHE_CHUNK: usize = 16 * 1024;
+
+const SYSCALL_CACHE_TARGETS: [(&[u8], &[u8]); 8] = [
+    (INITRAMFS_DRIVER_MANAGER_PATH, b"sbin/driver_manager"),
+    (INITRAMFS_BLKCACHE_PATH, b"sbin/blkcache_srv"),
+    (INITRAMFS_VIRTIO_BLK_PATH, b"sbin/virtio_blk_srv"),
+    (INITRAMFS_SRV_PATH, b"sbin/initramfs_srv"),
+    (INITRAMFS_VFS_PATH, b"vfs"),
+    (INITRAMFS_PROC_MGR_PATH, b"sbin/process_manager"),
+    (INITRAMFS_SUPERVISOR_PATH, b"sbin/supervisor"),
+    (INITRAMFS_INIT_PATH, b"init"),
+];
+
+fn syscall_name_candidates(cpio_name: &[u8]) -> [Vec<u8>; 3] {
+    let mut with_slash = Vec::with_capacity(cpio_name.len() + 1);
+    with_slash.push(b'/');
+    with_slash.extend_from_slice(cpio_name);
+    let mut with_initramfs = Vec::with_capacity(cpio_name.len() + b"/initramfs/".len());
+    with_initramfs.extend_from_slice(b"/initramfs/");
+    with_initramfs.extend_from_slice(cpio_name);
+    [cpio_name.to_vec(), with_slash, with_initramfs]
+}
+
+fn push_newc_entry(out: &mut Vec<u8>, name: &[u8], mode: u32, data: &[u8]) {
+    let namesz = name.len() + 1;
+    let mut h = [0u8; 110];
+    h[0..6].copy_from_slice(b"070701");
+    let mode_hex = alloc::format!("{:08x}", mode);
+    let size_hex = alloc::format!("{:08x}", data.len());
+    let namesz_hex = alloc::format!("{:08x}", namesz);
+    h[14..22].copy_from_slice(mode_hex.as_bytes());
+    h[54..62].copy_from_slice(size_hex.as_bytes());
+    h[94..102].copy_from_slice(namesz_hex.as_bytes());
+    out.extend_from_slice(&h);
+    out.extend_from_slice(name);
+    out.push(0);
+    while out.len() % 4 != 0 { out.push(0); }
+    out.extend_from_slice(data);
+    while out.len() % 4 != 0 { out.push(0); }
+}
+
+fn load_file_via_syscall(cpio_name: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    for candidate in syscall_name_candidates(cpio_name) {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        let mut ok = true;
+        loop {
+            if out.len() >= SYSCALL_CACHE_MAX_FILE_SIZE { ok = false; break; }
+            let mut chunk = [0u8; SYSCALL_CACHE_CHUNK];
+            let n = unsafe { yarm_user_rt::syscall::read_initramfs_file(&candidate, offset, &mut chunk) }.ok()?;
+            if n == 0 { break; }
+            if out.len().saturating_add(n) > SYSCALL_CACHE_MAX_FILE_SIZE { ok = false; break; }
+            out.extend_from_slice(&chunk[..n]);
+            offset = offset.saturating_add(n);
+            if n < SYSCALL_CACHE_CHUNK { break; }
+        }
+        if ok && !out.is_empty() {
+            return Some((candidate, out));
+        }
+    }
+    None
+}
+
+fn build_backend_from_syscall_cache() -> Option<(InitramfsBackend, usize)> {
+    yarm_user_rt::user_log!("INITRAMFS_SYSCALL_CACHE_BEGIN");
+    let mut cpio = Vec::new();
+    let mut cached = 0usize;
+    for (path, cpio_name) in SYSCALL_CACHE_TARGETS {
+        match load_file_via_syscall(cpio_name) {
+            Some((used_name, bytes)) => {
+                let first4 = [bytes.get(0).copied().unwrap_or(0), bytes.get(1).copied().unwrap_or(0), bytes.get(2).copied().unwrap_or(0), bytes.get(3).copied().unwrap_or(0)];
+                yarm_user_rt::user_log!(
+                    "INITRAMFS_SYSCALL_CACHE_FILE path={} syscall_name={} size={} first4=[{:x},{:x},{:x},{:x}]",
+                    core::str::from_utf8(path).unwrap_or("?"),
+                    core::str::from_utf8(&used_name).unwrap_or("?"),
+                    bytes.len(), first4[0], first4[1], first4[2], first4[3]
+                );
+                if (path == INITRAMFS_DRIVER_MANAGER_PATH || path == INITRAMFS_BLKCACHE_PATH || path == INITRAMFS_VIRTIO_BLK_PATH) && bytes.is_empty() {
+                    yarm_user_rt::user_log!("INITRAMFS_SYSCALL_CACHE_FILE_FAIL path={} err=zero_size", core::str::from_utf8(path).unwrap_or("?"));
+                    return None;
+                }
+                push_newc_entry(&mut cpio, cpio_name, 0o100755, &bytes);
+                cached += 1;
+            }
+            None => {
+                yarm_user_rt::user_log!("INITRAMFS_SYSCALL_CACHE_FILE_FAIL path={} err=read_failed", core::str::from_utf8(path).unwrap_or("?"));
+            }
+        }
+    }
+    if cached < 3 { return None; }
+    push_newc_entry(&mut cpio, b"TRAILER!!!", 0, &[]);
+    let leaked: &'static [u8] = Box::leak(cpio.into_boxed_slice());
+    Some((InitramfsBackend::from_cpio_newc_static(leaked), cached))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +202,7 @@ pub fn run_request_loop(service: &mut InitramfsService) -> Result<InitramfsLoopS
 
 pub fn run() {
     yarm_user_rt::user_log!("INITRAMFS_SRV_ENTRY");
-    let (backend, backend_source) = build_runtime_backend();
+    let (backend, backend_source, cache_entries) = build_runtime_backend();
     let mut svc = InitramfsService::with_backend(backend);
     let driver_manager_size = svc
         .backend_mut()
@@ -108,6 +212,13 @@ pub fn run() {
         InitramfsBackendSource::Cpio => {
             yarm_user_rt::user_log!(
                 "INITRAMFS_BACKEND_SOURCE source=cpio driver_manager_size={}",
+                driver_manager_size
+            );
+        }
+        InitramfsBackendSource::SyscallCache => {
+            yarm_user_rt::user_log!(
+                "INITRAMFS_BACKEND_SOURCE source=syscall-cache entries={} driver_manager_size={}",
+                cache_entries,
                 driver_manager_size
             );
         }
@@ -175,7 +286,7 @@ mod tests {
     use super::*;
     use alloc::boxed::Box;
     use alloc::format;
-    use alloc::vec::Vec;
+use alloc::vec::Vec;
     use super::super::archive::{INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_BOOT_MARKER_PATH_PTR};
     use super::super::super::common::vfs_ipc::{
         CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_inline_message,
@@ -387,7 +498,7 @@ mod tests {
 
     #[test]
     fn build_runtime_backend_uses_placeholder_when_boot_initrd_missing() {
-        let (_backend, source) = build_runtime_backend();
+        let (_backend, source, _entries) = build_runtime_backend();
         assert_eq!(source, InitramfsBackendSource::Placeholder);
     }
 }
