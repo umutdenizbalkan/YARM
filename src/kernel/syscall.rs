@@ -8,7 +8,7 @@ use super::ipc::{
 };
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
-use super::vm::{PAGE_SIZE, PageFlags, VirtAddr};
+use super::vm::{CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 use crate::arch::syscall_abi;
 use crate::kernel::boot::UserImageSpec;
 use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskClass};
@@ -33,7 +33,6 @@ pub const SYSCALL_VM_BRK_NR: usize = 14;
 pub const SYSCALL_DEBUG_LOG_NR: usize = 15;
 pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
 pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
-pub const SYSCALL_READ_INITRAMFS_FILE_NR: usize = 25;
 pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
 pub const SYSCALL_COUNT: usize = 27;
 const _: [(); SYSCALL_COUNT] = [(); 27];
@@ -86,12 +85,11 @@ pub enum Syscall {
     DebugLog = SYSCALL_DEBUG_LOG_NR,
     SpawnProcess = SYSCALL_SPAWN_PROCESS_NR,
     SpawnProcessFromUserBuf = SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR,
-    ReadInitramfsFile = SYSCALL_READ_INITRAMFS_FILE_NR,
     SpawnFromInitramfsFile = SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 20;
+    pub const VARIANT_COUNT: usize = 19;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -116,7 +114,6 @@ impl Syscall {
             SYSCALL_DEBUG_LOG_NR => Ok(Self::DebugLog),
             SYSCALL_SPAWN_PROCESS_NR => Ok(Self::SpawnProcess),
             SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR => Ok(Self::SpawnProcessFromUserBuf),
-            SYSCALL_READ_INITRAMFS_FILE_NR => Ok(Self::ReadInitramfsFile),
             SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR => Ok(Self::SpawnFromInitramfsFile),
             _ => Err(SyscallError::InvalidNumber),
         }
@@ -1589,6 +1586,11 @@ fn handle_spawn_process(
     startup_args[14] = 0;
     startup_args[15] = 0;
     startup_args[16] = 0;
+    // For initramfs_srv (image_id=4), we will map the boot initrd read-only
+    // into its address space and pass the user VA + length via startup slots 15/16.
+    // The mapping happens after the ASID is created below.
+    const INITRAMFS_IMAGE_ID: u64 = 4;
+    const INITRD_USER_VA_BASE: u64 = 0x0C00_0000;
     let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
     crate::yarm_log!("KSPAWN_PATH path={}", image_path);
     let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
@@ -1614,6 +1616,55 @@ fn handle_spawn_process(
         SyscallError::from(err)
     })?;
     crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
+
+    // Map boot initrd pages read-only into initramfs_srv (image_id=4).
+    // This provides the CPIO data in userspace without syscall bridge.
+    if image_id == INITRAMFS_IMAGE_ID {
+        if let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() {
+            let initrd_phys_raw = initrd.as_ptr() as u64;
+            let initrd_len = initrd.len() as u64;
+            let page: u64 = PAGE_SIZE as u64;
+            let phys_start = initrd_phys_raw & !(page - 1);
+            let phys_end = (initrd_phys_raw + initrd_len + page - 1) & !(page - 1);
+            let pages_to_map = ((phys_end - phys_start) / page) as usize;
+            let initrd_offset_in_first_page = (initrd_phys_raw - phys_start) as u64;
+            crate::yarm_log!(
+                "INITRAMFS_INITRD_MAP_BEGIN phys_start=0x{:x} phys_end=0x{:x} len={} pages={}",
+                phys_start, phys_end, initrd_len, pages_to_map
+            );
+            let initrd_flags = PageFlags {
+                read: true,
+                write: false,
+                execute: false,
+                user: true,
+                cache_policy: CachePolicy::WriteBack,
+            };
+            let mut map_ok = true;
+            for i in 0..pages_to_map {
+                let virt = VirtAddr(INITRD_USER_VA_BASE + (i as u64) * page);
+                let phys = PhysAddr(phys_start + (i as u64) * page);
+                if let Err(e) = kernel.map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags: initrd_flags }) {
+                    crate::yarm_log!(
+                        "INITRAMFS_INITRD_MAP_FAIL page={} virt=0x{:x} err={:?}",
+                        i, virt.0, e
+                    );
+                    map_ok = false;
+                    break;
+                }
+            }
+            if map_ok {
+                let user_initrd_ptr = INITRD_USER_VA_BASE + initrd_offset_in_first_page;
+                startup_args[15] = user_initrd_ptr;
+                startup_args[16] = initrd_len;
+                crate::yarm_log!(
+                    "INITRAMFS_INITRD_MAP_DONE user_ptr=0x{:x} len={} rights=ro",
+                    user_initrd_ptr, initrd_len
+                );
+            }
+        } else {
+            crate::yarm_log!("INITRAMFS_INITRD_MAP_SKIP reason=no_boot_initrd");
+        }
+    }
 
     let spawner_tid = current_tid(kernel).unwrap_or(0);
     let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
@@ -2027,55 +2078,6 @@ fn handle_spawn_from_initramfs_file(
     Ok(())
 }
 
-fn handle_read_initramfs_file(
-    kernel: &mut KernelState,
-    frame: &mut TrapFrame,
-) -> Result<(), SyscallError> {
-    // ABI: arg0=name_ptr, arg1=name_len, arg2=file_offset, arg3=out_ptr, arg4=out_len
-    let name_ptr = frame.arg(0);
-    let name_len = frame.arg(1);
-    let offset   = frame.arg(2);
-    let out_ptr  = frame.arg(3);
-    let out_len  = frame.arg(4);
-
-    if name_len == 0 || name_len > 128 || out_ptr == 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    if out_len == 0 {
-        frame.set_ok(0, 0, 0);  // ret0=ok, ret1=0 bytes
-        return Ok(());
-    }
-
-    let name_buf = kernel
-        .copy_from_current_user(name_ptr, name_len)
-        .map_err(|_| SyscallError::InvalidArgs)?;
-    let name = core::str::from_utf8(&name_buf[..name_len])
-        .map_err(|_| SyscallError::InvalidArgs)?;
-    let name = name.strip_prefix('/').unwrap_or(name);
-
-    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()
-        .ok_or(SyscallError::InvalidArgs)?;
-    let entry = CpioArchive::new(initrd)
-        .find(name)
-        .map_err(|_| SyscallError::InvalidArgs)?
-        .ok_or(SyscallError::InvalidArgs)?;
-
-    let data = entry.file_data();
-    if offset >= data.len() {
-        frame.set_ok(0, 0, 0);
-        return Ok(());
-    }
-
-    let available = data.len() - offset;
-    let n = out_len.min(available);
-
-    kernel
-        .copy_to_current_user_from_slice(out_ptr, &data[offset..offset + n])
-        .map_err(|_| SyscallError::PageFault)?;
-
-    frame.set_ok(0, n, 0);
-    Ok(())
-}
 
 fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
     match image_id {
@@ -2251,7 +2253,6 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::DebugLog => handle_debug_log(kernel, frame),
         Syscall::SpawnProcess => handle_spawn_process(kernel, frame),
         Syscall::SpawnProcessFromUserBuf => handle_spawn_process_from_user_buf(kernel, frame),
-        Syscall::ReadInitramfsFile => handle_read_initramfs_file(kernel, frame),
         Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {

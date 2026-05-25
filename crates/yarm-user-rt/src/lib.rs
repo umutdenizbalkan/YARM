@@ -55,7 +55,6 @@ pub mod syscall {
     const SYSCALL_YIELD_NR: usize = 0;
     pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
     pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
-    pub const SYSCALL_READ_INITRAMFS_FILE_NR: usize = 25;
     pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
@@ -504,40 +503,6 @@ pub mod syscall {
         Ok((ret.ret1 as u64, caller_cap, spawner_cap))
     }
 
-    /// Read bytes from a named file inside the boot initramfs CPIO.
-    ///
-    /// `name` is the CPIO entry name (e.g. `b"sbin/initramfs_srv"`).
-    /// `offset` is the byte offset within the file.
-    /// `out_buf` receives the bytes; returns the number of bytes actually copied.
-    /// Returns 0 when `offset >= file_size` (EOF).
-    pub unsafe fn read_initramfs_file(
-        name: &[u8],
-        offset: usize,
-        out_buf: &mut [u8],
-    ) -> core::result::Result<usize, SyscallError> {
-        if name.is_empty() || out_buf.is_empty() {
-            return Ok(0);
-        }
-        let args = [
-            name.as_ptr() as usize,     // arg0 = name_ptr
-            name.len(),                  // arg1 = name_len
-            offset,                      // arg2 = file_offset
-            out_buf.as_mut_ptr() as usize, // arg3 = out_ptr
-            out_buf.len(),               // arg4 = out_len
-            0,
-        ];
-        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_READ_INITRAMFS_FILE_NR, args) };
-        #[cfg(target_arch = "x86_64")]
-        if ret.error != 0 {
-            return Err(decode_syscall_error(ret.error));
-        }
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret0 != 0 {
-            return Err(decode_syscall_error(ret.ret0));
-        }
-        Ok(ret.ret1)
-    }
-
     /// Spawn a process directly from a named file inside the boot initramfs CPIO.
     ///
     /// The kernel reads the ELF into an internal staging buffer (no user-space
@@ -687,6 +652,8 @@ pub mod runtime {
     pub const STARTUP_SLOT_PROCESS_MANAGER_SERVICE_RECV_EP: usize = 12;
     pub const STARTUP_SLOT_SERVICE_EXTRA_CAP_0: usize = 13;
     pub const STARTUP_SLOT_SERVICE_EXTRA_CAP_1: usize = 14;
+    pub const STARTUP_SLOT_INITRD_PTR: usize = 15;
+    pub const STARTUP_SLOT_INITRD_LEN: usize = 16;
     pub const STARTUP_SLOT_PM_REQUEST_RECV_CAP: usize = 17;
     const STARTUP_SLOT_COUNT: usize = 18;
 
@@ -749,6 +716,12 @@ pub mod runtime {
         pub service_extra_cap_0: Option<u32>,
         /// Optional extra service send cap 1 (slot 14).
         pub service_extra_cap_1: Option<u32>,
+        /// Boot initramfs pointer mapped read-only into this process's address space (slot 15).
+        /// Zero/None if kernel did not provide an initrd mapping.
+        pub initrd_ptr: Option<u64>,
+        /// Boot initramfs length in bytes (slot 16).
+        /// Zero/None if kernel did not provide an initrd mapping.
+        pub initrd_len: Option<u64>,
         /// Optional process-manager inbound request receive cap (slot 17).
         ///
         /// Passed to the PM server (TID 3) so it knows which endpoint to block on.
@@ -1023,6 +996,14 @@ pub mod runtime {
         let service_extra_cap_1 = cap_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_SERVICE_EXTRA_CAP_1].load(Ordering::Relaxed),
         );
+        let initrd_ptr = {
+            let raw = STARTUP_ARG_SLOTS[STARTUP_SLOT_INITRD_PTR].load(Ordering::Relaxed);
+            if raw == 0 { None } else { Some(raw) }
+        };
+        let initrd_len = {
+            let raw = STARTUP_ARG_SLOTS[STARTUP_SLOT_INITRD_LEN].load(Ordering::Relaxed);
+            if raw == 0 { None } else { Some(raw) }
+        };
         let pm_request_recv_cap = cap_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_PM_REQUEST_RECV_CAP].load(Ordering::Relaxed),
         );
@@ -1042,6 +1023,8 @@ pub mod runtime {
             process_manager_service_recv_ep,
             service_extra_cap_0,
             service_extra_cap_1,
+            initrd_ptr,
+            initrd_len,
             pm_request_recv_cap,
         }
     }
@@ -1230,6 +1213,50 @@ mod tests {
         let (_frame, _len, tx_cap, flags) = ipc_call_prepare(&msg);
         assert_eq!(tx_cap, Some(65551));
         assert_ne!(flags & Message::FLAG_CAP_TRANSFER, 0);
+    }
+
+    #[test]
+    fn startup_initrd_slots_decode_from_slots_15_16() {
+        let original = startup_context();
+
+        install_startup_arg_slots([
+            42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0xC001000, // slot 15 = initrd_ptr
+            4096,      // slot 16 = initrd_len
+            0,
+        ]);
+        let ctx = startup_context();
+        assert_eq!(ctx.initrd_ptr, Some(0xC001000u64));
+        assert_eq!(ctx.initrd_len, Some(4096u64));
+
+        install_startup_arg_slots([
+            42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        let ctx2 = startup_context();
+        assert_eq!(ctx2.initrd_ptr, None);
+        assert_eq!(ctx2.initrd_len, None);
+
+        // Restore original
+        install_startup_arg_slots([
+            original.task_id,
+            original.process_manager_request_send_cap.map(u64::from).unwrap_or(0),
+            original.process_manager_reply_recv_cap.map(u64::from).unwrap_or(0),
+            original.supervisor_fault_recv_ep.map(u64::from).unwrap_or(0),
+            original.supervisor_control_send_ep.map(u64::from).unwrap_or(0),
+            original.supervisor_control_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_send_ep.map(u64::from).unwrap_or(0),
+            original.init_alert_recv_ep.map(u64::from).unwrap_or(0),
+            original.init_tid.unwrap_or(0),
+            original.supervisor_tid.unwrap_or(0),
+            original.supervisor_restart_window_ticks.unwrap_or(0),
+            original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
+            original.process_manager_service_recv_ep.map(u64::from).unwrap_or(0),
+            0,
+            0,
+            original.initrd_ptr.unwrap_or(0),
+            original.initrd_len.unwrap_or(0),
+            original.pm_request_recv_cap.map(u64::from).unwrap_or(0),
+        ]);
     }
 
 }
