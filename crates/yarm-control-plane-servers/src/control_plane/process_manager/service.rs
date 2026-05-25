@@ -1591,7 +1591,11 @@ unsafe fn pm_read_all_via_vfs(
     // as a fatal protocol error (premature EOF or format mismatch).
     while out.len() < file_len {
         let prev_len = out.len();
-        let to_read = core::cmp::min(512usize, file_len - out.len());
+        // Request at most MAX_PAYLOAD-16 bytes: 16 bytes are used for the u64
+        // read-length header that the VFS reply prepends before the data.
+        // Requesting 512 caused the VFS reply payload (header + data) to exceed
+        // Message::MAX_PAYLOAD (128), truncating the data silently.
+        let to_read = core::cmp::min(Message::MAX_PAYLOAD - 16, file_len - out.len());
         let read_msg = build_read_message(fd, to_read).map_err(|_| ProcessManagerError::Malformed)?;
         yarm_user_rt::user_log!("PM_VFS_CALL op=READ fd={} len={}", fd, to_read);
         let read_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &read_msg) }?;
