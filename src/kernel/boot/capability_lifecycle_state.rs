@@ -119,6 +119,19 @@ impl KernelState {
         })
     }
 
+    /// Returns the number of occupied (non-empty) slots in the given CNode.
+    /// Used for diagnostics and test assertions.
+    pub(crate) fn cnode_occupied_slots(&self, cnode: CNodeId) -> Option<usize> {
+        self.with_capability_state(|capability| {
+            capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .map(|space| kernel_ref(&space.cspace).occupied_slots())
+        })
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resize_process_cnode_slots(
         &mut self,

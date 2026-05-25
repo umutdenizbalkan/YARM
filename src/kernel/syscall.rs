@@ -382,31 +382,112 @@ fn materialize_received_message_cap(
         ("none", None)
     };
     let Some(raw_value) = value else { return Ok(None); };
+
+    if kind == "reply" {
+        // ── Direct-mint path for Reply caps ───────────────────────────────────────
+        // Reply caps are one-shot and non-delegatable.  We intentionally bypass
+        // `grant_task_to_task_with_rights` (which would call `record_delegated_capability_link`)
+        // and instead:
+        //   1. Take the transfer envelope to recover the underlying Reply object.
+        //   2. Verify the Reply cap is still live in the global registry.
+        //   3. Mint the Reply object directly into the receiver's cnode.
+        //   4. Record the resulting CapId in the global ReplyCapRecord so that
+        //      `ipc_reply` can later fast-revoke the exact slot.
+        //
+        // This prevents delegation-link table saturation (MAX_DELEGATED_CAPABILITY_LINKS
+        // entries would fill after ~1012 PM→VFS cycles on AArch64 freestanding, causing
+        // `CapabilityFull` in `record_delegated_capability_link`, which left an already-
+        // minted cap leaked in the receiver's cnode on every subsequent cycle, eventually
+        // exhausting the 512-slot freestanding cnode).
+        let envelope = match kernel.take_transfer_envelope(
+            raw_value,
+            endpoint,
+            crate::kernel::ipc::ThreadId(receiver_tid),
+        ) {
+            Some(e) => e,
+            None => {
+                crate::yarm_log!(
+                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=no_envelope",
+                    raw_value
+                );
+                return Err(SyscallError::InvalidCapability);
+            }
+        };
+        let (reply_index, reply_generation) = match envelope.source_object {
+            CapObject::Reply { index, generation } => (index, generation),
+            _ => {
+                crate::yarm_log!(
+                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=source_not_reply_object",
+                    raw_value
+                );
+                return Err(SyscallError::WrongObject);
+            }
+        };
+        let reply_object = CapObject::Reply {
+            index: reply_index,
+            generation: reply_generation,
+        };
+        crate::yarm_log!(
+            "IPC_RECV_REPLY_CAP_MATERIALIZE_BEGIN waiter_tid={} raw={} reply_index={} reply_generation={}",
+            receiver_tid, raw_value, reply_index, reply_generation
+        );
+        if kernel.capability_object_live(reply_object).is_none() {
+            crate::yarm_log!(
+                "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=reply_object_not_live",
+                raw_value
+            );
+            return Err(SyscallError::InvalidCapability);
+        }
+        let dest_cnode = match kernel.task_cnode(receiver_tid) {
+            Some(cnode) => cnode,
+            None => {
+                crate::yarm_log!(
+                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=no_receiver_cnode",
+                    raw_value
+                );
+                return Err(SyscallError::InvalidCapability);
+            }
+        };
+        let minted = match kernel.mint_capability_in_cnode(
+            dest_cnode,
+            Capability::new(reply_object, CapRights::SEND),
+        ) {
+            Ok(cap) => cap,
+            Err(err) => {
+                let (cnode_used, cnode_capacity) = kernel
+                    .cnode_slot_capacity(dest_cnode)
+                    .map(|cap| {
+                        let used = kernel.cnode_occupied_slots(dest_cnode).unwrap_or(0);
+                        (used, cap)
+                    })
+                    .unwrap_or((0, 0));
+                crate::yarm_log!(
+                    "IPC_RECV_REPLY_CAP_MATERIALIZE_FAIL waiter_tid={} reason={:?} cnode_used={} cnode_capacity={}",
+                    receiver_tid, err, cnode_used, cnode_capacity
+                );
+                crate::yarm_log!(
+                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err={:?}",
+                    raw_value, err
+                );
+                return Err(SyscallError::from(err));
+            }
+        };
+        // Record the materialized CapId in the global ReplyCapRecord so that
+        // ipc_reply can fast-revoke the exact slot using a kernel-controlled value.
+        kernel.set_reply_cap_waiter_cap(reply_index, reply_generation, minted);
+        crate::yarm_log!(
+            "IPC_RECV_REPLY_CAP_MATERIALIZE_OK waiter_tid={} local_reply_cap={}",
+            receiver_tid, minted.0
+        );
+        return Ok(Some(minted.0));
+    }
+
+    // ── Transfer-cap path (FLAG_CAP_TRANSFER) ────────────────────────────────
     match materialize_received_transfer_cap(kernel, Some(raw_value), endpoint, receiver_tid) {
         Ok(local_cap) => {
             Ok(local_cap)
         }
         Err(first_err) => {
-            if kind == "reply" {
-                let reply_index = usize::try_from(raw_value & 0xFFFF).map_err(|_| first_err)?;
-                let reply_generation = raw_value >> 16;
-                let reply_object = CapObject::Reply {
-                    index: reply_index,
-                    generation: reply_generation,
-                };
-                if reply_generation != 0 && kernel.capability_object_live(reply_object).is_some() {
-                    let dest_cnode = kernel
-                        .task_cnode(receiver_tid)
-                        .ok_or(SyscallError::InvalidCapability)?;
-                    let minted = kernel
-                        .mint_capability_in_cnode(
-                            dest_cnode,
-                            Capability::new(reply_object, CapRights::SEND),
-                        )
-                        .map_err(SyscallError::from)?;
-                    return Ok(Some(minted.0));
-                }
-            }
             crate::yarm_log!(
                 "IPC_RECV_CAP_MATERIALIZE_FAILED kind={} raw={} err={:?}",
                 kind,

@@ -58,6 +58,30 @@ impl KernelState {
         Ok(())
     }
 
+    /// Store the waiter-local Reply cap CapId in the matching global ReplyCapRecord.
+    ///
+    /// Called by the materialization path after it mints a Reply cap directly into
+    /// the waiter's cnode (without delegation tracking).  `ipc_reply` later reads
+    /// this value to fast-revoke the exact cnode slot using a kernel-controlled
+    /// CapId rather than the user-supplied argument.
+    pub(crate) fn set_reply_cap_waiter_cap(&mut self, reply_index: usize, reply_generation: u64, cap: CapId) {
+        self.with_ipc_state_mut(|ipc| {
+            if reply_index >= super::MAX_REPLY_CAPS {
+                return;
+            }
+            if ipc.reply_cap_generations[reply_index] != reply_generation {
+                return;
+            }
+            if let Some(record) = &mut ipc.reply_caps[reply_index] {
+                record.waiter_cap_id = Some(cap);
+                crate::yarm_log!(
+                    "IPC_RECV_REPLY_CAP_WAITER_CAP_SET reply_index={} reply_gen={} cap={}",
+                    reply_index, reply_generation, cap.0
+                );
+            }
+        });
+    }
+
     pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
@@ -373,6 +397,7 @@ impl KernelState {
                             reply_endpoint,
                             responder_tid,
                             caller_cap_id: CapId(0), // placeholder; updated in Phase 3
+                            waiter_cap_id: None,     // filled in when cap is materialized
                         });
                         return Ok::<_, KernelError>((idx, next_generation));
                     }
@@ -474,22 +499,56 @@ impl KernelState {
         let reply_object = capability.object;
 
         // Revoke the Reply cap from the replier's (current task's) cnode.
+        //
+        // Prefer `record.waiter_cap_id` (kernel-controlled CapId set during
+        // materialization) over the user-supplied `reply_cap` argument. Both
+        // should refer to the same slot, but using the kernel-recorded value
+        // is more robust against a misbehaving replier passing a different CapId
+        // that happens to resolve to the same Reply object.
+        //
+        // Fall back to `reply_cap` when `waiter_cap_id` is not set (e.g. the
+        // receiver consumed the message via the legacy non-v2 recv path that
+        // does not populate this field, or the materialization path was not the
+        // direct-mint path).
+        let replier_cap_to_revoke = record.waiter_cap_id.unwrap_or(reply_cap);
         let replier_ok = if let Some(replier_cnode) = self.current_task_cnode() {
-            self.fast_revoke_reply_cap_in_cnode(replier_cnode, reply_cap, reply_object)
+            self.fast_revoke_reply_cap_in_cnode(replier_cnode, replier_cap_to_revoke, reply_object)
         } else {
             false
         };
         crate::yarm_log!(
-            "IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid={} replier_tid={} cap={} ok={}",
+            "IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid={} replier_tid={} cap={} waiter_cap={} expected={:?} ok={}",
             record.caller_tid.0,
             replier_tid.0,
             reply_cap.0,
+            replier_cap_to_revoke.0,
+            reply_object,
             replier_ok
         );
         if !replier_ok {
-            crate::yarm_log!(
-                "IPC_REPLY_FAST_REVOKE_FAIL reason=replier_cap_not_found_or_mismatch"
-            );
+            // If waiter_cap_id revoke failed, attempt with user-supplied reply_cap as
+            // a best-effort fallback (covers the case where waiter_cap_id wasn't set).
+            if record.waiter_cap_id.is_some() && replier_cap_to_revoke.0 != reply_cap.0 {
+                let fallback_ok = if let Some(replier_cnode) = self.current_task_cnode() {
+                    self.fast_revoke_reply_cap_in_cnode(replier_cnode, reply_cap, reply_object)
+                } else {
+                    false
+                };
+                if fallback_ok {
+                    crate::yarm_log!(
+                        "IPC_REPLY_FAST_REVOKE_FAIL reason=waiter_cap_mismatch_used_fallback_reply_cap ok={}",
+                        fallback_ok
+                    );
+                } else {
+                    crate::yarm_log!(
+                        "IPC_REPLY_FAST_REVOKE_FAIL reason=replier_cap_not_found_or_mismatch"
+                    );
+                }
+            } else {
+                crate::yarm_log!(
+                    "IPC_REPLY_FAST_REVOKE_FAIL reason=replier_cap_not_found_or_mismatch"
+                );
+            }
         }
 
         // Revoke the Reply cap that create_reply_cap_for_caller minted into the
@@ -507,9 +566,10 @@ impl KernelState {
                 false
             };
             crate::yarm_log!(
-                "IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid={} cap={} ok={}",
+                "IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid={} cap={} expected={:?} ok={}",
                 record.caller_tid.0,
                 record.caller_cap_id.0,
+                reply_object,
                 caller_ok
             );
             if !caller_ok {

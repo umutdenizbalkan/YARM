@@ -196,6 +196,15 @@ pub(crate) struct ReplyCapRecord {
     /// **replier's** context) can also revoke it from the caller's cnode, preventing
     /// cnode slot exhaustion on the caller side over many repeated IPC cycles.
     pub(crate) caller_cap_id: CapId,
+    /// CapId of the Reply cap that `complete_blocked_recv_for_waiter` (or the
+    /// immediate recv path) minted into the **waiter/replier's** cnode when the
+    /// FLAG_REPLY_CAP message was delivered.  Stored here so that `ipc_reply`
+    /// can fast-revoke the exact slot using a kernel-controlled CapId rather
+    /// than relying solely on the user-supplied reply_cap argument.
+    ///
+    /// `None` if materialization has not yet occurred (e.g. the message is still
+    /// queued in the endpoint buffer and the receiver has not yet called recv).
+    pub(crate) waiter_cap_id: Option<CapId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
