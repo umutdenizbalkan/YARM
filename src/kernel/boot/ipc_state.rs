@@ -404,6 +404,21 @@ impl KernelState {
             Ok::<_, KernelError>(rec)
         })?;
 
+        // Recycle the one-shot Reply cap slot in the replier's cnode.
+        //
+        // Without this, each call/reply cycle permanently occupies one of the 512
+        // cnode slots in the replier (e.g. initramfs_srv).  After ~255 cycles the
+        // cnode fills up: mint_capability_in_cnode returns CapabilityFull, which
+        // surfaces as IPC_RECV_BLOCKED_COMPLETE_FAILED and kills the VFS exec path.
+        //
+        // reply_cap is the CapId in *the current (replier) task's* cnode — exactly
+        // what revoke_capability_in_cnode needs.  Failures are silently ignored: the
+        // global record is already consumed so the reply has been irrevocably sent;
+        // the worst case is a leaked cnode slot, not a safety violation.
+        if let Some(replier_cnode) = self.current_task_cnode() {
+            let _ = self.revoke_capability_in_cnode(replier_cnode, reply_cap);
+        }
+
         let endpoint_idx = match self.resolve_endpoint_index(record.reply_endpoint) {
             Ok(idx) => idx,
             Err(err) => return Err(err),

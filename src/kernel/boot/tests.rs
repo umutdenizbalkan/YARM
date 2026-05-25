@@ -1193,6 +1193,16 @@ fn ipc_send_deadline_timeout_wakes_blocked_sender_on_timer_tick() {
 
 #[test]
 fn reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint() {
+    std::thread::Builder::new()
+        .name("reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint() {
     let mut state = Bootstrap::init().expect("init");
     let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
     let reply_cap = state
@@ -1208,10 +1218,13 @@ fn reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint() {
     assert_eq!(received.sender_tid.0, 9);
     assert_eq!(received.as_slice(), b"ok");
 
+    // After ipc_reply the Reply cap is revoked from the cnode (fix for
+    // reply-cap cnode exhaustion), so a replay attempt gets InvalidCapability
+    // rather than StaleCapability.
     let replay = Message::new(9, b"no").expect("replay");
     assert_eq!(
         state.ipc_reply(reply_cap, replay),
-        Err(KernelError::StaleCapability)
+        Err(KernelError::InvalidCapability)
     );
 }
 
@@ -1456,12 +1469,14 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
 
     // No duplicate reply queued.
     assert_eq!(state.ipc_recv(reply_recv_cap_t1).expect("follow-up recv"), None);
-    // One-shot reply cap consumption.
+    // One-shot reply cap consumption.  After ipc_reply the Reply cap is revoked
+    // from the replier's cnode (reply-cap cnode exhaustion fix), so a replay
+    // returns InvalidCapability instead of StaleCapability / WrongObject.
     let replay = Message::with_header(2, 0x44, 0, None, b"xx").expect("replay");
     assert!(
         matches!(
             state.ipc_reply(receiver_local_reply_cap, replay),
-            Err(KernelError::WrongObject | KernelError::StaleCapability)
+            Err(KernelError::WrongObject | KernelError::StaleCapability | KernelError::InvalidCapability)
         ),
         "reusing one-shot reply cap must fail"
     );
@@ -1624,6 +1639,72 @@ fn duplicated_stale_reply_cap_is_rejected_after_caller_restart() {
         ),
         "duplicated stale reply-cap should be rejected after caller restart"
     );
+}
+
+#[test]
+fn ipc_call_reply_cap_materialization_survives_more_than_255_cycles() {
+    std::thread::Builder::new()
+        .name("ipc_call_reply_cap_materialization_survives_more_than_255_cycles".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_call_reply_cap_materialization_survives_more_than_255_cycles)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_call_reply_cap_materialization_survives_more_than_255_cycles() {
+    // Regression test for IPC reply-cap cnode exhaustion.
+    //
+    // Bug (pre-fix): ipc_reply consumed the global ReplyCapRecord but never
+    // revoked the Reply cap from the replier's cnode.  Each call/reply cycle
+    // permanently occupied one of the 512 cnode slots.  After ~255 cycles the
+    // cnode filled: CapabilityFull → mint_capability_in_cnode fails →
+    // IPC_RECV_BLOCKED_COMPLETE_FAILED → VFS-backed exec of driver_manager dies.
+    //
+    // Fix: ipc_reply now revokes the Reply cap from current_task_cnode() after
+    // consuming the global record, recycling the slot for the next cycle.
+    //
+    // We run 350 cycles (well past the 255 threshold) and verify that every
+    // create_reply_cap_for_caller + ipc_reply + ipc_recv round trip succeeds,
+    // and that the cnode still has room for new caps afterwards.
+    const CYCLES: usize = 350;
+
+    let mut state = Bootstrap::init().expect("init");
+
+    // Single endpoint: reply-route for create_reply_cap_for_caller and delivery
+    // channel for ipc_reply.  Depth=1 is sufficient because we drain it each
+    // cycle before the next iteration.
+    let (_eid, _send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+
+    for cycle in 0..CYCLES {
+        // Simulate materialize_received_message_cap: server mints a Reply cap into
+        // the current task's cnode on behalf of caller task 0.
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .unwrap_or_else(|err| {
+                panic!("create_reply_cap_for_caller failed at cycle {cycle}: {err:?}")
+            });
+
+        // Simulate server dispatching ipc_reply.  With the fix this also revokes
+        // the Reply cap from the cnode, recycling the slot.
+        let msg = Message::new(0, b"ok").expect("reply msg");
+        state.ipc_reply(reply_cap, msg).unwrap_or_else(|err| {
+            panic!("ipc_reply failed at cycle {cycle}: {err:?}")
+        });
+
+        // Drain the message so the endpoint does not back up.
+        let received = state
+            .ipc_recv(recv_cap)
+            .expect("recv ok")
+            .expect("message expected");
+        assert_eq!(received.as_slice(), b"ok", "wrong payload at cycle {cycle}");
+    }
+
+    // If cnode slots leaked, all 512 would be occupied and create_endpoint
+    // (which mints 2 caps) would fail with CapabilityFull / TaskMissing.
+    state
+        .create_endpoint(1)
+        .expect("new endpoint after all cycles: cnode slot leak detected");
 }
 
 #[test]
