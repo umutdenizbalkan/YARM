@@ -206,6 +206,39 @@ impl KernelState {
         Ok(minted)
     }
 
+    /// Narrow, no-alloc helper for recycling a one-shot Reply cap slot.
+    ///
+    /// Removes exactly one cap slot from `cnode` if and only if that slot
+    /// currently contains `expected_object` referenced by `cap` (generation
+    /// and index both match the CapId encoding).
+    ///
+    /// Unlike `revoke_capability_in_cnode` this:
+    /// - performs **no heap allocation**
+    /// - does not traverse delegation trees
+    /// - clears the cnode slot and bumps its generation to invalidate stale CapIds
+    /// - does not adjust memory-object refcounts (Reply caps have none)
+    /// - does not remove delegation links (Reply caps are never delegated)
+    ///
+    /// Returns `true` if the slot was cleared, `false` otherwise.
+    /// Callers must treat `false` as a diagnostic indication only — a `false`
+    /// result must never prevent or undo an already-delivered reply.
+    pub(crate) fn fast_revoke_reply_cap_in_cnode(
+        &mut self,
+        cnode: CNodeId,
+        cap: CapId,
+        expected_object: CapObject,
+    ) -> bool {
+        self.with_capability_state_mut(|capability_state| {
+            capability_state
+                .cnode_spaces
+                .iter_mut()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .map(|space| kernel_mut(&mut space.cspace).fast_revoke_reply_slot(cap, expected_object))
+                .unwrap_or(false)
+        })
+    }
+
     pub(crate) fn revoke_capability_in_cnode(
         &mut self,
         cnode: CNodeId,
