@@ -1432,6 +1432,19 @@ unsafe fn pm_vfs_spawn_inline(
         yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err=empty-elf", image_id);
         return Err(ProcessManagerError::Malformed);
     }
+    // Verify ELF magic before attempting spawn.
+    if image.len() < 4 || &image[..4] != b"\x7fELF" {
+        let first4_end = core::cmp::min(image.len(), 4);
+        yarm_user_rt::user_log!(
+            "PM_VFS_SPAWN_FAIL image_id={} err=bad-elf-magic first4={:x?}",
+            image_id, &image[..first4_end]
+        );
+        return Err(ProcessManagerError::Malformed);
+    }
+    yarm_user_rt::user_log!(
+        "PM_VFS_SPAWN_FROM_VFS_BYTES image_id={} len={} first4={:x?}",
+        image_id, image.len(), &image[..4]
+    );
     let result = unsafe {
         yarm_user_rt::syscall::spawn_process_from_user_buf(
             image_id,
@@ -1573,23 +1586,75 @@ unsafe fn pm_read_all_via_vfs(
     let open_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &open_msg) }?;
     let fd = decode_u64(open_reply.as_slice()).ok_or(ProcessManagerError::Malformed)?;
     let mut out = Vec::with_capacity(file_len);
-    let mut eof = false;
-    while !eof && out.len() < file_len {
+    // READ loop: accumulate file_len bytes in chunks.  Each iteration must make
+    // forward progress; zero-length reads before reaching file_len are treated
+    // as a fatal protocol error (premature EOF or format mismatch).
+    while out.len() < file_len {
+        let prev_len = out.len();
         let to_read = core::cmp::min(512usize, file_len - out.len());
         let read_msg = build_read_message(fd, to_read).map_err(|_| ProcessManagerError::Malformed)?;
         yarm_user_rt::user_log!("PM_VFS_CALL op=READ fd={} len={}", fd, to_read);
         let read_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &read_msg) }?;
         let payload = read_reply.as_slice();
+
+        {
+            let preview_len = core::cmp::min(payload.len(), 16);
+            yarm_user_rt::user_log!(
+                "PM_VFS_READ_REPLY_RAW fd={} requested={} len={} first16={:x?}",
+                fd, to_read, payload.len(), &payload[..preview_len]
+            );
+        }
+
         let read_len = decode_u64(payload).ok_or(ProcessManagerError::Malformed)? as usize;
+
+        if read_len == 0 {
+            // Premature EOF: backend signalled zero bytes before file_len reached.
+            yarm_user_rt::user_log!(
+                "PM_VFS_READ_EOF total={} expected={}",
+                out.len(), file_len
+            );
+            yarm_user_rt::user_log!(
+                "PM_VFS_READ_NO_PROGRESS fd={} total={} expected={} reason=premature_eof",
+                fd, out.len(), file_len
+            );
+            let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+            let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+            return Err(ProcessManagerError::Malformed);
+        }
+
         let inline = payload.get(16..).unwrap_or(&[]);
         let copy_len = core::cmp::min(read_len, inline.len());
         if copy_len > 0 {
+            let first4_end = core::cmp::min(copy_len, 4);
+            let first4 = &inline[..first4_end];
             out.extend_from_slice(&inline[..copy_len]);
+            yarm_user_rt::user_log!(
+                "PM_VFS_READ_APPEND bytes={} total={} expected={} first4={:x?}",
+                copy_len, out.len(), file_len, first4
+            );
         }
-        if read_len == 0 || copy_len == 0 {
-            eof = true;
+
+        if out.len() == prev_len {
+            // Got a positive read_len but no inline bytes — format mismatch or
+            // placeholder backend.  No progress means we can never complete.
+            yarm_user_rt::user_log!(
+                "PM_VFS_READ_NO_PROGRESS fd={} total={} expected={} read_len={} inline_len={}",
+                fd, prev_len, file_len, read_len, inline.len()
+            );
+            let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+            let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+            return Err(ProcessManagerError::Malformed);
         }
     }
+
+    {
+        let first4_end = core::cmp::min(out.len(), 4);
+        yarm_user_rt::user_log!(
+            "PM_VFS_READ_DONE total={} first4={:x?}",
+            out.len(), &out[..first4_end]
+        );
+    }
+
     let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
     yarm_user_rt::user_log!("PM_VFS_CALL op=CLOSE fd={}", fd);
     let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
@@ -2398,5 +2463,94 @@ mod tests {
             pm_service_send_cap: 0,
             state: ServiceState::Spawned,
         }));
+    }
+
+    // ── pm_read_all_via_vfs unit tests (mock-based) ──────────────────────────
+
+    /// Simulate the READ loop logic from pm_read_all_via_vfs with a mock VFS
+    /// backend that returns pre-built reply payloads.  Each payload must match
+    /// the extended inline format: [read_len u64 LE][status u64 LE][bytes...].
+    /// Returns `Err` on premature EOF or no-progress, matching production logic.
+    fn mock_read_all(file_len: usize, replies: &[Vec<u8>]) -> Result<Vec<u8>, &'static str> {
+        let mut out: Vec<u8> = Vec::with_capacity(file_len);
+        let mut call_idx = 0usize;
+        while out.len() < file_len {
+            let prev_len = out.len();
+            if call_idx >= replies.len() {
+                return Err("no more replies");
+            }
+            let payload = &replies[call_idx];
+            call_idx += 1;
+            if payload.len() < 8 {
+                return Err("short payload");
+            }
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&payload[..8]);
+            let read_len = u64::from_le_bytes(b) as usize;
+            if read_len == 0 {
+                // Premature EOF
+                return Err("premature_eof");
+            }
+            let inline = payload.get(16..).unwrap_or(&[]);
+            let copy_len = core::cmp::min(read_len, inline.len());
+            if copy_len > 0 {
+                out.extend_from_slice(&inline[..copy_len]);
+            }
+            if out.len() == prev_len {
+                return Err("no_progress");
+            }
+        }
+        Ok(out)
+    }
+
+    fn make_extended_reply(data: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(16 + data.len());
+        payload.extend_from_slice(&(data.len() as u64).to_le_bytes()); // read_len
+        payload.extend_from_slice(&0u64.to_le_bytes());                 // status
+        payload.extend_from_slice(data);
+        payload
+    }
+
+    fn make_count_only_reply(count: u64) -> Vec<u8> {
+        count.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn pm_read_all_via_vfs_premature_eof_returns_error() {
+        // Backend signals EOF (read_len=0) before reaching file_len.
+        let replies = vec![make_count_only_reply(0)];
+        let err = mock_read_all(100, &replies).expect_err("should fail");
+        assert_eq!(err, "premature_eof");
+    }
+
+    #[test]
+    fn pm_read_all_via_vfs_no_inline_bytes_returns_no_progress_error() {
+        // Backend returns a positive read_len but no inline bytes (count-only
+        // 8-byte reply).  This is the placeholder-mode format which cannot
+        // deliver actual file bytes; the loop must detect no progress and fail.
+        let replies = vec![make_count_only_reply(50)];
+        let err = mock_read_all(100, &replies).expect_err("should fail on no progress");
+        assert_eq!(err, "no_progress");
+    }
+
+    #[test]
+    fn pm_read_all_via_vfs_multi_chunk_accumulates_correctly() {
+        // Two READ replies accumulate to file_len.
+        let chunk1: Vec<u8> = (0u8..20).collect();
+        let chunk2: Vec<u8> = (20u8..30).collect();
+        let replies = vec![make_extended_reply(&chunk1), make_extended_reply(&chunk2)];
+        let result = mock_read_all(30, &replies).expect("should succeed");
+        assert_eq!(result.len(), 30);
+        assert_eq!(&result[..20], chunk1.as_slice());
+        assert_eq!(&result[20..], chunk2.as_slice());
+    }
+
+    #[test]
+    fn pm_read_all_via_vfs_single_chunk_exact_fit() {
+        // Single READ reply exactly covers file_len.
+        let data: Vec<u8> = (0u8..112).collect();
+        let replies = vec![make_extended_reply(&data)];
+        let result = mock_read_all(112, &replies).expect("should succeed");
+        assert_eq!(result, data);
     }
 }

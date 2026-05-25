@@ -6,6 +6,7 @@ use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
     ReadWriteRequest, openat_inline_message, read_message, statx_inline_message, write_message,
 };
+use yarm_ipc_abi::vfs_abi::{ReadWriteArgs, VFS_OP_READ};
 use super::super::common::service::FsService;
 use yarm_srv_common::cpio::CpioArchive;
 use yarm_srv_common::service_loop::run_typed_request_loop;
@@ -184,6 +185,15 @@ pub fn run() {
                         "INITRAMFS_SRV_GOT_MSG opcode={} reply_cap={}",
                         msg.opcode, reply_cap
                     );
+                    if msg.opcode == VFS_OP_READ {
+                        let payload = msg.as_slice();
+                        if let Ok(args) = ReadWriteArgs::decode(payload) {
+                            yarm_user_rt::user_log!(
+                                "INITRAMFS_READ fd={} requested={}",
+                                args.fd, args.len
+                            );
+                        }
+                    }
                     let response = svc.handle(msg).unwrap_or_else(|_| {
                         yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg")
                     });
