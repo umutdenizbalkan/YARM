@@ -34,8 +34,11 @@ pub const SYSCALL_DEBUG_LOG_NR: usize = 15;
 pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
 pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
 pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
-pub const SYSCALL_COUNT: usize = 27;
-const _: [(); SYSCALL_COUNT] = [(); 27];
+/// Phase 2 bulk-copy bridge: reads a named CPIO file chunk into caller's user buffer.
+/// TEMPORARY stepping stone — replace with page-cap zero-copy in Phase 3.
+pub const SYSCALL_INITRAMFS_READ_CHUNK_NR: usize = 27;
+pub const SYSCALL_COUNT: usize = 28;
+const _: [(); SYSCALL_COUNT] = [(); 28];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -86,10 +89,12 @@ pub enum Syscall {
     SpawnProcess = SYSCALL_SPAWN_PROCESS_NR,
     SpawnProcessFromUserBuf = SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR,
     SpawnFromInitramfsFile = SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR,
+    /// Phase 2 bulk-copy bridge. TEMPORARY — replace with page-cap in Phase 3.
+    InitramfsReadChunk = SYSCALL_INITRAMFS_READ_CHUNK_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 19;
+    pub const VARIANT_COUNT: usize = 20;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -115,6 +120,7 @@ impl Syscall {
             SYSCALL_SPAWN_PROCESS_NR => Ok(Self::SpawnProcess),
             SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR => Ok(Self::SpawnProcessFromUserBuf),
             SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR => Ok(Self::SpawnFromInitramfsFile),
+            SYSCALL_INITRAMFS_READ_CHUNK_NR => Ok(Self::InitramfsReadChunk),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -2273,6 +2279,95 @@ fn copy_spawn_startup_args(
     Ok(out)
 }
 
+/// Phase 2 bulk-copy bridge: reads up to 4096 bytes from a named initramfs CPIO
+/// file at the given byte offset into the caller's user buffer.
+///
+/// TEMPORARY stepping stone for Phase 2. Replace with page-cap zero-copy in Phase 3.
+///
+/// syscall nr=27 args:
+///   arg0 = name_ptr    (user VA of file name bytes, no leading slash required)
+///   arg1 = name_len    (1..=128)
+///   arg2 = offset      (byte offset into file)
+///   arg3 = dst_ptr     (user VA of caller's destination buffer)
+///   arg4 = max_len     (max bytes to copy; clamped to 4096)
+///
+/// Returns: ret0=0 (status OK), ret1=bytes_copied (0 if EOF or not found)
+fn handle_initramfs_read_chunk(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    let name_ptr = frame.arg(0);
+    let name_len = frame.arg(1);
+    let offset   = frame.arg(2) as u64;
+    let dst_ptr  = frame.arg(3);
+    let max_len  = core::cmp::min(frame.arg(4), 4096);
+
+    if name_len == 0 || name_len > 128 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if dst_ptr == 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    let name_buf = kernel
+        .copy_from_current_user(name_ptr, name_len)
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    let raw_name = core::str::from_utf8(&name_buf[..name_len])
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    // Accept both "sbin/driver_manager" and "/sbin/driver_manager" and
+    // "/initramfs/sbin/driver_manager" — strip leading slashes and optional
+    // "/initramfs/" prefix so callers can reuse VFS path strings.
+    let name = raw_name.trim_start_matches('/');
+    let name = name.strip_prefix("initramfs/").unwrap_or(name);
+    let name = name.trim_start_matches('/');
+
+    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()
+        .ok_or(SyscallError::InvalidArgs)?;
+    let entry = CpioArchive::new(initrd)
+        .find(name)
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    let data = match entry {
+        Some(e) => e.file_data(),
+        None => {
+            // File not found — return 0 bytes, not an error, so PM can detect
+            // and log gracefully rather than panic.
+            crate::yarm_log!(
+                "INITRAMFS_READ_CHUNK_NOT_FOUND name={} offset={} max_len={}",
+                name, offset, max_len
+            );
+            frame.set_ok(0, 0, 0);
+            return Ok(());
+        }
+    };
+
+    let offset_usize = offset as usize;
+    if offset_usize >= data.len() {
+        // EOF — return 0 bytes normally.
+        crate::yarm_log!(
+            "INITRAMFS_READ_CHUNK_EOF name={} offset={} file_len={}",
+            name, offset, data.len()
+        );
+        frame.set_ok(0, 0, 0);
+        return Ok(());
+    }
+
+    let available = data.len() - offset_usize;
+    let to_copy = core::cmp::min(available, max_len);
+
+    crate::yarm_log!(
+        "INITRAMFS_READ_CHUNK name={} offset={} to_copy={} file_len={}",
+        name, offset, to_copy, data.len()
+    );
+
+    validate_user_region(dst_ptr as u64, to_copy as u64)?;
+    kernel
+        .copy_to_current_user_from_slice(dst_ptr, &data[offset_usize..offset_usize + to_copy])
+        .map_err(SyscallError::from)?;
+
+    frame.set_ok(0, to_copy, 0);
+    Ok(())
+}
+
 fn handle_vm_anon_map(
     _kernel: &mut KernelState,
     _frame: &mut TrapFrame,
@@ -2391,6 +2486,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::SpawnProcess => handle_spawn_process(kernel, frame),
         Syscall::SpawnProcessFromUserBuf => handle_spawn_process_from_user_buf(kernel, frame),
         Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame),
+        Syscall::InitramfsReadChunk => handle_initramfs_read_chunk(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
@@ -2546,7 +2642,8 @@ mod tests {
         assert_eq!(SYSCALL_VM_ANON_MAP_NR, 13);
         assert_eq!(SYSCALL_VM_BRK_NR, 14);
         assert_eq!(SYSCALL_SPAWN_PROCESS_NR, 23);
-        assert_eq!(SYSCALL_COUNT, 27);
+        assert_eq!(SYSCALL_INITRAMFS_READ_CHUNK_NR, 27);
+        assert_eq!(SYSCALL_COUNT, 28);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 

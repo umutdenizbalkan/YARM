@@ -59,6 +59,10 @@ pub const VFS_OP_EPOLL_CTL: u16 = 19;
 pub const VFS_OP_EPOLL_PWAIT: u16 = 20;
 pub const VFS_OP_SENDFILE: u16 = 21;
 pub const VFS_OP_MOUNT_REGISTER: u16 = 23;
+/// Phase 2 bulk read opcode (4 KiB per IPC round trip via kernel-mediated copy bridge).
+/// VFS router routes this via fd-table lookup, same as VFS_OP_READ.
+/// Phase 3 will replace the kernel-mediated copy with page-cap zero-copy.
+pub const VFS_OP_READ_BULK: u16 = 24;
 pub const VFS_OPENAT_INLINE_PATH_MAX: usize = 96;
 pub const VFS_OPENAT_INLINE_PATH_HEADER_BYTES: usize = 25;
 pub const VFS_OPENAT_INLINE_PATH_MAX_BYTES: usize =
@@ -265,6 +269,75 @@ impl ReadWriteArgs {
     }
 }
 
+
+/// Wire format for VFS_OP_READ_BULK requests (fits in 32 bytes).
+///
+/// Layout (32 bytes, LE):
+/// ```text
+/// offset  size  field
+///      0     8  fd              file descriptor
+///      8     8  requested_len   bytes to read (≤4096)
+///     16     8  offset          byte offset in file (0 = use fd cursor)
+///     24     8  reserved        must be 0
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkReadArgs {
+    pub fd: u64,
+    pub requested_len: u64,
+    pub offset: u64,
+}
+
+impl BulkReadArgs {
+    pub const fn new(fd: u64, requested_len: u64, offset: u64) -> Self {
+        Self { fd, requested_len, offset }
+    }
+
+    pub const fn encode(self) -> [u8; VfsV1Args::ENCODED_LEN] {
+        VfsV1Args::new(self.fd, self.requested_len, self.offset, 0).encode()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, VfsCodecError> {
+        let args = VfsV1Args::decode(payload)?;
+        Ok(Self::new(args.arg0, args.arg1, args.arg2))
+    }
+}
+
+/// Reply payload for VFS_OP_READ_BULK (12 bytes).
+///
+/// Layout:
+/// ```text
+/// offset  size  field
+///      0     8  copied_len  bytes actually copied into caller's buffer
+///      8     1  eof         1 = end of file reached, 0 = more data available
+///      9     3  pad         reserved, zero
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkReadReply {
+    pub copied_len: u64,
+    pub eof: bool,
+}
+
+impl BulkReadReply {
+    pub const ENCODED_LEN: usize = 12;
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0..8].copy_from_slice(&self.copied_len.to_le_bytes());
+        out[8] = if self.eof { 1 } else { 0 };
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() < Self::ENCODED_LEN {
+            return None;
+        }
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&payload[0..8]);
+        let copied_len = u64::from_le_bytes(b);
+        let eof = payload[8] != 0;
+        Some(Self { copied_len, eof })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfsV1Args {
@@ -577,6 +650,58 @@ mod tests {
         ] {
             assert_ne!(code, VFS_STATUS_OK, "error code {code} must not equal OK");
         }
+    }
+
+    // ── BulkReadArgs / BulkReadReply tests ───────────────────────────────────
+
+    #[test]
+    fn bulk_read_args_roundtrip() {
+        let args = BulkReadArgs::new(7, 4096, 0);
+        let enc = args.encode();
+        let dec = BulkReadArgs::decode(&enc).expect("decode");
+        assert_eq!(dec.fd, 7);
+        assert_eq!(dec.requested_len, 4096);
+        assert_eq!(dec.offset, 0);
+    }
+
+    #[test]
+    fn bulk_read_args_rejects_oversized_payload() {
+        // BulkReadArgs uses VfsV1Args::decode which requires exactly 32 bytes.
+        let short = [0u8; 16];
+        assert!(BulkReadArgs::decode(&short).is_err());
+    }
+
+    #[test]
+    fn bulk_read_reply_roundtrip() {
+        let r = BulkReadReply { copied_len: 4096, eof: false };
+        let enc = r.encode();
+        let dec = BulkReadReply::decode(&enc).expect("decode");
+        assert_eq!(dec.copied_len, 4096);
+        assert!(!dec.eof);
+    }
+
+    #[test]
+    fn bulk_read_reply_eof_roundtrip() {
+        let r = BulkReadReply { copied_len: 512, eof: true };
+        let enc = r.encode();
+        let dec = BulkReadReply::decode(&enc).expect("decode");
+        assert_eq!(dec.copied_len, 512);
+        assert!(dec.eof);
+    }
+
+    #[test]
+    fn bulk_read_reply_rejects_short_payload() {
+        assert!(BulkReadReply::decode(&[0u8; 11]).is_none());
+    }
+
+    #[test]
+    fn vfs_op_read_bulk_constant_is_distinct() {
+        assert_ne!(VFS_OP_READ_BULK, VFS_OP_READ);
+        assert_ne!(VFS_OP_READ_BULK, VFS_OP_OPENAT);
+        assert_ne!(VFS_OP_READ_BULK, VFS_OP_CLOSE);
+        assert_ne!(VFS_OP_READ_BULK, VFS_OP_STATX);
+        assert_ne!(VFS_OP_READ_BULK, VFS_OP_MOUNT_REGISTER);
+        assert_eq!(VFS_OP_READ_BULK, 24);
     }
 
     #[test]

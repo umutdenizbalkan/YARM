@@ -56,6 +56,8 @@ pub mod syscall {
     pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
     pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
     pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
+    /// Phase 2 bulk-copy bridge. TEMPORARY — replace with page-cap in Phase 3.
+    pub const SYSCALL_INITRAMFS_READ_CHUNK_NR: usize = 27;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
     const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
@@ -614,6 +616,49 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
+    }
+
+    /// Read up to 4096 bytes from a named file in the boot initramfs CPIO at
+    /// the given byte offset into `dst`.
+    ///
+    /// Returns the number of bytes actually copied (may be less than `dst.len()`
+    /// at end-of-file).  Returns `Ok(0)` at EOF.
+    ///
+    /// # Phase 2 bulk-copy bridge
+    /// This is an **explicit temporary bridge** for Phase 2 chunked VFS reads.
+    /// It calls kernel syscall nr=27 which reads directly from the kernel's CPIO
+    /// and copies into the caller's buffer.  Replace with page-cap zero-copy in
+    /// Phase 3 once shared-memory primitives are available.
+    ///
+    /// # Safety
+    /// `dst` must be a valid writable slice in the caller's address space for
+    /// the duration of the syscall.
+    #[inline]
+    pub unsafe fn initramfs_read_chunk(
+        name: &[u8],
+        offset: u64,
+        dst: &mut [u8],
+    ) -> core::result::Result<usize, SyscallError> {
+        let max_len = core::cmp::min(dst.len(), 4096);
+        let args = [
+            name.as_ptr() as usize, // arg0 = name_ptr
+            name.len(),              // arg1 = name_len
+            offset as usize,         // arg2 = offset
+            dst.as_mut_ptr() as usize, // arg3 = dst_ptr
+            max_len,                 // arg4 = max_len
+            0,
+        ];
+        // SAFETY: Uses architecture syscall ABI; name and dst lifetimes cover the call.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_INITRAMFS_READ_CHUNK_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(ret.ret1)
     }
 
     #[inline]

@@ -334,7 +334,7 @@ fn route_for_test(
             let path = norm.as_bytes();
             mount_table.route(path).ok_or(VFS_STATUS_ERR_NO_MOUNT)
         }
-        VFS_OP_READ | VFS_OP_CLOSE => {
+        VFS_OP_READ | VFS_OP_CLOSE | yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK => {
             let args = ReadWriteArgs::decode(msg.as_slice()).map_err(|_| VFS_STATUS_ERR_CODEC)?;
             fd_table.lookup(args.fd, client_id).ok_or(VFS_STATUS_ERR_BAD_FD)
         }
@@ -504,6 +504,52 @@ mod service_level_tests {
 
         close_via_service_for_test(&mut fds, 3000, 13, &mut backend).expect("owner close");
         assert_eq!(backend.closes, 1);
+    }
+
+    #[test]
+    fn vfs_service_bulk_read_routes_via_fd_table() {
+        // VFS_OP_READ_BULK should route via fd table just like VFS_OP_READ.
+        use yarm_ipc_abi::vfs_abi::{BulkReadArgs, VFS_OP_READ_BULK};
+        let mounts = super::super::mount_table::VfsMountTable::new();
+        let mut fds = super::super::fd_table::VfsFdTable::new();
+        assert!(fds.insert(7, 11, "initramfs", 100));
+
+        // Build a VFS_OP_READ_BULK message using BulkReadArgs (32-byte payload).
+        let encoded = BulkReadArgs::new(7, 4096, 0).encode();
+        let bulk_msg = yarm_user_rt::ipc::Message::with_header(
+            100, // sender TID = client_id
+            VFS_OP_READ_BULK,
+            0,
+            None,
+            &encoded,
+        ).expect("bulk msg");
+
+        // Same client can route.
+        assert!(route_for_test(&mounts, &fds, &bulk_msg, 100).is_ok());
+        // Different client is rejected.
+        assert!(matches!(
+            route_for_test(&mounts, &fds, &bulk_msg, 200),
+            Err(VFS_STATUS_ERR_BAD_FD)
+        ));
+    }
+
+    #[test]
+    fn vfs_service_bulk_read_after_close_rejected() {
+        use yarm_ipc_abi::vfs_abi::{BulkReadArgs, VFS_OP_READ_BULK};
+        let mounts = super::super::mount_table::VfsMountTable::new();
+        let mut fds = super::super::fd_table::VfsFdTable::new();
+        assert!(fds.insert(9, 12, "initramfs", 300));
+        fds.remove(9, 300);
+
+        let encoded = BulkReadArgs::new(9, 4096, 0).encode();
+        let bulk_msg = yarm_user_rt::ipc::Message::with_header(
+            300, VFS_OP_READ_BULK, 0, None, &encoded,
+        ).expect("bulk msg");
+
+        assert!(matches!(
+            route_for_test(&mounts, &fds, &bulk_msg, 300),
+            Err(VFS_STATUS_ERR_BAD_FD)
+        ));
     }
 }
 
@@ -679,15 +725,22 @@ pub fn run() {
                         Err(VFS_STATUS_ERR_NO_MOUNT)
                     }
                 }
-                VFS_OP_READ | VFS_OP_CLOSE => {
+                VFS_OP_READ | VFS_OP_CLOSE | yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK => {
                     match ReadWriteArgs::decode(msg.as_slice()) {
                         Ok(args) => {
                             if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_id)
                             {
-                                yarm_user_rt::user_log!(
-                                    "VFS_ROUTE_FD_LOOKUP fd={} target={}",
-                                    args.fd, label.as_str()
-                                );
+                                if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
+                                    yarm_user_rt::user_log!(
+                                        "VFS_FORWARD_BULK_READ op={} fd={} target={}",
+                                        msg.opcode, args.fd, label.as_str()
+                                    );
+                                } else {
+                                    yarm_user_rt::user_log!(
+                                        "VFS_ROUTE_FD_LOOKUP fd={} target={}",
+                                        args.fd, label.as_str()
+                                    );
+                                }
                                 Ok((send_cap, label))
                             } else {
                                 yarm_user_rt::user_log!("VFS_ROUTE_BAD_FD fd={}", args.fd);
@@ -806,7 +859,14 @@ pub fn run() {
                         fd_table.remove(closed_fd, client_id);
                     }
                 }
-                yarm_user_rt::user_log!("VFS_ROUTE_REPLY op={} status=0 len={}", msg.opcode, response.len);
+                if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
+                    yarm_user_rt::user_log!(
+                        "VFS_ROUTE_BULK_REPLY op={} status=0 len={}",
+                        msg.opcode, response.len
+                    );
+                } else {
+                    yarm_user_rt::user_log!("VFS_ROUTE_REPLY op={} status=0 len={}", msg.opcode, response.len);
+                }
                 let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &response) };
             }
             Ok(None) => {

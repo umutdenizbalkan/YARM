@@ -204,10 +204,46 @@ pub fn run() {
                             );
                         }
                     }
-                    let response = svc.handle(msg).unwrap_or_else(|_| {
-                        yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg")
-                    });
-                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                    // Phase 3 readiness: log INITRAMFS_READ_BULK when VFS routes bulk reads here.
+                    // In Phase 2 the PM uses kernel syscall nr=27 directly, so this branch is
+                    // not exercised during normal boot. It will be activated in Phase 3 when
+                    // the bulk-read IPC path is wired through VFS.
+                    if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
+                        let payload = msg.as_slice();
+                        if let Ok(args) = yarm_ipc_abi::vfs_abi::BulkReadArgs::decode(payload) {
+                            yarm_user_rt::user_log!(
+                                "INITRAMFS_READ_BULK fd={} requested={}",
+                                args.fd, args.requested_len
+                            );
+                            // Phase 2 stub: PM uses kernel syscall nr=27 for data transfer.
+                            // Return status=unsupported so PM falls back to kernel direct path.
+                            let reply = yarm_ipc_abi::vfs_abi::BulkReadReply {
+                                copied_len: 0,
+                                eof: false,
+                            };
+                            let reply_bytes = reply.encode();
+                            let response = yarm_user_rt::ipc::Message::new(1, &reply_bytes)
+                                .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"));
+                            yarm_user_rt::user_log!(
+                                "INITRAMFS_READ_BULK_REPLY fd={} copied=0 eof=false phase=2_stub",
+                                args.fd
+                            );
+                            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                        } else {
+                            // Malformed payload
+                            let _ = unsafe {
+                                yarm_user_rt::syscall::ipc_reply(
+                                    reply_cap,
+                                    &yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"),
+                                )
+                            };
+                        }
+                    } else {
+                        let response = svc.handle(msg).unwrap_or_else(|_| {
+                            yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg")
+                        });
+                        let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                    }
                 }
                 _ => {
                     let _ = yarm_user_rt::syscall::yield_now();
