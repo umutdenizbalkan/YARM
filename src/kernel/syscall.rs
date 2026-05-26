@@ -1672,6 +1672,28 @@ fn handle_spawn_process(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
+    fn normalize_initrd_phys_ptr(raw_ptr: u64) -> Result<u64, SyscallError> {
+        let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
+        let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
+        if virt_base > phys_base && raw_ptr >= virt_base {
+            let off = raw_ptr
+                .checked_sub(virt_base)
+                .ok_or(SyscallError::Internal)?;
+            let phys = phys_base.checked_add(off).ok_or(SyscallError::Internal)?;
+            return Ok(phys);
+        }
+        if raw_ptr < virt_base || virt_base == phys_base {
+            return Ok(raw_ptr);
+        }
+        crate::yarm_log!(
+            "INITRAMFS_INITRD_ADDR_INVALID raw_ptr=0x{:x} virt_base=0x{:x} phys_base=0x{:x}",
+            raw_ptr,
+            virt_base,
+            phys_base
+        );
+        Err(SyscallError::InvalidArgs)
+    }
+
     let image_id = frame.arg(SYSCALL_ARG_CAP) as u64;
     let parent_pid = frame.arg(SYSCALL_ARG_PTR) as u64;
     let startup_args_ptr = frame.arg(SYSCALL_ARG_LEN);
@@ -1725,18 +1747,19 @@ fn handle_spawn_process(
     // This provides the CPIO data in userspace without syscall bridge.
     if image_id == INITRAMFS_IMAGE_ID {
         if let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() {
-            // `initrd.as_ptr()` is a kernel virtual address.  On x86_64 the
-            // kernel uses a high direct-map region at KERNEL_BOOTSTRAP_VIRT_BASE
-            // (0xFFFF_FF80_0000_0000), so `ptr = KERNEL_BOOTSTRAP_VIRT_BASE + phys`.
-            // Subtract the base to recover the physical address before installing
-            // it into the user page-table (which requires physical addresses).
-            // On AArch64 KERNEL_BOOTSTRAP_VIRT_BASE == KERNEL_BOOTSTRAP_PHYS_BASE
-            // so the subtraction is still correct (identity mapping → no-op).
             let initrd_virt_raw = initrd.as_ptr() as u64;
-            let initrd_phys_raw = initrd_virt_raw.wrapping_sub(
-                crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE
-            );
+            let initrd_phys_raw = normalize_initrd_phys_ptr(initrd_virt_raw)?;
             let initrd_len = initrd.len() as u64;
+            let mut first6 = [0u8; 6];
+            let first6_len = core::cmp::min(initrd.len(), first6.len());
+            first6[..first6_len].copy_from_slice(&initrd[..first6_len]);
+            crate::yarm_log!(
+                "INITRAMFS_INITRD_SOURCE_RANGE raw_ptr=0x{:x} phys_start=0x{:x} len={}",
+                initrd_virt_raw,
+                initrd_phys_raw,
+                initrd_len
+            );
+            crate::yarm_log!("INITRAMFS_INITRD_FIRST6 bytes={:?}", first6);
             let page: u64 = PAGE_SIZE as u64;
             let phys_start = initrd_phys_raw & !(page - 1);
             let phys_end = (initrd_phys_raw + initrd_len + page - 1) & !(page - 1);

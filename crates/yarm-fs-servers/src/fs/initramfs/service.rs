@@ -53,6 +53,16 @@ fn build_runtime_backend() -> (InitramfsBackend, InitramfsBackendSource, usize) 
                 .flatten()
                 .filter(|e| e.is_regular_file())
                 .count();
+            if entries == 0 {
+                let mut first6 = [0u8; 6];
+                let first6_len = core::cmp::min(cpio.len(), first6.len());
+                first6[..first6_len].copy_from_slice(&cpio[..first6_len]);
+                yarm_user_rt::user_log!(
+                    "INITRAMFS_CPIO_EMPTY len={} first6={:?}",
+                    cpio.len(),
+                    first6
+                );
+            }
             return (
                 InitramfsBackend::from_cpio_newc_static(cpio),
                 InitramfsBackendSource::Cpio,
