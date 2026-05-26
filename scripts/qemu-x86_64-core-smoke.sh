@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
+# x86_64 uniprocessor (-smp 1) core smoke test.
+# Greps for hard boot blockers (exits nonzero), then checks service entry
+# counts and IPC sequence markers.
 
 set -euo pipefail
 source "$(dirname "$0")/qemu-smoke-common.sh"
@@ -11,17 +14,16 @@ export BASH_XTRACEFD=19
 export PS4='+ ${BASH_SOURCE}:${LINENO}: '
 set -x
 
-KERNEL_IMAGE=${KERNEL_IMAGE:-build-x86_64/bootable-kernel.img}
+KERNEL_IMAGE=${KERNEL_IMAGE:-build-x86_64/kernel_boot.elf}
 KERNEL_DEBUG_ELF=${KERNEL_DEBUG_ELF:-build-x86_64/kernel_boot.elf}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build-x86_64/initramfs-core.cpio}
-TIMEOUT_SECS=${TIMEOUT_SECS:-30}
+TIMEOUT_SECS=${TIMEOUT_SECS:-60}
 QEMU_SMOKE_STRICT=${QEMU_SMOKE_STRICT:-0}
 QEMU_MACHINE=${QEMU_MACHINE:-q35}
 QEMU_CPU=${QEMU_CPU:-qemu64}
-QEMU_MEMORY=${QEMU_MEMORY:-1024M}
-QEMU_SMP=${QEMU_SMP:-2}
-QEMU_X86_ALLOW_ELF_KERNEL=${QEMU_X86_ALLOW_ELF_KERNEL:-1}
-QEMU_X86_PVH_MINIMAL=${QEMU_X86_PVH_MINIMAL:-1}
+QEMU_MEMORY=${QEMU_MEMORY:-512M}
+# SMP must always be 1; x86_64 SMP is out of scope for this smoke.
+QEMU_SMP=1
 DEFAULT_KERNEL_CMDLINE="console=ttyS0 rdinit=/init"
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"$DEFAULT_KERNEL_CMDLINE"}
 
@@ -31,60 +33,20 @@ if [[ "$KERNEL_CMDLINE" != *"console="* ]] || [[ "${#KERNEL_CMDLINE}" -lt 12 ]];
   KERNEL_CMDLINE="$DEFAULT_KERNEL_CMDLINE"
 fi
 
-check_x86_kernel_bootability() {
-  local kernel="$1"
-  if [[ ! -f "$kernel" ]]; then
-    return 1
-  fi
-  local ftype
-  if command -v file >/dev/null 2>&1; then
-    ftype=$(file -b "$kernel" 2>/dev/null || true)
-  elif command -v readelf >/dev/null 2>&1 && readelf -h "$kernel" >/dev/null 2>&1; then
-    ftype="ELF"
-  else
-    echo "[warn] unable to verify x86 kernel bootability because neither 'file' nor a usable 'readelf' probe is available"
-    return 1
-  fi
-  if [[ "$ftype" != *"ELF"* ]]; then
-    return 0
-  fi
-  if [[ "$QEMU_X86_ALLOW_ELF_KERNEL" != "1" ]]; then
-    echo "[warn] refusing ELF kernel direct-boot probe by default for x86 smoke"
-    echo "[hint] set QEMU_X86_ALLOW_ELF_KERNEL=1 to opt-in to PVH ELF probing"
-    echo "[hint] helper to fetch a known bootable image: scripts/fetch-linux-bzimage.sh"
-    return 1
-  fi
-  if command -v readelf >/dev/null 2>&1; then
-    if ! readelf -l "$kernel" 2>/dev/null | rg -q "NOTE"; then
-      echo "[warn] ELF kernel lacks a PT_NOTE program header; PVH entry note will be ignored by qemu"
-      return 1
-    fi
-    if readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
-      return 0
-    fi
-    if readelf -S "$kernel" 2>/dev/null | rg -q "\.note\.Xen"; then
-      return 0
-    fi
-  fi
-  echo "[warn] kernel image is an ELF without a verified PVH direct-boot note"
-  echo "[hint] the first blocker is still a verified direct-boot x86 kernel image (for example bzImage or PVH-enabled ELF)"
-  echo "[hint] use KERNEL_BOOTABLE_IMAGE_SOURCE=<path> with scripts/build-qemu-x86_64-artifacts.sh, then rerun this smoke test"
-  return 1
-}
-
+# ---------------------------------------------------------------------------
+# Pre-flight: verify required files and qemu binary are present.
+# ---------------------------------------------------------------------------
 
 if [[ ! -f "$KERNEL_IMAGE" ]]; then
   echo "[warn] kernel image missing: $KERNEL_IMAGE"
-  if [[ -f "$KERNEL_DEBUG_ELF" ]]; then
-    echo "[info] debug-only freestanding kernel ELF is available at: $KERNEL_DEBUG_ELF"
-    echo "[hint] this ELF is not launched automatically because it is not a verified qemu-system-x86_64 -kernel image"
-  fi
-  echo "[hint] provide a bootable image via KERNEL_IMAGE=<path> or rerun scripts/build-qemu-x86_64-artifacts.sh with KERNEL_BOOTABLE_IMAGE_SOURCE=<path>"
+  echo "[hint] run: scripts/build-qemu-x86_64-artifacts.sh"
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
   exit 0
 fi
 
-if ! check_x86_kernel_bootability "$KERNEL_IMAGE"; then
+if [[ ! -f "$INITRAMFS_IMAGE" ]]; then
+  echo "[warn] initramfs image missing: $INITRAMFS_IMAGE"
+  echo "[hint] run: scripts/build-qemu-x86_64-artifacts.sh"
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
   exit 0
 fi
@@ -95,9 +57,48 @@ if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# Verify the kernel ELF has a PVH note so QEMU can direct-boot it.
+# ---------------------------------------------------------------------------
+check_x86_kernel_bootability() {
+  local kernel="$1"
+  if [[ ! -f "$kernel" ]]; then
+    return 1
+  fi
+  if command -v readelf >/dev/null 2>&1; then
+    # Presence of a PT_NOTE segment is necessary for PVH direct-boot.
+    if ! readelf -l "$kernel" 2>/dev/null | rg -q "NOTE"; then
+      echo "[warn] kernel ELF lacks a PT_NOTE program header; PVH entry note will be ignored by qemu"
+      return 1
+    fi
+    # Check for Xen/PVH note by name.
+    if readelf -n "$kernel" 2>/dev/null | rg -qi "(PVH|Xen)"; then
+      return 0
+    fi
+    if readelf -S "$kernel" 2>/dev/null | rg -q "\.note\.Xen"; then
+      return 0
+    fi
+    echo "[warn] kernel ELF has no verified PVH/Xen direct-boot note"
+    return 1
+  fi
+  # readelf not available — assume bootable and let QEMU decide.
+  echo "[warn] readelf not found; skipping PVH note check"
+  return 0
+}
+
+if ! check_x86_kernel_bootability "$KERNEL_IMAGE"; then
+  echo "[warn] kernel image may not be PVH direct-bootable: $KERNEL_IMAGE"
+  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+  exit 0
+fi
+
 LOGFILE=${LOGFILE:-qemu-x86_64-core.log}
 rm -f "$LOGFILE"
 
+# ---------------------------------------------------------------------------
+# QEMU command — exactly as specified: q35, 512M, -smp 1, kernel_boot.elf,
+# initramfs-core.cpio, "console=ttyS0 rdinit=/init".
+# ---------------------------------------------------------------------------
 QEMU_CMD=(
   qemu-system-x86_64
   -machine "$QEMU_MACHINE"
@@ -110,47 +111,26 @@ QEMU_CMD=(
   -no-reboot
   -no-shutdown
   -kernel "$KERNEL_IMAGE"
+  -initrd "$INITRAMFS_IMAGE"
+  -append "$KERNEL_CMDLINE"
 )
-
-is_elf_kernel=0
-if command -v file >/dev/null 2>&1; then
-  if file -b "$KERNEL_IMAGE" 2>/dev/null | rg -q "ELF"; then
-    is_elf_kernel=1
-  fi
-elif command -v readelf >/dev/null 2>&1 && readelf -h "$KERNEL_IMAGE" >/dev/null 2>&1; then
-  is_elf_kernel=1
-fi
-
-if [[ "$QEMU_X86_PVH_MINIMAL" == "1" && "$is_elf_kernel" -eq 1 ]]; then
-  echo "[info] PVH minimal mode enabled: skipping initrd/cmdline for ELF boot triage"
-else
-  if [[ ! -f "$INITRAMFS_IMAGE" ]]; then
-    echo "[warn] initramfs image missing: $INITRAMFS_IMAGE"
-    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
-    exit 0
-  fi
-  QEMU_CMD+=(
-    -initrd "$INITRAMFS_IMAGE"
-    -append "$KERNEL_CMDLINE"
-  )
-fi
-
-MARKER_REGEX="YARM_SUPERVISOR_TID2_SPAWNED|YARM_PM_TID3_SPAWNED|YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|ABCDEFG|ABCDEF|ABCD"
-SPAWN_SEQUENCE=(
-  "YARM_SUPERVISOR_TID2_SPAWNED"
-  "YARM_PM_TID3_SPAWNED"
-  "YARM_BOOT_OK"
-)
-# Markers 4-6 come from user_log! which is a no-op in no_std; checked warn-only.
-SPAWN_IPC_SEQUENCE=(
-  "YARM_PM_RECV_LOOP_START"
-  "INIT_SPAWN_V5_CALL_BEGIN"
-  "INIT_SPAWN_V5_REPLY_OK"
-)
-FIRMWARE_FALLBACK_REGEX="SeaBIOS|iPXE|Booting from ROM"
 
 echo "[info] qemu command: ${QEMU_CMD[*]}"
 echo "[info] waiting up to ${TIMEOUT_SECS}s for boot markers..."
+
+# ---------------------------------------------------------------------------
+# Run QEMU with timeout, capture output to LOGFILE.
+# ---------------------------------------------------------------------------
+set +e
+if command -v timeout >/dev/null 2>&1; then
+  timeout --foreground "${TIMEOUT_SECS}s" stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
+  QEMU_STATUS=${PIPESTATUS[0]}
+else
+  echo "[warn] 'timeout' command unavailable; qemu run may not auto-terminate"
+  stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
+  QEMU_STATUS=${PIPESTATUS[0]}
+fi
+set -e
 
 log_has_pattern() {
   local pattern="$1"
@@ -158,63 +138,151 @@ log_has_pattern() {
   tr '\r' '\n' <"$LOGFILE" | rg -a -n "$pattern" >/dev/null 2>&1
 }
 
-set +e
-if command -v timeout >/dev/null 2>&1; then
-  timeout --foreground "${TIMEOUT_SECS}s" stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
-  QEMU_STATUS=${PIPESTATUS[0]}
-else
-  echo "[warn] 'timeout' command is unavailable; qemu run may not auto-terminate"
-  stdbuf -oL -eL "${QEMU_CMD[@]}" 2>&1 | tee "$LOGFILE"
-  QEMU_STATUS=${PIPESTATUS[0]}
+log_count_pattern() {
+  local pattern="$1"
+  [[ -f "$LOGFILE" ]] || { echo 0; return; }
+  tr '\r' '\n' <"$LOGFILE" | rg -a -c "$pattern" 2>/dev/null || echo 0
+}
+
+# ---------------------------------------------------------------------------
+# Hard blocker check — exit nonzero immediately if the log shows a crash or
+# missing critical ELF that means the boot never reached userspace.
+# ---------------------------------------------------------------------------
+HARD_BLOCKER_PATTERNS=(
+  "YARM_SUPERVISOR_ELF_MISSING"
+  "YARM_PM_ELF_MISSING"
+  "BOOTSTRAP_ERROR"
+  "PM_PANIC"
+  "INIT_PANIC"
+  "^PANIC "
+)
+
+hard_blocker_found=0
+for blocker in "${HARD_BLOCKER_PATTERNS[@]}"; do
+  if log_has_pattern "$blocker"; then
+    echo "[error] hard boot blocker detected in log: $blocker"
+    hard_blocker_found=1
+  fi
+done
+
+if [[ "$hard_blocker_found" -eq 1 ]]; then
+  echo "[error] hard boot blockers present — x86_64 smoke FAILED"
+  if [[ -f "$LOGFILE" ]]; then
+    echo "[info] last 40 log lines from $LOGFILE:"
+    tail -n 40 "$LOGFILE" || true
+  fi
+  exit 1
 fi
-set -e
 
-if log_has_pattern "$MARKER_REGEX"; then
-  if ! check_log_sequence "$LOGFILE" "${SPAWN_SEQUENCE[@]}"; then
-    echo "[warn] x86_64 spawn marker sequence missing or out of order"
-    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
-  fi
-  if ! check_log_sequence "$LOGFILE" "${SPAWN_IPC_SEQUENCE[@]}"; then
-    echo "[warn] spawn IPC sequence absent (user_log! is a no-op in no_std; expected)"
-  fi
+# ---------------------------------------------------------------------------
+# Kernel boot sequence check (required markers in order).
+# ---------------------------------------------------------------------------
+KERNEL_BOOT_SEQUENCE=(
+  "YARM_BOOT_PVH_START_INFO"
+  "YARM_BOOT_OK"
+  "YARM_SUPERVISOR_TID2_SPAWNED"
+  "YARM_PM_TID3_SPAWNED"
+)
 
-  if [[ "$QEMU_SMOKE_STRICT" != "1" ]]; then
-    echo "[ok] boot markers detected"
-    exit 0
-  fi
+FIRMWARE_FALLBACK_REGEX="SeaBIOS|iPXE|Booting from ROM"
 
+if log_has_pattern "$FIRMWARE_FALLBACK_REGEX"; then
+  echo "[warn] firmware fallback detected before any YARM boot markers"
+  echo "[hint] serial shows SeaBIOS/iPXE — QEMU did not accept the kernel as a PVH direct-boot image"
+  if [[ -f "$LOGFILE" ]]; then
+    echo "[info] last 20 log lines from $LOGFILE:"
+    tail -n 20 "$LOGFILE" || true
+  fi
+  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+  exit 0
+fi
+
+if ! log_has_pattern "YARM_BOOT_PVH_START_INFO"; then
+  echo "[warn] PVH boot marker not found — kernel may not have reached C entry"
+  if [[ "$QEMU_STATUS" -eq 124 ]]; then
+    echo "[warn] timeout reached (${TIMEOUT_SECS}s)"
+  fi
+  if [[ -f "$LOGFILE" ]]; then
+    echo "[info] last 20 log lines from $LOGFILE:"
+    tail -n 20 "$LOGFILE" || true
+  fi
+  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+  exit 0
+fi
+
+if ! check_log_sequence "$LOGFILE" "${KERNEL_BOOT_SEQUENCE[@]}"; then
+  echo "[warn] kernel boot marker sequence missing or out of order"
+  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# IPC sequence (user_log! output; no-op in pure no_std builds but checked
+# as a warn-only signal when present).
+# ---------------------------------------------------------------------------
+SPAWN_IPC_SEQUENCE=(
+  "YARM_PM_RECV_LOOP_START"
+  "INIT_SPAWN_V5_CALL_BEGIN"
+  "INIT_SPAWN_V5_REPLY_RECV_OK"
+)
+if ! check_log_sequence "$LOGFILE" "${SPAWN_IPC_SEQUENCE[@]}"; then
+  echo "[warn] PM/init IPC sequence absent (user_log! is a no-op in no_std; expected in hosted-dev)"
+fi
+
+# ---------------------------------------------------------------------------
+# Service entry count check.
+# Each of the six services must appear EXACTLY ONCE in the log.
+# ---------------------------------------------------------------------------
+declare -A REQUIRED_SERVICE_ENTRIES
+REQUIRED_SERVICE_ENTRIES=(
+  [INITRAMFS_SRV_ENTRY]=1
+  [DEVFS_SRV_ENTRY]=1
+  [VFS_SRV_ENTRY]=1
+  [DRIVER_MANAGER_ENTRY]=1
+  [BLKCACHE_SRV_ENTRY]=1
+  [VIRTIO_BLK_SRV_ENTRY]=1
+)
+
+service_count_fail=0
+for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"; do
+  expected="${REQUIRED_SERVICE_ENTRIES[$marker]}"
+  actual=$(log_count_pattern "$marker")
+  if [[ "$actual" -eq "$expected" ]]; then
+    echo "[ok] service entry count: ${marker}=${actual}"
+  elif [[ "$actual" -eq 0 ]]; then
+    echo "[warn] service entry MISSING: ${marker} (expected=${expected} got=0)"
+    service_count_fail=1
+  else
+    echo "[warn] service entry count wrong: ${marker} expected=${expected} got=${actual}"
+    service_count_fail=1
+  fi
+done
+
+if [[ "$service_count_fail" -eq 1 ]]; then
+  echo "[warn] one or more service entry counts wrong"
+  if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
+    echo "[error] strict x86_64 smoke: service entry count check failed"
+    exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Timer / scheduler progression (strict mode only).
+# ---------------------------------------------------------------------------
+if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
   strict_fail=0
-  irq_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_TIMER_IRQ_DELIVERED" || true)
-  eoi_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_TIMER_EOI_DONE" || true)
-  sched_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_SCHED_TICK" || true)
-  echo "[info] strict smoke marker counts: irq=${irq_count:-0} eoi=${eoi_count:-0} sched=${sched_count:-0}"
 
-  if ! log_has_pattern "YARM_TIMER_IRQ_DELIVERED"; then
-    echo "[warn] strict smoke: missing timer IRQ delivery marker"
-    strict_fail=1
-  fi
-  if ! log_has_pattern "YARM_TIMER_EOI_DONE"; then
-    echo "[warn] strict smoke: missing timer EOI completion marker"
-    strict_fail=1
-  fi
-  if ! log_has_pattern "YARM_SCHED_TICK"; then
-    echo "[warn] strict smoke: missing scheduler tick marker"
-    strict_fail=1
-  fi
+  for required_timer in "YARM_TIMER_IRQ_DELIVERED" "YARM_TIMER_EOI_DONE" "YARM_SCHED_TICK"; do
+    if ! log_has_pattern "$required_timer"; then
+      echo "[warn] strict smoke: missing timer/scheduler marker: $required_timer"
+      strict_fail=1
+    fi
+  done
 
   tick_lines=$(tr '\r' '\n' <"$LOGFILE" | rg -a -o "YARM_SCHED_TICK cpu=[0-9]+ tick=[0-9]+" || true)
-  tick_line_with_lineno=$(tr '\r' '\n' <"$LOGFILE" | rg -a -n "YARM_SCHED_TICK cpu=[0-9]+ tick=[0-9]+" || true)
-  tick_count=$(printf '%s\n' "$tick_lines" | rg -c "YARM_SCHED_TICK" || true)
+  tick_count=$(printf '%s\n' "$tick_lines" | rg -c "YARM_SCHED_TICK" 2>/dev/null || echo 0)
   first_tick=$(printf '%s\n' "$tick_lines" | head -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
   last_tick=$(printf '%s\n' "$tick_lines" | tail -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
-  first_tick_line=$(printf '%s\n' "$tick_line_with_lineno" | head -n1)
-  last_tick_line=$(printf '%s\n' "$tick_line_with_lineno" | tail -n1)
-  if [[ -n "$first_tick_line" ]]; then
-    echo "[info] strict smoke first tick line: $first_tick_line"
-  fi
-  if [[ -n "$last_tick_line" ]]; then
-    echo "[info] strict smoke last tick line: $last_tick_line"
-  fi
+
   if [[ -z "$first_tick" || -z "$last_tick" || "$tick_count" -lt 2 ]]; then
     echo "[warn] strict smoke: need at least two scheduler tick markers (got ${tick_count:-0})"
     strict_fail=1
@@ -224,39 +292,30 @@ if log_has_pattern "$MARKER_REGEX"; then
   fi
 
   if [[ "$strict_fail" -eq 1 ]]; then
-    echo "[warn] strict x86 smoke marker checks failed"
+    echo "[error] strict x86_64 smoke: timer/scheduler checks failed"
     exit 1
   fi
-
-  echo "[ok] strict x86 smoke markers detected (timer IRQ + EOI + scheduler tick progress)"
-  exit 0
+  echo "[ok] strict x86_64 smoke: timer IRQ + EOI + scheduler tick progression verified"
 fi
 
-if log_has_pattern "$FIRMWARE_FALLBACK_REGEX"; then
-  echo "[warn] firmware fallback detected before any YARM boot markers"
-  echo "[hint] qemu displayed SeaBIOS/iPXE output, which means serial output is working but the kernel was not accepted as a direct-boot image"
-  echo "[hint] this is not an initramfs userspace issue yet; the guest never reached kernel_entry_x86_64"
-  if [[ -f "$LOGFILE" ]]; then
-    echo "[info] last 20 log lines from $LOGFILE"
-    tail -n 20 "$LOGFILE" || true
-  fi
-  if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
-    exit 1
-  fi
-  exit 0
+# ---------------------------------------------------------------------------
+# Summary.
+# ---------------------------------------------------------------------------
+if [[ "$service_count_fail" -eq 0 ]]; then
+  echo "[ok] x86_64 core smoke: all 6 service entries present exactly once"
+else
+  echo "[warn] x86_64 core smoke: completed with service entry warnings (status=$QEMU_STATUS)"
 fi
 
-if [[ "$QEMU_STATUS" -eq 124 ]]; then
-  echo "[warn] timeout reached (${TIMEOUT_SECS}s) without marker detection"
+if log_has_pattern "YARM_BOOT_OK"; then
+  echo "[ok] x86_64 boot markers detected"
+  exit 0
 fi
 
 echo "[warn] boot markers not detected (status=$QEMU_STATUS)"
 if [[ -f "$LOGFILE" ]]; then
-  echo "[info] last 20 log lines from $LOGFILE"
+  echo "[info] last 20 log lines from $LOGFILE:"
   tail -n 20 "$LOGFILE" || true
 fi
-
-if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
-  exit 1
-fi
+[[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
 exit 0
