@@ -146,6 +146,18 @@ pub fn handle_trap_entry(
     // the same decode/dispatch path through descriptor_tables' stubs.
     let _ = kernel.set_current_cpu(cpu);
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
+    // Save the entering task's register context (PC, SP, GPRs) to its TCB before
+    // dispatching.  This is essential for x86_64 where the IPC blocking path does
+    // not call sync_current_thread_from_frame; without this, a blocked task's TCB
+    // retains its spawn-time PC and would restart from scratch on every resume.
+    //
+    // Skipped for tid==0 (supervisor/idle) — the kernel never returns to user-mode
+    // supervisor code via iretq, so there is nothing meaningful to save.
+    if let (Some(f), Some(tid)) = (frame.as_deref(), kernel.current_tid()) {
+        if tid != 0 {
+            let _ = kernel.sync_current_thread_from_frame(f);
+        }
+    }
     kernel.handle_trap_event(decode_trap_context(context), frame.as_deref_mut())?;
     restore_arch_thread_state(kernel, cpu, frame)?;
     Ok(())
