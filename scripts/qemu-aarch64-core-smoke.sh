@@ -126,6 +126,35 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     [BLKCACHE_SRV_READY]=1
     [VIRTIO_BLK_SRV_READY]=1
   )
+  # Phase 2: verify bulk read path was used for image_id 7/8/9.
+  declare -A REQUIRED_BULK_MARKERS=(
+    [PM_VFS_READ_BULK_BEGIN]=3
+    [PM_VFS_READ_BULK_DONE]=3
+    [PM_VFS_READ_DONE]=3
+  )
+  bulk_count_fail=0
+  for marker in "${!REQUIRED_BULK_MARKERS[@]}"; do
+    expected="${REQUIRED_BULK_MARKERS[$marker]}"
+    actual=$(log_count_pattern "$marker")
+    if [[ "$actual" -ge "$expected" ]]; then
+      echo "[ok] bulk marker: ${marker}>=${expected} (got=${actual})"
+    else
+      echo "[warn] bulk marker missing: ${marker} expected>=${expected} got=${actual}"
+      bulk_count_fail=1
+    fi
+  done
+  if [[ "$bulk_count_fail" -eq 1 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
+    exit 1
+  fi
+  # Phase 2: verify absent hot-path markers (should not appear in default logs).
+  ABSENT_MARKERS=(PM_VFS_READ_APPEND COPY_TO_USER_PAGE YARM_LOCK_SPLIT_STAGE2N)
+  for marker in "${ABSENT_MARKERS[@]}"; do
+    if log_count_pattern "$marker" | grep -q "^[1-9]"; then
+      echo "[warn] unexpected marker in log: ${marker}"
+    else
+      echo "[ok] absent marker confirmed: ${marker}"
+    fi
+  done
   service_count_fail=0
   for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"; do
     expected="${REQUIRED_SERVICE_ENTRIES[$marker]}"

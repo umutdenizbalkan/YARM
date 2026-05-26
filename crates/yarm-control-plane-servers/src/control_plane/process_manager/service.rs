@@ -28,6 +28,8 @@ use yarm_user_rt::capability::CapId;
 use yarm_user_rt::ipc::Message;
 
 const PM_VFS_READ_APPEND_TRACE: bool = false;
+/// Gate for per-chunk bulk-read trace logs.  Set true to debug chunk boundaries.
+const PM_VFS_BULK_READ_CHUNK_TRACE: bool = false;
 #[cfg(not(test))]
 use yarm_user_rt::vfs_client::{
     build_close_message, build_openat_message, build_read_message, build_statx_message,
@@ -1429,7 +1431,24 @@ unsafe fn pm_vfs_spawn_inline(
         vfs_send_cap,
         reply_recv_cap
     );
-    let image = unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, path_label) }?;
+    // For image_id 7-9: use the Phase 2 bulk read path (kernel syscall nr=27).
+    // For image_id 4-6: fall through to the existing inline 112-byte path.
+    let image = match pm_image_cpio_name(image_id) {
+        Some(cpio_name) => {
+            unsafe {
+                pm_read_all_via_vfs_bulk(
+                    image_id,
+                    vfs_send_cap,
+                    reply_recv_cap,
+                    path_label,
+                    cpio_name,
+                )
+            }?
+        }
+        None => {
+            unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, path_label) }?
+        }
+    };
     if image.is_empty() {
         yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err=empty-elf", image_id);
         return Err(ProcessManagerError::Malformed);
@@ -1556,6 +1575,192 @@ fn decode_u64(payload: &[u8]) -> Option<u64> {
     let mut b = [0u8; 8];
     b.copy_from_slice(&payload[..8]);
     Some(u64::from_le_bytes(b))
+}
+
+/// Map image_id (7/8/9) → bare CPIO entry name (no leading slash).
+/// These are the names inside the initramfs CPIO archive.
+#[cfg(not(test))]
+fn pm_image_cpio_name(image_id: u64) -> Option<&'static [u8]> {
+    match image_id {
+        7 => Some(b"sbin/driver_manager"),
+        8 => Some(b"sbin/blkcache_srv"),
+        9 => Some(b"sbin/virtio_blk_srv"),
+        _ => None,
+    }
+}
+
+/// Phase 2 bulk read path for image_id 7/8/9.
+///
+/// Uses kernel syscall nr=27 (`initramfs_read_chunk`) as a temporary bulk-copy
+/// bridge: each call reads up to 4096 bytes directly from the kernel's CPIO into
+/// PM's stack buffer, then appends to the ELF staging `Vec`.
+///
+/// Still uses VFS for STATX (file size) and OPENAT/CLOSE (fd lifecycle tracking).
+/// The actual data transfer bypasses VFS IPC.  This is an explicit Phase 2
+/// stepping stone; Phase 3 will route data through VFS using page-cap zero-copy.
+///
+/// Fallback to inline 112-byte path:
+/// - Only if `initramfs_read_chunk` returns `Unsupported` (kernel lacks CPIO).
+/// - Data mismatches, OOM, or other errors are fatal (no silent fall-through).
+#[cfg(not(test))]
+unsafe fn pm_read_all_via_vfs_bulk(
+    image_id: u64,
+    vfs_send_cap: u32,
+    reply_recv_cap: u32,
+    vfs_path: &[u8],
+    cpio_name: &[u8],
+) -> Result<Vec<u8>, ProcessManagerError> {
+    let path_str = core::str::from_utf8(vfs_path).unwrap_or("<path>");
+    let cpio_str = core::str::from_utf8(cpio_name).unwrap_or("<cpio>");
+
+    // ── 1. STATX via VFS to get file size ────────────────────────────────────
+    let stat_msg = build_statx_message(vfs_path).map_err(|_| ProcessManagerError::Malformed)?;
+    yarm_user_rt::user_log!("PM_VFS_CALL op=STATX path={}", path_str);
+    let stat_reply = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &stat_msg) }?;
+    let stat_payload = stat_reply.as_slice();
+    if stat_payload.len() != 8 {
+        yarm_user_rt::user_log!(
+            "PM_VFS_REPLY_DECODE_FAIL op=STATX image_id={} reason=bad_len expected=8 actual={}",
+            image_id, stat_payload.len()
+        );
+        return Err(ProcessManagerError::Malformed);
+    }
+    let file_len = decode_u64(stat_payload).ok_or(ProcessManagerError::Malformed)? as usize;
+    yarm_user_rt::user_log!(
+        "PM_VFS_REPLY_DECODE op=STATX image_id={} file_len={}",
+        image_id, file_len
+    );
+
+    // ── 2. OPENAT via VFS for fd lifecycle tracking ───────────────────────────
+    let open_msg = build_openat_message(vfs_path, 0).map_err(|_| ProcessManagerError::Malformed)?;
+    yarm_user_rt::user_log!("PM_VFS_CALL op=OPENAT path={}", path_str);
+    let open_reply = match unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &open_msg) } {
+        Ok(r) => r,
+        Err(e) => {
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL image_id={} stage=bulk-openat reason={:?}",
+                image_id, e
+            );
+            return Err(e);
+        }
+    };
+    let fd = match decode_u64(open_reply.as_slice()) {
+        Some(v) => v,
+        None => {
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL image_id={} stage=bulk-openat reason=bad_fd_decode",
+                image_id
+            );
+            return Err(ProcessManagerError::Malformed);
+        }
+    };
+    yarm_user_rt::user_log!(
+        "PM_VFS_OPENAT_DECODE image_id={} path={} fd={}",
+        image_id, path_str, fd
+    );
+
+    // ── 3. Bulk read loop via kernel syscall (4 KiB per call) ─────────────────
+    yarm_user_rt::user_log!(
+        "PM_VFS_READ_BULK_BEGIN image_id={} fd={} expected={} chunk=4096 cpio={}",
+        image_id, fd, file_len, cpio_str
+    );
+
+    let mut out = Vec::with_capacity(file_len);
+    let mut offset: u64 = 0;
+    let mut bulk_buf = [0u8; 4096];
+    let mut chunk_count: u32 = 0;
+
+    loop {
+        if out.len() >= file_len {
+            break;
+        }
+        let remaining = file_len - out.len();
+        let want = core::cmp::min(remaining, 4096);
+        let dst = &mut bulk_buf[..want];
+
+        // SAFETY: dst is valid writable memory in the PM's address space.
+        let bytes_copied = match unsafe {
+            yarm_user_rt::syscall::initramfs_read_chunk(cpio_name, offset, dst)
+        } {
+            Ok(n) => n,
+            Err(yarm_user_rt::syscall::SyscallError::InvalidArgs) => {
+                // Kernel doesn't have the CPIO file — fall back to inline path.
+                yarm_user_rt::user_log!(
+                    "PM_VFS_READ_BULK_UNSUPPORTED image_id={} fallback=inline reason=kernel_no_cpio",
+                    image_id
+                );
+                // Close fd before falling back.
+                let close_msg = match build_close_message(fd) {
+                    Ok(m) => m,
+                    Err(_) => return Err(ProcessManagerError::Malformed),
+                };
+                let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+                // Delegate to inline path.
+                return unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, vfs_path) };
+            }
+            Err(e) => {
+                yarm_user_rt::user_log!(
+                    "PM_VFS_READ_BULK_FAIL image_id={} stage=kernel_read_chunk offset={} err={:?}",
+                    image_id, offset, e
+                );
+                let close_msg = match build_close_message(fd) {
+                    Ok(m) => m,
+                    Err(_) => return Err(ProcessManagerError::Malformed),
+                };
+                let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+                return Err(ProcessManagerError::Malformed);
+            }
+        };
+
+        if bytes_copied == 0 {
+            // EOF before we finished — file shorter than STATX reported.
+            yarm_user_rt::user_log!(
+                "PM_VFS_READ_BULK_FAIL image_id={} stage=eof_early total={} expected={} offset={}",
+                image_id, out.len(), file_len, offset
+            );
+            let close_msg = match build_close_message(fd) {
+                Ok(m) => m,
+                Err(_) => return Err(ProcessManagerError::Malformed),
+            };
+            let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+            return Err(ProcessManagerError::Malformed);
+        }
+
+        out.extend_from_slice(&bulk_buf[..bytes_copied]);
+        offset += bytes_copied as u64;
+        chunk_count += 1;
+
+        if PM_VFS_BULK_READ_CHUNK_TRACE {
+            yarm_user_rt::user_log!(
+                "PM_VFS_READ_BULK_CHUNK image_id={} bytes={} total={} expected={} chunk_n={}",
+                image_id, bytes_copied, out.len(), file_len, chunk_count
+            );
+        }
+    }
+
+    // ── 4. CLOSE via VFS to release fd ───────────────────────────────────────
+    let close_msg = match build_close_message(fd) {
+        Ok(m) => m,
+        Err(_) => return Err(ProcessManagerError::Malformed),
+    };
+    yarm_user_rt::user_log!("PM_VFS_CALL op=CLOSE fd={}", fd);
+    let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+
+    // ── 5. Verify and log completion ──────────────────────────────────────────
+    {
+        let first4_end = core::cmp::min(out.len(), 4);
+        yarm_user_rt::user_log!(
+            "PM_VFS_READ_BULK_DONE image_id={} total={} first4={:x?} chunks={}",
+            image_id, out.len(), &out[..first4_end], chunk_count
+        );
+        // Emit the legacy completion marker so smoke scripts and existing greps pass.
+        yarm_user_rt::user_log!(
+            "PM_VFS_READ_DONE image_id={} total={} first4={:x?}",
+            image_id, out.len(), &out[..first4_end]
+        );
+    }
+
+    Ok(out)
 }
 
 #[cfg(not(test))]
