@@ -682,6 +682,33 @@ impl KernelState {
         let startup_slots_start =
             (stack_top.0 as usize).saturating_sub(startup_slots_bytes_len) & !0x7usize;
         let startup_stack_ptr = startup_slots_start & !0xFusize;
+        // x86-64 SysV ABI: at the very first instruction of a function the
+        // stack pointer must satisfy RSP ≡ 8 (mod 16) because a CALL would
+        // normally push an 8-byte return address before the callee is entered.
+        // We enter user tasks via IRETQ / SYSRETQ (no return-address push), so
+        // we must pre-subtract 8 from the initial stack pointer to satisfy the
+        // invariant.  The trap return path (flush_trap_context_to_iret_frame)
+        // and the initial-IRETQ path (enter_dispatched_user_task_if_available)
+        // both read the stack pointer directly from user_context, so the
+        // adjustment only needs to appear here.
+        // AArch64 requires 16-byte SP alignment at function entry — no
+        // pre-subtraction is needed there.
+        #[cfg(target_arch = "x86_64")]
+        let startup_stack_ptr = startup_stack_ptr.wrapping_sub(8);
+        #[allow(unused_variables)]
+        #[cfg(not(target_arch = "x86_64"))]
+        let startup_stack_ptr = startup_stack_ptr;
+        // Ensure slot[0] (task_id) is always the actual allocated TID.
+        // PM does not know the new task's TID at SpawnV5 call time and sends
+        // startup_args[0]=0.  Fill it now so that:
+        //   (a) the user-visible slot[0] holds the correct task_id, and
+        //   (b) user_context.arg0 = spec.tid ≠ 0, which satisfies the
+        //       x86_64 new-task detection check (is_new_task requires arg(0)!=0)
+        //       so the startup ABI registers (RDI/RSI/RDX/RCX/R8/R9) are
+        //       properly injected on the task's very first dispatch.
+        if spec.startup_args[0] == 0 {
+            spec.startup_args[0] = spec.tid;
+        }
         let startup_slots_ptr = VirtAddr(startup_slots_start as u64);
         let mut startup_slots_bytes = [0u8; core::mem::size_of::<u64>() * 18];
         for (index, slot) in spec.startup_args.iter().copied().enumerate() {
@@ -733,7 +760,7 @@ impl KernelState {
                 arg5: 0,
             };
             crate::yarm_log!(
-                "AARCH64_INITIAL_CONTEXT tid={} elr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x29=0x{:016x} x30=0x{:016x} ctx_ptr=0x{:x}",
+                "USER_INITIAL_CONTEXT tid={} pc=0x{:016x} sp=0x{:016x} arg0=0x{:016x} arg1=0x{:016x} gpr29=0x{:016x} gpr30=0x{:016x} ctx_ptr=0x{:x}",
                 spec.tid,
                 tcb.user_context.instruction_ptr.0,
                 tcb.user_context.stack_ptr.0,

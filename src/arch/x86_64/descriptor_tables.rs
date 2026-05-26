@@ -274,6 +274,23 @@ const DEBUG_UART_LINE_STATUS_PORT: u16 = 0x3FD;
 #[unsafe(no_mangle)]
 static YARM_X86_SYSCALL_RSP0: AtomicU64 = AtomicU64::new(0);
 
+/// Temporary single-core scratch slot for the user RSP at SYSCALL entry.
+///
+/// The x86-64 SYSCALL instruction does not switch stacks; we need to save
+/// the user RSP before switching to the kernel stack, but we cannot use any
+/// GPR as a temporary because all user GPRs must be saved before they are
+/// reused.  Writing user RSP here before touching any register solves the
+/// problem for single-core boots.
+///
+/// # NOT SMP-SAFE
+/// This is a global (not per-CPU) slot.  Two cores arriving at SYSCALL
+/// simultaneously would race on this field.  Acceptable only for the current
+/// -smp 1 x86_64 bring-up; replace with a per-CPU scratch (e.g. via SWAPGS /
+/// gs-relative pointer) before enabling SMP on x86_64.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+static YARM_X86_SYSCALL_SCRATCH_RSP: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 unsafe extern "C" {
     fn yarm_x86_lstar_entry();
@@ -547,7 +564,7 @@ fn log_decoded_fatal_trap(
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 unsafe fn build_trap_frame_from_saved_regs(
     regs: *const X86SavedRegs,
-    frame: *const X86InterruptStackFrame,
+    frame: *mut X86InterruptStackFrame,
     vector: u64,
 ) -> crate::kernel::trapframe::TrapFrame {
     let regs = unsafe { &*regs };
@@ -592,9 +609,71 @@ fn write_trap_returns_to_saved_regs(
 ) {
     let regs = unsafe { &mut *regs };
     regs.rax = trap_frame.ret0 as u64;
-    regs.rbx = trap_frame.ret1 as u64;
+    // ret1 is returned in R8 (caller-saved), NOT RBX (callee-saved).
+    // Writing to RBX via IRETQ would silently corrupt compiler-managed
+    // callee-saved registers in user code (RBX is preserved across calls
+    // by the System V ABI, so the compiler uses it freely; writing 0 to
+    // the saved RBX frame corrupts any live value the compiler kept there).
+    regs.r8 = trap_frame.ret1 as u64;
     regs.rdx = trap_frame.ret2 as u64;
     regs.rcx = trap_frame.error as u64;
+}
+
+/// Write the current task's register context to the X86SavedRegs on the kernel
+/// stack so that the assembly pop sequence restores the correct user registers.
+///
+/// This is called on a task switch.  The `trap_frame` has already been updated
+/// by `apply_user_context` with the incoming task's TCB context.
+///
+/// Two sub-cases:
+///   1. **New task first entry** (all `user_gprs` zero, `arg(0)` non-zero):
+///      The task has never run; deliver its startup ABI args through the
+///      x86-64 function-call registers (rdi, rsi, rdx, rcx, r8, r9).
+///   2. **Resumed task** (some `user_gprs` non-zero, or `arg(0)` zero):
+///      Restore the full GPR snapshot the task had when it last blocked or
+///      was preempted.  (rax is typically 0 for an IPC-recv resumption, set
+///      directly by `complete_blocked_recv_for_waiter`.)
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+fn write_task_gprs_to_saved_regs(
+    regs: *mut X86SavedRegs,
+    trap_frame: &crate::kernel::trapframe::TrapFrame,
+) {
+    let regs = unsafe { &mut *regs };
+    // Step 1: restore full GPR snapshot from TCB (zero for new tasks).
+    regs.rax = trap_frame.user_gpr(0) as u64;  // [0] = rax
+    regs.rbx = trap_frame.user_gpr(1) as u64;  // [1] = rbx
+    regs.rcx = trap_frame.user_gpr(2) as u64;  // [2] = rcx
+    regs.rdx = trap_frame.user_gpr(3) as u64;  // [3] = rdx
+    regs.rsi = trap_frame.user_gpr(4) as u64;  // [4] = rsi
+    regs.rdi = trap_frame.user_gpr(5) as u64;  // [5] = rdi
+    regs.rbp = trap_frame.user_gpr(6) as u64;  // [6] = rbp
+    regs.r8  = trap_frame.user_gpr(7) as u64;  // [7] = r8
+    regs.r9  = trap_frame.user_gpr(8) as u64;  // [8] = r9
+    regs.r10 = trap_frame.user_gpr(9) as u64;  // [9] = r10
+    regs.r11 = trap_frame.user_gpr(10) as u64; // [10] = r11
+    regs.r12 = trap_frame.user_gpr(11) as u64; // [11] = r12
+    regs.r13 = trap_frame.user_gpr(12) as u64; // [12] = r13
+    regs.r14 = trap_frame.user_gpr(13) as u64; // [13] = r14
+    regs.r15 = trap_frame.user_gpr(14) as u64; // [14] = r15
+    // Step 2: new task detection — all user_gprs are zero AND arg(0) is the
+    // non-zero task_id written at spawn time.  Deliver startup args through
+    // the x86-64 System V function-call ABI registers.
+    let is_new_task = trap_frame.user_gprs.iter().all(|&g| g == 0)
+        && trap_frame.arg(0) != 0;
+    if is_new_task {
+        regs.rdi = trap_frame.arg(0) as u64;  // rdi = arg0 (task_id)
+        regs.rsi = trap_frame.arg(1) as u64;  // rsi = arg1 (pm_send cap)
+        regs.rdx = trap_frame.arg(2) as u64;  // rdx = arg2 (pm_reply_recv cap)
+        regs.rcx = trap_frame.arg(3) as u64;  // rcx = arg3 (startup_slots_ptr)
+        regs.r8  = trap_frame.arg(4) as u64;  // r8  = arg4 (slots_len)
+        regs.r9  = trap_frame.arg(5) as u64;  // r9  = arg5 (reserved)
+        // Caller-saved scratch registers: clear to a defined state.
+        regs.rax = 0;
+        regs.rbx = 0;
+        regs.rbp = 0;
+        regs.r10 = 0;
+        regs.r11 = 0;
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -603,7 +682,7 @@ fn dispatch_trap_from_stub_for_test(
     vector: u64,
     error_code: u64,
     regs: &mut X86SavedRegs,
-    interrupt_frame: &X86InterruptStackFrame,
+    interrupt_frame: &mut X86InterruptStackFrame,
 ) -> Result<(), crate::kernel::boot::TrapHandleError> {
     let mut fault_addr = 0u64;
     if vector as usize == VEC_PAGE_FAULT {
@@ -617,7 +696,7 @@ fn dispatch_trap_from_stub_for_test(
     let mut trap_frame = unsafe {
         build_trap_frame_from_saved_regs(
             regs as *const X86SavedRegs,
-            interrupt_frame as *const X86InterruptStackFrame,
+            interrupt_frame as *mut X86InterruptStackFrame,
             vector,
         )
     };
@@ -633,13 +712,67 @@ fn dispatch_trap_from_stub_for_test(
     Ok(())
 }
 
+/// After `handle_trap_entry` processes an event (syscall, timer, fault, …) the
+/// scheduler may have switched to a different user task.  The new task's
+/// resume PC and stack pointer are stored in `trap_frame.saved_pc/sp` by
+/// `apply_current_thread_to_frame`, but the hardware interrupt frame that the
+/// assembly return path (`iretq` or `sysretq`) actually reads from is still
+/// the *old* task's values pushed at trap entry.
+///
+/// This function flushes the updated context back so the assembly exits into
+/// the correct task:
+///   • For the interrupt path  (`yarm_x86_common_trap_entry`):  `interrupt_frame`
+///     is the hardware interrupt frame; `iretq` reads RIP/RSP from it.
+///   • For the syscall fast path (`yarm_x86_lstar_entry`): `interrupt_frame` is
+///     the synthetic 5-word frame built on the kernel stack; `sysretq` loads
+///     RIP from `[frame+0]` (into RCX) and RSP from `[frame+24]`.
+///
+/// Only user-mode return frames (CS DPL=3) are updated; kernel-mode frames
+/// (timer/NMI in ring 0) are left untouched.
+///
+/// RFLAGS is always reset to 0x202 (IF=1, DF=0, all other flags clear).  This
+/// is safe because:
+///   - First task entry: 0x202 is the correct initial value.
+///   - Re-entry after a blocking syscall: RFLAGS is caller-clobbered across
+///     the syscall boundary per the x86-64 ABI, so resetting it is correct.
+///   - Re-entry after a timer preemption: losing the exact flag state is
+///     acceptable; DF=0 at function calls/returns is the only ABI requirement
+///     that matters, and 0x202 satisfies it.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+unsafe fn flush_trap_context_to_iret_frame(
+    interrupt_frame: *mut X86InterruptStackFrame,
+    trap_frame: &crate::kernel::trapframe::TrapFrame,
+) {
+    if interrupt_frame.is_null() {
+        return;
+    }
+    let frame = unsafe { &mut *interrupt_frame };
+    // Only update frames that will return to user mode (ring 3).
+    if (frame.cs & 0x3) != 0x3 {
+        return;
+    }
+    let new_pc = trap_frame.saved_pc();
+    let new_sp = trap_frame.saved_sp();
+    // new_pc / new_sp are 0 only if apply_current_thread_to_frame was never
+    // called (e.g. no runnable task).  Leave the frame unchanged in that case
+    // so the kernel returns cleanly (it will loop in idle).
+    if new_pc != 0 {
+        frame.rip = new_pc as u64;
+    }
+    if new_sp != 0 {
+        frame.rsp = new_sp as u64;
+    }
+    // Reset RFLAGS to a clean state: IF=1, all other flags clear.
+    frame.rflags = 0x202;
+}
+
 #[cfg(all(test, feature = "hosted-dev", target_arch = "x86_64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_x86_dispatch_trap_from_stub(
     _vector: u64,
     _error_code: u64,
     _regs: *mut X86SavedRegs,
-    _interrupt_frame: *const X86InterruptStackFrame,
+    _interrupt_frame: *mut X86InterruptStackFrame,
 ) {
 }
 
@@ -649,7 +782,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     vector: u64,
     error_code: u64,
     regs: *mut X86SavedRegs,
-    interrupt_frame: *const X86InterruptStackFrame,
+    interrupt_frame: *mut X86InterruptStackFrame,
 ) {
     let cpu_apic = raw_current_apic_id() as u64;
     let previous_depth = TRAP_DISPATCH_DEPTH.fetch_add(1, Ordering::AcqRel);
@@ -683,6 +816,9 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         return;
     };
     let fault_rip = frame.rip;
+    // Record the current task id BEFORE dispatching so we can detect a context
+    // switch after handle_trap_entry returns.
+    let entering_tid = kernel.current_tid();
     let mut trap_frame = unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
     if let Err(err) = crate::arch::x86_64::trap::handle_trap_entry(
         kernel,
@@ -701,9 +837,24 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
         halt_forever();
     }
-    if vector as usize == VEC_SYSCALL {
+    let exiting_tid = kernel.current_tid();
+    let task_switched = entering_tid != exiting_tid;
+    if task_switched {
+        // Scheduler switched to a different task.  The trap_frame now holds the
+        // new task's context (from apply_user_context).  Write it back to the
+        // X86SavedRegs so the pop sequence restores the correct user registers.
+        // For a new task first entry this delivers startup ABI args; for a
+        // resumed task it restores the GPR snapshot from the TCB.
+        write_task_gprs_to_saved_regs(regs, &trap_frame);
+    } else if vector as usize == VEC_SYSCALL {
+        // Same task, direct syscall return: overlay the syscall return values.
         write_trap_returns_to_saved_regs(regs, &trap_frame);
     }
+    // Flush the (possibly updated) task PC/SP back to the hardware interrupt
+    // frame so that iretq enters the correct task.  This is the critical path
+    // for both new-task first entry (new PC == spawn entry) and context switches
+    // (new PC == resumed task's saved PC from its TCB).
+    unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
     TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
 }
 
@@ -782,44 +933,93 @@ core::arch::global_asm!(
     .global yarm_x86_lstar_entry
     .type yarm_x86_lstar_entry, @function
 yarm_x86_lstar_entry:
-    // SYSCALL clobbers RCX/R11 with user RIP/RFLAGS. Preserve them explicitly.
-    mov r12, rcx
-    mov r13, r11
-    mov r14, rsp
+    // -----------------------------------------------------------------------
+    // SYSCALL fast-path entry.
+    //
+    // On SYSCALL the CPU places:
+    //   RCX <- user RIP (return address back to userspace)
+    //   R11 <- user RFLAGS
+    //   RSP still holds the user stack pointer
+    //
+    // Every other GPR (including the callee-saved R12/R13/R14/R15, RBX, RBP)
+    // holds the user's authentic value.
+    //
+    // PRIMARY RULE: do NOT touch any GPR before it is saved.
+    //
+    // We need to switch to the kernel stack, but we need user RSP for the
+    // synthetic IRETQ frame and cannot load it into a register first.
+    // Solution: write user RSP directly to YARM_X86_SYSCALL_SCRATCH_RSP
+    // (a RIP-relative store — no GPR touched).
+    //
+    // NOTE: YARM_X86_SYSCALL_SCRATCH_RSP is NOT SMP-safe.
+    //       Safe only for single-core (-smp 1) x86_64 bring-up.
+    //       For SMP: replace with a per-CPU scratch (SWAPGS + gs-relative).
+    // -----------------------------------------------------------------------
+
+    // Step 1 — save user RSP without touching any GPR.
+    mov qword ptr [rip + YARM_X86_SYSCALL_SCRATCH_RSP], rsp
+
+    // Step 2 — switch to the kernel stack (RSP0).
     mov rsp, qword ptr [rip + YARM_X86_SYSCALL_RSP0]
     test rsp, rsp
     jnz 1f
-    // RSP0 must be initialized before any real user SYSCALL entry.
-    // A zero value indicates broken descriptor/TSS setup; fail hard.
+    // RSP0 == 0: descriptor/TSS setup broken before first SYSCALL.  Halt.
     ud2
 1:
-    // Materialize synthetic interrupt frame expected by dispatch.
+    // Step 3 — build a synthetic 5-word IRETQ frame on the kernel stack.
+    //   +0   RIP    user return address  (from SYSCALL -> RCX)
+    //   +8   CS     ring-3 code segment  (0x23)
+    //  +16   RFLAGS user flags           (from SYSCALL -> R11)
+    //  +24   RSP    user stack pointer   (from scratch slot)
+    //  +32   SS     ring-3 data segment  (0x1b)
+    //
+    // To get user RSP into [rsp+24] without clobbering an unsaved GPR we
+    // reuse RCX: RCX was already clobbered by the hardware SYSCALL itself
+    // (it now holds user RIP), so overwriting it again here is safe.
     sub rsp, 40
-    mov qword ptr [rsp + 0], r12
-    mov qword ptr [rsp + 8], 0x23
-    mov qword ptr [rsp + 16], r13
-    mov qword ptr [rsp + 24], r14
-    mov qword ptr [rsp + 32], 0x1b
+    mov qword ptr [rsp +  0], rcx    // user RIP  (SYSCALL saved this for us)
+    mov qword ptr [rsp +  8], 0x23   // user CS   (ring-3 code)
+    mov qword ptr [rsp + 16], r11    // user RFLAGS (SYSCALL saved this for us)
+    mov rcx, qword ptr [rip + YARM_X86_SYSCALL_SCRATCH_RSP]
+    mov qword ptr [rsp + 24], rcx    // user RSP  (from scratch slot)
+    mov qword ptr [rsp + 32], 0x1b   // user SS   (ring-3 data)
 
-    // Keep arg3 compatible with trap ABI (rcx lane); syscall callers pass it in r10.
+    // Step 4 — move syscall arg3 into RCX.
+    // x86-64 Linux SYSCALL convention passes arg3 in R10 (not RCX) because
+    // SYSCALL clobbers RCX.  The YARM trap ABI expects arg3 in the RCX slot
+    // of X86SavedRegs, so we copy R10 -> RCX here before saving.
     mov rcx, r10
 
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rbp
-    push rdi
-    push rsi
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
+    // Step 5 — save ALL user GPRs.
+    // Crucially, R12/R13/R14/R15 are UNCHANGED since SYSCALL entry —
+    // they hold the user's authentic callee-saved values.
+    push rax            // user RAX (syscall number)
+    push rbx            // user RBX (callee-saved) ← authentic
+    push rcx            // = R10 (syscall arg3, per step 4)
+    push rdx            // user RDX (syscall arg2) ← authentic
+    push rbp            // user RBP (callee-saved) ← authentic
+    push rdi            // user RDI (syscall arg0) ← authentic
+    push rsi            // user RSI (syscall arg1) ← authentic
+    push r8             // user R8  (syscall arg4) ← authentic
+    push r9             // user R9  (syscall arg5) ← authentic
+    push r10            // user R10 (syscall arg3) ← authentic
+    push r11            // user R11 = RFLAGS placed here by SYSCALL
+                        //   (the user's real R11 is permanently lost — an
+                        //    unavoidable side-effect of the SYSCALL instruction)
+    push r12            // user R12 (callee-saved) ← AUTHENTIC  ✓
+    push r13            // user R13 (callee-saved) ← AUTHENTIC  ✓
+    push r14            // user R14 (callee-saved) ← AUTHENTIC  ✓
+    push r15            // user R15 (callee-saved) ← AUTHENTIC  ✓
+    // After 15 pushes × 8 = 120 bytes the IRETQ frame from step 3 is at
+    // [RSP + 120].
 
+    // Step 6 — call the Rust dispatcher.
+    //   RDI = 0x80   (SYSCALL vector)
+    //   RSI = 0      (no hardware error code)
+    //   RDX = RSP    (pointer to X86SavedRegs block)
+    //   RCX = RSP+120 (pointer to IRETQ frame)
+    // Align the stack to 16 bytes for the ABI; save pre-alignment RSP in R12
+    // at the KERNEL level (the user's R12 is already safely on the stack).
     mov rdi, 0x80
     xor rsi, rsi
     mov rdx, rsp
@@ -829,6 +1029,11 @@ yarm_x86_lstar_entry:
     call yarm_x86_dispatch_trap_from_stub
     mov rsp, r12
 
+    // Step 7 — restore all user GPRs and return via IRETQ.
+    // flush_trap_context_to_iret_frame has already patched [RSP+120].rip
+    // and [RSP+120].rsp with the selected task's PC and SP.
+    // write_task_gprs_to_saved_regs / write_trap_returns_to_saved_regs have
+    // written the correct values into the slots below.
     pop r15
     pop r14
     pop r13
@@ -844,11 +1049,13 @@ yarm_x86_lstar_entry:
     pop rcx
     pop rbx
     pop rax
-
-    mov rcx, qword ptr [rsp + 0]
-    mov r11, qword ptr [rsp + 16]
-    mov rsp, qword ptr [rsp + 24]
-    sysretq
+    // RSP now points at the 5-word IRETQ frame (step 3, updated in step 6):
+    //   [RSP+ 0] user RIP   ← patched by flush_trap_context_to_iret_frame
+    //   [RSP+ 8] user CS    = 0x23 (ring-3)
+    //   [RSP+16] user RFLAGS = 0x202 (IF=1)
+    //   [RSP+24] user RSP   ← patched by flush_trap_context_to_iret_frame
+    //   [RSP+32] user SS    = 0x1b (ring-3)
+    iretq
 "#
 );
 
@@ -1417,7 +1624,8 @@ mod tests {
             ss: KERNEL_DATA_SELECTOR as u64,
         };
         assert_eq!(kernel.timer_ticks_for_test(), 0);
-        dispatch_trap_from_stub_for_test(&mut kernel, VEC_TIMER as u64, 0, &mut regs, &frame)
+        let mut frame = frame;
+        dispatch_trap_from_stub_for_test(&mut kernel, VEC_TIMER as u64, 0, &mut regs, &mut frame)
             .expect("timer dispatch");
         assert_eq!(kernel.timer_ticks_for_test(), 1);
     }
@@ -1438,8 +1646,9 @@ mod tests {
             rsp: 0x9000,
             ss: KERNEL_DATA_SELECTOR as u64,
         };
+        let mut frame = frame;
         let result =
-            dispatch_trap_from_stub_for_test(&mut kernel, VEC_SYSCALL as u64, 0, &mut regs, &frame);
+            dispatch_trap_from_stub_for_test(&mut kernel, VEC_SYSCALL as u64, 0, &mut regs, &mut frame);
         assert_eq!(
             result,
             Err(crate::kernel::boot::TrapHandleError::Syscall(
@@ -1468,10 +1677,11 @@ mod tests {
             rsp: 0x8888,
             ss: 0x23,
         };
+        let mut frame = frame;
         let trap = unsafe {
             build_trap_frame_from_saved_regs(
                 &regs as *const X86SavedRegs,
-                &frame as *const X86InterruptStackFrame,
+                &mut frame as *mut X86InterruptStackFrame,
                 VEC_SYSCALL as u64,
             )
         };
@@ -1485,4 +1695,139 @@ mod tests {
         assert_eq!(trap.arg(4), 15);
         assert_eq!(trap.arg(5), 16);
     }
+
+    // -----------------------------------------------------------------------
+    // x86_64 startup argument mapping regression tests
+    //
+    // The x86_64 SysV ABI maps the first 6 function arguments to:
+    //   arg0 -> RDI   arg1 -> RSI   arg2 -> RDX
+    //   arg3 -> RCX   arg4 -> R8    arg5 -> R9
+    //
+    // For new-task first entry, write_task_gprs_to_saved_regs() must place
+    // startup args into exactly these registers.
+    // -----------------------------------------------------------------------
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn startup_arg_mapping_new_task_uses_sysv_calling_convention() {
+        // Build a TrapFrame that looks like a brand-new task: all user_gprs
+        // are zero (never ran) but startup args are non-zero.
+        let mut trap = crate::kernel::trapframe::TrapFrame::zeroed();
+        // Startup ABI: arg0=task_id, arg1=pm_send, arg2=pm_reply,
+        //              arg3=slots_ptr, arg4=slots_len, arg5=reserved
+        trap.set_arg(0, 0xAA);   // -> RDI
+        trap.set_arg(1, 0xBB);   // -> RSI
+        trap.set_arg(2, 0xCC);   // -> RDX
+        trap.set_arg(3, 0xDD);   // -> RCX
+        trap.set_arg(4, 0xEE);   // -> R8
+        trap.set_arg(5, 0xFF);   // -> R9
+        // user_gprs all zero → new-task detection fires
+
+        let mut regs = X86SavedRegs::default();
+        write_task_gprs_to_saved_regs(&mut regs as *mut X86SavedRegs, &trap);
+
+        assert_eq!(regs.rdi, 0xAA, "arg0 must go to RDI");
+        assert_eq!(regs.rsi, 0xBB, "arg1 must go to RSI");
+        assert_eq!(regs.rdx, 0xCC, "arg2 must go to RDX");
+        assert_eq!(regs.rcx, 0xDD, "arg3 must go to RCX");
+        assert_eq!(regs.r8,  0xEE, "arg4 must go to R8");
+        assert_eq!(regs.r9,  0xFF, "arg5 must go to R9");
+        // Scratch registers must be cleared
+        assert_eq!(regs.rax, 0);
+        assert_eq!(regs.rbx, 0);
+        assert_eq!(regs.rbp, 0);
+        assert_eq!(regs.r10, 0);
+        assert_eq!(regs.r11, 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn startup_arg_mapping_all_six_positions_independently() {
+        // Verify each arg slot independently to catch off-by-one in the
+        // RDI/RSI/RDX/RCX/R8/R9 assignment.
+        for (slot, expected_reg) in [
+            (0usize, "rdi"),
+            (1,      "rsi"),
+            (2,      "rdx"),
+            (3,      "rcx"),
+            (4,      "r8"),
+            (5,      "r9"),
+        ] {
+            let mut trap = crate::kernel::trapframe::TrapFrame::zeroed();
+            let sentinel = 0x1000_0000 + slot as usize;
+            trap.set_arg(slot, sentinel);
+            trap.set_arg(0, if slot == 0 { sentinel } else { 0x1 }); // ensure non-zero task-id
+
+            let mut regs = X86SavedRegs::default();
+            write_task_gprs_to_saved_regs(&mut regs as *mut X86SavedRegs, &trap);
+
+            let actual = match slot {
+                0 => regs.rdi as usize,
+                1 => regs.rsi as usize,
+                2 => regs.rdx as usize,
+                3 => regs.rcx as usize,
+                4 => regs.r8  as usize,
+                5 => regs.r9  as usize,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                actual, sentinel,
+                "arg{} must map to {} (sentinel 0x{:x} found 0x{:x})",
+                slot, expected_reg, sentinel, actual
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn resumed_task_gprs_are_restored_verbatim() {
+        // A resumed task (some user_gprs non-zero) must have its full GPR
+        // snapshot written back without the new-task arg override.
+        let mut trap = crate::kernel::trapframe::TrapFrame::zeroed();
+        // Non-zero user_gprs[0] disables new-task detection.
+        trap.set_user_gpr(0,  0x1);     // rax = 1 (non-zero -> resumed task)
+        trap.set_user_gpr(11, 0xCAFE);  // r12
+        trap.set_user_gpr(12, 0xBEEF);  // r13
+        trap.set_user_gpr(13, 0xDEAD);  // r14
+        trap.set_user_gpr(14, 0x1234);  // r15
+        trap.set_user_gpr(1,  0xABCD);  // rbx
+        trap.set_user_gpr(6,  0x5678);  // rbp
+        // Set arg0 non-zero — must NOT trigger new-task path.
+        trap.set_arg(0, 0xFF);
+
+        let mut regs = X86SavedRegs::default();
+        write_task_gprs_to_saved_regs(&mut regs as *mut X86SavedRegs, &trap);
+
+        // Callee-saved registers must be restored verbatim.
+        assert_eq!(regs.r12, 0xCAFE, "r12 must be restored from user_gpr[11]");
+        assert_eq!(regs.r13, 0xBEEF, "r13 must be restored from user_gpr[12]");
+        assert_eq!(regs.r14, 0xDEAD, "r14 must be restored from user_gpr[13]");
+        assert_eq!(regs.r15, 0x1234, "r15 must be restored from user_gpr[14]");
+        assert_eq!(regs.rbx, 0xABCD, "rbx must be restored from user_gpr[1]");
+        assert_eq!(regs.rbp, 0x5678, "rbp must be restored from user_gpr[6]");
+        // Startup args must NOT be injected into RDI/RSI/etc for a resumed task.
+        assert_ne!(regs.rdi, 0xFF, "startup args must not override resumed task RDI");
+    }
+
+    // -----------------------------------------------------------------------
+    // Callee-saved register preservation across SYSCALL — unit-test coverage
+    //
+    // The authentic hardware test (checking that R12/R13/R14/R15/RBX/RBP
+    // survive a real SYSCALL + IRETQ round-trip) requires running user-mode
+    // code on actual x86_64 hardware or QEMU.  It cannot be expressed as a
+    // cargo unit test because:
+    //   1. Unit tests run in kernel (ring-0) mode; SYSCALL from ring-0 is
+    //      undefined behaviour on x86-64.
+    //   2. The lstar entry assembly is not invocable from a hosted-dev test.
+    //
+    // Instead, the regression is covered at two levels:
+    //   a) The tests above verify write_task_gprs_to_saved_regs() correctly
+    //      maps user_gpr[11..14] (r12/r13/r14) to regs.r12/r13/r14.
+    //   b) The QEMU smoke test (`scripts/qemu-x86_64-core-smoke.sh`) exercises
+    //      the full entry/return path at runtime; a callee-saved register
+    //      corruption manifests as PM_NO_RECV_CAP or a GPF.
+    //
+    // The assembly fix (Step 1 of yarm_x86_lstar_entry) eliminates the source
+    // of the corruption: user RSP is now saved to YARM_X86_SYSCALL_SCRATCH_RSP
+    // before ANY GPR is touched, so R12/R13/R14 remain authentic at push time.
+    // -----------------------------------------------------------------------
 }

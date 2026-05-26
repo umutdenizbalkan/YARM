@@ -167,6 +167,20 @@ impl KernelState {
 
     fn fault_current_task(&mut self) -> Result<(), KernelError> {
         let cpu = self.current_cpu();
+        // Diagnostic: log the fault before acting, so we can see which task faulted
+        // and what the fault address was (from last_fault set by try_handle_demand_page_fault).
+        {
+            let (fault_opt, running_tid_opt) =
+                self.with_fault_state(|faults| (faults.last_fault, None::<u64>));
+            let _ = running_tid_opt;
+            let cur_tid = self.current_tid().unwrap_or(u64::MAX);
+            crate::yarm_log!(
+                "TASK_FAULT_CURRENT tid={} fault_addr=0x{:x} access={:?}",
+                cur_tid,
+                fault_opt.map(|f| f.addr.0).unwrap_or(0),
+                fault_opt.map(|f| f.access)
+            );
+        }
         let running_tid = self.current_tid().ok_or_else(|| {
             if cfg!(not(feature = "hosted-dev")) {
                 crate::yarm_log!(
@@ -233,17 +247,39 @@ impl KernelState {
             }
             Trap::TimerInterrupt => {
                 self.hal.acknowledge_interrupt(self.current_cpu(), 0);
-                #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-                if DEBUG_TIMER_LOG {
-                    crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);
-                }
                 let (_tick, should_preempt) = self.tick_scheduler_timer();
                 let _ = self
                     .process_ipc_timeout_deadlines(_tick.0)
                     .map_err(SyscallError::from)
                     .map_err(TrapHandleError::Syscall)?;
+                // Emit timer health markers unconditionally but only for the
+                // first few ticks so that the smoke test can verify the timer
+                // fires and the scheduler advances without flooding the UART.
+                // (BOOTSTRAP_TIMER_DEADLINE_TICKS / 16 ≈ 3 ms/tick on QEMU;
+                //  at 90 s we would get ~30 000 ticks — far too many to log.)
                 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+                {
+                    use core::sync::atomic::{AtomicU64, Ordering};
+                    static TIMER_LOG_EMITTED: AtomicU64 = AtomicU64::new(0);
+                    let log_seq = TIMER_LOG_EMITTED.fetch_add(1, Ordering::Relaxed);
+                    if log_seq < 4 {
+                        crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);
+                        crate::yarm_log!(
+                            "YARM_SCHED_TICK cpu={} tick={} preempt={}",
+                            self.current_cpu().0,
+                            _tick.0,
+                            should_preempt as u8
+                        );
+                        crate::yarm_log!(
+                            "YARM_TIMER_IRQ_DELIVERED cpu={} tick={}",
+                            self.current_cpu().0,
+                            _tick.0
+                        );
+                    }
+                }
+                #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "x86_64")))]
                 if DEBUG_TIMER_LOG {
+                    crate::yarm_log!("YARM_TIMER_EOI_DONE cpu={}", self.current_cpu().0);
                     crate::yarm_log!(
                         "YARM_SCHED_TICK cpu={} tick={} preempt={}",
                         self.current_cpu().0,
@@ -309,6 +345,13 @@ impl KernelState {
 
         match event {
             TrapEvent::PageFault(fault) => {
+                crate::yarm_log!(
+                    "PAGE_FAULT_ENTRY tid={} addr=0x{:x} access={:?} rip=0x{:x}",
+                    self.current_tid().unwrap_or(u64::MAX),
+                    fault.addr.0,
+                    fault.access,
+                    frame.as_ref().map(|f| f.saved_pc).unwrap_or(0)
+                );
                 if matches!(fault.access, FaultAccess::Write) {
                     if let Some(tid) = self.current_tid()
                         && let Some(asid) = self.task_asid(tid)
@@ -317,6 +360,7 @@ impl KernelState {
                             .map_err(SyscallError::from)
                             .map_err(TrapHandleError::Syscall)?
                     {
+                        crate::yarm_log!("PAGE_FAULT_HANDLED_COW");
                         return Ok(());
                     }
                 }
@@ -325,8 +369,16 @@ impl KernelState {
                     .map_err(SyscallError::from)
                     .map_err(TrapHandleError::Syscall)?
                 {
+                    crate::yarm_log!("PAGE_FAULT_HANDLED_DEMAND");
                     return Ok(());
                 }
+                crate::yarm_log!(
+                    "PAGE_FAULT_UNHANDLED tid={} addr=0x{:x} access={:?} rip=0x{:x}",
+                    self.current_tid().unwrap_or(u64::MAX),
+                    fault.addr.0,
+                    fault.access,
+                    frame.as_ref().map(|f| f.saved_pc).unwrap_or(0)
+                );
                 self.fault_current_task()
                     .map_err(SyscallError::from)
                     .map_err(TrapHandleError::Syscall)

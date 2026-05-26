@@ -278,7 +278,22 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     }
     if let Some(tcb) = kernel.tcb_mut(waiter_tid) {
         tcb.user_context.arg0 = 0;
-        tcb.user_context.user_gprs[0] = 0;
+        tcb.user_context.user_gprs[0] = 0;   // RAX / x0  = ret0  = 0 (success)
+        // x86_64: the LSTAR entry asm does "mov rcx, r10" to forward arg3 (meta_ptr)
+        // into RCX before the GPR snapshot.  user_gprs[2]=RCX therefore holds the
+        // meta_ptr when the task blocks.  On the blocked-recv resumption path,
+        // write_task_gprs_to_saved_regs restores user_gprs verbatim (there is no
+        // write_trap_returns_to_saved_regs call on the task-switch path), so RCX is
+        // restored as meta_ptr ≠ 0.  user_rt reads error from RCX and misinterprets
+        // it as a syscall failure, causing the task to silently discard the message
+        // and loop back to ipc_recv.  Zero all four x86_64 return-register slots so
+        // the resumed task sees: rax=0 (ret0=ok), rcx=0 (error=0), rdx=0, r8=0.
+        #[cfg(target_arch = "x86_64")]
+        {
+            tcb.user_context.user_gprs[2] = 0; // RCX = error = 0 (success)
+            tcb.user_context.user_gprs[3] = 0; // RDX = ret2  = 0
+            tcb.user_context.user_gprs[7] = 0; // R8  = ret1  = 0
+        }
     }
     crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=complete", waiter_tid);
     crate::yarm_log!("IPC_RECV_BLOCKED_COMPLETE tid={}", waiter_tid);
@@ -1710,7 +1725,17 @@ fn handle_spawn_process(
     // This provides the CPIO data in userspace without syscall bridge.
     if image_id == INITRAMFS_IMAGE_ID {
         if let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() {
-            let initrd_phys_raw = initrd.as_ptr() as u64;
+            // `initrd.as_ptr()` is a kernel virtual address.  On x86_64 the
+            // kernel uses a high direct-map region at KERNEL_BOOTSTRAP_VIRT_BASE
+            // (0xFFFF_FF80_0000_0000), so `ptr = KERNEL_BOOTSTRAP_VIRT_BASE + phys`.
+            // Subtract the base to recover the physical address before installing
+            // it into the user page-table (which requires physical addresses).
+            // On AArch64 KERNEL_BOOTSTRAP_VIRT_BASE == KERNEL_BOOTSTRAP_PHYS_BASE
+            // so the subtraction is still correct (identity mapping → no-op).
+            let initrd_virt_raw = initrd.as_ptr() as u64;
+            let initrd_phys_raw = initrd_virt_raw.wrapping_sub(
+                crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE
+            );
             let initrd_len = initrd.len() as u64;
             let page: u64 = PAGE_SIZE as u64;
             let phys_start = initrd_phys_raw & !(page - 1);

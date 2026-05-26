@@ -862,7 +862,10 @@ pub fn enter_dispatched_user_task_if_available(
         if !entry_resolve || !stack_resolve {
             return;
         }
-        if (context.stack_ptr.0 & 0xF) != 0 {
+        // The initial stack pointer is pre-adjusted to RSP ≡ 8 (mod 16) for
+        // x86-64 SysV ABI compliance (see spawn_user_task_from_image in
+        // exec_state.rs).  Accept 8-byte-aligned stacks (both 0 and 8 mod 16).
+        if (context.stack_ptr.0 & 0x7) != 0 {
             crate::yarm_log!(
                 "ENTER_USER_ABORT reason=stack_unaligned rsp=0x{:x}",
                 context.stack_ptr.0
@@ -911,6 +914,14 @@ pub fn enter_dispatched_user_task_if_available(
         }
         #[allow(unreachable_code)]
         {
+            // The stack pointer was pre-adjusted to RSP ≡ 8 (mod 16) at task
+            // spawn time (spawn_user_task_from_image in exec_state.rs) to
+            // satisfy the x86-64 SysV ABI requirement at function entry.  Use
+            // it directly here — no further adjustment is needed.
+            crate::yarm_log!(
+                "X86_ENTER_USER_RSP stack=0x{:x}",
+                context.stack_ptr.0,
+            );
             super::descriptor_tables::enter_user_mode_iret(
                 context.instruction_ptr.0,
                 context.stack_ptr.0,

@@ -141,7 +141,8 @@ log_has_pattern() {
 log_count_pattern() {
   local pattern="$1"
   [[ -f "$LOGFILE" ]] || { echo 0; return; }
-  tr '\r' '\n' <"$LOGFILE" | rg -a -c "$pattern" 2>/dev/null || echo 0
+  # Use word boundaries so e.g. VFS_SRV_ENTRY does not match DEVFS_SRV_ENTRY.
+  tr '\r' '\n' <"$LOGFILE" | rg -a -c "\b${pattern}\b" 2>/dev/null || echo 0
 }
 
 # ---------------------------------------------------------------------------
@@ -186,9 +187,9 @@ KERNEL_BOOT_SEQUENCE=(
 
 FIRMWARE_FALLBACK_REGEX="SeaBIOS|iPXE|Booting from ROM"
 
-if log_has_pattern "$FIRMWARE_FALLBACK_REGEX"; then
-  echo "[warn] firmware fallback detected before any YARM boot markers"
-  echo "[hint] serial shows SeaBIOS/iPXE — QEMU did not accept the kernel as a PVH direct-boot image"
+if log_has_pattern "$FIRMWARE_FALLBACK_REGEX" && ! log_has_pattern "YARM_BOOT_PVH_START_INFO"; then
+  echo "[warn] firmware fallback detected — QEMU did not accept the kernel as a PVH direct-boot image"
+  echo "[hint] serial shows SeaBIOS/iPXE without any YARM_BOOT_PVH_START_INFO marker"
   if [[ -f "$LOGFILE" ]]; then
     echo "[info] last 20 log lines from $LOGFILE:"
     tail -n 20 "$LOGFILE" || true
