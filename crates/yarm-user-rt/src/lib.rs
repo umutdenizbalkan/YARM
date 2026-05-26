@@ -623,12 +623,11 @@ pub mod syscall {
     ///
     /// Returns the number of bytes actually copied (may be less than `dst.len()`
     /// at end-of-file).  Returns `Ok(0)` at EOF.
+    /// Returns `Err` for not_found or access_denied — callers MUST NOT treat these as EOF.
     ///
-    /// # Phase 2 bulk-copy bridge
-    /// This is an **explicit temporary bridge** for Phase 2 chunked VFS reads.
-    /// It calls kernel syscall nr=27 which reads directly from the kernel's CPIO
-    /// and copies into the caller's buffer.  Replace with page-cap zero-copy in
-    /// Phase 3 once shared-memory primitives are available.
+    /// # Phase 2A bulk-copy bridge
+    /// Calls kernel syscall nr=27 (arg5=0 = self-ASID). PM-only/privileged.
+    /// Phase 2B adds VFS-mediated routing on top. Phase 3 uses page-cap zero-copy.
     ///
     /// # Safety
     /// `dst` must be a valid writable slice in the caller's address space for
@@ -641,14 +640,56 @@ pub mod syscall {
     ) -> core::result::Result<usize, SyscallError> {
         let max_len = core::cmp::min(dst.len(), 4096);
         let args = [
-            name.as_ptr() as usize, // arg0 = name_ptr
-            name.len(),              // arg1 = name_len
-            offset as usize,         // arg2 = offset
-            dst.as_mut_ptr() as usize, // arg3 = dst_ptr
-            max_len,                 // arg4 = max_len
-            0,
+            name.as_ptr() as usize,    // arg0 = name_ptr
+            name.len(),                 // arg1 = name_len
+            offset as usize,            // arg2 = offset
+            dst.as_mut_ptr() as usize,  // arg3 = dst_ptr (self-ASID)
+            max_len,                    // arg4 = max_len
+            0,                          // arg5 = target_tid (0 = self)
         ];
         // SAFETY: Uses architecture syscall ABI; name and dst lifetimes cover the call.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_INITRAMFS_READ_CHUNK_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(ret.ret1)
+    }
+
+    /// Phase 2B bridge: copy up to 4096 bytes from a named CPIO file into PM's
+    /// transfer buffer at `pm_dst_ptr` (PM's virtual address).
+    ///
+    /// Used by `initramfs_srv` to fill PM's 4 KiB transfer buffer as part of the
+    /// VFS-mediated bulk read path.  Only callable by `TaskClass::SystemServer`.
+    ///
+    /// TEMPORARY — replace with page-cap grant in Phase 3.
+    ///
+    /// # Safety
+    /// `name` must be a valid byte slice in the caller's address space.
+    /// `pm_dst_ptr` must be a valid writable VA in PM's address space.
+    #[inline]
+    pub unsafe fn initramfs_write_to_pm_buf(
+        name: &[u8],
+        offset: u64,
+        pm_dst_ptr: usize,
+        max_len: usize,
+    ) -> core::result::Result<usize, SyscallError> {
+        // PM_BOOTSTRAP_TID = 3 (hardcoded temporary bridge; replace with page-cap in Phase 3).
+        const PM_BOOTSTRAP_TID: usize = 3;
+        let clamped_len = core::cmp::min(max_len, 4096);
+        let args = [
+            name.as_ptr() as usize,  // arg0 = name_ptr
+            name.len(),               // arg1 = name_len
+            offset as usize,          // arg2 = offset
+            pm_dst_ptr,               // arg3 = dst_ptr (PM's VA)
+            clamped_len,              // arg4 = max_len
+            PM_BOOTSTRAP_TID,         // arg5 = target_tid = PM_TID (Phase 2B bridge)
+        ];
+        // SAFETY: name lifetime covers the call; pm_dst_ptr validated by kernel.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_INITRAMFS_READ_CHUNK_NR, args) };
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {

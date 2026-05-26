@@ -126,7 +126,7 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     [BLKCACHE_SRV_READY]=1
     [VIRTIO_BLK_SRV_READY]=1
   )
-  # Phase 2: verify bulk read path was used for image_id 7/8/9.
+  # Phase 2A/2B: verify bulk read path was used for image_id 7/8/9.
   declare -A REQUIRED_BULK_MARKERS=(
     [PM_VFS_READ_BULK_BEGIN]=3
     [PM_VFS_READ_BULK_DONE]=3
@@ -146,6 +146,54 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
   if [[ "$bulk_count_fail" -eq 1 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
     exit 1
   fi
+
+  # Phase 2B path or Phase 2A fallback: check which bulk-read mode was used.
+  PHASE2B_BULK_FORWARD=$(log_count_pattern "VFS_FORWARD_BULK_READ")
+  PHASE2A_FALLBACK=$(log_count_pattern "PM_VFS_READ_BULK_PHASE2A_BEGIN")
+  if [[ "$PHASE2B_BULK_FORWARD" -ge 3 ]]; then
+    echo "[ok] Phase 2B VFS bulk-read active: VFS_FORWARD_BULK_READ=${PHASE2B_BULK_FORWARD} (mode=vfs_transfer)"
+  elif [[ "$PHASE2A_FALLBACK" -ge 3 ]]; then
+    echo "[ok] Phase 2A fallback active: PM_VFS_READ_BULK_PHASE2A_BEGIN=${PHASE2A_FALLBACK} (mode=phase2a_bridge)"
+  else
+    echo "[warn] neither Phase 2B VFS_FORWARD_BULK_READ (got=${PHASE2B_BULK_FORWARD}) nor Phase 2A PM_VFS_READ_BULK_PHASE2A_BEGIN (got=${PHASE2A_FALLBACK}) reached 3"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+  fi
+
+  # Phase 2B: if VFS bulk-read forwarding was active, check initramfs handled it.
+  if [[ "$PHASE2B_BULK_FORWARD" -ge 1 && -f "$LOGFILE" ]]; then
+    INITRAMFS_BULK=$(log_count_pattern "INITRAMFS_READ_BULK fd=")
+    INITRAMFS_BULK_REPLY=$(log_count_pattern "INITRAMFS_READ_BULK_REPLY")
+    if [[ "$INITRAMFS_BULK" -ge 1 && "$INITRAMFS_BULK_REPLY" -ge 1 ]]; then
+      echo "[ok] Phase 2B initramfs bulk-read: handled=${INITRAMFS_BULK} replied=${INITRAMFS_BULK_REPLY}"
+    else
+      echo "[warn] Phase 2B VFS forwarding seen but initramfs bulk handler did not engage (INITRAMFS_READ_BULK=${INITRAMFS_BULK} REPLY=${INITRAMFS_BULK_REPLY})"
+      [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    fi
+  fi
+
+  # Phase 2A safety: must not have not_found failures (means CPIO entry missing).
+  if [[ -f "$LOGFILE" ]]; then
+    NOT_FOUND=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_FAIL.*reason=not_found" 2>/dev/null || echo 0)
+    if [[ "$NOT_FOUND" -gt 0 ]]; then
+      echo "[error] PM_VFS_READ_BULK_FAIL reason=not_found found: ${NOT_FOUND} — file missing in CPIO (hard failure)"
+      exit 1
+    else
+      echo "[ok] no PM_VFS_READ_BULK_FAIL reason=not_found"
+    fi
+  fi
+
+  # Mode check: verify PM_VFS_READ_BULK_DONE completions carry a known mode tag.
+  if [[ -f "$LOGFILE" ]]; then
+    BULK_DONE_VFS=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE.*mode=vfs_transfer" 2>/dev/null || echo 0)
+    BULK_DONE_2A=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE.*mode=phase2a_bridge" 2>/dev/null || echo 0)
+    BULK_DONE_TOTAL=$((BULK_DONE_VFS + BULK_DONE_2A))
+    echo "[ok] PM_VFS_READ_BULK_DONE: mode=vfs_transfer=${BULK_DONE_VFS} mode=phase2a_bridge=${BULK_DONE_2A} total=${BULK_DONE_TOTAL}"
+    if [[ "$BULK_DONE_TOTAL" -lt 3 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
+      echo "[error] expected at least 3 PM_VFS_READ_BULK_DONE with a known mode tag (got=${BULK_DONE_TOTAL})"
+      exit 1
+    fi
+  fi
+
   # Phase 2: verify absent hot-path markers (should not appear in default logs).
   ABSENT_MARKERS=(PM_VFS_READ_APPEND COPY_TO_USER_PAGE YARM_LOCK_SPLIT_STAGE2N)
   for marker in "${ABSENT_MARKERS[@]}"; do

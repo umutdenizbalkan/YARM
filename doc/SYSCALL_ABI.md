@@ -3,7 +3,7 @@
 # YARM Syscall ABI v10 (Frozen Contract)
 
 - ABI Version: `10`
-- Syscall count: `15`
+- Syscall count: `16`
 
 ## Syscall numbers
 
@@ -22,6 +22,7 @@
 - `12`: `Fork` (fork current process with CoW; return child tid in parent)
 - `13`: `VmAnonMap` (reserved; currently returns `InvalidArgs`)
 - `14`: `VmBrk` (staged: query + grow supported, shrink unsupported)
+- `27`: `InitramfsReadChunk` (**PM-only / privileged**, Phase 2A/2B bootstrap bridge — see below)
 
 ## Syscalls `9..14` status
 
@@ -321,3 +322,73 @@ Portability boundary:
 - Reply payloads are never opcode-prefix stripped.
 - Legacy 2-byte opcode-prefix stripping applies only to inline request-framed messages (`OPCODE_INLINE` request path), exactly once.
 - Current limitation: `ipc_call` carries a kernel reply capability; simultaneous application cap transfer in the same call message is not yet supported by syscall ABI v2.
+
+---
+
+## Syscall `27`: `InitramfsReadChunk` (PM-only, Phase 2A/2B Bootstrap Bridge)
+
+**Access gate**: `TaskClass::SystemServer` only.  Any other caller receives `MissingRight` and the
+kernel logs `INITRAMFS_READ_CHUNK_DENIED tid=<tid> name=<name>`.
+
+**Purpose**: Temporary bootstrap bridge that lets the Process Manager (PM) bulk-copy CPIO file
+data before a proper VFS-mediated file-transfer path is available.  This syscall bridges the
+gap between the single-page initramfs-copy prototype (Phase 2A) and the full shared-4KiB
+transfer-buffer VFS path (Phase 2B).  It will be superseded by `MemoryObject` page-cap grants
+in Phase 3.
+
+### Argument layout
+
+| Register | Field        | Description                                                                 |
+|----------|--------------|-----------------------------------------------------------------------------|
+| `arg0`   | `name_ptr`   | User-space pointer to the CPIO entry name byte slice                        |
+| `arg1`   | `name_len`   | Length in bytes of the CPIO entry name                                      |
+| `arg2`   | `offset`     | Byte offset within the file (absolute; 0 = start of file)                  |
+| `arg3`   | `dst_ptr`    | Destination user-space VA.  Phase 2A: caller's own VA.  Phase 2B: PM's VA. |
+| `arg4`   | `max_len`    | Maximum bytes to copy (clamped to 4096 by kernel)                          |
+| `arg5`   | `target_tid` | **Phase 2A**: `0` (copy to caller's ASID). **Phase 2B**: `3` (PM_BOOTSTRAP_TID — copy to PM's ASID). Any other value → `MissingRight`. |
+
+### Return values
+
+| Return    | Meaning                                             |
+|-----------|-----------------------------------------------------|
+| `ret0`    | `0` on success, non-zero error code on failure      |
+| `ret1`    | Number of bytes actually copied (0 at EOF)          |
+
+### Errors
+
+| Error            | Meaning                                                          |
+|------------------|------------------------------------------------------------------|
+| `MissingRight`   | Caller is not `TaskClass::SystemServer`, or `target_tid` is not 0 or `PM_BOOTSTRAP_TID` |
+| `Internal`       | File not found in CPIO archive                                   |
+| `InvalidArgs`    | Kernel does not have a boot CPIO loaded (bridge unavailable)     |
+| `PageFault`      | `dst_ptr` or the target ASID memory access failed               |
+
+### Phase 2A behavior (`arg5 = 0`)
+
+- Kernel finds the named file in the boot CPIO and copies `min(max_len, remaining)` bytes
+  to `dst_ptr` in the **caller's** address space.
+- Returns `Ok(0)` when `offset >= file_len` (EOF; file exists).
+- Returns `Err(Internal)` when the file is not present in CPIO.
+
+### Phase 2B extension (`arg5 = PM_BOOTSTRAP_TID = 3`)
+
+- Used by `initramfs_srv` when servicing `VFS_OP_READ_BULK` requests forwarded from PM.
+- Kernel performs a **cross-ASID copy**: finds the named CPIO entry and writes
+  `min(max_len, remaining)` bytes to `dst_ptr` in **PM's** address space (ASID of TID 3).
+- PM passes its stack `bulk_buf[4096]` VA as `BulkReadArgs.dst_ptr` in the IPC message.
+- After the IPC round-trip completes, PM reads the filled data from `bulk_buf`.
+- This is a temporary kernel-mediated transfer primitive.  The missing primitive for
+  zero-copy is a `MemoryObject` page-cap grant (Phase 3 target).
+
+### Lifecycle / removal gate
+
+- **Phase 2A / Phase 2B**: active, PM-only.
+- **Phase 3 target**: replace with `MemoryObject` page-cap grant; remove `arg5=PM_TID` extension.
+- **Removal condition**: VFS bulk-read path uses page-cap zero-copy and does not need kernel
+  cross-ASID copy mediation.
+
+### Syscall trace gates (hot-path, default `false`)
+
+- `INITRAMFS_READ_CHUNK_TRACE` in `src/kernel/syscall.rs` — per-chunk success/EOF log.
+- `PM_VFS_BULK_READ_CHUNK_TRACE` in PM service — Phase 2A per-chunk PM log.
+- `PM_VFS_BULK_READ_TRANSFER_CHUNK_TRACE` in PM service — Phase 2B per-chunk PM log.

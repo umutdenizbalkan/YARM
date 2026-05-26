@@ -215,20 +215,100 @@ pub fn run() {
                                 "INITRAMFS_READ_BULK fd={} requested={}",
                                 args.fd, args.requested_len
                             );
-                            // Phase 2 stub: PM uses kernel syscall nr=27 for data transfer.
-                            // Return status=unsupported so PM falls back to kernel direct path.
-                            let reply = yarm_ipc_abi::vfs_abi::BulkReadReply {
-                                copied_len: 0,
-                                eof: false,
-                            };
-                            let reply_bytes = reply.encode();
-                            let response = yarm_user_rt::ipc::Message::new(1, &reply_bytes)
-                                .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"));
-                            yarm_user_rt::user_log!(
-                                "INITRAMFS_READ_BULK_REPLY fd={} copied=0 eof=false phase=2_stub",
-                                args.fd
-                            );
-                            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                            // Validate requested_len
+                            if args.requested_len > 4096 {
+                                yarm_user_rt::user_log!(
+                                    "INITRAMFS_READ_BULK_BAD_LEN requested={}",
+                                    args.requested_len
+                                );
+                                let _ = unsafe {
+                                    yarm_user_rt::syscall::ipc_reply(
+                                        reply_cap,
+                                        &yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"),
+                                    )
+                                };
+                                continue;
+                            }
+                            // Validate dst_ptr is non-zero
+                            if args.dst_ptr == 0 {
+                                yarm_user_rt::user_log!(
+                                    "INITRAMFS_READ_BULK_BAD_BUFFER reason=null_dst_ptr"
+                                );
+                                let _ = unsafe {
+                                    yarm_user_rt::syscall::ipc_reply(
+                                        reply_cap,
+                                        &yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"),
+                                    )
+                                };
+                                continue;
+                            }
+                            // Phase 2B: look up CPIO name and file length for this fd.
+                            // Kernel syscall nr=27 (arg5=PM_TID) copies data directly into PM's
+                            // transfer buffer at dst_ptr via cross-ASID copy.
+                            let cpio_name_opt = svc.backend().cpio_name_for_fd(args.fd);
+                            let file_len_opt = svc.backend().file_len_for_fd(args.fd);
+                            match (cpio_name_opt, file_len_opt) {
+                                (Some(cpio_name), Some(file_len)) => {
+                                    let max_len = core::cmp::min(
+                                        args.requested_len as usize,
+                                        4096,
+                                    );
+                                    // SAFETY: initramfs_write_to_pm_buf delegates to kernel
+                                    // syscall nr=27 with arg5=PM_BOOTSTRAP_TID (3), which writes
+                                    // to PM's address space at dst_ptr.  The kernel validates the
+                                    // target ASID before performing the cross-task copy.
+                                    let result = unsafe {
+                                        yarm_user_rt::syscall::initramfs_write_to_pm_buf(
+                                            cpio_name,
+                                            args.offset,
+                                            args.dst_ptr as usize,
+                                            max_len,
+                                        )
+                                    };
+                                    match result {
+                                        Ok(copied_len) => {
+                                            let eof = copied_len == 0
+                                                || args.offset.saturating_add(copied_len as u64) >= file_len;
+                                            let reply = yarm_ipc_abi::vfs_abi::BulkReadReply {
+                                                copied_len: copied_len as u64,
+                                                eof,
+                                            };
+                                            let reply_bytes = reply.encode();
+                                            let response = yarm_user_rt::ipc::Message::new(0, &reply_bytes)
+                                                .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"));
+                                            yarm_user_rt::user_log!(
+                                                "INITRAMFS_READ_BULK_REPLY fd={} copied={} eof={}",
+                                                args.fd, copied_len, eof
+                                            );
+                                            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                                        }
+                                        Err(e) => {
+                                            yarm_user_rt::user_log!(
+                                                "INITRAMFS_READ_BULK_FAIL fd={} reason={:?}",
+                                                args.fd, e
+                                            );
+                                            let _ = unsafe {
+                                                yarm_user_rt::syscall::ipc_reply(
+                                                    reply_cap,
+                                                    &yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"),
+                                                )
+                                            };
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    yarm_user_rt::user_log!(
+                                        "INITRAMFS_READ_BULK_FAIL fd={} reason=bad_fd",
+                                        args.fd
+                                    );
+                                    let _ = unsafe {
+                                        yarm_user_rt::syscall::ipc_reply(
+                                            reply_cap,
+                                            &yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"),
+                                        )
+                                    };
+                                }
+                            }
                         } else {
                             // Malformed payload
                             let _ = unsafe {
