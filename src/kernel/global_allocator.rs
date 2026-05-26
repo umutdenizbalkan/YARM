@@ -102,6 +102,12 @@ mod non_hosted {
                 };
                 return virt as usize as *mut u8;
             }
+            // AArch64 and RISC-V use an identity mapping for the kernel heap region:
+            // KERNEL_BOOTSTRAP_VIRT_BASE == KERNEL_BOOTSTRAP_PHYS_BASE (e.g. 0x40080000 on
+            // virt/QEMU), so the physical frame address is the same as the virtual pointer.
+            // This assumption must hold for all platforms that use this allocator path; adding
+            // a new port requires either (a) keeping the identity mapping invariant or (b)
+            // replacing this conversion with a proper virt↔phys translation.
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             {
                 return phys as usize as *mut u8;
@@ -195,9 +201,17 @@ mod non_hosted {
                 return false;
             }
             let capacity = (PAGE_SIZE - start) / obj_size;
+            // alloc_bitmap is [u64; 4] == 256 bits; valid slot indices are 0..=255.
+            // capacity == 256 is acceptable (index 255 maps to bit 63 of word 3).
+            // capacity > 256 would overflow the bitmap, so we reject it.
+            // In practice the largest capacity (16-byte class) is 252, well within bounds.
             if capacity == 0 || capacity > 256 {
                 return false;
             }
+            debug_assert!(
+                capacity <= core::mem::size_of::<[u64; 4]>() * 8,
+                "slab capacity {capacity} overflows alloc_bitmap"
+            );
 
             let header = SlabPageHeader {
                 magic: SLAB_MAGIC,
@@ -385,6 +399,19 @@ mod non_hosted {
             if layout.align() > PAGE_SIZE || !layout.align().is_power_of_two() {
                 return null_mut();
             }
+            // Large allocation layout:
+            //   Page 0 (base_ptr .. base_ptr+PAGE_SIZE): LargeAllocHeader at offset 0.
+            //     Fields: magic (LARGE_MAGIC) + pages (total_pages as u64, >= 2).
+            //   Page 1 .. Page N (base_ptr+PAGE_SIZE ..): user payload, returned to caller.
+            //
+            // total_pages = 1 (header page) + payload_pages, where payload_pages is
+            // ceil(size + sizeof(LargeAllocHeader) / PAGE_SIZE) rounded up to at least 1.
+            // The extra header-overhead in payload_pages is conservative; it guarantees the
+            // caller's layout.size() bytes fit entirely within pages 1..N.
+            //
+            // Invariant: alloc_pt_contiguous_frames returns physically and virtually
+            // contiguous pages (the frame allocator maintains this), so base_ptr+PAGE_SIZE
+            // is a valid mapped pointer and the returned slice covers exactly pages 1..N.
             let payload_plus_header = layout.size().saturating_add(size_of::<LargeAllocHeader>());
             let payload_pages = payload_plus_header.div_ceil(PAGE_SIZE).max(1);
             let total_pages = payload_pages.saturating_add(1);
