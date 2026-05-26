@@ -26,6 +26,8 @@ use yarm_srv_common::service_loop::run_typed_request_loop;
 #[cfg(test)]
 use yarm_user_rt::capability::CapId;
 use yarm_user_rt::ipc::Message;
+
+const PM_VFS_READ_APPEND_TRACE: bool = false;
 #[cfg(not(test))]
 use yarm_user_rt::vfs_client::{
     build_close_message, build_openat_message, build_read_message, build_statx_message,
@@ -1692,10 +1694,12 @@ unsafe fn pm_read_all_via_vfs(
             let first4_end = core::cmp::min(copy_len, 4);
             let first4 = &inline[..first4_end];
             out.extend_from_slice(&inline[..copy_len]);
-            yarm_user_rt::user_log!(
-                "PM_VFS_READ_APPEND bytes={} total={} expected={} first4={:x?}",
-                copy_len, out.len(), file_len, first4
-            );
+            if PM_VFS_READ_APPEND_TRACE {
+                yarm_user_rt::user_log!(
+                    "PM_VFS_READ_APPEND bytes={} total={} expected={} first4={:x?}",
+                    copy_len, out.len(), file_len, first4
+                );
+            }
         }
 
         if out.len() == prev_len {

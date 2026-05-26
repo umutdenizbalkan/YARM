@@ -95,7 +95,7 @@ impl KernelState {
                     VirtAddr(page_base as u64),
                 )
                 .is_some();
-                if cfg!(not(feature = "hosted-dev")) {
+                if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
                     crate::yarm_log!(
                         "COPY_TO_USER_PAGE asid={} page_va=0x{:x} pte_present={} offset={}",
                         asid.0,

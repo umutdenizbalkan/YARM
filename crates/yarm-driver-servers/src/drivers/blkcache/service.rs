@@ -157,9 +157,9 @@ pub fn run() {
         loop { let _ = yarm_user_rt::syscall::yield_now(); }
     };
     yarm_user_rt::user_log!("BLKCACHE_SRV_RECV_CAP cap={}", recv_cap);
-    yarm_user_rt::user_log!("BLKCACHE_BLOCKING_RECV_LOOP");
-
     let mut backends = [BackendRecord::empty(); MAX_BACKENDS];
+    yarm_user_rt::user_log!("BLKCACHE_SRV_READY");
+    yarm_user_rt::user_log!("BLKCACHE_BLOCKING_RECV_LOOP");
 
     loop {
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {

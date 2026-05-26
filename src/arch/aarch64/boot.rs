@@ -553,6 +553,7 @@ static BSP_RELEASE_LOGGED: AtomicBool = AtomicBool::new(false);
 static SECONDARY_ONLINE_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static SECONDARY_READY_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
+const AARCH64_LOCK_SPLIT_TRACE: bool = false;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static SECONDARY_JOINED_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -682,7 +683,9 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     let trap_cpu =
         crate::kernel::scheduler::CpuId((crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8);
     if let Some(shared) = trap_shared_kernel() {
-        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry");
+        if AARCH64_LOCK_SPLIT_TRACE {
+            crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry");
+        }
         let mut trap_frame = crate::kernel::trapframe::TrapFrame::zeroed();
         trap_frame.set_saved_pc(frame.elr_el1 as usize);
         trap_frame.set_saved_sp(frame.sp_el0 as usize);
@@ -722,7 +725,9 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
             }
         }
     } else if let Some(kernel) = trap_kernel_state_mut() {
-        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry fallback=1");
+        if AARCH64_LOCK_SPLIT_TRACE {
+            crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry fallback=1");
+        }
         let current_tid = kernel.current_tid();
         if current_tid == Some(1) {
             boot_trace!(

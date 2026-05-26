@@ -33,6 +33,7 @@ pub fn run() {
     let Some(recv_cap) = ctx.process_manager_service_recv_ep else {
         return;
     };
+    yarm_user_rt::user_log!("VIRTIO_BLK_SRV_READY");
     loop {
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
             Ok(Some(received)) => {

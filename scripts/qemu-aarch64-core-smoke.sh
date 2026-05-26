@@ -69,6 +69,29 @@ else
   QEMU_STATUS=$?
 fi
 
+log_count_pattern() {
+  local pattern="$1"
+  [[ -f "$LOGFILE" ]] || { echo 0; return; }
+  tr '\r' '\n' <"$LOGFILE" | rg -a -c "\\b${pattern}\\b" 2>/dev/null || echo 0
+}
+
+BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_COMPLETE_FAILED|CapabilityFull|VM_FULL|YARM_FIRST_USER_FAIL|MemoryObjectMissing|ELF_MISSING|PrivilegeViolation|failed to bootstrap first user task|panic|InvalidCapability|WrongObject|StaleCapability|MissingRight|UserMemoryFault|PM_RECV_DECODE_FAIL|bad_len expected=16 got=8|CAP_LOOKUP tid=1 cap=0|empty-elf|Malformed|Syscall\\(Internal\\)|memory allocation of|DELEGATE_FAIL|delegation.*fail|IPC_REPLY_FAST_REVOKE_FAIL|PM_PANIC|INIT_PANIC|DEVFS_PANIC|VFS_PANIC|INITRAMFS_PANIC|INITRAMFS_CPIO_EMPTY'
+BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected'
+
+if [[ -f "$LOGFILE" ]]; then
+  blocker_lines="$(tr '\r' '\n' <"$LOGFILE" | rg -a -n "$BLOCKER_REGEX" || true)"
+  if [[ -n "$blocker_lines" ]]; then
+    blocker_lines="$(printf '%s\n' "$blocker_lines" | rg -a -v "$BLOCKER_EXCLUDE_REGEX" || true)"
+  fi
+  if [[ -n "$blocker_lines" ]]; then
+    echo "[error] BAD / BOOT BLOCKERS found:"
+    printf '%s\n' "$blocker_lines"
+    exit 1
+  else
+    echo "[ok] BAD / BOOT BLOCKERS: empty"
+  fi
+fi
+
 if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then
   if ! check_required_patterns "$LOGFILE" "${EARLY_MARKER_SEQUENCE[@]}"; then
     echo "[warn] aarch64 strict required markers are incomplete"
@@ -91,6 +114,31 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
   fi
   if ! check_log_sequence "$LOGFILE" "${SPAWN_IPC_SEQUENCE[@]}"; then
     echo "[warn] spawn IPC sequence absent (user_log! is a no-op in no_std; expected)"
+  fi
+  declare -A REQUIRED_SERVICE_ENTRIES=(
+    [INITRAMFS_SRV_ENTRY]=1
+    [DEVFS_SRV_ENTRY]=1
+    [VFS_SRV_ENTRY]=1
+    [DRIVER_MANAGER_ENTRY]=1
+    [BLKCACHE_SRV_ENTRY]=1
+    [VIRTIO_BLK_SRV_ENTRY]=1
+    [DRIVER_MANAGER_READY]=1
+    [BLKCACHE_SRV_READY]=1
+    [VIRTIO_BLK_SRV_READY]=1
+  )
+  service_count_fail=0
+  for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"; do
+    expected="${REQUIRED_SERVICE_ENTRIES[$marker]}"
+    actual=$(log_count_pattern "$marker")
+    if [[ "$actual" -eq "$expected" ]]; then
+      echo "[ok] marker count: ${marker}=${actual}"
+    else
+      echo "[warn] marker count wrong: ${marker} expected=${expected} got=${actual}"
+      service_count_fail=1
+    fi
+  done
+  if [[ "$service_count_fail" -eq 1 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
+    exit 1
   fi
   echo "[ok] aarch64 strict marker progression detected"
   exit 0
