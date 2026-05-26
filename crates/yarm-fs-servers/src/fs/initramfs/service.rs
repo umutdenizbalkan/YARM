@@ -227,6 +227,7 @@ mod tests {
     use super::*;
     use alloc::boxed::Box;
     use alloc::format;
+    use alloc::vec;
 use alloc::vec::Vec;
     use super::super::archive::{INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_BOOT_MARKER_PATH_PTR};
     use super::super::super::common::vfs_ipc::{
@@ -317,25 +318,26 @@ use alloc::vec::Vec;
 
     #[test]
     fn inline_statx_routes_to_initramfs_by_real_path_bytes() {
+        let mut cpio_data = Vec::new();
+        push_entry(&mut cpio_data, "sbin/driver_manager", 0o100755, &[0xAA; 256]);
+        push_entry(&mut cpio_data, "TRAILER!!!", 0, &[]);
+        let leaked: &'static [u8] = Box::leak(cpio_data.into_boxed_slice());
         let router = MountRouter::new(
             0x4800_0000_0000_0000,
             DevFsBackend::default(),
-            InitramfsBackend::new(4096),
+            InitramfsBackend::from_cpio_newc_static(leaked),
         );
         let mut svc = VfsService::with_backend(router);
-        svc.set_policy(MountNamespacePolicy::deny_all());
+        svc.set_policy(MountNamespacePolicy::deny_all().with_prefix(b"/initramfs"));
 
         let reply = svc
             .handle_request(
-                statx_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0).expect("statx inline"),
+                statx_inline_message(0, INITRAMFS_DRIVER_MANAGER_PATH, 0, 0).expect("statx inline"),
             )
             .expect("statx reply");
 
         assert_eq!(reply.opcode, yarm_ipc_abi::vfs_abi::VFS_OP_STATX);
-        assert_eq!(
-            decode_reply_u64(reply),
-            0x1000_0000_0000_0000 | 0o400 | (4096 << 16)
-        );
+        assert_eq!(decode_reply_u64(reply), 256);
     }
 
     #[test]
@@ -470,6 +472,22 @@ use alloc::vec::Vec;
         assert!(entries >= 1);
 
         // Clean up: reset slots
+        yarm_user_rt::runtime::install_startup_arg_slots([0u64; 18]);
+    }
+
+    #[test]
+    fn build_runtime_backend_keeps_cpio_source_for_present_but_invalid_initrd() {
+        let invalid: &'static [u8] = Box::leak(vec![1u8, 2, 3, 4, 5, 6].into_boxed_slice());
+        let mut slots = [0u64; 18];
+        slots[15] = invalid.as_ptr() as u64;
+        slots[16] = invalid.len() as u64;
+        yarm_user_rt::runtime::install_startup_arg_slots(slots);
+
+        let (mut backend, source, entries) = build_runtime_backend();
+        assert_eq!(source, InitramfsBackendSource::Cpio);
+        assert_eq!(entries, 0);
+        assert_eq!(backend.statx_path(INITRAMFS_DRIVER_MANAGER_PATH), Ok(1536));
+
         yarm_user_rt::runtime::install_startup_arg_slots([0u64; 18]);
     }
 
