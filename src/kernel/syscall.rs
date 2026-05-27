@@ -251,7 +251,7 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     }
     let recv_meta_flags = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
         SYSCALL_RECV_META_REPLY_CAP
-    } else if (msg.flags & Message::FLAG_CAP_TRANSFER) != 0 {
+    } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0 {
         SYSCALL_RECV_META_TRANSFERRED_CAP
     } else {
         0
@@ -417,7 +417,7 @@ fn materialize_received_message_cap(
     let raw = msg.transferred_cap().map(|c| c.0);
     let (kind, value) = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
         ("reply", raw)
-    } else if (msg.flags & Message::FLAG_CAP_TRANSFER) != 0 {
+    } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0 {
         ("transfer", raw)
     } else {
         ("none", None)
@@ -1204,11 +1204,23 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
     let sender_tid = current_tid(kernel)?;
+
+    // ── Transfer-cap argument (arg5) ──────────────────────────────────────────
+    // The user-space `ipc_reply` wrapper passes the transferred cap's CapId as
+    // the last syscall argument (SYSCALL_ARG_TRANSFER_CAP).  We validate it
+    // eagerly so that any error is surfaced before we copy the payload from user
+    // memory (which may fault).
+    let transfer_cap = transfer_cap_arg(kernel, frame)?;
+    if let Some(c) = transfer_cap {
+        validate_transfer_cap(kernel, c)?;
+    }
+
     crate::yarm_log!(
-        "IPC_REPLY_ENTER tid={} reply_cap={} len={}",
+        "IPC_REPLY_ENTER tid={} reply_cap={} len={} transfer_cap={}",
         sender_tid,
         reply_cap.0,
-        len
+        len,
+        transfer_cap.map(|c| c.0).unwrap_or(SYSCALL_NO_TRANSFER_CAP),
     );
     let cnode = kernel.current_task_cnode();
     let slot_result = cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, reply_cap));
@@ -1226,7 +1238,9 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
     if len > Message::MAX_PAYLOAD {
         return Err(SyscallError::InvalidArgs);
     }
-    let msg = if current_task_has_user_asid(kernel)? {
+
+    // ── Build raw payload bytes ────────────────────────────────────────────────
+    let payload_bytes: [u8; Message::MAX_PAYLOAD] = if current_task_has_user_asid(kernel)? {
         let payload = match kernel.copy_from_current_user(user_ptr, len) {
             Ok(payload) => payload,
             Err(KernelError::UserMemoryFault) => {
@@ -1235,18 +1249,77 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
             }
             Err(other) => return Err(SyscallError::from(other)),
         };
-        Message::new(sender_tid, &payload[..len]).map_err(|_| SyscallError::InvalidArgs)?
+        let mut out = [0u8; Message::MAX_PAYLOAD];
+        out[..len].copy_from_slice(&payload[..len]);
+        out
     } else {
-        let payload = inline_payload_from_frame(frame, len)?;
-        Message::new(sender_tid, &payload[..len]).map_err(|_| SyscallError::InvalidArgs)?
+        inline_payload_from_frame(frame, len)?
     };
+
+    // ── Stash transfer envelope if a cap is being forwarded ───────────────────
+    //
+    // For reply-with-cap we need to bind the transfer envelope to the endpoint
+    // that the original caller is waiting on.  We peek the reply endpoint from
+    // the ReplyCapRecord *before* calling `ipc_reply` (which would consume the
+    // record).
+    //
+    // We use `FLAG_CAP_TRANSFER_PLAIN` (bit 2) rather than the standard
+    // `FLAG_CAP_TRANSFER` (bit 0).  `FLAG_CAP_TRANSFER` triggers
+    // `should_strip_inline_opcode_prefix` on the receiver side, which assumes
+    // the sender prepended a 2-byte opcode in the payload (the ipc_send/
+    // ipc_call protocol).  Reply messages carry the payload bytes verbatim
+    // without any such prefix; using FLAG_CAP_TRANSFER_PLAIN avoids the
+    // destructive 2-byte strip and preserves the full payload for the receiver.
+    let transfer_handle = if transfer_cap.is_some() {
+        let reply_endpoint = kernel
+            .reply_cap_peek_endpoint(reply_cap)
+            .map_err(SyscallError::from)?;
+        let handle = stash_transfer_handle(kernel, transfer_cap, reply_endpoint, None)?;
+        crate::yarm_log!(
+            "IPC_REPLY_WITH_CAP_STASH tid={} transfer_cap={} handle={} endpoint={:?}",
+            sender_tid,
+            transfer_cap.map(|c| c.0).unwrap_or(0),
+            handle.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
+            reply_endpoint,
+        );
+        handle
+    } else {
+        None
+    };
+
+    // ── Build the kernel IPC message ──────────────────────────────────────────
+    let msg = if let Some(handle) = transfer_handle {
+        Message::with_header(
+            sender_tid,
+            OPCODE_INLINE,
+            Message::FLAG_CAP_TRANSFER_PLAIN,
+            Some(handle),
+            &payload_bytes[..len],
+        )
+        .map_err(|_| SyscallError::InvalidArgs)?
+    } else {
+        Message::new(sender_tid, &payload_bytes[..len]).map_err(|_| SyscallError::InvalidArgs)?
+    };
+
     crate::yarm_log!(
-        "IPC_REPLY_DELIVER len={} opcode={} flags={}",
+        "IPC_REPLY_DELIVER len={} opcode={} flags={} has_cap={}",
         msg.len,
         msg.opcode,
-        msg.flags
+        msg.flags,
+        transfer_handle.is_some(),
     );
     if let Err(err) = kernel.ipc_reply(reply_cap, msg) {
+        // If ipc_reply failed and we stashed a transfer envelope, clean it up.
+        if let Some(handle) = transfer_handle {
+            // Best-effort: ignore the result of taking back the envelope.
+            if let Ok(reply_endpoint) = kernel.reply_cap_peek_endpoint(reply_cap) {
+                let _ = kernel.take_transfer_envelope(
+                    handle,
+                    reply_endpoint,
+                    crate::kernel::ipc::ThreadId(sender_tid),
+                );
+            }
+        }
         if err == KernelError::WrongObject {
             let cnode = kernel.current_task_cnode();
             let slot_cap = cnode.and_then(|cn| kernel.capability_for_cnode_local(cn, reply_cap));
@@ -1310,7 +1383,7 @@ fn handle_ipc_recv_result_with_empty_error(
         Some(msg) => {
             let recv_meta_flags = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
                 SYSCALL_RECV_META_REPLY_CAP
-            } else if (msg.flags & Message::FLAG_CAP_TRANSFER) != 0 {
+            } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0 {
                 SYSCALL_RECV_META_TRANSFERRED_CAP
             } else {
                 0

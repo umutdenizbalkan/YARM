@@ -161,6 +161,16 @@ impl KernelState {
         self.copy_from_user(asid, VirtAddr(ptr as u64), len)
     }
 
+    #[cfg(test)]
+    pub fn write_user_memory_for_asid(
+        &mut self,
+        asid: Asid,
+        ptr: usize,
+        data: &[u8],
+    ) -> Result<(), KernelError> {
+        self.copy_to_user(asid, VirtAddr(ptr as u64), data)
+    }
+
     #[cfg(any(
         feature = "hosted-dev",
         not(any(

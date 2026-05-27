@@ -90,6 +90,21 @@ impl Message {
     pub const MAX_PAYLOAD: usize = 128;
     pub const FLAG_CAP_TRANSFER: u16 = 1 << 0;
     pub const FLAG_REPLY_CAP: u16 = 1 << 1;
+    /// Marks a reply-with-cap message produced by `handle_ipc_reply`.
+    ///
+    /// Unlike `FLAG_CAP_TRANSFER` (used by ipc_send/ipc_call where user-rt
+    /// prepends a 2-byte opcode prefix), this flag signals that the kernel
+    /// message was produced by `handle_ipc_reply` and therefore the payload
+    /// bytes do NOT have an opcode prefix.  `should_strip_inline_opcode_prefix`
+    /// only checks `FLAG_CAP_TRANSFER` and `FLAG_REPLY_CAP`, so a message
+    /// carrying this flag is never incorrectly stripped.
+    ///
+    /// Receive paths (`complete_blocked_recv_for_waiter`,
+    /// `handle_ipc_recv_result_with_empty_error`, and
+    /// `materialize_received_message_cap`) handle this flag identically to
+    /// `FLAG_CAP_TRANSFER` — they set `SYSCALL_RECV_META_TRANSFERRED_CAP`
+    /// and materialize the kernel-side cap into the receiver's cnode.
+    pub const FLAG_CAP_TRANSFER_PLAIN: u16 = 1 << 2;
     pub const NO_TRANSFER_CAP: u64 = u64::MAX;
 
     pub fn new(sender_tid: u64, bytes: &[u8]) -> Result<Self, IpcError> {
@@ -109,12 +124,13 @@ impl Message {
 
         let has_cap = transferred_cap.is_some();
         let flag_set = (flags & Self::FLAG_CAP_TRANSFER) != 0;
+        let plain_flag_set = (flags & Self::FLAG_CAP_TRANSFER_PLAIN) != 0;
 
         let reply_flag_set = (flags & Self::FLAG_REPLY_CAP) != 0;
-        if has_cap && !(flag_set || reply_flag_set) {
+        if has_cap && !(flag_set || reply_flag_set || plain_flag_set) {
             return Err(IpcError::MissingCapTransferFlag);
         }
-        if !has_cap && (flag_set || reply_flag_set) {
+        if !has_cap && (flag_set || reply_flag_set || plain_flag_set) {
             return Err(IpcError::InconsistentCapTransferFlag);
         }
 
