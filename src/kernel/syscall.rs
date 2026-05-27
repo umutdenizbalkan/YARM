@@ -2998,7 +2998,9 @@ mod tests {
         assert_eq!(SYSCALL_VM_BRK_NR, 14);
         assert_eq!(SYSCALL_SPAWN_PROCESS_NR, 23);
         assert_eq!(SYSCALL_INITRAMFS_READ_CHUNK_NR, 27);
-        assert_eq!(SYSCALL_COUNT, 28);
+        assert_eq!(SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR, 28);
+        assert_eq!(SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR, 29);
+        assert_eq!(SYSCALL_COUNT, 30);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 

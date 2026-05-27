@@ -683,7 +683,13 @@ fn spawn_user_task_from_image_registers_asid_and_class() {
     let stack_top = tcb.user_stack_top.expect("stack top");
     assert_ne!(stack_top.0, 0, "user stack top must be non-zero");
     assert_eq!(tcb.user_context.instruction_ptr, VirtAddr(0x8000));
-    assert_eq!(tcb.user_context.stack_ptr, stack_top);
+    // stack_ptr is below stack_top (startup_args are placed on the stack before first entry).
+    let sp = tcb.user_context.stack_ptr;
+    assert!(sp.0 <= stack_top.0, "stack_ptr must be at or below stack_top");
+    assert!(
+        sp.0 > stack_top.0 - 64 * crate::kernel::vm::PAGE_SIZE as u64,
+        "stack_ptr must be within the allocated stack region"
+    );
     let stack_base = VirtAddr(stack_top.0 - 64 * crate::kernel::vm::PAGE_SIZE as u64);
     let guard = VirtAddr(stack_base.0 - crate::kernel::vm::PAGE_SIZE as u64);
     let aspace = state.user_spaces.get(asid).expect("aspace");

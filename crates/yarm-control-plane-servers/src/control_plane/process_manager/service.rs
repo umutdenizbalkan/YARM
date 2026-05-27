@@ -1758,12 +1758,10 @@ unsafe fn pm_try_grant_ro_and_spawn(
     };
     match result {
         Ok((tid, caller_cap, spawner_cap)) => {
+            // PM_ELF_ZC_DONE is emitted by the kernel (yarm_log!) inside handle_spawn_from_memory_object.
+            // Emit a distinct PM-side marker for the user-space log so as not to double-count.
             yarm_user_rt::user_log!(
-                "PM_ELF_ZC_DONE image_id={} zc_pages=0 copied_pages=0",
-                image_id
-            );
-            yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_RESULT image_id={} tid={} caller_cap={} spawner_cap={}",
+                "PM_SPAWN_FROM_MO_DONE image_id={} tid={} caller_cap={} spawner_cap={}",
                 image_id, tid, caller_cap, spawner_cap
             );
             Ok((tid, caller_cap, spawner_cap))
