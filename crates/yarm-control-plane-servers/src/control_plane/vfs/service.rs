@@ -17,6 +17,11 @@ use yarm_srv_common::vfs_reply::VfsReply;
 #[cfg(all(test, feature = "legacy-tests"))]
 use yarm_user_rt::capability::CapId;
 
+/// Trace gate for hot-path VFS bulk-read forwarding logs.
+/// Set to `true` only when debugging Phase 2B transfer-buffer bulk reads.
+/// Default `false`: VFS_FORWARD_BULK_READ and VFS_ROUTE_BULK_REPLY are suppressed.
+const VFS_BULK_READ_TRACE: bool = false;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfsLoopSummary {
     pub fd: u64,
@@ -731,14 +736,16 @@ pub fn run() {
                             if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_id)
                             {
                                 if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
-                                    // Decode full BulkReadArgs to log requested_len.
-                                    let requested = yarm_ipc_abi::vfs_abi::BulkReadArgs::decode(msg.as_slice())
-                                        .map(|b| b.requested_len)
-                                        .unwrap_or(0);
-                                    yarm_user_rt::user_log!(
-                                        "VFS_FORWARD_BULK_READ op={} fd={} requested={} target={} mode=transfer_buffer",
-                                        msg.opcode, args.fd, requested, label.as_str()
-                                    );
+                                    if VFS_BULK_READ_TRACE {
+                                        // Decode full BulkReadArgs to log requested_len.
+                                        let requested = yarm_ipc_abi::vfs_abi::BulkReadArgs::decode(msg.as_slice())
+                                            .map(|b| b.requested_len)
+                                            .unwrap_or(0);
+                                        yarm_user_rt::user_log!(
+                                            "VFS_FORWARD_BULK_READ op={} fd={} requested={} target={} mode=transfer_buffer",
+                                            msg.opcode, args.fd, requested, label.as_str()
+                                        );
+                                    }
                                 } else {
                                     yarm_user_rt::user_log!(
                                         "VFS_ROUTE_FD_LOOKUP fd={} target={}",
@@ -871,10 +878,12 @@ pub fn run() {
                     }
                 }
                 if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
-                    yarm_user_rt::user_log!(
-                        "VFS_ROUTE_BULK_REPLY op={} status=0 len={}",
-                        msg.opcode, response.len
-                    );
+                    if VFS_BULK_READ_TRACE {
+                        yarm_user_rt::user_log!(
+                            "VFS_ROUTE_BULK_REPLY op={} status=0 len={}",
+                            msg.opcode, response.len
+                        );
+                    }
                 } else {
                     yarm_user_rt::user_log!("VFS_ROUTE_REPLY op={} status=0 len={}", msg.opcode, response.len);
                 }
