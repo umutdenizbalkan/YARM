@@ -126,49 +126,43 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     [BLKCACHE_SRV_READY]=1
     [VIRTIO_BLK_SRV_READY]=1
   )
-  # Phase 2B freeze: verify bulk read path was used for image_id 7/8/9.
-  declare -A REQUIRED_BULK_MARKERS=(
-    [PM_VFS_READ_BULK_BEGIN]=3
-    [PM_VFS_READ_BULK_DONE]=3
-    [PM_VFS_READ_DONE]=3
-  )
-  bulk_count_fail=0
-  for marker in "${!REQUIRED_BULK_MARKERS[@]}"; do
-    expected="${REQUIRED_BULK_MARKERS[$marker]}"
-    actual=$(log_count_pattern "$marker")
-    if [[ "$actual" -ge "$expected" ]]; then
-      echo "[ok] bulk marker: ${marker}>=${expected} (got=${actual})"
-    else
-      echo "[warn] bulk marker missing: ${marker} expected>=${expected} got=${actual}"
-      bulk_count_fail=1
-    fi
-  done
-  if [[ "$bulk_count_fail" -eq 1 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
-    exit 1
-  fi
-
-  # Phase 3A: PM_ELF_ZC_DONE image_id=7/8/9 must each appear exactly once.
-  # PM_ELF_ZC_DONE is emitted by:
-  #   - Phase 3A path (spawn_from_memory_object, SPAWN_FROM_MO_OK) OR
-  #   - Phase 3A ZC loader (load_elf_with_mo_zero_copy, zc_pages/copied_pages counts)
-  # If Phase 3A grant is unsupported, PM falls back to Phase 2B and PM_ELF_ZC_DONE
-  # is still emitted (from the kernel-side SPAWN_FROM_MO / load path).
-  # NOTE: With CPIO file data not page-aligned, zc_pages=0 is expected; copied_pages
-  # captures the actual load. PM logs PM_ELF_ZC_DONE after kernel returns.
+  # Phase 3B freeze: VFS-mediated bulk read (Phase 2B) must NOT be used for
+  # image_id 7/8/9 — all three late services must spawn via the ZC grant path.
   if [[ -f "$LOGFILE" ]]; then
-    phase3a_img_fail=0
+    phase3b_bulk_fail=0
     for img_id in 7 8 9; do
-      zc_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE image_id=${img_id}\\b" 2>/dev/null || echo 0)
-      if [[ "$zc_count" -eq 1 ]]; then
-        echo "[ok] Phase 3A: PM_ELF_ZC_DONE image_id=${img_id} count=1"
+      bulk_done=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE image_id=${img_id}\\b" 2>/dev/null || echo 0)
+      if [[ "$bulk_done" -eq 0 ]]; then
+        echo "[ok] Phase 3B: PM_VFS_READ_BULK_DONE image_id=${img_id} count=0 (ZC path active)"
       else
-        echo "[warn] Phase 3A: PM_ELF_ZC_DONE image_id=${img_id} expected=1 got=${zc_count}"
-        phase3a_img_fail=1
+        echo "[error] Phase 3B: PM_VFS_READ_BULK_DONE image_id=${img_id} count=${bulk_done} (Phase 2B fallback active — regression)"
+        phase3b_bulk_fail=1
       fi
     done
-    if [[ "$phase3a_img_fail" -eq 1 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
-      echo "[error] Phase 3A per-image_id PM_ELF_ZC_DONE check failed (strict)"
-      exit 1
+    if [[ "$phase3b_bulk_fail" -eq 1 ]]; then
+      [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    fi
+  fi
+
+  # Phase 3B: PM_ELF_ZC_DONE must appear exactly once per image_id, AND zc_pages > 0
+  # (CPIO 4096-byte alignment + 4 KiB ELF LOAD alignment both satisfied).
+  if [[ -f "$LOGFILE" ]]; then
+    phase3b_zc_fail=0
+    for img_id in 7 8 9; do
+      zc_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE image_id=${img_id}\\b" 2>/dev/null || echo 0)
+      zc_nonzero=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE image_id=${img_id}\\b.*zc_pages=[1-9]" 2>/dev/null || echo 0)
+      if [[ "$zc_count" -eq 1 && "$zc_nonzero" -eq 1 ]]; then
+        echo "[ok] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} count=1 zc_pages>0"
+      elif [[ "$zc_count" -eq 1 && "$zc_nonzero" -eq 0 ]]; then
+        echo "[error] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} count=1 but zc_pages=0 (CPIO or ELF alignment regression)"
+        phase3b_zc_fail=1
+      else
+        echo "[error] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} expected=1 got=${zc_count}"
+        phase3b_zc_fail=1
+      fi
+    done
+    if [[ "$phase3b_zc_fail" -eq 1 ]]; then
+      [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
     fi
   fi
 
@@ -183,31 +177,14 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     fi
   fi
 
-  # Phase 2B freeze: per-image_id strict check — if Phase 3A succeeded, Phase 2B
-  # fallback (PM_VFS_READ_BULK_DONE mode=vfs_transfer) should be 0 for each image.
-  # If Phase 3A was unsupported and fell back, Phase 2B count is checked instead.
+  # Phase 3B: PM_ELF_ZC_FAIL must be 0 — no ZC loader errors permitted.
   if [[ -f "$LOGFILE" ]]; then
-    phase2b_img_fail=0
-    phase3a_total=0
-    phase2b_total=0
-    for img_id in 7 8 9; do
-      zc_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE image_id=${img_id}\\b" 2>/dev/null || echo 0)
-      bulk_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE image_id=${img_id}\\b.*mode=vfs_transfer" 2>/dev/null || echo 0)
-      phase3a_total=$((phase3a_total + zc_count))
-      phase2b_total=$((phase2b_total + bulk_count))
-      if [[ "$zc_count" -ge 1 ]]; then
-        echo "[ok] Phase 3A: image_id=${img_id} spawned via grant_ro path (zc_done=${zc_count})"
-      elif [[ "$bulk_count" -eq 1 ]]; then
-        echo "[ok] Phase 2B fallback: image_id=${img_id} mode=vfs_transfer count=1 (grant_ro unsupported)"
-      else
-        echo "[warn] image_id=${img_id}: neither Phase 3A nor Phase 2B completed (zc_done=${zc_count} bulk_done=${bulk_count})"
-        phase2b_img_fail=1
-      fi
-    done
-    echo "[ok] spawn path totals: phase3a_grant=${phase3a_total} phase2b_fallback=${phase2b_total}"
-    if [[ "$phase2b_img_fail" -eq 1 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
-      echo "[error] Phase 3A/2B per-image_id spawn check failed (strict)"
-      exit 1
+    ZC_FAIL_TOTAL=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_FAIL" 2>/dev/null || echo 0)
+    if [[ "$ZC_FAIL_TOTAL" -eq 0 ]]; then
+      echo "[ok] Phase 3B: PM_ELF_ZC_FAIL count=0"
+    else
+      echo "[error] Phase 3B: PM_ELF_ZC_FAIL count=${ZC_FAIL_TOTAL} (ZC loader errors detected)"
+      [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
     fi
   fi
 
@@ -234,21 +211,20 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     fi
   fi
 
-  # Mode check: log PM_VFS_READ_BULK_DONE completion counts per mode.
-  # Phase 3A: if all images went through grant_ro path, PM_VFS_READ_BULK_DONE may be 0.
-  # Phase 2B fallback: if grant_ro unsupported, PM_VFS_READ_BULK_DONE count will be 3.
+  # Phase 3B summary: all three late services must complete via ZC path with zc_pages>0.
   if [[ -f "$LOGFILE" ]]; then
+    ZC_DONE_TOTAL=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE" 2>/dev/null || echo 0)
+    ZC_NONZERO_TOTAL=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE.*zc_pages=[1-9]" 2>/dev/null || echo 0)
     BULK_DONE_VFS=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE.*mode=vfs_transfer" 2>/dev/null || echo 0)
     BULK_DONE_2A=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE.*mode=phase2a_bridge" 2>/dev/null || echo 0)
-    ZC_DONE_TOTAL=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE" 2>/dev/null || echo 0)
-    BULK_DONE_TOTAL=$((BULK_DONE_VFS + BULK_DONE_2A))
-    echo "[ok] PM_VFS_READ_BULK_DONE: mode=vfs_transfer=${BULK_DONE_VFS} mode=phase2a_bridge=${BULK_DONE_2A} total=${BULK_DONE_TOTAL}"
-    echo "[ok] PM_ELF_ZC_DONE total=${ZC_DONE_TOTAL}"
-    # Success condition: either Phase 3A completed all 3 images (ZC_DONE_TOTAL>=3),
-    # or Phase 2B completed all 3 images (BULK_DONE_TOTAL>=3), or a mix.
-    COMBINED=$((ZC_DONE_TOTAL + BULK_DONE_TOTAL))
-    if [[ "$COMBINED" -lt 3 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
-      echo "[error] expected at least 3 combined Phase 3A/2B spawn completions (zc_done=${ZC_DONE_TOTAL} bulk_done=${BULK_DONE_TOTAL} combined=${COMBINED})"
+    echo "[ok] Phase 3B summary: PM_ELF_ZC_DONE total=${ZC_DONE_TOTAL} zc_pages>0 count=${ZC_NONZERO_TOTAL}"
+    echo "[ok] Phase 2B residual: bulk_done_vfs=${BULK_DONE_VFS} bulk_done_phase2a=${BULK_DONE_2A} (both must be 0)"
+    if [[ "$ZC_DONE_TOTAL" -lt 3 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
+      echo "[error] Phase 3B: expected PM_ELF_ZC_DONE>=3 got=${ZC_DONE_TOTAL}"
+      exit 1
+    fi
+    if [[ "$ZC_NONZERO_TOTAL" -lt 3 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
+      echo "[error] Phase 3B: expected zc_pages>0 for all 3 images, got ${ZC_NONZERO_TOTAL}/3"
       exit 1
     fi
   fi
