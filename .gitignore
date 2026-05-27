@@ -6,3 +6,4 @@
 /build-x86_64/
 /rustc-ice-*.txt
 *.log
+scripts/__pycache__/
