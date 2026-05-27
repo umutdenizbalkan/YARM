@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::{KernelError, KernelState, MemoryObject, kernel_mut, kernel_ref};
+use super::{KernelError, KernelState, MemoryObject, MemoryObjectKind, kernel_mut, kernel_ref};
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::frame_allocator::FrameAllocError;
 use crate::kernel::scheduler::CpuId;
@@ -372,6 +372,15 @@ impl KernelState {
         phys: PhysAddr,
         len: usize,
     ) -> Result<(u64, CapId), KernelError> {
+        self.create_memory_object_with_len_and_kind(phys, len, MemoryObjectKind::Anonymous)
+    }
+
+    fn create_memory_object_with_len_and_kind(
+        &mut self,
+        phys: PhysAddr,
+        len: usize,
+        kind: MemoryObjectKind,
+    ) -> Result<(u64, CapId), KernelError> {
         if len == 0 || !len.is_multiple_of(crate::kernel::vm::PAGE_SIZE) {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
@@ -395,16 +404,85 @@ impl KernelState {
                 cap_refcount: 0,
                 map_refcount: 0,
                 pin_refcount: 0,
+                kind,
             });
             Ok::<u64, KernelError>(id)
         })?;
 
+        let rights = match kind {
+            MemoryObjectKind::Anonymous => CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            // File-backed slices are read-only: no WRITE right.
+            MemoryObjectKind::InitramfsFileSlice { .. } => CapRights::READ | CapRights::MAP,
+        };
         let cap = self.mint_capability_for_current_context(Capability::new(
             CapObject::MemoryObject { id },
-            CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            rights,
         ))?;
 
         Ok((id, cap))
+    }
+
+    /// Create a read-only `MemoryObject` backed by a slice of the boot initramfs CPIO.
+    ///
+    /// `initrd` is the full initrd byte slice (from `boot_initrd_bytes()`).
+    /// `file_data_offset` is the byte offset of the CPIO file data within `initrd`.
+    /// `file_len` is the exact file data length.
+    ///
+    /// The MemoryObject's physical address is the page-aligned start of the file data.
+    /// Its length is `file_len` rounded up to the next page boundary.
+    /// The returned cap has READ | MAP rights (no WRITE).
+    pub(crate) fn create_initramfs_file_slice_mo(
+        &mut self,
+        initrd: &[u8],
+        file_data_offset: usize,
+        file_len: usize,
+    ) -> Result<(u64, CapId), KernelError> {
+        use crate::kernel::vm::PAGE_SIZE;
+        if file_len == 0 {
+            return Err(KernelError::Vm(VmError::Misaligned));
+        }
+        let file_end = file_data_offset.checked_add(file_len).ok_or(KernelError::WrongObject)?;
+        if file_end > initrd.len() {
+            return Err(KernelError::WrongObject);
+        }
+        // Compute physical address: translate initrd virtual pointer → physical.
+        let initrd_virt_raw = initrd.as_ptr() as u64;
+        let initrd_phys_base = Self::normalize_initrd_phys_ptr_static(initrd_virt_raw)
+            .map_err(|_| KernelError::WrongObject)?;
+        let file_phys_raw = initrd_phys_base.checked_add(file_data_offset as u64)
+            .ok_or(KernelError::WrongObject)?;
+        // Round physical address down to page boundary.
+        let page_size = PAGE_SIZE as u64;
+        let phys_page_start = file_phys_raw & !(page_size - 1);
+        // Length: from page-aligned start through end of file data, rounded up.
+        let offset_within_page = (file_phys_raw - phys_page_start) as usize;
+        let len_pages = (offset_within_page + file_len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+
+        let kind = MemoryObjectKind::InitramfsFileSlice {
+            initrd_offset: file_data_offset as u64,
+            file_len: file_len as u64,
+        };
+        self.create_memory_object_with_len_and_kind(
+            PhysAddr(phys_page_start),
+            len_pages,
+            kind,
+        )
+    }
+
+    /// Translate an initrd virtual pointer to a physical address.
+    /// Mirrors the kernel's local `normalize_initrd_phys_ptr` helper in syscall.rs.
+    fn normalize_initrd_phys_ptr_static(raw_ptr: u64) -> Result<u64, KernelError> {
+        let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
+        let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
+        if virt_base > phys_base && raw_ptr >= virt_base {
+            let off = raw_ptr.checked_sub(virt_base).ok_or(KernelError::WrongObject)?;
+            let phys = phys_base.checked_add(off).ok_or(KernelError::WrongObject)?;
+            return Ok(phys);
+        }
+        if raw_ptr < virt_base || virt_base == phys_base {
+            return Ok(raw_ptr);
+        }
+        Err(KernelError::WrongObject)
     }
 
     pub fn alloc_anonymous_memory_object(&mut self) -> Result<(u64, CapId), KernelError> {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::boot::{KernelError, KernelState, TransferSharedRegion};
+use super::boot::{KernelError, KernelState, MemoryObjectKind, TransferSharedRegion};
 use super::capabilities::{CapId, CapObject, CapRights, Capability};
 use super::ipc::{
     IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
@@ -37,8 +37,14 @@ pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
 /// Phase 2 bulk-copy bridge: reads a named CPIO file chunk into caller's user buffer.
 /// TEMPORARY stepping stone — replace with page-cap zero-copy in Phase 3.
 pub const SYSCALL_INITRAMFS_READ_CHUNK_NR: usize = 27;
-pub const SYSCALL_COUNT: usize = 28;
-const _: [(); SYSCALL_COUNT] = [(); 28];
+/// Phase 3A: Create a read-only MemoryObject backed by a named CPIO file slice.
+/// Only callable by SystemServer tasks (initramfs_srv).
+pub const SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR: usize = 28;
+/// Phase 3A: Spawn a process from a MemoryObject capability (zero-copy ELF load path).
+/// Only callable by PM (TID=3).
+pub const SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR: usize = 29;
+pub const SYSCALL_COUNT: usize = 30;
+const _: [(); SYSCALL_COUNT] = [(); 30];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -99,10 +105,14 @@ pub enum Syscall {
     SpawnFromInitramfsFile = SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR,
     /// Phase 2 bulk-copy bridge. TEMPORARY — replace with page-cap in Phase 3.
     InitramfsReadChunk = SYSCALL_INITRAMFS_READ_CHUNK_NR,
+    /// Phase 3A: Create a read-only MemoryObject for a named CPIO file slice.
+    CreateInitramfsFileSliceMo = SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR,
+    /// Phase 3A: Spawn a process from a MemoryObject capability.
+    SpawnFromMemoryObject = SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 20;
+    pub const VARIANT_COUNT: usize = 22;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -129,6 +139,8 @@ impl Syscall {
             SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR => Ok(Self::SpawnProcessFromUserBuf),
             SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR => Ok(Self::SpawnFromInitramfsFile),
             SYSCALL_INITRAMFS_READ_CHUNK_NR => Ok(Self::InitramfsReadChunk),
+            SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR => Ok(Self::CreateInitramfsFileSliceMo),
+            SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR => Ok(Self::SpawnFromMemoryObject),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -2430,6 +2442,285 @@ fn handle_initramfs_read_chunk(
     Ok(())
 }
 
+/// Phase 3A: Create a read-only MemoryObject backed by a named initramfs CPIO file slice.
+///
+/// Access control: caller must be `TaskClass::SystemServer` (initramfs_srv only).
+///
+/// ABI: arg0=name_ptr, arg1=name_len, arg2=flags (reserved, must be 0)
+///
+/// Returns: ret0=0, ret1=cap_id (u64), ret2=file_len (u64) on success.
+fn handle_create_initramfs_file_slice_mo(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    // Access gate: SystemServer only.
+    let caller_tid = current_tid(kernel)?;
+    let caller_class = kernel.task_class(caller_tid);
+    if caller_class != Some(TaskClass::SystemServer) {
+        crate::yarm_log!(
+            "CREATE_INITRAMFS_FILE_SLICE_MO_DENIED tid={} reason=not_system_server",
+            caller_tid
+        );
+        return Err(SyscallError::MissingRight);
+    }
+
+    let name_ptr = frame.arg(0);
+    let name_len = frame.arg(1);
+    let flags    = frame.arg(2) as u64;
+
+    if name_len == 0 || name_len > 128 {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if flags != 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    let name_buf = kernel
+        .copy_from_current_user(name_ptr, name_len)
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    let raw_name = core::str::from_utf8(&name_buf[..name_len])
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    // Strip leading slash and optional "/initramfs/" prefix.
+    let name = raw_name.trim_start_matches('/');
+    let name = name.strip_prefix("initramfs/").unwrap_or(name);
+    let name = name.trim_start_matches('/');
+
+    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()
+        .ok_or(SyscallError::InvalidArgs)?;
+    let entry = CpioArchive::new(initrd)
+        .find(name)
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    let cpio_entry = match entry {
+        Some(e) => e,
+        None => {
+            crate::yarm_log!(
+                "CREATE_INITRAMFS_FILE_SLICE_MO_NOT_FOUND name={}",
+                name
+            );
+            return Err(SyscallError::InvalidArgs);
+        }
+    };
+    let file_data = cpio_entry.file_data();
+    let file_len = file_data.len();
+    if file_len == 0 {
+        crate::yarm_log!(
+            "CREATE_INITRAMFS_FILE_SLICE_MO_EMPTY name={}", name
+        );
+        return Err(SyscallError::InvalidArgs);
+    }
+    // Compute byte offset of file_data within the initrd blob.
+    let initrd_ptr = initrd.as_ptr() as usize;
+    let data_ptr = file_data.as_ptr() as usize;
+    let file_data_offset = data_ptr.checked_sub(initrd_ptr).ok_or(SyscallError::InvalidArgs)?;
+
+    let (mo_id, cap_id) = kernel
+        .create_initramfs_file_slice_mo(initrd, file_data_offset, file_len)
+        .map_err(SyscallError::from)?;
+
+    crate::yarm_log!(
+        "CREATE_INITRAMFS_FILE_SLICE_MO_OK tid={} name={} file_len={} mo_id={} cap={}",
+        caller_tid, name, file_len, mo_id, cap_id.0
+    );
+
+    // ret1 = cap_id (u32 packed into u64), ret2 = file_len
+    frame.set_ok(0, cap_id.0 as usize, file_len);
+    Ok(())
+}
+
+/// Phase 3A: Spawn a process from an InitramfsFileSlice MemoryObject capability.
+///
+/// Access control: caller must be PM (TID == PM_BOOTSTRAP_TID).
+///
+/// ABI: arg0=image_id, arg1=mo_cap (CapId), arg2=parent_pid,
+///      arg3=startup_args_ptr, arg4=startup_args_count
+///
+/// Resolves the MemoryObject → reads initrd slice → loads ELF via load_elf_with_mo_zero_copy
+/// → spawns exactly like SpawnFromInitramfsFile.
+///
+/// Returns: ret0=0, ret1=spawned_tid, ret2=packed_send_caps on success.
+fn handle_spawn_from_memory_object(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    // Access gate: PM only.
+    let caller_tid = current_tid(kernel)?;
+    if caller_tid != PM_BOOTSTRAP_TID {
+        crate::yarm_log!(
+            "SPAWN_FROM_MO_DENIED tid={} reason=not_pm",
+            caller_tid
+        );
+        return Err(SyscallError::MissingRight);
+    }
+
+    let image_id        = frame.arg(0) as u64;
+    let mo_cap_raw      = frame.arg(1) as u64;
+    let parent_pid      = frame.arg(2) as u64;
+    let startup_args_ptr = frame.arg(3);
+    let startup_args_count = frame.arg(4);
+
+    crate::yarm_log!(
+        "SPAWN_FROM_MO_ENTER image_id={} mo_cap={} parent_pid={}",
+        image_id, mo_cap_raw, parent_pid
+    );
+
+    let mo_cap = CapId(mo_cap_raw);
+
+    // Resolve capability → must be a MemoryObject.
+    let capability = kernel
+        .resolve_capability_for_task(caller_tid, mo_cap)
+        .map_err(SyscallError::from)?;
+    let mo_id = match capability.object {
+        CapObject::MemoryObject { id } => id,
+        _ => {
+            crate::yarm_log!("SPAWN_FROM_MO_WRONG_CAP image_id={} mo_cap={}", image_id, mo_cap_raw);
+            return Err(SyscallError::WrongObject);
+        }
+    };
+
+    // Look up MemoryObject slot to get the InitramfsFileSlice kind.
+    let (file_data_offset, file_len) = kernel.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|mo| mo.id == mo_id)
+            .and_then(|mo| match mo.kind {
+                MemoryObjectKind::InitramfsFileSlice { initrd_offset, file_len } => {
+                    Some((initrd_offset as usize, file_len as usize))
+                }
+                _ => None,
+            })
+            .ok_or(KernelError::WrongObject)
+    }).map_err(SyscallError::from)?;
+
+    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()
+        .ok_or(SyscallError::InvalidArgs)?;
+
+    if file_data_offset.checked_add(file_len).ok_or(SyscallError::InvalidArgs)? > initrd.len() {
+        crate::yarm_log!(
+            "SPAWN_FROM_MO_BOUNDS_ERR image_id={} off={} len={} initrd_len={}",
+            image_id, file_data_offset, file_len, initrd.len()
+        );
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    let elf_bytes = &initrd[file_data_offset..file_data_offset + file_len];
+    crate::yarm_log!(
+        "SPAWN_FROM_MO_ELF image_id={} elf_len={}", image_id, elf_bytes.len()
+    );
+
+    // Parse ELF for entry point.
+    let elf = ElfImageInfo::parse(image_id, elf_bytes)
+        .map_err(|_| SyscallError::InvalidArgs)?;
+    crate::yarm_log!("SPAWN_FROM_MO_ENTRY entry=0x{:x}", elf.entry);
+
+    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
+
+    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    startup_args[2] = 0;
+    let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
+    startup_args[12] = 0;
+    startup_args[13] = 0;
+    startup_args[14] = 0;
+    startup_args[15] = 0;
+    startup_args[16] = 0;
+
+    let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
+    let (asid, _aspace_cap) = kernel.create_user_address_space().map_err(SyscallError::from)?;
+    crate::yarm_log!("SPAWN_FROM_MO_TID tid={} asid={}", tid, asid.0);
+
+    // Compute physical base of the initrd blob for zero-copy feasibility check.
+    let initrd_virt_raw = initrd.as_ptr() as u64;
+    let initrd_phys_base = {
+        let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
+        let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
+        if virt_base > phys_base && initrd_virt_raw >= virt_base {
+            initrd_virt_raw - virt_base + phys_base
+        } else {
+            initrd_virt_raw
+        }
+    };
+
+    // Load ELF using zero-copy path (falls back to copy if alignment not feasible).
+    let (entry, _first_vaddr, _heap_base, zc_pages, copied_pages) = kernel
+        .load_elf_with_mo_zero_copy(asid, elf_bytes, initrd_phys_base, file_data_offset as u64)
+        .map_err(SyscallError::from)?;
+
+    crate::yarm_log!(
+        "PM_ELF_ZC_DONE image_id={} path={} zc_pages={} copied_pages={}",
+        image_id, image_path, zc_pages, copied_pages
+    );
+
+    let spawner_tid = caller_tid;
+    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
+        Ok((_, send_cap, recv_cap)) => {
+            crate::yarm_log!(
+                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
+                spawner_tid, send_cap.0, recv_cap.0
+            );
+            (send_cap.0, recv_cap.0)
+        }
+        Err(e) => {
+            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
+            (0u64, 0u64)
+        }
+    };
+    let service_reply_recv_cap = match kernel.create_endpoint(8) {
+        Ok((eid, _, recv_cap)) => {
+            crate::yarm_log!(
+                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
+                eid, recv_cap.0
+            );
+            recv_cap.0
+        }
+        Err(e) => {
+            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
+            0u64
+        }
+    };
+    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
+        match kernel.grant_capability_task_to_task_with_rights(
+            spawner_tid,
+            CapId(service_send_cap),
+            parent_pid,
+            CapRights::SEND,
+        ) {
+            Ok(cap) => cap.0,
+            Err(_) => service_send_cap,
+        }
+    } else {
+        service_send_cap
+    };
+
+    let spawned = kernel
+        .spawn_user_task_from_image(UserImageSpec {
+            tid,
+            entry,
+            asid: Some(asid),
+            class: TaskClass::SystemServer,
+            startup_args,
+            spawner_tid,
+            service_recv_cap,
+            service_reply_recv_cap,
+            extra_send_caps,
+        })
+        .map_err(SyscallError::from)?;
+
+    crate::yarm_log!("SPAWN_FROM_MO_OK image_id={} spawned_tid={}", image_id, spawned.tid);
+
+    let packed_ret2 = if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
+        ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
+    } else {
+        caller_send_cap as u64
+    };
+    frame.set_ok(
+        0,
+        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
+        packed_ret2 as usize,
+    );
+    Ok(())
+}
+
 fn handle_vm_anon_map(
     _kernel: &mut KernelState,
     _frame: &mut TrapFrame,
@@ -2549,6 +2840,8 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::SpawnProcessFromUserBuf => handle_spawn_process_from_user_buf(kernel, frame),
         Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame),
         Syscall::InitramfsReadChunk => handle_initramfs_read_chunk(kernel, frame),
+        Syscall::CreateInitramfsFileSliceMo => handle_create_initramfs_file_slice_mo(kernel, frame),
+        Syscall::SpawnFromMemoryObject => handle_spawn_from_memory_object(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));

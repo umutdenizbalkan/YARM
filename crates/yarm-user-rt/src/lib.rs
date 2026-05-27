@@ -58,6 +58,10 @@ pub mod syscall {
     pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
     /// Phase 2 bulk-copy bridge. TEMPORARY — replace with page-cap in Phase 3.
     pub const SYSCALL_INITRAMFS_READ_CHUNK_NR: usize = 27;
+    /// Phase 3A: Create a read-only MemoryObject for a named CPIO file slice.
+    pub const SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR: usize = 28;
+    /// Phase 3A: Spawn a process from a MemoryObject capability.
+    pub const SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR: usize = 29;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
     const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
@@ -700,6 +704,81 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(ret.ret1)
+    }
+
+    /// Phase 3A: Create a read-only MemoryObject backed by a named CPIO file slice.
+    ///
+    /// Only callable by SystemServer tasks (initramfs_srv).
+    ///
+    /// Returns `(cap_id, file_len)` on success where `cap_id` is the new MemoryObject
+    /// capability and `file_len` is the exact file data length.
+    ///
+    /// # Safety
+    /// `name` must be a valid byte slice in the caller's address space.
+    #[inline]
+    pub unsafe fn create_initramfs_file_slice_mo(
+        name: &[u8],
+        flags: u64,
+    ) -> core::result::Result<(u32, u64), SyscallError> {
+        let args = [
+            name.as_ptr() as usize,  // arg0 = name_ptr
+            name.len(),               // arg1 = name_len
+            flags as usize,           // arg2 = flags (reserved, must be 0)
+            0,
+            0,
+            0,
+        ];
+        // SAFETY: Uses architecture syscall ABI; name lifetime covers the call.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        // ret1 = cap_id (u32), ret2 = file_len (usize)
+        Ok((ret.ret1 as u32, ret.ret2 as u64))
+    }
+
+    /// Phase 3A: Spawn a process from an InitramfsFileSlice MemoryObject capability.
+    ///
+    /// Only callable by PM (TID=3).
+    ///
+    /// Returns `(child_tid, caller_cap, spawner_cap)` on success, same layout as
+    /// `spawn_process_from_user_buf`.
+    ///
+    /// # Safety
+    /// `startup_args` must be a valid array in the caller's address space.
+    #[inline]
+    pub unsafe fn spawn_from_memory_object(
+        image_id: u64,
+        mo_cap: u32,
+        parent_pid: u64,
+        startup_args: &[u64; 18],
+    ) -> core::result::Result<(u64, u32, u32), SyscallError> {
+        let args = [
+            image_id as usize,               // arg0 = image_id
+            mo_cap as usize,                 // arg1 = mo_cap
+            parent_pid as usize,             // arg2 = parent_pid
+            startup_args.as_ptr() as usize,  // arg3 = startup_args_ptr
+            startup_args.len(),              // arg4 = startup_args_count
+            0,
+        ];
+        // SAFETY: Uses architecture syscall ABI; startup_args lifetime covers the call.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
+        let spawner_cap = (ret.ret2 >> 32) as u32;
+        Ok((ret.ret1 as u64, caller_cap, spawner_cap))
     }
 
     #[inline]

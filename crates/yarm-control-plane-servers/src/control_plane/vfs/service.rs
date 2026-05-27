@@ -771,6 +771,31 @@ pub fn run() {
                         }
                     }
                 }
+                yarm_ipc_abi::vfs_abi::VFS_OP_FILE_GRANT_RO => {
+                    // Phase 3A: route FILE_GRANT_RO via fd-table lookup to the backend.
+                    // FileGrantRoArgs has the same wire layout (32 bytes, arg0=fd) as VfsV1Args.
+                    match yarm_ipc_abi::vfs_abi::FileGrantRoArgs::decode(msg.as_slice()) {
+                        Ok(args) => {
+                            if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_id) {
+                                yarm_user_rt::user_log!(
+                                    "VFS_FILE_GRANT_RO_FORWARD fd={} target={}",
+                                    args.fd, label.as_str()
+                                );
+                                Ok((send_cap, label))
+                            } else {
+                                yarm_user_rt::user_log!(
+                                    "VFS_FILE_GRANT_RO_BAD_FD fd={} client_id={}",
+                                    args.fd, client_id
+                                );
+                                Err(VFS_STATUS_ERR_BAD_FD)
+                            }
+                        }
+                        Err(_) => {
+                            yarm_user_rt::user_log!("VFS_FILE_GRANT_RO_CODEC_ERR");
+                            Err(VFS_STATUS_ERR_CODEC)
+                        }
+                    }
+                }
                 op => {
                     yarm_user_rt::user_log!("VFS_ROUTE_UNKNOWN_OP op={}", op);
                     Err(VFS_STATUS_ERR_UNKNOWN_OP)
@@ -884,6 +909,13 @@ pub fn run() {
                             msg.opcode, response.len
                         );
                     }
+                } else if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_FILE_GRANT_RO {
+                    // Phase 3A: cap is transparently forwarded by ipc_reply via response.transferred_cap.
+                    yarm_user_rt::user_log!(
+                        "VFS_FILE_GRANT_RO_RELAY op={} has_cap={}",
+                        msg.opcode,
+                        response.transferred_cap().is_some()
+                    );
                 } else {
                     yarm_user_rt::user_log!("VFS_ROUTE_REPLY op={} status=0 len={}", msg.opcode, response.len);
                 }

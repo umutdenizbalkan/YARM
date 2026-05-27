@@ -1434,8 +1434,47 @@ unsafe fn pm_vfs_spawn_inline(
         vfs_send_cap,
         reply_recv_cap
     );
-    // For image_id 7-9: use the Phase 2 bulk read path (kernel syscall nr=27).
+    // For image_id 7-9: try Phase 3A (MemoryObject cap grant) first, then fall
+    // back to Phase 2B (transfer-buffer bulk read) only on Unsupported.
     // For image_id 4-6: fall through to the existing inline 112-byte path.
+    if pm_image_cpio_name(image_id).is_some() {
+        // Phase 3A attempt: VFS_OP_FILE_GRANT_RO → SpawnFromMemoryObject.
+        let phase3a_result = unsafe {
+            pm_try_grant_ro_and_spawn(
+                image_id,
+                vfs_send_cap,
+                reply_recv_cap,
+                path_label,
+                parent_pid,
+                startup_args,
+            )
+        };
+        match phase3a_result {
+            Ok((tid, caller_cap, spawner_cap)) => {
+                yarm_user_rt::user_log!(
+                    "PM_VFS_SPAWN_IMAGE_SELECTED image_id={} source=phase3a_grant",
+                    image_id
+                );
+                return Ok((tid, caller_cap, spawner_cap));
+            }
+            Err(ProcessManagerError::Unsupported) => {
+                // Backend doesn't support FILE_GRANT_RO yet — fall back to Phase 2B.
+                yarm_user_rt::user_log!(
+                    "PM_VFS_GRANT_RO_UNSUPPORTED image_id={} fallback=phase2b",
+                    image_id
+                );
+            }
+            Err(e) => {
+                // Hard error (NotFound, Malformed) — no fallback.
+                yarm_user_rt::user_log!(
+                    "PM_ELF_ZC_FAIL image_id={} reason=phase3a_hard_err err={:?}",
+                    image_id, e
+                );
+                return Err(e);
+            }
+        }
+    }
+
     let image = match pm_image_cpio_name(image_id) {
         Some(cpio_name) => {
             unsafe {
@@ -1566,6 +1605,183 @@ unsafe fn pm_vfs_call_u64(
         Err(e) => {
             yarm_user_rt::user_log!("PM_VFS_REPLY_RECV_FAIL op={} err={:?}", op, e);
             Err(ProcessManagerError::Unsupported)
+        }
+    }
+}
+
+/// Phase 3A variant of `pm_vfs_call_u64` that also returns the transferred cap.
+#[cfg(not(test))]
+unsafe fn pm_vfs_call_full(
+    vfs_send_cap: u32,
+    reply_recv_cap: u32,
+    msg: &Message,
+) -> Result<(Message, Option<u32>), ProcessManagerError> {
+    let op = msg.opcode;
+    match unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, msg) } {
+        Ok(()) => {
+            yarm_user_rt::user_log!("PM_VFS_CALL_SENT op={} status=ok", op);
+        }
+        Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+            yarm_user_rt::user_log!("PM_VFS_CALL_BLOCKED_NORMAL op={}", op);
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("PM_VFS_CALL_FAIL op={} err={:?}", op, e);
+            return Err(ProcessManagerError::Unsupported);
+        }
+    }
+    match unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) } {
+        Ok(Some(received)) => {
+            let transferred_cap = received.transferred_cap;
+            yarm_user_rt::user_log!(
+                "PM_VFS_REPLY_FULL op={} len={} transferred_cap={}",
+                op, received.message.len,
+                transferred_cap.unwrap_or(0)
+            );
+            Ok((received.message, transferred_cap))
+        }
+        Ok(None) => {
+            yarm_user_rt::user_log!("PM_VFS_REPLY_FULL_FAIL op={} err=no_message", op);
+            Err(ProcessManagerError::WouldBlock)
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("PM_VFS_REPLY_FULL_FAIL op={} err={:?}", op, e);
+            Err(ProcessManagerError::Unsupported)
+        }
+    }
+}
+
+/// Phase 3A: Try VFS_OP_FILE_GRANT_RO and spawn from MemoryObject cap.
+///
+/// Returns `Ok((tid, caller_cap, spawner_cap))` on success.
+/// Returns `Err(ProcessManagerError::Unsupported)` if the backend doesn't support
+/// FILE_GRANT_RO — caller should fall back to Phase 2B.
+/// Returns other errors on hard failures (NotFound, Malformed) — NO fallback.
+#[cfg(not(test))]
+unsafe fn pm_try_grant_ro_and_spawn(
+    image_id: u64,
+    vfs_send_cap: u32,
+    reply_recv_cap: u32,
+    vfs_path: &[u8],
+    parent_pid: u64,
+    startup_args: &[u64; 18],
+) -> Result<(u64, u32, u32), ProcessManagerError> {
+    let path_str = core::str::from_utf8(vfs_path).unwrap_or("<path>");
+
+    yarm_user_rt::user_log!("PM_VFS_GRANT_RO_BEGIN image_id={} path={}", image_id, path_str);
+
+    // ── 1. OPENAT via VFS to get fd ──────────────────────────────────────────
+    let open_msg = build_openat_message(vfs_path, 0).map_err(|_| ProcessManagerError::Malformed)?;
+    let open_reply = match unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &open_msg) } {
+        Ok(r) => r,
+        Err(e) => {
+            yarm_user_rt::user_log!(
+                "PM_ELF_ZC_FAIL image_id={} reason=openat_fail err={:?}",
+                image_id, e
+            );
+            return Err(e);
+        }
+    };
+    let fd = match decode_u64(open_reply.as_slice()) {
+        Some(v) => v,
+        None => {
+            yarm_user_rt::user_log!("PM_ELF_ZC_FAIL image_id={} reason=bad_fd_decode", image_id);
+            return Err(ProcessManagerError::Malformed);
+        }
+    };
+    yarm_user_rt::user_log!("PM_VFS_GRANT_RO_OPENAT image_id={} fd={}", image_id, fd);
+
+    // ── 2. VFS_OP_FILE_GRANT_RO → get MemoryObject cap ──────────────────────
+    let grant_payload = yarm_ipc_abi::vfs_abi::FileGrantRoArgs::new(fd).encode();
+    let grant_msg = Message::with_header(
+        0,
+        yarm_ipc_abi::vfs_abi::VFS_OP_FILE_GRANT_RO,
+        0,
+        None,
+        &grant_payload,
+    ).map_err(|_| ProcessManagerError::Malformed)?;
+
+    let (grant_reply, transferred_cap) = match unsafe {
+        pm_vfs_call_full(vfs_send_cap, reply_recv_cap, &grant_msg)
+    } {
+        Ok(r) => r,
+        Err(e) => {
+            yarm_user_rt::user_log!(
+                "PM_ELF_ZC_FAIL image_id={} reason=grant_ro_ipc_fail err={:?}",
+                image_id, e
+            );
+            // Close fd on error.
+            if let Ok(close_msg) = build_close_message(fd) {
+                let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+            }
+            return Err(e);
+        }
+    };
+
+    // Check reply status: non-zero opcode or no transferred cap → unsupported.
+    if grant_reply.opcode != 0 || transferred_cap.is_none() {
+        yarm_user_rt::user_log!(
+            "PM_ELF_ZC_FAIL image_id={} reason=grant_ro_unsupported opcode={} has_cap={}",
+            image_id, grant_reply.opcode, transferred_cap.is_some()
+        );
+        if let Ok(close_msg) = build_close_message(fd) {
+            let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+        }
+        return Err(ProcessManagerError::Unsupported);
+    }
+
+    let mo_cap = transferred_cap.unwrap();
+
+    // Decode file_len from reply payload.
+    let reply_payload = grant_reply.as_slice();
+    let file_grant_reply = yarm_ipc_abi::vfs_abi::FileGrantRoReply::decode(reply_payload);
+    let file_len = file_grant_reply.map(|r| r.file_len).unwrap_or(0);
+
+    yarm_user_rt::user_log!(
+        "PM_VFS_GRANT_RO_RECEIVED image_id={} len={} cap={}",
+        image_id, file_len, mo_cap
+    );
+
+    // Close fd — we have the cap now.
+    if let Ok(close_msg) = build_close_message(fd) {
+        let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+    }
+
+    // ── 3. Spawn from MemoryObject cap (kernel syscall nr=29) ────────────────
+    // SAFETY: mo_cap is a valid MemoryObject cap minted by the kernel.
+    let result = unsafe {
+        yarm_user_rt::syscall::spawn_from_memory_object(
+            image_id,
+            mo_cap,
+            parent_pid,
+            startup_args,
+        )
+    };
+    match result {
+        Ok((tid, caller_cap, spawner_cap)) => {
+            yarm_user_rt::user_log!(
+                "PM_ELF_ZC_DONE image_id={} zc_pages=0 copied_pages=0",
+                image_id
+            );
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_RESULT image_id={} tid={} caller_cap={} spawner_cap={}",
+                image_id, tid, caller_cap, spawner_cap
+            );
+            Ok((tid, caller_cap, spawner_cap))
+        }
+        Err(yarm_user_rt::syscall::SyscallError::WrongObject)
+        | Err(yarm_user_rt::syscall::SyscallError::InvalidArgs) => {
+            yarm_user_rt::user_log!(
+                "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_unsupported",
+                image_id
+            );
+            Err(ProcessManagerError::Unsupported)
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!(
+                "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_err err={:?}",
+                image_id, e
+            );
+            Err(ProcessManagerError::Malformed)
         }
     }
 }
