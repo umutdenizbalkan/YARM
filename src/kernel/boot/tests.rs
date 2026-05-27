@@ -5867,3 +5867,758 @@ fn run_ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
             "VFS cnode exhausted after 1536 direct-mint cycles: Reply cap slot leak detected",
         );
 }
+
+// ── Phase 3A: ipc_reply transfer-cap tests ────────────────────────────────────
+
+/// Phase 3A: Verify that the syscall-level `ipc_reply` path with a MemoryObject
+/// transfer cap correctly materializes a receiver-local cap.
+///
+/// This exercises the full `handle_ipc_reply → stash_transfer_handle →
+/// FLAG_CAP_TRANSFER_PLAIN message → complete_blocked_recv_for_waiter →
+/// materialize_received_transfer_cap` pipeline.
+#[test]
+fn ipc_reply_with_cap_materializes_receiver_local_memory_object_cap() {
+    std::thread::Builder::new()
+        .name("ipc_reply_with_cap_materializes_receiver_local_memory_object_cap".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_reply_with_cap_materializes_receiver_local_memory_object_cap)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_reply_with_cap_materializes_receiver_local_memory_object_cap() {
+    // task 0 = requester (PM-like):    sends request, waits for reply with cap
+    // task 1 = replier  (server-like): receives request, replies with MemoryObject cap
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+
+    // Both tasks need user ASIDs so that copy_to/from_user paths work.
+    let (asid0, aspace0) = state.create_user_address_space().expect("asid0");
+    let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(0, asid0).expect("bind asid0");
+    state.bind_task_asid(1, asid1).expect("bind asid1");
+
+    // Map buffers for both tasks.  task 0 buffer at 0x3000 (payload+meta),
+    // task 1 buffer at 0x4000 (recv payload+meta + reply payload).
+    state
+        .map_user_page(aspace0, VirtAddr(0x3000),
+            Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW })
+        .expect("map task0 page");
+    state
+        .map_user_page(aspace1, VirtAddr(0x4000),
+            Mapping { phys: PhysAddr(0xB000), flags: PageFlags::USER_RW })
+        .expect("map task1 page");
+
+    // Request endpoint (task 0 → task 1) and reply endpoint (task 1 → task 0).
+    let (_req_eid, req_send_cap_t0, req_recv_cap_global) =
+        state.create_endpoint(4).expect("req endpoint");
+    let req_recv_cap_t1 = state
+        .grant_capability_task_to_task(0, req_recv_cap_global, 1)
+        .expect("grant req_recv to task1");
+
+    let (_rep_eid, _rep_send, reply_recv_cap_t0) =
+        state.create_endpoint(4).expect("reply endpoint");
+
+    // Create a MemoryObject cap in task 1's cspace (simulates the cap returned
+    // by create_initramfs_file_slice_mo syscall 28).
+    let (_, global_mo_cap) = state.alloc_anonymous_memory_object().expect("mo");
+    let mo_cap_t1 = state
+        .grant_capability_task_to_task(0, global_mo_cap, 1)
+        .expect("grant mo to task1");
+
+    // Enqueue task 1; task 0 is already the current task (no need to enqueue).
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    // ── Navigate to task 1 ────────────────────────────────────────────────────
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("switch to task1");
+    }
+
+    // task 1 blocks on req_recv.
+    let mut recv_req = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [req_recv_cap_t1.0 as usize, 0x4000, 32, 0x4080, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut recv_req)).expect("task1 ipc_recv");
+
+    // ── Navigate to task 0 ────────────────────────────────────────────────────
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("switch to task0");
+    }
+
+    // task 0 issues ipc_call: sends a request, will block for reply.
+    let mut ipc_call_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcCall as usize,
+        [
+            req_send_cap_t0.0 as usize,   // send cap
+            0x3000,                        // payload ptr (can be zeroed)
+            0,                             // payload len = 0
+            0, 0,
+            reply_recv_cap_t0.0 as usize, // reply-recv cap (arg5)
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut ipc_call_frame)).expect("task0 ipc_call");
+
+    // ── Navigate back to task 1 ───────────────────────────────────────────────
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("switch to task1 for reply");
+    }
+
+    // Read the reply cap from the meta buffer that task 1 received.
+    let req_meta = state.read_user_memory_for_asid(asid1, 0x4080, 40).expect("read req meta");
+    let req_meta_flags = u64::from_le_bytes(req_meta[24..32].try_into().expect("flags"));
+    assert_ne!(req_meta_flags & 1, 0, "reply-cap flag must be set");
+    let reply_cap_t1 = CapId(u64::from_le_bytes(req_meta[16..24].try_into().expect("reply cap")));
+    assert!(
+        state.capability_service().resolve_current_task_capability(reply_cap_t1).is_some(),
+        "task1 must own the materialized reply cap"
+    );
+
+    // Write a small reply payload to task 1's memory.
+    state.write_user_memory_for_asid(asid1, 0x4000, &[0xAA, 0xBB]).expect("write payload");
+
+    // task 1 calls ipc_reply with the MemoryObject cap as transfer cap (arg5).
+    let mut ipc_reply_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcReply as usize,
+        [
+            reply_cap_t1.0 as usize,     // arg0 = reply cap
+            0x4000,                       // arg1 = payload ptr
+            2,                            // arg2 = payload len
+            0, 0,
+            mo_cap_t1.0 as usize,        // arg5 = transfer cap (MemoryObject)
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut ipc_reply_frame)).expect("task1 ipc_reply");
+    assert_eq!(ipc_reply_frame.error_code(), None, "ipc_reply must succeed");
+
+    // ── Navigate to task 0 ────────────────────────────────────────────────────
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("switch to task0 for recv");
+    }
+
+    // task 0 blocks on reply endpoint to drain the reply with cap.
+    let mut recv_reply_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [
+            reply_recv_cap_t0.0 as usize, // recv cap
+            0x3000,                        // payload ptr
+            32,                            // payload buf len
+            0x3080,                        // meta ptr
+            40,                            // meta len
+            0,
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut recv_reply_frame)).expect("task0 ipc_recv");
+
+    // Read back and verify.
+    let payload = state.read_user_memory_for_asid(asid0, 0x3000, 2).expect("read payload");
+    assert_eq!(&payload[..2], &[0xAA, 0xBB], "payload must be forwarded verbatim");
+
+    let meta = state.read_user_memory_for_asid(asid0, 0x3080, 40).expect("read reply meta");
+    let recv_meta_flags = u64::from_le_bytes(meta[24..32].try_into().expect("recv_meta_flags"));
+    let received_cap_id = u64::from_le_bytes(meta[16..24].try_into().expect("cap_id_field"));
+
+    // SYSCALL_RECV_META_TRANSFERRED_CAP = 1 << 1 = 2
+    assert_ne!(
+        recv_meta_flags & 2, 0,
+        "receiver must see SYSCALL_RECV_META_TRANSFERRED_CAP flag; recv_meta_flags={}",
+        recv_meta_flags
+    );
+    assert_ne!(
+        received_cap_id, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "receiver must have a materialized MemoryObject cap"
+    );
+
+    // Verify that task 0 now owns a MemoryObject cap.
+    let received_cap = CapId(received_cap_id);
+    let t0_cnode = state.current_task_cnode().expect("task0 cnode");
+    let cap_entry = state.capability_for_cnode(t0_cnode, received_cap)
+        .expect("materialized cap must exist in task0's cnode");
+    assert!(
+        matches!(cap_entry.object, CapObject::MemoryObject { .. }),
+        "materialized cap must be a MemoryObject, got {:?}",
+        cap_entry.object
+    );
+}
+
+/// Phase 3A: Verify that the transfer envelope binding rejects mismatched
+/// endpoints and wrong receivers, preventing capability forgery.
+///
+/// This directly tests the security properties of `stash_transfer_envelope` /
+/// `take_transfer_envelope` that underpin `handle_ipc_reply` cap delivery.
+#[test]
+fn reply_transfer_cap_endpoint_binding_rejects_wrong_receiver_or_forged_context() {
+    std::thread::Builder::new()
+        .name("reply_transfer_cap_endpoint_binding_rejects_wrong_receiver_or_forged_context".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_reply_transfer_cap_endpoint_binding_rejects_wrong_receiver_or_forged_context)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_reply_transfer_cap_endpoint_binding_rejects_wrong_receiver_or_forged_context() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    state.register_task(2).expect("task2");
+
+    let (_eid1, _send1, _recv1) = state.create_endpoint(2).expect("endpoint1");
+    let ep1_obj = state
+        .capability_service()
+        .resolve_current_task_capability(_recv1)
+        .expect("ep1 cap")
+        .object;
+    let (_eid2, _send2, _recv2) = state.create_endpoint(2).expect("endpoint2");
+    let ep2_obj = state
+        .capability_service()
+        .resolve_current_task_capability(_recv2)
+        .expect("ep2 cap")
+        .object;
+
+    let (_mo_id, mo_cap) = state.alloc_anonymous_memory_object().expect("mo");
+
+    // Stash a transfer envelope bound to ep1 with receiver = task1.
+    let handle = state
+        .stash_transfer_envelope(
+            crate::kernel::ipc::ThreadId(0), // source = task0
+            mo_cap,
+            ep1_obj,
+            Some(crate::kernel::ipc::ThreadId(1)), // bound receiver = task1
+            None,
+        )
+        .expect("stash envelope");
+
+    // ── Wrong endpoint ────────────────────────────────────────────────────────
+    // take_transfer_envelope validates that the stored endpoint matches.
+    let not_found = state.take_transfer_envelope(
+        handle, ep2_obj, crate::kernel::ipc::ThreadId(1)
+    );
+    assert!(not_found.is_none(), "wrong endpoint must be rejected");
+
+    // ── Wrong receiver ────────────────────────────────────────────────────────
+    let not_found2 = state.take_transfer_envelope(
+        handle, ep1_obj, crate::kernel::ipc::ThreadId(2)
+    );
+    assert!(not_found2.is_none(), "wrong receiver tid must be rejected");
+
+    // ── Forged handle (bad generation) ────────────────────────────────────────
+    let forged = handle ^ 0x0001_0000; // flip a generation bit
+    let not_found3 = state.take_transfer_envelope(
+        forged, ep1_obj, crate::kernel::ipc::ThreadId(1)
+    );
+    assert!(not_found3.is_none(), "forged handle must be rejected");
+
+    // ── Correct credentials succeed ───────────────────────────────────────────
+    let envelope = state
+        .take_transfer_envelope(handle, ep1_obj, crate::kernel::ipc::ThreadId(1))
+        .expect("correct credentials must succeed");
+    assert_eq!(envelope.source_cap, mo_cap);
+    assert!(matches!(envelope.source_object, CapObject::MemoryObject { .. }));
+
+    // ── Envelope is one-shot: second take must fail ───────────────────────────
+    let second_take = state.take_transfer_envelope(
+        handle, ep1_obj, crate::kernel::ipc::ThreadId(1)
+    );
+    assert!(second_take.is_none(), "envelope must be consumed after first take");
+}
+
+/// Phase 3A: Verify that the initramfs FILE_GRANT_RO ipc_reply path carries the
+/// MemoryObject cap to the direct receiver (single-hop, simulating initramfs→VFS).
+///
+/// This is identical in structure to `ipc_reply_with_cap_materializes_receiver_local
+/// _memory_object_cap` but uses names and context that mirror the real boot scenario.
+#[test]
+fn initramfs_file_grant_ro_reply_carries_cap() {
+    std::thread::Builder::new()
+        .name("initramfs_file_grant_ro_reply_carries_cap".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_initramfs_file_grant_ro_reply_carries_cap)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_initramfs_file_grant_ro_reply_carries_cap() {
+    // task 0 = VFS (requester of grant-RO)
+    // task 1 = initramfs_srv (has the MemoryObject, replies with it)
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("initramfs_srv task");
+
+    let (asid0, aspace0) = state.create_user_address_space().expect("asid0");
+    let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(0, asid0).expect("bind asid0");
+    state.bind_task_asid(1, asid1).expect("bind asid1");
+
+    state.map_user_page(aspace0, VirtAddr(0x5000),
+        Mapping { phys: PhysAddr(0xD000), flags: PageFlags::USER_RW })
+        .expect("map vfs page");
+    state.map_user_page(aspace1, VirtAddr(0x6000),
+        Mapping { phys: PhysAddr(0xE000), flags: PageFlags::USER_RW })
+        .expect("map initramfs_srv page");
+
+    let (_ep_id, ep_send_t0, ep_recv_global) = state.create_endpoint(4).expect("ep");
+    let ep_recv_t1 = state.grant_capability_task_to_task(0, ep_recv_global, 1)
+        .expect("grant ep recv to initramfs_srv");
+    let (_rep_id, _rep_send, reply_recv_t0) = state.create_endpoint(4).expect("reply ep");
+
+    // MemoryObject representing the CPIO file slice (created by initramfs_srv via syscall 28).
+    let (_mo_id, mo_global) = state.alloc_anonymous_memory_object().expect("alloc mo");
+    let mo_cap_t1 = state.grant_capability_task_to_task(0, mo_global, 1)
+        .expect("grant mo cap to initramfs_srv");
+
+    // Enqueue task 1 only; task 0 is already the current task.
+    state.enqueue_current_cpu(1).expect("enqueue initramfs_srv");
+
+    // initramfs_srv blocks on its receive endpoint.
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("navigate to initramfs_srv");
+    }
+    let mut srv_recv = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [ep_recv_t1.0 as usize, 0x6000, 32, 0x6080, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut srv_recv)).expect("initramfs_srv ipc_recv");
+
+    // VFS sends the FILE_GRANT_RO request via ipc_call.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("navigate to vfs");
+    }
+    // Write a 10-byte FileGrantRoArgs payload to VFS memory.
+    let grant_args_bytes = [0u8; 10];
+    state.write_user_memory_for_asid(asid0, 0x5000, &grant_args_bytes).expect("write grant args");
+
+    let mut call_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcCall as usize,
+        [
+            ep_send_t0.0 as usize,
+            0x5000, // payload ptr
+            10,     // payload len
+            0, 0,
+            reply_recv_t0.0 as usize, // reply recv cap
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut call_frame)).expect("vfs ipc_call");
+
+    // initramfs_srv wakes up, reads the reply cap from meta.
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("navigate to initramfs_srv for reply");
+    }
+    let meta1 = state.read_user_memory_for_asid(asid1, 0x6080, 40).expect("read initramfs meta");
+    let meta_flags1 = u64::from_le_bytes(meta1[24..32].try_into().expect("flags"));
+    assert_ne!(meta_flags1 & 1, 0, "initramfs_srv must see reply-cap flag");
+    let reply_cap_t1 = CapId(u64::from_le_bytes(meta1[16..24].try_into().expect("reply cap")));
+
+    // Write a FileGrantRoReply-like payload (12 bytes: file_len=1024, status=0).
+    let file_len: u64 = 1024;
+    let status: u32 = 0;
+    let mut reply_payload = [0u8; 12];
+    reply_payload[0..8].copy_from_slice(&file_len.to_le_bytes());
+    reply_payload[8..12].copy_from_slice(&status.to_le_bytes());
+    state.write_user_memory_for_asid(asid1, 0x6000, &reply_payload).expect("write reply payload");
+
+    // initramfs_srv replies with the MemoryObject cap (FLAG_CAP_TRANSFER_PLAIN path).
+    let mut reply_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcReply as usize,
+        [
+            reply_cap_t1.0 as usize, // reply cap
+            0x6000,                   // payload ptr
+            12,                       // payload len
+            0, 0,
+            mo_cap_t1.0 as usize,    // transfer cap = MemoryObject
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut reply_frame)).expect("initramfs_srv ipc_reply");
+    assert_eq!(reply_frame.error_code(), None, "ipc_reply with cap must succeed");
+
+    // VFS receives the reply.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("navigate to vfs for recv");
+    }
+    let mut vfs_recv = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [reply_recv_t0.0 as usize, 0x5000, 32, 0x5080, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut vfs_recv)).expect("vfs ipc_recv");
+
+    let reply_meta = state.read_user_memory_for_asid(asid0, 0x5080, 40).expect("read reply meta");
+    let reply_payload_recv = state.read_user_memory_for_asid(asid0, 0x5000, 12).expect("read reply payload");
+    let recv_meta_flags = u64::from_le_bytes(reply_meta[24..32].try_into().expect("recv_meta_flags"));
+    let received_cap_id = u64::from_le_bytes(reply_meta[16..24].try_into().expect("cap_id"));
+
+    // Payload must arrive intact (no OPCODE_INLINE stripping).
+    assert_eq!(&reply_payload_recv[..12], &reply_payload[..12],
+        "FileGrantRoReply payload must be delivered verbatim without stripping");
+
+    // SYSCALL_RECV_META_TRANSFERRED_CAP = 2.
+    assert_ne!(recv_meta_flags & 2, 0, "VFS must see TRANSFERRED_CAP flag; flags={}", recv_meta_flags);
+    assert_ne!(received_cap_id, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "VFS must receive a materialized MemoryObject cap");
+
+    // Verify VFS received a MemoryObject cap (has_cap=true).
+    let t0_cnode = state.task_cnode(0).expect("task0 cnode");
+    let mo_entry = state.capability_for_cnode(t0_cnode, CapId(received_cap_id))
+        .expect("materialized cap must be in VFS cnode");
+    assert!(matches!(mo_entry.object, CapObject::MemoryObject { .. }),
+        "cap must be a MemoryObject, got {:?}", mo_entry.object);
+}
+
+/// Phase 3A: Verify that a two-hop cap relay (server→relay→client) delivers the
+/// MemoryObject cap intact through both hops, simulating the VFS relay path.
+///
+/// Layout:
+///   task 0 (PM/client) → ipc_call → task 1 (VFS/relay) → ipc_call → task 2 (initramfs/server)
+///   task 2 → ipc_reply with MO cap → task 1 (receives local cap)
+///   task 1 → ipc_reply with local cap → task 0 (receives cap)
+#[test]
+fn vfs_file_grant_ro_relay_preserves_transferred_cap() {
+    std::thread::Builder::new()
+        .name("vfs_file_grant_ro_relay_preserves_transferred_cap".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_vfs_file_grant_ro_relay_preserves_transferred_cap)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_vfs_file_grant_ro_relay_preserves_transferred_cap() {
+    // 3 tasks: 0=PM, 1=VFS, 2=initramfs_srv
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1 VFS");
+    state.register_task(2).expect("task2 initramfs_srv");
+
+    let (asid0, aspace0) = state.create_user_address_space().expect("asid0");
+    let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+    let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+    state.bind_task_asid(0, asid0).expect("bind0");
+    state.bind_task_asid(1, asid1).expect("bind1");
+    state.bind_task_asid(2, asid2).expect("bind2");
+
+    // Map buffers.
+    state.map_user_page(aspace0, VirtAddr(0x2000),
+        Mapping { phys: PhysAddr(0xF000), flags: PageFlags::USER_RW }).expect("page0");
+    state.map_user_page(aspace1, VirtAddr(0x3000),
+        Mapping { phys: PhysAddr(0x10000), flags: PageFlags::USER_RW }).expect("page1");
+    state.map_user_page(aspace2, VirtAddr(0x4000),
+        Mapping { phys: PhysAddr(0x11000), flags: PageFlags::USER_RW }).expect("page2");
+
+    // PM → VFS endpoint and reply endpoint.
+    let (_ep_pm_vfs, ep_pm_vfs_send_t0, ep_pm_vfs_recv_global) =
+        state.create_endpoint(4).expect("ep_pm_vfs");
+    let ep_pm_vfs_recv_t1 = state
+        .grant_capability_task_to_task(0, ep_pm_vfs_recv_global, 1)
+        .expect("grant ep_pm_vfs_recv to VFS");
+    let (_, _, reply_pm_vfs_recv_t0) = state.create_endpoint(4).expect("reply_pm_vfs");
+
+    // VFS → initramfs endpoint and reply endpoint.
+    let (_ep_vfs_init, ep_vfs_init_send_t1, ep_vfs_init_recv_global) =
+        state.create_endpoint(4).expect("ep_vfs_init");
+    let ep_vfs_init_recv_t2 = state
+        .grant_capability_task_to_task(0, ep_vfs_init_recv_global, 2)
+        .expect("grant ep_vfs_init_recv to initramfs_srv");
+    let (_, _, reply_vfs_init_recv_t1) = state.create_endpoint(4).expect("reply_vfs_init");
+
+    // Grant the send and reply caps to their owners.
+    let ep_pm_vfs_send_t0_g = ep_pm_vfs_send_t0;
+    let ep_vfs_init_send_t1_g = state
+        .grant_capability_task_to_task(0, ep_vfs_init_send_t1, 1)
+        .expect("grant ep_vfs_init_send to VFS");
+    let reply_vfs_init_recv_t1_g = state
+        .grant_capability_task_to_task(0, reply_vfs_init_recv_t1, 1)
+        .expect("grant reply_vfs_init_recv to VFS");
+
+    // MemoryObject in initramfs_srv's cspace.
+    let (_mo_id, mo_global) = state.alloc_anonymous_memory_object().expect("alloc mo");
+    let mo_cap_t2 = state
+        .grant_capability_task_to_task(0, mo_global, 2)
+        .expect("grant mo to initramfs_srv");
+
+    // Enqueue tasks 2 and 1; task 0 is already the current task.
+    state.enqueue_current_cpu(2).expect("enqueue2");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    // ── initramfs_srv (task 2) blocks on its endpoint ─────────────────────────
+    while state.current_tid() != Some(2) {
+        state.yield_current().expect("nav to task2");
+    }
+    let mut t2_recv = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [ep_vfs_init_recv_t2.0 as usize, 0x4000, 32, 0x4080, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut t2_recv)).expect("task2 recv");
+
+    // ── VFS (task 1) blocks on PM→VFS endpoint ────────────────────────────────
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("nav to task1");
+    }
+    let mut t1_recv_pm = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [ep_pm_vfs_recv_t1.0 as usize, 0x3000, 32, 0x3080, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut t1_recv_pm)).expect("task1 recv from PM");
+
+    // ── PM (task 0) sends request to VFS via ipc_call ─────────────────────────
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("nav to task0");
+    }
+    let mut pm_call = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcCall as usize,
+        [ep_pm_vfs_send_t0_g.0 as usize, 0x2000, 0, 0, 0,
+         reply_pm_vfs_recv_t0.0 as usize],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut pm_call)).expect("pm ipc_call");
+
+    // ── VFS (task 1) forwards request to initramfs_srv ────────────────────────
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("nav to task1 relay forward");
+    }
+    // Read the PM→VFS reply cap from meta.
+    let meta_pm_vfs = state.read_user_memory_for_asid(asid1, 0x3080, 40).expect("meta_pm_vfs");
+    let flags_pm_vfs = u64::from_le_bytes(meta_pm_vfs[24..32].try_into().expect("flags"));
+    assert_ne!(flags_pm_vfs & 1, 0, "VFS must see reply-cap from PM");
+    let client_reply_cap_t1 = CapId(u64::from_le_bytes(meta_pm_vfs[16..24].try_into().expect("client_reply_cap")));
+
+    // VFS calls initramfs_srv via ipc_call.
+    let mut vfs_call = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcCall as usize,
+        [ep_vfs_init_send_t1_g.0 as usize, 0x3000, 0, 0, 0,
+         reply_vfs_init_recv_t1_g.0 as usize],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut vfs_call)).expect("vfs ipc_call");
+
+    // ── initramfs_srv (task 2) receives VFS request and replies with MO cap ───
+    while state.current_tid() != Some(2) {
+        state.yield_current().expect("nav to task2 reply");
+    }
+    let meta_t2 = state.read_user_memory_for_asid(asid2, 0x4080, 40).expect("meta_t2");
+    let flags_t2 = u64::from_le_bytes(meta_t2[24..32].try_into().expect("flags_t2"));
+    assert_ne!(flags_t2 & 1, 0, "initramfs_srv must see reply-cap");
+    let reply_cap_t2 = CapId(u64::from_le_bytes(meta_t2[16..24].try_into().expect("reply_cap_t2")));
+
+    // Write 12-byte reply payload.
+    let file_len: u64 = 65536; // large enough that low bytes are zero
+    let status: u32 = 0;
+    let mut payload_t2 = [0u8; 12];
+    payload_t2[0..8].copy_from_slice(&file_len.to_le_bytes());
+    payload_t2[8..12].copy_from_slice(&status.to_le_bytes());
+    state.write_user_memory_for_asid(asid2, 0x4000, &payload_t2).expect("write t2 payload");
+
+    // initramfs_srv replies with MemoryObject cap.
+    let mut t2_reply = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcReply as usize,
+        [reply_cap_t2.0 as usize, 0x4000, 12, 0, 0, mo_cap_t2.0 as usize],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut t2_reply)).expect("initramfs_srv ipc_reply");
+    assert_eq!(t2_reply.error_code(), None, "initramfs_srv ipc_reply must succeed");
+
+    // ── VFS (task 1) receives the reply from initramfs_srv (with MO cap) ──────
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("nav to task1 recv reply");
+    }
+    let mut t1_recv_reply = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [reply_vfs_init_recv_t1_g.0 as usize, 0x3100, 32, 0x3180, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut t1_recv_reply)).expect("vfs recv reply from initramfs");
+
+    // VFS must have received the MemoryObject cap.
+    let meta_vfs_from_init = state.read_user_memory_for_asid(asid1, 0x3180, 40)
+        .expect("meta_vfs_from_init");
+    let flags_vfs_from_init = u64::from_le_bytes(meta_vfs_from_init[24..32].try_into().expect("flags"));
+    let vfs_mo_cap_id = u64::from_le_bytes(meta_vfs_from_init[16..24].try_into().expect("cap_id"));
+
+    assert_ne!(flags_vfs_from_init & 2, 0,
+        "VFS must see TRANSFERRED_CAP after initramfs_srv reply; flags={}", flags_vfs_from_init);
+    assert_ne!(vfs_mo_cap_id, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "VFS must receive a materialized MO cap from initramfs_srv");
+
+    // Verify it's a MemoryObject in VFS's cnode.
+    let t1_cnode = state.task_cnode(1).expect("t1 cnode");
+    let vfs_mo_entry = state.capability_for_cnode(t1_cnode, CapId(vfs_mo_cap_id))
+        .expect("VFS must own the materialized MO cap");
+    assert!(matches!(vfs_mo_entry.object, CapObject::MemoryObject { .. }),
+        "VFS-local cap must be a MemoryObject; got {:?}", vfs_mo_entry.object);
+
+    // Also verify payload is intact (no stripping).
+    let payload_vfs_from_init = state.read_user_memory_for_asid(asid1, 0x3100, 12)
+        .expect("payload_vfs_from_init");
+    assert_eq!(&payload_vfs_from_init[..12], &payload_t2[..12],
+        "VFS_FILE_GRANT_RO_RELAY: payload must be forwarded verbatim (no OPCODE_INLINE strip)");
+
+    // ── VFS relays the reply (with its local MO cap) to PM ────────────────────
+    // VFS must call ipc_reply with the vfs_mo_cap_id as the transfer cap.
+    state.write_user_memory_for_asid(asid1, 0x3100, &payload_t2).expect("write relay payload");
+    let mut t1_relay_reply = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcReply as usize,
+        [
+            client_reply_cap_t1.0 as usize, // PM→VFS reply cap
+            0x3100,                          // payload (same FileGrantRoReply bytes)
+            12,
+            0, 0,
+            vfs_mo_cap_id as usize,         // transfer cap = VFS-local MO cap
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut t1_relay_reply)).expect("vfs relay ipc_reply");
+    assert_eq!(t1_relay_reply.error_code(), None, "VFS relay ipc_reply must succeed");
+
+    // ── PM (task 0) receives the final reply with MemoryObject cap ────────────
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("nav to pm recv");
+    }
+    let mut pm_recv = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [reply_pm_vfs_recv_t0.0 as usize, 0x2000, 32, 0x2080, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut pm_recv)).expect("pm ipc_recv");
+
+    let pm_meta = state.read_user_memory_for_asid(asid0, 0x2080, 40).expect("pm_meta");
+    let pm_flags = u64::from_le_bytes(pm_meta[24..32].try_into().expect("pm_flags"));
+    let pm_cap_id = u64::from_le_bytes(pm_meta[16..24].try_into().expect("pm_cap_id"));
+    let pm_payload = state.read_user_memory_for_asid(asid0, 0x2000, 12).expect("pm_payload");
+
+    assert_ne!(pm_flags & 2, 0,
+        "PM must see TRANSFERRED_CAP; pm_flags={}", pm_flags);
+    assert_ne!(pm_cap_id, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "PM must receive a materialized cap");
+
+    // Payload must still be intact.
+    assert_eq!(&pm_payload[..12], &payload_t2[..12],
+        "PM_VFS_GRANT_RO_RECEIVED: FileGrantRoReply payload must arrive intact");
+
+    let t0_cnode = state.task_cnode(0).expect("t0 cnode");
+    let pm_mo = state.capability_for_cnode(t0_cnode, CapId(pm_cap_id))
+        .expect("PM must own a materialized MO cap");
+    assert!(matches!(pm_mo.object, CapObject::MemoryObject { .. }),
+        "PM cap must be a MemoryObject; got {:?}", pm_mo.object);
+}
+
+/// Phase 3A: Specifically verify that PM receives a MemoryObject cap after the
+/// VFS FILE_GRANT_RO relay, and that the reply opcode is 0 (success indicator).
+///
+/// This exercises the acceptance criterion:
+///   PM_VFS_GRANT_RO_RECEIVED image_id=X cap=<valid_mo_cap>
+///   grant_reply.opcode == 0 (PM's success check)
+///   transferred_cap.is_some() == true
+#[test]
+fn pm_file_grant_ro_receives_memory_object_cap() {
+    std::thread::Builder::new()
+        .name("pm_file_grant_ro_receives_memory_object_cap".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_pm_file_grant_ro_receives_memory_object_cap)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_pm_file_grant_ro_receives_memory_object_cap() {
+    // Single-hop test (VFS plays both VFS + server roles):
+    // task 0 = PM, task 1 = VFS+server (replies with MO cap directly).
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1 vfs+server");
+
+    let (asid0, aspace0) = state.create_user_address_space().expect("asid0");
+    let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(0, asid0).expect("bind0");
+    state.bind_task_asid(1, asid1).expect("bind1");
+    state.map_user_page(aspace0, VirtAddr(0x7000),
+        Mapping { phys: PhysAddr(0x12000), flags: PageFlags::USER_RW }).expect("pm_page");
+    state.map_user_page(aspace1, VirtAddr(0x8000),
+        Mapping { phys: PhysAddr(0x13000), flags: PageFlags::USER_RW }).expect("srv_page");
+
+    let (_, ep_send_t0, ep_recv_global) = state.create_endpoint(4).expect("ep");
+    let ep_recv_t1 = state.grant_capability_task_to_task(0, ep_recv_global, 1)
+        .expect("grant ep recv");
+    let (_, _, reply_recv_t0) = state.create_endpoint(4).expect("reply ep");
+
+    let (_, mo_global) = state.alloc_anonymous_memory_object().expect("mo");
+    let mo_cap_t1 = state.grant_capability_task_to_task(0, mo_global, 1).expect("grant mo");
+
+    // Enqueue task 1 only; task 0 is already the current task.
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    // task 1 blocks on endpoint.
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("nav to task1");
+    }
+    let mut t1_recv = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [ep_recv_t1.0 as usize, 0x8000, 32, 0x8080, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut t1_recv)).expect("t1 recv");
+
+    // PM sends FILE_GRANT_RO request via ipc_call.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("nav to pm");
+    }
+    let mut pm_call = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcCall as usize,
+        [ep_send_t0.0 as usize, 0x7000, 0, 0, 0, reply_recv_t0.0 as usize],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut pm_call)).expect("pm ipc_call");
+
+    // task 1 reads reply cap and replies with MemoryObject cap.
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("nav to task1 reply");
+    }
+    let meta1 = state.read_user_memory_for_asid(asid1, 0x8080, 40).expect("meta1");
+    let flags1 = u64::from_le_bytes(meta1[24..32].try_into().expect("flags1"));
+    assert_ne!(flags1 & 1, 0, "server must see reply-cap");
+    let reply_cap_t1 = CapId(u64::from_le_bytes(meta1[16..24].try_into().expect("reply_cap")));
+
+    // FileGrantRoReply payload: file_len=0x1_0000 (65536), status=0.
+    // Low 2 bytes of file_len are 0x00,0x00 → opcode would be 0 even under old OPCODE_INLINE
+    // stripping, but FLAG_CAP_TRANSFER_PLAIN avoids stripping entirely.
+    let mut reply_payload = [0u8; 12];
+    reply_payload[0..8].copy_from_slice(&65536u64.to_le_bytes());
+    state.write_user_memory_for_asid(asid1, 0x8000, &reply_payload).expect("write reply");
+
+    let mut t1_reply = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcReply as usize,
+        [reply_cap_t1.0 as usize, 0x8000, 12, 0, 0, mo_cap_t1.0 as usize],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut t1_reply)).expect("t1 ipc_reply");
+    assert_eq!(t1_reply.error_code(), None, "ipc_reply with cap must succeed");
+
+    // PM receives reply with MO cap.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("nav to pm recv");
+    }
+    let mut pm_recv = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [reply_recv_t0.0 as usize, 0x7000, 32, 0x7080, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut pm_recv)).expect("pm recv");
+
+    let pm_meta = state.read_user_memory_for_asid(asid0, 0x7080, 40).expect("pm_meta");
+    let pm_flags = u64::from_le_bytes(pm_meta[24..32].try_into().expect("pm_flags"));
+    let pm_cap_id = u64::from_le_bytes(pm_meta[16..24].try_into().expect("pm_cap_id"));
+    let pm_payload_recv = state.read_user_memory_for_asid(asid0, 0x7000, 12)
+        .expect("pm_payload");
+
+    // PM checks: opcode == 0 (success indicator from VFS convention).
+    let pm_opcode = u16::from_le_bytes(pm_meta[8..10].try_into().expect("pm_opcode"));
+    assert_eq!(pm_opcode, 0,
+        "PM_VFS_GRANT_RO_RECEIVED: grant_reply.opcode must be 0 (success); got {}", pm_opcode);
+
+    // PM checks: transferred_cap.is_some() == true.
+    assert_ne!(pm_flags & 2, 0,
+        "PM_VFS_GRANT_RO_RECEIVED: transferred_cap must be present; pm_flags={}", pm_flags);
+    assert_ne!(pm_cap_id, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "PM must receive a valid cap id");
+
+    // Payload intact: FileGrantRoReply correctly decoded.
+    assert_eq!(&pm_payload_recv[..12], &reply_payload[..12],
+        "PM_VFS_GRANT_RO_RECEIVED: FileGrantRoReply payload must arrive intact without truncation");
+
+    let file_len_decoded = u64::from_le_bytes(pm_payload_recv[0..8].try_into().expect("file_len"));
+    assert_eq!(file_len_decoded, 65536,
+        "file_len must be decoded correctly from intact payload");
+
+    // PM must own a MemoryObject cap.
+    let t0_cnode = state.task_cnode(0).expect("t0 cnode");
+    let pm_mo = state.capability_for_cnode(t0_cnode, CapId(pm_cap_id))
+        .expect("PM must own the materialized MO cap after FILE_GRANT_RO");
+    assert!(matches!(pm_mo.object, CapObject::MemoryObject { .. }),
+        "PM_ELF_ZC: cap must be a MemoryObject for spawn_from_memory_object; got {:?}",
+        pm_mo.object);
+}

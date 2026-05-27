@@ -456,6 +456,27 @@ impl KernelState {
         Ok(cap_id)
     }
 
+    /// Return the reply endpoint recorded in the `ReplyCapRecord` for `reply_cap`
+    /// (resolved in the **current** task's cnode) without consuming or modifying the record.
+    ///
+    /// Used by `handle_ipc_reply` in syscall.rs to look up the reply endpoint so
+    /// it can call `stash_transfer_handle` before committing to the reply.  The
+    /// `ipc_reply` call itself would also validate and then consume the record, so
+    /// we can safely peek here without any TOCTOU concern (both paths run single-
+    /// threaded inside the kernel lock).
+    pub fn reply_cap_peek_endpoint(&self, reply_cap: CapId) -> Result<CapObject, KernelError> {
+        let capability = self.resolve_send_cap_task_local(reply_cap)?;
+        if !capability.has_right(CapRights::SEND) {
+            return Err(KernelError::MissingRight);
+        }
+        let slot = self.resolve_reply_index(capability.object)?;
+        self.with_ipc_state(|ipc| {
+            ipc.reply_caps[slot]
+                .ok_or(KernelError::StaleCapability)
+                .map(|rec| rec.reply_endpoint)
+        })
+    }
+
     pub fn ipc_reply(&mut self, reply_cap: CapId, msg: Message) -> Result<(), KernelError> {
         let current_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         crate::yarm_log!("IPC_REPLY_ENTER tid={}", current_tid);
