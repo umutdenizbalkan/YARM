@@ -17,6 +17,11 @@ use super::archive::{
 use super::install_boot_initrd_bytes;
 use yarm_srv_common::vfs_reply::VfsReply;
 
+/// Trace gate for hot-path initramfs bulk-read per-request logs.
+/// Set to `true` only when debugging Phase 2B transfer-buffer bulk reads.
+/// Default `false`: INITRAMFS_READ_BULK and INITRAMFS_READ_BULK_REPLY are suppressed.
+const INITRAMFS_READ_BULK_TRACE: bool = false;
+
 pub type InitramfsService = FsService<InitramfsBackend>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,10 +216,12 @@ pub fn run() {
                     if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
                         let payload = msg.as_slice();
                         if let Ok(args) = yarm_ipc_abi::vfs_abi::BulkReadArgs::decode(payload) {
-                            yarm_user_rt::user_log!(
-                                "INITRAMFS_READ_BULK fd={} requested={}",
-                                args.fd, args.requested_len
-                            );
+                            if INITRAMFS_READ_BULK_TRACE {
+                                yarm_user_rt::user_log!(
+                                    "INITRAMFS_READ_BULK fd={} requested={}",
+                                    args.fd, args.requested_len
+                                );
+                            }
                             // Validate requested_len
                             if args.requested_len > 4096 {
                                 yarm_user_rt::user_log!(
@@ -276,10 +283,12 @@ pub fn run() {
                                             let reply_bytes = reply.encode();
                                             let response = yarm_user_rt::ipc::Message::new(0, &reply_bytes)
                                                 .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"));
-                                            yarm_user_rt::user_log!(
-                                                "INITRAMFS_READ_BULK_REPLY fd={} copied={} eof={}",
-                                                args.fd, copied_len, eof
-                                            );
+                                            if INITRAMFS_READ_BULK_TRACE {
+                                                yarm_user_rt::user_log!(
+                                                    "INITRAMFS_READ_BULK_REPLY fd={} copied={} eof={}",
+                                                    args.fd, copied_len, eof
+                                                );
+                                            }
                                             let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
                                         }
                                         Err(e) => {
