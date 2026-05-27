@@ -2716,7 +2716,7 @@ fn handle_spawn_from_memory_object(
 
     // Load ELF using zero-copy path (falls back to copy if alignment not feasible).
     let (entry, _first_vaddr, _heap_base, zc_pages, copied_pages) = kernel
-        .load_elf_with_mo_zero_copy(asid, elf_bytes, initrd_phys_base, file_data_offset as u64)
+        .load_elf_with_mo_zero_copy(image_id, asid, elf_bytes, initrd_phys_base, file_data_offset as u64)
         .map_err(SyscallError::from)?;
 
     crate::yarm_log!(
