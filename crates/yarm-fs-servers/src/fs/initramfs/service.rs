@@ -327,6 +327,82 @@ pub fn run() {
                                 )
                             };
                         }
+                    } else if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_FILE_GRANT_RO {
+                        // Phase 3A: Caller requests a read-only MemoryObject cap for a CPIO file.
+                        let payload = msg.as_slice();
+                        match yarm_ipc_abi::vfs_abi::FileGrantRoArgs::decode(payload) {
+                            Ok(args) => {
+                                let cpio_name_opt = svc.backend().cpio_name_for_fd(args.fd);
+                                match cpio_name_opt {
+                                    Some(cpio_name) => {
+                                        // Create InitramfsFileSlice MemoryObject via kernel syscall nr=28.
+                                        // SAFETY: cpio_name is a static/long-lived byte slice from the CPIO archive.
+                                        let result = unsafe {
+                                            yarm_user_rt::syscall::create_initramfs_file_slice_mo(
+                                                cpio_name,
+                                                0,
+                                            )
+                                        };
+                                        match result {
+                                            Ok((cap_id, file_len)) => {
+                                                yarm_user_rt::user_log!(
+                                                    "INITRAMFS_FILE_GRANT_RO_REPLY path={} len={} cap={}",
+                                                    core::str::from_utf8(cpio_name).unwrap_or("<utf8err>"),
+                                                    file_len, cap_id
+                                                );
+                                                let reply_bytes = yarm_ipc_abi::vfs_abi::FileGrantRoReply {
+                                                    file_len,
+                                                    status: 0,
+                                                }.encode();
+                                                // Build reply with transferred MemoryObject cap.
+                                                let response = Message::with_header(
+                                                    0,
+                                                    0,
+                                                    Message::FLAG_CAP_TRANSFER,
+                                                    Some(cap_id as u64),
+                                                    &reply_bytes,
+                                                ).unwrap_or_else(|_| Message::new(1, &[]).expect("err msg"));
+                                                let _ = unsafe {
+                                                    yarm_user_rt::syscall::ipc_reply(reply_cap, &response)
+                                                };
+                                            }
+                                            Err(e) => {
+                                                yarm_user_rt::user_log!(
+                                                    "INITRAMFS_FILE_GRANT_RO_FAIL fd={} reason={:?}",
+                                                    args.fd, e
+                                                );
+                                                let _ = unsafe {
+                                                    yarm_user_rt::syscall::ipc_reply(
+                                                        reply_cap,
+                                                        &Message::new(1, &[]).expect("err msg"),
+                                                    )
+                                                };
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        yarm_user_rt::user_log!(
+                                            "INITRAMFS_FILE_GRANT_RO_FAIL fd={} reason=bad_fd",
+                                            args.fd
+                                        );
+                                        let _ = unsafe {
+                                            yarm_user_rt::syscall::ipc_reply(
+                                                reply_cap,
+                                                &Message::new(1, &[]).expect("err msg"),
+                                            )
+                                        };
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                let _ = unsafe {
+                                    yarm_user_rt::syscall::ipc_reply(
+                                        reply_cap,
+                                        &Message::new(1, &[]).expect("err msg"),
+                                    )
+                                };
+                            }
+                        }
                     } else {
                         let response = svc.handle(msg).unwrap_or_else(|_| {
                             yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg")

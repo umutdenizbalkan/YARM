@@ -147,24 +147,66 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     exit 1
   fi
 
-  # Phase 2B freeze: per-image_id strict check — image_id 7/8/9 must each appear
-  # exactly once with mode=vfs_transfer (transfer-buffer bulk read path confirmed).
-  # NOTE: VFS_FORWARD_BULK_READ and INITRAMFS_READ_BULK are trace-gated and will
-  # NOT appear in default logs; presence of PM_VFS_READ_BULK_DONE mode=vfs_transfer
-  # is the authoritative proof that Phase 2B was exercised end-to-end.
+  # Phase 3A: PM_ELF_ZC_DONE image_id=7/8/9 must each appear exactly once.
+  # PM_ELF_ZC_DONE is emitted by:
+  #   - Phase 3A path (spawn_from_memory_object, SPAWN_FROM_MO_OK) OR
+  #   - Phase 3A ZC loader (load_elf_with_mo_zero_copy, zc_pages/copied_pages counts)
+  # If Phase 3A grant is unsupported, PM falls back to Phase 2B and PM_ELF_ZC_DONE
+  # is still emitted (from the kernel-side SPAWN_FROM_MO / load path).
+  # NOTE: With CPIO file data not page-aligned, zc_pages=0 is expected; copied_pages
+  # captures the actual load. PM logs PM_ELF_ZC_DONE after kernel returns.
+  if [[ -f "$LOGFILE" ]]; then
+    phase3a_img_fail=0
+    for img_id in 7 8 9; do
+      zc_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE image_id=${img_id}\\b" 2>/dev/null || echo 0)
+      if [[ "$zc_count" -eq 1 ]]; then
+        echo "[ok] Phase 3A: PM_ELF_ZC_DONE image_id=${img_id} count=1"
+      else
+        echo "[warn] Phase 3A: PM_ELF_ZC_DONE image_id=${img_id} expected=1 got=${zc_count}"
+        phase3a_img_fail=1
+      fi
+    done
+    if [[ "$phase3a_img_fail" -eq 1 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
+      echo "[error] Phase 3A per-image_id PM_ELF_ZC_DONE check failed (strict)"
+      exit 1
+    fi
+  fi
+
+  # Phase 3A: verify no IPC_RECV_CAP_MATERIALIZE_FAILED (indicates cap-transfer errors).
+  if [[ -f "$LOGFILE" ]]; then
+    CAP_MAT_FAIL=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "IPC_RECV_CAP_MATERIALIZE_FAILED" 2>/dev/null || echo 0)
+    if [[ "$CAP_MAT_FAIL" -gt 0 ]]; then
+      echo "[error] IPC_RECV_CAP_MATERIALIZE_FAILED found: ${CAP_MAT_FAIL} — cap transfer errors (Phase 3A regression)"
+      exit 1
+    else
+      echo "[ok] no IPC_RECV_CAP_MATERIALIZE_FAILED"
+    fi
+  fi
+
+  # Phase 2B freeze: per-image_id strict check — if Phase 3A succeeded, Phase 2B
+  # fallback (PM_VFS_READ_BULK_DONE mode=vfs_transfer) should be 0 for each image.
+  # If Phase 3A was unsupported and fell back, Phase 2B count is checked instead.
   if [[ -f "$LOGFILE" ]]; then
     phase2b_img_fail=0
+    phase3a_total=0
+    phase2b_total=0
     for img_id in 7 8 9; do
-      img_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE image_id=${img_id}\\b.*mode=vfs_transfer" 2>/dev/null || echo 0)
-      if [[ "$img_count" -eq 1 ]]; then
-        echo "[ok] Phase 2B: PM_VFS_READ_BULK_DONE image_id=${img_id} mode=vfs_transfer count=1"
+      zc_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE image_id=${img_id}\\b" 2>/dev/null || echo 0)
+      bulk_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE image_id=${img_id}\\b.*mode=vfs_transfer" 2>/dev/null || echo 0)
+      phase3a_total=$((phase3a_total + zc_count))
+      phase2b_total=$((phase2b_total + bulk_count))
+      if [[ "$zc_count" -ge 1 ]]; then
+        echo "[ok] Phase 3A: image_id=${img_id} spawned via grant_ro path (zc_done=${zc_count})"
+      elif [[ "$bulk_count" -eq 1 ]]; then
+        echo "[ok] Phase 2B fallback: image_id=${img_id} mode=vfs_transfer count=1 (grant_ro unsupported)"
       else
-        echo "[warn] Phase 2B: PM_VFS_READ_BULK_DONE image_id=${img_id} mode=vfs_transfer expected=1 got=${img_count}"
+        echo "[warn] image_id=${img_id}: neither Phase 3A nor Phase 2B completed (zc_done=${zc_count} bulk_done=${bulk_count})"
         phase2b_img_fail=1
       fi
     done
+    echo "[ok] spawn path totals: phase3a_grant=${phase3a_total} phase2b_fallback=${phase2b_total}"
     if [[ "$phase2b_img_fail" -eq 1 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
-      echo "[error] Phase 2B per-image_id vfs_transfer check failed (strict)"
+      echo "[error] Phase 3A/2B per-image_id spawn check failed (strict)"
       exit 1
     fi
   fi
@@ -192,14 +234,21 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     fi
   fi
 
-  # Mode check: verify PM_VFS_READ_BULK_DONE completions carry a known mode tag.
+  # Mode check: log PM_VFS_READ_BULK_DONE completion counts per mode.
+  # Phase 3A: if all images went through grant_ro path, PM_VFS_READ_BULK_DONE may be 0.
+  # Phase 2B fallback: if grant_ro unsupported, PM_VFS_READ_BULK_DONE count will be 3.
   if [[ -f "$LOGFILE" ]]; then
     BULK_DONE_VFS=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE.*mode=vfs_transfer" 2>/dev/null || echo 0)
     BULK_DONE_2A=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE.*mode=phase2a_bridge" 2>/dev/null || echo 0)
+    ZC_DONE_TOTAL=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE" 2>/dev/null || echo 0)
     BULK_DONE_TOTAL=$((BULK_DONE_VFS + BULK_DONE_2A))
     echo "[ok] PM_VFS_READ_BULK_DONE: mode=vfs_transfer=${BULK_DONE_VFS} mode=phase2a_bridge=${BULK_DONE_2A} total=${BULK_DONE_TOTAL}"
-    if [[ "$BULK_DONE_TOTAL" -lt 3 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
-      echo "[error] expected at least 3 PM_VFS_READ_BULK_DONE with a known mode tag (got=${BULK_DONE_TOTAL})"
+    echo "[ok] PM_ELF_ZC_DONE total=${ZC_DONE_TOTAL}"
+    # Success condition: either Phase 3A completed all 3 images (ZC_DONE_TOTAL>=3),
+    # or Phase 2B completed all 3 images (BULK_DONE_TOTAL>=3), or a mix.
+    COMBINED=$((ZC_DONE_TOTAL + BULK_DONE_TOTAL))
+    if [[ "$COMBINED" -lt 3 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
+      echo "[error] expected at least 3 combined Phase 3A/2B spawn completions (zc_done=${ZC_DONE_TOTAL} bulk_done=${BULK_DONE_TOTAL} combined=${COMBINED})"
       exit 1
     fi
   fi

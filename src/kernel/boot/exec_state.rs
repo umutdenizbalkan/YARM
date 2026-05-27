@@ -397,6 +397,265 @@ impl KernelState {
         ))
     }
 
+    /// Count total ELF PT_LOAD pages for telemetry (not unique; overlapping segments counted multiple times).
+    fn count_elf_load_pages(image: &[u8]) -> Result<usize, KernelError> {
+        if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
+            return Err(KernelError::WrongObject);
+        }
+        let phoff = read_u64_le(image, 32)? as usize;
+        let phentsize = read_u16_le(image, 54)? as usize;
+        let phnum = read_u16_le(image, 56)? as usize;
+        let page_size = PAGE_SIZE as u64;
+        let mut total = 0usize;
+        for idx in 0..phnum {
+            let base = phoff
+                .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
+                .ok_or(KernelError::WrongObject)?;
+            if read_u32_le(image, base)? != PT_LOAD {
+                continue;
+            }
+            let p_vaddr = read_u64_le(image, base + 16)?;
+            let p_memsz = read_u64_le(image, base + 40)?;
+            if p_memsz == 0 {
+                continue;
+            }
+            let seg_start = p_vaddr & !(page_size - 1);
+            let seg_end = (p_vaddr + p_memsz + page_size - 1) & !(page_size - 1);
+            total = total.saturating_add(((seg_end - seg_start) / page_size) as usize);
+        }
+        Ok(total)
+    }
+
+    /// ELF loader for `SpawnFromMemoryObject` (Phase 3A syscall nr=29).
+    ///
+    /// Attempts zero-copy mapping of read-only, page-aligned file pages directly
+    /// from the initrd physical backing.  Falls back to alloc+copy for:
+    ///  - Writable segments
+    ///  - Pages that cross file/BSS boundary
+    ///  - Any segment whose file data is NOT page-aligned within the initrd
+    ///    (typical for CPIO archives in Phase 3A)
+    ///
+    /// Returns `(entry, first_pt_load_vaddr, heap_base, zc_pages, copied_pages)`.
+    pub fn load_elf_with_mo_zero_copy(
+        &mut self,
+        asid: Asid,
+        image: &[u8],
+        initrd_phys_base: u64,
+        file_initrd_offset: u64,
+    ) -> Result<(usize, usize, usize, usize, usize), KernelError> {
+        // Determine zero-copy feasibility: file data must start on a page boundary
+        // within the initrd physical region for any page to be directly mappable.
+        let page_size = PAGE_SIZE as u64;
+        let file_phys_start = initrd_phys_base.saturating_add(file_initrd_offset);
+        let zc_feasible = (file_phys_start & (page_size - 1)) == 0;
+
+        if !zc_feasible {
+            // CPIO file data is not page-aligned — use existing copy-based loader.
+            // zc_pages = 0; copied_pages = total page slots in PT_LOAD segments.
+            let copied_pages = Self::count_elf_load_pages(image).unwrap_or(0);
+            let (entry, first, heap) = self.load_elf_pt_load_segments(asid, image)?;
+            return Ok((entry, first, heap, 0, copied_pages));
+        }
+
+        // File data IS page-aligned in the initrd.  Perform per-page ZC decision.
+        // For each PT_LOAD page:
+        //   - Non-writable && fully within file && page-aligned phys → map RO from initrd
+        //   - Everything else → alloc anon frame + copy (writable, BSS, partial pages)
+        if image.len() < ELF64_EHDR_SIZE || &image[..4] != b"\x7FELF" || image[4] != 2 {
+            return Err(KernelError::WrongObject);
+        }
+        let entry = read_u64_le(image, 24)?;
+        let phoff = read_u64_le(image, 32)? as usize;
+        let phentsize = read_u16_le(image, 54)? as usize;
+        let phnum = read_u16_le(image, 56)? as usize;
+        if phnum == 0 || phentsize < ELF64_PHDR_SIZE {
+            return Err(KernelError::WrongObject);
+        }
+        let table_size = phnum.checked_mul(phentsize).ok_or(KernelError::WrongObject)?;
+        let phend = phoff.checked_add(table_size).ok_or(KernelError::WrongObject)?;
+        if phend > image.len() {
+            return Err(KernelError::WrongObject);
+        }
+
+        let mut max_loaded_end = 0u64;
+        let mut first_pt_load_vaddr = 0u64;
+        let mut saw_pt_load = false;
+        let mut zc_pages = 0usize;
+        let mut copied_pages = 0usize;
+
+        // First pass: allocate physical pages and map (staging flags for copy pages).
+        for idx in 0..phnum {
+            let base = phoff
+                .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
+                .ok_or(KernelError::WrongObject)?;
+            let p_type = read_u32_le(image, base)?;
+            if p_type != PT_LOAD {
+                continue;
+            }
+            let p_offset = read_u64_le(image, base + 8)? as usize;
+            let p_vaddr = read_u64_le(image, base + 16)?;
+            let p_filesz = read_u64_le(image, base + 32)? as usize;
+            let p_memsz = read_u64_le(image, base + 40)? as usize;
+            if !saw_pt_load {
+                first_pt_load_vaddr = p_vaddr;
+            }
+            saw_pt_load = true;
+            let seg_end = p_vaddr.checked_add(p_memsz as u64).ok_or(KernelError::WrongObject)?;
+            if seg_end > max_loaded_end {
+                max_loaded_end = seg_end;
+            }
+            if p_filesz > p_memsz {
+                return Err(KernelError::WrongObject);
+            }
+            let file_end = p_offset.checked_add(p_filesz).ok_or(KernelError::WrongObject)?;
+            if file_end > image.len() {
+                return Err(KernelError::WrongObject);
+            }
+            let seg_start = p_vaddr;
+            let page_start = seg_start & !(page_size - 1);
+            let page_end_va = (seg_end + page_size - 1) & !(page_size - 1);
+            let p_offset_page = p_offset as u64 & !(page_size - 1);
+            let p_vaddr_page = p_vaddr & !(page_size - 1);
+            let mut va = page_start;
+            while va < page_end_va {
+                let combined_pflags =
+                    Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
+                let flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
+                // ELF file page index within this segment.
+                let page_idx = (va - p_vaddr_page) / page_size;
+                let elf_file_page_start = p_offset_page + page_idx * page_size;
+                // Page is fully in file data if all bytes in [va, va+PAGE_SIZE)
+                // fall within [p_vaddr, p_vaddr+p_filesz).
+                let page_fully_in_file = va >= p_vaddr
+                    && p_filesz > 0
+                    && va.saturating_add(page_size) <= p_vaddr.saturating_add(p_filesz as u64);
+                // Zero-copy eligibility: RO, fully-in-file, page-aligned phys.
+                let initrd_phys_of_page = file_phys_start.saturating_add(elf_file_page_start);
+                let can_zc = !flags.write
+                    && page_fully_in_file
+                    && (initrd_phys_of_page & (page_size - 1)) == 0;
+
+                let existing = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
+                if existing.is_some() {
+                    // Page already mapped by an earlier overlapping segment — skip.
+                } else if can_zc {
+                    // Zero-copy: map the initrd physical page directly (RO final flags).
+                    self.map_user_page_in_asid_raw(
+                        asid,
+                        VirtAddr(va),
+                        Mapping { phys: PhysAddr(initrd_phys_of_page), flags },
+                    )?;
+                    zc_pages += 1;
+                } else {
+                    // Copy: alloc anonymous frame, map with staging RW flags.
+                    let phys = self.alloc_user_data_frame()?;
+                    let stage_flags = Self::staging_page_flags_from_final(flags);
+                    self.map_user_page_in_asid_raw(
+                        asid,
+                        VirtAddr(va),
+                        Mapping { phys: PhysAddr(phys), flags: stage_flags },
+                    )?;
+                    copied_pages += 1;
+                }
+                va += page_size;
+            }
+
+            // Copy ELF file bytes into non-ZC pages only.
+            // Iterate page by page to skip ZC pages (which are already correct and RO).
+            let mut va = page_start;
+            while va < page_end_va {
+                // Determine ZC status for this page.
+                let page_idx = (va - p_vaddr_page) / page_size;
+                let elf_file_page_start = p_offset_page + page_idx * page_size;
+                let combined_pflags =
+                    Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
+                let flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
+                let page_fully_in_file = va >= p_vaddr
+                    && p_filesz > 0
+                    && va.saturating_add(page_size) <= p_vaddr.saturating_add(p_filesz as u64);
+                let initrd_phys_of_page = file_phys_start.saturating_add(elf_file_page_start);
+                let can_zc = !flags.write
+                    && page_fully_in_file
+                    && (initrd_phys_of_page & (page_size - 1)) == 0;
+
+                if !can_zc {
+                    // Copy file bytes into this page.
+                    // Clamp the file range to what falls within this page's VA.
+                    let copy_va_start = core::cmp::max(va, p_vaddr);
+                    let copy_va_end = core::cmp::min(va + page_size, p_vaddr + p_filesz as u64);
+                    if copy_va_start < copy_va_end {
+                        let copy_len = (copy_va_end - copy_va_start) as usize;
+                        let file_off = (copy_va_start - p_vaddr) as usize + p_offset;
+                        self.copy_to_user(
+                            asid,
+                            VirtAddr(copy_va_start),
+                            &image[file_off..file_off + copy_len],
+                        )?;
+                    }
+                    // Zero BSS portion of this page.
+                    let bss_va_start = core::cmp::max(va, p_vaddr + p_filesz as u64);
+                    let bss_va_end = core::cmp::min(va + page_size, p_vaddr + p_memsz as u64);
+                    if bss_va_start < bss_va_end {
+                        let bss_len = (bss_va_end - bss_va_start) as usize;
+                        let zeros = [0u8; 256];
+                        let mut remaining = bss_len;
+                        let mut cursor = bss_va_start;
+                        while remaining > 0 {
+                            let chunk = remaining.min(zeros.len());
+                            self.copy_to_user(asid, VirtAddr(cursor), &zeros[..chunk])?;
+                            remaining -= chunk;
+                            cursor += chunk as u64;
+                        }
+                    }
+                }
+                va += page_size;
+            }
+        }
+
+        if !saw_pt_load {
+            return Err(KernelError::WrongObject);
+        }
+
+        // Second pass: enforce final permissions on copy pages.
+        // ZC pages already have final flags from the first pass.
+        for idx in 0..phnum {
+            let base = phoff
+                .checked_add(idx.checked_mul(phentsize).ok_or(KernelError::WrongObject)?)
+                .ok_or(KernelError::WrongObject)?;
+            if read_u32_le(image, base)? != PT_LOAD {
+                continue;
+            }
+            let p_vaddr = read_u64_le(image, base + 16)?;
+            let p_memsz = read_u64_le(image, base + 40)?;
+            let seg_end = p_vaddr.checked_add(p_memsz).ok_or(KernelError::WrongObject)?;
+            let page_start = p_vaddr & !(page_size - 1);
+            let page_end_va = (seg_end + page_size - 1) & !(page_size - 1);
+            let mut va = page_start;
+            while va < page_end_va {
+                let combined_pflags =
+                    Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
+                let final_flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
+                let phys =
+                    crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
+                        .ok_or(KernelError::UserMemoryFault)?
+                        .addr();
+                self.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr(va),
+                    Mapping { phys: PhysAddr(phys), flags: final_flags },
+                )?;
+                va += page_size;
+            }
+        }
+
+        let heap_base = max_loaded_end
+            .checked_add(page_size - 1)
+            .ok_or(KernelError::WrongObject)?
+            & !(page_size - 1);
+
+        Ok((entry as usize, first_pt_load_vaddr as usize, heap_base as usize, zc_pages, copied_pages))
+    }
+
     fn maybe_switch_kernel_context(
         &mut self,
         outgoing_tid: Option<u64>,

@@ -37,6 +37,19 @@ pub(crate) fn kernel_mut<T>(value: &mut KernelStorage<T>) -> &mut T {
     value
 }
 
+/// Discriminant for `MemoryObject` backing type.
+/// Phase 3A adds `InitramfsFileSlice` to enable read-only page grants from
+/// initramfs_srv to PM without a kernel-mediated cross-ASID copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryObjectKind {
+    /// Anonymous memory backed by a contiguous physical frame allocation.
+    Anonymous,
+    /// Read-only slice of the boot initramfs CPIO, backed by the initrd mapping.
+    /// `initrd_offset` is the byte offset of the file data within the initrd blob.
+    /// `file_len` is the exact file data length (NOT rounded up).
+    InitramfsFileSlice { initrd_offset: u64, file_len: u64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MemoryObject {
     pub(crate) id: u64,
@@ -45,6 +58,8 @@ pub(crate) struct MemoryObject {
     pub(crate) cap_refcount: u32,
     pub(crate) map_refcount: u32,
     pub(crate) pin_refcount: u32,
+    /// Backing type — distinguishes anonymous from initramfs file-slice objects.
+    pub(crate) kind: MemoryObjectKind,
 }
 
 #[derive(Debug)]

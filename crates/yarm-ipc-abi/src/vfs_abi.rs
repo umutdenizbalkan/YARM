@@ -63,6 +63,10 @@ pub const VFS_OP_MOUNT_REGISTER: u16 = 23;
 /// VFS router routes this via fd-table lookup, same as VFS_OP_READ.
 /// Phase 3 will replace the kernel-mediated copy with page-cap zero-copy.
 pub const VFS_OP_READ_BULK: u16 = 24;
+/// Phase 3A: Request a read-only MemoryObject capability for the full content of an
+/// already-opened file descriptor.  VFS routes this via fd-table lookup to the backend
+/// (initramfs_srv).  The reply carries a transferred MemoryObject cap and the file length.
+pub const VFS_OP_FILE_GRANT_RO: u16 = 25;
 pub const VFS_OPENAT_INLINE_PATH_MAX: usize = 96;
 pub const VFS_OPENAT_INLINE_PATH_HEADER_BYTES: usize = 25;
 pub const VFS_OPENAT_INLINE_PATH_MAX_BYTES: usize =
@@ -353,6 +357,85 @@ impl BulkReadReply {
         let copied_len = u64::from_le_bytes(b);
         let eof = payload[8] != 0;
         Some(Self { copied_len, eof })
+    }
+}
+
+/// Wire format for VFS_OP_FILE_GRANT_RO requests (32 bytes, 4 × u64 LE).
+///
+/// Phase 3A: requests a read-only MemoryObject cap for the file referenced by `fd`.
+/// `flags`, `offset`, `len` are reserved for future use and must be 0 in Phase 3A.
+///
+/// Layout:
+/// ```text
+/// offset  size  field
+///      0     8  fd       file descriptor (already opened by caller)
+///      8     8  flags    reserved — must be 0
+///     16     8  offset   reserved — must be 0 (full-file grant only in Phase 3A)
+///     24     8  len      reserved — must be 0 (full-file grant only in Phase 3A)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileGrantRoArgs {
+    pub fd: u64,
+    pub flags: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl FileGrantRoArgs {
+    pub const fn new(fd: u64) -> Self {
+        Self { fd, flags: 0, offset: 0, len: 0 }
+    }
+
+    pub const fn encode(self) -> [u8; VfsV1Args::ENCODED_LEN] {
+        VfsV1Args::new(self.fd, self.flags, self.offset, self.len).encode()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, VfsCodecError> {
+        let args = VfsV1Args::decode(payload)?;
+        Ok(Self { fd: args.arg0, flags: args.arg1, offset: args.arg2, len: args.arg3 })
+    }
+}
+
+/// Reply payload for VFS_OP_FILE_GRANT_RO (12 bytes).
+///
+/// The reply MESSAGE also carries a transferred MemoryObject cap via FLAG_CAP_TRANSFER.
+/// The payload contains the file length for convenience so the receiver does not need
+/// to stat the file separately.
+///
+/// Layout:
+/// ```text
+/// offset  size  field
+///      0     8  file_len  exact file data length in bytes (u64 LE)
+///      8     4  status    0=ok, non-zero=error (u32 LE)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileGrantRoReply {
+    pub file_len: u64,
+    pub status: u32,
+}
+
+impl FileGrantRoReply {
+    pub const ENCODED_LEN: usize = 12;
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[0..8].copy_from_slice(&self.file_len.to_le_bytes());
+        out[8..12].copy_from_slice(&self.status.to_le_bytes());
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.len() < Self::ENCODED_LEN {
+            return None;
+        }
+        let mut b8 = [0u8; 8];
+        let mut b4 = [0u8; 4];
+        b8.copy_from_slice(&payload[0..8]);
+        b4.copy_from_slice(&payload[8..12]);
+        Some(Self {
+            file_len: u64::from_le_bytes(b8),
+            status: u32::from_le_bytes(b4),
+        })
     }
 }
 
@@ -741,6 +824,48 @@ mod tests {
         assert_ne!(VFS_OP_READ_BULK, VFS_OP_STATX);
         assert_ne!(VFS_OP_READ_BULK, VFS_OP_MOUNT_REGISTER);
         assert_eq!(VFS_OP_READ_BULK, 24);
+    }
+
+    #[test]
+    fn vfs_op_file_grant_ro_constant_is_distinct() {
+        assert_eq!(VFS_OP_FILE_GRANT_RO, 25);
+        assert_ne!(VFS_OP_FILE_GRANT_RO, VFS_OP_READ_BULK);
+        assert_ne!(VFS_OP_FILE_GRANT_RO, VFS_OP_READ);
+        assert_ne!(VFS_OP_FILE_GRANT_RO, VFS_OP_OPENAT);
+    }
+
+    #[test]
+    fn file_grant_ro_args_roundtrip() {
+        let args = FileGrantRoArgs::new(42);
+        let enc = args.encode();
+        let dec = FileGrantRoArgs::decode(&enc).expect("decode");
+        assert_eq!(dec.fd, 42);
+        assert_eq!(dec.flags, 0);
+        assert_eq!(dec.offset, 0);
+        assert_eq!(dec.len, 0);
+    }
+
+    #[test]
+    fn file_grant_ro_reply_roundtrip() {
+        let r = FileGrantRoReply { file_len: 0xDEAD_BEEF_1234, status: 0 };
+        let enc = r.encode();
+        let dec = FileGrantRoReply::decode(&enc).expect("decode");
+        assert_eq!(dec.file_len, 0xDEAD_BEEF_1234);
+        assert_eq!(dec.status, 0);
+    }
+
+    #[test]
+    fn file_grant_ro_reply_error_status_roundtrip() {
+        let r = FileGrantRoReply { file_len: 0, status: 5 };
+        let enc = r.encode();
+        let dec = FileGrantRoReply::decode(&enc).expect("decode");
+        assert_eq!(dec.file_len, 0);
+        assert_eq!(dec.status, 5);
+    }
+
+    #[test]
+    fn file_grant_ro_reply_rejects_short_payload() {
+        assert!(FileGrantRoReply::decode(&[0u8; 11]).is_none());
     }
 
     #[test]
