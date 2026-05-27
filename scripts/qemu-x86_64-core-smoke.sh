@@ -241,6 +241,9 @@ REQUIRED_SERVICE_ENTRIES=(
   [DRIVER_MANAGER_ENTRY]=1
   [BLKCACHE_SRV_ENTRY]=1
   [VIRTIO_BLK_SRV_ENTRY]=1
+  [DRIVER_MANAGER_READY]=1
+  [BLKCACHE_SRV_READY]=1
+  [VIRTIO_BLK_SRV_READY]=1
 )
 
 service_count_fail=0
@@ -263,6 +266,70 @@ if [[ "$service_count_fail" -eq 1 ]]; then
   if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
     echo "[error] strict x86_64 smoke: service entry count check failed"
     exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 3B: zero-copy ELF loading baseline.
+# All three late services (image_id 7/8/9) must use the ZC grant path with
+# zc_pages > 0. Phase 2B bulk-read and Phase 2A bridge must be absent.
+# x86_64 SMP remains out of scope; this smoke is always -smp 1.
+# ---------------------------------------------------------------------------
+if [[ -f "$LOGFILE" ]]; then
+  phase3b_fail=0
+
+  # PM_ELF_ZC_DONE must appear exactly once per image_id, with zc_pages > 0.
+  for img_id in 7 8 9; do
+    zc_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE image_id=${img_id}\\b" 2>/dev/null || echo 0)
+    zc_nonzero=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE image_id=${img_id}\\b.*zc_pages=[1-9]" 2>/dev/null || echo 0)
+    if [[ "$zc_count" -eq 1 && "$zc_nonzero" -eq 1 ]]; then
+      echo "[ok] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} count=1 zc_pages>0"
+    elif [[ "$zc_count" -eq 1 && "$zc_nonzero" -eq 0 ]]; then
+      echo "[warn] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} count=1 but zc_pages=0 (CPIO or ELF alignment regression)"
+      phase3b_fail=1
+    else
+      echo "[warn] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} expected=1 got=${zc_count}"
+      phase3b_fail=1
+    fi
+  done
+
+  # PM_ELF_ZC_FAIL must be 0.
+  ZC_FAIL_TOTAL=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_FAIL" 2>/dev/null || echo 0)
+  if [[ "$ZC_FAIL_TOTAL" -eq 0 ]]; then
+    echo "[ok] Phase 3B: PM_ELF_ZC_FAIL count=0"
+  else
+    echo "[warn] Phase 3B: PM_ELF_ZC_FAIL count=${ZC_FAIL_TOTAL} (ZC loader errors)"
+    phase3b_fail=1
+  fi
+
+  # PM_VFS_READ_BULK_DONE image_id=7/8/9 must be 0 (Phase 2B path must not activate).
+  for img_id in 7 8 9; do
+    bulk_done=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE image_id=${img_id}\\b" 2>/dev/null || echo 0)
+    if [[ "$bulk_done" -eq 0 ]]; then
+      echo "[ok] Phase 3B: PM_VFS_READ_BULK_DONE image_id=${img_id} count=0 (ZC path active)"
+    else
+      echo "[warn] Phase 3B: PM_VFS_READ_BULK_DONE image_id=${img_id} count=${bulk_done} (Phase 2B fallback active)"
+      phase3b_fail=1
+    fi
+  done
+
+  # PM_VFS_READ_BULK_PHASE2A_BEGIN must be 0 (Phase 2A bridge must not activate).
+  PHASE2A_COUNT=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_PHASE2A_BEGIN" 2>/dev/null || echo 0)
+  if [[ "$PHASE2A_COUNT" -eq 0 ]]; then
+    echo "[ok] Phase 3B: PM_VFS_READ_BULK_PHASE2A_BEGIN count=0"
+  else
+    echo "[warn] Phase 3B: PM_VFS_READ_BULK_PHASE2A_BEGIN count=${PHASE2A_COUNT} (Phase 2A bridge active)"
+    phase3b_fail=1
+  fi
+
+  # Phase 3B summary.
+  ZC_DONE_TOTAL=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE" 2>/dev/null || echo 0)
+  ZC_NONZERO_TOTAL=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE.*zc_pages=[1-9]" 2>/dev/null || echo 0)
+  echo "[ok] Phase 3B summary: PM_ELF_ZC_DONE total=${ZC_DONE_TOTAL} zc_pages>0 count=${ZC_NONZERO_TOTAL}"
+
+  if [[ "$phase3b_fail" -eq 1 ]]; then
+    echo "[warn] Phase 3B x86_64 (-smp 1) checks did not all pass"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
   fi
 fi
 
