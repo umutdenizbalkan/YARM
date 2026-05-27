@@ -108,7 +108,8 @@ common_stage_blkcache_server_elf || true
 common_stage_virtio_blk_server_elf || true
 common_stage_driver_manager_elf || true
 common_verify_initramfs_stage_paths || true
-common_create_initramfs_newc
+# Phase 3B: use 4096-byte-aligned packer so late-service ELFs can be zero-copy loaded.
+common_create_initramfs_aligned
 
 [[ -f "$KERNEL_ELF" ]] && cp "$KERNEL_ELF" "$KERNEL_IMAGE"
 if [[ -f "$KERNEL_ELF" ]]; then

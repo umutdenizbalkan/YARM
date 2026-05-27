@@ -17,6 +17,10 @@
   "linker-flavor": "gnu-lld",
   "linker": "rust-lld",
   "pre-link-args": {
-    "gnu-lld": ["-Ttargets/aarch64-yarm-user-none.ld"]
+    "gnu-lld": [
+      "-Ttargets/aarch64-yarm-user-none.ld",
+      "-zmax-page-size=0x1000",
+      "-zcommon-page-size=0x1000"
+    ]
   }
 }

@@ -373,3 +373,50 @@ common_create_initramfs_newc() {
     common_exit_if_strict_mode
   fi
 }
+
+# common_create_initramfs_aligned — CPIO newc packer with 4096-byte alignment.
+#
+# Uses scripts/pack-initramfs-aligned.py to create the initramfs archive.
+# The late-service ELFs (driver_manager, blkcache_srv, virtio_blk_srv) have
+# their file data aligned to 4096-byte boundaries so that Phase 3B zero-copy
+# ELF loading can map RX pages directly from the initrd physical region
+# without a kernel-mediated copy.
+#
+# Falls back to common_create_initramfs_newc if Python 3 is not available.
+common_create_initramfs_aligned() {
+  local packer
+  packer="$(dirname "$(dirname "$0")")/scripts/pack-initramfs-aligned.py"
+  # Also look relative to the script lib directory (SCRIPT_DIR/../pack-initramfs-aligned.py)
+  if [[ ! -f "$packer" ]]; then
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    packer="${script_dir}/../pack-initramfs-aligned.py"
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[warn] python3 not found; falling back to common_create_initramfs_newc"
+    common_create_initramfs_newc
+    return
+  fi
+
+  if [[ ! -f "$packer" ]]; then
+    echo "[warn] pack-initramfs-aligned.py not found at $packer; falling back to common_create_initramfs_newc"
+    common_create_initramfs_newc
+    return
+  fi
+
+  echo "[info] packing initramfs with 4096-byte alignment for late-service ELFs"
+  local pack_log
+  pack_log="$(python3 "$packer" "$ROOTFS_DIR" "$INITRAMFS_IMAGE_ABS" \
+    --align sbin/driver_manager \
+    --align sbin/blkcache_srv \
+    --align sbin/virtio_blk_srv 2>&1)" || {
+    echo "[error] pack-initramfs-aligned.py failed"
+    printf '%s\n' "$pack_log" | sed 's/^/  /'
+    common_exit_if_strict_mode
+    return 1
+  }
+  # Print packer output (includes ALIGN_PROOF lines for the final report).
+  printf '%s\n' "$pack_log" | sed 's/^/[initramfs-pack] /'
+  echo "[ok] aligned initramfs archive created: $INITRAMFS_IMAGE_ABS"
+}

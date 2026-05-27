@@ -433,11 +433,14 @@ impl KernelState {
     ///  - Writable segments
     ///  - Pages that cross file/BSS boundary
     ///  - Any segment whose file data is NOT page-aligned within the initrd
-    ///    (typical for CPIO archives in Phase 3A)
+    ///    (typical for CPIO archives without explicit alignment)
+    ///
+    /// `image_id` is used only for diagnostic logging.
     ///
     /// Returns `(entry, first_pt_load_vaddr, heap_base, zc_pages, copied_pages)`.
     pub fn load_elf_with_mo_zero_copy(
         &mut self,
+        image_id: u64,
         asid: Asid,
         image: &[u8],
         initrd_phys_base: u64,
@@ -447,12 +450,24 @@ impl KernelState {
         // within the initrd physical region for any page to be directly mappable.
         let page_size = PAGE_SIZE as u64;
         let file_phys_start = initrd_phys_base.saturating_add(file_initrd_offset);
-        let zc_feasible = (file_phys_start & (page_size - 1)) == 0;
+        let offset_in_page = file_phys_start & (page_size - 1);
+        let zc_feasible = offset_in_page == 0;
+
+        crate::yarm_log!(
+            "ZC_FEASIBILITY image_id={} initrd_phys=0x{:x} file_off=0x{:x} \
+             file_phys=0x{:x} offset_in_page={} feasible={}",
+            image_id, initrd_phys_base, file_initrd_offset,
+            file_phys_start, offset_in_page, zc_feasible
+        );
 
         if !zc_feasible {
             // CPIO file data is not page-aligned — use existing copy-based loader.
             // zc_pages = 0; copied_pages = total page slots in PT_LOAD segments.
             let copied_pages = Self::count_elf_load_pages(image).unwrap_or(0);
+            crate::yarm_log!(
+                "ZC_FALLBACK image_id={} reason=cpio_file_data_unaligned copied_pages={}",
+                image_id, copied_pages
+            );
             let (entry, first, heap) = self.load_elf_pt_load_segments(asid, image)?;
             return Ok((entry, first, heap, 0, copied_pages));
         }
@@ -482,6 +497,7 @@ impl KernelState {
         let mut saw_pt_load = false;
         let mut zc_pages = 0usize;
         let mut copied_pages = 0usize;
+        let mut seg_load_idx = 0usize;
 
         // First pass: allocate physical pages and map (staging flags for copy pages).
         for idx in 0..phnum {
@@ -492,10 +508,13 @@ impl KernelState {
             if p_type != PT_LOAD {
                 continue;
             }
+            let p_flags_raw = read_u32_le(image, base + 4)?;
             let p_offset = read_u64_le(image, base + 8)? as usize;
             let p_vaddr = read_u64_le(image, base + 16)?;
             let p_filesz = read_u64_le(image, base + 32)? as usize;
             let p_memsz = read_u64_le(image, base + 40)? as usize;
+            let seg_idx = seg_load_idx;
+            seg_load_idx += 1;
             if !saw_pt_load {
                 first_pt_load_vaddr = p_vaddr;
             }
@@ -516,10 +535,31 @@ impl KernelState {
             let page_end_va = (seg_end + page_size - 1) & !(page_size - 1);
             let p_offset_page = p_offset as u64 & !(page_size - 1);
             let p_vaddr_page = p_vaddr & !(page_size - 1);
+
+            crate::yarm_log!(
+                "ZC_SEG_BEGIN image_id={} seg={} p_offset=0x{:x} p_vaddr=0x{:x} \
+                 p_filesz={} p_memsz={} p_flags=0x{:x} file_data_phys=0x{:x} \
+                 offset_in_page={}",
+                image_id, seg_idx, p_offset, p_vaddr, p_filesz, p_memsz,
+                p_flags_raw, file_phys_start, file_phys_start & (page_size - 1)
+            );
+
+            let mut seg_zc = 0usize;
+            let mut seg_copied = 0usize;
+
             let mut va = page_start;
             while va < page_end_va {
                 let combined_pflags =
                     Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
+                // Detect WX before calling page_flags_from_elf_pflags so we can log the reason.
+                if (combined_pflags & PF_W) != 0 && (combined_pflags & PF_X) != 0 {
+                    crate::yarm_log!(
+                        "ZC_PAGE image_id={} seg={} va=0x{:x} src_phys=0x0 \
+                         reason=wx_rejected pflags=0x{:x}",
+                        image_id, seg_idx, va, combined_pflags
+                    );
+                    return Err(KernelError::WrongObject);
+                }
                 let flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
                 // ELF file page index within this segment.
                 let page_idx = (va - p_vaddr_page) / page_size;
@@ -535,6 +575,28 @@ impl KernelState {
                     && page_fully_in_file
                     && (initrd_phys_of_page & (page_size - 1)) == 0;
 
+                // Determine diagnostic reason for the page decision.
+                let reason = if can_zc {
+                    "full_page_zc_ok"
+                } else if flags.write {
+                    "writable_segment_copy"
+                } else if va < p_vaddr {
+                    "partial_head_copy"
+                } else if p_filesz == 0 || va >= p_vaddr.saturating_add(p_filesz as u64) {
+                    "bss_copy"
+                } else if va.saturating_add(page_size) > p_vaddr.saturating_add(p_filesz as u64) {
+                    "partial_tail_copy"
+                } else {
+                    // page_fully_in_file is true but initrd_phys_of_page is misaligned;
+                    // can only occur if file_phys_start alignment changed mid-computation.
+                    "elf_offset_unaligned"
+                };
+
+                crate::yarm_log!(
+                    "ZC_PAGE image_id={} seg={} va=0x{:x} src_phys=0x{:x} reason={}",
+                    image_id, seg_idx, va, initrd_phys_of_page, reason
+                );
+
                 let existing = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
                 if existing.is_some() {
                     // Page already mapped by an earlier overlapping segment — skip.
@@ -546,6 +608,7 @@ impl KernelState {
                         Mapping { phys: PhysAddr(initrd_phys_of_page), flags },
                     )?;
                     zc_pages += 1;
+                    seg_zc += 1;
                 } else {
                     // Copy: alloc anonymous frame, map with staging RW flags.
                     let phys = self.alloc_user_data_frame()?;
@@ -556,9 +619,16 @@ impl KernelState {
                         Mapping { phys: PhysAddr(phys), flags: stage_flags },
                     )?;
                     copied_pages += 1;
+                    seg_copied += 1;
                 }
                 va += page_size;
             }
+
+            crate::yarm_log!(
+                "ZC_SEG_DONE image_id={} seg={} p_vaddr=0x{:x} p_flags=0x{:x} \
+                 zc_pages={} copied_pages={}",
+                image_id, seg_idx, p_vaddr, p_flags_raw, seg_zc, seg_copied
+            );
 
             // Copy ELF file bytes into non-ZC pages only.
             // Iterate page by page to skip ZC pages (which are already correct and RO).
