@@ -277,28 +277,45 @@ impl ReadWriteArgs {
 /// offset  size  field
 ///      0     8  fd              file descriptor
 ///      8     8  requested_len   bytes to read (≤4096)
-///     16     8  offset          byte offset in file (0 = use fd cursor)
-///     24     8  reserved        must be 0
+///     16     8  offset          byte offset in file (absolute)
+///     24     8  dst_ptr         caller's VA for transfer buffer
+///                               (Phase 2B: PM passes its bulk_buf address here;
+///                                was "reserved=0" before Phase 2B — wire-compatible)
 /// ```
+///
+/// Phase 2B transfer-buffer bridge: PM fills `dst_ptr` with its own stack buffer VA.
+/// initramfs_srv calls the kernel (syscall nr=27 with target_tid=PM_TID) to write
+/// CPIO data directly into PM's buffer.  PM reads from its stack buffer after the
+/// IPC round trip completes.
+///
+/// Missing primitive for pure page-cap: `MemoryObject` capability grant that lets
+/// initramfs_srv write to PM's page without kernel-mediated cross-ASID copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BulkReadArgs {
     pub fd: u64,
     pub requested_len: u64,
     pub offset: u64,
+    /// Phase 2B: caller's destination buffer VA (was reserved=0 before Phase 2B).
+    /// Wire-compatible with prior encoding (reserved field promoted to named field).
+    pub dst_ptr: u64,
 }
 
 impl BulkReadArgs {
     pub const fn new(fd: u64, requested_len: u64, offset: u64) -> Self {
-        Self { fd, requested_len, offset }
+        Self { fd, requested_len, offset, dst_ptr: 0 }
+    }
+
+    pub const fn new_with_dst(fd: u64, requested_len: u64, offset: u64, dst_ptr: u64) -> Self {
+        Self { fd, requested_len, offset, dst_ptr }
     }
 
     pub const fn encode(self) -> [u8; VfsV1Args::ENCODED_LEN] {
-        VfsV1Args::new(self.fd, self.requested_len, self.offset, 0).encode()
+        VfsV1Args::new(self.fd, self.requested_len, self.offset, self.dst_ptr).encode()
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, VfsCodecError> {
         let args = VfsV1Args::decode(payload)?;
-        Ok(Self::new(args.arg0, args.arg1, args.arg2))
+        Ok(Self { fd: args.arg0, requested_len: args.arg1, offset: args.arg2, dst_ptr: args.arg3 })
     }
 }
 
@@ -662,6 +679,28 @@ mod tests {
         assert_eq!(dec.fd, 7);
         assert_eq!(dec.requested_len, 4096);
         assert_eq!(dec.offset, 0);
+        // new() must set dst_ptr=0 (wire-compatible with Phase 2A reserved=0).
+        assert_eq!(dec.dst_ptr, 0);
+    }
+
+    #[test]
+    fn bulk_read_args_new_sets_dst_ptr_zero() {
+        // Phase 2A compatibility: BulkReadArgs::new() must have dst_ptr=0.
+        let args = BulkReadArgs::new(3, 512, 100);
+        assert_eq!(args.dst_ptr, 0);
+    }
+
+    #[test]
+    fn bulk_read_args_new_with_dst_roundtrip() {
+        // Phase 2B: new_with_dst encodes the PM transfer buffer VA in dst_ptr.
+        let dst = 0xFFFF_0000_1000usize as u64;
+        let args = BulkReadArgs::new_with_dst(5, 4096, 8192, dst);
+        let enc = args.encode();
+        let dec = BulkReadArgs::decode(&enc).expect("decode");
+        assert_eq!(dec.fd, 5);
+        assert_eq!(dec.requested_len, 4096);
+        assert_eq!(dec.offset, 8192);
+        assert_eq!(dec.dst_ptr, dst);
     }
 
     #[test]

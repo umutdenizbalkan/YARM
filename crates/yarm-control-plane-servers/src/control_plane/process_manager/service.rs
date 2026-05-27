@@ -30,9 +30,12 @@ use yarm_user_rt::ipc::Message;
 const PM_VFS_READ_APPEND_TRACE: bool = false;
 /// Gate for per-chunk bulk-read trace logs.  Set true to debug chunk boundaries.
 const PM_VFS_BULK_READ_CHUNK_TRACE: bool = false;
+/// Gate for Phase 2B VFS-transfer per-chunk logs (hot-path).
+const PM_VFS_BULK_READ_TRANSFER_CHUNK_TRACE: bool = false;
 #[cfg(not(test))]
 use yarm_user_rt::vfs_client::{
-    build_close_message, build_openat_message, build_read_message, build_statx_message,
+    build_bulk_read_message, build_close_message, build_openat_message, build_read_message,
+    build_statx_message,
 };
 use yarm_user_rt::process::{
     ProcessError as ProcessManagerError, ProcessId, ProcessManagerOps, WaitResult,
@@ -1589,19 +1592,21 @@ fn pm_image_cpio_name(image_id: u64) -> Option<&'static [u8]> {
     }
 }
 
-/// Phase 2 bulk read path for image_id 7/8/9.
+/// Phase 2B+2A bulk read path for image_id 7/8/9.
 ///
-/// Uses kernel syscall nr=27 (`initramfs_read_chunk`) as a temporary bulk-copy
-/// bridge: each call reads up to 4096 bytes directly from the kernel's CPIO into
-/// PM's stack buffer, then appends to the ELF staging `Vec`.
+/// Preference order:
+/// 1. Phase 2B: PM sends VFS_OP_READ_BULK IPC → VFS routes → initramfs fills PM's
+///    transfer buffer via kernel syscall nr=27 (target_tid=PM).  mode=vfs_transfer.
+/// 2. Phase 2A fallback: If VFS/initramfs returns unsupported (opcode≠0), PM falls
+///    back to direct kernel syscall nr=27 (Phase 2A bridge).  mode=phase2a_bridge.
+/// 3. Inline fallback: If Phase 2A kernel returns InvalidArgs (kernel lacks CPIO),
+///    fall back to old inline 112-byte VFS READ path.
 ///
-/// Still uses VFS for STATX (file size) and OPENAT/CLOSE (fd lifecycle tracking).
-/// The actual data transfer bypasses VFS IPC.  This is an explicit Phase 2
-/// stepping stone; Phase 3 will route data through VFS using page-cap zero-copy.
+/// Hard errors (NotFound=Internal, PermissionDenied=MissingRight, PageFault, etc.)
+/// are NEVER silently fell-through to a lower path.
 ///
-/// Fallback to inline 112-byte path:
-/// - Only if `initramfs_read_chunk` returns `Unsupported` (kernel lacks CPIO).
-/// - Data mismatches, OOM, or other errors are fatal (no silent fall-through).
+/// Phase 2B missing primitive: MemoryObject page-cap grant so initramfs can write
+/// directly to PM's page without kernel-mediated cross-ASID copy.
 #[cfg(not(test))]
 unsafe fn pm_read_all_via_vfs_bulk(
     image_id: u64,
@@ -1659,86 +1664,211 @@ unsafe fn pm_read_all_via_vfs_bulk(
         image_id, path_str, fd
     );
 
-    // ── 3. Bulk read loop via kernel syscall (4 KiB per call) ─────────────────
+    // ── 3. Phase 2B: attempt VFS-mediated transfer-buffer bulk read ───────────
+    // Try VFS_OP_READ_BULK IPC first.  If VFS/initramfs says unsupported
+    // (reply opcode ≠ 0 or copied_len=0+eof=false) fall back to Phase 2A.
     yarm_user_rt::user_log!(
-        "PM_VFS_READ_BULK_BEGIN image_id={} fd={} expected={} chunk=4096 cpio={}",
-        image_id, fd, file_len, cpio_str
+        "PM_VFS_READ_BULK_BEGIN image_id={} fd={} expected={} chunk=4096 mode=vfs_transfer",
+        image_id, fd, file_len
     );
 
     let mut out = Vec::with_capacity(file_len);
     let mut offset: u64 = 0;
     let mut bulk_buf = [0u8; 4096];
     let mut chunk_count: u32 = 0;
+    let mut used_phase2b = false;
+    let mut phase2b_unsupported = false;
 
-    loop {
+    // Phase 2B read loop: send VFS_OP_READ_BULK, initramfs fills bulk_buf via kernel.
+    'phase2b: loop {
         if out.len() >= file_len {
-            break;
+            break 'phase2b;
         }
         let remaining = file_len - out.len();
-        let want = core::cmp::min(remaining, 4096);
-        let dst = &mut bulk_buf[..want];
+        let want = core::cmp::min(remaining, 4096) as u64;
 
-        // SAFETY: dst is valid writable memory in the PM's address space.
-        let bytes_copied = match unsafe {
-            yarm_user_rt::syscall::initramfs_read_chunk(cpio_name, offset, dst)
-        } {
-            Ok(n) => n,
-            Err(yarm_user_rt::syscall::SyscallError::InvalidArgs) => {
-                // Kernel doesn't have the CPIO file — fall back to inline path.
+        let bulk_dst_ptr = bulk_buf.as_mut_ptr() as usize;
+        let bulk_msg = match build_bulk_read_message(fd, want, offset, bulk_dst_ptr) {
+            Ok(m) => m,
+            Err(_) => {
                 yarm_user_rt::user_log!(
-                    "PM_VFS_READ_BULK_UNSUPPORTED image_id={} fallback=inline reason=kernel_no_cpio",
+                    "PM_VFS_READ_BULK_FAIL image_id={} stage=build_msg reason=encode_fail",
                     image_id
                 );
-                // Close fd before falling back.
-                let close_msg = match build_close_message(fd) {
-                    Ok(m) => m,
-                    Err(_) => return Err(ProcessManagerError::Malformed),
-                };
-                let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
-                // Delegate to inline path.
-                return unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, vfs_path) };
-            }
-            Err(e) => {
-                yarm_user_rt::user_log!(
-                    "PM_VFS_READ_BULK_FAIL image_id={} stage=kernel_read_chunk offset={} err={:?}",
-                    image_id, offset, e
-                );
-                let close_msg = match build_close_message(fd) {
-                    Ok(m) => m,
-                    Err(_) => return Err(ProcessManagerError::Malformed),
-                };
-                let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
-                return Err(ProcessManagerError::Malformed);
+                phase2b_unsupported = true;
+                break 'phase2b;
             }
         };
 
-        if bytes_copied == 0 {
-            // EOF before we finished — file shorter than STATX reported.
+        // Send VFS_OP_READ_BULK and receive reply.
+        let bulk_reply = match unsafe {
+            pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &bulk_msg)
+        } {
+            Ok(r) => r,
+            Err(e) => {
+                yarm_user_rt::user_log!(
+                    "PM_VFS_READ_BULK_FAIL image_id={} stage=ipc_call reason={:?}",
+                    image_id, e
+                );
+                phase2b_unsupported = true;
+                break 'phase2b;
+            }
+        };
+
+        // Check reply opcode: 0 = success, non-0 = error/unsupported.
+        if bulk_reply.opcode != 0 {
             yarm_user_rt::user_log!(
-                "PM_VFS_READ_BULK_FAIL image_id={} stage=eof_early total={} expected={} offset={}",
-                image_id, out.len(), file_len, offset
+                "PM_VFS_READ_BULK_VFS_UNSUPPORTED image_id={} fallback=phase2a opcode={}",
+                image_id, bulk_reply.opcode
             );
-            let close_msg = match build_close_message(fd) {
-                Ok(m) => m,
-                Err(_) => return Err(ProcessManagerError::Malformed),
-            };
+            phase2b_unsupported = true;
+            break 'phase2b;
+        }
+
+        // Decode BulkReadReply.
+        let bulk_reply_payload = bulk_reply.as_slice();
+        let bulk_decoded = match yarm_ipc_abi::vfs_abi::BulkReadReply::decode(bulk_reply_payload) {
+            Some(r) => r,
+            None => {
+                yarm_user_rt::user_log!(
+                    "PM_VFS_READ_BULK_FAIL image_id={} stage=decode_reply reason=malformed",
+                    image_id
+                );
+                phase2b_unsupported = true;
+                break 'phase2b;
+            }
+        };
+
+        // copied_len=0 + eof=false = Phase 2B stub/unsupported.
+        if bulk_decoded.copied_len == 0 && !bulk_decoded.eof {
+            yarm_user_rt::user_log!(
+                "PM_VFS_READ_BULK_VFS_UNSUPPORTED image_id={} fallback=phase2a reason=stub_reply",
+                image_id
+            );
+            phase2b_unsupported = true;
+            break 'phase2b;
+        }
+
+        let bytes_copied = bulk_decoded.copied_len as usize;
+        if bytes_copied > 4096 || bytes_copied > bulk_buf.len() {
+            yarm_user_rt::user_log!(
+                "PM_VFS_READ_BULK_FAIL image_id={} stage=phase2b reason=copied_len_overflow copied={}",
+                image_id, bytes_copied
+            );
+            let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
             let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
             return Err(ProcessManagerError::Malformed);
         }
 
+        if bytes_copied == 0 && bulk_decoded.eof {
+            // Real EOF (file shorter than STATX reported).
+            yarm_user_rt::user_log!(
+                "PM_VFS_READ_BULK_FAIL image_id={} stage=eof_early_phase2b total={} expected={} offset={}",
+                image_id, out.len(), file_len, offset
+            );
+            let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+            let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+            return Err(ProcessManagerError::Malformed);
+        }
+
+        // Data was written by initramfs into bulk_buf[..bytes_copied] via kernel.
         out.extend_from_slice(&bulk_buf[..bytes_copied]);
         offset += bytes_copied as u64;
         chunk_count += 1;
+        used_phase2b = true;
 
-        if PM_VFS_BULK_READ_CHUNK_TRACE {
+        if PM_VFS_BULK_READ_TRANSFER_CHUNK_TRACE {
             yarm_user_rt::user_log!(
-                "PM_VFS_READ_BULK_CHUNK image_id={} bytes={} total={} expected={} chunk_n={}",
+                "PM_VFS_READ_BULK_TRANSFER_CHUNK image_id={} bytes={} total={} expected={} chunk_n={}",
                 image_id, bytes_copied, out.len(), file_len, chunk_count
             );
         }
     }
 
-    // ── 4. CLOSE via VFS to release fd ───────────────────────────────────────
+    // ── 4. Phase 2A fallback: direct kernel syscall if Phase 2B unsupported ───
+    if phase2b_unsupported && out.is_empty() {
+        yarm_user_rt::user_log!(
+            "PM_VFS_READ_BULK_PHASE2A_BEGIN image_id={} fd={} expected={} chunk=4096 cpio={}",
+            image_id, fd, file_len, cpio_str
+        );
+
+        offset = 0;
+        chunk_count = 0;
+
+        loop {
+            if out.len() >= file_len {
+                break;
+            }
+            let remaining = file_len - out.len();
+            let want = core::cmp::min(remaining, 4096);
+            let dst = &mut bulk_buf[..want];
+
+            // SAFETY: dst is valid writable memory in PM's address space.
+            let bytes_copied = match unsafe {
+                yarm_user_rt::syscall::initramfs_read_chunk(cpio_name, offset, dst)
+            } {
+                Ok(n) => n,
+                // InvalidArgs = kernel lacks CPIO ("bridge unavailable") → inline fallback.
+                Err(yarm_user_rt::syscall::SyscallError::InvalidArgs) => {
+                    yarm_user_rt::user_log!(
+                        "PM_VFS_READ_BULK_UNSUPPORTED image_id={} fallback=inline reason=kernel_no_cpio",
+                        image_id
+                    );
+                    let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+                    let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+                    return unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, vfs_path) };
+                }
+                // NOT-FOUND: file missing from CPIO — real error, no fallback.
+                Err(yarm_user_rt::syscall::SyscallError::Internal) => {
+                    yarm_user_rt::user_log!(
+                        "PM_VFS_READ_BULK_FAIL image_id={} stage=syscall reason=not_found offset={}",
+                        image_id, offset
+                    );
+                    let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+                    let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+                    return Err(ProcessManagerError::Malformed);
+                }
+                // PermissionDenied, PageFault, or any other error — real error, no fallback.
+                Err(e) => {
+                    yarm_user_rt::user_log!(
+                        "PM_VFS_READ_BULK_FAIL image_id={} stage=syscall reason={:?} offset={}",
+                        image_id, e, offset
+                    );
+                    let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+                    let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+                    return Err(ProcessManagerError::Malformed);
+                }
+            };
+
+            if bytes_copied == 0 {
+                yarm_user_rt::user_log!(
+                    "PM_VFS_READ_BULK_FAIL image_id={} stage=eof_early total={} expected={} offset={}",
+                    image_id, out.len(), file_len, offset
+                );
+                let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+                let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+                return Err(ProcessManagerError::Malformed);
+            }
+
+            out.extend_from_slice(&bulk_buf[..bytes_copied]);
+            offset += bytes_copied as u64;
+            chunk_count += 1;
+
+            if PM_VFS_BULK_READ_CHUNK_TRACE {
+                yarm_user_rt::user_log!(
+                    "PM_VFS_READ_BULK_CHUNK image_id={} bytes={} total={} expected={} chunk_n={}",
+                    image_id, bytes_copied, out.len(), file_len, chunk_count
+                );
+            }
+        }
+
+        yarm_user_rt::user_log!(
+            "PM_VFS_READ_BULK_PHASE2A_DONE image_id={} total={} chunks={}",
+            image_id, out.len(), chunk_count
+        );
+    }
+
+    // ── 5. CLOSE via VFS to release fd ───────────────────────────────────────
     let close_msg = match build_close_message(fd) {
         Ok(m) => m,
         Err(_) => return Err(ProcessManagerError::Malformed),
@@ -1746,12 +1876,13 @@ unsafe fn pm_read_all_via_vfs_bulk(
     yarm_user_rt::user_log!("PM_VFS_CALL op=CLOSE fd={}", fd);
     let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
 
-    // ── 5. Verify and log completion ──────────────────────────────────────────
+    // ── 6. Verify and log completion ──────────────────────────────────────────
     {
         let first4_end = core::cmp::min(out.len(), 4);
+        let mode = if used_phase2b { "vfs_transfer" } else { "phase2a_bridge" };
         yarm_user_rt::user_log!(
-            "PM_VFS_READ_BULK_DONE image_id={} total={} first4={:x?} chunks={}",
-            image_id, out.len(), &out[..first4_end], chunk_count
+            "PM_VFS_READ_BULK_DONE image_id={} total={} first4={:x?} chunks={} mode={}",
+            image_id, out.len(), &out[..first4_end], chunk_count, mode
         );
         // Emit the legacy completion marker so smoke scripts and existing greps pass.
         yarm_user_rt::user_log!(

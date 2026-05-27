@@ -323,6 +323,49 @@ impl KernelState {
         self.copy_from_user(asid, VirtAddr(user_ptr as u64), len)
     }
 
+    /// Copy a kernel slice into an arbitrary task's virtual address space.
+    ///
+    /// Uses one page-table walk per 4 KiB page boundary crossed, then a bulk
+    /// copy for each aligned chunk — avoids per-byte overhead for large buffers.
+    ///
+    /// Phase 2B temporary bridge: used by initramfs_srv to copy CPIO data into
+    /// PM's transfer buffer.  Replace with page-cap grant in Phase 3.
+    pub fn copy_slice_to_task(
+        &mut self,
+        target_tid: u64,
+        user_ptr: usize,
+        src: &[u8],
+    ) -> Result<(), KernelError> {
+        let asid = self.task_asid(target_tid).ok_or(KernelError::UserMemoryFault)?;
+        let page_size = crate::kernel::vm::PAGE_SIZE;
+        let len = src.len();
+        let mut done = 0usize;
+        while done < len {
+            let va_addr = user_ptr + done;
+            let offset_in_page = va_addr & (page_size - 1);
+            let bytes_in_page = page_size - offset_in_page;
+            let chunk = (len - done).min(bytes_in_page);
+            let phys = self.validate_user_access_for_asid(asid, va_addr, true)?;
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                let dst_ptr =
+                    Self::phys_to_direct_map_ptr(phys).ok_or(KernelError::UserMemoryFault)?;
+                // SAFETY: phys validated above; chunk ≤ remaining bytes in that page.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src[done..].as_ptr(), dst_ptr, chunk);
+                }
+            }
+            #[cfg(feature = "hosted-dev")]
+            {
+                for i in 0..chunk {
+                    self.write_user_byte(asid, VirtAddr(phys + i as u64), src[done + i])?;
+                }
+            }
+            done += chunk;
+        }
+        Ok(())
+    }
+
     /// Copy a kernel slice into the current user task's virtual address space.
     ///
     /// Uses one page-table walk per 4 KiB page boundary crossed, then a bulk

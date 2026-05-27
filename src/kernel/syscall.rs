@@ -67,6 +67,14 @@ pub const OPCODE_SHARED_MEM: u16 = 1;
 const AARCH64_SYSCALL_TRACE: bool = false;
 macro_rules! syscall_trace { ($($arg:tt)*) => { if AARCH64_SYSCALL_TRACE { crate::yarm_log!($($arg)*); } }; }
 
+/// Gate for per-chunk `INITRAMFS_READ_CHUNK` logs (hot-path).
+/// Set true to trace every chunk read for debugging.
+const INITRAMFS_READ_CHUNK_TRACE: bool = false;
+
+/// PM is always TID 3 (RING3_PM_SERVER_TID in both aarch64 and x86_64 boot).
+/// Temporary Phase 2B bridge constant — replace with page-cap grant in Phase 3.
+const PM_BOOTSTRAP_TID: u64 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Syscall {
@@ -2280,33 +2288,63 @@ fn copy_spawn_startup_args(
 }
 
 /// Phase 2 bulk-copy bridge: reads up to 4096 bytes from a named initramfs CPIO
-/// file at the given byte offset into the caller's user buffer.
+/// file at the given byte offset into the caller's (or a target task's) user buffer.
 ///
 /// TEMPORARY stepping stone for Phase 2. Replace with page-cap zero-copy in Phase 3.
+///
+/// Access control: caller must be `TaskClass::SystemServer`.
+/// Any other task class receives `SyscallError::MissingRight`.
 ///
 /// syscall nr=27 args:
 ///   arg0 = name_ptr    (user VA of file name bytes, no leading slash required)
 ///   arg1 = name_len    (1..=128)
 ///   arg2 = offset      (byte offset into file)
-///   arg3 = dst_ptr     (user VA of caller's destination buffer)
+///   arg3 = dst_ptr     (user VA of destination buffer)
 ///   arg4 = max_len     (max bytes to copy; clamped to 4096)
+///   arg5 = target_tid  (0 = write to caller's own ASID;
+///                       PM_BOOTSTRAP_TID(3) = write to PM's ASID — Phase 2B bridge)
 ///
-/// Returns: ret0=0 (status OK), ret1=bytes_copied (0 if EOF or not found)
+/// Returns: ret0=0 (status OK), ret1=bytes_copied
+///          ret0=SyscallError (non-zero) on all error cases, including not_found.
+///
+/// Note: EOF (offset >= file_len) returns ret0=0, ret1=0 — NOT an error.
+///       File-not-found returns ret0=SyscallError::Internal — NOT 0/EOF.
 fn handle_initramfs_read_chunk(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
+    // ── 0. Access gate: SystemServer only ────────────────────────────────────
+    let caller_tid = current_tid(kernel)?;
+    let caller_class = kernel.task_class(caller_tid);
+    if caller_class != Some(TaskClass::SystemServer) {
+        crate::yarm_log!(
+            "INITRAMFS_READ_CHUNK_DENIED tid={}",
+            caller_tid
+        );
+        return Err(SyscallError::MissingRight);
+    }
+
     let name_ptr = frame.arg(0);
     let name_len = frame.arg(1);
     let offset   = frame.arg(2) as u64;
     let dst_ptr  = frame.arg(3);
     let max_len  = core::cmp::min(frame.arg(4), 4096);
+    // Phase 2B extension: arg5 = target_tid (0 = self, PM_BOOTSTRAP_TID = PM's ASID)
+    let target_tid_arg = frame.arg(5) as u64;
 
     if name_len == 0 || name_len > 128 {
         return Err(SyscallError::InvalidArgs);
     }
     if dst_ptr == 0 {
         return Err(SyscallError::InvalidArgs);
+    }
+    // Validate target_tid: only 0 (self) or PM_BOOTSTRAP_TID allowed as Phase 2B bridge.
+    if target_tid_arg != 0 && target_tid_arg != PM_BOOTSTRAP_TID {
+        crate::yarm_log!(
+            "INITRAMFS_READ_CHUNK_DENIED tid={} target_tid={} reason=invalid_target",
+            caller_tid, target_tid_arg
+        );
+        return Err(SyscallError::MissingRight);
     }
 
     let name_buf = kernel
@@ -2329,24 +2367,25 @@ fn handle_initramfs_read_chunk(
     let data = match entry {
         Some(e) => e.file_data(),
         None => {
-            // File not found — return 0 bytes, not an error, so PM can detect
-            // and log gracefully rather than panic.
+            // File not found — return a real error (NOT 0/EOF).
+            // EOF is reserved for "file exists but offset >= file_len".
             crate::yarm_log!(
                 "INITRAMFS_READ_CHUNK_NOT_FOUND name={} offset={} max_len={}",
                 name, offset, max_len
             );
-            frame.set_ok(0, 0, 0);
-            return Ok(());
+            return Err(SyscallError::Internal);
         }
     };
 
     let offset_usize = offset as usize;
     if offset_usize >= data.len() {
-        // EOF — return 0 bytes normally.
-        crate::yarm_log!(
-            "INITRAMFS_READ_CHUNK_EOF name={} offset={} file_len={}",
-            name, offset, data.len()
-        );
+        // EOF — file exists, offset is past the end.
+        if INITRAMFS_READ_CHUNK_TRACE {
+            crate::yarm_log!(
+                "INITRAMFS_READ_CHUNK_EOF name={} offset={} file_len={}",
+                name, offset, data.len()
+            );
+        }
         frame.set_ok(0, 0, 0);
         return Ok(());
     }
@@ -2354,15 +2393,38 @@ fn handle_initramfs_read_chunk(
     let available = data.len() - offset_usize;
     let to_copy = core::cmp::min(available, max_len);
 
-    crate::yarm_log!(
-        "INITRAMFS_READ_CHUNK name={} offset={} to_copy={} file_len={}",
-        name, offset, to_copy, data.len()
-    );
+    if INITRAMFS_READ_CHUNK_TRACE {
+        crate::yarm_log!(
+            "INITRAMFS_READ_CHUNK name={} offset={} to_copy={} file_len={} target_tid={}",
+            name, offset, to_copy, data.len(), target_tid_arg
+        );
+    }
 
-    validate_user_region(dst_ptr as u64, to_copy as u64)?;
-    kernel
-        .copy_to_current_user_from_slice(dst_ptr, &data[offset_usize..offset_usize + to_copy])
-        .map_err(SyscallError::from)?;
+    // ── Copy to destination ASID ──────────────────────────────────────────────
+    if target_tid_arg == 0 {
+        // Default: copy to caller's own address space.
+        validate_user_region(dst_ptr as u64, to_copy as u64)?;
+        kernel
+            .copy_to_current_user_from_slice(dst_ptr, &data[offset_usize..offset_usize + to_copy])
+            .map_err(SyscallError::from)?;
+    } else {
+        // Phase 2B bridge: copy to PM's address space (target_tid = PM_BOOTSTRAP_TID).
+        // SAFETY: dst_ptr is PM's VA; to_copy ≤ 4096; data slice is valid CPIO data.
+        kernel
+            .copy_slice_to_task(
+                target_tid_arg,
+                dst_ptr,
+                &data[offset_usize..offset_usize + to_copy],
+            )
+            .map_err(|_| SyscallError::PageFault)?;
+    }
+
+    if INITRAMFS_READ_CHUNK_TRACE {
+        crate::yarm_log!(
+            "INITRAMFS_READ_CHUNK_FAIL name={} stage=copy_done to_copy={}",
+            name, to_copy
+        );
+    }
 
     frame.set_ok(0, to_copy, 0);
     Ok(())
@@ -4597,5 +4659,137 @@ mod tests {
 
         let reply_msg = Message::new(1, &[0x34, 0x12, 0xAA, 0xBB]).expect("reply msg");
         assert!(!should_strip_inline_opcode_prefix(&reply_msg));
+    }
+
+    // ── Phase 2A/2B syscall nr=27 unit tests ─────────────────────────────────
+
+    /// Verify that syscall nr=27 ABI number is stable (Phase 2A/2B bootstrap bridge).
+    /// This test does NOT use Bootstrap::init() so no large stack is needed.
+    #[test]
+    fn initramfs_read_chunk_syscall_nr_is_frozen_at_27() {
+        assert_eq!(SYSCALL_INITRAMFS_READ_CHUNK_NR, 27);
+        assert_eq!(
+            Syscall::decode(27).expect("decode nr=27"),
+            Syscall::InitramfsReadChunk
+        );
+    }
+
+    /// Access gate: a non-SystemServer (App) task must receive MissingRight immediately.
+    /// Uses a 4 MiB thread stack because Bootstrap::init() needs significant stack space.
+    #[test]
+    fn initramfs_read_chunk_denied_for_non_system_server() {
+        std::thread::Builder::new()
+            .name("initramfs_read_chunk_denied_for_non_system_server".into())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut state = Bootstrap::init().expect("kernel");
+                state
+                    .register_task_with_class(150, crate::kernel::task::TaskClass::App)
+                    .expect("register app task");
+                state.enqueue_current_cpu(150).expect("enqueue");
+                state.dispatch_next_task().expect("dispatch");
+                if state.current_tid() != Some(150) {
+                    state.yield_current().expect("switch to app task");
+                }
+                let mut frame = TrapFrame::new(
+                    Syscall::InitramfsReadChunk as usize,
+                    [0x1000, 5, 0, 0x2000, 64, 0],
+                );
+                let err = dispatch(&mut state, &mut frame)
+                    .expect_err("non-SystemServer must be denied");
+                assert_eq!(err, SyscallError::MissingRight);
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    /// Phase 2B arg5 gate: SystemServer with arg5 != 0 and != PM_BOOTSTRAP_TID → MissingRight.
+    /// The gate fires before the user-memory name read, so no address space setup needed.
+    /// Uses a 4 MiB thread stack because Bootstrap::init() needs significant stack space.
+    #[test]
+    fn initramfs_read_chunk_denied_for_invalid_target_tid() {
+        std::thread::Builder::new()
+            .name("initramfs_read_chunk_denied_for_invalid_target_tid".into())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut state = Bootstrap::init().expect("kernel");
+                state
+                    .register_task_with_class(151, crate::kernel::task::TaskClass::SystemServer)
+                    .expect("register system server");
+                state.enqueue_current_cpu(151).expect("enqueue");
+                state.dispatch_next_task().expect("dispatch");
+                if state.current_tid() != Some(151) {
+                    state.yield_current().expect("switch to system server");
+                }
+                // arg5 = 42 is neither 0 (self) nor PM_BOOTSTRAP_TID (3) — must be denied.
+                let mut frame = TrapFrame::new(
+                    Syscall::InitramfsReadChunk as usize,
+                    [0x1000, 5, 0, 0x2000, 64, 42],
+                );
+                let err = dispatch(&mut state, &mut frame)
+                    .expect_err("invalid target_tid must be denied");
+                assert_eq!(err, SyscallError::MissingRight);
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    /// File-not-found must return `Internal` (not 0/EOF and not silently 0 bytes).
+    /// Sets up user memory for the name pointer and a minimal CPIO without the file.
+    /// Uses a 4 MiB thread stack because Bootstrap::init() and address-space setup are heavy.
+    #[test]
+    fn initramfs_read_chunk_not_found_returns_internal_error() {
+        std::thread::Builder::new()
+            .name("initramfs_read_chunk_not_found_returns_internal_error".into())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut state = Bootstrap::init().expect("kernel");
+                state
+                    .register_task_with_class(152, crate::kernel::task::TaskClass::SystemServer)
+                    .expect("register system server");
+                // Map a user page for the name buffer.
+                let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+                state.bind_task_asid(152, asid).expect("bind asid to task");
+                state
+                    .map_user_page(
+                        aspace_cap,
+                        crate::kernel::vm::VirtAddr(0x4000),
+                        crate::kernel::vm::Mapping {
+                            phys: crate::kernel::vm::PhysAddr(0x8000),
+                            flags: crate::kernel::vm::PageFlags::USER_RW,
+                        },
+                    )
+                    .expect("map name page");
+                // Write the file name bytes into user memory.
+                let name = b"sbin/no_such_file_exists";
+                state
+                    .write_user_memory(152, 0x4000, name)
+                    .expect("write name into user memory");
+                // Install a minimal CPIO that does NOT contain the requested file.
+                let mut cpio = alloc::vec::Vec::new();
+                push_cpio_entry(&mut cpio, "TRAILER!!!", 0, &[]);
+                let cpio_bytes: &'static [u8] = Box::leak(cpio.into_boxed_slice());
+                crate::kernel::boot::Bootstrap::install_boot_initrd_bytes(cpio_bytes);
+
+                state.enqueue_current_cpu(152).expect("enqueue");
+                state.dispatch_next_task().expect("dispatch");
+                if state.current_tid() != Some(152) {
+                    state.yield_current().expect("switch to system server");
+                }
+                let mut frame = TrapFrame::new(
+                    Syscall::InitramfsReadChunk as usize,
+                    // arg0=name_ptr, arg1=name_len, arg2=offset=0, arg3=dst_ptr(non-zero), arg4=64, arg5=0
+                    [0x4000, name.len(), 0, 0x9000, 64, 0],
+                );
+                let err = dispatch(&mut state, &mut frame)
+                    .expect_err("not-found must be Internal error");
+                // MUST be Internal, NOT 0/EOF — critical Phase 2A safety constraint.
+                assert_eq!(err, SyscallError::Internal);
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
     }
 }

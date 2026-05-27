@@ -197,6 +197,21 @@ impl InitramfsBackend {
         self.inodes[handle.inode_idx].ok_or(VfsError::BadFd)
     }
 
+    /// Returns the bare CPIO entry name for an open fd (strips `/initramfs/` prefix).
+    /// Used by the Phase 2B `VFS_OP_READ_BULK` handler to pass to the kernel bulk copy
+    /// primitive (`initramfs_write_to_pm_buf` / syscall nr=27 with arg5=PM_TID).
+    pub fn cpio_name_for_fd(&self, fd: u64) -> Option<&'static [u8]> {
+        let inode = self.inode_for_fd(fd).ok()?;
+        Some(inode.path.strip_prefix(b"/initramfs/").unwrap_or(inode.path))
+    }
+
+    /// Returns the total file length for an open fd.
+    /// Used by the Phase 2B handler to determine whether a bulk read reached EOF.
+    pub fn file_len_for_fd(&self, fd: u64) -> Option<u64> {
+        let inode = self.inode_for_fd(fd).ok()?;
+        Some(inode.file_len)
+    }
+
     fn alloc_handle(&mut self, inode_idx: usize) -> Result<u64, VfsError> {
         let fd = self.next_fd;
         self.next_fd = self.next_fd.saturating_add(1);
@@ -495,6 +510,63 @@ mod tests {
         assert_eq!(fs.statx_path(INITRAMFS_DRIVER_MANAGER_PATH).expect("stat"), 10);
         let fd = fs.openat_path(INITRAMFS_DRIVER_MANAGER_PATH).expect("open");
         assert!(fd >= 10);
+    }
+
+
+    // ── Phase 2B bulk-read helper method tests ─────────────────────────────
+
+    /// cpio_name_for_fd strips "/initramfs/" prefix and returns the bare CPIO entry name.
+    #[test]
+    fn cpio_name_for_fd_strips_initramfs_prefix() {
+        let mut cpio_data = Vec::new();
+        push_entry(&mut cpio_data, "sbin/driver_manager", 0o100755, b"ELFdm");
+        push_entry(&mut cpio_data, "TRAILER!!!", 0, &[]);
+        let leaked: &'static [u8] = Box::leak(cpio_data.into_boxed_slice());
+        let mut fs = InitramfsBackend::from_cpio_newc_static(leaked);
+        let fd = fs.openat_path(INITRAMFS_DRIVER_MANAGER_PATH).expect("open");
+        let cpio_name = fs.cpio_name_for_fd(fd).expect("cpio name");
+        assert_eq!(cpio_name, b"sbin/driver_manager");
+    }
+
+    /// file_len_for_fd returns the file length for an open fd.
+    #[test]
+    fn file_len_for_fd_returns_correct_length() {
+        let mut cpio_data = Vec::new();
+        push_entry(&mut cpio_data, "sbin/blkcache_srv", 0o100755, &[0u8; 333]);
+        push_entry(&mut cpio_data, "TRAILER!!!", 0, &[]);
+        let leaked: &'static [u8] = Box::leak(cpio_data.into_boxed_slice());
+        let mut fs = InitramfsBackend::from_cpio_newc_static(leaked);
+        let fd = fs.openat_path(INITRAMFS_BLKCACHE_PATH).expect("open");
+        let file_len = fs.file_len_for_fd(fd).expect("file len");
+        assert_eq!(file_len, 333);
+    }
+
+    /// cpio_name_for_fd returns None for a nonexistent fd.
+    #[test]
+    fn cpio_name_for_fd_returns_none_for_invalid_fd() {
+        let fs = InitramfsBackend::new(4096);
+        assert!(fs.cpio_name_for_fd(999).is_none());
+    }
+
+    /// file_len_for_fd returns None for a nonexistent fd.
+    #[test]
+    fn file_len_for_fd_returns_none_for_invalid_fd() {
+        let fs = InitramfsBackend::new(4096);
+        assert!(fs.file_len_for_fd(999).is_none());
+    }
+
+    /// After close, cpio_name_for_fd returns None (fd ownership enforced).
+    #[test]
+    fn cpio_name_for_fd_unavailable_after_close() {
+        let mut cpio_data = Vec::new();
+        push_entry(&mut cpio_data, "sbin/virtio_blk_srv", 0o100755, &[0u8; 77]);
+        push_entry(&mut cpio_data, "TRAILER!!!", 0, &[]);
+        let leaked: &'static [u8] = Box::leak(cpio_data.into_boxed_slice());
+        let mut fs = InitramfsBackend::from_cpio_newc_static(leaked);
+        let fd = fs.openat_path(INITRAMFS_VIRTIO_BLK_PATH).expect("open");
+        assert!(fs.cpio_name_for_fd(fd).is_some());
+        fs.close(fd).expect("close");
+        assert!(fs.cpio_name_for_fd(fd).is_none());
     }
 
 }

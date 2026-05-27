@@ -731,9 +731,13 @@ pub fn run() {
                             if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_id)
                             {
                                 if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
+                                    // Decode full BulkReadArgs to log requested_len.
+                                    let requested = yarm_ipc_abi::vfs_abi::BulkReadArgs::decode(msg.as_slice())
+                                        .map(|b| b.requested_len)
+                                        .unwrap_or(0);
                                     yarm_user_rt::user_log!(
-                                        "VFS_FORWARD_BULK_READ op={} fd={} target={}",
-                                        msg.opcode, args.fd, label.as_str()
+                                        "VFS_FORWARD_BULK_READ op={} fd={} requested={} target={} mode=transfer_buffer",
+                                        msg.opcode, args.fd, requested, label.as_str()
                                     );
                                 } else {
                                     yarm_user_rt::user_log!(
@@ -743,7 +747,14 @@ pub fn run() {
                                 }
                                 Ok((send_cap, label))
                             } else {
-                                yarm_user_rt::user_log!("VFS_ROUTE_BAD_FD fd={}", args.fd);
+                                if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
+                                    yarm_user_rt::user_log!(
+                                        "VFS_BULK_READ_DENIED fd={} reason=ownership client_id={}",
+                                        args.fd, client_id
+                                    );
+                                } else {
+                                    yarm_user_rt::user_log!("VFS_ROUTE_BAD_FD fd={}", args.fd);
+                                }
                                 Err(VFS_STATUS_ERR_BAD_FD)
                             }
                         }

@@ -15,8 +15,8 @@
 
 use crate::ipc::Message;
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VfsV1Args, VFS_OP_CLOSE, VFS_OP_OPENAT,
-    VFS_OP_READ, VFS_OP_STATX,
+    BulkReadArgs, OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VfsV1Args,
+    VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_READ_BULK, VFS_OP_STATX,
 };
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -84,6 +84,23 @@ pub fn build_read_message(fd: u64, len: usize) -> Result<Message, VfsClientError
 pub fn build_close_message(fd: u64) -> Result<Message, VfsClientError> {
     let encoded = VfsV1Args::new(fd, 0, 0, 0).encode();
     Message::with_header(0, VFS_OP_CLOSE, 0, None, &encoded)
+        .map_err(|_| VfsClientError::MessageFailed)
+}
+
+/// Build a `VFS_OP_READ_BULK` [`Message`] for a Phase 2B transfer-buffer bulk read.
+///
+/// `dst_ptr` is PM's local stack buffer VA — initramfs will use kernel
+/// syscall nr=27 (target_tid=PM) to fill it directly.
+///
+/// Phase 2B temporary transfer-buffer bridge.  Replace with page-cap grant in Phase 3.
+pub fn build_bulk_read_message(
+    fd: u64,
+    requested_len: u64,
+    offset: u64,
+    dst_ptr: usize,
+) -> Result<Message, VfsClientError> {
+    let encoded = BulkReadArgs::new_with_dst(fd, requested_len, offset, dst_ptr as u64).encode();
+    Message::with_header(0, VFS_OP_READ_BULK, 0, None, &encoded)
         .map_err(|_| VfsClientError::MessageFailed)
 }
 
@@ -401,5 +418,31 @@ mod tests {
         assert_ne!(close.opcode, statx.opcode);
         assert_ne!(close.opcode, openat.opcode);
         assert_ne!(close.opcode, read.opcode);
+    }
+
+    // ── Phase 2B build_bulk_read_message tests ────────────────────────────────
+
+    /// Phase 2B: build_bulk_read_message encodes fd, requested_len, offset, and dst_ptr.
+    #[test]
+    fn build_bulk_read_message_encodes_dst_ptr() {
+        use yarm_ipc_abi::vfs_abi::{BulkReadArgs, VFS_OP_READ_BULK};
+        let dst_ptr = 0xDEAD_BEEF_0000usize;
+        let msg = build_bulk_read_message(7, 4096, 8192, dst_ptr).expect("bulk msg");
+        assert_eq!(msg.opcode, VFS_OP_READ_BULK);
+        let decoded = BulkReadArgs::decode(msg.as_slice()).expect("decode bulk args");
+        assert_eq!(decoded.fd, 7);
+        assert_eq!(decoded.requested_len, 4096);
+        assert_eq!(decoded.offset, 8192);
+        assert_eq!(decoded.dst_ptr, dst_ptr as u64);
+    }
+
+    /// Phase 2B: build_bulk_read_message with dst_ptr=0 encodes as zero (Phase 2A compat).
+    #[test]
+    fn build_bulk_read_message_zero_dst_ptr_is_phase2a_compat() {
+        use yarm_ipc_abi::vfs_abi::{BulkReadArgs, VFS_OP_READ_BULK};
+        let msg = build_bulk_read_message(3, 512, 0, 0).expect("bulk msg");
+        assert_eq!(msg.opcode, VFS_OP_READ_BULK);
+        let decoded = BulkReadArgs::decode(msg.as_slice()).expect("decode");
+        assert_eq!(decoded.dst_ptr, 0);
     }
 }
