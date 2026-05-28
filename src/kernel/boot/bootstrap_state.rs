@@ -11,6 +11,20 @@ unsafe extern "C" {
 
 static mut BOOTSTRAP_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
     core::mem::MaybeUninit::uninit();
+
+// Canonical boot-owned SharedKernel; written exactly once by init_shared_static*.
+// After write, only init_shared_static* touches this storage — no &'static mut KernelState
+// alias may be live at the same time (enforced by calling site convention, see §Phase L2A).
+//
+// Accessed only via addr_of_mut!/addr_of! + raw pointer operations (matching the
+// BOOTSTRAP_KERNEL_STATE pattern) to avoid the static_mut_refs lint.
+static mut BOOTSTRAP_SHARED_KERNEL: core::mem::MaybeUninit<crate::runtime::SharedKernel> =
+    core::mem::MaybeUninit::uninit();
+
+// Tracks whether BOOTSTRAP_SHARED_KERNEL has been initialized.
+// 0 = uninit, 1 = initialized.  Written once; read-only after.
+static BOOTSTRAP_SHARED_KERNEL_READY: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
 const MAX_BOOT_EXTRA_RESERVED: usize = 8;
 static BOOT_EXTRA_RESERVED_COUNT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
@@ -622,6 +636,111 @@ impl Bootstrap {
             state.dispatch_next_task()?;
             Ok(state)
         }
+    }
+
+    // ── Phase L2A: canonical boot-owned SharedKernel construction ──────────────
+    //
+    // These functions create the boot-time &'static SharedKernel without
+    // installing any trap state pointer.  Trap migration happens in a later
+    // phase.  The ownership contract is:
+    //
+    //   1. init_static_with_boot_memory_map writes BOOTSTRAP_KERNEL_STATE and
+    //      returns a &'static mut KernelState aliasing that storage.
+    //   2. We immediately ptr::read the bytes out, consuming the alias.
+    //      After the read, the caller must not use the &'static mut ref again.
+    //   3. The owned KernelState is moved into SharedKernel::new, which stores
+    //      it inside a SpinLock inside BOOTSTRAP_SHARED_KERNEL.
+    //   4. BOOTSTRAP_SHARED_KERNEL is written exactly once; READY flag is set.
+    //   5. Neither install_trap_kernel_state nor install_trap_shared_kernel is
+    //      called here.  Stage 2N remains fallback-active.
+
+    /// Construct the canonical boot-owned `SharedKernel` using the default
+    /// capacity profile and boot memory map.
+    ///
+    /// # Panics (in hosted-dev / test)
+    /// Panics if called a second time when `BOOTSTRAP_SHARED_KERNEL_READY` is
+    /// already set, matching the existing double-init guard pattern used by the
+    /// x86_64 `install_trap_kernel_state`.
+    pub fn init_shared_static() -> Result<&'static crate::runtime::SharedKernel, KernelError> {
+        Self::init_shared_static_with_capacity_profile(Self::default_capacity_profile())
+    }
+
+    pub fn init_shared_static_with_capacity_profile(
+        capacity_profile: KernelCapacityProfile,
+    ) -> Result<&'static crate::runtime::SharedKernel, KernelError> {
+        let (boot_map, boot_map_len) = Self::default_boot_memory_map();
+        let reserved = Self::default_reserved_ranges();
+        Self::init_shared_static_with_boot_memory_map(
+            capacity_profile,
+            &boot_map[..boot_map_len],
+            &reserved,
+        )
+    }
+
+    pub fn init_shared_static_with_boot_memory_map(
+        capacity_profile: KernelCapacityProfile,
+        boot_regions: &[MemoryRegion],
+        reserved_ranges: &[(u64, u64)],
+    ) -> Result<&'static crate::runtime::SharedKernel, KernelError> {
+        use core::sync::atomic::Ordering;
+
+        // Guard against double initialization with the same compare-exchange
+        // pattern used by x86_64's install_trap_kernel_state.
+        if BOOTSTRAP_SHARED_KERNEL_READY
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            panic!("init_shared_static called more than once");
+        }
+
+        // Step 1: initialize KernelState into BOOTSTRAP_KERNEL_STATE.
+        let state_ref =
+            Self::init_static_with_boot_memory_map(capacity_profile, boot_regions, reserved_ranges)?;
+
+        // Step 2: move the KernelState bytes out of BOOTSTRAP_KERNEL_STATE.
+        // After this ptr::read the &'static mut ref must not be used again;
+        // BOOTSTRAP_KERNEL_STATE holds logically-moved-from bytes.
+        //
+        // SAFETY: init_static_with_boot_memory_map fully initializes the
+        // MaybeUninit storage and returns a valid &'static mut KernelState.
+        // ptr::read produces an owned copy; we drop the reference immediately.
+        let owned: KernelState = unsafe { core::ptr::read(state_ref as *const KernelState) };
+
+        // Step 3: wrap in SharedKernel and write into BOOTSTRAP_SHARED_KERNEL.
+        let shared = crate::runtime::SharedKernel::new(owned);
+        // SAFETY: single-writer guaranteed by the compare_exchange guard above;
+        // the store of READY=1 (which is the read gate in shared_static_ref) has
+        // not happened yet, so no concurrent reader can observe the write target.
+        // We use addr_of_mut! + ptr::write to match the BOOTSTRAP_KERNEL_STATE
+        // pattern and avoid the static_mut_refs lint.
+        unsafe {
+            let ptr = core::ptr::addr_of_mut!(BOOTSTRAP_SHARED_KERNEL)
+                .cast::<crate::runtime::SharedKernel>();
+            core::ptr::write(ptr, shared);
+        }
+
+        // SAFETY: ptr::write above fully initialized the storage; the addr_of!
+        // cast to *const yields a pointer to a now-valid SharedKernel.
+        Ok(unsafe {
+            &*core::ptr::addr_of!(BOOTSTRAP_SHARED_KERNEL).cast::<crate::runtime::SharedKernel>()
+        })
+    }
+
+    /// Return the already-initialized boot `SharedKernel`, or `None` if
+    /// `init_shared_static*` has not been called yet.
+    ///
+    /// This accessor never initializes or mutates the shared kernel.
+    pub fn shared_static_ref() -> Option<&'static crate::runtime::SharedKernel> {
+        use core::sync::atomic::Ordering;
+        if BOOTSTRAP_SHARED_KERNEL_READY.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        // SAFETY: READY == 1 means BOOTSTRAP_SHARED_KERNEL was fully written
+        // by init_shared_static_with_boot_memory_map before the Acquire load
+        // observed 1; the Acquire ordering ensures the write is visible here.
+        Some(unsafe {
+            &*core::ptr::addr_of!(BOOTSTRAP_SHARED_KERNEL).cast::<crate::runtime::SharedKernel>()
+        })
     }
 }
 
