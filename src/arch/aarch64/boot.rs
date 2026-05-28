@@ -558,6 +558,9 @@ const AARCH64_LOCK_SPLIT_TRACE: bool = false;
 static SECONDARY_JOINED_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static LAST_VECTOR_RAW_ELR: AtomicU64 = AtomicU64::new(0);
+// One-shot: emitted once on the first AArch64 trap that takes the shared path.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static STAGE2N_FIRST_TRAP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -686,6 +689,12 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         if AARCH64_LOCK_SPLIT_TRACE {
             crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry");
         }
+        if STAGE2N_FIRST_TRAP_LOGGED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=aarch64");
+        }
         let mut trap_frame = crate::kernel::trapframe::TrapFrame::zeroed();
         trap_frame.set_saved_pc(frame.elr_el1 as usize);
         trap_frame.set_saved_sp(frame.sp_el0 as usize);
@@ -728,6 +737,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         if AARCH64_LOCK_SPLIT_TRACE {
             crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry fallback=1");
         }
+        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FALLBACK arch=aarch64 reason=no_shared_kernel");
         let current_tid = kernel.current_tid();
         if current_tid == Some(1) {
             boot_trace!(
@@ -1425,6 +1435,8 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     install_trap_shared_kernel(shared);
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=aarch64 shared=1 raw=0");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_done");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]

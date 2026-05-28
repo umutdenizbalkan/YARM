@@ -1045,8 +1045,27 @@ fn handle_ipc_recv_timeout(
     let user_len = frame.arg(SYSCALL_ARG_LEN);
     let waiter_tid = current_tid(kernel)?;
     clear_blocked_recv_state(kernel, waiter_tid, "error");
+    // Consume the per-CPU pre-read deadline from the split-read optimization path.
+    // When handle_trap_entry_shared (arch/trap_entry.rs) detects this syscall
+    // before acquiring the global lock, it pre-reads the scheduler tick under the
+    // lighter scheduler lock and stores an absolute deadline here.  Using that
+    // pre-computed deadline avoids a redundant tick read inside the global lock.
+    let preread_deadline: Option<u64> = {
+        let cpu_idx = kernel.current_cpu().0 as usize;
+        if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+            let v = crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
+                .swap(0, core::sync::atomic::Ordering::AcqRel);
+            if v != 0 { Some(v) } else { None }
+        } else {
+            None
+        }
+    };
     let received = if timeout_ticks == 0 {
         kernel.try_ipc_recv(cap).map_err(SyscallError::from)?
+    } else if let Some(deadline) = preread_deadline {
+        kernel
+            .ipc_recv_until_deadline(cap, deadline)
+            .map_err(SyscallError::from)?
     } else {
         kernel
             .ipc_recv_with_deadline(cap, timeout_ticks)
