@@ -1609,21 +1609,33 @@ fn should_strip_inline_opcode_prefix(msg: &Message) -> bool {
             || (msg.flags & Message::FLAG_CAP_TRANSFER) != 0)
 }
 
-fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let aspace_map_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
-    let addr = frame.arg(SYSCALL_ARG_PTR);
-    let len = frame.arg(SYSCALL_ARG_LEN);
-    let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
+/// Validates the (addr, len, prot) triple shared by VmMap and VmAnonMap.
+/// Returns `(map_len, end, flags)` where `map_len` is rounded up to `PAGE_SIZE`
+/// and `end = addr + map_len` is guaranteed not to overflow.
+fn validate_anon_map_args(
+    addr: usize,
+    len: usize,
+    prot: usize,
+) -> Result<(usize, usize, PageFlags), SyscallError> {
     if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
         return Err(SyscallError::InvalidArgs);
     }
     let map_len = round_up_page(len)?;
     let end = addr.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
     let flags = vm_map_page_flags(prot)?;
+    Ok((map_len, end, flags))
+}
 
+/// Checks the writable non-executable stack guard-page invariant.
+/// Shared by VmMap and VmAnonMap to prevent silent stack-overflow corruption.
+fn check_stack_guard(
+    kernel: &KernelState,
+    addr: usize,
+    flags: PageFlags,
+) -> Result<(), SyscallError> {
     // Reserve one unmapped page immediately below writable non-executable
-    // mappings so downward-growing task stacks can fault deterministically
-    // on overflow instead of silently corrupting adjacent pages.
+    // mappings so downward-growing task stacks fault deterministically on
+    // overflow instead of silently corrupting adjacent pages.
     if flags.write
         && !flags.execute
         && let Some(guard_page) = addr.checked_sub(PAGE_SIZE)
@@ -1633,7 +1645,21 @@ fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
     {
         return Err(SyscallError::InvalidArgs);
     }
+    Ok(())
+}
 
+fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let aspace_map_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let addr = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
+    let (map_len, end, flags) = validate_anon_map_args(addr, len, prot)?;
+    check_stack_guard(kernel, addr, flags)?;
+
+    // NOTE: partial-failure — if alloc or map fails mid-range, pages already
+    // mapped at [addr, va) remain mapped with no rollback. Physical frames and
+    // cap slots are reclaimed when the task exits.
+    // TODO: add rollback using unmap_user_page + revoke_capability_in_cnode.
     let mut va = addr;
     while va < end {
         let (_, mem_cap) = kernel
@@ -2794,11 +2820,47 @@ fn handle_spawn_from_memory_object(
     Ok(())
 }
 
+/// Undo physical mappings for [addr, mapped_end) on partial VmAnonMap failure.
+/// MemoryObject cap slots allocated before the error remain in the cnode as
+/// leaked slots; they are reclaimed when the task's cspace is destroyed on exit.
+/// TODO: revoke leaked MemoryObject caps after rollback unmap.
+fn rollback_anon_map(kernel: &mut KernelState, addr: usize, mapped_end: usize) {
+    let mut va = addr;
+    while va < mapped_end {
+        let _ = kernel.unmap_user_page_in_current_asid(VirtAddr(va as u64));
+        va += PAGE_SIZE;
+    }
+}
+
 fn handle_vm_anon_map(
-    _kernel: &mut KernelState,
-    _frame: &mut TrapFrame,
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    Err(SyscallError::InvalidArgs)
+    let addr = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
+    let (map_len, end, flags) = validate_anon_map_args(addr, len, prot)?;
+    check_stack_guard(kernel, addr, flags)?;
+
+    let mut va = addr;
+    while va < end {
+        let (_, mem_cap) = match kernel.alloc_anonymous_memory_object() {
+            Ok(pair) => pair,
+            Err(e) => {
+                rollback_anon_map(kernel, addr, va);
+                return Err(SyscallError::from(e));
+            }
+        };
+        if let Err(e) =
+            kernel.map_user_page_in_current_asid_with_caps(mem_cap, VirtAddr(va as u64), flags)
+        {
+            rollback_anon_map(kernel, addr, va);
+            return Err(SyscallError::from(e));
+        }
+        va += PAGE_SIZE;
+    }
+    frame.set_ok(addr, map_len, 0);
+    Ok(())
 }
 
 fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {

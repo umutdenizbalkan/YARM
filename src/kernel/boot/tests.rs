@@ -6622,3 +6622,211 @@ fn run_pm_file_grant_ro_receives_memory_object_cap() {
         "PM_ELF_ZC: cap must be a MemoryObject for spawn_from_memory_object; got {:?}",
         pm_mo.object);
 }
+
+// ---------------------------------------------------------------------------
+// VmAnonMap (syscall 13) tests
+//
+// Setup for each test:
+//   - Bootstrap::init() gives task 0 as the current task.
+//   - create_user_address_space() + bind_task_asid(0, asid) gives task 0 a
+//     live address space so that is_user_page_mapped_in_current_asid and
+//     map_user_page_in_current_asid_with_caps resolve correctly.
+//   - TrapFrame arg layout:  [CAP=0 (unused), PTR=addr, LEN=len, PAYLOAD0=prot, ...]
+//     SYSCALL_ARG_CAP=0, SYSCALL_ARG_PTR=1, SYSCALL_ARG_LEN=2, SYSCALL_ARG_INLINE_PAYLOAD0=3
+// ---------------------------------------------------------------------------
+
+fn vm_anon_map_frame(addr: usize, len: usize, prot: usize) -> TrapFrame {
+    TrapFrame::new(
+        crate::kernel::syscall::Syscall::VmAnonMap as usize,
+        [0, addr, len, prot, 0, 0],
+    )
+}
+
+fn setup_task0_with_asid() -> KernelState {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind asid");
+    state
+}
+
+// All VmAnonMap tests run on an 8 MiB stack because KernelState is large.
+
+// Helper: returns true if the syscall failed (handle_trap returned Err, or
+// the frame carries a non-zero error code).  Syscall validation errors
+// (InvalidArgs etc.) propagate as Err from handle_trap in the test
+// environment; page-fault errors are written into the frame instead.
+fn syscall_failed(result: Result<(), super::TrapHandleError>, frame: &TrapFrame) -> bool {
+    result.is_err() || frame.error_code().is_some()
+}
+
+fn syscall_succeeded(result: Result<(), super::TrapHandleError>, frame: &TrapFrame) -> bool {
+    result.is_ok() && frame.error_code().is_none()
+}
+
+#[test]
+fn vm_anon_map_rejects_len_zero() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = setup_task0_with_asid();
+            let mut frame = vm_anon_map_frame(0x1000, 0, 0x1);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(syscall_failed(r, &frame), "len=0 must fail");
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_rejects_unaligned_addr() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = setup_task0_with_asid();
+            let mut frame = vm_anon_map_frame(0x1001, PAGE_SIZE, 0x1);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(syscall_failed(r, &frame), "unaligned addr must fail");
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_rejects_overflow_range() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = setup_task0_with_asid();
+            // addr not page-aligned near usize::MAX → alignment check fires first
+            let addr = usize::MAX - PAGE_SIZE + 1;
+            let mut frame = vm_anon_map_frame(addr, PAGE_SIZE, 0x1);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(syscall_failed(r, &frame), "overflow range must fail");
+
+            // Page-aligned addr where addr + map_len wraps around
+            let addr2 = usize::MAX & !(PAGE_SIZE - 1);
+            let mut frame2 = vm_anon_map_frame(addr2, PAGE_SIZE, 0x1);
+            let r2 = state.handle_trap(Trap::Syscall, Some(&mut frame2));
+            assert!(syscall_failed(r2, &frame2), "page-aligned overflow range must fail");
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_maps_one_page_successfully() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = setup_task0_with_asid();
+            let addr = 0x1_0000;
+            let mut frame = vm_anon_map_frame(addr, PAGE_SIZE, 0x1);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(syscall_succeeded(r, &frame), "single-page anon map must succeed");
+            assert_eq!(frame.ret0(), addr, "ret0 must be the mapped address");
+            assert_eq!(frame.ret1(), PAGE_SIZE, "ret1 must be the mapped length");
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_maps_multiple_pages_successfully() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = setup_task0_with_asid();
+            let addr = 0x2_0000;
+            let len = 4 * PAGE_SIZE;
+            let mut frame = vm_anon_map_frame(addr, len, 0x3); // PROT_READ|WRITE
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(syscall_succeeded(r, &frame), "multi-page anon map must succeed");
+            assert_eq!(frame.ret0(), addr);
+            assert_eq!(frame.ret1(), len);
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_returns_addr_and_rounded_len() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = setup_task0_with_asid();
+            let addr = 0x3_0000;
+            // PAGE_SIZE+1 rounds up to 2*PAGE_SIZE
+            let mut frame = vm_anon_map_frame(addr, PAGE_SIZE + 1, 0x1);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(syscall_succeeded(r, &frame), "non-page-multiple len must succeed");
+            assert_eq!(frame.ret0(), addr, "ret0 must be addr");
+            assert_eq!(frame.ret1(), 2 * PAGE_SIZE, "ret1 must be rounded-up map_len");
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_rejects_unknown_prot_bits() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = setup_task0_with_asid();
+            // prot=0x8 has no defined PROT bit → must fail (same as VmMap)
+            let mut frame = vm_anon_map_frame(0x1000, PAGE_SIZE, 0x8);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(syscall_failed(r, &frame), "unknown prot bits must fail like VmMap");
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_preserves_stack_guard_page_behavior() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            use crate::kernel::vm::VirtAddr;
+            let mut state = setup_task0_with_asid();
+
+            // Pre-map a page at 0x4000 to act as the existing page below 0x5000.
+            let (_, guard_mem_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
+            state
+                .map_user_page_in_current_asid_with_caps(
+                    guard_mem_cap,
+                    VirtAddr(0x4000),
+                    PageFlags {
+                        read: true, write: false, execute: false, user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+                    },
+                )
+                .expect("map guard page");
+
+            // VmAnonMap at 0x5000 with PROT_READ|WRITE — guard-page check must reject
+            // because 0x4000 (= 0x5000 - PAGE_SIZE) is already mapped.
+            let mut frame = vm_anon_map_frame(0x5000, PAGE_SIZE, 0x3);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_failed(r, &frame),
+                "VmAnonMap must reject writable mapping when the page immediately below is mapped"
+            );
+
+            // VmAnonMap at 0x6000 has no adjacent mapped page below → must succeed.
+            let mut frame2 = vm_anon_map_frame(0x6000, PAGE_SIZE, 0x3);
+            let r2 = state.handle_trap(Trap::Syscall, Some(&mut frame2));
+            assert!(
+                syscall_succeeded(r2, &frame2),
+                "VmAnonMap at address with no guard-page conflict must succeed"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
