@@ -1414,9 +1414,17 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     crate::arch::aarch64::console::write_line(
         "YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_begin",
     );
+    // Hardware AArch64: own KernelState through SharedKernel (Stage-2N shared trap path).
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    let shared = crate::kernel::boot::Bootstrap::init_shared_static().expect("kernel init");
+    // SAFETY: single-CPU boot; no trap handler can race before install_trap_shared_kernel
+    // stores the pointer; the reference must not be used after the ERET to user space.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    let kernel: &mut crate::kernel::boot::KernelState = unsafe { shared.borrow_kernel_for_boot() };
+    #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
     let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    install_trap_kernel_state(kernel);
+    install_trap_shared_kernel(shared);
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_done");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]

@@ -89,6 +89,15 @@ impl<T> SpinLock<T> {
             None
         }
     }
+
+    /// Return a raw pointer to the inner value without acquiring the lock.
+    ///
+    /// Crate-private; only for boot code that cannot hold the lock across a
+    /// non-returning call (e.g. ERET to user space).  The caller must ensure
+    /// no concurrent lock holder exists.
+    pub(crate) fn data_ptr(&self) -> *mut T {
+        self.value.get()
+    }
 }
 
 impl<T> SpinLockIrq<T> {

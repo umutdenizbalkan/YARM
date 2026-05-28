@@ -386,17 +386,23 @@ handled via a dedicated helper with clear lock-contract comments.
   - fallback marker only when fallback is actually used.
 
 
-#### Stage 2N final status (current)
+#### Stage 2N final status (Phase L2B complete)
 
-- Stage 2N seam callsite migration is in place, but aarch64 remains **fallback-active** in normal boot flow (not fully active shared-path).
-- `trap_shared_kernel()` is `None` because bootstrap currently owns/exposes `&mut KernelState` from `Bootstrap::init_static()` rather than a canonical long-lived `SharedKernel` at trap entry installation time.
-- Recv-timeout special-casing remains blocked until `SharedKernel` becomes canonical at trap entry boundary.
+- Stage 2N shared-dispatch branch is **fully active** on AArch64 hardware.
+- AArch64 production boot (`run_with_prepared_kernel`) now calls `Bootstrap::init_shared_static()`,
+  installs the result via `install_trap_shared_kernel(shared)`, and obtains `&mut KernelState`
+  for the scheduler boot callback through `SharedKernel::borrow_kernel_for_boot()` (unsafe,
+  no-lock; safe only during single-CPU boot before ERET to user space).
+- `trap_shared_kernel()` returns `Some(shared)` from the first trap entry onward; the
+  fallback `trap_kernel_state_mut()` branch is never taken.
+- `TRAP_KERNEL_STATE_PTR` remains null for the duration of the run; `install_trap_kernel_state`
+  is not called from the new path.
 
 
-### Phase L2A: canonical boot-owned SharedKernel construction (current)
+### Phase L2A: canonical boot-owned SharedKernel construction (complete)
 
 - Added static storage: `BOOTSTRAP_SHARED_KERNEL: MaybeUninit<SharedKernel>` and
-  `BOOTSTRAP_SHARED_KERNEL_READY: AtomicU8` in `src/kernel/boot/bootstrap_state.rs`.
+  `BOOTSTRAP_SHARED_KERNEL_READY: AtomicU8` (3-state) in `src/kernel/boot/bootstrap_state.rs`.
 - Added new Bootstrap API:
   - `Bootstrap::init_shared_static() -> Result<&'static SharedKernel, KernelError>`
   - `Bootstrap::init_shared_static_with_capacity_profile(...)`
@@ -406,31 +412,30 @@ handled via a dedicated helper with clear lock-contract comments.
   1. Calls `init_static_with_boot_memory_map` to write `BOOTSTRAP_KERNEL_STATE`.
   2. Immediately `ptr::read`s the bytes out (consuming the `&'static mut` alias).
   3. Moves owned `KernelState` into `SharedKernel::new`, stored in `BOOTSTRAP_SHARED_KERNEL`.
-  4. Sets `BOOTSTRAP_SHARED_KERNEL_READY` to `1`; guarded by compare-exchange against double init.
+  4. Sets `BOOTSTRAP_SHARED_KERNEL_READY` 0→1 (initializing) via compare-exchange, then
+     2 (ready) via Release store after `ptr::write` completes.
   5. Does **not** call `install_trap_kernel_state` or `install_trap_shared_kernel`.
-- No trap state is installed. `trap_shared_kernel()` remains `None`. Stage 2N remains
-  **fallback-active** — this phase does not change any boot or trap behavior.
-- `shared_static_ref()` is a read-only accessor; it returns `None` until
-  `init_shared_static*` is called and `Some(&'static SharedKernel)` thereafter.
+- `shared_static_ref()` gates on `READY == 2`; returns `None` while 0 or 1.
 - `Bootstrap::init_static()` signature and behavior: **unchanged**.
-- Aliasing safety: after `ptr::read`, `BOOTSTRAP_KERNEL_STATE` is logically moved-from
-  and is not accessed again. `BOOTSTRAP_SHARED_KERNEL` becomes the sole live owner.
-  No simultaneous live `&'static mut KernelState` and `&'static SharedKernel` can exist
-  because `install_trap_kernel_state` is not called from the new code path.
 
-#### Phase L2A activation status
+### Phase L2B: AArch64 Stage-2N shared trap-entry activation (complete)
 
-- `Bootstrap::init_shared_static*` exist but are not called from any production boot path.
-- Stage 2N remains fallback-active (no change to arch boot, trap dispatch, or SMP paths).
-- Trap entry migration to use `install_trap_shared_kernel` is deferred to Phase L2B.
-
-#### Future Stage 3 design note
-
-- Route arch boot paths to call `Bootstrap::init_shared_static()` instead of `init_static()`.
-- Call `install_trap_shared_kernel(shared)` immediately after; nullify raw KernelState pointer.
-- Stage 2N shared path becomes active; fallback branch is no longer taken.
-- Once canonical, apply targeted recv-timeout split-read special-casing without altering
-  global-lock mutation semantics.
+- `src/arch/aarch64/boot.rs` `run_with_prepared_kernel` now calls
+  `Bootstrap::init_shared_static()` (hardware AArch64 path only), installs the result
+  via `install_trap_shared_kernel(shared)`, and calls `shared.borrow_kernel_for_boot()`
+  to obtain `&mut KernelState` for the pre-ERET boot callback.
+- `SpinLock::data_ptr()` (crate-private, `src/kernel/lock.rs`) and
+  `SharedKernel::borrow_kernel_for_boot()` (unsafe, `src/runtime.rs`) added to support
+  the boot bypass; neither holds the spinlock across the non-returning ERET.
+- `BOOTSTRAP_SHARED_KERNEL_READY` 3-state fix ensures `shared_static_ref()` cannot return
+  `Some` before `ptr::write(BOOTSTRAP_SHARED_KERNEL)` completes.
+- x86_64 boot paths and SMP configuration are **not changed**. Hosted-dev path retains
+  `Bootstrap::init_static()`.
+- Smoke-test proof (`AARCH64_LOCK_SPLIT_TRACE=true` run, then reverted):
+  - `YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry`: present
+  - `fallback=1` marker: absent (count = 0)
+  - `PM_ELF_ZC_DONE image_id=7/8/9 zc_pages>0`: confirmed
+  - `DRIVER_MANAGER_READY`, `BLKCACHE_SRV_READY`, `VIRTIO_BLK_SRV_READY`: confirmed
 
 ### Staged SharedKernel seam inventory (Stage 2B–2N audit)
 
