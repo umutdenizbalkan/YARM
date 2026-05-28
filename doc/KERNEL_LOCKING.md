@@ -333,7 +333,7 @@ handled via a dedicated helper with clear lock-contract comments.
 
 - Callsites audited (production + seam-related):
   - `src/arch/aarch64/boot.rs`: vector handoff path calls `aarch64::trap::handle_trap_entry(kernel, ...)` after obtaining `kernel: &mut KernelState` from `trap_kernel_state_mut()`.
-  - `src/arch/x86_64/descriptor_tables.rs`: trap stub dispatch paths call `x86_64::trap::handle_trap_entry(kernel, ...)` on `&mut KernelState`.
+  - `src/arch/x86_64/descriptor_tables.rs`: trap stub dispatch prefers `dispatch_trap_entry_with_shared_kernel(...)` via `trap_shared_kernel()` (SharedKernel-primary, Option A), with raw-KernelState fallback.
   - `src/arch/*/trap.rs`: ISA trap handlers accept `&mut KernelState` and call `kernel.handle_trap_event(...)`.
   - `src/kernel/boot/fault_state.rs`: `handle_selected_arch_trap_entry(...)` forwards `&mut KernelState` into `arch::trap_entry::handle_trap_entry(...)`.
 
@@ -373,7 +373,7 @@ handled via a dedicated helper with clear lock-contract comments.
 - Added marker: `YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry`.
 - Fallback behavior preserved: if `trap_shared_kernel()` is `None`, code falls back to existing `trap_kernel_state_mut()` + ISA `handle_trap_entry(...)` path.
 - Behavior remains unchanged because shared seam forwards through existing `SharedKernel::with_cpu(...)` / `KernelState` trap handling flow.
-- Per-ISA status: aarch64 migrated; x86_64 remains staged; riscv64 not applicable yet under current ownership shape.
+- Per-ISA status: aarch64 migrated (L2B); x86_64 migrated (Option A); riscv64 not applicable yet under current ownership shape.
 
 
 #### Stage 2N AArch64 activation status
@@ -429,8 +429,7 @@ handled via a dedicated helper with clear lock-contract comments.
   the boot bypass; neither holds the spinlock across the non-returning ERET.
 - `BOOTSTRAP_SHARED_KERNEL_READY` 3-state fix ensures `shared_static_ref()` cannot return
   `Some` before `ptr::write(BOOTSTRAP_SHARED_KERNEL)` completes.
-- x86_64 boot paths and SMP configuration are **not changed**. Hosted-dev path retains
-  `Bootstrap::init_static()`.
+- x86_64 hardware boot path uses `Bootstrap::init_shared_static()` + `install_trap_shared_kernel` + `borrow_kernel_for_boot()` (Option A). Hosted-dev path retains `Bootstrap::init_static()`.
 - Smoke-test proof (`AARCH64_LOCK_SPLIT_TRACE=true` run, then reverted):
   - `YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry`: present
   - `fallback=1` marker: absent (count = 0)
@@ -457,9 +456,8 @@ handled via a dedicated helper with clear lock-contract comments.
   - Reason: top-level shared dispatch seam used for controlled migration of trap entry ownership.
 
 - `install_trap_shared_kernel` / `trap_shared_kernel` (`src/arch/aarch64/boot.rs`, `src/arch/x86_64/descriptor_tables.rs`)
-  - Status: **gate/debug-only staged seam**
-  - Reason: ownership bridge is incomplete until canonical boot-owned `SharedKernel` is introduced; retain seam and fallback path.
-  - Hygiene: `#[allow(dead_code)]` applied to avoid misleading unused-function warnings while staged.
+  - Status: **active** — both `aarch64` (L2B) and `x86_64` (Option A) production paths call `install_trap_shared_kernel` at boot.
+  - `#[allow(dead_code)]` removed from `x86_64` `trap_shared_kernel`; it is now the live primary trap dispatch path.
 
 - No staged API removed in this audit; all retained seams are still relevant to planned canonical SharedKernel ownership transition.
 
@@ -511,7 +509,7 @@ AArch64 QEMU smoke proof:
 What is **not** changed:
 - `timeout_ticks == 0` (try-recv) falls through to existing `try_ipc_recv` path.
 - All other syscalls (ipc_send, ipc_recv, ipc_call, send-timeout, etc.) are unchanged.
-- x86_64 boot, trap, and SMP paths are completely untouched.
+- x86_64 single-core (-smp 1) boot and trap paths are migrated to SharedKernel-primary in Option A. SMP not changed.
 - AArch64 fallback path (raw `trap_kernel_state_mut` + direct `handle_trap_entry`)
   is preserved.
 - The global `SharedKernel` lock is not removed; all IPC mutation still occurs
@@ -560,8 +558,82 @@ not a correctness failure).
 | ISA      | Trap path          | SharedKernel canonical | recv-timeout split |
 |----------|--------------------|------------------------|--------------------|
 | AArch64  | shared-primary     | yes (L2B)              | active (L3)        |
-| x86_64   | raw `&mut KernelState` | no (future work)   | not active         |
+| x86_64   | shared-primary (Option A) | yes (Option A)  | not active         |
 | riscv64  | raw `&mut KernelState` | not applicable     | not active         |
+
+### Phase L3.2: end-to-end staging+consumption test coverage (complete)
+
+Added two unit tests in `src/kernel/boot/tests.rs` verifying the Phase L3
+per-CPU deadline staging protocol from the consumer side:
+
+- `staged_deadline_consumed_by_recv_timeout_dispatch` — writes a non-zero
+  deadline to `SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]` (mimicking
+  `handle_trap_entry_shared` on AArch64), then calls `syscall::dispatch` with
+  `SYSCALL_IPC_RECV_TIMEOUT_NR`. Asserts the slot is cleared to 0 after
+  dispatch, confirming `handle_ipc_recv_timeout` unconditionally consumes
+  the staged deadline via `swap(0, AcqRel)` before any branch.
+- `staged_deadline_cleared_on_try_recv_dispatch` — same setup with
+  `timeout_ticks=0` (try-recv path). Asserts the slot is still cleared,
+  confirming unconditional consumption even when the staged value is not used.
+
+Both tests pre-queue a message so `dispatch` does not block. The dispatch
+returns `Err(InvalidArgs)` because `user_ptr/user_len` are zero in the unit
+test; the slot swap happens before the metadata write, so the assertion is
+still valid.
+
+### Option A: x86_64 SharedKernel-primary trap ownership parity (complete)
+
+Migrated x86_64 single-core (-smp 1) production trap dispatch to use the
+same SharedKernel-primary path as AArch64.
+
+#### Changes
+
+**`src/arch/x86_64/descriptor_tables.rs`**:
+- Added `STAGE2N_FIRST_TRAP_LOGGED: AtomicBool` and
+  `STAGE2N_FALLBACK_LOGGED: AtomicBool` one-shot markers.
+- `install_trap_shared_kernel`: made `pub`, added
+  `register_apic_cpu_mapping(apic_id, BOOTSTRAP_CPU_ID)` call inside it.
+- Removed `#[allow(dead_code)]` from `trap_shared_kernel`.
+- `yarm_x86_dispatch_trap_from_stub`: added Stage 2N shared path before the
+  existing raw-KernelState fallback. Shared path calls
+  `dispatch_trap_entry_with_shared_kernel`, detects task switch via two
+  `shared.with_cpu()` calls for `entering_tid`/`exiting_tid`, and logs
+  `YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=x86_64` on first use.
+  Fallback path logs `YARM_LOCK_SPLIT_STAGE2N_FALLBACK arch=x86_64
+  reason=no_shared_kernel` on first use.
+
+**`src/arch/x86_64/boot.rs`** (`run_with_prepared_kernel`, hardware path only):
+- Replaced `Bootstrap::init_static*` + `ptr::read` + `install_trap_kernel_state`
+  with `Bootstrap::init_shared_static*` + `borrow_kernel_for_boot()` +
+  `install_trap_shared_kernel(shared)`.
+- Emits `YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=x86_64 shared=1 raw=0` after
+  `install_trap_shared_kernel`.
+- `install_trap_kernel_state` is no longer called; `TRAP_KERNEL_STATE_PTR`
+  remains null for the run.
+- SMP, IRQ, timer, and `run(kernel)` calls are unchanged.
+
+#### Safety argument for `borrow_kernel_for_boot` on x86_64
+
+`borrow_kernel_for_boot` bypasses the `SpinLock`. On AArch64 this is safe
+because DAIF masks interrupts until ERET. On x86_64, `enable_interrupts_for_boot`
+(STI) is called after `install_trap_shared_kernel` but before `run(kernel)`.
+The LAPIC timer deadline is `BOOTSTRAP_TIMER_DEADLINE_TICKS = 50,000,000` ticks
+(≈800 ms) >> the bootstrap window (≈50 ms on QEMU), making a timer interrupt
+before IRETQ implausible. After `run(kernel)` calls `enter_user_mode_iret -> !`,
+the boot reference is effectively dead and all subsequent trap handlers use
+`shared.with_cpu()`.
+
+Aliasing constraint: `install_trap_shared_kernel` sets `TRAP_SHARED_KERNEL_PTR`
+(shared path); `install_trap_kernel_state` is never called (raw path stays null).
+The dispatch function takes the shared branch XOR the raw branch, never both.
+
+#### Smoke proof (x86_64 -smp 1 QEMU run)
+
+- `YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=x86_64 shared=1 raw=0`: count = 1 ✓
+- `YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=x86_64`: count = 1 ✓
+- `YARM_LOCK_SPLIT_STAGE2N_FALLBACK`: absent ✓
+- All 6 service entries present exactly once ✓
+- `[ok] x86_64 boot markers detected` ✓
 
 ### Stage 3: remove global lock from syscall fast path
 

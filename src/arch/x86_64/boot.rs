@@ -1276,23 +1276,28 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     // Keep the run path free from additional serial-marker calls so boot remains deterministic.
     let prepared_len = PREPARED_PVH_BOOT_MEMMAP_LEN.load(core::sync::atomic::Ordering::Acquire);
     crate::arch::x86_64::console::write_line("KI0");
-    let kernel_state = if prepared_len > 0 {
+    let shared = if prepared_len > 0 {
         let boot_regions = unsafe { &PREPARED_PVH_BOOT_MEMMAP[..prepared_len] };
         let reserved_ranges = Bootstrap::default_reserved_ranges_for_arch_boot();
-        Bootstrap::init_static_with_boot_memory_map(
+        Bootstrap::init_shared_static_with_boot_memory_map(
             Bootstrap::default_capacity_profile(),
             boot_regions,
             &reserved_ranges,
         )
         .expect("kernel init with pvh memmap")
     } else {
-        Bootstrap::init_static().expect("kernel init")
+        Bootstrap::init_shared_static().expect("kernel init")
     };
-    let kernel_state =
-        unsafe { core::ptr::read(kernel_state as *mut crate::kernel::boot::KernelState) };
     crate::arch::x86_64::console::write_line("KI1");
     crate::yarm_log!("YARM_BOOT_INIT_READY prepared_pvh_regions={}", prepared_len);
-    let kernel = crate::arch::x86_64::descriptor_tables::install_trap_kernel_state(kernel_state);
+    // SAFETY: single-CPU boot; interrupts are disabled (STI not yet called);
+    // TRAP_SHARED_KERNEL_PTR is written by install_trap_shared_kernel below,
+    // which happens before STI, so no concurrent trap handler can call with_cpu
+    // while this boot reference is live. LAPIC deadline is 50M ticks (≈800ms)
+    // >> boot window (≈50ms), making a timer interrupt before IRETQ implausible.
+    let kernel = unsafe { shared.borrow_kernel_for_boot() };
+    crate::arch::x86_64::descriptor_tables::install_trap_shared_kernel(shared);
+    crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=x86_64 shared=1 raw=0");
     crate::arch::irq_guard::configure_external_irq_controller_from_platform_layout();
     crate::yarm_log!("YARM_SMP_LAPIC_READY source=platform_layout");
     let started_secondary = crate::arch::x86_64::smp::start_secondary_cpus(kernel).unwrap_or(0);
