@@ -463,7 +463,108 @@ handled via a dedicated helper with clear lock-contract comments.
 
 - No staged API removed in this audit; all retained seams are still relevant to planned canonical SharedKernel ownership transition.
 
+### Phase L3: recv-timeout split-read activation + Stage-2N verification markers (complete)
+
+#### Part A — Low-noise Stage-2N verification markers
+
+Three one-shot or first-occurrence markers were added to confirm the AArch64
+shared trap-entry path is correctly installed and used in production:
+
+1. **`YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=aarch64 shared=1 raw=0`**
+   — emitted once in `run_with_prepared_kernel` immediately after
+   `install_trap_shared_kernel(shared)` succeeds. Confirms the shared pointer
+   was installed and the raw `TRAP_KERNEL_STATE_PTR` was not.
+
+2. **`YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=aarch64`**
+   — emitted on the first AArch64 trap entry that takes the shared path
+   (`trap_shared_kernel()` returned `Some`). Uses a one-shot
+   `AtomicBool` (`STAGE2N_FIRST_TRAP_LOGGED`) so it fires exactly once.
+
+3. **`YARM_LOCK_SPLIT_STAGE2N_FALLBACK arch=aarch64 reason=no_shared_kernel`**
+   — emitted if the fallback raw-pointer path is taken. Must be **absent**
+   in a correct Phase L2B/L3 run.
+
+AArch64 QEMU smoke proof:
+- `Stage2N installed` count = 1 ✓
+- `First shared trap` count = 1 ✓
+- `Stage2N fallback` count = 0 ✓
+
+#### Part B — recv-timeout split-read activation (AArch64 shared path only)
+
+- The recv-timeout split-read bridge (`SharedKernel::ipc_recv_with_deadline_split_bridge`,
+  introduced in Stage 2D) is now **active** on the AArch64 shared trap/syscall path.
+- Activation point: `arch::trap_entry::handle_trap_entry_shared` detects
+  `SYSCALL_IPC_RECV_TIMEOUT_NR` (nr=5) before acquiring the global `SharedKernel`
+  lock, pre-reads the scheduler tick under the lighter `scheduler_state` lock, and
+  stores an absolute deadline in `SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]`
+  (`src/kernel/scheduler.rs`).
+- Inside `handle_ipc_recv_timeout` (`src/kernel/syscall.rs`), the deadline slot is
+  consumed atomically with `swap(0, AcqRel)`. If the slot is non-zero,
+  `ipc_recv_until_deadline(cap, deadline)` is called instead of
+  `ipc_recv_with_deadline(cap, timeout_ticks)` — avoiding a redundant tick read
+  inside the global lock.
+- Marker emitted when the split path is taken:
+  `YARM_LOCK_SPLIT_RECV_TIMEOUT path=shared_bridge`
+- Smoke boot does not exercise recv-timeout in the 30-second window; marker is
+  absent from smoke logs. A focused unit test exercises the path directly.
+
+What is **not** changed:
+- `timeout_ticks == 0` (try-recv) falls through to existing `try_ipc_recv` path.
+- All other syscalls (ipc_send, ipc_recv, ipc_call, send-timeout, etc.) are unchanged.
+- x86_64 boot, trap, and SMP paths are completely untouched.
+- AArch64 fallback path (raw `trap_kernel_state_mut` + direct `handle_trap_entry`)
+  is preserved.
+- The global `SharedKernel` lock is not removed; all IPC mutation still occurs
+  under `SharedKernel::with(...)`.
+- This is **not** Stage 3 global-lock removal.
+
+#### Per-CPU deadline staging protocol (`SPLIT_RECV_TIMEOUT_DEADLINE`)
+
+```
+SPLIT_RECV_TIMEOUT_DEADLINE: [AtomicU64; MAX_CPUS]   (src/kernel/scheduler.rs)
+
+seam layer (before global lock):
+  if syscall == SYSCALL_IPC_RECV_TIMEOUT_NR && timeout_ticks != 0:
+    now  = shared.scheduler_tick_now_split_read()          # scheduler lock only
+    SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx].store(
+        now.wrapping_add(timeout_ticks), Release)
+
+handler (inside global lock):
+  v = SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx].swap(0, AcqRel)
+  if v != 0:
+    ipc_recv_until_deadline(cap, v)   # no redundant tick read
+  else:
+    ipc_recv_with_deadline(cap, timeout_ticks)   # normal path
+```
+
+Slot value 0 is reserved as "not staged"; a wrapping deadline that produces
+0 is treated as the fallback path (correct: the error is one missed optimization,
+not a correctness failure).
+
+#### Tests added (src/kernel/boot/tests.rs)
+
+- `ipc_recv_until_deadline_with_queued_message_succeeds_immediately` — verifies
+  `ipc_recv_until_deadline` returns a queued message without blocking.
+- `ipc_recv_until_deadline_timeout_wakes_blocked_waiter_on_timer_tick` — verifies
+  deadline wakeup behavior matches `ipc_recv_with_deadline`.
+- `split_recv_timeout_deadline_slot_is_consumed_exactly_once` — verifies the
+  per-CPU deadline slot is cleared atomically after one consume.
+- `ipc_recv_with_deadline_split_bridge_returns_none_when_no_sender` — exercises
+  `SharedKernel::ipc_recv_with_deadline_split_bridge` from outside any lock,
+  proving no nested `with` while already holding the global lock.
+- `ipc_recv_with_deadline_split_bridge_zero_ticks_returns_none` — verifies
+  zero-tick try-recv behavior via the bridge.
+
+#### Architecture status after Phase L3
+
+| ISA      | Trap path          | SharedKernel canonical | recv-timeout split |
+|----------|--------------------|------------------------|--------------------|
+| AArch64  | shared-primary     | yes (L2B)              | active (L3)        |
+| x86_64   | raw `&mut KernelState` | no (future work)   | not active         |
+| riscv64  | raw `&mut KernelState` | not applicable     | not active         |
+
 ### Stage 3: remove global lock from syscall fast path
+
 
 - Route trap/syscall dispatch directly to subsystem locks where safe.
 - Keep global lock only for coarse-grain control-plane operations, if needed.

@@ -6940,3 +6940,155 @@ fn init_shared_static_does_not_install_trap_state() {
         .join()
         .expect("join");
 }
+
+// ── Phase L3: recv-timeout split-read and Stage-2N marker tests ───────────────
+//
+// Part A: verify ipc_recv_until_deadline behaves identically to
+// ipc_recv_with_deadline for immediate sends and timer-tick wakeups.
+// Part B: verify the split-bridge helper (SharedKernel::ipc_recv_with_deadline_split_bridge)
+// does not nest a SharedKernel::with inside an already-held lock — call it
+// from outside any lock and assert the result is consistent with the direct path.
+
+#[test]
+fn ipc_recv_until_deadline_with_queued_message_succeeds_immediately() {
+    // ipc_recv_until_deadline must return a queued notification message without
+    // blocking, same as ipc_recv_with_deadline.
+    std::thread::Builder::new()
+        .name("ipc_recv_until_deadline_immediate".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.set_timer_for_test(Timer::new(100));
+            state.register_task(1).expect("task1");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(1) {
+                state.yield_current().expect("switch to task1");
+            }
+
+            // Use a notification endpoint: post via IRQ or task2 sender.
+            // Simpler: create a buffered endpoint, send then receive in same task.
+            // With a buffered endpoint, ipc_send queues the message even when the
+            // sending task is also the future receiver — just needs a different cap.
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+            // Message::new(sender_tid, bytes) — first arg is sender_tid, not opcode.
+            let msg = Message::new(99, b"ping").expect("msg");
+            // ipc_send on a buffered endpoint queues immediately (no sender-block).
+            state.ipc_send(send_cap, msg).expect("send to buffered endpoint");
+
+            // Message is now queued; ipc_recv_until_deadline must return it.
+            let result = state
+                .ipc_recv_until_deadline(recv_cap, u64::MAX)
+                .expect("until_deadline should not fail");
+            assert!(result.is_some(), "queued message must be returned immediately");
+            assert_eq!(result.unwrap().sender_tid, ThreadId(99));
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn ipc_recv_until_deadline_timeout_wakes_blocked_waiter_on_timer_tick() {
+    // ipc_recv_until_deadline(cap, deadline) blocks the task and wakes it
+    // on a timer tick, exactly like ipc_recv_with_deadline.
+    std::thread::Builder::new()
+        .name("ipc_recv_until_deadline_timer_wake".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.set_timer_for_test(Timer::new(1));
+            state.register_task(1).expect("task1");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch to task1");
+            let blocked_tid = state.current_tid().expect("running tid");
+
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+            // Deadline = current tick + 1; expires on the next timer interrupt.
+            let now = state.scheduler_tick_now();
+            let deadline = now.wrapping_add(1);
+            let first = state
+                .ipc_recv_until_deadline(recv_cap, deadline)
+                .expect("until_deadline recv should not fail");
+            assert_eq!(first, None, "no sender yet; must block");
+            assert_eq!(
+                state.task_status(blocked_tid),
+                Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap)))
+            );
+
+            state
+                .handle_trap(Trap::TimerInterrupt, None)
+                .expect("timer trap");
+
+            assert!(matches!(
+                state.task_status(blocked_tid),
+                Some(TaskStatus::Runnable | TaskStatus::Running)
+            ));
+            assert!(
+                state
+                    .consume_ipc_timeout_fired_for_tid(blocked_tid)
+                    .expect("consume timeout marker"),
+                "timeout marker must be set when deadline expires via timer tick"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn split_recv_timeout_deadline_slot_is_consumed_exactly_once() {
+    // SPLIT_RECV_TIMEOUT_DEADLINE[cpu] is consumed atomically.  Storing a value
+    // then swapping returns it once; a subsequent swap returns 0.
+    use core::sync::atomic::Ordering;
+    let cpu_idx = 0usize;
+    let slot = &crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx];
+
+    slot.store(999, Ordering::Release);
+    let first = slot.swap(0, Ordering::AcqRel);
+    assert_eq!(first, 999, "slot must hold the stored deadline");
+    let second = slot.swap(0, Ordering::AcqRel);
+    assert_eq!(second, 0, "slot must be cleared after first consume");
+}
+
+#[test]
+fn ipc_recv_with_deadline_split_bridge_returns_none_when_no_sender() {
+    // SharedKernel::ipc_recv_with_deadline_split_bridge must not nest a
+    // SharedKernel::with inside an already-held lock.  Call it from outside
+    // any lock and verify it returns Ok(None) (no sender present).
+    use crate::runtime::SharedKernel;
+    std::thread::Builder::new()
+        .name("split_bridge_no_sender".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+            let (_eid, _send_cap, recv_cap) =
+                shared.with(|s| s.create_endpoint(2)).expect("endpoint");
+            let result = shared.ipc_recv_with_deadline_split_bridge(recv_cap, 1);
+            assert!(result.is_ok(), "split bridge must not error with a valid cap");
+            assert_eq!(result.unwrap(), None, "no sender present; must return None");
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn ipc_recv_with_deadline_split_bridge_zero_ticks_returns_none() {
+    // timeout_ticks == 0 means try-recv; no sender → Ok(None).
+    use crate::runtime::SharedKernel;
+    std::thread::Builder::new()
+        .name("split_bridge_zero_ticks".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+            let (_eid, _send_cap, recv_cap) =
+                shared.with(|s| s.create_endpoint(2)).expect("endpoint");
+            let result = shared.ipc_recv_with_deadline_split_bridge(recv_cap, 0);
+            assert!(result.is_ok(), "zero-tick split bridge must not error");
+            assert_eq!(result.unwrap(), None, "no sender; must return None");
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}

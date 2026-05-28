@@ -10,6 +10,21 @@ pub use yarm_kernel::scheduler::{CpuId, SchedulerError, TaskPriority};
 pub const MAX_RUN_QUEUE: usize = 64;
 pub const MAX_CPUS: usize = platform_constants::MAX_CPUS;
 const _: () = assert!(MAX_RUN_QUEUE.is_power_of_two());
+
+/// Per-CPU slot for the recv-timeout split-read optimization.
+///
+/// The arch trap-entry seam writes a pre-computed absolute deadline here before
+/// acquiring the global `SharedKernel` lock.  The recv-timeout syscall handler
+/// reads and clears the slot (consuming it atomically with `swap`); if the
+/// value is non-zero the handler calls `ipc_recv_until_deadline` directly,
+/// skipping the redundant tick read that would otherwise occur inside the lock.
+///
+/// Zero means "no pre-read deadline available."  Since deadlines are computed as
+/// `now.wrapping_add(timeout_ticks)` with `timeout_ticks > 0`, a zero result is
+/// theoretically possible but astronomically rare; in that case the handler falls
+/// back to the normal `ipc_recv_with_deadline` path, which is always correct.
+pub(crate) static SPLIT_RECV_TIMEOUT_DEADLINE: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
 const MEMBERSHIP_SLOTS: usize = 64;
 const MEMBERSHIP_EMPTY: u8 = 0;
 const MEMBERSHIP_TOMBSTONE: u8 = 1;
