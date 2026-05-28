@@ -267,6 +267,10 @@ static TRAP_KERNEL_STATE: TrapKernelStateCell =
 static TRAP_SHARED_KERNEL_PTR: core::sync::atomic::AtomicPtr<crate::runtime::SharedKernel> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static STAGE2N_FIRST_TRAP_LOGGED: AtomicBool = AtomicBool::new(false);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static STAGE2N_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_DATA_PORT: u16 = 0x3F8;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_LINE_STATUS_PORT: u16 = 0x3FD;
@@ -437,8 +441,11 @@ pub fn install_trap_kernel_state(
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-#[allow(dead_code)]
-fn install_trap_shared_kernel(shared: &'static crate::runtime::SharedKernel) {
+pub fn install_trap_shared_kernel(shared: &'static crate::runtime::SharedKernel) {
+    register_apic_cpu_mapping(
+        raw_current_apic_id() as u8,
+        crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID),
+    );
     TRAP_SHARED_KERNEL_PTR.store(shared as *const _ as *mut _, Ordering::SeqCst);
 }
 
@@ -454,7 +461,6 @@ fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelSta
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-#[allow(dead_code)]
 fn trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
     let ptr = TRAP_SHARED_KERNEL_PTR.load(Ordering::SeqCst);
     if ptr.is_null() {
@@ -803,7 +809,56 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         error_code,
         fault_addr,
     };
+    let cpu = current_cpu_id();
 
+    // Stage 2N: prefer SharedKernel path when available.
+    if let Some(shared) = trap_shared_kernel() {
+        if !STAGE2N_FIRST_TRAP_LOGGED.swap(true, Ordering::AcqRel) {
+            crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=x86_64");
+        }
+        let fault_rip = frame.rip;
+        let entering_tid: Option<u64> = shared
+            .with_cpu(cpu, |k| k.current_tid())
+            .unwrap_or(None);
+        let mut trap_frame =
+            unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
+        if let Err(err) = crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
+            shared,
+            cpu,
+            context,
+            Some(&mut trap_frame),
+        ) {
+            crate::pr_err!(
+                "x86 shared trap dispatch failed: vector={} error_code=0x{:x} rip=0x{:016x} err={:?}",
+                vector,
+                error_code,
+                fault_rip,
+                err
+            );
+            let _ = shared.with_cpu(cpu, |k| {
+                log_decoded_fatal_trap(Some(k), vector, error_code, frame, fault_addr);
+            });
+            debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
+            halt_forever();
+        }
+        let exiting_tid: Option<u64> = shared
+            .with_cpu(cpu, |k| k.current_tid())
+            .unwrap_or(None);
+        let task_switched = entering_tid != exiting_tid;
+        if task_switched {
+            write_task_gprs_to_saved_regs(regs, &trap_frame);
+        } else if vector as usize == VEC_SYSCALL {
+            write_trap_returns_to_saved_regs(regs, &trap_frame);
+        }
+        unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
+        TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+        return;
+    }
+
+    // Fallback: raw KernelState path (pre-Stage2N or no shared kernel installed).
+    if !STAGE2N_FALLBACK_LOGGED.swap(true, Ordering::AcqRel) {
+        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FALLBACK arch=x86_64 reason=no_shared_kernel");
+    }
     let Some(kernel) = trap_kernel_state_mut() else {
         if should_halt_without_kernel_state(vector as usize) {
             let fault_rip = frame.rip;
@@ -816,8 +871,6 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         return;
     };
     let fault_rip = frame.rip;
-    // Record the current task id BEFORE dispatching so we can detect a context
-    // switch after handle_trap_entry returns.
     let entering_tid = kernel.current_tid();
     let mut trap_frame = unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
     if let Err(err) = crate::arch::x86_64::trap::handle_trap_entry(
@@ -840,20 +893,10 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     let exiting_tid = kernel.current_tid();
     let task_switched = entering_tid != exiting_tid;
     if task_switched {
-        // Scheduler switched to a different task.  The trap_frame now holds the
-        // new task's context (from apply_user_context).  Write it back to the
-        // X86SavedRegs so the pop sequence restores the correct user registers.
-        // For a new task first entry this delivers startup ABI args; for a
-        // resumed task it restores the GPR snapshot from the TCB.
         write_task_gprs_to_saved_regs(regs, &trap_frame);
     } else if vector as usize == VEC_SYSCALL {
-        // Same task, direct syscall return: overlay the syscall return values.
         write_trap_returns_to_saved_regs(regs, &trap_frame);
     }
-    // Flush the (possibly updated) task PC/SP back to the hardware interrupt
-    // frame so that iretq enters the correct task.  This is the critical path
-    // for both new-task first entry (new PC == spawn entry) and context switches
-    // (new PC == resumed task's saved PC from its TCB).
     unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
     TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
 }
