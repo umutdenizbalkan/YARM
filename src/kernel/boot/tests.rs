@@ -7092,3 +7092,112 @@ fn ipc_recv_with_deadline_split_bridge_zero_ticks_returns_none() {
         .join()
         .expect("join");
 }
+
+// ── Phase L3.2: end-to-end staging → consumption path ────────────────────────
+//
+// The staging code in handle_trap_entry_shared is #[cfg(target_arch = "aarch64")]
+// and therefore does not compile for the x86_64 test binary.  The test below
+// directly writes to SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx] to mimic what
+// handle_trap_entry_shared would do on AArch64, then calls syscall::dispatch to
+// verify that handle_ipc_recv_timeout consumes the slot (sets it to 0).
+
+#[test]
+fn staged_deadline_consumed_by_recv_timeout_dispatch() {
+    use core::sync::atomic::Ordering;
+    use super::super::syscall::{
+        dispatch, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR,
+    };
+    std::thread::Builder::new()
+        .name("staged_deadline_consumed".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.set_timer_for_test(Timer::new(100));
+            state.register_task(1).expect("task1");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+            let msg = Message::new(99, b"").expect("msg");
+            state.ipc_send(send_cap, msg).expect("pre-queue message");
+
+            // Mimic handle_trap_entry_shared staging a deadline before the lock.
+            let cpu_idx = state.current_cpu().0 as usize;
+            let now = state.scheduler_tick_now();
+            let staged = now.wrapping_add(10);
+            crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
+                .store(staged, Ordering::Release);
+            assert_ne!(
+                crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
+                    .load(Ordering::Acquire),
+                0,
+                "slot must be non-zero before dispatch"
+            );
+
+            let mut frame = TrapFrame::zeroed();
+            frame.set_syscall_num(SYSCALL_IPC_RECV_TIMEOUT_NR);
+            frame.set_arg(SYSCALL_ARG_CAP, recv_cap.0 as usize);
+            frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, 10usize);
+            // dispatch may return InvalidArgs because user_ptr/user_len are not
+            // set up (no real user-space buffer in a unit test).  The slot swap
+            // in handle_ipc_recv_timeout happens unconditionally before the
+            // metadata write, so the slot assertion below is still valid.
+            let _ = dispatch(&mut state, &mut frame);
+
+            assert_eq!(
+                crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
+                    .load(Ordering::Acquire),
+                0,
+                "handle_ipc_recv_timeout must consume the pre-staged deadline"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn staged_deadline_cleared_on_try_recv_dispatch() {
+    // Even when timeout_ticks == 0 (try-recv path), handle_ipc_recv_timeout
+    // unconditionally swaps SPLIT_RECV_TIMEOUT_DEADLINE to 0, preventing a
+    // stale deadline from being picked up by a later timed recv call.
+    use core::sync::atomic::Ordering;
+    use super::super::syscall::{
+        dispatch, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR,
+    };
+    std::thread::Builder::new()
+        .name("staged_deadline_cleared_try_recv".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.set_timer_for_test(Timer::new(100));
+            state.register_task(1).expect("task1");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+            let msg = Message::new(88, b"").expect("msg");
+            state.ipc_send(send_cap, msg).expect("pre-queue message");
+
+            let cpu_idx = state.current_cpu().0 as usize;
+            // Stage a deadline even though the following dispatch is a try-recv.
+            crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
+                .store(42, Ordering::Release);
+
+            let mut frame = TrapFrame::zeroed();
+            frame.set_syscall_num(SYSCALL_IPC_RECV_TIMEOUT_NR);
+            frame.set_arg(SYSCALL_ARG_CAP, recv_cap.0 as usize);
+            frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, 0usize); // timeout_ticks == 0 → try-recv
+            let _ = dispatch(&mut state, &mut frame);
+
+            assert_eq!(
+                crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
+                    .load(Ordering::Acquire),
+                0,
+                "staged slot must be cleared even on the try-recv (timeout_ticks==0) path"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
