@@ -96,6 +96,26 @@ impl SharedKernel {
             state.control_plane_set_process_cnode_slots_via_syscall(target_pid, slot_capacity)
         })
     }
+
+    /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.
+    ///
+    /// This exists solely for AArch64 boot code that must pass `&mut KernelState`
+    /// to a callback that eventually calls `yarm_aarch64_enter_user_mode_eret -> !`.
+    /// Holding the `SpinLock` across an ERET that never returns would leave
+    /// `held = true` permanently, deadlocking all subsequent trap handlers.
+    ///
+    /// # Safety
+    /// * Must only be called during single-CPU boot before any trap handler can
+    ///   concurrently call `SharedKernel::with` or `with_cpu`.
+    /// * The returned reference must not be used after the ERET to user space;
+    ///   from that point all KernelState access must go through `with` / `with_cpu`.
+    /// * `TRAP_KERNEL_STATE_PTR` must remain null while this reference is live so
+    ///   that the trap fallback path cannot also yield `&mut KernelState`.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub(crate) unsafe fn borrow_kernel_for_boot(&self) -> &mut KernelState {
+        // SAFETY: delegated to caller (see doc comment above).
+        unsafe { &mut *self.state.data_ptr() }
+    }
 }
 
 #[cfg(test)]

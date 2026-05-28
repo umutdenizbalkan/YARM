@@ -21,8 +21,12 @@ static mut BOOTSTRAP_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
 static mut BOOTSTRAP_SHARED_KERNEL: core::mem::MaybeUninit<crate::runtime::SharedKernel> =
     core::mem::MaybeUninit::uninit();
 
-// Tracks whether BOOTSTRAP_SHARED_KERNEL has been initialized.
-// 0 = uninit, 1 = initialized.  Written once; read-only after.
+// Three-state readiness flag for BOOTSTRAP_SHARED_KERNEL:
+//   0 = uninit     — no initialization has started
+//   1 = initializing — compare_exchange claimed ownership; write in progress
+//   2 = ready      — ptr::write completed; safe to read via shared_static_ref
+// Separating "initializing" from "ready" prevents shared_static_ref from returning
+// Some before BOOTSTRAP_SHARED_KERNEL has been fully written (Phase L2A READY-state fix).
 static BOOTSTRAP_SHARED_KERNEL_READY: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
 const MAX_BOOT_EXTRA_RESERVED: usize = 8;
@@ -709,8 +713,8 @@ impl Bootstrap {
         // Step 3: wrap in SharedKernel and write into BOOTSTRAP_SHARED_KERNEL.
         let shared = crate::runtime::SharedKernel::new(owned);
         // SAFETY: single-writer guaranteed by the compare_exchange guard above;
-        // the store of READY=1 (which is the read gate in shared_static_ref) has
-        // not happened yet, so no concurrent reader can observe the write target.
+        // READY is still 1 (initializing), so no concurrent reader in
+        // shared_static_ref can yet observe the write target (it gates on == 2).
         // We use addr_of_mut! + ptr::write to match the BOOTSTRAP_KERNEL_STATE
         // pattern and avoid the static_mut_refs lint.
         unsafe {
@@ -718,6 +722,11 @@ impl Bootstrap {
                 .cast::<crate::runtime::SharedKernel>();
             core::ptr::write(ptr, shared);
         }
+
+        // Publish: transition 1 (initializing) → 2 (ready).  The Release store
+        // pairs with the Acquire load in shared_static_ref, ensuring the
+        // ptr::write above is visible to any reader that observes READY == 2.
+        BOOTSTRAP_SHARED_KERNEL_READY.store(2, Ordering::Release);
 
         // SAFETY: ptr::write above fully initialized the storage; the addr_of!
         // cast to *const yields a pointer to a now-valid SharedKernel.
@@ -732,12 +741,12 @@ impl Bootstrap {
     /// This accessor never initializes or mutates the shared kernel.
     pub fn shared_static_ref() -> Option<&'static crate::runtime::SharedKernel> {
         use core::sync::atomic::Ordering;
-        if BOOTSTRAP_SHARED_KERNEL_READY.load(Ordering::Acquire) == 0 {
+        if BOOTSTRAP_SHARED_KERNEL_READY.load(Ordering::Acquire) != 2 {
             return None;
         }
-        // SAFETY: READY == 1 means BOOTSTRAP_SHARED_KERNEL was fully written
-        // by init_shared_static_with_boot_memory_map before the Acquire load
-        // observed 1; the Acquire ordering ensures the write is visible here.
+        // SAFETY: READY == 2 means ptr::write(BOOTSTRAP_SHARED_KERNEL) completed
+        // and the Release store to READY=2 was observed by this Acquire load;
+        // the write is therefore fully visible here.
         Some(unsafe {
             &*core::ptr::addr_of!(BOOTSTRAP_SHARED_KERNEL).cast::<crate::runtime::SharedKernel>()
         })
