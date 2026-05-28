@@ -487,10 +487,10 @@ AArch64 QEMU smoke proof:
 - `First shared trap` count = 1 ✓
 - `Stage2N fallback` count = 0 ✓
 
-#### Part B — recv-timeout split-read activation (AArch64 shared path only)
+#### Part B — recv-timeout split-read activation (SharedKernel trap paths: AArch64 + x86_64 -smp 1)
 
 - The recv-timeout split-read bridge (`SharedKernel::ipc_recv_with_deadline_split_bridge`,
-  introduced in Stage 2D) is now **active** on the AArch64 shared trap/syscall path.
+  introduced in Stage 2D) is now **active** on SharedKernel-primary trap/syscall paths for both AArch64 and x86_64 single-core (`-smp 1`).
 - Activation point: `arch::trap_entry::handle_trap_entry_shared` detects
   `SYSCALL_IPC_RECV_TIMEOUT_NR` (nr=5) before acquiring the global `SharedKernel`
   lock, pre-reads the scheduler tick under the lighter `scheduler_state` lock, and
@@ -502,7 +502,8 @@ AArch64 QEMU smoke proof:
   `ipc_recv_with_deadline(cap, timeout_ticks)` — avoiding a redundant tick read
   inside the global lock.
 - Marker emitted when the split path is taken:
-  `YARM_LOCK_SPLIT_RECV_TIMEOUT path=shared_bridge`
+  `YARM_LOCK_SPLIT_RECV_TIMEOUT path=shared_bridge arch=aarch64`
+  and `YARM_LOCK_SPLIT_RECV_TIMEOUT path=shared_bridge arch=x86_64`
 - Smoke boot does not exercise recv-timeout in the 30-second window; marker is
   absent from smoke logs. A focused unit test exercises the path directly.
 
