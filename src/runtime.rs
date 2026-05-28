@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::boot::{KernelError, KernelState, TrapHandleError};
+use crate::kernel::boot::{
+    kernel_ref, KernelError, KernelState, SchedulerState, TrapHandleError,
+};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 use crate::kernel::lock::{SpinLock, SpinLockIrq};
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
-use crate::kernel::boot::SchedulerState;
+use crate::kernel::scheduler::CpuId;
 use crate::kernel::trap::Trap;
 use crate::kernel::trapframe::TrapFrame;
-use crate::kernel::scheduler::CpuId;
 
 #[derive(Debug)]
 pub struct SharedKernel {
@@ -47,7 +48,6 @@ impl SharedKernel {
         Ok(f(&mut guard))
     }
 
-
     pub fn scheduler_tick_now_split_read(&self) -> u64 {
         // Stage 2B split: read scheduler tick directly under scheduler lock.
         crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read");
@@ -59,6 +59,19 @@ impl SharedKernel {
         sched.timer.current_ticks().0
     }
 
+    pub fn current_tid_split_read(&self, cpu: CpuId) -> Option<u64> {
+        // Phase L5A split: read the scheduler's per-CPU current TID directly
+        // under the scheduler lock.  This intentionally avoids the global
+        // SharedKernel lock and does not mutate current_cpu or task state.
+        // SAFETY: `scheduler_state` points at the scheduler lock embedded in the
+        // same `KernelState` owned by `self.state`; the storage is stable for
+        // the `SharedKernel` lifetime.
+        let scheduler_state = unsafe { &*self.scheduler_state };
+        let sched = scheduler_state.lock();
+        kernel_ref(&sched.scheduler)
+            .current_tid_on(cpu)
+            .map(|tid| tid.0)
+    }
 
     pub fn ipc_recv_with_deadline_split_bridge(
         &self,
@@ -148,6 +161,20 @@ mod tests {
         });
 
         assert_eq!(processed, 1);
+    }
+
+    #[test]
+    fn current_tid_split_read_matches_scheduler_current_on_cpu() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state.register_task(42).expect("task42");
+            state.enqueue_current_cpu(42).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            assert_eq!(state.current_tid_on_cpu(CpuId(0)), Some(42));
+        });
+
+        assert_eq!(kernel.current_tid_split_read(CpuId(0)), Some(42));
+        assert_eq!(kernel.current_tid_split_read(CpuId(7)), None);
     }
 
     #[test]
