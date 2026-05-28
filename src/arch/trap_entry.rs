@@ -100,7 +100,14 @@ fn shared_recv_timeout_staging_info(
         return None;
     }
     let frame = frame?;
-    Some((frame.syscall_num(), frame.arg(3) as u64, "aarch64"))
+    // At this seam the AArch64 trap frame mirrors vector GPRs directly.
+    // `syscall_num`/`args` are populated later by aarch64::trap::handle_trap_entry,
+    // so staging must decode from architectural syscall ABI registers.
+    Some((
+        frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8),
+        frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X3) as u64,
+        "aarch64",
+    ))
 }
 
 #[cfg(target_arch = "x86_64")]
