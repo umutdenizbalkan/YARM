@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::arch::trap::TrapEvent;
-use crate::kernel::boot::{KernelState, TrapHandleError};
+use crate::kernel::boot::{FaultBookkeepingMode, KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::trapframe::TrapFrame;
 
@@ -21,6 +21,22 @@ pub fn handle_trap_entry(
 ) -> Result<(), TrapHandleError> {
     super::riscv64::trap::handle_trap_entry(kernel, cpu, context, frame)
 }
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    context: ArchTrapContext,
+    frame: Option<&mut TrapFrame>,
+    fault_bookkeeping_mode: FaultBookkeepingMode,
+) -> Result<(), TrapHandleError> {
+    super::riscv64::trap::handle_trap_entry_with_fault_bookkeeping_mode(
+        kernel,
+        cpu,
+        context,
+        frame,
+        fault_bookkeeping_mode,
+    )
+}
 
 #[cfg(target_arch = "x86_64")]
 pub type ArchTrapContext = super::x86_64::trap::X86TrapContext;
@@ -37,6 +53,22 @@ pub fn handle_trap_entry(
 ) -> Result<(), TrapHandleError> {
     super::x86_64::trap::handle_trap_entry(kernel, cpu, context, frame)
 }
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    context: ArchTrapContext,
+    frame: Option<&mut TrapFrame>,
+    fault_bookkeeping_mode: FaultBookkeepingMode,
+) -> Result<(), TrapHandleError> {
+    super::x86_64::trap::handle_trap_entry_with_fault_bookkeeping_mode(
+        kernel,
+        cpu,
+        context,
+        frame,
+        fault_bookkeeping_mode,
+    )
+}
 
 #[cfg(target_arch = "aarch64")]
 pub type ArchTrapContext = super::aarch64::trap::Aarch64TrapContext;
@@ -52,6 +84,22 @@ pub fn handle_trap_entry(
     frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
     super::aarch64::trap::handle_trap_entry(kernel, cpu, context, frame)
+}
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    context: ArchTrapContext,
+    frame: Option<&mut TrapFrame>,
+    fault_bookkeeping_mode: FaultBookkeepingMode,
+) -> Result<(), TrapHandleError> {
+    super::aarch64::trap::handle_trap_entry_with_fault_bookkeeping_mode(
+        kernel,
+        cpu,
+        context,
+        frame,
+        fault_bookkeeping_mode,
+    )
 }
 
 pub fn handle_trap_entry_shared(
@@ -83,8 +131,30 @@ pub fn handle_trap_entry_shared(
             }
         }
     }
+    // Stage 3B-E: SharedKernel trap paths pre-record only diagnostic page-fault
+    // bookkeeping under fault_state_lock before taking the global SharedKernel
+    // lock. All real trap behavior still runs in shared.with_cpu below; raw
+    // paths keep recording inside KernelState::handle_trap_event.
+    let fault_bookkeeping_mode = if let TrapEvent::PageFault(fault) = decode_trap_context(context) {
+        shared.record_fault_split_mut(fault);
+        if let Some(frame) = frame.as_deref() {
+            shared.record_fault_frame_snapshot_split_mut(frame);
+        }
+        FaultBookkeepingMode::AlreadyRecordedBySharedSeam
+    } else {
+        FaultBookkeepingMode::RecordInHandleTrapEvent
+    };
+
     let result = shared
-        .with_cpu(cpu, |kernel| handle_trap_entry(kernel, cpu, context, frame))
+        .with_cpu(cpu, |kernel| {
+            handle_trap_entry_with_fault_bookkeeping_mode(
+                kernel,
+                cpu,
+                context,
+                frame,
+                fault_bookkeeping_mode,
+            )
+        })
         .map_err(|err| TrapHandleError::Syscall(err.into()))?;
     result
 }

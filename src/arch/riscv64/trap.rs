@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::arch::trap::{FaultAccess, FaultInfo, TrapEvent};
-use crate::kernel::boot::{KernelState, TrapHandleError};
+use crate::kernel::boot::{FaultBookkeepingMode, KernelState, TrapHandleError};
 use crate::kernel::scheduler::{CpuId, MAX_CPUS};
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::VirtAddr;
@@ -88,11 +88,31 @@ pub fn handle_trap_entry(
     kernel: &mut KernelState,
     cpu: CpuId,
     context: Riscv64TrapContext,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    handle_trap_entry_with_fault_bookkeeping_mode(
+        kernel,
+        cpu,
+        context,
+        frame,
+        FaultBookkeepingMode::RecordInHandleTrapEvent,
+    )
+}
+
+pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    context: Riscv64TrapContext,
     mut frame: Option<&mut TrapFrame>,
+    fault_bookkeeping_mode: FaultBookkeepingMode,
 ) -> Result<(), TrapHandleError> {
     let _ = kernel.set_current_cpu(cpu);
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
-    kernel.handle_trap_event(decode_trap_context(context), frame.as_deref_mut())?;
+    kernel.handle_trap_event_with_fault_bookkeeping_mode(
+        decode_trap_context(context),
+        frame.as_deref_mut(),
+        fault_bookkeeping_mode,
+    )?;
     // RISC-V ecall does not advance SEPC automatically; advance by 4 so sret
     // resumes at the instruction after the ecall instead of re-executing it.
     if context.scause == EXC_USER_ECALL {

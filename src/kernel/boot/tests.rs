@@ -4801,6 +4801,138 @@ fn trap_event_page_fault_records_fault_then_faults_current_task() {
 }
 
 #[test]
+fn raw_page_fault_records_last_fault_frame() {
+    std::thread::Builder::new()
+        .name("raw_page_fault_records_last_fault_frame".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let fault = FaultInfo {
+                addr: VirtAddr(0x4444),
+                access: FaultAccess::Read,
+            };
+            let mut frame = TrapFrame::new(0, [0; 6]);
+            frame.saved_pc = 0x1111;
+            frame.saved_sp = 0x2222;
+            let expected_frame = frame.clone();
+
+            let _ = state.handle_trap_event(TrapEvent::PageFault(fault), Some(&mut frame));
+
+            assert_eq!(state.last_fault(), Some(fault));
+            assert_eq!(state.last_fault_frame(), Some(expected_frame));
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+#[test]
+fn shared_prerecorded_fault_bookkeeping_skips_duplicate_recording() {
+    use crate::runtime::SharedKernel;
+
+    std::thread::Builder::new()
+        .name("shared_prerecorded_fault_bookkeeping".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+            let fault = FaultInfo {
+                addr: VirtAddr(0x5555),
+                access: FaultAccess::Execute,
+            };
+            let mut prerecord_frame = TrapFrame::new(0, [0; 6]);
+            prerecord_frame.saved_pc = 0x1234;
+            prerecord_frame.saved_sp = 0x5678;
+            let expected_frame = prerecord_frame.clone();
+            let mut behavior_frame = TrapFrame::new(0, [0; 6]);
+            behavior_frame.saved_pc = 0x9999;
+            behavior_frame.saved_sp = 0xaaaa;
+
+            shared.record_fault_split_mut(fault);
+            shared.record_fault_frame_snapshot_split_mut(&prerecord_frame);
+
+            shared.with(|state| {
+                let _ = state.handle_trap_event_with_fault_bookkeeping_mode(
+                    TrapEvent::PageFault(fault),
+                    Some(&mut behavior_frame),
+                    FaultBookkeepingMode::AlreadyRecordedBySharedSeam,
+                );
+
+                assert_eq!(state.last_fault(), Some(fault));
+                assert_eq!(state.last_fault_frame(), Some(expected_frame));
+            });
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+#[test]
+fn shared_prerecorded_fault_report_uses_current_fault() {
+    use super::fault_state::SupervisorFaultReportWire;
+    use crate::runtime::SharedKernel;
+
+    std::thread::Builder::new()
+        .name("shared_prerecorded_fault_report".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+            let handler_recv_task1 = shared.with(|state| {
+                state.register_task(1).expect("task1");
+                state.enqueue_current_cpu(1).expect("enqueue task1");
+                let (_handler_eid, _handler_send, handler_recv) =
+                    state.create_endpoint(4).expect("handler endpoint");
+                state.set_fault_handler(handler_recv).expect("set handler");
+                state
+                    .grant_capability_task_to_task(0, handler_recv, 1)
+                    .expect("dup handler recv to task1")
+            });
+
+            let stale_fault = FaultInfo {
+                addr: VirtAddr(0x1111),
+                access: FaultAccess::Read,
+            };
+            shared.with(|state| state.record_fault(stale_fault));
+
+            let current_fault = FaultInfo {
+                addr: VirtAddr(0x6666),
+                access: FaultAccess::Execute,
+            };
+            let mut frame = TrapFrame::new(0, [0; 6]);
+            frame.saved_pc = 0x7777;
+            frame.saved_sp = 0x8888;
+            shared.record_fault_split_mut(current_fault);
+            shared.record_fault_frame_snapshot_split_mut(&frame);
+
+            shared.with(|state| {
+                state
+                    .handle_trap_event_with_fault_bookkeeping_mode(
+                        TrapEvent::PageFault(current_fault),
+                        None,
+                        FaultBookkeepingMode::AlreadyRecordedBySharedSeam,
+                    )
+                    .expect("handle pre-recorded page fault");
+
+                assert_eq!(state.last_fault(), Some(current_fault));
+                assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
+                assert_eq!(state.current_tid(), Some(1));
+
+                let report = state
+                    .ipc_recv(handler_recv_task1)
+                    .expect("handler recv")
+                    .expect("fault report");
+                let decoded = SupervisorFaultReportWire::decode(report.as_slice())
+                    .expect("decode fault wire");
+                assert_eq!(decoded.faulting_tid, 0);
+                assert_eq!(decoded.fault_addr, current_fault.addr.0);
+                assert_eq!(decoded.access, current_fault.access);
+            });
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+#[test]
 fn demand_page_fault_maps_heap_page_for_current_task() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");

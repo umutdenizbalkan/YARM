@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::arch::trap::{FaultAccess, FaultInfo, TrapEvent};
-use crate::kernel::boot::{KernelState, TrapHandleError};
+use crate::kernel::boot::{FaultBookkeepingMode, KernelState, TrapHandleError};
 use crate::kernel::scheduler::{CpuId, MAX_CPUS};
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::VirtAddr;
@@ -137,7 +137,23 @@ pub fn handle_trap_entry(
     kernel: &mut KernelState,
     cpu: CpuId,
     context: X86TrapContext,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    handle_trap_entry_with_fault_bookkeeping_mode(
+        kernel,
+        cpu,
+        context,
+        frame,
+        FaultBookkeepingMode::RecordInHandleTrapEvent,
+    )
+}
+
+pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    context: X86TrapContext,
     mut frame: Option<&mut TrapFrame>,
+    fault_bookkeeping_mode: FaultBookkeepingMode,
 ) -> Result<(), TrapHandleError> {
     super::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
     // NOTE(arch/x86_64): Architecture-specific IDT setup and assembly trap stubs
@@ -158,7 +174,11 @@ pub fn handle_trap_entry(
             let _ = kernel.sync_current_thread_from_frame(f);
         }
     }
-    kernel.handle_trap_event(decode_trap_context(context), frame.as_deref_mut())?;
+    kernel.handle_trap_event_with_fault_bookkeeping_mode(
+        decode_trap_context(context),
+        frame.as_deref_mut(),
+        fault_bookkeeping_mode,
+    )?;
     restore_arch_thread_state(kernel, cpu, frame)?;
     Ok(())
 }

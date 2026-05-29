@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::{KernelError, KernelState, TrapHandleError};
+use super::{FaultBookkeepingMode, KernelError, KernelState, TrapHandleError};
 use crate::arch::hal::Hal;
 use crate::kernel::ipc::Message;
 use crate::kernel::syscall::{Syscall, SyscallError, dispatch as dispatch_syscall};
@@ -355,10 +355,28 @@ impl KernelState {
         event: TrapEvent,
         frame: Option<&mut TrapFrame>,
     ) -> Result<(), TrapHandleError> {
-        if let Some(fault) = event.fault() {
-            self.record_fault(fault);
-            if let Some(frame) = frame.as_ref() {
-                self.record_fault_frame_snapshot(frame);
+        self.handle_trap_event_with_fault_bookkeeping_mode(
+            event,
+            frame,
+            FaultBookkeepingMode::RecordInHandleTrapEvent,
+        )
+    }
+
+    pub(crate) fn handle_trap_event_with_fault_bookkeeping_mode(
+        &mut self,
+        event: TrapEvent,
+        frame: Option<&mut TrapFrame>,
+        fault_bookkeeping_mode: FaultBookkeepingMode,
+    ) -> Result<(), TrapHandleError> {
+        if matches!(
+            fault_bookkeeping_mode,
+            FaultBookkeepingMode::RecordInHandleTrapEvent
+        ) {
+            if let Some(fault) = event.fault() {
+                self.record_fault(fault);
+                if let Some(frame) = frame.as_ref() {
+                    self.record_fault_frame_snapshot(frame);
+                }
             }
         }
 

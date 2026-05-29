@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::arch::trap::{FaultAccess, FaultInfo, TrapEvent};
-use crate::kernel::boot::{KernelState, TrapHandleError};
+use crate::kernel::boot::{FaultBookkeepingMode, KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
 #[cfg(test)]
 use crate::kernel::scheduler::MAX_CPUS;
@@ -198,7 +198,23 @@ pub fn handle_trap_entry(
     kernel: &mut KernelState,
     cpu: CpuId,
     context: Aarch64TrapContext,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    handle_trap_entry_with_fault_bookkeeping_mode(
+        kernel,
+        cpu,
+        context,
+        frame,
+        FaultBookkeepingMode::RecordInHandleTrapEvent,
+    )
+}
+
+pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    context: Aarch64TrapContext,
     mut frame: Option<&mut TrapFrame>,
+    fault_bookkeeping_mode: FaultBookkeepingMode,
 ) -> Result<(), TrapHandleError> {
     let event = decode_trap_context(context);
     let entering_tid = kernel.current_tid();
@@ -216,7 +232,11 @@ pub fn handle_trap_entry(
     }
     let _ = kernel.set_current_cpu(cpu);
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
-    if let Err(err) = kernel.handle_trap_event(event, frame.as_deref_mut()) {
+    if let Err(err) = kernel.handle_trap_event_with_fault_bookkeeping_mode(
+        event,
+        frame.as_deref_mut(),
+        fault_bookkeeping_mode,
+    ) {
         crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT err={:?}", err);
         crate::yarm_log!("AARCH64_TRAP_FAIL_REASON handle_trap_event");
         return Err(err);

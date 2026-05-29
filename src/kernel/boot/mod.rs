@@ -72,6 +72,12 @@ const MAX_TASKS: usize = 512;
 
 const MAX_MEMORY_OBJECTS: usize = 512;
 const MAX_BOOT_MEMORY_REGIONS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FaultBookkeepingMode {
+    RecordInHandleTrapEvent,
+    AlreadyRecordedBySharedSeam,
+}
 #[cfg(feature = "hosted-dev")]
 const MAX_COW_PAGES: usize = 1024;
 #[cfg(not(feature = "hosted-dev"))]

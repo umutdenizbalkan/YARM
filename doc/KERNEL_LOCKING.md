@@ -798,6 +798,34 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock still protects production trap mutation paths.
   This is not full Stage 3/global-lock removal.
 
+### Stage 3B-E: live shared-seam diagnostic fault bookkeeping split-mutation
+
+- SharedKernel trap paths now pre-record only diagnostic page-fault bookkeeping
+  before entering the global `SharedKernel` lock. When the shared seam decodes
+  `TrapEvent::PageFault(fault)`, it records `last_fault` and
+  `last_fault_frame` through the Stage 3B-A split helpers under
+  `fault_state_lock`.
+- Duplicate recording is prevented explicitly with `FaultBookkeepingMode`:
+  raw/non-shared paths use `RecordInHandleTrapEvent` and continue to record in
+  `KernelState::handle_trap_event(...)`, while shared pre-recorded page faults
+  use `AlreadyRecordedBySharedSeam` and skip only the diagnostic
+  `last_fault`/`last_fault_frame` write inside the globally locked behavior
+  path.
+- All real trap behavior remains under `shared.with_cpu(...)` / the global
+  `SharedKernel` lock: VM page-fault recovery, COW, demand paging, unhandled
+  fault policy, task faulting/blocking, fault IPC/report delivery, scheduler
+  decisions, syscall returns, startup caps, and register writeback are
+  unchanged.
+- Legacy `emit_fault_report(...)` and `fault_current_task(...)` wrappers remain
+  available for syscall/raw last-fault compatibility; current page-fault
+  report/log behavior continues to use the explicit `FaultInfo` from Stage
+  3B-C.
+- x86_64 task-switch detection still uses the conservative `with_cpu` TID
+  snapshots, x86_64 SMP remains explicitly out of scope, and Phase 3B
+  zero-copy paths are untouched.
+- The global `SharedKernel` lock is still retained for real trap behavior. This
+  is not full Stage 3/global-lock removal.
+
 ### Stage 3: remove global lock from syscall fast path
 
 
