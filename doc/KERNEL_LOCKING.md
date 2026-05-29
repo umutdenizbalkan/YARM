@@ -636,26 +636,29 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - All 6 service entries present exactly once ✓
 - `[ok] x86_64 boot markers detected` ✓
 
-### Phase L5A: shared-trap task-switch detection split-read (complete)
+### Phase L5A: shared-trap task-switch detection split-read (staged helper only)
 
 - Added narrow read-only helper: `SharedKernel::current_tid_split_read(cpu)`.
-- Purpose: snapshot the scheduler's per-CPU current TID for shared-trap
-  task-switch detection without acquiring the global `SharedKernel` lock.
-- Locking: helper acquires only `scheduler_state` (`SpinLockIrq`) and reads
+- Helper behavior: acquires only `scheduler_state` (`SpinLockIrq`) and reads
   `SmpScheduler::current_tid_on(cpu)`; it does not call `SharedKernel::with`,
   does not call `with_cpu`, and does not mutate `current_cpu`, scheduler, or
   task state.
-- x86_64 shared trap dispatch now uses the helper for the entering/exiting TID
-  snapshots around `dispatch_trap_entry_with_shared_kernel(...)`; actual
-  trap/syscall handling still enters through `shared.with_cpu(...)` inside the
-  shared trap seam.
+- Production use of this helper in the x86_64 shared trap dispatch was reverted:
+  it caused x86_64 startup register/cap corruption after supervisor blocked and
+  PM was scheduled. The suspected failure mode was incorrect task-switch
+  detection, selecting syscall-return-only writeback when full task frame
+  writeback was required.
+- x86_64 shared trap dispatch therefore again snapshots `entering_tid` and
+  `exiting_tid` through `shared.with_cpu(cpu, |k| k.current_tid())`, matching
+  the last known-good Phase 3B boot behavior.
+- SharedKernel-primary trap ownership remains active: x86_64 still enters
+  `dispatch_trap_entry_with_shared_kernel(...)`; only the read-only
+  task-switch snapshots were restored to the conservative global-lock path.
 - Register writeback semantics are unchanged: differing TID snapshots still use
   full task-switch frame writeback, while same-task syscall returns still use
   syscall-return-only writeback.
-- AArch64 has no equivalent entering/exiting TID task-switch detection in its
-  shared vector handoff, so it is left unchanged.
-- x86_64 SMP remains out of scope; this changes only the existing shared-primary
-  `-smp 1` trap path and does not touch `src/arch/x86_64/smp.rs`.
+- AArch64 behavior is unchanged. x86_64 SMP remains out of scope and
+  `src/arch/x86_64/smp.rs` is not touched.
 - The global `SharedKernel` lock still protects mutation paths. This is not
   Stage 3/global-lock removal.
 

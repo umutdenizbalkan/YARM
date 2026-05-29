@@ -817,7 +817,9 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=x86_64");
         }
         let fault_rip = frame.rip;
-        let entering_tid = shared.current_tid_split_read(cpu);
+        let entering_tid: Option<u64> = shared
+            .with_cpu(cpu, |k| k.current_tid())
+            .unwrap_or(None);
         let mut trap_frame =
             unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
         if let Err(err) = crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
@@ -839,7 +841,9 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
             halt_forever();
         }
-        let exiting_tid = shared.current_tid_split_read(cpu);
+        let exiting_tid: Option<u64> = shared
+            .with_cpu(cpu, |k| k.current_tid())
+            .unwrap_or(None);
         let task_switched = entering_tid != exiting_tid;
         if task_switched {
             write_task_gprs_to_saved_regs(regs, &trap_frame);
