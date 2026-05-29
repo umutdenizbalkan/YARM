@@ -708,6 +708,32 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock still protects mutation paths. This is not
   Stage 3/global-lock removal.
 
+### Phase L7A: scheduler topology split-read helpers (staged helper only)
+
+- Added narrow read-only helpers:
+  - `SharedKernel::online_cpu_count_split_read()`
+  - `SharedKernel::present_cpu_count_split_read()`
+- Helper behavior: each helper acquires only `scheduler_state`
+  (`SpinLockIrq`) and reads the `SmpScheduler` topology counts. They do not
+  call `SharedKernel::with`, do not call `with_cpu`, do not mutate
+  `current_cpu`, and do not touch scheduler runqueues or task-switch state.
+- Ownership/lock domain: `KernelState::online_cpu_count()` and
+  `KernelState::present_cpu_count()` already read `SmpScheduler` topology
+  through `scheduler_state`; L7A exposes the same read-only data through
+  `SharedKernel` without taking the outer global lock. The underlying topology
+  bitmaps are atomic and remain accessed while the scheduler lock is held by
+  the helper.
+- Production callsites are not migrated in this phase. Existing boot logs read
+  topology from the boot-owned `KernelState`, and the only `SharedKernel::with`
+  topology-count reads found during the audit are test/shared-static sanity
+  checks. The new helpers are staged for future low-risk telemetry or boot
+  status reads.
+- x86_64 SMP remains explicitly out of scope; this phase does not change SMP
+  bring-up, CPU online/offline mutation, runqueue selection, task switching,
+  register writeback, IPC, VFS, or Phase 3B zero-copy paths.
+- The global `SharedKernel` lock still protects mutation paths. This is not
+  Stage 3/global-lock removal.
+
 ### Stage 3: remove global lock from syscall fast path
 
 

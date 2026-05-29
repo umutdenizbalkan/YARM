@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::boot::{
-    kernel_ref, KernelError, KernelState, SchedulerState, TrapHandleError,
-};
+use crate::kernel::boot::{kernel_ref, KernelError, KernelState, SchedulerState, TrapHandleError};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
-use crate::kernel::lock::{SpinLock, SpinLockIrq};
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
+use crate::kernel::lock::{SpinLock, SpinLockIrq};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::trap::Trap;
 use crate::kernel::trapframe::TrapFrame;
@@ -73,6 +71,30 @@ impl SharedKernel {
             .map(|tid| tid.0)
     }
 
+    pub fn online_cpu_count_split_read(&self) -> usize {
+        // Phase L7A split: read scheduler topology through scheduler_state only.
+        // This is a read-only staged helper; it does not acquire the global
+        // SharedKernel lock, mutate runqueues, or update current_cpu.
+        // SAFETY: `scheduler_state` points at the scheduler lock embedded in the
+        // same `KernelState` owned by `self.state`; the storage is stable for
+        // the `SharedKernel` lifetime.
+        let scheduler_state = unsafe { &*self.scheduler_state };
+        let sched = scheduler_state.lock();
+        kernel_ref(&sched.scheduler).online_cpu_count()
+    }
+
+    pub fn present_cpu_count_split_read(&self) -> usize {
+        // Phase L7A split: read scheduler topology through scheduler_state only.
+        // This is a read-only staged helper; it does not acquire the global
+        // SharedKernel lock, mutate runqueues, or update current_cpu.
+        // SAFETY: `scheduler_state` points at the scheduler lock embedded in the
+        // same `KernelState` owned by `self.state`; the storage is stable for
+        // the `SharedKernel` lifetime.
+        let scheduler_state = unsafe { &*self.scheduler_state };
+        let sched = scheduler_state.lock();
+        kernel_ref(&sched.scheduler).present_cpu_count()
+    }
+
     pub fn ipc_recv_with_deadline_split_bridge(
         &self,
         recv_cap: CapId,
@@ -86,7 +108,6 @@ impl SharedKernel {
         let deadline = now.wrapping_add(timeout_ticks);
         self.with(|state| state.ipc_recv_until_deadline(recv_cap, deadline))
     }
-
 
     pub fn handle_trap_with_cpu(
         &self,
@@ -175,6 +196,17 @@ mod tests {
 
         assert_eq!(kernel.current_tid_split_read(CpuId(0)), Some(42));
         assert_eq!(kernel.current_tid_split_read(CpuId(7)), None);
+    }
+
+    #[test]
+    fn topology_count_split_reads_match_scheduler_state() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (online, present) =
+            kernel.with(|state| (state.online_cpu_count(), state.present_cpu_count()));
+
+        assert_eq!(kernel.online_cpu_count_split_read(), online);
+        assert_eq!(kernel.present_cpu_count_split_read(), present);
+        assert!(kernel.online_cpu_count_split_read() <= kernel.present_cpu_count_split_read());
     }
 
     #[test]
