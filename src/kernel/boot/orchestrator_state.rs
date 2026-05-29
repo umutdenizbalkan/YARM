@@ -84,8 +84,22 @@ impl KernelState {
         self.scheduler_state.lock()
     }
 
-    pub(crate) fn scheduler_state_lock_ptr(&self) -> *const crate::kernel::lock::SpinLockIrq<SchedulerState> {
+    pub(crate) fn scheduler_state_lock_ptr(
+        &self,
+    ) -> *const crate::kernel::lock::SpinLockIrq<SchedulerState> {
         &self.scheduler_state as *const _
+    }
+
+    pub(crate) fn boot_config_split_read_ptrs(
+        &self,
+    ) -> (
+        *const crate::kernel::lock::SpinLockIrq<()>,
+        *const KernelStorage<BootConfigSubsystem>,
+    ) {
+        (
+            &self.boot_config_state_lock as *const _,
+            &self.boot_config as *const _,
+        )
     }
 
     pub(crate) fn with_scheduler_state<R>(&self, f: impl FnOnce(&SchedulerState) -> R) -> R {

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::kernel::boot::{kernel_ref, KernelError, KernelState, SchedulerState, TrapHandleError};
+use crate::kernel::boot::{
+    kernel_ref, BootConfigSubsystem, KernelCapacityProfile, KernelError, KernelState,
+    KernelStorage, RuntimeCapacityConfig, SchedulerState, TrapHandleError,
+};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 #[cfg(test)]
@@ -15,14 +18,19 @@ use crate::kernel::trapframe::TrapFrame;
 pub struct SharedKernel {
     state: SpinLock<KernelState>,
     scheduler_state: *const SpinLockIrq<SchedulerState>,
+    boot_config_state_lock: *const SpinLockIrq<()>,
+    boot_config: *const KernelStorage<BootConfigSubsystem>,
 }
 
 impl SharedKernel {
     pub fn new(state: KernelState) -> Self {
         let scheduler_state = state.scheduler_state_lock_ptr();
+        let (boot_config_state_lock, boot_config) = state.boot_config_split_read_ptrs();
         Self {
             state: SpinLock::new(state),
             scheduler_state,
+            boot_config_state_lock,
+            boot_config,
         }
     }
 
@@ -93,6 +101,24 @@ impl SharedKernel {
         let scheduler_state = unsafe { &*self.scheduler_state };
         let sched = scheduler_state.lock();
         kernel_ref(&sched.scheduler).present_cpu_count()
+    }
+
+    pub fn capacity_profile_split_read(&self) -> KernelCapacityProfile {
+        // Phase L8B split: read immutable boot configuration under only the
+        // boot_config lock domain. This intentionally avoids the global
+        // SharedKernel lock and does not mutate boot config or runtime state.
+        // SAFETY: these pointers refer to the boot_config lock and storage
+        // embedded in the same `KernelState` owned by `self.state`; that storage
+        // is stable for the `SharedKernel` lifetime.
+        let boot_config_state_lock = unsafe { &*self.boot_config_state_lock };
+        let _guard = boot_config_state_lock.lock();
+        let boot_config = unsafe { &*self.boot_config };
+        kernel_ref(boot_config).capacity_profile
+    }
+
+    pub fn runtime_capacity_config_split_read(&self) -> RuntimeCapacityConfig {
+        let profile = self.capacity_profile_split_read();
+        KernelState::runtime_capacity_config_for_profile(profile)
     }
 
     pub fn ipc_recv_with_deadline_split_bridge(
@@ -207,6 +233,19 @@ mod tests {
         assert_eq!(kernel.online_cpu_count_split_read(), online);
         assert_eq!(kernel.present_cpu_count_split_read(), present);
         assert!(kernel.online_cpu_count_split_read() <= kernel.present_cpu_count_split_read());
+    }
+
+    #[test]
+    fn boot_config_split_reads_match_kernel_state_capacity_config() {
+        let kernel = SharedKernel::new(
+            Bootstrap::init_with_capacity_profile(KernelCapacityProfile::Constrained)
+                .expect("init constrained"),
+        );
+        let (profile, config) =
+            kernel.with(|state| (state.capacity_profile(), state.runtime_capacity_config()));
+
+        assert_eq!(kernel.capacity_profile_split_read(), profile);
+        assert_eq!(kernel.runtime_capacity_config_split_read(), config);
     }
 
     #[test]

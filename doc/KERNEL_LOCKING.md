@@ -734,6 +734,26 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock still protects mutation paths. This is not
   Stage 3/global-lock removal.
 
+### Phase L8B: boot-config capacity split-read helpers (staged helper only)
+
+- Added narrow read-only helpers:
+  - `SharedKernel::capacity_profile_split_read()`
+  - `SharedKernel::runtime_capacity_config_split_read()`
+- Helper behavior: the helpers acquire only the `boot_config_state_lock`
+  (`SpinLockIrq<()>`) and copy out the boot capacity profile or derive the
+  corresponding `RuntimeCapacityConfig`. They do not call `SharedKernel::with`,
+  do not call `with_cpu`, do not mutate boot configuration, and do not touch
+  scheduler, task, IPC, capability, VM, memory, driver, or `current_cpu` state.
+- Production callsites are not migrated in this phase. The helpers are staged
+  for future low-risk telemetry or boot-configuration reads and are covered by
+  a focused helper-level test comparing against the existing `KernelState`
+  capacity-profile/runtime-capacity-config accessors.
+- x86_64 SMP remains explicitly out of scope; this phase does not change SMP
+  bring-up, task switching, register writeback, IPC, VFS, or Phase 3B
+  zero-copy paths.
+- The global `SharedKernel` lock still protects mutation paths. This is not
+  Stage 3/global-lock removal.
+
 ### Stage 3: remove global lock from syscall fast path
 
 

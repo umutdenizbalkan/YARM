@@ -79,7 +79,15 @@ impl KernelState {
     }
 
     pub fn runtime_capacity_config(&self) -> RuntimeCapacityConfig {
-        match self.with_boot_config(|boot_config| boot_config.capacity_profile) {
+        Self::runtime_capacity_config_for_profile(
+            self.with_boot_config(|boot_config| boot_config.capacity_profile),
+        )
+    }
+
+    pub(crate) fn runtime_capacity_config_for_profile(
+        profile: KernelCapacityProfile,
+    ) -> RuntimeCapacityConfig {
+        match profile {
             KernelCapacityProfile::HostedDefault => Self::runtime_capacity_config_with_cnodes(
                 MAX_ENDPOINTS,
                 MAX_NOTIFICATIONS,
