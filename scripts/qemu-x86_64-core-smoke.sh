@@ -255,6 +255,13 @@ if [[ -f "$LOGFILE" ]]; then
     echo "[warn] Stage2N: x86_64 fallback count=${STAGE2N_FALLBACK} (expected 0)"
     stage2n_fail=1
   fi
+  TID_MISMATCH=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_LOCK_SPLIT_CURRENT_TID_MISMATCH" 2>/dev/null || echo 0)
+  if [[ "$TID_MISMATCH" -eq 0 ]]; then
+    echo "[ok] L5B: x86_64 current-TID split-read mismatch count=0"
+  else
+    echo "[warn] L5B: x86_64 current-TID split-read mismatch count=${TID_MISMATCH} (expected 0 in normal build)"
+    stage2n_fail=1
+  fi
   if [[ "${stage2n_fail:-0}" -eq 1 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
     echo "[error] strict x86_64 smoke: Stage2N SharedKernel-primary marker check failed"
     exit 1
