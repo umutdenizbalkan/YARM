@@ -716,14 +716,16 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         .is_ok()
         {
             write_trapframe_back_to_vector_frame(frame, &trap_frame);
-            let log_tid = shared.with(|k| k.current_tid()).unwrap_or(0);
-            boot_trace!(
-                "AARCH64_VECTOR_FRAME_FINAL tid={} x0={} x1={} x2={}",
-                log_tid,
-                frame.gprs[0],
-                frame.gprs[1],
-                frame.gprs[2],
-            );
+            if AARCH64_TRAP_TRACE {
+                let log_tid = shared.current_tid_split_read(trap_cpu).unwrap_or(0);
+                boot_trace!(
+                    "AARCH64_VECTOR_FRAME_FINAL tid={} x0={} x1={} x2={}",
+                    log_tid,
+                    frame.gprs[0],
+                    frame.gprs[1],
+                    frame.gprs[2],
+                );
+            }
         } else {
             crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE failed");
             crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE halting");

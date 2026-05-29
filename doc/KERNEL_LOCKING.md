@@ -690,6 +690,24 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock still protects mutation paths. This is not
   Stage 3/global-lock removal.
 
+### Phase L6B: AArch64 trace-only current-TID log read cleanup (complete)
+
+- Removed the unconditional AArch64 shared-vector trace metadata read of
+  `current_tid` from normal builds. The `AARCH64_VECTOR_FRAME_FINAL` TID value
+  is now computed only when `AARCH64_TRAP_TRACE` is enabled.
+- When tracing is enabled, the TID is read with
+  `SharedKernel::current_tid_split_read(trap_cpu)` as trace/log metadata only;
+  it is not used for register writeback, scheduling, syscall return values,
+  startup capability delivery, or IPC behavior.
+- Normal builds (`AARCH64_TRAP_TRACE=false`) do not take the global
+  `SharedKernel` lock for this trace-only TID field and do not emit additional
+  per-trap logs.
+- x86_64 task-switch detection is unchanged: conservative `with_cpu` snapshots
+  remain authoritative, and `current_tid_split_read` remains diagnostic/staged
+  only for x86_64.
+- The global `SharedKernel` lock still protects mutation paths. This is not
+  Stage 3/global-lock removal.
+
 ### Stage 3: remove global lock from syscall fast path
 
 
