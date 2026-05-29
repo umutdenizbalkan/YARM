@@ -777,6 +777,27 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock still protects production mutation paths. This
   is not full Stage 3/global-lock removal.
 
+### Stage 3B-C: explicit current-fault behavior source (preparatory only)
+
+- Added a behavior-preserving preparatory refactor for page-fault handling:
+  `TrapEvent::PageFault(fault)` still records `last_fault` and
+  `last_fault_frame` at the same point as before, but the current unhandled
+  page-fault report/log path now uses the explicit `FaultInfo` carried by the
+  current event.
+- `emit_fault_report_for_fault(faulted_tid, fault)` encodes the supervisor fault
+  report from the explicit current `FaultInfo`; `fault_current_task_for_fault`
+  logs/reports from that same value. The legacy `emit_fault_report(...)` and
+  `fault_current_task(...)` wrappers remain for last_fault-based syscall/raw
+  compatibility paths.
+- `last_fault` remains diagnostic/compatibility storage. This phase does not
+  live-migrate shared-seam fault bookkeeping and does not call the Stage 3B-A
+  split-mutation helpers from live trap paths.
+- VM fault recovery, COW/demand paging, scheduler task switching, register
+  writeback, syscall ABI, IPC cap transfer, VFS, syscall 27, and Phase 3B
+  zero-copy paths are unchanged.
+- The global `SharedKernel` lock still protects production trap mutation paths.
+  This is not full Stage 3/global-lock removal.
+
 ### Stage 3: remove global lock from syscall fast path
 
 
