@@ -826,6 +826,28 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock is still retained for real trap behavior. This
   is not full Stage 3/global-lock removal.
 
+### Stage 3C-B: telemetry split-mutation helpers (helper-only)
+
+- Added helper-only telemetry split-mutation scaffolding for simple diagnostic
+  counters:
+  - `SharedKernel::increment_tlb_shootdown_count_split_mut()`
+  - `SharedKernel::add_tlb_shootdown_timeout_count_split_mut(delta)`
+- Helper behavior: each helper avoids `SharedKernel::with` and `with_cpu`,
+  acquires only `telemetry_state_lock`, and mutates only
+  `TelemetrySubsystem::tlb_shootdown_count` or
+  `TelemetrySubsystem::tlb_shootdown_timeout_count`. The helpers do not touch
+  `current_cpu`, scheduler queues, IPC state, VM/TLB state, task state,
+  capabilities, driver state, fault state, boot config, VFS, or Phase 3B paths.
+- No live callsites are migrated in this phase. Existing TLB shootdown and
+  timeout counter increments still occur in `KernelState` under the existing
+  globally locked cross-CPU/TLB paths. Live telemetry migration remains deferred
+  because those paths are coupled to TLB invalidation, retired-ASID ACK logic,
+  cross-CPU mailbox processing, VM state, and current-CPU sequencing.
+- x86_64 SMP remains explicitly out of scope, x86_64 task-switch/register
+  writeback remains conservative, and Phase 3B zero-copy paths are untouched.
+- The global `SharedKernel` lock remains retained for real mutation paths. This
+  is not full Stage 3/global-lock removal.
+
 ### Stage 3: remove global lock from syscall fast path
 
 

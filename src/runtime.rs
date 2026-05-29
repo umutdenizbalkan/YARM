@@ -2,9 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::kernel::boot::{
-    kernel_mut, kernel_ref, BootConfigSubsystem, FaultSubsystem, KernelCapacityProfile,
-    KernelError, KernelState, KernelStorage, RuntimeCapacityConfig, SchedulerState,
-    TrapHandleError,
+    BootConfigSubsystem, FaultSubsystem, KernelCapacityProfile, KernelError, KernelState,
+    KernelStorage, RuntimeCapacityConfig, SchedulerState, TelemetrySubsystem, TrapHandleError,
+    kernel_mut, kernel_ref,
 };
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
@@ -150,6 +150,36 @@ impl SharedKernel {
         self.with_fault_split_mut(|faults| {
             faults.last_fault = None;
             faults.last_fault_frame = None;
+        });
+    }
+
+    fn with_telemetry_split_mut<R>(&self, f: impl FnOnce(&mut TelemetrySubsystem) -> R) -> R {
+        // Stage 3C-B helper-only split mutation: use only telemetry_state_lock
+        // and mutate only simple diagnostic telemetry counters. Do not acquire
+        // the outer SharedKernel lock and do not touch current_cpu, scheduler,
+        // IPC, VM, task, capability, driver, fault, or boot-config state.
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by
+        // this SharedKernel. `telemetry_split_mut_ptrs_from_raw` derives raw
+        // field pointers without creating a whole-KernelState reference; the
+        // telemetry lock serializes access to telemetry storage.
+        let (telemetry_state_lock, telemetry) =
+            unsafe { KernelState::telemetry_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let telemetry_state_lock = unsafe { &*telemetry_state_lock };
+        let _guard = telemetry_state_lock.lock();
+        let telemetry = unsafe { &mut *telemetry };
+        f(kernel_mut(telemetry))
+    }
+
+    pub fn increment_tlb_shootdown_count_split_mut(&self) {
+        self.with_telemetry_split_mut(|telemetry| {
+            telemetry.tlb_shootdown_count = telemetry.tlb_shootdown_count.wrapping_add(1);
+        });
+    }
+
+    pub fn add_tlb_shootdown_timeout_count_split_mut(&self, delta: u64) {
+        self.with_telemetry_split_mut(|telemetry| {
+            telemetry.tlb_shootdown_timeout_count =
+                telemetry.tlb_shootdown_timeout_count.wrapping_add(delta);
         });
     }
 
@@ -316,6 +346,37 @@ mod tests {
             assert_eq!(state.last_fault(), None);
             assert_eq!(state.last_fault_frame(), None);
         });
+    }
+
+    #[test]
+    fn telemetry_split_mut_helpers_match_kernel_state_accessors() {
+        std::thread::Builder::new()
+            .name("telemetry_split_mut_helpers".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+                let (initial_shootdowns, initial_timeouts) = kernel.with(|state| {
+                    (
+                        state.tlb_shootdown_count(),
+                        state.tlb_shootdown_timeout_count(),
+                    )
+                });
+
+                kernel.increment_tlb_shootdown_count_split_mut();
+                assert_eq!(
+                    kernel.with(|state| state.tlb_shootdown_count()),
+                    initial_shootdowns.wrapping_add(1)
+                );
+
+                kernel.add_tlb_shootdown_timeout_count_split_mut(7);
+                assert_eq!(
+                    kernel.with(|state| state.tlb_shootdown_timeout_count()),
+                    initial_timeouts.wrapping_add(7)
+                );
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
     }
 
     #[test]

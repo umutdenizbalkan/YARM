@@ -119,6 +119,23 @@ impl KernelState {
         }
     }
 
+    pub(crate) unsafe fn telemetry_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> (
+        *const crate::kernel::lock::SpinLockIrq<()>,
+        *mut KernelStorage<TelemetrySubsystem>,
+    ) {
+        // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s
+        // owning `SpinLock<KernelState>`. `addr_of!`/`addr_of_mut!` derive raw
+        // field pointers without creating references to the whole KernelState.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).telemetry_state_lock),
+                core::ptr::addr_of_mut!((*state).telemetry),
+            )
+        }
+    }
+
     pub(crate) fn with_scheduler_state<R>(&self, f: impl FnOnce(&SchedulerState) -> R) -> R {
         // Lock-order domain: scheduler
         Self::debug_lock_order_note("scheduler");
