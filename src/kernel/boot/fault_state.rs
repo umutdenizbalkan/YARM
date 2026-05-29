@@ -7,7 +7,7 @@ use crate::kernel::ipc::Message;
 use crate::kernel::syscall::{Syscall, SyscallError, dispatch as dispatch_syscall};
 use crate::kernel::task::FaultPolicy;
 use crate::kernel::task::TaskStatus;
-use crate::kernel::trap::{FaultAccess, Trap, TrapEvent};
+use crate::kernel::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
 use crate::kernel::trapframe::TrapFrame;
 
 const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
@@ -127,13 +127,9 @@ impl KernelState {
         Ok(true)
     }
 
-    fn emit_fault_report(&mut self, faulted_tid: u64) {
-        let (endpoint_idx, fault) =
-            self.with_fault_state(|faults| (faults.fault_handler_endpoint, faults.last_fault));
+    fn emit_fault_report_for_fault(&mut self, faulted_tid: u64, fault: FaultInfo) {
+        let endpoint_idx = self.with_fault_state(|faults| faults.fault_handler_endpoint);
         let Some(endpoint_idx) = endpoint_idx else {
-            return;
-        };
-        let Some(fault) = fault else {
             return;
         };
 
@@ -165,14 +161,33 @@ impl KernelState {
         }
     }
 
+    fn emit_fault_report(&mut self, faulted_tid: u64) {
+        let fault = self.with_fault_state(|faults| faults.last_fault);
+        let Some(fault) = fault else {
+            return;
+        };
+        self.emit_fault_report_for_fault(faulted_tid, fault);
+    }
+
+    fn fault_current_task_for_fault(&mut self, fault: FaultInfo) -> Result<(), KernelError> {
+        self.fault_current_task_with_fault(Some(fault))
+    }
+
     fn fault_current_task(&mut self) -> Result<(), KernelError> {
+        let fault = self.with_fault_state(|faults| faults.last_fault);
+        self.fault_current_task_with_fault(fault)
+    }
+
+    fn fault_current_task_with_fault(
+        &mut self,
+        fault_opt: Option<FaultInfo>,
+    ) -> Result<(), KernelError> {
         let cpu = self.current_cpu();
-        // Diagnostic: log the fault before acting, so we can see which task faulted
-        // and what the fault address was (from last_fault set by try_handle_demand_page_fault).
+        // Diagnostic: log the fault before acting. TrapEvent::PageFault callers
+        // pass the current FaultInfo explicitly so report/log behavior does not
+        // depend on re-reading global last_fault; legacy syscall/raw callers can
+        // still pass the diagnostic last_fault snapshot.
         {
-            let (fault_opt, running_tid_opt) =
-                self.with_fault_state(|faults| (faults.last_fault, None::<u64>));
-            let _ = running_tid_opt;
             let cur_tid = self.current_tid().unwrap_or(u64::MAX);
             crate::yarm_log!(
                 "TASK_FAULT_CURRENT tid={} fault_addr=0x{:x} access={:?}",
@@ -190,7 +205,11 @@ impl KernelState {
             }
             KernelError::TaskMissing
         })?;
-        self.emit_fault_report(running_tid);
+        if let Some(fault) = fault_opt {
+            self.emit_fault_report_for_fault(running_tid, fault);
+        } else {
+            self.emit_fault_report(running_tid);
+        }
 
         if self.effective_fault_policy_for(running_tid) == FaultPolicy::NotifyAndContinue {
             return Ok(());
@@ -379,7 +398,7 @@ impl KernelState {
                     fault.access,
                     frame.as_ref().map(|f| f.saved_pc).unwrap_or(0)
                 );
-                self.fault_current_task()
+                self.fault_current_task_for_fault(fault)
                     .map_err(SyscallError::from)
                     .map_err(TrapHandleError::Syscall)
             }

@@ -3177,7 +3177,61 @@ fn page_fault_emits_report_to_fault_handler_endpoint() {
     assert_eq!(report.sender_tid.0, 0);
     let decoded = SupervisorFaultReportWire::decode(report.as_slice()).expect("decode fault wire");
     assert_eq!(decoded.faulting_tid, 0);
+    assert_eq!(decoded.fault_addr, 8);
     assert_eq!(decoded.access, super::super::trap::FaultAccess::Write);
+}
+
+#[test]
+fn page_fault_report_uses_current_fault_not_stale_last_fault() {
+    std::thread::Builder::new()
+        .name("page_fault_report_uses_current_fault_not_stale_last_fault".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_page_fault_report_uses_current_fault_not_stale_last_fault)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_page_fault_report_uses_current_fault_not_stale_last_fault() {
+    use super::fault_state::SupervisorFaultReportWire;
+
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    state.enqueue_current_cpu(1).expect("enqueue task1");
+
+    let (_handler_eid, _handler_send, handler_recv) =
+        state.create_endpoint(4).expect("handler endpoint");
+    state.set_fault_handler(handler_recv).expect("set handler");
+    let handler_recv_task1 = state
+        .grant_capability_task_to_task(0, handler_recv, 1)
+        .expect("dup handler recv to task1");
+
+    let stale_fault = super::super::trap::FaultInfo {
+        addr: VirtAddr(0x1111),
+        access: super::super::trap::FaultAccess::Read,
+    };
+    state.record_fault(stale_fault);
+
+    let current_fault = super::super::trap::FaultInfo {
+        addr: VirtAddr(0x2222),
+        access: super::super::trap::FaultAccess::Execute,
+    };
+    state
+        .handle_trap_event(TrapEvent::PageFault(current_fault), None)
+        .expect("handle page fault");
+
+    assert_eq!(state.last_fault(), Some(current_fault));
+    assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
+    assert_eq!(state.current_tid(), Some(1));
+
+    let report = state
+        .ipc_recv(handler_recv_task1)
+        .expect("handler recv")
+        .expect("fault report");
+    let decoded = SupervisorFaultReportWire::decode(report.as_slice()).expect("decode fault wire");
+    assert_eq!(decoded.faulting_tid, 0);
+    assert_eq!(decoded.fault_addr, current_fault.addr.0);
+    assert_eq!(decoded.access, current_fault.access);
 }
 
 #[test]
@@ -3240,6 +3294,8 @@ fn page_fault_with_notify_and_continue_keeps_current_task_running() {
     assert_eq!(report.sender_tid.0, 0);
     let decoded = SupervisorFaultReportWire::decode(report.as_slice()).expect("decode fault wire");
     assert_eq!(decoded.faulting_tid, 0);
+    assert_eq!(decoded.fault_addr, 8);
+    assert_eq!(decoded.access, super::super::trap::FaultAccess::Write);
 }
 
 #[test]
