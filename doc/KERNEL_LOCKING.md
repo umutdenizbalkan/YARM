@@ -754,6 +754,29 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock still protects mutation paths. This is not
   Stage 3/global-lock removal.
 
+### Stage 3B-A: fault bookkeeping split-mutation helpers (helper-only)
+
+- Added narrow helper-only diagnostic fault bookkeeping split-mutation helpers:
+  - `SharedKernel::record_fault_split_mut(fault)`
+  - `SharedKernel::record_fault_frame_snapshot_split_mut(frame)`
+  - `SharedKernel::clear_last_fault_split_mut()`
+- Helper behavior: each helper avoids `SharedKernel::with` and `with_cpu`,
+  acquires only `fault_state_lock`, and mutates only
+  `FaultSubsystem::last_fault` and/or `FaultSubsystem::last_fault_frame`.
+  The helpers do not mutate fault handler endpoints, supervisor endpoints,
+  fault policy, task state, scheduler state, IPC, capabilities, VM, memory,
+  driver state, boot config, or `current_cpu`.
+- Production trap paths are not migrated in this phase. Shared trap dispatch
+  still enters the existing globally locked mutation path for live trap/syscall
+  handling; existing `KernelState` fault bookkeeping behavior is unchanged.
+- Stage 3B-B would be a separate later phase if the live SharedKernel trap path
+  is migrated to use these helpers before entering the global lock.
+- x86_64 SMP remains explicitly out of scope; this phase does not change task
+  switching, register writeback, VM fault handling, COW/demand paging, IPC,
+  VFS, or Phase 3B zero-copy paths.
+- The global `SharedKernel` lock still protects production mutation paths. This
+  is not full Stage 3/global-lock removal.
+
 ### Stage 3: remove global lock from syscall fast path
 
 

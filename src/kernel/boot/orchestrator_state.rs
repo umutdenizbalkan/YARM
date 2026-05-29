@@ -102,6 +102,23 @@ impl KernelState {
         )
     }
 
+    pub(crate) unsafe fn fault_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> (
+        *const crate::kernel::lock::SpinLockIrq<()>,
+        *mut KernelStorage<FaultSubsystem>,
+    ) {
+        // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s
+        // owning `SpinLock<KernelState>`. `addr_of!`/`addr_of_mut!` derive raw
+        // field pointers without creating references to the whole KernelState.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).fault_state_lock),
+                core::ptr::addr_of_mut!((*state).faults),
+            )
+        }
+    }
+
     pub(crate) fn with_scheduler_state<R>(&self, f: impl FnOnce(&SchedulerState) -> R) -> R {
         // Lock-order domain: scheduler
         Self::debug_lock_order_note("scheduler");
@@ -143,7 +160,7 @@ impl KernelState {
 
     #[cfg(feature = "posix-compat")]
     pub(crate) fn scheduler_tick_advance(&mut self) -> u64 {
-        self.with_scheduler_state_mut(|sched| sched.timer.tick_and_check().0.0)
+        self.with_scheduler_state_mut(|sched| sched.timer.tick_and_check().0 .0)
     }
 
     pub(crate) fn with_ipc_state<R>(&self, f: impl FnOnce(&IpcSubsystem) -> R) -> R {

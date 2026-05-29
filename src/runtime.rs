@@ -2,8 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::kernel::boot::{
-    kernel_ref, BootConfigSubsystem, KernelCapacityProfile, KernelError, KernelState,
-    KernelStorage, RuntimeCapacityConfig, SchedulerState, TrapHandleError,
+    kernel_mut, kernel_ref, BootConfigSubsystem, FaultSubsystem, KernelCapacityProfile,
+    KernelError, KernelState, KernelStorage, RuntimeCapacityConfig, SchedulerState,
+    TrapHandleError,
 };
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
@@ -11,7 +12,7 @@ use crate::kernel::ipc::Message;
 use crate::kernel::lock::SpinLockGuard;
 use crate::kernel::lock::{SpinLock, SpinLockIrq};
 use crate::kernel::scheduler::CpuId;
-use crate::kernel::trap::Trap;
+use crate::kernel::trap::{FaultInfo, Trap};
 use crate::kernel::trapframe::TrapFrame;
 
 #[derive(Debug)]
@@ -119,6 +120,37 @@ impl SharedKernel {
     pub fn runtime_capacity_config_split_read(&self) -> RuntimeCapacityConfig {
         let profile = self.capacity_profile_split_read();
         KernelState::runtime_capacity_config_for_profile(profile)
+    }
+
+    fn with_fault_split_mut<R>(&self, f: impl FnOnce(&mut FaultSubsystem) -> R) -> R {
+        // Stage 3B-A helper-only split mutation: use only fault_state_lock and
+        // mutate only diagnostic fault bookkeeping. Do not acquire the outer
+        // SharedKernel lock and do not touch current_cpu or other subsystems.
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by
+        // this SharedKernel. `fault_split_mut_ptrs_from_raw` derives raw field
+        // pointers without creating a whole-KernelState reference; the fault
+        // lock serializes access to the fault subsystem storage.
+        let (fault_state_lock, faults) =
+            unsafe { KernelState::fault_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let fault_state_lock = unsafe { &*fault_state_lock };
+        let _guard = fault_state_lock.lock();
+        let faults = unsafe { &mut *faults };
+        f(kernel_mut(faults))
+    }
+
+    pub fn record_fault_split_mut(&self, fault: FaultInfo) {
+        self.with_fault_split_mut(|faults| faults.last_fault = Some(fault));
+    }
+
+    pub fn record_fault_frame_snapshot_split_mut(&self, frame: &TrapFrame) {
+        self.with_fault_split_mut(|faults| faults.last_fault_frame = Some(frame.clone()));
+    }
+
+    pub fn clear_last_fault_split_mut(&self) {
+        self.with_fault_split_mut(|faults| {
+            faults.last_fault = None;
+            faults.last_fault_frame = None;
+        });
     }
 
     pub fn ipc_recv_with_deadline_split_bridge(
@@ -246,6 +278,44 @@ mod tests {
 
         assert_eq!(kernel.capacity_profile_split_read(), profile);
         assert_eq!(kernel.runtime_capacity_config_split_read(), config);
+    }
+
+    #[test]
+    fn fault_bookkeeping_split_mut_helpers_match_kernel_state_accessors() {
+        use crate::kernel::trap::FaultAccess;
+        use crate::kernel::vm::VirtAddr;
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let fault = FaultInfo {
+            addr: VirtAddr(0xdead_beef),
+            access: FaultAccess::Write,
+        };
+        let mut frame = TrapFrame::new(11, [1, 2, 3, 4, 5, 6]);
+        frame.set_saved_pc(0x4000);
+        frame.set_saved_sp(0x8000);
+
+        kernel.record_fault_split_mut(fault);
+        assert_eq!(kernel.with(|state| state.last_fault()), Some(fault));
+
+        kernel.record_fault_frame_snapshot_split_mut(&frame);
+        assert_eq!(
+            kernel.with(|state| state.last_fault_frame()),
+            Some(frame.clone())
+        );
+
+        kernel.clear_last_fault_split_mut();
+        assert_eq!(kernel.with(|state| state.last_fault()), None);
+        assert_eq!(kernel.with(|state| state.last_fault_frame()), None);
+
+        kernel.with(|state| {
+            state.record_fault(fault);
+            state.record_fault_frame_snapshot(&frame);
+            assert_eq!(state.last_fault(), Some(fault));
+            assert_eq!(state.last_fault_frame(), Some(frame.clone()));
+            state.clear_last_fault();
+            assert_eq!(state.last_fault(), None);
+            assert_eq!(state.last_fault_frame(), None);
+        });
     }
 
     #[test]
