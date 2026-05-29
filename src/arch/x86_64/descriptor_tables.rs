@@ -271,6 +271,8 @@ static STAGE2N_FIRST_TRAP_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static STAGE2N_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const X86_TID_SPLIT_READ_DIAG: bool = false;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_DATA_PORT: u16 = 0x3F8;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_LINE_STATUS_PORT: u16 = 0x3FD;
@@ -820,6 +822,16 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         let entering_tid: Option<u64> = shared
             .with_cpu(cpu, |k| k.current_tid())
             .unwrap_or(None);
+        if X86_TID_SPLIT_READ_DIAG {
+            let entering_split_tid = shared.current_tid_split_read(cpu);
+            if entering_split_tid != entering_tid {
+                crate::yarm_log!(
+                    "YARM_LOCK_SPLIT_CURRENT_TID_MISMATCH arch=x86_64 phase=enter conservative={:?} split={:?}",
+                    entering_tid,
+                    entering_split_tid
+                );
+            }
+        }
         let mut trap_frame =
             unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
         if let Err(err) = crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
@@ -844,6 +856,16 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         let exiting_tid: Option<u64> = shared
             .with_cpu(cpu, |k| k.current_tid())
             .unwrap_or(None);
+        if X86_TID_SPLIT_READ_DIAG {
+            let exiting_split_tid = shared.current_tid_split_read(cpu);
+            if exiting_split_tid != exiting_tid {
+                crate::yarm_log!(
+                    "YARM_LOCK_SPLIT_CURRENT_TID_MISMATCH arch=x86_64 phase=exit conservative={:?} split={:?}",
+                    exiting_tid,
+                    exiting_split_tid
+                );
+            }
+        }
         let task_switched = entering_tid != exiting_tid;
         if task_switched {
             write_task_gprs_to_saved_regs(regs, &trap_frame);

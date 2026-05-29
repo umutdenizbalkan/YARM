@@ -662,6 +662,28 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock still protects mutation paths. This is not
   Stage 3/global-lock removal.
 
+### Phase L5B: current-TID split-read diagnostic comparison (diagnostic-only)
+
+- L5A production use remains rolled back: x86_64 shared trap task-switch
+  detection continues to use the conservative `shared.with_cpu(cpu, |k|
+  k.current_tid())` snapshots for `entering_tid` and `exiting_tid`.
+- `SharedKernel::current_tid_split_read(cpu)` is still staged but is not used
+  for production task-switch decisions or register writeback selection.
+- Added an x86_64-local diagnostic gate, `X86_TID_SPLIT_READ_DIAG`, defaulting
+  to `false`. When explicitly enabled for investigation, the trap path compares
+  the conservative snapshot with the split-read snapshot and logs only on
+  mismatch:
+  - `YARM_LOCK_SPLIT_CURRENT_TID_MISMATCH arch=x86_64 phase=enter ...`
+  - `YARM_LOCK_SPLIT_CURRENT_TID_MISMATCH arch=x86_64 phase=exit ...`
+- Normal production smoke does not emit these mismatch markers because the gate
+  is disabled by default.
+- Purpose: diagnose why the split-read TID snapshot did not preserve the x86_64
+  register writeback decision path, without changing production behavior.
+- AArch64 behavior is unchanged. x86_64 SMP remains out of scope and
+  `src/arch/x86_64/smp.rs` is not touched.
+- The global `SharedKernel` lock still protects mutation paths. This is not
+  Stage 3/global-lock removal.
+
 ### Stage 3: remove global lock from syscall fast path
 
 
