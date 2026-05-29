@@ -230,6 +230,38 @@ if ! check_log_sequence "$LOGFILE" "${SPAWN_IPC_SEQUENCE[@]}"; then
 fi
 
 # ---------------------------------------------------------------------------
+# SharedKernel-primary trap ownership proof markers (Stage 2N / x86_64 -smp 1).
+# Installed and first-shared-trap markers must appear once; fallback must be absent.
+# ---------------------------------------------------------------------------
+if [[ -f "$LOGFILE" ]]; then
+  STAGE2N_INSTALLED=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=x86_64 shared=1 raw=0" 2>/dev/null || echo 0)
+  STAGE2N_FIRST=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=x86_64" 2>/dev/null || echo 0)
+  STAGE2N_FALLBACK=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_LOCK_SPLIT_STAGE2N_FALLBACK arch=x86_64" 2>/dev/null || echo 0)
+  if [[ "$STAGE2N_INSTALLED" -eq 1 ]]; then
+    echo "[ok] Stage2N: x86_64 installed shared trap state count=1"
+  else
+    echo "[warn] Stage2N: x86_64 installed marker count=${STAGE2N_INSTALLED} (expected 1)"
+    stage2n_fail=1
+  fi
+  if [[ "$STAGE2N_FIRST" -eq 1 ]]; then
+    echo "[ok] Stage2N: x86_64 first shared trap count=1"
+  else
+    echo "[warn] Stage2N: x86_64 first shared trap count=${STAGE2N_FIRST} (expected 1)"
+    stage2n_fail=1
+  fi
+  if [[ "$STAGE2N_FALLBACK" -eq 0 ]]; then
+    echo "[ok] Stage2N: x86_64 fallback count=0"
+  else
+    echo "[warn] Stage2N: x86_64 fallback count=${STAGE2N_FALLBACK} (expected 0)"
+    stage2n_fail=1
+  fi
+  if [[ "${stage2n_fail:-0}" -eq 1 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
+    echo "[error] strict x86_64 smoke: Stage2N SharedKernel-primary marker check failed"
+    exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Service entry count check.
 # Each of the six services must appear EXACTLY ONCE in the log.
 # ---------------------------------------------------------------------------

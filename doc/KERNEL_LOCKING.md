@@ -9,14 +9,15 @@ remove implicit global-lock coupling from syscall/trap paths.
 
 - `SharedKernel` global lock (`SpinLock<KernelState>`) still exists and remains
   the top-level serialization boundary where that runtime path is used.
-- Runtime lock behavior has **not** been decomposed yet; stages so far are
-  scaffolding/documentation-only.
+- Runtime mutation paths still retain the global `SharedKernel` lock, but
+  narrow split-read staging is active where explicitly documented below
+  (for example recv-timeout deadline pre-read on SharedKernel trap paths).
 - Debug lock-order tracking is hosted-dev + debug-assertions only and is
   non-fatal/report-only (`YARM_LOCK_ORDER_WARN ...`).
 - Non-hosted `no_std` lock-rank tracking is currently placeholder-only until a
   safe per-CPU/per-thread debug-local slot is introduced.
-- Next future step should be a **single narrow behavior-changing Stage 2 split**
-  (not broad decomposition in one pass).
+- Future work must remain narrow and independently validated; this document
+  does **not** claim Stage 3/global-lock removal.
 
 ## 1) Current global lock boundary (`SharedKernel`)
 
@@ -376,14 +377,19 @@ handled via a dedicated helper with clear lock-contract comments.
 - Per-ISA status: aarch64 migrated (L2B); x86_64 migrated (Option A); riscv64 not applicable yet under current ownership shape.
 
 
-#### Stage 2N AArch64 activation status
+#### Stage 2N AArch64 activation status (historical pre-L2B note)
 
-- `trap_shared_kernel()` returned `None` in validation runs because the aarch64 bootstrap path installs only `trap_kernel_state_mut` (`&mut KernelState`) from `Bootstrap::init_static()` and does not currently materialize a long-lived `SharedKernel` instance at that same point.
-- `install_trap_shared_kernel(...)` is present as a seam, but there is no safe same-point `SharedKernel` object to install yet without changing ownership/lifetime of the boot kernel object.
-- Therefore Stage 2N remains fallback-active on aarch64 for now: shared-dispatch branch is attempted first, then fallback `trap_kernel_state_mut()` path is used when shared pointer is absent.
+- Early Stage 2N validation runs observed `trap_shared_kernel() == None` because
+  the then-current AArch64 bootstrap path installed only `trap_kernel_state_mut`
+  (`&mut KernelState`) from `Bootstrap::init_static()`.
+- That fallback-active status is superseded by Phase L2B below: AArch64
+  production boot now materializes a long-lived `SharedKernel`, installs it with
+  `install_trap_shared_kernel(shared)`, and uses the shared-dispatch branch from
+  the first trap entry onward.
 - Marker behavior remains correct:
   - shared marker on shared-path use
-  - fallback marker only when fallback is actually used.
+  - fallback marker only when fallback is actually used; it must be absent in
+    current AArch64 SharedKernel-primary smoke.
 
 
 #### Stage 2N final status (Phase L2B complete)

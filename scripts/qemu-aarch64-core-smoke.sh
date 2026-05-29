@@ -188,14 +188,14 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     fi
   fi
 
-  # Phase 2B freeze: Phase 2A fallback must be zero (mode=vfs_transfer is the only
-  # accepted bulk-read path; Phase 2A bridge is the emergency fallback only).
+  # Phase 3B zero-copy freeze: Phase 2A fallback must be zero; late service
+  # spawns should use MemoryObject zero-copy instead of bulk VFS reads.
   if [[ -f "$LOGFILE" ]]; then
     PHASE2A_FALLBACK=$(log_count_pattern "PM_VFS_READ_BULK_PHASE2A_BEGIN")
     if [[ "$PHASE2A_FALLBACK" -eq 0 ]]; then
-      echo "[ok] Phase 2A bridge not triggered (PM_VFS_READ_BULK_PHASE2A_BEGIN=0) — Phase 2B active"
+      echo "[ok] Phase 3B: PM_VFS_READ_BULK_PHASE2A_BEGIN=0 (bulk bridge inactive)"
     else
-      echo "[warn] Phase 2A bridge triggered: PM_VFS_READ_BULK_PHASE2A_BEGIN=${PHASE2A_FALLBACK} (expected 0 in Phase 2B freeze)"
+      echo "[warn] Phase 3B: PM_VFS_READ_BULK_PHASE2A_BEGIN=${PHASE2A_FALLBACK} (expected 0; bulk bridge active)"
       [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
     fi
   fi
@@ -218,7 +218,7 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     BULK_DONE_VFS=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE.*mode=vfs_transfer" 2>/dev/null || echo 0)
     BULK_DONE_2A=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_READ_BULK_DONE.*mode=phase2a_bridge" 2>/dev/null || echo 0)
     echo "[ok] Phase 3B summary: PM_ELF_ZC_DONE total=${ZC_DONE_TOTAL} zc_pages>0 count=${ZC_NONZERO_TOTAL}"
-    echo "[ok] Phase 2B residual: bulk_done_vfs=${BULK_DONE_VFS} bulk_done_phase2a=${BULK_DONE_2A} (both must be 0)"
+    echo "[ok] Phase 3B bulk-read residual: bulk_done_vfs=${BULK_DONE_VFS} bulk_done_phase2a=${BULK_DONE_2A} (both must be 0)"
     if [[ "$ZC_DONE_TOTAL" -lt 3 && "$QEMU_SMOKE_STRICT" == "1" ]]; then
       echo "[error] Phase 3B: expected PM_ELF_ZC_DONE>=3 got=${ZC_DONE_TOTAL}"
       exit 1
@@ -229,15 +229,40 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     fi
   fi
 
-  # Phase 2B freeze: verify absent hot-path markers.
+  # SharedKernel-primary trap ownership proof markers (Stage 2N / L2B).
+  # Installed and first-shared-trap markers must appear once; fallback must be absent.
+  if [[ -f "$LOGFILE" ]]; then
+    STAGE2N_INSTALLED=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=aarch64 shared=1 raw=0" 2>/dev/null || echo 0)
+    STAGE2N_FIRST=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=aarch64" 2>/dev/null || echo 0)
+    STAGE2N_FALLBACK=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "YARM_LOCK_SPLIT_STAGE2N_FALLBACK arch=aarch64" 2>/dev/null || echo 0)
+    if [[ "$STAGE2N_INSTALLED" -eq 1 ]]; then
+      echo "[ok] Stage2N: AArch64 installed shared trap state count=1"
+    else
+      echo "[warn] Stage2N: AArch64 installed marker count=${STAGE2N_INSTALLED} (expected 1)"
+      [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    fi
+    if [[ "$STAGE2N_FIRST" -eq 1 ]]; then
+      echo "[ok] Stage2N: AArch64 first shared trap count=1"
+    else
+      echo "[warn] Stage2N: AArch64 first shared trap count=${STAGE2N_FIRST} (expected 1)"
+      [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    fi
+    if [[ "$STAGE2N_FALLBACK" -eq 0 ]]; then
+      echo "[ok] Stage2N: AArch64 fallback count=0"
+    else
+      echo "[warn] Stage2N: AArch64 fallback count=${STAGE2N_FALLBACK} (expected 0)"
+      [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    fi
+  fi
+
+  # Phase 3B freeze: verify absent hot-path markers.
   # The following MUST NOT appear in default logs:
-  #   - PM_VFS_READ_APPEND / COPY_TO_USER_PAGE / YARM_LOCK_SPLIT_STAGE2N: old inline path
+  #   - PM_VFS_READ_APPEND / COPY_TO_USER_PAGE: old inline copy path
   #   - VFS_FORWARD_BULK_READ / VFS_ROUTE_BULK_REPLY: trace-gated (VFS_BULK_READ_TRACE=false)
   #   - INITRAMFS_READ_BULK / INITRAMFS_READ_BULK_REPLY: trace-gated (INITRAMFS_READ_BULK_TRACE=false)
   ABSENT_MARKERS=(
     PM_VFS_READ_APPEND
     COPY_TO_USER_PAGE
-    YARM_LOCK_SPLIT_STAGE2N
     VFS_FORWARD_BULK_READ
     VFS_ROUTE_BULK_REPLY
     INITRAMFS_READ_BULK
