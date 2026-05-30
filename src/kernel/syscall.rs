@@ -1319,15 +1319,64 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         .map_err(|_| SyscallError::InvalidArgs)?
     };
 
-    if let Err(err) = kernel.ipc_send(cap, msg) {
-        if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
-            let _ = kernel.take_transfer_envelope(
-                handle,
-                endpoint,
-                crate::kernel::ipc::ThreadId(current_tid(kernel)?),
-            );
+    // Stage 4L: IpcCall to a recv-v2 blocked receiver — complete delivery outside
+    // ipc_state_lock using the same Phase 1-5 protocol as Stage 4K (IpcSend).
+    // ipc_try_send_queued_plain_endpoint_only returns ReceiverWaiterFound for
+    // FLAG_REPLY_CAP messages when a receiver waiter is present (the flag check
+    // only applies to the no-waiter enqueue path). complete_blocked_recv_for_waiter
+    // handles FLAG_REPLY_CAP via materialize_received_message_cap.
+    let call_split_wake = {
+        match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
+            IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
+                let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
+                if is_recv_v2 {
+                    // Phase 3: complete delivery outside ipc_state_lock.
+                    match complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg) {
+                        Ok(()) => {
+                            // Phase 4: clear waiter slot under ipc_state_lock.
+                            kernel.ipc_clear_plain_receiver_waiter_only(
+                                endpoint_idx,
+                                receiver_tid,
+                            );
+                            kernel.note_ipc_call_split_delivery();
+                            crate::yarm_log!(
+                                "IPC_CALL_SPLIT_DELIVERY tid={} receiver={} endpoint={}",
+                                sender_tid,
+                                receiver_tid.0,
+                                endpoint_idx
+                            );
+                            Some(receiver_tid)
+                        }
+                        Err(e) => {
+                            if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
+                                let _ = kernel.take_transfer_envelope(
+                                    handle,
+                                    endpoint,
+                                    crate::kernel::ipc::ThreadId(sender_tid),
+                                );
+                            }
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
-        return Err(SyscallError::from(err));
+    };
+
+    if call_split_wake.is_none() {
+        if let Err(err) = kernel.ipc_send(cap, msg) {
+            if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
+                let _ = kernel.take_transfer_envelope(
+                    handle,
+                    endpoint,
+                    crate::kernel::ipc::ThreadId(current_tid(kernel)?),
+                );
+            }
+            return Err(SyscallError::from(err));
+        }
     }
     crate::yarm_log!(
         "IPC_CALL_SENT_OR_QUEUED tid={} endpoint={}",
@@ -1338,6 +1387,10 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     // receives replies via an explicit recv on reply_recv_cap (ipc_recv_v2 /
     // ipc_recv_with_deadline), so the call syscall must not consume/decode reply
     // payload bytes here.
+    // Phase 5: wake receiver outside ipc_state_lock.
+    if let Some(recv_tid) = call_split_wake {
+        let _ = kernel.apply_split_receiver_wake_plan(recv_tid);
+    }
     frame.set_ok(0, 0, 0);
     encode_transfer_cap_ret(frame, None)?;
     Ok(())

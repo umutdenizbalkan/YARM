@@ -8875,3 +8875,139 @@ fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
         .expect("read receiver payload");
     assert_eq!(&payload[..6], b"4kstg\0", "Stage 4K must write payload to receiver user memory");
 }
+
+#[test]
+fn ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
+    std::thread::Builder::new()
+        .name("ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
+    // Stage 4L: IpcCall where the receiver is already blocked in a recv-v2 operation.
+    // The FLAG_REPLY_CAP message is delivered directly via complete_blocked_recv_for_waiter
+    // (outside ipc_state_lock), the waiter slot is cleared under ipc_state_lock, and the
+    // receiver is woken — without the message touching the endpoint queue.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    state.enqueue_current_cpu(1).expect("enqueue receiver");
+
+    // endpoint_A: task 0 sends via IpcCall, task 1 receives
+    let (endpoint_idx, send_cap_a, recv_cap_a) = state.create_endpoint(2).expect("endpoint_A");
+    let recv_cap_a_task1 = state
+        .grant_capability_task_to_task(0, recv_cap_a, 1)
+        .expect("grant recv_cap_A to task 1");
+
+    // endpoint_B: reply channel — task 0 holds the RECEIVE cap (reply_recv_cap)
+    let (_reply_eidx, _reply_send_b, reply_recv_cap_b) =
+        state.create_endpoint(2).expect("endpoint_B reply");
+
+    // Set up user memory for task 1 (recv-v2 needs: payload page + meta page).
+    let (asid1, aspace_map_cap1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind task1 asid");
+    let payload_ptr = 0x3000usize;
+    let meta_ptr = 0x4000usize;
+    state
+        .map_user_page(
+            aspace_map_cap1,
+            VirtAddr(payload_ptr as u64),
+            Mapping { phys: PhysAddr(0x9000), flags: PageFlags::USER_RW },
+        )
+        .expect("map payload page");
+    state
+        .map_user_page(
+            aspace_map_cap1,
+            VirtAddr(meta_ptr as u64),
+            Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW },
+        )
+        .expect("map meta page");
+
+    // Switch to task 1 — queue is empty so IpcRecv (recv-v2) blocks.
+    state.yield_current().expect("switch to task 1");
+    assert_eq!(state.current_tid(), Some(1));
+
+    let mut recv_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [
+            recv_cap_a_task1.0 as usize,  // arg[0] = recv cap
+            payload_ptr,                    // arg[1] = payload_ptr
+            Message::MAX_PAYLOAD,           // arg[2] = payload_len
+            meta_ptr,                       // arg[3] = meta_ptr (>0 → recv-v2)
+            40,                             // arg[4] = meta_len (≥40 → recv-v2)
+            0,
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut recv_frame)).expect("recv blocks");
+    assert_eq!(state.current_tid(), Some(0), "task 0 must be current after task 1 blocks");
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_a_task1))),
+        "task 1 must be blocked on recv"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        Some(ThreadId(1)),
+        "task 1 must be registered as endpoint waiter"
+    );
+
+    // Task 0 issues IpcCall — Stage 4L should fire.
+    let before_split = state.ipc_path_telemetry().ipc_call_split_deliveries;
+
+    // len=0: no application payload; avoids inline-opcode-prefix stripping complexity.
+    let mut call_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcCall as usize,
+        [
+            send_cap_a.0 as usize,          // arg[0] = endpoint send cap
+            0,                               // arg[1] = user_ptr (0 = inline payload path)
+            0,                               // arg[2] = payload len = 0
+            0,                               // arg[3] = inline payload word 0
+            0,                               // arg[4] = inline payload word 1
+            reply_recv_cap_b.0 as usize,    // arg[5] = reply_recv_cap
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut call_frame)).expect("ipc call Stage 4L");
+
+    assert_eq!(call_frame.error_code(), None, "Stage 4L IpcCall must succeed");
+
+    // Receiver must be woken to Runnable.
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Runnable),
+        "receiver must be Runnable after Stage 4L direct delivery"
+    );
+    // Waiter slot must be cleared.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        "endpoint waiter slot must be cleared after Stage 4L"
+    );
+    // Message must NOT be in the endpoint queue (delivered directly to recv-v2 buffer).
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        0,
+        "Stage 4L must deliver directly, not enqueue"
+    );
+    // Telemetry must record the split IpcCall delivery.
+    assert_eq!(
+        state.ipc_path_telemetry().ipc_call_split_deliveries,
+        before_split + 1,
+        "Stage 4L must increment ipc_call_split_deliveries"
+    );
+    // meta[24..32] must contain SYSCALL_RECV_META_REPLY_CAP (bit 0 set) written by
+    // complete_blocked_recv_for_waiter when FLAG_REPLY_CAP is present.
+    let meta = state
+        .read_user_memory_for_asid(asid1, meta_ptr, 40)
+        .expect("read receiver meta");
+    let recv_meta_flags = u64::from_le_bytes(meta[24..32].try_into().expect("flags"));
+    assert_ne!(
+        recv_meta_flags & (crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64),
+        0,
+        "Stage 4L must set SYSCALL_RECV_META_REPLY_CAP in meta[24..32]"
+    );
+    // meta[32..40] must contain the sender tid (task 0 = 0).
+    let sender_in_meta = u64::from_le_bytes(meta[32..40].try_into().expect("sender"));
+    assert_eq!(sender_in_meta, 0, "Stage 4L meta must record sender tid=0");
+}
