@@ -2,8 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::{
-    IpcEndpointRecvResult, IpcEndpointSplitRejectReason, IpcFastpathResult, KernelError,
-    KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, NotificationObject,
+    IpcEndpointRecvResult, IpcEndpointSendResult, IpcEndpointSplitRejectReason,
+    IpcFastpathResult, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
+    NotificationObject,
     ReplyCapRecord, SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
@@ -405,6 +406,62 @@ impl KernelState {
                     .recv()
                     .expect("peeked plain endpoint message must remain queued"),
             )
+        })
+    }
+
+    pub(crate) fn ipc_try_send_queued_plain_endpoint_only(
+        &mut self,
+        endpoint_idx: usize,
+        msg: Message,
+    ) -> IpcEndpointSendResult {
+        self.with_ipc_state_mut(|ipc| {
+            if endpoint_idx >= ipc.endpoints.len() {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+                );
+            }
+            if ipc.endpoint_waiters[endpoint_idx].is_some() {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
+                );
+            }
+            if ipc.endpoint_sender_waiters[endpoint_idx]
+                .iter()
+                .any(Option::is_some)
+            {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
+                );
+            }
+
+            let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
+                | Message::FLAG_CAP_TRANSFER_PLAIN
+                | Message::FLAG_REPLY_CAP;
+            if (msg.flags & split_unsafe_flags) != 0 || msg.transferred_cap().is_some() {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+                );
+            }
+
+            let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::EndpointMissing,
+                );
+            };
+            let endpoint = kernel_mut(endpoint_storage);
+            if endpoint.mode() != EndpointMode::Buffered {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+                );
+            }
+
+            if endpoint.send(msg).is_err() {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::EndpointQueueFull,
+                );
+            }
+
+            IpcEndpointSendResult::Enqueued
         })
     }
 
@@ -1120,6 +1177,10 @@ impl KernelState {
         self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
+    }
+
+    pub(crate) fn note_endpoint_only_queued_send_split(&mut self) {
+        self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
     }
 
     fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {

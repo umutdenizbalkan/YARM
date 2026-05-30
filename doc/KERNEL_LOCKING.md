@@ -889,6 +889,26 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock remains retained for all other production IPC
   mutation. This is not full global-lock removal.
 
+### Stage 4E: strict plain send enqueue live IPC endpoint split
+
+- Live `IpcSend` now tries the IPC endpoint-domain send helper only after send
+  capability validation, endpoint identity/generation resolution, current-TID
+  lookup, user-memory or inline payload construction, and message construction.
+  The live split is limited to a buffered endpoint with queue capacity, no
+  receiver waiter, no sender waiter, no timeout/deadline, no transfer-cap
+  argument, no transfer/reply-cap flags, and no transferred-cap handle.
+- The split helper mutates only the endpoint queue through
+  `KernelState::ipc_try_send_queued_plain_endpoint_only(...)`; queued-send
+  telemetry is recorded after a successful split to preserve existing
+  diagnostics, and syscall `TrapFrame` writes remain outside the endpoint
+  helper.
+- Every ineligible case falls back to the existing full IPC send path. Receiver
+  direct delivery, recv-v2 blocked completion, sender blocking, timeout/deadline
+  handling, cap-transfer, reply-cap, shared-memory transfer, call, reply, recv,
+  notification, scheduler/TCB, VM, VFS, and Phase 3B behavior are unchanged.
+- The global `SharedKernel` lock remains retained for all other production IPC
+  mutation. This is not full global-lock removal.
+
 ### Stage 3: remove global lock from syscall fast path
 
 

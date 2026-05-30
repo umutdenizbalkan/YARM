@@ -2,7 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::boot::{
-    IpcEndpointRecvResult, KernelError, KernelState, MemoryObjectKind, TransferSharedRegion,
+    IpcEndpointRecvResult, IpcEndpointSendResult, KernelError, KernelState, MemoryObjectKind,
+    TransferSharedRegion,
 };
 use super::capabilities::{CapId, CapObject, CapRights, Capability};
 use super::ipc::{
@@ -894,7 +895,28 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         Err(err) => return Err(err),
     };
 
-    let send_result = if send_timeout_ticks == 0 {
+    let split_send_result = if send_timeout_ticks == 0 && transfer_cap.is_none() {
+        match endpoint {
+            CapObject::Endpoint { .. } => {
+                let endpoint_idx = kernel
+                    .resolve_endpoint_index(endpoint)
+                    .map_err(SyscallError::from)?;
+                match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
+                    IpcEndpointSendResult::Enqueued => {
+                        kernel.note_endpoint_only_queued_send_split();
+                        Some(Ok(()))
+                    }
+                    IpcEndpointSendResult::Ineligible(_) => None,
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let send_result = if let Some(send_result) = split_send_result {
+        send_result
+    } else if send_timeout_ticks == 0 {
         kernel.ipc_send(cap, msg)
     } else {
         kernel.ipc_send_with_deadline(cap, msg, send_timeout_ticks)

@@ -2378,6 +2378,344 @@ fn map_ipc_recv_syscall_buffers_for_task(
 }
 
 #[test]
+fn endpoint_only_plain_send_enqueues_without_scheduler_mutation() {
+    std::thread::Builder::new()
+        .name("endpoint_only_plain_send_enqueues_without_scheduler_mutation".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_endpoint_only_plain_send_enqueues_without_scheduler_mutation)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_endpoint_only_plain_send_enqueues_without_scheduler_mutation() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let before_tid = state.current_tid();
+    let before_status = state.task_status(0);
+    let before_telemetry = state.ipc_path_telemetry();
+
+    let msg = Message::new(7, b"plain-send").expect("plain msg");
+    assert_eq!(
+        state.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg),
+        IpcEndpointSendResult::Enqueued
+    );
+
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1
+    );
+    assert_eq!(state.current_tid(), before_tid);
+    assert_eq!(state.task_status(0), before_status);
+    assert_eq!(state.ipc_path_telemetry().queued_sends, before_telemetry.queued_sends);
+
+    let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+    assert_eq!(received.sender_tid, ThreadId(7));
+    assert_eq!(received.as_slice(), b"plain-send");
+}
+
+#[test]
+fn endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue() {
+    std::thread::Builder::new()
+        .name("endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    state.enqueue_current_cpu(1).expect("enqueue receiver");
+    let (receiver_waiter_idx, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv cap");
+    state.yield_current().expect("run receiver");
+    assert_eq!(state.current_tid(), Some(1));
+    assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
+    assert_eq!(
+        state.ipc_try_send_queued_plain_endpoint_only(
+            receiver_waiter_idx,
+            Message::new(0, b"waiter").expect("msg"),
+        ),
+        IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::ReceiverWaiterPresent)
+    );
+
+    let mut sender_waiter_state = Bootstrap::init_boxed().expect("sender waiter init");
+    sender_waiter_state.register_task(1).expect("register sender2");
+    sender_waiter_state.enqueue_current_cpu(1).expect("enqueue sender2");
+    let (sender_waiter_idx, send_cap, _recv_cap) =
+        sender_waiter_state.create_endpoint(1).expect("endpoint");
+    sender_waiter_state
+        .ipc_send(send_cap, Message::new(0, b"first").expect("first"))
+        .expect("queue first");
+    assert_eq!(
+        sender_waiter_state.ipc_send(send_cap, Message::new(0, b"second").expect("second")),
+        Err(KernelError::WouldBlock)
+    );
+    assert_eq!(
+        sender_waiter_state.ipc_try_send_queued_plain_endpoint_only(
+            sender_waiter_idx,
+            Message::new(1, b"third").expect("third"),
+        ),
+        IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::SenderWaiterPresent)
+    );
+
+    let mut transfer_state = Bootstrap::init_boxed().expect("transfer init");
+    let (transfer_idx, _send_cap, _recv_cap) = transfer_state.create_endpoint(2).expect("endpoint");
+    for flags in [
+        Message::FLAG_CAP_TRANSFER,
+        Message::FLAG_CAP_TRANSFER_PLAIN,
+        Message::FLAG_REPLY_CAP,
+    ] {
+        let msg = Message::with_header(0, 0x55, flags, Some(99), b"cap")
+            .expect("flagged msg");
+        assert_eq!(
+            transfer_state.ipc_try_send_queued_plain_endpoint_only(transfer_idx, msg),
+            IpcEndpointSendResult::Ineligible(
+                IpcEndpointSplitRejectReason::TransferOrReplyCapMessage
+            )
+        );
+        assert_eq!(
+            transfer_state
+                .with_ipc_state(|ipc| ipc.endpoints[transfer_idx].as_ref().unwrap().queued()),
+            0,
+            "rejected transfer/reply message must not be queued by the endpoint helper"
+        );
+    }
+
+    let mut full_state = Bootstrap::init_boxed().expect("full init");
+    let (full_idx, _send_cap, _recv_cap) = full_state.create_endpoint(1).expect("endpoint");
+    assert_eq!(
+        full_state.ipc_try_send_queued_plain_endpoint_only(
+            full_idx,
+            Message::new(0, b"one").expect("one"),
+        ),
+        IpcEndpointSendResult::Enqueued
+    );
+    assert_eq!(
+        full_state.ipc_try_send_queued_plain_endpoint_only(
+            full_idx,
+            Message::new(0, b"two").expect("two"),
+        ),
+        IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::EndpointQueueFull)
+    );
+    assert_eq!(
+        full_state.with_ipc_state(|ipc| ipc.endpoints[full_idx].as_ref().unwrap().queued()),
+        1,
+        "full-queue rejection must not mutate endpoint depth"
+    );
+}
+
+fn inline_payload_word(bytes: &[u8]) -> usize {
+    let mut lane = [0u8; core::mem::size_of::<usize>()];
+    lane[..bytes.len()].copy_from_slice(bytes);
+    usize::from_le_bytes(lane)
+}
+
+#[test]
+fn ipc_send_syscall_uses_endpoint_only_plain_enqueue_branch() {
+    std::thread::Builder::new()
+        .name("ipc_send_syscall_uses_endpoint_only_plain_enqueue_branch".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_send_syscall_uses_endpoint_only_plain_enqueue_branch)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_send_syscall_uses_endpoint_only_plain_enqueue_branch() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let before_tid = state.current_tid();
+    let before_status = state.task_status(0);
+
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcSend as usize,
+        [
+            send_cap.0 as usize,
+            0,
+            4,
+            inline_payload_word(b"send"),
+            0,
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc send syscall");
+
+    assert_eq!(frame.error_code(), None);
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1
+    );
+    assert_eq!(state.current_tid(), before_tid);
+    assert_eq!(state.task_status(0), before_status);
+    assert_eq!(state.ipc_path_telemetry().queued_sends, 1);
+
+    let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+    assert_eq!(received.sender_tid, ThreadId(0));
+    assert_eq!(received.as_slice(), b"send");
+}
+
+#[test]
+fn ipc_send_syscall_receiver_waiter_falls_back_to_full_path() {
+    std::thread::Builder::new()
+        .name("ipc_send_syscall_receiver_waiter_falls_back_to_full_path".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_send_syscall_receiver_waiter_falls_back_to_full_path)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_send_syscall_receiver_waiter_falls_back_to_full_path() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    state.enqueue_current_cpu(1).expect("enqueue receiver");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv cap");
+    state.yield_current().expect("run receiver");
+    assert_eq!(state.current_tid(), Some(1));
+    assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
+    assert_eq!(state.current_tid(), Some(0));
+
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcSend as usize,
+        [
+            send_cap.0 as usize,
+            0,
+            4,
+            inline_payload_word(b"wake"),
+            0,
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc send syscall");
+
+    assert_eq!(frame.error_code(), None);
+    assert_eq!(state.task_status(1), Some(TaskStatus::Runnable));
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1,
+        "fallback full path must queue for the waiting receiver"
+    );
+    let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+    assert_eq!(received.as_slice(), b"wake");
+}
+
+#[test]
+fn ipc_send_syscall_sender_waiter_and_full_queue_fall_back_to_full_path() {
+    std::thread::Builder::new()
+        .name("ipc_send_syscall_sender_waiter_and_full_queue_fall_back_to_full_path".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_send_syscall_sender_waiter_and_full_queue_fall_back_to_full_path)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_send_syscall_sender_waiter_and_full_queue_fall_back_to_full_path() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register sender2");
+    state.enqueue_current_cpu(1).expect("enqueue sender2");
+    let (endpoint_idx, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+    let send_cap_task1 = state
+        .grant_capability_task_to_task(0, send_cap, 1)
+        .expect("grant send cap");
+
+    state
+        .ipc_send(send_cap, Message::new(0, b"one").expect("one"))
+        .expect("queue first");
+    assert_eq!(
+        state.ipc_send(send_cap, Message::new(0, b"two").expect("two")),
+        Err(KernelError::WouldBlock)
+    );
+    assert_eq!(state.current_tid(), Some(1));
+    assert_eq!(
+        state.task_status(0),
+        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+    );
+
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcSend as usize,
+        [
+            send_cap_task1.0 as usize,
+            0,
+            5,
+            inline_payload_word(b"three"),
+            0,
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc send syscall should block through full path");
+
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap_task1)))
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1,
+        "full-path blocked send must leave the original queued message in place"
+    );
+}
+
+#[test]
+fn ipc_send_syscall_transfer_message_falls_back_to_full_path() {
+    std::thread::Builder::new()
+        .name("ipc_send_syscall_transfer_message_falls_back_to_full_path".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_send_syscall_transfer_message_falls_back_to_full_path)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_send_syscall_transfer_message_falls_back_to_full_path() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let (_mem_id, transfer_cap) = state
+        .create_memory_object(PhysAddr(0xCA000))
+        .expect("memory object");
+
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcSend as usize,
+        [
+            send_cap.0 as usize,
+            0,
+            2,
+            inline_payload_word(b"tx"),
+            0,
+            transfer_cap.0 as usize,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc send syscall");
+
+    assert_eq!(frame.error_code(), None);
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1,
+        "fallback full path must queue transfer-bearing messages"
+    );
+    let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+    assert_ne!(received.transferred_cap().map(|c| c.0), None);
+    assert_eq!(received.as_slice(), b"tx");
+}
+
+#[test]
 fn ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mutation() {
     std::thread::Builder::new()
         .name("ipc_recv_syscall_uses_endpoint_only_plain_queued_branch".into())

@@ -89,6 +89,7 @@ pub(crate) enum IpcEndpointSplitRejectReason {
     ReceiverWaiterPresent,
     SenderWaiterPresent,
     TransferOrReplyCapMessage,
+    EndpointQueueFull,
 }
 
 #[allow(dead_code)]
