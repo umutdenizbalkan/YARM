@@ -2528,6 +2528,7 @@ fn run_ipc_recv_timeout_try_recv_uses_split_path() {
         .expect("queue");
     let before_tid = state.current_tid();
     let before_status = state.task_status(0);
+    let before_queued_recvs = state.ipc_path_telemetry().queued_recvs;
 
     let payload_ptr = 0x3000usize;
     let meta_ptr = 0x4000usize;
@@ -2567,6 +2568,11 @@ fn run_ipc_recv_timeout_try_recv_uses_split_path() {
     );
     assert_eq!(state.current_tid(), before_tid);
     assert_eq!(state.task_status(0), before_status);
+    assert_eq!(
+        state.ipc_path_telemetry().queued_recvs,
+        before_queued_recvs + 1,
+        "Stage 4G split path must increment queued_recvs telemetry"
+    );
 }
 
 #[test]
@@ -3369,6 +3375,7 @@ fn run_ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler
     );
     let before_tid = state.current_tid();
     let before_status = state.task_status(0);
+    let before_queued_recvs = state.ipc_path_telemetry().queued_recvs;
 
     let mut frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
@@ -3397,6 +3404,11 @@ fn run_ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler
     );
     assert_eq!(state.current_tid(), before_tid);
     assert_eq!(state.task_status(0), before_status);
+    assert_eq!(
+        state.ipc_path_telemetry().queued_recvs,
+        before_queued_recvs + 1,
+        "IpcRecv split path must increment queued_recvs telemetry"
+    );
 }
 
 #[test]
@@ -8725,4 +8737,141 @@ fn staged_deadline_cleared_on_try_recv_dispatch() {
         .expect("spawn")
         .join()
         .expect("join");
+}
+
+// ── Stage 4K unit tests ──────────────────────────────────────────────────────
+
+#[test]
+fn ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
+    std::thread::Builder::new()
+        .name("ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
+    // Stage 4K: IpcSend where the receiver is already blocked in a recv-v2 operation.
+    // complete_blocked_recv_for_waiter is called outside ipc_state_lock, the waiter slot
+    // is cleared under ipc_state_lock, and the receiver is woken — all without the message
+    // touching the endpoint queue.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    state.enqueue_current_cpu(1).expect("enqueue receiver");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv cap to task 1");
+
+    // Set up user memory for task 1 (payload page + meta page for recv-v2).
+    let (asid1, aspace_map_cap1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind task1 asid");
+    let payload_ptr = 0x3000usize;
+    let meta_ptr = 0x4000usize;
+    state
+        .map_user_page(
+            aspace_map_cap1,
+            VirtAddr(payload_ptr as u64),
+            Mapping {
+                phys: PhysAddr(0x9000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map payload page");
+    state
+        .map_user_page(
+            aspace_map_cap1,
+            VirtAddr(meta_ptr as u64),
+            Mapping {
+                phys: PhysAddr(0xA000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map meta page");
+
+    // Switch to task 1 so it can run the IpcRecv syscall (sets blocked_recv_state
+    // with RecvAbiVariant::RecvV2 when the queue is empty).
+    state.yield_current().expect("switch to task 1");
+    assert_eq!(state.current_tid(), Some(1));
+
+    let mut recv_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [
+            recv_cap_task1.0 as usize,  // arg[0] = cap
+            payload_ptr,                 // arg[1] = payload_ptr (SYSCALL_ARG_PTR)
+            Message::MAX_PAYLOAD,        // arg[2] = payload_len (SYSCALL_ARG_LEN)
+            meta_ptr,                    // arg[3] = meta_ptr (INLINE_PAYLOAD0, != 0 → recv-v2)
+            40,                          // arg[4] = meta_len (INLINE_PAYLOAD1, >= 40 → recv-v2)
+            0,                           // arg[5]
+        ],
+    );
+    // Queue is empty → task 1 blocks with blocked_recv_state.recv_abi = RecvV2.
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+        .expect("recv blocks");
+    assert_eq!(state.current_tid(), Some(0), "task 0 must be current after task 1 blocks");
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_task1))),
+        "task 1 must be blocked on recv"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        Some(ThreadId(1)),
+        "task 1 must be registered as endpoint waiter"
+    );
+
+    // Task 0 sends via IpcSend syscall.  Stage 4K should fire: is_task_recv_v2_blocked
+    // returns true, complete_blocked_recv_for_waiter delivers directly to task 1's user
+    // buffers, waiter slot is cleared, task 1 is woken.
+    let before_split_recv_v2 = state.ipc_path_telemetry().split_recv_v2_deliveries;
+    let before_status0 = state.task_status(0);
+
+    let mut send_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcSend as usize,
+        [
+            send_cap.0 as usize,
+            0,                           // user_ptr_or_offset (0 = inline payload)
+            6,                           // len = 6
+            inline_payload_word(b"4kstg"),  // inline payload bytes [0..8]
+            0,                           // inline payload bytes [8..16] (unused)
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut send_frame))
+        .expect("ipc send Stage 4K");
+
+    assert_eq!(send_frame.error_code(), None, "Stage 4K send must succeed");
+    assert_eq!(state.task_status(0), before_status0, "sender must not change status");
+    // Receiver must be woken.
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Runnable),
+        "receiver must be Runnable after Stage 4K direct delivery"
+    );
+    // Waiter slot must be cleared.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        "endpoint waiter slot must be cleared after Stage 4K"
+    );
+    // Message must NOT be in the endpoint queue (delivered directly to user buffer).
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        0,
+        "Stage 4K must deliver directly, not enqueue"
+    );
+    // Telemetry must record the split recv-v2 delivery.
+    assert_eq!(
+        state.ipc_path_telemetry().split_recv_v2_deliveries,
+        before_split_recv_v2 + 1,
+        "Stage 4K must increment split_recv_v2_deliveries"
+    );
+    // Payload must be written to receiver's user memory.
+    let payload = state
+        .read_user_memory_for_asid(asid1, payload_ptr, 6)
+        .expect("read receiver payload");
+    assert_eq!(&payload[..6], b"4kstg\0", "Stage 4K must write payload to receiver user memory");
 }

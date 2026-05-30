@@ -930,7 +930,18 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                                     _ => (None, IpcSchedulerPlan::None),
                                 }
                             } else {
-                                (None, IpcSchedulerPlan::None)
+                                // Stage 4K: recv-v2 blocked receiver — complete delivery outside
+                                // ipc_state_lock.  blocked_recv_state.take() runs inside
+                                // complete_blocked_recv_for_waiter; on failure the receiver is
+                                // left orphaned (same semantics as the full ipc_send path).
+                                complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg)?;
+                                // Phase 4: clear receiver waiter slot under ipc_state_lock.
+                                kernel.ipc_clear_plain_receiver_waiter_only(
+                                    endpoint_idx,
+                                    receiver_tid,
+                                );
+                                kernel.note_split_recv_v2_delivery();
+                                (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(receiver_tid))
                             }
                         }
                         IpcEndpointSendResult::Ineligible(_) => (None, IpcSchedulerPlan::None),
@@ -994,7 +1005,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 fn try_endpoint_split_recv(
     kernel: &mut KernelState,
     endpoint: CapObject,
-) -> Result<Option<(Option<Message>, IpcSchedulerPlan)>, SyscallError> {
+) -> Result<Option<(Message, IpcSchedulerPlan)>, SyscallError> {
     match endpoint {
         CapObject::Endpoint { .. } => {
             let endpoint_idx = kernel
@@ -1003,12 +1014,12 @@ fn try_endpoint_split_recv(
             match kernel.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx) {
                 IpcEndpointRecvResult::Received(msg) => {
                     kernel.note_endpoint_only_queued_recv_split();
-                    Ok(Some((Some(msg), IpcSchedulerPlan::None)))
+                    Ok(Some((msg, IpcSchedulerPlan::None)))
                 }
                 // Stage 4D: plain recv with sender-waiter refill — apply wake plan outside lock.
                 IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
                     kernel.note_endpoint_only_queued_recv_split();
-                    Ok(Some((Some(msg), IpcSchedulerPlan::WakeSender(wake_tid))))
+                    Ok(Some((msg, IpcSchedulerPlan::WakeSender(wake_tid))))
                 }
                 IpcEndpointRecvResult::Ineligible(_) => Ok(None),
             }
@@ -1054,8 +1065,8 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     );
     // Stage 4C/4D/4J: attempt immediate split recv; fallback to full ipc_recv path.
     let (received, split_scheduler_plan) =
-        if let Some(result) = try_endpoint_split_recv(kernel, endpoint)? {
-            result
+        if let Some((msg, plan)) = try_endpoint_split_recv(kernel, endpoint)? {
+            (Some(msg), plan)
         } else {
             (kernel.ipc_recv(cap).map_err(SyscallError::from)?, IpcSchedulerPlan::None)
         };
@@ -1162,9 +1173,11 @@ fn handle_ipc_recv_timeout(
     // irrelevant.  Ineligible cases (non-plain message, complex sender state, empty
     // queue) fall through to the appropriate timed/blocking path.
     let mut try_recv_scheduler_plan = IpcSchedulerPlan::None;
+    let mut split_recv_succeeded = false;
     let received = if let Some((msg, plan)) = try_endpoint_split_recv(kernel, endpoint)? {
+        split_recv_succeeded = true;
         try_recv_scheduler_plan = plan;
-        msg
+        Some(msg)
     } else if timeout_ticks == 0 {
         kernel.try_ipc_recv(cap).map_err(SyscallError::from)?
     } else if let Some(deadline) = preread_deadline {
@@ -1180,7 +1193,10 @@ fn handle_ipc_recv_timeout(
     if let IpcSchedulerPlan::WakeSender(wake_tid) = try_recv_scheduler_plan {
         let _ = kernel.apply_split_sender_wake_plan(wake_tid);
     }
-    let timed_out = if timeout_ticks == 0 {
+    // Skip the timeout-fired check when the split path already delivered a message.
+    // A stale ipc_timeout_fired flag from a prior syscall must not corrupt the result
+    // of an immediate split recv that succeeded before any blocking occurred.
+    let timed_out = if timeout_ticks == 0 || split_recv_succeeded {
         false
     } else {
         let fired = kernel

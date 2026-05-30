@@ -1384,6 +1384,33 @@ impl KernelState {
         self.ipc.telemetry.queued_recvs = self.ipc.telemetry.queued_recvs.saturating_add(1);
     }
 
+    /// Stage 4K: clear `endpoint_waiters[endpoint_idx]` under `ipc_state_lock` if and only if
+    /// the slot still holds `expected_receiver_tid`.  Called after `complete_blocked_recv_for_waiter`
+    /// succeeds to finalise the three-phase recv-v2 split delivery.  Under the global kernel lock
+    /// this always matches; the conditional re-verify is a defence-in-depth check.
+    pub(crate) fn ipc_clear_plain_receiver_waiter_only(
+        &mut self,
+        endpoint_idx: usize,
+        expected_receiver_tid: ThreadId,
+    ) {
+        self.with_ipc_state_mut(|ipc| {
+            if ipc.endpoint_waiters.get(endpoint_idx).copied().flatten()
+                == Some(expected_receiver_tid)
+            {
+                ipc.endpoint_waiters[endpoint_idx] = None;
+                crate::yarm_log!(
+                    "IPC_SEND_SPLIT_RECV_V2_CLEAR_WAITER receiver_tid={}",
+                    expected_receiver_tid.0
+                );
+            }
+        });
+    }
+
+    pub(crate) fn note_split_recv_v2_delivery(&mut self) {
+        self.ipc.telemetry.split_recv_v2_deliveries =
+            self.ipc.telemetry.split_recv_v2_deliveries.saturating_add(1);
+    }
+
     fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {
         if msg.opcode != PROC_OP_EXECUTE_RESTART {
             return Err(KernelError::WrongObject);
