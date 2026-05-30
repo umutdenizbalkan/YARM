@@ -2286,17 +2286,19 @@ fn run_endpoint_only_plain_recv_rejects_transfer_and_reply_messages_without_dequ
 }
 
 #[test]
-fn endpoint_only_plain_recv_rejects_sender_waiter_refill_case() {
+fn endpoint_only_plain_recv_two_phase_refills_plain_sender_waiter() {
     std::thread::Builder::new()
-        .name("endpoint_only_plain_recv_rejects_sender_waiter_refill_case".into())
+        .name("endpoint_only_plain_recv_two_phase_refills_plain_sender_waiter".into())
         .stack_size(8 * 1024 * 1024)
-        .spawn(run_endpoint_only_plain_recv_rejects_sender_waiter_refill_case)
+        .spawn(run_endpoint_only_plain_recv_two_phase_refills_plain_sender_waiter)
         .expect("spawn test thread")
         .join()
         .expect("join test thread");
 }
 
-fn run_endpoint_only_plain_recv_rejects_sender_waiter_refill_case() {
+fn run_endpoint_only_plain_recv_two_phase_refills_plain_sender_waiter() {
+    // Stage 4D: plain recv with sender-waiter refill.
+    // endpoint depth=1; first message fills queue; second send blocks sender (task 0).
     let mut state = Bootstrap::init_boxed().expect("init");
     state.register_task(1).expect("register receiver");
     state.enqueue_current_cpu(1).expect("enqueue receiver");
@@ -2305,44 +2307,266 @@ fn run_endpoint_only_plain_recv_rejects_sender_waiter_refill_case() {
         .grant_capability_task_to_task(0, recv_cap, 1)
         .expect("grant recv cap");
 
-    let first = Message::new(0, b"first").expect("first msg");
-    state.ipc_send(send_cap, first).expect("queue first message");
-    let second = Message::new(0, b"second").expect("second msg");
-    assert_eq!(state.ipc_send(send_cap, second), Err(KernelError::WouldBlock));
+    state
+        .ipc_send(send_cap, Message::new(0, b"first").expect("first"))
+        .expect("queue first");
+    assert_eq!(
+        state.ipc_send(send_cap, Message::new(0, b"second").expect("second")),
+        Err(KernelError::WouldBlock),
+        "second send must block (queue depth=1)"
+    );
     assert_eq!(state.current_tid(), Some(1));
     assert_eq!(
         state.task_status(0),
         Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
     );
 
-    let before_receiver_status = state.task_status(1);
-    assert_eq!(
-        state.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx),
-        IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::SenderWaiterPresent)
-    );
-    assert_eq!(state.current_tid(), Some(1));
-    assert_eq!(state.task_status(1), before_receiver_status);
-    assert_eq!(
-        state.task_status(0),
-        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
-    );
+    // Phase 1 (under ipc_state_lock): split helper dequeues "first", refills "second",
+    // returns ReceivedWithSenderWake with wake plan for deferred scheduler wake.
+    let result = state.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx);
+    let wake_tid = match result {
+        IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
+            assert_eq!(msg.as_slice(), b"first", "first message must be returned");
+            wake_tid
+        }
+        other => panic!("expected ReceivedWithSenderWake, got {other:?}"),
+    };
+
+    // Queue must now hold "second" (refilled from sender waiter).
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
         1,
-        "queued message must remain for the existing refill/wake path"
+        "second message must be refilled into queue"
+    );
+    // Sender waiter queue must be empty after dequeue.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[endpoint_idx]
+            .iter()
+            .all(Option::is_none)),
+        "sender waiter slot must be cleared after refill"
+    );
+    // Sender (task 0) must still be blocked — wake is deferred (Phase 2 not applied yet).
+    assert_eq!(
+        state.task_status(0),
+        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap))),
+        "sender must remain blocked until wake plan is applied"
     );
 
-    let received_first = state
+    // Phase 2 (outside ipc_state_lock): apply wake plan to unblock the sender.
+    state.apply_split_sender_wake_plan(wake_tid).expect("wake sender");
+    assert_eq!(
+        state.task_status(0),
+        Some(TaskStatus::Runnable),
+        "sender must be runnable after wake plan is applied"
+    );
+
+    // Receiver can now consume the refilled "second" message.
+    let second = state
         .ipc_recv(recv_cap_task1)
-        .expect("raw recv")
-        .expect("first message");
-    assert_eq!(received_first.as_slice(), b"first");
-    assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
-    let received_second = state
-        .ipc_recv(recv_cap_task1)
-        .expect("raw recv second")
-        .expect("refilled sender message");
-    assert_eq!(received_second.as_slice(), b"second");
+        .expect("recv second")
+        .expect("second message must be in queue");
+    assert_eq!(second.as_slice(), b"second");
+}
+
+#[test]
+fn endpoint_only_plain_recv_rejects_complex_sender_waiter_message() {
+    std::thread::Builder::new()
+        .name("endpoint_only_plain_recv_rejects_complex_sender_waiter_message".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_endpoint_only_plain_recv_rejects_complex_sender_waiter_message)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_endpoint_only_plain_recv_rejects_complex_sender_waiter_message() {
+    // Complex sender waiter messages (cap-transfer flags) require the full path for
+    // capability materialization.  The split helper must reject and leave the queue intact.
+    for &complex_flag in &[
+        Message::FLAG_CAP_TRANSFER,
+        Message::FLAG_CAP_TRANSFER_PLAIN,
+        Message::FLAG_REPLY_CAP,
+    ] {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        let (endpoint_idx, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+
+        // Fill the endpoint queue with a plain message.
+        state
+            .ipc_send(send_cap, Message::new(0, b"plain").expect("plain"))
+            .expect("queue plain");
+
+        // Directly inject a complex sender waiter at queue head (position 0).
+        let complex_msg =
+            Message::with_header(42, 0x55, complex_flag, Some(99), b"complex").expect("complex");
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_sender_waiters[endpoint_idx][0] = Some(SenderWaiter {
+                tid: ThreadId(42),
+                msg: complex_msg,
+            });
+        });
+
+        assert_eq!(
+            state.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx),
+            IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::SenderWaiterPresent),
+            "complex sender waiter (flag={complex_flag:#06x}) must force fallback to full path"
+        );
+        // Plain message must remain queued — no state was mutated.
+        assert_eq!(
+            state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+            1,
+            "plain message must not be dequeued when complex sender waiter rejects"
+        );
+        // Complex sender waiter must still be present.
+        assert!(
+            state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[endpoint_idx][0].is_some()),
+            "complex sender waiter must remain after rejection"
+        );
+    }
+}
+
+#[test]
+fn ipc_recv_syscall_split_two_phase_refills_plain_sender_waiter() {
+    std::thread::Builder::new()
+        .name("ipc_recv_syscall_split_two_phase_refills_plain_sender_waiter".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_recv_syscall_split_two_phase_refills_plain_sender_waiter)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_recv_syscall_split_two_phase_refills_plain_sender_waiter() {
+    // Integration test: IpcRecv syscall with a plain sender waiter in queue.
+    // Stage 4D two-phase refill must deliver "first" to receiver and wake blocked sender.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register sender-waiter task");
+    state.enqueue_current_cpu(1).expect("enqueue sender");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+    // Caps are minted in task 0's CNode.  Grant recv_cap to task 1 so it can recv via handle_trap.
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv cap to task 1");
+
+    // Block sender task 0 with "second" after filling queue with "first".
+    state
+        .ipc_send(send_cap, Message::new(0, b"first").expect("first"))
+        .expect("queue first");
+    assert_eq!(
+        state.ipc_send(send_cap, Message::new(0, b"second").expect("second")),
+        Err(KernelError::WouldBlock)
+    );
+    assert_eq!(
+        state.task_status(0),
+        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+    );
+
+    // Set up user memory buffers for current task (task 1 after yield).
+    assert_eq!(state.current_tid(), Some(1));
+    let payload_ptr = 0x3000usize;
+    let meta_ptr = 0x4000usize;
+    let asid = map_ipc_recv_syscall_buffers_for_task(
+        &mut state,
+        1,
+        payload_ptr,
+        meta_ptr,
+        0xA000,
+    );
+
+    // Dispatch IpcRecv: Stage 4D split path should deliver "first" and wake sender 0.
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [
+            recv_cap_task1.0 as usize,
+            payload_ptr,
+            Message::MAX_PAYLOAD,
+            meta_ptr,
+            40,
+            0,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc recv syscall with sender waiter");
+
+    assert_eq!(frame.error_code(), None);
+    let payload = state
+        .read_user_memory_for_asid(asid, payload_ptr, 5)
+        .expect("payload copy");
+    assert_eq!(&payload[..5], b"first");
+    // "second" must be refilled into the endpoint queue.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1,
+        "second message must be refilled by Stage 4D"
+    );
+    // Sender 0 must have been woken by the split wake plan.
+    assert_eq!(
+        state.task_status(0),
+        Some(TaskStatus::Runnable),
+        "sender 0 must be runnable after Stage 4D wake"
+    );
+}
+
+#[test]
+fn ipc_recv_timeout_try_recv_uses_split_path() {
+    std::thread::Builder::new()
+        .name("ipc_recv_timeout_try_recv_uses_split_path".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_recv_timeout_try_recv_uses_split_path)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_recv_timeout_try_recv_uses_split_path() {
+    // Stage 4G: IpcRecvTimeout with timeout_ticks=0 (try-recv) should use the Stage
+    // 4C/4D split path when a plain message is queued.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    state
+        .ipc_send(send_cap, Message::new(7, b"tryrecv").expect("msg"))
+        .expect("queue");
+    let before_tid = state.current_tid();
+    let before_status = state.task_status(0);
+
+    let payload_ptr = 0x3000usize;
+    let meta_ptr = 0x4000usize;
+    let asid = map_ipc_recv_syscall_buffers_for_task(
+        &mut state,
+        0,
+        payload_ptr,
+        meta_ptr,
+        0xB000,
+    );
+
+    // Dispatch IpcRecvTimeout with timeout_ticks=0 (Stage 4G try-recv path).
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecvTimeout as usize,
+        [
+            recv_cap.0 as usize,  // arg[0] = cap
+            payload_ptr,           // arg[1] = user_ptr
+            Message::MAX_PAYLOAD,  // arg[2] = user_len
+            0,                     // arg[3] = timeout_ticks = 0 (try-recv)
+            meta_ptr,              // arg[4] = meta_ptr
+            40,                    // arg[5] = meta_len
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc recv timeout try-recv");
+
+    assert_eq!(frame.error_code(), None);
+    let payload = state
+        .read_user_memory_for_asid(asid, payload_ptr, 7)
+        .expect("payload copy");
+    assert_eq!(&payload[..7], b"tryrecv");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        0,
+        "queue must be empty after try-recv via Stage 4G split path"
+    );
+    assert_eq!(state.current_tid(), before_tid);
+    assert_eq!(state.task_status(0), before_status);
 }
 
 fn map_ipc_recv_syscall_buffers_for_task(

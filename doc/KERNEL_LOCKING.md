@@ -909,6 +909,63 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock remains retained for all other production IPC
   mutation. This is not full global-lock removal.
 
+### Stage 4D: two-phase plain recv sender-waiter refill
+
+- Extended `ipc_try_recv_queued_plain_endpoint_only` to handle the sender-waiter
+  refill case using a two-phase lock protocol.
+- **Phase 1 (under `ipc_state_lock`)**: when a plain sender waiter is at queue
+  head (position 0), the helper dequeues the queued message for the receiver, compact-shifts
+  the sender-waiter slot out, and re-enqueues the sender's message into the
+  newly freed queue slot. Returns `IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid)`.
+- **Phase 2 (outside `ipc_state_lock`)**: the caller applies the deferred
+  scheduler wake via `apply_split_sender_wake_plan(wake_tid)` after the helper
+  returns, without holding any IPC endpoint lock.
+- `IpcSchedulerPlan::WakeSender(ThreadId)` carries the deferred wake intent from
+  the split helper through the syscall handler to the post-lock wake call.
+- **Fallback rules** (all cause `Ineligible(SenderWaiterPresent)` and fall back to full path):
+  - Sender waiter is present but its message carries `FLAG_CAP_TRANSFER`,
+    `FLAG_CAP_TRANSFER_PLAIN`, or `FLAG_REPLY_CAP` — capability materialization
+    cannot happen under `ipc_state_lock`.
+  - Position 0 is `None` but a later position is `Some` — gap created by
+    a prior timeout expiry that cleared position 0 without compacting; the
+    queue state is ambiguous so the full path must handle it.
+- **Lock contract**: `ipc_state_lock` is held only for endpoint queue mutation
+  (dequeue + sender-waiter compact shift + re-enqueue). It is not held while:
+  copying user memory, writing `TrapFrame`/register returns, minting/revoking
+  capabilities, materializing reply caps, mapping shared memory, mutating
+  scheduler queues, blocking/waking tasks, or mutating TCB wait metadata.
+- Correctness argument for the deferred wake window: the sender waiter is
+  removed from `endpoint_sender_waiters` under `ipc_state_lock`, so no
+  double-wake is possible. The sender's message is already in the endpoint queue
+  before the lock is released, so the state is consistent even if the system
+  is observed between Phase 1 and Phase 2.
+- `IpcRecv` syscall dispatch now handles both `Received` and
+  `ReceivedWithSenderWake` variants; `IpcRecvTimeout` (timeout_ticks > 0) also
+  propagates the wake plan through the same split path when Stage 4C/4D applies.
+- The global `SharedKernel` lock remains retained for all other IPC mutation.
+  **This is not full global-lock removal.**
+
+### Stage 4G: IpcRecvTimeout try-recv (timeout_ticks == 0) reuses Stage 4C/4D split
+
+- `handle_ipc_recv_timeout` now routes `timeout_ticks == 0` (non-blocking
+  try-recv) through `ipc_try_recv_queued_plain_endpoint_only` before falling
+  back to the existing `try_ipc_recv` full path.
+- When a plain queued message is present, Stage 4C applies: the message is
+  dequeued under `ipc_state_lock` and the caller proceeds without blocking.
+  When a plain sender waiter is also present, Stage 4D applies: the two-phase
+  refill runs under `ipc_state_lock` and the deferred sender wake is applied
+  outside the lock before returning.
+- All ineligible cases (complex sender-waiter messages, receiver waiter present,
+  non-buffered endpoint, empty queue, etc.) fall back to `try_ipc_recv`.
+- `IpcSchedulerPlan` is propagated through the timeout_ticks == 0 branch in
+  the same way as the `IpcRecv` branch: the wake plan is applied after the split
+  helper returns and before the syscall completes.
+- `timeout_ticks > 0` (blocking recv-timeout with deadline) is **not** changed
+  by Stage 4G; those cases still use the Phase L3 split-read bridge or the
+  full IPC deadline path.
+- The global `SharedKernel` lock remains retained for all other IPC mutation.
+  **This is not full global-lock removal.**
+
 ### Stage 3: remove global lock from syscall fast path
 
 

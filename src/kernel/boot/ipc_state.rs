@@ -345,13 +345,24 @@ impl KernelState {
         }
     }
 
-    /// Stage 4B endpoint-domain scaffolding for a future split receive path.
+    /// Stage 4C/4D endpoint-domain split receive helper.
     ///
     /// Preconditions: the caller has already validated the receive capability and
-    /// endpoint generation. This helper intentionally mutates only the selected
-    /// buffered endpoint queue under `ipc_state_lock`; it refuses every case that
-    /// would require scheduler, TCB, capability, user-memory, reply-cap, transfer,
-    /// notification, timeout, or sender-waiter refill behavior.
+    /// endpoint generation. This helper mutates only the selected buffered endpoint
+    /// queue under `ipc_state_lock`.
+    ///
+    /// Stage 4C: no sender waiter — dequeue the plain message and return Received.
+    ///
+    /// Stage 4D: plain sender waiter at queue head — two-phase refill:
+    ///   Phase 1 (here): dequeue receiver message, dequeue first sender waiter,
+    ///   enqueue sender's message into the newly-freed slot.
+    ///   Phase 2 (caller, outside lock): wake sender via apply_split_sender_wake_plan.
+    ///   Returns ReceivedWithSenderWake so the caller can apply the wake plan outside
+    ///   any lock.
+    ///
+    /// Falls back (Ineligible) for every case that requires scheduler/TCB mutation,
+    /// capability operations, user-memory access, TrapFrame writes, complex (flagged)
+    /// messages, non-buffered endpoints, or sender waiters with complex messages.
     #[allow(dead_code)]
     pub(crate) fn ipc_try_recv_queued_plain_endpoint_only(
         &mut self,
@@ -368,45 +379,117 @@ impl KernelState {
                     IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
                 );
             }
-            if ipc.endpoint_sender_waiters[endpoint_idx]
-                .iter()
-                .any(Option::is_some)
+
+            // Stage 4D: peek at sender waiter queue head (position 0) before touching the
+            // endpoint. Copies data so no reference is held across the endpoint borrow below.
+            let head_waiter: Option<(ThreadId, Message)> =
+                ipc.endpoint_sender_waiters[endpoint_idx][0].map(|w| (w.tid, w.msg));
+
+            // If the queue is sparse (position 0 is None but later positions are Some), the
+            // gap was left by a timed-out sender; fall back to the full path which handles
+            // arbitrary queue state correctly.
+            if head_waiter.is_none()
+                && ipc.endpoint_sender_waiters[endpoint_idx]
+                    .iter()
+                    .any(Option::is_some)
             {
                 return IpcEndpointRecvResult::Ineligible(
                     IpcEndpointSplitRejectReason::SenderWaiterPresent,
                 );
             }
 
-            let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
-                return IpcEndpointRecvResult::Ineligible(
-                    IpcEndpointSplitRejectReason::EndpointMissing,
-                );
-            };
-            let endpoint = kernel_mut(endpoint_storage);
-            if endpoint.mode() != EndpointMode::Buffered {
-                return IpcEndpointRecvResult::Ineligible(
-                    IpcEndpointSplitRejectReason::NonBufferedEndpoint,
-                );
+            // If a sender waiter exists at position 0, validate their message before
+            // dequeuing anything — ensures we can commit to the full two-phase refill.
+            if let Some((_, waiter_msg)) = head_waiter {
+                let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
+                    | Message::FLAG_CAP_TRANSFER_PLAIN
+                    | Message::FLAG_REPLY_CAP;
+                if (waiter_msg.flags & split_unsafe_flags) != 0
+                    || waiter_msg.transferred_cap().is_some()
+                {
+                    return IpcEndpointRecvResult::Ineligible(
+                        IpcEndpointSplitRejectReason::SenderWaiterPresent,
+                    );
+                }
             }
 
-            let Some(message) = endpoint.peek().copied() else {
-                return IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::EmptyQueue);
-            };
-            let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
-                | Message::FLAG_CAP_TRANSFER_PLAIN
-                | Message::FLAG_REPLY_CAP;
-            if (message.flags & split_unsafe_flags) != 0 || message.transferred_cap().is_some() {
-                return IpcEndpointRecvResult::Ineligible(
-                    IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
-                );
-            }
-
-            IpcEndpointRecvResult::Received(
+            // Borrow endpoint, validate mode and message, then dequeue.
+            // Scoped block so the &mut Endpoint borrow ends before the sender-waiter
+            // refill accesses ipc.endpoint_sender_waiters and re-borrows ipc.endpoints.
+            let received = {
+                let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+                    return IpcEndpointRecvResult::Ineligible(
+                        IpcEndpointSplitRejectReason::EndpointMissing,
+                    );
+                };
+                let endpoint = kernel_mut(endpoint_storage);
+                if endpoint.mode() != EndpointMode::Buffered {
+                    return IpcEndpointRecvResult::Ineligible(
+                        IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+                    );
+                }
+                let Some(message) = endpoint.peek().copied() else {
+                    return IpcEndpointRecvResult::Ineligible(
+                        IpcEndpointSplitRejectReason::EmptyQueue,
+                    );
+                };
+                let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
+                    | Message::FLAG_CAP_TRANSFER_PLAIN
+                    | Message::FLAG_REPLY_CAP;
+                if (message.flags & split_unsafe_flags) != 0
+                    || message.transferred_cap().is_some()
+                {
+                    return IpcEndpointRecvResult::Ineligible(
+                        IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+                    );
+                }
                 endpoint
                     .recv()
-                    .expect("peeked plain endpoint message must remain queued"),
-            )
+                    .expect("peeked plain endpoint message must remain queued")
+            };
+
+            // Stage 4D two-phase refill: only reached when head_waiter is Some with a
+            // plain message (validated above). All mutations stay under ipc_state_lock.
+            if let Some((waiter_tid, waiter_msg)) = head_waiter {
+                // Phase 1a: remove first sender waiter and compact the queue.
+                {
+                    let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
+                    queue[0] = None;
+                    for idx in 1..queue.len() {
+                        queue[idx - 1] = queue[idx].take();
+                    }
+                }
+                // Phase 1b: enqueue the sender's message into the slot freed by recv.
+                {
+                    let ep = kernel_mut(
+                        ipc.endpoints[endpoint_idx]
+                            .as_mut()
+                            .expect("endpoint must remain present after recv dequeue"),
+                    );
+                    ep.send(waiter_msg)
+                        .expect("one slot must be free after recv dequeue");
+                }
+                crate::yarm_log!(
+                    "IPC_RECV_SPLIT_REFILL_QUEUED waiter_tid={}",
+                    waiter_tid.0
+                );
+                return IpcEndpointRecvResult::ReceivedWithSenderWake(received, waiter_tid);
+            }
+
+            IpcEndpointRecvResult::Received(received)
         })
+    }
+
+    /// Apply a deferred scheduler wake plan returned by the Stage 4D split recv helper.
+    ///
+    /// Must be called outside `ipc_state_lock`. Wakes the sender whose message was
+    /// already refilled into the endpoint queue under ipc_state_lock.
+    pub(crate) fn apply_split_sender_wake_plan(
+        &mut self,
+        sender_tid: ThreadId,
+    ) -> Result<(), KernelError> {
+        crate::yarm_log!("IPC_RECV_SPLIT_REFILL_WAKE_APPLY tid={}", sender_tid.0);
+        self.wake_sender_waiter(sender_tid)
     }
 
     pub(crate) fn ipc_try_send_queued_plain_endpoint_only(
