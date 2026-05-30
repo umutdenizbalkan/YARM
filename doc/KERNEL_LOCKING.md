@@ -1683,19 +1683,26 @@ finds the receiver is not recv-v2 blocked, the code falls through to the existin
 #### Transfer envelope cleanup (error path)
 
 If `complete_blocked_recv_for_waiter` fails, the reply-cap transfer envelope stashed
-by `stash_transfer_handle` must be cleaned up before returning. Stage 4L does this
-explicitly using the already-captured `sender_tid` (not `current_tid(kernel)?` which
-could itself fail):
+by `stash_transfer_handle` must be cleaned up. The critical invariant: `stash_transfer_handle`
+binds the envelope to `receiver_tid = Some(waiter_tid)` (read via `endpoint_waiter_tid`).
+`take_transfer_envelope` checks the bound receiver and returns `None` if the caller's
+`receiver_tid` argument does not match. Stage 4L therefore passes `receiver_tid` (the
+waiter TID from Phase 1) — **not** `sender_tid` — to `take_transfer_envelope`:
 
 ```rust
 Err(e) => {
+    // Use receiver_tid (bound waiter TID), not sender_tid — the envelope was
+    // stashed with receiver_tid bound to the waiter.
     if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
-        let _ = kernel.take_transfer_envelope(handle, endpoint,
-            crate::kernel::ipc::ThreadId(sender_tid));
+        let _ = kernel.take_transfer_envelope(handle, endpoint, receiver_tid);
     }
     return Err(e);
 }
 ```
+
+Passing `sender_tid` instead of `receiver_tid` would cause `take_transfer_envelope` to
+return `None` (bound-receiver mismatch), permanently leaking the reply-cap slot
+(bug fixed in Stage 4L review pass, 2026-05-30).
 
 #### API surface (Stage 4L)
 
@@ -1718,6 +1725,30 @@ New method on `KernelState` (`src/kernel/boot/ipc_state.rs`):
   `SYSCALL_RECV_META_REPLY_CAP` bit set in meta[24..32], and sender tid correct
   in meta[32..40].
 
+#### Stage 4L code review (2026-05-30)
+
+**Bug found and fixed**: The original Stage 4L error path (when `complete_blocked_recv_for_waiter`
+fails) called `take_transfer_envelope(handle, endpoint, ThreadId(sender_tid))`. However
+`stash_transfer_handle` stashes the envelope with `receiver_tid = Some(waiter_tid)` (from
+`endpoint_waiter_tid`), and `take_transfer_envelope` enforces that the caller passes the
+matching bound receiver TID. With `sender_tid` (not `waiter_tid`), `take_transfer_envelope`
+returns `None` and the transfer envelope slot is permanently leaked. Fixed by using
+`receiver_tid` (the waiter TID from Phase 1) in the error path cleanup.
+
+**Simplification**: Removed redundant outer `{ }` block wrapping the match expression.
+Split the double-check of `call_split_wake` (`is_none()` + `if let Some`) into a single
+`if let Some(recv_tid)` / fallthrough structure.
+
+**Other findings (not fixed — pre-existing or latency-only)**:
+- `ipc_try_send_queued_plain_endpoint_only` does not check `endpoint.mode()` before
+  returning `ReceiverWaiterFound`, so Stage 4K/4L fire on synchronous endpoints and bypass
+  `switch_to_runnable_tid`. This is a latency deviation, not a correctness bug — the receiver
+  is still woken and will run. Same behavior applies to Stage 4K (pre-existing).
+- When `ReceiverWaiterFound` fires but `is_recv_v2` is false, Stage 4L falls to `ipc_send`
+  (correct); `ipc_send` does a second TCB scan (O(n) redundancy). Pre-existing in design.
+- `current_tid(kernel)?` in the `ipc_send` fallback error path cannot fail mid-syscall
+  (REFUTED as a real bug — `self.current` is set at syscall entry and never cleared).
+
 #### What Stage 4L does NOT change
 
 - IPC syscall ABI and SYSCALL_COUNT: unchanged.
@@ -1726,8 +1757,79 @@ New method on `KernelState` (`src/kernel/boot/ipc_state.rs`):
 - x86_64 register writeback: unchanged.
 - Phase 3B checks: not weakened.
 - The global `SharedKernel` lock is still retained.  **This is not full global-lock removal.**
-- IpcReply recv-v2 path: unchanged (already has a direct delivery path in `ipc_reply`,
-  lines 937–971 of `ipc_state.rs`, with its own lock discipline).
+- IpcReply recv-v2 path: now has telemetry (see Stage 4M below), but delivery logic unchanged.
+
+---
+
+### Stage 4M: IpcReply recv-v2 delivery telemetry
+
+**Implemented**: 2026-05-30. Affects `ipc_reply` in `src/kernel/boot/ipc_state.rs`.
+
+#### Motivation
+
+The `ipc_reply` function (lines 937–985 of `ipc_state.rs`) has had a recv-v2 direct delivery
+path since before Stage 4K: when the requester is already blocked in a recv-v2 operation
+on the reply endpoint, `complete_blocked_recv_for_waiter` delivers the reply directly to the
+requester's user buffers and `wake_waiter_for_endpoint` clears the waiter slot and wakes the
+task. This path was undocumented and had no telemetry counter.
+
+Stage 4M adds a telemetry counter (`ipc_reply_split_deliveries`) and an integration test
+to make this path auditable alongside Stage 4K and Stage 4L.
+
+#### Protocol (existing path, now instrumented)
+
+The `ipc_reply` recv-v2 delivery path predates the Phase 1–5 discipline of Stage 4K/4L.
+It reads `endpoint_waiters[endpoint_idx]` directly (not via `ipc_try_send_queued_plain_endpoint_only`),
+then calls `with_tcbs` to check recv-v2 status, then `complete_blocked_recv_for_waiter`, then
+`wake_waiter_for_endpoint` (which internally takes and clears the waiter slot under
+`ipc_state_lock`). All of this is safe under the global `SharedKernel` lock.
+
+#### API surface (Stage 4M)
+
+New items in `IpcPathTelemetry` (`crates/yarm-kernel/src/boot.rs`):
+
+- `ipc_reply_split_deliveries: u64` — counts successful ipc_reply recv-v2 deliveries.
+
+New method on `KernelState` (`src/kernel/boot/ipc_state.rs`):
+
+- `note_ipc_reply_split_delivery()` — increments `ipc_reply_split_deliveries` (saturating).
+
+#### Tests (Stage 4M)
+
+- `ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter`
+  (`src/kernel/boot/tests.rs`): integration test — task 1 (requester) calls IpcCall,
+  task 2 (replier) receives via recv-v2 and obtains local reply cap, task 1 blocks on
+  recv-v2 for the reply, task 2 calls `ipc_reply`; asserts task 1 is Runnable, reply
+  endpoint queue empty (direct delivery), `ipc_reply_split_deliveries` incremented,
+  reply payload in task 1's user buffer.
+
+#### What Stage 4M does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- The `ipc_reply` delivery logic: unchanged — only telemetry added.
+- The global `SharedKernel` lock is still retained.  **This is not full global-lock removal.**
+
+---
+
+### Current live / deferred IPC split matrix
+
+| Syscall path | Condition | Status | Telemetry counter |
+|---|---|---|---|
+| IpcRecv (plain buffered recv) | Queue non-empty, no pending sender wake | **Live** Stage 4C | `queued_recvs` |
+| IpcRecv (buffered recv + sender-waiter refill) | Queue non-empty, sender waiter present | **Live** Stage 4D | `queued_recvs` |
+| IpcSend (plain enqueue) | No receiver waiter, no sender waiters, buffered, no cap-transfer | **Live** Stage 4E | `queued_sends` |
+| IpcSend (to waiting non-recv-v2 receiver) | Receiver waiter present, not recv-v2, no sender waiters | **Live** Stage 4F | `queued_sends` |
+| IpcRecvTimeout (timeout_ticks=0 immediate recv) | Queue non-empty | **Live** Stage 4G | `queued_recvs` |
+| IpcSend (nonzero-timeout plain send) | No receiver, buffered, no cap-transfer, timeout >0 | **Live** Stage 4H | `queued_sends` |
+| IpcRecvTimeout (timeout_ticks>0 immediate recv) | Queue non-empty | **Live** Stage 4I | `queued_recvs` |
+| IpcSend to recv-v2 blocked receiver | Receiver waiter + recv-v2, no sender waiters | **Live** Stage 4K | `split_recv_v2_deliveries` |
+| IpcCall to recv-v2 blocked receiver | Receiver waiter + recv-v2, no sender waiters | **Live** Stage 4L | `ipc_call_split_deliveries` |
+| IpcReply to recv-v2 blocked requester | Requester waiter + recv-v2 on reply endpoint | **Live** Stage 4M | `ipc_reply_split_deliveries` |
+| IpcSend/IpcCall to non-recv-v2 receiver (ReceiverWaiterFound) | Receiver waiter, not recv-v2 | **Deferred** (falls to ipc_send) | — |
+| IpcSend/IpcCall with FLAG_CAP_TRANSFER | Any cap-transfer flag | **Deferred** (Ineligible) | — |
+| IpcSend/IpcCall to synchronous endpoint (no waiter) | Synchronous mode | **Deferred** (Ineligible) | — |
+| IpcReply to non-recv-v2 requester | Queue enqueue path | **Deferred** (enqueue+wake) | — |
+| MemoryObject zero-copy, VFS shared-reply | Phase 3B / VFS gate | **Deferred indefinitely** | — |
 
 ---
 
