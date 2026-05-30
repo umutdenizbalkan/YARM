@@ -966,6 +966,184 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock remains retained for all other IPC mutation.
   **This is not full global-lock removal.**
 
+### Stage 4D/4G review (clean — no changes required)
+
+The Stage 4D two-phase refill protocol and Stage 4G try-recv routing were
+reviewed against the following invariants. Result: **CLEAN**.
+
+#### Sender-waiter refill two-phase protocol
+
+- Phase 1 (under `ipc_state_lock`): dequeue queued message, compact sender-waiter
+  slot out, re-enqueue sender's message into freed slot. All three mutations are
+  atomic from the perspective of any concurrent observer holding `ipc_state_lock`.
+- Phase 2 (outside lock): `apply_split_sender_wake_plan` calls `wake_tid_to_runnable`
+  on the sender. The sender's message is already durably in the endpoint queue
+  before the lock is released, so the state is consistent in the window between
+  Phase 1 and Phase 2.
+
+#### Deferred sender wake correctness
+
+- The sender waiter is removed from `endpoint_sender_waiters[endpoint_idx][0]`
+  under `ipc_state_lock`, preventing any double-wake from a concurrent timer expiry
+  or another recv operation.
+- The global `SharedKernel` lock serializes all syscall/timer paths in the
+  current implementation; no concurrent timer tick can process the same sender
+  between Phase 1 and Phase 2. The deferred wake is therefore safe.
+
+#### Sender-waiter queue compaction / gap handling
+
+- Queue head (position 0) is the only dequeue position. If position 0 is `None`
+  but a later position is `Some`, the split path returns
+  `Ineligible(SenderWaiterPresent)` and falls back to the full IPC path.
+  This correctly handles the case where a prior timeout expiry cleared position 0
+  without compacting.
+- After a Stage 4D dequeue, the remaining slots are compact-shifted correctly:
+  `queue[idx-1] = queue[idx].take()` for all positions 1..len.
+
+#### timeout_ticks == 0 try-recv routing (Stage 4G)
+
+- `handle_ipc_recv_timeout` correctly routes `timeout_ticks == 0` through
+  `ipc_try_recv_queued_plain_endpoint_only` (Stage 4C/4D) before falling back
+  to `try_ipc_recv`.
+- The `IpcSchedulerPlan` is propagated and applied consistently in both the
+  `IpcRecv` and `timeout_ticks == 0` branches.
+
+#### Fallback for complex sender waiters
+
+- Messages with `FLAG_CAP_TRANSFER`, `FLAG_CAP_TRANSFER_PLAIN`, or `FLAG_REPLY_CAP`
+  at sender-waiter queue head correctly return `Ineligible(SenderWaiterPresent)`.
+- Cap materialization under `ipc_state_lock` is therefore never attempted.
+
+#### recv-v2 compatibility
+
+- Stage 4C/4D recv split operates only on the endpoint queue. It does not inspect
+  `blocked_recv_state` or `recv_abi` of any task, and does not call
+  `complete_blocked_recv_for_waiter`. recv-v2 waiters are therefore unaffected.
+
+#### cap-transfer / reply-cap compatibility
+
+- Messages with transfer or reply-cap flags are rejected at the queued-message
+  check as well as the sender-waiter check, falling back to the full path
+  in both cases.
+
+#### ipc_state_lock not held across scheduler/TCB/user-memory/cap/VM/TrapFrame
+
+- Confirmed: `ipc_try_recv_queued_plain_endpoint_only` exits `with_ipc_state_mut`
+  before `apply_split_sender_wake_plan` calls `wake_tid_to_runnable`.
+- `wake_tid_to_runnable` acquires `task_state_lock` (rank 3) and
+  `scheduler_state` (rank 2) — both outside `ipc_state_lock` (rank 4).
+- User-memory copy, `TrapFrame` writes, and cap materialization all occur outside
+  `ipc_state_lock` in the existing full-path helpers (`complete_blocked_recv_for_waiter`
+  and result encoding in `handle_ipc_recv`/`handle_ipc_recv_timeout`).
+
+---
+
+### Stage 4F: plain send to waiting legacy receiver
+
+- Live `IpcSend` now also tries the Stage 4F split path when `ipc_try_send_queued_plain_endpoint_only`
+  returns `Ineligible(ReceiverWaiterPresent)` and:
+  - `send_timeout_ticks == 0` (no blocking allowed)
+  - `transfer_cap.is_none()` (no cap-transfer argument)
+  - The waiting receiver is **not** recv-v2 blocked (verified under `task_state_lock` rank 3)
+  - The endpoint is buffered and the message carries no cap-transfer or reply-cap flags
+
+#### Two-phase send-to-receiver protocol
+
+- **Phase 1 (under `ipc_state_lock` rank 4)**:
+  `ipc_try_send_to_plain_receiver_endpoint_only(endpoint_idx, expected_receiver_tid, msg)`:
+  1. Re-verifies `endpoint_waiters[endpoint_idx] == Some(expected_receiver_tid)` — guards
+     against timeout clearing the slot between the pre-check and the lock acquisition.
+  2. Validates message flags (no cap-transfer, no reply-cap).
+  3. Enqueues `msg` into the endpoint queue.
+  4. Clears `endpoint_waiters[endpoint_idx] = None`.
+  5. Returns `IpcEndpointSendResult::EnqueuedWakeReceiver(receiver_tid)`.
+- **Phase 2 (outside `ipc_state_lock`)**:
+  `apply_split_receiver_wake_plan(receiver_tid)` calls `wake_tid_to_runnable(receiver_tid)`.
+
+#### Lock ordering for the Stage 4F pre-check sequence
+
+The pre-check sequence that precedes Phase 1 is:
+
+```
+1. ipc_endpoint_waiter_tid_direct(endpoint_idx)   // no lock — direct array read
+2. is_task_recv_v2_blocked(tid)                   // task_state_lock (rank 3)
+3. ipc_try_send_to_plain_receiver_endpoint_only   // ipc_state_lock (rank 4)
+```
+
+This respects the mandatory ordering: rank 3 (task) acquired and **released**
+before rank 4 (ipc) is acquired. No lock inversion is possible.
+
+`ipc_endpoint_waiter_tid_direct` reads `self.ipc.endpoint_waiters[endpoint_idx]`
+without holding `ipc_state_lock`. This is safe under the global `SharedKernel`
+lock, which serializes all syscall paths.
+
+#### Fallback rules
+
+The Stage 4F path returns `Ineligible(...)` and falls back to the full
+`ipc_send` path for any of the following:
+
+- `send_timeout_ticks != 0` (blocking or deadline send) — scheduling/blocking involves
+  TCB/scheduler mutation that must not happen under `ipc_state_lock`.
+- `transfer_cap.is_some()` — cap-transfer requires minting/materialization.
+- Receiver is recv-v2 blocked — delivery requires `complete_blocked_recv_for_waiter`
+  (user-memory copy, cap materialization, `TrapFrame` writes).
+- Message carries cap-transfer or reply-cap flags.
+- Endpoint is not buffered (synchronous endpoints require `switch_to_runnable_tid`).
+- Endpoint queue is full.
+- Receiver slot was cleared by a timeout between pre-check and lock acquisition
+  (re-verify inside lock catches this race).
+
+Synchronous (non-buffered) endpoint send-to-receiver is explicitly deferred:
+it requires `switch_to_runnable_tid` (scheduler handoff) which involves
+scheduler state and TCB state mutations incompatible with `ipc_state_lock`.
+
+#### Lock contract (Stage 4F)
+
+`ipc_state_lock` is held only for:
+- endpoint queue enqueue
+- `endpoint_waiters` slot clear
+
+It is **not** held while:
+- reading `endpoint_waiters[endpoint_idx]` for the pre-check (step 1 above)
+- checking `is_task_recv_v2_blocked` (step 2 above)
+- calling `apply_split_receiver_wake_plan` / `wake_tid_to_runnable` (Phase 2)
+- mutating task TCB status or scheduler runqueue (`wake_tid_to_runnable`)
+- copying user memory, writing `TrapFrame` registers, minting/revoking caps, or
+  mapping shared memory (none of these occur in Stage 4F)
+
+#### New API surface (Stage 4F)
+
+- `IpcEndpointSendResult::EnqueuedWakeReceiver(ThreadId)` — split send to waiting receiver
+- `IpcSchedulerPlan::WakeReceiver(ThreadId)` — deferred receiver wake plan
+- `KernelState::ipc_endpoint_waiter_tid_direct(endpoint_idx)` — lock-free waiter slot read
+- `KernelState::is_task_recv_v2_blocked(tid)` — under task_state_lock (rank 3)
+- `KernelState::ipc_try_send_to_plain_receiver_endpoint_only(...)` — Phase 1 under ipc_state_lock (rank 4)
+- `KernelState::apply_split_receiver_wake_plan(tid)` — Phase 2 wake outside lock
+
+#### Tests added (src/kernel/boot/tests.rs)
+
+- `endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_plan`
+  — unit test: directly injects receiver waiter state, verifies
+  `EnqueuedWakeReceiver` result, asserts message queued / waiter slot cleared /
+  receiver still Blocked before wake, then applies wake plan and asserts Runnable.
+- `ipc_send_syscall_split_delivers_to_waiting_plain_receiver`
+  — integration test: blocks task 1 on recv via full IPC path, then task 0
+  sends via `handle_trap(IpcSend)`. Asserts Stage 4F fires (sender not blocked,
+  receiver Runnable, waiter slot cleared, telemetry incremented).
+
+#### What Stage 4F does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback: unchanged.
+- Phase 3B checks: not weakened.
+- recv-v2, call, reply, cap-transfer: no change; all fall back to full IPC path.
+- The global `SharedKernel` lock is still retained for all other IPC mutation.
+  **This is not full global-lock removal.**
+
+---
+
 ### Stage 3: remove global lock from syscall fast path
 
 

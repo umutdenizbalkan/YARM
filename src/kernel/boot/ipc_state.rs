@@ -548,6 +548,108 @@ impl KernelState {
         })
     }
 
+    /// Return the waiter tid for an endpoint directly from the array (no lock).
+    ///
+    /// Safe only when the caller already holds the SharedKernel global lock (i.e. is in a
+    /// syscall handler) and will NOT subsequently acquire ipc_state_lock at rank 4 before
+    /// first dropping any rank-3 lock it acquires. Used for the Stage 4F pre-check ordering:
+    ///   1. direct read here (no lock)
+    ///   2. is_task_recv_v2_blocked (task_state_lock rank 3)
+    ///   3. ipc_try_send_to_plain_receiver_endpoint_only (ipc_state_lock rank 4)
+    pub(crate) fn ipc_endpoint_waiter_tid_direct(&self, endpoint_idx: usize) -> Option<ThreadId> {
+        if endpoint_idx >= self.ipc.endpoint_waiters.len() {
+            return None;
+        }
+        self.ipc.endpoint_waiters[endpoint_idx]
+    }
+
+    /// Return true if the task identified by `tid` is blocked on a recv-v2 operation.
+    /// Acquires task_state_lock (rank 3). Must be called before ipc_state_lock (rank 4).
+    pub(crate) fn is_task_recv_v2_blocked(&self, tid: u64) -> bool {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.blocked_recv_state.as_ref())
+                .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
+        })
+    }
+
+    /// Stage 4F: plain send to a waiting legacy (non-recv-v2) receiver on a buffered endpoint.
+    ///
+    /// Preconditions (caller must verify before this call):
+    ///   - `expected_receiver_tid` is not recv-v2 blocked (checked under task_state_lock rank 3)
+    ///   - message has no cap-transfer or reply-cap flags
+    ///
+    /// Under ipc_state_lock:
+    ///   - re-verifies receiver slot still holds expected_receiver_tid
+    ///   - enqueues msg into the endpoint queue
+    ///   - clears endpoint_waiters slot
+    ///
+    /// Returns EnqueuedWakeReceiver(tid) on success; caller must call
+    /// apply_split_receiver_wake_plan outside the lock.
+    pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only(
+        &mut self,
+        endpoint_idx: usize,
+        expected_receiver_tid: ThreadId,
+        msg: Message,
+    ) -> IpcEndpointSendResult {
+        self.with_ipc_state_mut(|ipc| {
+            if endpoint_idx >= ipc.endpoints.len() {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+                );
+            }
+            // Re-verify receiver slot: timeout may have cleared it between pre-check and lock.
+            if ipc.endpoint_waiters[endpoint_idx] != Some(expected_receiver_tid) {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
+                );
+            }
+            let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
+                | Message::FLAG_CAP_TRANSFER_PLAIN
+                | Message::FLAG_REPLY_CAP;
+            if (msg.flags & split_unsafe_flags) != 0 || msg.transferred_cap().is_some() {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+                );
+            }
+            let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::EndpointMissing,
+                );
+            };
+            let endpoint = kernel_mut(endpoint_storage);
+            if endpoint.mode() != EndpointMode::Buffered {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+                );
+            }
+            if endpoint.send(msg).is_err() {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::EndpointQueueFull,
+                );
+            }
+            // Clear receiver from waiters; wake is applied outside lock.
+            ipc.endpoint_waiters[endpoint_idx] = None;
+            crate::yarm_log!(
+                "IPC_SEND_SPLIT_ENQUEUED_WAKE_RECEIVER receiver_tid={}",
+                expected_receiver_tid.0
+            );
+            IpcEndpointSendResult::EnqueuedWakeReceiver(expected_receiver_tid)
+        })
+    }
+
+    /// Apply the deferred receiver-wake plan returned by ipc_try_send_to_plain_receiver_endpoint_only.
+    /// Must be called outside ipc_state_lock.
+    pub(crate) fn apply_split_receiver_wake_plan(
+        &mut self,
+        receiver_tid: ThreadId,
+    ) -> Result<(), KernelError> {
+        crate::yarm_log!("IPC_SEND_SPLIT_RECEIVER_WAKE_APPLY tid={}", receiver_tid.0);
+        self.wake_tid_to_runnable(receiver_tid)
+    }
+
     fn resolve_reply_index(&self, object: CapObject) -> Result<usize, KernelError> {
         match object {
             CapObject::Reply { index, generation } => self.with_ipc_state(|ipc| {

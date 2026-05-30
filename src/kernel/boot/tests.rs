@@ -2939,6 +2939,165 @@ fn run_ipc_send_syscall_transfer_message_falls_back_to_full_path() {
     assert_eq!(received.as_slice(), b"tx");
 }
 
+// ── Stage 4F unit tests ──────────────────────────────────────────────────────
+
+#[test]
+fn endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_plan() {
+    std::thread::Builder::new()
+        .name("endpoint_only_plain_send_to_waiting_receiver_enqueues_and_wake_plan".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_plan)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_plan() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+
+    // Directly inject receiver waiter state: task 1 blocked on recv.
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+    });
+    state.with_tcbs_mut(|tcbs| {
+        if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 1) {
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+        }
+    });
+
+    let msg = Message::new(7, b"hello").expect("msg");
+    let result = state.ipc_try_send_to_plain_receiver_endpoint_only(
+        endpoint_idx,
+        ThreadId(1),
+        msg,
+    );
+
+    let recv_tid = match result {
+        IpcEndpointSendResult::EnqueuedWakeReceiver(tid) => tid,
+        other => panic!("expected EnqueuedWakeReceiver, got {:?}", other),
+    };
+    assert_eq!(recv_tid, ThreadId(1));
+
+    // Message must be in the endpoint queue.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1,
+        "message must be queued after Stage 4F enqueue"
+    );
+    // Receiver waiter slot must be cleared under lock.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        "receiver waiter slot must be cleared after Stage 4F enqueue"
+    );
+    // Receiver must still be Blocked (wake not yet applied).
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap))),
+        "receiver must remain Blocked before wake plan is applied"
+    );
+
+    // Apply deferred wake plan.
+    state.apply_split_receiver_wake_plan(recv_tid).expect("wake");
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Runnable),
+        "receiver must be Runnable after wake plan is applied"
+    );
+
+    // Verify message is readable.
+    let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+    assert_eq!(received.as_slice(), b"hello");
+}
+
+#[test]
+fn ipc_send_syscall_split_delivers_to_waiting_plain_receiver() {
+    std::thread::Builder::new()
+        .name("ipc_send_syscall_split_delivers_to_waiting_plain_receiver".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_send_syscall_split_delivers_to_waiting_plain_receiver)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_send_syscall_split_delivers_to_waiting_plain_receiver() {
+    // Integration test: IpcSend syscall where a plain receiver is already waiting.
+    // Stage 4F must enqueue under ipc_state_lock, clear the waiter slot, and then
+    // wake the receiver outside the lock — all without touching the scheduler under lock.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    state.enqueue_current_cpu(1).expect("enqueue receiver");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv cap to task 1");
+
+    // Block task 1 on recv so it becomes a receiver waiter.
+    state.yield_current().expect("switch to task 1");
+    assert_eq!(state.current_tid(), Some(1));
+    assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
+    assert_eq!(state.current_tid(), Some(0));
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_task1)))
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        Some(ThreadId(1)),
+        "receiver must be registered as endpoint waiter"
+    );
+
+    // Now task 0 sends via syscall — Stage 4F split path should fire.
+    let before_status0 = state.task_status(0);
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcSend as usize,
+        [
+            send_cap.0 as usize,
+            0,
+            5,
+            inline_payload_word(b"stage4f"),
+            0,
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc send syscall Stage 4F");
+
+    assert_eq!(frame.error_code(), None, "Stage 4F send must succeed");
+    // Sender must not have blocked.
+    assert_eq!(
+        state.task_status(0),
+        before_status0,
+        "sender must not change status after Stage 4F send"
+    );
+    // Receiver must have been woken.
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Runnable),
+        "receiver must be Runnable after Stage 4F wake"
+    );
+    // Waiter slot must have been cleared.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        "endpoint waiter slot must be cleared after Stage 4F"
+    );
+    // Message must be readable by the receiver.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1,
+        "message must be in queue for receiver to pick up"
+    );
+    // telemetry counter must have incremented.
+    assert_eq!(
+        state.ipc_path_telemetry().queued_sends,
+        1,
+        "Stage 4F must count as a split queued send"
+    );
+}
+
 #[test]
 fn ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mutation() {
     std::thread::Builder::new()
