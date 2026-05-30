@@ -1380,6 +1380,10 @@ impl KernelState {
         self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
     }
 
+    pub(crate) fn note_endpoint_only_queued_recv_split(&mut self) {
+        self.ipc.telemetry.queued_recvs = self.ipc.telemetry.queued_recvs.saturating_add(1);
+    }
+
     fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {
         if msg.opcode != PROC_OP_EXECUTE_RESTART {
             return Err(KernelError::WrongObject);
