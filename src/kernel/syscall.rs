@@ -2,8 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::boot::{
-    IpcEndpointRecvResult, IpcEndpointSendResult, KernelError, KernelState, MemoryObjectKind,
-    TransferSharedRegion,
+    IpcEndpointRecvResult, IpcEndpointSendResult, IpcSchedulerPlan, KernelError, KernelState,
+    MemoryObjectKind, TransferSharedRegion,
 };
 use super::capabilities::{CapId, CapObject, CapRights, Capability};
 use super::ipc::{
@@ -990,23 +990,34 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         cap.0,
         endpoint
     );
-    let split_received = match endpoint {
+    let split_result = match endpoint {
         CapObject::Endpoint { .. } => {
             let endpoint_idx = kernel
                 .resolve_endpoint_index(endpoint)
                 .map_err(SyscallError::from)?;
             match kernel.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx) {
-                IpcEndpointRecvResult::Received(msg) => Some(Some(msg)),
+                IpcEndpointRecvResult::Received(msg) => {
+                    Some((Some(msg), IpcSchedulerPlan::None))
+                }
+                // Stage 4D: plain recv with sender-waiter refill — apply wake plan outside lock.
+                IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
+                    Some((Some(msg), IpcSchedulerPlan::WakeSender(wake_tid)))
+                }
                 IpcEndpointRecvResult::Ineligible(_) => None,
             }
         }
         _ => None,
     };
-    let received = if let Some(received) = split_received {
-        received
+    let (received, split_scheduler_plan) = if let Some(result) = split_result {
+        result
     } else {
-        kernel.ipc_recv(cap).map_err(SyscallError::from)?
+        (kernel.ipc_recv(cap).map_err(SyscallError::from)?, IpcSchedulerPlan::None)
     };
+    // Apply deferred scheduler plan: wake sender whose message was refilled into the
+    // endpoint queue under ipc_state_lock (Stage 4D). Lock is released; safe to wake.
+    if let IpcSchedulerPlan::WakeSender(wake_tid) = split_scheduler_plan {
+        let _ = kernel.apply_split_sender_wake_plan(wake_tid);
+    }
     let recv_v2_request = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) != 0
         && frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) >= IPC_RECV_META_V2_ENCODED_LEN;
     if received.is_none() {
@@ -1100,8 +1111,34 @@ fn handle_ipc_recv_timeout(
             None
         }
     };
+    // Stage 4G: for try-recv (timeout_ticks == 0), attempt the Stage 4C/4D split path
+    // first. On success the split path avoids the full ipc_recv path entirely.
+    // If ineligible, fall through to try_ipc_recv as before.
+    let mut try_recv_scheduler_plan = IpcSchedulerPlan::None;
     let received = if timeout_ticks == 0 {
-        kernel.try_ipc_recv(cap).map_err(SyscallError::from)?
+        let split_try = match endpoint {
+            CapObject::Endpoint { .. } => {
+                let endpoint_idx = kernel
+                    .resolve_endpoint_index(endpoint)
+                    .map_err(SyscallError::from)?;
+                match kernel.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx) {
+                    IpcEndpointRecvResult::Received(msg) => {
+                        Some((Some(msg), IpcSchedulerPlan::None))
+                    }
+                    IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
+                        Some((Some(msg), IpcSchedulerPlan::WakeSender(wake_tid)))
+                    }
+                    IpcEndpointRecvResult::Ineligible(_) => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some((msg, plan)) = split_try {
+            try_recv_scheduler_plan = plan;
+            msg
+        } else {
+            kernel.try_ipc_recv(cap).map_err(SyscallError::from)?
+        }
     } else if let Some(deadline) = preread_deadline {
         kernel
             .ipc_recv_until_deadline(cap, deadline)
@@ -1111,6 +1148,10 @@ fn handle_ipc_recv_timeout(
             .ipc_recv_with_deadline(cap, timeout_ticks)
             .map_err(SyscallError::from)?
     };
+    // Apply deferred scheduler plan from Stage 4D/4G split recv refill if any.
+    if let IpcSchedulerPlan::WakeSender(wake_tid) = try_recv_scheduler_plan {
+        let _ = kernel.apply_split_sender_wake_plan(wake_tid);
+    }
     let timed_out = if timeout_ticks == 0 {
         false
     } else {
