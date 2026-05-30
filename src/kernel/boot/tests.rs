@@ -2569,6 +2569,76 @@ fn run_ipc_recv_timeout_try_recv_uses_split_path() {
     assert_eq!(state.task_status(0), before_status);
 }
 
+#[test]
+fn ipc_recv_timeout_syscall_nonzero_timeout_uses_split_when_message_queued() {
+    std::thread::Builder::new()
+        .name("ipc_recv_timeout_syscall_nonzero_timeout_uses_split_when_message_queued".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_recv_timeout_syscall_nonzero_timeout_uses_split_when_message_queued)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_recv_timeout_syscall_nonzero_timeout_uses_split_when_message_queued() {
+    // Stage 4I: IpcRecvTimeout with timeout_ticks > 0 should use the Stage 4C/4D split
+    // path when a plain message is already queued. Delivery is immediate — the deadline
+    // is irrelevant when the queue is non-empty. Ineligible cases (empty queue,
+    // non-plain message) still fall back to the full timed path.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    state
+        .ipc_send(send_cap, Message::new(7, b"timed4i").expect("msg"))
+        .expect("queue");
+    let before_tid = state.current_tid();
+    let before_status = state.task_status(0);
+    let before_queued_recvs = state.ipc_path_telemetry().queued_recvs;
+
+    let payload_ptr = 0x3000usize;
+    let meta_ptr = 0x4000usize;
+    let asid = map_ipc_recv_syscall_buffers_for_task(
+        &mut state,
+        0,
+        payload_ptr,
+        meta_ptr,
+        0xC000,
+    );
+
+    // Dispatch IpcRecvTimeout with timeout_ticks=1000 (nonzero — Stage 4I path).
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecvTimeout as usize,
+        [
+            recv_cap.0 as usize,   // arg[0] = cap
+            payload_ptr,            // arg[1] = user_ptr
+            Message::MAX_PAYLOAD,   // arg[2] = user_len
+            1000,                   // arg[3] = timeout_ticks (nonzero)
+            meta_ptr,               // arg[4] = meta_ptr
+            40,                     // arg[5] = meta_len
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc recv timeout Stage 4I");
+
+    assert_eq!(frame.error_code(), None, "Stage 4I recv must succeed");
+    assert_eq!(state.current_tid(), before_tid, "sender tid must not change");
+    assert_eq!(state.task_status(0), before_status, "task status must not change");
+    let payload = state
+        .read_user_memory_for_asid(asid, payload_ptr, 7)
+        .expect("payload copy");
+    assert_eq!(&payload[..7], b"timed4i", "Stage 4I must deliver queued payload");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        0,
+        "queue must be empty after Stage 4I split recv"
+    );
+    assert_eq!(
+        state.ipc_path_telemetry().queued_recvs,
+        before_queued_recvs + 1,
+        "Stage 4I must increment queued_recvs telemetry"
+    );
+}
+
 fn map_ipc_recv_syscall_buffers_for_task(
     state: &mut KernelState,
     tid: u64,

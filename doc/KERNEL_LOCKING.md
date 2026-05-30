@@ -940,16 +940,17 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
   before the lock is released, so the state is consistent even if the system
   is observed between Phase 1 and Phase 2.
 - `IpcRecv` syscall dispatch now handles both `Received` and
-  `ReceivedWithSenderWake` variants; `IpcRecvTimeout` (timeout_ticks > 0) also
-  propagates the wake plan through the same split path when Stage 4C/4D applies.
+  `ReceivedWithSenderWake` variants; `IpcRecvTimeout` (any timeout_ticks value)
+  also propagates the wake plan through the same split path when Stage 4C/4D/4I
+  applies.
 - The global `SharedKernel` lock remains retained for all other IPC mutation.
   **This is not full global-lock removal.**
 
 ### Stage 4G: IpcRecvTimeout try-recv (timeout_ticks == 0) reuses Stage 4C/4D split
 
-- `handle_ipc_recv_timeout` now routes `timeout_ticks == 0` (non-blocking
-  try-recv) through `ipc_try_recv_queued_plain_endpoint_only` before falling
-  back to the existing `try_ipc_recv` full path.
+- `handle_ipc_recv_timeout` routes `timeout_ticks == 0` (non-blocking try-recv)
+  through `ipc_try_recv_queued_plain_endpoint_only` before falling back to the
+  existing `try_ipc_recv` full path.
 - When a plain queued message is present, Stage 4C applies: the message is
   dequeued under `ipc_state_lock` and the caller proceeds without blocking.
   When a plain sender waiter is also present, Stage 4D applies: the two-phase
@@ -960,10 +961,97 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - `IpcSchedulerPlan` is propagated through the timeout_ticks == 0 branch in
   the same way as the `IpcRecv` branch: the wake plan is applied after the split
   helper returns and before the syscall completes.
-- `timeout_ticks > 0` (blocking recv-timeout with deadline) is **not** changed
-  by Stage 4G; those cases still use the Phase L3 split-read bridge or the
-  full IPC deadline path.
+- `timeout_ticks > 0` (blocking recv-timeout with deadline) was not changed by
+  Stage 4G; extended by Stage 4I below.
 - The global `SharedKernel` lock remains retained for all other IPC mutation.
+  **This is not full global-lock removal.**
+
+### Stage 4I: IpcRecvTimeout nonzero timeout uses split path for immediate queued recv
+
+#### Rationale
+
+Stage 4G restricted the split recv path to `timeout_ticks == 0`.  That guard was
+conservative: the deadline is only needed if the receiver must *block* (empty queue,
+ineligible endpoint).  When a plain message is already in the queue, dequeuing it is
+immediate regardless of the timeout value.
+
+#### Change
+
+In `handle_ipc_recv_timeout` (`src/kernel/syscall.rs`), the Stage 4G/4I split
+attempt now runs **before** the `if timeout_ticks == 0 / else` branch:
+
+```
+// Old structure:
+if timeout_ticks == 0 {
+    split_try → try_ipc_recv
+} else if preread_deadline { ipc_recv_until_deadline }
+  else                     { ipc_recv_with_deadline }
+
+// New structure:
+immediate_result = split_try (regardless of timeout_ticks)
+if immediate_result.is_some() { use it }
+else if timeout_ticks == 0    { try_ipc_recv }
+else if preread_deadline       { ipc_recv_until_deadline }
+else                           { ipc_recv_with_deadline }
+```
+
+#### Correctness argument
+
+- If `ipc_try_recv_queued_plain_endpoint_only` returns `Received` or
+  `ReceivedWithSenderWake`, the message was dequeued under `ipc_state_lock` and
+  delivery is complete — no blocking needed, deadline unused.
+- The `timed_out` computation checks `consume_ipc_timeout_fired_for_tid`:
+  because we never registered a timer (split path returned immediately),
+  `ipc_timeout_fired == false` and `received == Some(msg)`, so `timed_out = false`.
+  `clear_blocked_recv_state` is called with `"immediate_success"`. ✓
+- If the split is ineligible (empty queue, non-plain message, complex state),
+  the path falls through to `try_ipc_recv` (timeout 0), `ipc_recv_until_deadline`
+  (preread deadline), or `ipc_recv_with_deadline` (full timed path) — all
+  unchanged.
+
+#### Lock contract (unchanged from Stage 4G)
+
+No new lock acquisitions.  `ipc_state_lock` (rank 4) acquired only inside
+`ipc_try_recv_queued_plain_endpoint_only`.  Deferred sender wake via
+`apply_split_sender_wake_plan` is applied outside the lock.  The `timed_out`
+evaluation and `handle_ipc_recv_result_with_empty_error` call happen after all
+locks are released.
+
+#### New telemetry field
+
+`IpcPathTelemetry::queued_recvs: u64` — incremented on each successful split recv
+(both Stage 4G and Stage 4I paths).  Added to `crates/yarm-kernel/src/boot.rs`;
+both the kernel-internal and the re-exported `yarm_kernel::boot::IpcPathTelemetry`
+struct gain the field.  The size-equality assertion in `types.rs` and
+`extraction_bridge_tests.rs` remains valid since both sides reference the same type.
+
+#### Test
+
+`ipc_recv_timeout_syscall_nonzero_timeout_uses_split_when_message_queued`:
+IpcRecvTimeout with `timeout_ticks=1000` on a pre-loaded endpoint.  Asserts
+immediate receipt, empty queue, task status unchanged, `queued_recvs` incremented.
+
+#### Fallback rules
+
+`handle_ipc_recv_timeout` falls back to the full timed path for any of the
+following:
+- Queue empty or no plain message at split time.
+- Endpoint is not buffered, or message has transfer/reply-cap flags.
+- Complex sender-waiter state (any sender waiter present alongside a receiver waiter).
+- Non-endpoint capability (notification, etc.).
+
+All such cases are routed to `try_ipc_recv`, `ipc_recv_until_deadline`, or
+`ipc_recv_with_deadline` exactly as before Stage 4I.
+
+#### What Stage 4I does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback: unchanged.
+- Phase 3B checks: not weakened.
+- recv-v2, call, reply, cap-transfer: no change; all fall back to full IPC path.
+- The global `SharedKernel` lock is still retained for all other IPC mutation.
   **This is not full global-lock removal.**
 
 ### Stage 4D/4G review (clean — no changes required)
@@ -1235,6 +1323,36 @@ rank-3 → rank-4 ordering for `is_task_recv_v2_blocked` are unchanged.
 with `len=0` and `SYSCALL_ARG_INLINE_PAYLOAD1=100` (so `send_timeout_ticks=100`)
 to a waiting plain receiver. Asserts receiver becomes Runnable, waiter slot cleared,
 message queued, telemetry incremented.
+
+#### Stage 4H review result (clean — no changes required)
+
+Stage 4H was reviewed against five points:
+
+1. **Nonzero-timeout immediate plain send is semantically identical to full path**:
+   Stage 4E (queue enqueue) and Stage 4F (receiver waiting) both deliver immediately.
+   Neither path registers a timer or blocks the sender; `send_timeout_ticks` is
+   consumed only by the full `ipc_send_with_deadline` blocking path, which is
+   bypassed when the split succeeds.  **CLEAN.**
+
+2. **Ineligible timeout cases still fall back to `ipc_send_with_deadline`**:
+   When `split_send_result = None`, the fallback at `syscall.rs:944–950` routes
+   `send_timeout_ticks == 0` to `ipc_send` and `send_timeout_ticks != 0` to
+   `ipc_send_with_deadline(cap, msg, send_timeout_ticks)` — unchanged.  **CLEAN.**
+
+3. **`stash_transfer_handle(kernel, None, ...)` has no side effects**:
+   The function returns `Ok(None)` immediately at the `let Some(...) else { return Ok(None); }`
+   guard on the first line.  No capability resolution, no envelope stash, no
+   receiver-tid lookup.  **CLEAN.**
+
+4. **No timeout/deadline blocking behavior changed**:
+   The split path returns `Some(Ok(()))` only on immediate success.  All cases
+   where the sender would have blocked (full queue, complex waiter state, etc.)
+   return `Ineligible`, leaving the deadline path unmodified.  **CLEAN.**
+
+5. **IPC ABI/SYSCALL_COUNT, x86_64 SMP, register writeback, SpawnV5, MemoryObject
+   zero-copy, VFS, syscall 27, Phase 3B untouched**:
+   The change is a one-line guard removal in `handle_ipc_send`; no other file or
+   subsystem was modified.  **CLEAN.**
 
 ---
 
