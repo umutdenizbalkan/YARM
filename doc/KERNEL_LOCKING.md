@@ -1589,6 +1589,20 @@ New telemetry field in `IpcPathTelemetry` (`crates/yarm-kernel/src/boot.rs`):
   (message delivered directly), `split_recv_v2_deliveries` incremented, and payload
   written to task 1's user memory.
 
+#### Stage 4K code review (2026-05-30)
+
+A deep review across 10 correctness dimensions was performed before Stage 4L work began:
+
+1. **Phase ordering** — Phase 1 (snapshot TID under `ipc_state_lock`) precedes Phase 3 (delivery outside lock) precedes Phase 4 (clear slot under `ipc_state_lock`) precedes Phase 5 (wake outside lock). Correct.
+2. **Lock ordering** — `is_task_recv_v2_blocked` acquires `task_state_lock` (rank 3) before `ipc_clear_plain_receiver_waiter_only` re-enters `ipc_state_lock` (rank 4). Correct.
+3. **Slot re-verification** — `ipc_clear_plain_receiver_waiter_only` re-reads the slot and only clears it if it still matches `expected_receiver_tid`. Defence-in-depth. Correct.
+4. **Error recovery** — On `complete_blocked_recv_for_waiter` failure, `?` propagates out of `handle_ipc_send` before the slot is cleared. The receiver's `blocked_recv_state` was already consumed (`take()`), leaving the receiver orphaned — same semantics as the full `ipc_send` path. No new orphan risk introduced.
+5. **`split_unsafe_flags` bypass** — The flag check is on the no-waiter enqueue path only; `ReceiverWaiterFound` arm has no such check. Stage 4K only reaches this arm inside the `transfer_cap.is_none()` guard in `handle_ipc_send`, which already excludes FLAG_REPLY_CAP / FLAG_CAP_TRANSFER messages. Correct.
+6. **Telemetry** — `note_split_recv_v2_delivery` uses `saturating_add`. Correct.
+7. **No queue bypass** — Message is never enqueued when `ReceiverWaiterFound` fires; queue remains empty. Correct.
+
+**Verdict**: Stage 4K is clean. No bugs found.
+
 #### What Stage 4K does NOT change
 
 - IPC syscall ABI and SYSCALL_COUNT: unchanged.
@@ -1600,7 +1614,124 @@ New telemetry field in `IpcPathTelemetry` (`crates/yarm-kernel/src/boot.rs`):
 
 ---
 
-### Deferred IPC split paths (analysis only — not implemented)
+### Stage 4L: IpcCall recv-v2 blocked delivery split
+
+**Implemented**: 2026-05-30. Affects `handle_ipc_call` in `src/kernel/syscall.rs`.
+
+#### Motivation
+
+Stage 4K showed that `ipc_try_send_queued_plain_endpoint_only` returns
+`ReceiverWaiterFound(receiver_tid)` for any flag combination when a receiver
+waiter is present — the `split_unsafe_flags` check only fires on the no-waiter
+enqueue branch. Stage 4K exploited this for plain `IpcSend` messages.
+
+`IpcCall` messages carry `FLAG_REPLY_CAP`. Previously, when the receiver was
+recv-v2 blocked, `handle_ipc_call` fell through to the full `ipc_send` path.
+Stage 4L eliminates that fallback by applying the same Phase 1–5 protocol.
+`complete_blocked_recv_for_waiter` already handles `FLAG_REPLY_CAP` correctly
+via `materialize_received_message_cap`.
+
+#### Protocol (Phase 1–5, identical structure to Stage 4K)
+
+```
+Phase 1  ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg)
+           → under ipc_state_lock (rank 4)
+           → ReceiverWaiterFound(receiver_tid) when receiver waiter present
+             with no sender waiters; FLAG_REPLY_CAP does not block this arm.
+
+Phase 2  is_task_recv_v2_blocked(receiver_tid.0)
+           → acquires task_state_lock (rank 3)
+           → must precede any ipc_state_lock re-acquisition (lock ordering)
+
+Phase 3  complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg)
+           → runs OUTSIDE ipc_state_lock
+           → copies payload and meta to receiver's user memory
+           → calls materialize_received_message_cap → mints reply cap in
+             receiver's cnode (capability_state_lock rank 5, no ipc lock held)
+           → sets FLAG_REPLY_CAP in meta[24..32] via SYSCALL_RECV_META_REPLY_CAP
+           → on failure: take_transfer_envelope cleans up stashed reply cap using
+             already-captured sender_tid (avoids second current_tid() call)
+             then propagates SyscallError
+
+Phase 4  ipc_clear_plain_receiver_waiter_only(endpoint_idx, receiver_tid)
+           → re-enters ipc_state_lock (rank 4)
+           → clears endpoint_waiters[endpoint_idx] only if slot still matches
+             expected_receiver_tid (defence-in-depth re-verify)
+
+         note_ipc_call_split_delivery()
+           → increments ipc_call_split_deliveries (saturating)
+
+Phase 5  apply_split_receiver_wake_plan(receiver_tid)
+           → OUTSIDE ipc_state_lock
+           → wake_tid_to_runnable(receiver_tid) sets task Runnable and enqueues
+             on the scheduler runqueue
+```
+
+If Phase 1 returns any result other than `ReceiverWaiterFound`, or if Phase 2
+finds the receiver is not recv-v2 blocked, the code falls through to the existing
+`kernel.ipc_send(cap, msg)` full path unchanged.
+
+#### Lock contract (Stage 4L)
+
+- No `ipc_state_lock` held during: user-memory copy (Phase 3), capability minting
+  (Phase 3), `task_state_lock` acquisition (Phase 2), or scheduler mutation (Phase 5).
+- Lock ordering: `task_state_lock` (rank 3) → `ipc_state_lock` (rank 4) →
+  `capability_state_lock` (rank 5). Phases 2, 3, 4 are sequentially non-overlapping.
+- `ipc_state_lock` is entered at Phase 1 (via `ipc_try_send_queued_plain_endpoint_only`)
+  and again at Phase 4 (via `ipc_clear_plain_receiver_waiter_only`) with no nesting.
+
+#### Transfer envelope cleanup (error path)
+
+If `complete_blocked_recv_for_waiter` fails, the reply-cap transfer envelope stashed
+by `stash_transfer_handle` must be cleaned up before returning. Stage 4L does this
+explicitly using the already-captured `sender_tid` (not `current_tid(kernel)?` which
+could itself fail):
+
+```rust
+Err(e) => {
+    if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
+        let _ = kernel.take_transfer_envelope(handle, endpoint,
+            crate::kernel::ipc::ThreadId(sender_tid));
+    }
+    return Err(e);
+}
+```
+
+#### API surface (Stage 4L)
+
+New items in `IpcPathTelemetry` (`crates/yarm-kernel/src/boot.rs`):
+
+- `ipc_call_split_deliveries: u64` — counts successful Stage 4L deliveries.
+
+New method on `KernelState` (`src/kernel/boot/ipc_state.rs`):
+
+- `note_ipc_call_split_delivery()` — increments `ipc_call_split_deliveries` (saturating).
+
+#### Tests (Stage 4L)
+
+- `ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver`
+  (`src/kernel/boot/tests.rs`): integration test — task 1 blocks in IpcRecv with
+  recv-v2 args (meta_ptr != 0, meta_len ≥ 40) on endpoint_A; task 0 issues IpcCall
+  using a send cap on endpoint_A and a reply_recv_cap on endpoint_B (reply channel);
+  Stage 4L fires; asserts task 1 is Runnable, endpoint_A waiter slot cleared,
+  queue empty (message delivered directly), `ipc_call_split_deliveries` incremented,
+  `SYSCALL_RECV_META_REPLY_CAP` bit set in meta[24..32], and sender tid correct
+  in meta[32..40].
+
+#### What Stage 4L does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback: unchanged.
+- Phase 3B checks: not weakened.
+- The global `SharedKernel` lock is still retained.  **This is not full global-lock removal.**
+- IpcReply recv-v2 path: unchanged (already has a direct delivery path in `ipc_reply`,
+  lines 937–971 of `ipc_state.rs`, with its own lock discipline).
+
+---
+
+### Deferred IPC split paths
 
 The following send/receive cases are explicitly deferred. They cannot be split
 without violating the hard invariants on `ipc_state_lock` scope. They fall back
@@ -1624,17 +1755,25 @@ handoff then fails or races, the waiter is orphaned with no recovery path.
 The Stage 4F buffered-path split intentionally excludes non-buffered endpoints
 (`Ineligible(NonBufferedEndpoint)`).
 
-#### Cap-transfer / call / reply sends (deferred)
+#### Cap-transfer and reply sends without recv-v2 receiver (deferred)
 
-**Blocker**: these paths require capability minting, reply-cap materialization,
-transfer-envelope allocation, and/or `TrapFrame` writes — all forbidden under
-`ipc_state_lock`. The `FLAG_CAP_TRANSFER`, `FLAG_CAP_TRANSFER_PLAIN`, and
-`FLAG_REPLY_CAP` message flag checks in `ipc_try_recv_queued_plain_endpoint_only`
-and `ipc_try_send_queued_plain_endpoint_only` correctly reject these messages
-and return `Ineligible(TransferOrReplyCapMessage)`.
+**Blocker**: `FLAG_CAP_TRANSFER` and `FLAG_CAP_TRANSFER_PLAIN` messages require
+capability minting, transfer-envelope allocation, and/or `TrapFrame` writes under
+`ipc_state_lock`. The `ipc_try_recv_queued_plain_endpoint_only` and the no-waiter
+branch of `ipc_try_send_queued_plain_endpoint_only` correctly reject these messages
+with `Ineligible(TransferOrReplyCapMessage)`.
 
-**Decision**: deferred indefinitely. Cap-transfer, call, and reply paths remain
-on the full IPC path.
+`FLAG_REPLY_CAP` messages (IpcCall, IpcReply) when the receiver is **not** recv-v2
+blocked also remain on the full path — the `ReceiverWaiterFound` arm returns the TID
+but the caller checks `is_task_recv_v2_blocked` and falls back to `ipc_send` for
+non-recv-v2 receivers.
+
+**Note**: `FLAG_REPLY_CAP` to a **recv-v2 blocked** receiver is now handled by
+Stage 4L (IpcCall) and the existing `ipc_reply` direct path, both of which call
+`complete_blocked_recv_for_waiter` outside `ipc_state_lock`.
+
+**Decision**: remaining cap-transfer paths and call/reply to non-recv-v2 receivers
+remain on the full IPC path indefinitely.
 
 ---
 

@@ -13,6 +13,7 @@ pub struct IpcPathTelemetry {
     pub queued_sends: u64,
     pub queued_recvs: u64,
     pub split_recv_v2_deliveries: u64,
+    pub ipc_call_split_deliveries: u64,
     pub blocked_sends: u64,
     pub rendezvous_handoffs: u64,
     pub transfer_records_created: u64,
