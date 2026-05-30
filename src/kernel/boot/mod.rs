@@ -103,10 +103,13 @@ pub(crate) enum IpcEndpointRecvResult {
     Ineligible(IpcEndpointSplitRejectReason),
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IpcEndpointSendResult {
     Enqueued,
+    /// Stage 4F: plain send to a waiting legacy (non-recv-v2) receiver.
+    /// Message enqueued and receiver slot cleared under ipc_state_lock.
+    /// Caller must apply WakeReceiver outside the lock via apply_split_receiver_wake_plan.
+    EnqueuedWakeReceiver(ThreadId),
     Ineligible(IpcEndpointSplitRejectReason),
 }
 
@@ -116,6 +119,9 @@ pub(crate) enum IpcSchedulerPlan {
     /// Wake a sender whose message was refilled into the endpoint queue under ipc_state_lock.
     /// Apply with apply_split_sender_wake_plan outside any ipc/endpoint lock.
     WakeSender(ThreadId),
+    /// Stage 4F: wake a receiver whose waiter slot was cleared under ipc_state_lock.
+    /// Apply with apply_split_receiver_wake_plan outside any ipc/endpoint lock.
+    WakeReceiver(ThreadId),
 }
 #[cfg(feature = "hosted-dev")]
 const MAX_COW_PAGES: usize = 1024;
