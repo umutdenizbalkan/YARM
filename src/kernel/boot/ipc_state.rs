@@ -503,18 +503,34 @@ impl KernelState {
                     IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
                 );
             }
-            if ipc.endpoint_waiters[endpoint_idx].is_some() {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
-                );
-            }
-            if ipc.endpoint_sender_waiters[endpoint_idx]
+            let receiver_waiter = ipc.endpoint_waiters[endpoint_idx];
+            let has_sender_waiters = ipc.endpoint_sender_waiters[endpoint_idx]
                 .iter()
-                .any(Option::is_some)
-            {
-                return IpcEndpointSendResult::Ineligible(
-                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
-                );
+                .any(Option::is_some);
+
+            match (receiver_waiter, has_sender_waiters) {
+                (Some(_), true) => {
+                    // Both receiver and sender waiters present: complex ordering state.
+                    // Fall back to the full IPC send path which handles this correctly.
+                    return IpcEndpointSendResult::Ineligible(
+                        IpcEndpointSplitRejectReason::SenderWaiterPresent,
+                    );
+                }
+                (Some(receiver_tid), false) => {
+                    // Receiver waiter present, no sender waiters.
+                    // TID comes from a locked ipc_state_lock read — no unlocked access needed.
+                    // Caller must check is_task_recv_v2_blocked (task_state_lock rank 3) before
+                    // calling ipc_try_send_to_plain_receiver_endpoint_only (ipc_state_lock rank 4).
+                    return IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid);
+                }
+                (None, true) => {
+                    return IpcEndpointSendResult::Ineligible(
+                        IpcEndpointSplitRejectReason::SenderWaiterPresent,
+                    );
+                }
+                (None, false) => {
+                    // No waiters: fall through to Stage 4E queue-enqueue logic below.
+                }
             }
 
             let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
@@ -546,21 +562,6 @@ impl KernelState {
 
             IpcEndpointSendResult::Enqueued
         })
-    }
-
-    /// Return the waiter tid for an endpoint directly from the array (no lock).
-    ///
-    /// Safe only when the caller already holds the SharedKernel global lock (i.e. is in a
-    /// syscall handler) and will NOT subsequently acquire ipc_state_lock at rank 4 before
-    /// first dropping any rank-3 lock it acquires. Used for the Stage 4F pre-check ordering:
-    ///   1. direct read here (no lock)
-    ///   2. is_task_recv_v2_blocked (task_state_lock rank 3)
-    ///   3. ipc_try_send_to_plain_receiver_endpoint_only (ipc_state_lock rank 4)
-    pub(crate) fn ipc_endpoint_waiter_tid_direct(&self, endpoint_idx: usize) -> Option<ThreadId> {
-        if endpoint_idx >= self.ipc.endpoint_waiters.len() {
-            return None;
-        }
-        self.ipc.endpoint_waiters[endpoint_idx]
     }
 
     /// Return true if the task identified by `tid` is blocked on a recv-v2 operation.
@@ -604,6 +605,17 @@ impl KernelState {
             if ipc.endpoint_waiters[endpoint_idx] != Some(expected_receiver_tid) {
                 return IpcEndpointSendResult::Ineligible(
                     IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
+                );
+            }
+            // Defense-in-depth: sender waiters should have been screened out by
+            // ipc_try_send_queued_plain_endpoint_only returning ReceiverWaiterFound only when
+            // no sender waiters are present. Re-check under lock for safety.
+            if ipc.endpoint_sender_waiters[endpoint_idx]
+                .iter()
+                .any(Option::is_some)
+            {
+                return IpcEndpointSendResult::Ineligible(
+                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
                 );
             }
             let split_unsafe_flags = Message::FLAG_CAP_TRANSFER

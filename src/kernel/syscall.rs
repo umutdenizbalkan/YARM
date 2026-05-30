@@ -2,8 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::boot::{
-    IpcEndpointRecvResult, IpcEndpointSendResult, IpcEndpointSplitRejectReason, IpcSchedulerPlan,
-    KernelError, KernelState, MemoryObjectKind, TransferSharedRegion,
+    IpcEndpointRecvResult, IpcEndpointSendResult, IpcSchedulerPlan, KernelError, KernelState,
+    MemoryObjectKind, TransferSharedRegion,
 };
 use super::capabilities::{CapId, CapObject, CapRights, Capability};
 use super::ipc::{
@@ -910,37 +910,24 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                         IpcEndpointSendResult::EnqueuedWakeReceiver(_) => {
                             unreachable!("Stage 4E never returns EnqueuedWakeReceiver")
                         }
-                        IpcEndpointSendResult::Ineligible(
-                            IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
-                        ) => {
-                            // Stage 4F: sender-waiter pre-check confirmed no sender waiter,
-                            // but there is a receiver waiter. Try the split send-to-receiver path.
-                            let maybe_receiver =
-                                kernel.ipc_endpoint_waiter_tid_direct(endpoint_idx);
-                            if let Some(receiver_tid) = maybe_receiver {
-                                // Check recv-v2 under task_state_lock (rank 3) BEFORE
-                                // ipc_state_lock (rank 4) — required by lock ordering.
-                                let is_recv_v2 =
-                                    kernel.is_task_recv_v2_blocked(receiver_tid.0);
-                                if !is_recv_v2 {
-                                    match kernel
-                                        .ipc_try_send_to_plain_receiver_endpoint_only(
-                                            endpoint_idx,
-                                            receiver_tid,
-                                            msg,
-                                        )
-                                    {
-                                        IpcEndpointSendResult::EnqueuedWakeReceiver(recv_tid) => {
-                                            kernel.note_endpoint_only_queued_send_split();
-                                            (
-                                                Some(Ok(())),
-                                                IpcSchedulerPlan::WakeReceiver(recv_tid),
-                                            )
-                                        }
-                                        _ => (None, IpcSchedulerPlan::None),
+                        IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
+                            // Stage 4F: ipc_try_send_queued_plain_endpoint_only found a plain
+                            // receiver waiter with no sender waiters. TID came from ipc_state_lock
+                            // read — no unlocked waiter array access needed.
+                            // Check recv-v2 under task_state_lock (rank 3) BEFORE
+                            // ipc_state_lock (rank 4) — required by lock ordering.
+                            let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
+                            if !is_recv_v2 {
+                                match kernel.ipc_try_send_to_plain_receiver_endpoint_only(
+                                    endpoint_idx,
+                                    receiver_tid,
+                                    msg,
+                                ) {
+                                    IpcEndpointSendResult::EnqueuedWakeReceiver(recv_tid) => {
+                                        kernel.note_endpoint_only_queued_send_split();
+                                        (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(recv_tid))
                                     }
-                                } else {
-                                    (None, IpcSchedulerPlan::None)
+                                    _ => (None, IpcSchedulerPlan::None),
                                 }
                             } else {
                                 (None, IpcSchedulerPlan::None)
