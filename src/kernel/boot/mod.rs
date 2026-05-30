@@ -78,6 +78,38 @@ pub(crate) enum FaultBookkeepingMode {
     RecordInHandleTrapEvent,
     AlreadyRecordedBySharedSeam,
 }
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpcEndpointSplitRejectReason {
+    EndpointIndexOutOfRange,
+    EndpointMissing,
+    NonBufferedEndpoint,
+    EmptyQueue,
+    ReceiverWaiterPresent,
+    SenderWaiterPresent,
+    TransferOrReplyCapMessage,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpcEndpointRecvResult {
+    Received(Message),
+    Ineligible(IpcEndpointSplitRejectReason),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpcEndpointSendResult {
+    Enqueued,
+    Ineligible(IpcEndpointSplitRejectReason),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpcSchedulerPlan {
+    None,
+}
 #[cfg(feature = "hosted-dev")]
 const MAX_COW_PAGES: usize = 1024;
 #[cfg(not(feature = "hosted-dev"))]

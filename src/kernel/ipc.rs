@@ -116,6 +116,14 @@ impl Endpoint {
         self.queue[idx].take()
     }
 
+    pub fn peek(&self) -> Option<&Message> {
+        if self.len == 0 {
+            return None;
+        }
+
+        self.queue[self.head].as_ref()
+    }
+
     pub fn queued(&self) -> usize {
         self.len
     }

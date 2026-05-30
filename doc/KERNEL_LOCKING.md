@@ -848,6 +848,29 @@ The dispatch function takes the shared branch XOR the raw branch, never both.
 - The global `SharedKernel` lock remains retained for real mutation paths. This
   is not full Stage 3/global-lock removal.
 
+### Stage 4B: IPC endpoint-domain scaffolding (helper-only)
+
+- Added IPC endpoint-domain scaffolding only; no live syscall path is migrated in
+  this phase. Existing `KernelState::ipc_send`, `ipc_recv`,
+  `ipc_recv_with_deadline`, `ipc_call`, `ipc_reply`, and syscall handlers
+  continue to use the existing globally locked IPC behavior.
+- The first future live IPC candidate is intentionally narrow: a plain queued
+  receive from a buffered endpoint after endpoint cap/index/generation
+  validation, with no transfer flags, no reply-cap flags, no timeout, no sender
+  waiter refill, no blocking, no notification path, no recv-v2 blocked
+  completion, no user-memory copy, no `TrapFrame` writes, no cap
+  materialization, no shared-memory mapping, and no scheduler/TCB mutation.
+- `ipc_state_lock` is the initial coarse IPC-domain lock. It protects endpoint
+  queues, endpoint waiters, sender waiters, reply records, transfer envelopes,
+  notification/IRQ routing state, and IPC telemetry. Per-endpoint locks remain a
+  later design step after the coarse IPC-domain contract is proven.
+- `ipc_state_lock` must not be held while copying user memory, writing
+  `TrapFrame` registers, minting/revoking/transferring capabilities, mapping
+  shared memory, mutating scheduler queues, blocking/waking tasks, mutating TCB
+  wait metadata, or touching VM/VFS/Phase 3B paths.
+- The global `SharedKernel` lock remains retained for production IPC mutation.
+  This is not full global-lock removal.
+
 ### Stage 3: remove global lock from syscall fast path
 
 

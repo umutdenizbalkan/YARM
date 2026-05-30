@@ -2,8 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::{
-    IpcFastpathResult, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
-    NotificationObject, ReplyCapRecord, SenderWaiter, kernel_ref, map_ipc_error,
+    IpcEndpointRecvResult, IpcEndpointSplitRejectReason, IpcFastpathResult, KernelError,
+    KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, NotificationObject,
+    ReplyCapRecord, SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
@@ -341,6 +342,70 @@ impl KernelState {
             | CapObject::Reply { .. }
             | CapObject::Irq { .. } => Err(KernelError::WrongObject),
         }
+    }
+
+    /// Stage 4B endpoint-domain scaffolding for a future split receive path.
+    ///
+    /// Preconditions: the caller has already validated the receive capability and
+    /// endpoint generation. This helper intentionally mutates only the selected
+    /// buffered endpoint queue under `ipc_state_lock`; it refuses every case that
+    /// would require scheduler, TCB, capability, user-memory, reply-cap, transfer,
+    /// notification, timeout, or sender-waiter refill behavior.
+    #[allow(dead_code)]
+    pub(crate) fn ipc_try_recv_queued_plain_endpoint_only(
+        &mut self,
+        endpoint_idx: usize,
+    ) -> IpcEndpointRecvResult {
+        self.with_ipc_state_mut(|ipc| {
+            if endpoint_idx >= ipc.endpoints.len() {
+                return IpcEndpointRecvResult::Ineligible(
+                    IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+                );
+            }
+            if ipc.endpoint_waiters[endpoint_idx].is_some() {
+                return IpcEndpointRecvResult::Ineligible(
+                    IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
+                );
+            }
+            if ipc.endpoint_sender_waiters[endpoint_idx]
+                .iter()
+                .any(Option::is_some)
+            {
+                return IpcEndpointRecvResult::Ineligible(
+                    IpcEndpointSplitRejectReason::SenderWaiterPresent,
+                );
+            }
+
+            let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+                return IpcEndpointRecvResult::Ineligible(
+                    IpcEndpointSplitRejectReason::EndpointMissing,
+                );
+            };
+            let endpoint = kernel_mut(endpoint_storage);
+            if endpoint.mode() != EndpointMode::Buffered {
+                return IpcEndpointRecvResult::Ineligible(
+                    IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+                );
+            }
+
+            let Some(message) = endpoint.peek().copied() else {
+                return IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::EmptyQueue);
+            };
+            let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
+                | Message::FLAG_CAP_TRANSFER_PLAIN
+                | Message::FLAG_REPLY_CAP;
+            if (message.flags & split_unsafe_flags) != 0 || message.transferred_cap().is_some() {
+                return IpcEndpointRecvResult::Ineligible(
+                    IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
+                );
+            }
+
+            IpcEndpointRecvResult::Received(
+                endpoint
+                    .recv()
+                    .expect("peeked plain endpoint message must remain queued"),
+            )
+        })
     }
 
     fn resolve_reply_index(&self, object: CapObject) -> Result<usize, KernelError> {

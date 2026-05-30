@@ -2207,6 +2207,145 @@ fn synchronous_endpoint_supports_multiple_blocked_senders() {
 }
 
 #[test]
+fn endpoint_only_plain_recv_dequeues_without_scheduler_mutation() {
+    std::thread::Builder::new()
+        .name("endpoint_only_plain_recv_dequeues_without_scheduler_mutation".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_endpoint_only_plain_recv_dequeues_without_scheduler_mutation)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_endpoint_only_plain_recv_dequeues_without_scheduler_mutation() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    let (endpoint_idx, send_cap, _recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let before_tid = state.current_tid();
+    let before_status = state.task_status(0);
+
+    let msg = Message::new(7, b"plain").expect("plain msg");
+    state.ipc_send(send_cap, msg).expect("queue plain message");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1
+    );
+
+    let result = state.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx);
+    match result {
+        IpcEndpointRecvResult::Received(received) => {
+            assert_eq!(received.sender_tid, ThreadId(7));
+            assert_eq!(received.as_slice(), b"plain");
+        }
+        other => panic!("expected endpoint-only receive success, got {other:?}"),
+    }
+
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        0
+    );
+    assert_eq!(state.current_tid(), before_tid);
+    assert_eq!(state.task_status(0), before_status);
+}
+
+#[test]
+fn endpoint_only_plain_recv_rejects_transfer_and_reply_messages_without_dequeue() {
+    std::thread::Builder::new()
+        .name("endpoint_only_plain_recv_rejects_transfer_and_reply_messages".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_endpoint_only_plain_recv_rejects_transfer_and_reply_messages_without_dequeue)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_endpoint_only_plain_recv_rejects_transfer_and_reply_messages_without_dequeue() {
+    let cases = [
+        Message::FLAG_CAP_TRANSFER,
+        Message::FLAG_CAP_TRANSFER_PLAIN,
+        Message::FLAG_REPLY_CAP,
+    ];
+
+    for flags in cases {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        let (endpoint_idx, send_cap, _recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let msg = Message::with_header(7, 0x44, flags, Some(99), b"cap").expect("flagged msg");
+        state.ipc_send(send_cap, msg).expect("queue flagged message");
+
+        assert_eq!(
+            state.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx),
+            IpcEndpointRecvResult::Ineligible(
+                IpcEndpointSplitRejectReason::TransferOrReplyCapMessage
+            )
+        );
+        assert_eq!(
+            state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+            1,
+            "flagged message must remain queued for the existing full IPC path"
+        );
+    }
+}
+
+#[test]
+fn endpoint_only_plain_recv_rejects_sender_waiter_refill_case() {
+    std::thread::Builder::new()
+        .name("endpoint_only_plain_recv_rejects_sender_waiter_refill_case".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_endpoint_only_plain_recv_rejects_sender_waiter_refill_case)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_endpoint_only_plain_recv_rejects_sender_waiter_refill_case() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    state.enqueue_current_cpu(1).expect("enqueue receiver");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv cap");
+
+    let first = Message::new(0, b"first").expect("first msg");
+    state.ipc_send(send_cap, first).expect("queue first message");
+    let second = Message::new(0, b"second").expect("second msg");
+    assert_eq!(state.ipc_send(send_cap, second), Err(KernelError::WouldBlock));
+    assert_eq!(state.current_tid(), Some(1));
+    assert_eq!(
+        state.task_status(0),
+        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+    );
+
+    let before_receiver_status = state.task_status(1);
+    assert_eq!(
+        state.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx),
+        IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::SenderWaiterPresent)
+    );
+    assert_eq!(state.current_tid(), Some(1));
+    assert_eq!(state.task_status(1), before_receiver_status);
+    assert_eq!(
+        state.task_status(0),
+        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1,
+        "queued message must remain for the existing refill/wake path"
+    );
+
+    let received_first = state
+        .ipc_recv(recv_cap_task1)
+        .expect("raw recv")
+        .expect("first message");
+    assert_eq!(received_first.as_slice(), b"first");
+    assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
+    let received_second = state
+        .ipc_recv(recv_cap_task1)
+        .expect("raw recv second")
+        .expect("refilled sender message");
+    assert_eq!(received_second.as_slice(), b"second");
+}
+
+#[test]
 fn blocked_sender_queue_depth_is_uniform_across_endpoints() {
     let mut state = Bootstrap::init().expect("init");
     for tid in 1..=5u64 {
