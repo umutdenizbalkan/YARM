@@ -896,7 +896,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     };
 
     let (split_send_result, split_scheduler_plan) =
-        if send_timeout_ticks == 0 && transfer_cap.is_none() {
+        if transfer_cap.is_none() {
             match endpoint {
                 CapObject::Endpoint { .. } => {
                     let endpoint_idx = kernel

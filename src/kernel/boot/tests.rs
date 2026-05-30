@@ -3192,6 +3192,82 @@ fn run_ipc_send_syscall_split_delivers_to_waiting_plain_receiver() {
 }
 
 #[test]
+fn ipc_send_syscall_nonzero_timeout_to_waiting_receiver_uses_split_path() {
+    std::thread::Builder::new()
+        .name("ipc_send_syscall_nonzero_timeout_to_waiting_receiver_uses_split_path".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_send_syscall_nonzero_timeout_to_waiting_receiver_uses_split_path)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_send_syscall_nonzero_timeout_to_waiting_receiver_uses_split_path() {
+    // Stage 4H: nonzero send_timeout_ticks must not prevent the Stage 4F split path
+    // when a plain receiver is already waiting. Delivery is immediate in that case;
+    // the deadline is irrelevant to the split decision.
+    //
+    // Frame layout for IpcSend with len=0:
+    //   arg3 (PAYLOAD0) = 0 (unused payload)
+    //   arg4 (PAYLOAD1) = 100 → send_timeout_ticks = 100 (nonzero)
+    // send_timeout_ticks is decoded from arg4 when (sender_has_user_asid || len == 0).
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    state.enqueue_current_cpu(1).expect("enqueue receiver");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv cap to task 1");
+
+    state.yield_current().expect("switch to task 1");
+    assert_eq!(state.current_tid(), Some(1));
+    assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
+    assert_eq!(state.current_tid(), Some(0));
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        Some(ThreadId(1)),
+        "receiver must be registered as endpoint waiter"
+    );
+
+    // len=0 so send_timeout_ticks comes from PAYLOAD1 (arg4); set it to 100 (nonzero).
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcSend as usize,
+        [
+            send_cap.0 as usize,
+            0,   // PTR
+            0,   // LEN = 0 → timeout decoded from arg4
+            0,   // PAYLOAD0
+            100, // PAYLOAD1 = send_timeout_ticks
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc send syscall Stage 4H");
+
+    assert_eq!(frame.error_code(), None, "Stage 4H send must succeed");
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Runnable),
+        "receiver must be Runnable after Stage 4H wake"
+    );
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        "endpoint waiter slot must be cleared after Stage 4H"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1,
+        "message must be in queue for receiver to pick up"
+    );
+    assert_eq!(
+        state.ipc_path_telemetry().queued_sends,
+        1,
+        "Stage 4H must count as a split queued send"
+    );
+}
+
+#[test]
 fn ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mutation() {
     std::thread::Builder::new()
         .name("ipc_recv_syscall_uses_endpoint_only_plain_queued_branch".into())

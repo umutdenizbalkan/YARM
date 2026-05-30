@@ -1076,14 +1076,14 @@ waiters presence under lock as defense-in-depth, returning
 
 ---
 
-#### Stage 4F protocol (post-review)
+#### Stage 4F protocol (post-review, updated by Stage 4H)
 
 - Live `IpcSend` now also tries the Stage 4F split path when `ipc_try_send_queued_plain_endpoint_only`
   returns `ReceiverWaiterFound(receiver_tid)` (implying: no sender waiters, receiver present) and:
-  - `send_timeout_ticks == 0` (no blocking allowed)
   - `transfer_cap.is_none()` (no cap-transfer argument)
   - The waiting receiver is **not** recv-v2 blocked (verified under `task_state_lock` rank 3)
   - The endpoint is buffered and the message carries no cap-transfer or reply-cap flags
+  - Note: `send_timeout_ticks` value is irrelevant — delivery is immediate when a receiver waits
 
 #### Two-phase send-to-receiver protocol
 
@@ -1124,9 +1124,8 @@ re-verification fails → `Ineligible`, full path used).
 
 #### Fallback rules
 
-The Stage 4F path falls back to the full `ipc_send` path for any of the following:
+The Stage 4F/4H path falls back to the full `ipc_send` or `ipc_send_with_deadline` path for any of the following:
 
-- `send_timeout_ticks != 0` (blocking or deadline send).
 - `transfer_cap.is_some()` — cap-transfer requires minting/materialization.
 - Receiver is recv-v2 blocked — delivery requires `complete_blocked_recv_for_waiter`.
 - Message carries cap-transfer or reply-cap flags.
@@ -1186,6 +1185,56 @@ It is **not** held while:
 - recv-v2, call, reply, cap-transfer: no change; all fall back to full IPC path.
 - The global `SharedKernel` lock is still retained for all other IPC mutation.
   **This is not full global-lock removal.**
+
+### Stage 4H: extend Stage 4E/4F split to nonzero-timeout sends
+
+#### Rationale
+
+Stage 4F previously restricted the split path to `send_timeout_ticks == 0`.  That
+guard was conservative: the `send_timeout_ticks` deadline is only used if the sender
+must *block* (queue full, no receiver waiting). When a plain receiver is already
+waiting (Stage 4F) or when the queue has room (Stage 4E), delivery is immediate and
+the deadline is entirely irrelevant.
+
+#### Change
+
+In `handle_ipc_send` (`src/kernel/syscall.rs`), the split guard was:
+
+```rust
+if send_timeout_ticks == 0 && transfer_cap.is_none() {
+```
+
+Changed to:
+
+```rust
+if transfer_cap.is_none() {
+```
+
+This allows the Stage 4E (pure enqueue) and Stage 4F (receiver-waiter wake) split
+paths to fire for any `send_timeout_ticks` value, not just zero.  Cap-transfer sends
+are still excluded.
+
+#### Correctness argument
+
+- Stage 4E (`Enqueued`): message is placed in the queue and the function returns —
+  no blocking, deadline unused.
+- Stage 4F (`ReceiverWaiterFound → EnqueuedWakeReceiver`): message is queued and the
+  waiting receiver is woken — no blocking, deadline unused.
+- If either split returns `Ineligible` (queue full, complex state, wrong flags, etc.),
+  the fallback routing at lines 944–950 correctly calls `ipc_send` (timeout 0) or
+  `ipc_send_with_deadline` (timeout nonzero) based on `send_timeout_ticks`.
+
+#### Lock contract (unchanged from Stage 4F)
+
+No new lock acquisitions introduced.  The `ipc_state_lock` discipline and the
+rank-3 → rank-4 ordering for `is_task_recv_v2_blocked` are unchanged.
+
+#### Test
+
+`ipc_send_syscall_nonzero_timeout_to_waiting_receiver_uses_split_path`: IpcSend
+with `len=0` and `SYSCALL_ARG_INLINE_PAYLOAD1=100` (so `send_timeout_ticks=100`)
+to a waiting plain receiver. Asserts receiver becomes Runnable, waiter slot cleared,
+message queued, telemetry incremented.
 
 ---
 
