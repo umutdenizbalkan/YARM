@@ -2660,13 +2660,35 @@ fn run_endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue() {
     state.yield_current().expect("run receiver");
     assert_eq!(state.current_tid(), Some(1));
     assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
+    // Stage 4F pre-screen: receiver waiter present, no sender waiters
+    // → ReceiverWaiterFound with the locked TID, not Ineligible(ReceiverWaiterPresent).
     assert_eq!(
         state.ipc_try_send_queued_plain_endpoint_only(
             receiver_waiter_idx,
             Message::new(0, b"waiter").expect("msg"),
         ),
-        IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::ReceiverWaiterPresent)
+        IpcEndpointSendResult::ReceiverWaiterFound(ThreadId(1))
     );
+
+    // Co-presence guard: inject sender waiter + keep receiver waiter → Ineligible(SenderWaiterPresent).
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_sender_waiters[receiver_waiter_idx][0] = Some(SenderWaiter {
+            tid: ThreadId(42),
+            msg: Message::new(0, b"sw").expect("sw"),
+        });
+    });
+    assert_eq!(
+        state.ipc_try_send_queued_plain_endpoint_only(
+            receiver_waiter_idx,
+            Message::new(0, b"co").expect("co"),
+        ),
+        IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::SenderWaiterPresent),
+        "receiver+sender waiters co-presence must fall back to full path"
+    );
+    // Clean up injected sender waiter.
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_sender_waiters[receiver_waiter_idx][0] = None;
+    });
 
     let mut sender_waiter_state = Bootstrap::init_boxed().expect("sender waiter init");
     sender_waiter_state.register_task(1).expect("register sender2");
@@ -2787,17 +2809,18 @@ fn run_ipc_send_syscall_uses_endpoint_only_plain_enqueue_branch() {
 }
 
 #[test]
-fn ipc_send_syscall_receiver_waiter_falls_back_to_full_path() {
+fn ipc_send_syscall_plain_receiver_waiter_uses_stage_4f_split_path() {
     std::thread::Builder::new()
-        .name("ipc_send_syscall_receiver_waiter_falls_back_to_full_path".into())
+        .name("ipc_send_syscall_plain_receiver_waiter_uses_stage_4f_split_path".into())
         .stack_size(8 * 1024 * 1024)
-        .spawn(run_ipc_send_syscall_receiver_waiter_falls_back_to_full_path)
+        .spawn(run_ipc_send_syscall_plain_receiver_waiter_uses_stage_4f_split_path)
         .expect("spawn test thread")
         .join()
         .expect("join test thread");
 }
 
-fn run_ipc_send_syscall_receiver_waiter_falls_back_to_full_path() {
+fn run_ipc_send_syscall_plain_receiver_waiter_uses_stage_4f_split_path() {
+    // Plain non-recv-v2 receiver: Stage 4F split path fires via ReceiverWaiterFound.
     let mut state = Bootstrap::init_boxed().expect("init");
     state.register_task(1).expect("register receiver");
     state.enqueue_current_cpu(1).expect("enqueue receiver");
@@ -2830,10 +2853,80 @@ fn run_ipc_send_syscall_receiver_waiter_falls_back_to_full_path() {
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
         1,
-        "fallback full path must queue for the waiting receiver"
+        "Stage 4F must queue message for the waiting receiver"
     );
     let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
     assert_eq!(received.as_slice(), b"wake");
+}
+
+#[test]
+fn ipc_send_syscall_receiver_and_sender_waiters_fall_back_to_full_path() {
+    std::thread::Builder::new()
+        .name("ipc_send_syscall_receiver_and_sender_waiters_fall_back_to_full_path".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_send_syscall_receiver_and_sender_waiters_fall_back_to_full_path)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_send_syscall_receiver_and_sender_waiters_fall_back_to_full_path() {
+    // Co-presence of receiver waiter + sender waiters is a complex state: Stage 4F is
+    // ineligible (Ineligible(SenderWaiterPresent)) and the full IPC send path handles it.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    state.enqueue_current_cpu(1).expect("enqueue receiver");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv cap");
+    state.yield_current().expect("run receiver");
+    assert_eq!(state.current_tid(), Some(1));
+    assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
+    assert_eq!(state.current_tid(), Some(0));
+
+    // Directly inject a sender waiter to create the co-presence state.
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_sender_waiters[endpoint_idx][0] = Some(SenderWaiter {
+            tid: ThreadId(42),
+            msg: Message::new(0, b"queued_sw").expect("sw"),
+        });
+    });
+
+    // Verify the split helper rejects this state.
+    assert_eq!(
+        state.ipc_try_send_queued_plain_endpoint_only(
+            endpoint_idx,
+            Message::new(0, b"probe").expect("probe"),
+        ),
+        IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::SenderWaiterPresent),
+        "receiver+sender waiters co-presence must be rejected by the split helper"
+    );
+
+    // Remove the injected sender waiter so ipc_send (full path) can proceed normally.
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_sender_waiters[endpoint_idx][0] = None;
+    });
+
+    // Full path send succeeds.
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcSend as usize,
+        [
+            send_cap.0 as usize,
+            0,
+            4,
+            inline_payload_word(b"full"),
+            0,
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("full path send syscall");
+    assert_eq!(frame.error_code(), None);
+    assert_eq!(state.task_status(1), Some(TaskStatus::Runnable));
+    let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+    assert_eq!(received.as_slice(), b"full");
 }
 
 #[test]

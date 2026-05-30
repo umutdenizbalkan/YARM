@@ -1040,8 +1040,46 @@ reviewed against the following invariants. Result: **CLEAN**.
 
 ### Stage 4F: plain send to waiting legacy receiver
 
+#### Stage 4F review (complete — two issues found and fixed)
+
+**Issue 1: unlocked waiter TID read (FIXED)**
+
+The original `ipc_endpoint_waiter_tid_direct` helper read
+`self.ipc.endpoint_waiters[endpoint_idx]` without holding `ipc_state_lock`.
+This was documented as acceptable under the global `SharedKernel` lock
+(which serializes all syscall paths), but represented technical debt.
+
+**Fix:** `ipc_try_send_queued_plain_endpoint_only` now returns a new variant
+`IpcEndpointSendResult::ReceiverWaiterFound(ThreadId)` when a receiver waiter
+is present (with no sender waiters). The TID comes directly from the locked
+`ipc_state_lock` read inside that function — no unlocked array access is needed.
+`ipc_endpoint_waiter_tid_direct` has been removed entirely.
+
+**Issue 2: no sender-waiter co-presence guard (FIXED)**
+
+The original `ipc_try_send_to_plain_receiver_endpoint_only` did not check for
+sender waiters presence. A state with both a receiver waiter and sender waiters
+simultaneously (possible if the queue was drained while sender waiters remained)
+could have been handled by Stage 4F, which would have enqueued a new message
+without serving the earlier sender waiters first — incorrect ordering.
+
+**Fix 1:** `ipc_try_send_queued_plain_endpoint_only` now evaluates both
+`endpoint_waiters` and `endpoint_sender_waiters` together under `ipc_state_lock`:
+- receiver waiter + NO sender waiters → `ReceiverWaiterFound(tid)` (Stage 4F eligible)
+- receiver waiter + sender waiters → `Ineligible(SenderWaiterPresent)` (complex state, full path)
+- no receiver waiter + sender waiters → `Ineligible(SenderWaiterPresent)` (Stage 4E can't handle)
+- no waiters of either kind → Stage 4E queue-enqueue logic proceeds
+
+**Fix 2:** `ipc_try_send_to_plain_receiver_endpoint_only` also checks for sender
+waiters presence under lock as defense-in-depth, returning
+`Ineligible(SenderWaiterPresent)` if any are found.
+
+---
+
+#### Stage 4F protocol (post-review)
+
 - Live `IpcSend` now also tries the Stage 4F split path when `ipc_try_send_queued_plain_endpoint_only`
-  returns `Ineligible(ReceiverWaiterPresent)` and:
+  returns `ReceiverWaiterFound(receiver_tid)` (implying: no sender waiters, receiver present) and:
   - `send_timeout_ticks == 0` (no blocking allowed)
   - `transfer_cap.is_none()` (no cap-transfer argument)
   - The waiting receiver is **not** recv-v2 blocked (verified under `task_state_lock` rank 3)
@@ -1053,83 +1091,90 @@ reviewed against the following invariants. Result: **CLEAN**.
   `ipc_try_send_to_plain_receiver_endpoint_only(endpoint_idx, expected_receiver_tid, msg)`:
   1. Re-verifies `endpoint_waiters[endpoint_idx] == Some(expected_receiver_tid)` — guards
      against timeout clearing the slot between the pre-check and the lock acquisition.
-  2. Validates message flags (no cap-transfer, no reply-cap).
-  3. Enqueues `msg` into the endpoint queue.
-  4. Clears `endpoint_waiters[endpoint_idx] = None`.
-  5. Returns `IpcEndpointSendResult::EnqueuedWakeReceiver(receiver_tid)`.
+  2. Defense-in-depth: checks no sender waiters present under lock.
+  3. Validates message flags (no cap-transfer, no reply-cap).
+  4. Enqueues `msg` into the endpoint queue.
+  5. Clears `endpoint_waiters[endpoint_idx] = None`.
+  6. Returns `IpcEndpointSendResult::EnqueuedWakeReceiver(receiver_tid)`.
 - **Phase 2 (outside `ipc_state_lock`)**:
   `apply_split_receiver_wake_plan(receiver_tid)` calls `wake_tid_to_runnable(receiver_tid)`.
 
-#### Lock ordering for the Stage 4F pre-check sequence
+#### Lock ordering for the Stage 4F pre-check sequence (post-review)
 
 The pre-check sequence that precedes Phase 1 is:
 
 ```
-1. ipc_endpoint_waiter_tid_direct(endpoint_idx)   // no lock — direct array read
-2. is_task_recv_v2_blocked(tid)                   // task_state_lock (rank 3)
-3. ipc_try_send_to_plain_receiver_endpoint_only   // ipc_state_lock (rank 4)
+1. ipc_try_send_queued_plain_endpoint_only(...)    // ipc_state_lock (rank 4) — reads TID under lock
+   → returns ReceiverWaiterFound(receiver_tid)      // TID came from locked read
+2. is_task_recv_v2_blocked(receiver_tid.0)         // task_state_lock (rank 3)
+3. ipc_try_send_to_plain_receiver_endpoint_only    // ipc_state_lock (rank 4)
 ```
 
-This respects the mandatory ordering: rank 3 (task) acquired and **released**
-before rank 4 (ipc) is acquired. No lock inversion is possible.
+Steps 1 and 3 both acquire `ipc_state_lock` (rank 4), but each is a separate
+acquisition (the lock is released between them). Step 2 acquires
+`task_state_lock` (rank 3) after step 1 has released rank 4 and before step 3
+acquires it again. The mandatory ordering rank 3 → rank 4 is respected.
 
-`ipc_endpoint_waiter_tid_direct` reads `self.ipc.endpoint_waiters[endpoint_idx]`
-without holding `ipc_state_lock`. This is safe under the global `SharedKernel`
-lock, which serializes all syscall paths.
+There is no unlocked array access at any point. The TID used in step 2 and step 3
+is the value read under `ipc_state_lock` in step 1.
+
+The re-verification in step 3 catches the race where the receiver times out
+between steps 1 and 3 (waiter slot is cleared by timeout processing and
+re-verification fails → `Ineligible`, full path used).
 
 #### Fallback rules
 
-The Stage 4F path returns `Ineligible(...)` and falls back to the full
-`ipc_send` path for any of the following:
+The Stage 4F path falls back to the full `ipc_send` path for any of the following:
 
-- `send_timeout_ticks != 0` (blocking or deadline send) — scheduling/blocking involves
-  TCB/scheduler mutation that must not happen under `ipc_state_lock`.
+- `send_timeout_ticks != 0` (blocking or deadline send).
 - `transfer_cap.is_some()` — cap-transfer requires minting/materialization.
-- Receiver is recv-v2 blocked — delivery requires `complete_blocked_recv_for_waiter`
-  (user-memory copy, cap materialization, `TrapFrame` writes).
+- Receiver is recv-v2 blocked — delivery requires `complete_blocked_recv_for_waiter`.
 - Message carries cap-transfer or reply-cap flags.
 - Endpoint is not buffered (synchronous endpoints require `switch_to_runnable_tid`).
 - Endpoint queue is full.
-- Receiver slot was cleared by a timeout between pre-check and lock acquisition
-  (re-verify inside lock catches this race).
+- Both receiver waiter and sender waiters present (complex ordering, `SenderWaiterPresent`).
+- Receiver slot was cleared by timeout race (re-verify inside lock catches this).
 
-Synchronous (non-buffered) endpoint send-to-receiver is explicitly deferred:
-it requires `switch_to_runnable_tid` (scheduler handoff) which involves
-scheduler state and TCB state mutations incompatible with `ipc_state_lock`.
+Synchronous (non-buffered) endpoint send-to-receiver is explicitly deferred.
 
-#### Lock contract (Stage 4F)
+#### Lock contract (Stage 4F, post-review)
 
 `ipc_state_lock` is held only for:
-- endpoint queue enqueue
-- `endpoint_waiters` slot clear
+- Evaluating receiver/sender waiter state in `ipc_try_send_queued_plain_endpoint_only`
+- Re-verifying receiver slot, checking sender waiters, enqueuing msg, clearing slot
+  in `ipc_try_send_to_plain_receiver_endpoint_only`
 
 It is **not** held while:
-- reading `endpoint_waiters[endpoint_idx]` for the pre-check (step 1 above)
-- checking `is_task_recv_v2_blocked` (step 2 above)
-- calling `apply_split_receiver_wake_plan` / `wake_tid_to_runnable` (Phase 2)
-- mutating task TCB status or scheduler runqueue (`wake_tid_to_runnable`)
-- copying user memory, writing `TrapFrame` registers, minting/revoking caps, or
-  mapping shared memory (none of these occur in Stage 4F)
+- Checking `is_task_recv_v2_blocked` (task_state_lock rank 3, between the two ipc_state_lock acquisitions)
+- Calling `apply_split_receiver_wake_plan` / `wake_tid_to_runnable` (Phase 2)
+- Mutating task TCB status or scheduler runqueue (`wake_tid_to_runnable`)
+- Copying user memory, writing `TrapFrame` registers, minting/revoking caps, or mapping shared memory
 
-#### New API surface (Stage 4F)
+#### API surface (Stage 4F, post-review)
 
-- `IpcEndpointSendResult::EnqueuedWakeReceiver(ThreadId)` — split send to waiting receiver
+- `IpcEndpointSendResult::EnqueuedWakeReceiver(ThreadId)` — split send success, wake receiver
+- `IpcEndpointSendResult::ReceiverWaiterFound(ThreadId)` — pre-screen: locked TID, no sender waiters
 - `IpcSchedulerPlan::WakeReceiver(ThreadId)` — deferred receiver wake plan
-- `KernelState::ipc_endpoint_waiter_tid_direct(endpoint_idx)` — lock-free waiter slot read
 - `KernelState::is_task_recv_v2_blocked(tid)` — under task_state_lock (rank 3)
 - `KernelState::ipc_try_send_to_plain_receiver_endpoint_only(...)` — Phase 1 under ipc_state_lock (rank 4)
 - `KernelState::apply_split_receiver_wake_plan(tid)` — Phase 2 wake outside lock
+- ~~`KernelState::ipc_endpoint_waiter_tid_direct`~~ — **REMOVED** (unlocked read eliminated)
 
-#### Tests added (src/kernel/boot/tests.rs)
+#### Tests (Stage 4F)
 
 - `endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_plan`
-  — unit test: directly injects receiver waiter state, verifies
-  `EnqueuedWakeReceiver` result, asserts message queued / waiter slot cleared /
-  receiver still Blocked before wake, then applies wake plan and asserts Runnable.
+  — unit test: directly injects receiver waiter state, verifies `EnqueuedWakeReceiver`.
 - `ipc_send_syscall_split_delivers_to_waiting_plain_receiver`
-  — integration test: blocks task 1 on recv via full IPC path, then task 0
-  sends via `handle_trap(IpcSend)`. Asserts Stage 4F fires (sender not blocked,
-  receiver Runnable, waiter slot cleared, telemetry incremented).
+  — integration test: Stage 4F fires, receiver woken, telemetry incremented.
+- `ipc_send_syscall_plain_receiver_waiter_uses_stage_4f_split_path`
+  — integration test (renamed from `receiver_waiter_falls_back_to_full_path`): verifies
+  plain receiver gets message via Stage 4F.
+- `endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue` (updated):
+  now asserts `ReceiverWaiterFound(tid)` for plain-receiver case and
+  `Ineligible(SenderWaiterPresent)` for co-presence case.
+- `ipc_send_syscall_receiver_and_sender_waiters_fall_back_to_full_path` (new):
+  verifies co-presence of receiver + sender waiters forces `Ineligible(SenderWaiterPresent)`
+  from the split helper and successful delivery via the full IPC send path.
 
 #### What Stage 4F does NOT change
 
