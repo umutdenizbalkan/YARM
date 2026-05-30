@@ -2345,6 +2345,244 @@ fn run_endpoint_only_plain_recv_rejects_sender_waiter_refill_case() {
     assert_eq!(received_second.as_slice(), b"second");
 }
 
+fn map_ipc_recv_syscall_buffers_for_task(
+    state: &mut KernelState,
+    tid: u64,
+    payload_ptr: usize,
+    meta_ptr: usize,
+    phys_base: u64,
+) -> Asid {
+    let (asid, aspace_map_cap) = state.create_user_address_space().expect("recv asid");
+    state.bind_task_asid(tid, asid).expect("bind recv asid");
+    state
+        .map_user_page(
+            aspace_map_cap,
+            VirtAddr(payload_ptr as u64),
+            Mapping {
+                phys: PhysAddr(phys_base),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map recv payload page");
+    state
+        .map_user_page(
+            aspace_map_cap,
+            VirtAddr(meta_ptr as u64),
+            Mapping {
+                phys: PhysAddr(phys_base + PAGE_SIZE as u64),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map recv meta page");
+    asid
+}
+
+#[test]
+fn ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mutation() {
+    std::thread::Builder::new()
+        .name("ipc_recv_syscall_uses_endpoint_only_plain_queued_branch".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mutation)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mutation() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    state
+        .ipc_send(send_cap, Message::new(7, b"live").expect("msg"))
+        .expect("queue msg");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1
+    );
+    let payload_ptr = 0x3000usize;
+    let meta_ptr = 0x4000usize;
+    let asid = map_ipc_recv_syscall_buffers_for_task(
+        &mut state,
+        0,
+        payload_ptr,
+        meta_ptr,
+        0xA000,
+    );
+    let before_tid = state.current_tid();
+    let before_status = state.task_status(0);
+
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [
+            recv_cap.0 as usize,
+            payload_ptr,
+            Message::MAX_PAYLOAD,
+            meta_ptr,
+            40,
+            0,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc recv syscall");
+
+    assert_eq!(frame.error_code(), None);
+    assert_eq!(frame.ret1(), 4);
+    let payload = state
+        .read_user_memory_for_asid(asid, payload_ptr, 4)
+        .expect("recv payload copy");
+    assert_eq!(&payload[..4], b"live");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        0
+    );
+    assert_eq!(state.current_tid(), before_tid);
+    assert_eq!(state.task_status(0), before_status);
+}
+
+#[test]
+fn ipc_recv_syscall_transfer_message_falls_back_to_full_path() {
+    std::thread::Builder::new()
+        .name("ipc_recv_syscall_transfer_message_falls_back_to_full_path".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_recv_syscall_transfer_message_falls_back_to_full_path)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_recv_syscall_transfer_message_falls_back_to_full_path() {
+    for flags in [Message::FLAG_CAP_TRANSFER, Message::FLAG_CAP_TRANSFER_PLAIN] {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let endpoint = state
+            .capability_service()
+            .resolve_current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+        let transfer_source = state
+            .mint_capability_for_current_context(Capability::new(
+                CapObject::Kernel,
+                CapRights::READ,
+            ))
+            .expect("transfer source cap");
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), transfer_source, endpoint, None, None)
+            .expect("transfer envelope");
+        let msg = Message::with_header(0, 0x44, flags, Some(handle), b"cap")
+            .expect("transfer msg");
+        state.ipc_send(send_cap, msg).expect("queue transfer msg");
+
+        let payload_ptr = 0x3000usize;
+        let meta_ptr = 0x4000usize;
+        let _asid = map_ipc_recv_syscall_buffers_for_task(
+            &mut state,
+            0,
+            payload_ptr,
+            meta_ptr,
+            0xC000,
+        );
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [
+                recv_cap.0 as usize,
+                payload_ptr,
+                Message::MAX_PAYLOAD,
+                meta_ptr,
+                40,
+                0,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut frame))
+            .expect("ipc recv syscall");
+
+        assert_eq!(frame.error_code(), None);
+        assert_ne!(frame.ret2() as u64, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP);
+        assert_eq!(
+            state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+            0,
+            "fallback full path must consume the transfer-bearing message"
+        );
+        assert!(
+            state
+                .resolve_capability_for_task(0, CapId(frame.ret2() as u64))
+                .is_ok(),
+            "fallback full path must materialize the transferred cap"
+        );
+    }
+}
+
+#[test]
+fn ipc_recv_syscall_sender_waiter_fallback_preserves_refill_and_wake() {
+    std::thread::Builder::new()
+        .name("ipc_recv_syscall_sender_waiter_fallback_preserves_refill_and_wake".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_recv_syscall_sender_waiter_fallback_preserves_refill_and_wake)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_recv_syscall_sender_waiter_fallback_preserves_refill_and_wake() {
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    state.enqueue_current_cpu(1).expect("enqueue receiver");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv cap");
+
+    state
+        .ipc_send(send_cap, Message::new(0, b"first").expect("first"))
+        .expect("queue first");
+    assert_eq!(
+        state.ipc_send(send_cap, Message::new(0, b"second").expect("second")),
+        Err(KernelError::WouldBlock)
+    );
+    assert_eq!(state.current_tid(), Some(1));
+    assert_eq!(
+        state.task_status(0),
+        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+    );
+
+    let payload_ptr = 0x5000usize;
+    let meta_ptr = 0x6000usize;
+    let asid = map_ipc_recv_syscall_buffers_for_task(
+        &mut state,
+        1,
+        payload_ptr,
+        meta_ptr,
+        0xE000,
+    );
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [
+            recv_cap_task1.0 as usize,
+            payload_ptr,
+            Message::MAX_PAYLOAD,
+            meta_ptr,
+            40,
+            0,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc recv syscall");
+
+    assert_eq!(frame.error_code(), None);
+    assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1,
+        "fallback full path must refill the endpoint from the sender waiter"
+    );
+    assert_eq!(frame.ret1(), 5);
+    let payload = state
+        .read_user_memory_for_asid(asid, payload_ptr, 5)
+        .expect("recv payload copy");
+    assert_eq!(&payload[..5], b"first");
+}
+
 #[test]
 fn blocked_sender_queue_depth_is_uniform_across_endpoints() {
     let mut state = Bootstrap::init().expect("init");

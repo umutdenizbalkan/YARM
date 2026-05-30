@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::boot::{KernelError, KernelState, MemoryObjectKind, TransferSharedRegion};
+use super::boot::{
+    IpcEndpointRecvResult, KernelError, KernelState, MemoryObjectKind, TransferSharedRegion,
+};
 use super::capabilities::{CapId, CapObject, CapRights, Capability};
 use super::ipc::{
     IPC_REGISTER_BYTES, Message, SharedMemoryRegion, pack_register_payload, unpack_register_payload,
@@ -966,7 +968,23 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         cap.0,
         endpoint
     );
-    let received = kernel.ipc_recv(cap).map_err(SyscallError::from)?;
+    let split_received = match endpoint {
+        CapObject::Endpoint { .. } => {
+            let endpoint_idx = kernel
+                .resolve_endpoint_index(endpoint)
+                .map_err(SyscallError::from)?;
+            match kernel.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx) {
+                IpcEndpointRecvResult::Received(msg) => Some(Some(msg)),
+                IpcEndpointRecvResult::Ineligible(_) => None,
+            }
+        }
+        _ => None,
+    };
+    let received = if let Some(received) = split_received {
+        received
+    } else {
+        kernel.ipc_recv(cap).map_err(SyscallError::from)?
+    };
     let recv_v2_request = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) != 0
         && frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) >= IPC_RECV_META_V2_ENCODED_LEN;
     if received.is_none() {
