@@ -1356,6 +1356,174 @@ Stage 4H was reviewed against five points:
 
 ---
 
+### Stage 4I review (clean — no changes required)
+
+Stage 4I was reviewed against five points:
+
+1. **Nonzero-timeout immediate queued recv is semantically identical to full path**:
+   `ipc_try_recv_queued_plain_endpoint_only` dequeues under `ipc_state_lock` and
+   returns `Received` or `ReceivedWithSenderWake`. Delivery is complete; the deadline
+   is never needed. `timed_out = false` because `consume_ipc_timeout_fired_for_tid`
+   returns false (no timer was registered). **CLEAN.**
+
+2. **Ineligible cases still fall back to timed path**:
+   When `try_endpoint_split_recv` returns `None`, the fallback branches route
+   `timeout_ticks == 0` to `try_ipc_recv`, preread deadline to `ipc_recv_until_deadline`,
+   and nonzero timeout to `ipc_recv_with_deadline` — unchanged. **CLEAN.**
+
+3. **`timed_out` computation is safe after split path**:
+   The pre-read deadline slot is consumed via `swap(0, AcqRel)` unconditionally
+   before the split attempt, so the slot is cleared even when the split fires.
+   `consume_ipc_timeout_fired_for_tid` returns false (no timer registered), and
+   `received == Some(msg)`, so `timed_out = false`. **CLEAN.**
+
+4. **Telemetry field `queued_recvs` added correctly**:
+   `IpcPathTelemetry::queued_recvs` was added to `crates/yarm-kernel/src/boot.rs`
+   after `queued_sends`. Size-equality assertions in `types.rs` and
+   `extraction_bridge_tests.rs` remain valid since both sides reference the same type.
+   **CLEAN.**
+
+5. **IPC ABI/SYSCALL_COUNT, x86_64 SMP, register writeback, SpawnV5, MemoryObject
+   zero-copy, VFS, syscall 27, Phase 3B untouched**:
+   The change was contained to `handle_ipc_recv_timeout` in `syscall.rs` and the new
+   telemetry field in `boot.rs`. No other file or subsystem was modified. **CLEAN.**
+
+---
+
+### Stage 4J: split-recv helper unification and telemetry gap fix
+
+#### Rationale
+
+Two issues were identified after Stage 4I:
+
+1. **Telemetry gap**: `handle_ipc_recv` (non-timeout IpcRecv) called
+   `ipc_try_recv_queued_plain_endpoint_only` but did NOT call
+   `note_endpoint_only_queued_recv_split()`, while `handle_ipc_recv_timeout` did.
+   This caused split recvs via `IpcRecv` to be silently uncounted.
+
+2. **Code duplication**: both `handle_ipc_recv` and `handle_ipc_recv_timeout`
+   contained nearly identical inline `match endpoint { CapObject::Endpoint { .. } => ... }`
+   split-recv blocks.
+
+#### Change
+
+Extracted a private module-level helper in `src/kernel/syscall.rs`:
+
+```rust
+fn try_endpoint_split_recv(
+    kernel: &mut KernelState,
+    endpoint: CapObject,
+) -> Result<Option<(Option<Message>, IpcSchedulerPlan)>, SyscallError>
+```
+
+The helper encapsulates:
+- `CapObject::Endpoint { .. }` guard
+- `resolve_endpoint_index` call
+- `ipc_try_recv_queued_plain_endpoint_only` dispatch
+- `note_endpoint_only_queued_recv_split()` in both `Received` and
+  `ReceivedWithSenderWake` arms ← **fixes the telemetry gap**
+- `Ineligible(_) => Ok(None)` and non-endpoint `_ => Ok(None)` fall-throughs
+
+Both `handle_ipc_recv` and `handle_ipc_recv_timeout` now call
+`try_endpoint_split_recv(kernel, endpoint)?` instead of inlining this logic.
+
+#### Correctness argument
+
+- Behavior is identical: the helper contains the same match arms as both callers
+  had before. No new guards, no removed guards, no new lock acquisitions.
+- The `note_endpoint_only_queued_recv_split()` call is side-effect-only telemetry;
+  adding it to `handle_ipc_recv` does not alter message delivery, lock order, or
+  scheduler plan propagation.
+- Both callers still apply the `WakeSender` plan outside the lock after the helper
+  returns — unchanged.
+
+#### Lock contract (unchanged from Stage 4C/4D/4G/4I)
+
+No new lock acquisitions. `ipc_state_lock` (rank 4) is acquired only inside
+`ipc_try_recv_queued_plain_endpoint_only`. The helper does not hold any lock when it
+returns. `note_endpoint_only_queued_recv_split` acquires `telemetry_state_lock` (rank 11)
+after `ipc_state_lock` has been released.
+
+#### Tests
+
+No new tests required: the behavior change is telemetry-only, and the telemetry
+counter (`queued_recvs`) is already exercised by the Stage 4I test
+(`ipc_recv_timeout_syscall_nonzero_timeout_uses_split_when_message_queued`) and the
+Stage 4C/4D recv tests. The refactoring path is covered by all existing split-recv
+test cases.
+
+#### What Stage 4J does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback: unchanged.
+- Phase 3B checks: not weakened.
+- The global `SharedKernel` lock is still retained for all other IPC mutation.
+  **This is not full global-lock removal.**
+
+---
+
+### Deferred IPC split paths (analysis only — not implemented)
+
+The following send/receive cases were audited and are explicitly deferred. They
+cannot be split without violating the hard invariants on `ipc_state_lock` scope.
+They fall back to the existing full IPC paths via `Ineligible(...)`.
+
+#### Synchronous endpoint send-to-receiver (deferred)
+
+**Blocker**: `ipc_send_with_optional_deadline` for `EndpointMode::Synchronous` calls
+`switch_to_runnable_tid(waiter_tid)` (`src/kernel/boot/task_core_state.rs:7`).
+`switch_to_runnable_tid` busy-loops calling `yield_current()` until
+`current_tid_on(cpu) == waiter_tid` — a scheduler context switch that:
+- mutates scheduler runqueues and TCB run-state
+- may preempt the current thread
+- cannot be decomposed into a lock-free pre-check + deferred wake
+
+Any split-path version would need to clear the receiver's endpoint waiter slot
+under `ipc_state_lock` before calling `switch_to_runnable_tid`. If the scheduler
+handoff then fails or races, the waiter is orphaned with no recovery path.
+
+**Decision**: deferred indefinitely. Synchronous sends remain on the full path.
+The Stage 4F buffered-path split intentionally excludes non-buffered endpoints
+(`Ineligible(NonBufferedEndpoint)`).
+
+#### Recv-v2 blocked delivery (deferred)
+
+**Blocker**: `complete_blocked_recv_for_waiter` performs user-memory copy, capability
+materialization (cap minting), and `TrapFrame` register writes — none of which may
+occur under `ipc_state_lock`.
+
+A split version would require:
+- Phase 1 (under `ipc_state_lock`): clear `endpoint_waiters[endpoint_idx]` and
+  snapshot receiver `BlockedRecvState`.
+- Phase 2 (outside lock): call `complete_blocked_recv_for_waiter`.
+
+**Problem**: if Phase 2 fails (e.g. `UserMemoryFault`), the receiver's waiter slot
+is already cleared under `ipc_state_lock`. There is no safe way to re-register
+the receiver as a waiter post-failure: the endpoint queue may have changed, the
+slot may have been reused, and re-registering requires acquiring `ipc_state_lock`
+again with the existing state unknown. The full path avoids this by never clearing
+the waiter until delivery succeeds.
+
+**Decision**: deferred. Recv-v2 blocked delivery remains on the full path.
+`is_task_recv_v2_blocked` check in Stage 4F correctly rejects these cases
+(`Ineligible(SenderWaiterPresent)` or full-path fallback).
+
+#### Cap-transfer / call / reply sends (deferred)
+
+**Blocker**: these paths require capability minting, reply-cap materialization,
+transfer-envelope allocation, and/or `TrapFrame` writes — all forbidden under
+`ipc_state_lock`. The `FLAG_CAP_TRANSFER`, `FLAG_CAP_TRANSFER_PLAIN`, and
+`FLAG_REPLY_CAP` message flag checks in `ipc_try_recv_queued_plain_endpoint_only`
+and `ipc_try_send_queued_plain_endpoint_only` correctly reject these messages
+and return `Ineligible(TransferOrReplyCapMessage)`.
+
+**Decision**: deferred indefinitely. Cap-transfer, call, and reply paths remain
+on the full IPC path.
+
+---
+
 ### Stage 3: remove global lock from syscall fast path
 
 
