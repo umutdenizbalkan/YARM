@@ -1452,6 +1452,33 @@ counter (`queued_recvs`) is already exercised by the Stage 4I test
 Stage 4C/4D recv tests. The refactoring path is covered by all existing split-recv
 test cases.
 
+#### Stage 4J follow-on fixes (applied in the same pass)
+
+The code review of Stage 4J identified three further improvements that were
+applied immediately:
+
+1. **Return type simplification**: `try_endpoint_split_recv` previously returned
+   `Result<Option<(Option<Message>, IpcSchedulerPlan)>, SyscallError>`.  The inner
+   `Option<Message>` is always `Some` on the split path — `Received` and
+   `ReceivedWithSenderWake` both carry a concrete `Message` value.  Simplified to
+   `Result<Option<(Message, IpcSchedulerPlan)>, SyscallError>`; callers wrap the
+   result with `Some(msg)` when building the `received: Option<Message>` binding.
+
+2. **Stale `timed_out` fix** (`handle_ipc_recv_timeout`): when the split path
+   delivers a message immediately, `consume_ipc_timeout_fired_for_tid` was still
+   called unconditionally.  A stale `ipc_timeout_fired = true` flag left over from
+   a prior syscall that exited before clearing it would cause `timed_out = true`
+   even though `received = Some(msg)`, resulting in `clear_blocked_recv_state`
+   being called with the wrong reason ("timeout" instead of "immediate_success").
+   Fixed by tracking `split_recv_succeeded: bool` and skipping the fired-flag
+   consume when the split path succeeded.
+
+3. **Missing telemetry assertions**: the Stage 4G test
+   (`ipc_recv_timeout_try_recv_uses_split_path`) and the IpcRecv syscall test
+   (`ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mutation`)
+   did not assert `queued_recvs`.  Both tests now capture `before_queued_recvs`
+   and assert `queued_recvs == before_queued_recvs + 1` after the split recv.
+
 #### What Stage 4J does NOT change
 
 - IPC syscall ABI and SYSCALL_COUNT: unchanged.
@@ -1464,11 +1491,120 @@ test cases.
 
 ---
 
+### Stage 4K: recv-v2 blocked delivery split
+
+#### Background — why the earlier deferred analysis was wrong
+
+The prior deferral note described a Phase-1 design that cleared
+`endpoint_waiters[endpoint_idx]` under `ipc_state_lock` *before* calling
+`complete_blocked_recv_for_waiter`.  If completion then failed, the waiter slot
+was already cleared and the receiver was orphaned with no recovery path.
+
+The correct design avoids this by **not** clearing the waiter slot in Phase 1.
+The slot is only cleared in a separate Phase 4 under `ipc_state_lock`, and only
+after Phase 3 (completion) has already succeeded.  On completion failure the
+waiter slot still holds the receiver TID — the same orphaned state that the full
+`ipc_send_with_optional_deadline` path produces (which also does not clear the
+waiter on completion failure).
+
+#### Rationale
+
+When `IpcSend` hits a receiver blocked in a recv-v2 operation (Stage 4F returns
+`ReceiverWaiterFound(receiver_tid)` and `is_task_recv_v2_blocked` = true), the
+previous code fell back to the full `ipc_send` path.  Stage 4K eliminates that
+fallback for the common case where delivery can succeed.
+
+#### Three-phase protocol
+
+1. **Phase 1** (under `ipc_state_lock`, inside `ipc_try_send_queued_plain_endpoint_only`):
+   returns `ReceiverWaiterFound(receiver_tid)` — **snapshot only**, waiter slot
+   is not cleared.
+
+2. **Phase 2** (under `task_state_lock`, rank 3): `is_task_recv_v2_blocked` confirms
+   the receiver is in a recv-v2 blocked state.  Acquiring task lock before ipc lock
+   preserves lock ordering (scheduler/task rank 3 < ipc rank 4).
+
+3. **Phase 3** (outside all sub-locks): `complete_blocked_recv_for_waiter` —
+   copies payload to receiver's user buffer, performs cap materialization if needed,
+   writes TrapFrame registers.  `blocked_recv_state.take()` at entry atomically
+   claims the state.  On failure the receiver is orphaned (same semantics as the
+   full path).
+
+4. **Phase 4** (under `ipc_state_lock`, rank 4): `ipc_clear_plain_receiver_waiter_only`
+   re-verifies the slot still holds `receiver_tid` and clears it.  Under the global
+   kernel lock no concurrent mutation is possible, so this always matches.
+
+5. **Phase 5** (outside lock): `apply_split_receiver_wake_plan(receiver_tid)` wakes
+   the receiver.
+
+#### Correctness argument
+
+- The waiter slot is cleared (Phase 4) only after completion has succeeded (Phase 3).
+  If Phase 3 fails the waiter slot is untouched — no regression relative to the
+  full path.
+- The message is never enqueued into the endpoint queue.  If Phase 3 fails, the
+  message stays with the sender (caller gets Err from the `?` propagation) and no
+  queue corruption occurs.
+- `complete_blocked_recv_for_waiter` is called with the same pre-conditions as in
+  the full `ipc_send_with_optional_deadline` path: receiver TID known, global lock
+  held, `blocked_recv_state` present.
+- Lock ordering is identical to Stages 4E/4F: task lock (rank 3) → ipc lock (rank 4).
+  Phase 3 and Phase 5 hold no sub-lock.
+
+#### Lock contract (Stage 4K)
+
+```
+Phase 1: ipc_state_lock (rank 4) — held by ipc_try_send_queued_plain_endpoint_only
+Phase 2: task_state_lock (rank 3) — held by is_task_recv_v2_blocked
+         → released before Phase 3
+Phase 3: no sub-lock held — complete_blocked_recv_for_waiter runs lock-free
+Phase 4: ipc_state_lock (rank 4) — held by ipc_clear_plain_receiver_waiter_only
+         → released before Phase 5
+Phase 5: no sub-lock held — apply_split_receiver_wake_plan runs lock-free
+```
+
+No lock is held across a user-memory copy, TrapFrame write, or capability
+materialization.  The ordering invariant (rank 3 before rank 4) is preserved.
+
+#### API surface (Stage 4K)
+
+New methods added to `KernelState` (in `src/kernel/boot/ipc_state.rs`):
+
+- `ipc_clear_plain_receiver_waiter_only(endpoint_idx, expected_receiver_tid)`:
+  clears `endpoint_waiters[endpoint_idx]` under `ipc_state_lock` iff the slot
+  still matches `expected_receiver_tid`.
+- `note_split_recv_v2_delivery()`: increments `split_recv_v2_deliveries` telemetry
+  counter.
+
+New telemetry field in `IpcPathTelemetry` (`crates/yarm-kernel/src/boot.rs`):
+
+- `split_recv_v2_deliveries: u64` — counts successful Stage 4K deliveries.
+
+#### Tests (Stage 4K)
+
+- `ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver`
+  (`src/kernel/boot/tests.rs`): integration test — task 1 blocks in IpcRecv with
+  recv-v2 args (meta_ptr != 0, meta_len ≥ 40); task 0 sends via IpcSend; Stage 4K
+  fires; asserts task 1 is Runnable, waiter slot cleared, endpoint queue empty
+  (message delivered directly), `split_recv_v2_deliveries` incremented, and payload
+  written to task 1's user memory.
+
+#### What Stage 4K does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback: unchanged.
+- Phase 3B checks: not weakened.
+- The global `SharedKernel` lock is still retained.  **This is not full global-lock removal.**
+
+---
+
 ### Deferred IPC split paths (analysis only — not implemented)
 
-The following send/receive cases were audited and are explicitly deferred. They
-cannot be split without violating the hard invariants on `ipc_state_lock` scope.
-They fall back to the existing full IPC paths via `Ineligible(...)`.
+The following send/receive cases are explicitly deferred. They cannot be split
+without violating the hard invariants on `ipc_state_lock` scope. They fall back
+to the existing full IPC paths via `Ineligible(...)`.
 
 #### Synchronous endpoint send-to-receiver (deferred)
 
@@ -1487,28 +1623,6 @@ handoff then fails or races, the waiter is orphaned with no recovery path.
 **Decision**: deferred indefinitely. Synchronous sends remain on the full path.
 The Stage 4F buffered-path split intentionally excludes non-buffered endpoints
 (`Ineligible(NonBufferedEndpoint)`).
-
-#### Recv-v2 blocked delivery (deferred)
-
-**Blocker**: `complete_blocked_recv_for_waiter` performs user-memory copy, capability
-materialization (cap minting), and `TrapFrame` register writes — none of which may
-occur under `ipc_state_lock`.
-
-A split version would require:
-- Phase 1 (under `ipc_state_lock`): clear `endpoint_waiters[endpoint_idx]` and
-  snapshot receiver `BlockedRecvState`.
-- Phase 2 (outside lock): call `complete_blocked_recv_for_waiter`.
-
-**Problem**: if Phase 2 fails (e.g. `UserMemoryFault`), the receiver's waiter slot
-is already cleared under `ipc_state_lock`. There is no safe way to re-register
-the receiver as a waiter post-failure: the endpoint queue may have changed, the
-slot may have been reused, and re-registering requires acquiring `ipc_state_lock`
-again with the existing state unknown. The full path avoids this by never clearing
-the waiter until delivery succeeds.
-
-**Decision**: deferred. Recv-v2 blocked delivery remains on the full path.
-`is_task_recv_v2_blocked` check in Stage 4F correctly rejects these cases
-(`Ineligible(SenderWaiterPresent)` or full-path fallback).
 
 #### Cap-transfer / call / reply sends (deferred)
 
