@@ -236,6 +236,11 @@ impl PriorityScheduler {
             if current.tid.0 == 0 && self.runnable_count() > 0 {
                 let next = self.dequeue_highest()?;
                 self.current = Some(next);
+                // Remove idle (tid=0) from the membership table so it can be
+                // re-enqueued later without hitting the AlreadyQueued guard.
+                if !self.membership_tracking_exhausted {
+                    self.membership_remove(current.tid);
+                }
                 return Some(next.tid);
             }
             return Some(current.tid);

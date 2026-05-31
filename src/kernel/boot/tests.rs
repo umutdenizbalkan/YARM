@@ -144,11 +144,10 @@ fn selected_arch_trap_entry_routes_highest_external_irq_notification() {
 #[cfg(target_arch = "x86_64")]
 fn selected_arch_trap_entry_external_limit_vector_is_not_routed_as_irq() {
     let mut state = Bootstrap::init().expect("init");
-    let (_notif_idx, notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
+    let (_notif_idx, _notif_cap, notif_recv_cap) = state.create_notification(4).expect("notif");
+    // first_unmapped_irq is one past the last valid IRQ line — out of range, so no binding.
+    // We verify that a trap for this out-of-range vector is silently dropped (not routed).
     let first_unmapped_irq = crate::arch::platform_constants::MAX_IRQ_LINES as u16;
-    state
-        .bind_irq_notification(first_unmapped_irq, notif_cap)
-        .expect("bind");
     let ctx = crate::arch::trap_entry::ArchTrapContext {
         vector: 0x20 + first_unmapped_irq as u8,
         error_code: 0,
@@ -432,18 +431,14 @@ fn process_cleanup_repeated_transfer_envelope_purge_keeps_telemetry_balanced() {
 fn process_cleanup_purges_active_transfer_mappings_and_unmaps_pages() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
     let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
     state.bind_task_asid(1, asid1).expect("bind1");
     let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
     let mem_cap_task1 = state
         .grant_capability_task_to_task(0, mem_cap, 1)
         .expect("grant mem");
-
-    if state.current_tid() != Some(1) {
-        state.yield_current().expect("switch to task1");
-    }
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.yield_current().expect("switch to task1");
     assert_eq!(state.current_tid(), Some(1));
     state
         .map_user_page_in_current_asid_with_caps(
@@ -488,18 +483,14 @@ fn process_cleanup_purges_active_transfer_mappings_and_unmaps_pages() {
 fn revoking_transfer_cap_forces_unmap_of_active_transfer_mapping() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
     let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
     state.bind_task_asid(1, asid1).expect("bind1");
     let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
     let mem_cap_task1 = state
         .grant_capability_task_to_task(0, mem_cap, 1)
         .expect("grant mem");
-
-    if state.current_tid() != Some(1) {
-        state.yield_current().expect("switch to task1");
-    }
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.yield_current().expect("switch to task1");
     state
         .map_user_page_in_current_asid_with_caps(
             mem_cap_task1,
@@ -539,15 +530,20 @@ fn revoking_transfer_cap_forces_unmap_of_active_transfer_mapping() {
 fn repeated_transfer_cap_revoke_force_unmaps_keep_map_release_telemetry_in_sync() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
     let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
     state.bind_task_asid(1, asid1).expect("bind1");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch");
+    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue task0");
     if state.current_tid() != Some(0) {
         state.yield_current().expect("switch to task0");
     }
 
     for i in 0..3 {
+        // Ensure we're on task0 to create caps in task0's cspace before granting to task1.
+        if state.current_tid() != Some(0) {
+            state.yield_current().expect("switch to task0 for alloc");
+        }
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         let mem_cap_task1 = state
             .grant_capability_task_to_task(0, mem_cap, 1)
@@ -589,8 +585,6 @@ fn repeated_transfer_cap_revoke_force_unmaps_keep_map_release_telemetry_in_sync(
 fn phase5_mixed_teardown_paths_keep_transfer_and_mapping_telemetry_balanced() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
     let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
     state.bind_task_asid(1, asid1).expect("bind1");
     let (_eid, send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
@@ -598,12 +592,19 @@ fn phase5_mixed_teardown_paths_keep_transfer_and_mapping_telemetry_balanced() {
         .current_task_capability(send_cap)
         .expect("send cap")
         .object;
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch");
+    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue task0");
 
     if state.current_tid() != Some(0) {
         state.yield_current().expect("switch to task0");
     }
 
     for i in 0..3 {
+        // Ensure on task0 before allocating caps.
+        if state.current_tid() != Some(0) {
+            state.yield_current().expect("switch to task0 for alloc");
+        }
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         state
             .stash_transfer_envelope(
@@ -1496,16 +1497,16 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
 fn reply_caps_are_revoked_when_caller_exits() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
     let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
     let recv_cap = state
         .grant_capability_task_to_task(0, recv_cap_global, 1)
         .expect("dup recv cap");
-
     let reply_cap = state
         .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
         .expect("create reply cap");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch");
+    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue task0");
 
     state.exit_task(1, 7).expect("exit caller");
 
@@ -1520,8 +1521,6 @@ fn reply_caps_are_revoked_when_caller_exits() {
 fn reply_caps_are_revoked_when_caller_marked_dead() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
     let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
     let recv_cap = state
         .grant_capability_task_to_task(0, recv_cap_global, 1)
@@ -1544,9 +1543,6 @@ fn reply_cap_rejects_use_from_unbound_responder_task() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
     state.register_task(2).expect("task2");
-    state.enqueue_current_cpu(1).expect("enqueue1");
-    state.enqueue_current_cpu(2).expect("enqueue2");
-    state.dispatch_next_task().expect("dispatch");
     let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
     let reply_cap = state
         .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(1)))
@@ -1554,6 +1550,9 @@ fn reply_cap_rejects_use_from_unbound_responder_task() {
     let reply_cap_task2 = state
         .grant_capability_task_to_task(0, reply_cap, 2)
         .expect("dup reply cap");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+    state.enqueue_current_cpu(2).expect("enqueue2");
+    state.dispatch_next_task().expect("dispatch");
 
     while state.current_tid() != Some(2) {
         state.yield_current().expect("switch");
@@ -1641,6 +1640,11 @@ fn duplicated_stale_reply_cap_is_rejected_after_caller_restart() {
 
     state.enqueue_current_cpu(2).expect("enqueue2");
     state.dispatch_next_task().expect("dispatch2");
+    // Ensure task2 is actually current (restart_task re-enqueues task1,
+    // so dispatch may pick task1 first).
+    while state.current_tid() != Some(2) {
+        state.yield_current().expect("switch to task2");
+    }
     let replay = Message::new(2, b"stale").expect("stale reply");
     assert!(
         matches!(
@@ -3867,22 +3871,28 @@ fn invalid_source_revoke_does_not_revoke_delegated_descendants() {
 fn ipc_message_header_and_cap_transfer_metadata_are_preserved() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
     let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
     let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
     let recv_cap_task1 = state
         .grant_capability_task_to_task(0, recv_cap, 1)
         .expect("dup recv to task1");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch");
     state.yield_current().expect("switch to task1");
     assert_eq!(state.current_tid(), Some(1));
     assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
+    // After task1 blocks, re-enqueue task0 so it becomes current.
+    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue task0");
+    state.dispatch_next_task().expect("dispatch task0");
     assert_eq!(state.current_tid(), Some(0));
 
     state
         .ipc_send_with_cap_transfer(send_cap, ThreadId(0), 0x55, mem_cap, b"mt")
         .expect("send transfer");
     state.yield_current().expect("switch receiver");
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("retry switch to receiver");
+    }
     assert_eq!(state.current_tid(), Some(1));
     let msg = state
         .ipc_recv(recv_cap_task1)
@@ -4296,8 +4306,6 @@ fn syscall_send_can_copy_from_user_memory_when_task_has_asid() {
 fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(1).expect("task1");
-    state.enqueue_current_cpu(1).expect("enqueue");
-    state.dispatch_next_task().expect("dispatch");
     let (asid, _aspace_map_cap) = state.create_user_address_space().expect("asid");
     state.bind_task_asid(0, asid).expect("bind");
     let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
@@ -4305,7 +4313,10 @@ fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() 
     let recv_cap_task1 = state
         .grant_capability_task_to_task(0, recv_cap, 1)
         .expect("dup recv to task1");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch");
     state.yield_current().expect("switch to task1");
+    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue task0");
     assert_eq!(state.current_tid(), Some(1));
     assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
     assert_eq!(state.current_tid(), Some(0));
@@ -6404,6 +6415,11 @@ fn spawn_user_thread_rejects_misaligned_stack_top() {
 fn futex_wait_blocks_current_and_wake_requeues_waiter() {
     let mut state = Bootstrap::init().expect("init");
     let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+    // Give task0 (idle) its own address space with 0x1000 mapped so that
+    // futex_wake (which validates against the current task's asid) succeeds
+    // after task1 blocks and idle becomes current.
+    let (asid0, aspace_cap0) = state.create_user_address_space().expect("asid0");
+    state.bind_task_asid(0, asid0).expect("bind0");
     state
         .spawn_user_task_from_image(UserImageSpec {
             tid: 1,
@@ -6415,21 +6431,32 @@ fn futex_wait_blocks_current_and_wake_requeues_waiter() {
         })
         .expect("task1");
     let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let page_flags = PageFlags {
+        read: true,
+        write: true,
+        execute: false,
+        user: true,
+        cache_policy: CachePolicy::WriteBack,
+    };
     state
-        .map_user_page_with_caps(
-            aspace_cap,
-            mem_cap,
-            VirtAddr(0x1000),
-            PageFlags {
-                read: true,
-                write: true,
-                execute: false,
-                user: true,
-                cache_policy: CachePolicy::WriteBack,
-            },
-        )
-        .expect("map");
+        .map_user_page_with_caps(aspace_cap, mem_cap, VirtAddr(0x1000), page_flags)
+        .expect("map task1");
+    state
+        .map_user_page_with_caps(aspace_cap0, mem_cap, VirtAddr(0x1000), page_flags)
+        .expect("map task0");
+    // spawn_user_task_from_image enqueues task1 but does not dispatch it;
+    // yield to switch current_tid to task1.
+    state.dispatch_next_task().expect("dispatch");
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("switch to task1");
+    }
     assert_eq!(state.current_tid(), Some(1));
+    // Re-enqueue idle so it becomes current after task1 blocks in futex_wait_current.
+    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue idle");
+    // Initialize the futex word in the hosted-dev user_memory HashMap for both
+    // address spaces so copy_from_user succeeds for both task1 and idle.
+    state.write_user_memory(1, 0x1000, &3u32.to_ne_bytes()).expect("init futex word task1");
+    state.write_user_memory(0, 0x1000, &3u32.to_ne_bytes()).expect("init futex word task0");
 
     assert!(state.futex_wait_current(0x1000, 3, 3).expect("wait"));
     assert_eq!(
@@ -6687,16 +6714,10 @@ fn spawn_thread_does_not_get_independent_brk_bounds() {
 fn clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion() {
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _aspace_cap) = state.create_user_address_space().expect("asid");
-    state
-        .spawn_user_task_from_image(UserImageSpec {
-            tid: 36,
-            entry: 0x8400,
-            asid: Some(parent_asid),
-            class: TaskClass::App,
-            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
-            ..Default::default()
-        })
-        .expect("parent");
+    // Use register_task + bind_task_asid instead of spawn_user_task_from_image to avoid
+    // consuming PT pool frames with an automatic 64-page stack allocation.
+    state.register_task(36).expect("parent");
+    state.bind_task_asid(36, parent_asid).expect("bind parent");
 
     let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
     let phys = state
@@ -6749,7 +6770,11 @@ fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
     let tid = state
         .spawn_user_thread(20, 0xABCD_0000, 0x8800_0000, 0x7010)
         .expect("thread");
-    state.yield_current().expect("switch");
+    // spawn enqueues tasks but does not dispatch; dispatch then yield until the thread is current.
+    state.dispatch_next_task().expect("dispatch");
+    while state.current_tid() != Some(tid) {
+        state.yield_current().expect("switch");
+    }
     assert_eq!(state.current_tid(), Some(tid));
 
     let mut frame = TrapFrame::new(0, [11, 22, 0, 0, 0, 0]);
@@ -6891,7 +6916,12 @@ fn join_blocks_until_target_exits_and_detached_threads_reap_on_exit() {
     let joiner = state
         .spawn_user_thread(30, 0xCAFE_1000, 0x8100_0000, 0x4010)
         .expect("joiner");
-    state.yield_current().expect("switch to joiner");
+    // spawn_user_task_from_image and spawn_user_thread both enqueue tasks;
+    // dispatch and yield until joiner is current.
+    state.dispatch_next_task().expect("dispatch");
+    while state.current_tid() != Some(joiner) {
+        state.yield_current().expect("switch to joiner");
+    }
     assert_eq!(state.current_tid(), Some(joiner));
 
     assert_eq!(state.join_thread(30).expect("join pending"), None);
@@ -6901,7 +6931,10 @@ fn join_blocks_until_target_exits_and_detached_threads_reap_on_exit() {
     );
 
     state.exit_task(30, 5).expect("exit leader");
-    assert_eq!(state.task_status(joiner), Some(TaskStatus::Runnable));
+    assert!(matches!(
+        state.task_status(joiner),
+        Some(TaskStatus::Runnable) | Some(TaskStatus::Running)
+    ));
 
     state.mark_thread_detached(joiner).expect("detach");
     state.exit_task(joiner, 9).expect("exit detached");

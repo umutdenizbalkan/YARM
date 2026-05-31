@@ -15,6 +15,8 @@ check-riscv64-none = "check --target riscv64gc-unknown-none-elf --no-default-fea
 YARM_X86_64_NONE_TARGET = "targets/x86_64-yarm-none.json"
 YARM_AARCH64_NONE_TARGET = "targets/aarch64-yarm-none.json"
 YARM_RISCV64_NONE_TARGET = "riscv64gc-unknown-none-elf"
+# KernelState is large; test threads need a bigger stack than the default 2 MiB.
+RUST_MIN_STACK = "16777216"
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = ["-C", "link-arg=-Ttargets/riscv64-yarm-none.ld"]
