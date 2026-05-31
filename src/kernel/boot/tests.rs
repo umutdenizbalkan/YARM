@@ -9118,7 +9118,8 @@ fn run_ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter() {
         0,
         "ipc_reply recv-v2 must not enqueue the message"
     );
-    // Waiter slot must be cleared (wake_waiter_for_endpoint does the take).
+    // Waiter slot must be cleared (Phase 4: ipc_clear_plain_receiver_waiter_only
+    // under ipc_state_lock; Phase 5: wake_tid_to_runnable outside locks).
     assert!(
         state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_none()),
         "reply endpoint waiter slot must be cleared after delivery"
@@ -9138,4 +9139,209 @@ fn run_ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter() {
         0,
         "request endpoint queue must be empty after round trip"
     );
+}
+
+// ── Part 1/3: Transfer-envelope bound-receiver invariant tests ─────────────
+//
+// These tests document the invariant fixed in the transfer-envelope cleanup
+// audit (Stage 4N Part 1): when a receiver waiter is present at stash time,
+// stash_transfer_handle binds the envelope to that receiver's TID via
+// endpoint_waiter_tid(endpoint).  Any cleanup path that passes the SENDER's
+// TID to take_transfer_envelope will fail the bound-receiver check and leave
+// the envelope slot permanently leaked.
+
+#[test]
+fn transfer_envelope_bound_receiver_cleanup_requires_receiver_tid() {
+    std::thread::Builder::new()
+        .name("transfer_envelope_bound_receiver_cleanup_requires_receiver_tid".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_transfer_envelope_bound_receiver_cleanup_requires_receiver_tid)
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+fn run_transfer_envelope_bound_receiver_cleanup_requires_receiver_tid() {
+    // Invariant: an envelope stashed with receiver_tid = Some(waiter_tid) can
+    // ONLY be claimed by passing waiter_tid to take_transfer_envelope.
+    // Passing sender_tid (which was the bug in handle_ipc_send and handle_ipc_call
+    // fallback paths) returns None and leaves the slot occupied forever.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+    let endpoint = state
+        .current_task_capability(send_cap)
+        .expect("send cap")
+        .object;
+
+    // Stash with receiver_tid = Some(ThreadId(7)) — simulates the binding that
+    // stash_transfer_handle performs via endpoint_waiter_tid when a receiver is
+    // waiting.  ThreadId(0) is the sender.
+    let handle = state
+        .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, Some(ThreadId(7)), None)
+        .expect("stash");
+
+    // Cleanup with sender_tid must fail — this is what BUG 1/BUG 2 did wrong.
+    assert!(
+        state.take_transfer_envelope(handle, endpoint, ThreadId(0)).is_none(),
+        "take with sender_tid must be rejected when envelope is bound to receiver_tid"
+    );
+    // Envelope still occupies its slot (not consumed above).
+    // Correct cleanup with receiver_tid must succeed.
+    assert!(
+        state.take_transfer_envelope(handle, endpoint, ThreadId(7)).is_some(),
+        "take with bound receiver_tid must succeed"
+    );
+    // Second take of the same handle is replay-safe — slot is now gone.
+    assert!(
+        state.take_transfer_envelope(handle, endpoint, ThreadId(7)).is_none(),
+        "second take of same handle must return None (one-shot)"
+    );
+}
+
+#[test]
+fn transfer_envelope_unbound_cleanup_accepts_any_tid() {
+    std::thread::Builder::new()
+        .name("transfer_envelope_unbound_cleanup_accepts_any_tid".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_transfer_envelope_unbound_cleanup_accepts_any_tid)
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+fn run_transfer_envelope_unbound_cleanup_accepts_any_tid() {
+    // Invariant: an envelope stashed with receiver_tid = None (no waiter present
+    // at stash time) can be claimed by any TID.  This is the fast-path where
+    // endpoint_waiter_tid returned None.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+    let endpoint = state
+        .current_task_capability(send_cap)
+        .expect("send cap")
+        .object;
+
+    let handle = state
+        .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
+        .expect("stash");
+
+    // Cleanup with sender_tid must succeed when envelope is unbound.
+    assert!(
+        state.take_transfer_envelope(handle, endpoint, ThreadId(0)).is_some(),
+        "take with sender_tid must succeed when envelope is unbound"
+    );
+}
+
+// ── Part 2/4: ipc_reply Phase 1–5 normalization ───────────────────────────
+//
+// Verifies that ipc_reply's recv-v2 fast path follows the Phase 1–5
+// lock-discipline protocol: Phase 1 snapshots the waiter TID under
+// ipc_state_lock; Phase 4 clears the slot under ipc_state_lock after delivery;
+// Phase 5 wakes the receiver outside all locks.
+
+#[test]
+fn ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake() {
+    std::thread::Builder::new()
+        .name("ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake() {
+    // Verifies the Phase 1–5 postconditions for the normalized ipc_reply recv-v2
+    // path:
+    //   Phase 1: snapshot waiter TID under ipc_state_lock
+    //   Phase 4: ipc_clear_plain_receiver_waiter_only clears endpoint_waiters slot
+    //   Phase 5: wake_tid_to_runnable wakes the receiver outside locks
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("task1 requester");
+    state.register_task(2).expect("task2 replier");
+
+    let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind1");
+    state
+        .map_user_page(aspace1, VirtAddr(0x3000), Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW })
+        .expect("map payload");
+    state
+        .map_user_page(aspace1, VirtAddr(0x4000), Mapping { phys: PhysAddr(0xB000), flags: PageFlags::USER_RW })
+        .expect("map meta");
+
+    let (reply_eidx, _reply_send, reply_recv) = state.create_endpoint(4).expect("reply_ep");
+    let reply_recv_t1 = state
+        .grant_capability_task_to_task(0, reply_recv, 1)
+        .expect("reply_recv t1");
+
+    // Create the reply cap in task 2's cnode (simulates what create_reply_cap_for_caller
+    // does during the IpcCall path).
+    state.enqueue_current_cpu(2).expect("enqueue2");
+    state.dispatch_next_task().expect("dispatch");
+    while state.current_tid() != Some(2) {
+        state.yield_current().expect("to t2");
+    }
+    let reply_cap = state
+        .create_reply_cap_for_caller(ThreadId(1), reply_recv_t1, Some(ThreadId(2)))
+        .expect("reply cap");
+
+    // Task 1: block in recv-v2 on the reply endpoint.
+    state.enqueue_current_cpu(1).expect("enqueue1");
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("to t1");
+    }
+    let mut recv_reply = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [reply_recv_t1.0 as usize, 0x3000, 8, 0x4000, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut recv_reply)).expect("recv blocks");
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(reply_recv_t1))),
+        "task 1 must be blocked on reply recv"
+    );
+    // Phase 1 precondition: waiter slot is populated.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_some()),
+        "endpoint_waiters slot must be Some before ipc_reply"
+    );
+
+    let split_before = state.ipc_path_telemetry().ipc_reply_split_deliveries;
+
+    // Task 2: ipc_reply triggers Phase 1–5 normalized recv-v2 delivery.
+    while state.current_tid() != Some(2) {
+        state.yield_current().expect("to t2");
+    }
+    let msg = Message::with_header(2, 0x55, 0, None, b"hi").expect("reply");
+    state.ipc_reply(reply_cap, msg).expect("ipc_reply");
+
+    // Phase 4 postcondition: ipc_clear_plain_receiver_waiter_only cleared the slot.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_none()),
+        "Phase 4 must clear endpoint_waiters slot after recv-v2 delivery"
+    );
+    // Phase 5 postcondition: wake_tid_to_runnable made task 1 Runnable.
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Runnable),
+        "Phase 5 must wake task 1 to Runnable"
+    );
+    // Message was delivered directly — not enqueued.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[reply_eidx].as_ref().unwrap().queued()),
+        0,
+        "recv-v2 direct delivery must not enqueue the message"
+    );
+    // Telemetry records the split delivery.
+    assert_eq!(
+        state.ipc_path_telemetry().ipc_reply_split_deliveries,
+        split_before + 1,
+        "ipc_reply_split_deliveries must be incremented"
+    );
+    // Payload delivered to task 1's user buffer.
+    let payload = state
+        .read_user_memory_for_asid(asid1, 0x3000, 2)
+        .expect("payload");
+    assert_eq!(&payload[..2], b"hi");
 }

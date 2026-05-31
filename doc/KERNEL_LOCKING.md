@@ -1811,6 +1811,158 @@ New method on `KernelState` (`src/kernel/boot/ipc_state.rs`):
 
 ---
 
+### Stage 4N: Transfer-envelope cleanup audit and `ipc_reply` Phase 1–5 normalization
+
+Stage 4N completes two independent tasks that were identified during the Stage 4L/4M
+review: (1) fix latent transfer-envelope cleanup bugs in `handle_ipc_send` and
+`handle_ipc_call` fallback paths, and (2) normalize `ipc_reply`'s recv-v2 waiter
+read to the Phase 1–5 `ipc_state_lock` discipline.
+
+---
+
+#### Part 1: Transfer-envelope cleanup audit (BUG 1 and BUG 2)
+
+**Root cause**: `stash_transfer_handle` (in `src/kernel/syscall.rs`) calls
+`endpoint_waiter_tid(endpoint)` internally and passes the result as `receiver_tid`
+to `stash_transfer_envelope`.  When a receiver waiter is present, `receiver_tid =
+Some(waiter_tid)`.  The envelope is then **bound** to that waiter TID.
+
+`take_transfer_envelope` enforces the bound-receiver invariant
+(`src/kernel/boot/transfer_state.rs` lines 83–87):
+```rust
+if let Some(bound_receiver) = envelope.receiver_tid {
+    if bound_receiver != receiver_tid {
+        return None;  // ← wrong TID: envelope stays occupied forever
+    }
+}
+```
+
+**BUG 1 — `handle_ipc_send` error path** (fixed): cleanup after `ipc_send` failure
+passed `ThreadId(current_tid(kernel)?)` (= sender_tid) instead of the receiver TID
+that was bound at stash time.  When a waiter was present, the bound-receiver check
+failed, `take_transfer_envelope` returned `None`, and the envelope slot was
+permanently leaked.
+
+**BUG 2 — `handle_ipc_call` ipc_send fallback error path** (fixed): same pattern —
+the ipc_call fallback to `ipc_send` passed sender_tid in cleanup, while the envelope
+stashed at lines 1300/1311 was bound to the receiver TID from `endpoint_waiter_tid`.
+
+**Fix**: `stash_transfer_handle` now returns `(Option<u64>, Option<ThreadId>)` — the
+handle AND the bound receiver TID captured at stash time.  All call sites store the
+bound TID and use it in cleanup:
+
+```rust
+// Before (buggy):
+let _ = kernel.take_transfer_envelope(handle, endpoint,
+    crate::kernel::ipc::ThreadId(current_tid(kernel)?));  // wrong: sender_tid
+
+// After (correct):
+let cleanup_tid = stash_bound_receiver_tid
+    .unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
+let _ = kernel.take_transfer_envelope(handle, endpoint, cleanup_tid);
+```
+
+`unwrap_or(sender_tid)` is safe: when `stash_bound_receiver_tid = None` (no waiter at
+stash time), the envelope was stored with `receiver_tid: None`, so the bound-receiver
+check in `take_transfer_envelope` is skipped and any TID is accepted.
+
+Call sites updated:
+- `handle_ipc_send`: 4 stash calls (two shared-mem, two inline, across user-asid and
+  register branches); cleanup at the `send_result` error path.
+- `handle_ipc_call`: 2 stash calls (user-asid and register branches); cleanup at the
+  `ipc_send` fallback error path.
+- `handle_ipc_reply`: 1 stash call; cleanup at the `ipc_reply` error path (previously
+  used `sender_tid` which was also correct when the reply endpoint has no bound waiter,
+  but normalized to use `stash_bound_reply_tid.unwrap_or(sender_tid)` for consistency).
+
+The Stage 4L error path (within the `ReceiverWaiterFound` arm) was **already correct**
+from the previous stage — it has direct access to `receiver_tid` from the match arm
+and uses it directly.
+
+---
+
+#### Part 2: `ipc_reply` recv-v2 Phase 1–5 normalization
+
+**Before normalization** (`ipc_reply` in `src/kernel/boot/ipc_state.rs`):
+
+Phase 1 read `endpoint_waiters[endpoint_idx]` directly without `with_ipc_state`:
+```rust
+if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {  // unlocked
+```
+
+Phase 4/5 called `wake_waiter_for_endpoint(endpoint_idx)` which does an unlocked
+`.take()` on `endpoint_waiters[endpoint_idx]` inside the combined clear+wake helper:
+```rust
+self.wake_waiter_for_endpoint(endpoint_idx)?;  // unlocked .take() + wake
+```
+
+These are safe under the global kernel lock but inconsistent with the Phase 1–5
+`ipc_state_lock` discipline established in Stage 4K/4L.
+
+**After normalization**:
+
+- **Phase 1** (snapshot): `self.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx])`
+  — snapshot under `ipc_state_lock` (rank 4), lock released before Phase 2.
+- **Phase 2** (confirm recv-v2): `self.with_tcbs(...)` — unchanged, under `task_state_lock`
+  (rank 3) after Phase 1's lock is released.
+- **Phase 3** (deliver): `complete_blocked_recv_for_waiter(...)` — unchanged, no locks.
+- **Phase 4** (clear slot): `self.ipc_clear_plain_receiver_waiter_only(endpoint_idx, waiter_tid)`
+  — clears `endpoint_waiters[endpoint_idx]` under `ipc_state_lock` (rank 4) only if the
+  slot still matches `waiter_tid`.
+- **Phase 5** (wake): `self.wake_tid_to_runnable(waiter_tid)?` — wakes receiver outside
+  all locks.
+
+The non-recv-v2 fallback path (enqueue + `wake_waiter_for_endpoint`) is unchanged — it
+remains correct under the global kernel lock.
+
+Lock-ordering note: Phase 1 and Phase 4 both acquire `ipc_state_lock` (rank 4), but
+they are **sequential**, not concurrent.  Between them, Phase 2 acquires `task_state_lock`
+(rank 3) while `ipc_state_lock` is not held — no rank inversion.
+
+---
+
+#### Part 3: Scaffolding tests
+
+New tests in `src/kernel/boot/tests.rs`:
+
+- **`transfer_envelope_bound_receiver_cleanup_requires_receiver_tid`**: Verifies the
+  bound-receiver invariant directly — stash with `receiver_tid = Some(ThreadId(7))`,
+  confirm cleanup with `ThreadId(0)` (sender) returns `None`, confirm cleanup with
+  `ThreadId(7)` (correct receiver) returns `Some`, confirm replay returns `None`.
+
+- **`transfer_envelope_unbound_cleanup_accepts_any_tid`**: Verifies the complementary
+  invariant — stash with `receiver_tid = None` (no waiter), confirm cleanup with any TID
+  succeeds.
+
+- **`ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake`**: Integration test
+  for the normalized Phase 1–5 path — verifies Phase 4 clears `endpoint_waiters` slot,
+  Phase 5 wakes the receiver to Runnable, message is not enqueued, telemetry incremented.
+
+---
+
+#### Part 4: Live split confirmation
+
+The normalization of Phase 4/5 (replacing `wake_waiter_for_endpoint` with
+`ipc_clear_plain_receiver_waiter_only` + `wake_tid_to_runnable`) confirms that the
+`ipc_reply` recv-v2 path was already a live split — the only change is lock discipline,
+not the split itself.  The existing Stage 4M test (`ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter`) continues to pass unchanged.
+
+#### API surface (Stage 4N)
+
+- `stash_transfer_handle` return type: `Result<(Option<u64>, Option<crate::kernel::ipc::ThreadId>), SyscallError>`
+  (was `Result<Option<u64>, SyscallError>`).  Callers updated to destructure.
+- No changes to public kernel API, IPC syscall ABI, or SYSCALL_COUNT.
+
+#### What Stage 4N does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- The global `SharedKernel` lock is still retained.  **This is not full global-lock removal.**
+- `SpawnV5`, `MemoryObject` zero-copy, VFS, syscall 27, `VFS_READ_SHARED_REPLY_ENABLED`,
+  x86_64 SMP / `smp.rs`, x86_64 register writeback, Phase 3B checks: all unchanged.
+- The split logic for `ipc_reply` recv-v2 is unchanged — only lock discipline updated.
+
+---
+
 ### Current live / deferred IPC split matrix
 
 | Syscall path | Condition | Status | Telemetry counter |
