@@ -1510,10 +1510,15 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
     // without any such prefix; using FLAG_CAP_TRANSFER_PLAIN avoids the
     // destructive 2-byte strip and preserves the full payload for the receiver.
     let mut stash_bound_reply_tid: Option<crate::kernel::ipc::ThreadId> = None;
+    // Captured here for the failure cleanup path: ipc_reply consumes and revokes the
+    // reply cap record (including fast_revoke_reply_cap_in_cnode), so re-probing
+    // reply_cap_peek_endpoint after a failed ipc_reply would fail and leak the envelope.
+    let mut reply_endpoint_for_cleanup: Option<CapObject> = None;
     let transfer_handle = if transfer_cap.is_some() {
         let reply_endpoint = kernel
             .reply_cap_peek_endpoint(reply_cap)
             .map_err(SyscallError::from)?;
+        reply_endpoint_for_cleanup = Some(reply_endpoint);
         let (handle, bound_tid) = stash_transfer_handle(kernel, transfer_cap, reply_endpoint, None)?;
         stash_bound_reply_tid = bound_tid;
         crate::yarm_log!(
@@ -1551,9 +1556,11 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
     );
     if let Err(err) = kernel.ipc_reply(reply_cap, msg) {
         // If ipc_reply failed and we stashed a transfer envelope, clean it up.
+        // Use the endpoint captured before ipc_reply: ipc_reply revokes the reply
+        // cap cnode slot on the fast path, so re-probing reply_cap_peek_endpoint
+        // here would fail and silently leave the envelope allocated.
         if let Some(handle) = transfer_handle {
-            // Best-effort: ignore the result of taking back the envelope.
-            if let Ok(reply_endpoint) = kernel.reply_cap_peek_endpoint(reply_cap) {
+            if let Some(reply_endpoint) = reply_endpoint_for_cleanup {
                 let cleanup_tid = stash_bound_reply_tid
                     .unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
                 let _ = kernel.take_transfer_envelope(handle, reply_endpoint, cleanup_tid);
@@ -4022,6 +4029,149 @@ mod tests {
         );
     }
 
+    // ── Part 3: Reply/cap-transfer decomposition invariants ───────────────────
+
+    #[test]
+    fn ipc_reply_with_cap_transfer_plain_delivers_receiver_local_cap() {
+        std::thread::Builder::new()
+            .name("ipc_reply_with_cap_transfer_plain_delivers_receiver_local_cap".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_ipc_reply_with_cap_transfer_plain_delivers_receiver_local_cap)
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    fn run_ipc_reply_with_cap_transfer_plain_delivers_receiver_local_cap() {
+        let mut state = Bootstrap::init().expect("kernel");
+
+        // Create the endpoint and the reply cap (task 0 is both caller and replier here).
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+
+        // Create a memory object to transfer alongside the reply payload.
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(crate::kernel::vm::PhysAddr(0x7000))
+            .expect("memory object");
+
+        // IpcReply from a kernel task (no user ASID): payload comes from inline registers.
+        // arg5 = mem_cap triggers FLAG_CAP_TRANSFER_PLAIN path in handle_ipc_reply.
+        let payload_word = usize::from_le_bytes(*b"reply_ok");
+        let mut reply_frame = TrapFrame::new(
+            Syscall::IpcReply as usize,
+            [reply_cap.0 as usize, 0, 8, payload_word, 0, mem_cap.0 as usize],
+        );
+        dispatch(&mut state, &mut reply_frame).expect("ipc reply with cap");
+        assert_eq!(reply_frame.error_code(), None);
+
+        // IpcRecv on a kernel task (meta_ptr=0 → inline register path).
+        let mut recv = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, Message::MAX_PAYLOAD, 0, 0, 0],
+        );
+        dispatch(&mut state, &mut recv).expect("recv");
+        assert_eq!(recv.error_code(), None);
+
+        // FLAG_CAP_TRANSFER_PLAIN is NOT stripped — full 8-byte payload must be preserved.
+        assert_eq!(recv.ret1(), 8, "full payload without opcode-prefix stripping");
+        let bytes = unpack_register_payload(
+            [
+                recv.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+                recv.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+            ],
+            recv.ret1(),
+        )
+        .expect("payload");
+        assert_eq!(&bytes[..8], b"reply_ok");
+
+        // A receiver-local cap was materialized from the transfer envelope (ret2 ≠ sentinel).
+        let recv_local_raw = recv.ret2() as u64;
+        assert_ne!(
+            recv_local_raw, SYSCALL_NO_TRANSFER_CAP,
+            "transfer cap must be materialized"
+        );
+        let recv_local = CapId(recv_local_raw);
+        // The materialized cap is a fresh slot, not the original sender-side cap id.
+        assert_ne!(recv_local, mem_cap, "must be a receiver-local cap id");
+        let resolved = state
+            .capability_service()
+            .resolve_current_task_capability(recv_local)
+            .expect("materialized cap must be accessible in receiver cnode");
+        assert!(
+            matches!(resolved.object, CapObject::MemoryObject { .. }),
+            "materialized cap must wrap the MemoryObject"
+        );
+    }
+
+    #[test]
+    fn ipc_reply_envelope_cleaned_up_when_endpoint_queue_full() {
+        std::thread::Builder::new()
+            .name("ipc_reply_envelope_cleaned_up_when_endpoint_queue_full".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_ipc_reply_envelope_cleaned_up_when_endpoint_queue_full)
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    fn run_ipc_reply_envelope_cleaned_up_when_endpoint_queue_full() {
+        let mut state = Bootstrap::init().expect("kernel");
+
+        // Capacity-1 endpoint so one queued message fills it.
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+
+        // Create reply cap targeting this endpoint before filling the queue.
+        let reply_cap = state
+            .create_reply_cap_for_caller(crate::kernel::ipc::ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+
+        // Fill the queue — endpoint is now at capacity.
+        let fill_msg = crate::kernel::ipc::Message::new(0, b"fill").expect("fill msg");
+        state.ipc_send(send_cap, fill_msg).expect("fill queue");
+
+        // Create a memory object to transfer with the reply.
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(crate::kernel::vm::PhysAddr(0x8000))
+            .expect("memory object");
+
+        let t0 = state.ipc_path_telemetry();
+
+        // IpcReply with cap to the full endpoint:
+        //   handle_ipc_reply will stash a transfer envelope (created += 1), then
+        //   ipc_reply will consume+revoke the reply cap slot and fail with QueueFull.
+        //   The cleanup path must take back the envelope (materialized += 1) so no
+        //   envelope slot is permanently allocated.
+        let mut reply_frame = TrapFrame::new(
+            Syscall::IpcReply as usize,
+            [
+                reply_cap.0 as usize,
+                0,
+                2,
+                usize::from_le_bytes([b'o', b'k', 0, 0, 0, 0, 0, 0]),
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        let err = dispatch(&mut state, &mut reply_frame).expect_err("queue full");
+        assert_eq!(err, SyscallError::QueueFull);
+
+        let t1 = state.ipc_path_telemetry();
+
+        // Envelope cleanup invariant: every stashed envelope was also reclaimed.
+        let created = t1.transfer_records_created - t0.transfer_records_created;
+        let materialized = t1.transfer_records_materialized - t0.transfer_records_materialized;
+        assert_eq!(
+            created, 1,
+            "exactly one envelope was stashed before the failed ipc_reply"
+        );
+        assert_eq!(
+            materialized, created,
+            "cleanup path must reclaim the stashed envelope on QueueFull failure"
+        );
+    }
+
     #[test]
     fn vm_map_syscall_maps_aligned_region() {
         let mut state = Bootstrap::init().expect("kernel");
@@ -5311,11 +5461,12 @@ mod tests {
 
     #[test]
     fn inline_prefix_stripping_applies_to_call_and_transfer_requests_only() {
+        // FLAG_REPLY_CAP requires a non-None cap value; use a synthetic handle.
         let call_msg = Message::with_header(
             1,
             OPCODE_INLINE,
             Message::FLAG_REPLY_CAP,
-            None,
+            Some(1),
             &[0x34, 0x12, 0xAA, 0xBB],
         )
         .expect("call msg");
@@ -5333,6 +5484,18 @@ mod tests {
 
         let reply_msg = Message::new(1, &[0x34, 0x12, 0xAA, 0xBB]).expect("reply msg");
         assert!(!should_strip_inline_opcode_prefix(&reply_msg));
+
+        // FLAG_CAP_TRANSFER_PLAIN (used by ipc_reply with cap) must never be stripped:
+        // reply payloads are not prefixed with an opcode, so stripping would corrupt them.
+        let plain_cap_msg = Message::with_header(
+            1,
+            OPCODE_INLINE,
+            Message::FLAG_CAP_TRANSFER_PLAIN,
+            Some(42),
+            &[0x34, 0x12, 0xAA, 0xBB],
+        )
+        .expect("plain cap msg");
+        assert!(!should_strip_inline_opcode_prefix(&plain_cap_msg));
     }
 
     // ── Phase 2A/2B syscall nr=27 unit tests ─────────────────────────────────
