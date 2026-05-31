@@ -9296,6 +9296,193 @@ fn run_ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter() {
     );
 }
 
+// ── Part 3/4: IpcReply with FLAG_CAP_TRANSFER_PLAIN Phase 1–5 invariant ──────
+//
+// Verifies that when the requester is recv-v2 blocked on the reply endpoint AND
+// the replier uses ipc_reply with a cap-transfer argument, the Stage 4M recv-v2
+// fast path still fires: complete_blocked_recv_for_waiter materializes the cap
+// in the requester's cspace outside ipc_state_lock, clears the waiter slot
+// (Phase 4), and wakes the requester (Phase 5).
+
+#[test]
+fn ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requester() {
+    std::thread::Builder::new()
+        .name("ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requester".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requester)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requester() {
+    // Stage 4M + FLAG_CAP_TRANSFER_PLAIN: when the requester is recv-v2 blocked on
+    // the reply endpoint, ipc_reply with a cap-transfer argument must deliver
+    // directly via complete_blocked_recv_for_waiter (Phase 3), materialize the cap
+    // in the requester's cspace, clear the waiter slot (Phase 4), and wake the
+    // requester (Phase 5) — without enqueuing to the reply endpoint queue.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("task1 requester");
+    state.register_task(2).expect("task2 replier");
+
+    let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+    let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+    state.bind_task_asid(1, asid1).expect("bind1");
+    state.bind_task_asid(2, asid2).expect("bind2");
+    // Task 1: payload page 0x3000 + meta page 0x4000 for recv-v2 reply receive.
+    state
+        .map_user_page(aspace1, VirtAddr(0x3000), Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW })
+        .expect("map t1 payload");
+    state
+        .map_user_page(aspace1, VirtAddr(0x4000), Mapping { phys: PhysAddr(0xB000), flags: PageFlags::USER_RW })
+        .expect("map t1 meta");
+    // Task 2: req recv payload 0x5000, req recv meta 0x6000, reply send payload 0x7000.
+    state
+        .map_user_page(aspace2, VirtAddr(0x5000), Mapping { phys: PhysAddr(0xC000), flags: PageFlags::USER_RW })
+        .expect("map t2 recv payload");
+    state
+        .map_user_page(aspace2, VirtAddr(0x6000), Mapping { phys: PhysAddr(0xD000), flags: PageFlags::USER_RW })
+        .expect("map t2 recv meta");
+    state
+        .map_user_page(aspace2, VirtAddr(0x7000), Mapping { phys: PhysAddr(0xE000), flags: PageFlags::USER_RW })
+        .expect("map t2 reply payload");
+
+    // Request endpoint (task1→task2) and reply endpoint (task2→task1).
+    let (req_eidx, req_send, req_recv) = state.create_endpoint(4).expect("req_ep");
+    let req_send_t1 = state.grant_capability_task_to_task(0, req_send, 1).expect("req_send t1");
+    let req_recv_t2 = state.grant_capability_task_to_task(0, req_recv, 2).expect("req_recv t2");
+    let (reply_eidx, _reply_send, reply_recv) = state.create_endpoint(4).expect("reply_ep");
+    let reply_recv_t1 = state.grant_capability_task_to_task(0, reply_recv, 1).expect("reply_recv t1");
+
+    // MemoryObject cap to transfer in the reply (task 0 owns it; grant to task 2).
+    let (_, mo_cap_global) = state.alloc_anonymous_memory_object().expect("mo");
+    let mo_cap_t2 = state.grant_capability_task_to_task(0, mo_cap_global, 2).expect("grant mo t2");
+
+    state.enqueue_current_cpu(2).expect("enqueue2");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+    state.dispatch_next_task().expect("dispatch");
+
+    // Task 1: IpcCall → task 2 not yet blocked on req_ep, so request is queued.
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("to t1");
+    }
+    let mut call_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcCall as usize,
+        [req_send_t1.0 as usize, 0, 0, 0, 0, reply_recv_t1.0 as usize],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut call_frame)).expect("ipc_call");
+
+    // Task 2: IpcRecv (recv-v2) dequeues the request; reads local reply cap from meta.
+    while state.current_tid() != Some(2) {
+        state.yield_current().expect("to t2 for recv");
+    }
+    let mut recv_req = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [req_recv_t2.0 as usize, 0x5000, 8, 0x6000, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut recv_req)).expect("recv request");
+    let req_meta = state.read_user_memory_for_asid(asid2, 0x6000, 40).expect("req meta");
+    let local_reply_cap = CapId(u64::from_le_bytes(req_meta[16..24].try_into().expect("cap field")));
+    assert!(
+        matches!(
+            state.capability_service().resolve_current_task_capability(local_reply_cap)
+                .map(|c| c.object),
+            Some(CapObject::Reply { .. })
+        ),
+        "task 2 must hold a materialized Reply cap"
+    );
+
+    // Task 1: IpcRecv (recv-v2) on reply_ep — empty queue, so blocks.
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("to t1 for reply recv");
+    }
+    let mut recv_reply = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [reply_recv_t1.0 as usize, 0x3000, 8, 0x4000, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut recv_reply)).expect("reply recv blocks");
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(reply_recv_t1))),
+        "task 1 must be blocked recv-v2 on reply endpoint"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx]),
+        Some(ThreadId(1)),
+        "reply endpoint waiter slot must hold task 1"
+    );
+
+    // Write the reply payload to task 2's user memory before the reply syscall.
+    state.write_user_memory_for_asid(asid2, 0x7000, b"rm").expect("write reply payload");
+    let split_before = state.ipc_path_telemetry().ipc_reply_split_deliveries;
+
+    // Task 2: IpcReply with mo_cap_t2 as transfer cap — Stage 4M fires.
+    while state.current_tid() != Some(2) {
+        state.yield_current().expect("to t2 for reply");
+    }
+    let mut reply_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcReply as usize,
+        [
+            local_reply_cap.0 as usize, // arg0 = reply cap
+            0x7000,                      // arg1 = payload ptr (task 2 user memory)
+            2,                           // arg2 = payload len
+            0, 0,
+            mo_cap_t2.0 as usize,       // arg5 = transfer cap (MemoryObject)
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut reply_frame)).expect("ipc_reply with cap");
+    assert_eq!(reply_frame.error_code(), None, "ipc_reply must succeed");
+
+    // Phase 5: requester must be Runnable.
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Runnable),
+        "Phase 5 must wake task 1 to Runnable"
+    );
+    // Phase 4: reply endpoint waiter slot must be cleared.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_none()),
+        "Phase 4 must clear reply endpoint waiter slot"
+    );
+    // Direct delivery — reply endpoint queue must be empty.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[reply_eidx].as_ref().unwrap().queued()),
+        0,
+        "Stage 4M direct delivery must not enqueue to reply endpoint"
+    );
+    // Telemetry must record the split delivery.
+    assert_eq!(
+        state.ipc_path_telemetry().ipc_reply_split_deliveries,
+        split_before + 1,
+        "Stage 4M must increment ipc_reply_split_deliveries"
+    );
+    // FLAG_CAP_TRANSFER_PLAIN does not strip any bytes — payload lands verbatim.
+    let payload = state.read_user_memory_for_asid(asid1, 0x3000, 2).expect("reply payload");
+    assert_eq!(&payload[..2], b"rm", "reply payload must be in requester user buffer");
+    // Meta must indicate a transferred cap (SYSCALL_RECV_META_TRANSFERRED_CAP bit).
+    let meta = state.read_user_memory_for_asid(asid1, 0x4000, 40).expect("reply meta");
+    let meta_flags = u64::from_le_bytes(meta[24..32].try_into().expect("meta flags"));
+    assert_ne!(
+        meta_flags & crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
+        0,
+        "meta must have SYSCALL_RECV_META_TRANSFERRED_CAP set; flags={}",
+        meta_flags
+    );
+    // The MemoryObject cap must be materialized in task 1's cspace.
+    let cap_id_raw = u64::from_le_bytes(meta[16..24].try_into().expect("cap_id field"));
+    assert_ne!(
+        cap_id_raw,
+        crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "Stage 4M must materialize MemoryObject cap in requester cspace"
+    );
+    // Request endpoint must be empty (no residual message from the round trip).
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[req_eidx].as_ref().unwrap().queued()),
+        0,
+        "request endpoint must be empty after round trip"
+    );
+}
+
 // ── Part 1/3: Transfer-envelope bound-receiver invariant tests ─────────────
 //
 // These tests document the invariant fixed in the transfer-envelope cleanup
