@@ -508,6 +508,15 @@ fn halt_forever() -> ! {
     }
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn idle_halt_loop() -> ! {
+    loop {
+        unsafe {
+            core::arch::asm!("sti", "hlt", options(nomem, nostack));
+        }
+    }
+}
+
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const fn should_halt_without_kernel_state(vector: usize) -> bool {
     vector < 32 && vector != VEC_SYSCALL
@@ -867,6 +876,16 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             }
         }
         let task_switched = entering_tid != exiting_tid;
+        if matches!(exiting_tid, None | Some(0)) {
+            // The scheduler uses TID 0 as its idle/supervisor sentinel.  It has
+            // no user context to iretq back to; returning through the current
+            // user trap frame would resume the task that just blocked and form
+            // a hot block/yield/retry loop.  Park the CPU with interrupts
+            // enabled instead, so timer and external IRQs still wake from HLT.
+            crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", cpu.0);
+            TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+            idle_halt_loop();
+        }
         if task_switched {
             write_task_gprs_to_saved_regs(regs, &trap_frame);
         } else if vector as usize == VEC_SYSCALL {
@@ -914,6 +933,14 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     }
     let exiting_tid = kernel.current_tid();
     let task_switched = entering_tid != exiting_tid;
+    if matches!(exiting_tid, None | Some(0)) {
+        // Raw fallback for early boot/tests before the shared kernel pointer is
+        // installed.  TID 0 is idle-only on x86_64 and must not iretq through
+        // the stale user frame that entered the kernel.
+        crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", current_cpu_id().0);
+        TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+        idle_halt_loop();
+    }
     if task_switched {
         write_task_gprs_to_saved_regs(regs, &trap_frame);
     } else if vector as usize == VEC_SYSCALL {
