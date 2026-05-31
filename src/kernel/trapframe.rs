@@ -143,12 +143,12 @@ impl TrapFrame {
             instruction_ptr: VirtAddr(self.saved_pc as u64),
             stack_ptr: VirtAddr(self.saved_sp as u64),
             user_gprs: self.user_gprs,
-            arg0: self.user_gprs[0],
-            arg1: self.user_gprs[1],
-            arg2: self.user_gprs[2],
-            arg3: self.user_gprs[3],
-            arg4: self.user_gprs[4],
-            arg5: self.user_gprs[5],
+            arg0: self.args[0],
+            arg1: self.args[1],
+            arg2: self.args[2],
+            arg3: self.args[3],
+            arg4: self.args[4],
+            arg5: self.args[5],
         }
     }
 

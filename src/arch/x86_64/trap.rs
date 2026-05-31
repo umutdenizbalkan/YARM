@@ -309,7 +309,13 @@ mod tests {
         let tid = state
             .spawn_user_thread(50, 0xCAFE_0000, 0x8100_0000, 0x4010)
             .expect("thread");
-        state.yield_current().expect("switch");
+        // spawn_user_task_from_image enqueues the leader (tid 50) before spawn_user_thread
+        // enqueues the thread (tid), so a single yield_current may land on the leader.
+        // Yield until we are actually on the spawned thread.
+        for _ in 0..5 {
+            if state.current_tid() == Some(tid) { break; }
+            state.yield_current().expect("switch");
+        }
         assert_eq!(state.current_tid(), Some(tid));
 
         let mut frame = TrapFrame::new(0, [0; 6]);
@@ -329,25 +335,19 @@ mod tests {
 
     #[test]
     fn tls_restore_slots_are_isolated_per_cpu() {
-        use crate::kernel::boot::{Bootstrap, UserImageSpec};
-        use crate::kernel::task::TaskClass;
-
+        use crate::kernel::boot::Bootstrap;
+        // Register a bare task for CPU 1 with TLS=0xAAA0.  Avoid spawn_user_task_from_image
+        // + spawn_user_thread because those use the balanced scheduler which may place tasks
+        // on either CPU — making it impossible to predict which queue a task lands in.
         let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
-        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        let tid_a = 61u64;
+        state.register_task(tid_a).expect("register thread a");
         state
-            .spawn_user_task_from_image(UserImageSpec {
-                tid: 60,
-                entry: 0x4000,
-                asid: Some(asid),
-                class: TaskClass::App,
-                startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
-                ..Default::default()
-            })
-            .expect("leader");
-        let tid_a = state
-            .spawn_user_thread(60, 0xAAA0_0000, 0x8200_0000, 0x4010)
-            .expect("thread a");
+            .set_thread_tls_base(tid_a, 0xAAA0_0000)
+            .expect("set tls a");
+        // Explicitly put tid_a into CPU 1's run queue.
+        state.enqueue_on_cpu(CpuId(1), tid_a).expect("enqueue a on cpu1");
         state.set_current_cpu(CpuId(1)).expect("switch cpu1");
         let _ = state.dispatch_next_task().expect("dispatch a");
         assert_eq!(state.current_tid(), Some(tid_a));
