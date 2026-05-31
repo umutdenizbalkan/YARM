@@ -21,7 +21,7 @@
 - `11`: `SpawnThread` (`arg0=tls_base`, `arg1=user_stack_top`, `arg2=user_entry`)
 - `12`: `Fork` (fork current process with CoW; return child tid in parent)
 - `13`: `VmAnonMap` (reserved; currently returns `InvalidArgs`)
-- `14`: `VmBrk` (staged: query + grow supported, shrink unsupported)
+- `14`: `VmBrk` (staged: query, grow, and page-granular shrink supported)
 - `27`: `InitramfsReadChunk` (**PM-only / privileged**, Phase 2A/2B bootstrap bridge — see below)
 
 ## Syscalls `9..14` status
@@ -31,7 +31,7 @@
 - `11` `SpawnThread`: exposed and wired.
 - `12` `Fork`: exposed and wired.
 - `13` `VmAnonMap`: reserved syscall number; current implementation is a stub returning `InvalidArgs`.
-- `14` `VmBrk`: staged syscall; query and grow are supported, shrink is currently unsupported.
+- `14` `VmBrk`: staged syscall; query, grow, and page-granular shrink are supported.
 
 ## Futex safety contract
 
@@ -63,15 +63,16 @@
 - `args[0] == 0`: query current break.
   - Returns current `brk_end` when bounds exist for current tid.
   - Returns `0` when no brk bounds are set yet.
-- `args[0] > 0`: grow request.
+- `args[0] > 0`: set-break request.
   - Validates userspace range (must be below kernel-space split).
-  - If no bounds exist yet, grow is rejected (`InvalidArgs`) to avoid creating an empty `[base,end)` heap window.
-  - If bounds exist, only grows (`requested >= current_end`), and rejects requests below `base`.
-  - Shrink (`requested < current_end`) is currently unsupported and rejected.
+  - If no bounds exist yet, non-query requests are rejected (`InvalidArgs`) to avoid creating an empty `[base,end)` heap window.
+  - Rejects requests below `base`.
+  - Growth (`requested >= current_end`) only updates the byte-granular `brk_end`; heap pages continue to be mapped lazily on demand faults.
+  - Shrink (`requested < current_end`) updates `brk_end` after page-granular unmap bookkeeping succeeds. The unmap window is `align_up(requested, PAGE_SIZE)..align_up(current_end, PAGE_SIZE)`, so the partially used page containing `requested` is preserved and lazy/unmapped pages in the shrink range are skipped safely.
 - Initial bounds are installed for the first user task at ELF boot/startup using:
   - `heap_base = page_align_up(max(PT_LOAD.p_vaddr + PT_LOAD.p_memsz))`
   - `set_task_brk_bounds(leader_tid, heap_base, heap_base)`
-- Growth currently relies on existing demand-page-fault behavior in `[brk_base, brk_end)` to allocate/map heap pages lazily when touched.
+- Growth relies on existing demand-page-fault behavior in `[brk_base, brk_end)` to allocate/map heap pages lazily when touched.
 - Fork staging rule: child process leader copies parent leader brk bounds (base/end).
 - Spawn-thread staging rule: spawned threads do not receive independent copied brk bounds.
 - Future work: move from tid-keyed staging toward process-wide brk ownership/model.
