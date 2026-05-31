@@ -904,61 +904,76 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     };
 
     let (split_send_result, split_scheduler_plan) =
-        if transfer_cap.is_none() {
-            match endpoint {
-                CapObject::Endpoint { .. } => {
-                    let endpoint_idx = kernel
-                        .resolve_endpoint_index(endpoint)
-                        .map_err(SyscallError::from)?;
-                    match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
-                        IpcEndpointSendResult::Enqueued => {
-                            kernel.note_endpoint_only_queued_send_split();
-                            (Some(Ok(())), IpcSchedulerPlan::None)
-                        }
-                        IpcEndpointSendResult::EnqueuedWakeReceiver(_) => {
-                            unreachable!("Stage 4E never returns EnqueuedWakeReceiver")
-                        }
-                        IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
-                            // Stage 4F: ipc_try_send_queued_plain_endpoint_only found a plain
-                            // receiver waiter with no sender waiters. TID came from ipc_state_lock
-                            // read — no unlocked waiter array access needed.
-                            // Check recv-v2 under task_state_lock (rank 3) BEFORE
-                            // ipc_state_lock (rank 4) — required by lock ordering.
-                            let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
-                            if !is_recv_v2 {
-                                match kernel.ipc_try_send_to_plain_receiver_endpoint_only(
-                                    endpoint_idx,
-                                    receiver_tid,
-                                    msg,
-                                ) {
-                                    IpcEndpointSendResult::EnqueuedWakeReceiver(recv_tid) => {
-                                        kernel.note_endpoint_only_queued_send_split();
-                                        (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(recv_tid))
-                                    }
-                                    _ => (None, IpcSchedulerPlan::None),
+        match endpoint {
+            CapObject::Endpoint { .. } => {
+                let endpoint_idx = kernel
+                    .resolve_endpoint_index(endpoint)
+                    .map_err(SyscallError::from)?;
+                match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
+                    IpcEndpointSendResult::Enqueued => {
+                        kernel.note_endpoint_only_queued_send_split();
+                        (Some(Ok(())), IpcSchedulerPlan::None)
+                    }
+                    IpcEndpointSendResult::EnqueuedWakeReceiver(_) => {
+                        unreachable!("Stage 4E never returns EnqueuedWakeReceiver")
+                    }
+                    IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
+                        // Stage 4F: ipc_try_send_queued_plain_endpoint_only found a plain
+                        // receiver waiter with no sender waiters. TID came from ipc_state_lock
+                        // read — no unlocked waiter array access needed.
+                        // Check recv-v2 under task_state_lock (rank 3) BEFORE
+                        // ipc_state_lock (rank 4) — required by lock ordering.
+                        let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
+                        if !is_recv_v2 {
+                            // Stage 4F: non-recv-v2 receiver. Cap-transfer messages return
+                            // Ineligible here (split_unsafe_flags check in
+                            // ipc_try_send_to_plain_receiver_endpoint_only).
+                            match kernel.ipc_try_send_to_plain_receiver_endpoint_only(
+                                endpoint_idx,
+                                receiver_tid,
+                                msg,
+                            ) {
+                                IpcEndpointSendResult::EnqueuedWakeReceiver(recv_tid) => {
+                                    kernel.note_endpoint_only_queued_send_split();
+                                    (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(recv_tid))
                                 }
-                            } else {
-                                // Stage 4K: recv-v2 blocked receiver — complete delivery outside
-                                // ipc_state_lock.  blocked_recv_state.take() runs inside
-                                // complete_blocked_recv_for_waiter; on failure the receiver is
-                                // left orphaned (same semantics as the full ipc_send path).
-                                complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg)?;
-                                // Phase 4: clear receiver waiter slot under ipc_state_lock.
-                                kernel.ipc_clear_plain_receiver_waiter_only(
-                                    endpoint_idx,
-                                    receiver_tid,
-                                );
-                                kernel.note_split_recv_v2_delivery();
-                                (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(receiver_tid))
+                                _ => (None, IpcSchedulerPlan::None),
+                            }
+                        } else {
+                            // Stage 4K/4O: recv-v2 blocked receiver — deliver directly outside
+                            // ipc_state_lock. complete_blocked_recv_for_waiter handles all flag
+                            // variants including FLAG_CAP_TRANSFER (Stage 4O) and
+                            // FLAG_CAP_TRANSFER_PLAIN; cap materialization, user-memory copy,
+                            // and TrapFrame writes all happen outside the lock.
+                            // Return Some(Err) on failure (not ?) so the outer error path at
+                            // `if let Err(err) = send_result` can release the transfer envelope
+                            // when transfer_cap.is_some().
+                            match complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg) {
+                                Ok(()) => {
+                                    // Phase 4: clear receiver waiter slot under ipc_state_lock.
+                                    kernel.ipc_clear_plain_receiver_waiter_only(
+                                        endpoint_idx,
+                                        receiver_tid,
+                                    );
+                                    kernel.note_split_recv_v2_delivery();
+                                    if transfer_cap.is_some() {
+                                        kernel.note_cap_transfer_recv_v2_delivery();
+                                    }
+                                    (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(receiver_tid))
+                                }
+                                Err(_err) => {
+                                    // Map delivery failure to UserMemoryFault so the
+                                    // outer error path releases the transfer envelope.
+                                    // Matches ipc_send_with_optional_deadline line ~1285.
+                                    (Some(Err(KernelError::UserMemoryFault)), IpcSchedulerPlan::None)
+                                }
                             }
                         }
-                        IpcEndpointSendResult::Ineligible(_) => (None, IpcSchedulerPlan::None),
                     }
+                    IpcEndpointSendResult::Ineligible(_) => (None, IpcSchedulerPlan::None),
                 }
-                _ => (None, IpcSchedulerPlan::None),
             }
-        } else {
-            (None, IpcSchedulerPlan::None)
+            _ => (None, IpcSchedulerPlan::None),
         };
     let send_result = if let Some(send_result) = split_send_result {
         send_result

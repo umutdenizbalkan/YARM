@@ -1433,6 +1433,11 @@ impl KernelState {
             self.ipc.telemetry.ipc_reply_split_deliveries.saturating_add(1);
     }
 
+    pub(crate) fn note_cap_transfer_recv_v2_delivery(&mut self) {
+        self.ipc.telemetry.cap_transfer_recv_v2_deliveries =
+            self.ipc.telemetry.cap_transfer_recv_v2_deliveries.saturating_add(1);
+    }
+
     fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {
         if msg.opcode != PROC_OP_EXECUTE_RESTART {
             return Err(KernelError::WrongObject);
