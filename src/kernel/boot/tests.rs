@@ -9011,3 +9011,131 @@ fn run_ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
     let sender_in_meta = u64::from_le_bytes(meta[32..40].try_into().expect("sender"));
     assert_eq!(sender_in_meta, 0, "Stage 4L meta must record sender tid=0");
 }
+
+#[test]
+fn ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter() {
+    std::thread::Builder::new()
+        .name("ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter() {
+    // IpcReply recv-v2 split: when the requester is already blocked in a recv-v2
+    // operation on the reply endpoint, ipc_reply delivers directly via
+    // complete_blocked_recv_for_waiter and increments ipc_reply_split_deliveries.
+    // Message must not appear in the reply endpoint queue.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("task1 requester");
+    state.register_task(2).expect("task2 replier");
+
+    let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+    let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+    state.bind_task_asid(1, asid1).expect("bind1");
+    state.bind_task_asid(2, asid2).expect("bind2");
+    state
+        .map_user_page(aspace1, VirtAddr(0x3000), Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW })
+        .expect("map req payload page");
+    state
+        .map_user_page(aspace1, VirtAddr(0x4000), Mapping { phys: PhysAddr(0xB000), flags: PageFlags::USER_RW })
+        .expect("map req meta page");
+    state
+        .map_user_page(aspace2, VirtAddr(0x5000), Mapping { phys: PhysAddr(0xC000), flags: PageFlags::USER_RW })
+        .expect("map rep payload page");
+    state
+        .map_user_page(aspace2, VirtAddr(0x6000), Mapping { phys: PhysAddr(0xD000), flags: PageFlags::USER_RW })
+        .expect("map rep meta page");
+
+    // Two endpoints: req_ep (task1→task2 request) and reply_ep (task2→task1 reply).
+    let (req_eidx, req_send, req_recv) = state.create_endpoint(4).expect("req_ep");
+    let req_send_t1 = state.grant_capability_task_to_task(0, req_send, 1).expect("req_send t1");
+    let req_recv_t2 = state.grant_capability_task_to_task(0, req_recv, 2).expect("req_recv t2");
+    let (reply_eidx, _reply_send, reply_recv) = state.create_endpoint(4).expect("reply_ep");
+    let reply_recv_t1 = state.grant_capability_task_to_task(0, reply_recv, 1).expect("reply_recv t1");
+
+    // Task 1: IpcCall → sends request with FLAG_REPLY_CAP, then immediately
+    // blocks on recv-v2 for the reply (request-send only ABI; recv is separate).
+    state.enqueue_current_cpu(2).expect("enqueue2");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+    state.dispatch_next_task().expect("dispatch");
+    while state.current_tid() != Some(1) { state.yield_current().expect("to t1"); }
+
+    let mut call_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcCall as usize,
+        [req_send_t1.0 as usize, 0, 0, 0, 0, reply_recv_t1.0 as usize],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut call_frame)).expect("ipc_call");
+
+    // Task 2: receive the request via recv-v2, obtain the local reply cap.
+    while state.current_tid() != Some(2) { state.yield_current().expect("to t2"); }
+    let mut recv_req = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [req_recv_t2.0 as usize, 0x5000, 8, 0x6000, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut recv_req)).expect("recv request");
+    let req_meta = state.read_user_memory_for_asid(asid2, 0x6000, 40).expect("req meta");
+    let local_reply_cap = CapId(u64::from_le_bytes(req_meta[16..24].try_into().expect("cap field")));
+    assert!(
+        matches!(
+            state.capability_service().resolve_current_task_capability(local_reply_cap)
+                .map(|c| c.object),
+            Some(CapObject::Reply { .. })
+        ),
+        "task 2 must hold a materialized Reply cap"
+    );
+
+    // Task 1: block on recv-v2 on the reply endpoint (empty queue → blocks).
+    while state.current_tid() != Some(1) { state.yield_current().expect("to t1"); }
+    let mut recv_reply = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [reply_recv_t1.0 as usize, 0x3000, 8, 0x4000, 40, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut recv_reply)).expect("recv reply blocks");
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(reply_recv_t1))),
+        "task 1 must be blocked on reply recv"
+    );
+    let before_reply_split = state.ipc_path_telemetry().ipc_reply_split_deliveries;
+
+    // Task 2: issue IpcReply — should trigger ipc_reply recv-v2 direct delivery.
+    while state.current_tid() != Some(2) { state.yield_current().expect("to t2"); }
+    let reply_msg = Message::with_header(2, 0x77, 0, None, b"ok").expect("reply msg");
+    state.ipc_reply(local_reply_cap, reply_msg).expect("ipc_reply");
+
+    // Task 1 must be woken to Runnable.
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Runnable),
+        "requester must be Runnable after ipc_reply recv-v2 delivery"
+    );
+    // Reply must NOT be in the endpoint queue (delivered directly to recv-v2 buffers).
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[reply_eidx].as_ref().unwrap().queued()),
+        0,
+        "ipc_reply recv-v2 must not enqueue the message"
+    );
+    // Waiter slot must be cleared (wake_waiter_for_endpoint does the take).
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_none()),
+        "reply endpoint waiter slot must be cleared after delivery"
+    );
+    // Telemetry must record the split delivery.
+    assert_eq!(
+        state.ipc_path_telemetry().ipc_reply_split_deliveries,
+        before_reply_split + 1,
+        "ipc_reply recv-v2 path must increment ipc_reply_split_deliveries"
+    );
+    // Payload must be in task 1's user buffer.
+    let payload = state.read_user_memory_for_asid(asid1, 0x3000, 2).expect("reply payload");
+    assert_eq!(&payload[..2], b"ok");
+    // Request endpoint must be unused after the round trip.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[req_eidx].as_ref().unwrap().queued()),
+        0,
+        "request endpoint queue must be empty after round trip"
+    );
+}

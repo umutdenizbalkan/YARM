@@ -956,6 +956,7 @@ impl KernelState {
                             waiter_tid.0,
                             endpoint_idx
                         );
+                        self.note_ipc_reply_split_delivery();
                         self.wake_waiter_for_endpoint(endpoint_idx)?;
                         return Ok(());
                     }
@@ -1414,6 +1415,11 @@ impl KernelState {
     pub(crate) fn note_ipc_call_split_delivery(&mut self) {
         self.ipc.telemetry.ipc_call_split_deliveries =
             self.ipc.telemetry.ipc_call_split_deliveries.saturating_add(1);
+    }
+
+    pub(crate) fn note_ipc_reply_split_delivery(&mut self) {
+        self.ipc.telemetry.ipc_reply_split_deliveries =
+            self.ipc.telemetry.ipc_reply_split_deliveries.saturating_add(1);
     }
 
     fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {
