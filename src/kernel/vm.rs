@@ -1094,8 +1094,12 @@ mod tests {
     fn map_space_and_manager_capacity_limits() {
         let mut aspace = AddressSpace::new_user();
         for i in 0..MAX_MAPPINGS {
-            let virt = VirtAddr(((i + 1) * PAGE_SIZE) as u64);
-            let phys = PhysAddr(((i + 100) * PAGE_SIZE) as u64);
+            // Use virtual addresses that skip one page between each mapping so consecutive
+            // pages are never adjacent in both VA and PA at the same time, preventing the
+            // entry-merge optimisation from collapsing all mappings into one entry.
+            let virt = VirtAddr(((i * 2 + 1) * PAGE_SIZE) as u64);
+            // Use a scrambled physical address (not consecutive) to further defeat merging.
+            let phys = PhysAddr(((i * 3 + 100) * PAGE_SIZE) as u64);
             assert_eq!(
                 aspace.map_page(
                     virt,
@@ -1108,9 +1112,12 @@ mod tests {
             );
         }
 
+        // The (MAX_MAPPINGS + 1)-th distinct mapping must be rejected.
+        // Use a virtual address that was not previously mapped (i.e. an even-numbered page
+        // since we used odd-numbered pages above) and a completely different physical address.
         assert_eq!(
             aspace.map_page(
-                VirtAddr(((MAX_MAPPINGS + 1) * PAGE_SIZE) as u64),
+                VirtAddr(((MAX_MAPPINGS * 2 + 2) * PAGE_SIZE) as u64),
                 Mapping {
                     phys: PhysAddr(0x9000_0000),
                     flags: PageFlags::USER_RX,

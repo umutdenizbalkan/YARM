@@ -1816,7 +1816,7 @@ fn handle_ipc_recv_result_with_empty_error(
                             user_ptr,
                             app_payload.len()
                         );
-                        frame.set_ok(0, app_payload.len(), frame.ret2());
+                        frame.set_ok(sender, app_payload.len(), frame.ret2());
                     }
                     Err(KernelError::UserMemoryFault) => {
                         crate::yarm_log!(
@@ -1834,7 +1834,7 @@ fn handle_ipc_recv_result_with_empty_error(
                 // Kernel task (no user ASID): return full raw payload in inline registers.
                 // Do not apply opcode-prefix stripping — app_payload is recv-v2 only.
                 let raw_len = msg.as_slice().len();
-                frame.set_ok(0, raw_len, frame.ret2());
+                frame.set_ok(sender, raw_len, frame.ret2());
                 crate::yarm_log!(
                     "IPC_RECV_WAKE_RETURN_REGS tid={} x0={} x1={} x2={} elr=na",
                     receiver_tid,
@@ -3591,12 +3591,12 @@ mod tests {
         state.register_task(1).expect("task1");
         state.enqueue_current_cpu(1).expect("enqueue");
         state.dispatch_next_task().expect("dispatch");
-        let (_eid, send_cap_global, _recv_cap) = state
+        // create_endpoint_with_mode mints caps in the current task's cspace.  After
+        // dispatch_next_task() the current task is task 1, so the caps are already in
+        // task 1's cspace – no cross-task grant is required.
+        let (_eid, send_cap, _recv_cap) = state
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
-        let send_cap = state
-            .grant_capability_task_to_task(0, send_cap_global, 1)
-            .expect("dup send cap");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
         assert!(
@@ -3654,17 +3654,17 @@ mod tests {
     fn syscall_send_with_timeout_succeeds_when_receiver_waiting() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("receiver");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
+        // Create endpoint while task 0 is current: send_cap goes into task 0's cspace,
+        // recv_cap is granted to task 1.
         let (_eid, send_cap_global, recv_cap_global) = state
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
-        state
-            .grant_capability_task_to_task(0, send_cap_global, 1)
-            .expect("dup send cap");
         let recv_cap = state
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
+        // yield_current marks task 0 Runnable and switches to task 1, so that when task 1
+        // later blocks on IpcRecv the scheduler can pick task 0 again.
+        state.enqueue_current_cpu(1).expect("enqueue");
         state.yield_current().expect("switch to receiver");
         assert_eq!(state.current_tid(), Some(1));
 
@@ -3696,12 +3696,11 @@ mod tests {
         state.register_task(1).expect("task1");
         state.enqueue_current_cpu(1).expect("enqueue");
         state.dispatch_next_task().expect("dispatch");
-        let (_eid, send_cap_global, _recv_cap) = state
+        // After dispatch_next_task() task 1 is current; create_endpoint_with_mode mints
+        // caps in the current task's cspace, so send_cap is already in task 1's cspace.
+        let (_eid, send_cap, _recv_cap) = state
             .create_endpoint_with_mode(1, EndpointMode::Synchronous)
             .expect("endpoint");
-        let send_cap = state
-            .grant_capability_task_to_task(0, send_cap_global, 1)
-            .expect("dup send cap");
         state.yield_current().expect("switch to task1");
         assert_eq!(state.current_tid(), Some(1));
 
