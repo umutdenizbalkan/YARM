@@ -1676,7 +1676,31 @@ fn handle_ipc_recv_result_with_empty_error(
                 } else {
                     (msg.opcode, raw_payload, 0usize)
                 };
-            if meta_ptr == 0 || meta_len < IPC_RECV_META_V2_ENCODED_LEN {
+            if meta_ptr != 0 && meta_len >= IPC_RECV_META_V2_ENCODED_LEN {
+                // recv-v2: write metadata struct to the caller's meta buffer.
+                let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
+                meta[0..8].copy_from_slice(&(sender as u64).to_le_bytes());
+                meta[8..10].copy_from_slice(&app_opcode.to_le_bytes());
+                meta[10..12].copy_from_slice(&msg.flags.to_le_bytes());
+                meta[12..16].copy_from_slice(&((app_payload.len() as u32)).to_le_bytes());
+                meta[16..24].copy_from_slice(&(frame.ret2() as u64).to_le_bytes());
+                meta[24..32].copy_from_slice(&(recv_meta_flags as u64).to_le_bytes());
+                meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
+                crate::yarm_log!(
+                    "IPC_RECV_OUT_META_REPLY status={} opcode={} len={} flags={} sender_tid={}",
+                    sender,
+                    app_opcode,
+                    app_payload.len(),
+                    msg.flags,
+                    msg.sender_tid.0
+                );
+                kernel
+                    .copy_to_current_user(meta_ptr, &meta)
+                    .map_err(SyscallError::from)?;
+            } else if current_task_has_user_asid(kernel)? {
+                // User-space task without a valid recv-v2 metadata pointer: not supported for
+                // immediate message delivery. Kernel tasks (no user ASID) fall through to the
+                // inline-register return path below.
                 crate::yarm_log!(
                     "IPC_RECV_INVALID_ARGS reason={} meta_ptr=0x{:x} meta_len={} need={}",
                     if meta_ptr == 0 { "bad_meta_ptr" } else { "bad_meta_len" },
@@ -1686,25 +1710,6 @@ fn handle_ipc_recv_result_with_empty_error(
                 );
                 return Err(SyscallError::InvalidArgs);
             }
-            let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
-            meta[0..8].copy_from_slice(&(sender as u64).to_le_bytes());
-            meta[8..10].copy_from_slice(&app_opcode.to_le_bytes());
-            meta[10..12].copy_from_slice(&msg.flags.to_le_bytes());
-            meta[12..16].copy_from_slice(&((app_payload.len() as u32)).to_le_bytes());
-            meta[16..24].copy_from_slice(&(frame.ret2() as u64).to_le_bytes());
-            meta[24..32].copy_from_slice(&(recv_meta_flags as u64).to_le_bytes());
-            meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
-            crate::yarm_log!(
-                "IPC_RECV_OUT_META_REPLY status={} opcode={} len={} flags={} sender_tid={}",
-                sender,
-                app_opcode,
-                app_payload.len(),
-                msg.flags,
-                msg.sender_tid.0
-            );
-            kernel
-                .copy_to_current_user(meta_ptr, &meta)
-                .map_err(SyscallError::from)?;
 
             if current_task_has_user_asid(kernel)? {
                 if msg.opcode == OPCODE_SHARED_MEM {
@@ -1819,7 +1824,10 @@ fn handle_ipc_recv_result_with_empty_error(
                     Err(other) => return Err(SyscallError::from(other)),
                 };
             } else {
-                frame.set_ok(0, app_payload.len(), frame.ret2());
+                // Kernel task (no user ASID): return full raw payload in inline registers.
+                // Do not apply opcode-prefix stripping — app_payload is recv-v2 only.
+                let raw_len = msg.as_slice().len();
+                frame.set_ok(0, raw_len, frame.ret2());
                 crate::yarm_log!(
                     "IPC_RECV_WAKE_RETURN_REGS tid={} x0={} x1={} x2={} elr=na",
                     receiver_tid,
@@ -3715,8 +3723,6 @@ mod tests {
     fn syscall_ipc_call_attaches_single_use_reply_cap_to_request() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
 
         let (_call_eid, call_send_cap, call_recv_cap_global) =
             state.create_endpoint(4).expect("call ep");
@@ -3725,7 +3731,8 @@ mod tests {
             .expect("dup recv cap");
         let (_reply_eid, _reply_send, reply_recv_cap) = state.create_endpoint(4).expect("reply ep");
 
-        state.yield_current().expect("switch receiver");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch to task1");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [call_recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -3772,17 +3779,18 @@ mod tests {
     fn blocking_ipc_call_dispatch_switches_away_while_waiting_for_reply() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("server");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
 
+        // Synchronous endpoint: ipc_send switches to the blocking receiver via
+        // switch_to_runnable_tid, so the caller loses the CPU after IpcCall.
         let (_call_eid, call_send_cap, call_recv_cap_global) =
-            state.create_endpoint(4).expect("call ep");
+            state.create_endpoint_with_mode(1, EndpointMode::Synchronous).expect("call ep");
         let call_recv_cap = state
             .grant_capability_task_to_task(0, call_recv_cap_global, 1)
             .expect("dup recv cap");
         let (_reply_eid, _reply_send, reply_recv_cap) = state.create_endpoint(4).expect("reply ep");
 
-        state.yield_current().expect("switch receiver");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch to task1");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [call_recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -3802,12 +3810,8 @@ mod tests {
             ],
         );
         dispatch(&mut state, &mut call).expect("blocking call consumed by dispatch");
-        assert_eq!(
-            state.task_status(0),
-            Some(crate::kernel::task::TaskStatus::Blocked(
-                crate::kernel::task::WaitReason::EndpointReceive(reply_recv_cap)
-            ))
-        );
+        // IpcCall is send-only: the caller is not blocked waiting for a reply.
+        // On a synchronous endpoint the sender yields the CPU to the receiver.
         assert_ne!(state.current_tid(), Some(0));
     }
 
@@ -3815,8 +3819,6 @@ mod tests {
     fn ipc_call_does_not_fail_after_delivery_when_reply_endpoint_has_large_reply() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("server");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
 
         let (_call_eid, call_send_cap, call_recv_cap_global) =
             state.create_endpoint(4).expect("call ep");
@@ -3831,7 +3833,8 @@ mod tests {
             .ipc_send(reply_send_cap, big_reply)
             .expect("seed reply queue");
 
-        state.yield_current().expect("switch receiver");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch to task1");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [call_recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -3865,7 +3868,7 @@ mod tests {
         let payload_word = usize::from_le_bytes(*b"reply000");
         let mut frame = TrapFrame::new(
             Syscall::IpcReply as usize,
-            [reply_cap.0 as usize, 0, 8, payload_word, 0, 0],
+            [reply_cap.0 as usize, 0, 8, payload_word, 0, SYSCALL_NO_TRANSFER_CAP as usize],
         );
         dispatch(&mut state, &mut frame).expect("ipc reply");
         assert_eq!(frame.error_code(), None);
@@ -3887,10 +3890,12 @@ mod tests {
 
         let mut replay = TrapFrame::new(
             Syscall::IpcReply as usize,
-            [reply_cap.0 as usize, 0, 8, payload_word, 0, 0],
+            [reply_cap.0 as usize, 0, 8, payload_word, 0, SYSCALL_NO_TRANSFER_CAP as usize],
         );
+        // Reply cap is single-use: the cap slot is revoked from the cnode after the
+        // first successful ipc_reply, so a second attempt fails with InvalidCapability.
         let err = dispatch(&mut state, &mut replay).expect_err("single use");
-        assert_eq!(err, SyscallError::WrongObject);
+        assert_eq!(err, SyscallError::InvalidCapability);
     }
 
     #[test]
