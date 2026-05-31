@@ -8877,6 +8877,161 @@ fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
 }
 
 #[test]
+fn ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiver() {
+    std::thread::Builder::new()
+        .name("ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiver".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiver)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiver() {
+    // Stage 4O: IpcSend with FLAG_CAP_TRANSFER where the receiver is already blocked in a
+    // recv-v2 operation.  complete_blocked_recv_for_waiter handles cap materialization outside
+    // ipc_state_lock; the waiter slot is cleared under ipc_state_lock; the receiver is woken
+    // — without the message touching the endpoint queue and without holding ipc_state_lock
+    // during the cap grant or user-memory writes.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    state.register_task(1).expect("register receiver");
+    state.enqueue_current_cpu(1).expect("enqueue receiver");
+
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv cap to task1");
+
+    // Create a memory object cap in task 0's cspace (the cap to transfer).
+    let (_mem_id, transfer_cap) = state
+        .create_memory_object(PhysAddr(0xCA000))
+        .expect("memory object");
+
+    // Set up user memory for task 1: payload page and meta page for recv-v2.
+    let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind task1 asid");
+    let payload_ptr = 0x3000usize;
+    let meta_ptr   = 0x4000usize;
+    state
+        .map_user_page(
+            aspace1,
+            VirtAddr(payload_ptr as u64),
+            Mapping { phys: PhysAddr(0x9000), flags: PageFlags::USER_RW },
+        )
+        .expect("map payload page");
+    state
+        .map_user_page(
+            aspace1,
+            VirtAddr(meta_ptr as u64),
+            Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW },
+        )
+        .expect("map meta page");
+
+    // Switch to task 1 so it can run the IpcRecv syscall (sets blocked_recv_state
+    // with RecvAbiVariant::RecvV2 when the endpoint queue is empty).
+    state.yield_current().expect("switch to task1");
+    assert_eq!(state.current_tid(), Some(1));
+
+    let mut recv_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [
+            recv_cap_task1.0 as usize, // arg[0] = recv cap
+            payload_ptr,               // arg[1] = payload_ptr  (SYSCALL_ARG_PTR)
+            Message::MAX_PAYLOAD,      // arg[2] = payload_len  (SYSCALL_ARG_LEN)
+            meta_ptr,                  // arg[3] = meta_ptr     (INLINE_PAYLOAD0, != 0 → recv-v2)
+            40,                        // arg[4] = meta_len     (INLINE_PAYLOAD1, >= 40 → recv-v2)
+            0,
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut recv_frame)).expect("recv blocks");
+    assert_eq!(state.current_tid(), Some(0), "task 0 must be current after task 1 blocks");
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_task1))),
+        "task 1 must be blocked on recv"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        Some(ThreadId(1)),
+        "task 1 must be registered as endpoint waiter"
+    );
+
+    // Record telemetry counters before Stage 4O delivery.
+    let before_split_recv_v2 = state.ipc_path_telemetry().split_recv_v2_deliveries;
+    let before_cap_transfer   = state.ipc_path_telemetry().cap_transfer_recv_v2_deliveries;
+
+    // Task 0 sends via IpcSend with transfer_cap.  Stage 4O fires: recv-v2 blocked receiver
+    // → complete_blocked_recv_for_waiter delivers payload + materializes cap into task 1's
+    // cspace directly, outside ipc_state_lock.
+    let mut send_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcSend as usize,
+        [
+            send_cap.0 as usize,
+            0,                                // user_ptr_or_offset = 0 (inline)
+            4,                                // len = 4 bytes (2-byte opcode prefix + b"4o")
+            inline_payload_word(b"\x00\x004o"), // opcode=0 (2 bytes) + payload b"4o" (2 bytes)
+            0,                                // inline payload [8..16]
+            transfer_cap.0 as usize,          // transfer cap (FLAG_CAP_TRANSFER)
+        ],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut send_frame)).expect("Stage 4O ipc_send");
+
+    assert_eq!(send_frame.error_code(), None, "Stage 4O send must succeed");
+
+    // Receiver must be woken to Runnable.
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Runnable),
+        "receiver must be Runnable after Stage 4O direct delivery"
+    );
+    // Waiter slot must be cleared (Phase 4).
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        "endpoint waiter slot must be cleared after Stage 4O"
+    );
+    // Message must NOT be in the endpoint queue (delivered directly to user buffers).
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        0,
+        "Stage 4O must deliver directly, not enqueue"
+    );
+    // Both telemetry counters must be incremented.
+    assert_eq!(
+        state.ipc_path_telemetry().split_recv_v2_deliveries,
+        before_split_recv_v2 + 1,
+        "Stage 4O must increment split_recv_v2_deliveries"
+    );
+    assert_eq!(
+        state.ipc_path_telemetry().cap_transfer_recv_v2_deliveries,
+        before_cap_transfer + 1,
+        "Stage 4O must increment cap_transfer_recv_v2_deliveries"
+    );
+    // Payload must be written to receiver's user memory.
+    let payload_bytes = state
+        .read_user_memory_for_asid(asid1, payload_ptr, 2)
+        .expect("read payload");
+    assert_eq!(&payload_bytes[..2], b"4o", "Stage 4O must write payload to receiver user memory");
+    // Meta must indicate SYSCALL_RECV_META_TRANSFERRED_CAP (bit 1).
+    let meta_bytes = state
+        .read_user_memory_for_asid(asid1, meta_ptr, 40)
+        .expect("read meta");
+    let recv_meta_flags = u64::from_le_bytes(meta_bytes[24..32].try_into().expect("meta flags"));
+    assert_ne!(
+        recv_meta_flags & crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
+        0,
+        "Stage 4O must set SYSCALL_RECV_META_TRANSFERRED_CAP in receiver meta; flags={}",
+        recv_meta_flags
+    );
+    // The materialized cap must exist in task 1's cspace.
+    let cap_id_raw = u64::from_le_bytes(meta_bytes[16..24].try_into().expect("cap_id"));
+    assert_ne!(
+        cap_id_raw,
+        crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "Stage 4O must materialize a cap in receiver cspace"
+    );
+}
+
+#[test]
 fn ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
     std::thread::Builder::new()
         .name("ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver".into())
