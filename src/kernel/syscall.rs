@@ -609,25 +609,28 @@ fn stash_transfer_handle(
     transfer_cap: Option<CapId>,
     endpoint: CapObject,
     shared_region: Option<TransferSharedRegion>,
-) -> Result<Option<u64>, SyscallError> {
+) -> Result<(Option<u64>, Option<crate::kernel::ipc::ThreadId>), SyscallError> {
     let Some(source_cap_id) = transfer_cap else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let sender_tid = current_tid(kernel)?;
     let _ = kernel
         .resolve_capability_for_task(sender_tid, source_cap_id)
         .map_err(SyscallError::from)?;
     let receiver_tid = kernel.endpoint_waiter_tid(endpoint);
-    Ok(Some(
-        kernel
-            .stash_transfer_envelope(
-                crate::kernel::ipc::ThreadId(sender_tid),
-                source_cap_id,
-                endpoint,
-                receiver_tid,
-                shared_region,
-            )
-            .ok_or(SyscallError::QueueFull)?,
+    Ok((
+        Some(
+            kernel
+                .stash_transfer_envelope(
+                    crate::kernel::ipc::ThreadId(sender_tid),
+                    source_cap_id,
+                    endpoint,
+                    receiver_tid,
+                    shared_region,
+                )
+                .ok_or(SyscallError::QueueFull)?,
+        ),
+        receiver_tid,
     ))
 }
 
@@ -787,6 +790,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         0
     };
 
+    let mut stash_bound_receiver_tid: Option<crate::kernel::ipc::ThreadId> = None;
     let msg_result = if sender_has_user_asid {
         if len > Message::MAX_PAYLOAD {
             let grant_cap = transfer_cap.ok_or(SyscallError::InvalidArgs)?;
@@ -804,7 +808,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
             };
-            let transfer_handle = stash_transfer_handle(
+            let (transfer_handle, bound_tid) = stash_transfer_handle(
                 kernel,
                 transfer_cap,
                 endpoint,
@@ -813,6 +817,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                     len: region.len,
                 }),
             )?;
+            stash_bound_receiver_tid = bound_tid;
             Message::with_header(
                 sender_tid,
                 OPCODE_SHARED_MEM,
@@ -831,7 +836,8 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 Err(other) => return Err(SyscallError::from(other)),
             };
 
-            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
+            let (transfer_handle, bound_tid) = stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
+            stash_bound_receiver_tid = bound_tid;
             Message::with_header(
                 sender_tid,
                 OPCODE_INLINE,
@@ -860,7 +866,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
             };
-            let transfer_handle = stash_transfer_handle(
+            let (transfer_handle, bound_tid) = stash_transfer_handle(
                 kernel,
                 transfer_cap,
                 endpoint,
@@ -869,6 +875,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                     len: region.len,
                 }),
             )?;
+            stash_bound_receiver_tid = bound_tid;
             Message::with_header(
                 sender_tid,
                 OPCODE_SHARED_MEM,
@@ -879,7 +886,8 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             .map_err(|_| SyscallError::InvalidArgs)
         } else {
             let payload = inline_payload_from_frame(frame, len)?;
-            let transfer_handle = stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
+            let (transfer_handle, bound_tid) = stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
+            stash_bound_receiver_tid = bound_tid;
             Message::with_header(
                 sender_tid,
                 OPCODE_INLINE,
@@ -961,11 +969,12 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     };
     if let Err(err) = send_result {
         if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
-            let _ = kernel.take_transfer_envelope(
-                handle,
-                endpoint,
-                crate::kernel::ipc::ThreadId(current_tid(kernel)?),
-            );
+            // Use the receiver TID that was bound at stash time. Passing sender_tid
+            // would fail the bound-receiver check inside take_transfer_envelope when
+            // endpoint_waiter_tid returned Some(waiter_tid) at stash time.
+            let cleanup_tid = stash_bound_receiver_tid
+                .unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
+            let _ = kernel.take_transfer_envelope(handle, endpoint, cleanup_tid);
         }
         if err == KernelError::WouldBlock && send_timeout_ticks != 0 {
             let timed_out = kernel
@@ -1288,6 +1297,7 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         return Err(SyscallError::InvalidArgs);
     }
 
+    let mut stash_bound_receiver_tid: Option<crate::kernel::ipc::ThreadId> = None;
     let msg = if current_task_has_user_asid(kernel)? {
         let payload = match kernel.copy_from_current_user(user_ptr_or_offset, len) {
             Ok(payload) => payload,
@@ -1297,7 +1307,8 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             }
             Err(other) => return Err(SyscallError::from(other)),
         };
-        let transfer_handle = stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
+        let (transfer_handle, bound_tid) = stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
+        stash_bound_receiver_tid = bound_tid;
         Message::with_header(
             sender_tid,
             OPCODE_INLINE,
@@ -1308,7 +1319,8 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         .map_err(|_| SyscallError::InvalidArgs)?
     } else {
         let payload = inline_payload_from_frame(frame, len)?;
-        let transfer_handle = stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
+        let (transfer_handle, bound_tid) = stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
+        stash_bound_receiver_tid = bound_tid;
         Message::with_header(
             sender_tid,
             OPCODE_INLINE,
@@ -1389,11 +1401,11 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 
     if let Err(err) = kernel.ipc_send(cap, msg) {
         if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
-            let _ = kernel.take_transfer_envelope(
-                handle,
-                endpoint,
-                crate::kernel::ipc::ThreadId(current_tid(kernel)?),
-            );
+            // Use the receiver TID bound at stash time — sender_tid would fail
+            // the bound-receiver check when a waiter was present at stash time.
+            let cleanup_tid = stash_bound_receiver_tid
+                .unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
+            let _ = kernel.take_transfer_envelope(handle, endpoint, cleanup_tid);
         }
         return Err(SyscallError::from(err));
     }
@@ -1482,11 +1494,13 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
     // ipc_call protocol).  Reply messages carry the payload bytes verbatim
     // without any such prefix; using FLAG_CAP_TRANSFER_PLAIN avoids the
     // destructive 2-byte strip and preserves the full payload for the receiver.
+    let mut stash_bound_reply_tid: Option<crate::kernel::ipc::ThreadId> = None;
     let transfer_handle = if transfer_cap.is_some() {
         let reply_endpoint = kernel
             .reply_cap_peek_endpoint(reply_cap)
             .map_err(SyscallError::from)?;
-        let handle = stash_transfer_handle(kernel, transfer_cap, reply_endpoint, None)?;
+        let (handle, bound_tid) = stash_transfer_handle(kernel, transfer_cap, reply_endpoint, None)?;
+        stash_bound_reply_tid = bound_tid;
         crate::yarm_log!(
             "IPC_REPLY_WITH_CAP_STASH tid={} transfer_cap={} handle={} endpoint={:?}",
             sender_tid,
@@ -1525,11 +1539,9 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
         if let Some(handle) = transfer_handle {
             // Best-effort: ignore the result of taking back the envelope.
             if let Ok(reply_endpoint) = kernel.reply_cap_peek_endpoint(reply_cap) {
-                let _ = kernel.take_transfer_envelope(
-                    handle,
-                    reply_endpoint,
-                    crate::kernel::ipc::ThreadId(sender_tid),
-                );
+                let cleanup_tid = stash_bound_reply_tid
+                    .unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
+                let _ = kernel.take_transfer_envelope(handle, reply_endpoint, cleanup_tid);
             }
         }
         if err == KernelError::WrongObject {

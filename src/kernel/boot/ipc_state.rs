@@ -934,13 +934,20 @@ impl KernelState {
                 endpoint_idx
             );
         }
-        if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+        // Phase 1: snapshot waiter TID under ipc_state_lock — consistent with the
+        // Stage 4K/4L Phase 1–5 discipline.  The lock is released before Phase 2–5
+        // so it is never held across user-memory copy, cap ops, or scheduler mutation.
+        let opt_waiter_tid: Option<ThreadId> =
+            self.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]);
+        if let Some(waiter_tid) = opt_waiter_tid {
             crate::yarm_log!(
                 "IPC_REPLY_DELIVER_TO_WAITER tid={} endpoint={} len={}",
                 waiter_tid.0,
                 endpoint_idx,
                 msg.len
             );
+            // Phase 2: confirm recv-v2 under task_state_lock (rank 3) before
+            // re-acquiring ipc_state_lock (rank 4) in Phase 4.
             let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
                 tcbs.iter()
                     .flatten()
@@ -949,6 +956,7 @@ impl KernelState {
                     .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
             });
             if waiter_recv_v2_blocked {
+                // Phase 3: complete delivery outside all locks.
                 match complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg) {
                     Ok(()) => {
                         crate::yarm_log!(
@@ -957,7 +965,10 @@ impl KernelState {
                             endpoint_idx
                         );
                         self.note_ipc_reply_split_delivery();
-                        self.wake_waiter_for_endpoint(endpoint_idx)?;
+                        // Phase 4: clear waiter slot under ipc_state_lock.
+                        self.ipc_clear_plain_receiver_waiter_only(endpoint_idx, waiter_tid);
+                        // Phase 5: wake receiver outside locks.
+                        self.wake_tid_to_runnable(waiter_tid)?;
                         return Ok(());
                     }
                     Err(err) => {
