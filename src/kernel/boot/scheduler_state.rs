@@ -103,6 +103,48 @@ impl KernelState {
         self.enqueue_on_cpu(self.current_cpu(), tid)
     }
 
+    /// Re-enqueue the idle task (TID 0) on CPU 0 after `dispatch_next_task` displaced it.
+    ///
+    /// In hosted-dev tests `dispatch_next_task` removes TID 0 from the scheduler's
+    /// `current` slot when a real task becomes runnable.  Call this immediately after
+    /// every `dispatch_next_task` so subsequent `yield_current` calls have TID 0 in the
+    /// membership table and can re-enqueue it without an `AlreadyQueued` error.
+    ///
+    /// See `doc/KERNEL_TEST_RULES.md §Rule 2 — Idle re-enqueue`.
+    #[cfg(test)]
+    pub fn idle_re_enqueue_for_test(&mut self) -> Result<(), KernelError> {
+        self.enqueue_on_cpu(CpuId(0), 0)
+    }
+
+    /// Return the number of tasks waiting in the run-queue of `cpu` (excludes the
+    /// currently running task).  Zero when `cpu` is offline or out of range.
+    #[allow(dead_code)]
+    pub(crate) fn runnable_count_on_cpu(&self, cpu: CpuId) -> usize {
+        self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
+    }
+
+    /// Inspect TCB status and return the wake plan without mutating any state.
+    ///
+    /// Returns `SchedulerWakePlan::Wake(tid)` when the task is in a state that
+    /// requires a scheduler wake (i.e. Blocked or Running-but-needs-requeue).
+    /// Returns `SchedulerWakePlan::None` when the task is already Runnable, is the
+    /// current task, or is not found.
+    ///
+    /// Usage: call under a domain lock to compute the plan, then call
+    /// `apply_scheduler_wake_plan` after releasing the lock.
+    #[allow(dead_code)]
+    pub(crate) fn compute_wake_plan_for_tid(&self, tid: crate::kernel::ipc::ThreadId) -> super::SchedulerWakePlan {
+        let status = match self.task_status(tid.0) {
+            Some(s) => s,
+            None => return super::SchedulerWakePlan::None,
+        };
+        match status {
+            TaskStatus::Blocked(_) => super::SchedulerWakePlan::Wake(tid),
+            TaskStatus::Running if self.current_tid() != Some(tid.0) => super::SchedulerWakePlan::Wake(tid),
+            _ => super::SchedulerWakePlan::None,
+        }
+    }
+
     pub fn online_cpu_count(&self) -> usize {
         self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).online_cpu_count())
     }

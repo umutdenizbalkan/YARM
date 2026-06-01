@@ -534,7 +534,7 @@ fn repeated_transfer_cap_revoke_force_unmaps_keep_map_release_telemetry_in_sync(
     state.bind_task_asid(1, asid1).expect("bind1");
     state.enqueue_current_cpu(1).expect("enqueue");
     state.dispatch_next_task().expect("dispatch");
-    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue task0");
+    state.idle_re_enqueue_for_test().expect("re-enqueue idle");
     if state.current_tid() != Some(0) {
         state.yield_current().expect("switch to task0");
     }
@@ -594,7 +594,7 @@ fn phase5_mixed_teardown_paths_keep_transfer_and_mapping_telemetry_balanced() {
         .object;
     state.enqueue_current_cpu(1).expect("enqueue");
     state.dispatch_next_task().expect("dispatch");
-    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue task0");
+    state.idle_re_enqueue_for_test().expect("re-enqueue idle");
 
     if state.current_tid() != Some(0) {
         state.yield_current().expect("switch to task0");
@@ -1506,7 +1506,7 @@ fn reply_caps_are_revoked_when_caller_exits() {
         .expect("create reply cap");
     state.enqueue_current_cpu(1).expect("enqueue");
     state.dispatch_next_task().expect("dispatch");
-    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue task0");
+    state.idle_re_enqueue_for_test().expect("re-enqueue idle");
 
     state.exit_task(1, 7).expect("exit caller");
 
@@ -4005,7 +4005,7 @@ fn ipc_message_header_and_cap_transfer_metadata_are_preserved() {
     assert_eq!(state.current_tid(), Some(1));
     assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
     // After task1 blocks, re-enqueue task0 so it becomes current.
-    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue task0");
+    state.idle_re_enqueue_for_test().expect("re-enqueue idle");
     state.dispatch_next_task().expect("dispatch task0");
     assert_eq!(state.current_tid(), Some(0));
 
@@ -4439,7 +4439,7 @@ fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() 
     state.enqueue_current_cpu(1).expect("enqueue");
     state.dispatch_next_task().expect("dispatch");
     state.yield_current().expect("switch to task1");
-    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue task0");
+    state.idle_re_enqueue_for_test().expect("re-enqueue idle");
     assert_eq!(state.current_tid(), Some(1));
     assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
     assert_eq!(state.current_tid(), Some(0));
@@ -6575,7 +6575,7 @@ fn futex_wait_blocks_current_and_wake_requeues_waiter() {
     }
     assert_eq!(state.current_tid(), Some(1));
     // Re-enqueue idle so it becomes current after task1 blocks in futex_wait_current.
-    state.enqueue_on_cpu(CpuId(0), 0).expect("re-enqueue idle");
+    state.idle_re_enqueue_for_test().expect("re-enqueue idle");
     // Initialize the futex word in the hosted-dev user_memory HashMap for both
     // address spaces so copy_from_user succeeds for both task1 and idle.
     state.write_user_memory(1, 0x1000, &3u32.to_ne_bytes()).expect("init futex word task1");

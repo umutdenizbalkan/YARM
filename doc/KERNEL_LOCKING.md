@@ -2229,6 +2229,70 @@ IPC, capability, VM, memory, and driver lock ranks.
 
 ---
 
+### Scheduler-domain lock contract
+
+The following functions touch **only** scheduler-internal state (rank 1–2 in the
+lock-rank order below) and no other domain state:
+
+| Function | File | Notes |
+|---|---|---|
+| `block_current_cpu` | `scheduler_state.rs` | Purely scheduler-internal |
+| `on_preempt_current_cpu` | `scheduler_state.rs` | Purely scheduler-internal |
+| `dispatch_next_current_cpu` | `scheduler_state.rs` | Purely scheduler-internal |
+| `enqueue_on_cpu` | `scheduler_state.rs` | Reads priority/affinity (rank 3 task domain) |
+| `enqueue_woken_task` | `scheduler_state.rs` | Reads CPU affinity only |
+| `runnable_count_on_cpu` | `scheduler_state.rs` | Read-only scheduler snapshot |
+| `compute_wake_plan_for_tid` | `scheduler_state.rs` | Read-only TCB status snapshot |
+
+The following functions cross into other domains (TCB status, HAL, kernel context):
+
+| Function | Additional domains touched |
+|---|---|
+| `dispatch_next_task` | `task_state_lock` (TCB status write), HAL (address space), kernel context switch |
+| `yield_current` | `task_state_lock` (TCB status), HAL (address space), kernel context switch |
+| `wake_tid_to_runnable` | `task_state_lock` (TCB status), `ipc_state_lock` (clear IPC timeout) |
+
+### `switch_to_runnable_tid` design constraint
+
+`switch_to_runnable_tid` (`task_core_state.rs`) is a cooperative busy-loop that
+calls `yield_current()` up to `MAX_TASKS` times until a target TID becomes the
+current task on the CPU.
+
+**Why it exists**: In hosted-dev / test builds there is no real preemption. IPC
+send paths that need the receiver to run immediately (synchronous endpoint handoff,
+fastpath send) use this to drive the cooperative scheduler.
+
+**Decomposition blocker**: Cannot be replaced with a plan-first pattern without a
+hosted-dev cooperative dispatch mechanism. On real hardware the receiver is
+scheduled by the normal preemption path (timer interrupt → `on_preempt` →
+`dispatch_next`), so the busy-loop is unnecessary freestanding. However, changing
+this requires architecture-specific dispatch hooks that are out of scope.
+
+**Invariant**: Must never be called while holding any domain lock. Each
+`yield_current` acquires `task_state_lock` (rank 3) and touches the address-space
+HAL — violating lock order if called inside an IPC/cap/VM lock.
+
+**Future**: replace with a `SwitchTo(ThreadId)` scheduler plan returned from the
+IPC send path, applied by the arch trap-return sequence, with a hosted-dev
+cooperative fallback.
+
+### Idle/TID 0 semantics
+
+TID 0 is the idle task. Key invariants:
+
+1. `dispatch_next` in `PriorityScheduler` preempts TID 0 when any real task is
+   runnable, and removes TID 0 from the membership table so it can be re-enqueued.
+2. After `dispatch_next_task()` in tests, TID 0 is displaced from `current`.  Call
+   `idle_re_enqueue_for_test()` (or `enqueue_on_cpu(CpuId(0), 0)`) immediately so
+   subsequent yields have TID 0 available (see `KERNEL_TEST_RULES.md §Rule 2`).
+3. In freestanding builds, when no real task is runnable, arch-specific code enters
+   the idle halt loop (WFI on AArch64, HLT on x86_64).  This is signalled by the
+   `SCHED_ENTER_IDLE_HLT` log event emitted from `idle_no_eret_loop()` (AArch64).
+4. Idle (TID 0) is never blocked via `block_current_cpu`; it only transitions
+   between `current` (Running) and queued (Runnable / membership table).
+5. In hosted-dev, idle burns host CPU cycles — this is expected; no WFI equivalent
+   exists in the test shim.
+
 ### Stage 3: remove global lock from syscall fast path
 
 

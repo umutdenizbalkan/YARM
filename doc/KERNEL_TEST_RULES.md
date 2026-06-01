@@ -26,7 +26,7 @@ cap lands in the newly-dispatched task's cspace, not the intended caller's.
 let reply_cap = state.create_reply_cap_for_caller(caller_tid, recv_cap, None)?;
 state.enqueue_current_cpu(caller_tid)?;
 state.dispatch_next_task()?;
-state.enqueue_on_cpu(CpuId(0), 0)?;   // Rule 2
+state.idle_re_enqueue_for_test()?;   // Rule 2
 
 // WRONG — cap goes into whoever is current after dispatch
 state.enqueue_current_cpu(caller_tid)?;
@@ -47,13 +47,16 @@ membership table until it is explicitly re-enqueued.
 calls `block_current_cpu()` + `dispatch_next_task()` will find an empty membership
 table and panic (no ready task to dispatch).
 
-**Rule:** After every `dispatch_next_task()` call in a test, immediately re-enqueue
-the idle task on CPU 0:
+**Rule:** After every `dispatch_next_task()` call in a test, immediately call
+`idle_re_enqueue_for_test()`:
 
 ```rust
 state.dispatch_next_task()?;
-state.enqueue_on_cpu(CpuId(0), 0)?;  // keep idle in membership table
+state.idle_re_enqueue_for_test()?;  // keep idle in membership table
 ```
+
+`idle_re_enqueue_for_test()` is a `#[cfg(test)]` helper on `KernelState` that
+wraps `enqueue_on_cpu(CpuId(0), 0)`.  It is defined in `scheduler_state.rs`.
 
 Exception: if the very next line in the test exits the process and no further
 blocking occurs, the re-enqueue can be omitted — but it is always safe to add it.
@@ -199,7 +202,7 @@ setups that consume a few mapping slots before the exhaustion loop.
 | Rule | Key point |
 |------|-----------|
 | 1. Cspace-at-mint | Mint caps **before** `dispatch_next_task` |
-| 2. Idle re-enqueue | After every `dispatch_next_task`, call `enqueue_on_cpu(CpuId(0), 0)` |
+| 2. Idle re-enqueue | After every `dispatch_next_task`, call `idle_re_enqueue_for_test()` |
 | 3. HashMap init | Write user memory **before** any syscall reads it; write per-ASID |
 | 4. ASID binding | Bind ASID to every task (including TID=0) that touches user memory |
 | 5. Running\|Runnable | After wake/exit, assert `Running \| Runnable`, not just `Runnable` |
