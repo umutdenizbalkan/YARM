@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+#[path = "sysdeps/kernel_hooks.rs"]
 mod kernel_hooks;
+#[path = "sysdeps/musl_startup.rs"]
 mod musl_startup;
+#[path = "sysdeps/service_hooks.rs"]
 mod service_hooks;
 
 pub use kernel_hooks::*;
