@@ -338,15 +338,16 @@ impl KernelState {
         payload[..8].copy_from_slice(&(timed_out as u64).to_le_bytes());
         payload[8..16].copy_from_slice(&(self.current_cpu().0 as u64).to_le_bytes());
         let msg = Message::new(0, &payload).map_err(|_| KernelError::WrongObject)?;
-        let endpoint = self
-            .ipc
-            .endpoints
-            .get_mut(endpoint_idx)
-            .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?;
-        endpoint
-            .send(msg)
-            .map_err(|_| KernelError::EndpointQueueFull)?;
+        // Enqueue the escalation message under ipc_state_lock (rank 3). Must not
+        // hold the lock when calling wake_waiter_for_endpoint (acquires task lock,
+        // rank 2) since that would invert the rank order.
+        self.with_ipc_state_mut(|ipc| {
+            let Some(ep_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut) else {
+                return Err(KernelError::WrongObject);
+            };
+            kernel_mut(ep_storage).send(msg).map_err(|_| KernelError::EndpointQueueFull)?;
+            Ok(())
+        })?;
         let _ = self.wake_waiter_for_endpoint(endpoint_idx);
         Ok(())
     }
@@ -437,10 +438,12 @@ impl KernelState {
     pub fn process_cross_cpu_work_for_cpu(&mut self, cpu: CpuId) -> Result<usize, KernelError> {
         let mut processed = 0usize;
 
+        // Take one work item at a time under ipc_state_lock, then release the
+        // lock before calling apply_cross_cpu_work, which may itself acquire
+        // ipc_state_lock (e.g. TlbShootdownAck path). Matches the drain_cross_cpu_work
+        // pattern that already uses with_ipc_state for this field.
         while let Some(item) = self
-            .ipc
-            .cross_cpu_work
-            .take_for_cpu(cpu)
+            .with_ipc_state(|ipc| ipc.cross_cpu_work.take_for_cpu(cpu))
             .map_err(map_smp_error)?
         {
             self.apply_cross_cpu_work(cpu, item)?;

@@ -10823,3 +10823,272 @@ fn cap_domain_reply_cap_record_exists_after_create_and_gone_after_revoke() {
         Err(KernelError::StaleCapability)
     );
 }
+
+#[test]
+fn cap_rights_grant_cannot_widen_rights_beyond_source() {
+    // Granting a SEND-only capability with RECEIVE added must be rejected with
+    // MissingRight.  The derive() call in grant_capability_task_to_task_with_rights
+    // must not silently admit rights the source does not hold.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+
+    // Mint a SEND-only endpoint cap in task 0's cnode.
+    let (endpoint_idx, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+    let generation = state.with_ipc_state(|ipc| ipc.endpoint_generations[endpoint_idx]);
+    let send_only_cap = state
+        .mint_capability_for_current_context(Capability::new(
+            CapObject::Endpoint { index: endpoint_idx, generation },
+            CapRights::SEND,
+        ))
+        .expect("mint send-only");
+
+    // Attempting to grant with RECEIVE right (which source does not have) must fail.
+    let result = state.grant_capability_task_to_task_with_rights(
+        0,
+        send_only_cap,
+        1,
+        CapRights::SEND | CapRights::RECEIVE,
+    );
+    assert_eq!(
+        result,
+        Err(KernelError::MissingRight),
+        "grant with rights beyond source must return MissingRight"
+    );
+
+    // Granting with only the rights the source holds must succeed.
+    let attenuated = state
+        .grant_capability_task_to_task_with_rights(0, send_only_cap, 1, CapRights::SEND)
+        .expect("grant same rights must succeed");
+    let delegated = state
+        .resolve_capability_for_task(1, attenuated)
+        .expect("delegated cap visible");
+    assert!(delegated.has_right(CapRights::SEND));
+    assert!(!delegated.has_right(CapRights::RECEIVE));
+}
+
+#[test]
+fn create_endpoint_both_domains_visible_after_two_phase_create() {
+    // Two-phase create: endpoint stored under ipc_state_lock (rank 3), caps minted
+    // under capability_state_lock (rank 4).  After create_endpoint returns, both
+    // domains must reflect the new object with no additional synchronisation.
+    let mut state = Bootstrap::init().expect("init");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+    // IPC domain: endpoint slot must be occupied.
+    let ep_present = state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].is_some());
+    assert!(ep_present, "endpoint must be present in ipc domain after create_endpoint");
+
+    // Capability domain: send and recv caps must resolve correctly.
+    let s = state
+        .resolve_capability_for_task(0, send_cap)
+        .expect("send cap must resolve");
+    assert!(s.has_right(CapRights::SEND), "send cap must carry SEND right");
+    assert!(!s.has_right(CapRights::RECEIVE), "send cap must not carry RECEIVE right");
+
+    let r = state
+        .resolve_capability_for_task(0, recv_cap)
+        .expect("recv cap must resolve");
+    assert!(r.has_right(CapRights::RECEIVE), "recv cap must carry RECEIVE right");
+    assert!(!r.has_right(CapRights::SEND), "recv cap must not carry SEND right");
+
+    // Both caps must reference the same endpoint index.
+    match s.object {
+        CapObject::Endpoint { index, .. } => {
+            assert_eq!(index, endpoint_idx, "send cap index must match created endpoint")
+        }
+        _ => panic!("send cap object type wrong"),
+    }
+    match r.object {
+        CapObject::Endpoint { index, .. } => {
+            assert_eq!(index, endpoint_idx, "recv cap index must match created endpoint")
+        }
+        _ => panic!("recv cap object type wrong"),
+    }
+}
+
+#[test]
+fn create_notification_both_domains_visible_after_two_phase_create() {
+    // Mirrors create_endpoint_both_domains_visible_after_two_phase_create for
+    // notification objects, which also use the two-phase lock-ordered create.
+    let mut state = Bootstrap::init().expect("init");
+    let (notif_idx, signal_cap, recv_cap) = state.create_notification(4).expect("notification");
+
+    // IPC domain: notification slot must be occupied.
+    let notif_present =
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some());
+    assert!(
+        notif_present,
+        "notification must be present in ipc domain after create_notification"
+    );
+
+    // Capability domain: signal and recv caps must resolve correctly.
+    let s = state
+        .resolve_capability_for_task(0, signal_cap)
+        .expect("signal cap must resolve");
+    assert!(s.has_right(CapRights::SIGNAL), "signal cap must carry SIGNAL right");
+
+    let r = state
+        .resolve_capability_for_task(0, recv_cap)
+        .expect("recv cap must resolve");
+    assert!(r.has_right(CapRights::RECEIVE), "notification recv cap must carry RECEIVE right");
+
+    // Both caps must reference the same notification index.
+    match s.object {
+        CapObject::Notification { index, .. } => assert_eq!(
+            index, notif_idx,
+            "signal cap index must match created notification"
+        ),
+        _ => panic!("signal cap object type wrong"),
+    }
+    match r.object {
+        CapObject::Notification { index, .. } => assert_eq!(
+            index, notif_idx,
+            "recv cap index must match created notification"
+        ),
+        _ => panic!("notification recv cap object type wrong"),
+    }
+}
+
+#[test]
+fn ipc_timeout_deadline_cleared_in_tcb_after_deadline_fires() {
+    // When a task blocks on ipc_recv_with_deadline and the timer fires, the
+    // ipc_timeout_deadline field in the TCB must be cleared to None.
+    let mut state = Bootstrap::init().expect("init");
+    state.set_timer_for_test(Timer::new(1));
+    state.register_task(1).expect("task1");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch to task1");
+    let blocked_tid = state.current_tid().expect("running tid");
+
+    let (_eid, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+    let first = state
+        .ipc_recv_with_deadline(recv_cap, 1)
+        .expect("deadline recv must not fail synchronously");
+    assert_eq!(first, None, "no message in queue; should return None and block");
+    assert_eq!(
+        state.task_status(blocked_tid),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap)))
+    );
+
+    // Deadline is set on the TCB while blocked.
+    let deadline_before = state
+        .tcb_mut(blocked_tid)
+        .expect("tcb exists")
+        .ipc_timeout_deadline;
+    assert!(
+        deadline_before.is_some(),
+        "ipc_timeout_deadline must be set in TCB while blocked with deadline"
+    );
+
+    state.handle_trap(Trap::TimerInterrupt, None).expect("timer trap");
+
+    // After the timer fires the deadline field must have been cleared.
+    let deadline_after = state
+        .tcb_mut(blocked_tid)
+        .expect("tcb exists after timer")
+        .ipc_timeout_deadline;
+    assert!(
+        deadline_after.is_none(),
+        "ipc_timeout_deadline must be None in TCB after deadline fires"
+    );
+    assert!(
+        state
+            .consume_ipc_timeout_fired_for_tid(blocked_tid)
+            .expect("consume timeout marker"),
+        "ipc_timeout_fired flag must be set after deadline expires"
+    );
+}
+
+#[test]
+fn user_task_cnode_isolated_from_system_server_cnode() {
+    // Revoking a capability from one task's cnode must not affect capabilities
+    // in another task's cnode.  CSpace isolation is a hard correctness requirement.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("user task");
+    state.register_task(2).expect("system server");
+
+    // Mint a unique kernel cap in each task's cnode.
+    let src1 = state
+        .mint_capability_for_current_context(Capability::new(
+            CapObject::MemoryObject { id: 0xAA },
+            CapRights::READ | CapRights::WRITE,
+        ))
+        .expect("mint for t1");
+    let cap1 = state
+        .grant_capability_task_to_task(0, src1, 1)
+        .expect("grant to task1");
+
+    let src2 = state
+        .mint_capability_for_current_context(Capability::new(
+            CapObject::MemoryObject { id: 0xBB },
+            CapRights::READ | CapRights::WRITE,
+        ))
+        .expect("mint for t2");
+    let cap2 = state
+        .grant_capability_task_to_task(0, src2, 2)
+        .expect("grant to task2");
+
+    assert!(
+        state.resolve_capability_for_task(1, cap1).is_ok(),
+        "cap1 must be present in task1 cnode before revoke"
+    );
+    assert!(
+        state.resolve_capability_for_task(2, cap2).is_ok(),
+        "cap2 must be present in task2 cnode before revoke"
+    );
+
+    // Revoke cap1 from task 1's cnode.
+    let cnode1 = state.task_cnode(1).expect("task1 cnode");
+    state.revoke_capability_in_cnode(cnode1, cap1).expect("revoke cap1");
+
+    // cap1 must now be absent from task 1's cnode.
+    assert!(
+        state.resolve_capability_for_task(1, cap1).is_err(),
+        "cap1 must be gone after revoke"
+    );
+
+    // cap2 in task 2's isolated cnode must be completely unaffected.
+    let cap2_after = state
+        .resolve_capability_for_task(2, cap2)
+        .expect("cap2 must remain in task2 cnode after unrelated revoke");
+    assert_eq!(
+        cap2_after.object,
+        CapObject::MemoryObject { id: 0xBB },
+        "cap2 object must be unchanged"
+    );
+}
+
+#[test]
+fn cap_materialization_reply_cap_visible_in_capability_domain() {
+    // After create_reply_cap_for_caller mints a reply cap, it must be immediately
+    // resolvable via the capability domain (capability_for_cnode / task_cnode), not
+    // just via the IPC reply_caps array.  Both domains must be coherent at call return.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("caller task");
+    let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+    let recv_cap = state
+        .grant_capability_task_to_task(0, recv_cap_global, 1)
+        .expect("grant recv to task1");
+
+    // create_reply_cap_for_caller mints into the current task (task 0) cnode.
+    let reply_cap = state
+        .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+        .expect("create reply cap");
+
+    // Capability domain: reply cap must resolve immediately after creation.
+    let resolved = state
+        .resolve_capability_for_task(0, reply_cap)
+        .expect("reply cap must be visible in capability domain immediately after creation");
+    assert!(
+        matches!(resolved.object, CapObject::Reply { .. }),
+        "resolved object must be a Reply cap"
+    );
+
+    // Direct cspace lookup must also find it.
+    let cnode0 = state.task_cnode(0).expect("task0 cnode");
+    let from_cspace = state.capability_for_cnode(cnode0, reply_cap);
+    assert!(
+        from_cspace.is_some(),
+        "reply cap must be present via capability_for_cnode after creation"
+    );
+}
