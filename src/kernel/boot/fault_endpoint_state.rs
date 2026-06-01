@@ -63,9 +63,10 @@ impl KernelState {
         tid: u64,
         policy: Option<FaultPolicy>,
     ) -> Result<(), KernelError> {
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.fault_policy_override = policy;
-        Ok(())
+        self.with_tcb_mut(tid, |tcb| {
+            tcb.fault_policy_override = policy;
+        })
+        .ok_or(KernelError::TaskMissing)
     }
 
     pub(crate) fn effective_fault_policy_for(&self, tid: u64) -> FaultPolicy {
@@ -113,8 +114,9 @@ impl KernelState {
         if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
             return Err(KernelError::Vm(VmError::InvalidAsid));
         }
-        let tcb = self.tcb_mut(tid).ok_or(KernelError::TaskMissing)?;
-        tcb.asid = Some(asid);
-        Ok(())
+        self.with_tcb_mut(tid, |tcb| {
+            tcb.asid = Some(asid);
+        })
+        .ok_or(KernelError::TaskMissing)
     }
 }

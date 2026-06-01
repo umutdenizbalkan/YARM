@@ -35,6 +35,20 @@ impl KernelState {
         Ok(self.current_tid() == Some(tid.0))
     }
 
+    pub(crate) fn with_tcb_mut<R>(
+        &mut self,
+        tid: u64,
+        f: impl FnOnce(&mut ThreadControlBlock) -> R,
+    ) -> Option<R> {
+        self.with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| f(tcb))
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn tcb_mut(&mut self, tid: u64) -> Option<&mut ThreadControlBlock> {
         self.tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid)
     }

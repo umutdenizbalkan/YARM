@@ -11564,3 +11564,103 @@ fn vm_domain_map_page_increments_memory_object_map_refcount_consistent_end_to_en
         "map_refcount must return to 0 after unmap (note_mapping_removed ran under memory lock)"
     );
 }
+
+// ── Task domain / with_tcb_mut / user-byte lock tests (Stage 4T+4) ───────────
+
+#[test]
+fn task_domain_with_tcb_mut_set_fault_policy_visible_via_effective_fault_policy_for() {
+    // set_task_fault_policy now routes through with_tcb_mut (task lock rank 2).
+    // The override must be visible via effective_fault_policy_for immediately.
+    let mut state = Bootstrap::init().expect("init");
+    state.set_fault_policy(FaultPolicy::NotifyAndContinue);
+
+    let effective_before = state.effective_fault_policy_for(0);
+    assert_eq!(
+        effective_before,
+        FaultPolicy::NotifyAndContinue,
+        "before override: effective policy must equal global policy"
+    );
+
+    state
+        .set_task_fault_policy(0, Some(FaultPolicy::KillTask))
+        .expect("set_task_fault_policy via with_tcb_mut");
+
+    let effective_after = state.effective_fault_policy_for(0);
+    assert_eq!(
+        effective_after,
+        FaultPolicy::KillTask,
+        "after override: effective policy must reflect the per-task override"
+    );
+
+    state
+        .set_task_fault_policy(0, None)
+        .expect("clear override");
+    let effective_cleared = state.effective_fault_policy_for(0);
+    assert_eq!(
+        effective_cleared,
+        FaultPolicy::NotifyAndContinue,
+        "after clear: effective policy must fall back to global policy"
+    );
+}
+
+#[test]
+fn task_domain_with_tcb_mut_bind_task_asid_visible_via_task_asid() {
+    // bind_task_asid now routes through with_tcb_mut (task lock rank 2).
+    // The bound ASID must be immediately visible via task_asid.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+
+    let asid_before = state.task_asid(0);
+    assert!(
+        asid_before.is_none() || asid_before != Some(asid),
+        "ASID must not be bound before bind_task_asid"
+    );
+
+    state
+        .bind_task_asid(0, asid)
+        .expect("bind_task_asid via with_tcb_mut");
+
+    let asid_after = state.task_asid(0);
+    assert_eq!(
+        asid_after,
+        Some(asid),
+        "task_asid must equal the bound ASID after bind_task_asid"
+    );
+}
+
+#[cfg(feature = "hosted-dev")]
+#[test]
+fn memory_domain_write_user_byte_goes_through_memory_lock_round_trip() {
+    // In hosted-dev, write_user_byte and read_user_byte now route through
+    // with_memory_state_mut / with_memory_state (memory lock rank 6).
+    // Verify the data is preserved through a copy_to_user → read_user_memory_for_asid
+    // round-trip — the bytes must survive the lock boundary.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, aspace_map_cap) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind asid");
+    state
+        .map_user_page(
+            aspace_map_cap,
+            VirtAddr(0x5000),
+            Mapping {
+                phys: PhysAddr(0xA000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("map page");
+
+    let payload = b"stage4t4";
+    state
+        .copy_to_user(asid, VirtAddr(0x5000), payload)
+        .expect("copy_to_user through memory lock");
+
+    let out = state
+        .read_user_memory_for_asid(asid, 0x5000, payload.len())
+        .expect("read_user_memory_for_asid through memory lock");
+
+    assert_eq!(
+        &out[..payload.len()],
+        payload,
+        "write_user_byte / read_user_byte round-trip must preserve data through memory lock"
+    );
+}
