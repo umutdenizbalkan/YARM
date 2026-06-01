@@ -10108,3 +10108,206 @@ fn sync_endpoint_phase4_helper_rejects_mismatched_waiter() {
     let result = state.ipc_try_send_sync_endpoint_only(eid, ThreadId(82), msg, false);
     assert_eq!(result, Err(KernelError::WrongObject), "must reject mismatched waiter");
 }
+
+// ── Stage 4R tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn stage4r_sender_waiter_registered_via_ipc_state_lock() {
+    // After a blocking ipc_send on a sync endpoint with no receiver, the SenderWaiter
+    // must be visible via with_ipc_state — proves enqueue_sender_waiter wraps
+    // with_ipc_state_mut correctly.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    let (eid, send_cap, _recv_cap) = state
+        .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+        .expect("sync endpoint");
+
+    let msg = Message::new(0, b"st4r").expect("msg");
+    assert_eq!(state.ipc_send(send_cap, msg), Err(KernelError::WouldBlock));
+    assert_eq!(
+        state.task_status(0),
+        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap)))
+    );
+
+    let registered = state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][0]);
+    assert_eq!(
+        registered,
+        Some(SenderWaiter { tid: ThreadId(0), msg }),
+        "enqueue_sender_waiter must register waiter under ipc_state_lock"
+    );
+}
+
+#[test]
+fn stage4r_blocked_sends_telemetry_incremented_after_sync_block() {
+    // blocked_sends counter (now written via with_ipc_state_mut) must be bumped
+    // each time a sender blocks on a sync endpoint with no waiter.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    let (_eid, send_cap, _recv_cap) = state
+        .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+        .expect("sync endpoint");
+
+    let before = state.ipc_path_telemetry().blocked_sends;
+    assert_eq!(
+        state.ipc_send(send_cap, Message::new(0, b"t").expect("msg")),
+        Err(KernelError::WouldBlock)
+    );
+    assert_eq!(
+        state.ipc_path_telemetry().blocked_sends,
+        before + 1,
+        "blocked_sends must be incremented after blocking send"
+    );
+}
+
+#[test]
+fn stage4r_receiver_consumes_blocked_sender_exactly_once() {
+    // After a sync sender blocks, the receiver's ipc_recv must consume the sender
+    // waiter exactly once — the slot must be cleared and the sender woken.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1 receiver");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    let (eid, send_cap, recv_cap) = state
+        .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+        .expect("sync endpoint");
+    let recv_cap_t1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv to task1");
+
+    // Task 0 blocks; dispatches to task 1.
+    let msg = Message::new(0, b"once").expect("msg");
+    assert_eq!(state.ipc_send(send_cap, msg), Err(KernelError::WouldBlock));
+    assert_eq!(state.current_tid(), Some(1));
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][0].is_some()),
+        "sender waiter must be registered before recv"
+    );
+
+    // Task 1 receives — must consume the sender waiter.
+    let received = state
+        .ipc_recv(recv_cap_t1)
+        .expect("recv ok")
+        .expect("msg present");
+    assert_eq!(received.as_slice(), b"once");
+
+    // Slot must be cleared exactly once (no stale entry).
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().all(Option::is_none)),
+        "sender waiter slot must be cleared after receiver consumes it exactly once"
+    );
+    assert_eq!(
+        state.task_status(0),
+        Some(TaskStatus::Runnable),
+        "sender must be runnable after receiver consumes it"
+    );
+}
+
+#[test]
+fn stage4r_sender_waiter_fifo_order_preserved() {
+    // Two senders block in arrival order.  endpoint_sender_waiters must reflect
+    // FIFO order, and the receiver must dequeue messages in that same order.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1 sender");
+    state.register_task(2).expect("task2 placeholder");
+    state.register_task(3).expect("task3 receiver");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+    state.enqueue_current_cpu(2).expect("enqueue2");
+    state.enqueue_current_cpu(3).expect("enqueue3");
+
+    let (eid, send_cap, recv_cap) = state
+        .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+        .expect("sync endpoint");
+    let send_cap_t1 = state
+        .grant_capability_task_to_task(0, send_cap, 1)
+        .expect("grant send to task1");
+    let recv_cap_t3 = state
+        .grant_capability_task_to_task(0, recv_cap, 3)
+        .expect("grant recv to task3");
+
+    // Task 0 blocks first → slot [0].
+    let msg0 = Message::new(0, b"first").expect("msg0");
+    assert_eq!(state.ipc_send(send_cap, msg0), Err(KernelError::WouldBlock));
+    assert_eq!(state.current_tid(), Some(1));
+
+    // Task 1 blocks second → slot [1].
+    let msg1 = Message::new(1, b"second").expect("msg1");
+    assert_eq!(state.ipc_send(send_cap_t1, msg1), Err(KernelError::WouldBlock));
+
+    // Verify FIFO order in IPC state.
+    let (slot0, slot1) = state.with_ipc_state(|ipc| (
+        ipc.endpoint_sender_waiters[eid][0],
+        ipc.endpoint_sender_waiters[eid][1],
+    ));
+    assert_eq!(
+        slot0.map(|w| w.tid),
+        Some(ThreadId(0)),
+        "first blocker must occupy slot 0"
+    );
+    assert_eq!(
+        slot1.map(|w| w.tid),
+        Some(ThreadId(1)),
+        "second blocker must occupy slot 1"
+    );
+
+    // Receiver dequeues in FIFO order.
+    while state.current_tid() != Some(3) {
+        state.yield_current().expect("yield to receiver");
+    }
+    let first = state.ipc_recv(recv_cap_t3).expect("recv1").expect("first msg");
+    let second = state.ipc_recv(recv_cap_t3).expect("recv2").expect("second msg");
+    assert_eq!(first.as_slice(), b"first");
+    assert_eq!(second.as_slice(), b"second");
+}
+
+#[test]
+fn stage4r_no_orphaned_sender_waiter_when_queue_full() {
+    // When endpoint_sender_waiters is full, enqueue_sender_waiter (now under
+    // with_ipc_state_mut) must return EndpointQueueFull without adding any new
+    // entry — the IPC state must be identical before and after the failed send.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    let (eid, send_cap, _recv_cap) = state
+        .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+        .expect("sync endpoint");
+
+    // Pre-fill every slot with a fake SenderWaiter.
+    let dummy_msg = Message::new(99, b"d").expect("dummy");
+    state.with_ipc_state_mut(|ipc| {
+        for (i, slot) in ipc.endpoint_sender_waiters[eid].iter_mut().enumerate() {
+            *slot = Some(SenderWaiter {
+                tid: ThreadId(100 + i as u64),
+                msg: dummy_msg,
+            });
+        }
+    });
+
+    // Record the pre-filled state for comparison.
+    let filled_count_before =
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().filter(|s| s.is_some()).count());
+    let queue_len =
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].len());
+    assert_eq!(filled_count_before, queue_len, "all slots must be pre-filled");
+
+    // The send must fail with EndpointQueueFull (propagated from enqueue_sender_waiter).
+    let result = state.ipc_send(send_cap, Message::new(0, b"x").expect("msg"));
+    assert_eq!(result, Err(KernelError::EndpointQueueFull));
+
+    // IPC invariant: no new entry with TID=0 was leaked into the full queue.
+    let tid0_present =
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().any(|s| s.map(|w| w.tid) == Some(ThreadId(0))));
+    assert!(!tid0_present, "no orphaned SenderWaiter for the failed sender must exist");
+
+    // Every pre-filled entry must be unchanged.
+    let all_unchanged = state.with_ipc_state(|ipc| {
+        ipc.endpoint_sender_waiters[eid].iter().enumerate().all(|(i, slot)| {
+            *slot == Some(SenderWaiter { tid: ThreadId(100 + i as u64), msg: dummy_msg })
+        })
+    });
+    assert!(all_unchanged, "pre-filled sender waiters must be unchanged after failed enqueue");
+}
