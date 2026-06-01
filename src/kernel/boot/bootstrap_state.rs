@@ -425,7 +425,8 @@ impl Bootstrap {
             if end <= start {
                 continue;
             }
-            crate::kernel::frame_allocator::register_reserved_range(start, end);
+            crate::kernel::frame_allocator::register_reserved_range(start, end)
+                .map_err(|_| KernelError::MemoryObjectFull)?;
             crate::yarm_log!(
                 "PMEM_RESERVE_RANGE start=0x{:x} end=0x{:x}",
                 start,
@@ -452,7 +453,8 @@ impl Bootstrap {
         // when the PT allocator itself legitimately allocates from its own pool.
         for r in pt_slice {
             if r.usable && r.len > 0 {
-                crate::kernel::frame_allocator::register_pt_pool_range(r.start, r.start + r.len);
+                crate::kernel::frame_allocator::register_pt_pool_range(r.start, r.start + r.len)
+                    .map_err(|_| KernelError::MemoryObjectFull)?;
                 crate::yarm_log!(
                     "PT_POOL_RANGE start=0x{:x} end=0x{:x} pages={}",
                     r.start,

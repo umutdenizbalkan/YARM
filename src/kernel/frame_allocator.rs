@@ -124,8 +124,13 @@ impl PhysicalFrameAllocator {
                 continue;
             }
             have_usable = true;
+            let end = region
+                .start
+                .checked_add(region.len)
+                .ok_or(FrameAllocError::InvalidMemoryMap)?;
+            let aligned_end = align_up_checked(end).ok_or(FrameAllocError::InvalidMemoryMap)?;
             min_phys = min_phys.min(align_down(region.start));
-            max_phys = max_phys.max(align_up(region.start.saturating_add(region.len)));
+            max_phys = max_phys.max(aligned_end);
         }
 
         if !have_usable || max_phys <= min_phys {
@@ -148,8 +153,14 @@ impl PhysicalFrameAllocator {
             if !region.usable || region.len == 0 {
                 continue;
             }
-            let start = align_up(region.start);
-            let end = align_down(region.start.saturating_add(region.len));
+            let Some(start) = align_up_checked(region.start) else {
+                continue;
+            };
+            let end = region
+                .start
+                .checked_add(region.len)
+                .ok_or(FrameAllocError::InvalidMemoryMap)?;
+            let end = align_down(end);
             if end <= start {
                 continue;
             }
@@ -174,7 +185,7 @@ impl PhysicalFrameAllocator {
         if self.free_frames == 0 {
             return Err(FrameAllocError::OutOfMemory);
         }
-        if !self.has_free_frame_ref_slot() {
+        if !self.ensure_frame_ref_capacity(1) {
             return Err(FrameAllocError::CapacityExceeded);
         }
 
@@ -214,7 +225,7 @@ impl PhysicalFrameAllocator {
         if pages == 0 || pages > self.free_frames || pages > self.largest_free_run_pages {
             return Err(FrameAllocError::OutOfMemory);
         }
-        if pages > self.free_frame_ref_slots() {
+        if !self.ensure_frame_ref_capacity(pages) {
             return Err(FrameAllocError::CapacityExceeded);
         }
 
@@ -242,7 +253,11 @@ impl PhysicalFrameAllocator {
             self.free_frames = self.free_frames.saturating_sub(pages);
             self.refresh_run_metadata();
             #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
-            crate::yarm_log!("CONTIG_ALLOC_COMMIT start=0x{:x} pages={}", alloc_phys, pages);
+            crate::yarm_log!(
+                "CONTIG_ALLOC_COMMIT start=0x{:x} pages={}",
+                alloc_phys,
+                pages
+            );
             for page in 0..pages {
                 let phys = alloc_phys.saturating_add((page as u64).saturating_mul(PAGE_SIZE_U64));
                 self.track_new_frame_ref(phys)?;
@@ -250,9 +265,14 @@ impl PhysicalFrameAllocator {
                 if let Some((rs, re)) = GLOBAL_RESERVED_RANGES.lock().find_overlap(phys) {
                     crate::yarm_log!(
                         "PMEM_ALLOC_RESERVED_BUG_CONTIG pa=0x{:x} range=0x{:x}..0x{:x} pages={}",
-                        phys, rs, re, pages
+                        phys,
+                        rs,
+                        re,
+                        pages
                     );
-                    panic!("PMEM_ALLOC_RESERVED_BUG_CONTIG: allocated contiguous frame overlaps reserved range");
+                    panic!(
+                        "PMEM_ALLOC_RESERVED_BUG_CONTIG: allocated contiguous frame overlaps reserved range"
+                    );
                 }
             }
             return Ok(alloc_phys);
@@ -340,7 +360,7 @@ impl PhysicalFrameAllocator {
         if self.frame_ref_slot(phys).is_some() {
             return Err(FrameAllocError::AlreadyFree);
         }
-        if !self.has_free_frame_ref_slot() {
+        if !self.ensure_frame_ref_capacity(1) {
             return Err(FrameAllocError::CapacityExceeded);
         }
 
@@ -496,6 +516,13 @@ impl PhysicalFrameAllocator {
             }
         }
         self.record_frame_ref_lookup(MAX_TRACKED_FRAME_REFS, false);
+        if self
+            .frame_refs
+            .iter()
+            .any(|slot| matches!(slot, FrameRefSlot::Tombstone))
+        {
+            self.compact_frame_refs();
+        }
         None
     }
 
@@ -522,9 +549,10 @@ impl PhysicalFrameAllocator {
                 FrameRefSlot::Occupied(_) => {}
             }
         }
-        if let Some(idx) = first_tombstone {
+        if first_tombstone.is_some() {
             self.record_frame_ref_insert(MAX_TRACKED_FRAME_REFS, false);
-            Ok(idx)
+            self.compact_frame_refs();
+            self.find_frame_ref_insert_slot(phys)
         } else {
             self.record_frame_ref_insert(MAX_TRACKED_FRAME_REFS, true);
             Err(FrameAllocError::CapacityExceeded)
@@ -620,13 +648,16 @@ impl PhysicalFrameAllocator {
     }
 
     fn extent_containing_frame(&self, phys: u64) -> Option<usize> {
-        self.extents.iter().enumerate().find_map(|(slot_idx, slot)| {
-            let extent = (*slot)?;
-            let extent_end = extent
-                .start_phys
-                .saturating_add((extent.pages as u64).saturating_mul(PAGE_SIZE_U64));
-            (phys >= extent.start_phys && phys < extent_end).then_some(slot_idx)
-        })
+        self.extents
+            .iter()
+            .enumerate()
+            .find_map(|(slot_idx, slot)| {
+                let extent = (*slot)?;
+                let extent_end = extent
+                    .start_phys
+                    .saturating_add((extent.pages as u64).saturating_mul(PAGE_SIZE_U64));
+                (phys >= extent.start_phys && phys < extent_end).then_some(slot_idx)
+            })
     }
 
     fn empty_extent_slot_except(&self, excluded: usize) -> Option<usize> {
@@ -636,17 +667,47 @@ impl PhysicalFrameAllocator {
             .find_map(|(idx, slot)| (idx != excluded && slot.is_none()).then_some(idx))
     }
 
-    fn has_free_frame_ref_slot(&self) -> bool {
-        self.frame_refs
-            .iter()
-            .any(|slot| !matches!(slot, FrameRefSlot::Occupied(_)))
+    fn frame_ref_counts(&self) -> (usize, usize, usize) {
+        let mut occupied = 0usize;
+        let mut tombstones = 0usize;
+        let mut empty = 0usize;
+        for slot in &self.frame_refs {
+            match slot {
+                FrameRefSlot::Empty => empty += 1,
+                FrameRefSlot::Tombstone => tombstones += 1,
+                FrameRefSlot::Occupied(_) => occupied += 1,
+            }
+        }
+        (occupied, tombstones, empty)
     }
 
-    fn free_frame_ref_slots(&self) -> usize {
-        self.frame_refs
-            .iter()
-            .filter(|slot| !matches!(slot, FrameRefSlot::Occupied(_)))
-            .count()
+    fn ensure_frame_ref_capacity(&mut self, slots: usize) -> bool {
+        let (occupied, tombstones, empty) = self.frame_ref_counts();
+        if MAX_TRACKED_FRAME_REFS.saturating_sub(occupied) < slots {
+            return false;
+        }
+        if tombstones != 0 && (empty < slots || tombstones > MAX_TRACKED_FRAME_REFS / 4) {
+            self.compact_frame_refs();
+        }
+        true
+    }
+
+    fn compact_frame_refs(&mut self) {
+        let old = self.frame_refs;
+        self.frame_refs = [const { FrameRefSlot::Empty }; MAX_TRACKED_FRAME_REFS];
+        for slot in old {
+            let FrameRefSlot::Occupied(entry) = slot else {
+                continue;
+            };
+            let start = self.frame_ref_hash(entry.phys);
+            for probe in 0..MAX_TRACKED_FRAME_REFS {
+                let idx = (start + probe) % MAX_TRACKED_FRAME_REFS;
+                if matches!(self.frame_refs[idx], FrameRefSlot::Empty) {
+                    self.frame_refs[idx] = FrameRefSlot::Occupied(entry);
+                    break;
+                }
+            }
+        }
     }
 
     fn split_extent_for_allocation(
@@ -708,25 +769,8 @@ impl PhysicalFrameAllocator {
         }
     }
 
-    fn update_hints_after_allocation(&mut self, idx: usize, old_pages: usize, new_pages: usize) {
-        self.single_page_hint_idx = if new_pages > 0 {
-            Some(idx)
-        } else {
-            self.extents
-                .iter()
-                .enumerate()
-                .find_map(|(probe, extent)| extent.map(|_| probe))
-        };
-
-        for (class_idx, class_pages) in CONTIG_SIZE_CLASSES.iter().enumerate() {
-            if self.run_hint_by_class[class_idx] == Some(idx) && new_pages < *class_pages {
-                self.run_hint_by_class[class_idx] = None;
-            }
-        }
-
-        if old_pages == self.largest_free_run_pages && new_pages < old_pages {
-            self.largest_free_run_pages = self.largest_free_run_pages.saturating_sub(1);
-        }
+    fn update_hints_after_allocation(&mut self, _idx: usize, _old_pages: usize, _new_pages: usize) {
+        self.refresh_run_metadata();
     }
 
     fn sort_extents(&mut self) {
@@ -776,21 +820,23 @@ impl GlobalReservedRanges {
         }
     }
 
-    fn add(&mut self, start: u64, end: u64) {
+    fn add(&mut self, start: u64, end: u64) -> Result<(), FrameAllocError> {
         if end <= start {
-            return;
+            return Ok(());
         }
         // Deduplicate: skip if this exact range is already registered.
         for i in 0..self.count {
             if self.starts[i] == start && self.ends[i] == end {
-                return;
+                return Ok(());
             }
         }
-        if self.count < MAX_GLOBAL_RESERVED {
-            self.starts[self.count] = start;
-            self.ends[self.count] = end;
-            self.count += 1;
+        if self.count >= MAX_GLOBAL_RESERVED {
+            return Err(FrameAllocError::CapacityExceeded);
         }
+        self.starts[self.count] = start;
+        self.ends[self.count] = end;
+        self.count += 1;
+        Ok(())
     }
 
     fn find_overlap(&self, pa: u64) -> Option<(u64, u64)> {
@@ -812,18 +858,18 @@ static GLOBAL_RESERVED_RANGES: SpinLockIrq<GlobalReservedRanges> =
 static PT_POOL_RANGES: SpinLockIrq<GlobalReservedRanges> =
     SpinLockIrq::new(GlobalReservedRanges::new());
 
-pub fn register_reserved_range(start: u64, end: u64) {
+pub fn register_reserved_range(start: u64, end: u64) -> Result<(), FrameAllocError> {
     if end <= start {
-        return;
+        return Ok(());
     }
-    GLOBAL_RESERVED_RANGES.lock().add(start, end);
+    GLOBAL_RESERVED_RANGES.lock().add(start, end)
 }
 
-pub fn register_pt_pool_range(start: u64, end: u64) {
+pub fn register_pt_pool_range(start: u64, end: u64) -> Result<(), FrameAllocError> {
     if end <= start {
-        return;
+        return Ok(());
     }
-    PT_POOL_RANGES.lock().add(start, end);
+    PT_POOL_RANGES.lock().add(start, end)
 }
 
 pub fn is_pa_reserved(pa: u64) -> Option<(u64, u64)> {
@@ -942,8 +988,15 @@ const fn align_down(value: u64) -> u64 {
     value & !(PAGE_SIZE_U64 - 1)
 }
 
-const fn align_up(value: u64) -> u64 {
-    (value + PAGE_SIZE_U64 - 1) & !(PAGE_SIZE_U64 - 1)
+const fn align_up_checked(value: u64) -> Option<u64> {
+    let mask = PAGE_SIZE_U64 - 1;
+    if value & mask == 0 {
+        Some(value)
+    } else if let Some(rounded) = value.checked_add(mask) {
+        Some(rounded & !mask)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -974,7 +1027,10 @@ mod tests {
     fn assert_allocator_invariants(alloc: &PhysicalFrameAllocator) {
         let extents = live_extents(alloc);
         let sum_free: usize = extents.iter().map(|extent| extent.pages).sum();
-        assert_eq!(alloc.free_frames, sum_free, "free_frames must equal extent sum");
+        assert_eq!(
+            alloc.free_frames, sum_free,
+            "free_frames must equal extent sum"
+        );
 
         let mut largest = 0usize;
         let mut prev_end = None;
@@ -1052,6 +1108,175 @@ mod tests {
             .iter()
             .filter(|entry| matches!(entry, FrameRefSlot::Occupied(_)))
             .count()
+    }
+
+    fn tombstone_count(alloc: &PhysicalFrameAllocator) -> usize {
+        alloc
+            .frame_refs
+            .iter()
+            .filter(|entry| matches!(entry, FrameRefSlot::Tombstone))
+            .count()
+    }
+
+    #[test]
+    fn allocation_refreshes_largest_metadata_for_equal_largest_extents() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc
+            .init_from_memory_map(&[
+                MemoryRegion {
+                    start: 0x3100_0000,
+                    len: 8 * PAGE_SIZE_U64,
+                    usable: true,
+                },
+                MemoryRegion {
+                    start: 0x3102_0000,
+                    len: 8 * PAGE_SIZE_U64,
+                    usable: true,
+                },
+            ])
+            .expect("init");
+
+        assert_eq!(alloc.largest_free_run_pages, 8);
+        let first = alloc
+            .alloc_frame()
+            .expect("alloc first page from first largest run");
+        assert_eq!(first, 0x3100_0000);
+        assert_eq!(alloc.largest_free_run_pages, 8);
+        assert_allocator_invariants(&alloc);
+
+        let second_run = alloc
+            .alloc_contiguous(8)
+            .expect("equal largest run must not be hidden by stale low max");
+        assert_eq!(second_run, 0x3102_0000);
+        assert_allocator_invariants(&alloc);
+    }
+
+    #[test]
+    fn allocation_refreshes_largest_metadata_when_largest_is_exhausted() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc
+            .init_from_memory_map(&[
+                MemoryRegion {
+                    start: 0x3200_0000,
+                    len: PAGE_SIZE_U64,
+                    usable: true,
+                },
+                MemoryRegion {
+                    start: 0x3201_0000,
+                    len: 4 * PAGE_SIZE_U64,
+                    usable: true,
+                },
+            ])
+            .expect("init");
+
+        let small = alloc.alloc_frame().expect("exhaust first extent");
+        assert_eq!(small, 0x3200_0000);
+        assert_eq!(alloc.largest_free_run_pages, 4);
+        assert_allocator_invariants(&alloc);
+    }
+
+    #[test]
+    fn frame_ref_compaction_purges_tombstones_and_preserves_entries() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc.base_phys = 0;
+        alloc.end_phys_exclusive = ((MAX_TRACKED_FRAME_REFS + 2) as u64) * PAGE_SIZE_U64;
+        alloc.total_frames = 1;
+        alloc.free_frames = 0;
+        alloc.initialized = true;
+        for slot in &mut alloc.frame_refs {
+            *slot = FrameRefSlot::Tombstone;
+        }
+        let live_phys = PAGE_SIZE_U64;
+        let live_slot = alloc.frame_ref_hash(live_phys);
+        alloc.frame_refs[live_slot] = FrameRefSlot::Occupied(FrameRefCount {
+            phys: live_phys,
+            refs: 1,
+        });
+
+        assert_eq!(tombstone_count(&alloc), MAX_TRACKED_FRAME_REFS - 1);
+        assert!(alloc.frame_ref_slot(2 * PAGE_SIZE_U64).is_none());
+        assert_eq!(tombstone_count(&alloc), 0);
+        assert_eq!(tracked_ref_count(&alloc), 1);
+        assert_eq!(alloc.frame_refcount(live_phys).expect("live ref"), 1);
+
+        let before_probes = alloc.frame_ref_telemetry.lookup_probes_total;
+        assert!(alloc.frame_ref_slot(3 * PAGE_SIZE_U64).is_none());
+        let miss_probes = alloc.frame_ref_telemetry.lookup_probes_total - before_probes;
+        assert!(
+            miss_probes < MAX_TRACKED_FRAME_REFS as u64,
+            "compacted miss should stop at an Empty slot, not scan the full table"
+        );
+    }
+
+    #[test]
+    fn frame_ref_tombstone_churn_compacts_before_capacity_failure() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc
+            .init_from_memory_map(&[MemoryRegion {
+                start: 0x3300_0000,
+                len: 64 * PAGE_SIZE_U64,
+                usable: true,
+            }])
+            .expect("init");
+
+        for _ in 0..32 {
+            let frame = alloc.alloc_frame().expect("alloc churn frame");
+            alloc.free_frame(frame).expect("free churn frame");
+        }
+        assert!(tombstone_count(&alloc) > 0);
+        alloc.compact_frame_refs();
+        assert_eq!(tombstone_count(&alloc), 0);
+        assert_eq!(tracked_ref_count(&alloc), 0);
+        assert_allocator_invariants(&alloc);
+    }
+
+    #[test]
+    fn global_reserved_ranges_report_capacity_instead_of_dropping() {
+        let mut ranges = GlobalReservedRanges::new();
+        for idx in 0..MAX_GLOBAL_RESERVED {
+            let start = 0x9000_0000 + (idx as u64) * 0x2000;
+            ranges
+                .add(start, start + PAGE_SIZE_U64)
+                .expect("capacity fill succeeds");
+        }
+        assert_eq!(ranges.count, MAX_GLOBAL_RESERVED);
+        assert_eq!(
+            ranges.add(0xA000_0000, 0xA000_0000 + PAGE_SIZE_U64),
+            Err(FrameAllocError::CapacityExceeded)
+        );
+        assert!(ranges.find_overlap(0xA000_0000).is_none());
+        ranges
+            .add(0x9000_0000, 0x9000_0000 + PAGE_SIZE_U64)
+            .expect("duplicate remains idempotent at capacity");
+        ranges
+            .add(0xB000_1000, 0xB000_0000)
+            .expect("invalid empty range remains ignored");
+    }
+
+    #[test]
+    fn align_up_checked_rejects_overflow_instead_of_wrapping() {
+        assert_eq!(align_up_checked(u64::MAX), None);
+        assert_eq!(align_up_checked(u64::MAX - 1), None);
+        assert_eq!(align_up_checked(u64::MAX - PAGE_SIZE_U64 + 2), None);
+        assert_eq!(
+            align_up_checked(u64::MAX - PAGE_SIZE_U64 + 1),
+            Some(u64::MAX - PAGE_SIZE_U64 + 1)
+        );
+    }
+
+    #[test]
+    fn memory_map_overflow_region_is_rejected() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        assert_eq!(
+            alloc.init_from_memory_map(&[MemoryRegion {
+                start: u64::MAX - PAGE_SIZE_U64,
+                len: PAGE_SIZE_U64 + 1,
+                usable: true,
+            }]),
+            Err(FrameAllocError::InvalidMemoryMap)
+        );
+        assert_eq!(alloc.base_phys, 0);
+        assert_eq!(alloc.end_phys_exclusive, 0);
     }
 
     #[test]
@@ -1337,7 +1562,9 @@ mod tests {
         }
 
         let mut alloc = PhysicalFrameAllocator::new_uninit();
-        alloc.init_from_memory_map(&regions).expect("init full extents");
+        alloc
+            .init_from_memory_map(&regions)
+            .expect("init full extents");
         assert_eq!(extent_count(&alloc), MAX_FREE_EXTENTS);
         let before = alloc;
 
@@ -1397,8 +1624,14 @@ mod tests {
         assert_eq!(alloc.free_frames(), 2);
         assert_eq!(alloc.frame_refcount(base).expect("p0"), 0);
         assert_eq!(alloc.frame_refcount(base + PAGE_SIZE_U64).expect("p1"), 1);
-        assert_eq!(alloc.frame_refcount(base + 2 * PAGE_SIZE_U64).expect("p2"), 1);
-        assert_eq!(alloc.frame_refcount(base + 3 * PAGE_SIZE_U64).expect("p3"), 0);
+        assert_eq!(
+            alloc.frame_refcount(base + 2 * PAGE_SIZE_U64).expect("p2"),
+            1
+        );
+        assert_eq!(
+            alloc.frame_refcount(base + 3 * PAGE_SIZE_U64).expect("p3"),
+            0
+        );
         assert_eq!(
             live_extents(&alloc),
             crate::std::vec![
@@ -1431,7 +1664,8 @@ mod tests {
     fn free_contiguous_insert_failure_preserves_state() {
         let mut alloc = PhysicalFrameAllocator::new_uninit();
         alloc.base_phys = 0x7500_0000;
-        alloc.end_phys_exclusive = alloc.base_phys + ((MAX_FREE_EXTENTS as u64) * 0x2_000) + 0x10_000;
+        alloc.end_phys_exclusive =
+            alloc.base_phys + ((MAX_FREE_EXTENTS as u64) * 0x2_000) + 0x10_000;
         alloc.total_frames = MAX_FREE_EXTENTS + 1;
         alloc.free_frames = MAX_FREE_EXTENTS;
         alloc.initialized = true;
@@ -1567,7 +1801,7 @@ mod tests {
         // addresses inside it and None for addresses strictly outside.
         let pt_start: u64 = 0xE000_0000;
         let pt_end: u64 = pt_start + 256 * 0x1000;
-        register_pt_pool_range(pt_start, pt_end);
+        register_pt_pool_range(pt_start, pt_end).expect("register PT pool");
 
         // First and last pages of the registered range must be found.
         assert!(
@@ -1651,7 +1885,7 @@ mod tests {
         let main_start: u64 = pt_end; // immediately after PT pool, no gap
         let main_end: u64 = main_start + 16 * 0x1000;
 
-        register_pt_pool_range(pt_start, pt_end);
+        register_pt_pool_range(pt_start, pt_end).expect("register PT pool");
 
         let mut main_alloc = PhysicalFrameAllocator::new_uninit();
         main_alloc
@@ -1680,7 +1914,7 @@ mod tests {
         // addresses within it and None for addresses outside.
         let res_start: u64 = 0xE400_0000;
         let res_end: u64 = res_start + 4 * 0x1000;
-        register_reserved_range(res_start, res_end);
+        register_reserved_range(res_start, res_end).expect("register reserved range");
 
         assert!(
             is_pa_reserved(res_start).is_some(),
@@ -1708,7 +1942,7 @@ mod tests {
         let usable_end: u64 = usable_start + 8 * 0x1000;
         let reserved_start: u64 = usable_end; // reserved range starts right after usable
         let reserved_end: u64 = reserved_start + 8 * 0x1000;
-        register_reserved_range(reserved_start, reserved_end);
+        register_reserved_range(reserved_start, reserved_end).expect("register reserved range");
 
         let mut alloc = PhysicalFrameAllocator::new_uninit();
         alloc
