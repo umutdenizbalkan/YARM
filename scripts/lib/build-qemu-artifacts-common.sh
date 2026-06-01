@@ -28,6 +28,13 @@ common_stage_server_init_elf() {
   cp "$SERVER_ELF" "$ROOTFS_DIR/sbin/init_server"
   chmod +x "$ROOTFS_DIR/sbin/init_server"
 
+  if [[ "${SERVER_BIN:-}" == "init_server" ]] && command -v strings >/dev/null 2>&1; then
+    if ! strings "$SERVER_ELF" | rg -q 'INIT_IDLE_PARK_BEGIN'; then
+      echo "[error] init_server ELF is missing INIT_IDLE_PARK_BEGIN; rebuild/repackage would boot stale idle-yield path: $SERVER_ELF"
+      return 1
+    fi
+  fi
+
   if command -v readelf >/dev/null 2>&1; then
     local readelf_out
     readelf_out="$(readelf -W -l "$SERVER_ELF")"
