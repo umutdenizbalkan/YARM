@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: enforce kernel/services split and thin service bins
+      - name: enforce kernel/services split and service bin boundaries
         run: scripts/check-service-arch-boundary.sh
 
 
