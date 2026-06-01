@@ -2237,6 +2237,102 @@ Existing tests that exercise the full sync endpoint send path
 
 ---
 
+### Stage 4R: normalize IPC-domain direct accesses to with_ipc_state / with_ipc_state_mut
+
+**Implemented**: 2026-06-01.  Affects `src/kernel/boot/ipc_state.rs`.
+
+#### Motivation
+
+After Stage 4Q, a number of methods inside `ipc_state.rs` still read or wrote
+`self.ipc.*` directly (under the global `SharedKernel` lock only) rather than
+going through the `with_ipc_state` / `with_ipc_state_mut` accessor pairs.  Stage
+4R is a normalization pass: every direct `self.ipc.*` access that can safely be
+wrapped is wrapped.  The remaining direct accesses are documented as globally-locked
+paths deferred to a future stage.
+
+#### Changes per function
+
+| Function | Change |
+|---|---|
+| `enqueue_sender_waiter` | Replaced `endpoint_sender_waiter_limit` helper (direct `self.ipc.endpoints`) + inline slot write with a single `with_ipc_state_mut` closure; defence-in-depth endpoint check and FIFO-first-free slot write are both inside the lock |
+| `wake_waiter_for_endpoint` | `endpoint_waiters[endpoint_idx].take()` moved into `with_ipc_state_mut` |
+| `block_current_on_receive_with_deadline` | Receiver waiter registration (`endpoint_waiters[endpoint_idx] = Some(...)`) moved into `with_ipc_state_mut` |
+| `signal_notification` | Refactored to plan-first: IRQ signal + waiter `.take()` under `with_ipc_state_mut`; TCB wake under `with_tcbs_mut` outside; matches the SchedulerWakePlan/SchedulerHandoffPlan discipline |
+| `ipc_send_fastpath` | Mode/waiter reads via `with_ipc_state`; telemetry writes via `with_ipc_state_mut` |
+| `ipc_send_with_optional_deadline` (buffered path) | Waiter read via `with_ipc_state`; `endpoint.send` via `with_ipc_state_mut`; telemetry writes via `with_ipc_state_mut` |
+| `ipc_send_with_cap_transfer` | Waiter read via `with_ipc_state` |
+| `ipc_recv_with_optional_deadline` (notification path) | Notification recv and waiter registration via `with_ipc_state_mut` |
+| `try_ipc_recv` (notification path) | Notification recv via `with_ipc_state_mut` |
+| `note_split_recv_v2_delivery`, `note_ipc_call_split_delivery`, `note_ipc_reply_split_delivery`, `note_cap_transfer_recv_v2_delivery`, `note_cap_transfer_stage4e_enqueued`, `note_endpoint_only_queued_send_split`, `note_endpoint_only_queued_recv_split` (7 helpers) | Each telemetry increment moved into `with_ipc_state_mut` |
+
+#### Remaining direct `self.ipc.*` accesses (deferred — globally locked)
+
+The following functions retain direct `self.ipc.*` access because they are
+called in contexts where the surrounding `endpoint.recv()` / `endpoint.send()`
+operations also access `self.ipc` directly; wrapping only the dequeue mutation
+would create inconsistent mixed-access patterns harder to audit than uniform
+direct access:
+
+- `dequeue_sender_waiter` — called from `try_ipc_recv` and
+  `ipc_recv_with_optional_deadline` buffered-endpoint paths.  Both callers
+  also call `endpoint.recv()` and `endpoint.send()` directly.  The correct
+  split requires a two-phase refill protocol identical to Stage 4C/4D, which
+  is deferred to a future Stage 4S.
+- `create_endpoint_with_mode`, `create_notification` setup blocks — write
+  initial IPC state directly; these are object-creation (not hot) paths.
+- `try_ipc_recv` buffered endpoint recv path — multiple interleaved
+  `endpoint.recv()` / sender-waiter dequeue / `endpoint.send()` accesses; left
+  as globally locked pending Stage 4S.
+- `ipc_recv_with_optional_deadline` buffered endpoint path (after-wake recv +
+  refill) — same as above.
+
+#### Lock ordering for `signal_notification` (plan-first)
+
+Sequential, never nested:
+1. `with_ipc_state_mut` (rank 3): `notif.send_irq(irq_line)` + `waiter.take()` — IPC domain.
+2. Released.
+3. `with_tcbs_mut` (rank 2): TCB status set to `Runnable` — task domain.
+4. Released.
+5. `enqueue_task` (rank 1): scheduler enqueue — scheduler domain.
+
+#### Tests (Stage 4R)
+
+Five new unit tests in `src/kernel/boot/tests.rs`:
+
+- `stage4r_sender_waiter_registered_via_ipc_state_lock`:
+  sync endpoint, task 0 blocks (no receiver); asserts
+  `with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][0]) == Some(SenderWaiter { tid: 0, msg })`.
+
+- `stage4r_blocked_sends_telemetry_incremented_after_sync_block`:
+  same setup; asserts `ipc_path_telemetry().blocked_sends` incremented by 1.
+
+- `stage4r_receiver_consumes_blocked_sender_exactly_once`:
+  sender blocks, receiver calls `ipc_recv`; asserts sender waiter slot cleared,
+  sender becomes Runnable, message delivered correctly.
+
+- `stage4r_sender_waiter_fifo_order_preserved`:
+  two senders block; asserts `endpoint_sender_waiters[eid][0]` holds the first sender
+  and `[1]` holds the second; receiver dequeues in FIFO order.
+
+- `stage4r_no_orphaned_sender_waiter_when_queue_full`:
+  pre-fills all `MAX_ENDPOINT_SENDER_WAITERS` slots via `with_ipc_state_mut`;
+  attempts another send; asserts `Err(EndpointQueueFull)` returned and no slot was
+  modified (no orphaned SenderWaiter for the failed sender).
+
+Total test count: **513 passed, 0 failed** (5 new Stage 4R + 508 pre-existing).
+
+#### What Stage 4R does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback: unchanged.
+- Phase 3B checks: not weakened.
+- Stage 4Q Phase 0–6 discipline: preserved (no protocol change, normalization only).
+- The global `SharedKernel` lock is still retained.  **This is not full global-lock removal.**
+
+---
+
 ### Current live / deferred IPC split matrix
 
 | Syscall path | Condition | Status | Telemetry counter |

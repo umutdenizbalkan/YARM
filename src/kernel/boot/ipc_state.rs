@@ -126,27 +126,24 @@ impl KernelState {
         })
     }
 
-    fn endpoint_sender_waiter_limit(&self, endpoint_idx: usize) -> Result<usize, KernelError> {
-        self.ipc
-            .endpoints
-            .get(endpoint_idx)
-            .and_then(Option::as_ref)
-            .ok_or(KernelError::WrongObject)?;
-        Ok(MAX_ENDPOINT_SENDER_WAITERS)
-    }
-
     fn enqueue_sender_waiter(
         &mut self,
         endpoint_idx: usize,
         waiter: SenderWaiter,
     ) -> Result<(), KernelError> {
-        let limit = self.endpoint_sender_waiter_limit(endpoint_idx)?;
-        let queue = &mut self.ipc.endpoint_sender_waiters[endpoint_idx];
-        if let Some(slot) = queue[..limit].iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(waiter);
-            return Ok(());
-        }
-        Err(KernelError::EndpointQueueFull)
+        self.with_ipc_state_mut(|ipc| {
+            // Defence-in-depth: verify endpoint still exists.
+            ipc.endpoints
+                .get(endpoint_idx)
+                .and_then(Option::as_ref)
+                .ok_or(KernelError::WrongObject)?;
+            let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
+            if let Some(slot) = queue[..MAX_ENDPOINT_SENDER_WAITERS].iter_mut().find(|s| s.is_none()) {
+                *slot = Some(waiter);
+                return Ok(());
+            }
+            Err(KernelError::EndpointQueueFull)
+        })
     }
 
     fn dequeue_sender_waiter(&mut self, endpoint_idx: usize) -> Option<SenderWaiter> {
@@ -198,7 +195,12 @@ impl KernelState {
             tcb.ipc_timeout_fired = false;
             Ok::<_, KernelError>(())
         })?;
-        self.ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
+        // Publish receiver waiter under ipc_state_lock (rank 3), AFTER TCB is marked
+        // Blocked under task_state_lock (rank 2) above — sequential ordering guarantees
+        // the waker sees a consistent Blocked TCB when it finds this slot.
+        self.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
+        });
         crate::yarm_log!(
             "IPC_RECV_BLOCK_REGISTER endpoint={} tid={}",
             endpoint_idx,
@@ -243,7 +245,8 @@ impl KernelState {
         &mut self,
         endpoint_idx: usize,
     ) -> Result<(), KernelError> {
-        if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx].take() {
+        let waiter_tid = self.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[endpoint_idx].take());
+        if let Some(waiter_tid) = waiter_tid {
             crate::yarm_log!("SCHED_WAKE tid={}", waiter_tid.0);
             self.wake_tid_to_runnable(waiter_tid)?;
         }
@@ -1217,11 +1220,17 @@ impl KernelState {
         notification_idx: usize,
         irq_line: u16,
     ) -> Result<(), KernelError> {
-        let notif = self.ipc.notifications[notification_idx]
-            .as_mut()
-            .ok_or(KernelError::WrongObject)?;
-        notif.send_irq(irq_line)?;
-        if let Some(waiter_tid) = self.ipc.notification_waiters[notification_idx].take() {
+        // Phase 1: send signal and snapshot waiter TID under ipc_state_lock.
+        // Lock released before Phase 2 (task_state_lock, rank 2) to preserve ordering.
+        let opt_waiter_tid = self.with_ipc_state_mut(|ipc| {
+            let notif = ipc.notifications[notification_idx]
+                .as_mut()
+                .ok_or(KernelError::WrongObject)?;
+            notif.send_irq(irq_line)?;
+            Ok::<_, KernelError>(ipc.notification_waiters[notification_idx].take())
+        })?;
+        // Phase 2: wake waiter outside ipc_state_lock.
+        if let Some(waiter_tid) = opt_waiter_tid {
             self.with_tcbs_mut(|tcbs| {
                 let tcb = tcbs
                     .iter_mut()
@@ -1382,7 +1391,7 @@ impl KernelState {
             return Err(KernelError::WouldBlock);
         }
 
-        if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+        if let Some(waiter_tid) = self.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]) {
             crate::yarm_log!(
                 "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
                 waiter_tid.0,
@@ -1423,31 +1432,40 @@ impl KernelState {
                 }
             }
         }
-        let endpoint = self
-            .ipc
-            .endpoints
-            .get_mut(endpoint_idx)
-            .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?;
-        if endpoint.send(msg).is_err() {
+        let queued = self.with_ipc_state_mut(|ipc| {
+            let Some(endpoint_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut) else {
+                return Err(KernelError::WrongObject);
+            };
+            let endpoint = kernel_mut(endpoint_storage);
+            Ok(endpoint.send(msg).is_ok())
+        })?;
+        if !queued {
             crate::yarm_log!("IPC_SEND_SYNC_NO_WAITER endpoint={}", endpoint_idx);
             let _ =
                 self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
-            self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
+            self.with_ipc_state_mut(|ipc| {
+                ipc.telemetry.blocked_sends = ipc.telemetry.blocked_sends.saturating_add(1);
+            });
             return Err(KernelError::WouldBlock);
         }
 
-        self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.queued_sends = ipc.telemetry.queued_sends.saturating_add(1);
+        });
         self.wake_waiter_for_endpoint(endpoint_idx)?;
         Ok(())
     }
 
     pub(crate) fn note_endpoint_only_queued_send_split(&mut self) {
-        self.ipc.telemetry.queued_sends = self.ipc.telemetry.queued_sends.saturating_add(1);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.queued_sends = ipc.telemetry.queued_sends.saturating_add(1);
+        });
     }
 
     pub(crate) fn note_endpoint_only_queued_recv_split(&mut self) {
-        self.ipc.telemetry.queued_recvs = self.ipc.telemetry.queued_recvs.saturating_add(1);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.queued_recvs = ipc.telemetry.queued_recvs.saturating_add(1);
+        });
     }
 
     /// Stage 4K: clear `endpoint_waiters[endpoint_idx]` under `ipc_state_lock` if and only if
@@ -1530,28 +1548,38 @@ impl KernelState {
     }
 
     pub(crate) fn note_split_recv_v2_delivery(&mut self) {
-        self.ipc.telemetry.split_recv_v2_deliveries =
-            self.ipc.telemetry.split_recv_v2_deliveries.saturating_add(1);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.split_recv_v2_deliveries =
+                ipc.telemetry.split_recv_v2_deliveries.saturating_add(1);
+        });
     }
 
     pub(crate) fn note_ipc_call_split_delivery(&mut self) {
-        self.ipc.telemetry.ipc_call_split_deliveries =
-            self.ipc.telemetry.ipc_call_split_deliveries.saturating_add(1);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.ipc_call_split_deliveries =
+                ipc.telemetry.ipc_call_split_deliveries.saturating_add(1);
+        });
     }
 
     pub(crate) fn note_ipc_reply_split_delivery(&mut self) {
-        self.ipc.telemetry.ipc_reply_split_deliveries =
-            self.ipc.telemetry.ipc_reply_split_deliveries.saturating_add(1);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.ipc_reply_split_deliveries =
+                ipc.telemetry.ipc_reply_split_deliveries.saturating_add(1);
+        });
     }
 
     pub(crate) fn note_cap_transfer_recv_v2_delivery(&mut self) {
-        self.ipc.telemetry.cap_transfer_recv_v2_deliveries =
-            self.ipc.telemetry.cap_transfer_recv_v2_deliveries.saturating_add(1);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.cap_transfer_recv_v2_deliveries =
+                ipc.telemetry.cap_transfer_recv_v2_deliveries.saturating_add(1);
+        });
     }
 
     pub(crate) fn note_cap_transfer_stage4e_enqueued(&mut self) {
-        self.ipc.telemetry.cap_transfer_stage4e_enqueued =
-            self.ipc.telemetry.cap_transfer_stage4e_enqueued.saturating_add(1);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.cap_transfer_stage4e_enqueued =
+                ipc.telemetry.cap_transfer_stage4e_enqueued.saturating_add(1);
+        });
     }
 
     fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {
@@ -1590,19 +1618,24 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-        let endpoint_mode = self
-            .ipc
-            .endpoints
-            .get(endpoint_idx)
-            .and_then(Option::as_ref)
-            .ok_or(KernelError::WrongObject)?
-            .mode();
-        let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx];
+        let (endpoint_mode, waiter_tid) = self
+            .with_ipc_state(|ipc| {
+                let mode = ipc
+                    .endpoints
+                    .get(endpoint_idx)
+                    .and_then(Option::as_ref)
+                    .map(|e| e.mode());
+                let waiter = ipc.endpoint_waiters[endpoint_idx];
+                (mode, waiter)
+            });
+        let endpoint_mode = endpoint_mode.ok_or(KernelError::WrongObject)?;
         let inline_sync_handoff =
             endpoint_mode == EndpointMode::Synchronous && waiter_tid.is_some();
         if !inline_sync_handoff {
-            self.ipc.telemetry.fastpath_attempts =
-                self.ipc.telemetry.fastpath_attempts.saturating_add(1);
+            self.with_ipc_state_mut(|ipc| {
+                ipc.telemetry.fastpath_attempts =
+                    ipc.telemetry.fastpath_attempts.saturating_add(1);
+            });
         }
 
         self.ipc_send(send_cap, msg)?;
@@ -1618,13 +1651,12 @@ impl KernelState {
         };
 
         if switched && !inline_sync_handoff {
-            self.ipc.telemetry.fastpath_switches =
-                self.ipc.telemetry.fastpath_switches.saturating_add(1);
-            self.ipc.telemetry.scheduler_fastpath_handoffs = self
-                .ipc
-                .telemetry
-                .scheduler_fastpath_handoffs
-                .saturating_add(1);
+            self.with_ipc_state_mut(|ipc| {
+                ipc.telemetry.fastpath_switches =
+                    ipc.telemetry.fastpath_switches.saturating_add(1);
+                ipc.telemetry.scheduler_fastpath_handoffs =
+                    ipc.telemetry.scheduler_fastpath_handoffs.saturating_add(1);
+            });
         }
 
         Ok(IpcFastpathResult {
@@ -1648,7 +1680,9 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
         let endpoint_idx = self.resolve_endpoint_index(send_capability.object)?;
-        let waiter_tid = self.ipc.endpoint_waiters[endpoint_idx].ok_or(KernelError::WouldBlock)?;
+        let waiter_tid = self
+            .with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx])
+            .ok_or(KernelError::WouldBlock)?;
         let transfer_handle = self
             .stash_transfer_envelope(
                 sender_tid,
@@ -1682,10 +1716,10 @@ impl KernelState {
         }
         if let CapObject::Notification { .. } = capability.object {
             let notif_idx = self.resolve_notification_index(capability.object)?;
-            let notif = self.ipc.notifications[notif_idx]
-                .as_mut()
-                .ok_or(KernelError::WrongObject)?;
-            return Ok(notif.recv());
+            let result = self.with_ipc_state_mut(|ipc| {
+                ipc.notifications[notif_idx].as_mut().map(|n| n.recv())
+            });
+            return result.ok_or(KernelError::WrongObject);
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
@@ -1756,12 +1790,16 @@ impl KernelState {
         }
         if let CapObject::Notification { .. } = capability.object {
             let notif_idx = self.resolve_notification_index(capability.object)?;
-            let notif = self.ipc.notifications[notif_idx]
-                .as_mut()
-                .ok_or(KernelError::WrongObject)?;
-            if let Some(msg) = notif.recv() {
-                return Ok(Some(msg));
+            // Try immediate recv under ipc_state_lock.
+            let immediate = self.with_ipc_state_mut(|ipc| {
+                ipc.notifications[notif_idx].as_mut().map(|n| n.recv())
+            });
+            match immediate {
+                None => return Err(KernelError::WrongObject),
+                Some(Some(msg)) => return Ok(Some(msg)),
+                Some(None) => {}
             }
+            // Nothing available — block.
             let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
             self.with_tcbs_mut(|tcbs| {
                 let tcb = tcbs
@@ -1774,7 +1812,10 @@ impl KernelState {
                 tcb.ipc_timeout_fired = false;
                 Ok::<_, KernelError>(())
             })?;
-            self.ipc.notification_waiters[notif_idx] = Some(ThreadId(blocked_tid));
+            // Publish waiter under ipc_state_lock after TCB is Blocked.
+            self.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[notif_idx] = Some(ThreadId(blocked_tid));
+            });
             let _ = self.dispatch_next_task()?;
             return Ok(None);
         }
