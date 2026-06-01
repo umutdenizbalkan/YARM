@@ -513,6 +513,46 @@ mod tests {
             panic!("could not find front-splitting alignment for test heap");
         }
 
+        fn front_split_layout_with_min_leading(
+            &self,
+            size: usize,
+            min_leading: usize,
+        ) -> (Layout, usize) {
+            let block_start = self.free_head as usize;
+            let block_end = block_start + unsafe { (*self.free_head).size };
+            for align in [64usize, 128, 256, 512, 1024, 2048, 4096, 8192, 16_384] {
+                let payload_start =
+                    checked_align_up(block_start + HEADER_SIZE + ALLOC_HDR_SIZE, align)
+                        .expect("align");
+                let alloc_header_addr = payload_start - ALLOC_HDR_SIZE;
+                let leading = alloc_header_addr - block_start;
+                if leading >= min_leading && payload_start + size <= block_end {
+                    return (Layout::from_size_align(size, align).unwrap(), leading);
+                }
+            }
+            panic!("could not find requested front-splitting alignment for test heap");
+        }
+
+        fn front_split_no_tail_layout(&self) -> (Layout, usize) {
+            let block_start = self.free_head as usize;
+            let block_end = block_start + unsafe { (*self.free_head).size };
+            for align in [64usize, 128, 256, 512, 1024, 2048, 4096, 8192, 16_384] {
+                let payload_start =
+                    checked_align_up(block_start + HEADER_SIZE + ALLOC_HDR_SIZE, align)
+                        .expect("align");
+                let alloc_header_addr = payload_start - ALLOC_HDR_SIZE;
+                let leading = alloc_header_addr - block_start;
+                if leading < MIN_SPLIT || payload_start >= block_end {
+                    continue;
+                }
+                let size = block_end - payload_start;
+                if let Ok(layout) = Layout::from_size_align(size, align) {
+                    return (layout, leading);
+                }
+            }
+            panic!("could not find front-split/no-tail layout for test heap");
+        }
+
         unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
             let request_align = layout.align().max(align_of::<usize>());
             let mut prev: *mut BHdr = core::ptr::null_mut();
@@ -1045,6 +1085,116 @@ mod tests {
         assert!(p.is_null());
         assert_eq!(a.free_block_count(), 1);
         assert_eq!(a.total_free_bytes(), free_at_start);
+    }
+
+    fn ranges_overlap(a_start: usize, a_size: usize, b_start: usize, b_size: usize) -> bool {
+        let a_end = a_start + a_size;
+        let b_end = b_start + b_size;
+        a_start < b_end && b_start < a_end
+    }
+
+    #[test]
+    fn front_split_without_tail_links_front_directly_to_original_next() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let free_start = a.free_head as usize;
+        let free_at_start = a.total_free_bytes();
+        let (layout, leading) = a.front_split_no_tail_layout();
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null());
+        let header = a.alloc_header_for(p);
+        let blocks = a.free_blocks();
+        assert_eq!(blocks, std::vec![(free_start, leading)]);
+        assert_eq!(header.block_start, free_start + leading);
+        assert_eq!(
+            header.block_start + header.block_size,
+            free_start + free_at_start
+        );
+        assert_eq!(a.total_free_bytes() + header.block_size, free_at_start);
+
+        unsafe { a.dealloc(p) };
+        assert_eq!(a.free_block_count(), 1);
+        assert_eq!(a.total_free_bytes(), free_at_start);
+    }
+
+    #[test]
+    fn subsequent_front_allocation_cannot_overlap_live_high_align_block() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let (layout, _) = a.front_split_layout_with_min_leading(1024, 512);
+        let high = unsafe { a.alloc(layout) };
+        assert!(!high.is_null());
+        let high_header = a.alloc_header_for(high);
+
+        let small_layout = Layout::from_size_align(32, align_of::<usize>()).unwrap();
+        let small = unsafe { a.alloc(small_layout) };
+        assert!(!small.is_null());
+        let small_header = a.alloc_header_for(small);
+        assert!(small_header.block_start < high_header.block_start);
+        assert!(!ranges_overlap(
+            small_header.block_start,
+            small_header.block_size,
+            high_header.block_start,
+            high_header.block_size,
+        ));
+
+        unsafe { a.dealloc(small) };
+        unsafe { a.dealloc(high) };
+        assert_eq!(a.free_block_count(), 1);
+    }
+
+    #[test]
+    fn subsequent_tail_allocation_cannot_overlap_live_high_align_block() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let (layout, _) = a.front_split_layout_with_min_leading(1024, 512);
+        let high = unsafe { a.alloc(layout) };
+        assert!(!high.is_null());
+        let high_header = a.alloc_header_for(high);
+
+        // Request more payload bytes than the front block can satisfy including allocator
+        // metadata, forcing first-fit search to skip the front block and use the tail block.
+        let front_free_size = a.free_blocks()[0].1;
+        let tail_layout = Layout::from_size_align(front_free_size, align_of::<usize>()).unwrap();
+        let tail = unsafe { a.alloc(tail_layout) };
+        assert!(!tail.is_null());
+        let tail_header = a.alloc_header_for(tail);
+        assert!(tail_header.block_start >= high_header.block_start + high_header.block_size);
+        assert!(!ranges_overlap(
+            tail_header.block_start,
+            tail_header.block_size,
+            high_header.block_start,
+            high_header.block_size,
+        ));
+
+        unsafe { a.dealloc(tail) };
+        unsafe { a.dealloc(high) };
+        assert_eq!(a.free_block_count(), 1);
+    }
+
+    #[test]
+    fn front_split_next_pointer_never_bypasses_live_allocation() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let (layout, _) = a.front_split_layout(512);
+        let high = unsafe { a.alloc(layout) };
+        assert!(!high.is_null());
+        let high_header = a.alloc_header_for(high);
+        let blocks = a.free_blocks();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0 + blocks[0].1, high_header.block_start);
+        assert_eq!(
+            high_header.block_start + high_header.block_size,
+            blocks[1].0
+        );
+
+        let first = a.free_head;
+        let next = unsafe { (*first).next };
+        assert_eq!(next as usize, blocks[1].0);
+        assert!(next as usize >= high_header.block_start + high_header.block_size);
+
+        unsafe { a.dealloc(high) };
+        assert_eq!(a.free_block_count(), 1);
     }
 
     #[test]
