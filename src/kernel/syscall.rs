@@ -198,9 +198,10 @@ impl From<KernelError> for SyscallError {
 }
 
 fn clear_blocked_recv_state(kernel: &mut KernelState, tid: u64, reason: &str) {
-    if let Some(tcb) = kernel.tcb_mut(tid)
-        && tcb.blocked_recv_state.take().is_some()
-    {
+    let was_some = kernel
+        .with_tcb_mut(tid, |tcb| tcb.blocked_recv_state.take().is_some())
+        .unwrap_or(false);
+    if was_some {
         crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason={}", tid, reason);
     }
 }
@@ -210,12 +211,10 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     waiter_tid: u64,
     msg: &Message,
 ) -> Result<(), SyscallError> {
-    let blocked_state = {
-        let tcb = kernel.tcb_mut(waiter_tid).ok_or(SyscallError::InvalidArgs)?;
-        tcb.blocked_recv_state
-            .take()
-            .ok_or(SyscallError::InvalidArgs)?
-    };
+    let blocked_state = kernel
+        .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())
+        .flatten()
+        .ok_or(SyscallError::InvalidArgs)?;
     let waiter_asid = kernel.task_asid(waiter_tid).ok_or(SyscallError::InvalidArgs)?;
     let recv_endpoint = kernel
         .resolve_capability_for_task(waiter_tid, blocked_state.recv_cap)
@@ -305,9 +304,9 @@ pub(crate) fn complete_blocked_recv_for_waiter(
             return Err(SyscallError::InvalidArgs);
         }
     }
-    if let Some(tcb) = kernel.tcb_mut(waiter_tid) {
+    kernel.with_tcb_mut(waiter_tid, |tcb| {
         tcb.user_context.arg0 = 0;
-        tcb.user_context.user_gprs[0] = 0;   // RAX / x0  = ret0  = 0 (success)
+        tcb.user_context.user_gprs[0] = 0; // RAX / x0  = ret0  = 0 (success)
         // x86_64: the LSTAR entry asm does "mov rcx, r10" to forward arg3 (meta_ptr)
         // into RCX before the GPR snapshot.  user_gprs[2]=RCX therefore holds the
         // meta_ptr when the task blocks.  On the blocked-recv resumption path,
@@ -323,7 +322,7 @@ pub(crate) fn complete_blocked_recv_for_waiter(
             tcb.user_context.user_gprs[3] = 0; // RDX = ret2  = 0
             tcb.user_context.user_gprs[7] = 0; // R8  = ret1  = 0
         }
-    }
+    });
     crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=complete", waiter_tid);
     crate::yarm_log!("IPC_RECV_BLOCKED_COMPLETE tid={}", waiter_tid);
     Ok(())
@@ -1119,9 +1118,9 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 meta_user_len: frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
                 recv_abi: RecvAbiVariant::RecvV2,
             };
-            if let Some(tcb) = kernel.tcb_mut(recv_tid) {
+            kernel.with_tcb_mut(recv_tid, |tcb| {
                 tcb.blocked_recv_state = Some(state);
-            }
+            });
             crate::yarm_log!(
                 "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={}",
                 recv_tid,

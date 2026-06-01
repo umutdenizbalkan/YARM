@@ -8,7 +8,9 @@ use crate::kernel::vm::{Asid, VirtAddr, VmError};
 impl KernelState {
     #[cfg(feature = "hosted-dev")]
     fn write_user_byte(&mut self, asid: Asid, va: VirtAddr, value: u8) -> Result<(), KernelError> {
-        self.memory.user_memory.insert((asid.0, va.0), value);
+        self.with_memory_state_mut(|memory| {
+            memory.user_memory.insert((asid.0, va.0), value);
+        });
         Ok(())
     }
 
@@ -28,11 +30,13 @@ impl KernelState {
 
     #[cfg(feature = "hosted-dev")]
     fn read_user_byte(&self, asid: Asid, va: VirtAddr) -> Result<u8, KernelError> {
-        self.memory
-            .user_memory
-            .get(&(asid.0, va.0))
-            .copied()
-            .ok_or(KernelError::UserMemoryFault)
+        self.with_memory_state(|memory| {
+            memory
+                .user_memory
+                .get(&(asid.0, va.0))
+                .copied()
+                .ok_or(KernelError::UserMemoryFault)
+        })
     }
 
     #[cfg(not(feature = "hosted-dev"))]

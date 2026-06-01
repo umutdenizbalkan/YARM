@@ -336,3 +336,35 @@ forbidden.
 
 Tests that verify map→refcount consistency must not hold any lock across the two
 operations.
+
+
+---
+
+## Rule 14 — Task domain: use `with_tcb_mut` for all TCB field mutations in production code
+
+All production mutations of `ThreadControlBlock` fields must go through
+`with_tcb_mut(tid, |tcb| { ... })`, which acquires the task lock (rank 2) for
+the duration of the closure.
+
+The old `tcb_mut(tid) -> Option<&mut ThreadControlBlock>` method is restricted to
+`#[cfg(test)]` after Stage 4T+4.  Do not use it in production paths.
+
+```rust
+// correct:
+state.with_tcb_mut(tid, |tcb| {
+    tcb.fault_policy_override = Some(policy);
+});
+
+// wrong (Bug I pattern — avoid):
+// let tcb = state.tcb_mut(tid).ok_or(...)?;
+// tcb.fault_policy_override = Some(policy);
+```
+
+---
+
+## Rule 15 — Memory domain: user_memory hashmap mutations must use `with_memory_state_mut`
+
+In hosted-dev, `write_user_byte` / `read_user_byte` access `memory.user_memory`.
+These must go through `with_memory_state_mut` / `with_memory_state` (rank 6).
+
+Direct `self.memory.user_memory` access is forbidden in production code (Bug H pattern).

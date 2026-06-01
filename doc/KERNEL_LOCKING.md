@@ -3191,3 +3191,74 @@ document future domain-split intent and enforce ordering when splitting becomes 
 The `validate_user_access_for_asid` fix merges 3 separate `self.user_spaces` reads
 into one `with_user_spaces` call, reducing lock contention on the future hot path
 while preserving all trace logging.
+
+---
+
+## §10 Stage 4T+4 — Compound lifecycle and domain-integration audit
+
+### 10.1 Audit scope
+
+Stage 4T+4 audited compound lifecycle paths, cross-domain interactions, and
+remaining direct-field bypasses across the kernel boot subsystem.
+
+**TLB/shootdown audit result (agent 3):** All `live_tlb_shootdown` and
+`cross_cpu_work` field accesses are within `with_ipc_state` / `with_ipc_state_mut`
+closures. No bypass accesses found. The backward lock ordering (memory rank 6 acquires
+IPC rank 3) in `request_live_asid_shootdown` is acceptable because no nested
+acquisitions to lower ranks occur.
+
+**task_policy_state.rs `task_classes` window (intentional):** After `with_tcbs_mut`
+releases the task lock, `task_classes[inserted_idx] = Some(class)` runs outside the
+closure. The developer-documented invariant is: no other path can observe the new TCB
+slot until `provision_default_kernel_context` completes, because `KernelState` requires
+`&mut self` (exclusive) and the kernel runs with interrupts disabled during task
+creation. This window is documented and not a real race.
+
+**`tls_restore_pending` / `robust_futex` companion arrays** in `thread_state.rs`:
+These companion arrays share the task-lock rank by design — they are accessed alongside
+`tcbs` in the same `&mut self` scope. No dedicated wrapper is needed.
+
+### 10.2 Bugs fixed
+
+| Bug | File | Location | Description |
+|-----|------|----------|-------------|
+| H | `user_memory_state.rs` | `write_user_byte` (hosted-dev, L11) | Direct `self.memory.user_memory` access — wrapped in `with_memory_state_mut` |
+| H | `user_memory_state.rs` | `read_user_byte` (hosted-dev, L31) | Direct `self.memory.user_memory` access — wrapped in `with_memory_state` |
+| I | `task_core_state.rs` | `tcb_mut()` (L38) | Production bypass exposing `&mut ThreadControlBlock` — restricted to `#[cfg(test)]`, new `with_tcb_mut` helper added |
+| I | `fault_endpoint_state.rs` | `set_task_fault_policy` (L66) | Used `tcb_mut()` — converted to `with_tcb_mut` |
+| I | `fault_endpoint_state.rs` | `bind_task_asid` (L116) | Used `tcb_mut()` — converted to `with_tcb_mut` |
+| I | `syscall.rs` | `clear_blocked_recv_state` (L201) | Used `tcb_mut()` — converted to `with_tcb_mut` |
+| I | `syscall.rs` | `complete_blocked_recv_for_waiter` (L214,308) | Used `tcb_mut()` — converted to `with_tcb_mut` |
+| I | `syscall.rs` | recv blocking path (L1122) | Used `tcb_mut()` — converted to `with_tcb_mut` |
+
+### 10.3 New `with_tcb_mut` helper
+
+`task_core_state.rs` now exposes:
+
+```rust
+pub(crate) fn with_tcb_mut<R>(
+    &mut self,
+    tid: u64,
+    f: impl FnOnce(&mut ThreadControlBlock) -> R,
+) -> Option<R>
+```
+
+This acquires the task lock (rank 2) via `with_tcbs_mut`, finds the TCB by TID,
+and calls the closure with `&mut ThreadControlBlock`. The old `tcb_mut()` method
+which returned `&mut ThreadControlBlock` without the lock is now `#[cfg(test)]` only.
+
+### 10.4 Lock-ordering preserved
+
+- Bug H: memory domain lock (rank 6) used for `user_memory` hashmap mutations.
+- Bug I: task lock (rank 2) via `with_tcb_mut` for all TCB field mutations.
+- No new lock-rank inversions introduced.
+
+### 10.5 Test coverage
+
+Three new invariant tests added (total: 547 / 0 failed):
+
+| Test | Invariant |
+|------|-----------|
+| `task_domain_with_tcb_mut_set_fault_policy_visible_via_effective_fault_policy_for` | Bug I regression: `set_task_fault_policy` uses task lock, result visible via `effective_fault_policy_for` |
+| `task_domain_with_tcb_mut_bind_task_asid_visible_via_task_asid` | Bug I regression: `bind_task_asid` uses task lock, ASID visible via `task_asid` |
+| `memory_domain_write_user_byte_goes_through_memory_lock_round_trip` | Bug H regression (hosted-dev): `copy_to_user` → `read_user_memory_for_asid` round-trip preserves data through memory lock |
