@@ -56,9 +56,12 @@ mod non_hosted {
     // - Each slab size class has its own SpinLockIrq<u64> guarding that class's page list head
     //   and all metadata mutations for pages belonging to the class (free-list, bitmap, used count,
     //   unlink/reclaim decisions).
+    // - The slab class lock must not be held while calling the frame allocator. Small-allocation
+    //   slow paths drop the class lock before alloc_pt_frame/free_pt_frame, then reacquire and
+    //   rescan before linking a new page. This preserves lock layering: slab class locks sit above
+    //   raw frame allocation and never nest around it.
     // - Large allocation path uses a separate lock to serialize large-header lifecycle operations.
     // - No nested allocator locks are taken (class lock and large lock are disjoint paths).
-    // - Lock hold may span frame allocator calls; this is intentional to prevent reclaim/list races.
     // IRQ context note:
     // - SpinLockIrq disables local IRQs while held, so allocator lock holders cannot be preempted by
     //   IRQ handlers on the same CPU acquiring the same lock.
@@ -102,12 +105,13 @@ mod non_hosted {
                 };
                 return virt as usize as *mut u8;
             }
-            // AArch64 and RISC-V use an identity mapping for the kernel heap region:
-            // KERNEL_BOOTSTRAP_VIRT_BASE == KERNEL_BOOTSTRAP_PHYS_BASE (e.g. 0x40080000 on
-            // virt/QEMU), so the physical frame address is the same as the virtual pointer.
-            // This assumption must hold for all platforms that use this allocator path; adding
-            // a new port requires either (a) keeping the identity mapping invariant or (b)
-            // replacing this conversion with a proper virt↔phys translation.
+            // AArch64 and RISC-V currently access allocator frames through an early
+            // identity-mapped lower-memory window, so the physical frame address is the
+            // virtual pointer used by the kernel allocator. Do not replace this with
+            // KERNEL_BOOTSTRAP_VIRT_BASE + phys: that constant is an image/bootstrap anchor
+            // on these ports, not a proven direct-map offset for every allocator frame.
+            // Future higher-half ports should provide an arch-owned phys<->kernel-virt helper
+            // and update this conversion together with the corresponding bootstrap mappings.
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             {
                 return phys as usize as *mut u8;
@@ -328,18 +332,18 @@ mod non_hosted {
             false
         }
 
-        unsafe fn try_reclaim_empty_slab_page(
+        unsafe fn try_unlink_empty_slab_page(
             class_head: &mut u64,
             class_idx: usize,
             target_page_ptr: *mut u8,
-        ) {
+        ) -> Option<u64> {
             let target_phys = Self::ptr_to_phys(target_page_ptr as *const u8);
             let mut empty_pages = 0usize;
             let mut phys = *class_head;
             while phys != 0 {
                 let page_ptr = Self::phys_to_ptr(phys);
                 if page_ptr.is_null() {
-                    return;
+                    return None;
                 }
                 let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
                 if header.magic == SLAB_MAGIC
@@ -353,15 +357,16 @@ mod non_hosted {
 
             let should_keep_warm = KEEP_ONE_WARM_EMPTY_PAGE_PER_CLASS && empty_pages <= 1;
             if should_keep_warm {
-                return;
+                return None;
             }
 
             if unsafe { Self::unlink_slab_page(class_head, target_phys) } {
-                let _ = free_pt_frame(target_phys);
+                return Some(target_phys);
             }
+            None
         }
 
-        unsafe fn alloc_small(class_head: &mut u64, class_idx: usize) -> *mut u8 {
+        unsafe fn alloc_small_from_list(class_head: &mut u64, class_idx: usize) -> *mut u8 {
             let mut phys = *class_head;
             while phys != 0 {
                 let page_ptr = Self::phys_to_ptr(phys);
@@ -377,7 +382,21 @@ mod non_hosted {
                 }
                 phys = header.next_page_phys;
             }
+            null_mut()
+        }
 
+        unsafe fn alloc_small(class_idx: usize) -> *mut u8 {
+            {
+                let mut class_head = Self::class_lock(class_idx).lock();
+                let ptr = unsafe { Self::alloc_small_from_list(&mut class_head, class_idx) };
+                if !ptr.is_null() {
+                    return ptr;
+                }
+            }
+
+            // Slow path: never hold the slab class lock while asking the frame allocator for a
+            // page. alloc_pt_frame() takes the frame-allocator lock, and keeping the class lock
+            // across that call would invert allocator lock layering on future multicore paths.
             let Ok(new_phys) = alloc_pt_frame() else {
                 return null_mut();
             };
@@ -387,12 +406,30 @@ mod non_hosted {
                 return null_mut();
             }
 
-            if !unsafe { Self::slab_init_page(page_ptr, class_idx, *class_head) } {
+            if !unsafe { Self::slab_init_page(page_ptr, class_idx, 0) } {
                 let _ = free_pt_frame(new_phys);
                 return null_mut();
             }
-            *class_head = new_phys;
-            unsafe { Self::slab_alloc_from_page(page_ptr) }
+
+            let mut unused_new_page = false;
+            let allocated = {
+                let mut class_head = Self::class_lock(class_idx).lock();
+                let existing = unsafe { Self::alloc_small_from_list(&mut class_head, class_idx) };
+                if !existing.is_null() {
+                    unused_new_page = true;
+                    existing
+                } else {
+                    let header = unsafe { &mut *(page_ptr as *mut SlabPageHeader) };
+                    header.next_page_phys = *class_head;
+                    *class_head = new_phys;
+                    unsafe { Self::slab_alloc_from_page(page_ptr) }
+                }
+            };
+
+            if unused_new_page {
+                let _ = free_pt_frame(new_phys);
+            }
+            allocated
         }
 
         unsafe fn alloc_large(layout: Layout) -> *mut u8 {
@@ -439,8 +476,7 @@ mod non_hosted {
             }
 
             if let Some(class_idx) = Self::slab_class_for(layout) {
-                let mut class_head = Self::class_lock(class_idx).lock();
-                return unsafe { Self::alloc_small(&mut class_head, class_idx) };
+                return unsafe { Self::alloc_small(class_idx) };
             }
             let _large_guard = LARGE_ALLOC_LOCK.lock();
             unsafe { Self::alloc_large(layout) }
@@ -459,26 +495,44 @@ mod non_hosted {
                     let class_idx =
                         unsafe { (&*(page_ptr as *const SlabPageHeader)).class_idx as usize };
                     if class_idx < SLAB_CLASS_SIZES.len() {
-                        let mut class_head = Self::class_lock(class_idx).lock();
-                        let ok = unsafe { Self::slab_dealloc_from_page(page_ptr, ptr) };
-                        if ok {
-                            let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
-                            if header.used == 0 {
-                                unsafe {
-                                    Self::try_reclaim_empty_slab_page(
-                                        &mut class_head,
-                                        class_idx,
-                                        page_ptr,
-                                    )
-                                };
+                        let reclaim_phys = {
+                            let mut class_head = Self::class_lock(class_idx).lock();
+                            let ok = unsafe { Self::slab_dealloc_from_page(page_ptr, ptr) };
+                            if ok {
+                                let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
+                                if header.used == 0 {
+                                    unsafe {
+                                        Self::try_unlink_empty_slab_page(
+                                            &mut class_head,
+                                            class_idx,
+                                            page_ptr,
+                                        )
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
                             }
+                        };
+                        if let Some(phys) = reclaim_phys {
+                            let _ = free_pt_frame(phys);
                         }
                         return;
                     }
+                    debug_assert!(
+                        false,
+                        "corrupt slab class index in kernel allocator dealloc"
+                    );
+                    return;
                 }
             }
 
             if !(ptr as usize).is_multiple_of(PAGE_SIZE) {
+                debug_assert!(
+                    false,
+                    "invalid kernel allocator dealloc pointer: non-slab, non-page-aligned"
+                );
                 return;
             }
 
@@ -491,10 +545,18 @@ mod non_hosted {
 
             let header = unsafe { core::ptr::read(header_ptr) };
             if header.magic != LARGE_MAGIC {
+                debug_assert!(
+                    false,
+                    "invalid kernel allocator dealloc pointer: missing large magic"
+                );
                 return;
             }
             let pages = header.pages as usize;
             if pages < 2 {
+                debug_assert!(
+                    false,
+                    "corrupt large allocation page count in kernel allocator dealloc"
+                );
                 return;
             }
             let base_phys = Self::ptr_to_phys(header_ptr as *const u8);
@@ -797,6 +859,60 @@ mod hosted_dev_allocator_model_tests {
         assert_eq!(p3, p1);
         assert!(a.dealloc(24, 8, p2));
         assert!(a.dealloc(24, 8, p3));
+    }
+
+    #[test]
+    fn slab_slot_offsets_never_masquerade_as_large_allocations() {
+        for class_idx in 0..CLASS_SIZES.len() {
+            let obj = CLASS_SIZES[class_idx];
+            let start = align_up(SLAB_HEADER_BYTES, obj);
+            let cap = class_capacity(class_idx);
+            assert!(cap > 0);
+            for idx in 0..cap {
+                let offset = start + idx * obj;
+                assert!(offset > 0 && offset < PAGE_SIZE);
+                assert_ne!(offset % PAGE_SIZE, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn large_dealloc_rejects_interior_pointer_but_accepts_returned_pointer() {
+        let mut a = ModelAlloc::new();
+        let ptr = a.alloc(8192, 64).expect("large alloc");
+        assert_eq!(ptr % PAGE_SIZE, 0);
+        assert!(!a.dealloc(8192, 64, ptr + PAGE_SIZE));
+        assert!(a.dealloc(8192, 64, ptr));
+    }
+
+    #[test]
+    fn slow_path_rescan_uses_existing_slot_and_does_not_leak_unused_page() {
+        let mut a = ReclaimModelAlloc::new();
+        let class_idx = ReclaimModelAlloc::class_for(64, 8).expect("class");
+        let cap = class_capacity(class_idx);
+        let mut full_page = Vec::new();
+        for _ in 0..cap {
+            full_page.push(a.alloc(64, 8).expect("fill page"));
+        }
+        assert_eq!(a.classes[class_idx].pages.len(), 1);
+
+        // Thread A would drop the class lock and allocate a raw frame here. Before it
+        // reacquires the lock, thread B frees a slot in the existing page.
+        let speculative_raw_frame = align_up(a.next_addr, PAGE_SIZE);
+        a.next_addr = speculative_raw_frame + PAGE_SIZE;
+        let freed_by_other_cpu = full_page.pop().expect("one slot");
+        assert!(a.dealloc(64, 8, freed_by_other_cpu));
+
+        // The fixed slow path must rescan after reacquiring the class lock and consume the
+        // existing free slot instead of linking the speculative page.
+        let reused = a.alloc(64, 8).expect("rescan alloc");
+        assert_eq!(reused, freed_by_other_cpu);
+        assert_eq!(a.classes[class_idx].pages.len(), 1);
+
+        for ptr in full_page {
+            assert!(a.dealloc(64, 8, ptr));
+        }
+        assert!(a.dealloc(64, 8, reused));
     }
 
     #[test]
