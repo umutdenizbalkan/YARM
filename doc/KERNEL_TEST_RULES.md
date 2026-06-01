@@ -404,3 +404,55 @@ subsystem rank when invoking the helper (per the lock-rank hierarchy in §2).
 
 Document this constraint in the helper's inline comment, following the pattern in
 `runtime.rs::with_fault_split_read` / `with_telemetry_split_read`.
+
+---
+
+## Rule 18 — Arch-boundary split-read TID tests must prove task-switch detection
+
+When a split-read helper is used at an arch/trap boundary to determine whether a
+task switch occurred (`entering_tid != exiting_tid`), the test suite must cover
+three distinct scheduler states:
+
+1. **Task-switch occurred**: enqueue ≥2 tasks before the first dispatch so that a
+   subsequent `yield_current` dispatches a *different* task. Assert
+   `exiting_tid ≠ entering_tid` and `task_switched = true`.
+
+2. **No task switch**: dispatch a single task with no competitor in the run queue.
+   Assert `exiting_tid == entering_tid` and `task_switched = false`.
+
+3. **Offline CPU**: pass an out-of-range `CpuId` (e.g. `CpuId(255)`) to the helper.
+   Assert `None` is returned (same as the conservative `with_cpu` path for an
+   offline CPU).
+
+**Dual-enqueue pattern** (required for case 1): enqueue **both** tasks before
+calling `dispatch_next_task()` for the first time:
+
+```rust
+// CORRECT — task 82 is in the run queue when task 81 yields
+state.register_task(81).expect("task81");
+state.register_task(82).expect("task82");
+state.enqueue_current_cpu(81).expect("enqueue 81");
+state.enqueue_current_cpu(82).expect("enqueue 82");
+state.dispatch_next_task().expect("dispatch to 81");
+// ...
+state.yield_current().expect("yield 81");
+// exiting_tid == Some(82) ≠ Some(81) == entering_tid  ✓
+
+// WRONG — task 81 re-dispatches because task 82 was never queued before dispatch
+state.register_task(81).expect("task81");
+state.enqueue_current_cpu(81).expect("enqueue 81");
+state.dispatch_next_task().expect("dispatch to 81");
+state.register_task(82).expect("task82");
+state.enqueue_current_cpu(82).expect("enqueue 82");
+state.yield_current().expect("yield 81");
+// Both entering_tid and exiting_tid == Some(81) — WRONG assertion would fail
+```
+
+The WRONG pattern fails because `dispatch_next_task` removes the idle task (TID 0)
+from the membership table; when only task 81 remains, `yield_current` re-dispatches
+task 81 and `exiting_tid == entering_tid`.
+
+**Equivalence test** (companion to case 1): every arch-boundary split-read conversion
+must include a test that calls both `split_read` and the conservative
+`with_cpu → current_tid` path on the same scheduler state and asserts they produce
+the same value (Rule 16 pattern extended to arch-boundary callers).

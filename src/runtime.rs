@@ -649,4 +649,118 @@ mod tests {
             "tlb_shootdown_timeout_count split_read must match global read"
         );
     }
+
+    // ── Stage 4T+6 x86_64 trap TID split-read equivalence tests ─────────────
+
+    #[test]
+    fn current_tid_split_read_matches_with_cpu_current_tid_entering_snapshot() {
+        // Proves that current_tid_split_read(cpu) is equivalent to
+        // with_cpu(cpu, |k| k.current_tid()).unwrap_or(None) at the
+        // point in time that corresponds to the entering_tid snapshot
+        // in the x86_64 shared trap path (Stage 4T+6 conversion).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+
+        kernel.with(|state| {
+            state.register_task(77).expect("task77");
+            state.enqueue_current_cpu(77).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+
+        let split = kernel.current_tid_split_read(cpu);
+        let conservative = kernel.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
+        assert_eq!(
+            split, conservative,
+            "entering_tid: current_tid_split_read must equal with_cpu current_tid"
+        );
+        assert_eq!(split, Some(77));
+    }
+
+    #[test]
+    fn current_tid_split_read_reflects_task_switch_for_exiting_snapshot() {
+        // Proves that current_tid_split_read(cpu) correctly reflects a task
+        // switch — the exiting_tid snapshot in the x86_64 shared trap path
+        // must see the newly-dispatched task, not the entering task.
+        //
+        // Setup: enqueue both 81 and 82 before dispatch so the runqueue has
+        // [81, 82]. Dispatch picks 81; queue is [82]. Yield from 81 → queue
+        // becomes [82, 81] → dispatch picks 82. This guarantees a switch.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+
+        kernel.with(|state| {
+            state.register_task(81).expect("task81");
+            state.register_task(82).expect("task82");
+            // Enqueue both before dispatch so 82 is waiting when 81 yields.
+            state.enqueue_current_cpu(81).expect("enqueue 81");
+            state.enqueue_current_cpu(82).expect("enqueue 82");
+            state.dispatch_next_task().expect("dispatch to 81");
+        });
+
+        // Entering snapshot: current is task 81 (first FIFO pick).
+        let entering_tid = kernel.current_tid_split_read(cpu);
+        assert_eq!(entering_tid, Some(81), "entering_tid must be task 81");
+
+        // Simulate task switch: yield task 81; queue now has [82, 81], dispatch picks 82.
+        kernel.with(|state| {
+            state.yield_current().expect("yield 81");
+        });
+
+        // Exiting snapshot: task 82 (or 81 re-dispatched on single-task edge case —
+        // we assert only that the scheduler call is visible, not the exact TID).
+        let exiting_tid = kernel.current_tid_split_read(cpu);
+        assert_ne!(
+            exiting_tid, entering_tid,
+            "exiting_tid must differ from entering_tid after yield"
+        );
+        // task_switched detection — same logic as the x86_64 trap handler.
+        let task_switched = entering_tid != exiting_tid;
+        assert!(task_switched, "task_switched must be true when TIDs differ");
+    }
+
+    #[test]
+    fn current_tid_split_read_no_switch_detection_for_same_task_return() {
+        // Proves that when no task switch occurs, entering_tid == exiting_tid
+        // via current_tid_split_read — triggering the "write trap returns only"
+        // branch in the x86_64 trap handler (Stage 4T+6).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+
+        kernel.with(|state| {
+            state.register_task(91).expect("task91");
+            state.enqueue_current_cpu(91).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+
+        let entering_tid = kernel.current_tid_split_read(cpu);
+
+        // No dispatch between entering and exiting — same task continues.
+        let exiting_tid = kernel.current_tid_split_read(cpu);
+
+        assert_eq!(
+            entering_tid, exiting_tid,
+            "exiting_tid must equal entering_tid when no task switch"
+        );
+        let task_switched = entering_tid != exiting_tid;
+        assert!(!task_switched, "task_switched must be false for same-task return");
+    }
+
+    #[test]
+    fn current_tid_split_read_offline_cpu_returns_none() {
+        // Proves that current_tid_split_read for an offline CPU returns None —
+        // same as the former with_cpu path (validate_online_cpu fail → unwrap_or(None)).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let offline_cpu = CpuId(7);
+
+        let split = kernel.current_tid_split_read(offline_cpu);
+        let conservative = kernel.with_cpu(offline_cpu, |k| k.current_tid()).unwrap_or(None);
+        assert_eq!(
+            split, None,
+            "offline CPU must return None from current_tid_split_read"
+        );
+        assert_eq!(
+            split, conservative,
+            "split_read must match with_cpu for offline CPU"
+        );
+    }
 }
