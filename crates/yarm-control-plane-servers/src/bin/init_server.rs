@@ -10,6 +10,12 @@ yarm::install_freestanding_allocator!(
     "control-plane server freestanding allocator OOM"
 );
 
+#[cfg(not(feature = "hosted-dev"))]
+use core::sync::atomic::{AtomicU32, Ordering};
+
+#[cfg(not(feature = "hosted-dev"))]
+static INIT_IDLE_FUTEX: AtomicU32 = AtomicU32::new(0);
+
 #[inline]
 fn run() {
     yarm_control_plane_servers::run_init_server();
@@ -35,7 +41,16 @@ pub extern "C" fn yarm_user_entry() -> ! {
     }
     yarm_user_rt::user_log!("INIT_NO_RECV_CAP_EXPECTED_ONE_SHOT_IDLE");
     loop {
-        let _ = yarm::user_rt::syscall::yield_now();
+        let observed = INIT_IDLE_FUTEX.load(Ordering::Relaxed);
+        if yarm::user_rt::syscall::futex_wait(
+            INIT_IDLE_FUTEX.as_ptr(),
+            observed,
+            observed,
+        )
+        .is_err()
+        {
+            let _ = yarm::user_rt::syscall::yield_now();
+        }
     }
 }
 
