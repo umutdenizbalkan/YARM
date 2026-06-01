@@ -2932,3 +2932,81 @@ Four tests in `src/kernel/boot/tests.rs` verify lock-domain invariants:
 ## 6) Scope note
 
 This document is audit/design-only and does not change runtime lock behavior.
+
+---
+
+## 7) Capability domain audit (post Stage 4T)
+
+### 7.1 Audit scope
+
+Full sweep of all methods in `KernelState` that touch `self.capability.*` fields,
+classified by access pattern.  Objective: confirm that every production-code access
+to `CapabilitySubsystem` goes through `with_capability_state` / `with_capability_state_mut`.
+
+### 7.2 Classification buckets
+
+| Bucket | Description | Files |
+|--------|-------------|-------|
+| A | All accesses through `with_capability_state` wrapper | `capability_state.rs`, `capability_lifecycle_state.rs`, `cnode_state.rs`, `delegation_state.rs`, `capability_service_state.rs` |
+| B | Multi-lock helper: `with_task_then_capability` (rank 2→4) | `cnode_state.rs::task_cnode` |
+| C | `#[cfg(test)]` direct access — test scaffolding only, acceptable | `task_core_state.rs::cspace_for_cnode`, `cspace_for_cnode_mut` |
+
+All production methods are in bucket A or B.  Bucket C is `#[cfg(test)]` only and
+acceptable because it never runs in freestanding/production builds.
+
+### 7.3 Capability lock-rank contract
+
+| Rank | Lock | Notes |
+|------|------|-------|
+| 1 | scheduler_state | Per-CPU runqueue, dispatch, preemption |
+| 2 | task_state_lock | TCB allocation, status, affinity |
+| 3 | ipc_state_lock | Endpoints, notifications, reply_caps, transfer_envelopes, cross_cpu_work |
+| 4 | capability_state_lock | CNode spaces, process_cnodes, delegated_capability_links |
+| 5 | vm_state_lock | Page tables, ASID, TLB shootdown coordination |
+
+Acquisition order must be **strictly ascending** (lower rank first).  Acquiring
+rank-4 then rank-3 (capability then IPC) is a deadlock hazard and is forbidden.
+
+### 7.4 Direct-access sweep results
+
+The sweep searched all `src/kernel/boot/` files for direct `self.ipc.*`,
+`self.capability.*`, and `self.scheduler.*` field accesses outside the approved
+accessor wrappers.
+
+**Capability domain (`self.capability.*`)**: All clean. No direct field access in
+production code.  Two `#[cfg(test)]` exceptions in `task_core_state.rs` (bucket C
+above) are acceptable.
+
+**IPC domain (`self.ipc.*`)**: Two bugs found and fixed in `scheduler_state.rs`:
+
+| Bug | Location | Pattern | Fix |
+|-----|----------|---------|-----|
+| `escalate_tlb_shootdown_timeout` | `scheduler_state.rs` ~line 341 | Direct `self.ipc.endpoints.get_mut(...)` bypassing `ipc_state_lock` | Wrapped endpoint send in `with_ipc_state_mut`; wake call kept outside lock |
+| `process_cross_cpu_work_for_cpu` | `scheduler_state.rs` ~line 440 | Direct `self.ipc.cross_cpu_work.take_for_cpu(cpu)` bypassing `ipc_state_lock` | One-item-at-a-time take under `with_ipc_state`; lock released before `apply_cross_cpu_work` which may itself acquire IPC lock on `TlbShootdownAck` path |
+
+Both fixes preserve lock-rank order (IPC rank 3; scheduler operations that follow
+are rank 1/2 which are lower — no inversion possible).
+
+### 7.5 Capability invariant tests added (Stage 4T+1)
+
+Six new tests in `src/kernel/boot/tests.rs`:
+
+| Test | Invariant verified |
+|------|--------------------|
+| `cap_rights_grant_cannot_widen_rights_beyond_source` | `grant_capability_task_to_task_with_rights` must return `MissingRight` when requested rights exceed source |
+| `create_endpoint_both_domains_visible_after_two_phase_create` | After `create_endpoint`, IPC domain (endpoint slot) and capability domain (send/recv caps) are both coherent at call return |
+| `create_notification_both_domains_visible_after_two_phase_create` | Same for `create_notification` / notification slot |
+| `ipc_timeout_deadline_cleared_in_tcb_after_deadline_fires` | `TCB.ipc_timeout_deadline` is `None` after the timer fires for a deadline-blocked recv |
+| `user_task_cnode_isolated_from_system_server_cnode` | Revoking a cap from task 1's cnode does not affect task 2's cnode |
+| `cap_materialization_reply_cap_visible_in_capability_domain` | After `create_reply_cap_for_caller`, the reply cap resolves via both `resolve_capability_for_task` and `capability_for_cnode` |
+
+### 7.6 Live conversions made vs deferred
+
+**Made (Stage 4T+1)**:
+- `escalate_tlb_shootdown_timeout`: IPC endpoint send now under `with_ipc_state_mut` (rank 3).
+- `process_cross_cpu_work_for_cpu`: cross_cpu_work take now under `with_ipc_state` per iteration.
+
+**Deferred**:
+- Scheduler block/deadline/futex domain passes — no unsafe direct accesses found; deferred to next campaign.
+- VM/fault/TLB audit — helper-only, deferred; all known paths clean.
+- Global `SharedKernel` lock removal from syscall fast path — Stage 3+ work; not in scope for Stage 4T+1.
