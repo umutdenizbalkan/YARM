@@ -3262,3 +3262,116 @@ Three new invariant tests added (total: 547 / 0 failed):
 | `task_domain_with_tcb_mut_set_fault_policy_visible_via_effective_fault_policy_for` | Bug I regression: `set_task_fault_policy` uses task lock, result visible via `effective_fault_policy_for` |
 | `task_domain_with_tcb_mut_bind_task_asid_visible_via_task_asid` | Bug I regression: `bind_task_asid` uses task lock, ASID visible via `task_asid` |
 | `memory_domain_write_user_byte_goes_through_memory_lock_round_trip` | Bug H regression (hosted-dev): `copy_to_user` → `read_user_memory_for_asid` round-trip preserves data through memory lock |
+
+---
+
+## §11 Stage 4T+5 — Global-lock split-read/split-mut readiness pass
+
+### 11.1 Audit scope
+
+Stage 4T+5 audited all `SharedKernel::with` and `SharedKernel::with_cpu` production
+call sites for split-read/split-mut conversion readiness.
+
+### 11.2 SharedKernel call-site classification
+
+| Location | Method | Class | Reason |
+|----------|--------|-------|--------|
+| `arch/trap_entry.rs:149` | `with_cpu → handle_trap_entry_with_fault_bookkeeping_mode` | **F** | Arch/trap boundary — sets current_cpu, full trap dispatch |
+| `arch/x86_64/descriptor_tables.rs:823,857` | `with_cpu → current_tid()` (entering/exiting diagnostic) | **F** | Arch/trap boundary — used for GPR writeback decision; defer |
+| `arch/x86_64/descriptor_tables.rs:850` | `with_cpu → log_decoded_fatal_trap` | **F** | Arch fatal-trap path — must hold global lock |
+| `runtime.rs:193` | `with → try_ipc_recv` | **H** | Mutates IPC endpoint state |
+| `runtime.rs:197` | `with → ipc_recv_until_deadline` | **D** | Pre-staged: `ipc_recv_with_deadline_split_bridge` handles deadline staging |
+| `runtime.rs:207` | `with_cpu → handle_trap` | **F** | Arch/trap boundary — `handle_trap_with_cpu` entry |
+| `runtime.rs:217-222` | `with → task/enqueue/dispatch ops` | **H** | Multi-domain mutations (scheduler+task+IPC) |
+| `runtime.rs:260-278` | `with → cross-CPU work submit/process` | **H** | IPC+scheduler mutations |
+| Telemetry mutation paths | `increment_tlb_shootdown_count_split_mut` etc. | **C** | Already split (telemetry_state_lock rank 10) |
+| Fault mutation paths | `record_fault_split_mut` etc. | **C** | Already split (fault_state_lock rank 8) |
+| Scheduler reads | `scheduler_tick_now_split_read` etc. | **C** | Already split (scheduler lock rank 1) |
+| Boot config reads | `capacity_profile_split_read` etc. | **C** | Already split (boot_config_state_lock rank 11) |
+
+**Class codes:** A=ready split-read, B=ready split-mut, C=already split, D=helper-only staged,
+E=needs plan-first decomp, F=arch/trap boundary defer, G=boot-only/global OK, H=unsafe to split yet.
+
+### 11.3 New split-read helpers added
+
+Five new `SharedKernel` split-read methods (all under subsystem lock only, no global lock):
+
+| Helper | Lock domain | Rank | Pattern |
+|--------|-------------|------|---------|
+| `last_fault_split_read()` | `fault_state_lock` | 8 | Fault subsystem |
+| `last_fault_frame_split_read()` | `fault_state_lock` | 8 | Fault subsystem |
+| `fault_policy_split_read()` | `fault_state_lock` | 8 | Fault subsystem |
+| `tlb_shootdown_count_split_read()` | `telemetry_state_lock` | 10 | Telemetry subsystem |
+| `tlb_shootdown_timeout_count_split_read()` | `telemetry_state_lock` | 10 | Telemetry subsystem |
+
+Two private `SharedKernel` infrastructure helpers:
+- `with_fault_split_read<R>(&self, f)` — reuses `fault_split_mut_ptrs_from_raw`, downgrades `*mut` to `*const` for read
+- `with_telemetry_split_read<R>(&self, f)` — reuses `telemetry_split_mut_ptrs_from_raw`, same pattern
+
+All new helpers document:
+- which lock they acquire
+- which locks must not be held
+- that they do not acquire the outer `SharedKernel` lock
+
+### 11.4 Complete split helper inventory (post-Stage 4T+5)
+
+**Scheduler domain (rank 1):**
+- `scheduler_tick_now_split_read()` — timer tick read
+- `current_tid_split_read(cpu)` — per-CPU current TID read
+- `online_cpu_count_split_read()` — topology read
+- `present_cpu_count_split_read()` — topology read
+
+**Fault domain (rank 8):**
+- `record_fault_split_mut(fault)` — write last_fault
+- `record_fault_frame_snapshot_split_mut(frame)` — write last_fault_frame
+- `clear_last_fault_split_mut()` — clear both fault fields
+- `last_fault_split_read()` **NEW** — read last_fault
+- `last_fault_frame_split_read()` **NEW** — read last_fault_frame
+- `fault_policy_split_read()` **NEW** — read fault_policy
+
+**Telemetry domain (rank 10):**
+- `increment_tlb_shootdown_count_split_mut()` — counter increment
+- `add_tlb_shootdown_timeout_count_split_mut(delta)` — counter add
+- `tlb_shootdown_count_split_read()` **NEW** — counter read
+- `tlb_shootdown_timeout_count_split_read()` **NEW** — counter read
+
+**Boot config domain (rank 11):**
+- `capacity_profile_split_read()` — immutable config read
+- `runtime_capacity_config_split_read()` — computed config read
+
+**IPC recv bridge:**
+- `ipc_recv_with_deadline_split_bridge(cap, timeout)` — pre-stages deadline then calls `with()`
+
+### 11.5 Remaining direct bypass sweep result
+
+All direct field accesses classified (no new bypasses found vs Stage 4T+4):
+
+| Category | Status |
+|----------|--------|
+| `orchestrator_state.rs` wrapper implementations | Legitimate — inside lock closures |
+| Test-only `tcb_mut`, `cspace_for_cnode`, `cspace_for_cnode_mut` | `#[cfg(test)]` gated |
+| `tls_restore_pending` / `robust_futex` in `thread_state.rs` | Companion arrays, task lock covers them; acceptable |
+| `task_classes[idx]` post-lock in `task_policy_state.rs:51` | Documented intentional window, `&mut self` exclusivity |
+| `task_classes[idx]` inside `with_tcbs` in `task_policy_state.rs:138` | Protected by task lock via closure capture |
+
+### 11.6 Paths still globally locked and why
+
+| Path | Why globally locked |
+|------|-------------------|
+| `handle_trap_with_cpu` / `dispatch_trap_entry_with_shared_kernel` | Full trap dispatch: current_cpu mutation, TrapFrame writeback, IPC/cap/VM/scheduler coupling |
+| x86_64 `entering_tid` / `exiting_tid` reads at trap boundary | Correctness: used to determine `task_switched` → GPR writeback. Arch boundary (F). Diagnostic `current_tid_split_read` comparison shows they always match; live conversion deferred. |
+| IPC recv/send/call/reply | Mutates IPC endpoints, scheduler queues, TCBs simultaneously |
+| Task lifecycle (register/enqueue/dispatch) | Multi-domain: task + scheduler + capability + IPC |
+| SpawnV5 / exec / COW / VM_ANON_MAP | Multi-domain with TrapFrame writeback |
+
+### 11.7 Tests
+
+Three new split-read correctness tests added (`runtime::tests`):
+
+| Test | Invariant |
+|------|-----------|
+| `fault_split_read_helpers_match_kernel_state_accessors` | `last_fault_split_read` / `last_fault_frame_split_read` match global-lock reads; clear propagates |
+| `fault_policy_split_read_matches_kernel_state_accessor` | `fault_policy_split_read` matches `state.fault_policy()`, default is `KillTask` |
+| `telemetry_split_read_helpers_match_kernel_state_accessors` | `tlb_shootdown_count_split_read` / `timeout_count_split_read` match global reads, see split_mut updates |
+
+Total: 547 → 550 / 0 failed.

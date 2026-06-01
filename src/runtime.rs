@@ -8,6 +8,7 @@ use crate::kernel::boot::{
 };
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
+use crate::kernel::task::FaultPolicy;
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
 use crate::kernel::lock::{SpinLock, SpinLockIrq};
@@ -181,6 +182,69 @@ impl SharedKernel {
             telemetry.tlb_shootdown_timeout_count =
                 telemetry.tlb_shootdown_timeout_count.wrapping_add(delta);
         });
+    }
+
+    fn with_fault_split_read<R>(&self, f: impl FnOnce(&FaultSubsystem) -> R) -> R {
+        // Stage 4T+5 split-read: acquires fault_state_lock (rank 8) only.
+        // Does not acquire the outer SharedKernel lock. Does not mutate any state.
+        // Callers must not hold any lock of rank ≤ 8 (scheduler/task/ipc/cap/vm/
+        // memory/driver) when invoking this helper.
+        // SAFETY: `fault_split_mut_ptrs_from_raw` derives raw field pointers from
+        // the stable KernelState storage owned by this SharedKernel without creating
+        // a whole-KernelState reference. The fault lock serializes access; the *mut
+        // pointer is downgraded to *const for this read-only use.
+        let (fault_state_lock, faults) =
+            unsafe { KernelState::fault_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let fault_state_lock = unsafe { &*fault_state_lock };
+        let _guard = fault_state_lock.lock();
+        let faults: &KernelStorage<FaultSubsystem> = unsafe { &*(faults as *const _) };
+        f(kernel_ref(faults))
+    }
+
+    pub fn last_fault_split_read(&self) -> Option<crate::kernel::trap::FaultInfo> {
+        // Stage 4T+5 split-read: reads last_fault under fault_state_lock (rank 8).
+        // Does not acquire the outer SharedKernel lock.
+        self.with_fault_split_read(|faults| faults.last_fault)
+    }
+
+    pub fn last_fault_frame_split_read(&self) -> Option<crate::kernel::trapframe::TrapFrame> {
+        // Stage 4T+5 split-read: reads last_fault_frame under fault_state_lock (rank 8).
+        // Does not acquire the outer SharedKernel lock.
+        self.with_fault_split_read(|faults| faults.last_fault_frame.clone())
+    }
+
+    pub fn fault_policy_split_read(&self) -> FaultPolicy {
+        // Stage 4T+5 split-read: reads fault_policy under fault_state_lock (rank 8).
+        // Does not acquire the outer SharedKernel lock.
+        self.with_fault_split_read(|faults| faults.fault_policy)
+    }
+
+    fn with_telemetry_split_read<R>(&self, f: impl FnOnce(&TelemetrySubsystem) -> R) -> R {
+        // Stage 4T+5 split-read: acquires telemetry_state_lock (rank 10) only.
+        // Does not acquire the outer SharedKernel lock. Does not mutate any state.
+        // Callers must not hold any lock of rank ≤ 10 when invoking this helper.
+        // SAFETY: `telemetry_split_mut_ptrs_from_raw` derives raw field pointers
+        // from the stable KernelState storage owned by this SharedKernel without
+        // creating a whole-KernelState reference. The telemetry lock serializes
+        // access; the *mut pointer is downgraded to *const for read-only use.
+        let (telemetry_state_lock, telemetry) =
+            unsafe { KernelState::telemetry_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let telemetry_state_lock = unsafe { &*telemetry_state_lock };
+        let _guard = telemetry_state_lock.lock();
+        let telemetry: &KernelStorage<TelemetrySubsystem> = unsafe { &*(telemetry as *const _) };
+        f(kernel_ref(telemetry))
+    }
+
+    pub fn tlb_shootdown_count_split_read(&self) -> u64 {
+        // Stage 4T+5 split-read: reads tlb_shootdown_count under telemetry_state_lock (rank 10).
+        // Does not acquire the outer SharedKernel lock.
+        self.with_telemetry_split_read(|telemetry| telemetry.tlb_shootdown_count)
+    }
+
+    pub fn tlb_shootdown_timeout_count_split_read(&self) -> u64 {
+        // Stage 4T+5 split-read: reads tlb_shootdown_timeout_count under telemetry_state_lock (rank 10).
+        // Does not acquire the outer SharedKernel lock.
+        self.with_telemetry_split_read(|telemetry| telemetry.tlb_shootdown_timeout_count)
     }
 
     pub fn ipc_recv_with_deadline_split_bridge(
@@ -491,6 +555,98 @@ mod tests {
         assert_eq!(
             err,
             TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::MissingRight)
+        );
+    }
+
+    // ── Stage 4T+5 split-read helpers ─────────────────────────────────────────
+
+    #[test]
+    fn fault_split_read_helpers_match_kernel_state_accessors() {
+        use crate::kernel::trap::{FaultAccess, FaultInfo};
+        use crate::kernel::vm::VirtAddr;
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+
+        // Initially no fault recorded.
+        assert_eq!(kernel.last_fault_split_read(), None);
+        assert_eq!(kernel.last_fault_frame_split_read(), None);
+
+        let fault = FaultInfo { addr: VirtAddr(0xDEAD_0000), access: FaultAccess::Write };
+        kernel.record_fault_split_mut(fault);
+
+        // Split-read must match the global-lock read.
+        assert_eq!(
+            kernel.last_fault_split_read(),
+            kernel.with(|state| state.last_fault()),
+            "last_fault_split_read must match kernel.with last_fault after record"
+        );
+        assert_eq!(kernel.last_fault_split_read(), Some(fault));
+
+        let mut frame = TrapFrame::new(11, [1, 2, 3, 4, 5, 6]);
+        frame.set_saved_pc(0x6000);
+        frame.set_saved_sp(0xA000);
+        kernel.record_fault_frame_snapshot_split_mut(&frame);
+
+        assert_eq!(
+            kernel.last_fault_frame_split_read(),
+            kernel.with(|state| state.last_fault_frame()),
+            "last_fault_frame_split_read must match kernel.with last_fault_frame after snapshot"
+        );
+        assert!(kernel.last_fault_frame_split_read().is_some());
+
+        // After clear: both split-read and global-lock read return None.
+        kernel.clear_last_fault_split_mut();
+        assert_eq!(kernel.last_fault_split_read(), None);
+        assert_eq!(kernel.with(|state| state.last_fault()), None);
+    }
+
+    #[test]
+    fn fault_policy_split_read_matches_kernel_state_accessor() {
+        use crate::kernel::task::FaultPolicy;
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let expected = kernel.with(|state| state.fault_policy());
+        let split = kernel.fault_policy_split_read();
+        assert_eq!(
+            split, expected,
+            "fault_policy_split_read must match kernel.with fault_policy"
+        );
+        // Default policy must be KillTask.
+        assert_eq!(split, FaultPolicy::KillTask);
+    }
+
+    #[test]
+    fn telemetry_split_read_helpers_match_kernel_state_accessors() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+
+        let (count0, timeout0) = kernel.with(|state| {
+            (state.tlb_shootdown_count(), state.tlb_shootdown_timeout_count())
+        });
+
+        // Initial values match.
+        assert_eq!(kernel.tlb_shootdown_count_split_read(), count0);
+        assert_eq!(kernel.tlb_shootdown_timeout_count_split_read(), timeout0);
+
+        // After mutations via split_mut, split_read sees the updated values.
+        kernel.increment_tlb_shootdown_count_split_mut();
+        kernel.add_tlb_shootdown_timeout_count_split_mut(5);
+
+        assert_eq!(kernel.tlb_shootdown_count_split_read(), count0.wrapping_add(1));
+        assert_eq!(
+            kernel.tlb_shootdown_timeout_count_split_read(),
+            timeout0.wrapping_add(5)
+        );
+
+        // Split-read matches global-lock read.
+        assert_eq!(
+            kernel.tlb_shootdown_count_split_read(),
+            kernel.with(|state| state.tlb_shootdown_count()),
+            "tlb_shootdown_count split_read must match global read"
+        );
+        assert_eq!(
+            kernel.tlb_shootdown_timeout_count_split_read(),
+            kernel.with(|state| state.tlb_shootdown_timeout_count()),
+            "tlb_shootdown_timeout_count split_read must match global read"
         );
     }
 }
