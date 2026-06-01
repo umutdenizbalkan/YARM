@@ -2113,6 +2113,130 @@ Task 1 (requester) blocks recv-v2 on the reply endpoint; task 2 (replier) issues
 
 ---
 
+### Stage 4Q: synchronous-endpoint send Phase 1–6 lock-discipline normalization
+
+**Implemented**: 2026-06-01. Affects `ipc_send_with_optional_deadline` in
+`src/kernel/boot/ipc_state.rs`.
+
+#### Motivation
+
+The `EndpointMode::Synchronous` send path in `ipc_send_with_optional_deadline`
+previously accessed `self.ipc.endpoint_waiters`, `self.ipc.endpoints`, and
+`self.ipc.telemetry` directly — under the global `SharedKernel` lock only,
+never under `ipc_state_lock`.  The waiter slot was cleared by `wake_waiter_for_endpoint`
+which also directly mutated `self.ipc.endpoint_waiters` without `with_ipc_state_mut`.
+`switch_to_runnable_tid` (a busy-loop over `yield_current`) was used for the handoff.
+
+Stage 4Q applies the same Phase 1–6 discipline already established for `ipc_reply`
+(Stage 4M/4N) and `handle_ipc_call` (Stage 4L):
+- endpoint/waiter mutations under `ipc_state_lock` via `with_ipc_state_mut`
+- user-memory writes outside all locks
+- scheduler wake/handoff outside all locks
+
+The busy-loop `switch_to_runnable_tid` is replaced by the one-shot
+`apply_scheduler_handoff_plan(YieldTo(tid))` → `yield_current_to(tid)`, introduced
+in Session 4 (`yield_current_to`).
+
+#### Protocol (Phase 0–6)
+
+```
+Phase 0  with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].map(|e| e.mode()))
+           → snapshot endpoint mode under ipc_state_lock — no mutation
+
+Phase 1  with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx])
+           → snapshot waiter TID under ipc_state_lock — no mutation
+
+Phase 2  with_tcbs(|tcbs| { ... recv_abi == RecvV2 ... })
+           → check recv-v2 under task_state_lock (rank 3), OUTSIDE ipc_state_lock (rank 4)
+
+Phase 3  complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)   [recv-v2 path only]
+           → runs OUTSIDE all locks (TrapFrame / user-memory write)
+           → on failure: return Err(KernelError::UserMemoryFault) — no waiter orphan
+             (waiter slot not yet cleared; Phase 4 is skipped on error)
+
+Phase 4  ipc_try_send_sync_endpoint_only(endpoint_idx, waiter_tid, msg, recv_v2_completed)
+           → under with_ipc_state_mut (ipc_state_lock, rank 4)
+           → re-verifies endpoint_waiters[endpoint_idx] == Some(waiter_tid)
+             (defence-in-depth; always matches under global kernel lock)
+           → legacy path only: endpoint.send(msg) to enqueue into queue
+           → clears endpoint_waiters[endpoint_idx] = None
+           → bumps telemetry.rendezvous_handoffs
+           → returns SchedulerWakePlan::Wake(waiter_tid)
+
+Phase 5  apply_scheduler_wake_plan(Wake(waiter_tid))
+           → OUTSIDE ipc_state_lock
+           → wake_tid_to_runnable: sets task Runnable, enqueues on scheduler runqueue
+
+Phase 6  apply_scheduler_handoff_plan(YieldTo(waiter_tid))
+           → OUTSIDE ipc_state_lock
+           → yield_current_to(waiter_tid): one-shot preempt via on_preempt_prefer
+             makes waiter_tid current, re-enqueues sender at tail of runqueue
+```
+
+If Phase 1 returns `None` (no waiter), the code falls through to
+`block_current_on_send_with_deadline` (blocking path) unchanged.
+
+If Phase 3 fails (`complete_blocked_recv_for_waiter` error), Phase 4 is skipped
+entirely — the waiter slot is still populated, so the waiter is not orphaned.
+
+#### Lock contract (Stage 4Q)
+
+- No `ipc_state_lock` held during: recv-v2 TrapFrame write (Phase 3),
+  `task_state_lock` acquisition (Phase 2), or scheduler mutation (Phase 5–6).
+- Lock ordering: `task_state_lock` (rank 3) → `ipc_state_lock` (rank 4).
+  Phases 2, 3, 4 are sequentially non-overlapping (Phase 2 under task lock,
+  Phase 3 outside all locks, Phase 4 under ipc lock).
+- `ipc_state_lock` entered at Phase 0 (mode snapshot), Phase 1 (waiter snapshot),
+  and Phase 4 (`ipc_try_send_sync_endpoint_only`) — all non-nested.
+- Telemetry mutations (`fastpath_attempts`, `fastpath_switches`,
+  `scheduler_fastpath_handoffs`, `blocked_sends`) moved into `with_ipc_state_mut`
+  closures.
+
+#### New helper
+
+`ipc_try_send_sync_endpoint_only(endpoint_idx, expected_receiver_tid, msg, recv_v2_completed)`
+(`src/kernel/boot/ipc_state.rs`):
+- Called from `ipc_send_with_optional_deadline` at Phase 4.
+- Under `with_ipc_state_mut`: re-verify waiter, optionally enqueue message (legacy),
+  clear waiter slot, bump telemetry.
+- Returns `Result<SchedulerWakePlan, KernelError>`.
+
+#### Tests (Stage 4Q)
+
+Three new unit tests in `src/kernel/boot/tests.rs`:
+
+- `sync_endpoint_phase4_helper_delivers_legacy_message_under_ipc_state_lock`:
+  parks a legacy receiver on a sync endpoint; calls `ipc_try_send_sync_endpoint_only`
+  directly with `recv_v2_completed=false`; asserts waiter slot cleared, message
+  enqueued in endpoint queue, `Wake(80)` returned, `rendezvous_handoffs == 1`.
+
+- `sync_endpoint_phase4_helper_skips_enqueue_when_recv_v2_completed`:
+  same setup with `recv_v2_completed=true`; asserts waiter slot cleared, endpoint
+  queue empty (message already delivered via TrapFrame), `Wake(81)` returned.
+
+- `sync_endpoint_phase4_helper_rejects_mismatched_waiter`:
+  parks receiver, manually clears the waiter slot to simulate a timeout race,
+  calls `ipc_try_send_sync_endpoint_only`; asserts `Err(WrongObject)` — no orphan.
+
+Existing tests that exercise the full sync endpoint send path
+(`yield_current_to_is_single_step_for_ipc_handoff`,
+`synchronous_endpoint_blocked_send_updates_telemetry`,
+`ipc_fastpath_blocked_path_is_measured_without_switch`) continue to pass (508/0).
+
+#### What Stage 4Q does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback: unchanged.
+- Phase 3B checks: not weakened.
+- Timeout/deadline blocking path: unchanged.
+- Reply-cap and FLAG_CAP_TRANSFER semantics: unchanged (both pass through
+  `complete_blocked_recv_for_waiter` or `endpoint.send` as before).
+- The global `SharedKernel` lock is still retained.  **This is not full global-lock removal.**
+
+---
+
 ### Current live / deferred IPC split matrix
 
 | Syscall path | Condition | Status | Telemetry counter |
@@ -2132,7 +2256,9 @@ Task 1 (requester) blocks recv-v2 on the reply endpoint; task 2 (replier) issues
 | IpcSend/IpcCall to non-recv-v2 receiver (ReceiverWaiterFound) | Receiver waiter, not recv-v2 | **Deferred** (falls to ipc_send) | — |
 | IpcSend with FLAG_CAP_TRANSFER/PLAIN (no receiver waiter, buffered) | No receiver, buffered endpoint, FLAG_CAP_TRANSFER or FLAG_CAP_TRANSFER_PLAIN | **Live** Stage 4E (extended) | `queued_sends`, `cap_transfer_stage4e_enqueued` |
 | IpcSend/IpcCall with FLAG_CAP_TRANSFER to non-recv-v2 receiver | FLAG_CAP_TRANSFER, non-recv-v2 receiver present | **Deferred** (falls to ipc_send) | — |
-| IpcSend/IpcCall to synchronous endpoint (no waiter) | Synchronous mode | **Deferred** (Ineligible) | — |
+| IpcSend to synchronous endpoint with receiver waiter (legacy) | Synchronous mode, waiter present, not recv-v2 | **Live** Stage 4Q | `rendezvous_handoffs`, `fastpath_switches` |
+| IpcSend to synchronous endpoint with receiver waiter (recv-v2) | Synchronous mode, waiter present, recv-v2 | **Live** Stage 4Q | `rendezvous_handoffs`, `fastpath_switches` |
+| IpcSend/IpcCall to synchronous endpoint (no waiter) | Synchronous mode, no waiter | **Deferred** (blocking send) | `blocked_sends` |
 | IpcReply to non-recv-v2 requester | Queue enqueue path | **Deferred** (enqueue+wake) | — |
 | MemoryObject zero-copy, VFS shared-reply | Phase 3B / VFS gate | **Deferred indefinitely** | — |
 
@@ -2144,23 +2270,11 @@ The following send/receive cases are explicitly deferred. They cannot be split
 without violating the hard invariants on `ipc_state_lock` scope. They fall back
 to the existing full IPC paths via `Ineligible(...)`.
 
-#### Synchronous endpoint send-to-receiver (deferred)
+#### Synchronous endpoint send-to-receiver (implemented — Stage 4Q)
 
-**Blocker**: `ipc_send_with_optional_deadline` for `EndpointMode::Synchronous` calls
-`switch_to_runnable_tid(waiter_tid)` (`src/kernel/boot/task_core_state.rs:7`).
-`switch_to_runnable_tid` busy-loops calling `yield_current()` until
-`current_tid_on(cpu) == waiter_tid` — a scheduler context switch that:
-- mutates scheduler runqueues and TCB run-state
-- may preempt the current thread
-- cannot be decomposed into a lock-free pre-check + deferred wake
-
-Any split-path version would need to clear the receiver's endpoint waiter slot
-under `ipc_state_lock` before calling `switch_to_runnable_tid`. If the scheduler
-handoff then fails or races, the waiter is orphaned with no recovery path.
-
-**Decision**: deferred indefinitely. Synchronous sends remain on the full path.
-The Stage 4F buffered-path split intentionally excludes non-buffered endpoints
-(`Ineligible(NonBufferedEndpoint)`).
+**Previously deferred** because `switch_to_runnable_tid` (a busy-loop) was called
+while `self.ipc` was accessed directly (no `ipc_state_lock`). Stage 4Q resolves
+this: see §Stage 4Q below.
 
 #### Stage 4E extension: FLAG_CAP_TRANSFER/PLAIN buffered no-receiver enqueue (live)
 
