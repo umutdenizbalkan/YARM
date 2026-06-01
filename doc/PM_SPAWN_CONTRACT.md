@@ -46,6 +46,10 @@ image_ids ≥ 4 use `SpawnFromInitramfsFile` (syscall nr=26) via
 `pm_vfs_spawn_inline`. image_ids 1–3 use the direct kernel spawn backend.
 image_id=0 is rejected by PM — it is never spawned from userspace.
 
+`SpawnFromInitramfsFile` is a privileged kernel-extension slot, not part of the
+public user syscall count/range. See `SYSCALL_ABI.md` for the public ABI vs.
+kernel dispatch-table split and the full privileged syscall table.
+
 ---
 
 ## Startup Slot Layout (0–17)
