@@ -172,6 +172,19 @@ macro_rules! install {
                     if payload_end <= block_end {
                         let alloc_header_addr = payload_start - ALLOC_HEADER_SIZE;
 
+                        // High-align requests can create a sizable gap between the free block's
+                        // header and the allocation header. If the gap is large enough to be a
+                        // useful free block, split it off instead of trapping it inside the active
+                        // allocation until dealloc. Smaller gaps stay in the allocation block so
+                        // the free list never contains an unusable fragment.
+                        let leading = alloc_header_addr - block_start;
+                        let front_split = leading >= MIN_SPLIT;
+                        let alloc_block_start = if front_split {
+                            alloc_header_addr
+                        } else {
+                            block_start
+                        };
+
                         // Bug fix #2: align the split point to align_of::<BlockHeader>()
                         // so the new free-block header is never written through a
                         // misaligned pointer (UB; bus-error on strict-alignment arches
@@ -181,46 +194,49 @@ macro_rules! install {
                         else {
                             return null_mut();
                         };
-                        let remaining = if split_at <= block_end {
+                        let tail_remaining = if split_at <= block_end {
                             block_end - split_at
                         } else {
                             0
                         };
+                        let tail_split = tail_remaining >= MIN_SPLIT;
+                        let alloc_block_end = if tail_split { split_at } else { block_end };
                         let next = unsafe { (*cur).next };
 
-                        // Bug fix #1: when no split happens the allocation owns the
-                        // ENTIRE original block (whole block removed from free list).
-                        // Storing payload_end-block_start here would permanently leak
-                        // the tail bytes because dealloc only restores block_size bytes.
-                        let alloc_block_size;
+                        if front_split {
+                            unsafe {
+                                (*cur).size = leading;
+                            }
+                        }
 
-                        if remaining >= MIN_SPLIT {
+                        let tail_free = if tail_split {
                             let new_free = split_at as *mut BlockHeader;
                             unsafe {
-                                (*new_free).size = remaining;
+                                (*new_free).size = tail_remaining;
                                 (*new_free).next = next;
                             }
-                            if prev.is_null() {
-                                unsafe { *self.free.get() = new_free };
-                            } else {
-                                unsafe { (*prev).next = new_free };
-                            }
-                            // Allocation owns [block_start, split_at).
-                            alloc_block_size = split_at - block_start;
+                            new_free
                         } else {
-                            // No split: allocation owns the full original block.
+                            next
+                        };
+
+                        if front_split {
+                            unsafe { (*cur).next = tail_free };
                             if prev.is_null() {
-                                unsafe { *self.free.get() = next };
+                                unsafe { *self.free.get() = cur };
                             } else {
-                                unsafe { (*prev).next = next };
+                                unsafe { (*prev).next = cur };
                             }
-                            alloc_block_size = unsafe { (*cur).size };
+                        } else if prev.is_null() {
+                            unsafe { *self.free.get() = tail_free };
+                        } else {
+                            unsafe { (*prev).next = tail_free };
                         }
 
                         let alloc_header = alloc_header_addr as *mut AllocHeader;
                         unsafe {
-                            (*alloc_header).block_start = block_start;
-                            (*alloc_header).block_size = alloc_block_size;
+                            (*alloc_header).block_start = alloc_block_start;
+                            (*alloc_header).block_size = alloc_block_end - alloc_block_start;
                         }
 
                         return payload_start as *mut u8;
@@ -461,6 +477,42 @@ mod tests {
             block_end <= heap_end
         }
 
+        fn free_blocks(&self) -> std::vec::Vec<(usize, usize)> {
+            let mut blocks = std::vec::Vec::new();
+            let mut cur = self.free_head;
+            while !cur.is_null() {
+                blocks.push((cur as usize, unsafe { (*cur).size }));
+                cur = unsafe { (*cur).next };
+            }
+            blocks
+        }
+
+        fn alloc_header_for(&self, ptr: *mut u8) -> AHdr {
+            assert!(self.ptr_may_have_alloc_header(ptr));
+            let ah_addr = (ptr as usize).checked_sub(ALLOC_HDR_SIZE).unwrap();
+            let ah = ah_addr as *const AHdr;
+            AHdr {
+                block_start: unsafe { (*ah).block_start },
+                block_size: unsafe { (*ah).block_size },
+            }
+        }
+
+        fn front_split_layout(&self, size: usize) -> (Layout, usize) {
+            let block_start = self.free_head as usize;
+            let block_end = block_start + unsafe { (*self.free_head).size };
+            for align in [64usize, 128, 256, 512, 1024, 2048, 4096, 8192, 16_384] {
+                let payload_start =
+                    checked_align_up(block_start + HEADER_SIZE + ALLOC_HDR_SIZE, align)
+                        .expect("align");
+                let alloc_header_addr = payload_start - ALLOC_HDR_SIZE;
+                let leading = alloc_header_addr - block_start;
+                if leading >= MIN_SPLIT && payload_start + size <= block_end {
+                    return (Layout::from_size_align(size, align).unwrap(), leading);
+                }
+            }
+            panic!("could not find front-splitting alignment for test heap");
+        }
+
         unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
             let request_align = layout.align().max(align_of::<usize>());
             let mut prev: *mut BHdr = core::ptr::null_mut();
@@ -486,47 +538,59 @@ mod tests {
 
                 if payload_end <= block_end {
                     let alloc_header_addr = payload_start - ALLOC_HDR_SIZE;
+                    let leading = alloc_header_addr - block_start;
+                    let front_split = leading >= MIN_SPLIT;
+                    let alloc_block_start = if front_split {
+                        alloc_header_addr
+                    } else {
+                        block_start
+                    };
 
                     // Bug fix #2: align split point to BHdr alignment.
                     let Some(split_at) = checked_align_up(payload_end, align_of::<BHdr>()) else {
                         return core::ptr::null_mut();
                     };
-                    let remaining = if split_at <= block_end {
+                    let tail_remaining = if split_at <= block_end {
                         block_end - split_at
                     } else {
                         0
                     };
+                    let tail_split = tail_remaining >= MIN_SPLIT;
+                    let alloc_block_end = if tail_split { split_at } else { block_end };
                     let next = unsafe { (*cur).next };
 
-                    // Bug fix #1: no-split path records the full original block size.
-                    let alloc_block_size;
+                    if front_split {
+                        unsafe { (*cur).size = leading };
+                    }
 
-                    if remaining >= MIN_SPLIT {
+                    let tail_free = if tail_split {
                         let new_free = split_at as *mut BHdr;
                         unsafe {
-                            (*new_free).size = remaining;
+                            (*new_free).size = tail_remaining;
                             (*new_free).next = next;
                         }
-                        if prev.is_null() {
-                            self.free_head = new_free;
-                        } else {
-                            unsafe { (*prev).next = new_free };
-                        }
-                        alloc_block_size = split_at - block_start;
+                        new_free
                     } else {
+                        next
+                    };
+
+                    if front_split {
+                        unsafe { (*cur).next = tail_free };
                         if prev.is_null() {
-                            self.free_head = next;
+                            self.free_head = cur;
                         } else {
-                            unsafe { (*prev).next = next };
+                            unsafe { (*prev).next = cur };
                         }
-                        // Full original block — do NOT store payload_end-block_start.
-                        alloc_block_size = unsafe { (*cur).size };
+                    } else if prev.is_null() {
+                        self.free_head = tail_free;
+                    } else {
+                        unsafe { (*prev).next = tail_free };
                     }
 
                     let ah = alloc_header_addr as *mut AHdr;
                     unsafe {
-                        (*ah).block_start = block_start;
-                        (*ah).block_size = alloc_block_size;
+                        (*ah).block_start = alloc_block_start;
+                        (*ah).block_size = alloc_block_end - alloc_block_start;
                     }
 
                     return payload_start as *mut u8;
@@ -902,6 +966,85 @@ mod tests {
             assert_eq!((p as usize) % align, 0, "alignment violated");
             unsafe { a.dealloc(p) };
         }
+    }
+
+    #[test]
+    fn high_align_front_split_creates_front_free_block_and_tail() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let free_start = a.free_head as usize;
+        let free_at_start = a.total_free_bytes();
+        let (layout, leading) = a.front_split_layout(128);
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null());
+        assert_eq!((p as usize) % layout.align(), 0);
+
+        let header = a.alloc_header_for(p);
+        assert_eq!(header.block_start, (p as usize) - ALLOC_HDR_SIZE);
+        assert_eq!(header.block_start - free_start, leading);
+        let blocks = a.free_blocks();
+        assert_eq!(blocks.len(), 2, "front and tail free blocks should remain");
+        assert_eq!(blocks[0], (free_start, leading));
+        assert_eq!(a.total_free_bytes() + header.block_size, free_at_start);
+
+        unsafe { a.dealloc(p) };
+        assert_eq!(a.free_block_count(), 1);
+        assert_eq!(a.total_free_bytes(), free_at_start);
+    }
+
+    #[test]
+    fn small_leading_padding_stays_in_allocation_until_dealloc() {
+        const HEAP: usize = 4096;
+        let mut a = TestFreeList::new(HEAP);
+        let free_start = a.free_head as usize;
+        let free_at_start = a.total_free_bytes();
+        let layout = Layout::from_size_align(64, align_of::<usize>()).unwrap();
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null());
+        let header = a.alloc_header_for(p);
+        let leading = (p as usize) - ALLOC_HDR_SIZE - free_start;
+        assert!(leading < MIN_SPLIT);
+        assert_eq!(header.block_start, free_start);
+
+        unsafe { a.dealloc(p) };
+        assert_eq!(a.free_block_count(), 1);
+        assert_eq!(a.total_free_bytes(), free_at_start);
+    }
+
+    #[test]
+    fn front_split_tail_split_preserves_full_coverage() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let free_at_start = a.total_free_bytes();
+        let (layout, _) = a.front_split_layout(1024);
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null());
+        let header = a.alloc_header_for(p);
+        let blocks = a.free_blocks();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "front split should coexist with tail split"
+        );
+        assert_eq!(a.total_free_bytes() + header.block_size, free_at_start);
+        assert_eq!(blocks[0].0 + blocks[0].1, header.block_start);
+        assert_eq!(header.block_start + header.block_size, blocks[1].0);
+
+        unsafe { a.dealloc(p) };
+        assert_eq!(a.free_block_count(), 1);
+        assert_eq!(a.total_free_bytes(), free_at_start);
+    }
+
+    #[test]
+    fn too_large_high_alignment_fails_without_corrupting_freelist() {
+        const HEAP: usize = 4096;
+        let mut a = TestFreeList::new(HEAP);
+        let free_at_start = a.total_free_bytes();
+        let layout = Layout::from_size_align(1, 1 << 20).unwrap();
+        let p = unsafe { a.alloc(layout) };
+        assert!(p.is_null());
+        assert_eq!(a.free_block_count(), 1);
+        assert_eq!(a.total_free_bytes(), free_at_start);
     }
 
     #[test]
