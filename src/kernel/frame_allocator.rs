@@ -18,12 +18,12 @@ const CONTIG_SIZE_CLASSES: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 #[cfg(not(feature = "hosted-dev"))]
 const CONTIG_SIZE_CLASSES: [usize; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
 
-// TODO(frame-allocator-scale): this fixed-array allocator is intentionally kept
-// small and auditable for the current boot/runtime boundary. A production-scale
-// design should move free extents into intrusive records stored in free physical
-// pages, replace the linear `frame_refs` table with an inverted page map or
-// radix refcount map, and remove the MAX_FREE_EXTENTS/MAX_TRACKED_FRAME_REFS
-// bottlenecks without weakening the rollback guarantees below.
+// TODO(frame-allocator-scale): the fixed hash table below removes the previous
+// linear phys→refcount scan, but it is still bounded by MAX_TRACKED_FRAME_REFS.
+// A production-scale design should size metadata from the boot RAM map: use an
+// inverted page map or radix metadata for O(1)/O(log n) shared-frame/COW/fork
+// lookups, and eventually move free extents into intrusive records stored in
+// free physical pages. Keep the rollback guarantees below when replacing this.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryRegion {
@@ -56,6 +56,23 @@ struct FrameRefCount {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameRefSlot {
+    Empty,
+    Tombstone,
+    Occupied(FrameRefCount),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FrameRefTelemetry {
+    lookup_probes_total: u64,
+    lookup_max_probes: usize,
+    lookup_misses: u64,
+    insert_probes_total: u64,
+    insert_max_probes: usize,
+    insert_capacity_failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysicalFrameAllocator {
     base_phys: u64,
     end_phys_exclusive: u64,
@@ -66,7 +83,8 @@ pub struct PhysicalFrameAllocator {
     largest_free_run_pages: usize,
     run_hint_by_class: [Option<usize>; CONTIG_SIZE_CLASSES.len()],
     single_page_hint_idx: Option<usize>,
-    frame_refs: [Option<FrameRefCount>; MAX_TRACKED_FRAME_REFS],
+    frame_refs: [FrameRefSlot; MAX_TRACKED_FRAME_REFS],
+    frame_ref_telemetry: FrameRefTelemetry,
 }
 
 impl PhysicalFrameAllocator {
@@ -81,7 +99,15 @@ impl PhysicalFrameAllocator {
             largest_free_run_pages: 0,
             run_hint_by_class: [const { None }; CONTIG_SIZE_CLASSES.len()],
             single_page_hint_idx: None,
-            frame_refs: [const { None }; MAX_TRACKED_FRAME_REFS],
+            frame_refs: [const { FrameRefSlot::Empty }; MAX_TRACKED_FRAME_REFS],
+            frame_ref_telemetry: FrameRefTelemetry {
+                lookup_probes_total: 0,
+                lookup_max_probes: 0,
+                lookup_misses: 0,
+                insert_probes_total: 0,
+                insert_max_probes: 0,
+                insert_capacity_failures: 0,
+            },
         }
     }
 
@@ -115,7 +141,8 @@ impl PhysicalFrameAllocator {
         self.largest_free_run_pages = 0;
         self.run_hint_by_class = [const { None }; CONTIG_SIZE_CLASSES.len()];
         self.single_page_hint_idx = None;
-        self.frame_refs = [const { None }; MAX_TRACKED_FRAME_REFS];
+        self.frame_refs = [const { FrameRefSlot::Empty }; MAX_TRACKED_FRAME_REFS];
+        self.frame_ref_telemetry = FrameRefTelemetry::default();
 
         for region in regions {
             if !region.usable || region.len == 0 {
@@ -375,8 +402,11 @@ impl PhysicalFrameAllocator {
     pub fn frame_refcount(&self, phys: u64) -> Result<u16, FrameAllocError> {
         self.frame_index(phys)?;
         Ok(self
-            .frame_ref_slot(phys)
-            .map(|idx| self.frame_refs[idx].expect("ref slot").refs)
+            .frame_ref_slot_readonly(phys)
+            .map(|idx| match self.frame_refs[idx] {
+                FrameRefSlot::Occupied(entry) => entry.refs,
+                FrameRefSlot::Empty | FrameRefSlot::Tombstone => 0,
+            })
             .unwrap_or(0))
     }
 
@@ -401,20 +431,109 @@ impl PhysicalFrameAllocator {
         Ok(((phys - self.base_phys) / PAGE_SIZE_U64) as usize)
     }
 
-    fn frame_ref_slot(&self, phys: u64) -> Option<usize> {
-        self.frame_refs
-            .iter()
-            .position(|slot| slot.is_some_and(|entry| entry.phys == phys))
+    fn frame_ref_hash(&self, phys: u64) -> usize {
+        let page = phys / PAGE_SIZE_U64;
+        (page.wrapping_mul(11_400_714_819_323_198_485u64) as usize) % MAX_TRACKED_FRAME_REFS
+    }
+
+    fn record_frame_ref_lookup(&mut self, probes: usize, found: bool) {
+        self.frame_ref_telemetry.lookup_probes_total = self
+            .frame_ref_telemetry
+            .lookup_probes_total
+            .saturating_add(probes as u64);
+        self.frame_ref_telemetry.lookup_max_probes =
+            self.frame_ref_telemetry.lookup_max_probes.max(probes);
+        if !found {
+            self.frame_ref_telemetry.lookup_misses =
+                self.frame_ref_telemetry.lookup_misses.saturating_add(1);
+        }
+    }
+
+    fn record_frame_ref_insert(&mut self, probes: usize, capacity_failed: bool) {
+        self.frame_ref_telemetry.insert_probes_total = self
+            .frame_ref_telemetry
+            .insert_probes_total
+            .saturating_add(probes as u64);
+        self.frame_ref_telemetry.insert_max_probes =
+            self.frame_ref_telemetry.insert_max_probes.max(probes);
+        if capacity_failed {
+            self.frame_ref_telemetry.insert_capacity_failures = self
+                .frame_ref_telemetry
+                .insert_capacity_failures
+                .saturating_add(1);
+        }
+    }
+
+    fn frame_ref_slot_readonly(&self, phys: u64) -> Option<usize> {
+        let start = self.frame_ref_hash(phys);
+        for probe in 0..MAX_TRACKED_FRAME_REFS {
+            let idx = (start + probe) % MAX_TRACKED_FRAME_REFS;
+            match self.frame_refs[idx] {
+                FrameRefSlot::Empty => return None,
+                FrameRefSlot::Tombstone => continue,
+                FrameRefSlot::Occupied(entry) if entry.phys == phys => return Some(idx),
+                FrameRefSlot::Occupied(_) => continue,
+            }
+        }
+        None
+    }
+
+    fn frame_ref_slot(&mut self, phys: u64) -> Option<usize> {
+        let start = self.frame_ref_hash(phys);
+        for probe in 0..MAX_TRACKED_FRAME_REFS {
+            let idx = (start + probe) % MAX_TRACKED_FRAME_REFS;
+            match self.frame_refs[idx] {
+                FrameRefSlot::Empty => {
+                    self.record_frame_ref_lookup(probe + 1, false);
+                    return None;
+                }
+                FrameRefSlot::Tombstone => continue,
+                FrameRefSlot::Occupied(entry) if entry.phys == phys => {
+                    self.record_frame_ref_lookup(probe + 1, true);
+                    return Some(idx);
+                }
+                FrameRefSlot::Occupied(_) => continue,
+            }
+        }
+        self.record_frame_ref_lookup(MAX_TRACKED_FRAME_REFS, false);
+        None
+    }
+
+    fn find_frame_ref_insert_slot(&mut self, phys: u64) -> Result<usize, FrameAllocError> {
+        let start = self.frame_ref_hash(phys);
+        let mut first_tombstone = None;
+        for probe in 0..MAX_TRACKED_FRAME_REFS {
+            let idx = (start + probe) % MAX_TRACKED_FRAME_REFS;
+            match self.frame_refs[idx] {
+                FrameRefSlot::Empty => {
+                    let insert_idx = first_tombstone.unwrap_or(idx);
+                    self.record_frame_ref_insert(probe + 1, false);
+                    return Ok(insert_idx);
+                }
+                FrameRefSlot::Tombstone => {
+                    if first_tombstone.is_none() {
+                        first_tombstone = Some(idx);
+                    }
+                }
+                FrameRefSlot::Occupied(entry) if entry.phys == phys => {
+                    self.record_frame_ref_insert(probe + 1, false);
+                    return Err(FrameAllocError::AlreadyFree);
+                }
+                FrameRefSlot::Occupied(_) => {}
+            }
+        }
+        if let Some(idx) = first_tombstone {
+            self.record_frame_ref_insert(MAX_TRACKED_FRAME_REFS, false);
+            Ok(idx)
+        } else {
+            self.record_frame_ref_insert(MAX_TRACKED_FRAME_REFS, true);
+            Err(FrameAllocError::CapacityExceeded)
+        }
     }
 
     fn track_new_frame_ref(&mut self, phys: u64) -> Result<(), FrameAllocError> {
-        if self.frame_ref_slot(phys).is_some() {
-            return Err(FrameAllocError::AlreadyFree);
-        }
-        let Some(slot) = self.frame_refs.iter_mut().find(|entry| entry.is_none()) else {
-            return Err(FrameAllocError::CapacityExceeded);
-        };
-        *slot = Some(FrameRefCount { phys, refs: 1 });
+        let slot = self.find_frame_ref_insert_slot(phys)?;
+        self.frame_refs[slot] = FrameRefSlot::Occupied(FrameRefCount { phys, refs: 1 });
         Ok(())
     }
 
@@ -422,9 +541,11 @@ impl PhysicalFrameAllocator {
         let Some(slot) = self.frame_ref_slot(phys) else {
             return Err(FrameAllocError::AlreadyFree);
         };
-        let mut entry = self.frame_refs[slot].expect("slot");
+        let FrameRefSlot::Occupied(mut entry) = self.frame_refs[slot] else {
+            return Err(FrameAllocError::AlreadyFree);
+        };
         entry.refs = entry.refs.saturating_add(1);
-        self.frame_refs[slot] = Some(entry);
+        self.frame_refs[slot] = FrameRefSlot::Occupied(entry);
         Ok(entry.refs)
     }
 
@@ -432,13 +553,15 @@ impl PhysicalFrameAllocator {
         let Some(slot) = self.frame_ref_slot(phys) else {
             return Err(FrameAllocError::AlreadyFree);
         };
-        let mut entry = self.frame_refs[slot].expect("slot");
+        let FrameRefSlot::Occupied(mut entry) = self.frame_refs[slot] else {
+            return Err(FrameAllocError::AlreadyFree);
+        };
         if entry.refs > 1 {
             entry.refs -= 1;
-            self.frame_refs[slot] = Some(entry);
+            self.frame_refs[slot] = FrameRefSlot::Occupied(entry);
             return Ok(entry.refs);
         }
-        self.frame_refs[slot] = None;
+        self.frame_refs[slot] = FrameRefSlot::Tombstone;
         Ok(0)
     }
 
@@ -514,11 +637,16 @@ impl PhysicalFrameAllocator {
     }
 
     fn has_free_frame_ref_slot(&self) -> bool {
-        self.frame_refs.iter().any(Option::is_none)
+        self.frame_refs
+            .iter()
+            .any(|slot| !matches!(slot, FrameRefSlot::Occupied(_)))
     }
 
     fn free_frame_ref_slots(&self) -> usize {
-        self.frame_refs.iter().filter(|entry| entry.is_none()).count()
+        self.frame_refs
+            .iter()
+            .filter(|slot| !matches!(slot, FrameRefSlot::Occupied(_)))
+            .count()
     }
 
     fn split_extent_for_allocation(
@@ -880,7 +1008,14 @@ mod tests {
             }
         }
 
-        let refs: Vec<FrameRefCount> = alloc.frame_refs.iter().filter_map(|entry| *entry).collect();
+        let refs: Vec<FrameRefCount> = alloc
+            .frame_refs
+            .iter()
+            .filter_map(|entry| match entry {
+                FrameRefSlot::Occupied(frame_ref) => Some(*frame_ref),
+                FrameRefSlot::Empty | FrameRefSlot::Tombstone => None,
+            })
+            .collect();
         assert_eq!(
             refs.len(),
             alloc.total_frames.saturating_sub(alloc.free_frames),
@@ -898,6 +1033,25 @@ mod tests {
                 assert_ne!(entry.phys, other.phys, "duplicate frame_ref entry");
             }
         }
+    }
+
+    fn assert_allocator_state_eq_ignoring_telemetry(
+        left: &PhysicalFrameAllocator,
+        right: &PhysicalFrameAllocator,
+    ) {
+        let mut left = *left;
+        let mut right = *right;
+        left.frame_ref_telemetry = FrameRefTelemetry::default();
+        right.frame_ref_telemetry = FrameRefTelemetry::default();
+        assert_eq!(left, right);
+    }
+
+    fn tracked_ref_count(alloc: &PhysicalFrameAllocator) -> usize {
+        alloc
+            .frame_refs
+            .iter()
+            .filter(|entry| matches!(entry, FrameRefSlot::Occupied(_)))
+            .count()
     }
 
     #[test]
@@ -1191,7 +1345,7 @@ mod tests {
             alloc.reserve_frame(0x7200_1000),
             Err(FrameAllocError::CapacityExceeded)
         );
-        assert_eq!(alloc, before);
+        assert_allocator_state_eq_ignoring_telemetry(&alloc, &before);
         assert_allocator_invariants(&alloc);
     }
 
@@ -1287,7 +1441,7 @@ mod tests {
                 pages: 1,
             });
         }
-        alloc.frame_refs[0] = Some(FrameRefCount {
+        alloc.frame_refs[0] = FrameRefSlot::Occupied(FrameRefCount {
             phys: alloc.base_phys,
             refs: 1,
         });
@@ -1298,7 +1452,88 @@ mod tests {
             alloc.free_contiguous(alloc.base_phys, 1),
             Err(FrameAllocError::CapacityExceeded)
         );
-        assert_eq!(alloc, before);
+        assert_allocator_state_eq_ignoring_telemetry(&alloc, &before);
+    }
+
+    #[test]
+    fn frame_ref_hash_tracks_many_unique_frames_with_bounded_probes() {
+        let pages = MAX_TRACKED_FRAME_REFS.min(128);
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc
+            .init_from_memory_map(&[MemoryRegion {
+                start: 0x7700_0000,
+                len: (pages as u64) * PAGE_SIZE_U64,
+                usable: true,
+            }])
+            .expect("init");
+
+        let base = alloc.alloc_contiguous(pages).expect("alloc many");
+        assert_eq!(tracked_ref_count(&alloc), pages);
+        assert!(alloc.frame_ref_telemetry.insert_probes_total >= pages as u64);
+        assert!(alloc.frame_ref_telemetry.insert_max_probes >= 1);
+        assert_allocator_invariants(&alloc);
+
+        alloc.free_contiguous(base, pages).expect("free many");
+        assert_eq!(tracked_ref_count(&alloc), 0);
+        assert_allocator_invariants(&alloc);
+    }
+
+    #[test]
+    fn frame_ref_hash_handles_collision_heavy_inc_dec_and_tombstones() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc.base_phys = 0;
+        alloc.end_phys_exclusive = (MAX_TRACKED_FRAME_REFS as u64) * PAGE_SIZE_U64 * 64;
+        alloc.total_frames = 32;
+        alloc.free_frames = 0;
+        alloc.initialized = true;
+        let colliding = MAX_TRACKED_FRAME_REFS.min(32);
+
+        for idx in 0..colliding {
+            let phys = (idx as u64) * (MAX_TRACKED_FRAME_REFS as u64) * PAGE_SIZE_U64;
+            alloc.track_new_frame_ref(phys).expect("track collision");
+        }
+        assert!(alloc.frame_ref_telemetry.insert_max_probes >= colliding);
+
+        let middle = ((colliding / 2) as u64) * (MAX_TRACKED_FRAME_REFS as u64) * PAGE_SIZE_U64;
+        let tail = ((colliding - 1) as u64) * (MAX_TRACKED_FRAME_REFS as u64) * PAGE_SIZE_U64;
+        assert_eq!(alloc.retain_frame(tail).expect("retain tail"), 2);
+        assert_eq!(alloc.untrack_frame_ref(middle).expect("delete middle"), 0);
+        alloc.extents[0] = Some(FreeExtent {
+            start_phys: middle,
+            pages: 1,
+        });
+        alloc.free_frames = 1;
+        alloc.refresh_run_metadata();
+        assert_eq!(alloc.frame_refcount(tail).expect("tail lookup"), 2);
+        assert_eq!(alloc.untrack_frame_ref(tail).expect("drop tail retain"), 1);
+        assert_eq!(alloc.frame_refcount(tail).expect("tail after drop"), 1);
+        assert!(alloc.frame_ref_telemetry.lookup_max_probes >= colliding);
+        assert_allocator_invariants(&alloc);
+    }
+
+    #[test]
+    fn frame_ref_hash_capacity_failure_does_not_insert() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc.base_phys = 0;
+        alloc.end_phys_exclusive = ((MAX_TRACKED_FRAME_REFS + 1) as u64) * PAGE_SIZE_U64;
+        alloc.total_frames = MAX_TRACKED_FRAME_REFS;
+        alloc.free_frames = 0;
+        alloc.initialized = true;
+
+        for idx in 0..MAX_TRACKED_FRAME_REFS {
+            alloc
+                .track_new_frame_ref((idx as u64) * PAGE_SIZE_U64)
+                .expect("fill frame ref table");
+        }
+        let before = alloc;
+        assert_eq!(
+            alloc.track_new_frame_ref((MAX_TRACKED_FRAME_REFS as u64) * PAGE_SIZE_U64),
+            Err(FrameAllocError::CapacityExceeded)
+        );
+        assert_allocator_state_eq_ignoring_telemetry(&alloc, &before);
+        assert_eq!(tracked_ref_count(&alloc), MAX_TRACKED_FRAME_REFS);
+        assert!(alloc.frame_ref_telemetry.insert_capacity_failures > 0);
+        assert_allocator_invariants(&alloc);
     }
 
     #[test]
