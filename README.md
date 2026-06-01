@@ -88,10 +88,10 @@ scripts/phase7-shared-ipc-gates.sh
 YARM is active development software with extracted workspace-owned service domains and crate-graph boundary enforcement.
 See:
 
-- `MICROKERNEL_BOUNDARY.md`
-- `ARCH_SPLIT.md`
-- `KERNEL_STATUS.md`
-- `USERSPACE_SERVER_MATURITY.md`
+- `doc/MICROKERNEL_BOUNDARY.md`
+- `doc/ARCH_SPLIT.md`
+- `doc/KERNEL_STATUS.md`
+- `doc/USERSPACE_SERVER_MATURITY.md`
 
 ## License
 

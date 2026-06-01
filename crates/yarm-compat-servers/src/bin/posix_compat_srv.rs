@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-#![no_std]
+#![cfg_attr(not(feature = "hosted-dev"), no_std)]
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 #[inline]
 #[cfg(not(test))]
 fn run() {
-    yarm_server_runtime::run_posix_compat_server();
+    yarm_compat_servers::run_posix_compat_server();
 }
 
 #[inline]
