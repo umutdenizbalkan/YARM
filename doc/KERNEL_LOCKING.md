@@ -2229,6 +2229,56 @@ IPC, capability, VM, memory, and driver lock ranks.
 
 ---
 
+### SchedulerHandoffPlan: deferred cooperative CPU handoff
+
+`SchedulerHandoffPlan` (`src/kernel/boot/mod.rs`) encodes the intent to yield
+CPU time to a specific task after an IPC send completes.  It separates the
+*decision* (which task should receive the CPU next, at message-delivery time)
+from the *execution* (the cooperative yield loop, applied after all domain
+mutations are done).
+
+```
+enum SchedulerHandoffPlan { None, YieldTo(ThreadId) }
+```
+
+Usage protocol:
+```
+// 1. At message-delivery time, before any context switch:
+let plan = if has_receiver { SchedulerHandoffPlan::YieldTo(receiver_tid) }
+           else             { SchedulerHandoffPlan::None };
+// 2. After all IPC/cap/VM domain mutations are complete and all domain locks
+//    are released:
+let switched = kernel.apply_scheduler_handoff_plan(plan)?;
+```
+
+`apply_scheduler_handoff_plan` delegates to `switch_to_runnable_tid(tid)`, a
+bounded `yield_current` loop that cooperatively hands off the CPU to `tid`.
+Returns `true` if `tid` became the current task, `false` otherwise.
+
+**Hosted-dev semantics**: `YieldTo(tid)` drives `switch_to_runnable_tid(tid)`.
+With TID 0 (idle) always in the run-queue, this typically takes ≥2 iterations:
+iteration 1 re-enqueues the sender and lands on idle or another task; iteration
+2 lands on the target.  Because `yield_current` re-enqueues the current task
+before dispatching, TID 0 remains in the membership table and does **not**
+require `idle_re_enqueue_for_test` after `apply_scheduler_handoff_plan`.
+
+**Freestanding semantics**: The hardware preemption mechanism (`timer interrupt
+→ on_preempt → dispatch_next`) schedules the receiver at the next timer tick.
+The cooperative loop still runs in freestanding builds but is not semantically
+required; it is a no-op if the receiver is already current.
+
+**Lock constraint**: Must be called outside all IPC/cap/VM/memory domain locks.
+Internally calls `yield_current` which acquires `task_state_lock` (rank 3) and
+touches the address-space HAL.
+
+**Call sites** (as of this writing):
+- `ipc_send_with_optional_deadline` (`ipc_state.rs`) — synchronous endpoint with
+  a waiting receiver.
+- `ipc_send_fastpath` (`ipc_state.rs`) — buffered endpoint with a receiver
+  waiter.
+
+---
+
 ### Scheduler-domain lock contract
 
 The following functions touch **only** scheduler-internal state (rank 1–2 in the

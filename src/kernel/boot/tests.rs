@@ -5570,6 +5570,36 @@ fn ipc_send_fastpath_detects_waiter() {
 }
 
 #[test]
+fn apply_scheduler_handoff_plan_none_returns_false() {
+    let mut state = Bootstrap::init().expect("init");
+    let switched = state
+        .apply_scheduler_handoff_plan(crate::kernel::boot::SchedulerHandoffPlan::None)
+        .expect("plan None");
+    assert!(!switched);
+}
+
+#[test]
+fn apply_scheduler_handoff_plan_yield_to_hands_off_cpu() {
+    // Verify that SchedulerHandoffPlan::YieldTo delegates to switch_to_runnable_tid
+    // and returns true when the target becomes current.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(41).expect("target task");
+
+    // Enqueue task 41 so it is runnable.
+    state.enqueue_current_cpu(41).expect("enqueue target");
+
+    let switched = state
+        .apply_scheduler_handoff_plan(crate::kernel::boot::SchedulerHandoffPlan::YieldTo(
+            ThreadId(41),
+        ))
+        .expect("plan YieldTo");
+    assert!(switched, "YieldTo should hand off CPU to task 41");
+    assert_eq!(state.current_tid(), Some(41));
+    // yield_current (called internally) already re-enqueues TID 0 before dispatching,
+    // so idle remains in the membership table — no idle_re_enqueue_for_test needed here.
+}
+
+#[test]
 fn driver_registration_and_capability_grants_work() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(3).expect("task");

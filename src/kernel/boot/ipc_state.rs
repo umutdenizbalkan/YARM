@@ -690,6 +690,23 @@ impl KernelState {
         }
     }
 
+    /// Apply a deferred cooperative-handoff plan.
+    ///
+    /// `YieldTo(tid)` drives `switch_to_runnable_tid(tid)` — a bounded
+    /// `yield_current` loop that cooperatively hands off the CPU to `tid`.
+    /// Returns `true` when `tid` became the current task, `false` otherwise.
+    ///
+    /// Must be called outside all IPC/cap/VM/memory domain locks.
+    pub(crate) fn apply_scheduler_handoff_plan(
+        &mut self,
+        plan: super::SchedulerHandoffPlan,
+    ) -> Result<bool, KernelError> {
+        match plan {
+            super::SchedulerHandoffPlan::None => Ok(false),
+            super::SchedulerHandoffPlan::YieldTo(tid) => self.switch_to_runnable_tid(tid),
+        }
+    }
+
     fn resolve_reply_index(&self, object: CapObject) -> Result<usize, KernelError> {
         match object {
             CapObject::Reply { index, generation } => self.with_ipc_state(|ipc| {
@@ -1335,7 +1352,9 @@ impl KernelState {
                     self.ipc.telemetry.rendezvous_handoffs.saturating_add(1);
                 self.wake_waiter_for_endpoint(endpoint_idx)?;
                 crate::yarm_log!("IPC_SEND_SYNC_WAKE_DONE waiter_tid={}", waiter_tid.0);
-                let switched = self.switch_to_runnable_tid(waiter_tid)?;
+                let switched = self.apply_scheduler_handoff_plan(
+                    super::SchedulerHandoffPlan::YieldTo(waiter_tid),
+                )?;
                 if switched {
                     self.ipc.telemetry.fastpath_switches =
                         self.ipc.telemetry.fastpath_switches.saturating_add(1);
@@ -1527,7 +1546,9 @@ impl KernelState {
         let switched = if inline_sync_handoff {
             true
         } else if waiter_tid.is_some() {
-            self.switch_to_runnable_tid(waiter_tid.expect("checked is_some"))?
+            self.apply_scheduler_handoff_plan(
+                super::SchedulerHandoffPlan::YieldTo(waiter_tid.expect("checked is_some")),
+            )?
         } else {
             false
         };
