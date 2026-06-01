@@ -4298,7 +4298,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
         // Now task1 is current (idle task0 displaced). Re-enqueue task0 so it can
         // be switched to after task1 yields.
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         state.yield_current().expect("switch to task1");
         while state.current_tid() != Some(1) {
             state.yield_current().expect("retry switch to task1");
@@ -4353,7 +4353,7 @@ mod tests {
         state.yield_current().expect("switch receiver");
         // Re-enqueue task0 (idle was displaced; membership cleared by dispatch_next_task fix).
         // task0 in queue so scheduler picks it after task1 blocks.
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4419,7 +4419,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4476,7 +4476,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4527,7 +4527,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4577,7 +4577,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4645,7 +4645,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4741,7 +4741,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4804,7 +4804,7 @@ mod tests {
             }
             // Re-enqueue task0 so scheduler picks it after task1 blocks.
             // In later iterations task0 may already be in queue; ignore AlreadyQueued.
-            let _ = state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0);
+            let _ = state.idle_re_enqueue_for_test();
             let mut block_recv = TrapFrame::new(
                 Syscall::IpcRecv as usize,
                 [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4882,7 +4882,7 @@ mod tests {
             }
             // Re-enqueue task0 so scheduler picks it after task1 blocks.
             // In later iterations task0 may already be in queue; ignore AlreadyQueued.
-            let _ = state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0);
+            let _ = state.idle_re_enqueue_for_test();
             let mut block_recv = TrapFrame::new(
                 Syscall::IpcRecv as usize,
                 [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4945,7 +4945,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5009,7 +5009,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5100,7 +5100,7 @@ mod tests {
             state.enqueue_current_cpu(1).expect("enqueue");
             state.dispatch_next_task().expect("dispatch");
             state.yield_current().expect("switch receiver");
-            state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+            state.idle_re_enqueue_for_test().expect("re-enqueue idle");
             let mut block_recv = TrapFrame::new(
                 Syscall::IpcRecv as usize,
                 [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5169,7 +5169,7 @@ mod tests {
             state.enqueue_current_cpu(1).expect("enqueue");
             state.dispatch_next_task().expect("dispatch");
             state.yield_current().expect("switch receiver");
-            state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+            state.idle_re_enqueue_for_test().expect("re-enqueue idle");
             let mut block_recv = TrapFrame::new(
                 Syscall::IpcRecv as usize,
                 [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5230,7 +5230,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5385,7 +5385,7 @@ mod tests {
         state.enqueue_current_cpu(1).expect("enqueue");
         state.dispatch_next_task().expect("dispatch");
         state.yield_current().expect("switch to task1");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         let mut block_recv_frame = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5430,7 +5430,7 @@ mod tests {
         state.enqueue_current_cpu(1).expect("enqueue");
         state.dispatch_next_task().expect("dispatch");
         state.yield_current().expect("switch to task1");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         assert_eq!(state.current_tid(), Some(1));
         assert_eq!(state.ipc_recv(recv1_task1).expect("block recv"), None);
         assert_eq!(state.current_tid(), Some(0));
@@ -5475,7 +5475,7 @@ mod tests {
         state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch to task1");
-        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.idle_re_enqueue_for_test().expect("re-enqueue idle");
         assert_eq!(state.current_tid(), Some(1));
         assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
         assert_eq!(state.current_tid(), Some(0));

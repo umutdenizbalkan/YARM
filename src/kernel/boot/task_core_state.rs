@@ -4,6 +4,24 @@
 use super::*;
 
 impl KernelState {
+    /// Cooperative busy-loop that yields until `tid` becomes the current task.
+    ///
+    /// # Design constraints
+    ///
+    /// This is a **hosted-dev / cooperative-scheduling aid**.  In freestanding builds
+    /// the normal preemption path (timer interrupt → `on_preempt` → `dispatch_next`)
+    /// handles task switching without busy-looping.  In hosted-dev tests there is no
+    /// real preemption, so IPC send paths that need the receiver to run immediately
+    /// (synchronous endpoint handoff, fastpath send) call this to drive the scheduler
+    /// cooperatively.
+    ///
+    /// Consequences for decomposition (see `doc/KERNEL_LOCKING.md §switch_to_runnable_tid`):
+    /// - Cannot be replaced with a plan-first pattern without a cooperative dispatch
+    ///   mechanism for hosted-dev.
+    /// - Must not be called while holding any domain lock — each `yield_current` call
+    ///   acquires `task_state_lock` and touches the address-space HAL.
+    /// - Do NOT convert synchronous endpoint call sites to plan-first until a
+    ///   hosted-dev dispatch replacement exists.
     pub(crate) fn switch_to_runnable_tid(&mut self, tid: ThreadId) -> Result<bool, KernelError> {
         let mut spins = 0usize;
         while spins < MAX_TASKS {

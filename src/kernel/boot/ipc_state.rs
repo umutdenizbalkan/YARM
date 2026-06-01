@@ -252,7 +252,7 @@ impl KernelState {
 
     fn wake_sender_waiter(&mut self, sender_tid: ThreadId) -> Result<(), KernelError> {
         crate::yarm_log!("SCHED_WAKE tid={}", sender_tid.0);
-        self.wake_tid_to_runnable(sender_tid)
+        self.apply_scheduler_wake_plan(super::SchedulerWakePlan::Wake(sender_tid))
     }
 
     pub(crate) fn process_ipc_timeout_deadlines(
@@ -996,7 +996,7 @@ impl KernelState {
                         // Phase 4: clear waiter slot under ipc_state_lock.
                         self.ipc_clear_plain_receiver_waiter_only(endpoint_idx, waiter_tid);
                         // Phase 5: wake receiver outside locks.
-                        self.wake_tid_to_runnable(waiter_tid)?;
+                        self.apply_scheduler_wake_plan(super::SchedulerWakePlan::Wake(waiter_tid))?;
                         return Ok(());
                     }
                     Err(err) => {
