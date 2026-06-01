@@ -1280,23 +1280,33 @@ impl KernelState {
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
 
+        // Phase 0: snapshot endpoint mode under ipc_state_lock.
         let endpoint_mode = self
-            .ipc
-            .endpoints
-            .get(endpoint_idx)
-            .and_then(Option::as_ref)
-            .ok_or(KernelError::WrongObject)?
-            .mode();
+            .with_ipc_state(|ipc| {
+                ipc.endpoints
+                    .get(endpoint_idx)
+                    .and_then(Option::as_ref)
+                    .map(|e| e.mode())
+            })
+            .ok_or(KernelError::WrongObject)?;
 
         if endpoint_mode == EndpointMode::Synchronous {
-            if let Some(waiter_tid) = self.ipc.endpoint_waiters[endpoint_idx] {
+            // Phase 1: snapshot waiter TID under ipc_state_lock.  Lock released before
+            // Phase 2 (task_state_lock, rank 3) to preserve lock-rank ordering.
+            let opt_waiter_tid: Option<ThreadId> =
+                self.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]);
+            if let Some(waiter_tid) = opt_waiter_tid {
                 crate::yarm_log!(
                     "IPC_SEND_SYNC_WAITER endpoint={} waiter_tid={}",
                     endpoint_idx,
                     waiter_tid.0
                 );
-                self.ipc.telemetry.fastpath_attempts =
-                    self.ipc.telemetry.fastpath_attempts.saturating_add(1);
+                self.with_ipc_state_mut(|ipc| {
+                    ipc.telemetry.fastpath_attempts =
+                        ipc.telemetry.fastpath_attempts.saturating_add(1);
+                });
+                // Phase 2: check recv-v2 under task_state_lock (rank 3), outside
+                // ipc_state_lock (rank 4), to preserve lock-rank ordering.
                 let waiter_recv_v2_blocked = self.with_tcbs(|tcbs| {
                     tcbs.iter()
                         .flatten()
@@ -1305,6 +1315,7 @@ impl KernelState {
                         .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
                 });
                 if waiter_recv_v2_blocked {
+                    // Phase 3: complete delivery outside all locks (TrapFrame/user-memory write).
                     crate::yarm_log!(
                         "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
                         waiter_tid.0,
@@ -1333,39 +1344,30 @@ impl KernelState {
                             return Err(KernelError::UserMemoryFault);
                         }
                     }
-                } else {
-                    let endpoint = self
-                        .ipc
-                        .endpoints
-                        .get_mut(endpoint_idx)
-                        .and_then(Option::as_mut)
-                        .ok_or(KernelError::WrongObject)?;
-                    endpoint
-                        .send(msg)
-                        .map_err(|_| KernelError::EndpointQueueFull)?;
-                    crate::yarm_log!(
-                        "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
-                        waiter_tid.0,
-                        endpoint_idx,
-                        msg.len,
-                        msg.transferred_cap().map(|c| c.0).unwrap_or(u64::MAX)
-                    );
                 }
-                self.ipc.telemetry.rendezvous_handoffs =
-                    self.ipc.telemetry.rendezvous_handoffs.saturating_add(1);
-                self.wake_waiter_for_endpoint(endpoint_idx)?;
+                // Phase 4: under ipc_state_lock — for legacy path enqueue message, then
+                // clear waiter slot and bump telemetry.  Re-verifies waiter slot for
+                // defence-in-depth.
+                let wake_plan = self.ipc_try_send_sync_endpoint_only(
+                    endpoint_idx,
+                    waiter_tid,
+                    msg,
+                    waiter_recv_v2_blocked,
+                )?;
                 crate::yarm_log!("IPC_SEND_SYNC_WAKE_DONE waiter_tid={}", waiter_tid.0);
+                // Phase 5: wake receiver outside all locks.
+                self.apply_scheduler_wake_plan(wake_plan)?;
+                // Phase 6: cooperative handoff outside all locks.
                 let switched = self.apply_scheduler_handoff_plan(
                     super::SchedulerHandoffPlan::YieldTo(waiter_tid),
                 )?;
                 if switched {
-                    self.ipc.telemetry.fastpath_switches =
-                        self.ipc.telemetry.fastpath_switches.saturating_add(1);
-                    self.ipc.telemetry.scheduler_fastpath_handoffs = self
-                        .ipc
-                        .telemetry
-                        .scheduler_fastpath_handoffs
-                        .saturating_add(1);
+                    self.with_ipc_state_mut(|ipc| {
+                        ipc.telemetry.fastpath_switches =
+                            ipc.telemetry.fastpath_switches.saturating_add(1);
+                        ipc.telemetry.scheduler_fastpath_handoffs =
+                            ipc.telemetry.scheduler_fastpath_handoffs.saturating_add(1);
+                    });
                 }
                 crate::yarm_log!("IPC_SEND_SYNC_SWITCH_DONE waiter_tid={}", waiter_tid.0);
                 return Ok(());
@@ -1374,7 +1376,9 @@ impl KernelState {
             crate::yarm_log!("IPC_SEND_SYNC_NO_WAITER endpoint={}", endpoint_idx);
             let _ =
                 self.block_current_on_send_with_deadline(endpoint_idx, send_cap, msg, deadline)?;
-            self.ipc.telemetry.blocked_sends = self.ipc.telemetry.blocked_sends.saturating_add(1);
+            self.with_ipc_state_mut(|ipc| {
+                ipc.telemetry.blocked_sends = ipc.telemetry.blocked_sends.saturating_add(1);
+            });
             return Err(KernelError::WouldBlock);
         }
 
@@ -1466,6 +1470,63 @@ impl KernelState {
                 );
             }
         });
+    }
+
+    /// Stage 4Q: synchronous-endpoint send — clear waiter slot and (for legacy receivers)
+    /// enqueue message, all under `ipc_state_lock`.
+    ///
+    /// Preconditions (caller must verify before this call):
+    ///   - Phase 2 recv-v2 check done under task_state_lock (rank 3), outside ipc_state_lock
+    ///   - if `recv_v2_completed` is true, message was already written to receiver's TrapFrame
+    ///     via `complete_blocked_recv_for_waiter` outside all locks (Phase 3)
+    ///
+    /// Under ipc_state_lock:
+    ///   - re-verifies receiver slot still holds `expected_receiver_tid` (defence-in-depth)
+    ///   - for legacy (non-recv-v2): enqueues `msg` into the endpoint queue
+    ///   - clears `endpoint_waiters` slot
+    ///   - bumps `rendezvous_handoffs` telemetry
+    ///
+    /// Returns `SchedulerWakePlan::Wake(tid)` on success; caller must apply outside the lock
+    /// via `apply_scheduler_wake_plan`, then optionally `apply_scheduler_handoff_plan`.
+    pub(crate) fn ipc_try_send_sync_endpoint_only(
+        &mut self,
+        endpoint_idx: usize,
+        expected_receiver_tid: ThreadId,
+        msg: Message,
+        recv_v2_completed: bool,
+    ) -> Result<super::SchedulerWakePlan, KernelError> {
+        self.with_ipc_state_mut(|ipc| {
+            // Re-verify waiter slot: defence-in-depth under the global kernel lock.
+            if ipc.endpoint_waiters.get(endpoint_idx).copied().flatten()
+                != Some(expected_receiver_tid)
+            {
+                return Err(KernelError::WrongObject);
+            }
+            if !recv_v2_completed {
+                // Legacy path: deliver message via endpoint queue.
+                let Some(endpoint_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut) else {
+                    return Err(KernelError::WrongObject);
+                };
+                let endpoint = kernel_mut(endpoint_storage);
+                if endpoint.mode() != EndpointMode::Synchronous {
+                    return Err(KernelError::WrongObject);
+                }
+                crate::yarm_log!(
+                    "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={}",
+                    expected_receiver_tid.0,
+                    endpoint_idx
+                );
+                endpoint.send(msg).map_err(|_| KernelError::EndpointQueueFull)?;
+            }
+            ipc.endpoint_waiters[endpoint_idx] = None;
+            ipc.telemetry.rendezvous_handoffs =
+                ipc.telemetry.rendezvous_handoffs.saturating_add(1);
+            crate::yarm_log!(
+                "IPC_SEND_SYNC_CLEAR_WAITER receiver_tid={}",
+                expected_receiver_tid.0
+            );
+            Ok(super::SchedulerWakePlan::Wake(expected_receiver_tid))
+        })
     }
 
     pub(crate) fn note_split_recv_v2_delivery(&mut self) {

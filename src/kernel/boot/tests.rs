@@ -9983,3 +9983,128 @@ fn run_ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake() {
         .expect("payload");
     assert_eq!(&payload[..2], b"hi");
 }
+
+#[test]
+fn sync_endpoint_phase4_helper_delivers_legacy_message_under_ipc_state_lock() {
+    // ipc_try_send_sync_endpoint_only (Stage 4M, legacy path):
+    //  - re-verifies waiter slot under ipc_state_lock
+    //  - enqueues message into endpoint queue (legacy, non-recv-v2)
+    //  - clears endpoint_waiters slot
+    //  - returns Wake(waiter_tid)
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(80).expect("receiver");
+
+    let (eid, _send_cap, recv_cap) = state
+        .create_endpoint_with_mode(3, EndpointMode::Synchronous)
+        .expect("sync endpoint");
+    // Grant recv_cap to task 80 so it can use it while current.
+    let recv_cap_80 = state
+        .grant_capability_task_to_task(0, recv_cap, 80)
+        .expect("grant recv to 80");
+
+    // Park receiver in waiter slot via ipc_recv block.
+    state.enqueue_current_cpu(80).expect("enqueue");
+    state.yield_current().expect("switch");
+    assert_eq!(state.current_tid(), Some(80));
+    let mut recv_tf = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [recv_cap_80.0 as usize, 8, 0xB000, 0, 0, 0],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_tf))
+        .expect("recv trap");
+    // Receiver is now blocked in the endpoint waiter slot.
+    let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    assert_eq!(waiter_tid, Some(ThreadId(80)), "receiver must be in waiter slot");
+
+    // Now call the Phase 4 helper directly (legacy, recv_v2_completed=false).
+    let msg = Message::new(1, b"st4m").expect("msg");
+    let plan = state
+        .ipc_try_send_sync_endpoint_only(eid, ThreadId(80), msg, false)
+        .expect("phase4 ok");
+    // Waiter slot must have been cleared.
+    let after = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    assert_eq!(after, None, "waiter slot must be cleared after Phase 4");
+    // Message must be in the endpoint queue.
+    let queued = state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued());
+    assert_eq!(queued, 1, "legacy message must be enqueued");
+    // Plan must wake the receiver.
+    assert_eq!(plan, super::SchedulerWakePlan::Wake(ThreadId(80)));
+    // Telemetry bump.
+    assert_eq!(state.ipc_path_telemetry().rendezvous_handoffs, 1);
+}
+
+#[test]
+fn sync_endpoint_phase4_helper_skips_enqueue_when_recv_v2_completed() {
+    // ipc_try_send_sync_endpoint_only with recv_v2_completed=true must:
+    //  - skip endpoint.send() (message already in receiver's TrapFrame)
+    //  - still clear waiter slot and return Wake(waiter_tid)
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(81).expect("receiver");
+
+    let (eid, _send_cap, recv_cap) = state
+        .create_endpoint_with_mode(4, EndpointMode::Synchronous)
+        .expect("sync endpoint");
+    let recv_cap_81 = state
+        .grant_capability_task_to_task(0, recv_cap, 81)
+        .expect("grant recv to 81");
+
+    state.enqueue_current_cpu(81).expect("enqueue");
+    state.yield_current().expect("switch");
+    assert_eq!(state.current_tid(), Some(81));
+    let mut recv_tf = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [recv_cap_81.0 as usize, 8, 0xC000, 0, 0, 0],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_tf))
+        .expect("recv trap");
+    let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    assert_eq!(waiter_tid, Some(ThreadId(81)));
+
+    let msg = Message::new(1, b"v2done").expect("msg");
+    let plan = state
+        .ipc_try_send_sync_endpoint_only(eid, ThreadId(81), msg, true)
+        .expect("phase4 recv_v2 ok");
+    // Waiter slot cleared.
+    let after = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    assert_eq!(after, None, "waiter slot must be cleared");
+    // Message must NOT be in endpoint queue (recv-v2 path delivers directly to TrapFrame).
+    let queued = state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued());
+    assert_eq!(queued, 0, "recv-v2 path must not enqueue into endpoint");
+    assert_eq!(plan, super::SchedulerWakePlan::Wake(ThreadId(81)));
+}
+
+#[test]
+fn sync_endpoint_phase4_helper_rejects_mismatched_waiter() {
+    // ipc_try_send_sync_endpoint_only must return Err(WrongObject) when the waiter
+    // slot no longer holds the expected TID (defence-in-depth re-verification).
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(82).expect("receiver");
+
+    let (eid, _send_cap, recv_cap) = state
+        .create_endpoint_with_mode(5, EndpointMode::Synchronous)
+        .expect("sync endpoint");
+    let recv_cap_82 = state
+        .grant_capability_task_to_task(0, recv_cap, 82)
+        .expect("grant recv to 82");
+
+    state.enqueue_current_cpu(82).expect("enqueue");
+    state.yield_current().expect("switch");
+    assert_eq!(state.current_tid(), Some(82));
+    let mut recv_tf = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [recv_cap_82.0 as usize, 8, 0xD000, 0, 0, 0],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_tf))
+        .expect("recv trap");
+    // Clear the waiter slot manually to simulate a timeout clearing the slot.
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[eid] = None;
+    });
+
+    let msg = Message::new(1, b"stale").expect("msg");
+    let result = state.ipc_try_send_sync_endpoint_only(eid, ThreadId(82), msg, false);
+    assert_eq!(result, Err(KernelError::WrongObject), "must reject mismatched waiter");
+}
