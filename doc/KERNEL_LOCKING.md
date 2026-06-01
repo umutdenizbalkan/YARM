@@ -2234,8 +2234,8 @@ IPC, capability, VM, memory, and driver lock ranks.
 `SchedulerHandoffPlan` (`src/kernel/boot/mod.rs`) encodes the intent to yield
 CPU time to a specific task after an IPC send completes.  It separates the
 *decision* (which task should receive the CPU next, at message-delivery time)
-from the *execution* (the cooperative yield loop, applied after all domain
-mutations are done).
+from the *execution* (the one-shot preempt, applied after all domain mutations
+are done).
 
 ```
 enum SchedulerHandoffPlan { None, YieldTo(ThreadId) }
@@ -2251,25 +2251,25 @@ let plan = if has_receiver { SchedulerHandoffPlan::YieldTo(receiver_tid) }
 let switched = kernel.apply_scheduler_handoff_plan(plan)?;
 ```
 
-`apply_scheduler_handoff_plan` delegates to `switch_to_runnable_tid(tid)`, a
-bounded `yield_current` loop that cooperatively hands off the CPU to `tid`.
-Returns `true` if `tid` became the current task, `false` otherwise.
+`apply_scheduler_handoff_plan` delegates to `yield_current_to(tid)` (see below),
+a one-shot direct-dispatch that moves `tid` from the run-queue to current in a
+single scheduler operation.  Returns `true` if `tid` became the current task.
 
-**Hosted-dev semantics**: `YieldTo(tid)` drives `switch_to_runnable_tid(tid)`.
-With TID 0 (idle) always in the run-queue, this typically takes ≥2 iterations:
-iteration 1 re-enqueues the sender and lands on idle or another task; iteration
-2 lands on the target.  Because `yield_current` re-enqueues the current task
-before dispatching, TID 0 remains in the membership table and does **not**
-require `idle_re_enqueue_for_test` after `apply_scheduler_handoff_plan`.
+**Hosted-dev semantics**: `YieldTo(tid)` calls `yield_current_to(tid)`.  If `tid`
+is in the run-queue (guaranteed at the IPC handoff call sites: `wake_waiter_for_endpoint`
+runs immediately before), `on_preempt_prefer` bypasses FIFO order and makes `tid`
+current directly.  Returns true in one step, regardless of TID 0 position in the
+queue.  `yield_current_to` re-enqueues the outgoing task via `on_preempt_prefer`,
+so TID 0 remains in the membership table — no `idle_re_enqueue_for_test` is
+needed after `apply_scheduler_handoff_plan`.
 
-**Freestanding semantics**: The hardware preemption mechanism (`timer interrupt
-→ on_preempt → dispatch_next`) schedules the receiver at the next timer tick.
-The cooperative loop still runs in freestanding builds but is not semantically
-required; it is a no-op if the receiver is already current.
+**Freestanding semantics**: Identical one-shot preempt via `on_preempt_prefer`.
+The target is made current immediately; hardware preemption will run other tasks
+at the next timer tick.
 
 **Lock constraint**: Must be called outside all IPC/cap/VM/memory domain locks.
-Internally calls `yield_current` which acquires `task_state_lock` (rank 3) and
-touches the address-space HAL.
+Internally calls `yield_current_to` which acquires `task_state_lock` (rank 3)
+and touches the address-space HAL.
 
 **Call sites** (as of this writing):
 - `ipc_send_with_optional_deadline` (`ipc_state.rs`) — synchronous endpoint with
@@ -2288,6 +2288,7 @@ lock-rank order below) and no other domain state:
 |---|---|---|
 | `block_current_cpu` | `scheduler_state.rs` | Purely scheduler-internal |
 | `on_preempt_current_cpu` | `scheduler_state.rs` | Purely scheduler-internal |
+| `on_preempt_prefer_current_cpu` | `scheduler_state.rs` | Purely scheduler-internal; bypasses FIFO |
 | `dispatch_next_current_cpu` | `scheduler_state.rs` | Purely scheduler-internal |
 | `enqueue_on_cpu` | `scheduler_state.rs` | Reads priority/affinity (rank 3 task domain) |
 | `enqueue_woken_task` | `scheduler_state.rs` | Reads CPU affinity only |
@@ -2300,31 +2301,29 @@ The following functions cross into other domains (TCB status, HAL, kernel contex
 |---|---|
 | `dispatch_next_task` | `task_state_lock` (TCB status write), HAL (address space), kernel context switch |
 | `yield_current` | `task_state_lock` (TCB status), HAL (address space), kernel context switch |
+| `yield_current_to` | `task_state_lock` (TCB status), HAL (address space), kernel context switch |
 | `wake_tid_to_runnable` | `task_state_lock` (TCB status), `ipc_state_lock` (clear IPC timeout) |
 
-### `switch_to_runnable_tid` design constraint
+### `switch_to_runnable_tid` design constraint (retired from hot path)
 
-`switch_to_runnable_tid` (`task_core_state.rs`) is a cooperative busy-loop that
-calls `yield_current()` up to `MAX_TASKS` times until a target TID becomes the
-current task on the CPU.
+`switch_to_runnable_tid` (`task_core_state.rs`) was a cooperative busy-loop that
+called `yield_current()` up to `MAX_TASKS` times until a target TID became the
+current task.  It is no longer in the production hot path: all call sites that
+went through `apply_scheduler_handoff_plan(YieldTo(...))` now use `yield_current_to`
+instead.  The function is retained as a fallback (marked `#[allow(dead_code)]`)
+and as the documented baseline for the design constraint rationale.
 
-**Why it exists**: In hosted-dev / test builds there is no real preemption. IPC
-send paths that need the receiver to run immediately (synchronous endpoint handoff,
-fastpath send) use this to drive the cooperative scheduler.
+**Why it existed**: In hosted-dev / test builds there is no real preemption. IPC
+send paths that need the receiver to run immediately used this to drive the
+cooperative scheduler.  The typical case took ≥2 iterations because TID 0 (idle)
+was at the head of the queue.
 
-**Decomposition blocker**: Cannot be replaced with a plan-first pattern without a
-hosted-dev cooperative dispatch mechanism. On real hardware the receiver is
-scheduled by the normal preemption path (timer interrupt → `on_preempt` →
-`dispatch_next`), so the busy-loop is unnecessary freestanding. However, changing
-this requires architecture-specific dispatch hooks that are out of scope.
+**Successor**: `yield_current_to(target)` + `on_preempt_prefer(preferred)`.
+`yield_current_to` calls `on_preempt_prefer` once: re-enqueues the outgoing task,
+then scans the queues for `target` and makes it current directly if found — O(n)
+in queue size (MAX_RUN_QUEUE = 64), no loop.
 
-**Invariant**: Must never be called while holding any domain lock. Each
-`yield_current` acquires `task_state_lock` (rank 3) and touches the address-space
-HAL — violating lock order if called inside an IPC/cap/VM lock.
-
-**Future**: replace with a `SwitchTo(ThreadId)` scheduler plan returned from the
-IPC send path, applied by the arch trap-return sequence, with a hosted-dev
-cooperative fallback.
+**Invariant (unchanged)**: Must never be called while holding any domain lock.
 
 ### Idle/TID 0 semantics
 
@@ -2342,6 +2341,37 @@ TID 0 is the idle task. Key invariants:
    between `current` (Running) and queued (Runnable / membership table).
 5. In hosted-dev, idle burns host CPU cycles — this is expected; no WFI equivalent
    exists in the test shim.
+
+### `yield_current_to` and `on_preempt_prefer`: one-shot cooperative handoff
+
+`yield_current_to(target)` (`exec_state.rs`) is the non-busy-loop successor to
+`switch_to_runnable_tid`.  It performs a single scheduler operation to hand off
+the CPU to a specific target task:
+
+1. Sets outgoing (current) task TCB status to `Runnable`.
+2. Calls `on_preempt_prefer_current_cpu(target)`:
+   - Re-enqueues the outgoing task at the tail of its priority queue.
+   - Searches all three priority queues for `target`; if found, removes it and
+     sets it as `current` directly (bypasses FIFO order).
+   - If `target` is not found, falls back to normal FIFO `dispatch_next`.
+3. Sets incoming task TCB status to `Running`.
+4. Switches address space (HAL) and kernel context.
+5. Returns `true` if `target` became current, `false` otherwise.
+
+**Complexity**: O(P × Q) where P = 3 priority levels, Q ≤ MAX_RUN_QUEUE = 64.
+**Loop count**: exactly 1 (no busy-loop). `switch_to_runnable_tid` took ≥2 in
+the typical IPC case (TID 0 at queue head); `yield_current_to` always takes 1.
+
+**Idle/TID 0 behavior**: `on_preempt_prefer` re-enqueues the outgoing task before
+searching for the target.  If outgoing = TID 0, TID 0 is re-enqueued and remains
+in the membership table.  No `idle_re_enqueue_for_test` call is needed after
+`yield_current_to` — unlike after `dispatch_next_task`.
+
+**`RingQueue::remove_tid`**: the underlying building block.  Compacts the ring
+buffer by shifting elements after the removed slot toward the head.  Safe for
+arbitrary removal positions (not just head/tail).  O(Q) where Q ≤ 64.
+
+---
 
 ### Stage 3: remove global lock from syscall fast path
 

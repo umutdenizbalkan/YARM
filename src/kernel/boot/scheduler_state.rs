@@ -91,6 +91,17 @@ impl KernelState {
             .map(|tid| tid.0)
     }
 
+    /// Preempt the current task on the current CPU, preferring `preferred` as the
+    /// next task.  Returns the TID of the new current task (which is `preferred`
+    /// when it was runnable, or the FIFO head otherwise).
+    pub(crate) fn on_preempt_prefer_current_cpu(&mut self, preferred: u64) -> Option<u64> {
+        let cpu = self.current_cpu();
+        let mut sched = self.scheduler_state();
+        kernel_mut(&mut sched.scheduler)
+            .on_preempt_prefer_on(cpu, ThreadId(preferred))
+            .map(|tid| tid.0)
+    }
+
     pub fn block_current_cpu(&mut self) -> Option<u64> {
         let cpu = self.current_cpu();
         let mut sched = self.scheduler_state();

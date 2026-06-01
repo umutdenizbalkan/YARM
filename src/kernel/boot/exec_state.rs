@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::{KernelError, KernelState, SpawnedUserTask, UserImageSpec};
+use crate::kernel::ipc::ThreadId;
 use crate::kernel::capabilities::{CapId, CapRights};
 use crate::arch::hal::Hal;
 use crate::kernel::scheduler::CpuId;
@@ -1449,6 +1450,72 @@ impl KernelState {
             }
         }
         Ok(())
+    }
+
+    /// Yield the current task, directly dispatching `target` as the next task when possible.
+    ///
+    /// Uses `on_preempt_prefer` to move `target` from the run-queue to `current` in one
+    /// scheduler operation, bypassing the FIFO order.  If `target` is not in the run-queue
+    /// (e.g. already current, blocked, or not yet woken), falls back to the normal FIFO
+    /// dispatch for this one yield.
+    ///
+    /// Returns `true` when `target` became the new current task, `false` otherwise.
+    ///
+    /// This replaces the `switch_to_runnable_tid` busy-loop for call sites where the
+    /// caller guarantees `target` was just woken (i.e. `wake_waiter_for_endpoint` ran
+    /// immediately before this call).  In that common case the function completes in
+    /// exactly one scheduler operation instead of up to `MAX_TASKS` iterations.
+    ///
+    /// Must be called outside all IPC/cap/VM/memory domain locks (same constraint as
+    /// `yield_current`).
+    pub(crate) fn yield_current_to(&mut self, target: ThreadId) -> Result<bool, KernelError> {
+        let outgoing_tid = self.current_tid();
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.scheduler_yield_calls =
+                ipc.telemetry.scheduler_yield_calls.saturating_add(1);
+        });
+        if let Some(tid) = outgoing_tid {
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Runnable;
+                Ok::<_, KernelError>(())
+            })?;
+        }
+        let next_tid = self.on_preempt_prefer_current_cpu(target.0);
+        let achieved = next_tid == Some(target.0);
+        if let Some(tid) = next_tid {
+            let incoming_asid = self.task_asid(tid);
+            if let Some(asid) = incoming_asid {
+                self.hal.switch_address_space(asid);
+            }
+            self.maybe_switch_kernel_context(outgoing_tid, tid)?;
+            if outgoing_tid != Some(tid) {
+                self.with_ipc_state_mut(|ipc| {
+                    ipc.telemetry.scheduler_context_switches =
+                        ipc.telemetry.scheduler_context_switches.saturating_add(1);
+                });
+            }
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.status = TaskStatus::Running;
+                Ok::<_, KernelError>(())
+            })?;
+        } else {
+            // No runnable task after preempt (queue was empty); re-enqueue and redispatch.
+            if let Some(tid) = outgoing_tid {
+                let _ = self.enqueue_current_cpu(tid);
+                let _ = self.dispatch_next_task()?;
+            }
+        }
+        Ok(achieved)
     }
 }
 
