@@ -162,20 +162,18 @@ pub(crate) enum SchedulerWakePlan {
 ///
 /// Encodes the intent to yield CPU time to a specific task after an IPC send
 /// completes.  Separates the *decision* (which task should receive the CPU next,
-/// computed at message-delivery time) from the *execution* (the cooperative yield
-/// loop, applied after all IPC/cap/VM domain mutations are done).
+/// computed at message-delivery time) from the *execution* (the one-shot direct
+/// dispatch, applied after all IPC/cap/VM domain mutations are done).
 ///
-/// **Hosted-dev semantics (cooperative scheduling):**
-/// `YieldTo(tid)` drives `switch_to_runnable_tid(tid)`, a bounded `yield_current`
-/// loop that runs until `tid` becomes the scheduler's current task.  Because
-/// TID 0 (idle) is always in the run-queue, the loop typically takes two
-/// iterations: one yield lands on idle, the second lands on the target.
+/// **Hosted-dev and freestanding semantics:**
+/// `YieldTo(tid)` drives `yield_current_to(tid)`, which calls `on_preempt_prefer`
+/// once: the outgoing task is re-enqueued at the tail of its queue, then `tid`
+/// is removed from whichever priority queue it is in and made current directly,
+/// bypassing FIFO order.  Completes in one scheduler operation (O(P×Q) where
+/// P = 3 priority levels, Q ≤ MAX_RUN_QUEUE = 64) — no busy-loop.
 ///
-/// **Freestanding semantics:**
-/// The hardware preemption mechanism schedules `tid` at the next timer interrupt
-/// or architectural preemption point.  The cooperative loop still runs in
-/// freestanding builds (see `switch_to_runnable_tid` doc for the open issue),
-/// but it is not semantically required there.
+/// Callers that guarantee `tid` was just enqueued (e.g. via `wake_waiter_for_endpoint`
+/// immediately before) will always get `true` back.
 ///
 /// Usage:
 /// ```text
@@ -192,7 +190,8 @@ pub(crate) enum SchedulerWakePlan {
 pub(crate) enum SchedulerHandoffPlan {
     /// No cooperative handoff required.
     None,
-    /// Yield CPU to the identified task.  Applied via `apply_scheduler_handoff_plan`.
+    /// Yield CPU to the identified task.  Applied via `apply_scheduler_handoff_plan`
+    /// → `yield_current_to` → `on_preempt_prefer` (one scheduler operation).
     /// Returns `true` if the target became the current task, `false` otherwise.
     YieldTo(ThreadId),
 }

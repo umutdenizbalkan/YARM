@@ -692,9 +692,12 @@ impl KernelState {
 
     /// Apply a deferred cooperative-handoff plan.
     ///
-    /// `YieldTo(tid)` drives `switch_to_runnable_tid(tid)` — a bounded
-    /// `yield_current` loop that cooperatively hands off the CPU to `tid`.
+    /// `YieldTo(tid)` calls `yield_current_to(tid)` — a one-shot preempt that removes
+    /// `tid` from the run-queue and makes it current directly, bypassing FIFO order.
     /// Returns `true` when `tid` became the current task, `false` otherwise.
+    ///
+    /// Callers that guarantee `tid` was just enqueued (e.g. via `wake_waiter_for_endpoint`)
+    /// will always get `true` back.
     ///
     /// Must be called outside all IPC/cap/VM/memory domain locks.
     pub(crate) fn apply_scheduler_handoff_plan(
@@ -703,7 +706,7 @@ impl KernelState {
     ) -> Result<bool, KernelError> {
         match plan {
             super::SchedulerHandoffPlan::None => Ok(false),
-            super::SchedulerHandoffPlan::YieldTo(tid) => self.switch_to_runnable_tid(tid),
+            super::SchedulerHandoffPlan::YieldTo(tid) => self.yield_current_to(tid),
         }
     }
 

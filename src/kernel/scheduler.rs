@@ -85,6 +85,25 @@ impl RingQueue {
         self.len -= 1;
         Some(tid)
     }
+
+    /// Remove `tid` from any position in the ring buffer.
+    /// Compacts the elements after the removed slot toward the head.
+    /// Returns `true` if `tid` was found and removed, `false` otherwise.
+    fn remove_tid(&mut self, tid: ThreadId) -> bool {
+        for i in 0..self.len {
+            let idx = Self::index(self.head + i);
+            if self.tids[idx] == tid {
+                for j in i..self.len - 1 {
+                    let dst = Self::index(self.head + j);
+                    let src = Self::index(self.head + j + 1);
+                    self.tids[dst] = self.tids[src];
+                }
+                self.len -= 1;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -269,6 +288,49 @@ impl PriorityScheduler {
                 return Some(running.tid);
             }
         }
+        self.dispatch_next()
+    }
+
+    /// Like `on_preempt`, but prefers dispatching `preferred` as the next task.
+    ///
+    /// Re-enqueues the current task at the tail of its priority queue, then:
+    /// - If `preferred` is in any queue: removes it and makes it current directly
+    ///   (bypassing FIFO order), returning `Some(preferred)`.
+    /// - Otherwise: falls back to `dispatch_next()` (FIFO head of highest-priority queue).
+    ///
+    /// Used by `yield_current_to` to implement one-shot cooperative handoff without
+    /// the busy-loop of `switch_to_runnable_tid`.
+    pub fn on_preempt_prefer(&mut self, preferred: ThreadId) -> Option<ThreadId> {
+        // Re-enqueue current (same logic as on_preempt).
+        if let Some(running) = self.current.take() {
+            if !self.membership_tracking_exhausted {
+                self.membership_remove(running.tid);
+            }
+            if let Err(err) = self.enqueue_with_priority(running.tid, running.priority) {
+                if err != SchedulerError::AlreadyQueued && self.runnable_count() != 0 {
+                    crate::yarm_log!(
+                        "scheduler inconsistency: failed to re-enqueue preempted task {:?}; preserving current task",
+                        err
+                    );
+                }
+                if !self.membership_tracking_exhausted {
+                    let _ = self.membership_insert(running.tid);
+                }
+                self.current = Some(running);
+                return Some(running.tid);
+            }
+        }
+        // Scan queues in priority order for the preferred TID.
+        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            if self.queues[Self::priority_index(priority)].remove_tid(preferred) {
+                if !self.membership_tracking_exhausted {
+                    self.membership_remove(preferred);
+                }
+                self.current = Some(ScheduledTask { tid: preferred, priority });
+                return Some(preferred);
+            }
+        }
+        // Preferred not in any queue; fall back to normal FIFO dispatch.
         self.dispatch_next()
     }
 
@@ -464,6 +526,13 @@ impl SmpScheduler {
         self.schedulers[idx].on_preempt()
     }
 
+    /// Preempt current task on `cpu`, preferring `preferred` as the next task.
+    /// See `PriorityScheduler::on_preempt_prefer` for semantics.
+    pub fn on_preempt_prefer_on(&mut self, cpu: CpuId, preferred: ThreadId) -> Option<ThreadId> {
+        let idx = self.check_online_cpu(cpu).ok()?;
+        self.schedulers[idx].on_preempt_prefer(preferred)
+    }
+
     pub fn block_current_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
         let idx = self.check_online_cpu(cpu).ok()?;
         self.schedulers[idx].block_current()
@@ -611,6 +680,66 @@ mod tests {
             sched.enqueue_with_priority(ThreadId(1000), TaskPriority::High),
             Err(SchedulerError::AlreadyQueued)
         );
+    }
+
+    #[test]
+    fn on_preempt_prefer_selects_preferred_over_fifo_head() {
+        // With TID 1 at head and TID 2 behind it, on_preempt_prefer(TID 2) must
+        // skip TID 1 and make TID 2 current in one operation.
+        let mut sched = PriorityScheduler::default();
+        sched
+            .enqueue_with_priority(ThreadId(1), TaskPriority::Normal)
+            .expect("enqueue 1");
+        sched
+            .enqueue_with_priority(ThreadId(2), TaskPriority::Normal)
+            .expect("enqueue 2");
+        sched.dispatch_next(); // make TID 1 current
+
+        // Preempt TID 1 in favor of TID 2.
+        let next = sched.on_preempt_prefer(ThreadId(2));
+        assert_eq!(next, Some(ThreadId(2)));
+        assert_eq!(sched.current_tid(), Some(ThreadId(2)));
+        // TID 1 was re-enqueued.
+        assert_eq!(sched.runnable_count(), 1);
+        assert!(sched.contains_tid(ThreadId(1)));
+    }
+
+    #[test]
+    fn on_preempt_prefer_falls_back_to_fifo_when_preferred_absent() {
+        let mut sched = PriorityScheduler::default();
+        sched
+            .enqueue_with_priority(ThreadId(1), TaskPriority::Normal)
+            .expect("enqueue 1");
+        sched.dispatch_next(); // make TID 1 current
+
+        // TID 99 is not in any queue; on_preempt_prefer should fall back to FIFO
+        // (which re-enqueues TID 1 and picks from head).
+        let next = sched.on_preempt_prefer(ThreadId(99));
+        // TID 1 was re-enqueued and is the only task; FIFO picks it.
+        assert_eq!(next, Some(ThreadId(1)));
+    }
+
+    #[test]
+    fn ring_queue_remove_tid_compacts_correctly() {
+        let mut q = RingQueue::new();
+        q.push(ThreadId(10)).expect("10");
+        q.push(ThreadId(20)).expect("20");
+        q.push(ThreadId(30)).expect("30");
+
+        // Remove the middle element.
+        assert!(q.remove_tid(ThreadId(20)));
+        assert_eq!(q.len, 2);
+        assert_eq!(q.pop(), Some(ThreadId(10)));
+        assert_eq!(q.pop(), Some(ThreadId(30)));
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn ring_queue_remove_tid_returns_false_when_absent() {
+        let mut q = RingQueue::new();
+        q.push(ThreadId(5)).expect("5");
+        assert!(!q.remove_tid(ThreadId(99)));
+        assert_eq!(q.len, 1);
     }
 
     #[test]

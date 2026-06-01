@@ -5595,8 +5595,109 @@ fn apply_scheduler_handoff_plan_yield_to_hands_off_cpu() {
         .expect("plan YieldTo");
     assert!(switched, "YieldTo should hand off CPU to task 41");
     assert_eq!(state.current_tid(), Some(41));
-    // yield_current (called internally) already re-enqueues TID 0 before dispatching,
+    // yield_current_to (called internally) re-enqueues TID 0 before dispatching,
     // so idle remains in the membership table — no idle_re_enqueue_for_test needed here.
+}
+
+#[test]
+fn yield_current_to_dispatches_target_directly() {
+    // Verify that yield_current_to makes the target current in ONE scheduler step,
+    // even when idle (TID 0) is also queued ahead of the target.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(42).expect("target task");
+    state.register_task(43).expect("other task");
+
+    // Enqueue idle-like filler (TID 43) then target (TID 42) so TID 43 is at the
+    // head of the queue.  Normal FIFO dispatch would pick TID 43 first.
+    state.enqueue_current_cpu(43).expect("enqueue filler");
+    state.enqueue_current_cpu(42).expect("enqueue target");
+
+    // yield_current_to must skip TID 43 and dispatch TID 42 directly.
+    let switched = state
+        .yield_current_to(ThreadId(42))
+        .expect("yield_current_to");
+    assert!(switched, "target TID 42 should become current");
+    assert_eq!(state.current_tid(), Some(42));
+    // TID 43 should still be runnable in the queue (not discarded).
+    assert_eq!(
+        state.task_status(43),
+        Some(crate::kernel::task::TaskStatus::Runnable)
+    );
+    // TID 0 was re-enqueued by on_preempt; no idle_re_enqueue_for_test needed.
+}
+
+#[test]
+fn yield_current_to_falls_back_when_target_absent() {
+    // When the target is not in the run-queue, yield_current_to falls back to
+    // normal FIFO dispatch and returns false.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(50).expect("filler");
+    state.enqueue_current_cpu(50).expect("enqueue filler");
+
+    // TID 99 is registered but never enqueued — not runnable.
+    state.register_task(99).expect("absent target");
+
+    let switched = state
+        .yield_current_to(ThreadId(99))
+        .expect("yield_current_to fallback");
+    assert!(!switched, "absent target should return false");
+    // TID 50 should have become current via normal FIFO dispatch.
+    assert_eq!(state.current_tid(), Some(50));
+}
+
+#[test]
+fn yield_current_to_is_single_step_for_ipc_handoff() {
+    // Verify that the sync-endpoint IPC handoff uses yield_current_to (one scheduler
+    // operation) and that the receiver becomes current after exactly one yield call.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(70).expect("sender");
+    state.register_task(71).expect("receiver");
+
+    let (_eid, send_cap, recv_cap) = state
+        .create_endpoint_with_mode(5, EndpointMode::Synchronous)
+        .expect("sync endpoint");
+    let recv_cap_71 = state
+        .grant_capability_task_to_task(0, recv_cap, 71)
+        .expect("dup recv");
+    let send_cap_70 = state
+        .grant_capability_task_to_task(0, send_cap, 70)
+        .expect("dup send");
+
+    // Park receiver on the endpoint.
+    state.enqueue_current_cpu(71).expect("enqueue receiver");
+    state.yield_current().expect("run receiver");
+    assert_eq!(state.current_tid(), Some(71));
+    let mut recv_tf = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [recv_cap_71.0 as usize, 8, 0xA000, 0, 0, 0],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_tf))
+        .expect("recv trap");
+
+    // Switch to sender.
+    state.enqueue_current_cpu(70).expect("enqueue sender");
+    state.yield_current().expect("run sender");
+    if state.current_tid() != Some(70) {
+        state.yield_current().expect("sender retry");
+    }
+    assert_eq!(state.current_tid(), Some(70));
+
+    let yield_calls_before = state.ipc_path_telemetry().scheduler_yield_calls;
+    let msg = Message::new(70, b"direct").expect("msg");
+    let fast = state.ipc_send_fastpath(send_cap_70, msg).expect("fastpath");
+    // The inline_sync_handoff path calls ipc_send → apply_scheduler_handoff_plan
+    // → yield_current_to once. switched_to_waiter must be true (receiver ran).
+    assert!(fast.switched_to_waiter);
+    // Exactly one yield_current_to call happened (one scheduler_yield_calls increment).
+    let yield_delta = state
+        .ipc_path_telemetry()
+        .scheduler_yield_calls
+        .saturating_sub(yield_calls_before);
+    assert_eq!(yield_delta, 1, "one-shot handoff must fire exactly one yield");
+    // Telemetry confirms the rendezvous handoff was counted.
+    let t = state.ipc_path_telemetry();
+    assert_eq!(t.rendezvous_handoffs, 1);
 }
 
 #[test]

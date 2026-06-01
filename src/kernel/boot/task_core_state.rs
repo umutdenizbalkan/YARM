@@ -22,6 +22,7 @@ impl KernelState {
     ///   acquires `task_state_lock` and touches the address-space HAL.
     /// - Do NOT convert synchronous endpoint call sites to plan-first until a
     ///   hosted-dev dispatch replacement exists.
+    #[allow(dead_code)]
     pub(crate) fn switch_to_runnable_tid(&mut self, tid: ThreadId) -> Result<bool, KernelError> {
         let mut spins = 0usize;
         while spins < MAX_TASKS {
