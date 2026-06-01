@@ -52,6 +52,7 @@ pub mod syscall {
     const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
     const SYSCALL_IPC_CALL_NR: usize = 6;
     const SYSCALL_IPC_REPLY_NR: usize = 7;
+    const SYSCALL_FUTEX_WAIT_NR: usize = 9;
     const SYSCALL_YIELD_NR: usize = 0;
     pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
     pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
@@ -779,6 +780,31 @@ pub mod syscall {
         let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
         let spawner_cap = (ret.ret2 >> 32) as u32;
         Ok((ret.ret1 as u64, caller_cap, spawner_cap))
+    }
+
+    #[inline]
+    pub fn futex_wait(
+        addr: *const u32,
+        expected: u32,
+        observed: u32,
+    ) -> core::result::Result<bool, SyscallError> {
+        // SAFETY: Uses architecture syscall ABI to enter kernel. The kernel validates
+        // that `addr` names a readable current-user futex word before blocking.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_FUTEX_WAIT_NR,
+                [addr as usize, expected as usize, observed as usize, 0, 0, 0],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 > 1 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(ret.ret0 != 0)
     }
 
     #[inline]

@@ -10,6 +10,12 @@ yarm::install_freestanding_allocator!(
     "control-plane server freestanding allocator OOM"
 );
 
+#[cfg(not(feature = "hosted-dev"))]
+use core::sync::atomic::AtomicU32;
+
+#[cfg(not(feature = "hosted-dev"))]
+static INIT_IDLE_FUTEX: AtomicU32 = AtomicU32::new(0);
+
 #[inline]
 fn run() {
     yarm_control_plane_servers::run_init_server();
@@ -34,7 +40,25 @@ pub extern "C" fn yarm_user_entry() -> ! {
         }
     }
     yarm_user_rt::user_log!("INIT_NO_RECV_CAP_EXPECTED_ONE_SHOT_IDLE");
+    yarm_user_rt::user_log!("INIT_IDLE_PARK_BEGIN");
     loop {
+        let observed = INIT_IDLE_FUTEX.load(core::sync::atomic::Ordering::Relaxed);
+        yarm_user_rt::user_log!("INIT_IDLE_PARK_FUTEX_BEGIN");
+        match yarm::user_rt::syscall::futex_wait(INIT_IDLE_FUTEX.as_ptr(), observed, observed) {
+            Ok(blocked) => {
+                yarm_user_rt::user_log!(
+                    "INIT_IDLE_PARK_FUTEX_RETURN ret={}",
+                    usize::from(blocked)
+                );
+                if blocked {
+                    continue;
+                }
+            }
+            Err(err) => {
+                yarm_user_rt::user_log!("INIT_IDLE_PARK_FUTEX_RETURN ret={}", err as usize);
+            }
+        }
+        yarm_user_rt::user_log!("INIT_IDLE_PARK_FALLBACK_YIELD");
         let _ = yarm::user_rt::syscall::yield_now();
     }
 }
