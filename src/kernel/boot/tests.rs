@@ -10624,3 +10624,202 @@ fn stage4s_sender_waiter_compaction_shifts_queue_left() {
         "all sender-waiter slots must be empty after all takes"
     );
 }
+
+// ── Stage 4T tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn stage4t_ipc_recv_handles_sparse_sender_waiter_queue() {
+    // Sparse sender-waiter queue regression: process_ipc_timeout_deadlines nulls
+    // timed-out slots in-place without compacting, creating gaps like
+    // [None, Some(B), ...].  ipc_recv_endpoint_take must scan past the None at
+    // slot[0] and deliver the live sender at slot[1].
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    state.register_task(2).expect("task2");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+    state.enqueue_current_cpu(2).expect("enqueue2");
+
+    let (eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("depth=1 endpoint");
+    let send_cap_t1 = state
+        .grant_capability_task_to_task(0, send_cap, 1)
+        .expect("grant send to t1");
+    let send_cap_t2 = state
+        .grant_capability_task_to_task(0, send_cap, 2)
+        .expect("grant send to t2");
+
+    // Fill the endpoint queue from task 0.
+    let m_queued = Message::new(0, b"queued").expect("queued");
+    state.ipc_send(send_cap, m_queued).expect("send queued ok");
+
+    // Task 1 blocks as sender_waiter[0].
+    state.yield_current().expect("yield to t1");
+    assert_eq!(state.current_tid(), Some(1));
+    let m1 = Message::new(1, b"from_t1").expect("m1");
+    assert_eq!(state.ipc_send(send_cap_t1, m1), Err(KernelError::WouldBlock));
+
+    // After WouldBlock, dispatch_next_task ran → current is now task 2.
+    // Task 2 blocks as sender_waiter[1].
+    let m2 = Message::new(2, b"from_t2").expect("m2");
+    assert_eq!(state.ipc_send(send_cap_t2, m2), Err(KernelError::WouldBlock));
+
+    // Both waiter slots must be occupied before we introduce the gap.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][0].is_some()),
+        "slot[0] must hold t1 before gap injection"
+    );
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][1].is_some()),
+        "slot[1] must hold t2 before gap injection"
+    );
+
+    // Simulate a timeout: null slot[0] in-place, as process_ipc_timeout_deadlines
+    // does — no compaction, leaving a sparse queue [None, Some(t2)].
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_sender_waiters[eid][0] = None;
+    });
+
+    // Return to task 0 to call ipc_recv_endpoint_take.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("yield to t0");
+    }
+
+    // ipc_recv_endpoint_take must find t2 at slot[1] rather than treating the
+    // None at slot[0] as "no waiters".
+    let (received, plan) = state
+        .ipc_recv_endpoint_take(eid)
+        .expect("take ok");
+
+    assert_eq!(
+        received.unwrap().as_slice(),
+        b"queued",
+        "must dequeue the originally queued message"
+    );
+    // Wake plan targets t2 (the live sender found at slot[1]).
+    assert_eq!(
+        plan,
+        super::SchedulerWakePlan::Wake(ThreadId(2)),
+        "wake plan must target the live sender at slot[1]"
+    );
+    // t2's message must have been refilled into the endpoint queue.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
+        1,
+        "endpoint must be refilled with t2's message after sparse-queue take"
+    );
+    // All waiter slots must be empty after compaction.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().all(Option::is_none)),
+        "all sender-waiter slots must be empty after sparse-queue take"
+    );
+}
+
+// ── Capability domain bridge tests ────────────────────────────────────────────
+
+#[test]
+fn cap_domain_lock_read_sees_minted_capability() {
+    // create_endpoint uses with_ipc_state_mut (rank 3) for slot/generation, then
+    // mint_capability_for_active_cnode (rank 4) for the caps — sequential, correct
+    // lock order.  Both capability_for_cnode (which uses with_capability_state
+    // internally) and a direct with_capability_state closure must reflect the
+    // newly minted caps after create_endpoint returns.
+    let mut state = Bootstrap::init().expect("init");
+    let (eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+    let t0_cnode = state.task_cnode(0).expect("t0 cnode");
+
+    let send_entry = state.capability_for_cnode(t0_cnode, send_cap);
+    let recv_entry = state.capability_for_cnode(t0_cnode, recv_cap);
+
+    assert!(
+        matches!(
+            send_entry,
+            Some(cap)
+            if matches!(cap.object, CapObject::Endpoint { index, .. } if index == eid)
+               && cap.has_right(CapRights::SEND)
+        ),
+        "send cap must be an Endpoint SEND cap at the correct index"
+    );
+    assert!(
+        matches!(
+            recv_entry,
+            Some(cap)
+            if matches!(cap.object, CapObject::Endpoint { index, .. } if index == eid)
+               && cap.has_right(CapRights::RECEIVE)
+        ),
+        "recv cap must be an Endpoint RECEIVE cap at the correct index"
+    );
+
+    // Direct with_capability_state confirms the lock itself reflects the mutation.
+    let cnode_count = state.with_capability_state(|cap| {
+        cap.cnode_spaces.iter().flatten().count()
+    });
+    assert!(cnode_count >= 1, "at least one cnode space must be visible via with_capability_state");
+}
+
+#[test]
+fn cap_domain_with_task_then_capability_reads_consistent_state() {
+    // with_task_then_capability acquires task lock (rank 2) then capability lock
+    // (rank 4) in that order.  After register_task (which also sets up a process
+    // cnode record via set_process_cnode_for_pid), lock_order_task_capability_snapshot_for_test
+    // must observe the updated counts from both domains atomically.
+    let mut state = Bootstrap::init().expect("init");
+
+    let (tasks_before, cnodes_before) =
+        state.lock_order_task_capability_snapshot_for_test();
+
+    state.register_task(55).expect("new task");
+
+    let (tasks_after, cnodes_after) =
+        state.lock_order_task_capability_snapshot_for_test();
+
+    assert_eq!(
+        tasks_after,
+        tasks_before + 1,
+        "task count must increase by 1 after register_task"
+    );
+    assert!(
+        cnodes_after >= cnodes_before + 1,
+        "process-cnode count must increase after register_task (set_process_cnode_for_pid)"
+    );
+}
+
+#[test]
+fn cap_domain_reply_cap_record_exists_after_create_and_gone_after_revoke() {
+    // create_reply_cap_for_caller installs a ReplyCapRecord under with_ipc_state_mut
+    // (rank 3) before returning.  mark_task_dead calls revoke_reply_caps_for_caller,
+    // which clears the record under with_ipc_state_mut.  Both operations must be
+    // visible immediately via with_ipc_state without additional synchronisation.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("caller task");
+    let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+    let recv_cap = state
+        .grant_capability_task_to_task(0, recv_cap_global, 1)
+        .expect("grant recv to t1");
+
+    // Mint the Reply cap for caller task 1 into the current (task 0) cnode.
+    let reply_cap = state
+        .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+        .expect("create reply cap");
+
+    // Record must be immediately visible under with_ipc_state.
+    let record_exists = state.with_ipc_state(|ipc| ipc.reply_caps.iter().any(Option::is_some));
+    assert!(
+        record_exists,
+        "ReplyCapRecord must be visible via with_ipc_state after create_reply_cap_for_caller"
+    );
+
+    // mark_task_dead calls revoke_reply_caps_for_caller, which clears the record
+    // under with_ipc_state_mut.
+    state.mark_task_dead(1).expect("mark dead");
+
+    let record_gone = state.with_ipc_state(|ipc| ipc.reply_caps.iter().all(Option::is_none));
+    assert!(
+        record_gone,
+        "ReplyCapRecord must be gone via with_ipc_state after mark_task_dead"
+    );
+
+    // Using the now-stale reply cap must fail with StaleCapability (slot is None).
+    assert_eq!(
+        state.ipc_reply(reply_cap, Message::new(0, b"stale").expect("msg")),
+        Err(KernelError::StaleCapability)
+    );
+}

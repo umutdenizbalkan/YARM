@@ -1076,47 +1076,34 @@ impl KernelState {
         max_depth: usize,
         mode: EndpointMode,
     ) -> Result<(usize, CapId, CapId), KernelError> {
-        let limits = self.runtime_capacity_config();
-        let mut slot_index = None;
-        for (idx, slot) in self
-            .ipc
-            .endpoints
-            .iter()
-            .take(limits.max_endpoints)
-            .enumerate()
-        {
-            if slot.is_none() {
-                slot_index = Some(idx);
-                break;
+        let max_endpoints = self.runtime_capacity_config().max_endpoints;
+        // Atomic under ipc_state_lock: find free slot, assign generation, store endpoint.
+        // Capability minting happens outside the lock (capability rank 4 > ipc rank 3).
+        let (endpoint_idx, generation) = self.with_ipc_state_mut(|ipc| {
+            let slot = ipc
+                .endpoints
+                .iter()
+                .take(max_endpoints)
+                .position(Option::is_none)
+                .ok_or(KernelError::EndpointFull)?;
+            let mut next_gen = ipc.endpoint_generations[slot].wrapping_add(1);
+            if next_gen == 0 {
+                next_gen = 1;
             }
-        }
-
-        let endpoint_idx = slot_index.ok_or(KernelError::EndpointFull)?;
-        let mut next_generation = self.ipc.endpoint_generations[endpoint_idx].wrapping_add(1);
-        if next_generation == 0 {
-            next_generation = 1;
-        }
-        self.ipc.endpoint_generations[endpoint_idx] = next_generation;
-        self.ipc.endpoints[endpoint_idx] = Some(super::store_kernel_value(
-            Endpoint::new_with_mode(max_depth, mode).map_err(map_ipc_error)?,
-        ));
-
+            ipc.endpoint_generations[slot] = next_gen;
+            ipc.endpoints[slot] = Some(super::store_kernel_value(
+                Endpoint::new_with_mode(max_depth, mode).map_err(map_ipc_error)?,
+            ));
+            Ok::<_, KernelError>((slot, next_gen))
+        })?;
         let send_cap = self.mint_capability_for_active_cnode(Capability::new(
-            CapObject::Endpoint {
-                index: endpoint_idx,
-                generation: self.ipc.endpoint_generations[endpoint_idx],
-            },
+            CapObject::Endpoint { index: endpoint_idx, generation },
             CapRights::SEND,
         ))?;
-
         let recv_cap = self.mint_capability_for_active_cnode(Capability::new(
-            CapObject::Endpoint {
-                index: endpoint_idx,
-                generation: self.ipc.endpoint_generations[endpoint_idx],
-            },
+            CapObject::Endpoint { index: endpoint_idx, generation },
             CapRights::RECEIVE,
         ))?;
-
         Ok((endpoint_idx, send_cap, recv_cap))
     }
 
@@ -1124,35 +1111,30 @@ impl KernelState {
         &mut self,
         max_depth: usize,
     ) -> Result<(usize, CapId, CapId), KernelError> {
-        let limits = self.runtime_capacity_config();
-
-        let mut slot_index = None;
-        for (idx, slot) in self
-            .ipc
-            .notifications
-            .iter()
-            .take(limits.max_notifications)
-            .enumerate()
-        {
-            if slot.is_none() {
-                slot_index = Some(idx);
-                break;
+        let max_notifications = self.runtime_capacity_config().max_notifications;
+        // Slot selection, generation bump, and object storage are atomic under
+        // ipc_state_lock. Capability minting happens outside the lock (cap rank
+        // 4 > ipc rank 3; acquiring both simultaneously would invert lock order).
+        let (notification_idx, generation) = self.with_ipc_state_mut(|ipc| {
+            let slot = ipc
+                .notifications
+                .iter()
+                .take(max_notifications)
+                .position(Option::is_none)
+                .ok_or(KernelError::EndpointFull)?;
+            let mut next_gen = ipc.notification_generations[slot].wrapping_add(1);
+            if next_gen == 0 {
+                next_gen = 1;
             }
-        }
-
-        let notification_idx = slot_index.ok_or(KernelError::EndpointFull)?;
-        let mut next_generation =
-            self.ipc.notification_generations[notification_idx].wrapping_add(1);
-        if next_generation == 0 {
-            next_generation = 1;
-        }
-        self.ipc.notification_generations[notification_idx] = next_generation;
-        self.ipc.notifications[notification_idx] = Some(NotificationObject::new(max_depth)?);
+            ipc.notification_generations[slot] = next_gen;
+            ipc.notifications[slot] = Some(NotificationObject::new(max_depth)?);
+            Ok::<_, KernelError>((slot, next_gen))
+        })?;
 
         let notification_cap = self.mint_capability_for_active_cnode(Capability::new(
             CapObject::Notification {
                 index: notification_idx,
-                generation: self.ipc.notification_generations[notification_idx],
+                generation,
             },
             CapRights::SIGNAL,
         ))?;
@@ -1160,7 +1142,7 @@ impl KernelState {
         let recv_cap = self.mint_capability_for_active_cnode(Capability::new(
             CapObject::Notification {
                 index: notification_idx,
-                generation: self.ipc.notification_generations[notification_idx],
+                generation,
             },
             CapRights::RECEIVE,
         ))?;
@@ -1725,12 +1707,25 @@ impl KernelState {
                 };
                 kernel_mut(ep_storage).recv()
             };
-            // 1b: Compact sender-waiter queue (inline dequeue+shift).
+            // 1b: Compact sender-waiter queue.
+            //
+            // Scan for the first live sender rather than always taking slot[0]:
+            // process_ipc_timeout_deadlines nulls expired slots in-place without
+            // compacting, creating sparse queues ([None, Some(B), ...]). Taking
+            // only slot[0] would miss live senders at positions > 0, permanently
+            // stranding them.  Full left-compaction after the take keeps the queue
+            // dense for subsequent operations.
             let opt_waiter = {
                 let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
-                if let Some(head) = queue[0].take() {
-                    for i in 1..queue.len() {
-                        queue[i - 1] = queue[i].take();
+                if let Some(idx) = queue.iter().position(Option::is_some) {
+                    let head = queue[idx].take().expect("position guarantees Some");
+                    // Full left-compact: move remaining Some entries to the front.
+                    let mut write = 0;
+                    for read in 0..queue.len() {
+                        if queue[read].is_some() {
+                            queue[write] = queue[read].take();
+                            write += 1;
+                        }
                     }
                     Some(head)
                 } else {

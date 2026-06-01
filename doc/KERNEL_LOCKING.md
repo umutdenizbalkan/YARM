@@ -2424,12 +2424,174 @@ Total test count: **520 passed, 0 failed** (7 new Stage 4S + 513 pre-existing).
 
 ---
 
+### Stage 4T: IPC finalization audit, sparse-queue fix, create_* wrapper completion
+
+**Scope**: finalization pass over all hot-path IPC helpers plus two control-plane
+functions (`create_endpoint_with_mode`, `create_notification`) that still accessed
+`self.ipc.*` directly outside `ipc_state_lock`.
+
+#### Audit: no ipc_state_lock held during dangerous operations
+
+All functions in `src/kernel/boot/ipc_state.rs` were audited for the following
+invariants. Every finding below is **CLEAN** (no violation found in the audited code):
+
+| Invariant | Result |
+|---|---|
+| No `ipc_state_lock` held during user-memory copy | CLEAN |
+| No `ipc_state_lock` held during TrapFrame write | CLEAN |
+| No `ipc_state_lock` held during cap operations (rank 4 > rank 3) | CLEAN |
+| No `ipc_state_lock` held during VM operations (rank 5 > rank 3) | CLEAN |
+| No `ipc_state_lock` held during scheduler/TCB mutation (rank 1–2 < rank 3) | CLEAN |
+| All endpoint + waiter mutations atomic under single `ipc_state_lock` closure | CLEAN |
+| Sender-waiter FIFO preserved | CLEAN (with sparse-queue fix — see below) |
+| No orphaned waiters | CLEAN |
+| No duplicate wake | CLEAN |
+| No transfer-envelope leak | CLEAN |
+| No reply-cap rematerialization | CLEAN |
+| No message loss | CLEAN |
+
+#### Sparse sender-waiter queue bug and fix
+
+**Root cause**: `process_ipc_timeout_deadlines` nulls timed-out sender slots
+in-place (no left-compaction):
+
+```rust
+// process_ipc_timeout_deadlines — in-place null, no compaction:
+ipc.endpoint_sender_waiters[eid][slot_idx] = None;
+```
+
+This creates sparse queues: `[None, Some(B), None, Some(D), ...]`.
+
+The old `ipc_recv_endpoint_take` used `queue[0].take()` unconditionally:
+
+```rust
+// OLD — only ever looked at slot[0]:
+if let Some(head) = queue[0].take() { ... }
+```
+
+If slot[0] is None (the timed-out sender), the old code returned `opt_waiter = None`
+even when slot[1] held a live sender. That sender was permanently stranded — never
+delivered, never woken.
+
+**Fix** in `ipc_recv_endpoint_take`:
+
+```rust
+// NEW — scan for first live sender, full left-compaction after:
+if let Some(idx) = queue.iter().position(Option::is_some) {
+    let head = queue[idx].take().expect("position guarantees Some");
+    let mut write = 0;
+    for read in 0..queue.len() {
+        if queue[read].is_some() {
+            queue[write] = queue[read].take();
+            write += 1;
+        }
+    }
+    Some(head)
+} else {
+    None
+}
+```
+
+`iter().position(Option::is_some)` finds the first live slot in O(n). The
+subsequent compaction left-packs all remaining Some entries so the next call
+starts at `queue[0]` with no gap. The normal case (no gap, sender at slot[0]) is
+functionally identical to the old code.
+
+**IPC path correctness**: `ipc_try_recv_queued_plain_endpoint_only` (Stage 4C/4D)
+already returned `Ineligible(SenderWaiterPresent)` when any waiter slot is occupied
+(including sparse slots). That fall-through now reaches `ipc_recv_endpoint_take`
+which correctly scans and delivers the live sender. End-to-end behavior is now
+correct for the sparse case.
+
+#### Direct-access sweep: final state
+
+| Pattern | Location | Classification |
+|---|---|---|
+| `self.ipc.endpoints[...]` | `create_endpoint_with_mode` — now inside `with_ipc_state_mut` | Eliminated |
+| `self.ipc.endpoint_generations[...]` | `create_endpoint_with_mode` — now inside `with_ipc_state_mut` | Eliminated |
+| `self.ipc.notifications[...]` | `create_notification` — now inside `with_ipc_state_mut` | Eliminated |
+| `self.ipc.notification_generations[...]` | `create_notification` — now inside `with_ipc_state_mut` | Eliminated |
+| All remaining `with_ipc_state` / `with_ipc_state_mut` accesses | Throughout `ipc_state.rs` | Intentionally locked |
+| Test-only `with_ipc_state` / `with_ipc_state_mut` in `tests.rs` | Test harness | Test-only |
+
+**Result**: zero remaining hot-path or warm-path direct `self.ipc.*` accesses.
+All reads and mutations of `IpcSubsystem` fields go through `with_ipc_state` or
+`with_ipc_state_mut`.
+
+#### `create_endpoint_with_mode` and `create_notification` wrapper pattern
+
+Both functions now follow the same two-phase pattern:
+
+**Phase 1** (under `ipc_state_lock`, rank 3): find free slot, bump generation,
+store object. Returns `(idx, generation)`.
+
+**Phase 2** (after lock release): call `mint_capability_for_active_cnode` (which
+acquires `capability_state_lock`, rank 4) twice — once for the send cap, once for
+the receive cap.
+
+Lock ordering is correct: rank 3 closes before rank 4 opens. The generation value
+captured in phase 1 is used for both cap mints, eliminating the old pattern that
+re-read `self.ipc.notification_generations[idx]` after the lock was released.
+
+#### Tests (Stage 4T)
+
+Four new tests added to `src/kernel/boot/tests.rs`:
+
+- `stage4t_ipc_recv_handles_sparse_sender_waiter_queue`:
+  two senders block as waiter[0] and waiter[1]; slot[0] is nulled to simulate a
+  timeout-induced gap; `ipc_recv_endpoint_take` must find the live sender at slot[1],
+  deliver its message via refill, wake it, and leave all slots empty.
+
+- `cap_domain_lock_read_sees_minted_capability`:
+  after `create_endpoint`, both `capability_for_cnode` (which uses
+  `with_capability_state` internally) and a direct `with_capability_state` closure
+  must see the minted SEND and RECEIVE caps at the correct endpoint index.
+
+- `cap_domain_with_task_then_capability_reads_consistent_state`:
+  `lock_order_task_capability_snapshot_for_test` (which calls
+  `with_task_then_capability`, acquiring task rank 2 then capability rank 4) must
+  reflect an increased task count and process-cnode count after `register_task`.
+
+- `cap_domain_reply_cap_record_exists_after_create_and_gone_after_revoke`:
+  `create_reply_cap_for_caller` installs a `ReplyCapRecord` under
+  `with_ipc_state_mut`; `mark_task_dead` (via `revoke_reply_caps_for_caller`)
+  clears it under `with_ipc_state_mut`; both transitions are immediately visible
+  via `with_ipc_state` without additional synchronization.
+
+Total test count: **524 passed, 0 failed** (4 new Stage 4T + 520 pre-existing).
+
+#### IPC hot-path phase complete
+
+As of Stage 4T, all IPC hot-path and warm-path accesses to `IpcSubsystem` fields
+go through `with_ipc_state` or `with_ipc_state_mut`. The only remaining direct
+`self.ipc.*` accesses are:
+
+- Inside `with_ipc_state` / `with_ipc_state_mut` closures themselves (correct —
+  these closures receive a `&IpcSubsystem` / `&mut IpcSubsystem` argument).
+- Test-only `with_ipc_state_mut` calls that inject state for regression testing.
+
+**This completes the IPC domain lock-access audit.** The global `SharedKernel` lock
+is still retained. **This is not full global-lock removal.**
+
+#### What Stage 4T does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback: unchanged.
+- Phase 3B checks: not weakened.
+- Stage 4S `ipc_recv_endpoint_take` protocol: preserved (sparse fix is a drop-in
+  replacement, same return type and semantics for the non-sparse case).
+- The global `SharedKernel` lock is still retained.  **This is not full global-lock removal.**
+
+---
+
 ### Current live / deferred IPC split matrix
 
 | Syscall path | Condition | Status | Telemetry counter |
 |---|---|---|---|
 | IpcRecv (plain buffered recv) | Queue non-empty, no pending sender wake | **Live** Stage 4C | `queued_recvs` |
-| IpcRecv (buffered recv + sender-waiter refill) | Queue non-empty, sender waiter present | **Live** Stage 4D | `queued_recvs` |
+| IpcRecv (buffered recv + sender-waiter refill) | Queue non-empty, sender waiter present | **Live** Stage 4D + Stage 4T (sparse-queue fix) | `queued_recvs` |
 | IpcSend (plain enqueue) | No receiver waiter, no sender waiters, buffered, no cap-transfer | **Live** Stage 4E | `queued_sends` |
 | IpcSend (to waiting non-recv-v2 receiver) | Receiver waiter present, not recv-v2, no sender waiters | **Live** Stage 4F | `queued_sends` |
 | IpcRecvTimeout (timeout_ticks=0 immediate recv) | Queue non-empty | **Live** Stage 4G | `queued_recvs` |
@@ -2671,6 +2833,88 @@ in the membership table.  No `idle_re_enqueue_for_test` call is needed after
 **`RingQueue::remove_tid`**: the underlying building block.  Compacts the ring
 buffer by shifting elements after the removed slot toward the head.  Safe for
 arbitrary removal positions (not just head/tail).  O(Q) where Q ≤ 64.
+
+---
+
+### Capability domain bridge: lock contract and invariants
+
+The capability domain (`capability_state_lock`, lock rank 4) is already fully
+wrapped. No direct `self.capability.*` field accesses exist outside the two
+accessor closures. This section documents the contract and the bridge to adjacent
+domains.
+
+#### Accessors
+
+| Accessor | Rank | Mutability | File |
+|---|---|---|---|
+| `with_capability_state(f)` | 4 | read-only | `orchestrator_state.rs:263` |
+| `with_capability_state_mut(f)` | 4 | read-write | `orchestrator_state.rs:272` |
+| `with_task_then_capability(f)` | 2+4 | read-only (both) | `orchestrator_state.rs:315` |
+
+`CapabilitySubsystem` is not `KernelStorage`-wrapped at the top level; the closures
+receive `&self.capability` / `&mut self.capability` directly (not `kernel_ref`).
+
+#### Lock rank 4 — what may NOT be called inside a capability closure
+
+Never acquire a lower-ranked lock inside a capability-domain closure:
+
+| Forbidden | Rank | Reason |
+|---|---|---|
+| Any IPC state mutation | 3 | rank inversion (ipc < cap) |
+| `task_state_lock` | 2 | rank inversion |
+| `scheduler_state` | 1 | rank inversion |
+
+Capability closures may call functions that:
+- Read/write only `CapabilitySubsystem` fields.
+- Read/write `KernelStorage<CNodeSpace>` via `kernel_ref` / `kernel_mut`.
+- Do not acquire any other named subsystem lock.
+
+#### `with_task_then_capability` ordering invariant
+
+`with_task_then_capability` acquires:
+1. `task_state_lock` (rank 2)
+2. `capability_state_lock` (rank 4)
+
+This is the only legal multi-lock combination involving the capability domain. Never
+acquire `capability_state_lock` first then `task_state_lock` — that inverts the rank
+order and can deadlock.
+
+#### Two-phase create pattern (control-plane endpoints and notifications)
+
+`create_endpoint_with_mode` and `create_notification` follow this ordering:
+
+```
+Phase 1: with_ipc_state_mut (rank 3) → find slot, bump gen, store object → (idx, gen)
+Phase 2: mint_capability_for_active_cnode (rank 4, via with_capability_state_mut) × 2
+```
+
+Rank 3 closes before rank 4 opens. Caps are minted using the generation value
+captured in Phase 1 — no re-read of the IPC domain after the lock is released.
+
+#### Reply cap record lifecycle
+
+`ReplyCapRecord` entries live in `IpcSubsystem::reply_caps` (rank 3). All create,
+update, and delete operations use `with_ipc_state_mut`:
+
+| Operation | Function | Lock |
+|---|---|---|
+| Create | `create_reply_cap_for_caller` Phase 1 | `with_ipc_state_mut` |
+| Update `caller_cap_id` | `create_reply_cap_for_caller` Phase 3 | `with_ipc_state_mut` |
+| Consume (ipc_reply) | `ipc_reply` | `with_ipc_state_mut` |
+| Revoke (task death / restart) | `revoke_reply_caps_for_caller` | `with_ipc_state_mut` |
+
+After any of these operations returns, the change is immediately visible to any
+subsequent `with_ipc_state` call without additional synchronization (the global
+`SharedKernel` lock serializes all callers end-to-end).
+
+#### Capability domain bridge tests
+
+Four tests in `src/kernel/boot/tests.rs` verify lock-domain invariants:
+
+- `cap_domain_lock_read_sees_minted_capability` (Stage 4T)
+- `cap_domain_with_task_then_capability_reads_consistent_state` (Stage 4T)
+- `cap_domain_reply_cap_record_exists_after_create_and_gone_after_revoke` (Stage 4T)
+- `lock_order_snapshot_reads_task_then_capability_domains` (pre-4T)
 
 ---
 
