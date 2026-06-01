@@ -3,26 +3,62 @@
 # YARM Syscall ABI v10 (Frozen Contract)
 
 - ABI Version: `10`
-- Syscall count: `16`
+- Public syscall count: `16` (`0..=15`)
+- Kernel dispatch table count: `30` (`SYSCALL_COUNT`, slots `0..=29`)
 
-## Syscall numbers
+## Public ABI v10 syscall numbers
 
-- `0`: `Yield`
-- `1`: `IpcSend`
-- `2`: `IpcRecv`
-- `3`: `VmMap` (YARM-native VM map syscall, capability-targeted)
-- `4`: `TransferRelease` (release a recv auto-mapped shared-memory transfer)
-- `5`: `IpcRecvTimeout` (bounded non-blocking receive with scheduler-yield retry budget)
-- `6`: `IpcCall` (send with kernel-minted ephemeral reply-cap transfer)
-- `7`: `IpcReply` (consume reply-cap and send reply to bound caller endpoint)
-- `8`: `ControlPlaneSetCnodeSlots` (control-plane cnode slot-capacity resize by target process id)
-- `9`: `FutexWait` (`arg0=addr`, `arg1=expected`, `arg2=observed`)
-- `10`: `FutexWake` (`arg0=addr`, `arg1=max_wake`)
-- `11`: `SpawnThread` (`arg0=tls_base`, `arg1=user_stack_top`, `arg2=user_entry`)
-- `12`: `Fork` (fork current process with CoW; return child tid in parent)
-- `13`: `VmAnonMap` (reserved; currently returns `InvalidArgs`)
-- `14`: `VmBrk` (staged: query, grow, and page-granular shrink supported)
-- `27`: `InitramfsReadChunk` (**PM-only / privileged**, Phase 2A/2B bootstrap bridge — see below)
+`SYSCALL_COUNT` in the kernel is the dispatch-table size, not the public ABI
+count. The current public ABI v10 surface is the contiguous user-callable range
+`0..=15` (**16 slots**). Some public slots still enforce capability or control
+plane policy and can return `MissingRight`; that does not make them private
+kernel-extension slots.
+
+| Nr | Name | Public ABI status |
+|----|------|-------------------|
+| `0` | `Yield` | public |
+| `1` | `IpcSend` | public, endpoint capability/right checked |
+| `2` | `IpcRecv` | public, endpoint capability/right checked |
+| `3` | `VmMap` | public, capability-targeted YARM-native VM map syscall |
+| `4` | `TransferRelease` | public, releases a recv auto-mapped shared-memory transfer |
+| `5` | `IpcRecvTimeout` | public, bounded non-blocking receive with scheduler-yield retry budget |
+| `6` | `IpcCall` | public, send with kernel-minted ephemeral reply-cap transfer |
+| `7` | `IpcReply` | public, consumes a reply-cap and sends reply to the bound caller endpoint |
+| `8` | `ControlPlaneSetCnodeSlots` | public control-plane ABI; policy-gated by `control_plane_set_process_cnode_slots`, non-authorized callers receive `MissingRight` |
+| `9` | `FutexWait` | public (`arg0=addr`, `arg1=expected`, `arg2=observed`) |
+| `10` | `FutexWake` | public (`arg0=addr`, `arg1=max_wake`) |
+| `11` | `SpawnThread` | public (`arg0=tls_base`, `arg1=user_stack_top`, `arg2=user_entry`) |
+| `12` | `Fork` | public, forks current process with CoW and returns child tid in parent |
+| `13` | `VmAnonMap` | reserved public syscall number; currently returns `InvalidArgs` |
+| `14` | `VmBrk` | public staged syscall; query, grow, and page-granular shrink are supported |
+| `15` | `DebugLog` | public debug logging syscall |
+
+## Reserved and gap slots
+
+- `16..=22`: reserved/unassigned in ABI v10. `Syscall::decode` rejects these
+  numbers with `InvalidNumber`.
+- `25`: reserved/unassigned in ABI v10. `Syscall::decode` rejects this number
+  with `InvalidNumber`.
+- `30+`: outside the current kernel dispatch table and rejected with
+  `InvalidNumber`.
+
+## Privileged kernel extensions
+
+The kernel currently declares `SYSCALL_COUNT = 30`, so dispatch-table slots
+`0..=29` are in range. This is deliberately a different concept from the
+public ABI count above: slots `23`, `24`, `26`, `27`, `28`, and `29` are
+non-public kernel extensions used by PM, SystemServer, and bootstrap service
+plumbing. They are documented here so integrators can distinguish reserved
+holes from implemented privileged paths.
+
+| Nr | Name | Caller restriction | Args | Returns | Failure / denial | Related docs |
+|----|------|--------------------|------|---------|------------------|--------------|
+| `23` | `SpawnProcess` | Privileged/bootstrap spawn extension intended for PM/control-plane bootstrap use. The current handler does not perform a class/TID gate before loading from the boot initrd. | `arg0=image_id`, `arg1=parent_pid`, `arg2=startup_args_ptr`, `arg3=startup_args_count`, `arg4..arg5` reserved/unused. | On success, `ret0=0`, `ret1=spawned_tid`, `ret2=service send cap` or packed spawner/parent send caps. | Invalid image IDs, malformed startup args, missing initrd entries, ELF/load failures, task/capacity exhaustion, or user-copy failures return the corresponding syscall error; no access-denial error is emitted by this handler today. | `PM_SPAWN_CONTRACT.md` bootstrap boundary |
+| `24` | `SpawnProcessFromUserBuf` | Privileged staging extension intended for PM/control-plane use. The current handler does not perform a class/TID gate before copying the caller-supplied ELF buffer. | `arg0=image_id`, `arg1=elf_user_ptr`, `arg2=elf_len`, `arg3=parent_pid`, `arg4=startup_args_ptr`, `arg5=startup_args_count`. | On success, `ret0=0`, `ret1=spawned_tid`, `ret2=service send cap` or packed spawner/parent send caps. | `elf_user_ptr == 0`, `elf_len == 0`, `elf_len > 128 KiB`, invalid user memory, malformed ELF/startup args, or spawn/load/capacity failures return an error; no access-denial error is emitted by this handler today. | PM spawn staging/history |
+| `26` | `SpawnFromInitramfsFile` | PM/VFS-backed spawn extension used by PM for image IDs `>= 4` through `pm_vfs_spawn_inline`. The current handler does not perform a class/TID gate before reading the named initramfs file. | `arg0=image_id`, `arg1=name_ptr`, `arg2=name_len`, `arg3=parent_pid`, `arg4=startup_args_ptr`, `arg5=startup_args_count`. | On success, `ret0=0`, `ret1=spawned_tid`, `ret2=service send cap` or packed spawner/parent send caps. | Empty/overlong names, invalid user memory/UTF-8, missing initrd entries, invalid image IDs, malformed ELF/startup args, or spawn/load/capacity failures return an error; no access-denial error is emitted by this handler today. | `PM_SPAWN_CONTRACT.md` (`pm_vfs_spawn_inline`) |
+| `27` | `InitramfsReadChunk` | SystemServer-only Phase 2A/2B bootstrap bridge. Non-`TaskClass::SystemServer` callers receive `MissingRight`. `arg5` target writes are limited to `0` (self) or PM TID `3`; other targets receive `MissingRight`. | `arg0=name_ptr`, `arg1=name_len`, `arg2=offset`, `arg3=dst_ptr`, `arg4=max_len` (clamped to `4096`), `arg5=target_tid` (`0` self, `3` PM). | On success, `ret0=0`, `ret1=bytes_copied`, `ret2=0`. EOF returns success with `ret1=0`. | Non-SystemServer or invalid target receives `MissingRight`; invalid names/pointers/UTF-8/initrd access return errors; file-not-found returns `Internal` rather than EOF. | Phase 2A/2B bootstrap bridge notes below |
+| `28` | `CreateInitramfsFileSliceMo` | SystemServer-only (`initramfs_srv`) Phase 3A bridge. Non-`TaskClass::SystemServer` callers receive `MissingRight`. | `arg0=name_ptr`, `arg1=name_len`, `arg2=flags` (reserved, must be `0`), `arg3..arg5` reserved/unused. | On success, `ret0=0`, `ret1=cap_id`, `ret2=file_len`. | Non-SystemServer receives `MissingRight`; empty/overlong names, nonzero flags, invalid user memory/UTF-8, missing/empty files, bounds failures, or MemoryObject/capability allocation failures return errors. | MemoryObject-backed initramfs spawn path |
+| `29` | `SpawnFromMemoryObject` | PM-only Phase 3A zero-copy spawn path. Caller TID must be PM bootstrap TID `3`; other callers receive `MissingRight`. | `arg0=image_id`, `arg1=mo_cap`, `arg2=parent_pid`, `arg3=startup_args_ptr`, `arg4=startup_args_count`, `arg5` reserved/unused. | On success, `ret0=0`, `ret1=spawned_tid`, `ret2=service send cap` or packed spawner/parent send caps. | Non-PM callers receive `MissingRight`; invalid caps, wrong object type/kind, invalid initrd slice bounds, malformed ELF/startup args, or spawn/load/capacity failures return errors. | Phase 3A MemoryObject zero-copy spawn path |
 
 ## Syscalls `9..14` status
 

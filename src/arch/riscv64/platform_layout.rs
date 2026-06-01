@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-// RISC-V 64 prototype platform layout constants.
+// RISC-V 64 QEMU `virt`/OpenSBI platform layout constants.
+//
+// This profile is concrete for YARM's supported riscv64 smoke target. It keeps
+// the fixed QEMU `virt` PLIC base/context and current bootstrap VA/PA anchors;
+// production firmware-table discovery remains future work, but the constants are
+// not placeholders for the current target.
 
 pub const KERNEL_BOOTSTRAP_VIRT_BASE: u64 = 0xFFFF_0000;
 pub const KERNEL_BOOTSTRAP_PHYS_BASE: u64 = 0x0;
