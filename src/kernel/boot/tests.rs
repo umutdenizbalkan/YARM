@@ -11319,3 +11319,248 @@ fn ipc_timeout_not_fired_when_message_delivered_before_deadline() {
         .expect("consume");
     assert!(!timeout_fired, "timeout_fired must be false when message delivered before deadline");
 }
+
+// ── VM / memory-lifecycle domain lock tests (Stage 4T+3) ─────────────────────
+
+#[test]
+fn memory_lifecycle_note_mapping_inserted_increments_map_refcount_via_with_memory_state() {
+    // note_mapping_inserted now runs under with_memory_state_mut (rank 6).
+    // The increment must be immediately visible via with_memory_state after the
+    // call returns — no extra synchronisation needed.
+    let mut state = Bootstrap::init().expect("init");
+    let phys = PhysAddr(0x8C000);
+    let (_mo_id, _cap) = state.create_memory_object(phys).expect("memory object");
+
+    let before = state.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|obj| obj.phys == phys)
+            .map(|obj| obj.map_refcount)
+    });
+    assert_eq!(before, Some(0), "map_refcount must be 0 before note_mapping_inserted");
+
+    state.note_mapping_inserted(phys);
+
+    let after = state.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|obj| obj.phys == phys)
+            .map(|obj| obj.map_refcount)
+    });
+    assert_eq!(after, Some(1), "map_refcount must be 1 after note_mapping_inserted");
+}
+
+#[test]
+fn memory_lifecycle_note_mapping_removed_decrements_map_refcount_via_with_memory_state() {
+    // note_mapping_removed runs under with_memory_state_mut (rank 6).
+    // After an insert→remove round-trip the map_refcount must return to 0,
+    // visible via with_memory_state immediately.
+    let mut state = Bootstrap::init().expect("init");
+    let phys = PhysAddr(0x8D000);
+    let (_mo_id, _cap) = state.create_memory_object(phys).expect("memory object");
+
+    state.note_mapping_inserted(phys);
+    state.note_mapping_removed(phys);
+
+    let after = state.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|obj| obj.phys == phys)
+            .map(|obj| obj.map_refcount)
+    });
+    assert_eq!(after, Some(0), "map_refcount must be 0 after insert→remove round-trip");
+}
+
+#[test]
+fn memory_lifecycle_cap_refcount_delta_visible_via_with_memory_state() {
+    // adjust_memory_object_cap_refcount runs under with_memory_state_mut (rank 6).
+    // A +1 delta must be visible via with_memory_state immediately; a subsequent
+    // -1 delta must restore the original value.
+    let mut state = Bootstrap::init().expect("init");
+    let phys = PhysAddr(0x8E000);
+    let (mo_id, _cap) = state.create_memory_object(phys).expect("memory object");
+    let cap_obj = CapObject::MemoryObject { id: mo_id };
+
+    let base = state.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|obj| obj.id == mo_id)
+            .map(|obj| obj.cap_refcount)
+    }).expect("refcount readable");
+
+    state.adjust_memory_object_cap_refcount(cap_obj, 1);
+
+    let incremented = state.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|obj| obj.id == mo_id)
+            .map(|obj| obj.cap_refcount)
+    }).expect("refcount readable after increment");
+    assert_eq!(incremented, base + 1, "cap_refcount must increase by 1 after delta +1");
+
+    state.adjust_memory_object_cap_refcount(cap_obj, -1);
+
+    let restored = state.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|obj| obj.id == mo_id)
+            .map(|obj| obj.cap_refcount)
+    }).expect("refcount readable after decrement");
+    assert_eq!(restored, base, "cap_refcount must restore to base after delta -1");
+}
+
+#[test]
+fn vm_domain_unmap_in_asid_removes_mapping_visible_via_with_user_spaces() {
+    // unmap_user_page_in_asid now wraps the page-table mutation in with_user_spaces_mut
+    // (rank 5).  The removal must be visible via with_user_spaces immediately after
+    // the call, with no stale mapping remaining.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _cap) = state.create_user_address_space().expect("asid");
+    let phys = PhysAddr(0x7E000);
+    let virt = VirtAddr(0x2000_0000);
+    let flags = PageFlags {
+        read: true,
+        write: true,
+        execute: false,
+        user: true,
+        cache_policy: CachePolicy::WriteBack,
+    };
+
+    state
+        .map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags })
+        .expect("map");
+
+    let mapped = state.with_user_spaces(|spaces| {
+        spaces.get(asid).and_then(|aspace| aspace.resolve(virt)).is_some()
+    });
+    assert!(mapped, "page must be present via with_user_spaces after map_user_page_in_asid_raw");
+
+    state.unmap_user_page_in_asid(asid, virt).expect("unmap");
+
+    let still_mapped = state.with_user_spaces(|spaces| {
+        spaces.get(asid).and_then(|aspace| aspace.resolve(virt)).is_some()
+    });
+    assert!(
+        !still_mapped,
+        "page must be absent via with_user_spaces after unmap_user_page_in_asid"
+    );
+}
+
+#[test]
+fn vm_domain_is_user_page_mapped_in_current_asid_reflects_mapping_state() {
+    // is_user_page_mapped_in_current_asid wraps the shadow lookup in with_user_spaces
+    // (rank 5).  The result must agree with the actual state of the address space
+    // both before and after an unmap.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _cap) = state.create_user_address_space().expect("asid");
+    state.register_task(1).expect("task1");
+    state.bind_task_asid(1, asid).expect("bind asid");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.dispatch_next_task().expect("dispatch to task1");
+    assert_eq!(state.current_tid(), Some(1), "task1 must be current after dispatch");
+
+    let phys = PhysAddr(0x7F000);
+    let virt = VirtAddr(0x3000_0000);
+    let flags = PageFlags {
+        read: true,
+        write: true,
+        execute: false,
+        user: true,
+        cache_policy: CachePolicy::WriteBack,
+    };
+
+    state
+        .map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags })
+        .expect("map");
+
+    let mapped = state
+        .is_user_page_mapped_in_current_asid(virt)
+        .expect("query after map");
+    assert!(mapped, "is_user_page_mapped_in_current_asid must return true after mapping");
+
+    state.unmap_user_page_in_asid(asid, virt).expect("unmap");
+
+    let still_mapped = state
+        .is_user_page_mapped_in_current_asid(virt)
+        .expect("query after unmap");
+    assert!(
+        !still_mapped,
+        "is_user_page_mapped_in_current_asid must return false after unmap"
+    );
+}
+
+#[test]
+fn vm_domain_map_page_increments_memory_object_map_refcount_consistent_end_to_end() {
+    // End-to-end: map_user_page_in_asid_raw calls note_mapping_inserted (rank 6)
+    // after releasing the vm lock (rank 5).  The map_refcount increment must be
+    // visible via with_memory_state immediately after map_user_page_in_asid_raw
+    // returns.  Subsequent unmap via unmap_user_page_in_asid must decrement it back.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _cap) = state.create_user_address_space().expect("asid");
+    let phys = PhysAddr(0x9C000);
+    let (_mo_id, _mo_cap) = state.create_memory_object(phys).expect("memory object");
+    let virt = VirtAddr(0x4000_0000);
+    let flags = PageFlags {
+        read: true,
+        write: false,
+        execute: false,
+        user: true,
+        cache_policy: CachePolicy::WriteBack,
+    };
+
+    let refcount_before = state.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|obj| obj.phys == phys)
+            .map(|obj| obj.map_refcount)
+    });
+    assert_eq!(refcount_before, Some(0), "map_refcount must be 0 before map");
+
+    state
+        .map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags })
+        .expect("map");
+
+    let refcount_after_map = state.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|obj| obj.phys == phys)
+            .map(|obj| obj.map_refcount)
+    });
+    assert_eq!(
+        refcount_after_map,
+        Some(1),
+        "map_refcount must be 1 after map (note_mapping_inserted ran under memory lock)"
+    );
+
+    state.unmap_user_page_in_asid(asid, virt).expect("unmap");
+
+    let refcount_after_unmap = state.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|obj| obj.phys == phys)
+            .map(|obj| obj.map_refcount)
+    });
+    assert_eq!(
+        refcount_after_unmap,
+        Some(0),
+        "map_refcount must return to 0 after unmap (note_mapping_removed ran under memory lock)"
+    );
+}

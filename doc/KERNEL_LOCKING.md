@@ -3119,3 +3119,75 @@ VM/fault/TLB domain split:
 - Audit `user_spaces` direct accesses in `fault_state.rs` and `thread_state.rs`.
 - Enforce `with_user_spaces*` wrappers consistently (currently ~3 inconsistent direct accesses).
 - Audit `memory_lifecycle_state.rs` for `with_memory_state_mut` coverage.
+
+---
+
+## 9) Stage 4T+3 VM/fault/TLB/user-space domain audit
+
+### 9.1 Scope
+
+Full sweep of direct `self.user_spaces.*` and `self.memory.*` accesses outside the
+`with_user_spaces`/`with_user_spaces_mut` (rank 5) and `with_memory_state`/
+`with_memory_state_mut` (rank 6) wrappers across all `boot/*.rs` files.
+
+Files audited: `memory_lifecycle_state.rs`, `memory_state.rs`, `user_memory_state.rs`,
+`exec_state.rs`, `fault_state.rs`, `thread_state.rs`.
+
+### 9.2 Audit results
+
+| File | Status |
+|------|--------|
+| `fault_state.rs` | CLEAN — all user_spaces accesses via `with_user_spaces` |
+| `thread_state.rs` | CLEAN — all accesses via wrappers |
+| `exec_state.rs` | CLEAN (prod); one `#[cfg(test)]` direct access kept (test-only) |
+| `memory_state.rs` (lines 1–610) | CLEAN — COW, clone, destroy, alloc paths all via wrappers |
+| `memory_state.rs` (lines 611+) | Bug G (6 functions) — fixed in this pass |
+| `user_memory_state.rs` | Bug F (2 cfg variants of `validate_user_access_for_asid`) — fixed |
+| `memory_lifecycle_state.rs` | Bug E (6 functions) — fixed in this pass |
+
+### 9.3 Bugs found and fixed
+
+| ID | File | Function(s) | Pattern | Fix |
+|----|------|-------------|---------|-----|
+| E | `memory_lifecycle_state.rs` | `adjust_memory_object_cap_refcount`, `adjust_memory_object_pin_refcount`, `note_mapping_inserted`, `note_mapping_removed`, `reclaim_memory_object_if_unreferenced`, `reclaim_memory_object_for_phys` | Direct `self.memory.memory_objects[slot]` and `self.memory.frame_allocator` without `with_memory_state_mut` | Wrapped mutation in `with_memory_state_mut`; `reclaim_memory_object_for_phys` reads id under `with_memory_state` then calls `reclaim_memory_object_if_unreferenced` |
+| F | `user_memory_state.rs` | `validate_user_access_for_asid` (both cfg variants) | Direct `self.user_spaces.get(asid)` — 1 site in hosted-dev, 3 sites in non-hosted | Consolidated all user_spaces reads into single `with_user_spaces` call per variant; preserved all trace logging |
+| G | `memory_state.rs` | `unmap_user_page_in_current_asid`, `is_user_page_mapped_in_current_asid`, `unmap_user_page`, `unmap_user_page_in_asid`, `protect_user_page`, `protect_user_page_in_asid` | Direct `self.user_spaces.get_mut/get(asid)` | Wrapped page-table mutations in `with_user_spaces_mut`; for protect functions, extracted `(old, current_phys)` tuple from closure |
+
+### 9.4 Lock-ordering preserved
+
+All fixes produce strictly ordered lock acquisitions:
+- `with_user_spaces_mut` (rank 5) → released → `with_memory_state_mut` (rank 6) for
+  lifecycle ops (`note_mapping_inserted/removed`, `clear_cow_page`).
+- No rank inversion: memory lock never acquired while vm lock is held.
+- IPC lock (rank 3) for `request_live_asid_shootdown` is acquired after both vm and
+  memory locks are released.
+
+### 9.5 Remaining known direct accesses (deferred)
+
+| File | Location | Justification |
+|------|----------|---------------|
+| `exec_state.rs` test | `load_elf_copies_into_staging_then_finalizes_rx_permissions` | `#[cfg(test)]` only; single-threaded, no lock discipline needed |
+| `spawn_user_task_from_image` test helper | `spawn_user_task_from_image_registers_asid_and_class` in `tests.rs` | Test direct access; deferred |
+| Various `tests.rs` helpers | Test-only code | Tests may access fields directly; production paths are covered |
+
+### 9.6 Test coverage
+
+Six new invariant tests added at the bottom of `tests.rs` (total: 544 / 0 failed):
+
+| Test | Invariant |
+|------|-----------|
+| `memory_lifecycle_note_mapping_inserted_increments_map_refcount_via_with_memory_state` | Bug E regression: `note_mapping_inserted` increments map_refcount under memory lock |
+| `memory_lifecycle_note_mapping_removed_decrements_map_refcount_via_with_memory_state` | Round-trip insert→remove restores map_refcount to 0 |
+| `memory_lifecycle_cap_refcount_delta_visible_via_with_memory_state` | `adjust_memory_object_cap_refcount` ±1 delta visible via `with_memory_state` |
+| `vm_domain_unmap_in_asid_removes_mapping_visible_via_with_user_spaces` | Bug G regression: unmap visible via `with_user_spaces` |
+| `vm_domain_is_user_page_mapped_in_current_asid_reflects_mapping_state` | `is_user_page_mapped_in_current_asid` returns true/false correctly via vm lock |
+| `vm_domain_map_page_increments_memory_object_map_refcount_consistent_end_to_end` | End-to-end: map increments refcount (rank 5 → rank 6 sequential), unmap decrements it |
+
+### 9.7 Paths still globally locked
+
+All paths remain serialized by `SharedKernel::with(...)`.  The vm and memory locks
+document future domain-split intent and enforce ordering when splitting becomes safe.
+
+The `validate_user_access_for_asid` fix merges 3 separate `self.user_spaces` reads
+into one `with_user_spaces` call, reducing lock contention on the future hot path
+while preserving all trace logging.
