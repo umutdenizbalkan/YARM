@@ -2333,6 +2333,97 @@ Total test count: **513 passed, 0 failed** (5 new Stage 4R + 508 pre-existing).
 
 ---
 
+### Stage 4S: atomic recv+refill under ipc_state_lock; remove dead dequeue helpers
+
+**Target**: `try_ipc_recv` and `ipc_recv_with_optional_deadline` had three
+separate recv+refill patterns totalling ~75 lines that accessed `self.ipc.*`
+directly (outside `ipc_state_lock`) and used the dead-code helpers
+`dequeue_sender_waiter` / `wake_sender_waiter`.
+
+**Also fixed (Stage 4R miss)**: `ipc_reply` non-recv-v2 path (lines 1037–1046
+as of the Stage 4R commit) accessed `self.ipc.endpoints` directly to enqueue the
+reply message, then called `wake_waiter_for_endpoint` as a separate step.
+This left a window where the endpoint queue held the reply but the receiver waiter
+slot had not yet been cleared, violating the "endpoint state + waiter slot are
+atomic" invariant.
+
+#### New helper: `ipc_recv_endpoint_take`
+
+```rust
+pub(crate) fn ipc_recv_endpoint_take(
+    &mut self,
+    endpoint_idx: usize,
+) -> Result<(Option<Message>, SchedulerWakePlan), KernelError>
+```
+
+All mutations happen under a single `ipc_state_lock` (rank 3) acquisition:
+
+1. **1a** — `endpoint.recv()` in a scoped block; borrow released before step 1b.
+2. **1b** — Inline dequeue+compact of `endpoint_sender_waiters[endpoint_idx]`:
+   take `queue[0]`, shift `queue[1..]` left, clear tail.
+3. **Match on (opt_msg, opt_waiter)**:
+   - `(Some, Some)` → refill endpoint with waiter's message; return `Wake(waiter.tid)`.
+   - `(Some, None)` → return message; `None` wake.
+   - `(None, Some)` → direct delivery (bypass endpoint queue); return `Wake(waiter.tid)`.
+   - `(None, None)` → return `None`; `None` wake.
+
+The caller applies the wake plan with `apply_scheduler_wake_plan` after releasing
+the lock, following the `SchedulerWakePlan` deferred-wake discipline.
+
+#### ipc_reply fix
+
+The non-recv-v2 path in `ipc_reply` now wraps both `endpoint.send(msg)` and
+`endpoint_waiters[idx].take()` in a single `with_ipc_state_mut` closure.
+The returned `SchedulerWakePlan` is applied outside the lock.
+
+#### Dead code removed
+
+`KernelState::dequeue_sender_waiter` and `KernelState::wake_sender_waiter`
+are removed.  All call sites are replaced by `ipc_recv_endpoint_take` or its
+inline equivalent inside closures.
+
+#### Tests (Stage 4S)
+
+Seven new tests added to `src/kernel/boot/tests.rs`:
+
+- `stage4s_ipc_recv_endpoint_take_empty_queue_no_waiter_returns_none`:
+  empty endpoint, no sender waiters → `(None, None wake)`.
+
+- `stage4s_ipc_recv_endpoint_take_queued_message_no_waiter`:
+  one queued message, no sender waiters → message returned, no wake.
+
+- `stage4s_ipc_recv_endpoint_take_direct_delivery_from_sender_waiter`:
+  empty endpoint queue + one sender waiter → direct delivery, wake sender.
+
+- `stage4s_ipc_recv_endpoint_take_refill_from_sender_waiter`:
+  one queued message + one sender waiter → dequeue message, refill endpoint
+  from waiter, wake sender; second take yields waiter's message.
+
+- `stage4s_try_ipc_recv_delegates_to_endpoint_take`:
+  `try_ipc_recv` on a buffered endpoint with a queued message returns it.
+
+- `stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically`:
+  simulates the fixed ipc_reply non-recv-v2 path; asserts enqueue and waiter
+  clear happen atomically (both visible to ipc_state reader after the closure).
+
+- `stage4s_sender_waiter_compaction_shifts_queue_left`:
+  two sender waiters queued; first take dequeues m0, refills from slot[0],
+  compacts slot[0]=second-waiter, slot[1]=None; second take yields second waiter.
+
+Total test count: **520 passed, 0 failed** (7 new Stage 4S + 513 pre-existing).
+
+#### What Stage 4S does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback: unchanged.
+- Phase 3B checks: not weakened.
+- `ipc_try_recv_queued_plain_endpoint_only` (Stage 4C/4D split path): unchanged.
+- The global `SharedKernel` lock is still retained.  **This is not full global-lock removal.**
+
+---
+
 ### Current live / deferred IPC split matrix
 
 | Syscall path | Condition | Status | Telemetry counter |
@@ -2355,7 +2446,7 @@ Total test count: **513 passed, 0 failed** (5 new Stage 4R + 508 pre-existing).
 | IpcSend to synchronous endpoint with receiver waiter (legacy) | Synchronous mode, waiter present, not recv-v2 | **Live** Stage 4Q | `rendezvous_handoffs`, `fastpath_switches` |
 | IpcSend to synchronous endpoint with receiver waiter (recv-v2) | Synchronous mode, waiter present, recv-v2 | **Live** Stage 4Q | `rendezvous_handoffs`, `fastpath_switches` |
 | IpcSend/IpcCall to synchronous endpoint (no waiter) | Synchronous mode, no waiter | **Deferred** (blocking send) | `blocked_sends` |
-| IpcReply to non-recv-v2 requester | Queue enqueue path | **Deferred** (enqueue+wake) | — |
+| IpcReply to non-recv-v2 requester | Queue enqueue path | **Live** Stage 4S (ipc_reply fix) | — |
 | MemoryObject zero-copy, VFS shared-reply | Phase 3B / VFS gate | **Deferred indefinitely** | — |
 
 ---

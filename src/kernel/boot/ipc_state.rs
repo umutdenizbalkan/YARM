@@ -146,16 +146,6 @@ impl KernelState {
         })
     }
 
-    fn dequeue_sender_waiter(&mut self, endpoint_idx: usize) -> Option<SenderWaiter> {
-        let queue = &mut self.ipc.endpoint_sender_waiters[endpoint_idx];
-        let head = queue[0].take()?;
-        for idx in 1..queue.len() {
-            queue[idx - 1] = queue[idx].take();
-        }
-        queue[queue.len() - 1] = None;
-        Some(head)
-    }
-
     fn resolve_send_cap_task_local(&self, send_cap: CapId) -> Result<Capability, KernelError> {
         let cnode = self.current_task_cnode().ok_or(KernelError::TaskMissing)?;
         self.capability_for_cnode_local(cnode, send_cap)
@@ -251,11 +241,6 @@ impl KernelState {
             self.wake_tid_to_runnable(waiter_tid)?;
         }
         Ok(())
-    }
-
-    fn wake_sender_waiter(&mut self, sender_tid: ThreadId) -> Result<(), KernelError> {
-        crate::yarm_log!("SCHED_WAKE tid={}", sender_tid.0);
-        self.apply_scheduler_wake_plan(super::SchedulerWakePlan::Wake(sender_tid))
     }
 
     pub(crate) fn process_ipc_timeout_deadlines(
@@ -1034,16 +1019,24 @@ impl KernelState {
             }
             crate::yarm_log!("IPC_REPLY_WAKE_CALLER tid={}", waiter_tid.0);
         }
-        let endpoint = self
-            .ipc
-            .endpoints
-            .get_mut(endpoint_idx)
-            .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?;
-        endpoint
-            .send(msg)
-            .map_err(|_| KernelError::EndpointQueueFull)?;
-        self.wake_waiter_for_endpoint(endpoint_idx)?;
+        // Phase 3: enqueue reply and atomically snapshot receiver waiter under
+        // ipc_state_lock (rank 3).  Lock released before Phase 4 scheduler mutation.
+        let wake_plan = self.with_ipc_state_mut(|ipc| {
+            let ep_storage = ipc.endpoints[endpoint_idx]
+                .as_mut()
+                .ok_or(KernelError::WrongObject)?;
+            kernel_mut(ep_storage)
+                .send(msg)
+                .map_err(|_| KernelError::EndpointQueueFull)?;
+            Ok::<_, KernelError>(
+                ipc.endpoint_waiters[endpoint_idx]
+                    .take()
+                    .map(super::SchedulerWakePlan::Wake)
+                    .unwrap_or(super::SchedulerWakePlan::None),
+            )
+        })?;
+        // Phase 4: wake receiver outside all locks.
+        self.apply_scheduler_wake_plan(wake_plan)?;
         Ok(())
     }
 
@@ -1708,6 +1701,63 @@ impl KernelState {
         Ok(())
     }
 
+    /// Atomically dequeue one message from the endpoint and compact sender-waiter queue.
+    ///
+    /// All mutations happen under `ipc_state_lock` (rank 3).  Returns the message (if any)
+    /// and a deferred wake plan to apply after the lock is released.
+    ///
+    /// Protocol:
+    ///   1a. Dequeue from endpoint queue (scoped borrow released before step 1b).
+    ///   1b. Compact sender-waiter queue: take head, shift remainder left.
+    ///   2.  If message + waiter: refill endpoint with waiter's message → WakeSender.
+    ///       If message, no waiter: return message → None wake.
+    ///       If no message + waiter: direct delivery of waiter's message → WakeSender.
+    ///       If neither: return None → None wake.
+    pub(crate) fn ipc_recv_endpoint_take(
+        &mut self,
+        endpoint_idx: usize,
+    ) -> Result<(Option<Message>, super::SchedulerWakePlan), KernelError> {
+        self.with_ipc_state_mut(|ipc| {
+            // 1a: Dequeue from endpoint queue; scoped block releases the borrow.
+            let opt_msg = {
+                let Some(ep_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+                    return Err(KernelError::WrongObject);
+                };
+                kernel_mut(ep_storage).recv()
+            };
+            // 1b: Compact sender-waiter queue (inline dequeue+shift).
+            let opt_waiter = {
+                let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
+                if let Some(head) = queue[0].take() {
+                    for i in 1..queue.len() {
+                        queue[i - 1] = queue[i].take();
+                    }
+                    Some(head)
+                } else {
+                    None
+                }
+            };
+            match (opt_msg, opt_waiter) {
+                (Some(msg), Some(waiter)) => {
+                    // Endpoint slot just freed: refill with waiter's message.
+                    let ep_storage = ipc.endpoints[endpoint_idx]
+                        .as_mut()
+                        .expect("endpoint must exist after recv");
+                    kernel_mut(ep_storage)
+                        .send(waiter.msg)
+                        .map_err(|_| KernelError::EndpointQueueFull)?;
+                    Ok((Some(msg), super::SchedulerWakePlan::Wake(waiter.tid)))
+                }
+                (Some(msg), None) => Ok((Some(msg), super::SchedulerWakePlan::None)),
+                (None, Some(waiter)) => {
+                    // Direct delivery: bypass endpoint queue.
+                    Ok((Some(waiter.msg), super::SchedulerWakePlan::Wake(waiter.tid)))
+                }
+                (None, None) => Ok((None, super::SchedulerWakePlan::None)),
+            }
+        })
+    }
+
     pub fn try_ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
         // Probe path resolves receive capability in the current task cspace.
         let capability = self.resolve_recv_cap_task_local(recv_cap)?;
@@ -1723,35 +1773,9 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-
-        let dequeued = self
-            .ipc
-            .endpoints
-            .get_mut(endpoint_idx)
-            .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?
-            .recv();
-
-        if let Some(msg) = dequeued {
-            if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-                self.ipc
-                    .endpoints
-                    .get_mut(endpoint_idx)
-                    .and_then(Option::as_mut)
-                    .ok_or(KernelError::WrongObject)?
-                    .send(waiter.msg)
-                    .map_err(|_| KernelError::EndpointQueueFull)?;
-                self.wake_sender_waiter(waiter.tid)?;
-            }
-            return Ok(Some(msg));
-        }
-
-        if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-            self.wake_sender_waiter(waiter.tid)?;
-            return Ok(Some(waiter.msg));
-        }
-
-        Ok(None)
+        let (msg, wake_plan) = self.ipc_recv_endpoint_take(endpoint_idx)?;
+        self.apply_scheduler_wake_plan(wake_plan)?;
+        Ok(msg)
     }
 
     pub fn ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
@@ -1821,32 +1845,11 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-
-        let dequeued = self
-            .ipc
-            .endpoints
-            .get_mut(endpoint_idx)
-            .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?
-            .recv();
-
-        if let Some(msg) = dequeued {
-            if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-                self.ipc
-                    .endpoints
-                    .get_mut(endpoint_idx)
-                    .and_then(Option::as_mut)
-                    .ok_or(KernelError::WrongObject)?
-                    .send(waiter.msg)
-                    .map_err(|_| KernelError::EndpointQueueFull)?;
-                self.wake_sender_waiter(waiter.tid)?;
-            }
-            return Ok(Some(msg));
-        }
-
-        if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-            self.wake_sender_waiter(waiter.tid)?;
-            return Ok(Some(waiter.msg));
+        // Phase 1: try immediate recv under ipc_state_lock.
+        let (msg, wake_plan) = self.ipc_recv_endpoint_take(endpoint_idx)?;
+        self.apply_scheduler_wake_plan(wake_plan)?;
+        if msg.is_some() {
+            return Ok(msg);
         }
 
         let blocked_tid =
@@ -1855,30 +1858,9 @@ impl KernelState {
         if timed_out {
             return Ok(None);
         }
-        let after_wake = self
-            .ipc
-            .endpoints
-            .get_mut(endpoint_idx)
-            .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?
-            .recv();
-        if let Some(msg) = after_wake {
-            if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-                self.ipc
-                    .endpoints
-                    .get_mut(endpoint_idx)
-                    .and_then(Option::as_mut)
-                    .ok_or(KernelError::WrongObject)?
-                    .send(waiter.msg)
-                    .map_err(|_| KernelError::EndpointQueueFull)?;
-                self.wake_sender_waiter(waiter.tid)?;
-            }
-            return Ok(Some(msg));
-        }
-        if let Some(waiter) = self.dequeue_sender_waiter(endpoint_idx) {
-            self.wake_sender_waiter(waiter.tid)?;
-            return Ok(Some(waiter.msg));
-        }
-        Ok(None)
+        // Phase 2: post-wake recv under ipc_state_lock (sender may have delivered directly).
+        let (msg, wake_plan) = self.ipc_recv_endpoint_take(endpoint_idx)?;
+        self.apply_scheduler_wake_plan(wake_plan)?;
+        Ok(msg)
     }
 }

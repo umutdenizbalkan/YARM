@@ -10311,3 +10311,316 @@ fn stage4r_no_orphaned_sender_waiter_when_queue_full() {
     });
     assert!(all_unchanged, "pre-filled sender waiters must be unchanged after failed enqueue");
 }
+
+// ── Stage 4S tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn stage4s_ipc_recv_endpoint_take_empty_queue_no_waiter_returns_none() {
+    // ipc_recv_endpoint_take on an empty endpoint with no sender waiters must return
+    // (None, SchedulerWakePlan::None) — no message, no wake side-effect.
+    let mut state = Bootstrap::init().expect("init");
+    let (eid, _send_cap, _recv_cap) = state
+        .create_endpoint(4)
+        .expect("buffered endpoint");
+    let (msg, plan) = state
+        .ipc_recv_endpoint_take(eid)
+        .expect("take ok");
+    assert!(msg.is_none(), "empty endpoint must yield no message");
+    assert_eq!(plan, super::SchedulerWakePlan::None, "no wake plan");
+    // Endpoint queue must be untouched.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
+        0
+    );
+}
+
+#[test]
+fn stage4s_ipc_recv_endpoint_take_queued_message_no_waiter() {
+    // ipc_recv_endpoint_take dequeues the message and returns None wake plan when
+    // there are no sender waiters.
+    let mut state = Bootstrap::init().expect("init");
+    let (eid, send_cap, _recv_cap) = state
+        .create_endpoint(4)
+        .expect("buffered endpoint");
+    let msg = Message::new(0, b"hello").expect("msg");
+    state.ipc_send(send_cap, msg).expect("send ok");
+
+    let (received, plan) = state
+        .ipc_recv_endpoint_take(eid)
+        .expect("take ok");
+    assert_eq!(received.unwrap().as_slice(), b"hello");
+    assert_eq!(plan, super::SchedulerWakePlan::None, "no sender waiter → no wake");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
+        0,
+        "endpoint must be empty after take"
+    );
+}
+
+#[test]
+fn stage4s_ipc_recv_endpoint_take_direct_delivery_from_sender_waiter() {
+    // When the endpoint queue is empty but a sender waiter exists, ipc_recv_endpoint_take
+    // must deliver the waiter's message directly and return WakeSender plan.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1 sender");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    let (eid, send_cap, _recv_cap) = state
+        .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+        .expect("sync endpoint depth=1");
+
+    // Task 0 sends and blocks (sync endpoint, no receiver); dispatches to task 1.
+    let msg = Message::new(0, b"direct").expect("msg");
+    assert_eq!(state.ipc_send(send_cap, msg), Err(KernelError::WouldBlock));
+    // After blocking, current task is task 1 (task 0 is blocked as sender waiter).
+    assert_eq!(state.current_tid(), Some(1));
+
+    // ipc_recv_endpoint_take is state-only — no current-task check; call from task 1.
+    // Verify sender waiter is registered.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][0].is_some()),
+        "sender waiter must be registered"
+    );
+
+    let (received, plan) = state
+        .ipc_recv_endpoint_take(eid)
+        .expect("take ok");
+    assert_eq!(received.unwrap().as_slice(), b"direct", "must get sender's message");
+    assert_eq!(plan, super::SchedulerWakePlan::Wake(ThreadId(0)), "must wake the sender");
+    // Sender waiter slot must be cleared.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().all(Option::is_none)),
+        "sender waiter slot must be cleared after direct delivery"
+    );
+    // Endpoint queue must remain empty (message bypassed it).
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
+        0
+    );
+}
+
+#[test]
+fn stage4s_ipc_recv_endpoint_take_refill_from_sender_waiter() {
+    // When the endpoint queue has a message AND a sender waiter exists,
+    // ipc_recv_endpoint_take must:
+    //   1. Dequeue the queued message for the caller.
+    //   2. Refill the endpoint slot with the sender waiter's message.
+    //   3. Return WakeSender plan for the sender.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1 sender");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    // depth=1: one slot in endpoint queue.
+    let (eid, send_cap, _recv_cap) = state
+        .create_endpoint(1)
+        .expect("buffered depth=1");
+    let send_cap_t1 = state
+        .grant_capability_task_to_task(0, send_cap, 1)
+        .expect("grant send to t1");
+
+    // Fill the endpoint queue from task 0.
+    let msg_queued = Message::new(0, b"queued").expect("queued");
+    state.ipc_send(send_cap, msg_queued).expect("send queued ok");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
+        1
+    );
+
+    // Switch to task 1 and have it block as a sender waiter.
+    state.yield_current().expect("yield to t1");
+    assert_eq!(state.current_tid(), Some(1));
+    let msg_waiter = Message::new(1, b"waiter").expect("waiter msg");
+    assert_eq!(state.ipc_send(send_cap_t1, msg_waiter), Err(KernelError::WouldBlock));
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][0].is_some()),
+        "sender waiter registered"
+    );
+
+    // Back to task 0 to call ipc_recv_endpoint_take.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("yield back");
+    }
+
+    let (received, plan) = state
+        .ipc_recv_endpoint_take(eid)
+        .expect("take ok");
+    // Must get the originally queued message.
+    assert_eq!(received.unwrap().as_slice(), b"queued");
+    // Sender waiter's message must have been refilled into the endpoint.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
+        1,
+        "endpoint must be refilled with waiter's message"
+    );
+    let refilled = state
+        .ipc_recv_endpoint_take(eid)
+        .expect("second take");
+    assert_eq!(refilled.0.unwrap().as_slice(), b"waiter");
+    // Sender must be woken.
+    assert_eq!(plan, super::SchedulerWakePlan::Wake(ThreadId(1)));
+    // Sender waiter slot must be cleared.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().all(Option::is_none))
+    );
+}
+
+#[test]
+fn stage4s_try_ipc_recv_delegates_to_endpoint_take() {
+    // try_ipc_recv on a buffered endpoint with a queued message must return it
+    // without blocking, and wake any sender waiter as a side-effect.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    let (eid, send_cap, recv_cap) = state
+        .create_endpoint(2)
+        .expect("buffered depth=2");
+
+    let msg = Message::new(0, b"probe").expect("msg");
+    state.ipc_send(send_cap, msg).expect("send ok");
+
+    let received = state.try_ipc_recv(recv_cap).expect("try_recv ok");
+    assert_eq!(received.unwrap().as_slice(), b"probe");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
+        0
+    );
+}
+
+#[test]
+fn stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically() {
+    // Verify the Stage 4R-miss fix: the non-recv-v2 ipc_reply path must enqueue
+    // the message and clear the receiver waiter inside a single with_ipc_state_mut
+    // closure.  After apply_scheduler_wake_plan, the receiver must be Runnable and
+    // the endpoint queue must hold exactly one message.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("receiver task");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+
+    let (eid, _send_cap, recv_cap) = state
+        .create_endpoint(4)
+        .expect("buffered endpoint");
+    let recv_cap_t1 = state
+        .grant_capability_task_to_task(0, recv_cap, 1)
+        .expect("grant recv to t1");
+
+    // Task 1 blocks waiting to receive.
+    state.yield_current().expect("yield to t1");
+    assert_eq!(state.current_tid(), Some(1));
+    let mut tf = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [recv_cap_t1.0 as usize, 8, 0xE000, 0, 0, 0],
+    );
+    state.handle_trap(Trap::Syscall, Some(&mut tf)).expect("recv trap");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]),
+        Some(ThreadId(1)),
+        "receiver waiter must be registered"
+    );
+
+    // Back to task 0.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("yield to t0");
+    }
+    let reply_msg = Message::new(0, b"reply").expect("reply msg");
+
+    // Simulate the Stage-4R-miss-fixed ipc_reply non-recv-v2 path directly:
+    // enqueue message AND clear+return receiver waiter in one closure.
+    let wake_plan = state.with_ipc_state_mut(|ipc| {
+        let ep = ipc.endpoints[eid].as_mut().expect("endpoint must exist");
+        kernel_mut(ep).send(reply_msg).expect("enqueue reply ok");
+        ipc.endpoint_waiters[eid]
+            .take()
+            .map(super::SchedulerWakePlan::Wake)
+            .unwrap_or(super::SchedulerWakePlan::None)
+    });
+    state.apply_scheduler_wake_plan(wake_plan).expect("apply wake");
+
+    // Receiver waiter slot must be cleared inside the closure (atomic with enqueue).
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]),
+        None,
+        "waiter slot must be cleared atomically with enqueue"
+    );
+    // Receiver must be Runnable after wake.
+    assert_eq!(
+        state.task_status(1),
+        Some(TaskStatus::Runnable),
+        "receiver must be runnable after reply wake"
+    );
+    // Message must be in the endpoint queue for the receiver to consume.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
+        1,
+        "reply message must be queued"
+    );
+}
+
+#[test]
+fn stage4s_sender_waiter_compaction_shifts_queue_left() {
+    // After ipc_recv_endpoint_take consumes a message and refills from slot[0],
+    // the remaining sender-waiter slots must shift left with no gaps.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("t1");
+    state.register_task(2).expect("t2");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+    state.enqueue_current_cpu(2).expect("enqueue2");
+
+    // depth=1: one message fits in the endpoint queue.
+    let (eid, send_cap, _recv_cap) = state
+        .create_endpoint(1)
+        .expect("buffered depth=1");
+    let send_cap_t1 = state
+        .grant_capability_task_to_task(0, send_cap, 1)
+        .expect("grant send to t1");
+    let send_cap_t2 = state
+        .grant_capability_task_to_task(0, send_cap, 2)
+        .expect("grant send to t2");
+
+    // Fill endpoint queue.
+    let m0 = Message::new(0, b"m0").expect("m0");
+    state.ipc_send(send_cap, m0).expect("send m0 ok");
+
+    // Task 1 blocks as sender-waiter[0].
+    state.yield_current().expect("yield t1");
+    assert_eq!(state.current_tid(), Some(1));
+    let m1 = Message::new(1, b"m1").expect("m1");
+    assert_eq!(state.ipc_send(send_cap_t1, m1), Err(KernelError::WouldBlock));
+
+    // Task 2 blocks as sender-waiter[1].
+    let m2 = Message::new(2, b"m2").expect("m2");
+    assert_eq!(state.ipc_send(send_cap_t2, m2), Err(KernelError::WouldBlock));
+
+    // Back to task 0.
+    while state.current_tid() != Some(0) {
+        state.yield_current().expect("yield t0");
+    }
+
+    // Verify two waiters are queued.
+    assert!(state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][0].is_some()));
+    assert!(state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][1].is_some()));
+
+    // First take: dequeues m0, refills from slot[0] (m1), shifts: slot[0]=m2, slot[1]=None.
+    let (r0, _plan0) = state.ipc_recv_endpoint_take(eid).expect("take0");
+    assert_eq!(r0.unwrap().as_slice(), b"m0");
+
+    // After compaction slot[0] must now hold the second waiter (m2).
+    let slot0_after = state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][0]);
+    let slot1_after = state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][1]);
+    assert_eq!(
+        slot0_after.map(|w| w.tid),
+        Some(ThreadId(2)),
+        "after first take, slot[0] must hold the second waiter"
+    );
+    assert!(slot1_after.is_none(), "slot[1] must be None after compaction");
+
+    // Second take: dequeues m1 (now in endpoint), refills from slot[0] (m2).
+    let (r1, _plan1) = state.ipc_recv_endpoint_take(eid).expect("take1");
+    assert_eq!(r1.unwrap().as_slice(), b"m1");
+
+    // All sender-waiter slots must be empty.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().all(Option::is_none)),
+        "all sender-waiter slots must be empty after all takes"
+    );
+}
