@@ -2794,26 +2794,47 @@ fn run_endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue() {
         IpcEndpointSendResult::Ineligible(IpcEndpointSplitRejectReason::SenderWaiterPresent)
     );
 
+    // Stage 4E extension: FLAG_CAP_TRANSFER and FLAG_CAP_TRANSFER_PLAIN are now
+    // accepted by the no-receiver buffered-enqueue split path.  In the real send path
+    // the cap is already stashed in the transfer-envelope table before
+    // ipc_try_send_queued_plain_endpoint_only is called, so enqueuing the message is
+    // identical to what ipc_send_with_optional_deadline does for the same case.
     let mut transfer_state = Bootstrap::init_boxed().expect("transfer init");
-    let (transfer_idx, _send_cap, _recv_cap) = transfer_state.create_endpoint(2).expect("endpoint");
-    for flags in [
-        Message::FLAG_CAP_TRANSFER,
-        Message::FLAG_CAP_TRANSFER_PLAIN,
-        Message::FLAG_REPLY_CAP,
+    let (transfer_idx, _send_cap, _recv_cap) = transfer_state.create_endpoint(4).expect("endpoint");
+    for (flags, desc) in [
+        (Message::FLAG_CAP_TRANSFER, "FLAG_CAP_TRANSFER"),
+        (Message::FLAG_CAP_TRANSFER_PLAIN, "FLAG_CAP_TRANSFER_PLAIN"),
     ] {
         let msg = Message::with_header(0, 0x55, flags, Some(99), b"cap")
-            .expect("flagged msg");
+            .expect(desc);
         assert_eq!(
             transfer_state.ipc_try_send_queued_plain_endpoint_only(transfer_idx, msg),
+            IpcEndpointSendResult::Enqueued,
+            "{desc}: Stage 4E should enqueue cap-transfer messages when no receiver waiter"
+        );
+    }
+    assert_eq!(
+        transfer_state
+            .with_ipc_state(|ipc| ipc.endpoints[transfer_idx].as_ref().unwrap().queued()),
+        2,
+        "both cap-transfer messages must be queued via Stage 4E"
+    );
+    // FLAG_REPLY_CAP still requires the full path; rejected before the queue check.
+    {
+        let reply_msg = Message::with_header(0, 0x55, Message::FLAG_REPLY_CAP, Some(99), b"cap")
+            .expect("reply cap msg");
+        assert_eq!(
+            transfer_state.ipc_try_send_queued_plain_endpoint_only(transfer_idx, reply_msg),
             IpcEndpointSendResult::Ineligible(
                 IpcEndpointSplitRejectReason::TransferOrReplyCapMessage
-            )
+            ),
+            "FLAG_REPLY_CAP must still be rejected by Stage 4E"
         );
         assert_eq!(
             transfer_state
                 .with_ipc_state(|ipc| ipc.endpoints[transfer_idx].as_ref().unwrap().queued()),
-            0,
-            "rejected transfer/reply message must not be queued by the endpoint helper"
+            2,
+            "FLAG_REPLY_CAP rejection must not enqueue the message"
         );
     }
 
@@ -2890,6 +2911,108 @@ fn run_ipc_send_syscall_uses_endpoint_only_plain_enqueue_branch() {
     let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
     assert_eq!(received.sender_tid, ThreadId(0));
     assert_eq!(received.as_slice(), b"send");
+}
+
+#[test]
+fn ipc_send_syscall_cap_transfer_uses_stage4e_buffered_enqueue() {
+    std::thread::Builder::new()
+        .name("ipc_send_syscall_cap_transfer_uses_stage4e_buffered_enqueue".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_ipc_send_syscall_cap_transfer_uses_stage4e_buffered_enqueue)
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
+}
+
+fn run_ipc_send_syscall_cap_transfer_uses_stage4e_buffered_enqueue() {
+    // Stage 4E extension: a cap-transfer send to a buffered endpoint with no
+    // receiver waiter goes through Stage 4E (the split buffered-enqueue path)
+    // rather than the full ipc_send path.  The cap is already stashed in the
+    // transfer-envelope table by handle_ipc_send before ipc_try_send_queued_plain_endpoint_only
+    // is called, so the buffered enqueue is behaviorally identical to the full path.
+    let mut state = Bootstrap::init_boxed().expect("init");
+    let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+
+    // Memory object to transfer — a valid cap that can be stashed.
+    let (_mem_id, mem_cap) = state
+        .create_memory_object(crate::kernel::vm::PhysAddr(0xA000))
+        .expect("mem obj");
+
+    let before_telemetry = state.ipc_path_telemetry();
+    let before_tid = state.current_tid();
+
+    // IpcSend with transfer cap: no user ASID so payload comes from inline registers.
+    // arg5 = mem_cap triggers FLAG_CAP_TRANSFER stash + Stage 4E extended path.
+    let mut frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcSend as usize,
+        [
+            send_cap.0 as usize,
+            0,
+            4,
+            inline_payload_word(b"cap!"),
+            0,
+            mem_cap.0 as usize,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut frame))
+        .expect("ipc send with cap transfer syscall");
+
+    assert_eq!(frame.error_code(), None, "send must succeed");
+    // Stage 4E must have fired: no scheduler mutation, tid unchanged.
+    assert_eq!(state.current_tid(), before_tid, "Stage 4E must not context-switch");
+    // Telemetry: exactly one Stage 4E send, including cap-transfer counter.
+    let after_telemetry = state.ipc_path_telemetry();
+    assert_eq!(
+        after_telemetry.queued_sends - before_telemetry.queued_sends,
+        1,
+        "Stage 4E must increment queued_sends"
+    );
+    assert_eq!(
+        after_telemetry.cap_transfer_stage4e_enqueued - before_telemetry.cap_transfer_stage4e_enqueued,
+        1,
+        "cap_transfer_stage4e_enqueued must be incremented"
+    );
+    // Message is in the endpoint queue.
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
+        1,
+        "message must be in the endpoint queue"
+    );
+
+    // Receive via syscall (full ipc_recv path) — materialises the transferred cap.
+    let mut recv_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [
+            recv_cap.0 as usize,
+            0,
+            crate::kernel::ipc::Message::MAX_PAYLOAD,
+            0,
+            0,
+            0,
+        ],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+        .expect("ipc recv syscall");
+    assert_eq!(recv_frame.error_code(), None, "recv must succeed");
+
+    // Transferred cap must be materialised in the receiver's cspace.
+    let recv_local_raw = recv_frame.ret2() as u64;
+    assert_ne!(
+        recv_local_raw,
+        crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "receiver must get a transferred cap"
+    );
+    let recv_local = CapId(recv_local_raw);
+    let resolved = state
+        .capability_service()
+        .resolve_current_task_capability(recv_local)
+        .expect("materialized cap must be accessible");
+    assert!(
+        matches!(resolved.object, CapObject::MemoryObject { .. }),
+        "materialised cap must wrap the MemoryObject"
+    );
 }
 
 #[test]

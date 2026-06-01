@@ -16,6 +16,9 @@ pub struct IpcPathTelemetry {
     pub ipc_call_split_deliveries: u64,
     pub ipc_reply_split_deliveries: u64,
     pub cap_transfer_recv_v2_deliveries: u64,
+    /// Stage 4E: cap-transfer messages buffered into the endpoint queue via the split
+    /// send path (no receiver waiter).  Incremented alongside queued_sends.
+    pub cap_transfer_stage4e_enqueued: u64,
     pub blocked_sends: u64,
     pub rendezvous_handoffs: u64,
     pub transfer_records_created: u64,
