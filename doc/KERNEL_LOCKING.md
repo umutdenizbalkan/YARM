@@ -3010,3 +3010,112 @@ Six new tests in `src/kernel/boot/tests.rs`:
 - Scheduler block/deadline/futex domain passes — no unsafe direct accesses found; deferred to next campaign.
 - VM/fault/TLB audit — helper-only, deferred; all known paths clean.
 - Global `SharedKernel` lock removal from syscall fast path — Stage 3+ work; not in scope for Stage 4T+1.
+
+---
+
+## 8) Stage 4T+2 scheduler/lifecycle/IPC-lock audit
+
+### 8.1 Audit scope
+
+Full sweep of `scheduler_state.rs`, `restart_state.rs`, `fault_state.rs`,
+`thread_state.rs`, `task_policy_state.rs`, `exec_state.rs`, `ipc_state.rs` and
+all scheduler/block/deadline/futex/join/exit/restart/timer/cross-CPU/TLB paths.
+
+### 8.2 Classification table
+
+| Path | File | Category | Status |
+|------|------|----------|--------|
+| `block_current_on_receive_with_deadline` | `ipc_state.rs` | E (IPC-coupled block) | CLEAN — scheduler→task(2)→IPC(3) order correct |
+| `block_current_on_send_with_deadline` | `ipc_state.rs` | E (IPC-coupled block) | CLEAN — same ordering |
+| `process_ipc_timeout_deadlines` | `ipc_state.rs` | D (deadline/timer mutation) | CLEAN — `with_tcbs_mut` only |
+| `wake_tid_to_runnable` | `ipc_state.rs` | B+C (wake+status) | CLEAN — `with_tcbs_mut` then enqueue |
+| `clear_ipc_timeout_for_tid` | `ipc_state.rs` | D | CLEAN — `with_tcbs_mut` |
+| `exit_task` | `restart_state.rs` | G (lifecycle) | CLEAN — `with_tcbs_mut`; calls report_task_exit (Bug A, fixed) |
+| `restart_task` | `restart_state.rs` | G | CLEAN — `with_tcbs_mut` |
+| `mark_task_dead` | `restart_state.rs` | G | CLEAN — `with_tcbs_mut` |
+| `report_task_exit_to_supervisor` | `restart_state.rs` | G+E | **BUG A fixed** — now uses `send_message_to_endpoint_and_wake` |
+| `report_transfer_revoke_to_supervisor` | `restart_state.rs` | G+E | **BUG B fixed** — now uses `send_message_to_endpoint_and_wake` |
+| `emit_fault_report_for_fault` | `fault_state.rs` | G+E | **BUG C fixed** — now uses `send_message_to_endpoint_and_wake` |
+| `escalate_tlb_shootdown_timeout` | `scheduler_state.rs` | H+E | **Stage 4T+1 fix** refactored to `send_message_to_endpoint_and_wake` |
+| `register_task_with_class_and_cnode_slots_in_process` | `task_policy_state.rs` | C (task status mutation) | **BUG D fixed** — now uses `with_tcbs_mut` for TCB insertion |
+| `join_thread` | `thread_state.rs` | F/G | CLEAN — `with_tcbs_mut` + `block_current_cpu` + `dispatch_next_task` |
+| `wake_joiners_for` | `thread_state.rs` | B+C | CLEAN — `with_tcbs_mut` then `enqueue_task` per woken tid |
+| `dispatch_next_task` | `ipc_state.rs`/scheduler | A (scheduler read) | CLEAN — `scheduler_state()` guard |
+| `yield_current` | ipc/scheduler | B | CLEAN — `scheduler_state()` guard |
+| `yield_current_to` | scheduler | B | CLEAN — one-shot handoff pattern |
+| `futex_wait_current` | (ipc_state) | F | CLEAN — `with_tcbs_mut` + block pattern |
+| `futex_wake` | (ipc_state) | F | CLEAN — `with_tcbs_mut` then enqueue |
+| `process_cross_cpu_work_for_cpu` | `scheduler_state.rs` | I | CLEAN (Stage 4T+1 fix) |
+| `apply_cross_cpu_work` (TlbShootdownAck) | `scheduler_state.rs` | I+H | CLEAN — `with_ipc_state_mut` |
+
+### 8.3 Bugs found and fixed
+
+| Bug | Location | Pattern | Fix |
+|-----|----------|---------|-----|
+| A | `restart_state.rs::report_task_exit_to_supervisor` | Direct `self.ipc.endpoints.get_mut(...)` without `ipc_state_lock` | `send_message_to_endpoint_and_wake` |
+| B | `restart_state.rs::report_transfer_revoke_to_supervisor` | Same direct bypass | `send_message_to_endpoint_and_wake` |
+| C | `fault_state.rs::emit_fault_report_for_fault` | Same direct bypass | `send_message_to_endpoint_and_wake` |
+| D | `task_policy_state.rs::register_task_with_class_and_cnode_slots_in_process` | Direct `self.tcbs[idx] = Some(tcb)` without `task_state_lock` | `with_tcbs_mut` for TCB slot, companion `task_classes[idx]` set after |
+
+### 8.4 New plan-first scaffold
+
+`send_message_to_endpoint_and_wake` (`ipc_state.rs`) — canonical supervisor-notify
+pattern: enqueues a message under `ipc_state_lock` (rank 3) then wakes the waiter
+after releasing the lock.  Enforces the ordering: task lock (rank 2) must not be
+held while acquiring IPC lock (rank 3).  All 4 supervisor-endpoint send sites now
+use this helper.
+
+### 8.5 Lock-rank contract additions
+
+| Operation | Correct order | Forbidden |
+|-----------|-------------|----------|
+| Supervisor endpoint notify | Read `fault_state` (rank 8) → enqueue under `ipc_state_lock` (rank 3) → wake after lock release (acquires task rank 2) | Do NOT hold `ipc_state_lock` when calling `wake_tid_to_runnable` |
+| TCB registration | `with_tcbs_mut` (rank 2) → set companion `task_classes` after release | Do NOT mutate `self.tcbs[idx]` directly |
+| Deadline registration/clear | `with_tcbs_mut` (rank 2) | Do NOT hold `ipc_state_lock` during `ipc_timeout_deadline` mutation |
+
+### 8.6 Direct-access sweep results (Stage 4T+2)
+
+**scheduler domain** (`self.scheduler_state`): All clean — all access via `scheduler_state()` guard or `with_scheduler_state*` wrappers.
+
+**task/TCB domain** (`self.tcbs`, `self.task_classes`): Clean after fix D.  `self.task_classes[idx]` accessed immutably inside `with_tcbs` closures (under `task_state_lock`) is acceptable.
+
+**IPC domain** (`self.ipc.*`): Clean after fixes A/B/C.
+
+**Other direct fields** (`self.robust_futex`, `self.tls_restore_pending`): These are `KernelStorage` fields with no dedicated subsystem lock.  Accesses are serialized by the top-level `SharedKernel` lock.  Acceptable.
+
+**`exec_state.rs:1227`** (`&self.tcbs as *const _ as usize`): Diagnostic raw-pointer log, no data access.  Acceptable.
+
+### 8.7 Tests added (Stage 4T+2)
+
+| Test | Invariant |
+|------|-----------|
+| `task_exit_supervisor_report_message_visible_via_ipc_state` | Bug A regression: message enqueued via `with_ipc_state` |
+| `transfer_revoke_supervisor_report_message_visible_via_ipc_state` | Bug B regression |
+| `fault_handler_report_message_visible_via_ipc_state` | Bug C regression |
+| `register_task_tcb_and_class_consistent_after_allocation` | Bug D regression: both `tcbs` and `task_classes` set correctly |
+| `send_message_to_endpoint_and_wake_enqueues_and_wakes` | New helper contract: message enqueued and waiter woken |
+| `exit_task_leaves_exited_status_not_runnable_in_queue` | Exited task never appears Runnable |
+| `restart_task_makes_task_runnable_with_new_token` | Restart is idempotent; stale token rejected |
+| `ipc_timeout_not_fired_when_message_delivered_before_deadline` | No spurious timeout_fired after direct delivery before deadline |
+
+### 8.8 VM/fault/TLB audit
+
+Scoped to helper-only:
+- `emit_fault_report_for_fault` (Bug C) was the only direct bypass; fixed.
+- `try_handle_demand_page_fault` uses `self.user_spaces.get(asid)` directly (not through `with_user_spaces`) — this is inside a method that does NOT hold any subsystem lock, and `user_spaces` is the `pub` field protected by `vm_state_lock` in the `with_user_spaces*` wrappers.  This is a minor inconsistency but not a race hazard given the global `SharedKernel` lock.  Classified as deferred for a future VM domain pass.
+- All other VM mutation paths (`map_user_page_in_asid_raw`, `clone_user_address_space_cow`, etc.) use `with_user_spaces_mut`.
+
+### 8.9 Paths still globally locked and why
+
+All paths remain serialized by `SharedKernel::with(...)` at the top level.  The subsystem locks exist to document future domain-split intent and to enforce ordering when splitting becomes safe.
+
+- `dispatch_next_task`, `yield_current`, scheduler queue operations: Not yet split from the global lock.  Requires per-CPU runqueue architecture (Stage 4+).
+- `futex_wait_current`, `futex_wake`: Not yet split; require per-futex-key lock + scheduler integration.
+- Fork/spawn/exec paths: Not split; large compound operations touching VM, cap, and task domains simultaneously.
+
+### 8.10 Next recommended domain pass
+
+VM/fault/TLB domain split:
+- Audit `user_spaces` direct accesses in `fault_state.rs` and `thread_state.rs`.
+- Enforce `with_user_spaces*` wrappers consistently (currently ~3 inconsistent direct accesses).
+- Audit `memory_lifecycle_state.rs` for `with_memory_state_mut` coverage.

@@ -27,17 +27,7 @@ impl KernelState {
             &encode_task_exited_event(tid, code, restart_token),
         )
         .map_err(|_| KernelError::WrongObject)?;
-        let endpoint = self
-            .ipc
-            .endpoints
-            .get_mut(endpoint_idx)
-            .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?;
-        endpoint
-            .send(msg)
-            .map_err(|_| KernelError::EndpointQueueFull)?;
-        let _ = self.wake_waiter_for_endpoint(endpoint_idx);
-        Ok(())
+        self.send_message_to_endpoint_and_wake(endpoint_idx, msg)
     }
 
     pub fn report_transfer_revoke_to_supervisor(
@@ -58,17 +48,7 @@ impl KernelState {
             &encode_transfer_revoked_event(owner_pid, cap, base, len),
         )
         .map_err(|_| KernelError::WrongObject)?;
-        let endpoint = self
-            .ipc
-            .endpoints
-            .get_mut(endpoint_idx)
-            .and_then(Option::as_mut)
-            .ok_or(KernelError::WrongObject)?;
-        endpoint
-            .send(msg)
-            .map_err(|_| KernelError::EndpointQueueFull)?;
-        let _ = self.wake_waiter_for_endpoint(endpoint_idx);
-        Ok(())
+        self.send_message_to_endpoint_and_wake(endpoint_idx, msg)
     }
 
     pub fn exit_task(&mut self, tid: u64, code: u64) -> Result<u64, KernelError> {

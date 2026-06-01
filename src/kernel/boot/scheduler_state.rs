@@ -338,18 +338,9 @@ impl KernelState {
         payload[..8].copy_from_slice(&(timed_out as u64).to_le_bytes());
         payload[8..16].copy_from_slice(&(self.current_cpu().0 as u64).to_le_bytes());
         let msg = Message::new(0, &payload).map_err(|_| KernelError::WrongObject)?;
-        // Enqueue the escalation message under ipc_state_lock (rank 3). Must not
-        // hold the lock when calling wake_waiter_for_endpoint (acquires task lock,
-        // rank 2) since that would invert the rank order.
-        self.with_ipc_state_mut(|ipc| {
-            let Some(ep_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut) else {
-                return Err(KernelError::WrongObject);
-            };
-            kernel_mut(ep_storage).send(msg).map_err(|_| KernelError::EndpointQueueFull)?;
-            Ok(())
-        })?;
-        let _ = self.wake_waiter_for_endpoint(endpoint_idx);
-        Ok(())
+        // send_message_to_endpoint_and_wake enqueues under ipc_state_lock
+        // (rank 3) and wakes outside the lock (task lock rank 2 < ipc rank 3).
+        self.send_message_to_endpoint_and_wake(endpoint_idx, msg)
     }
 
     fn apply_cross_cpu_work(&mut self, cpu: CpuId, item: WorkItem) -> Result<(), KernelError> {

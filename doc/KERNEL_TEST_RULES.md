@@ -208,3 +208,72 @@ setups that consume a few mapping slots before the exhaustion loop.
 | 5. Running\|Runnable | After wake/exit, assert `Running \| Runnable`, not just `Runnable` |
 | 6. mark vs exit | `mark_task_dead` leaves task current; `exit_task` dispatches away |
 | 7. Capacity fit | Hosted-dev pool sizes must not exceed `2*(MAX_MAPPINGS-2)` |
+| 7. Endpoint caps in correct cnode | Create endpoints while the task that needs send_cap is current; grant recv to waiters |
+| 8. supervisor endpoint vs fault handler | `set_supervisor_endpoint` and `set_fault_handler` are distinct; a test that checks fault reports must set `set_fault_handler`, not `set_supervisor_endpoint` |
+| 9. send_message_to_endpoint_and_wake | Call directly (it is `pub(crate)`); do not inline the enqueue+wake pattern in tests |
+| 10. task_class consistency | After `register_task`, verify both `task_status` (from `with_tcbs`) and `task_class` (from `task_classes`) are Some |
+
+---
+
+## Rule 7 — Endpoint capabilities must be in the current task's cnode
+
+When a test creates an endpoint and then dispatches to another task, the caps are in
+the **original current task's** cnode.  If the new current task tries to use the cap,
+the capability resolution will fail.
+
+**Pattern:**
+
+```rust
+// Create endpoint while task 0 (idle) is current — both caps go into task 0's cnode.
+let (_eid, send_cap, recv_cap_t0) = state.create_endpoint(4).expect("ep");
+
+// Grant the cap the receiver needs.
+let recv_cap_t1 = state
+    .grant_capability_task_to_task(0, recv_cap_t0, 1)
+    .expect("grant recv");
+
+// Now dispatch to task 1.
+state.enqueue_current_cpu(1).expect("enqueue");
+state.dispatch_next_task().expect("dispatch");
+// task 1 uses recv_cap_t1; task 0 uses send_cap after task 1 blocks.
+```
+
+---
+
+## Rule 8 — supervisor_endpoint vs fault_handler_endpoint
+
+`set_supervisor_endpoint(recv_cap)` sets `FaultSubsystem::supervisor_endpoint`.
+`set_fault_handler(recv_cap)` sets `FaultSubsystem::fault_handler_endpoint`.
+
+They are independent.  A test verifying that `emit_fault_report_for_fault` delivers a
+message must call `set_fault_handler`, not `set_supervisor_endpoint`.  A test
+verifying that `report_task_exit_to_supervisor` delivers must call
+`set_supervisor_endpoint`.
+
+---
+
+## Rule 9 — send_message_to_endpoint_and_wake usage
+
+The helper is `pub(crate)` and can be called directly in tests:
+
+```rust
+state.send_message_to_endpoint_and_wake(endpoint_idx, msg).expect("send");
+```
+
+Do not reproduce the `with_ipc_state_mut` + `wake_waiter_for_endpoint` pattern inline
+in new tests — use the helper to keep tests and the documented pattern in sync.
+
+---
+
+## Rule 10 — TCB and task_class consistency after register_task
+
+After `register_task` (or any `register_task_with_class*` variant), both the TCB
+slot (visible via `with_tcbs`) and the task class (visible via `task_class()`) must
+be `Some`.  If a test depends on `task_class()` returning `None` to check that a
+task is not yet registered, it must not call `register_task` beforehand.
+
+```rust
+state.register_task(42).expect("register");
+assert!(state.task_status(42).is_some(), "tcb exists");
+assert_eq!(state.task_class(42), Some(TaskClass::App), "class set");
+```
