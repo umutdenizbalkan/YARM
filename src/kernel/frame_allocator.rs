@@ -9,6 +9,9 @@ const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
 const MAX_FREE_EXTENTS: usize = 256;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_FREE_EXTENTS: usize = 512;
+#[cfg(feature = "hosted-dev")]
+const MAX_TRACKED_FRAME_REFS: usize = 256;
+#[cfg(not(feature = "hosted-dev"))]
 const MAX_TRACKED_FRAME_REFS: usize = 8192;
 #[cfg(feature = "hosted-dev")]
 const CONTIG_SIZE_CLASSES: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
@@ -545,7 +548,16 @@ impl GlobalReservedRanges {
     }
 
     fn add(&mut self, start: u64, end: u64) {
-        if end > start && self.count < MAX_GLOBAL_RESERVED {
+        if end <= start {
+            return;
+        }
+        // Deduplicate: skip if this exact range is already registered.
+        for i in 0..self.count {
+            if self.starts[i] == start && self.ends[i] == end {
+                return;
+            }
+        }
+        if self.count < MAX_GLOBAL_RESERVED {
             self.starts[self.count] = start;
             self.ends[self.count] = end;
             self.count += 1;

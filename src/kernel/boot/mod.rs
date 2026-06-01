@@ -128,7 +128,7 @@ pub(crate) enum IpcSchedulerPlan {
     WakeReceiver(ThreadId),
 }
 #[cfg(feature = "hosted-dev")]
-const MAX_COW_PAGES: usize = 1024;
+const MAX_COW_PAGES: usize = 100;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_COW_PAGES: usize = 256;
 

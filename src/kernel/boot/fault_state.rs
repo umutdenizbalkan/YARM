@@ -95,7 +95,9 @@ impl KernelState {
             return Ok(false);
         }
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
-        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
+        let Some(asid) = self.task_asid(tid) else {
+            return Ok(false); // No user address space → not a demand-paged fault
+        };
         let page = fault.addr.page_align_down();
         if page.0 >= crate::kernel::vm::KERNEL_SPACE_BASE {
             return Ok(false);

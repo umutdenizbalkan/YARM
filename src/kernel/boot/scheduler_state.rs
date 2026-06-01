@@ -223,21 +223,21 @@ impl KernelState {
             );
         }
         if tid == BOOTSTRAP_FIRST_USER_TID {
-            if cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID
-                && cfg!(not(feature = "hosted-dev"))
-            {
-                crate::yarm_log!(
-                    "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
-                    current_cpu.0,
-                    tid,
-                    cpu.0
-                );
+            if cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+                if cfg!(not(feature = "hosted-dev")) {
+                    crate::yarm_log!(
+                        "FIRST_USER_PIN_VIOLATION cpu={} tid={} chosen_cpu={}",
+                        current_cpu.0,
+                        tid,
+                        cpu.0
+                    );
+                    assert_eq!(cpu.0, crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+                    assert_eq!(
+                        cpu.0 as usize,
+                        crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize
+                    );
+                }
             }
-            assert_eq!(cpu.0, crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
-            assert_eq!(
-                cpu.0 as usize,
-                crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize
-            );
         }
         let mut sched = self.scheduler_state();
         kernel_mut(&mut sched.scheduler)

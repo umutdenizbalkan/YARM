@@ -270,118 +270,142 @@ mod tests {
 
     #[test]
     fn trap_entry_sets_cpu_and_handles_timer() {
-        use crate::kernel::boot::Bootstrap;
+        // KernelState is large; use an 8 MiB thread stack to avoid overflow.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                use crate::kernel::boot::Bootstrap;
 
-        let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
-        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+                let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
+                state.bring_up_cpu(CpuId(1)).expect("cpu1");
 
-        handle_trap_entry(
-            &mut state,
-            CpuId(1),
-            X86TrapContext {
-                vector: VEC_TIMER,
-                error_code: 0,
-                fault_addr: 0,
-            },
-            None,
-        )
-        .expect("timer");
-        assert_eq!(state.current_cpu(), CpuId(1));
+                handle_trap_entry(
+                    &mut state,
+                    CpuId(1),
+                    X86TrapContext {
+                        vector: VEC_TIMER,
+                        error_code: 0,
+                        fault_addr: 0,
+                    },
+                    None,
+                )
+                .expect("timer");
+                assert_eq!(state.current_cpu(), CpuId(1));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     #[test]
     fn trap_entry_restores_tls_for_resumed_thread() {
-        use crate::kernel::boot::{Bootstrap, UserImageSpec};
-        use crate::kernel::task::TaskClass;
+        // KernelState is large; use an 8 MiB thread stack to avoid overflow.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                use crate::kernel::boot::{Bootstrap, UserImageSpec};
+                use crate::kernel::task::TaskClass;
 
-        let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
-        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
-        state
-            .spawn_user_task_from_image(UserImageSpec {
-                tid: 50,
-                entry: 0x4000,
-                asid: Some(asid),
-                class: TaskClass::App,
-                startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
-                ..Default::default()
+                let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
+                let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+                state
+                    .spawn_user_task_from_image(UserImageSpec {
+                        tid: 50,
+                        entry: 0x4000,
+                        asid: Some(asid),
+                        class: TaskClass::App,
+                        startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+                        ..Default::default()
+                    })
+                    .expect("leader");
+                let tid = state
+                    .spawn_user_thread(50, 0xCAFE_0000, 0x8100_0000, 0x4010)
+                    .expect("thread");
+                // spawn_user_task_from_image enqueues the leader (tid 50) before
+                // spawn_user_thread enqueues the thread; yield until on the spawned thread.
+                for _ in 0..5 {
+                    if state.current_tid() == Some(tid) {
+                        break;
+                    }
+                    state.yield_current().expect("switch");
+                }
+                assert_eq!(state.current_tid(), Some(tid));
+
+                let mut frame = TrapFrame::new(0, [0; 6]);
+                handle_trap_entry(
+                    &mut state,
+                    CpuId(1),
+                    X86TrapContext {
+                        vector: VEC_TIMER,
+                        error_code: 0,
+                        fault_addr: 0,
+                    },
+                    Some(&mut frame),
+                )
+                .expect("trap");
+                assert_eq!(last_restored_tls_base(CpuId(1)), Some(0xCAFE_0000));
             })
-            .expect("leader");
-        let tid = state
-            .spawn_user_thread(50, 0xCAFE_0000, 0x8100_0000, 0x4010)
-            .expect("thread");
-        // spawn_user_task_from_image enqueues the leader (tid 50) before spawn_user_thread
-        // enqueues the thread (tid), so a single yield_current may land on the leader.
-        // Yield until we are actually on the spawned thread.
-        for _ in 0..5 {
-            if state.current_tid() == Some(tid) { break; }
-            state.yield_current().expect("switch");
-        }
-        assert_eq!(state.current_tid(), Some(tid));
-
-        let mut frame = TrapFrame::new(0, [0; 6]);
-        handle_trap_entry(
-            &mut state,
-            CpuId(1),
-            X86TrapContext {
-                vector: VEC_TIMER,
-                error_code: 0,
-                fault_addr: 0,
-            },
-            Some(&mut frame),
-        )
-        .expect("trap");
-        assert_eq!(last_restored_tls_base(CpuId(1)), Some(0xCAFE_0000));
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     #[test]
     fn tls_restore_slots_are_isolated_per_cpu() {
-        use crate::kernel::boot::Bootstrap;
-        // Register a bare task for CPU 1 with TLS=0xAAA0.  Avoid spawn_user_task_from_image
-        // + spawn_user_thread because those use the balanced scheduler which may place tasks
-        // on either CPU — making it impossible to predict which queue a task lands in.
-        let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
-        state.bring_up_cpu(CpuId(1)).expect("cpu1");
-        let tid_a = 61u64;
-        state.register_task(tid_a).expect("register thread a");
-        state
-            .set_thread_tls_base(tid_a, 0xAAA0_0000)
-            .expect("set tls a");
-        // Explicitly put tid_a into CPU 1's run queue.
-        state.enqueue_on_cpu(CpuId(1), tid_a).expect("enqueue a on cpu1");
-        state.set_current_cpu(CpuId(1)).expect("switch cpu1");
-        let _ = state.dispatch_next_task().expect("dispatch a");
-        assert_eq!(state.current_tid(), Some(tid_a));
-        let mut frame_a = TrapFrame::new(0, [0; 6]);
-        handle_trap_entry(
-            &mut state,
-            CpuId(1),
-            X86TrapContext {
-                vector: VEC_TIMER,
-                error_code: 0,
-                fault_addr: 0,
-            },
-            Some(&mut frame_a),
-        )
-        .expect("trap a");
+        // KernelState is large; use an 8 MiB thread stack to avoid overflow.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                use crate::kernel::boot::Bootstrap;
+                // Register a bare task for CPU 1 with TLS=0xAAA0.  Avoid
+                // spawn_user_task_from_image + spawn_user_thread because those use the
+                // balanced scheduler which may place tasks on either CPU.
+                let mut state = crate::std::boxed::Box::new(Bootstrap::init().expect("init"));
+                state.bring_up_cpu(CpuId(1)).expect("cpu1");
+                let tid_a = 61u64;
+                state.register_task(tid_a).expect("register thread a");
+                state
+                    .set_thread_tls_base(tid_a, 0xAAA0_0000)
+                    .expect("set tls a");
+                state.enqueue_on_cpu(CpuId(1), tid_a).expect("enqueue a on cpu1");
+                state.set_current_cpu(CpuId(1)).expect("switch cpu1");
+                let _ = state.dispatch_next_task().expect("dispatch a");
+                assert_eq!(state.current_tid(), Some(tid_a));
+                let mut frame_a = TrapFrame::new(0, [0; 6]);
+                handle_trap_entry(
+                    &mut state,
+                    CpuId(1),
+                    X86TrapContext {
+                        vector: VEC_TIMER,
+                        error_code: 0,
+                        fault_addr: 0,
+                    },
+                    Some(&mut frame_a),
+                )
+                .expect("trap a");
 
-        state
-            .set_thread_tls_base(0, 0xBBB0_0000)
-            .expect("set tls boot");
-        state.set_current_cpu(CpuId(0)).expect("switch cpu0");
-        let mut frame_b = TrapFrame::new(0, [0; 6]);
-        handle_trap_entry(
-            &mut state,
-            CpuId(0),
-            X86TrapContext {
-                vector: VEC_TIMER,
-                error_code: 0,
-                fault_addr: 0,
-            },
-            Some(&mut frame_b),
-        )
-        .expect("trap b");
+                state
+                    .set_thread_tls_base(0, 0xBBB0_0000)
+                    .expect("set tls boot");
+                state.set_current_cpu(CpuId(0)).expect("switch cpu0");
+                let mut frame_b = TrapFrame::new(0, [0; 6]);
+                handle_trap_entry(
+                    &mut state,
+                    CpuId(0),
+                    X86TrapContext {
+                        vector: VEC_TIMER,
+                        error_code: 0,
+                        fault_addr: 0,
+                    },
+                    Some(&mut frame_b),
+                )
+                .expect("trap b");
 
-        assert_eq!(last_restored_tls_base(CpuId(1)), Some(0xAAA0_0000));
-        assert_eq!(last_restored_tls_base(CpuId(0)), Some(0xBBB0_0000));
+                assert_eq!(last_restored_tls_base(CpuId(1)), Some(0xAAA0_0000));
+                assert_eq!(last_restored_tls_base(CpuId(0)), Some(0xBBB0_0000));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 }

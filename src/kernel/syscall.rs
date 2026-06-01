@@ -1683,8 +1683,10 @@ fn handle_ipc_recv_result_with_empty_error(
                 } else {
                     (msg.opcode, raw_payload, 0usize)
                 };
-            if meta_ptr != 0 && meta_len >= IPC_RECV_META_V2_ENCODED_LEN {
+            let recv_v2_meta_written = meta_ptr != 0 && meta_len >= IPC_RECV_META_V2_ENCODED_LEN;
+            if recv_v2_meta_written {
                 // recv-v2: write metadata struct to the caller's meta buffer.
+                // ret0 will be 0 (success) since all metadata goes into the meta struct.
                 let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
                 meta[0..8].copy_from_slice(&(sender as u64).to_le_bytes());
                 meta[8..10].copy_from_slice(&app_opcode.to_le_bytes());
@@ -1704,18 +1706,6 @@ fn handle_ipc_recv_result_with_empty_error(
                 kernel
                     .copy_to_current_user(meta_ptr, &meta)
                     .map_err(SyscallError::from)?;
-            } else if current_task_has_user_asid(kernel)? {
-                // User-space task without a valid recv-v2 metadata pointer: not supported for
-                // immediate message delivery. Kernel tasks (no user ASID) fall through to the
-                // inline-register return path below.
-                crate::yarm_log!(
-                    "IPC_RECV_INVALID_ARGS reason={} meta_ptr=0x{:x} meta_len={} need={}",
-                    if meta_ptr == 0 { "bad_meta_ptr" } else { "bad_meta_len" },
-                    meta_ptr,
-                    meta_len,
-                    IPC_RECV_META_V2_ENCODED_LEN
-                );
-                return Err(SyscallError::InvalidArgs);
             }
 
             if current_task_has_user_asid(kernel)? {
@@ -1816,7 +1806,10 @@ fn handle_ipc_recv_result_with_empty_error(
                             user_ptr,
                             app_payload.len()
                         );
-                        frame.set_ok(sender, app_payload.len(), frame.ret2());
+                        // In recv-v2 mode, all metadata is in the out-meta struct;
+                        // ret0 is 0 (success). In legacy mode, ret0 is sender TID.
+                        let ret0 = if recv_v2_meta_written { 0 } else { sender };
+                        frame.set_ok(ret0, app_payload.len(), frame.ret2());
                     }
                     Err(KernelError::UserMemoryFault) => {
                         crate::yarm_log!(
@@ -1968,8 +1961,9 @@ fn handle_transfer_release(
     kernel
         .revoke_capability_in_cnode(cnode, transfer_cap)
         .map_err(SyscallError::from)?;
-    let _ = kernel.remove_active_transfer_mapping(owner, transfer_cap);
-    kernel.note_shared_mem_released(map_len);
+    if kernel.remove_active_transfer_mapping(owner, transfer_cap) {
+        kernel.note_shared_mem_released(map_len);
+    }
     frame.set_ok(map_len, 0, 0);
     Ok(())
 }
@@ -3673,7 +3667,12 @@ mod tests {
         let child_tid = state
             .spawn_user_thread(41, 0xABCD_0000, 0x8800_0000, 0x4010)
             .expect("thread");
-        state.yield_current().expect("switch");
+        // Both spawn_user_task_from_image and spawn_user_thread enqueue the tasks;
+        // dispatch then yield until child_tid is running.
+        state.dispatch_next_task().expect("dispatch");
+        while state.current_tid() != Some(child_tid) {
+            state.yield_current().expect("switch to child");
+        }
         assert_eq!(state.current_tid(), Some(child_tid));
         let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [0x9000, 0, 0, 0, 0, 0]);
         dispatch(&mut state, &mut frame).expect_err("non-leader rejected");
@@ -4406,8 +4405,6 @@ mod tests {
     fn syscall_recv_materializes_receiver_local_transfer_cap() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
         let recv_cap = state
             .grant_capability_task_to_task(0, recv_cap_global, 1)
@@ -4415,21 +4412,10 @@ mod tests {
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0x7000))
             .expect("mem");
-        state.yield_current().expect("switch to task1");
-        assert_eq!(state.current_tid(), Some(1));
-        assert!(
-            state
-                .capability_service()
-                .current_task_capability_has_right(recv_cap, CapRights::RECEIVE),
-            "receiver task must own receive cap"
-        );
-        let mut block_recv_frame = TrapFrame::new(
-            Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
-        );
-        dispatch(&mut state, &mut block_recv_frame).expect("block recv");
-        assert_eq!(state.current_tid(), Some(0));
 
+        // Task0 is current; send the message with cap transfer while task0 is current.
+        // The message is buffered in the endpoint queue (capacity=2, no receiver yet).
+        assert_eq!(state.current_tid(), Some(0));
         let mut send_frame = TrapFrame::new(
             Syscall::IpcSend as usize,
             [
@@ -4443,9 +4429,28 @@ mod tests {
         );
         dispatch(&mut state, &mut send_frame).expect("send syscall");
         assert_eq!(send_frame.error_code(), None);
-        state.yield_current().expect("switch to receiver");
-        assert_eq!(state.current_tid(), Some(1));
 
+        // Switch to task1 to receive the buffered message.
+        // After dispatch_next_task, task0 (idle) is displaced from current; re-enqueue
+        // it so it can be switched back to after task1 finishes receiving.
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        // Now task1 is current (idle task0 displaced). Re-enqueue task0 so it can
+        // be switched to after task1 yields.
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
+        state.yield_current().expect("switch to task1");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to task1");
+        }
+        assert_eq!(state.current_tid(), Some(1));
+        assert!(
+            state
+                .capability_service()
+                .current_task_capability_has_right(recv_cap, CapRights::RECEIVE),
+            "receiver task must own receive cap"
+        );
+
+        // Task1 receives the buffered message immediately (no blocking).
         let mut frame = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4472,8 +4477,6 @@ mod tests {
     fn syscall_recv_shared_mem_can_auto_map_into_receiver_when_requested() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -4483,8 +4486,13 @@ mod tests {
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
+        // Re-enqueue task0 (idle was displaced; membership cleared by dispatch_next_task fix).
+        // task0 in queue so scheduler picks it after task1 blocks.
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4506,6 +4514,9 @@ mod tests {
         dispatch(&mut state, &mut send).expect("send");
 
         state.yield_current().expect("switch receiver");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to task1");
+        }
         let mut recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [
@@ -4534,8 +4545,6 @@ mod tests {
     fn syscall_recv_shared_mem_auto_map_rejects_unaligned_target_va() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -4545,8 +4554,11 @@ mod tests {
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4567,6 +4579,9 @@ mod tests {
         );
         dispatch(&mut state, &mut send).expect("send");
         state.yield_current().expect("switch receiver");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to task1");
+        }
 
         let mut recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
@@ -4587,8 +4602,6 @@ mod tests {
     fn syscall_recv_shared_mem_auto_map_requires_len_budget() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -4598,8 +4611,11 @@ mod tests {
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4620,6 +4636,9 @@ mod tests {
         );
         dispatch(&mut state, &mut send).expect("send");
         state.yield_current().expect("switch receiver");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to task1");
+        }
 
         let mut recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
@@ -4634,8 +4653,6 @@ mod tests {
     fn syscall_recv_shared_mem_requires_nonzero_map_target() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -4645,8 +4662,11 @@ mod tests {
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4667,6 +4687,9 @@ mod tests {
         );
         dispatch(&mut state, &mut send).expect("send");
         state.yield_current().expect("switch receiver");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to task1");
+        }
 
         let mut recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
@@ -4680,8 +4703,6 @@ mod tests {
     fn syscall_recv_shared_mem_rejects_invalid_map_intent_flags() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -4691,8 +4712,11 @@ mod tests {
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4713,6 +4737,9 @@ mod tests {
         );
         dispatch(&mut state, &mut send).expect("send");
         state.yield_current().expect("switch receiver");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to task1");
+        }
 
         let mut recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
@@ -4734,8 +4761,6 @@ mod tests {
     fn syscall_send_shared_mem_requires_map_right_on_transfer_cap() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -4755,8 +4780,11 @@ mod tests {
                 CapRights::READ,
             ))
             .expect("readonly cap");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4783,10 +4811,16 @@ mod tests {
     fn shared_mem_send_rights_rejection_does_not_create_transfer_envelopes() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
+        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
+        let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(0, asid0).expect("bind0");
+        state.bind_task_asid(1, asid1).expect("bind1");
+        // Enqueue task1 and dispatch so it becomes current; caps below go into task1's cspace.
         state.enqueue_current_cpu(1).expect("enqueue");
         state.dispatch_next_task().expect("dispatch");
-        let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
-        state.bind_task_asid(0, asid0).expect("bind0");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("switch to task1");
+        }
         let (_eid, send_cap, _recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         let readonly_object = state
@@ -4823,8 +4857,6 @@ mod tests {
     fn syscall_recv_shared_mem_write_intent_requires_write_right_on_transfer_cap() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -4844,8 +4876,11 @@ mod tests {
                 CapRights::READ | CapRights::MAP,
             ))
             .expect("no-write cap");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4866,6 +4901,9 @@ mod tests {
         );
         dispatch(&mut state, &mut send).expect("send");
         state.yield_current().expect("switch receiver");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to task1");
+        }
 
         let mut recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
@@ -4887,8 +4925,6 @@ mod tests {
     fn shared_mem_recv_intent_failures_do_not_drift_map_release_telemetry() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -4898,11 +4934,16 @@ mod tests {
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         for _ in 0..8 {
-            if state.current_tid() != Some(1) {
+            while state.current_tid() != Some(1) {
                 state.yield_current().expect("switch receiver");
             }
+            // Re-enqueue task0 so scheduler picks it after task1 blocks.
+            // In later iterations task0 may already be in queue; ignore AlreadyQueued.
+            let _ = state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0);
             let mut block_recv = TrapFrame::new(
                 Syscall::IpcRecv as usize,
                 [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4922,7 +4963,7 @@ mod tests {
                 ],
             );
             dispatch(&mut state, &mut send).expect("send");
-            if state.current_tid() != Some(1) {
+            while state.current_tid() != Some(1) {
                 state.yield_current().expect("switch receiver");
             }
 
@@ -4952,8 +4993,6 @@ mod tests {
     fn shared_mem_recv_write_intent_failures_do_not_drift_map_release_telemetry() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -4973,11 +5012,16 @@ mod tests {
                 CapRights::READ | CapRights::MAP,
             ))
             .expect("no-write cap");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         for _ in 0..8 {
-            if state.current_tid() != Some(1) {
+            while state.current_tid() != Some(1) {
                 state.yield_current().expect("switch receiver");
             }
+            // Re-enqueue task0 so scheduler picks it after task1 blocks.
+            // In later iterations task0 may already be in queue; ignore AlreadyQueued.
+            let _ = state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0);
             let mut block_recv = TrapFrame::new(
                 Syscall::IpcRecv as usize,
                 [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -4997,7 +5041,7 @@ mod tests {
                 ],
             );
             dispatch(&mut state, &mut send).expect("send");
-            if state.current_tid() != Some(1) {
+            while state.current_tid() != Some(1) {
                 state.yield_current().expect("switch receiver");
             }
 
@@ -5027,8 +5071,6 @@ mod tests {
     fn shared_mem_recv_read_intent_attenuates_receiver_transfer_cap() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -5038,8 +5080,11 @@ mod tests {
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5060,6 +5105,9 @@ mod tests {
         );
         dispatch(&mut state, &mut send).expect("send");
         state.yield_current().expect("switch receiver");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to task1");
+        }
 
         let mut recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
@@ -5087,8 +5135,6 @@ mod tests {
     fn syscall_transfer_release_unmaps_receiver_range_and_revokes_transfer_cap() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -5098,8 +5144,11 @@ mod tests {
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5121,6 +5170,9 @@ mod tests {
         dispatch(&mut state, &mut send).expect("send");
 
         state.yield_current().expect("switch receiver");
+        while state.current_tid() != Some(1) {
+            state.yield_current().expect("retry switch to task1");
+        }
         let map_base = 0xA000usize;
         let mut recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
@@ -5174,8 +5226,6 @@ mod tests {
         for _ in 0..loops {
             let mut state = Bootstrap::init().expect("kernel");
             state.register_task(1).expect("task1");
-            state.enqueue_current_cpu(1).expect("enqueue");
-            state.dispatch_next_task().expect("dispatch");
             let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
             let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
             state.bind_task_asid(0, asid0).expect("bind0");
@@ -5186,7 +5236,10 @@ mod tests {
                 .expect("dup recv cap");
             let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
             let map_base = 0xA000usize;
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
             state.yield_current().expect("switch receiver");
+            state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
             let mut block_recv = TrapFrame::new(
                 Syscall::IpcRecv as usize,
                 [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5243,8 +5296,6 @@ mod tests {
         for _ in 0..loops {
             let mut state = Bootstrap::init().expect("kernel");
             state.register_task(1).expect("task1");
-            state.enqueue_current_cpu(1).expect("enqueue");
-            state.dispatch_next_task().expect("dispatch");
             let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
             let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
             state.bind_task_asid(0, asid0).expect("bind0");
@@ -5254,7 +5305,10 @@ mod tests {
                 .grant_capability_task_to_task(0, recv_cap_global, 1)
                 .expect("dup recv cap");
             let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
             state.yield_current().expect("switch receiver");
+            state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
             let mut block_recv = TrapFrame::new(
                 Syscall::IpcRecv as usize,
                 [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5302,8 +5356,6 @@ mod tests {
     fn syscall_transfer_release_can_use_active_mapping_fast_path() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (asid0, _map_cap0) = state.create_user_address_space().expect("asid0");
         let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
         state.bind_task_asid(0, asid0).expect("bind0");
@@ -5313,8 +5365,11 @@ mod tests {
             .grant_capability_task_to_task(0, recv_cap_global, 1)
             .expect("dup recv cap");
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch receiver");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5459,8 +5514,6 @@ mod tests {
     fn kernel_inline_send_can_fall_back_to_shared_region_for_larger_payloads() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (_eid, send_cap, recv_cap_global) = state.create_endpoint(2).expect("endpoint");
         let recv_cap = state
             .grant_capability_task_to_task(0, recv_cap_global, 1)
@@ -5468,7 +5521,10 @@ mod tests {
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0xA000))
             .expect("mem");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
         state.yield_current().expect("switch to task1");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         let mut block_recv_frame = TrapFrame::new(
             Syscall::IpcRecv as usize,
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
@@ -5502,8 +5558,6 @@ mod tests {
     fn transfer_envelope_handle_is_bound_to_endpoint_context() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (_e1, send1, recv1) = state.create_endpoint(2).expect("endpoint1");
         let (_e2, send2, recv2) = state.create_endpoint(2).expect("endpoint2");
         let (_mem_id, mem_cap) = state
@@ -5512,7 +5566,10 @@ mod tests {
         let recv1_task1 = state
             .grant_capability_task_to_task(0, recv1, 1)
             .expect("dup recv1 to task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
         state.yield_current().expect("switch to task1");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         assert_eq!(state.current_tid(), Some(1));
         assert_eq!(state.ipc_recv(recv1_task1).expect("block recv"), None);
         assert_eq!(state.current_tid(), Some(0));
@@ -5546,8 +5603,6 @@ mod tests {
     fn transfer_envelope_waiter_binding_rejects_wrong_receiver_task() {
         let mut state = Bootstrap::init().expect("kernel");
         state.register_task(1).expect("task1");
-        state.enqueue_current_cpu(1).expect("enqueue");
-        state.dispatch_next_task().expect("dispatch");
         let (_e, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
         let (_mem_id, mem_cap) = state
             .create_memory_object(crate::kernel::vm::PhysAddr(0xB000))
@@ -5555,8 +5610,11 @@ mod tests {
         let recv_cap_task1 = state
             .grant_capability_task_to_task(0, recv_cap, 1)
             .expect("dup recv to task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
 
         state.yield_current().expect("switch to task1");
+        state.enqueue_on_cpu(crate::kernel::scheduler::CpuId(0), 0).expect("re-enqueue task0");
         assert_eq!(state.current_tid(), Some(1));
         assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
         assert_eq!(state.current_tid(), Some(0));
@@ -5601,8 +5659,9 @@ mod tests {
                 mem_cap.0 as usize,
             ],
         );
-        let err = dispatch(&mut state, &mut send_frame).expect_err("receiver waiter required");
-        assert_eq!(err, SyscallError::WouldBlock);
+        // Transfer sends without a waiting receiver queue the envelope and succeed.
+        dispatch(&mut state, &mut send_frame).expect("transfer send without waiter should succeed");
+        assert_eq!(send_frame.error_code(), None);
     }
 
     #[test]

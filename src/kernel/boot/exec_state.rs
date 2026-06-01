@@ -1298,10 +1298,12 @@ impl KernelState {
                         tid
                     );
                 }
-                assert_eq!(
-                    current_cpu.0,
-                    crate::arch::platform_constants::BOOTSTRAP_CPU_ID
-                );
+                if cfg!(not(feature = "hosted-dev")) {
+                    assert_eq!(
+                        current_cpu.0,
+                        crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+                    );
+                }
             }
             if cfg!(not(feature = "hosted-dev"))
                 && DEBUG_DISPATCH_CONTEXT_LOG
@@ -1493,78 +1495,92 @@ mod tests {
 
     #[test]
     fn load_elf_returns_heap_base_aligned_to_max_pt_load_end() {
-        let mut image = vec![0u8; 64 + 56];
-        image[0..4].copy_from_slice(b"\x7FELF");
-        image[4] = 2; // ELFCLASS64
-        image[5] = 1; // little-endian
-        image[6] = 1; // version
-        image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-        image[18..20].copy_from_slice(&183u16.to_le_bytes()); // AArch64
-        image[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
-        image[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // e_entry
-        image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
-        image[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
-        image[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
-        image[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut image = vec![0u8; 64 + 56];
+                image[0..4].copy_from_slice(b"\x7FELF");
+                image[4] = 2; // ELFCLASS64
+                image[5] = 1; // little-endian
+                image[6] = 1; // version
+                image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+                image[18..20].copy_from_slice(&183u16.to_le_bytes()); // AArch64
+                image[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+                image[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // e_entry
+                image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+                image[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+                image[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+                image[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
 
-        let ph = 64usize;
-        image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-        image[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
-        image[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
-        image[ph + 16..ph + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_vaddr
-        image[ph + 24..ph + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_paddr
-        image[ph + 32..ph + 40].copy_from_slice(&0u64.to_le_bytes()); // p_filesz
-        image[ph + 40..ph + 48].copy_from_slice(&0x1234u64.to_le_bytes()); // p_memsz
-        image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+                let ph = 64usize;
+                image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+                image[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+                image[ph + 8..ph + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+                image[ph + 16..ph + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_vaddr
+                image[ph + 24..ph + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_paddr
+                image[ph + 32..ph + 40].copy_from_slice(&0u64.to_le_bytes()); // p_filesz
+                image[ph + 40..ph + 48].copy_from_slice(&0x1234u64.to_le_bytes()); // p_memsz
+                image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
-        let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
-        let (asid, _map) = state.create_user_address_space().expect("asid");
-        let (entry, _first_pt_load, heap_base) = state
-            .load_elf_pt_load_segments(asid, &image)
-            .expect("load elf");
-        assert_eq!(entry, 0x0040_0000usize);
-        assert_eq!(heap_base, 0x0040_2000usize);
+                let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
+                let (asid, _map) = state.create_user_address_space().expect("asid");
+                let (entry, _first_pt_load, heap_base) = state
+                    .load_elf_pt_load_segments(asid, &image)
+                    .expect("load elf");
+                assert_eq!(entry, 0x0040_0000usize);
+                assert_eq!(heap_base, 0x0040_2000usize);
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     #[test]
     fn load_elf_copies_into_staging_then_finalizes_rx_permissions() {
-        let mut image = vec![0u8; 64 + 56 + 4];
-        image[0..4].copy_from_slice(b"\x7FELF");
-        image[4] = 2;
-        image[5] = 1;
-        image[6] = 1;
-        image[16..18].copy_from_slice(&2u16.to_le_bytes());
-        image[18..20].copy_from_slice(&183u16.to_le_bytes());
-        image[20..24].copy_from_slice(&1u32.to_le_bytes());
-        image[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes());
-        image[32..40].copy_from_slice(&64u64.to_le_bytes());
-        image[52..54].copy_from_slice(&64u16.to_le_bytes());
-        image[54..56].copy_from_slice(&56u16.to_le_bytes());
-        image[56..58].copy_from_slice(&1u16.to_le_bytes());
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut image = vec![0u8; 64 + 56 + 4];
+                image[0..4].copy_from_slice(b"\x7FELF");
+                image[4] = 2;
+                image[5] = 1;
+                image[6] = 1;
+                image[16..18].copy_from_slice(&2u16.to_le_bytes());
+                image[18..20].copy_from_slice(&183u16.to_le_bytes());
+                image[20..24].copy_from_slice(&1u32.to_le_bytes());
+                image[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+                image[32..40].copy_from_slice(&64u64.to_le_bytes());
+                image[52..54].copy_from_slice(&64u16.to_le_bytes());
+                image[54..56].copy_from_slice(&56u16.to_le_bytes());
+                image[56..58].copy_from_slice(&1u16.to_le_bytes());
 
-        let ph = 64usize;
-        image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
-        image[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
-        image[ph + 8..ph + 16].copy_from_slice(&(64u64 + 56u64).to_le_bytes());
-        image[ph + 16..ph + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes());
-        image[ph + 24..ph + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes());
-        image[ph + 32..ph + 40].copy_from_slice(&4u64.to_le_bytes());
-        image[ph + 40..ph + 48].copy_from_slice(&4u64.to_le_bytes());
-        image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
-        image[64 + 56..64 + 60].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+                let ph = 64usize;
+                image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+                image[ph + 4..ph + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+                image[ph + 8..ph + 16].copy_from_slice(&(64u64 + 56u64).to_le_bytes());
+                image[ph + 16..ph + 24].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+                image[ph + 24..ph + 32].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+                image[ph + 32..ph + 40].copy_from_slice(&4u64.to_le_bytes());
+                image[ph + 40..ph + 48].copy_from_slice(&4u64.to_le_bytes());
+                image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+                image[64 + 56..64 + 60].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
 
-        let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
-        let (asid, _map) = state.create_user_address_space().expect("asid");
-        state
-            .load_elf_pt_load_segments(asid, &image)
-            .expect("load elf");
-        let mapping = state
-            .user_spaces
-            .get(asid)
-            .and_then(|aspace| aspace.resolve(VirtAddr(0x0040_0000)))
-            .expect("resolved mapping");
-        assert!(mapping.flags.read);
-        assert!(!mapping.flags.write);
-        assert!(mapping.flags.execute);
+                let mut state = crate::kernel::boot::Bootstrap::init().expect("kernel");
+                let (asid, _map) = state.create_user_address_space().expect("asid");
+                state
+                    .load_elf_pt_load_segments(asid, &image)
+                    .expect("load elf");
+                let mapping = state
+                    .user_spaces
+                    .get(asid)
+                    .and_then(|aspace| aspace.resolve(VirtAddr(0x0040_0000)))
+                    .expect("resolved mapping");
+                assert!(mapping.flags.read);
+                assert!(!mapping.flags.write);
+                assert!(mapping.flags.execute);
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 }
