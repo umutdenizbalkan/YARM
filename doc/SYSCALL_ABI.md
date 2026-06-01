@@ -114,6 +114,10 @@ Reserved/deprecated terminology:
   and planned removal gate.
 - **Removed/invalid** means not dispatched by this kernel ABI.
 
+| `13` | `VmAnonMap` | reserved public syscall number; currently returns `InvalidArgs` |
+| `14` | `VmBrk` | public staged syscall; query, grow, and page-granular shrink are supported |
+| `15` | `DebugLog` | public debug logging syscall |
+
 ## Reserved and gap slots
 
 - `16..=22`: reserved/unassigned in ABI v10. `Syscall::decode` rejects these
