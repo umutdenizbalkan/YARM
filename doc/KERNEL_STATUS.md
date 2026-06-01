@@ -38,6 +38,8 @@ These are workspace service-crate responsibilities.
 - `scripts/check-service-arch-boundary.sh`
 - `scripts/phase5-boundary-gates.sh`
 
+PR-BND-6 pass C landed; boundary milestone freeze status is recorded in `doc/MICROKERNEL_BOUNDARY.md`.
+
 ## Current known limitation snapshot
 
 No kernel-side doc blocker is currently tracked in this file; active work is primarily service-crate reliability hardening while preserving the mechanism/policy split.
