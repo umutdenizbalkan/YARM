@@ -368,3 +368,39 @@ In hosted-dev, `write_user_byte` / `read_user_byte` access `memory.user_memory`.
 These must go through `with_memory_state_mut` / `with_memory_state` (rank 6).
 
 Direct `self.memory.user_memory` access is forbidden in production code (Bug H pattern).
+
+---
+
+## Rule 16 — Split-read helpers must be verified against global-lock reads
+
+Every new `*_split_read` helper on `SharedKernel` must have a test that:
+1. Mutates the relevant state (via `split_mut` or `kernel.with(|state| ...)`).
+2. Reads via the split-read helper.
+3. Reads via `kernel.with(|state| state.xxx())` (global lock path).
+4. Asserts both return the same value.
+
+This ensures the split helper sees the same subsystem lock and accesses the correct
+field — no stale reads, no wrong pointer arithmetic.
+
+```rust
+// correct pattern:
+kernel.record_fault_split_mut(fault);
+assert_eq!(
+    kernel.last_fault_split_read(),
+    kernel.with(|state| state.last_fault())
+);
+
+// wrong — only checks one path:
+// assert_eq!(kernel.last_fault_split_read(), Some(fault));
+```
+
+---
+
+## Rule 17 — Split-read helpers must not hold outer SharedKernel lock
+
+A `*_split_read` helper must acquire ONLY its own subsystem lock — never the outer
+`SharedKernel` `SpinLock<KernelState>`. Callers must not hold any lock of rank ≤ the
+subsystem rank when invoking the helper (per the lock-rank hierarchy in §2).
+
+Document this constraint in the helper's inline comment, following the pattern in
+`runtime.rs::with_fault_split_read` / `with_telemetry_split_read`.
