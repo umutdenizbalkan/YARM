@@ -3375,3 +3375,174 @@ Three new split-read correctness tests added (`runtime::tests`):
 | `telemetry_split_read_helpers_match_kernel_state_accessors` | `tlb_shootdown_count_split_read` / `timeout_count_split_read` match global reads, see split_mut updates |
 
 Total: 547 → 550 / 0 failed.
+
+---
+
+## §12 Stage 4T+6 — x86_64 trap TID split-read conversion
+
+### 12.1 Motivation
+
+The x86_64 shared-trap dispatch function
+(`yarm_x86_dispatch_trap_from_stub` in `src/arch/x86_64/descriptor_tables.rs`)
+previously read `entering_tid` and `exiting_tid` using:
+
+```rust
+shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None)
+```
+
+Each call acquired the global `SharedKernel` `SpinLock<KernelState>`, called
+`set_current_cpu(cpu)` (acquiring the scheduler lock to set `current_cpu`), and then
+read `current_tid_on(current_cpu)`.  This imposed 2 additional global lock
+acquisitions per trap — one for the entering snapshot, one for the exiting snapshot —
+in addition to the global lock already held for `dispatch_trap_entry_with_shared_kernel`.
+
+Stage L5A introduced `SharedKernel::current_tid_split_read(cpu)` as a staged helper
+but immediately reverted its use after observing x86_64 startup corruption. Stage L5B
+re-introduced it as a diagnostic-only comparison gate (`X86_TID_SPLIT_READ_DIAG: bool
+= false`).  Stage 4T+5 confirmed in `§11.6` that "diagnostic `current_tid_split_read`
+comparison shows they always match; live conversion deferred."
+
+Stage 4T+6 completes the conversion after establishing a formal arch-boundary safety
+proof.
+
+### 12.2 Arch-boundary safety proof
+
+**`current_tid_split_read(cpu)` is equivalent to
+`with_cpu(cpu, |k| k.current_tid()).unwrap_or(None)` for all reachable CPU states.**
+
+#### Case 1 — CPU offline (`validate_online_cpu` would fail)
+
+- `with_cpu` path: `with_cpu(cpu, ...)` calls `set_current_cpu(cpu)` which calls
+  `validate_online_cpu(cpu)`; if the CPU is offline this returns `Err`, and
+  `unwrap_or(None)` produces `None`.
+- Split-read path: `current_tid_split_read(cpu)` calls `check_online_cpu(cpu).ok()?`;
+  if the CPU is offline this returns `None`.
+- **Both paths produce `None`. Equivalent.**
+
+#### Case 2 — CPU online
+
+- `with_cpu` path: `set_current_cpu(cpu)` sets `scheduler_state.current_cpu = cpu`;
+  then `k.current_tid()` reads `current_tid_on(scheduler_state.current_cpu)` =
+  `current_tid_on(cpu)`.
+- Split-read path: `current_tid_split_read(cpu)` directly reads
+  `scheduler.current_tid_on(cpu)` under the scheduler lock.
+- **Both paths read `current_tid_on(cpu)` for the same CPU.  Equivalent.**
+
+#### Side-effect analysis: `set_current_cpu(cpu)`
+
+`set_current_cpu(cpu)` has one side effect beyond the `current_cpu` field write: it
+establishes `current_cpu = cpu` for any code that reads `scheduler_state.current_cpu`
+later in the same lock critical section.
+
+- **For `entering_tid`**: the `with_cpu` call happens before
+  `dispatch_trap_entry_with_shared_kernel(shared, cpu, context, frame)`, which
+  internally also calls `shared.with_cpu(cpu, |k| ...)` — this second `with_cpu` call
+  will again call `set_current_cpu(cpu)` and override any value set by the
+  entering-snapshot `with_cpu` call.  The `set_current_cpu` side effect from the
+  entering snapshot is therefore completely shadowed before any code can observe it.
+- **For `exiting_tid`**: the `with_cpu` call happens after `dispatch_trap_entry_with_shared_kernel`
+  has returned and released all its locks.  After the dispatch returns, no other code
+  path reads `scheduler_state.current_cpu` before the trap handler returns to hardware.
+  The side effect of setting `current_cpu = cpu` is harmless — it sets the field to the
+  same value it already holds from the last `set_current_cpu(cpu)` call inside dispatch.
+
+**Conclusion**: removing `set_current_cpu` side effects does not change any observable
+behavior at the entering or exiting TID call sites.
+
+#### `task_switched` detection correctness
+
+`task_switched = entering_tid != exiting_tid` determines whether
+`write_task_gprs_to_saved_regs` (full task-switch frame writeback) or
+`write_trap_returns_to_saved_regs` (syscall-return-only writeback) is used.
+
+The split-read produces the same `entering_tid` and `exiting_tid` values as the
+conservative path (proved above), so `task_switched` is computed identically and the
+correct writeback path is always selected.
+
+### 12.3 Changes made
+
+**`src/arch/x86_64/descriptor_tables.rs`**:
+
+1. Removed dead constant `X86_TID_SPLIT_READ_DIAG: bool = false` (and the dead
+   diagnostic comparison blocks it guarded, which were compiled out by the `if false`
+   branch optimizer in all builds).
+
+2. Replaced the `entering_tid` snapshot:
+   ```rust
+   // REMOVED (Class F guard, 2 lock acquisitions):
+   let entering_tid: Option<u64> = shared
+       .with_cpu(cpu, |k| k.current_tid())
+       .unwrap_or(None);
+
+   // NEW (Class E, scheduler lock rank 1 only):
+   // Stage 4T+6: current_tid_split_read(cpu) is equivalent to with_cpu→current_tid
+   // because current_tid_on(cpu) == set_current_cpu(cpu)→current_tid_on(current_cpu)
+   // for online CPUs, and both return None for offline CPUs.  The set_current_cpu
+   // side effect was immediately overridden by dispatch's own with_cpu call.
+   let entering_tid: Option<u64> = shared.current_tid_split_read(cpu);
+   ```
+
+3. Replaced the `exiting_tid` snapshot identically, with an additional comment noting
+   that at exit time the dispatch has already released all its locks and the scheduler
+   state reflects the final dispatched task.
+
+4. **Fatal-trap `with_cpu` kept as-is (Class F)**:
+   ```rust
+   let _ = shared.with_cpu(cpu, |k| {
+       log_decoded_fatal_trap(Some(k), vector, error_code, frame, fault_addr);
+   });
+   ```
+   This call passes `&mut KernelState` to the fatal-trap logger, which is required for
+   the logger to access `KernelState` subsystem state.  No split-read can replace it.
+
+**Net effect**: 2 global lock acquisitions per trap eliminated (entering + exiting
+snapshots).  The fatal-trap path (1 global lock, Class F) and the main dispatch path
+(1 global lock for `dispatch_trap_entry_with_shared_kernel`) are unchanged.
+
+### 12.4 Classification update (§11.2 revision)
+
+The call sites previously classified as `F` at `descriptor_tables.rs:823,857` have
+been converted:
+
+| Location | Method | Old Class | New Class |
+|----------|--------|-----------|-----------|
+| `arch/x86_64/descriptor_tables.rs` (entering_tid) | `current_tid_split_read(cpu)` | F (deferred) | **E (converted)** |
+| `arch/x86_64/descriptor_tables.rs` (exiting_tid) | `current_tid_split_read(cpu)` | F (deferred) | **E (converted)** |
+| `arch/x86_64/descriptor_tables.rs` (fatal-trap) | `with_cpu → log_decoded_fatal_trap` | F | **F (kept, needs &mut KernelState)** |
+
+### 12.5 Complete split helper inventory update
+
+**Scheduler domain (rank 1):** (updated from §11.4)
+- `scheduler_tick_now_split_read()` — timer tick read
+- `current_tid_split_read(cpu)` — per-CPU current TID read (**now live in x86_64 trap**)
+- `online_cpu_count_split_read()` — topology read
+- `present_cpu_count_split_read()` — topology read
+
+### 12.6 Tests
+
+Four new split-read correctness tests added (`runtime::tests`):
+
+| Test | Invariant |
+|------|-----------|
+| `current_tid_split_read_matches_with_cpu_current_tid_entering_snapshot` | `current_tid_split_read(cpu)` == `with_cpu(cpu, \|k\| k.current_tid()).unwrap_or(None)` after dispatch; both return `Some(77)` |
+| `current_tid_split_read_reflects_task_switch_for_exiting_snapshot` | After `yield_current()` from task 81 (with task 82 queued), split read returns `Some(82) ≠ Some(81)`; `task_switched` flag is true |
+| `current_tid_split_read_no_switch_detection_for_same_task_return` | After dispatch to task 71 with no yield, split read returns same TID for both entering and exiting snapshots; `task_switched` is false |
+| `current_tid_split_read_offline_cpu_returns_none` | `current_tid_split_read(CpuId(255))` returns `None` for an offline/nonexistent CPU |
+
+Total: 550 → 554 / 0 failed.
+
+### 12.7 What Stage 4T+6 does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback semantics: unchanged — `task_switched` computation and
+  `write_task_gprs_to_saved_regs` / `write_trap_returns_to_saved_regs` selection are
+  identical to the pre-conversion behavior.
+- TrapFrame contents: unchanged.
+- Task switch behavior: unchanged.
+- Scheduling decisions: unchanged.
+- AArch64 behavior: unchanged.
+- The fatal-trap `with_cpu` call and the main dispatch `with_cpu` call are retained.
+- The global `SharedKernel` lock is still retained for all mutation paths.
+  **This is not Stage 3/global-lock removal.**
