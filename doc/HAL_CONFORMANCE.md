@@ -76,6 +76,20 @@ discovery or production-board coverage. Current status:
 | x86_64 | QEMU `q35` PVH, `qemu64`, 512 MiB RAM default | `false` | Higher-half/direct-map bootstrap aliases, kernel link base, allocator floor `0x1000_0000`, PC-compatible LAPIC/IOAPIC physical MMIO addresses and aliases, timer tick budget. | PVH memmap supplies usable RAM, but ACPI/MP-table driven interrupt topology discovery remains future work for non-QEMU/non-PC-compatible targets. |
 | RISC-V 64 | QEMU `virt`/OpenSBI, `rv64`, 512 MiB RAM default | `false` | Bootstrap VA/PA anchors, allocator floor `0x1000_0000`, PLIC base `0x0c00_0000`, S-mode context index `1`, timer tick budget. | Firmware-table/device-tree driven memory and interrupt topology discovery remains future work beyond the current QEMU `virt` profile. |
 
+### `NEXT_ANON_PHYS_BASE` audit note
+
+`NEXT_ANON_PHYS_BASE` is intentionally a per-ISA conservative allocator floor,
+not merely the kernel image end. A naive `align_up(__kernel_end, 2 MiB)` floor is
+not safe as a cross-ISA replacement because boot modules/initrds, DTBs, PVH
+metadata, page tables, and low bootstrap structures can live outside the kernel
+image and, on some paths, are discovered only during architecture preparation or
+not yet fully folded into a runtime-computed floor. A safe dynamic floor would
+need to be at least `align_up(max(kernel_end, initrd_end, module_end,
+reserved_boot_end), 2 MiB)` and also prove the result lies in usable RAM before
+allocator seeding. Until every boot path supplies those inputs early enough, the
+hardcoded floors remain the truth-in-labeling contract and reserved-range
+sanitization remains responsible for excluding known boot-owned windows.
+
 ## Invariants
 
 - syscall/trap arg register count must remain aligned across selected ISA ABI profiles for core syscall paths.

@@ -11,6 +11,9 @@
 pub const KERNEL_BOOTSTRAP_VIRT_BASE: u64 = 0x4008_0000;
 pub const KERNEL_BOOTSTRAP_PHYS_BASE: u64 = 0x4008_0000;
 pub const KERNEL_LINK_VIRT_BASE: u64 = 0x0;
+// Conservative allocator floor for anonymous/page-table frames. Do not derive
+// this from `align_up(__kernel_end, 2 MiB)` alone: QEMU `virt` can place the
+// DTB/initrd above the kernel image, and those boot ranges must stay reserved.
 pub const NEXT_ANON_PHYS_BASE: u64 = 0x5000_0000;
 pub const KERNEL_PHYS_DIRECT_MAP_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 

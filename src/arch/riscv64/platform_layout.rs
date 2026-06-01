@@ -11,6 +11,10 @@
 pub const KERNEL_BOOTSTRAP_VIRT_BASE: u64 = 0xFFFF_0000;
 pub const KERNEL_BOOTSTRAP_PHYS_BASE: u64 = 0x0;
 pub const KERNEL_LINK_VIRT_BASE: u64 = 0x0;
+// Conservative allocator floor for the fallback boot memory map. RISC-V QEMU
+// `virt` initrd/firmware placement is not currently folded into a computed
+// allocator floor, so `align_up(__kernel_end, 2 MiB)` alone is not a safe
+// replacement for this target-wide fallback.
 pub const NEXT_ANON_PHYS_BASE: u64 = 0x1000_0000;
 pub const KERNEL_PHYS_DIRECT_MAP_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 

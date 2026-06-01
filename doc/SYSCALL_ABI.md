@@ -29,6 +29,91 @@ kernel-extension slots.
 | `10` | `FutexWake` | public (`arg0=addr`, `arg1=max_wake`) |
 | `11` | `SpawnThread` | public (`arg0=tls_base`, `arg1=user_stack_top`, `arg2=user_entry`) |
 | `12` | `Fork` | public, forks current process with CoW and returns child tid in parent |
+| `13` | `VmAnonMap` | public, wired anonymous page mapping syscall |
+| `14` | `VmBrk` | public staged syscall; query, grow, and page-granular shrink are supported |
+| `15` | `DebugLog` | public debug logging syscall |
+
+## ABI slot status matrix
+
+Status terms used by this matrix:
+
+- **public v10**: part of the stable user-callable syscall ABI for version `10`.
+- **privileged extension**: implemented dispatch-table slot outside the public v10
+  range; intended for PM/SystemServer/bootstrap plumbing and not counted in the
+  public ABI surface.
+- **reserved gap**: not assigned and not dispatched in v10. Calls currently fail
+  with `InvalidNumber`; assignment to a public user ABI requires a future ABI
+  version as described below.
+- **deprecated**: still dispatched for compatibility, but discouraged, with a
+  documented replacement and removal plan. **No public v10 syscall is currently
+  deprecated.**
+- **removed/invalid**: not dispatched by this kernel ABI.
+
+| Slot/range | Name | Status | Caller class | Notes |
+|------------|------|--------|--------------|-------|
+| `0` | `Yield` | public v10 | any user task | Stable public syscall. |
+| `1` | `IpcSend` | public v10 | any user task with endpoint rights | Capability/right checks apply. |
+| `2` | `IpcRecv` | public v10 | any user task with endpoint rights | Capability/right checks apply. |
+| `3` | `VmMap` | public v10 | any user task with mapping capability | Capability-targeted VM mapping. |
+| `4` | `TransferRelease` | public v10 | transfer receiver | Releases auto-mapped shared-memory transfer. |
+| `5` | `IpcRecvTimeout` | public v10 | any user task with endpoint rights | Bounded receive/probe variant. |
+| `6` | `IpcCall` | public v10 | any user task with endpoint rights | Request send with kernel-minted reply-cap transfer. |
+| `7` | `IpcReply` | public v10 | reply-cap holder | Consumes one-shot reply capability. |
+| `8` | `ControlPlaneSetCnodeSlots` | public v10 | policy-gated user/control-plane callers | Public ABI slot; kernel policy may return `MissingRight`. |
+| `9` | `FutexWait` | public v10 | any user task | Futex address validation applies. |
+| `10` | `FutexWake` | public v10 | any user task | Futex address validation applies. |
+| `11` | `SpawnThread` | public v10 | any user task | Spawns a thread in the current process/thread group. |
+| `12` | `Fork` | public v10 | any user task | CoW process fork. |
+| `13` | `VmAnonMap` | public v10 | any user task | Wired anonymous mapping syscall; not reserved or deprecated. |
+| `14` | `VmBrk` | public v10 | thread-group leader | Staged per-task brk contract. |
+| `15` | `DebugLog` | public v10 | any user task | Debug logging aid; semantics are best-effort. |
+| `16..=22` | — | reserved gap | none | `Syscall::decode` rejects these with `InvalidNumber`; unavailable until explicitly assigned in a future ABI. |
+| `23` | `SpawnProcess` | privileged extension | privileged/bootstrap control-plane use | Implemented kernel dispatch slot; not part of public v10 count. |
+| `24` | `SpawnProcessFromUserBuf` | privileged extension | privileged/control-plane staging use | Implemented kernel dispatch slot; not part of public v10 count. |
+| `25` | — | reserved gap | none | `Syscall::decode` rejects this with `InvalidNumber`; unavailable until explicitly assigned in a future ABI. |
+| `26` | `SpawnFromInitramfsFile` | privileged extension | PM/VFS-backed spawn path | Implemented kernel dispatch slot; not part of public v10 count. |
+| `27` | `InitramfsReadChunk` | privileged extension | SystemServer only | Phase 2A/2B bootstrap bridge; not part of public v10 count. |
+| `28` | `CreateInitramfsFileSliceMo` | privileged extension | SystemServer only | Phase 3A initramfs MemoryObject helper; not part of public v10 count. |
+| `29` | `SpawnFromMemoryObject` | privileged extension | PM TID `3` only | Phase 3A zero-copy spawn helper; not part of public v10 count. |
+| `30+` | — | removed/invalid | none | Outside `SYSCALL_COUNT = 30`; not dispatched. |
+
+## ABI versioning and deprecation policy
+
+The v10 contract is frozen for the public ABI slots listed above. Freezing means
+call numbers and incompatible user-visible semantics do not change inside v10;
+it does not prevent compatible implementation fixes or documentation updates.
+
+Changes that require an ABI v11 bump include:
+
+- renumbering any public syscall;
+- changing public syscall argument layout, return layout, error behavior, or
+  side effects incompatibly;
+- assigning a reserved public gap (`16..=22` or `25`) to a user-visible public
+  syscall;
+- changing public struct layout, encoded metadata bytes, flag bits, sentinel
+  values, or existing flag meanings incompatibly;
+- removing or making invalid a public v10 syscall that is still documented as
+  callable.
+
+Changes allowed within v10 include:
+
+- bug fixes that preserve the documented public behavior;
+- documentation clarifications and reserved-slot documentation;
+- adding or refining privileged extension slots outside the public v10 range,
+  provided they do not change existing public syscall behavior;
+- tightening access checks for privileged-only extension syscalls;
+- compatible additions that do not change existing public argument/return
+  layouts, existing flag meanings, or existing success/error contracts.
+
+Reserved/deprecated terminology:
+
+- **Reserved** means not callable and invalid in the current ABI; a reserved slot
+  may be assigned only by an explicit future ABI decision.
+- **Deprecated** means callable for compatibility but discouraged; deprecation
+  requires this document to name the replacement, first-deprecated ABI version,
+  and planned removal gate.
+- **Removed/invalid** means not dispatched by this kernel ABI.
+
 | `13` | `VmAnonMap` | reserved public syscall number; currently returns `InvalidArgs` |
 | `14` | `VmBrk` | public staged syscall; query, grow, and page-granular shrink are supported |
 | `15` | `DebugLog` | public debug logging syscall |
@@ -66,7 +151,7 @@ holes from implemented privileged paths.
 - `10` `FutexWake`: exposed and wired.
 - `11` `SpawnThread`: exposed and wired.
 - `12` `Fork`: exposed and wired.
-- `13` `VmAnonMap`: reserved syscall number; current implementation is a stub returning `InvalidArgs`.
+- `13` `VmAnonMap`: exposed and wired; maps anonymous pages at a caller-selected page-aligned virtual address.
 - `14` `VmBrk`: staged syscall; query, grow, and page-granular shrink are supported.
 
 ## Futex safety contract
@@ -167,6 +252,27 @@ holes from implemented privileged paths.
 - `args[3]`: protection flags bitmask (`READ=0x1`, `WRITE=0x2`, `EXEC=0x4`)
 - `args[4]`: reserved (must be `0`)
 - `args[5]`: reserved (must be `0`)
+
+### `VmAnonMap` argument layout
+
+- Syscall number: `13`
+- `args[0]`: reserved for future use; portable callers should pass `0`
+- `args[1]`: virtual address (page-aligned)
+- `args[2]`: mapping length in bytes (rounded up to page size)
+- `args[3]`: protection flags bitmask (`READ=0x1`, `WRITE=0x2`, `EXEC=0x4`)
+- `args[4]`: reserved for future use; portable callers should pass `0`
+- `args[5]`: reserved for future use; portable callers should pass `0`
+
+`VmAnonMap` semantics:
+
+- The syscall is public v10 and wired; it is not reserved or deprecated.
+- The kernel validates the `(addr, len, prot)` triple, rejects zero length and
+  non-page-aligned addresses, rounds length up to page size, allocates anonymous
+  MemoryObjects page-by-page, and maps them into the current address space.
+- Success returns `ret0=addr`, `ret1=rounded_length`, `ret2=0`.
+- Partial mapping failures roll back physical mappings already installed for the
+  requested range; any already allocated MemoryObject cap slots are reclaimed
+  with the task cspace on exit.
 
 ### `SpawnThread` argument layout and runtime contract
 
