@@ -243,6 +243,33 @@ impl KernelState {
         Ok(())
     }
 
+    /// Enqueue `msg` into the endpoint at `endpoint_idx` and wake any waiter.
+    ///
+    /// This is the canonical "supervisor notify" pattern used by fault reporting,
+    /// task-exit, transfer-revoke, and TLB-shootdown escalation.  It enforces the
+    /// lock ordering:
+    ///
+    /// - Enqueue under `ipc_state_lock` (rank 3) so the message is visible before
+    ///   the lock is released.
+    /// - Wake the waiter **after** releasing `ipc_state_lock` — `wake_tid_to_runnable`
+    ///   acquires `task_state_lock` (rank 2), which ranks below IPC (rank 3) and
+    ///   must therefore not be acquired while the IPC lock is held.
+    pub(crate) fn send_message_to_endpoint_and_wake(
+        &mut self,
+        endpoint_idx: usize,
+        msg: crate::kernel::ipc::Message,
+    ) -> Result<(), KernelError> {
+        self.with_ipc_state_mut(|ipc| {
+            let Some(ep_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut) else {
+                return Err(KernelError::WrongObject);
+            };
+            kernel_mut(ep_storage).send(msg).map_err(|_| KernelError::EndpointQueueFull)?;
+            Ok(())
+        })?;
+        let _ = self.wake_waiter_for_endpoint(endpoint_idx);
+        Ok(())
+    }
+
     pub(crate) fn process_ipc_timeout_deadlines(
         &mut self,
         now_tick: u64,

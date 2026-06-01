@@ -28,17 +28,27 @@ impl KernelState {
             Self::requested_cnode_slot_capacity_for_class(class, limits, requested_cnode_slots)?;
         self.ensure_cnode_space_with_slots(cnode, cnode_slots)?;
         self.set_process_cnode_for_pid(process_pid, cnode)?;
-        let inserted = if let Some(idx) = self.tcbs.iter().position(|slot| slot.is_none()) {
-            let tcb = ThreadControlBlock::new(ThreadId(tid), None);
-            self.tcbs[idx] = Some(tcb);
-            self.task_classes[idx] = Some(class);
-            true
-        } else {
-            false
-        };
-        if !inserted {
+        // Allocate TCB slot under task_state_lock (rank 2) to prevent concurrent
+        // task creation from claiming the same slot.  task_classes is a companion
+        // array indexed in tandem with tcbs (same MAX_TASKS length, no separate
+        // lock); set it immediately after the TCB is inserted while the index is
+        // still in scope.
+        let inserted_idx = self.with_tcbs_mut(|tcbs| {
+            if let Some(idx) = tcbs.iter().position(|slot| slot.is_none()) {
+                let tcb = ThreadControlBlock::new(ThreadId(tid), None);
+                tcbs[idx] = Some(tcb);
+                Some(idx)
+            } else {
+                None
+            }
+        });
+        let Some(inserted_idx) = inserted_idx else {
             return Err(KernelError::TaskTableFull);
-        }
+        };
+        // Set the class entry for the slot we just claimed.  task_state_lock is
+        // released here, but no other path can observe this slot until the class
+        // is set and provision_default_kernel_context completes.
+        super::kernel_mut(&mut self.task_classes)[inserted_idx] = Some(class);
         self.provision_default_kernel_context(tid)?;
         Ok(())
     }

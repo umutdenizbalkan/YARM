@@ -147,20 +147,9 @@ impl KernelState {
             Err(_) => return,
         };
 
-        let sent = if let Some(endpoint) = self
-            .ipc
-            .endpoints
-            .get_mut(endpoint_idx)
-            .and_then(Option::as_mut)
-        {
-            endpoint.send(msg).is_ok()
-        } else {
-            false
-        };
-
-        if sent {
-            let _ = self.wake_waiter_for_endpoint(endpoint_idx);
-        }
+        // send_message_to_endpoint_and_wake enqueues under ipc_state_lock
+        // (rank 3) and wakes outside the lock (task lock rank 2 < ipc rank 3).
+        let _ = self.send_message_to_endpoint_and_wake(endpoint_idx, msg);
     }
 
     fn emit_fault_report(&mut self, faulted_tid: u64) {
@@ -246,6 +235,15 @@ impl KernelState {
         })?;
         let _ = self.dispatch_next_task()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emit_fault_report_for_fault_for_test(
+        &mut self,
+        faulted_tid: u64,
+        fault: crate::kernel::trap::FaultInfo,
+    ) {
+        self.emit_fault_report_for_fault(faulted_tid, fault);
     }
 
     pub fn handle_trap(
