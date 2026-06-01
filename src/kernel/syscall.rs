@@ -912,6 +912,14 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
                     IpcEndpointSendResult::Enqueued => {
                         kernel.note_endpoint_only_queued_send_split();
+                        // Stage 4E now accepts FLAG_CAP_TRANSFER / FLAG_CAP_TRANSFER_PLAIN
+                        // (cap already stashed in transfer-envelope table by stash_transfer_handle).
+                        if (msg.flags
+                            & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN))
+                            != 0
+                        {
+                            kernel.note_cap_transfer_stage4e_enqueued();
+                        }
                         (Some(Ok(())), IpcSchedulerPlan::None)
                     }
                     IpcEndpointSendResult::EnqueuedWakeReceiver(_) => {

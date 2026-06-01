@@ -127,6 +127,35 @@ pub(crate) enum IpcSchedulerPlan {
     /// Apply with apply_split_receiver_wake_plan outside any ipc/endpoint lock.
     WakeReceiver(ThreadId),
 }
+
+#[allow(dead_code)]
+/// General-purpose deferred scheduler wake plan.
+///
+/// Separates the *decision* (computed while holding a domain lock) from the
+/// *execution* (applied after all domain locks are released).  Analogous to
+/// `IpcSchedulerPlan` but intended for non-IPC kernel domains (fault, restart,
+/// capability lifecycle, thread join) that need to wake a task as a side effect
+/// of a mutation that is itself guarded by a domain lock.
+///
+/// Usage pattern:
+/// ```text
+/// // inside a domain-lock closure — compute only, no scheduler mutation:
+/// let plan = if some_condition { SchedulerWakePlan::Wake(tid) }
+///            else              { SchedulerWakePlan::None };
+/// // after releasing the domain lock — execute:
+/// kernel.apply_scheduler_wake_plan(plan)?;
+/// ```
+///
+/// See `doc/KERNEL_LOCKING.md §SchedulerWakePlan` for the authoritative
+/// lock-ordering rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchedulerWakePlan {
+    /// No scheduling action required.
+    None,
+    /// Wake the identified task: mark it Runnable and enqueue it on the
+    /// appropriate CPU.  Applied via `apply_scheduler_wake_plan`.
+    Wake(ThreadId),
+}
 #[cfg(feature = "hosted-dev")]
 const MAX_COW_PAGES: usize = 100;
 #[cfg(not(feature = "hosted-dev"))]

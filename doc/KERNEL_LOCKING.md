@@ -2130,7 +2130,8 @@ Task 1 (requester) blocks recv-v2 on the reply endpoint; task 2 (replier) issues
 | IpcReply with FLAG_CAP_TRANSFER_PLAIN to recv-v2 blocked requester | Requester waiter + recv-v2, cap-transfer reply | **Live** Stage 4M (Stage 4P test coverage) | `ipc_reply_split_deliveries` |
 | IpcSend with FLAG_CAP_TRANSFER to recv-v2 blocked receiver | Receiver waiter + recv-v2, FLAG_CAP_TRANSFER | **Live** Stage 4O | `split_recv_v2_deliveries`, `cap_transfer_recv_v2_deliveries` |
 | IpcSend/IpcCall to non-recv-v2 receiver (ReceiverWaiterFound) | Receiver waiter, not recv-v2 | **Deferred** (falls to ipc_send) | — |
-| IpcSend/IpcCall with FLAG_CAP_TRANSFER (no recv-v2 waiter) | FLAG_CAP_TRANSFER, no recv-v2 receiver | **Deferred** (Ineligible or falls to ipc_send) | — |
+| IpcSend with FLAG_CAP_TRANSFER/PLAIN (no receiver waiter, buffered) | No receiver, buffered endpoint, FLAG_CAP_TRANSFER or FLAG_CAP_TRANSFER_PLAIN | **Live** Stage 4E (extended) | `queued_sends`, `cap_transfer_stage4e_enqueued` |
+| IpcSend/IpcCall with FLAG_CAP_TRANSFER to non-recv-v2 receiver | FLAG_CAP_TRANSFER, non-recv-v2 receiver present | **Deferred** (falls to ipc_send) | — |
 | IpcSend/IpcCall to synchronous endpoint (no waiter) | Synchronous mode | **Deferred** (Ineligible) | — |
 | IpcReply to non-recv-v2 requester | Queue enqueue path | **Deferred** (enqueue+wake) | — |
 | MemoryObject zero-copy, VFS shared-reply | Phase 3B / VFS gate | **Deferred indefinitely** | — |
@@ -2161,16 +2162,25 @@ handoff then fails or races, the waiter is orphaned with no recovery path.
 The Stage 4F buffered-path split intentionally excludes non-buffered endpoints
 (`Ineligible(NonBufferedEndpoint)`).
 
-#### Cap-transfer sends to non-recv-v2 receivers (deferred)
+#### Stage 4E extension: FLAG_CAP_TRANSFER/PLAIN buffered no-receiver enqueue (live)
 
-`FLAG_CAP_TRANSFER` to a **recv-v2 blocked** receiver is now handled by Stage 4O
-(IpcSend), which calls `complete_blocked_recv_for_waiter` outside `ipc_state_lock`
-— same as the full `ipc_send_with_optional_deadline` path already did.
+`FLAG_CAP_TRANSFER` and `FLAG_CAP_TRANSFER_PLAIN` messages sent to a **buffered
+endpoint with no receiver waiter** are now handled by Stage 4E (the extended split
+path) in `ipc_try_send_queued_plain_endpoint_only`.
 
-**Remaining deferred cases**:
-- `FLAG_CAP_TRANSFER` with **no receiver waiter**: the no-waiter enqueue branch of
-  `ipc_try_send_queued_plain_endpoint_only` rejects with
-  `Ineligible(TransferOrReplyCapMessage)` — falls to full `ipc_send`.
+**Why safe**: `handle_ipc_send` calls `stash_transfer_handle` before the split
+path is attempted.  At that point the cap is moved into the transfer-envelope
+table; the `Message` carries only the numeric envelope handle.  For the
+no-receiver buffered-enqueue case, `ipc_send_with_optional_deadline` does an
+identical `endpoint.send(msg)`, so Stage 4E is a strict behavioural subset.  The
+receiver's `ipc_recv` or `ipc_recv_timeout` falls through to the full path (Stage
+4C/4D still rejects cap-transfer messages on the recv side) which materialises
+the cap from the envelope handle.
+
+**Telemetry**: `cap_transfer_stage4e_enqueued` increments alongside `queued_sends`
+for every FLAG_CAP_TRANSFER/PLAIN message buffered via Stage 4E.
+
+**Still deferred (cap-transfer):**
 - `FLAG_CAP_TRANSFER` to a **non-recv-v2** blocked receiver: `is_task_recv_v2_blocked`
   returns false; `ipc_try_send_to_plain_receiver_endpoint_only` rejects with
   `Ineligible(TransferOrReplyCapMessage)` — falls to full `ipc_send`.
@@ -2182,8 +2192,40 @@ The Stage 4F buffered-path split intentionally excludes non-buffered endpoints
 (IpcCall) and the existing `ipc_reply` direct path, both of which call
 `complete_blocked_recv_for_waiter` outside `ipc_state_lock`.
 
-**Decision**: remaining cap-transfer paths without a recv-v2 receiver remain on the
+**Decision**: remaining cap-transfer paths with a receiver waiter remain on the
 full IPC path indefinitely.
+
+---
+
+### SchedulerWakePlan: cross-domain deferred wake pattern
+
+`SchedulerWakePlan` (`src/kernel/boot/mod.rs`) is the cross-domain analogue of
+`IpcSchedulerPlan`.  It separates the *decision* (computed while holding a domain
+lock) from the *execution* (applied after all domain locks are released).
+
+```
+enum SchedulerWakePlan { None, Wake(ThreadId) }
+```
+
+Usage protocol:
+```
+// 1. Inside a domain-lock closure: compute the plan, no scheduler mutation.
+let plan = if condition { SchedulerWakePlan::Wake(tid) }
+           else         { SchedulerWakePlan::None };
+// 2. Release all domain locks.
+// 3. Apply the plan — acquires only scheduler-internal state (rank 1–2).
+kernel.apply_scheduler_wake_plan(plan)?;
+```
+
+`apply_scheduler_wake_plan` delegates to `wake_tid_to_runnable`, which acquires
+only `task_state_lock` (rank 3) and `scheduler_state` (rank 2) — both below all
+IPC, capability, VM, memory, and driver lock ranks.
+
+**Domains that should adopt this pattern** when adding new task-wake side effects:
+- Fault handlers that wake a supervisor endpoint waiter
+- Restart paths that notify a monitor endpoint
+- Capability lifecycle events that unblock a waiting task
+- Thread join / futex wake paths
 
 ---
 

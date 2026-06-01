@@ -489,7 +489,7 @@ impl KernelState {
         sender_tid: ThreadId,
     ) -> Result<(), KernelError> {
         crate::yarm_log!("IPC_RECV_SPLIT_REFILL_WAKE_APPLY tid={}", sender_tid.0);
-        self.wake_sender_waiter(sender_tid)
+        self.apply_scheduler_wake_plan(super::SchedulerWakePlan::Wake(sender_tid))
     }
 
     pub(crate) fn ipc_try_send_queued_plain_endpoint_only(
@@ -533,10 +533,20 @@ impl KernelState {
                 }
             }
 
-            let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
-                | Message::FLAG_CAP_TRANSFER_PLAIN
-                | Message::FLAG_REPLY_CAP;
-            if (msg.flags & split_unsafe_flags) != 0 || msg.transferred_cap().is_some() {
+            // Stage 4E: FLAG_REPLY_CAP messages carry a kernel reply-cap handle and
+            // must use the full send path (reply-cap semantics require endpoint-side
+            // tracking not present here).
+            //
+            // FLAG_CAP_TRANSFER and FLAG_CAP_TRANSFER_PLAIN are safe for Stage 4E:
+            // stash_transfer_handle already moved the cap into the transfer-envelope
+            // table before this call, so the message's transferred_cap field is merely
+            // a numeric envelope handle.  For the no-receiver buffered-enqueue case,
+            // ipc_send_with_optional_deadline does an identical endpoint.send(msg),
+            // making Stage 4E a strict behavioural subset of the full path.
+            // The receiver's ipc_recv (or ipc_recv_timeout) falls through to the full
+            // path to materialise the cap, since Stage 4C/4D still rejects cap-transfer
+            // messages on the recv side.
+            if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
                 return IpcEndpointSendResult::Ineligible(
                     IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
                 );
@@ -659,7 +669,25 @@ impl KernelState {
         receiver_tid: ThreadId,
     ) -> Result<(), KernelError> {
         crate::yarm_log!("IPC_SEND_SPLIT_RECEIVER_WAKE_APPLY tid={}", receiver_tid.0);
-        self.wake_tid_to_runnable(receiver_tid)
+        self.apply_scheduler_wake_plan(super::SchedulerWakePlan::Wake(receiver_tid))
+    }
+
+    /// Apply a general-purpose deferred wake plan produced by any kernel domain.
+    ///
+    /// Callers compute the plan while holding a domain-specific lock, then release
+    /// that lock before calling this function.  The function itself acquires only
+    /// scheduler-internal state (rank 1–2) which is below all IPC/task/capability
+    /// locks, so no lock-ordering violation is possible.
+    ///
+    /// See `doc/KERNEL_LOCKING.md §SchedulerWakePlan` for the full protocol.
+    pub(crate) fn apply_scheduler_wake_plan(
+        &mut self,
+        plan: super::SchedulerWakePlan,
+    ) -> Result<(), KernelError> {
+        match plan {
+            super::SchedulerWakePlan::None => Ok(()),
+            super::SchedulerWakePlan::Wake(tid) => self.wake_tid_to_runnable(tid),
+        }
     }
 
     fn resolve_reply_index(&self, object: CapObject) -> Result<usize, KernelError> {
@@ -1436,6 +1464,11 @@ impl KernelState {
     pub(crate) fn note_cap_transfer_recv_v2_delivery(&mut self) {
         self.ipc.telemetry.cap_transfer_recv_v2_deliveries =
             self.ipc.telemetry.cap_transfer_recv_v2_deliveries.saturating_add(1);
+    }
+
+    pub(crate) fn note_cap_transfer_stage4e_enqueued(&mut self) {
+        self.ipc.telemetry.cap_transfer_stage4e_enqueued =
+            self.ipc.telemetry.cap_transfer_stage4e_enqueued.saturating_add(1);
     }
 
     fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {
