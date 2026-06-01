@@ -63,6 +63,19 @@ All three profiles must satisfy identical kernel-facing semantics for:
 - A firmware-blob staging helper now stages canonical per-ISA IRQ controller descriptions derived by selected-ISA topology discovery (`discover_irq_controller_description`), reducing malformed handoff risk.
 - Remaining integration work is implementing concrete platform ACPI/DT extraction producers that feed the registered provider in production boot environments.
 
+## Platform layout profile status
+
+`PROFILE_IS_PLACEHOLDER` on `src/arch/<isa>/platform_layout.rs` describes
+whether that ISA's **platform-layout constants** are placeholders for the
+currently supported QEMU smoke target. It does not claim generic hardware
+discovery or production-board coverage. Current status:
+
+| ISA | Current smoke target | `PROFILE_IS_PLACEHOLDER` | Hardcoded/static anchors | Remaining non-generic work |
+|-----|----------------------|--------------------------|--------------------------|----------------------------|
+| AArch64 | QEMU `virt`, `cortex-a72`, 1 GiB RAM default | `false` | RAM/kernel bootstrap anchors `0x4000_0000`/`0x4008_0000`, allocator floor `0x5000_0000`, GICv2 CPU interface fallback `0x0801_0000`, timer tick budget. | DTB is parsed for RAM/initrd/CPU bitmap/PSCI/GIC handoff, but non-QEMU boards still need full platform description handoff instead of relying on these fallback anchors. |
+| x86_64 | QEMU `q35` PVH, `qemu64`, 512 MiB RAM default | `false` | Higher-half/direct-map bootstrap aliases, kernel link base, allocator floor `0x1000_0000`, PC-compatible LAPIC/IOAPIC physical MMIO addresses and aliases, timer tick budget. | PVH memmap supplies usable RAM, but ACPI/MP-table driven interrupt topology discovery remains future work for non-QEMU/non-PC-compatible targets. |
+| RISC-V 64 | QEMU `virt`/OpenSBI, `rv64`, 512 MiB RAM default | `false` | Bootstrap VA/PA anchors, allocator floor `0x1000_0000`, PLIC base `0x0c00_0000`, S-mode context index `1`, timer tick budget. | Firmware-table/device-tree driven memory and interrupt topology discovery remains future work beyond the current QEMU `virt` profile. |
+
 ## Invariants
 
 - syscall/trap arg register count must remain aligned across selected ISA ABI profiles for core syscall paths.
