@@ -690,11 +690,14 @@ impl KernelState {
     ) -> Result<Option<Mapping>, KernelError> {
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
-        let aspace = self
-            .user_spaces
-            .get_mut(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let unmapped = aspace.unmap_page(virt);
+        let unmapped = self.with_user_spaces_mut(|spaces| {
+            Ok::<_, KernelError>(
+                spaces
+                    .get_mut(asid)
+                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                    .unmap_page(virt),
+            )
+        })?;
         if let Some(mapping) = unmapped {
             self.clear_cow_page(asid, virt);
             self.note_mapping_removed(mapping.phys);
@@ -713,11 +716,12 @@ impl KernelState {
         }
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
-        let aspace = self
-            .user_spaces
-            .get(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        Ok(aspace.resolve(virt).is_some())
+        self.with_user_spaces(|spaces| {
+            spaces
+                .get(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))
+                .map(|aspace| aspace.resolve(virt).is_some())
+        })
     }
 
     #[cfg(feature = "posix-compat")]
@@ -748,11 +752,14 @@ impl KernelState {
         if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
-        let aspace = self
-            .user_spaces
-            .get_mut(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let unmapped = aspace.unmap_page(virt);
+        let unmapped = self.with_user_spaces_mut(|spaces| {
+            Ok::<_, KernelError>(
+                spaces
+                    .get_mut(asid)
+                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                    .unmap_page(virt),
+            )
+        })?;
         if let Some(mapping) = unmapped {
             self.clear_cow_page(asid, virt);
             self.note_mapping_removed(mapping.phys);
@@ -767,11 +774,14 @@ impl KernelState {
         asid: Asid,
         virt: VirtAddr,
     ) -> Result<Option<Mapping>, KernelError> {
-        let aspace = self
-            .user_spaces
-            .get_mut(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let unmapped = aspace.unmap_page(virt);
+        let unmapped = self.with_user_spaces_mut(|spaces| {
+            Ok::<_, KernelError>(
+                spaces
+                    .get_mut(asid)
+                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                    .unmap_page(virt),
+            )
+        })?;
         if let Some(mapping) = unmapped {
             self.clear_cow_page(asid, virt);
             self.note_mapping_removed(mapping.phys);
@@ -798,22 +808,19 @@ impl KernelState {
         if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
-        let aspace = self
-            .user_spaces
-            .get_mut(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let current = aspace
-            .resolve(virt)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let old = aspace
-            .map_page(
-                virt,
-                Mapping {
-                    phys: current.phys,
-                    flags: new_flags,
-                },
-            )
-            .map_err(KernelError::Vm)?;
+        let (old, current_phys) = self.with_user_spaces_mut(|spaces| -> Result<_, KernelError> {
+            let aspace = spaces
+                .get_mut(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+            let current_phys = aspace
+                .resolve(virt)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                .phys;
+            let old = aspace
+                .map_page(virt, Mapping { phys: current_phys, flags: new_flags })
+                .map_err(KernelError::Vm)?;
+            Ok((old, current_phys))
+        })?;
         if let Some(old_mapping) = old {
             self.clear_cow_page(asid, virt);
             self.note_mapping_removed(old_mapping.phys);
@@ -822,7 +829,7 @@ impl KernelState {
         if new_flags.write {
             self.clear_cow_page(asid, virt);
         }
-        self.note_mapping_inserted(current.phys);
+        self.note_mapping_inserted(current_phys);
         Ok(old)
     }
 
@@ -833,22 +840,19 @@ impl KernelState {
         virt: VirtAddr,
         new_flags: PageFlags,
     ) -> Result<Option<Mapping>, KernelError> {
-        let aspace = self
-            .user_spaces
-            .get_mut(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let current = aspace
-            .resolve(virt)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let old = aspace
-            .map_page(
-                virt,
-                Mapping {
-                    phys: current.phys,
-                    flags: new_flags,
-                },
-            )
-            .map_err(KernelError::Vm)?;
+        let (old, current_phys) = self.with_user_spaces_mut(|spaces| -> Result<_, KernelError> {
+            let aspace = spaces
+                .get_mut(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+            let current_phys = aspace
+                .resolve(virt)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                .phys;
+            let old = aspace
+                .map_page(virt, Mapping { phys: current_phys, flags: new_flags })
+                .map_err(KernelError::Vm)?;
+            Ok((old, current_phys))
+        })?;
         if let Some(old_mapping) = old {
             self.clear_cow_page(asid, virt);
             self.note_mapping_removed(old_mapping.phys);
@@ -857,7 +861,7 @@ impl KernelState {
         if new_flags.write {
             self.clear_cow_page(asid, virt);
         }
-        self.note_mapping_inserted(current.phys);
+        self.note_mapping_inserted(current_phys);
         Ok(old)
     }
 }

@@ -185,23 +185,24 @@ impl KernelState {
         va: usize,
         need_write: bool,
     ) -> Result<u64, KernelError> {
-        let aspace = self
-            .user_spaces
-            .get(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
         let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1usize);
         let page_off = (va - page_base) as u64;
-        let mapping = aspace
-            .resolve(VirtAddr(page_base as u64))
-            .ok_or(KernelError::UserMemoryFault)?;
-        if !mapping.flags.user || !mapping.flags.read || (need_write && !mapping.flags.write) {
-            return Err(KernelError::UserMemoryFault);
-        }
-        mapping
-            .phys
-            .0
-            .checked_add(page_off)
-            .ok_or(KernelError::UserMemoryFault)
+        self.with_user_spaces(|spaces| {
+            let aspace = spaces
+                .get(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+            let mapping = aspace
+                .resolve(VirtAddr(page_base as u64))
+                .ok_or(KernelError::UserMemoryFault)?;
+            if !mapping.flags.user || !mapping.flags.read || (need_write && !mapping.flags.write) {
+                return Err(KernelError::UserMemoryFault);
+            }
+            mapping
+                .phys
+                .0
+                .checked_add(page_off)
+                .ok_or(KernelError::UserMemoryFault)
+        })
     }
 
     #[cfg(all(
@@ -226,21 +227,22 @@ impl KernelState {
                 need_write
             );
         }
-        let user_space_exists = self.user_spaces.get(asid).is_some();
+        let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1usize);
+        let page_off = (va - page_base) as u64;
+        let (user_space_exists, shadow_mapping_present) = self.with_user_spaces(|spaces| {
+            let exists = spaces.get(asid).is_some();
+            let shadow = spaces
+                .get(asid)
+                .and_then(|aspace| aspace.resolve(VirtAddr(page_base as u64)))
+                .is_some();
+            (exists, shadow)
+        });
         if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
             crate::yarm_log!("ASID_EXISTS={}", user_space_exists);
         }
-        let _ = self
-            .user_spaces
-            .get(asid)
-            .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-        let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1usize);
-        let page_off = (va - page_base) as u64;
-        let shadow_mapping_present = self
-            .user_spaces
-            .get(asid)
-            .and_then(|aspace| aspace.resolve(VirtAddr(page_base as u64)))
-            .is_some();
+        if !user_space_exists {
+            return Err(KernelError::Vm(VmError::InvalidAsid));
+        }
         let pte_result =
             crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(page_base as u64));
         if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {

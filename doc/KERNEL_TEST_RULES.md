@@ -277,3 +277,62 @@ state.register_task(42).expect("register");
 assert!(state.task_status(42).is_some(), "tcb exists");
 assert_eq!(state.task_class(42), Some(TaskClass::App), "class set");
 ```
+
+
+---
+
+## Rule 11 — VM domain: with_user_spaces required for all address-space reads/writes
+
+All production access to `user_spaces` (the `AddressSpaceManager`) must go through
+the `with_user_spaces` / `with_user_spaces_mut` wrappers (vm lock, rank 5).  Tests
+may access `state.user_spaces` directly (single-threaded, no rank needed), but new
+production code must never bypass the wrapper.
+
+```rust
+// correct (production):
+let mapped = state.with_user_spaces(|spaces| {
+    spaces.get(asid).and_then(|aspace| aspace.resolve(virt)).is_some()
+});
+
+// wrong (Bug G pattern — avoid in production):
+// let aspace = self.user_spaces.get(asid).ok_or(...)?;
+```
+
+---
+
+## Rule 12 — Memory domain: with_memory_state_mut required for memory object mutations
+
+All mutations to `memory.memory_objects`, `memory.frame_allocator`, and other
+`MemorySubsystem` fields must go through `with_memory_state_mut` (rank 6).
+Read-only queries use `with_memory_state`.  Tests that need the raw state may use
+the accessor but should verify the result via `with_memory_state` where possible.
+
+```rust
+// correct:
+state.note_mapping_inserted(phys);  // internally uses with_memory_state_mut
+let rc = state.with_memory_state(|memory| {
+    memory.memory_objects.iter().flatten()
+        .find(|obj| obj.phys == phys)
+        .map(|obj| obj.map_refcount)
+});
+
+// wrong (Bug E pattern — avoid):
+// self.memory.memory_objects[slot].as_mut().map(|obj| obj.map_refcount = ...)
+```
+
+---
+
+## Rule 13 — Lock-rank interleaving: vm (5) then memory (6) is the only valid order
+
+Operations that touch both the vm domain and the memory domain must acquire the
+locks in rank order: finish all `with_user_spaces_mut` work (acquire rank 5, release
+rank 5) before starting `with_memory_state_mut` work (rank 6).  Nesting them is
+forbidden.
+
+`map_user_page_in_asid_raw` is the canonical example:
+1. `with_user_spaces_mut` — page table mutation (rank 5, released)
+2. `note_mapping_inserted` — map_refcount update (rank 6, released)
+3. `request_live_asid_shootdown` — IPC notification (rank 3, released)
+
+Tests that verify map→refcount consistency must not hold any lock across the two
+operations.
