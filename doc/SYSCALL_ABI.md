@@ -114,9 +114,9 @@ Reserved/deprecated terminology:
   and planned removal gate.
 - **Removed/invalid** means not dispatched by this kernel ABI.
 
-| `13` | `VmAnonMap` | reserved public syscall number; currently returns `InvalidArgs` |
-| `14` | `VmBrk` | public staged syscall; query, grow, and page-granular shrink are supported |
-| `15` | `DebugLog` | public debug logging syscall |
+The public tail slots `13..=15` are assigned and dispatched in v10:
+`13` is `VmAnonMap`, `14` is `VmBrk`, and `15` is `DebugLog`.
+They are not reserved gaps and are covered by the public ABI v10 matrix above.
 
 ## Reserved and gap slots
 
@@ -444,7 +444,7 @@ Portability boundary:
 - Trap/syscall argument lane count and IPC inline register-lane width are sourced from `crate::arch::syscall_abi` (`TRAPFRAME_ARG_REGS`, `IPC_REGISTER_WORDS`).
 - `src/kernel/syscall.rs` and `src/kernel/trapframe.rs` include compile-time assertions to keep ABI lane mapping synchronized with the selected ISA profile.
 
-## TODO / design note: inline IPC register payload expansion
+## Design note: inline IPC register payload expansion
 
 - `IPC_REGISTER_WORDS` remains **2** for the current ABI generation.
 - Raising inline register payload width to **8 words** (64 bytes on 64-bit targets) is **not** blocked by `Message::MAX_PAYLOAD`; that limit is currently **128** bytes.
@@ -468,16 +468,17 @@ Portability boundary:
 
 ---
 
-## Syscall `27`: `InitramfsReadChunk` (PM-only, Phase 2A/2B Bootstrap Bridge)
+## Syscall `27`: `InitramfsReadChunk` (SystemServer-only Phase 2A/2B Bootstrap Bridge)
 
 **Access gate**: `TaskClass::SystemServer` only.  Any other caller receives `MissingRight` and the
 kernel logs `INITRAMFS_READ_CHUNK_DENIED tid=<tid> name=<name>`.
 
-**Purpose**: Temporary bootstrap bridge that lets the Process Manager (PM) bulk-copy CPIO file
-data before a proper VFS-mediated file-transfer path is available.  This syscall bridges the
-gap between the single-page initramfs-copy prototype (Phase 2A) and the full shared-4KiB
-transfer-buffer VFS path (Phase 2B).  It will be superseded by `MemoryObject` page-cap grants
-in Phase 3.
+**Purpose**: Temporary bootstrap bridge called by `TaskClass::SystemServer` initramfs/VFS
+plumbing to bulk-copy CPIO file data for itself (`arg5=0`) or into PM (`arg5=3`) before the
+page-cap zero-copy path fully replaces this transfer primitive.  This syscall bridges the gap
+between the single-page initramfs-copy prototype (Phase 2A) and the full shared-4KiB
+transfer-buffer VFS path (Phase 2B), while the MemoryObject-based spawn helpers occupy slots
+`28` and `29`.
 
 ### Argument layout
 
@@ -520,13 +521,14 @@ in Phase 3.
   `min(max_len, remaining)` bytes to `dst_ptr` in **PM's** address space (ASID of TID 3).
 - PM passes its stack `bulk_buf[4096]` VA as `BulkReadArgs.dst_ptr` in the IPC message.
 - After the IPC round-trip completes, PM reads the filled data from `bulk_buf`.
-- This is a temporary kernel-mediated transfer primitive.  The missing primitive for
-  zero-copy is a `MemoryObject` page-cap grant (Phase 3 target).
+- This is a temporary kernel-mediated transfer primitive.  The MemoryObject-backed
+  zero-copy spawn helpers exist at slots `28` and `29`; this bridge remains documented
+  only for the older bulk-read copy path until that path no longer needs cross-ASID copy mediation.
 
 ### Lifecycle / removal gate
 
-- **Phase 2A / Phase 2B**: active, PM-only.
-- **Phase 3 target**: replace with `MemoryObject` page-cap grant; remove `arg5=PM_TID` extension.
+- **Phase 2A / Phase 2B**: active, SystemServer-only; `arg5=3` targets PM memory for the Phase 2B bridge.
+- **Phase 3 target**: retire this bridge after the MemoryObject/page-cap path no longer needs `arg5=PM_TID` cross-ASID copy mediation.
 - **Removal condition**: VFS bulk-read path uses page-cap zero-copy and does not need kernel
   cross-ASID copy mediation.
 
