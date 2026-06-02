@@ -905,3 +905,57 @@ Tests must NOT assert:
 - That a single shootdown is fired for multiple pages — batch shootdown is not implemented.
 
 ---
+
+## Rule N+10 — Two-Phase Unmap / TlbShootdownWaitPlan tests
+
+### N+10.1 — Phase 1 must be tested in isolation
+
+`unmap_page_phase1` is a phase-1-only helper. Tests must call it directly (not
+through `handle_vm_anon_map` or `handle_vm_brk`) so that the phase boundary is
+visible and verifiable at the test level.
+
+### N+10.2 — Test the absent-page case for phase 1
+
+Every phase-1 helper must have a test verifying it returns `Ok(None)` when the
+target page is absent (lazy, never faulted). Rollback and shrink loops iterate
+over sparse ranges; absent-page safety must be a tested invariant, not an
+assumption.
+
+### N+10.3 — The phys field is the deferred-reclamation frame
+
+Tests that construct or inspect `TlbShootdownWaitPlan` must verify that the
+`phys` field equals the physical address of the mapping that was removed.
+This is the frame that must not be reclaimed until phase 3; the test is the
+specification for that invariant.
+
+### N+10.4 — Bitmap consistency across phase 1 and compute_tlb_shootdown_request_plan
+
+`TlbShootdownWaitPlan.target_cpu_bitmap` is computed by `unmap_page_phase1`
+via `compute_tlb_shootdown_request_plan`. Any test exercising the plan struct
+must include a cross-check: the bitmap in the plan must equal the bitmap
+returned by a standalone `compute_tlb_shootdown_request_plan` call for the
+same ASID and virtual address.
+
+### N+10.5 — Phase 1 is destructive at the page-table level
+
+A test must verify that the virtual address is absent from the address space
+immediately after `unmap_page_phase1` returns, even though frame reclamation
+is deferred. This documents the invariant: phase 1 is not idempotent from the
+address-space perspective.
+
+### N+10.6 — Aggregate bitmap tests must use OR-of-per-page bitmaps
+
+Tests for `VmBrkShrinkTlbPlan` and `VmAnonMapRollbackTlbPlan` must build the
+`aggregate_target_bitmap` by OR-ing the per-page bitmaps from
+`compute_tlb_shootdown_request_plan`, not by hard-coding a constant. This
+documents the intended construction algorithm and remains correct if the
+single-CPU assumption is ever relaxed.
+
+### N+10.7 — Do not add tests asserting frame is immediately reusable after phase 1
+
+Tests must not assert that `reclaim_memory_object_for_phys` has been called
+after `unmap_page_phase1`. Phase 3 (reclamation) is explicitly deferred;
+asserting premature reclamation would contradict the two-phase ordering
+invariant this design is trying to enforce.
+
+---

@@ -851,6 +851,63 @@ impl KernelState {
         Ok(unmapped)
     }
 
+    /// Stage 5E: Phase-1 unmap — removes page table entry and clears memory
+    /// accounting (COW record + map_refcount), but defers TLB shootdown and
+    /// frame reclamation to the caller.
+    ///
+    /// Returns `Ok(Some(plan))` if the page was mapped. The caller MUST:
+    ///   1. IF `plan.target_cpu_bitmap != 0`: call `request_live_asid_shootdown`
+    ///      on `(plan.asid, plan.virt)` before step 2.
+    ///   2. Call `reclaim_memory_object_for_phys(plan.phys)` after step 1.
+    ///
+    /// Returns `Ok(None)` if the page was not present — idempotent, safe to call
+    /// on lazy / never-faulted pages (same as `unmap_user_page_in_asid`).
+    ///
+    /// ## Lock sequence (all acquired+released sequentially, none simultaneously)
+    ///   vm (rank 5)     — unmap page table entry
+    ///   memory (rank 6) — clear_cow_page, note_mapping_removed
+    ///   scheduler (rank 1) + task (rank 2) — compute_tlb_shootdown_request_plan
+    ///
+    /// Compared to `unmap_user_page_in_asid`, this omits:
+    ///   - `reclaim_memory_object_for_phys`  (deferred to phase 3)
+    ///   - `request_live_asid_shootdown`     (deferred to phase 2)
+    ///
+    /// ## Relationship to blocker #1
+    ///
+    /// The existing `unmap_user_page_in_asid` calls `reclaim_memory_object_for_phys`
+    /// BEFORE `request_live_asid_shootdown`. Under the global lock this is safe.
+    /// `unmap_page_phase1` + explicit shootdown + explicit reclaim is the pattern
+    /// needed for global-lock-free correctness.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn unmap_page_phase1(
+        &mut self,
+        asid: Asid,
+        virt: VirtAddr,
+    ) -> Result<Option<super::TlbShootdownWaitPlan>, KernelError> {
+        let unmapped = self.with_user_spaces_mut(|spaces| {
+            Ok::<_, KernelError>(
+                spaces
+                    .get_mut(asid)
+                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                    .unmap_page(virt),
+            )
+        })?;
+        let Some(mapping) = unmapped else {
+            return Ok(None);
+        };
+        self.clear_cow_page(asid, virt);
+        self.note_mapping_removed(mapping.phys);
+        // Frame reclamation is intentionally NOT done here (deferred to phase 3).
+        let req = self.compute_tlb_shootdown_request_plan(asid, virt);
+        Ok(Some(super::TlbShootdownWaitPlan {
+            asid: req.asid,
+            virt: req.virt,
+            target_cpu_bitmap: req.target_cpu_bitmap,
+            requester: req.requester,
+            phys: mapping.phys,
+        }))
+    }
+
     pub fn protect_user_page(
         &mut self,
         aspace_map_cap: CapId,

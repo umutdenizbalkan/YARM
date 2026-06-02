@@ -4592,3 +4592,214 @@ After Stage 5D:
 | `src/kernel/boot/tests.rs` | Added 6 new Stage 5D tests |
 | `doc/KERNEL_LOCKING.md` | This section (Section 19) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+9 added |
+
+---
+
+## §20 Stage 5E: TLB shootdown wait/rank-ordering decomposition
+
+### 20.1 Goal
+
+Stage 5E precisely characterises the rank-ordering gap between the current
+`unmap_user_page_in_asid` path and a future global-lock-free unmap, and
+introduces the scaffolding needed to close it without changing any live
+behaviour.
+
+The primary deliverable is:
+
+- A precise, written characterisation of **blocker #1** that separates it
+  into two sub-problems (§20.3).
+- `unmap_page_phase1` — the phase-1 building block for a future two-phase
+  unmap (page table removal + accounting; no frame reclamation; no TLB
+  shootdown).
+- Three new aggregate TLB plan structs: `TlbShootdownWaitPlan`,
+  `VmBrkShrinkTlbPlan`, `VmAnonMapRollbackTlbPlan`.
+- 6 new tests (609 total after Stage 5E).
+- This section (§20) and KERNEL_TEST_RULES.md Rule N+10.
+
+### 20.2 Blocker #1 — precise characterisation
+
+**Blocker #1** was originally stated as: "ipc(3) is acquired after vm(5) and
+memory(6) in the TLB shootdown path, violating declared lock-rank ordering."
+
+After the Stage 5D and 5E audits, the problem splits into two orthogonal
+sub-problems:
+
+#### 20.2.1 Sub-problem A — sequential rank inversion (documentation issue)
+
+`request_live_asid_shootdown` acquires ipc(3) in the `begin_live_tlb_shootdown_wait`
+call **after** vm(5) and memory(6) have been acquired and **released**. At no
+point are ipc(3) and vm(5) or memory(6) **simultaneously** held.
+
+The lock sequence in `unmap_user_page_in_current_asid` is:
+
+```
+vm(5) acquired → page unmapped → vm(5) released
+memory(6) acquired → frame accounting → memory(6) released
+                   → frame reclaimed
+ipc(3) acquired → shootdown wait → ipc(3) released
+```
+
+This is sequential, not concurrent. It cannot cause a classic deadlock.
+However, it violates the declared domain-rank ordering (ranks are defined to
+prevent simultaneous holds, not just to express priority), and any future code
+that re-acquires vm(5) or memory(6) inside the shootdown wait **would** be a
+real deadlock. The sub-problem is a documentation gap and a latent hazard.
+
+**Resolution**: The rank ordering documentation must acknowledge that
+`request_live_asid_shootdown` is exempt from strict rank enforcement because
+it is always called after all higher-ranked locks are released. A rank comment
+in the function and in §19 is sufficient until global-lock removal begins.
+
+#### 20.2.2 Sub-problem B — pre-shootdown frame reclamation (real ordering bug for global-lock removal)
+
+In `unmap_user_page_in_asid` (and `_in_current_asid`), the call sequence is:
+
+```
+1. unmap page from page table         (vm lock)
+2. clear COW entry                    (memory lock)
+3. decrement map_refcount             (memory lock)
+4. reclaim_memory_object_for_phys     (memory lock) ← PROBLEM
+5. request_live_asid_shootdown        (ipc lock)
+```
+
+Step 4 makes the physical frame available for reuse **before** step 5
+broadcasts TLB invalidation to remote CPUs. Under the global lock this is
+safe: no other CPU can fault or map memory while the global lock is held.
+Without the global lock, a remote CPU could:
+
+1. Receive a new allocation (the just-reclaimed frame), and
+2. Still have a stale TLB entry pointing to that frame from the old mapping.
+
+The result would be a UAF-style memory safety violation at the hardware level.
+
+**Resolution design** (two-phase unmap, §20.4):
+
+- **Phase 1** (vm + memory, no reclamation): unmap page, clear COW, decrement
+  map_refcount. Return `TlbShootdownWaitPlan` carrying the physical frame.
+- **Phase 2** (ipc): execute TLB shootdown via `request_live_asid_shootdown`.
+  Skip entirely if `target_cpu_bitmap == 0`.
+- **Phase 3** (memory): call `reclaim_memory_object_for_phys` now that
+  shootdown is complete.
+
+This ordering is safe under and without the global lock.
+
+### 20.3 `tick_retired_shootdowns` always returns 0
+
+`tick_retired_shootdowns()` in `vm.rs` always returns 0. The function body
+increments `retired.age_ticks` but unconditionally returns 0. This means
+`escalate_tlb_shootdown_timeout` (which is called when the tick count exceeds
+a threshold) is structurally present but currently unreachable.
+
+This is intentional: retired-shootdown timeout escalation is unimplemented.
+The function is a placeholder for future observability. It does not affect
+correctness today.
+
+### 20.4 Two-phase unmap design (scaffold, not live)
+
+```
+Phase 1 — unmap_page_phase1(&mut self, asid, virt)
+    └─ vm lock:      AddressSpace::unmap_page(virt) → Option<Mapping>
+    └─ memory lock:  clear_cow_page(asid, virt)
+    └─ memory lock:  note_mapping_removed(phys)
+    └─ read:         compute_tlb_shootdown_request_plan(asid, virt)
+    └─ returns:      Option<TlbShootdownWaitPlan>
+                     (Some → page was present; None → page was absent/lazy)
+    NOTE: reclaim_memory_object_for_phys is NOT called here.
+
+Phase 2 — TLB shootdown (future code, not yet scaffolded as live)
+    if plan.target_cpu_bitmap != 0:
+        ipc lock: begin_live_tlb_shootdown_wait(...)
+        busy-wait for ACKs
+        ipc lock: clear_live_tlb_shootdown_wait()
+    else: fast path, skip
+
+Phase 3 — frame reclamation (future code, not yet scaffolded as live)
+    memory lock: reclaim_memory_object_for_phys(plan.phys)
+```
+
+The `phys` field in `TlbShootdownWaitPlan` is the physical frame withheld from
+reclamation until after the shootdown. This is the key invariant: the frame
+must not be reusable by any allocator until phase 2 completes.
+
+### 20.5 Aggregate TLB plan structs
+
+Three structs were added to `src/kernel/boot/mod.rs`:
+
+**`TlbShootdownWaitPlan`** (per-page):
+
+| Field | Meaning |
+|-------|---------|
+| `asid` | ASID of the removed mapping |
+| `virt` | Virtual address removed in phase 1 |
+| `target_cpu_bitmap` | CPUs to notify (0 = no shootdown needed) |
+| `requester` | CPU that performed phase 1 (excluded from targets) |
+| `phys` | Physical frame to reclaim in phase 3 (held back from allocator) |
+
+**`VmBrkShrinkTlbPlan`** (aggregate for VmBrk shrink):
+
+| Field | Meaning |
+|-------|---------|
+| `asid` | ASID being shrunk |
+| `unmap_start` | Page-aligned start of the shrink range |
+| `unmap_end` | Page-aligned exclusive end of the shrink range |
+| `aggregate_target_bitmap` | OR of per-page target bitmaps from phase 1 |
+
+Zero `aggregate_target_bitmap` means the entire shrink needs no cross-CPU IPC.
+
+**`VmAnonMapRollbackTlbPlan`** (aggregate for VmAnonMap rollback):
+
+| Field | Meaning |
+|-------|---------|
+| `asid` | ASID whose pages are being rolled back |
+| `progress` | `VmPageMapProgress` — rollback covers `[base_addr, mapped_end)` |
+| `aggregate_target_bitmap` | OR of per-page target bitmaps accumulated during rollback |
+
+Together with `VmAnonMapProgressPlan` (Stage 5D), this closes the last
+structural gap for plan-first VmAnonMap decomposition. The remaining blocker
+is x86_64 smoke approval (blocker #3).
+
+### 20.6 Live conversions in Stage 5E
+
+**No live conversions.** `unmap_page_phase1` is scaffolding only (`#[cfg_attr(not(test), allow(dead_code))]`). `handle_vm_anon_map`, `rollback_anon_map`, and `handle_vm_brk` are unchanged.
+
+Remaining blockers for full conversion:
+
+| Blocker | Status after Stage 5E |
+|---------|-----------------------|
+| #1a — sequential rank inversion documentation | Characterised (§20.2.1); resolve in docs before conversion |
+| #1b — pre-shootdown frame reclamation | Design complete (§20.4); implement when global lock removal begins |
+| #2 — per-page loop progress capture | **Resolved** (Stage 5D, `VmPageMapProgress`) |
+| #3 — x86_64 SMP smoke approval | Still required |
+
+### 20.7 Hard invariants for Stage 5E
+
+- `handle_vm_anon_map` is **unchanged**. No live VM/TLB behavior change.
+- `handle_vm_brk` is **unchanged**.
+- All 609 tests pass (`--test-threads=1`).
+- No SMP/smp.rs changes.
+- No trap return/writeback changes.
+- No syscall ABI changes.
+- No CapRights widening, SpawnV5, VFS, syscall27, Phase 3B changes.
+- Global lock (`SharedKernel::with_cpu()`) still wraps all syscall handlers.
+- `tick_retired_shootdowns` always-0 behaviour is preserved.
+
+### 20.8 Tests added (Stage 5E)
+
+| Test | What it proves |
+|------|----------------|
+| `tlb_shootdown_wait_plan_captures_correct_phys_and_fields` | phase1 plan carries correct asid, virt, and phys (the deferred-reclaim frame) |
+| `tlb_shootdown_wait_plan_none_for_absent_page` | phase1 returns Ok(None) for an absent/lazy page |
+| `tlb_shootdown_wait_plan_target_bitmap_matches_request_plan` | phase1 bitmap == compute_tlb_shootdown_request_plan bitmap |
+| `unmap_page_phase1_removes_page_from_address_space` | page is absent from address space immediately after phase 1 |
+| `vm_brk_shrink_tlb_plan_aggregate_is_zero_in_single_cpu` | OR of per-page bitmaps is 0 in single-CPU; no cross-CPU IPC needed |
+| `vm_anon_map_rollback_tlb_plan_covers_progress_range` | VmAnonMapRollbackTlbPlan correctly captures VmPageMapProgress fields |
+
+### 20.9 Files changed (Stage 5E)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/mod.rs` | Added `TlbShootdownWaitPlan`, `VmBrkShrinkTlbPlan`, `VmAnonMapRollbackTlbPlan` structs |
+| `src/kernel/boot/memory_state.rs` | Added `unmap_page_phase1` helper (scaffold, dead code in non-test builds) |
+| `src/kernel/boot/tests.rs` | Added 6 new Stage 5E tests |
+| `doc/KERNEL_LOCKING.md` | This section (Section 20) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+10 added |

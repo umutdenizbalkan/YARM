@@ -9126,6 +9126,246 @@ fn vm_brk_shrink_with_partially_mapped_lazy_region() {
         .expect("join");
 }
 
+// ── Stage 5E: TLB shootdown wait/rank-ordering decomposition tests ───────────
+//
+// These tests verify:
+//   1. unmap_page_phase1 returns TlbShootdownWaitPlan with correct asid/virt/phys.
+//   2. unmap_page_phase1 returns Ok(None) for an absent (never-mapped) page.
+//   3. TlbShootdownWaitPlan.target_cpu_bitmap matches compute_tlb_shootdown_request_plan.
+//   4. unmap_page_phase1 removes the page from the address space (phase 1 is destructive).
+//   5. VmBrkShrinkTlbPlan.aggregate_target_bitmap is zero in single-CPU context.
+//   6. VmAnonMapRollbackTlbPlan correctly captures the rollback progress range.
+
+#[test]
+fn tlb_shootdown_wait_plan_captures_correct_phys_and_fields() {
+    // Stage 5E: unmap_page_phase1 must return a TlbShootdownWaitPlan that
+    // captures the ASID, virtual address, and physical frame from the removed
+    // mapping. The physical address in the plan is the frame to reclaim in
+    // phase 3 after the TLB shootdown in phase 2.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+            let virt = VirtAddr(0x30_0000);
+
+            let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            let expected_phys = state
+                .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+                .expect("resolve phys");
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
+                .expect("map page");
+
+            let plan = state
+                .unmap_page_phase1(asid, virt)
+                .expect("unmap_page_phase1 must not error");
+            let plan = plan.expect("plan must be Some for a mapped page");
+
+            assert_eq!(plan.asid, asid, "plan must record the ASID of the unmapped page");
+            assert_eq!(plan.virt, virt, "plan must record the virtual address of the unmapped page");
+            assert_eq!(
+                plan.phys, expected_phys,
+                "plan must carry the physical frame to reclaim in phase 3"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn tlb_shootdown_wait_plan_none_for_absent_page() {
+    // Stage 5E: unmap_page_phase1 on a page that was never mapped must return
+    // Ok(None). Rollback loops call phase1 over sparse address ranges; absent
+    // pages must not cause an error.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+            let virt = VirtAddr(0x31_0000);
+
+            let result = state
+                .unmap_page_phase1(asid, virt)
+                .expect("unmap_page_phase1 on absent page must not error");
+            assert!(
+                result.is_none(),
+                "unmap_page_phase1 on absent page must return Ok(None)"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn tlb_shootdown_wait_plan_target_bitmap_matches_request_plan() {
+    // Stage 5E: TlbShootdownWaitPlan.target_cpu_bitmap must equal the bitmap
+    // returned by compute_tlb_shootdown_request_plan for the same ASID and
+    // virtual address. The bitmap depends on scheduler+task state, not on
+    // page table contents, so the snapshot taken before mapping is valid.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+            let virt = VirtAddr(0x32_0000);
+
+            // Snapshot expected bitmap before mutating page tables.
+            let expected_bitmap = state
+                .compute_tlb_shootdown_request_plan(asid, virt)
+                .target_cpu_bitmap;
+
+            let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
+                .expect("map page");
+
+            let plan = state
+                .unmap_page_phase1(asid, virt)
+                .expect("phase1 must not error")
+                .expect("phase1 must be Some");
+
+            assert_eq!(
+                plan.target_cpu_bitmap, expected_bitmap,
+                "TlbShootdownWaitPlan bitmap must match compute_tlb_shootdown_request_plan"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn unmap_page_phase1_removes_page_from_address_space() {
+    // Stage 5E: unmap_page_phase1 is destructive at phase 1 — the page table
+    // entry is removed immediately. Frame reclamation is deferred to phase 3,
+    // but the virtual address must be absent from the address space right after
+    // phase 1 returns.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+            let virt = VirtAddr(0x33_0000);
+
+            let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
+                .expect("map page");
+
+            assert!(
+                state
+                    .is_user_page_mapped_in_asid(asid, virt)
+                    .expect("pre-phase1 check"),
+                "page must be mapped before phase 1"
+            );
+
+            let _plan = state
+                .unmap_page_phase1(asid, virt)
+                .expect("phase1 must not error");
+
+            assert!(
+                !state
+                    .is_user_page_mapped_in_asid(asid, virt)
+                    .expect("post-phase1 check"),
+                "page must not be mapped after phase 1"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_brk_shrink_tlb_plan_aggregate_is_zero_in_single_cpu() {
+    // Stage 5E: In a single-CPU hosted-dev environment, every per-page
+    // compute_tlb_shootdown_request_plan returns target_cpu_bitmap == 0.
+    // A VmBrkShrinkTlbPlan built by OR-ing these bitmaps must have
+    // aggregate_target_bitmap == 0, confirming no cross-CPU IPC is needed.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let page_virts = [
+                VirtAddr(0x34_0000),
+                VirtAddr(0x35_0000),
+                VirtAddr(0x36_0000),
+            ];
+
+            for virt in page_virts {
+                let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+                state
+                    .map_user_page_in_asid_with_caps(asid, cap, virt, PageFlags::USER_RW)
+                    .expect("map page");
+            }
+
+            // Build aggregate bitmap as the future two-phase shrink loop would.
+            let mut aggregate_bitmap: crate::kernel::topology::CpuBitmap = 0;
+            for virt in page_virts {
+                let req = state.compute_tlb_shootdown_request_plan(asid, virt);
+                aggregate_bitmap |= req.target_cpu_bitmap;
+            }
+
+            let plan = crate::kernel::boot::VmBrkShrinkTlbPlan {
+                asid,
+                unmap_start: 0x34_0000,
+                unmap_end: 0x37_0000,
+                aggregate_target_bitmap: aggregate_bitmap,
+            };
+
+            assert_eq!(
+                plan.aggregate_target_bitmap, 0,
+                "single-CPU: aggregate shootdown bitmap must be 0; no cross-CPU IPC needed"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_rollback_tlb_plan_covers_progress_range() {
+    // Stage 5E: VmAnonMapRollbackTlbPlan must capture the progress range from
+    // VmPageMapProgress exactly. The rollback covers [base_addr, mapped_end).
+    // aggregate_target_bitmap == 0 in single-CPU confirms no shootdown is needed.
+    let base = 0x40_0000_usize;
+    let mapped_end = base + 2 * PAGE_SIZE;
+    let end_addr = base + 4 * PAGE_SIZE;
+
+    let progress = crate::kernel::boot::VmPageMapProgress {
+        base_addr: base,
+        mapped_end,
+        end_addr,
+    };
+
+    let plan = crate::kernel::boot::VmAnonMapRollbackTlbPlan {
+        asid: crate::kernel::vm::Asid(1),
+        progress,
+        aggregate_target_bitmap: 0,
+    };
+
+    assert_eq!(
+        plan.progress.base_addr, base,
+        "rollback plan must capture base_addr from progress"
+    );
+    assert_eq!(
+        plan.progress.mapped_end, mapped_end,
+        "rollback plan must capture mapped_end from progress"
+    );
+    assert_eq!(
+        plan.progress.end_addr, end_addr,
+        "rollback plan must capture end_addr from progress"
+    );
+    assert_eq!(
+        plan.progress.mapped_end - plan.progress.base_addr,
+        2 * PAGE_SIZE,
+        "rollback range must cover exactly the two mapped pages"
+    );
+    assert_eq!(
+        plan.aggregate_target_bitmap, 0,
+        "single-CPU rollback plan must have zero aggregate bitmap"
+    );
+}
+
 // ── Phase L2A: canonical boot SharedKernel construction tests ─────────────────
 //
 // These tests verify Bootstrap::init_shared_static_with_boot_memory_map

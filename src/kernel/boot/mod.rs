@@ -375,6 +375,116 @@ pub(crate) struct VmAnonMapProgressPlan {
     pub(crate) progress: VmPageMapProgress,
 }
 
+// ── Stage 5E: Two-phase unmap / rank-safe TLB wait plan types ─────────────────
+//
+// These types implement the rank-safe two-phase unmap design that resolves
+// blocker #1 (frame reclamation before TLB shootdown) at the scaffolding level.
+//
+// ## Background
+//
+// The current unmap path calls `reclaim_memory_object_for_phys` BEFORE
+// `request_live_asid_shootdown`. Under the global lock this is safe: no
+// concurrent thread can map the reclaimed frame before shootdown completes.
+// For future global-lock removal, the frame MUST NOT be reused until all
+// remote CPUs have acknowledged the TLB invalidation.
+//
+// ## Two-phase design
+//
+//   Phase 1 — `unmap_page_phase1()` (vm rank 5, memory rank 6, sequential):
+//     - Remove page table entry           (vm lock, rank 5)
+//     - Clear COW record                  (memory lock, rank 6)
+//     - Decrement map_refcount            (memory lock, rank 6)
+//     - Return TlbShootdownWaitPlan       (carries asid, virt, phys, target_bitmap)
+//     - Does NOT reclaim frame
+//
+//   Phase 2 — TLB notification (ipc lock, rank 3):
+//     - IF plan.target_cpu_bitmap != 0:
+//         request_live_asid_shootdown(plan.asid, plan.virt)
+//     - ELSE: skip (ipc lock never acquired)
+//
+//   Phase 3 — Frame reclamation (memory lock, rank 6):
+//     - reclaim_memory_object_for_phys(plan.phys)
+//
+// Under this ordering, ipc(3) is acquired BETWEEN memory(6) uses, never
+// simultaneously. The frame (plan.phys) is held until after phase 2, so
+// no other mapping can reuse it while remote CPUs still hold stale TLBs.
+//
+// See KERNEL_LOCKING.md §20 for the full design and blocker analysis.
+
+/// Stage 5E: Two-phase unmap TLB wait plan.
+///
+/// Extends `TlbShootdownRequestPlan` with the physical frame address, enabling
+/// frame reclamation to be deferred until AFTER TLB shootdown completes.
+///
+/// ## Safety invariant
+///
+/// The caller of `unmap_page_phase1` must NOT call `reclaim_memory_object_for_phys`
+/// on `plan.phys` until EITHER:
+/// - `plan.target_cpu_bitmap == 0` (no remote CPUs hold stale TLBs), OR
+/// - `request_live_asid_shootdown(plan.asid, plan.virt)` has returned `Ok(())`.
+///
+/// Violating this ordering under a global-lock-free design would allow stale TLB
+/// entries on remote CPUs to point to a reused physical frame.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TlbShootdownWaitPlan {
+    /// ASID whose TLB entry was invalidated in phase 1.
+    pub(crate) asid: Asid,
+    /// Page-aligned virtual address removed in phase 1.
+    pub(crate) virt: VirtAddr,
+    /// Target CPU bitmap (scheduler+task snapshot). Zero = fast path, no shootdown.
+    pub(crate) target_cpu_bitmap: crate::kernel::topology::CpuBitmap,
+    /// CPU that performed phase 1 (excluded from targets).
+    pub(crate) requester: crate::kernel::scheduler::CpuId,
+    /// Physical frame to reclaim in phase 3 (AFTER shootdown in phase 2).
+    pub(crate) phys: PhysAddr,
+}
+
+/// Stage 5E: Aggregate TLB plan for a VmBrk shrink operation.
+///
+/// Captures the per-ASID shootdown state for all pages in the shrink range.
+/// In the future two-phase design, all pages are unmapped first (phase 1), then
+/// a single ASID-wide batch shootdown is issued (phase 2), then all frames are
+/// reclaimed (phase 3). This reduces the N-page shrink from N serial IPC waits
+/// to one.
+///
+/// `aggregate_target_bitmap` is the union of per-page target bitmaps from phase 1.
+/// If it is zero, no cross-CPU notification is needed and the batch shootdown is
+/// skipped entirely.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VmBrkShrinkTlbPlan {
+    /// ASID being shrunk.
+    pub(crate) asid: Asid,
+    /// Page-aligned start of the unmap range.
+    pub(crate) unmap_start: usize,
+    /// Page-aligned exclusive end of the unmap range.
+    pub(crate) unmap_end: usize,
+    /// Union of per-page target bitmaps from phase 1.
+    /// Zero means no shootdown is needed (all pages were private to requester CPU).
+    pub(crate) aggregate_target_bitmap: crate::kernel::topology::CpuBitmap,
+}
+
+/// Stage 5E: Aggregate TLB plan for a VmAnonMap rollback operation.
+///
+/// Captures the rollback range and accumulated shootdown state. In the future
+/// two-phase design, all rollback unmaps happen in phase 1, then one shootdown
+/// covers all removed pages in phase 2, then frames are reclaimed in phase 3.
+///
+/// Together with `VmAnonMapProgressPlan` (Stage 5D), this struct closes the
+/// last structural gap for plan-first VmAnonMap decomposition. The remaining
+/// blocker is x86_64 smoke approval (blocker #3).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VmAnonMapRollbackTlbPlan {
+    /// ASID of the task whose pages are being rolled back.
+    pub(crate) asid: Asid,
+    /// Pages to roll back: [progress.base_addr, progress.mapped_end).
+    pub(crate) progress: VmPageMapProgress,
+    /// Union of per-page target bitmaps accumulated during rollback phase 1.
+    pub(crate) aggregate_target_bitmap: crate::kernel::topology::CpuBitmap,
+}
+
 #[cfg(feature = "hosted-dev")]
 const MAX_COW_PAGES: usize = 100;
 #[cfg(not(feature = "hosted-dev"))]
