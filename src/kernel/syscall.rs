@@ -3167,7 +3167,7 @@ fn handle_vm_brk(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
                 // Missing mappings are valid for lazy brk pages: a page in the
                 // shrink interval may never have faulted in, so the unmap
                 // helper returns Ok(None) and we continue without panicking.
-                _kernel
+                kernel
                     .unmap_user_page_in_current_asid(VirtAddr(va as u64))
                     .map_err(SyscallError::from)?;
                 va += PAGE_SIZE;
@@ -3180,8 +3180,8 @@ fn handle_vm_brk(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
     // from unset state. Heap pages are still allocated lazily by demand-fault
     // mapping in [base, end). Shrink updates the byte-granular brk after all
     // page-granular unmap bookkeeping succeeds.
-    _kernel
-        .set_task_brk_bounds(tid, base, requested)
+    kernel
+        .set_task_brk_bounds(plan.tid, base, requested)
         .map_err(SyscallError::from)?;
     frame.set_ok(requested, 0, 0);
     Ok(())
