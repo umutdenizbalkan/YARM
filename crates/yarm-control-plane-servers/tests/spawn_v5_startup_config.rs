@@ -193,3 +193,56 @@ fn pm_logs_memory_object_alignment_precondition_for_vfs_spawn_ids() {
     assert!(pm_src.contains("PM_SPAWN_FROM_MO_BEGIN image_id={}"));
     assert!(pm_src.contains("reason=spawn_from_mo_err mo_cap={}"));
 }
+
+#[test]
+fn kernel_spawn_from_mo_allowlist_covers_fat_and_ramfs() {
+    let kernel_src = include_str!("../../../src/kernel/syscall.rs");
+    assert!(kernel_src.contains("10 => Some(\"sbin/fat_srv\")"));
+    assert!(kernel_src.contains("11 => Some(\"sbin/ramfs_srv\")"));
+    assert!(kernel_src.contains("SPAWN_FROM_MO_AFTER_ENTRY image_id={}"));
+    assert!(kernel_src.contains("SPAWN_FROM_MO_VALIDATE_OK image_id={}"));
+    assert!(kernel_src.contains("SPAWN_FROM_MO_TID_ALLOC_BEGIN image_id={}"));
+    assert!(kernel_src.contains("SPAWN_FROM_MO_TASK_CREATE_BEGIN image_id={}"));
+    assert!(kernel_src.contains("SPAWN_FROM_MO_RETURN_OK image_id={}"));
+}
+
+#[test]
+fn user_rt_x86_64_raw_syscall_documents_required_clobbers_and_arg3_r10() {
+    let x86_src = include_str!("../../yarm-user-rt/src/arch/x86_64.rs");
+    assert!(x86_src.contains("in(\"r10\") args[3]"));
+    assert!(x86_src.contains("lateout(\"rcx\") error"));
+    assert!(x86_src.contains("lateout(\"r11\") _"));
+    assert!(!x86_src.contains("in(\"rcx\") args[3]"));
+}
+
+#[test]
+fn spawn_from_memory_object_wrapper_packs_image11_args_and_exposes_raw_diagnostics() {
+    let user_rt_src = include_str!("../../yarm-user-rt/src/lib.rs");
+    assert!(user_rt_src.contains("pub unsafe fn spawn_from_memory_object_raw_diagnostic"));
+    assert!(user_rt_src.contains("image_id as usize"));
+    assert!(user_rt_src.contains("mo_cap as usize"));
+    assert!(user_rt_src.contains("parent_pid as usize"));
+    assert!(user_rt_src.contains("startup_args.as_ptr() as usize"));
+    assert!(user_rt_src.contains("startup_args.len()"));
+}
+
+#[test]
+fn pm_spawn_from_mo_error_path_keeps_normal_spawnv5_reply_shape() {
+    let pm_src = include_str!("../src/control_plane/process_manager/service.rs");
+    assert!(pm_src.contains("PM_SPAWN_FROM_MO_SYSCALL_BEGIN image_id={}"));
+    assert!(pm_src.contains("PM_SPAWN_FROM_MO_SYSCALL_RETURN image_id={}"));
+    assert!(pm_src.contains("PM_SPAWN_FROM_MO_SYSCALL_ERR image_id={}"));
+    assert!(pm_src.contains("PM_SPAWN_FROM_MO_AFTER_SYSCALL image_id={}"));
+    assert!(pm_src.contains("let encoded = encode_spawn_v5_reply(0, 0);"));
+    assert!(pm_src.contains("Message::with_header(\n                                        0,\n                                        PROC_OP_SPAWN_V5_CAP"));
+}
+
+#[test]
+fn pm_vfs_call_u64_has_raw_syscall_and_decode_diagnostics() {
+    let pm_src = include_str!("../src/control_plane/process_manager/service.rs");
+    assert!(pm_src.contains("PM_VFS_CALL_U64_BEGIN op={}"));
+    assert!(pm_src.contains("PM_VFS_CALL_U64_AFTER_SYSCALL op={}"));
+    assert!(pm_src.contains("PM_VFS_CALL_U64_DECODE_OK op={}"));
+    assert!(pm_src.contains("PM_VFS_CALL_U64_DECODE_ERR op={}"));
+    assert!(pm_src.contains("ipc_call_raw_diagnostic"));
+}

@@ -215,13 +215,16 @@ pub(crate) fn complete_blocked_recv_for_waiter(
         .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())
         .flatten()
         .ok_or(SyscallError::InvalidArgs)?;
-    let waiter_asid = kernel.task_asid(waiter_tid).ok_or(SyscallError::InvalidArgs)?;
+    let waiter_asid = kernel
+        .task_asid(waiter_tid)
+        .ok_or(SyscallError::InvalidArgs)?;
     let recv_endpoint = kernel
         .resolve_capability_for_task(waiter_tid, blocked_state.recv_cap)
         .map_err(SyscallError::from)?
         .object;
     let payload = msg.as_slice();
-    let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2 {
+    let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2
+    {
         (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
     } else {
         (msg.opcode, payload)
@@ -258,13 +261,8 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     } else {
         0
     };
-    let recv_local_transfer = materialize_received_message_cap(
-        kernel,
-        recv_endpoint,
-        waiter_tid,
-        msg.sender_tid.0,
-        msg,
-    )?;
+    let recv_local_transfer =
+        materialize_received_message_cap(kernel, recv_endpoint, waiter_tid, msg.sender_tid.0, msg)?;
     if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
         crate::yarm_log!(
             "IPC_RECV_BLOCKED_REPLY_CAP_MINT waiter_tid={} local_reply_cap={} reply_obj={}",
@@ -323,7 +321,10 @@ pub(crate) fn complete_blocked_recv_for_waiter(
             tcb.user_context.user_gprs[7] = 0; // R8  = ret1  = 0
         }
     });
-    crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=complete", waiter_tid);
+    crate::yarm_log!(
+        "IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=complete",
+        waiter_tid
+    );
     crate::yarm_log!("IPC_RECV_BLOCKED_COMPLETE tid={}", waiter_tid);
     Ok(())
 }
@@ -424,7 +425,9 @@ fn materialize_received_message_cap(
     } else {
         ("none", None)
     };
-    let Some(raw_value) = value else { return Ok(None); };
+    let Some(raw_value) = value else {
+        return Ok(None);
+    };
 
     if kind == "reply" {
         // ── Direct-mint path for Reply caps ───────────────────────────────────────
@@ -472,7 +475,10 @@ fn materialize_received_message_cap(
         };
         crate::yarm_log!(
             "IPC_RECV_REPLY_CAP_MATERIALIZE_BEGIN waiter_tid={} raw={} reply_index={} reply_generation={}",
-            receiver_tid, raw_value, reply_index, reply_generation
+            receiver_tid,
+            raw_value,
+            reply_index,
+            reply_generation
         );
         if kernel.capability_object_live(reply_object).is_none() {
             crate::yarm_log!(
@@ -491,10 +497,9 @@ fn materialize_received_message_cap(
                 return Err(SyscallError::InvalidCapability);
             }
         };
-        let minted = match kernel.mint_capability_in_cnode(
-            dest_cnode,
-            Capability::new(reply_object, CapRights::SEND),
-        ) {
+        let minted = match kernel
+            .mint_capability_in_cnode(dest_cnode, Capability::new(reply_object, CapRights::SEND))
+        {
             Ok(cap) => cap,
             Err(err) => {
                 let (cnode_used, cnode_capacity) = kernel
@@ -506,11 +511,15 @@ fn materialize_received_message_cap(
                     .unwrap_or((0, 0));
                 crate::yarm_log!(
                     "IPC_RECV_REPLY_CAP_MATERIALIZE_FAIL waiter_tid={} reason={:?} cnode_used={} cnode_capacity={}",
-                    receiver_tid, err, cnode_used, cnode_capacity
+                    receiver_tid,
+                    err,
+                    cnode_used,
+                    cnode_capacity
                 );
                 crate::yarm_log!(
                     "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err={:?}",
-                    raw_value, err
+                    raw_value,
+                    err
                 );
                 return Err(SyscallError::from(err));
             }
@@ -520,16 +529,15 @@ fn materialize_received_message_cap(
         kernel.set_reply_cap_waiter_cap(reply_index, reply_generation, minted);
         crate::yarm_log!(
             "IPC_RECV_REPLY_CAP_MATERIALIZE_OK waiter_tid={} local_reply_cap={}",
-            receiver_tid, minted.0
+            receiver_tid,
+            minted.0
         );
         return Ok(Some(minted.0));
     }
 
     // ── Transfer-cap path (FLAG_CAP_TRANSFER) ────────────────────────────────
     match materialize_received_transfer_cap(kernel, Some(raw_value), endpoint, receiver_tid) {
-        Ok(local_cap) => {
-            Ok(local_cap)
-        }
+        Ok(local_cap) => Ok(local_cap),
         Err(first_err) => {
             crate::yarm_log!(
                 "IPC_RECV_CAP_MATERIALIZE_FAILED kind={} raw={} err={:?}",
@@ -835,7 +843,8 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
                 Err(other) => return Err(SyscallError::from(other)),
             };
 
-            let (transfer_handle, bound_tid) = stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
+            let (transfer_handle, bound_tid) =
+                stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
             stash_bound_receiver_tid = bound_tid;
             Message::with_header(
                 sender_tid,
@@ -885,7 +894,8 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             .map_err(|_| SyscallError::InvalidArgs)
         } else {
             let payload = inline_payload_from_frame(frame, len)?;
-            let (transfer_handle, bound_tid) = stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
+            let (transfer_handle, bound_tid) =
+                stash_transfer_handle(kernel, transfer_cap, endpoint, None)?;
             stash_bound_receiver_tid = bound_tid;
             Message::with_header(
                 sender_tid,
@@ -902,86 +912,87 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         Err(err) => return Err(err),
     };
 
-    let (split_send_result, split_scheduler_plan) =
-        match endpoint {
-            CapObject::Endpoint { .. } => {
-                let endpoint_idx = kernel
-                    .resolve_endpoint_index(endpoint)
-                    .map_err(SyscallError::from)?;
-                match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
-                    IpcEndpointSendResult::Enqueued => {
-                        kernel.note_endpoint_only_queued_send_split();
-                        // Stage 4E now accepts FLAG_CAP_TRANSFER / FLAG_CAP_TRANSFER_PLAIN
-                        // (cap already stashed in transfer-envelope table by stash_transfer_handle).
-                        if (msg.flags
-                            & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN))
-                            != 0
-                        {
-                            kernel.note_cap_transfer_stage4e_enqueued();
-                        }
-                        (Some(Ok(())), IpcSchedulerPlan::None)
+    let (split_send_result, split_scheduler_plan) = match endpoint {
+        CapObject::Endpoint { .. } => {
+            let endpoint_idx = kernel
+                .resolve_endpoint_index(endpoint)
+                .map_err(SyscallError::from)?;
+            match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
+                IpcEndpointSendResult::Enqueued => {
+                    kernel.note_endpoint_only_queued_send_split();
+                    // Stage 4E now accepts FLAG_CAP_TRANSFER / FLAG_CAP_TRANSFER_PLAIN
+                    // (cap already stashed in transfer-envelope table by stash_transfer_handle).
+                    if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN))
+                        != 0
+                    {
+                        kernel.note_cap_transfer_stage4e_enqueued();
                     }
-                    IpcEndpointSendResult::EnqueuedWakeReceiver(_) => {
-                        unreachable!("Stage 4E never returns EnqueuedWakeReceiver")
-                    }
-                    IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
-                        // Stage 4F: ipc_try_send_queued_plain_endpoint_only found a plain
-                        // receiver waiter with no sender waiters. TID came from ipc_state_lock
-                        // read — no unlocked waiter array access needed.
-                        // Check recv-v2 under task_state_lock (rank 3) BEFORE
-                        // ipc_state_lock (rank 4) — required by lock ordering.
-                        let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
-                        if !is_recv_v2 {
-                            // Stage 4F: non-recv-v2 receiver. Cap-transfer messages return
-                            // Ineligible here (split_unsafe_flags check in
-                            // ipc_try_send_to_plain_receiver_endpoint_only).
-                            match kernel.ipc_try_send_to_plain_receiver_endpoint_only(
-                                endpoint_idx,
-                                receiver_tid,
-                                msg,
-                            ) {
-                                IpcEndpointSendResult::EnqueuedWakeReceiver(recv_tid) => {
-                                    kernel.note_endpoint_only_queued_send_split();
-                                    (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(recv_tid))
-                                }
-                                _ => (None, IpcSchedulerPlan::None),
-                            }
-                        } else {
-                            // Stage 4K/4O: recv-v2 blocked receiver — deliver directly outside
-                            // ipc_state_lock. complete_blocked_recv_for_waiter handles all flag
-                            // variants including FLAG_CAP_TRANSFER (Stage 4O) and
-                            // FLAG_CAP_TRANSFER_PLAIN; cap materialization, user-memory copy,
-                            // and TrapFrame writes all happen outside the lock.
-                            // Return Some(Err) on failure (not ?) so the outer error path at
-                            // `if let Err(err) = send_result` can release the transfer envelope
-                            // when transfer_cap.is_some().
-                            match complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg) {
-                                Ok(()) => {
-                                    // Phase 4: clear receiver waiter slot under ipc_state_lock.
-                                    kernel.ipc_clear_plain_receiver_waiter_only(
-                                        endpoint_idx,
-                                        receiver_tid,
-                                    );
-                                    kernel.note_split_recv_v2_delivery();
-                                    if transfer_cap.is_some() {
-                                        kernel.note_cap_transfer_recv_v2_delivery();
-                                    }
-                                    (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(receiver_tid))
-                                }
-                                Err(_err) => {
-                                    // Map delivery failure to UserMemoryFault so the
-                                    // outer error path releases the transfer envelope.
-                                    // Matches ipc_send_with_optional_deadline line ~1285.
-                                    (Some(Err(KernelError::UserMemoryFault)), IpcSchedulerPlan::None)
-                                }
-                            }
-                        }
-                    }
-                    IpcEndpointSendResult::Ineligible(_) => (None, IpcSchedulerPlan::None),
+                    (Some(Ok(())), IpcSchedulerPlan::None)
                 }
+                IpcEndpointSendResult::EnqueuedWakeReceiver(_) => {
+                    unreachable!("Stage 4E never returns EnqueuedWakeReceiver")
+                }
+                IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
+                    // Stage 4F: ipc_try_send_queued_plain_endpoint_only found a plain
+                    // receiver waiter with no sender waiters. TID came from ipc_state_lock
+                    // read — no unlocked waiter array access needed.
+                    // Check recv-v2 under task_state_lock (rank 3) BEFORE
+                    // ipc_state_lock (rank 4) — required by lock ordering.
+                    let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
+                    if !is_recv_v2 {
+                        // Stage 4F: non-recv-v2 receiver. Cap-transfer messages return
+                        // Ineligible here (split_unsafe_flags check in
+                        // ipc_try_send_to_plain_receiver_endpoint_only).
+                        match kernel.ipc_try_send_to_plain_receiver_endpoint_only(
+                            endpoint_idx,
+                            receiver_tid,
+                            msg,
+                        ) {
+                            IpcEndpointSendResult::EnqueuedWakeReceiver(recv_tid) => {
+                                kernel.note_endpoint_only_queued_send_split();
+                                (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(recv_tid))
+                            }
+                            _ => (None, IpcSchedulerPlan::None),
+                        }
+                    } else {
+                        // Stage 4K/4O: recv-v2 blocked receiver — deliver directly outside
+                        // ipc_state_lock. complete_blocked_recv_for_waiter handles all flag
+                        // variants including FLAG_CAP_TRANSFER (Stage 4O) and
+                        // FLAG_CAP_TRANSFER_PLAIN; cap materialization, user-memory copy,
+                        // and TrapFrame writes all happen outside the lock.
+                        // Return Some(Err) on failure (not ?) so the outer error path at
+                        // `if let Err(err) = send_result` can release the transfer envelope
+                        // when transfer_cap.is_some().
+                        match complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg) {
+                            Ok(()) => {
+                                // Phase 4: clear receiver waiter slot under ipc_state_lock.
+                                kernel.ipc_clear_plain_receiver_waiter_only(
+                                    endpoint_idx,
+                                    receiver_tid,
+                                );
+                                kernel.note_split_recv_v2_delivery();
+                                if transfer_cap.is_some() {
+                                    kernel.note_cap_transfer_recv_v2_delivery();
+                                }
+                                (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(receiver_tid))
+                            }
+                            Err(_err) => {
+                                // Map delivery failure to UserMemoryFault so the
+                                // outer error path releases the transfer envelope.
+                                // Matches ipc_send_with_optional_deadline line ~1285.
+                                (
+                                    Some(Err(KernelError::UserMemoryFault)),
+                                    IpcSchedulerPlan::None,
+                                )
+                            }
+                        }
+                    }
+                }
+                IpcEndpointSendResult::Ineligible(_) => (None, IpcSchedulerPlan::None),
             }
-            _ => (None, IpcSchedulerPlan::None),
-        };
+        }
+        _ => (None, IpcSchedulerPlan::None),
+    };
     let send_result = if let Some(send_result) = split_send_result {
         send_result
     } else if send_timeout_ticks == 0 {
@@ -994,8 +1005,8 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             // Use the receiver TID that was bound at stash time. Passing sender_tid
             // would fail the bound-receiver check inside take_transfer_envelope when
             // endpoint_waiter_tid returned Some(waiter_tid) at stash time.
-            let cleanup_tid = stash_bound_receiver_tid
-                .unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
+            let cleanup_tid =
+                stash_bound_receiver_tid.unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
             let _ = kernel.take_transfer_envelope(handle, endpoint, cleanup_tid);
         }
         if err == KernelError::WouldBlock && send_timeout_ticks != 0 {
@@ -1076,7 +1087,11 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     let endpoint_cap = kernel
         .current_task_cnode()
         .and_then(|cnode| kernel.capability_for_cnode_local(cnode, cap))
-        .and_then(|capability| kernel.capability_object_live(capability.object).map(|_| capability));
+        .and_then(|capability| {
+            kernel
+                .capability_object_live(capability.object)
+                .map(|_| capability)
+        });
     let Some(endpoint_cap) = endpoint_cap else {
         clear_blocked_recv_state(kernel, recv_tid, "error");
         crate::yarm_log!(
@@ -1099,7 +1114,10 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         if let Some((msg, plan)) = try_endpoint_split_recv(kernel, endpoint)? {
             (Some(msg), plan)
         } else {
-            (kernel.ipc_recv(cap).map_err(SyscallError::from)?, IpcSchedulerPlan::None)
+            (
+                kernel.ipc_recv(cap).map_err(SyscallError::from)?,
+                IpcSchedulerPlan::None,
+            )
         };
     // Apply deferred scheduler plan: wake sender whose message was refilled into the
     // endpoint queue under ipc_state_lock (Stage 4D). Lock is released; safe to wake.
@@ -1138,7 +1156,11 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         "IPC_RECV_GOT_MSG tid={} cap={} transfer_cap={}",
         recv_tid,
         cap.0,
-        received.as_ref().and_then(|m| m.transferred_cap()).map(|c| c.0).unwrap_or(u64::MAX)
+        received
+            .as_ref()
+            .and_then(|m| m.transferred_cap())
+            .map(|c| c.0)
+            .unwrap_or(u64::MAX)
     );
     handle_ipc_recv_result(
         kernel,
@@ -1162,7 +1184,11 @@ fn handle_ipc_recv_timeout(
     let endpoint_cap = kernel
         .current_task_cnode()
         .and_then(|cnode| kernel.capability_for_cnode_local(cnode, cap))
-        .and_then(|capability| kernel.capability_object_live(capability.object).map(|_| capability));
+        .and_then(|capability| {
+            kernel
+                .capability_object_live(capability.object)
+                .map(|_| capability)
+        });
     let Some(endpoint_cap) = endpoint_cap else {
         crate::yarm_log!(
             "IPC_RECV_INVALID_CAP_SOURCE reason=timeout_post_validate_endpoint_lookup tid={} cap={} endpoint={}",
@@ -1329,7 +1355,8 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
             }
             Err(other) => return Err(SyscallError::from(other)),
         };
-        let (transfer_handle, bound_tid) = stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
+        let (transfer_handle, bound_tid) =
+            stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
         stash_bound_receiver_tid = bound_tid;
         Message::with_header(
             sender_tid,
@@ -1341,7 +1368,8 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         .map_err(|_| SyscallError::InvalidArgs)?
     } else {
         let payload = inline_payload_from_frame(frame, len)?;
-        let (transfer_handle, bound_tid) = stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
+        let (transfer_handle, bound_tid) =
+            stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
         stash_bound_receiver_tid = bound_tid;
         Message::with_header(
             sender_tid,
@@ -1364,47 +1392,39 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     // receiver_tid = Some(waiter_tid). Error-path cleanup must pass that same
     // receiver_tid to take_transfer_envelope — passing sender_tid would cause
     // the bound-receiver check to fail and the envelope to leak.
-    let call_split_wake =
-        match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
-            IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
-                let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
-                if is_recv_v2 {
-                    // Phase 3: complete delivery outside ipc_state_lock.
-                    match complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg) {
-                        Ok(()) => {
-                            // Phase 4: clear waiter slot under ipc_state_lock.
-                            kernel.ipc_clear_plain_receiver_waiter_only(
-                                endpoint_idx,
-                                receiver_tid,
-                            );
-                            kernel.note_ipc_call_split_delivery();
-                            crate::yarm_log!(
-                                "IPC_CALL_SPLIT_DELIVERY tid={} receiver={} endpoint={}",
-                                sender_tid,
-                                receiver_tid.0,
-                                endpoint_idx
-                            );
-                            Some(receiver_tid)
-                        }
-                        Err(e) => {
-                            // Use receiver_tid (not sender_tid) — the envelope was
-                            // stashed with receiver_tid bound to the waiter.
-                            if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
-                                let _ = kernel.take_transfer_envelope(
-                                    handle,
-                                    endpoint,
-                                    receiver_tid,
-                                );
-                            }
-                            return Err(e);
-                        }
+    let call_split_wake = match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
+        IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
+            let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
+            if is_recv_v2 {
+                // Phase 3: complete delivery outside ipc_state_lock.
+                match complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg) {
+                    Ok(()) => {
+                        // Phase 4: clear waiter slot under ipc_state_lock.
+                        kernel.ipc_clear_plain_receiver_waiter_only(endpoint_idx, receiver_tid);
+                        kernel.note_ipc_call_split_delivery();
+                        crate::yarm_log!(
+                            "IPC_CALL_SPLIT_DELIVERY tid={} receiver={} endpoint={}",
+                            sender_tid,
+                            receiver_tid.0,
+                            endpoint_idx
+                        );
+                        Some(receiver_tid)
                     }
-                } else {
-                    None
+                    Err(e) => {
+                        // Use receiver_tid (not sender_tid) — the envelope was
+                        // stashed with receiver_tid bound to the waiter.
+                        if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
+                            let _ = kernel.take_transfer_envelope(handle, endpoint, receiver_tid);
+                        }
+                        return Err(e);
+                    }
                 }
+            } else {
+                None
             }
-            _ => None,
-        };
+        }
+        _ => None,
+    };
 
     if let Some(recv_tid) = call_split_wake {
         // Phase 5: wake receiver outside ipc_state_lock.
@@ -1425,8 +1445,8 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
             // Use the receiver TID bound at stash time — sender_tid would fail
             // the bound-receiver check when a waiter was present at stash time.
-            let cleanup_tid = stash_bound_receiver_tid
-                .unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
+            let cleanup_tid =
+                stash_bound_receiver_tid.unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
             let _ = kernel.take_transfer_envelope(handle, endpoint, cleanup_tid);
         }
         return Err(SyscallError::from(err));
@@ -1526,7 +1546,8 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
             .reply_cap_peek_endpoint(reply_cap)
             .map_err(SyscallError::from)?;
         reply_endpoint_for_cleanup = Some(reply_endpoint);
-        let (handle, bound_tid) = stash_transfer_handle(kernel, transfer_cap, reply_endpoint, None)?;
+        let (handle, bound_tid) =
+            stash_transfer_handle(kernel, transfer_cap, reply_endpoint, None)?;
         stash_bound_reply_tid = bound_tid;
         crate::yarm_log!(
             "IPC_REPLY_WITH_CAP_STASH tid={} transfer_cap={} handle={} endpoint={:?}",
@@ -1568,8 +1589,8 @@ fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
         // here would fail and silently leave the envelope allocated.
         if let Some(handle) = transfer_handle {
             if let Some(reply_endpoint) = reply_endpoint_for_cleanup {
-                let cleanup_tid = stash_bound_reply_tid
-                    .unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
+                let cleanup_tid =
+                    stash_bound_reply_tid.unwrap_or(crate::kernel::ipc::ThreadId(sender_tid));
                 let _ = kernel.take_transfer_envelope(handle, reply_endpoint, cleanup_tid);
             }
         }
@@ -1636,7 +1657,9 @@ fn handle_ipc_recv_result_with_empty_error(
         Some(msg) => {
             let recv_meta_flags = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
                 SYSCALL_RECV_META_REPLY_CAP
-            } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0 {
+            } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN))
+                != 0
+            {
                 SYSCALL_RECV_META_TRANSFERRED_CAP
             } else {
                 0
@@ -1698,7 +1721,7 @@ fn handle_ipc_recv_result_with_empty_error(
                 meta[0..8].copy_from_slice(&(sender as u64).to_le_bytes());
                 meta[8..10].copy_from_slice(&app_opcode.to_le_bytes());
                 meta[10..12].copy_from_slice(&msg.flags.to_le_bytes());
-                meta[12..16].copy_from_slice(&((app_payload.len() as u32)).to_le_bytes());
+                meta[12..16].copy_from_slice(&(app_payload.len() as u32).to_le_bytes());
                 meta[16..24].copy_from_slice(&(frame.ret2() as u64).to_le_bytes());
                 meta[24..32].copy_from_slice(&(recv_meta_flags as u64).to_le_bytes());
                 meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
@@ -2095,7 +2118,12 @@ fn handle_spawn_process(
     );
     let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
     startup_args[2] = 0;
-    let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
+    let extra_send_caps = [
+        startup_args[13],
+        startup_args[14],
+        startup_args[15],
+        startup_args[16],
+    ];
     startup_args[12] = 0;
     startup_args[13] = 0;
     startup_args[14] = 0;
@@ -2108,7 +2136,8 @@ fn handle_spawn_process(
     const INITRD_USER_VA_BASE: u64 = 0x0C00_0000;
     let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
     crate::yarm_log!("KSPAWN_PATH path={}", image_path);
-    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
+    let initrd =
+        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
     let entry = CpioArchive::new(initrd)
         .find(image_path)
         .map_err(|_| SyscallError::InvalidArgs)?
@@ -2126,10 +2155,12 @@ fn handle_spawn_process(
         SyscallError::from(err)
     })?;
     crate::yarm_log!("KSPAWN_ASID_OK tid={} asid={}", tid, asid.0);
-    kernel.load_elf_pt_load_segments(asid, elf_bytes).map_err(|err| {
-        crate::yarm_log!("KSPAWN_FAIL phase=load_elf err={:?}", err);
-        SyscallError::from(err)
-    })?;
+    kernel
+        .load_elf_pt_load_segments(asid, elf_bytes)
+        .map_err(|err| {
+            crate::yarm_log!("KSPAWN_FAIL phase=load_elf err={:?}", err);
+            SyscallError::from(err)
+        })?;
     crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
 
     // Map boot initrd pages read-only into initramfs_srv (image_id=4).
@@ -2156,7 +2187,10 @@ fn handle_spawn_process(
             let initrd_offset_in_first_page = (initrd_phys_raw - phys_start) as u64;
             crate::yarm_log!(
                 "INITRAMFS_INITRD_MAP_BEGIN phys_start=0x{:x} phys_end=0x{:x} len={} pages={}",
-                phys_start, phys_end, initrd_len, pages_to_map
+                phys_start,
+                phys_end,
+                initrd_len,
+                pages_to_map
             );
             let initrd_flags = PageFlags {
                 read: true,
@@ -2169,10 +2203,19 @@ fn handle_spawn_process(
             for i in 0..pages_to_map {
                 let virt = VirtAddr(INITRD_USER_VA_BASE + (i as u64) * page);
                 let phys = PhysAddr(phys_start + (i as u64) * page);
-                if let Err(e) = kernel.map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags: initrd_flags }) {
+                if let Err(e) = kernel.map_user_page_in_asid_raw(
+                    asid,
+                    virt,
+                    Mapping {
+                        phys,
+                        flags: initrd_flags,
+                    },
+                ) {
                     crate::yarm_log!(
                         "INITRAMFS_INITRD_MAP_FAIL page={} virt=0x{:x} err={:?}",
-                        i, virt.0, e
+                        i,
+                        virt.0,
+                        e
                     );
                     map_ok = false;
                     break;
@@ -2184,7 +2227,8 @@ fn handle_spawn_process(
                 startup_args[16] = initrd_len;
                 crate::yarm_log!(
                     "INITRAMFS_INITRD_MAP_DONE user_ptr=0x{:x} len={} rights=ro",
-                    user_initrd_ptr, initrd_len
+                    user_initrd_ptr,
+                    initrd_len
                 );
             }
         } else {
@@ -2197,7 +2241,9 @@ fn handle_spawn_process(
         Ok((_, send_cap, recv_cap)) => {
             crate::yarm_log!(
                 "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid, send_cap.0, recv_cap.0
+                spawner_tid,
+                send_cap.0,
+                recv_cap.0
             );
             (send_cap.0, recv_cap.0)
         }
@@ -2284,11 +2330,12 @@ fn handle_spawn_process(
     // When parent delegation occurred, pack both the spawner's own send cap (high
     // 32 bits) and the parent-delegated cap (low 32 bits) into ret2 so the
     // spawner can use its own copy while forwarding the parent's copy.
-    let packed_ret2 = if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-        ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-    } else {
-        caller_send_cap as u64
-    };
+    let packed_ret2 =
+        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
+            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
+        } else {
+            caller_send_cap as u64
+        };
     frame.set_ok(
         0,
         usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
@@ -2338,7 +2385,12 @@ fn handle_spawn_process_from_user_buf(
     crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
     let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
     startup_args[2] = 0;
-    let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
+    let extra_send_caps = [
+        startup_args[13],
+        startup_args[14],
+        startup_args[15],
+        startup_args[16],
+    ];
     startup_args[12] = 0;
     startup_args[13] = 0;
     startup_args[14] = 0;
@@ -2353,10 +2405,12 @@ fn handle_spawn_process_from_user_buf(
         SyscallError::from(err)
     })?;
     crate::yarm_log!("KSPAWN_ASID_OK tid={} asid={}", tid, asid.0);
-    kernel.load_elf_pt_load_segments(asid, elf_bytes).map_err(|err| {
-        crate::yarm_log!("KSPAWN_FAIL phase=load_elf err={:?}", err);
-        SyscallError::from(err)
-    })?;
+    kernel
+        .load_elf_pt_load_segments(asid, elf_bytes)
+        .map_err(|err| {
+            crate::yarm_log!("KSPAWN_FAIL phase=load_elf err={:?}", err);
+            SyscallError::from(err)
+        })?;
     crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
     let spawner_tid = current_tid(kernel).unwrap_or(0);
     let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
@@ -2470,10 +2524,10 @@ fn handle_spawn_from_initramfs_file(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    let image_id         = frame.arg(0) as u64;
-    let name_ptr         = frame.arg(1);
-    let name_len         = frame.arg(2);
-    let parent_pid       = frame.arg(3) as u64;
+    let image_id = frame.arg(0) as u64;
+    let name_ptr = frame.arg(1);
+    let name_len = frame.arg(2);
+    let parent_pid = frame.arg(3) as u64;
     let startup_args_ptr = frame.arg(4);
     let startup_args_count = frame.arg(5);
 
@@ -2484,12 +2538,12 @@ fn handle_spawn_from_initramfs_file(
     let name_buf = kernel
         .copy_from_current_user(name_ptr, name_len)
         .map_err(|_| SyscallError::InvalidArgs)?;
-    let name = core::str::from_utf8(&name_buf[..name_len])
-        .map_err(|_| SyscallError::InvalidArgs)?;
+    let name =
+        core::str::from_utf8(&name_buf[..name_len]).map_err(|_| SyscallError::InvalidArgs)?;
     let name = name.strip_prefix('/').unwrap_or(name);
 
-    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()
-        .ok_or(SyscallError::InvalidArgs)?;
+    let initrd =
+        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
     let entry = CpioArchive::new(initrd)
         .find(name)
         .map_err(|_| SyscallError::InvalidArgs)?
@@ -2519,7 +2573,12 @@ fn handle_spawn_from_initramfs_file(
 
     let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
     startup_args[2] = 0;
-    let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
+    let extra_send_caps = [
+        startup_args[13],
+        startup_args[14],
+        startup_args[15],
+        startup_args[16],
+    ];
     startup_args[12] = 0;
     startup_args[13] = 0;
     startup_args[14] = 0;
@@ -2527,17 +2586,23 @@ fn handle_spawn_from_initramfs_file(
     startup_args[16] = 0;
 
     let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
-    let (asid, _aspace_cap) = kernel.create_user_address_space().map_err(SyscallError::from)?;
+    let (asid, _aspace_cap) = kernel
+        .create_user_address_space()
+        .map_err(SyscallError::from)?;
     crate::yarm_log!("KSPAWN_FROM_CPIO tid={} asid={}", tid, asid.0);
 
-    kernel.load_elf_pt_load_segments(asid, elf_bytes).map_err(SyscallError::from)?;
+    kernel
+        .load_elf_pt_load_segments(asid, elf_bytes)
+        .map_err(SyscallError::from)?;
 
     let spawner_tid = current_tid(kernel).unwrap_or(0);
     let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
         Ok((_, send_cap, recv_cap)) => {
             crate::yarm_log!(
                 "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid, send_cap.0, recv_cap.0
+                spawner_tid,
+                send_cap.0,
+                recv_cap.0
             );
             (send_cap.0, recv_cap.0)
         }
@@ -2604,7 +2669,6 @@ fn handle_spawn_from_initramfs_file(
     Ok(())
 }
 
-
 fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
     match image_id {
         0 => Some("init"),
@@ -2617,6 +2681,8 @@ fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
         7 => Some("sbin/driver_manager"),
         8 => Some("sbin/blkcache_srv"),
         9 => Some("sbin/virtio_blk_srv"),
+        10 => Some("sbin/fat_srv"),
+        11 => Some("sbin/ramfs_srv"),
         _ => None,
     }
 }
@@ -2656,7 +2722,9 @@ fn copy_spawn_startup_args(
             out[slot_idx] = u64::from_le_bytes(word);
             slot_idx += 1;
         }
-        ptr = ptr.checked_add(chunk_bytes).ok_or(SyscallError::InvalidArgs)?;
+        ptr = ptr
+            .checked_add(chunk_bytes)
+            .ok_or(SyscallError::InvalidArgs)?;
         bytes_remaining -= chunk_bytes;
     }
     Ok(out)
@@ -2692,18 +2760,15 @@ fn handle_initramfs_read_chunk(
     let caller_tid = current_tid(kernel)?;
     let caller_class = kernel.task_class(caller_tid);
     if caller_class != Some(TaskClass::SystemServer) {
-        crate::yarm_log!(
-            "INITRAMFS_READ_CHUNK_DENIED tid={}",
-            caller_tid
-        );
+        crate::yarm_log!("INITRAMFS_READ_CHUNK_DENIED tid={}", caller_tid);
         return Err(SyscallError::MissingRight);
     }
 
     let name_ptr = frame.arg(0);
     let name_len = frame.arg(1);
-    let offset   = frame.arg(2) as u64;
-    let dst_ptr  = frame.arg(3);
-    let max_len  = core::cmp::min(frame.arg(4), 4096);
+    let offset = frame.arg(2) as u64;
+    let dst_ptr = frame.arg(3);
+    let max_len = core::cmp::min(frame.arg(4), 4096);
     // Phase 2B extension: arg5 = target_tid (0 = self, PM_BOOTSTRAP_TID = PM's ASID)
     let target_tid_arg = frame.arg(5) as u64;
 
@@ -2717,7 +2782,8 @@ fn handle_initramfs_read_chunk(
     if target_tid_arg != 0 && target_tid_arg != PM_BOOTSTRAP_TID {
         crate::yarm_log!(
             "INITRAMFS_READ_CHUNK_DENIED tid={} target_tid={} reason=invalid_target",
-            caller_tid, target_tid_arg
+            caller_tid,
+            target_tid_arg
         );
         return Err(SyscallError::MissingRight);
     }
@@ -2725,8 +2791,8 @@ fn handle_initramfs_read_chunk(
     let name_buf = kernel
         .copy_from_current_user(name_ptr, name_len)
         .map_err(|_| SyscallError::InvalidArgs)?;
-    let raw_name = core::str::from_utf8(&name_buf[..name_len])
-        .map_err(|_| SyscallError::InvalidArgs)?;
+    let raw_name =
+        core::str::from_utf8(&name_buf[..name_len]).map_err(|_| SyscallError::InvalidArgs)?;
     // Accept both "sbin/driver_manager" and "/sbin/driver_manager" and
     // "/initramfs/sbin/driver_manager" — strip leading slashes and optional
     // "/initramfs/" prefix so callers can reuse VFS path strings.
@@ -2734,8 +2800,8 @@ fn handle_initramfs_read_chunk(
     let name = name.strip_prefix("initramfs/").unwrap_or(name);
     let name = name.trim_start_matches('/');
 
-    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()
-        .ok_or(SyscallError::InvalidArgs)?;
+    let initrd =
+        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
     let entry = CpioArchive::new(initrd)
         .find(name)
         .map_err(|_| SyscallError::InvalidArgs)?;
@@ -2746,7 +2812,9 @@ fn handle_initramfs_read_chunk(
             // EOF is reserved for "file exists but offset >= file_len".
             crate::yarm_log!(
                 "INITRAMFS_READ_CHUNK_NOT_FOUND name={} offset={} max_len={}",
-                name, offset, max_len
+                name,
+                offset,
+                max_len
             );
             return Err(SyscallError::Internal);
         }
@@ -2758,7 +2826,9 @@ fn handle_initramfs_read_chunk(
         if INITRAMFS_READ_CHUNK_TRACE {
             crate::yarm_log!(
                 "INITRAMFS_READ_CHUNK_EOF name={} offset={} file_len={}",
-                name, offset, data.len()
+                name,
+                offset,
+                data.len()
             );
         }
         frame.set_ok(0, 0, 0);
@@ -2771,7 +2841,11 @@ fn handle_initramfs_read_chunk(
     if INITRAMFS_READ_CHUNK_TRACE {
         crate::yarm_log!(
             "INITRAMFS_READ_CHUNK name={} offset={} to_copy={} file_len={} target_tid={}",
-            name, offset, to_copy, data.len(), target_tid_arg
+            name,
+            offset,
+            to_copy,
+            data.len(),
+            target_tid_arg
         );
     }
 
@@ -2797,7 +2871,8 @@ fn handle_initramfs_read_chunk(
     if INITRAMFS_READ_CHUNK_TRACE {
         crate::yarm_log!(
             "INITRAMFS_READ_CHUNK_FAIL name={} stage=copy_done to_copy={}",
-            name, to_copy
+            name,
+            to_copy
         );
     }
 
@@ -2829,7 +2904,7 @@ fn handle_create_initramfs_file_slice_mo(
 
     let name_ptr = frame.arg(0);
     let name_len = frame.arg(1);
-    let flags    = frame.arg(2) as u64;
+    let flags = frame.arg(2) as u64;
 
     if name_len == 0 || name_len > 128 {
         return Err(SyscallError::InvalidArgs);
@@ -2841,40 +2916,37 @@ fn handle_create_initramfs_file_slice_mo(
     let name_buf = kernel
         .copy_from_current_user(name_ptr, name_len)
         .map_err(|_| SyscallError::InvalidArgs)?;
-    let raw_name = core::str::from_utf8(&name_buf[..name_len])
-        .map_err(|_| SyscallError::InvalidArgs)?;
+    let raw_name =
+        core::str::from_utf8(&name_buf[..name_len]).map_err(|_| SyscallError::InvalidArgs)?;
     // Strip leading slash and optional "/initramfs/" prefix.
     let name = raw_name.trim_start_matches('/');
     let name = name.strip_prefix("initramfs/").unwrap_or(name);
     let name = name.trim_start_matches('/');
 
-    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()
-        .ok_or(SyscallError::InvalidArgs)?;
+    let initrd =
+        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
     let entry = CpioArchive::new(initrd)
         .find(name)
         .map_err(|_| SyscallError::InvalidArgs)?;
     let cpio_entry = match entry {
         Some(e) => e,
         None => {
-            crate::yarm_log!(
-                "CREATE_INITRAMFS_FILE_SLICE_MO_NOT_FOUND name={}",
-                name
-            );
+            crate::yarm_log!("CREATE_INITRAMFS_FILE_SLICE_MO_NOT_FOUND name={}", name);
             return Err(SyscallError::InvalidArgs);
         }
     };
     let file_data = cpio_entry.file_data();
     let file_len = file_data.len();
     if file_len == 0 {
-        crate::yarm_log!(
-            "CREATE_INITRAMFS_FILE_SLICE_MO_EMPTY name={}", name
-        );
+        crate::yarm_log!("CREATE_INITRAMFS_FILE_SLICE_MO_EMPTY name={}", name);
         return Err(SyscallError::InvalidArgs);
     }
     // Compute byte offset of file_data within the initrd blob.
     let initrd_ptr = initrd.as_ptr() as usize;
     let data_ptr = file_data.as_ptr() as usize;
-    let file_data_offset = data_ptr.checked_sub(initrd_ptr).ok_or(SyscallError::InvalidArgs)?;
+    let file_data_offset = data_ptr
+        .checked_sub(initrd_ptr)
+        .ok_or(SyscallError::InvalidArgs)?;
 
     let (mo_id, cap_id) = kernel
         .create_initramfs_file_slice_mo(initrd, file_data_offset, file_len)
@@ -2882,7 +2954,11 @@ fn handle_create_initramfs_file_slice_mo(
 
     crate::yarm_log!(
         "CREATE_INITRAMFS_FILE_SLICE_MO_OK tid={} name={} file_len={} mo_id={} cap={}",
-        caller_tid, name, file_len, mo_id, cap_id.0
+        caller_tid,
+        name,
+        file_len,
+        mo_id,
+        cap_id.0
     );
 
     // ret1 = cap_id (u32 packed into u64), ret2 = file_len
@@ -2908,22 +2984,21 @@ fn handle_spawn_from_memory_object(
     // Access gate: PM only.
     let caller_tid = current_tid(kernel)?;
     if caller_tid != PM_BOOTSTRAP_TID {
-        crate::yarm_log!(
-            "SPAWN_FROM_MO_DENIED tid={} reason=not_pm",
-            caller_tid
-        );
+        crate::yarm_log!("SPAWN_FROM_MO_DENIED tid={} reason=not_pm", caller_tid);
         return Err(SyscallError::MissingRight);
     }
 
-    let image_id        = frame.arg(0) as u64;
-    let mo_cap_raw      = frame.arg(1) as u64;
-    let parent_pid      = frame.arg(2) as u64;
+    let image_id = frame.arg(0) as u64;
+    let mo_cap_raw = frame.arg(1) as u64;
+    let parent_pid = frame.arg(2) as u64;
     let startup_args_ptr = frame.arg(3);
     let startup_args_count = frame.arg(4);
 
     crate::yarm_log!(
         "SPAWN_FROM_MO_ENTER image_id={} mo_cap={} parent_pid={}",
-        image_id, mo_cap_raw, parent_pid
+        image_id,
+        mo_cap_raw,
+        parent_pid
     );
 
     let mo_cap = CapId(mo_cap_raw);
@@ -2935,62 +3010,162 @@ fn handle_spawn_from_memory_object(
     let mo_id = match capability.object {
         CapObject::MemoryObject { id } => id,
         _ => {
-            crate::yarm_log!("SPAWN_FROM_MO_WRONG_CAP image_id={} mo_cap={}", image_id, mo_cap_raw);
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_WRONG_CAP image_id={} mo_cap={}",
+                image_id,
+                mo_cap_raw
+            );
             return Err(SyscallError::WrongObject);
         }
     };
 
     // Look up MemoryObject slot to get the InitramfsFileSlice kind.
-    let (file_data_offset, file_len) = kernel.with_memory_state(|memory| {
-        memory
-            .memory_objects
-            .iter()
-            .flatten()
-            .find(|mo| mo.id == mo_id)
-            .and_then(|mo| match mo.kind {
-                MemoryObjectKind::InitramfsFileSlice { initrd_offset, file_len } => {
-                    Some((initrd_offset as usize, file_len as usize))
-                }
-                _ => None,
-            })
-            .ok_or(KernelError::WrongObject)
-    }).map_err(SyscallError::from)?;
+    let (file_data_offset, file_len) = kernel
+        .with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|mo| mo.id == mo_id)
+                .and_then(|mo| match mo.kind {
+                    MemoryObjectKind::InitramfsFileSlice {
+                        initrd_offset,
+                        file_len,
+                    } => Some((initrd_offset as usize, file_len as usize)),
+                    _ => None,
+                })
+                .ok_or(KernelError::WrongObject)
+        })
+        .map_err(SyscallError::from)?;
 
-    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()
-        .ok_or(SyscallError::InvalidArgs)?;
+    let initrd =
+        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
 
-    if file_data_offset.checked_add(file_len).ok_or(SyscallError::InvalidArgs)? > initrd.len() {
+    if file_data_offset
+        .checked_add(file_len)
+        .ok_or(SyscallError::InvalidArgs)?
+        > initrd.len()
+    {
         crate::yarm_log!(
             "SPAWN_FROM_MO_BOUNDS_ERR image_id={} off={} len={} initrd_len={}",
-            image_id, file_data_offset, file_len, initrd.len()
+            image_id,
+            file_data_offset,
+            file_len,
+            initrd.len()
         );
         return Err(SyscallError::InvalidArgs);
     }
 
     let elf_bytes = &initrd[file_data_offset..file_data_offset + file_len];
     crate::yarm_log!(
-        "SPAWN_FROM_MO_ELF image_id={} elf_len={}", image_id, elf_bytes.len()
+        "SPAWN_FROM_MO_ELF image_id={} elf_len={}",
+        image_id,
+        elf_bytes.len()
     );
 
     // Parse ELF for entry point.
-    let elf = ElfImageInfo::parse(image_id, elf_bytes)
-        .map_err(|_| SyscallError::InvalidArgs)?;
+    let elf = match ElfImageInfo::parse(image_id, elf_bytes) {
+        Ok(elf) => elf,
+        Err(_) => {
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_VALIDATE_ERR image_id={} reason=elf_parse",
+                image_id
+            );
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_RETURN_ERR image_id={} err=InvalidArgs",
+                image_id
+            );
+            return Err(SyscallError::InvalidArgs);
+        }
+    };
     crate::yarm_log!("SPAWN_FROM_MO_ENTRY entry=0x{:x}", elf.entry);
+    crate::yarm_log!("SPAWN_FROM_MO_AFTER_ENTRY image_id={}", image_id);
 
-    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
+    let image_path = match spawn_image_path_for_image_id(image_id) {
+        Some(path) => {
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_VALIDATE_OK image_id={} path={}",
+                image_id,
+                path
+            );
+            path
+        }
+        None => {
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_VALIDATE_ERR image_id={} reason=image_path",
+                image_id
+            );
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_RETURN_ERR image_id={} err=InvalidArgs",
+                image_id
+            );
+            return Err(SyscallError::InvalidArgs);
+        }
+    };
 
-    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
+    let mut startup_args =
+        match copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count) {
+            Ok(args) => args,
+            Err(err) => {
+                crate::yarm_log!(
+                    "SPAWN_FROM_MO_VALIDATE_ERR image_id={} reason=startup_args err={:?}",
+                    image_id,
+                    err
+                );
+                crate::yarm_log!(
+                    "SPAWN_FROM_MO_RETURN_ERR image_id={} err={:?}",
+                    image_id,
+                    err
+                );
+                return Err(err);
+            }
+        };
     startup_args[2] = 0;
-    let extra_send_caps = [startup_args[13], startup_args[14], startup_args[15], startup_args[16]];
+    let extra_send_caps = [
+        startup_args[13],
+        startup_args[14],
+        startup_args[15],
+        startup_args[16],
+    ];
     startup_args[12] = 0;
     startup_args[13] = 0;
     startup_args[14] = 0;
     startup_args[15] = 0;
     startup_args[16] = 0;
 
-    let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
-    let (asid, _aspace_cap) = kernel.create_user_address_space().map_err(SyscallError::from)?;
-    crate::yarm_log!("SPAWN_FROM_MO_TID tid={} asid={}", tid, asid.0);
+    crate::yarm_log!("SPAWN_FROM_MO_TID_ALLOC_BEGIN image_id={}", image_id);
+    let tid = match kernel.allocate_thread_id() {
+        Ok(tid) => tid,
+        Err(err) => {
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_RETURN_ERR image_id={} phase=allocate_tid err={:?}",
+                image_id,
+                err
+            );
+            return Err(SyscallError::from(err));
+        }
+    };
+    let (asid, _aspace_cap) = match kernel.create_user_address_space() {
+        Ok(values) => {
+            crate::yarm_log!("SPAWN_FROM_MO_ASID_OK image_id={}", image_id);
+            values
+        }
+        Err(err) => {
+            crate::yarm_log!("SPAWN_FROM_MO_ASID_ERR image_id={} err={:?}", image_id, err);
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_RETURN_ERR image_id={} phase=create_asid err={:?}",
+                image_id,
+                err
+            );
+            return Err(SyscallError::from(err));
+        }
+    };
+    crate::yarm_log!(
+        "SPAWN_FROM_MO_TID image_id={} tid={} asid={}",
+        image_id,
+        tid,
+        asid.0
+    );
 
     // Compute physical base of the initrd blob for zero-copy feasibility check.
     let initrd_virt_raw = initrd.as_ptr() as u64;
@@ -3005,13 +3180,31 @@ fn handle_spawn_from_memory_object(
     };
 
     // Load ELF using zero-copy path (falls back to copy if alignment not feasible).
-    let (entry, _first_vaddr, _heap_base, zc_pages, copied_pages) = kernel
-        .load_elf_with_mo_zero_copy(image_id, asid, elf_bytes, initrd_phys_base, file_data_offset as u64)
-        .map_err(SyscallError::from)?;
+    let (entry, _first_vaddr, _heap_base, zc_pages, copied_pages) = match kernel
+        .load_elf_with_mo_zero_copy(
+            image_id,
+            asid,
+            elf_bytes,
+            initrd_phys_base,
+            file_data_offset as u64,
+        ) {
+        Ok(values) => values,
+        Err(err) => {
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_RETURN_ERR image_id={} phase=load_elf err={:?}",
+                image_id,
+                err
+            );
+            return Err(SyscallError::from(err));
+        }
+    };
 
     crate::yarm_log!(
         "PM_ELF_ZC_DONE image_id={} path={} zc_pages={} copied_pages={}",
-        image_id, image_path, zc_pages, copied_pages
+        image_id,
+        image_path,
+        zc_pages,
+        copied_pages
     );
 
     let spawner_tid = caller_tid;
@@ -3019,7 +3212,9 @@ fn handle_spawn_from_memory_object(
         Ok((_, send_cap, recv_cap)) => {
             crate::yarm_log!(
                 "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid, send_cap.0, recv_cap.0
+                spawner_tid,
+                send_cap.0,
+                recv_cap.0
             );
             (send_cap.0, recv_cap.0)
         }
@@ -3032,7 +3227,8 @@ fn handle_spawn_from_memory_object(
         Ok((eid, _, recv_cap)) => {
             crate::yarm_log!(
                 "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
-                eid, recv_cap.0
+                eid,
+                recv_cap.0
             );
             recv_cap.0
         }
@@ -3055,31 +3251,72 @@ fn handle_spawn_from_memory_object(
         service_send_cap
     };
 
-    let spawned = kernel
-        .spawn_user_task_from_image(UserImageSpec {
-            tid,
-            entry,
-            asid: Some(asid),
-            class: TaskClass::SystemServer,
-            startup_args,
-            spawner_tid,
-            service_recv_cap,
-            service_reply_recv_cap,
-            extra_send_caps,
-        })
-        .map_err(SyscallError::from)?;
-
-    crate::yarm_log!("SPAWN_FROM_MO_OK image_id={} spawned_tid={}", image_id, spawned.tid);
-
-    let packed_ret2 = if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-        ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-    } else {
-        caller_send_cap as u64
+    crate::yarm_log!(
+        "SPAWN_FROM_MO_TASK_CREATE_BEGIN image_id={} tid={}",
+        image_id,
+        tid
+    );
+    let spawned = match kernel.spawn_user_task_from_image(UserImageSpec {
+        tid,
+        entry,
+        asid: Some(asid),
+        class: TaskClass::SystemServer,
+        startup_args,
+        spawner_tid,
+        service_recv_cap,
+        service_reply_recv_cap,
+        extra_send_caps,
+    }) {
+        Ok(spawned) => {
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_TASK_CREATE_OK image_id={} tid={}",
+                image_id,
+                spawned.tid
+            );
+            spawned
+        }
+        Err(err) => {
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_TASK_CREATE_ERR image_id={} err={:?}",
+                image_id,
+                err
+            );
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_RETURN_ERR image_id={} phase=task_create err={:?}",
+                image_id,
+                err
+            );
+            return Err(SyscallError::from(err));
+        }
     };
-    frame.set_ok(
-        0,
-        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        packed_ret2 as usize,
+
+    crate::yarm_log!(
+        "SPAWN_FROM_MO_OK image_id={} spawned_tid={}",
+        image_id,
+        spawned.tid
+    );
+
+    let packed_ret2 =
+        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
+            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
+        } else {
+            caller_send_cap as u64
+        };
+    let spawned_tid = match usize::try_from(spawned.tid) {
+        Ok(tid) => tid,
+        Err(_) => {
+            crate::yarm_log!(
+                "SPAWN_FROM_MO_RETURN_ERR image_id={} err=Internal",
+                image_id
+            );
+            return Err(SyscallError::Internal);
+        }
+    };
+    frame.set_ok(0, spawned_tid, packed_ret2 as usize);
+    crate::yarm_log!(
+        "SPAWN_FROM_MO_RETURN_OK image_id={} tid={}",
+        image_id,
+        spawned.tid
     );
     Ok(())
 }
@@ -3096,10 +3333,7 @@ fn rollback_anon_map(kernel: &mut KernelState, addr: usize, mapped_end: usize) {
     }
 }
 
-fn handle_vm_anon_map(
-    kernel: &mut KernelState,
-    frame: &mut TrapFrame,
-) -> Result<(), SyscallError> {
+fn handle_vm_anon_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let addr = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
     let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
@@ -3210,11 +3444,22 @@ fn handle_debug_log(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
     let a1 = frame.arg(1);
     let a2 = frame.arg(2);
     let tid = kernel.current_tid().unwrap_or(0);
-    syscall_trace!("DEBUG_LOG_ARGS tid={} a0=0x{:x} a1=0x{:x} a2=0x{:x}", tid, a0, a1, a2);
+    syscall_trace!(
+        "DEBUG_LOG_ARGS tid={} a0=0x{:x} a1=0x{:x} a2=0x{:x}",
+        tid,
+        a0,
+        a1,
+        a2
+    );
     let user_ptr = a0;
     let raw_len = a1;
     let len = raw_len.min(Message::MAX_PAYLOAD);
-    syscall_trace!("DEBUG_LOG_ENTER tid={} ptr=0x{:x} len={}", tid, user_ptr, raw_len);
+    syscall_trace!(
+        "DEBUG_LOG_ENTER tid={} ptr=0x{:x} len={}",
+        tid,
+        user_ptr,
+        raw_len
+    );
     if user_ptr == 0 || len == 0 {
         frame.set_ok(0, 0, 0);
         return Ok(());
@@ -3362,11 +3607,11 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{boxed::Box, format, vec::Vec};
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::{EndpointMode, IPC_REGISTER_WORDS};
     use crate::kernel::scheduler_timer::Timer;
     use crate::kernel::trapframe::TrapFrame;
+    use alloc::{boxed::Box, format, vec::Vec};
 
     fn push_cpio_entry(out: &mut Vec<u8>, name: &str, mode: u32, data: &[u8]) {
         let namesz = name.len() + 1;
@@ -3580,64 +3825,79 @@ mod tests {
         };
     }
 
-    vm_brk_stack_test!(syscall_vm_brk_shrink_by_full_page_unmaps_page_and_updates_end, {
-        let mut state = brk_test_state(0x4000, 0x8000);
-        map_heap_page(&mut state, 0x7000);
+    vm_brk_stack_test!(
+        syscall_vm_brk_shrink_by_full_page_unmaps_page_and_updates_end,
+        {
+            let mut state = brk_test_state(0x4000, 0x8000);
+            map_heap_page(&mut state, 0x7000);
 
-        assert_eq!(vm_brk(&mut state, 0x7000).expect("shrink"), 0x7000);
+            assert_eq!(vm_brk(&mut state, 0x7000).expect("shrink"), 0x7000);
 
-        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x7000)));
-        assert!(!current_asid_page_mapped(&state, 0x7000));
-    });
+            assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x7000)));
+            assert!(!current_asid_page_mapped(&state, 0x7000));
+        }
+    );
 
-    vm_brk_stack_test!(syscall_vm_brk_shrink_within_same_page_keeps_mapping_and_updates_end, {
-        let mut state = brk_test_state(0x4000, 0x7800);
-        map_heap_page(&mut state, 0x7000);
+    vm_brk_stack_test!(
+        syscall_vm_brk_shrink_within_same_page_keeps_mapping_and_updates_end,
+        {
+            let mut state = brk_test_state(0x4000, 0x7800);
+            map_heap_page(&mut state, 0x7000);
 
-        assert_eq!(vm_brk(&mut state, 0x7001).expect("shrink"), 0x7001);
+            assert_eq!(vm_brk(&mut state, 0x7001).expect("shrink"), 0x7001);
 
-        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x7001)));
-        assert!(current_asid_page_mapped(&state, 0x7000));
-    });
+            assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x7001)));
+            assert!(current_asid_page_mapped(&state, 0x7000));
+        }
+    );
 
-    vm_brk_stack_test!(syscall_vm_brk_shrink_multiple_pages_preserves_partial_requested_page, {
-        let mut state = brk_test_state(0x4000, 0x7000);
-        map_heap_page(&mut state, 0x4000);
-        map_heap_page(&mut state, 0x5000);
-        map_heap_page(&mut state, 0x6000);
+    vm_brk_stack_test!(
+        syscall_vm_brk_shrink_multiple_pages_preserves_partial_requested_page,
+        {
+            let mut state = brk_test_state(0x4000, 0x7000);
+            map_heap_page(&mut state, 0x4000);
+            map_heap_page(&mut state, 0x5000);
+            map_heap_page(&mut state, 0x6000);
 
-        assert_eq!(vm_brk(&mut state, 0x4001).expect("shrink"), 0x4001);
+            assert_eq!(vm_brk(&mut state, 0x4001).expect("shrink"), 0x4001);
 
-        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x4001)));
-        assert!(current_asid_page_mapped(&state, 0x4000));
-        assert!(!current_asid_page_mapped(&state, 0x5000));
-        assert!(!current_asid_page_mapped(&state, 0x6000));
-    });
+            assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x4001)));
+            assert!(current_asid_page_mapped(&state, 0x4000));
+            assert!(!current_asid_page_mapped(&state, 0x5000));
+            assert!(!current_asid_page_mapped(&state, 0x6000));
+        }
+    );
 
-    vm_brk_stack_test!(syscall_vm_brk_shrink_to_heap_base_releases_full_pages_above_base, {
-        let mut state = brk_test_state(0x4000, 0x7000);
-        map_heap_page(&mut state, 0x4000);
-        map_heap_page(&mut state, 0x5000);
-        map_heap_page(&mut state, 0x6000);
+    vm_brk_stack_test!(
+        syscall_vm_brk_shrink_to_heap_base_releases_full_pages_above_base,
+        {
+            let mut state = brk_test_state(0x4000, 0x7000);
+            map_heap_page(&mut state, 0x4000);
+            map_heap_page(&mut state, 0x5000);
+            map_heap_page(&mut state, 0x6000);
 
-        assert_eq!(vm_brk(&mut state, 0x4000).expect("shrink"), 0x4000);
+            assert_eq!(vm_brk(&mut state, 0x4000).expect("shrink"), 0x4000);
 
-        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x4000)));
-        assert!(!current_asid_page_mapped(&state, 0x4000));
-        assert!(!current_asid_page_mapped(&state, 0x5000));
-        assert!(!current_asid_page_mapped(&state, 0x6000));
-    });
+            assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x4000)));
+            assert!(!current_asid_page_mapped(&state, 0x4000));
+            assert!(!current_asid_page_mapped(&state, 0x5000));
+            assert!(!current_asid_page_mapped(&state, 0x6000));
+        }
+    );
 
-    vm_brk_stack_test!(syscall_vm_brk_shrink_below_heap_base_is_rejected_without_changing_end, {
-        let mut state = brk_test_state(0x4000, 0x8000);
-        map_heap_page(&mut state, 0x7000);
-        let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [0x3fff, 0, 0, 0, 0, 0]);
+    vm_brk_stack_test!(
+        syscall_vm_brk_shrink_below_heap_base_is_rejected_without_changing_end,
+        {
+            let mut state = brk_test_state(0x4000, 0x8000);
+            map_heap_page(&mut state, 0x7000);
+            let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [0x3fff, 0, 0, 0, 0, 0]);
 
-        dispatch(&mut state, &mut frame).expect_err("vm brk shrink below base rejected");
+            dispatch(&mut state, &mut frame).expect_err("vm brk shrink below base rejected");
 
-        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x8000)));
-        assert!(current_asid_page_mapped(&state, 0x7000));
-    });
+            assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x8000)));
+            assert!(current_asid_page_mapped(&state, 0x7000));
+        }
+    );
 
     vm_brk_stack_test!(syscall_vm_brk_shrink_over_lazy_unmapped_pages_succeeds, {
         let mut state = brk_test_state(0x4000, 0x8000);
@@ -3652,28 +3912,34 @@ mod tests {
         assert!(!current_asid_page_mapped(&state, 0x7000));
     });
 
-    vm_brk_stack_test!(syscall_vm_brk_grow_after_shrink_allows_demand_mapping_again, {
-        let mut state = brk_test_state(0x4000, 0x7000);
-        map_heap_page(&mut state, 0x6000);
-        assert_eq!(vm_brk(&mut state, 0x5000).expect("shrink"), 0x5000);
-        assert!(!current_asid_page_mapped(&state, 0x6000));
+    vm_brk_stack_test!(
+        syscall_vm_brk_grow_after_shrink_allows_demand_mapping_again,
+        {
+            let mut state = brk_test_state(0x4000, 0x7000);
+            map_heap_page(&mut state, 0x6000);
+            assert_eq!(vm_brk(&mut state, 0x5000).expect("shrink"), 0x5000);
+            assert!(!current_asid_page_mapped(&state, 0x6000));
 
-        assert_eq!(vm_brk(&mut state, 0x7000).expect("grow"), 0x7000);
-        map_heap_page(&mut state, 0x6000);
+            assert_eq!(vm_brk(&mut state, 0x7000).expect("grow"), 0x7000);
+            map_heap_page(&mut state, 0x6000);
 
-        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x7000)));
-        assert!(current_asid_page_mapped(&state, 0x6000));
-    });
+            assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x7000)));
+            assert!(current_asid_page_mapped(&state, 0x6000));
+        }
+    );
 
-    vm_brk_stack_test!(syscall_vm_brk_invalid_shrink_kernel_address_leaves_end_unchanged, {
-        let mut state = brk_test_state(0x4000, 0x8000);
-        let kernel_addr = crate::kernel::vm::KERNEL_SPACE_BASE as usize;
-        let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [kernel_addr, 0, 0, 0, 0, 0]);
+    vm_brk_stack_test!(
+        syscall_vm_brk_invalid_shrink_kernel_address_leaves_end_unchanged,
+        {
+            let mut state = brk_test_state(0x4000, 0x8000);
+            let kernel_addr = crate::kernel::vm::KERNEL_SPACE_BASE as usize;
+            let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [kernel_addr, 0, 0, 0, 0, 0]);
 
-        dispatch(&mut state, &mut frame).expect_err("kernel address rejected");
+            dispatch(&mut state, &mut frame).expect_err("kernel address rejected");
 
-        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x8000)));
-    });
+            assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x8000)));
+        }
+    );
 
     #[test]
     fn syscall_vm_brk_rejects_kernel_address() {
@@ -3970,8 +4236,9 @@ mod tests {
 
         // Synchronous endpoint: ipc_send switches to the blocking receiver via
         // switch_to_runnable_tid, so the caller loses the CPU after IpcCall.
-        let (_call_eid, call_send_cap, call_recv_cap_global) =
-            state.create_endpoint_with_mode(1, EndpointMode::Synchronous).expect("call ep");
+        let (_call_eid, call_send_cap, call_recv_cap_global) = state
+            .create_endpoint_with_mode(1, EndpointMode::Synchronous)
+            .expect("call ep");
         let call_recv_cap = state
             .grant_capability_task_to_task(0, call_recv_cap_global, 1)
             .expect("dup recv cap");
@@ -4013,7 +4280,8 @@ mod tests {
         let call_recv_cap = state
             .grant_capability_task_to_task(0, call_recv_cap_global, 1)
             .expect("dup recv cap");
-        let (_reply_eid, reply_send_cap, reply_recv_cap) = state.create_endpoint(4).expect("reply ep");
+        let (_reply_eid, reply_send_cap, reply_recv_cap) =
+            state.create_endpoint(4).expect("reply ep");
 
         // Seed reply endpoint with a payload larger than register lanes.
         let big_reply = Message::new(1, &[0u8; 24]).expect("reply");
@@ -4056,7 +4324,14 @@ mod tests {
         let payload_word = usize::from_le_bytes(*b"reply000");
         let mut frame = TrapFrame::new(
             Syscall::IpcReply as usize,
-            [reply_cap.0 as usize, 0, 8, payload_word, 0, SYSCALL_NO_TRANSFER_CAP as usize],
+            [
+                reply_cap.0 as usize,
+                0,
+                8,
+                payload_word,
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
         );
         dispatch(&mut state, &mut frame).expect("ipc reply");
         assert_eq!(frame.error_code(), None);
@@ -4078,7 +4353,14 @@ mod tests {
 
         let mut replay = TrapFrame::new(
             Syscall::IpcReply as usize,
-            [reply_cap.0 as usize, 0, 8, payload_word, 0, SYSCALL_NO_TRANSFER_CAP as usize],
+            [
+                reply_cap.0 as usize,
+                0,
+                8,
+                payload_word,
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
         );
         // Reply cap is single-use: the cap slot is revoked from the cnode after the
         // first successful ipc_reply, so a second attempt fails with InvalidCapability.
@@ -4089,7 +4371,10 @@ mod tests {
     #[test]
     fn recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload() {
         std::thread::Builder::new()
-            .name("recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload".into())
+            .name(
+                "recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload"
+                    .into(),
+            )
             .stack_size(8 * 1024 * 1024)
             .spawn(run_recv_v2_reports_metadata_only_via_out_meta_and_preserves_plain_reply_payload)
             .expect("spawn test thread")
@@ -4142,9 +4427,18 @@ mod tests {
         assert_eq!(recv.ret0(), 0);
         assert_eq!(recv.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
         assert_eq!(&payload[..2], b"xy");
-        assert_eq!(u16::from_le_bytes(meta[8..10].try_into().expect("opcode")), 0xBEEF);
-        assert_eq!(u32::from_le_bytes(meta[12..16].try_into().expect("payload len")), 2);
-        assert_eq!(u64::from_le_bytes(meta[24..32].try_into().expect("meta flags")), 0);
+        assert_eq!(
+            u16::from_le_bytes(meta[8..10].try_into().expect("opcode")),
+            0xBEEF
+        );
+        assert_eq!(
+            u32::from_le_bytes(meta[12..16].try_into().expect("payload len")),
+            2
+        );
+        assert_eq!(
+            u64::from_le_bytes(meta[24..32].try_into().expect("meta flags")),
+            0
+        );
     }
 
     #[test]
@@ -4161,11 +4455,19 @@ mod tests {
     fn run_recv_v2_materializes_reply_cap_once_per_message() {
         let mut state = Bootstrap::init().expect("kernel");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
-        let (_reply_eid, _reply_send_cap, reply_recv_cap) = state.create_endpoint(4).expect("reply endpoint");
+        let (_reply_eid, _reply_send_cap, reply_recv_cap) =
+            state.create_endpoint(4).expect("reply endpoint");
         let payload_word = usize::from_le_bytes(*b"ok\0\0\0\0\0\0");
         let mut call = TrapFrame::new(
             Syscall::IpcCall as usize,
-            [send_cap.0 as usize, 0, 2, payload_word, 0, reply_recv_cap.0 as usize],
+            [
+                send_cap.0 as usize,
+                0,
+                2,
+                payload_word,
+                0,
+                reply_recv_cap.0 as usize,
+            ],
         );
         dispatch(&mut state, &mut call).expect("call");
 
@@ -4186,20 +4488,40 @@ mod tests {
         let m1_ptr = 0x6080usize;
         let mut recv1 = TrapFrame::new(
             Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, p1_ptr, 8, m1_ptr, IPC_RECV_META_V2_ENCODED_LEN, 0],
+            [
+                recv_cap.0 as usize,
+                p1_ptr,
+                8,
+                m1_ptr,
+                IPC_RECV_META_V2_ENCODED_LEN,
+                0,
+            ],
         );
         dispatch(&mut state, &mut recv1).expect("recv1");
         let m1 = state
             .read_user_memory(0, m1_ptr, IPC_RECV_META_V2_ENCODED_LEN)
             .expect("read meta1");
         let flags = u64::from_le_bytes(m1[24..32].try_into().expect("flags"));
-        assert_eq!(flags & (SYSCALL_RECV_META_REPLY_CAP as u64), SYSCALL_RECV_META_REPLY_CAP as u64);
+        assert_eq!(
+            flags & (SYSCALL_RECV_META_REPLY_CAP as u64),
+            SYSCALL_RECV_META_REPLY_CAP as u64
+        );
         let recv_local_cap = CapId(u64::from_le_bytes(m1[32..40].try_into().expect("cap")));
-        assert_ne!(recv_local_cap.0, reply_recv_cap.0, "must be receiver-local cap id");
+        assert_ne!(
+            recv_local_cap.0, reply_recv_cap.0,
+            "must be receiver-local cap id"
+        );
 
         let mut recv2 = TrapFrame::new(
             Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, p1_ptr, 8, m1_ptr, IPC_RECV_META_V2_ENCODED_LEN, 0],
+            [
+                recv_cap.0 as usize,
+                p1_ptr,
+                8,
+                m1_ptr,
+                IPC_RECV_META_V2_ENCODED_LEN,
+                0,
+            ],
         );
         dispatch(&mut state, &mut recv2).expect("no duplicate message or rematerialization");
         assert_eq!(
@@ -4242,7 +4564,14 @@ mod tests {
         let payload_word = usize::from_le_bytes(*b"reply_ok");
         let mut reply_frame = TrapFrame::new(
             Syscall::IpcReply as usize,
-            [reply_cap.0 as usize, 0, 8, payload_word, 0, mem_cap.0 as usize],
+            [
+                reply_cap.0 as usize,
+                0,
+                8,
+                payload_word,
+                0,
+                mem_cap.0 as usize,
+            ],
         );
         dispatch(&mut state, &mut reply_frame).expect("ipc reply with cap");
         assert_eq!(reply_frame.error_code(), None);
@@ -4256,7 +4585,11 @@ mod tests {
         assert_eq!(recv.error_code(), None);
 
         // FLAG_CAP_TRANSFER_PLAIN is NOT stripped — full 8-byte payload must be preserved.
-        assert_eq!(recv.ret1(), 8, "full payload without opcode-prefix stripping");
+        assert_eq!(
+            recv.ret1(),
+            8,
+            "full payload without opcode-prefix stripping"
+        );
         let bytes = unpack_register_payload(
             [
                 recv.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
@@ -5773,8 +6106,8 @@ mod tests {
                     Syscall::InitramfsReadChunk as usize,
                     [0x1000, 5, 0, 0x2000, 64, 0],
                 );
-                let err = dispatch(&mut state, &mut frame)
-                    .expect_err("non-SystemServer must be denied");
+                let err =
+                    dispatch(&mut state, &mut frame).expect_err("non-SystemServer must be denied");
                 assert_eq!(err, SyscallError::MissingRight);
             })
             .expect("spawn test thread")
@@ -5861,8 +6194,8 @@ mod tests {
                     // arg0=name_ptr, arg1=name_len, arg2=offset=0, arg3=dst_ptr(non-zero), arg4=64, arg5=0
                     [0x4000, name.len(), 0, 0x9000, 64, 0],
                 );
-                let err = dispatch(&mut state, &mut frame)
-                    .expect_err("not-found must be Internal error");
+                let err =
+                    dispatch(&mut state, &mut frame).expect_err("not-found must be Internal error");
                 // MUST be Internal, NOT 0/EOF — critical Phase 2A safety constraint.
                 assert_eq!(err, SyscallError::Internal);
             })
