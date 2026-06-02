@@ -2,8 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::boot::{
-    IpcEndpointRecvResult, IpcEndpointSendResult, IpcSchedulerPlan, KernelError, KernelState,
-    MemoryObjectKind, TransferSharedRegion,
+    ControlPlaneCnodePlan, IpcEndpointRecvResult, IpcEndpointSendResult, IpcSchedulerPlan,
+    KernelError, KernelState, MemoryObjectKind, TransferSharedRegion, VmBrkPlan,
 };
 use super::capabilities::{CapId, CapObject, CapRights, Capability};
 use super::ipc::{
@@ -1985,8 +1985,17 @@ fn handle_control_plane_set_cnode_slots(
     if target_pid == 0 || slot_capacity == 0 {
         return Err(SyscallError::InvalidArgs);
     }
+    // Stage 5B plan-first: snapshot task domain (rank 2) before capability
+    // mutation (rank 4). When the global lock is removed, this read moves to
+    // before the with_cpu() call via split-read on SharedKernel.
+    let plan = ControlPlaneCnodePlan {
+        requester_class: kernel
+            .task_class(requester_tid)
+            .ok_or(SyscallError::from(KernelError::TaskMissing))?,
+        requester_pid: kernel.process_id(requester_tid).unwrap_or(requester_tid),
+    };
     kernel
-        .control_plane_set_process_cnode_slots(requester_tid, target_pid, slot_capacity)
+        .control_plane_set_process_cnode_slots_planned(&plan, target_pid, slot_capacity)
         .map_err(SyscallError::from)?;
     frame.set_ok(slot_capacity, target_pid as usize, 0);
     Ok(())
@@ -3118,29 +3127,32 @@ fn handle_vm_anon_map(
     Ok(())
 }
 
-fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let tid = current_tid(_kernel)?;
-    let leader_tid = _kernel
-        .thread_group_id(tid)
-        .map(|group| group.0)
-        .ok_or(SyscallError::InvalidArgs)?;
-    if tid != leader_tid {
+fn handle_vm_brk(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    let tid = current_tid(kernel)?;
+    // Stage 5B plan-first: snapshot task domain (rank 2) before memory
+    // mutation (rank 6). When the global lock is removed, this read moves to
+    // before the with_cpu() call via split-read on SharedKernel.
+    let plan = VmBrkPlan {
+        tid,
+        is_group_leader: kernel.is_thread_group_leader(tid),
+    };
+    if !plan.is_group_leader {
         return Err(SyscallError::InvalidArgs);
     }
 
-    let requested = _frame.arg(SYSCALL_ARG_CAP);
+    let requested = frame.arg(SYSCALL_ARG_CAP);
     if requested == 0 {
-        let current_end = _kernel
-            .task_brk_bounds(tid)
+        let current_end = kernel
+            .task_brk_bounds(plan.tid)
             .map(|(_, end)| end)
             .unwrap_or(0);
-        _frame.set_ok(current_end, 0, 0);
+        frame.set_ok(current_end, 0, 0);
         return Ok(());
     }
 
     validate_user_region(requested as u64, 1)?;
-    let (base, current_end) = _kernel
-        .task_brk_bounds(tid)
+    let (base, current_end) = kernel
+        .task_brk_bounds(plan.tid)
         .ok_or(SyscallError::InvalidArgs)?;
     if requested < base {
         return Err(SyscallError::InvalidArgs);
@@ -3153,10 +3165,10 @@ fn handle_vm_brk(_kernel: &mut KernelState, _frame: &mut TrapFrame) -> Result<()
     // requires pre-initialized brk bounds to avoid creating an empty
     // [base,end) window from unset state. Heap pages are still allocated
     // lazily by demand-fault mapping in [base, end).
-    _kernel
-        .set_task_brk_bounds(tid, base, requested)
+    kernel
+        .set_task_brk_bounds(plan.tid, base, requested)
         .map_err(SyscallError::from)?;
-    _frame.set_ok(requested, 0, 0);
+    frame.set_ok(requested, 0, 0);
     Ok(())
 }
 
