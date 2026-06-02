@@ -540,3 +540,52 @@ that modifies scheduler/task state from the x86_64 timer ISR path until
 guard enforces this; do not widen the window between STI and the guard being set.
 
 ---
+
+## Rule N+2 — Phase BT2: arm the BSP LAPIC timer ONLY after `signal_bootstrap_scheduler_ready()`
+
+**Root cause (BT2)**: Prior to this fix, the BSP LAPIC timer was armed in two places:
+1. `init_lapic_mmio_base()` in `src/arch/x86_64/irq.rs` (during LAPIC SVR configuration)
+2. `run_with_prepared_kernel()` in `src/arch/x86_64/boot.rs` (before `run(kernel)`)
+
+Both armings occurred before `bootstrap_first_user_task()` began loading ELF images.
+At LAPIC divide-by-16 with a 50,000,000-tick deadline (~800 ms/fire in QEMU), loading
+three ELF images takes ~17 s, so the timer ISR fired 21 times during bootstrap. Each
+fire entered `yarm_x86_dispatch_trap_from_stub`, which calls `shared.with_cpu()` three
+times (entering_tid, dispatch, exiting_tid). Each `with_cpu()` call acquired a second
+`&mut KernelState` while `borrow_kernel_for_boot()`'s raw `&mut` alias was still live.
+Under Rust's aliasing rules this is undefined behaviour; the optimizer corrupted TCB
+tables and page-table entries, causing `bootstrap_first_user_task()` to hang and
+`signal_bootstrap_scheduler_ready()` to never be called.
+
+Observed smoke: `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY: 21`, `X86_BOOTSTRAP_SCHEDULER_READY: 0`,
+`ENTER_USER: 0`, `service_entries: 0`.
+
+**Fix (D)**: Remove both early timer armings. Arm the BSP LAPIC timer exactly once via
+`start_bsp_periodic_timer(kernel)`, called in `run_scheduler_loop()` immediately after
+`signal_bootstrap_scheduler_ready()` returns. This eliminates the aliasing window
+entirely. The BT1 EOI-only guard is preserved as defence-in-depth but fires zero times.
+
+**Expected smoke markers after fix**:
+- `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY: 0` (was 21 — timer not armed during bootstrap)
+- `X86_BOOTSTRAP_SCHEDULER_READY: 1` (was 0 — bootstrap now completes)
+- `X86_BOOTSTRAP_TIMER_STARTED: 1` (new marker — timer armed after signal)
+- `ENTER_USER: ≥1` (was 0 — userspace tasks now reached)
+
+**Rule**: The BSP LAPIC timer must NOT be armed in `init_lapic_mmio_base()` or anywhere
+before `signal_bootstrap_scheduler_ready()` completes. The single authorised arming site
+is `start_bsp_periodic_timer(kernel)` in `src/arch/boot_entry.rs`.
+
+**Test**: `init_lapic_does_not_arm_timer_before_signal` in `src/arch/x86_64/irq.rs`
+asserts that the LAPIC timer initial-count register remains 0 after `init_lapic_mmio_base()`.
+`bootstrap_scheduler_ready_gates_timer_isr_scheduling` in
+`src/arch/x86_64/descriptor_tables.rs` asserts idempotent signal semantics.
+
+**Files changed by BT2**:
+- `src/arch/x86_64/irq.rs` — removed timer arm from `init_lapic_mmio_base()`; updated test
+- `src/arch/x86_64/boot.rs` — removed `program_timer_deadline_current_cpu()` from `run_with_prepared_kernel()`
+- `src/arch/boot_entry.rs` — added `start_bsp_periodic_timer(kernel)` function
+- `src/bin/kernel_boot.rs` — call `start_bsp_periodic_timer(kernel)` after `signal_bootstrap_scheduler_ready()`
+- `src/arch/x86_64/descriptor_tables.rs` — added BT2 comment block and test
+- `doc/KERNEL_LOCKING.md` — added Section 15 for Phase BT2
+
+---

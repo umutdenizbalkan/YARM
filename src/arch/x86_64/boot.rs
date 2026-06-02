@@ -1292,9 +1292,12 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     crate::yarm_log!("YARM_BOOT_INIT_READY prepared_pvh_regions={}", prepared_len);
     // SAFETY: single-CPU boot; interrupts are disabled (STI not yet called);
     // TRAP_SHARED_KERNEL_PTR is written by install_trap_shared_kernel below,
-    // which happens before STI, so no concurrent trap handler can call with_cpu
-    // while this boot reference is live. LAPIC deadline is 50M ticks (≈800ms)
-    // >> boot window (≈50ms), making a timer interrupt before IRETQ implausible.
+    // which happens before STI. The BSP LAPIC timer is NOT armed here (BT2 fix):
+    // init_lapic_mmio_base no longer programs the timer, and the explicit arm
+    // below was removed. The timer is armed by start_bsp_periodic_timer() only
+    // after signal_bootstrap_scheduler_ready() completes, so no timer ISR can
+    // race with borrow_kernel_for_boot()'s raw &mut KernelState alias during
+    // bootstrap ELF loading (which takes >800ms in QEMU on slow hosts).
     let kernel = unsafe { shared.borrow_kernel_for_boot() };
     crate::arch::x86_64::descriptor_tables::install_trap_shared_kernel(shared);
     crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=x86_64 shared=1 raw=0");
@@ -1308,9 +1311,7 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.present_cpu_count()
     );
     crate::yarm_log!("YARM_BOOT_STAGE post_smp_startup");
-    kernel.program_timer_deadline_current_cpu(
-        crate::arch::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS,
-    );
+    // BT2: timer is NOT armed here; armed after bootstrap in start_bsp_periodic_timer().
     crate::arch::x86_64::irq::enable_interrupts_for_boot();
     debug_uart_marker(b'J');
     crate::yarm_log!("YARM_BOOT_STAGE pre_boot_ok");

@@ -21,6 +21,11 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
     // are spawned and enqueued. Must come after bootstrap_first_user_task and
     // release_secondary_cpus_after_bootstrap complete.
     yarm::arch::boot_entry::signal_bootstrap_scheduler_ready();
+    // x86_64 BT2: arm the BSP LAPIC timer only after bootstrap completes.
+    // The timer was intentionally not armed during LAPIC init or
+    // run_with_prepared_kernel, so no timer ISR could race with
+    // borrow_kernel_for_boot()'s raw &mut alias during ELF loading.
+    yarm::arch::boot_entry::start_bsp_periodic_timer(kernel);
     if DEBUG_DISPATCH_CONTEXT_LOG {
         yarm::yarm_log!("BSP_POST_RELEASE cpu={}", cpu.0);
         yarm::yarm_log!("BSP_REDISPATCH_BEGIN cpu={}", cpu.0);

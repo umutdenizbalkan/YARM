@@ -59,6 +59,25 @@ pub fn signal_bootstrap_scheduler_ready() {
     }
 }
 
+/// Arms the BSP LAPIC periodic timer after bootstrap completes.
+///
+/// Must be called after signal_bootstrap_scheduler_ready() so that the timer
+/// ISR sees BOOTSTRAP_SCHEDULER_READY=true and takes the normal scheduling path.
+/// On x86_64 bare metal the timer was intentionally not armed during LAPIC init
+/// or run_with_prepared_kernel (BT2 fix) — this is the single point where the
+/// BSP timer starts. No-op on other architectures and hosted-dev.
+pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    {
+        kernel.program_timer_deadline_current_cpu(
+            crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+        );
+        crate::yarm_log!("X86_BOOTSTRAP_TIMER_STARTED");
+    }
+    #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+    let _ = kernel;
+}
+
 struct IrqDescriptionLockGuard;
 
 impl IrqDescriptionLockGuard {
