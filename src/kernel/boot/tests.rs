@@ -9366,6 +9366,289 @@ fn vm_anon_map_rollback_tlb_plan_covers_progress_range() {
     );
 }
 
+// ── Stage 5F: live two-phase VmBrk shrink tests ──────────────────────────────
+//
+// These tests verify:
+//   1. VmBrk two-phase shrink removes all mapped pages and updates bounds.
+//   2. Non-page-aligned shrink preserves the partial page containing requested_end.
+//   3. A shrink within the last page produces an empty unmap range (no pages removed).
+//   4. execute_tlb_shootdown_wait_plan completes without error in single-CPU fast path.
+//   5. Single-page full unmap shrinks correctly.
+//
+// The Stage 5D regression tests (vm_brk_shrink_tolerates_lazy_unmapped_pages,
+// vm_brk_shrink_with_partially_mapped_lazy_region) also exercise the new path
+// and must continue to pass.
+
+#[test]
+fn vm_brk_two_phase_shrink_removes_mapped_pages_and_updates_bounds() {
+    // Stage 5F: The two-phase shrink path (unmap_page_phase1 +
+    // execute_tlb_shootdown_wait_plan) must remove all mapped pages in the
+    // shrink range and update the brk bounds to the requested byte value.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let base = 0x60_0000_usize;
+            let page1 = base;
+            let page2 = base + PAGE_SIZE;
+            let page3 = base + 2 * PAGE_SIZE;
+            let brk_end = base + 3 * PAGE_SIZE;
+
+            for virt in [page1, page2, page3] {
+                let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+                state
+                    .map_user_page_in_asid_with_caps(asid, cap, VirtAddr(virt as u64), PageFlags::USER_RW)
+                    .expect("map page");
+            }
+            state
+                .set_task_brk_bounds(0, base, brk_end)
+                .expect("set brk bounds");
+
+            // Shrink to base: must unmap all three pages.
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmBrk as usize,
+                [base, 0, 0, 0, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "two-phase VmBrk shrink must succeed"
+            );
+
+            for virt in [page1, page2, page3] {
+                assert!(
+                    !state
+                        .is_user_page_mapped_in_asid(asid, VirtAddr(virt as u64))
+                        .expect("post-shrink check"),
+                    "page at {:#x} must not be mapped after two-phase shrink", virt
+                );
+            }
+            assert_eq!(
+                state.task_brk_bounds(0),
+                Some((base, base)),
+                "brk bounds must reflect the shrink to base"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_brk_two_phase_shrink_non_page_aligned_preserves_partial_page() {
+    // Stage 5F: A non-page-aligned requested_end must leave the partial page
+    // containing it mapped. Only full pages strictly above requested_end are
+    // unmapped.  round_up_page(requested) gives the start of the unmap range,
+    // so pages below round_up are preserved.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let base = 0x70_0000_usize;
+            let page2 = base + PAGE_SIZE;
+            let brk_end = base + 2 * PAGE_SIZE;
+
+            for virt in [base, page2] {
+                let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+                state
+                    .map_user_page_in_asid_with_caps(asid, cap, VirtAddr(virt as u64), PageFlags::USER_RW)
+                    .expect("map page");
+            }
+            state
+                .set_task_brk_bounds(0, base, brk_end)
+                .expect("set brk bounds");
+
+            // Shrink to base + 0x800 (non-aligned, within page 1).
+            // round_up_page(base + 0x800) = base + PAGE_SIZE = unmap_start.
+            // unmap_end = round_up_page(brk_end) = brk_end.
+            // Unmap range: [base + PAGE_SIZE, brk_end) = page 2 only.
+            let requested = base + 0x800;
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmBrk as usize,
+                [requested, 0, 0, 0, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "non-aligned VmBrk shrink must succeed"
+            );
+
+            // Page 1 (base) must still be mapped — it is below the unmap range.
+            assert!(
+                state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(base as u64))
+                    .expect("page1 check"),
+                "page 1 must remain mapped (below non-aligned requested_end)"
+            );
+            // Page 2 must be gone.
+            assert!(
+                !state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(page2 as u64))
+                    .expect("page2 check"),
+                "page 2 must be unmapped by shrink"
+            );
+            // brk bounds must reflect the byte-granular shrink.
+            assert_eq!(
+                state.task_brk_bounds(0),
+                Some((base, requested)),
+                "brk end must be set to the non-aligned requested_end"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_brk_two_phase_shrink_empty_unmap_range_preserves_page() {
+    // Stage 5F: When the requested_end falls within the last page of the brk
+    // region, round_up_page(requested) == round_up_page(current_end), so the
+    // unmap range is empty.  No pages must be removed; the byte-granular brk
+    // is still updated.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let base = 0x80_0000_usize;
+            let brk_end = base + PAGE_SIZE;
+
+            let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, cap, VirtAddr(base as u64), PageFlags::USER_RW)
+                .expect("map page");
+            state
+                .set_task_brk_bounds(0, base, brk_end)
+                .expect("set brk bounds");
+
+            // Shrink to base + 0x800 — still within the single page.
+            // unmap_start = round_up_page(base + 0x800) = base + PAGE_SIZE = brk_end
+            // unmap_end   = round_up_page(brk_end)      = brk_end
+            // unmap_start == unmap_end → skip loop entirely.
+            let requested = base + 0x800;
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmBrk as usize,
+                [requested, 0, 0, 0, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "intra-page shrink must succeed"
+            );
+
+            // The page must still be mapped.
+            assert!(
+                state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(base as u64))
+                    .expect("page check"),
+                "page must remain mapped after intra-page shrink"
+            );
+            assert_eq!(
+                state.task_brk_bounds(0),
+                Some((base, requested)),
+                "brk end must be updated to the intra-page requested_end"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn execute_tlb_shootdown_wait_plan_completes_in_single_cpu_fast_path() {
+    // Stage 5F: In single-CPU (hosted-dev), unmap_page_phase1 always produces
+    // target_cpu_bitmap == 0 (no remote CPUs), so execute_tlb_shootdown_wait_plan
+    // takes the fast path: the ipc lock is not acquired and no cross-CPU work is
+    // submitted.  The function must return Ok(()) without error, and the page
+    // must remain absent (phase 1 already removed it).
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+            let virt = VirtAddr(0xA0_0000);
+
+            let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
+                .expect("map page");
+
+            let plan = state
+                .unmap_page_phase1(asid, virt)
+                .expect("phase1 must not error")
+                .expect("phase1 must be Some");
+
+            assert_eq!(
+                plan.target_cpu_bitmap, 0,
+                "single-CPU: phase1 bitmap must be 0 (fast path)"
+            );
+
+            // Phase 2 + 3: shootdown (fast path, skipped) + reclamation.
+            state
+                .execute_tlb_shootdown_wait_plan(plan)
+                .expect("execute_tlb_shootdown_wait_plan must succeed");
+
+            // Page was already gone after phase1 and must remain absent.
+            assert!(
+                !state
+                    .is_user_page_mapped_in_asid(asid, virt)
+                    .expect("post-phase2 check"),
+                "page must remain absent after execute_tlb_shootdown_wait_plan"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_brk_two_phase_shrink_single_page_updates_to_base() {
+    // Stage 5F: A one-page brk region shrinks to base, unmapping the single page
+    // and setting brk_end == base.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let base = 0x90_0000_usize;
+            let brk_end = base + PAGE_SIZE;
+
+            let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, cap, VirtAddr(base as u64), PageFlags::USER_RW)
+                .expect("map page");
+            state
+                .set_task_brk_bounds(0, base, brk_end)
+                .expect("set brk bounds");
+
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmBrk as usize,
+                [base, 0, 0, 0, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "single-page two-phase shrink must succeed"
+            );
+
+            assert!(
+                !state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(base as u64))
+                    .expect("post-shrink page check"),
+                "single page must be unmapped after full shrink"
+            );
+            assert_eq!(
+                state.task_brk_bounds(0),
+                Some((base, base)),
+                "brk end must equal base after full shrink to base"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
 // ── Phase L2A: canonical boot SharedKernel construction tests ─────────────────
 //
 // These tests verify Bootstrap::init_shared_static_with_boot_memory_map
