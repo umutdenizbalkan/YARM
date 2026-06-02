@@ -688,14 +688,20 @@ mod tests {
         );
     }
 
-    // ── Stage 4T+6 x86_64 trap TID split-read equivalence tests ─────────────
+    // ── Stage 4T+6R: current_tid_split_read equivalence tests ───────────────
+    // These tests prove value-equivalence for the current_tid_split_read helper.
+    // NOTE: Stage 4T+6's live conversion of x86_64 entering_tid/exiting_tid from
+    // with_cpu→current_tid to current_tid_split_read was reverted (Stage 4T+6R)
+    // because it broke the x86_64 service chain in smoke testing despite passing
+    // these unit tests. The helper is still used by other callers (AArch64 trace).
+    // The x86_64 shared trap path uses with_cpu→current_tid (global lock, Class F).
 
     #[test]
     fn current_tid_split_read_matches_with_cpu_current_tid_entering_snapshot() {
-        // Proves that current_tid_split_read(cpu) is equivalent to
-        // with_cpu(cpu, |k| k.current_tid()).unwrap_or(None) at the
-        // point in time that corresponds to the entering_tid snapshot
-        // in the x86_64 shared trap path (Stage 4T+6 conversion).
+        // Proves that current_tid_split_read(cpu) returns the same value as
+        // with_cpu(cpu, |k| k.current_tid()).unwrap_or(None) on the same scheduler
+        // state. NOTE: value-equivalence alone is insufficient for live x86_64 trap
+        // use — the with_cpu path is required there (see Stage 4T+6R revert).
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let cpu = CpuId(0);
 
@@ -799,6 +805,81 @@ mod tests {
         assert_eq!(
             split, conservative,
             "split_read must match with_cpu for offline CPU"
+        );
+    }
+
+    // ── Stage 4T+6R: with_cpu entering/exiting TID path tests ───────────────
+    // These tests cover the reverted x86_64 trap path that uses with_cpu for
+    // both entering_tid and exiting_tid reads. They prove that task_switched
+    // detection and scheduler progress are correct with the global-lock path.
+
+    #[test]
+    fn with_cpu_entering_exiting_tid_detects_task_switch() {
+        // Proves that the with_cpu→current_tid path (live in x86_64 shared trap
+        // after Stage 4T+6R revert) correctly detects a task switch for both
+        // entering_tid and exiting_tid snapshots. This is the acceptance test for
+        // the reverted code path — unit-test coverage that smoke testing validates.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+
+        kernel.with(|state| {
+            state.register_task(83).expect("task83");
+            state.register_task(84).expect("task84");
+            state.enqueue_current_cpu(83).expect("enqueue 83");
+            state.enqueue_current_cpu(84).expect("enqueue 84");
+            state.dispatch_next_task().expect("dispatch to 83");
+        });
+
+        let entering_tid = kernel.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
+        assert_eq!(entering_tid, Some(83), "entering_tid must be task 83");
+
+        kernel.with(|state| {
+            state.yield_current().expect("yield 83");
+        });
+
+        let exiting_tid = kernel.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
+        assert_ne!(
+            exiting_tid, entering_tid,
+            "exiting_tid must differ from entering_tid after task switch"
+        );
+        let task_switched = entering_tid != exiting_tid;
+        assert!(task_switched, "task_switched must be true after yield");
+    }
+
+    #[test]
+    fn with_cpu_entering_exiting_tid_no_switch_same_task() {
+        // Proves that the with_cpu→current_tid path returns equal entering_tid and
+        // exiting_tid when no task switch occurs (no yield between reads).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+
+        kernel.with(|state| {
+            state.register_task(85).expect("task85");
+            state.enqueue_current_cpu(85).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+
+        let entering_tid = kernel.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
+        let exiting_tid = kernel.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
+        assert_eq!(
+            entering_tid, exiting_tid,
+            "entering_tid must equal exiting_tid when no task switch"
+        );
+        let task_switched = entering_tid != exiting_tid;
+        assert!(!task_switched, "task_switched must be false for same-task return");
+    }
+
+    #[test]
+    fn with_cpu_entering_tid_offline_cpu_returns_none() {
+        // Proves that with_cpu for an offline CPU returns Err, making
+        // unwrap_or(None) give None — the same sentinel as current_tid_split_read.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let offline_cpu = CpuId(7);
+
+        let entering_tid = kernel.with_cpu(offline_cpu, |k| k.current_tid()).unwrap_or(None);
+        assert_eq!(
+            entering_tid, None,
+            "offline CPU must return None from with_cpu→current_tid"
         );
     }
 

@@ -868,13 +868,16 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=x86_64");
         }
         let fault_rip = frame.rip;
-        // Stage 4T+6: entering_tid read via current_tid_split_read (scheduler lock,
-        // rank 1 only). Equivalent to the former with_cpu→current_tid path because
-        // current_tid_on(cpu) returns None for offline CPUs (same as validate_online_cpu
-        // failing) and the same value as set_current_cpu(cpu)→current_tid_on(current_cpu)
-        // when the CPU is online. The set_current_cpu side effect from the old path was
-        // immediately overridden by dispatch's own with_cpu call.
-        let entering_tid: Option<u64> = shared.current_tid_split_read(cpu);
+        // Stage 4T+6R: reverted to conservative with_cpu→current_tid path.
+        // Stage 4T+6 converted this to current_tid_split_read(cpu), which has
+        // equivalent return-value semantics but broke the x86_64 service chain
+        // in smoke testing (service_entries=0, repeated SCHED_ENTER_IDLE_HLT).
+        // The unit-test value-equivalence proof was insufficient: smoke behavior
+        // is the acceptance criterion. Both entering_tid and exiting_tid reads
+        // are restored to the global-lock with_cpu path (Class F).
+        let entering_tid: Option<u64> = shared
+            .with_cpu(cpu, |k| k.current_tid())
+            .unwrap_or(None);
         let mut trap_frame =
             unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
         if let Err(err) = crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
@@ -898,11 +901,11 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
             halt_forever();
         }
-        // Stage 4T+6: exiting_tid read via current_tid_split_read (scheduler lock,
-        // rank 1 only). See entering_tid comment for the equivalence proof. At this
-        // point the main dispatch has already released all its locks; the scheduler
-        // state for cpu reflects the final dispatched task.
-        let exiting_tid: Option<u64> = shared.current_tid_split_read(cpu);
+        // Stage 4T+6R: reverted to conservative with_cpu→current_tid path.
+        // See entering_tid comment above for the revert rationale.
+        let exiting_tid: Option<u64> = shared
+            .with_cpu(cpu, |k| k.current_tid())
+            .unwrap_or(None);
         let task_switched = entering_tid != exiting_tid;
         if task_switched {
             write_task_gprs_to_saved_regs(regs, &trap_frame);
