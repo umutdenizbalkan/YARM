@@ -3494,21 +3494,28 @@ correct writeback path is always selected.
    ```
    This call passes `&mut KernelState` to the fatal-trap logger, which is required for
    the logger to access `KernelState` subsystem state.  No split-read can replace it.
+   (This was subsequently replaced by `log_decoded_fatal_trap_from_snapshot` in Stage 4T+7.)
 
-**Net effect**: 2 global lock acquisitions per trap eliminated (entering + exiting
+**Net effect (Stage 4T+6 intent)**: 2 global lock acquisitions per trap eliminated (entering + exiting
 snapshots).  The fatal-trap path (1 global lock, Class F) and the main dispatch path
 (1 global lock for `dispatch_trap_entry_with_shared_kernel`) are unchanged.
 
+> **⚠ Stage 4T+6R REVERT**: The entering_tid and exiting_tid conversions were subsequently
+> reverted (Stage 4T+6R, same commit series) because x86_64 smoke testing showed the
+> service chain stalling (service_entries=0, repeated SCHED_ENTER_IDLE_HLT) after the
+> conversion.  See §12.8 for the full revert record.  `current_tid_split_read` remains
+> available as a helper for other callers (e.g., AArch64 trace path, Stage L6B) but is
+> **not live in the x86_64 trap entering/exiting TID snapshots**.
+
 ### 12.4 Classification update (§11.2 revision)
 
-The call sites previously classified as `F` at `descriptor_tables.rs:823,857` have
-been converted:
+After Stage 4T+6R revert, the entering_tid and exiting_tid sites remain Class F:
 
-| Location | Method | Old Class | New Class |
-|----------|--------|-----------|-----------|
-| `arch/x86_64/descriptor_tables.rs` (entering_tid) | `current_tid_split_read(cpu)` | F (deferred) | **E (converted)** |
-| `arch/x86_64/descriptor_tables.rs` (exiting_tid) | `current_tid_split_read(cpu)` | F (deferred) | **E (converted)** |
-| `arch/x86_64/descriptor_tables.rs` (fatal-trap) | `with_cpu → log_decoded_fatal_trap` | F | **F (kept, needs &mut KernelState)** |
+| Location | Method | Stage 4T+5 Class | Stage 4T+6 (reverted) | Final (4T+6R) |
+|----------|--------|------------------|-----------------------|---------------|
+| `arch/x86_64/descriptor_tables.rs` (entering_tid) | `with_cpu → current_tid` | F | E (broken, reverted) | **F (restored)** |
+| `arch/x86_64/descriptor_tables.rs` (exiting_tid) | `with_cpu → current_tid` | F | E (broken, reverted) | **F (restored)** |
+| `arch/x86_64/descriptor_tables.rs` (fatal-trap) | `with_cpu → log_decoded_fatal_trap` | F | F (kept) | **E (converted Stage 4T+7)** |
 
 ### 12.5 Complete split helper inventory update
 
@@ -3520,7 +3527,9 @@ been converted:
 
 ### 12.6 Tests
 
-Four new split-read correctness tests added (`runtime::tests`):
+Stage 4T+6 added four split-read helper tests; Stage 4T+6R added three with_cpu path tests.
+
+**Stage 4T+6 split-read helper tests** (value-equivalence; helper is still used by AArch64 trace):
 
 | Test | Invariant |
 |------|-----------|
@@ -3529,21 +3538,71 @@ Four new split-read correctness tests added (`runtime::tests`):
 | `current_tid_split_read_no_switch_detection_for_same_task_return` | After dispatch to task 71 with no yield, split read returns same TID for both entering and exiting snapshots; `task_switched` is false |
 | `current_tid_split_read_offline_cpu_returns_none` | `current_tid_split_read(CpuId(255))` returns `None` for an offline/nonexistent CPU |
 
-Total: 550 → 554 / 0 failed.
+**Stage 4T+6R with_cpu path tests** (cover the reverted live code):
 
-### 12.7 What Stage 4T+6 does NOT change
+| Test | Invariant |
+|------|-----------|
+| `with_cpu_entering_exiting_tid_detects_task_switch` | `with_cpu→current_tid` entering_tid=Some(83), exiting_tid=Some(84) after yield; `task_switched` is true |
+| `with_cpu_entering_exiting_tid_no_switch_same_task` | Two consecutive `with_cpu→current_tid` calls without yield return equal TIDs; `task_switched` is false |
+| `with_cpu_entering_tid_offline_cpu_returns_none` | `with_cpu(CpuId(7), …).unwrap_or(None)` returns `None` for offline CPU |
+
+Total: 550 (pre-4T+6) → 554 (4T+6) → 557 (4T+7) → **560 (4T+6R)** / 0 failed.
+
+### 12.7 Correctness note: value-equivalence is not behavior-equivalence
+
+The Stage 4T+6 conversion proved that `current_tid_split_read(cpu)` and
+`with_cpu(cpu, |k| k.current_tid()).unwrap_or(None)` return the same value for all
+reachable scheduler states (online/offline CPU, dispatched/idle task).
+
+However, the x86_64 smoke test showed the service chain stalling after the conversion
+(service_entries=0, repeated SCHED_ENTER_IDLE_HLT) despite all unit tests passing.
+
+The root cause was not identified through static analysis — the `set_current_cpu` side
+effect of `with_cpu` is provably redundant (the main dispatch's `with_cpu` also calls
+`set_current_cpu(cpu)`, and `handle_trap_entry_with_fault_bookkeeping_mode` calls it
+again defensively). Yet removing the entering/exiting TID `with_cpu` calls broke
+hardware behavior.
+
+**Lesson**: For arch-boundary trap paths, smoke-level acceptance testing (service chain
+running, tasks dispatching correctly) is the required acceptance criterion. Unit tests
+proving return-value equivalence are necessary but not sufficient. A conversion must pass
+smoke testing before it can be considered complete.
+
+### 12.8 Stage 4T+6R — Revert record
+
+**What was reverted**: Both entering_tid and exiting_tid reads in `yarm_x86_dispatch_trap_from_stub`
+were restored to `with_cpu(cpu, |k| k.current_tid()).unwrap_or(None)`.
+
+**What was NOT reverted**: 
+- `current_tid_split_read` helper remains; it is still used by AArch64 trace (Stage L6B, Class C).
+- Stage 4T+7 fatal-trap snapshot conversion remains (smoke shows `real_fatal_ish=0`; that code path was never triggered by the regression).
+
+**Final state of x86_64 shared trap TID reads**:
+```rust
+// entering_tid — with_cpu global lock (Class F, restored Stage 4T+6R)
+let entering_tid: Option<u64> = shared
+    .with_cpu(cpu, |k| k.current_tid())
+    .unwrap_or(None);
+// ... dispatch ...
+// exiting_tid — with_cpu global lock (Class F, restored Stage 4T+6R)
+let exiting_tid: Option<u64> = shared
+    .with_cpu(cpu, |k| k.current_tid())
+    .unwrap_or(None);
+```
+
+### 12.9 What Stage 4T+6 does NOT change (final state after 4T+6R)
 
 - IPC syscall ABI and SYSCALL_COUNT: unchanged.
 - SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
 - x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
 - x86_64 register writeback semantics: unchanged — `task_switched` computation and
   `write_task_gprs_to_saved_regs` / `write_trap_returns_to_saved_regs` selection are
-  identical to the pre-conversion behavior.
+  identical to the pre-Stage-4T+6 behavior.
 - TrapFrame contents: unchanged.
 - Task switch behavior: unchanged.
 - Scheduling decisions: unchanged.
 - AArch64 behavior: unchanged.
-- The fatal-trap `with_cpu` call and the main dispatch `with_cpu` call are retained.
+- The fatal-trap path and main dispatch `with_cpu` calls are retained.
 - The global `SharedKernel` lock is still retained for all mutation paths.
   **This is not Stage 3/global-lock removal.**
 
@@ -3572,8 +3631,8 @@ scheme from §11 and §12 was applied:
 
 | Location | Description | Class |
 |----------|-------------|-------|
-| `entering_tid` (shared path) | `current_tid_split_read(cpu)` | C (Stage 4T+6) |
-| `exiting_tid` (shared path) | `current_tid_split_read(cpu)` | C (Stage 4T+6) |
+| `entering_tid` (shared path) | `with_cpu(cpu, \|k\| k.current_tid()).unwrap_or(None)` — **reverted Stage 4T+6R** (was C after 4T+6, now **F** again) |
+| `exiting_tid` (shared path) | `with_cpu(cpu, \|k\| k.current_tid()).unwrap_or(None)` — **reverted Stage 4T+6R** (was C after 4T+6, now **F** again) |
 | Fatal-trap `with_cpu` (shared path) | `shared.with_cpu(cpu, \|k\| log_decoded_fatal_trap(Some(k), ...))` — previously F, now **E** (converted, Stage 4T+7) |
 | `entering_tid` (raw fallback) | `kernel.current_tid()` — inside raw `&mut KernelState` critical section | F |
 | `exiting_tid` (raw fallback) | `kernel.current_tid()` — same critical section | F |

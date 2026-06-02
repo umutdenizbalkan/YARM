@@ -481,3 +481,36 @@ suite must cover three invariants:
 Incorrect values silently produce a misleading log; only tests can catch this.  The
 offline-CPU case exercises the `unwrap_or(0)` sentinel; the ASID case exercises the
 rank-2 task-lock path; the TID case exercises the rank-1 scheduler-lock path.
+
+---
+
+## Rule 20 — Arch-boundary trap-path conversions require smoke-level acceptance, not only unit-test value-equivalence
+
+When a `with_cpu` call at an arch/trap boundary is replaced with a split-read helper
+(removing a global-lock acquisition), the change is **not complete** until the
+x86_64 service-chain smoke test confirms correct behavior end-to-end:
+
+**Required smoke health signals** (x86_64 core smoke):
+- `service_entries` ≥ 1 (at least one service endpoint reached)
+- `driver/blkcache/virtio READY` all present
+- `PM_ELF_ZC_DONE image_id 7/8/9` total 3
+- `real_fatal_ish = 0` and `x86_fallback = 0`
+- No repeated `SCHED_ENTER_IDLE_HLT` after the first task's initial syscall
+
+**Rationale**: Stage 4T+6 converted x86_64 entering_tid and exiting_tid reads from
+`with_cpu(cpu, |k| k.current_tid()).unwrap_or(None)` to `current_tid_split_read(cpu)`.
+Unit tests proved the two paths return identical values for all reachable scheduler
+states. Yet the x86_64 smoke test showed the service chain stalling after the conversion
+(service_entries=0, repeated SCHED_ENTER_IDLE_HLT after TID 2's STARTUP_INSTALL_FINAL
+syscall) — a failure invisible to unit tests. The conversion was reverted (Stage 4T+6R).
+
+**Corollary**: Unit tests proving return-value equivalence are necessary but NOT
+sufficient for trap-boundary conversions. They do not cover hardware-level lock ordering,
+memory visibility guarantees on real CPUs, timing effects, or interactions between the
+converted path and the broader service-chain bootstrap sequence.
+
+**For the x86_64 shared trap path specifically**: all `with_cpu` calls at the
+entering_tid and exiting_tid sites are classified **Class F** (global lock required).
+Do not attempt to convert them without a successful end-to-end smoke run.
+
+---
