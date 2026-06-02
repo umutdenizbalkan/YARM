@@ -47,13 +47,13 @@ tracks the written length, while hosted/core tests exercise exact byte writes vi
 Init can spawn `ramfs_srv` as image id 11, pass the RAMFS startup config in
 startup slots 14/15, and register the selected prefix with VFS using the existing
 `VFS_OP_MOUNT_REGISTER` request. Process manager resolves image id 11 to
-`/initramfs/sbin/ramfs_srv` and logs `PM_IMAGE_ID_RAMFS_SRV path=...`.
+`/initramfs/sbin/ramfs_srv` and logs `PM_IMAGE_ID_11_RAMFS_SRV path=...`.
 
 Smoke-visible markers for the RAMFS path are:
 
 - `INIT_RAMFS_SPAWN_BEGIN`
 - `INIT_RAMFS_SPAWN_OK`
-- `PM_IMAGE_ID_RAMFS_SRV path=...`
+- `PM_IMAGE_ID_11_RAMFS_SRV path=...`
 - `RAMFS_BIN_ENTRY_START`
 - `RAMFS_BIN_BEFORE_RUN`
 - `RAMFS_SRV_ENTRY`
@@ -65,7 +65,10 @@ Smoke-visible markers for the RAMFS path are:
 
 The QEMU core smoke scripts count RAMFS markers only when
 `RAMFS_SMOKE_EXPECTED=1` is set, so default profiles without RAMFS are not forced
-to fail.
+to fail. When RAMFS is expected, the smoke scripts require the spawn markers,
+`PM_IMAGE_ID_11_RAMFS_SRV`, `RAMFS_MOUNT_READY`, `VFS_MOUNT_REGISTER_RAMFS_OK`,
+and at least one RAMFS config marker (`RAMFS_CONFIG_FOUND` or
+`RAMFS_CONFIG_DEFAULT`).
 
 ## Limits and errors
 

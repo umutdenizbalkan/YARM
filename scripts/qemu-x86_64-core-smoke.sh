@@ -446,7 +446,7 @@ if [[ -f "$LOGFILE" ]]; then
   RAMFS_MARKERS=(
     INIT_RAMFS_SPAWN_BEGIN
     INIT_RAMFS_SPAWN_OK
-    PM_IMAGE_ID_RAMFS_SRV
+    PM_IMAGE_ID_11_RAMFS_SRV
     RAMFS_CONFIG_FOUND
     RAMFS_CONFIG_DEFAULT
     RAMFS_MOUNT_READY
@@ -461,9 +461,28 @@ if [[ -f "$LOGFILE" ]]; then
     fi
     echo "[info] RAMFS smoke marker count: ${marker}=${count}"
   done
-  if [[ "$RAMFS_SMOKE_EXPECTED" == "1" && "$ramfs_seen" -eq 0 ]]; then
-    echo "[error] RAMFS smoke expected but no RAMFS markers were observed"
-    exit 1
+  if [[ "$RAMFS_SMOKE_EXPECTED" == "1" ]]; then
+    if [[ "$ramfs_seen" -eq 0 ]]; then
+      echo "[error] RAMFS smoke expected but no RAMFS markers were observed"
+      exit 1
+    fi
+    RAMFS_REQUIRED_MARKERS=(
+      INIT_RAMFS_SPAWN_BEGIN
+      INIT_RAMFS_SPAWN_OK
+      PM_IMAGE_ID_11_RAMFS_SRV
+      RAMFS_MOUNT_READY
+      VFS_MOUNT_REGISTER_RAMFS_OK
+    )
+    for marker in "${RAMFS_REQUIRED_MARKERS[@]}"; do
+      if [[ "$(log_count_pattern "$marker")" -eq 0 ]]; then
+        echo "[error] RAMFS smoke expected marker missing: ${marker}"
+        exit 1
+      fi
+    done
+    if [[ "$(log_count_pattern RAMFS_CONFIG_FOUND)" -eq 0 && "$(log_count_pattern RAMFS_CONFIG_DEFAULT)" -eq 0 ]]; then
+      echo "[error] RAMFS smoke expected config marker missing"
+      exit 1
+    fi
   fi
 fi
 

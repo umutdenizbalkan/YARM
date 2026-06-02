@@ -410,6 +410,18 @@ mod tests {
         assert!(RamFsMountConfig::new(b"relative", false, 1).is_none());
         assert!(RamFsMountConfig::new(b"/too-long", false, 1).is_none());
         assert!(RamFsMountConfig::decode_startup_words(0, 0).is_none());
+
+        let (mut prefix_word, meta) = default.encode_startup_words();
+        prefix_word &= !0xff;
+        assert!(RamFsMountConfig::decode_startup_words(prefix_word, meta).is_none());
+
+        let (prefix_word, mut meta) = default.encode_startup_words();
+        meta &= !(0xffu64 << 56);
+        assert!(RamFsMountConfig::decode_startup_words(prefix_word, meta).is_none());
+
+        let (_, fallback) = service_from_startup_config(RamFsStartupConfig { mount_config: None })
+            .expect("fallback service");
+        assert_eq!(fallback, default);
     }
 
     #[test]
@@ -482,6 +494,8 @@ mod tests {
         let pm_src = include_str!(
             "../../../../../crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
         );
+        let initramfs_src =
+            include_str!("../../../../../crates/yarm-fs-servers/src/fs/initramfs/archive.rs");
         let ramfs_bin_src = include_str!("../../bin/ramfs_srv.rs");
         for marker in [
             "INIT_RAMFS_SPAWN_BEGIN",
@@ -490,8 +504,10 @@ mod tests {
         ] {
             assert!(init_src.contains(marker), "missing init marker: {marker}");
         }
-        assert!(pm_src.contains("PM_IMAGE_ID_RAMFS_SRV"));
+        assert!(pm_src.contains("PM_IMAGE_ID_11_RAMFS_SRV"));
         assert!(pm_src.contains("/initramfs/sbin/ramfs_srv"));
+        assert!(initramfs_src.contains("INITRAMFS_RAMFS_SRV_PATH"));
+        assert!(initramfs_src.contains("sbin/ramfs_srv"));
         assert!(ramfs_bin_src.contains("RAMFS_BIN_ENTRY_START"));
         assert!(ramfs_bin_src.contains("RAMFS_BIN_BEFORE_RUN"));
     }
@@ -500,8 +516,20 @@ mod tests {
     fn ramfs_server_contract_docs_match_behavior() {
         let doc = include_str!("../../../../../doc/RAMFS_SERVER_CONTRACT.md");
         assert!(doc.contains("/ram"));
-        assert!(doc.contains("RAMFS_CONFIG_FOUND"));
-        assert!(doc.contains("RAMFS_MOUNT_READY"));
+        for marker in [
+            "INIT_RAMFS_SPAWN_BEGIN",
+            "INIT_RAMFS_SPAWN_OK",
+            "PM_IMAGE_ID_11_RAMFS_SRV",
+            "RAMFS_BIN_ENTRY_START",
+            "RAMFS_BIN_BEFORE_RUN",
+            "RAMFS_CONFIG_FOUND prefix=...",
+            "RAMFS_CONFIG_DEFAULT prefix=/ram reason=missing-config",
+            "RAMFS_MOUNT_READY prefix=...",
+            "RAMFS_MOUNT_FAILED reason=...",
+            "VFS_MOUNT_REGISTER_RAMFS_OK prefix=...",
+        ] {
+            assert!(doc.contains(marker), "missing doc marker: {marker}");
+        }
         assert!(doc.contains("memory-only"));
         assert!(doc.contains("VFS_OP_WRITE"));
     }

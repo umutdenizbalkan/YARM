@@ -1426,7 +1426,7 @@ unsafe fn pm_vfs_spawn_inline(
         yarm_user_rt::user_log!("PM_IMAGE_ID_10_FAT_SRV path=/initramfs/sbin/fat_srv");
     }
     if image_id == 11 {
-        yarm_user_rt::user_log!("PM_IMAGE_ID_RAMFS_SRV path=/initramfs/sbin/ramfs_srv");
+        yarm_user_rt::user_log!("PM_IMAGE_ID_11_RAMFS_SRV path=/initramfs/sbin/ramfs_srv");
     }
     let path_log = core::str::from_utf8(path_label).unwrap_or("<path-bytes>");
     yarm_user_rt::user_log!(
