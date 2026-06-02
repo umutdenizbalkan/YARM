@@ -3546,3 +3546,191 @@ Total: 550 → 554 / 0 failed.
 - The fatal-trap `with_cpu` call and the main dispatch `with_cpu` call are retained.
 - The global `SharedKernel` lock is still retained for all mutation paths.
   **This is not Stage 3/global-lock removal.**
+
+## §13 Stage 4T+7 — Trap-boundary split-read audit and fatal-trap snapshot conversion
+
+### 13.1 Audit scope
+
+A rigorous arch-boundary pass classified every `current_tid` read and every
+`SharedKernel` global-lock acquisition across all four trap stacks (x86_64,
+AArch64, RISC-V, `arch/trap_entry.rs`) plus `runtime.rs`.  The classification
+scheme from §11 and §12 was applied:
+
+| Class | Meaning |
+|-------|---------|
+| A/B | Read-only / diagnostic — convertible with existing split-read helpers |
+| C | Already converted in a prior stage |
+| D | Requires TrapFrame writeback — deferred |
+| E | Already converted this stage |
+| F | Requires `&mut KernelState` / global lock — keep |
+| G | Arch/SMP-sensitive — deferred |
+| H | Unsafe to split |
+
+### 13.2 Per-arch audit findings
+
+**x86_64 (`src/arch/x86_64/descriptor_tables.rs`)**
+
+| Location | Description | Class |
+|----------|-------------|-------|
+| `entering_tid` (shared path) | `current_tid_split_read(cpu)` | C (Stage 4T+6) |
+| `exiting_tid` (shared path) | `current_tid_split_read(cpu)` | C (Stage 4T+6) |
+| Fatal-trap `with_cpu` (shared path) | `shared.with_cpu(cpu, \|k\| log_decoded_fatal_trap(Some(k), ...))` — previously F, now **E** (converted, Stage 4T+7) |
+| `entering_tid` (raw fallback) | `kernel.current_tid()` — inside raw `&mut KernelState` critical section | F |
+| `exiting_tid` (raw fallback) | `kernel.current_tid()` — same critical section | F |
+| Fatal-trap (raw fallback) | `log_decoded_fatal_trap(Some(kernel), ...)` — same critical section | F |
+| Main dispatch `with_cpu` (shared path) | `dispatch_trap_entry_with_shared_kernel` | F (required) |
+
+**AArch64 (`src/arch/aarch64/boot.rs`, `src/arch/aarch64/trap.rs`)**
+
+| Location | Description | Class |
+|----------|-------------|-------|
+| AArch64 trace TID (shared path) | `current_tid_split_read(trap_cpu)` under `AARCH64_TRAP_TRACE = false` | C (Stage L6B) |
+| All `kernel.current_tid()` in `handle_trap_entry_with_fault_bookkeeping_mode` | All inside `&mut KernelState` under global lock | F |
+| Raw fallback `current_tid()` calls | Inside raw `&mut KernelState` path | F |
+| Main dispatch `with_cpu` | `handle_trap_entry_shared` → `with_cpu(cpu, \|k\| ...)` | F (required) |
+
+**RISC-V (`src/arch/riscv64/trap.rs`)**
+
+No `current_tid` reads in the handler body. No conversion needed.
+
+**`src/arch/trap_entry.rs`**
+
+| Location | Description | Class |
+|----------|-------------|-------|
+| `scheduler_tick_now_split_read()` | Timer tick, rank 1 | C (Stage L4A) |
+| `record_fault_split_mut(fault)` | Fault bookkeeping, rank 8 | C (Stage 3B-E) |
+| Main dispatch `with_cpu` | `handle_trap_entry_shared` | F (required) |
+
+**Conclusion**: The only remaining global-lock acquisition in the arch trap
+dispatch path that was potentially convertible was the x86_64 shared-path fatal
+trap `with_cpu`.  All other remaining `with_cpu` calls require `&mut KernelState`
+(Class F) and must be kept.
+
+### 13.3 Fatal-trap `with_cpu` conversion
+
+**Before (Stage 4T+6, Class F)**:
+```rust
+let _ = shared.with_cpu(cpu, |k| {
+    log_decoded_fatal_trap(Some(k), vector, error_code, frame, fault_addr);
+});
+```
+This acquired the global `SharedKernel` lock solely to read `k.current_tid()` and
+`k.task_asid(current_tid)` for diagnostic logging — two read-only accesses inside a
+fatal error path that never returns.
+
+**Safety proof**: The fatal-trap logger only reads two fields:
+1. `k.current_tid()` — reads `scheduler_state.current_tid_on(current_cpu)` under the
+   scheduler lock (rank 1).
+2. `k.task_asid(current_tid)` — reads the TCB array under `task_state_lock` (rank 2).
+
+Both reads can be performed without the global lock by acquiring the subsystem locks
+directly. Since neither field is mutated, no write-order guarantee is needed.
+
+**Lock sequence for `fatal_trap_read_snapshot`**:
+1. Acquire scheduler lock (rank 1) → read `current_tid_on(cpu)` → release.
+2. If `current_tid != 0`: acquire task lock (rank 2) → scan TCBs for ASID → release.
+
+Lock ranks are strictly ascending (1 → 2); no lock inversion.
+
+**After (Stage 4T+7, Class E)**:
+```rust
+// Stage 4T+7: pre-read TID and ASID via split-read helpers (scheduler
+// lock rank 1, task lock rank 2) before logging. Avoids the global
+// SharedKernel lock in the fatal error path.
+let snapshot = shared.fatal_trap_read_snapshot(cpu);
+log_decoded_fatal_trap_from_snapshot(snapshot, vector, error_code, frame, fault_addr);
+```
+
+### 13.4 New infrastructure
+
+**`src/kernel/boot/orchestrator_state.rs`**:
+
+```rust
+pub(crate) unsafe fn task_asid_for_tid_from_raw(state: *const KernelState, tid: u64) -> u64
+```
+Acquires `task_state_lock` (rank 2) via `addr_of!`-derived raw pointer. Scans TCBs;
+returns `asid.0 as u64` or `0` if the task has no ASID binding.  Kept in
+`orchestrator_state.rs` (not `runtime.rs`) because `MAX_TASKS` and `ThreadControlBlock`
+are private to the `boot` module and accessible there via `use super::*`.
+
+**`src/runtime.rs`**:
+
+```rust
+pub struct FatalTrapReadSnapshot {
+    pub current_tid: u64,
+    pub current_asid: u64,
+}
+
+pub fn task_asid_for_tid_split_read(&self, tid: u64) -> u64
+// Acquires task_state_lock (rank 2) only via task_asid_for_tid_from_raw.
+
+pub fn fatal_trap_read_snapshot(&self, cpu: CpuId) -> FatalTrapReadSnapshot
+// Acquires scheduler lock (rank 1) then task lock (rank 2), in order, both transiently.
+```
+
+**`src/arch/x86_64/descriptor_tables.rs`**:
+
+```rust
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn log_decoded_fatal_trap_from_snapshot(
+    snapshot: crate::runtime::FatalTrapReadSnapshot,
+    vector: u64, error_code: u64, frame: &X86InterruptStackFrame, fault_addr: u64,
+)
+```
+Emits identical UART output to `log_decoded_fatal_trap(Some(k), ...)`.  Uses
+`snapshot.current_tid` and `snapshot.current_asid` instead of live reads through
+`&KernelState`.
+
+### 13.5 Classification update
+
+| Location | Method | Stage 4T+6 Class | Stage 4T+7 Class |
+|----------|--------|-----------------|-----------------|
+| `descriptor_tables.rs` (fatal-trap, shared path) | `with_cpu → log_decoded_fatal_trap(Some(k), ...)` | F (kept) | **E (converted)** |
+
+### 13.6 Complete split-read helper inventory (updated from §12.5)
+
+**Scheduler domain (rank 1):**
+- `scheduler_tick_now_split_read()` — timer tick read
+- `current_tid_split_read(cpu)` — per-CPU current TID read (live in x86_64 trap since Stage 4T+6)
+- `online_cpu_count_split_read()` — topology read
+- `present_cpu_count_split_read()` — topology read
+
+**Task domain (rank 2) — new in Stage 4T+7:**
+- `task_asid_for_tid_split_read(tid)` — look up bound ASID for a TID; returns 0 if unbound
+
+**Fault domain (rank 8):**
+- `last_fault_split_read()` — last recorded fault
+- `last_fault_frame_split_read()` — last fault trap frame
+- `fault_policy_split_read()` — global fault policy
+
+**Telemetry domain (rank 10):**
+- `tlb_shootdown_count_split_read()` — TLB shootdown counter
+- `tlb_shootdown_timeout_count_split_read()` — TLB timeout counter
+
+**Composite snapshot (ranks 1 + 2) — new in Stage 4T+7:**
+- `fatal_trap_read_snapshot(cpu)` → `FatalTrapReadSnapshot` — TID + ASID snapshot for fatal trap logging
+
+### 13.7 Tests
+
+Three new split-read correctness tests added (`runtime::tests`):
+
+| Test | Invariant |
+|------|-----------|
+| `fatal_trap_read_snapshot_tid_matches_split_read` | `snapshot.current_tid` equals `current_tid_split_read(cpu).unwrap_or(0)` after dispatch to task 73 |
+| `fatal_trap_read_snapshot_asid_matches_kernel_state_task_asid` | `snapshot.current_asid` equals `task_asid_for_tid_split_read(74)` equals `global_lock task_asid(74)`, all zero for a task without an ASID binding |
+| `fatal_trap_read_snapshot_offline_cpu_returns_zeros` | `fatal_trap_read_snapshot(CpuId(255))` returns `current_tid=0`, `current_asid=0` |
+
+Total: 554 → 557 / 0 failed.
+
+### 13.8 What Stage 4T+7 does NOT change
+
+- IPC syscall ABI and SYSCALL_COUNT: unchanged.
+- SpawnV5, MemoryObject zero-copy, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- x86_64 register writeback semantics: unchanged.
+- TrapFrame contents: unchanged.
+- Task switch behavior and scheduling decisions: unchanged.
+- AArch64 and RISC-V behavior: unchanged.
+- The main dispatch `with_cpu` call and all raw-fallback Class F paths: retained.
+- The global `SharedKernel` lock is still retained for all mutation paths.
+  **This is not Stage 3/global-lock removal.**

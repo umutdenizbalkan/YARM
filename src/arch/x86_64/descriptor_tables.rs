@@ -567,6 +567,57 @@ fn log_decoded_fatal_trap(
     debug_uart_putc(b'\n');
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn log_decoded_fatal_trap_from_snapshot(
+    snapshot: crate::runtime::FatalTrapReadSnapshot,
+    vector: u64,
+    error_code: u64,
+    frame: &X86InterruptStackFrame,
+    fault_addr: u64,
+) {
+    if FATAL_LOG_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        debug_uart_putc(b'!');
+        debug_uart_putc(b'F');
+        debug_uart_putc(b'R');
+        debug_uart_putc(b'\n');
+        halt_forever();
+    }
+    let mut active_cr3 = 0u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nostack, preserves_flags));
+    }
+    debug_uart_putc(b'!');
+    debug_uart_putc(b'F');
+    debug_uart_putc(b'v');
+    debug_uart_hex_u64(vector);
+    debug_uart_putc(b'e');
+    debug_uart_hex_u64(error_code);
+    debug_uart_putc(b'i');
+    debug_uart_hex_u64(frame.rip);
+    debug_uart_putc(b's');
+    debug_uart_hex_u64(frame.cs);
+    debug_uart_putc(b'f');
+    debug_uart_hex_u64(frame.rflags);
+    debug_uart_putc(b'p');
+    debug_uart_hex_u64(frame.rsp);
+    debug_uart_putc(b'S');
+    debug_uart_hex_u64(frame.ss);
+    debug_uart_putc(b'2');
+    debug_uart_hex_u64(fault_addr);
+    debug_uart_putc(b'3');
+    debug_uart_hex_u64(active_cr3);
+    debug_uart_putc(b't');
+    debug_uart_hex_u64(snapshot.current_tid);
+    debug_uart_putc(b'a');
+    debug_uart_hex_u64(snapshot.current_asid);
+    debug_uart_putc(b'c');
+    debug_uart_hex_u64(frame.cs & 0x3);
+    debug_uart_putc(b'\n');
+}
+
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 unsafe fn build_trap_frame_from_saved_regs(
     regs: *const X86SavedRegs,
@@ -839,9 +890,11 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
                 fault_rip,
                 err
             );
-            let _ = shared.with_cpu(cpu, |k| {
-                log_decoded_fatal_trap(Some(k), vector, error_code, frame, fault_addr);
-            });
+            // Stage 4T+7: pre-read TID and ASID via split-read helpers (scheduler
+            // lock rank 1, task lock rank 2) before logging. Avoids the global
+            // SharedKernel lock in the fatal error path.
+            let snapshot = shared.fatal_trap_read_snapshot(cpu);
+            log_decoded_fatal_trap_from_snapshot(snapshot, vector, error_code, frame, fault_addr);
             debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
             halt_forever();
         }

@@ -16,6 +16,18 @@ use crate::kernel::scheduler::CpuId;
 use crate::kernel::trap::{FaultInfo, Trap};
 use crate::kernel::trapframe::TrapFrame;
 
+/// Pre-read snapshot of diagnostic data for the fatal-trap log path.
+///
+/// Populated by `SharedKernel::fatal_trap_read_snapshot` using only sub-global
+/// split-read locks (scheduler rank 1, task rank 2). Used by the x86_64
+/// shared-kernel trap path to log fatal trap diagnostics without acquiring the
+/// global `SharedKernel` lock.
+#[derive(Debug, Clone, Copy)]
+pub struct FatalTrapReadSnapshot {
+    pub current_tid: u64,
+    pub current_asid: u64,
+}
+
 #[derive(Debug)]
 pub struct SharedKernel {
     state: SpinLock<KernelState>,
@@ -281,6 +293,32 @@ impl SharedKernel {
         self.with(|state| {
             state.control_plane_set_process_cnode_slots_via_syscall(target_pid, slot_capacity)
         })
+    }
+
+    pub fn task_asid_for_tid_split_read(&self, tid: u64) -> u64 {
+        // Stage 4T+7 split-read: acquires task_state_lock (rank 2) only.
+        // Does not acquire the outer SharedKernel lock. Does not mutate any state.
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by
+        // this SharedKernel. `task_asid_for_tid_from_raw` derives raw field pointers
+        // without creating a whole-KernelState reference; the task lock serializes
+        // access to the TCB array.
+        unsafe {
+            KernelState::task_asid_for_tid_from_raw(self.state.data_ptr() as *const _, tid)
+        }
+    }
+
+    pub fn fatal_trap_read_snapshot(&self, cpu: CpuId) -> FatalTrapReadSnapshot {
+        // Stage 4T+7 split-read: pre-read diagnostic data for the fatal-trap log.
+        // Acquires scheduler lock (rank 1) for current_tid, then task lock (rank 2)
+        // for ASID — each held transiently and released before the next is acquired.
+        // Does not acquire the outer SharedKernel lock.
+        let current_tid = self.current_tid_split_read(cpu).unwrap_or(0);
+        let current_asid = if current_tid != 0 {
+            self.task_asid_for_tid_split_read(current_tid)
+        } else {
+            0
+        };
+        FatalTrapReadSnapshot { current_tid, current_asid }
     }
 
     /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.
@@ -761,6 +799,80 @@ mod tests {
         assert_eq!(
             split, conservative,
             "split_read must match with_cpu for offline CPU"
+        );
+    }
+
+    // ── Stage 4T+7 fatal-trap snapshot split-read tests ──────────────────────
+
+    #[test]
+    fn fatal_trap_read_snapshot_tid_matches_split_read() {
+        // Proves that fatal_trap_read_snapshot.current_tid equals
+        // current_tid_split_read(cpu).unwrap_or(0) for the same cpu at the
+        // same scheduler state — validating the TID leg of Stage 4T+7.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+
+        kernel.with(|state| {
+            state.register_task(73).expect("task73");
+            state.enqueue_current_cpu(73).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+
+        let snapshot = kernel.fatal_trap_read_snapshot(cpu);
+        let expected_tid = kernel.current_tid_split_read(cpu).unwrap_or(0);
+        assert_eq!(
+            snapshot.current_tid, expected_tid,
+            "fatal_trap_read_snapshot.current_tid must equal current_tid_split_read"
+        );
+        assert_eq!(snapshot.current_tid, 73);
+    }
+
+    #[test]
+    fn fatal_trap_read_snapshot_asid_matches_kernel_state_task_asid() {
+        // Proves that fatal_trap_read_snapshot.current_asid equals
+        // task_asid_for_tid_split_read(current_tid) — both return 0 for a task
+        // without an ASID binding, validating the ASID leg of Stage 4T+7.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+
+        kernel.with(|state| {
+            state.register_task(74).expect("task74");
+            state.enqueue_current_cpu(74).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+
+        let snapshot = kernel.fatal_trap_read_snapshot(cpu);
+        let asid_via_split = kernel.task_asid_for_tid_split_read(74);
+        let asid_via_global = kernel.with(|state| state.task_asid(74).map(|a| a.0 as u64).unwrap_or(0));
+
+        assert_eq!(
+            snapshot.current_asid, asid_via_split,
+            "snapshot.current_asid must match task_asid_for_tid_split_read"
+        );
+        assert_eq!(
+            snapshot.current_asid, asid_via_global,
+            "snapshot.current_asid must match global-lock task_asid"
+        );
+        // No ASID was bound, so both should be 0.
+        assert_eq!(snapshot.current_asid, 0);
+    }
+
+    #[test]
+    fn fatal_trap_read_snapshot_offline_cpu_returns_zeros() {
+        // Proves that fatal_trap_read_snapshot for an offline CPU returns
+        // current_tid=0 and current_asid=0 — the safe zero-fill sentinel used
+        // by log_decoded_fatal_trap_from_snapshot when no task is running.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let offline_cpu = CpuId(255);
+
+        let snapshot = kernel.fatal_trap_read_snapshot(offline_cpu);
+        assert_eq!(
+            snapshot.current_tid, 0,
+            "offline CPU must produce current_tid=0 in fatal_trap_read_snapshot"
+        );
+        assert_eq!(
+            snapshot.current_asid, 0,
+            "offline CPU must produce current_asid=0 in fatal_trap_read_snapshot"
         );
     }
 }

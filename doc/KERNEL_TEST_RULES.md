@@ -456,3 +456,28 @@ task 81 and `exiting_tid == entering_tid`.
 must include a test that calls both `split_read` and the conservative
 `with_cpu → current_tid` path on the same scheduler state and asserts they produce
 the same value (Rule 16 pattern extended to arch-boundary callers).
+
+---
+
+## Rule 19 — Fatal-trap snapshot tests must cover TID, ASID, and offline-CPU cases
+
+When a `FatalTrapReadSnapshot` (or equivalent composite split-read snapshot) is
+introduced to replace a global-lock acquisition in a fatal error log path, the test
+suite must cover three invariants:
+
+1. **TID leg**: `snapshot.current_tid` must equal `current_tid_split_read(cpu).unwrap_or(0)`
+   on the same scheduler state after a task has been dispatched.  Assert the concrete
+   expected TID value.
+
+2. **ASID leg**: `snapshot.current_asid` must equal both `task_asid_for_tid_split_read(tid)`
+   and the global-lock `task_asid(tid).map(|a| a.0 as u64).unwrap_or(0)` for the same task.
+   If no ASID is bound, all three must be `0`.
+
+3. **Offline CPU**: `fatal_trap_read_snapshot(CpuId(N))` for an offline or nonexistent CPU
+   must return `current_tid = 0` and `current_asid = 0` — the safe zero-fill sentinel used
+   by the log function when no task is running.
+
+**Rationale**: The fatal-trap log path is a diagnostic-only, never-returns path.
+Incorrect values silently produce a misleading log; only tests can catch this.  The
+offline-CPU case exercises the `unwrap_or(0)` sentinel; the ASID case exercises the
+rank-2 task-lock path; the TID case exercises the rank-1 scheduler-lock path.
