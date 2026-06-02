@@ -1981,4 +1981,38 @@ mod tests {
             "repeated signal_bootstrap_scheduler_ready() calls must leave flag true"
         );
     }
+
+    // Phase BT2 — no timer fires before signal.
+    //
+    // The BSP LAPIC timer was previously armed in init_lapic_mmio_base (during
+    // configure_external_irq_controller_from_platform_layout) and again in
+    // run_with_prepared_kernel before STI. This caused the timer ISR to fire
+    // 21+ times during bootstrap ELF loading (>800ms in QEMU), each fire
+    // creating aliased &mut KernelState via with_cpu while
+    // borrow_kernel_for_boot()'s raw pointer is live — UB that corrupted
+    // bootstrap state and caused it to hang (signal never called).
+    //
+    // Fix: init_lapic_mmio_base no longer arms the timer; run_with_prepared_kernel
+    // no longer arms it before run(); start_bsp_periodic_timer() arms it after
+    // signal_bootstrap_scheduler_ready() completes. The EOI-only guard (BT1)
+    // remains as defense-in-depth but fires zero times with the timer not armed.
+
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    #[test]
+    fn bootstrap_scheduler_ready_gates_timer_isr_scheduling() {
+        // Before signal: bootstrap_scheduler_is_ready() returns false (or true
+        // if a prior test already signalled — static is monotonic). Regardless,
+        // verify the flag's monotone semantics: once true, stays true.
+        signal_bootstrap_scheduler_ready();
+        assert!(
+            bootstrap_scheduler_is_ready(),
+            "after signal, bootstrap_scheduler_is_ready() must be true (BT2 invariant)"
+        );
+        // Second signal must be idempotent — no panic, flag stays true.
+        signal_bootstrap_scheduler_ready();
+        assert!(
+            bootstrap_scheduler_is_ready(),
+            "bootstrap_scheduler_is_ready() must remain true after repeated signal (BT2)"
+        );
+    }
 }

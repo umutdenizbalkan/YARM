@@ -40,7 +40,10 @@ pub fn init_lapic_mmio_base(base: usize) {
         LAPIC_SVR_OFFSET,
         LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR,
     );
-    lapic_program_timer_deadline(base, super::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS);
+    // BT2: do NOT arm the LAPIC timer here. The timer is armed explicitly by
+    // start_bsp_periodic_timer() after signal_bootstrap_scheduler_ready(), so
+    // no timer ISR can race with borrow_kernel_for_boot()'s raw &mut alias
+    // during bootstrap ELF loading (which takes >800ms in QEMU).
     LAPIC_MMIO_BASE.store(base, Ordering::Relaxed);
     LAPIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
@@ -239,14 +242,16 @@ mod tests {
     }
 
     #[test]
-    fn init_lapic_programs_bootstrap_timer_deadline() {
+    fn init_lapic_does_not_arm_timer_before_signal() {
+        // BT2: init_lapic_mmio_base must NOT arm the LAPIC timer. The timer is
+        // armed explicitly after signal_bootstrap_scheduler_ready() to prevent
+        // ISR aliasing with borrow_kernel_for_boot() during bootstrap ELF load.
         let mut regs = [0u32; 512];
         init_lapic_mmio_base(regs.as_mut_ptr() as usize);
-        let expected = crate::arch::x86_64::platform_layout::BOOTSTRAP_TIMER_DEADLINE_TICKS
-            .clamp(1, u32::MAX as u64) as u32;
         assert_eq!(
             regs[LAPIC_TIMER_INITIAL_COUNT_OFFSET / core::mem::size_of::<u32>()],
-            expected
+            0,
+            "LAPIC timer must not be armed during init_lapic_mmio_base (BT2 invariant)"
         );
     }
 }
