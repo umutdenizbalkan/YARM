@@ -293,6 +293,87 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# Optional FAT userspace mount/config smoke markers.
+# Do not fail default core smoke profiles without a real FAT block image; set
+# FAT_SMOKE_EXPECTED=1 when the profile is expected to spawn and mount FAT.
+# ---------------------------------------------------------------------------
+if [[ -f "$LOGFILE" ]]; then
+  FAT_SMOKE_EXPECTED=${FAT_SMOKE_EXPECTED:-0}
+  FAT_MARKERS=(
+    INIT_FAT_SPAWN_BEGIN
+    INIT_FAT_SPAWN_OK
+    PM_IMAGE_ID_10_FAT_SRV
+    FAT_CONFIG_FOUND
+    FAT_BLOCK_BACKEND_STARTUP_CAP
+    FAT_MOUNT_READY
+    FAT_MOUNT_FAILED
+    VFS_MOUNT_REGISTER_FAT_OK
+  )
+  fat_seen=0
+  for marker in "${FAT_MARKERS[@]}"; do
+    count=$(log_count_pattern "$marker")
+    if [[ "$count" -gt 0 ]]; then
+      fat_seen=1
+    fi
+    echo "[info] FAT smoke marker count: ${marker}=${count}"
+  done
+  if [[ "$FAT_SMOKE_EXPECTED" == "1" && "$fat_seen" -eq 0 ]]; then
+    echo "[error] FAT smoke expected but no FAT markers were observed"
+    exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Optional RAMFS userspace mount/config smoke markers.
+# Do not fail default core smoke profiles; set RAMFS_SMOKE_EXPECTED=1 when the
+# profile is expected to spawn and mount RAMFS.
+# ---------------------------------------------------------------------------
+if [[ -f "$LOGFILE" ]]; then
+  RAMFS_SMOKE_EXPECTED=${RAMFS_SMOKE_EXPECTED:-0}
+  RAMFS_MARKERS=(
+    INIT_RAMFS_SPAWN_BEGIN
+    INIT_RAMFS_SPAWN_OK
+    PM_IMAGE_ID_11_RAMFS_SRV
+    RAMFS_CONFIG_FOUND
+    RAMFS_CONFIG_DEFAULT
+    RAMFS_MOUNT_READY
+    RAMFS_MOUNT_FAILED
+    VFS_MOUNT_REGISTER_RAMFS_OK
+  )
+  ramfs_seen=0
+  for marker in "${RAMFS_MARKERS[@]}"; do
+    count=$(log_count_pattern "$marker")
+    if [[ "$count" -gt 0 ]]; then
+      ramfs_seen=1
+    fi
+    echo "[info] RAMFS smoke marker count: ${marker}=${count}"
+  done
+  if [[ "$RAMFS_SMOKE_EXPECTED" == "1" ]]; then
+    if [[ "$ramfs_seen" -eq 0 ]]; then
+      echo "[error] RAMFS smoke expected but no RAMFS markers were observed"
+      exit 1
+    fi
+    RAMFS_REQUIRED_MARKERS=(
+      INIT_RAMFS_SPAWN_BEGIN
+      INIT_RAMFS_SPAWN_OK
+      PM_IMAGE_ID_11_RAMFS_SRV
+      RAMFS_MOUNT_READY
+      VFS_MOUNT_REGISTER_RAMFS_OK
+    )
+    for marker in "${RAMFS_REQUIRED_MARKERS[@]}"; do
+      if [[ "$(log_count_pattern "$marker")" -eq 0 ]]; then
+        echo "[error] RAMFS smoke expected marker missing: ${marker}"
+        exit 1
+      fi
+    done
+    if [[ "$(log_count_pattern RAMFS_CONFIG_FOUND)" -eq 0 && "$(log_count_pattern RAMFS_CONFIG_DEFAULT)" -eq 0 ]]; then
+      echo "[error] RAMFS smoke expected config marker missing"
+      exit 1
+    fi
+  fi
+fi
+
 echo "[warn] boot shell and init-server markers not detected (status=$QEMU_STATUS)"
 if [[ -f "$LOGFILE" ]]; then
   echo "[info] last 20 log lines from $LOGFILE"
