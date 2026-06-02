@@ -5272,3 +5272,200 @@ the same acceptance criteria as §22.1. The same markers apply:
 | `src/kernel/boot/tests.rs` | 6 Stage 6 tests added |
 | `doc/KERNEL_LOCKING.md` | This section (§23) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+13 added |
+
+## §24 Stage 6A: smoke acceptance record, remaining-path audit, and next-target gate
+
+### 24.1 Stage 6 x86_64 -smp 1 smoke acceptance
+
+Stage 6 commit `dbc60bb` was validated on x86_64 with `-smp 1` (single vCPU).
+All acceptance criteria passed:
+
+| Marker | Expected | Actual |
+|--------|----------|--------|
+| `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY` | 0 | 0 ✓ |
+| `X86_BOOTSTRAP_SCHEDULER_READY` | 1 | 1 ✓ |
+| `X86_BOOTSTRAP_TIMER_STARTED` | 1 | 1 ✓ |
+| `ENTER_USER` | ≥ 1 | 3 ✓ |
+| `STARTUP_INSTALL_FINAL` | ≥ 1 | 9 ✓ |
+| `PM_ELF_ZC_DONE` image_id 7/8/9 total | 3 | 3 ✓ |
+| ZC nonzero pages | 3 | 3 ✓ |
+| `PM_ELF_ZC_FAIL` | 0 | 0 ✓ |
+| `INITRAMFS_SRV_ENTRY` | 1 | 1 ✓ |
+| `DEVFS_SRV_ENTRY` | 1 | 1 ✓ |
+| `VFS_SRV_ENTRY` | 1 | 1 ✓ |
+| `DRIVER_MANAGER_READY` | 1 | 1 ✓ |
+| `BLKCACHE_SRV_READY` | 1 | 1 ✓ |
+| `VIRTIO_BLK_SRV_READY` | 1 | 1 ✓ |
+| fallback | 0 | 0 ✓ |
+| TID mismatch | 0 | 0 ✓ |
+| fatal-ish | 0 | 0 ✓ |
+| oom / capacity / Vm(Full) | 0 | 0 ✓ |
+
+**Stage 6 is accepted for x86_64 -smp 1.**
+
+### 24.2 AArch64 health note
+
+AArch64 was reported healthy after Stage 6. No AArch64-specific marker table is
+available for this stage. x86_64 SMP and AArch64 SMP remain deferred; the
+single-CPU smoke is the accepted validation boundary for all stages through
+Stage 6.
+
+### 24.3 Remaining current-ASID caller audit
+
+After Stage 6 the following callers of the current-ASID helpers remain in
+production code (`src/kernel/syscall.rs`). Test helper code (lines ≥ 3580) is
+excluded.
+
+#### 24.3.1 `unmap_user_page_in_current_asid` — 3 call sites
+
+| Location | Context | Ordering note |
+|----------|---------|---------------|
+| `map_shared_region_into_receiver` line 702 | Rollback on partial map failure in IPC recv shared-memory path | Reclaims before shootdown (pre-Stage-5E ordering) |
+| `handle_ipc_recv` line 1791 | Rollback when `register_active_transfer_mapping` fails in IPC recv | Reclaims before shootdown |
+| `handle_transfer_release` line 1959 | Forward unmap loop in `TransferRelease` syscall (syscall 4) | Reclaims before shootdown |
+
+All three retain the pre-Stage-5E ordering issue: `unmap_user_page_in_current_asid`
+calls `reclaim_memory_object_for_phys` **before** `request_live_asid_shootdown`.
+In single-CPU operation this is not observable (the local TLB is flushed by the
+page-table write before the frame is reused), but on multi-CPU it is unsafe
+until the two-phase conversion is applied.
+
+`unmap_user_page_in_current_asid` also reads the scheduler (rank 1) and task
+(rank 2) domains internally on every call, coupling the unmap loop to those
+domains inside the global lock.
+
+#### 24.3.2 `map_user_page_in_current_asid_with_caps` — 1 call site
+
+| Location | Context |
+|----------|---------|
+| `map_shared_region_into_receiver` line 695 | Forward map in IPC recv shared-memory path |
+
+Like its rollback partner, this resolves the current ASID internally on every
+call. Converting to `map_user_page_in_asid_with_caps` with a plan-first ASID
+eliminates the per-call scheduler/task reads.
+
+#### 24.3.3 `is_user_page_mapped_in_current_asid` — 1 call site
+
+| Location | Context |
+|----------|---------|
+| `check_stack_guard` line 1897 | Guard check used only by `handle_vm_map` (syscall 3) |
+
+**Note on ASID consistency**: `handle_vm_map` maps pages via `map_user_page_with_caps(aspace_map_cap,
+...)`, which resolves the target ASID from the `aspace_map_cap` capability object.
+`check_stack_guard` checks `is_user_page_mapped_in_current_asid`, which resolves
+the ASID from `current_tid()`. In practice these are the same ASID (a task
+only holds capabilities to its own address space), but the code paths diverge.
+The correct Stage-7 fix resolves the ASID from `aspace_map_cap` via the
+capability object and passes that ASID to the inline guard check — making the
+guard consistent with where the pages actually go. This is a documentation of
+a pre-existing subtle mismatch, not a runtime bug.
+
+#### 24.3.4 Summary table
+
+| Helper | Callers remaining | Ordering issue |
+|--------|-------------------|----------------|
+| `unmap_user_page_in_current_asid` | 3 | Reclaim before shootdown (unsafe on SMP) |
+| `map_user_page_in_current_asid_with_caps` | 1 | Per-call ASID re-resolution |
+| `is_user_page_mapped_in_current_asid` | 1 | Per-call ASID re-resolution (read-only; no ordering issue) |
+
+### 24.4 Next-target recommendation
+
+Candidates are ranked by conversion safety and independence from the hard
+invariants.
+
+#### Rank 1 — `handle_transfer_release` two-phase unmap (Stage 7)
+
+**Why**: `handle_transfer_release` (syscall 4 `TransferRelease`) has the
+cleanest profile for the next live conversion:
+
+- Already resolves `current_tid` plan-first at the top of the function.
+- The unmap loop is entirely analogous to `rollback_anon_map` (Stage 6) —
+  one page at a time, current-ASID, no mid-loop scheduler reads.
+- Two-phase conversion: plan-first ASID (`task_asid(current_tid)` once before
+  the loop), then `unmap_page_phase1` + `execute_tlb_shootdown_wait_plan` per
+  page.
+- Fixes the reclaim-before-shootdown ordering issue for this path.
+- Capability revoke (`revoke_capability_in_cnode`) and
+  `remove_active_transfer_mapping` happen **after** all unmaps — the existing
+  ordering is already correct and is preserved unchanged.
+- Does not touch VFS/syscall27/IPC recv/VFS_READ_SHARED_REPLY_ENABLED.
+- Observable behavior preserved: `TransferRelease` returns the same success/error
+  codes; unmapped range is the same; capability revoke is unchanged.
+
+Locking sequence (Stage 7 target):
+```
+task lock [plan-first ASID resolution, rank 2]
+  → release
+  → per page:
+      vm lock (phase1: remove PTE + note_mapping_removed)  [rank 5]
+        → release
+        → [if bitmap != 0] ipc lock (shootdown wait)       [rank 3 < rank 5 ok]
+        → memory lock (reclaim)                            [rank 6]
+  → capability lock (revoke_capability_in_cnode)           [rank 4]
+  → memory lock (remove_active_transfer_mapping/note_shared_mem_released)
+```
+
+Gate conditions:
+- Two-phase helpers (`unmap_page_phase1`, `execute_tlb_shootdown_wait_plan`) are
+  live (Stage 5E/5F).
+- Stage 6 acceptance: x86_64 -smp 1 passed (this stage, §24.1).
+- Tests: add Stage 7 transfer-release two-phase tests before converting.
+- x86_64 -smp 1 smoke required after Stage 7.
+
+#### Rank 2 — `handle_vm_map` explicit-ASID guard (Stage 7 companion)
+
+Inline the `check_stack_guard` call in `handle_vm_map` with an explicit-ASID
+check, resolving the ASID from the `aspace_map_cap` capability object rather
+than from `current_tid`. This:
+- Eliminates the last live caller of `is_user_page_mapped_in_current_asid`.
+- Makes the guard check consistent with the map target ASID.
+- Is surgical and read-only (no unmap/reclaim, no ordering issue).
+- Prerequisite: add a helper or inline the capability→ASID extraction.
+
+This is lower-priority than Rank 1 because `is_user_page_mapped_in_current_asid`
+has no multi-CPU ordering issue (it is read-only). It is a cleanup/consistency
+fix, not a safety-critical correction. It can be done in the same stage as
+Rank 1 or separately.
+
+#### Rank 3 — `map_shared_region_into_receiver` + IPC recv rollback (Stage 7+)
+
+The IPC recv shared-memory path (`map_shared_region_into_receiver` and its
+rollback at line 1791) is the most complex remaining current-ASID caller. It
+sits inside `handle_ipc_recv`, which implements IPC recv-v2. The invariant
+"Preserve IPC recv-v2, reply-cap, transfer-envelope" means behavioral
+preservation is mandatory; this path can be converted but requires careful
+recv-v2 regression coverage and is higher-risk than Ranks 1 and 2.
+
+#### Rank 4 — `VmAnonMapProgressPlan` live wiring (deferred)
+
+Explicitly deferred per §23.6. Not gated by Stage 6A.
+
+#### Rank 5 — Capability revoke in `rollback_anon_map` (deferred)
+
+Explicitly deferred per §23.6. Not gated by Stage 6A.
+
+### 24.5 Stage 7 gate conditions
+
+Stage 7 (`handle_transfer_release` two-phase conversion) is gated on:
+
+1. ✓ Stage 6 x86_64 -smp 1 smoke passed (this stage, §24.1).
+2. ✓ 620 tests pass on `claude/ecstatic-feynman-9ZZwC` (Stage 6 commit
+   `dbc60bb`).
+3. Stage 7 must add `handle_transfer_release` two-phase tests before the live
+   conversion (minimum: single-page release removes page + revokes cap; absent
+   page handling if applicable; two-phase fast-path in single-CPU).
+4. Stage 7 must pass all 620+ tests after conversion.
+5. Stage 7 requires x86_64 -smp 1 smoke before acceptance.
+
+### 24.6 Still deferred (unchanged)
+
+- `VmAnonMapProgressPlan` live wiring.
+- Capability revoke on `rollback_anon_map`.
+- x86_64 SMP smoke.
+- `map_shared_region_into_receiver` two-phase conversion (Rank 3, after Stage 7).
+
+### 24.7 Files changed (Stage 6A)
+
+| File | Change |
+|------|--------|
+| `doc/KERNEL_LOCKING.md` | This section (§24): smoke acceptance record, remaining-path audit, next-target recommendation, Stage 7 gate conditions |
