@@ -5469,3 +5469,152 @@ Stage 7 (`handle_transfer_release` two-phase conversion) is gated on:
 | File | Change |
 |------|--------|
 | `doc/KERNEL_LOCKING.md` | This section (§24): smoke acceptance record, remaining-path audit, next-target recommendation, Stage 7 gate conditions |
+
+---
+
+## §25 — Stage 7: Large coherent pass — remaining current-ASID syscall.rs domain
+
+**Commit:** `claude/ecstatic-feynman-9ZZwC` (Stage 7)
+**Tests:** 629 total (620 from Stage 6 + 9 new Stage 7 tests)
+**Prerequisites:** Stage 6A acceptance (§24), 620-test baseline, Stage 6 x86_64 -smp 1 smoke.
+
+### 25.1 Scope
+
+Stage 7 owns the entire remaining current-ASID caller set inside `syscall.rs`
+that was audited in §24.3. Three live conversions and one dead-code cleanup:
+
+| Target | Conversion | Risk |
+|--------|-----------|------|
+| `handle_transfer_release` unmap loop | `unmap_user_page_in_current_asid` → two-phase | SMP reclaim ordering |
+| `map_shared_region_into_receiver` rollback (2 sites) | `unmap_user_page_in_current_asid` → two-phase | rollback correctness |
+| `handle_vm_map` stack-guard check | `is_user_page_mapped_in_current_asid` → explicit-ASID | ASID consistency |
+| `check_stack_guard` helper | deleted (dead after guard inlined in `handle_vm_map`) | — |
+
+The IPC recv forward-map site (`map_user_page_in_current_asid_with_caps` in
+`try_handle_demand_page_fault`) is **deferred** (Class D) — it lives in
+`fault_state.rs`, is guarded by the "preserve COW/fork/demand-paging" hard
+invariant, and already has `asid` in scope from line 98 for a future stage.
+
+### 25.2 `handle_transfer_release` — two-phase unmap
+
+**Before (unsafe on SMP):**
+```rust
+match kernel.unmap_user_page_in_current_asid(VirtAddr(va as u64)) {
+    None    => return Err(SyscallError::InvalidArgs),
+    Some(_) => { va += PAGE_SIZE; }
+}
+```
+`unmap_user_page_in_current_asid` calls `reclaim_memory_object_for_phys` before
+`request_live_asid_shootdown`, violating the reclaim-after-shootdown ordering.
+
+**After (Stage 7):**
+```rust
+// plan-first ASID resolution
+let asid = kernel.task_asid(owner.0).ok_or(...)?;
+while va < end {
+    let plan = kernel.unmap_page_phase1(asid, VirtAddr(va as u64))
+        .map_err(SyscallError::from)?;
+    let Some(plan) = plan else { return Err(SyscallError::InvalidArgs); };
+    kernel.execute_tlb_shootdown_wait_plan(plan).map_err(SyscallError::from)?;
+    va += PAGE_SIZE;
+}
+```
+
+`Ok(None)` from `unmap_page_phase1` is mapped to `InvalidArgs` exactly as
+before — absent-page behavior is preserved.
+
+Locking sequence per page:
+1. Acquire global lock (held throughout).
+2. Phase 1: PTE removal + `note_mapping_removed` (vm rank 5, memory rank 6).
+3. Phase 2: `execute_tlb_shootdown_wait_plan` — TLB shootdown wait (ipc rank 3)
+   then `reclaim_memory_object_for_phys` (memory rank 6). Reclaim occurs after
+   all CPUs have acknowledged the shootdown. SMP-safe.
+
+### 25.3 `map_shared_region_into_receiver` — plan-first ASID + two-phase rollback
+
+**Before:** Both rollback sites used `unmap_user_page_in_current_asid` (unsafe
+reclaim ordering). ASID was resolved implicitly from `current_asid()` on each
+call.
+
+**After:**
+```rust
+let asid = kernel.task_asid(tid).ok_or(...)?;   // plan-first, once
+while va < end {
+    if let Err(err) = kernel.map_user_page_in_asid_with_caps(asid, ...) {
+        // two-phase rollback
+        let mut rollback = requested_va;
+        while rollback < va {
+            if let Ok(Some(plan)) = kernel.unmap_page_phase1(asid, VirtAddr(rollback as u64)) {
+                let _ = kernel.execute_tlb_shootdown_wait_plan(plan);
+            }
+            rollback += PAGE_SIZE;
+        }
+        return Err(SyscallError::from(err));
+    }
+    va += PAGE_SIZE;
+}
+```
+
+The IPC recv `register_active_transfer_mapping` rollback site follows the same
+pattern: `receiver_asid` captured before the `.map_err` closure (Asid is Copy),
+rollback loop uses `unmap_page_phase1` + `execute_tlb_shootdown_wait_plan`.
+
+### 25.4 `handle_vm_map` — explicit-ASID guard + `check_stack_guard` deletion
+
+**Inconsistency corrected:** Before Stage 7, `check_stack_guard` used
+`is_user_page_mapped_in_current_asid` (current-task ASID), while the map loop
+called `map_user_page_with_caps` using the capability ASID. If the capability
+referred to a different address space, the guard fired against the wrong ASID.
+
+**Fix:** ASID extracted from `aspace_map_cap` capability before the guard check:
+```rust
+let map_asid = {
+    let cap = kernel.capability_service()
+        .resolve_current_task_capability(aspace_map_cap)
+        .ok_or(...)?;
+    match cap.object {
+        CapObject::AddressSpace { asid } => Asid(asid),
+        _ => return Err(...),
+    }
+};
+// guard uses map_asid, same ASID as the map loop
+if flags.write && !flags.execute
+    && let Some(guard_page) = addr.checked_sub(PAGE_SIZE)
+    && kernel.is_user_page_mapped_in_asid(map_asid, VirtAddr(guard_page as u64))
+           .map_err(SyscallError::from)?
+{
+    return Err(SyscallError::InvalidArgs);
+}
+```
+
+`check_stack_guard` (private, 20-line helper) is deleted — logic fully inlined.
+`is_user_page_mapped_in_current_asid` gains
+`#[cfg_attr(not(test), allow(dead_code))]` (still referenced in test module).
+
+### 25.5 Dead-code cleanup
+
+| Helper | Status after Stage 7 |
+|--------|---------------------|
+| `unmap_user_page_in_current_asid` | test-only; `#[cfg_attr(not(test), allow(dead_code))]` added |
+| `is_user_page_mapped_in_current_asid` | test-only; `#[cfg_attr(not(test), allow(dead_code))]` added |
+| `check_stack_guard` | deleted (no test or production caller) |
+
+Pre-existing warning on `stash_bound_receiver_tid` (2 occurrences) unchanged.
+
+### 25.6 Still deferred (unchanged from §24.6)
+
+- `VmAnonMapProgressPlan` live wiring.
+- Capability revoke on `rollback_anon_map`.
+- `map_user_page_in_current_asid_with_caps` in `try_handle_demand_page_fault`
+  (`fault_state.rs:120`) — demand paging path, hard invariant.
+- x86_64 SMP smoke (required before Stage 7 acceptance; noted for operator).
+
+### 25.7 Files changed (Stage 7)
+
+| File | Change |
+|------|--------|
+| `src/kernel/syscall.rs` | `handle_transfer_release` two-phase; `map_shared_region_into_receiver` plan-first ASID + two-phase rollback; IPC recv rollback two-phase; `handle_vm_map` explicit-ASID guard; `check_stack_guard` deleted |
+| `src/kernel/boot/memory_state.rs` | `#[cfg_attr(not(test), allow(dead_code))]` on `unmap_user_page_in_current_asid` and `is_user_page_mapped_in_current_asid` |
+| `src/kernel/boot/tests.rs` | 9 new Stage 7 tests (transfer-release two-phase, vm_map guard, map_shared_region rollback) |
+| `doc/KERNEL_LOCKING.md` | This section (§25) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+14 (Stage 7 test rules) |

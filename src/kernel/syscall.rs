@@ -691,15 +691,28 @@ fn map_shared_region_into_receiver(
     let end = requested_va
         .checked_add(mapped_len)
         .ok_or(SyscallError::InvalidArgs)?;
+    // Stage 7: resolve ASID once plan-first (rank-2 task read before vm/memory mutation).
+    // The caller (handle_ipc_recv_result_with_empty_error) already confirmed
+    // current_task_has_user_asid, so task_asid returns Some here.
+    let tid = kernel.current_tid().ok_or(SyscallError::Internal)?;
+    let asid = kernel
+        .task_asid(tid)
+        .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
     while va < end {
-        if let Err(err) = kernel.map_user_page_in_current_asid_with_caps(
+        if let Err(err) = kernel.map_user_page_in_asid_with_caps(
+            asid,
             receiver_mem_cap,
             VirtAddr(va as u64),
             map_flags,
         ) {
+            // Stage 7: two-phase rollback — reclaim only after shootdown wait/fast path.
             let mut rollback = requested_va;
             while rollback < va {
-                let _ = kernel.unmap_user_page_in_current_asid(VirtAddr(rollback as u64));
+                if let Ok(Some(plan)) =
+                    kernel.unmap_page_phase1(asid, VirtAddr(rollback as u64))
+                {
+                    let _ = kernel.execute_tlb_shootdown_wait_plan(plan);
+                }
                 rollback += PAGE_SIZE;
             }
             return Err(SyscallError::from(err));
@@ -1776,6 +1789,12 @@ fn handle_ipc_recv_result_with_empty_error(
                             return Err(err);
                         }
                     };
+                    // Stage 7: plan-first ASID for the register_active_transfer_mapping
+                    // rollback below. current_task_has_user_asid (checked above) guarantees
+                    // task_asid returns Some. Captured by the map_err closure as Copy.
+                    let receiver_asid = kernel
+                        .task_asid(receiver_tid)
+                        .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
                     kernel
                         .register_active_transfer_mapping(
                             crate::kernel::ipc::ThreadId(receiver_tid),
@@ -1784,11 +1803,15 @@ fn handle_ipc_recv_result_with_empty_error(
                             mapped_len,
                         )
                         .map_err(|e| {
+                            // Stage 7: two-phase rollback — reclaim only after shootdown.
                             let mut rollback = mapped_va;
                             let end = mapped_va.saturating_add(mapped_len);
                             while rollback < end {
-                                let _ = kernel
-                                    .unmap_user_page_in_current_asid(VirtAddr(rollback as u64));
+                                if let Ok(Some(plan)) = kernel
+                                    .unmap_page_phase1(receiver_asid, VirtAddr(rollback as u64))
+                                {
+                                    let _ = kernel.execute_tlb_shootdown_wait_plan(plan);
+                                }
                                 rollback += PAGE_SIZE;
                             }
                             revoke_current_transfer_cap_best_effort(kernel, transfer_cap);
@@ -1880,36 +1903,37 @@ fn validate_anon_map_args(
     Ok((map_len, end, flags))
 }
 
-/// Checks the writable non-executable stack guard-page invariant.
-/// Shared by VmMap and VmAnonMap to prevent silent stack-overflow corruption.
-fn check_stack_guard(
-    kernel: &KernelState,
-    addr: usize,
-    flags: PageFlags,
-) -> Result<(), SyscallError> {
-    // Reserve one unmapped page immediately below writable non-executable
-    // mappings so downward-growing task stacks fault deterministically on
-    // overflow instead of silently corrupting adjacent pages.
-    if flags.write
-        && !flags.execute
-        && let Some(guard_page) = addr.checked_sub(PAGE_SIZE)
-        && kernel
-            .is_user_page_mapped_in_current_asid(VirtAddr(guard_page as u64))
-            .map_err(SyscallError::from)?
-    {
-        return Err(SyscallError::InvalidArgs);
-    }
-    Ok(())
-}
-
 fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let aspace_map_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let addr = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
     let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
     let (map_len, end, flags) = validate_anon_map_args(addr, len, prot)?;
-    check_stack_guard(kernel, addr, flags)?;
-
+    // Stage 7: extract ASID from aspace_map_cap (the capability target) so that the
+    // stack guard check looks at the same address space as the map loop. The old
+    // check_stack_guard used is_user_page_mapped_in_current_asid, which would differ
+    // from the map target if aspace_map_cap refers to a different address space.
+    let map_asid = {
+        let cap = kernel
+            .capability_service()
+            .resolve_current_task_capability(aspace_map_cap)
+            .ok_or(SyscallError::from(KernelError::InvalidCapability))?;
+        match cap.object {
+            CapObject::AddressSpace { asid } => Asid(asid),
+            _ => return Err(SyscallError::from(KernelError::WrongObject)),
+        }
+    };
+    // Explicit-ASID guard check (same condition as check_stack_guard / handle_vm_anon_map):
+    // reject write-only mappings when the page immediately below addr is already mapped.
+    if flags.write
+        && !flags.execute
+        && let Some(guard_page) = addr.checked_sub(PAGE_SIZE)
+        && kernel
+            .is_user_page_mapped_in_asid(map_asid, VirtAddr(guard_page as u64))
+            .map_err(SyscallError::from)?
+    {
+        return Err(SyscallError::InvalidArgs);
+    }
     // NOTE: partial-failure — if alloc or map fails mid-range, pages already
     // mapped at [addr, va) remain mapped with no rollback. Physical frames and
     // cap slots are reclaimed when the task exits.
@@ -1953,14 +1977,25 @@ fn handle_transfer_release(
         }
     };
     let end = base.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
+    // Stage 7: plan-first ASID resolution before the two-phase unmap loop
+    // (rank-2 task read before vm/memory mutation in loop body).
+    // current_task_has_user_asid (checked above) guarantees task_asid returns Some.
+    let asid = kernel
+        .task_asid(owner.0)
+        .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
     let mut va = base;
     while va < end {
-        let unmapped = kernel
-            .unmap_user_page_in_current_asid(VirtAddr(va as u64))
+        // Stage 7: two-phase unmap — reclaim only after shootdown wait/fast path.
+        // Ok(None) means the page was never mapped; preserve old InvalidArgs behavior.
+        let plan = kernel
+            .unmap_page_phase1(asid, VirtAddr(va as u64))
             .map_err(SyscallError::from)?;
-        if unmapped.is_none() {
+        let Some(plan) = plan else {
             return Err(SyscallError::InvalidArgs);
-        }
+        };
+        kernel
+            .execute_tlb_shootdown_wait_plan(plan)
+            .map_err(SyscallError::from)?;
         va += PAGE_SIZE;
     }
 
