@@ -816,3 +816,92 @@ live-converted to plan-first unless all three blockers from §18.2 of
 Stage 5C status is: helpers-only, scaffolding only, no live conversion.
 
 ---
+
+## Rule N+9 — Stage 5D: TLB shootdown plan, rollback progress, and VmBrk lazy-unmap rules
+
+### N+9.1 — TlbShootdownRequestPlan tests must use the compute helper, not internal fields
+
+Tests that verify TLB shootdown targeting must call
+`state.compute_tlb_shootdown_request_plan(asid, virt)` and assert on the returned
+`TlbShootdownRequestPlan` struct. Do not read `live_cpu_bitmap_for_asid` directly —
+it is private and the plan helper is the intended test surface.
+
+Required assertions:
+- `plan.asid` equals the requested ASID.
+- `plan.virt` equals the requested virtual address.
+- `plan.target_cpu_bitmap == 0` in hosted-dev (single-CPU, no remote targets).
+
+### N+9.2 — Zero-target assertions must be separated by ASID binding state
+
+Two cases produce `target_cpu_bitmap == 0` for different reasons:
+1. **Bound ASID, single CPU**: the only CPU running the ASID is the requester.
+2. **Unbound ASID**: no CPU is running the ASID at all.
+
+Both must be tested separately because they exercise different branches of
+`live_cpu_bitmap_for_asid`.
+
+### N+9.3 — VmPageMapProgress rollback scope must be tested directly
+
+A test for `VmPageMapProgress` must explicitly verify the invariant:
+> Rollback covers `[base_addr, mapped_end)` only, not `[base_addr, end_addr)`.
+
+Pattern:
+1. Map N pages where N < total range.
+2. Simulate rollback of M < N pages by explicitly unmapping `[base_addr, base_addr + M*PAGE_SIZE)`.
+3. Assert pages in `[base_addr + M*PAGE_SIZE, base_addr + N*PAGE_SIZE)` are still mapped.
+4. Assert pages in `[base_addr + N*PAGE_SIZE, end_addr)` were never mapped and remain absent.
+
+Do NOT call `rollback_anon_map` directly — it is `fn` (private). Test the rollback mechanism via
+the explicit-ASID `unmap_user_page_in_asid` helper in a controlled loop.
+
+### N+9.4 — VmPageMapProgress empty-progress must be a unit test
+
+The initial state `VmPageMapProgress { base_addr: X, mapped_end: X, end_addr: Y }` (empty
+rollback range) must have a dedicated struct unit test that verifies `mapped_end == base_addr` and
+computes `end_addr - base_addr` to confirm the total range is correct. This is a fast, lock-free
+test that does not need thread spawn or ASID setup.
+
+### N+9.5 — VmBrk lazy-unmap tests must drive the syscall via TrapFrame
+
+Tests that verify `VmBrk` shrink over lazy (never-faulted) pages must use a
+real `TrapFrame` + `handle_trap(Trap::Syscall, ...)` rather than calling
+`set_task_brk_bounds` and `unmap_user_page_in_current_asid` separately. The
+goal is to verify the whole plan-first path: leader check → brk query → unmap
+loop with Ok(None) tolerance → `set_task_brk_bounds`.
+
+Frame layout for VM_BRK:
+```rust
+TrapFrame::new(
+    crate::kernel::syscall::Syscall::VmBrk as usize,
+    [requested_end, 0, 0, 0, 0, 0],  // arg0 = SYSCALL_ARG_CAP = requested
+)
+```
+
+Required setup: task 0 must be a group leader (which Bootstrap::init() guarantees)
+and must have brk bounds initialized via `state.set_task_brk_bounds(0, base, end)`.
+
+### N+9.6 — VmBrk shrink with mixed mapped+lazy pages must be tested
+
+A test must map only a subset of pages in the brk range (simulating partial demand paging),
+then issue a VmBrk shrink over the full range. The shrink must succeed, and all pages in the
+range (mapped and lazy) must be absent after the shrink.
+
+This verifies that the unmap loop correctly handles the `Ok(None)` return from
+`unmap_user_page_in_current_asid` for lazy pages without aborting the loop.
+
+### N+9.7 — Do not add TLB live-conversion tests without x86_64 smoke
+
+No test may assert that a TLB shootdown happens at a different lock rank order than
+the current implementation (ipc rank 3 acquired after vm rank 5 and memory rank 6)
+unless x86_64 SMP smoke has been approved and the rank inversion is resolved.
+
+Tests may assert:
+- The target bitmap is 0 (no shootdown needed) — always safe.
+- Unmap succeeds (relies on current implementation's correctness) — always safe.
+- The plan struct captures the correct fields — always safe.
+
+Tests must NOT assert:
+- That ipc(3) is acquired before vm(5) during unmap — this is false in the current implementation.
+- That a single shootdown is fired for multiple pages — batch shootdown is not implemented.
+
+---

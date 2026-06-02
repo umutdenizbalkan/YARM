@@ -4407,3 +4407,188 @@ Returns the `KernelState` and the `Asid` bound to task 0, whereas the existing `
 | `src/kernel/boot/tests.rs` | Added `setup_task0_with_known_asid()` helper and 5 new Stage 5C tests |
 | `doc/KERNEL_LOCKING.md` | This section (Section 18) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+8 added |
+
+## 19. Stage 5D — TLB shootdown / rollback-domain audit and plan scaffolding
+
+Stage 5D performs a comprehensive audit of every TLB shootdown and cross-CPU work path, classifies each one by type, designs scaffolding plan types that make the rollback/progress state explicit, adds a target-bitmap compute helper, and adds tests for the new invariants. No live conversion of VmAnonMap is performed — Stage 5C blockers #1 and #3 remain.
+
+**Additional fix:** Stage 5D also corrects a `_kernel` → `kernel` regression in `handle_vm_brk` that was introduced by the `32687af` merge-from-main commit. The variable was used at lines 3170 and 3183 (shrink unmap loop and `set_task_brk_bounds` call).
+
+### 19.1 Full TLB / cross-CPU shootdown path audit
+
+Every TLB-relevant function, classified by type (A–I):
+
+| Class | Meaning |
+|-------|---------|
+| A | Pure TLB request record (compute only, no mutation) |
+| B | Cross-CPU work enqueue |
+| C | IPC-coupled notification |
+| D | Busy-wait / timeout |
+| E | VM mutation coupled |
+| F | Memory / frame rollback coupled |
+| G | Scheduler / timer coupled |
+| H | Safe plan-first candidate |
+| I | Unsafe / defer |
+
+| Function | File:Line | Classes | Notes |
+|----------|-----------|---------|-------|
+| `live_cpu_bitmap_for_asid` | memory_state.rs:126 | A, H | Reads scheduler(1)+task(2) only; no mutation. Safe to snapshot before any domain lock. |
+| `begin_live_tlb_shootdown_wait` | memory_state.rs:12 | C, D | Acquires ipc(3). Called inside vm(5)+memory(6) context → rank inversion. |
+| `clear_live_tlb_shootdown_wait` | memory_state.rs:38 | C | Releases active shootdown state under ipc(3). |
+| `live_tlb_shootdown_pending` | memory_state.rs:29 | D | Reads ipc(3). Polled in busy-wait loop. |
+| `request_live_asid_shootdown` | memory_state.rs:146 | B,C,D,G | Full shootdown sequence: compute targets → ipc(3) wait → work enqueue → busy-wait spin → yield. Rank inversion: ipc(3) acquired after memory(6). |
+| `rollback_anon_map` | syscall.rs:3091 | E,F,I | Calls unmap per page → per-page shootdown. Per-page busy-wait in rollback is the primary cost. Blocker #1. |
+| VmBrk shrink unmap loop | syscall.rs:3161 | E,F,I | Per-page shootdown for each shrink page. Same rank-inversion concern as rollback. |
+| `unmap_user_page_in_current_asid` | memory_state.rs:690 | E,F,I | Unmaps page, calls `request_live_asid_shootdown`. Lock sequence: vm(5)→memory(6)→ipc(3). |
+| `unmap_user_page_in_asid` | memory_state.rs:805 | E,F,H | Explicit-ASID unmap (Stage 5C). Same as above but no scheduler/task re-read. |
+| `destroy_user_address_space_by_asid` | memory_state.rs:200 | B,E | Fire-and-forget: destroys ASID, enqueues TlbShootdown work item per CPU with `requester: None`. No busy-wait. Safe for plan-first. |
+| `submit_cross_cpu_work` | scheduler_state.rs:315 | B,C | Enqueues WorkItem into SmpMailbox under ipc(3). |
+| `acknowledge_shootdown` | vm.rs:751 | A,H | Clears CPU bit from retired ASID bitmap under vm(5). Called from TlbShootdown handler. |
+| `tick_retired_shootdowns` | vm.rs:783 | G | Increments age ticks; always returns 0 (timeout escalation not triggered). |
+| `retired_entry` | vm.rs:771 | A | Read-only query of retired ASID set under vm(5). |
+| `any_mapping_for_phys` | vm.rs:793 | A | Read-only: checks live address spaces for phys mapping. |
+| `destroy_and_collect_mappings` | vm.rs:716 | E,B | Removes ASID entry, moves to retired if `pending_cpu_bitmap != 0`. |
+| `protect_user_page` | memory_state.rs:827 | E | VM mutation (flags only). **No TLB shootdown needed** — same phys, only permissions changed; hardware handles via page-table update. |
+| `escalate_tlb_shootdown_timeout` | scheduler_state.rs:333 | G,C | Sends supervisor endpoint message. Currently unreachable (`tick_retired_shootdowns` always returns 0). |
+
+### 19.2 Rank inversion in the unmap path
+
+The documented rank inversion exists at three call sites:
+
+```
+unmap_user_page_in_current_asid (memory_state.rs:690):
+  vm_state_lock (5) → [unmap page table entry]
+  memory_state_lock (6) → [note_mapping_removed, reclaim]
+  ipc_state_lock (3) → [begin_live_tlb_shootdown_wait]    ← rank 3 acquired after 5+6
+
+unmap_user_page_in_asid (memory_state.rs:822):
+  vm_state_lock (5) → [unmap page table entry]
+  memory_state_lock (6) → [clear_cow_page, note_mapping_removed, reclaim]
+  ipc_state_lock (3) → [begin_live_tlb_shootdown_wait]    ← same inversion
+
+unmap_user_page (memory_state.rs:800):
+  capability_state_lock (4) → [resolve cap to ASID]
+  vm_state_lock (5) → [unmap page table entry]
+  memory_state_lock (6) → [note_mapping_removed, reclaim]
+  ipc_state_lock (3) → [begin_live_tlb_shootdown_wait]    ← same inversion
+```
+
+This inversion is intentional and safe as long as the global `SharedKernel` lock is held: all three lock closures (`vm`, `memory`, `ipc`) are acquired and released sequentially, never simultaneously. There is no actual deadlock risk under the global lock because only one thread of execution is active at a time. **The inversion becomes a real risk only if the global lock is removed**, which is why full global-lock removal requires explicit approval.
+
+The comment at memory_state.rs:158–160 records the safety invariant:
+> "mapping removal completes BEFORE we publish shootdown work items, so remote CPUs can only ACK after invalidating post-unmap state."
+
+### 19.3 TLB shootdown fast path
+
+`request_live_asid_shootdown` returns immediately without touching the ipc lock when `targets == 0` (line 154):
+
+```rust
+let targets = self.live_cpu_bitmap_for_asid(asid) & !requester_bit;
+if targets == 0 {
+    return Ok(());
+}
+```
+
+This covers:
+- Single-CPU systems (always fast path)
+- ASIDs private to the requester CPU (no other CPU has this task active)
+
+`compute_tlb_shootdown_request_plan` (Stage 5D, memory_state.rs) pre-computes this bitmap before any domain lock is acquired, making the fast-path determination explicit in the plan.
+
+### 19.4 Rollback progress model (blocker #2 resolution)
+
+Stage 5C blocker #2 was: "The per-page loop variable `va` is not captured in any plan struct." Stage 5D resolves this by introducing `VmPageMapProgress`:
+
+```rust
+pub(crate) struct VmPageMapProgress {
+    pub(crate) base_addr: usize,  // page-aligned start
+    pub(crate) mapped_end: usize, // exclusive upper bound of mapped pages
+    pub(crate) end_addr: usize,   // page-aligned end of requested range
+}
+```
+
+Invariant: `base_addr ≤ mapped_end ≤ end_addr`; all are multiples of PAGE_SIZE.
+Rollback must unmap `[base_addr, mapped_end)` only — never `[base_addr, end_addr)`.
+
+This makes the rollback scope explicit at the type level, preventing the old off-by-one risk where a bare `va` variable could be misread as "all pages up to end" rather than "all pages actually mapped."
+
+With `VmPageMapProgress`, the planned VmAnonMap handler loop body would be:
+```
+for each page at progress.mapped_end:
+    alloc_anonymous_memory_object()       → memory(6)
+    map_user_page_in_asid_with_caps(...)  → cap(4) + vm(5)
+    progress.mapped_end += PAGE_SIZE      ← advance AFTER successful map
+on error:
+    for va in progress.base_addr..progress.mapped_end step PAGE_SIZE:
+        unmap_user_page_in_asid(plan.asid, va) → vm(5) [+ ipc(3) if targets ≠ 0]
+```
+
+### 19.5 New plan types (Stage 5D)
+
+All added to `src/kernel/boot/mod.rs`:
+
+| Struct | Purpose | Lock-domain reads |
+|--------|---------|-------------------|
+| `TlbShootdownRequestPlan` | Computed target bitmap for one unmap shootdown | scheduler(1) + task(2) |
+| `VmPageMapProgress` | Explicit per-page rollback scope | None (pure data) |
+| `VmAnonMapProgressPlan` | VmAnonMapPlan + VmPageMapProgress | (captures prior reads) |
+
+All carry `#[cfg_attr(not(test), allow(dead_code))]` since they are scaffolding only.
+
+New helper added to `src/kernel/boot/memory_state.rs`:
+
+| Function | Purpose | Lock-domain |
+|----------|---------|-------------|
+| `compute_tlb_shootdown_request_plan(asid, virt)` | Snapshot target bitmap before vm/ipc lock | scheduler(1)+task(2) read, no mutation |
+
+### 19.6 Live conversion decisions
+
+| Path | Decision | Reason |
+|------|----------|--------|
+| `handle_vm_anon_map` full decomposition | **Deferred** | Blockers #1 (TLB busy-wait rank inversion) and #3 (x86_64 smoke required) |
+| `rollback_anon_map` per-page shootdown batching | **Deferred** | Live VM/TLB behavior change; x86_64 smoke required |
+| VmBrk shrink per-page shootdown batching | **Deferred** | Same |
+| `compute_tlb_shootdown_request_plan` helper | **Live** (helper only) | Pure read, no domain mutation, no lock inversion |
+| `VmBrk` `_kernel` → `kernel` bug fix | **Live** | Compile error fix; no behavioral change (variable rename only) |
+
+VmAnonMap is **helper-only scaffolding**. `handle_vm_anon_map` is unchanged.
+
+### 19.7 Why VmAnonMap live conversion is still deferred
+
+After Stage 5D:
+- **Blocker #1** (TLB busy-wait rank inversion): Still present. `begin_live_tlb_shootdown_wait` acquires ipc(3) after vm(5) and memory(6). Resolving this requires either (a) releasing all domain locks before the shootdown wait — which changes when page-table mutations become visible to remote CPUs — or (b) a dedicated shootdown thread that doesn't invert ranks. Both require design work beyond scaffolding.
+- **Blocker #2** (per-page progress): **Resolved by Stage 5D** via `VmPageMapProgress`. The `VmAnonMapProgressPlan` now captures all necessary loop state.
+- **Blocker #3** (x86_64 smoke): Still required. Any live VM/TLB reordering must be validated on real SMP hardware.
+
+### 19.8 Hard invariants for Stage 5D
+
+- `handle_vm_anon_map` is **unchanged**. No live VM/TLB behavior change.
+- VmBrk `_kernel` fix: compile error only, no semantic change.
+- All 603 tests pass (--test-threads=1).
+- No SMP/smp.rs changes.
+- No trap return/writeback changes.
+- No syscall ABI changes.
+- No CapRights widening, SpawnV5, VFS, syscall27, Phase 3B changes.
+- Global lock (`SharedKernel::with_cpu()`) still wraps all syscall handlers.
+
+### 19.9 Tests added (Stage 5D)
+
+| Test | File | What it proves |
+|------|------|----------------|
+| `tlb_shootdown_request_plan_has_no_remote_targets_in_single_cpu` | tests.rs | In single-CPU context, target_cpu_bitmap == 0 for bound ASID |
+| `tlb_shootdown_request_plan_unbound_asid_has_no_targets` | tests.rs | ASID not bound to any task → target_cpu_bitmap == 0 |
+| `vm_page_map_progress_rollback_covers_only_mapped_range` | tests.rs | Partial rollback of page 1 leaves page 2 mapped and page 3 absent |
+| `vm_page_map_progress_empty_initial_rollback_range` | tests.rs | Initial VmPageMapProgress has mapped_end == base_addr (empty rollback) |
+| `vm_brk_shrink_tolerates_lazy_unmapped_pages` | tests.rs | VmBrk shrink over all-lazy range succeeds via Ok(None) unmap |
+| `vm_brk_shrink_with_partially_mapped_lazy_region` | tests.rs | VmBrk shrink with mixed mapped+lazy pages succeeds; all pages absent after |
+
+### 19.10 Files changed (Stage 5D)
+
+| File | Change |
+|------|--------|
+| `src/kernel/syscall.rs` | Fix `_kernel` → `kernel` in `handle_vm_brk` shrink loop and `set_task_brk_bounds` call (regression from `32687af` merge) |
+| `src/kernel/boot/mod.rs` | Added `TlbShootdownRequestPlan`, `VmPageMapProgress`, `VmAnonMapProgressPlan` structs with full doc comments |
+| `src/kernel/boot/memory_state.rs` | Added `compute_tlb_shootdown_request_plan` helper |
+| `src/kernel/boot/tests.rs` | Added 6 new Stage 5D tests |
+| `doc/KERNEL_LOCKING.md` | This section (Section 19) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+9 added |

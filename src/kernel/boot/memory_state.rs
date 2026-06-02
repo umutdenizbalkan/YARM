@@ -143,6 +143,33 @@ impl KernelState {
         bitmap
     }
 
+    /// Stage 5D: Compute the TLB shootdown target set for a single-page unmap
+    /// without acquiring any vm or ipc domain locks.
+    ///
+    /// Reads scheduler (rank 1) + task (rank 2) state to determine which CPUs
+    /// are currently running the given ASID, then returns a `TlbShootdownRequestPlan`
+    /// that captures the target bitmap and requester CPU. The caller can use this
+    /// snapshot to avoid recomputing the bitmap on every iteration of an unmap loop.
+    ///
+    /// When `plan.target_cpu_bitmap == 0`, no cross-CPU notification is needed and
+    /// `request_live_asid_shootdown` returns immediately — the unmap is ipc-lock-free.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn compute_tlb_shootdown_request_plan(
+        &self,
+        asid: Asid,
+        virt: VirtAddr,
+    ) -> super::TlbShootdownRequestPlan {
+        let requester = self.current_cpu();
+        let requester_bit = 1u64 << requester.0;
+        let target_cpu_bitmap = self.live_cpu_bitmap_for_asid(asid) & !requester_bit;
+        super::TlbShootdownRequestPlan {
+            asid,
+            virt,
+            target_cpu_bitmap,
+            requester,
+        }
+    }
+
     fn request_live_asid_shootdown(
         &mut self,
         asid: Asid,

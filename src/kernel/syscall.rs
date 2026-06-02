@@ -3181,7 +3181,7 @@ fn handle_vm_brk(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
     // mapping in [base, end). Shrink updates the byte-granular brk after all
     // page-granular unmap bookkeeping succeeds.
     kernel
-        .set_task_brk_bounds(plan.tid, base, requested)
+        .set_task_brk_bounds(tid, base, requested)
         .map_err(SyscallError::from)?;
     frame.set_ok(requested, 0, 0);
     Ok(())
