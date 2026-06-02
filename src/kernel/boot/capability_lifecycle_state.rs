@@ -57,6 +57,48 @@ impl KernelState {
         }
     }
 
+    /// Stage 5B plan-first variant of `control_plane_set_process_cnode_slots`.
+    ///
+    /// Uses `plan.requester_class` and `plan.requester_pid` (snapshotted from the
+    /// task domain, rank 2) instead of re-reading task state inside the capability
+    /// mutation (rank 4). This eliminates the task→capability lock re-entry that
+    /// `resize_process_cnode_slots` would otherwise perform.
+    ///
+    /// Lock-domain flow: caller already holds snapshot (no lock) → this function
+    /// only acquires capability lock (rank 4) via `process_cnode_for_pid`,
+    /// `resize_cnode_slots`, `ensure_cnode_space_with_slots`, and
+    /// `set_process_cnode_for_pid`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn control_plane_set_process_cnode_slots_planned(
+        &mut self,
+        plan: &ControlPlaneCnodePlan,
+        target_pid: u64,
+        slot_capacity: usize,
+    ) -> Result<(), KernelError> {
+        let requester_is_system_server = plan.requester_class == TaskClass::SystemServer;
+        if !requester_is_system_server && plan.requester_pid != target_pid {
+            return Err(KernelError::MissingRight);
+        }
+
+        if let Some(existing_cnode) = self.process_cnode_for_pid(target_pid) {
+            if requester_is_system_server {
+                self.resize_cnode_slots(existing_cnode, slot_capacity)
+            } else {
+                // Non-system-server can only resize its own cnode (requester_pid == target_pid).
+                // Use plan.requester_class for the class guard — it IS the target's class here.
+                match plan.requester_class {
+                    TaskClass::Driver | TaskClass::SystemServer => {}
+                    TaskClass::App => return Err(KernelError::MissingRight),
+                }
+                self.resize_cnode_slots(existing_cnode, slot_capacity)
+            }
+        } else {
+            let target_cnode = CNodeId(target_pid);
+            self.ensure_cnode_space_with_slots(target_cnode, slot_capacity)?;
+            self.set_process_cnode_for_pid(target_pid, target_cnode)
+        }
+    }
+
     pub(crate) fn ensure_cnode_space(&mut self, cnode: CNodeId) -> Result<(), KernelError> {
         let slot_capacity = crate::kernel::capabilities::MAX_CAPABILITIES_PER_CSPACE;
         self.ensure_cnode_space_with_slots(cnode, slot_capacity)

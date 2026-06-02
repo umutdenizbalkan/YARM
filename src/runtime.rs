@@ -355,6 +355,26 @@ impl SharedKernel {
         }
     }
 
+    // ── Stage 5B split-read helpers ──────────────────────────────────────────
+
+    pub fn process_id_split_read(&self, tid: u64) -> Option<u64> {
+        // Stage 5B split-read: read thread-group-id (process id) under task lock (rank 2) only.
+        // Does not acquire the outer SharedKernel lock. Does not mutate any state.
+        // Lock order: task (rank 2). Forbidden caller-held locks: none with rank ≤ 2.
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by
+        // this SharedKernel. `process_id_from_raw` uses `addr_of!` to derive raw
+        // field pointers; the task lock serializes access to the `tcbs` array.
+        unsafe { KernelState::process_id_from_raw(self.state.data_ptr() as *const _, tid) }
+    }
+
+    pub fn is_group_leader_split_read(&self, tid: u64) -> bool {
+        // Stage 5B split-read: check thread-group-leader status under task lock (rank 2) only.
+        // Does not acquire the outer SharedKernel lock. Does not mutate any state.
+        // Lock order: task (rank 2). Forbidden caller-held locks: none with rank ≤ 2.
+        // SAFETY: same as `process_id_split_read`.
+        unsafe { KernelState::is_group_leader_from_raw(self.state.data_ptr() as *const _, tid) }
+    }
+
     /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.
     ///
     /// This exists solely for AArch64 boot code that must pass `&mut KernelState`
@@ -1124,5 +1144,80 @@ mod tests {
             "cnode_slot_capacity_split_read must match global after creation"
         );
         assert_eq!(kernel.cnode_slot_capacity_split_read(521), Some(requested_slots));
+    }
+
+    #[test]
+    fn process_id_split_read_matches_global() {
+        // Stage 5B: prove process_id_split_read (task lock only, rank 2)
+        // returns the same value as the globally-locked process_id() accessor,
+        // for both thread-group leaders and non-leader threads.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+
+        // Before registration: both paths return None.
+        assert_eq!(
+            kernel.process_id_split_read(530),
+            kernel.with(|state| state.process_id(530)),
+            "process_id_split_read must match global for absent TID"
+        );
+        assert_eq!(kernel.process_id_split_read(530), None);
+
+        // Register a task as its own thread-group leader (pid == tid).
+        kernel.with(|state| {
+            state.register_task(530).expect("leader");
+        });
+
+        let via_global = kernel.with(|state| state.process_id(530));
+        assert_eq!(
+            kernel.process_id_split_read(530),
+            via_global,
+            "process_id_split_read must match global for group leader"
+        );
+        // For a bare register_task, thread_group_id == tid.
+        assert_eq!(kernel.process_id_split_read(530), Some(530));
+
+        // Unknown TID returns None from both.
+        assert_eq!(
+            kernel.process_id_split_read(999),
+            kernel.with(|state| state.process_id(999)),
+            "process_id_split_read must match global for unknown TID"
+        );
+        assert_eq!(kernel.process_id_split_read(999), None);
+    }
+
+    #[test]
+    fn is_group_leader_split_read_matches_global() {
+        // Stage 5B: prove is_group_leader_split_read (task lock only, rank 2)
+        // agrees with the globally-locked is_thread_group_leader() accessor,
+        // for absent tasks and registered group-leader tasks.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+
+        // Before registration: both return false.
+        assert_eq!(
+            kernel.is_group_leader_split_read(540),
+            kernel.with(|state| state.is_thread_group_leader(540)),
+            "is_group_leader_split_read must match global for absent TID"
+        );
+        assert!(!kernel.is_group_leader_split_read(540));
+
+        // After registration: bare register_task sets thread_group_id == tid.
+        kernel.with(|state| {
+            state.register_task(540).expect("leader");
+        });
+
+        let via_global = kernel.with(|state| state.is_thread_group_leader(540));
+        assert_eq!(
+            kernel.is_group_leader_split_read(540),
+            via_global,
+            "is_group_leader_split_read must match global for registered leader"
+        );
+        assert!(kernel.is_group_leader_split_read(540));
+
+        // Unknown TID still returns false from both.
+        assert_eq!(
+            kernel.is_group_leader_split_read(999),
+            kernel.with(|state| state.is_thread_group_leader(999)),
+            "is_group_leader_split_read must match global for unknown TID"
+        );
+        assert!(!kernel.is_group_leader_split_read(999));
     }
 }

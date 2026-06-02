@@ -195,6 +195,56 @@ pub(crate) enum SchedulerHandoffPlan {
     /// Returns `true` if the target became the current task, `false` otherwise.
     YieldTo(ThreadId),
 }
+
+// ── Stage 5B plan-first structs ──────────────────────────────────────────────
+//
+// Each struct captures the task-domain snapshot (rank 2) produced by the
+// plan-read phase. The mutation phase uses only these snapshots, never
+// re-acquiring the task lock inside a capability or memory lock.
+//
+// Lock-domain flow:
+//   ControlPlaneCnodePlan: task (rank 2) read → capability (rank 4) mutation
+//   VmBrkPlan:             task (rank 2) read → memory    (rank 6) mutation
+//   VmAnonMapPlan:         scaffolding only — no live conversion in Stage 5B
+//                          (requires x86_64 TLB smoke; see KERNEL_LOCKING.md §17)
+
+/// Stage 5B plan-first snapshot for `ControlPlaneSetCnodeSlots`.
+///
+/// Captures the requester's task class and process id under the task lock
+/// (rank 2) before any capability mutation (rank 4). The mutation phase uses
+/// these fields directly, avoiding a second task-domain read inside the
+/// capability closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlPlaneCnodePlan {
+    pub(crate) requester_class: TaskClass,
+    pub(crate) requester_pid: u64,
+}
+
+/// Stage 5B plan-first snapshot for `VmBrk`.
+///
+/// Captures whether the calling thread is the thread-group leader under the
+/// task lock (rank 2) before any memory mutation (rank 6). The mutation phase
+/// uses this flag directly, avoiding a second task-domain read inside the
+/// memory closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VmBrkPlan {
+    pub(crate) tid: u64,
+    pub(crate) is_group_leader: bool,
+}
+
+/// Stage 5B scaffolding for `VmAnonMap` — helper-only, no live conversion.
+///
+/// VmAnonMap touches all of: scheduler (rank 1), task (rank 2), ipc (rank 3 —
+/// TLB shootdown via cross_cpu_work), capability (rank 4), vm (rank 5), and
+/// memory (rank 6). Live plan-first conversion requires x86_64 TLB smoke
+/// approval per KERNEL_LOCKING.md §17 invariant. This struct exists as
+/// scaffolding for that future stage.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VmAnonMapPlan {
+    pub(crate) tid: u64,
+}
+
 #[cfg(feature = "hosted-dev")]
 const MAX_COW_PAGES: usize = 100;
 #[cfg(not(feature = "hosted-dev"))]

@@ -4119,3 +4119,116 @@ No new hot/warm direct bypasses discovered by this sweep.
 - No Phase 3B weakening.
 - No trap return / register writeback changes.
 - No global-lock removal: all syscall handlers still acquire `SharedKernel` global lock via `with_cpu()`.
+
+---
+
+## 17. Stage 5B — Plan-first syscall decomposition
+
+Stage 5B introduces plan-first decomposition for three syscall candidates. Each candidate has its task-domain reads (rank 2) separated from capability or memory mutations (rank 4/6) via a plan struct. The plan struct captures the task snapshot before the mutation phase begins, eliminating task-lock re-entry inside the mutation closure.
+
+### 17.1 Candidate audit and classification
+
+| Syscall | Lock domains touched | Stage 5B classification |
+|---------|---------------------|------------------------|
+| `ControlPlaneSetCnodeSlots` | scheduler (1), task (2), capability (4), boot_config (11 inside capability) | **Live conversion** — rank order 2→4 clean; boot_config (11) inside capability (4) is valid (11 > 4) |
+| `VmBrk` | scheduler (1), task (2), memory (6) | **Live conversion** — rank order 2→6 clean; no VM/TLB involved; grow-only (shrink rejected) |
+| `VmAnonMap` | scheduler (1), task (2), ipc (3 — TLB shootdown), capability (4), vm (5), memory (6) | **Helper-only scaffolding** — 6 domains including TLB; requires x86_64 smoke approval before live conversion |
+
+### 17.2 Lock-domain flow per syscall
+
+**ControlPlaneSetCnodeSlots:**
+```
+Plan phase (rank 2 — task):
+  task_class(requester_tid)      → task lock acquired/released
+  process_id(requester_tid)      → task lock acquired/released
+
+Mutation phase (rank 4 — capability):
+  process_cnode_for_pid(pid)     → capability lock
+  resize_cnode_slots / ensure_cnode_space_with_slots / set_process_cnode_for_pid
+                                 → capability lock
+  runtime_capacity_config()      → boot_config lock (rank 11, inside capability closure; valid since 11 > 4)
+```
+
+**VmBrk:**
+```
+Plan phase (rank 2 — task):
+  is_thread_group_leader(tid)    → task lock acquired/released
+
+Mutation phase (rank 6 — memory):
+  task_brk_bounds(tid)           → memory lock (read)
+  set_task_brk_bounds(tid,…)     → task lock (verify), then memory lock (write)
+                                    (task rank 2 < memory rank 6; valid ordering)
+```
+
+**VmAnonMap (scaffolding only):**
+VmAnonMap touches ranks 1, 2, 3, 4, 5, and 6 in a single operation with TLB shootdown (rank 3 / IPC) in the rollback path. No live conversion without explicit x86_64 TLB smoke approval. `VmAnonMapPlan` struct exists as scaffolding.
+
+### 17.3 New plan structs
+
+Added to `src/kernel/boot/mod.rs`:
+
+| Struct | Fields | Purpose |
+|--------|--------|---------|
+| `ControlPlaneCnodePlan` | `requester_class: TaskClass`, `requester_pid: u64` | Task snapshot for ControlPlaneSetCnodeSlots |
+| `VmBrkPlan` | `tid: u64`, `is_group_leader: bool` | Task snapshot for VmBrk leader check |
+| `VmAnonMapPlan` | `tid: u64` | Scaffolding only; no live conversion in Stage 5B |
+
+### 17.4 New split-read helpers (Stage 5B)
+
+Added to `orchestrator_state.rs`:
+
+| Function | Lock acquired | Purpose |
+|----------|--------------|---------|
+| `process_id_from_raw(state, tid)` | `task_state_lock` (rank 2) | Read `thread_group_id.0` for a TID |
+| `is_group_leader_from_raw(state, tid)` | `task_state_lock` (rank 2) | Check `thread_group_id.0 == tid` |
+
+Added to `runtime.rs`:
+
+| Method | Delegates to | Purpose |
+|--------|-------------|---------|
+| `process_id_split_read(&self, tid)` | `process_id_from_raw` | `SharedKernel` wrapper |
+| `is_group_leader_split_read(&self, tid)` | `is_group_leader_from_raw` | `SharedKernel` wrapper |
+
+### 17.5 Planned method variants
+
+Added to `capability_lifecycle_state.rs`:
+- `control_plane_set_process_cnode_slots_planned(&mut self, plan: &ControlPlaneCnodePlan, target_pid: u64, slot_capacity: usize)` — accepts plan snapshot instead of re-reading task state; eliminates task-lock entry inside capability mutations.
+
+The `resize_process_cnode_slots` re-read of `task_class` is eliminated by using `plan.requester_class` directly (valid because in the non-system-server path `requester_pid == target_pid`, so the requester class is the target class).
+
+### 17.6 Updated syscall handlers
+
+- `handle_control_plane_set_cnode_slots` (`syscall.rs`): builds `ControlPlaneCnodePlan` from task domain, then calls `control_plane_set_process_cnode_slots_planned`.
+- `handle_vm_brk` (`syscall.rs`): builds `VmBrkPlan` (group-leader check), then proceeds to memory domain for brk_bounds read/write.
+
+Migration path: when the global lock is removed, the plan-build step moves before `with_cpu()` using `task_class_split_read` / `process_id_split_read` / `is_group_leader_split_read` on `SharedKernel`. The mutation phase only needs the capability or memory domain lock.
+
+### 17.7 Hard invariants for Stage 5B
+
+- No syscall ABI changes (SYSCALL_COUNT unchanged).
+- No CapRights widening.
+- BT2 preserved: BSP LAPIC timer not armed before `signal_bootstrap_scheduler_ready()`.
+- No SMP/smp.rs, trap return/writeback, or timer/bootstrap changes.
+- No SpawnV5, VFS, syscall27, Phase 3B changes.
+- VmAnonMap: no live conversion without x86_64 smoke approval.
+- No Class F re-entry (x86_64 entering_tid/exiting_tid split-read).
+- Global lock still in place: all syscall handlers still acquire `SharedKernel` global lock via `with_cpu()`.
+
+### 17.8 Tests added (Stage 5B)
+
+| Test | File | What it proves |
+|------|------|----------------|
+| `process_id_split_read_matches_global` | `runtime.rs` | `process_id_split_read` == `kernel.with(process_id)` for absent and group-leader TIDs |
+| `is_group_leader_split_read_matches_global` | `runtime.rs` | `is_group_leader_split_read` == `is_thread_group_leader` before and after registration |
+
+### 17.9 Files changed (Stage 5B)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/mod.rs` | Added `ControlPlaneCnodePlan`, `VmBrkPlan`, `VmAnonMapPlan` structs |
+| `src/kernel/boot/orchestrator_state.rs` | Added `process_id_from_raw`, `is_group_leader_from_raw` |
+| `src/runtime.rs` | Added `process_id_split_read`, `is_group_leader_split_read`; added 2 equivalence tests |
+| `src/kernel/boot/capability_lifecycle_state.rs` | Added `control_plane_set_process_cnode_slots_planned` |
+| `src/kernel/syscall.rs` | Updated `handle_control_plane_set_cnode_slots` and `handle_vm_brk` to plan-first |
+| `doc/KERNEL_LOCKING.md` | This section (Section 17) |
+| `doc/KERNEL_TEST_RULES.md` | Stage 5B rules added |

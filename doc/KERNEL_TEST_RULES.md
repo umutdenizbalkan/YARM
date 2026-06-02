@@ -686,3 +686,49 @@ let task_class = self.task_class(tid);  // acquires task_state_lock (rank 2 < 3)
 ```
 
 ---
+
+## Rule N+6 — Stage 5B: plan-first decomposition for multi-domain syscall handlers
+
+**Rule**: Any syscall handler that reads from one lock domain and mutates
+another must use a plan-first pattern:
+
+1. **Read phase**: snapshot all task-domain data (rank 2) into a `*Plan` struct
+   before any mutation. In the current implementation this happens inside the
+   global lock; when the global lock is removed, the read phase moves before
+   `with_cpu()` using split-reads on `SharedKernel`.
+2. **Mutation phase**: use only the plan snapshot for task-domain data; do not
+   re-acquire the task lock inside a capability or memory closure.
+3. The `*_planned` variant of the function must accept `&*Plan` and must not
+   call any `with_tcbs` / `task_class` / `process_id` accessor internally —
+   only capability or memory domain accessors.
+4. Add a comment on the plan-build step:
+   ```
+   // Stage 5B plan-first: snapshot task domain (rank N) before <other> mutation (rank M).
+   // When the global lock is removed, this read moves to before the with_cpu() call
+   // via split-read on SharedKernel.
+   ```
+5. `VmAnonMapPlan` and any other plan struct for TLB-touching syscalls are
+   **scaffolding only** until x86_64 smoke approval is obtained. Do not
+   implement live conversion for TLB-adjacent paths without that approval.
+
+**Corollary for plan structs**:
+- Plan structs live in `src/kernel/boot/mod.rs` alongside other plan enums.
+- Plan structs derive `Debug, Clone, Copy, PartialEq, Eq`.
+- Each plan struct must have a documented lock-domain flow in `KERNEL_LOCKING.md §17`.
+
+---
+
+## Rule N+7 — Stage 5B: equivalence tests for Stage 5B split-read helpers
+
+**Rule**: Every new `*_split_read` helper added in Stage 5B must have a
+corresponding equivalence test in `runtime.rs` that:
+
+1. Verifies the split-read result matches the globally-locked accessor for both
+   absent and present TIDs/PIDs.
+2. Checks at least one non-trivial case (e.g., a group-leader vs. a non-existent
+   task, a registered vs. unregistered TID).
+3. Is named `<helper_name>_matches_global` by convention.
+
+This is an extension of Rule N+3 to Stage 5B helpers.
+
+---

@@ -518,4 +518,46 @@ impl KernelState {
             .find(|space| space.id == cnode)
             .map(|space| space.slot_capacity)
     }
+
+    /// Stage 5B split-read: read the thread-group-id (process id) for a thread
+    /// under only the task lock (rank 2). Returns `None` if `tid` is not found.
+    ///
+    /// # Safety
+    /// Same requirements as `task_class_from_raw`. `task_state_lock` serializes
+    /// access to the `tcbs` array; `addr_of!` avoids a reference to the whole
+    /// `KernelState`.
+    pub(crate) unsafe fn process_id_from_raw(
+        state: *const KernelState,
+        tid: u64,
+    ) -> Option<u64> {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+        let _guard = lock_ref.lock();
+        let tcbs: &[Option<ThreadControlBlock>; MAX_TASKS] =
+            kernel_ref(unsafe { &*core::ptr::addr_of!((*state).tcbs) });
+        tcbs.iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .map(|tcb| tcb.thread_group_id.0)
+    }
+
+    /// Stage 5B split-read: check whether `tid` is the thread-group leader under
+    /// only the task lock (rank 2). Returns `false` if the task does not exist.
+    ///
+    /// # Safety
+    /// Same requirements as `task_class_from_raw`. `task_state_lock` serializes
+    /// access to the `tcbs` array.
+    pub(crate) unsafe fn is_group_leader_from_raw(
+        state: *const KernelState,
+        tid: u64,
+    ) -> bool {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+        let _guard = lock_ref.lock();
+        let tcbs: &[Option<ThreadControlBlock>; MAX_TASKS] =
+            kernel_ref(unsafe { &*core::ptr::addr_of!((*state).tcbs) });
+        tcbs.iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .map(|tcb| tcb.thread_group_id.0 == tid)
+            .unwrap_or(false)
+    }
 }
