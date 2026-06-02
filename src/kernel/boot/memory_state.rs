@@ -732,6 +732,7 @@ impl KernelState {
         self.map_user_page(aspace_map_cap, virt, Mapping { phys, flags })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn map_user_page_in_current_asid_with_caps(
         &mut self,
         mem_cap: CapId,

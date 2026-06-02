@@ -5618,3 +5618,165 @@ Pre-existing warning on `stash_bound_receiver_tid` (2 occurrences) unchanged.
 | `src/kernel/boot/tests.rs` | 9 new Stage 7 tests (transfer-release two-phase, vm_map guard, map_shared_region rollback) |
 | `doc/KERNEL_LOCKING.md` | This section (§25) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+14 (Stage 7 test rules) |
+
+---
+
+## §26 — Stage 8: Stage 7 smoke acceptance + demand-paging explicit-ASID conversion
+
+**Commit:** `claude/ecstatic-feynman-9ZZwC` (Stage 8)
+**Tests:** 635 total (629 from Stage 7 + 6 new Stage 8 tests)
+**Prerequisites:** Stage 7 implementation (§25), Stage 7 x86_64 -smp 1 smoke (this section).
+
+### 26.1 Stage 7 x86_64 -smp 1 smoke acceptance
+
+| Counter | Expected | Actual |
+|---------|----------|--------|
+| `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY` | 0 | 0 |
+| `X86_BOOTSTRAP_SCHEDULER_READY` | 1 | 1 |
+| `X86_BOOTSTRAP_TIMER_STARTED` | 1 | 1 |
+| `ENTER_USER` | ≥1 | 3 |
+| `STARTUP_INSTALL_FINAL` | ≥1 | 9 |
+| `PM_ELF_ZC_DONE image_id 7/8/9 total` | 3 | 3 |
+| `ZC nonzero pages` | 3 | 3 |
+| `PM_ELF_ZC_FAIL` | 0 | 0 |
+| `INITRAMFS_SRV_ENTRY` | 1 | 1 |
+| `DEVFS_SRV_ENTRY` | 1 | 1 |
+| `VFS_SRV_ENTRY` | 1 | 1 |
+| `DRIVER_MANAGER_READY` | 1 | 1 |
+| `BLKCACHE_SRV_READY` | 1 | 1 |
+| `VIRTIO_BLK_SRV_READY` | 1 | 1 |
+| `fallback` | 0 | 0 |
+| `TID mismatch` | 0 | 0 |
+| `fatal-ish` | 0 | 0 |
+| `oom/capacity/Vm(Full)` | 0 | 0 |
+
+**Stage 7 accepted for x86_64 -smp 1.** AArch64: no data available, not claimed.
+x86_64 SMP (>1 CPU): deferred, unchanged from §25.6.
+
+### 26.2 Full current-ASID sweep — production status after Stage 8
+
+Search scope: all production code (non-test) in `src/`.
+
+| Helper | Production callers after Stage 8 | Status |
+|--------|----------------------------------|--------|
+| `unmap_user_page_in_current_asid` | 0 | test-only (`#[cfg_attr(not(test), allow(dead_code))]`) |
+| `is_user_page_mapped_in_current_asid` | 0 | test-only (`#[cfg_attr(not(test), allow(dead_code))]`) |
+| `map_user_page_in_current_asid_with_caps` | 0 | test-only (`#[cfg_attr(not(test), allow(dead_code))]`) |
+
+**All three current-ASID VM helpers now have zero production callers.** They are
+retained for test use in `syscall.rs` test module and `boot/tests.rs`.
+
+The `current_asid` field in `FatalTrapReadSnapshot` (`runtime.rs`) is a
+diagnostic read-only snapshot, not a mutation path — outside scope.
+
+The `current_asid` variable in `x86_64/descriptor_tables.rs` is a local
+diagnostic variable used in debug UART output during fatal traps — not a VM
+mutation path, outside scope.
+
+### 26.3 `try_handle_demand_page_fault` — audit
+
+**Call chain:** `handle_trap_event_with_fault_bookkeeping_mode` (fault_state.rs)
+→ `try_handle_demand_page_fault` (fault_state.rs).
+
+**Source of faulting address:** `fault.addr` from the hardware page-fault trap
+context, page-aligned to `fault.addr.page_align_down()`.
+
+**Source of faulting task/TID:** `self.current_tid()` at line 97 — the task
+currently scheduled on the faulting CPU at the moment the trap fires. Under the
+global lock this cannot change between the trap entry and line 120.
+
+**Source of ASID:** `self.task_asid(tid)` at line 98, from the same `tid`.
+The returned `asid` is already used at lines 109 (`user_spaces.get(asid)`) and
+125 (`asid.0` in the hosted-dev memory initializer) — the canonical ASID for
+the fault path.
+
+**Is "current ASID" semantically required?** No. The faulting task is the
+current task; its ASID is `task_asid(current_tid())`. Both the old
+`map_user_page_in_current_asid_with_caps` (which internally calls
+`current_tid()` → `task_asid(tid)` again) and the new
+`map_user_page_in_asid_with_caps(asid, ...)` use the same ASID — the plan-first
+`asid` variable already in scope eliminates the redundant double-read.
+
+**Can the fault ASID be captured plan-first?** Yes — `asid` is already resolved
+before the map call. The conversion is a one-line change.
+
+**Timer/preemption/restart ambiguity:** Not applicable. The global lock is held
+for the entire trap dispatch. Timer interrupts are acknowledged and rescheduled
+but do not release the lock mid-fault. `current_tid()` is stable.
+
+**TLB behavior:** No TLB shootdown needed on allocation — the new page is
+freshly allocated and not cached anywhere. Demand paging always maps into the
+current CPU's active address space; shootdown is only needed on unmap.
+
+**COW interaction:** Handled before demand paging at lines 411-420 of
+`handle_trap_event_with_fault_bookkeeping_mode`. Demand paging is only reached
+for write faults to unallocated pages, not for COW pages.
+
+**Error/fault-report behavior:** Unchanged. `map_user_page_in_asid_with_caps`
+propagates the same `KernelError` variants as `map_user_page_in_current_asid_with_caps`.
+
+**Explicit-ASID verdict: SAFE.** The `asid` variable at line 98 is the exact
+same ASID that the old helper would have computed internally. The global lock
+guarantees stability. No observable behavior changes.
+
+### 26.4 Live conversion — `try_handle_demand_page_fault`
+
+**Before (Stage 7, implicit current-ASID double-read):**
+```rust
+let (_id, mem_cap) = self.alloc_anonymous_memory_object()?;
+let flags = crate::kernel::vm::PageFlags::USER_RW;
+self.map_user_page_in_current_asid_with_caps(mem_cap, page, flags)?;
+```
+`map_user_page_in_current_asid_with_caps` internally called `current_tid()` and
+`task_asid(tid)` a second time — redundant reads already done at lines 97-100.
+
+**After (Stage 8, plan-first ASID):**
+```rust
+let (_id, mem_cap) = self.alloc_anonymous_memory_object()?;
+let flags = crate::kernel::vm::PageFlags::USER_RW;
+// Stage 8: asid resolved plan-first above (line 98); identical to
+// map_user_page_in_current_asid_with_caps under the global lock since
+// current_tid cannot change between the plan-first resolution and here.
+self.map_user_page_in_asid_with_caps(asid, mem_cap, page, flags)?;
+```
+
+**ASID source:** `asid` from `self.task_asid(tid)` at line 98, where `tid` is
+`self.current_tid()` at line 97.
+
+**Locking sequence:**
+1. Global lock held throughout (all trap dispatch).
+2. `alloc_anonymous_memory_object` — memory rank 6.
+3. `map_user_page_in_asid_with_caps` — capability rank 4 → vm rank 5 → memory rank 6.
+   No scheduler (rank 1) or task (rank 2) re-read inside the map call.
+4. No TLB shootdown on fresh allocation (single-page, new physical frame).
+
+### 26.5 Helper cleanup after Stage 8
+
+| Helper | Status |
+|--------|--------|
+| `map_user_page_in_current_asid_with_caps` | `#[cfg_attr(not(test), allow(dead_code))]` added; 0 production callers |
+| `unmap_user_page_in_current_asid` | already test-only from Stage 7 |
+| `is_user_page_mapped_in_current_asid` | already test-only from Stage 7 |
+
+All three helpers are retained for test use. Deletion would break test
+comparisons that exercise the current-ASID vs explicit-ASID equivalence.
+
+### 26.6 Still deferred (updated from §25.6)
+
+- `VmAnonMapProgressPlan` live wiring.
+- Capability revoke on `rollback_anon_map`.
+- x86_64 SMP (>1 CPU) — requires lock-free or per-CPU demand-paging path.
+- Full global-lock removal.
+- RAMFS/FAT runtime server spawning (main branch is healthy; `ramfs_srv`/`fat_srv`
+  images exist but spawning is TODO for a later stage — do not touch).
+- AArch64 smoke (no data available, not claimed).
+
+### 26.7 Files changed (Stage 8)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/fault_state.rs` | `try_handle_demand_page_fault` line 120: `map_user_page_in_current_asid_with_caps` → `map_user_page_in_asid_with_caps(asid, ...)` |
+| `src/kernel/boot/memory_state.rs` | `#[cfg_attr(not(test), allow(dead_code))]` added to `map_user_page_in_current_asid_with_caps` |
+| `src/kernel/boot/tests.rs` | 6 new Stage 8 tests (demand-page explicit-ASID) |
+| `doc/KERNEL_LOCKING.md` | This section (§26): Stage 7 smoke acceptance, full current-ASID sweep, demand-paging audit, live conversion |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+15 (Stage 8 test rules) |
