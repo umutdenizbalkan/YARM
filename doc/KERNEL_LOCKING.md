@@ -5780,3 +5780,194 @@ comparisons that exercise the current-ASID vs explicit-ASID equivalence.
 | `src/kernel/boot/tests.rs` | 6 new Stage 8 tests (demand-page explicit-ASID) |
 | `doc/KERNEL_LOCKING.md` | This section (§26): Stage 7 smoke acceptance, full current-ASID sweep, demand-paging audit, live conversion |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+15 (Stage 8 test rules) |
+
+---
+
+## §27 — Stage 9: VmAnonMapProgressPlan live wiring + rollback cap cleanup
+
+### 27.1 Stage 8 smoke acceptance (x86_64 -smp 1)
+
+| Counter | Value |
+|---------|-------|
+| ENTER_USER | 3 |
+| All services READY | 1 each |
+| fallback | 0 |
+| fatal | 0 |
+| oom | 0 |
+
+### 27.2 Final current-ASID helper sweep
+
+Stage 9 deletes the three helpers that became test-only in Stage 7 and Stage 8:
+
+| Helper | Action |
+|--------|--------|
+| `map_user_page_in_current_asid_with_caps` | Deleted from `memory_state.rs` |
+| `unmap_user_page_in_current_asid` | Deleted from `memory_state.rs` |
+| `is_user_page_mapped_in_current_asid` | Deleted from `memory_state.rs` |
+
+All call sites in `syscall.rs` tests and `boot/tests.rs` migrated to explicit-ASID
+variants (`map_user_page_in_asid_with_caps`, `is_user_page_mapped_in_asid`).
+
+### 27.3 VmAnonMapProgressPlan live wiring in handle_vm_anon_map
+
+`handle_vm_anon_map` in `syscall.rs` now constructs a `VmAnonMapProgressPlan`
+explicitly, replacing the bare local variables `tid`, `asid`, and `va`. The plan
+struct's `progress.mapped_end` field is advanced on each successful page map,
+matching the Stage 5D scaffold exactly.
+
+The `#[cfg_attr(not(test), allow(dead_code))]` attributes are removed from:
+- `VmAnonMapValidatedArgs`
+- `VmPageMapProgress`
+- `VmAnonMapProgressPlan`
+
+These structs are now used in production code.
+
+### 27.4 Rollback cap cleanup: revoke_capability_in_cnode before execute_tlb_shootdown_wait_plan
+
+`rollback_anon_map` in `syscall.rs` gains an `unmapped_cap: Option<CapId>` parameter
+and two new cap-cleanup steps:
+
+1. **Un-mapped cap revocation** (`unmapped_cap`): If `map_user_page_in_asid_with_caps`
+   failed, the MemoryObject cap was allocated but never inserted into the address
+   space. `revoke_capability_in_cnode` is called directly (no phase-1 unmap needed).
+
+2. **Mapped-page cap revocation**: For each already-mapped page in `[addr, mapped_end)`,
+   after `unmap_page_phase1` returns a `TlbShootdownWaitPlan` (which carries the
+   physical address), `find_current_task_cap_for_memory_object_phys` locates the
+   MemoryObject cap and `revoke_capability_in_cnode` revokes it. Then
+   `execute_tlb_shootdown_wait_plan` completes the two-phase unmap, which now sees
+   both `cap_refcount=0` and `map_refcount=0`, and frees the physical frame.
+
+A new helper `find_current_task_cap_for_memory_object_phys` is added to
+`capability_lifecycle_state.rs`. It searches the current task's cnode for a
+MemoryObject cap whose physical address matches a given `PhysAddr`.
+
+### 27.5 Remaining deferred items
+
+- x86_64 SMP (>1 CPU) — requires lock-free or per-CPU demand-paging path.
+- Full global-lock removal.
+- RAMFS/FAT runtime server spawning (main branch is healthy; images exist but
+  spawning is deferred).
+- AArch64 smoke (no data available, not claimed).
+
+### 27.6 Files changed (Stage 9)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/capability_lifecycle_state.rs` | Added `find_current_task_cap_for_memory_object_phys` |
+| `src/kernel/boot/memory_state.rs` | Deleted `map_user_page_in_current_asid_with_caps`, `unmap_user_page_in_current_asid`, `is_user_page_mapped_in_current_asid` |
+| `src/kernel/boot/mod.rs` | Removed `#[cfg_attr(not(test), allow(dead_code))]` from `VmAnonMapValidatedArgs`, `VmPageMapProgress`, `VmAnonMapProgressPlan`; updated docstring |
+| `src/kernel/boot/tests.rs` | Migrated all current-ASID test calls; 5 new Stage 9 tests; test renamed |
+| `src/kernel/syscall.rs` | `rollback_anon_map` gains `unmapped_cap` param + cap cleanup; `handle_vm_anon_map` wires `VmAnonMapProgressPlan`; test helpers migrated |
+| `doc/KERNEL_LOCKING.md` | This section (§27) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+16 (Stage 9 test rules) |
+
+---
+
+## §27 Stage 9: current-ASID helper deletion, VmAnonMapProgressPlan live-wiring, rollback cap cleanup
+
+### 27.1 Stage 8 smoke acceptance
+
+**x86_64 -smp 1 smoke:** Stage 8 commit `c376e6e` passes with ENTER_USER=3,
+all services READY=1, fallback=0, fatal=0, oom=0. Accepted.
+
+### 27.2 Current-ASID helper deletion
+
+All three current-ASID helpers are deleted from `memory_state.rs`:
+
+| Helper | Stage introduced | Deleted in |
+|--------|-----------------|------------|
+| `map_user_page_in_current_asid_with_caps` | Stage 5 | Stage 9 |
+| `unmap_user_page_in_current_asid` | Stage 5 | Stage 9 |
+| `is_user_page_mapped_in_current_asid` | Stage 5 | Stage 9 |
+
+All test callers migrated to explicit-ASID equivalents:
+- `map_user_page_in_asid_with_caps(asid, cap, virt, flags)` (5 test sites in tests.rs + 1 in syscall.rs)
+- `is_user_page_mapped_in_asid(asid, virt)` (4 test sites)
+
+The `_current_asid` helpers were wrappers that read `current_tid()` +
+`task_asid(tid)` on every call — semantically correct under the global lock,
+but structurally inconsistent with the plan-first pattern. With zero callers
+outside tests, and all test callers migrated, deletion is safe.
+
+### 27.3 VmAnonMapProgressPlan live wiring
+
+`handle_vm_anon_map` now constructs a `VmAnonMapProgressPlan` before the map
+loop, capturing all plan-first fields in one struct:
+
+```
+VmAnonMapProgressPlan {
+    validated: VmAnonMapValidatedArgs { addr, map_len, end, flags },
+    tid,
+    asid,
+    progress: VmPageMapProgress { base_addr: addr, mapped_end: addr, end_addr: end },
+}
+```
+
+The loop variable `va` is replaced by `plan.progress.mapped_end`; all rollback
+calls pass `plan.progress.base_addr` and `plan.progress.mapped_end` from the
+struct. The `#[cfg_attr(not(test), allow(dead_code))]` guard is removed from
+`VmAnonMapValidatedArgs`, `VmPageMapProgress`, and `VmAnonMapProgressPlan`.
+
+**Locking sequence (unchanged from Stage 6):**
+1. Global lock held throughout.
+2. `validate_anon_map_args` — lock-free computation.
+3. `current_tid` + `task_asid` — scheduler rank 1 + task rank 2 (plan-first).
+4. `alloc_anonymous_memory_object` — memory rank 6.
+5. `map_user_page_in_asid_with_caps` — cap rank 4 → vm rank 5 → memory rank 6.
+6. On failure: `rollback_anon_map` — see §27.4.
+
+### 27.4 Rollback capability cleanup
+
+`rollback_anon_map` now accepts `unmapped_cap: Option<CapId>` and fully cleans
+up MemoryObject capability slots during rollback:
+
+**Case A — map failure** (`unmapped_cap = Some(cap)`):
+The cap was allocated by `alloc_anonymous_memory_object` (cap_refcount=1,
+map_refcount=0) but `map_user_page_in_asid_with_caps` failed before the page
+was inserted into the address space. `revoke_capability_in_cnode` drops
+cap_refcount to 0 and calls `reclaim_memory_object_if_unreferenced`, freeing
+the frame immediately.
+
+**Case B — alloc failure** (`unmapped_cap = None`):
+`alloc_anonymous_memory_object` itself failed; no cap was produced. Nothing
+extra to revoke.
+
+**Case C — already-mapped pages** (loop over `[addr, mapped_end)`):
+For each page, `unmap_page_phase1` removes the PTE (map_refcount → 0) and
+returns the physical address via the `TlbShootdownWaitPlan`. Then
+`find_current_task_cap_for_memory_object_phys(phys)` locates the CapId in the
+current task's cnode. `revoke_capability_in_cnode` drops cap_refcount to 0;
+`reclaim_memory_object_if_unreferenced` sees both refcounts=0 and frees the
+frame. `execute_tlb_shootdown_wait_plan` performs the TLB shootdown (or fast
+path if no remote CPUs are live on the ASID); the reclaim call inside the wait
+plan is now a no-op (slot already freed).
+
+**Safety:** All operations execute under the global lock. No other CPU can
+reuse the freed frame between `revoke_capability_in_cnode` and the TLB
+shootdown because the global lock prevents any concurrent allocation.
+
+**New helper:** `find_current_task_cap_for_memory_object_phys(phys)` in
+`capability_lifecycle_state.rs` — scans `memory_objects` for the MemoryObjectId
+whose `phys` matches, then scans the current task's cnode for the CapId whose
+`object == CapObject::MemoryObject { id }`. O(MO_slots × cnode_size); safe
+because both loops run under the global lock.
+
+### 27.5 Still deferred
+
+- x86_64 SMP (>1 CPU) — requires lock-free or per-CPU demand-paging path.
+- Full global-lock removal.
+- RAMFS/FAT runtime server spawning.
+- AArch64 smoke (no data available, not claimed).
+
+### 27.6 Files changed (Stage 9)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/capability_lifecycle_state.rs` | New `find_current_task_cap_for_memory_object_phys` |
+| `src/kernel/boot/memory_state.rs` | Deleted 3 current-ASID helpers |
+| `src/kernel/boot/mod.rs` | Removed `dead_code` guards from 3 plan structs; updated `VmAnonMapProgressPlan` comment |
+| `src/kernel/syscall.rs` | `rollback_anon_map` + `unmapped_cap` + cap cleanup; `handle_vm_anon_map` wired with `VmAnonMapProgressPlan`; test helpers migrated to explicit-ASID |
+| `src/kernel/boot/tests.rs` | 5 new Stage 9 tests; 9 test sites migrated from current-ASID to explicit-ASID; 1 test renamed |
+| `doc/KERNEL_LOCKING.md` | This section (§27) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+16 (Stage 9 test rules) |

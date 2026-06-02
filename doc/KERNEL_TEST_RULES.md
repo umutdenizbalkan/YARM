@@ -1256,3 +1256,63 @@ After Stage 8 the `map_user_page_in_current_asid_with_caps` helper must have
 zero production callers. Its continued presence is justified only by test-module
 use in `syscall.rs` and `boot/tests.rs` (equivalence comparisons). A future
 stage may delete it once those tests are updated.
+
+---
+
+## Rule N+16 — Stage 9 test rules: current-ASID helper deletion, VmAnonMapProgressPlan wiring, rollback cap cleanup
+
+### N+16.1 — No direct calls to deleted current-ASID helpers
+
+`map_user_page_in_current_asid_with_caps`, `unmap_user_page_in_current_asid`,
+and `is_user_page_mapped_in_current_asid` are deleted in Stage 9. All tests
+must use the explicit-ASID equivalents:
+- `map_user_page_in_asid_with_caps(asid, cap, virt, flags)`
+- `unmap_user_page_in_asid(asid, virt)`
+- `is_user_page_mapped_in_asid(asid, virt)`
+
+When a test maps pages on behalf of a non-current task (e.g., task1), the test
+must retrieve `asid` from `state.task_asid(tid)` and pass it explicitly.
+
+### N+16.2 — VmAnonMapProgressPlan field coverage
+
+Tests for `handle_vm_anon_map` must indirectly verify that `VmAnonMapProgressPlan`
+is correctly populated:
+- `base_addr` == syscall `addr` arg (no offset).
+- After success, all pages in `[base_addr, end_addr)` are mapped.
+- After failure, no pages from the failed syscall remain mapped.
+
+Testing the struct fields directly is not required; observable address-space
+state is sufficient.
+
+### N+16.3 — Rollback cap cleanup correctness
+
+After a successful VmAnonMap + simulated rollback (unmap_page_phase1 +
+revoke_capability_in_cnode + execute_tlb_shootdown_wait_plan), a test must
+verify that the MemoryObject count drops by exactly the number of pages rolled
+back. This confirms `reclaim_memory_object_if_unreferenced` freed the frame
+(both refcounts reached zero).
+
+### N+16.4 — `find_current_task_cap_for_memory_object_phys` contract
+
+A test must verify:
+- Returns `None` for a physical address not backed by any MemoryObject in the
+  current task's cnode.
+- Returns `Some((cnode, cap_id))` for a physical address of a freshly mapped
+  anonymous page, and that `revoke_capability_in_cnode(cnode, cap_id)` succeeds.
+
+### N+16.5 — Full suite must pass at 640+ tests
+
+Every Stage 9 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 640 tests (635 from Stage 8 + 5 new Stage 9 tests). All prior tests serve
+as the behavior-unchanged regression harness.
+
+### N+16.6 — No observable behavior change in VmAnonMap success path
+
+Stage 9 wires `VmAnonMapProgressPlan` into the live path. Tests must confirm
+that a multi-page `VmAnonMap` still maps every page in the requested range and
+returns the correct address and length — identical to Stage 6/7/8 behavior.
+
+### N+16.7 — No observable behavior change in demand paging
+
+Stage 9 must not alter the behavior of `try_handle_demand_page_fault`. All
+Stage 8 demand-page tests must continue to pass unchanged.

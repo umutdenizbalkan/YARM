@@ -439,4 +439,44 @@ impl KernelState {
             );
         }
     }
+
+    /// Find the CapId in the current task's cnode that holds a MemoryObject backed
+    /// by the given physical address.
+    ///
+    /// Used by rollback_anon_map to locate and revoke caps for pages being unmapped
+    /// during VmAnonMap failure recovery. Returns None if not found.
+    ///
+    /// Safe for freshly-created anonymous caps (no delegations, no transfer mappings)
+    /// under the global lock.
+    pub(crate) fn find_current_task_cap_for_memory_object_phys(
+        &self,
+        phys: PhysAddr,
+    ) -> Option<(CNodeId, CapId)> {
+        let cnode = self.current_task_cnode()?;
+        let mo_id = self.with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|o| o.phys == phys)
+                .map(|o| o.id)
+        })?;
+        let target_obj = CapObject::MemoryObject { id: mo_id };
+        let cap_id = self.with_capability_state(|caps| {
+            caps.cnode_spaces
+                .iter()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .and_then(|space| {
+                    let cspace = kernel_ref(&space.cspace);
+                    cspace.live_cap_ids().find(|&id| {
+                        cspace
+                            .get(id)
+                            .map(|cap| cap.object == target_obj)
+                            .unwrap_or(false)
+                    })
+                })
+        })?;
+        Some((cnode, cap_id))
+    }
 }

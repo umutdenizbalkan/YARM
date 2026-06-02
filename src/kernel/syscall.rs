@@ -3,7 +3,8 @@
 
 use super::boot::{
     ControlPlaneCnodePlan, IpcEndpointRecvResult, IpcEndpointSendResult, IpcSchedulerPlan,
-    KernelError, KernelState, MemoryObjectKind, TransferSharedRegion, VmBrkPlan,
+    KernelError, KernelState, MemoryObjectKind, TransferSharedRegion, VmAnonMapProgressPlan,
+    VmAnonMapValidatedArgs, VmBrkPlan, VmPageMapProgress,
 };
 use super::capabilities::{CapId, CapObject, CapRights, Capability};
 use super::ipc::{
@@ -3120,32 +3121,37 @@ fn handle_spawn_from_memory_object(
 }
 
 /// Undo physical mappings for [addr, mapped_end) on partial VmAnonMap failure.
-/// MemoryObject cap slots allocated before the error remain in the cnode as
-/// leaked slots; they are reclaimed when the task's cspace is destroyed on exit.
-/// TODO: revoke leaked MemoryObject caps after rollback unmap.
-fn rollback_anon_map(kernel: &mut KernelState, asid: Asid, addr: usize, mapped_end: usize) {
-    // Stage 6: two-phase unmap — phase 1 removes the page-table entry and
-    // clears memory accounting; execute_tlb_shootdown_wait_plan issues the
-    // TLB shootdown (if needed) and reclaims the physical frame only AFTER
-    // the shootdown wait / fast path completes.
-    //
-    // Absent pages (never faulted-in or already rolled back) are silently
-    // skipped — unmap_page_phase1 returns Ok(None), the inner if-let does
-    // not match, and the loop continues. Errors from either phase are also
-    // silently ignored, preserving the old `let _ = unmap_user_page_in_current_asid`
-    // error-discarding behavior.
-    //
-    // NOTE: The capability minted by alloc_anonymous_memory_object for each
-    // successfully mapped page is NOT revoked here. cap_refcount remains 1 for
-    // each rolled-back page so reclaim_memory_object_for_phys will NOT free
-    // the physical frame to the allocator (it checks cap_refcount != 0 first).
-    // The capability slot and the physical frame are only reclaimed when the
-    // task exits and all capabilities are destroyed. This is pre-existing
-    // behavior inherited from the old unmap_user_page_in_current_asid path;
-    // capability revoke in rollback is deferred to a later stage.
+/// Stage 9: also revokes capability slots for rolled-back pages so physical
+/// frames are fully reclaimed. `unmapped_cap` carries the cap that was allocated
+/// for the failing page but never mapped (only set on map failure, not alloc failure).
+fn rollback_anon_map(
+    kernel: &mut KernelState,
+    asid: Asid,
+    addr: usize,
+    mapped_end: usize,
+    unmapped_cap: Option<CapId>,
+) {
+    // Revoke the un-mapped cap first (case: map_user_page_in_asid_with_caps failed).
+    // The cap was allocated but the page was never inserted into the address space,
+    // so there is no phase-1 unmap — we revoke it directly.
+    if let Some(cap) = unmapped_cap {
+        if let Some(cnode) = kernel.current_task_cnode() {
+            let _ = kernel.revoke_capability_in_cnode(cnode, cap);
+        }
+    }
+    // Stage 6: two-phase unmap for mapped pages; Stage 9: also revoke their caps.
+    // After unmap_page_phase1, map_refcount=0 and we have the physical address.
+    // Revoking the cap decrements cap_refcount to 0; execute_tlb_shootdown_wait_plan
+    // then frees the physical frame (reclaim_memory_object_if_unreferenced sees both=0).
+    // Absent pages (Ok(None)) are silently skipped — unmap_page_phase1 tolerates them.
     let mut va = addr;
     while va < mapped_end {
         if let Ok(Some(wait_plan)) = kernel.unmap_page_phase1(asid, VirtAddr(va as u64)) {
+            if let Some((cnode, cap_id)) =
+                kernel.find_current_task_cap_for_memory_object_phys(wait_plan.phys)
+            {
+                let _ = kernel.revoke_capability_in_cnode(cnode, cap_id);
+            }
             let _ = kernel.execute_tlb_shootdown_wait_plan(wait_plan);
         }
         va += PAGE_SIZE;
@@ -3161,52 +3167,63 @@ fn handle_vm_anon_map(
     let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
     let (map_len, end, flags) = validate_anon_map_args(addr, len, prot)?;
 
-    // Stage 6 plan-first: resolve the current task's ASID once before the
-    // stack guard check and the map loop. This eliminates the per-iteration
-    // scheduler (rank 1) + task (rank 2) reads that were embedded inside
-    // map_user_page_in_current_asid_with_caps. All three operations below
-    // (guard check, map loop, rollback) use this single ASID snapshot.
+    // Stage 6 plan-first; Stage 9: captured in VmAnonMapProgressPlan so all fields
+    // (tid, asid, validated args, mapped_end progress) are explicit in one struct.
     let tid = current_tid(kernel)?;
     let asid = kernel
         .task_asid(tid)
         .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
+    let mut plan = VmAnonMapProgressPlan {
+        validated: VmAnonMapValidatedArgs { addr, map_len, end, flags },
+        tid,
+        asid,
+        progress: VmPageMapProgress { base_addr: addr, mapped_end: addr, end_addr: end },
+    };
 
-    // Stage 6: explicit-ASID stack guard check. Uses is_user_page_mapped_in_asid
-    // with the plan-first ASID instead of re-reading scheduler+task state.
-    // Semantics are identical to check_stack_guard (Stage 5C): the guard fires
-    // iff flags.write && !flags.execute && the page immediately below addr is
-    // already mapped. Execute-only and write+execute mappings bypass the guard.
-    if flags.write
-        && !flags.execute
-        && let Some(guard_page) = addr.checked_sub(PAGE_SIZE)
+    // Stage 6: explicit-ASID stack guard check using the plan-first ASID.
+    // Guard fires iff flags.write && !flags.execute && the page below addr is mapped.
+    if plan.validated.flags.write
+        && !plan.validated.flags.execute
+        && let Some(guard_page) = plan.validated.addr.checked_sub(PAGE_SIZE)
         && kernel
-            .is_user_page_mapped_in_asid(asid, VirtAddr(guard_page as u64))
+            .is_user_page_mapped_in_asid(plan.asid, VirtAddr(guard_page as u64))
             .map_err(SyscallError::from)?
     {
         return Err(SyscallError::InvalidArgs);
     }
 
-    let mut va = addr;
-    while va < end {
+    while plan.progress.mapped_end < plan.progress.end_addr {
+        let va = plan.progress.mapped_end;
         let (_, mem_cap) = match kernel.alloc_anonymous_memory_object() {
             Ok(pair) => pair,
             Err(e) => {
-                rollback_anon_map(kernel, asid, addr, va);
+                // Stage 9: alloc failure — no unmapped cap (alloc itself failed).
+                rollback_anon_map(
+                    kernel,
+                    plan.asid,
+                    plan.progress.base_addr,
+                    plan.progress.mapped_end,
+                    None,
+                );
                 return Err(SyscallError::from(e));
             }
         };
-        // Stage 6: use the explicit-ASID map helper to avoid per-iteration
-        // scheduler+task reads. Equivalent to map_user_page_in_current_asid_with_caps
-        // but uses the plan-first ASID.
         if let Err(e) =
-            kernel.map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(va as u64), flags)
+            kernel.map_user_page_in_asid_with_caps(plan.asid, mem_cap, VirtAddr(va as u64), plan.validated.flags)
         {
-            rollback_anon_map(kernel, asid, addr, va);
+            // Stage 9: map failure — mem_cap was allocated but not mapped; pass it for revoke.
+            rollback_anon_map(
+                kernel,
+                plan.asid,
+                plan.progress.base_addr,
+                plan.progress.mapped_end,
+                Some(mem_cap),
+            );
             return Err(SyscallError::from(e));
         }
-        va += PAGE_SIZE;
+        plan.progress.mapped_end += PAGE_SIZE;
     }
-    frame.set_ok(addr, map_len, 0);
+    frame.set_ok(plan.validated.addr, plan.validated.map_len, 0);
     Ok(())
 }
 
@@ -3625,19 +3642,19 @@ mod tests {
     }
 
     fn map_heap_page(state: &mut KernelState, addr: usize) {
+        let tid = state.current_tid().expect("current tid");
+        let asid = state.task_asid(tid).expect("asid");
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("heap mem");
         state
-            .map_user_page_in_current_asid_with_caps(
-                mem_cap,
-                VirtAddr(addr as u64),
-                PageFlags::USER_RW,
-            )
+            .map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(addr as u64), PageFlags::USER_RW)
             .expect("map heap page");
     }
 
     fn current_asid_page_mapped(state: &KernelState, page: usize) -> bool {
+        let tid = state.current_tid().expect("current tid");
+        let asid = state.task_asid(tid).expect("asid");
         state
-            .is_user_page_mapped_in_current_asid(VirtAddr(page as u64))
+            .is_user_page_mapped_in_asid(asid, VirtAddr(page as u64))
             .expect("query mapping")
     }
 
