@@ -453,4 +453,69 @@ impl KernelState {
         let _mem_guard = self.memory_state_lock.lock();
         f(kernel_mut(&mut self.memory))
     }
+
+    // ── Stage 5A split-read helpers ──────────────────────────────────────────
+
+    /// Stage 5A split-read: look up the task class for `tid` under only the
+    /// task lock (rank 2). Returns `None` if no task with that TID exists.
+    ///
+    /// # Safety
+    /// `state` must be the raw pointer of the `KernelState` storage owned by
+    /// the calling `SharedKernel`. `addr_of!` derives raw field pointers without
+    /// creating a reference to the whole `KernelState`; `task_state_lock`
+    /// serializes access to both `tcbs` and `task_classes`.
+    pub(crate) unsafe fn task_class_from_raw(
+        state: *const KernelState,
+        tid: u64,
+    ) -> Option<TaskClass> {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+        let _guard = lock_ref.lock();
+        let tcbs: &[Option<ThreadControlBlock>; MAX_TASKS] =
+            kernel_ref(unsafe { &*core::ptr::addr_of!((*state).tcbs) });
+        let task_classes: &[Option<TaskClass>; MAX_TASKS] =
+            kernel_ref(unsafe { &*core::ptr::addr_of!((*state).task_classes) });
+        tcbs.iter().enumerate().find_map(|(idx, slot)| {
+            slot.as_ref()
+                .filter(|tcb| tcb.tid.0 == tid)
+                .and(task_classes[idx])
+        })
+    }
+
+    /// Stage 5A split-read: check whether a task with `tid` exists under only
+    /// the task lock (rank 2).
+    ///
+    /// # Safety
+    /// Same requirements as `task_class_from_raw`.
+    pub(crate) unsafe fn task_exists_from_raw(state: *const KernelState, tid: u64) -> bool {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+        let _guard = lock_ref.lock();
+        let tcbs: &[Option<ThreadControlBlock>; MAX_TASKS] =
+            kernel_ref(unsafe { &*core::ptr::addr_of!((*state).tcbs) });
+        tcbs.iter().flatten().any(|tcb| tcb.tid.0 == tid)
+    }
+
+    /// Stage 5A split-read: read the CNode slot capacity for a process `pid`
+    /// under only the capability lock (rank 4). Returns `None` if no CNode is
+    /// registered for that pid.
+    ///
+    /// # Safety
+    /// `state` must be the raw pointer of the `KernelState` storage owned by
+    /// the calling `SharedKernel`. `addr_of!` derives raw field pointers without
+    /// creating a reference to the whole `KernelState`; `capability_state_lock`
+    /// serializes access to the `capability` field.
+    pub(crate) unsafe fn cnode_slot_capacity_from_raw(
+        state: *const KernelState,
+        pid: u64,
+    ) -> Option<usize> {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).capability_state_lock) };
+        let _guard = lock_ref.lock();
+        let capability: &CapabilitySubsystem =
+            unsafe { &*core::ptr::addr_of!((*state).capability) };
+        let cnode = CNodeId(pid);
+        kernel_ref(&capability.cnode_spaces)
+            .iter()
+            .flatten()
+            .find(|space| space.id == cnode)
+            .map(|space| space.slot_capacity)
+    }
 }

@@ -8,7 +8,7 @@ use crate::kernel::boot::{
 };
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
-use crate::kernel::task::FaultPolicy;
+use crate::kernel::task::{FaultPolicy, TaskClass};
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
 use crate::kernel::lock::{SpinLock, SpinLockIrq};
@@ -319,6 +319,40 @@ impl SharedKernel {
             0
         };
         FatalTrapReadSnapshot { current_tid, current_asid }
+    }
+
+    // ── Stage 5A split-read helpers ──────────────────────────────────────────
+
+    pub fn task_class_split_read(&self, tid: u64) -> Option<TaskClass> {
+        // Stage 5A split-read: read task class under task lock (rank 2) only.
+        // Does not acquire the outer SharedKernel lock. Does not mutate any state.
+        // Lock order: task (rank 2). Forbidden caller-held locks: none with rank ≤ 2.
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by
+        // this SharedKernel. `task_class_from_raw` uses `addr_of!` to derive raw
+        // field pointers without creating a whole-KernelState reference; the task
+        // lock serializes access to both `tcbs` and `task_classes`.
+        unsafe { KernelState::task_class_from_raw(self.state.data_ptr() as *const _, tid) }
+    }
+
+    pub fn task_exists_split_read(&self, tid: u64) -> bool {
+        // Stage 5A split-read: check task existence under task lock (rank 2) only.
+        // Does not acquire the outer SharedKernel lock. Does not mutate any state.
+        // Lock order: task (rank 2). Forbidden caller-held locks: none with rank ≤ 2.
+        // SAFETY: same as `task_class_split_read`.
+        unsafe { KernelState::task_exists_from_raw(self.state.data_ptr() as *const _, tid) }
+    }
+
+    pub fn cnode_slot_capacity_split_read(&self, pid: u64) -> Option<usize> {
+        // Stage 5A split-read: read CNode slot capacity under capability lock (rank 4) only.
+        // Does not acquire the outer SharedKernel lock. Does not mutate any state.
+        // Lock order: capability (rank 4). Forbidden caller-held locks: none with rank ≤ 4.
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by
+        // this SharedKernel. `cnode_slot_capacity_from_raw` uses `addr_of!` to derive
+        // raw field pointers without creating a whole-KernelState reference; the
+        // capability lock serializes access to the `capability` field.
+        unsafe {
+            KernelState::cnode_slot_capacity_from_raw(self.state.data_ptr() as *const _, pid)
+        }
     }
 
     /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.
@@ -955,5 +989,140 @@ mod tests {
             snapshot.current_asid, 0,
             "offline CPU must produce current_asid=0 in fatal_trap_read_snapshot"
         );
+    }
+
+    // ── Stage 5A split-read helpers ───────────────────────────────────────────
+
+    #[test]
+    fn task_class_split_read_matches_global() {
+        // Stage 5A: prove task_class_split_read (task lock only, rank 2)
+        // returns the same value as the globally-locked task_class() accessor,
+        // for both present and absent TIDs.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+
+        // Before registration: both paths return None.
+        assert_eq!(
+            kernel.task_class_split_read(501),
+            kernel.with(|state| state.task_class(501)),
+            "task_class_split_read must match global for absent TID"
+        );
+        assert_eq!(kernel.task_class_split_read(501), None);
+
+        // Register tasks with distinct classes.
+        kernel.with(|state| {
+            state
+                .register_task_with_class(501, TaskClass::App)
+                .expect("app");
+            state
+                .register_task_with_class(502, TaskClass::SystemServer)
+                .expect("sys_srv");
+        });
+
+        // After registration: split-read matches global.
+        assert_eq!(
+            kernel.task_class_split_read(501),
+            kernel.with(|state| state.task_class(501)),
+            "task_class_split_read must match global for App"
+        );
+        assert_eq!(kernel.task_class_split_read(501), Some(TaskClass::App));
+
+        assert_eq!(
+            kernel.task_class_split_read(502),
+            kernel.with(|state| state.task_class(502)),
+            "task_class_split_read must match global for SystemServer"
+        );
+        assert_eq!(kernel.task_class_split_read(502), Some(TaskClass::SystemServer));
+
+        // Unknown TID still returns None from both paths.
+        assert_eq!(
+            kernel.task_class_split_read(999),
+            kernel.with(|state| state.task_class(999)),
+            "task_class_split_read must match global for unknown TID"
+        );
+        assert_eq!(kernel.task_class_split_read(999), None);
+    }
+
+    #[test]
+    fn task_exists_split_read_matches_global() {
+        // Stage 5A: prove task_exists_split_read (task lock only, rank 2)
+        // agrees with a globally-locked existence check, for both present
+        // and absent TIDs.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+
+        // Before registration.
+        let absent_via_global =
+            kernel.with(|state| state.task_class(511)).is_some();
+        assert_eq!(
+            kernel.task_exists_split_read(511),
+            absent_via_global,
+            "task_exists_split_read must match global for absent TID"
+        );
+        assert!(!kernel.task_exists_split_read(511));
+
+        // After registration.
+        kernel.with(|state| {
+            state.register_task(511).expect("task511");
+        });
+
+        let present_via_global =
+            kernel.with(|state| state.task_class(511)).is_some();
+        assert_eq!(
+            kernel.task_exists_split_read(511),
+            present_via_global,
+            "task_exists_split_read must match global for registered TID"
+        );
+        assert!(kernel.task_exists_split_read(511));
+    }
+
+    #[test]
+    fn cnode_slot_capacity_split_read_matches_global() {
+        // Stage 5A: prove cnode_slot_capacity_split_read (capability lock only,
+        // rank 4) returns the same slot count as the globally-locked accessor,
+        // both before and after a CNode is created.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        const PID: u64 = 520;
+
+        // Before CNode creation: both paths return None.
+        let before_global = kernel.with(|state| {
+            use crate::kernel::capabilities::CNodeId;
+            state.cnode_slot_capacity(CNodeId(PID))
+        });
+        assert_eq!(
+            kernel.cnode_slot_capacity_split_read(PID),
+            before_global,
+            "cnode_slot_capacity_split_read must match global before creation"
+        );
+        assert_eq!(kernel.cnode_slot_capacity_split_read(PID), None);
+
+        // Create a CNode via the control plane.
+        kernel.with(|state| {
+            state
+                .register_task_with_class(PID, TaskClass::SystemServer)
+                .expect("system server");
+            state
+                .register_task_with_class(521, TaskClass::App)
+                .expect("target");
+            state.enqueue_current_cpu(PID).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(PID) {
+                state.yield_current().expect("switch");
+            }
+        });
+        let requested_slots = 8usize;
+        kernel
+            .control_plane_set_process_cnode_slots_via_syscall(521, requested_slots)
+            .expect("create cnode");
+
+        // After creation: split-read matches global.
+        let after_global = kernel.with(|state| {
+            use crate::kernel::capabilities::CNodeId;
+            state.cnode_slot_capacity(CNodeId(521))
+        });
+        assert_eq!(
+            kernel.cnode_slot_capacity_split_read(521),
+            after_global,
+            "cnode_slot_capacity_split_read must match global after creation"
+        );
+        assert_eq!(kernel.cnode_slot_capacity_split_read(521), Some(requested_slots));
     }
 }

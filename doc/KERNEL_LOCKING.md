@@ -3915,3 +3915,207 @@ With this fix, no timer ISR fires between `enable_interrupts_for_boot()` (STI) a
 | `src/arch/boot_entry.rs` | Add `start_bsp_periodic_timer(kernel)` function |
 | `src/bin/kernel_boot.rs` | Call `start_bsp_periodic_timer(kernel)` after `signal_bootstrap_scheduler_ready()` |
 | `src/arch/x86_64/descriptor_tables.rs` | Add BT2 test `bootstrap_scheduler_ready_gates_timer_isr_scheduling` |
+
+---
+
+## 16. Stage 5A: domain-owned split-read pass (task + capability domains)
+
+### 16.1 Goal and scope
+
+Stage 5A resumes global-lock removal after BT2, targeting safe read-only paths.
+The goal is NOT full global-lock removal but rather: add split-read infrastructure
+for the task and capability domains (extending the existing fault/telemetry/
+scheduler/boot-config split-read pattern), prove equivalence with tests, and
+document all remaining globally-locked syscall paths with precise deferral reasons.
+
+No trap-path, arch, timer, or bootstrap code is changed. No ABI is altered.
+x86_64 smoke is NOT required because all changes are lock-domain scaffolding
+in `orchestrator_state.rs` and `runtime.rs` only.
+
+### 16.2 Lock domain rank table (authoritative)
+
+| Rank | Domain | Lock field in KernelState | Data protected |
+|------|--------|--------------------------|----------------|
+| 1 | scheduler | `scheduler_state: SpinLockIrq<SchedulerState>` | runqueues, timer, current_cpu |
+| 2 | task | `task_state_lock: SpinLockIrq<()>` | `tcbs`, `task_classes`, `tls_restore_pending`, `robust_futex` |
+| 3 | ipc | `ipc_state_lock: SpinLockIrq<()>` | endpoints, waiters, sender_waiters, notifications, irq_routes, transfer_envelopes, reply_caps, cross_cpu_work, live_tlb_shootdown |
+| 4 | capability | `capability_state_lock: SpinLockIrq<()>` | `cnode_spaces`, `process_cnodes`, `delegated_capability_links` |
+| 5 | vm | `vm_state_lock: SpinLockIrq<()>` | `user_spaces` (AddressSpaceManager) |
+| 6 | memory | `memory_state_lock: SpinLockIrq<()>` | `memory_objects`, `brk_regions`, `cow_pages`, `frame_allocator` |
+| 7 | driver | `driver_state_lock: SpinLockIrq<()>` | `driver_records` |
+| 8 | fault | `fault_state_lock: SpinLockIrq<()>` | `last_fault`, `last_fault_frame`, `fault_handler_endpoint`, `fault_policy` |
+| 9 | restart | `restart_state_lock: SpinLockIrq<()>` | `next_restart_token` |
+| 10 | telemetry | `telemetry_state_lock: SpinLockIrq<()>` | `tlb_shootdown_count`, `tlb_shootdown_timeout_count`, `tid_allocation` |
+| 11 | boot_config | `boot_config_state_lock: SpinLockIrq<()>` | `capacity_profile` |
+
+Lock ordering rule: a caller may acquire rank-N only if it holds no lock of rank ≥ N.
+The outer `SharedKernel` `SpinLock<KernelState>` is the "global" lock (rank 0, highest precedence);
+holding it allows acquiring any domain lock without deadlock risk.
+
+### 16.3 Stage 5A audit: production syscall/operation paths
+
+Classification key:
+- **A** pure read, ready for split-read
+- **B** single-domain mutation, ready for split-mut
+- **C** two-domain operation, ready for plan-first split
+- **D** three-or-more-domain operation, keep globally locked for now
+- **E** requires user-memory copy, defer or plan-first only
+- **F** requires TrapFrame writeback, defer
+- **G** requires cap materialization/revoke/mint, plan-first only
+- **H** requires VM page-table mutation/TLB shootdown, plan-first only
+- **I** scheduler/task current-tid/trap-boundary sensitive, defer
+- **J** boot/arch/timer sensitive, defer
+- **K** already split (no global lock required)
+- **L** unsafe / unknown, defer
+
+| Nr | Syscall | Classification | Domains touched | Deferral / Notes |
+|----|---------|---------------|-----------------|------------------|
+| 0 | Yield | B+I | scheduler | Trap-boundary; yield_current mutates runqueue. Keep globally locked. |
+| 1 | IpcSend | D+I | ipc (rank 3), task (rank 2), scheduler (rank 1) | Three domains; IPC enqueue + task wake + scheduler. Keep globally locked. |
+| 2 | IpcRecv | D+I | ipc, task, scheduler | Three domains; blocking recv. Keep globally locked. |
+| 3 | VmMap | D+H | vm (rank 5), memory (rank 6), capability (rank 4) | Cap lookup + VM mutation + TLB. Keep globally locked. |
+| 4 | TransferRelease | D+H+G | ipc, vm, capability | Transfer cap revoke + VM unmap. Keep globally locked. |
+| 5 | IpcRecvTimeout | D+I+K | scheduler tick = K; try-recv = D | Tick read already split (Stage 2B). IPC recv still globally locked. |
+| 6 | IpcCall | D+I+G | ipc, task, scheduler, capability | Reply cap mint + IPC. Keep globally locked. |
+| 7 | IpcReply | D+I+G | ipc, task, scheduler, capability | Reply cap consume + IPC. Keep globally locked. |
+| 8 | ControlPlaneSetCnodeSlots | C+G | task (rank 2) read, capability (rank 4) mut, boot_config (rank 11) read | Could be plan-first (read task class, then mutate capability). Deferred Stage 5B. |
+| 9 | FutexWait | D+I | ipc (futex), task, scheduler | Three domains; futex block + scheduler. Keep globally locked. |
+| 10 | FutexWake | D+I | ipc (futex), task, scheduler | Three domains; futex wake + scheduler. Keep globally locked. |
+| 11 | SpawnThread | D | task, scheduler, memory, vm, capability | Five domains; keep globally locked. |
+| 12 | Fork | D | task, scheduler, memory, vm, capability, ipc | Six domains; keep globally locked. |
+| 13 | VmAnonMap | C+H | vm (rank 5), memory (rank 6) | Could be plan-first (memory alloc → VM map). Deferred Stage 5B. |
+| 14 | VmBrk | B+C | task (rank 2) read, memory (rank 6) mut | Two sequential domains; plan-first feasible. Deferred Stage 5B. |
+| 15 | DebugLog | E | scheduler (tid read), user memory | User memory copy required; keep globally locked. |
+| 23 | SpawnProcess | D | task, scheduler, memory, vm, capability, ipc | Six domains; keep globally locked. |
+| 24 | SpawnProcessFromUserBuf | D+E | all domains + user memory copy | Keep globally locked. |
+| 26 | SpawnFromInitramfsFile | D+E | all domains + user memory copy | Keep globally locked. |
+| 27 | InitramfsReadChunk | E | memory (chunk bounds), user memory | User memory copy; keep globally locked. |
+| 28 | CreateInitramfsFileSliceMo | D+G | memory, capability, task | Cap mint + memory. Keep globally locked. |
+| 29 | SpawnFromMemoryObject | D+G | task, scheduler, memory, vm, capability, ipc | Six domains + cap lookup. Keep globally locked. |
+
+**SharedKernel non-trap production `with()` calls:**
+- `ipc_recv_with_deadline_split_bridge` (lines 269/273): scheduler tick already split (K); IPC recv body still uses `with()` (D+I). Not convertible without full IPC-domain split.
+- `control_plane_set_process_cnode_slots_via_syscall` (line 293): calls `handle_trap()` internally (F+I). Keep globally locked.
+
+### 16.4 Split-read infrastructure added (Stage 5A)
+
+All split-read helpers follow the `data_ptr()` + `addr_of!` pattern: derive raw field
+pointers from `SharedKernel`'s stable `SpinLock<KernelState>` storage without creating
+a whole-`KernelState` reference, then acquire only the required domain lock.
+
+#### 16.4.1 Task domain (rank 2) — new static functions in `orchestrator_state.rs`
+
+| Function | Lock(s) acquired | Returns | Notes |
+|----------|-----------------|---------|-------|
+| `KernelState::task_class_from_raw(state, tid)` | task (rank 2) | `Option<TaskClass>` | Reads `tcbs` + `task_classes` under task lock |
+| `KernelState::task_exists_from_raw(state, tid)` | task (rank 2) | `bool` | Reads `tcbs` under task lock |
+
+Safety requirement: both functions read `tcbs` and (for `task_class_from_raw`)
+`task_classes` under `task_state_lock`. Both arrays are protected by the same lock.
+The functions use `core::ptr::addr_of!` to derive field pointers without creating
+a reference to the whole `KernelState`.
+
+#### 16.4.2 Capability domain (rank 4) — new static function in `orchestrator_state.rs`
+
+| Function | Lock(s) acquired | Returns | Notes |
+|----------|-----------------|---------|-------|
+| `KernelState::cnode_slot_capacity_from_raw(state, pid)` | capability (rank 4) | `Option<usize>` | Reads `capability.cnode_spaces` under capability lock |
+
+#### 16.4.3 SharedKernel public split-read methods (new in `runtime.rs`)
+
+| Method | Calls | Lock order | Classification |
+|--------|-------|-----------|----------------|
+| `task_class_split_read(tid)` | `task_class_from_raw` | task (rank 2) only | A — pure read |
+| `task_exists_split_read(tid)` | `task_exists_from_raw` | task (rank 2) only | A — pure read |
+| `cnode_slot_capacity_split_read(pid)` | `cnode_slot_capacity_from_raw` | capability (rank 4) only | A — pure read |
+
+Forbidden caller-held locks:
+- `task_class_split_read` / `task_exists_split_read`: must not hold scheduler (rank 1) or task (rank 2) before calling.
+- `cnode_slot_capacity_split_read`: must not hold scheduler (rank 1), task (rank 2), ipc (rank 3), or capability (rank 4) before calling.
+
+These methods do NOT acquire the outer `SharedKernel` SpinLock. They are live
+production-ready split-reads: any future caller that only needs a task class or
+CNode capacity check no longer needs `SharedKernel::with()`.
+
+### 16.5 Existing split-read / split-mut inventory (Stage 4T+5 and earlier)
+
+| Method | Domain | Rank | Classification |
+|--------|--------|------|----------------|
+| `scheduler_tick_now_split_read` | scheduler | 1 | K — already split |
+| `current_tid_split_read` | scheduler | 1 | K — already split |
+| `online_cpu_count_split_read` | scheduler | 1 | K — already split |
+| `present_cpu_count_split_read` | scheduler | 1 | K — already split |
+| `task_asid_for_tid_split_read` | task | 2 | K — already split |
+| `fatal_trap_read_snapshot` | scheduler (rank 1), task (rank 2) | 1+2 | K — already split |
+| `capacity_profile_split_read` | boot_config | 11 | K — already split |
+| `runtime_capacity_config_split_read` | boot_config | 11 | K — already split |
+| `last_fault_split_read` | fault | 8 | K — already split |
+| `last_fault_frame_split_read` | fault | 8 | K — already split |
+| `fault_policy_split_read` | fault | 8 | K — already split |
+| `record_fault_split_mut` | fault | 8 | K — already split |
+| `record_fault_frame_snapshot_split_mut` | fault | 8 | K — already split |
+| `clear_last_fault_split_mut` | fault | 8 | K — already split |
+| `increment_tlb_shootdown_count_split_mut` | telemetry | 10 | K — already split |
+| `add_tlb_shootdown_timeout_count_split_mut` | telemetry | 10 | K — already split |
+| `tlb_shootdown_count_split_read` | telemetry | 10 | K — already split |
+| `tlb_shootdown_timeout_count_split_read` | telemetry | 10 | K — already split |
+| **task_class_split_read** (5A) | task | 2 | **A — new Stage 5A** |
+| **task_exists_split_read** (5A) | task | 2 | **A — new Stage 5A** |
+| **cnode_slot_capacity_split_read** (5A) | capability | 4 | **A — new Stage 5A** |
+
+### 16.6 Paths still globally locked and why
+
+| Path | Why globally locked | Next candidate stage |
+|------|---------------------|---------------------|
+| All trap dispatch via `with_cpu()` | F+I: TrapFrame writeback + trap-boundary | Keep — do not convert |
+| x86_64 entering_tid/exiting_tid `with_cpu()` | F: Stage 4T+6R revert; confirmed smoke-broken | Defer indefinitely (Class F) |
+| IpcSend/IpcRecv/IpcCall/IpcReply | D+I: three domains + scheduler | Stage 5B or later |
+| FutexWait/FutexWake | D+I: futex + task + scheduler | Stage 5B or later |
+| SpawnThread/Fork/SpawnProcess/* | D: many domains | Stage 5C or later |
+| VmMap/VmAnonMap | C+H: VM + memory + TLB | Stage 5B candidate (plan-first) |
+| VmBrk | B+C: task read + memory mut | Stage 5B candidate |
+| ControlPlaneSetCnodeSlots | C+G: task read + cap mut | Stage 5B candidate |
+| DebugLog | E: user-memory copy | Requires copy infrastructure |
+| TransferRelease | D+H+G: IPC + VM + cap | Stage 5C or later |
+
+### 16.7 Sweep: remaining `SharedKernel::with()` / `with_cpu()` production callers
+
+| Site | File | Classification | Notes |
+|------|------|---------------|-------|
+| `with_cpu()` in `dispatch_trap_entry_with_shared_kernel` | `arch/trap_entry.rs:149` | F+I | Do not touch |
+| `with_cpu()` in `handle_trap_with_cpu` | `runtime.rs:283` | F+I | Do not touch |
+| `with_cpu()` entering/exiting tid in `descriptor_tables.rs:895,923` | x86_64 | F (Class F, 4T+6R) | Do not touch |
+| `with()` in `ipc_recv_with_deadline_split_bridge` | `runtime.rs:269,273` | D+I | Tick already split; IPC body deferred |
+| `with()` in `control_plane_set_process_cnode_slots_via_syscall` | `runtime.rs:293` | F+I | Internally calls `handle_trap()` |
+| `borrow_kernel_for_boot()` in x86_64 `boot.rs` | x86_64 only | J | BT2 protected; do not touch |
+| `borrow_kernel_for_boot()` in aarch64 `boot.rs` | aarch64 only | J | Single-CPU boot; do not touch |
+
+No new hot/warm direct bypasses discovered by this sweep.
+
+### 16.8 Tests added (Stage 5A)
+
+| Test | File | What it proves |
+|------|------|----------------|
+| `task_class_split_read_matches_global` | `runtime.rs` | `task_class_split_read` == `kernel.with(task_class)` for App, SystemServer, and absent TIDs |
+| `task_exists_split_read_matches_global` | `runtime.rs` | `task_exists_split_read` == global existence check before and after registration |
+| `cnode_slot_capacity_split_read_matches_global` | `runtime.rs` | `cnode_slot_capacity_split_read` == `kernel.with(cnode_slot_capacity)` before and after CNode creation |
+
+### 16.9 Files changed (Stage 5A)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/orchestrator_state.rs` | Added `task_class_from_raw`, `task_exists_from_raw`, `cnode_slot_capacity_from_raw` |
+| `src/runtime.rs` | Added `task_class_split_read`, `task_exists_split_read`, `cnode_slot_capacity_split_read`; added 3 equivalence tests |
+| `doc/KERNEL_LOCKING.md` | This section (Section 16) |
+| `doc/KERNEL_TEST_RULES.md` | Stage 5A rules added |
+
+### 16.10 Hard invariants confirmed
+
+- x86_64 BT2 preserved: BSP LAPIC timer still not armed before `signal_bootstrap_scheduler_ready()`.
+- No SMP/smp.rs changes.
+- No syscall ABI changes (SYSCALL_COUNT unchanged).
+- No AArch64 changes.
+- No SpawnV5/VFS/syscall27 changes.
+- No Phase 3B weakening.
+- No trap return / register writeback changes.
+- No global-lock removal: all syscall handlers still acquire `SharedKernel` global lock via `with_cpu()`.
