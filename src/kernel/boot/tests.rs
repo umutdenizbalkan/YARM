@@ -9649,6 +9649,228 @@ fn vm_brk_two_phase_shrink_single_page_updates_to_base() {
         .expect("join");
 }
 
+// ── Stage 6: VmAnonMap live two-phase unmap + explicit-ASID forward map ──────
+//
+// These tests verify the Stage 6 live conversions of handle_vm_anon_map and
+// rollback_anon_map:
+//   1. handle_vm_anon_map resolves ASID plan-first and maps via explicit ASID.
+//   2. The explicit-ASID guard check fires correctly (replaces check_stack_guard).
+//   3. rollback_anon_map uses unmap_page_phase1 + execute_tlb_shootdown_wait_plan.
+//   4. rollback_anon_map tolerates Ok(None) from phase1 (absent pages).
+//   5. execute-only prot bypasses guard (regression).
+//   6. write+execute prot bypasses guard (regression).
+
+#[test]
+fn vm_anon_map_stage6_plan_first_asid_maps_pages_correctly() {
+    // Stage 6: handle_vm_anon_map resolves ASID plan-first and maps all pages
+    // via map_user_page_in_asid_with_caps. A three-page write-only map must
+    // succeed and all three pages must be visible via is_user_page_mapped_in_asid.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let addr = 0x10_0000_usize;
+            let len = 3 * PAGE_SIZE;
+            // PROT_READ|WRITE = 0x3
+            let mut frame = vm_anon_map_frame(addr, len, 0x3);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "three-page PROT_READ|WRITE map must succeed"
+            );
+
+            for i in 0..3_usize {
+                let virt = VirtAddr((addr + i * PAGE_SIZE) as u64);
+                assert!(
+                    state
+                        .is_user_page_mapped_in_asid(asid, virt)
+                        .expect("page check"),
+                    "page at offset {} must be mapped after stage-6 anon map", i
+                );
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_stage6_explicit_asid_guard_fires() {
+    // Stage 6: the inline explicit-ASID guard check (replacing check_stack_guard)
+    // must reject a write mapping when the page immediately below addr is already
+    // mapped. Condition: flags.write && !flags.execute && guard_page mapped.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            // Pre-map the guard page one page below the target.
+            let guard_virt = VirtAddr(0x20_0000u64);
+            let target_addr = 0x20_1000_usize; // guard_virt + PAGE_SIZE
+            let (_, guard_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, guard_cap, guard_virt, PageFlags::USER_RW)
+                .expect("guard map");
+
+            // PROT_WRITE only (0x2): write=true, execute=false → guard check fires.
+            let mut frame = vm_anon_map_frame(target_addr, PAGE_SIZE, 0x2);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_failed(r, &frame),
+                "write-only map at guarded addr must be rejected by explicit-ASID guard check"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_stage6_rollback_two_phase_removes_pages() {
+    // Stage 6: rollback_anon_map uses unmap_page_phase1 +
+    // execute_tlb_shootdown_wait_plan. Exercise the two-phase helpers directly:
+    // map two pages, phase-1-unmap both, execute phase-2, confirm both absent.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let page1 = VirtAddr(0x30_0000u64);
+            let page2 = VirtAddr(0x30_1000u64);
+
+            for virt in [page1, page2] {
+                let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+                state
+                    .map_user_page_in_asid_with_caps(asid, cap, virt, PageFlags::USER_RW)
+                    .expect("map page");
+            }
+
+            // Phase 1 both pages.
+            let plan1 = state
+                .unmap_page_phase1(asid, page1)
+                .expect("phase1 page1 no error")
+                .expect("phase1 page1 must be Some");
+            let plan2 = state
+                .unmap_page_phase1(asid, page2)
+                .expect("phase1 page2 no error")
+                .expect("phase1 page2 must be Some");
+
+            // Phase 2 both plans (fast path in single-CPU).
+            state
+                .execute_tlb_shootdown_wait_plan(plan1)
+                .expect("phase2 page1");
+            state
+                .execute_tlb_shootdown_wait_plan(plan2)
+                .expect("phase2 page2");
+
+            for virt in [page1, page2] {
+                assert!(
+                    !state
+                        .is_user_page_mapped_in_asid(asid, virt)
+                        .expect("post-rollback check"),
+                    "page at {:#x} must be absent after two-phase rollback", virt.0
+                );
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_stage6_rollback_tolerates_absent_pages() {
+    // Stage 6: rollback_anon_map silently skips Ok(None) from unmap_page_phase1
+    // (pages that were never mapped, e.g. partial failure before first alloc).
+    // Calling unmap_page_phase1 on an unmapped page must return Ok(None) — no
+    // panic, no error.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let never_mapped = VirtAddr(0x40_0000u64);
+
+            // Phase 1 on an unmapped page must return Ok(None).
+            let result = state.unmap_page_phase1(asid, never_mapped);
+            assert!(result.is_ok(), "phase1 on absent page must not error");
+            assert!(
+                result.unwrap().is_none(),
+                "phase1 on absent page must return None (no plan)"
+            );
+
+            // Page must still be absent.
+            assert!(
+                !state
+                    .is_user_page_mapped_in_asid(asid, never_mapped)
+                    .expect("check"),
+                "absent page must remain absent"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_stage6_execute_only_guard_bypass_regression() {
+    // Stage 6 regression: the explicit-ASID guard condition is
+    // `write && !execute`. PROT_EXEC (0x4) must bypass the guard even when
+    // the page below is mapped — matching pre-Stage-6 behavior.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let guard_virt = VirtAddr(0x50_0000u64);
+            let target_addr = 0x50_1000_usize;
+            let (_, guard_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, guard_cap, guard_virt, PageFlags::USER_RW)
+                .expect("guard map");
+
+            // PROT_EXEC only (0x4): execute=true → guard bypassed.
+            let mut frame = vm_anon_map_frame(target_addr, PAGE_SIZE, 0x4);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "PROT_EXEC must bypass explicit-ASID guard check (regression)"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_stage6_write_execute_guard_bypass_regression() {
+    // Stage 6 regression: PROT_WRITE|PROT_EXEC (0x6) must also bypass the guard
+    // because execute=true disarms the check. Matches pre-Stage-6 behavior.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let guard_virt = VirtAddr(0x60_0000u64);
+            let target_addr = 0x60_1000_usize;
+            let (_, guard_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, guard_cap, guard_virt, PageFlags::USER_RW)
+                .expect("guard map");
+
+            // PROT_WRITE|PROT_EXEC (0x6): write=true but execute=true → guard bypassed.
+            let mut frame = vm_anon_map_frame(target_addr, PAGE_SIZE, 0x6);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "PROT_WRITE|PROT_EXEC must bypass explicit-ASID guard check (regression)"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
 // ── Phase L2A: canonical boot SharedKernel construction tests ─────────────────
 //
 // These tests verify Bootstrap::init_shared_static_with_boot_memory_map

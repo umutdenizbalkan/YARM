@@ -792,7 +792,6 @@ impl KernelState {
     ///
     /// Lock-domain flow: capability (rank 4) → vm (rank 5).
     /// No scheduler or task lock acquisition.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn map_user_page_in_asid_with_caps(
         &mut self,
         asid: Asid,
@@ -812,7 +811,6 @@ impl KernelState {
     /// (rank 2) state.
     ///
     /// Lock-domain flow: vm (rank 5) read only.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_user_page_mapped_in_asid(
         &self,
         asid: Asid,

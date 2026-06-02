@@ -5137,3 +5137,138 @@ All Stage 5F tests (614 total) pass unchanged.
 |------|--------|
 | `doc/KERNEL_LOCKING.md` | This section (Section 22): smoke record, VmBrk acceptance, VmAnonMap readiness audit, Stage 6 gate decision |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+12 added: Stage 6 VmAnonMap gate conditions |
+
+## §23 Stage 6: VmAnonMap live two-phase unmap and explicit-ASID forward map
+
+### 23.1 What was converted
+
+Stage 6 live-converts the VmAnonMap syscall path to use the two-phase unmap
+helpers and explicit-ASID forward mapping, completing the work gated by §22.
+
+#### 23.1.1 `rollback_anon_map` — two-phase unmap
+
+Old implementation called `unmap_user_page_in_current_asid` (one-phase, no
+TLB shootdown wait, implicit current ASID).
+
+New implementation:
+
+1. **Plan-first ASID**: ASID is resolved once by the caller (`handle_vm_anon_map`)
+   before the loop starts and passed as a parameter.
+2. **Per page**: `unmap_page_phase1(asid, VirtAddr(va))` — removes page table
+   entry, clears COW state, records the mapping removal, returns a
+   `TlbShootdownWaitPlan`. Returns `Ok(None)` for absent pages (silently skipped).
+3. **Phase 2**: `execute_tlb_shootdown_wait_plan(plan)` — fast path when
+   `target_cpu_bitmap == 0` (single CPU / no remote CPUs); otherwise sends
+   cross-CPU shootdown IPI and waits, then calls `reclaim_memory_object_for_phys`.
+4. **Capability not revoked**: Pre-existing behavior preserved. `cap_refcount=1`
+   means `reclaim_memory_object_for_phys` does not free the frame to the
+   allocator; the frame is freed only at task exit. Capability revoke is deferred
+   to a later stage.
+
+Locking sequence per page (rollback path):
+```
+vm lock (phase1: remove PTE + note_mapping_removed)
+  → release vm lock
+  → [if bitmap != 0] ipc lock (cross-CPU shootdown wait)  [rank 3 < rank 5 ok]
+  → memory lock (reclaim_memory_object_for_phys)           [rank 6 > rank 3 ok]
+```
+Absent pages (`Ok(None)`) skip both phase-2 locks entirely.
+
+#### 23.1.2 `handle_vm_anon_map` — plan-first ASID forward map
+
+Old implementation resolved ASID implicitly each iteration via
+`map_user_page_in_current_asid_with_caps` (current-ASID path, no explicit
+ASID parameter).
+
+New implementation:
+
+1. **Plan-first ASID resolution**: `current_tid(kernel)?` then
+   `kernel.task_asid(tid).ok_or(...)` — resolves ASID once before the map
+   loop. Returns `UserMemoryFault` if the task has no ASID.
+2. **Explicit-ASID guard check**: Inline check using
+   `is_user_page_mapped_in_asid(asid, VirtAddr(guard_page))` replaces the
+   old `check_stack_guard` call. Condition unchanged: `write && !execute &&
+   guard_page_mapped`. `check_stack_guard` is preserved for `handle_vm_map`.
+3. **Forward map loop**: `map_user_page_in_asid_with_caps(asid, mem_cap,
+   VirtAddr(va), flags)` — explicit ASID, identical frame allocation logic.
+4. **Rollback on error**: `rollback_anon_map(kernel, asid, addr, va)` — passes
+   the plan-first ASID through; each rollback iteration uses phase1+phase2.
+
+Locking sequence per page (forward map path):
+```
+memory lock (alloc_anonymous_memory_object)               [rank 6]
+  → release memory lock
+  → vm + memory lock (map_user_page_in_asid_with_caps)   [rank 5 then rank 6, ordered]
+  → release both
+```
+
+#### 23.1.3 Dead-code suppression removed
+
+`#[cfg_attr(not(test), allow(dead_code))]` removed from:
+- `map_user_page_in_asid_with_caps` (now live in `handle_vm_anon_map`)
+- `is_user_page_mapped_in_asid` (now live in guard check)
+
+`VmAnonMapProgressPlan` retains `#[cfg_attr(not(test), allow(dead_code))]`
+— wiring deferred.
+
+### 23.2 Invariants preserved
+
+| Invariant | How preserved |
+|-----------|---------------|
+| VmAnonMap observable behavior | Same frame allocation + flag encoding + guard condition |
+| Rollback covers only mapped range | Loop: `addr..mapped_end`, skips `Ok(None)` |
+| Capability-not-revoked on rollback | `reclaim_memory_object_for_phys` with `cap_refcount=1` does not free frame |
+| No SYSCALL_COUNT / ABI change | No new syscalls; no argument encoding change |
+| SpawnV5 semantics unchanged | Not touched |
+| Phase 3B not weakened | Not touched |
+| VFS/IPC/recv-v2/COW/demand paging | Not touched |
+| x86_64 SMP / trap / bootstrap | Not touched |
+| `check_stack_guard` for `handle_vm_map` | Original function preserved; Stage 6 only inlines for anon map |
+
+### 23.3 Lock rank ordering
+
+All lock acquisitions in the converted paths respect the domain rank order
+(rank 1 scheduler < rank 2 task < rank 3 ipc < rank 4 capability < rank 5 vm
+< rank 6 memory). No rank inversions introduced.
+
+Phase 2 (ipc rank 3) always executes after phase 1 (vm rank 5) has released
+its lock, so the rank-3 < rank-5 sequence at execution time is safe
+(ipc acquired when vm is NOT held).
+
+### 23.4 Tests
+
+6 new tests added in `src/kernel/boot/tests.rs`:
+
+| Test | What it verifies |
+|------|-----------------|
+| `vm_anon_map_stage6_plan_first_asid_maps_pages_correctly` | Three-page map via syscall, all pages visible via explicit-ASID check |
+| `vm_anon_map_stage6_explicit_asid_guard_fires` | Guard rejects PROT_WRITE when page below is pre-mapped |
+| `vm_anon_map_stage6_rollback_two_phase_removes_pages` | Phase1+phase2 helpers remove two pre-mapped pages |
+| `vm_anon_map_stage6_rollback_tolerates_absent_pages` | Phase1 on absent page returns `Ok(None)`, no panic/error |
+| `vm_anon_map_stage6_execute_only_guard_bypass_regression` | PROT_EXEC bypasses guard even when guard page is mapped |
+| `vm_anon_map_stage6_write_execute_guard_bypass_regression` | PROT_WRITE\|PROT_EXEC bypasses guard (execute=true disarms) |
+
+Total test count after Stage 6: **620** (was 614 before Stage 6).
+
+### 23.5 Smoke requirement
+
+Before Stage 6 is considered complete, x86_64 `-smp 1` smoke must pass with
+the same acceptance criteria as §22.1. The same markers apply:
+`X86_BOOTSTRAP_SCHEDULER_READY`, `ENTER_USER ≥ 1`, `STARTUP_INSTALL_FINAL ≥ 1`,
+`PM_ELF_ZC_FAIL = 0`, no fatal-ish / oom / TID-mismatch markers.
+
+### 23.6 Deferred
+
+- `VmAnonMapProgressPlan` live wiring (progress tracking across loop iterations).
+- Capability revoke on rollback (pre-existing; deferred since Stage 5C).
+- x86_64 SMP smoke.
+
+### 23.7 Files changed (Stage 6)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/memory_state.rs` | Removed `dead_code` suppression from `map_user_page_in_asid_with_caps` and `is_user_page_mapped_in_asid` |
+| `src/kernel/syscall.rs` | `rollback_anon_map` converted to two-phase; `handle_vm_anon_map` converted to plan-first ASID + explicit-ASID guard; `Asid` added to imports |
+| `src/kernel/boot/tests.rs` | 6 Stage 6 tests added |
+| `doc/KERNEL_LOCKING.md` | This section (§23) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+13 added |

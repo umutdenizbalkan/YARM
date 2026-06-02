@@ -11,7 +11,7 @@ use super::ipc::{
 };
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
-use super::vm::{CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+use super::vm::{Asid, CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 use crate::arch::syscall_abi;
 use crate::kernel::boot::UserImageSpec;
 use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskClass};
@@ -3088,10 +3088,31 @@ fn handle_spawn_from_memory_object(
 /// MemoryObject cap slots allocated before the error remain in the cnode as
 /// leaked slots; they are reclaimed when the task's cspace is destroyed on exit.
 /// TODO: revoke leaked MemoryObject caps after rollback unmap.
-fn rollback_anon_map(kernel: &mut KernelState, addr: usize, mapped_end: usize) {
+fn rollback_anon_map(kernel: &mut KernelState, asid: Asid, addr: usize, mapped_end: usize) {
+    // Stage 6: two-phase unmap — phase 1 removes the page-table entry and
+    // clears memory accounting; execute_tlb_shootdown_wait_plan issues the
+    // TLB shootdown (if needed) and reclaims the physical frame only AFTER
+    // the shootdown wait / fast path completes.
+    //
+    // Absent pages (never faulted-in or already rolled back) are silently
+    // skipped — unmap_page_phase1 returns Ok(None), the inner if-let does
+    // not match, and the loop continues. Errors from either phase are also
+    // silently ignored, preserving the old `let _ = unmap_user_page_in_current_asid`
+    // error-discarding behavior.
+    //
+    // NOTE: The capability minted by alloc_anonymous_memory_object for each
+    // successfully mapped page is NOT revoked here. cap_refcount remains 1 for
+    // each rolled-back page so reclaim_memory_object_for_phys will NOT free
+    // the physical frame to the allocator (it checks cap_refcount != 0 first).
+    // The capability slot and the physical frame are only reclaimed when the
+    // task exits and all capabilities are destroyed. This is pre-existing
+    // behavior inherited from the old unmap_user_page_in_current_asid path;
+    // capability revoke in rollback is deferred to a later stage.
     let mut va = addr;
     while va < mapped_end {
-        let _ = kernel.unmap_user_page_in_current_asid(VirtAddr(va as u64));
+        if let Ok(Some(wait_plan)) = kernel.unmap_page_phase1(asid, VirtAddr(va as u64)) {
+            let _ = kernel.execute_tlb_shootdown_wait_plan(wait_plan);
+        }
         va += PAGE_SIZE;
     }
 }
@@ -3104,21 +3125,48 @@ fn handle_vm_anon_map(
     let len = frame.arg(SYSCALL_ARG_LEN);
     let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
     let (map_len, end, flags) = validate_anon_map_args(addr, len, prot)?;
-    check_stack_guard(kernel, addr, flags)?;
+
+    // Stage 6 plan-first: resolve the current task's ASID once before the
+    // stack guard check and the map loop. This eliminates the per-iteration
+    // scheduler (rank 1) + task (rank 2) reads that were embedded inside
+    // map_user_page_in_current_asid_with_caps. All three operations below
+    // (guard check, map loop, rollback) use this single ASID snapshot.
+    let tid = current_tid(kernel)?;
+    let asid = kernel
+        .task_asid(tid)
+        .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
+
+    // Stage 6: explicit-ASID stack guard check. Uses is_user_page_mapped_in_asid
+    // with the plan-first ASID instead of re-reading scheduler+task state.
+    // Semantics are identical to check_stack_guard (Stage 5C): the guard fires
+    // iff flags.write && !flags.execute && the page immediately below addr is
+    // already mapped. Execute-only and write+execute mappings bypass the guard.
+    if flags.write
+        && !flags.execute
+        && let Some(guard_page) = addr.checked_sub(PAGE_SIZE)
+        && kernel
+            .is_user_page_mapped_in_asid(asid, VirtAddr(guard_page as u64))
+            .map_err(SyscallError::from)?
+    {
+        return Err(SyscallError::InvalidArgs);
+    }
 
     let mut va = addr;
     while va < end {
         let (_, mem_cap) = match kernel.alloc_anonymous_memory_object() {
             Ok(pair) => pair,
             Err(e) => {
-                rollback_anon_map(kernel, addr, va);
+                rollback_anon_map(kernel, asid, addr, va);
                 return Err(SyscallError::from(e));
             }
         };
+        // Stage 6: use the explicit-ASID map helper to avoid per-iteration
+        // scheduler+task reads. Equivalent to map_user_page_in_current_asid_with_caps
+        // but uses the plan-first ASID.
         if let Err(e) =
-            kernel.map_user_page_in_current_asid_with_caps(mem_cap, VirtAddr(va as u64), flags)
+            kernel.map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(va as u64), flags)
         {
-            rollback_anon_map(kernel, addr, va);
+            rollback_anon_map(kernel, asid, addr, va);
             return Err(SyscallError::from(e));
         }
         va += PAGE_SIZE;

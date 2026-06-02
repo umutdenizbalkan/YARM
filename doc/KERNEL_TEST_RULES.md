@@ -1058,4 +1058,57 @@ smoke run passes with all acceptance criteria from §22.1. The VmBrk smoke
 (Stage 5G) validates the two-phase pattern in isolation; VmAnonMap rollback
 must be validated in its own smoke run.
 
+## Rule N+13 — Stage 6 VmAnonMap live conversion tests
+
+### N+13.1 — Plan-first ASID maps all pages correctly
+
+A test must call `VmAnonMap` through `handle_trap` with a multi-page range and
+verify all pages are visible via `is_user_page_mapped_in_asid(asid, ...)` after
+success. This validates that the Stage 6 explicit-ASID forward map path produces
+the same observable result as the old current-ASID path.
+
+### N+13.2 — Explicit-ASID guard check fires correctly
+
+A test must pre-map the guard page (one page below the target address), then
+attempt a `PROT_WRITE` (write=true, execute=false) mapping at the target. The
+syscall must fail. This validates the inlined explicit-ASID guard check in
+`handle_vm_anon_map` (which replaced the `check_stack_guard` call).
+
+### N+13.3 — Two-phase rollback removes mapped pages
+
+A test must directly call `unmap_page_phase1` and `execute_tlb_shootdown_wait_plan`
+on pre-mapped pages, simulating the rollback path, and assert all pages are absent
+afterwards. This validates the Phase 1 + Phase 2 helpers as used by
+`rollback_anon_map`.
+
+### N+13.4 — Rollback tolerates absent pages (`Ok(None)` from phase1)
+
+A test must call `unmap_page_phase1` on a page that was never mapped and assert
+the result is `Ok(None)` (not an error, not `Some`). No panic must occur. This
+validates the silent-skip branch in `rollback_anon_map`.
+
+### N+13.5 — Execute-only bypass regression must be covered
+
+A test with `PROT_EXEC` (execute=true, write=false) at a guarded address must
+succeed. Tests N+13.5 and N+13.6 together confirm the guard condition
+`write && !execute` is preserved exactly through the Stage 6 inline conversion.
+
+### N+13.6 — Write+execute bypass regression must be covered
+
+A test with `PROT_WRITE|PROT_EXEC` (both write and execute true) at a guarded
+address must succeed (execute=true disarms the guard). This is the symmetric
+counterpart to N+13.5.
+
+### N+13.7 — Full suite must pass at 620+ tests
+
+Every Stage 6 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 620 tests (614 from Stage 5 + 6 new Stage 6 tests). The Stage 5C/5D/5E/5F
+tests serve as the behavior-unchanged regression harness.
+
+### N+13.8 — Capability-not-revoked behavior must NOT be asserted as fixed
+
+Stage 6 tests must not assert that capability slots are freed during rollback.
+The `rollback_anon_map` comment documenting cap_refcount=1 behavior is
+sufficient. Any test asserting cap-slot reclamation belongs in a later stage.
+
 ---
