@@ -3793,3 +3793,73 @@ Total: 554 → 557 / 0 failed.
 - The main dispatch `with_cpu` call and all raw-fallback Class F paths: retained.
 - The global `SharedKernel` lock is still retained for all mutation paths.
   **This is not Stage 3/global-lock removal.**
+
+---
+
+## 14. x86_64 bootstrap timer guard (Phase BT1)
+
+### 14.1 Root cause
+
+`borrow_kernel_for_boot()` bypasses the `SpinLock<KernelState>` and returns a raw
+`&mut KernelState`. The x86_64 boot sequence calls `enable_interrupts_for_boot`
+(STI) before `run(kernel)` / `bootstrap_first_user_task`. ELF loading for three
+~16 MB images in QEMU takes longer than the LAPIC timer deadline of
+`BOOTSTRAP_TIMER_DEADLINE_TICKS = 50,000,000 ticks ≈ 800 ms`, so the timer IRQ
+fires while bootstrap holds the raw `borrow_kernel_for_boot` reference.
+
+The timer ISR enters via `dispatch_trap_entry_with_shared_kernel` →
+`SharedKernel::with_cpu(...)`, which acquires `SpinLock<KernelState>`. This
+succeeds (bootstrap does not hold the SpinLock) and returns a second mutable
+reference to the same `KernelState` memory — an aliased mutable reference that is
+undefined behavior. The ISR modifies scheduler state (tick counter, current_cpu,
+potentially current_tid via `yield_current`), corrupting the bootstrap's view.
+After IRETQ, `dispatch_ready_task` returns `None` and the kernel enters the idle
+path without ever reaching userspace.
+
+### 14.2 Fix: EOI-only timer guard (Phase BT1)
+
+A `BOOTSTRAP_SCHEDULER_READY: AtomicBool` flag is added to
+`src/arch/x86_64/descriptor_tables.rs`. It starts `false`. The timer ISR in
+`src/kernel/boot/fault_state.rs` checks this flag immediately after `acknowledge_interrupt`;
+if false, it logs `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY`, re-arms the timer, and returns
+`Ok(())` without ticking the scheduler or calling `yield_current`.
+
+`signal_bootstrap_scheduler_ready()` (in `src/arch/x86_64/descriptor_tables.rs`,
+exposed via `src/arch/boot_entry.rs`) stores `true` with `Ordering::Release`.
+`run_scheduler_loop` in `src/bin/kernel_boot.rs` calls
+`yarm::arch::boot_entry::signal_bootstrap_scheduler_ready()` after both
+`bootstrap_first_user_task` and `release_secondary_cpus_after_bootstrap` complete.
+
+At that point all three user tasks (TID 1/2/3) are in the run queue. The timer ISR
+will re-arm to 50M ticks from its last EOI-only fire, giving a long enough window
+for `dispatch_ready_task` + `enter_dispatched_user_task_if_available` to complete
+the IRETQ to TID 1 before the next tick.
+
+### 14.3 Instrumentation markers
+
+- `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY cpu=<n>`: emitted each time a timer IRQ is
+  suppressed during bootstrap. Expected: present (≥1) in x86_64 smoke when ELF
+  loading takes >800 ms.
+- `X86_BOOTSTRAP_SCHEDULER_READY`: emitted once after bootstrap completes and the
+  flag is set. Expected: exactly 1 occurrence in x86_64 smoke.
+
+### 14.4 Invariants preserved
+
+- AArch64 paths: untouched (guard is `#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]`).
+- hosted-dev: `signal_bootstrap_scheduler_ready()` is a no-op (no `#[cfg]` body).
+- x86_64 SMP and `src/arch/x86_64/smp.rs`: untouched.
+- Syscall ABI / SYSCALL_COUNT: unchanged.
+- SpawnV5, VFS, syscall 27, VFS_READ_SHARED_REPLY_ENABLED: untouched.
+- Phase 3B checks: not weakened.
+- Register writeback / trap return semantics: unchanged.
+- The global `SharedKernel` lock is still retained for all mutation paths.
+  **This is not Stage 3/global-lock removal.**
+
+### 14.5 Files changed
+
+| File | Change |
+|------|--------|
+| `src/arch/x86_64/descriptor_tables.rs` | `BOOTSTRAP_SCHEDULER_READY` static, `signal_bootstrap_scheduler_ready()`, `bootstrap_scheduler_is_ready()` |
+| `src/arch/boot_entry.rs` | `signal_bootstrap_scheduler_ready()` wrapper (x86_64 bare-metal only) |
+| `src/kernel/boot/fault_state.rs` | EOI-only guard in `Trap::TimerInterrupt` arm |
+| `src/bin/kernel_boot.rs` | Call `signal_bootstrap_scheduler_ready()` after bootstrap and secondary-CPU release |

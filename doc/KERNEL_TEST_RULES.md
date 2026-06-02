@@ -514,3 +514,29 @@ entering_tid and exiting_tid sites are classified **Class F** (global lock requi
 Do not attempt to convert them without a successful end-to-end smoke run.
 
 ---
+
+## Rule N+1 — x86_64 bootstrap timer: do not tick/yield before `BOOTSTRAP_SCHEDULER_READY`
+
+**Invariant**: On x86_64 bare metal, the LAPIC timer IRQ may fire during
+`bootstrap_first_user_task` (ELF loading takes >800 ms; timer deadline is 800 ms).
+At that point, `bootstrap_first_user_task` holds a raw `&mut KernelState` from
+`borrow_kernel_for_boot()`, which bypasses `SpinLock<KernelState>`. If the timer
+ISR simultaneously acquires the SpinLock via `shared.with_cpu()`, both hold mutable
+aliases to the same memory — undefined behavior. Ticking or yielding in this window
+corrupts scheduler state and causes the kernel to idle instead of entering userspace.
+
+**Guard**: `BOOTSTRAP_SCHEDULER_READY: AtomicBool` in
+`src/arch/x86_64/descriptor_tables.rs` starts `false`. The timer ISR checks it
+immediately after `acknowledge_interrupt`. While `false`, the ISR does EOI + re-arm
+only and returns. `signal_bootstrap_scheduler_ready()` sets it to `true` (Release)
+after bootstrap and secondary-CPU release complete.
+
+**Rule**: Never call `tick_scheduler_timer()`, `yield_current()`, or any function
+that modifies scheduler/task state from the x86_64 timer ISR path until
+`bootstrap_scheduler_is_ready()` returns `true`. The EOI-only guard must come first.
+
+**Corollary**: `borrow_kernel_for_boot()` is safe only if no concurrent path acquires
+`SharedKernel::with_cpu()` for the same `KernelState`. On x86_64, the bootstrap timer
+guard enforces this; do not widen the window between STI and the guard being set.
+
+---

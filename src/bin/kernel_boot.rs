@@ -17,6 +17,10 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
         yarm::pr_err!("failed to bootstrap first user task: {:?}", err);
     }
     yarm::arch::boot_entry::release_secondary_cpus_after_bootstrap();
+    // x86_64: unblock the timer ISR from EOI-only mode now that all user tasks
+    // are spawned and enqueued. Must come after bootstrap_first_user_task and
+    // release_secondary_cpus_after_bootstrap complete.
+    yarm::arch::boot_entry::signal_bootstrap_scheduler_ready();
     if DEBUG_DISPATCH_CONTEXT_LOG {
         yarm::yarm_log!("BSP_POST_RELEASE cpu={}", cpu.0);
         yarm::yarm_log!("BSP_REDISPATCH_BEGIN cpu={}", cpu.0);

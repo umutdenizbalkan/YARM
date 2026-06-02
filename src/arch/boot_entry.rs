@@ -48,6 +48,17 @@ pub fn emit_panic(info: &core::panic::PanicInfo<'_>) {
     crate::arch::selected_isa::boot::emit_panic(info)
 }
 
+/// Called once after bootstrap_first_user_task completes and all user tasks are
+/// enqueued. On x86_64 bare metal, this unblocks the timer ISR from EOI-only
+/// mode so it can process scheduler ticks and preemption normally.
+pub fn signal_bootstrap_scheduler_ready() {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    {
+        crate::arch::x86_64::descriptor_tables::signal_bootstrap_scheduler_ready();
+        crate::yarm_log!("X86_BOOTSTRAP_SCHEDULER_READY");
+    }
+}
+
 struct IrqDescriptionLockGuard;
 
 impl IrqDescriptionLockGuard {
