@@ -959,3 +959,55 @@ asserting premature reclamation would contradict the two-phase ordering
 invariant this design is trying to enforce.
 
 ---
+
+## Rule N+11 — VmBrk two-phase shrink tests
+
+### N+11.1 — Test the partial-page preservation invariant
+
+A test must verify that a non-page-aligned `requested_end` leaves the page
+containing it mapped. This is the core invariant of `round_up_page(requested)`:
+only full pages strictly above `requested_end` are in the unmap range.
+
+### N+11.2 — Test the empty-range case
+
+A test must verify that when `round_up_page(requested) == round_up_page(current_end)`,
+no pages are unmapped and the brk bounds are still updated. This guards against
+the loop running when `unmap_start >= unmap_end`.
+
+### N+11.3 — Test execute_tlb_shootdown_wait_plan directly
+
+`execute_tlb_shootdown_wait_plan` must have at least one direct test that calls
+it with a plan obtained from `unmap_page_phase1`. The test must verify:
+- No error is returned.
+- The page is absent from the address space after the call
+  (phase 1 removed it; phase 2+3 must not re-insert it).
+- In single-CPU, `target_cpu_bitmap == 0` so the fast path is taken.
+
+### N+11.4 — Preserve Stage 5D lazy-page regression tests
+
+The Stage 5D tests (`vm_brk_shrink_tolerates_lazy_unmapped_pages` and
+`vm_brk_shrink_with_partially_mapped_lazy_region`) must continue to pass with
+the Stage 5F implementation. Adding new lazy-page tests for the two-phase path
+is permitted but not required if the Stage 5D tests already provide coverage.
+
+### N+11.5 — Tests must not assert shootdown order relative to reclaim
+
+Tests must not assert that `request_live_asid_shootdown` is called BEFORE
+`reclaim_memory_object_for_phys` by inspecting internal state — this would be
+an implementation detail, not an observable invariant. Instead, verify the
+observable consequence: that the page is absent from the address space and that
+no error occurred.
+
+### N+11.6 — x86_64 smoke required for SMP tests
+
+No test may assert that the two-phase ordering produces a different result on
+SMP hardware without x86_64 smoke approval. Single-CPU (fast-path) tests are
+always permitted.
+
+### N+11.7 — VmAnonMap behavior must not change
+
+Every Stage 5F test suite run must include at least one end-to-end VmAnonMap
+test (map → access → unmap lifecycle). If VmAnonMap behavior changes unexpectedly,
+the test must catch it. The Stage 5C/5D VmAnonMap tests serve this purpose.
+
+---

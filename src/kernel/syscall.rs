@@ -3162,14 +3162,31 @@ fn handle_vm_brk(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
         let unmap_start = round_up_page(requested)?;
         let unmap_end = round_up_page(current_end)?;
         if unmap_start < unmap_end {
+            // Stage 5F two-phase shrink: resolve ASID once before the loop
+            // (plan-first: snapshot task rank 2 before vm+memory mutation).
+            // Equivalent to the per-iteration resolution in the old path, but
+            // done once so the loop body is free of scheduler/task reads.
+            let asid = kernel
+                .task_asid(plan.tid)
+                .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
             let mut va = unmap_start;
             while va < unmap_end {
-                // Missing mappings are valid for lazy brk pages: a page in the
-                // shrink interval may never have faulted in, so the unmap
-                // helper returns Ok(None) and we continue without panicking.
-                kernel
-                    .unmap_user_page_in_current_asid(VirtAddr(va as u64))
-                    .map_err(SyscallError::from)?;
+                // Stage 5F: two-phase unmap per page.
+                //   Phase 1 (unmap_page_phase1): remove page table entry, clear COW,
+                //     decrement map_refcount.  Returns Ok(None) for lazy/absent pages
+                //     so the loop tolerates brk pages that were never faulted in.
+                //   Phase 2 (execute_tlb_shootdown_wait_plan): TLB shootdown when
+                //     needed, then frame reclamation AFTER shootdown completes.
+                //   This ordering (reclaim after shootdown) is the fix for Stage 5E
+                //   blocker #1b: the old path reclaimed before shooting.
+                if let Some(wait_plan) = kernel
+                    .unmap_page_phase1(asid, VirtAddr(va as u64))
+                    .map_err(SyscallError::from)?
+                {
+                    kernel
+                        .execute_tlb_shootdown_wait_plan(wait_plan)
+                        .map_err(SyscallError::from)?;
+                }
                 va += PAGE_SIZE;
             }
         }

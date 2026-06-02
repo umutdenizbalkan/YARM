@@ -153,7 +153,6 @@ impl KernelState {
     ///
     /// When `plan.target_cpu_bitmap == 0`, no cross-CPU notification is needed and
     /// `request_live_asid_shootdown` returns immediately — the unmap is ipc-lock-free.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn compute_tlb_shootdown_request_plan(
         &self,
         asid: Asid,
@@ -170,6 +169,40 @@ impl KernelState {
         }
     }
 
+    /// Stage 5F (Part 1): rank-ordering characterisation for Stage 5E blocker #1a.
+    ///
+    /// ## Lock/rank ordering
+    ///
+    /// This function acquires the ipc domain lock (rank 3) to register the
+    /// pending shootdown. The critical ordering property is:
+    ///
+    ///   **All vm (rank 5) and memory (rank 6) locks are RELEASED before this
+    ///   function is called. There is no simultaneous vm/memory/ipc nesting.**
+    ///
+    /// The correct call sequence in the two-phase design is:
+    ///
+    /// ```text
+    ///   Phase 1 — vm(5) acquired → page removed → vm(5) released
+    ///             memory(6) acquired → clear COW, decrement refcount → memory(6) released
+    ///   Phase 2 — ipc(3) acquired [this function] → shootdown wait → ipc(3) released
+    ///   Phase 3 — memory(6) acquired → reclaim frame → memory(6) released
+    /// ```
+    ///
+    /// ## Real hazard (Stage 5E blocker #1b)
+    ///
+    /// The hazard is NOT that ipc(3) and vm(5)/memory(6) are held simultaneously —
+    /// they are never simultaneously held. The hazard is that the old callers
+    /// (`unmap_user_page_in_*`) call `reclaim_memory_object_for_phys` BEFORE
+    /// this function. Under the global lock that ordering is safe; for global-lock
+    /// removal, the frame must not be freed until after shootdown completes.
+    /// The `unmap_page_phase1` + `execute_tlb_shootdown_wait_plan` pattern fixes
+    /// this ordering.
+    ///
+    /// ## Fast path
+    ///
+    /// If `targets == 0` (no remote CPU has the ASID loaded), this function
+    /// returns immediately without acquiring the ipc lock. TLB shootdown is not
+    /// needed. In single-CPU (hosted-dev), this is always the path taken.
     fn request_live_asid_shootdown(
         &mut self,
         asid: Asid,
@@ -878,7 +911,6 @@ impl KernelState {
     /// BEFORE `request_live_asid_shootdown`. Under the global lock this is safe.
     /// `unmap_page_phase1` + explicit shootdown + explicit reclaim is the pattern
     /// needed for global-lock-free correctness.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn unmap_page_phase1(
         &mut self,
         asid: Asid,
@@ -906,6 +938,46 @@ impl KernelState {
             requester: req.requester,
             phys: mapping.phys,
         }))
+    }
+
+    /// Stage 5F: Execute phases 2 and 3 of the two-phase unmap for a single page.
+    ///
+    /// This is the mandatory second step after `unmap_page_phase1`. It MUST be
+    /// called for every `Some(plan)` returned by phase 1, and only after all
+    /// vm/memory lock work for phase 1 is complete.
+    ///
+    /// ## Phase 2 — TLB shootdown (ipc rank 3)
+    ///
+    /// If `plan.target_cpu_bitmap == 0`, the fast path is taken: no cross-CPU
+    /// notification is needed and the ipc lock is NOT acquired. In single-CPU
+    /// environments (hosted-dev, BT2), this is always the fast path.
+    ///
+    /// If `plan.target_cpu_bitmap != 0`, `request_live_asid_shootdown` is called
+    /// which acquires ipc(3) sequentially after vm(5)/memory(6) were released in
+    /// phase 1. There is no simultaneous vm/memory/ipc nesting (see comment on
+    /// `request_live_asid_shootdown` for the full rank-ordering characterisation).
+    ///
+    /// ## Phase 3 — frame reclamation (memory rank 6)
+    ///
+    /// `reclaim_memory_object_for_phys(plan.phys)` is called after the shootdown
+    /// (or after confirming no shootdown is needed). This ensures the physical
+    /// frame is not freed before all CPUs have invalidated their TLB entries for
+    /// the removed mapping — the fix for Stage 5E blocker #1b.
+    pub(crate) fn execute_tlb_shootdown_wait_plan(
+        &mut self,
+        plan: super::TlbShootdownWaitPlan,
+    ) -> Result<(), KernelError> {
+        // Phase 2: Fast path if no remote CPUs need notification.
+        // The bitmap in the plan is the snapshot from phase 1; under the global
+        // lock it is equivalent to recomputing now (no CPU can start running the
+        // ASID between phase 1 and phase 2).
+        if plan.target_cpu_bitmap != 0 {
+            self.request_live_asid_shootdown(plan.asid, plan.virt)?;
+        }
+        // Phase 3: Reclaim the physical frame now that shootdown is complete (or
+        // confirmed unnecessary). This ordering prevents UAF under global-lock removal.
+        self.reclaim_memory_object_for_phys(plan.phys);
+        Ok(())
     }
 
     pub fn protect_user_page(

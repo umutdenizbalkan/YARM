@@ -4803,3 +4803,187 @@ Remaining blockers for full conversion:
 | `src/kernel/boot/tests.rs` | Added 6 new Stage 5E tests |
 | `doc/KERNEL_LOCKING.md` | This section (Section 20) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+10 added |
+
+---
+
+## §21 Stage 5F: live two-phase VmBrk shrink
+
+### 21.1 Goal
+
+Stage 5F resolves Stage 5E blocker #1a in code comments and performs the first
+bounded live two-phase VM/TLB conversion: the VmBrk shrink path only.
+
+VmAnonMap and `rollback_anon_map` remain unchanged.
+
+### 21.2 Part 1 — rank-ordering clarification (blocker #1a resolved)
+
+A full doc comment was added to `request_live_asid_shootdown` in
+`memory_state.rs`. The comment states precisely:
+
+- ipc(rank 3) is acquired **sequentially**, after all vm(5) and memory(6)
+  locks have been **released**. There is no simultaneous vm/memory/ipc nesting.
+- The correct two-phase call sequence is:
+  ```
+  Phase 1: vm(5) → remove page → vm(5) released
+           memory(6) → clear COW + decrement refcount → memory(6) released
+  Phase 2: ipc(3) → shootdown wait → ipc(3) released
+  Phase 3: memory(6) → reclaim frame → memory(6) released
+  ```
+- The real hazard (blocker #1b) is that the old callers reclaimed the frame
+  BEFORE the shootdown. Under the global lock this is safe; without it, a
+  freed frame could be reused while stale TLB entries still point to it.
+- Future code that splits paths must release vm/memory before calling
+  `request_live_asid_shootdown`.
+
+**Blocker #1a status: resolved** (code comment + §21).
+
+### 21.3 VmBrk shrink path — audit (Part 2)
+
+The old shrink path in `handle_vm_brk`:
+
+```
+requested < current_end:
+  unmap_start = round_up_page(requested)
+  unmap_end   = round_up_page(current_end)
+  if unmap_start < unmap_end:
+    for va in [unmap_start, unmap_end) step PAGE_SIZE:
+      unmap_user_page_in_current_asid(va):
+        1. scheduler(1) + task(2): resolve current TID and ASID
+        2. vm(5): AddressSpace::unmap_page(va) → Option<Mapping>
+        3. if Some(mapping):
+             memory(6): clear_cow_page(asid, va)
+             memory(6): note_mapping_removed(phys)
+             memory(6): reclaim_memory_object_for_phys(phys)  ← wrong order
+             ipc(3): request_live_asid_shootdown(asid, va)    ← after reclaim
+        4. Returns Ok(None) for lazy/absent pages → loop continues
+set_task_brk_bounds(tid, base, requested)
+frame.set_ok(requested)
+```
+
+Key behaviors to preserve:
+- Partial page (non-page-aligned `requested_end`): `unmap_start = round_up_page(requested)`
+  means the page containing `requested_end` is NOT unmapped. Preserved ✓
+- Lazy pages: `unmap_user_page_in_current_asid` returns `Ok(None)` for absent
+  pages. The new `unmap_page_phase1` preserves this — see §20. Preserved ✓
+- brk updated after all unmap bookkeeping: `set_task_brk_bounds` is called after
+  the unmap loop. Preserved ✓
+- Error behavior: if any unmap step errors, the loop aborts and brk is NOT
+  updated. Preserved ✓ (new path uses `?` in the same positions)
+
+### 21.4 Live two-phase VmBrk shrink conversion (Part 3)
+
+**Conversion: LIVE.** The shrink branch in `handle_vm_brk` was updated to use
+the two-phase unmap pattern.
+
+New method added: `execute_tlb_shootdown_wait_plan(&mut self, plan: TlbShootdownWaitPlan)`.
+
+#### 21.4.1 New lock/order sequence
+
+```
+Phase 0 (plan-first): scheduler(1) + task(2) → resolve ASID once, before loop
+  [ old: resolved per-iteration inside unmap_user_page_in_current_asid ]
+
+For each va in [unmap_start, unmap_end):
+  Phase 1 — unmap_page_phase1(asid, va):
+    vm(5): AddressSpace::unmap_page(va) → Option<Mapping>
+    if Some(mapping):
+      memory(6): clear_cow_page(asid, va)
+      memory(6): note_mapping_removed(phys)
+      scheduler(1)+task(2): compute_tlb_shootdown_request_plan → target bitmap
+    returns Ok(Some(plan)) or Ok(None)
+
+  Phase 2+3 — execute_tlb_shootdown_wait_plan(plan):
+    if plan.target_cpu_bitmap != 0:
+      ipc(3): begin_live_tlb_shootdown_wait(...)
+      busy-wait for ACKs
+      ipc(3): clear_live_tlb_shootdown_wait()
+    else: fast path, no ipc lock (always taken in single-CPU)
+    memory(6): reclaim_memory_object_for_phys(plan.phys)   ← AFTER shootdown
+
+set_task_brk_bounds(tid, base, requested)
+frame.set_ok(requested)
+```
+
+#### 21.4.2 What changed vs old path
+
+| Property | Old path | New path |
+|----------|----------|----------|
+| ASID resolution | Per-iteration (scheduler+task read each loop) | Once before loop (plan-first) |
+| reclaim vs shootdown order | reclaim BEFORE shootdown | shootdown BEFORE reclaim ✓ |
+| Lazy page handling | `Ok(None)` in `unmap_user_page_in_current_asid` | `Ok(None)` in `unmap_page_phase1` |
+| Partial page | `round_up_page(requested)` unchanged | unchanged |
+| brk update timing | after all unmaps | after all unmaps (unchanged) |
+| Error abort | `?` propagates | `?` propagates (unchanged) |
+
+The only **semantic** change is the order of shootdown and reclaim. Under the
+global lock, both orders are safe — no observable behavior difference.
+
+### 21.5 Frame reclaim ordering invariant
+
+**Invariant**: `reclaim_memory_object_for_phys(plan.phys)` in phase 3 is called
+only after `request_live_asid_shootdown` (phase 2) has completed or confirmed
+that no shootdown is needed (`target_cpu_bitmap == 0`).
+
+This is enforced by the sequential structure of `execute_tlb_shootdown_wait_plan`:
+```rust
+if plan.target_cpu_bitmap != 0 {
+    self.request_live_asid_shootdown(plan.asid, plan.virt)?;
+    // Returns only after all ACKs received or fast-pathed.
+}
+self.reclaim_memory_object_for_phys(plan.phys);  // Always last.
+```
+
+### 21.6 VmAnonMap — still deferred (Part 4)
+
+`handle_vm_anon_map` and `rollback_anon_map` are **unchanged**.
+
+The VmBrk conversion demonstrates that the two-phase pattern works correctly.
+VmAnonMap defers until:
+- Blocker #3 (x86_64 SMP smoke) is satisfied.
+- The per-page loop progress capture (`VmAnonMapProgressPlan`) is wired up.
+
+### 21.7 x86_64 smoke requirement (Part 6)
+
+**x86_64 smoke is required** before this change is considered final for SMP.
+The VmBrk shrink path was live-converted: `reclaim_memory_object_for_phys` now
+runs after `request_live_asid_shootdown`, a different order than before.
+
+Under the global lock on a single-CPU host, the behavior is identical.
+On SMP hardware, the new ordering ensures frames are not reused while stale
+TLB entries exist. The smoke acceptance criteria are unchanged from the
+Stage 5E task specification.
+
+The conversion is safe to ship to main for the current single-CPU supported
+configurations. Smoke is required before enabling VmBrk shrink on the SMP
+path.
+
+### 21.8 Hard invariants for Stage 5F
+
+- VmBrk shrink semantics: preserved (partial page, lazy pages, brk timing). ✓
+- `handle_vm_anon_map` unchanged. ✓
+- All 614 tests pass. ✓
+- No SMP/smp.rs changes. ✓
+- No trap return/writeback changes. ✓
+- No syscall ABI/SYSCALL_COUNT changes. ✓
+- No CapRights widening, SpawnV5, VFS, syscall27, Phase 3B changes. ✓
+- Global lock (`SharedKernel::with_cpu()`) still wraps all syscall handlers. ✓
+
+### 21.9 Tests added (Stage 5F)
+
+| Test | What it proves |
+|------|----------------|
+| `vm_brk_two_phase_shrink_removes_mapped_pages_and_updates_bounds` | end-to-end: all 3 pages removed, bounds updated |
+| `vm_brk_two_phase_shrink_non_page_aligned_preserves_partial_page` | non-aligned requested_end preserves partial page, removes full pages above |
+| `vm_brk_two_phase_shrink_empty_unmap_range_preserves_page` | intra-page shrink: empty unmap range, page preserved, brk updated |
+| `execute_tlb_shootdown_wait_plan_completes_in_single_cpu_fast_path` | phase2+3 helper: fast path (bitmap==0), no error, page still absent |
+| `vm_brk_two_phase_shrink_single_page_updates_to_base` | single-page brk: full unmap, bounds = (base, base) |
+
+### 21.10 Files changed (Stage 5F)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/memory_state.rs` | Added rank-ordering doc comment to `request_live_asid_shootdown`; removed `#[cfg_attr(not(test), allow(dead_code))]` from `compute_tlb_shootdown_request_plan` and `unmap_page_phase1` (now live); added `execute_tlb_shootdown_wait_plan` |
+| `src/kernel/syscall.rs` | Live-converted VmBrk shrink to two-phase: ASID resolved once plan-first, per-page `unmap_page_phase1` + `execute_tlb_shootdown_wait_plan` |
+| `src/kernel/boot/tests.rs` | Added 5 new Stage 5F tests |
+| `doc/KERNEL_LOCKING.md` | This section (Section 21) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+11 added |
