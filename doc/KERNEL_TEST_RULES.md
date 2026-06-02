@@ -1112,3 +1112,80 @@ The `rollback_anon_map` comment documenting cap_refcount=1 behavior is
 sufficient. Any test asserting cap-slot reclamation belongs in a later stage.
 
 ---
+
+## Rule N+14 — Stage 7 tests: remaining current-ASID syscall.rs domain
+
+Stage 7 converts `handle_transfer_release`, `map_shared_region_into_receiver`
+rollback, and the `handle_vm_map` guard to explicit-ASID / two-phase paths,
+and deletes `check_stack_guard`. The following rules govern Stage 7 tests.
+
+### N+14.1 — `handle_transfer_release` two-phase tests must cover the success path
+
+A test must map a page into a known ASID, call `TransferRelease` for that page,
+and verify the page is no longer mapped in the address space afterward. This
+confirms Phase 1 (PTE removal) and Phase 2 (shootdown + reclaim) both execute
+on the success path.
+
+### N+14.2 — `handle_transfer_release` must return `InvalidArgs` for absent pages
+
+A test must call `TransferRelease` on a virtual address that was never mapped
+and verify the syscall returns `InvalidArgs`. This preserves the
+`Ok(None)` → `InvalidArgs` mapping that replaces the old
+`unmap_user_page_in_current_asid` → `None` → `InvalidArgs` path.
+
+### N+14.3 — `handle_transfer_release` fast-path bitmap test on single-CPU
+
+A test must verify that `execute_tlb_shootdown_wait_plan` completes without
+blocking (fast path) in a single-CPU simulated environment, confirming that the
+bitmap fast-path in the shootdown machinery works correctly when all CPUs are
+accounted for immediately.
+
+### N+14.4 — `handle_transfer_release` multi-page test must unmap all pages
+
+A test must map N pages into a known ASID, call `TransferRelease` covering all
+N pages, and verify that every page is absent after the call. This ensures the
+Phase 1/Phase 2 loop iterates correctly across a multi-page region.
+
+### N+14.5 — `handle_vm_map` guard must use capability ASID
+
+A test must create an address space capability, pre-map the guard page in that
+capability's ASID, then call `VmMap` with `write && !execute` flags and verify
+`InvalidArgs` is returned. The test must use the capability ASID explicitly
+(not the current-task ASID) to confirm the ASID-consistency fix. A companion
+test must confirm that an un-mapped guard page in the capability ASID does NOT
+block the `VmMap` call.
+
+### N+14.6 — `handle_vm_map` execute-only and write+execute bypass regressions
+
+Two regression tests must confirm that the `write && !execute` guard condition
+is preserved exactly:
+- `execute && !write` maps must NOT trigger the guard (guard bypass test).
+- `write && execute` maps must NOT trigger the guard (guard bypass test).
+
+These correspond to N+13.5 and N+13.6 for the Stage 6 `handle_vm_anon_map`
+tests and verify that deleting `check_stack_guard` and inlining the condition
+did not alter the flag logic.
+
+### N+14.7 — `map_shared_region_into_receiver` rollback two-phase test
+
+A test must induce a partial-failure scenario in `map_shared_region_into_receiver`
+(e.g., by exhausting memory after the first page is mapped) and verify that the
+pages already mapped are removed by the rollback path using two-phase unmap.
+This confirms the rollback loop iterates from `requested_va` up to `va` and
+calls `unmap_page_phase1` + `execute_tlb_shootdown_wait_plan` for each page.
+
+### N+14.8 — Full suite must pass at 629+ tests
+
+Every Stage 7 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 629 tests (620 from Stage 6 + 9 new Stage 7 tests). All prior
+Stage 5C/5D/5E/5F, Stage 6, and Stage 6A tests serve as the
+behavior-unchanged regression harness.
+
+### N+14.9 — `check_stack_guard` deletion must not require a test change
+
+`check_stack_guard` was a private helper with no direct test. Its deletion is
+covered by the Stage 7 `handle_vm_map` guard tests (N+14.5, N+14.6). No
+existing test may be changed to accommodate the deletion — any break would
+indicate the inlined condition differs from the deleted helper.
+
+---

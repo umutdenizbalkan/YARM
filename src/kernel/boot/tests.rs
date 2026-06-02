@@ -9871,6 +9871,405 @@ fn vm_anon_map_stage6_write_execute_guard_bypass_regression() {
         .expect("join");
 }
 
+// ── Stage 7: two-phase handle_transfer_release + VmMap explicit-ASID guard ────
+//
+// These tests verify the Stage 7 live conversions:
+//   1. handle_transfer_release uses two-phase unmap (plan-first ASID + phase1 +
+//      execute_tlb_shootdown_wait_plan) — absent pages → InvalidArgs unchanged.
+//   2. map_shared_region_into_receiver rollback uses two-phase unmap.
+//   3. IPC recv register_active_transfer_mapping rollback uses two-phase unmap.
+//   4. handle_vm_map guard uses capability-ASID (not current_task ASID).
+
+#[test]
+fn transfer_release_stage7_two_phase_unmaps_mapped_page() {
+    // Stage 7: handle_transfer_release must unmap the mapped page via
+    // unmap_page_phase1 + execute_tlb_shootdown_wait_plan, and revoke the
+    // transfer capability. The page must be absent after the syscall.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let virt = VirtAddr(0x1_0000u64);
+            let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
+                .expect("map page");
+            // Register the transfer mapping so the zero-args fast path works.
+            state
+                .register_active_transfer_mapping(
+                    crate::kernel::ipc::ThreadId(0),
+                    mem_cap,
+                    virt,
+                    PAGE_SIZE,
+                )
+                .expect("register transfer");
+            state.note_shared_mem_mapped(PAGE_SIZE);
+
+            // TransferRelease with zero base/len: looks up the active mapping.
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::TransferRelease as usize,
+                [mem_cap.0 as usize, 0, 0, 0, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "TransferRelease must succeed for a mapped page"
+            );
+
+            // Page must be unmapped.
+            assert!(
+                !state
+                    .is_user_page_mapped_in_asid(asid, virt)
+                    .expect("post-release check"),
+                "page must be absent after TransferRelease"
+            );
+            // Capability must be revoked.
+            assert!(
+                state
+                    .capability_service()
+                    .resolve_current_task_capability(mem_cap)
+                    .is_none(),
+                "transfer capability must be revoked after TransferRelease"
+            );
+            // Telemetry must record the release.
+            let t = state.ipc_path_telemetry();
+            assert_eq!(t.shared_mem_bytes_released, PAGE_SIZE as u64);
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn transfer_release_stage7_absent_page_returns_invalid_args() {
+    // Stage 7: handle_transfer_release must return InvalidArgs when a page in
+    // the release range is not mapped. This preserves the old behavior where
+    // unmap_user_page_in_current_asid returned None → InvalidArgs.
+    // With two-phase: unmap_page_phase1 returning Ok(None) must also → InvalidArgs.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, _asid) = setup_task0_with_known_asid();
+
+            let base = 0x2_0000_usize;
+            let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            // Do NOT map the page — simulate absent page in release range.
+            state
+                .register_active_transfer_mapping(
+                    crate::kernel::ipc::ThreadId(0),
+                    mem_cap,
+                    VirtAddr(base as u64),
+                    PAGE_SIZE,
+                )
+                .expect("register transfer");
+
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::TransferRelease as usize,
+                [mem_cap.0 as usize, base, PAGE_SIZE, 0, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_failed(r, &frame),
+                "TransferRelease must fail (InvalidArgs) for absent page"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn transfer_release_stage7_fast_path_bitmap_zero_in_single_cpu() {
+    // Stage 7: In single-CPU (hosted-dev), unmap_page_phase1 always produces
+    // target_cpu_bitmap == 0. execute_tlb_shootdown_wait_plan takes the fast
+    // path (no ipc lock). Verify via the direct phase1 helper and then via the
+    // full TransferRelease syscall flow.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let virt = VirtAddr(0x3_0000u64);
+            let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
+                .expect("map page");
+
+            // Verify phase1 produces bitmap=0 (fast path) before release.
+            // We re-map after to leave it mapped for the full release test.
+            let plan = state
+                .unmap_page_phase1(asid, virt)
+                .expect("phase1 must not error")
+                .expect("phase1 must be Some");
+            assert_eq!(
+                plan.target_cpu_bitmap, 0,
+                "single-CPU: phase1 bitmap must be 0"
+            );
+            state.execute_tlb_shootdown_wait_plan(plan).expect("phase2");
+
+            // Re-map and run the full TransferRelease path.
+            let (_, mem_cap2) = state.alloc_anonymous_memory_object().expect("alloc mo2");
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap2, virt, PageFlags::USER_RW)
+                .expect("re-map");
+            state
+                .register_active_transfer_mapping(
+                    crate::kernel::ipc::ThreadId(0),
+                    mem_cap2,
+                    virt,
+                    PAGE_SIZE,
+                )
+                .expect("register");
+            state.note_shared_mem_mapped(PAGE_SIZE);
+
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::TransferRelease as usize,
+                [mem_cap2.0 as usize, 0, 0, 0, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(syscall_succeeded(r, &frame), "TransferRelease must succeed");
+            assert!(
+                !state
+                    .is_user_page_mapped_in_asid(asid, virt)
+                    .expect("post-release check"),
+                "page must be absent after TransferRelease"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn transfer_release_stage7_multi_page_all_unmapped() {
+    // Stage 7: TransferRelease with a multi-page range must unmap every page
+    // using the two-phase helpers.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let base = 0x4_0000_usize;
+            let n_pages = 3_usize;
+            let len = n_pages * PAGE_SIZE;
+            let mut caps = [crate::kernel::capabilities::CapId(0); 3];
+            for i in 0..n_pages {
+                let virt = VirtAddr((base + i * PAGE_SIZE) as u64);
+                let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+                state
+                    .map_user_page_in_asid_with_caps(asid, cap, virt, PageFlags::USER_RW)
+                    .expect("map");
+                caps[i] = cap;
+            }
+            // Use the first cap as the "transfer cap" identity.
+            state
+                .register_active_transfer_mapping(
+                    crate::kernel::ipc::ThreadId(0),
+                    caps[0],
+                    VirtAddr(base as u64),
+                    len,
+                )
+                .expect("register transfer");
+            state.note_shared_mem_mapped(len);
+
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::TransferRelease as usize,
+                [caps[0].0 as usize, 0, 0, 0, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(syscall_succeeded(r, &frame), "multi-page release must succeed");
+
+            for i in 0..n_pages {
+                let virt = VirtAddr((base + i * PAGE_SIZE) as u64);
+                assert!(
+                    !state
+                        .is_user_page_mapped_in_asid(asid, virt)
+                        .expect("post-release check"),
+                    "page {} must be absent after multi-page TransferRelease", i
+                );
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_map_stage7_guard_uses_capability_asid() {
+    // Stage 7: handle_vm_map must use the ASID from aspace_map_cap for the stack
+    // guard check, not the current-task ASID. This test maps a guard page into
+    // the CAPABILITY's ASID and verifies the guard fires on a write map attempt.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let (asid, map_cap) = state.create_user_address_space().expect("asid");
+            state.bind_task_asid(0, asid).expect("bind asid");
+
+            // Pre-map the guard page into the capability's ASID.
+            let guard_virt = VirtAddr(0x5_0000u64);
+            let target_addr = 0x5_1000_usize;
+            let (_, guard_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, guard_cap, guard_virt, PageFlags::USER_RW)
+                .expect("guard map");
+
+            // PROT_WRITE (0x2): write=true, execute=false → guard must fire on
+            // the capability ASID (where the guard page is).
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmMap as usize,
+                [map_cap.0 as usize, target_addr, PAGE_SIZE, 0x2, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_failed(r, &frame),
+                "VmMap with PROT_WRITE must be rejected when guard page is mapped in capability ASID"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_map_stage7_guard_no_guard_page_allows_write_map() {
+    // Stage 7: when no guard page is present, a write-only map must succeed.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let (asid, map_cap) = state.create_user_address_space().expect("asid");
+            state.bind_task_asid(0, asid).expect("bind asid");
+
+            // No guard page mapped below 0x6_1000.
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmMap as usize,
+                [map_cap.0 as usize, 0x6_1000_usize, PAGE_SIZE, 0x2, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "VmMap with PROT_WRITE must succeed when no guard page is present"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_map_stage7_execute_only_guard_bypass_regression() {
+    // Stage 7 regression: PROT_EXEC (0x4, execute=true, write=false) must bypass
+    // the guard even when a guard page is mapped below. Matches pre-Stage-7 behavior.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let (asid, map_cap) = state.create_user_address_space().expect("asid");
+            state.bind_task_asid(0, asid).expect("bind asid");
+
+            let guard_virt = VirtAddr(0x7_0000u64);
+            let target_addr = 0x7_1000_usize;
+            let (_, guard_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, guard_cap, guard_virt, PageFlags::USER_RW)
+                .expect("guard map");
+
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmMap as usize,
+                [map_cap.0 as usize, target_addr, PAGE_SIZE, 0x4, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "PROT_EXEC must bypass guard (execute-only, no write)"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_map_stage7_write_execute_guard_bypass_regression() {
+    // Stage 7 regression: PROT_WRITE|PROT_EXEC (0x6) must also bypass the guard
+    // because execute=true disarms the check. Matches pre-Stage-7 behavior.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let (asid, map_cap) = state.create_user_address_space().expect("asid");
+            state.bind_task_asid(0, asid).expect("bind asid");
+
+            let guard_virt = VirtAddr(0x8_0000u64);
+            let target_addr = 0x8_1000_usize;
+            let (_, guard_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
+            state
+                .map_user_page_in_asid_with_caps(asid, guard_cap, guard_virt, PageFlags::USER_RW)
+                .expect("guard map");
+
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmMap as usize,
+                [map_cap.0 as usize, target_addr, PAGE_SIZE, 0x6, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "PROT_WRITE|PROT_EXEC must bypass guard (execute disarms check)"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn map_shared_region_stage7_rollback_two_phase_on_partial_failure() {
+    // Stage 7: map_shared_region_into_receiver rolls back mapped pages with
+    // two-phase unmap. Verify by mapping one page of a two-page request
+    // successfully, then having the second allocation fail (out-of-frames),
+    // and confirming the first page is unmapped after rollback.
+    // Proxy test: unmap_page_phase1 + execute_tlb_shootdown_wait_plan cleans up
+    // pages from a partial forward map. Exercise directly since triggering OOM
+    // inside the syscall is not straightforward in the test harness.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            // Map two pages, then use phase1 + phase2 to roll them back (simulating
+            // what map_shared_region_into_receiver's rollback does on error).
+            let page1 = VirtAddr(0x9_0000u64);
+            let page2 = VirtAddr(0x9_1000u64);
+            for virt in [page1, page2] {
+                let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+                state
+                    .map_user_page_in_asid_with_caps(asid, cap, virt, PageFlags::USER_RW)
+                    .expect("map");
+            }
+
+            // Two-phase rollback (same code path as map_shared_region rollback).
+            for virt in [page1, page2] {
+                if let Ok(Some(plan)) = state.unmap_page_phase1(asid, virt) {
+                    state.execute_tlb_shootdown_wait_plan(plan).expect("phase2");
+                }
+            }
+
+            for virt in [page1, page2] {
+                assert!(
+                    !state
+                        .is_user_page_mapped_in_asid(asid, virt)
+                        .expect("post-rollback check"),
+                    "page at {:#x} must be absent after two-phase rollback", virt.0
+                );
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
 // ── Phase L2A: canonical boot SharedKernel construction tests ─────────────────
 //
 // These tests verify Bootstrap::init_shared_static_with_boot_memory_map

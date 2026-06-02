@@ -744,6 +744,7 @@ impl KernelState {
         self.map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn unmap_user_page_in_current_asid(
         &mut self,
         virt: VirtAddr,
@@ -767,6 +768,7 @@ impl KernelState {
         Ok(unmapped)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_user_page_mapped_in_current_asid(
         &self,
         virt: VirtAddr,
