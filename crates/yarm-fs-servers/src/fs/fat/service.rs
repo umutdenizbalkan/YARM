@@ -325,14 +325,30 @@ mod tests {
         assert_eq!(default.prefix(), b"/fat");
         assert_eq!(default.device_id, 1);
         assert!(default.readonly);
-        let configured = FatMountConfig::new(b"/mnt/fat", 42, true).expect("config");
-        let (prefix, meta) = configured.encode_startup_words();
-        assert_eq!(
-            FatMountConfig::decode_startup_words(prefix, meta),
-            Some(configured)
-        );
+        assert_eq!(default.block_cap_source, FatBlockCapSource::ServiceExtraCap0);
+
+        for (prefix, device_id, readonly) in [
+            (b"/fat".as_slice(), 1u32, true),
+            (b"/mnt/fat".as_slice(), 42u32, true),
+            (b"/1234567".as_slice(), u32::MAX, false),
+        ] {
+            let configured = FatMountConfig::new(prefix, device_id, readonly).expect("config");
+            let (prefix_word, meta) = configured.encode_startup_words();
+            let decoded = FatMountConfig::decode_startup_words(prefix_word, meta).expect("decode");
+            assert_eq!(decoded.prefix(), prefix);
+            assert_eq!(decoded.device_id, device_id);
+            assert_eq!(decoded.readonly, readonly);
+            assert_eq!(decoded.block_cap_source, FatBlockCapSource::ServiceExtraCap0);
+            assert_eq!(decoded, configured);
+        }
+
         assert!(FatMountConfig::new(b"relative", 1, true).is_none());
         assert!(FatMountConfig::new(b"/too-long", 1, true).is_none());
+        assert!(FatMountConfig::decode_startup_words(0, 0).is_none());
+        let configured = FatMountConfig::new(b"/fat", 7, true).expect("config");
+        let (prefix_word, mut meta) = configured.encode_startup_words();
+        meta &= !(0xffu64 << 56);
+        assert!(FatMountConfig::decode_startup_words(prefix_word, meta).is_none());
     }
 
     #[test]
@@ -362,12 +378,36 @@ mod tests {
     }
 
     #[test]
+    fn fat_userspace_integration_source_markers_are_present() {
+        let init_src = include_str!(
+            "../../../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let pm_src = include_str!(
+            "../../../../../crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
+        );
+        let fat_bin_src = include_str!("../../bin/fat_srv.rs");
+        for marker in [
+            "INIT_FAT_SPAWN_BEGIN",
+            "INIT_FAT_SPAWN_OK",
+            "VFS_MOUNT_REGISTER_FAT_OK prefix=",
+        ] {
+            assert!(init_src.contains(marker), "missing init marker: {marker}");
+        }
+        assert!(pm_src.contains("PM_IMAGE_ID_10_FAT_SRV"));
+        assert!(pm_src.contains("/initramfs/sbin/fat_srv"));
+        assert!(fat_bin_src.contains("FAT_BIN_ENTRY_START"));
+        assert!(fat_bin_src.contains("FAT_BIN_BEFORE_RUN"));
+    }
+
+    #[test]
     fn fat_server_contract_docs_match_startup_backend_behavior() {
         let doc = include_str!("../../../../../doc/FAT_SERVER_CONTRACT.md");
         assert!(doc.contains("service_extra_cap_0"));
         assert!(doc.contains("/mnt/fat"));
         assert!(doc.contains("device id"));
         assert!(doc.contains("FAT_NO_BLOCK_BACKEND"));
+        assert!(doc.contains("PM_IMAGE_ID_10_FAT_SRV"));
+        assert!(doc.contains("VFS_MOUNT_REGISTER_FAT_OK prefix="));
         assert!(doc.contains("sample image"));
         assert!(doc.contains("read-only"));
         assert!(doc.contains("VfsError::Unsupported"));

@@ -83,9 +83,16 @@ blkcache send cap is available. It passes the blkcache send cap in
 `service_extra_cap_0`, the packed FAT prefix word in startup slot 14, and FAT mount
 metadata in startup slot 15. If spawning succeeds, init sends an existing
 `VFS_OP_MOUNT_REGISTER` request to `vfs_server` for the configured FAT prefix and
-logs `VFS_MOUNT_REGISTER_FAT_OK` when VFS accepts the route. This does not change
-kernel ABI or SpawnV5 semantics; it only uses existing userspace startup words and
-existing VFS mount registration.
+logs `PM_IMAGE_ID_10_FAT_SRV` when PM resolves image id 10 and
+`VFS_MOUNT_REGISTER_FAT_OK prefix=...` when VFS accepts the route. This does not
+change kernel ABI or SpawnV5 semantics; it only uses existing userspace startup
+words and existing VFS mount registration.
+
+Smoke scripts treat FAT markers as optional unless `FAT_SMOKE_EXPECTED=1` is set,
+because the current core smoke profiles may run without a real FAT block image.
+When enabled, the smoke marker block counts `INIT_FAT_SPAWN_BEGIN`,
+`INIT_FAT_SPAWN_OK`, `FAT_CONFIG_FOUND`, `FAT_BLOCK_BACKEND_STARTUP_CAP`,
+`FAT_MOUNT_READY`, `FAT_MOUNT_FAILED`, and `VFS_MOUNT_REGISTER_FAT_OK`.
 
 ## Known limitations
 

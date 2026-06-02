@@ -424,7 +424,10 @@ fn register_fat_mount_with_vfs(
         reply_msg.as_slice()[3],
     ]);
     if status == VFS_MOUNT_STATUS_OK {
-        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_OK");
+        yarm_user_rt::user_log!(
+            "VFS_MOUNT_REGISTER_FAT_OK prefix={}",
+            alloc::string::String::from_utf8_lossy(mount_config.prefix())
+        );
         true
     } else {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR status={}", status);

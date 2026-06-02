@@ -293,6 +293,37 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# Optional FAT userspace mount/config smoke markers.
+# Do not fail default core smoke profiles without a real FAT block image; set
+# FAT_SMOKE_EXPECTED=1 when the profile is expected to spawn and mount FAT.
+# ---------------------------------------------------------------------------
+if [[ -f "$LOGFILE" ]]; then
+  FAT_SMOKE_EXPECTED=${FAT_SMOKE_EXPECTED:-0}
+  FAT_MARKERS=(
+    INIT_FAT_SPAWN_BEGIN
+    INIT_FAT_SPAWN_OK
+    PM_IMAGE_ID_10_FAT_SRV
+    FAT_CONFIG_FOUND
+    FAT_BLOCK_BACKEND_STARTUP_CAP
+    FAT_MOUNT_READY
+    FAT_MOUNT_FAILED
+    VFS_MOUNT_REGISTER_FAT_OK
+  )
+  fat_seen=0
+  for marker in "${FAT_MARKERS[@]}"; do
+    count=$(log_count_pattern "$marker")
+    if [[ "$count" -gt 0 ]]; then
+      fat_seen=1
+    fi
+    echo "[info] FAT smoke marker count: ${marker}=${count}"
+  done
+  if [[ "$FAT_SMOKE_EXPECTED" == "1" && "$fat_seen" -eq 0 ]]; then
+    echo "[error] FAT smoke expected but no FAT markers were observed"
+    exit 1
+  fi
+fi
+
 echo "[warn] boot shell and init-server markers not detected (status=$QEMU_STATUS)"
 if [[ -f "$LOGFILE" ]]; then
   echo "[info] last 20 log lines from $LOGFILE"
