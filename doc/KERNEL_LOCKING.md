@@ -4987,3 +4987,153 @@ path.
 | `src/kernel/boot/tests.rs` | Added 5 new Stage 5F tests |
 | `doc/KERNEL_LOCKING.md` | This section (Section 21) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+11 added |
+
+---
+
+## §22 Stage 5G: VmBrk smoke acceptance, VmAnonMap readiness gate
+
+### 22.1 Stage 5F x86_64 -smp 1 smoke results
+
+The two-phase VmBrk shrink conversion (Stage 5F commit `a262d7e`) was validated
+on x86_64 with `-smp 1` (single vCPU). All acceptance criteria passed:
+
+| Marker | Expected | Actual |
+|--------|----------|--------|
+| `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY` | 0 | 0 ✓ |
+| `X86_BOOTSTRAP_SCHEDULER_READY` | 1 | 1 ✓ |
+| `X86_BOOTSTRAP_TIMER_STARTED` | 1 | 1 ✓ |
+| `ENTER_USER` | ≥ 1 | 3 ✓ |
+| `STARTUP_INSTALL_FINAL` | ≥ 1 | 9 ✓ |
+| `PM_ELF_ZC_DONE` image_id 7/8/9 total | 3 | 3 ✓ |
+| ZC nonzero pages | 3 | 3 ✓ |
+| `PM_ELF_ZC_FAIL` | 0 | 0 ✓ |
+| initramfs/devfs/vfs entries | 1 each | 1 each ✓ |
+| `DRIVER_MANAGER_READY` | 1 | 1 ✓ |
+| `BLKCACHE_SRV_READY` | 1 | 1 ✓ |
+| `VIRTIO_BLK_SRV_READY` | 1 | 1 ✓ |
+| fallback | 0 | 0 ✓ |
+| TID mismatch | 0 | 0 ✓ |
+| fatal-ish | 0 | 0 ✓ |
+| oom / capacity | 0 | 0 ✓ |
+
+### 22.2 VmBrk two-phase shrink acceptance status
+
+| Scope | Status |
+|-------|--------|
+| x86_64 -smp 1 (single vCPU) | **Accepted** ✓ (smoke §22.1) |
+| x86_64 SMP (multi-vCPU) | **Deferred** — not tested, not changed |
+| AArch64 | **Deferred** — smoke not run |
+
+The two-phase shrink conversion is accepted for x86_64 single-CPU configurations.
+SMP is out of scope until a dedicated multi-CPU smoke run is scheduled.
+
+### 22.3 VmAnonMap live conversion — full readiness audit
+
+This section records the state of every identified blocker as of Stage 5G.
+
+#### 22.3.1 Blocker tracking table
+
+| Blocker | Description | Status |
+|---------|-------------|--------|
+| #1a | ipc(3) acquired after vm(5)/memory(6) — sequential rank inversion documentation | **Resolved** Stage 5F §21.2 |
+| #1b | `reclaim_memory_object_for_phys` called before `request_live_asid_shootdown` — frame-reuse hazard for global-lock removal | **Design complete** (Stage 5E §20.4); **pattern validated** (Stage 5F VmBrk smoke §22.1) |
+| #2 | Per-page loop progress not captured — rollback scope undefined at type level | **Resolved** Stage 5D (`VmPageMapProgress`, `VmAnonMapProgressPlan`) |
+| #3 | x86_64 smoke required before any live VM/TLB reordering | **Partially satisfied** — VmBrk smoke validates the two-phase pattern; VmAnonMap rollback uses the identical pattern (see §22.3.2). A Stage 6 x86_64 -smp 1 smoke run is still required after the VmAnonMap conversion. |
+
+#### 22.3.2 Two-phase pattern transferability
+
+The two-phase pattern validated by VmBrk smoke (§22.1) transfers directly to
+VmAnonMap rollback because:
+
+1. `rollback_anon_map` calls `unmap_user_page_in_current_asid` per page — the
+   same old one-shot function replaced by `unmap_page_phase1` +
+   `execute_tlb_shootdown_wait_plan` in Stage 5F.
+2. The new helpers operate on (asid, virt) pairs and are agnostic to the calling
+   context (VmBrk shrink vs. VmAnonMap rollback).
+3. `rollback_anon_map` already silently ignores errors (`let _ = ...`), which is
+   compatible with the `?` propagation inside `execute_tlb_shootdown_wait_plan`
+   (the caller would need `let _ = kernel.execute_tlb_shootdown_wait_plan(plan)`).
+
+#### 22.3.3 VmAnonMap-specific items for Stage 6
+
+In addition to converting `rollback_anon_map`, Stage 6 should address these
+VmAnonMap-specific plan-first gaps:
+
+| Item | What is needed | Scaffold available |
+|------|----------------|-------------------|
+| ASID resolution in forward map loop | Resolve ASID once before loop via `task_asid(tid)` (plan-first); use `map_user_page_in_asid_with_caps` per iteration | ✓ Stage 5C |
+| Stack guard check | Replace `is_user_page_mapped_in_current_asid` with `is_user_page_mapped_in_asid(asid, ...)` | ✓ Stage 5C |
+| Rollback ASID resolution | Resolve ASID once before loop; use `unmap_page_phase1(asid, va)` per iteration | ✓ Stage 5E |
+| `VmAnonMapProgressPlan` wiring | Wire plan into forward loop and rollback path | ✓ Stage 5D (struct only, not wired) |
+| Error-path shootdown/reclaim in rollback | Per-page `execute_tlb_shootdown_wait_plan`; errors silently ignored | ✓ Stage 5F (helper live) |
+
+#### 22.3.4 Pre-existing issue: capability not revoked in rollback
+
+`rollback_anon_map` unmaps pages but does not destroy the capability slots
+created by `alloc_anonymous_memory_object`. After rollback:
+
+- `map_refcount == 0` (unmap decremented it)
+- `cap_refcount == 1` (capability still alive in task's CNode)
+
+`reclaim_memory_object_for_phys` checks `cap_refcount != 0` and skips the
+`free_frame` call. The physical frame is therefore not returned to the
+allocator until the task exits (at which point all capabilities are destroyed).
+
+This is **pre-existing behavior** in the current `rollback_anon_map`.  The
+two-phase conversion does NOT change this behavior — `execute_tlb_shootdown_wait_plan`
+calls the same `reclaim_memory_object_for_phys`, which has the same cap_refcount
+check. Stage 6 must not claim to fix this issue; a separate fix (revoke capability
+before unmap) is needed and is out of scope.
+
+#### 22.3.5 `handle_vm_map` rollback gap (adjacent pre-existing issue)
+
+`handle_vm_map` explicitly documents a missing rollback (see TODO in
+`src/kernel/syscall.rs`). This is also pre-existing and out of scope for
+Stage 5G and Stage 6 (VmAnonMap only).
+
+### 22.4 Stage 6 gate decision
+
+**Stage 6 MAY proceed with a live VmAnonMap rollback conversion**, subject to
+the following conditions:
+
+#### 22.4.1 Required before Stage 6 merge
+
+1. `rollback_anon_map` converted to use `unmap_page_phase1` +
+   `execute_tlb_shootdown_wait_plan` per page, with ASID resolved once
+   before the loop (plan-first).
+2. Forward map loop (`handle_vm_anon_map`) converted to use
+   `map_user_page_in_asid_with_caps` with plan-first ASID resolution.
+3. `check_stack_guard` call updated to use `is_user_page_mapped_in_asid`
+   with the plan-first ASID.
+4. Full test suite passes (614+ tests, `--test-threads=1`).
+5. x86_64 -smp 1 smoke run passes for Stage 6 changes.
+
+#### 22.4.2 Deferred to a later stage
+
+- `VmAnonMapProgressPlan` wiring into the live loop (plan struct already
+  exists; wiring requires the map loop to hold the progress value across
+  iterations and pass it to rollback).
+- Capability revoke on rollback (pre-existing issue §22.3.4).
+- x86_64 SMP (multi-CPU) smoke.
+
+#### 22.4.3 Stage 6 scope summary
+
+| Conversion | In scope | Notes |
+|------------|----------|-------|
+| `rollback_anon_map` → two-phase | ✓ | Identical pattern to VmBrk shrink |
+| `handle_vm_anon_map` forward loop plan-first ASID | ✓ | Use Stage 5C helpers |
+| `check_stack_guard` explicit-ASID | ✓ | Stage 5C helper available |
+| `VmAnonMapProgressPlan` live wiring | Defer | Non-trivial; separate stage |
+| Capability revoke in rollback | Defer | Pre-existing issue, separate fix |
+
+### 22.5 No code changes in Stage 5G
+
+Stage 5G is a documentation-only pass. No source files were modified.
+All Stage 5F tests (614 total) pass unchanged.
+
+### 22.6 Files changed (Stage 5G)
+
+| File | Change |
+|------|--------|
+| `doc/KERNEL_LOCKING.md` | This section (Section 22): smoke record, VmBrk acceptance, VmAnonMap readiness audit, Stage 6 gate decision |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+12 added: Stage 6 VmAnonMap gate conditions |
