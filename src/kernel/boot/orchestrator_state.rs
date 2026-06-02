@@ -136,6 +136,26 @@ impl KernelState {
         }
     }
 
+    /// Stage 4T+7 split-read: look up the ASID bound to `tid` under only the
+    /// task lock (rank 2). Returns `0` if the task is not found or has no ASID.
+    ///
+    /// # Safety
+    /// `state` must be the raw pointer of the `KernelState` storage owned by the
+    /// calling `SharedKernel`. `addr_of!` derives raw field pointers without
+    /// creating a reference to the whole `KernelState`; the `task_state_lock`
+    /// serializes access to the TCB array.
+    pub(crate) unsafe fn task_asid_for_tid_from_raw(state: *const KernelState, tid: u64) -> u64 {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+        let _guard = lock_ref.lock();
+        let tcbs = kernel_ref(unsafe { &*core::ptr::addr_of!((*state).tcbs) });
+        tcbs.iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == tid)
+            .and_then(|tcb| tcb.asid)
+            .map(|asid| asid.0 as u64)
+            .unwrap_or(0)
+    }
+
     pub(crate) fn with_scheduler_state<R>(&self, f: impl FnOnce(&SchedulerState) -> R) -> R {
         // Lock-order domain: scheduler
         Self::debug_lock_order_note("scheduler");
