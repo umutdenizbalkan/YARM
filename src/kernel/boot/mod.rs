@@ -232,17 +232,71 @@ pub(crate) struct VmBrkPlan {
     pub(crate) is_group_leader: bool,
 }
 
-/// Stage 5B scaffolding for `VmAnonMap` — helper-only, no live conversion.
+/// Stage 5B scaffolding for `VmAnonMap`, strengthened in Stage 5C — helper-only,
+/// no live conversion.
 ///
-/// VmAnonMap touches all of: scheduler (rank 1), task (rank 2), ipc (rank 3 —
-/// TLB shootdown via cross_cpu_work), capability (rank 4), vm (rank 5), and
-/// memory (rank 6). Live plan-first conversion requires x86_64 TLB smoke
-/// approval per KERNEL_LOCKING.md §17 invariant. This struct exists as
-/// scaffolding for that future stage.
-#[allow(dead_code)]
+/// ## Stage 5C audit summary
+///
+/// VmAnonMap touches 6 lock domains in the following sequence (no inversions):
+/// ```text
+/// A  validate_anon_map_args        lock-free (pure computation)
+/// B  check_stack_guard              scheduler(1)→task(2)→vm(5) [reads only]
+/// C  alloc_anonymous_memory_object  memory(6)→boot_config(11)→memory(6)→capability(4)
+///                                   [all released independently, no simultaneous holds]
+/// D  map_user_page_in_current_asid  scheduler(1)→task(2)→capability(4)→vm(5)→memory(6)
+/// G  rollback: unmap_user_page      scheduler(1)→task(2)→vm(5)→memory(6)→ipc(3)
+///    ↳ request_live_asid_shootdown  scheduler(1)→task(2)→ipc(3) [TLB busy-wait]
+/// H  frame.set_ok                   TrapFrame write (last)
+/// ```
+///
+/// ## Why live conversion is deferred
+///
+/// Three blockers, all requiring x86_64 SMP smoke before resolution:
+/// 1. **TLB busy-wait in rollback**: `request_live_asid_shootdown` spins on
+///    `begin_live_tlb_shootdown_wait` (ipc rank 3) and cross-CPU ACKs. Any change
+///    to its invocation context outside the global lock risks TLB coherency races.
+/// 2. **Per-page alloc-map-rollback interleaving**: The loop allocates, maps, and
+///    conditionally rolls back each page. Splitting this across per-domain lock
+///    acquisitions without the global lock requires careful state management not
+///    yet designed.
+/// 3. **Implicit current-ASID per iteration**: `map_user_page_in_current_asid_with_caps`
+///    re-reads `current_tid()`/`task_asid(tid)` on every page. The explicit-ASID
+///    helpers (Stage 5C) eliminate this, but live use requires smoke.
+///
+/// ## Migration path
+///
+/// When x86_64 smoke is approved:
+/// 1. `handle_vm_anon_map` reads `tid` + `asid` once via `VmAnonMapPlan` before
+///    the loop (or before `with_cpu()` via `current_tid_split_read` + `task_asid_for_tid_split_read`).
+/// 2. The loop uses `map_user_page_in_asid_with_caps` / `unmap_user_page_in_asid`
+///    (Stage 5C explicit-ASID helpers) for all per-page work.
+/// 3. `check_stack_guard` uses `is_user_page_mapped_in_asid` with the plan ASID.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VmAnonMapPlan {
+    /// Validated, rounded syscall arguments (lock-free phase).
+    pub(crate) validated: VmAnonMapValidatedArgs,
+    /// TID of the calling thread (scheduler snapshot, rank 1).
     pub(crate) tid: u64,
+    /// ASID of the calling task's address space (task snapshot, rank 2).
+    pub(crate) asid: Asid,
+}
+
+/// Stage 5C: Result of `validate_anon_map_args` — pure computation, no locks.
+///
+/// Captured before any lock acquisition so it can be reused across plan phases
+/// without repeating the overflow/alignment arithmetic.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VmAnonMapValidatedArgs {
+    /// Page-aligned start address (same as syscall arg `addr`).
+    pub(crate) addr: usize,
+    /// Page-rounded mapping length (`≥ len`, multiple of PAGE_SIZE).
+    pub(crate) map_len: usize,
+    /// `addr + map_len` (guaranteed no overflow).
+    pub(crate) end: usize,
+    /// Resolved `PageFlags` from the `prot` syscall argument.
+    pub(crate) flags: PageFlags,
 }
 
 #[cfg(feature = "hosted-dev")]

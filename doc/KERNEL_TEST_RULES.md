@@ -732,3 +732,87 @@ corresponding equivalence test in `runtime.rs` that:
 This is an extension of Rule N+3 to Stage 5B helpers.
 
 ---
+
+## Rule N+8 — Stage 5C: VmAnonMap plan/rollback/TLB rules
+
+### N+8.1 — Plan structs for TLB-touching syscalls are scaffolding until smoke approved
+
+`VmAnonMapPlan` and `VmAnonMapValidatedArgs` exist as scaffolding only. Do not
+wire them into `handle_vm_anon_map` (the production syscall handler) without:
+
+1. Resolving all three documented blockers (§18.2 of `KERNEL_LOCKING.md`):
+   - Rollback TLB busy-wait (ipc rank 3) ordering
+   - Per-iteration loop state captured in plan
+   - x86_64 smoke approval obtained
+2. x86_64 smoke testing of the new code path.
+
+Both structs carry `#[cfg_attr(not(test), allow(dead_code))]` for this reason.
+Do not remove that attribute until live conversion is approved.
+
+### N+8.2 — Rollback helpers must be tested without triggering full mid-loop failure
+
+`unmap_user_page_in_asid` is the rollback building block for the planned
+`VmAnonMap` path. Because triggering a mid-loop allocation failure in
+hosted-dev (which would require filling all 512 `MAX_MEMORY_OBJECTS` slots) is
+impractical, test the rollback mechanism directly:
+
+1. Map a page successfully.
+2. Call `unmap_user_page_in_asid` explicitly and assert it returns `Some(mapping)`.
+3. Confirm both current-ASID and explicit-ASID checks return false after the unmap.
+
+Do **not** attempt to drive `handle_vm_anon_map` into mid-loop failure via
+syscall frames — the state setup cost is prohibitive and would couple tests to
+an internal allocation limit.
+
+### N+8.3 — Unmap idempotency must be tested explicitly
+
+`unmap_user_page_in_asid` on a never-mapped page must return `Ok(None)` without
+error. This invariant must be confirmed by a dedicated test because the rollback
+loop in the planned path may call unmap on pages that were never successfully
+mapped (if the failure occurs before a map completes).
+
+The idempotency test pattern:
+```rust
+let result = state.unmap_user_page_in_asid(asid, virt);
+assert!(result.is_ok(), "unmap of unmapped page must not return Err");
+assert_eq!(result.unwrap(), None, "unmap of unmapped page must return None");
+```
+
+### N+8.4 — Stack guard bypass tests must use the syscall frame path
+
+Tests that verify the stack guard condition (`write && !execute`) must drive
+`handle_vm_anon_map` via a real syscall frame (using `vm_anon_map_frame` +
+`handle_trap(Trap::Syscall, Some(&mut frame))` + `syscall_succeeded`). Do not
+call internal guard-check methods directly — the guard is conditioned on the
+`PageFlags` computed from the `prot` argument, so driving via the syscall ABI
+is the only way to confirm end-to-end behavior.
+
+| `prot` value | `write` | `execute` | guard fires? |
+|-------------|---------|-----------|--------------|
+| `0x2` (PROT_WRITE) | true | false | **yes** — guard active |
+| `0x4` (PROT_EXEC) | false | true | **no** — write=false |
+| `0x6` (PROT_WRITE\|PROT_EXEC) | true | true | **no** — execute=true disarms |
+
+### N+8.5 — Explicit-ASID helpers must be equivalence-tested against current-ASID path
+
+`map_user_page_in_asid_with_caps`, `is_user_page_mapped_in_asid`, and
+`unmap_user_page_in_asid` are the explicit-ASID building blocks. For each one,
+there must be a test that confirms:
+
+- The explicit-ASID helper produces the same result as the current-ASID path
+  when both target the same address space.
+- An address that was not mapped returns a consistent negative result from both
+  the current-ASID and explicit-ASID check.
+
+Use `setup_task0_with_known_asid()` (which returns `(KernelState, Asid)`) rather
+than `setup_task0_with_asid()` (which discards the ASID) for tests that need
+the ASID value.
+
+### N+8.6 — TLB live-conversion claim prohibited without smoke
+
+No test, doc, or commit message may claim that `handle_vm_anon_map` has been
+live-converted to plan-first unless all three blockers from §18.2 of
+`KERNEL_LOCKING.md` are resolved **and** x86_64 smoke approval is recorded.
+Stage 5C status is: helpers-only, scaffolding only, no live conversion.
+
+---
