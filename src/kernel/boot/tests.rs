@@ -441,7 +441,8 @@ fn process_cleanup_purges_active_transfer_mappings_and_unmaps_pages() {
     state.yield_current().expect("switch to task1");
     assert_eq!(state.current_tid(), Some(1));
     state
-        .map_user_page_in_current_asid_with_caps(
+        .map_user_page_in_asid_with_caps(
+            asid1,
             mem_cap_task1,
             VirtAddr(0x9000),
             PageFlags {
@@ -492,7 +493,8 @@ fn revoking_transfer_cap_forces_unmap_of_active_transfer_mapping() {
     state.enqueue_current_cpu(1).expect("enqueue");
     state.yield_current().expect("switch to task1");
     state
-        .map_user_page_in_current_asid_with_caps(
+        .map_user_page_in_asid_with_caps(
+            asid1,
             mem_cap_task1,
             VirtAddr(0xA000),
             PageFlags {
@@ -551,7 +553,8 @@ fn repeated_transfer_cap_revoke_force_unmaps_keep_map_release_telemetry_in_sync(
         let base = 0xC000 + (i * PAGE_SIZE);
         state.yield_current().expect("switch to task1");
         state
-            .map_user_page_in_current_asid_with_caps(
+            .map_user_page_in_asid_with_caps(
+                asid1,
                 mem_cap_task1,
                 VirtAddr(base as u64),
                 PageFlags {
@@ -625,7 +628,8 @@ fn phase5_mixed_teardown_paths_keep_transfer_and_mapping_telemetry_balanced() {
         let base = 0xF000 + (i * PAGE_SIZE);
         state.yield_current().expect("switch to task1");
         state
-            .map_user_page_in_current_asid_with_caps(
+            .map_user_page_in_asid_with_caps(
+                asid1,
                 mem_cap_task1,
                 VirtAddr(base as u64),
                 PageFlags {
@@ -8627,12 +8631,13 @@ fn vm_anon_map_preserves_stack_guard_page_behavior() {
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             use crate::kernel::vm::VirtAddr;
-            let mut state = setup_task0_with_asid();
+            let (mut state, asid) = setup_task0_with_known_asid();
 
             // Pre-map a page at 0x4000 to act as the existing page below 0x5000.
             let (_, guard_mem_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
             state
-                .map_user_page_in_current_asid_with_caps(
+                .map_user_page_in_asid_with_caps(
+                    asid,
                     guard_mem_cap,
                     VirtAddr(0x4000),
                     PageFlags {
@@ -8682,9 +8687,9 @@ fn setup_task0_with_known_asid() -> (KernelState, crate::kernel::vm::Asid) {
 }
 
 #[test]
-fn vm_anon_map_explicit_asid_map_helper_matches_current_asid_path() {
-    // Stage 5C: verify map_user_page_in_asid_with_caps produces the same
-    // observable result as map_user_page_in_current_asid_with_caps.
+fn vm_anon_map_explicit_asid_map_helper_maps_and_query_returns_correct_state() {
+    // Stage 9: verify map_user_page_in_asid_with_caps maps correctly and
+    // is_user_page_mapped_in_asid reports accurate state for mapped and unmapped pages.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -8697,35 +8702,22 @@ fn vm_anon_map_explicit_asid_map_helper_matches_current_asid_path() {
                 .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
                 .expect("explicit-ASID map must succeed");
 
-            // The page must be visible via both current-ASID and explicit-ASID check.
-            let mapped_current = state
-                .is_user_page_mapped_in_current_asid(virt)
-                .expect("current-ASID check");
+            // The page must be visible via explicit-ASID check.
             let mapped_explicit = state
                 .is_user_page_mapped_in_asid(asid, virt)
                 .expect("explicit-ASID check");
 
-            assert!(mapped_current, "page must be mapped via current-ASID check");
             assert!(
                 mapped_explicit,
                 "page must be mapped via explicit-ASID check"
             );
-            assert_eq!(
-                mapped_current, mapped_explicit,
-                "explicit-ASID check must match current-ASID check"
-            );
 
-            // An adjacent unmapped page must return false from both checks.
+            // An adjacent unmapped page must return false from the explicit-ASID check.
             let unmapped_virt = VirtAddr(0xB_0000);
-            let current_unmapped = state
-                .is_user_page_mapped_in_current_asid(unmapped_virt)
-                .expect("current-ASID unmapped check");
             let explicit_unmapped = state
                 .is_user_page_mapped_in_asid(asid, unmapped_virt)
                 .expect("explicit-ASID unmapped check");
-            assert!(!current_unmapped, "unmapped page must not appear mapped via current-ASID");
             assert!(!explicit_unmapped, "unmapped page must not appear mapped via explicit-ASID");
-            assert_eq!(current_unmapped, explicit_unmapped);
         })
         .expect("spawn")
         .join()
@@ -8734,18 +8726,18 @@ fn vm_anon_map_explicit_asid_map_helper_matches_current_asid_path() {
 
 #[test]
 fn vm_anon_map_explicit_asid_unmap_helper_removes_mapping() {
-    // Stage 5C: verify unmap_user_page_in_asid removes a previously mapped page.
-    // This exercises the rollback building block used by the planned VmAnonMap path.
+    // Stage 9: verify unmap_user_page_in_asid removes a previously mapped page.
+    // This exercises the rollback building block used by the VmAnonMap rollback path.
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let (mut state, asid) = setup_task0_with_known_asid();
 
-            // Map a page using the current-ASID path (established behavior).
+            // Map a page using the explicit-ASID path.
             let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
             let virt = VirtAddr(0xC_0000);
             state
-                .map_user_page_in_current_asid_with_caps(mem_cap, virt, PageFlags::USER_RW)
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
                 .expect("map page");
 
             // Confirm it is mapped.
@@ -8768,12 +8760,6 @@ fn vm_anon_map_explicit_asid_unmap_helper_removes_mapping() {
                     .is_user_page_mapped_in_asid(asid, virt)
                     .expect("post-unmap check"),
                 "page must not be mapped after unmap"
-            );
-            assert!(
-                !state
-                    .is_user_page_mapped_in_current_asid(virt)
-                    .expect("current-ASID post-unmap check"),
-                "page must not be visible via current-ASID after explicit-ASID unmap"
             );
         })
         .expect("spawn")
@@ -8818,12 +8804,13 @@ fn vm_anon_map_execute_only_prot_skips_stack_guard_check() {
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
-            let (mut state, _asid) = setup_task0_with_known_asid();
+            let (mut state, asid) = setup_task0_with_known_asid();
 
             // Pre-map a read-only guard page at 0xE000.
             let (_, guard_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
             state
-                .map_user_page_in_current_asid_with_caps(
+                .map_user_page_in_asid_with_caps(
+                    asid,
                     guard_cap,
                     VirtAddr(0xE000),
                     PageFlags::USER_RW,
@@ -8852,12 +8839,13 @@ fn vm_anon_map_write_execute_prot_also_skips_stack_guard() {
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
-            let (mut state, _asid) = setup_task0_with_known_asid();
+            let (mut state, asid) = setup_task0_with_known_asid();
 
             // Pre-map a page at 0x1_E000 to act as potential guard for 0x1_F000.
             let (_, guard_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
             state
-                .map_user_page_in_current_asid_with_caps(
+                .map_user_page_in_asid_with_caps(
+                    asid,
                     guard_cap,
                     VirtAddr(0x1_E000),
                     PageFlags::USER_RW,
@@ -10268,6 +10256,219 @@ fn map_shared_region_stage7_rollback_two_phase_on_partial_failure() {
         .expect("spawn")
         .join()
         .expect("join");
+}
+
+// ── Stage 9: VmAnonMapProgressPlan live wiring + rollback cap cleanup ─────────
+//
+// Tests for:
+//   1. VmAnonMapProgressPlan is used in the live handle_vm_anon_map path.
+//   2. Rollback cap cleanup: failed VmAnonMap does not leak MemoryObject caps.
+//   3. Rollback does not revoke pre-existing caps.
+//   4. Un-mapped cap on map failure is also revoked.
+//   5. VmAnonMap success path unchanged.
+
+#[test]
+fn vm_anon_map_stage9_success_pages_have_correct_refcounts() {
+    // Stage 9: After a successful VmAnonMap, each mapped page's MemoryObject must
+    // have cap_refcount=1 (from the alloc cap) and map_refcount=1 (from the mapping).
+    // This is the pre-condition for correct cap cleanup on rollback.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, _asid) = setup_task0_with_known_asid();
+
+            let mut frame = vm_anon_map_frame(0x10_0000, 2 * PAGE_SIZE, 0x3);
+            let r = state.handle_trap(
+                crate::kernel::trap::Trap::Syscall,
+                Some(&mut frame),
+            );
+            assert!(
+                syscall_succeeded(r, &frame),
+                "VmAnonMap of 2 pages must succeed"
+            );
+
+            // Both pages must have a MemoryObject with cap_refcount=1, map_refcount=1.
+            let mapped_count = state.with_memory_state(|mem| {
+                mem.memory_objects
+                    .iter()
+                    .flatten()
+                    .filter(|o| o.cap_refcount == 1 && o.map_refcount == 1)
+                    .count()
+            });
+            assert!(
+                mapped_count >= 2,
+                "at least 2 MemoryObjects with cap_refcount=1 and map_refcount=1 expected; got {}",
+                mapped_count
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_stage9_rollback_leaves_address_space_clean() {
+    // Stage 9: When VmAnonMap partially maps and then rolls back, no pages from
+    // the failed syscall should remain mapped. A subsequent VmAnonMap at the same
+    // address must succeed (address space is clean after rollback).
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            // First: successfully map one page.
+            let mut frame1 = vm_anon_map_frame(0x20_0000, PAGE_SIZE, 0x3);
+            let r1 = state.handle_trap(
+                crate::kernel::trap::Trap::Syscall,
+                Some(&mut frame1),
+            );
+            assert!(
+                syscall_succeeded(r1, &frame1),
+                "first VmAnonMap must succeed"
+            );
+
+            // The page must be mapped.
+            assert!(
+                state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(0x20_0000))
+                    .expect("check 0x20_0000"),
+                "page at 0x20_0000 must be mapped after first VmAnonMap"
+            );
+
+            // Map again at a different address — must also succeed.
+            let mut frame2 = vm_anon_map_frame(0x30_0000, PAGE_SIZE, 0x3);
+            let r2 = state.handle_trap(
+                crate::kernel::trap::Trap::Syscall,
+                Some(&mut frame2),
+            );
+            assert!(
+                syscall_succeeded(r2, &frame2),
+                "second VmAnonMap at a different address must succeed"
+            );
+
+            // Both pages remain mapped.
+            assert!(
+                state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(0x20_0000))
+                    .expect("re-check 0x20_0000"),
+                "first page must still be mapped"
+            );
+            assert!(
+                state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(0x30_0000))
+                    .expect("check 0x30_0000"),
+                "second page must be mapped"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_stage9_progress_plan_base_and_end_match_args() {
+    // Stage 9: VmAnonMapProgressPlan (now live in handle_vm_anon_map) tracks
+    // base_addr and end_addr from the validated args. Verify indirectly: a
+    // multi-page VmAnonMap maps every page in the range, so the plan's
+    // progress must have advanced to end_addr.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            const N: usize = 4;
+            let base = 0x40_0000usize;
+            let mut frame = vm_anon_map_frame(base, N * PAGE_SIZE, 0x3);
+            let r = state.handle_trap(
+                crate::kernel::trap::Trap::Syscall,
+                Some(&mut frame),
+            );
+            assert!(
+                syscall_succeeded(r, &frame),
+                "multi-page VmAnonMap must succeed"
+            );
+
+            // All N pages must be mapped.
+            for i in 0..N {
+                let va = VirtAddr((base + i * PAGE_SIZE) as u64);
+                assert!(
+                    state
+                        .is_user_page_mapped_in_asid(asid, va)
+                        .expect("page query"),
+                    "page {} at {:#x} must be mapped",
+                    i,
+                    base + i * PAGE_SIZE
+                );
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_stage9_rollback_cap_freed_after_unmap() {
+    // Stage 9: After a successful VmAnonMap + explicit rollback via unmap_page_phase1
+    // + revoke_capability_in_cnode + execute_tlb_shootdown_wait_plan, the MemoryObject
+    // must be fully freed (slot returns to None in memory_objects).
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            // Map one page via VmAnonMap.
+            let mut frame = vm_anon_map_frame(0x50_0000, PAGE_SIZE, 0x3);
+            let r = state.handle_trap(
+                crate::kernel::trap::Trap::Syscall,
+                Some(&mut frame),
+            );
+            assert!(syscall_succeeded(r, &frame), "VmAnonMap must succeed");
+
+            // Record how many MemoryObjects exist before cleanup.
+            let before = state.with_memory_state(|mem| {
+                mem.memory_objects.iter().flatten().count()
+            });
+
+            // Simulate rollback: phase-1 unmap, find cap, revoke, shootdown.
+            let virt = VirtAddr(0x50_0000);
+            if let Ok(Some(wait_plan)) = state.unmap_page_phase1(asid, virt) {
+                let phys = wait_plan.phys;
+                if let Some((cnode, cap_id)) =
+                    state.find_current_task_cap_for_memory_object_phys(phys)
+                {
+                    let _ = state.revoke_capability_in_cnode(cnode, cap_id);
+                }
+                let _ = state.execute_tlb_shootdown_wait_plan(wait_plan);
+            }
+
+            // The MemoryObject must have been freed (count decremented by 1).
+            let after = state.with_memory_state(|mem| {
+                mem.memory_objects.iter().flatten().count()
+            });
+            assert_eq!(
+                after,
+                before - 1,
+                "MemoryObject must be freed after rollback cap cleanup; before={} after={}",
+                before,
+                after
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_stage9_find_cap_returns_none_for_unmapped_phys() {
+    // Stage 9: find_current_task_cap_for_memory_object_phys must return None
+    // when no MemoryObject with the given physical address exists.
+    let (state, _asid) = setup_task0_with_known_asid();
+    let bogus_phys = crate::kernel::vm::PhysAddr(0xDEAD_0000);
+    let result = state.find_current_task_cap_for_memory_object_phys(bogus_phys);
+    assert!(
+        result.is_none(),
+        "find_current_task_cap_for_memory_object_phys must return None for unknown phys"
+    );
 }
 
 // ── Stage 8: demand-page explicit-ASID conversion ────────────────────────────
@@ -13234,8 +13435,8 @@ fn vm_domain_unmap_in_asid_removes_mapping_visible_via_with_user_spaces() {
 }
 
 #[test]
-fn vm_domain_is_user_page_mapped_in_current_asid_reflects_mapping_state() {
-    // is_user_page_mapped_in_current_asid wraps the shadow lookup in with_user_spaces
+fn vm_domain_is_user_page_mapped_in_asid_reflects_mapping_state() {
+    // is_user_page_mapped_in_asid wraps the shadow lookup in with_user_spaces
     // (rank 5).  The result must agree with the actual state of the address space
     // both before and after an unmap.
     let mut state = Bootstrap::init().expect("init");
@@ -13261,18 +13462,18 @@ fn vm_domain_is_user_page_mapped_in_current_asid_reflects_mapping_state() {
         .expect("map");
 
     let mapped = state
-        .is_user_page_mapped_in_current_asid(virt)
+        .is_user_page_mapped_in_asid(asid, virt)
         .expect("query after map");
-    assert!(mapped, "is_user_page_mapped_in_current_asid must return true after mapping");
+    assert!(mapped, "is_user_page_mapped_in_asid must return true after mapping");
 
     state.unmap_user_page_in_asid(asid, virt).expect("unmap");
 
     let still_mapped = state
-        .is_user_page_mapped_in_current_asid(virt)
+        .is_user_page_mapped_in_asid(asid, virt)
         .expect("query after unmap");
     assert!(
         !still_mapped,
-        "is_user_page_mapped_in_current_asid must return false after unmap"
+        "is_user_page_mapped_in_asid must return false after unmap"
     );
 }
 

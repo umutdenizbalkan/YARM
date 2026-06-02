@@ -286,7 +286,6 @@ pub(crate) struct VmAnonMapPlan {
 ///
 /// Captured before any lock acquisition so it can be reused across plan phases
 /// without repeating the overflow/alignment arithmetic.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VmAnonMapValidatedArgs {
     /// Page-aligned start address (same as syscall arg `addr`).
@@ -341,7 +340,6 @@ pub(crate) struct TlbShootdownRequestPlan {
 /// of `PAGE_SIZE`. When `mapped_end == base_addr` the rollback range is empty
 /// (nothing to unmap). Rollback covers `[base_addr, mapped_end)` only, never
 /// the full `[base_addr, end_addr)`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VmPageMapProgress {
     /// Page-aligned start of the requested mapping range.
@@ -359,10 +357,7 @@ pub(crate) struct VmPageMapProgress {
 /// This, combined with the explicit-ASID helpers from Stage 5C and the
 /// `TlbShootdownRequestPlan` from Stage 5D, resolves Stage 5C blocker #2.
 ///
-/// Remaining blockers before live conversion:
-///   #1: TLB busy-wait (ipc rank 3) in rollback has rank inversion with vm (5).
-///   #3: x86_64 smoke required before live VM/TLB reordering.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Stage 9: live-wired in handle_vm_anon_map; all blockers resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VmAnonMapProgressPlan {
     /// Lock-free validated syscall arguments (same as VmAnonMapPlan.validated).

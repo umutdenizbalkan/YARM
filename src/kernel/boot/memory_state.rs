@@ -732,61 +732,6 @@ impl KernelState {
         self.map_user_page(aspace_map_cap, virt, Mapping { phys, flags })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn map_user_page_in_current_asid_with_caps(
-        &mut self,
-        mem_cap: CapId,
-        virt: VirtAddr,
-        flags: PageFlags,
-    ) -> Result<Option<Mapping>, KernelError> {
-        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
-        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
-        let phys = self.resolve_memory_object_phys(mem_cap, flags)?;
-        self.map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags })
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn unmap_user_page_in_current_asid(
-        &mut self,
-        virt: VirtAddr,
-    ) -> Result<Option<Mapping>, KernelError> {
-        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
-        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
-        let unmapped = self.with_user_spaces_mut(|spaces| {
-            Ok::<_, KernelError>(
-                spaces
-                    .get_mut(asid)
-                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?
-                    .unmap_page(virt),
-            )
-        })?;
-        if let Some(mapping) = unmapped {
-            self.clear_cow_page(asid, virt);
-            self.note_mapping_removed(mapping.phys);
-            self.reclaim_memory_object_for_phys(mapping.phys);
-            self.request_live_asid_shootdown(asid, virt)?;
-        }
-        Ok(unmapped)
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn is_user_page_mapped_in_current_asid(
-        &self,
-        virt: VirtAddr,
-    ) -> Result<bool, KernelError> {
-        if !virt.0.is_multiple_of(crate::kernel::vm::PAGE_SIZE as u64) {
-            return Err(KernelError::WrongObject);
-        }
-        let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
-        let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
-        self.with_user_spaces(|spaces| {
-            spaces
-                .get(asid)
-                .ok_or(KernelError::Vm(VmError::InvalidAsid))
-                .map(|aspace| aspace.resolve(virt).is_some())
-        })
-    }
-
     /// Stage 5C explicit-ASID helper: map a page using a pre-resolved ASID.
     ///
     /// Equivalent to `map_user_page_in_current_asid_with_caps` but takes
