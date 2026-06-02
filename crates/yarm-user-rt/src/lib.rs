@@ -52,6 +52,7 @@ pub mod syscall {
     const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
     const SYSCALL_IPC_CALL_NR: usize = 6;
     const SYSCALL_IPC_REPLY_NR: usize = 7;
+    const SYSCALL_FUTEX_WAIT_NR: usize = 9;
     const SYSCALL_YIELD_NR: usize = 0;
     pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
     pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
@@ -782,6 +783,31 @@ pub mod syscall {
     }
 
     #[inline]
+    pub fn futex_wait(
+        addr: *const u32,
+        expected: u32,
+        observed: u32,
+    ) -> core::result::Result<bool, SyscallError> {
+        // SAFETY: Uses architecture syscall ABI to enter kernel. The kernel validates
+        // that `addr` names a readable current-user futex word before blocking.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_FUTEX_WAIT_NR,
+                [addr as usize, expected as usize, observed as usize, 0, 0, 0],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 > 1 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(ret.ret0 != 0)
+    }
+
+    #[inline]
     pub fn yield_now() -> core::result::Result<(), SyscallError> {
         // SAFETY: Uses architecture syscall ABI to enter kernel.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_YIELD_NR, [0; 6]) };
@@ -1112,6 +1138,14 @@ pub mod runtime {
         ) -> Result<CapId, KernelIpcError>;
         fn grant_driver_dma(&mut self, tid: u64, cap: CapId) -> Result<(), KernelIpcError>;
         fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelIpcError>;
+    }
+
+    #[inline]
+    pub fn startup_arg_slot(index: usize) -> Option<u64> {
+        if index >= STARTUP_SLOT_COUNT {
+            return None;
+        }
+        Some(STARTUP_ARG_SLOTS[index].load(Ordering::Relaxed))
     }
 
     #[inline]

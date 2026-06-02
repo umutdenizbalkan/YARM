@@ -56,9 +56,12 @@ mod non_hosted {
     // - Each slab size class has its own SpinLockIrq<u64> guarding that class's page list head
     //   and all metadata mutations for pages belonging to the class (free-list, bitmap, used count,
     //   unlink/reclaim decisions).
+    // - The slab class lock must not be held while calling the frame allocator. Small-allocation
+    //   slow paths drop the class lock before alloc_pt_frame/free_pt_frame, then reacquire and
+    //   rescan before linking a new page. This preserves lock layering: slab class locks sit above
+    //   raw frame allocation and never nest around it.
     // - Large allocation path uses a separate lock to serialize large-header lifecycle operations.
     // - No nested allocator locks are taken (class lock and large lock are disjoint paths).
-    // - Lock hold may span frame allocator calls; this is intentional to prevent reclaim/list races.
     // IRQ context note:
     // - SpinLockIrq disables local IRQs while held, so allocator lock holders cannot be preempted by
     //   IRQ handlers on the same CPU acquiring the same lock.
@@ -102,12 +105,13 @@ mod non_hosted {
                 };
                 return virt as usize as *mut u8;
             }
-            // AArch64 and RISC-V use an identity mapping for the kernel heap region:
-            // KERNEL_BOOTSTRAP_VIRT_BASE == KERNEL_BOOTSTRAP_PHYS_BASE (e.g. 0x40080000 on
-            // virt/QEMU), so the physical frame address is the same as the virtual pointer.
-            // This assumption must hold for all platforms that use this allocator path; adding
-            // a new port requires either (a) keeping the identity mapping invariant or (b)
-            // replacing this conversion with a proper virt↔phys translation.
+            // AArch64 and RISC-V currently access allocator frames through an early
+            // identity-mapped lower-memory window, so the physical frame address is the
+            // virtual pointer used by the kernel allocator. Do not replace this with
+            // KERNEL_BOOTSTRAP_VIRT_BASE + phys: that constant is an image/bootstrap anchor
+            // on these ports, not a proven direct-map offset for every allocator frame.
+            // Future higher-half ports should provide an arch-owned phys<->kernel-virt helper
+            // and update this conversion together with the corresponding bootstrap mappings.
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             {
                 return phys as usize as *mut u8;
@@ -168,30 +172,93 @@ mod non_hosted {
             SLAB_CLASS_SIZES.iter().position(|&size| size >= needed)
         }
 
-        fn bit_is_set(map: &[u64; 4], idx: usize) -> bool {
-            let word = idx / 64;
-            let bit = idx % 64;
-            (word < map.len()) && ((map[word] & (1u64 << bit)) != 0)
-        }
-
-        fn set_bit(map: &mut [u64; 4], idx: usize) {
-            let word = idx / 64;
-            let bit = idx % 64;
-            if word < map.len() {
-                map[word] |= 1u64 << bit;
-            }
-        }
-
-        fn clear_bit(map: &mut [u64; 4], idx: usize) {
-            let word = idx / 64;
-            let bit = idx % 64;
-            if word < map.len() {
-                map[word] &= !(1u64 << bit);
-            }
-        }
-
         fn slab_object_start(obj_size: usize) -> usize {
             Self::align_up(size_of::<SlabPageHeader>(), obj_size)
+        }
+
+        fn slab_header_ptr(page_ptr: *mut u8) -> *mut SlabPageHeader {
+            page_ptr as *mut SlabPageHeader
+        }
+
+        // Slab metadata/provenance discipline:
+        // Slab pages contain a header followed by object slots whose first bytes are reused as
+        // free-list links while the slot is free. Keep header manipulation raw-pointer based and
+        // do not hold `&mut SlabPageHeader` references while reading/writing slot bytes in the
+        // same page. The class lock provides synchronization; these helpers keep Rust aliasing
+        // assumptions from spanning the header+slot raw memory operations.
+        unsafe fn header_magic(header: *const SlabPageHeader) -> u64 {
+            unsafe { core::ptr::addr_of!((*header).magic).read() }
+        }
+
+        unsafe fn header_class_idx(header: *const SlabPageHeader) -> u16 {
+            unsafe { core::ptr::addr_of!((*header).class_idx).read() }
+        }
+
+        unsafe fn header_obj_size(header: *const SlabPageHeader) -> u16 {
+            unsafe { core::ptr::addr_of!((*header).obj_size).read() }
+        }
+
+        unsafe fn header_capacity(header: *const SlabPageHeader) -> u16 {
+            unsafe { core::ptr::addr_of!((*header).capacity).read() }
+        }
+
+        unsafe fn header_free_head(header: *const SlabPageHeader) -> u16 {
+            unsafe { core::ptr::addr_of!((*header).free_head).read() }
+        }
+
+        unsafe fn header_used(header: *const SlabPageHeader) -> u16 {
+            unsafe { core::ptr::addr_of!((*header).used).read() }
+        }
+
+        unsafe fn header_next_page_phys(header: *const SlabPageHeader) -> u64 {
+            unsafe { core::ptr::addr_of!((*header).next_page_phys).read() }
+        }
+
+        unsafe fn write_header_free_head(header: *mut SlabPageHeader, value: u16) {
+            unsafe { core::ptr::addr_of_mut!((*header).free_head).write(value) };
+        }
+
+        unsafe fn write_header_used(header: *mut SlabPageHeader, value: u16) {
+            unsafe { core::ptr::addr_of_mut!((*header).used).write(value) };
+        }
+
+        unsafe fn write_header_next_page_phys(header: *mut SlabPageHeader, value: u64) {
+            unsafe { core::ptr::addr_of_mut!((*header).next_page_phys).write(value) };
+        }
+
+        unsafe fn header_bitmap_word_ptr(header: *mut SlabPageHeader, word: usize) -> *mut u64 {
+            unsafe { (core::ptr::addr_of_mut!((*header).alloc_bitmap) as *mut u64).add(word) }
+        }
+
+        unsafe fn header_bitmap_bit_is_set(header: *const SlabPageHeader, idx: usize) -> bool {
+            let word = idx / 64;
+            let bit = idx % 64;
+            if word >= 4 {
+                return false;
+            }
+            let word_ptr =
+                unsafe { (core::ptr::addr_of!((*header).alloc_bitmap) as *const u64).add(word) };
+            (unsafe { word_ptr.read() } & (1u64 << bit)) != 0
+        }
+
+        unsafe fn header_bitmap_set_bit(header: *mut SlabPageHeader, idx: usize) {
+            let word = idx / 64;
+            let bit = idx % 64;
+            if word < 4 {
+                let word_ptr = unsafe { Self::header_bitmap_word_ptr(header, word) };
+                let value = unsafe { word_ptr.read() } | (1u64 << bit);
+                unsafe { word_ptr.write(value) };
+            }
+        }
+
+        unsafe fn header_bitmap_clear_bit(header: *mut SlabPageHeader, idx: usize) {
+            let word = idx / 64;
+            let bit = idx % 64;
+            if word < 4 {
+                let word_ptr = unsafe { Self::header_bitmap_word_ptr(header, word) };
+                let value = unsafe { word_ptr.read() } & !(1u64 << bit);
+                unsafe { word_ptr.write(value) };
+            }
         }
 
         unsafe fn slab_init_page(page_ptr: *mut u8, class_idx: usize, next_page_phys: u64) -> bool {
@@ -239,40 +306,43 @@ mod non_hosted {
         }
 
         unsafe fn slab_alloc_from_page(page_ptr: *mut u8) -> *mut u8 {
-            let header = unsafe { &mut *(page_ptr as *mut SlabPageHeader) };
-            if header.free_head == FREE_NONE {
+            let header = Self::slab_header_ptr(page_ptr);
+            let free_head = unsafe { Self::header_free_head(header) };
+            if free_head == FREE_NONE {
                 return null_mut();
             }
 
-            let idx = header.free_head as usize;
-            if idx >= header.capacity as usize {
+            let idx = free_head as usize;
+            let capacity = unsafe { Self::header_capacity(header) } as usize;
+            if idx >= capacity {
                 return null_mut();
             }
 
-            let obj_size = header.obj_size as usize;
+            let obj_size = unsafe { Self::header_obj_size(header) } as usize;
             let start = Self::slab_object_start(obj_size);
             let slot = unsafe { page_ptr.add(start + idx * obj_size) };
             let next = unsafe { core::ptr::read_unaligned(slot as *const u16) };
-            header.free_head = next;
-            header.used = header.used.saturating_add(1);
-            Self::set_bit(&mut header.alloc_bitmap, idx);
+            let used = unsafe { Self::header_used(header) };
+            unsafe { Self::write_header_free_head(header, next) };
+            unsafe { Self::write_header_used(header, used.saturating_add(1)) };
+            unsafe { Self::header_bitmap_set_bit(header, idx) };
             slot
         }
 
         unsafe fn slab_dealloc_from_page(page_ptr: *mut u8, ptr: *mut u8) -> bool {
-            let header = unsafe { &mut *(page_ptr as *mut SlabPageHeader) };
-            if header.magic != SLAB_MAGIC {
+            let header = Self::slab_header_ptr(page_ptr);
+            if unsafe { Self::header_magic(header) } != SLAB_MAGIC {
                 return false;
             }
-            let class_idx = header.class_idx as usize;
+            let class_idx = unsafe { Self::header_class_idx(header) } as usize;
             if class_idx >= SLAB_CLASS_SIZES.len() {
                 return false;
             }
-            if header.obj_size as usize != SLAB_CLASS_SIZES[class_idx] {
+            let obj_size = unsafe { Self::header_obj_size(header) } as usize;
+            if obj_size != SLAB_CLASS_SIZES[class_idx] {
                 return false;
             }
 
-            let obj_size = header.obj_size as usize;
             let start = Self::slab_object_start(obj_size);
             let page_addr = page_ptr as usize;
             let ptr_addr = ptr as usize;
@@ -284,18 +354,20 @@ mod non_hosted {
                 return false;
             }
             let idx = rel / obj_size;
-            if idx >= header.capacity as usize {
+            if idx >= unsafe { Self::header_capacity(header) } as usize {
                 return false;
             }
-            if !Self::bit_is_set(&header.alloc_bitmap, idx) {
+            if !unsafe { Self::header_bitmap_bit_is_set(header, idx) } {
                 return false;
             }
 
-            Self::clear_bit(&mut header.alloc_bitmap, idx);
+            let free_head = unsafe { Self::header_free_head(header) };
+            let used = unsafe { Self::header_used(header) };
+            unsafe { Self::header_bitmap_clear_bit(header, idx) };
             let slot = ptr as *mut u16;
-            unsafe { core::ptr::write_unaligned(slot, header.free_head) };
-            header.free_head = idx as u16;
-            header.used = header.used.saturating_sub(1);
+            unsafe { core::ptr::write_unaligned(slot, free_head) };
+            unsafe { Self::write_header_free_head(header, idx as u16) };
+            unsafe { Self::write_header_used(header, used.saturating_sub(1)) };
             true
         }
 
@@ -307,8 +379,8 @@ mod non_hosted {
                 if page_ptr.is_null() {
                     return false;
                 }
-                let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
-                let next = header.next_page_phys;
+                let header = Self::slab_header_ptr(page_ptr);
+                let next = unsafe { Self::header_next_page_phys(header) };
                 if phys == target_phys {
                     if prev_phys == 0 {
                         *class_head = next;
@@ -317,8 +389,8 @@ mod non_hosted {
                         if prev_ptr.is_null() {
                             return false;
                         }
-                        let prev_header = unsafe { &mut *(prev_ptr as *mut SlabPageHeader) };
-                        prev_header.next_page_phys = next;
+                        let prev_header = Self::slab_header_ptr(prev_ptr);
+                        unsafe { Self::write_header_next_page_phys(prev_header, next) };
                     }
                     return true;
                 }
@@ -328,56 +400,71 @@ mod non_hosted {
             false
         }
 
-        unsafe fn try_reclaim_empty_slab_page(
+        unsafe fn try_unlink_empty_slab_page(
             class_head: &mut u64,
             class_idx: usize,
             target_page_ptr: *mut u8,
-        ) {
+        ) -> Option<u64> {
             let target_phys = Self::ptr_to_phys(target_page_ptr as *const u8);
             let mut empty_pages = 0usize;
             let mut phys = *class_head;
             while phys != 0 {
                 let page_ptr = Self::phys_to_ptr(phys);
                 if page_ptr.is_null() {
-                    return;
+                    return None;
                 }
-                let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
-                if header.magic == SLAB_MAGIC
-                    && header.class_idx as usize == class_idx
-                    && header.used == 0
+                let header = Self::slab_header_ptr(page_ptr);
+                if unsafe { Self::header_magic(header) } == SLAB_MAGIC
+                    && unsafe { Self::header_class_idx(header) } as usize == class_idx
+                    && unsafe { Self::header_used(header) } == 0
                 {
                     empty_pages = empty_pages.saturating_add(1);
                 }
-                phys = header.next_page_phys;
+                phys = unsafe { Self::header_next_page_phys(header) };
             }
 
             let should_keep_warm = KEEP_ONE_WARM_EMPTY_PAGE_PER_CLASS && empty_pages <= 1;
             if should_keep_warm {
-                return;
+                return None;
             }
 
             if unsafe { Self::unlink_slab_page(class_head, target_phys) } {
-                let _ = free_pt_frame(target_phys);
+                return Some(target_phys);
             }
+            None
         }
 
-        unsafe fn alloc_small(class_head: &mut u64, class_idx: usize) -> *mut u8 {
+        unsafe fn alloc_small_from_list(class_head: &mut u64, class_idx: usize) -> *mut u8 {
             let mut phys = *class_head;
             while phys != 0 {
                 let page_ptr = Self::phys_to_ptr(phys);
                 if page_ptr.is_null() {
                     break;
                 }
-                let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
-                if header.magic == SLAB_MAGIC
-                    && header.class_idx as usize == class_idx
-                    && header.free_head != FREE_NONE
+                let header = Self::slab_header_ptr(page_ptr);
+                if unsafe { Self::header_magic(header) } == SLAB_MAGIC
+                    && unsafe { Self::header_class_idx(header) } as usize == class_idx
+                    && unsafe { Self::header_free_head(header) } != FREE_NONE
                 {
                     return unsafe { Self::slab_alloc_from_page(page_ptr) };
                 }
-                phys = header.next_page_phys;
+                phys = unsafe { Self::header_next_page_phys(header) };
+            }
+            null_mut()
+        }
+
+        unsafe fn alloc_small(class_idx: usize) -> *mut u8 {
+            {
+                let mut class_head = Self::class_lock(class_idx).lock();
+                let ptr = unsafe { Self::alloc_small_from_list(&mut class_head, class_idx) };
+                if !ptr.is_null() {
+                    return ptr;
+                }
             }
 
+            // Slow path: never hold the slab class lock while asking the frame allocator for a
+            // page. alloc_pt_frame() takes the frame-allocator lock, and keeping the class lock
+            // across that call would invert allocator lock layering on future multicore paths.
             let Ok(new_phys) = alloc_pt_frame() else {
                 return null_mut();
             };
@@ -387,12 +474,26 @@ mod non_hosted {
                 return null_mut();
             }
 
-            if !unsafe { Self::slab_init_page(page_ptr, class_idx, *class_head) } {
+            let mut free_new_page = false;
+            let allocated = {
+                let mut class_head = Self::class_lock(class_idx).lock();
+                let existing = unsafe { Self::alloc_small_from_list(&mut class_head, class_idx) };
+                if !existing.is_null() {
+                    free_new_page = true;
+                    existing
+                } else if !unsafe { Self::slab_init_page(page_ptr, class_idx, *class_head) } {
+                    free_new_page = true;
+                    null_mut()
+                } else {
+                    *class_head = new_phys;
+                    unsafe { Self::slab_alloc_from_page(page_ptr) }
+                }
+            };
+
+            if free_new_page {
                 let _ = free_pt_frame(new_phys);
-                return null_mut();
             }
-            *class_head = new_phys;
-            unsafe { Self::slab_alloc_from_page(page_ptr) }
+            allocated
         }
 
         unsafe fn alloc_large(layout: Layout) -> *mut u8 {
@@ -439,8 +540,7 @@ mod non_hosted {
             }
 
             if let Some(class_idx) = Self::slab_class_for(layout) {
-                let mut class_head = Self::class_lock(class_idx).lock();
-                return unsafe { Self::alloc_small(&mut class_head, class_idx) };
+                return unsafe { Self::alloc_small(class_idx) };
             }
             let _large_guard = LARGE_ALLOC_LOCK.lock();
             unsafe { Self::alloc_large(layout) }
@@ -456,29 +556,47 @@ mod non_hosted {
             if !page_ptr.is_null() {
                 let magic = unsafe { core::ptr::read_unaligned(page_ptr as *const u64) };
                 if magic == SLAB_MAGIC {
-                    let class_idx =
-                        unsafe { (&*(page_ptr as *const SlabPageHeader)).class_idx as usize };
+                    let header = Self::slab_header_ptr(page_ptr);
+                    let class_idx = unsafe { Self::header_class_idx(header) } as usize;
                     if class_idx < SLAB_CLASS_SIZES.len() {
-                        let mut class_head = Self::class_lock(class_idx).lock();
-                        let ok = unsafe { Self::slab_dealloc_from_page(page_ptr, ptr) };
-                        if ok {
-                            let header = unsafe { &*(page_ptr as *const SlabPageHeader) };
-                            if header.used == 0 {
-                                unsafe {
-                                    Self::try_reclaim_empty_slab_page(
-                                        &mut class_head,
-                                        class_idx,
-                                        page_ptr,
-                                    )
-                                };
+                        let reclaim_phys = {
+                            let mut class_head = Self::class_lock(class_idx).lock();
+                            let ok = unsafe { Self::slab_dealloc_from_page(page_ptr, ptr) };
+                            if ok {
+                                let header = Self::slab_header_ptr(page_ptr);
+                                if unsafe { Self::header_used(header) } == 0 {
+                                    unsafe {
+                                        Self::try_unlink_empty_slab_page(
+                                            &mut class_head,
+                                            class_idx,
+                                            page_ptr,
+                                        )
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
                             }
+                        };
+                        if let Some(phys) = reclaim_phys {
+                            let _ = free_pt_frame(phys);
                         }
                         return;
                     }
+                    debug_assert!(
+                        false,
+                        "corrupt slab class index in kernel allocator dealloc"
+                    );
+                    return;
                 }
             }
 
             if !(ptr as usize).is_multiple_of(PAGE_SIZE) {
+                debug_assert!(
+                    false,
+                    "invalid kernel allocator dealloc pointer: non-slab, non-page-aligned"
+                );
                 return;
             }
 
@@ -491,10 +609,18 @@ mod non_hosted {
 
             let header = unsafe { core::ptr::read(header_ptr) };
             if header.magic != LARGE_MAGIC {
+                debug_assert!(
+                    false,
+                    "invalid kernel allocator dealloc pointer: missing large magic"
+                );
                 return;
             }
             let pages = header.pages as usize;
             if pages < 2 {
+                debug_assert!(
+                    false,
+                    "corrupt large allocation page count in kernel allocator dealloc"
+                );
                 return;
             }
             let base_phys = Self::ptr_to_phys(header_ptr as *const u8);
@@ -570,6 +696,10 @@ mod hosted_dev_allocator_model_tests {
     struct ReclaimModelAlloc {
         next_addr: usize,
         classes: [ReclaimClassPool; CLASS_SIZES.len()],
+        raw_frames: BTreeSet<usize>,
+        initialized_frames: BTreeSet<usize>,
+        freed_uninitialized_frames: usize,
+        dirty_freed_frames: usize,
     }
 
     impl ReclaimModelAlloc {
@@ -577,11 +707,36 @@ mod hosted_dev_allocator_model_tests {
             Self {
                 next_addr: 0x2000_0000,
                 classes: array::from_fn(|_| ReclaimClassPool::default()),
+                raw_frames: BTreeSet::new(),
+                initialized_frames: BTreeSet::new(),
+                freed_uninitialized_frames: 0,
+                dirty_freed_frames: 0,
             }
         }
 
         fn class_for(size: usize, align: usize) -> Option<usize> {
             ModelAlloc::class_for(size, align)
+        }
+
+        fn alloc_raw_frame(&mut self) -> usize {
+            let base = align_up(self.next_addr, PAGE_SIZE);
+            self.next_addr = base + PAGE_SIZE;
+            assert!(self.raw_frames.insert(base));
+            base
+        }
+
+        fn init_raw_frame_as_slab(&mut self, base: usize) {
+            assert!(self.raw_frames.contains(&base));
+            self.initialized_frames.insert(base);
+        }
+
+        fn free_raw_frame(&mut self, base: usize) {
+            assert!(self.raw_frames.remove(&base));
+            if self.initialized_frames.remove(&base) {
+                self.dirty_freed_frames += 1;
+            } else {
+                self.freed_uninitialized_frames += 1;
+            }
         }
 
         fn alloc(&mut self, size: usize, align: usize) -> Option<usize> {
@@ -596,8 +751,8 @@ mod hosted_dev_allocator_model_tests {
 
             let cap = class_capacity(class_idx);
             let start = align_up(SLAB_HEADER_BYTES, obj);
-            let base = align_up(self.next_addr, PAGE_SIZE);
-            self.next_addr = base + PAGE_SIZE;
+            let base = self.alloc_raw_frame();
+            self.init_raw_frame_as_slab(base);
             let mut page = ReclaimPage::default();
             for idx in 0..cap {
                 page.free.push(base + start + idx * obj);
@@ -797,6 +952,64 @@ mod hosted_dev_allocator_model_tests {
         assert_eq!(p3, p1);
         assert!(a.dealloc(24, 8, p2));
         assert!(a.dealloc(24, 8, p3));
+    }
+
+    #[test]
+    fn slab_slot_offsets_never_masquerade_as_large_allocations() {
+        for class_idx in 0..CLASS_SIZES.len() {
+            let obj = CLASS_SIZES[class_idx];
+            let start = align_up(SLAB_HEADER_BYTES, obj);
+            let cap = class_capacity(class_idx);
+            assert!(cap > 0);
+            for idx in 0..cap {
+                let offset = start + idx * obj;
+                assert!(offset > 0 && offset < PAGE_SIZE);
+                assert_ne!(offset % PAGE_SIZE, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn large_dealloc_rejects_interior_pointer_but_accepts_returned_pointer() {
+        let mut a = ModelAlloc::new();
+        let ptr = a.alloc(8192, 64).expect("large alloc");
+        assert_eq!(ptr % PAGE_SIZE, 0);
+        assert!(!a.dealloc(8192, 64, ptr + PAGE_SIZE));
+        assert!(a.dealloc(8192, 64, ptr));
+    }
+
+    #[test]
+    fn slow_path_rescan_uses_existing_slot_and_does_not_leak_unused_page() {
+        let mut a = ReclaimModelAlloc::new();
+        let class_idx = ReclaimModelAlloc::class_for(64, 8).expect("class");
+        let cap = class_capacity(class_idx);
+        let mut full_page = Vec::new();
+        for _ in 0..cap {
+            full_page.push(a.alloc(64, 8).expect("fill page"));
+        }
+        assert_eq!(a.classes[class_idx].pages.len(), 1);
+
+        // Thread A would drop the class lock and allocate a raw frame here. The fixed
+        // kernel path must not initialize this raw frame until after the rescan decides
+        // it is still needed.
+        let speculative_raw_frame = a.alloc_raw_frame();
+        let freed_by_other_cpu = full_page.pop().expect("one slot");
+        assert!(a.dealloc(64, 8, freed_by_other_cpu));
+
+        // The fixed slow path rescans after reacquiring the class lock, consumes the
+        // existing free slot, and returns the still-unmodified speculative frame.
+        let reused = a.alloc(64, 8).expect("rescan alloc");
+        assert_eq!(reused, freed_by_other_cpu);
+        a.free_raw_frame(speculative_raw_frame);
+        assert_eq!(a.classes[class_idx].pages.len(), 1);
+        assert!(!a.initialized_frames.contains(&speculative_raw_frame));
+        assert_eq!(a.freed_uninitialized_frames, 1);
+        assert_eq!(a.dirty_freed_frames, 0);
+
+        for ptr in full_page {
+            assert!(a.dealloc(64, 8, ptr));
+        }
+        assert!(a.dealloc(64, 8, reused));
     }
 
     #[test]

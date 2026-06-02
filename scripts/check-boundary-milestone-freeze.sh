@@ -4,18 +4,31 @@
 
 set -euo pipefail
 
-if ! rg -n "## Boundary milestone status" MICROKERNEL_BOUNDARY.md >/dev/null; then
-  echo "[fail] boundary milestone status section missing in MICROKERNEL_BOUNDARY.md"
+BOUNDARY_DOC=${BOUNDARY_DOC:-doc/MICROKERNEL_BOUNDARY.md}
+KERNEL_STATUS_DOC=${KERNEL_STATUS_DOC:-doc/KERNEL_STATUS.md}
+
+if [[ ! -f "$BOUNDARY_DOC" ]]; then
+  echo "[fail] boundary milestone document missing: $BOUNDARY_DOC"
   exit 1
 fi
 
-if ! rg -n "✅ \*\*COMPLETE\*\*" MICROKERNEL_BOUNDARY.md >/dev/null; then
-  echo "[fail] boundary milestone completion marker missing in MICROKERNEL_BOUNDARY.md"
+if [[ ! -f "$KERNEL_STATUS_DOC" ]]; then
+  echo "[fail] kernel status document missing: $KERNEL_STATUS_DOC"
   exit 1
 fi
 
-if ! rg -n "PR-BND-6 pass C landed" KERNEL_STATUS.md >/dev/null; then
-  echo "[fail] KERNEL_STATUS.md must record PR-BND-6 pass C landed"
+if ! rg -n "## Boundary milestone status" "$BOUNDARY_DOC" >/dev/null; then
+  echo "[fail] boundary milestone status section missing in $BOUNDARY_DOC"
+  exit 1
+fi
+
+if ! rg -n "✅ \*\*COMPLETE\*\*" "$BOUNDARY_DOC" >/dev/null; then
+  echo "[fail] boundary milestone completion marker missing in $BOUNDARY_DOC"
+  exit 1
+fi
+
+if ! rg -n "PR-BND-6 pass C landed" "$KERNEL_STATUS_DOC" >/dev/null; then
+  echo "[fail] $KERNEL_STATUS_DOC must record PR-BND-6 pass C landed"
   exit 1
 fi
 

@@ -1412,6 +1412,8 @@ unsafe fn pm_vfs_spawn_inline(
         7 => b"/initramfs/sbin/driver_manager",
         8 => b"/initramfs/sbin/blkcache_srv",
         9 => b"/initramfs/sbin/virtio_blk_srv",
+        10 => b"/initramfs/sbin/fat_srv",
+        11 => b"/initramfs/sbin/ramfs_srv",
         _ => {
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_IMAGE_UNKNOWN image_id={}",
@@ -1420,6 +1422,12 @@ unsafe fn pm_vfs_spawn_inline(
             return Err(ProcessManagerError::Unsupported);
         }
     };
+    if image_id == 10 {
+        yarm_user_rt::user_log!("PM_IMAGE_ID_10_FAT_SRV path=/initramfs/sbin/fat_srv");
+    }
+    if image_id == 11 {
+        yarm_user_rt::user_log!("PM_IMAGE_ID_11_RAMFS_SRV path=/initramfs/sbin/ramfs_srv");
+    }
     let path_log = core::str::from_utf8(path_label).unwrap_or("<path-bytes>");
     yarm_user_rt::user_log!(
         "PM_VFS_SPAWN_IMAGE_BEGIN image_id={} path={} parent_pid={}",
@@ -1802,6 +1810,8 @@ fn pm_image_cpio_name(image_id: u64) -> Option<&'static [u8]> {
         7 => Some(b"sbin/driver_manager"),
         8 => Some(b"sbin/blkcache_srv"),
         9 => Some(b"sbin/virtio_blk_srv"),
+        10 => Some(b"sbin/fat_srv"),
+        11 => Some(b"sbin/ramfs_srv"),
         _ => None,
     }
 }

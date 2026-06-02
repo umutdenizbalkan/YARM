@@ -23,6 +23,26 @@ _start:
 1:
     wfi
     j 1b
+
+    .global yarm_riscv64_secondary_entry
+    .type yarm_riscv64_secondary_entry,@function
+yarm_riscv64_secondary_entry:
+    // OpenSBI HSM hart_start passes the opaque value in a0. YARM passes a
+    // pointer to SecondaryHartHandoff; do not enter _start/yarm_kernel_main.
+    beqz a0, 2f
+    ld sp, 8(a0)
+    andi sp, sp, -16
+    la t0, 3f
+    csrw stvec, t0
+    li t1, 2
+    csrc sstatus, t1
+    call yarm_riscv64_secondary_boot
+2:
+    wfi
+    j 2b
+3:
+    wfi
+    j 3b
     "#
 );
 
@@ -367,6 +387,147 @@ pub fn bootstrap_first_user_task(
     Ok(())
 }
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+const QEMU_VIRT_HSM_SECONDARY_HART_LIMIT: usize = 8;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+const RISCV64_SECONDARY_STACK_BYTES: usize = 4096;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+const RISCV64_SECONDARY_ACK_EMPTY: usize = 0;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+const RISCV64_SECONDARY_ACK_START_REQUESTED: usize = 1;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+const RISCV64_SECONDARY_ACK_PARKED: usize = 2;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+const RISCV64_SECONDARY_ACK_POLL_ITERS: usize = 100_000;
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SecondaryHartHandoff {
+    hart_id: usize,
+    stack_top: usize,
+    ack: usize,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+impl SecondaryHartHandoff {
+    const fn empty() -> Self {
+        Self { hart_id: usize::MAX, stack_top: 0, ack: RISCV64_SECONDARY_ACK_EMPTY }
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[repr(align(16))]
+#[derive(Clone, Copy)]
+struct SecondaryHartStack([u8; RISCV64_SECONDARY_STACK_BYTES]);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static mut RISCV64_SECONDARY_HANDOFFS: [SecondaryHartHandoff; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
+    [SecondaryHartHandoff::empty(); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static mut RISCV64_SECONDARY_STACKS: [SecondaryHartStack; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
+    [SecondaryHartStack([0; RISCV64_SECONDARY_STACK_BYTES]); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+unsafe extern "C" {
+    fn yarm_riscv64_secondary_entry() -> !;
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_riscv64_secondary_boot(handoff_ptr: usize) -> ! {
+    if handoff_ptr != 0 {
+        let handoff = handoff_ptr as *mut SecondaryHartHandoff;
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).ack), RISCV64_SECONDARY_ACK_PARKED);
+        }
+    }
+    crate::arch::riscv64::console::write_line("YARM_RISCV64_SMP_SECONDARY_PARKED");
+    loop {
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)); }
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn secondary_stack_top(slot: usize) -> usize {
+    let stacks = core::ptr::addr_of_mut!(RISCV64_SECONDARY_STACKS) as *mut SecondaryHartStack;
+    unsafe { stacks.add(slot).cast::<u8>().add(RISCV64_SECONDARY_STACK_BYTES) as usize }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
+    let handoffs = core::ptr::addr_of_mut!(RISCV64_SECONDARY_HANDOFFS) as *mut SecondaryHartHandoff;
+    let handoff = unsafe { handoffs.add(slot) };
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).hart_id), hart_id);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).stack_top), secondary_stack_top(slot));
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).ack), RISCV64_SECONDARY_ACK_START_REQUESTED);
+    }
+    handoff as usize
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn secondary_ack(slot: usize) -> usize {
+    let handoffs = core::ptr::addr_of!(RISCV64_SECONDARY_HANDOFFS) as *const SecondaryHartHandoff;
+    let handoff = unsafe { handoffs.add(slot) };
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*handoff).ack)) }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn wait_for_secondary_ack(slot: usize) -> bool {
+    for _ in 0..RISCV64_SECONDARY_ACK_POLL_ITERS {
+        if secondary_ack(slot) == RISCV64_SECONDARY_ACK_PARKED {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn release_qemu_virt_secondaries_with_hsm() {
+    match crate::arch::riscv64::sbi::probe_extension(crate::arch::riscv64::sbi::SBI_EXT_HSM) {
+        Ok(0) => {
+            crate::yarm_log!("YARM_RISCV64_SMP_HSM unavailable probe=0");
+            return;
+        }
+        Ok(value) => crate::yarm_log!("YARM_RISCV64_SMP_HSM available probe={}", value),
+        Err(err) => {
+            crate::yarm_log!("YARM_RISCV64_SMP_HSM probe_err={:?}", err);
+            return;
+        }
+    }
+
+    let entry_addr = (yarm_riscv64_secondary_entry as *const () as usize)
+        .saturating_sub(crate::arch::platform_constants::KERNEL_LINK_VIRT_BASE as usize);
+    let boot_hart = crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize;
+    for hart_id in 0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT {
+        if hart_id == boot_hart {
+            continue;
+        }
+        let slot = hart_id;
+        let handoff_ptr = prepare_secondary_handoff(slot, hart_id);
+        match crate::arch::riscv64::sbi::hsm_hart_start(hart_id, entry_addr, handoff_ptr) {
+            Ok(()) => {
+                let acked = wait_for_secondary_ack(slot);
+                crate::yarm_log!(
+                    "YARM_RISCV64_SMP_HART_START hart={} ret=0 ack={} state=parked_not_online entry=0x{:x} handoff=0x{:x}",
+                    hart_id, acked as u8, entry_addr, handoff_ptr
+                );
+            }
+            Err(err) => {
+                crate::yarm_log!("YARM_RISCV64_SMP_HART_START hart={} err={:?} ack=0 state=not_started", hart_id, err);
+            }
+        }
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn release_secondary_cpus_after_bootstrap() {
+    release_qemu_virt_secondaries_with_hsm();
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "riscv64")))]
 pub fn release_secondary_cpus_after_bootstrap() {}
 
 pub fn enter_dispatched_user_task_if_available(

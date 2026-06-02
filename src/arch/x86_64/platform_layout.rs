@@ -1,11 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-// x86_64 platform layout constants.
+// x86_64 QEMU q35/PVH platform layout constants.
+//
+// This profile is not a placeholder for the supported x86_64 smoke target. It
+// deliberately encodes the PVH higher-half/direct-map bootstrap aliases and the
+// standard PC-compatible LAPIC/IOAPIC physical MMIO locations used by QEMU q35.
+// Boot-time memory availability is still discovered from the PVH memmap; these
+// constants are target-specific anchors, not generic ACPI-discovered hardware.
 
 pub const KERNEL_BOOTSTRAP_VIRT_BASE: u64 = 0xFFFF_FF80_0000_0000;
 pub const KERNEL_BOOTSTRAP_PHYS_BASE: u64 = 0x0;
 pub const KERNEL_PHYS_DIRECT_MAP_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+// Conservative low-memory exclusion/floor for allocator seeding. This also
+// keeps PVH boot data, modules, trampoline/AP stack backing pages, and other
+// low boot structures out of early anonymous allocations. Do not replace with
+// `align_up(__kernel_end, 2 MiB)` unless module/reserved ranges are included.
 pub const NEXT_ANON_PHYS_BASE: u64 = 0x1000_0000;
 
 // Link base for the kernel image's high-VA suffix.  The linker script

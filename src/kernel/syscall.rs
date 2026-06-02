@@ -3157,16 +3157,31 @@ fn handle_vm_brk(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
     if requested < base {
         return Err(SyscallError::InvalidArgs);
     }
+
     if requested < current_end {
-        return Err(SyscallError::InvalidArgs);
+        let unmap_start = round_up_page(requested)?;
+        let unmap_end = round_up_page(current_end)?;
+        if unmap_start < unmap_end {
+            let mut va = unmap_start;
+            while va < unmap_end {
+                // Missing mappings are valid for lazy brk pages: a page in the
+                // shrink interval may never have faulted in, so the unmap
+                // helper returns Ok(None) and we continue without panicking.
+                _kernel
+                    .unmap_user_page_in_current_asid(VirtAddr(va as u64))
+                    .map_err(SyscallError::from)?;
+                va += PAGE_SIZE;
+            }
+        }
     }
 
-    // Staged VM_BRK behavior: query + grow only, tracked per-task. Grow
-    // requires pre-initialized brk bounds to avoid creating an empty
-    // [base,end) window from unset state. Heap pages are still allocated
-    // lazily by demand-fault mapping in [base, end).
-    kernel
-        .set_task_brk_bounds(plan.tid, base, requested)
+    // Staged VM_BRK behavior: tracked per-task. Growth requires
+    // pre-initialized brk bounds to avoid creating an empty [base,end) window
+    // from unset state. Heap pages are still allocated lazily by demand-fault
+    // mapping in [base, end). Shrink updates the byte-granular brk after all
+    // page-granular unmap bookkeeping succeeds.
+    _kernel
+        .set_task_brk_bounds(tid, base, requested)
         .map_err(SyscallError::from)?;
     frame.set_ok(requested, 0, 0);
     Ok(())
@@ -3501,15 +3516,147 @@ mod tests {
         assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x9000)));
     }
 
-    #[test]
-    fn syscall_vm_brk_shrink_is_rejected() {
+    fn brk_test_state(base: usize, end: usize) -> KernelState {
         let mut state = Bootstrap::init().expect("kernel");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        state.set_task_brk_bounds(0, base, end).expect("set brk");
         state
-            .set_task_brk_bounds(0, 0x4000, 0x8000)
-            .expect("set brk");
-        let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [0x7000, 0, 0, 0, 0, 0]);
-        dispatch(&mut state, &mut frame).expect_err("vm brk shrink rejected");
     }
+
+    fn map_heap_page(state: &mut KernelState, addr: usize) {
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("heap mem");
+        state
+            .map_user_page_in_current_asid_with_caps(
+                mem_cap,
+                VirtAddr(addr as u64),
+                PageFlags::USER_RW,
+            )
+            .expect("map heap page");
+    }
+
+    fn current_asid_page_mapped(state: &KernelState, page: usize) -> bool {
+        state
+            .is_user_page_mapped_in_current_asid(VirtAddr(page as u64))
+            .expect("query mapping")
+    }
+
+    fn vm_brk(state: &mut KernelState, requested: usize) -> Result<usize, SyscallError> {
+        let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [requested, 0, 0, 0, 0, 0]);
+        dispatch(state, &mut frame)?;
+        assert_eq!(frame.error_code(), None);
+        Ok(frame.ret0())
+    }
+
+    macro_rules! vm_brk_stack_test {
+        ($name:ident, $body:block) => {
+            #[test]
+            fn $name() {
+                std::thread::Builder::new()
+                    .name(stringify!($name).into())
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(|| $body)
+                    .expect("spawn vm-brk test thread")
+                    .join()
+                    .expect("join vm-brk test thread");
+            }
+        };
+    }
+
+    vm_brk_stack_test!(syscall_vm_brk_shrink_by_full_page_unmaps_page_and_updates_end, {
+        let mut state = brk_test_state(0x4000, 0x8000);
+        map_heap_page(&mut state, 0x7000);
+
+        assert_eq!(vm_brk(&mut state, 0x7000).expect("shrink"), 0x7000);
+
+        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x7000)));
+        assert!(!current_asid_page_mapped(&state, 0x7000));
+    });
+
+    vm_brk_stack_test!(syscall_vm_brk_shrink_within_same_page_keeps_mapping_and_updates_end, {
+        let mut state = brk_test_state(0x4000, 0x7800);
+        map_heap_page(&mut state, 0x7000);
+
+        assert_eq!(vm_brk(&mut state, 0x7001).expect("shrink"), 0x7001);
+
+        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x7001)));
+        assert!(current_asid_page_mapped(&state, 0x7000));
+    });
+
+    vm_brk_stack_test!(syscall_vm_brk_shrink_multiple_pages_preserves_partial_requested_page, {
+        let mut state = brk_test_state(0x4000, 0x7000);
+        map_heap_page(&mut state, 0x4000);
+        map_heap_page(&mut state, 0x5000);
+        map_heap_page(&mut state, 0x6000);
+
+        assert_eq!(vm_brk(&mut state, 0x4001).expect("shrink"), 0x4001);
+
+        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x4001)));
+        assert!(current_asid_page_mapped(&state, 0x4000));
+        assert!(!current_asid_page_mapped(&state, 0x5000));
+        assert!(!current_asid_page_mapped(&state, 0x6000));
+    });
+
+    vm_brk_stack_test!(syscall_vm_brk_shrink_to_heap_base_releases_full_pages_above_base, {
+        let mut state = brk_test_state(0x4000, 0x7000);
+        map_heap_page(&mut state, 0x4000);
+        map_heap_page(&mut state, 0x5000);
+        map_heap_page(&mut state, 0x6000);
+
+        assert_eq!(vm_brk(&mut state, 0x4000).expect("shrink"), 0x4000);
+
+        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x4000)));
+        assert!(!current_asid_page_mapped(&state, 0x4000));
+        assert!(!current_asid_page_mapped(&state, 0x5000));
+        assert!(!current_asid_page_mapped(&state, 0x6000));
+    });
+
+    vm_brk_stack_test!(syscall_vm_brk_shrink_below_heap_base_is_rejected_without_changing_end, {
+        let mut state = brk_test_state(0x4000, 0x8000);
+        map_heap_page(&mut state, 0x7000);
+        let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [0x3fff, 0, 0, 0, 0, 0]);
+
+        dispatch(&mut state, &mut frame).expect_err("vm brk shrink below base rejected");
+
+        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x8000)));
+        assert!(current_asid_page_mapped(&state, 0x7000));
+    });
+
+    vm_brk_stack_test!(syscall_vm_brk_shrink_over_lazy_unmapped_pages_succeeds, {
+        let mut state = brk_test_state(0x4000, 0x8000);
+        map_heap_page(&mut state, 0x4000);
+
+        assert_eq!(vm_brk(&mut state, 0x5000).expect("shrink"), 0x5000);
+
+        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x5000)));
+        assert!(current_asid_page_mapped(&state, 0x4000));
+        assert!(!current_asid_page_mapped(&state, 0x5000));
+        assert!(!current_asid_page_mapped(&state, 0x6000));
+        assert!(!current_asid_page_mapped(&state, 0x7000));
+    });
+
+    vm_brk_stack_test!(syscall_vm_brk_grow_after_shrink_allows_demand_mapping_again, {
+        let mut state = brk_test_state(0x4000, 0x7000);
+        map_heap_page(&mut state, 0x6000);
+        assert_eq!(vm_brk(&mut state, 0x5000).expect("shrink"), 0x5000);
+        assert!(!current_asid_page_mapped(&state, 0x6000));
+
+        assert_eq!(vm_brk(&mut state, 0x7000).expect("grow"), 0x7000);
+        map_heap_page(&mut state, 0x6000);
+
+        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x7000)));
+        assert!(current_asid_page_mapped(&state, 0x6000));
+    });
+
+    vm_brk_stack_test!(syscall_vm_brk_invalid_shrink_kernel_address_leaves_end_unchanged, {
+        let mut state = brk_test_state(0x4000, 0x8000);
+        let kernel_addr = crate::kernel::vm::KERNEL_SPACE_BASE as usize;
+        let mut frame = TrapFrame::new(Syscall::VmBrk as usize, [kernel_addr, 0, 0, 0, 0, 0]);
+
+        dispatch(&mut state, &mut frame).expect_err("kernel address rejected");
+
+        assert_eq!(state.task_brk_bounds(0), Some((0x4000, 0x8000)));
+    });
 
     #[test]
     fn syscall_vm_brk_rejects_kernel_address() {

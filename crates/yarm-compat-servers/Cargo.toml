@@ -12,6 +12,8 @@ hosted-dev = []
 posix-compat = ["yarm-server-runtime/posix-compat"]
 
 [dependencies]
+yarm-ipc-abi = { path = "../yarm-ipc-abi" }
+yarm-user-rt = { path = "../yarm-user-rt" }
 yarm-server-runtime = { path = "../yarm-server-runtime", default-features = false, features = ["hosted-dev"] }
 
 [lib]

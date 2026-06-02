@@ -26,7 +26,7 @@ use crate::yarm_compat_servers::{
 /// the POSIX compatibility syscall dispatch and IPC bindings.
 ///
 /// Deprecated in-process service ownership has been intentionally removed.
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 pub struct PosixSysdepsContext<'a> {
     #[cfg(test)]
     pub kernel: &'a mut KernelState,

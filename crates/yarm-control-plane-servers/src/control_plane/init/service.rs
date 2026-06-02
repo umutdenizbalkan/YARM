@@ -4,6 +4,9 @@
 use crate::control_plane::init::{
     CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase,
 };
+use yarm_fs_servers::fat::service::FatMountConfig;
+use yarm_fs_servers::ramfs::service::RamFsMountConfig;
+use yarm_ipc_abi::vfs_abi::{MountRegisterArgs, VFS_MOUNT_STATUS_OK, VFS_OP_MOUNT_REGISTER};
 use yarm_ipc_abi::blkcache_abi::{
     RegisterBackendArgs, BLKCACHE_OP_REGISTER_BACKEND,
 };
@@ -371,6 +374,129 @@ fn spawn_v5_reply_is_success(pid: u64, _service_send_cap: u64) -> bool {
     pid != 0
 }
 
+fn register_ramfs_mount_with_vfs(
+    vfs_send_cap: u32,
+    reply_recv_cap: u32,
+    ramfs_send_cap: u64,
+    mount_config: RamFsMountConfig,
+) -> bool {
+    let Some((payload, len)) = (MountRegisterArgs {
+        backend_send_cap: ramfs_send_cap,
+        flags: if mount_config.readonly { 1 } else { 0 },
+        prefix: mount_config.prefix(),
+    })
+    .encode() else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=encode");
+        return false;
+    };
+    let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        VFS_OP_MOUNT_REGISTER,
+        0,
+        None,
+        &payload[..len],
+    ) else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=message");
+        return false;
+    };
+    yarm_user_rt::user_log!(
+        "VFS_MOUNT_REGISTER_RAMFS_BEGIN prefix={}",
+        alloc::string::String::from_utf8_lossy(mount_config.prefix())
+    );
+    let call = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+    if call.is_err() {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=ipc-call");
+        return false;
+    }
+    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) };
+    let Ok(Some(reply_msg)) = reply else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=no-reply");
+        return false;
+    };
+    if reply_msg.as_slice().len() < 4 {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=short-reply");
+        return false;
+    }
+    let status = u32::from_le_bytes([
+        reply_msg.as_slice()[0],
+        reply_msg.as_slice()[1],
+        reply_msg.as_slice()[2],
+        reply_msg.as_slice()[3],
+    ]);
+    if status == VFS_MOUNT_STATUS_OK {
+        yarm_user_rt::user_log!(
+            "VFS_MOUNT_REGISTER_RAMFS_OK prefix={}",
+            alloc::string::String::from_utf8_lossy(mount_config.prefix())
+        );
+        true
+    } else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR status={}", status);
+        false
+    }
+}
+
+fn register_fat_mount_with_vfs(
+    vfs_send_cap: u32,
+    reply_recv_cap: u32,
+    fat_send_cap: u64,
+    mount_config: FatMountConfig,
+) -> bool {
+    let Some((payload, len)) = (MountRegisterArgs {
+        backend_send_cap: fat_send_cap,
+        flags: if mount_config.readonly { 1 } else { 0 },
+        prefix: mount_config.prefix(),
+    })
+    .encode() else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=encode");
+        return false;
+    };
+    let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        VFS_OP_MOUNT_REGISTER,
+        0,
+        None,
+        &payload[..len],
+    ) else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=message");
+        return false;
+    };
+    yarm_user_rt::user_log!(
+        "VFS_MOUNT_REGISTER_FAT_BEGIN prefix={} device_id={}",
+        alloc::string::String::from_utf8_lossy(mount_config.prefix()),
+        mount_config.device_id
+    );
+    let call = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+    if call.is_err() {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=ipc-call");
+        return false;
+    }
+    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) };
+    let Ok(Some(reply_msg)) = reply else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=no-reply");
+        return false;
+    };
+    if reply_msg.as_slice().len() < 4 {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=short-reply");
+        return false;
+    }
+    let status = u32::from_le_bytes([
+        reply_msg.as_slice()[0],
+        reply_msg.as_slice()[1],
+        reply_msg.as_slice()[2],
+        reply_msg.as_slice()[3],
+    ]);
+    if status == VFS_MOUNT_STATUS_OK {
+        yarm_user_rt::user_log!(
+            "VFS_MOUNT_REGISTER_FAT_OK prefix={}",
+            alloc::string::String::from_utf8_lossy(mount_config.prefix())
+        );
+        true
+    } else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR status={}", status);
+        false
+    }
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("INIT_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
@@ -418,6 +544,40 @@ pub fn run() {
         "INIT_VFS_SPAWN_CAPS recv_cap={} initramfs_send={} devfs_send={}",
         vfs_recv_cap, initramfs_send_cap, devfs_send_cap
     );
+
+    // --- Spawn ramfs_srv (image_id=11) and register /ram with VFS when available. ---
+    {
+        let ramfs_mount_config = RamFsMountConfig::new(
+            b"/ram",
+            false,
+            yarm_fs_servers::ramfs::RAMFS_DEFAULT_MAX_BYTES as u32,
+        )
+        .unwrap_or_else(RamFsMountConfig::default_compat);
+        let (ramfs_prefix_word, ramfs_meta_word) = ramfs_mount_config.encode_startup_words();
+        yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_BEGIN");
+        if let Some((ramfs_child_tid, init_ramfs_send_cap)) = spawn_v5_cap(
+            pm_send,
+            pm_recv,
+            11,
+            [0, ramfs_prefix_word, ramfs_meta_word, 0],
+            1,
+        ) {
+            yarm_user_rt::user_log!(
+                "INIT_RAMFS_SPAWN_OK child_tid={} send_cap={} prefix={}",
+                ramfs_child_tid,
+                init_ramfs_send_cap,
+                alloc::string::String::from_utf8_lossy(ramfs_mount_config.prefix())
+            );
+            let _ = register_ramfs_mount_with_vfs(
+                vfs_recv_cap as u32,
+                pm_recv,
+                init_ramfs_send_cap,
+                ramfs_mount_config,
+            );
+        } else {
+            yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_RETURN ok=0 child_tid=0");
+        }
+    }
 
     // --- Spawn driver_manager (image_id=7) ---
     // No service caps required at spawn time. VFS-backed late services are
@@ -606,6 +766,37 @@ pub fn run() {
         Err(_e) => {
             yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}", BlkStatus::DeviceUnavailable as u32);
         }
+    }
+
+    // --- Spawn read-only fat_srv (image_id=10) once blkcache cap is available. ---
+    {
+        let fat_mount_config = FatMountConfig::new(b"/fat", 1, true)
+            .unwrap_or_else(FatMountConfig::default_compat);
+        let (fat_prefix_word, fat_meta_word) = fat_mount_config.encode_startup_words();
+        yarm_user_rt::user_log!("INIT_FAT_SPAWN_BEGIN");
+        let Some((fat_child_tid, init_fat_send_cap)) = spawn_v5_cap(
+            pm_send,
+            pm_recv,
+            10,
+            [init_blkcache_send_cap, fat_prefix_word, fat_meta_word, 0],
+            1,
+        ) else {
+            yarm_user_rt::user_log!("INIT_FAT_SPAWN_RETURN ok=0 child_tid=0");
+            return;
+        };
+        yarm_user_rt::user_log!(
+            "INIT_FAT_SPAWN_OK child_tid={} send_cap={} prefix={} device_id={}",
+            fat_child_tid,
+            init_fat_send_cap,
+            alloc::string::String::from_utf8_lossy(fat_mount_config.prefix()),
+            fat_mount_config.device_id
+        );
+        let _ = register_fat_mount_with_vfs(
+            vfs_recv_cap as u32,
+            pm_recv,
+            init_fat_send_cap,
+            fat_mount_config,
+        );
     }
 
     let Some(alert_recv) = ctx.init_alert_recv_ep else {

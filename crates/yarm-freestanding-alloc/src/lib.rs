@@ -51,13 +51,27 @@ macro_rules! install {
             (value + (align - 1)) & !(align - 1)
         }
 
+        #[inline]
+        const fn checked_align_up(value: usize, align: usize) -> Option<usize> {
+            match value.checked_add(align - 1) {
+                Some(rounded) => Some(rounded & !(align - 1)),
+                None => None,
+            }
+        }
+
         impl RuntimeAllocator {
             fn lock(&self) {
-                while self
-                    .lock
-                    .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_err()
-                {
+                loop {
+                    while self.lock.load(Ordering::Relaxed) {
+                        core::hint::spin_loop();
+                    }
+                    if self
+                        .lock
+                        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        return;
+                    }
                     core::hint::spin_loop();
                 }
             }
@@ -66,13 +80,17 @@ macro_rules! install {
                 self.lock.store(false, Ordering::Release);
             }
 
-            unsafe fn ensure_initialized(&self) {
-                if self.initialized.load(Ordering::Acquire) {
+            unsafe fn ensure_initialized_locked(&self) {
+                if self.initialized.load(Ordering::Relaxed) {
                     return;
                 }
 
                 let base = self.heap.get().cast::<u8>() as usize;
-                let aligned_base = align_up(base, align_of::<BlockHeader>());
+                let Some(aligned_base) = checked_align_up(base, align_of::<BlockHeader>()) else {
+                    unsafe { *self.free.get() = null_mut() };
+                    self.initialized.store(true, Ordering::Release);
+                    return;
+                };
                 let offset = aligned_base - base;
 
                 if offset + HEADER_SIZE > HEAP_SIZE {
@@ -90,9 +108,45 @@ macro_rules! install {
                 self.initialized.store(true, Ordering::Release);
             }
 
-            unsafe fn alloc_inner(&self, layout: Layout) -> *mut u8 {
-                unsafe { self.ensure_initialized() };
+            fn heap_bounds(&self) -> (usize, usize) {
+                let start = self.heap.get().cast::<u8>() as usize;
+                let end = start.saturating_add(HEAP_SIZE);
+                (start, end)
+            }
 
+            fn ptr_may_have_alloc_header(&self, ptr: *mut u8) -> bool {
+                let ptr_addr = ptr as usize;
+                let (heap_start, heap_end) = self.heap_bounds();
+                if ptr_addr < heap_start || ptr_addr >= heap_end {
+                    return false;
+                }
+                let Some(header_addr) = ptr_addr.checked_sub(ALLOC_HEADER_SIZE) else {
+                    return false;
+                };
+                let Some(header_end) = header_addr.checked_add(ALLOC_HEADER_SIZE) else {
+                    return false;
+                };
+                header_addr >= heap_start && header_end <= heap_end
+            }
+
+            fn alloc_header_is_plausible(&self, header: &AllocHeader) -> bool {
+                let (heap_start, heap_end) = self.heap_bounds();
+                if header.block_start < heap_start || header.block_start >= heap_end {
+                    return false;
+                }
+                if !header.block_start.is_multiple_of(align_of::<BlockHeader>()) {
+                    return false;
+                }
+                if header.block_size < HEADER_SIZE || header.block_size > HEAP_SIZE {
+                    return false;
+                }
+                let Some(block_end) = header.block_start.checked_add(header.block_size) else {
+                    return false;
+                };
+                block_end <= heap_end
+            }
+
+            unsafe fn alloc_inner(&self, layout: Layout) -> *mut u8 {
                 let request_align = layout.align().max(align_of::<usize>());
                 let mut prev: *mut BlockHeader = null_mut();
                 let mut cur: *mut BlockHeader = unsafe { *self.free.get() };
@@ -101,7 +155,7 @@ macro_rules! install {
                     let block_start = cur as usize;
                     let payload_start = match block_start
                         .checked_add(HEADER_SIZE + ALLOC_HEADER_SIZE)
-                        .map(|v| align_up(v, request_align))
+                        .and_then(|v| checked_align_up(v, request_align))
                     {
                         Some(v) => v,
                         None => return null_mut(),
@@ -118,51 +172,71 @@ macro_rules! install {
                     if payload_end <= block_end {
                         let alloc_header_addr = payload_start - ALLOC_HEADER_SIZE;
 
+                        // High-align requests can create a sizable gap between the free block's
+                        // header and the allocation header. If the gap is large enough to be a
+                        // useful free block, split it off instead of trapping it inside the active
+                        // allocation until dealloc. Smaller gaps stay in the allocation block so
+                        // the free list never contains an unusable fragment.
+                        let leading = alloc_header_addr - block_start;
+                        let front_split = leading >= MIN_SPLIT;
+                        let alloc_block_start = if front_split {
+                            alloc_header_addr
+                        } else {
+                            block_start
+                        };
+
                         // Bug fix #2: align the split point to align_of::<BlockHeader>()
                         // so the new free-block header is never written through a
                         // misaligned pointer (UB; bus-error on strict-alignment arches
                         // like AArch64 when size is not a multiple of the header align).
-                        let split_at = align_up(payload_end, align_of::<BlockHeader>());
-                        let remaining = if split_at <= block_end {
+                        let Some(split_at) =
+                            checked_align_up(payload_end, align_of::<BlockHeader>())
+                        else {
+                            return null_mut();
+                        };
+                        let tail_remaining = if split_at <= block_end {
                             block_end - split_at
                         } else {
                             0
                         };
+                        let tail_split = tail_remaining >= MIN_SPLIT;
+                        let alloc_block_end = if tail_split { split_at } else { block_end };
                         let next = unsafe { (*cur).next };
 
-                        // Bug fix #1: when no split happens the allocation owns the
-                        // ENTIRE original block (whole block removed from free list).
-                        // Storing payload_end-block_start here would permanently leak
-                        // the tail bytes because dealloc only restores block_size bytes.
-                        let alloc_block_size;
+                        if front_split {
+                            unsafe {
+                                (*cur).size = leading;
+                            }
+                        }
 
-                        if remaining >= MIN_SPLIT {
+                        let tail_free = if tail_split {
                             let new_free = split_at as *mut BlockHeader;
                             unsafe {
-                                (*new_free).size = remaining;
+                                (*new_free).size = tail_remaining;
                                 (*new_free).next = next;
                             }
-                            if prev.is_null() {
-                                unsafe { *self.free.get() = new_free };
-                            } else {
-                                unsafe { (*prev).next = new_free };
-                            }
-                            // Allocation owns [block_start, split_at).
-                            alloc_block_size = split_at - block_start;
+                            new_free
                         } else {
-                            // No split: allocation owns the full original block.
+                            next
+                        };
+
+                        if front_split {
+                            unsafe { (*cur).next = tail_free };
                             if prev.is_null() {
-                                unsafe { *self.free.get() = next };
+                                unsafe { *self.free.get() = cur };
                             } else {
-                                unsafe { (*prev).next = next };
+                                unsafe { (*prev).next = cur };
                             }
-                            alloc_block_size = unsafe { (*cur).size };
+                        } else if prev.is_null() {
+                            unsafe { *self.free.get() = tail_free };
+                        } else {
+                            unsafe { (*prev).next = tail_free };
                         }
 
                         let alloc_header = alloc_header_addr as *mut AllocHeader;
                         unsafe {
-                            (*alloc_header).block_start = block_start;
-                            (*alloc_header).block_size = alloc_block_size;
+                            (*alloc_header).block_start = alloc_block_start;
+                            (*alloc_header).block_size = alloc_block_end - alloc_block_start;
                         }
 
                         return payload_start as *mut u8;
@@ -180,12 +254,23 @@ macro_rules! install {
                     return;
                 }
 
-                unsafe { self.ensure_initialized() };
+                if !self.ptr_may_have_alloc_header(ptr) {
+                    debug_assert!(false, "invalid freestanding allocator dealloc pointer");
+                    return;
+                }
 
-                let alloc_header_addr = (ptr as usize).saturating_sub(ALLOC_HEADER_SIZE);
+                let Some(alloc_header_addr) = (ptr as usize).checked_sub(ALLOC_HEADER_SIZE) else {
+                    debug_assert!(false, "invalid freestanding allocator dealloc pointer");
+                    return;
+                };
                 let alloc_header = alloc_header_addr as *const AllocHeader;
-                let block = unsafe { (*alloc_header).block_start } as *mut BlockHeader;
-                unsafe { (*block).size = (*alloc_header).block_size };
+                let header = unsafe { &*alloc_header };
+                if !self.alloc_header_is_plausible(header) {
+                    debug_assert!(false, "invalid freestanding allocator allocation header");
+                    return;
+                }
+                let block = header.block_start as *mut BlockHeader;
+                unsafe { (*block).size = header.block_size };
                 let mut prev: *mut BlockHeader = null_mut();
                 let mut cur: *mut BlockHeader = unsafe { *self.free.get() };
 
@@ -229,6 +314,7 @@ macro_rules! install {
                     return layout.align() as *mut u8;
                 }
                 ALLOC.lock();
+                unsafe { ALLOC.ensure_initialized_locked() };
                 let ptr = unsafe { ALLOC.alloc_inner(layout) };
                 ALLOC.unlock();
                 ptr
@@ -239,6 +325,7 @@ macro_rules! install {
                     return;
                 }
                 ALLOC.lock();
+                unsafe { ALLOC.ensure_initialized_locked() };
                 unsafe { ALLOC.dealloc_inner(ptr) };
                 ALLOC.unlock();
             }
@@ -269,6 +356,7 @@ mod tests {
     extern crate std;
 
     use core::mem::{align_of, size_of};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::alloc::{Layout, alloc, dealloc};
 
     // -----------------------------------------------------------------------
@@ -295,6 +383,10 @@ mod tests {
 
     fn align_up(v: usize, a: usize) -> usize {
         (v + (a - 1)) & !(a - 1)
+    }
+
+    fn checked_align_up(v: usize, a: usize) -> Option<usize> {
+        v.checked_add(a - 1).map(|rounded| rounded & !(a - 1))
     }
 
     /// Free-list allocator backed by a Vec<u8>.  Not thread-safe; for tests only.
@@ -338,6 +430,129 @@ mod tests {
             total
         }
 
+        fn free_block_count(&self) -> usize {
+            let mut count = 0usize;
+            let mut cur = self.free_head;
+            while !cur.is_null() {
+                count += 1;
+                cur = unsafe { (*cur).next };
+            }
+            count
+        }
+
+        fn heap_bounds(&self) -> (usize, usize) {
+            let start = self.heap.as_ptr() as usize;
+            (start, start + self.heap.len())
+        }
+
+        fn ptr_may_have_alloc_header(&self, ptr: *mut u8) -> bool {
+            let ptr_addr = ptr as usize;
+            let (heap_start, heap_end) = self.heap_bounds();
+            if ptr_addr < heap_start || ptr_addr >= heap_end {
+                return false;
+            }
+            let Some(header_addr) = ptr_addr.checked_sub(ALLOC_HDR_SIZE) else {
+                return false;
+            };
+            let Some(header_end) = header_addr.checked_add(ALLOC_HDR_SIZE) else {
+                return false;
+            };
+            header_addr >= heap_start && header_end <= heap_end
+        }
+
+        fn alloc_header_is_plausible(&self, h: &AHdr) -> bool {
+            let (heap_start, heap_end) = self.heap_bounds();
+            if h.block_start < heap_start || h.block_start >= heap_end {
+                return false;
+            }
+            if !h.block_start.is_multiple_of(align_of::<BHdr>()) {
+                return false;
+            }
+            if h.block_size < HEADER_SIZE || h.block_size > self.heap.len() {
+                return false;
+            }
+            let Some(block_end) = h.block_start.checked_add(h.block_size) else {
+                return false;
+            };
+            block_end <= heap_end
+        }
+
+        fn free_blocks(&self) -> std::vec::Vec<(usize, usize)> {
+            let mut blocks = std::vec::Vec::new();
+            let mut cur = self.free_head;
+            while !cur.is_null() {
+                blocks.push((cur as usize, unsafe { (*cur).size }));
+                cur = unsafe { (*cur).next };
+            }
+            blocks
+        }
+
+        fn alloc_header_for(&self, ptr: *mut u8) -> AHdr {
+            assert!(self.ptr_may_have_alloc_header(ptr));
+            let ah_addr = (ptr as usize).checked_sub(ALLOC_HDR_SIZE).unwrap();
+            let ah = ah_addr as *const AHdr;
+            AHdr {
+                block_start: unsafe { (*ah).block_start },
+                block_size: unsafe { (*ah).block_size },
+            }
+        }
+
+        fn front_split_layout(&self, size: usize) -> (Layout, usize) {
+            let block_start = self.free_head as usize;
+            let block_end = block_start + unsafe { (*self.free_head).size };
+            for align in [64usize, 128, 256, 512, 1024, 2048, 4096, 8192, 16_384] {
+                let payload_start =
+                    checked_align_up(block_start + HEADER_SIZE + ALLOC_HDR_SIZE, align)
+                        .expect("align");
+                let alloc_header_addr = payload_start - ALLOC_HDR_SIZE;
+                let leading = alloc_header_addr - block_start;
+                if leading >= MIN_SPLIT && payload_start + size <= block_end {
+                    return (Layout::from_size_align(size, align).unwrap(), leading);
+                }
+            }
+            panic!("could not find front-splitting alignment for test heap");
+        }
+
+        fn front_split_layout_with_min_leading(
+            &self,
+            size: usize,
+            min_leading: usize,
+        ) -> (Layout, usize) {
+            let block_start = self.free_head as usize;
+            let block_end = block_start + unsafe { (*self.free_head).size };
+            for align in [64usize, 128, 256, 512, 1024, 2048, 4096, 8192, 16_384] {
+                let payload_start =
+                    checked_align_up(block_start + HEADER_SIZE + ALLOC_HDR_SIZE, align)
+                        .expect("align");
+                let alloc_header_addr = payload_start - ALLOC_HDR_SIZE;
+                let leading = alloc_header_addr - block_start;
+                if leading >= min_leading && payload_start + size <= block_end {
+                    return (Layout::from_size_align(size, align).unwrap(), leading);
+                }
+            }
+            panic!("could not find requested front-splitting alignment for test heap");
+        }
+
+        fn front_split_no_tail_layout(&self) -> (Layout, usize) {
+            let block_start = self.free_head as usize;
+            let block_end = block_start + unsafe { (*self.free_head).size };
+            for align in [64usize, 128, 256, 512, 1024, 2048, 4096, 8192, 16_384] {
+                let payload_start =
+                    checked_align_up(block_start + HEADER_SIZE + ALLOC_HDR_SIZE, align)
+                        .expect("align");
+                let alloc_header_addr = payload_start - ALLOC_HDR_SIZE;
+                let leading = alloc_header_addr - block_start;
+                if leading < MIN_SPLIT || payload_start >= block_end {
+                    continue;
+                }
+                let size = block_end - payload_start;
+                if let Ok(layout) = Layout::from_size_align(size, align) {
+                    return (layout, leading);
+                }
+            }
+            panic!("could not find front-split/no-tail layout for test heap");
+        }
+
         unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
             let request_align = layout.align().max(align_of::<usize>());
             let mut prev: *mut BHdr = core::ptr::null_mut();
@@ -347,7 +562,7 @@ mod tests {
                 let block_start = cur as usize;
                 let payload_start = match block_start
                     .checked_add(HEADER_SIZE + ALLOC_HDR_SIZE)
-                    .map(|v| align_up(v, request_align))
+                    .and_then(|v| checked_align_up(v, request_align))
                 {
                     Some(v) => v,
                     None => return core::ptr::null_mut(),
@@ -363,45 +578,59 @@ mod tests {
 
                 if payload_end <= block_end {
                     let alloc_header_addr = payload_start - ALLOC_HDR_SIZE;
+                    let leading = alloc_header_addr - block_start;
+                    let front_split = leading >= MIN_SPLIT;
+                    let alloc_block_start = if front_split {
+                        alloc_header_addr
+                    } else {
+                        block_start
+                    };
 
                     // Bug fix #2: align split point to BHdr alignment.
-                    let split_at = align_up(payload_end, align_of::<BHdr>());
-                    let remaining = if split_at <= block_end {
+                    let Some(split_at) = checked_align_up(payload_end, align_of::<BHdr>()) else {
+                        return core::ptr::null_mut();
+                    };
+                    let tail_remaining = if split_at <= block_end {
                         block_end - split_at
                     } else {
                         0
                     };
+                    let tail_split = tail_remaining >= MIN_SPLIT;
+                    let alloc_block_end = if tail_split { split_at } else { block_end };
                     let next = unsafe { (*cur).next };
 
-                    // Bug fix #1: no-split path records the full original block size.
-                    let alloc_block_size;
+                    if front_split {
+                        unsafe { (*cur).size = leading };
+                    }
 
-                    if remaining >= MIN_SPLIT {
+                    let tail_free = if tail_split {
                         let new_free = split_at as *mut BHdr;
                         unsafe {
-                            (*new_free).size = remaining;
+                            (*new_free).size = tail_remaining;
                             (*new_free).next = next;
                         }
-                        if prev.is_null() {
-                            self.free_head = new_free;
-                        } else {
-                            unsafe { (*prev).next = new_free };
-                        }
-                        alloc_block_size = split_at - block_start;
+                        new_free
                     } else {
+                        next
+                    };
+
+                    if front_split {
+                        unsafe { (*cur).next = tail_free };
                         if prev.is_null() {
-                            self.free_head = next;
+                            self.free_head = cur;
                         } else {
-                            unsafe { (*prev).next = next };
+                            unsafe { (*prev).next = cur };
                         }
-                        // Full original block — do NOT store payload_end-block_start.
-                        alloc_block_size = unsafe { (*cur).size };
+                    } else if prev.is_null() {
+                        self.free_head = tail_free;
+                    } else {
+                        unsafe { (*prev).next = tail_free };
                     }
 
                     let ah = alloc_header_addr as *mut AHdr;
                     unsafe {
-                        (*ah).block_start = block_start;
-                        (*ah).block_size = alloc_block_size;
+                        (*ah).block_start = alloc_block_start;
+                        (*ah).block_size = alloc_block_end - alloc_block_start;
                     }
 
                     return payload_start as *mut u8;
@@ -417,10 +646,19 @@ mod tests {
             if ptr.is_null() {
                 return;
             }
-            let ah_addr = (ptr as usize).saturating_sub(ALLOC_HDR_SIZE);
+            if !self.ptr_may_have_alloc_header(ptr) {
+                return;
+            }
+            let Some(ah_addr) = (ptr as usize).checked_sub(ALLOC_HDR_SIZE) else {
+                return;
+            };
             let ah = ah_addr as *const AHdr;
-            let block_start = unsafe { (*ah).block_start };
-            let block_size = unsafe { (*ah).block_size };
+            let header = unsafe { &*ah };
+            if !self.alloc_header_is_plausible(header) {
+                return;
+            }
+            let block_start = header.block_start;
+            let block_size = header.block_size;
             let block = block_start as *mut BHdr;
             unsafe { (*block).size = block_size };
 
@@ -439,24 +677,115 @@ mod tests {
 
             // Coalesce block with next.
             let next = unsafe { (*block).next };
-            if !next.is_null()
-                && unsafe { block as usize + (*block).size } == next as usize
-            {
+            if !next.is_null() && unsafe { block as usize + (*block).size } == next as usize {
                 unsafe {
                     (*block).size = (*block).size.saturating_add((*next).size);
                     (*block).next = (*next).next;
                 }
             }
             // Coalesce prev with block.
-            if !prev.is_null()
-                && unsafe { prev as usize + (*prev).size } == block as usize
-            {
+            if !prev.is_null() && unsafe { prev as usize + (*prev).size } == block as usize {
                 unsafe {
                     (*prev).size = (*prev).size.saturating_add((*block).size);
                     (*prev).next = (*block).next;
                 }
             }
         }
+    }
+
+    struct TestInitAllocator {
+        heap: std::vec::Vec<u8>,
+        free_head: *mut BHdr,
+        initialized: bool,
+        init_count: usize,
+    }
+
+    impl TestInitAllocator {
+        fn new(size: usize) -> Self {
+            let mut heap = std::vec::Vec::<u8>::with_capacity(size);
+            unsafe { heap.set_len(size) };
+            Self {
+                heap,
+                free_head: core::ptr::null_mut(),
+                initialized: false,
+                init_count: 0,
+            }
+        }
+
+        fn ensure_initialized_locked(&mut self) {
+            if self.initialized {
+                return;
+            }
+            self.init_count += 1;
+            let base = self.heap.as_mut_ptr() as usize;
+            let Some(aligned) = checked_align_up(base, align_of::<BHdr>()) else {
+                self.initialized = true;
+                return;
+            };
+            let offset = aligned - base;
+            if offset + HEADER_SIZE > self.heap.len() {
+                self.free_head = core::ptr::null_mut();
+                self.initialized = true;
+                return;
+            }
+            let head = aligned as *mut BHdr;
+            unsafe {
+                (*head).size = self.heap.len() - offset;
+                (*head).next = core::ptr::null_mut();
+            }
+            self.free_head = head;
+            self.initialized = true;
+        }
+    }
+
+    struct TestTtasLock {
+        locked: AtomicBool,
+        cas_attempts: AtomicUsize,
+    }
+
+    impl TestTtasLock {
+        const fn new(locked: bool) -> Self {
+            Self {
+                locked: AtomicBool::new(locked),
+                cas_attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn try_lock_once(&self) -> bool {
+            if self.locked.load(Ordering::Relaxed) {
+                return false;
+            }
+            self.cas_attempts.fetch_add(1, Ordering::Relaxed);
+            self.locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        }
+
+        fn unlock(&self) {
+            self.locked.store(false, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn initialization_happens_once_under_allocator_lock_model() {
+        let mut a = TestInitAllocator::new(4096);
+        a.ensure_initialized_locked();
+        let first_head = a.free_head;
+        let first_size = unsafe { (*first_head).size };
+        a.ensure_initialized_locked();
+        assert_eq!(a.init_count, 1);
+        assert_eq!(a.free_head, first_head);
+        assert_eq!(unsafe { (*a.free_head).size }, first_size);
+    }
+
+    #[test]
+    fn ttas_lock_does_not_cas_while_obviously_locked() {
+        let lock = TestTtasLock::new(true);
+        assert!(!lock.try_lock_once());
+        assert_eq!(lock.cas_attempts.load(Ordering::Relaxed), 0);
+        lock.unlock();
+        assert!(lock.try_lock_once());
+        assert_eq!(lock.cas_attempts.load(Ordering::Relaxed), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -607,7 +936,11 @@ mod tests {
             let layout = Layout::from_size_align(size, align).unwrap();
             let p = unsafe { a.alloc(layout) };
             assert!(!p.is_null(), "alloc failed size={size} align={align}");
-            assert_eq!((p as usize) % align, 0, "alignment violated size={size} align={align}");
+            assert_eq!(
+                (p as usize) % align,
+                0,
+                "alignment violated size={size} align={align}"
+            );
             unsafe { a.dealloc(p) };
         }
 
@@ -625,8 +958,15 @@ mod tests {
         const HEAP: usize = 64 * 1024;
         let mut a = TestFreeList::new(HEAP);
 
-        let cases: &[(usize, usize)] =
-            &[(17, 1), (31, 1), (33, 8), (65, 16), (100, 16), (1, 1), (7, 1)];
+        let cases: &[(usize, usize)] = &[
+            (17, 1),
+            (31, 1),
+            (33, 8),
+            (65, 16),
+            (100, 16),
+            (1, 1),
+            (7, 1),
+        ];
 
         // First pass: allocate all.
         let mut ptrs = std::vec::Vec::new();
@@ -666,6 +1006,230 @@ mod tests {
             assert_eq!((p as usize) % align, 0, "alignment violated");
             unsafe { a.dealloc(p) };
         }
+    }
+
+    #[test]
+    fn high_align_front_split_creates_front_free_block_and_tail() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let free_start = a.free_head as usize;
+        let free_at_start = a.total_free_bytes();
+        let (layout, leading) = a.front_split_layout(128);
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null());
+        assert_eq!((p as usize) % layout.align(), 0);
+
+        let header = a.alloc_header_for(p);
+        assert_eq!(header.block_start, (p as usize) - ALLOC_HDR_SIZE);
+        assert_eq!(header.block_start - free_start, leading);
+        let blocks = a.free_blocks();
+        assert_eq!(blocks.len(), 2, "front and tail free blocks should remain");
+        assert_eq!(blocks[0], (free_start, leading));
+        assert_eq!(a.total_free_bytes() + header.block_size, free_at_start);
+
+        unsafe { a.dealloc(p) };
+        assert_eq!(a.free_block_count(), 1);
+        assert_eq!(a.total_free_bytes(), free_at_start);
+    }
+
+    #[test]
+    fn small_leading_padding_stays_in_allocation_until_dealloc() {
+        const HEAP: usize = 4096;
+        let mut a = TestFreeList::new(HEAP);
+        let free_start = a.free_head as usize;
+        let free_at_start = a.total_free_bytes();
+        let layout = Layout::from_size_align(64, align_of::<usize>()).unwrap();
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null());
+        let header = a.alloc_header_for(p);
+        let leading = (p as usize) - ALLOC_HDR_SIZE - free_start;
+        assert!(leading < MIN_SPLIT);
+        assert_eq!(header.block_start, free_start);
+
+        unsafe { a.dealloc(p) };
+        assert_eq!(a.free_block_count(), 1);
+        assert_eq!(a.total_free_bytes(), free_at_start);
+    }
+
+    #[test]
+    fn front_split_tail_split_preserves_full_coverage() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let free_at_start = a.total_free_bytes();
+        let (layout, _) = a.front_split_layout(1024);
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null());
+        let header = a.alloc_header_for(p);
+        let blocks = a.free_blocks();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "front split should coexist with tail split"
+        );
+        assert_eq!(a.total_free_bytes() + header.block_size, free_at_start);
+        assert_eq!(blocks[0].0 + blocks[0].1, header.block_start);
+        assert_eq!(header.block_start + header.block_size, blocks[1].0);
+
+        unsafe { a.dealloc(p) };
+        assert_eq!(a.free_block_count(), 1);
+        assert_eq!(a.total_free_bytes(), free_at_start);
+    }
+
+    #[test]
+    fn too_large_high_alignment_fails_without_corrupting_freelist() {
+        const HEAP: usize = 4096;
+        let mut a = TestFreeList::new(HEAP);
+        let free_at_start = a.total_free_bytes();
+        let layout = Layout::from_size_align(1, 1 << 20).unwrap();
+        let p = unsafe { a.alloc(layout) };
+        assert!(p.is_null());
+        assert_eq!(a.free_block_count(), 1);
+        assert_eq!(a.total_free_bytes(), free_at_start);
+    }
+
+    fn ranges_overlap(a_start: usize, a_size: usize, b_start: usize, b_size: usize) -> bool {
+        let a_end = a_start + a_size;
+        let b_end = b_start + b_size;
+        a_start < b_end && b_start < a_end
+    }
+
+    #[test]
+    fn front_split_without_tail_links_front_directly_to_original_next() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let free_start = a.free_head as usize;
+        let free_at_start = a.total_free_bytes();
+        let (layout, leading) = a.front_split_no_tail_layout();
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null());
+        let header = a.alloc_header_for(p);
+        let blocks = a.free_blocks();
+        assert_eq!(blocks, std::vec![(free_start, leading)]);
+        assert_eq!(header.block_start, free_start + leading);
+        assert_eq!(
+            header.block_start + header.block_size,
+            free_start + free_at_start
+        );
+        assert_eq!(a.total_free_bytes() + header.block_size, free_at_start);
+
+        unsafe { a.dealloc(p) };
+        assert_eq!(a.free_block_count(), 1);
+        assert_eq!(a.total_free_bytes(), free_at_start);
+    }
+
+    #[test]
+    fn subsequent_front_allocation_cannot_overlap_live_high_align_block() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let (layout, _) = a.front_split_layout_with_min_leading(1024, 512);
+        let high = unsafe { a.alloc(layout) };
+        assert!(!high.is_null());
+        let high_header = a.alloc_header_for(high);
+
+        let small_layout = Layout::from_size_align(32, align_of::<usize>()).unwrap();
+        let small = unsafe { a.alloc(small_layout) };
+        assert!(!small.is_null());
+        let small_header = a.alloc_header_for(small);
+        assert!(small_header.block_start < high_header.block_start);
+        assert!(!ranges_overlap(
+            small_header.block_start,
+            small_header.block_size,
+            high_header.block_start,
+            high_header.block_size,
+        ));
+
+        unsafe { a.dealloc(small) };
+        unsafe { a.dealloc(high) };
+        assert_eq!(a.free_block_count(), 1);
+    }
+
+    #[test]
+    fn subsequent_tail_allocation_cannot_overlap_live_high_align_block() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let (layout, _) = a.front_split_layout_with_min_leading(1024, 512);
+        let high = unsafe { a.alloc(layout) };
+        assert!(!high.is_null());
+        let high_header = a.alloc_header_for(high);
+
+        // Request more payload bytes than the front block can satisfy including allocator
+        // metadata, forcing first-fit search to skip the front block and use the tail block.
+        let front_free_size = a.free_blocks()[0].1;
+        let tail_layout = Layout::from_size_align(front_free_size, align_of::<usize>()).unwrap();
+        let tail = unsafe { a.alloc(tail_layout) };
+        assert!(!tail.is_null());
+        let tail_header = a.alloc_header_for(tail);
+        assert!(tail_header.block_start >= high_header.block_start + high_header.block_size);
+        assert!(!ranges_overlap(
+            tail_header.block_start,
+            tail_header.block_size,
+            high_header.block_start,
+            high_header.block_size,
+        ));
+
+        unsafe { a.dealloc(tail) };
+        unsafe { a.dealloc(high) };
+        assert_eq!(a.free_block_count(), 1);
+    }
+
+    #[test]
+    fn front_split_next_pointer_never_bypasses_live_allocation() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let (layout, _) = a.front_split_layout(512);
+        let high = unsafe { a.alloc(layout) };
+        assert!(!high.is_null());
+        let high_header = a.alloc_header_for(high);
+        let blocks = a.free_blocks();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0 + blocks[0].1, high_header.block_start);
+        assert_eq!(
+            high_header.block_start + high_header.block_size,
+            blocks[1].0
+        );
+
+        let first = a.free_head;
+        let next = unsafe { (*first).next };
+        assert_eq!(next as usize, blocks[1].0);
+        assert!(next as usize >= high_header.block_start + high_header.block_size);
+
+        unsafe { a.dealloc(high) };
+        assert_eq!(a.free_block_count(), 1);
+    }
+
+    #[test]
+    fn high_alignment_churn_returns_to_single_free_block() {
+        const HEAP: usize = 64 * 1024;
+        let mut a = TestFreeList::new(HEAP);
+        let free_at_start = a.total_free_bytes();
+        let cases = [
+            Layout::from_size_align(1, 64).unwrap(),
+            Layout::from_size_align(97, 128).unwrap(),
+            Layout::from_size_align(4096, 4096).unwrap(),
+            Layout::from_size_align(33, 256).unwrap(),
+        ];
+        let mut ptrs = std::vec::Vec::new();
+        for layout in cases {
+            let p = unsafe { a.alloc(layout) };
+            assert!(!p.is_null());
+            assert_eq!((p as usize) % layout.align(), 0);
+            ptrs.push((layout, p));
+        }
+        for (_, p) in ptrs.into_iter().rev() {
+            unsafe { a.dealloc(p) };
+        }
+        assert_eq!(a.total_free_bytes(), free_at_start);
+        assert_eq!(a.free_block_count(), 1);
+    }
+
+    #[test]
+    fn zero_size_sentinel_wrong_layout_is_rejected_before_header_read() {
+        let mut a = TestFreeList::new(4096);
+        let free_at_start = a.total_free_bytes();
+        let sentinel = align_of::<usize>() as *mut u8;
+        unsafe { a.dealloc(sentinel) };
+        assert_eq!(a.total_free_bytes(), free_at_start);
+        assert_eq!(a.free_block_count(), 1);
     }
 
     // -----------------------------------------------------------------------

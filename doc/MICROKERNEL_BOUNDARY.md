@@ -49,6 +49,10 @@ Milestone freeze/assertion checks:
 
 - `scripts/check-boundary-milestone-freeze.sh`
 
+## Boundary milestone status
+
+✅ **COMPLETE** — PR-BND-6 pass C landed; the boundary milestone freeze gate now tracks this moved document at `doc/MICROKERNEL_BOUNDARY.md`.
+
 ## Current rule of thumb
 
 - If behavior is policy/translation/orchestration, it belongs in workspace service crates.
