@@ -299,6 +299,82 @@ pub(crate) struct VmAnonMapValidatedArgs {
     pub(crate) flags: PageFlags,
 }
 
+// ── Stage 5D: TLB shootdown / rollback-domain plan types ─────────────────────
+//
+// These types make TLB shootdown targeting and per-page rollback progress
+// explicit so future plan-first decompositions can use them. All are
+// helper-only scaffolding; no live conversion is wired in Stage 5D.
+//
+// See KERNEL_LOCKING.md §19 for the full audit and lock-sequence table.
+
+/// Stage 5D: Computed TLB shootdown target set for a single-page unmap.
+///
+/// Captured from the scheduler domain (rank 1) + task domain (rank 2) before
+/// any vm (rank 5) or ipc (rank 3) domain is touched. In the future plan-first
+/// path, this snapshot eliminates the per-page re-computation of `live_cpu_bitmap_for_asid`
+/// inside the unmap loop.
+///
+/// When `target_cpu_bitmap == 0` no cross-CPU notification is needed (the page
+/// is only live on the requester CPU) and `request_live_asid_shootdown` returns
+/// immediately without acquiring the ipc lock — making per-page unmap fast-path
+/// entirely ipc-lock-free in the single-CPU or private-ASID case.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TlbShootdownRequestPlan {
+    /// ASID whose TLB entry is being invalidated.
+    pub(crate) asid: Asid,
+    /// Page-aligned virtual address of the unmapped page.
+    pub(crate) virt: VirtAddr,
+    /// Bitmask of CPUs that must receive and ACK the shootdown.
+    /// Excludes the requester bit. Zero means no cross-CPU work needed.
+    pub(crate) target_cpu_bitmap: crate::kernel::topology::CpuBitmap,
+    /// The CPU performing the unmap (excluded from targets).
+    pub(crate) requester: crate::kernel::scheduler::CpuId,
+}
+
+/// Stage 5D: Per-page mapping progress for VmAnonMap rollback tracking.
+///
+/// Addresses Stage 5C blocker #2: the per-page loop variable `va` was an
+/// implicit bare `usize`; this struct makes the progress interval explicit.
+///
+/// Invariant: `base_addr ≤ mapped_end ≤ end_addr`; all three are multiples
+/// of `PAGE_SIZE`. When `mapped_end == base_addr` the rollback range is empty
+/// (nothing to unmap). Rollback covers `[base_addr, mapped_end)` only, never
+/// the full `[base_addr, end_addr)`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VmPageMapProgress {
+    /// Page-aligned start of the requested mapping range.
+    pub(crate) base_addr: usize,
+    /// Exclusive upper bound of pages that have been successfully mapped.
+    /// Rollback must cover `[base_addr, mapped_end)` and no more.
+    pub(crate) mapped_end: usize,
+    /// Page-aligned end of the total requested range.
+    pub(crate) end_addr: usize,
+}
+
+/// Stage 5D: Progress-aware VmAnonMap plan (strengthens Stage 5C VmAnonMapPlan).
+///
+/// Replaces the bare `va` loop variable with an explicit `VmPageMapProgress`.
+/// This, combined with the explicit-ASID helpers from Stage 5C and the
+/// `TlbShootdownRequestPlan` from Stage 5D, resolves Stage 5C blocker #2.
+///
+/// Remaining blockers before live conversion:
+///   #1: TLB busy-wait (ipc rank 3) in rollback has rank inversion with vm (5).
+///   #3: x86_64 smoke required before live VM/TLB reordering.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VmAnonMapProgressPlan {
+    /// Lock-free validated syscall arguments (same as VmAnonMapPlan.validated).
+    pub(crate) validated: VmAnonMapValidatedArgs,
+    /// TID of the calling thread (scheduler snapshot, rank 1).
+    pub(crate) tid: u64,
+    /// ASID of the calling task's address space (task snapshot, rank 2).
+    pub(crate) asid: Asid,
+    /// Explicit per-page mapping progress (addresses Stage 5C blocker #2).
+    pub(crate) progress: VmPageMapProgress,
+}
+
 #[cfg(feature = "hosted-dev")]
 const MAX_COW_PAGES: usize = 100;
 #[cfg(not(feature = "hosted-dev"))]

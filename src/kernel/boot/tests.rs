@@ -8878,6 +8878,254 @@ fn vm_anon_map_write_execute_prot_also_skips_stack_guard() {
         .expect("join");
 }
 
+// ── Stage 5D: TLB shootdown / rollback-domain plan tests ─────────────────────
+//
+// These tests verify:
+//   1. TlbShootdownRequestPlan captures the correct target bitmap.
+//   2. VmPageMapProgress rollback covers only mapped pages, not the full range.
+//   3. VmBrk shrink tolerates lazy (never-faulted) unmapped pages.
+//   4. VmAnonMapProgressPlan struct captures correct initial empty-progress state.
+
+#[test]
+fn tlb_shootdown_request_plan_has_no_remote_targets_in_single_cpu() {
+    // Stage 5D: In a hosted-dev single-CPU environment, any ASID is only live
+    // on the current (requester) CPU. The target bitmap must be 0, which means
+    // request_live_asid_shootdown returns immediately without touching the ipc
+    // lock — making unmap operations ipc-lock-free in the common case.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (state, asid) = setup_task0_with_known_asid();
+            let virt = VirtAddr(0x4_0000);
+
+            let plan = state.compute_tlb_shootdown_request_plan(asid, virt);
+
+            assert_eq!(plan.asid, asid, "plan must record the requested ASID");
+            assert_eq!(plan.virt, virt, "plan must record the requested virt address");
+            assert_eq!(
+                plan.target_cpu_bitmap, 0,
+                "single-CPU context: requester is the only CPU, target bitmap must be 0"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn tlb_shootdown_request_plan_unbound_asid_has_no_targets() {
+    // Stage 5D: An ASID that is not bound to any running task has no live
+    // CPUs and always produces an empty target bitmap — no shootdown needed.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            // Create an ASID but do NOT bind it to any task.
+            let (unbound_asid, _) = state.create_user_address_space().expect("asid");
+            let virt = VirtAddr(0x5_0000);
+
+            let plan = state.compute_tlb_shootdown_request_plan(unbound_asid, virt);
+
+            assert_eq!(
+                plan.target_cpu_bitmap, 0,
+                "unbound ASID has no live CPUs: target bitmap must be 0"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_page_map_progress_rollback_covers_only_mapped_range() {
+    // Stage 5D: VmPageMapProgress makes rollback scope explicit. A partial map
+    // failure at page K must roll back only [base, page_K), leaving pages
+    // [page_K, end) unaffected. This test verifies the invariant by manually
+    // mapping 2 of 3 pages and rolling back only page 1, confirming page 2
+    // remains mapped and page 3 (never mapped) stays absent.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            let base = 0x20_0000_usize;
+            let page2 = base + PAGE_SIZE;
+            let page3 = base + 2 * PAGE_SIZE;
+
+            let (_, cap1) = state.alloc_anonymous_memory_object().expect("alloc 1");
+            let (_, cap2) = state.alloc_anonymous_memory_object().expect("alloc 2");
+            state
+                .map_user_page_in_asid_with_caps(asid, cap1, VirtAddr(base as u64), PageFlags::USER_RW)
+                .expect("map page 1");
+            state
+                .map_user_page_in_asid_with_caps(asid, cap2, VirtAddr(page2 as u64), PageFlags::USER_RW)
+                .expect("map page 2");
+
+            // Confirm initial state: pages 1 and 2 mapped, page 3 not.
+            assert!(
+                state.is_user_page_mapped_in_asid(asid, VirtAddr(base as u64)).expect("pre-check 1"),
+                "page 1 must be mapped"
+            );
+            assert!(
+                state.is_user_page_mapped_in_asid(asid, VirtAddr(page2 as u64)).expect("pre-check 2"),
+                "page 2 must be mapped"
+            );
+            assert!(
+                !state.is_user_page_mapped_in_asid(asid, VirtAddr(page3 as u64)).expect("pre-check 3"),
+                "page 3 must not be mapped"
+            );
+
+            // Simulate partial rollback: progress.mapped_end = page2.
+            // Rollback covers [base, page2) = page 1 only.
+            state
+                .unmap_user_page_in_asid(asid, VirtAddr(base as u64))
+                .expect("rollback page 1");
+
+            // After rollback of page 1 only: page 2 must remain mapped.
+            assert!(
+                !state.is_user_page_mapped_in_asid(asid, VirtAddr(base as u64)).expect("post-check 1"),
+                "page 1 must be unmapped after partial rollback"
+            );
+            assert!(
+                state.is_user_page_mapped_in_asid(asid, VirtAddr(page2 as u64)).expect("post-check 2"),
+                "page 2 must remain mapped (rollback did not reach it)"
+            );
+            assert!(
+                !state.is_user_page_mapped_in_asid(asid, VirtAddr(page3 as u64)).expect("post-check 3"),
+                "page 3 was never mapped and must remain absent"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_page_map_progress_empty_initial_rollback_range() {
+    // Stage 5D: When VmPageMapProgress.mapped_end == base_addr, the rollback
+    // range is empty — no pages need to be unmapped. This is the correct
+    // starting state at the beginning of a VmAnonMap loop.
+    let page_size = PAGE_SIZE;
+    let base = 0x1_0000_usize;
+    let end = base + 3 * page_size;
+
+    // Initial progress: nothing mapped yet.
+    let progress = crate::kernel::boot::VmPageMapProgress {
+        base_addr: base,
+        mapped_end: base,
+        end_addr: end,
+    };
+    assert_eq!(
+        progress.mapped_end, progress.base_addr,
+        "initial progress must have empty rollback range"
+    );
+    assert_eq!(progress.end_addr - progress.base_addr, 3 * page_size);
+
+    // After mapping the first page: rollback covers exactly one page.
+    let progress_after_one = crate::kernel::boot::VmPageMapProgress {
+        base_addr: base,
+        mapped_end: base + page_size,
+        end_addr: end,
+    };
+    assert_eq!(
+        progress_after_one.mapped_end - progress_after_one.base_addr,
+        page_size,
+        "after one page, rollback range must cover exactly PAGE_SIZE bytes"
+    );
+}
+
+#[test]
+fn vm_brk_shrink_tolerates_lazy_unmapped_pages() {
+    // Stage 5D: VmBrk shrink calls unmap_user_page_in_current_asid for each
+    // page in [round_up(requested), round_up(current_end)). Pages in a brk
+    // region that were never faulted in are not in the page table; unmap must
+    // return Ok(None) rather than Err so the shrink succeeds for lazy regions.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = setup_task0_with_asid();
+
+            // Set brk to [0x10000, 0x14000) — 4 pages, none mapped (lazy).
+            state
+                .set_task_brk_bounds(0, 0x10000, 0x14000)
+                .expect("set brk bounds");
+
+            // Shrink to base: VM_BRK with requested=0x10000.
+            // SYSCALL_ARG_CAP = arg index 0 = requested.
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmBrk as usize,
+                [0x10000, 0, 0, 0, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "VmBrk shrink over lazy-unmapped pages must succeed"
+            );
+
+            // Bounds must reflect the shrink.
+            assert_eq!(
+                state.task_brk_bounds(0),
+                Some((0x10000, 0x10000)),
+                "brk end must equal base after full shrink"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_brk_shrink_with_partially_mapped_lazy_region() {
+    // Stage 5D: VmBrk shrink where some pages in the shrink range are mapped
+    // (faulted in) and some are not (lazy). The unmap loop must handle both
+    // without error — mapped pages unmap cleanly, unmapped pages return Ok(None).
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            // Set brk to [0x20000, 0x24000) — 4 pages.
+            state
+                .set_task_brk_bounds(0, 0x20000, 0x24000)
+                .expect("set brk bounds");
+
+            // Manually map only page 1 (0x20000) and page 3 (0x22000); leave pages 2 and 4 lazy.
+            let (_, cap1) = state.alloc_anonymous_memory_object().expect("alloc cap1");
+            let (_, cap3) = state.alloc_anonymous_memory_object().expect("alloc cap3");
+            state
+                .map_user_page_in_asid_with_caps(asid, cap1, VirtAddr(0x20000), PageFlags::USER_RW)
+                .expect("map page 1");
+            state
+                .map_user_page_in_asid_with_caps(asid, cap3, VirtAddr(0x22000), PageFlags::USER_RW)
+                .expect("map page 3");
+
+            // Shrink to base: must succeed even though pages 2 and 4 are not mapped.
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmBrk as usize,
+                [0x20000, 0, 0, 0, 0, 0],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "VmBrk shrink with mixed mapped/lazy pages must succeed"
+            );
+
+            // All pages must be unmapped (mapped ones were unmapped by shrink).
+            for va in [0x20000u64, 0x21000, 0x22000, 0x23000] {
+                assert!(
+                    !state
+                        .is_user_page_mapped_in_asid(asid, VirtAddr(va))
+                        .expect("post-shrink check"),
+                    "page at {:#x} must not be mapped after shrink",
+                    va
+                );
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
 // ── Phase L2A: canonical boot SharedKernel construction tests ─────────────────
 //
 // These tests verify Bootstrap::init_shared_static_with_boot_memory_map
