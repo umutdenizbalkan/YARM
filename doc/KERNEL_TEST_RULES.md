@@ -589,3 +589,100 @@ asserts that the LAPIC timer initial-count register remains 0 after `init_lapic_
 - `doc/KERNEL_LOCKING.md` — added Section 15 for Phase BT2
 
 ---
+
+## Rule N+3 — Stage 5A: split-read helpers must prove equivalence with a globally-locked test
+
+**Rule**: Every new `SharedKernel::*_split_read` or `*_split_mut` helper added
+under a domain sub-lock must be accompanied by an equivalence test that:
+1. Reads the same value via `kernel.with(|state| ...)` (globally-locked path).
+2. Reads the same value via the new split-read helper.
+3. Asserts they are equal.
+
+This pattern was established for fault (Stage 4T+5) and telemetry (Stage 4T+5),
+and extended for task class and capability slot capacity in Stage 5A.
+
+**Rationale**: Split-read helpers bypass the global `SpinLock<KernelState>`.
+Without an explicit equivalence test, it is easy to accidentally write a helper
+that acquires the wrong sub-lock, accesses the wrong field, or has an off-by-one
+in array indexing — all of which would return a silently wrong value that no type
+check or unit test would catch. The equivalence test is the only proof that the
+split-read observes the same shared state as the canonical global-lock path.
+
+**Requirement**: For each new `*_split_read` helper, the equivalence test must:
+- Cover the absent/None case (before the target entity exists).
+- Cover the present/Some case (after creation or mutation via global lock).
+- Use `assert_eq!` with a descriptive message naming the helper.
+
+**Examples** (Stage 5A, `runtime.rs`):
+- `task_class_split_read_matches_global`
+- `task_exists_split_read_matches_global`
+- `cnode_slot_capacity_split_read_matches_global`
+
+---
+
+## Rule N+4 — Stage 5A: do not add split-read helpers for trap-boundary-sensitive reads
+
+**Rule**: The following operations must NEVER be converted to split-read helpers
+on `SharedKernel`, even if the underlying data is technically readable under a
+domain sub-lock:
+
+1. **x86_64 entering_tid / exiting_tid** in `yarm_x86_dispatch_trap_from_stub` (Class F).
+   Stage 4T+6 attempted this and was smoke-broken. The x86_64 trap path's
+   `with_cpu()` calls at these sites must remain globally locked.
+
+2. **Any TrapFrame read or write** (Class F). TrapFrame register writeback
+   semantics require the global lock's exclusivity guarantee.
+
+3. **Scheduler yield/dispatch operations** (Class I). `yield_current`,
+   `dispatch_next_task`, `dispatch_ready_task`, and `enter_dispatched_user_task_if_available`
+   modify runqueues atomically with status updates. Split-mut here risks a
+   task becoming runnable but not enqueued (or vice versa).
+
+4. **x86_64 / AArch64 boot or timer paths** (Class J). BSP LAPIC timer arming,
+   BT1/BT2 guards, and AArch64 boot ERET paths must not be touched.
+
+**Corollary**: A split-read helper is safe if and only if:
+- It acquires exactly the domain lock(s) for the data it reads.
+- It returns a `Copy` snapshot (no borrowed references out of the lock scope).
+- It is not on any path that also writes a TrapFrame, drives a scheduler state
+  machine, or touches arch/boot/timer state.
+- It has a passing equivalence test (Rule N+3).
+
+---
+
+## Rule N+5 — Stage 5A: lock-domain rank ordering for split-read helpers
+
+**Rule**: When writing a new `*_from_raw` function in `orchestrator_state.rs`
+that acquires a domain sub-lock, it must:
+
+1. Acquire domain locks in **strictly increasing rank order** (scheduler=1,
+   task=2, ipc=3, capability=4, vm=5, memory=6, driver=7, fault=8, restart=9,
+   telemetry=10, boot_config=11).
+2. Release each lock before acquiring the next — no simultaneous multi-domain
+   lock holding unless a dedicated multi-lock helper exists (e.g.,
+   `with_task_then_capability`).
+3. Include a `// Lock-order domain: <name> (rank N)` comment before the lock
+   acquisition, matching the `debug_lock_order_note` domain string.
+4. If the function accesses multiple fields protected by the same lock (e.g.,
+   `tcbs` + `task_classes` both under `task_state_lock`), note this explicitly
+   in the SAFETY comment: `// task_state_lock protects both tcbs and task_classes`.
+
+**Example** (correct):
+```rust
+pub(crate) unsafe fn task_class_from_raw(state: *const KernelState, tid: u64) -> Option<TaskClass> {
+    // Lock-order domain: task (rank 2)
+    // task_state_lock protects both tcbs and task_classes.
+    let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+    let _guard = lock_ref.lock();
+    ...
+}
+```
+
+**Violation example** (do NOT do):
+```rust
+// WRONG: acquires task (rank 2) AFTER ipc (rank 3) — rank inversion.
+let _ipc = self.ipc_state_lock.lock();
+let task_class = self.task_class(tid);  // acquires task_state_lock (rank 2 < 3)
+```
+
+---
