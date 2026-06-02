@@ -145,6 +145,12 @@ log_count_pattern() {
   tr '\r' '\n' <"$LOGFILE" | rg -a -c "\b${pattern}\b" 2>/dev/null || echo 0
 }
 
+log_count_user_msg_marker() {
+  local marker="$1"
+  [[ -f "$LOGFILE" ]] || { echo 0; return; }
+  tr '\r' '\n' <"$LOGFILE" | rg -a -c "(^|[[:space:]])msg=${marker}([[:space:]]|$)" 2>/dev/null || echo 0
+}
+
 # ---------------------------------------------------------------------------
 # Hard blocker check — exit nonzero immediately if the log shows a crash or
 # missing critical ELF that means the boot never reached userspace.
@@ -457,7 +463,7 @@ if [[ -f "$LOGFILE" ]]; then
   )
   ramfs_seen=0
   for marker in "${RAMFS_MARKERS[@]}"; do
-    count=$(log_count_pattern "$marker")
+    count=$(log_count_user_msg_marker "$marker")
     if [[ "$count" -gt 0 ]]; then
       ramfs_seen=1
     fi
@@ -478,16 +484,16 @@ if [[ -f "$LOGFILE" ]]; then
       VFS_MOUNT_REGISTER_RAMFS_OK
     )
     for marker in "${RAMFS_REQUIRED_MARKERS[@]}"; do
-      if [[ "$(log_count_pattern "$marker")" -eq 0 ]]; then
+      if [[ "$(log_count_user_msg_marker "$marker")" -eq 0 ]]; then
         echo "[error] RAMFS smoke expected marker missing: ${marker}"
         exit 1
       fi
     done
-    if [[ "$(log_count_pattern RAMFS_CONFIG_FOUND)" -eq 0 && "$(log_count_pattern RAMFS_CONFIG_DEFAULT)" -eq 0 ]]; then
+    if [[ "$(log_count_user_msg_marker RAMFS_CONFIG_FOUND)" -eq 0 && "$(log_count_user_msg_marker RAMFS_CONFIG_DEFAULT)" -eq 0 ]]; then
       echo "[error] RAMFS smoke expected config marker missing"
       exit 1
     fi
-    if ! tr '\r' '\n' <"$LOGFILE" | rg -a -q 'VFS_MOUNT_REGISTER_RAMFS_OK prefix='; then
+    if ! tr '\r' '\n' <"$LOGFILE" | rg -a -q '(^|[[:space:]])msg=VFS_MOUNT_REGISTER_RAMFS_OK prefix='; then
       echo "[error] RAMFS smoke expected VFS mount registration prefix missing"
       exit 1
     fi

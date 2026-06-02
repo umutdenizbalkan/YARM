@@ -10,6 +10,8 @@ use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcess
 #[cfg(test)]
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use alloc::vec::Vec;
+use yarm_fs_servers::fat::service::FatMountConfig;
+use yarm_fs_servers::ramfs::{RAMFS_DEFAULT_MAX_BYTES, service::RamFsMountConfig};
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, LIFECYCLE_STATE_SPAWNED,
     LifecycleQueryReply, LifecycleQueryRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT,
@@ -53,12 +55,50 @@ const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 const BOOTSTRAP_IMAGE_ID_MIN: u64 = 1;
 const BOOTSTRAP_SERVICE_IMAGE_ID_MAX: u64 = 6;
 const VFS_SERVICE_IMAGE_ID_MIN: u64 = 7;
-const VFS_SERVICE_IMAGE_ID_MAX: u64 = 9;
+const VFS_SERVICE_IMAGE_ID_MAX: u64 = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpawnLoadSource {
     DirectInitrd,
     Vfs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnV5StartupLayout {
+    pub startup_args: [u64; 18],
+}
+
+#[inline]
+pub fn build_spawn_v5_startup_layout(image_id: u64, service_caps: [u64; 4]) -> SpawnV5StartupLayout {
+    let mut startup_args = [0u64; 18];
+    match image_id {
+        // FAT keeps the block backend in service_extra_cap_0 and carries its
+        // userspace-only mount config as raw child startup words.
+        10 => {
+            let mount_config = FatMountConfig::new(b"/fat", 1, true)
+                .unwrap_or_else(FatMountConfig::default_compat);
+            let (prefix_word, meta_word) = mount_config.encode_startup_words();
+            startup_args[13] = service_caps[0];
+            startup_args[14] = prefix_word;
+            startup_args[15] = meta_word;
+        }
+        // RAMFS has no inbound service cap dependencies. Its prefix/config must
+        // be raw startup words, not SpawnV5 cap fields.
+        11 => {
+            let mount_config = RamFsMountConfig::new(b"/ram", false, RAMFS_DEFAULT_MAX_BYTES as u32)
+                .unwrap_or_else(RamFsMountConfig::default_compat);
+            let (prefix_word, meta_word) = mount_config.encode_startup_words();
+            startup_args[14] = prefix_word;
+            startup_args[15] = meta_word;
+        }
+        _ => {
+            startup_args[13] = service_caps[0];
+            startup_args[14] = service_caps[1];
+            startup_args[15] = service_caps[2];
+            startup_args[16] = service_caps[3];
+        }
+    }
+    SpawnV5StartupLayout { startup_args }
 }
 
 fn resolve_spawn_load_source(image_id: u64) -> Result<SpawnLoadSource, ProcessManagerError> {
@@ -1189,11 +1229,10 @@ impl ProcessService {
                             (t, c as u64, s)
                         }
                         SpawnLoadSource::Vfs => {
-                            let mut startup_args = [0u64; 18];
-                            startup_args[13] = req.service_caps[0];
-                            startup_args[14] = req.service_caps[1];
-                            startup_args[15] = req.service_caps[2];
-                            startup_args[16] = req.service_caps[3];
+                            let startup_args = build_spawn_v5_startup_layout(
+                                req.image_id,
+                                req.service_caps,
+                            ).startup_args;
                             let vfs_send_cap = self
                                 .lifecycle_table
                                 .get_by_image_id(6)
@@ -3067,7 +3106,8 @@ mod tests {
         assert_eq!(resolve_spawn_load_source(7).ok(), Some(SpawnLoadSource::Vfs));
         assert_eq!(resolve_spawn_load_source(8).ok(), Some(SpawnLoadSource::Vfs));
         assert_eq!(resolve_spawn_load_source(9).ok(), Some(SpawnLoadSource::Vfs));
-        assert_eq!(resolve_spawn_load_source(10), Err(ProcessManagerError::Unsupported));
+        assert_eq!(resolve_spawn_load_source(10).ok(), Some(SpawnLoadSource::Vfs));
+        assert_eq!(resolve_spawn_load_source(11).ok(), Some(SpawnLoadSource::Vfs));
     }
 
     #[test]

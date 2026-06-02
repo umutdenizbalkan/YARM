@@ -11,6 +11,19 @@ use yarm_ipc_abi::blkcache_abi::{
     RegisterBackendArgs, BLKCACHE_OP_REGISTER_BACKEND,
 };
 use yarm_ipc_abi::block_abi::{BlkGetInfoReply, BlkGetInfoRequest, BlkStatus, BLK_OP_GET_INFO};
+
+pub const RAMFS_IMAGE_ID: u64 = 11;
+pub const FAT_IMAGE_ID: u64 = 10;
+
+#[inline]
+pub const fn ramfs_spawn_v5_service_caps() -> [u64; 4] {
+    [0, 0, 0, 0]
+}
+
+#[inline]
+pub const fn fat_spawn_v5_service_caps(block_send_cap: u64) -> [u64; 4] {
+    [block_send_cap, 0, 0, 0]
+}
 #[cfg(test)]
 use super::super::process_manager::service::ProcessService;
 #[cfg(test)]
@@ -553,13 +566,12 @@ pub fn run() {
             yarm_fs_servers::ramfs::RAMFS_DEFAULT_MAX_BYTES as u32,
         )
         .unwrap_or_else(RamFsMountConfig::default_compat);
-        let (ramfs_prefix_word, ramfs_meta_word) = ramfs_mount_config.encode_startup_words();
         yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_BEGIN");
         if let Some((ramfs_child_tid, init_ramfs_send_cap)) = spawn_v5_cap(
             pm_send,
             pm_recv,
-            11,
-            [0, ramfs_prefix_word, ramfs_meta_word, 0],
+            RAMFS_IMAGE_ID,
+            ramfs_spawn_v5_service_caps(),
             1,
         ) {
             yarm_user_rt::user_log!(
@@ -772,13 +784,12 @@ pub fn run() {
     {
         let fat_mount_config = FatMountConfig::new(b"/fat", 1, true)
             .unwrap_or_else(FatMountConfig::default_compat);
-        let (fat_prefix_word, fat_meta_word) = fat_mount_config.encode_startup_words();
         yarm_user_rt::user_log!("INIT_FAT_SPAWN_BEGIN");
         let Some((fat_child_tid, init_fat_send_cap)) = spawn_v5_cap(
             pm_send,
             pm_recv,
-            10,
-            [init_blkcache_send_cap, fat_prefix_word, fat_meta_word, 0],
+            FAT_IMAGE_ID,
+            fat_spawn_v5_service_caps(init_blkcache_send_cap),
             1,
         ) else {
             yarm_user_rt::user_log!("INIT_FAT_SPAWN_RETURN ok=0 child_tid=0");

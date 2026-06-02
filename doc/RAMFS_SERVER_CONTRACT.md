@@ -44,10 +44,12 @@ tracks the written length, while hosted/core tests exercise exact byte writes vi
 
 ## Init/PM/VFS wiring
 
-Init can spawn `ramfs_srv` as image id 11, pass the RAMFS startup config in
-startup slots 14/15, and register the selected prefix with VFS using the existing
-`VFS_OP_MOUNT_REGISTER` request. Process manager resolves image id 11 to
-`/initramfs/sbin/ramfs_srv` and logs `PM_IMAGE_ID_11_RAMFS_SRV path=...`.
+Init can request `ramfs_srv` as image id 11 without placing RAMFS config bytes
+in SpawnV5 cap fields. Process manager resolves image id 11 to
+`/initramfs/sbin/ramfs_srv`, logs `PM_IMAGE_ID_11_RAMFS_SRV path=...`, and
+forwards the userspace-only RAMFS startup config as child raw startup slots
+14/15 before init registers the selected prefix with VFS using the existing
+`VFS_OP_MOUNT_REGISTER` request.
 
 Smoke-visible markers for the RAMFS path are:
 
