@@ -117,7 +117,10 @@ impl KernelState {
 
         let (_id, mem_cap) = self.alloc_anonymous_memory_object()?;
         let flags = crate::kernel::vm::PageFlags::USER_RW;
-        self.map_user_page_in_current_asid_with_caps(mem_cap, page, flags)?;
+        // Stage 8: asid resolved plan-first above (line 98); identical to
+        // map_user_page_in_current_asid_with_caps under the global lock since
+        // current_tid cannot change between the plan-first resolution and here.
+        self.map_user_page_in_asid_with_caps(asid, mem_cap, page, flags)?;
 
         #[cfg(feature = "hosted-dev")]
         self.with_memory_state_mut(|memory| {

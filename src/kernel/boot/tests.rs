@@ -10270,6 +10270,175 @@ fn map_shared_region_stage7_rollback_two_phase_on_partial_failure() {
         .expect("join");
 }
 
+// ── Stage 8: demand-page explicit-ASID conversion ────────────────────────────
+//
+// These tests verify the Stage 8 conversion of try_handle_demand_page_fault:
+//   map_user_page_in_current_asid_with_caps → map_user_page_in_asid_with_caps
+// using the task-ASID resolved plan-first at line 98 of fault_state.rs.
+//
+// Hard invariant: demand paging observable behavior is preserved exactly.
+
+#[test]
+fn demand_page_stage8_explicit_asid_maps_into_faulting_task_address_space() {
+    // The demand page must appear in the exact ASID owned by the faulting task
+    // (plan-first asid variable), not implicitly re-read from current_tid inside
+    // map_user_page_in_current_asid_with_caps.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind");
+    state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
+
+    let fault = FaultInfo { addr: VirtAddr(0x5001), access: FaultAccess::Read };
+    state
+        .handle_trap_event(TrapEvent::PageFault(fault), None)
+        .expect("demand page fault handled");
+
+    let mapping = state
+        .user_spaces
+        .get(asid)
+        .expect("aspace for faulting task")
+        .resolve(VirtAddr(0x5000))
+        .expect("page must be in the faulting task ASID");
+    assert!(mapping.flags.user && mapping.flags.read && mapping.flags.write);
+    assert_eq!(state.task_status(0), Some(TaskStatus::Running));
+}
+
+#[test]
+fn demand_page_stage8_task_without_asid_falls_through_to_task_fault() {
+    // A task with no address space bound must not trigger demand paging.
+    // try_handle_demand_page_fault returns Ok(false) when task_asid(tid) = None,
+    // and the page fault falls through to fault_current_task → Faulted.
+    let mut state = Bootstrap::init().expect("init");
+    // task 0 has no ASID bound after Bootstrap::init()
+    state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
+
+    let fault = FaultInfo { addr: VirtAddr(0x5000), access: FaultAccess::Write };
+    state
+        .handle_trap_event(TrapEvent::PageFault(fault), None)
+        .expect("page fault handled");
+    assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
+}
+
+#[test]
+fn demand_page_stage8_execute_fault_not_demand_mapped() {
+    // Execute faults must never trigger demand paging: try_handle_demand_page_fault
+    // returns Ok(false) immediately for FaultAccess::Execute.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind");
+    state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
+
+    let fault = FaultInfo { addr: VirtAddr(0x5000), access: FaultAccess::Execute };
+    state
+        .handle_trap_event(TrapEvent::PageFault(fault), None)
+        .expect("page fault handled");
+    assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
+    assert!(
+        state
+            .user_spaces
+            .get(asid)
+            .expect("aspace")
+            .resolve(VirtAddr(0x5000))
+            .is_none(),
+        "execute fault must not demand-map the page"
+    );
+}
+
+#[test]
+fn demand_page_stage8_already_mapped_page_skips_remap() {
+    // If the faulting page is already mapped, try_handle_demand_page_fault returns
+    // Ok(true) without allocating a new memory object or remapping the page.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind");
+    state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
+
+    let (_, pre_cap) = state.alloc_anonymous_memory_object().expect("pre alloc");
+    state
+        .map_user_page_in_asid_with_caps(asid, pre_cap, VirtAddr(0x5000), PageFlags::USER_RW)
+        .expect("pre-map");
+    let pre_phys = state
+        .user_spaces
+        .get(asid)
+        .expect("aspace")
+        .resolve(VirtAddr(0x5000))
+        .expect("pre-mapped")
+        .phys;
+
+    let fault = FaultInfo { addr: VirtAddr(0x5000), access: FaultAccess::Write };
+    state
+        .handle_trap_event(TrapEvent::PageFault(fault), None)
+        .expect("demand page handled");
+
+    let post_phys = state
+        .user_spaces
+        .get(asid)
+        .expect("aspace")
+        .resolve(VirtAddr(0x5000))
+        .expect("still mapped")
+        .phys;
+    assert_eq!(pre_phys, post_phys, "physical address must not change for already-mapped page");
+    assert_eq!(state.task_status(0), Some(TaskStatus::Running));
+}
+
+#[test]
+fn demand_page_stage8_mapped_page_has_user_rw_flags() {
+    // The demand-mapped page must carry exactly PageFlags::USER_RW
+    // (read=true, write=true, execute=false, user=true).
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind");
+    state.set_task_brk_bounds(0, 0x1000, 0x9000).expect("brk");
+
+    let fault = FaultInfo { addr: VirtAddr(0x3001), access: FaultAccess::Write };
+    state
+        .handle_trap_event(TrapEvent::PageFault(fault), None)
+        .expect("demand page");
+
+    let mapping = state
+        .user_spaces
+        .get(asid)
+        .expect("aspace")
+        .resolve(VirtAddr(0x3000))
+        .expect("mapped");
+    assert!(mapping.flags.user, "demand page must be user-accessible");
+    assert!(mapping.flags.read, "demand page must be readable");
+    assert!(mapping.flags.write, "demand page must be writable");
+    assert!(!mapping.flags.execute, "demand page must not be executable");
+    assert_eq!(state.task_status(0), Some(TaskStatus::Running));
+}
+
+#[test]
+fn demand_page_stage8_stack_region_demand_maps() {
+    // A fault within the user_stack_top growth window is demand-mapped using the
+    // plan-first ASID exactly as a brk-region fault is.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind");
+    // Set stack top to 0x100_0000; fault at 0xFF_F000 is within the 8 MiB window.
+    state.with_tcbs_mut(|tcbs| {
+        if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 0) {
+            tcb.user_stack_top = Some(VirtAddr(0x100_0000));
+        }
+    });
+
+    let fault = FaultInfo { addr: VirtAddr(0xFF_F001), access: FaultAccess::Write };
+    state
+        .handle_trap_event(TrapEvent::PageFault(fault), None)
+        .expect("stack demand page");
+
+    assert!(
+        state
+            .user_spaces
+            .get(asid)
+            .expect("aspace")
+            .resolve(VirtAddr(0xFF_F000))
+            .is_some(),
+        "stack growth page must be demand-mapped"
+    );
+    assert_eq!(state.task_status(0), Some(TaskStatus::Running));
+}
+
 // ── Phase L2A: canonical boot SharedKernel construction tests ─────────────────
 //
 // These tests verify Bootstrap::init_shared_static_with_boot_memory_map

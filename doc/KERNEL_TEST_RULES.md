@@ -1189,3 +1189,70 @@ existing test may be changed to accommodate the deletion — any break would
 indicate the inlined condition differs from the deleted helper.
 
 ---
+
+## Rule N+15 — Stage 8 tests: demand-paging explicit-ASID conversion
+
+Stage 8 converts `try_handle_demand_page_fault` from `map_user_page_in_current_asid_with_caps`
+to `map_user_page_in_asid_with_caps(asid, ...)` using the plan-first ASID
+already in scope at line 98 of `fault_state.rs`. The following rules govern
+Stage 8 tests.
+
+### N+15.1 — Demand page maps into the faulting task's ASID
+
+A test must set up a task with a known ASID, trigger a page fault in the brk
+region, and verify that the mapped page appears in that exact ASID (not in any
+other address space). This confirms the plan-first `asid` variable drives the
+mapping, not an implicit re-read inside `map_user_page_in_current_asid_with_caps`.
+
+### N+15.2 — Task without ASID falls through to task fault
+
+A test must trigger a page fault for a task with no address space bound
+(i.e., `task_asid(tid) = None`) and verify the task ends up `Faulted`. This
+confirms the `Ok(false)` early-return path in `try_handle_demand_page_fault`
+and the subsequent `fault_current_task` dispatch are both preserved.
+
+### N+15.3 — Execute fault is not demand-mapped
+
+A test must trigger an execute page fault in the brk region and verify that
+(a) the page is NOT mapped and (b) the task is `Faulted`. The
+`FaultAccess::Execute` early-return at the top of `try_handle_demand_page_fault`
+must be preserved through the explicit-ASID conversion.
+
+### N+15.4 — Already-mapped page returns without remap
+
+A test must pre-map a page, then trigger a demand fault for the same address,
+and verify that the physical address does not change. This confirms the
+`already_mapped` guard (lines 108-116 of `fault_state.rs`) is preserved.
+
+### N+15.5 — Demand-mapped page carries USER_RW flags
+
+A test must verify that the page allocated by demand paging has exactly
+`PageFlags::USER_RW` (read=true, write=true, execute=false, user=true).
+Demand paging always allocates with `USER_RW`; this invariant must not change.
+
+### N+15.6 — Stack growth window demand-maps using plan-first ASID
+
+A test must set `tcb.user_stack_top` for a task, trigger a fault in the 8 MiB
+stack growth window below `stack_top`, and verify the page is demand-mapped into
+the task's ASID. This confirms `fault_addr_in_demand_backed_region` and the
+plan-first ASID path cooperate correctly for the stack case.
+
+### N+15.7 — Full suite must pass at 635+ tests
+
+Every Stage 8 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 635 tests (629 from Stage 7 + 6 new Stage 8 tests). All prior tests serve
+as the behavior-unchanged regression harness.
+
+### N+15.8 — No demand-paging observable behavior change
+
+Stage 8 tests must NOT assert any behavior that differs from the old
+`map_user_page_in_current_asid_with_caps` path. The conversion is
+semantics-preserving under the global lock; tests validate equivalence, not a
+new behavior.
+
+### N+15.9 — `map_user_page_in_current_asid_with_caps` test-only status
+
+After Stage 8 the `map_user_page_in_current_asid_with_caps` helper must have
+zero production callers. Its continued presence is justified only by test-module
+use in `syscall.rs` and `boot/tests.rs` (equivalence comparisons). A future
+stage may delete it once those tests are updated.
