@@ -1011,3 +1011,51 @@ test (map → access → unmap lifecycle). If VmAnonMap behavior changes unexpec
 the test must catch it. The Stage 5C/5D VmAnonMap tests serve this purpose.
 
 ---
+
+## Rule N+12 — Stage 6 VmAnonMap live conversion gate conditions
+
+### N+12.1 — Forward map loop must resolve ASID plan-first
+
+Stage 6 tests must include a test verifying that `handle_vm_anon_map` can be
+called with the plan-first ASID pattern: a single `task_asid(tid)` call before
+the loop, followed by `map_user_page_in_asid_with_caps` per iteration. The
+test must confirm that the result is identical to the old current-ASID path.
+
+### N+12.2 — rollback_anon_map must use two-phase per-page unmap
+
+After Stage 6 conversion, `rollback_anon_map` must call `unmap_page_phase1`
+followed by `execute_tlb_shootdown_wait_plan` per page, with ASID resolved
+once before the loop. A test must verify that a rollback triggered by a
+mid-loop alloc failure removes all pages mapped before the failure without
+error.
+
+### N+12.3 — Rollback must tolerate absent pages
+
+Tests must verify that `rollback_anon_map` (with two-phase path) returns
+without error when called on a range that includes pages never mapped. The
+`unmap_page_phase1` `Ok(None)` path must be exercised in at least one
+rollback test.
+
+### N+12.4 — Pre-existing capability-not-revoked behavior must be documented, not fixed
+
+Stage 6 tests must NOT assert that capability slots are freed during rollback.
+The pre-existing behavior (cap_refcount remains 1 after rollback; frame not
+freed until task exit) must be documented in a code comment added during
+Stage 6. A test that relies on the cap slot being freed would be asserting
+a correctness fix that is out of scope.
+
+### N+12.5 — Stage 5C/5D/5E/5F regression tests must all pass
+
+Every Stage 6 commit must pass the full test suite, which includes all
+VmAnonMap scaffold tests from Stage 5C, TLB plan tests from Stage 5D/5E,
+and VmBrk two-phase tests from Stage 5F. These serve as the VmAnonMap
+behavior-unchanged regression harness.
+
+### N+12.6 — x86_64 -smp 1 smoke required after Stage 6 conversion
+
+A Stage 6 VmAnonMap live conversion is not accepted until a new x86_64 -smp 1
+smoke run passes with all acceptance criteria from §22.1. The VmBrk smoke
+(Stage 5G) validates the two-phase pattern in isolation; VmAnonMap rollback
+must be validated in its own smoke run.
+
+---
