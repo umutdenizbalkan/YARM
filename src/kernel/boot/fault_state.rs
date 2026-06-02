@@ -266,6 +266,24 @@ impl KernelState {
             }
             Trap::TimerInterrupt => {
                 self.hal.acknowledge_interrupt(self.current_cpu(), 0);
+                // x86_64: During bootstrap, borrow_kernel_for_boot() holds a raw
+                // &mut KernelState without the SpinLock. The timer ISR acquires the
+                // SpinLock via with_cpu(), creating aliased mutable references — UB.
+                // Guard: skip tick/yield until signal_bootstrap_scheduler_ready() is
+                // called (after all user tasks are spawned and enqueued). EOI + re-arm
+                // keeps the timer alive without corrupting mid-bootstrap kernel state.
+                #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+                if !crate::arch::x86_64::descriptor_tables::bootstrap_scheduler_is_ready() {
+                    crate::yarm_log!(
+                        "X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY cpu={}",
+                        self.current_cpu().0
+                    );
+                    self.hal.program_timer_deadline(
+                        self.current_cpu(),
+                        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+                    );
+                    return Ok(());
+                }
                 let (_tick, should_preempt) = self.tick_scheduler_timer();
                 let _ = self
                     .process_ipc_timeout_deadlines(_tick.0)

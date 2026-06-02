@@ -270,6 +270,22 @@ static TRAP_SHARED_KERNEL_PTR: core::sync::atomic::AtomicPtr<crate::runtime::Sha
 static STAGE2N_FIRST_TRAP_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static STAGE2N_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Set to true after bootstrap_first_user_task completes and all user tasks are
+/// enqueued. The timer ISR checks this flag: if false, it does EOI-only and
+/// re-arms without ticking/yielding, to avoid racing with borrow_kernel_for_boot.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static BOOTSTRAP_SCHEDULER_READY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn signal_bootstrap_scheduler_ready() {
+    BOOTSTRAP_SCHEDULER_READY.store(true, Ordering::Release);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn bootstrap_scheduler_is_ready() -> bool {
+    BOOTSTRAP_SCHEDULER_READY.load(Ordering::Acquire)
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_DATA_PORT: u16 = 0x3F8;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -1962,4 +1978,34 @@ mod tests {
     // of the corruption: user RSP is now saved to YARM_X86_SYSCALL_SCRATCH_RSP
     // before ANY GPR is touched, so R12/R13/R14 remain authentic at push time.
     // -----------------------------------------------------------------------
+
+    // Phase BT1 — bootstrap timer guard invariant tests.
+    //
+    // The LAPIC timer may fire during bootstrap_first_user_task (ELF loading
+    // takes >800 ms; timer deadline is 800 ms). The timer ISR must NOT tick or
+    // yield until signal_bootstrap_scheduler_ready() has been called, otherwise
+    // it races with borrow_kernel_for_boot's raw &mut KernelState alias (UB).
+
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    #[test]
+    fn bootstrap_scheduler_ready_starts_false_and_sets_to_true() {
+        // Resetting is not possible (static), but signal → assert is idempotent:
+        // regardless of prior test state, after signal the flag must be true.
+        signal_bootstrap_scheduler_ready();
+        assert!(
+            bootstrap_scheduler_is_ready(),
+            "bootstrap_scheduler_is_ready() must return true after signal"
+        );
+    }
+
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    #[test]
+    fn bootstrap_scheduler_ready_is_idempotent() {
+        signal_bootstrap_scheduler_ready();
+        signal_bootstrap_scheduler_ready();
+        assert!(
+            bootstrap_scheduler_is_ready(),
+            "repeated signal_bootstrap_scheduler_ready() calls must leave flag true"
+        );
+    }
 }
