@@ -4232,3 +4232,178 @@ Migration path: when the global lock is removed, the plan-build step moves befor
 | `src/kernel/syscall.rs` | Updated `handle_control_plane_set_cnode_slots` and `handle_vm_brk` to plan-first |
 | `doc/KERNEL_LOCKING.md` | This section (Section 17) |
 | `doc/KERNEL_TEST_RULES.md` | Stage 5B rules added |
+
+## 18. Stage 5C — VmAnonMap audit, explicit-ASID helpers, and deferred conversion decision
+
+Stage 5C performs a comprehensive lock-domain audit of `handle_vm_anon_map`, strengthens the `VmAnonMapPlan` scaffold introduced in Stage 5B, adds explicit-ASID memory helpers as building blocks for future plan-first decomposition, and documents the precise reasons why live conversion remains deferred.
+
+### 18.1 Full VmAnonMap lock-domain audit
+
+`handle_vm_anon_map` touches six lock domains in a single operation:
+
+| Order | Domain | Rank | Operations | Notes |
+|-------|--------|------|------------|-------|
+| 1 | scheduler | 1 | `current_tid()` to identify caller | Single read; result is TID for all subsequent lookups |
+| 2 | task | 2 | `task_asid_for_tid(tid)` to get ASID | Read only; used to select address space for every page |
+| 3 | capability | 4 | `resolve_memory_object_phys(mem_cap, flags)` per page | One cap lookup per page in the requested range |
+| 4 | vm | 5 | `map_user_page_in_asid_raw` / `unmap_page` per page | Adds/removes page table entries in the target ASID |
+| 5 | memory | 6 | `alloc_anonymous_memory_object()` per page | Allocates backing PhysAddr for each new mapping |
+| 6 | ipc (TLB) | 3 | `request_live_asid_shootdown` → `begin_live_tlb_shootdown_wait` | Rank 3 busy-wait spin in the rollback path only |
+
+Stack guard check path:
+```
+Validation (lock-free):   validate_anon_map_args(addr, len, prot) → VmAnonMapValidatedArgs
+Guard check:              is_user_page_mapped_in_current_asid(addr - PAGE_SIZE) → vm lock (5)
+Per-page alloc:           alloc_anonymous_memory_object()                       → memory lock (6)
+Per-page cap resolve:     resolve_memory_object_phys(cap, flags)                → capability lock (4)
+Per-page map:             map_user_page_in_asid_raw(asid, virt, mapping)        → vm lock (5)
+Rollback (on error):      unmap_user_page_in_asid(asid, va)                     → vm lock (5)
+                          request_live_asid_shootdown(asid)                     → scheduler (1) + ipc (3)
+                          begin_live_tlb_shootdown_wait(...)                    → ipc lock (3) spin
+```
+
+### 18.2 Three blockers preventing live conversion
+
+**Blocker 1 — TLB shootdown busy-wait in rollback path (ipc rank 3)**
+
+`request_live_asid_shootdown` → `begin_live_tlb_shootdown_wait` acquires the ipc lock (rank 3) and spins until remote CPUs acknowledge the shootdown. This is a cross-CPU busy-wait. Any ordering change relative to the surrounding scheduler (rank 1) or task (rank 2) reads risks a TLB coherency window if the ASID is reused before the shootdown completes. Rank 3 (ipc) is lower than ranks 4/5/6 consumed by the forward path, making the rollback lock sequence inconsistent with the plan-first forward ordering.
+
+**Blocker 2 — Per-iteration loop state not captured in plan struct**
+
+The forward mapping loop accumulates state in a local variable `va` (the next virtual address to map). Decomposing without the global lock would require either (a) capturing the entire mapping intent up front (list of `(va, mem_cap)` pairs) into the plan, or (b) making partial mappings visible to other CPUs and recoverable across lock boundaries. Neither is designed yet. The current `VmAnonMapPlan` captures only the validated args and ASID — not the per-page iterator state.
+
+**Blocker 3 — x86_64 smoke requirement**
+
+The kernel hard-invariant "any live VM/TLB behavior change requires x86_64 smoke request" is not satisfied. Reorganizing the lock-acquisition order of `handle_vm_anon_map` changes when TLB shootdowns fire relative to the global lock boundary, which is a live VM/TLB behavioral change requiring x86_64 smoke-level testing before it may be merged.
+
+### 18.3 Strengthened `VmAnonMapPlan` (Stage 5C)
+
+Stage 5B left `VmAnonMapPlan` as `{ tid: u64 }` — a minimal placeholder. Stage 5C replaces it with a full plan that would support live decomposition once the three blockers are resolved:
+
+```rust
+// src/kernel/boot/mod.rs
+
+/// Stage 5C: Task-domain snapshot for VM_ANON_MAP plan-first decomposition.
+///
+/// Lock sequence (when live conversion is enabled):
+///   Phase 1 — Validation (no locks):    validate_anon_map_args() → VmAnonMapValidatedArgs
+///   Phase 2 — Scheduler snapshot (1):   current_tid()            → plan.tid
+///   Phase 3 — Task snapshot (2):        task_asid_for_tid(tid)   → plan.asid
+///   Phase 4 — Guard check (5):          is_user_page_mapped_in_asid(plan.asid, addr-PAGE_SIZE)
+///   Phase 5 — Per-page alloc+map (4+5+6): alloc_anon + resolve_cap + map_user_page_in_asid
+///   Phase 6 — Rollback on error (3+5):  unmap_user_page_in_asid + request_live_asid_shootdown
+///                                        + begin_live_tlb_shootdown_wait  ← BLOCKER 1
+///
+/// Live conversion DEFERRED. Three blockers (see §18.2):
+///   1. TLB shootdown busy-wait (ipc rank 3) in rollback — rank ordering inconsistent.
+///   2. Per-page loop iterator state (variable `va`) not captured in plan.
+///   3. x86_64 smoke approval required before any live VM/TLB reordering.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct VmAnonMapPlan {
+    pub(crate) validated: VmAnonMapValidatedArgs,
+    pub(crate) tid: u64,
+    pub(crate) asid: Asid,
+}
+
+/// Stage 5C: Result of `validate_anon_map_args` — pure computation, no locks.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct VmAnonMapValidatedArgs {
+    pub(crate) addr: usize,
+    pub(crate) map_len: usize,
+    pub(crate) end: usize,       // addr + map_len, no-overflow guaranteed
+    pub(crate) flags: PageFlags,
+}
+```
+
+### 18.4 Explicit-ASID memory helpers (Stage 5C)
+
+Three helpers in `src/kernel/boot/memory_state.rs` form the building blocks for future per-page work that targets a specific ASID without re-reading scheduler or task state on every iteration:
+
+| Function | Lock acquired | Returns | Purpose |
+|----------|--------------|---------|---------|
+| `map_user_page_in_asid_with_caps(asid, mem_cap, virt, flags)` | vm (5) + cap (4) | `Result<Option<Mapping>, KernelError>` | Map one page into a named ASID using a cap-based phys resolution |
+| `unmap_user_page_in_asid(asid, virt)` | vm (5) | `Result<Option<Mapping>, KernelError>` | Remove one page from a named ASID; returns `None` if not mapped (rollback-safe) |
+| `is_user_page_mapped_in_asid(asid, virt)` | vm (5) | `Result<bool, KernelError>` | Check whether a specific page is present in a named ASID |
+
+`unmap_user_page_in_asid` was already present unconditionally (no change). `map_user_page_in_asid_with_caps` had an unnecessary `#[cfg(feature = "posix-compat")]` gate removed so it is unconditionally available. `is_user_page_mapped_in_asid` is new in Stage 5C.
+
+All three carry `#[cfg_attr(not(test), allow(dead_code))]` because the plan-first `handle_vm_anon_map` path that calls them has not yet been wired up (deferred).
+
+**Why explicit-ASID helpers eliminate per-iteration lock re-entry**
+
+The current `handle_vm_anon_map` calls `map_user_page_in_current_asid_with_caps` inside the loop, which internally reads `current_tid()` (scheduler rank 1) then `task_asid_for_tid(tid)` (task rank 2) on every iteration to locate the target address space. In the plan-first path the ASID is already in `plan.asid`; the explicit-ASID helpers bypass the scheduler and task reads and go directly to the vm (rank 5) lock.
+
+### 18.5 Lock sequence comparison: current vs. planned
+
+**Current `handle_vm_anon_map` (still active):**
+```
+with_cpu() → global lock acquired
+  current_tid()                                    → scheduler (1)
+  task_asid_for_tid(tid)                           → task (2)
+  is_user_page_mapped_in_current_asid(addr-PAGE)  → vm (5)  [guard check]
+  loop:
+    alloc_anonymous_memory_object()                → memory (6)
+    map_user_page_in_current_asid_with_caps(...)   → scheduler (1) + task (2) + cap (4) + vm (5)
+    on error: unmap_user_page_in_asid(asid, va)    → vm (5)
+              request_live_asid_shootdown(asid)     → scheduler (1)
+              begin_live_tlb_shootdown_wait(...)    → ipc (3) spin
+global lock released
+```
+
+**Planned `handle_vm_anon_map` (deferred, requires blocker resolution):**
+```
+Phase 1 (lock-free):      validate_anon_map_args(addr, len, prot) → VmAnonMapValidatedArgs
+Phase 2 (split-read, 1):  current_tid_split_read()               → plan.tid
+Phase 3 (split-read, 2):  task_asid_for_tid_split_read(tid)      → plan.asid
+with_cpu() → global lock acquired
+  Phase 4 (vm, 5):        is_user_page_mapped_in_asid(plan.asid, addr-PAGE)  [guard]
+  loop:
+    Phase 5a (memory, 6): alloc_anonymous_memory_object()
+    Phase 5b (cap, 4):    resolve_memory_object_phys(cap, flags)
+    Phase 5c (vm, 5):     map_user_page_in_asid_with_caps(plan.asid, …)
+    on error:
+    Phase 6a (vm, 5):     unmap_user_page_in_asid(plan.asid, va)
+    Phase 6b (ipc, 3):    request_live_asid_shootdown + begin_live_tlb_shootdown_wait ← BLOCKER 1
+global lock released
+```
+
+Note: even the planned path retains the `with_cpu()` global lock for the mutation phases. The benefit is eliminating the redundant per-iteration scheduler+task reads inside the loop. Full global-lock removal is not claimed.
+
+### 18.6 Hard invariants for Stage 5C
+
+- VmAnonMap is **helper-only scaffolding** — `handle_vm_anon_map` is unchanged.
+- No live VM/TLB behavior change. The three new helpers are `#[cfg_attr(not(test), allow(dead_code))]`.
+- Rollback behavior of `handle_vm_anon_map` is unmodified.
+- Stack guard check path is unmodified.
+- x86_64 BT2 preserved.
+- No SMP/smp.rs, trap return/writeback, or ABI changes.
+- No CapRights widening, SpawnV5, VFS, syscall27, or Phase 3B changes.
+- Global lock (`SharedKernel::with_cpu()`) still wraps the full `handle_vm_anon_map` body.
+
+### 18.7 Tests added (Stage 5C)
+
+Five new tests in `src/kernel/boot/tests.rs`, after the existing `vm_anon_map_preserves_stack_guard_page_behavior`:
+
+| Test | What it proves |
+|------|----------------|
+| `vm_anon_map_explicit_asid_map_helper_matches_current_asid_path` | `map_user_page_in_asid_with_caps` and `is_user_page_mapped_in_asid` produce the same observable result as the established current-ASID path |
+| `vm_anon_map_explicit_asid_unmap_helper_removes_mapping` | `unmap_user_page_in_asid` removes a page that was mapped via the current-ASID path; both current-ASID and explicit-ASID checks confirm absence |
+| `vm_anon_map_unmap_idempotent_on_already_unmapped_page` | `unmap_user_page_in_asid` on a never-mapped page returns `Ok(None)` — rollback is safe to call without a prior successful map |
+| `vm_anon_map_execute_only_prot_skips_stack_guard_check` | prot=PROT_EXEC (0x4): stack guard condition `write && !execute` is false, so the syscall succeeds even when the guard page is already mapped |
+| `vm_anon_map_write_execute_prot_also_skips_stack_guard` | prot=PROT_WRITE\|PROT_EXEC (0x6): execute=true disarms the guard even when write=true |
+
+Helper added to support the above tests:
+```rust
+fn setup_task0_with_known_asid() -> (KernelState, Asid)
+```
+Returns the `KernelState` and the `Asid` bound to task 0, whereas the existing `setup_task0_with_asid()` discards the ASID after binding.
+
+### 18.8 Files changed (Stage 5C)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/mod.rs` | Replaced `VmAnonMapPlan { tid }` with full `VmAnonMapPlan { validated, tid, asid }`; added `VmAnonMapValidatedArgs`; added `#[cfg_attr(not(test), allow(dead_code))]` to both |
+| `src/kernel/boot/memory_state.rs` | Removed `posix-compat` feature gate from `map_user_page_in_asid_with_caps`; added `is_user_page_mapped_in_asid`; both carry `#[cfg_attr(not(test), allow(dead_code))]` |
+| `src/kernel/boot/tests.rs` | Added `setup_task0_with_known_asid()` helper and 5 new Stage 5C tests |
+| `doc/KERNEL_LOCKING.md` | This section (Section 18) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+8 added |

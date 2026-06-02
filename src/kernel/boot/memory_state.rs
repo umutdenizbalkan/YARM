@@ -724,7 +724,15 @@ impl KernelState {
         })
     }
 
-    #[cfg(feature = "posix-compat")]
+    /// Stage 5C explicit-ASID helper: map a page using a pre-resolved ASID.
+    ///
+    /// Equivalent to `map_user_page_in_current_asid_with_caps` but takes
+    /// an explicit `asid` from the caller's `VmAnonMapPlan` instead of
+    /// re-reading the scheduler (rank 1) and task (rank 2) state.
+    ///
+    /// Lock-domain flow: capability (rank 4) → vm (rank 5).
+    /// No scheduler or task lock acquisition.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn map_user_page_in_asid_with_caps(
         &mut self,
         asid: Asid,
@@ -734,6 +742,31 @@ impl KernelState {
     ) -> Result<Option<Mapping>, KernelError> {
         let phys = self.resolve_memory_object_phys(mem_cap, flags)?;
         self.map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags })
+    }
+
+    /// Stage 5C explicit-ASID helper: check whether a page is mapped using a
+    /// pre-resolved ASID.
+    ///
+    /// Equivalent to `is_user_page_mapped_in_current_asid` but takes an
+    /// explicit `asid` instead of re-reading scheduler (rank 1) and task
+    /// (rank 2) state.
+    ///
+    /// Lock-domain flow: vm (rank 5) read only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_user_page_mapped_in_asid(
+        &self,
+        asid: Asid,
+        virt: VirtAddr,
+    ) -> Result<bool, KernelError> {
+        if !virt.0.is_multiple_of(crate::kernel::vm::PAGE_SIZE as u64) {
+            return Err(KernelError::WrongObject);
+        }
+        self.with_user_spaces(|spaces| {
+            spaces
+                .get(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))
+                .map(|aspace| aspace.resolve(virt).is_some())
+        })
     }
 
     pub fn unmap_user_page(

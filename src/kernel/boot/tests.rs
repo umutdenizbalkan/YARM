@@ -8664,6 +8664,220 @@ fn vm_anon_map_preserves_stack_guard_page_behavior() {
         .expect("join");
 }
 
+// ── Stage 5C VmAnonMap explicit-ASID helper tests ─────────────────────────────
+//
+// These tests exercise the Stage 5C explicit-ASID scaffolding helpers:
+//   map_user_page_in_asid_with_caps     (replaces per-iteration scheduler+task reads)
+//   unmap_user_page_in_asid             (already existed; tested as rollback building block)
+//   is_user_page_mapped_in_asid         (explicit-ASID variant of the stack guard check)
+//
+// Each test uses an 8 MiB stack (KernelState is large).
+
+/// Helper: create a state with task 0 bound to a known ASID and return both.
+fn setup_task0_with_known_asid() -> (KernelState, crate::kernel::vm::Asid) {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind asid");
+    (state, asid)
+}
+
+#[test]
+fn vm_anon_map_explicit_asid_map_helper_matches_current_asid_path() {
+    // Stage 5C: verify map_user_page_in_asid_with_caps produces the same
+    // observable result as map_user_page_in_current_asid_with_caps.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            // Allocate a memory object and map it via the explicit-ASID helper.
+            let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            let virt = VirtAddr(0xA_0000);
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
+                .expect("explicit-ASID map must succeed");
+
+            // The page must be visible via both current-ASID and explicit-ASID check.
+            let mapped_current = state
+                .is_user_page_mapped_in_current_asid(virt)
+                .expect("current-ASID check");
+            let mapped_explicit = state
+                .is_user_page_mapped_in_asid(asid, virt)
+                .expect("explicit-ASID check");
+
+            assert!(mapped_current, "page must be mapped via current-ASID check");
+            assert!(
+                mapped_explicit,
+                "page must be mapped via explicit-ASID check"
+            );
+            assert_eq!(
+                mapped_current, mapped_explicit,
+                "explicit-ASID check must match current-ASID check"
+            );
+
+            // An adjacent unmapped page must return false from both checks.
+            let unmapped_virt = VirtAddr(0xB_0000);
+            let current_unmapped = state
+                .is_user_page_mapped_in_current_asid(unmapped_virt)
+                .expect("current-ASID unmapped check");
+            let explicit_unmapped = state
+                .is_user_page_mapped_in_asid(asid, unmapped_virt)
+                .expect("explicit-ASID unmapped check");
+            assert!(!current_unmapped, "unmapped page must not appear mapped via current-ASID");
+            assert!(!explicit_unmapped, "unmapped page must not appear mapped via explicit-ASID");
+            assert_eq!(current_unmapped, explicit_unmapped);
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_explicit_asid_unmap_helper_removes_mapping() {
+    // Stage 5C: verify unmap_user_page_in_asid removes a previously mapped page.
+    // This exercises the rollback building block used by the planned VmAnonMap path.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+
+            // Map a page using the current-ASID path (established behavior).
+            let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+            let virt = VirtAddr(0xC_0000);
+            state
+                .map_user_page_in_current_asid_with_caps(mem_cap, virt, PageFlags::USER_RW)
+                .expect("map page");
+
+            // Confirm it is mapped.
+            assert!(
+                state
+                    .is_user_page_mapped_in_asid(asid, virt)
+                    .expect("pre-unmap check"),
+                "page must be mapped before unmap"
+            );
+
+            // Unmap via explicit-ASID helper (simulates the rollback path).
+            let unmapped = state
+                .unmap_user_page_in_asid(asid, virt)
+                .expect("unmap_user_page_in_asid must not error");
+            assert!(unmapped.is_some(), "must report an unmapped mapping");
+
+            // Confirm it is gone.
+            assert!(
+                !state
+                    .is_user_page_mapped_in_asid(asid, virt)
+                    .expect("post-unmap check"),
+                "page must not be mapped after unmap"
+            );
+            assert!(
+                !state
+                    .is_user_page_mapped_in_current_asid(virt)
+                    .expect("current-ASID post-unmap check"),
+                "page must not be visible via current-ASID after explicit-ASID unmap"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_unmap_idempotent_on_already_unmapped_page() {
+    // Stage 5C: unmap_user_page_in_asid on an already-unmapped page returns
+    // None (no mapping found) without error — rollback must be safe to call
+    // even if a page was never mapped.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+            let virt = VirtAddr(0xD_0000);
+
+            // Unmap a page that was never mapped — must succeed with None.
+            let result = state.unmap_user_page_in_asid(asid, virt);
+            assert!(
+                result.is_ok(),
+                "unmap of unmapped page must not return Err"
+            );
+            assert_eq!(
+                result.unwrap(),
+                None,
+                "unmap of unmapped page must return None"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_execute_only_prot_skips_stack_guard_check() {
+    // Stage 5C: the stack guard check is conditioned on `write && !execute`.
+    // An execute-only mapping (prot=PROT_EXEC=0x4) must succeed even if the
+    // page immediately below is already mapped, because execute-only is not
+    // a downward-growing stack page.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, _asid) = setup_task0_with_known_asid();
+
+            // Pre-map a read-only guard page at 0xE000.
+            let (_, guard_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
+            state
+                .map_user_page_in_current_asid_with_caps(
+                    guard_cap,
+                    VirtAddr(0xE000),
+                    PageFlags::USER_RW,
+                )
+                .expect("guard map");
+
+            // VmAnonMap at 0xF000 with PROT_EXEC (0x4) only — guard check must
+            // be skipped (flags.write=false), so the map must succeed.
+            let mut frame = vm_anon_map_frame(0xF000, PAGE_SIZE, 0x4);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "execute-only prot must skip the stack guard check and succeed"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_anon_map_write_execute_prot_also_skips_stack_guard() {
+    // Stage 5C: the guard check fires only when `write && !execute`.
+    // A write+execute mapping (PROT_WRITE|PROT_EXEC = 0x6) must also skip
+    // the guard (execute=true disarms the guard even when write=true).
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, _asid) = setup_task0_with_known_asid();
+
+            // Pre-map a page at 0x1_E000 to act as potential guard for 0x1_F000.
+            let (_, guard_cap) = state.alloc_anonymous_memory_object().expect("guard mo");
+            state
+                .map_user_page_in_current_asid_with_caps(
+                    guard_cap,
+                    VirtAddr(0x1_E000),
+                    PageFlags::USER_RW,
+                )
+                .expect("guard map");
+
+            // PROT_WRITE|PROT_EXEC at 0x1_F000 — guard check condition is false
+            // because flags.execute=true, so map must succeed.
+            let mut frame = vm_anon_map_frame(0x1_F000, PAGE_SIZE, 0x6);
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "write+execute prot must skip stack guard check"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
 // ── Phase L2A: canonical boot SharedKernel construction tests ─────────────────
 //
 // These tests verify Bootstrap::init_shared_static_with_boot_memory_map
