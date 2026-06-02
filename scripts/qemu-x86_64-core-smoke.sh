@@ -447,6 +447,8 @@ if [[ -f "$LOGFILE" ]]; then
     INIT_RAMFS_SPAWN_BEGIN
     INIT_RAMFS_SPAWN_OK
     PM_IMAGE_ID_11_RAMFS_SRV
+    RAMFS_BIN_ENTRY_START
+    RAMFS_BIN_BEFORE_RUN
     RAMFS_CONFIG_FOUND
     RAMFS_CONFIG_DEFAULT
     RAMFS_MOUNT_READY
@@ -470,6 +472,8 @@ if [[ -f "$LOGFILE" ]]; then
       INIT_RAMFS_SPAWN_BEGIN
       INIT_RAMFS_SPAWN_OK
       PM_IMAGE_ID_11_RAMFS_SRV
+      RAMFS_BIN_ENTRY_START
+      RAMFS_BIN_BEFORE_RUN
       RAMFS_MOUNT_READY
       VFS_MOUNT_REGISTER_RAMFS_OK
     )
@@ -481,6 +485,10 @@ if [[ -f "$LOGFILE" ]]; then
     done
     if [[ "$(log_count_pattern RAMFS_CONFIG_FOUND)" -eq 0 && "$(log_count_pattern RAMFS_CONFIG_DEFAULT)" -eq 0 ]]; then
       echo "[error] RAMFS smoke expected config marker missing"
+      exit 1
+    fi
+    if ! tr '\r' '\n' <"$LOGFILE" | rg -a -q 'VFS_MOUNT_REGISTER_RAMFS_OK prefix='; then
+      echo "[error] RAMFS smoke expected VFS mount registration prefix missing"
       exit 1
     fi
   fi

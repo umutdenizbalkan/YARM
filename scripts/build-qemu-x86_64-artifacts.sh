@@ -17,6 +17,7 @@ SERVER_BIN=${SERVER_BIN:-init_server}
 PM_BIN=${PM_BIN:-process_manager}
 SUPERVISOR_BIN=${SUPERVISOR_BIN:-supervisor}
 INITRAMFS_SERVER_BIN=${INITRAMFS_SERVER_BIN:-initramfs_srv}
+RAMFS_SERVER_BIN=${RAMFS_SERVER_BIN:-ramfs_srv}
 DEVFS_SERVER_BIN=${DEVFS_SERVER_BIN:-devfs_srv}
 VFS_SERVER_BIN=${VFS_SERVER_BIN:-vfs_server}
 BLKCACHE_SERVER_BIN=${BLKCACHE_SERVER_BIN:-blkcache_srv}
@@ -34,6 +35,7 @@ SERVER_ELF=${SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE
 PM_ELF=${PM_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${PM_BIN}}
 SUPERVISOR_ELF=${SUPERVISOR_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${SUPERVISOR_BIN}}
 INITRAMFS_SERVER_ELF=${INITRAMFS_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${INITRAMFS_SERVER_BIN}}
+RAMFS_SERVER_ELF=${RAMFS_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${RAMFS_SERVER_BIN}}
 DEVFS_SERVER_ELF=${DEVFS_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${DEVFS_SERVER_BIN}}
 VFS_SERVER_ELF=${VFS_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${VFS_SERVER_BIN}}
 BLKCACHE_SERVER_ELF=${BLKCACHE_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${BLKCACHE_SERVER_BIN}}
@@ -114,6 +116,16 @@ cargo build \
   "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
 INITRAMFS_SERVER_BUILD_STATUS=$?
 
+echo "[info] building ${INITRAMFS_SERVER_PACKAGE}/${RAMFS_SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
+cargo build \
+  --target "$SERVER_RUST_TARGET" \
+  --profile "$SERVER_BUILD_PROFILE" \
+  ${BOOTSTRAP_FEATURE_ARGS} \
+  -p "$INITRAMFS_SERVER_PACKAGE" \
+  --bin "$RAMFS_SERVER_BIN" \
+  "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
+RAMFS_SERVER_BUILD_STATUS=$?
+
 echo "[info] building ${INITRAMFS_SERVER_PACKAGE}/${DEVFS_SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
 cargo build \
   --target "$SERVER_RUST_TARGET" \
@@ -155,6 +167,7 @@ if [[ "$KERNEL_BUILD_STATUS" -ne 0 || \
       "$PM_BUILD_STATUS" -ne 0 || \
       "$SUPERVISOR_BUILD_STATUS" -ne 0 || \
       "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 || \
+      "$RAMFS_SERVER_BUILD_STATUS" -ne 0 || \
       "$DEVFS_SERVER_BUILD_STATUS" -ne 0 || \
       "$VFS_SERVER_BUILD_STATUS" -ne 0 || \
       "$DRIVER_MANAGER_BUILD_STATUS" -ne 0 || \
@@ -167,6 +180,7 @@ common_stage_server_init_elf || true
 common_stage_aux_server_elf || true
 common_stage_supervisor_elf || true
 common_stage_initramfs_server_elf || true
+common_stage_ramfs_server_elf || true
 common_stage_devfs_server_elf || true
 common_stage_vfs_server_elf || true
 common_stage_blkcache_server_elf || true

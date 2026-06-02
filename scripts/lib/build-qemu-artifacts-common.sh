@@ -223,6 +223,30 @@ common_stage_initramfs_server_elf() {
   echo "[ok] staged initramfs server ELF as /sbin/initramfs_srv"
 }
 
+common_stage_ramfs_server_elf() {
+  if [[ ! -f "$RAMFS_SERVER_ELF" ]]; then
+    echo "[warn] ramfs server ELF missing: $RAMFS_SERVER_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$RAMFS_SERVER_ELF" "$ROOTFS_DIR/sbin/ramfs_srv"
+  chmod +x "$ROOTFS_DIR/sbin/ramfs_srv"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$RAMFS_SERVER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] ramfs server ELF has forbidden RWE PT_LOAD segment: $RAMFS_SERVER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $RAMFS_SERVER_ELF"
+  fi
+
+  echo "[ok] staged ramfs server ELF as /sbin/ramfs_srv"
+}
+
 common_stage_devfs_server_elf() {
   if [[ ! -f "$DEVFS_SERVER_ELF" ]]; then
     echo "[warn] devfs server ELF missing: $DEVFS_SERVER_ELF"
@@ -346,7 +370,7 @@ common_stage_virtio_blk_server_elf() {
 
 common_verify_initramfs_stage_paths() {
   local missing=0
-  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor"; do
+  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/ramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor"; do
     if [[ ! -f "$ROOTFS_DIR/$path" ]]; then
       echo "[error] expected initramfs path missing: $ROOTFS_DIR/$path"
       missing=1

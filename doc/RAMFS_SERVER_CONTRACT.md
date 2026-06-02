@@ -65,10 +65,35 @@ Smoke-visible markers for the RAMFS path are:
 
 The QEMU core smoke scripts count RAMFS markers only when
 `RAMFS_SMOKE_EXPECTED=1` is set, so default profiles without RAMFS are not forced
-to fail. When RAMFS is expected, the smoke scripts require the spawn markers,
-`PM_IMAGE_ID_11_RAMFS_SRV`, `RAMFS_MOUNT_READY`, `VFS_MOUNT_REGISTER_RAMFS_OK`,
-and at least one RAMFS config marker (`RAMFS_CONFIG_FOUND` or
-`RAMFS_CONFIG_DEFAULT`).
+to fail. Dedicated RAMFS smoke entry points set this variable and reuse the core
+smoke health checks:
+
+```sh
+scripts/qemu-aarch64-ramfs-smoke.sh
+scripts/qemu-x86_64-ramfs-smoke.sh
+```
+
+Both wrappers preserve the default core smoke behavior when
+`RAMFS_SMOKE_EXPECTED` is not set directly on the core smoke scripts. The RAMFS
+profile expects this marker block in the QEMU log, with every listed count at
+least one unless the config line uses the documented alternative:
+
+```text
+INIT_RAMFS_SPAWN_BEGIN >=1
+INIT_RAMFS_SPAWN_OK >=1
+PM_IMAGE_ID_11_RAMFS_SRV path=/initramfs/sbin/ramfs_srv >=1
+RAMFS_BIN_ENTRY_START >=1
+RAMFS_BIN_BEFORE_RUN >=1
+RAMFS_CONFIG_FOUND prefix=... >=1
+  or RAMFS_CONFIG_DEFAULT prefix=/ram reason=missing-config >=1
+RAMFS_MOUNT_READY prefix=... >=1
+VFS_MOUNT_REGISTER_RAMFS_OK prefix=... >=1
+```
+
+When RAMFS is expected, the smoke scripts require the spawn markers,
+`PM_IMAGE_ID_11_RAMFS_SRV`, `RAMFS_BIN_ENTRY_START`, `RAMFS_BIN_BEFORE_RUN`,
+`RAMFS_MOUNT_READY`, `VFS_MOUNT_REGISTER_RAMFS_OK prefix=...`, and at least one
+RAMFS config marker (`RAMFS_CONFIG_FOUND` or `RAMFS_CONFIG_DEFAULT`).
 
 ## Limits and errors
 
