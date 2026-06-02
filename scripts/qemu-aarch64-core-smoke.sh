@@ -324,6 +324,37 @@ if [[ -f "$LOGFILE" ]]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# Optional RAMFS userspace mount/config smoke markers.
+# Do not fail default core smoke profiles; set RAMFS_SMOKE_EXPECTED=1 when the
+# profile is expected to spawn and mount RAMFS.
+# ---------------------------------------------------------------------------
+if [[ -f "$LOGFILE" ]]; then
+  RAMFS_SMOKE_EXPECTED=${RAMFS_SMOKE_EXPECTED:-0}
+  RAMFS_MARKERS=(
+    INIT_RAMFS_SPAWN_BEGIN
+    INIT_RAMFS_SPAWN_OK
+    PM_IMAGE_ID_RAMFS_SRV
+    RAMFS_CONFIG_FOUND
+    RAMFS_CONFIG_DEFAULT
+    RAMFS_MOUNT_READY
+    RAMFS_MOUNT_FAILED
+    VFS_MOUNT_REGISTER_RAMFS_OK
+  )
+  ramfs_seen=0
+  for marker in "${RAMFS_MARKERS[@]}"; do
+    count=$(log_count_pattern "$marker")
+    if [[ "$count" -gt 0 ]]; then
+      ramfs_seen=1
+    fi
+    echo "[info] RAMFS smoke marker count: ${marker}=${count}"
+  done
+  if [[ "$RAMFS_SMOKE_EXPECTED" == "1" && "$ramfs_seen" -eq 0 ]]; then
+    echo "[error] RAMFS smoke expected but no RAMFS markers were observed"
+    exit 1
+  fi
+fi
+
 echo "[warn] boot shell and init-server markers not detected (status=$QEMU_STATUS)"
 if [[ -f "$LOGFILE" ]]; then
   echo "[info] last 20 log lines from $LOGFILE"

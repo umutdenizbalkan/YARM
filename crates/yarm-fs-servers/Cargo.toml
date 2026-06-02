@@ -26,7 +26,6 @@ path = "src/bin/devfs_srv.rs"
 [[bin]]
 name = "ramfs_srv"
 path = "src/bin/ramfs_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "initramfs_srv"
