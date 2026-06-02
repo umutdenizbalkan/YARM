@@ -111,6 +111,43 @@ pub struct IpcBlockDevice {
     pub reply_recv_cap: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FatBlockDevice {
+    Mem(MemBlockDevice),
+    Ipc(IpcBlockDevice),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatBackendKind {
+    MemoryImage,
+    IpcBlock,
+}
+
+impl FatBlockDevice {
+    pub const fn kind(&self) -> FatBackendKind {
+        match self {
+            Self::Mem(_) => FatBackendKind::MemoryImage,
+            Self::Ipc(_) => FatBackendKind::IpcBlock,
+        }
+    }
+}
+
+impl BlockDevice for FatBlockDevice {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Mem(device) => device.len(),
+            Self::Ipc(device) => device.len(),
+        }
+    }
+
+    fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> Result<(), FatError> {
+        match self {
+            Self::Mem(device) => device.read_exact_at(offset, out),
+            Self::Ipc(device) => device.read_exact_at(offset, out),
+        }
+    }
+}
+
 impl BlockDevice for IpcBlockDevice {
     fn len(&self) -> u64 {
         u64::MAX
@@ -577,7 +614,7 @@ impl FatLayout {
 
 #[derive(Debug, Clone)]
 pub struct FatBackend {
-    fs: FatFs<MemBlockDevice>,
+    fs: FatFs<FatBlockDevice>,
     entries: Vec<DirEntryInfo>,
     open_fds: [Option<OpenFd>; MAX_OPEN_FDS],
     next_fd: u64,
@@ -595,7 +632,23 @@ impl FatBackend {
     }
     pub fn from_image(bytes: Vec<u8>) -> Result<Self, FatError> {
         Ok(Self {
-            fs: FatFs::mount(MemBlockDevice::new(bytes))?,
+            fs: FatFs::mount(FatBlockDevice::Mem(MemBlockDevice::new(bytes)))?,
+            entries: Vec::new(),
+            open_fds: [None; MAX_OPEN_FDS],
+            next_fd: 300,
+        })
+    }
+    pub fn from_ipc_block(
+        device_id: u64,
+        send_cap: u32,
+        reply_recv_cap: u32,
+    ) -> Result<Self, FatError> {
+        Ok(Self {
+            fs: FatFs::mount(FatBlockDevice::Ipc(IpcBlockDevice {
+                device_id,
+                send_cap,
+                reply_recv_cap,
+            }))?,
             entries: Vec::new(),
             open_fds: [None; MAX_OPEN_FDS],
             next_fd: 300,
@@ -603,6 +656,9 @@ impl FatBackend {
     }
     pub const fn layout(&self) -> FatLayout {
         self.fs.layout()
+    }
+    pub const fn backend_kind(&self) -> FatBackendKind {
+        self.fs.device.kind()
     }
     pub fn lookup_entry(&self, path: &[u8]) -> Result<DirEntryInfo, FatError> {
         self.fs.lookup(path)

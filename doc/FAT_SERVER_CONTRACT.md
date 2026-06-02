@@ -37,20 +37,43 @@ Unsupported mutating operations such as write, mkdir, and unlink are rejected wi
   supported. Deleted entries are ignored, `0x00` terminates a directory, and volume
   labels are not exposed as files.
 
-## Block backend assumptions
+## Production backend selection
 
 The FAT core is backend-agnostic through a small `BlockDevice` trait. Hosted tests
-use an in-memory block image. Freestanding/server code has an `IpcBlockDevice`
-implementation for the existing inline block ABI, but production mounting still
-requires startup wiring that provides the block service send capability, reply
-receive capability, and device id to the FAT server.
+use an in-memory block image. In production, `run_fat()` reads the userspace startup
+context and expects:
+
+- `service_extra_cap_0` to contain the filesystem-facing blkcache/block service send
+  capability.
+- `process_manager_reply_recv_cap` to contain the reply receive endpoint used for
+  synchronous block IPC replies.
+- device id `1` (`FAT_DEFAULT_BLOCK_DEVICE_ID`) until a userspace mount/config ABI
+  exists for per-mount device selection.
+
+When both caps are present, the service logs `FAT_BLOCK_BACKEND_STARTUP_CAP cap=...`,
+constructs an IPC block backend, mounts FAT from device id 1, and logs
+`FAT_MOUNT_READY` after the read-only mount smoke succeeds. If IPC probing or BPB
+parsing fails, the service logs `FAT_MOUNT_FAILED reason=...`.
+
+When either cap is missing in the production/no-default-features path, the service
+logs `FAT_NO_BLOCK_BACKEND` and `FAT_MOUNT_FAILED reason=no-block-backend`. It does
+not silently mount the sample image and does not fake filesystem availability.
+
+Hosted-dev and unit tests may explicitly select the sample image path. That path logs
+`FAT_BLOCK_BACKEND_SAMPLE_IMAGE reason=no-startup-block-cap-hosted-dev` and remains
+for synthetic image tests and local development only.
 
 ## Known limitations
 
 - The VFS reply ABI currently returns only the historical scalar `statx` value, so
   file type metadata is exposed by the FAT core but not serialized in a richer stat
   structure.
-- The shipped `run_fat()` bootstrap mounts a built-in sample image until process
-  manager/VFS mount plumbing provides a real block device capability.
+- Current production startup has a fixed device id 1 expectation; a future
+  userspace-only mount/config payload should carry the device id and mount prefix
+  once that control-plane path exists.
+- The existing blkcache/block stack still exposes truthful stub behavior in some
+  driver paths; FAT mount fails clearly when the backend cannot return real sector
+  data.
 - FAT writes, allocation, truncation, mkdir, rename, and unlink are intentionally
-  unsupported.
+  unsupported and return `VfsError::Unsupported` where the current VFS/backend
+  surface exposes them.
