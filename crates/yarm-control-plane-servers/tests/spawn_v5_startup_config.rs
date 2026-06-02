@@ -120,3 +120,76 @@ fn ramfs_expected_smoke_markers_match_runtime_strings() {
         "missing runtime RAMFS config marker"
     );
 }
+
+#[test]
+fn artifact_scripts_align_vfs_spawned_ramfs_and_fat_services() {
+    let common = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    assert!(common.contains("--align sbin/ramfs_srv"));
+    assert!(common.contains("--align sbin/fat_srv"));
+    assert!(common.contains("ALIGN_PROOF"));
+    assert!(common.contains("sbin/ramfs_srv"));
+    assert!(common.contains("sbin/fat_srv"));
+}
+
+#[test]
+fn artifact_scripts_build_and_stage_ramfs_and_fat_services() {
+    let x86 = include_str!("../../../scripts/build-qemu-x86_64-artifacts.sh");
+    let aarch64 = include_str!("../../../scripts/build-qemu-aarch64-artifacts.sh");
+    let common = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+
+    for script in [x86, aarch64] {
+        assert!(script.contains("RAMFS_SERVER_BIN"));
+        assert!(script.contains("FAT_SERVER_BIN"));
+        assert!(script.contains("--bin \"$RAMFS_SERVER_BIN\""));
+        assert!(script.contains("--bin \"$FAT_SERVER_BIN\""));
+        assert!(script.contains("common_stage_ramfs_server_elf"));
+        assert!(script.contains("common_stage_fat_server_elf"));
+    }
+    assert!(common.contains("common_stage_ramfs_server_elf()"));
+    assert!(common.contains("common_stage_fat_server_elf()"));
+}
+
+#[test]
+fn aligned_packer_emits_align_proof_for_ramfs_srv() {
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let packer = repo.join("scripts/pack-initramfs-aligned.py");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let tmp = std::env::temp_dir().join(format!("yarm-align-proof-{nonce}"));
+    let root = tmp.join("rootfs");
+    let sbin = root.join("sbin");
+    fs::create_dir_all(&sbin).expect("create sbin");
+    fs::write(sbin.join("ramfs_srv"), b"ramfs-test-elf-bytes").expect("write ramfs");
+    let out = tmp.join("initramfs.cpio");
+
+    let output = Command::new("python3")
+        .arg(&packer)
+        .arg(&root)
+        .arg(&out)
+        .arg("--align")
+        .arg("sbin/ramfs_srv")
+        .output()
+        .expect("run aligned packer");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = fs::remove_dir_all(&tmp);
+
+    assert!(output.status.success(), "packer failed: {stderr}");
+    assert!(
+        stderr.contains("ALIGN_PROOF path=sbin/ramfs_srv") && stderr.contains("aligned=true"),
+        "missing ramfs ALIGN_PROOF in: {stderr}"
+    );
+}
+
+#[test]
+fn pm_logs_memory_object_alignment_precondition_for_vfs_spawn_ids() {
+    let pm_src = include_str!("../src/control_plane/process_manager/service.rs");
+    assert!(pm_src.contains("PM_VFS_MO_ALIGN_REQUIRED image_id={}"));
+    assert!(pm_src.contains("PM_SPAWN_FROM_MO_BEGIN image_id={}"));
+    assert!(pm_src.contains("reason=spawn_from_mo_err mo_cap={}"));
+}

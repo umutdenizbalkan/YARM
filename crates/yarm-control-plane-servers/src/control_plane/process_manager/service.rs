@@ -1787,6 +1787,12 @@ unsafe fn pm_try_grant_ro_and_spawn(
         "PM_VFS_GRANT_RO_RECEIVED image_id={} len={} cap={}",
         image_id, file_len, mo_cap
     );
+    if (7..=11).contains(&image_id) {
+        yarm_user_rt::user_log!(
+            "PM_VFS_MO_ALIGN_REQUIRED image_id={} path={} file_len={} source=aligned-initramfs",
+            image_id, path_str, file_len
+        );
+    }
 
     // Close fd — we have the cap now.
     if let Ok(close_msg) = build_close_message(fd) {
@@ -1794,6 +1800,10 @@ unsafe fn pm_try_grant_ro_and_spawn(
     }
 
     // ── 3. Spawn from MemoryObject cap (kernel syscall nr=29) ────────────────
+    yarm_user_rt::user_log!(
+        "PM_SPAWN_FROM_MO_BEGIN image_id={} mo_cap={} file_len={} parent_pid={}",
+        image_id, mo_cap, file_len, parent_pid
+    );
     // SAFETY: mo_cap is a valid MemoryObject cap minted by the kernel.
     let result = unsafe {
         yarm_user_rt::syscall::spawn_from_memory_object(
@@ -1816,15 +1826,15 @@ unsafe fn pm_try_grant_ro_and_spawn(
         Err(yarm_user_rt::syscall::SyscallError::WrongObject)
         | Err(yarm_user_rt::syscall::SyscallError::InvalidArgs) => {
             yarm_user_rt::user_log!(
-                "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_unsupported",
-                image_id
+                "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_unsupported mo_cap={} file_len={}",
+                image_id, mo_cap, file_len
             );
             Err(ProcessManagerError::Unsupported)
         }
         Err(e) => {
             yarm_user_rt::user_log!(
-                "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_err err={:?}",
-                image_id, e
+                "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_err mo_cap={} file_len={} err={:?}",
+                image_id, mo_cap, file_len, e
             );
             Err(ProcessManagerError::Malformed)
         }

@@ -247,6 +247,30 @@ common_stage_ramfs_server_elf() {
   echo "[ok] staged ramfs server ELF as /sbin/ramfs_srv"
 }
 
+common_stage_fat_server_elf() {
+  if [[ ! -f "$FAT_SERVER_ELF" ]]; then
+    echo "[warn] fat server ELF missing: $FAT_SERVER_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$FAT_SERVER_ELF" "$ROOTFS_DIR/sbin/fat_srv"
+  chmod +x "$ROOTFS_DIR/sbin/fat_srv"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$FAT_SERVER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] fat server ELF has forbidden RWE PT_LOAD segment: $FAT_SERVER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $FAT_SERVER_ELF"
+  fi
+
+  echo "[ok] staged fat server ELF as /sbin/fat_srv"
+}
+
 common_stage_devfs_server_elf() {
   if [[ ! -f "$DEVFS_SERVER_ELF" ]]; then
     echo "[warn] devfs server ELF missing: $DEVFS_SERVER_ELF"
@@ -370,7 +394,7 @@ common_stage_virtio_blk_server_elf() {
 
 common_verify_initramfs_stage_paths() {
   local missing=0
-  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/ramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor"; do
+  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/ramfs_srv" "sbin/fat_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor"; do
     if [[ ! -f "$ROOTFS_DIR/$path" ]]; then
       echo "[error] expected initramfs path missing: $ROOTFS_DIR/$path"
       missing=1
@@ -408,7 +432,8 @@ common_create_initramfs_newc() {
 # common_create_initramfs_aligned — CPIO newc packer with 4096-byte alignment.
 #
 # Uses scripts/pack-initramfs-aligned.py to create the initramfs archive.
-# The late-service ELFs (driver_manager, blkcache_srv, virtio_blk_srv) have
+# The VFS-spawned service ELFs (driver_manager, blkcache_srv, virtio_blk_srv,
+# fat_srv, ramfs_srv) have
 # their file data aligned to 4096-byte boundaries so that Phase 3B zero-copy
 # ELF loading can map RX pages directly from the initrd physical region
 # without a kernel-mediated copy.
@@ -441,7 +466,9 @@ common_create_initramfs_aligned() {
   pack_log="$(python3 "$packer" "$ROOTFS_DIR" "$INITRAMFS_IMAGE_ABS" \
     --align sbin/driver_manager \
     --align sbin/blkcache_srv \
-    --align sbin/virtio_blk_srv 2>&1)" || {
+    --align sbin/virtio_blk_srv \
+    --align sbin/fat_srv \
+    --align sbin/ramfs_srv 2>&1)" || {
     echo "[error] pack-initramfs-aligned.py failed"
     printf '%s\n' "$pack_log" | sed 's/^/  /'
     common_exit_if_strict_mode

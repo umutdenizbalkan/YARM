@@ -49,7 +49,12 @@ in SpawnV5 cap fields. Process manager resolves image id 11 to
 `/initramfs/sbin/ramfs_srv`, logs `PM_IMAGE_ID_11_RAMFS_SRV path=...`, and
 forwards the userspace-only RAMFS startup config as child raw startup slots
 14/15 before init registers the selected prefix with VFS using the existing
-`VFS_OP_MOUNT_REGISTER` request.
+`VFS_OP_MOUNT_REGISTER` request. Because image id 11 is VFS/MemoryObject
+spawned, QEMU artifact builds must stage `/sbin/ramfs_srv` and pack
+`sbin/ramfs_srv` on a 4096-byte CPIO data boundary; the aligned packer emits
+`ALIGN_PROOF path=sbin/ramfs_srv ... aligned=true` when this precondition is
+met. FAT image id 10 follows the same VFS/MemoryObject artifact policy for
+`sbin/fat_srv`.
 
 Smoke-visible markers for the RAMFS path are:
 
