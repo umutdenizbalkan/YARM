@@ -1141,6 +1141,14 @@ pub mod runtime {
     }
 
     #[inline]
+    pub fn startup_arg_slot(index: usize) -> Option<u64> {
+        if index >= STARTUP_SLOT_COUNT {
+            return None;
+        }
+        Some(STARTUP_ARG_SLOTS[index].load(Ordering::Relaxed))
+    }
+
+    #[inline]
     pub fn startup_context() -> StartupContext {
         // Reads runtime-provided startup ABI slots. Zero/missing values map to
         // `None` for optional endpoint caps.

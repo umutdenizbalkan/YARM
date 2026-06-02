@@ -85,6 +85,10 @@ Rules:
   - duplicate normalized prefixes are rejected,
   - zero send-cap and invalid/oversized prefixes are rejected,
   - successful insertion participates in longest-prefix routing.
+- FAT is registered dynamically by `init_server` when `fat_srv` is spawned with a
+  blkcache/block send cap. The FAT prefix comes from the userspace FAT mount
+  config (`/fat` by default in current init wiring), and successful registration
+  is logged as `VFS_MOUNT_REGISTER_FAT_OK`.
 
 ---
 

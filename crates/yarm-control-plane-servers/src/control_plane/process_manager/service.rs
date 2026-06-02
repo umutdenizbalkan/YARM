@@ -1412,6 +1412,7 @@ unsafe fn pm_vfs_spawn_inline(
         7 => b"/initramfs/sbin/driver_manager",
         8 => b"/initramfs/sbin/blkcache_srv",
         9 => b"/initramfs/sbin/virtio_blk_srv",
+        10 => b"/initramfs/sbin/fat_srv",
         _ => {
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_IMAGE_UNKNOWN image_id={}",
@@ -1802,6 +1803,7 @@ fn pm_image_cpio_name(image_id: u64) -> Option<&'static [u8]> {
         7 => Some(b"sbin/driver_manager"),
         8 => Some(b"sbin/blkcache_srv"),
         9 => Some(b"sbin/virtio_blk_srv"),
+        10 => Some(b"sbin/fat_srv"),
         _ => None,
     }
 }

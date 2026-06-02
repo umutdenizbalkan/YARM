@@ -12,17 +12,115 @@ use yarm_srv_common::vfs_reply::VfsReply;
 pub type FatService = FsService<FatBackend>;
 
 pub const FAT_DEFAULT_BLOCK_DEVICE_ID: u64 = 1;
+pub const FAT_DEFAULT_MOUNT_PREFIX: &[u8] = b"/fat";
+pub const FAT_MOUNT_CONFIG_FLAG_READONLY: u16 = 1 << 0;
+pub const FAT_MOUNT_CONFIG_BLOCK_CAP_SOURCE_SERVICE_EXTRA_0: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatBlockCapSource {
+    ServiceExtraCap0,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FatMountConfig {
+    pub prefix: [u8; 8],
+    pub prefix_len: u8,
+    pub device_id: u32,
+    pub readonly: bool,
+    pub block_cap_source: FatBlockCapSource,
+}
+
+impl FatMountConfig {
+    pub const fn default_compat() -> Self {
+        Self {
+            prefix: [b'/', b'f', b'a', b't', 0, 0, 0, 0],
+            prefix_len: 4,
+            device_id: FAT_DEFAULT_BLOCK_DEVICE_ID as u32,
+            readonly: true,
+            block_cap_source: FatBlockCapSource::ServiceExtraCap0,
+        }
+    }
+
+    pub fn new(prefix: &[u8], device_id: u32, readonly: bool) -> Option<Self> {
+        if prefix.is_empty() || prefix.len() > 8 || prefix[0] != b'/' {
+            return None;
+        }
+        let mut out = [0u8; 8];
+        out[..prefix.len()].copy_from_slice(prefix);
+        Some(Self {
+            prefix: out,
+            prefix_len: prefix.len() as u8,
+            device_id,
+            readonly,
+            block_cap_source: FatBlockCapSource::ServiceExtraCap0,
+        })
+    }
+
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix[..self.prefix_len as usize]
+    }
+
+    pub fn encode_startup_words(self) -> (u64, u64) {
+        let mut prefix_word = 0u64;
+        let mut idx = 0usize;
+        while idx < self.prefix.len() {
+            prefix_word |= (self.prefix[idx] as u64) << (idx * 8);
+            idx += 1;
+        }
+        let flags = if self.readonly {
+            FAT_MOUNT_CONFIG_FLAG_READONLY
+        } else {
+            0
+        };
+        let meta = (self.device_id as u64)
+            | ((flags as u64) << 32)
+            | ((self.prefix_len as u64) << 48)
+            | ((FAT_MOUNT_CONFIG_BLOCK_CAP_SOURCE_SERVICE_EXTRA_0 as u64) << 56);
+        (prefix_word, meta)
+    }
+
+    pub fn decode_startup_words(prefix_word: u64, meta: u64) -> Option<Self> {
+        if prefix_word == 0 || meta == 0 {
+            return None;
+        }
+        let prefix_len = ((meta >> 48) & 0xff) as u8;
+        if prefix_len == 0 || prefix_len > 8 {
+            return None;
+        }
+        let source = ((meta >> 56) & 0xff) as u8;
+        if source != FAT_MOUNT_CONFIG_BLOCK_CAP_SOURCE_SERVICE_EXTRA_0 {
+            return None;
+        }
+        let mut prefix = [0u8; 8];
+        let mut idx = 0usize;
+        while idx < 8 {
+            prefix[idx] = ((prefix_word >> (idx * 8)) & 0xff) as u8;
+            idx += 1;
+        }
+        if prefix[0] != b'/' {
+            return None;
+        }
+        let flags = ((meta >> 32) & 0xffff) as u16;
+        Some(Self {
+            prefix,
+            prefix_len,
+            device_id: (meta & 0xffff_ffff) as u32,
+            readonly: (flags & FAT_MOUNT_CONFIG_FLAG_READONLY) != 0,
+            block_cap_source: FatBlockCapSource::ServiceExtraCap0,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FatStartupConfig {
     pub block_send_cap: Option<u32>,
     pub reply_recv_cap: Option<u32>,
-    pub device_id: u64,
+    pub mount_config: Option<FatMountConfig>,
     pub allow_sample_image: bool,
 }
 
 impl FatStartupConfig {
-    pub const fn production(
+    pub fn production(
         block_send_cap: Option<u32>,
         reply_recv_cap: Option<u32>,
         device_id: u64,
@@ -30,7 +128,7 @@ impl FatStartupConfig {
         Self {
             block_send_cap,
             reply_recv_cap,
-            device_id,
+            mount_config: FatMountConfig::new(FAT_DEFAULT_MOUNT_PREFIX, device_id as u32, true),
             allow_sample_image: false,
         }
     }
@@ -39,7 +137,7 @@ impl FatStartupConfig {
         Self {
             block_send_cap: None,
             reply_recv_cap: None,
-            device_id: FAT_DEFAULT_BLOCK_DEVICE_ID,
+            mount_config: Some(FatMountConfig::default_compat()),
             allow_sample_image: true,
         }
     }
@@ -47,17 +145,27 @@ impl FatStartupConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FatServiceStartup {
-    Mounted { backend_kind: FatBackendKind },
+    Mounted {
+        backend_kind: FatBackendKind,
+        mount_config: FatMountConfig,
+    },
     NoBlockBackend,
     MountFailed(FatError),
 }
 
 pub fn startup_config_from_runtime() -> FatStartupConfig {
     let ctx = yarm_user_rt::runtime::startup_context();
+    let raw_prefix = yarm_user_rt::runtime::startup_arg_slot(
+        yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_1,
+    )
+    .unwrap_or(0);
+    let raw_meta =
+        yarm_user_rt::runtime::startup_arg_slot(yarm_user_rt::runtime::STARTUP_SLOT_INITRD_PTR)
+            .unwrap_or(0);
     FatStartupConfig {
         block_send_cap: ctx.service_extra_cap_0,
         reply_recv_cap: ctx.process_manager_reply_recv_cap,
-        device_id: FAT_DEFAULT_BLOCK_DEVICE_ID,
+        mount_config: FatMountConfig::decode_startup_words(raw_prefix, raw_meta),
         allow_sample_image: cfg!(feature = "hosted-dev"),
     }
 }
@@ -67,8 +175,26 @@ pub fn service_from_startup_config(
 ) -> Result<FatService, FatServiceStartup> {
     match (config.block_send_cap, config.reply_recv_cap) {
         (Some(block_send_cap), Some(reply_recv_cap)) => {
+            let mount_config = config.mount_config.unwrap_or_else(|| {
+                yarm_user_rt::user_log!(
+                    "FAT_CONFIG_DEFAULT_DEVICE_ID device_id={} reason=missing-config",
+                    FAT_DEFAULT_BLOCK_DEVICE_ID
+                );
+                FatMountConfig::default_compat()
+            });
+            if config.mount_config.is_some() {
+                yarm_user_rt::user_log!(
+                    "FAT_CONFIG_FOUND prefix={} device_id={}",
+                    alloc::string::String::from_utf8_lossy(mount_config.prefix()),
+                    mount_config.device_id
+                );
+            }
             yarm_user_rt::user_log!("FAT_BLOCK_BACKEND_STARTUP_CAP cap={}", block_send_cap);
-            match FatBackend::from_ipc_block(config.device_id, block_send_cap, reply_recv_cap) {
+            match FatBackend::from_ipc_block(
+                u64::from(mount_config.device_id),
+                block_send_cap,
+                reply_recv_cap,
+            ) {
                 Ok(backend) => Ok(FatService::with_backend(backend)),
                 Err(err) => Err(FatServiceStartup::MountFailed(err)),
             }
@@ -115,10 +241,20 @@ pub fn run_with_config(config: FatStartupConfig) -> FatServiceStartup {
     match service_from_startup_config(config) {
         Ok(mut svc) => {
             let backend_kind = svc.backend().backend_kind();
+            let mount_config = config
+                .mount_config
+                .unwrap_or_else(FatMountConfig::default_compat);
             match run_mount_smoke(&mut svc) {
                 Ok(()) => {
-                    yarm_user_rt::user_log!("FAT_MOUNT_READY");
-                    FatServiceStartup::Mounted { backend_kind }
+                    yarm_user_rt::user_log!(
+                        "FAT_MOUNT_READY prefix={} device_id={}",
+                        alloc::string::String::from_utf8_lossy(mount_config.prefix()),
+                        mount_config.device_id
+                    );
+                    FatServiceStartup::Mounted {
+                        backend_kind,
+                        mount_config,
+                    }
                 }
                 Err(err) => {
                     yarm_user_rt::user_log!("FAT_MOUNT_FAILED reason={:?}", err);
@@ -184,9 +320,53 @@ mod tests {
     }
 
     #[test]
+    fn fat_config_parse_and_default_behavior() {
+        let default = FatMountConfig::default_compat();
+        assert_eq!(default.prefix(), b"/fat");
+        assert_eq!(default.device_id, 1);
+        assert!(default.readonly);
+        let configured = FatMountConfig::new(b"/mnt/fat", 42, true).expect("config");
+        let (prefix, meta) = configured.encode_startup_words();
+        assert_eq!(
+            FatMountConfig::decode_startup_words(prefix, meta),
+            Some(configured)
+        );
+        assert!(FatMountConfig::new(b"relative", 1, true).is_none());
+        assert!(FatMountConfig::new(b"/too-long", 1, true).is_none());
+    }
+
+    #[test]
+    fn configured_device_id_overrides_default() {
+        let configured = FatMountConfig::new(b"/mnt/fat", 42, true).expect("config");
+        let cfg = FatStartupConfig {
+            block_send_cap: Some(7),
+            reply_recv_cap: Some(8),
+            mount_config: Some(configured),
+            allow_sample_image: false,
+        };
+        assert_eq!(cfg.mount_config.unwrap().device_id, 42);
+        assert_eq!(cfg.mount_config.unwrap().prefix(), b"/mnt/fat");
+    }
+
+    #[test]
+    fn production_block_cap_with_config_selects_ipc_backend_attempt() {
+        let configured = FatMountConfig::new(b"/mnt/fat", 42, true).expect("config");
+        let err = service_from_startup_config(FatStartupConfig {
+            block_send_cap: Some(7),
+            reply_recv_cap: Some(8),
+            mount_config: Some(configured),
+            allow_sample_image: false,
+        })
+        .expect_err("fake caps still force IPC mount failure in tests");
+        assert!(matches!(err, FatServiceStartup::MountFailed(_)));
+    }
+
+    #[test]
     fn fat_server_contract_docs_match_startup_backend_behavior() {
         let doc = include_str!("../../../../../doc/FAT_SERVER_CONTRACT.md");
         assert!(doc.contains("service_extra_cap_0"));
+        assert!(doc.contains("/mnt/fat"));
+        assert!(doc.contains("device id"));
         assert!(doc.contains("FAT_NO_BLOCK_BACKEND"));
         assert!(doc.contains("sample image"));
         assert!(doc.contains("read-only"));
