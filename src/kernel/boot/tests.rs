@@ -6970,6 +6970,8 @@ fn spawn_thread_does_not_get_independent_brk_bounds() {
 
 #[test]
 fn clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion() {
+    // After a COW capacity error mid-clone the rollback must destroy the partially
+    // constructed child ASID, leaving no child COW records in the global table.
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     // Use register_task + bind_task_asid instead of spawn_user_task_from_image to avoid
@@ -6981,7 +6983,10 @@ fn clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion() 
     let phys = state
         .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
         .expect("phys");
-    let writable_pages = (super::MAX_COW_PAGES / 2) + 1;
+    // 3 writable pages; capacity limit = 5 makes mark_cow_page fail when trying
+    // to record the child side of page 2 (after parent0,child0,parent1,child1,parent2 = 5).
+    let writable_pages = 3usize;
+    state.with_memory_state_mut(|m| m.cow_page_capacity_limit = Some(5));
     for page in 0..writable_pages {
         let va = VirtAddr(0x20_0000 + (page * PAGE_SIZE) as u64);
         state
@@ -7005,7 +7010,6 @@ fn clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion() 
         memory
             .cow_pages
             .iter()
-            .flatten()
             .any(|entry| entry.asid != parent_asid)
     });
     assert!(!lingering_child_cow);
@@ -7350,8 +7354,10 @@ fn fork_failed_clone_restores_parent_write_permissions() {
     let phys = state
         .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
         .expect("phys");
-    // Map enough writable pages to exhaust COW capacity mid-clone.
-    let writable_pages = (super::MAX_COW_PAGES / 2) + 1;
+    // Map 3 writable pages; capacity limit = 5 forces failure at child COW
+    // record for page 2 (after 5 pushes: parent0,child0,parent1,child1,parent2).
+    let writable_pages = 3usize;
+    state.with_memory_state_mut(|m| m.cow_page_capacity_limit = Some(5));
     for page in 0..writable_pages {
         let va = VirtAddr(0x10_0000 + (page * PAGE_SIZE) as u64);
         state
@@ -7359,7 +7365,7 @@ fn fork_failed_clone_restores_parent_write_permissions() {
             .expect("map parent page");
     }
 
-    // The clone must fail (COW full).
+    // The clone must fail (COW capacity limit reached).
     let result = state.clone_user_address_space_cow(parent_asid);
     assert_eq!(result, Err(KernelError::MemoryObjectFull));
 
@@ -7391,7 +7397,10 @@ fn fork_failed_clone_leaves_no_parent_cow_records() {
     let phys = state
         .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
         .expect("phys");
-    let writable_pages = (super::MAX_COW_PAGES / 2) + 1;
+    // 3 writable pages; capacity limit = 5 triggers failure mid-clone at child
+    // side of page 2, after which rollback must clear all parent COW records.
+    let writable_pages = 3usize;
+    state.with_memory_state_mut(|m| m.cow_page_capacity_limit = Some(5));
     for page in 0..writable_pages {
         let va = VirtAddr(0x20_0000 + (page * PAGE_SIZE) as u64);
         state
@@ -7405,7 +7414,6 @@ fn fork_failed_clone_leaves_no_parent_cow_records() {
         memory
             .cow_pages
             .iter()
-            .flatten()
             .filter(|e| e.asid == parent_asid)
             .count()
     });
@@ -7536,6 +7544,173 @@ fn fork_cow_split_old_frame_eventually_freed_after_both_exit() {
         "shared frame must be reclaimed after both parent and child release all caps"
     );
 }
+
+// ---------- Stage 13: COW content correctness + Vec scalability tests ----------
+
+#[test]
+fn cow_clone_copies_parent_content_to_child() {
+    // After clone, the child must be able to read the same bytes the parent
+    // wrote before cloning.  This verifies the hosted-dev UserMemoryStore copy
+    // uses physical-frame keys (asid, phys) rather than (asid, virt).
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(60).expect("parent");
+    state.bind_task_asid(60, parent_asid).expect("bind parent");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x1000), PageFlags::USER_RW)
+        .expect("map parent");
+
+    state
+        .write_user_memory_for_asid(parent_asid, 0x1000, &[0xAA, 0xBB, 0xCC])
+        .expect("write parent content");
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+
+    let child_bytes = state
+        .read_user_memory_for_asid(child_asid, 0x1000, 3)
+        .expect("read child content");
+    assert_eq!(
+        child_bytes[..3],
+        [0xAA, 0xBB, 0xCC],
+        "child must see parent content after clone"
+    );
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+#[test]
+fn cow_fault_preserves_parent_content_and_copies_to_child() {
+    // After a COW fault in the child:
+    //  - parent still sees the original bytes at the shared virtual address
+    //  - child sees the same bytes (copied to the new private frame)
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 61,
+            entry: 0x5000,
+            asid: Some(parent_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("parent");
+    state.yield_current_to(ThreadId(61)).expect("switch to task61");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x2000), PageFlags::USER_RW)
+        .expect("map parent");
+
+    state
+        .write_user_memory_for_asid(parent_asid, 0x2000, &[0x11, 0x22, 0x33])
+        .expect("write parent content");
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+
+    // Child triggers a COW fault — gets a new private frame with copied content.
+    state
+        .try_handle_cow_fault(child_asid, VirtAddr(0x2000))
+        .expect("child cow fault");
+
+    // Parent must still see the original content.
+    let parent_bytes = state
+        .read_user_memory_for_asid(parent_asid, 0x2000, 3)
+        .expect("read parent after child fault");
+    assert_eq!(
+        parent_bytes[..3],
+        [0x11, 0x22, 0x33],
+        "parent content must be preserved after child COW fault"
+    );
+
+    // Child must also see the copied content in its new private frame.
+    let child_bytes = state
+        .read_user_memory_for_asid(child_asid, 0x2000, 3)
+        .expect("read child after fault");
+    assert_eq!(
+        child_bytes[..3],
+        [0x11, 0x22, 0x33],
+        "child must see copied content after COW fault"
+    );
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+#[test]
+fn cow_vec_grows_beyond_old_array_limit() {
+    // With the dynamic Vec, a clone of more than the old MAX_COW_PAGES (100)
+    // writable pages must succeed.  Each writable page produces two COW records
+    // (parent + child), so 110 pages = 220 records — beyond the old cap.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(62).expect("parent");
+    state.bind_task_asid(62, parent_asid).expect("bind parent");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    for page in 0..110usize {
+        let va = VirtAddr(0x30_0000 + (page * PAGE_SIZE) as u64);
+        state
+            .map_user_page_in_asid_raw(parent_asid, va, Mapping { phys, flags: PageFlags::USER_RW })
+            .expect("map page");
+    }
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone must succeed");
+
+    let cow_count = state.with_memory_state(|m| m.cow_pages.len());
+    assert_eq!(cow_count, 220, "110 writable pages × 2 sides = 220 COW records");
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+#[test]
+fn cow_pages_vec_cleared_after_both_asids_destroyed() {
+    // Destroying child then parent ASID must clear all COW records from the Vec,
+    // leaving it empty — no slots are "leaked" the way a fixed-size array could.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(63).expect("parent");
+    state.bind_task_asid(63, parent_asid).expect("bind parent");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    for page in 0..4usize {
+        let va = VirtAddr(0x40_0000 + (page * PAGE_SIZE) as u64);
+        state
+            .map_user_page_in_asid_raw(parent_asid, va, Mapping { phys, flags: PageFlags::USER_RW })
+            .expect("map");
+    }
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    assert_eq!(state.with_memory_state(|m| m.cow_pages.len()), 8, "4 pages × 2 = 8 records");
+
+    state.destroy_user_address_space_by_asid(child_asid).expect("destroy child");
+    assert_eq!(
+        state.with_memory_state(|m| m.cow_pages.iter().filter(|e| e.asid == child_asid).count()),
+        0,
+        "child COW records must be gone after child ASID destroyed"
+    );
+
+    // Restore parent write permissions so we can destroy it cleanly.
+    for page in 0..4usize {
+        let va = VirtAddr(0x40_0000 + (page * PAGE_SIZE) as u64);
+        let _ = state.try_handle_cow_fault(parent_asid, va);
+    }
+    let _ = state.destroy_user_address_space_by_asid(parent_asid);
+    assert_eq!(
+        state.with_memory_state(|m| m.cow_pages.len()),
+        0,
+        "Vec must be empty after all ASIDs destroyed"
+    );
+}
+
+// ---------- End Stage 13 COW tests ----------
 
 // ---------- End Stage 12 COW/fork tests ----------
 

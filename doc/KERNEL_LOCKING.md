@@ -6230,7 +6230,30 @@ Expected markers (from user-provided values):
 
 663 tests pass single-threaded (`cargo test --lib -- --test-threads=1`).
 11 new COW/fork lifetime tests (tids 41-51) added.
-x86_64 -smp 1 smoke requested for Stage 12 (live COW/fork behavior changed).
+
+#### Stage 12 x86_64 -smp 1 smoke (accepted)
+
+| Marker | Value |
+|--------|-------|
+| `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY` | 0 |
+| `X86_BOOTSTRAP_SCHEDULER_READY` | 1 |
+| `X86_BOOTSTRAP_TIMER_STARTED` | 1 |
+| `ENTER_USER` | 3 |
+| `STARTUP_INSTALL_FINAL` | 9 |
+| `PM_ELF_ZC_DONE` total | 3 |
+| ZC nonzero pages | 3 |
+| `PM_ELF_ZC_FAIL` | 0 |
+| `INITRAMFS_SRV_ENTRY` | 1 |
+| `DEVFS_SRV_ENTRY` | 1 |
+| `VFS_SRV_ENTRY` | 1 |
+| `DRIVER_MANAGER_READY` | 1 |
+| `BLKCACHE_SRV_READY` | 1 |
+| `VIRTIO_BLK_SRV_READY` | 1 |
+| fallback | 0 |
+| TID mismatch | 0 |
+| fatal-ish | 0 |
+| oom/capacity/Vm(Full) | 0 |
+| cap/refcount suspicious | 0 |
 
 ### 30.8 Files changed (Stage 12)
 
@@ -6241,3 +6264,78 @@ x86_64 -smp 1 smoke requested for Stage 12 (live COW/fork behavior changed).
 | `src/kernel/boot/tests.rs` | 11 new Stage 12 COW/fork lifetime tests; task-switch fix (yield_current_to before alloc) |
 | `doc/KERNEL_LOCKING.md` | This section (§30) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+19 (Stage 12 test rules) |
+
+## §31 — Stage 13: COW content copy + COW table scalability
+
+### 31.1 Motivation
+
+Stage 12 fixed COW/fork refcount lifetime bugs and rollback. Stage 13 completes
+the COW pass: (1) bare-metal content copy on COW fault was a documented TODO;
+(2) the hosted-dev clone copy used virtual addresses as UserMemoryStore keys
+instead of physical addresses; (3) the COW table was a fixed-size global array
+that one process could exhaust for all others.
+
+### 31.2 Bug inventory
+
+| Bug | Location | Severity | Fix |
+|-----|----------|----------|-----|
+| `try_handle_cow_fault` had no content copy | `memory_state.rs` | SILENT DATA LOSS (bare-metal) | Add `copy_frame_contents_for_cow`; wire before remap |
+| `clone_user_address_space_cow` hosted-dev copy used `virt` key | `memory_state.rs:368` | SILENT DATA LOSS (hosted-dev) | Use `mapping.phys` key |
+| `try_handle_cow_fault` leaked new frame on remap failure | `memory_state.rs` | LEAK | Revoke `new_mem_cap` on all error paths |
+| Global fixed-size `[Option<CowPageRecord>; MAX_COW_PAGES]` | `defs.rs` | EXHAUSTION | Replace with `Vec<CowPageRecord>` |
+
+### 31.3 `copy_frame_contents_for_cow`
+
+New private helper in `memory_state.rs`:
+
+```
+fn copy_frame_contents_for_cow(&mut self, asid, old_phys, new_phys) -> Result<(), KernelError>
+```
+
+- **hosted-dev**: copies `(asid, old_phys+offset) → (asid, new_phys+offset)` for offset in `0..PAGE_SIZE`
+  using the `UserMemoryStore` BTreeMap.
+- **bare-metal**: `phys_to_direct_map_ptr(old_phys)` → `copy_nonoverlapping PAGE_SIZE bytes`
+  to `phys_to_direct_map_ptr(new_phys)`.
+
+`phys_to_direct_map_ptr` visibility lifted to `pub(super)` to allow cross-module use within
+the `boot` module.
+
+### 31.4 COW table → dynamic Vec
+
+| Before | After |
+|--------|-------|
+| `KernelStorage<[Option<CowPageRecord>; MAX_COW_PAGES]>` | `Vec<CowPageRecord>` |
+| `mark_cow_page`: linear scan for `None` slot, `Err(MemoryObjectFull)` if full | `push` after dedup check; `#[cfg(test)]` capacity limit for exhaustion tests |
+| `clear_cow_page`: iterate setting matching entries to `None` | `retain(|e| !(asid && virt match))` |
+| `clear_cow_pages_for_asid`: iterate setting asid entries to `None` | `retain(|e| e.asid != asid)` |
+| `is_cow_page`: `iter().flatten().any(...)` | `iter().any(...)` |
+| `MAX_COW_PAGES` constant (100/256) | Removed |
+
+The `#[cfg(test)]` field `cow_page_capacity_limit: Option<usize>` in `MemorySubsystem`
+allows tests to simulate exhaustion without a production hard cap. Default is `None`
+(unlimited). Tests set it to a small value (e.g. `Some(5)`) to trigger `Err(MemoryObjectFull)`
+from `mark_cow_page`.
+
+### 31.5 Refcount transition table (updated, no changes from Stage 12)
+
+Table unchanged — Vec switch does not affect refcount semantics.
+
+### 31.6 Stage 13 acceptance
+
+667 tests pass single-threaded (`cargo test --lib -- --test-threads=1`).
+4 new Stage 13 tests added (content correctness × 2, Vec scalability × 2).
+`cargo check --no-default-features` clean.
+x86_64 -smp 1 smoke required for Stage 13 (live COW fault content-copy behavior changed).
+
+### 31.7 Files changed (Stage 13)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/defs.rs` | `cow_pages` field type → `Vec<CowPageRecord>`; `#[cfg(test)] cow_page_capacity_limit` |
+| `src/kernel/boot/bootstrap_state.rs` | Init `cow_pages: Vec::new()`; `#[cfg(test)] cow_page_capacity_limit: None` |
+| `src/kernel/boot/mod.rs` | Remove `MAX_COW_PAGES` constants |
+| `src/kernel/boot/memory_state.rs` | 4 COW functions updated; `copy_frame_contents_for_cow` added; `try_handle_cow_fault` content copy + rollback; clone copy key fix |
+| `src/kernel/boot/user_memory_state.rs` | `phys_to_direct_map_ptr` visibility → `pub(super)` |
+| `src/kernel/boot/tests.rs` | 2 exhaustion tests redesigned (capacity limit field); `.iter().flatten()` → `.iter()`; 4 new Stage 13 tests |
+| `doc/KERNEL_LOCKING.md` | §30.7 smoke acceptance table; this section (§31) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+20 (Stage 13 test rules) |
