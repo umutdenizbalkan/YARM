@@ -1463,3 +1463,62 @@ being marked as a COW page in either asid. The child gets the same physical fram
 
 Every Stage 12 commit must pass `cargo test --lib -- --test-threads=1` with at
 least 663 tests (652 from Stage 10+11 + 11 new Stage 12 tests).
+
+## Rule N+20 — Stage 13: COW content correctness + Vec scalability tests
+
+### N+20.1 — Clone content copy must use physical-frame keys
+
+In hosted-dev the `UserMemoryStore` is keyed by `(asid, phys_addr)`, not
+`(asid, virt_addr)`. Any test that writes to a parent page before cloning and
+then reads from the child must succeed: the clone copy in
+`clone_user_address_space_cow` must use `mapping.phys` as the key, not `virt`.
+
+A test verifying this: write known bytes to `parent_asid` at a virtual address,
+clone, read from `child_asid` at the same virtual address, assert the bytes match.
+
+### N+20.2 — COW fault content copy must produce readable child data
+
+After `try_handle_cow_fault(child_asid, virt)`, the child's new private frame must
+contain a copy of the original shared frame's content. Test by:
+1. Writing bytes to parent before clone.
+2. Cloning → child shares the same physical frame (read-only COW).
+3. Triggering `try_handle_cow_fault` on the child.
+4. Reading from child at the same virtual address — must see the original bytes.
+5. Reading from parent at the same virtual address — must also still see them.
+
+### N+20.3 — Exhaustion tests use `cow_page_capacity_limit`, not array size
+
+The two rollback-under-exhaustion tests (`clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion`
+and `fork_failed_clone_leaves_no_parent_cow_records`) must set
+`state.with_memory_state_mut(|m| m.cow_page_capacity_limit = Some(N))` to simulate
+a cap rather than relying on `super::MAX_COW_PAGES` (which no longer exists).
+
+The limit and page count must be chosen so that failure occurs after at least one
+parent+child COW pair succeeds: e.g. 3 writable pages with limit 5 causes failure at
+the 6th push (child side of page 2).
+
+### N+20.4 — Vec grows beyond old fixed-cap limit
+
+A test must clone an address space with more than 100 writable pages (the old
+`MAX_COW_PAGES` hosted-dev limit) and assert the clone succeeds without error.
+Verify `cow_pages.len() == pages * 2` after the clone.
+
+### N+20.5 — COW Vec entries cleared on ASID destroy
+
+Destroying an ASID (via `destroy_user_address_space_by_asid`) must remove all
+`cow_pages` Vec entries for that ASID. Test by:
+1. Cloning → child gets COW records.
+2. Destroying child ASID → child entries gone (filter by asid, count == 0).
+3. Destroying parent ASID → Vec empty (`len() == 0`).
+
+### N+20.6 — Exhaustion-test `.iter().flatten()` must become `.iter()`
+
+With `Vec<CowPageRecord>` (not `Vec<Option<CowPageRecord>>`), any test that used
+`.iter().flatten()` to scan `cow_pages` is a compile error or logic bug. All scans
+must use `.iter()` directly and match on `CowPageRecord` fields, not `Option<CowPageRecord>`.
+
+### N+20.7 — Full suite at 667+ tests (single-threaded)
+
+Every Stage 13 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 667 tests (663 from Stage 12 + 4 new Stage 13 tests).
+`cargo check --no-default-features` must also be clean.

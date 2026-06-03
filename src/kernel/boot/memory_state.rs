@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::{KernelError, KernelState, MemoryObject, MemoryObjectKind, kernel_mut, kernel_ref};
+use super::{KernelError, KernelState, MemoryObject, MemoryObjectKind, kernel_mut};
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::frame_allocator::FrameAllocError;
 use crate::kernel::scheduler::CpuId;
@@ -46,50 +46,40 @@ impl KernelState {
             if memory
                 .cow_pages
                 .iter()
-                .flatten()
                 .any(|entry| entry.asid == asid && entry.virt == virt)
             {
                 return Ok(());
             }
-            let Some(slot) = kernel_mut(&mut memory.cow_pages)
-                .iter_mut()
-                .find(|slot| slot.is_none())
-            else {
-                return Err(KernelError::MemoryObjectFull);
-            };
-            *slot = Some(super::CowPageRecord { asid, virt });
+            #[cfg(test)]
+            if let Some(limit) = memory.cow_page_capacity_limit {
+                if memory.cow_pages.len() >= limit {
+                    return Err(KernelError::MemoryObjectFull);
+                }
+            }
+            memory.cow_pages.push(super::CowPageRecord { asid, virt });
             Ok(())
         })
     }
 
     fn clear_cow_page(&mut self, asid: Asid, virt: VirtAddr) {
         self.with_memory_state_mut(|memory| {
-            for slot in kernel_mut(&mut memory.cow_pages).iter_mut() {
-                if matches!(
-                    slot.as_ref(),
-                    Some(entry) if entry.asid == asid && entry.virt == virt
-                ) {
-                    *slot = None;
-                }
-            }
+            memory
+                .cow_pages
+                .retain(|entry| !(entry.asid == asid && entry.virt == virt));
         });
     }
 
     fn clear_cow_pages_for_asid(&mut self, asid: Asid) {
         self.with_memory_state_mut(|memory| {
-            for slot in kernel_mut(&mut memory.cow_pages).iter_mut() {
-                if matches!(slot.as_ref(), Some(entry) if entry.asid == asid) {
-                    *slot = None;
-                }
-            }
+            memory.cow_pages.retain(|entry| entry.asid != asid);
         });
     }
 
     pub(crate) fn is_cow_page(&self, asid: Asid, virt: VirtAddr) -> bool {
         self.with_memory_state(|memory| {
-            kernel_ref(&memory.cow_pages)
+            memory
+                .cow_pages
                 .iter()
-                .flatten()
                 .any(|entry| entry.asid == asid && entry.virt == virt)
         })
     }
@@ -364,9 +354,9 @@ impl KernelState {
             }
             #[cfg(feature = "hosted-dev")]
             self.with_memory_state_mut(|memory| {
-                for offset in 0..crate::kernel::vm::PAGE_SIZE {
-                    let from = (parent_asid.0, virt.0 + offset as u64);
-                    let to = (child_asid.0, virt.0 + offset as u64);
+                for offset in 0..crate::kernel::vm::PAGE_SIZE as u64 {
+                    let from = (parent_asid.0, mapping.phys.0 + offset);
+                    let to = (child_asid.0, mapping.phys.0 + offset);
                     if let Some(value) = memory.user_memory.get(&from).copied() {
                         memory.user_memory.insert(to, value);
                     }
@@ -409,6 +399,42 @@ impl KernelState {
         }
     }
 
+    fn copy_frame_contents_for_cow(
+        &mut self,
+        asid: Asid,
+        old_phys: PhysAddr,
+        new_phys: PhysAddr,
+    ) -> Result<(), KernelError> {
+        #[cfg(feature = "hosted-dev")]
+        {
+            self.with_memory_state_mut(|memory| {
+                for offset in 0..crate::kernel::vm::PAGE_SIZE as u64 {
+                    let key = (asid.0, old_phys.0 + offset);
+                    if let Some(value) = memory.user_memory.get(&key).copied() {
+                        memory.user_memory.insert((asid.0, new_phys.0 + offset), value);
+                    }
+                }
+            });
+            Ok(())
+        }
+        #[cfg(not(feature = "hosted-dev"))]
+        {
+            let _ = asid;
+            let src =
+                Self::phys_to_direct_map_ptr(old_phys.0).ok_or(KernelError::UserMemoryFault)?;
+            let dst =
+                Self::phys_to_direct_map_ptr(new_phys.0).ok_or(KernelError::UserMemoryFault)?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src as *const u8,
+                    dst,
+                    crate::kernel::vm::PAGE_SIZE,
+                );
+            }
+            Ok(())
+        }
+    }
+
     pub(crate) fn try_handle_cow_fault(
         &mut self,
         asid: Asid,
@@ -425,23 +451,32 @@ impl KernelState {
             self.clear_cow_page(asid, page);
             return Ok(true);
         }
-        let (_id, mem_cap) = self.alloc_anonymous_memory_object()?;
-        let new_phys = self.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)?;
-        // NOTE (bare-metal TODO): on a real architecture the old page contents
-        // must be copied from `mapping.phys` to `new_phys` before remapping.
-        // In hosted-dev the VM memory is keyed by (asid, virt_addr), so the
-        // content survives the physical-frame swap without an explicit copy.
+        let (_id, new_mem_cap) = self.alloc_anonymous_memory_object()?;
+        let new_phys = match self.resolve_memory_object_phys(new_mem_cap, PageFlags::USER_RW) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(cnode) = self.current_task_cnode() {
+                    let _ = self.revoke_capability_in_cnode(cnode, new_mem_cap);
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.copy_frame_contents_for_cow(asid, mapping.phys, new_phys) {
+            if let Some(cnode) = self.current_task_cnode() {
+                let _ = self.revoke_capability_in_cnode(cnode, new_mem_cap);
+            }
+            return Err(e);
+        }
         let mut flags = mapping.flags;
         flags.write = true;
-        self.map_user_page_in_asid_raw(
-            asid,
-            page,
-            Mapping {
-                phys: new_phys,
-                flags,
-            },
-        )
-        .map(|_| ())?;
+        if let Err(e) =
+            self.map_user_page_in_asid_raw(asid, page, Mapping { phys: new_phys, flags })
+        {
+            if let Some(cnode) = self.current_task_cnode() {
+                let _ = self.revoke_capability_in_cnode(cnode, new_mem_cap);
+            }
+            return Err(e);
+        }
         self.clear_cow_page(asid, page);
         Ok(true)
     }

@@ -481,11 +481,6 @@ pub(crate) struct VmAnonMapRollbackTlbPlan {
 }
 
 #[cfg(feature = "hosted-dev")]
-const MAX_COW_PAGES: usize = 100;
-#[cfg(not(feature = "hosted-dev"))]
-const MAX_COW_PAGES: usize = 256;
-
-#[cfg(feature = "hosted-dev")]
 const MAX_NOTIFICATIONS: usize = 64;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_NOTIFICATIONS: usize = 32;
