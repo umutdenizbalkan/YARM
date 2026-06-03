@@ -1369,3 +1369,43 @@ and length — identical to pre-Stage-10 behavior.
 
 All Stage 7 shared-region, transfer-release, and IPC recv-v2 tests must continue to
 pass. Stage 10 does not modify the shared-region or IPC paths.
+
+---
+
+## N+18 — Stage 11 test rules: Two-phase active transfer cleanup
+
+### N+18.1 — Two-phase unmap must be exercised by active transfer tests
+
+Every new active-transfer-cleanup test must verify both phases of the two-phase unmap:
+- Phase 1: the mapped page is gone (PTE cleared, `is_user_page_mapped_in_asid` returns false).
+- Phase 2 (via reclaim): the MemoryObject slot is freed when cap_refcount, map_refcount,
+  and pin_refcount all reach zero.
+
+### N+18.2 — cap_refcount setup must match assertion
+
+A test that asserts `memory_object_slot_by_id(mo_id).is_none()` must ensure the
+MemoryObject's `cap_refcount` reaches zero after the operation under test.
+If the cap was granted to a second task before the test, `cap_refcount=2` and the
+slot will NOT be freed after revoking only one task's cap. Allocate while the
+task-under-test is current so the cap lives only in its cspace (`cap_refcount=1`).
+
+### N+18.3 — Absent-page tolerance
+
+At least one test must register an active mapping for N pages but physically map
+fewer than N. `purge_active_transfer_mappings_for_pid` must not panic on the unmapped
+pages (silently skipped by `unmap_range_two_phase`).
+
+### N+18.4 — Cross-pid isolation
+
+At least one test must verify that purging PID A does not unmap pages owned by PID B.
+
+### N+18.5 — Full suite at 652+ tests (single-threaded)
+
+Every Stage 11 commit must pass `cargo test --lib -- --test-threads=1` with at least
+652 tests (647 from Stage 10 + 5 new Stage 11 tests).
+
+### N+18.6 — Revoke-cap path tested independently
+
+`revoke_capability_in_cnode` → `revoke_active_transfer_mappings_for_cap` must have
+its own test, independent from the purge path, confirming the same unmap-and-reclaim
+behavior.

@@ -10979,6 +10979,272 @@ fn vm_map_stage10_rollback_via_phase1_unmap_cleans_pages() {
         .expect("join");
 }
 
+// ── Stage 11: two-phase active-transfer cleanup conversion ────────────────────
+//
+// These tests verify that purge_active_transfer_mappings_for_pid and
+// revoke_active_transfer_mappings_for_cap now use unmap_range_two_phase
+// (unmap_page_phase1 + execute_tlb_shootdown_wait_plan) instead of
+// unmap_user_page_in_asid. Observable invariants:
+//   - All pages in the active mapping range are unmapped after cleanup.
+//   - MemoryObjects are freed (frame reclaimed) after both refcounts reach zero.
+//   - Absent pages are tolerated without error.
+//   - Unrelated caps/mappings are not disturbed.
+
+#[test]
+fn active_transfer_stage11_purge_unmaps_pages_and_frees_frames() {
+    // Stage 11: purge_active_transfer_mappings_for_pid must unmap all pages in
+    // the active mapping range and free the MemoryObject when both refcounts
+    // reach zero (map via page-unmap in purge, cap via revoke_capability_in_cnode).
+    //
+    // Allocate while task1 is current so the cap lives only in task1's cspace
+    // (cap_refcount=1). After purge revokes task1's cap, cap_refcount→0 and
+    // map_refcount is already 0 from the two-phase unmap, so the frame is freed.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind1");
+
+    // Switch to task1 first so alloc mints the cap in task1's cspace (cap_refcount=1).
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.yield_current().expect("switch to task1");
+    assert_eq!(state.current_tid(), Some(1));
+
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(asid1, mem_cap, VirtAddr(0xA000), PageFlags::USER_RW)
+        .expect("map");
+    state
+        .register_active_transfer_mapping(ThreadId(1), mem_cap, VirtAddr(0xA000), PAGE_SIZE)
+        .expect("register");
+
+    // Record state before purge.
+    let slot_before = state.memory_object_slot_by_id(mo_id);
+    assert!(slot_before.is_some(), "MemoryObject must exist before purge");
+
+    // Purge all active mappings for pid 1 (simulates process exit).
+    state.exit_task(1, 0).expect("exit task1");
+    assert_eq!(state.current_tid(), Some(0));
+    state.purge_active_transfer_mappings_for_pid(1);
+
+    // Page must be unmapped.
+    assert!(
+        !state
+            .is_user_page_mapped_in_asid(asid1, VirtAddr(0xA000))
+            .expect("check mapping"),
+        "page must be unmapped after purge"
+    );
+
+    // MemoryObject must be freed: purge revokes mem_cap (cap_refcount 1→0) and
+    // the two-phase unmap already cleared map_refcount, so reclaim triggers.
+    let slot_after = state.memory_object_slot_by_id(mo_id);
+    assert!(
+        slot_after.is_none(),
+        "MemoryObject must be reclaimed after purge (both refcounts zero)"
+    );
+}
+
+#[test]
+fn active_transfer_stage11_purge_tolerates_already_unmapped_pages() {
+    // Stage 11: If a page in the active mapping range is already unmapped
+    // (e.g. demand paging never faulted it in, or it was manually unmapped),
+    // purge_active_transfer_mappings_for_pid must not panic or error.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (asid1, _) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind1");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let mem_cap_task1 = state.grant_capability_task_to_task(0, mem_cap, 1).expect("grant");
+
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.yield_current().expect("switch to task1");
+
+    // Register an active mapping for 2 pages, but only actually map the first.
+    let base = VirtAddr(0xB000);
+    state
+        .map_user_page_in_asid_with_caps(asid1, mem_cap_task1, base, PageFlags::USER_RW)
+        .expect("map first page");
+    state
+        .register_active_transfer_mapping(ThreadId(1), mem_cap_task1, base, 2 * PAGE_SIZE)
+        .expect("register");
+
+    state.exit_task(1, 0).expect("exit task1");
+    assert_eq!(state.current_tid(), Some(0));
+
+    // Must not panic even though the second page (0xC000) was never mapped.
+    state.purge_active_transfer_mappings_for_pid(1);
+
+    assert!(
+        !state
+            .is_user_page_mapped_in_asid(asid1, base)
+            .expect("check base"),
+        "first page must be unmapped"
+    );
+    // No assertion needed for the second page — just confirming no panic.
+}
+
+#[test]
+fn active_transfer_stage11_purge_does_not_disturb_other_pids() {
+    // Stage 11: purge_active_transfer_mappings_for_pid must not touch active
+    // mappings that belong to a different task/pid.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    state.register_task(2).expect("task2");
+    let (asid1, _) = state.create_user_address_space().expect("asid1");
+    let (asid2, _) = state.create_user_address_space().expect("asid2");
+    state.bind_task_asid(1, asid1).expect("bind1");
+    state.bind_task_asid(2, asid2).expect("bind2");
+
+    // Map and register for task1.
+    let (_id1, cap1) = state.alloc_anonymous_memory_object().expect("mem1");
+    let cap1_t1 = state.grant_capability_task_to_task(0, cap1, 1).expect("grant1");
+    state.enqueue_current_cpu(1).expect("enqueue1");
+    state.yield_current().expect("switch to task1");
+    state
+        .map_user_page_in_asid_with_caps(asid1, cap1_t1, VirtAddr(0xC000), PageFlags::USER_RW)
+        .expect("map t1");
+    state
+        .register_active_transfer_mapping(ThreadId(1), cap1_t1, VirtAddr(0xC000), PAGE_SIZE)
+        .expect("register t1");
+
+    // Map and register for task2.
+    state.yield_current().expect("switch to task0");
+    let (_id2, cap2) = state.alloc_anonymous_memory_object().expect("mem2");
+    let cap2_t2 = state.grant_capability_task_to_task(0, cap2, 2).expect("grant2");
+    state.enqueue_current_cpu(2).expect("enqueue2");
+    state.yield_current().expect("switch to task2");
+    state
+        .map_user_page_in_asid_with_caps(asid2, cap2_t2, VirtAddr(0xD000), PageFlags::USER_RW)
+        .expect("map t2");
+    state
+        .register_active_transfer_mapping(ThreadId(2), cap2_t2, VirtAddr(0xD000), PAGE_SIZE)
+        .expect("register t2");
+
+    // Exit and purge task1 only.
+    state.yield_current().expect("switch to task0");
+    state.exit_task(1, 0).expect("exit task1");
+    state.purge_active_transfer_mappings_for_pid(1);
+
+    // Task1's page must be unmapped.
+    assert!(
+        !state
+            .is_user_page_mapped_in_asid(asid1, VirtAddr(0xC000))
+            .expect("check t1"),
+        "task1 page must be unmapped after purge"
+    );
+
+    // Task2's page must still be mapped.
+    assert!(
+        state
+            .is_user_page_mapped_in_asid(asid2, VirtAddr(0xD000))
+            .expect("check t2"),
+        "task2 page must remain mapped (different pid, not purged)"
+    );
+}
+
+#[test]
+fn active_transfer_stage11_revoke_cap_unmaps_pages_and_frees_frame() {
+    // Stage 11: revoking a transfer cap via revoke_capability_in_cnode triggers
+    // revoke_active_transfer_mappings_for_cap, which now uses two-phase unmap.
+    // After revoke, the mapped page must be gone and the MemoryObject freed.
+    //
+    // Allocate while task1 is current so cap lives only in task1's cspace
+    // (cap_refcount=1). After revoke, cap_refcount→0 and map_refcount is already
+    // 0 from the two-phase unmap, so reclaim fires and the slot is freed.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (asid1, _) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind1");
+
+    // Switch to task1 so alloc mints the cap in task1's cspace (cap_refcount=1).
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.yield_current().expect("switch to task1");
+    assert_eq!(state.current_tid(), Some(1));
+
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(asid1, mem_cap, VirtAddr(0xE000), PageFlags::USER_RW)
+        .expect("map");
+    state
+        .register_active_transfer_mapping(ThreadId(1), mem_cap, VirtAddr(0xE000), PAGE_SIZE)
+        .expect("register");
+
+    // Revoke the transfer cap → triggers revoke_active_transfer_mappings_for_cap.
+    let task1_cnode = state.task_cnode(1).expect("cnode");
+    state
+        .revoke_capability_in_cnode(task1_cnode, mem_cap)
+        .expect("revoke");
+
+    // Page must be unmapped.
+    assert!(
+        !state
+            .is_user_page_mapped_in_asid(asid1, VirtAddr(0xE000))
+            .expect("check"),
+        "page must be unmapped after cap revoke"
+    );
+
+    // MemoryObject must be freed (cap_refcount 1→0 after revoke, map_refcount=0
+    // after two-phase unmap, pin_refcount=0) so reclaim triggers.
+    assert!(
+        state.memory_object_slot_by_id(mo_id).is_none(),
+        "MemoryObject must be reclaimed after cap revoke and two-phase unmap"
+    );
+}
+
+#[test]
+fn active_transfer_stage11_revoke_does_not_touch_unrelated_cap_mapping() {
+    // Stage 11: revoke_active_transfer_mappings_for_cap must only unmap pages
+    // belonging to the revoked cap's active mapping, not other active mappings.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (asid1, _) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind1");
+
+    // Two independent memory objects and caps for task1.
+    let (_id_a, cap_a) = state.alloc_anonymous_memory_object().expect("mem_a");
+    let (_id_b, cap_b) = state.alloc_anonymous_memory_object().expect("mem_b");
+    let cap_a_t1 = state.grant_capability_task_to_task(0, cap_a, 1).expect("grant_a");
+    let cap_b_t1 = state.grant_capability_task_to_task(0, cap_b, 1).expect("grant_b");
+
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.yield_current().expect("switch to task1");
+
+    state
+        .map_user_page_in_asid_with_caps(asid1, cap_a_t1, VirtAddr(0xF000), PageFlags::USER_RW)
+        .expect("map_a");
+    state
+        .map_user_page_in_asid_with_caps(asid1, cap_b_t1, VirtAddr(0x1_0000), PageFlags::USER_RW)
+        .expect("map_b");
+    state
+        .register_active_transfer_mapping(ThreadId(1), cap_a_t1, VirtAddr(0xF000), PAGE_SIZE)
+        .expect("register_a");
+    state
+        .register_active_transfer_mapping(ThreadId(1), cap_b_t1, VirtAddr(0x1_0000), PAGE_SIZE)
+        .expect("register_b");
+
+    // Revoke only cap_a_t1.
+    let task1_cnode = state.task_cnode(1).expect("cnode");
+    state
+        .revoke_capability_in_cnode(task1_cnode, cap_a_t1)
+        .expect("revoke_a");
+
+    // cap_a's page must be unmapped.
+    assert!(
+        !state
+            .is_user_page_mapped_in_asid(asid1, VirtAddr(0xF000))
+            .expect("check_a"),
+        "cap_a page must be unmapped after revoke"
+    );
+
+    // cap_b's page must remain mapped.
+    assert!(
+        state
+            .is_user_page_mapped_in_asid(asid1, VirtAddr(0x1_0000))
+            .expect("check_b"),
+        "cap_b page must remain mapped (unrelated cap, not revoked)"
+    );
+}
+
 // ── Phase L2A: canonical boot SharedKernel construction tests ─────────────────
 //
 // These tests verify Bootstrap::init_shared_static_with_boot_memory_map

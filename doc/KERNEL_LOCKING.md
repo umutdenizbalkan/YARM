@@ -6084,3 +6084,70 @@ no rollback, and the corresponding caps leaked until task exit.
 | `src/kernel/boot/tests.rs` | 7 new Stage 10 tests (VmMap refcounts, non-current ASID, MemoryObject invariants, rollback) |
 | `doc/KERNEL_LOCKING.md` | This section (§28): Stage 9 acceptance, full audit table, IPC/shared-region audit, VmMap fix |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+17 (Stage 10 test rules) |
+
+---
+
+## §29 Stage 11: Two-phase unmap for active transfer cleanup
+
+### 29.1 Scope
+
+Stage 11 converts `purge_active_transfer_mappings_for_pid` and
+`revoke_active_transfer_mappings_for_cap` from one-phase `unmap_user_page_in_asid`
+to two-phase `unmap_page_phase1` + `execute_tlb_shootdown_wait_plan`, completing
+the two-phase migration for all VM-mutating paths.
+
+### 29.2 Changed paths
+
+| Function | Location | Change |
+|----------|----------|--------|
+| `purge_active_transfer_mappings_for_pid` | `cnode_state.rs` | Per-mapping loop replaced with `unmap_range_two_phase(asid, base, len)` |
+| `revoke_active_transfer_mappings_for_cap` | `capability_lifecycle_state.rs` | Same: `unmap_range_two_phase(asid, base, len)` |
+| `unmap_range_two_phase` | `memory_state.rs` | New helper: phase-1 loop over pages, then phase-2 per page |
+
+### 29.3 Invariants preserved
+
+- **map_refcount**: decremented by `unmap_page_phase1` via `note_mapping_removed`
+  before the TLB shootdown.  Reclaim fires inside `execute_tlb_shootdown_wait_plan`
+  only when all three refcounts (cap, map, pin) are zero at that point.
+- **cap_refcount**: NOT decremented inside `revoke_active_transfer_mappings_for_cap`.
+  The caller (`revoke_capability_in_cnode` or `revoke_capability_direct_in_process_cnode`)
+  decrements cap_refcount **after** this function returns, then calls
+  `reclaim_memory_object_if_unreferenced` for the final reclaim.
+- **Absent pages**: `unmap_range_two_phase` silently skips pages for which
+  `unmap_page_phase1` returns `Ok(None)` (PTE not present — demand paging never
+  faulted the page in).
+- **Active transfer semantics**: unchanged — the active mapping record is still cleared
+  before `revoke_capability_in_cnode` is called inside the purge path.
+
+### 29.4 Locking sequence
+
+Both callers hold the global lock throughout (single-CPU hosted-dev environment).
+Domain rank sequence for `unmap_range_two_phase`:
+1. vm rank 5 read (PTE lookup in `unmap_page_phase1`)
+2. memory rank 6 write (`note_mapping_removed` decrement)
+3. No cross-CPU TLB invalidation in hosted-dev (stub shootdown)
+4. memory rank 6 write (`reclaim_memory_object_for_phys` if unreferenced)
+
+### 29.5 Stage 10 acceptance
+
+Stage 10 (commit `b550353`) accepted — 647 tests pass (single-threaded), all
+MemoryObject cap/map/pin refcount invariants validated by 7 new tests.
+
+### 29.6 Still deferred
+
+- x86_64 SMP (>1 CPU) — requires lock-free or per-CPU demand-paging path.
+- Full global-lock removal.
+- COW/fork MemoryObject lifetime.
+- AArch64 smoke.
+- x86_64 SMP smoke (requested for Stage 10+11 together).
+
+### 29.7 Files changed (Stage 11)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/memory_state.rs` | `unmap_range_two_phase` helper added |
+| `src/kernel/boot/cnode_state.rs` | `purge_active_transfer_mappings_for_pid`: one-phase → `unmap_range_two_phase` |
+| `src/kernel/boot/capability_lifecycle_state.rs` | `revoke_active_transfer_mappings_for_cap`: one-phase → `unmap_range_two_phase` |
+| `src/kernel/boot/tests.rs` | 5 new Stage 11 tests |
+| `doc/KERNEL_LOCKING.md` | This section (§29): Stage 10 acceptance, Stage 11 audit |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+18 (Stage 11 test rules) |
