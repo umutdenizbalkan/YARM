@@ -1522,3 +1522,70 @@ must use `.iter()` directly and match on `CowPageRecord` fields, not `Option<Cow
 Every Stage 13 commit must pass `cargo test --lib -- --test-threads=1` with at
 least 667 tests (663 from Stage 12 + 4 new Stage 13 tests).
 `cargo check --no-default-features` must also be clean.
+
+## Rule N+21 — Stage 14: COW BTreeMap scalability + lifecycle stress tests
+
+### N+21.1 — Use stable helper API, not internal field access
+
+Tests must not access `memory.cow_pages` directly. Use the three `#[cfg(test)]`
+helpers on `KernelState`:
+
+- `state.cow_page_count()` — total records across all ASIDs
+- `state.cow_page_count_for_asid(asid)` — records for one ASID
+- `state.cow_asid_bucket_count()` — number of ASID keys in the BTreeMap
+
+This keeps tests stable against future storage changes.
+
+### N+21.2 — Empty bucket collapse is mandatory
+
+When the last virtual-address entry is cleared for an ASID (via
+`clear_cow_page` or `clear_cow_pages_for_asid`), the ASID's key must be
+removed from the BTreeMap immediately. Tests must assert
+`cow_asid_bucket_count()` decrements when a bucket empties.
+
+Ghost buckets (ASID key present but `BTreeSet` empty) are a violation of
+this invariant.
+
+### N+21.3 — Lifecycle stress: fork + exit cycles leave zero records
+
+Tests that fork and then exit (child-first or parent-first) must assert
+that `cow_page_count() == 0` and `cow_asid_bucket_count() == 0` after all
+tasks in the fork tree have been destroyed.
+
+### N+21.4 — ASID isolation: same virt addr in two ASIDs must not alias
+
+A test with two ASIDs both mapping `VirtAddr(X)` as COW must verify that
+`is_cow_page(asid_a, VirtAddr(X))` and `is_cow_page(asid_b, VirtAddr(X))` are
+independent — destroying or splitting one ASID's record must not affect the other.
+
+### N+21.5 — Large-ASID cleanup is O(log A), not O(N)
+
+A test must mark ≥ 50 virtual pages COW in one ASID and then call
+`clear_cow_pages_for_asid`. Assert that after the call:
+
+- `cow_page_count_for_asid(asid) == 0`
+- `cow_asid_bucket_count()` decrements by 1 (the ASID's bucket is removed)
+
+### N+21.6 — Duplicate insertion is idempotent (BTreeSet semantics)
+
+Marking the same `(asid, virt)` pair COW twice must not create duplicate
+records. Assert `cow_page_count_for_asid(asid) == 1` after two `mark_cow_page`
+calls on the same address.
+
+### N+21.7 — Helper tasks for cnode must use a separate ASID
+
+When a test spawns a helper task (e.g. for cnode allocation or IPC), it must
+pass `asid: Some(helper_asid)` where `helper_asid` is a dedicated address
+space created for that helper. Passing `asid: None` causes
+`spawn_user_task_from_image` to return `Err(UserMemoryFault)`.
+
+If the helper task's address space would be included in a COW clone, use a
+completely separate ASID so helper stack pages do not inflate the parent's
+COW record count.
+
+### N+21.8 — Full suite at 676+ tests (single-threaded)
+
+Every Stage 14 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 676 tests (667 from Stage 13 + 9 new Stage 14 tests).
+Both `cargo check --no-default-features` and `cargo check --features hosted-dev`
+must be clean.

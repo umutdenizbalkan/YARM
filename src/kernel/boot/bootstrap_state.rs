@@ -593,7 +593,7 @@ impl Bootstrap {
                     user_memory: store_kernel_value(UserMemoryStore::default()),
                     memory_objects: [None; MAX_MEMORY_OBJECTS],
                     brk_regions: [None; MAX_TASKS],
-                    cow_pages: alloc::vec::Vec::new(),
+                    cow_pages: alloc::collections::BTreeMap::new(),
                     #[cfg(test)]
                     cow_page_capacity_limit: None,
                     next_memory_object_id: 1,

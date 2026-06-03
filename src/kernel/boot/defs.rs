@@ -265,7 +265,7 @@ pub(crate) struct MemorySubsystem {
     pub(crate) user_memory: KernelStorage<UserMemoryStore>,
     pub(crate) memory_objects: [Option<MemoryObject>; MAX_MEMORY_OBJECTS],
     pub(crate) brk_regions: [Option<BrkRegionRecord>; MAX_TASKS],
-    pub(crate) cow_pages: alloc::vec::Vec<CowPageRecord>,
+    pub(crate) cow_pages: alloc::collections::BTreeMap<u16, alloc::collections::BTreeSet<u64>>,
     #[cfg(test)]
     pub(crate) cow_page_capacity_limit: Option<usize>,
     pub(crate) next_memory_object_id: u64,

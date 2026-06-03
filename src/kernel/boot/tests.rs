@@ -7006,12 +7006,8 @@ fn clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion() 
         Err(KernelError::MemoryObjectFull)
     );
 
-    let lingering_child_cow = state.with_memory_state(|memory| {
-        memory
-            .cow_pages
-            .iter()
-            .any(|entry| entry.asid != parent_asid)
-    });
+    let lingering_child_cow = state.cow_asid_bucket_count() > 0
+        && state.cow_page_count() != state.cow_page_count_for_asid(parent_asid);
     assert!(!lingering_child_cow);
 }
 
@@ -7410,15 +7406,9 @@ fn fork_failed_clone_leaves_no_parent_cow_records() {
 
     let _ = state.clone_user_address_space_cow(parent_asid); // expected to fail
 
-    let parent_cow_count = state.with_memory_state(|memory| {
-        memory
-            .cow_pages
-            .iter()
-            .filter(|e| e.asid == parent_asid)
-            .count()
-    });
     assert_eq!(
-        parent_cow_count, 0,
+        state.cow_page_count_for_asid(parent_asid),
+        0,
         "no parent COW records must linger after failed clone rollback"
     );
 }
@@ -7639,10 +7629,10 @@ fn cow_fault_preserves_parent_content_and_copies_to_child() {
 }
 
 #[test]
-fn cow_vec_grows_beyond_old_array_limit() {
-    // With the dynamic Vec, a clone of more than the old MAX_COW_PAGES (100)
+fn cow_tracked_beyond_old_array_limit() {
+    // With the indexed BTreeMap, a clone of more than the old MAX_COW_PAGES (100)
     // writable pages must succeed.  Each writable page produces two COW records
-    // (parent + child), so 110 pages = 220 records — beyond the old cap.
+    // (parent + child), so 110 pages = 220 records — beyond the old fixed cap.
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _) = state.create_user_address_space().expect("asid");
     state.register_task(62).expect("parent");
@@ -7661,15 +7651,23 @@ fn cow_vec_grows_beyond_old_array_limit() {
 
     let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone must succeed");
 
-    let cow_count = state.with_memory_state(|m| m.cow_pages.len());
-    assert_eq!(cow_count, 220, "110 writable pages × 2 sides = 220 COW records");
+    assert_eq!(
+        state.cow_page_count(),
+        220,
+        "110 writable pages × 2 sides = 220 COW records"
+    );
+    assert_eq!(
+        state.cow_asid_bucket_count(),
+        2,
+        "exactly 2 ASID buckets: parent + child"
+    );
 
     let _ = state.destroy_user_address_space_by_asid(child_asid);
 }
 
 #[test]
-fn cow_pages_vec_cleared_after_both_asids_destroyed() {
-    // Destroying child then parent ASID must clear all COW records from the Vec,
+fn cow_pages_map_cleared_after_both_asids_destroyed() {
+    // Destroying child then parent ASID must clear all COW records from the map,
     // leaving it empty — no slots are "leaked" the way a fixed-size array could.
     let mut state = Bootstrap::init().expect("init");
     let (parent_asid, _) = state.create_user_address_space().expect("asid");
@@ -7688,14 +7686,16 @@ fn cow_pages_vec_cleared_after_both_asids_destroyed() {
     }
 
     let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
-    assert_eq!(state.with_memory_state(|m| m.cow_pages.len()), 8, "4 pages × 2 = 8 records");
+    assert_eq!(state.cow_page_count(), 8, "4 pages × 2 = 8 records total");
+    assert_eq!(state.cow_asid_bucket_count(), 2, "2 ASID buckets after clone");
 
     state.destroy_user_address_space_by_asid(child_asid).expect("destroy child");
     assert_eq!(
-        state.with_memory_state(|m| m.cow_pages.iter().filter(|e| e.asid == child_asid).count()),
+        state.cow_page_count_for_asid(child_asid),
         0,
         "child COW records must be gone after child ASID destroyed"
     );
+    assert_eq!(state.cow_asid_bucket_count(), 1, "only parent bucket remains");
 
     // Restore parent write permissions so we can destroy it cleanly.
     for page in 0..4usize {
@@ -7703,14 +7703,385 @@ fn cow_pages_vec_cleared_after_both_asids_destroyed() {
         let _ = state.try_handle_cow_fault(parent_asid, va);
     }
     let _ = state.destroy_user_address_space_by_asid(parent_asid);
-    assert_eq!(
-        state.with_memory_state(|m| m.cow_pages.len()),
-        0,
-        "Vec must be empty after all ASIDs destroyed"
-    );
+    assert_eq!(state.cow_page_count(), 0, "map must be empty after all ASIDs destroyed");
+    assert_eq!(state.cow_asid_bucket_count(), 0, "no ASID buckets remain");
 }
 
 // ---------- End Stage 13 COW tests ----------
+
+// ---------- Stage 14: COW metadata lifecycle stress + scalability tests ----------
+
+#[test]
+fn cow_fork_exit_cycles_do_not_grow_metadata() {
+    // Repeated fork/destroy cycles must leave the COW map fully empty each time.
+    // If cleanup is wrong the bucket count grows monotonically.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(64).expect("parent");
+    state.bind_task_asid(64, parent_asid).expect("bind parent");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    for page in 0..3usize {
+        let va = VirtAddr(0x50_0000 + (page * PAGE_SIZE) as u64);
+        state
+            .map_user_page_in_asid_raw(parent_asid, va, Mapping { phys, flags: PageFlags::USER_RW })
+            .expect("map");
+    }
+
+    for cycle in 0..5usize {
+        let child_asid = state
+            .clone_user_address_space_cow(parent_asid)
+            .unwrap_or_else(|e| panic!("clone cycle {cycle} failed: {e:?}"));
+        assert_eq!(state.cow_asid_bucket_count(), 2, "cycle {cycle}: 2 buckets after clone");
+        state.destroy_user_address_space_by_asid(child_asid).expect("destroy child");
+        // After child destroy, parent still has its COW records; restore write
+        // permissions before next cycle so parent can be re-cloned.
+        for page in 0..3usize {
+            let va = VirtAddr(0x50_0000 + (page * PAGE_SIZE) as u64);
+            let _ = state.try_handle_cow_fault(parent_asid, va);
+            // Re-protect for next clone.
+            state
+                .map_user_page_in_asid_raw(
+                    parent_asid,
+                    va,
+                    Mapping { phys, flags: PageFlags::USER_RW },
+                )
+                .expect("re-map for next cycle");
+        }
+        assert_eq!(
+            state.cow_asid_bucket_count(),
+            0,
+            "cycle {cycle}: all buckets gone after restore"
+        );
+    }
+}
+
+#[test]
+fn cow_child_exits_first_parent_records_intact() {
+    // When the child ASID is destroyed first, the parent's COW records must remain.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(65).expect("parent");
+    state.bind_task_asid(65, parent_asid).expect("bind parent");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    state
+        .map_user_page_in_asid_raw(parent_asid, VirtAddr(0x1000), Mapping { phys, flags: PageFlags::USER_RW })
+        .expect("map");
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    assert_eq!(state.cow_page_count_for_asid(parent_asid), 1);
+    assert_eq!(state.cow_page_count_for_asid(child_asid), 1);
+
+    state.destroy_user_address_space_by_asid(child_asid).expect("destroy child");
+    assert_eq!(state.cow_page_count_for_asid(child_asid), 0, "child records gone");
+    assert_eq!(state.cow_page_count_for_asid(parent_asid), 1, "parent record intact");
+
+    // Parent's COW record is still active — is_cow_page must return true.
+    assert!(
+        state.is_cow_page(parent_asid, VirtAddr(0x1000)),
+        "parent page still COW-marked after child exits"
+    );
+}
+
+#[test]
+fn cow_parent_exits_first_child_records_intact() {
+    // When the parent ASID is destroyed first, the child's COW records must remain.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(66).expect("parent");
+    state.bind_task_asid(66, parent_asid).expect("bind parent");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    state
+        .map_user_page_in_asid_raw(parent_asid, VirtAddr(0x2000), Mapping { phys, flags: PageFlags::USER_RW })
+        .expect("map");
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+
+    state.destroy_user_address_space_by_asid(parent_asid).expect("destroy parent");
+    assert_eq!(state.cow_page_count_for_asid(parent_asid), 0, "parent records gone");
+    assert_eq!(state.cow_page_count_for_asid(child_asid), 1, "child record intact");
+
+    assert!(
+        state.is_cow_page(child_asid, VirtAddr(0x2000)),
+        "child page still COW-marked after parent exits"
+    );
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+#[test]
+fn cow_split_success_removes_faulting_record() {
+    // After try_handle_cow_fault succeeds, is_cow_page must return false for
+    // the faulting (asid, virt) — the COW record has been consumed.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 67,
+            entry: 0x6000,
+            asid: Some(parent_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("parent");
+    state.yield_current_to(ThreadId(67)).expect("switch to 67");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x3000), PageFlags::USER_RW)
+        .expect("map");
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+
+    assert!(state.is_cow_page(child_asid, VirtAddr(0x3000)), "child page is COW before fault");
+    state.try_handle_cow_fault(child_asid, VirtAddr(0x3000)).expect("cow fault");
+    assert!(
+        !state.is_cow_page(child_asid, VirtAddr(0x3000)),
+        "child COW record removed after successful split"
+    );
+    // Parent's COW record must still exist.
+    assert!(
+        state.is_cow_page(parent_asid, VirtAddr(0x3000)),
+        "parent COW record survives child split"
+    );
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+#[test]
+fn cow_both_sides_split_independently() {
+    // Both parent and child can COW-split independently; each split removes only
+    // that side's record; neither interferes with the other.
+    // Use a separate helper ASID for the spawned task so that stack pages in
+    // helper_asid do not bleed into parent_asid's COW record count.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("parent asid");
+    let (helper_asid, _) = state.create_user_address_space().expect("helper asid");
+    state.register_task(68).expect("parent task");
+    state.bind_task_asid(68, parent_asid).expect("bind parent");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 169,
+            entry: 0x7000,
+            asid: Some(helper_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("helper");
+    state.yield_current_to(ThreadId(169)).expect("switch to 169");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    // Map the test page directly in parent_asid; helper_asid stack pages
+    // are never COW-marked because we clone parent_asid, not helper_asid.
+    let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+    state
+        .map_user_page_in_asid_raw(parent_asid, VirtAddr(0x4000), Mapping { phys, flags: PageFlags::USER_RW })
+        .expect("map");
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    assert_eq!(state.cow_page_count(), 2);
+
+    // Child splits first.
+    state.try_handle_cow_fault(child_asid, VirtAddr(0x4000)).expect("child fault");
+    assert_eq!(state.cow_page_count(), 1, "child record gone, parent remains");
+    assert!(!state.is_cow_page(child_asid, VirtAddr(0x4000)));
+    assert!(state.is_cow_page(parent_asid, VirtAddr(0x4000)));
+
+    // Parent splits.
+    state.try_handle_cow_fault(parent_asid, VirtAddr(0x4000)).expect("parent fault");
+    assert_eq!(state.cow_page_count(), 0, "both records gone");
+    assert_eq!(state.cow_asid_bucket_count(), 0, "no ASID buckets remain");
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+#[test]
+fn cow_duplicate_mark_is_idempotent() {
+    // Marking the same (asid, virt) twice must not create duplicate records.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(69).expect("task");
+    state.bind_task_asid(69, asid).expect("bind");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    state
+        .map_user_page_in_asid_raw(asid, VirtAddr(0x5000), Mapping { phys, flags: PageFlags::USER_RW })
+        .expect("map");
+
+    // Manually mark the same page twice.
+    let child_asid = state.clone_user_address_space_cow(asid).expect("first clone");
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+
+    // Re-protect parent for second clone.
+    let phys2 = state
+        .with_user_spaces(|spaces| {
+            spaces.get(asid).and_then(|a| a.resolve(VirtAddr(0x5000))).map(|m| m.phys)
+        })
+        .unwrap_or(phys);
+    state
+        .map_user_page_in_asid_raw(asid, VirtAddr(0x5000), Mapping { phys: phys2, flags: PageFlags::USER_RW })
+        .expect("re-map");
+
+    let child_asid2 = state.clone_user_address_space_cow(asid).expect("second clone");
+    // Each (asid, virt) pair appears exactly once in the BTreeSet.
+    assert_eq!(state.cow_page_count_for_asid(asid), 1, "parent has exactly 1 record");
+    assert_eq!(state.cow_page_count_for_asid(child_asid2), 1, "child has exactly 1 record");
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid2);
+}
+
+#[test]
+fn cow_asid_isolation_lookup_not_confused() {
+    // Two ASIDs with the same virtual address marked COW must each see only
+    // their own record — cross-ASID confusion must not occur.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid_a, _) = state.create_user_address_space().expect("asid_a");
+    let (asid_b, _) = state.create_user_address_space().expect("asid_b");
+    state.register_task(70).expect("task_a");
+    state.bind_task_asid(70, asid_a).expect("bind a");
+    state.register_task(71).expect("task_b");
+    state.bind_task_asid(71, asid_b).expect("bind b");
+
+    let (_mo_a, cap_a) = state.alloc_anonymous_memory_object().expect("mo_a");
+    let phys_a = state.resolve_memory_object_phys(cap_a, PageFlags::USER_RW).expect("phys_a");
+    let (_mo_b, cap_b) = state.alloc_anonymous_memory_object().expect("mo_b");
+    let phys_b = state.resolve_memory_object_phys(cap_b, PageFlags::USER_RW).expect("phys_b");
+
+    // Both ASIDs map the same virtual address 0x6000 (to different phys frames).
+    state
+        .map_user_page_in_asid_raw(asid_a, VirtAddr(0x6000), Mapping { phys: phys_a, flags: PageFlags::USER_RW })
+        .expect("map a");
+    state
+        .map_user_page_in_asid_raw(asid_b, VirtAddr(0x6000), Mapping { phys: phys_b, flags: PageFlags::USER_RW })
+        .expect("map b");
+
+    let child_a = state.clone_user_address_space_cow(asid_a).expect("clone_a");
+    let child_b = state.clone_user_address_space_cow(asid_b).expect("clone_b");
+
+    // Mark ASID-A's page COW (it was done by clone); verify it doesn't bleed to ASID-B.
+    assert!(state.is_cow_page(asid_a, VirtAddr(0x6000)), "asid_a page is COW");
+    assert!(state.is_cow_page(asid_b, VirtAddr(0x6000)), "asid_b page is COW");
+    assert!(state.is_cow_page(child_a, VirtAddr(0x6000)), "child_a page is COW");
+    assert!(state.is_cow_page(child_b, VirtAddr(0x6000)), "child_b page is COW");
+
+    // Destroy child_a — must not affect asid_b or child_b records.
+    state.destroy_user_address_space_by_asid(child_a).expect("destroy child_a");
+    assert_eq!(state.cow_page_count_for_asid(child_a), 0, "child_a records gone");
+    assert_eq!(state.cow_page_count_for_asid(child_b), 1, "child_b record untouched");
+    assert_eq!(state.cow_page_count_for_asid(asid_b), 1, "asid_b record untouched");
+
+    let _ = state.destroy_user_address_space_by_asid(child_b);
+    let _ = state.destroy_user_address_space_by_asid(asid_a);
+    let _ = state.destroy_user_address_space_by_asid(asid_b);
+}
+
+#[test]
+fn cow_large_asid_clear_leaves_other_asid_intact() {
+    // Clearing an ASID with many COW pages must not disturb another ASID's records.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid_a, _) = state.create_user_address_space().expect("asid_a");
+    let (asid_b, _) = state.create_user_address_space().expect("asid_b");
+    state.register_task(72).expect("task_a");
+    state.bind_task_asid(72, asid_a).expect("bind a");
+    state.register_task(73).expect("task_b");
+    state.bind_task_asid(73, asid_b).expect("bind b");
+
+    let (_mo_a, cap_a) = state.alloc_anonymous_memory_object().expect("mo_a");
+    let phys_a = state.resolve_memory_object_phys(cap_a, PageFlags::USER_RW).expect("phys_a");
+    let (_mo_b, cap_b) = state.alloc_anonymous_memory_object().expect("mo_b");
+    let phys_b = state.resolve_memory_object_phys(cap_b, PageFlags::USER_RW).expect("phys_b");
+
+    // Map 50 pages in asid_a and 1 page in asid_b at different virtual addresses.
+    for page in 0..50usize {
+        let va = VirtAddr(0x70_0000 + (page * PAGE_SIZE) as u64);
+        state
+            .map_user_page_in_asid_raw(asid_a, va, Mapping { phys: phys_a, flags: PageFlags::USER_RW })
+            .expect("map a");
+    }
+    state
+        .map_user_page_in_asid_raw(asid_b, VirtAddr(0x80_0000), Mapping { phys: phys_b, flags: PageFlags::USER_RW })
+        .expect("map b");
+
+    let child_a = state.clone_user_address_space_cow(asid_a).expect("clone_a");
+    let child_b = state.clone_user_address_space_cow(asid_b).expect("clone_b");
+
+    assert_eq!(state.cow_page_count_for_asid(asid_a), 50);
+    assert_eq!(state.cow_page_count_for_asid(child_a), 50);
+    assert_eq!(state.cow_page_count_for_asid(asid_b), 1);
+    assert_eq!(state.cow_page_count_for_asid(child_b), 1);
+
+    // Destroy child_a (50-record bucket) — O(log num_asids) bucket removal.
+    state.destroy_user_address_space_by_asid(child_a).expect("destroy child_a");
+    assert_eq!(state.cow_page_count_for_asid(child_a), 0, "child_a records gone");
+    assert_eq!(state.cow_page_count_for_asid(asid_b), 1, "asid_b unaffected");
+    assert_eq!(state.cow_page_count_for_asid(child_b), 1, "child_b unaffected");
+
+    let _ = state.destroy_user_address_space_by_asid(child_b);
+    let _ = state.destroy_user_address_space_by_asid(asid_a);
+    let _ = state.destroy_user_address_space_by_asid(asid_b);
+}
+
+#[test]
+fn cow_map_empty_bucket_removed_after_last_entry_cleared() {
+    // When the last virt entry is removed from an ASID bucket, the bucket itself
+    // must be removed from the BTreeMap — no empty ghost buckets.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(74).expect("task");
+    state.bind_task_asid(74, parent_asid).expect("bind");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+    state
+        .map_user_page_in_asid_raw(parent_asid, VirtAddr(0x9000), Mapping { phys, flags: PageFlags::USER_RW })
+        .expect("map");
+
+    let (helper_asid75, _) = state.create_user_address_space().expect("helper asid75");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 75,
+            entry: 0xA000,
+            asid: Some(helper_asid75),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("helper task for cnode");
+    state.yield_current_to(ThreadId(75)).expect("switch to 75");
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    assert_eq!(state.cow_asid_bucket_count(), 2, "2 buckets after clone");
+
+    // COW-fault the child page: removes child's entry, collapses empty bucket.
+    state.try_handle_cow_fault(child_asid, VirtAddr(0x9000)).expect("child cow fault");
+    assert_eq!(state.cow_page_count_for_asid(child_asid), 0, "child entry removed");
+    assert_eq!(state.cow_asid_bucket_count(), 1, "empty child bucket collapsed");
+
+    // COW-fault the parent page (it re-mapped itself after the child split).
+    state.try_handle_cow_fault(parent_asid, VirtAddr(0x9000)).expect("parent cow fault");
+    assert_eq!(state.cow_page_count_for_asid(parent_asid), 0, "parent entry removed");
+    assert_eq!(state.cow_asid_bucket_count(), 0, "all buckets gone");
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+// ---------- End Stage 14 COW lifecycle + scalability tests ----------
 
 // ---------- End Stage 12 COW/fork tests ----------
 
