@@ -63,10 +63,20 @@ impl KernelState {
             if let Err(link_err) = self.record_delegated_capability_link(source_tid, source_cap, dest_tid, delegated_cap) {
                 // Delegation link table is full: roll back the already-minted cap to
                 // prevent a permanent slot leak in the destination cnode.
-                let _ = self.fast_revoke_reply_cap_in_cnode(dest_cnode, delegated_cap, attenuated.object);
+                //
+                // fast_revoke_reply_cap_in_cnode clears the cnode slot but does NOT
+                // adjust cap_refcount (it is intentionally named for Reply caps which
+                // carry no MemoryObject refcount).  For MemoryObject / DmaRegion caps,
+                // mint_capability_in_cnode already incremented cap_refcount, so we must
+                // decrement it here to keep the refcount symmetric.
+                let revoked = self.fast_revoke_reply_cap_in_cnode(dest_cnode, delegated_cap, attenuated.object);
+                if revoked {
+                    self.adjust_memory_object_cap_refcount(attenuated.object, -1);
+                    self.reclaim_memory_object_if_unreferenced(attenuated.object);
+                }
                 crate::yarm_log!(
-                    "GRANT_CAP_LINK_FAIL_ROLLBACK src_tid={} src_cap={} dest_tid={} dest_cap={} err={:?}",
-                    source_tid, source_cap.0, dest_tid, delegated_cap.0, link_err
+                    "GRANT_CAP_LINK_FAIL_ROLLBACK src_tid={} src_cap={} dest_tid={} dest_cap={} err={:?} revoked={}",
+                    source_tid, source_cap.0, dest_tid, delegated_cap.0, link_err, revoked
                 );
                 return Err(link_err);
             }

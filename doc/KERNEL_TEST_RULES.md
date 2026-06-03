@@ -1864,3 +1864,91 @@ must be clean.
 x86_64 `-smp 1` smoke is required after Stage 18 because
 `destroy_user_address_space_by_asid` changed the ordering of TlbShootdown
 submission relative to frame reclaim — a live ASID destroy behavior change.
+
+---
+
+## Rule N+26 — Stage 19: capability/cnode domain test rules
+
+### N+26.1 — cap_refcount symmetry: mint increments, revoke decrements
+
+Every call to `mint_capability_in_cnode` for a `CapObject::MemoryObject` or
+`CapObject::DmaRegion` must be paired with exactly one call that decrements
+`cap_refcount` by −1 (via `revoke_capability_in_cnode`,
+`revoke_capability_direct_in_process_cnode`, or the rollback path).
+
+A test must:
+1. Create a MemoryObject and verify `cap_refcount == 1` after the initial mint.
+2. Revoke the cap and verify `cap_refcount == 0` and the MemoryObject slot is
+   reclaimed.
+
+### N+26.2 — Reply caps carry no MemoryObject refcount
+
+`CapObject::Reply` is not a `MemoryObject`.  `adjust_memory_object_cap_refcount`
+must be a no-op for all cap objects that are not `MemoryObject` or `DmaRegion`.
+
+A test must mint a Reply cap and verify that no MemoryObject's `cap_refcount`
+changes.
+
+### N+26.3 — `revoke_reply_caps_for_caller` is idempotent
+
+Calling `revoke_reply_caps_for_caller(tid)` twice must not panic or double-decrement
+any counter.  The second call must return 0.
+
+### N+26.4 — `exit_task` clears ReplyCapRecords; `mark_task_dead` clears cnode
+
+`exit_task` calls `revoke_reply_caps_for_caller` synchronously before returning.
+A test must create a Reply cap record, call `exit_task`, and verify the record is
+gone.
+
+`mark_task_dead` additionally calls `maybe_cleanup_process_cnode_for_pid` which
+revokes all caps and reclaims MemoryObjects.  Tests that verify cnode teardown
+must use `mark_task_dead`, not `exit_task` (which sets `Exited`, not `Dead`).
+
+### N+26.5 — cnode teardown cascades through delegated descendants
+
+`revoke_capability_in_cnode` revokes the source cap and all delegation descendants
+via `collect_delegated_descendants`.  Each revoke decrements `cap_refcount` by 1.
+When all holders' cnodes are torn down, `cap_refcount` must reach 0 and the
+MemoryObject must be reclaimed.
+
+A test must:
+1. Grant a cap from task A to task B (cap_refcount = 2).
+2. Mark task A dead (triggers cnode teardown + cascade to task B's cap).
+3. Verify the MemoryObject slot is reclaimed (cap_refcount = 0).
+
+### N+26.6 — `grant_capability_task_to_task_with_rights` rollback must decrement cap_refcount
+
+When `record_delegated_capability_link` fails (delegation link table full), the
+rollback path in `grant_capability_task_to_task_with_rights` must:
+1. Call `fast_revoke_reply_cap_in_cnode` to clear the cnode slot.
+2. If the revoke succeeded, call `adjust_memory_object_cap_refcount(attenuated.object, -1)`
+   and `reclaim_memory_object_if_unreferenced(attenuated.object)`.
+
+Without step 2, `cap_refcount` is permanently inflated after each rollback.
+
+A test must fill the delegation link table, call `grant_capability_task_to_task_with_rights`,
+verify it returns `Err(CapabilityFull)`, and verify `cap_refcount` is unchanged from
+the pre-grant value.
+
+### N+26.7 — double revoke returns Err, not panic
+
+Revoking a cnode slot that is already empty must return `Err(InvalidCapability)`,
+not panic.  A test must revoke a cap, then attempt a second revoke of the same
+`CapId` and assert it returns an error.
+
+### N+26.8 — fork cap inheritance increments cap_refcount per inherited cap
+
+After `fork_user_process_cow`, each inherited cap in the child's cnode corresponds
+to one additional `cap_refcount` increment on the backing MemoryObject.  A test must
+fork with one MemoryObject cap in the parent and verify `cap_refcount == 2` after.
+
+### N+26.9 — Full suite at 757+ tests (single-threaded)
+
+Every Stage 19 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 757 tests (748 from Stage 18 + 9 new Stage 19 tests).
+Both `cargo check --no-default-features` and `cargo check --features hosted-dev`
+must be clean.
+
+x86_64 `-smp 1` smoke is NOT required after Stage 19: the changes are confined
+to capability/refcount accounting in hosted-dev paths with no cross-CPU or
+live-boot behavior changes.

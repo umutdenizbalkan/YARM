@@ -17522,4 +17522,296 @@ fn active_transfer_purge_is_idempotent() {
 
 // ── End Stage 18 TLB shootdown + cross-CPU VM cleanup tests ──────────────────
 
+// ── Stage 19: capability/cnode lifetime audit + cap_refcount symmetry ─────────
+
+#[test]
+fn cap_refcount_increment_on_mint() {
+    // mint_capability_in_cnode must increment cap_refcount to 1 for a freshly
+    // created MemoryObject that had cap_refcount=0 before the mint.
+    let mut state = Bootstrap::init().expect("init");
+    // alloc_anonymous_memory_object calls mint_capability_in_cnode internally and
+    // returns the (id, cap) pair.  cap_refcount must be 1 after the alloc.
+    let (mo_id, _cap) = state.alloc_anonymous_memory_object().expect("alloc");
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").cap_refcount,
+        1,
+        "cap_refcount must be 1 immediately after mint"
+    );
+}
+
+#[test]
+fn cap_refcount_decrement_on_revoke() {
+    // revoke_capability_in_cnode must decrement cap_refcount back to 0 and
+    // reclaim the MemoryObject slot.
+    let mut state = Bootstrap::init().expect("init");
+    let (mo_id, cap) = state.alloc_anonymous_memory_object().expect("alloc");
+    let cnode = state.current_task_cnode().expect("cnode");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot before revoke");
+    assert_eq!(state.memory.memory_objects[slot].expect("obj").cap_refcount, 1);
+
+    state.revoke_capability_in_cnode(cnode, cap).expect("revoke");
+
+    // cap_refcount reached 0 → MemoryObject must be reclaimed.
+    assert!(
+        state.memory_object_slot_by_id(mo_id).is_none(),
+        "MemoryObject must be reclaimed when cap_refcount reaches 0"
+    );
+}
+
+#[test]
+fn reply_cap_mint_does_not_increment_memory_object_refcount() {
+    // Reply caps reference a CapObject::Reply{index, generation}, NOT a
+    // MemoryObject.  adjust_memory_object_cap_refcount must be a no-op for
+    // non-MemoryObject cap objects.  Minting a Reply cap must not change any
+    // MemoryObject's cap_refcount.
+    let mut state = Bootstrap::init().expect("init");
+
+    // Create a MemoryObject so we can observe its cap_refcount.
+    let (mo_id, _mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    let refcount_before = state.memory.memory_objects[slot].expect("obj").cap_refcount;
+
+    // Create an endpoint so we have a valid RECEIVE cap for create_reply_cap_for_caller.
+    let (_eid, _send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+
+    // Mint a Reply cap into the current task's cnode (simulates ipc_call path).
+    let _reply_cap = state
+        .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+        .expect("reply cap created");
+
+    // The MemoryObject's cap_refcount must be unchanged — Reply caps have no MemoryObject.
+    let refcount_after = state.memory.memory_objects[slot].expect("obj").cap_refcount;
+    assert_eq!(
+        refcount_after, refcount_before,
+        "minting a Reply cap must not change MemoryObject cap_refcount"
+    );
+}
+
+#[test]
+fn revoke_reply_cap_record_clears_global_slot() {
+    // revoke_reply_caps_for_caller must clear all global ReplyCapRecord slots
+    // whose caller_tid matches the given tid.
+    let mut state = Bootstrap::init().expect("init");
+    let (_eid, _send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+
+    // Mint a Reply cap — this inserts a ReplyCapRecord for caller_tid=0.
+    let _reply_cap = state
+        .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+        .expect("reply cap");
+
+    // Revoke all reply cap records for caller 0.
+    let revoked = state.revoke_reply_caps_for_caller(0);
+    assert_eq!(revoked, 1, "must revoke exactly one reply cap record");
+
+    // A second call must return 0 (already cleared).
+    let revoked_again = state.revoke_reply_caps_for_caller(0);
+    assert_eq!(revoked_again, 0, "second revoke of already-cleared slot must return 0");
+}
+
+#[test]
+fn task_exit_clears_reply_cap_records() {
+    // When a caller task exits, mark_task_dead → exit_task path calls
+    // revoke_reply_caps_for_caller so that stale ReplyCapRecords pointing to
+    // the exited task are not left in the global array.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+
+    let (_eid, _send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+
+    // Mint a Reply cap for caller = task 0.
+    let _reply_cap = state
+        .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+        .expect("reply cap");
+
+    // Exit task 0 (the caller).
+    state.exit_task(0, 0).expect("exit");
+
+    // After exit, revoke_reply_caps_for_caller for tid=0 must return 0 because
+    // exit_task already cleared the records.
+    let remaining = state.revoke_reply_caps_for_caller(0);
+    assert_eq!(
+        remaining, 0,
+        "exit_task must clear reply cap records for the exiting task"
+    );
+}
+
+#[test]
+fn cnode_teardown_releases_all_cap_refcounts() {
+    // mark_task_dead triggers maybe_cleanup_process_cnode_for_pid which calls
+    // revoke_capability_in_cnode for every live slot.  revoke_capability_in_cnode
+    // cascades to delegated descendants — revoking the source cap also revokes the
+    // destination cap, applying two cap_refcount decrements.
+    //
+    // Invariant: after the source holder is marked dead:
+    //   - Source cap's cap_refcount decrement applied (−1).
+    //   - Delegated cap in dest cnode also revoked (−1).
+    //   - Total cap_refcount reaches 0 → MemoryObject is reclaimed.
+    //
+    // Note: exit_task sets status to Exited (not Dead) so maybe_cleanup_process_cnode_for_pid
+    // would skip it; mark_task_dead sets status Dead and calls the cleanup directly.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    // Grant cap to task 1 so task 1's cnode holds a reference.
+    let _cap_t1 = state
+        .grant_capability_task_to_task(0, mem_cap, 1)
+        .expect("grant to task1");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").cap_refcount,
+        2,
+        "source + delegated cap → cap_refcount must be 2"
+    );
+
+    // mark_task_dead: sets Dead status, then calls maybe_cleanup_process_cnode_for_pid.
+    // revoke_capability_in_cnode cascades: source revoke also revokes all
+    // delegated descendants (including task1's cap).  Both decrements apply,
+    // cap_refcount reaches 0, and the MemoryObject is reclaimed immediately.
+    state.mark_task_dead(0).expect("mark task0 dead");
+
+    // cap_refcount is now 0 because revoke_capability_in_cnode cascaded to
+    // the delegated cap in task1's cnode.  MemoryObject must be reclaimed.
+    assert!(
+        state.memory_object_slot_by_id(mo_id).is_none(),
+        "MemoryObject must be reclaimed after source-cap revoke cascades to all descendants"
+    );
+}
+
+#[test]
+fn double_revoke_capability_is_safe() {
+    // Revoking an already-revoked (empty) cnode slot must return Err, not panic,
+    // and must not double-decrement cap_refcount.
+    let mut state = Bootstrap::init().expect("init");
+    let (mo_id, cap) = state.alloc_anonymous_memory_object().expect("alloc");
+    let cnode = state.current_task_cnode().expect("cnode");
+
+    // First revoke: should succeed and reclaim the MemoryObject.
+    state.revoke_capability_in_cnode(cnode, cap).expect("first revoke");
+    assert!(state.memory_object_slot_by_id(mo_id).is_none(), "reclaimed after first revoke");
+
+    // Second revoke on the same now-empty slot: must return Err(InvalidCapability),
+    // not panic, and must not underflow any refcount.
+    let result = state.revoke_capability_in_cnode(cnode, cap);
+    assert!(
+        result.is_err(),
+        "second revoke of empty slot must return Err, not panic"
+    );
+}
+
+#[test]
+fn fork_cap_inheritance_increments_refcount() {
+    // After fork, both parent and child hold a cap to the same MemoryObject.
+    // cap_refcount must be 2 (one from parent's mint, one from child's inherited cap).
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 51,
+            entry: 0x9000,
+            asid: Some(parent_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("parent");
+    state.yield_current_to(ThreadId(51)).expect("switch to task51");
+
+    let (mo_id, _mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot before fork");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("mo").cap_refcount,
+        1,
+        "cap_refcount must be 1 before fork"
+    );
+
+    let _child_tid = state.fork_user_process_cow(51).expect("fork");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot after fork");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("mo").cap_refcount,
+        2,
+        "cap_refcount must be 2 after fork (parent + child cap)"
+    );
+}
+
+#[test]
+fn grant_cap_with_rights_link_fail_decrements_cap_refcount() {
+    // When grant_capability_task_to_task_with_rights rolls back because the
+    // delegation link table is full, it must decrement cap_refcount back to the
+    // pre-grant value.  Without the fix, the fast_revoke_reply_cap_in_cnode call
+    // in the rollback path cleared the cnode slot without decrementing refcount,
+    // causing a permanent cap_refcount leak.
+    std::thread::Builder::new()
+        .name("grant_cap_link_fail_rollback_decrements_refcount".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("task1");
+
+            let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+            // Record the cap_refcount before filling the link table.
+            let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+            let refcount_before_grant = state.memory.memory_objects[slot]
+                .expect("obj")
+                .cap_refcount;
+
+            // Fill the delegation link table with synthetic (unique) entries so
+            // that the next record_delegated_capability_link call fails with
+            // CapabilityFull.  We use (0, CapId(fake), 1, CapId(fake+1)) pairs
+            // with distinct CapId values to bypass the dedup check.
+            // hosted-dev uses 4096 slots; freestanding uses 2048.
+            let cap_base = 0x8000_0000u64; // outside normal cap range; won't clash
+            let mut filled = 0usize;
+            loop {
+                let src_cap = CapId(cap_base + filled as u64);
+                let dst_cap = CapId(cap_base + 0x1_0000_0000 + filled as u64);
+                let result = state.record_delegated_capability_link(0, src_cap, 1, dst_cap);
+                match result {
+                    Ok(()) => {
+                        filled += 1;
+                    }
+                    Err(KernelError::CapabilityFull) => break,
+                    Err(e) => panic!("unexpected error filling link table: {e:?}"),
+                }
+            }
+            assert!(filled > 0, "must have filled at least one link slot");
+
+            // Now grant_capability_task_to_task_with_rights will fail at the
+            // record_delegated_capability_link step (table full).  The rollback
+            // must restore cap_refcount to refcount_before_grant.
+            let result = state.grant_capability_task_to_task_with_rights(
+                0,
+                mem_cap,
+                1,
+                CapRights::READ | CapRights::MAP,
+            );
+            assert_eq!(
+                result,
+                Err(KernelError::CapabilityFull),
+                "grant must fail when link table is full"
+            );
+
+            // The cap_refcount on the MemoryObject must not have increased.
+            let slot = state.memory_object_slot_by_id(mo_id).expect("slot after rollback");
+            let refcount_after_rollback = state.memory.memory_objects[slot]
+                .expect("obj")
+                .cap_refcount;
+            assert_eq!(
+                refcount_after_rollback, refcount_before_grant,
+                "rollback must restore cap_refcount: before={refcount_before_grant} after={refcount_after_rollback}"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+// ── End Stage 19 capability/cnode lifetime audit tests ────────────────────────
+
 // ── End Stage 16 timeout/deadline/block-state tests ───────────────────────────
