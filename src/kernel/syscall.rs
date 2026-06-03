@@ -302,6 +302,19 @@ pub(crate) fn complete_blocked_recv_for_waiter(
         }
         Err(_) => {
             crate::yarm_log!("IPC_RECV_BLOCKED_COPY_META result=err len=40");
+            // Stage 20: the cap was already materialized into the receiver's cnode
+            // (and the envelope consumed) before this metadata copy faulted.  The
+            // message is being dropped and the receiver stays blocked, so roll back
+            // the freshly-minted cap to avoid a cnode-slot / cap_refcount leak (and,
+            // for Reply caps, a dangling global waiter_cap_id).
+            if let Some(materialized) = recv_local_transfer {
+                let is_reply = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
+                kernel.rollback_materialized_recv_cap(
+                    waiter_tid,
+                    CapId(materialized),
+                    is_reply,
+                );
+            }
             return Err(SyscallError::InvalidArgs);
         }
     }
@@ -1724,9 +1737,21 @@ fn handle_ipc_recv_result_with_empty_error(
                     msg.flags,
                     msg.sender_tid.0
                 );
-                kernel
-                    .copy_to_current_user(meta_ptr, &meta)
-                    .map_err(SyscallError::from)?;
+                if let Err(copy_err) = kernel.copy_to_current_user(meta_ptr, &meta) {
+                    // Stage 20: the cap was materialized into this (receiver/current)
+                    // task's cnode before this meta copy faulted.  Roll it back so the
+                    // dropped delivery does not leak a cnode slot / cap_refcount.
+                    if let Some(materialized) = recv_local_transfer {
+                        let is_reply = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
+                        kernel.rollback_materialized_recv_cap(
+                            receiver_tid,
+                            CapId(materialized),
+                            is_reply,
+                        );
+                        let _ = encode_transfer_cap_ret(frame, None);
+                    }
+                    return Err(SyscallError::from(copy_err));
+                }
             }
 
             if current_task_has_user_asid(kernel)? {
@@ -1827,6 +1852,17 @@ fn handle_ipc_recv_result_with_empty_error(
                 }
 
                 if user_len < app_payload.len() {
+                    // Stage 20: roll back the already-materialized cap before
+                    // dropping the message for an undersized user buffer.
+                    if let Some(materialized) = recv_local_transfer {
+                        let is_reply = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
+                        kernel.rollback_materialized_recv_cap(
+                            receiver_tid,
+                            CapId(materialized),
+                            is_reply,
+                        );
+                        let _ = encode_transfer_cap_ret(frame, None);
+                    }
                     return Err(SyscallError::InvalidArgs);
                 }
                 match kernel.copy_to_current_user(user_ptr, app_payload) {

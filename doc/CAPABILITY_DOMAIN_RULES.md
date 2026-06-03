@@ -105,6 +105,24 @@ Transfer envelopes live in the IPC domain (rank 3).  The capabilities they
 carry are materialized in the capability domain (rank 4) only after the
 envelope is taken, using the two-phase pattern.
 
+### 5.1 Materialize rollback on recv copy failure (Stage 20)
+
+The recv-delivery paths materialize the transferred/reply cap into the
+receiver's CNode (and consume the transfer envelope) **before** the
+metadata/payload `copy_to_user` that may fault.  If that copy fails, the
+message is dropped — so the materialized cap must be rolled back via
+`rollback_materialized_recv_cap` (the inverse of the materialization mint):
+
+- Reply cap → `fast_revoke_reply_cap_in_cnode` (no `cap_refcount`) + clear the
+  global `waiter_cap_id` (`clear_reply_cap_waiter_cap`, generation-guarded). The
+  `ReplyCapRecord` stays live; the reply remains re-deliverable.
+- Transfer cap → `revoke_capability_in_cnode` (removes delegation link,
+  decrements `cap_refcount`, reclaims if unreferenced).
+
+Rollback is idempotent: a second call returns `false` (slot already cleared) and
+never underflows `cap_refcount`.  The envelope itself is consumed exactly once;
+the rollback does not (and cannot) resurrect it.
+
 ---
 
 ## 6. Cap slot ownership
@@ -184,5 +202,6 @@ list triggers a double-mutable-borrow error because both calls borrow `state`.
 | Capability state (`self.capability.*`) | `capability_state.rs`, `capability_lifecycle_state.rs`, `cnode_state.rs`, `delegation_state.rs`, `capability_service_state.rs`, `task_core_state.rs` | **CLEAN** — all production accesses through `with_capability_state*`; two `#[cfg(test)]` exceptions acceptable |
 | IPC state (`self.ipc.*`) | All `src/kernel/boot/` files | **CLEAN after fixes** — two direct-access bugs found and fixed in `scheduler_state.rs` |
 | Scheduler state | `scheduler_state.rs`, `fault_state.rs` | **CLEAN** — no inappropriate cross-domain direct accesses |
+| IPC cap-transfer / reply-cap materialize | `transfer_state.rs`, `ipc_state.rs`, `syscall.rs` | **CLEAN after Stage 20 fix** — recv copy-fault now rolls back the materialized cap (§5.1); no mint/revoke under `ipc_state_lock` |
 
-Last audited: Stage 4T+1 (2026-06-01).
+Last audited: Stage 20 (2026-06-03).

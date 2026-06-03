@@ -1952,3 +1952,58 @@ must be clean.
 x86_64 `-smp 1` smoke is NOT required after Stage 19: the changes are confined
 to capability/refcount accounting in hosted-dev paths with no cross-CPU or
 live-boot behavior changes.
+
+## Rule N+27 — Stage 20: IPC cap-transfer / reply-cap / transfer-envelope test rules
+
+### N+27.1 — recv-delivery cap is materialized once; rolled back on copy failure
+
+Both recv-delivery paths materialize the transferred/reply cap into the receiver's
+cnode (and consume the transfer envelope) before the metadata/payload copy that may
+fault. A test must verify that on copy failure the materialized cap is rolled back:
+
+- Transfer cap: `rollback_materialized_recv_cap(receiver, cap, false)` clears the
+  receiver cnode slot AND decrements `cap_refcount` to the pre-materialization value.
+- Reply cap: `rollback_materialized_recv_cap(receiver, cap, true)` fast-revokes the
+  slot AND clears the global `waiter_cap_id`, leaving the `ReplyCapRecord` live.
+
+### N+27.2 — successful transfer materialization sets cap_refcount = 2
+
+A test must stash an envelope, take it, grant the source cap into the receiver, and
+verify the backing MemoryObject `cap_refcount == 2` (sender + receiver) and the
+envelope is consumed exactly once (a second take returns `None`).
+
+### N+27.3 — reply cap is one-shot; double revoke is a stable error
+
+A test must `ipc_reply` once (consuming the global `ReplyCapRecord`), then verify a
+second `ipc_reply` on the same `CapId` returns a stable error
+(`InvalidCapability`), never panics or underflows.
+
+### N+27.4 — transfer-envelope / mapping cleanup is idempotent
+
+A test must verify that a second `take_transfer_envelope` returns `None` without
+double-decrementing `pin_refcount`, that a second `rollback_materialized_recv_cap`
+returns `false` without underflowing `cap_refcount`, and that
+`remove_active_transfer_mapping` returns `false` for an already-removed mapping.
+
+### N+27.5 — `clear_reply_cap_waiter_cap` is generation-guarded
+
+A test must verify that clearing `waiter_cap_id` with a stale generation is ignored
+and with the matching generation succeeds.
+
+### N+27.6 — mapping registration does not change cap_refcount
+
+A test must verify `register_active_transfer_mapping` /
+`remove_active_transfer_mapping` leave the backing MemoryObject `cap_refcount`
+governed solely by cap mint/revoke (Invariant 11).
+
+### N+27.7 — Full suite at 767+ tests (single-threaded)
+
+Every Stage 20 commit must pass `cargo test --lib --features hosted-dev --
+--test-threads=1` with at least 767 tests (757 from Stage 19 + 10 new Stage 20
+tests). Both `cargo check --no-default-features` and `cargo check --features
+hosted-dev` must be clean, and `git diff --check` must be clean.
+
+x86_64 `-smp 1` smoke is NOT required after Stage 20: the only behavioral change is
+on the IPC recv copy-fault error path (a previously-leaking cnode slot is now
+revoked); the success path, syscall ABI, `SYSCALL_COUNT`, and SpawnV5 semantics are
+unchanged, and no cross-CPU, SMP, trap/timer/bootstrap, or live boot path is touched.

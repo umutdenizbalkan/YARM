@@ -17814,4 +17814,388 @@ fn grant_cap_with_rights_link_fail_decrements_cap_refcount() {
 
 // ── End Stage 19 capability/cnode lifetime audit tests ────────────────────────
 
+// ── Stage 20: IPC cap-transfer / reply-cap / transfer-envelope lifetime ───────
+
+#[test]
+fn stage20_transfer_cap_materialize_success_sets_cap_refcount_to_two() {
+    // Invariant 3/10: a successful transfer materialization (envelope take + grant
+    // into the receiver cnode) leaves the MemoryObject with cap_refcount == 2
+    // (sender's original cap + receiver's delegated cap) and consumes the envelope.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+    let endpoint = state
+        .current_task_capability(send_cap)
+        .expect("send cap")
+        .object;
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").cap_refcount,
+        1,
+        "cap_refcount must be 1 after alloc (sender only)"
+    );
+
+    let handle = state
+        .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, Some(ThreadId(1)), None)
+        .expect("stash");
+    // Take the envelope (recv side) then grant into the receiver's cnode, mirroring
+    // materialize_received_transfer_cap.
+    let envelope = state
+        .take_transfer_envelope(handle, endpoint, ThreadId(1))
+        .expect("take");
+    let source = state
+        .resolve_capability_for_task(envelope.source_tid.0, envelope.source_cap)
+        .expect("source cap");
+    let derived = state
+        .grant_capability_task_to_task_with_rights(
+            envelope.source_tid.0,
+            envelope.source_cap,
+            1,
+            source.rights(),
+        )
+        .expect("grant");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot after");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").cap_refcount,
+        2,
+        "cap_refcount must be 2 after transfer materialization"
+    );
+    // Envelope is consumed: a second take returns None.
+    assert!(
+        state.take_transfer_envelope(handle, endpoint, ThreadId(1)).is_none(),
+        "envelope must be consumed exactly once"
+    );
+    // The materialized cap is a fresh slot in the receiver cnode.
+    assert!(
+        state.task_capability(1, derived).is_some(),
+        "receiver must own materialized cap"
+    );
+}
+
+#[test]
+fn stage20_rollback_materialized_transfer_cap_restores_cap_refcount() {
+    // Invariant 3/4/12: rolling back a materialized transfer cap removes the cnode
+    // slot AND decrements cap_refcount back to the pre-materialization value.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    let before = state.memory.memory_objects[slot].expect("obj").cap_refcount;
+    assert_eq!(before, 1);
+
+    let derived = state
+        .grant_capability_task_to_task_with_rights(0, mem_cap, 1, CapRights::READ | CapRights::MAP)
+        .expect("grant");
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").cap_refcount,
+        2,
+        "cap_refcount must be 2 after grant"
+    );
+
+    // Roll back as the recv-delivery copy-failure path would.
+    let rolled = state.rollback_materialized_recv_cap(1, derived, false);
+    assert!(rolled, "transfer-cap rollback must clear a slot");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").cap_refcount,
+        before,
+        "rollback must restore cap_refcount to pre-grant value"
+    );
+    assert!(
+        state.task_capability(1, derived).is_none(),
+        "rolled-back cap must no longer exist in receiver cnode"
+    );
+}
+
+#[test]
+fn stage20_rollback_materialized_transfer_cap_double_call_is_harmless() {
+    // Invariant 12: double rollback (slot already cleared) must not underflow and
+    // must report no-op without panicking.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let derived = state
+        .grant_capability_task_to_task_with_rights(0, mem_cap, 1, CapRights::READ | CapRights::MAP)
+        .expect("grant");
+
+    assert!(state.rollback_materialized_recv_cap(1, derived, false));
+    // Second rollback: slot already gone (and the MemoryObject may be reclaimed).
+    let second = state.rollback_materialized_recv_cap(1, derived, false);
+    assert!(!second, "second rollback must be a no-op");
+    // Source cap still intact, refcount must not be underflowed below 1.
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").cap_refcount,
+        1,
+        "source cap_refcount must remain 1 after double rollback"
+    );
+}
+
+#[test]
+fn stage20_rollback_materialized_reply_cap_clears_slot_and_waiter_id() {
+    // Invariant 2/6: rolling back a materialized Reply cap fast-revokes the receiver
+    // cnode slot and clears the global waiter_cap_id, while the ReplyCapRecord stays
+    // live (the reply was never consumed by the mint).
+    std::thread::Builder::new()
+        .name("stage20_rollback_reply_cap".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            // create_reply_cap_for_caller mints the Reply cap into the caller's
+            // (current task 0) cnode and reserves global slot 0.
+            let reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+                .expect("create reply cap");
+            // The reserved global record is at index 0 for a fresh kernel.
+            let reply_index = 0usize;
+            assert!(state.reply_cap_record_present(reply_index));
+
+            // Simulate materialization: record the caller-local cap as the waiter cap
+            // (set_reply_cap_waiter_cap is what the recv path calls).
+            let reply_gen = state.with_ipc_state(|ipc| ipc.reply_cap_generations[reply_index]);
+            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap);
+            assert_eq!(
+                state.reply_cap_record_waiter_cap(reply_index),
+                Some(reply_cap),
+                "waiter_cap_id must be set after materialization"
+            );
+
+            // Roll back as a recv-delivery copy failure would.
+            let rolled = state.rollback_materialized_recv_cap(0, reply_cap, true);
+            assert!(rolled, "reply-cap rollback must clear the cnode slot");
+            assert_eq!(
+                state.reply_cap_record_waiter_cap(reply_index),
+                None,
+                "waiter_cap_id must be cleared after rollback"
+            );
+            assert!(
+                state.reply_cap_record_present(reply_index),
+                "ReplyCapRecord must remain live (reply not consumed by mint)"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage20_reply_cap_double_revoke_is_idempotent() {
+    // Invariant 2/12: ipc_reply revokes the one-shot reply cap; a second ipc_reply
+    // returns a stable error (InvalidCapability) without panic or underflow.
+    std::thread::Builder::new()
+        .name("stage20_reply_cap_double_revoke".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            let reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+                .expect("create reply cap");
+            let reply = Message::new(7, b"ok").expect("reply");
+            state.ipc_reply(reply_cap, reply).expect("first reply");
+            // Drain the delivered reply so the endpoint state is clean.
+            let _ = state.ipc_recv(recv_cap).expect("recv");
+            // Global record must be consumed.
+            assert!(
+                !state.reply_cap_record_present(0),
+                "ReplyCapRecord must be consumed after ipc_reply"
+            );
+            let replay = Message::new(7, b"no").expect("replay");
+            assert_eq!(
+                state.ipc_reply(reply_cap, replay),
+                Err(KernelError::InvalidCapability),
+                "second ipc_reply on a consumed reply cap must be a stable error"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage20_clear_reply_cap_waiter_cap_generation_guard() {
+    // Invariant 2: clear_reply_cap_waiter_cap is generation-guarded — a stale
+    // generation must not disturb a reused record.
+    std::thread::Builder::new()
+        .name("stage20_clear_waiter_cap_gen_guard".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            let reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+                .expect("create reply cap");
+            let reply_index = 0usize;
+            let reply_gen = state.with_ipc_state(|ipc| ipc.reply_cap_generations[reply_index]);
+            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap);
+            assert_eq!(state.reply_cap_record_waiter_cap(reply_index), Some(reply_cap));
+
+            // A clear with a stale generation must be ignored.
+            state.clear_reply_cap_waiter_cap(reply_index, reply_gen.wrapping_sub(1));
+            assert_eq!(
+                state.reply_cap_record_waiter_cap(reply_index),
+                Some(reply_cap),
+                "stale-generation clear must be ignored"
+            );
+            // A clear with the correct generation succeeds.
+            state.clear_reply_cap_waiter_cap(reply_index, reply_gen);
+            assert_eq!(state.reply_cap_record_waiter_cap(reply_index), None);
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage20_transfer_envelope_double_take_is_harmless() {
+    // Invariant 1/12: an envelope is consumed exactly once; a second take returns
+    // None and does not double-decrement the pin_refcount.
+    let mut state = Bootstrap::init().expect("init");
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+    let endpoint = state
+        .current_task_capability(send_cap)
+        .expect("send cap")
+        .object;
+
+    let handle = state
+        .stash_transfer_envelope(
+            ThreadId(0),
+            mem_cap,
+            endpoint,
+            None,
+            Some(TransferSharedRegion { offset: 0x2000, len: PAGE_SIZE as u64 }),
+        )
+        .expect("stash");
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    assert_eq!(state.memory.memory_objects[slot].expect("obj").pin_refcount, 1);
+
+    assert!(state.take_transfer_envelope(handle, endpoint, ThreadId(0)).is_some());
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").pin_refcount,
+        0,
+        "pin_refcount must drop to 0 after take"
+    );
+    // Second take is a no-op: returns None, pin_refcount stays 0 (no underflow).
+    assert!(state.take_transfer_envelope(handle, endpoint, ThreadId(0)).is_none());
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").pin_refcount,
+        0,
+        "double take must not underflow pin_refcount"
+    );
+}
+
+#[test]
+fn stage20_failed_transfer_send_cleans_envelope_and_keeps_refcount() {
+    // Invariant 1/3: ipc_send_with_cap_transfer error-path takes back the envelope
+    // (cleaned exactly once) and the source cap_refcount is unchanged (cap stays
+    // with the sender; nothing was minted into a receiver).
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+    let endpoint = state
+        .current_task_capability(send_cap)
+        .expect("send cap")
+        .object;
+
+    let before = {
+        let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+        state.memory.memory_objects[slot].expect("obj").cap_refcount
+    };
+
+    // Directly model the stash + error cleanup contract: stash, then take back.
+    let handle = state
+        .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, Some(ThreadId(1)), None)
+        .expect("stash");
+    let t_created = state.ipc_path_telemetry().transfer_records_created;
+    // Error path takes the envelope back with the bound receiver tid.
+    assert!(
+        state.take_transfer_envelope(handle, endpoint, ThreadId(1)).is_some(),
+        "error cleanup must take the envelope exactly once"
+    );
+    let t_mat = state.ipc_path_telemetry().transfer_records_materialized;
+    assert!(t_mat >= 1 && t_created >= 1);
+
+    let after = {
+        let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+        state.memory.memory_objects[slot].expect("obj").cap_refcount
+    };
+    assert_eq!(after, before, "failed transfer must not change source cap_refcount");
+}
+
+#[test]
+fn stage20_active_transfer_mapping_is_two_phase_and_refcount_safe() {
+    // Invariant 11: active-transfer mappings register/remove cleanly and the
+    // backing MemoryObject cap_refcount is governed only by cap mint/revoke, not by
+    // mapping registration.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let derived = state
+        .grant_capability_task_to_task_with_rights(0, mem_cap, 1, CapRights::READ | CapRights::MAP)
+        .expect("grant");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    let refcount = state.memory.memory_objects[slot].expect("obj").cap_refcount;
+    assert_eq!(refcount, 2);
+
+    state
+        .register_active_transfer_mapping(ThreadId(1), derived, VirtAddr(0x9000), PAGE_SIZE)
+        .expect("register");
+    // Registration must not change cap_refcount.
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").cap_refcount,
+        2,
+        "mapping registration must not touch cap_refcount"
+    );
+    assert!(state.active_transfer_mapping_for(ThreadId(1), derived).is_some());
+
+    assert!(state.remove_active_transfer_mapping(ThreadId(1), derived));
+    assert!(
+        state.active_transfer_mapping_for(ThreadId(1), derived).is_none(),
+        "mapping must be removed exactly once"
+    );
+    // Removal of a non-existent mapping is a harmless false.
+    assert!(!state.remove_active_transfer_mapping(ThreadId(1), derived));
+}
+
+#[test]
+fn stage20_reply_cap_creation_does_not_change_memory_cap_refcount() {
+    // Invariant 9/10: reply-cap creation mints a Reply object (no MemoryObject), so
+    // no MemoryObject cap_refcount changes; recv-v2 reply-cap metadata is unaffected
+    // by unrelated MemoryObject allocations.
+    std::thread::Builder::new()
+        .name("stage20_reply_cap_no_mem_refcount".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let (mo_id, _mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+            let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+            let before = state.memory.memory_objects[slot].expect("obj").cap_refcount;
+
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            let _reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+                .expect("create reply cap");
+
+            let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+            let after = state.memory.memory_objects[slot].expect("obj").cap_refcount;
+            assert_eq!(before, after, "reply-cap creation must not touch MemoryObject cap_refcount");
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
 // ── End Stage 16 timeout/deadline/block-state tests ───────────────────────────
