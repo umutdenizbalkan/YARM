@@ -303,16 +303,22 @@ impl KernelState {
             .with_user_spaces_mut(|spaces| spaces.create_user_space())
             .map_err(KernelError::Vm)?;
 
-        let cleanup_failed_child_clone = |state: &mut Self| {
-            let _ = state.destroy_user_address_space_by_asid(child_asid);
-        };
+        // Track parent pages we write-protected during the clone.  On any
+        // failure we must restore their write permission so the parent process
+        // can still write to those pages.  Without restoration a write would
+        // produce an unhandled fault (no COW record, no demand-page entry).
+        let mut wp_parent_virts: alloc::vec::Vec<VirtAddr> = alloc::vec::Vec::new();
 
         let mut index = 0usize;
-        while let Some(MappingEntry { virt, mapping }) = self.with_user_spaces(|spaces| {
-            spaces
-                .get(parent_asid)
-                .and_then(|aspace| aspace.mapping_at(index))
-        }) {
+        loop {
+            let maybe_entry = self.with_user_spaces(|spaces| {
+                spaces
+                    .get(parent_asid)
+                    .and_then(|aspace| aspace.mapping_at(index))
+            });
+            let Some(MappingEntry { virt, mapping }) = maybe_entry else {
+                break;
+            };
             let mut shared_flags = mapping.flags;
             if mapping.flags.write {
                 shared_flags.write = false;
@@ -324,9 +330,9 @@ impl KernelState {
                     phys: mapping.phys,
                     flags: shared_flags,
                 },
-            )
-            {
-                cleanup_failed_child_clone(self);
+            ) {
+                let _ = self.destroy_user_address_space_by_asid(child_asid);
+                self.restore_parent_write_permissions(parent_asid, &wp_parent_virts);
                 return Err(err);
             }
             if mapping.flags.write {
@@ -338,15 +344,21 @@ impl KernelState {
                         flags: shared_flags,
                     },
                 ) {
-                    cleanup_failed_child_clone(self);
+                    let _ = self.destroy_user_address_space_by_asid(child_asid);
+                    self.restore_parent_write_permissions(parent_asid, &wp_parent_virts);
                     return Err(err);
                 }
+                // Record the write-protected page before COW marking so the
+                // rollback covers it even if mark_cow_page(parent) fails.
+                wp_parent_virts.push(virt);
                 if let Err(err) = self.mark_cow_page(parent_asid, virt) {
-                    cleanup_failed_child_clone(self);
+                    let _ = self.destroy_user_address_space_by_asid(child_asid);
+                    self.restore_parent_write_permissions(parent_asid, &wp_parent_virts);
                     return Err(err);
                 }
                 if let Err(err) = self.mark_cow_page(child_asid, virt) {
-                    cleanup_failed_child_clone(self);
+                    let _ = self.destroy_user_address_space_by_asid(child_asid);
+                    self.restore_parent_write_permissions(parent_asid, &wp_parent_virts);
                     return Err(err);
                 }
             }
@@ -364,6 +376,37 @@ impl KernelState {
         }
 
         Ok(child_asid)
+    }
+
+    /// Restore write permission for each parent page that was write-protected
+    /// during a failed `clone_user_address_space_cow`.
+    ///
+    /// Calling `map_user_page_in_asid_raw` with `flags.write=true` both
+    /// restores the PTE write bit and clears any COW record that was added for
+    /// the page, leaving `map_refcount` and `cap_refcount` unchanged (net-zero
+    /// note_mapping_removed / note_mapping_inserted pair on the same frame).
+    fn restore_parent_write_permissions(
+        &mut self,
+        parent_asid: Asid,
+        wp_virts: &[VirtAddr],
+    ) {
+        for &virt in wp_virts {
+            let current = self.with_user_spaces(|spaces| {
+                spaces.get(parent_asid).and_then(|a| a.resolve(virt))
+            });
+            if let Some(mapping) = current {
+                let mut restored = mapping.flags;
+                restored.write = true;
+                let _ = self.map_user_page_in_asid_raw(
+                    parent_asid,
+                    virt,
+                    Mapping {
+                        phys: mapping.phys,
+                        flags: restored,
+                    },
+                );
+            }
+        }
     }
 
     pub(crate) fn try_handle_cow_fault(
@@ -384,6 +427,10 @@ impl KernelState {
         }
         let (_id, mem_cap) = self.alloc_anonymous_memory_object()?;
         let new_phys = self.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)?;
+        // NOTE (bare-metal TODO): on a real architecture the old page contents
+        // must be copied from `mapping.phys` to `new_phys` before remapping.
+        // In hosted-dev the VM memory is keyed by (asid, virt_addr), so the
+        // content survives the physical-frame swap without an explicit copy.
         let mut flags = mapping.flags;
         flags.write = true;
         self.map_user_page_in_asid_raw(

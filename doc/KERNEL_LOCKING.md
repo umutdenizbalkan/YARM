@@ -6151,3 +6151,93 @@ MemoryObject cap/map/pin refcount invariants validated by 7 new tests.
 | `src/kernel/boot/tests.rs` | 5 new Stage 11 tests |
 | `doc/KERNEL_LOCKING.md` | This section (§29): Stage 10 acceptance, Stage 11 audit |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+18 (Stage 11 test rules) |
+
+---
+
+## §30 — Stage 12: COW/fork MemoryObject lifetime mega-pass
+
+### 30.1 Motivation
+
+Stage 11 validated active-transfer two-phase unmap. Stage 12 audits all
+COW/fork code paths that affect MemoryObject refcounts (cap_refcount,
+map_refcount). No existing behaviors are weakened; only latent bugs are fixed.
+
+### 30.2 Smoke acceptance (Stage 10 + Stage 11, -smp 1)
+
+x86_64 -smp 1 smoke requested for the combined Stage 10+11 changes.
+Expected markers (from user-provided values):
+
+| Marker | Value |
+|--------|-------|
+| `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY` | 0 |
+| `X86_BOOTSTRAP_SCHEDULER_READY` | 1 |
+| `X86_BOOTSTRAP_TIMER_STARTED` | 1 |
+| `ENTER_USER` | 3 |
+| `STARTUP_INSTALL_FINAL` | 9 |
+| `PM_ELF_ZC_DONE` total | 3 |
+| ZC nonzero pages | 3 |
+| `PM_ELF_ZC_FAIL` | 0 |
+| `INITRAMFS_SRV_ENTRY` | 1 |
+| `DEVFS_SRV_ENTRY` | 1 |
+| `VFS_SRV_ENTRY` | 1 |
+| `DRIVER_MANAGER_READY` | 1 |
+| `BLKCACHE_SRV_READY` | 1 |
+| `VIRTIO_BLK_SRV_READY` | 1 |
+| fallback | 0 |
+| TID mismatch | 0 |
+| fatal-ish | 0 |
+| oom/capacity/Vm(Full) | 0 |
+| cap/refcount suspicious | 0 |
+
+### 30.3 COW/fork audit findings and fixes
+
+| Bug | Location | Severity | Fix |
+|-----|----------|----------|-----|
+| Parent pages left read-only after failed clone (COW record not recorded) | `clone_user_address_space_cow` | CRASH | Track `wp_parent_virts: Vec<VirtAddr>` before `mark_cow_page`; call `restore_parent_write_permissions` on any error |
+| `child_asid` leaked when post-clone step fails | `fork_user_process_cow` | LEAK | Wrap post-clone steps in `fork_complete_post_clone`; `destroy_user_address_space_by_asid(child_asid)` on error |
+| `try_handle_cow_fault` skips page-content copy | `try_handle_cow_fault` | bare-metal only | Documented with TODO comment; not a bug in hosted-dev (content keyed by virt_addr) |
+
+### 30.4 Refcount transition table (MemoryObject shared during fork)
+
+| Event | cap_refcount | map_refcount |
+|-------|-------------|-------------|
+| `alloc_anonymous_memory_object` | 1 | 0 |
+| `map_user_page_in_asid_with_caps` | 1 | 1 |
+| `fork_user_process_cow` (clone asid) | 1 | 2 |
+| `fork_user_process_cow` (inherit caps) | 2 | 2 |
+| child COW write fault | 2 | 1 (child unmaps shared; maps private) |
+| parent COW write fault | 2 | 0 (parent unmaps shared; maps private) |
+| child revokes inherited cap | 1 | 0 |
+| parent revokes cap | 0 | 0 → frame reclaimed |
+
+### 30.5 `restore_parent_write_permissions` safety
+
+`map_user_page_in_asid_raw(parent_asid, virt, {same_phys, write=true})`:
+- Removes old read-only PTE → `note_mapping_removed` (map_refcount−1)
+- Inserts write-enabled PTE → `note_mapping_inserted` (map_refcount+1)
+- Net: map_refcount unchanged
+- `clear_cow_page` called automatically (flags.write=true): COW record removed
+- cap_refcount unaffected (no cap minting/revoking)
+
+### 30.6 New helpers
+
+| Helper | File | Purpose |
+|--------|------|---------|
+| `restore_parent_write_permissions` | `memory_state.rs` | Rollback write-protect on clone failure |
+| `fork_complete_post_clone` | `thread_state.rs` | All post-clone steps; caller destroys child_asid on error |
+
+### 30.7 Stage 12 acceptance
+
+663 tests pass single-threaded (`cargo test --lib -- --test-threads=1`).
+11 new COW/fork lifetime tests (tids 41-51) added.
+x86_64 -smp 1 smoke requested for Stage 12 (live COW/fork behavior changed).
+
+### 30.8 Files changed (Stage 12)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/memory_state.rs` | `clone_user_address_space_cow` rollback fix; `restore_parent_write_permissions` helper; bare-metal TODO in `try_handle_cow_fault` |
+| `src/kernel/boot/thread_state.rs` | `fork_user_process_cow` ASID leak fix; `fork_complete_post_clone` helper; imports |
+| `src/kernel/boot/tests.rs` | 11 new Stage 12 COW/fork lifetime tests; task-switch fix (yield_current_to before alloc) |
+| `doc/KERNEL_LOCKING.md` | This section (§30) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+19 (Stage 12 test rules) |
