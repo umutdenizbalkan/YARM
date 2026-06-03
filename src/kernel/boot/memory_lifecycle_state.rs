@@ -118,4 +118,24 @@ impl KernelState {
             self.reclaim_memory_object_if_unreferenced(CapObject::MemoryObject { id });
         }
     }
+
+    /// Return `(cap_refcount, map_refcount, pin_refcount)` for the MemoryObject
+    /// backing `phys`, or `None` if the object has been reclaimed.
+    #[cfg(test)]
+    pub(crate) fn memory_object_refcounts(&self, phys: PhysAddr) -> Option<(u32, u32, u32)> {
+        self.with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|obj| obj.phys == phys)
+                .map(|obj| (obj.cap_refcount, obj.map_refcount, obj.pin_refcount))
+        })
+    }
+
+    /// Return true if a MemoryObject slot exists for `phys` (i.e., not reclaimed).
+    #[cfg(test)]
+    pub(crate) fn memory_object_exists_for_phys(&self, phys: PhysAddr) -> bool {
+        self.memory_object_refcounts(phys).is_some()
+    }
 }

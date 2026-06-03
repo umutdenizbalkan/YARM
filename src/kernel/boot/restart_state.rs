@@ -74,13 +74,17 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         let _ = self.revoke_reply_caps_for_caller(tid);
+        self.clear_ipc_waiters_for_tid(tid);
         self.report_task_exit_to_supervisor(tid, code, token)?;
         if let Some(robust) = robust {
+            // Use futex_wake_on_exit: the addresses come from the task's own
+            // robust list and are trusted user-space, but current_tid() may be
+            // a different task (e.g. supervisor) when exit is externally driven.
             let stride = core::mem::size_of::<usize>();
             let mut offset = 0usize;
             while offset < robust.len {
                 let addr = robust.head.saturating_add(offset.saturating_mul(stride));
-                let _ = self.futex_wake(addr, u32::MAX);
+                let _ = self.futex_wake_on_exit(addr);
                 offset += 1;
             }
         }
@@ -144,6 +148,7 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         let _ = self.revoke_reply_caps_for_caller(tid);
+        self.clear_ipc_waiters_for_tid(tid);
         let _ = self.release_kernel_context(tid);
         let _ = self.revoke_driver_runtime_caps(tid);
         self.maybe_cleanup_process_cnode_for_pid(process_pid);
