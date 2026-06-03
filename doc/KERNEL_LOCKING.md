@@ -6795,3 +6795,165 @@ x86_64 -smp 1 smoke required: live scheduler (WakeTask path) behavior changed.
 | `src/kernel/boot/tests.rs` | 20 new Stage 16 tests (TIDs 280–322) |
 | `doc/KERNEL_LOCKING.md` | §34 (this section) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+23 (Stage 16 test rules) |
+
+## §35 — Stage 17: cross-CPU work queue audit + scheduler wake-plan centralization
+
+### 35.1 Stage 16 smoke acceptance
+
+x86_64 -smp 1 smoke markers (required after Stage 16 WakeTask path changes):
+
+| Marker | Expected | Notes |
+|--------|----------|-------|
+| `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY` | 0 | full timer path |
+| `X86_BOOTSTRAP_SCHEDULER_READY` | 1 | |
+| `X86_BOOTSTRAP_TIMER_STARTED` | 1 | |
+| `ENTER_USER` | 3 | init + 2 servers |
+| `STARTUP_INSTALL_FINAL` | 9 | |
+| `PM_ELF_ZC_DONE total` | 3 | zero-copy ELF loads |
+| `ZC nonzero pages` | ≥3 | |
+| `PM_ELF_ZC_FAIL` | 0 | |
+| `INITRAMFS_SRV_ENTRY` | 1 | |
+| `DEVFS_SRV_ENTRY` | 1 | |
+| `VFS_SRV_ENTRY` | 1 | |
+| `DRIVER_MANAGER_READY` | 1 | |
+| `BLKCACHE_READY` | 1 | |
+| `VIRTIO_READY` | 1 | |
+| fallback | 0 | |
+| TID mismatch | 0 | |
+| fatal-ish | 0 | |
+| oom/capacity | 0 | |
+| cap/refcount suspicious | 0 | |
+
+### 35.2 Cross-CPU work domain audit results
+
+Audit performed at commit `1e5d96d` (Stage 16 baseline).
+
+#### WorkItem variants
+
+| Variant | Purpose | Stale-safe strategy |
+|---------|---------|---------------------|
+| `Reschedule` | Trigger context switch on target CPU | CPU-match guard: noop if `current_cpu() != cpu` |
+| `TlbShootdown { asid, va_range, requester, sequence }` | Request TLB invalidation | Retired-ASID check + sequence validated on ACK |
+| `TlbShootdownAck { sequence, from_cpu }` | Confirm TLB invalidation | Sequence-number guard: `wait.sequence != sequence` → skip |
+| `WakeTask { tid }` | Wake a blocked task | Status guard: non-Blocked states → silent no-op (Stage 16 + Stage 17) |
+
+#### Queue characteristics
+
+- **Type**: `CrossCpuWorkQueue` — 64-slot fixed ring buffer per CPU in `SmpMailbox`
+- **Lock**: `SpinLockIrq<WorkQueue>` — IRQ-safe spin lock
+- **Processing**: One item at a time, dequeued under `ipc_state_lock` (rank 3), then
+  lock released before `apply_cross_cpu_work` (allows TlbShootdownAck to re-acquire)
+- **Overflow**: `SmpError::QueueFull` returned to caller; no silent drops
+
+#### Lock-rank table for cross-CPU work
+
+| Operation | Locks acquired | Order |
+|-----------|---------------|-------|
+| `submit_cross_cpu_work` | `ipc_state_lock` (rank 3) → `CrossCpuWorkQueue` spinlock | 3 only |
+| `process_cross_cpu_work_for_cpu` dequeue | `ipc_state_lock` (rank 3) | 3 only |
+| `apply_cross_cpu_work` WakeTask | `task_state_lock` (rank 2) → scheduler (rank 1) | 2 → 1 |
+| `apply_cross_cpu_work` TlbShootdownAck | `ipc_state_lock` (rank 3) | 3 only |
+| `apply_cross_cpu_work` Reschedule | scheduler (rank 1) | 1 only |
+
+No lock-order violations found. Dequeue-then-release pattern prevents rank-3
+re-entry while holding rank-3.
+
+### 35.3 Production bug fixed (Stage 17)
+
+**`WorkItem::WakeTask` missing-TID propagation in `apply_cross_cpu_work`**:
+
+The Stage 16 `WakeTask` handler called `ok_or(KernelError::TaskMissing)?` when
+no TCB was found, propagating `TaskMissing` out of `process_cross_cpu_work_for_cpu`.
+A stale cross-CPU WakeTask item for a task whose TID was never registered (or whose
+slot was recycled with a different TID) would therefore cause the entire work-drain
+loop to fail with an error.
+
+**Fix**: Introduced `apply_cross_cpu_wake_task` (centralized helper) which returns
+`CrossCpuWakeApplyResult::SkippedMissing` as `Ok` for a missing TID.  The `WakeTask`
+arm now delegates to this helper; all `Skipped*` results are silent no-ops.
+
+### 35.4 CrossCpuWakeApplyResult enum
+
+`pub enum CrossCpuWakeApplyResult` in `src/kernel/smp.rs` makes wake-path semantics
+observable and testable:
+
+| Variant | Condition | Action |
+|---------|-----------|--------|
+| `Applied` | `Blocked(_)` | Status → `Runnable`, task enqueued |
+| `SkippedMissing` | TID not in TCB table | No-op (stale item) |
+| `SkippedDead` | `Dead` status | No-op (terminated) |
+| `SkippedExited` | `Exited(_)` status | No-op (terminated) |
+| `SkippedAlreadyRunnable` | `Runnable` status | No-op (duplicate wake) |
+| `SkippedRunning` | `Running` status | No-op (already active) |
+| `SkippedFaulted` | `Faulted` status | No-op (faulted, not schedulable) |
+
+### 35.5 Wake-plan invariants
+
+1. `apply_cross_cpu_wake_task` is the single canonical Blocked→Runnable transition
+   for cross-CPU WakeTask items.
+2. All non-`Applied` results are silent no-ops; no error is propagated.
+3. Only `Applied` triggers `enqueue_on_cpu`; all other results skip enqueue.
+4. A missing TID (`SkippedMissing`) is not an error; it is an expected consequence
+   of task termination racing with cross-CPU wake delivery.
+5. Faulted tasks are not woken; a WakeTask for a Faulted TID is silently dropped.
+6. The helper is `pub(crate)` and directly callable by tests to unit-test each variant.
+
+### 35.6 Test helpers added (Stage 17)
+
+| Helper | Location | Purpose |
+|--------|----------|---------|
+| `apply_cross_cpu_wake_task(cpu, tid)` | `scheduler_state.rs` | Centralized wake-plan; returns `CrossCpuWakeApplyResult` |
+| `cross_cpu_work_count_for_cpu(cpu)` | `ipc_state.rs` | Queue depth probe; returns 0 for out-of-range CPU |
+
+### 35.7 Stage 17 test inventory
+
+| Test | TID(s) | Verifies |
+|------|--------|---------|
+| `cross_cpu_wake_apply_result_missing_tid` | 330 (unregistered) | `SkippedMissing` returned, no error |
+| `cross_cpu_wake_apply_result_dead_task` | 331 | `SkippedDead`, task remains Dead |
+| `cross_cpu_wake_apply_result_exited_task` | 332 | `SkippedExited`, task remains Exited |
+| `cross_cpu_wake_apply_result_runnable_task` | 333 | `SkippedAlreadyRunnable`, task stays Runnable |
+| `cross_cpu_wake_apply_result_blocked_task_becomes_runnable` | 335 | `Applied`, task becomes Runnable |
+| `cross_cpu_wake_apply_result_faulted_task` | 353 | `SkippedFaulted`, no state change |
+| `cross_cpu_work_count_helper_tracks_submit_and_drain` | — | Helper counts 0→2→0 across submit/drain |
+| `cross_cpu_work_count_for_invalid_cpu_returns_zero` | — | Out-of-range CPU → 0, no panic |
+| `process_cross_cpu_work_missing_tid_not_an_error` | 336 (unregistered) | **Bug fix test**: missing TID does not cause Err |
+| `process_cross_cpu_work_dead_task_no_resurrection` | 337 | Dead task unaffected by WakeTask in queue |
+| `process_cross_cpu_work_exited_task_no_resurrection` | 338 | Exited task unaffected by WakeTask in queue |
+| `process_cross_cpu_work_blocked_task_becomes_runnable` | 340 | Blocked task woken via queue |
+| `process_cross_cpu_work_mixed_stale_fresh_items` | 341 (dead), 342 (blocked) | Stale+fresh in same drain; only fresh wakes |
+| `duplicate_wake_task_items_for_same_tid_are_harmless` | 343 | Two WakeTask items: first wakes, second no-op |
+| `repeated_wake_task_drain_cycles_no_stale_state` | 344–347 | 4 block→wake→check cycles, no stale state |
+| `repeated_exit_before_drain_no_resurrection` | 348–351 | 4 exit-then-drain cycles, no resurrection |
+| `work_queue_drains_fully_count_zero_after_drain` | — | 8 items → drain → count=0 |
+| `work_queue_full_then_drain_then_refill` | 5000–6063 | Fill→drain→refill×2, no wrap-around corruption |
+
+### 35.8 Deferred items
+
+- TLB shootdown test harness (requires multi-CPU address-space teardown, not testable in
+  single-CPU hosted-dev without a second CPU's inbox being serviced).
+- Futex timeout (timed futex_wait): not implemented.
+- Join timeout (timed join_thread): not implemented.
+- Full global-lock-removal: deferred.
+- x86_64 SMP (multi-core run-queue balancing): deferred.
+- RAMFS/FAT runtime spawning: untouched, deferred.
+
+### 35.9 Stage 17 acceptance
+
+728 tests pass single-threaded (`cargo test --lib -- --test-threads=1`).
+18 new Stage 17 tests added (TIDs 330–353 sparse).
+`cargo check --no-default-features` clean.
+`cargo check --features hosted-dev` clean.
+x86_64 -smp 1 smoke not required: no live scheduler/cross-CPU behavior changed for
+running tasks (missing-TID fix is a no-op path; no new code executes on the hot path).
+
+### 35.10 Files changed (Stage 17)
+
+| File | Change |
+|------|--------|
+| `src/kernel/smp.rs` | `CrossCpuWakeApplyResult` enum (7 variants) |
+| `src/kernel/boot/scheduler_state.rs` | `apply_cross_cpu_wake_task` centralized helper; `WakeTask` arm delegates to it |
+| `src/kernel/boot/ipc_state.rs` | `cross_cpu_work_count_for_cpu` test helper |
+| `src/kernel/boot/tests.rs` | 18 new Stage 17 tests (TIDs 330–353 sparse) |
+| `doc/KERNEL_LOCKING.md` | §35 (this section) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+24 (Stage 17 test rules) |

@@ -1700,3 +1700,57 @@ Every Stage 16 commit must pass `cargo test --lib -- --test-threads=1` with at
 least 710 tests (690 from Stage 15 + 20 new Stage 16 tests).
 Both `cargo check --no-default-features` and `cargo check --features hosted-dev`
 must be clean.
+
+## N+24 — Stage 17 cross-CPU work queue test rules
+
+### N+24.1 — apply_cross_cpu_wake_task must return a typed result for every status
+
+Tests for `apply_cross_cpu_wake_task` must assert the exact `CrossCpuWakeApplyResult`
+variant, not just that the call succeeds.  Each status variant (Missing, Dead, Exited,
+Runnable, Running, Faulted, Blocked→Applied) must have at least one test that checks
+the returned value and verifies post-call TCB state is unchanged (for Skipped variants)
+or correctly transitioned (for Applied).
+
+### N+24.2 — Missing TID must not propagate as an error
+
+`process_cross_cpu_work_for_cpu` must return `Ok` when the work queue contains a
+`WakeTask` item for an unregistered or previously-freed TID.  A test must submit such
+an item and assert the call returns `Ok` and the processed count includes that item.
+
+### N+24.3 — cross_cpu_work_count_for_cpu must track queue depth
+
+Tests that submit items to the work queue must verify queue depth before and after
+`process_cross_cpu_work_for_cpu` using `cross_cpu_work_count_for_cpu`.  Do not infer
+queue state only from side-effects on TCB status.
+
+### N+24.4 — Stale WakeTask items must not change TCB status
+
+When a WakeTask item targets a Dead, Exited, Runnable, Running, or Faulted task, the
+task's status must be identical before and after `process_cross_cpu_work_for_cpu`.
+Tests must assert the exact final status, not just that the task "still exists".
+
+### N+24.5 — Duplicate WakeTask items for the same TID are harmless
+
+Submitting two WakeTask items for the same TID must not cause a double-enqueue,
+panic, or status corruption.  The second item must be a silent no-op
+(`SkippedAlreadyRunnable`).  A test must assert processed count == 2 and final
+status == Runnable.
+
+### N+24.6 — Work queue must drain to zero count after process
+
+Every test that exercises `process_cross_cpu_work_for_cpu` must verify that
+`cross_cpu_work_count_for_cpu` returns 0 after the call.  Partial drain is not
+acceptable; the function must consume all pending items in one call.
+
+### N+24.7 — Wrap-around must not corrupt queue ordering
+
+A test that fills the queue to `MAX_CROSS_CPU_WORK`, drains it fully, and refills
+it again must verify that all items are processed in FIFO order and the count returns
+to 0 after each drain.  This guards against pointer-arithmetic bugs in the ring buffer.
+
+### N+24.8 — Full suite at 728+ tests (single-threaded)
+
+Every Stage 17 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 728 tests (710 from Stage 16 + 18 new Stage 17 tests).
+Both `cargo check --no-default-features` and `cargo check --features hosted-dev`
+must be clean.

@@ -15,6 +15,28 @@ pub enum SmpError {
     QueueFull,
 }
 
+/// Outcome returned by `KernelState::apply_cross_cpu_wake_task`.
+///
+/// Allows callers and tests to observe exactly which guard path was taken
+/// without inspecting TCB state after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossCpuWakeApplyResult {
+    /// Task was `Blocked(_)` → transitioned to `Runnable` and enqueued.
+    Applied,
+    /// No TCB found for the TID; stale item, silently dropped.
+    SkippedMissing,
+    /// TCB exists but status is `Dead`; stale wake item, silently dropped.
+    SkippedDead,
+    /// TCB exists but status is `Exited(_)`; stale wake item, silently dropped.
+    SkippedExited,
+    /// TCB exists but status is already `Runnable`; duplicate wake, silently dropped.
+    SkippedAlreadyRunnable,
+    /// TCB exists but status is `Running`; task is already active, silently dropped.
+    SkippedRunning,
+    /// TCB exists but status is `Faulted`; wake on faulted task, silently dropped.
+    SkippedFaulted,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkItem {
     Reschedule,
