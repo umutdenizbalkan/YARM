@@ -413,13 +413,14 @@ impl KernelState {
             if mapping_pid != owner_pid || mapping.transfer_cap != cap {
                 continue;
             }
+            // Stage 11: two-phase unmap. Absent pages silently skipped.
+            // cap_refcount is decremented by the caller (revoke_capability_in_cnode /
+            // revoke_capability_direct_in_process_cnode) AFTER this function returns,
+            // so reclaim_memory_object_for_phys inside execute_tlb_shootdown_wait_plan
+            // is a no-op (cap_refcount=1). Final reclaim happens when the caller calls
+            // reclaim_memory_object_if_unreferenced after decrementing cap_refcount.
             if let Some(asid) = self.task_asid(mapping.owner_tid.0) {
-                let mut va = mapping.base.0 as usize;
-                let end = va.saturating_add(mapping.len);
-                while va < end {
-                    let _ = self.unmap_user_page_in_asid(asid, VirtAddr(va as u64));
-                    va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
-                }
+                self.unmap_range_two_phase(asid, mapping.base.0 as usize, mapping.len);
             }
             self.with_ipc_state_mut(|ipc| ipc.active_transfer_mappings[idx] = None);
             self.note_shared_mem_released(mapping.len);

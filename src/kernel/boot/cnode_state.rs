@@ -235,13 +235,13 @@ impl KernelState {
             if owner_pid != pid && mapping.owner_tid.0 != pid {
                 continue;
             }
+            // Stage 11: two-phase unmap — PTE removal + map_refcount decrement in
+            // phase 1, then TLB shootdown + deferred frame reclaim in phase 2.
+            // Absent pages are silently skipped (unmap_range_two_phase tolerates them).
+            // Frame reclaim completes when revoke_capability_in_cnode (below) drops
+            // cap_refcount to 0 and calls reclaim_memory_object_if_unreferenced.
             if let Some(asid) = self.task_asid(mapping.owner_tid.0) {
-                let mut va = mapping.base.0 as usize;
-                let end = va.saturating_add(mapping.len);
-                while va < end {
-                    let _ = self.unmap_user_page_in_asid(asid, VirtAddr(va as u64));
-                    va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
-                }
+                self.unmap_range_two_phase(asid, mapping.base.0 as usize, mapping.len);
             }
             self.with_ipc_state_mut(|ipc| ipc.active_transfer_mappings[idx] = None);
             self.note_shared_mem_released(mapping.len);

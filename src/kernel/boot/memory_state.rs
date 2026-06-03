@@ -926,6 +926,32 @@ impl KernelState {
         Ok(())
     }
 
+    /// Stage 11: Two-phase unmap of a contiguous VA range.
+    ///
+    /// For each page in `[base, base + len)`: calls `unmap_page_phase1` (PTE
+    /// removal + `map_refcount--`), then `execute_tlb_shootdown_wait_plan`
+    /// (TLB shootdown + deferred frame reclaim). Absent pages are silently
+    /// skipped — `unmap_page_phase1` returns `Ok(None)` for them.
+    ///
+    /// Used by `purge_active_transfer_mappings_for_pid` and
+    /// `revoke_active_transfer_mappings_for_cap` to replace the old one-phase
+    /// `unmap_user_page_in_asid` pattern. Errors from either phase are swallowed
+    /// (same policy as the one-phase path they replace).
+    ///
+    /// Lock-domain flow (each page, no simultaneous acquisition):
+    ///   vm (5) → memory (6) → scheduler+task (1+2) [phase 1]
+    ///   ipc (3) → memory (6) [phase 2]
+    pub(crate) fn unmap_range_two_phase(&mut self, asid: Asid, base: usize, len: usize) {
+        let end = base.saturating_add(len);
+        let mut va = base;
+        while va < end {
+            if let Ok(Some(wait_plan)) = self.unmap_page_phase1(asid, VirtAddr(va as u64)) {
+                let _ = self.execute_tlb_shootdown_wait_plan(wait_plan);
+            }
+            va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
+        }
+    }
+
     pub fn protect_user_page(
         &mut self,
         aspace_map_cap: CapId,
