@@ -71,6 +71,24 @@ impl KernelState {
         })
     }
 
+    /// Return true if a TCB exists for `tid` regardless of status.
+    #[cfg(test)]
+    pub(crate) fn task_exists(&self, tid: u64) -> bool {
+        self.with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == tid))
+    }
+
+    /// Return true if the task is in `TaskStatus::Dead`.
+    #[cfg(test)]
+    pub(crate) fn task_is_dead(&self, tid: u64) -> bool {
+        self.task_status(tid) == Some(TaskStatus::Dead)
+    }
+
+    /// Return true if the task is in `TaskStatus::Exited(_)`.
+    #[cfg(test)]
+    pub(crate) fn task_is_exited(&self, tid: u64) -> bool {
+        matches!(self.task_status(tid), Some(TaskStatus::Exited(_)))
+    }
+
     #[cfg(test)]
     pub(crate) fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
         self.capability

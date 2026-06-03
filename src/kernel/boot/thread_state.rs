@@ -315,18 +315,10 @@ impl KernelState {
             }
             return Ok(None);
         };
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .ok_or(KernelError::TaskMissing)?;
-            if tcb.blocked_recv_state.take().is_some() {
-                crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=cancel", tid);
-            }
-            tcb.status = TaskStatus::Dead;
-            Ok::<_, KernelError>(())
-        })?;
+        // Delegate full cleanup to mark_task_dead: it sets Dead status, revokes
+        // reply caps, releases the kernel context, and triggers process-cnode
+        // cleanup once all threads in the group are Dead.
+        self.mark_task_dead(tid)?;
         Ok(Some(exit_code))
     }
 

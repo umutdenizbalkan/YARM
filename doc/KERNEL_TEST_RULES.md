@@ -1589,3 +1589,59 @@ Every Stage 14 commit must pass `cargo test --lib -- --test-threads=1` with at
 least 676 tests (667 from Stage 13 + 9 new Stage 14 tests).
 Both `cargo check --no-default-features` and `cargo check --features hosted-dev`
 must be clean.
+
+## N+22 — Stage 15 lifecycle test rules
+
+### N+22.1 — IPC waiter cleanup must be tested at exit and dead
+
+Every path that transitions a task to `Exited` or `Dead` must have at least one
+test verifying that `endpoint_waiter_count`, `sender_waiter_count`, and
+`notification_waiter_count` return zero for that task after the transition.
+
+### N+22.2 — join_thread must run full mark_task_dead cleanup
+
+A test must verify that calling `join_thread` on an already-`Exited` task
+results in `task_is_dead` returning true AND that process cnode cleanup
+(`YARM_PROC_CNODE_CLEANUP`) ran (i.e., `maybe_cleanup_process_cnode_for_pid`
+was called).  Inline `tcb.status = Dead` without calling `mark_task_dead` is
+forbidden.
+
+### N+22.3 — Robust futex wake must not depend on current_tid ASID
+
+Tests that call `exit_task` on a non-current task (supervisor-driven exit)
+must not fail due to ASID mismatch in the futex wake path.  Use
+`futex_wake_on_exit` (no ASID validation) for the robust list wake loop.
+
+### N+22.4 — Repeated lifecycle stress tests must not exhaust the frame pool
+
+Lifecycle stress tests that iterate more than once (fork/exit loops, futex
+wait/exit cycles) must not use `spawn_user_task_from_image` unless they also
+call `destroy_user_address_space_by_asid` to free user stack frames between
+iterations.  Prefer `register_task` (no user stack) when the test does not
+need a user address space.
+
+### N+22.5 — futex_waiter_count relies on TCB status, not a separate list
+
+`futex_waiter_count` counts tasks in `Blocked(WaitReason::Futex(addr))` status.
+Tests must not assume a separate futex waiter list is maintained.  A task that
+transitions from `Blocked(Futex)` to any other status is no longer counted.
+
+### N+22.6 — MemoryObject refcounts must drop to zero for reclaim
+
+A test that verifies MemoryObject reclamation must confirm both
+`cap_refcount == 0` (all capability handles revoked) and `map_refcount == 0`
+(all page-table entries unmapped) before checking
+`memory_object_exists_for_phys` returns false.
+
+### N+22.7 — Supervisor endpoint must receive task exit event
+
+When a supervisor endpoint is registered, `exit_task` must enqueue a
+`SUPERVISOR_OP_TASK_EXITED` message.  A test must verify the message is
+retrievable from the endpoint after `exit_task` completes.
+
+### N+22.8 — Full suite at 690+ tests (single-threaded)
+
+Every Stage 15 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 690 tests (676 from Stage 14 + 14 new Stage 15 tests).
+Both `cargo check --no-default-features` and `cargo check --features hosted-dev`
+must be clean.

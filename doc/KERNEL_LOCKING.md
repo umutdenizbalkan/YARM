@@ -6475,3 +6475,160 @@ x86_64 -smp 1 smoke required for Stage 14 (live COW fault metadata lookup behavi
 | `src/kernel/boot/tests.rs` | Stage 13 tests updated to use new helper API; 9 new Stage 14 tests |
 | `doc/KERNEL_LOCKING.md` | §31.6 Stage 13 smoke acceptance; this section (§32) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+21 (Stage 14 test rules) |
+
+## §33 — Stage 15: task/process lifecycle cleanup + exit/revoke/join/futex decomposition
+
+### 33.1 Stage 14 x86_64 -smp 1 smoke acceptance
+
+| Counter | Value |
+|---------|-------|
+| X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY | 0 |
+| X86_BOOTSTRAP_SCHEDULER_READY | 1 |
+| X86_BOOTSTRAP_TIMER_STARTED | 1 |
+| ENTER_USER | 3 |
+| STARTUP_INSTALL_FINAL | 9 |
+| PM_ELF_ZC_DONE total | 3 |
+| ZC nonzero pages | 3 |
+| PM_ELF_ZC_FAIL | 0 |
+| INITRAMFS_SRV_ENTRY | 1 |
+| DEVFS_SRV_ENTRY | 1 |
+| VFS_SRV_ENTRY | 1 |
+| DRIVER_MANAGER_READY | 1 |
+| BLKCACHE_SRV_READY | 1 |
+| VIRTIO_BLK_SRV_READY | 1 |
+| fallback | 0 |
+| TID mismatch | 0 |
+| fatal-ish | 0 |
+| oom/capacity | 0 |
+| cap/refcount suspicious | 0 |
+
+### 33.2 Lifecycle domain map
+
+Stage 15 audits and repairs three lifecycle cleanup gaps that existed before
+this stage:
+
+| Gap | Affected path | Root cause | Fix |
+|-----|--------------|------------|-----|
+| IPC waiter leak | `exit_task`, `mark_task_dead` | Neither path cleared `endpoint_waiters`, `endpoint_sender_waiters`, or `notification_waiters` for the exiting TID | Added `clear_ipc_waiters_for_tid` called from both paths |
+| Join cleanup bypass | `join_thread` when target already `Exited` | Set `Dead` status inline, skipping `mark_task_dead` and thus `maybe_cleanup_process_cnode_for_pid` | `join_thread` now calls `mark_task_dead` |
+| Robust futex ASID mismatch | `exit_task` robust futex wake loop | Called `futex_wake` which validates addresses against `current_tid()`'s ASID; fails silently when exit is externally driven | Added `futex_wake_on_exit` that skips ASID validation and calls `futex_wake_inner` directly |
+
+### 33.3 Lock-rank table (unchanged from Stage 14)
+
+| Domain | Rank |
+|--------|------|
+| scheduler | 1 |
+| task | 2 |
+| ipc | 3 |
+| capability | 4 |
+| vm | 5 |
+| memory | 6 |
+
+### 33.4 Cleanup ordering table
+
+`exit_task` ordering (must not reorder):
+
+1. Advance restart token counter (restart_state lock)
+2. Snapshot robust futex state and detach flag from TCB (task lock)
+3. Set `status = Exited(code)`, clear `blocked_recv_state` (task lock)
+4. `revoke_reply_caps_for_caller` (capability lock)
+5. `clear_ipc_waiters_for_tid` (ipc lock) ← Stage 15 addition
+6. `report_task_exit_to_supervisor` (ipc lock, sends message)
+7. Robust futex wake loop via `futex_wake_on_exit` (task lock per TCB)
+8. `wake_joiners_for` (task lock, sets joiners Runnable, enqueues)
+9. If self-exiting: `block_current_cpu` + `dispatch_next_task`
+10. If detached: `reap_if_detached` → `mark_task_dead`
+
+`mark_task_dead` ordering:
+
+1. Snapshot `thread_group_id` (task lock)
+2. Set `status = Dead`, clear `restart.token` (task lock)
+3. `revoke_reply_caps_for_caller` (capability lock)
+4. `clear_ipc_waiters_for_tid` (ipc lock) ← Stage 15 addition
+5. `release_kernel_context` (memory lock, frees kernel stack)
+6. `revoke_driver_runtime_caps` (capability lock)
+7. `maybe_cleanup_process_cnode_for_pid` (capability lock, revokes all caps)
+
+### 33.5 Wake-outside-lock plan
+
+`futex_wake_on_exit` is called from `exit_task` without holding any lock.  The
+wake path (`futex_wake_inner`) acquires the task lock internally per TCB to
+transition `Blocked(Futex(addr))` → `Runnable` and enqueue.  This is the same
+pattern as `futex_wake` and is safe.
+
+### 33.6 Path table
+
+| Call site | Calls `clear_ipc_waiters_for_tid`? | Calls `mark_task_dead`? |
+|-----------|-----------------------------------|------------------------|
+| `exit_task` | Yes (Stage 15) | No (caller calls later) |
+| `mark_task_dead` | Yes (Stage 15) | N/A |
+| `join_thread` (target Exited) | Via `mark_task_dead` (Stage 15) | Yes (Stage 15) |
+| `process_ipc_timeout_deadlines` | Yes (pre-existing) | No |
+
+### 33.7 Resource lifetime table
+
+| Resource | Created by | Freed by | When |
+|----------|-----------|---------|------|
+| Kernel stack | `provision_default_kernel_context` | `release_kernel_context` in `mark_task_dead` | On Dead |
+| CNode + capability space | `ensure_cnode_space_with_slots` | `maybe_cleanup_process_cnode_for_pid` in `mark_task_dead` | On Dead (last thread in group) |
+| IPC waiter slot | `futex_wait`, endpoint recv/send | `clear_ipc_waiters_for_tid` in `exit_task`/`mark_task_dead` | On Exited or Dead |
+| Reply cap | `ipc_call` | `revoke_reply_caps_for_caller` | On Exited or Dead |
+| Driver runtime caps | driver grant | `revoke_driver_runtime_caps` | On Dead |
+| User stack frames (raw) | `alloc_user_data_frame` in `spawn_user_task_from_image` | ASID destroy via page-table walk | On ASID destroy |
+| MemoryObject | `alloc_anonymous_memory_object` | `reclaim_memory_object_if_unreferenced` when refcounts → 0 | When all refs released |
+
+### 33.8 Stage 15 new functions
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `clear_ipc_waiters_for_tid` | `ipc_state.rs` | Remove TID from all IPC waiter arrays |
+| `futex_wake_on_exit` | `exec_state.rs` | Wake robust futex holders without ASID validation |
+| `futex_wake_inner` | `exec_state.rs` | Extracted wake logic shared by `futex_wake` and `futex_wake_on_exit` |
+| `endpoint_waiter_count` (test) | `ipc_state.rs` | Count receiver-blocked tasks on endpoint |
+| `sender_waiter_count` (test) | `ipc_state.rs` | Count sender-blocked tasks on endpoint |
+| `futex_waiter_count` (test) | `ipc_state.rs` | Count futex-blocked tasks at address |
+| `join_waiter_count` (test) | `ipc_state.rs` | Count join-blocked tasks for a target TID |
+| `task_exists` (test) | `task_core_state.rs` | Check TCB slot exists regardless of status |
+| `task_is_dead` (test) | `task_core_state.rs` | Check TCB is in Dead status |
+| `task_is_exited` (test) | `task_core_state.rs` | Check TCB is in Exited status |
+| `memory_object_refcounts` (test) | `memory_lifecycle_state.rs` | Return (cap, map, pin) refcount tuple |
+| `memory_object_exists_for_phys` (test) | `memory_lifecycle_state.rs` | Check MemoryObject slot is live |
+
+### 33.9 Stage 15 test inventory
+
+| Test | TID range | Verifies |
+|------|-----------|---------|
+| `exit_task_clears_endpoint_receiver_waiter_slot` | 200 | IPC receiver waiter cleared on exit |
+| `exit_task_clears_sender_waiter_slot` | 201, 202 | IPC sender waiter cleared on exit |
+| `exit_task_clears_notification_waiter_slot` | 203 | Notification waiter cleared on exit |
+| `mark_task_dead_clears_endpoint_receiver_waiter` | 210 | IPC receiver waiter cleared on dead |
+| `join_thread_calls_mark_task_dead_for_already_exited_target` | 220, 221 | Join → mark_task_dead runs process cnode cleanup |
+| `repeated_fork_exit_cycles_leave_no_cow_records` | 230, 231 | Fork/exit loop leaves no COW state |
+| `exit_without_joiner_does_not_crash` | 232 | Self-exit with no joiners is safe |
+| `repeated_futex_wait_exit_wake_cycles_no_stale_waiters` | 240–243 | Exit clears Futex-blocked status |
+| `memory_object_reclaimed_after_all_refs_released_on_task_exit` | 250 | MemoryObject reclaimed after cap+map refs drop to 0 |
+| `restart_task_re_enqueues_and_clears_exited_status` | 260, 261 | Restart transitions Exited → Runnable |
+| `supervisor_endpoint_receives_task_exit_event` | 270, 271 | Supervisor notified on exit |
+
+### 33.10 Stage 15 acceptance
+
+690 tests pass single-threaded (`cargo test --lib -- --test-threads=1`).
+14 new Stage 15 tests added.
+`cargo check --no-default-features` clean.
+`cargo check --features hosted-dev` clean.
+x86_64 -smp 1 smoke required: live lifecycle/scheduler/task behavior changed
+(IPC waiter cleanup, join cleanup, futex wake path).
+
+### 33.11 Files changed (Stage 15)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/ipc_state.rs` | `clear_ipc_waiters_for_tid`; 4 `#[cfg(test)]` count helpers |
+| `src/kernel/boot/restart_state.rs` | `exit_task`: add `clear_ipc_waiters_for_tid`; `futex_wake_on_exit` for robust list; `mark_task_dead`: add `clear_ipc_waiters_for_tid` |
+| `src/kernel/boot/exec_state.rs` | `futex_wake_on_exit`; extract `futex_wake_inner` |
+| `src/kernel/boot/thread_state.rs` | `join_thread`: call `mark_task_dead` instead of inline Dead set |
+| `src/kernel/boot/task_core_state.rs` | 3 `#[cfg(test)]` helpers: `task_exists`, `task_is_dead`, `task_is_exited` |
+| `src/kernel/boot/memory_lifecycle_state.rs` | 2 `#[cfg(test)]` helpers: `memory_object_refcounts`, `memory_object_exists_for_phys` |
+| `src/kernel/boot/tests.rs` | 14 new Stage 15 lifecycle tests (TIDs 200–270) |
+| `doc/KERNEL_LOCKING.md` | §33 (this section) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+22 (Stage 15 test rules) |

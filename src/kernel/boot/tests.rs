@@ -15319,3 +15319,506 @@ fn memory_domain_write_user_byte_goes_through_memory_lock_round_trip() {
         "write_user_byte / read_user_byte round-trip must preserve data through memory lock"
     );
 }
+
+// ── Stage 15: Task/process lifecycle stress tests ─────────────────────────────
+
+// ---------- Part A: IPC waiter cleanup on exit ----------
+
+#[test]
+fn exit_task_clears_endpoint_receiver_waiter_slot() {
+    // A task blocked on endpoint recv must be removed from endpoint_waiters
+    // when exit_task is called.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 200,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("spawn");
+    state.yield_current_to(ThreadId(200)).expect("switch");
+
+    let (ep_idx, ep_recv_cap, _ep_send_cap) = state.create_endpoint(8).expect("endpoint");
+
+    // Directly inject a waiter into the global endpoint_waiters slot and set
+    // the task's WaitReason to EndpointReceive (mirrors what ipc_recv does).
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(200));
+    });
+    state.with_tcbs_mut(|tcbs| {
+        let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 200).unwrap();
+        tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(ep_recv_cap));
+        Ok::<_, KernelError>(())
+    }).expect("set blocked");
+
+    assert_eq!(state.endpoint_waiter_count(ep_idx), 1, "waiter slot occupied before exit");
+
+    state.exit_task(200, 0).expect("exit");
+
+    assert_eq!(
+        state.endpoint_waiter_count(ep_idx),
+        0,
+        "waiter slot must be cleared by exit_task"
+    );
+}
+
+#[test]
+fn exit_task_clears_notification_waiter_slot() {
+    // A task blocked on notification recv must be removed from notification_waiters.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 201,
+            entry: 0x4000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("spawn");
+    state.yield_current_to(ThreadId(201)).expect("switch");
+
+    let (notif_idx, _notif_cap, _notif_recv) = state.create_notification(4).expect("notif");
+
+    // Inject the task as a notification waiter.
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(crate::kernel::ipc::ThreadId(201));
+    });
+
+    let waiter_before = state.with_ipc_state(|ipc| ipc.notification_waiters[notif_idx]);
+    assert!(waiter_before.is_some(), "notification waiter slot occupied before exit");
+
+    state.exit_task(201, 0).expect("exit");
+
+    let waiter_after = state.with_ipc_state(|ipc| ipc.notification_waiters[notif_idx]);
+    assert!(
+        waiter_after.is_none(),
+        "notification waiter slot must be cleared by exit_task"
+    );
+}
+
+#[test]
+fn mark_task_dead_clears_endpoint_waiter_slot() {
+    // mark_task_dead must also clear IPC waiter slots.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(202).expect("task");
+
+    let (ep_idx, _ep_recv_cap, _ep_send_cap) = state.create_endpoint(4).expect("endpoint");
+
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(202));
+    });
+
+    assert_eq!(state.endpoint_waiter_count(ep_idx), 1, "before");
+
+    state.mark_task_dead(202).expect("dead");
+
+    assert_eq!(
+        state.endpoint_waiter_count(ep_idx),
+        0,
+        "endpoint waiter must be cleared by mark_task_dead"
+    );
+}
+
+// ---------- Part B: join_thread triggers full cleanup ----------
+
+#[test]
+fn join_thread_reap_triggers_process_cnode_cleanup() {
+    // When join_thread completes on an already-Exited target, mark_task_dead
+    // must be called, triggering maybe_cleanup_process_cnode_for_pid.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 210,
+            entry: 0x5000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("leader");
+    state.dispatch_next_task().expect("dispatch");
+    // Spawn a joiner thread in the same process.
+    let joiner = state.spawn_user_thread(210, 0xCAFE_2000, 0x8200_0000, 0x5010).expect("joiner");
+    while state.current_tid() != Some(joiner) {
+        state.yield_current().expect("yield");
+    }
+
+    // Block joiner on join.
+    let join_result = state.join_thread(210).expect("join pending");
+    assert_eq!(join_result, None);
+    assert_eq!(state.join_waiter_count(210), 1, "joiner blocked");
+
+    // Leader exits.
+    state.exit_task(210, 42).expect("exit leader");
+    assert_eq!(state.task_is_exited(210), true, "leader is Exited");
+    // Joiners should be woken.
+    assert_eq!(state.join_waiter_count(210), 0, "joiner woken");
+
+    // Joiner is now runnable; switch to it and call join_thread to reap.
+    while state.current_tid() != Some(joiner) {
+        state.yield_current().expect("yield to joiner");
+    }
+    let code = state.join_thread(210).expect("join reap");
+    assert_eq!(code, Some(42), "exit code returned");
+    assert_eq!(state.task_is_dead(210), true, "leader is Dead after join");
+
+    // Process cnode for 210's PID must be cleaned up once joiner also exits.
+    let pid = state.process_id(joiner).expect("pid");
+    state.mark_thread_detached(joiner).expect("detach");
+    state.exit_task(joiner, 0).expect("exit joiner");
+    assert_eq!(
+        state.process_cnode_for_pid(pid),
+        None,
+        "process cnode must be cleaned up after all threads dead"
+    );
+}
+
+#[test]
+fn join_thread_immediate_reap_when_target_already_exited() {
+    // join_thread on a target that exited before the join call should immediately
+    // transition to Dead and return the exit code.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 211,
+            entry: 0x5000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("leader");
+    state.dispatch_next_task().expect("dispatch");
+    let joiner = state.spawn_user_thread(211, 0xCAFE_3000, 0x8300_0000, 0x5010).expect("joiner");
+    state.dispatch_next_task().expect("dispatch2");
+
+    // Exit leader before joiner calls join.
+    state.exit_task(211, 77).expect("exit");
+    assert_eq!(state.task_is_exited(211), true);
+
+    // Joiner calls join: target already Exited → immediate reap.
+    let code = state.join_thread(211).expect("join immediate");
+    assert_eq!(code, Some(77));
+    assert_eq!(state.task_is_dead(211), true, "must be Dead after immediate join");
+    assert_eq!(state.join_waiter_count(211), 0, "no stale join waiters");
+
+    // Cleanup the joiner.
+    state.mark_thread_detached(joiner).expect("detach");
+    state.exit_task(joiner, 0).expect("exit joiner");
+}
+
+// ---------- Part C: Robust futex wake on external exit ----------
+
+#[test]
+fn robust_futex_wake_works_when_exit_is_externally_driven() {
+    // futex_wake_on_exit must wake tasks blocked on robust futex addresses
+    // even when the caller of exit_task is not the exiting task (external exit).
+    // In hosted-dev we simulate this by making the exiting task not current.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid_waiter, _) = state.create_user_address_space().expect("asid_waiter");
+    let (asid_victim, _) = state.create_user_address_space().expect("asid_victim");
+
+    // Spawn the waiter task (TID 220) in asid_waiter.
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 220,
+            entry: 0x4000,
+            asid: Some(asid_waiter),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("waiter");
+    // Spawn the victim task (TID 221) in asid_victim.
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 221,
+            entry: 0x4100,
+            asid: Some(asid_victim),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("victim");
+
+    // Make waiter current.
+    state.yield_current_to(ThreadId(220)).expect("switch to 220");
+
+    // Register a robust futex on victim with a known user-space address.
+    let futex_addr: usize = 0x6000;
+    // Map a page in victim's ASID so the address is valid for victim.
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+    state
+        .map_user_page_in_asid_raw(
+            asid_victim,
+            VirtAddr(futex_addr as u64),
+            Mapping { phys, flags: PageFlags::USER_RW },
+        )
+        .expect("map futex page");
+
+    // Register robust futex list for victim.
+    state.set_robust_futex_head(221, futex_addr, 1).expect("robust");
+
+    // Block waiter on the futex address by directly setting TCB status.
+    state.with_tcbs_mut(|tcbs| {
+        let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 220).unwrap();
+        tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(futex_addr as u64)));
+        Ok::<_, KernelError>(())
+    }).expect("block waiter");
+
+    assert_eq!(state.futex_waiter_count(futex_addr), 1, "one waiter before exit");
+
+    // Exit victim while waiter (220) is current — simulates external exit.
+    // The current task is 220, not 221.
+    assert!(state.current_tid() != Some(221), "exit is externally driven");
+    state.exit_task(221, 0).expect("exit victim");
+
+    // The robust futex wake in exit_task must have woken the waiter.
+    assert_eq!(
+        state.futex_waiter_count(futex_addr),
+        0,
+        "waiter must be woken by robust futex cleanup even on external exit"
+    );
+    assert!(
+        matches!(
+            state.task_status(220),
+            Some(TaskStatus::Runnable) | Some(TaskStatus::Running)
+        ),
+        "waiter must be Runnable after wake"
+    );
+}
+
+// ---------- Part D: Lifecycle stress: repeated fork/exit cycles ----------
+
+#[test]
+fn repeated_fork_exit_cycles_leave_no_cow_records() {
+    // Fork + destroy child without COW split + destroy parent: all COW records
+    // must be cleared after each full cycle.
+    let mut state = Bootstrap::init().expect("init");
+
+    for i in 0..3u64 {
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        let tid = 230 + i;
+        state.register_task(tid).expect("task");
+        state.bind_task_asid(tid, asid).expect("bind");
+
+        let (_mo, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+        state
+            .map_user_page_in_asid_raw(asid, VirtAddr(0x6000), Mapping { phys, flags: PageFlags::USER_RW })
+            .expect("map");
+
+        let child_asid = state.clone_user_address_space_cow(asid).expect("clone");
+        assert_eq!(state.cow_page_count(), 2, "2 records after clone");
+
+        // Destroy both ASIDs (simulating parent + child exit with no COW split).
+        let _ = state.destroy_user_address_space_by_asid(child_asid);
+        let _ = state.destroy_user_address_space_by_asid(asid);
+
+        assert_eq!(state.cow_page_count(), 0, "0 records after both destroyed");
+        assert_eq!(state.cow_asid_bucket_count(), 0, "no buckets after cleanup");
+    }
+}
+
+#[test]
+fn exit_task_does_not_leave_stale_join_waiters_when_no_joiner() {
+    // exit_task on a task with no joiners must not panic or corrupt anything.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(231).expect("task");
+    state.exit_task(231, 0).expect("exit with no joiners");
+    assert_eq!(state.join_waiter_count(231), 0, "no stale waiters");
+}
+
+#[test]
+fn joiner_exits_while_waiting_does_not_leave_stale_waiter() {
+    // If the joiner exits before the target exits, wake_joiners_for must not
+    // try to wake a dead task.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 232,
+            entry: 0x5000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("leader");
+    state.dispatch_next_task().expect("dispatch");
+    let joiner = state.spawn_user_thread(232, 0xCAFE_4000, 0x8400_0000, 0x5010).expect("joiner");
+    while state.current_tid() != Some(joiner) {
+        state.yield_current().expect("yield");
+    }
+    // Block joiner in Join wait.
+    state.with_tcbs_mut(|tcbs| {
+        let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == joiner).unwrap();
+        tcb.status = TaskStatus::Blocked(WaitReason::Join(ThreadId(232)));
+        Ok::<_, KernelError>(())
+    }).expect("block joiner");
+    assert_eq!(state.join_waiter_count(232), 1, "joiner waiting");
+
+    // Joiner exits before target.
+    state.exit_task(joiner, 1).expect("joiner exits first");
+    // The joiner's status changes from Blocked(Join) to Exited; no longer counted.
+    assert_eq!(state.join_waiter_count(232), 0, "joiner no longer in join wait");
+
+    // Target exits now: wake_joiners_for must find no blocked joiners.
+    state.exit_task(232, 2).expect("target exits");
+    // Should not crash.
+}
+
+#[test]
+fn repeated_futex_wait_exit_wake_cycles_no_stale_waiters() {
+    // Repeated: block task on futex, exit task, verify waiter count is zero.
+    // Uses register_task (no user stack) so the MemoryObject table is not
+    // exhausted across iterations.
+    let mut state = Bootstrap::init().expect("init");
+    let futex_addr: usize = 0x7000;
+
+    for i in 0..4u64 {
+        let tid = 240 + i;
+        state.register_task(tid).expect("register");
+
+        // Directly block the task on the futex without going through the
+        // futex_wait syscall path (which would copy_from_user in freestanding).
+        state
+            .with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(futex_addr as u64)));
+                Ok::<_, KernelError>(())
+            })
+            .expect("block");
+        assert_eq!(state.futex_waiter_count(futex_addr), 1, "one waiter i={i}");
+
+        // exit_task transitions status to Exited, so futex_waiter_count drops
+        // to zero because the Blocked(Futex) pattern no longer matches.
+        state.exit_task(tid, 0).expect("exit");
+        assert_eq!(
+            state.futex_waiter_count(futex_addr),
+            0,
+            "no stale futex waiters after exit i={i}"
+        );
+
+        state.mark_task_dead(tid).expect("dead");
+    }
+}
+
+#[test]
+fn memory_object_reclaimed_after_all_refs_released_on_task_exit() {
+    // A MemoryObject should be reclaimed once cap_refcount, map_refcount, and
+    // pin_refcount all drop to zero after the owning task exits and is reaped.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 250,
+            entry: 0x5000,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("task");
+    state.yield_current_to(ThreadId(250)).expect("switch");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+    state
+        .map_user_page_in_asid_raw(asid, VirtAddr(0x8000), Mapping { phys, flags: PageFlags::USER_RW })
+        .expect("map");
+
+    let (cap_ref, map_ref, _pin_ref) = state.memory_object_refcounts(phys).expect("refcounts");
+    assert!(cap_ref >= 1, "cap_refcount must be at least 1");
+    assert!(map_ref >= 1, "map_refcount must be at least 1");
+
+    // Kill the task; after mark_task_dead, process cnode cleanup revokes caps and
+    // unmaps pages, dropping both refcounts to 0 and reclaiming the frame.
+    state.exit_task(250, 0).expect("exit");
+    state.mark_task_dead(250).expect("dead");
+
+    // Object must be reclaimed (slot cleared) once all refs are zero.
+    assert!(
+        !state.memory_object_exists_for_phys(phys),
+        "MemoryObject must be reclaimed after all refs released on task exit"
+    );
+}
+
+#[test]
+fn asid_cow_metadata_cleared_on_address_space_destroy() {
+    // destroy_user_address_space_by_asid must clear all COW records for the ASID.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(260).expect("task");
+    state.bind_task_asid(260, asid).expect("bind");
+
+    let (_mo, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+    state
+        .map_user_page_in_asid_raw(asid, VirtAddr(0x9000), Mapping { phys, flags: PageFlags::USER_RW })
+        .expect("map");
+
+    let child_asid = state.clone_user_address_space_cow(asid).expect("clone");
+    assert_eq!(state.cow_page_count_for_asid(asid), 1, "parent has COW record");
+    assert_eq!(state.cow_page_count_for_asid(child_asid), 1, "child has COW record");
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+    assert_eq!(state.cow_page_count_for_asid(child_asid), 0, "child records cleared");
+    assert_eq!(state.cow_page_count_for_asid(asid), 1, "parent record intact");
+
+    let _ = state.destroy_user_address_space_by_asid(asid);
+    assert_eq!(state.cow_page_count(), 0, "all records cleared");
+    assert_eq!(state.cow_asid_bucket_count(), 0, "no buckets remain");
+}
+
+#[test]
+fn mark_task_dead_on_already_dead_task_is_safe() {
+    // Calling mark_task_dead twice on the same task must not panic or corrupt state.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(261).expect("task");
+    state.mark_task_dead(261).expect("first dead");
+    // TCB still exists but status is Dead; second call should be ok.
+    // (mark_task_dead checks TaskMissing only if the TCB is absent)
+    let result = state.mark_task_dead(261);
+    // Either Ok or TaskMissing is acceptable — must not panic.
+    let _ = result;
+}
+
+// ---------- Part E: IPC endpoint / sender waiter cleanup ----------
+
+#[test]
+fn exit_task_clears_sender_waiter_slot() {
+    // A task blocked on endpoint send must be removed from endpoint_sender_waiters.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(270).expect("task");
+
+    let (ep_idx, _ep_recv_cap, _ep_send_cap) = state.create_endpoint(4).expect("endpoint");
+
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+            tid: crate::kernel::ipc::ThreadId(270),
+            msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
+        });
+    });
+
+    assert_eq!(state.sender_waiter_count(ep_idx), 1, "sender waiter before exit");
+
+    state.exit_task(270, 0).expect("exit");
+
+    assert_eq!(
+        state.sender_waiter_count(ep_idx),
+        0,
+        "sender waiter slot must be cleared by exit_task"
+    );
+}
+
+// ── End Stage 15 lifecycle tests ──────────────────────────────────────────────

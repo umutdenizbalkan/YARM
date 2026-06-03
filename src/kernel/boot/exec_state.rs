@@ -816,6 +816,28 @@ impl KernelState {
 
     pub fn futex_wake(&mut self, addr: usize, max_wake: u32) -> Result<u32, KernelError> {
         self.validate_current_user_futex_word(addr)?;
+        self.futex_wake_inner(addr, max_wake)
+    }
+
+    /// Wake futex waiters without `copy_from_user` address validation.
+    ///
+    /// Used by the robust-futex cleanup path in `exit_task`: the exiting task
+    /// registered the robust list addresses itself, so they are trusted user-space
+    /// addresses.  Using `futex_wake` directly from `exit_task` would use the
+    /// *current* task's ASID for validation (which may be the supervisor, not the
+    /// exiting task), causing the wake to fail silently.
+    pub(crate) fn futex_wake_on_exit(&mut self, addr: usize) -> Result<u32, KernelError> {
+        if addr == 0 {
+            return Err(KernelError::WrongObject);
+        }
+        let end = addr.checked_add(core::mem::size_of::<u32>() - 1);
+        if end.is_none_or(|end| end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE) {
+            return Err(KernelError::UserMemoryFault);
+        }
+        self.futex_wake_inner(addr, u32::MAX)
+    }
+
+    fn futex_wake_inner(&mut self, addr: usize, max_wake: u32) -> Result<u32, KernelError> {
         if max_wake == 0 {
             return Ok(0);
         }

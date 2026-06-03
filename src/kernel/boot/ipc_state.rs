@@ -97,6 +97,90 @@ impl KernelState {
         })
     }
 
+    /// Remove `tid` from all IPC waiter slots.
+    ///
+    /// Must be called on task exit and death so a dead task cannot be found as
+    /// a pending receiver, sender, or notification waiter.  The IPC timeout
+    /// path (`process_ipc_timeout_deadlines`) performs the same clearance for
+    /// timed-out tasks; this helper applies the same logic unconditionally.
+    pub(crate) fn clear_ipc_waiters_for_tid(&mut self, tid: u64) {
+        let tid = crate::kernel::ipc::ThreadId(tid);
+        self.with_ipc_state_mut(|ipc| {
+            for waiter in ipc.endpoint_waiters.iter_mut() {
+                if *waiter == Some(tid) {
+                    *waiter = None;
+                }
+            }
+            for queue in ipc.endpoint_sender_waiters.iter_mut() {
+                for slot in queue.iter_mut() {
+                    if slot.as_ref().is_some_and(|w| w.tid == tid) {
+                        *slot = None;
+                    }
+                }
+            }
+            for waiter in ipc.notification_waiters.iter_mut() {
+                if *waiter == Some(tid) {
+                    *waiter = None;
+                }
+            }
+        });
+    }
+
+    /// Count non-None endpoint_waiters slots for test assertions.
+    #[cfg(test)]
+    pub(crate) fn endpoint_waiter_count(&self, endpoint_idx: usize) -> usize {
+        self.with_ipc_state(|ipc| {
+            if ipc.endpoint_waiters.get(endpoint_idx).and_then(|w| *w).is_some() {
+                1
+            } else {
+                0
+            }
+        })
+    }
+
+    /// Count non-None sender_waiter slots for a given endpoint for test assertions.
+    #[cfg(test)]
+    pub(crate) fn sender_waiter_count(&self, endpoint_idx: usize) -> usize {
+        self.with_ipc_state(|ipc| {
+            ipc.endpoint_sender_waiters
+                .get(endpoint_idx)
+                .map_or(0, |q| q.iter().filter(|s| s.is_some()).count())
+        })
+    }
+
+    /// Count tasks blocked with WaitReason::Futex on `addr` for test assertions.
+    #[cfg(test)]
+    pub(crate) fn futex_waiter_count(&self, addr: usize) -> usize {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        use crate::kernel::vm::VirtAddr;
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .filter(|tcb| {
+                    tcb.status
+                        == TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))
+                })
+                .count()
+        })
+    }
+
+    /// Count tasks blocked with WaitReason::Join(target_tid) for test assertions.
+    #[cfg(test)]
+    pub(crate) fn join_waiter_count(&self, target_tid: u64) -> usize {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .filter(|tcb| {
+                    tcb.status
+                        == TaskStatus::Blocked(WaitReason::Join(
+                            crate::kernel::ipc::ThreadId(target_tid),
+                        ))
+                })
+                .count()
+        })
+    }
+
     fn clear_ipc_timeout_for_tid(&mut self, tid: u64) -> Result<(), KernelError> {
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
