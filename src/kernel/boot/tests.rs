@@ -16571,4 +16571,421 @@ fn repeated_recv_block_timeout_delivery_no_stale_timeout() {
     }
 }
 
+// ── Stage 17: cross-CPU work queue audit + scheduler wake-plan tests ──────────
+
+// Part A — CrossCpuWakeApplyResult variant coverage
+
+#[test]
+fn cross_cpu_wake_apply_result_missing_tid() {
+    // TID 330 is never registered; apply_cross_cpu_wake_task must return
+    // SkippedMissing without error (stale WakeTask for a non-existent TID).
+    let mut state = Bootstrap::init().expect("init");
+    let result = state
+        .apply_cross_cpu_wake_task(CpuId(0), ThreadId(330))
+        .expect("no error for missing TID");
+    assert_eq!(
+        result,
+        crate::kernel::smp::CrossCpuWakeApplyResult::SkippedMissing,
+        "missing TID must return SkippedMissing"
+    );
+}
+
+#[test]
+fn cross_cpu_wake_apply_result_dead_task() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(331).expect("register");
+    state.mark_task_dead(331).expect("dead");
+
+    let result = state
+        .apply_cross_cpu_wake_task(CpuId(0), ThreadId(331))
+        .expect("no error for dead task");
+    assert_eq!(
+        result,
+        crate::kernel::smp::CrossCpuWakeApplyResult::SkippedDead
+    );
+    assert!(state.task_is_dead(331), "task must remain Dead");
+}
+
+#[test]
+fn cross_cpu_wake_apply_result_exited_task() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(332).expect("register");
+    state.exit_task(332, 0).expect("exit");
+
+    let result = state
+        .apply_cross_cpu_wake_task(CpuId(0), ThreadId(332))
+        .expect("no error for exited task");
+    assert_eq!(
+        result,
+        crate::kernel::smp::CrossCpuWakeApplyResult::SkippedExited
+    );
+    assert!(state.task_is_exited(332), "task must remain Exited");
+}
+
+#[test]
+fn cross_cpu_wake_apply_result_runnable_task() {
+    // register_task creates the TCB in Runnable status.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(333).expect("register");
+    assert!(state.task_is_runnable(333));
+
+    let result = state
+        .apply_cross_cpu_wake_task(CpuId(0), ThreadId(333))
+        .expect("no error for runnable task");
+    assert_eq!(
+        result,
+        crate::kernel::smp::CrossCpuWakeApplyResult::SkippedAlreadyRunnable
+    );
+    assert!(state.task_is_runnable(333), "task must remain Runnable");
+}
+
+#[test]
+fn cross_cpu_wake_apply_result_blocked_task_becomes_runnable() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(335).expect("register");
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 335).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::Poll);
+            Ok::<_, KernelError>(())
+        })
+        .expect("set blocked");
+
+    let result = state
+        .apply_cross_cpu_wake_task(CpuId(0), ThreadId(335))
+        .expect("apply");
+    assert_eq!(
+        result,
+        crate::kernel::smp::CrossCpuWakeApplyResult::Applied
+    );
+    assert!(state.task_is_runnable(335), "task must be Runnable after Applied");
+}
+
+#[test]
+fn cross_cpu_wake_apply_result_faulted_task() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(353).expect("register");
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 353).unwrap();
+            tcb.status = TaskStatus::Faulted;
+            Ok::<_, KernelError>(())
+        })
+        .expect("set faulted");
+
+    let result = state
+        .apply_cross_cpu_wake_task(CpuId(0), ThreadId(353))
+        .expect("no error for faulted task");
+    assert_eq!(
+        result,
+        crate::kernel::smp::CrossCpuWakeApplyResult::SkippedFaulted
+    );
+}
+
+// Part B — cross_cpu_work_count_for_cpu helper
+
+#[test]
+fn cross_cpu_work_count_helper_tracks_submit_and_drain() {
+    let mut state = Bootstrap::init().expect("init");
+
+    assert_eq!(
+        state.cross_cpu_work_count_for_cpu(CpuId(0)),
+        0,
+        "empty queue initially"
+    );
+
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::Reschedule)
+        .expect("submit 1");
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::Reschedule)
+        .expect("submit 2");
+    assert_eq!(
+        state.cross_cpu_work_count_for_cpu(CpuId(0)),
+        2,
+        "count == 2 after two submits"
+    );
+
+    state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("drain");
+    assert_eq!(
+        state.cross_cpu_work_count_for_cpu(CpuId(0)),
+        0,
+        "count == 0 after drain"
+    );
+}
+
+#[test]
+fn cross_cpu_work_count_for_invalid_cpu_returns_zero() {
+    let state = Bootstrap::init().expect("init");
+    // CpuId past MAX_CPUS: pending_for_cpu returns Err, unwrap_or(0) catches it.
+    let count = state.cross_cpu_work_count_for_cpu(CpuId(255));
+    assert_eq!(count, 0);
+}
+
+// Part C — process_cross_cpu_work_for_cpu integration tests
+
+#[test]
+fn process_cross_cpu_work_missing_tid_not_an_error() {
+    // TID 336 is never registered; WakeTask for it must not cause process_ to return Err.
+    let mut state = Bootstrap::init().expect("init");
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(336) })
+        .expect("submit");
+
+    let processed = state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("must succeed even for missing TID");
+    assert_eq!(processed, 1, "one item processed");
+    assert_eq!(state.cross_cpu_work_count_for_cpu(CpuId(0)), 0, "queue empty");
+}
+
+#[test]
+fn process_cross_cpu_work_dead_task_no_resurrection() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(337).expect("register");
+    state.mark_task_dead(337).expect("dead");
+
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(337) })
+        .expect("submit");
+    state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("process");
+
+    assert!(state.task_is_dead(337), "Dead task must not be resurrected");
+}
+
+#[test]
+fn process_cross_cpu_work_exited_task_no_resurrection() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(338).expect("register");
+    state.exit_task(338, 42).expect("exit");
+
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(338) })
+        .expect("submit");
+    state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("process");
+
+    assert!(state.task_is_exited(338), "Exited task must not be resurrected");
+}
+
+#[test]
+fn process_cross_cpu_work_blocked_task_becomes_runnable() {
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(340).expect("register");
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 340).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::Poll);
+            Ok::<_, KernelError>(())
+        })
+        .expect("set blocked");
+
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(340) })
+        .expect("submit");
+
+    let processed = state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("process");
+    assert_eq!(processed, 1);
+    assert!(state.task_is_runnable(340), "blocked task must become Runnable");
+}
+
+// Part D — mixed/duplicate items
+
+#[test]
+fn process_cross_cpu_work_mixed_stale_fresh_items() {
+    // TID 341: dead (stale); TID 342: blocked (fresh).  Only 342 becomes Runnable.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(341).expect("dead task");
+    state.mark_task_dead(341).expect("dead");
+    state.register_task(342).expect("blocked task");
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 342).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::Poll);
+            Ok::<_, KernelError>(())
+        })
+        .expect("set blocked");
+
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(341) })
+        .expect("stale submit");
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(342) })
+        .expect("fresh submit");
+
+    let processed = state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("process");
+    assert_eq!(processed, 2, "two items processed");
+    assert!(state.task_is_dead(341), "dead task unchanged");
+    assert!(state.task_is_runnable(342), "blocked task woken");
+}
+
+#[test]
+fn duplicate_wake_task_items_for_same_tid_are_harmless() {
+    // Two WakeTask items for TID 343: first makes it Runnable; second is a no-op.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(343).expect("register");
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 343).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::Poll);
+            Ok::<_, KernelError>(())
+        })
+        .expect("set blocked");
+
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(343) })
+        .expect("first");
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(343) })
+        .expect("duplicate");
+
+    let processed = state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("process");
+    assert_eq!(processed, 2, "both items processed");
+    assert!(state.task_is_runnable(343), "task Runnable after first wake");
+}
+
+// Part E — stress cycles
+
+#[test]
+fn repeated_wake_task_drain_cycles_no_stale_state() {
+    // 4 tasks: each cycle blocks the task, submits WakeTask, drains, checks Runnable.
+    let mut state = Bootstrap::init().expect("init");
+    for i in 0..4u64 {
+        let tid = 344 + i;
+        state.register_task(tid).expect("register");
+        state
+            .with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::Poll);
+                Ok::<_, KernelError>(())
+            })
+            .expect("block");
+
+        state
+            .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(tid) })
+            .expect("submit");
+        state
+            .process_cross_cpu_work_for_cpu(CpuId(0))
+            .expect("drain");
+
+        assert!(state.task_is_runnable(tid), "runnable after wake cycle i={i}");
+        assert_eq!(
+            state.cross_cpu_work_count_for_cpu(CpuId(0)),
+            0,
+            "queue empty after cycle i={i}"
+        );
+    }
+}
+
+#[test]
+fn repeated_exit_before_drain_no_resurrection() {
+    // 4 tasks: each cycle: block → exit → submit WakeTask → drain → verify still Exited.
+    let mut state = Bootstrap::init().expect("init");
+    for i in 0..4u64 {
+        let tid = 348 + i;
+        state.register_task(tid).expect("register");
+        state
+            .with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::Poll);
+                Ok::<_, KernelError>(())
+            })
+            .expect("block");
+        state.exit_task(tid, 1).expect("exit");
+
+        state
+            .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(tid) })
+            .expect("submit stale wake");
+        state
+            .process_cross_cpu_work_for_cpu(CpuId(0))
+            .expect("drain");
+
+        assert!(
+            state.task_is_exited(tid),
+            "Exited task not resurrected in cycle i={i}"
+        );
+    }
+}
+
+#[test]
+fn work_queue_drains_fully_count_zero_after_drain() {
+    // Submit 8 Reschedule items to CPU 0 and verify count returns to 0 after drain.
+    let mut state = Bootstrap::init().expect("init");
+
+    for _ in 0..8 {
+        state
+            .submit_cross_cpu_work(CpuId(0), WorkItem::Reschedule)
+            .expect("submit");
+    }
+    assert_eq!(state.cross_cpu_work_count_for_cpu(CpuId(0)), 8);
+
+    let processed = state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("drain");
+    assert_eq!(processed, 8, "all 8 items processed");
+    assert_eq!(
+        state.cross_cpu_work_count_for_cpu(CpuId(0)),
+        0,
+        "queue fully drained"
+    );
+}
+
+#[test]
+fn work_queue_full_then_drain_then_refill() {
+    use crate::kernel::smp::MAX_CROSS_CPU_WORK;
+
+    let mut state = Bootstrap::init().expect("init");
+
+    for i in 0..MAX_CROSS_CPU_WORK {
+        state
+            .submit_cross_cpu_work(
+                CpuId(0),
+                WorkItem::WakeTask { tid: ThreadId(5000 + i as u64) },
+            )
+            .expect("fill");
+    }
+    assert_eq!(
+        state.cross_cpu_work_count_for_cpu(CpuId(0)),
+        MAX_CROSS_CPU_WORK
+    );
+
+    // Full drain.
+    state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("drain");
+    assert_eq!(state.cross_cpu_work_count_for_cpu(CpuId(0)), 0);
+
+    // Refill to capacity again — wrap-around must not corrupt state.
+    for i in 0..MAX_CROSS_CPU_WORK {
+        state
+            .submit_cross_cpu_work(
+                CpuId(0),
+                WorkItem::WakeTask { tid: ThreadId(6000 + i as u64) },
+            )
+            .expect("refill");
+    }
+    assert_eq!(
+        state.cross_cpu_work_count_for_cpu(CpuId(0)),
+        MAX_CROSS_CPU_WORK
+    );
+
+    state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("second drain");
+    assert_eq!(state.cross_cpu_work_count_for_cpu(CpuId(0)), 0);
+}
+
+// ── End Stage 17 cross-CPU work queue tests ───────────────────────────────────
+
 // ── End Stage 16 timeout/deadline/block-state tests ───────────────────────────

@@ -209,6 +209,17 @@ impl KernelState {
         })
     }
 
+    /// Return the number of pending cross-CPU work items queued for `cpu`.
+    ///
+    /// Returns 0 for an out-of-range `cpu` rather than propagating an error, so
+    /// tests can call this unconditionally as a queue-depth probe.
+    #[cfg(test)]
+    pub(crate) fn cross_cpu_work_count_for_cpu(&self, cpu: crate::kernel::scheduler::CpuId) -> usize {
+        self.with_ipc_state(|ipc| {
+            ipc.cross_cpu_work.pending_for_cpu(cpu).unwrap_or(0)
+        })
+    }
+
     fn clear_ipc_timeout_for_tid(&mut self, tid: u64) -> Result<(), KernelError> {
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs

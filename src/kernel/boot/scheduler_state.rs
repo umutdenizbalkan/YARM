@@ -6,7 +6,7 @@ use crate::arch::hal::Hal;
 use crate::kernel::ipc::Message;
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::scheduler::{CpuId, TaskPriority};
-use crate::kernel::smp::{SmpError, WorkItem};
+use crate::kernel::smp::{CrossCpuWakeApplyResult, SmpError, WorkItem};
 use crate::kernel::task::{TaskClass, TaskStatus};
 use crate::kernel::time::Tick;
 
@@ -343,6 +343,42 @@ impl KernelState {
         self.send_message_to_endpoint_and_wake(endpoint_idx, msg)
     }
 
+    /// Inspect the TCB for `tid` and apply the cross-CPU wake if the task is
+    /// `Blocked`.  All other states are silent no-ops; a missing TID is
+    /// likewise a no-op (`SkippedMissing`) rather than an error.
+    ///
+    /// This is the canonical wake-transition point for cross-CPU `WakeTask`
+    /// items.  The caller (or a test) can inspect the returned
+    /// `CrossCpuWakeApplyResult` to determine which guard path was taken.
+    pub(crate) fn apply_cross_cpu_wake_task(
+        &mut self,
+        cpu: CpuId,
+        tid: ThreadId,
+    ) -> Result<CrossCpuWakeApplyResult, KernelError> {
+        let result = self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid.0) else {
+                return Ok::<CrossCpuWakeApplyResult, KernelError>(
+                    CrossCpuWakeApplyResult::SkippedMissing,
+                );
+            };
+            match tcb.status {
+                TaskStatus::Blocked(_) => {
+                    tcb.status = TaskStatus::Runnable;
+                    Ok(CrossCpuWakeApplyResult::Applied)
+                }
+                TaskStatus::Dead => Ok(CrossCpuWakeApplyResult::SkippedDead),
+                TaskStatus::Exited(_) => Ok(CrossCpuWakeApplyResult::SkippedExited),
+                TaskStatus::Runnable => Ok(CrossCpuWakeApplyResult::SkippedAlreadyRunnable),
+                TaskStatus::Running => Ok(CrossCpuWakeApplyResult::SkippedRunning),
+                TaskStatus::Faulted => Ok(CrossCpuWakeApplyResult::SkippedFaulted),
+            }
+        })?;
+        if result == CrossCpuWakeApplyResult::Applied {
+            self.enqueue_on_cpu(cpu, tid.0)?;
+        }
+        Ok(result)
+    }
+
     fn apply_cross_cpu_work(&mut self, cpu: CpuId, item: WorkItem) -> Result<(), KernelError> {
         match item {
             WorkItem::Reschedule => {
@@ -412,23 +448,11 @@ impl KernelState {
                 Ok(())
             }
             WorkItem::WakeTask { tid } => {
-                // Guard: only transition Blocked → Runnable.  Dead/Exited/Runnable/Running
-                // tasks must not be forcibly re-enqueued by a stale cross-CPU wake item.
-                let should_enqueue = self.with_tcbs_mut(|tcbs| {
-                    let tcb = tcbs
-                        .iter_mut()
-                        .flatten()
-                        .find(|tcb| tcb.tid.0 == tid.0)
-                        .ok_or(KernelError::TaskMissing)?;
-                    if !matches!(tcb.status, TaskStatus::Blocked(_)) {
-                        return Ok::<bool, KernelError>(false);
-                    }
-                    tcb.status = TaskStatus::Runnable;
-                    Ok(true)
-                })?;
-                if should_enqueue {
-                    self.enqueue_on_cpu(cpu, tid.0)?;
-                }
+                // Delegate to apply_cross_cpu_wake_task, which handles all
+                // non-Blocked states (including missing TID) as silent no-ops.
+                // This fixes the Stage 16 guard and ensures stale WakeTask items
+                // for recycled/missing TIDs do not propagate TaskMissing errors.
+                let _ = self.apply_cross_cpu_wake_task(cpu, tid)?;
                 Ok(())
             }
         }
