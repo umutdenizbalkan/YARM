@@ -1316,3 +1316,56 @@ returns the correct address and length — identical to Stage 6/7/8 behavior.
 
 Stage 9 must not alter the behavior of `try_handle_demand_page_fault`. All
 Stage 8 demand-page tests must continue to pass unchanged.
+
+---
+
+## Rule N+17 — Stage 10 test rules: MemoryObject/cap lifetime invariants + VmMap rollback
+
+### N+17.1 — MemoryObject refcount symmetry
+
+For every alloc/map/unmap/revoke operation, a test must verify that the
+corresponding refcount changes symmetrically:
+
+- `alloc_anonymous_memory_object` → `cap_refcount` increments from 0 to 1.
+- `map_user_page_in_asid_with_caps` → `map_refcount` increments by 1 per page.
+- `unmap_page_phase1` → `map_refcount` decrements by 1 per page.
+- `revoke_capability_in_cnode` → `cap_refcount` decrements by 1.
+
+### N+17.2 — Frame reclaim requires both refcounts zero
+
+A test must verify:
+- After unmap (map_refcount=0) but before cap revoke (cap_refcount=1): frame NOT freed.
+- After cap revoke (cap_refcount=0) but before unmap (map_refcount=1): frame NOT freed.
+- After both reach zero: frame IS freed (MemoryObject slot cleared).
+
+### N+17.3 — VmMap plan-first ASID coverage
+
+A test must verify that `handle_vm_map` maps into the address space identified by
+`aspace_map_cap`, not the current task's address space. Specifically:
+- Map into a non-current ASID via `aspace_map_cap`.
+- Confirm the page appears in the target ASID.
+- Confirm the page does NOT appear in the current task's ASID.
+
+### N+17.4 — VmMap rollback cleans address space and frees frames
+
+After a simulated partial VmMap failure (map pages, then rollback via phase-1 + cap
+revoke + phase-2), a test must verify:
+- All pages in the rolled-back range are unmapped.
+- All MemoryObjects created for those pages are freed (slot count decrements).
+
+### N+17.5 — Full suite must pass at 647+ tests
+
+Every Stage 10 commit must pass `cargo test --lib -- --test-threads=1` with at least
+647 tests (640 from Stage 9 + 7 new Stage 10 tests). All prior tests serve as the
+behavior-unchanged regression harness.
+
+### N+17.6 — No observable behavior change in success paths
+
+Stage 10 wires explicit-ASID into `handle_vm_map`. Tests must confirm that a
+successful VmMap still maps every page in the range and returns the correct address
+and length — identical to pre-Stage-10 behavior.
+
+### N+17.7 — Shared-region and transfer-release tests unchanged
+
+All Stage 7 shared-region, transfer-release, and IPC recv-v2 tests must continue to
+pass. Stage 10 does not modify the shared-region or IPC paths.

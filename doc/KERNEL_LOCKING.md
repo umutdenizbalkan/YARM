@@ -5971,3 +5971,116 @@ because both loops run under the global lock.
 | `src/kernel/boot/tests.rs` | 5 new Stage 9 tests; 9 test sites migrated from current-ASID to explicit-ASID; 1 test renamed |
 | `doc/KERNEL_LOCKING.md` | This section (§27) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+16 (Stage 9 test rules) |
+
+---
+
+## §28 Stage 10: MemoryObject/cap lifetime audit + VmMap rollback hardening
+
+### 28.1 Stage 9 smoke acceptance
+
+**x86_64 -smp 1 smoke:** Stage 9 commit `61261ed` accepted. Smoke table from
+Stage 9 matches Stage 8 baseline (all services READY=1, fallback=0, fatal=0, oom=0).
+Stage 9 is accepted for x86_64 -smp 1.
+
+### 28.2 MemoryObject/cap lifetime audit
+
+Every production path touching `memory_objects`, `cap_refcount`, `map_refcount`,
+or `pin_refcount` is classified below.
+
+#### Lifetime classes
+
+| Class | Description |
+|-------|-------------|
+| A | Cap-only lifetime (no page mapping) |
+| B | Map-only lifetime (raw/test-only) |
+| C | Cap+map paired (anonymous allocation) |
+| D | Transfer-envelope pin ownership |
+| E | Shared-region active mapping |
+| F | COW/fork ownership |
+| G | Demand-page ownership |
+| H | Rollback path |
+
+#### Path table
+
+| Path | Class | cap_refcount | map_refcount | pin_refcount | Frame reclaim |
+|------|-------|-------------|-------------|-------------|--------------|
+| `alloc_anonymous_memory_object` | A | +1 on alloc | 0 | 0 | Never |
+| `map_user_page_in_asid_with_caps` | C | (unchanged) | +1 per page | 0 | After both=0 |
+| `map_user_page_in_asid_raw` (test) | B | (unchanged) | +1 per page | 0 | After both=0 |
+| `unmap_user_page_in_asid` (one-phase) | C/E | (unchanged) | -1 per page | 0 | If cap=0 too |
+| `unmap_page_phase1` | C/H | (unchanged) | -1 per page | 0 | Deferred |
+| `execute_tlb_shootdown_wait_plan` | H | (unchanged) | (unchanged) | (unchanged) | After shootdown |
+| `revoke_capability_in_cnode` | A/C | -1 | (unchanged) | 0 | If map=0 too |
+| `stash_transfer_envelope` | D | (unchanged) | (unchanged) | +1 if shared | Never |
+| `take_transfer_envelope` | D | (unchanged) | (unchanged) | -1 if shared | Never |
+| `map_shared_region_into_receiver` | E | (unchanged) | +1 per page | 0 | After cap+map=0 |
+| `handle_transfer_release` (phase1+phase2) | E | (unchanged) | -1 per page | 0 | After cap=0 |
+| `revoke_active_transfer_mappings_for_cap` | E | -1 at caller | -1 per page | 0 | After cap=0 |
+| `purge_active_transfer_mappings_for_pid` | E | -1 at line 249 | -1 per page | 0 | After cap=0 |
+| COW swap (`try_cow_page` / `map_cow_page`) | F | (unchanged) | -1 old +1 new | 0 | If old unreferenced |
+| Demand-page (`try_handle_demand_page_fault`) | G | +1 | +1 | 0 | Never (success) |
+| `rollback_anon_map` (Stage 9) | H | -1 per page | -1 per page | 0 | After both=0 |
+| `handle_vm_map` rollback (Stage 10) | H | -1 per page | -1 per page | 0 | After both=0 |
+
+#### Key invariants
+
+1. **Reclaim condition**: Frame is freed exactly when `cap_refcount == 0 && map_refcount == 0 && pin_refcount == 0`.
+2. **TLB before reclaim**: For pages involved in TLB shootdown, reclaim MUST happen after `execute_tlb_shootdown_wait_plan`. Under the global lock this is trivially satisfied.
+3. **Cap before map**: In the anonymous path, `cap_refcount` is decremented (revoke) BEFORE TLB shootdown completes; the frame is freed by `reclaim_memory_object_if_unreferenced` inside the revoke call only if `map_refcount` is already 0. If `map_refcount` is still 1, `reclaim_memory_object_if_unreferenced` is a no-op and the frame remains live until phase-2 unmap clears `map_refcount`.
+4. **Shared-region ordering**: `purge_active_transfer_mappings_for_pid` and `revoke_capability_direct_in_process_cnode` both call `revoke_active_transfer_mappings_for_cap` BEFORE decrementing `cap_refcount`. This is safe: the one-phase unmap decrements `map_refcount`, and `reclaim_memory_object_for_phys` (inside unmap) is a no-op because `cap_refcount` is still 1. Cap decrement happens next, then `reclaim_memory_object_if_unreferenced` frees the frame.
+
+### 28.3 IPC shared-memory forward-map audit (Part 2)
+
+`map_shared_region_into_receiver` was already converted to plan-first explicit-ASID
+in Stage 7. No further conversion is needed. The path is correct:
+
+- Plan-first ASID: resolved from `current_tid` + `task_asid` before the map loop.
+- Map loop: `map_user_page_in_asid_with_caps(asid, receiver_mem_cap, ...)` — one cap, multiple pages.
+- Rollback on partial failure: `unmap_page_phase1` + `execute_tlb_shootdown_wait_plan` for `[requested_va, va)`.
+- Cap revoke: `revoke_current_transfer_cap_best_effort(kernel, transfer_cap)` in the outer error handler.
+- `register_active_transfer_mapping` failure also rolls back with the same two-phase pattern.
+
+**The shared-region cap is NOT revoked inside `map_shared_region_into_receiver` rollback** — by design: the rollback only unmaps the shared pages; the transfer cap revoke happens in the outer error handler, which properly decrements `cap_refcount` and triggers `reclaim_memory_object_if_unreferenced`.
+
+### 28.4 VmMap rollback hardening (Stage 10 live change)
+
+`handle_vm_map` had a TODO: on partial failure, already-mapped pages remained with
+no rollback, and the corresponding caps leaked until task exit.
+
+**Stage 10 fix:**
+- Switched map loop from `map_user_page_with_caps(aspace_map_cap, ...)` (re-resolves cap
+  on every page) to `map_user_page_in_asid_with_caps(map_asid, ...)` using the ASID
+  already resolved plan-first from `aspace_map_cap`.
+- Added `mapped_end` progress counter.
+- On alloc failure: `rollback_anon_map(kernel, map_asid, addr, mapped_end, None)`.
+- On map failure: `rollback_anon_map(kernel, map_asid, addr, mapped_end, Some(mem_cap))`.
+- `rollback_anon_map` is reused directly: anonymous memory is always allocated in the
+  current task's cnode regardless of which address space it is mapped into, so
+  `find_current_task_cap_for_memory_object_phys` locates the cap correctly.
+
+**Locking sequence (unchanged from Stage 7):**
+1. Global lock held throughout.
+2. `validate_anon_map_args` — lock-free.
+3. Resolve `map_asid` from `aspace_map_cap` — capability rank 4 read.
+4. Stack guard check — vm rank 5 read.
+5. Per page: `alloc_anonymous_memory_object` (memory rank 6), then `map_user_page_in_asid_with_caps` (cap rank 4 → vm rank 5 → memory rank 6).
+6. On failure: `rollback_anon_map` — cap rank 4 + vm rank 5 + memory rank 6 (via phase-1 + revoke + phase-2).
+
+### 28.5 Still deferred
+
+- x86_64 SMP (>1 CPU) — requires lock-free or per-CPU demand-paging path.
+- Full global-lock removal.
+- RAMFS/FAT runtime server spawning (main branch healthy; spawning TODO).
+- `purge_active_transfer_mappings_for_pid` / `revoke_active_transfer_mappings_for_cap` — still use one-phase `unmap_user_page_in_asid`. Safe under global lock; two-phase conversion deferred to global-lock-removal stage.
+- COW/fork MemoryObject lifetime (separate complexity domain).
+- AArch64 smoke (no data available).
+- x86_64 SMP smoke (deferred).
+
+### 28.6 Files changed (Stage 10)
+
+| File | Change |
+|------|--------|
+| `src/kernel/syscall.rs` | `handle_vm_map`: explicit-ASID map loop + rollback via `rollback_anon_map` |
+| `src/kernel/boot/tests.rs` | 7 new Stage 10 tests (VmMap refcounts, non-current ASID, MemoryObject invariants, rollback) |
+| `doc/KERNEL_LOCKING.md` | This section (§28): Stage 9 acceptance, full audit table, IPC/shared-region audit, VmMap fix |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+17 (Stage 10 test rules) |
