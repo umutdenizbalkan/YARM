@@ -10640,6 +10640,345 @@ fn demand_page_stage8_stack_region_demand_maps() {
     assert_eq!(state.task_status(0), Some(TaskStatus::Running));
 }
 
+// ── Stage 10: MemoryObject/cap lifetime audit + VmMap rollback hardening ──────
+//
+// These tests verify:
+//   1. VmMap (handle_vm_map) uses plan-first map_asid and rolls back on failure.
+//   2. MemoryObject cap_refcount / map_refcount / pin_refcount invariants.
+//   3. Shared-region map_refcount symmetry (map→unmap).
+//   4. Frame reclaim requires both cap_refcount==0 and map_refcount==0.
+
+#[test]
+fn vm_map_stage10_success_pages_have_correct_refcounts() {
+    // Stage 10: After a successful VmMap, each newly-created anonymous
+    // MemoryObject must have cap_refcount=1 and map_refcount=1.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let (asid, aspace_cap) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind");
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmMap as usize,
+                [
+                    aspace_cap.0 as usize,
+                    0x20_0000,
+                    2 * PAGE_SIZE,
+                    0x3, // PROT_READ | PROT_WRITE
+                    0,
+                    0,
+                ],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(syscall_succeeded(r, &frame), "VmMap must succeed");
+
+            let count = state.with_memory_state(|mem| {
+                mem.memory_objects
+                    .iter()
+                    .flatten()
+                    .filter(|o| o.cap_refcount == 1 && o.map_refcount == 1)
+                    .count()
+            });
+            assert!(
+                count >= 2,
+                "at least 2 MemoryObjects with cap_refcount=1 and map_refcount=1; got {}",
+                count
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_map_stage10_maps_into_non_current_address_space() {
+    // Stage 10: VmMap must map into the address space identified by aspace_map_cap,
+    // which may differ from the current task's default address space. The plan-first
+    // map_asid ensures the correct ASID is used for every page.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            // Create a second address space — this is the target for VmMap.
+            let (target_asid, target_cap) =
+                state.create_user_address_space().expect("target aspace");
+            // Bind the current task to a DIFFERENT address space so the map
+            // target (target_asid) is not the current task's ASID.
+            let (current_asid, _current_cap) =
+                state.create_user_address_space().expect("current aspace");
+            state.bind_task_asid(0, current_asid).expect("bind current asid");
+
+            let target_va = VirtAddr(0x50_0000);
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::VmMap as usize,
+                [
+                    target_cap.0 as usize,
+                    target_va.0 as usize,
+                    PAGE_SIZE,
+                    0x3, // PROT_READ | PROT_WRITE
+                    0,
+                    0,
+                ],
+            );
+            let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
+            assert!(
+                syscall_succeeded(r, &frame),
+                "VmMap into non-current address space must succeed"
+            );
+
+            // Page must appear in the TARGET address space.
+            assert!(
+                state
+                    .is_user_page_mapped_in_asid(target_asid, target_va)
+                    .expect("check target"),
+                "page must be mapped in target address space"
+            );
+            // Page must NOT appear in the CURRENT task's address space.
+            assert!(
+                !state
+                    .is_user_page_mapped_in_asid(current_asid, target_va)
+                    .expect("check current"),
+                "page must not be mapped in current address space"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn memory_object_cap_refcount_increments_on_alloc_decrements_on_revoke() {
+    // Stage 10: alloc_anonymous_memory_object increments cap_refcount to 1.
+    // revoke_capability_in_cnode decrements it back to 0.
+    let (mut state, _asid) = setup_task0_with_known_asid();
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot after alloc");
+    let refcount_after_alloc = state.with_memory_state(|mem| {
+        mem.memory_objects[slot].expect("obj").cap_refcount
+    });
+    assert_eq!(refcount_after_alloc, 1, "cap_refcount must be 1 after alloc");
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state.revoke_capability_in_cnode(cnode, mem_cap).expect("revoke");
+
+    // After revoke, the slot should be None (frame freed, object reclaimed).
+    let slot_after = state.memory_object_slot_by_id(mo_id);
+    assert!(
+        slot_after.is_none(),
+        "MemoryObject must be reclaimed after cap revoke with map_refcount=0"
+    );
+}
+
+#[test]
+fn memory_object_map_refcount_increments_on_map_decrements_on_unmap() {
+    // Stage 10: map_user_page_in_asid_with_caps increments map_refcount;
+    // unmap_page_phase1 decrements it; execute_tlb_shootdown_wait_plan frees frame.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+            let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc");
+            let virt = VirtAddr(0x60_0000);
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
+                .expect("map");
+
+            let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+            let after_map = state.with_memory_state(|mem| {
+                let o = mem.memory_objects[slot].expect("obj");
+                (o.cap_refcount, o.map_refcount)
+            });
+            assert_eq!(after_map, (1, 1), "cap_refcount=1, map_refcount=1 after map");
+
+            // Phase-1 unmap decrements map_refcount.
+            let wait_plan = state
+                .unmap_page_phase1(asid, virt)
+                .expect("phase1")
+                .expect("was mapped");
+            let after_phase1 = state.with_memory_state(|mem| {
+                let o = mem.memory_objects[slot].expect("obj");
+                (o.cap_refcount, o.map_refcount)
+            });
+            assert_eq!(
+                after_phase1,
+                (1, 0),
+                "cap_refcount=1, map_refcount=0 after phase-1 unmap"
+            );
+
+            // Revoke cap → cap_refcount=0.
+            let cnode = state.current_task_cnode().expect("cnode");
+            state.revoke_capability_in_cnode(cnode, mem_cap).expect("revoke");
+
+            // Now execute the TLB shootdown — frame must be freed.
+            state.execute_tlb_shootdown_wait_plan(wait_plan).expect("phase2");
+
+            // MemoryObject must be reclaimed.
+            assert!(
+                state.memory_object_slot_by_id(mo_id).is_none(),
+                "MemoryObject must be reclaimed after both refcounts reach zero"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn memory_object_frame_not_reclaimed_while_cap_refcount_nonzero() {
+    // Stage 10: reclaim_memory_object_if_unreferenced must not free the frame
+    // when cap_refcount > 0, even after map_refcount reaches 0.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+            let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc");
+            let virt = VirtAddr(0x70_0000);
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
+                .expect("map");
+
+            // Unmap the page (map_refcount → 0). Cap is still alive (cap_refcount=1).
+            let wait_plan = state
+                .unmap_page_phase1(asid, virt)
+                .expect("phase1")
+                .expect("was mapped");
+            state.execute_tlb_shootdown_wait_plan(wait_plan).expect("phase2");
+
+            // MemoryObject must still exist because cap_refcount=1.
+            let slot = state.memory_object_slot_by_id(mo_id);
+            assert!(
+                slot.is_some(),
+                "MemoryObject must persist while cap_refcount=1 even after unmap"
+            );
+
+            // Now revoke the cap → cap_refcount=0, frame freed.
+            let cnode = state.current_task_cnode().expect("cnode");
+            state.revoke_capability_in_cnode(cnode, mem_cap).expect("revoke");
+            assert!(
+                state.memory_object_slot_by_id(mo_id).is_none(),
+                "MemoryObject must be reclaimed after cap revoke"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn memory_object_frame_not_reclaimed_while_map_refcount_nonzero() {
+    // Stage 10: reclaim_memory_object_if_unreferenced must not free the frame
+    // when map_refcount > 0, even after cap_refcount reaches 0.
+    // Simulates the shared-region case: transfer cap revoked but pages still mapped.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let (mut state, asid) = setup_task0_with_known_asid();
+            let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc");
+            let virt = VirtAddr(0x80_0000);
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, PageFlags::USER_RW)
+                .expect("map");
+
+            // Revoke the cap (cap_refcount → 0). Page is still mapped (map_refcount=1).
+            let cnode = state.current_task_cnode().expect("cnode");
+            state.revoke_capability_in_cnode(cnode, mem_cap).expect("revoke");
+
+            // MemoryObject must still exist because map_refcount=1.
+            let slot = state.memory_object_slot_by_id(mo_id);
+            assert!(
+                slot.is_some(),
+                "MemoryObject must persist while map_refcount=1 even after cap revoke"
+            );
+            let obj = state.with_memory_state(|mem| mem.memory_objects[slot.unwrap()].unwrap());
+            assert_eq!(obj.cap_refcount, 0, "cap_refcount must be 0 after revoke");
+            assert_eq!(obj.map_refcount, 1, "map_refcount must still be 1 (page still mapped)");
+
+            // Unmap the page → map_refcount=0, then phase2 frees the frame.
+            let wait_plan = state
+                .unmap_page_phase1(asid, virt)
+                .expect("phase1")
+                .expect("was mapped");
+            state.execute_tlb_shootdown_wait_plan(wait_plan).expect("phase2");
+            assert!(
+                state.memory_object_slot_by_id(mo_id).is_none(),
+                "MemoryObject must be reclaimed after both refcounts reach zero"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn vm_map_stage10_rollback_via_phase1_unmap_cleans_pages() {
+    // Stage 10: Verify the rollback building block (unmap_page_phase1 +
+    // find_current_task_cap + revoke_cap + execute_tlb_shootdown) cleans up
+    // pages that would have been created by a partially-failed VmMap.
+    // Simulates what rollback_anon_map does for handle_vm_map on failure.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let (asid, _aspace_cap) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind");
+
+            // Simulate two pages successfully mapped (as VmMap would do).
+            let base = 0x90_0000usize;
+            let mut caps = alloc::vec::Vec::new();
+            for i in 0..2 {
+                let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc");
+                let va = VirtAddr((base + i * PAGE_SIZE) as u64);
+                state
+                    .map_user_page_in_asid_with_caps(asid, mem_cap, va, PageFlags::USER_RW)
+                    .expect("map");
+                caps.push(mem_cap);
+            }
+
+            let before_count = state.with_memory_state(|mem| {
+                mem.memory_objects.iter().flatten().count()
+            });
+
+            // Roll them back exactly as rollback_anon_map does for VmMap:
+            for i in 0..2 {
+                let va = VirtAddr((base + i * PAGE_SIZE) as u64);
+                if let Ok(Some(wait_plan)) = state.unmap_page_phase1(asid, va) {
+                    if let Some((cnode, cap_id)) =
+                        state.find_current_task_cap_for_memory_object_phys(wait_plan.phys)
+                    {
+                        let _ = state.revoke_capability_in_cnode(cnode, cap_id);
+                    }
+                    let _ = state.execute_tlb_shootdown_wait_plan(wait_plan);
+                }
+            }
+
+            let after_count = state.with_memory_state(|mem| {
+                mem.memory_objects.iter().flatten().count()
+            });
+            assert_eq!(
+                after_count,
+                before_count - 2,
+                "both MemoryObjects must be freed after rollback; before={} after={}",
+                before_count,
+                after_count
+            );
+            // Both pages must be unmapped.
+            for i in 0..2 {
+                let va = VirtAddr((base + i * PAGE_SIZE) as u64);
+                assert!(
+                    !state
+                        .is_user_page_mapped_in_asid(asid, va)
+                        .expect("check"),
+                    "page {} must not be mapped after rollback",
+                    i
+                );
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
 // ── Phase L2A: canonical boot SharedKernel construction tests ─────────────────
 //
 // These tests verify Bootstrap::init_shared_static_with_boot_memory_map

@@ -1935,19 +1935,31 @@ fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
     {
         return Err(SyscallError::InvalidArgs);
     }
-    // NOTE: partial-failure — if alloc or map fails mid-range, pages already
-    // mapped at [addr, va) remain mapped with no rollback. Physical frames and
-    // cap slots are reclaimed when the task exits.
-    // TODO: add rollback using unmap_user_page + revoke_capability_in_cnode.
-    let mut va = addr;
-    while va < end {
-        let (_, mem_cap) = kernel
-            .alloc_anonymous_memory_object()
-            .map_err(SyscallError::from)?;
-        kernel
-            .map_user_page_with_caps(aspace_map_cap, mem_cap, VirtAddr(va as u64), flags)
-            .map_err(SyscallError::from)?;
-        va += PAGE_SIZE;
+    // Stage 10: use map_asid (resolved plan-first above) directly instead of
+    // re-resolving from aspace_map_cap on every page. Track mapped_end for
+    // rollback symmetry: on alloc or map failure, rollback_anon_map revokes
+    // caps and reclaims frames for [addr, mapped_end) — same two-phase pattern
+    // as handle_vm_anon_map. Anonymous memory is always allocated in the
+    // current task's cnode regardless of which address space it is mapped into.
+    let mut mapped_end = addr;
+    while mapped_end < end {
+        let (_, mem_cap) = match kernel.alloc_anonymous_memory_object() {
+            Ok(pair) => pair,
+            Err(e) => {
+                rollback_anon_map(kernel, map_asid, addr, mapped_end, None);
+                return Err(SyscallError::from(e));
+            }
+        };
+        if let Err(e) = kernel.map_user_page_in_asid_with_caps(
+            map_asid,
+            mem_cap,
+            VirtAddr(mapped_end as u64),
+            flags,
+        ) {
+            rollback_anon_map(kernel, map_asid, addr, mapped_end, Some(mem_cap));
+            return Err(SyscallError::from(e));
+        }
+        mapped_end += PAGE_SIZE;
     }
     frame.set_ok(addr, map_len, 0);
     Ok(())
