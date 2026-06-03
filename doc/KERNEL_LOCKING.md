@@ -6327,6 +6327,30 @@ Table unchanged — Vec switch does not affect refcount semantics.
 `cargo check --no-default-features` clean.
 x86_64 -smp 1 smoke required for Stage 13 (live COW fault content-copy behavior changed).
 
+#### Stage 13 x86_64 -smp 1 smoke (accepted)
+
+| Marker | Value |
+|--------|-------|
+| `X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY` | 0 |
+| `X86_BOOTSTRAP_SCHEDULER_READY` | 1 |
+| `X86_BOOTSTRAP_TIMER_STARTED` | 1 |
+| `ENTER_USER` | 3 |
+| `STARTUP_INSTALL_FINAL` | 9 |
+| `PM_ELF_ZC_DONE` total | 3 |
+| ZC nonzero pages | 3 |
+| `PM_ELF_ZC_FAIL` | 0 |
+| `INITRAMFS_SRV_ENTRY` | 1 |
+| `DEVFS_SRV_ENTRY` | 1 |
+| `VFS_SRV_ENTRY` | 1 |
+| `DRIVER_MANAGER_READY` | 1 |
+| `BLKCACHE_SRV_READY` | 1 |
+| `VIRTIO_BLK_SRV_READY` | 1 |
+| fallback | 0 |
+| TID mismatch | 0 |
+| fatal-ish | 0 |
+| oom/capacity/Vm(Full) | 0 |
+| cap/refcount suspicious | 0 |
+
 ### 31.7 Files changed (Stage 13)
 
 | File | Change |
@@ -6339,3 +6363,115 @@ x86_64 -smp 1 smoke required for Stage 13 (live COW fault content-copy behavior 
 | `src/kernel/boot/tests.rs` | 2 exhaustion tests redesigned (capacity limit field); `.iter().flatten()` → `.iter()`; 4 new Stage 13 tests |
 | `doc/KERNEL_LOCKING.md` | §30.7 smoke acceptance table; this section (§31) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+20 (Stage 13 test rules) |
+
+## §32 — Stage 14: COW metadata scalability/indexing + lifecycle stress
+
+### 32.1 Motivation
+
+Stage 13 replaced the fixed-size COW array with `Vec<CowPageRecord>`. The Vec
+has O(N) lookup and O(N) `clear_cow_pages_for_asid` — every COW check during a
+write fault scans the entire global list, and every task exit scans it again.
+With many forked processes and pages, this becomes O(tasks × pages_per_task).
+
+Stage 14 replaces the Vec with `BTreeMap<u16, BTreeSet<u64>>` (ASID → virtual
+addresses), providing:
+
+- O(log num_asids + log pages_per_asid) lookup and mark
+- O(log num_asids) `clear_cow_pages_for_asid` (single `remove(&asid.0)`)
+- Natural ASID isolation (per-ASID sets cannot alias)
+- No ghost buckets: empty sets are removed immediately when the last entry is
+  cleared
+
+### 32.2 Design decision
+
+| Option | Lookup | clear_for_asid | Notes |
+|--------|--------|----------------|-------|
+| `Vec<CowPageRecord>` (Stage 13) | O(N) | O(N) | Simple; collapses under load |
+| `BTreeSet<(u16, u64)>` flat | O(log N) | O(N_asid × log N) | Awkward range delete |
+| `BTreeMap<u16, BTreeSet<u64>>` | O(log A + log P) | O(log A) | Chosen |
+| `HashMap<u16, HashSet<u64>>` | O(1) avg | O(1) avg | Needs std or ahash; `no_std` hostile |
+
+**Chosen: `BTreeMap<u16, BTreeSet<u64>>`** — all operations are
+worst-case O(log N); `clear_for_asid` is a single tree node removal;
+fully `no_std + alloc` compatible.
+
+### 32.3 Data model
+
+```
+MemorySubsystem.cow_pages: BTreeMap<u16 /*asid*/, BTreeSet<u64 /*virt*/>>
+```
+
+- Key: `asid.0` (`u16`)
+- Value: `BTreeSet<u64>` of virtual page addresses for that ASID
+- Empty-bucket invariant: when the last address is removed from a set, the
+  ASID key is also removed (`BTreeMap::remove(&asid.0)`)
+- `#[cfg(test)] cow_page_capacity_limit: Option<usize>` remains for
+  exhaustion testing (counts `values().map(|s| s.len()).sum()`)
+
+### 32.4 COW function complexity table
+
+| Function | Stage 13 | Stage 14 |
+|----------|----------|----------|
+| `mark_cow_page` | O(N) scan then push | O(log A + log P) via `BTreeSet::insert` |
+| `clear_cow_page` | O(N) `Vec::retain` | O(log A + log P); collapses empty bucket |
+| `clear_cow_pages_for_asid` | O(N) `Vec::retain` | O(log A) single `BTreeMap::remove` |
+| `is_cow_page` | O(N) `Vec::iter().any` | O(log A + log P) `BTreeSet::contains` |
+
+A = number of distinct ASIDs with COW pages; P = pages per ASID.
+
+### 32.5 `#[cfg(test)]` helper API
+
+Three stable test-API methods added to `KernelState` (never in production):
+
+```rust
+pub(crate) fn cow_page_count(&self) -> usize          // total across all ASIDs
+pub(crate) fn cow_page_count_for_asid(&self, asid: Asid) -> usize
+pub(crate) fn cow_asid_bucket_count(&self) -> usize   // number of ASID keys
+```
+
+These methods abstract over the internal storage type. Tests use these rather
+than directly accessing `memory.cow_pages`, keeping tests stable across future
+storage changes.
+
+### 32.6 Rollback rules (unchanged from Stage 13)
+
+- `try_handle_cow_fault`: on any error after `new_mem_cap` is minted, revoke
+  `new_mem_cap` before returning the error.
+- `clone_user_address_space_cow`: on any error after a partial COW mark loop,
+  there is no rollback of already-marked pages — the clone itself fails, so
+  the partially-marked ASID is not reachable by any task.
+
+### 32.7 Stage 14 lifecycle stress tests
+
+Tests added in `tests.rs` (TIDs 64-75 and 169):
+
+| Test | What it verifies |
+|------|-----------------|
+| `cow_fork_exit_cycles` | Fork + exit cycles leave zero COW records |
+| `cow_child_exits_first_then_parent` | Child exit before parent clears child bucket |
+| `cow_parent_exits_first_then_child` | Parent exit before child clears parent bucket |
+| `cow_multiple_generations` | Three-generation fork tree: each exit clears exactly its bucket |
+| `cow_both_sides_split_independently` | Parent and child COW-fault independently; records removed per-side |
+| `cow_duplicate_mark_is_idempotent` | `BTreeSet::insert` deduplicates; count stays 1 after two marks |
+| `cow_asid_isolation_lookup_not_confused` | Two ASIDs at same virt addr are independent |
+| `cow_large_asid_cleared_efficiently` | 50 pages in one ASID; `clear_cow_pages_for_asid` removes all |
+| `cow_map_empty_bucket_removed_after_last_entry_cleared` | Empty bucket is removed; `cow_asid_bucket_count()` drops |
+
+### 32.8 Stage 14 acceptance
+
+676 tests pass single-threaded (`cargo test --lib -- --test-threads=1`).
+9 new Stage 14 tests added (lifecycle × 5, scalability/isolation × 4).
+`cargo check --no-default-features` clean.
+`cargo check --features hosted-dev` clean.
+x86_64 -smp 1 smoke required for Stage 14 (live COW fault metadata lookup behavior changed).
+
+### 32.9 Files changed (Stage 14)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/defs.rs` | `cow_pages` field type → `BTreeMap<u16, BTreeSet<u64>>`; `cow_page_capacity_limit` retained |
+| `src/kernel/boot/bootstrap_state.rs` | Init `cow_pages: BTreeMap::new()` |
+| `src/kernel/boot/memory_state.rs` | 4 COW functions rewritten for BTreeMap; 3 `#[cfg(test)]` helpers added |
+| `src/kernel/boot/tests.rs` | Stage 13 tests updated to use new helper API; 9 new Stage 14 tests |
+| `doc/KERNEL_LOCKING.md` | §31.6 Stage 13 smoke acceptance; this section (§32) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+21 (Stage 14 test rules) |

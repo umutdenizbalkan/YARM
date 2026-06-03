@@ -43,35 +43,36 @@ impl KernelState {
 
     fn mark_cow_page(&mut self, asid: Asid, virt: VirtAddr) -> Result<(), KernelError> {
         self.with_memory_state_mut(|memory| {
-            if memory
-                .cow_pages
-                .iter()
-                .any(|entry| entry.asid == asid && entry.virt == virt)
-            {
-                return Ok(());
-            }
             #[cfg(test)]
             if let Some(limit) = memory.cow_page_capacity_limit {
-                if memory.cow_pages.len() >= limit {
+                let total: usize = memory.cow_pages.values().map(|s| s.len()).sum();
+                if total >= limit {
                     return Err(KernelError::MemoryObjectFull);
                 }
             }
-            memory.cow_pages.push(super::CowPageRecord { asid, virt });
+            memory
+                .cow_pages
+                .entry(asid.0)
+                .or_insert_with(alloc::collections::BTreeSet::new)
+                .insert(virt.0);
             Ok(())
         })
     }
 
     fn clear_cow_page(&mut self, asid: Asid, virt: VirtAddr) {
         self.with_memory_state_mut(|memory| {
-            memory
-                .cow_pages
-                .retain(|entry| !(entry.asid == asid && entry.virt == virt));
+            if let Some(set) = memory.cow_pages.get_mut(&asid.0) {
+                set.remove(&virt.0);
+                if set.is_empty() {
+                    memory.cow_pages.remove(&asid.0);
+                }
+            }
         });
     }
 
     fn clear_cow_pages_for_asid(&mut self, asid: Asid) {
         self.with_memory_state_mut(|memory| {
-            memory.cow_pages.retain(|entry| entry.asid != asid);
+            memory.cow_pages.remove(&asid.0);
         });
     }
 
@@ -79,9 +80,26 @@ impl KernelState {
         self.with_memory_state(|memory| {
             memory
                 .cow_pages
-                .iter()
-                .any(|entry| entry.asid == asid && entry.virt == virt)
+                .get(&asid.0)
+                .map_or(false, |set| set.contains(&virt.0))
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cow_page_count(&self) -> usize {
+        self.with_memory_state(|memory| memory.cow_pages.values().map(|s| s.len()).sum())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cow_page_count_for_asid(&self, asid: Asid) -> usize {
+        self.with_memory_state(|memory| {
+            memory.cow_pages.get(&asid.0).map_or(0, |s| s.len())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cow_asid_bucket_count(&self) -> usize {
+        self.with_memory_state(|memory| memory.cow_pages.len())
     }
 
     pub fn destroy_user_address_space(&mut self, aspace_cap: CapId) -> Result<(), KernelError> {
