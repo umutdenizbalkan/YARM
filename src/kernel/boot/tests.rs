@@ -7011,6 +7011,534 @@ fn clone_user_address_space_cow_cleans_child_state_on_cow_capacity_exhaustion() 
     assert!(!lingering_child_cow);
 }
 
+// ---------- Stage 12: COW/fork MemoryObject lifetime tests ----------
+
+#[test]
+fn fork_cow_map_refcount_incremented_for_shared_pages() {
+    // After fork, each physical frame shared between parent and child must have
+    // map_refcount=2 (one PTE in each address space).
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(41).expect("parent");
+    state.bind_task_asid(41, parent_asid).expect("bind parent");
+    state.enqueue_current_cpu(41).expect("enqueue");
+    state.yield_current().expect("switch to task41");
+
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x1000), PageFlags::USER_RW)
+        .expect("map parent");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot before fork");
+    assert_eq!(state.memory.memory_objects[slot].expect("mo").map_refcount, 1);
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot after clone");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("mo").map_refcount,
+        2,
+        "child clone must increment map_refcount for the shared frame"
+    );
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+#[test]
+fn fork_cow_cap_refcount_incremented_after_inherit() {
+    // After fork and cap inheritance the MemoryObject's cap_refcount must be 2
+    // (one in parent cnode, one in child cnode via grant).
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 42,
+            entry: 0x9000,
+            asid: Some(parent_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("parent");
+    state.yield_current_to(ThreadId(42)).expect("switch to task42");
+
+    let (mo_id, _mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot before fork");
+    assert_eq!(state.memory.memory_objects[slot].expect("mo").cap_refcount, 1);
+
+    let child_tid = state.fork_user_process_cow(42).expect("fork");
+    let _ = child_tid;
+
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot after fork");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("mo").cap_refcount,
+        2,
+        "child must inherit cap; cap_refcount must be 2 after fork"
+    );
+}
+
+#[test]
+fn fork_child_exit_does_not_reclaim_shared_frame_while_parent_alive() {
+    // When the child exits first the parent's mapping keeps map_refcount >= 1
+    // and cap_refcount >= 1, so the physical frame must NOT be reclaimed.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 43,
+            entry: 0x9100,
+            asid: Some(parent_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("parent");
+
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x2000), PageFlags::USER_RW)
+        .expect("map parent");
+
+    let child_tid = state.fork_user_process_cow(43).expect("fork");
+    let child_asid = state.task_asid(child_tid).expect("child asid");
+
+    // Destroy child address space (simulates child exit cleanup).
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+    // Revoke child's inherited cap.
+    let child_cnode = state.task_cnode(child_tid).expect("child cnode");
+    let child_caps = state.snapshot_live_capabilities_for_task(child_tid).expect("caps");
+    for (cap_id, cap) in &child_caps {
+        if matches!(cap.object, CapObject::MemoryObject { id } if id == mo_id) {
+            let _ = state.revoke_capability_in_cnode(child_cnode, *cap_id);
+        }
+    }
+
+    // Parent's frame must still be alive.
+    assert!(
+        state.memory_object_slot_by_id(mo_id).is_some(),
+        "MemoryObject must survive child exit while parent still holds cap and mapping"
+    );
+    assert!(
+        state.is_user_page_mapped_in_asid(parent_asid, VirtAddr(0x2000)).unwrap_or(false),
+        "parent page must remain mapped after child exits"
+    );
+}
+
+#[test]
+fn fork_parent_exit_does_not_reclaim_while_child_maps_frame() {
+    // Parent exits first: child still maps the frame, so it must not be reclaimed.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 44,
+            entry: 0x9200,
+            asid: Some(parent_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("parent");
+
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x3000), PageFlags::USER_RW)
+        .expect("map parent");
+
+    let child_tid = state.fork_user_process_cow(44).expect("fork");
+    let child_asid = state.task_asid(child_tid).expect("child asid");
+
+    // Exit parent: destroy address space then revoke all parent caps.
+    let _ = state.destroy_user_address_space_by_asid(parent_asid);
+    let parent_cnode = state.task_cnode(44).expect("parent cnode");
+    let parent_caps = state.snapshot_live_capabilities_for_task(44).expect("caps");
+    for (cap_id, cap) in &parent_caps {
+        if matches!(cap.object, CapObject::MemoryObject { id } if id == mo_id) {
+            let _ = state.revoke_capability_in_cnode(parent_cnode, *cap_id);
+        }
+    }
+
+    // Child still maps the frame; it must not be reclaimed.
+    assert!(
+        state.memory_object_slot_by_id(mo_id).is_some(),
+        "MemoryObject must survive parent exit while child still holds cap and mapping"
+    );
+    assert!(
+        state.is_user_page_mapped_in_asid(child_asid, VirtAddr(0x3000)).unwrap_or(false),
+        "child page must remain mapped after parent exits"
+    );
+}
+
+#[test]
+fn fork_both_exit_reclaims_shared_frame() {
+    // When both parent and child have exited (address spaces destroyed, caps
+    // revoked), the shared frame must be fully reclaimed.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 45,
+            entry: 0x9300,
+            asid: Some(parent_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("parent");
+    state.yield_current_to(ThreadId(45)).expect("switch to task45");
+
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x4000), PageFlags::USER_RW)
+        .expect("map parent");
+
+    let child_tid = state.fork_user_process_cow(45).expect("fork");
+    let child_asid = state.task_asid(child_tid).expect("child asid");
+
+    // Exit child: destroy child asid, revoke child caps.
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+    let child_cnode = state.task_cnode(child_tid).expect("child cnode");
+    for (cap_id, cap) in state.snapshot_live_capabilities_for_task(child_tid).expect("caps") {
+        if matches!(cap.object, CapObject::MemoryObject { id } if id == mo_id) {
+            let _ = state.revoke_capability_in_cnode(child_cnode, cap_id);
+        }
+    }
+
+    assert!(
+        state.memory_object_slot_by_id(mo_id).is_some(),
+        "must survive after child-only exit"
+    );
+
+    // Exit parent: destroy parent asid, revoke parent caps.
+    let _ = state.destroy_user_address_space_by_asid(parent_asid);
+    let parent_cnode = state.task_cnode(45).expect("parent cnode");
+    for (cap_id, cap) in state.snapshot_live_capabilities_for_task(45).expect("caps") {
+        if matches!(cap.object, CapObject::MemoryObject { id } if id == mo_id) {
+            let _ = state.revoke_capability_in_cnode(parent_cnode, cap_id);
+        }
+    }
+
+    assert!(
+        state.memory_object_slot_by_id(mo_id).is_none(),
+        "MemoryObject must be reclaimed after both parent and child exit"
+    );
+}
+
+#[test]
+fn fork_cow_write_fault_gives_child_private_frame() {
+    // After fork, a write to a COW page in the child must allocate a new
+    // private frame: the child gets a different physical page, and the parent's
+    // mapping still points to the original shared frame.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(46).expect("parent");
+    state.bind_task_asid(46, parent_asid).expect("bind parent");
+    state.enqueue_current_cpu(46).expect("enqueue");
+    state.yield_current().expect("switch to task46");
+
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let original_phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x5000), PageFlags::USER_RW)
+        .expect("map parent");
+
+    // COW clone: parent and child share the frame (both read-only in PTE).
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+
+    // Both should be COW-marked and read-only.
+    assert!(state.is_cow_page(parent_asid, VirtAddr(0x5000)));
+    assert!(state.is_cow_page(child_asid, VirtAddr(0x5000)));
+
+    // Simulate a write fault in the child at 0x5000.
+    let handled = state
+        .try_handle_cow_fault(child_asid, VirtAddr(0x5000))
+        .expect("cow fault");
+    assert!(handled, "write to COW page must be handled");
+
+    // Child should now map a NEW private frame (different from original_phys).
+    let child_mapping = state
+        .with_user_spaces(|spaces| spaces.get(child_asid).and_then(|a| a.resolve(VirtAddr(0x5000))))
+        .expect("child mapping after fault");
+    assert_ne!(
+        child_mapping.phys,
+        original_phys,
+        "child must get a private frame after COW fault"
+    );
+    assert!(child_mapping.flags.write, "child's new private frame must be writable");
+
+    // Parent's mapping must still point to the original shared frame.
+    let parent_mapping = state
+        .with_user_spaces(|spaces| {
+            spaces.get(parent_asid).and_then(|a| a.resolve(VirtAddr(0x5000)))
+        })
+        .expect("parent mapping after child fault");
+    assert_eq!(
+        parent_mapping.phys, original_phys,
+        "parent must still map the original shared frame after child COW fault"
+    );
+
+    // Original shared frame: map_refcount reduced by 1 (child no longer maps it).
+    let slot = state.memory_object_slot_by_id(mo_id).expect("mo slot");
+    let mo = state.memory.memory_objects[slot].expect("mo");
+    assert_eq!(
+        mo.map_refcount, 1,
+        "shared frame map_refcount must decrease to 1 after child splits"
+    );
+
+    // Child's COW record must be cleared; parent's COW record remains until parent writes.
+    assert!(
+        !state.is_cow_page(child_asid, VirtAddr(0x5000)),
+        "child COW record must be cleared after fault"
+    );
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+#[test]
+fn fork_cow_write_fault_does_not_reclaim_shared_frame_while_parent_maps() {
+    // After child's COW split, the old shared frame must NOT be reclaimed
+    // because the parent still maps it (map_refcount >= 1).
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(47).expect("parent");
+    state.bind_task_asid(47, parent_asid).expect("bind parent");
+    state.enqueue_current_cpu(47).expect("enqueue");
+    state.yield_current().expect("switch to task47");
+
+    let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x6000), PageFlags::USER_RW)
+        .expect("map parent");
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+
+    // Child writes → COW split.
+    state
+        .try_handle_cow_fault(child_asid, VirtAddr(0x6000))
+        .expect("cow fault");
+
+    // Old shared frame (mo_id) must still exist because parent maps it.
+    assert!(
+        state.memory_object_slot_by_id(mo_id).is_some(),
+        "shared frame must not be reclaimed while parent still maps it"
+    );
+    assert!(
+        state.is_user_page_mapped_in_asid(parent_asid, VirtAddr(0x6000)).unwrap_or(false),
+        "parent mapping must be intact after child COW fault"
+    );
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+#[test]
+fn fork_failed_clone_restores_parent_write_permissions() {
+    // When clone_user_address_space_cow fails (COW capacity exhausted mid-clone),
+    // the parent's write-protected pages must have their write permission restored.
+    // Before this fix, pages where mark_cow_page(parent) failed were left with
+    // a read-only PTE and no COW record, causing an unhandled fault on write.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(48).expect("parent");
+    state.bind_task_asid(48, parent_asid).expect("bind parent");
+    state.enqueue_current_cpu(48).expect("enqueue");
+    state.yield_current().expect("switch to task48");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    // Map enough writable pages to exhaust COW capacity mid-clone.
+    let writable_pages = (super::MAX_COW_PAGES / 2) + 1;
+    for page in 0..writable_pages {
+        let va = VirtAddr(0x10_0000 + (page * PAGE_SIZE) as u64);
+        state
+            .map_user_page_in_asid_raw(parent_asid, va, Mapping { phys, flags: PageFlags::USER_RW })
+            .expect("map parent page");
+    }
+
+    // The clone must fail (COW full).
+    let result = state.clone_user_address_space_cow(parent_asid);
+    assert_eq!(result, Err(KernelError::MemoryObjectFull));
+
+    // After rollback, every parent page must have write permission restored.
+    for page in 0..writable_pages {
+        let va = VirtAddr(0x10_0000 + (page * PAGE_SIZE) as u64);
+        let mapping = state
+            .with_user_spaces(|spaces| spaces.get(parent_asid).and_then(|a| a.resolve(va)))
+            .unwrap_or_else(|| panic!("parent page {page} must still exist after failed clone"));
+        assert!(
+            mapping.flags.write,
+            "parent page {page} must have write permission restored after failed clone"
+        );
+    }
+}
+
+#[test]
+fn fork_failed_clone_leaves_no_parent_cow_records() {
+    // After a failed clone the rollback must clear all parent COW records that
+    // were added during the clone attempt.
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(49).expect("parent");
+    state.bind_task_asid(49, parent_asid).expect("bind parent");
+    state.enqueue_current_cpu(49).expect("enqueue");
+    state.yield_current().expect("switch to task49");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    let writable_pages = (super::MAX_COW_PAGES / 2) + 1;
+    for page in 0..writable_pages {
+        let va = VirtAddr(0x20_0000 + (page * PAGE_SIZE) as u64);
+        state
+            .map_user_page_in_asid_raw(parent_asid, va, Mapping { phys, flags: PageFlags::USER_RW })
+            .expect("map");
+    }
+
+    let _ = state.clone_user_address_space_cow(parent_asid); // expected to fail
+
+    let parent_cow_count = state.with_memory_state(|memory| {
+        memory
+            .cow_pages
+            .iter()
+            .flatten()
+            .filter(|e| e.asid == parent_asid)
+            .count()
+    });
+    assert_eq!(
+        parent_cow_count, 0,
+        "no parent COW records must linger after failed clone rollback"
+    );
+}
+
+#[test]
+fn fork_read_only_page_shared_without_cow_marking() {
+    // Pages that are already read-only in the parent must be shared in the
+    // child without any COW record (no write fault needed for them).
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(50).expect("parent");
+    state.bind_task_asid(50, parent_asid).expect("bind parent");
+    state.enqueue_current_cpu(50).expect("enqueue");
+    state.yield_current().expect("switch to task50");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    let ro_flags = PageFlags { read: true, write: false, execute: false, user: true, cache_policy: CachePolicy::WriteBack };
+    state
+        .map_user_page_in_asid_raw(parent_asid, VirtAddr(0x7000), Mapping { phys, flags: ro_flags })
+        .expect("map ro");
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+
+    // Neither parent nor child should have a COW record for this page.
+    assert!(
+        !state.is_cow_page(parent_asid, VirtAddr(0x7000)),
+        "read-only parent page must not have a COW record"
+    );
+    assert!(
+        !state.is_cow_page(child_asid, VirtAddr(0x7000)),
+        "read-only child page must not have a COW record"
+    );
+
+    // Child should still see the page mapped.
+    assert!(
+        state.is_user_page_mapped_in_asid(child_asid, VirtAddr(0x7000)).unwrap_or(false),
+        "child must have the read-only page mapped"
+    );
+
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+#[test]
+fn fork_cow_split_old_frame_eventually_freed_after_both_exit() {
+    // After COW split: old shared frame must be freed when BOTH tasks release
+    // their caps (even though neither maps it any more after the split).
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: 51,
+            entry: 0x9400,
+            asid: Some(parent_asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("parent");
+    state.yield_current_to(ThreadId(51)).expect("switch to task51");
+
+    let (shared_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x8000), PageFlags::USER_RW)
+        .expect("map parent");
+
+    let child_tid = state.fork_user_process_cow(51).expect("fork");
+    let child_asid = state.task_asid(child_tid).expect("child asid");
+
+    // Child triggers a COW split — it gets a new private frame.
+    state
+        .try_handle_cow_fault(child_asid, VirtAddr(0x8000))
+        .expect("cow fault");
+
+    // Shared frame: no longer mapped in child, still mapped in parent.
+    assert!(
+        state.memory_object_slot_by_id(shared_mo_id).is_some(),
+        "shared frame must exist while parent maps it"
+    );
+
+    // Parent also splits (to simulate parent writing too).
+    state
+        .try_handle_cow_fault(parent_asid, VirtAddr(0x8000))
+        .expect("parent cow fault");
+
+    // Shared frame: no longer mapped by anyone, but both still hold caps.
+    {
+        let slot = state.memory_object_slot_by_id(shared_mo_id).expect("slot");
+        let mo = state.memory.memory_objects[slot].expect("mo");
+        assert_eq!(mo.map_refcount, 0, "shared frame map_refcount must be 0");
+        assert_eq!(mo.cap_refcount, 2, "both tasks still hold caps");
+    }
+    assert!(
+        state.memory_object_slot_by_id(shared_mo_id).is_some(),
+        "shared frame must survive while cap holders exist"
+    );
+
+    // Child exits: destroy child asid, revoke child caps for shared_mo.
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+    let child_cnode = state.task_cnode(child_tid).expect("child cnode");
+    for (cap_id, cap) in state.snapshot_live_capabilities_for_task(child_tid).expect("caps") {
+        if matches!(cap.object, CapObject::MemoryObject { id } if id == shared_mo_id) {
+            let _ = state.revoke_capability_in_cnode(child_cnode, cap_id);
+        }
+    }
+    assert!(
+        state.memory_object_slot_by_id(shared_mo_id).is_some(),
+        "shared frame must survive while parent holds cap"
+    );
+
+    // Parent exits: destroy parent asid, revoke parent caps.
+    let _ = state.destroy_user_address_space_by_asid(parent_asid);
+    let parent_cnode = state.task_cnode(51).expect("parent cnode");
+    for (cap_id, cap) in state.snapshot_live_capabilities_for_task(51).expect("caps") {
+        if matches!(cap.object, CapObject::MemoryObject { id } if id == shared_mo_id) {
+            let _ = state.revoke_capability_in_cnode(parent_cnode, cap_id);
+        }
+    }
+    assert!(
+        state.memory_object_slot_by_id(shared_mo_id).is_none(),
+        "shared frame must be reclaimed after both parent and child release all caps"
+    );
+}
+
+// ---------- End Stage 12 COW/fork tests ----------
+
 #[test]
 fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
     let mut state = Bootstrap::init().expect("init");

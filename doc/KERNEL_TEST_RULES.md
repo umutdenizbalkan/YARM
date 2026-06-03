@@ -1409,3 +1409,57 @@ Every Stage 11 commit must pass `cargo test --lib -- --test-threads=1` with at l
 `revoke_capability_in_cnode` → `revoke_active_transfer_mappings_for_cap` must have
 its own test, independent from the purge path, confirming the same unmap-and-reclaim
 behavior.
+
+---
+
+## Rule N+19 — Stage 12: COW/fork MemoryObject lifetime tests
+
+### N+19.1 — Current task must own the cap before fork
+
+Any test that asserts `cap_refcount == 2` after `fork_user_process_cow` (one for
+parent, one for inherited child cap) must ensure the MemoryObject cap is minted in
+the parent task's cnode. Call `yield_current_to(ThreadId(parent_tid))` after
+`spawn_user_task_from_image` and before `alloc_anonymous_memory_object`. Without
+this switch, the cap lands in TID 0's cnode (Bootstrap default current task);
+`inherit_parent_capabilities_for_fork` finds nothing in the parent's cnode and
+cap_refcount stays at 1.
+
+### N+19.2 — Fork lifetime matrix: all four reclaim paths tested
+
+The test suite must cover all four scenarios:
+1. Both tasks alive → frame survives (cap_refcount=2, map_refcount=2).
+2. Child exits first → frame survives (cap_refcount=1, map_refcount=1).
+3. Parent exits first → frame survives (cap_refcount=1, map_refcount=1).
+4. Both exit → frame reclaimed (cap_refcount=0, map_refcount=0).
+
+### N+19.3 — COW split frame retention
+
+After a COW write fault (child gets private frame), the original shared frame must
+not be reclaimed while the parent still maps it. A test must confirm the shared
+MemoryObject still exists after the child's COW fault, and is only reclaimed after
+both tasks release all caps and mappings.
+
+### N+19.4 — Failed-clone rollback: parent write permissions restored
+
+A test must force `clone_user_address_space_cow` to fail (fill COW capacity) and
+then verify that every parent page that was write-protected during the partial clone
+has its write permission restored. Without rollback, a write to those pages causes
+an unhandled fault (no COW record, not demand-paged).
+
+### N+19.5 — Failed-clone rollback: no stale COW records
+
+After a failed clone, the parent must have zero COW records for the pages that were
+partially processed. Test by counting `cow_pages` entries for the parent asid after
+the failed fork.
+
+### N+19.6 — Read-only pages shared without COW marking
+
+A page that is already read-only before fork must be shared in the child without
+being marked as a COW page in either asid. The child gets the same physical frame
+(map_refcount increments) but neither `is_cow_page(parent, virt)` nor
+`is_cow_page(child, virt)` must return true.
+
+### N+19.7 — Full suite at 663+ tests (single-threaded)
+
+Every Stage 12 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 663 tests (652 from Stage 10+11 + 11 new Stage 12 tests).

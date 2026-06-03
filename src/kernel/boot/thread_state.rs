@@ -5,10 +5,11 @@ use super::{KernelError, KernelState};
 use crate::kernel::capabilities::CapObject;
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::task::{
-    KernelExecutionContext, RobustFutexState, TaskStatus, ThreadDetachState, ThreadGroupId,
-    UserRegisterContext, WaitReason,
+    KernelExecutionContext, RobustFutexState, TaskClass, TaskStatus, ThreadControlBlock,
+    ThreadDetachState, ThreadGroupId, UserRegisterContext, WaitReason,
 };
 use crate::kernel::trapframe::TrapFrame;
+use crate::kernel::vm::Asid;
 
 const KERNEL_STACK_REGION_BASE: usize = 0xFFFF_8000_0000_0000;
 const KERNEL_STACK_REGION_SIZE: usize = 0x4000;
@@ -629,6 +630,23 @@ impl KernelState {
         let parent_asid = parent.asid.ok_or(KernelError::UserMemoryFault)?;
         let child_asid = self.clone_user_address_space_cow(parent_asid)?;
 
+        // All steps below must destroy child_asid on failure to prevent leaking
+        // the cloned address space when post-clone task setup fails.
+        let result =
+            self.fork_complete_post_clone(parent, parent_class, child_asid, parent_tid);
+        if result.is_err() {
+            let _ = self.destroy_user_address_space_by_asid(child_asid);
+        }
+        result
+    }
+
+    fn fork_complete_post_clone(
+        &mut self,
+        parent: ThreadControlBlock,
+        parent_class: TaskClass,
+        child_asid: Asid,
+        parent_tid: u64,
+    ) -> Result<u64, KernelError> {
         let child_tid = self.allocate_thread_id()?;
         self.register_task_with_class(child_tid, parent_class)?;
         let child_cnode = self.task_cnode(child_tid).ok_or(KernelError::TaskMissing)?;
