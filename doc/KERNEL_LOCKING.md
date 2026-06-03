@@ -6632,3 +6632,166 @@ x86_64 -smp 1 smoke required: live lifecycle/scheduler/task behavior changed
 | `src/kernel/boot/tests.rs` | 14 new Stage 15 lifecycle tests (TIDs 200–270) |
 | `doc/KERNEL_LOCKING.md` | §33 (this section) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+22 (Stage 15 test rules) |
+
+## §34 — Stage 16: timeout/deadline/block-state cleanup + scheduler wait-state consistency
+
+### 34.1 Stage 15 x86_64 -smp 1 smoke acceptance
+
+Stage 15 accepted. x86_64 -smp 1 smoke passed clean.
+
+| Counter | Value |
+|---------|-------|
+| X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY | 0 |
+| X86_BOOTSTRAP_SCHEDULER_READY | 1 |
+| X86_BOOTSTRAP_TIMER_STARTED | 1 |
+| ENTER_USER | 3 |
+| STARTUP_INSTALL_FINAL | 9 |
+| PM_ELF_ZC_DONE total | 3 |
+| ZC nonzero pages | 3 |
+| PM_ELF_ZC_FAIL | 0 |
+| INITRAMFS_SRV_ENTRY | 1 |
+| DEVFS_SRV_ENTRY | 1 |
+| VFS_SRV_ENTRY | 1 |
+| DRIVER_MANAGER_READY | 1 |
+| BLKCACHE_SRV_READY | 1 |
+| VIRTIO_BLK_SRV_READY | 1 |
+| fallback | 0 |
+| TID mismatch | 0 |
+| fatal-ish | 0 |
+| oom/capacity | 0 |
+| cap/refcount suspicious | 0 |
+
+x86_64 SMP remains deferred. AArch64 smoke data not available.
+
+### 34.2 Blocking/timeout domain map
+
+| Path | Class | Waiter state owner | Deadline state | Scheduler state | Stale-entry risk |
+|------|-------|-------------------|----------------|-----------------|-----------------|
+| IPC recv block | A/K | `endpoint_waiters[ep]` | `tcb.ipc_timeout_deadline` | task_state_lock (rank 2) | Low — slot cleared on wake/exit |
+| IPC send block | A/K | `endpoint_sender_waiters[ep][i]` | `tcb.ipc_timeout_deadline` | task_state_lock | Low — slot cleared on wake/timeout/exit |
+| IPC recv timeout | C/G | same slot | cleared in `process_ipc_timeout_deadlines` | set Runnable, enqueue | **Fixed**: skip Exited/Dead (stage 16 WakeTask fix) |
+| IPC send deadline | C/F | same slot | cleared in `process_ipc_timeout_deadlines` | set Runnable, enqueue | Low — blocked_ipc guard |
+| IPC delivery before timeout | B/G | `take()` from slot | cleared by `clear_ipc_timeout_for_tid` via `wake_tid_to_runnable` | set Runnable, enqueue | None — delivery clears both |
+| IPC exit before timeout | D/G | cleared by `clear_ipc_waiters_for_tid` | stale in TCB but harmless (Exited skipped) | Exited status prevents re-enqueue | Low |
+| Futex wait | A | TCB status = Blocked(Futex) | none (no futex timeout) | task_state_lock | N/A |
+| Futex wake | B/H | TCB status scan | n/a | set Runnable, enqueue | Low — status match required |
+| Futex exit cleanup | D/H | via `exit_task` Blocked(Futex) check | n/a | Exited overrides Blocked | Low |
+| Join wait | A | TCB status = Blocked(Join) | none (no join timeout) | task_state_lock | N/A |
+| Join target exit | B/I | `wake_joiners_for` sets Runnable | n/a | enqueue | Low |
+| Joiner exit | E | `exit_task` → status = Exited | n/a | Exited | Low |
+| mark_task_dead while blocked | E | `clear_ipc_waiters_for_tid` | stale in TCB (harmless) | Dead status prevents re-enqueue | Low |
+| notification waiter exit | J | `clear_ipc_waiters_for_tid` | n/a | Exited | Low |
+| WakeTask cross-CPU | B/L | TCB status check | n/a | **Fixed**: only Blocked→Runnable | **Fixed** — was unconditional |
+| Timer tick deadline handling | C/K | `process_ipc_timeout_deadlines` | cleared | set Runnable, enqueue | Low — blocked_ipc guard filters non-IPC |
+| Scheduler yield/preempt | L | n/a | n/a | runs on Runnable tasks | Low |
+
+### 34.3 Block-state invariants
+
+1. A task may be in a run queue only if its TCB status is Runnable/Running-compatible.
+2. A task blocked on endpoint receiver waiter must not also be in the run queue.
+3. A task blocked as endpoint sender waiter must not also be in the run queue.
+4. A task blocked on futex must not also be in the run queue.
+5. A task blocked on join must not also be in the run queue.
+6. Dead/Exited tasks must not be endpoint receiver waiters (enforced by `clear_ipc_waiters_for_tid`).
+7. Dead/Exited tasks must not be sender waiters (enforced by `clear_ipc_waiters_for_tid`).
+8. Dead/Exited tasks must not be notification waiters (enforced by `clear_ipc_waiters_for_tid`).
+9. Dead/Exited tasks must not be futex waiters (status overwritten; `futex_waiter_count` checks Blocked(Futex)).
+10. Dead/Exited tasks must not be join waiters (status overwritten; `wake_joiners_for` pattern match required).
+11. Dead/Exited tasks must not be resurrected by `WakeTask` cross-CPU work items (**fixed Stage 16**).
+12. A successful delivery/wake calls `clear_ipc_timeout_for_tid` to prevent later timeout from misfiring.
+13. A timeout clears the waiter slot and sets `ipc_timeout_deadline = None` before enqueuing.
+14. Exit/death calls `clear_ipc_waiters_for_tid`; stale `ipc_timeout_deadline` in Exited TCBs is harmless (blocked_ipc guard in `process_ipc_timeout_deadlines`).
+15. No timeout path may set Runnable on a Dead or Exited task (blocked_ipc guard + status check).
+16. No IPC message delivered to a cleared waiter slot (slot is atomically taken under ipc_state_lock).
+17. Futex wake requires `Blocked(Futex(addr))` status match; stale/dead waiters do not match.
+18. Join wake requires `Blocked(Join(tid))` status match.
+19. Duplicate wake is harmless: `wake_tid_to_runnable` accepts Runnable/Running and skips status update if already Runnable.
+20. Duplicate timeout is prevented: `ipc_timeout_deadline` is cleared on first fire; subsequent `process_ipc_timeout_deadlines` calls skip it.
+
+### 34.4 Timeout/deadline lifecycle rules
+
+- IPC recv/send timeouts are per-TCB (`ipc_timeout_deadline`, `ipc_timeout_fired`).
+- Deadline set in `block_current_on_receive_with_deadline` / `block_current_on_send_with_deadline`.
+- Deadline cleared in `clear_ipc_timeout_for_tid` (called from `wake_tid_to_runnable`).
+- Timeout fired in `process_ipc_timeout_deadlines` (timer ISR path).
+- Stale deadline in Exited TCB is harmless: `blocked_ipc` guard skips non-IPC-blocked tasks.
+- Futex and join have no timeouts in this kernel version.
+
+### 34.5 Cancel-on-exit/death rules
+
+1. `exit_task` calls `clear_ipc_waiters_for_tid` (all three waiter arrays).
+2. `mark_task_dead` calls `clear_ipc_waiters_for_tid` (idempotent).
+3. `clear_ipc_waiters_for_tid` is idempotent — calling twice is safe.
+4. After `exit_task`, `ipc_timeout_deadline` in TCB may be non-None (harmless: Exited status blocks timeout path).
+5. After `mark_task_dead`, the TCB status is Dead which also blocks the timeout path.
+6. Robust futex cleanup uses `futex_wake_on_exit` (no ASID validation) — Stage 15 fix preserved.
+
+### 34.6 Wake-outside-lock rules
+
+| Path | Mutation under lock | Wake outside lock |
+|------|--------------------|--------------------|
+| `send_message_to_endpoint_and_wake` | enqueue under `ipc_state_lock` (rank 3) | `wake_waiter_for_endpoint` after release |
+| `ipc_recv_endpoint_take` (Stage 4D) | dequeue + refill under `ipc_state_lock` | `apply_split_sender_wake_plan` after release |
+| `process_ipc_timeout_deadlines` | TCB scan + waiter clear under both locks | `enqueue_task` after both locks released |
+| `futex_wake_inner` | TCB scan + status set under `task_state_lock` | `enqueue_task` after lock released |
+| `wake_joiners_for` | TCB scan + status set under `task_state_lock` | `enqueue_task` after lock released |
+
+### 34.7 Production bug fixed (Stage 16)
+
+**`WorkItem::WakeTask` in `scheduler_state.rs`**: The cross-CPU wake path set
+`tcb.status = TaskStatus::Runnable` unconditionally, including for Dead/Exited/Runnable
+tasks.  Fixed: only Blocked tasks are transitioned to Runnable; Dead/Exited/Runnable
+skip the enqueue.  This prevents stale cross-CPU wake items from resurrecting terminated
+tasks or duplicating run-queue entries.
+
+### 34.8 Stage 16 test inventory
+
+| Test | TID(s) | Verifies |
+|------|--------|---------|
+| `recv_timeout_process_clears_endpoint_waiter_and_deadline` | 280 | waiter + deadline cleared after timeout fires |
+| `send_deadline_process_clears_sender_waiter_and_deadline` | 281 | sender waiter + deadline cleared after send timeout |
+| `exit_before_ipc_recv_timeout_clears_waiter_and_deadline` | 282 | exit_task clears recv waiter; Exited skipped by timeout |
+| `ipc_deadline_count_helper_reports_set_and_cleared` | 283 | `ipc_deadline_count_for_tid` helper |
+| `ipc_timeout_does_not_fire_for_futex_blocked_task` | 284 | IPC timeout path skips Futex-blocked tasks |
+| `repeated_recv_timeout_cycles_no_stale_receiver_waiter` | 285-288 | Stress: 4 recv-timeout cycles no stale waiter |
+| `task_helpers_runnable_blocked_dead_consistent` | 290 | `task_is_runnable`, `task_is_blocked`, `task_blocked_reason` helpers |
+| `notification_waiter_count_reflects_exit_cleanup` | 291 | `notification_waiter_count` helper + exit cleanup |
+| `wake_endpoint_waiter_dead_task_does_not_resurrect_task` | 292 | Dead waiter not resurrected by wake_waiter_for_endpoint |
+| `wake_endpoint_waiter_exited_task_does_not_resurrect_task` | 293 | Exited waiter not resurrected |
+| `exit_then_mark_dead_waiter_cleanup_is_idempotent` | 300 | Idempotency of exit + mark_dead waiter cleanup |
+| `clear_ipc_waiters_is_idempotent_for_all_waiter_types` | 301 | Double-clear is safe for all three waiter arrays |
+| `timeout_fires_then_exit_no_double_disruption` | 302 | Timeout then exit: no double-clean panic |
+| `wake_task_cross_cpu_work_skips_dead_task` | 306 | WakeTask noop for Dead task (**new bug fix test**) |
+| `wake_task_cross_cpu_work_skips_exited_task` | 307 | WakeTask noop for Exited task |
+| `wake_task_cross_cpu_work_skips_runnable_task` | 308 | WakeTask noop for already-Runnable task |
+| `repeated_send_deadline_cycles_no_stale_sender_waiter` | 311-314 | Stress: 4 send-deadline cycles no stale waiter |
+| `repeated_mixed_waiter_block_exit_no_stale_state` | 315-317 | Exit clears recv/sender/notification waiters |
+| `ipc_deadline_cleared_after_delivery_before_timeout` | 318 | Delivery clears deadline; later timeout is no-op |
+| `repeated_recv_block_timeout_delivery_no_stale_timeout` | 319-322 | Stress: 4 delivery-before-timeout cycles, no stale flag |
+
+### 34.9 Deferred items
+
+- Futex timeout (timed futex_wait): not implemented. Current futex wait is non-timeout.
+- Join timeout (timed join_thread): not implemented. Current join wait is non-timeout.
+- Full global-lock-removal: deferred (requires cooperative dispatch for hosted-dev).
+- x86_64 SMP (multi-core run-queue balancing): deferred.
+- RAMFS/FAT runtime spawning: untouched, deferred.
+
+### 34.10 Stage 16 acceptance
+
+710 tests pass single-threaded (`cargo test --lib -- --test-threads=1`).
+20 new Stage 16 tests added (TIDs 280–322).
+`cargo check --no-default-features` clean.
+`cargo check --features hosted-dev` clean.
+x86_64 -smp 1 smoke required: live scheduler (WakeTask path) behavior changed.
+
+### 34.11 Files changed (Stage 16)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/scheduler_state.rs` | Fix `WorkItem::WakeTask`: guard Blocked→Runnable only |
+| `src/kernel/boot/ipc_state.rs` | `notification_waiter_count`, `ipc_deadline_count_for_tid` test helpers |
+| `src/kernel/boot/task_core_state.rs` | `task_is_runnable`, `task_is_blocked`, `task_blocked_reason` test helpers |
+| `src/kernel/boot/tests.rs` | 20 new Stage 16 tests (TIDs 280–322) |
+| `doc/KERNEL_LOCKING.md` | §34 (this section) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+23 (Stage 16 test rules) |

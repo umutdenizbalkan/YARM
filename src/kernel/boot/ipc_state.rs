@@ -164,6 +164,34 @@ impl KernelState {
         })
     }
 
+    /// Count non-None notification_waiters slots for a given notification index.
+    #[cfg(test)]
+    pub(crate) fn notification_waiter_count(&self, notification_idx: usize) -> usize {
+        self.with_ipc_state(|ipc| {
+            if ipc
+                .notification_waiters
+                .get(notification_idx)
+                .and_then(|w| *w)
+                .is_some()
+            {
+                1
+            } else {
+                0
+            }
+        })
+    }
+
+    /// Return 1 if `tid` has a non-None `ipc_timeout_deadline`, else 0.
+    #[cfg(test)]
+    pub(crate) fn ipc_deadline_count_for_tid(&self, tid: u64) -> usize {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map_or(0, |tcb| if tcb.ipc_timeout_deadline.is_some() { 1 } else { 0 })
+        })
+    }
+
     /// Count tasks blocked with WaitReason::Join(target_tid) for test assertions.
     #[cfg(test)]
     pub(crate) fn join_waiter_count(&self, target_tid: u64) -> usize {

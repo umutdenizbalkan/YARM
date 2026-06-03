@@ -1645,3 +1645,58 @@ Every Stage 15 commit must pass `cargo test --lib -- --test-threads=1` with at
 least 690 tests (676 from Stage 14 + 14 new Stage 15 tests).
 Both `cargo check --no-default-features` and `cargo check --features hosted-dev`
 must be clean.
+
+## N+23 — Stage 16 timeout/deadline/block-state test rules
+
+### N+23.1 — IPC timeout must clear both waiter slot and TCB deadline
+
+Every test that exercises `process_ipc_timeout_deadlines` must assert both:
+- `endpoint_waiter_count` (or `sender_waiter_count`) == 0 after the timeout fires
+- `ipc_deadline_count_for_tid` == 0 for the expired task
+
+Checking only the TCB status or only the waiter slot is insufficient.
+
+### N+23.2 — Exit before timeout must leave Exited status immune to timeout processing
+
+When `exit_task` is called before the deadline fires, `process_ipc_timeout_deadlines`
+must not set the task back to Runnable.  A test must verify that calling
+`process_ipc_timeout_deadlines(deadline)` on an Exited task returns 0 expired.
+
+### N+23.3 — Delivery before timeout must clear deadline and prevent later firing
+
+When a receiver waiter is woken by message delivery (not timeout), the IPC deadline
+in the TCB must be cleared (by `clear_ipc_timeout_for_tid` in `wake_tid_to_runnable`).
+A test must verify that `process_ipc_timeout_deadlines(deadline)` is a no-op after
+delivery, and `ipc_timeout_fired` must be false.
+
+### N+23.4 — WakeTask cross-CPU must not resurrect Dead or Exited tasks
+
+Tests for `WorkItem::WakeTask` must verify that Dead and Exited tasks are unaffected
+by the cross-CPU wake item.  The fix (Stage 16) checks `Blocked(_)` before transitioning
+to Runnable.  Tests must assert `task_is_dead` or `task_is_exited` remains true.
+
+### N+23.5 — clear_ipc_waiters_for_tid must be idempotent
+
+Calling `clear_ipc_waiters_for_tid(tid)` twice must produce the same result as
+calling it once.  A test must inject waiters in all three arrays and verify that
+double-clearing does not panic or corrupt state.
+
+### N+23.6 — IPC timeout must skip non-IPC-blocked tasks
+
+A task with `ipc_timeout_deadline` set but `Blocked(Futex(_))` or `Blocked(Join(_))`
+status must not be expired by `process_ipc_timeout_deadlines`.  This guards the
+`blocked_ipc` filter in the timeout path.
+
+### N+23.7 — Test helpers must reflect live kernel state
+
+`notification_waiter_count`, `ipc_deadline_count_for_tid`, `task_is_runnable`,
+`task_is_blocked`, `task_blocked_reason` must be used instead of direct field access
+in new tests.  These helpers are stable across refactors; direct field access may
+silently pass after a storage layout change.
+
+### N+23.8 — Full suite at 710+ tests (single-threaded)
+
+Every Stage 16 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 710 tests (690 from Stage 15 + 20 new Stage 16 tests).
+Both `cargo check --no-default-features` and `cargo check --features hosted-dev`
+must be clean.
