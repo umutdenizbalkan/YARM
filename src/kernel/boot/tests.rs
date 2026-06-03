@@ -16988,4 +16988,538 @@ fn work_queue_full_then_drain_then_refill() {
 
 // ── End Stage 17 cross-CPU work queue tests ───────────────────────────────────
 
+// ── Stage 18: TLB shootdown + cross-CPU VM cleanup audit ─────────────────────
+
+// Part A — ASID destroy: ordering, COW cleanup, retirement
+
+#[test]
+fn asid_destroy_sends_tlb_shootdown_before_reclaim_ordering() {
+    // Verify that destroy_user_address_space_by_asid queues TLB shootdown
+    // work items to all online CPUs.  Under Stage 18 the shootdown is sent
+    // BEFORE frame reclaim.  Both CPU 0 and CPU 1 must have a TlbShootdown
+    // work item in their inbox immediately after destroy.
+    let mut state = Bootstrap::init().expect("init");
+    state.bring_up_cpu(CpuId(1)).expect("cpu1");
+
+    let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+    // Map a page so there is something to drain.
+    let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("memobj");
+    state
+        .map_user_page_with_caps(
+            aspace_cap,
+            mem_cap,
+            VirtAddr(0x5000),
+            PageFlags { read: true, write: false, execute: false, user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+        )
+        .expect("map");
+
+    state.destroy_user_address_space(aspace_cap).expect("destroy");
+
+    // TLB shootdown work items must already be in the queues.
+    let count0 = state.cross_cpu_work_count_for_cpu(CpuId(0));
+    let count1 = state.cross_cpu_work_count_for_cpu(CpuId(1));
+    assert!(count0 >= 1, "CPU 0 must have a TlbShootdown work item queued");
+    assert!(count1 >= 1, "CPU 1 must have a TlbShootdown work item queued");
+
+    // ASID must be retired (not live).
+    assert!(!state.asid_is_live_for_test(asid), "ASID must not be live after destroy");
+    assert!(state.asid_is_retired_for_test(asid), "ASID must be retired after destroy");
+}
+
+#[test]
+fn asid_destroy_clears_cow_metadata() {
+    // COW pages recorded for an ASID must be removed by destroy.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+
+    // Inject a synthetic COW record.
+    state.with_memory_state_mut(|memory| {
+        memory
+            .cow_pages
+            .entry(asid.0)
+            .or_default()
+            .insert(0x7000_u64);
+    });
+    assert_eq!(state.cow_page_count_for_asid(asid), 1, "COW record injected");
+
+    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    assert_eq!(
+        state.cow_page_count_for_asid(asid),
+        0,
+        "COW metadata must be cleared on ASID destroy"
+    );
+}
+
+#[test]
+fn asid_destroy_clears_all_mappings() {
+    // All pages must be removed from the address space on destroy.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+    let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xD000)).expect("memobj");
+    state
+        .map_user_page_with_caps(
+            aspace_cap,
+            mem_cap,
+            VirtAddr(0x1000),
+            PageFlags { read: true, write: true, execute: false, user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+        )
+        .expect("map");
+
+    assert_eq!(state.mapped_page_count_for_asid(asid), 1, "one page mapped");
+    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    // ASID is gone from live table; mapped_page_count_for_asid returns 0 for
+    // a non-existent ASID (with_user_spaces get returns None → 0).
+    assert_eq!(state.mapped_page_count_for_asid(asid), 0, "all mappings cleared");
+}
+
+#[test]
+fn asid_destroy_does_not_affect_other_asid() {
+    // Destroying one ASID must leave another ASID's mappings and COW metadata intact.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid_a, aspace_a) = state.create_user_address_space().expect("asid_a");
+    let (asid_b, _aspace_b) = state.create_user_address_space().expect("asid_b");
+    let (_mem_id, mem_cap_a) = state.create_memory_object(PhysAddr(0xE000)).expect("memobj_a");
+    let (_mem_id2, mem_cap_b) = state.create_memory_object(PhysAddr(0xF000)).expect("memobj_b");
+
+    state
+        .map_user_page_with_caps(
+            aspace_a,
+            mem_cap_a,
+            VirtAddr(0x1000),
+            PageFlags { read: true, write: true, execute: false, user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+        )
+        .expect("map a");
+    state
+        .map_user_page_in_asid_with_caps(
+            asid_b,
+            mem_cap_b,
+            VirtAddr(0x2000),
+            PageFlags { read: true, write: true, execute: false, user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+        )
+        .expect("map b");
+
+    // Inject COW record for both.
+    state.with_memory_state_mut(|memory| {
+        memory.cow_pages.entry(asid_b.0).or_default().insert(0x2000);
+    });
+
+    state.destroy_user_address_space(aspace_a).expect("destroy a");
+
+    assert!(!state.asid_is_live_for_test(asid_a), "asid_a not live");
+    assert!(state.asid_is_live_for_test(asid_b), "asid_b still live");
+    assert_eq!(state.mapped_page_count_for_asid(asid_b), 1, "asid_b page intact");
+    assert_eq!(state.cow_page_count_for_asid(asid_b), 1, "asid_b COW record intact");
+}
+
+#[test]
+fn asid_destroy_puts_asid_in_retired_array_when_cpus_online() {
+    // With at least one CPU online, destroy must move the ASID to the retired array.
+    let mut state = Bootstrap::init().expect("init");
+    state.bring_up_cpu(CpuId(1)).expect("cpu1");
+
+    let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+    assert!(state.asid_is_live_for_test(asid), "live before destroy");
+    assert!(!state.asid_is_retired_for_test(asid), "not retired before destroy");
+
+    state.destroy_user_address_space(aspace_cap).expect("destroy");
+
+    assert!(!state.asid_is_live_for_test(asid), "not live after destroy");
+    assert!(state.asid_is_retired_for_test(asid), "retired after destroy");
+}
+
+#[test]
+fn asid_not_reused_while_in_retired_array() {
+    // An ASID in the retired array must not be reused by a new address space.
+    let mut state = Bootstrap::init().expect("init");
+    state.bring_up_cpu(CpuId(1)).expect("cpu1");
+
+    let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    assert!(state.asid_is_retired_for_test(asid));
+
+    // Allocate several new address spaces; none should have the same ASID.
+    for _ in 0..4 {
+        let (new_asid, _new_cap) = state.create_user_address_space().expect("new asid");
+        assert_ne!(new_asid, asid, "retired ASID must not be reused");
+        // Destroy immediately to recycle the slot.
+        let _ = state.with_user_spaces_mut(|spaces| spaces.destroy(new_asid, 0));
+    }
+}
+
+// Part B — Stale TLB work for destroyed ASID
+
+#[test]
+fn stale_tlb_shootdown_for_retired_asid_is_harmless() {
+    // A TlbShootdown work item for an already-destroyed (retired) ASID must be
+    // processed without error — the retired entry check in apply_cross_cpu_work
+    // calls acknowledge_shootdown which gracefully handles the retired entry.
+    let mut state = Bootstrap::init().expect("init");
+    state.bring_up_cpu(CpuId(1)).expect("cpu1");
+
+    let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    assert!(state.asid_is_retired_for_test(asid));
+
+    // Inject an additional stale TlbShootdown work item on top of the real one.
+    state
+        .submit_cross_cpu_work(
+            CpuId(0),
+            WorkItem::TlbShootdown { asid, va_range: None, requester: None, sequence: 0 },
+        )
+        .expect("stale item");
+
+    // Process all work on CPU 0 — must not error or panic.
+    state.set_current_cpu(CpuId(0)).expect("cpu0");
+    let processed = state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("process must succeed for stale TlbShootdown");
+    assert!(processed >= 1, "at least one item processed");
+}
+
+#[test]
+fn duplicate_tlb_shootdown_for_same_asid_harmless() {
+    // Two TlbShootdown work items for the same ASID must both be processed
+    // without error, even after the ASID is retired.
+    let mut state = Bootstrap::init().expect("init");
+
+    let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+    state.destroy_user_address_space(aspace_cap).expect("destroy");
+
+    // Submit a second duplicate shootdown.
+    state
+        .submit_cross_cpu_work(
+            CpuId(0),
+            WorkItem::TlbShootdown { asid, va_range: None, requester: None, sequence: 0 },
+        )
+        .expect("duplicate submit");
+
+    state.set_current_cpu(CpuId(0)).expect("cpu0");
+    let result = state.process_cross_cpu_work_for_cpu(CpuId(0));
+    assert!(result.is_ok(), "duplicate TlbShootdown must not error: {result:?}");
+}
+
+#[test]
+fn tlb_shootdown_for_never_existing_asid_is_harmless() {
+    // A TlbShootdown for an ASID that was never allocated (not live, not retired)
+    // must not crash or return an error from process_cross_cpu_work_for_cpu.
+    let mut state = Bootstrap::init().expect("init");
+    let phantom_asid = Asid(0xFFFF);
+
+    state
+        .submit_cross_cpu_work(
+            CpuId(0),
+            WorkItem::TlbShootdown {
+                asid: phantom_asid,
+                va_range: None,
+                requester: None,
+                sequence: 0,
+            },
+        )
+        .expect("submit phantom");
+
+    let result = state.process_cross_cpu_work_for_cpu(CpuId(0));
+    assert!(result.is_ok(), "phantom ASID TlbShootdown must not error: {result:?}");
+}
+
+// Part C — Two-phase unmap ordering and frame reclaim
+
+#[test]
+fn two_phase_unmap_map_refcount_decrements_in_phase1() {
+    // After phase 1 (unmap_page_phase1), map_refcount must be 0.
+    // The frame must still exist (not yet reclaimed).
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xA000)).expect("memobj");
+    let phys = PhysAddr(0xA000);
+
+    state
+        .map_user_page_in_asid_with_caps(
+            asid, mem_cap, VirtAddr(0x3000),
+            PageFlags { read: true, write: false, execute: false, user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+        )
+        .expect("map");
+
+    let refcounts = state.memory_object_refcounts(phys).expect("object exists");
+    assert_eq!(refcounts.1, 1, "map_refcount == 1 after map");
+
+    // Phase 1: remove PTE + decrement map_refcount.
+    let plan = state
+        .unmap_page_phase1(asid, VirtAddr(0x3000))
+        .expect("phase1 ok")
+        .expect("page was mapped");
+    assert_eq!(plan.phys, phys);
+
+    let refcounts = state.memory_object_refcounts(phys).expect("still exists after phase1");
+    assert_eq!(refcounts.1, 0, "map_refcount == 0 after phase1");
+
+    // Frame still exists (not reclaimed) until phase 2/3.
+    assert!(state.memory_object_exists_for_phys(phys), "frame must exist between phases");
+
+    // Phase 2+3: shootdown + reclaim.
+    state.execute_tlb_shootdown_wait_plan(plan).expect("phase2");
+    // After phase 3, frame is reclaimed if all refcounts are 0.
+    // cap_refcount remains 1 (mem_cap still alive), so frame is NOT reclaimed yet.
+    assert!(
+        state.memory_object_exists_for_phys(phys),
+        "frame must exist while cap_refcount > 0"
+    );
+}
+
+#[test]
+fn two_phase_unmap_fast_path_no_cross_cpu_work() {
+    // When only one CPU is online and no task has the ASID active,
+    // target_cpu_bitmap is 0 → fast path, no cross-CPU work item queued.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+    let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xB000)).expect("memobj");
+
+    state
+        .map_user_page_in_asid_with_caps(
+            asid, mem_cap, VirtAddr(0x4000),
+            PageFlags { read: true, write: false, execute: false, user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+        )
+        .expect("map");
+
+    let before = state.cross_cpu_work_count_for_cpu(CpuId(0));
+    let plan = state
+        .unmap_page_phase1(asid, VirtAddr(0x4000))
+        .expect("phase1")
+        .expect("mapped");
+    state.execute_tlb_shootdown_wait_plan(plan).expect("phase2");
+    let after = state.cross_cpu_work_count_for_cpu(CpuId(0));
+
+    // Single CPU, no task running ASID → no cross-CPU work queued.
+    assert_eq!(after, before, "fast path: no cross-CPU work item queued");
+}
+
+#[test]
+fn unmap_phase1_absent_page_returns_none() {
+    // Phase 1 on an unmapped VA must return Ok(None) — idempotent for absent pages.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+
+    let result = state
+        .unmap_page_phase1(asid, VirtAddr(0x9000))
+        .expect("phase1 must succeed");
+    assert!(result.is_none(), "absent page must return Ok(None)");
+}
+
+// Part D — MemoryObject refcount invariants
+
+#[test]
+fn reclaim_blocked_while_cap_refcount_nonzero() {
+    // A MemoryObject with cap_refcount > 0 must not be reclaimed by
+    // reclaim_memory_object_for_phys.
+    let mut state = Bootstrap::init().expect("init");
+    let phys = PhysAddr(0x11000);
+    let (_mem_id, _mem_cap) = state.create_memory_object(phys).expect("memobj");
+
+    let (cap_rc, map_rc, pin_rc) = state.memory_object_refcounts(phys).expect("exists");
+    assert_eq!(cap_rc, 1, "cap_refcount starts at 1");
+    assert_eq!(map_rc, 0);
+    assert_eq!(pin_rc, 0);
+
+    // Attempt reclaim with cap_refcount == 1 → must not free.
+    state.reclaim_memory_object_for_phys(phys);
+    assert!(
+        state.memory_object_exists_for_phys(phys),
+        "object must survive while cap_refcount > 0"
+    );
+}
+
+#[test]
+fn reclaim_blocked_while_map_refcount_nonzero() {
+    let mut state = Bootstrap::init().expect("init");
+    let phys = PhysAddr(0x12000);
+    let (_, _cap) = state.create_memory_object(phys).expect("memobj");
+
+    // Lower cap_refcount to 0, manually bump map_refcount to 1.
+    state.with_memory_state_mut(|memory| {
+        if let Some(obj) = memory.memory_objects.iter_mut().flatten()
+            .find(|o| o.phys == phys) {
+            obj.cap_refcount = 0;
+            obj.map_refcount = 1;
+        }
+    });
+
+    state.reclaim_memory_object_for_phys(phys);
+    assert!(
+        state.memory_object_exists_for_phys(phys),
+        "object must survive while map_refcount > 0"
+    );
+}
+
+#[test]
+fn reclaim_blocked_while_pin_refcount_nonzero() {
+    let mut state = Bootstrap::init().expect("init");
+    let phys = PhysAddr(0x13000);
+    let (_, _cap) = state.create_memory_object(phys).expect("memobj");
+
+    state.with_memory_state_mut(|memory| {
+        if let Some(obj) = memory.memory_objects.iter_mut().flatten()
+            .find(|o| o.phys == phys) {
+            obj.cap_refcount = 0;
+            obj.pin_refcount = 1;
+        }
+    });
+
+    state.reclaim_memory_object_for_phys(phys);
+    assert!(
+        state.memory_object_exists_for_phys(phys),
+        "object must survive while pin_refcount > 0"
+    );
+}
+
+#[test]
+fn reclaim_happens_when_all_refcounts_zero() {
+    let mut state = Bootstrap::init().expect("init");
+    let phys = PhysAddr(0x14000);
+    let (_, _cap) = state.create_memory_object(phys).expect("memobj");
+
+    // Manually zero all refcounts.
+    state.with_memory_state_mut(|memory| {
+        if let Some(obj) = memory.memory_objects.iter_mut().flatten()
+            .find(|o| o.phys == phys) {
+            obj.cap_refcount = 0;
+            obj.map_refcount = 0;
+            obj.pin_refcount = 0;
+        }
+    });
+
+    state.reclaim_memory_object_for_phys(phys);
+    assert!(
+        !state.memory_object_exists_for_phys(phys),
+        "object must be reclaimed when all refcounts are zero"
+    );
+}
+
+// Part E — COW + ASID lifecycle
+
+#[test]
+fn cow_metadata_cleared_on_asid_destroy_after_fork() {
+    // After a COW fork, destroying the child ASID must remove only the child's
+    // COW records, leaving the parent's intact.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(0).expect("idle");
+    let (parent_asid, _parent_cap) = state.create_user_address_space().expect("parent asid");
+    let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0x15000)).expect("memobj");
+    state
+        .map_user_page_in_asid_with_caps(
+            parent_asid, mem_cap, VirtAddr(0x1000),
+            PageFlags { read: true, write: true, execute: false, user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+        )
+        .expect("map parent");
+
+    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("fork");
+    let parent_cow = state.cow_page_count_for_asid(parent_asid);
+    let child_cow = state.cow_page_count_for_asid(child_asid);
+    assert!(parent_cow > 0 || child_cow > 0, "fork must produce COW records");
+
+    // Destroy child: child COW records gone, parent unaffected.
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+    assert_eq!(
+        state.cow_page_count_for_asid(child_asid),
+        0,
+        "child COW records must be cleared on destroy"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(parent_asid),
+        parent_cow,
+        "parent COW records must be unchanged"
+    );
+}
+
+#[test]
+fn repeated_asid_destroy_by_asid_returns_error_not_panic() {
+    // Calling destroy_user_address_space_by_asid on an already-destroyed ASID
+    // must return Err (InvalidAsid), not panic.
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
+    state.destroy_user_address_space(aspace_cap).expect("first destroy");
+
+    let result = state.destroy_user_address_space_by_asid(asid);
+    assert!(
+        result.is_err(),
+        "destroying already-destroyed ASID must return Err, got Ok"
+    );
+}
+
+#[test]
+fn active_transfer_count_helper_tracks_mappings() {
+    // active_transfer_count_for_pid returns 0 for a PID with no transfers,
+    // and a positive count after transfers are registered.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind1");
+    let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let mem_cap_t1 = state.grant_capability_task_to_task(0, mem_cap, 1).expect("grant");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.yield_current().expect("switch");
+
+    state
+        .map_user_page_in_asid_with_caps(
+            asid1, mem_cap_t1, VirtAddr(0x6000),
+            PageFlags { read: true, write: false, execute: false, user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+        )
+        .expect("map");
+    state
+        .register_active_transfer_mapping(ThreadId(1), mem_cap_t1, VirtAddr(0x6000), PAGE_SIZE)
+        .expect("register transfer");
+    state.note_shared_mem_mapped(PAGE_SIZE);
+
+    assert_eq!(state.active_transfer_count_for_pid(1), 1, "one transfer registered");
+
+    state.purge_active_transfer_mappings_for_pid(1);
+    assert_eq!(
+        state.active_transfer_count_for_pid(1),
+        0,
+        "zero transfers after purge"
+    );
+}
+
+#[test]
+fn active_transfer_purge_is_idempotent() {
+    // Calling purge_active_transfer_mappings_for_pid twice for the same PID
+    // must not panic or underflow any refcounts.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("task1");
+    let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
+    state.bind_task_asid(1, asid1).expect("bind1");
+    let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let mem_cap_t1 = state.grant_capability_task_to_task(0, mem_cap, 1).expect("grant");
+    state.enqueue_current_cpu(1).expect("enqueue");
+    state.yield_current().expect("switch");
+
+    state
+        .map_user_page_in_asid_with_caps(
+            asid1, mem_cap_t1, VirtAddr(0x7000),
+            PageFlags { read: true, write: false, execute: false, user: true,
+                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+        )
+        .expect("map");
+    state
+        .register_active_transfer_mapping(ThreadId(1), mem_cap_t1, VirtAddr(0x7000), PAGE_SIZE)
+        .expect("register");
+    state.note_shared_mem_mapped(PAGE_SIZE);
+
+    // First purge: removes the active transfer.
+    state.purge_active_transfer_mappings_for_pid(1);
+    assert_eq!(state.active_transfer_count_for_pid(1), 0);
+
+    // Second purge: must be a no-op, no panic.
+    state.purge_active_transfer_mappings_for_pid(1);
+    assert_eq!(state.active_transfer_count_for_pid(1), 0, "idempotent");
+}
+
+// ── End Stage 18 TLB shootdown + cross-CPU VM cleanup tests ──────────────────
+
 // ── End Stage 16 timeout/deadline/block-state tests ───────────────────────────

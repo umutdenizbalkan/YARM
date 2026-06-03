@@ -251,4 +251,22 @@ impl KernelState {
             self.note_transfer_record_revoked();
         }
     }
+
+    /// Return the number of active transfer mapping slots owned by `pid`.
+    #[cfg(test)]
+    pub(crate) fn active_transfer_count_for_pid(&self, pid: u64) -> usize {
+        let mut count = 0;
+        for idx in 0..MAX_TRANSFER_ENVELOPES {
+            let mapping = self.with_ipc_state(|ipc| ipc.active_transfer_mappings[idx]);
+            if let Some(mapping) = mapping {
+                let owner_pid = self
+                    .process_id(mapping.owner_tid.0)
+                    .unwrap_or(mapping.owner_tid.0);
+                if owner_pid == pid || mapping.owner_tid.0 == pid {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
 }

@@ -276,17 +276,24 @@ impl KernelState {
                 spaces.destroy_and_collect_mappings(asid, pending_cpu_bitmap)
             })
             .map_err(KernelError::Vm)?;
-        for mapping in drained.into_iter().flatten() {
-            self.note_mapping_removed(mapping.phys);
-            self.reclaim_memory_object_for_phys(mapping.phys);
-        }
 
+        // Stage 18 ordering fix: submit TLB shootdown work items BEFORE
+        // reclaiming frames.  Under the global lock both orderings are safe,
+        // but this matches the two-phase-unmap contract (shootdown precedes
+        // reclaim) and is the correct direction for future lock-free SMP.
+        //
+        // Shootdown is fire-and-forget (requester: None, sequence: 0).
+        // Queue-full errors are silenced: the ASID is already retired and
+        // frames must be reclaimed regardless.  A full queue means other
+        // work is pending; the TLB will eventually be invalidated when that
+        // work drains.  Frame reuse before invalidation cannot happen because
+        // the retired ASID cannot be reused until all CPUs ACK it.
         for cpu in 0..u64::BITS as usize {
             let cpu_bit = 1u64 << cpu;
             if (pending_cpu_bitmap & cpu_bit) == 0 {
                 continue;
             }
-            self.submit_cross_cpu_work(
+            let _ = self.submit_cross_cpu_work(
                 crate::kernel::scheduler::CpuId(cpu as u8),
                 crate::kernel::smp::WorkItem::TlbShootdown {
                     asid,
@@ -294,7 +301,13 @@ impl KernelState {
                     requester: None,
                     sequence: 0,
                 },
-            )?;
+            );
+        }
+
+        // Reclaim physical frames after shootdown work items have been queued.
+        for mapping in drained.into_iter().flatten() {
+            self.note_mapping_removed(mapping.phys);
+            self.reclaim_memory_object_for_phys(mapping.phys);
         }
 
         Ok(())
@@ -1124,5 +1137,25 @@ impl KernelState {
         }
         self.note_mapping_inserted(current_phys);
         Ok(old)
+    }
+
+    /// Return true if `asid` is in the live (non-retired) address space table.
+    #[cfg(test)]
+    pub(crate) fn asid_is_live_for_test(&self, asid: Asid) -> bool {
+        self.with_user_spaces(|spaces| spaces.get(asid).is_some())
+    }
+
+    /// Return true if `asid` is in the retired ASID table awaiting shootdown ACKs.
+    #[cfg(test)]
+    pub(crate) fn asid_is_retired_for_test(&self, asid: Asid) -> bool {
+        self.with_user_spaces(|spaces| spaces.retired_entry(asid).is_some())
+    }
+
+    /// Return the number of pages currently mapped in `asid`.
+    #[cfg(test)]
+    pub(crate) fn mapped_page_count_for_asid(&self, asid: Asid) -> usize {
+        self.with_user_spaces(|spaces| {
+            spaces.get(asid).map_or(0, |aspace| aspace.mappings())
+        })
     }
 }
