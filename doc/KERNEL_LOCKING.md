@@ -7448,3 +7448,133 @@ cross-CPU, trap/timer/bootstrap, SMP, or live boot path is touched.
 
 **Deferred (still deferred at Stage 20):** x86_64 SMP / `smp.rs`; RAMFS/FAT
 runtime spawning; full global-lock removal.
+
+### 38.10 Stage 20 acceptance (consolidated record)
+
+Recorded here for the Stage 21 audit trail (mirrors §37.8 for Stage 19).
+
+- **Baseline:** 757 tests (Stage 19) → **767 tests** (Stage 20), single-threaded,
+  `RUST_MIN_STACK=8388608`.
+- **Bug fixed:** Recv-v2 cap materialization rollback — a failed `copy_to_user`
+  after materializing a transferred cap left a populated cnode slot, an inflated
+  `MemoryObject cap_refcount`, and a stale reply-cap `waiter_cap_id`. The Stage 20
+  fix (`rollback_materialized_recv_cap`) clears the cnode slot, restores
+  `cap_refcount`, and clears the stale `waiter_cap_id`.
+- **Checks:** `cargo check --no-default-features` clean; `cargo check --features
+  hosted-dev` clean; `git diff --check` clean.
+- **x86_64 smoke:** not required — change is confined to the IPC recv copy-fault
+  error path; success path, syscall ABI, `SYSCALL_COUNT`, and SpawnV5 unchanged.
+- **Invariants:** all Stage 12–20 VM/COW/TLB/task/wake/cap/IPC behavior preserved;
+  recv-v2 / reply-cap / transfer-envelope semantics preserved.
+
+---
+
+## §39 — Stage 21: notification / IRQ-route lifetime audit + waiter/route cleanup hardening
+
+Stage 21 audits the lifetime of **notification objects** and **IRQ routes**: how a
+notification is created, signalled, waited on, and (newly) destroyed, and how IRQ
+routes that target a notification are bound and torn down. The focus is on
+preventing a wake from resurrecting a dead task and preventing an IRQ route from
+outliving the notification it points at.
+
+### 39.1 Notification / IRQ data model
+
+| Field (`IpcState`) | Shape | Role |
+| --- | --- | --- |
+| `notifications[idx]` | `Option<NotificationObject>` | pending-IRQ ring buffer (FIFO) |
+| `notification_waiters[idx]` | `Option<ThreadId>` | single registered waiter TID |
+| `notification_generations[idx]` | `u64` | liveness epoch; bumped on create-reuse and on destroy |
+| `irq_routes[irq_line]` | `Option<usize>` | hardware IRQ line → notification slot index |
+
+All four live under `ipc_state_lock` (rank 3). Capability minting for the
+notification's SIGNAL/RECEIVE caps happens **outside** the lock (cap rank 4 > ipc
+rank 3), preserving the create-two-phase pattern from §38.
+
+### 39.2 Lifetime paths audited
+
+| Path | Lock domains | Wake under lock? | Stale handling |
+| --- | --- | --- | --- |
+| `create_notification` | ipc (slot+gen+object), then cap (mint) | n/a | bumps gen; Stage 21 also sanitises stale waiter + routes on slot reuse |
+| `bind_irq_notification` | cap (resolve), ipc (route store) | n/a | requires SIGNAL right; generation-checked via `resolve_notification_index` |
+| `route_external_irq` → `signal_notification` | ipc (send_irq + waiter snapshot), then task (wake) | **no** — waiter woken after `ipc_state_lock` released | Stage 21: dead/exited/missing waiter is a no-op; destroyed-target IRQ is a swallowed no-op |
+| `ipc_recv` (notification) | ipc (immediate recv), task (block), ipc (publish waiter) | no | publishes waiter after TCB marked Blocked |
+| `clear_ipc_waiters_for_tid` (exit/death/timeout) | ipc | n/a | clears `notification_waiters` entry for the TID |
+| `destroy_notification` (Stage 21 new) | ipc (route teardown + waiter clear + object remove + gen bump) | n/a | atomic teardown; returns snapshotted waiter for out-of-lock unblock |
+
+### 39.3 Bugs fixed (Stage 21)
+
+1. **`signal_notification` resurrected dead waiters** (`ipc_state.rs`,
+   the Phase-2 wake block). The waiter TID snapshotted from
+   `notification_waiters` was transitioned `→ Runnable` and enqueued
+   **unconditionally**, without checking `TaskStatus`. A TID that had since been
+   exited/killed (or already woken by a timeout) would be resurrected or
+   double-enqueued. **Fix:** only wake when `matches!(tcb.status,
+   Blocked(_))`; missing TID and all non-Blocked states are silent no-ops —
+   mirroring `apply_cross_cpu_wake_task` and the WakeTask work-item guard.
+
+2. **No notification destroy / IRQ-route teardown path existed.** Notifications
+   were created (gen bumped on slot reuse) but never freed, and `irq_routes`
+   entries were never torn down. A future free-and-reuse of a slot would let a
+   stale route silently retarget the new (different-generation) notification, and
+   a leftover waiter could be re-targeted. **Fix:** added
+   `destroy_notification`, which under a single `ipc_state_lock` critical section
+   (a) drops every route targeting the slot, (b) clears the waiter, (c) removes
+   the object and bumps the generation (invalidating any surviving cap via
+   `capability_object_live` / `resolve_notification_index`). `create_notification`
+   additionally sanitises stale waiter/routes on slot reuse as defence-in-depth,
+   and `route_external_irq` treats a destroyed-target (`WrongObject`) as a benign
+   no-op rather than a kernel error.
+
+### 39.4 Invariants enforced (Stage 21)
+
+1. A notification signal may only transition a waiter `Blocked(_) → Runnable`;
+   it never resurrects `Dead`/`Exited` or double-enqueues `Runnable`/`Running`.
+2. An IRQ route never outlives its target notification (`destroy_notification`
+   clears routes before removing the object, under one lock).
+3. A destroyed notification's caps are non-live (generation bump).
+4. A reused notification slot starts with no stale waiter and no stale route.
+5. A hardware IRQ to a destroyed/absent route target is a no-op, not an error.
+6. The waiter wake happens **outside** `ipc_state_lock` (rank 3 → task rank 2,
+   no inversion); the route/object/generation teardown is atomic under it.
+
+### 39.5 Stage 21 test inventory
+
+| Test | Asserts |
+| --- | --- |
+| `stage21_signal_wakes_waiting_task_exactly_once` | Blocked waiter woken once; slot consumed; second IRQ no double-wake |
+| `stage21_signal_skips_dead_waiter_safely` | Dead waiter not resurrected |
+| `stage21_signal_skips_exited_waiter_safely` | Exited waiter not resurrected |
+| `stage21_exit_task_clears_notification_waiter` | `exit_task` clears waiter slot |
+| `stage21_mark_task_dead_clears_notification_waiter` | `mark_task_dead` clears waiter slot |
+| `stage21_destroy_notification_clears_waiter_and_invalidates_caps` | destroy clears waiter, removes object, bumps gen, caps non-live |
+| `stage21_signal_before_wait_leaves_pending_for_later_recv` | pending IRQ delivered to later recv |
+| `stage21_wait_before_signal_registers_then_wakes` | waiter registered then woken by signal |
+| `stage21_repeated_signal_accumulates_pending` | repeated signals queue FIFO, drained by recv |
+| `stage21_irq_route_registration_and_teardown` | route registered by bind, torn down by destroy |
+| `stage21_irq_delivery_to_destroyed_notification_is_safe_noop` | IRQ to destroyed target is a no-op (incl. forced stale route) |
+
+### 39.6 Files changed (Stage 21)
+
+| File | Change |
+| --- | --- |
+| `src/kernel/boot/ipc_state.rs` | `signal_notification` Blocked-status wake guard; new `destroy_notification`; `create_notification` slot-reuse sanitise; `route_external_irq` destroyed-target no-op |
+| `src/kernel/boot/tests.rs` | 11 new Stage 21 notification/IRQ-route lifetime tests + `stage21_block_on_notification` helper |
+| `doc/KERNEL_LOCKING.md` | §38.10 Stage 20 acceptance (consolidated); §39 (this section) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+28 (Stage 21 test rules) |
+
+### 39.7 Stage 21 acceptance
+
+778 tests pass single-threaded (767 Stage 20 baseline + 11 = 778),
+`RUST_MIN_STACK=8388608`. `cargo check --no-default-features` clean.
+`cargo check --features hosted-dev` clean. `git diff --check` clean.
+
+x86_64 `-smp 1` smoke **not required**: the only behavioral change is on the
+notification wake/destroy paths — `signal_notification` now refuses to wake a
+non-Blocked waiter (strictly safer), and `destroy_notification` is a new
+teardown primitive not yet wired into any live boot path. Syscall ABI,
+`SYSCALL_COUNT`, SpawnV5, trap/timer/bootstrap, SMP, and the live IRQ-delivery
+success path (`route_external_irq` for a live, bound notification) are unchanged.
+
+**Deferred (still deferred at Stage 21):** wiring `destroy_notification` into a
+capability-revoke / process-teardown path; x86_64 SMP / `smp.rs`; RAMFS/FAT
+runtime spawning; full global-lock removal.

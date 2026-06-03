@@ -1322,6 +1322,18 @@ impl KernelState {
                 next_gen = 1;
             }
             ipc.notification_generations[slot] = next_gen;
+            // Defence-in-depth (Stage 21): a reused slot must start with no
+            // stale waiter and no IRQ route inherited from a prior occupant.
+            // `destroy_notification` already performs this teardown, but a slot
+            // could also be freed by a future path that forgets to; sanitising
+            // here guarantees the new notification cannot be targeted by a
+            // route bound to the previous generation.
+            ipc.notification_waiters[slot] = None;
+            for route in ipc.irq_routes.iter_mut() {
+                if *route == Some(slot) {
+                    *route = None;
+                }
+            }
             ipc.notifications[slot] = Some(NotificationObject::new(max_depth)?);
             Ok::<_, KernelError>((slot, next_gen))
         })?;
@@ -1400,19 +1412,88 @@ impl KernelState {
             Ok::<_, KernelError>(ipc.notification_waiters[notification_idx].take())
         })?;
         // Phase 2: wake waiter outside ipc_state_lock.
+        //
+        // Invariant (Stage 21): only a task that is still `Blocked(_)` may be
+        // transitioned to `Runnable` and enqueued.  A waiter TID snapshotted
+        // from `notification_waiters` can race against `exit_task` /
+        // `mark_task_dead` (which clear the slot) or against a timeout that
+        // already woke the task; if the slot was observed non-None but the TCB
+        // is now Dead/Exited/Runnable/Running/Faulted, signalling must NOT
+        // resurrect or double-enqueue it.  This mirrors the cross-CPU
+        // `apply_cross_cpu_wake_task` guard and the WakeTask work-item policy.
         if let Some(waiter_tid) = opt_waiter_tid {
-            self.with_tcbs_mut(|tcbs| {
-                let tcb = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
-                    .ok_or(KernelError::TaskMissing)?;
-                tcb.status = TaskStatus::Runnable;
-                Ok::<_, KernelError>(())
+            let should_enqueue = self.with_tcbs_mut(|tcbs| {
+                let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == waiter_tid.0)
+                else {
+                    // Missing TID (recycled/never registered): silent no-op.
+                    return Ok::<bool, KernelError>(false);
+                };
+                if matches!(tcb.status, TaskStatus::Blocked(_)) {
+                    tcb.status = TaskStatus::Runnable;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             })?;
-            self.enqueue_task(waiter_tid.0)?;
+            if should_enqueue {
+                self.enqueue_task(waiter_tid.0)?;
+            }
         }
         Ok(())
+    }
+
+    /// Tear down a notification object and all IRQ routes that target it.
+    ///
+    /// Stage 21 lifetime invariant: an IRQ route must never outlive the
+    /// notification it points at, and a freed notification slot must carry no
+    /// stale waiter.  Teardown order is:
+    ///   1. Drop every `irq_routes` entry whose target is `notification_idx`
+    ///      (route teardown BEFORE the object is removed, so a concurrent
+    ///      `route_external_irq` either sees the live object or no route).
+    ///   2. Clear the `notification_waiters` slot (the waiter, if any, is woken
+    ///      by the task-exit / unblock path; here we only drop the dangling
+    ///      reference so a later signal cannot target a stale TID).
+    ///   3. Remove the object and bump the generation so any surviving
+    ///      `CapObject::Notification` cap fails the generation check in
+    ///      `resolve_notification_index` / `capability_object_live`.
+    ///
+    /// All three steps run under a single `ipc_state_lock` critical section so
+    /// the route/object/generation transition is atomic with respect to IRQ
+    /// delivery. Returns the snapshotted waiter TID (if any) so the caller can
+    /// unblock it outside the lock; `None` if the slot was already empty.
+    ///
+    /// Currently exercised by the Stage 21 lifetime tests and available as the
+    /// teardown primitive for future capability-revoke wiring; allow dead_code
+    /// in non-test builds until that wiring lands.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn destroy_notification(
+        &mut self,
+        notification_idx: usize,
+    ) -> Result<Option<ThreadId>, KernelError> {
+        if notification_idx >= self.runtime_capacity_config().max_notifications {
+            return Err(KernelError::WrongObject);
+        }
+        self.with_ipc_state_mut(|ipc| {
+            if ipc.notifications[notification_idx].is_none() {
+                return Err(KernelError::WrongObject);
+            }
+            // 1. Route teardown first.
+            for route in ipc.irq_routes.iter_mut() {
+                if *route == Some(notification_idx) {
+                    *route = None;
+                }
+            }
+            // 2. Snapshot + clear waiter.
+            let waiter = ipc.notification_waiters[notification_idx].take();
+            // 3. Remove object and bump generation to invalidate live caps.
+            ipc.notifications[notification_idx] = None;
+            let mut next_gen = ipc.notification_generations[notification_idx].wrapping_add(1);
+            if next_gen == 0 {
+                next_gen = 1;
+            }
+            ipc.notification_generations[notification_idx] = next_gen;
+            Ok::<Option<ThreadId>, KernelError>(waiter)
+        })
     }
 
     pub fn route_external_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {
@@ -1422,7 +1503,17 @@ impl KernelState {
         let Some(notification_idx) = notification_idx else {
             return Ok(());
         };
-        self.signal_notification(notification_idx, irq_line)
+        // Stage 21: a hardware IRQ that lands on a route whose target
+        // notification was destroyed (object slot now None) is a benign no-op,
+        // not an error — the IRQ simply has nowhere to be delivered. Without
+        // this, a stale route surviving a destroy would turn every spurious
+        // interrupt into a kernel error. `destroy_notification` clears matching
+        // routes, so this is defence-in-depth for the destroy/deliver race.
+        match self.signal_notification(notification_idx, irq_line) {
+            Ok(()) => Ok(()),
+            Err(KernelError::WrongObject) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn ipc_send(&mut self, send_cap: CapId, msg: Message) -> Result<(), KernelError> {

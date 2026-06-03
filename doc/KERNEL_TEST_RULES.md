@@ -2007,3 +2007,62 @@ x86_64 `-smp 1` smoke is NOT required after Stage 20: the only behavioral change
 on the IPC recv copy-fault error path (a previously-leaking cnode slot is now
 revoked); the success path, syscall ABI, `SYSCALL_COUNT`, and SpawnV5 semantics are
 unchanged, and no cross-CPU, SMP, trap/timer/bootstrap, or live boot path is touched.
+
+## Rule N+28 — Stage 21: notification / IRQ-route lifetime test rules
+
+Stage 21 hardens the notification wake path and adds the `destroy_notification`
+teardown primitive. Tests must cover both the wake-safety guard and the
+route/object/generation teardown ordering.
+
+### N+28.1 — Signal must not resurrect a non-Blocked waiter
+
+A test must assert that `signal_notification` (driven via `route_external_irq`)
+woken against a `Dead` or `Exited` waiter TID lingering in `notification_waiters`
+leaves the task in its terminal state. Only a `Blocked(_)` waiter may transition
+to `Runnable`. See `stage21_signal_skips_dead_waiter_safely`,
+`stage21_signal_skips_exited_waiter_safely`,
+`stage21_signal_wakes_waiting_task_exactly_once`.
+
+### N+28.2 — Exit/death clears the notification waiter
+
+Both `exit_task` and `mark_task_dead` must clear the `notification_waiters` slot
+for the dying TID (via `clear_ipc_waiters_for_tid`). See
+`stage21_exit_task_clears_notification_waiter`,
+`stage21_mark_task_dead_clears_notification_waiter`.
+
+### N+28.3 — Destroy ordering and generation bump
+
+A test must assert `destroy_notification` (a) tears down every `irq_routes` entry
+targeting the slot, (b) clears the waiter and returns its snapshot, (c) removes
+the object and bumps the generation so the cap is non-live via
+`capability_object_live`. See
+`stage21_destroy_notification_clears_waiter_and_invalidates_caps`,
+`stage21_irq_route_registration_and_teardown`.
+
+### N+28.4 — Pending vs waiter ordering
+
+Tests must cover signal-before-wait (pending consumed by later recv),
+wait-before-signal (waiter registered then woken), and repeated signal (FIFO
+accumulation drained by recv). See
+`stage21_signal_before_wait_leaves_pending_for_later_recv`,
+`stage21_wait_before_signal_registers_then_wakes`,
+`stage21_repeated_signal_accumulates_pending`.
+
+### N+28.5 — IRQ to a destroyed target is a benign no-op
+
+A test must assert a hardware IRQ routed at a destroyed notification (including a
+forced stale route surviving the destroy) returns `Ok(())`, not an error. See
+`stage21_irq_delivery_to_destroyed_notification_is_safe_noop`.
+
+### N+28.6 — Full suite at 778+ tests (single-threaded)
+
+Every Stage 21 commit must pass `cargo test --lib --features hosted-dev --
+--test-threads=1` with at least 778 tests (767 from Stage 20 + 11 new Stage 21
+tests). Both `cargo check --no-default-features` and `cargo check --features
+hosted-dev` must be clean, and `git diff --check` must be clean.
+
+x86_64 `-smp 1` smoke is NOT required after Stage 21: the only behavioral change is
+on the notification wake/destroy paths — the wake now refuses a non-Blocked waiter
+(strictly safer), and `destroy_notification` is a new teardown primitive not yet
+wired into a live boot path. Syscall ABI, `SYSCALL_COUNT`, SpawnV5,
+trap/timer/bootstrap, SMP, and the live IRQ-delivery success path are unchanged.

@@ -18199,3 +18199,291 @@ fn stage20_reply_cap_creation_does_not_change_memory_cap_refcount() {
 }
 
 // ── End Stage 16 timeout/deadline/block-state tests ───────────────────────────
+
+// ── Stage 21: notification / IRQ-route lifetime tests ─────────────────────────
+
+/// Set `tid` to `Blocked(EndpointReceive(0))` to model a task parked on a
+/// notification recv, without driving the full block path. Mirrors the
+/// injection idiom used by the Stage 16 waiter-cleanup tests.
+#[cfg(test)]
+fn stage21_block_on_notification(state: &mut KernelState, tid: u64) {
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .expect("tcb");
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(0)));
+            Ok::<_, KernelError>(())
+        })
+        .expect("block");
+}
+
+#[test]
+fn stage21_signal_wakes_waiting_task_exactly_once() {
+    // route_external_irq -> signal_notification must wake a Blocked waiter once
+    // (Blocked -> Runnable, waiter slot consumed). A second IRQ with no waiter
+    // registered must not re-wake or re-enqueue anything.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(2101).expect("task");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(9, notif_cap).expect("bind");
+
+    stage21_block_on_notification(&mut state, 2101);
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(ThreadId(2101));
+    });
+    assert!(state.task_is_blocked(2101), "waiter blocked before signal");
+    assert_eq!(state.notification_waiter_count(notif_idx), 1, "waiter present");
+
+    state.route_external_irq(9).expect("irq");
+    assert!(state.task_is_runnable(2101), "waiter woken to Runnable");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        0,
+        "waiter slot consumed by signal"
+    );
+
+    // Second IRQ: no registered waiter, task already Runnable, must stay Runnable.
+    state.route_external_irq(9).expect("irq2");
+    assert!(state.task_is_runnable(2101), "no double-wake");
+    assert_eq!(state.notification_waiter_count(notif_idx), 0, "still no waiter");
+}
+
+#[test]
+fn stage21_signal_skips_dead_waiter_safely() {
+    // A stale Dead-task TID lingering in notification_waiters must NOT be
+    // resurrected to Runnable by a signal.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(2102).expect("task");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(10, notif_cap).expect("bind");
+
+    state.mark_task_dead(2102).expect("dead");
+    assert!(state.task_is_dead(2102), "dead before injection");
+    // Simulate a stale waiter reference surviving (defence-in-depth).
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(ThreadId(2102));
+    });
+
+    state.route_external_irq(10).expect("irq");
+    assert!(
+        state.task_is_dead(2102),
+        "Dead task must not be resurrected by signal_notification"
+    );
+}
+
+#[test]
+fn stage21_signal_skips_exited_waiter_safely() {
+    // Same as above for an Exited task.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(2103).expect("task");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(11, notif_cap).expect("bind");
+
+    state.exit_task(2103, 0).expect("exit");
+    assert!(state.task_is_exited(2103), "exited before injection");
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(ThreadId(2103));
+    });
+
+    state.route_external_irq(11).expect("irq");
+    assert!(
+        state.task_is_exited(2103),
+        "Exited task must not be resurrected by signal_notification"
+    );
+}
+
+#[test]
+fn stage21_exit_task_clears_notification_waiter() {
+    // exit_task -> clear_ipc_waiters_for_tid must drop the notification waiter.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(2104).expect("task");
+    let (notif_idx, _cap, _recv) = state.create_notification(4).expect("notif");
+    stage21_block_on_notification(&mut state, 2104);
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(ThreadId(2104));
+    });
+    assert_eq!(state.notification_waiter_count(notif_idx), 1, "before exit");
+
+    state.exit_task(2104, 7).expect("exit");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        0,
+        "notification waiter cleared by exit_task"
+    );
+}
+
+#[test]
+fn stage21_mark_task_dead_clears_notification_waiter() {
+    // mark_task_dead must also clear the notification waiter slot.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(2105).expect("task");
+    let (notif_idx, _cap, _recv) = state.create_notification(4).expect("notif");
+    stage21_block_on_notification(&mut state, 2105);
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(ThreadId(2105));
+    });
+    assert_eq!(state.notification_waiter_count(notif_idx), 1, "before death");
+
+    state.mark_task_dead(2105).expect("dead");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        0,
+        "notification waiter cleared by mark_task_dead"
+    );
+}
+
+#[test]
+fn stage21_destroy_notification_clears_waiter_and_invalidates_caps() {
+    // destroy_notification with an active waiter must: clear the waiter slot,
+    // remove the object, and bump generation so the SIGNAL cap goes stale.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(2106).expect("task");
+    let (notif_idx, _notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let gen_before = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
+    // A live notification cap is one whose object generation matches.
+    let live_object = CapObject::Notification {
+        index: notif_idx,
+        generation: gen_before,
+    };
+    assert!(
+        state.capability_object_live(live_object).is_some(),
+        "notification cap live before destroy"
+    );
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(ThreadId(2106));
+    });
+
+    let waiter = state.destroy_notification(notif_idx).expect("destroy");
+    assert_eq!(waiter, Some(ThreadId(2106)), "destroy returns snapshotted waiter");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        0,
+        "waiter slot cleared by destroy"
+    );
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_none()),
+        "object removed by destroy"
+    );
+    let gen_after = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
+    assert_ne!(gen_before, gen_after, "generation bumped on destroy");
+
+    // The capability minted at the pre-destroy generation must now be non-live.
+    assert!(
+        state.capability_object_live(live_object).is_none(),
+        "destroyed notification cap must be non-live (generation mismatch)"
+    );
+}
+
+#[test]
+fn stage21_signal_before_wait_leaves_pending_for_later_recv() {
+    // Signal-before-wait: an IRQ delivered while no task waits must leave a
+    // pending entry that a subsequent recv consumes (no waiter woken).
+    let mut state = Bootstrap::init().expect("init");
+    let (_notif_idx, notif_cap, recv_cap) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(12, notif_cap).expect("bind");
+
+    // No waiter registered yet.
+    state.route_external_irq(12).expect("irq");
+
+    // The pending IRQ is delivered by a non-blocking recv.
+    let msg = state.try_ipc_recv(recv_cap).expect("recv");
+    assert!(msg.is_some(), "pending IRQ delivered to later recv");
+    // No further pending entries.
+    let again = state.try_ipc_recv(recv_cap).expect("recv2");
+    assert!(again.is_none(), "no spurious second delivery");
+}
+
+#[test]
+fn stage21_wait_before_signal_registers_then_wakes() {
+    // Wait-before-signal: the waiter is registered first, then a signal wakes it.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(2108).expect("task");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(13, notif_cap).expect("bind");
+
+    stage21_block_on_notification(&mut state, 2108);
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(ThreadId(2108));
+    });
+    assert_eq!(state.notification_waiter_count(notif_idx), 1, "waiter registered");
+    assert!(state.task_is_blocked(2108), "blocked before signal");
+
+    state.route_external_irq(13).expect("irq");
+    assert!(state.task_is_runnable(2108), "signal woke waiter");
+    assert_eq!(state.notification_waiter_count(notif_idx), 0, "waiter consumed");
+}
+
+#[test]
+fn stage21_repeated_signal_accumulates_pending() {
+    // Repeated signals with no waiter must accumulate pending IRQs up to depth,
+    // each consumable by recv in order (FIFO).
+    let mut state = Bootstrap::init().expect("init");
+    let (_notif_idx, notif_cap, recv_cap) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(14, notif_cap).expect("bind");
+
+    state.route_external_irq(14).expect("irq1");
+    state.route_external_irq(14).expect("irq2");
+    state.route_external_irq(14).expect("irq3");
+
+    // Three pending entries, delivered in order, then drained.
+    for _ in 0..3 {
+        assert!(
+            state.try_ipc_recv(recv_cap).expect("recv").is_some(),
+            "pending IRQ present"
+        );
+    }
+    assert!(
+        state.try_ipc_recv(recv_cap).expect("recv").is_none(),
+        "queue drained after three signals"
+    );
+}
+
+#[test]
+fn stage21_irq_route_registration_and_teardown() {
+    // bind_irq_notification registers a route; destroy_notification tears down
+    // every route targeting the destroyed notification.
+    let mut state = Bootstrap::init().expect("init");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(15, notif_cap).expect("bind");
+
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.irq_routes[15]),
+        Some(notif_idx),
+        "route registered to notification"
+    );
+
+    state.destroy_notification(notif_idx).expect("destroy");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.irq_routes[15]),
+        None,
+        "route torn down by destroy_notification"
+    );
+}
+
+#[test]
+fn stage21_irq_delivery_to_destroyed_notification_is_safe_noop() {
+    // After a notification is destroyed, a hardware IRQ that still references it
+    // (defence-in-depth: route forced to survive) must be a benign no-op, not a
+    // kernel error.
+    let mut state = Bootstrap::init().expect("init");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(16, notif_cap).expect("bind");
+
+    state.destroy_notification(notif_idx).expect("destroy");
+    // Normal path: route was cleared, so this is an immediate no-op.
+    state.route_external_irq(16).expect("noop after destroy");
+
+    // Defence-in-depth: force a stale route back at the freed slot and confirm
+    // signal_notification reports the dead object as a swallowed no-op.
+    state.with_ipc_state_mut(|ipc| {
+        ipc.irq_routes[16] = Some(notif_idx);
+    });
+    state
+        .route_external_irq(16)
+        .expect("stale route to destroyed notification must be a no-op, not an error");
+}
+
+// ── End Stage 21 notification / IRQ-route lifetime tests ──────────────────────
